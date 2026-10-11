@@ -359,6 +359,14 @@ under *Local models (not in config)* with an *Add to config* button (the `.onnx`
 also runs on ONNX Runtime, incl. CoreML). Weights are never committed (YOLO weights are AGPL-3.0);
 `models/`, `cache/` and `openvino/` are git-ignored.
 
+A model anywhere on the machine (e.g. a fine-tuned RF-DETR `inference_model.onnx`) can be added by
+path: the Config page's *Add a model by path* form, `POST /v1/models/add` (form fields `path`,
+`name`, `family`, `classes`) or `blue-onyx-prism add-model --path <file|dir> [--name n]
+[--family rfdetr] [--classes c.yaml]`. `path` is a `.onnx` / `.xml` file or a directory holding
+exactly one model (a Hugging Face `onnx/` subfolder is searched too); a `<model>.yaml`, or a lone
+`classes.yaml` / `data.yaml` / `names.yaml` beside it, supplies the class names. Fine-tuned RF-DETR
+needs `--family rfdetr` (`auto` treats DETR ports as D-FINE). Duplicate names or files are refused.
+
 ### Converting ONNX models to OpenVINO IR
 
 ONNX models (the YOLOv5 ipcam and RT-DETRv2 catalogs) load directly. If one fails on the ONNX
@@ -585,6 +593,7 @@ Put models in `deploy/models` and a `blue_onyx_prism_config.json` in `deploy/con
 | POST | `/v1/vision/detection` | multipart `image`, optional `min_confidence`; default model |
 | POST | `/v1/vision/custom/{model}` | same, named model |
 | POST, GET | `/v1/vision/custom/list` | configured model names |
+| POST | `/v1/models/add` | add a custom model by file or directory path to the config (`path`, `name`, `family`, `classes`) |
 | GET | `/v1/status/updateavailable` | GitHub release check |
 | GET | `/`, `/stats`, `/stats.json`, `/prometheus` | UI and metrics |
 | GET | `/logs`, `/logs.json?after=<seq>&level=<min>` | log page; recent log events newer than `after` at `level` (`trace`..`error`) or more severe, with `last` as the next cursor |

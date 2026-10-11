@@ -78,7 +78,7 @@
     <button type="submit" formaction="/config/restart?back=models" class="danger restart-now" data-restart{% if pending.is_empty() %} hidden{% endif %}>Restart now</button>
     <span class="form-msg" aria-live="polite"></span>
   </div>
-  <p class="muted">More models: download them under <a href="#resources">Resources</a>, or add the files found in the models directory under <a href="#local-models">Local models</a>. Other per-model settings (classes, object filter, lazy, GPU precision) are in the Models JSON under <a href="#server">Advanced</a>; it stays in sync with this card.</p>
+  <p class="muted">More models: download them under <a href="#resources">Resources</a>, add the files found in the models directory under <a href="#local-models">Local models</a>, or add any model file or directory by path under <a href="#custom-model">Add a model by path</a>. Other per-model settings (classes, object filter, lazy, GPU precision) are in the Models JSON under <a href="#server">Advanced</a>; it stays in sync with this card.</p>
 </form>
 
 <section class="card" id="benchmark">
@@ -163,6 +163,23 @@
   </table>
   </div>
   {% endif %}
+  <h3 id="custom-model">Add a model by path</h3>
+  <div id="resource-custom-model" data-id="custom-model">
+  {% if at_row == "custom-model" %}{% call notices("resources-row") %}{% endcall %}{% endif %}
+  <form method="post" action="/v1/models/add#resource-custom-model" class="grid" data-ajax>
+    <label>Path <input type="text" name="path" required placeholder="C:\models\my-rfdetr\inference_model.onnx" autocomplete="off"></label>
+    <label>Name (optional) <input type="text" name="name" placeholder="default: file name" autocomplete="off"></label>
+    <label>Family
+      <select name="family">
+      <option value="">auto - pick from the model's outputs</option>
+      {% for f in family_choices %}<option value="{{ f.value }}">{{ f.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Classes YAML (optional) <input type="text" name="classes" placeholder="default: &lt;model&gt;.yaml beside it" autocomplete="off"></label>
+    <div class="actions"><button type="submit">Add to config</button></div>
+    <p class="muted">A <code>.onnx</code> / <code>.xml</code> file, or the directory holding one, on the machine running the service; relative paths are under <code>{{ data_root }}</code>. Fine-tuned RF-DETR: choose <code>rfdetr</code>. Classes: a YAML with a names list (default: <code>&lt;model&gt;.yaml</code> beside it, then COCO-80). Restart to load.</p>
+  </form>
+  </div>
   <p class="muted">Ultralytics YOLO (AGPL-3.0), RF-DETR large and DEIMv2 (non-commercial / personal use only) are not downloadable as ONNX: use Export in the <a href="#res-models-export">exported models</a> section, or export by hand with <code>scripts/export_model.py --out-dir "{{ models_dir }}"</code> (see the README); other model files show up under Local models. The NVIDIA CUDA/cuDNN libraries (for <code>ort:cuda</code> without a CUDA 12 / cuDNN 9 install) are covered by NVIDIA's license.</p>
 </section>
 
@@ -251,7 +268,7 @@ document.addEventListener("click", function (e) {
   if (!L || !window.fetch || !box) return;
   var key = function (r) { return r.busy ? "busy" : r.state; };
   var timer = null, swapping = null;
-  function rowOf(id) { return box.querySelector('tr[data-id="' + CSS.escape(id) + '"]'); }
+  function rowOf(id) { return box.querySelector('[data-id="' + CSS.escape(id) + '"]'); }
   // Replace the section's content with the fresh page's, keeping scroll offsets, open
   // <details> and the answers shown next to the buttons.
   function swap() {
@@ -260,7 +277,7 @@ document.addEventListener("click", function (e) {
       var fresh = new DOMParser().parseFromString(html, "text/html").getElementById("resources");
       if (!fresh) return;
       var msgs = [];
-      box.querySelectorAll(".action-msg").forEach(function (m) { var tr = m.closest("tr[data-id]"); msgs.push([tr ? tr.dataset.id : null, m]); });
+      box.querySelectorAll(".action-msg").forEach(function (m) { var tr = m.closest("[data-id]"); msgs.push([tr ? tr.dataset.id : null, m]); });
       var st = L.view.capture(box), y = window.scrollY;
       box.replaceChildren.apply(box, Array.prototype.slice.call(document.adoptNode(fresh).childNodes));
       L.view.restore(box, st);
@@ -295,7 +312,11 @@ document.addEventListener("click", function (e) {
     clearTimeout(timer); timer = null;
     if (box.querySelector('tr[data-busy="true"]')) timer = setTimeout(tick, 1500);
   }
-  box.addEventListener("prism:action", function () { swap(); });
+  box.addEventListener("prism:action", function (e) {
+    // A refused "Add a model by path" keeps what was typed.
+    if (e.target.closest && e.target.closest("#resource-custom-model") && !(e.detail && e.detail.ok)) return;
+    swap();
+  });
   watch();
 })();
 // ---- Live config: refresh fields from GET /v1/config, keep and mark unsaved edits, merge saves.

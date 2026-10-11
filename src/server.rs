@@ -120,6 +120,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/resources/download", post(resources_download))
         .route("/v1/resources/remove", post(resources_remove))
         .route("/v1/resources/add-to-config", post(resources_add_to_config))
+        .route("/v1/models/add", post(models_add))
         .route("/v1/resources/export", post(resources_export))
         .route("/v1/resources/export/cancel", post(resources_export_cancel))
         .route("/stats", get(stats_page))
@@ -988,7 +989,8 @@ fn action_response(
             .iter()
             .flat_map(|g| g.rows.iter())
             .any(|r| r.id == id)
-            || t.local_models.iter().any(|l| l.id == id);
+            || t.local_models.iter().any(|l| l.id == id)
+            || id == crate::resources::status::CUSTOM_MODEL_ROW;
         t.at = if has_row {
             "resources-row"
         } else {
@@ -1071,6 +1073,95 @@ async fn resources_add_to_config(
         },
     };
     action_response(&state, &headers, &id, result)
+}
+
+/// `POST /v1/models/add` (`path`, optional `name`, `family`, `classes`): appends a custom model
+/// (a file, or the directory holding one) to `models` and saves the config file.
+async fn models_add(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    form: Result<Form<HashMap<String, String>>, FormRejection>,
+) -> Response {
+    use crate::resources::status::{ActionError, CUSTOM_MODEL_ROW, CustomModel};
+    let form = form.map(|Form(f)| f).unwrap_or_default();
+    let field = |k: &str| {
+        form.get(k)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let some = |s: String| (!s.is_empty()).then_some(s);
+    let family = match field("family").to_ascii_lowercase().as_str() {
+        "" => Ok(crate::model::ModelFamilyKind::Auto),
+        f => <crate::model::ModelFamilyKind as clap::ValueEnum>::from_str(f, true).map_err(|_| {
+            ActionError::BadRequest(format!(
+                "unknown family '{f}'; valid: {}",
+                family_names().join(", ")
+            ))
+        }),
+    };
+    let req = family.map(|family| CustomModel {
+        path: field("path"),
+        name: some(field("name")),
+        family,
+        classes: some(field("classes")),
+    });
+    let result = match req {
+        Err(e) => Err(e),
+        Ok(req) => {
+            let mut outcome = String::new();
+            let saved = save_config(&state, "config page (add model by path)", |c| {
+                outcome = crate::resources::status::add_custom_model(c, &req)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                Ok(())
+            });
+            match saved {
+                Ok(_) => Ok(format!(
+                    "{outcome}. Saved to {}; restart to load it.",
+                    state.config_path.display()
+                )),
+                Err(e) => match e.downcast::<ActionError>() {
+                    Ok(a) => Err(a),
+                    Err(e) => Err(ActionError::Failed(format!("{e:#}"))),
+                },
+            }
+        }
+    };
+    action_response(&state, &headers, CUSTOM_MODEL_ROW, result)
+}
+
+fn family_names() -> Vec<String> {
+    <crate::model::ModelFamilyKind as clap::ValueEnum>::value_variants()
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Options of the "Add a model by path" family select (auto is the empty default option).
+fn family_choices() -> Vec<FamilyChoice> {
+    use crate::model::ModelFamilyKind as K;
+    <K as clap::ValueEnum>::value_variants()
+        .iter()
+        .filter(|k| **k != K::Auto)
+        .map(|k| FamilyChoice {
+            value: k.to_string(),
+            label: match k {
+                K::Auto => "auto",
+                K::Yolo26 => "yolo26 - YOLO26 / YOLOv10 end-to-end [1,300,6]",
+                K::Yolo5 => "yolo5 - YOLOv5 [1,N,5+C]",
+                K::Yolo8 => "yolo8 - YOLOv8/9/11/12 [1,4+C,8400]",
+                K::RtDetr => "rtdetr - RT-DETRv2, DEIMv2",
+                K::Detr => "detr - D-FINE (Hugging Face DETR ports)",
+                K::RfDetr => "rfdetr - RF-DETR incl. fine-tuned",
+            }
+            .to_string(),
+        })
+        .collect()
+}
+
+/// One `<option>` of the family select.
+struct FamilyChoice {
+    value: String,
+    label: String,
 }
 
 /// `POST /v1/resources/export` (`id` of an exportable model, `confirm_large` when the export
@@ -1576,6 +1667,10 @@ struct ConfigTemplate {
     resource_groups: Vec<crate::resources::status::ResourceGroup>,
     /// Model files in `models_dir` that no config entry uses.
     local_models: Vec<crate::resources::status::LocalModel>,
+    /// Families of the "Add a model by path" form.
+    family_choices: Vec<FamilyChoice>,
+    /// Resolved data root (relative model paths are under it).
+    data_root: String,
     resources_enabled: bool,
     /// Resolved `models_dir` (where exported models go).
     models_dir: String,
@@ -1760,6 +1855,8 @@ fn config_template(
         bench_summary,
         resource_groups,
         local_models,
+        family_choices: family_choices(),
+        data_root: cfg.data_root().display().to_string(),
         models_dir,
         tools_dir,
         export_notice: [
@@ -3384,6 +3481,54 @@ mod tests {
             let (s, b) = post_action(&state, "/v1/resources/add-to-config", bad).await;
             assert_eq!(s, StatusCode::NOT_FOUND, "{bad}: {b}");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn add_model_by_path() {
+        let (state, root) = resources_state();
+        let dir = root.join("rf");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inference_model.onnx"), b"x").unwrap();
+        std::fs::write(dir.join("classes.yaml"), b"names:\n- a\n").unwrap();
+        let enc =
+            |p: &std::path::Path| p.to_string_lossy().replace('\\', "%5C").replace('/', "%2F");
+
+        let (_, html) = get_text(&state, "/config").await;
+        assert!(html.contains("action=\"/v1/models/add"), "{html}");
+        assert!(html.contains("<option value=\"rfdetr\">"));
+
+        let body = format!("path={}&name=mine&family=rfdetr&classes=", enc(&dir));
+        let (s, b) = post_action(&state, "/v1/models/add", &body).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("added 'mine'"),
+            "{b}"
+        );
+        let last = state.config.changes(1).pop().expect("logged");
+        assert_eq!(last.source, "config page (add model by path)");
+        let saved = Config::load(&state.config_path).unwrap();
+        let m = saved
+            .models
+            .iter()
+            .find(|m| m.effective_name() == "mine")
+            .unwrap();
+        assert_eq!(m.family, crate::model::ModelFamilyKind::RfDetr);
+        assert_eq!(m.path, PathBuf::from("rf/inference_model.onnx"));
+        assert_eq!(m.classes, Some(PathBuf::from("rf/classes.yaml")));
+
+        let (s, _) = post_action(&state, "/v1/models/add", &body).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let (s, _) = post_action(&state, "/v1/models/add", "path=%2Fno%2Fsuch.onnx").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, b) = post_action(
+            &state,
+            "/v1/models/add",
+            &format!("path={}&name=zz&family=nope", enc(&dir)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert!(b["message"].as_str().unwrap().contains("rfdetr"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

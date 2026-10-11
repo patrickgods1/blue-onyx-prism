@@ -27,6 +27,7 @@ use super::manager::{self, Job, State, Status};
 use super::provision::{Provision, Provisioner};
 use super::resolve::{self, Installed, Resolution};
 use crate::config::Config;
+use crate::model::ModelFamilyKind;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -120,12 +121,17 @@ pub enum ActionError {
     /// Refused in the current state (409): large without confirmation, in use, downloading.
     Conflict(String),
     Failed(String),
+    /// Invalid input (400): empty or malformed fields.
+    BadRequest(String),
 }
 
 impl ActionError {
     pub fn message(&self) -> &str {
         match self {
-            ActionError::NotFound(m) | ActionError::Conflict(m) | ActionError::Failed(m) => m,
+            ActionError::NotFound(m)
+            | ActionError::Conflict(m)
+            | ActionError::Failed(m)
+            | ActionError::BadRequest(m) => m,
         }
     }
 
@@ -135,6 +141,7 @@ impl ActionError {
             ActionError::NotFound(_) => 404,
             ActionError::Conflict(_) => 409,
             ActionError::Failed(_) => 500,
+            ActionError::BadRequest(_) => 400,
         }
     }
 }
@@ -1195,6 +1202,217 @@ fn add_local_to_config(config: &mut Config, file: &str) -> Result<String, Action
     Ok(describe_outcomes(&out))
 }
 
+/// Row id of the "Add a model by path" form (notices land next to it).
+pub const CUSTOM_MODEL_ROW: &str = "custom-model";
+
+/// A custom model to add to the config (the form / `add-model` fields).
+#[derive(Debug, Clone, Default)]
+pub struct CustomModel {
+    /// A `.onnx` / `.xml` file or the directory holding one.
+    pub path: String,
+    pub name: Option<String>,
+    pub family: ModelFamilyKind,
+    /// YAML with the class names.
+    pub classes: Option<String>,
+}
+
+/// Trim and strip one pair of surrounding quotes ("Copy as path" on Windows).
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    for q in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            return s[1..s.len() - 1].trim();
+        }
+    }
+    s
+}
+
+fn model_files_in(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && model_ext(p).is_some())
+        .collect();
+    files.sort();
+    // One entry per stem, `.onnx` preferred over `.xml`.
+    let mut by_stem: Vec<(String, PathBuf)> = Vec::new();
+    for f in files {
+        let stem = f
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match by_stem.iter_mut().find(|(s, _)| *s == stem) {
+            Some(e) => {
+                if model_ext(&f) == Some("onnx") {
+                    e.1 = f;
+                }
+            }
+            None => by_stem.push((stem, f)),
+        }
+    }
+    by_stem
+}
+
+/// The single model file in `dir` (or its `onnx/` subdirectory).
+fn pick_model_in_dir(dir: &Path) -> Result<PathBuf, ActionError> {
+    let mut found = model_files_in(dir);
+    if found.is_empty() {
+        found = model_files_in(&dir.join("onnx"));
+    }
+    match found.len() {
+        0 => Err(ActionError::NotFound(format!(
+            "no .onnx or .xml model in {}",
+            dir.display()
+        ))),
+        1 => Ok(found.remove(0).1),
+        _ => {
+            let names: Vec<String> = found
+                .iter()
+                .filter_map(|(_, p)| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .collect();
+            Err(ActionError::Conflict(format!(
+                "{} holds several models ({}); give the path of the model file instead",
+                dir.display(),
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// Add a custom model by file or directory (the config page's "Add a model by path" form and
+/// `add-model`). Duplicates by name or file are errors, not skips.
+pub fn add_custom_model(config: &mut Config, req: &CustomModel) -> Result<String, ActionError> {
+    let raw = unquote(&req.path);
+    if raw.is_empty() {
+        return Err(ActionError::BadRequest("the model path is empty".into()));
+    }
+    let given = config.data_path(Path::new(raw));
+    let file = if given.is_dir() {
+        pick_model_in_dir(&given)?
+    } else if given.is_file() {
+        if model_ext(&given).is_none() {
+            return Err(ActionError::BadRequest(format!(
+                "{} is not a model file (.onnx or .xml)",
+                given.display()
+            )));
+        }
+        given
+    } else {
+        return Err(ActionError::NotFound(format!(
+            "{} does not exist",
+            given.display()
+        )));
+    };
+    if model_ext(&file) == Some("xml") && !file.with_extension("bin").is_file() {
+        return Err(ActionError::NotFound(format!(
+            "{} needs its weights file {} beside it",
+            file.display(),
+            file.with_extension("bin").display()
+        )));
+    }
+    let stem = file
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| stem.clone());
+    if name.contains(['/', '\\', '?', '#']) || name.chars().any(char::is_control) {
+        return Err(ActionError::BadRequest(format!(
+            "invalid model name '{name}': it is part of a URL, so it must not contain / \\ ? # or control characters"
+        )));
+    }
+
+    // Classes: explicit file, else a `<stem>.yaml` sidecar (found at load), else a well-known
+    // file beside the model.
+    let classes = match req
+        .classes
+        .as_deref()
+        .map(unquote)
+        .filter(|c| !c.is_empty())
+    {
+        Some(c) => {
+            let p = config.data_path(Path::new(c));
+            if !p.is_file() {
+                return Err(ActionError::NotFound(format!(
+                    "classes file {} does not exist",
+                    p.display()
+                )));
+            }
+            crate::model::classes::load_class_names(&p)
+                .map_err(|e| ActionError::BadRequest(format!("{e:#}")))?;
+            Some(p)
+        }
+        None => {
+            let dir = file.parent().unwrap_or_else(|| Path::new("."));
+            if file.with_extension("yaml").is_file() {
+                None
+            } else {
+                let ok: Vec<PathBuf> = ["classes.yaml", "classes.yml", "data.yaml", "names.yaml"]
+                    .iter()
+                    .map(|n| dir.join(n))
+                    .filter(|p| p.is_file() && crate::model::classes::load_class_names(p).is_ok())
+                    .collect();
+                (ok.len() == 1).then(|| ok[0].clone())
+            }
+        }
+    };
+
+    // Duplicates are errors here (add_to_config would skip them silently).
+    let norm = crate::registry::normalize_name(&name);
+    for m in &config.models {
+        if crate::registry::normalize_name(&m.effective_name()) == norm {
+            return Err(ActionError::Conflict(format!(
+                "a model named '{name}' is already in the config"
+            )));
+        }
+        if same_file(&config.data_path(&m.path), &file) {
+            return Err(ActionError::Conflict(format!(
+                "{} is already in the config as '{}'",
+                file.display(),
+                m.effective_name()
+            )));
+        }
+    }
+
+    let root = config.data_root();
+    let root_canon = root.canonicalize().ok();
+    let rel = |p: &Path| -> PathBuf {
+        for base in [Some(root.as_path()), root_canon.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(r) = p.strip_prefix(base) {
+                return r.to_path_buf();
+            }
+        }
+        p.to_path_buf()
+    };
+    let out = crate::download::add_to_config(
+        config,
+        vec![crate::config::ModelConfig {
+            name: Some(name),
+            path: rel(&file),
+            family: req.family,
+            classes: classes.map(|c| rel(&c)),
+            ..Default::default()
+        }],
+    );
+    let mut msg = describe_outcomes(&out);
+    if req.family != ModelFamilyKind::Auto {
+        msg.push_str(&format!(" (family {})", req.family));
+    }
+    Ok(msg)
+}
+
 fn describe_outcomes(out: &[crate::download::AddOutcome]) -> String {
     out.iter()
         .map(|o| match o {
@@ -1234,4 +1452,255 @@ pub fn queue_needs(ctx: &ResourcesCtx, config: &Config) -> Vec<String> {
             title
         })
         .collect()
+}
+
+#[cfg(test)]
+mod custom_model_tests {
+    use super::*;
+    use crate::config::ModelConfig;
+
+    struct Dirs {
+        root: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl Drop for Dirs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.outside);
+        }
+    }
+
+    fn setup() -> (Dirs, Config) {
+        let base = std::env::temp_dir().join(format!("bop-custom-{}", uuid::Uuid::new_v4()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let config = Config {
+            download_dir: Some(root.clone()),
+            ..Default::default()
+        };
+        (
+            Dirs {
+                root: base,
+                outside,
+            },
+            config,
+        )
+    }
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    fn req(path: &Path) -> CustomModel {
+        CustomModel {
+            path: path.to_string_lossy().to_string(),
+            ..Default::default()
+        }
+    }
+
+    const YAML: &str = "names:\n- a\n- b\n";
+
+    #[test]
+    fn file_path_and_family() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("mine.onnx");
+        touch(&f);
+        let r = CustomModel {
+            family: ModelFamilyKind::RfDetr,
+            ..req(&f)
+        };
+        let msg = add_custom_model(&mut c, &r).unwrap();
+        assert!(
+            msg.contains("added 'mine'") && msg.contains("family rfdetr"),
+            "{msg}"
+        );
+        assert_eq!(c.models[0].path, f);
+        assert_eq!(c.models[0].family, ModelFamilyKind::RfDetr);
+        assert_eq!(c.models[0].classes, None);
+    }
+
+    #[test]
+    fn dir_with_one_model_and_onnx_preferred() {
+        let (d, mut c) = setup();
+        touch(&d.outside.join("x.onnx"));
+        touch(&d.outside.join("x.xml"));
+        touch(&d.outside.join("x.bin"));
+        add_custom_model(&mut c, &req(&d.outside)).unwrap();
+        assert_eq!(c.models[0].path, d.outside.join("x.onnx"));
+    }
+
+    #[test]
+    fn dir_with_two_stems_conflicts() {
+        let (d, mut c) = setup();
+        touch(&d.outside.join("a.onnx"));
+        touch(&d.outside.join("b.onnx"));
+        let e = add_custom_model(&mut c, &req(&d.outside)).unwrap_err();
+        assert!(matches!(e, ActionError::Conflict(_)), "{e}");
+        assert!(e.message().contains("a.onnx") && e.message().contains("file"));
+    }
+
+    #[test]
+    fn onnx_subdir_is_scanned() {
+        let (d, mut c) = setup();
+        touch(&d.outside.join("onnx/model.onnx"));
+        add_custom_model(&mut c, &req(&d.outside)).unwrap();
+        assert_eq!(c.models[0].path, d.outside.join("onnx/model.onnx"));
+        assert_eq!(c.models[0].effective_name(), "model");
+    }
+
+    #[test]
+    fn missing_and_empty_dir_not_found() {
+        let (d, mut c) = setup();
+        let e = add_custom_model(&mut c, &req(&d.outside.join("nope.onnx"))).unwrap_err();
+        assert!(matches!(e, ActionError::NotFound(_)));
+        let e = add_custom_model(&mut c, &req(&d.outside)).unwrap_err();
+        assert!(matches!(e, ActionError::NotFound(_)));
+        assert!(e.message().contains("no .onnx or .xml model"));
+        let e = add_custom_model(&mut c, &req(Path::new("  "))).unwrap_err();
+        assert_eq!(e.status(), 400);
+    }
+
+    #[test]
+    fn xml_needs_bin() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("ir.xml");
+        touch(&f);
+        let e = add_custom_model(&mut c, &req(&f)).unwrap_err();
+        assert!(matches!(e, ActionError::NotFound(_)), "{e}");
+        touch(&d.outside.join("ir.bin"));
+        add_custom_model(&mut c, &req(&f)).unwrap();
+    }
+
+    #[test]
+    fn wrong_extension_rejected() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("notes.txt");
+        touch(&f);
+        assert_eq!(
+            add_custom_model(&mut c, &req(&f)).unwrap_err().status(),
+            400
+        );
+    }
+
+    #[test]
+    fn quoted_path() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("q.onnx");
+        touch(&f);
+        for q in ['"', '\''] {
+            let mut c2 = c.clone();
+            let r = CustomModel {
+                path: format!("  {q}{}{q} ", f.display()),
+                ..Default::default()
+            };
+            add_custom_model(&mut c2, &r).unwrap();
+        }
+        add_custom_model(&mut c, &req(&f)).unwrap();
+    }
+
+    #[test]
+    fn duplicates_conflict() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("one.onnx");
+        let g = d.outside.join("sub/two.onnx");
+        touch(&f);
+        touch(&g);
+        add_custom_model(&mut c, &req(&f)).unwrap();
+        // Same name, other file.
+        let r = CustomModel {
+            name: Some("ONE".into()),
+            ..req(&g)
+        };
+        let e = add_custom_model(&mut c, &r).unwrap_err();
+        assert!(matches!(e, ActionError::Conflict(_)));
+        assert!(
+            e.message().contains("a model named 'ONE' is already"),
+            "{e}"
+        );
+        // Same file, other name.
+        let r = CustomModel {
+            name: Some("other".into()),
+            ..req(&f)
+        };
+        let e = add_custom_model(&mut c, &r).unwrap_err();
+        assert!(matches!(e, ActionError::Conflict(_)));
+        assert!(
+            e.message().contains("already in the config as 'one'"),
+            "{e}"
+        );
+        assert_eq!(c.models.len(), 1);
+    }
+
+    #[test]
+    fn classes_validation_and_discovery() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("m.onnx");
+        touch(&f);
+        let bad = d.outside.join("bad.yaml");
+        std::fs::write(&bad, "foo: 1\n").unwrap();
+        let r = CustomModel {
+            classes: Some(bad.to_string_lossy().to_string()),
+            ..req(&f)
+        };
+        let e = add_custom_model(&mut c, &r).unwrap_err();
+        assert_eq!(e.status(), 400);
+        assert!(
+            e.message().contains("NAMES") || e.message().contains("names"),
+            "{e}"
+        );
+        assert!(c.models.is_empty());
+
+        std::fs::write(d.outside.join("data.yaml"), YAML).unwrap();
+        add_custom_model(&mut c, &req(&f)).unwrap();
+        assert_eq!(c.models[0].classes, Some(d.outside.join("data.yaml")));
+    }
+
+    #[test]
+    fn sidecar_wins_over_data_yaml() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("m.onnx");
+        touch(&f);
+        std::fs::write(d.outside.join("m.yaml"), YAML).unwrap();
+        std::fs::write(d.outside.join("data.yaml"), YAML).unwrap();
+        add_custom_model(&mut c, &req(&f)).unwrap();
+        assert_eq!(c.models[0].classes, None);
+    }
+
+    #[test]
+    fn paths_relative_to_data_root() {
+        let (d, mut c) = setup();
+        touch(&d.root.join("root/models/in.onnx"));
+        touch(&d.outside.join("out.onnx"));
+        std::fs::write(d.root.join("root/models/in.yaml"), YAML).unwrap();
+        let r = CustomModel {
+            classes: Some("models/in.yaml".into()),
+            ..req(Path::new("models/in.onnx"))
+        };
+        add_custom_model(&mut c, &r).unwrap();
+        assert_eq!(c.models[0].path, PathBuf::from("models/in.onnx"));
+        assert_eq!(c.models[0].classes, Some(PathBuf::from("models/in.yaml")));
+        add_custom_model(&mut c, &req(&d.outside.join("out.onnx"))).unwrap();
+        assert_eq!(c.models[1].path, d.outside.join("out.onnx"));
+        let _: &ModelConfig = &c.models[1];
+    }
+
+    #[test]
+    fn invalid_names_rejected() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("n.onnx");
+        touch(&f);
+        for bad in ["a/b", "a\\b", "a?b", "a#b", "a\nb"] {
+            let r = CustomModel {
+                name: Some(bad.into()),
+                ..req(&f)
+            };
+            let e = add_custom_model(&mut c, &r).unwrap_err();
+            assert_eq!(e.status(), 400, "{bad}");
+        }
+        assert!(c.models.is_empty());
+    }
 }
