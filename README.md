@@ -594,6 +594,7 @@ Put models in `deploy/models` and a `blue_onyx_prism_config.json` in `deploy/con
 | POST | `/v1/vision/custom/{model}` | same, named model |
 | POST, GET | `/v1/vision/custom/list` | configured model names |
 | POST | `/v1/models/add` | add a custom model by file or directory path to the config (`path`, `name`, `family`, `classes`) |
+| GET | `/v1/fs/browse` | read-only file browser behind the Config page's *Browse...* buttons: `?path=<dir>&kind=model` or `classes`; lists only folders and `.onnx`/`.xml` (or `.yaml`/`.yml`) files of the machine running the service |
 | GET | `/v1/status/updateavailable` | GitHub release check |
 | GET | `/`, `/stats`, `/stats.json`, `/prometheus` | UI and metrics |
 | GET | `/logs`, `/logs.json?after=<seq>&level=<min>` | log page; recent log events newer than `after` at `level` (`trace`..`error`) or more severe, with `last` as the next cursor |

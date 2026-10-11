@@ -167,7 +167,7 @@
   <div id="resource-custom-model" data-id="custom-model">
   {% if at_row == "custom-model" %}{% call notices("resources-row") %}{% endcall %}{% endif %}
   <form method="post" action="/v1/models/add#resource-custom-model" class="grid" data-ajax>
-    <label>Path <input type="text" name="path" required placeholder="C:\models\my-rfdetr\inference_model.onnx" autocomplete="off"></label>
+    <label>Path <span class="with-browse"><input type="text" name="path" required placeholder="{{ model_path_example }}" autocomplete="off"><button type="button" class="browse" data-browse="model" data-target="path" hidden>Browse&hellip;</button></span></label>
     <label>Name (optional) <input type="text" name="name" placeholder="default: file name" autocomplete="off"></label>
     <label>Family
       <select name="family">
@@ -175,9 +175,9 @@
       {% for f in family_choices %}<option value="{{ f.value }}">{{ f.label }}</option>{% endfor %}
       </select>
     </label>
-    <label>Classes YAML (optional) <input type="text" name="classes" placeholder="default: &lt;model&gt;.yaml beside it" autocomplete="off"></label>
+    <label>Classes YAML (optional) <span class="with-browse"><input type="text" name="classes" placeholder="default: &lt;model&gt;.yaml beside it" autocomplete="off"><button type="button" class="browse" data-browse="classes" data-target="classes" hidden>Browse&hellip;</button></span></label>
     <div class="actions"><button type="submit">Add to config</button></div>
-    <p class="muted">A <code>.onnx</code> / <code>.xml</code> file, or the directory holding one, on the machine running the service; relative paths are under <code>{{ data_root }}</code>. Fine-tuned RF-DETR: choose <code>rfdetr</code>. Classes: a YAML with a names list (default: <code>&lt;model&gt;.yaml</code> beside it, then COCO-80). Restart to load.</p>
+    <p class="muted">A <code>.onnx</code> / <code>.xml</code> file, or the directory holding one, on the machine running the service (Browse&hellip; lists that machine's folders, not the browser's); relative paths are under <code>{{ data_root }}</code>. Fine-tuned RF-DETR: choose <code>rfdetr</code>. Classes: a YAML with a names list (default: <code>&lt;model&gt;.yaml</code> beside it, then COCO-80). Restart to load.</p>
   </form>
   </div>
   <p class="muted">Ultralytics YOLO (AGPL-3.0), RF-DETR large and DEIMv2 (non-commercial / personal use only) are not downloadable as ONNX: use Export in the <a href="#res-models-export">exported models</a> section, or export by hand with <code>scripts/export_model.py --out-dir "{{ models_dir }}"</code> (see the README); other model files show up under Local models. The NVIDIA CUDA/cuDNN libraries (for <code>ort:cuda</code> without a CUDA 12 / cuDNN 9 install) are covered by NVIDIA's license.</p>
@@ -241,6 +241,87 @@
   <div id="pending-box"{% if pending.is_empty() %} hidden{% endif %}><p class="muted">Saved but not running yet (a restart applies):</p>
   <ul id="pending-list">{% for p in pending %}<li>{{ p }}</li>{% endfor %}</ul></div>
 </form>
+<dialog id="browse-dialog">
+  <h3 id="browse-title">Choose a model file or folder</h3>
+  <div class="browse-bar">
+    <select id="browse-roots" aria-label="Places"></select>
+    <button type="button" id="browse-up" class="small">Up</button>
+  </div>
+  <div id="browse-path" class="browse-path"></div>
+  <div id="browse-list" class="browse-list"></div>
+  <p id="browse-msg" class="muted" role="status"></p>
+  <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
+</dialog>
+<script>
+// Server-side file browser for the Path / Classes inputs (GET /v1/fs/browse).
+(function () {
+  var dlg = document.getElementById("browse-dialog");
+  if (!window.fetch || !dlg || typeof dlg.showModal !== "function") return;
+  var $ = function (id) { return document.getElementById(id); };
+  var list = $("browse-list"), pathEl = $("browse-path"), msg = $("browse-msg"), roots = $("browse-roots");
+  var up = $("browse-up"), use = $("browse-use"), title = $("browse-title");
+  var kind = "model", target = null, cur = null, seq = 0;
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function pick(path) {
+    target.value = path;
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+    dlg.close();
+    target.focus();
+  }
+  function render(j) {
+    cur = j;
+    pathEl.textContent = j.path;
+    msg.textContent = j.truncated ? "Only the first entries are shown." : (j.entries.length ? "" : "Nothing to choose here.");
+    up.disabled = !j.parent;
+    up.dataset.path = j.parent || "";
+    roots.textContent = "";
+    var here = el("option", null, "Places\u2026"); here.value = ""; roots.appendChild(here);
+    j.roots.forEach(function (r) { var o = el("option", null, r.label + "  " + r.path); o.value = r.path; roots.appendChild(o); });
+    roots.value = "";
+    use.hidden = kind !== "model";
+    list.textContent = "";
+    var sel = null;
+    j.entries.forEach(function (e) {
+      var b = el("button", "browse-item" + (e.dir ? " dir" : " file"));
+      b.type = "button";
+      b.appendChild(el("span", "browse-name", (e.dir ? "\uD83D\uDCC1 " : "") + e.name));
+      b.appendChild(el("span", "browse-size", e.dir ? "" : e.sizeText));
+      if (!e.dir && j.selected === e.name) { b.classList.add("selected"); sel = b; }
+      b.addEventListener("click", function () { if (e.dir) go(e.path, false); else pick(e.path); });
+      list.appendChild(b);
+    });
+    if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: "nearest" });
+  }
+  function go(path, retry) {
+    var n = ++seq;
+    var url = "/v1/fs/browse?kind=" + encodeURIComponent(kind) + (path ? "&path=" + encodeURIComponent(path) : "");
+    fetch(url, { headers: { Accept: "application/json" } }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, body: j }; });
+    }).then(function (res) {
+      if (n !== seq) return;
+      if (res.status === 200) { render(res.body); if (retry) msg.textContent = retry; return; }
+      var m = (res.body && res.body.message) || "Cannot list that folder.";
+      if (res.status === 404 && path) { go("", m); return; }
+      msg.textContent = m;
+    }).catch(function () { if (n === seq) msg.textContent = "Cannot reach the server."; });
+  }
+  document.querySelectorAll("button.browse").forEach(function (b) {
+    b.hidden = false;
+    b.addEventListener("click", function () {
+      kind = b.dataset.browse === "classes" ? "classes" : "model";
+      target = b.form.elements[b.dataset.target];
+      title.textContent = kind === "classes" ? "Choose a classes YAML" : "Choose a model file or folder";
+      list.textContent = ""; msg.textContent = "Loading\u2026";
+      dlg.showModal();
+      go(target.value.trim(), "");
+    });
+  });
+  roots.addEventListener("change", function () { if (roots.value) go(roots.value, false); });
+  up.addEventListener("click", function () { if (up.dataset.path) go(up.dataset.path, false); });
+  use.addEventListener("click", function () { if (cur) pick(cur.path); });
+  $("browse-cancel").addEventListener("click", function () { dlg.close(); });
+})();
+</script>
 <script>
 // Confirmation for large downloads and removals (without JS the button label shows the size).
 // Delegated: the Resources section is re-rendered in place.
