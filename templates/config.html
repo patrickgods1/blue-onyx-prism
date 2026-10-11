@@ -66,7 +66,7 @@
     <td class="model-thr"><input type="number" data-key="model:confidence_threshold:{{ m.key }}" name="threshold.{{ m.name }}" min="0" max="1" step="0.01" value="{{ m.threshold }}" placeholder="{{ global_threshold }}" aria-label="Confidence threshold of {{ m.name }} (empty = global)">
       <span class="thr-hint">{% if let Some(t) = m.best_threshold %}<br><span class="muted">benchmark best {{ t.0 }} ({{ t.1 }})</span>{% if let Some(st) = t.2 %} <span class="muted">{{ st }}</span>{% else %} <button type="button" class="small" data-use-threshold="{{ t.0 }}" title="Put {{ t.0 }} in the threshold field (then save)">use</button>{% endif %}{% endif %}</span></td>
     <td class="running st-{{ m.running_class }}">{{ m.running }}</td>
-    <td><code>{{ m.path }}</code>{% if !m.exists %}{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-yolo26" title="{{ x }}: exported on this machine on request (AGPL-3.0)">export it</a>{% else %} <span class="muted">(missing)</span>{% endif %}{% endif %}</td>
+    <td><code>{{ m.path }}</code>{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-export" title="{{ x }}: exported on this machine on request">export it</a>{% else if !m.exists %} <span class="muted">(missing)</span>{% endif %}</td>
   </tr>
   {% endfor %}
   </tbody>
@@ -94,7 +94,7 @@
   {% if !resources_enabled %}<p class="muted">This server has no download manager; use <code>blue-onyx-prism fetch</code>.</p>{% endif %}
   {% for g in resource_groups %}
   <h3 id="res-{{ g.key }}">{{ g.title }}</h3>
-  {% if g.key == "models-yolo26" %}<p class="muted">{{ yolo26_notice }} Export makes <code>&lt;name&gt;.onnx</code> + <code>.yaml</code> in <code>{{ models_dir }}</code> (runs on OpenVINO and ONNX Runtime incl. CoreML); the toolchain lives in <code>{{ tools_dir }}</code> (remove it with <em>Remove export toolchain</em>). Nothing is exported automatically. CLI: <code>blue-onyx-prism fetch --resource model:yolo26s --allow-large</code>; by hand: <code>scripts/export_yolo26.py</code>.</p>{% endif %}
+  {% if g.key == "models-export" %}<p class="muted">{{ export_notice }} Export makes <code>&lt;name&gt;.onnx</code> + <code>.yaml</code> in <code>{{ models_dir }}</code> (runs on OpenVINO and ONNX Runtime incl. CoreML); the toolchain lives in <code>{{ tools_dir }}</code> (remove it with <em>Remove export toolchain</em>). Nothing is exported automatically. CLI: <code>blue-onyx-prism fetch --resource model:yolo11s --allow-large</code>; by hand: <code>scripts/export_model.py</code>.</p>{% endif %}
   <div class="scroll">
   <table class="resources">
   <thead><tr><th>Resource</th><th>Size</th><th>State</th><th>Action</th></tr></thead>
@@ -163,7 +163,7 @@
   </table>
   </div>
   {% endif %}
-  <p class="muted">YOLO26 is not downloadable (the weights are AGPL-3.0): use Export in the <a href="#res-models-yolo26">YOLO26</a> section, or export by hand with <code>scripts/export_yolo26.py --out-dir "{{ models_dir }}"</code> (see the README); other model files show up under Local models. The NVIDIA CUDA/cuDNN libraries (for <code>ort:cuda</code> without a CUDA 12 / cuDNN 9 install) are covered by NVIDIA's license.</p>
+  <p class="muted">Ultralytics YOLO (AGPL-3.0), RF-DETR large and DEIMv2 (non-commercial / personal use only) are not downloadable as ONNX: use Export in the <a href="#res-models-export">exported models</a> section, or export by hand with <code>scripts/export_model.py --out-dir "{{ models_dir }}"</code> (see the README); other model files show up under Local models. The NVIDIA CUDA/cuDNN libraries (for <code>ort:cuda</code> without a CUDA 12 / cuDNN 9 install) are covered by NVIDIA's license.</p>
 </section>
 
 <div id="at-server" class="anchor"></div>

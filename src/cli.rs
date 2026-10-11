@@ -64,9 +64,10 @@ pub enum Command {
         #[arg(long)]
         for_config: bool,
         /// Resource id (repeatable), e.g. `openvino-runtime`, `onnxruntime-cuda`,
-        /// `nvidia-cuda-libs`, `model:IPcam-general`. See `list-resources`. `model:yolo26<n|s|m|l|x>`
-        /// exports YOLO26 on this machine (AGPL-3.0; sets up a pinned uv + Python toolchain in
-        /// `<data root>/tools` the first time, which needs --allow-large).
+        /// `nvidia-cuda-libs`, `model:IPcam-general`. See `list-resources`. Exportable models
+        /// (`model:yolov8n`, `model:yolo26s`, `model:rfdetr-large`, `model:deimv2-n`, ...) are
+        /// exported on this machine (sets up a pinned uv + Python toolchain in `<data root>/tools`
+        /// the first time, which needs --allow-large).
         #[arg(long)]
         resource: Vec<String>,
         /// Every resource available for this platform (large ones need --allow-large).

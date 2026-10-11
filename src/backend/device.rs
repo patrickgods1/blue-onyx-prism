@@ -343,14 +343,41 @@ fn make_static(
     Ok(true)
 }
 
+/// The CPU plugin's own `INFERENCE_PRECISION_HINT` (f16 on ARM, f32 / bf16 on x86), read before
+/// the first change so later models get it back.
+static CPU_DEFAULT_PRECISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// CPU: f32 for models that need it ([`crate::resources::catalog::F32_MODELS`]); otherwise the
+/// plugin default, restored if an earlier model changed it (the hint is a Core-wide setting).
+fn set_cpu_precision(core: &mut openvino::Core, dt: &DeviceType, needs_f32: bool) {
+    if !needs_f32 && CPU_DEFAULT_PRECISION.get().is_none() {
+        return;
+    }
+    let default = CPU_DEFAULT_PRECISION.get_or_init(|| {
+        core.get_property(dt, &PropertyKey::Rw(RwPropertyKey::HintInferencePrecision))
+            .unwrap_or_else(|_| "f32".to_string())
+    });
+    let want = if needs_f32 { "f32" } else { default.as_str() };
+    match core_set_property(core, dt, &RwPropertyKey::HintInferencePrecision, want) {
+        Ok(()) => tracing::info!("OpenVINO {dt}: INFERENCE_PRECISION_HINT={want}"),
+        Err(e) => {
+            tracing::warn!("OpenVINO {dt}: failed to set INFERENCE_PRECISION_HINT={want}: {e}")
+        }
+    }
+}
+
 fn compile_on(
     core: &mut openvino::Core,
     model: &Model,
     device: &str,
     gpu_precision: &str,
+    needs_f32: bool,
     path: &std::path::Path,
 ) -> Result<openvino::CompiledModel> {
     let dt = DeviceType::from(device);
+    if device.eq_ignore_ascii_case("CPU") {
+        set_cpu_precision(core, &dt, needs_f32);
+    }
     if device.to_ascii_uppercase().starts_with("GPU") {
         core_set_property(
             core,
@@ -441,13 +468,18 @@ pub fn load_model(
         );
         primary = intel;
     }
+    // Models whose activations overflow f16 (DEIMv2 L/X, RF-DETR L) default to f32.
+    let needs_f32 = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(crate::resources::catalog::needs_f32);
     let precision = req
         .gpu_precision
         .as_deref()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or("f16")
+        .unwrap_or(if needs_f32 { "f32" } else { "f16" })
         .to_ascii_lowercase();
-    let compiled = compile_on(core, &model, &primary, &precision, path)?;
+    let compiled = compile_on(core, &model, &primary, &precision, needs_f32, path)?;
     let actual = primary;
     let compile_ms = t0.elapsed().as_millis() as u64;
     let device = DeviceInfo {

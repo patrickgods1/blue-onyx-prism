@@ -1,6 +1,6 @@
 //! `fetch` and `list-resources` subcommands, on top of the resolver and the download manager.
-//! `fetch --resource model:yolo26<size>` runs the YOLO26 export ([`super::export`]) instead of a
-//! download.
+//! `fetch --resource model:<name>` of an exportable model (`yolov8n`, `rfdetr-large`, `deimv2-s`,
+//! ...) runs the model export ([`super::export`]) instead of a download.
 
 use super::catalog::{self, Resource, ResourceKind};
 use super::manager::{self, Job, ManagerOptions};
@@ -96,7 +96,7 @@ pub fn fetch_jobs(
     if req.all_for_platform {
         let auto = crate::setup_onnxruntime::auto_flavor(hw);
         // Benchmark image sets are not part of a deployment; name them (`bench:<id>`) to fetch.
-        // YOLO26 exports (and their toolchain) run code: only when named.
+        // Model exports (and their toolchain) run code: only when named.
         for res in catalog::for_platform(&hw.os, &hw.arch).filter(|r| {
             !matches!(
                 r.kind,
@@ -128,7 +128,7 @@ fn job_for(res: &'static Resource, root: &Path, models_dir: &Path, activate: boo
     }
 }
 
-/// Exportable models named in `req` (`model:yolo26s`).
+/// Exportable models named in `req` (`model:yolo26s`, `model:deimv2-n`).
 pub fn requested_exports(req: &FetchRequest, os: &str, arch: &str) -> Vec<&'static Resource> {
     let mut out: Vec<&'static Resource> = Vec::new();
     for id in &req.resources {
@@ -168,14 +168,17 @@ pub fn export_model(config: &Config, res: &'static Resource, allow_large: bool) 
                 )
             });
         bail!(
-            "exporting {} first sets up the export toolchain in {}{cost} and runs Ultralytics' \
-             exporter ({}); pass --allow-large to go ahead",
+            "exporting {} first sets up the export toolchain in {}{cost} and runs {} ({}); pass \
+             --allow-large to go ahead",
             res.id,
             paths.tools.display(),
-            catalog::YOLO26_LICENSE
+            catalog::export_recipe(res).map_or("the exporter", |r| r.exporter()),
+            res.license
         );
     }
-    println!("note: {}", catalog::YOLO26_NOTICE);
+    if let Some(r) = catalog::export_recipe(res) {
+        println!("note: {}", r.notice());
+    }
     println!(
         "Exporting {} into {} (toolchain in {}):",
         res.title,
@@ -190,9 +193,13 @@ pub fn export_model(config: &Config, res: &'static Resource, allow_large: bool) 
         &fetcher,
         true,
     )?;
+    let family = match res.provides {
+        catalog::Provides::Model { family, .. } => family.to_string(),
+        _ => "auto".to_string(),
+    };
     println!(
         "Exported {} in {:.0} s: {} and {} ({} classes). Add it on the Config page (Add to \
-         config) or to `models`: {{\"name\": \"{}\", \"path\": \"models/{}\", \"family\": \"yolo26\"}}",
+         config) or to `models`: {{\"name\": \"{}\", \"path\": \"models/{}\", \"family\": \"{family}\"}}",
         res.title,
         started.elapsed().as_secs_f64(),
         out.onnx.display(),
@@ -208,7 +215,7 @@ pub fn export_model(config: &Config, res: &'static Resource, allow_large: bool) 
 }
 
 /// Run `fetch`: resolve, download with progress bars, mark the wanted ORT flavor active, then run
-/// the YOLO26 exports that were named.
+/// the model exports that were named.
 pub fn fetch(config: &Config, req: &FetchRequest) -> Result<()> {
     let root = resolve::download_root(config);
     let hw = crate::backend::detect::hardware();
@@ -367,10 +374,14 @@ pub fn model_files(res: &Resource, dir: &Path) -> Vec<PathBuf> {
     res.parts.iter().map(|p| dir.join(p.file_name)).collect()
 }
 
+/// Largest response [`remote_size`] counts byte by byte when the server sends no size.
+const COUNT_BODY_MAX: u64 = 64 * 1024 * 1024;
+
 /// Total size a server reports for `url`: `Content-Range: bytes 0-0/<total>` of a one-byte
-/// range request, else `Content-Length` when the range is ignored.
+/// range request, else `Content-Length` when the range is ignored, else (streamed responses such
+/// as GitHub source archives) the length of the body, up to [`COUNT_BODY_MAX`].
 async fn remote_size(client: &reqwest::Client, url: &str) -> Result<u64> {
-    let resp = client
+    let mut resp = client
         .get(url)
         .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
@@ -382,10 +393,17 @@ async fn remote_size(client: &reqwest::Client, url: &str) -> Result<u64> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.rsplit('/').next())
         .and_then(|v| v.trim().parse::<u64>().ok());
-    match total.or(resp.content_length()) {
-        Some(n) => Ok(n),
-        None => bail!("no size in the response"),
+    if let Some(n) = total.or(resp.content_length()) {
+        return Ok(n);
     }
+    let mut n = 0u64;
+    while let Some(chunk) = resp.chunk().await? {
+        n += chunk.len() as u64;
+        if n > COUNT_BODY_MAX {
+            bail!("no size in the response (and the body is over {COUNT_BODY_MAX} bytes)");
+        }
+    }
+    Ok(n)
 }
 
 /// `list-resources --check-urls`: every distinct catalog URL (all platforms) must answer with

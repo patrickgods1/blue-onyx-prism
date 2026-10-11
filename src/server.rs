@@ -1017,9 +1017,9 @@ async fn resources_add_to_config(
     action_response(&state, &headers, &id, result)
 }
 
-/// `POST /v1/resources/export` (`id` of a YOLO26 model, `confirm_large` when the export
+/// `POST /v1/resources/export` (`id` of an exportable model, `confirm_large` when the export
 /// toolchain is not installed yet, `add_to_config` to append it to `models` when done): queues the
-/// export (one at a time). It runs Ultralytics' exporter locally; see `resources::export`.
+/// export (one at a time). It runs the model's exporter locally; see `resources::export`.
 async fn resources_export(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1346,7 +1346,7 @@ struct ModelSelectRow {
     /// Best confidence threshold of the latest benchmark: (value "0.35", objective "f1",
     /// "in use" / "configured; restart to use" when it is the configured threshold).
     best_threshold: Option<(String, String, Option<&'static str>)>,
-    /// The file is missing and made by exporting this resource (`model:yolo26s`).
+    /// The file is missing (or outdated) and made by exporting this resource (`model:yolo26s`).
     needs_export: Option<String>,
 }
 
@@ -1471,13 +1471,9 @@ fn model_choices(
                 Some((format!("{t:.2}"), f.objective.clone(), state))
             });
             let exists = c.data_path(&m.path).is_file();
-            let needs_export = (!exists
-                && m.path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("onnx")))
-            .then(|| crate::resources::catalog::export_model(&m.path.to_string_lossy()))
-            .flatten()
-            .map(|r| r.id.to_string());
+            // Missing, or from another version (the old RF-DETR large download).
+            let needs_export = crate::resources::export::pending_export(&c.data_path(&m.path))
+                .map(|r| r.id.to_string());
             ModelSelectRow {
                 devices: model_device_choices(snap, m.device.as_deref(), &global),
                 key,
@@ -1524,12 +1520,12 @@ struct ConfigTemplate {
     /// Model files in `models_dir` that no config entry uses.
     local_models: Vec<crate::resources::status::LocalModel>,
     resources_enabled: bool,
-    /// Resolved `models_dir` (where YOLO26 exports go).
+    /// Resolved `models_dir` (where exported models go).
     models_dir: String,
-    /// Where the YOLO26 export toolchain lives (`<data root>/tools`).
+    /// Where the model export toolchain lives (`<data root>/tools`).
     tools_dir: String,
-    /// AGPL-3.0 notice shown with the YOLO26 group.
-    yolo26_notice: &'static str,
+    /// License notices of the export recipes, shown with the export group.
+    export_notice: String,
     force_cpu_note: Option<String>,
     /// One line about the `benchmark` config section and the last results.
     bench_summary: String,
@@ -1709,7 +1705,15 @@ fn config_template(
         local_models,
         models_dir,
         tools_dir,
-        yolo26_notice: crate::resources::catalog::YOLO26_NOTICE,
+        export_notice: [
+            crate::resources::catalog::ExportRecipe::Ultralytics,
+            crate::resources::catalog::ExportRecipe::RfDetr,
+            crate::resources::catalog::ExportRecipe::DeimV2,
+        ]
+        .iter()
+        .map(|r| r.notice())
+        .collect::<Vec<_>>()
+        .join(" "),
         force_cpu_note,
         resources_enabled: state.resources.is_some(),
         nav: "config",
@@ -3072,7 +3076,7 @@ mod tests {
             html.contains("Download 629 MB (large)"),
             "large button shows the size"
         );
-        assert!(html.contains("export_yolo26.py"));
+        assert!(html.contains("export_model.py"));
         assert!(html.contains("name=\"auto_download\" checked"));
         assert!(html.contains("name=\"allow_large_downloads\">"));
         // A browser download goes back to the page with a notice.
@@ -3402,8 +3406,28 @@ mod tests {
         let (state, root) = export_state(fake.clone());
         let j = resources(&state).await;
         let n = row(&j, "model:yolo26n");
-        assert_eq!(n["group"], "models-yolo26");
+        assert_eq!(n["group"], "models-export");
         assert_eq!(n["action"], "export");
+        // Every exportable model has an Export row; the DEIMv2 source is part of the toolchain.
+        for r in crate::resources::catalog::EXPORT_MODELS {
+            let e = row(&j, r.id);
+            assert_eq!(e["action"], "export", "{}", r.id);
+            assert_eq!(e["group"], "models-export", "{}", r.id);
+            assert!(e["confirm"].as_str().unwrap().contains(r.title), "{e}");
+        }
+        assert!(
+            !j["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == crate::resources::catalog::DEIMV2_SRC_ID)
+        );
+        let d = row(&j, "model:deimv2-n");
+        assert!(
+            d["confirm"].as_str().unwrap().contains("DEIMv2 code"),
+            "{d}"
+        );
+        assert_eq!(row(&j, "model:rfdetr-large")["license"], "Apache-2.0");
         assert_eq!(n["state"], "available", "{n}");
         assert_eq!(n["large"], true, "toolchain not installed yet");
         assert!(n["confirm"].as_str().unwrap().contains("AGPL-3.0"));
@@ -3502,7 +3526,7 @@ mod tests {
         // Remove export toolchain.
         let (s, b) = post_action(&state, "/v1/resources/remove", "id=tool%3Auv").await;
         assert_eq!(s, StatusCode::OK, "{b}");
-        assert!(!root.join("tools/yolo26-env").exists());
+        assert!(!root.join("tools/export-env").exists());
         assert!(!root.join("tools/uv").exists());
         let j = resources(&state).await;
         assert_eq!(row(&j, "tool:uv")["state"], "available");
@@ -3516,7 +3540,7 @@ mod tests {
             return;
         }
         let fake = Arc::new(crate::resources::export::fake::Fake {
-            hang_on: Some("export_yolo26.py"),
+            hang_on: Some("export_model.py"),
             ..crate::resources::export::fake::Fake::new()
         });
         let (state, root) = export_state(fake);
@@ -3561,12 +3585,12 @@ mod tests {
         assert_eq!(row(&j, "tool:uv")["removable"], false);
         let (_, html) = get_text(&state, "/config").await;
         assert!(
-            html.contains("YOLO26 (exported locally, AGPL-3.0)"),
+            html.contains("exported on this machine (Ultralytics YOLO, RF-DETR L, DEIMv2)"),
             "{html}"
         );
         assert!(html.contains("action=\"/v1/resources/export/cancel#resource-"));
         assert!(html.contains("needs export"), "Models card marks yolo26s");
-        assert!(html.contains("href=\"#res-models-yolo26\""));
+        assert!(html.contains("href=\"#res-models-export\""));
         assert!(html.contains("Remove export toolchain") || html.contains("an export is running"));
         let (s, b) = post_action(&state, "/v1/resources/remove", "id=tool%3Auv").await;
         assert_eq!(s, StatusCode::CONFLICT, "{b}");

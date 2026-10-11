@@ -7,9 +7,10 @@
 //! Rules:
 //! - **Models**: an enabled model whose file (or default `<stem>.yaml`) is missing and whose file
 //!   name matches a catalog model needs that model resource. A missing file that is not in the
-//!   catalog is reported in [`ModelPlan::error`]. A missing YOLO26 file is "needs export"
-//!   ([`ModelPlan::needs_export`]): it is never downloaded or exported automatically (exporting
-//!   runs Ultralytics' code and needs a click, see `super::export`).
+//!   catalog is reported in [`ModelPlan::error`]. A missing (or outdated) exported model file
+//!   (Ultralytics YOLO, RF-DETR L, DEIMv2) is "needs export" ([`ModelPlan::needs_export`]): it is
+//!   never downloaded or exported automatically (exporting runs downloaded code and needs a
+//!   click, see `super::export`).
 //! - **Runtimes**: each enabled model's device plan is computed with the real `select` /
 //!   `plan` code on a *hypothetical* probe in which every runtime that is installed **or
 //!   downloadable** for this platform is present. The candidates are walked in order and the
@@ -435,7 +436,10 @@ impl Resolver<'_> {
                     plan.needs_export = catalog::export_model(&m.path.to_string_lossy())
                         .filter(|r| export_produces(r, &m.path))
                         .map(|r| r.id);
-                    plan.error = Some(missing_model_message(&m.path));
+                    plan.error = Some(missing_model_message_for(
+                        &m.path,
+                        self.config.data_path(&m.path).is_file(),
+                    ));
                     self.out.models.push(plan);
                     return;
                 }
@@ -957,18 +961,25 @@ fn export_produces(res: &Resource, path: &Path) -> bool {
 
 /// Why a configured model file that is not downloadable is missing.
 pub fn missing_model_message(path: &Path) -> String {
+    missing_model_message_for(path, false)
+}
+
+/// [`missing_model_message`]; `outdated`: the file exists but is an older export / download of an
+/// exportable model (see `export::is_outdated`).
+fn missing_model_message_for(path: &Path, outdated: bool) -> String {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     if let Some(r) = catalog::export_model(&stem).filter(|r| export_produces(r, path)) {
-        super::export::needs_export_message(r, path)
-    } else if stem.starts_with("yolo26") {
+        super::export::needs_export_message(r, path, outdated)
+    } else if let Some(r) = catalog::export_model(&stem) {
         format!(
-            "model file {} not found; YOLO26 weights are AGPL-3.0 and cannot be downloaded: \
-             export them on the Config page (Resources, YOLO26; it writes {stem}.onnx, so point \
-             `path` at that) or with scripts/export_yolo26.py",
-            path.display()
+            "model file {} not found; {} is not downloadable: export it on the Config page \
+             (Resources, exported models; it writes {stem}.onnx, so point `path` at that) or with \
+             scripts/export_model.py",
+            path.display(),
+            r.title
         )
     } else {
         format!(
@@ -1061,10 +1072,12 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
         out.resources.insert(catalog::CUDA_LIBS_ID.to_string());
     }
 
-    // Model files, spelled as in the config.
+    // Model files, spelled as in the config. An exported model's file from another version (the
+    // old RF-DETR large download) does not count: it needs an export.
     for m in config.enabled_models() {
         for p in model_files(m) {
-            if config.data_path(&p).is_file() {
+            let abs = config.data_path(&p);
+            if abs.is_file() && super::export::pending_export(&abs).is_none() {
                 out.files.insert(p);
             }
         }

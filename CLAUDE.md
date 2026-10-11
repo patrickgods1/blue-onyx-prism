@@ -18,7 +18,7 @@ cargo run -- list-devices                    # runnable device options and the `
 cargo run -- download-models --name IPcam-general
 cargo run -- fetch [--for-config] [--resource <id>] [--all-for-platform] [--allow-large]   # pre-download what the config needs
 cargo run -- list-resources [--check-urls]   # installed / needed / available; --check-urls checks every pinned URL (weekly CI)
-cargo run -- fetch --resource model:yolo26s --allow-large   # on-demand YOLO26 export (pinned uv + Python env in <data root>/tools)
+cargo run -- fetch --resource model:yolo26s --allow-large   # on-demand model export (pinned uv + Python env in <data root>/tools)
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --force-cpu
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --device ort:cpu
 cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco-cctv|bmd45-cctv|exdark-night|dir:<p>] [--max-images 20]   # grade models x devices; benchmark.json next to the config
@@ -29,13 +29,18 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-On-demand YOLO26 export (`src/resources/export.rs`, the only code that runs downloaded programs; user-triggered
-only, never by `auto_download`): `tool:uv` + `scripts/yolo26-export/locks/*.txt` (hashed; regenerate with
-`scripts/yolo26-export/gen_locks.sh`) + the embedded `scripts/export_yolo26.py`; everything under `<data root>/tools/`.
+On-demand model export (`src/resources/export.rs`, the only code that runs downloaded programs; user-triggered
+only, never by `auto_download`): `tool:uv` + `scripts/model-export/locks/*.txt` (hashed; regenerate with
+`scripts/model-export/gen_locks.sh`) + the embedded `scripts/export_model.py`; everything under `<data root>/tools/`.
+Recipes (`catalog::ExportRecipe`): Ultralytics YOLOv8/9/10/11/12/26 (`.pt`, AGPL-3.0), RF-DETR L (transformers,
+safetensors, 704 px), DEIMv2 (official code `tool:deimv2-src` pinned to the last Apache-2.0 commit + safetensors; marked non-commercial / personal use, the upstream license now covers the weights);
+all offline, static-shape ONNX checked against PyTorch with ONNX Runtime, stamped with `COREML_CACHE_KEY` (ORT's
+CoreML cache is otherwise keyed by path). A manifest of another version = "needs export". `catalog::F32_MODELS`
+(RF-DETR L, DEIMv2 L/X) overflow f16: OpenVINO compiles them with f32 on CPU and GPU.
 
-Python export env (YOLO26 -> OpenVINO IR, by hand): `.venv` (Python 3.11, `ultralytics`, `openvino`),
-created with `uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt`;
-run `.venv/Scripts/python.exe scripts/export_yolo26.py` (Windows) or `.venv/bin/python scripts/export_yolo26.py`.
+Python export env (models -> ONNX + OpenVINO IR, by hand): `.venv` (Python 3.11, `ultralytics`, `openvino`,
+`transformers`), created with `uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt`;
+run `.venv/bin/python scripts/export_model.py --name yolo26s` (Windows: `.venv/Scripts/python.exe`).
 
 OpenVINO libs are discovered through `openvino-finder`: `OPENVINO_INSTALL_DIR` (Windows; on Unix
 `backend/libs.rs` loads `openvino_c` by path) pointing at `<download root>/openvino` when present, or the OS library path.
@@ -72,14 +77,14 @@ NPU are never auto. RT-DETR runs on CoreML only with every input dim pinned (a d
   warm-up, falling down the list, CPU last); `ort.rs` is the ONNX Runtime backend (all `ort` code lives here).
   `onnx_rewrite.rs`: `ort:coreml` loads a cached copy without HardSigmoid/HardSwish/opset<13 Split (protobuf wire-level, `cache/coreml/<stem>-<sha16>-v<N>.onnx`, `BOP_COREML_REWRITE=0` off).
   Also `GET /v1/devices` and the config-page device dropdown.
-- `src/model/` model families: `yolo26` (end-to-end `[1,300,6]`), `yolo5` (`[1,N,5+C]` + NMS),
-  `yolo8` (`[1,4+C,8400]` + NMS), `detr` (D-FINE: `pixel_values` -> `logits/pred_boxes`), `rfdetr` (same, ImageNet-normalized, COCO-91 head), `rtdetr` (`images` + i64 `orig_target_sizes`; `labels/boxes/scores`).
+- `src/model/` model families: `yolo26` (YOLO26/YOLOv10 end-to-end `[1,300,6]`), `yolo5` (`[1,N,5+C]` + NMS),
+  `yolo8` (YOLOv8/9/11/12 `[1,4+C,8400]` + NMS), `detr` (D-FINE: `pixel_values` -> `logits/pred_boxes`), `rfdetr` (same, ImageNet-normalized, COCO-91 head), `rtdetr` (RT-DETRv2, DEIMv2: `images` + i64 `orig_target_sizes`; `labels/boxes/scores`; input size from the model's static dims).
   Preprocess = letterbox (YOLO) or stretch (RT-DETR) to 640x640 RGB f32 0..1, CHW.
 - `src/resources/` on-demand resources: `catalog` (pins), `resolve` (pure needs from config + hardware +
   installed), `manager` (one download thread, Range resume, SHA-256, staging + atomic rename, `.installed.json`,
   `.downloads.lock`, backoff), `extract` (whitelist-only, nothing executed), `provision` (startup: models wait
   with progress; a new runtime starts a new registry generation), `status` (`/v1/resources` + UI actions),
-  `commands` (`fetch`, `list-resources`), `export` (YOLO26 export: stages uv -> Python -> packages -> weights ->
+  `commands` (`fetch`, `list-resources`), `export` (model export: stages uv -> Python -> packages -> weights ->
   export -> install, fake-able `CommandRunner`/`Fetcher`, one at a time, cancellable).
 - `src/config.rs` JSON config next to the exe; CLI overrides only non-default values and writes back.
   The server holds it in `config_store.rs` (revision + change log, detects edits on disk); every UI writer goes

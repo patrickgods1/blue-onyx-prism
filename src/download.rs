@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn catalog_shape() {
-        assert_eq!(catalog().len(), 21);
+        assert_eq!(catalog().len(), 20);
         for e in catalog() {
             // YOLOv5 / RT-DETRv2 ship a class file; D-FINE / RF-DETR use COCO-80.
             let detr = matches!(

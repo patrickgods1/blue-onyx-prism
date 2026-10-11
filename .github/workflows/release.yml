@@ -88,7 +88,7 @@ jobs:
               cp deploy/com.blueonyx.prism.plist "$STAGE/deploy/"
             fi
           fi
-          cp scripts/export_yolo26.py scripts/convert_onnx_to_ir.py scripts/requirements-export.txt "$STAGE/scripts/"
+          cp scripts/export_model.py scripts/convert_onnx_to_ir.py scripts/requirements-export.txt "$STAGE/scripts/"
           cp README.md LICENSE "$STAGE/"
           mkdir -p "$STAGE/models"
           "$OUT/blue-onyx-prism" setup-openvino --dest "$STAGE/openvino"

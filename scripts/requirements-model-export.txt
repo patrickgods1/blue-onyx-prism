@@ -1,0 +1,26 @@
+# Pinned Python packages for the on-demand model export (Config page "Export", or
+# `blue-onyx-prism fetch --resource model:<name>`): Ultralytics YOLO (v8/v9/v10/11/12/26), RF-DETR
+# (Hugging Face transformers) and DEIMv2 (official source, a pinned GitHub archive). ONNX only: no
+# OpenVINO Python package (the OpenVINO runtime reads the .onnx directly). Every release is at
+# least two weeks old.
+#
+# This is the input of the hashed per-platform locks in scripts/model-export/locks/, which the
+# service installs with `uv pip install --require-hashes --no-deps --only-binary :all:`. Regenerate
+# them after changing a pin with scripts/model-export/gen_locks.sh.
+#
+# torch / torchvision: CPU builds. On Linux and Windows they come from the PyTorch CPU index
+# (`--torch-backend cpu`, https://download.pytorch.org/whl/cpu) so the ~2 GB CUDA wheels are not
+# pulled; on macOS from PyPI.
+ultralytics==8.4.163
+torch==2.14.0
+torchvision==0.29.0
+onnx==1.22.0
+onnxslim==0.1.96
+# Ultralytics checks for onnxruntime when it simplifies the ONNX graph (and would otherwise try to
+# pip-install it); the export script also uses it to check the RF-DETR / DEIMv2 graphs.
+onnxruntime==1.29.0
+# RF-DETR (RfDetrForObjectDetection, safetensors) and DEIMv2 (safetensors) loading.
+transformers==5.17.0
+safetensors==0.8.0
+huggingface-hub==1.33.0
+pyyaml==6.0.3
