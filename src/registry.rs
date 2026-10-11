@@ -271,19 +271,15 @@ impl ModelRegistry {
                     // Class names are read after the files arrive (in the worker).
                     return Ok((device, Vec::new()));
                 }
+                // An exported model's file is made by a user-started export, never downloaded;
+                // a file from another version (the old RF-DETR large download) is not used.
+                if let Some(r) = crate::resources::export::pending_export(&path) {
+                    bail!(
+                        "{}",
+                        crate::resources::export::needs_export_message(r, &m.path, path.is_file())
+                    );
+                }
                 if !path.is_file() {
-                    // A YOLO26 file is made by a user-started export, never downloaded.
-                    if path
-                        .extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("onnx"))
-                        && let Some(r) =
-                            crate::resources::catalog::export_model(&path.to_string_lossy())
-                    {
-                        bail!(
-                            "{}",
-                            crate::resources::export::needs_export_message(r, &m.path)
-                        );
-                    }
                     bail!(
                         "model file not found: {} (download it with `download-models` or fix `path`)",
                         path.display()

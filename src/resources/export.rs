@@ -1,32 +1,41 @@
-//! On-demand YOLO26 export: **the one place in Blue Onyx Prism that executes downloaded code.**
+//! On-demand model export: **the one place in Blue Onyx Prism that executes downloaded code.**
 //!
 //! Everything else the service downloads is data (libraries are loaded, never run as programs;
-//! archives are extracted by whitelist). YOLO26 weights are AGPL-3.0 and cannot be redistributed,
-//! so the only way to offer them is to fetch Ultralytics' official weights and run Ultralytics'
-//! exporter on the user's machine. That is a deliberate exception with these limits:
+//! archives are extracted by whitelist). Some models are only published as PyTorch weights:
+//! Ultralytics YOLO (AGPL-3.0, cannot be redistributed), RF-DETR L and DEIMv2 (safetensors). The
+//! only way to offer them is to fetch the official weights and export them to ONNX on the user's
+//! machine ([`catalog::ExportRecipe`]: Ultralytics' exporter, transformers + `torch.onnx`, or the
+//! official DEIMv2 code + `torch.onnx`). That is a deliberate exception with these limits:
 //!
-//! - **User-triggered only**: the Config page's Export button (with a confirm naming the size and
-//!   the AGPL-3.0 license) or `blue-onyx-prism fetch --resource model:yolo26<size>`. A config entry
-//!   pointing at a missing YOLO26 file is reported as "needs export"; `auto_download` never
+//! - **User-triggered only**: the Config page's Export button (with a confirm naming the model and
+//!   its license) or `blue-onyx-prism fetch --resource model:<name>`. A config entry pointing at a
+//!   missing (or outdated) exported file is reported as "needs export"; `auto_download` never
 //!   exports.
 //! - **Pinned toolchain**: `tool:uv` (catalog, SHA-256 checked), Python 3.11 installed by that uv,
-//!   and the packages of `scripts/yolo26-export/locks/*.txt`, installed with
+//!   and the packages of `scripts/model-export/locks/*.txt`, installed with
 //!   `--require-hashes --no-deps --only-binary :all:` (every wheel hash-checked, nothing built from
 //!   source). On Linux and Windows torch comes from the PyTorch CPU index.
-//! - **Pinned weights**: the catalog's `.pt` part, downloaded and verified by the download manager.
-//! - **Pinned script**: `scripts/export_yolo26.py`, embedded in the binary, run as
-//!   `python -u -I` with `YOLO_OFFLINE=1` and `YOLO_AUTOINSTALL=false` (Ultralytics neither reaches
-//!   the network nor pip-installs anything) and its settings in our own `YOLO_CONFIG_DIR`.
+//! - **Pinned weights and code**: the catalog's parts (`.pt`, or `model.safetensors` +
+//!   `config.json`) downloaded and verified by the download manager into
+//!   `tools/export-weights/<name>/`; for DEIMv2 also `tool:deimv2-src`, the official source at a
+//!   pinned commit (SHA-256 checked GitHub archive, only `engine/**/*.py` and `configs/**/*.yml`
+//!   extracted).
+//! - **Pinned script**: `scripts/export_model.py`, embedded in the binary, run as `python -u -I`
+//!   offline: `YOLO_OFFLINE=1`, `YOLO_AUTOINSTALL=false`, `HF_HUB_OFFLINE=1`,
+//!   `TRANSFORMERS_OFFLINE=1` (nothing reaches the network or pip-installs anything), with its
+//!   settings and caches in our own `tools/export-config`.
 //! - **Contained**: everything lives under `<data root>/tools/` (see [`Paths`]); "Remove export
-//!   toolchain" deletes it. Inherited `PYTHON*`, `UV_*`, `PIP_*`, `CONDA_*`, `VIRTUAL_ENV` and
-//!   `YOLO_*` variables are dropped, uv runs with `--no-config`.
+//!   toolchain" deletes it. Inherited `PYTHON*`, `UV_*`, `PIP_*`, `CONDA_*`, `VIRTUAL_ENV`,
+//!   `YOLO_*`, `HF_*`, `TRANSFORMERS_*` and `TORCH_*` variables are dropped, uv runs with
+//!   `--no-config`.
 //! - Child processes run with captured output (streamed into the log), a timeout per stage and
 //!   cancellation (the child is killed). One export at a time ([`Exporter`] queues the rest; a
 //!   lock file serializes processes).
 //!
 //! Stages ([`Stage`]): uv -> Python -> packages -> weights -> export -> install. The result,
-//! `models/yolo26<size>.onnx` + `.yaml`, is moved into place from a staging directory and recorded
-//! in `models/.yolo26<size>.installed.json` like a downloaded model.
+//! `models/<name>.onnx` + `.yaml`, is moved into place from a staging directory and recorded
+//! in `models/.<name>.installed.json` like a downloaded model (an older version's manifest makes
+//! the file "needs export" again).
 //!
 //! [`run_export`] is the stage machine over two seams, [`CommandRunner`] (processes) and
 //! [`Fetcher`] (verified downloads), so it is tested without network or Python.
@@ -44,15 +53,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// The export script (`scripts/export_yolo26.py`), written into the work directory before it runs.
-pub static EXPORT_SCRIPT: &str = include_str!("../../scripts/export_yolo26.py");
+/// The export script (`scripts/export_model.py`), written into the work directory before it runs.
+pub static EXPORT_SCRIPT: &str = include_str!("../../scripts/export_model.py");
+/// File name of the export script in the work directory.
+pub const SCRIPT_NAME: &str = "export_model.py";
 /// Hashed package lock for macOS arm64 (PyPI).
 pub static LOCK_MACOS_ARM64: &str =
-    include_str!("../../scripts/yolo26-export/locks/macos-arm64.txt");
+    include_str!("../../scripts/model-export/locks/macos-arm64.txt");
 /// Hashed package lock for Linux x86_64 / aarch64 and Windows x86_64 (torch from the PyTorch CPU
 /// index).
 pub static LOCK_TORCH_CPU_INDEX: &str =
-    include_str!("../../scripts/yolo26-export/locks/torch-cpu-index.txt");
+    include_str!("../../scripts/model-export/locks/torch-cpu-index.txt");
 
 /// Python version of the export environment.
 pub const PYTHON_VERSION: &str = "3.11";
@@ -90,18 +101,20 @@ pub struct Paths {
     pub tools: PathBuf,
     /// `tools/uv` (the `tool:uv` install).
     pub uv_dir: PathBuf,
-    /// `tools/yolo26-env`: the Python virtual environment.
+    /// `tools/export-env`: the Python virtual environment.
     pub env: PathBuf,
     /// `tools/python`: Python installations made by uv.
     pub python_installs: PathBuf,
     /// `tools/uv-cache` (deleted after the packages are installed).
     pub uv_cache: PathBuf,
-    /// `tools/yolo26-weights`: verified `.pt` files.
+    /// `tools/export-weights`: verified weights, one directory per model (`<name>/`).
     pub weights: PathBuf,
-    /// `tools/yolo26-work`: the script and Ultralytics' intermediate files.
+    /// `tools/export-work`: the script and the exporters' intermediate files (`<name>/`).
     pub work: PathBuf,
-    /// `tools/yolo26-config`: `YOLO_CONFIG_DIR` (Ultralytics settings).
+    /// `tools/export-config`: `YOLO_CONFIG_DIR` (Ultralytics settings), `HF_HOME`, `TORCH_HOME`.
     pub yolo_config: PathBuf,
+    /// `tools/deimv2-src`: the DEIMv2 source code (`tool:deimv2-src`).
+    pub deimv2_src: PathBuf,
     /// The configured models directory (where the `.onnx` / `.yaml` go).
     pub models: PathBuf,
 }
@@ -111,12 +124,13 @@ impl Paths {
         let tools = root.join(TOOLS_DIR);
         Self {
             uv_dir: root.join(catalog::UV_DEST),
-            env: tools.join("yolo26-env"),
+            env: tools.join("export-env"),
             python_installs: tools.join("python"),
             uv_cache: tools.join("uv-cache"),
-            weights: tools.join("yolo26-weights"),
-            work: tools.join("yolo26-work"),
-            yolo_config: tools.join("yolo26-config"),
+            weights: tools.join("export-weights"),
+            work: tools.join("export-work"),
+            yolo_config: tools.join("export-config"),
+            deimv2_src: root.join(catalog::DEIMV2_SRC_DEST),
             tools,
             models,
         }
@@ -142,7 +156,30 @@ impl Paths {
 
     /// Cross-process export lock.
     pub fn lock_file(&self) -> PathBuf {
-        self.tools.join(".yolo26-export.lock")
+        self.tools.join(".model-export.lock")
+    }
+
+    /// Verified weights of the model `name` (`tools/export-weights/<name>`).
+    pub fn weights_of(&self, name: &str) -> PathBuf {
+        self.weights.join(name)
+    }
+
+    /// Directories of the YOLO26-only export of earlier versions (same layout, older names);
+    /// deleted when the current environment is built, and by "Remove export toolchain".
+    pub fn legacy_dirs(&self) -> Vec<PathBuf> {
+        [
+            "yolo26-env",
+            "yolo26-weights",
+            "yolo26-work",
+            "yolo26-config",
+        ]
+        .iter()
+        .map(|d| self.tools.join(d))
+        .chain([
+            self.tools.join(".yolo26-export.lock"),
+            self.tools.join("yolo26-requirements.lock.txt"),
+        ])
+        .collect()
     }
 
     /// Staging directory of one export, next to the models (same filesystem: atomic renames).
@@ -160,21 +197,25 @@ impl Paths {
             self.weights.clone(),
             self.work.clone(),
             self.yolo_config.clone(),
+            self.deimv2_src.clone(),
         ]
+        .into_iter()
+        .chain(self.legacy_dirs())
+        .collect()
     }
 }
 
 /// The package lock for a platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackageLock {
-    /// File name under `scripts/yolo26-export/locks/`.
+    /// File name under `scripts/model-export/locks/`.
     pub name: &'static str,
     pub text: &'static str,
     /// torch / torchvision come from the PyTorch CPU index (`--torch-backend cpu`).
     pub torch_cpu_index: bool,
 }
 
-/// The package lock for `(os, arch)`; None = YOLO26 cannot be exported there (no PyTorch wheels).
+/// The package lock for `(os, arch)`; None = models cannot be exported there (no PyTorch wheels).
 pub fn package_lock(os: &str, arch: &str) -> Option<PackageLock> {
     match (os, arch) {
         ("macos", "aarch64") => Some(PackageLock {
@@ -191,15 +232,15 @@ pub fn package_lock(os: &str, arch: &str) -> Option<PackageLock> {
     }
 }
 
-/// Why YOLO26 cannot be exported on `(os, arch)`, if it cannot.
+/// Why models cannot be exported on `(os, arch)`, if they cannot.
 pub fn unsupported_reason(os: &str, arch: &str) -> Option<String> {
     let ok = package_lock(os, arch).is_some()
         && catalog::uv_for(os, arch).is_some()
         && catalog::toolchain_estimate(os, arch).is_some();
     (!ok).then(|| {
         format!(
-            "YOLO26 export is not available on {os}/{arch} (no PyTorch 2.14 CPU wheels); export \
-             on another machine with scripts/export_yolo26.py and copy the .onnx and .yaml"
+            "model export is not available on {os}/{arch} (no PyTorch 2.14 CPU wheels); export \
+             on another machine with scripts/export_model.py and copy the .onnx and .yaml"
         )
     })
 }
@@ -271,10 +312,28 @@ pub fn toolchain_state(paths: &Paths, platform: Platform) -> ToolchainState {
     }
 }
 
-/// `res` is exported into `models`: its `.onnx` is there (with our manifest, or exported by hand
-/// with the script).
+/// `res` is exported into `models`: its `.onnx` is there (with our manifest of this version, or
+/// exported by hand with the script, i.e. without a manifest).
 pub fn is_exported(res: &Resource, models: &Path) -> bool {
     catalog::export_files(res).is_some_and(|(onnx, _)| models.join(onnx).is_file())
+        && !is_outdated(res, models)
+}
+
+/// A manifest of `res` in `models` records another version: the file there is from an older
+/// export or an earlier download under the same name (the onnx-community RF-DETR large v1).
+pub fn is_outdated(res: &Resource, models: &Path) -> bool {
+    manifest(res, models).is_some_and(|m| m.version != res.version)
+}
+
+/// The exportable model whose output `path` (absolute, as the service reads it) is and that still
+/// has to be exported: the `.onnx` is missing, or is from another version (see [`is_outdated`]).
+pub fn pending_export(path: &Path) -> Option<&'static Resource> {
+    let onnx = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("onnx"));
+    let res = catalog::export_model(&path.to_string_lossy()).filter(|_| onnx)?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    (!path.is_file() || is_outdated(res, dir)).then_some(res)
 }
 
 /// Our manifest of an export of `res` in `models`.
@@ -282,7 +341,8 @@ pub fn manifest(res: &Resource, models: &Path) -> Option<Manifest> {
     manager::read_manifest(&manager::manifest_path(res, models)).filter(|m| m.id == res.id)
 }
 
-/// Delete the export toolchain (uv, Python, the environment, weights, work files).
+/// Delete the export toolchain (uv, Python, the environment, weights, work files, the DEIMv2
+/// source).
 pub fn remove_toolchain(paths: &Paths) -> Result<()> {
     for d in paths.toolchain_dirs() {
         remove_any(&d)?;
@@ -371,7 +431,7 @@ pub enum Stage {
     Python,
     /// `uv pip install --require-hashes` of the lock.
     Packages,
-    /// Download and verify the `.pt` weights.
+    /// Download and verify the weights (and the DEIMv2 source).
     Weights,
     /// Run the export script.
     Export,
@@ -513,8 +573,8 @@ pub trait Fetcher: Send + Sync {
     ) -> Result<()>;
 }
 
-/// Variables that could redirect Python, uv, pip or Ultralytics; dropped from the child's
-/// environment.
+/// Variables that could redirect Python, uv, pip, Ultralytics, Hugging Face or PyTorch; dropped
+/// from the child's environment.
 fn sanitized(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
     [
@@ -523,6 +583,10 @@ fn sanitized(key: &str) -> bool {
         "PIP_",
         "CONDA_",
         "YOLO_",
+        "HF_",
+        "HUGGINGFACE_",
+        "TRANSFORMERS_",
+        "TORCH_",
         "VIRTUAL_ENV",
         "__PYVENV",
     ]
@@ -739,7 +803,7 @@ impl ExportJob {
 }
 
 /// Name of the lock file written into `tools/` for `uv pip install -r`.
-const LOCKFILE_NAME: &str = "yolo26-requirements.lock.txt";
+const LOCKFILE_NAME: &str = "model-export-requirements.lock.txt";
 
 /// Global uv flags: no user/project config, no colors, our cache.
 fn uv_cmd(job: &ExportJob, stage: Stage, timeout: Duration, args: &[&std::ffi::OsStr]) -> Cmd {
@@ -860,6 +924,12 @@ fn run_stages(
         bail!(why);
     }
     let lock = package_lock(os, arch).ok_or_else(|| anyhow!("no package lock"))?;
+    let recipe =
+        catalog::export_recipe(res).ok_or_else(|| anyhow!("{} has no export recipe", res.id))?;
+    let family = match res.provides {
+        catalog::Provides::Model { family, .. } => family,
+        _ => bail!("{} is not a model", res.id),
+    };
     let check = |cancel: &AtomicBool| -> Result<()> {
         if cancel.load(Ordering::Relaxed) {
             Err(anyhow!(Cancelled))
@@ -881,7 +951,7 @@ fn run_stages(
     std::fs::create_dir_all(&p.tools).with_context(|| format!("creating {}", p.tools.display()))?;
     enter!(Stage::Uv, None, "checking the toolchain");
     let _lock = ExportLock::acquire(&p.lock_file(), cancel, || {
-        tracing::info!("another process is exporting a YOLO26 model; waiting");
+        tracing::info!("another process is exporting a model; waiting");
     })?;
 
     // 1. uv
@@ -917,6 +987,12 @@ fn run_stages(
         enter!(Stage::Packages, Some(100), "packages already installed");
     } else {
         let _ = std::fs::remove_file(p.env.join(ENV_MARKER));
+        // The YOLO26-only toolchain of earlier versions (same tools, older names) is replaced.
+        for d in p.legacy_dirs() {
+            if let Err(e) = remove_any(&d) {
+                tracing::warn!("removing the old export toolchain: {e:#}");
+            }
+        }
         enter!(Stage::Python, Some(0), "uv python install 3.11");
         let mut py_args: Vec<&std::ffi::OsStr> = vec![
             "python".as_ref(),
@@ -1005,42 +1081,72 @@ fn run_stages(
     }
     check(cancel)?;
 
-    // 4. Weights
-    let part = res
-        .parts
-        .first()
-        .ok_or_else(|| anyhow!("{} has no weights", res.id))?;
-    let weights = p.weights.join(part.file_name);
-    if manager::is_installed(res, &p.weights) && weights.is_file() {
+    // 4. Weights (and the code a recipe needs)
+    let weights_dir = p.weights_of(name);
+    let mut downloads: Vec<(&'static Resource, PathBuf)> = vec![(res, weights_dir.clone())];
+    for extra in catalog::export_extras(res) {
+        let dir = if extra.id == catalog::DEIMV2_SRC_ID {
+            p.deimv2_src.clone()
+        } else {
+            p.tools
+                .join(extra.dest.strip_prefix("tools/").unwrap_or(extra.dest))
+        };
+        downloads.push((extra, dir));
+    }
+    let missing: Vec<&(&'static Resource, PathBuf)> = downloads
+        .iter()
+        .filter(|(r, dir)| !manager::is_installed(r, dir))
+        .collect();
+    if missing.is_empty() {
         enter!(Stage::Weights, Some(100), "weights already downloaded");
     } else {
-        enter!(Stage::Weights, Some(0), part.file_name);
-        fetcher.fetch(
-            res,
-            &p.weights,
-            &mut |b, t| {
-                let pct = (b * 100).checked_div(t).unwrap_or(0) as u8;
-                let d = format!("{} {} of {} MB", part.file_name, mb(b), mb(t));
-                report(Progress::Stage {
-                    stage: Stage::Weights,
-                    percent: Some(pct),
-                    detail: &d,
-                });
-            },
-            cancel,
-        )?;
-        if !weights.is_file() {
-            bail!("{} is missing after the download", weights.display());
+        let total: u64 = missing.iter().map(|(r, _)| r.size()).sum();
+        let mut done = 0u64;
+        for (r, dir) in missing {
+            let label = r.parts.first().map_or(r.title, |p| p.file_name);
+            enter!(
+                Stage::Weights,
+                Some((done * 100).checked_div(total).unwrap_or(0) as u8),
+                label
+            );
+            fetcher.fetch(
+                r,
+                dir,
+                &mut |b, _| {
+                    let all = done + b;
+                    let pct = (all * 100).checked_div(total).unwrap_or(0).min(100) as u8;
+                    let d = format!("{label} {} of {} MB", mb(all), mb(total));
+                    report(Progress::Stage {
+                        stage: Stage::Weights,
+                        percent: Some(pct),
+                        detail: &d,
+                    });
+                },
+                cancel,
+            )?;
+            if !manager::is_installed(r, dir) {
+                bail!(
+                    "{} is not complete in {} after the download",
+                    r.title,
+                    dir.display()
+                );
+            }
+            done += r.size();
+            check(cancel)?;
         }
     }
     check(cancel)?;
 
     // 5. Export
-    enter!(Stage::Export, Some(0), "starting Ultralytics' exporter");
+    enter!(
+        Stage::Export,
+        Some(0),
+        &format!("starting {}", recipe.exporter())
+    );
     std::fs::create_dir_all(&p.work).with_context(|| format!("creating {}", p.work.display()))?;
     std::fs::create_dir_all(&p.yolo_config)
         .with_context(|| format!("creating {}", p.yolo_config.display()))?;
-    let script = p.work.join("export_yolo26.py");
+    let script = p.work.join(SCRIPT_NAME);
     std::fs::write(&script, EXPORT_SCRIPT)
         .with_context(|| format!("writing {}", script.display()))?;
     std::fs::create_dir_all(&p.models)
@@ -1048,24 +1154,48 @@ fn run_stages(
     let staging = p.staging(name);
     remove_any(&staging)?;
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
-    let size = name.trim_start_matches("yolo26");
+    let work = p.work.join(name);
+    remove_any(&work)?;
+    // Ultralytics takes the `.pt` file; the Hugging Face recipes the directory with
+    // `model.safetensors` + `config.json`.
+    let weights_arg = match recipe {
+        catalog::ExportRecipe::Ultralytics => weights_dir.join(
+            res.parts
+                .first()
+                .ok_or_else(|| anyhow!("{} has no weights", res.id))?
+                .file_name,
+        ),
+        _ => weights_dir.clone(),
+    };
+    let mut args: Vec<OsString> = vec![
+        "-u".into(),
+        "-I".into(),
+        script.clone().into_os_string(),
+        "--recipe".into(),
+        recipe.as_str().into(),
+        "--name".into(),
+        name.into(),
+        "--family".into(),
+        family.to_string().into(),
+        "--weights".into(),
+        weights_arg.into_os_string(),
+        "--imgsz".into(),
+        catalog::export_input_size(res).to_string().into(),
+        "--no-openvino".into(),
+        "--out-dir".into(),
+        staging.clone().into_os_string(),
+        "--work".into(),
+        work.clone().into_os_string(),
+    ];
+    if recipe == catalog::ExportRecipe::DeimV2 {
+        args.push("--source".into());
+        args.push(p.deimv2_src.clone().into_os_string());
+    }
+    let cfg = |sub: &str| p.yolo_config.join(sub).into_os_string();
     let cmd = Cmd {
         stage: Stage::Export,
         program: p.env_python(windows),
-        args: vec![
-            "-u".into(),
-            "-I".into(),
-            script.clone().into_os_string(),
-            "--sizes".into(),
-            size.into(),
-            "--weights".into(),
-            weights.clone().into_os_string(),
-            "--no-openvino".into(),
-            "--out-dir".into(),
-            staging.clone().into_os_string(),
-            "--work".into(),
-            p.work.clone().into_os_string(),
-        ],
+        args,
         env: vec![
             ("YOLO_OFFLINE".into(), "1".into()),
             ("YOLO_AUTOINSTALL".into(), "false".into()),
@@ -1073,6 +1203,11 @@ fn run_stages(
                 "YOLO_CONFIG_DIR".into(),
                 p.yolo_config.clone().into_os_string(),
             ),
+            ("HF_HUB_OFFLINE".into(), "1".into()),
+            ("TRANSFORMERS_OFFLINE".into(), "1".into()),
+            ("HF_HUB_DISABLE_TELEMETRY".into(), "1".into()),
+            ("HF_HOME".into(), cfg("huggingface")),
+            ("TORCH_HOME".into(), cfg("torch")),
             ("MPLBACKEND".into(), "Agg".into()),
         ],
         cwd: p.work.clone(),
@@ -1087,7 +1222,7 @@ fn run_stages(
                 line: l,
             });
             lines += 1;
-            // No real progress from Ultralytics: creep towards 90% with the output.
+            // No real progress from the exporters: creep towards 90% with the output.
             let pct = (lines.min(45) * 2) as u8;
             report(Progress::Stage {
                 stage: Stage::Export,
@@ -1097,10 +1232,8 @@ fn run_stages(
         },
         cancel,
     );
-    // Ultralytics' copies in the work dir are not needed any more.
-    for f in [format!("{name}.pt"), onnx_name.clone()] {
-        let _ = std::fs::remove_file(p.work.join(f));
-    }
+    // The exporters' copies and intermediate files are not needed any more.
+    let _ = remove_any(&work);
     if let Err(e) = export {
         let _ = remove_any(&staging);
         return Err(e);
@@ -1136,7 +1269,7 @@ fn install_outputs(
         .with_context(|| format!("the exporter wrote no {yaml_name}"))?;
     let classes = class_count(&text)?;
     if classes != 80 {
-        bail!("{yaml_name} lists {classes} classes; YOLO26 COCO models have 80");
+        bail!("{yaml_name} lists {classes} classes; the exportable COCO models have 80");
     }
     let shas = vec![manager::sha256_file(&onnx)?, manager::sha256_file(&yaml)?];
     let mut files = Vec::new();
@@ -1321,7 +1454,7 @@ impl Exporter {
         let (tx, rx) = crossbeam_channel::unbounded();
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
-            .name("yolo26-export".into())
+            .name("model-export".into())
             .spawn(move || worker_loop(&worker, &rx))
             .expect("spawning the export thread");
         Self {
@@ -1511,7 +1644,12 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
         }
         let flag = Arc::new(AtomicBool::new(false));
         *shared.current.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, flag.clone()));
-        tracing::info!(model = %res.model_name().unwrap_or(id), "YOLO26 export started ({})", catalog::YOLO26_LICENSE);
+        tracing::info!(
+            model = %res.model_name().unwrap_or(id),
+            "model export started ({}, {})",
+            catalog::export_recipe(res).map_or("?", |r| r.exporter()),
+            res.license
+        );
         let started = Instant::now();
         let mut last_stage: Option<Stage> = None;
         let mut report = |p: Progress<'_>| match p {
@@ -1557,7 +1695,7 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
             Ok(out) => {
                 tracing::info!(
                     model = %res.model_name().unwrap_or(id),
-                    "YOLO26 export finished in {:.0} s: {} ({} classes)",
+                    "model export finished in {:.0} s: {} ({} classes)",
                     started.elapsed().as_secs_f64(),
                     out.onnx.display(),
                     out.classes
@@ -1569,13 +1707,13 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
                 shared.set_state(id, ExportState::Installed);
             }
             Err(e) if e.cancelled => {
-                tracing::warn!(model = %res.model_name().unwrap_or(id), "YOLO26 export cancelled");
+                tracing::warn!(model = %res.model_name().unwrap_or(id), "model export cancelled");
                 shared.set_state(id, ExportState::Cancelled);
             }
             Err(e) => {
                 tracing::warn!(
                     model = %res.model_name().unwrap_or(id),
-                    "YOLO26 export failed{}: {}",
+                    "model export failed{}: {}",
                     e.stage.map(|s| format!(" while {}", s.label())).unwrap_or_default(),
                     e.message
                 );
@@ -1654,15 +1792,21 @@ pub fn cli_fetcher(root: &Path) -> ManagerFetcher {
     ManagerFetcher::new(Arc::new(Manager::start(opts)))
 }
 
-/// "needs export" text for a configured model file that an export would produce.
-pub fn needs_export_message(res: &Resource, path: &Path) -> String {
+/// "needs export" text for a configured model file that an export would produce. `outdated`: the
+/// file is there but from another version (see [`is_outdated`]).
+pub fn needs_export_message(res: &Resource, path: &Path, outdated: bool) -> String {
+    let why = if outdated {
+        "is from an older version of this model"
+    } else {
+        "is not there yet"
+    };
     format!(
-        "needs export: {} is not there yet. YOLO26 ({}) is exported on this machine on request: \
-         click Export for {} on the Config page (Resources, YOLO26 section) or run \
-         `blue-onyx-prism fetch --resource {}`",
+        "needs export: {} {why}. {} ({}) is exported on this machine on request: click Export \
+         for it on the Config page (Resources, exported models) or run \
+         `blue-onyx-prism fetch --resource {} --allow-large`",
         path.display(),
-        catalog::YOLO26_LICENSE,
         res.title,
+        res.license,
         res.id
     )
 }
@@ -1749,12 +1893,9 @@ pub mod fake {
                 on_line("Prepared 48 packages in 40s");
                 on_line("Installed 48 packages in 2s");
             }
-            if d.contains("export_yolo26.py") {
-                let size = arg_after(cmd, "--sizes").unwrap();
-                let name = format!("yolo26{}", size.display());
-                on_line(&format!(
-                    "[export_yolo26] {name}: exporting ONNX (opset 17)"
-                ));
+            if d.contains(SCRIPT_NAME) {
+                let name = arg_after(cmd, "--name").unwrap().display().to_string();
+                on_line(&format!("[export_model] {name}: exporting ONNX (opset 17)"));
                 let out = arg_after(cmd, "--out-dir").unwrap();
                 let names: String = (0..self.classes).map(|i| format!("  - c{i}\n")).collect();
                 std::fs::write(out.join(format!("{name}.onnx")), vec![7u8; 4096]).unwrap();
@@ -1780,10 +1921,17 @@ pub mod fake {
             progress(res.size() / 2, res.size());
             std::fs::create_dir_all(dir).unwrap();
             let mut files = Vec::new();
-            if res.kind == ResourceKind::Tool {
+            if res.id == catalog::UV_ID {
                 std::fs::write(dir.join("uv"), b"uv").unwrap();
                 std::fs::write(dir.join("uv.exe"), b"uv").unwrap();
                 files.push("uv".to_string());
+            } else if res.kind == ResourceKind::Tool {
+                std::fs::create_dir_all(dir.join("engine")).unwrap();
+                std::fs::create_dir_all(dir.join("configs")).unwrap();
+                std::fs::write(dir.join("engine/__init__.py"), b"").unwrap();
+                std::fs::write(dir.join("configs/a.yml"), b"").unwrap();
+                files.push("engine/__init__.py".to_string());
+                files.push("configs/a.yml".to_string());
             } else {
                 for p in res.parts {
                     std::fs::write(dir.join(p.file_name), b"weights").unwrap();
@@ -1886,32 +2034,50 @@ mod tests {
         assert!(cmds[2].contains("--require-hashes --no-deps --only-binary :all: -r "));
         assert!(!cmds[2].contains("--torch-backend"), "macOS uses PyPI");
         assert!(cmds[3].contains(" -u -I "));
-        assert!(cmds[3].contains("--sizes n --weights "));
-        assert!(cmds[3].contains("--no-openvino --out-dir "));
+        assert!(
+            cmds[3].contains("--recipe ultralytics --name yolo26n --family yolo26 --weights "),
+            "{}",
+            cmds[3]
+        );
+        assert!(cmds[3].contains("--imgsz 640 --no-openvino --out-dir "));
+        assert!(!cmds[3].contains("--source"));
         let all = fake.commands.lock().unwrap().clone();
         let export = &all[3];
         assert_eq!(export.program, j.paths.env_python(false));
-        for (k, v) in [("YOLO_OFFLINE", "1"), ("YOLO_AUTOINSTALL", "false")] {
+        for (k, v) in [
+            ("YOLO_OFFLINE", "1"),
+            ("YOLO_AUTOINSTALL", "false"),
+            ("HF_HUB_OFFLINE", "1"),
+            ("TRANSFORMERS_OFFLINE", "1"),
+        ] {
             assert!(export.env.iter().any(|(a, b)| a == k && b == v), "{k}");
         }
         assert_eq!(
             arg_after(export, "--weights").unwrap(),
-            root.join("tools/yolo26-weights/yolo26n.pt")
+            root.join("tools/export-weights/yolo26n/yolo26n.pt")
         );
         assert_eq!(
-            std::fs::read_to_string(root.join("tools/yolo26-work/export_yolo26.py")).unwrap(),
+            arg_after(export, "--work").unwrap(),
+            root.join("tools/export-work/yolo26n")
+        );
+        assert!(
+            !root.join("tools/export-work/yolo26n").exists(),
+            "work files removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("tools/export-work/export_model.py")).unwrap(),
             EXPORT_SCRIPT
         );
         // Manifest, marker, staging gone, cache gone.
         let m = manifest(yolo26n(), &root.join("models")).unwrap();
-        assert_eq!(m.version, catalog::YOLO26_EXPORT_VERSION);
+        assert_eq!(m.version, catalog::ULTRALYTICS_EXPORT_VERSION);
         assert_eq!(m.files, ["yolo26n.onnx", "yolo26n.yaml"]);
         assert_eq!(m.sha256.len(), 2);
         assert!(is_exported(yolo26n(), &root.join("models")));
         assert!(!j.paths.staging("yolo26n").exists());
         assert!(toolchain_state(&j.paths, MAC).ready());
         assert!(
-            std::fs::read_to_string(root.join("tools/yolo26-requirements.lock.txt"))
+            std::fs::read_to_string(root.join("tools/model-export-requirements.lock.txt"))
                 .unwrap()
                 .contains("ultralytics==8.4.163")
         );
@@ -1923,7 +2089,7 @@ mod tests {
         assert!(fake2.fetched.lock().unwrap().is_empty());
         let cmds = fake2.cmds();
         assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].contains("export_yolo26.py"));
+        assert!(cmds[0].contains("export_model.py"));
 
         // Remove: model files and toolchain.
         remove_export(yolo26n(), &root.join("models")).unwrap();
@@ -1952,7 +2118,7 @@ mod tests {
         assert_eq!(all[0].program, root.join("tools/uv/uv.exe"));
         assert_eq!(
             all[3].program,
-            root.join("tools/yolo26-env/Scripts/python.exe")
+            root.join("tools/export-env/Scripts/python.exe")
         );
     }
 
@@ -1990,7 +2156,7 @@ mod tests {
 
         // Exporter fails: staging removed, nothing installed.
         let fake = Fake {
-            fail_on: Some("export_yolo26.py"),
+            fail_on: Some("export_model.py"),
             ..Fake::new()
         };
         let e = run(&fake, &j).0.unwrap_err();
@@ -2025,7 +2191,7 @@ mod tests {
     fn exporter_queues_cancels_and_reports() {
         let root = tmp("exporter");
         let fake = Arc::new(Fake {
-            hang_on: Some("export_yolo26.py"),
+            hang_on: Some("export_model.py"),
             ..Fake::new()
         });
         let ex = Exporter::start(fake.clone(), fake.clone());
@@ -2267,7 +2433,7 @@ mod tests {
 
     #[test]
     fn locks_match_the_requirements_and_platforms() {
-        let reqs = include_str!("../../scripts/requirements-yolo26-export.txt");
+        let reqs = include_str!("../../scripts/requirements-model-export.txt");
         for lock in [LOCK_MACOS_ARM64, LOCK_TORCH_CPU_INDEX] {
             for line in reqs.lines().filter(|l| l.contains("==")) {
                 let (pkg, ver) = line.split_once("==").unwrap();
@@ -2289,6 +2455,7 @@ mod tests {
         assert!(LOCK_TORCH_CPU_INDEX.contains("torch==2.14.0+cpu"));
         assert!(LOCK_MACOS_ARM64.contains("torch==2.14.0 "));
         assert!(reqs.contains(&format!("ultralytics=={}", catalog::ULTRALYTICS_VERSION)));
+        assert!(reqs.contains(&format!("transformers=={}", catalog::TRANSFORMERS_VERSION)));
         // Supported platforms agree across the lock, uv and the estimates.
         for p in crate::resources::catalog::SHIPPED_PLATFORMS {
             assert!(package_lock(p.os, p.arch).is_some(), "{p}");
@@ -2299,11 +2466,16 @@ mod tests {
         }
         // The script has the flags the exporter passes.
         for f in [
+            "--recipe",
+            "--name",
+            "--family",
             "--weights",
+            "--imgsz",
             "--no-openvino",
             "--out-dir",
             "--work",
-            "--sizes",
+            "--source",
+            "HF_HUB_OFFLINE",
         ] {
             assert!(EXPORT_SCRIPT.contains(f), "{f}");
         }
@@ -2311,9 +2483,143 @@ mod tests {
 
     #[test]
     fn needs_export_text() {
-        let t = needs_export_message(yolo26n(), Path::new("models/yolo26n.onnx"));
-        assert!(t.starts_with("needs export: models/yolo26n.onnx"));
+        let t = needs_export_message(yolo26n(), Path::new("models/yolo26n.onnx"), false);
+        assert!(t.starts_with("needs export: models/yolo26n.onnx is not there yet"));
         assert!(t.contains("fetch --resource model:yolo26n"));
         assert!(t.contains("AGPL-3.0"));
+        let rf = catalog::export_model("rfdetr-large").unwrap();
+        let t = needs_export_message(rf, Path::new("models/rfdetr-large.onnx"), true);
+        assert!(t.contains("older version"), "{t}");
+        assert!(t.contains("Apache-2.0"));
+    }
+
+    #[test]
+    fn deimv2_export_fetches_the_source_and_passes_it() {
+        let root = tmp("deimv2");
+        let fake = Fake::new();
+        let mut j = job(&root, LINUX);
+        j.resource = catalog::export_model("deimv2-atto").unwrap();
+        let (r, _) = run(&fake, &j);
+        let out = r.unwrap();
+        assert_eq!(out.onnx, root.join("models/deimv2-atto.onnx"));
+        assert_eq!(
+            *fake.fetched.lock().unwrap(),
+            ["tool:uv", "model:deimv2-atto", "tool:deimv2-src"]
+        );
+        let all = fake.commands.lock().unwrap().clone();
+        let export = all.last().unwrap();
+        let d = export.display();
+        assert!(
+            d.contains("--recipe deimv2 --name deimv2-atto --family rtdetr"),
+            "{d}"
+        );
+        assert!(d.contains("--imgsz 320"), "{d}");
+        assert_eq!(
+            arg_after(export, "--weights").unwrap(),
+            root.join("tools/export-weights/deimv2-atto")
+        );
+        assert_eq!(
+            arg_after(export, "--source").unwrap(),
+            root.join("tools/deimv2-src")
+        );
+        assert!(
+            root.join("tools/export-weights/deimv2-atto/model.safetensors")
+                .is_file()
+        );
+        assert!(
+            root.join("tools/export-weights/deimv2-atto/config.json")
+                .is_file()
+        );
+        let m = manifest(j.resource, &root.join("models")).unwrap();
+        assert_eq!(m.version, j.resource.version);
+
+        // A second DEIMv2 export reuses the source; RF-DETR needs none and passes its directory.
+        let fake = Fake::new();
+        j.resource = catalog::export_model("deimv2-n").unwrap();
+        run(&fake, &j).0.unwrap();
+        assert_eq!(*fake.fetched.lock().unwrap(), ["model:deimv2-n"]);
+        let fake = Fake::new();
+        j.resource = catalog::export_model("rfdetr-large").unwrap();
+        run(&fake, &j).0.unwrap();
+        assert_eq!(*fake.fetched.lock().unwrap(), ["model:rfdetr-large"]);
+        let all = fake.commands.lock().unwrap().clone();
+        let d = all.last().unwrap().display();
+        assert!(
+            d.contains("--recipe rfdetr --name rfdetr-large --family rfdetr"),
+            "{d}"
+        );
+        assert!(d.contains("--imgsz 704") && !d.contains("--source"), "{d}");
+
+        // Remove toolchain: the source goes with it.
+        remove_toolchain(&j.paths).unwrap();
+        assert!(!root.join("tools").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn outdated_manifest_means_needs_export() {
+        let root = tmp("outdated");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let rf = catalog::export_model("rfdetr-large").unwrap();
+        let onnx = models.join("rfdetr-large.onnx");
+        // Exported by hand (no manifest): counts.
+        std::fs::write(&onnx, b"x").unwrap();
+        assert!(is_exported(rf, &models));
+        assert!(pending_export(&onnx).is_none());
+        // The old onnx-community download of the same name: outdated.
+        let old = Manifest {
+            id: "model:rfdetr-large".into(),
+            version: "4988fbacee4aa815e43c2e0666377ab26bddf1e8".into(),
+            sha256: vec!["ab".into()],
+            files: vec!["rfdetr-large.onnx".into()],
+        };
+        std::fs::write(
+            manager::manifest_path(rf, &models),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert!(is_outdated(rf, &models));
+        assert!(!is_exported(rf, &models));
+        assert_eq!(pending_export(&onnx).unwrap().id, "model:rfdetr-large");
+        // Missing file: pending; not an export output (IR, unknown name): none.
+        assert!(pending_export(&models.join("yolov8n.onnx")).is_some());
+        assert!(pending_export(&models.join("yolov8n.xml")).is_none());
+        assert!(pending_export(&models.join("custom.onnx")).is_none());
+        // Exporting replaces it.
+        let fake = Fake::new();
+        let mut j = job(&root, MAC);
+        j.resource = rf;
+        run(&fake, &j).0.unwrap();
+        assert!(is_exported(rf, &models));
+        assert!(pending_export(&onnx).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_toolchain_is_replaced() {
+        let root = tmp("legacy");
+        for d in [
+            "yolo26-env/bin",
+            "yolo26-weights",
+            "yolo26-work",
+            "yolo26-config",
+        ] {
+            std::fs::create_dir_all(root.join("tools").join(d)).unwrap();
+        }
+        std::fs::write(root.join("tools/yolo26-requirements.lock.txt"), b"x").unwrap();
+        let fake = Fake::new();
+        let j = job(&root, MAC);
+        run(&fake, &j).0.unwrap();
+        for d in [
+            "yolo26-env",
+            "yolo26-weights",
+            "yolo26-work",
+            "yolo26-config",
+        ] {
+            assert!(!root.join("tools").join(d).exists(), "{d}");
+        }
+        assert!(!root.join("tools/yolo26-requirements.lock.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

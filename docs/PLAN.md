@@ -77,7 +77,7 @@ src/bin/blue_onyx_prism_benchmark.rs  compile/warmup/p50/p95 latency, --device G
 src/bin/test_blue_onyx_prism.rs       posts an image N times, prints JSON
 templates/{welcome,stats,config,test}.html, prometheus.txt   (askama; structure copied from upstream)
 assets/favicon.ico, assets/style.css, assets/<permissive>.ttf  (include_bytes)
-scripts/export_yolo26.py       Ultralytics -> OpenVINO IR + NAMES yaml
+scripts/export_model.py        Ultralytics YOLO / RF-DETR / DEIMv2 -> ONNX (+ OpenVINO IR) + NAMES yaml
 scripts/convert_onnx_to_ir.py  `ovc` fallback for ONNX models the frontend rejects
 scripts/install_service.ps1, scripts/uninstall_service.ps1   (Windows)
 scripts/install_systemd.sh, scripts/install_launchd.sh       (Linux, macOS)

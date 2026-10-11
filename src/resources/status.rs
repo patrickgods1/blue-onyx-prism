@@ -12,10 +12,11 @@
 //!   `download-models --add-to-config`, or a model file found in `models_dir` that no config
 //!   entry references (id `local:<file>`, see [`local_models`]; family `auto`).
 //!
-//! - **Export** (YOLO26, [`export`]): queues a user-confirmed export on the [`super::export`]
-//!   exporter (the toolchain download needs `confirm_large` unless `allow_large_downloads`);
-//!   **Cancel** stops it. Remove deletes the exported files; removing `tool:uv` removes the whole
-//!   export toolchain.
+//! - **Export** (Ultralytics YOLO, RF-DETR L, DEIMv2; [`export`]): queues a user-confirmed export
+//!   on the [`super::export`] exporter (the toolchain download needs `confirm_large` unless
+//!   `allow_large_downloads`); **Cancel** stops it. Remove deletes the exported files; removing
+//!   `tool:uv` removes the whole export toolchain (including the DEIMv2 source, which has no row
+//!   of its own).
 //!
 //! Rows carry a `group` ([`group_of`]) so the UI shows Runtimes, GPU libraries and Models
 //! (by family) as separate tables ([`grouped`]).
@@ -99,7 +100,7 @@ pub struct ResourceRow {
     pub can_add_to_config: bool,
     /// Where it installs.
     pub target: String,
-    /// Which buttons the UI shows: `download` (catalog downloads), `export` (YOLO26), `toolchain`
+    /// Which buttons the UI shows: `download` (catalog downloads), `export` (exported models), `toolchain`
     /// (`tool:uv`: Remove deletes the whole export toolchain), `none` (not possible here).
     pub action: &'static str,
     /// A running export or download can be cancelled.
@@ -166,7 +167,10 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("models-rt-detr", "Models \u{b7} RT-DETRv2"),
     ("models-d-fine", "Models \u{b7} D-FINE"),
     ("models-rf-detr", "Models \u{b7} RF-DETR"),
-    ("models-yolo26", "YOLO26 (exported locally, AGPL-3.0)"),
+    (
+        "models-export",
+        "Models \u{b7} exported on this machine (Ultralytics YOLO, RF-DETR L, DEIMv2)",
+    ),
     ("bench-images", "Benchmark images"),
 ];
 
@@ -181,12 +185,12 @@ pub fn group_of(r: &Resource) -> &'static str {
         ResourceKind::CudaLibs => "gpu-libraries",
         ResourceKind::Model => model_group(r.id),
         ResourceKind::BenchImages => "bench-images",
-        ResourceKind::ExportModel | ResourceKind::Tool => YOLO26_GROUP,
+        ResourceKind::ExportModel | ResourceKind::Tool => EXPORT_GROUP,
     }
 }
 
-/// Group key of the YOLO26 exports and their toolchain.
-pub const YOLO26_GROUP: &str = "models-yolo26";
+/// Group key of the exported models and their toolchain.
+pub const EXPORT_GROUP: &str = "models-export";
 
 fn model_group(id: &str) -> &'static str {
     let id = id.to_ascii_lowercase();
@@ -293,7 +297,7 @@ pub fn local_models(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<LocalMod
         .chain(catalog::MODELS.iter())
         .filter(|r| r.kind == ResourceKind::Model)
         .flat_map(|r| r.parts.iter().map(|p| p.file_name.to_ascii_lowercase()))
-        // Exported YOLO26 models have their own rows (with Add to config).
+        // Exported models have their own rows (with Add to config).
         .chain(
             catalog::EXPORT_MODELS
                 .iter()
@@ -535,6 +539,8 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
 
     platform_resources(ctx)
         .into_iter()
+        // The DEIMv2 source is part of the export toolchain (the `tool:uv` row).
+        .filter(|r| r.id != catalog::DEIMV2_SRC_ID)
         .map(|r| {
             if matches!(r.kind, ResourceKind::ExportModel | ResourceKind::Tool) {
                 return export_row(ctx, config, r, &res, &statuses, &configured);
@@ -664,29 +670,28 @@ fn toolchain_cost(p: Platform) -> Option<String> {
 
 /// Confirmation text before exporting `res`.
 pub fn export_confirm(res: &Resource, toolchain_ready: bool, p: Platform) -> String {
+    let recipe = catalog::export_recipe(res);
+    let extra: u64 = catalog::export_extras(res).iter().map(|r| r.size()).sum();
+    let size = catalog::format_size(res.size() + extra);
     let what = if toolchain_ready {
-        format!(
-            "Downloads the {} weights ({}).",
-            res.title,
-            catalog::format_size(res.size())
-        )
+        format!("Downloads the {} weights ({size}).", res.title)
     } else {
         format!(
-            "Sets up the export toolchain once (uv, Python 3.11, PyTorch CPU and Ultralytics: {}) \
-             and downloads the {} weights ({}).",
+            "Sets up the export toolchain once (uv, Python 3.11, PyTorch CPU, Ultralytics and \
+             transformers: {}) and downloads the {} weights ({size}).",
             toolchain_cost(p).unwrap_or_else(|| "large".into()),
             res.title,
-            catalog::format_size(res.size())
         )
     };
     format!(
-        "Export {}? {what} It runs Ultralytics' exporter locally (a few minutes). {}",
+        "Export {}? {what} It runs {} locally (a few minutes). {}",
         res.title,
-        catalog::YOLO26_NOTICE
+        recipe.map_or("the exporter", |r| r.exporter()),
+        recipe.map_or("", |r| r.notice())
     )
 }
 
-/// Rows of the YOLO26 group: exportable models and the `tool:uv` toolchain row.
+/// Rows of the export group: exportable models and the `tool:uv` toolchain row.
 fn export_row(
     ctx: Option<&ResourcesCtx>,
     config: &Config,
@@ -768,12 +773,12 @@ fn export_row(
             row.removable = blocked.is_none();
             row.remove_blocked = blocked;
             row.confirm = Some(format!(
-                "Remove the YOLO26 export toolchain ({})? Exported models stay; a later export \
+                "Remove the model export toolchain ({})? Exported models stay; a later export \
                  downloads it again.",
                 paths.tools.display()
             ));
         } else {
-            row.state_text = "not installed; the first YOLO26 export downloads it".into();
+            row.state_text = "not installed; the first model export downloads it".into();
         }
         if let Some(why) = unsupported {
             row.state_text = why;
@@ -859,7 +864,7 @@ fn export_row(
     row
 }
 
-/// Queue an export of `id` (a YOLO26 model). Without a ready toolchain it needs `confirm` unless
+/// Queue an export of `id` (an exportable model). Without a ready toolchain it needs `confirm` unless
 /// `allow_large_downloads` is set. `on_done` runs after a successful export (e.g. add it to the
 /// config).
 pub fn export(
@@ -892,11 +897,11 @@ pub fn export(
     let toolchain = export::toolchain_state(&paths, platform);
     if !toolchain.ready() && !confirm && !config.allow_large_downloads {
         return Err(ActionError::Conflict(format!(
-            "exporting {} sets up the export toolchain first ({}) and runs Ultralytics' exporter \
-             ({}); confirm it",
+            "exporting {} sets up the export toolchain first ({}) and runs {} ({}); confirm it",
             res.title,
             toolchain_cost(platform).unwrap_or_else(|| "large".into()),
-            catalog::YOLO26_LICENSE
+            catalog::export_recipe(res).map_or("the exporter", |r| r.exporter()),
+            res.license
         )));
     }
     let exporter = ctx.provisioner.exporter_for(config);
@@ -908,8 +913,7 @@ pub fn export(
         .map_err(ActionError::Conflict)?;
     Ok(format!(
         "exporting {} ({}): progress is shown below and in the Logs",
-        res.title,
-        catalog::YOLO26_LICENSE
+        res.title, res.license
     ))
 }
 
@@ -1019,16 +1023,16 @@ pub fn remove(
             export::remove_toolchain(&paths).map_err(|e| ActionError::Failed(format!("{e:#}")))?;
             // The manager remembers the uv and weights downloads as installed.
             if let Some(m) = ctx.and_then(|c| c.provisioner.manager()) {
-                for s in m
-                    .statuses()
-                    .iter()
-                    .filter(|s| s.id == res.id || catalog::export_model(s.id).is_some())
-                {
+                for s in m.statuses().iter().filter(|s| {
+                    s.id == res.id
+                        || s.id == catalog::DEIMV2_SRC_ID
+                        || catalog::export_model(s.id).is_some()
+                }) {
                     m.forget(&s.key);
                 }
             }
             return Ok(format!(
-                "removed the YOLO26 export toolchain from {}",
+                "removed the model export toolchain from {}",
                 paths.tools.display()
             ));
         }
@@ -1110,8 +1114,7 @@ pub fn add_to_config(
     Ok(describe_outcomes(&out))
 }
 
-/// Append an exported YOLO26 model: `models/yolo26<size>.onnx` with its class file, family
-/// `yolo26`.
+/// Append an exported model: `models/<name>.onnx` with its class file and the catalog family.
 fn add_export_to_config(config: &mut Config, res: &Resource) -> Result<String, ActionError> {
     let dir = target_dir(config, res);
     if !export::is_exported(res, &dir) {

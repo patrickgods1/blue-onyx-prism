@@ -20,7 +20,7 @@ Modeled on [blue-onyx](https://github.com/xnorpx/blue-onyx) (MIT), adding multi-
 - Native OpenVINO inference: Intel integrated/discrete GPU on Windows and Linux, CPU everywhere, automatic GPU -> CPU fallback.
 - ONNX Runtime as a second runtime (NVIDIA CUDA/TensorRT, DirectML, CoreML, CPU) with `auto` device selection by detected hardware.
 - Several models served at once, each with its own worker and metrics; per-model device, threshold, class filter and lazy loading.
-- Model families: YOLO26 (end-to-end), YOLOv5 (the blue-onyx IPcam models), YOLOv8/11, RT-DETRv2. ONNX or OpenVINO IR.
+- Model families: YOLO26 / YOLOv10 (end-to-end), YOLOv5 (the blue-onyx IPcam models), YOLOv8/9/11/12, RT-DETRv2 and DEIMv2, D-FINE, RF-DETR. ONNX or OpenVINO IR.
 - Compiled-model cache (fast restarts), HTTP served while models compile, web UI (stats, test page, config editor), Prometheus metrics.
 - Runs as a Windows service, systemd unit, launchd daemon or Docker container.
 
@@ -128,7 +128,7 @@ blue-onyx-prism fetch --all-for-platform  # everything for this OS/arch (large o
   shows anything still missing.
 - **Web UI:** the Config page has a *Resources* card, grouped into Runtimes, GPU libraries, Models
   by family (YOLOv5, RT-DETRv2, D-FINE, RF-DETR) and *Local models (not in config)* (`.onnx` / `.xml`
-  files in `models_dir` that no config entry uses, e.g. YOLO26 exports), with state, size,
+  files in `models_dir` that no config entry uses, e.g. exports made by hand), with state, size,
   Download / Remove, a live progress bar and *Add to config*. `GET /v1/resources` returns the same as
   JSON (each row has a `group`; local files are in `localModels`).
   Device options that need a download show "will download ... (size)" in the Device dropdown;
@@ -140,11 +140,12 @@ blue-onyx-prism fetch --all-for-platform  # everything for this OS/arch (large o
   `fetch --resource nvidia-cuda-libs`, and the libraries are covered by the
   [NVIDIA Software License Agreement](https://docs.nvidia.com/cuda/eula/) (CUDA, cuDNN
   redistributables). TensorRT is never downloaded.
-- **YOLO26** weights are AGPL-3.0 and cannot be redistributed: the service exports them on
-  request (Config page, *YOLO26 (exported locally, AGPL-3.0)*, or
-  `fetch --resource model:yolo26s`; see [Exporting YOLO26 models](#exporting-yolo26-models)). A
-  config entry pointing at a YOLO26 file that is not exported yet shows "needs export"; it is never
-  exported automatically.
+- **Exported models**: Ultralytics YOLOv8/v9/v10/11/12/26 (AGPL-3.0, cannot be redistributed),
+  RF-DETR large (current 704 px release) and DEIMv2 are only published as PyTorch weights, so the
+  service exports them to ONNX on request (Config page, *Models · exported on this machine*, or
+  `fetch --resource model:yolo11s --allow-large`; see [Exporting models](#exporting-models)). A
+  config entry pointing at such a file that is not exported yet (or is outdated, like the earlier
+  `rfdetr-large` download) shows "needs export"; nothing is exported automatically.
 
 ## Quick start
 
@@ -239,7 +240,7 @@ models stay in the config but are not loaded or served).
 | Rust | `winget install Rustlang.Rustup` (stable, MSVC) | `curl https://sh.rustup.rs -sSf \| sh` | `curl https://sh.rustup.rs -sSf \| sh` |
 | C/C++ toolchain | Visual Studio 2022 Build Tools with the "Desktop development with C++" workload (`winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`) | `sudo apt install build-essential pkg-config` | `xcode-select --install` |
 | Intel GPU (optional) | Intel graphics driver (OpenCL comes with it) | `sudo apt install intel-opencl-icd` and access to `/dev/dri` (`render` group) | not available (CPU only) |
-| Python 3.10-3.12 (only for exporting YOLO26 by hand; the Config page export brings its own) | `winget install astral-sh.uv` then `uv venv --python 3.11 .venv` | `uv venv --python 3.11 .venv` or `python3 -m venv .venv` | same |
+| Python 3.10-3.12 (only for exporting models by hand; the Config page export brings its own) | `winget install astral-sh.uv` then `uv venv --python 3.11 .venv` | `uv venv --python 3.11 .venv` or `python3 -m venv .venv` | same |
 
 The pinned Rust channel is in `rust-toolchain.toml`; `rustup` picks it up automatically. No `build.rs`,
 no system OpenVINO install is needed to build: the `openvino` crate loads the runtime at run time.
@@ -259,7 +260,7 @@ cargo run --release -- list-devices             # what can run here and what `au
 
 # 2. Get a model. Either download a ready-made ONNX model from Hugging Face ...
 cargo run --release -- download-models --name IPcam-general
-# ... or export YOLO26 to OpenVINO IR (needs the Python env, see below).
+# ... or export a model (YOLO26, YOLO11, DEIMv2, ...) to OpenVINO IR by hand (needs the Python env, see below).
 
 # 3. Run the server (CPU) and test it.
 cargo run --release -- --model models/IPcam-general.onnx --family yolo5 --force-cpu
@@ -278,50 +279,72 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-### Exporting YOLO26 models
+### Exporting models
 
 **On demand (no repo or Python needed).** On the Config page, *Resources*, section
-*YOLO26 (exported locally, AGPL-3.0)*: click *Export* next to yolo26n/s/m/l/x. The confirmation
-names the download and the license. The first export sets up a private toolchain (about 350 MB
-download and 1.2 GB on disk on macOS arm64, up to ~470 MB / 1.6 GB on Linux x86_64): the pinned
-[uv](https://github.com/astral-sh/uv) release (SHA-256 checked), Python 3.11 installed by uv, and
-the hashed package locks in `scripts/yolo26-export/locks/` (Ultralytics, PyTorch CPU, ONNX;
-installed with `--require-hashes --only-binary :all:`). Then it downloads Ultralytics' official
-`yolo26<size>.pt` (SHA-256 pinned), runs the embedded `scripts/export_yolo26.py` with Ultralytics'
-network access and auto-install off, and moves `yolo26<size>.onnx` + `.yaml` into `models_dir`. The
-row shows the stage (1/6 ... 6/6) and a progress bar, the output goes to the Logs page, and a running
-export can be cancelled; one export runs at a time. *and add to config* (checked by default) appends
-the model to `models` when it is done (enabled when no other model is; restart to load it). Later
-exports reuse the toolchain (only the weights are downloaded; yolo26n took 55 s from scratch on an
-M1, yolo26s 5 s afterwards).
+*Models · exported on this machine*: click *Export* next to a model. The confirmation names the
+download, what runs and the license. Exportable (`model:<name>`):
 
-Headless: `blue-onyx-prism fetch --resource model:yolo26s --allow-large` (`--allow-large`, or
+| Models | Recipe | Family | License |
+|---|---|---|---|
+| `yolov8{n,s,m,l,x}`, `yolov9{t,s,m,c,e}`, `yolo11{n,s,m,l,x}`, `yolo12{n,s,m,l,x}` | Ultralytics exporter, official `.pt` (assets v8.4.0) | `yolo8` (NMS in the service) | AGPL-3.0 |
+| `yolov10{n,s,m,b,l,x}`, `yolo26{n,s,m,l,x}` | same | `yolo26` (end-to-end `[1,300,6]`) | AGPL-3.0 |
+| `rfdetr-large` (RF-DETR L, 704x704) | transformers `RfDetrForObjectDetection` + `torch.onnx`, `Roboflow/rf-detr-large` safetensors | `rfdetr` | Apache-2.0 |
+| `deimv2-{atto,femto,pico,n,s,m,l,x}` (320 / 416 / 640 px) | official DEIMv2 code (commit `add5bcd`) + `torch.onnx`, `Intellindust/DEIMv2_*_COCO` safetensors | `rtdetr` | Apache-2.0 (see below) |
+
+The first export sets up a private toolchain (about 375 MB download and 1.3 GB on disk on macOS
+arm64, up to ~495 MB / 1.7 GB on Linux x86_64): the pinned [uv](https://github.com/astral-sh/uv)
+release (SHA-256 checked), Python 3.11 installed by uv, and the hashed package locks in
+`scripts/model-export/locks/` (Ultralytics, PyTorch CPU, ONNX, transformers; installed with
+`--require-hashes --only-binary :all:`). Then it downloads the model's official weights (SHA-256
+pinned; DEIMv2 also the SHA-256 pinned source archive, of which only `engine/**/*.py` and the
+training configs `configs/**/*.yml` are extracted), runs the embedded `scripts/export_model.py` offline (Ultralytics and Hugging Face
+network access and auto-install off), checks the output against the PyTorch model with ONNX
+Runtime, and moves `<name>.onnx` + `.yaml` into `models_dir`. The row shows the stage (1/6 ... 6/6)
+and a progress bar, the output goes to the Logs page, and a running export can be cancelled; one
+export runs at a time. *and add to config* (checked by default) appends the model to `models` when
+it is done (enabled when no other model is; restart to load it). Later exports reuse the toolchain
+(only the weights are downloaded; the first export took 60 s on an M1, later ones 3-30 s).
+
+Headless: `blue-onyx-prism fetch --resource model:yolo11s --allow-large` (`--allow-large`, or
 `allow_large_downloads`, is only needed while the toolchain is not installed).
 
 Where things live: everything is under `<download_dir or exe dir>/tools/`: `uv/`, `python/`,
-`yolo26-env/` (the virtual environment), `yolo26-weights/`, `yolo26-work/`, `yolo26-config/`
-(Ultralytics settings). *Remove export toolchain* on the `tool:uv` row (or deleting `tools/`)
-frees it; exported models stay. Removing a YOLO26 row deletes its `.onnx` / `.yaml`.
+`export-env/` (the virtual environment), `export-weights/<name>/`, `export-work/`,
+`export-config/` (Ultralytics / Hugging Face settings), `deimv2-src/`. *Remove export toolchain* on
+the `tool:uv` row (or deleting `tools/`) frees it; exported models stay. Removing an exported row
+deletes its `.onnx` / `.yaml`. The YOLO26-only toolchain of earlier versions (`yolo26-env/` ...) is
+replaced by the first export.
 
 This is the one feature that runs downloaded code (everything else is data loaded by whitelist); it
 only runs when you click Export or name the resource on the command line. Supported where PyTorch
 2.14 has CPU wheels: Windows x86_64, Linux x86_64 / aarch64, macOS arm64 (14+).
+
+RF-DETR large and DEIMv2 L/X overflow half precision (NaN or garbage with OpenVINO's f16, the
+GPU default and the CPU default on ARM): OpenVINO runs them in f32 (`gpu_precision` still
+overrides on GPU), which is slower; prefer the smaller DEIMv2 / RF-DETR models on an iGPU.
+
+DEIMv2 license: the source is pinned to the last commit released under Apache-2.0 (2026-08-14) and
+the Hugging Face weights were published in 2025-10 under that license; the DEIMv2 repository has
+since moved to a non-commercial license. The DINOv3-based variants (`deimv2-s/m/l/x`) also carry
+Meta's DINOv3 License for the backbone. Check both before commercial use.
 
 **By hand** (also makes OpenVINO IR):
 
 ```sh
 uv venv --python 3.11 .venv
 uv pip install -r scripts/requirements-export.txt         # or .venv/bin/pip install -r ...
-.venv/Scripts/python.exe scripts/export_yolo26.py          # Windows
-.venv/bin/python scripts/export_yolo26.py                  # Linux / macOS
+.venv/bin/python scripts/export_model.py --name yolo26n yolo26s   # Linux / macOS (Windows: .venv/Scripts/python.exe)
+.venv/bin/python scripts/export_model.py --name deimv2-n --weights <dir with model.safetensors + config.json> --source <DEIMv2 checkout>
 ```
 
-This writes `yolo26{n,s,m}.{xml,bin,onnx,yaml}` and prints the `"models"` snippet for the config
-file. The output directory is `--out-dir` (default `target/release/models` when it exists, i.e. next
-to the release exe, else `models/`); point it at the `models` directory next to the exe you run (the
-Config page names it). The files then appear under *Local models (not in config)* with an
-*Add to config* button (the `.onnx` is preferred: it also runs on ONNX Runtime, incl. CoreML). YOLO26 weights are AGPL-3.0 and are never committed; `models/`, `cache/` and `openvino/` are
-git-ignored.
+This writes `<name>.{xml,bin,onnx,yaml}` and prints the `"models"` snippet for the config file
+(`--help` lists the recipes and options). The output directory is `--out-dir` (default
+`target/release/models` when it exists, i.e. next to the release exe, else `models/`); point it at
+the `models` directory next to the exe you run (the Config page names it). The files then appear
+under *Local models (not in config)* with an *Add to config* button (the `.onnx` is preferred: it
+also runs on ONNX Runtime, incl. CoreML). Weights are never committed (YOLO weights are AGPL-3.0);
+`models/`, `cache/` and `openvino/` are git-ignored.
 
 ### Converting ONNX models to OpenVINO IR
 
@@ -332,13 +355,13 @@ frontend, or to ship FP16 weights, convert it with the same venv:
 .venv/bin/python scripts/convert_onnx_to_ir.py models/rt-detrv2-s.onnx   # -> models/rt-detrv2-s.{xml,bin}
 ```
 
-To change the pinned export packages, edit `scripts/requirements-yolo26-export.txt` and regenerate
-the locks with `scripts/yolo26-export/gen_locks.sh <path to the pinned uv>`.
+To change the pinned export packages, edit `scripts/requirements-model-export.txt` and regenerate
+the locks with `scripts/model-export/gen_locks.sh <path to the pinned uv>`.
 
 ### Repository layout
 
 - `src/` Rust crate (see CLAUDE.md for the module map)
-- `scripts/` service install scripts (Windows PowerShell, systemd, launchd) and the YOLO26 export script
+- `scripts/` service install scripts (Windows PowerShell, systemd, launchd) and the model export script
 - `deploy/` systemd unit, launchd plist, docker-compose; `Dockerfile` at the root
 - `docs/PLAN.md` implementation plan and phase checklist
 - `.github/workflows/ci.yml` build, lint, test and a CPU smoke test on Windows, Linux and macOS; `release.yml` builds the per-OS archives and a draft release
@@ -629,7 +652,8 @@ response has `success: false` or a non-200 status.
 ## License
 
 MIT. Portions derived from [blue-onyx](https://github.com/xnorpx/blue-onyx) (MIT, Marcus Asteborg).
-See `LICENSE`. YOLO26 weights and the Ultralytics exporter are AGPL-3.0 and are not distributed
-with this project: the on-demand export downloads the official weights from Ultralytics' GitHub
-release on your request and exports them on your machine (see above). The blue-onyx IPcam models and RT-DETRv2 models are downloaded from their own
+See `LICENSE`. Ultralytics YOLO weights and the Ultralytics exporter are AGPL-3.0 and are not
+distributed with this project: the on-demand export downloads the official weights from
+Ultralytics' GitHub release on your request and exports them on your machine (see above), as it
+does for RF-DETR large (Apache-2.0) and DEIMv2 (see the license note above). The blue-onyx IPcam models and RT-DETRv2 models are downloaded from their own
 Hugging Face repositories under their own licenses.

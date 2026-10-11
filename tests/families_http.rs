@@ -1,5 +1,5 @@
 //! End-to-end HTTP test for the phase-2 model families: YOLO26 (IR from
-//! `scripts/export_yolo26.py`, both explicit and `auto` family) and RT-DETRv2 (ONNX), served
+//! `scripts/export_model.py`, both explicit and `auto` family) and RT-DETRv2 (ONNX), served
 //! together on CPU and queried through `/v1/vision/custom/{model}`.
 //!
 //! Each model is used only if present under `models/` (`yolo26n.xml`, `yolo26s.xml`,

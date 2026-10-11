@@ -429,7 +429,7 @@ fn missing_model_files() {
     assert!(r.is_satisfied());
     let e = r.model("yolo26s").unwrap().error.clone().unwrap();
     assert!(
-        e.contains("export_yolo26.py") && e.contains("Config page"),
+        e.contains("export_model.py") && e.contains("Config page"),
         "{e}"
     );
     assert!(
@@ -805,15 +805,17 @@ fn cuda_libraries_system_install_vs_download() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// YOLO26 export (catalog pins, needs-export, fetch routing)
+// Model export (catalog pins, needs-export, fetch routing)
 // ---------------------------------------------------------------------------------------------
 
 #[test]
 fn yolo26_exports_and_uv_are_pinned() {
-    // Five sizes, the official Ultralytics release assets, AGPL-3.0, family yolo26.
+    // YOLO26: five sizes, unchanged. Every Ultralytics model: the official release assets,
+    // AGPL-3.0, family yolo26 (end-to-end v10 / 26) or yolo8.
     let sizes: Vec<&str> = catalog::EXPORT_MODELS
         .iter()
         .map(|r| r.model_name().unwrap())
+        .filter(|n| n.starts_with("yolo26"))
         .collect();
     assert_eq!(
         sizes,
@@ -823,8 +825,17 @@ fn yolo26_exports_and_uv_are_pinned() {
         let name = r.model_name().unwrap();
         assert_eq!(r.id, format!("model:{name}"));
         assert_eq!(r.kind, ResourceKind::ExportModel);
+        assert_eq!(
+            catalog::export_files(r),
+            Some((format!("{name}.onnx"), format!("{name}.yaml")))
+        );
+        assert!(catalog::model(name).is_none());
+        assert!(blue_onyx_prism::download::find(name).is_none());
+        if catalog::export_recipe(r) != Some(catalog::ExportRecipe::Ultralytics) {
+            continue;
+        }
         assert_eq!(r.license, "AGPL-3.0");
-        assert_eq!(r.version, catalog::YOLO26_EXPORT_VERSION);
+        assert_eq!(r.version, catalog::ULTRALYTICS_EXPORT_VERSION);
         assert!(r.platform.is_none());
         assert_eq!(r.parts.len(), 1);
         let p = &r.parts[0];
@@ -835,18 +846,21 @@ fn yolo26_exports_and_uv_are_pinned() {
         assert_eq!(p.file_name, format!("{name}.pt"));
         assert_eq!(p.layout, Layout::File);
         assert!(
-            p.size > 5_000_000 && p.size < 130_000_000,
+            p.size > 4_000_000 && p.size < 150_000_000,
             "{name} {}",
             p.size
         );
         assert!(!r.is_large(), "the weights alone are small");
-        assert!(matches!(
-            r.provides,
-            catalog::Provides::Model {
-                family: ModelFamilyKind::Yolo26,
-                ..
-            }
-        ));
+        let e2e = name.starts_with("yolov10") || name.starts_with("yolo26");
+        assert!(
+            matches!(
+                r.provides,
+                catalog::Provides::Model {
+                    family: ModelFamilyKind::Yolo26,
+                    ..
+                }
+            ) == e2e
+        );
         assert_eq!(
             catalog::export_files(r),
             Some((format!("{name}.onnx"), format!("{name}.yaml")))
@@ -922,6 +936,63 @@ fn yolo26_exports_and_uv_are_pinned() {
         );
     }
     assert!(catalog::toolchain_estimate("macos", "x86_64").is_none());
+}
+
+#[test]
+fn rfdetr_large_is_an_export_now() {
+    let inst = Installed {
+        ort_in_build: true,
+        ..Installed::default()
+    }
+    .with_resources(&[OPENVINO_RUNTIME_ID]);
+    let hw = HardwareInfo::new("linux", "x86_64", vec![]);
+    // A config that still names the old download: needs export, nothing is downloaded.
+    let cfg = config(vec![
+        model("models/rfdetr-large.onnx"),
+        model("models/deimv2-n.onnx"),
+    ]);
+    let r = needed(&cfg, &hw, &inst);
+    assert!(r.is_satisfied(), "{:?}", ids(&r));
+    for (m, id) in [
+        ("rfdetr-large", "model:rfdetr-large"),
+        ("deimv2-n", "model:deimv2-n"),
+    ] {
+        let p = r.model(m).unwrap();
+        assert_eq!(p.needs_export, Some(id));
+        assert!(p.error.as_deref().unwrap().starts_with("needs export:"));
+    }
+    assert!(blue_onyx_prism::download::find("rfdetr-large").is_none());
+
+    // The old onnx-community download on disk: its manifest is another version, so it does not
+    // count as installed and the plan says it is outdated.
+    let root = std::env::temp_dir().join(format!("bop-rfdetr-old-{}", std::process::id()));
+    let models = root.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::write(models.join("rfdetr-large.onnx"), b"old v1 model").unwrap();
+    std::fs::write(
+        models.join(".rfdetr-large.installed.json"),
+        r#"{"id":"model:rfdetr-large","version":"4988fbacee4aa815e43c2e0666377ab26bddf1e8","sha256":[],"files":["rfdetr-large.onnx"]}"#,
+    )
+    .unwrap();
+    let cfg = Config {
+        download_dir: Some(root.clone()),
+        ..config(vec![model("models/rfdetr-large.onnx")])
+    };
+    let inst = blue_onyx_prism::resources::resolve::detect_installed(&cfg, &root, None);
+    assert!(!inst.has_file(std::path::Path::new("models/rfdetr-large.onnx")));
+    let r = needed(&cfg, &hw, &inst);
+    let p = r.model("rfdetr-large").unwrap();
+    assert_eq!(p.needs_export, Some("model:rfdetr-large"));
+    assert!(
+        p.error.as_deref().unwrap().contains("older version"),
+        "{:?}",
+        p.error
+    );
+    let res = catalog::export_model("rfdetr-large").unwrap();
+    assert!(!blue_onyx_prism::resources::export::is_exported(
+        res, &models
+    ));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

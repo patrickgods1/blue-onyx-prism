@@ -14,7 +14,10 @@
 //! - [`Layout::NvidiaWheel`]: CUDA/cuDNN shared libraries from `nvidia/<component>/{bin,lib}/`,
 //!   flat.
 //! - [`Layout::Uv`]: only the `uv` / `uv.exe` binary of a uv release archive (made executable;
-//!   it is run only by a YOLO26 export the user starts, see `super::export`).
+//!   it is run only by a model export the user starts, see `super::export`).
+//! - [`Layout::SourceTree`]: the DEIMv2 source archive: `engine/**/*.py`, `configs/**/*.yml` and
+//!   the license, paths kept (plain path components only). Imported / read only by a DEIMv2
+//!   export the user starts.
 //! - [`Layout::File`]: not an archive; the manager moves the verified file into place.
 
 use super::catalog::{ArchiveKind, Flavor, Layout, Resource, ResourceKind};
@@ -91,8 +94,45 @@ pub fn extract_part(
                 ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, |_, _, _| None),
             }
         }
+        Layout::SourceTree => match kind {
+            ArchiveKind::Zip => extract_zip(archive, dest, source_wanted),
+            ArchiveKind::TarGz => extract_tgz(archive, dest, source_wanted, |_, _, _| None),
+        },
         Layout::File => anyhow::bail!("{} is not an archive", archive.display()),
     }
+}
+
+/// Source archives (`<top>/...`, as GitHub makes them): `engine/**/*.py`, `configs/**/*.yml`
+/// (the training configs the model is built from) and the top-level `LICENSE` / `LICENSE.md`,
+/// paths kept below the top folder. Every component must be a plain
+/// name (ASCII letters, digits, `_`, `-`, `.`; not starting with `.`).
+pub fn source_wanted(entry: &str) -> Option<String> {
+    let parts = components(entry)?;
+    let rest = parts.get(1..)?;
+    let plain = |p: &String| {
+        !p.starts_with('.')
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    if rest.is_empty() || !rest.iter().all(plain) {
+        return None;
+    }
+    match rest {
+        [f] if f == "LICENSE" || f == "LICENSE.md" => Some(f.clone()),
+        [first, .., last] if first == "engine" && last.ends_with(".py") => Some(rest.join("/")),
+        [first, .., last] if first == "configs" && last.ends_with(".yml") => Some(rest.join("/")),
+        _ => None,
+    }
+}
+
+/// A source archive must have given us the package to import.
+fn source_check(got: &BTreeSet<String>) -> Result<Vec<String>> {
+    if !got.iter().any(|f| f.starts_with("engine/"))
+        || !got.iter().any(|f| f.starts_with("configs/"))
+    {
+        anyhow::bail!("the source archive has no engine/ package or configs/");
+    }
+    Ok(Vec::new())
 }
 
 /// File name of the uv binary.
@@ -151,6 +191,14 @@ pub fn finalize(
             w
         }
         ResourceKind::CudaLibs => wheel_check(target.windows(), dest, got)?,
+        ResourceKind::Tool
+            if resource
+                .parts
+                .iter()
+                .all(|p| p.layout == Layout::SourceTree) =>
+        {
+            source_check(got)?
+        }
         ResourceKind::Tool => uv_check(target.windows(), dest, got)?,
         ResourceKind::Model | ResourceKind::BenchImages | ResourceKind::ExportModel => Vec::new(),
     };
@@ -669,7 +717,9 @@ pub fn ort_wanted(layout: Layout, flavor: Flavor, windows: bool, entry: &str) ->
         Layout::NugetDirectMl => {
             (dirs == ["bin", "x64-win"] && name == DIRECTML_DLL).then(|| name.clone())
         }
-        Layout::OpenVino | Layout::NvidiaWheel | Layout::Uv | Layout::File => None,
+        Layout::OpenVino | Layout::NvidiaWheel | Layout::Uv | Layout::SourceTree | Layout::File => {
+            None
+        }
     }
 }
 
@@ -1410,5 +1460,95 @@ mod tests {
         let mut got = extract_part(&zip, ArchiveKind::Zip, Layout::Uv, None, wt, &empty).unwrap();
         assert!(finalize(win, "0.12.19", wt, &empty, &mut got).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_tree_whitelist() {
+        let w = source_wanted;
+        assert_eq!(
+            w("DEIMv2-abc/engine/deim/postprocessor.py").as_deref(),
+            Some("engine/deim/postprocessor.py")
+        );
+        assert_eq!(
+            w("DEIMv2-abc/engine/backbone/dinov3/layers/block.py").as_deref(),
+            Some("engine/backbone/dinov3/layers/block.py")
+        );
+        assert_eq!(w("DEIMv2-abc/LICENSE").as_deref(), Some("LICENSE"));
+        assert_eq!(
+            w("DEIMv2-abc/configs/deimv2/deimv2_hgnetv2_pico_coco.yml").as_deref(),
+            Some("configs/deimv2/deimv2_hgnetv2_pico_coco.yml")
+        );
+        for bad in [
+            "pax_global_header",
+            "DEIMv2-abc/",
+            "DEIMv2-abc/train.py",
+            "DEIMv2-abc/tools/deployment/export_onnx.py",
+            "DEIMv2-abc/engine/data/x.yml",
+            "DEIMv2-abc/configs/x.py",
+            "DEIMv2-abc/configs/deimv2/x.yaml.sh",
+            "DEIMv2-abc/engine/../../x.py",
+            "DEIMv2-abc/engine/.hidden/x.py",
+            "DEIMv2-abc/engine/a b.py",
+            "DEIMv2-abc/engine/x.py.sh",
+            "DEIMv2-abc/example.jpg",
+            "C:/x/engine/x.py",
+        ] {
+            assert_eq!(w(bad), None, "{bad}");
+        }
+
+        // A real tar.gz: only the whitelisted files land, paths kept.
+        let dir = std::env::temp_dir().join(format!("bop-src-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("src.tar.gz");
+        {
+            let f = std::fs::File::create(&archive).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            for (name, body) in [
+                ("top/engine/__init__.py", "from . import data\n"),
+                ("top/engine/deim/deim.py", "x = 1\n"),
+                ("top/configs/base/deimv2.yml", "a: 1\n"),
+                ("top/train.py", "import os\n"),
+                ("top/LICENSE", "Apache\n"),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                tar.append_data(&mut h, name, body.as_bytes()).unwrap();
+            }
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let dest = dir.join("out");
+        let t = Target {
+            os: "linux",
+            arch: "x86_64",
+        };
+        let mut got = extract_part(
+            &archive,
+            ArchiveKind::TarGz,
+            Layout::SourceTree,
+            None,
+            t,
+            &dest,
+        )
+        .unwrap();
+        assert_eq!(
+            got.iter().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "LICENSE",
+                "configs/base/deimv2.yml",
+                "engine/__init__.py",
+                "engine/deim/deim.py"
+            ]
+        );
+        assert!(dest.join("engine/deim/deim.py").is_file());
+        assert!(!dest.join("train.py").exists());
+        let src = crate::resources::catalog::deimv2_source().unwrap();
+        finalize(src, src.version, t, &dest, &mut got).unwrap();
+        assert!(dest.join("VERSION").is_file());
+        let mut empty = BTreeSet::new();
+        assert!(finalize(src, src.version, t, &dir.join("none"), &mut empty).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
