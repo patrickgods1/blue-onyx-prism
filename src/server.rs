@@ -7,7 +7,7 @@ use crate::backend::detect::HardwareInfo;
 use crate::backend::select::{OpenVinoProbe, OrtProbe, RuntimeProbe, Selection, select};
 use crate::backend::spec::{self, DeviceSpec};
 use crate::cli::LogReloadHandle;
-use crate::config::{Config, FORM_FIELDS, LogLevel};
+use crate::config::{Config, FORM_FIELDS, LogLevel, ModelConfig};
 use crate::metrics::{Metrics, Stat};
 use crate::registry::ModelRegistry;
 use crate::setup_onnxruntime::InstalledOrt;
@@ -158,7 +158,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Bind `0.0.0.0:port` and serve until `shutdown` or `state.restart` is cancelled.
+/// Bind `0.0.0.0:port` (and `[::1]:port`, best effort) and serve until `shutdown` or
+/// `state.restart` is cancelled.
 pub async fn serve(
     state: Arc<AppState>,
     port: u16,
@@ -179,16 +180,35 @@ pub async fn serve(
             }
         }
     };
-    info!("listening on http://{addr}");
+    // `localhost` may resolve to ::1 first, and some clients do not fall back to 127.0.0.1.
+    let loopback6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    let listener6 = match tokio::net::TcpListener::bind(loopback6).await {
+        Ok(l) => Some(l),
+        Err(e) => {
+            warn!("not listening on {loopback6}: {e}");
+            None
+        }
+    };
+    info!("listening on {addr}; open http://localhost:{port}/");
     let restart = state.restart.clone();
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async move {
+    let stopped = move || {
+        let (shutdown, restart) = (shutdown.clone(), restart.clone());
+        async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
                 _ = restart.cancelled() => {}
             }
-        })
-        .await?;
+        }
+    };
+    let app = router(state);
+    let v4 = axum::serve(listener, app.clone()).with_graceful_shutdown(stopped());
+    match listener6 {
+        Some(l6) => {
+            let v6 = axum::serve(l6, app).with_graceful_shutdown(stopped());
+            tokio::try_join!(v4.into_future(), v6.into_future())?;
+        }
+        None => v4.await?,
+    }
     info!("HTTP server stopped");
     Ok(())
 }
@@ -333,13 +353,21 @@ struct WelcomeTemplate {
 /// Hardware, runtimes and device options as seen by this process.
 struct DevicesSnapshot {
     hardware: HardwareInfo,
+    /// Global options and `auto` ranking (any model, with an `.onnx`).
     selection: Selection,
+    /// What the options were built from (per-model selections, [`Self::model_selection`]).
+    probe: RuntimeProbe,
     openvino_version: String,
     openvino_devices: Vec<String>,
     onnxruntime: Option<InstalledOrt>,
 }
 
 impl DevicesSnapshot {
+    /// The selection model `m` loads with: see [`model_selection`].
+    fn model_selection(&self, state: &AppState, cfg: &Config, m: &ModelConfig) -> Selection {
+        model_selection(state, &self.hardware, &self.probe, cfg, m)
+    }
+
     /// Display text of the device `auto` resolves to.
     fn auto_pick_label(&self) -> String {
         match self.selection.auto_pick() {
@@ -356,6 +384,34 @@ impl DevicesSnapshot {
     }
 }
 
+/// The selection model `m` loads with (after a restart, as the registry builds it): its own
+/// `.onnx` check, and `auto` ordered by the model's benchmark speed order from the current
+/// `benchmark.json` (cached by file stamp, see `live::bench_summary`).
+pub(crate) fn model_selection(
+    state: &AppState,
+    hw: &HardwareInfo,
+    probe: &RuntimeProbe,
+    cfg: &Config,
+    m: &ModelConfig,
+) -> Selection {
+    let path = cfg.data_path(&m.path);
+    let mut sel = select(
+        hw,
+        probe,
+        crate::backend::select::onnx_path_for(&path).is_some(),
+    );
+    let bench = live::bench_summary(&crate::benchmark::results_path(&state.config_path));
+    let key = crate::registry::normalize_name(&m.effective_name());
+    if let Some(order) = (*bench)
+        .as_ref()
+        .and_then(|b| b.models.get(&key))
+        .and_then(|f| f.auto_order.as_deref())
+    {
+        sel.apply_measured_order(order);
+    }
+    sel
+}
+
 /// Snapshot of the process's devices. Uses the shared runtimes when they are free (workers hold
 /// the lock while compiling a model; waiting would stall the page), else rebuilds the options from
 /// the OpenVINO facts the registry captured at startup.
@@ -369,9 +425,8 @@ fn devices_snapshot(state: &AppState) -> DevicesSnapshot {
             rt.probe().clone(),
         ))
     });
-    let probe = live.as_ref().map(|(_, _, p)| p.clone());
-    let live = live.map(|(h, s, _)| (h, s));
-    let (hardware, selection) = live.unwrap_or_else(|| {
+    let live_probe = live.as_ref().map(|(_, _, p)| p.clone());
+    let (hardware, selection, probe) = live.unwrap_or_else(|| {
         let hardware = crate::backend::detect::hardware().clone();
         let probe = if info.openvino_version.is_empty() && info.available_devices.is_empty() {
             RuntimeProbe {
@@ -382,14 +437,14 @@ fn devices_snapshot(state: &AppState) -> DevicesSnapshot {
             RuntimeProbe::openvino_only(&info.available_devices)
         };
         let selection = select(&hardware, &probe, true);
-        (hardware, selection)
+        (hardware, selection, probe)
     });
     // Options a download would make runnable ("downloadable").
     let mut selection = selection;
     {
         let cfg = state.config_read();
         let root = crate::resources::download_root(&cfg);
-        let installed = crate::resources::detect_installed(&cfg, &root, probe);
+        let installed = crate::resources::detect_installed(&cfg, &root, live_probe);
         crate::resources::resolve::annotate_selection(
             &mut selection,
             &cfg,
@@ -409,6 +464,7 @@ fn devices_snapshot(state: &AppState) -> DevicesSnapshot {
     DevicesSnapshot {
         hardware,
         selection,
+        probe,
         openvino_version: info.openvino_version.clone(),
         openvino_devices: info.available_devices.clone(),
         onnxruntime,
@@ -1437,7 +1493,8 @@ fn model_choices(
             let facts = bench.and_then(|b| b.models.get(&key));
             let run = live::running_view(state, &name);
             let hint = facts.map(|r| {
-                let configured = crate::benchmark::configured_device(c, m, &snap.selection);
+                let sel = snap.model_selection(state, c, m);
+                let configured = crate::benchmark::configured_device(c, m, &sel);
                 let text = match &r.recommended {
                     Some(d) if configured.as_deref() == Some(d.as_str()) => {
                         if run.device.as_deref() == Some(d.as_str()) {
@@ -2427,6 +2484,7 @@ mod tests {
                     vram_mb: 0,
                     index: 0,
                     discrete: false,
+                    cuda: None,
                 },
                 GpuAdapter {
                     vendor: GpuVendor::Nvidia,
@@ -2434,14 +2492,17 @@ mod tests {
                     vram_mb: 12288,
                     index: 1,
                     discrete: true,
+                    cuda: None,
                 },
             ],
         );
         let names: Vec<String> = devices.iter().map(|d| d.to_string()).collect();
-        let selection = select(&hardware, &RuntimeProbe::openvino_only(&names), true);
+        let probe = RuntimeProbe::openvino_only(&names);
+        let selection = select(&hardware, &probe, true);
         DevicesSnapshot {
             hardware,
             selection,
+            probe,
             openvino_version: "test".into(),
             openvino_devices: names,
             onnxruntime: None,

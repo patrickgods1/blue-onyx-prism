@@ -162,14 +162,28 @@ Backward compatibility:
 
 The input is `HardwareInfo` (detected GPUs) plus `RuntimeProbe` (OpenVINO `available_devices`, the installed ORT flavor and the EPs it reports). The output is an ordered `Vec<DeviceOption { spec, label, runnable, reason }>`. `auto` is the runnable options in this order:
 
-1. **NVIDIA GPU** with a usable CUDA EP → `ort:cuda:<idx of largest VRAM>`
-2. **Intel GPU** listed by OpenVINO → `openvino:gpu`, choosing the discrete one (Arc) when `DEVICE_TYPE=discrete`
-3. **AMD or other GPU on Windows** with the DirectML EP → `ort:directml:<idx>`
-4. **macOS arm64** with the CoreML EP → `ort:coreml`
-5. **CPU**: `openvino:cpu`, else `ort:cpu`. This is always the final fallback.
+1. **Discrete GPUs**, larger VRAM first (ties in detection order), each with its runtimes in order:
+   NVIDIA → `ort:cuda:<ordinal>`, `ort:tensorrt:<ordinal>`, then `ort:directml:<idx>` (Windows);
+   Intel Arc → `openvino:gpu.N` (`DEVICE_TYPE=discrete`), then `ort:directml:<idx>`;
+   AMD or other → `ort:directml:<idx>` (Windows). An NVIDIA GPU whose compute capability the pinned
+   ORT CUDA build has no kernels for (Pascal on Windows) is not runnable on CUDA/TensorRT, so it starts
+   at DirectML.
+2. **Integrated GPUs**: Intel via OpenVINO (`openvino:gpu`), then DirectML on Windows for the ones
+   OpenVINO does not cover (AMD APUs; Intel only when OpenVINO has no GPU).
+3. **macOS arm64** with the CoreML EP → `ort:coreml`
+4. **CPU**: `openvino:cpu`, else `ort:cpu`. This is always the final fallback.
+
+Benchmark order (added 2026-10-11): when `benchmark.json` beside the config has results for a model,
+`auto` for that model puts first the devices `recommend()` chooses among (ran on the device itself,
+agree with the CPU reference or no reference ran, as accurate as the best within the metric's tie),
+fastest full-request p50 first (`benchmark::speed_order`), then the rest of the ranking above; the CPU
+stays last. Entries that are not a runnable option now (device gone, another ORT flavor) and results
+recorded on a different GPU set are ignored. The registry reads the file when it is (re)built
+(`Runtimes::set_measured_orders`); `list-devices` and the Config page use the same order. Explicit
+devices are unaffected.
 
 Exclusions and per-model filtering:
-- TensorRT and NPU are listed and selectable but never picked by `auto`: TensorRT takes minutes to build its first engine, and NPU support for these models varies.
+- NPU is listed and selectable but never picked by `auto`: NPU support for these models varies. TensorRT joins `auto` (after CUDA on the same GPU) only when its libraries load: it takes minutes to build its first engine, so it is a fallback for a CUDA failure.
 - Linux AMD (MIGraphX/ROCm) isn't in the stock ORT packages, so for now it falls to CPU.
 - ORT needs `.onnx`. A model given as `.xml` uses a sibling `<stem>.onnx` if one exists; otherwise its ORT options are marked "needs ONNX export" and `auto` skips them for that model.
 - Options that can't run carry a reason, for example "NVIDIA GPU found but CUDA 12/cuDNN 9 not loadable" or "run `setup-onnxruntime`".
@@ -383,7 +397,7 @@ Handler flow: multipart (`image`, optional `min_confidence`; 32 MB body limit) -
 - **Licenses:** YOLO26 AGPL-3.0 (weights exported locally, not committed); RT-DETRv2 Apache-2.0; check MikeLud model license before bundling; code MIT with blue-onyx attribution.
 - **One ORT library per process:** the CUDA and DirectML builds can't be loaded together, so `setup-onnxruntime` installs one flavor chosen from the hardware, and the options list reflects that flavor.
 - **CUDA/cuDNN are user-installed:** they're too large to bundle. The CUDA option shows exactly which library is missing, and `auto` skips it until it loads.
-- **TensorRT first-build time:** building the first engine takes minutes, so it's never picked by `auto` and keeps an engine cache in `cache/tensorrt`.
+- **TensorRT first-build time:** building the first engine takes minutes, so `auto` tries it only after CUDA on the same GPU, and it keeps an engine cache in `cache/tensorrt`.
 - **DirectML EP in maintenance mode:** it's still shipped and works on DX12 GPUs. Revisit if Microsoft drops it, with Windows ML EPs as a possible replacement.
 - **CoreML slower than OpenVINO CPU on M1:** measured `inferenceMs` for IPcam-general is 37 (openvino:cpu), 69 (ort:cpu), 104 (ort:coreml); rt-detrv2-s is 101 (openvino:cpu), 235 (ort:cpu). CoreML partitions the graph (203 of 257 nodes in 53 pieces), so the Neural Engine/GPU gains are lost to transfers. `auto` still ranks CoreML first on Apple silicon; revisit that ranking (users can set `"device": "openvino:cpu"` meanwhile).
 - **RT-DETR on CoreML aborts the process with a dynamic batch:** ORT 1.24.4 hands Core ML a program with unbounded dims and MPSGraph asserts (`'mps.concat' op invalid input tensor shapes` -> `original module failed verification`). With the batch pinned to 1 (free-dimension override on `N`) it runs correctly and faster than `openvino:cpu` (rt-detrv2-s 57 vs 105 ms, -x 200 vs 329 ms full request on an M1), so only RT-DETR models with unpinnable dynamic input dims are refused on `ort:coreml` (`backend/ort.rs` `unsupported_on`).

@@ -7,9 +7,12 @@ use super::images::{GroundTruth, ImageSet, SetKind};
 use super::metrics::GtBox;
 use super::threshold::{Objective, ThresholdAdvice};
 use super::{Bench, Comparison, Detection, Job, MATCH_IOU, REFERENCE_DEVICES, RunResult, compare};
+use crate::backend::detect::HardwareInfo;
 use crate::backend::spec::Device;
+use crate::config::{Config, ModelConfig};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// File name of the persisted results, in the config file's directory.
@@ -17,6 +20,27 @@ pub const RESULTS_FILE: &str = "benchmark.json";
 /// Devices within this fraction of the fastest total p50 count as equally fast (timing noise);
 /// among them the configured device is kept.
 pub const NOISE_MARGIN: f64 = 0.05;
+
+/// Measured `auto` orders of `models` (keyed by `config.data_path(&m.path)`, what the registry
+/// plans with) from `results` on `hw`; see [`BenchmarkResults::auto_order`]. Models are matched
+/// by name, like `--apply`.
+pub fn auto_orders<'a>(
+    results: Option<&BenchmarkResults>,
+    config: &Config,
+    models: impl IntoIterator<Item = &'a ModelConfig>,
+    hw: &HardwareInfo,
+) -> HashMap<PathBuf, Vec<Device>> {
+    let Some(results) = results else {
+        return HashMap::new();
+    };
+    models
+        .into_iter()
+        .filter_map(|m| {
+            let order = results.auto_order(&m.effective_name(), hw)?;
+            Some((config.data_path(&m.path), order))
+        })
+        .collect()
+}
 
 /// `benchmark.json` beside `config_path`.
 pub fn results_path(config_path: &Path) -> PathBuf {
@@ -197,6 +221,88 @@ pub struct Recommendation {
     pub reason: String,
 }
 
+/// The eligible devices of a sweep with their grades, and which of them are as accurate as the
+/// best: shared by [`recommend`] (the first of [`Ranked::fastest_accurate`]) and [`speed_order`]
+/// (all of them, the measured `auto` order).
+struct Ranked<'a> {
+    /// Eligible devices ([`DeviceResult::eligible`]) that have grades or a p50, in sweep order.
+    eligible: Vec<(&'a DeviceResult, Grades)>,
+    /// The grading metric of the sweep (its tie decides "as accurate").
+    metric: AccuracyMetric,
+    /// Best accuracy score among `eligible`; None when nothing was scored.
+    top_acc: Option<f64>,
+}
+
+impl<'a> Ranked<'a> {
+    fn of(devices: &'a [DeviceResult]) -> Self {
+        let eligible: Vec<(&DeviceResult, Grades)> = devices
+            .iter()
+            .filter(|d| d.eligible())
+            .filter_map(|d| {
+                let g = d.grades().copied().or_else(|| {
+                    d.total_p50()
+                        .map(|p| Grades::new(None, p, Default::default(), false))
+                })?;
+                Some((d, g))
+            })
+            .collect();
+        // Devices of one model whose detections agree differ in accuracy only by numeric noise
+        // (OpenVINO's f16 CPU inference on ARM moves AP by ~1 point), so accuracy within
+        // ACCURACY_TIE of the best counts as equal and the fastest of those wins. Letter grades
+        // are too coarse here: 14 ms and 35 ms are both speed A.
+        // Every run of one sweep is graded on one metric; the tie is on its scale.
+        let metric = eligible
+            .iter()
+            .find(|(_, g)| g.accuracy_score.is_some())
+            .map_or(AccuracyMetric::Ap50, |(_, g)| g.metric);
+        let top_acc = eligible
+            .iter()
+            .filter_map(|(_, g)| g.accuracy_score)
+            .max_by(f64::total_cmp);
+        Self {
+            eligible,
+            metric,
+            top_acc,
+        }
+    }
+
+    fn as_accurate(&self, g: &Grades) -> bool {
+        match (self.top_acc, g.accuracy_score) {
+            (Some(top), Some(a)) => a >= top - self.metric.tie(),
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
+
+    /// The eligible devices as accurate as the best, fastest full-request p50 first (ties:
+    /// [`Grades::rank_cmp`], then sweep order).
+    fn fastest_accurate(&self) -> impl Iterator<Item = (&'a DeviceResult, Grades)> {
+        let mut v: Vec<(&'a DeviceResult, Grades)> = self
+            .eligible
+            .iter()
+            .filter(|(_, g)| self.as_accurate(g))
+            .copied()
+            .collect();
+        v.sort_by(|a, b| {
+            a.1.p50_ms
+                .total_cmp(&b.1.p50_ms)
+                .then_with(|| Grades::rank_cmp(&a.1, &b.1))
+        });
+        v.into_iter()
+    }
+}
+
+/// The measured `auto` order of one sweep: the devices [`recommend`] chooses among (ran on the
+/// device itself, detections agree with the CPU reference or no reference ran, as accurate as
+/// the best), fastest full-request p50 first. The recommended device (without the
+/// configured-device noise rule) is the first. Specs as recorded ("ort:directml:0").
+pub fn speed_order(devices: &[DeviceResult]) -> Vec<&str> {
+    Ranked::of(devices)
+        .fastest_accurate()
+        .map(|(d, _)| d.device.as_str())
+        .collect()
+}
+
 /// The best device among those that ran and whose detections agree with the CPU reference:
 /// the fastest full-request p50 among those as accurate as the best (within the grading
 /// metric's tie, [`AccuracyMetric::tie`]: [`ACCURACY_TIE`] for AP50, 0.01 for ROC AUC). When the
@@ -208,45 +314,9 @@ pub fn recommend(
     configured: Option<&str>,
     margin: f64,
 ) -> Recommendation {
-    let eligible: Vec<(&DeviceResult, Grades)> = devices
-        .iter()
-        .filter(|d| d.eligible())
-        .filter_map(|d| {
-            let g = d.grades().copied().or_else(|| {
-                d.total_p50()
-                    .map(|p| Grades::new(None, p, Default::default(), false))
-            })?;
-            Some((d, g))
-        })
-        .collect();
-    // Devices of one model whose detections agree differ in accuracy only by numeric noise
-    // (OpenVINO's f16 CPU inference on ARM moves AP by ~1 point), so accuracy within
-    // ACCURACY_TIE of the best counts as equal and the fastest of those wins. Letter grades are
-    // too coarse here: 14 ms and 35 ms are both speed A.
-    // Every run of one sweep is graded on one metric; the tie is on its scale.
-    let metric = eligible
-        .iter()
-        .find(|(_, g)| g.accuracy_score.is_some())
-        .map_or(AccuracyMetric::Ap50, |(_, g)| g.metric);
-    let top_acc = eligible
-        .iter()
-        .filter_map(|(_, g)| g.accuracy_score)
-        .max_by(f64::total_cmp);
-    let as_accurate = |g: &Grades| match (top_acc, g.accuracy_score) {
-        (Some(top), Some(a)) => a >= top - metric.tie(),
-        (Some(_), None) => false,
-        (None, _) => true,
-    };
-    let Some((best, bg)) = eligible
-        .iter()
-        .filter(|(_, g)| as_accurate(g))
-        .min_by(|a, b| {
-            a.1.p50_ms
-                .total_cmp(&b.1.p50_ms)
-                .then_with(|| Grades::rank_cmp(&a.1, &b.1))
-        })
-        .map(|(d, g)| (*d, *g))
-    else {
+    let ranked = Ranked::of(devices);
+    let (eligible, metric) = (&ranked.eligible, ranked.metric);
+    let Some((best, bg)) = ranked.fastest_accurate().next() else {
         let reason = if devices.iter().any(DeviceResult::ok) {
             "no device's detections agree with the CPU reference".to_string()
         } else {
@@ -517,6 +587,20 @@ pub struct HardwareSummary {
 }
 
 impl HardwareSummary {
+    /// The results were measured on `hw`'s GPUs: same OS/arch and the same GPUs (index and
+    /// name) in the same order, so `ort:directml:N` / `openvino:gpu.N` still name the same
+    /// devices. Other GPU facts (VRAM, CUDA details) may differ.
+    pub fn same_gpus(&self, hw: &HardwareInfo) -> bool {
+        self.os == hw.os
+            && self.arch == hw.arch
+            && self.gpus.len() == hw.gpus.len()
+            && self
+                .gpus
+                .iter()
+                .zip(&hw.gpus)
+                .all(|(s, g)| s.starts_with(&format!("#{} {} (", g.index, g.name)))
+    }
+
     pub fn current() -> Self {
         let hw = crate::backend::detect::hardware();
         Self {
@@ -854,6 +938,21 @@ impl BenchmarkResults {
         self.models
             .iter()
             .find(|m| crate::registry::normalize_name(&m.model) == key)
+    }
+
+    /// The measured `auto` order of model `name` on `hw` ([`speed_order`] of its latest sweep):
+    /// None when it has no results, they were measured on other GPUs
+    /// ([`HardwareSummary::same_gpus`]) or no device qualified. Specs that no longer parse are
+    /// dropped.
+    pub fn auto_order(&self, name: &str, hw: &HardwareInfo) -> Option<Vec<Device>> {
+        if !self.hardware.same_gpus(hw) {
+            return None;
+        }
+        let order: Vec<Device> = speed_order(&self.find(name)?.devices)
+            .into_iter()
+            .filter_map(|s| crate::backend::spec::parse(s).ok()?.device().copied())
+            .collect();
+        (!order.is_empty()).then_some(order)
     }
 
     /// `(model, best confidence threshold)` of every model with threshold advice, optionally
@@ -1652,5 +1751,162 @@ mod tests {
         // A round trip keeps everything.
         let back: ModelResult = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn speed_order_is_fastest_first_among_the_recommendable() {
+        // Faster first; the CPU reference is in it too (the plan keeps the CPU last).
+        let m = model(
+            vec![
+                dev("openvino:gpu.0", 41.6, scene()),
+                dev("openvino:cpu", 80.0, scene()),
+                dev("ort:directml:0", 10.5, scene()),
+                dev("ort:directml:1", 109.2, scene()),
+            ],
+            None,
+        );
+        assert_eq!(
+            speed_order(&m.devices),
+            [
+                "ort:directml:0",
+                "openvino:gpu.0",
+                "openvino:cpu",
+                "ort:directml:1"
+            ]
+        );
+        assert_eq!(m.recommended.as_deref(), Some(speed_order(&m.devices)[0]));
+
+        // Failed runs, fallback runs and devices that disagree with the reference are out.
+        let mut fb = dev("openvino:gpu.0", 5.0, scene());
+        fb.run.as_mut().unwrap().fell_back = true;
+        let m = model(
+            vec![
+                failed("ort:directml:0"),
+                fb,
+                dev("ort:directml:1", 3.0, vec![]),
+                dev("openvino:cpu", 80.0, scene()),
+            ],
+            None,
+        );
+        assert!(!m.devices[2].eligible());
+        assert_eq!(speed_order(&m.devices), ["openvino:cpu"]);
+
+        // Accuracy: within the tie of the best counts as equal (speed decides); clearly less
+        // accurate devices are out, however fast. No reference ran: all are checked by grades.
+        let m = model(
+            vec![
+                graded("ort:directml:0", 10.0, Some(0.480)),
+                graded("openvino:gpu.0", 40.0, Some(0.490)),
+                graded("ort:directml:1", 5.0, Some(0.40)),
+            ],
+            None,
+        );
+        assert_eq!(m.reference, None);
+        assert_eq!(
+            speed_order(&m.devices),
+            ["ort:directml:0", "openvino:gpu.0"]
+        );
+
+        // Nothing ran: empty (the static ranking stays).
+        let m = model(vec![failed("ort:directml:0")], None);
+        assert!(speed_order(&m.devices).is_empty());
+    }
+
+    #[test]
+    fn auto_order_needs_the_same_gpus() {
+        use crate::backend::detect::{GpuAdapter, GpuVendor};
+        let gtx = GpuAdapter {
+            vendor: GpuVendor::Nvidia,
+            name: "NVIDIA GeForce GTX 1070 Ti".into(),
+            vram_mb: 8060,
+            index: 0,
+            discrete: true,
+            cuda: None,
+        };
+        let uhd = GpuAdapter {
+            vendor: GpuVendor::Intel,
+            name: "Intel(R) UHD Graphics 630".into(),
+            vram_mb: 128,
+            index: 1,
+            discrete: false,
+            cuda: None,
+        };
+        let hw = HardwareInfo::new("windows", "x86_64", vec![gtx.clone(), uhd.clone()]);
+        // Recorded by an older version without the CUDA facts: still the same GPUs.
+        let recorded = HardwareSummary {
+            os: "windows".into(),
+            arch: "x86_64".into(),
+            cpu: "Intel(R) Core(TM) i5-8600K CPU @ 3.60GHz".into(),
+            gpus: vec![
+                "#0 NVIDIA GeForce GTX 1070 Ti (NVIDIA, discrete, 8060 MB VRAM)".into(),
+                "#1 Intel(R) UHD Graphics 630 (Intel, integrated, 128 MB VRAM)".into(),
+            ],
+        };
+        assert!(recorded.same_gpus(&hw));
+        let mut m = model(
+            vec![
+                dev("openvino:gpu.0", 41.6, scene()),
+                dev("ort:directml:0", 10.5, scene()),
+            ],
+            None,
+        );
+        m.model = "IPcam-general".into();
+        let mut failed_only = model(vec![failed("openvino:gpu.0")], None);
+        failed_only.model = "yolo26n".into();
+        let results =
+            BenchmarkResults::new(recorded.clone(), Default::default(), vec![m, failed_only]);
+        let d = |s: &str| *crate::backend::spec::parse(s).unwrap().device().unwrap();
+        assert_eq!(
+            results.auto_order("ipcam-general.onnx", &hw),
+            Some(vec![d("ort:directml:0"), d("openvino:gpu.0")])
+        );
+        assert_eq!(results.auto_order("yolo26n", &hw), None);
+        assert_eq!(results.auto_order("other", &hw), None);
+
+        // Keyed by the resolved model path, for the models asked about only.
+        let mut cfg = Config::default();
+        let entry = |name: &str, path: &str| ModelConfig {
+            name: Some(name.into()),
+            path: path.into(),
+            ..ModelConfig::default()
+        };
+        cfg.models = vec![
+            entry("IPcam-general", "models/IPcam-general.onnx"),
+            entry("yolo26n", "models/yolo26n.xml"),
+        ];
+        let orders = auto_orders(Some(&results), &cfg, &cfg.models, &hw);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(
+            orders[&cfg.data_path(Path::new("models/IPcam-general.onnx"))][0],
+            d("ort:directml:0")
+        );
+        assert!(auto_orders(None, &cfg, &cfg.models, &hw).is_empty());
+
+        // Another GPU set (a card added, swapped or reordered): results are stale.
+        for gpus in [
+            vec![uhd.clone()],
+            vec![
+                GpuAdapter {
+                    index: 0,
+                    ..uhd.clone()
+                },
+                GpuAdapter {
+                    index: 1,
+                    ..gtx.clone()
+                },
+            ],
+            vec![
+                GpuAdapter {
+                    name: "NVIDIA GeForce RTX 3060".into(),
+                    ..gtx.clone()
+                },
+                uhd.clone(),
+            ],
+        ] {
+            let other = HardwareInfo::new("windows", "x86_64", gpus);
+            assert!(!recorded.same_gpus(&other));
+            assert_eq!(results.auto_order("IPcam-general", &other), None);
+        }
+        assert!(!recorded.same_gpus(&HardwareInfo::new("linux", "x86_64", hw.gpus.clone())));
     }
 }

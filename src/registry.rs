@@ -120,6 +120,20 @@ impl ModelRegistry {
         shutdown: CancellationToken,
         provision: Option<&crate::resources::provision::Provision>,
     ) -> Result<Self> {
+        Self::start_with_benchmark(config, metrics, shutdown, provision, None)
+    }
+
+    /// [`Self::start_with`], ordering each `auto` model's devices by the benchmark results at
+    /// `benchmark` (`benchmark.json` beside the config, read once per registry): the measured
+    /// devices fastest first, then the rest of the static ranking (see
+    /// `Selection::apply_measured_order`). A missing or unreadable file changes nothing.
+    pub fn start_with_benchmark(
+        config: &Config,
+        metrics: &Metrics,
+        shutdown: CancellationToken,
+        provision: Option<&crate::resources::provision::Provision>,
+        benchmark: Option<&Path>,
+    ) -> Result<Self> {
         if config.models.is_empty() {
             bail!(
                 "no models configured: pass `--model <path> [--family yolo5|yolo8|yolo26|rtdetr]`, \
@@ -160,7 +174,17 @@ impl ModelRegistry {
             openvino_dir: config.openvino_dir_effective(),
         };
         let ort_opts: OrtOptions = config.ort_options();
-        let runtimes = Runtimes::new_with(&opts, &ort_opts);
+        let mut runtimes = Runtimes::new_with(&opts, &ort_opts);
+        if let Some(path) = benchmark {
+            let results = crate::benchmark::BenchmarkResults::load_or_warn(path);
+            let orders = crate::benchmark::auto_orders(
+                results.as_ref(),
+                config,
+                enabled.iter().copied(),
+                runtimes.hardware(),
+            );
+            runtimes.set_measured_orders(orders);
+        }
         if let Err(e) = runtimes.require_any() {
             match provision.filter(|p| p.has_needs()) {
                 // Fresh install: the runtimes are being downloaded (or must be fetched); serve
@@ -197,6 +221,20 @@ impl ModelRegistry {
             "device options probed"
         );
         let best_cpu = runtimes.best_cpu();
+        for m in &enabled {
+            let path = config.data_path(&m.path);
+            if runtimes.measured_orders().contains_key(&path)
+                && matches!(config.device_spec_for(m), Ok(DeviceSpec::Auto))
+                && !config.force_cpu
+            {
+                let sel = runtimes.selection(Some(&path));
+                info!(
+                    model = %m.effective_name(),
+                    auto = %crate::backend::select::format_auto(&sel),
+                    "device order from benchmark results"
+                );
+            }
+        }
         // Where each enabled model is headed (label of its first runnable load candidate),
         // computed before the workers can hold the runtimes lock: shown as "<label> (loading)".
         let planned_labels: Vec<Option<String>> = enabled

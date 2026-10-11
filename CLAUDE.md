@@ -58,9 +58,13 @@ wheels, ~1.9 GB) is preloaded by path before the CUDA provider loads.
 
 Device spec (`device` in config/model entry, `--device`): `auto` (default), `openvino:gpu[.N]`,
 `openvino:cpu`, `openvino:npu`, `ort:cuda[:N]`, `ort:tensorrt[:N]`, `ort:directml[:N]`, `ort:coreml`,
-`ort:cpu`; legacy `GPU`/`GPU.N`/`CPU` mean `openvino:*`. `auto` ranks: NVIDIA+CUDA, Intel GPU (OpenVINO),
-AMD/other on Windows (DirectML), macOS arm64 (CoreML), CPU (`openvino:cpu`, else `ort:cpu`). TensorRT and
-NPU are never auto. RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim aborts MPSGraph in ORT 1.24.4). ORT needs `.onnx` files.
+`ort:cpu`; legacy `GPU`/`GPU.N`/`CPU` mean `openvino:*`. `auto` ranks: discrete GPUs first (larger VRAM
+first), each with its runtimes in order (NVIDIA: `ort:cuda`, `ort:tensorrt` when its libs load, `ort:directml` on
+Windows; Intel Arc: `openvino:gpu.N`, then `ort:directml`; AMD/other: `ort:directml` on Windows), then integrated
+GPUs (Intel via OpenVINO, else DirectML), macOS arm64 (CoreML), CPU (`openvino:cpu`, else `ort:cpu`). An NVIDIA
+GPU whose compute capability has no kernels in the pinned ORT CUDA build (`catalog.rs`) skips CUDA/TensorRT.
+A model with results in `benchmark.json` orders its `auto` devices by measured speed (fastest eligible first,
+then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim aborts MPSGraph in ORT 1.24.4). ORT needs `.onnx` files.
 
 ## Architecture (see the plan in the repo history / README for detail)
 

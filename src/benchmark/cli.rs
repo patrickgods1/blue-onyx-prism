@@ -20,7 +20,8 @@ use super::threshold::{Objective, ThresholdAdvice};
 use super::{
     Bench, BenchmarkResults, Comparison, Job, MATCH_IOU, ModelResult, Phase, RunResult, Stats,
     SweepOptions, compare, config_models, configured_device, export, job_for_config, job_for_file,
-    pick_reference, pseudo_ground_truth, reference_device, results_path, sweep,
+    no_pseudo_gt_device, pick_reference, pseudo_ground_truth, pseudo_gt_device, results_path,
+    sweep,
 };
 use crate::backend::{CoreOptions, OrtOptions, Runtimes, libs, spec};
 use crate::config::{
@@ -51,7 +52,8 @@ pub struct BenchArgs {
     /// Default: auto for --model, the configured device for config models.
     #[arg(long, value_parser = parse_device_arg)]
     pub device: Option<String>,
-    /// Run every runnable device option (see `list-devices`) for each model, grade accuracy and
+    /// Run every runnable device option (see `list-devices`; `benchmark.devices` of the config
+    /// limits them) for each model, grade accuracy and
     /// speed, compare detections with the CPU reference, print the recommended device, and save
     /// the results to `benchmark.json` next to the config file (web UI Benchmark page). Cannot
     /// be combined with --device, --force-cpu or --compare-cpu.
@@ -541,8 +543,16 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         openvino_dir,
     };
     let ort_opts: OrtOptions = config.ort_options();
-    let runtimes = Runtimes::new_with(&opts, &ort_opts);
+    let mut runtimes = Runtimes::new_with(&opts, &ort_opts);
     runtimes.require_any()?;
+    // `auto` models resolve as the server would run them (the configured device of a sweep).
+    let orders = super::auto_orders(
+        BenchmarkResults::load_or_warn(&results_path(&config_path)).as_ref(),
+        &config,
+        config.enabled_models(),
+        runtimes.hardware(),
+    );
+    runtimes.set_measured_orders(orders);
     let info = runtimes.info();
     let versions = RuntimeVersions::of(&runtimes);
     let runtimes = Mutex::new(runtimes);
@@ -619,6 +629,11 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         }
     };
 
+    // `benchmark.devices` of the config limits the sweep, as on the web UI's Benchmark page,
+    // and the pseudo-ground-truth device.
+    let sweep_devices = super::service::parse_devices(&config.benchmark.devices)
+        .context("benchmark.devices in the config")?;
+
     // Pseudo ground truth for datasets without it (accuracy relative to a reference model).
     if sets.iter().any(|s| !s.annotated()) {
         let reference = pick_reference(
@@ -636,7 +651,9 @@ pub fn run(args: BenchArgs) -> Result<bool> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .selection(Some(&job.path));
-            let device = reference_device(&sel).context("no CPU device for pseudo ground truth")?;
+            let allowed = sweep_devices.as_deref();
+            let device =
+                pseudo_gt_device(&sel, allowed).with_context(|| no_pseudo_gt_device(allowed))?;
             if !args.json {
                 eprintln!("pseudo ground truth: {} on {device} ...", job.name);
             }
@@ -683,7 +700,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
                 configured_device(&config, m, &sel)
             });
             let opts = SweepOptions {
-                devices: None,
+                devices: sweep_devices.clone(),
                 configured,
                 threshold_objective: objective,
             };

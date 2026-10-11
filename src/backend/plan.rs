@@ -5,8 +5,9 @@
 //! (compile + create request + warm-up in the worker) on each until one succeeds.
 //!
 //! Semantics:
-//! - `auto` -> the `select` ranking ([`auto_candidates`]): the first candidate is not a
-//!   fallback, every later one (down to CPU) is. A machine whose ranking is CPU only loads CPU as
+//! - `auto` -> the `select` ranking ([`auto_candidates`]; reordered by the model's benchmark
+//!   speed order when it has one, `Selection::apply_measured_order`): the first candidate is not
+//!   a fallback, every later one (down to CPU) is. A machine whose ranking is CPU only loads CPU as
 //!   a regular pick, with a note when a GPU was found but nothing GPU-class can run.
 //! - `openvino:gpu[.N]` -> GPU, then CPU as a fallback. When OpenVINO lists no GPU at all, only
 //!   CPU is tried and it counts as a fallback (unchanged from the old `DeviceSelection`).
@@ -307,6 +308,7 @@ mod tests {
             vram_mb: 12288,
             index: 0,
             discrete: true,
+            cuda: None,
         };
         let hw = HardwareInfo::new("linux", "x86_64", vec![nvidia]);
         let ov = devs(&["CPU", "GPU"]);
@@ -404,6 +406,7 @@ mod tests {
             vram_mb: 0,
             index: 0,
             discrete: false,
+            cuda: None,
         };
         let hw = HardwareInfo::new("macos", "aarch64", vec![apple]);
         let ort = OrtProbe::installed(

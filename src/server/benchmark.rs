@@ -384,7 +384,7 @@ fn config_view(state: &AppState, snap: &DevicesSnapshot) -> serde_json::Value {
                 .get(&key)
                 .cloned()
                 .filter(|_| m.enabled)
-                .or_else(|| configured_device(&cfg, m, &snap.selection));
+                .or_else(|| configured_device(&cfg, m, &snap.model_selection(state, &cfg, m)));
             let provider = m
                 .enabled
                 .then(|| state.registry.by_name(&name))

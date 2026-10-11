@@ -112,11 +112,12 @@ pub fn run_server_with(
         let workers = shutdown.child_token();
         let metrics = Arc::new(Metrics::new(crate::VERSION));
         let provision = Arc::new(provisioner.prepare(&config, loaded_ort));
-        let registry = match ModelRegistry::start_with(
+        let registry = match ModelRegistry::start_with_benchmark(
             &config,
             &metrics,
             workers.clone(),
             Some(&provision),
+            Some(&crate::benchmark::results_path(&config_path)),
         ) {
             Ok(r) => Arc::new(r),
             Err(e) => match previous.take() {

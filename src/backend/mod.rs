@@ -16,7 +16,7 @@
 //! // Whole plan (GPU, then CPU) in one call, without warm-up:
 //! let mut backend: Backend = rt.load(&spec::parse("auto")?, &req)?;
 //! // Or per candidate, compiling under the `Runtimes` lock and creating the request elsewhere:
-//! for candidate in rt.plan(&spec, &req.path) { .. }       // `auto` = hardware ranking
+//! for candidate in rt.plan(&spec, &req.path) { .. }       // `auto` = hardware (or benchmark) ranking
 //! let compiled: Compiled = rt.compile(&candidate, &req)?;   // `Compiled` is Send
 //! let mut backend = compiled.into_backend()?;             // creates the InferRequest
 //! let outs: Vec<NamedOutput> = backend.infer(&chw_f32, &extra_inputs)?;
@@ -40,6 +40,8 @@ pub use spec::{DeviceSpec, Runtime};
 
 use crate::model::{ExtraInput, NamedOutput, PortSpec};
 use anyhow::Result;
+use spec::Device;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Options applied once per runtime.
@@ -312,6 +314,9 @@ pub struct Runtimes {
     hw: HardwareInfo,
     /// What each runtime offers, captured at construction.
     probe: RuntimeProbe,
+    /// Measured `auto` order per model path (benchmark speed order, fastest first), see
+    /// [`Self::set_measured_orders`].
+    measured: HashMap<PathBuf, Vec<Device>>,
 }
 
 impl Runtimes {
@@ -393,6 +398,7 @@ impl Runtimes {
             ort_error,
             hw,
             probe,
+            measured: HashMap::new(),
         }
     }
 
@@ -405,10 +411,27 @@ impl Runtimes {
     }
 
     /// Device options and the `auto` ranking for `model` (None: any model, assuming an `.onnx`
-    /// exists for ONNX Runtime).
+    /// exists for ONNX Runtime). A model with a measured order ([`Self::set_measured_orders`])
+    /// has its `auto` ranking reordered by it.
     pub fn selection(&self, model: Option<&Path>) -> Selection {
         let has_onnx = model.is_none_or(|m| select::onnx_path_for(m).is_some());
-        select::select(&self.hw, &self.probe, has_onnx)
+        let mut sel = select::select(&self.hw, &self.probe, has_onnx);
+        if let Some(order) = model.and_then(|m| self.measured.get(m)) {
+            sel.apply_measured_order(order);
+        }
+        sel
+    }
+
+    /// Per-model measured `auto` orders (model path as passed to [`Self::plan`] -> devices,
+    /// fastest first; from `benchmark.json`, see `benchmark::auto_orders`). Replaces any earlier
+    /// orders; explicit device specs are unaffected.
+    pub fn set_measured_orders(&mut self, orders: HashMap<PathBuf, Vec<Device>>) {
+        self.measured = orders;
+    }
+
+    /// The measured `auto` orders set with [`Self::set_measured_orders`].
+    pub fn measured_orders(&self) -> &HashMap<PathBuf, Vec<Device>> {
+        &self.measured
     }
 
     /// Ok when at least one runtime is usable; otherwise the initialization errors of every
