@@ -40,6 +40,33 @@ pub(super) struct BenchFacts {
     pub objective: String,
     /// Measured `auto` order on this machine (`BenchmarkResults::auto_order`).
     pub auto_order: Option<Vec<crate::backend::spec::Device>>,
+    /// The threshold advice (the recommendation text is rewritten against the config now).
+    pub advice: Option<crate::benchmark::threshold::ThresholdAdvice>,
+}
+
+impl BenchFacts {
+    /// The recommendation with its threshold part against the threshold configured now
+    /// (`threshold`) and the one the loaded model runs with (`running`); see
+    /// [`crate::benchmark::current`]. Exact counts only where the results store them.
+    pub fn recommendation_now(&self, threshold: f32, running: Option<f64>) -> String {
+        let Some(advice) = &self.advice else {
+            return self.recommendation.clone();
+        };
+        let mut a = advice.clone();
+        let n = crate::benchmark::current::ModelNow {
+            threshold,
+            running: running.map(|r| r as f32),
+            device: None,
+        };
+        crate::benchmark::current::rebase_advice(
+            &mut a,
+            &self.model,
+            &self.recommendation,
+            &[],
+            None,
+            &n,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +117,13 @@ pub(super) fn bench_summary(path: &Path) -> Arc<Option<BenchSummary>> {
                             .map(|t| t.objective.clone())
                             .unwrap_or_else(|| m.threshold_objective.to_string()),
                         auto_order: r.auto_order(&m.model, hw),
+                        advice: m.threshold.clone().map(|mut a| {
+                            // Only what the recommendation text needs.
+                            a.exact.clear();
+                            a.roc = None;
+                            a.by_device.clear();
+                            a
+                        }),
                     },
                 )
             })
@@ -242,6 +276,7 @@ pub(super) fn payload(state: &AppState) -> Value {
             let facts = (*bench)
                 .as_ref()
                 .and_then(|b| b.models.get(&key).cloned());
+            let running = running_view(state, &name);
             json!({
                 "name": name,
                 "key": key,
@@ -254,12 +289,15 @@ pub(super) fn payload(state: &AppState) -> Value {
                 "resolvedDevice": resolved,
                 "threshold": m.confidence_threshold.map(thr),
                 "effectiveThreshold": thr(m.confidence_threshold.unwrap_or(cfg.confidence_threshold)),
-                "running": running_view(state, &name),
+                "running": running,
                 "restartNeeded": !reasons.is_empty(),
                 "reasons": reasons,
                 "bench": facts.map(|f| json!({
                     "recommended": f.recommended,
-                    "recommendation": f.recommendation,
+                    "recommendation": f.recommendation_now(
+                        m.confidence_threshold.unwrap_or(cfg.confidence_threshold),
+                        running.threshold,
+                    ),
                     "inUse": f.recommended.is_some() && f.recommended == resolved,
                     "bestThreshold": f.best_threshold.map(thr),
                     "objective": f.objective,
@@ -716,10 +754,13 @@ impl ConflictView {
 pub(super) fn conflict_page(
     state: &AppState,
     action: &'static str,
+    at: &'static str,
     conflicts: &[Conflict],
     form: &[(String, String)],
 ) -> Response {
     let mut t = super::config_template(state, None, None, None);
     t.conflict = Some(ConflictView::new(action, conflicts, form));
+    // Rendered right above its form (the form posts to `#at-<section>`).
+    t.conflict_at = at;
     (StatusCode::CONFLICT, render(&t)).into_response()
 }
