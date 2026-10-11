@@ -51,6 +51,21 @@ pub enum Command {
         #[arg(long)]
         add_to_config: bool,
     },
+    /// Add a custom model file (or the directory holding it) to the config's models list.
+    AddModel {
+        /// A `.onnx` / `.xml` file, or the directory holding one.
+        #[arg(long)]
+        path: PathBuf,
+        /// Name in `/v1/vision/custom/{name}` (default: the file name without extension).
+        #[arg(long)]
+        name: Option<String>,
+        /// Model family (fine-tuned RF-DETR needs `rfdetr`).
+        #[arg(long, value_enum, default_value = "auto")]
+        family: crate::model::ModelFamilyKind,
+        /// YAML with the class names (default: `<model>.yaml` beside it, then COCO-80).
+        #[arg(long)]
+        classes: Option<PathBuf>,
+    },
     /// List downloadable models and whether they are present locally.
     ListModels {
         #[arg(long)]
@@ -246,6 +261,17 @@ impl Cli {
                 name,
                 dir: abs(&dir),
                 add_to_config,
+            },
+            Command::AddModel {
+                path,
+                name,
+                family,
+                classes,
+            } => Command::AddModel {
+                path: absolutize(&path, base),
+                name,
+                family,
+                classes: abs(&classes),
             },
             Command::ListModels { dir } => Command::ListModels { dir: abs(&dir) },
             Command::Fetch { .. } | Command::ListResources { .. } | Command::Benchmark(_) => cmd,
@@ -529,6 +555,48 @@ mod tests {
             }
             _ => panic!("wrong command"),
         }
+    }
+
+    #[test]
+    fn add_model_parses_and_absolutizes() {
+        let base = std::env::temp_dir().join("bo-cli-base");
+        let cli = Cli::try_parse_from([
+            "x",
+            "add-model",
+            "--path",
+            "m/inference_model.onnx",
+            "--name",
+            "mine",
+            "--family",
+            "rfdetr",
+            "--classes",
+            "c.yaml",
+        ])
+        .unwrap()
+        .absolutized(&base);
+        match cli.command {
+            Some(Command::AddModel {
+                path,
+                name,
+                family,
+                classes,
+            }) => {
+                assert_eq!(path, base.join("m/inference_model.onnx"));
+                assert_eq!(name.as_deref(), Some("mine"));
+                assert_eq!(family, crate::model::ModelFamilyKind::RfDetr);
+                assert_eq!(classes, Some(base.join("c.yaml")));
+            }
+            _ => panic!("wrong command"),
+        }
+        let cli = Cli::try_parse_from(["x", "add-model", "--path", "d"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::AddModel {
+                family: crate::model::ModelFamilyKind::Auto,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["x", "add-model"]).is_err());
     }
 
     #[test]

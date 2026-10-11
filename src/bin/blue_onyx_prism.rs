@@ -246,6 +246,34 @@ fn run(cli: Cli) -> Result<()> {
             }
             return Ok(());
         }
+        Some(Command::AddModel {
+            path: model_path,
+            name,
+            family,
+            classes,
+        }) => {
+            let path = cli
+                .config
+                .clone()
+                .unwrap_or_else(Config::default_config_path);
+            let mut cfg = if path.exists() {
+                Config::load(&path)?
+            } else {
+                Config::default()
+            };
+            let req = resources::status::CustomModel {
+                path: model_path.to_string_lossy().to_string(),
+                name,
+                family,
+                classes: classes.map(|c| c.to_string_lossy().to_string()),
+            };
+            let msg = resources::status::add_custom_model(&mut cfg, &req)
+                .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
+            cfg.save(&path)?;
+            println!("{msg}");
+            println!("config: {}", path.display());
+            return Ok(());
+        }
         Some(Command::ListModels { dir }) => {
             download::print_list(&models_dir(&cli, dir));
             return Ok(());
