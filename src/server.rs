@@ -39,6 +39,7 @@ pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTART_DELAY: Duration = Duration::from_millis(250);
 
 mod benchmark;
+mod browse;
 mod live;
 
 static STYLE_CSS: &str = include_str!("../assets/style.css");
@@ -121,6 +122,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/resources/remove", post(resources_remove))
         .route("/v1/resources/add-to-config", post(resources_add_to_config))
         .route("/v1/models/add", post(models_add))
+        .route("/v1/fs/browse", get(browse::browse))
         .route("/v1/resources/export", post(resources_export))
         .route("/v1/resources/export/cancel", post(resources_export_cancel))
         .route("/stats", get(stats_page))
@@ -1671,6 +1673,9 @@ struct ConfigTemplate {
     family_choices: Vec<FamilyChoice>,
     /// Resolved data root (relative model paths are under it).
     data_root: String,
+    /// Placeholder of the model path field: a file under `models_dir` with this OS's separators
+    /// (where Browse starts).
+    model_path_example: String,
     resources_enabled: bool,
     /// Resolved `models_dir` (where exported models go).
     models_dir: String,
@@ -1807,7 +1812,13 @@ fn config_template(
         &cfg,
     ));
     let local_models = crate::resources::status::local_models(state.resources.as_ref(), &cfg);
-    let models_dir = cfg.data_path(&cfg.models_dir).display().to_string();
+    let models_path = cfg.data_path(&cfg.models_dir);
+    let model_path_example = models_path
+        .join("my-rfdetr")
+        .join("inference_model.onnx")
+        .display()
+        .to_string();
+    let models_dir = models_path.display().to_string();
     let force_cpu_note = force_cpu_note(&cfg, &snap);
     let tools_dir = cfg
         .data_root()
@@ -1857,6 +1868,7 @@ fn config_template(
         local_models,
         family_choices: family_choices(),
         data_root: cfg.data_root().display().to_string(),
+        model_path_example,
         models_dir,
         tools_dir,
         export_notice: [
@@ -3220,6 +3232,32 @@ mod tests {
         assert_eq!(ov["loaded"], true);
         assert_eq!(ov["removable"], false);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn config_page_has_browse_buttons() {
+        let state = test_state();
+        let (s, html) = get_text(&state, "/config").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains("data-browse=\"model\" data-target=\"path\""));
+        assert!(html.contains("data-browse=\"classes\" data-target=\"classes\""));
+        assert!(html.contains("id=\"browse-dialog\""));
+        // The path hint is a file under the models dir in this OS's form (where Browse starts).
+        let cfg = state.config_read().clone();
+        let example = cfg
+            .data_path(&cfg.models_dir)
+            .join("my-rfdetr")
+            .join("inference_model.onnx");
+        let escaped = askama::filters::escape(example.display(), askama::filters::Html)
+            .unwrap()
+            .to_string();
+        assert!(
+            html.contains(&format!("placeholder=\"{escaped}\"")),
+            "{html}"
+        );
+        let (s, body) = get_text(&state, "/v1/fs/browse?kind=nope").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(body.contains("\"success\":false"));
     }
 
     #[tokio::test]
