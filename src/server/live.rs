@@ -38,6 +38,8 @@ pub(super) struct BenchFacts {
     /// Best confidence threshold that can be applied, and its objective.
     pub best_threshold: Option<f32>,
     pub objective: String,
+    /// Measured `auto` order on this machine (`BenchmarkResults::auto_order`).
+    pub auto_order: Option<Vec<crate::backend::spec::Device>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,6 +69,7 @@ pub(super) fn bench_summary(path: &Path) -> Arc<Option<BenchSummary>> {
     let Some((mt, len)) = stamp else {
         return Arc::new(None);
     };
+    let hw = crate::backend::detect::hardware();
     let summary = crate::benchmark::BenchmarkResults::load_or_warn(path).map(|r| BenchSummary {
         count: r.models.len(),
         timestamp: r.timestamp.clone(),
@@ -86,6 +89,7 @@ pub(super) fn bench_summary(path: &Path) -> Arc<Option<BenchSummary>> {
                             .as_ref()
                             .map(|t| t.objective.clone())
                             .unwrap_or_else(|| m.threshold_objective.to_string()),
+                        auto_order: r.auto_order(&m.model, hw),
                     },
                 )
             })
@@ -175,22 +179,35 @@ pub(super) fn running_view(state: &AppState, name: &str) -> RunningView {
     }
 }
 
-/// Device selection of the loaded runtimes (cheap; None while they are busy compiling).
-fn quick_selection(state: &AppState) -> Option<crate::backend::select::Selection> {
+/// Hardware and runtime probe of the loaded runtimes (cheap; None while they are busy
+/// compiling).
+fn quick_probe(
+    state: &AppState,
+) -> Option<(
+    crate::backend::HardwareInfo,
+    crate::backend::select::RuntimeProbe,
+)> {
     let rt = state.registry.runtimes()?;
     let rt = rt.try_lock().ok()?;
-    Some(rt.selection(None))
+    Some((rt.hardware().clone(), rt.probe().clone()))
 }
 
-/// The device `m` runs on after a restart, as a canonical spec (`auto` resolved).
+/// The device `m` runs on after a restart, as a canonical spec (`auto` resolved with the
+/// model's own selection, see [`super::model_selection`]).
 fn configured_resolved(
     state: &AppState,
     cfg: &Config,
     m: &crate::config::ModelConfig,
-    sel: Option<&crate::backend::select::Selection>,
+    probe: Option<&(
+        crate::backend::HardwareInfo,
+        crate::backend::select::RuntimeProbe,
+    )>,
 ) -> Option<String> {
-    match sel {
-        Some(sel) => crate::benchmark::configured_device(cfg, m, sel),
+    match probe {
+        Some((hw, probe)) => {
+            let sel = super::model_selection(state, hw, probe, cfg, m);
+            crate::benchmark::configured_device(cfg, m, &sel)
+        }
         None => match cfg.device_spec_for(m).ok()? {
             crate::backend::DeviceSpec::Auto => state
                 .registry
@@ -210,7 +227,7 @@ pub(super) fn payload(state: &AppState) -> Value {
     let (revision, cfg) = state.config.snapshot();
     let pending = config_merge::pending(&state.running, &cfg);
     let bench = bench_summary(&crate::benchmark::results_path(&state.config_path));
-    let sel = quick_selection(state);
+    let probe = quick_probe(state);
     let default = cfg.effective_default_index();
     let thr = crate::config::round_threshold_f64;
     let models: Vec<Value> = cfg
@@ -221,7 +238,7 @@ pub(super) fn payload(state: &AppState) -> Value {
             let name = m.effective_name();
             let key = normalize_name(&name);
             let reasons = pending.for_model(&name);
-            let resolved = configured_resolved(state, &cfg, m, sel.as_ref());
+            let resolved = configured_resolved(state, &cfg, m, probe.as_ref());
             let facts = (*bench)
                 .as_ref()
                 .and_then(|b| b.models.get(&key).cloned());

@@ -33,7 +33,7 @@ pub mod threshold;
 
 pub use report::{
     Agreement, BenchmarkResults, DeviceResult, ModelResult, NOISE_MARGIN, RESULTS_FILE,
-    Recommendation, Verdict, recommend, results_path,
+    Recommendation, Verdict, auto_orders, recommend, results_path, speed_order,
 };
 
 use crate::api::Prediction;
@@ -1811,7 +1811,11 @@ mod tests {
             .filter(|o| o.runnable)
             .map(|o| o.spec)
             .collect();
-        Selection { options, auto }
+        Selection {
+            options,
+            auto,
+            auto_measured: false,
+        }
     }
 
     fn dev(s: &str) -> Device {

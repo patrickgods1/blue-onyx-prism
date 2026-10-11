@@ -285,12 +285,14 @@ fn fresh_windows_nvidia_with_large_downloads_needs_cuda() {
 }
 
 #[test]
-fn fresh_windows_nvidia_without_large_downloads_falls_to_openvino() {
+fn fresh_windows_nvidia_without_large_downloads_falls_to_directml() {
     let cfg = ipcam();
-    // NVIDIA + Intel iGPU: the Intel GPU via OpenVINO.
+    // NVIDIA + Intel iGPU: the discrete NVIDIA GPU via DirectML before the iGPU, plus OpenVINO
+    // for the CPU fallback.
     let r = needed(&cfg, &win(vec![intel_igpu(0), rtx(1)]), &files_only(&cfg));
-    assert_eq!(ids(&r), [OPENVINO_RUNTIME_ID]);
-    assert_eq!(pick(&r, "IPcam-general"), "openvino:gpu");
+    assert_eq!(ids(&r), ["onnxruntime-directml", OPENVINO_RUNTIME_ID]);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:directml:1");
+    assert_eq!(r.ort_flavor, Some(Flavor::DirectMl));
     // The skipped CUDA option is offered as an optional (large) download.
     let opt: Vec<&str> = r.optional.iter().map(|n| n.id()).collect();
     assert_eq!(opt, ["onnxruntime-cuda", CUDA_LIBS_ID]);
@@ -300,12 +302,17 @@ fn fresh_windows_nvidia_without_large_downloads_falls_to_openvino() {
         "{skipped:?}"
     );
     assert!(skipped[0].contains("allow_large_downloads"));
-    assert_eq!(r.ort_flavor, None);
 
-    // NVIDIA only: OpenVINO CPU.
+    // NVIDIA only: DirectML too.
     let r = needed(&cfg, &win(vec![rtx(0)]), &files_only(&cfg));
+    assert_eq!(ids(&r), ["onnxruntime-directml", OPENVINO_RUNTIME_ID]);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:directml:0");
+
+    // Linux has no DirectML: the Intel GPU via OpenVINO.
+    let linux = HardwareInfo::new("linux", "x86_64", vec![intel_igpu(0), rtx(1)]);
+    let r = needed(&cfg, &linux, &files_only(&cfg));
     assert_eq!(ids(&r), [OPENVINO_RUNTIME_ID]);
-    assert_eq!(pick(&r, "IPcam-general"), "openvino:cpu");
+    assert_eq!(pick(&r, "IPcam-general"), "openvino:gpu");
 }
 
 /// An NVIDIA GPU the CUDA driver reports with compute capability `major.minor`.
@@ -334,12 +341,18 @@ fn pascal_gpu_never_plans_the_cuda_download() {
             .all(|n| n.id() != "onnxruntime-cuda" && n.id() != CUDA_LIBS_ID)
     };
 
-    // GTX 1070 Ti + UHD 630: the Intel GPU via OpenVINO, nothing for CUDA.
+    // GTX 1070 Ti + UHD 630: the discrete GPU via DirectML before the iGPU, nothing for CUDA.
     let hw = win(vec![pascal(0), intel_igpu(1)]);
     let inst = files_only(&cfg);
     let r = needed(&cfg, &hw, &inst);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:directml:0");
+    assert_eq!(ids(&r), ["onnxruntime-directml", OPENVINO_RUNTIME_ID]);
+    assert!(no_cuda(&r), "{:?}", r.needs);
+    // An .xml-only model: ONNX Runtime cannot load it, so the iGPU via OpenVINO.
+    let mut xml = cfg.clone();
+    xml.models[0].path = "models/IPcam-general.xml".into();
+    let r = needed(&xml, &hw, &files_only(&xml));
     assert_eq!(pick(&r, "IPcam-general"), "openvino:gpu");
-    assert_eq!(ids(&r), [OPENVINO_RUNTIME_ID]);
     assert!(no_cuda(&r), "{:?}", r.needs);
     // Downloadable options: DirectML for the NVIDIA GPU, never CUDA/TensorRT.
     let offers = downloadable_options(&cfg, &hw, &inst, true);
@@ -740,10 +753,11 @@ fn fetch_jobs_follow_the_resolver() {
     let ids = |jobs: &[blue_onyx_prism::resources::Job]| -> Vec<&str> {
         jobs.iter().map(|j| j.resource.id).collect()
     };
-    // Default = --for-config: OpenVINO, and a note about the skipped CUDA libraries.
+    // Default = --for-config: DirectML for the NVIDIA GPU, OpenVINO for the CPU fallback, and a
+    // note about the skipped CUDA libraries.
     let (jobs, notes) = fetch_jobs(&cfg, &hw, &inst, &root, &FetchRequest::default()).unwrap();
-    assert_eq!(ids(&jobs), [OPENVINO_RUNTIME_ID]);
-    assert_eq!(jobs[0].target, root.join("openvino"));
+    assert_eq!(ids(&jobs), ["onnxruntime-directml", OPENVINO_RUNTIME_ID]);
+    assert_eq!(jobs[1].target, root.join("openvino"));
     assert!(
         notes
             .iter()
@@ -859,7 +873,7 @@ fn cuda_libraries_system_install_vs_download() {
             assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
             assert!(ids(&r).contains(&CUDA_LIBS_ID));
         } else {
-            assert_eq!(pick(&r, "IPcam-general"), "openvino:cpu");
+            assert_eq!(pick(&r, "IPcam-general"), "ort:directml:0");
             assert!(!ids(&r).contains(&CUDA_LIBS_ID));
             assert!(r.optional.iter().any(|n| n.id() == CUDA_LIBS_ID));
         }

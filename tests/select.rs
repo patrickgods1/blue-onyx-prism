@@ -1,10 +1,12 @@
 //! Device options and the `auto` ranking on made-up hardware (no runtime libraries needed).
 
-use blue_onyx_prism::backend::detect::{GpuAdapter, GpuVendor, HardwareInfo};
+use blue_onyx_prism::backend::detect::{
+    ComputeCapability, CudaInfo, GpuAdapter, GpuVendor, HardwareInfo,
+};
 use blue_onyx_prism::backend::select::{
     EpStatus, NEEDS_ONNX, OpenVinoProbe, OrtProbe, OvDevice, RuntimeProbe, Selection, select,
 };
-use blue_onyx_prism::backend::spec::Target;
+use blue_onyx_prism::backend::spec::{Device, Target};
 use blue_onyx_prism::backend::{ORT_UNAVAILABLE, auto_candidates};
 
 fn gpu(vendor: GpuVendor, name: &str, vram_mb: u64, index: u32, discrete: bool) -> GpuAdapter {
@@ -69,19 +71,66 @@ fn openvino_igpu() -> OpenVinoProbe {
     ])
 }
 
+/// The CUDA/TensorRT flavor; `cuda` is why CUDA (and so TensorRT, which needs the same
+/// libraries) cannot load.
 fn ort_gpu_flavor(cuda: Option<&str>) -> OrtProbe {
-    let cuda = match cuda {
-        None => EpStatus::usable(Target::Cuda),
-        Some(reason) => EpStatus::broken(Target::Cuda, reason),
+    let status = |t: Target| match cuda {
+        None => EpStatus::usable(t),
+        Some(reason) => EpStatus::broken(t, reason),
     };
     OrtProbe::installed(
         "gpu",
         vec![
-            cuda,
-            EpStatus::usable(Target::TensorRt),
+            status(Target::Cuda),
+            status(Target::TensorRt),
             EpStatus::usable(Target::Cpu),
         ],
     )
+}
+
+/// The DirectML flavor.
+fn ort_directml() -> OrtProbe {
+    OrtProbe::installed(
+        "directml",
+        vec![
+            EpStatus::usable(Target::DirectMl),
+            EpStatus::usable(Target::Cpu),
+        ],
+    )
+}
+
+/// Every ONNX Runtime EP usable (as if each flavor were loaded), to see the whole ranking.
+fn ort_everything() -> OrtProbe {
+    OrtProbe::installed(
+        "gpu",
+        [
+            Target::Cuda,
+            Target::TensorRt,
+            Target::DirectMl,
+            Target::Cpu,
+        ]
+        .into_iter()
+        .map(EpStatus::usable)
+        .collect(),
+    )
+}
+
+/// `g` with the CUDA driver's facts.
+fn with_cuda(g: GpuAdapter, ordinal: u32, major: u32, minor: u32) -> GpuAdapter {
+    GpuAdapter {
+        cuda: Some(CudaInfo {
+            ordinal,
+            compute_capability: ComputeCapability::new(major, minor),
+        }),
+        ..g
+    }
+}
+
+fn dev(spec: &str) -> Device {
+    *blue_onyx_prism::backend::spec::parse(spec)
+        .unwrap()
+        .device()
+        .unwrap()
 }
 
 fn auto(sel: &Selection) -> Vec<String> {
@@ -179,12 +228,20 @@ fn nvidia_and_intel_igpu_with_cuda() {
         ort: ort_gpu_flavor(None),
     };
     let sel = select(&hw, &probe, true);
-    assert_eq!(auto(&sel), ["ort:cuda:0", "openvino:gpu", "openvino:cpu"]);
+    // The discrete GPU first (CUDA, then TensorRT, which runs), then the iGPU.
+    assert_eq!(
+        auto(&sel),
+        [
+            "ort:cuda:0",
+            "ort:tensorrt:0",
+            "openvino:gpu",
+            "openvino:cpu"
+        ]
+    );
     assert_eq!(
         sel.auto_pick().unwrap().label,
         "ONNX Runtime CUDA (NVIDIA GeForce RTX 3060, 12288 MB)"
     );
-    // TensorRT runs but is never picked by auto.
     assert!(runnable(&sel, "ort:tensorrt:0"));
     // The gpu flavor has no DirectML.
     assert!(
@@ -207,7 +264,100 @@ fn nvidia_and_intel_igpu_with_cuda() {
     );
 
     let fell_back: Vec<bool> = auto_candidates(&sel).iter().map(|c| c.fell_back).collect();
-    assert_eq!(fell_back, [false, true, true]);
+    assert_eq!(fell_back, [false, true, true, true]);
+
+    // Every EP usable: CUDA, TensorRT and DirectML on the RTX, then the iGPU on OpenVINO
+    // (DirectML on the iGPU stays out: OpenVINO covers Intel).
+    let probe = RuntimeProbe {
+        openvino: openvino_igpu(),
+        ort: ort_everything(),
+    };
+    let sel = select(&hw, &probe, true);
+    assert_eq!(
+        auto(&sel),
+        [
+            "ort:cuda:0",
+            "ort:tensorrt:0",
+            "ort:directml:1",
+            "openvino:gpu",
+            "openvino:cpu"
+        ]
+    );
+    // TensorRT whose libraries do not load stays out.
+    let mut probe = probe;
+    probe.ort.providers[1] = EpStatus::broken(Target::TensorRt, "nvinfer_10.dll not found");
+    let sel = select(&hw, &probe, true);
+    assert_eq!(
+        auto(&sel),
+        [
+            "ort:cuda:0",
+            "ort:directml:1",
+            "openvino:gpu",
+            "openvino:cpu"
+        ]
+    );
+}
+
+#[test]
+fn pascal_dgpu_uses_directml_before_the_igpu() {
+    // GTX 1070 Ti (6.1): the pinned Windows CUDA build has no kernels for it.
+    let gtx = with_cuda(
+        gpu(
+            GpuVendor::Nvidia,
+            "NVIDIA GeForce GTX 1070 Ti",
+            8060,
+            0,
+            true,
+        ),
+        0,
+        6,
+        1,
+    );
+    let hw = HardwareInfo::new("windows", "x86_64", vec![gtx, uhd630(1)]);
+    for ort in [ort_everything(), ort_directml()] {
+        let probe = RuntimeProbe {
+            openvino: openvino_igpu(),
+            ort,
+        };
+        let sel = select(&hw, &probe, true);
+        assert!(!runnable(&sel, "ort:cuda:0") && !runnable(&sel, "ort:tensorrt:0"));
+        assert_eq!(
+            auto(&sel),
+            ["ort:directml:0", "openvino:gpu", "openvino:cpu"]
+        );
+    }
+    // An .xml-only model: ONNX Runtime cannot load it, so the iGPU leads.
+    let probe = RuntimeProbe {
+        openvino: openvino_igpu(),
+        ort: ort_directml(),
+    };
+    let sel = select(&hw, &probe, false);
+    assert_eq!(auto(&sel), ["openvino:gpu", "openvino:cpu"]);
+}
+
+#[test]
+fn amd_dgpu_before_intel_igpu() {
+    let rx6600 = gpu(GpuVendor::Amd, "AMD Radeon RX 6600", 8176, 1, true);
+    let hw = HardwareInfo::new("windows", "x86_64", vec![uhd630(0), rx6600]);
+    let probe = RuntimeProbe {
+        openvino: openvino_igpu(),
+        ort: ort_directml(),
+    };
+    let sel = select(&hw, &probe, true);
+    assert_eq!(
+        auto(&sel),
+        ["ort:directml:1", "openvino:gpu", "openvino:cpu"]
+    );
+    // Without OpenVINO's GPU, DirectML covers the iGPU too, after the dGPU.
+    let probe = RuntimeProbe {
+        openvino: openvino(vec![ov_cpu()]),
+        ort: ort_directml(),
+    };
+    let sel = select(&hw, &probe, true);
+    assert_eq!(
+        auto(&sel),
+        ["ort:directml:1", "ort:directml:0", "openvino:cpu"]
+    );
 }
 
 #[test]
@@ -237,27 +387,21 @@ fn nvidia_and_intel_igpu_without_usable_cuda() {
         Some("run `setup-onnxruntime`")
     );
 
-    // DirectML flavor on the same box: the iGPU stays on OpenVINO, the RTX (not covered by CUDA)
-    // is next through DirectML.
+    // DirectML flavor on the same box: the discrete RTX through DirectML first, then the iGPU
+    // on OpenVINO.
     let probe = RuntimeProbe {
         openvino: openvino_igpu(),
-        ort: OrtProbe::installed(
-            "directml",
-            vec![
-                EpStatus::usable(Target::DirectMl),
-                EpStatus::usable(Target::Cpu),
-            ],
-        ),
+        ort: ort_directml(),
     };
     let sel = select(&hw, &probe, true);
     assert_eq!(
         auto(&sel),
-        ["openvino:gpu", "ort:directml:1", "openvino:cpu"]
+        ["ort:directml:1", "openvino:gpu", "openvino:cpu"]
     );
 }
 
 #[test]
-fn largest_nvidia_gpu_wins() {
+fn nvidia_gpus_largest_first() {
     let hw = HardwareInfo::new(
         "linux",
         "x86_64",
@@ -272,8 +416,19 @@ fn largest_nvidia_gpu_wins() {
         ort: ort_gpu_flavor(None),
     };
     let sel = select(&hw, &probe, true);
-    // Ties keep the first.
-    assert_eq!(auto(&sel), ["ort:cuda:1", "openvino:cpu"]);
+    // Larger VRAM first, ties in platform order; each GPU with CUDA then TensorRT.
+    assert_eq!(
+        auto(&sel),
+        [
+            "ort:cuda:1",
+            "ort:tensorrt:1",
+            "ort:cuda:2",
+            "ort:tensorrt:2",
+            "ort:cuda:0",
+            "ort:tensorrt:0",
+            "openvino:cpu"
+        ]
+    );
 }
 
 #[test]
@@ -476,6 +631,29 @@ fn intel_arc_discrete_plus_igpu() {
     let fell_back: Vec<bool> = auto_candidates(&sel).iter().map(|c| c.fell_back).collect();
     assert_eq!(fell_back, [false, true, true]);
 
+    // DirectML flavor: the Arc on OpenVINO, then on DirectML, then the iGPU on OpenVINO.
+    let mut p = probe(Some("discrete"));
+    p.ort = ort_directml();
+    let sel = select(&hw, &p, true);
+    assert_eq!(
+        auto(&sel),
+        [
+            "openvino:gpu.1",
+            "ort:directml:1",
+            "openvino:gpu.0",
+            "openvino:cpu"
+        ]
+    );
+
+    // OpenVINO marks a GPU discrete that detection did not find: after detected dGPUs, before
+    // the iGPU (where it was before).
+    let hw_igpu = HardwareInfo::new("windows", "x86_64", vec![uhd630(0)]);
+    let sel = select(&hw_igpu, &probe(Some("discrete")), true);
+    assert_eq!(
+        auto(&sel),
+        ["openvino:gpu.1", "openvino:gpu.0", "openvino:cpu"]
+    );
+
     // Two GPUs, neither discrete: only the first, like a bare GPU request.
     let sel = select(
         &hw,
@@ -552,9 +730,9 @@ fn xml_only_model_skips_onnx_runtime() {
     };
     let sel = select(&hw, &probe, false);
     assert!(sel.auto.is_empty());
-    // With an .onnx it would be CUDA, then ORT CPU.
+    // With an .onnx it would be CUDA, TensorRT, then ORT CPU.
     let sel = select(&hw, &probe, true);
-    assert_eq!(auto(&sel), ["ort:cuda:0", "ort:cpu"]);
+    assert_eq!(auto(&sel), ["ort:cuda:0", "ort:tensorrt:0", "ort:cpu"]);
 }
 
 #[test]
@@ -578,5 +756,94 @@ fn options_serialize_and_format() {
     assert_eq!(
         blue_onyx_prism::backend::select::format_auto(&sel),
         "openvino:gpu -> openvino:cpu"
+    );
+}
+
+#[test]
+fn measured_order_reorders_auto() {
+    let gtx = gpu(
+        GpuVendor::Nvidia,
+        "NVIDIA GeForce GTX 1070 Ti",
+        8060,
+        0,
+        true,
+    );
+    let hw = HardwareInfo::new("windows", "x86_64", vec![gtx, uhd630(1)]);
+    let probe = RuntimeProbe {
+        openvino: openvino(vec![
+            ov_cpu(),
+            ov_dev(
+                "GPU.0",
+                "Intel(R) UHD Graphics 630 (iGPU)",
+                Some("integrated"),
+            ),
+        ]),
+        ort: ort_directml(),
+    };
+    let fresh = || select(&hw, &probe, true);
+    assert_eq!(
+        auto(&fresh()),
+        ["ort:directml:0", "openvino:gpu.0", "openvino:cpu"]
+    );
+
+    // Faster first; a runnable option outside the static ranking (DirectML on the iGPU) joins;
+    // the CPU stays last even when measured faster.
+    let mut sel = fresh();
+    sel.apply_measured_order(&[
+        dev("openvino:gpu.0"),
+        dev("openvino:cpu"),
+        dev("ort:directml:1"),
+        dev("ort:directml:0"),
+    ]);
+    assert!(sel.auto_measured);
+    assert_eq!(
+        auto(&sel),
+        [
+            "openvino:gpu.0",
+            "ort:directml:1",
+            "ort:directml:0",
+            "openvino:cpu"
+        ]
+    );
+    assert_eq!(
+        blue_onyx_prism::backend::select::format_auto(&sel),
+        "openvino:gpu.0 -> ort:directml:1 -> ort:directml:0 -> openvino:cpu (benchmark order)"
+    );
+
+    // Stale entries (CUDA from another flavor, a GPU that is gone) are skipped; the rest of the
+    // static ranking follows the measured ones.
+    let mut sel = fresh();
+    sel.apply_measured_order(&[
+        dev("ort:cuda:0"),
+        dev("openvino:gpu.3"),
+        dev("openvino:gpu.0"),
+    ]);
+    assert_eq!(
+        auto(&sel),
+        ["openvino:gpu.0", "ort:directml:0", "openvino:cpu"]
+    );
+
+    // Nothing usable (or nothing measured): the static ranking, not marked.
+    for measured in [vec![], vec![dev("ort:cuda:0"), dev("openvino:cpu")]] {
+        let mut sel = fresh();
+        sel.apply_measured_order(&measured);
+        assert!(!sel.auto_measured);
+        assert_eq!(auto(&sel), auto(&fresh()));
+    }
+
+    // Plans follow: the measured first is the regular pick, the rest are fallbacks.
+    let mut sel = fresh();
+    sel.apply_measured_order(&[dev("openvino:gpu.0")]);
+    let got: Vec<(String, bool)> = auto_candidates(&sel)
+        .iter()
+        .map(|c| (c.device.to_string(), c.fell_back))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("openvino:gpu.0".to_string(), false),
+            ("ort:directml:0".to_string(), true),
+            ("openvino:cpu".to_string(), true)
+        ]
     );
 }

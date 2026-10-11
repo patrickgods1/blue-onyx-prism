@@ -37,13 +37,23 @@ NVIDIA (CUDA/TensorRT) and DirectML devices use ONNX Runtime; see the matrix bel
 ## Hardware and device selection
 
 `"device": "auto"` (the default) chooses per model, tries the next candidate if compile or warm-up
-fails, and always ends on the CPU. Ranking: NVIDIA GPU with CUDA, Intel GPU (OpenVINO), AMD or other GPU
-on Windows (DirectML), Apple silicon (CoreML), CPU (`openvino:cpu`, else `ort:cpu`).
+fails, and always ends on the CPU. Ranking: discrete GPUs first (larger VRAM first), each with its
+runtimes in order: NVIDIA `ort:cuda`, `ort:tensorrt`, then `ort:directml` (Windows); Intel Arc
+`openvino:gpu.N`, then `ort:directml`; AMD/other `ort:directml` (Windows). Then integrated GPUs (Intel
+via OpenVINO; DirectML on Windows for the others), Apple silicon (CoreML), and the CPU (`openvino:cpu`,
+else `ort:cpu`). An NVIDIA GPU the pinned ONNX Runtime CUDA build has no kernels for (e.g. a Pascal GTX
+10xx on Windows) skips CUDA/TensorRT and starts at DirectML.
+
+When `benchmark.json` (written by `benchmark` next to the config) has results for a model, `auto` orders
+that model's devices by measured speed instead: the devices `benchmark` would recommend (ran, agree with
+the CPU reference, as accurate as the best) fastest first, then the remaining options in the ranking
+above, CPU last. Results for a device that is gone or cannot run now are ignored; the file is read when
+the models are (re)loaded. `list-devices` marks such a model's order "(benchmark order)".
 
 | OS | GPU | `auto` picks | Setup | Notes |
 |---|---|---|---|---|
 | Windows | Intel iGPU/Arc | `openvino:gpu` | `setup-openvino` | Primary target. `ort:directml` is selectable. |
-| Windows | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12 and cuDNN 9 are installed by you (not bundled). Without them `auto` skips CUDA. |
+| Windows | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12 and cuDNN 9 are installed by you (not bundled). Without them `auto` skips CUDA; with the DirectML flavor (or a Pascal card) it is `ort:directml`, ahead of an Intel iGPU. |
 | Windows | AMD / other DX12 | `ort:directml` | `setup-onnxruntime --flavor directml` | |
 | Linux | Intel | `openvino:gpu` | `setup-openvino` | `intel-opencl-icd`, `render` group. |
 | Linux | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12 + cuDNN 9 user-installed. |
@@ -51,8 +61,9 @@ on Windows (DirectML), Apple silicon (CoreML), CPU (`openvino:cpu`, else `ort:cp
 | macOS arm64 | Apple GPU | `ort:coreml` | `setup-onnxruntime` | RT-DETRv2 runs on CoreML (~1.6-1.9x `openvino:cpu` on an M1) because its batch dimension is pinned to 1; an RT-DETR export with an unnamed dynamic dimension is refused there (MPSGraph would abort) and uses the CPU. YOLO26 needs the `.onnx` export. |
 | any | none | `openvino:cpu` | `setup-openvino` | `ort:cpu` if OpenVINO is missing. |
 
-TensorRT (`ort:tensorrt`, first engine build takes minutes) and the NPU (`openvino:npu`) can be
-selected but are never chosen by `auto`. ONNX Runtime needs `.onnx` models; an IR `.xml` model uses a
+TensorRT (`ort:tensorrt`, first engine build takes minutes) follows CUDA in `auto` only when its
+libraries load, so it is tried only if CUDA fails. The NPU (`openvino:npu`) can be selected but is never
+chosen by `auto`. ONNX Runtime needs `.onnx` models; an IR `.xml` model uses a
 sibling `<stem>.onnx` if present, otherwise its ONNX Runtime options are skipped.
 
 Device specs: `auto`, `openvino:gpu[.N]`, `openvino:cpu`, `openvino:npu`, `ort:cuda[:N]`,

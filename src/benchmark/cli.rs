@@ -543,8 +543,16 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         openvino_dir,
     };
     let ort_opts: OrtOptions = config.ort_options();
-    let runtimes = Runtimes::new_with(&opts, &ort_opts);
+    let mut runtimes = Runtimes::new_with(&opts, &ort_opts);
     runtimes.require_any()?;
+    // `auto` models resolve as the server would run them (the configured device of a sweep).
+    let orders = super::auto_orders(
+        BenchmarkResults::load_or_warn(&results_path(&config_path)).as_ref(),
+        &config,
+        config.enabled_models(),
+        runtimes.hardware(),
+    );
+    runtimes.set_measured_orders(orders);
     let info = runtimes.info();
     let versions = RuntimeVersions::of(&runtimes);
     let runtimes = Mutex::new(runtimes);

@@ -2,11 +2,11 @@
 //! fetch, list-resources, list-devices, benchmark) or the HTTP service.
 
 use anyhow::Result;
-use blue_onyx_prism::backend::{CoreOptions, OrtOptions, Runtimes, select};
+use blue_onyx_prism::backend::{CoreOptions, DeviceSpec, OrtOptions, Runtimes, select};
 use blue_onyx_prism::cli::{self, Cli, Command};
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};
 use blue_onyx_prism::{
-    download, resources, runner, setup_onnxruntime, setup_openvino, system_info,
+    benchmark, download, resources, runner, setup_onnxruntime, setup_openvino, system_info,
 };
 use clap::Parser;
 use std::path::PathBuf;
@@ -32,12 +32,16 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--config` or the default config path.
+fn config_path(cli: &Cli) -> PathBuf {
+    cli.config
+        .clone()
+        .unwrap_or_else(Config::default_config_path)
+}
+
 /// The config file (`--config` or the default path) if it exists, else defaults. Read-only.
 fn read_config(cli: &Cli) -> Config {
-    let path = cli
-        .config
-        .clone()
-        .unwrap_or_else(Config::default_config_path);
+    let path = config_path(cli);
     if path.exists() {
         Config::load(&path).unwrap_or_default()
     } else {
@@ -56,7 +60,8 @@ fn models_dir(cli: &Cli, dir: Option<PathBuf>) -> PathBuf {
 }
 
 /// `list-devices`: hardware, runtimes, the option table, the `auto` pick, and the load plan of each
-/// model. Works without OpenVINO (its options are shown as not runnable).
+/// model (`auto` ordered by `benchmark.json` beside the config when it has results for the
+/// model, as the server does). Works without OpenVINO (its options are shown as not runnable).
 fn list_devices(cli: &Cli, models: &[PathBuf]) {
     let mut cfg = read_config(cli);
     if let Some(d) = &cli.openvino_dir {
@@ -69,7 +74,7 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) {
         cfg.force_cpu = true;
     }
     let ort_opts: OrtOptions = cfg.ort_options();
-    let rt = Runtimes::new_with(
+    let mut rt = Runtimes::new_with(
         &CoreOptions {
             cache_dir: None,
             intra_threads: 0,
@@ -128,6 +133,10 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) {
     if entries.is_empty() {
         return;
     }
+    let results =
+        benchmark::BenchmarkResults::load_or_warn(&benchmark::results_path(&config_path(cli)));
+    let orders = benchmark::auto_orders(results.as_ref(), &cfg, &entries, rt.hardware());
+    rt.set_measured_orders(orders);
     println!("Models:");
     for m in &entries {
         let path = cfg.data_path(&m.path);
@@ -144,12 +153,18 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) {
             .iter()
             .map(|c| c.device.to_string())
             .collect();
+        let measured =
+            if matches!(spec, DeviceSpec::Auto) && rt.selection(Some(&path)).auto_measured {
+                " (benchmark order)"
+            } else {
+                ""
+            };
         let onnx = match select::onnx_path_for(&path) {
             Some(_) => "",
             None => ", no .onnx for ONNX Runtime",
         };
         println!(
-            "  {name} ({}{onnx}): device {spec} -> {}",
+            "  {name} ({}{onnx}): device {spec} -> {}{measured}",
             path.display(),
             plan.join(" -> ")
         );
