@@ -33,7 +33,7 @@ On-demand model export (`src/resources/export.rs`, the only code that runs downl
 only, never by `auto_download`): `tool:uv` + `scripts/model-export/locks/*.txt` (hashed; regenerate with
 `scripts/model-export/gen_locks.sh`) + the embedded `scripts/export_model.py`; everything under `<data root>/tools/`.
 Recipes (`catalog::ExportRecipe`): Ultralytics YOLOv8/9/10/11/12/26 (`.pt`, AGPL-3.0), RF-DETR L (transformers,
-safetensors, 704 px), DEIMv2 (official code `tool:deimv2-src` pinned to the last Apache-2.0 commit + safetensors);
+safetensors, 704 px), DEIMv2 (official code `tool:deimv2-src` pinned to the last Apache-2.0 commit + safetensors; marked non-commercial / personal use, the upstream license now covers the weights);
 all offline, static-shape ONNX checked against PyTorch with ONNX Runtime, stamped with `COREML_CACHE_KEY` (ORT's
 CoreML cache is otherwise keyed by path). A manifest of another version = "needs export". `catalog::F32_MODELS`
 (RF-DETR L, DEIMv2 L/X) overflow f16: OpenVINO compiles them with f32 on CPU and GPU.

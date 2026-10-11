@@ -290,7 +290,7 @@ download, what runs and the license. Exportable (`model:<name>`):
 | `yolov8{n,s,m,l,x}`, `yolov9{t,s,m,c,e}`, `yolo11{n,s,m,l,x}`, `yolo12{n,s,m,l,x}` | Ultralytics exporter, official `.pt` (assets v8.4.0) | `yolo8` (NMS in the service) | AGPL-3.0 |
 | `yolov10{n,s,m,b,l,x}`, `yolo26{n,s,m,l,x}` | same | `yolo26` (end-to-end `[1,300,6]`) | AGPL-3.0 |
 | `rfdetr-large` (RF-DETR L, 704x704) | transformers `RfDetrForObjectDetection` + `torch.onnx`, `Roboflow/rf-detr-large` safetensors | `rfdetr` | Apache-2.0 |
-| `deimv2-{atto,femto,pico,n,s,m,l,x}` (320 / 416 / 640 px) | official DEIMv2 code (commit `add5bcd`) + `torch.onnx`, `Intellindust/DEIMv2_*_COCO` safetensors | `rtdetr` | Apache-2.0 (see below) |
+| `deimv2-{atto,femto,pico,n,s,m,l,x}` (320 / 416 / 640 px) | official DEIMv2 code (commit `add5bcd`) + `torch.onnx`, `Intellindust/DEIMv2_*_COCO` safetensors | `rtdetr` | Non-commercial / personal use (see below) |
 
 The first export sets up a private toolchain (about 375 MB download and 1.3 GB on disk on macOS
 arm64, up to ~495 MB / 1.7 GB on Linux x86_64): the pinned [uv](https://github.com/astral-sh/uv)
@@ -324,10 +324,12 @@ RF-DETR large and DEIMv2 L/X overflow half precision (NaN or garbage with OpenVI
 GPU default and the CPU default on ARM): OpenVINO runs them in f32 (`gpu_precision` still
 overrides on GPU), which is slower; prefer the smaller DEIMv2 / RF-DETR models on an iGPU.
 
-DEIMv2 license: the source is pinned to the last commit released under Apache-2.0 (2026-08-14) and
-the Hugging Face weights were published in 2025-10 under that license; the DEIMv2 repository has
-since moved to a non-commercial license. The DINOv3-based variants (`deimv2-s/m/l/x`) also carry
-Meta's DINOv3 License for the backbone. Check both before commercial use.
+DEIMv2 license: **non-commercial / personal use only.** The DEIMv2 repository moved from
+Apache-2.0 to the non-commercial DEIMv2 License (2026-08-24), which also covers the model weights.
+The export pins the last Apache-2.0 source commit (`add5bcd`) and weights published in 2025-10, but
+treat DEIMv2 as personal use (e.g. your own cameras); commercial use needs a license from
+Intellindust. The DINOv3-based variants (`deimv2-s/m/l/x`) also carry Meta's DINOv3 License for
+the backbone.
 
 **By hand** (also makes OpenVINO IR):
 
@@ -655,5 +657,5 @@ MIT. Portions derived from [blue-onyx](https://github.com/xnorpx/blue-onyx) (MIT
 See `LICENSE`. Ultralytics YOLO weights and the Ultralytics exporter are AGPL-3.0 and are not
 distributed with this project: the on-demand export downloads the official weights from
 Ultralytics' GitHub release on your request and exports them on your machine (see above), as it
-does for RF-DETR large (Apache-2.0) and DEIMv2 (see the license note above). The blue-onyx IPcam models and RT-DETRv2 models are downloaded from their own
+does for RF-DETR large (Apache-2.0) and DEIMv2 (non-commercial / personal use, see the license note above). The blue-onyx IPcam models and RT-DETRv2 models are downloaded from their own
 Hugging Face repositories under their own licenses.

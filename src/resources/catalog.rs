@@ -1344,9 +1344,11 @@ macro_rules! deimv2 {
     };
 }
 
-const DEIMV2_HGNET_LICENSE: &str =
-    "Apache-2.0 (DEIMv2 at add5bcd; later DEIMv2 releases are non-commercial)";
-const DEIMV2_DINOV3_LICENSE: &str = "Apache-2.0 (DEIMv2 at add5bcd; later DEIMv2 releases are non-commercial) + DINOv3 License (backbone)";
+/// DEIMv2 is marked non-commercial / personal use: the pinned source (add5bcd) and the weights
+/// predate the move to the non-commercial DEIMv2 License, but that license now claims the weights.
+const DEIMV2_HGNET_LICENSE: &str = "Non-commercial / personal use only (DEIMv2 License)";
+const DEIMV2_DINOV3_LICENSE: &str =
+    "Non-commercial / personal use only (DEIMv2 License) + DINOv3 License (backbone)";
 
 /// Models exported on this machine on request ([`super::export`]): the parts are the official
 /// weights (and configs); the export writes `models/<name>.onnx` + `models/<name>.yaml` (80 COCO
@@ -2252,7 +2254,11 @@ mod tests {
             let files: Vec<_> = r.parts.iter().map(|p| p.file_name).collect();
             if recipe != ExportRecipe::Ultralytics {
                 assert_eq!(files, ["model.safetensors", "config.json"], "{name}");
-                assert!(r.license.starts_with("Apache-2.0"));
+                if recipe == ExportRecipe::DeimV2 {
+                    assert!(r.license.starts_with("Non-commercial"), "{name}");
+                } else {
+                    assert!(r.license.starts_with("Apache-2.0"), "{name}");
+                }
             }
         }
         // Every size the request asked for.
