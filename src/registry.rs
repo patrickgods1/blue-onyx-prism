@@ -26,7 +26,10 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+mod plan;
+
 pub use crate::backend::RuntimeInfo;
+pub use plan::{ModelPlan, PlanOutcome, PlanRuntimes, plan_model, plan_models};
 
 /// Lowercase and strip a trailing `.onnx` / `.xml` (Blue Iris sends file stems, users may not).
 pub fn normalize_name(name: &str) -> String {
@@ -261,120 +264,57 @@ fn try_lock_runtimes(rt: &Mutex<Runtimes>) -> Option<std::sync::MutexGuard<'_, R
 }
 
 impl Spawner {
-    /// Spawn the worker of enabled model `m` (or a `Failed` handle when it cannot be set up:
-    /// missing file, pending export, bad classes, downloads that must be fetched by hand).
-    /// `planned` is the display label of its first runnable device; `after` the startup
-    /// [`LoadGate`] to wait for (reloads pass None); `stop` its own token. The returned handle
-    /// owns the thread's join handle (`join`), None for a failed handle.
+    /// Spawn the worker of a planned model (or a `Failed` handle when the plan failed: missing
+    /// file, pending export, bad classes, downloads that must be fetched by hand). `after` is
+    /// the startup [`LoadGate`] to wait for (reloads pass None); `stop` its own token. The
+    /// returned handle owns the thread's join handle (`join`), None for a failed handle.
     fn spawn_model(
         &self,
         config: &Config,
-        m: &ModelConfig,
-        provision: Option<&Provision>,
-        planned: Option<String>,
+        plan: ModelPlan,
         after: Option<LoadGate>,
         stop: CancellationToken,
     ) -> WorkerHandle {
-        let name = m.effective_name();
-        let path = config.data_path(&m.path);
-        let load = load_request(config, m, path.clone());
+        let ModelPlan {
+            name,
+            device,
+            load,
+            classes,
+            live,
+            lazy,
+            wait,
+            model,
+            planned,
+            outcome,
+            ..
+        } = plan;
         // Counters live for the whole process; the device/provider restart on each load.
         let mm = self.metrics.model(&name);
         mm.begin_load(load.requested.clone());
-
-        // Downloads this model waits for (phase 7.3).
-        if let Some(p) = provision
-            && let Some(msg) = p.manual_failure(&name)
-        {
+        if let PlanOutcome::Failed(msg) = outcome {
             warn!(model = %name, "{msg}");
             return WorkerHandle::failed(name, msg, mm);
         }
-        let mut wait = provision.and_then(|p| p.wait_for(&name));
-        if let Some(w) = &wait {
-            let only_runtimes = w.blocks().iter().all(|b| b.is_runtime());
-            if only_runtimes && path.is_file() {
-                let device = config.device_spec_for(m).unwrap_or(self.best_cpu);
-                let rt = self.runtimes.lock().unwrap_or_else(|e| e.into_inner());
-                let sel = rt.selection(Some(&path));
-                let interim = rt
-                    .plan(&device, &path)
-                    .into_iter()
-                    .find(|c| sel.option(&c.device).is_some_and(|o| o.runnable));
-                drop(rt);
-                if let Some(c) = interim {
-                    let ids: Vec<&str> = w.blocks().iter().map(|b| b.resource.id).collect();
-                    info!(
-                        model = %name,
-                        "loading on {} while {} downloads; switching after it is installed",
-                        c.device,
-                        ids.join(", ")
-                    );
-                    wait = None;
-                }
-            }
-        }
 
-        let setup = (|| -> Result<(DeviceSpec, Vec<String>)> {
-            // `force_cpu`: the best CPU option (OpenVINO, else ONNX Runtime).
-            let device = if config.force_cpu {
-                self.best_cpu
-            } else {
-                config.device_spec_for(m)?
-            };
-            if wait.is_some() {
-                // Class names are read after the files arrive (in the worker).
-                return Ok((device, Vec::new()));
-            }
-            // An exported model's file is made by a user-started export, never downloaded;
-            // a file from another version (the old RF-DETR large download) is not used.
-            if let Some(r) = crate::resources::export::pending_export(&path) {
-                bail!(
-                    "{}",
-                    crate::resources::export::needs_export_message(r, &m.path, path.is_file())
-                );
-            }
-            if !path.is_file() {
-                bail!(
-                    "model file not found: {} (download it with `download-models` or fix `path`)",
-                    path.display()
-                );
-            }
-            let classes_path = m.classes.as_deref().map(|c| config.data_path(c));
-            Ok((device, resolve_class_names(&path, classes_path.as_deref())?))
-        })();
-        let (device, classes) = match setup {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("{e:#}");
-                warn!(model = %name, "{msg}");
-                return WorkerHandle::failed(name, msg, mm);
-            }
-        };
-
-        let resolved = ModelConfig {
-            path,
-            classes: m.classes.as_deref().map(|c| config.data_path(c)),
-            ..m.clone()
-        };
         let cfg = WorkerConfig {
             name,
             device,
             load,
             classes,
-            live: LiveSettings::for_model(config, m).shared(),
+            live: live.shared(),
             queue_size: config.worker_queue_size,
-            lazy: m.lazy,
+            lazy,
             can_use_gpu: self.can_use_gpu,
-            model: resolved,
-            wait,
             concurrency: Some(crate::worker::Concurrency {
                 profile: self.profile.clone(),
-                overrides: config.concurrency_overrides(m),
+                overrides: config.concurrency_overrides(&model),
             }),
+            model,
+            wait,
             prep: Some(self.prep.clone()),
         };
         let mut handle = spawn_worker_after(self.runtimes.clone(), cfg, mm, stop, after);
-        handle.set_planned(device, planned);
+        handle.set_planned(device, planned.map(|(_, label)| label));
         handle
     }
 
@@ -561,23 +501,13 @@ impl ModelRegistry {
                 );
             }
         }
-        // Where each enabled model is headed (its first runnable load candidate), computed
-        // before the workers can hold the runtimes lock: shown as "<label> (loading)".
-        let planned: Vec<Option<(crate::backend::spec::Device, String)>> = enabled
-            .iter()
-            .map(|m| {
-                let device = if config.force_cpu {
-                    best_cpu
-                } else {
-                    config.device_spec_for(m).ok()?
-                };
-                runtimes.first_runnable(&device, &config.data_path(&m.path))
-            })
-            .collect();
+        // Where each enabled model is headed and whether it can be spawned, decided before the
+        // workers can hold the runtimes lock.
+        let plans = plan_models(config, &runtimes, provision, best_cpu)?;
         let profile = config.profile();
-        let planned_devices: Vec<_> = planned
+        let planned_devices: Vec<_> = plans
             .iter()
-            .map(|p| p.as_ref().map(|(d, _)| *d))
+            .map(|p| p.planned.as_ref().map(|(d, _)| *d))
             .collect();
         let prep_threads = preprocess_threads(config, &profile, &planned_devices);
         info!(
@@ -597,14 +527,12 @@ impl ModelRegistry {
             reload: Mutex::new(()),
         };
 
-        let mut workers = Vec::with_capacity(enabled.len());
+        let mut workers = Vec::with_capacity(plans.len());
         // Startup order: each spawned worker waits for the previous one's gate.
         let mut prev: Option<LoadGate> = None;
-        for (mi, &m) in enabled.iter().enumerate() {
-            let label = planned.get(mi).cloned().flatten().map(|(_, l)| l);
+        for plan in plans {
             let stop = spawner.shutdown.child_token();
-            let mut handle =
-                spawner.spawn_model(config, m, provision, label, prev.clone(), stop.clone());
+            let mut handle = spawner.spawn_model(config, plan, prev.clone(), stop.clone());
             let join = handle.join.take();
             if join.is_some() {
                 prev = Some(handle.load_gate());
@@ -836,17 +764,15 @@ impl ModelRegistry {
             return Ok(Reload::Stopped { name });
         };
 
-        let path = config.data_path(&m.path);
-        let device = if config.force_cpu {
-            sp.best_cpu
-        } else {
-            config.device_spec_for(m).unwrap_or(DeviceSpec::Auto)
-        };
-        let label = try_lock_runtimes(&sp.runtimes)
-            .and_then(|rt| rt.first_runnable(&device, &path))
-            .map(|(_, l)| l);
+        let plan = plan_model(
+            config,
+            m,
+            &plan::LockedRuntimes(&sp.runtimes),
+            provision,
+            sp.best_cpu,
+        );
         let stop = sp.shutdown.child_token();
-        let mut handle = sp.spawn_model(config, m, provision, label, None, stop.clone());
+        let mut handle = sp.spawn_model(config, plan, None, stop.clone());
         let join = handle.join.take();
         let device_text = handle.planned_device_text();
         let new_name = handle.name.clone();
