@@ -75,7 +75,7 @@ num_cpus = "1"
 base64 = "0.23"
 # Same major as openvino-sys's runtime-linking dependency; used to preload libtbb/libopenvino
 # (Unix) and to probe the ONNX Runtime / CUDA libraries.
-libloading = "0.8"
+libloading = "0.9"
 # ONNX Runtime (feature `onnxruntime`): the shared library is loaded at runtime (`load-dynamic`),
 # so nothing is linked or downloaded at build time. All `ort` code lives in src/backend/ort.rs.
 # No `api-NN` feature: any ONNX Runtime 1.17+ library loads (`setup-onnxruntime` pins 1.24.4).

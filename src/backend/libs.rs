@@ -274,7 +274,11 @@ fn preload_dependencies(install_dir: &Path) {
                 note(format!("preloaded {}", path.display()));
                 loaded.push(lib);
             }
-            Err(e) => note(format!("could not preload {}: {e}", path.display())),
+            Err(e) => note(format!(
+                "could not preload {}: {}",
+                path.display(),
+                dl_error(&e)
+            )),
         }
     }
 }
@@ -339,10 +343,10 @@ pub(crate) fn core_set_property_variadic(
     // field is that pointer (size asserted above); `core` outlives the call and the C strings
     // are NUL-terminated and alive for the call.
     unsafe {
-        let lib = libloading::Library::new(&path).map_err(|e| e.to_string())?;
+        let lib = libloading::Library::new(&path).map_err(|e| dl_error(&e))?;
         let set: libloading::Symbol<SetProperty> = lib
             .get(b"ov_core_set_property\0")
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| dl_error(&e))?;
         let raw: *const c_void = std::mem::transmute_copy(core);
         let status = set(raw, device.as_ptr(), key.as_ptr(), value.as_ptr());
         if status == 0 {
@@ -795,6 +799,20 @@ pub fn preload_cuda_libs(dir: &Path) -> CudaPreload {
     report
 }
 
+/// A libloading error as text, with its OS cause: since libloading 0.9 the `Display` text is
+/// only "dlopen failed" / "LoadLibraryExW failed" and the dlerror / Windows error is the source.
+pub(crate) fn dl_error(e: &libloading::Error) -> String {
+    use std::error::Error as _;
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        text.push_str(": ");
+        text.push_str(&c.to_string());
+        cause = c.source();
+    }
+    text
+}
+
 /// Load one CUDA library by absolute path and keep it loaded.
 fn open_cuda_lib(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
@@ -804,7 +822,7 @@ fn open_cuda_lib(path: &Path) -> Result<(), String> {
         // downloaded) that ONNX Runtime's CUDA provider would load itself; their initializers
         // run as they would then. The handle is leaked so they stay loaded for the process.
         let lib = unsafe { Library::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| dl_error(&e))?;
         std::mem::forget(lib);
         Ok(())
     }
@@ -814,7 +832,7 @@ fn open_cuda_lib(path: &Path) -> Result<(), String> {
         // SAFETY: as above. LOAD_WITH_ALTERED_SEARCH_PATH resolves the DLL's own imports from
         // its directory first (the other CUDA DLLs next to it).
         let lib = unsafe { Library::load_with_flags(path, LOAD_WITH_ALTERED_SEARCH_PATH) }
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| dl_error(&e))?;
         std::mem::forget(lib);
         Ok(())
     }
@@ -830,13 +848,22 @@ pub fn system_cuda_present() -> bool {
     cuda_core_libs(cfg!(windows)).iter().all(|n| {
         // SAFETY: probing CUDA libraries by name, which the CUDA provider would load itself; the
         // handle is dropped right away and no symbol is used.
-        unsafe { libloading::Library::new(n) }.is_ok()
+        unsafe { libloading::Library::new(*n) }.is_ok()
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dl_error_keeps_the_os_cause() {
+        // SAFETY: the file does not exist, so nothing is loaded and no initializer runs.
+        let e = unsafe { libloading::Library::new("bop-no-such-library-xyz.so") }
+            .expect_err("a missing library must not load");
+        let text = dl_error(&e);
+        assert!(text.len() > e.to_string().len(), "{text}");
+    }
 
     #[test]
     fn picks_soname_style_files() {
