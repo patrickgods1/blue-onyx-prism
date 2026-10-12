@@ -326,11 +326,19 @@ fn extract_zip(
         if entry.is_dir() || entry.is_symlink() {
             continue;
         }
-        let Some(rel) = wanted(entry.name()) else {
+        let name = entry
+            .name()
+            .with_context(|| {
+                format!(
+                    "reading the name of zip entry #{i} of {}",
+                    archive.display()
+                )
+            })?
+            .into_owned();
+        let Some(rel) = wanted(&name) else {
             continue;
         };
-        write_entry(dest, &rel, &mut entry)
-            .with_context(|| format!("extracting {}", entry.name()))?;
+        write_entry(dest, &rel, &mut entry).with_context(|| format!("extracting {name}"))?;
         got.insert(rel);
     }
     Ok(got)

@@ -66,7 +66,7 @@ ab_glyph = "0.2"
 indicatif = "0.18"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json", "multipart", "stream", "http2"] }
 futures-util = "0.3"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
 # SHA-256 of downloads (already in the tree via other crates).
