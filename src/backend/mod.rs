@@ -227,12 +227,25 @@ impl OvBackend {
 
     /// Run one inference. `chw` must be `3 * w * h` f32 values in CHW order.
     pub fn infer(&mut self, chw: &[f32], extra: &[ExtraInput]) -> Result<Vec<NamedOutput>> {
+        let mut outs = Vec::new();
+        self.infer_into(chw, extra, &mut outs)?;
+        Ok(outs)
+    }
+
+    /// [`Self::infer`] into `outs`, reusing its buffers.
+    pub fn infer_into(
+        &mut self,
+        chw: &[f32],
+        extra: &[ExtraInput],
+        outs: &mut Vec<NamedOutput>,
+    ) -> Result<()> {
         device::run_inference(
             &self.info,
             &mut self.request,
             &mut self.input_tensor,
             chw,
             extra,
+            outs,
         )
     }
 }
@@ -281,10 +294,22 @@ impl Backend {
 
     /// Run one inference. `chw` must be `3 * w * h` f32 values in CHW order.
     pub fn infer(&mut self, chw: &[f32], extra: &[ExtraInput]) -> Result<Vec<NamedOutput>> {
+        let mut outs = Vec::new();
+        self.infer_into(chw, extra, &mut outs)?;
+        Ok(outs)
+    }
+
+    /// [`Self::infer`] into `outs`, reusing its buffers (one entry per model output).
+    pub fn infer_into(
+        &mut self,
+        chw: &[f32],
+        extra: &[ExtraInput],
+        outs: &mut Vec<NamedOutput>,
+    ) -> Result<()> {
         match self {
-            Backend::OpenVino(b) => b.infer(chw, extra),
+            Backend::OpenVino(b) => b.infer_into(chw, extra, outs),
             #[cfg(feature = "onnxruntime")]
-            Backend::Ort(b) => b.infer(chw, extra),
+            Backend::Ort(b) => b.infer_into(chw, extra, outs),
         }
     }
 }

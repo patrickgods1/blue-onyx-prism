@@ -7,7 +7,7 @@
 
 use super::spec::{Runtime, Target};
 use super::{Candidate, CoreOptions, LoadRequest, ModelInfo, OvBackend, OvCompiled};
-use crate::model::{ExtraData, ExtraInput, NamedOutput, OutputBuf, PortElem, PortSpec};
+use crate::model::{ExtraData, ExtraInput, NamedOutput, PortElem, PortSpec};
 use anyhow::{Context, Result};
 use openvino::{
     DeviceType, ElementType, Model, Node, PartialShape, PropertyKey, RwPropertyKey, Shape, Tensor,
@@ -651,7 +651,14 @@ fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
-fn read_output(model: &ModelInfo, tensor: &Tensor, spec: &PortSpec) -> Result<NamedOutput> {
+/// Copy output `tensor` into `out`, reusing its buffer (no allocation once it has grown to the
+/// output's size). f16 outputs are widened to f32.
+fn read_output_into(
+    model: &ModelInfo,
+    tensor: &Tensor,
+    spec: &PortSpec,
+    out: &mut NamedOutput,
+) -> Result<()> {
     let ctx = || {
         format!(
             "model {} on {}: output '{}'",
@@ -660,51 +667,79 @@ fn read_output(model: &ModelInfo, tensor: &Tensor, spec: &PortSpec) -> Result<Na
             spec.name
         )
     };
-    let shape: Vec<usize> = tensor
-        .get_shape()
-        .with_context(ctx)?
-        .get_dimensions()
-        .iter()
-        .map(|&d| d.max(0) as usize)
-        .collect();
+    out.shape.clear();
+    out.shape.extend(
+        tensor
+            .get_shape()
+            .with_context(ctx)?
+            .get_dimensions()
+            .iter()
+            .map(|&d| d.max(0) as usize),
+    );
     let elem = tensor.get_element_type().with_context(ctx)?;
-    let n: usize = shape.iter().product();
-    let data = match elem {
-        ElementType::F32 => OutputBuf::F32(tensor.get_data::<f32>().with_context(ctx)?.to_vec()),
-        ElementType::F16 => OutputBuf::F32(
-            tensor
-                .get_data::<u16>()
-                .with_context(ctx)?
-                .iter()
-                .map(|&h| f16_to_f32(h))
-                .collect(),
-        ),
-        ElementType::I64 => OutputBuf::I64(tensor.get_data::<i64>().with_context(ctx)?.to_vec()),
-        ElementType::I32 => OutputBuf::I32(tensor.get_data::<i32>().with_context(ctx)?.to_vec()),
+    let n: usize = out.shape.iter().product();
+    match elem {
+        ElementType::F32 => out
+            .data
+            .f32_mut()
+            .extend_from_slice(tensor.get_data::<f32>().with_context(ctx)?),
+        ElementType::F16 => {
+            let src = tensor.get_data::<u16>().with_context(ctx)?;
+            out.data
+                .f32_mut()
+                .extend(src.iter().map(|&h| f16_to_f32(h)));
+        }
+        ElementType::I64 => out
+            .data
+            .i64_mut()
+            .extend_from_slice(tensor.get_data::<i64>().with_context(ctx)?),
+        ElementType::I32 => out
+            .data
+            .i32_mut()
+            .extend_from_slice(tensor.get_data::<i32>().with_context(ctx)?),
         other => anyhow::bail!("{}: unsupported element type {other}", ctx()),
-    };
-    let len = match &data {
-        OutputBuf::F32(v) => v.len(),
-        OutputBuf::I64(v) => v.len(),
-        OutputBuf::I32(v) => v.len(),
-    };
-    if len != n {
-        anyhow::bail!("{}: {len} values but shape {shape:?}", ctx());
     }
-    Ok(NamedOutput {
-        name: spec.name.clone(),
-        shape,
-        data,
-    })
+    let len = out.data.len();
+    if len != n {
+        anyhow::bail!("{}: {len} values but shape {:?}", ctx(), out.shape);
+    }
+    if out.name != spec.name {
+        out.name.clone_from(&spec.name);
+    }
+    Ok(())
 }
 
+/// Read every output of a finished `request` into `outs` (one entry per model output, buffers
+/// reused).
+pub(crate) fn read_outputs(
+    model: &ModelInfo,
+    request: &openvino::InferRequest,
+    outs: &mut Vec<NamedOutput>,
+) -> Result<()> {
+    NamedOutput::resize_slots(outs, model.outputs.len());
+    for (i, (spec, out)) in model.outputs.iter().zip(outs.iter_mut()).enumerate() {
+        let t = request.get_output_tensor_by_index(i).with_context(|| {
+            format!(
+                "model {} on {}: getting output '{}' (#{i})",
+                model.path.display(),
+                model.device.actual,
+                spec.name
+            )
+        })?;
+        read_output_into(model, &t, spec, out)?;
+    }
+    Ok(())
+}
+
+/// Run one inference synchronously; the outputs go into `outs` (buffers reused).
 pub fn run_inference(
     model: &ModelInfo,
     request: &mut openvino::InferRequest,
     input_tensor: &mut openvino::Tensor,
     chw: &[f32],
     extra: &[ExtraInput],
-) -> Result<Vec<NamedOutput>> {
+    outs: &mut Vec<NamedOutput>,
+) -> Result<()> {
     let where_ = || format!("model {} on {}", model.path.display(), model.device.actual);
     let idx = image_index(model)?;
     {
@@ -749,15 +784,7 @@ pub fn run_inference(
         .infer()
         .with_context(|| format!("{}: inference failed", where_()))?;
     drop(extras);
-
-    let mut outs = Vec::with_capacity(model.outputs.len());
-    for (i, spec) in model.outputs.iter().enumerate() {
-        let t = request
-            .get_output_tensor_by_index(i)
-            .with_context(|| format!("{}: getting output '{}' (#{i})", where_(), spec.name))?;
-        outs.push(read_output(model, &t, spec)?);
-    }
-    Ok(outs)
+    read_outputs(model, request, outs)
 }
 
 #[cfg(test)]

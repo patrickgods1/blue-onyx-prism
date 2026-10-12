@@ -125,6 +125,17 @@ fn yolo5_on_ort_cpu() {
         }
         // Wrong input size is an error, not a crash.
         assert!(backend.infer(&chw[..10], &[]).is_err());
+        // `infer_into` refills the same output buffers.
+        let mut reused = Vec::new();
+        backend
+            .infer_into(&chw, &[], &mut reused)
+            .expect("infer_into");
+        let ptr = reused[0].as_f32().expect("f32 output").as_ptr();
+        backend
+            .infer_into(&chw, &[], &mut reused)
+            .expect("infer_into");
+        assert_eq!(reused[0].as_f32().unwrap().as_ptr(), ptr, "buffer reused");
+        assert_eq!(reused[0].shape, outs[0].shape);
     });
 }
 

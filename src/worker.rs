@@ -421,6 +421,8 @@ struct Engine {
     family: Box<dyn Family>,
     pre: Preprocessor,
     provider: String,
+    /// Output buffers reused request after request.
+    outputs: Vec<crate::model::NamedOutput>,
 }
 
 struct WorkerCtx {
@@ -677,7 +679,10 @@ impl WorkerCtx {
         let t = Instant::now();
         let (chw, ctx) = pre.run(&gray, in_w, in_h)?;
         let extra = family.extra_inputs(&ctx);
-        backend.infer(chw, &extra).context("warm-up inference")?;
+        let mut outputs = Vec::new();
+        backend
+            .infer_into(chw, &extra, &mut outputs)
+            .context("warm-up inference")?;
         let warmup_ms = t.elapsed().as_millis() as u64;
         Ok((
             Engine {
@@ -685,6 +690,7 @@ impl WorkerCtx {
                 family,
                 pre,
                 provider,
+                outputs,
             },
             compile_ms,
             warmup_ms,
@@ -734,7 +740,7 @@ impl WorkerCtx {
             let pre_d = t.elapsed();
 
             let t = Instant::now();
-            let outputs = eng.backend.infer(chw, &extra)?;
+            eng.backend.infer_into(chw, &extra, &mut eng.outputs)?;
             infer_d = t.elapsed();
 
             let t = Instant::now();
@@ -742,7 +748,7 @@ impl WorkerCtx {
                 confidence_threshold: effective_threshold(req.min_confidence, self.cfg.confidence_threshold),
                 nms_iou: self.cfg.nms_iou,
             };
-            let dets = eng.family.postprocess(&outputs, &ctx, &params)?;
+            let dets = eng.family.postprocess(&eng.outputs, &ctx, &params)?;
             let filter = (!self.cfg.object_filter.is_empty()).then_some(self.cfg.object_filter.as_slice());
             let preds = crate::model::to_predictions(&dets, &ctx, &self.cfg.classes, filter);
             let post_d = t.elapsed();

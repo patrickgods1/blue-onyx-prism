@@ -35,7 +35,7 @@ use super::device::{
 use super::select::{EpStatus, NEEDS_ONNX, OrtProbe, onnx_path_for};
 use super::spec::{Runtime, Target};
 use super::{Candidate, DeviceInfo, LoadRequest, ModelInfo, libs, onnx_rewrite};
-use crate::model::{ExtraData, ExtraInput, NamedOutput, OutputBuf, PortElem, PortSpec};
+use crate::model::{ExtraData, ExtraInput, NamedOutput, PortElem, PortSpec};
 use ::ort::ep::{self, ExecutionProvider};
 use ::ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ::ort::session::{Session, SessionInputValue};
@@ -1058,29 +1058,33 @@ pub(crate) fn extra_value(port: &PortSpec, extra: &ExtraInput) -> Result<DynValu
     })
 }
 
-/// Copy one output value into an owned [`NamedOutput`].
-fn read_output(name: &str, v: &DynValue) -> Result<NamedOutput> {
+/// Copy one output value into `out`, reusing its buffer.
+fn read_output_into(name: &str, v: &DynValue, out: &mut NamedOutput) -> Result<()> {
     let ty = v.dtype().tensor_type();
-    let (shape, data) = match ty {
+    let shape: &[i64] = match ty {
         Some(TensorElementType::Float32) => {
             let (s, d) = v.try_extract_tensor::<f32>().map_err(ort_err)?;
-            (s.to_vec(), OutputBuf::F32(d.to_vec()))
+            out.data.f32_mut().extend_from_slice(d);
+            s
         }
         Some(TensorElementType::Int64) => {
             let (s, d) = v.try_extract_tensor::<i64>().map_err(ort_err)?;
-            (s.to_vec(), OutputBuf::I64(d.to_vec()))
+            out.data.i64_mut().extend_from_slice(d);
+            s
         }
         Some(TensorElementType::Int32) => {
             let (s, d) = v.try_extract_tensor::<i32>().map_err(ort_err)?;
-            (s.to_vec(), OutputBuf::I32(d.to_vec()))
+            out.data.i32_mut().extend_from_slice(d);
+            s
         }
         other => bail!("output '{name}': unsupported element type {other:?}"),
     };
-    Ok(NamedOutput {
-        name: name.to_string(),
-        shape: shape.iter().map(|&d| d.max(0) as usize).collect(),
-        data,
-    })
+    out.shape.clear();
+    out.shape.extend(shape.iter().map(|&d| d.max(0) as usize));
+    if out.name != name {
+        out.name = name.to_string();
+    }
+    Ok(())
 }
 
 impl OrtBackend {
@@ -1090,6 +1094,18 @@ impl OrtBackend {
 
     /// Run one inference. `chw` must be `3 * w * h` f32 values in CHW order.
     pub fn infer(&mut self, chw: &[f32], extra: &[ExtraInput]) -> Result<Vec<NamedOutput>> {
+        let mut outs = Vec::new();
+        self.infer_into(chw, extra, &mut outs)?;
+        Ok(outs)
+    }
+
+    /// [`Self::infer`] into `outs`, reusing its buffers.
+    pub fn infer_into(
+        &mut self,
+        chw: &[f32],
+        extra: &[ExtraInput],
+        outs: &mut Vec<NamedOutput>,
+    ) -> Result<()> {
         let where_ = || {
             format!(
                 "model {} on {}",
@@ -1131,14 +1147,14 @@ impl OrtBackend {
             .session
             .run(inputs)
             .map_err(|e| anyhow::anyhow!("{}: inference failed: {e}", where_()))?;
-        let mut outs = Vec::with_capacity(self.info.outputs.len());
-        for spec in &self.info.outputs {
+        NamedOutput::resize_slots(outs, self.info.outputs.len());
+        for (spec, out) in self.info.outputs.iter().zip(outs.iter_mut()) {
             let v = outputs
                 .get(&spec.name)
                 .with_context(|| format!("{}: missing output '{}'", where_(), spec.name))?;
-            outs.push(read_output(&spec.name, v).with_context(where_)?);
+            read_output_into(&spec.name, v, out).with_context(where_)?;
         }
-        Ok(outs)
+        Ok(())
     }
 }
 
