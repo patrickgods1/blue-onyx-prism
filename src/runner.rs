@@ -137,8 +137,8 @@ pub fn run_server_with(
     let started = Instant::now();
     // The listener is bound once and survives generation restarts (a port change in the config
     // applies when the process restarts).
-    let listeners = rt.block_on(server::bind(config.port))?;
-    let bound_port = listeners.port();
+    let listeners = rt.block_on(server::bind(config.bind_address, config.port))?;
+    let (bound_address, bound_port) = (config.bind_address, listeners.port());
     let mut listeners = Some(listeners);
     // Stops the HTTP server: on `shutdown`, or when the loop gives up.
     let server_stop = shutdown.child_token();
@@ -227,9 +227,10 @@ pub fn run_server_with(
             running: Arc::new({
                 let mut c = config.clone();
                 c.normalize();
-                // What is running is the port bound at process start (a changed port shows as
-                // pending until the process restarts).
+                // What is running is the address bound at process start (a changed port or
+                // address shows as pending until the process restarts).
                 c.port = bound_port;
+                c.bind_address = bound_address;
                 c
             }),
             started,
@@ -338,10 +339,11 @@ pub fn run_server_with(
         if next.log_path != config.log_path {
             warn!("log_path changes take effect after the process is restarted");
         }
-        if next.port != config.port {
+        if (next.port, next.bind_address) != (config.port, config.bind_address) {
             warn!(
                 port = next.port,
-                "port changes take effect after the process is restarted"
+                bind_address = %next.bind_address,
+                "port and bind_address changes take effect after the process is restarted"
             );
         }
         previous = Some(std::mem::replace(&mut config, next));

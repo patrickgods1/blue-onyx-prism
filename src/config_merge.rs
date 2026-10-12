@@ -287,6 +287,8 @@ fn field_label(field: &str) -> String {
 fn global_label(k: &str) -> String {
     match k {
         "port" => "Port".into(),
+        "bind_address" => "Bind address".into(),
+        "allow_remote_admin" => "Allow remote administration".into(),
         "request_timeout_secs" => "Request timeout".into(),
         "worker_queue_size" => "Worker queue size".into(),
         "device" => "Device".into(),
@@ -690,7 +692,7 @@ pub struct Pending {
     pub global: Vec<String>,
     /// Reasons per model (normalized name), e.g. "device: auto → openvino:cpu".
     pub models: BTreeMap<String, Vec<String>>,
-    /// Changes only a process restart applies (`port`, `log_path`).
+    /// Changes only a process restart applies (`port`, `bind_address`, `log_path`).
     pub process: Vec<String>,
 }
 
@@ -711,10 +713,10 @@ impl Pending {
     }
 }
 
-/// Globals a restart does not need: the log level applies immediately, the benchmark section
-/// is read when a benchmark starts.
+/// Globals a restart does not need: the log level and `allow_remote_admin` apply immediately,
+/// the benchmark section is read when a benchmark starts.
 fn live_global(k: &str) -> bool {
-    matches!(k, "log_level" | "default_model") || k.starts_with("benchmark.")
+    matches!(k, "log_level" | "default_model" | "allow_remote_admin") || k.starts_with("benchmark.")
 }
 
 fn thr_text(t: f32) -> String {
@@ -741,7 +743,7 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
             value_text(k, x),
             value_text(k, y)
         );
-        if matches!(g, "port" | "log_path") {
+        if matches!(g, "port" | "bind_address" | "log_path") {
             out.process
                 .push(format!("{text} (needs a process restart)"));
         } else {
@@ -1132,10 +1134,13 @@ mod tests {
         c.port = 4000;
         c.models[1].enabled = false;
         c.log_path = Some("logs".into());
+        c.bind_address = "127.0.0.1".parse().unwrap();
+        // Applies at once: never pending.
+        c.allow_remote_admin = true;
         let p = pending(&running, &c);
         assert!(p.global.is_empty(), "{:?}", p.global);
         assert_eq!(p.for_model("yolo26s"), ["disabled; still loaded"]);
-        assert_eq!(p.process.len(), 2);
+        assert_eq!(p.process.len(), 3, "{:?}", p.process);
         assert!(
             p.process
                 .contains(&"Port: 32168 \u{2192} 4000 (needs a process restart)".to_string()),

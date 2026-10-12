@@ -1182,7 +1182,7 @@ mod tests {
     }
 
     async fn call(state: &Arc<AppState>, req: Request<Body>) -> (StatusCode, serde_json::Value) {
-        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        let resp = router(state.clone()).oneshot(local(req)).await.unwrap();
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1192,15 +1192,22 @@ mod tests {
         (status, v)
     }
 
+    /// Requests come from this machine (the admin routes refuse remote clients).
+    fn local(req: Request<Body>) -> Request<Body> {
+        crate::server::tests::from_peer(req, "127.0.0.1:50000")
+    }
+
     fn post(uri: &str, body: &str) -> Request<Body> {
-        Request::post(uri)
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(body.to_string()))
-            .unwrap()
+        local(
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
     }
 
     fn get(uri: &str) -> Request<Body> {
-        Request::get(uri).body(Body::empty()).unwrap()
+        local(Request::get(uri).body(Body::empty()).unwrap())
     }
 
     #[tokio::test]

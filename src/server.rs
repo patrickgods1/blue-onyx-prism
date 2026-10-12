@@ -113,7 +113,8 @@ impl AppState {
 /// (see [`Shared`]); a plain `Arc<AppState>` works for tests and makes a fixed one.
 pub fn router(state: impl Into<Shared>) -> Router {
     let shared: Shared = state.into();
-    Router::new()
+    // Open to every client: Blue Iris (often on another machine), monitoring and read-only JSON.
+    let open = Router::new()
         .route("/", get(welcome))
         .route("/v1/vision/detection", post(detection_default))
         .route("/v1/vision/custom/list", get(custom_list).post(custom_list))
@@ -121,6 +122,13 @@ pub fn router(state: impl Into<Shared>) -> Router {
         .route("/v1/status/updateavailable", get(update_available))
         .route("/v1/devices", get(devices_json))
         .route("/v1/config", get(live::config_json))
+        .route("/stats.json", get(stats_json))
+        .route("/prometheus", get(prometheus))
+        .route("/static/style.css", get(style_css))
+        .route("/static/live.js", get(live_js))
+        .route("/favicon.ico", get(favicon));
+    // Administration: loopback clients only unless `allow_remote_admin` ([`admin_only`]).
+    let admin = Router::new()
         .route("/v1/resources", get(resources_json))
         .route("/v1/resources/download", post(resources_download))
         .route("/v1/resources/remove", post(resources_remove))
@@ -130,8 +138,6 @@ pub fn router(state: impl Into<Shared>) -> Router {
         .route("/v1/resources/export", post(resources_export))
         .route("/v1/resources/export/cancel", post(resources_export_cancel))
         .route("/stats", get(stats_page))
-        .route("/stats.json", get(stats_json))
-        .route("/prometheus", get(prometheus))
         .route("/test", get(test_page).post(test_submit))
         .route("/config", get(config_page).post(config_submit))
         .route("/config/models", post(config_models))
@@ -157,12 +163,71 @@ pub fn router(state: impl Into<Shared>) -> Router {
         .route("/v1/benchmark/settings", post(benchmark::settings))
         .route("/v1/benchmark/images", get(benchmark::images_detail))
         .route("/v1/benchmark/image", get(benchmark::image_file))
-        .route("/static/style.css", get(style_css))
-        .route("/static/live.js", get(live_js))
-        .route("/favicon.ico", get(favicon))
+        .route_layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            admin_only,
+        ));
+    open.merge(admin)
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(shared)
+}
+
+/// Whether a client may use the admin routes: a loopback peer, or anyone with
+/// `allow_remote_admin`. A request without a peer address (not from [`serve_on`]) is refused.
+fn admin_allowed(peer: Option<std::net::SocketAddr>, allow_remote_admin: bool) -> bool {
+    allow_remote_admin
+        || peer.is_some_and(|a| match a.ip() {
+            std::net::IpAddr::V4(ip) => ip.is_loopback(),
+            // `::1`, or an IPv4 loopback client on a dual-stack socket (`::ffff:127.0.0.1`).
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        })
+}
+
+/// Middleware of the admin routes: 403 (an HTML page for browsers, else JSON) for a client
+/// that is not on this machine, unless `allow_remote_admin` is set (read per request, so it
+/// applies at once).
+async fn admin_only(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0);
+    let allow_remote = state.config_read().allow_remote_admin;
+    if admin_allowed(peer, allow_remote) {
+        return next.run(req).await;
+    }
+    let who = peer.map_or_else(|| "unknown".to_string(), |a| a.ip().to_string());
+    warn!(peer = %who, path = %req.uri().path(), "admin route refused for a remote client");
+    let msg = format!(
+        "Administration is only available from this machine (your address: {who}). Set \
+         \"allow_remote_admin\": true in the config (or start with --allow-remote-admin, or \
+         check \"Allow remote administration\" on the Config page from this machine) to allow it."
+    );
+    if wants_html(req.headers()) {
+        let page = MessageTemplate {
+            nav: "",
+            version: crate::VERSION,
+            heading: "Forbidden".into(),
+            message: msg,
+            refresh_secs: 0,
+            refresh_url: String::new(),
+            restarting: false,
+            generation: 0,
+        };
+        (StatusCode::FORBIDDEN, render(&page)).into_response()
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
+        )
+            .into_response()
+    }
 }
 
 /// The process-wide router state: the generation (`AppState`) that is current. A generation
@@ -222,22 +287,28 @@ impl Listeners {
     }
 }
 
-/// Bind `0.0.0.0:port` (and `[::1]:port`, best effort). Called once per process run: a port in
-/// use is a startup error.
-pub async fn bind(port: u16) -> anyhow::Result<Listeners> {
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+/// Bind `address:port`; for `0.0.0.0` and `127.0.0.1` also `[::1]:port` (best effort,
+/// `localhost` may resolve to it). Called once per process run: a port in use is a startup
+/// error.
+pub async fn bind(address: std::net::IpAddr, port: u16) -> anyhow::Result<Listeners> {
+    let addr = std::net::SocketAddr::new(address, port);
     let v4 = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         anyhow::anyhow!("binding {addr}: {e} (is another instance running on port {port}?)")
     })?;
     let port = v4.local_addr().map(|a| a.port()).unwrap_or(port);
     // `localhost` may resolve to ::1 first, and some clients do not fall back to 127.0.0.1.
-    let loopback6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
-    let v6 = match tokio::net::TcpListener::bind(loopback6).await {
-        Ok(l) => Some(l),
-        Err(e) => {
-            warn!("not listening on {loopback6}: {e}");
-            None
+    let v6 = match address {
+        std::net::IpAddr::V4(a) if a.is_unspecified() || a.is_loopback() => {
+            let loopback6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+            match tokio::net::TcpListener::bind(loopback6).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    warn!("not listening on {loopback6}: {e}");
+                    None
+                }
+            }
         }
+        _ => None,
     };
     info!("listening on {addr}; open http://localhost:{port}/");
     Ok(Listeners { v4, v6, port })
@@ -252,11 +323,15 @@ pub async fn serve_on(
 ) -> anyhow::Result<()> {
     let app = router(shared);
     let stopped = |t: CancellationToken| async move { t.cancelled().await };
-    let v4 =
-        axum::serve(listeners.v4, app.clone()).with_graceful_shutdown(stopped(shutdown.clone()));
+    // The peer address feeds the admin-route check ([`admin_only`]).
+    let service = || {
+        app.clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()
+    };
+    let v4 = axum::serve(listeners.v4, service()).with_graceful_shutdown(stopped(shutdown.clone()));
     match listeners.v6 {
         Some(l6) => {
-            let v6 = axum::serve(l6, app).with_graceful_shutdown(stopped(shutdown));
+            let v6 = axum::serve(l6, service()).with_graceful_shutdown(stopped(shutdown));
             tokio::try_join!(v4.into_future(), v6.into_future())?;
         }
         None => v4.await?,
@@ -1501,6 +1576,8 @@ async fn test_submit(
 #[derive(serde::Serialize)]
 struct ConfigView {
     port: String,
+    bind_address: String,
+    allow_remote_admin: bool,
     request_timeout_secs: String,
     worker_queue_size: String,
     device: String,
@@ -1529,6 +1606,8 @@ impl ConfigView {
         };
         Self {
             port: c.port.to_string(),
+            bind_address: c.bind_address.to_string(),
+            allow_remote_admin: c.allow_remote_admin,
             request_timeout_secs: c.request_timeout_secs.to_string(),
             worker_queue_size: c.worker_queue_size.to_string(),
             device: c.device.clone(),
@@ -1559,12 +1638,15 @@ impl ConfigView {
                 "save_ref_image" => self.save_ref_image = v.is_some(),
                 "auto_download" | "allow_large_downloads"
                     if !form.contains_key("download_settings") => {}
+                "allow_remote_admin" if !form.contains_key("access_settings") => {}
+                "allow_remote_admin" => self.allow_remote_admin = v.is_some(),
                 "auto_download" => self.auto_download = v.is_some(),
                 "allow_large_downloads" => self.allow_large_downloads = v.is_some(),
                 _ => {
                     let Some(v) = v else { continue };
                     let slot = match key {
                         "port" => &mut self.port,
+                        "bind_address" => &mut self.bind_address,
                         "request_timeout_secs" => &mut self.request_timeout_secs,
                         "worker_queue_size" => &mut self.worker_queue_size,
                         "device" => &mut self.device,
@@ -2537,7 +2619,7 @@ async fn fallback(uri: axum::http::Uri) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::ModelConfig;
     use crate::metrics::ModelMetrics;
@@ -2587,7 +2669,10 @@ mod tests {
     }
 
     async fn call(state: &Arc<AppState>, req: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
-        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        let resp = router(state.clone())
+            .oneshot(from_peer(req, LOCAL))
+            .await
+            .unwrap();
         let status = resp.status();
         let headers = resp.headers().clone();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -2595,6 +2680,23 @@ mod tests {
             .unwrap()
             .to_vec();
         (status, headers, body)
+    }
+
+    const LOCAL: &str = "127.0.0.1:50000";
+    const REMOTE: &str = "10.0.0.5:50000";
+
+    /// `req` as if it came from `peer` (what `serve_on` adds), unless it already names one.
+    pub(crate) fn from_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
+        let ext = req.extensions_mut();
+        if ext
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .is_none()
+        {
+            ext.insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                peer.parse().unwrap(),
+            ));
+        }
+        req
     }
 
     /// `/v1/vision/custom/list` names through `app`.
@@ -2690,6 +2792,136 @@ mod tests {
             )
             .body(Body::from(body))
             .unwrap()
+    }
+
+    /// `method uri` from `peer` (an empty urlencoded body for POST), optionally as a browser.
+    fn from(peer: &str, method: &str, uri: &str, html: bool) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if method == "POST" {
+            b = b.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        }
+        if html {
+            b = b.header(header::ACCEPT, "text/html");
+        }
+        from_peer(b.body(Body::empty()).unwrap(), peer)
+    }
+
+    #[test]
+    fn loopback_peers_are_local() {
+        let ok = |a: &str| admin_allowed(Some(a.parse().unwrap()), false);
+        assert!(ok("127.0.0.1:1"));
+        assert!(ok("127.8.9.10:1"));
+        assert!(ok("[::1]:1"));
+        assert!(ok("[::ffff:127.0.0.1]:1"));
+        assert!(!ok("10.0.0.5:1"));
+        assert!(!ok("192.168.1.20:1"));
+        assert!(!ok("[fe80::1]:1"));
+        assert!(!ok("[::ffff:10.0.0.5]:1"));
+        assert!(!admin_allowed(None, false));
+        assert!(admin_allowed(Some("10.0.0.5:1".parse().unwrap()), true));
+    }
+
+    #[tokio::test]
+    async fn admin_routes_answer_loopback_only() {
+        let state = test_state();
+        let admin = [
+            ("GET", "/config"),
+            ("POST", "/config"),
+            ("GET", "/v1/fs/browse"),
+            ("POST", "/v1/resources/export"),
+            ("POST", "/config/restart"),
+        ];
+        for (method, uri) in admin {
+            // A remote client gets 403 with the setting that enables remote administration.
+            let (s, h, b) = call(&state, from(REMOTE, method, uri, false)).await;
+            let body = String::from_utf8_lossy(&b).to_string();
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}: {body}");
+            assert!(
+                h[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json"),
+                "{method} {uri}"
+            );
+            let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            assert_eq!(j["success"], false);
+            assert!(
+                j["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("allow_remote_admin"),
+                "{j}"
+            );
+            assert!(j["message"].as_str().unwrap().contains("10.0.0.5"), "{j}");
+            // Browsers get a page.
+            let (s, h, b) = call(&state, from(REMOTE, method, uri, true)).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert!(
+                h[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html")
+            );
+            let html = String::from_utf8_lossy(&b);
+            assert!(html.contains("Forbidden") && html.contains("allow_remote_admin"));
+            // This machine gets the route.
+            let (s, _, b) = call(&state, from(LOCAL, method, uri, true)).await;
+            assert_ne!(
+                s,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}: {}",
+                String::from_utf8_lossy(&b)
+            );
+            let (s, _, _) = call(&state, from("[::1]:50000", method, uri, true)).await;
+            assert_ne!(s, StatusCode::FORBIDDEN, "{method} {uri} from ::1");
+        }
+
+        // Read-only and Blue Iris routes stay open to remote clients.
+        for uri in [
+            "/",
+            "/stats.json",
+            "/prometheus",
+            "/v1/devices",
+            "/v1/config",
+            "/static/style.css",
+            "/favicon.ico",
+            "/v1/vision/custom/list",
+        ] {
+            let (s, _, _) = call(&state, from(REMOTE, "GET", uri, false)).await;
+            assert_eq!(s, StatusCode::OK, "{uri}");
+        }
+        let (s, _, b) = call(
+            &state,
+            from_peer(
+                Request::post("/v1/vision/detection")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=XBOUNDARYX",
+                    )
+                    .body(Body::from(
+                        "--XBOUNDARYX\r\nContent-Disposition: form-data; name=\"image\"; \
+                         filename=\"t.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nxx\r\n--XBOUNDARYX--\r\n",
+                    ))
+                    .unwrap(),
+                REMOTE,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let r: VisionDetectionResponse = serde_json::from_slice(&b).unwrap();
+        assert!(!r.success, "the test models failed to load: {r:?}");
+        assert!(r.error.unwrap().contains("ipcam-general"));
+
+        // `allow_remote_admin` applies at once.
+        state
+            .config
+            .update("test", |c| {
+                c.allow_remote_admin = true;
+                Ok(())
+            })
+            .unwrap();
+        let (s, _, _) = call(&state, from(REMOTE, "GET", "/config", true)).await;
+        assert_eq!(s, StatusCode::OK);
     }
 
     #[test]

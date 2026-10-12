@@ -191,6 +191,9 @@
   <input type="hidden" name="base" value="{{ server_base }}">
   <input type="hidden" name="base_revision" value="{{ revision }}">
   <label>Port <span class="tag restart">needs process restart</span> <input type="number" name="port" min="1" max="65535" value="{{ c.port }}" required></label>
+  <label>Bind address <span class="tag restart">needs process restart</span> <input type="text" name="bind_address" value="{{ c.bind_address }}" placeholder="0.0.0.0" required></label>
+  <input type="hidden" name="access_settings" value="1">
+  <label class="check"><input type="checkbox" name="allow_remote_admin"{% if c.allow_remote_admin %} checked{% endif %}> Allow remote administration <span class="tag now">applies now</span> (Config, Test, Logs, Benchmark and resource actions from other machines; off = this machine only)</label>
   <label>Request timeout (s) <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
   <label>Worker queue size (0 = auto) <input type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
 
