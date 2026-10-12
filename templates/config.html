@@ -190,7 +190,7 @@
   <h2>Server <span class="tag restart">needs restart</span></h2>
   <input type="hidden" name="base" value="{{ server_base }}">
   <input type="hidden" name="base_revision" value="{{ revision }}">
-  <label>Port <input type="number" name="port" min="1" max="65535" value="{{ c.port }}" required></label>
+  <label>Port <span class="tag restart">needs process restart</span> <input type="number" name="port" min="1" max="65535" value="{{ c.port }}" required></label>
   <label>Request timeout (s) <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
   <label>Worker queue size (0 = auto) <input type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
 
@@ -237,7 +237,7 @@
 <div id="at-restart" class="anchor"></div>
 <form method="post" action="/config/restart?back=restart" class="card" id="restart" data-ajax>
   <div class="inline-row"><button type="submit" class="danger" data-restart>Restart server</button>
-  <span class="muted">Reloads the config file, recompiles the enabled models and rebinds the port.</span></div>
+  <span class="muted">Reloads the config file and recompiles the enabled models; the server keeps answering meanwhile. Port and log directory changes need a process restart.</span></div>
   <div id="pending-box"{% if pending.is_empty() %} hidden{% endif %}><p class="muted">Saved but not running yet (a restart applies):</p>
   <ul id="pending-list">{% for p in pending %}<li>{{ p }}</li>{% endfor %}</ul></div>
 </form>

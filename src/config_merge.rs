@@ -690,7 +690,7 @@ pub struct Pending {
     pub global: Vec<String>,
     /// Reasons per model (normalized name), e.g. "device: auto → openvino:cpu".
     pub models: BTreeMap<String, Vec<String>>,
-    /// Changes only a process restart applies (`log_path`).
+    /// Changes only a process restart applies (`port`, `log_path`).
     pub process: Vec<String>,
 }
 
@@ -741,7 +741,7 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
             value_text(k, x),
             value_text(k, y)
         );
-        if g == "log_path" {
+        if matches!(g, "port" | "log_path") {
             out.process
                 .push(format!("{text} (needs a process restart)"));
         } else {
@@ -1133,9 +1133,15 @@ mod tests {
         c.models[1].enabled = false;
         c.log_path = Some("logs".into());
         let p = pending(&running, &c);
-        assert_eq!(p.global, ["Port: 32168 \u{2192} 4000"]);
+        assert!(p.global.is_empty(), "{:?}", p.global);
         assert_eq!(p.for_model("yolo26s"), ["disabled; still loaded"]);
-        assert_eq!(p.process.len(), 1);
+        assert_eq!(p.process.len(), 2);
+        assert!(
+            p.process
+                .contains(&"Port: 32168 \u{2192} 4000 (needs a process restart)".to_string()),
+            "{:?}",
+            p.process
+        );
         // A threshold that only differs below 0.01 is not pending.
         let mut d = running.clone();
         d.confidence_threshold = 0.5000001;

@@ -73,7 +73,8 @@ impl Running {
             config_path,
         ));
         let port = free_port();
-        let server = tokio::spawn(server::serve(state, port, token.clone()));
+        let listeners = server::bind(port).await.expect("bind");
+        let server = tokio::spawn(server::serve_on(listeners, state.into(), token.clone()));
         Self {
             base: format!("http://127.0.0.1:{port}"),
             token,
@@ -503,10 +504,51 @@ async fn switch_models_with_restart() {
         "IPcam-general must not be served before a restart"
     );
 
-    // ... until the restart.
+    // ... until the restart. The listener stays up: requests issued during the restart get an
+    // HTTP answer (from the old generation, or "initializing" from the new one), never a
+    // connection error.
     let t2 = Instant::now();
     post_form(&client, &format!("{base}/config/restart"), "").await;
+    let during = {
+        let (client, base, image) = (client.clone(), base.clone(), image.clone());
+        tokio::spawn(async move {
+            let mut answers = Vec::new();
+            let end = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < end {
+                let part = reqwest::multipart::Part::bytes(image.clone())
+                    .file_name("dog_bike_car.jpg")
+                    .mime_str("image/jpeg")
+                    .unwrap();
+                let form = reqwest::multipart::Form::new().part("image", part);
+                let r = client
+                    .post(format!("{base}/v1/vision/detection"))
+                    .multipart(form)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("request during the restart failed: {e}"));
+                assert!(r.status().is_success(), "HTTP {}", r.status());
+                let body: VisionDetectionResponse = r.json().await.expect("detection JSON");
+                answers.push(body);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            answers
+        })
+    };
     wait_serving(&client, &base, &["IPcam-general"]).await;
+    let answers = during.await.expect("requests during the restart");
+    assert!(!answers.is_empty());
+    for r in &answers {
+        let e = r.error.as_deref().unwrap_or_default();
+        assert!(
+            r.success || e.contains("initializing") || e.contains("not running"),
+            "unexpected answer during the restart: {r:?}"
+        );
+    }
+    eprintln!(
+        "{} requests during the restart: {} succeeded",
+        answers.len(),
+        answers.iter().filter(|r| r.success).count()
+    );
     eprintln!(
         "generation 3 (IPcam-general) ready after {:?}",
         t2.elapsed()

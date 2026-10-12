@@ -103,7 +103,8 @@ async fn yolo26_and_rtdetr_over_http() {
         config_path,
     ));
     let port = free_port();
-    let server = tokio::spawn(server::serve(state, port, token.clone()));
+    let listeners = server::bind(port).await.expect("bind");
+    let server = tokio::spawn(server::serve_on(listeners, state.into(), token.clone()));
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 

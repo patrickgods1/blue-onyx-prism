@@ -62,8 +62,8 @@ pub struct AppState {
     pub config_path: PathBuf,
     /// Runtime log level control; `None` when logging was not initialized by this process.
     pub log_reload: Option<LogReloadHandle>,
-    /// Cancelled by `POST /config/restart`. [`serve`] stops when it fires; the main binary
-    /// uses a child of the shutdown token so it also stops the workers of this generation.
+    /// This generation's token, cancelled by `POST /config/restart`: the run loop
+    /// (`runner`) then builds the next generation and swaps it in ([`Shared::swap`]).
     pub restart: CancellationToken,
     /// Download manager and this generation's provisioning plan (None in tests that do not
     /// exercise resources).
@@ -109,7 +109,10 @@ impl AppState {
     }
 }
 
-pub fn router(state: Arc<AppState>) -> Router {
+/// The router. Every handler reads the generation that is current when its request arrives
+/// (see [`Shared`]); a plain `Arc<AppState>` works for tests and makes a fixed one.
+pub fn router(state: impl Into<Shared>) -> Router {
+    let shared: Shared = state.into();
     Router::new()
         .route("/", get(welcome))
         .route("/v1/vision/detection", post(detection_default))
@@ -159,34 +162,77 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/favicon.ico", get(favicon))
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .with_state(state)
+        .with_state(shared)
 }
 
-/// Bind `0.0.0.0:port` (and `[::1]:port`, best effort) and serve until `shutdown` or
-/// `state.restart` is cancelled.
-pub async fn serve(
-    state: Arc<AppState>,
-    port: u16,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()> {
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    // A few retries cover a just-closed listener from the previous generation on restart.
-    let mut attempt = 0;
-    let listener = loop {
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => break l,
-            Err(e) if attempt < 5 && e.kind() == std::io::ErrorKind::AddrInUse => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            Err(e) => {
-                anyhow::bail!("binding {addr}: {e} (is another instance running on port {port}?)")
-            }
+/// The process-wide router state: the generation (`AppState`) that is current. A generation
+/// restart swaps it ([`Shared::swap`]); the listener stays up. Handlers extract
+/// `State<Arc<AppState>>` as before ([`axum::extract::FromRef`]), one `Arc` clone per request,
+/// so an in-flight request keeps its generation (and its workers) alive until it finishes.
+#[derive(Clone)]
+pub struct Shared {
+    current: Arc<std::sync::RwLock<Arc<AppState>>>,
+}
+
+impl Shared {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self {
+            current: Arc::new(std::sync::RwLock::new(state)),
         }
-    };
+    }
+
+    /// The generation new requests are served by.
+    pub fn current(&self) -> Arc<AppState> {
+        self.current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Make `state` current; returns the previous generation.
+    pub fn swap(&self, state: Arc<AppState>) -> Arc<AppState> {
+        let mut g = self.current.write().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *g, state)
+    }
+}
+
+impl From<Arc<AppState>> for Shared {
+    fn from(state: Arc<AppState>) -> Self {
+        Self::new(state)
+    }
+}
+
+impl axum::extract::FromRef<Shared> for Arc<AppState> {
+    fn from_ref(shared: &Shared) -> Self {
+        shared.current()
+    }
+}
+
+/// The process's HTTP listeners (bound once, see [`bind`]).
+pub struct Listeners {
+    v4: tokio::net::TcpListener,
+    v6: Option<tokio::net::TcpListener>,
+    port: u16,
+}
+
+impl Listeners {
+    /// The bound port (useful after binding port 0).
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Bind `0.0.0.0:port` (and `[::1]:port`, best effort). Called once per process run: a port in
+/// use is a startup error.
+pub async fn bind(port: u16) -> anyhow::Result<Listeners> {
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let v4 = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        anyhow::anyhow!("binding {addr}: {e} (is another instance running on port {port}?)")
+    })?;
+    let port = v4.local_addr().map(|a| a.port()).unwrap_or(port);
     // `localhost` may resolve to ::1 first, and some clients do not fall back to 127.0.0.1.
     let loopback6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
-    let listener6 = match tokio::net::TcpListener::bind(loopback6).await {
+    let v6 = match tokio::net::TcpListener::bind(loopback6).await {
         Ok(l) => Some(l),
         Err(e) => {
             warn!("not listening on {loopback6}: {e}");
@@ -194,21 +240,23 @@ pub async fn serve(
         }
     };
     info!("listening on {addr}; open http://localhost:{port}/");
-    let restart = state.restart.clone();
-    let stopped = move || {
-        let (shutdown, restart) = (shutdown.clone(), restart.clone());
-        async move {
-            tokio::select! {
-                _ = shutdown.cancelled() => {}
-                _ = restart.cancelled() => {}
-            }
-        }
-    };
-    let app = router(state);
-    let v4 = axum::serve(listener, app.clone()).with_graceful_shutdown(stopped());
-    match listener6 {
+    Ok(Listeners { v4, v6, port })
+}
+
+/// Serve `shared` on `listeners` until `shutdown` is cancelled (in-flight requests finish).
+/// Runs for the whole process: generation restarts swap `shared` instead of stopping it.
+pub async fn serve_on(
+    listeners: Listeners,
+    shared: Shared,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let app = router(shared);
+    let stopped = |t: CancellationToken| async move { t.cancelled().await };
+    let v4 =
+        axum::serve(listeners.v4, app.clone()).with_graceful_shutdown(stopped(shutdown.clone()));
+    match listeners.v6 {
         Some(l6) => {
-            let v6 = axum::serve(l6, app).with_graceful_shutdown(stopped());
+            let v6 = axum::serve(l6, app).with_graceful_shutdown(stopped(shutdown));
             tokio::try_join!(v4.into_future(), v6.into_future())?;
         }
         None => v4.await?,
@@ -2212,10 +2260,14 @@ struct MessageTemplate {
     /// The server is restarting: poll until it answers, then go to `refresh_url` (the meta
     /// refresh stays as the no-JS fallback).
     restarting: bool,
+    /// Config-store generation when the restart was requested; the page waits until
+    /// `/v1/config` reports another one (the listener stays up across a restart).
+    generation: u64,
 }
 
-/// Stops the HTTP server and the workers of this generation; the main binary then reloads the
-/// config file and starts again.
+/// Ends this generation: the run loop (`runner`) reloads the config file, starts the next
+/// generation and swaps it in; the listener stays up and the old workers stop once their
+/// requests have drained.
 /// `back` (query): the Config page section to return to (`models`, `server`, `restart`).
 async fn config_restart(
     State(state): State<Arc<AppState>>,
@@ -2273,6 +2325,7 @@ fn restart_response_to(state: &AppState, message: String, url: String) -> Respon
         refresh_secs: 5,
         refresh_url: url,
         restarting: true,
+        generation: state.config.generation(),
     })
 }
 
@@ -2542,6 +2595,48 @@ mod tests {
             .unwrap()
             .to_vec();
         (status, headers, body)
+    }
+
+    /// `/v1/vision/custom/list` names through `app`.
+    async fn listed(app: &Router) -> Vec<String> {
+        let req = Request::get("/v1/vision/custom/list")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        serde_json::from_value(v["models"].clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_swap_serves_the_new_generation() {
+        let a = test_state();
+        let mm = Arc::new(ModelMetrics::new("next", "CPU", ""));
+        let registry = ModelRegistry::from_handles(
+            vec![WorkerHandle::failed("next", "x", mm)],
+            Some(0),
+            RuntimeInfo::default(),
+        );
+        let b = Arc::new(AppState::new(
+            Arc::new(registry),
+            Arc::new(Metrics::new("0.0.0")),
+            Config::default(),
+            a.config_path.clone(),
+        ));
+        let shared = Shared::new(a.clone());
+        let app = router(shared.clone());
+        assert_eq!(listed(&app).await, ["ipcam-general", "<b>evil</b>"]);
+
+        // Same router (= same listener): the next request sees the new generation.
+        let prev = shared.swap(b.clone());
+        assert!(Arc::ptr_eq(&prev, &a));
+        assert!(Arc::ptr_eq(&shared.current(), &b));
+        assert_eq!(listed(&app).await, ["next"]);
+        // Nothing but the caller holds the old generation once its requests are done.
+        drop(prev);
+        assert_eq!(Arc::strong_count(&a), 1);
     }
 
     async fn get_text(state: &Arc<AppState>, uri: &str) -> (StatusCode, String) {
@@ -4284,7 +4379,10 @@ mod tests {
         assert_eq!(j["revision"], 3);
         assert_eq!(j["changes"][1]["source"], "file changed on disk");
         assert_eq!(j["changes"][1]["summary"], "Port \u{2192} 4321");
-        assert_eq!(j["pending"]["global"][0], "Port: 32168 \u{2192} 4321");
+        assert_eq!(
+            j["pending"]["process"][0],
+            "Port: 32168 \u{2192} 4321 (needs a process restart)"
+        );
         assert_eq!(j["pendingCount"], 2);
         assert_eq!(state.config_read().port, 4321);
     }
