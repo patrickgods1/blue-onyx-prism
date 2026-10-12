@@ -222,27 +222,45 @@ Explicit config values always win; the profile only fills `0`/`auto`.
   - **High**: cores >= 12 and memory >= 16 GB and (discrete GPU with >= 6 GB VRAM, or Apple
     with >= 8 cores).
   - **Mid**: everything else.
-  - `preprocess_threads = clamp(cores / 2, 1, cap)` with cap 2 / 4 / 8 by class. When the
-    model's chosen device is a CPU device the pool size is additionally capped at 2 (OpenVINO
-    CPU inference already uses every core; more decode threads just contend). The cap is applied
-    per generation from the registry's planned devices, so the profile exposes
-    `preprocess_threads_for(all_cpu: bool)`.
-  - `inflight` (per model, 2.2): 2 everywhere except Low-class CPU-only inference, where it is 1.
+  - `preprocess_threads = clamp(cores / 2, 1, 8)` for every class: decode + letterbox is
+    ~10-20 ms of CPU per request, so even 150 requests/s need only 2-3 threads; per-class caps
+    would not change anything. When every model's chosen device is a CPU device the pool is
+    capped at 2 (OpenVINO CPU inference already uses every core; more decode threads just
+    contend). The cap is applied per generation from the registry's planned devices, so the
+    profile exposes `preprocess_threads_for(all_cpu: bool)`.
+  - `inflight` is per *device class*, not per machine class, because concurrent inference is
+    where higher-spec machines actually have headroom (`Profile::inflight_for(&Device)`):
+    - integrated GPU (OpenVINO GPU on an iGPU): 2;
+    - discrete OpenVINO GPU (Intel Arc): 4, and the model is compiled with
+      `PERFORMANCE_HINT=THROUGHPUT` so the plugin creates several streams
+      (`NUM_STREAMS` read back after compile; `inflight = min(4, streams)`);
+    - ONNX Runtime devices: 1 per session (`Session::run` is `&mut self`); `ort_sessions: usize`
+      (config, default 1, High class with a discrete NVIDIA GPU defaults to 2) creates that many
+      sessions of the model and the worker round-robins over them, at the cost of one model's
+      memory per session;
+    - CPU-only inference on >= 12 logical cores: `PERFORMANCE_HINT=THROUGHPUT` with
+      `inflight = NUM_STREAMS` reported by OpenVINO (the classic server-CPU setup); below 12
+      cores: `LATENCY`, inflight 1 (one request already uses every core).
+  - `intra_threads` stays the user's setting; the profile never changes it.
   - `model_sizes`: the catalog sizes recommended for this class, from the model name suffix
     (`n`/`s` for Low, `s`/`m` for Mid, `m`/`l`/`x` for High; the IPcam YOLOv5 models count as
     `s`). A hint only: the benchmark remains the source of truth.
   - `reasons`: human text for the UI, e.g. `"6 logical cores"`, `"integrated GPU (Intel UHD 630)"`.
-- Config: `preprocess_threads: usize` (0 = profile), `inflight: usize` (0 = profile), and
-  `hardware_profile: "auto" | "low" | "mid" | "high"` (forces the class; for testing and for
-  users who disagree). All three are runtime-level (restart) fields in `config_merge::pending`.
+- Config: `preprocess_threads: usize` (0 = profile), `inflight: usize` (0 = profile, applies to
+  every model; a per-model `inflight` override on `ModelConfig` too), `ort_sessions: usize`
+  (0 = profile), and `hardware_profile: "auto" | "low" | "mid" | "high"` (forces the class; for
+  testing and for users who disagree). All are runtime-level (restart) fields in
+  `config_merge::pending`.
 - Exposure: `GET /v1/devices` gains `profile: {class, cores, memoryGb, gpuClass, preprocessThreads,
   inflight, recommendedSizes, reasons}`; the welcome page shows one line ("Hardware profile:
   low-spec — 6 cores, 16 GB, Intel UHD 630 (integrated) → 2 preprocess threads, 2 in flight");
   `list-devices` prints the same; the Resources/model list marks catalog models whose size is
   in `recommendedSizes` as "recommended for this machine".
-- Tests (`profile.rs`): i5-8500 + UHD 630 -> Low (2 threads, 2 in flight, n/s); 4 cores / 8 GB /
-  no GPU -> Low (1 in flight when CPU-only); 16 cores / 32 GB / RTX 3060 12 GB -> High (8
-  threads, m/l/x); M1 8-core / 16 GB -> High; 8 cores / 16 GB / GTX 1050 2 GB -> Mid.
+- Tests (`profile.rs`): i5-8500 + UHD 630 -> Low (3 threads, iGPU 2 in flight, CPU-only 1,
+  n/s); 4 cores / 8 GB / no GPU -> Low (2 threads capped, 1 in flight); 16 cores / 32 GB /
+  RTX 3060 12 GB -> High (8 threads, `ort_sessions` 2, m/l/x); 16 cores / 32 GB / Arc A770 ->
+  High (discrete OpenVINO GPU 4 in flight); 16 cores / no GPU -> CPU-only THROUGHPUT with
+  inflight = streams; M1 8-core / 16 GB -> High; 8 cores / 16 GB / GTX 1050 2 GB -> Mid.
   A `/v1/devices` router test asserts the `profile` object is present and `hardware_profile:
   "high"` overrides the class.
 
