@@ -326,9 +326,6 @@ input.edited, select.edited, textarea.edited { border-color: var(--accent); box-
 .live-note { display: block; font-size: 0.8rem; color: var(--warn-fg); }
 .form-msg { align-self: center; font-size: 0.9rem; }
 .ok-text { color: var(--ok-fg); }
-.conflict-panel { margin-top: 0.75rem; grid-column: 1 / -1; }
-.conflict-panel button.chosen { outline: 3px solid var(--warn-fg); }
-.card.conflict { border-color: var(--warn-fg); border-width: 2px; }
 table.model-card td.model-thr input { width: 6rem; }
 table.model-card td.running { font-size: 0.85rem; max-width: 16rem; }
 table.model-card td.running.st-ok { color: var(--ok-fg); }

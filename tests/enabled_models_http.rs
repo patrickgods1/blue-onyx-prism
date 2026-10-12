@@ -1,8 +1,9 @@
 //! `enabled: false` models stay in the config but are not loaded or served; with every model
 //! disabled the HTTP server (and its web UI) still comes up.
 //!
-//! Switching models through the Models card (`POST /config/models`) and the in-process restart
-//! (`runner::run_server_on`, as used by the binary and the Windows service) is covered too.
+//! Switching models through the Models card (`POST /config/models`, with a restart and with a
+//! per-model reload) and the in-process restart (`runner::run_server_on`, as used by the binary
+//! and the Windows service) is covered too.
 //!
 //! Real OpenVINO: skips (passes with a message) unless `models/IPcam-general.onnx` (and, for the
 //! switch test, `models/rt-detrv2-s.onnx`) and `openvino/` exist under the repo root (or
@@ -153,7 +154,10 @@ async fn disabled_models_are_not_served() {
     let run = Running::start(config).await;
     assert_eq!(run.registry.names(), ["IPcam-general"]);
     assert_eq!(
-        run.registry.default_model().map(|w| w.name.as_str()),
+        run.registry
+            .default_model()
+            .map(|w| w.name.clone())
+            .as_deref(),
         Some("IPcam-general")
     );
     assert!(run.registry.by_name("off-model").is_none());
@@ -499,33 +503,34 @@ async fn switch_models_with_restart() {
         "{r:?}"
     );
 
-    // Switch back with "Save" only: the file changes, the running generation does not.
+    // Switch back with "Save" only: applies at once, per model (IPcam-general starts,
+    // rt-detrv2-s stops), without a new generation.
     let page = post_form(
         &client,
         &format!("{base}/config/models"),
         "enabled=IPcam-general&default_model=IPcam-general&action=save",
     )
     .await;
-    assert!(page.contains("Restart the server to apply"), "{page}");
+    assert!(page.contains("Loading IPcam-general on"), "{page}");
+    assert!(page.contains("stopping rt-detrv2-s"), "{page}");
+    assert!(!page.contains("Restart the server to apply"), "{page}");
     let saved = Config::load(&config_path).unwrap();
     assert!(saved.models[0].enabled && !saved.models[1].enabled);
     assert_eq!(saved.default_model.as_deref(), Some("IPcam-general"));
     assert_eq!(
         list_models(&client, &base).await.as_deref(),
-        Some(&["rt-detrv2-s".to_string()][..])
+        Some(&["IPcam-general".to_string()][..])
     );
+    wait_serving(&client, &base, &["IPcam-general"]).await;
     let r = post_image(&client, &format!("{base}/v1/vision/detection"), &image).await;
-    assert!(r.success && labels(&r).iter().any(|l| l == "dog"), "{r:?}");
+    assert!(r.success && !r.predictions.is_empty(), "{r:?}");
     let r = post_image(
         &client,
-        &format!("{base}/v1/vision/custom/IPcam-general"),
+        &format!("{base}/v1/vision/custom/rt-detrv2-s"),
         &image,
     )
     .await;
-    assert!(
-        !r.success,
-        "IPcam-general must not be served before a restart"
-    );
+    assert!(!r.success, "rt-detrv2-s was disabled: {r:?}");
 
     // ... until the restart. The listener stays up: requests issued during the restart get an
     // HTTP answer (from the old generation, or "initializing" from the new one), never a

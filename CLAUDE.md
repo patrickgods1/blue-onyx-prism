@@ -95,7 +95,11 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   export -> install, fake-able `CommandRunner`/`Fetcher`, one at a time, cancellable).
 - `src/config.rs` JSON config next to the exe; CLI overrides only non-default values and writes back.
   The server holds it in `config_store.rs` (revision + change log, detects edits on disk); every UI writer goes
-  through `save_config`, and forms 3-way merge against the values they were rendered from (`config_merge.rs`, 409 on conflict).
+  through `save_config` (last write wins). A save applies live: per-request settings (thresholds, filters, timeout,
+  image saving, default model) swap into the workers (`LiveSettings`), structural model changes (enable/disable,
+  device, family, classes) reload only that model (`ModelRegistry::reload_model`), and only runtime-level fields
+  (port, bind address, runtime dirs, cache, threads, profile/concurrency) stay pending until a restart
+  (`config_merge::pending`).
 - Windows service in `src/bin/blue_onyx_prism_service.rs` (cfg windows). systemd/launchd/Docker in `deploy/`.
 
 ## Conventions

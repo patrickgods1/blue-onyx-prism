@@ -152,8 +152,8 @@
     n.textContent = text; el.classList.add("edited-conflict");
   }
   // Refresh one control to the server value `v`: unedited -> take it (flash when it changed);
-  // edited -> keep the user's value; mark it when the server changed it too. Returns true when
-  // the control now shows the server value (the caller then adopts the new base).
+  // edited -> keep the user's value; mark it when the server changed it too (saving writes the
+  // user's value: last write wins). Returns true when the control now shows the server value.
   function refresh(el, v, describe) {
     if (!edited(el)) {
       var changed = !same(el, current(el), v);
@@ -162,7 +162,7 @@
       return true;
     }
     if (same(el, current(el), v)) { set(el, v); note(el, null); el.classList.remove("edited"); return true; }
-    if (!same(el, baseline(el), v)) note(el, "Changed elsewhere to " + (describe ? describe(v) : String(v)) + "; saving asks which to keep.");
+    if (!same(el, baseline(el), v)) note(el, "Changed elsewhere to " + (describe ? describe(v) : String(v)) + "; saving replaces it with your value.");
     else note(el, null);
     return false;
   }

@@ -372,9 +372,9 @@ fn loaded_devices(state: &AppState) -> HashMap<String, String> {
 /// The config's view for the page: global device, and per model its `device`, the device it
 /// runs on (loaded, else what the config resolves to) and its execution provider.
 fn config_view(state: &AppState, snap: &DevicesSnapshot) -> serde_json::Value {
-    state.config.check_disk();
+    super::sync_config(state);
     let (revision, cfg) = state.config.snapshot();
-    let pending = crate::config_merge::pending(&state.running, &cfg);
+    let pending = crate::config_merge::pending(&state.running(), &cfg);
     let thr = crate::config::round_threshold_f64;
     let loaded = loaded_devices(state);
     let models: Vec<serde_json::Value> = cfg
@@ -430,19 +430,13 @@ fn models_now(
     cfg: &Config,
     snap: &DevicesSnapshot,
 ) -> HashMap<String, crate::benchmark::current::ModelNow> {
+    // The threshold the served model's worker uses now (live settings); a model without a
+    // worker (disabled) runs with nothing.
     let running = |name: &str| {
-        let key = crate::registry::normalize_name(name);
         state
-            .running
-            .models
-            .iter()
-            .find(|m| crate::registry::normalize_name(&m.effective_name()) == key)
-            // A disabled model runs with nothing.
-            .filter(|m| m.enabled)
-            .map(|m| {
-                m.confidence_threshold
-                    .unwrap_or(state.running.confidence_threshold)
-            })
+            .registry
+            .by_name(name)
+            .map(|w| w.live().confidence_threshold)
     };
     crate::benchmark::current::from_config(
         cfg,
@@ -789,8 +783,9 @@ fn truthy(v: &str) -> bool {
 /// - `model=<name>&device=<spec>`: one model ("" or `global` = follow the global device);
 /// - `all=1` (optionally limited by repeated `model`): every recommendation of the saved results.
 ///
-/// `restart=1` restarts the server afterwards (like `POST /config/restart`). Answers JSON with
-/// the changes; 400 on bad input, 404 when `all` finds no recommendation.
+/// The changed models reload on their new devices at once (per-model reload); `restart=1`
+/// restarts the server when a change could not be applied that way. Answers JSON with the
+/// changes; 400 on bad input, 404 when `all` finds no recommendation.
 pub(super) async fn apply(
     State(state): State<Arc<AppState>>,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
@@ -874,12 +869,25 @@ pub(super) async fn apply(
     if force_cpu {
         message.push_str(" Note: Force CPU is on and overrides per-model devices.");
     }
-    let restarting = restart && !changes.is_empty();
+    // `save_config` reloaded the changed models (per-model reload); a change that could not
+    // be applied that way stays pending and needs a restart (`restart=1` does it now).
+    let pending = crate::config_merge::pending(&state.running(), &state.config_read());
+    let unapplied = changes
+        .iter()
+        .any(|c| !pending.for_model(&c.model).is_empty());
+    let restarting = restart && unapplied;
     if restarting {
         message.push_str(" Restarting the server to load the models on their new devices.");
         schedule_restart(&state);
-    } else if !changes.is_empty() {
+    } else if unapplied {
         message.push_str(" Restart the server to apply.");
+    } else if changes
+        .iter()
+        .any(|c| state.registry.by_name(&c.model).is_some())
+    {
+        message.push_str(" Reloading the models on their new devices (no restart needed).");
+    } else if !changes.is_empty() {
+        message.push_str(" Used when the model is enabled (no restart needed).");
     }
     info!("benchmark apply: {message}");
     Json(serde_json::json!({
@@ -1021,8 +1029,9 @@ pub(super) const BLUE_IRIS_THRESHOLD_NOTE: &str = "Blue Iris may send its own mi
 /// - `model=<name>&threshold=<0..1>`: one model (repeat the pair for several);
 /// - `all=1` (optionally limited by repeated `model`): every best threshold of the saved results.
 ///
-/// `restart=1` restarts the server afterwards. Answers JSON with the changes; 400 on bad input,
-/// 404 when `all` finds no best threshold.
+/// Thresholds apply live (no restart; `restart=1` is accepted and ignored, `restarting` is
+/// always false). Answers JSON with the changes; 400 on bad input, 404 when `all` finds no
+/// best threshold.
 pub(super) async fn apply_threshold(
     State(state): State<Arc<AppState>>,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
@@ -1038,7 +1047,6 @@ pub(super) async fn apply_threshold(
         .map(|(_, v)| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .collect();
-    let restart = field("restart").is_some_and(truthy);
     let picks: Vec<(String, f32)> = if field("all").is_some_and(truthy) {
         let results = match BenchmarkResults::load(&results_path(&state.config_path)) {
             Ok(Some(r)) => r,
@@ -1113,12 +1121,10 @@ pub(super) async fn apply_threshold(
                 .join("; ")
         )
     };
-    let restarting = restart && !changes.is_empty();
-    if restarting {
-        message.push_str(" Restarting the server to use the new thresholds.");
-        schedule_restart(&state);
-    } else if !changes.is_empty() {
-        message.push_str(" Restart the server to apply.");
+    // Thresholds apply live (`save_config` swapped the workers' settings): no restart.
+    let restarting = false;
+    if !changes.is_empty() {
+        message.push_str(" Applied now: the next detections use it.");
     }
     message.push(' ');
     message.push_str(BLUE_IRIS_THRESHOLD_NOTE);
@@ -1415,11 +1421,13 @@ mod tests {
         assert_eq!(v["changes"][0]["model"], "dfine-s");
         assert_eq!(v["changes"][0]["to"], "ort:coreml");
         assert_eq!(v["restarting"], false);
+        // dfine-s is disabled: nothing to reload or restart.
         assert!(
             v["message"]
                 .as_str()
                 .unwrap()
-                .contains("Restart the server")
+                .contains("Used when the model is enabled"),
+            "{v}"
         );
         let saved = Config::load(&cfg_path).unwrap();
         assert_eq!(saved.models[1].device.as_deref(), Some("ort:coreml"));
@@ -1566,14 +1574,17 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["changes"].as_array().unwrap().len(), 1, "{v}");
         assert_eq!(v["changes"][0]["model"], "ipcam-general");
-        assert_eq!(v["restarting"], true);
+        // Thresholds apply live: no restart even when asked for.
+        assert_eq!(v["restarting"], false);
+        assert!(
+            v["message"].as_str().unwrap().contains("Applied now"),
+            "{v}"
+        );
         let saved = Config::load(&cfg_path).unwrap();
         assert_eq!(saved.models[0].confidence_threshold, Some(0.42));
         // Devices are untouched by the threshold apply.
         assert_eq!(saved.models[0].device, None);
-        tokio::time::timeout(Duration::from_secs(5), st.restart.cancelled())
-            .await
-            .expect("restart requested");
+        assert!(!st.restart.is_cancelled());
         // Several pairs at once (the search page's Apply all).
         let (s, v) = call(
             &st,

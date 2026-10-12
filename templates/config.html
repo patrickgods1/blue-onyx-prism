@@ -1,36 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Config{% endblock %}
 {% macro notices(here) %}{% if at == here %}{% if let Some(m) = message %}<p class="notice">{{ m }}</p>{% endif %}{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}{% endif %}{% endmacro %}
-{% macro conflict_card(here) %}{% if let Some(x) = conflict %}{% if conflict_at == here %}
-<form method="post" action="{{ x.action }}#at-{{ here }}" class="card conflict" id="conflict">
-  <h2>Not saved: changed elsewhere</h2>
-  <p class="error">{{ x.message }}</p>
-  <p class="muted">Your other changes in that form were not saved yet either. Choose a value per field and save again; the page below shows the current config.</p>
-  <div class="scroll">
-  <table>
-  <thead><tr><th>Field</th><th>Your value</th><th>Current value</th><th>Keep</th></tr></thead>
-  <tbody>
-  {% for r in x.rows %}
-  <tr>
-    <td>{{ r.label }}</td><td><code>{{ r.mine }}</code></td><td><code>{{ r.current }}</code></td>
-    <td><label class="check"><input type="radio" name="resolve.{{ r.key }}" value="mine" checked> Use mine</label>
-      <label class="check"><input type="radio" name="resolve.{{ r.key }}" value="current"> Use current</label>
-      <input type="hidden" name="resolve_cur.{{ r.key }}" value="{{ r.current_json }}"></td>
-  </tr>
-  {% endfor %}
-  </tbody>
-  </table>
-  </div>
-  {% for h in x.replay %}<input type="hidden" name="{{ h.0 }}" value="{{ h.1 }}">
-  {% endfor %}
-  <div class="actions">
-    <button type="submit">Save with these choices</button>
-    <button type="submit" name="resolve_all" value="mine">Use mine for all</button>
-    <button type="submit" name="resolve_all" value="current">Use current for all</button>
-    <a href="/config#at-{{ here }}">Discard my changes</a>
-  </div>
-</form>
-{% endif %}{% endif %}{% endmacro %}
 {% block content %}
 <h1 id="cfg-title" data-revision="{{ revision }}">Configuration</h1>
 <p class="muted">File: <code>{{ config_path }}</code> &middot; revision <span id="cfg-rev">{{ revision }}</span></p>
@@ -42,12 +12,9 @@
 
 <div id="at-models" class="anchor"></div>
 {% call notices("models") %}{% endcall %}
-{% call conflict_card("models") %}{% endcall %}
 <form method="post" action="/config/models#at-models" class="card primary" id="models">
-  <h2>Models <span class="tag restart">needs restart</span></h2>
-  <input type="hidden" name="base" value="{{ card_base }}">
-  <input type="hidden" name="base_revision" value="{{ revision }}">
-  <p class="muted">Checked models are compiled and served. The default model serves <code>/v1/vision/detection</code>. Each model can run on its own device (OpenVINO and ONNX Runtime models run side by side; one ONNX Runtime flavor per process) and have its own confidence threshold (empty = the global {{ global_threshold }}); <a href="/benchmark">Benchmark</a> measures which device and threshold suit each model best. <em>Running</em> is what the loaded worker uses now; a <span class="tag restart">restart needed</span> badge means the saved config differs from it.</p>
+  <h2>Models <span class="tag now">applies now</span></h2>
+  <p class="muted">Checked models are compiled and served. The default model serves <code>/v1/vision/detection</code>. Each model can run on its own device (OpenVINO and ONNX Runtime models run side by side; one ONNX Runtime flavor per process) and have its own confidence threshold (empty = the global {{ global_threshold }}); <a href="/benchmark">Benchmark</a> measures which device and threshold suit each model best. <em>Running</em> is what the loaded worker uses now. Saving applies at once: thresholds without a reload, other changes reload only that model; a <span class="tag restart">restart needed</span> badge means the saved config differs from what runs and needs a server restart.</p>
   {% if c.force_cpu %}<p class="warn">Force CPU is on and overrides every per-model device. <a href="#inference">Change</a></p>{% endif %}
   <div class="scroll">
   <table class="model-card">
@@ -185,16 +152,13 @@
 
 <div id="at-server" class="anchor"></div>
 {% call notices("server") %}{% endcall %}
-{% call conflict_card("server") %}{% endcall %}
 <form method="post" action="/config#at-server" class="card grid" id="server">
   <h2>Server <span class="tag restart">needs restart</span></h2>
-  <input type="hidden" name="base" value="{{ server_base }}">
-  <input type="hidden" name="base_revision" value="{{ revision }}">
   <label>Port <span class="tag restart">needs process restart</span> <input type="number" name="port" min="1" max="65535" value="{{ c.port }}" required></label>
   <label>Bind address <span class="tag restart">needs process restart</span> <input type="text" name="bind_address" value="{{ c.bind_address }}" placeholder="0.0.0.0" required></label>
   <input type="hidden" name="access_settings" value="1">
   <label class="check"><input type="checkbox" name="allow_remote_admin"{% if c.allow_remote_admin %} checked{% endif %}> Allow remote administration <span class="tag now">applies now</span> (Config, Test, Logs, Benchmark and resource actions from other machines; off = this machine only)</label>
-  <label>Request timeout (s) <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
+  <label>Request timeout (s) <span class="tag now">applies now</span> <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
   <label>Worker queue size (0 = auto) <input type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
 
   <h2 id="inference">Inference <span class="tag restart">needs restart</span></h2>
@@ -206,15 +170,15 @@
   </label>
   <label class="check"><input type="checkbox" name="force_cpu" id="force-cpu"{% if c.force_cpu %} checked{% endif %}> Force CPU (overrides every device setting)</label>
   <label>GPU index <input type="number" name="gpu_index" min="0" value="{{ c.gpu_index }}" required></label>
-  <p class="muted">"will download" options are fetched on save (the server restarts and switches once installed). Unavailable options are greyed out with the reason. Per-model devices: <code>"device"</code> in the Models JSON. Live list: <a href="/v1/devices"><code>/v1/devices</code></a>.</p>
+  <p class="muted">"will download" options are fetched on save (models serve on what they can meanwhile; the server restarts once to load a new runtime when it is installed). Unavailable options are greyed out with the reason. Per-model devices: <code>"device"</code> in the Models JSON. Live list: <a href="/v1/devices"><code>/v1/devices</code></a>.</p>
   <input type="hidden" name="download_settings" value="1">
   <label class="check"><input type="checkbox" name="auto_download"{% if c.auto_download %} checked{% endif %}> Auto download (missing runtimes and models at startup)</label>
   <label class="check"><input type="checkbox" name="allow_large_downloads"{% if c.allow_large_downloads %} checked{% endif %}> Allow large downloads (over 500 MB, e.g. NVIDIA CUDA libraries)</label>
   <label>Cache dir (empty disables) <input type="text" name="cache_dir" value="{{ c.cache_dir }}"></label>
   <label>CPU threads (0 = default) <input type="number" name="intra_threads" min="0" value="{{ c.intra_threads }}" required></label>
-  <label>Confidence threshold <input type="number" name="confidence_threshold" min="0" max="1" step="0.01" value="{{ c.confidence_threshold }}" required></label>
-  <label>NMS IoU <input type="number" name="nms_iou" min="0" max="1" step="0.01" value="{{ c.nms_iou }}" required></label>
-  <label>Object filter (comma separated, empty = all) <input type="text" name="object_filter" value="{{ c.object_filter }}"></label>
+  <label>Confidence threshold <span class="tag now">applies now</span> <input type="number" name="confidence_threshold" min="0" max="1" step="0.01" value="{{ c.confidence_threshold }}" required></label>
+  <label>NMS IoU <span class="tag now">applies now</span> <input type="number" name="nms_iou" min="0" max="1" step="0.01" value="{{ c.nms_iou }}" required></label>
+  <label>Object filter (comma separated, empty = all) <span class="tag now">applies now</span> <input type="text" name="object_filter" value="{{ c.object_filter }}"></label>
 
   <h2 id="logging">Logging and images</h2>
   <label>Log level <span class="tag now">applies now</span>
@@ -223,7 +187,7 @@
     </select>
   </label>
   <label>Log directory (empty = stdout) <span class="tag restart">needs process restart</span> <input type="text" name="log_path" value="{{ c.log_path }}"></label>
-  <label>Save annotated images to <span class="tag restart">needs restart</span> <input type="text" name="save_image_path" value="{{ c.save_image_path }}" placeholder="disabled"></label>
+  <label>Save annotated images to <span class="tag now">applies now</span> <input type="text" name="save_image_path" value="{{ c.save_image_path }}" placeholder="disabled"></label>
   <label class="check"><input type="checkbox" name="save_ref_image"{% if c.save_ref_image %} checked{% endif %}> Also save the unannotated image</label>
   <p class="muted">Recent log lines: <a href="/logs">Logs</a>.</p>
 
@@ -403,7 +367,8 @@ document.addEventListener("click", function (e) {
   });
   watch();
 })();
-// ---- Live config: refresh fields from GET /v1/config, keep and mark unsaved edits, merge saves.
+// ---- Live config: refresh fields from GET /v1/config, keep and mark unsaved edits; a save
+// writes the form as shown (last write wins).
 (function () {
   var L = window.PrismLive;
   if (!L || !window.fetch) return;
@@ -411,30 +376,23 @@ document.addEventListener("click", function (e) {
   var serverForm = $("server"), card = $("models");
   var pageRev = +$("cfg-title").dataset.revision, epoch = null, own = {}, resetAfter = null;
   U.markEdits(serverForm); U.markEdits(card);
-  function isModelKey(k) { return k.indexOf("model:") === 0 || k === "models:order"; }
-  function baseOf(form) { var h = form.querySelector("input[name=base]"); try { return JSON.parse(h.value); } catch (e) { return {}; } }
-  function setBase(form, b) { form.querySelector("input[name=base]").value = JSON.stringify(b); }
-  // Take the server's base values for `keys` (the field now shows the server value).
-  function adopt(base, nb, keys) { keys.forEach(function (k) { if (k in nb) base[k] = nb[k]; else delete base[k]; }); }
   function show(v) { return v === "" || v === null || v === undefined ? "global" : v === true ? "on" : v === false ? "off" : String(v); }
   function fmtThr(t) { return t === null || t === undefined ? "" : String(t); }
   function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
 
   // Main form: inputs/selects/checkboxes keyed by name, the models JSON as a whole.
   function refreshServer(j, force) {
-    var view = j.forms.server.view, nb = j.forms.server.base, base = baseOf(serverForm);
+    var view = j.forms.server.view;
     Object.keys(view).forEach(function (name) {
       var ctl = serverForm.elements[name];
       if (!ctl || ctl.type === "hidden" || !ctl.tagName) return;
-      var keys = name === "models_json" ? Object.keys(nb).concat(Object.keys(base)).filter(isModelKey) : [name];
-      if (force) { U.set(ctl, view[name]); U.note(ctl, null); ctl.classList.remove("edited"); adopt(base, nb, keys); return; }
+      if (force) { U.set(ctl, view[name]); U.note(ctl, null); ctl.classList.remove("edited"); return; }
       var describe = name === "models_json" ? function () { return "a newer models list (see the change banner)"; } : show;
-      if (U.refresh(ctl, view[name], describe)) adopt(base, nb, keys);
+      U.refresh(ctl, view[name], describe);
     });
     var adv = serverForm.querySelector("details.advanced"), ta = serverForm.elements.models_json;
     if (ta && ta.classList.contains("edited-conflict")) adv.open = true;
     var dev = $("device"), fc = $("force-cpu"); if (dev && fc) { dev.disabled = fc.checked; $("device-hint").hidden = !fc.checked; }
-    setBase(serverForm, base);
   }
 
   // Models card: rows keyed by model; a new or removed model re-renders the card.
@@ -442,17 +400,16 @@ document.addEventListener("click", function (e) {
     var rows = card.querySelectorAll("tbody tr[data-model]");
     var names = Array.prototype.map.call(rows, function (r) { return r.dataset.model; }).join("\n");
     if (names !== j.models.map(function (m) { return m.key; }).join("\n")) { reloadCard(force); return; }
-    var nb = j.forms.models.base, base = baseOf(card);
-    var upd = function (ctl, v, key) {
-      if (force) { U.set(ctl, v); U.note(ctl, null); ctl.classList.remove("edited"); adopt(base, nb, [key]); return; }
-      if (U.refresh(ctl, v, show)) adopt(base, nb, [key]);
+    var upd = function (ctl, v) {
+      if (force) { U.set(ctl, v); U.note(ctl, null); ctl.classList.remove("edited"); return; }
+      U.refresh(ctl, v, show);
     };
     j.models.forEach(function (m, i) {
       var tr = rows[i];
-      upd(tr.querySelector("input[name=enabled]"), m.enabled, "model:enabled:" + m.key);
-      upd(tr.querySelector("select"), m.device || "", "model:device:" + m.key);
+      upd(tr.querySelector("input[name=enabled]"), m.enabled);
+      upd(tr.querySelector("select"), m.device || "");
       var thr = tr.querySelector("input[type=number]");
-      upd(thr, fmtThr(m.threshold), "model:confidence_threshold:" + m.key);
+      upd(thr, fmtThr(m.threshold));
       thr.placeholder = j.globalThreshold.toFixed(2);
       var run = tr.querySelector("td.running"); run.textContent = m.running.text; run.className = "running st-" + m.running.stateClass;
       var badge = tr.querySelector(".pending-badge"); badge.hidden = !m.restartNeeded; badge.title = m.reasons.join("; ");
@@ -471,7 +428,7 @@ document.addEventListener("click", function (e) {
         else { var b = el("button", "small", "use"); b.type = "button"; b.dataset.useThreshold = t; b.title = "Put " + t + " in the threshold field (then save)"; th.append(b); }
       }
     });
-    // Default radio group (one control for the merge).
+    // Default radio group (one control).
     var radios = card.querySelectorAll("input[name=default_model]"), def = j.models.find(function (m) { return m.default; });
     var groupEdited = Array.prototype.some.call(radios, function (r) { return r.checked !== r.defaultChecked; });
     var defName = def ? def.name : null;
@@ -479,13 +436,11 @@ document.addEventListener("click", function (e) {
       var changed = false;
       radios.forEach(function (r) { var on = r.value === defName; if (r.checked !== on) changed = true; r.checked = on; r.defaultChecked = on; });
       if (changed && !force) radios.forEach(function (r) { if (r.checked) U.flash(r); });
-      adopt(base, nb, ["default"]);
     } else {
       var mine = Array.prototype.find.call(radios, function (r) { return r.checked; });
-      if (mine && mine.value === defName) { radios.forEach(function (r) { r.defaultChecked = r.checked; }); adopt(base, nb, ["default"]); }
+      if (mine && mine.value === defName) radios.forEach(function (r) { r.defaultChecked = r.checked; });
     }
     card.querySelector(".restart-now").hidden = !j.restartNeeded;
-    setBase(card, base);
   }
 
   // Re-render the Models card from a fresh /config, carrying the user's unsaved edits over.
@@ -493,7 +448,7 @@ document.addEventListener("click", function (e) {
     fetch("/config", {cache: "no-store"}).then(function (r) { return r.text(); }).then(function (html) {
       var doc = new DOMParser().parseFromString(html, "text/html"), fresh = doc.getElementById("models");
       if (!fresh) return;
-      var oldBase = baseOf(card), nb = JSON.parse(fresh.querySelector("input[name=base]").value), oldRows = {};
+      var oldRows = {};
       card.querySelectorAll("tbody tr[data-model]").forEach(function (r) { oldRows[r.dataset.model] = r; });
       if (!force) card.querySelectorAll("[data-key]").forEach(function (c) {
         if (!U.edited(c)) return;
@@ -501,9 +456,7 @@ document.addEventListener("click", function (e) {
         if (!target) return;
         if (c.type === "checkbox" || c.type === "radio") target.checked = c.checked; else target.value = c.value;
         target.classList.add("edited");
-        if (k in oldBase) nb[k] = oldBase[k]; else delete nb[k];
       });
-      fresh.querySelector("input[name=base]").value = JSON.stringify(nb);
       var st = L.view.capture(card);
       card.replaceChildren.apply(card, Array.prototype.slice.call(document.adoptNode(fresh).childNodes));
       L.view.restore(card, st);
@@ -560,21 +513,18 @@ document.addEventListener("click", function (e) {
     input.value = b.dataset.useThreshold; input.classList.toggle("edited", U.edited(input)); U.flash(input);
   });
 
-  // Save without leaving the page: JSON answers, conflicts shown inline.
+  // Save without leaving the page: JSON answers shown next to the button.
   function msgOf(form) { return form.querySelector(".form-msg"); }
   function say(form, cls, text) { var m = msgOf(form); m.className = "form-msg " + cls; m.textContent = text; }
   // `by`: the clicked button, disabled while the request runs.
   function send(form, data, by) {
     say(form, "muted", "saving…");
-    var btns = by ? [by] : Array.prototype.slice.call(form.querySelectorAll(".conflict-panel button"));
-    btns.forEach(function (b) { b.disabled = true; });
-    var done = function () { btns.forEach(function (b) { b.disabled = false; }); };
+    if (by) by.disabled = true;
+    var done = function () { if (by) by.disabled = false; };
     return fetch(form.getAttribute("action").split("#")[0], {method: "POST", body: new URLSearchParams(data), headers: {"Accept": "application/json"}})
       .then(function (r) { return r.json().then(function (j) { j._status = r.status; return j; }); })
       .then(function (j) {
         done();
-        var old = form.querySelector(".conflict-panel"); if (old) old.remove();
-        if (j._status === 409 && j.conflict) { say(form, "", ""); conflictPanel(form, data, j); return; }
         if (!j.success) { say(form, "error-text", j.message); return; }
         own[j.revision] = true;
         say(form, "ok-text", j.message);
@@ -583,35 +533,6 @@ document.addEventListener("click", function (e) {
         L.poll(true);
       })
       .catch(function (e) { done(); say(form, "error-text", "Not saved: " + e); });
-  }
-  function conflictPanel(form, data, j) {
-    var panel = el("div", "conflict-panel"), choices = {};
-    panel.append(el("p", "error", j.message));
-    var t = el("table"), head = el("tr"); ["Field", "Your value", "Current value", ""].forEach(function (h) { head.append(el("th", null, h)); });
-    var th = el("thead"); th.append(head); t.append(th); var tb = el("tbody"); t.append(tb);
-    var save = el("button", null, "Save with these choices"); save.type = "button"; save.disabled = true;
-    j.conflicts.forEach(function (c) {
-      var tr = el("tr"), mine = el("button", "small", "Use mine"), cur = el("button", "small", "Use current"), act = el("td");
-      mine.type = cur.type = "button";
-      var pick = function (v) { choices[c.key] = v; mine.classList.toggle("chosen", v === "mine"); cur.classList.toggle("chosen", v === "current"); save.disabled = j.conflicts.some(function (x) { return !choices[x.key]; }); };
-      mine.addEventListener("click", function () { pick("mine"); }); cur.addEventListener("click", function () { pick("current"); });
-      tr.append(el("td", null, c.label)); var a = el("td"); a.append(el("code", null, c.mine_text)); tr.append(a);
-      var b = el("td"); b.append(el("code", null, c.current_text)); tr.append(b); act.append(mine, cur); tr.append(act); tb.append(tr);
-    });
-    var wrap = el("div", "scroll"); wrap.append(t); panel.append(wrap);
-    var submit = function (all) {
-      var d = new FormData(); data.forEach(function (v, k) { if (k.indexOf("resolve") !== 0) d.append(k, v); });
-      j.conflicts.forEach(function (c) { d.append("resolve." + c.key, all || choices[c.key]); d.append("resolve_cur." + c.key, "current" in c ? JSON.stringify(c.current) : ""); });
-      send(form, d);
-    };
-    save.addEventListener("click", function () { submit(null); });
-    var allMine = el("button", null, "Use mine for all"), allCur = el("button", null, "Use current for all"), cancel = el("button", null, "Cancel");
-    allMine.type = allCur.type = cancel.type = "button";
-    allMine.addEventListener("click", function () { submit("mine"); }); allCur.addEventListener("click", function () { submit("current"); });
-    cancel.addEventListener("click", function () { panel.remove(); });
-    var bar = el("div", "actions"); bar.append(save, allMine, allCur, cancel); panel.append(bar);
-    form.querySelector(".actions").before(panel);
-    panel.scrollIntoView({block: "nearest"});
   }
   document.addEventListener("submit", function (e) {
     var form = e.target;

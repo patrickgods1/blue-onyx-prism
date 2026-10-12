@@ -23,13 +23,14 @@ use crate::api::{VisionDetectionRequest, VisionDetectionResponse};
 use crate::backend::{
     Backend, Candidate, Completion, DeviceInfo, DeviceSpec, LoadRequest, Runtimes,
 };
-use crate::config::ModelConfig;
+use crate::config::{Config, ModelConfig};
 use crate::metrics::{DropReason, ModelGauges, ModelMetrics, ModelStateLabel};
 use crate::model::{Family, PostParams, PreprocessCtx};
 use crate::prep::{PrepJob, PrepPool, PrepSpec, Prepared};
 use crate::profile::{DeviceTuning, Overrides, Profile};
 use crate::startup::{ModelState, StateHandle};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -67,14 +68,11 @@ pub struct WorkerConfig {
     pub device: DeviceSpec,
     pub load: LoadRequest,
     pub classes: Vec<String>,
-    pub object_filter: Vec<String>,
-    pub confidence_threshold: f32,
-    pub nms_iou: f32,
-    pub request_timeout: Duration,
+    /// Settings applied without a reload (threshold, filter, timeout, image saving); the
+    /// registry swaps them when the config changes and the worker reads them per request.
+    pub live: Arc<ArcSwap<LiveSettings>>,
     /// 0 = auto-size from the warm-up inference time.
     pub queue_size: usize,
-    pub save_image_path: Option<PathBuf>,
-    pub save_ref_image: bool,
     /// Compile on the first request instead of at startup.
     pub lazy: bool,
     /// Reported as `canUseGPU` (some GPU-class device option of any runtime can run).
@@ -87,6 +85,53 @@ pub struct WorkerConfig {
     pub concurrency: Option<Concurrency>,
     /// The generation's decode + preprocess pool (None: the worker starts a one-thread pool).
     pub prep: Option<Arc<PrepPool>>,
+}
+
+/// The per-model settings a config change applies without reloading the model (per-model
+/// overrides already resolved). The worker takes one snapshot when a request arrives and uses
+/// it for that request's timeout, postprocessing and image saving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveSettings {
+    pub confidence_threshold: f32,
+    pub nms_iou: f32,
+    /// Only report these labels (case-insensitive); empty = all.
+    pub object_filter: Vec<String>,
+    /// Save annotated images here.
+    pub save_image_path: Option<PathBuf>,
+    pub save_ref_image: bool,
+    /// How long a request may wait in the queue plus processing.
+    pub request_timeout: Duration,
+}
+
+impl LiveSettings {
+    /// The settings of model `m` under `config` (the model's threshold and object filter win
+    /// over the global ones).
+    pub fn for_model(config: &Config, m: &ModelConfig) -> Self {
+        Self {
+            confidence_threshold: m
+                .confidence_threshold
+                .unwrap_or(config.confidence_threshold),
+            nms_iou: config.nms_iou,
+            object_filter: m
+                .object_filter
+                .clone()
+                .unwrap_or_else(|| config.object_filter.clone()),
+            save_image_path: config.save_image_path.as_deref().map(crate::resolve_path),
+            save_ref_image: config.save_ref_image,
+            request_timeout: config.request_timeout(),
+        }
+    }
+
+    /// A shareable cell holding `self` (what [`WorkerConfig::live`] and the handle share).
+    pub fn shared(self) -> Arc<ArcSwap<LiveSettings>> {
+        Arc::new(ArcSwap::from_pointee(self))
+    }
+}
+
+impl Default for LiveSettings {
+    fn default() -> Self {
+        Self::for_model(&Config::default(), &ModelConfig::default())
+    }
 }
 
 /// What decides a model's concurrency on the device it loads on.
@@ -154,7 +199,7 @@ pub struct WorkerHandle {
     soft_capacity: Arc<AtomicUsize>,
     gate: LoadGate,
     load_started: Arc<AtomicBool>,
-    request_timeout: Duration,
+    live: Arc<ArcSwap<LiveSettings>>,
 }
 
 impl WorkerHandle {
@@ -183,16 +228,27 @@ impl WorkerHandle {
             soft_capacity: Arc::new(AtomicUsize::new(0)),
             gate,
             load_started: Arc::new(AtomicBool::new(true)),
-            request_timeout: Duration::from_secs(
-                crate::config::Config::default().request_timeout_secs,
-            ),
+            live: LiveSettings::default().shared(),
         }
     }
 
-    /// How long a request may wait in the queue plus processing (`request_timeout_secs`); the
-    /// server waits this plus a short grace for the worker's reply.
+    /// How long a request may wait in the queue plus processing (`request_timeout_secs`, live);
+    /// the server waits this plus a short grace for the worker's reply.
     pub fn request_timeout(&self) -> Duration {
-        self.request_timeout
+        self.live.load().request_timeout
+    }
+
+    /// The live settings in effect now (see [`LiveSettings`]).
+    pub fn live(&self) -> Arc<LiveSettings> {
+        self.live.load_full()
+    }
+
+    /// Swap in new live settings; requests that arrive from now on use them. True when they
+    /// differ from the previous ones.
+    pub fn set_live(&self, settings: LiveSettings) -> bool {
+        let new = Arc::new(settings);
+        let old = self.live.swap(new.clone());
+        *old != *new
     }
 
     /// Ask a lazy model that has not started compiling to compile now. Only the first call
@@ -437,7 +493,7 @@ pub fn spawn_worker_after(
         soft_capacity,
         gate: handle_gate,
         load_started,
-        request_timeout: cfg.request_timeout,
+        live: cfg.live.clone(),
     }
 }
 
@@ -466,6 +522,8 @@ struct Meta {
     enqueued: Instant,
     image_name: String,
     min_confidence: f32,
+    /// The live settings when the request arrived (used for its whole life).
+    live: Arc<LiveSettings>,
 }
 
 struct Job {
@@ -780,6 +838,7 @@ impl WorkerCtx {
             enqueued,
             image_name: req.image_name,
             min_confidence: req.min_confidence,
+            live: self.cfg.live.load_full(),
         };
         let stage = if let Some(resp) = self.timed_out(&meta) {
             Stage::Answer(resp)
@@ -788,7 +847,7 @@ impl WorkerCtx {
             let job = PrepJob {
                 image: req.image_data,
                 spec: eng.spec,
-                keep_image: self.cfg.save_image_path.is_some(),
+                keep_image: meta.live.save_image_path.is_some(),
                 reply: tx,
             };
             match prep.submit(job) {
@@ -802,21 +861,22 @@ impl WorkerCtx {
     /// The drop answer when `meta` waited longer than the request timeout.
     fn timed_out(&self, meta: &Meta) -> Option<VisionDetectionResponse> {
         let waited = meta.enqueued.elapsed();
-        if waited <= self.cfg.request_timeout {
+        let timeout = meta.live.request_timeout;
+        if waited <= timeout {
             return None;
         }
         self.metrics.record_drop(DropReason::Timeout);
         warn!(
             model = %self.cfg.name,
             waited_ms = waited.as_millis() as u64,
-            timeout_ms = self.cfg.request_timeout.as_millis() as u64,
+            timeout_ms = timeout.as_millis() as u64,
             "dropping request that waited longer than the request timeout (server overloaded)"
         );
         Some(self.error_response(
             format!(
                 "Request dropped: waited {} ms in queue (timeout {} ms)",
                 waited.as_millis(),
-                self.cfg.request_timeout.as_millis()
+                timeout.as_millis()
             ),
             0,
             0,
@@ -957,7 +1017,7 @@ impl WorkerCtx {
         if let Some(&Done::Slot(i)) = p.order.front()
             && let Some(f) = p.slots[i].as_mut()
             && f.done.is_none()
-            && f.submitted.elapsed() > self.cfg.request_timeout
+            && f.submitted.elapsed() > f.meta.live.request_timeout
         {
             warn!(
                 model = %self.cfg.name,
@@ -1055,7 +1115,7 @@ impl WorkerCtx {
         let cap = if self.cfg.queue_size > 0 {
             self.cfg.queue_size
         } else {
-            auto_queue_size(self.cfg.request_timeout, warmup_ms)
+            auto_queue_size(self.cfg.live.load().request_timeout, warmup_ms)
         };
         self.soft_capacity.store(cap, Ordering::Relaxed);
         if let Ok(mut d) = self.device.write() {
@@ -1180,18 +1240,18 @@ impl WorkerCtx {
             .unwrap_or_else(Instant::now)
             .saturating_duration_since(f.submitted);
         let t = Instant::now();
+        let live = f.meta.live.clone();
         let params = PostParams {
             confidence_threshold: effective_threshold(
                 f.min_confidence(),
-                self.cfg.confidence_threshold,
+                live.confidence_threshold,
             ),
-            nms_iou: self.cfg.nms_iou,
+            nms_iou: live.nms_iou,
         };
         let result = eng.backend.collect(slot).and_then(|outs| {
             let dets = eng.family.postprocess(&outs, &f.ctx, &params);
             eng.backend.recycle(slot, outs);
-            let filter =
-                (!self.cfg.object_filter.is_empty()).then_some(self.cfg.object_filter.as_slice());
+            let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
             Ok(crate::model::to_predictions(
                 &dets?,
                 &f.ctx,
@@ -1219,7 +1279,7 @@ impl WorkerCtx {
                     process_ms = process_d.as_secs_f64() * 1e3,
                     "detection done"
                 );
-                if let (Some(dir), Some(img)) = (&self.cfg.save_image_path, &f.img) {
+                if let (Some(dir), Some(img)) = (&live.save_image_path, &f.img) {
                     let file_name =
                         if f.meta.image_name.is_empty() || f.meta.image_name == "image.jpg" {
                             format!("{}.jpg", uuid::Uuid::new_v4())
@@ -1231,7 +1291,7 @@ impl WorkerCtx {
                         &file_name,
                         img,
                         &predictions,
-                        self.cfg.save_ref_image,
+                        live.save_ref_image,
                     ) {
                         warn!(model = %name, "could not save annotated image: {e:#}");
                     }
@@ -1390,6 +1450,7 @@ mod tests {
                 enqueued: Instant::now(),
                 image_name: String::new(),
                 min_confidence: 0.0,
+                live: Arc::new(LiveSettings::default()),
             },
             ctx: PreprocessCtx {
                 orig_w: 1,

@@ -1,6 +1,6 @@
 //! Field-level view of the config for the web UI: flatten a [`Config`] into canonical
-//! `key -> JSON value` maps, describe what changed between two configs, compute what a restart
-//! would apply, and 3-way merge a form submission into the current config.
+//! `key -> JSON value` maps, describe what changed between two configs (the change log), say
+//! which changes apply without a restart, and compute what a restart would still apply.
 //!
 //! Keys:
 //! - `port`, `device`, ... : top-level config fields (`benchmark.<field>` for the benchmark section);
@@ -12,11 +12,8 @@
 //! `<name>` is the model's normalized name ([`normalize_name`]), so entries are identified by
 //! name, not by position.
 //!
-//! A form posts the canonical values it was rendered from (its *base*). For every key the merge
-//! keeps the current server value when the user did not change it (submitted == base), takes
-//! the user's value when only the user changed it (current == base), accepts it when both made
-//! the same change, and reports a [`Conflict`] when both changed it differently: nothing is
-//! overwritten silently.
+//! Saving is last write wins: a form posts the section it edits and the server applies it as
+//! is (the Config page refreshes the fields the user has not touched from `GET /v1/config`).
 
 use crate::config::{Config, ModelConfig};
 use crate::registry::normalize_name;
@@ -29,18 +26,6 @@ pub type Fields = BTreeMap<String, Value>;
 
 pub const ORDER_KEY: &str = "models:order";
 pub const DEFAULT_KEY: &str = "default";
-
-/// Which form a set of fields belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    /// The main `/config` form: [`crate::config::FORM_FIELDS`] and the whole models list (JSON).
-    ServerForm,
-    /// The Models card: per model `enabled`, `device`, `confidence_threshold`, and the default.
-    ModelsCard,
-}
-
-/// Model fields the Models card edits.
-pub const CARD_MODEL_FIELDS: &[&str] = &["enabled", "device", "confidence_threshold"];
 
 pub fn model_key(field: &str, name: &str) -> String {
     format!("model:{field}:{}", normalize_name(name))
@@ -110,13 +95,6 @@ fn models_of(c: &Config) -> Vec<(String, Map<String, Value>)> {
         .collect()
 }
 
-/// Effective default model's name (what serves `/v1/vision/detection`), as JSON.
-fn default_value(c: &Config) -> Value {
-    c.effective_default_index()
-        .map(|i| Value::String(c.models[i].effective_name()))
-        .unwrap_or(Value::Null)
-}
-
 /// Every field of `c`: globals, `benchmark.*`, `default_model`, models (presence, fields, order).
 pub fn flatten_all(c: &Config) -> Fields {
     let mut out = Fields::new();
@@ -133,127 +111,27 @@ pub fn flatten_all(c: &Config) -> Fields {
             }
         }
     }
-    add_models(&mut out, c, None);
+    add_models(&mut out, c);
     out
 }
 
-fn add_models(out: &mut Fields, c: &Config, only: Option<&[&str]>) {
+fn add_models(out: &mut Fields, c: &Config) {
     let models = models_of(c);
-    if only.is_none() {
-        out.insert(
-            ORDER_KEY.to_string(),
-            Value::Array(
-                models
-                    .iter()
-                    .map(|(n, _)| Value::String(n.clone()))
-                    .collect(),
-            ),
-        );
-    }
+    out.insert(
+        ORDER_KEY.to_string(),
+        Value::Array(
+            models
+                .iter()
+                .map(|(n, _)| Value::String(n.clone()))
+                .collect(),
+        ),
+    );
     for (name, obj) in models {
-        if only.is_none() {
-            out.insert(format!("model::{name}"), Value::Bool(true));
-        }
+        out.insert(format!("model::{name}"), Value::Bool(true));
         for (f, v) in obj {
-            if only.is_none_or(|o| o.contains(&f.as_str())) {
-                out.insert(format!("model:{f}:{name}"), v);
-            }
+            out.insert(format!("model:{f}:{name}"), v);
         }
     }
-}
-
-/// The fields a form shows, as rendered from `c` (its base).
-pub fn form_fields(c: &Config, scope: Scope) -> Fields {
-    let mut out = Fields::new();
-    match scope {
-        Scope::ServerForm => {
-            let obj = config_object(c);
-            for &k in crate::config::FORM_FIELDS {
-                if let Some(v) = obj.get(k) {
-                    out.insert(k.to_string(), v.clone());
-                }
-            }
-            add_models(&mut out, c, None);
-        }
-        Scope::ModelsCard => {
-            out.insert(DEFAULT_KEY.to_string(), default_value(c));
-            add_models(&mut out, c, Some(CARD_MODEL_FIELDS));
-        }
-    }
-    out
-}
-
-/// One field both the user and someone else changed, to different values.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Conflict {
-    pub key: String,
-    /// "IPcam-general · device", "Port".
-    pub label: String,
-    /// Value when the form was rendered (None = absent, e.g. the model did not exist; omitted
-    /// from JSON, unlike a JSON `null` value).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base: Option<Value>,
-    /// The user's value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mine: Option<Value>,
-    /// The server's current value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current: Option<Value>,
-    /// Display text of `mine` / `current`.
-    pub mine_text: String,
-    pub current_text: String,
-}
-
-/// How the user resolved a conflict on the conflict page.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Resolution {
-    /// Keep the user's value; `seen` is the server value the user saw when choosing (if the
-    /// server changed the field again since, it is a conflict again).
-    Mine { seen: Option<Value> },
-    /// Take the server's current value.
-    Current,
-}
-
-/// Why a merge produced no config.
-#[derive(Debug)]
-pub enum MergeError {
-    Conflicts(Vec<Conflict>),
-    Invalid(anyhow::Error),
-}
-
-impl std::fmt::Display for MergeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MergeError::Conflicts(c) => write!(f, "{}", conflict_message(c)),
-            MergeError::Invalid(e) => write!(f, "{e:#}"),
-        }
-    }
-}
-
-impl std::error::Error for MergeError {}
-
-/// "Not saved: changed elsewhere since this page was loaded: IPcam-general · device (yours:
-/// openvino:gpu, now: openvino:cpu)."
-pub fn conflict_message(conflicts: &[Conflict]) -> String {
-    let parts: Vec<String> = conflicts
-        .iter()
-        .map(|c| {
-            format!(
-                "{} (yours: {}, now: {})",
-                c.label, c.mine_text, c.current_text
-            )
-        })
-        .collect();
-    format!(
-        "Not saved: {} changed elsewhere since this page was loaded: {}. Choose which value \
-         to keep.",
-        if conflicts.len() == 1 {
-            "a field was"
-        } else {
-            "fields were"
-        },
-        parts.join("; ")
-    )
 }
 
 /// Display names of the models mentioned in `maps` (normalized name -> name as configured).
@@ -446,246 +324,6 @@ pub fn describe_changes(old: &Config, new: &Config) -> (Vec<FieldChange>, String
 }
 
 // ---------------------------------------------------------------------------------------------
-// Merge
-
-/// 3-way decision for one key: Ok(resolved value) or Err(()) on a conflict.
-fn merge_one<'a>(
-    b: Option<&'a Value>,
-    m: Option<&'a Value>,
-    c: Option<&'a Value>,
-) -> Result<Option<&'a Value>, ()> {
-    if m == b {
-        Ok(c)
-    } else if c == b || m == c {
-        Ok(m)
-    } else {
-        Err(())
-    }
-}
-
-fn names_of(v: Option<&Value>) -> Vec<String> {
-    v.and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// `list` restricted to the names in `keep`, in `list` order.
-fn restricted(list: &[String], keep: &BTreeSet<&str>) -> Vec<String> {
-    list.iter()
-        .filter(|n| keep.contains(n.as_str()))
-        .cloned()
-        .collect()
-}
-
-/// Merge the user's `mine` (submitted) over `current`, given the `base` the form was rendered
-/// from, applying `resolutions` chosen on a conflict page. Returns the merged config (not yet
-/// validated as a whole) or the conflicts.
-pub fn merge(
-    current: &Config,
-    scope: Scope,
-    base: &Fields,
-    mine: &Fields,
-    resolutions: &BTreeMap<String, Resolution>,
-) -> Result<Config, MergeError> {
-    let cur = form_fields(current, scope);
-    let mut base = base.clone();
-    for (k, r) in resolutions {
-        let v = match r {
-            Resolution::Mine { seen } => seen.clone(),
-            Resolution::Current => mine.get(k).cloned(),
-        };
-        match v {
-            Some(v) => base.insert(k.clone(), v),
-            None => base.remove(k),
-        };
-    }
-    let mut names = display_names(&[mine, &cur, &base]);
-    for m in &current.models {
-        let n = m.effective_name();
-        names.entry(normalize_name(&n)).or_insert(n);
-    }
-    let keys: BTreeSet<&String> = base
-        .keys()
-        .chain(mine.keys())
-        .chain(cur.keys())
-        .filter(|k| parse_key(k) != Key::Order)
-        .collect();
-    let mut resolved = Fields::new();
-    let mut conflicts = Vec::new();
-    for k in keys {
-        let (b, m, c) = (base.get(k), mine.get(k), cur.get(k));
-        match merge_one(b, m, c) {
-            Ok(Some(v)) => {
-                resolved.insert(k.clone(), v.clone());
-            }
-            Ok(None) => {}
-            Err(()) => conflicts.push(Conflict {
-                key: k.clone(),
-                label: label(k, &names),
-                base: b.cloned(),
-                mine: m.cloned(),
-                current: c.cloned(),
-                mine_text: value_text(k, m),
-                current_text: value_text(k, c),
-            }),
-        }
-    }
-    // Order (server form only): the user's order when only the user reordered the models
-    // both saw, the current order otherwise; a conflict when both reordered differently.
-    let order = if scope == Scope::ServerForm {
-        let final_names: BTreeSet<&str> = resolved
-            .keys()
-            .filter_map(|k| match parse_key(k) {
-                Key::Presence(n) => Some(n),
-                _ => None,
-            })
-            .collect();
-        let (b, m, c) = (
-            names_of(base.get(ORDER_KEY)),
-            names_of(mine.get(ORDER_KEY)),
-            names_of(cur.get(ORDER_KEY)),
-        );
-        let bs: BTreeSet<&str> = b.iter().map(String::as_str).collect();
-        let ms: BTreeSet<&str> = m.iter().map(String::as_str).collect();
-        let cs: BTreeSet<&str> = c.iter().map(String::as_str).collect();
-        let bm: BTreeSet<&str> = bs.intersection(&ms).copied().collect();
-        let bc: BTreeSet<&str> = bs.intersection(&cs).copied().collect();
-        let user_reordered = restricted(&m, &bm) != restricted(&b, &bm);
-        let server_reordered = restricted(&c, &bc) != restricted(&b, &bc);
-        let common: BTreeSet<&str> = bm.intersection(&bc).copied().collect();
-        let primary = if user_reordered && server_reordered {
-            if restricted(&m, &common) != restricted(&c, &common) {
-                let key = ORDER_KEY.to_string();
-                conflicts.push(Conflict {
-                    label: label(&key, &names),
-                    mine_text: m.join(", "),
-                    current_text: c.join(", "),
-                    base: base.get(ORDER_KEY).cloned(),
-                    mine: mine.get(ORDER_KEY).cloned(),
-                    current: cur.get(ORDER_KEY).cloned(),
-                    key,
-                });
-            }
-            &c
-        } else if user_reordered {
-            &m
-        } else {
-            &c
-        };
-        let mut order: Vec<String> = Vec::new();
-        for n in primary.iter().chain(c.iter()).chain(m.iter()) {
-            if final_names.contains(n.as_str()) && !order.contains(n) {
-                order.push(n.clone());
-            }
-        }
-        Some(order)
-    } else {
-        None
-    };
-    if !conflicts.is_empty() {
-        return Err(MergeError::Conflicts(conflicts));
-    }
-    apply(current, scope, &resolved, order.as_deref()).map_err(MergeError::Invalid)
-}
-
-/// Write `resolved` (every key of the scope; absent = removed) over `current`.
-fn apply(
-    current: &Config,
-    scope: Scope,
-    resolved: &Fields,
-    order: Option<&[String]>,
-) -> anyhow::Result<Config> {
-    let mut obj = config_object(current);
-    let mut default: Option<String> = None;
-    for (k, v) in resolved {
-        match parse_key(k) {
-            Key::Global(g) => {
-                obj.insert(g.to_string(), v.clone());
-            }
-            Key::Bench(b) => {
-                if let Some(Value::Object(bo)) = obj.get_mut("benchmark") {
-                    bo.insert(b.to_string(), v.clone());
-                }
-            }
-            Key::Default => default = v.as_str().map(str::to_string),
-            _ => {}
-        }
-    }
-    // Models: per-model field maps.
-    let current_models = models_of(current);
-    let mut fields_by_model: BTreeMap<&str, Map<String, Value>> = BTreeMap::new();
-    for (k, v) in resolved {
-        if let Key::Model { field, name } = parse_key(k) {
-            fields_by_model
-                .entry(name)
-                .or_default()
-                .insert(field.to_string(), v.clone());
-        }
-    }
-    let models: Vec<Value> = match scope {
-        Scope::ServerForm => {
-            let order = order.unwrap_or_default();
-            let mut out = Vec::new();
-            for name in order {
-                // Every field of the model is in scope: the resolved ones are the model.
-                let Some(fields) = fields_by_model.get(name.as_str()) else {
-                    continue;
-                };
-                out.push(Value::Object(fields.clone()));
-            }
-            out
-        }
-        Scope::ModelsCard => current_models
-            .into_iter()
-            .map(|(name, mut o)| {
-                for &f in CARD_MODEL_FIELDS {
-                    match resolved.get(&format!("model:{f}:{name}")) {
-                        Some(v) => {
-                            o.insert(f.to_string(), v.clone());
-                        }
-                        None => {
-                            o.remove(f);
-                        }
-                    }
-                }
-                Value::Object(o)
-            })
-            .collect(),
-    };
-    obj.insert("models".into(), Value::Array(models));
-    let mut c: Config =
-        serde_json::from_value(Value::Object(obj)).map_err(|e| anyhow::anyhow!("models: {e}"))?;
-    if scope == Scope::ModelsCard {
-        // The card's radio: the chosen default is enabled too (like `apply_models_selection`).
-        let now = default_value(current);
-        let chosen = default.map(Value::String).unwrap_or(Value::Null);
-        if chosen != now {
-            match chosen.as_str() {
-                Some(name) => {
-                    let key = normalize_name(name);
-                    let Some(m) = c
-                        .models
-                        .iter_mut()
-                        .find(|m| normalize_name(&m.effective_name()) == key)
-                    else {
-                        anyhow::bail!("default model '{name}' is not one of the configured models");
-                    };
-                    m.enabled = true;
-                    c.default_model = Some(m.effective_name());
-                }
-                None => c.default_model = None,
-            }
-        }
-    }
-    c.normalize();
-    Ok(c)
-}
-
-// ---------------------------------------------------------------------------------------------
 // Pending restart
 
 /// What a restart would change: differences between the config this generation runs with and
@@ -718,13 +356,119 @@ impl Pending {
 }
 
 /// Globals a restart does not need: the log level and `allow_remote_admin` apply immediately,
-/// the benchmark section is read when a benchmark starts.
-fn live_global(k: &str) -> bool {
-    matches!(k, "log_level" | "default_model" | "allow_remote_admin") || k.starts_with("benchmark.")
+/// the per-request settings go into every worker's live settings
+/// ([`crate::worker::LiveSettings`], through `ModelRegistry::apply_live`), `default_model`
+/// switches the registry's default at once, and the benchmark section is read when a
+/// benchmark starts. Every other global is runtime-level and needs a restart.
+pub fn live_global(k: &str) -> bool {
+    matches!(
+        k,
+        "log_level"
+            | "default_model"
+            | "allow_remote_admin"
+            | "request_timeout_secs"
+            | "confidence_threshold"
+            | "nms_iou"
+            | "object_filter"
+            | "save_image_path"
+            | "save_ref_image"
+    ) || k.starts_with("benchmark.")
 }
 
-fn thr_text(t: f32) -> String {
-    format!("{:.2}", crate::config::round_threshold_f64(t))
+/// Model fields applied live (the worker reads them per request).
+pub const LIVE_MODEL_FIELDS: &[&str] = &["confidence_threshold", "object_filter"];
+
+/// Labels of the changed fields that applied without a restart (live globals, the default
+/// model, per-model thresholds and object filters; the benchmark section is not listed: it is
+/// only read when a benchmark starts).
+pub fn applied_live(changes: &[FieldChange]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|c| match parse_key(&c.key) {
+            Key::Global(g) => live_global(g),
+            Key::Default => true,
+            Key::Model { field, .. } => LIVE_MODEL_FIELDS.contains(&field),
+            _ => false,
+        })
+        .map(|c| c.label.clone())
+        .collect()
+}
+
+/// `current` with the runtime-level globals (everything [`live_global`] does not list, e.g.
+/// `port`, `device`, `force_cpu`, `cache_dir`) of `running`: what this generation can apply
+/// without a restart. Models, live globals and the benchmark section come from `current`.
+pub fn runtime_overlay(running: &Config, current: &Config) -> Config {
+    let mut obj = config_object(current);
+    for (k, v) in config_object(running) {
+        if !matches!(k.as_str(), "models" | "benchmark" | "default_model") && !live_global(&k) {
+            obj.insert(k, v);
+        }
+    }
+    match serde_json::from_value::<Config>(Value::Object(obj)) {
+        Ok(mut c) => {
+            c.normalize();
+            c
+        }
+        Err(_) => current.clone(),
+    }
+}
+
+/// The enabled entry of model `key` (normalized name).
+fn enabled_model<'a>(c: &'a Config, key: &str) -> Option<&'a ModelConfig> {
+    c.models
+        .iter()
+        .find(|m| m.enabled && normalize_name(&m.effective_name()) == key)
+}
+
+/// The models whose worker has to be replaced, started or stopped to go from `running` to
+/// `next` (same runtime-level globals, see [`runtime_overlay`]): enabled in one and not the
+/// other, or enabled in both with a field other than the live ones ([`LIVE_MODEL_FIELDS`])
+/// changed. Names as `next` spells them (else `running`), in `next` order.
+pub fn model_reloads(running: &Config, next: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for m in next.models.iter().chain(running.models.iter()) {
+        let name = m.effective_name();
+        let key = normalize_name(&name);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let changed = match (enabled_model(running, &key), enabled_model(next, &key)) {
+            (None, None) => false,
+            (Some(r), Some(n)) => {
+                let strip = |m: &ModelConfig| {
+                    let mut o = model_object(m);
+                    for f in LIVE_MODEL_FIELDS {
+                        o.remove(*f);
+                    }
+                    o
+                };
+                strip(r) != strip(n) || running.device_for(r) != next.device_for(n)
+            }
+            _ => true,
+        };
+        if changed {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Put `source`'s entry of model `name` into `target` (replace it, add it at the end, or
+/// remove it when `source` has none): a model whose reload did not happen keeps showing what
+/// runs.
+pub fn keep_model_from(target: &mut Config, source: &Config, name: &str) {
+    let key = normalize_name(name);
+    let is = |m: &ModelConfig| normalize_name(&m.effective_name()) == key;
+    let from = source.models.iter().find(|m| is(m)).cloned();
+    match (target.models.iter().position(is), from) {
+        (Some(i), Some(m)) => target.models[i] = m,
+        (Some(i), None) => {
+            target.models.remove(i);
+        }
+        (None, Some(m)) => target.models.push(m),
+        (None, None) => {}
+    }
 }
 
 /// What a restart would apply, comparing the running config with the current one.
@@ -754,22 +498,8 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
             out.global.push(text);
         }
     }
-    let name_of = |c: &Config, i: usize| c.models[i].effective_name();
-    let (da, db) = (
-        running
-            .effective_default_index()
-            .map(|i| name_of(running, i)),
-        current
-            .effective_default_index()
-            .map(|i| name_of(current, i)),
-    );
-    if da.as_deref().map(normalize_name) != db.as_deref().map(normalize_name) {
-        out.global.push(format!(
-            "default model: {} \u{2192} {}",
-            da.as_deref().unwrap_or("none"),
-            db.as_deref().unwrap_or("none")
-        ));
-    }
+    // The default model applies live (a default that is not loaded yet shows as that model's
+    // "enabled; not loaded yet").
     let find = |c: &'_ Config, key: &str| -> Option<ModelConfig> {
         c.models
             .iter()
@@ -796,25 +526,12 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
                 if dr != dc {
                     reasons.push(format!("device: {dr} \u{2192} {dc}"));
                 }
-                let tr = r
-                    .confidence_threshold
-                    .unwrap_or(running.confidence_threshold);
-                let tc = c
-                    .confidence_threshold
-                    .unwrap_or(current.confidence_threshold);
-                if thr_text(tr) != thr_text(tc) {
-                    reasons.push(format!(
-                        "threshold: {} \u{2192} {}",
-                        thr_text(tr),
-                        thr_text(tc)
-                    ));
-                }
+                // Threshold and object filter apply live.
                 let (or, oc) = (model_object(&r), model_object(&c));
                 for (f, v) in &oc {
-                    if matches!(
-                        f.as_str(),
-                        "name" | "device" | "confidence_threshold" | "enabled"
-                    ) {
+                    if matches!(f.as_str(), "name" | "device" | "enabled")
+                        || LIVE_MODEL_FIELDS.contains(&f.as_str())
+                    {
                         continue;
                     }
                     if or.get(f) != Some(v) {
@@ -833,7 +550,6 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn cfg() -> Config {
         let mut c = Config {
@@ -850,10 +566,6 @@ mod tests {
         };
         c.normalize();
         c
-    }
-
-    fn set(f: &mut Fields, k: &str, v: Value) {
-        f.insert(k.to_string(), v);
     }
 
     #[test]
@@ -888,211 +600,6 @@ mod tests {
         assert_eq!(f["nms_iou"].to_string(), "0.5");
     }
 
-    /// Scalar field: the five merge cases.
-    #[test]
-    fn scalar_merge_cases() {
-        let base_cfg = cfg();
-        let base = form_fields(&base_cfg, Scope::ServerForm);
-        let none = BTreeMap::new();
-        // No change anywhere.
-        let out = merge(&base_cfg, Scope::ServerForm, &base, &base, &none).unwrap();
-        assert_eq!(out, base_cfg);
-        // User-only change.
-        let mut mine = base.clone();
-        set(&mut mine, "port", json!(4000));
-        let out = merge(&base_cfg, Scope::ServerForm, &base, &mine, &none).unwrap();
-        assert_eq!(out.port, 4000);
-        // Server-only change: kept.
-        let mut server = base_cfg.clone();
-        server.port = 5000;
-        let out = merge(&server, Scope::ServerForm, &base, &base, &none).unwrap();
-        assert_eq!(out.port, 5000);
-        // Both, same value.
-        server.port = 4000;
-        let out = merge(&server, Scope::ServerForm, &base, &mine, &none).unwrap();
-        assert_eq!(out.port, 4000);
-        // Both, different values: conflict naming both values.
-        server.port = 5000;
-        let Err(MergeError::Conflicts(c)) = merge(&server, Scope::ServerForm, &base, &mine, &none)
-        else {
-            panic!("expected a conflict");
-        };
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].key, "port");
-        assert_eq!(c[0].label, "Port");
-        assert_eq!(
-            (c[0].mine_text.as_str(), c[0].current_text.as_str()),
-            ("4000", "5000")
-        );
-        // Resolutions.
-        let mut r = BTreeMap::new();
-        r.insert(
-            "port".to_string(),
-            Resolution::Mine {
-                seen: Some(json!(5000)),
-            },
-        );
-        assert_eq!(
-            merge(&server, Scope::ServerForm, &base, &mine, &r)
-                .unwrap()
-                .port,
-            4000
-        );
-        r.insert("port".to_string(), Resolution::Current);
-        assert_eq!(
-            merge(&server, Scope::ServerForm, &base, &mine, &r)
-                .unwrap()
-                .port,
-            5000
-        );
-        // "Use mine" against a value the user did not see is a conflict again.
-        r.insert(
-            "port".to_string(),
-            Resolution::Mine {
-                seen: Some(json!(4500)),
-            },
-        );
-        assert!(merge(&server, Scope::ServerForm, &base, &mine, &r).is_err());
-    }
-
-    /// The stale-page bug: the models JSON of a page loaded before a benchmark apply carries
-    /// the old device/threshold; saving it must keep the applied values.
-    #[test]
-    fn models_json_merge_per_model_field() {
-        let base_cfg = cfg();
-        let base = form_fields(&base_cfg, Scope::ServerForm);
-        let mut server = base_cfg.clone();
-        server.models[0].device = Some("openvino:cpu".into());
-        server.models[0].confidence_threshold = Some(0.35);
-        let none = BTreeMap::new();
-        // Unchanged submission (stale page): server values kept.
-        let out = merge(&server, Scope::ServerForm, &base, &base, &none).unwrap();
-        assert_eq!(out, server);
-        // The user changed another model's field: both changes survive.
-        let mut mine = base.clone();
-        set(&mut mine, "model:lazy:yolo26s", json!(true));
-        let out = merge(&server, Scope::ServerForm, &base, &mine, &none).unwrap();
-        assert_eq!(out.models[0].device.as_deref(), Some("openvino:cpu"));
-        assert_eq!(out.models[0].confidence_threshold, Some(0.35));
-        assert!(out.models[1].lazy);
-        // The user changed the same field differently: conflict.
-        set(&mut mine, "model:device:ipcam-general", json!("ort:coreml"));
-        let Err(MergeError::Conflicts(c)) = merge(&server, Scope::ServerForm, &base, &mine, &none)
-        else {
-            panic!("expected a conflict");
-        };
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].label, "IPcam-general \u{b7} device");
-        assert_eq!(c[0].mine_text, "ort:coreml");
-        assert_eq!(c[0].current_text, "openvino:cpu");
-        // Both set the same value: fine.
-        set(
-            &mut mine,
-            "model:device:ipcam-general",
-            json!("openvino:cpu"),
-        );
-        assert!(merge(&server, Scope::ServerForm, &base, &mine, &none).is_ok());
-    }
-
-    #[test]
-    fn models_json_add_remove_and_order() {
-        let base_cfg = cfg();
-        let base = form_fields(&base_cfg, Scope::ServerForm);
-        let none = BTreeMap::new();
-        // Server added a model; the user removed yolo26s: both happen.
-        let mut server = base_cfg.clone();
-        server.models.push(ModelConfig {
-            name: Some("extra".into()),
-            path: "models/extra.onnx".into(),
-            ..Default::default()
-        });
-        let mut user = base_cfg.clone();
-        user.models.remove(1);
-        let mine = form_fields(&user, Scope::ServerForm);
-        let out = merge(&server, Scope::ServerForm, &base, &mine, &none).unwrap();
-        let names: Vec<String> = out.models.iter().map(|m| m.effective_name()).collect();
-        assert_eq!(names, ["IPcam-general", "extra"]);
-        // The user removed a model the server changed: conflict.
-        let mut server2 = base_cfg.clone();
-        server2.models[1].device = Some("openvino:cpu".into());
-        let Err(MergeError::Conflicts(c)) = merge(&server2, Scope::ServerForm, &base, &mine, &none)
-        else {
-            panic!("expected a conflict");
-        };
-        assert!(c.iter().any(|c| c.key == "model:device:yolo26s"), "{c:?}");
-        // The user reordered; the server changed a field: order and field both applied.
-        let mut user = base_cfg.clone();
-        user.models.reverse();
-        let mine = form_fields(&user, Scope::ServerForm);
-        let out = merge(&server2, Scope::ServerForm, &base, &mine, &none).unwrap();
-        assert_eq!(out.models[0].effective_name(), "yolo26s");
-        assert_eq!(out.models[0].device.as_deref(), Some("openvino:cpu"));
-        // The user added a model with a name the server also added differently: conflict.
-        let mut user = base_cfg.clone();
-        user.models.push(ModelConfig {
-            name: Some("extra".into()),
-            path: "models/other.onnx".into(),
-            ..Default::default()
-        });
-        let mine = form_fields(&user, Scope::ServerForm);
-        assert!(matches!(
-            merge(&server, Scope::ServerForm, &base, &mine, &none),
-            Err(MergeError::Conflicts(_))
-        ));
-    }
-
-    #[test]
-    fn models_card_merge() {
-        let base_cfg = cfg();
-        let base = form_fields(&base_cfg, Scope::ModelsCard);
-        assert_eq!(base["default"], json!("IPcam-general"));
-        assert_eq!(base["model:device:ipcam-general"], Value::Null);
-        let none = BTreeMap::new();
-        let mut server = base_cfg.clone();
-        server.models[0].device = Some("openvino:cpu".into());
-        server.models[0].confidence_threshold = Some(0.35);
-        // Stale card: unchanged rows keep the server's device and threshold.
-        let out = merge(&server, Scope::ModelsCard, &base, &base, &none).unwrap();
-        assert_eq!(out, server);
-        // The user unchecks yolo26s and sets a threshold on it.
-        let mut mine = base.clone();
-        set(&mut mine, "model:enabled:yolo26s", json!(false));
-        set(&mut mine, "model:confidence_threshold:yolo26s", json!(0.6));
-        let out = merge(&server, Scope::ModelsCard, &base, &mine, &none).unwrap();
-        assert!(!out.models[1].enabled);
-        assert_eq!(out.models[1].confidence_threshold, Some(0.6));
-        assert_eq!(out.models[0].device.as_deref(), Some("openvino:cpu"));
-        // Default radio: choosing a disabled model enables it.
-        let mut server3 = base_cfg.clone();
-        server3.models[1].enabled = false;
-        let base3 = form_fields(&server3, Scope::ModelsCard);
-        let mut mine = base3.clone();
-        set(&mut mine, "default", json!("yolo26s"));
-        let out = merge(&server3, Scope::ModelsCard, &base3, &mine, &none).unwrap();
-        assert!(out.models[1].enabled);
-        assert_eq!(out.default_model.as_deref(), Some("yolo26s"));
-        // A model added on the server after the card was rendered is left alone.
-        let mut server4 = base_cfg.clone();
-        server4.models.push(ModelConfig {
-            name: Some("extra".into()),
-            path: "models/extra.onnx".into(),
-            enabled: false,
-            ..Default::default()
-        });
-        let out = merge(&server4, Scope::ModelsCard, &base, &base, &none).unwrap();
-        assert_eq!(out, server4);
-        // Both changed the device differently: conflict.
-        let mut mine = base.clone();
-        set(&mut mine, "model:device:ipcam-general", json!("ort:cpu"));
-        let Err(MergeError::Conflicts(c)) = merge(&server, Scope::ModelsCard, &base, &mine, &none)
-        else {
-            panic!("expected a conflict");
-        };
-        assert_eq!(c[0].key, "model:device:ipcam-general");
-        assert_eq!(c[0].label, "IPcam-general \u{b7} device");
-        assert!(conflict_message(&c).contains("yours: ort:cpu, now: openvino:cpu"));
-    }
-
     #[test]
     fn change_summaries() {
         let a = cfg();
@@ -1116,6 +623,196 @@ mod tests {
     }
 
     #[test]
+    fn applied_live_lists_live_fields_only() {
+        let a = cfg();
+        let mut b = a.clone();
+        b.models[0].confidence_threshold = Some(0.35);
+        b.models[1].object_filter = Some(vec!["person".into()]);
+        b.models[1].lazy = true;
+        b.nms_iou = 0.6;
+        b.request_timeout_secs = 5;
+        b.port = 4000;
+        b.default_model = Some("yolo26s".into());
+        b.benchmark.warmup = 9;
+        let (changes, _) = describe_changes(&a, &b);
+        let live = applied_live(&changes);
+        for l in [
+            "IPcam-general \u{b7} threshold",
+            "yolo26s \u{b7} object filter",
+            "NMS IoU",
+            "Request timeout",
+            "Default model",
+        ] {
+            assert!(live.contains(&l.to_string()), "{l}: {live:?}");
+        }
+        assert_eq!(live.len(), 5, "{live:?}");
+    }
+
+    #[test]
+    fn overlay_keeps_runtime_level_globals() {
+        let running = cfg();
+        let mut current = running.clone();
+        current.port = 4000;
+        current.device = "openvino:cpu".into();
+        current.force_cpu = true;
+        current.worker_queue_size = 3;
+        current.confidence_threshold = 0.3;
+        current.request_timeout_secs = 7;
+        current.default_model = Some("yolo26s".into());
+        current.models[1].lazy = true;
+        current.benchmark.warmup = 9;
+        let o = runtime_overlay(&running, &current);
+        assert_eq!(
+            (o.port, o.device.as_str(), o.force_cpu, o.worker_queue_size),
+            (running.port, running.device.as_str(), false, 0)
+        );
+        assert_eq!(o.confidence_threshold, 0.3);
+        assert_eq!(o.request_timeout_secs, 7);
+        assert_eq!(o.default_model.as_deref(), Some("yolo26s"));
+        assert!(o.models[1].lazy);
+        assert_eq!(o.benchmark.warmup, 9);
+        // What stays pending is exactly the runtime-level part (the global device also shows
+        // on each model it moves).
+        let p = pending(&o, &current);
+        assert_eq!(p.global.len(), 3, "{p:?}");
+        assert_eq!(p.process.len(), 1, "{p:?}");
+        assert_eq!(p.for_model("yolo26s"), ["device: auto \u{2192} CPU"]);
+    }
+
+    #[test]
+    fn reloads_for_structural_model_changes_only() {
+        let running = cfg();
+        let mut next = running.clone();
+        assert!(model_reloads(&running, &next).is_empty());
+        // Live fields: no reload.
+        next.models[0].confidence_threshold = Some(0.35);
+        next.models[0].object_filter = Some(vec!["car".into()]);
+        assert!(model_reloads(&running, &next).is_empty());
+        // Device, lazy, a new model, a disabled one.
+        next.models[0].device = Some("openvino:cpu".into());
+        next.models[1].enabled = false;
+        next.models.push(ModelConfig {
+            name: Some("extra".into()),
+            path: "models/extra.onnx".into(),
+            ..Default::default()
+        });
+        next.models.push(ModelConfig {
+            name: Some("off".into()),
+            path: "models/off.onnx".into(),
+            enabled: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            model_reloads(&running, &next),
+            ["IPcam-general", "yolo26s", "extra"]
+        );
+        // Removed from the config.
+        let mut gone = running.clone();
+        gone.models.remove(1);
+        assert_eq!(model_reloads(&running, &gone), ["yolo26s"]);
+        // A model whose reload did not happen keeps its running entry.
+        keep_model_from(&mut next, &running, "extra");
+        keep_model_from(&mut next, &running, "IPcam-general");
+        assert_eq!(model_reloads(&running, &next), ["yolo26s"]);
+        let mut back = gone.clone();
+        keep_model_from(&mut back, &running, "yolo26s");
+        assert!(model_reloads(&running, &back).is_empty());
+    }
+
+    type Edit = Box<dyn Fn(&mut Config)>;
+
+    /// Phase 3 classification: live globals and per-model live fields are never pending;
+    /// every runtime-level global is, one reason each.
+    #[test]
+    fn pending_lists_only_runtime_level_fields() {
+        let running = cfg();
+        let live: Vec<Edit> = vec![
+            Box::new(|c| c.confidence_threshold = 0.3),
+            Box::new(|c| c.nms_iou = 0.6),
+            Box::new(|c| c.object_filter = vec!["person".into()]),
+            Box::new(|c| c.save_image_path = Some("shots".into())),
+            Box::new(|c| c.save_ref_image = true),
+            Box::new(|c| c.request_timeout_secs = 3),
+            Box::new(|c| c.log_level = crate::config::LogLevel::Trace),
+            Box::new(|c| c.allow_remote_admin = true),
+            Box::new(|c| c.default_model = Some("yolo26s".into())),
+            Box::new(|c| c.benchmark.repeat_per_image = 7),
+            Box::new(|c| c.models[0].confidence_threshold = Some(0.2)),
+            Box::new(|c| c.models[1].object_filter = Some(vec!["car".into()])),
+        ];
+        for (i, edit) in live.iter().enumerate() {
+            let mut c = running.clone();
+            edit(&mut c);
+            c.normalize();
+            assert_ne!(c, running, "edit {i} changes something");
+            let p = pending(&running, &c);
+            assert!(!p.restart_needed(), "edit {i} is live: {p:?}");
+        }
+        let runtime: Vec<(&str, Edit)> = vec![
+            ("port", Box::new(|c| c.port = 4000)),
+            (
+                "bind_address",
+                Box::new(|c| c.bind_address = "127.0.0.1".parse().unwrap()),
+            ),
+            ("log_path", Box::new(|c| c.log_path = Some("logs".into()))),
+            (
+                "openvino_dir",
+                Box::new(|c| c.openvino_dir = Some("ov".into())),
+            ),
+            (
+                "onnxruntime_dir",
+                Box::new(|c| c.onnxruntime_dir = Some("ort".into())),
+            ),
+            ("cache_dir", Box::new(|c| c.cache_dir = "c2".into())),
+            ("intra_threads", Box::new(|c| c.intra_threads = 2)),
+            (
+                "download_dir",
+                Box::new(|c| c.download_dir = Some("dl".into())),
+            ),
+            ("models_dir", Box::new(|c| c.models_dir = "m2".into())),
+            ("worker_queue_size", Box::new(|c| c.worker_queue_size = 4)),
+            ("preprocess_threads", Box::new(|c| c.preprocess_threads = 2)),
+            ("inflight", Box::new(|c| c.inflight = 2)),
+            ("ort_sessions", Box::new(|c| c.ort_sessions = 2)),
+            (
+                "auto_download",
+                Box::new(|c| c.auto_download = !c.auto_download),
+            ),
+            (
+                "allow_large_downloads",
+                Box::new(|c| c.allow_large_downloads = !c.allow_large_downloads),
+            ),
+            ("gpu_index", Box::new(|c| c.gpu_index = 1)),
+        ];
+        for (k, edit) in &runtime {
+            assert!(!live_global(k), "{k}");
+            let mut c = running.clone();
+            edit(&mut c);
+            let p = pending(&running, &c);
+            assert_eq!(p.global.len() + p.process.len(), 1, "{k}: {p:?}");
+            assert!(p.models.is_empty(), "{k}: {p:?}");
+        }
+        // The global device and force_cpu also show on every model they move.
+        for edit in [
+            Box::new(|c: &mut Config| c.device = "openvino:cpu".into()) as Edit,
+            Box::new(|c: &mut Config| c.force_cpu = true),
+        ] {
+            let mut c = running.clone();
+            edit(&mut c);
+            let p = pending(&running, &c);
+            assert_eq!(p.global.len(), 1, "{p:?}");
+            assert_eq!(p.models.len(), 2, "{p:?}");
+        }
+        // Per-model structural changes stay pending until the model reloads.
+        let mut c = running.clone();
+        c.models[1].lazy = true;
+        c.models[0].enabled = false;
+        let p = pending(&running, &c);
+        assert_eq!(p.for_model("yolo26s"), ["lazy changed"]);
+        assert_eq!(p.for_model("IPcam-general"), ["disabled; still loaded"]);
+    }
+
+    #[test]
     fn pending_restart_reasons() {
         let running = cfg();
         assert!(!pending(&running, &running).restart_needed());
@@ -1125,15 +822,13 @@ mod tests {
         c.log_level = crate::config::LogLevel::Debug;
         c.benchmark.warmup = 9;
         let p = pending(&running, &c);
+        // The threshold applies live.
         assert_eq!(
             p.for_model("IPcam-general"),
-            [
-                "device: auto \u{2192} openvino:cpu",
-                "threshold: 0.50 \u{2192} 0.35"
-            ]
+            ["device: auto \u{2192} openvino:cpu"]
         );
         assert!(p.global.is_empty(), "{:?}", p.global);
-        assert_eq!(p.count(), 2);
+        assert_eq!(p.count(), 1);
         // Global changes and enable/disable.
         c.port = 4000;
         c.models[1].enabled = false;
