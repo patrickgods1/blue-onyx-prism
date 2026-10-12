@@ -141,8 +141,8 @@ handle), `src/config.rs` (`preprocess_threads`), `tests/postprocess.rs` (unchang
 
 ### 2.1 Decode + preprocess pool
 
-- One process-wide pool (not per model): `std::thread` x `preprocess_threads` (config, default
-  `num_cpus::get().clamp(2, 6)`), fed by a bounded `crossbeam_channel` of `PrepJob`. Owned by the
+- One process-wide pool (not per model): `std::thread` x `preprocess_threads` (config; `0` =
+  from the hardware profile, see 2.5), fed by a bounded `crossbeam_channel` of `PrepJob`. Owned by the
   registry (`Arc<PrepPool>`), shared by every worker; dropped with the registry generation.
 - `PrepJob { image: Bytes, image_name, min_confidence, geometry: PrepSpec, reply: Sender<Prepared> }`.
   `PrepSpec` is what `Preprocessor::for_family` needs: input size, resize mode, normalization.
@@ -205,6 +205,46 @@ handle), `src/config.rs` (`preprocess_threads`), `tests/postprocess.rs` (unchang
   benchmark's per-image latency implies.
 - Numbers to record in the PR: requests/s and p95 round trip at 6 clients, for `openvino:gpu`
   and `openvino:cpu`, before and after, on the i5-8500 box.
+
+### 2.5 Hardware profiles (low / mid / high spec)
+
+One binary; the tunables that 2.1-2.2 introduce default from a profile derived at startup from
+facts the process already has (`num_cpus`, `system_info::total_memory_gb`, `HardwareInfo` GPUs).
+Explicit config values always win; the profile only fills `0`/`auto`.
+
+- `src/profile.rs` (new, pure, no runtime calls): `struct Facts { logical_cores, memory_gb:
+  Option<f64>, gpu: GpuClass, arch }` with `enum GpuClass { None, Integrated, Discrete { vram_mb }, Apple }`,
+  `enum HardwareClass { Low, Mid, High }`, and `struct Profile { class, preprocess_threads,
+  inflight, model_sizes: &'static [ModelSize], reasons: Vec<String> }`.
+  `fn classify(&Facts) -> Profile`:
+  - **Low**: logical cores <= 6, or memory <= 8 GB, or no GPU / integrated GPU only on x86.
+    The i5-8500 + UHD 630 lands here by design.
+  - **High**: cores >= 12 and memory >= 16 GB and (discrete GPU with >= 6 GB VRAM, or Apple
+    with >= 8 cores).
+  - **Mid**: everything else.
+  - `preprocess_threads = clamp(cores / 2, 1, cap)` with cap 2 / 4 / 8 by class. When the
+    model's chosen device is a CPU device the pool size is additionally capped at 2 (OpenVINO
+    CPU inference already uses every core; more decode threads just contend). The cap is applied
+    per generation from the registry's planned devices, so the profile exposes
+    `preprocess_threads_for(all_cpu: bool)`.
+  - `inflight` (per model, 2.2): 2 everywhere except Low-class CPU-only inference, where it is 1.
+  - `model_sizes`: the catalog sizes recommended for this class, from the model name suffix
+    (`n`/`s` for Low, `s`/`m` for Mid, `m`/`l`/`x` for High; the IPcam YOLOv5 models count as
+    `s`). A hint only: the benchmark remains the source of truth.
+  - `reasons`: human text for the UI, e.g. `"6 logical cores"`, `"integrated GPU (Intel UHD 630)"`.
+- Config: `preprocess_threads: usize` (0 = profile), `inflight: usize` (0 = profile), and
+  `hardware_profile: "auto" | "low" | "mid" | "high"` (forces the class; for testing and for
+  users who disagree). All three are runtime-level (restart) fields in `config_merge::pending`.
+- Exposure: `GET /v1/devices` gains `profile: {class, cores, memoryGb, gpuClass, preprocessThreads,
+  inflight, recommendedSizes, reasons}`; the welcome page shows one line ("Hardware profile:
+  low-spec — 6 cores, 16 GB, Intel UHD 630 (integrated) → 2 preprocess threads, 2 in flight");
+  `list-devices` prints the same; the Resources/model list marks catalog models whose size is
+  in `recommendedSizes` as "recommended for this machine".
+- Tests (`profile.rs`): i5-8500 + UHD 630 -> Low (2 threads, 2 in flight, n/s); 4 cores / 8 GB /
+  no GPU -> Low (1 in flight when CPU-only); 16 cores / 32 GB / RTX 3060 12 GB -> High (8
+  threads, m/l/x); M1 8-core / 16 GB -> High; 8 cores / 16 GB / GTX 1050 2 GB -> Mid.
+  A `/v1/devices` router test asserts the `profile` object is present and `hardware_profile:
+  "high"` overrides the class.
 
 ---
 
