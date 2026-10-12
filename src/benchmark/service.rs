@@ -29,6 +29,7 @@ use crate::backend::spec::{self, Device, DeviceSpec};
 use crate::backend::{CoreOptions, Runtimes};
 use crate::config::{BenchmarkConfig, Config, DatasetRef};
 use crate::model::PostParams;
+use crate::sync::LockExt;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -306,7 +307,7 @@ impl BenchmarkService {
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner.lock_recover()
     }
 
     pub fn status(&self) -> Status {
@@ -575,7 +576,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
     let devices = req.parsed_devices()?;
     let mut sets = resolve_sets(ctx, req, h)?;
     let runtimes = run_runtimes(ctx)?;
-    let versions = RuntimeVersions::of(&runtimes.lock().unwrap_or_else(|e| e.into_inner()));
+    let versions = RuntimeVersions::of(&runtimes.lock_recover());
     let run = ServiceRun {
         ctx,
         req,
@@ -772,7 +773,7 @@ struct ServiceRun<'a> {
 
 impl ServiceRun<'_> {
     fn lock(&self) -> MutexGuard<'_, Runtimes> {
-        self.runtimes.lock().unwrap_or_else(|e| e.into_inner())
+        self.runtimes.lock_recover()
     }
 
     /// Fill the ground truth of the sets without it from the reference model. Only

@@ -20,6 +20,7 @@
 //! - [`logbuf`]    in-memory ring of recent log events for the web UI's Logs page
 //! - [`resources`] downloadable runtimes/models: pinned catalog and the needs resolver
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
+//! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
 
 pub mod api;
 pub mod backend;
@@ -43,6 +44,7 @@ pub mod server;
 pub mod setup_onnxruntime;
 pub mod setup_openvino;
 pub mod startup;
+pub mod sync;
 pub mod system_info;
 pub mod update;
 pub mod worker;

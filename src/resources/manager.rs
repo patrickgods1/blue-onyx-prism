@@ -25,6 +25,7 @@
 
 use super::catalog::{ArchiveKind, Layout, Resource, ResourceKind};
 use super::extract::{self, Target};
+use crate::sync::LockExt;
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
@@ -421,19 +422,19 @@ impl Shared {
         if let Some(hook) = &self.opts.on_progress {
             hook(&status);
         }
-        let mut map = self.statuses.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.statuses.lock_recover();
         map.insert(status.key.clone(), status);
         drop(map);
         self.changed.notify_all();
     }
 
     fn state(&self, key: &str) -> Option<State> {
-        let map = self.statuses.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.statuses.lock_recover();
         map.get(key).map(|s| s.state.clone())
     }
 
     fn emit(&self, ev: Event) {
-        let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut subs = self.subscribers.lock_recover();
         subs.retain(|s| s.send(ev.clone()).is_ok());
     }
 }
@@ -490,22 +491,14 @@ impl Manager {
     }
 
     pub fn status(&self, key: &str) -> Option<Status> {
-        let map = self
-            .shared
-            .statuses
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let map = self.shared.statuses.lock_recover();
         map.get(key).cloned()
     }
 
     /// Drop the remembered status of `key` (after its files were removed), so it can be
     /// queued again. Queued or running jobs are kept.
     pub fn forget(&self, key: &str) {
-        let mut map = self
-            .shared
-            .statuses
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.shared.statuses.lock_recover();
         if map.get(key).is_some_and(|s| s.state.is_final()) {
             map.remove(key);
         }
@@ -513,22 +506,14 @@ impl Manager {
 
     /// Every job seen so far.
     pub fn statuses(&self) -> Vec<Status> {
-        let map = self
-            .shared
-            .statuses
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let map = self.shared.statuses.lock_recover();
         map.values().cloned().collect()
     }
 
     /// Terminal events from now on (installed / failed).
     pub fn subscribe(&self) -> Receiver<Event> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut subs = self
-            .shared
-            .subscribers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut subs = self.shared.subscribers.lock_recover();
         subs.push(tx);
         rx
     }
@@ -537,11 +522,7 @@ impl Manager {
     /// statuses of `keys`.
     pub fn wait(&self, keys: &[String], timeout: Option<Duration>) -> Vec<Status> {
         let deadline = timeout.map(|t| Instant::now() + t);
-        let mut map = self
-            .shared
-            .statuses
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.shared.statuses.lock_recover();
         loop {
             let done = keys
                 .iter()
@@ -570,7 +551,7 @@ impl Manager {
     pub fn shutdown(&self) {
         self.shared.stop.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Msg::Stop);
-        let handle = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let handle = self.thread.lock_recover().take();
         if let Some(h) = handle {
             let _ = h.join();
         }
@@ -1222,7 +1203,7 @@ pub fn cli_progress() -> ProgressFn {
     .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
     .progress_chars("=> ");
     Arc::new(move |s: &Status| {
-        let mut bars = bars.lock().unwrap_or_else(|e| e.into_inner());
+        let mut bars = bars.lock_recover();
         let bar = bars.entry(s.key.clone()).or_insert_with(|| {
             let b = multi.add(indicatif::ProgressBar::new(s.size));
             b.set_style(style.clone());

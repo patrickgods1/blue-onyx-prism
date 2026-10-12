@@ -29,6 +29,7 @@ use crate::model::{Family, PostParams, PreprocessCtx};
 use crate::prep::{PrepJob, PrepPool, PrepSpec, Prepared};
 use crate::profile::{DeviceTuning, Overrides, Profile};
 use crate::startup::{ModelState, StateHandle};
+use crate::sync::LockExt;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError};
@@ -153,19 +154,19 @@ impl LoadGate {
 
     pub fn open(&self) {
         let (lock, cv) = &*self.0;
-        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock.lock_recover();
         *g = true;
         cv.notify_all();
     }
 
     pub fn is_open(&self) -> bool {
-        *self.0.0.lock().unwrap_or_else(|e| e.into_inner())
+        *self.0.0.lock_recover()
     }
 
     /// Block until the gate opens or `shutdown` is cancelled. Returns true when opened.
     pub fn wait(&self, shutdown: &CancellationToken) -> bool {
         let (lock, cv) = &*self.0;
-        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock.lock_recover();
         while !*g {
             if shutdown.is_cancelled() {
                 return false;
@@ -1096,7 +1097,7 @@ impl WorkerCtx {
     fn load(&self) -> Result<Engine> {
         let name = &self.cfg.name;
         let candidates = {
-            let rt = self.runtimes.lock().unwrap_or_else(|e| e.into_inner());
+            let rt = self.runtimes.lock_recover();
             rt.plan(&self.cfg.device, &self.cfg.load.path)
         };
         info!(
@@ -1162,7 +1163,7 @@ impl WorkerCtx {
         self.state
             .set_initializing(format!("{COMPILING_ON} {}", cand.device));
         let compiled = {
-            let mut rt = self.runtimes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut rt = self.runtimes.lock_recover();
             let tuning = self.tuning_for(&rt, cand);
             rt.compile_tuned(cand, &self.cfg.load, &tuning)?
         };

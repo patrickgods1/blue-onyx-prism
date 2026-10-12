@@ -2,6 +2,7 @@
 
 use super::AppState;
 use crate::config::Config;
+use crate::sync::LockExt;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -61,7 +62,7 @@ impl Applied {
 /// Runtime-level globals keep their running values until a restart. Idempotent; one at a
 /// time.
 pub(crate) fn apply_config(state: &AppState) -> Applied {
-    let _one = state.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = state.apply_lock.lock_recover();
     let (revision, current) = state.config.snapshot();
     let running = state.running();
     let mut next = crate::config_merge::runtime_overlay(&running, &current);
@@ -123,7 +124,7 @@ pub(crate) fn apply_config(state: &AppState) -> Applied {
 /// models that failed for a missing file once it is installed. One at a time with
 /// [`apply_config`].
 pub(crate) fn reload_models(state: &AppState, names: &[String]) -> Vec<crate::registry::Reload> {
-    let _one = state.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = state.apply_lock.lock_recover();
     let running = state.running();
     names
         .iter()

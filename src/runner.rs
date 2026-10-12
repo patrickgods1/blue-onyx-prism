@@ -23,6 +23,7 @@ use crate::metrics::Metrics;
 use crate::registry::ModelRegistry;
 use crate::resources::provision::{Provision, Provisioner};
 use crate::server::{self, AppState};
+use crate::sync::LockExt;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -201,12 +202,9 @@ impl Process {
             resources: Some(crate::resources::status::ResourcesCtx {
                 provisioner: self.provisioner.clone(),
                 provision: provision.clone(),
-                openvino_loaded: registry.runtimes().is_some_and(|rt| {
-                    rt.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .openvino()
-                        .is_some()
-                }),
+                openvino_loaded: registry
+                    .runtimes()
+                    .is_some_and(|rt| rt.lock_recover().openvino().is_some()),
                 ort_loaded: loaded_ort,
             }),
             benchmark: self.benchmark.clone(),
@@ -475,7 +473,7 @@ pub fn run_server_with(
 /// The ONNX Runtime flavor `registry` loaded, if any.
 fn registry_ort_flavor(registry: &ModelRegistry) -> Option<crate::resources::catalog::Flavor> {
     let rt = registry.runtimes()?;
-    let rt = rt.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = rt.lock_recover();
     let ort = &rt.probe().ort;
     if !ort.is_available() {
         return None;

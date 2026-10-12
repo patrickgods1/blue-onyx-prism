@@ -39,6 +39,7 @@ use super::select::{EpStatus, NEEDS_ONNX, OrtProbe, onnx_path_for};
 use super::spec::{Runtime, Target};
 use super::{Candidate, Completion, DeviceInfo, LoadRequest, ModelInfo, libs, onnx_rewrite};
 use crate::model::{ExtraData, ExtraInput, NamedOutput, PortElem, PortSpec};
+use crate::sync::LockExt;
 use ::ort::ep::{self, ExecutionProvider};
 use ::ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ::ort::session::{Session, SessionInputValue};
@@ -107,7 +108,7 @@ pub(crate) fn version_supported(version: &str, min_minor: u32) -> bool {
 }
 
 fn load_library(path: &Path) -> Result<LoadedLib> {
-    let mut slot = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = LOADED.lock_recover();
     if let Some(lib) = slot.as_ref() {
         if lib.path != path {
             tracing::warn!(

@@ -48,6 +48,7 @@ use crate::config::{Config, ModelConfig};
 use crate::model::classes::resolve_class_names;
 use crate::model::preprocess::Preprocessor;
 use crate::model::{ModelFamilyKind, PostParams};
+use crate::sync::LockExt;
 use anyhow::{Context, Result, bail};
 use grade::{Grades, Weights};
 use images::{GroundTruth, ImageSet};
@@ -722,7 +723,7 @@ fn ms(d: Duration) -> f64 {
 
 /// Lock the shared runtimes, ignoring poisoning (a panicked compile leaves them usable).
 fn lock(rt: &Mutex<Runtimes>) -> std::sync::MutexGuard<'_, Runtimes> {
-    rt.lock().unwrap_or_else(|e| e.into_inner())
+    rt.lock_recover()
 }
 
 fn to_pred(p: &Prediction) -> PredBox {

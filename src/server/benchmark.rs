@@ -26,6 +26,7 @@ use crate::config::{Config, DatasetRef};
 use crate::config_form::{
     DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
 };
+use crate::sync::LockExt;
 use askama::Template;
 use axum::Json;
 use axum::extract::rejection::{FormRejection, QueryRejection};
@@ -485,7 +486,7 @@ fn saved_view(
         file_stamp(&path),
         file_stamp(&preds)
     );
-    let mut cache = SAVED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = SAVED_CACHE.lock_recover();
     if let Some((k, v)) = cache.as_ref()
         && *k == key
     {

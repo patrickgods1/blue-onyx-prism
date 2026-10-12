@@ -6,6 +6,7 @@
 //! receives what is new. `cli::init_logging_with` always installs it under the reloadable level
 //! filter, so it holds exactly what the configured level emits.
 
+use crate::sync::LockExt;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -95,7 +96,7 @@ impl LogBuffer {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Ring> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner.lock_recover()
     }
 
     /// Append an entry (evicting the oldest when full); returns its sequence number.

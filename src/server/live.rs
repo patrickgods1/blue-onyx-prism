@@ -11,6 +11,7 @@ use crate::config::{Config, validate_config};
 use crate::config_merge::{self, Pending};
 use crate::registry::normalize_name;
 use crate::startup::ModelState;
+use crate::sync::LockExt;
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -84,7 +85,7 @@ static BENCH_CACHE: Mutex<BenchCache> = Mutex::new(None);
 pub(super) fn bench_summary(path: &Path) -> Arc<Option<BenchSummary>> {
     let md = std::fs::metadata(path).ok();
     let stamp = md.as_ref().map(|m| (m.modified().ok(), m.len()));
-    let mut cache = BENCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = BENCH_CACHE.lock_recover();
     if let (Some(c), Some((mt, len))) = (cache.as_ref(), stamp)
         && c.0 == path
         && c.1 == mt

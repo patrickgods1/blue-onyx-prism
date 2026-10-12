@@ -1,5 +1,6 @@
 //! Request/latency counters and Prometheus text rendering.
 
+use crate::sync::RwLockExt;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -209,16 +210,11 @@ impl ModelMetrics {
 }
 
 fn read_string(l: &RwLock<String>) -> String {
-    l.read()
-        .map(|g| g.clone())
-        .unwrap_or_else(|e| e.into_inner().clone())
+    l.read_recover().clone()
 }
 
 fn write_string(l: &RwLock<String>, v: String) {
-    match l.write() {
-        Ok(mut g) => *g = v,
-        Err(e) => *e.into_inner() = v,
-    }
+    *l.write_recover() = v;
 }
 
 /// Lifecycle state of a model as exported to Prometheus.
@@ -279,10 +275,7 @@ impl Metrics {
     /// so counters survive registry restarts.
     pub fn model(&self, name: &str) -> Arc<ModelMetrics> {
         let key = crate::registry::normalize_name(name);
-        let mut g = match self.models.write() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
+        let mut g = self.models.write_recover();
         if let Some(m) = g
             .iter()
             .find(|m| crate::registry::normalize_name(&m.name) == key)
@@ -310,11 +303,7 @@ const PREFIX: &str = "blue_onyx_prism_";
 /// Render all metrics in the Prometheus text exposition format. `gauges` adds the per-model
 /// `model_info`, `model_ready`, `queue_length` and `queue_capacity` series.
 pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
-    let models: Vec<Arc<ModelMetrics>> = m
-        .models
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_else(|e| e.into_inner().clone());
+    let models: Vec<Arc<ModelMetrics>> = m.models.read_recover().clone();
     let mut out = String::new();
 
     let _ = writeln!(out, "# HELP {PREFIX}info Build information.");

@@ -1,6 +1,7 @@
 //! Release update check against the project's GitHub releases.
 
 use crate::api::{StatusUpdateResponse, VersionInfo};
+use crate::sync::LockExt;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::sync::Mutex;
@@ -52,13 +53,13 @@ async fn fetch_latest() -> Result<Release> {
 /// Results are cached in-process (1 hour; 5 minutes after a failure) to stay within GitHub's
 /// unauthenticated rate limit.
 pub async fn check_update(current: &str) -> StatusUpdateResponse {
-    if let Some((at, resp)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+    if let Some((at, resp)) = CACHE.lock_recover().as_ref()
         && fresh(*at, resp.success, Instant::now())
     {
         return resp.clone();
     }
     let resp = check_uncached(current).await;
-    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), resp.clone()));
+    *CACHE.lock_recover() = Some((Instant::now(), resp.clone()));
     resp
 }
 

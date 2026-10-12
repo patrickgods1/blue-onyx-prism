@@ -29,6 +29,7 @@ use crate::config_form::{
     DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
 };
 use crate::model::{ModelFamilyKind, PostParams};
+use crate::sync::LockExt;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -796,10 +797,7 @@ struct RunCtx<'a> {
 impl RunCtx<'_> {
     /// The device selection for the model at `path`.
     fn selection(&self, path: &Path) -> crate::backend::Selection {
-        self.runtimes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .selection(Some(path))
+        self.runtimes.lock_recover().selection(Some(path))
     }
 
     /// Fill the ground truth of the sets without it from the reference model; a failure only

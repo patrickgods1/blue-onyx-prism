@@ -16,6 +16,7 @@ use crate::config::{Config, ModelConfig};
 use crate::metrics::{Metrics, ModelGauges};
 use crate::profile::Profile;
 use crate::resources::provision::Provision;
+use crate::sync::{LockExt, RwLockExt};
 use crate::worker::{LiveSettings, LoadGate, WorkerConfig, WorkerHandle, spawn_worker_after};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
@@ -203,6 +204,9 @@ pub struct ModelRegistry {
     pub runtime_info: RuntimeInfo,
     /// None for registries built from handles (they cannot spawn workers).
     spawner: Option<Spawner>,
+    /// The `stop-{name}` helper threads of workers removed by a disable or reload
+    /// ([`retire_worker`]); pruned of finished ones on each retire, joined by [`Self::shutdown`].
+    retiring: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// What [`ModelRegistry::reload_model`] did.
@@ -242,11 +246,7 @@ impl Reload {
 /// The spec, label and planned devices helpers need the runtimes lock; a reload must not wait
 /// behind a model that is compiling, so it only tries.
 fn try_lock_runtimes(rt: &Mutex<Runtimes>) -> Option<std::sync::MutexGuard<'_, Runtimes>> {
-    match rt.try_lock() {
-        Ok(g) => Some(g),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+    rt.try_lock_recover()
 }
 
 impl Spawner {
@@ -331,15 +331,16 @@ impl Spawner {
 /// Stop a worker that left the registry without blocking the caller: on a helper thread, let
 /// its in-flight requests finish (the handle's sender goes away with the last HTTP handler that
 /// uses it, and the worker exits once its channel is empty), at most the request timeout plus
-/// a second, then cancel its token and join it.
-fn retire_worker(slot: WorkerSlot) {
+/// a second, then cancel its token and join it. Returns the helper thread (None: the worker had
+/// no thread, or the helper could not be spawned).
+fn retire_worker(slot: WorkerSlot) -> Option<JoinHandle<()>> {
     let WorkerSlot { handle, stop, join } = slot;
     let name = handle.name.clone();
     let drain = handle.request_timeout() + Duration::from_secs(1);
     drop(handle);
     let Some(join) = join else {
         stop.cancel();
-        return;
+        return None;
     };
     let spawned = std::thread::Builder::new()
         .name(format!("stop-{name}"))
@@ -355,9 +356,13 @@ fn retire_worker(slot: WorkerSlot) {
                 info!(model = %name, "previous worker stopped");
             }
         });
-    if let Err(e) = spawned {
-        // The thread still stops (its token is cancelled); it is just not joined.
-        warn!("could not spawn a thread to stop a worker: {e}");
+    match spawned {
+        Ok(helper) => Some(helper),
+        Err(e) => {
+            // The thread still stops (its token is cancelled); it is just not joined.
+            warn!("could not spawn a thread to stop a worker: {e}");
+            None
+        }
     }
 }
 
@@ -539,6 +544,7 @@ impl ModelRegistry {
             slots: RwLock::new(Slots::from_slots(workers, default_idx)),
             runtime_info,
             spawner: Some(spawner),
+            retiring: Mutex::new(Vec::new()),
         })
     }
 
@@ -564,15 +570,25 @@ impl ModelRegistry {
             slots: RwLock::new(Slots::from_slots(workers, default_idx)),
             runtime_info,
             spawner: None,
+            retiring: Mutex::new(Vec::new()),
         }
     }
 
+    /// Stop a worker that left the registry without waiting for it ([`retire_worker`]); its
+    /// helper thread is kept for [`Self::shutdown`], and finished helpers are dropped.
+    fn retire(&self, slot: WorkerSlot) {
+        let helper = retire_worker(slot);
+        let mut retiring = self.retiring.lock_recover();
+        retiring.retain(|h| !h.is_finished());
+        retiring.extend(helper);
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Slots> {
-        self.slots.read().unwrap_or_else(|e| e.into_inner())
+        self.slots.read_recover()
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Slots> {
-        self.slots.write().unwrap_or_else(|e| e.into_inner())
+        self.slots.write_recover()
     }
 
     /// The shared runtimes (None for registries built with [`Self::from_handles`]). Lock briefly:
@@ -591,16 +607,13 @@ impl ModelRegistry {
     /// generation's own plan is current).
     pub fn latest_provision(&self) -> Option<Arc<Provision>> {
         let s = self.spawner.as_ref()?;
-        s.provision
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        s.provision.read_recover().clone()
     }
 
     /// Record the plan reloads are made with (see [`Self::latest_provision`]).
     pub fn set_provision(&self, provision: Arc<Provision>) {
         if let Some(s) = &self.spawner {
-            *s.provision.write().unwrap_or_else(|e| e.into_inner()) = Some(provision);
+            *s.provision.write_recover() = Some(provision);
         }
     }
 
@@ -613,7 +626,7 @@ impl ModelRegistry {
     /// runtimes. None for registries built with [`Self::from_handles`].
     pub fn selection(&self, model: Option<&Path>) -> Option<Selection> {
         let rt = self.runtimes()?;
-        let rt = rt.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = rt.lock_recover();
         Some(rt.selection(model))
     }
 
@@ -723,7 +736,7 @@ impl ModelRegistry {
         let Some(sp) = &self.spawner else {
             bail!("this registry cannot reload models");
         };
-        let _one = sp.reload.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = sp.reload.lock_recover();
         validate_names(config)?;
         let key = normalize_name(name);
         let entry = config
@@ -746,7 +759,7 @@ impl ModelRegistry {
             };
             let name = old.handle.name.clone();
             info!(model = %name, "model disabled; stopping its worker");
-            retire_worker(old);
+            self.retire(old);
             return Ok(Reload::Stopped { name });
         };
 
@@ -779,7 +792,7 @@ impl ModelRegistry {
         match old {
             Some(old) => {
                 info!(model = %new_name, device = %device_text, "reloading model");
-                retire_worker(old);
+                self.retire(old);
             }
             None => info!(model = %new_name, device = %device_text, "model enabled; loading"),
         }
@@ -806,7 +819,8 @@ impl ModelRegistry {
 
     /// Stop every worker and join the threads. Workers no other thread holds a handle of exit
     /// once their channel is empty; the others are cancelled. Cancel the shutdown token first
-    /// for a prompt exit.
+    /// for a prompt exit (it also cuts short the drain of workers retired by a reload). Joins
+    /// the live workers, then the helper threads stopping retired ones.
     pub fn shutdown(self) {
         let slots = self.slots.into_inner().unwrap_or_else(|e| e.into_inner());
         for WorkerSlot { handle, stop, join } in slots.workers {
@@ -821,6 +835,15 @@ impl ModelRegistry {
                 error!(model = %name, "worker thread panicked");
             }
             info!(model = %name, "worker stopped");
+        }
+        let retiring = self
+            .retiring
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        for helper in retiring {
+            if helper.join().is_err() {
+                error!("thread stopping a retired worker panicked");
+            }
         }
     }
 }
@@ -1053,6 +1076,50 @@ mod tests {
         assert!(reg.reload_model("a", &c, None).is_err());
         assert_eq!(reg.reloads("a"), 0);
         assert_eq!(reg.names(), ["a"]);
+    }
+
+    #[test]
+    fn shutdown_joins_retired_workers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let metrics = Metrics::new("0");
+        let reg = ModelRegistry::from_handles(Vec::new(), None, RuntimeInfo::default());
+        let generation = CancellationToken::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        // A worker that only exits once its token is cancelled (its sender is still held).
+        let stop = generation.child_token();
+        let (token, flag) = (stop.clone(), stopped.clone());
+        let join = std::thread::spawn(move || {
+            while !token.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::SeqCst);
+        });
+        reg.retire(WorkerSlot {
+            handle: Arc::new(WorkerHandle::failed("a", "test", metrics.model("a"))),
+            stop,
+            join: Some(join),
+        });
+        // A handle without a thread is cancelled in place; no helper is kept.
+        let b_stop = generation.child_token();
+        reg.retire(WorkerSlot {
+            handle: Arc::new(WorkerHandle::failed("b", "test", metrics.model("b"))),
+            stop: b_stop.clone(),
+            join: None,
+        });
+        assert!(b_stop.is_cancelled());
+        assert_eq!(reg.retiring.lock_recover().len(), 1);
+        assert!(!stopped.load(Ordering::SeqCst));
+        // Cancelling the generation token first (as the runner does) cuts the drain short; the
+        // helper then joins the worker, and shutdown joins the helper.
+        let t = Instant::now();
+        generation.cancel();
+        reg.shutdown();
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "shutdown returned before the worker"
+        );
+        assert!(t.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! preload is harmless (dyld matches loaded images by install name) and `setup-openvino`
 //! additionally installs TBB next to libopenvino for `@rpath` resolution.
 
+use crate::sync::LockExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -728,7 +729,7 @@ static CUDA_PRELOADED: Mutex<Option<(PathBuf, CudaPreload)>> = Mutex::new(None);
 
 /// The `cuda-libs` directory this process preloaded, if any (its files must not be removed).
 pub fn cuda_libs_preloaded() -> Option<PathBuf> {
-    let slot = CUDA_PRELOADED.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = CUDA_PRELOADED.lock_recover();
     slot.as_ref()
         .filter(|(_, r)| !r.loaded.is_empty())
         .map(|(d, _)| d.clone())
@@ -738,7 +739,7 @@ pub fn cuda_libs_preloaded() -> Option<PathBuf> {
 /// [`cuda_preload_order`], retrying failures until no pass makes progress. Runs once per
 /// process; later calls return the first result. The libraries stay loaded for the process.
 pub fn preload_cuda_libs(dir: &Path) -> CudaPreload {
-    let mut slot = CUDA_PRELOADED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = CUDA_PRELOADED.lock_recover();
     if let Some((d, r)) = slot.as_ref() {
         if d != dir {
             tracing::debug!(
