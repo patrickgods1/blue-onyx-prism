@@ -542,6 +542,17 @@ impl Runtimes {
         }
     }
 
+    /// The first runnable load candidate of `spec` for `model` (where the model is headed) and
+    /// its option label ("ONNX Runtime CoreML (Apple M1)"); None when nothing can run.
+    pub fn first_runnable(&self, spec: &DeviceSpec, model: &Path) -> Option<(Device, String)> {
+        let sel = self.selection(Some(model));
+        self.plan(spec, model).into_iter().find_map(|c| {
+            sel.option(&c.device)
+                .filter(|o| o.runnable)
+                .map(|o| (c.device, o.label.clone()))
+        })
+    }
+
     /// Compile on exactly `cand.device` (no fallback).
     pub fn compile(&mut self, cand: &Candidate, req: &LoadRequest) -> Result<Compiled> {
         match cand.device.runtime {

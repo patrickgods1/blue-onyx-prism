@@ -484,6 +484,8 @@ struct WelcomeTemplate {
     devices: String,
     gpus: Vec<String>,
     auto_pick: String,
+    /// The hardware profile line ("low-spec: 6 logical cores, ...").
+    profile: String,
     /// Distinct execution providers of the loaded models.
     in_use: String,
     force_cpu_note: Option<String>,
@@ -614,10 +616,23 @@ fn devices_snapshot(state: &AppState) -> DevicesSnapshot {
     }
 }
 
+/// The hardware profile of the running generation and its decode + preprocess threads, else
+/// (registries without runtimes) the profile the current config gives.
+fn profile_view(state: &AppState) -> (crate::profile::Profile, usize) {
+    if let Some((p, n)) = state.registry.profile() {
+        return (p.clone(), n);
+    }
+    let cfg = state.config_read();
+    let p = cfg.profile();
+    let n = crate::registry::preprocess_threads(&cfg, &p, &[]);
+    (p, n)
+}
+
 /// `GET /v1/devices`: detected hardware, runtimes and every device option with `auto`'s pick.
 async fn devices_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     blocking(move || {
         let snap = devices_snapshot(&state);
+        let (profile, threads) = profile_view(&state);
         Json(serde_json::json!({
             "success": true,
             "hardware": snap.hardware,
@@ -633,6 +648,7 @@ async fn devices_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
             },
             "selection": snap.selection,
             "autoPick": snap.selection.auto_pick().map(|o| o.spec.to_string()),
+            "profile": profile.to_json(threads),
         }))
     })
     .await
@@ -686,6 +702,10 @@ async fn welcome(State(state): State<Arc<AppState>>) -> Response {
             },
             gpus: snap.hardware.gpus.iter().map(|g| g.to_string()).collect(),
             auto_pick: snap.auto_pick_label(),
+            profile: {
+                let (p, n) = profile_view(&state);
+                p.summary(n)
+            },
             in_use: if in_use.is_empty() {
                 "nothing loaded yet".to_string()
             } else {
@@ -2629,6 +2649,11 @@ pub(crate) mod tests {
     /// State with two models that failed to load (no OpenVINO needed); the second name contains
     /// markup to check escaping.
     fn test_state() -> Arc<AppState> {
+        test_state_with(|_| {})
+    }
+
+    /// [`test_state`] with `edit` applied to its config.
+    fn test_state_with(edit: impl FnOnce(&mut Config)) -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("bo_srv_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let names = ["ipcam-general", "<b>evil</b>"];
@@ -2647,7 +2672,7 @@ pub(crate) mod tests {
             has_gpu: false,
         };
         let registry = ModelRegistry::from_handles(workers, Some(0), info);
-        let config = Config {
+        let mut config = Config {
             models: names
                 .iter()
                 .map(|n| ModelConfig {
@@ -2658,6 +2683,7 @@ pub(crate) mod tests {
                 .collect(),
             ..Default::default()
         };
+        edit(&mut config);
         Arc::new(AppState::new(
             Arc::new(registry),
             Arc::new(metrics),
@@ -3114,6 +3140,42 @@ pub(crate) mod tests {
         assert!(
             home.contains("ONNX Runtime") && home.contains("GPUs") && home.contains("Auto picks")
         );
+    }
+
+    #[tokio::test]
+    async fn devices_report_the_hardware_profile() {
+        let json = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).unwrap();
+        let state = test_state();
+        let req = || Request::get("/v1/devices").body(Body::empty()).unwrap();
+        let (s, _, b) = call(&state, req()).await;
+        assert_eq!(s, StatusCode::OK);
+        let p = &json(&b)["profile"];
+        assert!(
+            ["low", "mid", "high"].contains(&p["class"].as_str().unwrap()),
+            "{p}"
+        );
+        assert_eq!(p["forced"], false);
+        assert!(p["cores"].as_u64().unwrap() >= 1);
+        assert!(p["preprocessThreads"].as_u64().unwrap() >= 1);
+        assert!(p["inflight"].as_u64().unwrap() >= 1);
+        assert!(p["gpuClass"].is_string());
+        assert!(!p["recommendedSizes"].as_array().unwrap().is_empty());
+        assert!(!p["reasons"].as_array().unwrap().is_empty());
+        let (_, home) = get_text(&state, "/").await;
+        assert!(home.contains("Hardware profile"), "{home}");
+
+        let state = test_state_with(|c| {
+            c.hardware_profile = crate::profile::HardwareProfile::High;
+            c.preprocess_threads = 5;
+        });
+        let (_, _, b) = call(&state, req()).await;
+        let p = &json(&b)["profile"];
+        assert_eq!(p["class"], "high");
+        assert_eq!(p["forced"], true);
+        assert_eq!(p["preprocessThreads"], 5);
+        assert_eq!(p["recommendedSizes"], serde_json::json!(["m", "l", "x"]));
+        let (_, home) = get_text(&state, "/").await;
+        assert!(home.contains("high-spec"), "{home}");
     }
 
     #[tokio::test]

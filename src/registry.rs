@@ -8,6 +8,7 @@
 use crate::backend::{CoreOptions, DeviceSpec, LoadRequest, OrtOptions, Runtimes, Selection};
 use crate::config::{Config, ModelConfig};
 use crate::metrics::{Metrics, ModelGauges};
+use crate::profile::Profile;
 use crate::worker::{LoadGate, WorkerConfig, WorkerHandle, spawn_worker_after};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -26,6 +27,9 @@ pub struct ModelRegistry {
     pub runtime_info: RuntimeInfo,
     /// The runtimes the workers load through (None for registries built from handles).
     runtimes: Option<Arc<Mutex<Runtimes>>>,
+    /// Hardware profile of this generation and its decode + preprocess thread count (None for
+    /// registries built from handles).
+    profile: Option<(Profile, usize)>,
 }
 
 /// Lowercase and strip a trailing `.onnx` / `.xml` (Blue Iris sends file stems, users may not).
@@ -87,15 +91,23 @@ fn resolve_default(config: &Config) -> Option<usize> {
     Some(config.models[..idx].iter().filter(|m| m.enabled).count())
 }
 
-/// Label of the first runnable load candidate of `device` for `model` (the option label from
-/// `backend::select`, e.g. "ONNX Runtime CoreML (Apple M1)"); None when nothing can run.
-fn planned_label(runtimes: &Runtimes, device: &DeviceSpec, model: &Path) -> Option<String> {
-    let sel = runtimes.selection(Some(model));
-    runtimes
-        .plan(device, model)
-        .into_iter()
-        .find_map(|c| sel.option(&c.device).filter(|o| o.runnable))
-        .map(|o| o.label.clone())
+/// Decode + preprocess threads of a generation: the configured `preprocess_threads`, else the
+/// profile's, capped when every model is headed for a CPU device (`planned`: the first runnable
+/// device of each model, None when nothing can run).
+pub fn preprocess_threads(
+    config: &Config,
+    profile: &Profile,
+    planned: &[Option<crate::backend::spec::Device>],
+) -> usize {
+    if config.preprocess_threads > 0 {
+        return config
+            .preprocess_threads
+            .min(crate::profile::MAX_PREPROCESS_THREADS * 4);
+    }
+    let mut known = planned.iter().flatten().peekable();
+    let all_cpu =
+        known.peek().is_some() && known.all(|d| d.target == crate::backend::spec::Target::Cpu);
+    profile.preprocess_threads_for(all_cpu)
 }
 
 impl ModelRegistry {
@@ -235,9 +247,9 @@ impl ModelRegistry {
                 );
             }
         }
-        // Where each enabled model is headed (label of its first runnable load candidate),
-        // computed before the workers can hold the runtimes lock: shown as "<label> (loading)".
-        let planned_labels: Vec<Option<String>> = enabled
+        // Where each enabled model is headed (its first runnable load candidate), computed
+        // before the workers can hold the runtimes lock: shown as "<label> (loading)".
+        let planned: Vec<Option<(crate::backend::spec::Device, String)>> = enabled
             .iter()
             .map(|m| {
                 let device = if config.force_cpu {
@@ -245,9 +257,23 @@ impl ModelRegistry {
                 } else {
                     config.device_spec_for(m).ok()?
                 };
-                planned_label(&runtimes, &device, &config.data_path(&m.path))
+                runtimes.first_runnable(&device, &config.data_path(&m.path))
             })
             .collect();
+        let planned_labels: Vec<Option<String>> = planned
+            .iter()
+            .map(|p| p.as_ref().map(|(_, l)| l.clone()))
+            .collect();
+        let profile = config.profile();
+        let planned_devices: Vec<_> = planned
+            .iter()
+            .map(|p| p.as_ref().map(|(d, _)| *d))
+            .collect();
+        let prep_threads = preprocess_threads(config, &profile, &planned_devices);
+        info!(
+            profile = %profile.summary(prep_threads),
+            "hardware profile"
+        );
         let runtimes = Arc::new(Mutex::new(runtimes));
 
         let mut workers = Vec::with_capacity(enabled.len());
@@ -376,6 +402,7 @@ impl ModelRegistry {
             default_idx,
             runtime_info,
             runtimes: Some(runtimes),
+            profile: Some((profile, prep_threads)),
         })
     }
 
@@ -398,6 +425,7 @@ impl ModelRegistry {
             default_idx,
             runtime_info,
             runtimes: None,
+            profile: None,
         }
     }
 
@@ -405,6 +433,12 @@ impl ModelRegistry {
     /// workers hold the lock while compiling.
     pub fn runtimes(&self) -> Option<&Arc<Mutex<Runtimes>>> {
         self.runtimes.as_ref()
+    }
+
+    /// The hardware profile of this generation and its decode + preprocess thread count (None
+    /// for registries built with [`Self::from_handles`]).
+    pub fn profile(&self) -> Option<(&Profile, usize)> {
+        self.profile.as_ref().map(|(p, n)| (p, *n))
     }
 
     /// Device options and the `auto` ranking for `model` (None: any model), from the shared
@@ -576,6 +610,40 @@ mod tests {
             .err()
             .expect("must fail");
         assert!(format!("{err:#}").contains("duplicate"));
+    }
+
+    #[test]
+    fn pool_size_from_profile_and_planned_devices() {
+        use crate::backend::spec::{Device, Runtime, Target};
+        use crate::backend::{GpuAdapter, GpuVendor, HardwareInfo};
+        use crate::profile::{Facts, classify};
+        let hw = HardwareInfo::new(
+            "windows",
+            "x86_64",
+            vec![GpuAdapter {
+                vendor: GpuVendor::Intel,
+                name: "Intel(R) UHD Graphics 630".into(),
+                vram_mb: 0,
+                index: 0,
+                discrete: false,
+                cuda: None,
+            }],
+        );
+        let profile = classify(&Facts::from_hardware(6, Some(16.0), &hw));
+        let cpu = Device::new(Runtime::OpenVino, Target::Cpu, None).unwrap();
+        let ort_cpu = Device::new(Runtime::Ort, Target::Cpu, None).unwrap();
+        let gpu = Device::new(Runtime::OpenVino, Target::Gpu, None).unwrap();
+        let mut c = Config::default();
+        assert_eq!(preprocess_threads(&c, &profile, &[]), 3);
+        assert_eq!(preprocess_threads(&c, &profile, &[Some(gpu), Some(cpu)]), 3);
+        assert_eq!(
+            preprocess_threads(&c, &profile, &[Some(cpu), Some(ort_cpu), None]),
+            2,
+            "every model on a CPU device"
+        );
+        assert_eq!(preprocess_threads(&c, &profile, &[None]), 3);
+        c.preprocess_threads = 6;
+        assert_eq!(preprocess_threads(&c, &profile, &[Some(cpu)]), 6);
     }
 
     #[test]

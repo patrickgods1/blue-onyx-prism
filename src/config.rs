@@ -137,6 +137,9 @@ pub struct ModelConfig {
     /// Load this model at startup. Disabled models stay in the config but are not loaded or
     /// served.
     pub enabled: bool,
+    /// Concurrent inferences of this model (None = the global `inflight`). Restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inflight: Option<usize>,
 }
 
 impl Default for ModelConfig {
@@ -152,6 +155,7 @@ impl Default for ModelConfig {
             lazy: false,
             gpu_precision: None,
             enabled: true,
+            inflight: None,
         }
     }
 }
@@ -211,6 +215,18 @@ pub struct Config {
     pub save_ref_image: bool,
     /// CPU inference threads (0 = OpenVINO default).
     pub intra_threads: usize,
+    /// Decode + preprocess threads shared by every model (0 = from the hardware profile:
+    /// `clamp(cores / 2, 1, 8)`, at most 2 when every model runs on the CPU). Restart.
+    pub preprocess_threads: usize,
+    /// Concurrent inferences per model (0 = from the hardware profile and the model's device,
+    /// see [`crate::profile::Profile::tuning_for`]); a model's own `inflight` wins. Restart.
+    pub inflight: usize,
+    /// ONNX Runtime sessions per model, one inference in flight each (0 = from the hardware
+    /// profile: 2 on a high-spec machine with an NVIDIA GPU, else 1). Each session holds its own
+    /// copy of the model. Restart.
+    pub ort_sessions: usize,
+    /// `auto` (classify the hardware) or a forced class: `low`, `mid`, `high`. Restart.
+    pub hardware_profile: crate::profile::HardwareProfile,
     pub models_dir: PathBuf,
     /// Download missing resources (runtimes, models) in the background at startup. `false`
     /// (air-gapped, Docker) only reports what is missing and the command to fetch it.
@@ -345,6 +361,10 @@ impl Default for Config {
             save_image_path: None,
             save_ref_image: false,
             intra_threads: 0,
+            preprocess_threads: 0,
+            inflight: 0,
+            ort_sessions: 0,
+            hardware_profile: crate::profile::HardwareProfile::Auto,
             models_dir: PathBuf::from("models"),
             auto_download: true,
             allow_large_downloads: false,
@@ -543,6 +563,19 @@ impl Config {
                     .join(crate::backend::libs::ORT_DIR_NAME)
                     .join(crate::backend::libs::CUDA_LIBS_DIR_NAME),
             ),
+        }
+    }
+
+    /// The hardware profile of this machine under `hardware_profile`.
+    pub fn profile(&self) -> crate::profile::Profile {
+        crate::profile::Profile::current(self.hardware_profile)
+    }
+
+    /// Explicit concurrency settings of `m` (its `inflight`, else the global one; 0 = profile).
+    pub fn concurrency_overrides(&self, m: &ModelConfig) -> crate::profile::Overrides {
+        crate::profile::Overrides {
+            inflight: m.inflight.filter(|&n| n > 0).unwrap_or(self.inflight),
+            ort_sessions: self.ort_sessions,
         }
     }
 

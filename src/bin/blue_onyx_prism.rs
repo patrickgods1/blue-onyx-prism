@@ -130,13 +130,26 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) {
             })
             .collect()
     };
-    if entries.is_empty() {
-        return;
-    }
     let results =
         benchmark::BenchmarkResults::load_or_warn(&benchmark::results_path(&config_path(cli)));
     let orders = benchmark::auto_orders(results.as_ref(), &cfg, &entries, rt.hardware());
     rt.set_measured_orders(orders);
+    // Same pool size as the server: configured, else the profile's (capped when every model is
+    // headed for a CPU device).
+    let planned: Vec<_> = entries
+        .iter()
+        .map(|m| {
+            let spec = cfg.device_spec_for(m).ok()?;
+            rt.first_runnable(&spec, &cfg.data_path(&m.path))
+                .map(|(d, _)| d)
+        })
+        .collect();
+    let profile = cfg.profile();
+    let threads = blue_onyx_prism::registry::preprocess_threads(&cfg, &profile, &planned);
+    println!("Hardware profile: {}", profile.summary(threads));
+    if entries.is_empty() {
+        return;
+    }
     println!("Models:");
     for m in &entries {
         let path = cfg.data_path(&m.path);
