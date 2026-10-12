@@ -1,15 +1,14 @@
 //! Live config for the pages:
 //! - `GET /v1/config`: the effective config, its revision and change log, per model what is
-//!   configured vs what the running worker uses, what a restart would apply, and the canonical
-//!   field values the Config page's forms are merged against (ETag / If-None-Match);
-//! - the 3-way merge of the Config page's forms ([`server_form_edit`], [`models_card_edit`])
-//!   and their conflict answers (409 JSON, or the Config page with a conflict card).
+//!   configured vs what the running worker uses, what a restart would apply, and the main
+//!   form's field values the Config page refreshes untouched fields from (ETag /
+//!   If-None-Match);
+//! - the Config page's forms ([`server_form_edit`], [`models_card_edit`]): applied as
+//!   submitted (last write wins; the change log keeps what changed).
 
-use super::{AppState, ConfigView, render};
-use crate::config::{Config, parse_config_form, validate_config, validate_models};
-use crate::config_merge::{
-    self, Conflict, Fields, MergeError, Pending, Resolution, Scope, form_fields,
-};
+use super::{AppState, ConfigView};
+use crate::config::{Config, validate_config};
+use crate::config_merge::{self, Pending};
 use crate::registry::normalize_name;
 use crate::startup::ModelState;
 use axum::Json;
@@ -17,7 +16,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -326,10 +325,6 @@ pub(super) fn payload(state: &AppState) -> Value {
         "forms": {
             "server": {
                 "view": ConfigView::from_config(&cfg),
-                "base": form_fields(&cfg, Scope::ServerForm),
-            },
-            "models": {
-                "base": form_fields(&cfg, Scope::ModelsCard),
             },
         },
     })
@@ -404,93 +399,15 @@ pub(super) async fn config_json(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Form merge
+// Forms (last write wins)
 
-/// Merge metadata a Config page form posts: `base` (canonical values it was rendered from)
-/// and conflict resolutions (`resolve.<key>` = mine|current, `resolve_cur.<key>` = the
-/// current value the user saw, `resolve_all`).
-#[derive(Debug, Default)]
-pub(super) struct FormMeta {
-    pub base: Option<Fields>,
-    pub resolutions: BTreeMap<String, Resolution>,
-}
-
-impl FormMeta {
-    pub fn parse(pairs: &[(String, String)]) -> anyhow::Result<Self> {
-        let get = |k: &str| pairs.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
-        let base = match get("base").map(str::trim).filter(|b| !b.is_empty()) {
-            Some(b) => Some(
-                serde_json::from_str::<Fields>(b)
-                    .map_err(|e| anyhow::anyhow!("invalid form base: {e}"))?,
-            ),
-            None => None,
-        };
-        let all = get("resolve_all").map(str::trim);
-        let mut resolutions = BTreeMap::new();
-        for (k, v) in pairs {
-            let Some(key) = k.strip_prefix("resolve_cur.") else {
-                continue;
-            };
-            let seen: Option<Value> = if v.trim().is_empty() {
-                None
-            } else {
-                Some(
-                    serde_json::from_str(v)
-                        .map_err(|e| anyhow::anyhow!("invalid resolve value: {e}"))?,
-                )
-            };
-            let choice = all
-                .filter(|a| !a.is_empty())
-                .or_else(|| get(&format!("resolve.{key}")).map(str::trim));
-            match choice {
-                Some("mine") => {
-                    resolutions.insert(key.to_string(), Resolution::Mine { seen });
-                }
-                Some("current") => {
-                    resolutions.insert(key.to_string(), Resolution::Current);
-                }
-                _ => {}
-            }
-        }
-        Ok(Self { base, resolutions })
-    }
-}
-
-fn merged(
-    c: &mut Config,
-    scope: Scope,
-    base: &Fields,
-    mine: &Fields,
-    meta: &FormMeta,
-) -> anyhow::Result<()> {
-    match config_merge::merge(c, scope, base, mine, &meta.resolutions) {
-        Ok(new) => {
-            validate_config(&new)?;
-            *c = new;
-            Ok(())
-        }
-        Err(MergeError::Invalid(e)) => Err(e),
-        Err(e @ MergeError::Conflicts(_)) => Err(anyhow::Error::new(e)),
-    }
-}
-
-/// The main `/config` form over the current config `c`: merged against its `base` when the
-/// form carries one, else applied as submitted (API clients).
+/// The main `/config` form: applied to the current config `c` as submitted (a field the form
+/// does not carry keeps its value; see [`crate::config::apply_config_form`]).
 pub(super) fn server_form_edit(
     c: &mut Config,
     form: &HashMap<String, String>,
-    meta: &FormMeta,
 ) -> anyhow::Result<()> {
-    let Some(base) = &meta.base else {
-        return crate::config::apply_config_form(c, form);
-    };
-    let mut mine = c.clone();
-    parse_config_form(&mut mine, form)?;
-    if form.contains_key("models_json") {
-        validate_models(&mine.models)?;
-    }
-    let mine = form_fields(&mine, Scope::ServerForm);
-    merged(c, Scope::ServerForm, base, &mine, meta)
+    crate::config::apply_config_form(c, form)
 }
 
 fn field<'a>(form: &'a [(String, String)], k: &'a str) -> impl Iterator<Item = &'a str> {
@@ -499,158 +416,48 @@ fn field<'a>(form: &'a [(String, String)], k: &'a str) -> impl Iterator<Item = &
         .map(|(_, v)| v.as_str())
 }
 
-/// The Models card's submission as canonical fields, for the models listed in `base`: `enabled`
-/// (repeated), `default_model`, `device.<name>` ("" = global), `threshold.<name>` ("" =
-/// global). A field the form does not carry keeps its base value.
-pub(super) fn card_mine(base: &Fields, form: &[(String, String)]) -> anyhow::Result<Fields> {
-    let names: Vec<String> = base
-        .keys()
-        .filter_map(|k| match config_merge::parse_key(k) {
-            config_merge::Key::Model {
-                field: "enabled",
-                name,
-            } => Some(name.to_string()),
-            _ => None,
+/// The Models card over the current config `c`, applied as submitted: `enabled` (repeated; the
+/// listed models are enabled, the others disabled), `default_model`, `device.<name>` ("" =
+/// global) and `threshold.<name>` ("" = global).
+pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> anyhow::Result<()> {
+    let enabled: Vec<String> = field(form, "enabled").map(str::to_string).collect();
+    let default = field(form, "default_model").next();
+    crate::config::apply_models_selection(c, &enabled, default)?;
+    let devices: Vec<(String, Option<String>)> = form
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("device.")
+                .map(|name| (name.to_string(), Some(v.clone())))
         })
         .collect();
-    let display = |n: &str| {
-        base.get(&format!("model:name:{n}"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| n.to_string())
-    };
-    let known = |name: &str| {
-        let k = normalize_name(name);
-        names.iter().find(|n| **n == k).cloned()
-    };
-    let mut mine = base.clone();
-    let mut enabled: Vec<String> = Vec::new();
-    for e in field(form, "enabled") {
-        match known(e) {
-            Some(n) => enabled.push(n),
-            None => anyhow::bail!("'{e}' is not one of the configured models"),
-        }
-    }
-    let default = field(form, "default_model")
-        .next()
-        .map(str::trim)
-        .filter(|d| !d.is_empty());
-    if let Some(d) = default {
-        let Some(n) = known(d) else {
-            anyhow::bail!("default model '{d}' is not one of the configured models");
-        };
-        // The card's radio values are the configured names; keep the base's spelling.
-        let name = match base.get(config_merge::DEFAULT_KEY).and_then(Value::as_str) {
-            Some(b) if normalize_name(b) == n => b.to_string(),
-            _ => d.to_string(),
-        };
-        mine.insert(config_merge::DEFAULT_KEY.into(), Value::String(name));
-        if !enabled.contains(&n) {
-            enabled.push(n);
-        }
-    }
-    for n in &names {
-        mine.insert(
-            format!("model:enabled:{n}"),
-            Value::Bool(enabled.contains(n)),
-        );
-    }
+    crate::config::apply_model_devices(c, &devices)?;
+    let mut thresholds = Vec::new();
     for (k, v) in form {
-        if let Some(name) = k.strip_prefix("device.") {
-            let Some(n) = known(name) else {
-                anyhow::bail!("'{name}' is not one of the configured models");
-            };
+        if let Some(name) = k.strip_prefix("threshold.") {
             let v = v.trim();
-            let value = if v.is_empty() || v.eq_ignore_ascii_case("global") {
-                Value::Null
+            let t = if v.is_empty() {
+                None
             } else {
-                crate::backend::spec::parse(v)
-                    .map_err(|e| anyhow::anyhow!("model '{}' device: {e}", display(&n)))?;
-                Value::String(v.to_string())
+                Some(
+                    v.parse::<f32>()
+                        .map_err(|_| anyhow::anyhow!("threshold: '{v}' is not a number"))?,
+                )
             };
-            mine.insert(format!("model:device:{n}"), value);
-        } else if let Some(name) = k.strip_prefix("threshold.") {
-            let Some(n) = known(name) else {
-                anyhow::bail!("'{name}' is not one of the configured models");
-            };
-            let v = v.trim();
-            let value = if v.is_empty() {
-                Value::Null
-            } else {
-                let t: f32 = v.parse().map_err(|_| {
-                    anyhow::anyhow!("model '{}' threshold: '{v}' is not a number", display(&n))
-                })?;
-                if !(t.is_finite() && (0.0..=1.0).contains(&t)) {
-                    anyhow::bail!(
-                        "model '{}' threshold: must be between 0 and 1, got {v}",
-                        display(&n)
-                    );
-                }
-                json!(crate::config::round_threshold_f64(t))
-            };
-            mine.insert(format!("model:confidence_threshold:{n}"), value);
+            thresholds.push((name.to_string(), t));
         }
     }
-    Ok(mine)
-}
-
-/// The Models card over the current config `c`: merged against its `base` when present, else
-/// applied as submitted (enabled set, default, per-model devices).
-pub(super) fn models_card_edit(
-    c: &mut Config,
-    form: &[(String, String)],
-    meta: &FormMeta,
-) -> anyhow::Result<()> {
-    let Some(base) = &meta.base else {
-        let enabled: Vec<String> = field(form, "enabled").map(str::to_string).collect();
-        let default = field(form, "default_model").next();
-        crate::config::apply_models_selection(c, &enabled, default)?;
-        let devices: Vec<(String, Option<String>)> = form
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("device.")
-                    .map(|name| (name.to_string(), Some(v.clone())))
-            })
-            .collect();
-        crate::config::apply_model_devices(c, &devices)?;
-        let mut thresholds = Vec::new();
-        for (k, v) in form {
-            if let Some(name) = k.strip_prefix("threshold.") {
-                let v = v.trim();
-                let t = if v.is_empty() {
-                    None
-                } else {
-                    Some(
-                        v.parse::<f32>()
-                            .map_err(|_| anyhow::anyhow!("threshold: '{v}' is not a number"))?,
-                    )
-                };
-                thresholds.push((name.to_string(), t));
-            }
-        }
-        for (name, t) in thresholds {
-            let key = normalize_name(&name);
-            let Some(m) = c
-                .models
-                .iter_mut()
-                .find(|m| normalize_name(&m.effective_name()) == key)
-            else {
-                anyhow::bail!("'{name}' is not one of the configured models");
-            };
-            m.confidence_threshold = t;
-        }
-        return validate_config(c);
-    };
-    let mine = card_mine(base, form)?;
-    merged(c, Scope::ModelsCard, base, &mine, meta)
-}
-
-/// The conflicts of a failed save, if that is why it failed.
-pub(super) fn conflicts_of(e: &anyhow::Error) -> Option<&[Conflict]> {
-    match e.downcast_ref::<MergeError>() {
-        Some(MergeError::Conflicts(c)) => Some(c),
-        _ => None,
+    for (name, t) in thresholds {
+        let key = normalize_name(&name);
+        let Some(m) = c
+            .models
+            .iter_mut()
+            .find(|m| normalize_name(&m.effective_name()) == key)
+        else {
+            anyhow::bail!("'{name}' is not one of the configured models");
+        };
+        m.confidence_threshold = t;
     }
+    validate_config(c)
 }
 
 pub(super) fn wants_json(headers: &HeaderMap) -> bool {
@@ -658,21 +465,6 @@ pub(super) fn wants_json(headers: &HeaderMap) -> bool {
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("application/json"))
-}
-
-/// 409 JSON for a conflict: the fields with the user's and the current values.
-pub(super) fn conflict_json(state: &AppState, conflicts: &[Conflict]) -> Response {
-    (
-        StatusCode::CONFLICT,
-        Json(json!({
-            "success": false,
-            "conflict": true,
-            "message": config_merge::conflict_message(conflicts),
-            "conflicts": conflicts,
-            "revision": state.config.revision(),
-        })),
-    )
-        .into_response()
 }
 
 /// JSON answer of a Config page form.
@@ -692,67 +484,4 @@ pub(super) fn error_json(status: StatusCode, message: String) -> Response {
         Json(json!({ "success": false, "message": message })),
     )
         .into_response()
-}
-
-/// One row of the conflict card.
-pub(super) struct ConflictRow {
-    pub key: String,
-    pub label: String,
-    pub mine: String,
-    pub current: String,
-    /// JSON of the current value ("" = absent), posted back as `resolve_cur.<key>`.
-    pub current_json: String,
-}
-
-/// The conflict card of the Config page (no-JS answer): the user's submission is posted again
-/// with a choice per field.
-pub(super) struct ConflictView {
-    pub action: &'static str,
-    pub message: String,
-    pub rows: Vec<ConflictRow>,
-    /// The user's submission (hidden fields).
-    pub replay: Vec<(String, String)>,
-}
-
-impl ConflictView {
-    pub fn new(action: &'static str, conflicts: &[Conflict], form: &[(String, String)]) -> Self {
-        Self {
-            action,
-            message: config_merge::conflict_message(conflicts),
-            rows: conflicts
-                .iter()
-                .map(|c| ConflictRow {
-                    key: c.key.clone(),
-                    label: c.label.clone(),
-                    mine: c.mine_text.clone(),
-                    current: c.current_text.clone(),
-                    current_json: c.current.as_ref().map(Value::to_string).unwrap_or_default(),
-                })
-                .collect(),
-            replay: form
-                .iter()
-                .filter(|(k, _)| {
-                    !k.starts_with("resolve.")
-                        && !k.starts_with("resolve_cur.")
-                        && k != "resolve_all"
-                })
-                .cloned()
-                .collect(),
-        }
-    }
-}
-
-/// The Config page with the conflict card (409).
-pub(super) fn conflict_page(
-    state: &AppState,
-    action: &'static str,
-    at: &'static str,
-    conflicts: &[Conflict],
-    form: &[(String, String)],
-) -> Response {
-    let mut t = super::config_template(state, None, None, None);
-    t.conflict = Some(ConflictView::new(action, conflicts, form));
-    // Rendered right above its form (the form posts to `#at-<section>`).
-    t.conflict_at = at;
-    (StatusCode::CONFLICT, render(&t)).into_response()
 }

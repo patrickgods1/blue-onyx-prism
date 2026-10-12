@@ -1923,23 +1923,15 @@ struct ConfigTemplate {
     bench_summary: String,
     /// Config revision the page was rendered from.
     revision: u64,
-    /// Canonical values the main form / the Models card were rendered from (JSON, posted back
-    /// as `base` so a save merges instead of overwriting).
-    server_base: String,
-    card_base: String,
     /// Global confidence threshold (placeholder of the per-model inputs).
     global_threshold: String,
     /// What a restart would apply (all reasons).
     pending: Vec<String>,
-    /// A save that conflicted with changes made elsewhere (no-JS answer).
-    conflict: Option<live::ConflictView>,
     /// Where `message` / `error` are shown: "" (top), "models", "server", "resources" or
     /// "resources-row" (in the row of resource `at_row`). The forms post to their section's
     /// `#fragment`, so a no-JS answer lands there.
     at: &'static str,
     at_row: String,
-    /// The form `conflict` belongs to ("models" or "server").
-    conflict_at: &'static str,
 }
 
 /// One `<option>` of the Device select.
@@ -2023,22 +2015,8 @@ fn config_template(
     let (revision, cfg) = state.config.snapshot();
     let mut c = ConfigView::from_config(&cfg);
     let models = model_choices(&cfg, &snap, state, (*bench).as_ref());
-    let mut server_base = serde_json::to_string(&crate::config_merge::form_fields(
-        &cfg,
-        crate::config_merge::Scope::ServerForm,
-    ))
-    .unwrap_or_default();
-    let card_base = serde_json::to_string(&crate::config_merge::form_fields(
-        &cfg,
-        crate::config_merge::Scope::ModelsCard,
-    ))
-    .unwrap_or_default();
     if let Some(form) = submitted {
         c.overlay(form);
-        // A rejected submission shown as typed keeps the base it was made from.
-        if let Some(b) = form.get("base").filter(|b| !b.trim().is_empty()) {
-            server_base = b.clone();
-        }
     }
     let log_levels = level_choices(&c.log_level);
     let device_choices = device_choices(&snap, &c.device, &c.gpu_index);
@@ -2127,17 +2105,13 @@ fn config_template(
         message,
         error,
         revision,
-        server_base,
-        card_base,
         global_threshold: format!(
             "{:.2}",
             crate::config::round_threshold_f64(cfg.confidence_threshold)
         ),
         pending,
-        conflict: None,
         at: "",
         at_row: String::new(),
-        conflict_at: "",
     }
 }
 
@@ -2360,16 +2334,12 @@ pub(crate) fn sync_config(state: &AppState) {
     }
 }
 
-/// Validate and save the form. Changes apply at once where they can ([`apply_config`]: live
-/// settings, per-model reloads, the log level); runtime-level settings on restart.
-/// `default_model` and the `enabled` flags are only changed when the form carries them (the
-/// page's main form does not; the Models card posts to `/config/models`).
-///
-/// The page's form carries `base` (the values it was rendered from): the submission is merged
-/// field by field into the current config ([`crate::config_merge`]), so a page opened before
-/// another change (Benchmark apply, another tab, the CLI) does not revert it; a field changed
-/// on both sides is a conflict (409: the page with a conflict card, or JSON). Clients that
-/// send `Accept: application/json` get JSON.
+/// Validate and save the form, as submitted (last write wins; the change log records what
+/// changed). Changes apply at once where they can ([`apply_config`]: live settings, per-model
+/// reloads, the log level); runtime-level settings on restart. `default_model` and the
+/// `enabled` flags are only changed when the form carries them (the page's main form does
+/// not; the Models card posts to `/config/models`). Clients that send
+/// `Accept: application/json` get JSON.
 async fn config_submit(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2387,20 +2357,8 @@ async fn config_submit(
                 return render(&config_template(&state, None, Some(msg), None));
             }
         };
-        let form: HashMap<String, String> = pairs.iter().cloned().collect();
-        let meta = match live::FormMeta::parse(&pairs) {
-            Ok(m) => m,
-            Err(e) => {
-                let msg = format!("Not saved: {e:#}");
-                if json {
-                    return live::error_json(StatusCode::BAD_REQUEST, msg);
-                }
-                return render(&config_template(&state, None, Some(msg), None));
-            }
-        };
-        match save_config(&state, "config page", |c| {
-            live::server_form_edit(c, &form, &meta)
-        }) {
+        let form: HashMap<String, String> = pairs.into_iter().collect();
+        match save_config(&state, "config page", |c| live::server_form_edit(c, &form)) {
             Ok(msg) => {
                 // A device change to an option that needs a download was queued by
                 // `apply_config`: the model serves on what it can meanwhile; an installed runtime
@@ -2411,14 +2369,6 @@ async fn config_submit(
                 render(&config_template_at(&state, Some(msg), None, None, "server"))
             }
             Err(e) => {
-                if let Some(conflicts) = live::conflicts_of(&e) {
-                    warn!("config form conflicts with newer changes: {e}");
-                    return if json {
-                        live::conflict_json(&state, conflicts)
-                    } else {
-                        live::conflict_page(&state, "/config", "server", conflicts, &pairs)
-                    };
-                }
                 warn!("rejected config form: {e:#}");
                 let msg = format!("Not saved: {e:#}");
                 if json {
@@ -2438,8 +2388,7 @@ async fn config_submit(
 }
 
 /// The Models card: `enabled` (repeated, one per checked model), `default_model` (radio),
-/// `device.<name>` / `threshold.<name>` ("" = global), `base` (see [`config_submit`]) and
-/// `action` (`save` or `restart`). Saves like `config_submit` (a changed model reloads on its
+/// `device.<name>` / `threshold.<name>` ("" = global) and `action` (`save` or `restart`). Saves like `config_submit` (a changed model reloads on its
 /// own: "reloading <model> on <device>"); `restart` then restarts like `POST /config/restart`.
 async fn config_models(
     State(state): State<Arc<AppState>>,
@@ -2459,10 +2408,8 @@ async fn config_models(
             }
         };
         let restart = form.iter().any(|(k, a)| k == "action" && a == "restart");
-        let result = live::FormMeta::parse(&form).and_then(|meta| {
-            save_config(&state, "config page (Models card)", |c| {
-                live::models_card_edit(c, &form, &meta)
-            })
+        let result = save_config(&state, "config page (Models card)", |c| {
+            live::models_card_edit(c, &form)
         });
         match result {
             Ok(msg) if restart => {
@@ -2475,14 +2422,6 @@ async fn config_models(
             Ok(msg) if json => live::saved_json(&state, msg, false),
             Ok(msg) => render(&config_template_at(&state, Some(msg), None, None, "models")),
             Err(e) => {
-                if let Some(conflicts) = live::conflicts_of(&e) {
-                    warn!("Models card conflicts with newer changes: {e}");
-                    return if json {
-                        live::conflict_json(&state, conflicts)
-                    } else {
-                        live::conflict_page(&state, "/config/models", "models", conflicts, &form)
-                    };
-                }
                 warn!("rejected models selection: {e:#}");
                 let msg = format!("Models not saved: {e:#}");
                 if json {
@@ -4476,35 +4415,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ---- live config: revision, merge of stale pages, /v1/config ----
+    // ---- live config: revision, last write wins, /v1/config ----
 
-    fn html_unescape(s: &str) -> String {
-        s.replace("&#34;", "\"")
-            .replace("&quot;", "\"")
-            .replace("&#39;", "'")
-            .replace("&#x27;", "'")
-            .replace("&lt;", "<")
-            .replace("&#60;", "<")
-            .replace("&gt;", ">")
-            .replace("&#62;", ">")
-            .replace("&amp;", "&")
-            .replace("&#38;", "&")
-    }
-
-    /// The hidden `base` of a Config page form: 0 = Models card, 1 = the main form.
-    fn page_base(html: &str, idx: usize) -> String {
-        let marker = "name=\"base\" value=\"";
-        let mut rest = html;
-        for _ in 0..=idx {
-            let i = rest.find(marker).expect("base field");
-            rest = &rest[i + marker.len()..];
-        }
-        html_unescape(&rest[..rest.find('"').unwrap()])
-    }
-
-    /// The main form as a browser posts it from a page rendered from `c`, with `base` and the
-    /// user's `edits`.
-    fn server_form_body(c: &Config, base: &str, edits: &[(&str, &str)]) -> String {
+    /// The main form as a browser posts it from a page rendered from `c`, with the user's
+    /// `edits`.
+    fn server_form_body(c: &Config, edits: &[(&str, &str)]) -> String {
         let view = serde_json::to_value(ConfigView::from_config(c)).unwrap();
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (k, v) in view.as_object().unwrap() {
@@ -4519,7 +4434,6 @@ pub(crate) mod tests {
             pairs.push((k.to_string(), v.to_string()));
         }
         pairs.push(("download_settings".into(), "1".into()));
-        pairs.push(("base".into(), base.into()));
         pairs
             .iter()
             .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
@@ -4540,19 +4454,17 @@ pub(crate) mod tests {
         (c.models[0].device.clone(), c.models[0].confidence_threshold)
     }
 
-    /// The reported bug: a Config page opened before a Benchmark apply, then saved, reverted
-    /// the applied device and threshold (main form and Models card). Both now merge.
+    /// Last write wins: a Config page opened before a Benchmark apply and saved afterwards
+    /// writes what it shows (no 409, no merge); the change log records both writes. The page
+    /// no longer carries a `base`, and one posted by an old cached page is ignored.
     #[tokio::test]
-    async fn stale_config_page_keeps_benchmark_apply() {
+    async fn stale_config_page_last_write_wins() {
         let state = test_state();
-        let evil = urlencode("<b>evil</b>");
         state.config.update("test", |_| Ok(())).unwrap();
-        // The page is opened...
         let (_, page) = get_text(&state, "/config").await;
-        let (card_base, server_base) = (page_base(&page, 0), page_base(&page, 1));
+        assert!(!page.contains("name=\"base\""), "{page}");
+        assert!(!page.contains("resolve_all"), "{page}");
         let stale = state.config_read().clone();
-        assert!(page.contains("data-revision=\"1\""));
-        // ...then the Benchmark page applies a device and a threshold.
         let (s, _, b) = call(
             &state,
             post_form(
@@ -4577,139 +4489,52 @@ pub(crate) mod tests {
         // Rounded in the API answer (was 0.3499999940395355).
         assert!(text.contains("\"to\":0.35"), "{text}");
         assert!(!text.contains("0.34999"), "{text}");
-        assert_eq!(state.config.revision(), 3);
         let applied = (Some("openvino:cpu".to_string()), Some(0.35));
         assert_eq!(first_model(&state), applied);
 
-        // 1. The stale main form saved as is: nothing reverted, nothing changed.
-        let body = server_form_body(&stale, &server_base, &[]);
-        let (s, _, b) = call(&state, post_form("/config", &body, true)).await;
-        let html = String::from_utf8(b).unwrap();
-        assert_eq!(s, StatusCode::OK);
-        assert!(html.contains("No changes"), "{html}");
-        assert_eq!(first_model(&state), applied);
-        assert_eq!(state.config.revision(), 3);
-        // With a user edit: the edit is saved, the applied values stay (memory and file).
-        let body = server_form_body(&stale, &server_base, &[("port", "4000")]);
-        let (s, _, b) = call(&state, post_form("/config", &body, true)).await;
-        assert_eq!(s, StatusCode::OK);
-        assert!(
-            String::from_utf8(b)
-                .unwrap()
-                .contains("Restart the server to apply")
-        );
+        // The stale main form (its models JSON predates the apply) overwrites the model entry.
+        let body = server_form_body(&stale, &[("port", "4000")]);
+        let body = format!("{body}&base=%7B%7D&base_revision=1");
+        let (s, _, b) = call(&state, post_json("/config", &body)).await;
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(s, StatusCode::OK, "{j}");
+        assert_eq!(j["success"], true);
         assert_eq!(state.config_read().port, 4000);
-        assert_eq!(first_model(&state), applied);
+        assert_eq!(first_model(&state), (None, None));
         let file = Config::load(&state.config_path).unwrap();
         assert_eq!(file, *state.config_read());
         let last = state.config.changes(1).pop().unwrap();
-        assert_eq!((last.source.as_str(), last.revision), ("config page", 4));
-        assert_eq!(last.summary, "Port \u{2192} 4000");
+        assert_eq!(last.source, "config page");
+        assert!(
+            last.summary.contains("Port \u{2192} 4000"),
+            "{}",
+            last.summary
+        );
+        assert!(
+            last.summary.contains("device \u{2192} global"),
+            "{}",
+            last.summary
+        );
 
-        // 2. The stale Models card with one user edit (a threshold on the other model).
+        // The Models card writes its rows as posted.
+        let evil = urlencode("<b>evil</b>");
         let card = format!(
             "enabled=ipcam-general&enabled={evil}&default_model=ipcam-general&device.ipcam-general=\
-             &device.{evil}=&threshold.ipcam-general=&threshold.{evil}=0.6&base={}&action=save",
-            urlencode(&card_base)
+             ort:cpu&device.{evil}=&threshold.ipcam-general=&threshold.{evil}=0.6&action=save"
         );
-        let (s, _, b) = call(&state, post_form("/config/models", &card, true)).await;
+        let (s, _, b) = call(&state, post_json("/config/models", &card)).await;
         assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
-        assert_eq!(first_model(&state), applied);
+        assert_eq!(first_model(&state), (Some("ort:cpu".to_string()), None));
         assert_eq!(
             state.config_read().models[1].confidence_threshold,
             Some(0.6)
         );
         let last = state.config.changes(1).pop().unwrap();
         assert_eq!(last.source, "config page (Models card)");
-        assert_eq!(last.summary, "<b>evil</b> threshold \u{2192} 0.6");
-
-        // 3. A conflicting edit: the stale card picks another device for the same model.
-        let conflicting = card.replace("device.ipcam-general=&", "device.ipcam-general=ort:cpu&");
-        let rev = state.config.revision();
-        let (s, _, b) = call(&state, post_form("/config/models", &conflicting, true)).await;
-        let html = String::from_utf8(b).unwrap();
-        assert_eq!(s, StatusCode::CONFLICT);
-        assert!(html.contains("Not saved: changed elsewhere"), "{html}");
-        assert!(html.contains("ipcam-general \u{b7} device"), "{html}");
-        assert!(
-            html.contains("<code>ort:cpu</code>") && html.contains("<code>openvino:cpu</code>")
-        );
-        assert!(html.contains("value=\"mine\" checked> Use mine"));
-        assert!(html.contains("name=\"resolve_cur.model:device:ipcam-general\""));
-        assert_eq!(state.config.revision(), rev, "nothing saved");
-        assert_eq!(first_model(&state), applied);
-        // The same as JSON (the page's script).
-        let (s, _, b) = call(&state, post_json("/config/models", &conflicting)).await;
-        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        assert_eq!(s, StatusCode::CONFLICT);
-        assert_eq!(j["conflict"], true);
-        assert_eq!(j["conflicts"][0]["key"], "model:device:ipcam-general");
-        assert_eq!(j["conflicts"][0]["mine_text"], "ort:cpu");
-        assert_eq!(j["conflicts"][0]["current_text"], "openvino:cpu");
-        assert_eq!(j["conflicts"][0]["current"], "openvino:cpu");
-        assert!(
-            j["conflicts"][0].get("base").is_some(),
-            "base was null, not absent"
-        );
-        // "Use current" keeps the applied device (the rest of the card is still saved).
-        let key = urlencode("model:device:ipcam-general");
-        let cur = urlencode("\"openvino:cpu\"");
-        let resolved = format!("{conflicting}&resolve.{key}=current&resolve_cur.{key}={cur}");
-        let (s, _, b) = call(&state, post_json("/config/models", &resolved)).await;
-        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
-        assert_eq!(first_model(&state), applied);
-        // "Use mine" takes the user's device.
-        let resolved = format!("{conflicting}&resolve.{key}=mine&resolve_cur.{key}={cur}");
-        let (s, _, b) = call(&state, post_json("/config/models", &resolved)).await;
-        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        assert_eq!(s, StatusCode::OK, "{j}");
-        assert_eq!(j["revision"], state.config.revision());
-        assert_eq!(first_model(&state).0.as_deref(), Some("ort:cpu"));
-        // "Use mine" against a value the user has not seen is a conflict again.
-        let stale_choice = format!("{conflicting}&resolve.{key}=mine&resolve_cur.{key}={cur}")
-            .replace(
-                "device.ipcam-general=ort:cpu",
-                "device.ipcam-general=ort:coreml",
-            );
-        let (s, _, _) = call(&state, post_json("/config/models", &stale_choice)).await;
-        assert_eq!(s, StatusCode::CONFLICT);
-
-        // 4. The stale main form's models JSON changes the applied threshold differently.
-        let mut edited = stale.clone();
-        edited.models[0].confidence_threshold = Some(0.4);
-        let body = server_form_body(&edited, &server_base, &[]);
-        let (s, _, b) = call(&state, post_json("/config", &body)).await;
-        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        assert_eq!(s, StatusCode::CONFLICT, "{j}");
-        let keys: Vec<&str> = j["conflicts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| c["key"].as_str().unwrap())
-            .collect();
-        assert_eq!(keys, ["model:confidence_threshold:ipcam-general"]);
-        assert!(
-            j["message"]
-                .as_str()
-                .unwrap()
-                .contains("yours: 0.4, now: 0.35"),
-            "{j}"
-        );
-        // No-JS: the conflict page replays the submission for "Use mine for all".
-        let (s, _, b) = call(&state, post_form("/config", &body, true)).await;
-        let html = String::from_utf8(b).unwrap();
-        assert_eq!(s, StatusCode::CONFLICT);
-        assert!(
-            html.contains("name=\"resolve_all\" value=\"mine\""),
-            "{html}"
-        );
-        assert!(html.contains("<input type=\"hidden\" name=\"models_json\""));
-        assert_eq!(first_model(&state).1, Some(0.35));
     }
 
-    /// Legacy clients (no `base`) keep the old apply-as-submitted behavior.
     #[tokio::test]
-    async fn forms_without_base_apply_as_submitted() {
+    async fn forms_apply_as_submitted() {
         let state = test_state();
         let (s, _, _) = call(
             &state,
@@ -4748,8 +4573,7 @@ pub(crate) mod tests {
         assert_eq!(j["models"][0]["running"]["present"], true);
         assert_eq!(j["models"][0]["running"]["threshold"], 0.5);
         assert_eq!(j["models"][0]["default"], true);
-        assert!(j["forms"]["server"]["base"]["model:device:ipcam-general"].is_null());
-        assert_eq!(j["forms"]["models"]["base"]["default"], "ipcam-general");
+        assert!(j["forms"]["server"].get("base").is_none());
         assert_eq!(
             j["forms"]["server"]["view"]["port"],
             crate::DEFAULT_PORT.to_string()
