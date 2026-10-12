@@ -8,7 +8,7 @@ use crate::backend::select::{OpenVinoProbe, OrtProbe, RuntimeProbe, Selection, s
 use crate::backend::spec::{self, DeviceSpec};
 use crate::cli::LogReloadHandle;
 use crate::config::{Config, FORM_FIELDS, LogLevel, ModelConfig};
-use crate::metrics::{Metrics, Stat};
+use crate::metrics::{DropReason, Histogram, Metrics};
 use crate::registry::ModelRegistry;
 use crate::setup_onnxruntime::InstalledOrt;
 use crate::startup::ModelState;
@@ -838,23 +838,21 @@ async fn dispatch(
                     )
                 })
             });
-            handle
-                .metrics
-                .rejected_initializing
-                .fetch_add(1, Ordering::Relaxed);
+            handle.metrics.record_drop(DropReason::Initializing);
             return VisionDetectionResponse::error(crate::worker::initializing_message(
                 name,
                 detail.as_deref(),
             ));
         }
         ModelState::Failed(m) => {
+            handle.metrics.record_drop(DropReason::Failed);
             return VisionDetectionResponse::error(format!("Model '{name}' failed to load: {m}"));
         }
     }
 
     if handle.is_full() {
         warn!(model = %name, "worker queue is full, server is overloaded; rejecting request");
-        handle.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+        handle.metrics.record_drop(DropReason::QueueFull);
         return VisionDetectionResponse::error("Worker queue is full");
     }
 
@@ -865,11 +863,11 @@ async fn dispatch(
     {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
-            handle.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            handle.metrics.record_drop(DropReason::QueueFull);
             return VisionDetectionResponse::error("Worker queue is full");
         }
         Err(TrySendError::Disconnected(_)) => {
-            handle.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            handle.metrics.record_drop(DropReason::WorkerGone);
             return VisionDetectionResponse::error(format!("Model '{name}' worker is not running"));
         }
     }
@@ -878,12 +876,12 @@ async fn dispatch(
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             warn!(model = %name, "worker dropped the request without replying");
-            handle.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            handle.metrics.record_drop(DropReason::WorkerGone);
             VisionDetectionResponse::error("Worker dropped the request")
         }
         Err(_) => {
             warn!(model = %name, "timed out waiting for the worker");
-            handle.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            handle.metrics.record_drop(DropReason::Timeout);
             VisionDetectionResponse::error("Operation timed out")
         }
     }
@@ -922,7 +920,7 @@ struct TimingCells {
 }
 
 impl TimingCells {
-    fn from_stat(s: &Stat) -> Self {
+    fn from_stat(s: &Histogram) -> Self {
         if s.count() == 0 {
             let dash = || "-".to_string();
             return Self {
@@ -1012,7 +1010,7 @@ async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
                 device: dev
                     .as_ref()
                     .map(|d| d.actual.clone())
-                    .unwrap_or_else(|| m.requested_device.clone()),
+                    .unwrap_or_else(|| m.requested_device()),
                 provider: w.execution_provider(),
                 fell_back: match dev.as_ref().map(|d| d.fell_back) {
                     Some(true) => "yes",
@@ -1020,7 +1018,7 @@ async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
                     None => "-",
                 },
                 requests: m.requests.load(Ordering::Relaxed),
-                dropped: m.dropped.load(Ordering::Relaxed),
+                dropped: m.dropped_failures(),
                 queue: format!("{}/{}", w.sender.len(), w.queue_capacity()),
                 timings: [
                     TimingCells::from_stat(&m.inference_ms),
@@ -1048,7 +1046,7 @@ async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         .map(|w| {
             let m = &w.metrics;
             let dev = w.device.read().ok().and_then(|d| d.clone());
-            let stat = |s: &Stat| {
+            let stat = |s: &Histogram| {
                 serde_json::json!({ "count": s.count(), "avg": s.avg(), "min": s.min(), "max": s.max() })
             };
             serde_json::json!({
@@ -1060,7 +1058,7 @@ async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
                 "stateClass": state_view(w).1,
                 "runtime": runtime_text(reg, &ortv, dev.as_ref()),
                 "lazy": w.lazy,
-                "requestedDevice": m.requested_device,
+                "requestedDevice": m.requested_device(),
                 "device": dev.as_ref().map(|d| d.actual.clone()),
                 "deviceName": dev.as_ref().map(|d| d.full_name.clone()),
                 "fellBack": dev.as_ref().map(|d| d.fell_back),
@@ -1068,8 +1066,8 @@ async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
                 "queueLength": w.sender.len(),
                 "queueCapacity": w.queue_capacity(),
                 "requests": m.requests.load(Ordering::Relaxed),
-                "dropped": m.dropped.load(Ordering::Relaxed),
-                "rejectedInitializing": m.rejected_initializing.load(Ordering::Relaxed),
+                "dropped": m.dropped_failures(),
+                "rejectedInitializing": m.dropped(DropReason::Initializing),
                 "inferenceMs": stat(&m.inference_ms),
                 "processMs": stat(&m.process_ms),
                 "roundTripMs": stat(&m.round_trip_ms),

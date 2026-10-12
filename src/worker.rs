@@ -12,7 +12,7 @@
 use crate::api::{VisionDetectionRequest, VisionDetectionResponse};
 use crate::backend::{Backend, Candidate, DeviceInfo, DeviceSpec, LoadRequest, Runtimes};
 use crate::config::ModelConfig;
-use crate::metrics::{ModelGauges, ModelMetrics, ModelStateLabel};
+use crate::metrics::{DropReason, ModelGauges, ModelMetrics, ModelStateLabel};
 use crate::model::preprocess::Preprocessor;
 use crate::model::{Family, PostParams};
 use crate::startup::{ModelState, StateHandle};
@@ -508,11 +508,12 @@ impl WorkerCtx {
                 // Only reachable for a lazy model (between the server's trigger and the state
                 // update) or after a failed load: answer at once, never block.
                 let msg = match self.state.get() {
-                    ModelState::Failed(msg) => format!("Model '{name}' failed to load: {msg}"),
+                    ModelState::Failed(msg) => {
+                        self.metrics.record_drop(DropReason::Failed);
+                        format!("Model '{name}' failed to load: {msg}")
+                    }
                     _ => {
-                        self.metrics
-                            .rejected_initializing
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.record_drop(DropReason::Initializing);
                         initializing_message(&name, self.state.detail().as_deref())
                     }
                 };
@@ -521,7 +522,7 @@ impl WorkerCtx {
             } else {
                 let waited = enqueued.elapsed();
                 if waited > self.cfg.request_timeout {
-                    self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.record_drop(DropReason::Timeout);
                     warn!(
                         model = %name,
                         waited_ms = waited.as_millis() as u64,
