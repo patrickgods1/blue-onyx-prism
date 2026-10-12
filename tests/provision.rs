@@ -173,7 +173,7 @@ fn model_download_goes_initializing_to_ready_without_restart() {
     );
     assert!(plan.wait_for("fixture-model").is_some());
 
-    let metrics = Metrics::new("test");
+    let metrics = std::sync::Arc::new(Metrics::new("test"));
     let token = CancellationToken::new();
     let reg = ModelRegistry::start_with(&cfg, &metrics, token.clone(), Some(&plan)).unwrap();
     let w = reg.by_name("fixture-model").unwrap();
@@ -226,7 +226,7 @@ fn auto_download_off_fails_with_the_command() {
     let plan = prov.prepare(&cfg, None);
     assert!(plan.has_needs());
     assert!(prov.manager().is_none(), "nothing is downloaded");
-    let metrics = Metrics::new("test");
+    let metrics = std::sync::Arc::new(Metrics::new("test"));
     let token = CancellationToken::new();
     // Starts even when no runtime is installed here: the models are reported, not fatal.
     let reg = ModelRegistry::start_with(&cfg, &metrics, token.clone(), Some(&plan)).unwrap();

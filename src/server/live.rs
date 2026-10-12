@@ -171,7 +171,7 @@ pub(super) fn running_view(state: &AppState, name: &str) -> RunningView {
             text: "not loaded".into(),
         };
     };
-    let (st, class, detail) = super::state_view(w);
+    let (st, class, detail) = super::state_view(&w);
     let provider = w.execution_provider();
     let device = w
         .device
@@ -250,7 +250,7 @@ fn configured_resolved(
 pub(super) fn payload(state: &AppState) -> Value {
     super::sync_config(state);
     let (revision, cfg) = state.config.snapshot();
-    let pending = config_merge::pending(&state.running, &cfg);
+    let pending = config_merge::pending(&state.running(), &cfg);
     let bench = bench_summary(&crate::benchmark::results_path(&state.config_path));
     let probe = quick_probe(state);
     let default = cfg.effective_default_index();

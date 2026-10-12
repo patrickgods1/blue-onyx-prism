@@ -54,9 +54,15 @@ pub struct AppState {
     /// [`save_config`] / [`crate::config_store::ConfigStore::update`]. Shared by every
     /// generation of the process.
     pub config: Arc<crate::config_store::ConfigStore>,
-    /// The config this generation's registry was started with (what is running; the pages
-    /// compare it with `config` to show what a restart would apply).
-    pub running: Arc<Config>,
+    /// What this generation runs: the config its registry was started with, updated as
+    /// changes apply without a restart (live settings, per-model reloads; see
+    /// [`apply_config`]). The pages compare it with `config` to show what a restart would
+    /// apply. Read it with [`AppState::running`].
+    pub running: arc_swap::ArcSwap<Config>,
+    /// One [`apply_config`] at a time.
+    pub apply_lock: std::sync::Mutex<()>,
+    /// Config revision [`apply_config`] last applied (0: none yet).
+    pub applied_revision: std::sync::atomic::AtomicU64,
     /// Process start (survives in-process restarts).
     pub started: Instant,
     pub config_path: PathBuf,
@@ -89,7 +95,9 @@ impl AppState {
                 config,
                 config_path.clone(),
             )),
-            running: Arc::new(running),
+            running: arc_swap::ArcSwap::from_pointee(running),
+            apply_lock: std::sync::Mutex::new(()),
+            applied_revision: std::sync::atomic::AtomicU64::new(0),
             started: Instant::now(),
             config_path,
             log_reload: None,
@@ -97,6 +105,11 @@ impl AppState {
             resources: None,
             benchmark: crate::benchmark::service::BenchmarkService::new(),
         }
+    }
+
+    /// What this generation runs now (see [`AppState::running`](field@AppState::running)).
+    pub fn running(&self) -> Arc<Config> {
+        self.running.load_full()
     }
 
     fn config_read(&self) -> crate::config_store::ConfigRef<'_> {
@@ -665,7 +678,7 @@ async fn welcome(State(state): State<Arc<AppState>>) -> Response {
         let reg = &state.registry;
         let snap = devices_snapshot(&state);
         let default = default_name(reg);
-        let pending = crate::config_merge::pending(&state.running, &state.config_read());
+        let pending = crate::config_merge::pending(&state.running(), &state.config_read());
         let models = reg
             .workers()
             .iter()
@@ -788,7 +801,7 @@ async fn detection_default(
         ));
     };
     let req = parse_detection_body(multipart).await.map(|(r, _)| r);
-    Json(run_detection(&state, handle, req, start, "detect").await)
+    Json(run_detection(&state, &handle, req, start, "detect").await)
 }
 
 async fn detection_custom(
@@ -804,7 +817,7 @@ async fn detection_custom(
         return Json(r);
     };
     let req = parse_detection_body(multipart).await.map(|(r, _)| r);
-    Json(run_detection(&state, handle, req, start, "custom").await)
+    Json(run_detection(&state, &handle, req, start, "custom").await)
 }
 
 async fn run_detection(
@@ -1078,6 +1091,7 @@ async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
                 "stateClass": state_view(w).1,
                 "runtime": runtime_text(reg, &ortv, dev.as_ref()),
                 "lazy": w.lazy,
+                "reloads": reg.reloads(&w.name),
                 "requestedDevice": m.requested_device(),
                 "device": dev.as_ref().map(|d| d.actual.clone()),
                 "deviceName": dev.as_ref().map(|d| d.full_name.clone()),
@@ -1243,8 +1257,8 @@ async fn resources_remove(
     .await
 }
 
-/// `POST /v1/resources/add-to-config` (`id` of an installed model): appends it to `models` and
-/// saves the config file (restart to load it).
+/// `POST /v1/resources/add-to-config` (`id` of an installed model): appends it to `models`,
+/// saves the config file and starts its worker (no restart).
 async fn resources_add_to_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1260,10 +1274,7 @@ async fn resources_add_to_config(
             Ok(())
         });
         let result = match saved {
-            Ok(_) => Ok(format!(
-                "{outcome}. Saved to {}.",
-                state.config_path.display()
-            )),
+            Ok(msg) => Ok(format!("{outcome}. {msg}")),
             Err(e) => match e.downcast::<crate::resources::status::ActionError>() {
                 Ok(a) => Err(a),
                 Err(e) => Err(crate::resources::status::ActionError::Failed(format!(
@@ -1277,7 +1288,8 @@ async fn resources_add_to_config(
 }
 
 /// `POST /v1/models/add` (`path`, optional `name`, `family`, `classes`): appends a custom model
-/// (a file, or the directory holding one) to `models` and saves the config file.
+/// (a file, or the directory holding one) to `models`, saves the config file and starts its
+/// worker (no restart).
 async fn models_add(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1319,10 +1331,7 @@ async fn models_add(
                     Ok(())
                 });
                 match saved {
-                    Ok(_) => Ok(format!(
-                        "{outcome}. Saved to {}; restart to load it.",
-                        state.config_path.display()
-                    )),
+                    Ok(msg) => Ok(format!("{outcome}. {msg}")),
                     Err(e) => match e.downcast::<ActionError>() {
                         Ok(a) => Err(a),
                         Err(e) => Err(ActionError::Failed(format!("{e:#}"))),
@@ -1390,9 +1399,16 @@ async fn resources_export(
         let cfg = state.config_read().clone();
         let on_done: Option<crate::resources::export::OnDone> = add.then(|| {
             let config = state.config.clone();
+            // Weak: an export can outlive this generation (a restart must not wait for it).
+            let generation = Arc::downgrade(&state);
             let id = id.clone();
             Box::new(move |_: &crate::resources::export::ExportOutput| {
-                add_export_to_config(&config, &id)
+                add_export_to_config(&config, &id);
+                // Start the model's worker now (a later generation reads the file anyway, and
+                // `sync_config` catches up with a generation that started meanwhile).
+                if let Some(state) = generation.upgrade() {
+                    apply_config(&state);
+                }
             }) as crate::resources::export::OnDone
         });
         let result = match &state.resources {
@@ -1538,7 +1554,7 @@ async fn test_submit(
     };
 
     let image = req.image_data.clone();
-    let resp = run_detection(&state, handle, Ok(req), start, command).await;
+    let resp = run_detection(&state, &handle, Ok(req), start, command).await;
     let json = serde_json::to_string_pretty(&resp).unwrap_or_default();
     let mut summary = if resp.success {
         format!(
@@ -1794,7 +1810,7 @@ fn model_choices(
 ) -> Vec<ModelSelectRow> {
     let default = c.effective_default_index();
     let global = global_device_label(c, snap);
-    let pending = crate::config_merge::pending(&state.running, c);
+    let pending = crate::config_merge::pending(&state.running(), c);
     let thr = crate::config::round_threshold_f64;
     c.models
         .iter()
@@ -2071,7 +2087,7 @@ fn config_template(
         )
     };
     let pending = {
-        let p = crate::config_merge::pending(&state.running, &cfg);
+        let p = crate::config_merge::pending(&state.running(), &cfg);
         let mut all = p.global.clone();
         for m in &cfg.models {
             for r in p.for_model(&m.effective_name()) {
@@ -2143,8 +2159,10 @@ async fn config_page(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// Apply `edit` to the current config through the config store (one writer for everything:
-/// it bumps the revision and logs the change under `source`), write the file and, when the log
-/// level changed, apply it now. Returns the message for the page ("restart to apply", ...).
+/// it bumps the revision and logs the change under `source`), write the file and apply what
+/// can be applied now ([`apply_config`]: live settings, per-model reloads, the log level).
+/// Returns the message for the page ("Applied now: ...", "reloading x on y", "restart to
+/// apply ...").
 fn save_config(
     state: &AppState,
     source: &str,
@@ -2152,7 +2170,7 @@ fn save_config(
 ) -> anyhow::Result<String> {
     let up = state.config.update(source, edit)?;
     // Also applies a change picked up from the file before the edit.
-    apply_config_live(state);
+    let applied = apply_config(state);
     if !up.changed {
         return Ok(format!(
             "No changes: {} already has these values.",
@@ -2177,7 +2195,11 @@ fn save_config(
     if !live.is_empty() {
         msg.push_str(&format!(" Applied now: {}.", live.join(", ")));
     }
-    let pending = crate::config_merge::pending(&state.running, &state.config_read());
+    if let Some(text) = applied.describe() {
+        msg.push(' ');
+        msg.push_str(&text);
+    }
+    let pending = crate::config_merge::pending(&state.running(), &state.config_read());
     if pending.restart_needed() {
         msg.push_str(" Restart the server to apply the other changes.");
     }
@@ -2193,22 +2215,153 @@ fn save_config(
     Ok(msg)
 }
 
-/// Apply the live part of the current config to this generation's workers (thresholds,
-/// object filters, timeouts, image saving, the default model); see
-/// [`ModelRegistry::apply_live`]. Idempotent.
-pub(crate) fn apply_config_live(state: &AppState) {
-    let cfg = state.config_read().clone();
-    state.registry.apply_live(&cfg);
+/// What [`apply_config`] did.
+#[derive(Debug, Default)]
+pub(crate) struct Applied {
+    pub live: crate::registry::LiveApplied,
+    /// Per-model reloads, starts and stops.
+    pub reloads: Vec<crate::registry::Reload>,
+    /// Downloads queued for a new device ("ONNX Runtime CUDA ...").
+    pub queued: Vec<String>,
+    /// Models whose change could not be applied (they stay pending).
+    pub errors: Vec<String>,
 }
 
-/// Pick up a config file changed on disk and apply its live part.
-pub(crate) fn sync_config(state: &AppState) {
-    if state.config.check_disk().is_some() {
-        apply_config_live(state);
+impl Applied {
+    /// "Reloading IPcam-general on OpenVINO CPU; stopping yolo26s. Downloading ...: ..."
+    pub fn describe(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let r: Vec<String> = self
+            .reloads
+            .iter()
+            .filter(|r| !matches!(r, crate::registry::Reload::Unchanged { .. }))
+            .map(crate::registry::Reload::describe)
+            .collect();
+        if !r.is_empty() {
+            let mut t = r.join("; ");
+            if let Some(c) = t.get_mut(0..1) {
+                c.make_ascii_uppercase();
+            }
+            parts.push(format!("{t}."));
+        }
+        if !self.queued.is_empty() {
+            parts.push(format!(
+                "Downloading {} for the new device setting; the model serves on what it can \
+                 meanwhile and switches when the download is installed (progress on the home \
+                 and Config pages).",
+                self.queued.join(", ")
+            ));
+        }
+        if !self.errors.is_empty() {
+            parts.push(format!("Not applied: {}.", self.errors.join("; ")));
+        }
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 }
 
-/// Validate and save the form. Changes apply on restart, except the log level (immediately).
+/// Apply the current config to this generation as far as it can without a restart, and
+/// record the result as what runs ([`AppState::running`]):
+/// - per-model changes ([`crate::config_merge::model_reloads`]: enabled/disabled, added,
+///   removed, device, path, family, ...) reload, start or stop that model's worker only
+///   ([`ModelRegistry::reload_model`]); a device that needs a download queues it first and the
+///   model waits for it (or serves on what it can meanwhile);
+/// - the live settings (thresholds, object filters, timeout, image saving, NMS) and the
+///   default model swap at once ([`ModelRegistry::apply_live`]).
+///
+/// Runtime-level globals keep their running values until a restart. Idempotent; one at a
+/// time.
+pub(crate) fn apply_config(state: &AppState) -> Applied {
+    let _one = state.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (revision, current) = state.config.snapshot();
+    let running = state.running();
+    let mut next = crate::config_merge::runtime_overlay(&running, &current);
+    let names = crate::config_merge::model_reloads(&running, &next);
+    let mut out = Applied::default();
+    if !names.is_empty() && state.registry.can_reload() {
+        let provision = state.resources.as_ref().map(|ctx| {
+            // A device the dropdown marks "will download" is downloaded even with
+            // `auto_download` off (the user picked it).
+            let device_changed = names.iter().any(|n| {
+                let key = crate::registry::normalize_name(n);
+                let dev = |c: &Config| {
+                    c.models
+                        .iter()
+                        .find(|m| crate::registry::normalize_name(&m.effective_name()) == key)
+                        .filter(|m| m.enabled)
+                        .map(|m| c.device_for(m))
+                };
+                dev(&next).is_some() && dev(&running) != dev(&next)
+            });
+            if device_changed {
+                out.queued = crate::resources::status::queue_needs(ctx, &next);
+                if !out.queued.is_empty() {
+                    info!("device change needs downloads: {}", out.queued.join(", "));
+                }
+            }
+            let plan = Arc::new(ctx.provisioner.prepare(&next, ctx.ort_loaded));
+            state.registry.set_provision(plan.clone());
+            plan
+        });
+        for name in &names {
+            match state
+                .registry
+                .reload_model(name, &next, provision.as_deref())
+            {
+                Ok(r) => out.reloads.push(r),
+                Err(e) => {
+                    warn!(model = %name, "not reloaded: {e:#}");
+                    out.errors.push(format!("{name}: {e:#}"));
+                    crate::config_merge::keep_model_from(&mut next, &running, name);
+                }
+            }
+        }
+    } else {
+        // Registries built from handles cannot spawn workers: the changes stay pending.
+        for name in &names {
+            crate::config_merge::keep_model_from(&mut next, &running, name);
+        }
+    }
+    out.live = state.registry.apply_live(&next);
+    state.running.store(Arc::new(next));
+    state
+        .applied_revision
+        .store(revision, std::sync::atomic::Ordering::Release);
+    out
+}
+
+/// Reload `names` as they run now (their files or runtimes changed, not the config), e.g. the
+/// models that failed for a missing file once it is installed. One at a time with
+/// [`apply_config`].
+pub(crate) fn reload_models(state: &AppState, names: &[String]) -> Vec<crate::registry::Reload> {
+    let _one = state.apply_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let running = state.running();
+    names
+        .iter()
+        .filter_map(|n| match state.registry.reload_model(n, &running, None) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!(model = %n, "not reloaded: {e:#}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Pick up a config file changed on disk (or a change another writer made, e.g. an export
+/// that added its model) and apply it ([`apply_config`]).
+pub(crate) fn sync_config(state: &AppState) {
+    state.config.check_disk();
+    if state.config.revision()
+        != state
+            .applied_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        apply_config(state);
+    }
+}
+
+/// Validate and save the form. Changes apply at once where they can ([`apply_config`]: live
+/// settings, per-model reloads, the log level); runtime-level settings on restart.
 /// `default_model` and the `enabled` flags are only changed when the form carries them (the
 /// page's main form does not; the Models card posts to `/config/models`).
 ///
@@ -2223,102 +2376,71 @@ async fn config_submit(
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
 ) -> Response {
     blocking(move || {
-    let json = live::wants_json(&headers);
-    let pairs = match form {
-        Ok(Form(f)) => f,
-        Err(e) => {
-            let msg = format!("Invalid form submission: {e}");
-            if json {
-                return live::error_json(StatusCode::BAD_REQUEST, msg);
-            }
-            return render(&config_template(&state, None, Some(msg), None));
-        }
-    };
-    let form: HashMap<String, String> = pairs.iter().cloned().collect();
-    let meta = match live::FormMeta::parse(&pairs) {
-        Ok(m) => m,
-        Err(e) => {
-            let msg = format!("Not saved: {e:#}");
-            if json {
-                return live::error_json(StatusCode::BAD_REQUEST, msg);
-            }
-            return render(&config_template(&state, None, Some(msg), None));
-        }
-    };
-    let devices = |c: &Config| {
-        (
-            c.device.clone(),
-            c.force_cpu,
-            c.gpu_index,
-            c.models
-                .iter()
-                .map(|m| m.device.clone())
-                .collect::<Vec<_>>(),
-        )
-    };
-    let before = devices(&state.config_read());
-    match save_config(&state, "config page", |c| {
-        live::server_form_edit(c, &form, &meta)
-    }) {
-        Ok(msg) => {
-            // A device change to an option that needs a download (the dropdown's
-            // "will download ..." entries, or a per-model `device`): queue it and restart. The
-            // new generation waits for the download (or runs on CPU meanwhile) and switches
-            // once it is installed, through the usual provisioning restart.
-            let cfg = state.config_read().clone();
-            if devices(&cfg) != before
-                && let Some(ctx) = &state.resources
-            {
-                let queued = crate::resources::status::queue_needs(ctx, &cfg);
-                if !queued.is_empty() {
-                    info!("device change needs downloads: {}", queued.join(", "));
-                    let msg = format!(
-                        "Saved. Downloading {} for the new device setting; the server                          restarts now, serves on what it can meanwhile, and switches when                          the download is installed (progress on the home and Config pages).",
-                        queued.join(", ")
-                    );
-                    if json {
-                        schedule_restart(&state);
-                        return live::saved_json(&state, msg, true);
-                    }
-                    return restart_response_with(&state, msg);
+        let json = live::wants_json(&headers);
+        let pairs = match form {
+            Ok(Form(f)) => f,
+            Err(e) => {
+                let msg = format!("Invalid form submission: {e}");
+                if json {
+                    return live::error_json(StatusCode::BAD_REQUEST, msg);
                 }
+                return render(&config_template(&state, None, Some(msg), None));
             }
-            if json {
-                return live::saved_json(&state, msg, false);
+        };
+        let form: HashMap<String, String> = pairs.iter().cloned().collect();
+        let meta = match live::FormMeta::parse(&pairs) {
+            Ok(m) => m,
+            Err(e) => {
+                let msg = format!("Not saved: {e:#}");
+                if json {
+                    return live::error_json(StatusCode::BAD_REQUEST, msg);
+                }
+                return render(&config_template(&state, None, Some(msg), None));
             }
-            render(&config_template_at(&state, Some(msg), None, None, "server"))
+        };
+        match save_config(&state, "config page", |c| {
+            live::server_form_edit(c, &form, &meta)
+        }) {
+            Ok(msg) => {
+                // A device change to an option that needs a download was queued by
+                // `apply_config`: the model serves on what it can meanwhile; an installed runtime
+                // starts a new generation (runtime libraries load once per generation).
+                if json {
+                    return live::saved_json(&state, msg, false);
+                }
+                render(&config_template_at(&state, Some(msg), None, None, "server"))
+            }
+            Err(e) => {
+                if let Some(conflicts) = live::conflicts_of(&e) {
+                    warn!("config form conflicts with newer changes: {e}");
+                    return if json {
+                        live::conflict_json(&state, conflicts)
+                    } else {
+                        live::conflict_page(&state, "/config", "server", conflicts, &pairs)
+                    };
+                }
+                warn!("rejected config form: {e:#}");
+                let msg = format!("Not saved: {e:#}");
+                if json {
+                    return live::error_json(StatusCode::BAD_REQUEST, msg);
+                }
+                render(&config_template_at(
+                    &state,
+                    None,
+                    Some(msg),
+                    Some(&form),
+                    "server",
+                ))
+            }
         }
-        Err(e) => {
-            if let Some(conflicts) = live::conflicts_of(&e) {
-                warn!("config form conflicts with newer changes: {e}");
-                return if json {
-                    live::conflict_json(&state, conflicts)
-                } else {
-                    live::conflict_page(&state, "/config", "server", conflicts, &pairs)
-                };
-            }
-            warn!("rejected config form: {e:#}");
-            let msg = format!("Not saved: {e:#}");
-            if json {
-                return live::error_json(StatusCode::BAD_REQUEST, msg);
-            }
-            render(&config_template_at(
-                &state,
-                None,
-                Some(msg),
-                Some(&form),
-                "server",
-            ))
-        }
-    }
     })
     .await
 }
 
 /// The Models card: `enabled` (repeated, one per checked model), `default_model` (radio),
 /// `device.<name>` / `threshold.<name>` ("" = global), `base` (see [`config_submit`]) and
-/// `action` (`save` or `restart`). Saves like `config_submit`; `restart` then restarts like
-/// `POST /config/restart`.
+/// `action` (`save` or `restart`). Saves like `config_submit` (a changed model reloads on its
+/// own: "reloading <model> on <device>"); `restart` then restarts like `POST /config/restart`.
 async fn config_models(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2439,11 +2561,6 @@ fn schedule_restart(state: &AppState) {
         tokio::time::sleep(RESTART_DELAY).await;
         token.cancel();
     });
-}
-
-/// Restart like `POST /config/restart`, showing `message`.
-fn restart_response_with(state: &AppState, message: String) -> Response {
-    restart_response_to(state, message, "/config".into())
 }
 
 /// Restart, showing `message`, then go to `url`.

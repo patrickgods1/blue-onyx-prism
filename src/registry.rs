@@ -4,38 +4,29 @@
 //!
 //! Workers are spawned in config order; each waits for its predecessor's [`LoadGate`] before
 //! locking the core, so compile order is deterministic and only one model compiles at a time.
+//!
+//! Config changes apply per model (docs/REVIEW_PLAN.md, phase 3): [`ModelRegistry::apply_live`]
+//! swaps the per-request settings of every worker, [`ModelRegistry::reload_model`] replaces,
+//! starts or stops one model's worker without touching the others (no `LoadGate`: a reload
+//! compiles as soon as the runtimes lock is free). The decode + preprocess pool and the runtimes
+//! belong to the generation: a reload uses them as they are.
 
 use crate::backend::{CoreOptions, DeviceSpec, LoadRequest, OrtOptions, Runtimes, Selection};
 use crate::config::{Config, ModelConfig};
 use crate::metrics::{Metrics, ModelGauges};
 use crate::profile::Profile;
+use crate::resources::provision::Provision;
 use crate::worker::{LiveSettings, LoadGate, WorkerConfig, WorkerHandle, spawn_worker_after};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub use crate::backend::RuntimeInfo;
-
-pub struct ModelRegistry {
-    workers: Vec<WorkerHandle>,
-    /// Lowercase name -> index into `workers`.
-    by_name: HashMap<String, usize>,
-    /// The model serving `/v1/vision/detection` (index into `workers`); `default_model`
-    /// applies live through [`Self::apply_live`].
-    default_idx: RwLock<Option<usize>>,
-    pub runtime_info: RuntimeInfo,
-    /// The runtimes the workers load through (None for registries built from handles).
-    runtimes: Option<Arc<Mutex<Runtimes>>>,
-    /// Hardware profile of this generation and its decode + preprocess thread count (None for
-    /// registries built from handles).
-    profile: Option<(Profile, usize)>,
-    /// The generation's decode + preprocess pool (shared with the workers; its threads stop
-    /// when the last holder drops it).
-    _prep: Option<Arc<crate::prep::PrepPool>>,
-}
 
 /// Lowercase and strip a trailing `.onnx` / `.xml` (Blue Iris sends file stems, users may not).
 pub fn normalize_name(name: &str) -> String {
@@ -143,12 +134,317 @@ pub fn preprocess_threads(
     profile.preprocess_threads_for(all_cpu)
 }
 
+/// One served model: its handle (shared with the HTTP handlers that are using it), its own stop
+/// token (a child of the generation's worker token) and its thread.
+struct WorkerSlot {
+    handle: Arc<WorkerHandle>,
+    stop: CancellationToken,
+    join: Option<JoinHandle<()>>,
+}
+
+/// The served models. `by_name` and the default index always match `workers` (they change
+/// together under one lock).
+#[derive(Default)]
+struct Slots {
+    workers: Vec<WorkerSlot>,
+    /// Lowercase name -> index into `workers`.
+    by_name: HashMap<String, usize>,
+    default_idx: Option<usize>,
+    /// Normalized name -> reloads of that model in this generation.
+    reloads: HashMap<String, u64>,
+}
+
+impl Slots {
+    fn from_slots(workers: Vec<WorkerSlot>, default_idx: Option<usize>) -> Self {
+        let mut s = Self {
+            workers,
+            ..Self::default()
+        };
+        s.rebuild_names();
+        s.default_idx = default_idx.filter(|&i| i < s.workers.len());
+        s
+    }
+
+    fn rebuild_names(&mut self) {
+        self.by_name = self
+            .workers
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (normalize_name(&w.handle.name), i))
+            .collect();
+    }
+
+    /// Put the workers in `config` order (models it does not list keep their order at the end),
+    /// rebuild the name map and resolve the default model.
+    fn reindex(&mut self, config: &Config) {
+        let pos = |name: &str| {
+            let key = normalize_name(name);
+            config
+                .models
+                .iter()
+                .position(|m| normalize_name(&m.effective_name()) == key)
+                .unwrap_or(usize::MAX)
+        };
+        self.workers.sort_by_key(|w| pos(&w.handle.name));
+        self.rebuild_names();
+        self.default_idx = default_by_name(config, &self.by_name, self.workers.len());
+    }
+}
+
+/// What a registry started from a config needs to spawn (and respawn) workers.
+struct Spawner {
+    runtimes: Arc<Mutex<Runtimes>>,
+    metrics: Arc<Metrics>,
+    /// The generation's worker token (each worker gets a child of it).
+    shutdown: CancellationToken,
+    profile: Profile,
+    /// The generation's decode + preprocess pool (shared by every worker, reloads included).
+    prep: Arc<crate::prep::PrepPool>,
+    prep_threads: usize,
+    best_cpu: DeviceSpec,
+    can_use_gpu: bool,
+    /// The provisioning plan made for the latest reload (None: the generation's plan holds).
+    provision: RwLock<Option<Arc<Provision>>>,
+    /// One reload at a time.
+    reload: Mutex<()>,
+}
+
+pub struct ModelRegistry {
+    slots: RwLock<Slots>,
+    pub runtime_info: RuntimeInfo,
+    /// None for registries built from handles (they cannot spawn workers).
+    spawner: Option<Spawner>,
+}
+
+/// What [`ModelRegistry::reload_model`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reload {
+    /// A new worker was spawned (replacing the old one, if any); the text names where it is
+    /// headed ("OpenVINO CPU", "auto").
+    Spawned {
+        name: String,
+        device: String,
+        /// An old worker was replaced (false: the model was not served before).
+        replaced: bool,
+    },
+    /// The model is no longer served (disabled or removed); its worker stops once its requests
+    /// are answered.
+    Stopped { name: String },
+    /// Not served before and not enabled now: nothing to do.
+    Unchanged { name: String },
+}
+
+impl Reload {
+    /// "reloading IPcam-general on OpenVINO CPU", "loading x on auto", "stopping yolo26s".
+    pub fn describe(&self) -> String {
+        match self {
+            Reload::Spawned {
+                name,
+                device,
+                replaced: true,
+            } => format!("reloading {name} on {device}"),
+            Reload::Spawned { name, device, .. } => format!("loading {name} on {device}"),
+            Reload::Stopped { name } => format!("stopping {name}"),
+            Reload::Unchanged { name } => format!("{name} unchanged"),
+        }
+    }
+}
+
+/// The spec, label and planned devices helpers need the runtimes lock; a reload must not wait
+/// behind a model that is compiling, so it only tries.
+fn try_lock_runtimes(rt: &Mutex<Runtimes>) -> Option<std::sync::MutexGuard<'_, Runtimes>> {
+    match rt.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+impl Spawner {
+    /// Spawn the worker of enabled model `m` (or a `Failed` handle when it cannot be set up:
+    /// missing file, pending export, bad classes, downloads that must be fetched by hand).
+    /// `planned` is the display label of its first runnable device; `after` the startup
+    /// [`LoadGate`] to wait for (reloads pass None); `stop` its own token. The returned handle
+    /// owns the thread's join handle (`join`), None for a failed handle.
+    fn spawn_model(
+        &self,
+        config: &Config,
+        m: &ModelConfig,
+        provision: Option<&Provision>,
+        planned: Option<String>,
+        after: Option<LoadGate>,
+        stop: CancellationToken,
+    ) -> WorkerHandle {
+        let name = m.effective_name();
+        let path = config.data_path(&m.path);
+        let load = load_request(config, m, path.clone());
+        // Counters live for the whole process; the device/provider restart on each load.
+        let mm = self.metrics.model(&name);
+        mm.begin_load(load.requested.clone());
+
+        // Downloads this model waits for (phase 7.3).
+        if let Some(p) = provision
+            && let Some(msg) = p.manual_failure(&name)
+        {
+            warn!(model = %name, "{msg}");
+            return WorkerHandle::failed(name, msg, mm);
+        }
+        let mut wait = provision.and_then(|p| p.wait_for(&name));
+        if let Some(w) = &wait {
+            let only_runtimes = w.blocks().iter().all(|b| b.is_runtime());
+            if only_runtimes && path.is_file() {
+                let device = config.device_spec_for(m).unwrap_or(self.best_cpu);
+                let rt = self.runtimes.lock().unwrap_or_else(|e| e.into_inner());
+                let sel = rt.selection(Some(&path));
+                let interim = rt
+                    .plan(&device, &path)
+                    .into_iter()
+                    .find(|c| sel.option(&c.device).is_some_and(|o| o.runnable));
+                drop(rt);
+                if let Some(c) = interim {
+                    let ids: Vec<&str> = w.blocks().iter().map(|b| b.resource.id).collect();
+                    info!(
+                        model = %name,
+                        "loading on {} while {} downloads; switching after it is installed",
+                        c.device,
+                        ids.join(", ")
+                    );
+                    wait = None;
+                }
+            }
+        }
+
+        let setup = (|| -> Result<(DeviceSpec, Vec<String>)> {
+            // `force_cpu`: the best CPU option (OpenVINO, else ONNX Runtime).
+            let device = if config.force_cpu {
+                self.best_cpu
+            } else {
+                config.device_spec_for(m)?
+            };
+            if wait.is_some() {
+                // Class names are read after the files arrive (in the worker).
+                return Ok((device, Vec::new()));
+            }
+            // An exported model's file is made by a user-started export, never downloaded;
+            // a file from another version (the old RF-DETR large download) is not used.
+            if let Some(r) = crate::resources::export::pending_export(&path) {
+                bail!(
+                    "{}",
+                    crate::resources::export::needs_export_message(r, &m.path, path.is_file())
+                );
+            }
+            if !path.is_file() {
+                bail!(
+                    "model file not found: {} (download it with `download-models` or fix `path`)",
+                    path.display()
+                );
+            }
+            let classes_path = m.classes.as_deref().map(|c| config.data_path(c));
+            Ok((device, resolve_class_names(&path, classes_path.as_deref())?))
+        })();
+        let (device, classes) = match setup {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                warn!(model = %name, "{msg}");
+                return WorkerHandle::failed(name, msg, mm);
+            }
+        };
+
+        let resolved = ModelConfig {
+            path,
+            classes: m.classes.as_deref().map(|c| config.data_path(c)),
+            ..m.clone()
+        };
+        let cfg = WorkerConfig {
+            name,
+            device,
+            load,
+            classes,
+            live: LiveSettings::for_model(config, m).shared(),
+            queue_size: config.worker_queue_size,
+            lazy: m.lazy,
+            can_use_gpu: self.can_use_gpu,
+            model: resolved,
+            wait,
+            concurrency: Some(crate::worker::Concurrency {
+                profile: self.profile.clone(),
+                overrides: config.concurrency_overrides(m),
+            }),
+            prep: Some(self.prep.clone()),
+        };
+        let mut handle = spawn_worker_after(self.runtimes.clone(), cfg, mm, stop, after);
+        handle.set_planned(device, planned);
+        handle
+    }
+
+    /// Where each enabled model of `config` is headed (its first runnable load candidate);
+    /// None when the runtimes are busy compiling.
+    fn planned_devices(
+        &self,
+        config: &Config,
+    ) -> Option<Vec<Option<crate::backend::spec::Device>>> {
+        let rt = try_lock_runtimes(&self.runtimes)?;
+        Some(
+            config
+                .enabled_models()
+                .map(|m| {
+                    let device = if config.force_cpu {
+                        self.best_cpu
+                    } else {
+                        config.device_spec_for(m).ok()?
+                    };
+                    rt.first_runnable(&device, &config.data_path(&m.path))
+                        .map(|(d, _)| d)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Stop a worker that left the registry without blocking the caller: on a helper thread, let
+/// its in-flight requests finish (the handle's sender goes away with the last HTTP handler that
+/// uses it, and the worker exits once its channel is empty), at most the request timeout plus
+/// a second, then cancel its token and join it.
+fn retire_worker(slot: WorkerSlot) {
+    let WorkerSlot { handle, stop, join } = slot;
+    let name = handle.name.clone();
+    let drain = handle.request_timeout() + Duration::from_secs(1);
+    drop(handle);
+    let Some(join) = join else {
+        stop.cancel();
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name(format!("stop-{name}"))
+        .spawn(move || {
+            let deadline = Instant::now() + drain;
+            while !join.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            stop.cancel();
+            if join.join().is_err() {
+                error!(model = %name, "worker thread panicked");
+            } else {
+                info!(model = %name, "previous worker stopped");
+            }
+        });
+    if let Err(e) = spawned {
+        // The thread still stops (its token is cancelled); it is just not joined.
+        warn!("could not spawn a thread to stop a worker: {e}");
+    }
+}
+
 impl ModelRegistry {
     /// Create the `Core` and spawn one worker per enabled model. Returns as soon as the
     /// workers are spawned; models compile in the background (see `WorkerHandle::state`).
     /// An empty `models` list is an error; models that are all disabled give an empty registry
     /// (the web UI stays up so a model can be enabled).
-    pub fn start(config: &Config, metrics: &Metrics, shutdown: CancellationToken) -> Result<Self> {
+    pub fn start(
+        config: &Config,
+        metrics: &Arc<Metrics>,
+        shutdown: CancellationToken,
+    ) -> Result<Self> {
         Self::start_with(config, metrics, shutdown, None)
     }
 
@@ -161,9 +457,9 @@ impl ModelRegistry {
     /// [`Provisioner`]: crate::resources::provision::Provisioner
     pub fn start_with(
         config: &Config,
-        metrics: &Metrics,
+        metrics: &Arc<Metrics>,
         shutdown: CancellationToken,
-        provision: Option<&crate::resources::provision::Provision>,
+        provision: Option<&Provision>,
     ) -> Result<Self> {
         Self::start_with_benchmark(config, metrics, shutdown, provision, None)
     }
@@ -174,9 +470,9 @@ impl ModelRegistry {
     /// `Selection::apply_measured_order`). A missing or unreadable file changes nothing.
     pub fn start_with_benchmark(
         config: &Config,
-        metrics: &Metrics,
+        metrics: &Arc<Metrics>,
         shutdown: CancellationToken,
-        provision: Option<&crate::resources::provision::Provision>,
+        provision: Option<&Provision>,
         benchmark: Option<&Path>,
     ) -> Result<Self> {
         if config.models.is_empty() {
@@ -186,23 +482,8 @@ impl ModelRegistry {
                  `blue-onyx-prism download-models --name IPcam-general`"
             );
         }
-
-        // Validate names (of all entries, enabled or not) before touching OpenVINO.
-        let mut seen = std::collections::HashSet::new();
-        for m in &config.models {
-            let key = normalize_name(&m.effective_name());
-            if !seen.insert(key.clone()) {
-                bail!(
-                    "duplicate model name '{key}' in config; set a distinct `name` for each entry"
-                );
-            }
-        }
+        validate_names(config)?;
         let enabled: Vec<&ModelConfig> = config.enabled_models().collect();
-        let by_name: HashMap<String, usize> = enabled
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (normalize_name(&m.effective_name()), i))
-            .collect();
         let disabled = config.models.len() - enabled.len();
         if enabled.is_empty() {
             warn!(
@@ -293,10 +574,6 @@ impl ModelRegistry {
                 runtimes.first_runnable(&device, &config.data_path(&m.path))
             })
             .collect();
-        let planned_labels: Vec<Option<String>> = planned
-            .iter()
-            .map(|p| p.as_ref().map(|(_, l)| l.clone()))
-            .collect();
         let profile = config.profile();
         let planned_devices: Vec<_> = planned
             .iter()
@@ -307,187 +584,176 @@ impl ModelRegistry {
             profile = %profile.summary(prep_threads),
             "hardware profile"
         );
-        let prep = crate::prep::PrepPool::new(prep_threads);
-        let runtimes = Arc::new(Mutex::new(runtimes));
+        let spawner = Spawner {
+            runtimes: Arc::new(Mutex::new(runtimes)),
+            metrics: metrics.clone(),
+            shutdown,
+            profile,
+            prep: crate::prep::PrepPool::new(prep_threads),
+            prep_threads,
+            best_cpu,
+            can_use_gpu: runtime_info.has_gpu,
+            provision: RwLock::new(None),
+            reload: Mutex::new(()),
+        };
 
         let mut workers = Vec::with_capacity(enabled.len());
+        // Startup order: each spawned worker waits for the previous one's gate.
         let mut prev: Option<LoadGate> = None;
         for (mi, &m) in enabled.iter().enumerate() {
-            let name = m.effective_name();
-            let path = config.data_path(&m.path);
-            let load = load_request(config, m, path.clone());
-            // Counters live for the whole process; the device/provider restart on each load.
-            let mm = metrics.model(&name);
-            mm.begin_load(load.requested.clone());
-
-            // Downloads this model waits for (phase 7.3).
-            if let Some(p) = provision
-                && let Some(msg) = p.manual_failure(&name)
-            {
-                warn!(model = %name, "{msg}");
-                workers.push(WorkerHandle::failed(name, msg, mm));
-                continue;
-            }
-            let mut wait = provision.and_then(|p| p.wait_for(&name));
-            if let Some(w) = &wait {
-                let only_runtimes = w.blocks().iter().all(|b| b.is_runtime());
-                if only_runtimes && path.is_file() {
-                    let device = config.device_spec_for(m).unwrap_or(best_cpu);
-                    let rt = runtimes.lock().unwrap_or_else(|e| e.into_inner());
-                    let sel = rt.selection(Some(&path));
-                    let interim = rt
-                        .plan(&device, &path)
-                        .into_iter()
-                        .find(|c| sel.option(&c.device).is_some_and(|o| o.runnable));
-                    drop(rt);
-                    if let Some(c) = interim {
-                        let ids: Vec<&str> = w.blocks().iter().map(|b| b.resource.id).collect();
-                        info!(
-                            model = %name,
-                            "loading on {} while {} downloads; switching after it is installed",
-                            c.device,
-                            ids.join(", ")
-                        );
-                        wait = None;
-                    }
-                }
-            }
-
-            let setup = (|| -> Result<(DeviceSpec, Vec<String>)> {
-                // `force_cpu`: the best CPU option (OpenVINO, else ONNX Runtime).
-                let device = if config.force_cpu {
-                    best_cpu
-                } else {
-                    config.device_spec_for(m)?
-                };
-                if wait.is_some() {
-                    // Class names are read after the files arrive (in the worker).
-                    return Ok((device, Vec::new()));
-                }
-                // An exported model's file is made by a user-started export, never downloaded;
-                // a file from another version (the old RF-DETR large download) is not used.
-                if let Some(r) = crate::resources::export::pending_export(&path) {
-                    bail!(
-                        "{}",
-                        crate::resources::export::needs_export_message(r, &m.path, path.is_file())
-                    );
-                }
-                if !path.is_file() {
-                    bail!(
-                        "model file not found: {} (download it with `download-models` or fix `path`)",
-                        path.display()
-                    );
-                }
-                let classes_path = m.classes.as_deref().map(|c| config.data_path(c));
-                Ok((device, resolve_class_names(&path, classes_path.as_deref())?))
-            })();
-            let (device, classes) = match setup {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    warn!(model = %name, "{msg}");
-                    workers.push(WorkerHandle::failed(name, msg, mm));
-                    continue;
-                }
-            };
-
-            let resolved = ModelConfig {
-                path,
-                classes: m.classes.as_deref().map(|c| config.data_path(c)),
-                ..m.clone()
-            };
-            let cfg = WorkerConfig {
-                name: name.clone(),
-                device,
-                load,
-                classes,
-                live: LiveSettings::for_model(config, m).shared(),
-                queue_size: config.worker_queue_size,
-                lazy: m.lazy,
-                can_use_gpu: runtime_info.has_gpu,
-                model: resolved,
-                wait,
-                concurrency: Some(crate::worker::Concurrency {
-                    profile: profile.clone(),
-                    overrides: config.concurrency_overrides(m),
-                }),
-                prep: Some(prep.clone()),
-            };
+            let label = planned.get(mi).cloned().flatten().map(|(_, l)| l);
+            let stop = spawner.shutdown.child_token();
             let mut handle =
-                spawn_worker_after(runtimes.clone(), cfg, mm, shutdown.clone(), prev.take());
-            handle.set_planned(device, planned_labels.get(mi).cloned().flatten());
-            prev = Some(handle.load_gate());
-            workers.push(handle);
+                spawner.spawn_model(config, m, provision, label, prev.clone(), stop.clone());
+            let join = handle.join.take();
+            if join.is_some() {
+                prev = Some(handle.load_gate());
+            }
+            workers.push(WorkerSlot {
+                handle: Arc::new(handle),
+                stop,
+                join,
+            });
         }
 
         let default_idx = resolve_default(config);
         if let Some(i) = default_idx {
-            info!(model = %workers[i].name, "default model for /v1/vision/detection");
+            info!(model = %workers[i].handle.name, "default model for /v1/vision/detection");
         }
 
         Ok(Self {
-            workers,
-            by_name,
-            default_idx: RwLock::new(default_idx),
+            slots: RwLock::new(Slots::from_slots(workers, default_idx)),
             runtime_info,
-            runtimes: Some(runtimes),
-            profile: Some((profile, prep_threads)),
-            _prep: Some(prep),
+            spawner: Some(spawner),
         })
     }
 
     /// Registry over already constructed handles (no OpenVINO involved). Used by tests that
-    /// exercise the HTTP layer with e.g. [`WorkerHandle::failed`] handles.
+    /// exercise the HTTP layer with e.g. [`WorkerHandle::failed`] handles. It cannot reload.
     pub fn from_handles(
         workers: Vec<WorkerHandle>,
         default_idx: Option<usize>,
         runtime_info: RuntimeInfo,
     ) -> Self {
-        let by_name = workers
-            .iter()
-            .enumerate()
-            .map(|(i, w)| (normalize_name(&w.name), i))
+        let workers = workers
+            .into_iter()
+            .map(|mut h| {
+                let join = h.join.take();
+                WorkerSlot {
+                    handle: Arc::new(h),
+                    stop: CancellationToken::new(),
+                    join,
+                }
+            })
             .collect();
-        let default_idx = default_idx.filter(|&i| i < workers.len());
         Self {
-            workers,
-            by_name,
-            default_idx: RwLock::new(default_idx),
+            slots: RwLock::new(Slots::from_slots(workers, default_idx)),
             runtime_info,
-            runtimes: None,
-            profile: None,
-            _prep: None,
+            spawner: None,
         }
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Slots> {
+        self.slots.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Slots> {
+        self.slots.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The shared runtimes (None for registries built with [`Self::from_handles`]). Lock briefly:
     /// workers hold the lock while compiling.
     pub fn runtimes(&self) -> Option<&Arc<Mutex<Runtimes>>> {
-        self.runtimes.as_ref()
+        self.spawner.as_ref().map(|s| &s.runtimes)
     }
 
     /// The hardware profile of this generation and its decode + preprocess thread count (None
-    /// for registries built with [`Self::from_handles`]).
+    /// for registries built with [`Self::from_handles`]). Reloads keep the pool size.
     pub fn profile(&self) -> Option<(&Profile, usize)> {
-        self.profile.as_ref().map(|(p, n)| (p, *n))
+        self.spawner.as_ref().map(|s| (&s.profile, s.prep_threads))
+    }
+
+    /// The provisioning plan made by the latest reload that involved downloads (None: the
+    /// generation's own plan is current).
+    pub fn latest_provision(&self) -> Option<Arc<Provision>> {
+        let s = self.spawner.as_ref()?;
+        s.provision
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record the plan reloads are made with (see [`Self::latest_provision`]).
+    pub fn set_provision(&self, provision: Arc<Provision>) {
+        if let Some(s) = &self.spawner {
+            *s.provision.write().unwrap_or_else(|e| e.into_inner()) = Some(provision);
+        }
+    }
+
+    /// True when the registry can spawn workers (not built from handles).
+    pub fn can_reload(&self) -> bool {
+        self.spawner.is_some()
     }
 
     /// Device options and the `auto` ranking for `model` (None: any model), from the shared
     /// runtimes. None for registries built with [`Self::from_handles`].
     pub fn selection(&self, model: Option<&Path>) -> Option<Selection> {
-        let rt = self.runtimes.as_ref()?;
+        let rt = self.runtimes()?;
         let rt = rt.lock().unwrap_or_else(|e| e.into_inner());
         Some(rt.selection(model))
     }
 
     /// Live per-model gauges (state, device, queue) for `/prometheus`, in config order.
     pub fn gauges(&self) -> Vec<ModelGauges> {
-        self.workers.iter().map(WorkerHandle::gauges).collect()
+        self.read()
+            .workers
+            .iter()
+            .map(|w| w.handle.gauges())
+            .collect()
     }
 
-    pub fn default_model(&self) -> Option<&WorkerHandle> {
-        let idx = *self.default_idx.read().unwrap_or_else(|e| e.into_inner());
-        idx.and_then(|i| self.workers.get(i))
+    /// The model serving `/v1/vision/detection`.
+    pub fn default_model(&self) -> Option<Arc<WorkerHandle>> {
+        let s = self.read();
+        s.default_idx
+            .and_then(|i| s.workers.get(i))
+            .map(|w| w.handle.clone())
+    }
+
+    /// Case-insensitive lookup; a trailing `.onnx` / `.xml` is ignored.
+    pub fn by_name(&self, name: &str) -> Option<Arc<WorkerHandle>> {
+        let s = self.read();
+        s.by_name
+            .get(&normalize_name(name))
+            .and_then(|&i| s.workers.get(i))
+            .map(|w| w.handle.clone())
+    }
+
+    /// Names of the served (enabled) models in config order.
+    pub fn names(&self) -> Vec<String> {
+        self.read()
+            .workers
+            .iter()
+            .map(|w| w.handle.name.clone())
+            .collect()
+    }
+
+    /// The served models' handles in config order (a snapshot: a reload replaces handles).
+    pub fn workers(&self) -> Vec<Arc<WorkerHandle>> {
+        self.read()
+            .workers
+            .iter()
+            .map(|w| w.handle.clone())
+            .collect()
+    }
+
+    /// How often `name` was reloaded in this generation.
+    pub fn reloads(&self, name: &str) -> u64 {
+        self.read()
+            .reloads
+            .get(&normalize_name(name))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Apply the live part of `config` without reloading anything: every served model's
@@ -496,8 +762,9 @@ impl ModelRegistry {
     /// are skipped. Returns what changed.
     pub fn apply_live(&self, config: &Config) -> LiveApplied {
         let mut out = LiveApplied::default();
-        for w in &self.workers {
-            let key = normalize_name(&w.name);
+        let mut s = self.write();
+        for w in &s.workers {
+            let key = normalize_name(&w.handle.name);
             let Some(m) = config
                 .models
                 .iter()
@@ -505,15 +772,14 @@ impl ModelRegistry {
             else {
                 continue;
             };
-            if w.set_live(LiveSettings::for_model(config, m)) {
-                out.models.push(w.name.clone());
+            if w.handle.set_live(LiveSettings::for_model(config, m)) {
+                out.models.push(w.handle.name.clone());
             }
         }
-        let new = default_by_name(config, &self.by_name, self.workers.len());
-        let mut idx = self.default_idx.write().unwrap_or_else(|e| e.into_inner());
-        if *idx != new {
-            *idx = new;
-            out.default_model = new.map(|i| self.workers[i].name.clone());
+        let new = default_by_name(config, &s.by_name, s.workers.len());
+        if s.default_idx != new {
+            s.default_idx = new;
+            out.default_model = new.map(|i| s.workers[i].handle.name.clone());
             out.default_changed = true;
             info!(
                 model = out.default_model.as_deref().unwrap_or("none"),
@@ -526,37 +792,142 @@ impl ModelRegistry {
         out
     }
 
-    /// Case-insensitive lookup; a trailing `.onnx` / `.xml` is ignored.
-    pub fn by_name(&self, name: &str) -> Option<&WorkerHandle> {
-        self.by_name
-            .get(&normalize_name(name))
-            .and_then(|&i| self.workers.get(i))
+    /// Reload model `name` from `config` without touching the others: a served model gets a
+    /// new worker (the old one is taken out of routing at once and stops on a helper thread
+    /// once its requests are answered); a model that is enabled but not served is spawned; a
+    /// served model that is disabled or gone from `config` is stopped. The new worker loads
+    /// right away (no startup [`LoadGate`]), through this generation's runtimes and prep pool;
+    /// `provision` is the plan for downloads it may wait for. Runtime-level settings come from
+    /// `config` as given (the caller keeps the running ones; see
+    /// `config_merge::runtime_overlay`). Errors for registries built from handles.
+    pub fn reload_model(
+        &self,
+        name: &str,
+        config: &Config,
+        provision: Option<&Provision>,
+    ) -> Result<Reload> {
+        let Some(sp) = &self.spawner else {
+            bail!("this registry cannot reload models");
+        };
+        let _one = sp.reload.lock().unwrap_or_else(|e| e.into_inner());
+        validate_names(config)?;
+        let key = normalize_name(name);
+        let entry = config
+            .models
+            .iter()
+            .find(|m| normalize_name(&m.effective_name()) == key);
+        let served = self.read().by_name.contains_key(&key);
+        let Some(m) = entry.filter(|m| m.enabled) else {
+            if !served {
+                return Ok(Reload::Unchanged {
+                    name: name.to_string(),
+                });
+            }
+            let old = {
+                let mut s = self.write();
+                let i = s.by_name[&key];
+                let old = s.workers.remove(i);
+                s.reindex(config);
+                old
+            };
+            let name = old.handle.name.clone();
+            info!(model = %name, "model disabled; stopping its worker");
+            retire_worker(old);
+            return Ok(Reload::Stopped { name });
+        };
+
+        let path = config.data_path(&m.path);
+        let device = if config.force_cpu {
+            sp.best_cpu
+        } else {
+            config.device_spec_for(m).unwrap_or(DeviceSpec::Auto)
+        };
+        let label = try_lock_runtimes(&sp.runtimes)
+            .and_then(|rt| rt.first_runnable(&device, &path))
+            .map(|(_, l)| l);
+        let stop = sp.shutdown.child_token();
+        let mut handle = sp.spawn_model(config, m, provision, label, None, stop.clone());
+        let join = handle.join.take();
+        let device_text = handle.planned_device_text();
+        let new_name = handle.name.clone();
+        let slot = WorkerSlot {
+            handle: Arc::new(handle),
+            stop,
+            join,
+        };
+        let old = {
+            let mut s = self.write();
+            let old = s.by_name.get(&key).copied().map(|i| s.workers.remove(i));
+            s.workers.push(slot);
+            *s.reloads.entry(key.clone()).or_default() += u64::from(old.is_some());
+            s.reindex(config);
+            old
+        };
+        let replaced = old.is_some();
+        match old {
+            Some(old) => {
+                info!(model = %new_name, device = %device_text, "reloading model");
+                retire_worker(old);
+            }
+            None => info!(model = %new_name, device = %device_text, "model enabled; loading"),
+        }
+        // The decode + preprocess pool is sized once per generation.
+        if config.preprocess_threads == 0
+            && let Some(planned) = sp.planned_devices(config)
+        {
+            let want = preprocess_threads(config, &sp.profile, &planned);
+            if want != sp.prep_threads {
+                info!(
+                    threads = sp.prep_threads,
+                    wanted = want,
+                    "the models' devices now call for another preprocess pool size; it keeps \
+                     its size until the server restarts"
+                );
+            }
+        }
+        Ok(Reload::Spawned {
+            name: new_name,
+            device: device_text,
+            replaced,
+        })
     }
 
-    /// Names of the served (enabled) models in config order.
-    pub fn names(&self) -> Vec<String> {
-        self.workers.iter().map(|w| w.name.clone()).collect()
-    }
-
-    pub fn workers(&self) -> &[WorkerHandle] {
-        &self.workers
-    }
-
-    /// Drop all senders and join the worker threads. Cancel the shutdown token first for a
-    /// prompt exit; otherwise each worker exits once its channel disconnects.
+    /// Stop every worker and join the threads. Workers no other thread holds a handle of exit
+    /// once their channel is empty; the others are cancelled. Cancel the shutdown token first
+    /// for a prompt exit.
     pub fn shutdown(self) {
-        for w in self.workers {
-            let name = w.name.clone();
-            w.join();
+        let slots = self.slots.into_inner().unwrap_or_else(|e| e.into_inner());
+        for WorkerSlot { handle, stop, join } in slots.workers {
+            let name = handle.name.clone();
+            if Arc::try_unwrap(handle).is_err() {
+                // Someone still holds the sender: do not wait for the disconnect.
+                stop.cancel();
+            }
+            if let Some(j) = join
+                && j.join().is_err()
+            {
+                error!(model = %name, "worker thread panicked");
+            }
             info!(model = %name, "worker stopped");
         }
     }
 }
 
+/// Names of all entries (enabled or not) must be distinct after normalization.
+fn validate_names(config: &Config) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for m in &config.models {
+        let key = normalize_name(&m.effective_name());
+        if !seen.insert(key.clone()) {
+            bail!("duplicate model name '{key}' in config; set a distinct `name` for each entry");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn name_normalization() {
@@ -594,7 +965,7 @@ mod tests {
     #[test]
     fn empty_config_is_an_error() {
         let c = Config::default();
-        let m = Metrics::new("0");
+        let m = Arc::new(Metrics::new("0"));
         let err = ModelRegistry::start(&c, &m, CancellationToken::new())
             .err()
             .expect("must fail");
@@ -610,7 +981,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        let m = Metrics::new("0");
+        let m = Arc::new(Metrics::new("0"));
         let err = ModelRegistry::start(&c, &m, CancellationToken::new())
             .err()
             .expect("must fail");
@@ -674,7 +1045,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        let m = Metrics::new("0");
+        let m = Arc::new(Metrics::new("0"));
         let err = ModelRegistry::start(&c, &m, CancellationToken::new())
             .err()
             .expect("must fail");
@@ -755,6 +1126,41 @@ mod tests {
         c.default_model = Some("off".into());
         assert!(reg.apply_live(&c).default_changed);
         assert_eq!(reg.default_model().unwrap().name, "a");
+    }
+
+    #[test]
+    fn registries_from_handles_cannot_reload() {
+        let metrics = Metrics::new("0");
+        let reg = ModelRegistry::from_handles(
+            vec![WorkerHandle::failed("a", "test", metrics.model("a"))],
+            Some(0),
+            RuntimeInfo::default(),
+        );
+        assert!(!reg.can_reload());
+        let c = Config::default();
+        assert!(reg.reload_model("a", &c, None).is_err());
+        assert_eq!(reg.reloads("a"), 0);
+        assert_eq!(reg.names(), ["a"]);
+    }
+
+    #[test]
+    fn reload_texts() {
+        let r = Reload::Spawned {
+            name: "m".into(),
+            device: "OpenVINO CPU".into(),
+            replaced: true,
+        };
+        assert_eq!(r.describe(), "reloading m on OpenVINO CPU");
+        let r = Reload::Spawned {
+            name: "m".into(),
+            device: "auto".into(),
+            replaced: false,
+        };
+        assert_eq!(r.describe(), "loading m on auto");
+        assert_eq!(
+            Reload::Stopped { name: "m".into() }.describe(),
+            "stopping m"
+        );
     }
 
     #[test]

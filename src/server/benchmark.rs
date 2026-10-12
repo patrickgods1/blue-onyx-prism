@@ -374,7 +374,7 @@ fn loaded_devices(state: &AppState) -> HashMap<String, String> {
 fn config_view(state: &AppState, snap: &DevicesSnapshot) -> serde_json::Value {
     super::sync_config(state);
     let (revision, cfg) = state.config.snapshot();
-    let pending = crate::config_merge::pending(&state.running, &cfg);
+    let pending = crate::config_merge::pending(&state.running(), &cfg);
     let thr = crate::config::round_threshold_f64;
     let loaded = loaded_devices(state);
     let models: Vec<serde_json::Value> = cfg
@@ -783,8 +783,9 @@ fn truthy(v: &str) -> bool {
 /// - `model=<name>&device=<spec>`: one model ("" or `global` = follow the global device);
 /// - `all=1` (optionally limited by repeated `model`): every recommendation of the saved results.
 ///
-/// `restart=1` restarts the server afterwards (like `POST /config/restart`). Answers JSON with
-/// the changes; 400 on bad input, 404 when `all` finds no recommendation.
+/// The changed models reload on their new devices at once (per-model reload); `restart=1`
+/// restarts the server when a change could not be applied that way. Answers JSON with the
+/// changes; 400 on bad input, 404 when `all` finds no recommendation.
 pub(super) async fn apply(
     State(state): State<Arc<AppState>>,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
@@ -868,12 +869,25 @@ pub(super) async fn apply(
     if force_cpu {
         message.push_str(" Note: Force CPU is on and overrides per-model devices.");
     }
-    let restarting = restart && !changes.is_empty();
+    // `save_config` reloaded the changed models (per-model reload); a change that could not
+    // be applied that way stays pending and needs a restart (`restart=1` does it now).
+    let pending = crate::config_merge::pending(&state.running(), &state.config_read());
+    let unapplied = changes
+        .iter()
+        .any(|c| !pending.for_model(&c.model).is_empty());
+    let restarting = restart && unapplied;
     if restarting {
         message.push_str(" Restarting the server to load the models on their new devices.");
         schedule_restart(&state);
-    } else if !changes.is_empty() {
+    } else if unapplied {
         message.push_str(" Restart the server to apply.");
+    } else if changes
+        .iter()
+        .any(|c| state.registry.by_name(&c.model).is_some())
+    {
+        message.push_str(" Reloading the models on their new devices (no restart needed).");
+    } else if !changes.is_empty() {
+        message.push_str(" Used when the model is enabled (no restart needed).");
     }
     info!("benchmark apply: {message}");
     Json(serde_json::json!({
@@ -1407,11 +1421,13 @@ mod tests {
         assert_eq!(v["changes"][0]["model"], "dfine-s");
         assert_eq!(v["changes"][0]["to"], "ort:coreml");
         assert_eq!(v["restarting"], false);
+        // dfine-s is disabled: nothing to reload or restart.
         assert!(
             v["message"]
                 .as_str()
                 .unwrap()
-                .contains("Restart the server")
+                .contains("Used when the model is enabled"),
+            "{v}"
         );
         let saved = Config::load(&cfg_path).unwrap();
         assert_eq!(saved.models[1].device.as_deref(), Some("ort:coreml"));

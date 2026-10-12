@@ -9,7 +9,9 @@
 //! On-demand resources (phase 7.3): before each generation the [`Provisioner`] (which owns the
 //! download manager for the whole run) works out what the config is missing and queues it.
 //! When a runtime the generation can use gets installed, a watcher thread restarts the
-//! generation the same way `/config/restart` does, but keeps the in-memory config.
+//! generation the same way `/config/restart` does, but keeps the in-memory config (runtime
+//! libraries load once per generation); an installed model file reloads only the models that
+//! failed without it.
 //!
 //! The HTTP listener is bound once per run and serves [`server::Shared`]: a restart builds the
 //! next generation while the old one keeps answering, swaps it in, and stops the old workers
@@ -218,19 +220,11 @@ pub fn run_server_with(
         if loaded_ort.is_none() {
             loaded_ort = registry_ort_flavor(&registry);
         }
-        let resources_restart = Arc::new(AtomicBool::new(false));
-        let watcher = spawn_watcher(
-            provision.clone(),
-            registry.clone(),
-            generation.clone(),
-            resources_restart.clone(),
-        );
-
         let state = Arc::new(AppState {
             registry: registry.clone(),
             metrics: metrics.clone(),
             config: store.clone(),
-            running: Arc::new({
+            running: arc_swap::ArcSwap::from_pointee({
                 let mut c = config.clone();
                 c.normalize();
                 // What is running is the address bound at process start (a changed port or
@@ -239,6 +233,8 @@ pub fn run_server_with(
                 c.bind_address = bound_address;
                 c
             }),
+            apply_lock: std::sync::Mutex::new(()),
+            applied_revision: std::sync::atomic::AtomicU64::new(0),
             started,
             config_path: config_path.clone(),
             log_reload: Some(log.clone()),
@@ -256,6 +252,13 @@ pub fn run_server_with(
             }),
             benchmark: benchmark.clone(),
         });
+        let resources_restart = Arc::new(AtomicBool::new(false));
+        let watcher = spawn_watcher(
+            provision.clone(),
+            Arc::downgrade(&state),
+            generation.clone(),
+            resources_restart.clone(),
+        );
         // The store's generation (and adopted config) changes together with the swap, so pages
         // waiting for the restart see the new generation's models.
         if !first {
@@ -373,12 +376,16 @@ fn registry_ort_flavor(registry: &ModelRegistry) -> Option<crate::resources::cat
     )
 }
 
-/// Watch the download manager during one generation: log every outcome and, when a runtime
-/// that this generation can use is installed, restart it (sets `restart`, cancels
-/// `generation`). None when nothing is being downloaded.
+/// Watch the download manager during one generation and log every outcome. When a model file
+/// is installed, the models of this generation that failed for want of it reload on their own
+/// (per-model reload, [`server::reload_models`]); models waiting for it load by themselves.
+/// When a runtime that this generation can use is installed, the generation restarts (sets
+/// `restart`, cancels `generation`): runtime libraries are loaded once per generation, when
+/// its `Runtimes` is built. The plan of the latest per-model reload (if any) supersedes
+/// `provision`. None when nothing is being downloaded.
 fn spawn_watcher(
     provision: Arc<Provision>,
-    registry: Arc<ModelRegistry>,
+    state: std::sync::Weak<AppState>,
     generation: CancellationToken,
     restart: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
@@ -402,7 +409,14 @@ fn spawn_watcher(
                     continue;
                 };
                 info!("{text}");
-                let Some(res) = provision
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let registry = state.registry.clone();
+                let plan = registry
+                    .latest_provision()
+                    .unwrap_or_else(|| provision.clone());
+                let Some(res) = plan
                     .resolution
                     .needs
                     .iter()
@@ -411,15 +425,32 @@ fn spawn_watcher(
                 else {
                     continue;
                 };
+                if res.kind.is_model() {
+                    // Failed models that wanted this file (e.g. fetched by hand with
+                    // `auto_download` off): reload just them.
+                    let failed: Vec<String> = registry
+                        .workers()
+                        .iter()
+                        .filter(|w| matches!(w.state.get(), crate::startup::ModelState::Failed(_)))
+                        .filter(|w| plan.blocks(&w.name).iter().any(|b| b.resource.id == id))
+                        .map(|w| w.name.clone())
+                        .collect();
+                    if !failed.is_empty() {
+                        info!(resource = id, models = ?failed, "model file installed; reloading");
+                        server::reload_models(&state, &failed);
+                    }
+                    continue;
+                }
                 // Models not served on their planned device yet: waiting, failed, or loaded on
                 // an interim device while their runtime downloaded.
                 let not_ready: Vec<String> = registry
                     .workers()
                     .iter()
-                    .filter(|w| !w.state.is_ready() || provision.is_blocked_on_runtime(&w.name))
+                    .filter(|w| !w.state.is_ready() || plan.is_blocked_on_runtime(&w.name))
                     .map(|w| w.name.clone())
                     .collect();
-                match provision.restart_for(res, &not_ready) {
+                drop(state);
+                match plan.restart_for(res, &not_ready) {
                     Ok(()) => {
                         info!(
                             resource = id,

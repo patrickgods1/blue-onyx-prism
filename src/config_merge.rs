@@ -756,6 +756,83 @@ pub fn applied_live(changes: &[FieldChange]) -> Vec<String> {
         .collect()
 }
 
+/// `current` with the runtime-level globals (everything [`live_global`] does not list, e.g.
+/// `port`, `device`, `force_cpu`, `cache_dir`) of `running`: what this generation can apply
+/// without a restart. Models, live globals and the benchmark section come from `current`.
+pub fn runtime_overlay(running: &Config, current: &Config) -> Config {
+    let mut obj = config_object(current);
+    for (k, v) in config_object(running) {
+        if !matches!(k.as_str(), "models" | "benchmark" | "default_model") && !live_global(&k) {
+            obj.insert(k, v);
+        }
+    }
+    match serde_json::from_value::<Config>(Value::Object(obj)) {
+        Ok(mut c) => {
+            c.normalize();
+            c
+        }
+        Err(_) => current.clone(),
+    }
+}
+
+/// The enabled entry of model `key` (normalized name).
+fn enabled_model<'a>(c: &'a Config, key: &str) -> Option<&'a ModelConfig> {
+    c.models
+        .iter()
+        .find(|m| m.enabled && normalize_name(&m.effective_name()) == key)
+}
+
+/// The models whose worker has to be replaced, started or stopped to go from `running` to
+/// `next` (same runtime-level globals, see [`runtime_overlay`]): enabled in one and not the
+/// other, or enabled in both with a field other than the live ones ([`LIVE_MODEL_FIELDS`])
+/// changed. Names as `next` spells them (else `running`), in `next` order.
+pub fn model_reloads(running: &Config, next: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for m in next.models.iter().chain(running.models.iter()) {
+        let name = m.effective_name();
+        let key = normalize_name(&name);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let changed = match (enabled_model(running, &key), enabled_model(next, &key)) {
+            (None, None) => false,
+            (Some(r), Some(n)) => {
+                let strip = |m: &ModelConfig| {
+                    let mut o = model_object(m);
+                    for f in LIVE_MODEL_FIELDS {
+                        o.remove(*f);
+                    }
+                    o
+                };
+                strip(r) != strip(n) || running.device_for(r) != next.device_for(n)
+            }
+            _ => true,
+        };
+        if changed {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Put `source`'s entry of model `name` into `target` (replace it, add it at the end, or
+/// remove it when `source` has none): a model whose reload did not happen keeps showing what
+/// runs.
+pub fn keep_model_from(target: &mut Config, source: &Config, name: &str) {
+    let key = normalize_name(name);
+    let is = |m: &ModelConfig| normalize_name(&m.effective_name()) == key;
+    let from = source.models.iter().find(|m| is(m)).cloned();
+    match (target.models.iter().position(is), from) {
+        (Some(i), Some(m)) => target.models[i] = m,
+        (Some(i), None) => {
+            target.models.remove(i);
+        }
+        (None, Some(m)) => target.models.push(m),
+        (None, None) => {}
+    }
+}
+
 /// What a restart would apply, comparing the running config with the current one.
 pub fn pending(running: &Config, current: &Config) -> Pending {
     let mut out = Pending::default();
@@ -1141,6 +1218,77 @@ mod tests {
             assert!(live.contains(&l.to_string()), "{l}: {live:?}");
         }
         assert_eq!(live.len(), 5, "{live:?}");
+    }
+
+    #[test]
+    fn overlay_keeps_runtime_level_globals() {
+        let running = cfg();
+        let mut current = running.clone();
+        current.port = 4000;
+        current.device = "openvino:cpu".into();
+        current.force_cpu = true;
+        current.worker_queue_size = 3;
+        current.confidence_threshold = 0.3;
+        current.request_timeout_secs = 7;
+        current.default_model = Some("yolo26s".into());
+        current.models[1].lazy = true;
+        current.benchmark.warmup = 9;
+        let o = runtime_overlay(&running, &current);
+        assert_eq!(
+            (o.port, o.device.as_str(), o.force_cpu, o.worker_queue_size),
+            (running.port, running.device.as_str(), false, 0)
+        );
+        assert_eq!(o.confidence_threshold, 0.3);
+        assert_eq!(o.request_timeout_secs, 7);
+        assert_eq!(o.default_model.as_deref(), Some("yolo26s"));
+        assert!(o.models[1].lazy);
+        assert_eq!(o.benchmark.warmup, 9);
+        // What stays pending is exactly the runtime-level part (the global device also shows
+        // on each model it moves).
+        let p = pending(&o, &current);
+        assert_eq!(p.global.len(), 3, "{p:?}");
+        assert_eq!(p.process.len(), 1, "{p:?}");
+        assert_eq!(p.for_model("yolo26s"), ["device: auto \u{2192} CPU"]);
+    }
+
+    #[test]
+    fn reloads_for_structural_model_changes_only() {
+        let running = cfg();
+        let mut next = running.clone();
+        assert!(model_reloads(&running, &next).is_empty());
+        // Live fields: no reload.
+        next.models[0].confidence_threshold = Some(0.35);
+        next.models[0].object_filter = Some(vec!["car".into()]);
+        assert!(model_reloads(&running, &next).is_empty());
+        // Device, lazy, a new model, a disabled one.
+        next.models[0].device = Some("openvino:cpu".into());
+        next.models[1].enabled = false;
+        next.models.push(ModelConfig {
+            name: Some("extra".into()),
+            path: "models/extra.onnx".into(),
+            ..Default::default()
+        });
+        next.models.push(ModelConfig {
+            name: Some("off".into()),
+            path: "models/off.onnx".into(),
+            enabled: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            model_reloads(&running, &next),
+            ["IPcam-general", "yolo26s", "extra"]
+        );
+        // Removed from the config.
+        let mut gone = running.clone();
+        gone.models.remove(1);
+        assert_eq!(model_reloads(&running, &gone), ["yolo26s"]);
+        // A model whose reload did not happen keeps its running entry.
+        keep_model_from(&mut next, &running, "extra");
+        keep_model_from(&mut next, &running, "IPcam-general");
+        assert_eq!(model_reloads(&running, &next), ["yolo26s"]);
+        let mut back = gone.clone();
+        keep_model_from(&mut back, &running, "yolo26s");
+        assert!(model_reloads(&running, &back).is_empty());
     }
 
     #[test]
