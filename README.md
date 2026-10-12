@@ -605,8 +605,10 @@ RENDER_GID=$(getent group render | cut -d: -f3) docker compose up -d --build
 
 Put models in `deploy/models` and a `blue_onyx_prism_config.json` in `deploy/config`.
 In Docker every client, the host's browser included, reaches the service from the bridge
-network, not loopback: set `"allow_remote_admin": true` in that config to use the Config, Test, Logs
-and Benchmark pages (see [Remote access](#remote-access)).
+network, not loopback: `deploy/docker-config.json` therefore ships with `"allow_remote_admin": true`
+so the Config, Test, Logs and Benchmark pages work; keep it in your own config, and publish the port
+on the host's loopback only (`-p 127.0.0.1:32168:32168`) if the host should be the only admin (see
+[Remote access](#remote-access)).
 
 ## HTTP API
 

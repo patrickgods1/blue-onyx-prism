@@ -69,7 +69,9 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 
 ## Architecture (see the plan in the repo history / README for detail)
 
-- `src/server.rs` axum HTTP (one tokio current-thread runtime). Blue Iris calls
+- `src/server.rs` axum HTTP (2-thread tokio runtime; fs-heavy handlers run in `server::blocking`). The
+  listener is bound once per process (`bind` + `serve_on`) and serves `Shared`, the swappable current
+  `AppState`; admin routes answer loopback peers only unless `allow_remote_admin`. Blue Iris calls
   `POST /v1/vision/detection` (default model) and `POST /v1/vision/custom/{model}` (named model),
   `POST /v1/vision/custom/list`. Responses use `api.rs` structs (camelCase; `Prediction` snake_case).
 - `src/registry.rs` loads N models from config sequentially on one `Core`; each model gets its own
