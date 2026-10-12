@@ -1200,7 +1200,7 @@ mod tests {
 
     /// Requests come from this machine (the admin routes refuse remote clients).
     fn local(req: Request<Body>) -> Request<Body> {
-        crate::server::tests::from_peer(req, "127.0.0.1:50000")
+        crate::server::test_util::from_peer(req, "127.0.0.1:50000")
     }
 
     fn post(uri: &str, body: &str) -> Request<Body> {
