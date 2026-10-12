@@ -5,93 +5,20 @@
 //! per-model reload) and the in-process restart (`runner::run_server_on`, as used by the binary
 //! and the Windows service) is covered too.
 //!
-//! Real OpenVINO: skips (passes with a message) unless `models/IPcam-general.onnx` (and, for the
-//! switch test, `models/rt-detrv2-s.onnx`) and `openvino/` exist under the repo root (or
-//! `BLUE_ONYX_TEST_ROOT`).
+//! Real OpenVINO, `#[ignore]`d: needs `models/IPcam-general.{onnx,yaml}` and `openvino/` under
+//! `common::test_root()` (a missing one fails the test). The switch test serves
+//! `models/rt-detrv2-s.onnx` as its second model when present; without it the entry named
+//! `rt-detrv2-s` is backed by a second copy of IPcam-general (the switching logic is the same,
+//! only the COCO label check is skipped).
+
+mod common;
 
 use blue_onyx_prism::api::VisionDetectionResponse;
-use blue_onyx_prism::cli::{self, LogReloadHandle};
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};
-use blue_onyx_prism::metrics::Metrics;
 use blue_onyx_prism::model::ModelFamilyKind;
-use blue_onyx_prism::registry::ModelRegistry;
-use blue_onyx_prism::runner;
-use blue_onyx_prism::server::{self, AppState};
-use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use common::{Server, list_models, post_form, post_image, temp_dir, wait_until};
+use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
-
-const TEST_IMAGE: &str = "tests/data/dog_bike_car.jpg";
-
-fn repo_root() -> PathBuf {
-    std::env::var_os("BLUE_ONYX_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("free port")
-}
-
-async fn post_image(client: &reqwest::Client, url: &str, bytes: &[u8]) -> VisionDetectionResponse {
-    let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-        .file_name("dog_bike_car.jpg")
-        .mime_str("image/jpeg")
-        .unwrap();
-    let form = reqwest::multipart::Form::new().part("image", part);
-    let resp = client.post(url).multipart(form).send().await.expect("POST");
-    assert!(resp.status().is_success(), "HTTP {}", resp.status());
-    resp.json().await.expect("detection JSON")
-}
-
-struct Running {
-    base: String,
-    token: CancellationToken,
-    server: tokio::task::JoinHandle<anyhow::Result<()>>,
-    registry: Arc<ModelRegistry>,
-}
-
-impl Running {
-    async fn start(config: Config) -> Self {
-        let token = CancellationToken::new();
-        let metrics = Arc::new(Metrics::new(blue_onyx_prism::VERSION));
-        let registry =
-            Arc::new(ModelRegistry::start(&config, &metrics, token.clone()).expect("registry"));
-        let config_path = std::env::temp_dir().join(format!(
-            "bo_en_config_{}_{}.json",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let state = Arc::new(AppState::new(
-            registry.clone(),
-            metrics,
-            config,
-            config_path,
-        ));
-        let port = free_port();
-        let listeners = server::bind([0, 0, 0, 0].into(), port).await.expect("bind");
-        let server = tokio::spawn(server::serve_on(listeners, state.into(), token.clone()));
-        Self {
-            base: format!("http://127.0.0.1:{port}"),
-            token,
-            server,
-            registry,
-        }
-    }
-
-    async fn stop(self) {
-        self.token.cancel();
-        self.server.await.unwrap().unwrap();
-        if let Ok(reg) = Arc::try_unwrap(self.registry) {
-            reg.shutdown();
-        }
-    }
-}
 
 /// GET `path`, retrying until the listener is up.
 async fn get_text(client: &reqwest::Client, url: &str) -> String {
@@ -108,24 +35,14 @@ async fn get_text(client: &reqwest::Client, url: &str) -> String {
 }
 
 #[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn disabled_models_are_not_served() {
-    let root = repo_root();
-    let model = root.join("models").join("IPcam-general.onnx");
-    let ov_dir = root.join("openvino");
-    if !model.is_file() || !ov_dir.is_dir() {
-        eprintln!(
-            "skipping disabled_models_are_not_served: need {} and {}",
-            model.display(),
-            ov_dir.display()
-        );
-        return;
-    }
-    let image = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TEST_IMAGE))
-        .expect("test image");
-    let cache = std::env::temp_dir().join(format!("bo_en_cache_{}", std::process::id()));
+    let model = common::require_ipcam();
+    let ov_dir = common::require_openvino();
+    let image = common::test_image();
     let base_config = Config {
         force_cpu: true,
-        cache_dir: cache.to_string_lossy().to_string(),
+        cache_dir: common::cache_dir("en"),
         openvino_dir: Some(ov_dir),
         ..Default::default()
     };
@@ -138,7 +55,7 @@ async fn disabled_models_are_not_served() {
         models: vec![
             ModelConfig {
                 name: Some("off-model".into()),
-                path: root.join("models").join("does-not-exist.onnx"),
+                path: common::models_dir().join("does-not-exist.onnx"),
                 enabled: false,
                 ..Default::default()
             },
@@ -151,16 +68,16 @@ async fn disabled_models_are_not_served() {
         ..base_config.clone()
     };
     let t0 = Instant::now();
-    let run = Running::start(config).await;
-    assert_eq!(run.registry.names(), ["IPcam-general"]);
+    let run = Server::start_in_process(config).await;
+    assert_eq!(run.registry().names(), ["IPcam-general"]);
     assert_eq!(
-        run.registry
+        run.registry()
             .default_model()
             .map(|w| w.name.clone())
             .as_deref(),
         Some("IPcam-general")
     );
-    assert!(run.registry.by_name("off-model").is_none());
+    assert!(run.registry().by_name("off-model").is_none());
 
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
@@ -225,9 +142,9 @@ async fn disabled_models_are_not_served() {
         }],
         ..base_config
     };
-    let run = Running::start(config).await;
-    assert!(run.registry.names().is_empty());
-    assert!(run.registry.default_model().is_none());
+    let run = Server::start_in_process(config).await;
+    assert!(run.registry().names().is_empty());
+    assert!(run.registry().default_model().is_none());
     let home = get_text(&client, &format!("{}/", run.base)).await;
     assert!(home.contains("No models are enabled"), "{home}");
     let cfg = get_text(&client, &format!("{}/config", run.base)).await;
@@ -251,74 +168,6 @@ async fn disabled_models_are_not_served() {
 
 // ---------------------------------------------------------------------------------------------
 // In-process restart through the production run loop
-
-/// The global subscriber can be installed once per test binary; every server shares the handle.
-fn log_handle() -> LogReloadHandle {
-    static LOG: OnceLock<LogReloadHandle> = OnceLock::new();
-    LOG.get_or_init(|| cli::init_logging(LogLevel::Warn, None).expect("init logging"))
-        .clone()
-}
-
-/// `runner::run_server_on` (registry + HTTP generations, reload on `POST /config/restart`) on
-/// its own thread and runtime, exactly like the binary.
-struct Served {
-    base: String,
-    shutdown: CancellationToken,
-    thread: std::thread::JoinHandle<anyhow::Result<()>>,
-}
-
-impl Served {
-    fn start(config: Config, config_path: PathBuf) -> Self {
-        config.save(&config_path).expect("write config");
-        let base = format!("http://127.0.0.1:{}", config.port);
-        let shutdown = CancellationToken::new();
-        let token = shutdown.clone();
-        let log = log_handle();
-        let thread = std::thread::spawn(move || {
-            let rt = runner::build_runtime()?;
-            runner::run_server_on(&rt, config, config_path, log, token)
-        });
-        Self {
-            base,
-            shutdown,
-            thread,
-        }
-    }
-
-    fn stop(self) {
-        self.shutdown.cancel();
-        self.thread
-            .join()
-            .expect("server thread panicked")
-            .expect("server result");
-    }
-}
-
-/// Poll `check` every 100 ms until it returns true; panic after `timeout`.
-async fn wait_until<F, Fut>(what: &str, timeout: Duration, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let deadline = Instant::now() + timeout;
-    while !check().await {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// `/v1/vision/custom/list` model names, None while the server is down (between generations).
-async fn list_models(client: &reqwest::Client, base: &str) -> Option<Vec<String>> {
-    let v: serde_json::Value = client
-        .post(format!("{base}/v1/vision/custom/list"))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    serde_json::from_value(v["models"].clone()).ok()
-}
 
 /// Home page body, None while the server is down.
 async fn home(client: &reqwest::Client, base: &str) -> Option<String> {
@@ -369,32 +218,10 @@ async fn prom_requests(client: &reqwest::Client, base: &str, model: &str) -> Opt
         .map(|v| v.parse().expect("numeric sample"))
 }
 
-async fn post_form(client: &reqwest::Client, url: &str, body: &str) -> String {
-    let resp = client
-        .post(url)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(body.to_string())
-        .send()
-        .await
-        .expect("POST form");
-    assert!(resp.status().is_success(), "{url}: HTTP {}", resp.status());
-    resp.text().await.expect("form response")
-}
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bo_en_{tag}_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn base_config(ov_dir: &Path) -> Config {
     Config {
-        port: free_port(),
         force_cpu: true,
-        cache_dir: std::env::temp_dir()
-            .join(format!("bo_en_cache_{}", std::process::id()))
-            .to_string_lossy()
-            .to_string(),
+        cache_dir: common::cache_dir("en"),
         openvino_dir: Some(ov_dir.to_path_buf()),
         log_level: LogLevel::Warn,
         ..Default::default()
@@ -406,22 +233,16 @@ fn labels(r: &VisionDetectionResponse) -> Vec<String> {
 }
 
 #[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn switch_models_with_restart() {
-    let root = repo_root();
-    let ipcam = root.join("models").join("IPcam-general.onnx");
-    let rtdetr = root.join("models").join("rt-detrv2-s.onnx");
-    let ov_dir = root.join("openvino");
-    if !ipcam.is_file() || !rtdetr.is_file() || !ov_dir.is_dir() {
-        eprintln!(
-            "skipping switch_models_with_restart: need {}, {} and {}",
-            ipcam.display(),
-            rtdetr.display(),
-            ov_dir.display()
-        );
-        return;
-    }
-    let image = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TEST_IMAGE))
-        .expect("test image");
+    let ipcam = common::require_ipcam();
+    let ov_dir = common::require_openvino();
+    let (rtdetr, rt_family) = match common::optional_model("rt-detrv2-s.onnx") {
+        Some(p) => (p, ModelFamilyKind::RtDetr),
+        None => (ipcam.clone(), ModelFamilyKind::Yolo5),
+    };
+    let real_rtdetr = rt_family == ModelFamilyKind::RtDetr;
+    let image = common::test_image();
     let config_path = temp_dir("switch").join("cfg.json");
     let config = Config {
         models: vec![
@@ -434,7 +255,7 @@ async fn switch_models_with_restart() {
             ModelConfig {
                 name: Some("rt-detrv2-s".into()),
                 path: rtdetr,
-                family: ModelFamilyKind::RtDetr,
+                family: rt_family,
                 enabled: false,
                 ..Default::default()
             },
@@ -443,7 +264,7 @@ async fn switch_models_with_restart() {
     };
     let client = reqwest::Client::new();
     let t0 = Instant::now();
-    let served = Served::start(config, config_path.clone());
+    let served = Server::start(config, config_path.clone()).await;
     let base = served.base.clone();
     wait_serving(&client, &base, &["IPcam-general"]).await;
     eprintln!(
@@ -487,7 +308,9 @@ async fn switch_models_with_restart() {
 
     let r = post_image(&client, &format!("{base}/v1/vision/detection"), &image).await;
     assert!(r.success, "detection failed: {r:?}");
-    assert!(labels(&r).iter().any(|l| l == "dog"), "no dog: {r:?}");
+    if real_rtdetr {
+        assert!(labels(&r).iter().any(|l| l == "dog"), "no dog: {r:?}");
+    }
     let r = post_image(
         &client,
         &format!("{base}/v1/vision/custom/IPcam-general"),
@@ -600,24 +423,15 @@ async fn switch_models_with_restart() {
         .expect("IPcam-general series");
     assert_eq!(count_after, count_before + 1);
 
-    served.stop();
+    served.stop().await;
 }
 
 #[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn restart_into_zero_enabled_models_keeps_http_up() {
-    let root = repo_root();
-    let model = root.join("models").join("IPcam-general.onnx");
-    let ov_dir = root.join("openvino");
-    if !model.is_file() || !ov_dir.is_dir() {
-        eprintln!(
-            "skipping restart_into_zero_enabled_models_keeps_http_up: need {} and {}",
-            model.display(),
-            ov_dir.display()
-        );
-        return;
-    }
-    let image = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TEST_IMAGE))
-        .expect("test image");
+    let model = common::require_ipcam();
+    let ov_dir = common::require_openvino();
+    let image = common::test_image();
     let config_path = temp_dir("zero").join("cfg.json");
     let config = Config {
         models: vec![ModelConfig {
@@ -628,7 +442,7 @@ async fn restart_into_zero_enabled_models_keeps_http_up() {
         ..base_config(&ov_dir)
     };
     let client = reqwest::Client::new();
-    let served = Served::start(config.clone(), config_path.clone());
+    let served = Server::start(config.clone(), config_path.clone()).await;
     let base = served.base.clone();
     wait_serving(&client, &base, &["IPcam-general"]).await;
 
@@ -658,5 +472,5 @@ async fn restart_into_zero_enabled_models_keeps_http_up() {
     assert!(cfg.contains("action=\"/config/models#at-models\""), "{cfg}");
     assert!(cfg.contains("aria-label=\"Load IPcam-general\">"), "{cfg}");
 
-    served.stop();
+    served.stop().await;
 }

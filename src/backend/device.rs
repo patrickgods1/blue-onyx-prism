@@ -28,10 +28,15 @@ pub(crate) const DEFAULT_IMAGE_SHAPE: [i64; 4] = [
 ];
 
 /// `[1, 3, H, W]` for a model at `path` whose image input has dynamic dimensions: the size from
-/// [`crate::model::dynamic_input_size`] (catalog, Hugging Face `preprocessor_config.json`,
-/// RF-DETR default, else 640).
+/// [`crate::model::dynamic_input_size`] (catalog size by file name, Hugging Face
+/// `preprocessor_config.json`, RF-DETR default, else 640). The catalog lookup happens here so
+/// the model layer stays independent of `crate::resources`.
 pub(crate) fn dynamic_image_shape(path: &std::path::Path, outputs: &[PortSpec]) -> [i64; 4] {
-    let (w, h) = crate::model::dynamic_input_size(path, outputs);
+    let catalog_hint = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .and_then(crate::resources::catalog::model_input_size);
+    let (w, h) = crate::model::dynamic_input_size(path, outputs, catalog_hint);
     [1, 3, h as i64, w as i64]
 }
 /// Static shape for RT-DETR's `orig_target_sizes` when dynamic.
@@ -1060,6 +1065,19 @@ mod tests {
         assert_eq!(
             dynamic_image_shape(Path::new("m/rfdetr-small.onnx"), &out(91)),
             [1, 3, 512, 512]
+        );
+        // Catalog sizes by file name (case-insensitive), wired through as the hint.
+        assert_eq!(
+            dynamic_image_shape(Path::new("models/rfdetr-nano.onnx"), &[]),
+            [1, 3, 384, 384]
+        );
+        assert_eq!(
+            dynamic_image_shape(Path::new("x/RFDETR-MEDIUM.onnx"), &out(91)),
+            [1, 3, 576, 576]
+        );
+        assert_eq!(
+            dynamic_image_shape(Path::new("models/dfine-s.onnx"), &[]),
+            DEFAULT_IMAGE_SHAPE
         );
     }
 

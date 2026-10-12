@@ -10,6 +10,7 @@
 use crate::image::RgbImage;
 use crate::model::preprocess::Preprocessor;
 use crate::model::{Family, Normalization, PreprocessCtx, ResizeMode};
+use crate::sync::LockExt;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
@@ -112,8 +113,7 @@ impl TensorPool {
     pub fn take(self: &Arc<Self>, len: usize) -> PooledBuf {
         let buf = self
             .free
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_recover()
             .get_mut(&len)
             .and_then(Vec::pop)
             .unwrap_or_else(|| Vec::with_capacity(len));
@@ -126,15 +126,11 @@ impl TensorPool {
 
     /// Buffers currently free for `len`.
     pub fn free_count(&self, len: usize) -> usize {
-        self.free
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&len)
-            .map_or(0, Vec::len)
+        self.free.lock_recover().get(&len).map_or(0, Vec::len)
     }
 
     fn give_back(&self, len: usize, buf: Vec<f32>) {
-        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        let mut free = self.free.lock_recover();
         let list = free.entry(len).or_default();
         if list.len() < MAX_POOLED_PER_LEN {
             list.push(buf);

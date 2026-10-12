@@ -30,6 +30,7 @@ mod service {
     use blue_onyx_prism::backend::libs;
     use blue_onyx_prism::cli::{self, ExtraLogLayer, LogReloadHandle};
     use blue_onyx_prism::config::{Config, LogLevel};
+    use blue_onyx_prism::sync::LockExt;
     use blue_onyx_prism::{resolve_path, runner, system_info};
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -181,7 +182,7 @@ mod service {
                     ServiceControl::UserEvent(code) if code.to_raw() == CONTROL_RESTART => {
                         info!("restart requested (control code {CONTROL_RESTART})");
                         restart_requested.store(true, Ordering::SeqCst);
-                        current.lock().unwrap_or_else(|e| e.into_inner()).cancel();
+                        current.lock_recover().cancel();
                         ServiceControlHandlerResult::NoError
                     }
                     _ => ServiceControlHandlerResult::NotImplemented,
@@ -286,7 +287,7 @@ mod service {
         let mut last_error: Option<String> = None;
         while !stop.is_cancelled() {
             let attempt = stop.child_token();
-            *current.lock().unwrap_or_else(|e| e.into_inner()) = attempt.clone();
+            *current.lock_recover() = attempt.clone();
             restart_requested.store(false, Ordering::SeqCst);
 
             let result = match loaded.take().unwrap_or_else(cli::for_service) {

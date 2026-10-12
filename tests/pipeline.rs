@@ -5,42 +5,28 @@
 //! images (answered as errors without disturbing the other slots) and a shutdown while
 //! inferences are in flight.
 //!
-//! Skips (passes with a message) unless `models/IPcam-general.onnx`, `models/yolo26n.xml` and
-//! `openvino/` exist under the repo root (`BLUE_ONYX_TEST_ROOT` overrides the root).
+//! `#[ignore]`d: needs `models/IPcam-general.{onnx,yaml}` and `openvino/` under
+//! `common::test_root()` (a missing one fails the test). The second model is `models/yolo26n.xml`
+//! when present, else a second copy of IPcam-general.
+
+mod common;
 
 use blue_onyx_prism::api::VisionDetectionResponse;
 use blue_onyx_prism::config::{Config, ModelConfig};
-use blue_onyx_prism::metrics::{DropReason, Metrics};
+use blue_onyx_prism::metrics::DropReason;
 use blue_onyx_prism::model::ModelFamilyKind;
-use blue_onyx_prism::registry::ModelRegistry;
-use blue_onyx_prism::server::{self, AppState};
 use blue_onyx_prism::startup::ModelState;
 use blue_onyx_prism::worker::ORDER_TARGET;
+use common::Server;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
-const TEST_IMAGE: &str = "tests/data/dog_bike_car.jpg";
 const CLIENTS: usize = 6;
 const REQUESTS: usize = 200;
-
-fn repo_root() -> PathBuf {
-    std::env::var_os("BLUE_ONYX_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("free port")
-}
 
 /// One worker order event: (message, model, image).
 type OrderEvent = (String, String, String);
@@ -124,32 +110,33 @@ fn assert_fifo(events: &[OrderEvent], expect_total: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn pipelined_worker_keeps_order_under_load() {
-    let root = repo_root();
-    let general = root.join("models").join("IPcam-general.onnx");
-    let yolo = root.join("models").join("yolo26n.xml");
-    let ov_dir = root.join("openvino");
-    if !general.is_file() || !yolo.is_file() || !ov_dir.is_dir() {
-        eprintln!(
-            "skipping pipelined_worker_keeps_order_under_load: need {}, {} and {}",
-            general.display(),
-            yolo.display(),
-            ov_dir.display()
-        );
-        return;
-    }
+    let general = common::require_ipcam();
+    let ov_dir = common::require_openvino();
+    // The second model: YOLO26n when exported, else another copy of the required model.
+    let second = match common::optional_model("yolo26n.xml") {
+        Some(path) => ModelConfig {
+            path,
+            ..Default::default()
+        },
+        None => ModelConfig {
+            name: Some("IPcam-general-2".into()),
+            path: general.clone(),
+            family: ModelFamilyKind::Yolo5,
+            ..Default::default()
+        },
+    };
     let events: Arc<Mutex<Vec<OrderEvent>>> = Arc::default();
     let subscriber = tracing_subscriber::registry().with(OrderLayer(events.clone()));
     tracing::subscriber::set_global_default(subscriber).expect("global subscriber");
 
-    let image = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TEST_IMAGE))
-        .expect("test image");
-    let cache = std::env::temp_dir().join(format!("bo_pipe_cache_{}", std::process::id()));
+    let image = common::test_image();
     // Two models on the CPU: the default one with two inferences in flight (exercises the slots
     // and the async path on any machine), the second with the profile's count.
     let config = Config {
         device: "openvino:cpu".into(),
-        cache_dir: cache.to_string_lossy().to_string(),
+        cache_dir: common::cache_dir("pipe"),
         openvino_dir: Some(ov_dir),
         preprocess_threads: 4,
         auto_download: false,
@@ -160,34 +147,13 @@ async fn pipelined_worker_keeps_order_under_load() {
                 inflight: Some(2),
                 ..Default::default()
             },
-            ModelConfig {
-                path: yolo,
-                ..Default::default()
-            },
+            second,
         ],
         ..Default::default()
     };
-    let token = CancellationToken::new();
-    let metrics = Arc::new(Metrics::new(blue_onyx_prism::VERSION));
-    let registry =
-        Arc::new(ModelRegistry::start(&config, &metrics, token.clone()).expect("registry"));
-    let config_path = std::env::temp_dir().join(format!(
-        "bo_pipe_config_{}_{}.json",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let state = Arc::new(AppState::new(
-        registry.clone(),
-        metrics.clone(),
-        config,
-        config_path,
-    ));
-    let port = free_port();
-    let listeners = server::bind([127, 0, 0, 1].into(), port)
-        .await
-        .expect("bind");
-    let server = tokio::spawn(server::serve_on(listeners, state.into(), token.clone()));
-    let base = format!("http://127.0.0.1:{port}");
+    let server = Server::start_in_process(config).await;
+    let (base, metrics) = (server.base.clone(), server.metrics().clone());
+    let registry = server.registry().clone();
 
     let deadline = Instant::now() + Duration::from_secs(180);
     while !registry
@@ -285,18 +251,11 @@ async fn pipelined_worker_keeps_order_under_load() {
         })
         .collect();
     tokio::time::sleep(Duration::from_millis(60)).await;
-    token.cancel();
-    server.await.unwrap().unwrap();
+    server.cancel();
+    drop(registry);
+    server.stop().await;
     for t in inflight {
         let _ = t.await;
     }
-    let reg = Arc::try_unwrap(registry).unwrap_or_else(|_| panic!("registry still shared"));
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        reg.shutdown();
-        let _ = tx.send(());
-    });
-    rx.recv_timeout(Duration::from_secs(30))
-        .expect("workers did not stop after the shutdown token was cancelled");
     eprintln!("shutdown phase {:.1} s", t_shutdown.elapsed().as_secs_f64());
 }

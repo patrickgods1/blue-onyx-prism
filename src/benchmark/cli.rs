@@ -24,11 +24,12 @@ use super::{
     sweep,
 };
 use crate::backend::{CoreOptions, OrtOptions, Runtimes, libs, spec};
-use crate::config::{
-    Config, DatasetRef, DeviceChange, ModelConfig, ThresholdChange, apply_model_devices,
-    apply_model_thresholds,
+use crate::config::{Config, DatasetRef, ModelConfig};
+use crate::config_form::{
+    DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
 };
 use crate::model::{ModelFamilyKind, PostParams};
+use crate::sync::LockExt;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -41,7 +42,7 @@ pub struct BenchArgs {
     #[arg(long)]
     pub model: Vec<PathBuf>,
     /// Model family for --model (default: auto-detect).
-    #[arg(long, value_enum)]
+    #[arg(long, value_parser = crate::cli::family_parser())]
     pub family: Option<ModelFamilyKind>,
     /// Class names YAML for --model (default: <model>.yaml beside the model, else COCO-80).
     #[arg(long)]
@@ -464,45 +465,18 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         list_datasets(&config);
         return Ok(true);
     }
-    if args.threshold_search {
-        let results = BenchmarkResults::load(&results_path(&config_path))?;
-        let preds = super::search::StoredPreds::load(&super::search::preds_path(&config_path))?;
-        match (results, preds) {
-            (Some(r), Some(p)) if !p.runs.is_empty() => {
-                return threshold_search_cli(&args, &config, &r, &p);
-            }
-            _ => {
-                if !args.json {
-                    eprintln!(
-                        "--threshold-search: no stored predictions beside {}; running the benchmark first",
-                        config_path.display()
-                    );
-                }
-            }
-        }
+    if args.threshold_search
+        && let Some(ok) = stored_threshold_search(&args, &config, &config_path)?
+    {
+        return Ok(ok);
     }
-    if (args.apply || args.apply_threshold) && !config_path.exists() {
-        bail!(
-            "{} needs a config file; {} does not exist",
-            if args.apply {
-                "--apply"
-            } else {
-                "--apply-threshold"
-            },
-            config_path.display()
-        );
-    }
+    check_args(&args, &config_path)?;
     let objective = args
         .threshold_objective
         .unwrap_or(config.benchmark.threshold_objective);
     let metric = args
         .accuracy_metric
         .unwrap_or(config.benchmark.accuracy_metric);
-    if let Some(w) = args.accuracy_weight
-        && !(0.0..=1.0).contains(&w)
-    {
-        bail!("--accuracy-weight must be between 0 and 1");
-    }
     let all_devices = args.all_devices
         || args.apply
         || args.apply_threshold
@@ -517,6 +491,110 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     let mut errors = Vec::new();
     let jobs = jobs(&args, &config, &mut errors)?;
     let (mut sets, warnings) = load_sets(&args, &config)?;
+    let (repeat, warmup, weights) = timing_settings(&args, &config, &sets);
+    let cache_dir = cache_dir_arg(&args, &config);
+    let runtimes = open_runtimes(
+        &args,
+        &config,
+        &config_path,
+        cache_dir.clone(),
+        openvino_dir,
+    )?;
+    let info = runtimes.info();
+    let versions = RuntimeVersions::of(&runtimes);
+    let runtimes = Mutex::new(runtimes);
+    let mut report = Report::new(info, errors, &sets, warnings);
+    if !args.json {
+        print_header(
+            &report,
+            &versions,
+            cache_dir.as_deref(),
+            &sets,
+            warmup,
+            repeat,
+        );
+    }
+
+    let params = PostParams {
+        confidence_threshold: args.min_confidence.unwrap_or(config.confidence_threshold),
+        nms_iou: config.nms_iou,
+    };
+    let progress = cli_progress(args.json);
+
+    // `benchmark.devices` of the config limits the sweep, as on the web UI's Benchmark page,
+    // and the pseudo-ground-truth device.
+    let sweep_devices = super::service::parse_devices(&config.benchmark.devices)
+        .context("benchmark.devices in the config")?;
+    let ctx = RunCtx {
+        args: &args,
+        config: &config,
+        config_path: &config_path,
+        runtimes: &runtimes,
+        sweep_devices: &sweep_devices,
+        objective,
+        metric,
+        weights,
+    };
+
+    // Pseudo ground truth for datasets without it (accuracy relative to a reference model).
+    if sets.iter().any(|s| !s.annotated()) {
+        let mut pb = Bench::new(&[], 0, 1, params);
+        pb.cache_dir = cache_dir.as_deref();
+        pb.progress = Some(&progress);
+        ctx.pseudo_ground_truth(&pb, &jobs, &mut sets, &mut report);
+    }
+
+    let mut bench = Bench::new(&sets, warmup, repeat, params);
+    bench.object_filter = &config.object_filter;
+    bench.cache_dir = cache_dir.as_deref();
+    bench.weights = weights;
+    bench.threshold_objective = objective;
+    bench.accuracy_metric = metric;
+
+    let swept = ctx.run_jobs(&mut bench, &progress, &jobs, all_devices, &mut report)?;
+
+    if all_devices
+        && !swept.is_empty()
+        && let Some(ok) = ctx.finish_sweep(&sets, versions, &swept, &mut report)?
+    {
+        return Ok(ok);
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    }
+    Ok(report.errors.is_empty())
+}
+
+/// The checks of `args` that need no runtime: `--apply` / `--apply-threshold` need an existing
+/// config file, `--accuracy-weight` is within 0..1.
+fn check_args(args: &BenchArgs, config_path: &Path) -> Result<()> {
+    if (args.apply || args.apply_threshold) && !config_path.exists() {
+        bail!(
+            "{} needs a config file; {} does not exist",
+            if args.apply {
+                "--apply"
+            } else {
+                "--apply-threshold"
+            },
+            config_path.display()
+        );
+    }
+    if let Some(w) = args.accuracy_weight
+        && !(0.0..=1.0).contains(&w)
+    {
+        bail!("--accuracy-weight must be between 0 and 1");
+    }
+    Ok(())
+}
+
+/// (timed runs per image, warm-up iterations, grade weights) of a run over `sets`: the flags,
+/// else the config (a single image defaults to [`SINGLE_IMAGE_REPEAT`] runs).
+fn timing_settings(
+    args: &BenchArgs,
+    config: &Config,
+    sets: &[ImageSet],
+) -> (usize, usize, super::grade::Weights) {
     let image_total: usize = sets.iter().map(|s| s.images.len()).sum();
     let repeat = args.repeat.unwrap_or(if image_total == 1 {
         SINGLE_IMAGE_REPEAT
@@ -531,14 +609,54 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         },
         None => config.benchmark.weights,
     };
+    (repeat, warmup, weights)
+}
 
-    let cache_dir = match &args.cache_dir {
+/// The compiled-model cache directory: `--cache-dir` ("" disables), else the config's.
+fn cache_dir_arg(args: &BenchArgs, config: &Config) -> Option<PathBuf> {
+    match &args.cache_dir {
         Some(d) if d.trim().is_empty() => None,
         Some(d) => Some(PathBuf::from(d)),
         None => config.cache_dir_path(),
-    };
+    }
+}
+
+/// `--threshold-search` over the predictions stored beside the config: Some(outcome) when
+/// there are any, None (after a note) when the benchmark must run first.
+fn stored_threshold_search(
+    args: &BenchArgs,
+    config: &Config,
+    config_path: &Path,
+) -> Result<Option<bool>> {
+    let results = BenchmarkResults::load(&results_path(config_path))?;
+    let preds = super::search::StoredPreds::load(&super::search::preds_path(config_path))?;
+    match (results, preds) {
+        (Some(r), Some(p)) if !p.runs.is_empty() => {
+            threshold_search_cli(args, config, &r, &p).map(Some)
+        }
+        _ => {
+            if !args.json {
+                eprintln!(
+                    "--threshold-search: no stored predictions beside {}; running the benchmark first",
+                    config_path.display()
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// The runtimes of a run, with `auto` models resolved as the server would run them (the
+/// configured device of a sweep, ordered by the stored results).
+fn open_runtimes(
+    args: &BenchArgs,
+    config: &Config,
+    config_path: &Path,
+    cache_dir: Option<PathBuf>,
+    openvino_dir: Option<PathBuf>,
+) -> Result<Runtimes> {
     let opts = CoreOptions {
-        cache_dir: cache_dir.clone(),
+        cache_dir,
         intra_threads: args.threads.unwrap_or(config.intra_threads),
         openvino_dir,
     };
@@ -547,74 +665,67 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     runtimes.require_any()?;
     // `auto` models resolve as the server would run them (the configured device of a sweep).
     let orders = super::auto_orders(
-        BenchmarkResults::load_or_warn(&results_path(&config_path)).as_ref(),
-        &config,
+        BenchmarkResults::load_or_warn(&results_path(config_path)).as_ref(),
+        config,
         config.enabled_models(),
         runtimes.hardware(),
     );
     runtimes.set_measured_orders(orders);
-    let info = runtimes.info();
-    let versions = RuntimeVersions::of(&runtimes);
-    let runtimes = Mutex::new(runtimes);
-    let mut report = Report {
-        version: crate::VERSION,
-        openvino_version: info.openvino_version,
-        available_devices: info.available_devices,
-        models: Vec::new(),
-        errors,
-        results_file: None,
-        applied: Vec::new(),
-        applied_thresholds: Vec::new(),
-        datasets: sets.iter().map(|s| s.id.clone()).collect(),
-        warnings,
-        ranking: Vec::new(),
-    };
-    if !args.json {
-        println!(
-            "Blue Onyx Prism {} benchmark | OpenVINO {} | ONNX Runtime {} | devices {:?} | cache {}",
-            report.version,
-            report.openvino_version,
-            versions
-                .onnxruntime
-                .as_deref()
-                .map(|v| match &versions.onnxruntime_flavor {
-                    Some(f) => format!("{v} ({f})"),
-                    None => v.to_string(),
-                })
-                .unwrap_or_else(|| "not loaded".into()),
-            report.available_devices,
-            cache_dir
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "disabled".into())
-        );
-        let names: Vec<String> = sets
-            .iter()
-            .map(|s| {
-                format!(
-                    "{} ({} images, {})",
-                    s.id,
-                    s.images.len(),
-                    s.ground_truth.describe()
-                )
-            })
-            .collect();
-        println!("datasets: {}", names.join("; "));
-        println!("warmup {warmup} | {repeat} timed run(s) per image");
-        for w in &report.warnings {
-            eprintln!("warning: {w}");
-        }
-        for e in &report.errors {
-            eprintln!("error: {e}");
-        }
-    }
+    Ok(runtimes)
+}
 
-    let params = PostParams {
-        confidence_threshold: args.min_confidence.unwrap_or(config.confidence_threshold),
-        nms_iou: config.nms_iou,
-    };
-    let quiet = args.json;
-    let progress = move |p: &super::Progress| {
+/// The banner of a table run: versions, devices, cache, datasets, iterations, then the
+/// warnings and errors so far (stderr).
+fn print_header(
+    report: &Report,
+    versions: &RuntimeVersions,
+    cache_dir: Option<&Path>,
+    sets: &[ImageSet],
+    warmup: usize,
+    repeat: usize,
+) {
+    println!(
+        "Blue Onyx Prism {} benchmark | OpenVINO {} | ONNX Runtime {} | devices {:?} | cache {}",
+        report.version,
+        report.openvino_version,
+        versions
+            .onnxruntime
+            .as_deref()
+            .map(|v| match &versions.onnxruntime_flavor {
+                Some(f) => format!("{v} ({f})"),
+                None => v.to_string(),
+            })
+            .unwrap_or_else(|| "not loaded".into()),
+        report.available_devices,
+        cache_dir
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "disabled".into())
+    );
+    let names: Vec<String> = sets
+        .iter()
+        .map(|s| {
+            format!(
+                "{} ({} images, {})",
+                s.id,
+                s.images.len(),
+                s.ground_truth.describe()
+            )
+        })
+        .collect();
+    println!("datasets: {}", names.join("; "));
+    println!("warmup {warmup} | {repeat} timed run(s) per image");
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    for e in &report.errors {
+        eprintln!("error: {e}");
+    }
+}
+
+/// Progress lines on stderr (none when `quiet`): each model/device load and every 50 timed
+/// requests of long runs.
+fn cli_progress(quiet: bool) -> impl Fn(&super::Progress) + Sync {
+    move |p: &super::Progress| {
         if quiet {
             return;
         }
@@ -627,31 +738,88 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         {
             eprintln!("    {}/{} requests", p.done, p.total);
         }
-    };
+    }
+}
 
-    // `benchmark.devices` of the config limits the sweep, as on the web UI's Benchmark page,
-    // and the pseudo-ground-truth device.
-    let sweep_devices = super::service::parse_devices(&config.benchmark.devices)
-        .context("benchmark.devices in the config")?;
+impl Report {
+    /// An empty report of a run over `sets`, with the errors and warnings so far.
+    fn new(
+        info: crate::backend::RuntimeInfo,
+        errors: Vec<String>,
+        sets: &[ImageSet],
+        warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            version: crate::VERSION,
+            openvino_version: info.openvino_version,
+            available_devices: info.available_devices,
+            models: Vec::new(),
+            errors,
+            results_file: None,
+            applied: Vec::new(),
+            applied_thresholds: Vec::new(),
+            datasets: sets.iter().map(|s| s.id.clone()).collect(),
+            warnings,
+            ranking: Vec::new(),
+        }
+    }
 
-    // Pseudo ground truth for datasets without it (accuracy relative to a reference model).
-    if sets.iter().any(|s| !s.annotated()) {
+    /// Record a warning, printed on stderr unless `quiet`.
+    fn warn(&mut self, quiet: bool, w: String) {
+        if !quiet {
+            eprintln!("warning: {w}");
+        }
+        self.warnings.push(w);
+    }
+
+    /// Record an error, printed on stderr unless `quiet`.
+    fn error(&mut self, quiet: bool, msg: String) {
+        if !quiet {
+            eprintln!("error: {msg}");
+        }
+        self.errors.push(msg);
+    }
+}
+
+/// What the steps of [`run`] share once the runtimes are open.
+struct RunCtx<'a> {
+    args: &'a BenchArgs,
+    config: &'a Config,
+    config_path: &'a Path,
+    runtimes: &'a Mutex<Runtimes>,
+    /// `benchmark.devices` of the config (None = every runnable option).
+    sweep_devices: &'a Option<Vec<spec::Device>>,
+    objective: Objective,
+    metric: AccuracyMetric,
+    weights: super::grade::Weights,
+}
+
+impl RunCtx<'_> {
+    /// The device selection for the model at `path`.
+    fn selection(&self, path: &Path) -> crate::backend::Selection {
+        self.runtimes.lock_recover().selection(Some(path))
+    }
+
+    /// Fill the ground truth of the sets without it from the reference model; a failure only
+    /// warns (accuracy is then not scored on those sets).
+    fn pseudo_ground_truth(
+        &self,
+        pb: &Bench,
+        jobs: &[Planned],
+        sets: &mut [ImageSet],
+        report: &mut Report,
+    ) {
+        let (args, config) = (self.args, self.config);
         let reference = pick_reference(
-            &config,
+            config,
             args.reference_model
                 .as_deref()
                 .or(config.benchmark.reference_model.as_deref()),
         )
-        .and_then(|m| job_for_config(&config, m, None));
-        let mut pb = Bench::new(&[], 0, 1, params);
-        pb.cache_dir = cache_dir.as_deref();
-        pb.progress = Some(&progress);
+        .and_then(|m| job_for_config(config, m, None));
         let outcome = reference.and_then(|job| {
-            let sel = runtimes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .selection(Some(&job.path));
-            let allowed = sweep_devices.as_deref();
+            let sel = self.selection(&job.path);
+            let allowed = self.sweep_devices.as_deref();
             let device =
                 pseudo_gt_device(&sel, allowed).with_context(|| no_pseudo_gt_device(allowed))?;
             if !args.json {
@@ -661,79 +829,93 @@ pub fn run(args: BenchArgs) -> Result<bool> {
                 .iter()
                 .any(|p| p.job.name.eq_ignore_ascii_case(&job.name))
             {
-                let w = format!(
-                    "{} is also the pseudo-ground-truth reference: its accuracy on the datasets \
-                     without ground truth is 100% by construction",
-                    job.name
+                report.warn(
+                    args.json,
+                    format!(
+                        "{} is also the pseudo-ground-truth reference: its accuracy on the datasets \
+                         without ground truth is 100% by construction",
+                        job.name
+                    ),
                 );
-                if !args.json {
-                    eprintln!("warning: {w}");
-                }
-                report.warnings.push(w);
             }
-            pseudo_ground_truth(&pb, &runtimes, &job, device, &mut sets)
+            pseudo_ground_truth(pb, self.runtimes, &job, device, sets)
         });
         if let Err(e) = outcome {
-            let w = format!("accuracy is not scored for datasets without ground truth: {e:#}");
-            if !args.json {
-                eprintln!("warning: {w}");
-            }
-            report.warnings.push(w);
+            report.warn(
+                args.json,
+                format!("accuracy is not scored for datasets without ground truth: {e:#}"),
+            );
         }
     }
 
-    let mut bench = Bench::new(&sets, warmup, repeat, params);
-    bench.object_filter = &config.object_filter;
-    bench.cache_dir = cache_dir.as_deref();
-    bench.weights = weights;
-    bench.threshold_objective = objective;
-    bench.accuracy_metric = metric;
-
-    let mut swept: Vec<ModelResult> = Vec::new();
-    for Planned { job, entry } in &jobs {
-        if all_devices {
-            let configured = entry.as_ref().and_then(|m| {
-                let sel = runtimes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .selection(Some(&job.path));
-                configured_device(&config, m, &sel)
-            });
-            let opts = SweepOptions {
-                devices: sweep_devices.clone(),
-                configured,
-                threshold_objective: objective,
-            };
-            bench.progress = Some(&progress);
-            let result = sweep(&bench, &runtimes, job, &opts, &mut |_| {})?;
-            bench.progress = None;
-            match model_report(&result) {
-                Ok(m) => {
-                    if !args.json {
-                        print_all_devices(&result, &m);
-                    }
-                    report.models.push(m);
-                }
-                Err(e) => {
-                    let msg = format!("{}: {e:#}", job.name);
-                    if !args.json {
-                        eprintln!("error: {msg}");
-                    }
-                    report.errors.push(msg);
-                }
+    /// Run every job: a device sweep each with `all_devices` (returned), else one run on its
+    /// device (printed and recorded in `report`).
+    fn run_jobs<'b>(
+        &self,
+        bench: &mut Bench<'b>,
+        progress: &'b (dyn Fn(&super::Progress) + Sync),
+        jobs: &[Planned],
+        all_devices: bool,
+        report: &mut Report,
+    ) -> Result<Vec<ModelResult>> {
+        let mut swept: Vec<ModelResult> = Vec::new();
+        for Planned { job, entry } in jobs {
+            if all_devices {
+                let result = self.sweep_job(bench, progress, job, entry.as_ref(), report)?;
+                swept.push(result);
+                continue;
             }
-            swept.push(result);
-            continue;
+            if let Some(model_report) = self.run_job(bench, job, report) {
+                if !self.args.json {
+                    print_model(&model_report);
+                }
+                report.models.push(model_report);
+            }
         }
-        let primary = match bench.run(&runtimes, job, &job.device) {
+        Ok(swept)
+    }
+
+    /// `--all-devices` for one job: sweep its devices, print and record the model report.
+    fn sweep_job<'b>(
+        &self,
+        bench: &mut Bench<'b>,
+        progress: &'b (dyn Fn(&super::Progress) + Sync),
+        job: &Job,
+        entry: Option<&ModelConfig>,
+        report: &mut Report,
+    ) -> Result<ModelResult> {
+        let configured = entry.and_then(|m| {
+            let sel = self.selection(&job.path);
+            configured_device(self.config, m, &sel)
+        });
+        let opts = SweepOptions {
+            devices: self.sweep_devices.clone(),
+            configured,
+            threshold_objective: self.objective,
+        };
+        bench.progress = Some(progress);
+        let result = sweep(bench, self.runtimes, job, &opts, &mut |_| {})?;
+        bench.progress = None;
+        match model_report(&result) {
+            Ok(m) => {
+                if !self.args.json {
+                    print_all_devices(&result, &m);
+                }
+                report.models.push(m);
+            }
+            Err(e) => report.error(self.args.json, format!("{}: {e:#}", job.name)),
+        }
+        Ok(result)
+    }
+
+    /// One job on its device (and on CPU with `--compare-cpu`); None (error recorded) when it
+    /// failed.
+    fn run_job(&self, bench: &Bench, job: &Job, report: &mut Report) -> Option<ModelReport> {
+        let primary = match bench.run(self.runtimes, job, &job.device) {
             Ok(r) => r,
             Err(e) => {
-                let msg = format!("{}: {e:#}", job.name);
-                if !args.json {
-                    eprintln!("error: {msg}");
-                }
-                report.errors.push(msg);
-                continue;
+                report.error(self.args.json, format!("{}: {e:#}", job.name));
+                return None;
             }
         };
         let mut model_report = ModelReport {
@@ -748,12 +930,12 @@ pub fn run(args: BenchArgs) -> Result<bool> {
             reference: None,
             threshold: None,
         };
-        if args.compare_cpu {
+        if self.args.compare_cpu {
             if model_report.primary.device == "CPU" {
                 model_report.note =
                     Some("--compare-cpu skipped: the model already runs on CPU".into());
             } else {
-                match bench.run(&runtimes, job, "CPU") {
+                match bench.run(self.runtimes, job, "CPU") {
                     Ok(cpu) => {
                         let mut c = Comparison::default();
                         for (a, b) in model_report.primary.per_image.iter().zip(&cpu.per_image) {
@@ -764,131 +946,154 @@ pub fn run(args: BenchArgs) -> Result<bool> {
                         model_report.comparison = Some(c);
                         model_report.cpu = Some(cpu);
                     }
-                    Err(e) => {
-                        let msg = format!("{} on CPU: {e:#}", job.name);
-                        if !args.json {
-                            eprintln!("error: {msg}");
-                        }
-                        report.errors.push(msg);
-                    }
+                    Err(e) => report.error(self.args.json, format!("{} on CPU: {e:#}", job.name)),
                 }
             }
         }
-        if !args.json {
-            print_model(&model_report);
-        }
-        report.models.push(model_report);
+        Some(model_report)
     }
 
-    if all_devices && !swept.is_empty() {
-        let results = BenchmarkResults::new(HardwareSummary::current(), versions, swept.clone())
-            .with_sets(&sets);
+    /// After an `--all-devices` sweep: rank, print the summaries, save the results, apply
+    /// devices / thresholds, write the report. Some(outcome) when `--threshold-search` ends the
+    /// run.
+    fn finish_sweep(
+        &self,
+        sets: &[ImageSet],
+        versions: RuntimeVersions,
+        swept: &[ModelResult],
+        report: &mut Report,
+    ) -> Result<Option<bool>> {
+        let args = self.args;
+        let results = BenchmarkResults::new(HardwareSummary::current(), versions, swept.to_vec())
+            .with_sets(sets);
         report.ranking = results.ranking();
         if !args.json && report.ranking.len() > 1 {
             print_ranking(&report.ranking);
         }
         if !args.json {
-            print_thresholds(&swept, objective);
-            print_frame_roc(&swept);
+            print_thresholds(swept, self.objective);
+            print_frame_roc(swept);
         }
-        let path = results_path(&config_path);
-        let merged = if args.no_save {
-            results
-        } else {
-            let mut merged =
-                BenchmarkResults::merge(BenchmarkResults::load_or_warn(&path), results);
-            // Models kept from earlier runs are graded like this run's.
-            merged.regrade(metric, weights);
-            merged.save(&path)?;
-            super::search::save_beside(&path, &merged, &swept);
-            if !args.json {
-                println!("\nresults saved to {}", path.display());
-            }
-            report.results_file = Some(path.display().to_string());
-            merged
-        };
+        let merged = self.save_results(results, swept, report)?;
         if args.apply {
-            let picks: Vec<(String, Option<String>)> = swept
-                .iter()
-                .filter_map(|m| m.recommended.clone().map(|d| (m.model.clone(), Some(d))))
-                .collect();
-            let mut cfg = Config::load(&config_path)?;
-            let changes = apply_model_devices(&mut cfg, &picks)?;
-            if !changes.is_empty() {
-                cfg.save(&config_path)?;
-            }
-            if !args.json {
-                println!();
-                if changes.is_empty() {
-                    println!(
-                        "--apply: {} already uses the recommended devices; nothing changed",
-                        config_path.display()
-                    );
-                } else {
-                    println!("--apply: updated {}:", config_path.display());
-                    for c in &changes {
-                        println!("  {}", c.describe());
-                    }
-                    println!("Restart the server to load the models on their new devices.");
-                }
-                for m in swept.iter().filter(|m| m.recommended.is_none()) {
-                    println!("  {}: unchanged ({})", m.model, m.recommendation);
-                }
-                if cfg.force_cpu {
-                    println!(
-                        "note: force_cpu is on in the config and overrides every per-model device"
-                    );
-                }
-            }
-            report.applied = changes;
+            report.applied = self.apply_devices(swept)?;
         }
         if args.apply_threshold {
-            report.applied_thresholds = apply_thresholds(&swept, &config_path, args.json)?;
+            report.applied_thresholds = apply_thresholds(swept, self.config_path, args.json)?;
         }
         if let Some(out) = &args.report {
-            // After --apply / --apply-threshold: the report compares with the config as it is
-            // when written (the config file, else the config this run used).
-            let now_cfg = Config::load(&config_path)
-                .ok()
-                .filter(|_| config_path.exists())
-                .unwrap_or_else(|| config.clone());
-            let preds = super::search::StoredPreds::merge(
-                super::search::StoredPreds::load(&super::search::preds_path(&config_path))
-                    .ok()
-                    .flatten(),
-                &merged,
-                &swept,
-            );
-            let device = |m: &crate::config::ModelConfig| {
-                let sel = runtimes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .selection(Some(&now_cfg.data_path(&m.path)));
-                configured_device(&now_cfg, m, &sel)
-            };
-            let now = super::current::from_config(&now_cfg, &device, &|_| None);
-            let mut view = merged.clone();
-            super::current::rebase(&mut view, Some(&preds), &now);
-            export::write(&view, out)?;
-            if !args.json {
-                println!("report written to {}", out.display());
-            }
+            self.write_report(&merged, swept, out)?;
         }
         if args.threshold_search {
-            let preds = super::search::StoredPreds::merge(None, &merged, &swept);
+            let preds = super::search::StoredPreds::merge(None, &merged, swept);
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
-            return Ok(
-                threshold_search_cli(&args, &config, &merged, &preds)? && report.errors.is_empty()
-            );
+            return Ok(Some(
+                threshold_search_cli(args, self.config, &merged, &preds)?
+                    && report.errors.is_empty(),
+            ));
         }
+        Ok(None)
     }
 
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    /// Merge `results` into `benchmark.json` (and the stored predictions) beside the config
+    /// unless `--no-save`; returns what was saved (`results` itself with `--no-save`).
+    fn save_results(
+        &self,
+        results: BenchmarkResults,
+        swept: &[ModelResult],
+        report: &mut Report,
+    ) -> Result<BenchmarkResults> {
+        if self.args.no_save {
+            return Ok(results);
+        }
+        let path = results_path(self.config_path);
+        let mut merged = BenchmarkResults::merge(BenchmarkResults::load_or_warn(&path), results);
+        // Models kept from earlier runs are graded like this run's.
+        merged.regrade(self.metric, self.weights);
+        merged.save(&path)?;
+        super::search::save_beside(&path, &merged, swept);
+        if !self.args.json {
+            println!("\nresults saved to {}", path.display());
+        }
+        report.results_file = Some(path.display().to_string());
+        Ok(merged)
     }
-    Ok(report.errors.is_empty())
+
+    /// `--apply`: write the recommended devices of `swept` into the config file.
+    fn apply_devices(&self, swept: &[ModelResult]) -> Result<Vec<DeviceChange>> {
+        let config_path = self.config_path;
+        let picks: Vec<(String, Option<String>)> = swept
+            .iter()
+            .filter_map(|m| m.recommended.clone().map(|d| (m.model.clone(), Some(d))))
+            .collect();
+        let mut cfg = Config::load(config_path)?;
+        let changes = apply_model_devices(&mut cfg, &picks)?;
+        if !changes.is_empty() {
+            cfg.save(config_path)?;
+        }
+        if !self.args.json {
+            println!();
+            if changes.is_empty() {
+                println!(
+                    "--apply: {} already uses the recommended devices; nothing changed",
+                    config_path.display()
+                );
+            } else {
+                println!("--apply: updated {}:", config_path.display());
+                for c in &changes {
+                    println!("  {}", c.describe());
+                }
+                println!("Restart the server to load the models on their new devices.");
+            }
+            for m in swept.iter().filter(|m| m.recommended.is_none()) {
+                println!("  {}: unchanged ({})", m.model, m.recommendation);
+            }
+            if cfg.force_cpu {
+                println!(
+                    "note: force_cpu is on in the config and overrides every per-model device"
+                );
+            }
+        }
+        Ok(changes)
+    }
+
+    /// `--report`: write the standalone report of `merged`, compared with the config as it is
+    /// now (after `--apply` / `--apply-threshold`).
+    fn write_report(
+        &self,
+        merged: &BenchmarkResults,
+        swept: &[ModelResult],
+        out: &Path,
+    ) -> Result<()> {
+        let config_path = self.config_path;
+        // After --apply / --apply-threshold: the report compares with the config as it is
+        // when written (the config file, else the config this run used).
+        let now_cfg = Config::load(config_path)
+            .ok()
+            .filter(|_| config_path.exists())
+            .unwrap_or_else(|| self.config.clone());
+        let preds = super::search::StoredPreds::merge(
+            super::search::StoredPreds::load(&super::search::preds_path(config_path))
+                .ok()
+                .flatten(),
+            merged,
+            swept,
+        );
+        let device = |m: &crate::config::ModelConfig| {
+            let sel = self.selection(&now_cfg.data_path(&m.path));
+            configured_device(&now_cfg, m, &sel)
+        };
+        let now = super::current::from_config(&now_cfg, &device, &|_| None);
+        let mut view = merged.clone();
+        super::current::rebase(&mut view, Some(&preds), &now);
+        export::write(&view, out)?;
+        if !self.args.json {
+            println!("report written to {}", out.display());
+        }
+        Ok(())
+    }
 }
 
 /// `--threshold-search`: search the stored predictions and print the results.
@@ -898,8 +1103,45 @@ fn threshold_search_cli(
     results: &BenchmarkResults,
     preds: &super::search::StoredPreds,
 ) -> Result<bool> {
-    use super::search::{SearchRequest, search};
-    let req = SearchRequest {
+    let req = search_request(args, config);
+    let current = |m: &str| {
+        super::find_model(config, m).map(|c| {
+            c.confidence_threshold
+                .unwrap_or(config.confidence_threshold)
+        })
+    };
+    let out = super::search::search(results, preds, &req, &current)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(out.errors.is_empty());
+    }
+    print_search_summary(&req, &out);
+    for r in &out.results {
+        if let Some(roc) = &r.roc {
+            println!(
+                "  {} frame ROC AUC: macro {} micro {} ({} positive / {} negative frame samples); {}",
+                r.model,
+                pct1(roc.auc),
+                pct1(roc.micro_auc),
+                roc.positives,
+                roc.negatives,
+                class_aucs(roc)
+            );
+        }
+    }
+    for r in &out.results {
+        print_search_detail(r);
+    }
+    for e in &out.errors {
+        eprintln!("error: {e}");
+    }
+    println!("{BLUE_IRIS_NOTE}");
+    Ok(out.errors.is_empty())
+}
+
+/// The `--threshold-search` request of `args` (defaults from `config`).
+fn search_request(args: &BenchArgs, config: &Config) -> super::search::SearchRequest {
+    super::search::SearchRequest {
         models: args.search_model.clone(),
         device: args.search_device.clone(),
         datasets: args.dataset.clone(),
@@ -909,18 +1151,11 @@ fn threshold_search_cli(
             .threshold_objective
             .unwrap_or(config.benchmark.threshold_objective),
         iou: args.iou.unwrap_or(0.5),
-    };
-    let current = |m: &str| {
-        super::find_model(config, m).map(|c| {
-            c.confidence_threshold
-                .unwrap_or(config.confidence_threshold)
-        })
-    };
-    let out = search(results, preds, &req, &current)?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(out.errors.is_empty());
     }
+}
+
+/// The heading of a threshold search and one summary row per model.
+fn print_search_summary(req: &super::search::SearchRequest, out: &super::search::SearchOutput) {
     let mut filters = Vec::new();
     if !req.datasets.is_empty() {
         filters.push(format!("datasets {}", req.datasets.join(", ")));
@@ -993,93 +1228,78 @@ fn threshold_search_cli(
             if r.relative { "  (relative)" } else { "" }
         );
     }
-    for r in &out.results {
-        if let Some(roc) = &r.roc {
-            println!(
-                "  {} frame ROC AUC: macro {} micro {} ({} positive / {} negative frame samples); {}",
-                r.model,
-                pct1(roc.auc),
-                pct1(roc.micro_auc),
-                roc.positives,
-                roc.negatives,
-                class_aucs(roc)
-            );
-        }
+}
+
+/// The threshold table of one searched model (nothing without a best threshold), with the
+/// best thresholds and frame ROC AUCs per dataset / class.
+fn print_search_detail(r: &super::search::SearchResult) {
+    let Some(b) = &r.best else { return };
+    println!();
+    println!(
+        "  {} on {}: best {:.2} (exact optimum {:.3}, near-optimal range {}){}",
+        r.model,
+        r.device,
+        b.threshold,
+        b.exact_threshold.unwrap_or(b.threshold),
+        b.plateau
+            .map_or("-".into(), |[lo, hi]| format!("{lo:.3}..{hi:.3}")),
+        b.note.as_ref().map_or(String::new(), |n| format!("; {n}"))
+    );
+    println!(
+        "    {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6} {:>6}",
+        "conf", "P", "R", "F1", "F2", "FP/img", "TPR", "FPR"
+    );
+    let mut extra = vec![r.configured, b.point];
+    if let Some(c) = r.current {
+        extra.push(c);
     }
-    for r in &out.results {
-        let Some(b) = &r.best else { continue };
-        println!();
+    for p in super::threshold::table_points(&r.grid, &extra) {
+        let mut marks = Vec::new();
+        if (b.threshold - p.threshold).abs() < 1e-6 {
+            marks.push("best");
+        }
+        if (r.configured.threshold - p.threshold).abs() < 1e-6 {
+            marks.push("configured");
+        }
+        if r.current
+            .is_some_and(|c| (c.threshold - p.threshold).abs() < 1e-6)
+        {
+            marks.push("in config now");
+        }
         println!(
-            "  {} on {}: best {:.2} (exact optimum {:.3}, near-optimal range {}){}",
-            r.model,
-            r.device,
-            b.threshold,
-            b.exact_threshold.unwrap_or(b.threshold),
-            b.plateau
-                .map_or("-".into(), |[lo, hi]| format!("{lo:.3}..{hi:.3}")),
-            b.note.as_ref().map_or(String::new(), |n| format!("; {n}"))
+            "    {:>5.2} {:>6} {:>6} {:>6} {:>6} {:>7.2} {:>6} {:>6}{}",
+            p.threshold,
+            pct1(p.precision),
+            pct1(p.recall),
+            pct1(p.f1),
+            pct1(p.f2),
+            p.fp_per_image,
+            pct1(p.frame.and_then(|f| f.tpr)),
+            pct1(p.frame.and_then(|f| f.fpr)),
+            if marks.is_empty() {
+                String::new()
+            } else {
+                format!("  <- {}", marks.join(", "))
+            }
         );
-        println!(
-            "    {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6} {:>6}",
-            "conf", "P", "R", "F1", "F2", "FP/img", "TPR", "FPR"
-        );
-        let mut extra = vec![r.configured, b.point];
-        if let Some(c) = r.current {
-            extra.push(c);
-        }
-        for p in super::threshold::table_points(&r.grid, &extra) {
-            let mut marks = Vec::new();
-            if (b.threshold - p.threshold).abs() < 1e-6 {
-                marks.push("best");
-            }
-            if (r.configured.threshold - p.threshold).abs() < 1e-6 {
-                marks.push("configured");
-            }
-            if r.current
-                .is_some_and(|c| (c.threshold - p.threshold).abs() < 1e-6)
-            {
-                marks.push("in config now");
-            }
-            println!(
-                "    {:>5.2} {:>6} {:>6} {:>6} {:>6} {:>7.2} {:>6} {:>6}{}",
-                p.threshold,
-                pct1(p.precision),
-                pct1(p.recall),
-                pct1(p.f1),
-                pct1(p.f2),
-                p.fp_per_image,
-                pct1(p.frame.and_then(|f| f.tpr)),
-                pct1(p.frame.and_then(|f| f.fpr)),
-                if marks.is_empty() {
-                    String::new()
-                } else {
-                    format!("  <- {}", marks.join(", "))
-                }
-            );
-        }
-        let groups: Vec<String> = r
-            .by_dataset
-            .iter()
-            .chain(&r.per_class)
-            .filter_map(|g| Some(format!("{} {:.2}", g.key, g.best.as_ref()?.threshold)))
-            .collect();
-        if !groups.is_empty() {
-            println!("    best by dataset/class: {}", groups.join(", "));
-        }
-        let aucs: Vec<String> = r
-            .by_dataset
-            .iter()
-            .filter_map(|g| Some(format!("{} {}", g.key, pct1(Some(g.roc_auc?)))))
-            .collect();
-        if !aucs.is_empty() {
-            println!("    frame ROC AUC by dataset: {}", aucs.join(", "));
-        }
     }
-    for e in &out.errors {
-        eprintln!("error: {e}");
+    let groups: Vec<String> = r
+        .by_dataset
+        .iter()
+        .chain(&r.per_class)
+        .filter_map(|g| Some(format!("{} {:.2}", g.key, g.best.as_ref()?.threshold)))
+        .collect();
+    if !groups.is_empty() {
+        println!("    best by dataset/class: {}", groups.join(", "));
     }
-    println!("{BLUE_IRIS_NOTE}");
-    Ok(out.errors.is_empty())
+    let aucs: Vec<String> = r
+        .by_dataset
+        .iter()
+        .filter_map(|g| Some(format!("{} {}", g.key, pct1(Some(g.roc_auc?)))))
+        .collect();
+    if !aucs.is_empty() {
+        println!("    frame ROC AUC by dataset: {}", aucs.join(", "));
+    }
 }
 
 /// `--apply-threshold`: write the best thresholds of `swept` into the config file.
@@ -1445,6 +1665,26 @@ pub fn agreement_text(r: &RunResult) -> String {
 /// Comparison table of an `--all-devices` model report, fastest first, with grades, then the
 /// recommended device's accuracy breakdown.
 fn print_all_devices(result: &ModelResult, m: &ModelReport) {
+    print_device_table(result, m);
+    for s in &m.skipped_devices {
+        println!("  skipped {s}");
+    }
+    match &m.recommended {
+        Some(d) => println!("  recommended: {d} ({})", result.recommendation),
+        None => println!("  recommended: none ({})", result.recommendation),
+    }
+    let p = &m.primary;
+    print_accuracy_breakdown(p);
+    if let Some(a) = &result.threshold {
+        print_threshold_table(a);
+    }
+    if p.images > 1 {
+        print_resolution_speeds(p);
+    }
+}
+
+/// The heading and one row per device run of [`print_all_devices`], fastest first.
+fn print_device_table(result: &ModelResult, m: &ModelReport) {
     println!();
     println!(
         "== {}: all runnable devices ({} images x {} runs, ms)",
@@ -1473,14 +1713,7 @@ fn print_all_devices(result: &ModelResult, m: &ModelReport) {
         .first()
         .map(|r| r.stages_ms.total.p50)
         .unwrap_or_default();
-    let pct = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{:.1}", v * 100.0));
     for r in &runs {
-        let name = if r.device_name.is_empty() {
-            r.device.clone()
-        } else {
-            format!("{} ({})", r.device, r.device_name)
-        };
-        let name: String = name.chars().take(26).collect();
         let mut marks = Vec::new();
         if r.stages_ms.total.p50 == fastest && runs.len() > 1 {
             marks.push("fastest");
@@ -1491,47 +1724,54 @@ fn print_all_devices(result: &ModelResult, m: &ModelReport) {
         if result.configured.as_deref() == Some(r.requested_device.as_str()) {
             marks.push("configured");
         }
-        let acc = r.accuracy.as_ref().map(|a| &a.overall);
-        let grades = r.grades.as_ref().map_or("-".to_string(), |g| {
-            format!(
-                "{}/{}{}/{}",
-                g.overall,
-                g.accuracy.map_or("-".to_string(), |a| a.to_string()),
-                if g.relative { "*" } else { "" },
-                g.speed
-            )
-        });
-        println!(
-            "  {:<16} {:<26} {:>7.0} {:>9.2} {:>9.2} {:>9.2} {:>7.1} {:>6} {:>6} {:>6} {:>5} {:>5} {:<7} {:<12}{}",
-            r.requested_device,
-            name,
-            r.compile_ms,
-            r.stages_ms.infer.p50,
-            r.stages_ms.total.p50,
-            r.stages_ms.total.p95,
-            r.throughput_fps,
-            pct(acc.and_then(|a| a.ap50)),
-            pct(acc.and_then(|a| a.ap50_95)),
-            pct(r.accuracy.as_ref().and_then(|a| a.roc_auc())),
-            pct(acc.and_then(|a| a.precision)),
-            pct(acc.and_then(|a| a.recall)),
-            grades,
-            agreement_text(r),
-            if marks.is_empty() {
-                String::new()
-            } else {
-                format!("  <- {}", marks.join(", "))
-            }
-        );
+        println!("{}", device_row(r, &marks));
     }
-    for s in &m.skipped_devices {
-        println!("  skipped {s}");
-    }
-    match &m.recommended {
-        Some(d) => println!("  recommended: {d} ({})", result.recommendation),
-        None => println!("  recommended: none ({})", result.recommendation),
-    }
-    let p = &m.primary;
+}
+
+/// One row of [`print_device_table`] with its `marks` ("fastest", "recommended", ...).
+fn device_row(r: &RunResult, marks: &[&str]) -> String {
+    let name = if r.device_name.is_empty() {
+        r.device.clone()
+    } else {
+        format!("{} ({})", r.device, r.device_name)
+    };
+    let name: String = name.chars().take(26).collect();
+    let acc = r.accuracy.as_ref().map(|a| &a.overall);
+    let grades = r.grades.as_ref().map_or("-".to_string(), |g| {
+        format!(
+            "{}/{}{}/{}",
+            g.overall,
+            g.accuracy.map_or("-".to_string(), |a| a.to_string()),
+            if g.relative { "*" } else { "" },
+            g.speed
+        )
+    });
+    format!(
+        "  {:<16} {:<26} {:>7.0} {:>9.2} {:>9.2} {:>9.2} {:>7.1} {:>6} {:>6} {:>6} {:>5} {:>5} {:<7} {:<12}{}",
+        r.requested_device,
+        name,
+        r.compile_ms,
+        r.stages_ms.infer.p50,
+        r.stages_ms.total.p50,
+        r.stages_ms.total.p95,
+        r.throughput_fps,
+        pct1(acc.and_then(|a| a.ap50)),
+        pct1(acc.and_then(|a| a.ap50_95)),
+        pct1(r.accuracy.as_ref().and_then(|a| a.roc_auc())),
+        pct1(acc.and_then(|a| a.precision)),
+        pct1(acc.and_then(|a| a.recall)),
+        grades,
+        agreement_text(r),
+        if marks.is_empty() {
+            String::new()
+        } else {
+            format!("  <- {}", marks.join(", "))
+        }
+    )
+}
+
+/// The accuracy of `p` overall, per dataset and per tag (or why it is not scored).
+fn print_accuracy_breakdown(p: &RunResult) {
     match &p.accuracy {
         Some(a) => {
             println!(
@@ -1543,7 +1783,7 @@ fn print_all_devices(result: &ModelResult, m: &ModelReport) {
                 a.overall
                     .by_size
                     .iter()
-                    .map(|b| format!("{} {}", b.bucket, pct(b.recall)))
+                    .map(|b| format!("{} {}", b.bucket, pct1(b.recall)))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -1553,10 +1793,10 @@ fn print_all_devices(result: &ModelResult, m: &ModelReport) {
                     b.key,
                     b.images,
                     b.gt,
-                    pct(b.ap50),
-                    pct(b.roc_auc),
-                    pct(b.precision),
-                    pct(b.recall),
+                    pct1(b.ap50),
+                    pct1(b.roc_auc),
+                    pct1(b.precision),
+                    pct1(b.recall),
                     if b.relative { "  (relative)" } else { "" }
                 );
             }
@@ -1567,25 +1807,18 @@ fn print_all_devices(result: &ModelResult, m: &ModelReport) {
             }
         }
     }
-    if let Some(a) = &result.threshold {
-        print_threshold_table(a);
-    }
-    if p.images > 1 {
-        // Every bucket; one without images is n/a (it does not enter any grade).
-        for bucket in super::images::RESOLUTION_BUCKETS {
-            match p.by_resolution.iter().find(|b| b.bucket == bucket) {
-                Some(b) => println!(
-                    "    res:{:<6} {:>4} img  pre {:>7.2}  infer {:>7.2}  post {:>6.2}  total p50 {:>7.2} p95 {:>7.2}",
-                    b.bucket,
-                    b.images,
-                    b.pre_p50,
-                    b.infer_p50,
-                    b.post_p50,
-                    b.total_p50,
-                    b.total_p95
-                ),
-                None => println!("    res:{bucket:<6}    0 img  n/a"),
-            }
+}
+
+/// Speed per resolution bucket of `p`: every bucket; one without images is n/a (it does not
+/// enter any grade).
+fn print_resolution_speeds(p: &RunResult) {
+    for bucket in super::images::RESOLUTION_BUCKETS {
+        match p.by_resolution.iter().find(|b| b.bucket == bucket) {
+            Some(b) => println!(
+                "    res:{:<6} {:>4} img  pre {:>7.2}  infer {:>7.2}  post {:>6.2}  total p50 {:>7.2} p95 {:>7.2}",
+                b.bucket, b.images, b.pre_p50, b.infer_p50, b.post_p50, b.total_p50, b.total_p95
+            ),
+            None => println!("    res:{bucket:<6}    0 img  n/a"),
         }
     }
 }
@@ -1733,6 +1966,59 @@ mod tests {
 
     fn parse(argv: &[&str]) -> Result<BenchArgs, clap::Error> {
         Cli::try_parse_from(argv).map(|c| c.args)
+    }
+
+    #[test]
+    fn timing_cache_and_arg_checks() {
+        let config = Config::default();
+        let one = vec![ImageSet::sample()];
+        let two = vec![ImageSet::sample(), ImageSet::sample()];
+        let args = parse(&["x"]).unwrap();
+        let b = &config.benchmark;
+        assert_eq!(
+            timing_settings(&args, &config, &one),
+            (SINGLE_IMAGE_REPEAT, b.warmup, b.weights)
+        );
+        assert_eq!(
+            timing_settings(&args, &config, &two),
+            (b.repeat_per_image.max(1), b.warmup, b.weights)
+        );
+        let args = parse(&[
+            "x",
+            "--repeat",
+            "7",
+            "--warmup",
+            "2",
+            "--accuracy-weight",
+            "0.25",
+        ])
+        .unwrap();
+        let (repeat, warmup, w) = timing_settings(&args, &config, &one);
+        assert_eq!((repeat, warmup, w.accuracy, w.speed), (7, 2, 0.25, 0.75));
+
+        assert_eq!(
+            cache_dir_arg(&parse(&["x", "--cache-dir", " "]).unwrap(), &config),
+            None
+        );
+        assert_eq!(
+            cache_dir_arg(&parse(&["x", "--cache-dir", "c2"]).unwrap(), &config),
+            Some(PathBuf::from("c2"))
+        );
+        assert_eq!(
+            cache_dir_arg(&parse(&["x"]).unwrap(), &config),
+            config.cache_dir_path()
+        );
+
+        let missing = Path::new("/nonexistent/blue-onyx-prism/cfg.json");
+        assert!(check_args(&parse(&["x"]).unwrap(), missing).is_ok());
+        let err = check_args(&parse(&["x", "--apply-threshold"]).unwrap(), missing).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("--apply-threshold needs a config file")
+        );
+        let err =
+            check_args(&parse(&["x", "--accuracy-weight", "1.5"]).unwrap(), missing).unwrap_err();
+        assert_eq!(err.to_string(), "--accuracy-weight must be between 0 and 1");
     }
 
     #[test]

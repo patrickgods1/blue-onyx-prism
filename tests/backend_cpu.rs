@@ -1,56 +1,19 @@
-//! Real OpenVINO inference: sets up the runtime (from a local archive when available, else
-//! download) and the IPcam-general model, then runs one inference on CPU and on GPU.
-//! Set `BLUE_ONYX_SKIP_OPENVINO_TESTS=1` to skip (e.g. offline CI).
-//! Run with `cargo test --test backend_cpu -- --nocapture` to see timings.
+//! Real OpenVINO inference on the IPcam-general model: one inference on CPU and on GPU.
+//!
+//! `#[ignore]`d: needs `models/IPcam-general.{onnx,yaml}` and `openvino/` under
+//! `common::test_root()` (a missing one fails the test). Run with
+//! `cargo test --test backend_cpu -- --ignored --nocapture` to see timings.
+
+mod common;
 
 use blue_onyx_prism::backend::{CoreOptions, LoadRequest, Runtimes, spec};
-use blue_onyx_prism::setup_openvino;
-use std::path::{Path, PathBuf};
-
-fn repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn ensure_runtime(dir: &Path) {
-    if dir.is_dir() {
-        return;
-    }
-    // Set BLUE_ONYX_PRISM_ARCHIVE to a downloaded archive to skip the download.
-    let archive = std::env::var_os("BLUE_ONYX_PRISM_ARCHIVE").map(PathBuf::from);
-    setup_openvino::run(&setup_openvino::SetupOptions {
-        dest: Some(dir.to_path_buf()),
-        version: None,
-        archive,
-        keep_archive: false,
-        root: Some(repo()),
-    })
-    .expect("OpenVINO runtime setup");
-}
-
-fn ensure_model(models: &Path) -> PathBuf {
-    let onnx = models.join("IPcam-general.onnx");
-    if !onnx.is_file() || !models.join("IPcam-general.yaml").is_file() {
-        blue_onyx_prism::download::download_with_root(
-            &["IPcam-general".to_string()],
-            false,
-            models,
-            &repo(),
-        )
-        .unwrap_or_else(|e| panic!("downloading IPcam-general: {e:#}"));
-    }
-    onnx
-}
 
 #[test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 fn cpu_and_gpu_inference() {
-    if std::env::var_os("BLUE_ONYX_SKIP_OPENVINO_TESTS").is_some() {
-        eprintln!("skipping: BLUE_ONYX_SKIP_OPENVINO_TESTS set");
-        return;
-    }
-    let root = repo();
-    let ov_dir = root.join("openvino");
-    ensure_runtime(&ov_dir);
-    let model_path = ensure_model(&root.join("models"));
+    let root = common::test_root();
+    let ov_dir = common::require_openvino();
+    let model_path = common::require_ipcam();
 
     let mut rt = Runtimes::new(&CoreOptions {
         cache_dir: Some(root.join("cache")),

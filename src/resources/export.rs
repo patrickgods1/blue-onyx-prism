@@ -42,6 +42,7 @@
 
 use super::catalog::{self, Platform, Resource, ResourceKind};
 use super::manager::{self, Job, Manager, Manifest, State as DownloadState};
+use crate::sync::LockExt;
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
@@ -254,18 +255,10 @@ struct EnvMarker {
     uv: String,
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 fn marker_for(lock: &PackageLock) -> EnvMarker {
     EnvMarker {
         lock: lock.name.to_string(),
-        lock_sha256: sha256_hex(lock.text.as_bytes()),
+        lock_sha256: manager::sha256_hex(lock.text.as_bytes()),
         python: PYTHON_VERSION.to_string(),
         uv: catalog::UV_VERSION.to_string(),
     }
@@ -345,7 +338,7 @@ pub fn manifest(res: &Resource, models: &Path) -> Option<Manifest> {
 /// source).
 pub fn remove_toolchain(paths: &Paths) -> Result<()> {
     for d in paths.toolchain_dirs() {
-        remove_any(&d)?;
+        manager::remove_any(&d)?;
     }
     let _ = std::fs::remove_file(paths.lock_file());
     let _ = std::fs::remove_file(paths.tools.join(LOCKFILE_NAME));
@@ -366,16 +359,6 @@ pub fn remove_export(res: &Resource, models: &Path) -> Result<()> {
     }
     let _ = std::fs::remove_file(manager::manifest_path(res, models));
     Ok(())
-}
-
-fn remove_any(p: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => {
-            std::fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))
-        }
-        Ok(_) => std::fs::remove_file(p).with_context(|| format!("removing {}", p.display())),
-        Err(_) => Ok(()),
-    }
 }
 
 /// Exclusive cross-process export lock; released on drop.
@@ -989,7 +972,7 @@ fn run_stages(
         let _ = std::fs::remove_file(p.env.join(ENV_MARKER));
         // The YOLO26-only toolchain of earlier versions (same tools, older names) is replaced.
         for d in p.legacy_dirs() {
-            if let Err(e) = remove_any(&d) {
+            if let Err(e) = manager::remove_any(&d) {
                 tracing::warn!("removing the old export toolchain: {e:#}");
             }
         }
@@ -1152,10 +1135,10 @@ fn run_stages(
     std::fs::create_dir_all(&p.models)
         .with_context(|| format!("creating {}", p.models.display()))?;
     let staging = p.staging(name);
-    remove_any(&staging)?;
+    manager::remove_any(&staging)?;
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let work = p.work.join(name);
-    remove_any(&work)?;
+    manager::remove_any(&work)?;
     // Ultralytics takes the `.pt` file; the Hugging Face recipes the directory with
     // `model.safetensors` + `config.json`.
     let weights_arg = match recipe {
@@ -1233,9 +1216,9 @@ fn run_stages(
         cancel,
     );
     // The exporters' copies and intermediate files are not needed any more.
-    let _ = remove_any(&work);
+    let _ = manager::remove_any(&work);
     if let Err(e) = export {
-        let _ = remove_any(&staging);
+        let _ = manager::remove_any(&staging);
         return Err(e);
     }
     check(cancel)?;
@@ -1243,7 +1226,7 @@ fn run_stages(
     // 6. Install
     enter!(Stage::Install, Some(0), "checking the output");
     let out = install_outputs(res, &staging, &p.models, &onnx_name, &yaml_name);
-    let _ = remove_any(&staging);
+    let _ = manager::remove_any(&staging);
     let out = out?;
     enter!(Stage::Install, Some(100), "installed");
     Ok(out)
@@ -1415,7 +1398,7 @@ struct Shared {
 
 impl Shared {
     fn update(&self, id: &'static str, f: impl FnOnce(&mut ExportStatus)) {
-        let mut map = self.statuses.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.statuses.lock_recover();
         if let Some(s) = map.get_mut(id) {
             f(s);
         }
@@ -1468,11 +1451,7 @@ impl Exporter {
     pub fn enqueue(&self, req: ExportRequest) -> Result<(), String> {
         let res = req.job.resource;
         {
-            let mut map = self
-                .shared
-                .statuses
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut map = self.shared.statuses.lock_recover();
             if map.get(res.id).is_some_and(|s| s.state.is_busy()) {
                 return Err(format!("{} is already being exported", res.title));
             }
@@ -1486,11 +1465,7 @@ impl Exporter {
                 },
             );
         }
-        self.shared
-            .cancelled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(res.id);
+        self.shared.cancelled.lock_recover().remove(res.id);
         self.shared.changed.notify_all();
         self.tx
             .send(Msg::Job(Box::new(req)))
@@ -1504,20 +1479,12 @@ impl Exporter {
         };
         match st.state {
             ExportState::Queued => {
-                self.shared
-                    .cancelled
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(st.id);
+                self.shared.cancelled.lock_recover().insert(st.id);
                 self.shared.set_state(st.id, ExportState::Cancelled);
                 true
             }
             ExportState::Running { .. } => {
-                let cur = self
-                    .shared
-                    .current
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let cur = self.shared.current.lock_recover();
                 if let Some((cid, flag)) = cur.as_ref()
                     && cid.eq_ignore_ascii_case(id)
                 {
@@ -1531,22 +1498,14 @@ impl Exporter {
     }
 
     pub fn status(&self, id: &str) -> Option<ExportStatus> {
-        let map = self
-            .shared
-            .statuses
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let map = self.shared.statuses.lock_recover();
         map.values()
             .find(|s| s.id.eq_ignore_ascii_case(id))
             .cloned()
     }
 
     pub fn statuses(&self) -> Vec<ExportStatus> {
-        let map = self
-            .shared
-            .statuses
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let map = self.shared.statuses.lock_recover();
         map.values().cloned().collect()
     }
 
@@ -1557,22 +1516,14 @@ impl Exporter {
 
     /// Drop a finished status (after its files were removed).
     pub fn forget(&self, id: &str) {
-        let mut map = self
-            .shared
-            .statuses
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.shared.statuses.lock_recover();
         map.retain(|k, s| !(k.eq_ignore_ascii_case(id) && !s.state.is_busy()));
     }
 
     /// Block until `id` is no longer busy or `timeout` passes.
     pub fn wait(&self, id: &str, timeout: Option<Duration>) -> Option<ExportStatus> {
         let deadline = timeout.map(|t| Instant::now() + t);
-        let mut map = self
-            .shared
-            .statuses
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.shared.statuses.lock_recover();
         loop {
             let st = map
                 .values()
@@ -1600,17 +1551,11 @@ impl Exporter {
     /// Stop the worker (a running export is cancelled: its child process is killed) and join.
     pub fn shutdown(&self) {
         self.shared.stop.store(true, Ordering::Relaxed);
-        if let Some((_, flag)) = self
-            .shared
-            .current
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
+        if let Some((_, flag)) = self.shared.current.lock_recover().as_ref() {
             flag.store(true, Ordering::Relaxed);
         }
         let _ = self.tx.send(Msg::Stop);
-        let handle = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let handle = self.thread.lock_recover().take();
         if let Some(h) = handle {
             let _ = h.join();
         }
@@ -1634,16 +1579,12 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
         }
         let res = req.job.resource;
         let id = res.id;
-        let skipped = shared
-            .cancelled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
+        let skipped = shared.cancelled.lock_recover().remove(id);
         if skipped {
             continue;
         }
         let flag = Arc::new(AtomicBool::new(false));
-        *shared.current.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, flag.clone()));
+        *shared.current.lock_recover() = Some((id, flag.clone()));
         tracing::info!(
             model = %res.model_name().unwrap_or(id),
             "model export started ({}, {})",
@@ -1690,7 +1631,7 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
             &mut report,
             &flag,
         );
-        *shared.current.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *shared.current.lock_recover() = None;
         match result {
             Ok(out) => {
                 tracing::info!(
@@ -1813,8 +1754,8 @@ pub fn needs_export_message(res: &Resource, path: &Path, outdated: bool) -> Stri
 
 /// A fake toolchain for tests (no network, no Python): records commands and writes what the real
 /// tools would (manifests of fetched resources, the venv's interpreter, the exporter's output).
-#[doc(hidden)]
-pub mod fake {
+#[cfg(test)]
+pub(crate) mod fake {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 

@@ -1,3 +1,5 @@
+*This is the original implementation plan. It is kept for history and may not match the code; README.md and CLAUDE.md describe the current state.*
+
 # Plan: Blue Onyx Prism — cross-platform Blue Iris object detection service on native OpenVINO (Rust)
 
 ## Context
@@ -14,12 +16,10 @@ You want a Blue Iris AI server like [blue-onyx](https://github.com/xnorpx/blue-o
 
 **Update (2026-10-09): multi-runtime.** OpenVINO stays the primary runtime, and it remains the best choice for Intel CPUs, Intel GPUs and Intel NPUs. It cannot accelerate NVIDIA or AMD GPUs, and on Apple Silicon it runs on CPU only. So **ONNX Runtime (the `ort` crate) is added as a second runtime**, which gives CUDA/TensorRT, DirectML and CoreML. The default device becomes `auto`: it detects the hardware and the runtimes that can actually run, then picks the best option for each model, with every other runnable option still selectable. The original "no ONNX Runtime" rule is dropped. See [Multi-runtime backend and auto device selection](#multi-runtime-backend-and-auto-device-selection).
 
-**Verified environment facts (this dev box):** i5-8600K (6C/6T), 16 GB, UHD 630 driver 31.0.101.2140 with OpenCL runtime present, plus a GTX 1070 Ti (ignored). No Rust, no VS Build Tools, no cmake; Python is Anaconda 3.8 (too old for ultralytics/openvino wheels). Git 2.45 present with identity set; `gh` 2.52 installed but **not logged in**. The target i5-8500 box is the same GPU generation, so GPU testing here is representative.
-
 ## Naming and repository
 
 - GitHub repo slug `blue-onyx-prism` (display/description "Blue Onyx Prism"), public, MIT with blue-onyx attribution in LICENSE/README. Crate `blue-onyx-prism`, lib `blue_onyx_prism`, bins `blue-onyx-prism`, `blue-onyx-prism-service` (Windows only), `blue-onyx-prism-benchmark`, `test-blue-onyx-prism`. Windows service name `BlueOnyxPrismService`; config `blue_onyx_prism_config.json` (+ `_service.json`). Nothing collides with upstream, so both can coexist on one machine.
-- Repo creation (phase 0): `git init -b main` in this folder, `.gitignore` (`target/`, `models/`, `cache/`, `openvino/` lib dir, `*.log`, `*_config*.json`, `.venv/`), initial commit of the skeleton, then **you run `gh auth login`** (interactive, browser), then `gh repo create blue-onyx-prism --public --description "Blue Onyx Prism" --source . --push`. Commits happen at the end of each phase.
+- Repo creation (phase 0): `git init -b main` in this folder, `.gitignore` (`target/`, `models/`, `cache/`, `openvino/` lib dir, `*.log`, `*_config*.json`, `.venv/`), initial commit of the skeleton, then `gh repo create blue-onyx-prism --public --description "Blue Onyx Prism" --source . --push`. Commits happen at the end of each phase.
 
 ## Cross-platform support
 

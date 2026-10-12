@@ -577,7 +577,9 @@ detection API (`/v1/vision/*`), `/v1/status/updateavailable`, the home page `/`,
 
 - To administer from another machine, set `"allow_remote_admin": true` (or check *Allow remote
   administration* on the Config page from this machine, or start with `--allow-remote-admin`). It
-  applies at once.
+  applies at once. Be aware that this also opens the Config page's file browser
+  (`GET /v1/fs/browse`, which lists folders and model/YAML file names across the whole filesystem)
+  and every admin action to anyone who can reach the port, so enable it only on a trusted network.
 - To keep everything on this machine (Blue Iris on the same PC), set `"bind_address": "127.0.0.1"`
   (or `--bind-address 127.0.0.1`); it applies when the process restarts.
 

@@ -13,6 +13,19 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
+/// `--family` parser: the lowercase family names (each with its help line) parsed through
+/// `ModelFamilyKind`'s `FromStr`, so the model layer needs no clap derive.
+pub(crate) fn family_parser() -> impl clap::builder::TypedValueParser<Value = ModelFamilyKind> {
+    use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+    PossibleValuesParser::new(
+        ModelFamilyKind::ALL.map(|k| PossibleValue::new(k.name()).help(k.description())),
+    )
+    .map(|s| {
+        s.parse::<ModelFamilyKind>()
+            .expect("PossibleValuesParser only passes known family names")
+    })
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Download the OpenVINO runtime libraries next to the executable.
@@ -60,7 +73,7 @@ pub enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Model family (fine-tuned RF-DETR needs `rfdetr`).
-        #[arg(long, value_enum, default_value = "auto")]
+        #[arg(long, value_parser = family_parser(), default_value = "auto")]
         family: crate::model::ModelFamilyKind,
         /// YAML with the class names (default: `<model>.yaml` beside it, then COCO-80).
         #[arg(long)]
@@ -140,7 +153,7 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<PathBuf>,
     /// Model family for --model.
-    #[arg(long, value_enum)]
+    #[arg(long, value_parser = family_parser())]
     pub family: Option<ModelFamilyKind>,
     /// Class names YAML for --model.
     #[arg(long)]
@@ -516,6 +529,21 @@ pub fn init_logging_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn family_values() {
+        for k in ModelFamilyKind::ALL {
+            let cli = Cli::try_parse_from(["bop", "--family", k.name()]).unwrap();
+            assert_eq!(cli.family, Some(k));
+        }
+        let err = Cli::try_parse_from(["bop", "--family", "bogus"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[possible values: auto, yolo26, yolo5, yolo8, rtdetr, detr, rfdetr]"),
+            "{err}"
+        );
+    }
 
     fn temp_cfg() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bo_cli_{}", uuid::Uuid::new_v4()));

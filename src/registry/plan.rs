@@ -3,11 +3,13 @@
 //! and what the runtimes offer; no threads are started here ([`super::Spawner::spawn_model`]
 //! turns a [`ModelPlan`] into a worker).
 
-use super::{load_request, resolve_class_names, try_lock_runtimes, validate_names};
+use super::{load_request, try_lock_runtimes, validate_names};
 use crate::backend::spec::Device;
 use crate::backend::{DeviceSpec, LoadRequest, Runtimes};
 use crate::config::{Config, ModelConfig};
+use crate::model::classes::resolve_class_names;
 use crate::resources::provision::{Provision, Wait};
+use crate::sync::LockExt;
 use crate::worker::LiveSettings;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
@@ -44,7 +46,7 @@ impl PlanRuntimes for LockedRuntimes<'_> {
     }
 
     fn first_runnable_wait(&self, spec: &DeviceSpec, model: &Path) -> Option<(Device, String)> {
-        let rt = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let rt = self.0.lock_recover();
         rt.first_runnable(spec, model)
     }
 }

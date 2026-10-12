@@ -29,6 +29,7 @@ use crate::backend::spec::{self, Device, DeviceSpec};
 use crate::backend::{CoreOptions, Runtimes};
 use crate::config::{BenchmarkConfig, Config, DatasetRef};
 use crate::model::PostParams;
+use crate::sync::LockExt;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -306,7 +307,7 @@ impl BenchmarkService {
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner.lock_recover()
     }
 
     pub fn status(&self) -> Status {
@@ -513,7 +514,7 @@ fn download_datasets(ctx: &RunContext, ids: &[String], h: &RunHandle) -> Result<
     let mut keys: Vec<(String, String)> = Vec::new();
     for id in ids {
         let rid = format!("{}{id}", crate::resources::catalog::BENCH_ID_PREFIX);
-        match crate::resources::status::download(rctx, &ctx.config, &rid, false) {
+        match crate::resources::actions::download(rctx, &ctx.config, &rid, false) {
             Ok(msg) => {
                 tracing::info!("benchmark: {msg}");
                 if let Some(r) = crate::resources::catalog::bench_set(id) {
@@ -573,6 +574,78 @@ fn download_datasets(ctx: &RunContext, ids: &[String], h: &RunHandle) -> Result<
 /// file (also when cancelled).
 pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> {
     let devices = req.parsed_devices()?;
+    let mut sets = resolve_sets(ctx, req, h)?;
+    let runtimes = run_runtimes(ctx)?;
+    let versions = RuntimeVersions::of(&runtimes.lock_recover());
+    let run = ServiceRun {
+        ctx,
+        req,
+        h,
+        runtimes,
+        devices,
+        params: PostParams {
+            confidence_threshold: ctx.config.confidence_threshold,
+            nms_iou: ctx.config.nms_iou,
+        },
+        cache_dir: ctx.config.cache_dir_path(),
+    };
+    let image_count: usize = sets.iter().map(|s| s.images.len()).sum();
+
+    // Pseudo ground truth for datasets without ground truth.
+    if sets.iter().any(|s| !s.annotated()) {
+        run.pseudo_ground_truth(&mut sets)?;
+    }
+
+    let names: Vec<String> = if req.models.is_empty() {
+        default_models(&ctx.config)
+    } else {
+        req.models.clone()
+    };
+    if names.is_empty() {
+        bail!("no model to benchmark: enable a model whose file is present, or choose models");
+    }
+    let entries: Vec<(String, Option<crate::config::ModelConfig>)> = names
+        .iter()
+        .map(|n| (n.clone(), find_model(&ctx.config, n).cloned()))
+        .collect();
+    let overall = OverallProgress {
+        runs_done: std::sync::atomic::AtomicUsize::new(0),
+        runs_total: run.runs_total(&entries),
+        model_count: entries.len(),
+        started: Instant::now(),
+    };
+    let mut finished: Vec<ModelResult> = Vec::new();
+    let mut outcome: Result<()> = Ok(());
+
+    for (mi, (name, entry)) in entries.iter().enumerate() {
+        if h.is_cancelled() {
+            outcome = Err(super::Cancelled.into());
+            break;
+        }
+        match run.bench_model(&sets, &overall, mi, name, entry.as_ref()) {
+            Ok(r) => finished.push(r),
+            Err(e) => {
+                outcome = Err(e);
+                break;
+            }
+        }
+    }
+
+    if !finished.is_empty() {
+        run.save(&sets, versions, &finished)?;
+    }
+    outcome?;
+    Ok(run_summary(
+        &finished,
+        image_count,
+        &sets,
+        &ctx.results_path,
+    ))
+}
+
+/// The datasets of a run, downloading missing built-in sets first when the config allows it;
+/// resolution problems become run warnings.
+fn resolve_sets(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<Vec<ImageSet>> {
     let root = ctx.config.data_root();
     let mut resolved = images::resolve(&req.datasets, &root, req.max_images)?;
     if !resolved.not_downloaded.is_empty() && ctx.config.benchmark.auto_download_datasets {
@@ -584,9 +657,12 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
     for w in &resolved.warnings {
         h.warn(w.clone());
     }
-    let mut sets: Vec<ImageSet> = resolved.sets;
+    Ok(resolved.sets)
+}
 
-    let runtimes = match &ctx.runtimes {
+/// The registry's shared runtimes, else dedicated ones from the config.
+fn run_runtimes(ctx: &RunContext) -> Result<Arc<Mutex<Runtimes>>> {
+    Ok(match &ctx.runtimes {
         Some(rt) => rt.clone(),
         None => {
             let c = &ctx.config;
@@ -602,24 +678,114 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
             rt.require_any()?;
             Arc::new(Mutex::new(rt))
         }
-    };
-    let lock = || runtimes.lock().unwrap_or_else(|e| e.into_inner());
-    let versions = RuntimeVersions::of(&lock());
-    let params = PostParams {
-        confidence_threshold: ctx.config.confidence_threshold,
-        nms_iou: ctx.config.nms_iou,
-    };
-    let cache_dir = ctx.config.cache_dir_path();
-    let image_count: usize = sets.iter().map(|s| s.images.len()).sum();
+    })
+}
 
-    // Pseudo ground truth for datasets without ground truth.
-    if sets.iter().any(|s| !s.annotated()) {
+/// The completion message of a run.
+fn run_summary(
+    finished: &[ModelResult],
+    image_count: usize,
+    sets: &[ImageSet],
+    results_path: &std::path::Path,
+) -> String {
+    let recs: Vec<String> = finished
+        .iter()
+        .map(|m| match &m.recommended {
+            Some(d) => format!("{}: {d}", m.model),
+            None => format!("{}: none", m.model),
+        })
+        .collect();
+    format!(
+        "Benchmarked {} model(s) on {image_count} image(s) from {}; recommended {}. Results saved \
+         to {}.",
+        finished.len(),
+        sets.iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        recs.join(", "),
+        results_path.display()
+    )
+}
+
+/// Overall progress of a run across its models and devices (percentage and ETA).
+struct OverallProgress {
+    /// Device runs finished.
+    runs_done: std::sync::atomic::AtomicUsize,
+    /// Total device runs, for the overall percentage.
+    runs_total: usize,
+    model_count: usize,
+    started: Instant,
+}
+
+impl OverallProgress {
+    /// The status view of `p`, the progress of model `mi` (0-based).
+    fn view(&self, mi: usize, p: &Progress) -> ProgressView {
+        let done = self.runs_done.load(Ordering::Relaxed);
+        let frac = if p.total == 0 {
+            0.0
+        } else {
+            p.done as f64 / p.total as f64
+        };
+        // Loading and warm-up count as the first 10% of a device run, timing as the rest.
+        let within = match p.phase {
+            Phase::Loading => 0.0,
+            Phase::Warmup => 0.1 * frac,
+            Phase::Timing => 0.1 + 0.9 * frac,
+        };
+        let percent = if self.runs_total == 0 {
+            0.0
+        } else {
+            ((done as f64 + within) / self.runs_total as f64 * 100.0).min(100.0)
+        };
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let eta_secs = (percent > 1.0).then(|| elapsed * (100.0 - percent) / percent);
+        ProgressView {
+            stage: "benchmark".into(),
+            model: p.model.to_string(),
+            model_index: mi + 1,
+            model_count: self.model_count,
+            device: p.device.to_string(),
+            phase: phase_name(p.phase),
+            done: p.done,
+            total: p.total,
+            image: p.image.to_string(),
+            runs_done: done,
+            runs_total: self.runs_total,
+            percent,
+            eta_secs,
+            text: String::new(),
+        }
+    }
+}
+
+/// One benchmark run of the service once its datasets and runtimes are ready.
+struct ServiceRun<'a> {
+    ctx: &'a RunContext,
+    req: &'a RunRequest,
+    h: &'a RunHandle,
+    runtimes: Arc<Mutex<Runtimes>>,
+    /// The requested devices (None = every runnable option of each model).
+    devices: Option<Vec<Device>>,
+    params: PostParams,
+    cache_dir: Option<PathBuf>,
+}
+
+impl ServiceRun<'_> {
+    fn lock(&self) -> MutexGuard<'_, Runtimes> {
+        self.runtimes.lock_recover()
+    }
+
+    /// Fill the ground truth of the sets without it from the reference model. Only
+    /// cancellation fails; any other problem is a warning (accuracy not scored on those sets).
+    fn pseudo_ground_truth(&self, sets: &mut [ImageSet]) -> Result<()> {
+        let (ctx, h, devices) = (self.ctx, self.h, self.devices.as_deref());
         // The guard of `lock()` is dropped before pseudo ground truth locks the runtimes again.
-        let reference = pick_reference(&ctx.config, req.reference_model.as_deref())
+        let reference = pick_reference(&ctx.config, self.req.reference_model.as_deref())
             .and_then(|m| job_for_config(&ctx.config, m, None))
             .map(|job| {
-                let sel = lock().selection(Some(&job.path));
-                (pseudo_gt_device(&sel, devices.as_deref()), job)
+                let sel = self.lock().selection(Some(&job.path));
+                (pseudo_gt_device(&sel, devices), job)
             });
         match reference {
             Ok((Some(device), job)) => {
@@ -644,19 +810,13 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
                         ..Default::default()
                     })
                 };
-                let mut pb = Bench::new(&[], 0, 1, params);
-                pb.cache_dir = cache_dir.as_deref();
+                let mut pb = Bench::new(&[], 0, 1, self.params);
+                pb.cache_dir = self.cache_dir.as_deref();
                 pb.cancel = Some(h.cancel_flag());
                 pb.progress = Some(&progress);
-                match pseudo_ground_truth(&pb, &runtimes, &job, device, &mut sets) {
+                match pseudo_ground_truth(&pb, &self.runtimes, &job, device, sets) {
                     Ok(_) => {
-                        let key = crate::registry::normalize_name;
-                        let in_run = req.models.is_empty()
-                            && default_models(&ctx.config)
-                                .iter()
-                                .any(|m| key(m) == key(&job.name))
-                            || req.models.iter().any(|m| key(m) == key(&job.name));
-                        if in_run {
+                        if self.in_run(&job.name) {
                             h.warn(format!(
                                 "{} is also the pseudo-ground-truth reference: its accuracy on \
                                  the datasets without ground truth is 100% by construction",
@@ -673,63 +833,65 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
             }
             Ok((None, _)) => h.warn(format!(
                 "{}; accuracy is not scored for the datasets without ground truth",
-                no_pseudo_gt_device(devices.as_deref())
+                no_pseudo_gt_device(devices)
             )),
             Err(e) => h.warn(format!(
                 "{e:#}; accuracy is not scored for the datasets without ground truth"
             )),
         }
+        Ok(())
     }
 
-    let names: Vec<String> = if req.models.is_empty() {
-        default_models(&ctx.config)
-    } else {
-        req.models.clone()
-    };
-    if names.is_empty() {
-        bail!("no model to benchmark: enable a model whose file is present, or choose models");
-    }
-    // Total device runs, for the overall percentage.
-    let per_model = |path: &std::path::Path| -> usize {
-        match &devices {
-            Some(d) => d.len(),
-            None => lock()
-                .selection(Some(path))
-                .options
+    /// Whether the model `name` is benchmarked by this run.
+    fn in_run(&self, name: &str) -> bool {
+        let key = crate::registry::normalize_name;
+        self.req.models.is_empty()
+            && default_models(&self.ctx.config)
                 .iter()
-                .filter(|o| o.runnable)
-                .count(),
-        }
-    };
-    let entries: Vec<(String, Option<crate::config::ModelConfig>)> = names
-        .iter()
-        .map(|n| (n.clone(), find_model(&ctx.config, n).cloned()))
-        .collect();
-    let runs_total: usize = entries
-        .iter()
-        .map(|(_, m)| {
-            m.as_ref()
-                .map(|m| per_model(&ctx.config.data_path(&m.path)))
-                .unwrap_or(0)
-        })
-        .sum();
+                .any(|m| key(m) == key(name))
+            || self.req.models.iter().any(|m| key(m) == key(name))
+    }
 
-    let model_count = entries.len();
-    let runs_done = std::sync::atomic::AtomicUsize::new(0);
-    let started = Instant::now();
-    let mut finished: Vec<ModelResult> = Vec::new();
-    let mut outcome: Result<()> = Ok(());
+    /// Total device runs of `entries` (unknown models count none).
+    fn runs_total(&self, entries: &[(String, Option<crate::config::ModelConfig>)]) -> usize {
+        let per_model = |path: &std::path::Path| -> usize {
+            match &self.devices {
+                Some(d) => d.len(),
+                None => self
+                    .lock()
+                    .selection(Some(path))
+                    .options
+                    .iter()
+                    .filter(|o| o.runnable)
+                    .count(),
+            }
+        };
+        entries
+            .iter()
+            .map(|(_, m)| {
+                m.as_ref()
+                    .map(|m| per_model(&self.ctx.config.data_path(&m.path)))
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
 
-    for (mi, (name, entry)) in entries.iter().enumerate() {
-        if h.is_cancelled() {
-            outcome = Err(super::Cancelled.into());
-            break;
-        }
+    /// Sweep model `mi` (`name`, its config `entry`) over the devices, publishing progress and
+    /// the result. A model that is not configured or cannot be loaded is a failed result; an
+    /// error (cancellation, a failed sweep) ends the run.
+    fn bench_model(
+        &self,
+        sets: &[ImageSet],
+        overall: &OverallProgress,
+        mi: usize,
+        name: &str,
+        entry: Option<&crate::config::ModelConfig>,
+    ) -> Result<ModelResult> {
+        let (ctx, req, h) = (self.ctx, self.req, self.h);
         let Some(m) = entry else {
             let r = ModelResult::failed(name, "", format!("'{name}' is not a configured model"));
             h.push_done(r.clone());
-            finished.push(r);
-            continue;
+            return Ok(r);
         };
         let job = match job_for_config(&ctx.config, m, None) {
             Ok(j) => j,
@@ -737,110 +899,55 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
                 let path = ctx.config.data_path(&m.path).display().to_string();
                 let r = ModelResult::failed(&m.effective_name(), &path, format!("{e:#}"));
                 h.push_done(r.clone());
-                finished.push(r);
-                continue;
+                return Ok(r);
             }
         };
         let configured = ctx
             .loaded
             .get(&crate::registry::normalize_name(&job.name))
             .cloned()
-            .or_else(|| configured_device(&ctx.config, m, &lock().selection(Some(&job.path))));
-        let progress = |p: &Progress| {
-            let done = runs_done.load(Ordering::Relaxed);
-            let frac = if p.total == 0 {
-                0.0
-            } else {
-                p.done as f64 / p.total as f64
-            };
-            // Loading and warm-up count as the first 10% of a device run, timing as the rest.
-            let within = match p.phase {
-                Phase::Loading => 0.0,
-                Phase::Warmup => 0.1 * frac,
-                Phase::Timing => 0.1 + 0.9 * frac,
-            };
-            let percent = if runs_total == 0 {
-                0.0
-            } else {
-                ((done as f64 + within) / runs_total as f64 * 100.0).min(100.0)
-            };
-            let elapsed = started.elapsed().as_secs_f64();
-            let eta_secs = (percent > 1.0).then(|| elapsed * (100.0 - percent) / percent);
-            h.set_progress(ProgressView {
-                stage: "benchmark".into(),
-                model: p.model.to_string(),
-                model_index: mi + 1,
-                model_count,
-                device: p.device.to_string(),
-                phase: phase_name(p.phase),
-                done: p.done,
-                total: p.total,
-                image: p.image.to_string(),
-                runs_done: done,
-                runs_total,
-                percent,
-                eta_secs,
-                text: String::new(),
-            });
-        };
-        let mut bench = Bench::new(&sets, req.warmup, req.repeat, params);
+            .or_else(|| configured_device(&ctx.config, m, &self.lock().selection(Some(&job.path))));
+        let progress = |p: &Progress| h.set_progress(overall.view(mi, p));
+        let mut bench = Bench::new(sets, req.warmup, req.repeat, self.params);
         bench.object_filter = &ctx.config.object_filter;
-        bench.cache_dir = cache_dir.as_deref();
+        bench.cache_dir = self.cache_dir.as_deref();
         bench.cancel = Some(h.cancel_flag());
         bench.progress = Some(&progress);
         bench.weights = req.weights;
         bench.threshold_objective = req.threshold_objective;
         bench.accuracy_metric = req.accuracy_metric;
         let opts = SweepOptions {
-            devices: devices.clone(),
+            devices: self.devices.clone(),
             configured,
             threshold_objective: req.threshold_objective,
         };
-        let swept = sweep(&bench, &runtimes, &job, &opts, &mut |partial| {
-            runs_done.fetch_add(1, Ordering::Relaxed);
+        let r = sweep(&bench, &self.runtimes, &job, &opts, &mut |partial| {
+            overall.runs_done.fetch_add(1, Ordering::Relaxed);
             h.set_current(partial.summary());
-        });
-        match swept {
-            Ok(r) => {
-                h.push_done(r.summary());
-                finished.push(r);
-            }
-            Err(e) => {
-                outcome = Err(e);
-                break;
-            }
-        }
+        })?;
+        h.push_done(r.summary());
+        Ok(r)
     }
 
-    if !finished.is_empty() {
-        let results = BenchmarkResults::new(HardwareSummary::current(), versions, finished.clone())
-            .with_sets(&sets);
+    /// Merge the finished models into the results file (and the stored predictions).
+    fn save(
+        &self,
+        sets: &[ImageSet],
+        versions: RuntimeVersions,
+        finished: &[ModelResult],
+    ) -> Result<()> {
+        let (ctx, req) = (self.ctx, self.req);
+        let results =
+            BenchmarkResults::new(HardwareSummary::current(), versions, finished.to_vec())
+                .with_sets(sets);
         let mut merged =
             BenchmarkResults::merge(BenchmarkResults::load_or_warn(&ctx.results_path), results);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(req.accuracy_metric, req.weights);
         merged.save(&ctx.results_path)?;
-        super::search::save_beside(&ctx.results_path, &merged, &finished);
+        super::search::save_beside(&ctx.results_path, &merged, finished);
+        Ok(())
     }
-    outcome?;
-    let recs: Vec<String> = finished
-        .iter()
-        .map(|m| match &m.recommended {
-            Some(d) => format!("{}: {d}", m.model),
-            None => format!("{}: none", m.model),
-        })
-        .collect();
-    Ok(format!(
-        "Benchmarked {} model(s) on {image_count} image(s) from {}; recommended {}. Results saved \
-         to {}.",
-        finished.len(),
-        sets.iter()
-            .map(|s| s.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        recs.join(", "),
-        ctx.results_path.display()
-    ))
 }
 
 fn phase_name(p: Phase) -> String {

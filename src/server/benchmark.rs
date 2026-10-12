@@ -22,9 +22,11 @@ use super::{
 use crate::benchmark::images::{self, ImageSet};
 use crate::benchmark::service::{RunContext, RunRequest, default_models};
 use crate::benchmark::{BenchmarkResults, configured_device, results_path};
-use crate::config::{
-    Config, DatasetRef, DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
+use crate::config::{Config, DatasetRef};
+use crate::config_form::{
+    DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
 };
+use crate::sync::LockExt;
 use askama::Template;
 use axum::Json;
 use axum::extract::rejection::{FormRejection, QueryRejection};
@@ -484,7 +486,7 @@ fn saved_view(
         file_stamp(&path),
         file_stamp(&preds)
     );
-    let mut cache = SAVED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = SAVED_CACHE.lock_recover();
     if let Some((k, v)) = cache.as_ref()
         && *k == key
     {
@@ -794,54 +796,10 @@ pub(super) async fn apply(
         Ok(Form(f)) => f,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
-    let field = |k: &str| {
-        form.iter()
-            .find(|(key, _)| key == k)
-            .map(|(_, v)| v.as_str())
-    };
-    let models: Vec<String> = form
-        .iter()
-        .filter(|(k, _)| k == "model")
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .collect();
-    let restart = field("restart").is_some_and(truthy);
-    let picks: Vec<(String, Option<String>)> = if field("all").is_some_and(truthy) {
-        let path = results_path(&state.config_path);
-        let results = match BenchmarkResults::load(&path) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return json_error(
-                    StatusCode::NOT_FOUND,
-                    "no benchmark results yet; run a benchmark first".into(),
-                );
-            }
-            Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        };
-        let only = (!models.is_empty()).then_some(models.as_slice());
-        let recs = results.recommendations(only);
-        if recs.is_empty() {
-            return json_error(
-                StatusCode::NOT_FOUND,
-                "the saved results recommend no device for these models".into(),
-            );
-        }
-        // Results may name models that were removed from the config since: skip those.
-        let cfg = state.config_read().clone();
-        recs.into_iter()
-            .filter(|(m, _)| crate::benchmark::find_model(&cfg, m).is_some())
-            .map(|(m, d)| (m, Some(d)))
-            .collect()
-    } else {
-        match (models.as_slice(), field("device")) {
-            ([model], Some(device)) => vec![(model.clone(), Some(device.to_string()))],
-            _ => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "give `model` and `device`, or `all=1` to apply every recommendation".into(),
-                );
-            }
-        }
+    let restart = form_field(&form, "restart").is_some_and(truthy);
+    let picks = match device_picks(&state, &form) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
     };
     let mut changes: Vec<DeviceChange> = Vec::new();
     let saved = save_config(&state, "benchmark apply", |c| {
@@ -852,6 +810,111 @@ pub(super) async fn apply(
         warn!("benchmark apply refused: {e:#}");
         return json_error(StatusCode::BAD_REQUEST, format!("{e:#}"));
     }
+    let (message, restarting) = device_apply_outcome(&state, &changes, restart);
+    info!("benchmark apply: {message}");
+    Json(serde_json::json!({
+        "success": true,
+        "message": message,
+        "changes": changes,
+        "restarting": restarting,
+    }))
+    .into_response()
+}
+
+/// An API error answered as `{"success": false, "message": ...}` with its status (see
+/// [`json_error`]); small, unlike a [`Response`], so helpers can return it in a `Result`.
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        json_error(self.status, self.message)
+    }
+}
+
+/// The value of the first `key` field of a form (untrimmed).
+fn form_field<'f>(form: &'f [(String, String)], key: &str) -> Option<&'f str> {
+    form.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// The non-empty `model` fields of a form, trimmed.
+fn form_models(form: &[(String, String)]) -> Vec<String> {
+    form.iter()
+        .filter(|(k, _)| k == "model")
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// The saved results of the apply actions: 404 when there are none yet, 500 when they cannot
+/// be read.
+fn results_for_apply(state: &AppState) -> Result<BenchmarkResults, ApiError> {
+    match BenchmarkResults::load(&results_path(&state.config_path)) {
+        Ok(Some(r)) => Ok(r),
+        Ok(None) => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no benchmark results yet; run a benchmark first",
+        )),
+        Err(e) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e:#}"),
+        )),
+    }
+}
+
+/// The (model, device) pairs of an apply form: `all=1` takes the saved recommendations of
+/// the configured models (limited to the form's models, if any), else one `model` + `device`.
+fn device_picks(
+    state: &AppState,
+    form: &[(String, String)],
+) -> Result<Vec<(String, Option<String>)>, ApiError> {
+    let models = form_models(form);
+    if !form_field(form, "all").is_some_and(truthy) {
+        return match (models.as_slice(), form_field(form, "device")) {
+            ([model], Some(device)) => Ok(vec![(model.clone(), Some(device.to_string()))]),
+            _ => Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "give `model` and `device`, or `all=1` to apply every recommendation",
+            )),
+        };
+    }
+    let results = results_for_apply(state)?;
+    let only = (!models.is_empty()).then_some(models.as_slice());
+    let recs = results.recommendations(only);
+    if recs.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "the saved results recommend no device for these models",
+        ));
+    }
+    // Results may name models that were removed from the config since: skip those.
+    let cfg = state.config_read().clone();
+    Ok(recs
+        .into_iter()
+        .filter(|(m, _)| crate::benchmark::find_model(&cfg, m).is_some())
+        .map(|(m, d)| (m, Some(d)))
+        .collect())
+}
+
+/// The answer to saved device `changes` and whether the server restarts (scheduled here when
+/// `restart` is asked and a change could not be applied by a per-model reload).
+fn device_apply_outcome(
+    state: &Arc<AppState>,
+    changes: &[DeviceChange],
+    restart: bool,
+) -> (String, bool) {
     let force_cpu = state.config_read().force_cpu;
     let mut message = if changes.is_empty() {
         "No change: the models already use these devices.".to_string()
@@ -878,7 +941,7 @@ pub(super) async fn apply(
     let restarting = restart && unapplied;
     if restarting {
         message.push_str(" Restarting the server to load the models on their new devices.");
-        schedule_restart(&state);
+        schedule_restart(state);
     } else if unapplied {
         message.push_str(" Restart the server to apply.");
     } else if changes
@@ -889,35 +952,26 @@ pub(super) async fn apply(
     } else if !changes.is_empty() {
         message.push_str(" Used when the model is enabled (no restart needed).");
     }
-    info!("benchmark apply: {message}");
-    Json(serde_json::json!({
-        "success": true,
-        "message": message,
-        "changes": changes,
-        "restarting": restarting,
-    }))
-    .into_response()
+    (message, restarting)
 }
 
 /// The saved results and stored predictions, or a 400 telling to run a benchmark first.
-#[allow(clippy::result_large_err)]
 fn search_data(
     state: &AppState,
-) -> Result<(BenchmarkResults, crate::benchmark::search::StoredPreds), Response> {
+) -> Result<(BenchmarkResults, crate::benchmark::search::StoredPreds), ApiError> {
     use crate::benchmark::search::{StoredPreds, preds_path};
     let none = || {
-        json_error(
+        ApiError::new(
             StatusCode::BAD_REQUEST,
             "no stored predictions: run a benchmark first (it stores the predictions the \
-             threshold search needs)"
-                .into(),
+             threshold search needs)",
         )
     };
     let results = match BenchmarkResults::load(&results_path(&state.config_path)) {
         Ok(Some(r)) => r,
         Ok(None) => return Err(none()),
         Err(e) => {
-            return Err(json_error(
+            return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("{e:#}"),
             ));
@@ -926,7 +980,7 @@ fn search_data(
     match StoredPreds::load(&preds_path(&state.config_path)) {
         Ok(Some(p)) if !p.runs.is_empty() => Ok((results, p)),
         Ok(_) => Err(none()),
-        Err(e) => Err(json_error(
+        Err(e) => Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{e:#}"),
         )),
@@ -953,7 +1007,7 @@ fn current_thresholds(cfg: &Config) -> HashMap<String, f64> {
 pub(super) async fn search_options(State(state): State<Arc<AppState>>) -> Response {
     let (results, preds) = match search_data(&state) {
         Ok(d) => d,
-        Err(r) => return r,
+        Err(e) => return e.into_response(),
     };
     let cfg = state.config_read().clone();
     Json(serde_json::json!({
@@ -990,7 +1044,7 @@ pub(super) async fn threshold_search(
     };
     let (results, preds) = match search_data(&state) {
         Ok(d) => d,
-        Err(r) => return r,
+        Err(e) => return e.into_response(),
     };
     let current = current_thresholds(&cfg);
     let lookup = |m: &str| {
@@ -1040,65 +1094,9 @@ pub(super) async fn apply_threshold(
         Ok(Form(f)) => f,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
-    let field = |k: &str| form.iter().find(|(key, _)| key == k).map(|(_, v)| v.trim());
-    let models: Vec<String> = form
-        .iter()
-        .filter(|(k, _)| k == "model")
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .collect();
-    let picks: Vec<(String, f32)> = if field("all").is_some_and(truthy) {
-        let results = match BenchmarkResults::load(&results_path(&state.config_path)) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return json_error(
-                    StatusCode::NOT_FOUND,
-                    "no benchmark results yet; run a benchmark first".into(),
-                );
-            }
-            Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        };
-        let only = (!models.is_empty()).then_some(models.as_slice());
-        let cfg = state.config_read().clone();
-        let picks: Vec<(String, f32)> = results
-            .thresholds(only)
-            .into_iter()
-            .filter(|(m, _)| crate::benchmark::find_model(&cfg, m).is_some())
-            .collect();
-        if picks.is_empty() {
-            return json_error(
-                StatusCode::NOT_FOUND,
-                "the saved results have no best threshold for these models".into(),
-            );
-        }
-        picks
-    } else {
-        let values: Vec<&str> = form
-            .iter()
-            .filter(|(k, _)| k == "threshold")
-            .map(|(_, v)| v.trim())
-            .collect();
-        if models.is_empty() || models.len() != values.len() {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "give `model` and `threshold` (repeated in pairs), or `all=1` to apply every \
-                 best threshold"
-                    .into(),
-            );
-        }
-        let mut picks = Vec::new();
-        for (m, t) in models.iter().zip(values) {
-            match t.parse::<f32>() {
-                Ok(v) => picks.push((m.clone(), v)),
-                Err(_) => {
-                    return json_error(
-                        StatusCode::BAD_REQUEST,
-                        format!("threshold: '{t}' is not a number"),
-                    );
-                }
-            }
-        }
-        picks
+    let picks = match threshold_picks(&state, &form) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
     };
     let mut changes: Vec<ThresholdChange> = Vec::new();
     if let Err(e) = save_config(&state, "benchmark apply-threshold", |c| {
@@ -1138,6 +1136,58 @@ pub(super) async fn apply_threshold(
     .into_response()
 }
 
+/// The (model, threshold) pairs of an apply-threshold form: `all=1` takes the saved best
+/// thresholds of the configured models (limited to the form's models, if any), else the
+/// `model` / `threshold` pairs.
+fn threshold_picks(
+    state: &AppState,
+    form: &[(String, String)],
+) -> Result<Vec<(String, f32)>, ApiError> {
+    let models = form_models(form);
+    if form_field(form, "all").is_some_and(truthy) {
+        let results = results_for_apply(state)?;
+        let only = (!models.is_empty()).then_some(models.as_slice());
+        let cfg = state.config_read().clone();
+        let picks: Vec<(String, f32)> = results
+            .thresholds(only)
+            .into_iter()
+            .filter(|(m, _)| crate::benchmark::find_model(&cfg, m).is_some())
+            .collect();
+        if picks.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "the saved results have no best threshold for these models",
+            ));
+        }
+        return Ok(picks);
+    }
+    let values: Vec<&str> = form
+        .iter()
+        .filter(|(k, _)| k == "threshold")
+        .map(|(_, v)| v.trim())
+        .collect();
+    if models.is_empty() || models.len() != values.len() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "give `model` and `threshold` (repeated in pairs), or `all=1` to apply every \
+             best threshold",
+        ));
+    }
+    let mut picks = Vec::new();
+    for (m, t) in models.iter().zip(values) {
+        match t.parse::<f32>() {
+            Ok(v) => picks.push((m.clone(), v)),
+            Err(_) => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("threshold: '{t}' is not a number"),
+                ));
+            }
+        }
+    }
+    Ok(picks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::router;
@@ -1150,6 +1200,27 @@ mod tests {
     use axum::http::{Request, header};
     use std::time::Duration;
     use tower::ServiceExt;
+
+    #[test]
+    fn form_helpers_and_api_errors() {
+        let form: Vec<(String, String)> = [
+            ("model", " a "),
+            ("all", "1"),
+            ("model", ""),
+            ("model", "b"),
+            ("all", "0"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(form_models(&form), ["a", "b"]);
+        assert_eq!(form_field(&form, "all"), Some("1"));
+        assert_eq!(form_field(&form, "device"), None);
+        // Small enough to return in a `Result` without boxing.
+        assert!(std::mem::size_of::<ApiError>() <= 32);
+        let r = ApiError::new(StatusCode::NOT_FOUND, "nope").into_response();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
 
     fn state() -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("bo_bench_{}", uuid::Uuid::new_v4()));

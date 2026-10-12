@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::registry::ModelRegistry;
 use crate::startup::ModelState;
+use crate::sync::RwLockExt;
 use crate::worker::WorkerHandle;
 use askama::Template;
 use axum::extract::{DefaultBodyLimit, State};
@@ -265,15 +266,12 @@ impl Shared {
 
     /// The generation new requests are served by.
     pub fn current(&self) -> Arc<AppState> {
-        self.current
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.current.read_recover().clone()
     }
 
     /// Make `state` current; returns the previous generation.
     pub fn swap(&self, state: Arc<AppState>) -> Arc<AppState> {
-        let mut g = self.current.write().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.current.write_recover();
         std::mem::replace(&mut *g, state)
     }
 }

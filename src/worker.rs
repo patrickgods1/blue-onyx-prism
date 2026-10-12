@@ -29,6 +29,7 @@ use crate::model::{Family, PostParams, PreprocessCtx};
 use crate::prep::{PrepJob, PrepPool, PrepSpec, Prepared};
 use crate::profile::{DeviceTuning, Overrides, Profile};
 use crate::startup::{ModelState, StateHandle};
+use crate::sync::LockExt;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError};
@@ -153,19 +154,19 @@ impl LoadGate {
 
     pub fn open(&self) {
         let (lock, cv) = &*self.0;
-        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock.lock_recover();
         *g = true;
         cv.notify_all();
     }
 
     pub fn is_open(&self) -> bool {
-        *self.0.0.lock().unwrap_or_else(|e| e.into_inner())
+        *self.0.0.lock_recover()
     }
 
     /// Block until the gate opens or `shutdown` is cancelled. Returns true when opened.
     pub fn wait(&self, shutdown: &CancellationToken) -> bool {
         let (lock, cv) = &*self.0;
-        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = lock.lock_recover();
         while !*g {
             if shutdown.is_cancelled() {
                 return false;
@@ -322,12 +323,7 @@ impl WorkerHandle {
     /// Execution provider string of the loaded model; before that, where it is headed:
     /// "<planned label> (loading)" ("not loaded" for a model that failed before planning).
     pub fn execution_provider(&self) -> String {
-        if let Some(p) = self
-            .device
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
-        {
+        if let Some(p) = loaded_provider(&self.device) {
             return p;
         }
         let failed = matches!(self.state.get(), ModelState::Failed(_));
@@ -619,6 +615,15 @@ struct WorkerCtx {
     shutdown: CancellationToken,
 }
 
+/// Execution provider string of the device the model loaded on (None before it has loaded, or
+/// when the lock is poisoned). `device` is the slot shared by [`WorkerHandle`] and the worker.
+fn loaded_provider(device: &RwLock<Option<DeviceInfo>>) -> Option<String> {
+    device
+        .read()
+        .ok()
+        .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
+}
+
 /// Elapsed milliseconds as the API's i32.
 fn ms(d: Duration) -> i32 {
     d.as_millis().min(i32::MAX as u128) as i32
@@ -635,8 +640,10 @@ impl WorkerCtx {
             }
             if self.cfg.classes.is_empty() {
                 let classes = self.cfg.model.classes.clone();
-                match crate::registry::resolve_class_names(&self.cfg.model.path, classes.as_deref())
-                {
+                match crate::model::classes::resolve_class_names(
+                    &self.cfg.model.path,
+                    classes.as_deref(),
+                ) {
                     Ok(c) => self.cfg.classes = c,
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -897,12 +904,7 @@ impl WorkerCtx {
         r: Result<Result<Prepared>, crossbeam_channel::RecvError>,
         meta: &Meta,
     ) -> Stage {
-        let provider = self
-            .device
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
-            .unwrap_or_default();
+        let provider = loaded_provider(&self.device).unwrap_or_default();
         match r {
             Ok(Ok(prepared)) => Stage::Ready(prepared),
             Ok(Err(e)) => Stage::Answer(self.failure(meta, &provider, &e)),
@@ -1095,7 +1097,7 @@ impl WorkerCtx {
     fn load(&self) -> Result<Engine> {
         let name = &self.cfg.name;
         let candidates = {
-            let rt = self.runtimes.lock().unwrap_or_else(|e| e.into_inner());
+            let rt = self.runtimes.lock_recover();
             rt.plan(&self.cfg.device, &self.cfg.load.path)
         };
         info!(
@@ -1161,7 +1163,7 @@ impl WorkerCtx {
         self.state
             .set_initializing(format!("{COMPILING_ON} {}", cand.device));
         let compiled = {
-            let mut rt = self.runtimes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut rt = self.runtimes.lock_recover();
             let tuning = self.tuning_for(&rt, cand);
             rt.compile_tuned(cand, &self.cfg.load, &tuning)?
         };
@@ -1216,12 +1218,7 @@ impl WorkerCtx {
         inference_ms: i32,
         process_ms: i32,
     ) -> VisionDetectionResponse {
-        let provider = self
-            .device
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
-            .unwrap_or_default();
+        let provider = loaded_provider(&self.device).unwrap_or_default();
         VisionDetectionResponse {
             command: "detect".into(),
             executionProvider: provider,

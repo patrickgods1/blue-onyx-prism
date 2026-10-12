@@ -61,7 +61,7 @@ fn action_response(
     state: &AppState,
     headers: &HeaderMap,
     id: &str,
-    result: Result<String, crate::resources::status::ActionError>,
+    result: Result<String, crate::resources::actions::ActionError>,
 ) -> Response {
     if let Err(e) = &result {
         warn!("resource action refused: {e}");
@@ -80,7 +80,7 @@ fn action_response(
             .flat_map(|g| g.rows.iter())
             .any(|r| r.id == id)
             || t.local_models.iter().any(|l| l.id == id)
-            || id == crate::resources::status::CUSTOM_MODEL_ROW;
+            || id == crate::resources::actions::CUSTOM_MODEL_ROW;
         t.at = if has_row {
             "resources-row"
         } else {
@@ -99,8 +99,8 @@ fn action_response(
     }
 }
 
-fn no_manager() -> crate::resources::status::ActionError {
-    crate::resources::status::ActionError::Failed(
+fn no_manager() -> crate::resources::actions::ActionError {
+    crate::resources::actions::ActionError::Failed(
         "this server has no download manager (run the service, or use `blue-onyx-prism fetch`)"
             .into(),
     )
@@ -117,7 +117,7 @@ pub(super) async fn resources_download(
         let (id, confirm) = action_fields(&form);
         let cfg = state.config_read().clone();
         let result = match &state.resources {
-            Some(ctx) => crate::resources::status::download(ctx, &cfg, &id, confirm),
+            Some(ctx) => crate::resources::actions::download(ctx, &cfg, &id, confirm),
             None => Err(no_manager()),
         };
         action_response(&state, &headers, &id, result)
@@ -135,7 +135,7 @@ pub(super) async fn resources_remove(
         let form = form.map(|Form(f)| f).unwrap_or_default();
         let (id, _) = action_fields(&form);
         let cfg = state.config_read().clone();
-        let result = crate::resources::status::remove(state.resources.as_ref(), &cfg, &id);
+        let result = crate::resources::actions::remove(state.resources.as_ref(), &cfg, &id);
         action_response(&state, &headers, &id, result)
     })
     .await
@@ -153,15 +153,15 @@ pub(super) async fn resources_add_to_config(
         let (id, _) = action_fields(&form);
         let mut outcome = String::new();
         let saved = save_config(&state, "resources add-to-config", |c| {
-            outcome = crate::resources::status::add_to_config(state.resources.as_ref(), c, &id)
+            outcome = crate::resources::actions::add_to_config(state.resources.as_ref(), c, &id)
                 .map_err(|e| anyhow::anyhow!(e))?;
             Ok(())
         });
         let result = match saved {
             Ok(msg) => Ok(format!("{outcome}. {msg}")),
-            Err(e) => match e.downcast::<crate::resources::status::ActionError>() {
+            Err(e) => match e.downcast::<crate::resources::actions::ActionError>() {
                 Ok(a) => Err(a),
-                Err(e) => Err(crate::resources::status::ActionError::Failed(format!(
+                Err(e) => Err(crate::resources::actions::ActionError::Failed(format!(
                     "{e:#}"
                 ))),
             },
@@ -180,7 +180,7 @@ pub(super) async fn models_add(
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
     blocking(move || {
-        use crate::resources::status::{ActionError, CUSTOM_MODEL_ROW, CustomModel};
+        use crate::resources::actions::{ActionError, CUSTOM_MODEL_ROW, CustomModel};
         let form = form.map(|Form(f)| f).unwrap_or_default();
         let field = |k: &str| {
             form.get(k)
@@ -190,14 +190,12 @@ pub(super) async fn models_add(
         let some = |s: String| (!s.is_empty()).then_some(s);
         let family = match field("family").to_ascii_lowercase().as_str() {
             "" => Ok(crate::model::ModelFamilyKind::Auto),
-            f => <crate::model::ModelFamilyKind as clap::ValueEnum>::from_str(f, true).map_err(
-                |_| {
-                    ActionError::BadRequest(format!(
-                        "unknown family '{f}'; valid: {}",
-                        family_names().join(", ")
-                    ))
-                },
-            ),
+            f => f.parse::<crate::model::ModelFamilyKind>().map_err(|_| {
+                ActionError::BadRequest(format!(
+                    "unknown family '{f}'; valid: {}",
+                    family_names().join(", ")
+                ))
+            }),
         };
         let req = family.map(|family| CustomModel {
             path: field("path"),
@@ -210,7 +208,7 @@ pub(super) async fn models_add(
             Ok(req) => {
                 let mut outcome = String::new();
                 let saved = save_config(&state, "config page (add model by path)", |c| {
-                    outcome = crate::resources::status::add_custom_model(c, &req)
+                    outcome = crate::resources::actions::add_custom_model(c, &req)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     Ok(())
                 });
@@ -229,7 +227,7 @@ pub(super) async fn models_add(
 }
 
 fn family_names() -> Vec<String> {
-    <crate::model::ModelFamilyKind as clap::ValueEnum>::value_variants()
+    crate::model::ModelFamilyKind::ALL
         .iter()
         .map(ToString::to_string)
         .collect()
@@ -238,7 +236,7 @@ fn family_names() -> Vec<String> {
 /// Options of the "Add a model by path" family select (auto is the empty default option).
 pub(super) fn family_choices() -> Vec<FamilyChoice> {
     use crate::model::ModelFamilyKind as K;
-    <K as clap::ValueEnum>::value_variants()
+    K::ALL
         .iter()
         .filter(|k| **k != K::Auto)
         .map(|k| FamilyChoice {
@@ -297,7 +295,7 @@ pub(super) async fn resources_export(
         });
         let result = match &state.resources {
             Some(ctx) => {
-                crate::resources::status::export(ctx, &cfg, &id, confirm, on_done).map(|m| {
+                crate::resources::actions::export(ctx, &cfg, &id, confirm, on_done).map(|m| {
                     if add {
                         format!("{m}; it is added to the config when done")
                     } else {
@@ -317,8 +315,8 @@ pub(super) async fn resources_export(
 fn add_export_to_config(config: &crate::config_store::ConfigStore, id: &str) {
     let mut msg = String::new();
     match config.update("resources export", |c| {
-        msg =
-            crate::resources::status::add_to_config(None, c, id).map_err(|e| anyhow::anyhow!(e))?;
+        msg = crate::resources::actions::add_to_config(None, c, id)
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }) {
         Ok(_) => info!("{msg} ({})", config.path().display()),
@@ -337,7 +335,7 @@ pub(super) async fn resources_export_cancel(
         let form = form.map(|Form(f)| f).unwrap_or_default();
         let (id, _) = action_fields(&form);
         let result = match &state.resources {
-            Some(ctx) => crate::resources::status::cancel_export(ctx, &id),
+            Some(ctx) => crate::resources::actions::cancel_export(ctx, &id),
             None => Err(no_manager()),
         };
         action_response(&state, &headers, &id, result)

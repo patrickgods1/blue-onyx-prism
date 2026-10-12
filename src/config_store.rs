@@ -11,6 +11,7 @@
 
 use crate::config::Config;
 use crate::config_merge::{FieldChange, describe_changes};
+use crate::sync::RwLockExt;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -135,11 +136,11 @@ impl ConfigStore {
     }
 
     fn lock_read(&self) -> RwLockReadGuard<'_, Inner> {
-        self.inner.read().unwrap_or_else(|e| e.into_inner())
+        self.inner.read_recover()
     }
 
     fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
-        self.inner.write().unwrap_or_else(|e| e.into_inner())
+        self.inner.write_recover()
     }
 
     pub fn path(&self) -> &Path {

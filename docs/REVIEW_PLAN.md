@@ -1,3 +1,5 @@
+*This is the review follow-up plan. It is kept for history and may not match the code; README.md and CLAUDE.md describe the current state.*
+
 # Review follow-up plan
 
 Outcome of the 2026-10-11 design review. Five phases, each one PR, each green on `cargo test`,

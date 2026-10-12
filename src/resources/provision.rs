@@ -22,6 +22,7 @@ use super::catalog::{Flavor, Resource, ResourceKind};
 use super::manager::{self, Manager, ManagerOptions, State};
 use super::resolve::{self, Need, Resolution};
 use crate::config::Config;
+use crate::sync::LockExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,16 +82,13 @@ impl Provisioner {
 
     /// The YOLO26 exporter, once an export was started.
     pub fn exporter(&self) -> Option<Arc<super::export::Exporter>> {
-        self.exporter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.exporter.lock_recover().clone()
     }
 
     /// The YOLO26 exporter, started on first use (Config page Export buttons). Its downloads go
     /// through [`Self::manager_for`].
     pub fn exporter_for(&self, config: &Config) -> Arc<super::export::Exporter> {
-        let mut slot = self.exporter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.exporter.lock_recover();
         if let Some(e) = slot.as_ref() {
             return e.clone();
         }
@@ -111,10 +109,7 @@ impl Provisioner {
 
     /// The manager, once something was queued.
     pub fn manager(&self) -> Option<Arc<Manager>> {
-        self.manager
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.manager.lock_recover().clone()
     }
 
     /// Extra downloadable models (test hook, see [`ProvisionOptions`]).
@@ -125,7 +120,7 @@ impl Provisioner {
     /// The download manager, started on first use (also used by the web UI's Download
     /// buttons).
     pub fn manager_for(&self, config: &Config) -> Arc<Manager> {
-        let mut slot = self.manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.manager.lock_recover();
         if let Some(m) = slot.as_ref() {
             return m.clone();
         }

@@ -447,46 +447,82 @@ pub fn select(hw: &HardwareInfo, probe: &RuntimeProbe, has_onnx: bool) -> Select
         has_onnx,
         options: Vec::new(),
     };
-    let ov = &probe.openvino;
-
-    // NVIDIA: CUDA and TensorRT per GPU, as (CUDA ordinal, GPU) in ordinal order.
     let nvidia = cuda_ordinals(hw);
-    for target in [Target::Cuda, Target::TensorRt] {
-        for (ordinal, g) in &nvidia {
-            b.push_ort_unless(
-                target,
-                Some(*ordinal),
-                gpu_label(target, g),
-                ort_cuda_unsupported(hw, g),
+    let ov_gpus: Vec<&OvDevice> = probe.openvino.gpus().collect();
+
+    // ---- options, roughly in ranking order ----
+    b.push_nvidia(hw, &nvidia);
+    b.push_openvino_gpus(hw, &ov_gpus);
+    if hw.is_windows() {
+        b.push_directml(hw);
+    }
+    if hw.is_macos() {
+        b.push_coreml();
+    }
+    b.push_npu();
+    b.push_cpu();
+
+    // ---- auto ranking ----
+    let gpus = GpuRanking::new(hw, &b, &nvidia, &ov_gpus);
+    let mut auto = Auto {
+        b: &b,
+        list: Vec::new(),
+    };
+    // 1. Discrete GPUs; 2. integrated GPUs; 3. CoreML on Apple silicon; 4. CPU.
+    gpus.rank_discrete(&mut auto);
+    gpus.rank_integrated(&mut auto);
+    auto.rank_coreml(hw);
+    auto.rank_cpu();
+    let auto = auto.list;
+
+    Selection {
+        options: b.options,
+        auto,
+        auto_measured: false,
+    }
+}
+
+impl Builder<'_> {
+    /// NVIDIA: CUDA and TensorRT per GPU, as (CUDA ordinal, GPU) in ordinal order.
+    fn push_nvidia(&mut self, hw: &HardwareInfo, nvidia: &[(u32, &GpuAdapter)]) {
+        for target in [Target::Cuda, Target::TensorRt] {
+            for (ordinal, g) in nvidia {
+                self.push_ort_unless(
+                    target,
+                    Some(*ordinal),
+                    gpu_label(target, g),
+                    ort_cuda_unsupported(hw, g),
+                );
+            }
+        }
+    }
+
+    /// OpenVINO GPUs as listed; if none is listed but an Intel GPU exists, say why it can't run.
+    fn push_openvino_gpus(&mut self, hw: &HardwareInfo, ov_gpus: &[&OvDevice]) {
+        for d in ov_gpus {
+            if let Some(spec) = d.spec() {
+                let reason = (!d.is_intel_or_unknown()).then(|| {
+                    "not an Intel GPU (OpenVINO's GPU plugin supports Intel GPUs only)".to_string()
+                });
+                self.push(spec, ov_label("GPU", Some(d)), reason);
+            }
+        }
+        if ov_gpus.is_empty() && hw.has_vendor(GpuVendor::Intel) {
+            let intel = hw.gpus_of(GpuVendor::Intel).next().expect("has Intel");
+            let reason = self.ov_reason().unwrap_or_else(|| {
+                "OpenVINO lists no GPU device (install the Intel graphics driver / compute runtime)"
+                    .to_string()
+            });
+            self.push(
+                Device::OPENVINO_GPU,
+                format!("OpenVINO GPU ({})", intel.name),
+                Some(reason),
             );
         }
     }
 
-    // OpenVINO GPUs as listed; if none is listed but an Intel GPU exists, say why it can't run.
-    let ov_gpus: Vec<&OvDevice> = ov.gpus().collect();
-    for d in &ov_gpus {
-        if let Some(spec) = d.spec() {
-            let reason = (!d.is_intel_or_unknown()).then(|| {
-                "not an Intel GPU (OpenVINO's GPU plugin supports Intel GPUs only)".to_string()
-            });
-            b.push(spec, ov_label("GPU", Some(d)), reason);
-        }
-    }
-    if ov_gpus.is_empty() && hw.has_vendor(GpuVendor::Intel) {
-        let intel = hw.gpus_of(GpuVendor::Intel).next().expect("has Intel");
-        let reason = b.ov_reason().unwrap_or_else(|| {
-            "OpenVINO lists no GPU device (install the Intel graphics driver / compute runtime)"
-                .to_string()
-        });
-        b.push(
-            Device::OPENVINO_GPU,
-            format!("OpenVINO GPU ({})", intel.name),
-            Some(reason),
-        );
-    }
-
-    // DirectML on every Windows GPU, discrete and larger first.
-    if hw.is_windows() {
+    /// DirectML on every (Windows) GPU, discrete and larger first.
+    fn push_directml(&mut self, hw: &HardwareInfo) {
         let mut dml: Vec<&GpuAdapter> = hw.gpus.iter().collect();
         dml.sort_by(|a, c| {
             c.discrete
@@ -495,7 +531,7 @@ pub fn select(hw: &HardwareInfo, probe: &RuntimeProbe, has_onnx: bool) -> Select
                 .then(a.index.cmp(&c.index))
         });
         for g in &dml {
-            b.push_ort(
+            self.push_ort(
                 Target::DirectMl,
                 Some(g.index),
                 gpu_label(Target::DirectMl, g),
@@ -503,144 +539,205 @@ pub fn select(hw: &HardwareInfo, probe: &RuntimeProbe, has_onnx: bool) -> Select
         }
     }
 
-    if hw.is_macos() {
-        b.push_ort(
+    /// CoreML (macOS).
+    fn push_coreml(&mut self) {
+        self.push_ort(
             Target::CoreMl,
             None,
             "ONNX Runtime CoreML (Apple GPU and Neural Engine)".to_string(),
         );
     }
 
-    if let Some(npu) = ov.find("NPU") {
-        b.push(
-            device(Runtime::OpenVino, Target::Npu, None),
-            ov_label("NPU", Some(npu)),
-            None,
-        );
-    }
-
-    let ov_cpu_reason = b.ov_reason().or_else(|| {
-        ov.find("CPU")
-            .is_none()
-            .then(|| "OpenVINO lists no CPU device".to_string())
-    });
-    b.push(
-        Device::OPENVINO_CPU,
-        ov_label("CPU", ov.find("CPU")),
-        ov_cpu_reason,
-    );
-    b.push_ort(Target::Cpu, None, "ONNX Runtime CPU".to_string());
-
-    // ---- auto ranking ----
-    let mut auto: Vec<Device> = Vec::new();
-    let add = |auto: &mut Vec<Device>, d: Device| {
-        if b.runnable(&d) && !auto.contains(&d) {
-            auto.push(d);
+    /// OpenVINO's NPU, when listed (never ranked by `auto`).
+    fn push_npu(&mut self) {
+        if let Some(npu) = self.probe.openvino.find("NPU") {
+            self.push(
+                device(Runtime::OpenVino, Target::Npu, None),
+                ov_label("NPU", Some(npu)),
+                None,
+            );
         }
-    };
-
-    // Intel GPUs via OpenVINO, discrete (Arc) and integrated; several integrated and no discrete
-    // one -> only the first, as a bare `GPU` request would.
-    let intel: Vec<&OvDevice> = ov_gpus
-        .iter()
-        .copied()
-        .filter(|d| d.is_intel_or_unknown())
-        .filter(|d| d.spec().is_some_and(|s| b.runnable(&s)))
-        .collect();
-    let ov_discrete: Vec<Device> = intel
-        .iter()
-        .filter(|d| d.is_discrete())
-        .filter_map(|d| d.spec())
-        .collect();
-    let mut ov_integrated: Vec<Device> = intel
-        .iter()
-        .filter(|d| !d.is_discrete())
-        .filter_map(|d| d.spec())
-        .collect();
-    if ov_discrete.is_empty() {
-        ov_integrated.truncate(1);
     }
-    let intel_covered = !ov_discrete.is_empty() || !ov_integrated.is_empty();
-    // The k-th discrete Intel adapter (platform order) is OpenVINO's k-th discrete GPU.
-    let mut intel_discrete: Vec<&GpuAdapter> = hw
-        .gpus_of(GpuVendor::Intel)
-        .filter(|g| g.discrete)
-        .collect();
-    intel_discrete.sort_by_key(|g| g.index);
-    let ov_of = |g: &GpuAdapter| -> Option<Device> {
-        let k = intel_discrete.iter().position(|a| a.index == g.index)?;
-        ov_discrete.get(k).copied()
-    };
-    let dml_on = |g: &GpuAdapter| {
-        hw.is_windows()
-            .then(|| device(Runtime::Ort, Target::DirectMl, Some(g.index)))
-    };
 
-    // Per GPU: NVIDIA -> CUDA, TensorRT, DirectML; Intel discrete (Arc) -> OpenVINO, DirectML;
-    // Intel integrated -> DirectML unless OpenVINO covers Intel; AMD/others -> DirectML.
-    let chain = |g: &GpuAdapter| -> Vec<Device> {
+    /// The CPU tail: OpenVINO CPU, then ONNX Runtime CPU.
+    fn push_cpu(&mut self) {
+        let ov = &self.probe.openvino;
+        let ov_cpu_reason = self.ov_reason().or_else(|| {
+            ov.find("CPU")
+                .is_none()
+                .then(|| "OpenVINO lists no CPU device".to_string())
+        });
+        self.push(
+            Device::OPENVINO_CPU,
+            ov_label("CPU", ov.find("CPU")),
+            ov_cpu_reason,
+        );
+        self.push_ort(Target::Cpu, None, "ONNX Runtime CPU".to_string());
+    }
+}
+
+/// The `auto` list under construction: only runnable options of `b`, each once.
+struct Auto<'b, 'a> {
+    b: &'b Builder<'a>,
+    list: Vec<Device>,
+}
+
+impl Auto<'_, '_> {
+    fn add(&mut self, d: Device) {
+        if self.b.runnable(&d) && !self.list.contains(&d) {
+            self.list.push(d);
+        }
+    }
+
+    /// 3. CoreML on Apple silicon.
+    fn rank_coreml(&mut self, hw: &HardwareInfo) {
+        let coreml = device(Runtime::Ort, Target::CoreMl, None);
+        if hw.is_apple_silicon() && self.b.runnable(&coreml) {
+            self.list.push(coreml);
+        }
+    }
+
+    /// 4. CPU: `openvino:cpu`, else `ort:cpu`.
+    fn rank_cpu(&mut self) {
+        let ort_cpu = device(Runtime::Ort, Target::Cpu, None);
+        if self.b.runnable(&Device::OPENVINO_CPU) {
+            self.list.push(Device::OPENVINO_CPU);
+        } else if self.b.runnable(&ort_cpu) {
+            self.list.push(ort_cpu);
+        }
+    }
+}
+
+/// What the GPU part of the `auto` ranking needs: the runnable OpenVINO GPUs and how detected
+/// adapters map onto runtimes.
+struct GpuRanking<'a> {
+    hw: &'a HardwareInfo,
+    /// (CUDA ordinal, GPU), see [`cuda_ordinals`].
+    nvidia: &'a [(u32, &'a GpuAdapter)],
+    /// Runnable Intel OpenVINO GPUs marked discrete, in OpenVINO's order.
+    ov_discrete: Vec<Device>,
+    /// Runnable Intel OpenVINO integrated GPUs (only the first when there is no discrete one).
+    ov_integrated: Vec<Device>,
+    /// OpenVINO runs some Intel GPU (so integrated Intel GPUs skip DirectML).
+    intel_covered: bool,
+    /// Discrete Intel adapters in platform order.
+    intel_discrete: Vec<&'a GpuAdapter>,
+}
+
+impl<'a> GpuRanking<'a> {
+    fn new(
+        hw: &'a HardwareInfo,
+        b: &Builder<'_>,
+        nvidia: &'a [(u32, &'a GpuAdapter)],
+        ov_gpus: &[&OvDevice],
+    ) -> Self {
+        // Intel GPUs via OpenVINO, discrete (Arc) and integrated; several integrated and no
+        // discrete one -> only the first, as a bare `GPU` request would.
+        let intel: Vec<&OvDevice> = ov_gpus
+            .iter()
+            .copied()
+            .filter(|d| d.is_intel_or_unknown())
+            .filter(|d| d.spec().is_some_and(|s| b.runnable(&s)))
+            .collect();
+        let ov_discrete: Vec<Device> = intel
+            .iter()
+            .filter(|d| d.is_discrete())
+            .filter_map(|d| d.spec())
+            .collect();
+        let mut ov_integrated: Vec<Device> = intel
+            .iter()
+            .filter(|d| !d.is_discrete())
+            .filter_map(|d| d.spec())
+            .collect();
+        if ov_discrete.is_empty() {
+            ov_integrated.truncate(1);
+        }
+        let intel_covered = !ov_discrete.is_empty() || !ov_integrated.is_empty();
+        let mut intel_discrete: Vec<&GpuAdapter> = hw
+            .gpus_of(GpuVendor::Intel)
+            .filter(|g| g.discrete)
+            .collect();
+        intel_discrete.sort_by_key(|g| g.index);
+        Self {
+            hw,
+            nvidia,
+            ov_discrete,
+            ov_integrated,
+            intel_covered,
+            intel_discrete,
+        }
+    }
+
+    /// The k-th discrete Intel adapter (platform order) is OpenVINO's k-th discrete GPU.
+    fn ov_of(&self, g: &GpuAdapter) -> Option<Device> {
+        let k = self
+            .intel_discrete
+            .iter()
+            .position(|a| a.index == g.index)?;
+        self.ov_discrete.get(k).copied()
+    }
+
+    fn dml_on(&self, g: &GpuAdapter) -> Option<Device> {
+        self.hw
+            .is_windows()
+            .then(|| device(Runtime::Ort, Target::DirectMl, Some(g.index)))
+    }
+
+    /// Per GPU: NVIDIA -> CUDA, TensorRT, DirectML; Intel discrete (Arc) -> OpenVINO, DirectML;
+    /// Intel integrated -> DirectML unless OpenVINO covers Intel; AMD/others -> DirectML.
+    fn chain(&self, g: &GpuAdapter) -> Vec<Device> {
         let mut v: Vec<Device> = Vec::new();
         match g.vendor {
             GpuVendor::Nvidia => {
-                if let Some((ordinal, _)) = nvidia.iter().find(|(_, n)| n.index == g.index) {
+                if let Some((ordinal, _)) = self.nvidia.iter().find(|(_, n)| n.index == g.index) {
                     for t in [Target::Cuda, Target::TensorRt] {
                         v.push(device(Runtime::Ort, t, Some(*ordinal)));
                     }
                 }
-                v.extend(dml_on(g));
+                v.extend(self.dml_on(g));
             }
             GpuVendor::Intel if g.discrete => {
-                v.extend(ov_of(g));
-                v.extend(dml_on(g));
+                v.extend(self.ov_of(g));
+                v.extend(self.dml_on(g));
             }
-            GpuVendor::Intel if intel_covered => {}
-            _ => v.extend(dml_on(g)),
+            GpuVendor::Intel if self.intel_covered => {}
+            _ => v.extend(self.dml_on(g)),
         }
         v
-    };
-    let by_vram = |v: &mut Vec<&GpuAdapter>| {
+    }
+
+    /// The detected adapters that are (not) discrete, larger VRAM first (ties: platform order).
+    fn by_vram(&self, discrete: bool) -> Vec<&'a GpuAdapter> {
+        let mut v: Vec<&GpuAdapter> = self
+            .hw
+            .gpus
+            .iter()
+            .filter(|g| g.discrete == discrete)
+            .collect();
         v.sort_by(|a, c| c.vram_mb.cmp(&a.vram_mb).then(a.index.cmp(&c.index)));
-    };
-    let (mut discrete, mut integrated): (Vec<&GpuAdapter>, Vec<&GpuAdapter>) =
-        hw.gpus.iter().partition(|g| g.discrete);
-    by_vram(&mut discrete);
-    by_vram(&mut integrated);
+        v
+    }
 
-    // 1. Discrete GPUs, larger VRAM first (ties: platform order).
-    for g in &discrete {
-        for d in chain(g) {
-            add(&mut auto, d);
-        }
-    }
-    // 2. OpenVINO's discrete GPUs no detected adapter accounts for, then its integrated ones,
-    //    then the other integrated GPUs.
-    for d in ov_discrete.iter().chain(&ov_integrated) {
-        add(&mut auto, *d);
-    }
-    for g in &integrated {
-        for d in chain(g) {
-            add(&mut auto, d);
+    /// 1. Discrete GPUs, larger VRAM first (ties: platform order).
+    fn rank_discrete(&self, auto: &mut Auto) {
+        for g in self.by_vram(true) {
+            for d in self.chain(g) {
+                auto.add(d);
+            }
         }
     }
 
-    // 3. CoreML on Apple silicon.
-    let coreml = device(Runtime::Ort, Target::CoreMl, None);
-    if hw.is_apple_silicon() && b.runnable(&coreml) {
-        auto.push(coreml);
-    }
-
-    // 4. CPU.
-    let ort_cpu = device(Runtime::Ort, Target::Cpu, None);
-    if b.runnable(&Device::OPENVINO_CPU) {
-        auto.push(Device::OPENVINO_CPU);
-    } else if b.runnable(&ort_cpu) {
-        auto.push(ort_cpu);
-    }
-
-    Selection {
-        options: b.options,
-        auto,
-        auto_measured: false,
+    /// 2. OpenVINO's discrete GPUs no detected adapter accounts for, then its integrated ones,
+    ///    then the other integrated GPUs.
+    fn rank_integrated(&self, auto: &mut Auto) {
+        for d in self.ov_discrete.iter().chain(&self.ov_integrated) {
+            auto.add(*d);
+        }
+        for g in self.by_vram(false) {
+            for d in self.chain(g) {
+                auto.add(d);
+            }
+        }
     }
 }
 

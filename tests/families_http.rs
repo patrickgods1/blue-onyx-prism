@@ -1,111 +1,56 @@
-//! End-to-end HTTP test for the phase-2 model families: YOLO26 (IR from
-//! `scripts/export_model.py`, both explicit and `auto` family) and RT-DETRv2 (ONNX), served
-//! together on CPU and queried through `/v1/vision/custom/{model}`.
+//! End-to-end HTTP test for the model families: YOLO26 (IR from `scripts/export_model.py`,
+//! both explicit and `auto` family) and RT-DETRv2 (ONNX), served together on CPU and queried
+//! through `/v1/vision/custom/{model}`.
 //!
-//! Each model is used only if present under `models/` (`yolo26n.xml`, `yolo26s.xml`,
-//! `rt-detrv2-s.onnx`); the test skips (passes with a message) when none are, or when `openvino/`
-//! is missing. Set `BLUE_ONYX_TEST_ROOT` to point at another checkout that has them.
+//! `#[ignore]`d: needs `openvino/` and `models/IPcam-general.{onnx,yaml}` under
+//! `common::test_root()` (a missing one fails the test). `yolo26s.xml`, `yolo26n.xml` and
+//! `rt-detrv2-s.onnx` are optional extras: each present one is served and checked too.
 
-use blue_onyx_prism::api::VisionDetectionResponse;
+mod common;
+
 use blue_onyx_prism::config::{Config, ModelConfig};
-use blue_onyx_prism::metrics::Metrics;
 use blue_onyx_prism::model::ModelFamilyKind;
-use blue_onyx_prism::registry::ModelRegistry;
-use blue_onyx_prism::server::{self, AppState};
-use std::path::PathBuf;
-use std::sync::Arc;
+use common::{Server, post_image_with};
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
-
-const TEST_IMAGE: &str = "tests/data/dog_bike_car.jpg";
-
-fn repo_root() -> PathBuf {
-    std::env::var_os("BLUE_ONYX_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("free port")
-}
-
-async fn post_image(client: &reqwest::Client, url: &str, bytes: &[u8]) -> VisionDetectionResponse {
-    let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-        .file_name("dog_bike_car.jpg")
-        .mime_str("image/jpeg")
-        .unwrap();
-    let form = reqwest::multipart::Form::new()
-        .part("image", part)
-        .text("min_confidence", "0.4");
-    let resp = client.post(url).multipart(form).send().await.expect("POST");
-    assert!(resp.status().is_success(), "HTTP {}", resp.status());
-    resp.json().await.expect("detection JSON")
-}
 
 #[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn yolo26_and_rtdetr_over_http() {
-    let root = repo_root();
-    let ov_dir = root.join("openvino");
-    let models_dir = root.join("models");
+    let ov_dir = common::require_openvino();
+    let ipcam = common::require_ipcam();
     let candidates = [
         ("yolo26s", "yolo26s.xml", ModelFamilyKind::Yolo26),
         ("yolo26n-auto", "yolo26n.xml", ModelFamilyKind::Auto),
         ("rt-detrv2-s", "rt-detrv2-s.onnx", ModelFamilyKind::RtDetr),
     ];
-    let models: Vec<ModelConfig> = candidates
-        .iter()
-        .filter(|(_, file, _)| models_dir.join(file).is_file())
-        .map(|(name, file, family)| ModelConfig {
+    // The required model first (IPcam classes, not COCO), then the optional COCO ones.
+    let mut models = vec![ModelConfig {
+        name: Some("IPcam-general".into()),
+        path: ipcam,
+        family: ModelFamilyKind::Yolo5,
+        ..Default::default()
+    }];
+    models.extend(candidates.iter().filter_map(|(name, file, family)| {
+        common::optional_model(file).map(|path| ModelConfig {
             name: Some(name.to_string()),
-            path: models_dir.join(file),
+            path,
             family: *family,
             ..Default::default()
         })
-        .collect();
-    if models.is_empty() || !ov_dir.is_dir() {
-        eprintln!(
-            "skipping yolo26_and_rtdetr_over_http: need {} and one of {:?} in {}",
-            ov_dir.display(),
-            candidates.iter().map(|c| c.1).collect::<Vec<_>>(),
-            models_dir.display()
-        );
-        return;
-    }
+    }));
     let names: Vec<String> = models.iter().map(|m| m.name.clone().unwrap()).collect();
-    let image = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TEST_IMAGE))
-        .expect("test image");
+    let image = common::test_image();
 
-    let cache = std::env::temp_dir().join(format!("bo_fam_cache_{}", std::process::id()));
     let config = Config {
         force_cpu: true,
-        cache_dir: cache.to_string_lossy().to_string(),
+        cache_dir: common::cache_dir("fam"),
         openvino_dir: Some(ov_dir),
         default_model: names.first().cloned(),
         models,
         ..Default::default()
     };
-    let token = CancellationToken::new();
-    let metrics = Arc::new(Metrics::new(blue_onyx_prism::VERSION));
-    let registry =
-        Arc::new(ModelRegistry::start(&config, &metrics, token.clone()).expect("registry"));
-    let config_path = std::env::temp_dir().join(format!(
-        "bo_it_config_{}_{}.json",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let state = Arc::new(AppState::new(
-        registry.clone(),
-        metrics,
-        config,
-        config_path,
-    ));
-    let port = free_port();
-    let listeners = server::bind([0, 0, 0, 0].into(), port).await.expect("bind");
-    let server = tokio::spawn(server::serve_on(listeners, state.into(), token.clone()));
-    let base = format!("http://127.0.0.1:{port}");
+    let server = Server::start_in_process(config).await;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
 
     // Wait until every model is compiled (GET / shows one state cell per model).
@@ -127,15 +72,20 @@ async fn yolo26_and_rtdetr_over_http() {
     }
 
     for name in &names {
-        let r = post_image(&client, &format!("{base}/v1/vision/custom/{name}"), &image).await;
+        let url = format!("{base}/v1/vision/custom/{name}");
+        let r = post_image_with(&client, &url, &image, Some("0.4")).await;
         eprintln!("{name}: {r:?}");
         assert!(r.success, "{name}: detection failed: {r:?}");
-        for want in ["dog", "bicycle"] {
-            assert!(
-                r.predictions.iter().any(|p| p.label == want),
-                "{name}: no '{want}' in {:?}",
-                r.predictions
-            );
+        if name == "IPcam-general" {
+            assert!(!r.predictions.is_empty(), "{name}: nothing detected: {r:?}");
+        } else {
+            for want in ["dog", "bicycle"] {
+                assert!(
+                    r.predictions.iter().any(|p| p.label == want),
+                    "{name}: no '{want}' in {:?}",
+                    r.predictions
+                );
+            }
         }
         for p in &r.predictions {
             assert!(
@@ -146,10 +96,5 @@ async fn yolo26_and_rtdetr_over_http() {
         }
     }
 
-    token.cancel();
-    server.await.unwrap().unwrap();
-    if let Ok(reg) = Arc::try_unwrap(registry) {
-        reg.shutdown();
-    }
-    std::fs::remove_dir_all(&cache).ok();
+    server.stop().await;
 }

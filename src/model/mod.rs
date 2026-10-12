@@ -15,9 +15,8 @@ pub mod yolo8;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-#[clap(rename_all = "lowercase")]
 pub enum ModelFamilyKind {
     /// Pick from the model's output shapes at load time.
     #[default]
@@ -41,7 +40,25 @@ pub enum ModelFamilyKind {
 
 impl std::fmt::Display for ModelFamilyKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
+        f.write_str(self.name())
+    }
+}
+
+impl ModelFamilyKind {
+    /// Every family, in the order shown in help texts and UI selects.
+    pub const ALL: [ModelFamilyKind; 7] = [
+        ModelFamilyKind::Auto,
+        ModelFamilyKind::Yolo26,
+        ModelFamilyKind::Yolo5,
+        ModelFamilyKind::Yolo8,
+        ModelFamilyKind::RtDetr,
+        ModelFamilyKind::Detr,
+        ModelFamilyKind::RfDetr,
+    ];
+
+    /// Lowercase name, as in `Display`, serde and `--family`.
+    pub fn name(self) -> &'static str {
+        match self {
             ModelFamilyKind::Auto => "auto",
             ModelFamilyKind::Yolo26 => "yolo26",
             ModelFamilyKind::Yolo5 => "yolo5",
@@ -49,8 +66,48 @@ impl std::fmt::Display for ModelFamilyKind {
             ModelFamilyKind::RtDetr => "rtdetr",
             ModelFamilyKind::Detr => "detr",
             ModelFamilyKind::RfDetr => "rfdetr",
-        };
-        f.write_str(s)
+        }
+    }
+
+    /// One-line description for CLI help (`--family`).
+    pub fn description(self) -> &'static str {
+        match self {
+            ModelFamilyKind::Auto => "Pick from the model's output shapes at load time",
+            ModelFamilyKind::Yolo26 => {
+                "Ultralytics YOLO26 exported end-to-end (`nms=False`): output `[1, 300, 6]`"
+            }
+            ModelFamilyKind::Yolo5 => {
+                "YOLOv5 (incl. MikeLud ipcam models): output `[1, N, 5+C]`, needs NMS"
+            }
+            ModelFamilyKind::Yolo8 => "YOLOv8/11 raw: output `[1, 4+C, 8400]`, needs NMS",
+            ModelFamilyKind::RtDetr => {
+                "RT-DETRv2 ONNX: inputs `images` + `orig_target_sizes`, outputs `labels/boxes/scores`"
+            }
+            ModelFamilyKind::Detr => {
+                "Hugging Face DETR-style export (D-FINE, RF-DETR): input `pixel_values`, outputs \
+                 `logits [1,Q,C]` + `pred_boxes [1,Q,4]` (normalized cx,cy,w,h). Stretch, x/255; \
+                 ImageNet mean/std normalization only for 91-class (COCO category id) heads, i.e. RF-DETR"
+            }
+            ModelFamilyKind::RfDetr => {
+                "RF-DETR (same ports as `detr`) with ImageNet mean/std normalization regardless \
+                 of the class count, for fine-tuned RF-DETR models"
+            }
+        }
+    }
+}
+
+/// Parses the lowercase names used by `Display` and serde (`auto`, `yolo26`, ..., `rfdetr`).
+impl std::str::FromStr for ModelFamilyKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        ModelFamilyKind::ALL
+            .into_iter()
+            .find(|k| k.name() == s)
+            .ok_or_else(|| {
+                let valid: Vec<&str> = ModelFamilyKind::ALL.iter().map(|k| k.name()).collect();
+                anyhow::anyhow!("unknown model family '{s}'; valid: {}", valid.join(", "))
+            })
     }
 }
 
@@ -367,17 +424,18 @@ pub fn detect_family(
 }
 
 /// Input size `(w, h)` to use when the model's image input has dynamic height/width:
-/// 1. the catalog's size for a downloaded model (matched by file name, e.g. `rfdetr-base.onnx`),
+/// 1. `catalog_hint`: the download catalog's size for this model, looked up by the caller from
+///    the file name (e.g. `rfdetr-base.onnx`); the model layer does not depend on the catalog,
 /// 2. `size` from a Hugging Face `preprocessor_config.json` when the model sits in a repo's `onnx/`
 ///    directory (`<repo>/onnx/model.onnx` + `<repo>/preprocessor_config.json`),
 /// 3. 560 for RF-DETR-style outputs (`logits` with 91 COCO category ids), the RF-DETR base size,
 /// 4. 640.
-pub fn dynamic_input_size(path: &std::path::Path, outputs: &[PortSpec]) -> (u32, u32) {
-    if let Some(s) = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .and_then(crate::resources::catalog::model_input_size)
-    {
+pub fn dynamic_input_size(
+    path: &std::path::Path,
+    outputs: &[PortSpec],
+    catalog_hint: Option<u32>,
+) -> (u32, u32) {
+    if let Some(s) = catalog_hint {
         return (s, s);
     }
     if let Some(dir) = path.parent()
@@ -565,6 +623,22 @@ mod tests {
     }
 
     #[test]
+    fn family_from_str_round_trips() {
+        for k in ModelFamilyKind::ALL {
+            assert_eq!(k.to_string().parse::<ModelFamilyKind>().unwrap(), k);
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(json, format!("\"{k}\""));
+            assert!(!k.description().is_empty());
+        }
+        let err = "bogus".parse::<ModelFamilyKind>().unwrap_err().to_string();
+        assert!(
+            err.contains("bogus") && err.contains("auto, yolo26, yolo5"),
+            "{err}"
+        );
+        assert!("YOLO5".parse::<ModelFamilyKind>().is_err());
+    }
+
+    #[test]
     fn dynamic_input_sizes() {
         use std::path::Path;
         let none: [PortSpec; 0] = [];
@@ -572,26 +646,22 @@ mod tests {
             port("pred_boxes", &[-1, 300, 4]),
             port("logits", &[-1, 300, 91]),
         ];
-        // Catalog models, by file name.
+        // A catalog hint wins over everything else.
         assert_eq!(
-            dynamic_input_size(Path::new("models/rfdetr-nano.onnx"), &none),
+            dynamic_input_size(Path::new("models/rfdetr-nano.onnx"), &none, Some(384)),
             (384, 384)
         );
         assert_eq!(
-            dynamic_input_size(Path::new("x/RFDETR-MEDIUM.onnx"), &rf_out),
+            dynamic_input_size(Path::new("x/RFDETR-MEDIUM.onnx"), &rf_out, Some(576)),
             (576, 576)
-        );
-        assert_eq!(
-            dynamic_input_size(Path::new("models/dfine-s.onnx"), &none),
-            (640, 640)
         );
         // Unknown RF-DETR-like model: base size; anything else: 640.
         assert_eq!(
-            dynamic_input_size(Path::new("m/custom.onnx"), &rf_out),
+            dynamic_input_size(Path::new("m/custom.onnx"), &rf_out, None),
             (560, 560)
         );
         assert_eq!(
-            dynamic_input_size(Path::new("m/custom.onnx"), &none),
+            dynamic_input_size(Path::new("m/custom.onnx"), &none, None),
             (640, 640)
         );
         // Hugging Face repo layout.
@@ -603,10 +673,10 @@ mod tests {
         )
         .unwrap();
         let model = repo.join("onnx").join("model.onnx");
-        assert_eq!(dynamic_input_size(&model, &rf_out), (448, 512));
+        assert_eq!(dynamic_input_size(&model, &rf_out, None), (448, 512));
         // Only next to an `onnx/` directory.
         assert_eq!(
-            dynamic_input_size(&repo.join("model.onnx"), &none),
+            dynamic_input_size(&repo.join("model.onnx"), &none, None),
             (640, 640)
         );
         std::fs::remove_dir_all(&repo).ok();

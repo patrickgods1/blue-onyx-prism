@@ -17,31 +17,31 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
+          toolchain: 1.99.0 # keep equal to rust-toolchain.toml
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy (OpenVINO only)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - name: Build (OpenVINO only)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo build --no-default-features
+        run: cargo build --locked --no-default-features
+      # Fixture-dependent tests are #[ignore]d here; they run in "Integration tests (real models)".
       - name: Unit tests (no OpenVINO needed)
-        run: cargo test
-        env:
-          BLUE_ONYX_SKIP_OPENVINO_TESTS: "1"
+        run: cargo test --locked
       - name: Build release (all binaries)
-        run: cargo build --release --bins
+        run: cargo build --locked --release --bins
       - name: Fetch OpenVINO runtime
-        run: cargo run --release -- setup-openvino --dest target/release/openvino
+        run: cargo run --locked --release -- setup-openvino --dest target/release/openvino
       - name: Download smallest model
-        run: cargo run --release -- download-models --name ipcam-bird --dir target/release/models
+        run: cargo run --locked --release -- download-models --name ipcam-bird --dir target/release/models
       # Each smoke run uses its own port so a slow shutdown of the previous server cannot collide.
       # scripts/ci/smoke.sh <bin> <client> <port> <provider substring> <server args...>
       - name: Smoke test (OpenVINO CPU)
@@ -55,7 +55,17 @@ jobs:
             --model target/release/models/ipcam-bird.onnx --family yolo5 --force-cpu \
             --cache-dir target/release/cache
       - name: Fetch ONNX Runtime (CPU)
-        run: cargo run --release -- setup-onnxruntime --flavor cpu --dir target/release/onnxruntime
+        run: cargo run --locked --release -- setup-onnxruntime --flavor cpu --dir target/release/onnxruntime
+      - name: Download IPcam-general
+        run: cargo run --locked --release -- download-models --name IPcam-general --dir target/release/models
+      # The ignored tests need models/, openvino/ and onnxruntime/ (flat, as `--dir` installs it) under
+      # BLUE_ONYX_TEST_ROOT, which is where the steps above installed them. A missing fixture fails
+      # the test. They run on the debug test binaries (reusing the cargo cache); the runtime is found
+      # through the root, not through the binary's location.
+      - name: Integration tests (real models)
+        run: cargo test --locked -- --ignored --test-threads=1
+        env:
+          BLUE_ONYX_TEST_ROOT: ${{ github.workspace }}/target/release
       - name: Smoke test (ONNX Runtime CPU)
         shell: bash
         run: |
@@ -83,7 +93,7 @@ jobs:
       - name: Fetch ONNX Runtime (DirectML)
         if: runner.os == 'Windows'
         continue-on-error: true
-        run: cargo run --release -- setup-onnxruntime --flavor directml --dir target/release/onnxruntime-directml
+        run: cargo run --locked --release -- setup-onnxruntime --flavor directml --dir target/release/onnxruntime-directml
       - name: Smoke test (ONNX Runtime DirectML, WARP)
         if: runner.os == 'Windows'
         continue-on-error: true
@@ -94,3 +104,12 @@ jobs:
             32171 "DirectML" \
             --model target/release/models/ipcam-bird.onnx --family yolo5 --device ort:directml \
             --onnxruntime-dir target/release/onnxruntime-directml --cache-dir target/release/cache
+
+  supply-chain:
+    name: supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories bans licenses sources

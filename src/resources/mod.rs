@@ -7,12 +7,16 @@
 //! - [`manager`]: the download manager (queue, verified resumable downloads, atomic installs,
 //!   manifests, cross-process lock, backoff, progress and events).
 //! - [`provision`]: service startup integration (what a registry generation waits for).
-//! - [`status`]: the web UI's resource rows and Download / Remove / Add-to-config actions.
+//! - [`status`]: the web UI's resource rows and groups (read-only view).
+//! - [`actions`]: the Download / Remove / Add-to-config / Export actions and "Add a model by
+//!   path" (mutate the disk, the download queue or the config).
 //! - [`commands`]: the `fetch` and `list-resources` subcommands.
 //! - [`extract`]: whitelist-only archive extraction shared by the manager and `setup-*`.
 //! - [`export`]: the user-triggered YOLO26 export (pinned uv + Python env + Ultralytics'
 //!   exporter); the only module that executes downloaded code.
 
+/// Download / Remove / Add-to-config / Export actions on resources and custom models.
+pub mod actions;
 pub mod catalog;
 pub mod commands;
 pub mod export;

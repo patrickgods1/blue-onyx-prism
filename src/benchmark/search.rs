@@ -667,32 +667,7 @@ fn search_run(
     current: Option<f32>,
 ) -> Result<SearchResult> {
     let map = ClassMap::for_model(&run.classes);
-    let wanted: Vec<String> = if req.classes.is_empty() {
-        map.classes.clone()
-    } else {
-        let mut v = Vec::new();
-        for c in &req.classes {
-            let canon = canonical_label(c);
-            let class = map
-                .classes
-                .iter()
-                .find(|k| **k == canon)
-                .or_else(|| {
-                    map.gt_class(&canon)
-                        .and_then(|g| map.classes.iter().find(|k| *k == g))
-                })
-                .with_context(|| {
-                    format!(
-                        "class '{c}' is not scored for this model (scored: {})",
-                        map.classes.join(", ")
-                    )
-                })?;
-            if !v.contains(class) {
-                v.push(class.clone());
-            }
-        }
-        v
-    };
+    let wanted = wanted_classes(&map, &req.classes)?;
     let inputs = scored_inputs(run, sets, &map, req, &wanted);
     if inputs.is_empty() {
         bail!("no scored images match these filters");
@@ -756,21 +731,7 @@ fn search_run(
         .filter(|(_, bp)| bp.npos > 0)
         .map(|(c, bp)| group(c, &bp, relative, roc.class_auc(c)))
         .collect();
-    let ground_truth = if relative {
-        let refs: std::collections::BTreeSet<String> = chosen
-            .iter()
-            .filter_map(|&k| match &inputs[k].0.ground_truth {
-                GroundTruth::Pseudo(r) => Some(r.clone()),
-                _ => None,
-            })
-            .collect();
-        format!(
-            "relative to {}, not ground truth",
-            refs.into_iter().collect::<Vec<_>>().join(", ")
-        )
-    } else {
-        "ground truth".to_string()
-    };
+    let ground_truth = ground_truth_desc(&inputs, &chosen, relative);
     Ok(SearchResult {
         model: run.model.clone(),
         device: run.device.clone(),
@@ -800,6 +761,55 @@ fn search_run(
         per_class,
         roc: (roc.positives + roc.negatives > 0).then_some(roc),
     })
+}
+
+/// The scored classes of `map` a search is limited to: `requested` (any label naming a scored
+/// class, deduplicated), else every scored class.
+fn wanted_classes(map: &ClassMap, requested: &[String]) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        return Ok(map.classes.clone());
+    }
+    let mut v = Vec::new();
+    for c in requested {
+        let canon = canonical_label(c);
+        let class = map
+            .classes
+            .iter()
+            .find(|k| **k == canon)
+            .or_else(|| {
+                map.gt_class(&canon)
+                    .and_then(|g| map.classes.iter().find(|k| *k == g))
+            })
+            .with_context(|| {
+                format!(
+                    "class '{c}' is not scored for this model (scored: {})",
+                    map.classes.join(", ")
+                )
+            })?;
+        if !v.contains(class) {
+            v.push(class.clone());
+        }
+    }
+    Ok(v)
+}
+
+/// [`SearchResult::ground_truth`] of the `chosen` inputs.
+fn ground_truth_desc(inputs: &[Input], chosen: &[usize], relative: bool) -> String {
+    if relative {
+        let refs: std::collections::BTreeSet<String> = chosen
+            .iter()
+            .filter_map(|&k| match &inputs[k].0.ground_truth {
+                GroundTruth::Pseudo(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect();
+        format!(
+            "relative to {}, not ground truth",
+            refs.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    } else {
+        "ground truth".to_string()
+    }
 }
 
 /// CSV of the search summary (the `configured` columns at the threshold configured now) and
@@ -1004,6 +1014,31 @@ pub(crate) mod tests {
             runs: vec![run("openvino:cpu", 0.0), run("ort:coreml", 0.05)],
         };
         (results, preds)
+    }
+
+    #[test]
+    fn wanted_classes_resolve_dedupe_and_reject() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let coco = ClassMap::for_model(&names(&["person", "car", "dog"]));
+        assert_eq!(wanted_classes(&coco, &[]).unwrap(), coco.classes);
+        assert_eq!(
+            wanted_classes(&coco, &names(&["car", "person", "car"])).unwrap(),
+            ["car", "person"]
+        );
+        let err = wanted_classes(&coco, &names(&["zebra"])).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "class 'zebra' is not scored for this model (scored: {})",
+                coco.classes.join(", ")
+            )
+        );
+        // A ground-truth label of a merged model class names that class.
+        let ipcam = ClassMap::for_model(&names(&["person", "vehicle"]));
+        assert_eq!(
+            wanted_classes(&ipcam, &names(&["car"])).unwrap(),
+            ["vehicle"]
+        );
     }
 
     #[test]
