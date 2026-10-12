@@ -817,12 +817,15 @@ impl ModelRegistry {
         })
     }
 
-    /// Stop every worker and join the threads. Workers no other thread holds a handle of exit
+    /// Stop every worker and join the threads (the registry is left empty, so a straggling
+    /// request of a retired generation gets "no model"). Workers no other thread holds a handle of exit
     /// once their channel is empty; the others are cancelled. Cancel the shutdown token first
     /// for a prompt exit (it also cuts short the drain of workers retired by a reload). Joins
     /// the live workers, then the helper threads stopping retired ones.
-    pub fn shutdown(self) {
-        let slots = self.slots.into_inner().unwrap_or_else(|e| e.into_inner());
+    pub fn shutdown(&self) {
+        // Taken out of the registry (not consumed): a handler of a retired generation may still
+        // hold an `Arc` of it while its connection winds down; it then sees no models.
+        let slots = std::mem::take(&mut *self.slots.write_recover());
         for WorkerSlot { handle, stop, join } in slots.workers {
             let name = handle.name.clone();
             if Arc::try_unwrap(handle).is_err() {
@@ -836,10 +839,7 @@ impl ModelRegistry {
             }
             info!(model = %name, "worker stopped");
         }
-        let retiring = self
-            .retiring
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner());
+        let retiring = std::mem::take(&mut *self.retiring.lock_recover());
         for helper in retiring {
             if helper.join().is_err() {
                 error!("thread stopping a retired worker panicked");

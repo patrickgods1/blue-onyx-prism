@@ -152,7 +152,7 @@ async fn pipelined_worker_keeps_order_under_load() {
         ..Default::default()
     };
     let server = Server::start_in_process(config).await;
-    let (base, metrics) = (server.base.clone(), server.metrics.clone());
+    let (base, metrics) = (server.base.clone(), server.metrics().clone());
     let registry = server.registry().clone();
 
     let deadline = Instant::now() + Duration::from_secs(180);

@@ -49,7 +49,8 @@ static RT: Mutex<Option<Runtimes>> = Mutex::new(None);
 
 fn with_runtimes<T>(f: impl FnOnce(&mut Runtimes) -> T) -> T {
     let lib = ort_lib();
-    let openvino_dir = common::require_openvino();
+    // Not required: these tests exercise ONNX Runtime; OpenVINO is just offered if present.
+    let openvino_dir = common::test_root().join("openvino");
     let mut guard = RT.lock().unwrap_or_else(|e| e.into_inner());
     let rt = guard.get_or_insert_with(|| {
         Runtimes::new_with(

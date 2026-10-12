@@ -248,8 +248,8 @@ enum Mode {
 pub struct Server {
     pub base: String,
     pub token: CancellationToken,
-    /// Metrics of the in-process server (a fresh, unused instance in runner mode).
-    pub metrics: Arc<Metrics>,
+    /// Metrics of the in-process server (None in runner mode: the run loop owns its own).
+    metrics: Option<Arc<Metrics>>,
     mode: Mode,
 }
 
@@ -276,7 +276,7 @@ impl Server {
             let server = Self {
                 base,
                 token,
-                metrics: Arc::new(Metrics::new(blue_onyx_prism::VERSION)),
+                metrics: None,
                 mode: Mode::Runner { thread },
             };
             match server.wait_http_or_exit().await {
@@ -309,9 +309,16 @@ impl Server {
         Self {
             base: format!("http://127.0.0.1:{port}"),
             token,
-            metrics,
+            metrics: Some(metrics),
             mode: Mode::InProcess { server, registry },
         }
+    }
+
+    /// The metrics of an in-process server.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        self.metrics
+            .as_ref()
+            .expect("metrics() needs Server::start_in_process")
     }
 
     /// The registry of an in-process server.

@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Error for a config without models (the server has nothing to serve).
 pub fn ensure_models(config: &Config, config_path: &std::path::Path) -> Result<()> {
@@ -128,10 +128,15 @@ impl Generation {
         {
             warn!("resource watcher panicked");
         }
-        match Arc::try_unwrap(registry) {
-            Ok(reg) => reg.shutdown(),
-            Err(_) => warn!("registry still referenced; workers stop via the shutdown token"),
+        // Shut down in place even when a connection task still holds the generation's state
+        // (axum drops a connection's router clone after signalling the server future, see
+        // `SHUTDOWN_LINGER`): the workers are always joined.
+        if Arc::strong_count(&registry) > 1 {
+            debug!(
+                "registry still referenced by a winding-down request; shutting it down in place"
+            );
         }
+        registry.shutdown();
     }
 }
 

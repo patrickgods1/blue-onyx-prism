@@ -1,16 +1,17 @@
 //! Release update check against the project's GitHub releases.
 
 use crate::api::{StatusUpdateResponse, VersionInfo};
-use crate::sync::LockExt;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 const OK_TTL: Duration = Duration::from_secs(3600);
 const ERR_TTL: Duration = Duration::from_secs(300);
 
-static CACHE: Mutex<Option<(Instant, StatusUpdateResponse)>> = Mutex::new(None);
+/// The last answer: when it was fetched, the `current` version it was computed for, and the
+/// response. An async mutex held across the fetch, so concurrent cold calls make one request.
+static CACHE: Mutex<Option<(Instant, String, StatusUpdateResponse)>> = Mutex::const_new(None);
 
 /// Whether a result cached at `cached_at` is still usable at `now`: an hour for a successful
 /// check, five minutes for a failed one.
@@ -53,13 +54,15 @@ async fn fetch_latest() -> Result<Release> {
 /// Results are cached in-process (1 hour; 5 minutes after a failure) to stay within GitHub's
 /// unauthenticated rate limit.
 pub async fn check_update(current: &str) -> StatusUpdateResponse {
-    if let Some((at, resp)) = CACHE.lock_recover().as_ref()
+    let mut cache = CACHE.lock().await;
+    if let Some((at, cur, resp)) = cache.as_ref()
+        && cur == current
         && fresh(*at, resp.success, Instant::now())
     {
         return resp.clone();
     }
     let resp = check_uncached(current).await;
-    *CACHE.lock_recover() = Some((Instant::now(), resp.clone()));
+    *cache = Some((Instant::now(), current.to_string(), resp.clone()));
     resp
 }
 

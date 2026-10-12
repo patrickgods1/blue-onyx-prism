@@ -2141,7 +2141,10 @@ pub fn find(id: &str, os: &str, arch: &str) -> Option<&'static Resource> {
 
 /// `s` without `prefix`, compared ASCII case-insensitively.
 pub(crate) fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    (s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix))
+    // `get` (not slicing) so a multibyte character straddling the prefix length is a plain
+    // mismatch rather than a panic (user-supplied ids reach this).
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
         .then(|| &s[prefix.len()..])
 }
 
@@ -2187,6 +2190,15 @@ pub fn model(name: &str) -> Option<&'static Resource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_prefix_ci_is_char_boundary_safe() {
+        assert_eq!(strip_prefix_ci("MODEL:x", "model:"), Some("x"));
+        assert_eq!(strip_prefix_ci("abcdeé", "abcdef"), None);
+        assert_eq!(strip_prefix_ci("abcdé", "abcdef"), None);
+        assert_eq!(strip_prefix_ci("é", "ab"), None);
+        assert_eq!(strip_prefix_ci("ab", "abc"), None);
+    }
 
     #[test]
     fn ort_cuda_compute_capabilities() {

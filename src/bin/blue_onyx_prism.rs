@@ -1,7 +1,7 @@
 //! Main binary: CLI subcommands (setup-openvino, setup-onnxruntime, download-models, list-models,
 //! fetch, list-resources, list-devices, benchmark) or the HTTP service.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use blue_onyx_prism::backend::{CoreOptions, DeviceSpec, OrtOptions, Runtimes, select};
 use blue_onyx_prism::cli::{self, Cli, Command};
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};
@@ -44,7 +44,7 @@ fn config_path(cli: &Cli) -> PathBuf {
 fn read_config(cli: &Cli) -> Result<Config> {
     let path = config_path(cli);
     if path.exists() {
-        Config::load(&path)
+        Config::load(&path).context("fix the config file, or pass --config <another file>")
     } else {
         Ok(Config::default())
     }
