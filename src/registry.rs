@@ -9,11 +9,11 @@ use crate::backend::{CoreOptions, DeviceSpec, LoadRequest, OrtOptions, Runtimes,
 use crate::config::{Config, ModelConfig};
 use crate::metrics::{Metrics, ModelGauges};
 use crate::profile::Profile;
-use crate::worker::{LoadGate, WorkerConfig, WorkerHandle, spawn_worker_after};
+use crate::worker::{LiveSettings, LoadGate, WorkerConfig, WorkerHandle, spawn_worker_after};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -23,7 +23,9 @@ pub struct ModelRegistry {
     workers: Vec<WorkerHandle>,
     /// Lowercase name -> index into `workers`.
     by_name: HashMap<String, usize>,
-    default_idx: Option<usize>,
+    /// The model serving `/v1/vision/detection` (index into `workers`); `default_model`
+    /// applies live through [`Self::apply_live`].
+    default_idx: RwLock<Option<usize>>,
     pub runtime_info: RuntimeInfo,
     /// The runtimes the workers load through (None for registries built from handles).
     runtimes: Option<Arc<Mutex<Runtimes>>>,
@@ -92,6 +94,34 @@ fn resolve_default(config: &Config) -> Option<usize> {
         }
     }
     Some(config.models[..idx].iter().filter(|m| m.enabled).count())
+}
+
+/// What [`ModelRegistry::apply_live`] changed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LiveApplied {
+    /// Served models whose live settings changed.
+    pub models: Vec<String>,
+    /// The default model changed (to `default_model`; None: nothing is served).
+    pub default_changed: bool,
+    pub default_model: Option<String>,
+}
+
+/// The served model (index into the workers, looked up by normalized name in `by_name`) that
+/// `config` makes the default: its effective default when that model is served, else the
+/// first served model.
+fn default_by_name(
+    config: &Config,
+    by_name: &HashMap<String, usize>,
+    served: usize,
+) -> Option<usize> {
+    config
+        .effective_default_index()
+        .and_then(|i| {
+            by_name
+                .get(&normalize_name(&config.models[i].effective_name()))
+                .copied()
+        })
+        .or((served > 0).then_some(0))
 }
 
 /// Decode + preprocess threads of a generation: the configured `preprocess_threads`, else the
@@ -371,18 +401,8 @@ impl ModelRegistry {
                 device,
                 load,
                 classes,
-                object_filter: m
-                    .object_filter
-                    .clone()
-                    .unwrap_or_else(|| config.object_filter.clone()),
-                confidence_threshold: m
-                    .confidence_threshold
-                    .unwrap_or(config.confidence_threshold),
-                nms_iou: config.nms_iou,
-                request_timeout: config.request_timeout(),
+                live: LiveSettings::for_model(config, m).shared(),
                 queue_size: config.worker_queue_size,
-                save_image_path: config.save_image_path.as_deref().map(crate::resolve_path),
-                save_ref_image: config.save_ref_image,
                 lazy: m.lazy,
                 can_use_gpu: runtime_info.has_gpu,
                 model: resolved,
@@ -408,7 +428,7 @@ impl ModelRegistry {
         Ok(Self {
             workers,
             by_name,
-            default_idx,
+            default_idx: RwLock::new(default_idx),
             runtime_info,
             runtimes: Some(runtimes),
             profile: Some((profile, prep_threads)),
@@ -432,7 +452,7 @@ impl ModelRegistry {
         Self {
             workers,
             by_name,
-            default_idx,
+            default_idx: RwLock::new(default_idx),
             runtime_info,
             runtimes: None,
             profile: None,
@@ -466,7 +486,44 @@ impl ModelRegistry {
     }
 
     pub fn default_model(&self) -> Option<&WorkerHandle> {
-        self.default_idx.and_then(|i| self.workers.get(i))
+        let idx = *self.default_idx.read().unwrap_or_else(|e| e.into_inner());
+        idx.and_then(|i| self.workers.get(i))
+    }
+
+    /// Apply the live part of `config` without reloading anything: every served model's
+    /// [`LiveSettings`] (threshold, NMS IoU, object filter, request timeout, image saving) and
+    /// the default model. Models of `config` that are not served (disabled, or not loaded yet)
+    /// are skipped. Returns what changed.
+    pub fn apply_live(&self, config: &Config) -> LiveApplied {
+        let mut out = LiveApplied::default();
+        for w in &self.workers {
+            let key = normalize_name(&w.name);
+            let Some(m) = config
+                .models
+                .iter()
+                .find(|m| normalize_name(&m.effective_name()) == key)
+            else {
+                continue;
+            };
+            if w.set_live(LiveSettings::for_model(config, m)) {
+                out.models.push(w.name.clone());
+            }
+        }
+        let new = default_by_name(config, &self.by_name, self.workers.len());
+        let mut idx = self.default_idx.write().unwrap_or_else(|e| e.into_inner());
+        if *idx != new {
+            *idx = new;
+            out.default_model = new.map(|i| self.workers[i].name.clone());
+            out.default_changed = true;
+            info!(
+                model = out.default_model.as_deref().unwrap_or("none"),
+                "default model for /v1/vision/detection changed"
+            );
+        }
+        if !out.models.is_empty() {
+            info!(models = ?out.models, "live settings applied");
+        }
+        out
     }
 
     /// Case-insensitive lookup; a trailing `.onnx` / `.xml` is ignored.
@@ -499,6 +556,7 @@ impl ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn name_normalization() {
@@ -655,6 +713,48 @@ mod tests {
         assert_eq!(preprocess_threads(&c, &profile, &[None]), 3);
         c.preprocess_threads = 6;
         assert_eq!(preprocess_threads(&c, &profile, &[Some(cpu)]), 6);
+    }
+
+    #[test]
+    fn apply_live_swaps_settings_and_default() {
+        let metrics = Metrics::new("0");
+        let workers = ["a", "b"]
+            .iter()
+            .map(|n| WorkerHandle::failed(*n, "test", metrics.model(n)))
+            .collect();
+        let reg = ModelRegistry::from_handles(workers, Some(0), RuntimeInfo::default());
+        let mut c = Config::default();
+        for n in ["a", "b", "off"] {
+            c.models.push(ModelConfig {
+                name: Some(n.into()),
+                path: format!("{n}.onnx").into(),
+                enabled: n != "off",
+                ..Default::default()
+            });
+        }
+        // Defaults everywhere: nothing changes.
+        assert_eq!(reg.apply_live(&c), LiveApplied::default());
+        c.confidence_threshold = 0.3;
+        c.models[1].confidence_threshold = Some(0.8);
+        c.models[1].object_filter = Some(vec!["person".into()]);
+        c.request_timeout_secs = 3;
+        c.default_model = Some("B".into());
+        let applied = reg.apply_live(&c);
+        assert_eq!(applied.models, ["a", "b"]);
+        assert!(applied.default_changed);
+        assert_eq!(reg.default_model().unwrap().name, "b");
+        let a = reg.by_name("a").unwrap();
+        assert_eq!(a.live().confidence_threshold, 0.3);
+        assert_eq!(a.request_timeout(), Duration::from_secs(3));
+        let b = reg.by_name("b").unwrap().live();
+        assert_eq!(b.confidence_threshold, 0.8);
+        assert_eq!(b.object_filter, ["person"]);
+        // Idempotent.
+        assert_eq!(reg.apply_live(&c), LiveApplied::default());
+        // A default that is not served falls back to the first served model.
+        c.default_model = Some("off".into());
+        assert!(reg.apply_live(&c).default_changed);
+        assert_eq!(reg.default_model().unwrap().name, "a");
     }
 
     #[test]

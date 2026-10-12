@@ -37,6 +37,9 @@ pub struct ChangeRecord {
     /// "IPcam-general device → openvino:cpu, threshold → 0.35".
     pub summary: String,
     pub fields: Vec<FieldChange>,
+    /// Labels of the fields of this change that apply without a restart (live settings, the
+    /// default model, the log level; see [`crate::config_merge::applied_live`]).
+    pub live: Vec<String>,
 }
 
 /// File identity used to notice changes made by other processes.
@@ -190,6 +193,7 @@ impl ConfigStore {
             time: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             source: source.to_string(),
             summary,
+            live: crate::config_merge::applied_live(&fields),
             fields,
         };
         inner.changes.push_back(rec.clone());

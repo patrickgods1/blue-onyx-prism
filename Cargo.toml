@@ -79,6 +79,7 @@ libloading = "0.8"
 # so nothing is linked or downloaded at build time. All `ort` code lives in src/backend/ort.rs.
 # No `api-NN` feature: any ONNX Runtime 1.17+ library loads (`setup-onnxruntime` pins 1.24.4).
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "load-dynamic", "tracing", "cuda", "tensorrt", "directml", "coreml"] }
+arc-swap = "1"
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = "11"

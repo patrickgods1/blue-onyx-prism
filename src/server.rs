@@ -2001,7 +2001,7 @@ fn config_template(
     error: Option<String>,
     submitted: Option<&HashMap<String, String>>,
 ) -> ConfigTemplate {
-    state.config.check_disk();
+    sync_config(state);
     let snap = devices_snapshot(state);
     let bench = live::bench_summary(&crate::benchmark::results_path(&state.config_path));
     let (revision, cfg) = state.config.snapshot();
@@ -2151,6 +2151,8 @@ fn save_config(
     edit: impl FnOnce(&mut Config) -> anyhow::Result<()>,
 ) -> anyhow::Result<String> {
     let up = state.config.update(source, edit)?;
+    // Also applies a change picked up from the file before the edit.
+    apply_config_live(state);
     if !up.changed {
         return Ok(format!(
             "No changes: {} already has these values.",
@@ -2160,10 +2162,25 @@ fn save_config(
     let level = state.config_read().log_level;
     let level = (level != up.before.log_level).then_some(level);
     info!(path = %state.config_path.display(), revision = up.revision, source, "config saved from the web UI");
-    let mut msg = format!(
-        "Saved to {}. Restart the server to apply the changes.",
-        state.config_path.display()
-    );
+    let mut msg = format!("Saved to {}.", state.config_path.display());
+    let live: Vec<String> = up
+        .record
+        .as_ref()
+        .map(|r| {
+            r.live
+                .iter()
+                .filter(|l| *l != "Log level")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if !live.is_empty() {
+        msg.push_str(&format!(" Applied now: {}.", live.join(", ")));
+    }
+    let pending = crate::config_merge::pending(&state.running, &state.config_read());
+    if pending.restart_needed() {
+        msg.push_str(" Restart the server to apply the other changes.");
+    }
     if let Some(level) = level {
         match apply_log_level(state, level) {
             Ok(()) => msg.push_str(&format!(
@@ -2174,6 +2191,21 @@ fn save_config(
         }
     }
     Ok(msg)
+}
+
+/// Apply the live part of the current config to this generation's workers (thresholds,
+/// object filters, timeouts, image saving, the default model); see
+/// [`ModelRegistry::apply_live`]. Idempotent.
+pub(crate) fn apply_config_live(state: &AppState) {
+    let cfg = state.config_read().clone();
+    state.registry.apply_live(&cfg);
+}
+
+/// Pick up a config file changed on disk and apply its live part.
+pub(crate) fn sync_config(state: &AppState) {
+    if state.config.check_disk().is_some() {
+        apply_config_live(state);
+    }
 }
 
 /// Validate and save the form. Changes apply on restart, except the log level (immediately).
@@ -4611,7 +4643,7 @@ pub(crate) mod tests {
         assert!(b.is_empty());
         assert_eq!(h[header::ETAG].to_str().unwrap(), etag);
 
-        // A change: new revision, pending restart for the model, the change log entry.
+        // A change: new revision, applied live (no restart), the change log entry.
         let (s, _, _) = call(
             &state,
             post_form(
@@ -4630,35 +4662,24 @@ pub(crate) mod tests {
         assert!(!text.contains("0.34999"), "{text}");
         let j: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(j["revision"], 2);
-        assert_eq!(j["restartNeeded"], true);
-        assert_eq!(j["pendingCount"], 1);
-        assert_eq!(j["models"][0]["restartNeeded"], true);
-        assert_eq!(
-            j["models"][0]["reasons"][0],
-            "threshold: 0.50 \u{2192} 0.35"
-        );
-        // Running: what the worker uses (still the old threshold until a restart).
-        assert_eq!(j["models"][0]["running"]["threshold"], 0.5);
+        assert_eq!(j["restartNeeded"], false);
+        assert_eq!(j["pendingCount"], 0);
+        assert_eq!(j["models"][0]["restartNeeded"], false);
+        // Running: what the worker uses, already the new threshold.
+        assert_eq!(j["models"][0]["running"]["threshold"], 0.35);
         assert_eq!(j["models"][1]["restartNeeded"], false);
         assert_eq!(j["changes"][0]["source"], "benchmark apply-threshold");
         assert_eq!(
             j["changes"][0]["summary"],
             "ipcam-general threshold \u{2192} 0.35"
         );
+        assert_eq!(j["changes"][0]["live"][0], "ipcam-general \u{b7} threshold");
         // The config file says 0.35, too.
         let file = std::fs::read_to_string(&state.config_path).unwrap();
         assert!(file.contains("\"confidence_threshold\": 0.35"), "{file}");
-        // The other pages carry the pending state.
         let (_, home) = get_text(&state, "/").await;
-        assert!(
-            home.contains("title=\"threshold: 0.50 \u{2192} 0.35\">restart needed"),
-            "{home}"
-        );
+        assert!(!home.contains("title=\"threshold"), "{home}");
         let (_, cfg) = get_text(&state, "/config").await;
-        assert!(
-            cfg.contains("<li>ipcam-general: threshold: 0.50 \u{2192} 0.35</li>"),
-            "{cfg}"
-        );
         assert!(cfg.contains("value=\"0.35\" placeholder=\"0.50\""), "{cfg}");
 
         // Another process edits the file (the CLI, an editor): picked up on the next poll.
@@ -4675,7 +4696,7 @@ pub(crate) mod tests {
             j["pending"]["process"][0],
             "Port: 32168 \u{2192} 4321 (needs a process restart)"
         );
-        assert_eq!(j["pendingCount"], 2);
+        assert_eq!(j["pendingCount"], 1);
         assert_eq!(state.config_read().port, 4321);
     }
 

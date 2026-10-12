@@ -718,13 +718,42 @@ impl Pending {
 }
 
 /// Globals a restart does not need: the log level and `allow_remote_admin` apply immediately,
-/// the benchmark section is read when a benchmark starts.
-fn live_global(k: &str) -> bool {
-    matches!(k, "log_level" | "default_model" | "allow_remote_admin") || k.starts_with("benchmark.")
+/// the per-request settings go into every worker's live settings
+/// ([`crate::worker::LiveSettings`], through `ModelRegistry::apply_live`), `default_model`
+/// switches the registry's default at once, and the benchmark section is read when a
+/// benchmark starts. Every other global is runtime-level and needs a restart.
+pub fn live_global(k: &str) -> bool {
+    matches!(
+        k,
+        "log_level"
+            | "default_model"
+            | "allow_remote_admin"
+            | "request_timeout_secs"
+            | "confidence_threshold"
+            | "nms_iou"
+            | "object_filter"
+            | "save_image_path"
+            | "save_ref_image"
+    ) || k.starts_with("benchmark.")
 }
 
-fn thr_text(t: f32) -> String {
-    format!("{:.2}", crate::config::round_threshold_f64(t))
+/// Model fields applied live (the worker reads them per request).
+pub const LIVE_MODEL_FIELDS: &[&str] = &["confidence_threshold", "object_filter"];
+
+/// Labels of the changed fields that applied without a restart (live globals, the default
+/// model, per-model thresholds and object filters; the benchmark section is not listed: it is
+/// only read when a benchmark starts).
+pub fn applied_live(changes: &[FieldChange]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|c| match parse_key(&c.key) {
+            Key::Global(g) => live_global(g),
+            Key::Default => true,
+            Key::Model { field, .. } => LIVE_MODEL_FIELDS.contains(&field),
+            _ => false,
+        })
+        .map(|c| c.label.clone())
+        .collect()
 }
 
 /// What a restart would apply, comparing the running config with the current one.
@@ -754,22 +783,8 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
             out.global.push(text);
         }
     }
-    let name_of = |c: &Config, i: usize| c.models[i].effective_name();
-    let (da, db) = (
-        running
-            .effective_default_index()
-            .map(|i| name_of(running, i)),
-        current
-            .effective_default_index()
-            .map(|i| name_of(current, i)),
-    );
-    if da.as_deref().map(normalize_name) != db.as_deref().map(normalize_name) {
-        out.global.push(format!(
-            "default model: {} \u{2192} {}",
-            da.as_deref().unwrap_or("none"),
-            db.as_deref().unwrap_or("none")
-        ));
-    }
+    // The default model applies live (a default that is not loaded yet shows as that model's
+    // "enabled; not loaded yet").
     let find = |c: &'_ Config, key: &str| -> Option<ModelConfig> {
         c.models
             .iter()
@@ -796,25 +811,12 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
                 if dr != dc {
                     reasons.push(format!("device: {dr} \u{2192} {dc}"));
                 }
-                let tr = r
-                    .confidence_threshold
-                    .unwrap_or(running.confidence_threshold);
-                let tc = c
-                    .confidence_threshold
-                    .unwrap_or(current.confidence_threshold);
-                if thr_text(tr) != thr_text(tc) {
-                    reasons.push(format!(
-                        "threshold: {} \u{2192} {}",
-                        thr_text(tr),
-                        thr_text(tc)
-                    ));
-                }
+                // Threshold and object filter apply live.
                 let (or, oc) = (model_object(&r), model_object(&c));
                 for (f, v) in &oc {
-                    if matches!(
-                        f.as_str(),
-                        "name" | "device" | "confidence_threshold" | "enabled"
-                    ) {
+                    if matches!(f.as_str(), "name" | "device" | "enabled")
+                        || LIVE_MODEL_FIELDS.contains(&f.as_str())
+                    {
                         continue;
                     }
                     if or.get(f) != Some(v) {
@@ -1116,6 +1118,32 @@ mod tests {
     }
 
     #[test]
+    fn applied_live_lists_live_fields_only() {
+        let a = cfg();
+        let mut b = a.clone();
+        b.models[0].confidence_threshold = Some(0.35);
+        b.models[1].object_filter = Some(vec!["person".into()]);
+        b.models[1].lazy = true;
+        b.nms_iou = 0.6;
+        b.request_timeout_secs = 5;
+        b.port = 4000;
+        b.default_model = Some("yolo26s".into());
+        b.benchmark.warmup = 9;
+        let (changes, _) = describe_changes(&a, &b);
+        let live = applied_live(&changes);
+        for l in [
+            "IPcam-general \u{b7} threshold",
+            "yolo26s \u{b7} object filter",
+            "NMS IoU",
+            "Request timeout",
+            "Default model",
+        ] {
+            assert!(live.contains(&l.to_string()), "{l}: {live:?}");
+        }
+        assert_eq!(live.len(), 5, "{live:?}");
+    }
+
+    #[test]
     fn pending_restart_reasons() {
         let running = cfg();
         assert!(!pending(&running, &running).restart_needed());
@@ -1125,15 +1153,13 @@ mod tests {
         c.log_level = crate::config::LogLevel::Debug;
         c.benchmark.warmup = 9;
         let p = pending(&running, &c);
+        // The threshold applies live.
         assert_eq!(
             p.for_model("IPcam-general"),
-            [
-                "device: auto \u{2192} openvino:cpu",
-                "threshold: 0.50 \u{2192} 0.35"
-            ]
+            ["device: auto \u{2192} openvino:cpu"]
         );
         assert!(p.global.is_empty(), "{:?}", p.global);
-        assert_eq!(p.count(), 2);
+        assert_eq!(p.count(), 1);
         // Global changes and enable/disable.
         c.port = 4000;
         c.models[1].enabled = false;

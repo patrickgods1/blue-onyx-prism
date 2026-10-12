@@ -178,18 +178,9 @@ pub(super) fn running_view(state: &AppState, name: &str) -> RunningView {
         .read()
         .ok()
         .and_then(|d| d.as_ref().map(|d| d.spec.clone()));
-    let key = normalize_name(name);
-    let threshold = state
-        .running
-        .models
-        .iter()
-        .find(|m| normalize_name(&m.effective_name()) == key)
-        .map(|m| {
-            crate::config::round_threshold_f64(
-                m.confidence_threshold
-                    .unwrap_or(state.running.confidence_threshold),
-            )
-        });
+    let threshold = Some(crate::config::round_threshold_f64(
+        w.live().confidence_threshold,
+    ));
     let text = match w.state.get() {
         ModelState::Failed(m) => format!("Failed: {m}"),
         ModelState::Ready => match threshold {
@@ -257,7 +248,7 @@ fn configured_resolved(
 
 /// The payload of `GET /v1/config`.
 pub(super) fn payload(state: &AppState) -> Value {
-    state.config.check_disk();
+    super::sync_config(state);
     let (revision, cfg) = state.config.snapshot();
     let pending = config_merge::pending(&state.running, &cfg);
     let bench = bench_summary(&crate::benchmark::results_path(&state.config_path));
