@@ -2,8 +2,12 @@
 //! and the web UI's Benchmark page.
 //!
 //! A run compiles a model on a device, warms it up, then sends every image of the chosen
-//! datasets ([`images`]) through the production per-request pipeline (decode -> preprocess ->
-//! infer -> postprocess, exactly as `worker.rs` runs it), `repeat` timed times per image. Timing
+//! datasets ([`images`]) through the production per-request stages (decode -> preprocess ->
+//! infer -> postprocess, the code `worker.rs` runs), one image at a time on one thread with one
+//! infer request, `repeat` timed times per image. The service is faster than these per-image
+//! latencies imply: it decodes and preprocesses on a pool while inferring and can keep several
+//! inferences in flight (`crate::profile`), so measure its throughput with
+//! `test-blue-onyx-prism --repeat 200 --parallel 6`. Timing
 //! uses the model's configured confidence threshold; the same inference outputs are also
 //! post-processed (untimed) at [`EVAL_CONFIDENCE`] for AP. Accuracy ([`metrics`]) is measured
 //! against the dataset's ground truth, or against pseudo ground truth from a reference model
@@ -892,7 +896,7 @@ impl<'a> Bench<'a> {
             None => (!self.object_filter.is_empty()).then_some(self.object_filter),
         };
 
-        // One request exactly as `WorkerCtx::process` runs it, with per-stage timings; with
+        // One request through the worker's stages, serially, with per-stage timings; with
         // `eval`, the same outputs are post-processed again at the evaluation threshold
         // (untimed, unfiltered).
         let mut iteration = |bytes: &[u8], eval: bool| -> Result<Sample> {
