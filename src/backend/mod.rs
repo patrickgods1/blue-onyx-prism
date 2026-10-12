@@ -20,6 +20,11 @@
 //! let compiled: Compiled = rt.compile(&candidate, &req)?;   // `Compiled` is Send
 //! let mut backend = compiled.into_backend()?;             // creates the InferRequest
 //! let outs: Vec<NamedOutput> = backend.infer(&chw_f32, &extra_inputs)?;
+//! // Pipelined (worker): `compile_tuned` with a profile's `DeviceTuning` gives several slots;
+//! let seq = backend.submit(slot, &chw_f32, &extra_inputs)?; // infer_async / session thread
+//! let done: Completion = backend.completions().recv()?;      // select on it with other work
+//! let outs = backend.collect(done.slot)?;                     // ...postprocess...
+//! backend.recycle(done.slot, outs);                           // buffers back to the slot
 //! ```
 
 pub mod detect;
@@ -39,6 +44,7 @@ pub use select::{DeviceOption, RuntimeProbe, Selection};
 pub use spec::{DeviceSpec, Runtime};
 
 use crate::model::{ExtraInput, NamedOutput, PortSpec};
+use crate::profile::{DeviceClass, DeviceTuning, PerfHint};
 use anyhow::Result;
 use spec::Device;
 use std::collections::HashMap;
@@ -160,9 +166,15 @@ impl OvCore {
         device::apply_core_properties(&mut self.core, &self.opts, &self.available)
     }
 
-    /// Read, (reshape to static), compile on exactly `cand.device` and introspect ports.
-    pub fn compile(&mut self, cand: &Candidate, req: &LoadRequest) -> Result<OvCompiled> {
-        device::load_model(&mut self.core, &self.available, cand, req)
+    /// Read, (reshape to static), compile on exactly `cand.device` with `tuning`'s performance
+    /// hint and introspect ports.
+    pub fn compile(
+        &mut self,
+        cand: &Candidate,
+        req: &LoadRequest,
+        tuning: &DeviceTuning,
+    ) -> Result<OvCompiled> {
+        device::load_model(&mut self.core, &self.available, cand, req, tuning)
     }
 
     /// Human readable device description (FULL_DEVICE_NAME) for a device string.
@@ -201,18 +213,36 @@ impl OvCore {
 }
 
 /// An OpenVINO compiled model plus its metadata. `CompiledModel` is `Send`, so this can be moved
-/// into a worker thread; the `InferRequest` is created there ([`OvBackend::new`]).
+/// into a worker thread; the `InferRequest`s are created there ([`OvBackend::new`]).
 pub struct OvCompiled {
     pub(crate) compiled: openvino::CompiledModel,
     pub info: ModelInfo,
+    /// Hint it was compiled with and the in-flight count wanted.
+    pub(crate) tuning: DeviceTuning,
+    /// `NUM_STREAMS` of the compiled model (None when not readable).
+    pub(crate) streams: Option<usize>,
 }
 
-/// Per-worker OpenVINO inference state.
+/// A finished asynchronous inference: which slot, its sequence number (from
+/// [`Backend::submit`]) and when it finished. Stale ones (e.g. of a synchronous
+/// [`Backend::infer`]) carry an older sequence number and are ignored by the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Completion {
+    pub slot: usize,
+    pub seq: u64,
+    pub at: std::time::Instant,
+}
+
+/// Per-worker OpenVINO inference state: one `InferRequest` per slot, all from one compiled
+/// model, each with a completion callback feeding [`Backend::completions`].
 pub struct OvBackend {
     pub(crate) info: ModelInfo,
-    pub(crate) request: openvino::InferRequest,
-    pub(crate) input_tensor: openvino::Tensor,
-    /// Kept alive for as long as its infer request.
+    /// Dropped (after `Drop` aborted what is in flight) before the compiled model.
+    pub(crate) slots: Vec<device::OvSlot>,
+    pub(crate) done_rx: crossbeam_channel::Receiver<Completion>,
+    pub(crate) tuning: DeviceTuning,
+    pub(crate) streams: Option<usize>,
+    /// Kept alive for as long as its infer requests.
     pub(crate) _compiled: openvino::CompiledModel,
 }
 
@@ -227,13 +257,31 @@ impl OvBackend {
 
     /// Run one inference. `chw` must be `3 * w * h` f32 values in CHW order.
     pub fn infer(&mut self, chw: &[f32], extra: &[ExtraInput]) -> Result<Vec<NamedOutput>> {
-        device::run_inference(
-            &self.info,
-            &mut self.request,
-            &mut self.input_tensor,
-            chw,
-            extra,
-        )
+        let mut outs = Vec::new();
+        self.infer_into(chw, extra, &mut outs)?;
+        Ok(outs)
+    }
+
+    /// [`Self::infer`] into `outs`, reusing its buffers (slot 0, synchronously).
+    pub fn infer_into(
+        &mut self,
+        chw: &[f32],
+        extra: &[ExtraInput],
+        outs: &mut Vec<NamedOutput>,
+    ) -> Result<()> {
+        // Completions of earlier synchronous calls are never consumed; drop them.
+        while self.done_rx.try_recv().is_ok() {}
+        device::recycle(&mut self.slots, 0, std::mem::take(outs));
+        device::submit(&self.info, &mut self.slots, 0, chw, extra)?;
+        *outs = device::collect(&self.info, &mut self.slots, 0)?;
+        Ok(())
+    }
+}
+
+impl Drop for OvBackend {
+    fn drop(&mut self) {
+        // Never free a request (or its callback context) with an inference in flight.
+        device::abort(&mut self.slots);
     }
 }
 
@@ -263,7 +311,9 @@ impl Compiled {
     }
 }
 
-/// Inference state of one model on one worker thread.
+/// Inference state of one model on one worker thread: [`Self::slots`] inferences can be in
+/// flight at once ([`Self::submit`] / [`Self::collect`]); [`Self::infer`] runs one
+/// synchronously on slot 0.
 pub enum Backend {
     OpenVino(OvBackend),
     #[cfg(feature = "onnxruntime")]
@@ -279,12 +329,103 @@ impl Backend {
         }
     }
 
-    /// Run one inference. `chw` must be `3 * w * h` f32 values in CHW order.
-    pub fn infer(&mut self, chw: &[f32], extra: &[ExtraInput]) -> Result<Vec<NamedOutput>> {
+    /// Number of slots (concurrent inferences): OpenVINO infer requests, ONNX Runtime sessions.
+    pub fn slots(&self) -> usize {
         match self {
-            Backend::OpenVino(b) => b.infer(chw, extra),
+            Backend::OpenVino(b) => b.slots.len(),
             #[cfg(feature = "onnxruntime")]
-            Backend::Ort(b) => b.infer(chw, extra),
+            Backend::Ort(b) => b.slots(),
+        }
+    }
+
+    /// Hint the model was compiled with and `NUM_STREAMS` (OpenVINO; None for ONNX Runtime or
+    /// when not readable).
+    pub fn hint_and_streams(&self) -> (PerfHint, Option<usize>) {
+        match self {
+            Backend::OpenVino(b) => (b.tuning.hint, b.streams),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(_) => (PerfHint::Latency, None),
+        }
+    }
+
+    /// Start an inference on the free slot `slot`. `chw` (`3 * w * h` f32 values in CHW
+    /// order) and `extra` are copied, so they can be reused at once. Returns the sequence
+    /// number its [`Completion`] carries.
+    pub fn submit(&mut self, slot: usize, chw: &[f32], extra: &[ExtraInput]) -> Result<u64> {
+        match self {
+            Backend::OpenVino(b) => device::submit(&b.info, &mut b.slots, slot, chw, extra),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.submit(slot, chw, extra),
+        }
+    }
+
+    /// Completions of submitted inferences (select on it; then [`Self::collect`] the slot).
+    pub fn completions(&self) -> &crossbeam_channel::Receiver<Completion> {
+        match self {
+            Backend::OpenVino(b) => &b.done_rx,
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.completions(),
+        }
+    }
+
+    /// True while `slot` has an inference in flight (submitted, not collected).
+    pub fn is_busy(&self, slot: usize) -> bool {
+        match self {
+            Backend::OpenVino(b) => device::is_busy(&b.slots, slot),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.is_busy(slot),
+        }
+    }
+
+    /// The outputs of `slot`'s inference, waiting for it when it has not finished. The buffers
+    /// belong to the slot: hand them back with [`Self::recycle`] so the next inference reuses
+    /// them.
+    pub fn collect(&mut self, slot: usize) -> Result<Vec<NamedOutput>> {
+        match self {
+            Backend::OpenVino(b) => device::collect(&b.info, &mut b.slots, slot),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.collect(slot),
+        }
+    }
+
+    /// Return output buffers lent by [`Self::collect`] to `slot`.
+    pub fn recycle(&mut self, slot: usize, outs: Vec<NamedOutput>) {
+        match self {
+            Backend::OpenVino(b) => device::recycle(&mut b.slots, slot, outs),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.recycle(slot, outs),
+        }
+    }
+
+    /// Stop every inference in flight (OpenVINO: cancel and wait; ONNX Runtime: wait, a
+    /// running session cannot be interrupted). Their results are discarded.
+    pub fn abort(&mut self) {
+        match self {
+            Backend::OpenVino(b) => device::abort(&mut b.slots),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.abort(),
+        }
+    }
+
+    /// Run one inference synchronously (slot 0: submit + collect). `chw` must be `3 * w * h`
+    /// f32 values in CHW order.
+    pub fn infer(&mut self, chw: &[f32], extra: &[ExtraInput]) -> Result<Vec<NamedOutput>> {
+        let mut outs = Vec::new();
+        self.infer_into(chw, extra, &mut outs)?;
+        Ok(outs)
+    }
+
+    /// [`Self::infer`] into `outs`, reusing its buffers (one entry per model output).
+    pub fn infer_into(
+        &mut self,
+        chw: &[f32],
+        extra: &[ExtraInput],
+        outs: &mut Vec<NamedOutput>,
+    ) -> Result<()> {
+        match self {
+            Backend::OpenVino(b) => b.infer_into(chw, extra, outs),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.infer_into(chw, extra, outs),
         }
     }
 }
@@ -542,8 +683,31 @@ impl Runtimes {
         }
     }
 
-    /// Compile on exactly `cand.device` (no fallback).
+    /// The first runnable load candidate of `spec` for `model` (where the model is headed) and
+    /// its option label ("ONNX Runtime CoreML (Apple M1)"); None when nothing can run.
+    pub fn first_runnable(&self, spec: &DeviceSpec, model: &Path) -> Option<(Device, String)> {
+        let sel = self.selection(Some(model));
+        self.plan(spec, model).into_iter().find_map(|c| {
+            sel.option(&c.device)
+                .filter(|o| o.runnable)
+                .map(|o| (c.device, o.label.clone()))
+        })
+    }
+
+    /// Compile on exactly `cand.device` (no fallback) for serial use: LATENCY hint, one infer
+    /// request / session ([`DeviceTuning::SERIAL`]).
     pub fn compile(&mut self, cand: &Candidate, req: &LoadRequest) -> Result<Compiled> {
+        self.compile_tuned(cand, req, &DeviceTuning::SERIAL)
+    }
+
+    /// Compile on exactly `cand.device` (no fallback) with `tuning`: OpenVINO's performance
+    /// hint and in-flight count (clamped to `NUM_STREAMS` when asked), ONNX Runtime's sessions.
+    pub fn compile_tuned(
+        &mut self,
+        cand: &Candidate,
+        req: &LoadRequest,
+        tuning: &DeviceTuning,
+    ) -> Result<Compiled> {
         match cand.device.runtime {
             Runtime::OpenVino => {
                 let Some(core) = self.ov.as_mut() else {
@@ -552,7 +716,7 @@ impl Runtimes {
                         self.ov_error.as_deref().unwrap_or("not initialized")
                     );
                 };
-                Ok(Compiled::OpenVino(core.compile(cand, req)?))
+                Ok(Compiled::OpenVino(core.compile(cand, req, tuning)?))
             }
             #[cfg(feature = "onnxruntime")]
             Runtime::Ort => {
@@ -562,10 +726,46 @@ impl Runtimes {
                         self.ort_error.as_deref().unwrap_or("not initialized")
                     );
                 };
-                Ok(Compiled::Ort(rt.compile(cand, req)?))
+                Ok(Compiled::Ort(rt.compile(cand, req, tuning.ort_sessions)?))
             }
             #[cfg(not(feature = "onnxruntime"))]
-            Runtime::Ort => anyhow::bail!("{ORT_UNAVAILABLE} ({})", cand.device),
+            Runtime::Ort => {
+                let _ = tuning;
+                anyhow::bail!("{ORT_UNAVAILABLE} ({})", cand.device)
+            }
+        }
+    }
+
+    /// The concurrency class of `device` ([`crate::profile::Profile::tuning_for`]): an
+    /// OpenVINO GPU is discrete when OpenVINO reports `DEVICE_TYPE=discrete` for it.
+    pub fn device_class(&self, device: &Device) -> DeviceClass {
+        match (device.runtime, device.target) {
+            (Runtime::OpenVino, spec::Target::Gpu) => {
+                let name = device
+                    .openvino_device()
+                    .unwrap_or_else(|| "GPU".to_string());
+                let gpus: Vec<&select::OvDevice> = self
+                    .probe
+                    .openvino
+                    .devices
+                    .iter()
+                    .filter(|d| d.is_gpu())
+                    .collect();
+                let found = gpus
+                    .iter()
+                    .find(|d| d.name.eq_ignore_ascii_case(&name))
+                    .or_else(|| gpus.first());
+                if found.is_some_and(|d| d.is_discrete()) {
+                    DeviceClass::DiscreteGpu
+                } else {
+                    DeviceClass::IntegratedGpu
+                }
+            }
+            (Runtime::OpenVino, spec::Target::Npu) => DeviceClass::Npu,
+            (Runtime::OpenVino, _) => DeviceClass::Cpu,
+            (Runtime::Ort, t) => DeviceClass::Ort {
+                gpu: t != spec::Target::Cpu,
+            },
         }
     }
 

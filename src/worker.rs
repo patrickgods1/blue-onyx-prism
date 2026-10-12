@@ -1,30 +1,44 @@
 //! Per-model inference thread.
 //!
-//! Each configured model gets one OS thread that owns its [`Backend`] (the `InferRequest` is
-//! created on that thread) and receives work over a bounded crossbeam channel. Loading walks the
-//! device candidates of the model's [`DeviceSpec`] (e.g. GPU, then CPU): a candidate is accepted
-//! only once it compiles, creates its request and passes the warm-up inference. The channel is
-//! created before the model is compiled so the HTTP layer can route to it immediately; the
-//! effective queue depth is a "soft capacity" computed after the warm-up inference
-//! (`request_timeout / warmup_ms`, clamped to 1..=64) and checked by the server through
-//! [`WorkerHandle::is_full`]. Flow modeled on blue-onyx `worker.rs` (MIT).
+//! Each configured model gets one OS thread that owns its [`Backend`] (the infer requests /
+//! sessions are created on that thread) and receives work over a bounded crossbeam channel.
+//! Loading walks the device candidates of the model's [`DeviceSpec`] (e.g. GPU, then CPU): a
+//! candidate is accepted only once it compiles, creates its requests and passes the warm-up
+//! inference. The channel is created before the model is compiled so the HTTP layer can route
+//! to it immediately; the effective queue depth is a "soft capacity" computed after the warm-up
+//! inference (`request_timeout / warmup_ms`, clamped to 1..=64) and checked by the server
+//! through [`WorkerHandle::is_full`]. Flow modeled on blue-onyx `worker.rs` (MIT).
+//!
+//! The worker is pipelined (docs/REVIEW_PLAN.md, phase 2): decode + preprocess run on the
+//! registry's shared [`PrepPool`], and up to [`Backend::slots`] inferences run at once (the
+//! hardware profile decides how many per device, see [`crate::profile`]). The loop is a small
+//! state machine that waits with `crossbeam_channel::Select` on the work channel, the prep
+//! reply of the oldest request and the backend's completions (plus a tick for the shutdown
+//! token), so it neither spins nor sleeps while work is ready. Requests leave preprocessing and
+//! are answered in arrival order (FIFO per model); a request that fails before inference (bad
+//! image, timeout) is answered in its turn without disturbing the slots. Postprocessing stays
+//! on this thread.
 
 use crate::api::{VisionDetectionRequest, VisionDetectionResponse};
-use crate::backend::{Backend, Candidate, DeviceInfo, DeviceSpec, LoadRequest, Runtimes};
+use crate::backend::{
+    Backend, Candidate, Completion, DeviceInfo, DeviceSpec, LoadRequest, Runtimes,
+};
 use crate::config::ModelConfig;
 use crate::metrics::{DropReason, ModelGauges, ModelMetrics, ModelStateLabel};
-use crate::model::preprocess::Preprocessor;
-use crate::model::{Family, PostParams};
+use crate::model::{Family, PostParams, PreprocessCtx};
+use crate::prep::{PrepJob, PrepPool, PrepSpec, Prepared};
+use crate::profile::{DeviceTuning, Overrides, Profile};
 use crate::startup::{ModelState, StateHandle};
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, Select, Sender, TryRecvError};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// A message for a worker thread.
 pub enum WorkItem {
@@ -68,6 +82,18 @@ pub struct WorkerConfig {
     /// Downloads to wait for before loading (phase 7.3); progress goes into the model state.
     /// `classes` is empty then and read from disk once the files are there.
     pub wait: Option<crate::resources::provision::Wait>,
+    /// Hardware profile and explicit settings that decide the compile hint and the number of
+    /// inferences in flight per device; None = one at a time with the latency hint.
+    pub concurrency: Option<Concurrency>,
+    /// The generation's decode + preprocess pool (None: the worker starts a one-thread pool).
+    pub prep: Option<Arc<PrepPool>>,
+}
+
+/// What decides a model's concurrency on the device it loads on.
+#[derive(Debug, Clone)]
+pub struct Concurrency {
+    pub profile: Profile,
+    pub overrides: Overrides,
 }
 
 /// One-shot "this worker is done with its startup load" signal, used by the registry to make
@@ -419,9 +445,109 @@ pub fn spawn_worker_after(
 struct Engine {
     backend: Backend,
     family: Box<dyn Family>,
-    pre: Preprocessor,
+    /// Geometry the prep pool preprocesses this model's images for.
+    spec: PrepSpec,
     provider: String,
 }
+
+/// Where a request is between intake and reply.
+enum Stage {
+    /// Waiting for the prep pool.
+    Prep(Receiver<Result<Prepared>>),
+    /// Decoded and preprocessed, waiting for a free slot.
+    Ready(Prepared),
+    /// Already answered (dropped or failed); replied in order.
+    Answer(VisionDetectionResponse),
+}
+
+/// Who asked and when.
+struct Meta {
+    reply: tokio::sync::oneshot::Sender<VisionDetectionResponse>,
+    enqueued: Instant,
+    image_name: String,
+    min_confidence: f32,
+}
+
+struct Job {
+    meta: Meta,
+    stage: Stage,
+}
+
+/// A request whose inference was submitted into a slot.
+struct InFlight {
+    meta: Meta,
+    ctx: PreprocessCtx,
+    img: Option<crate::image::RgbImage>,
+    decode: Duration,
+    preprocess: Duration,
+    seq: u64,
+    submitted: Instant,
+    /// When the backend reported it finished.
+    done: Option<Instant>,
+}
+
+/// Replies in request order: a slot to collect, or an answer decided earlier.
+enum Done {
+    Slot(usize),
+    Answer(Box<(Meta, VisionDetectionResponse)>),
+}
+
+/// The worker's requests between intake and reply. Requests leave `pending` in FIFO order and
+/// are answered in the order they entered `order`, so replies keep the request order.
+#[derive(Default)]
+struct Pipeline {
+    pending: VecDeque<Job>,
+    order: VecDeque<Done>,
+    slots: Vec<Option<InFlight>>,
+    /// Round-robin start for the next free slot.
+    next: usize,
+}
+
+impl Pipeline {
+    fn resize(&mut self, slots: usize) {
+        self.slots.resize_with(slots.max(1), || None);
+    }
+
+    fn free_slot(&mut self) -> Option<usize> {
+        let n = self.slots.len();
+        let i = (0..n)
+            .map(|k| (self.next + k) % n)
+            .find(|&i| self.slots[i].is_none())?;
+        self.next = (i + 1) % n;
+        Some(i)
+    }
+
+    fn busy(&self) -> bool {
+        self.slots.iter().any(Option::is_some)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.order.is_empty() && !self.busy()
+    }
+
+    /// Record a backend completion (ignores stale ones, e.g. of the warm-up).
+    fn complete(&mut self, c: Completion) -> bool {
+        match self.slots.get_mut(c.slot) {
+            Some(Some(f)) if f.seq == c.seq && f.done.is_none() => {
+                f.done = Some(c.at);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What woke the worker.
+enum Event {
+    Work(Result<WorkItem, crossbeam_channel::RecvError>),
+    Prep(Result<Result<Prepared>, crossbeam_channel::RecvError>),
+    Done(Result<Completion, crossbeam_channel::RecvError>),
+    Tick,
+}
+
+/// Target of the trace events that record request order (`accepted` / `replied`, field
+/// `image`); `tests/pipeline.rs` checks FIFO order with them.
+pub const ORDER_TARGET: &str = "blue_onyx_prism::worker::order";
 
 struct WorkerCtx {
     runtimes: Arc<Mutex<Runtimes>>,
@@ -478,77 +604,381 @@ impl WorkerCtx {
             self.gate.open();
         }
 
+        let prep = self.cfg.prep.clone().unwrap_or_else(|| PrepPool::new(1));
+        let mut p = Pipeline::default();
+        if let Some(e) = &engine {
+            p.resize(e.backend.slots());
+        }
+        let tick = crossbeam_channel::tick(POLL);
+        let mut closed = false;
         loop {
-            let item = match rx.recv_timeout(POLL) {
-                Ok(item) => item,
-                Err(RecvTimeoutError::Timeout) => {
-                    if self.shutdown.is_cancelled() {
-                        break;
-                    }
-                    continue;
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
-            };
             if self.shutdown.is_cancelled() {
                 break;
             }
-            let (req, reply, enqueued) = match item {
-                WorkItem::Load => {
-                    if engine.is_none() && !matches!(self.state.get(), ModelState::Failed(_)) {
-                        // Lazy model: compile now; requests meanwhile are answered
-                        // "initializing" by the server.
-                        engine = self.try_load();
+            // Everything that can happen without waiting.
+            loop {
+                let mut progressed = false;
+                if let Some(eng) = engine.as_mut() {
+                    while let Ok(c) = eng.backend.completions().try_recv() {
+                        progressed |= p.complete(c);
                     }
-                    continue;
+                    progressed |= self.reply_front(eng, &mut p);
+                    progressed |= self.fill_slots(eng, &mut p);
                 }
-                WorkItem::Detect(req, reply, enqueued) => (req, reply, enqueued),
-            };
-
-            if engine.is_none() {
-                // Only reachable for a lazy model (between the server's trigger and the state
-                // update) or after a failed load: answer at once, never block.
-                let msg = match self.state.get() {
-                    ModelState::Failed(msg) => {
-                        self.metrics.record_drop(DropReason::Failed);
-                        format!("Model '{name}' failed to load: {msg}")
+                while !closed && self.has_room(engine.as_ref(), &p, &prep) {
+                    match rx.try_recv() {
+                        Ok(item) => {
+                            self.accept(item, &mut engine, &mut p, &prep);
+                            progressed = true;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => closed = true,
                     }
-                    _ => {
-                        self.metrics.record_drop(DropReason::Initializing);
-                        initializing_message(&name, self.state.detail().as_deref())
-                    }
-                };
-                let _ = reply.send(self.error_response(msg, 0, 0));
-                continue;
-            } else {
-                let waited = enqueued.elapsed();
-                if waited > self.cfg.request_timeout {
-                    self.metrics.record_drop(DropReason::Timeout);
-                    warn!(
-                        model = %name,
-                        waited_ms = waited.as_millis() as u64,
-                        timeout_ms = self.cfg.request_timeout.as_millis() as u64,
-                        "dropping request that waited longer than the request timeout (server overloaded)"
-                    );
-                    let _ = reply.send(self.error_response(
-                        format!(
-                            "Request dropped: waited {} ms in queue (timeout {} ms)",
-                            waited.as_millis(),
-                            self.cfg.request_timeout.as_millis()
-                        ),
-                        0,
-                        0,
-                    ));
-                    continue;
+                }
+                if !progressed || self.shutdown.is_cancelled() {
+                    break;
                 }
             }
+            if self.shutdown.is_cancelled() || (closed && p.is_empty()) {
+                break;
+            }
 
-            let Some(eng) = engine.as_mut() else { continue };
-            let resp = self.process(eng, req, enqueued);
-            if reply.send(resp).is_err() {
-                debug!(model = %name, "client went away before the response was sent");
+            // Wait for whatever can move the pipeline next.
+            let event = {
+                let mut sel = Select::new();
+                let i_work =
+                    (!closed && self.has_room(engine.as_ref(), &p, &prep)).then(|| sel.recv(&rx));
+                let head_prep = match p.pending.front() {
+                    Some(Job {
+                        stage: Stage::Prep(r),
+                        ..
+                    }) if p.slots.iter().any(Option::is_none) => Some(r),
+                    _ => None,
+                };
+                let i_prep = head_prep.map(|r| sel.recv(r));
+                let done_rx = engine.as_ref().map(|e| e.backend.completions());
+                let i_done = done_rx.filter(|_| p.busy()).map(|r| sel.recv(r));
+                let i_tick = sel.recv(&tick);
+                let op = sel.select();
+                let i = op.index();
+                if Some(i) == i_work {
+                    Event::Work(op.recv(&rx))
+                } else if Some(i) == i_prep
+                    && let Some(r) = head_prep
+                {
+                    Event::Prep(op.recv(r))
+                } else if Some(i) == i_done
+                    && let Some(r) = done_rx
+                {
+                    Event::Done(op.recv(r))
+                } else {
+                    debug_assert_eq!(i, i_tick);
+                    let _ = op.recv(&tick);
+                    Event::Tick
+                }
+            };
+            match event {
+                Event::Work(Ok(item)) => self.accept(item, &mut engine, &mut p, &prep),
+                Event::Work(Err(_)) => closed = true,
+                Event::Prep(r) => {
+                    if let Some(job) = p.pending.front_mut() {
+                        job.stage = self.prep_stage(r, &job.meta);
+                    }
+                }
+                Event::Done(Ok(c)) => {
+                    p.complete(c);
+                }
+                Event::Done(Err(_)) => {}
+                Event::Tick => self.unstick(&mut p),
             }
         }
+        if let Some(eng) = engine.as_mut()
+            && p.busy()
+        {
+            // Never leave an inference running past the worker (shutdown).
+            eng.backend.abort();
+        }
+        self.answer_remaining(p, &rx);
         info!(model = %name, "worker exiting");
+    }
+
+    /// Shutdown: answer every request still in the pipeline or queued in the channel at once
+    /// (instead of letting its HTTP handler wait for the request timeout).
+    fn answer_remaining(&self, p: Pipeline, rx: &Receiver<WorkItem>) {
+        let msg = || format!("Model '{}' is shutting down", self.cfg.name);
+        let mut metas: Vec<Meta> = Vec::new();
+        for d in p.order {
+            match d {
+                Done::Slot(_) => {}
+                Done::Answer(a) => metas.push(a.0),
+            }
+        }
+        metas.extend(p.slots.into_iter().flatten().map(|f| f.meta));
+        metas.extend(p.pending.into_iter().map(|j| j.meta));
+        for m in metas {
+            let _ = m.reply.send(self.error_response(msg(), 0, 0));
+        }
+        while let Ok(item) = rx.try_recv() {
+            if let WorkItem::Detect(_, reply, _) = item {
+                let _ = reply.send(self.error_response(msg(), 0, 0));
+            }
+        }
+    }
+
+    /// Another request may enter preprocessing: always while not loaded (answered at once),
+    /// else while fewer than slots + pool threads (at most 4) wait.
+    fn has_room(&self, engine: Option<&Engine>, p: &Pipeline, prep: &PrepPool) -> bool {
+        match engine {
+            None => true,
+            Some(_) => p.pending.len() < p.slots.len() + prep.threads().clamp(1, 4),
+        }
+    }
+
+    /// Handle one work item: a lazy load, or a detection request that enters the pipeline (or
+    /// is answered at once when the model is not loaded).
+    fn accept(
+        &self,
+        item: WorkItem,
+        engine: &mut Option<Engine>,
+        p: &mut Pipeline,
+        prep: &PrepPool,
+    ) {
+        let name = &self.cfg.name;
+        let (req, reply, enqueued) = match item {
+            WorkItem::Load => {
+                if engine.is_none() && !matches!(self.state.get(), ModelState::Failed(_)) {
+                    // Lazy model: compile now; requests meanwhile are answered
+                    // "initializing" by the server.
+                    *engine = self.try_load();
+                    if let Some(e) = engine.as_ref() {
+                        p.resize(e.backend.slots());
+                    }
+                }
+                return;
+            }
+            WorkItem::Detect(req, reply, enqueued) => (req, reply, enqueued),
+        };
+        let Some(eng) = engine.as_ref() else {
+            // Only reachable for a lazy model (between the server's trigger and the state
+            // update) or after a failed load: answer at once, never block.
+            let msg = match self.state.get() {
+                ModelState::Failed(msg) => {
+                    self.metrics.record_drop(DropReason::Failed);
+                    format!("Model '{name}' failed to load: {msg}")
+                }
+                _ => {
+                    self.metrics.record_drop(DropReason::Initializing);
+                    initializing_message(name, self.state.detail().as_deref())
+                }
+            };
+            let _ = reply.send(self.error_response(msg, 0, 0));
+            return;
+        };
+        trace!(target: ORDER_TARGET, model = %name, image = %req.image_name, "accepted");
+        let meta = Meta {
+            reply,
+            enqueued,
+            image_name: req.image_name,
+            min_confidence: req.min_confidence,
+        };
+        let stage = if let Some(resp) = self.timed_out(&meta) {
+            Stage::Answer(resp)
+        } else {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let job = PrepJob {
+                image: req.image_data,
+                spec: eng.spec,
+                keep_image: self.cfg.save_image_path.is_some(),
+                reply: tx,
+            };
+            match prep.submit(job) {
+                Ok(()) => Stage::Prep(rx),
+                Err(e) => Stage::Answer(self.failure(&meta, &eng.provider, &e)),
+            }
+        };
+        p.pending.push_back(Job { meta, stage });
+    }
+
+    /// The drop answer when `meta` waited longer than the request timeout.
+    fn timed_out(&self, meta: &Meta) -> Option<VisionDetectionResponse> {
+        let waited = meta.enqueued.elapsed();
+        if waited <= self.cfg.request_timeout {
+            return None;
+        }
+        self.metrics.record_drop(DropReason::Timeout);
+        warn!(
+            model = %self.cfg.name,
+            waited_ms = waited.as_millis() as u64,
+            timeout_ms = self.cfg.request_timeout.as_millis() as u64,
+            "dropping request that waited longer than the request timeout (server overloaded)"
+        );
+        Some(self.error_response(
+            format!(
+                "Request dropped: waited {} ms in queue (timeout {} ms)",
+                waited.as_millis(),
+                self.cfg.request_timeout.as_millis()
+            ),
+            0,
+            0,
+        ))
+    }
+
+    /// The error answer for a request that failed before inference (bad image, ...).
+    fn failure(&self, meta: &Meta, provider: &str, e: &anyhow::Error) -> VisionDetectionResponse {
+        warn!(model = %self.cfg.name, image = %meta.image_name, "detection failed: {e:#}");
+        let mut r = self.error_response(format!("{e:#}"), 0, 0);
+        r.executionProvider = provider.to_string();
+        r
+    }
+
+    /// The stage of a request whose prep reply arrived.
+    fn prep_stage(
+        &self,
+        r: Result<Result<Prepared>, crossbeam_channel::RecvError>,
+        meta: &Meta,
+    ) -> Stage {
+        let provider = self
+            .device
+            .read()
+            .ok()
+            .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
+            .unwrap_or_default();
+        match r {
+            Ok(Ok(prepared)) => Stage::Ready(prepared),
+            Ok(Err(e)) => Stage::Answer(self.failure(meta, &provider, &e)),
+            Err(_) => Stage::Answer(self.failure(
+                meta,
+                &provider,
+                &anyhow::anyhow!("the preprocessing thread stopped"),
+            )),
+        }
+    }
+
+    /// Move requests from the head of `pending` into free slots (or into `order` when they
+    /// were answered already). True when something moved.
+    fn fill_slots(&self, eng: &mut Engine, p: &mut Pipeline) -> bool {
+        let mut moved = false;
+        while let Some(job) = p.pending.front_mut() {
+            if let Stage::Prep(rx) = &job.stage {
+                let r = match rx.try_recv() {
+                    Ok(r) => Ok(r),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => Err(crossbeam_channel::RecvError),
+                };
+                job.stage = self.prep_stage(r, &job.meta);
+                moved = true;
+            }
+            let slot = match &job.stage {
+                Stage::Answer(_) => None,
+                Stage::Ready(_) => match p.free_slot() {
+                    Some(s) => Some(s),
+                    None => break,
+                },
+                Stage::Prep(_) => unreachable!("resolved above"),
+            };
+            let Some(Job { meta, stage }) = p.pending.pop_front() else {
+                break;
+            };
+            moved = true;
+            let prepared = match (stage, slot) {
+                (Stage::Answer(resp), _) => {
+                    p.order.push_back(Done::Answer(Box::new((meta, resp))));
+                    continue;
+                }
+                (Stage::Ready(prepared), Some(_)) => prepared,
+                _ => unreachable!("a ready request has a slot"),
+            };
+            let slot = slot.unwrap_or_default();
+            // The request timeout also covers the wait for decode + preprocess.
+            if let Some(resp) = self.timed_out(&meta) {
+                p.order.push_back(Done::Answer(Box::new((meta, resp))));
+                continue;
+            }
+            let extra = eng.family.extra_inputs(&prepared.ctx);
+            let submitted = Instant::now();
+            match eng.backend.submit(slot, &prepared.chw, &extra) {
+                Ok(seq) => {
+                    let Prepared {
+                        ctx,
+                        img,
+                        decode,
+                        preprocess,
+                        ..
+                    } = prepared; // the tensor buffer goes back to the pool here
+                    p.slots[slot] = Some(InFlight {
+                        meta,
+                        ctx,
+                        img,
+                        decode,
+                        preprocess,
+                        seq,
+                        submitted,
+                        done: None,
+                    });
+                    p.order.push_back(Done::Slot(slot));
+                }
+                Err(e) => {
+                    let resp = self.failure(&meta, &eng.provider, &e);
+                    p.order.push_back(Done::Answer(Box::new((meta, resp))));
+                }
+            }
+        }
+        moved
+    }
+
+    /// Reply to the requests at the front of `order` that are answered or whose inference
+    /// finished. True when something was replied.
+    fn reply_front(&self, eng: &mut Engine, p: &mut Pipeline) -> bool {
+        let mut replied = false;
+        loop {
+            match p.order.front() {
+                Some(Done::Answer(..)) => {
+                    if let Some(Done::Answer(answer)) = p.order.pop_front() {
+                        let (meta, resp) = *answer;
+                        self.reply(meta, resp);
+                    }
+                }
+                Some(&Done::Slot(i)) if p.slots[i].as_ref().is_some_and(|f| f.done.is_some()) => {
+                    p.order.pop_front();
+                    if let Some(f) = p.slots[i].take() {
+                        self.finish(eng, i, f);
+                    }
+                }
+                _ => break,
+            }
+            replied = true;
+        }
+        replied
+    }
+
+    /// A tick: if the oldest inference has run for longer than the request timeout without a
+    /// completion, collect it anyway (blocking), so a lost notification cannot stall the model.
+    fn unstick(&self, p: &mut Pipeline) {
+        if let Some(&Done::Slot(i)) = p.order.front()
+            && let Some(f) = p.slots[i].as_mut()
+            && f.done.is_none()
+            && f.submitted.elapsed() > self.cfg.request_timeout
+        {
+            warn!(
+                model = %self.cfg.name,
+                slot = i,
+                "no completion after the request timeout; waiting for the inference"
+            );
+            f.done = Some(Instant::now());
+        }
+    }
+
+    fn reply(&self, meta: Meta, resp: VisionDetectionResponse) {
+        trace!(
+            target: ORDER_TARGET,
+            model = %self.cfg.name,
+            image = %meta.image_name,
+            success = resp.success,
+            "replied"
+        );
+        if meta.reply.send(resp).is_err() {
+            debug!(model = %self.cfg.name, "client went away before the response was sent");
+        }
     }
 
     /// Block until the model's downloads are installed (true: load now). Keeps the state
@@ -633,6 +1063,7 @@ impl WorkerCtx {
         }
         self.metrics
             .set_loaded(dev.actual.clone(), engine.provider.clone());
+        let (hint, streams) = engine.backend.hint_and_streams();
         info!(
             model = %name,
             family = %engine.family.kind(),
@@ -645,19 +1076,34 @@ impl WorkerCtx {
             compile_ms,
             warmup_ms,
             queue = cap,
+            inflight = engine.backend.slots(),
+            hint = hint.as_str(),
+            streams = ?streams,
             "model ready"
         );
         Ok(engine)
     }
 
-    /// Compile (under the runtimes lock), create the request and warm up on one candidate.
-    /// Returns the engine with its compile and warm-up times.
+    /// The compile hint and in-flight count for `cand` (serial without a profile).
+    fn tuning_for(&self, rt: &Runtimes, cand: &Candidate) -> DeviceTuning {
+        match &self.cfg.concurrency {
+            Some(c) => c
+                .profile
+                .tuning_with(rt.device_class(&cand.device), c.overrides),
+            None => DeviceTuning::SERIAL,
+        }
+    }
+
+    /// Compile (under the runtimes lock), create the requests and warm up on one candidate.
+    /// Returns the engine with its compile and warm-up times (the warm-up is the inference
+    /// only; decode and preprocess run on the prep pool).
     fn load_on(&self, cand: &Candidate) -> Result<(Engine, u64, u64)> {
         self.state
             .set_initializing(format!("{COMPILING_ON} {}", cand.device));
         let compiled = {
             let mut rt = self.runtimes.lock().unwrap_or_else(|e| e.into_inner());
-            rt.compile(cand, &self.cfg.load)?
+            let tuning = self.tuning_for(&rt, cand);
+            rt.compile_tuned(cand, &self.cfg.load, &tuning)?
         };
         let info = compiled.info();
         let provider = info.device.execution_provider();
@@ -669,21 +1115,34 @@ impl WorkerCtx {
             &info.outputs,
             self.cfg.classes.len(),
         )?;
-        let mut pre = Preprocessor::for_family(in_w, in_h, family.as_ref());
+        let spec = PrepSpec::for_family(in_w, in_h, family.as_ref());
         let mut backend = compiled.into_backend()?;
 
-        // Warm-up on a mid-gray frame the size of the model input.
+        // Warm-up on a mid-gray frame the size of the model input: slot 0 timed, then every
+        // other slot at once (first runs allocate per request / session).
         let gray = vec![114u8; in_w as usize * in_h as usize * 3];
-        let t = Instant::now();
+        let mut pre = spec.preprocessor();
         let (chw, ctx) = pre.run(&gray, in_w, in_h)?;
         let extra = family.extra_inputs(&ctx);
+        let t = Instant::now();
         backend.infer(chw, &extra).context("warm-up inference")?;
         let warmup_ms = t.elapsed().as_millis() as u64;
+        let others = 1..backend.slots();
+        for s in others.clone() {
+            backend
+                .submit(s, chw, &extra)
+                .context("warm-up inference")?;
+        }
+        for s in others {
+            let outs = backend.collect(s).context("warm-up inference")?;
+            backend.recycle(s, outs);
+        }
+        while backend.completions().try_recv().is_ok() {}
         Ok((
             Engine {
                 backend,
                 family,
-                pre,
+                spec,
                 provider,
             },
             compile_ms,
@@ -713,70 +1172,64 @@ impl WorkerCtx {
         }
     }
 
-    fn process(
-        &self,
-        eng: &mut Engine,
-        req: VisionDetectionRequest,
-        enqueued: Instant,
-    ) -> VisionDetectionResponse {
+    /// Collect `slot`'s finished inference, postprocess on this thread and reply.
+    fn finish(&self, eng: &mut Engine, slot: usize, f: InFlight) {
         let name = &self.cfg.name;
-        let queue_ms = enqueued.elapsed().as_millis() as u64;
-        let start = Instant::now();
-        let mut infer_d = Duration::ZERO;
-        let result = (|| -> Result<(Vec<crate::api::Prediction>, crate::image::RgbImage, [Duration; 3])> {
-            let t = Instant::now();
-            let img = crate::image::decode(&req.image_data)?;
-            let decode_d = t.elapsed();
-
-            let t = Instant::now();
-            let (chw, ctx) = eng.pre.run(&img.rgb, img.width, img.height)?;
-            let extra = eng.family.extra_inputs(&ctx);
-            let pre_d = t.elapsed();
-
-            let t = Instant::now();
-            let outputs = eng.backend.infer(chw, &extra)?;
-            infer_d = t.elapsed();
-
-            let t = Instant::now();
-            let params = PostParams {
-                confidence_threshold: effective_threshold(req.min_confidence, self.cfg.confidence_threshold),
-                nms_iou: self.cfg.nms_iou,
-            };
-            let dets = eng.family.postprocess(&outputs, &ctx, &params)?;
-            let filter = (!self.cfg.object_filter.is_empty()).then_some(self.cfg.object_filter.as_slice());
-            let preds = crate::model::to_predictions(&dets, &ctx, &self.cfg.classes, filter);
-            let post_d = t.elapsed();
-            Ok((preds, img, [decode_d, pre_d, post_d]))
-        })();
-        let process_d = start.elapsed();
-
-        match result {
-            Ok((predictions, img, [decode_d, pre_d, post_d])) => {
+        let infer_d = f
+            .done
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(f.submitted);
+        let t = Instant::now();
+        let params = PostParams {
+            confidence_threshold: effective_threshold(
+                f.min_confidence(),
+                self.cfg.confidence_threshold,
+            ),
+            nms_iou: self.cfg.nms_iou,
+        };
+        let result = eng.backend.collect(slot).and_then(|outs| {
+            let dets = eng.family.postprocess(&outs, &f.ctx, &params);
+            eng.backend.recycle(slot, outs);
+            let filter =
+                (!self.cfg.object_filter.is_empty()).then_some(self.cfg.object_filter.as_slice());
+            Ok(crate::model::to_predictions(
+                &dets?,
+                &f.ctx,
+                &self.cfg.classes,
+                filter,
+            ))
+        });
+        let post_d = t.elapsed();
+        let process_d = f.decode + f.preprocess + infer_d + post_d;
+        let resp = match result {
+            Ok(predictions) => {
                 self.metrics.inference_ms.record(infer_d.as_millis() as u64);
                 self.metrics.process_ms.record(process_d.as_millis() as u64);
                 debug!(
                     model = %name,
-                    image = %req.image_name,
-                    size = %format!("{}x{}", img.width, img.height),
+                    image = %f.meta.image_name,
+                    size = %format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
                     count = predictions.len(),
-                    queue_ms,
-                    decode_ms = decode_d.as_secs_f64() * 1e3,
-                    preprocess_ms = pre_d.as_secs_f64() * 1e3,
+                    slot,
+                    queue_ms = f.submitted.saturating_duration_since(f.meta.enqueued).as_millis() as u64,
+                    decode_ms = f.decode.as_secs_f64() * 1e3,
+                    preprocess_ms = f.preprocess.as_secs_f64() * 1e3,
                     inference_ms = infer_d.as_secs_f64() * 1e3,
                     postprocess_ms = post_d.as_secs_f64() * 1e3,
                     process_ms = process_d.as_secs_f64() * 1e3,
                     "detection done"
                 );
-                if let Some(dir) = &self.cfg.save_image_path {
-                    let file_name = if req.image_name.is_empty() || req.image_name == "image.jpg" {
-                        format!("{}.jpg", uuid::Uuid::new_v4())
-                    } else {
-                        req.image_name.clone()
-                    };
+                if let (Some(dir), Some(img)) = (&self.cfg.save_image_path, &f.img) {
+                    let file_name =
+                        if f.meta.image_name.is_empty() || f.meta.image_name == "image.jpg" {
+                            format!("{}.jpg", uuid::Uuid::new_v4())
+                        } else {
+                            f.meta.image_name.clone()
+                        };
                     if let Err(e) = crate::image::save_annotated(
                         dir,
                         &file_name,
-                        &img,
+                        img,
                         &predictions,
                         self.cfg.save_ref_image,
                     ) {
@@ -799,12 +1252,19 @@ impl WorkerCtx {
                 }
             }
             Err(e) => {
-                warn!(model = %name, image = %req.image_name, "detection failed: {e:#}");
+                warn!(model = %name, image = %f.meta.image_name, "detection failed: {e:#}");
                 let mut r = self.error_response(format!("{e:#}"), ms(infer_d), ms(process_d));
                 r.executionProvider = eng.provider.clone();
                 r
             }
-        }
+        };
+        self.reply(f.meta, resp);
+    }
+}
+
+impl InFlight {
+    fn min_confidence(&self) -> f32 {
+        self.meta.min_confidence
     }
 }
 
@@ -920,6 +1380,79 @@ mod tests {
         // Eager models and failed handles never send Load.
         let m = Arc::new(ModelMetrics::new("x", "CPU", ""));
         assert!(!WorkerHandle::failed("x", "boom", m).trigger_load());
+    }
+
+    fn in_flight(seq: u64) -> InFlight {
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        InFlight {
+            meta: Meta {
+                reply,
+                enqueued: Instant::now(),
+                image_name: String::new(),
+                min_confidence: 0.0,
+            },
+            ctx: PreprocessCtx {
+                orig_w: 1,
+                orig_h: 1,
+                input_w: 1,
+                input_h: 1,
+                mode: crate::model::ResizeMode::Letterbox,
+                scale: 1.0,
+                pad_x: 0.0,
+                pad_y: 0.0,
+            },
+            img: None,
+            decode: Duration::ZERO,
+            preprocess: Duration::ZERO,
+            seq,
+            submitted: Instant::now(),
+            done: None,
+        }
+    }
+
+    #[test]
+    fn pipeline_slots_round_robin_and_completions() {
+        let mut p = Pipeline::default();
+        p.resize(0);
+        assert_eq!(p.slots.len(), 1, "at least one slot");
+        p.resize(3);
+        assert!(p.is_empty() && !p.busy());
+        assert_eq!(p.free_slot(), Some(0));
+        p.slots[0] = Some(in_flight(1));
+        assert_eq!(p.free_slot(), Some(1));
+        p.slots[1] = Some(in_flight(1));
+        assert_eq!(p.free_slot(), Some(2));
+        p.slots[2] = Some(in_flight(4));
+        assert_eq!(p.free_slot(), None);
+        assert!(p.busy() && !p.is_empty());
+        let at = Instant::now();
+        // Stale (older sequence number) and unknown slots are ignored.
+        assert!(!p.complete(Completion {
+            slot: 2,
+            seq: 3,
+            at
+        }));
+        assert!(!p.complete(Completion {
+            slot: 9,
+            seq: 1,
+            at
+        }));
+        assert!(p.complete(Completion {
+            slot: 2,
+            seq: 4,
+            at
+        }));
+        assert!(
+            !p.complete(Completion {
+                slot: 2,
+                seq: 4,
+                at
+            }),
+            "once"
+        );
+        assert_eq!(p.slots[2].as_ref().unwrap().done, Some(at));
+        p.slots[0] = None;
+        assert_eq!(p.free_slot(), Some(0));
     }
 
     #[test]

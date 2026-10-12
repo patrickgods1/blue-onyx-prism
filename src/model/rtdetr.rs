@@ -89,7 +89,8 @@ impl Family for RtDetr {
         }
         let n = n_labels;
 
-        let labels = labels_o.as_i64().ok_or_else(|| {
+        let mut scratch = Vec::new();
+        let labels = labels_o.as_i64(&mut scratch).ok_or_else(|| {
             anyhow::anyhow!("rtdetr: output `labels` must be i64 or i32, got f32")
         })?;
         let boxes = boxes_o

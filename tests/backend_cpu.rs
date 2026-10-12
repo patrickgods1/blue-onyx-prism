@@ -101,6 +101,17 @@ fn cpu_and_gpu_inference() {
     assert_eq!(outs[0].shape, vec![1, 25200, 8]);
     assert_eq!(outs[0].as_f32().expect("f32 output").len(), 25200 * 8);
     assert!(backend.infer(&chw[1..], &[]).is_err(), "length check");
+    // `infer_into` refills the same output buffers.
+    let mut reused = Vec::new();
+    backend
+        .infer_into(&chw, &[], &mut reused)
+        .expect("infer_into");
+    let ptr = reused[0].as_f32().expect("f32 output").as_ptr();
+    backend
+        .infer_into(&chw, &[], &mut reused)
+        .expect("infer_into");
+    assert_eq!(reused[0].as_f32().unwrap().as_ptr(), ptr, "buffer reused");
+    assert_eq!(reused, outs, "same input, same outputs");
 
     // GPU with CPU fallback, loaded twice (second load should hit the compile cache).
     for run in 1..=2 {

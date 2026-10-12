@@ -55,7 +55,7 @@ impl std::fmt::Display for ModelFamilyKind {
 }
 
 /// How the source image is fitted into the model input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResizeMode {
     /// Keep aspect ratio, pad with gray (114) and center. Used by YOLO families.
     Letterbox,
@@ -115,7 +115,9 @@ impl PreprocessCtx {
     }
 }
 
-/// A raw output tensor copied out of the inference request.
+/// A raw output tensor copied out of the inference request. Backends refill the same buffers
+/// request after request ([`Self::f32_mut`] and friends keep the allocation), so steady state
+/// does not allocate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputBuf {
     F32(Vec<f32>),
@@ -123,7 +125,64 @@ pub enum OutputBuf {
     I32(Vec<i32>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl Default for OutputBuf {
+    fn default() -> Self {
+        OutputBuf::F32(Vec::new())
+    }
+}
+
+impl OutputBuf {
+    /// Number of elements.
+    pub fn len(&self) -> usize {
+        match self {
+            OutputBuf::F32(v) => v.len(),
+            OutputBuf::I64(v) => v.len(),
+            OutputBuf::I32(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The buffer as an empty f32 vector, keeping its capacity when it already holds f32.
+    pub fn f32_mut(&mut self) -> &mut Vec<f32> {
+        if !matches!(self, OutputBuf::F32(_)) {
+            *self = OutputBuf::F32(Vec::new());
+        }
+        let OutputBuf::F32(v) = self else {
+            unreachable!()
+        };
+        v.clear();
+        v
+    }
+
+    /// The buffer as an empty i64 vector, keeping its capacity when it already holds i64.
+    pub fn i64_mut(&mut self) -> &mut Vec<i64> {
+        if !matches!(self, OutputBuf::I64(_)) {
+            *self = OutputBuf::I64(Vec::new());
+        }
+        let OutputBuf::I64(v) = self else {
+            unreachable!()
+        };
+        v.clear();
+        v
+    }
+
+    /// The buffer as an empty i32 vector, keeping its capacity when it already holds i32.
+    pub fn i32_mut(&mut self) -> &mut Vec<i32> {
+        if !matches!(self, OutputBuf::I32(_)) {
+            *self = OutputBuf::I32(Vec::new());
+        }
+        let OutputBuf::I32(v) = self else {
+            unreachable!()
+        };
+        v.clear();
+        v
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NamedOutput {
     pub name: String,
     pub shape: Vec<usize>,
@@ -137,13 +196,25 @@ impl NamedOutput {
             _ => None,
         }
     }
-    /// Integer outputs as i64 regardless of storage width.
-    pub fn as_i64(&self) -> Option<Vec<i64>> {
+
+    /// Integer outputs as i64 regardless of storage width: the stored slice for i64, else the
+    /// values widened into `scratch` (owned by the caller, reused across calls). None for f32.
+    pub fn as_i64<'a>(&'a self, scratch: &'a mut Vec<i64>) -> Option<&'a [i64]> {
         match &self.data {
-            OutputBuf::I64(v) => Some(v.clone()),
-            OutputBuf::I32(v) => Some(v.iter().map(|&x| x as i64).collect()),
+            OutputBuf::I64(v) => Some(v),
+            OutputBuf::I32(v) => {
+                scratch.clear();
+                scratch.extend(v.iter().map(|&x| i64::from(x)));
+                Some(scratch)
+            }
             OutputBuf::F32(_) => None,
         }
+    }
+
+    /// Prepare `outs` to receive `n` outputs: keeps the existing entries (and their buffers),
+    /// adds empty ones or drops extra ones.
+    pub fn resize_slots(outs: &mut Vec<NamedOutput>, n: usize) {
+        outs.resize_with(n, NamedOutput::default);
     }
 }
 
@@ -550,6 +621,42 @@ mod tests {
         );
         assert_eq!(parse_hf_preprocessor_size("{}"), None);
         assert_eq!(parse_hf_preprocessor_size("not json"), None);
+    }
+
+    #[test]
+    fn output_buffers_are_reused() {
+        let mut b = OutputBuf::default();
+        b.f32_mut().extend_from_slice(&[1.0, 2.0, 3.0]);
+        let cap = match &b {
+            OutputBuf::F32(v) => v.capacity(),
+            _ => unreachable!(),
+        };
+        let v = b.f32_mut();
+        assert!(
+            v.is_empty() && v.capacity() == cap,
+            "same allocation, cleared"
+        );
+        v.push(4.0);
+        assert_eq!(b, OutputBuf::F32(vec![4.0]));
+        b.i32_mut().extend_from_slice(&[7, -1]);
+        assert_eq!(b.len(), 2);
+        let out = NamedOutput {
+            name: "labels".into(),
+            shape: vec![1, 2],
+            data: b,
+        };
+        let mut scratch = Vec::new();
+        assert_eq!(out.as_i64(&mut scratch), Some(&[7i64, -1][..]));
+        let out = NamedOutput {
+            data: OutputBuf::I64(vec![5]),
+            ..out
+        };
+        assert_eq!(out.as_i64(&mut scratch), Some(&[5i64][..]));
+        let f = NamedOutput::default();
+        assert!(f.as_i64(&mut scratch).is_none() && f.data.is_empty());
+        let mut outs = vec![NamedOutput::default(); 3];
+        NamedOutput::resize_slots(&mut outs, 1);
+        assert_eq!(outs.len(), 1);
     }
 
     #[test]

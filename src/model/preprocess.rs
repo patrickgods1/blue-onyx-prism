@@ -84,6 +84,21 @@ impl Preprocessor {
     /// `rgb` is tightly packed RGB8, `w*h*3` bytes. Returns CHW f32 in 0..1 (or normalized)
     /// (length `3*input_w*input_h`) and the geometry needed to map boxes back.
     pub fn run(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<(&[f32], PreprocessCtx)> {
+        let mut tensor = std::mem::take(&mut self.tensor);
+        let r = self.run_into(rgb, w, h, &mut tensor);
+        self.tensor = tensor;
+        r.map(|ctx| (&self.tensor[..], ctx))
+    }
+
+    /// [`Self::run`] into a caller-owned tensor buffer (resized to `3*input_w*input_h`, its
+    /// allocation reused), e.g. a pooled buffer that outlives this call.
+    pub fn run_into(
+        &mut self,
+        rgb: &[u8],
+        w: u32,
+        h: u32,
+        out: &mut Vec<f32>,
+    ) -> Result<PreprocessCtx> {
         if w == 0 || h == 0 {
             anyhow::bail!("cannot preprocess an empty image ({w}x{h})");
         }
@@ -128,15 +143,15 @@ impl Preprocessor {
         };
 
         let plane = iw as usize * ih as usize;
-        self.tensor.resize(3 * plane, 0.0);
+        out.resize(3 * plane, 0.0);
         if new_w != iw || new_h != ih {
-            for (c, p) in self.tensor.chunks_exact_mut(plane).enumerate() {
+            for (c, p) in out.chunks_exact_mut(plane).enumerate() {
                 p.fill(self.lut[c][PAD_VALUE as usize]);
             }
         }
 
         // HWC u8 -> CHW f32 in one pass over the content rows.
-        let (r_plane, rest) = self.tensor.split_at_mut(plane);
+        let (r_plane, rest) = out.split_at_mut(plane);
         let (g_plane, b_plane) = rest.split_at_mut(plane);
         let row_bytes = new_w as usize * 3;
         let [lr, lg, lb] = &self.lut;
@@ -163,7 +178,7 @@ impl Preprocessor {
             pad_x: pad_x as f32,
             pad_y: pad_y as f32,
         };
-        Ok((&self.tensor, ctx))
+        Ok(ctx)
     }
 }
 
@@ -285,5 +300,30 @@ mod tests {
         assert_eq!(t[40], 114.0 / 255.0);
         assert!(p.run(&b, 33, 128).is_err());
         assert!(p.run(&[], 0, 0).is_err());
+    }
+
+    #[test]
+    fn run_into_matches_run_on_a_dirty_buffer() {
+        let mut p = Preprocessor::new(64, 48, ResizeMode::Letterbox)
+            .with_normalization(Some(Normalization::IMAGENET));
+        let img: Vec<u8> = (0..100 * 30 * 3).map(|i| (i * 7 % 256) as u8).collect();
+        let (want, want_ctx) = p.run(&img, 100, 30).map(|(t, c)| (t.to_vec(), c)).unwrap();
+        let mut out = vec![f32::NAN; 5];
+        let ctx = p.run_into(&img, 100, 30, &mut out).unwrap();
+        assert_eq!(ctx, want_ctx);
+        assert_eq!(out.len(), want.len());
+        assert!(
+            out.iter()
+                .zip(&want)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        // Reused with stale values from a bigger image: still exact.
+        out.iter_mut().for_each(|v| *v = 9.0);
+        p.run_into(&img, 100, 30, &mut out).unwrap();
+        assert!(
+            out.iter()
+                .zip(&want)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
     }
 }
