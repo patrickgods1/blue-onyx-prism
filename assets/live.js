@@ -298,6 +298,11 @@
     var links = Array.prototype.slice.call(nav.querySelectorAll('a[role="tab"]'));
     var panels = links.map(function (a) { return document.getElementById((a.getAttribute("href") || "").slice(1)); });
     if (!links.length || panels.some(function (p) { return !p; })) return null;
+    links.forEach(function (a, i) {
+      if (!a.id) a.id = panels[i].id + "-tab";
+      a.setAttribute("aria-controls", panels[i].id);
+      panels[i].setAttribute("role", "tabpanel"); panels[i].setAttribute("aria-labelledby", a.id);
+    });
     var current = null;
     function indexOf(id) {
       if (!id) return null;

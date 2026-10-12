@@ -56,7 +56,7 @@ impl DevicesSnapshot {
     /// Display text of the device `auto` resolves to.
     pub(super) fn auto_pick_label(&self) -> String {
         match self.selection.auto_pick() {
-            Some(o) => format!("{} ({})", o.spec, o.label),
+            Some(o) => format!("{} \u{b7} {}", o.spec, o.label),
             None => "nothing runnable".to_string(),
         }
     }
@@ -243,7 +243,7 @@ mod tests {
         assert!(cfg.contains("currently:"));
         let (_, home) = get_text(&state, "/").await;
         assert!(
-            home.contains("ONNX Runtime") && home.contains("GPUs") && home.contains("Auto picks")
+            home.contains("ONNX Runtime") && home.contains("GPUs") && home.contains("Auto device")
         );
     }
 

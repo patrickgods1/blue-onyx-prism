@@ -688,14 +688,14 @@ mod tests {
             "<td>Failed:<br><span class=\"detail\">model file not found: x.onnx</span></td>"
         ));
         assert!(home.contains("<tr class=\"st-fail\">"));
-        assert!(home.contains("In use") && home.contains("nothing loaded yet"));
-        assert!(home.contains("OpenVINO can use"));
+        assert!(home.contains("Running on") && home.contains("nothing loaded yet"));
+        assert!(home.contains("OpenVINO devices"));
         assert!(!home.contains("Force CPU is on"));
         // Prometheus moved to the footer, Logs is in the nav.
         assert!(home.contains("<a href=\"/logs\">Logs</a>"));
         assert!(home.contains("<a href=\"/prometheus\">Prometheus metrics</a>"));
         assert!(!home.contains("<b>evil</b>") && home.contains("&#60;b&#62;evil"));
-        assert!(home.contains("href=\"/static/style.css\""));
+        assert!(home.contains("href=\"/static/style.css?v="));
 
         let (s, stats) = get_text(&state, "/stats").await;
         assert_eq!(s, StatusCode::OK);

@@ -198,6 +198,7 @@ table.stats td, table.stats th { white-space: nowrap; }
 .drop { border: 2px dashed var(--border); border-radius: 8px; padding: 0.6rem 0.9rem; }
 .drop.over { border-color: var(--accent); background: var(--code-bg); }
 .drop img { display: block; max-width: 100%; max-height: 16rem; margin-top: 0.5rem; border-radius: 6px; }
+.drop img[hidden] { display: none; }
 canvas.result { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 6px; }
 .result-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
 @media (max-width: 800px) { .result-grid { grid-template-columns: 1fr; } }
@@ -258,6 +259,7 @@ span.small { font-size: 0.8rem; font-weight: normal; }
 .grade-none { background: var(--code-bg); color: var(--muted); }
 table.bench td, table.bench th { white-space: nowrap; }
 th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--fg); }
 th.sortable[data-dir="asc"]::after { content: " \25B2"; }
 th.sortable[data-dir="desc"]::after { content: " \25BC"; }
 table.bench tr.fastest td { background: var(--ok-bg); }

@@ -214,11 +214,16 @@
   var L = window.PrismLive, T = L && L.tabs(document.querySelector("nav.tabs"));
   function sortable(table) {
     table.querySelectorAll("th").forEach(function (th, i) {
-      th.classList.add("sortable");
-      th.addEventListener("click", function () { L.sortTable(table, i, th.dataset.dir !== "asc"); });
+      th.classList.add("sortable"); th.tabIndex = 0; th.setAttribute("role", "button");
+      if (th.textContent) th.title = "Sort by " + th.textContent;
+      var sort = function () { L.sortTable(table, i, th.dataset.dir !== "asc"); };
+      th.addEventListener("click", sort);
+      th.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sort(); } });
     });
     return table;
   }
+  // "12 Oct 2026, 16:53" in the browser's time zone (results store RFC 3339 UTC).
+  function when(ts) { var d = ts ? new Date(ts) : null; return d && !isNaN(d) ? d.toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : (ts || ""); }
   function table(cls, head) {
     var t = el("table", "bench " + (cls || "")), tr = el("tr"); var th = el("thead");
     head.forEach(function (h) { tr.appendChild(el("th", null, h)); }); th.appendChild(tr); t.appendChild(th); t.appendChild(el("tbody")); return t;
@@ -803,7 +808,7 @@
     else if (m.error) sum.appendChild(el("span", "error-text", "failed"));
     else sum.appendChild(el("span", "muted", m.recommended || m.recommendation || "running…"));
     if (c.restartNeeded) { var rb = el("span", "tag restart", "restart needed"); rb.title = (c.pending || []).join("; "); sum.appendChild(rb); }
-    sum.appendChild(el("span", "muted", (m.datasets || []).join(", ") + " · " + (m.images || 0) + " images · " + m.timestamp));
+    sum.appendChild(el("span", "muted", (m.datasets || []).join(", ") + " · " + (m.images || 0) + " image" + (m.images === 1 ? "" : "s") + " · " + when(m.timestamp)));
     det2.appendChild(sum); det2.appendChild(card);
     card.appendChild(el("p", "muted cfg-line", "Configured: " + (c.device ? c.device : "global (" + cfg.globalLabel + ")") + (configured ? " · resolves to " + configured : "") + (c.provider ? " · now: " + c.provider : "") + (c.restartNeeded ? " · restart needed (" + c.pending.join("; ") + ")" : "")));
     if (m.error) { card.appendChild(el("p", "error", m.error)); return det2; }
