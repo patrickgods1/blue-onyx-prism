@@ -6,6 +6,7 @@ license = "MIT"
 description = "Blue Iris compatible object detection service on OpenVINO and ONNX Runtime, with hardware-based device selection"
 repository = "https://github.com/patrickgods1/blue-onyx-prism"
 default-run = "blue-onyx-prism"
+rust-version = "1.99"
 
 [lib]
 name = "blue_onyx_prism"

@@ -83,7 +83,7 @@ pub(crate) fn apply_config(state: &AppState) -> Applied {
                 dev(&next).is_some() && dev(&running) != dev(&next)
             });
             if device_changed {
-                out.queued = crate::resources::status::queue_needs(ctx, &next);
+                out.queued = crate::resources::actions::queue_needs(ctx, &next);
                 if !out.queued.is_empty() {
                     info!("device change needs downloads: {}", out.queued.join(", "));
                 }

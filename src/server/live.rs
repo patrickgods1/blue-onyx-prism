@@ -407,12 +407,12 @@ pub(super) async fn config_json(
 // Forms (last write wins)
 
 /// The main `/config` form: applied to the current config `c` as submitted (a field the form
-/// does not carry keeps its value; see [`crate::config::apply_config_form`]).
+/// does not carry keeps its value; see [`crate::config_form::apply_config_form`]).
 pub(super) fn server_form_edit(
     c: &mut Config,
     form: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    crate::config::apply_config_form(c, form)
+    crate::config_form::apply_config_form(c, form)
 }
 
 fn field<'a>(form: &'a [(String, String)], k: &'a str) -> impl Iterator<Item = &'a str> {
@@ -427,7 +427,7 @@ fn field<'a>(form: &'a [(String, String)], k: &'a str) -> impl Iterator<Item = &
 pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> anyhow::Result<()> {
     let enabled: Vec<String> = field(form, "enabled").map(str::to_string).collect();
     let default = field(form, "default_model").next();
-    crate::config::apply_models_selection(c, &enabled, default)?;
+    crate::config_form::apply_models_selection(c, &enabled, default)?;
     let devices: Vec<(String, Option<String>)> = form
         .iter()
         .filter_map(|(k, v)| {
@@ -435,7 +435,7 @@ pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> any
                 .map(|name| (name.to_string(), Some(v.clone())))
         })
         .collect();
-    crate::config::apply_model_devices(c, &devices)?;
+    crate::config_form::apply_model_devices(c, &devices)?;
     let mut thresholds = Vec::new();
     for (k, v) in form {
         if let Some(name) = k.strip_prefix("threshold.") {

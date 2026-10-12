@@ -4,6 +4,7 @@
 //! Module map (see CLAUDE.md):
 //! - [`api`]       wire structs for the CodeProject.AI compatible JSON API
 //! - [`config`]    JSON config next to the executable, merged with CLI flags
+//! - [`config_form`] applying the web UI's forms (config page, models, devices, thresholds) to a `Config`
 //! - [`config_store`] the live config with a revision and change log (every writer goes through it)
 //! - [`config_merge`] field-level config view: change summaries, pending restart, 3-way form merge
 //! - [`backend`]   runtimes (OpenVINO today), device specs, load plans, inference backends
@@ -25,6 +26,7 @@ pub mod backend;
 pub mod benchmark;
 pub mod cli;
 pub mod config;
+pub mod config_form;
 pub mod config_merge;
 pub mod config_store;
 pub mod download;

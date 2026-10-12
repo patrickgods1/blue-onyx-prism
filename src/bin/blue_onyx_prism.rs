@@ -40,30 +40,31 @@ fn config_path(cli: &Cli) -> PathBuf {
 }
 
 /// The config file (`--config` or the default path) if it exists, else defaults. Read-only.
-fn read_config(cli: &Cli) -> Config {
+/// A file that exists but cannot be read or parsed is an error (the message names the path).
+fn read_config(cli: &Cli) -> Result<Config> {
     let path = config_path(cli);
     if path.exists() {
-        Config::load(&path).unwrap_or_default()
+        Config::load(&path)
     } else {
-        Config::default()
+        Ok(Config::default())
     }
 }
 
 /// `--dir` if given, else the configured `models_dir` (from the config file when it exists),
 /// resolved against the exe dir.
-fn models_dir(cli: &Cli, dir: Option<PathBuf>) -> PathBuf {
+fn models_dir(cli: &Cli, dir: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(d) = dir {
-        return d;
+        return Ok(d);
     }
-    let cfg = read_config(cli);
-    cfg.data_path(&cfg.models_dir)
+    let cfg = read_config(cli)?;
+    Ok(cfg.data_path(&cfg.models_dir))
 }
 
 /// `list-devices`: hardware, runtimes, the option table, the `auto` pick, and the load plan of each
 /// model (`auto` ordered by `benchmark.json` beside the config when it has results for the
 /// model, as the server does). Works without OpenVINO (its options are shown as not runnable).
-fn list_devices(cli: &Cli, models: &[PathBuf]) {
-    let mut cfg = read_config(cli);
+fn list_devices(cli: &Cli, models: &[PathBuf]) -> Result<()> {
+    let mut cfg = read_config(cli)?;
     if let Some(d) = &cli.openvino_dir {
         cfg.openvino_dir = Some(d.clone());
     }
@@ -148,7 +149,7 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) {
     let threads = blue_onyx_prism::registry::preprocess_threads(&cfg, &profile, &planned);
     println!("Hardware profile: {}", profile.summary(threads));
     if entries.is_empty() {
-        return;
+        return Ok(());
     }
     println!("Models:");
     for m in &entries {
@@ -182,6 +183,7 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) {
             plan.join(" -> ")
         );
     }
+    Ok(())
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -197,7 +199,7 @@ fn run(cli: Cli) -> Result<()> {
                 version,
                 archive,
                 keep_archive: false,
-                root: Some(resources::download_root(&read_config(&cli))),
+                root: Some(resources::download_root(&read_config(&cli)?)),
             };
             let dir = setup_openvino::run(&opts)?;
             println!("OpenVINO runtime installed in {}", dir.display());
@@ -209,7 +211,7 @@ fn run(cli: Cli) -> Result<()> {
                 dest: dir,
                 flavor,
                 keep_archive: false,
-                root: Some(resources::download_root(&read_config(&cli))),
+                root: Some(resources::download_root(&read_config(&cli)?)),
             };
             let (dir, flavor) = setup_onnxruntime::run(&opts)?;
             println!(
@@ -229,8 +231,8 @@ fn run(cli: Cli) -> Result<()> {
             if !all && name.is_empty() {
                 anyhow::bail!("specify --name <model> (repeatable) or --all; see `list-models`");
             }
-            let dir = models_dir(&cli, dir);
-            let root = resources::download_root(&read_config(&cli));
+            let dir = models_dir(&cli, dir)?;
+            let root = resources::download_root(&read_config(&cli)?);
             let files = download::download_with_root(&name, all, &dir, &root)?;
             for f in &files {
                 println!("{}", f.display());
@@ -274,13 +276,13 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 Config::default()
             };
-            let req = resources::status::CustomModel {
+            let req = resources::actions::CustomModel {
                 path: model_path.to_string_lossy().to_string(),
                 name,
                 family,
                 classes: classes.map(|c| c.to_string_lossy().to_string()),
             };
-            let msg = resources::status::add_custom_model(&mut cfg, &req)
+            let msg = resources::actions::add_custom_model(&mut cfg, &req)
                 .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
             cfg.save(&path)?;
             println!("{msg}");
@@ -288,7 +290,7 @@ fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         Some(Command::ListModels { dir }) => {
-            download::print_list(&models_dir(&cli, dir));
+            download::print_list(&models_dir(&cli, dir)?);
             return Ok(());
         }
         Some(Command::Fetch {
@@ -304,7 +306,7 @@ fn run(cli: Cli) -> Result<()> {
                 all_for_platform,
                 allow_large,
             };
-            return resources::commands::fetch(&read_config(&cli), &req);
+            return resources::commands::fetch(&read_config(&cli)?, &req);
         }
         Some(Command::ListResources { check_urls: true }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
@@ -312,7 +314,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::ListResources { check_urls: false }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
-            let cfg = read_config(&cli);
+            let cfg = read_config(&cli)?;
             let root = resources::download_root(&cfg);
             let installed = resources::detect_installed(&cfg, &root, None);
             print!(
@@ -335,7 +337,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::ListDevices { model }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
-            list_devices(&cli, &model);
+            list_devices(&cli, &model)?;
             return Ok(());
         }
         None => {}

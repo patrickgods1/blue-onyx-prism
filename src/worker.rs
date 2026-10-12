@@ -635,8 +635,10 @@ impl WorkerCtx {
             }
             if self.cfg.classes.is_empty() {
                 let classes = self.cfg.model.classes.clone();
-                match crate::registry::resolve_class_names(&self.cfg.model.path, classes.as_deref())
-                {
+                match crate::model::classes::resolve_class_names(
+                    &self.cfg.model.path,
+                    classes.as_deref(),
+                ) {
                     Ok(c) => self.cfg.classes = c,
                     Err(e) => {
                         let msg = format!("{e:#}");

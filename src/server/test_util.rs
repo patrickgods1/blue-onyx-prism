@@ -207,7 +207,7 @@ fn model_res(
         .iter()
         .map(|(f, data)| Part {
             url: leak(format!("{base}/{f}")),
-            sha256: leak(crate::resources::manager::tests_sha256(data)),
+            sha256: leak(crate::resources::manager::sha256_hex(data)),
             size: size.unwrap_or(data.len() as u64),
             file_name: leak(f.to_string()),
             archive: None,

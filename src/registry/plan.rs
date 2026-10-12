@@ -3,10 +3,11 @@
 //! and what the runtimes offer; no threads are started here ([`super::Spawner::spawn_model`]
 //! turns a [`ModelPlan`] into a worker).
 
-use super::{load_request, resolve_class_names, try_lock_runtimes, validate_names};
+use super::{load_request, try_lock_runtimes, validate_names};
 use crate::backend::spec::Device;
 use crate::backend::{DeviceSpec, LoadRequest, Runtimes};
 use crate::config::{Config, ModelConfig};
+use crate::model::classes::resolve_class_names;
 use crate::resources::provision::{Provision, Wait};
 use crate::worker::LiveSettings;
 use anyhow::{Result, bail};

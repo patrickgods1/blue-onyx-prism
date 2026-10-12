@@ -2139,7 +2139,8 @@ pub fn find(id: &str, os: &str, arch: &str) -> Option<&'static Resource> {
     for_platform(os, arch).find(|r| r.id.eq_ignore_ascii_case(id))
 }
 
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+/// `s` without `prefix`, compared ASCII case-insensitively.
+pub(crate) fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     (s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix))
         .then(|| &s[prefix.len()..])
 }

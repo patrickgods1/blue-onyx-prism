@@ -66,6 +66,20 @@ pub fn coco80() -> Vec<String> {
         .expect("bundled coco_classes.yaml is valid")
 }
 
+/// Class names: explicit `classes` path, else `<model stem>.yaml` beside the model, else COCO-80.
+pub fn resolve_class_names(model_path: &Path, classes: Option<&Path>) -> Result<Vec<String>> {
+    if let Some(p) = classes {
+        return load_class_names(p)
+            .with_context(|| format!("loading class names from {}", p.display()));
+    }
+    let sidecar = model_path.with_extension("yaml");
+    if sidecar.is_file() {
+        return load_class_names(&sidecar)
+            .with_context(|| format!("loading class names from {}", sidecar.display()));
+    }
+    Ok(coco80())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +119,14 @@ mod tests {
         assert_eq!(n.len(), 80);
         assert_eq!(n[0], "person");
         assert_eq!(n[2], "car");
+    }
+
+    #[test]
+    fn sidecar_classes_absent_falls_back() {
+        let dir = std::env::temp_dir().join(format!("bo_reg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = resolve_class_names(&dir.join("m.onnx"), None).unwrap();
+        assert_eq!(names, coco80());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

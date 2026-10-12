@@ -513,7 +513,7 @@ fn download_datasets(ctx: &RunContext, ids: &[String], h: &RunHandle) -> Result<
     let mut keys: Vec<(String, String)> = Vec::new();
     for id in ids {
         let rid = format!("{}{id}", crate::resources::catalog::BENCH_ID_PREFIX);
-        match crate::resources::status::download(rctx, &ctx.config, &rid, false) {
+        match crate::resources::actions::download(rctx, &ctx.config, &rid, false) {
             Ok(msg) => {
                 tracing::info!("benchmark: {msg}");
                 if let Some(r) = crate::resources::catalog::bench_set(id) {

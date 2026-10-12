@@ -86,7 +86,7 @@ pub struct VisionCustomListResponse {
 }
 
 #[allow(non_snake_case)]
-#[derive(Serialize, Default, Debug)]
+#[derive(Serialize, Default, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusUpdateResponse {
     pub success: bool,

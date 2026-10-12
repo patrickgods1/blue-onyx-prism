@@ -254,18 +254,10 @@ struct EnvMarker {
     uv: String,
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 fn marker_for(lock: &PackageLock) -> EnvMarker {
     EnvMarker {
         lock: lock.name.to_string(),
-        lock_sha256: sha256_hex(lock.text.as_bytes()),
+        lock_sha256: manager::sha256_hex(lock.text.as_bytes()),
         python: PYTHON_VERSION.to_string(),
         uv: catalog::UV_VERSION.to_string(),
     }
@@ -345,7 +337,7 @@ pub fn manifest(res: &Resource, models: &Path) -> Option<Manifest> {
 /// source).
 pub fn remove_toolchain(paths: &Paths) -> Result<()> {
     for d in paths.toolchain_dirs() {
-        remove_any(&d)?;
+        manager::remove_any(&d)?;
     }
     let _ = std::fs::remove_file(paths.lock_file());
     let _ = std::fs::remove_file(paths.tools.join(LOCKFILE_NAME));
@@ -366,16 +358,6 @@ pub fn remove_export(res: &Resource, models: &Path) -> Result<()> {
     }
     let _ = std::fs::remove_file(manager::manifest_path(res, models));
     Ok(())
-}
-
-fn remove_any(p: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => {
-            std::fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))
-        }
-        Ok(_) => std::fs::remove_file(p).with_context(|| format!("removing {}", p.display())),
-        Err(_) => Ok(()),
-    }
 }
 
 /// Exclusive cross-process export lock; released on drop.
@@ -989,7 +971,7 @@ fn run_stages(
         let _ = std::fs::remove_file(p.env.join(ENV_MARKER));
         // The YOLO26-only toolchain of earlier versions (same tools, older names) is replaced.
         for d in p.legacy_dirs() {
-            if let Err(e) = remove_any(&d) {
+            if let Err(e) = manager::remove_any(&d) {
                 tracing::warn!("removing the old export toolchain: {e:#}");
             }
         }
@@ -1152,10 +1134,10 @@ fn run_stages(
     std::fs::create_dir_all(&p.models)
         .with_context(|| format!("creating {}", p.models.display()))?;
     let staging = p.staging(name);
-    remove_any(&staging)?;
+    manager::remove_any(&staging)?;
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let work = p.work.join(name);
-    remove_any(&work)?;
+    manager::remove_any(&work)?;
     // Ultralytics takes the `.pt` file; the Hugging Face recipes the directory with
     // `model.safetensors` + `config.json`.
     let weights_arg = match recipe {
@@ -1233,9 +1215,9 @@ fn run_stages(
         cancel,
     );
     // The exporters' copies and intermediate files are not needed any more.
-    let _ = remove_any(&work);
+    let _ = manager::remove_any(&work);
     if let Err(e) = export {
-        let _ = remove_any(&staging);
+        let _ = manager::remove_any(&staging);
         return Err(e);
     }
     check(cancel)?;
@@ -1243,7 +1225,7 @@ fn run_stages(
     // 6. Install
     enter!(Stage::Install, Some(0), "checking the output");
     let out = install_outputs(res, &staging, &p.models, &onnx_name, &yaml_name);
-    let _ = remove_any(&staging);
+    let _ = manager::remove_any(&staging);
     let out = out?;
     enter!(Stage::Install, Some(100), "installed");
     Ok(out)
@@ -1813,8 +1795,8 @@ pub fn needs_export_message(res: &Resource, path: &Path, outdated: bool) -> Stri
 
 /// A fake toolchain for tests (no network, no Python): records commands and writes what the real
 /// tools would (manifests of fetched resources, the venv's interpreter, the exporter's output).
-#[doc(hidden)]
-pub mod fake {
+#[cfg(test)]
+pub(crate) mod fake {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 

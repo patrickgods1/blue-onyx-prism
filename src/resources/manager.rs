@@ -969,7 +969,8 @@ fn sibling(dir: &Path, what: &str) -> Result<PathBuf> {
     Ok(parent.join(format!(".{name}.{what}")))
 }
 
-fn remove_any(p: &Path) -> Result<()> {
+/// Remove `p` whether it is a file, a directory tree or a symlink; absent is fine.
+pub(crate) fn remove_any(p: &Path) -> Result<()> {
     match std::fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => {
             std::fs::remove_dir_all(p).with_context(|| format!("removing {}", p.display()))
@@ -1049,9 +1050,8 @@ fn merge_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Lowercase hex SHA-256 of `data` (test fixtures).
-#[doc(hidden)]
-pub fn tests_sha256(data: &[u8]) -> String {
+/// Lowercase hex SHA-256 of `data`.
+pub fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(data)
         .iter()

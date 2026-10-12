@@ -23,6 +23,7 @@
 //! with external data are left alone ([`Outcome::ExternalData`]), since a copy elsewhere would
 //! lose the relative data paths. [`rewrite_cached`] writes the result next to other caches.
 
+use crate::resources::manager::sha256_hex;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1219,14 +1220,6 @@ pub fn cache_file_name(src: &Path, sha_hex: &str) -> String {
         .unwrap_or_else(|| "model".into());
     let short = &sha_hex[..sha_hex.len().min(16)];
     format!("{stem}-{short}-v{REWRITER_VERSION}.onnx")
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// Rewrite `src` into `dir/<stem>-<sha256 16 hex>-v<version>.onnx` (written to a temporary file

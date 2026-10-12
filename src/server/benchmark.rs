@@ -22,8 +22,9 @@ use super::{
 use crate::benchmark::images::{self, ImageSet};
 use crate::benchmark::service::{RunContext, RunRequest, default_models};
 use crate::benchmark::{BenchmarkResults, configured_device, results_path};
-use crate::config::{
-    Config, DatasetRef, DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
+use crate::config::{Config, DatasetRef};
+use crate::config_form::{
+    DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
 };
 use askama::Template;
 use axum::Json;

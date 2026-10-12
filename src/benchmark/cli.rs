@@ -24,9 +24,9 @@ use super::{
     sweep,
 };
 use crate::backend::{CoreOptions, OrtOptions, Runtimes, libs, spec};
-use crate::config::{
-    Config, DatasetRef, DeviceChange, ModelConfig, ThresholdChange, apply_model_devices,
-    apply_model_thresholds,
+use crate::config::{Config, DatasetRef, ModelConfig};
+use crate::config_form::{
+    DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
 };
 use crate::model::{ModelFamilyKind, PostParams};
 use anyhow::{Context, Result, bail};
@@ -41,7 +41,7 @@ pub struct BenchArgs {
     #[arg(long)]
     pub model: Vec<PathBuf>,
     /// Model family for --model (default: auto-detect).
-    #[arg(long, value_enum)]
+    #[arg(long, value_parser = crate::cli::family_parser())]
     pub family: Option<ModelFamilyKind>,
     /// Class names YAML for --model (default: <model>.yaml beside the model, else COCO-80).
     #[arg(long)]

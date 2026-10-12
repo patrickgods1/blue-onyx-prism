@@ -17,7 +17,7 @@ use crate::metrics::{Metrics, ModelGauges};
 use crate::profile::Profile;
 use crate::resources::provision::Provision;
 use crate::worker::{LiveSettings, LoadGate, WorkerConfig, WorkerHandle, spawn_worker_after};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -42,20 +42,6 @@ pub fn normalize_name(name: &str) -> String {
         }
     }
     lower
-}
-
-/// Class names: explicit `classes` path, else `<model stem>.yaml` beside the model, else COCO-80.
-pub fn resolve_class_names(model_path: &Path, classes: Option<&Path>) -> Result<Vec<String>> {
-    if let Some(p) = classes {
-        return crate::model::classes::load_class_names(p)
-            .with_context(|| format!("loading class names from {}", p.display()));
-    }
-    let sidecar = model_path.with_extension("yaml");
-    if sidecar.is_file() {
-        return crate::model::classes::load_class_names(&sidecar)
-            .with_context(|| format!("loading class names from {}", sidecar.display()));
-    }
-    Ok(crate::model::classes::coco80())
 }
 
 /// Build the per-model `LoadRequest` (the device spec comes from `Config::device_spec_for`).
@@ -1087,13 +1073,5 @@ mod tests {
             Reload::Stopped { name: "m".into() }.describe(),
             "stopping m"
         );
-    }
-
-    #[test]
-    fn sidecar_classes_absent_falls_back() {
-        let dir = std::env::temp_dir().join(format!("bo_reg_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let names = resolve_class_names(&dir.join("m.onnx"), None).unwrap();
-        assert_eq!(names, crate::model::classes::coco80());
     }
 }
