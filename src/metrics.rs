@@ -5,34 +5,51 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-/// Lock-free running statistic in milliseconds.
+/// Upper bounds (ms, inclusive) of the histogram buckets; the last bucket is `+Inf`.
+pub const BUCKET_BOUNDS_MS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+const BUCKETS: usize = BUCKET_BOUNDS_MS.len() + 1;
+
+/// Lock-free latency histogram in milliseconds. Buckets are stored non-cumulatively (one
+/// `fetch_add` per sample); the Prometheus rendering accumulates them. `min`/`max` feed the
+/// Stats page.
 #[derive(Debug)]
-pub struct Stat {
+pub struct Histogram {
+    buckets: [AtomicU64; BUCKETS],
     count: AtomicU64,
-    total: AtomicU64,
+    sum: AtomicU64,
     min: AtomicU64,
     max: AtomicU64,
 }
 
-impl Default for Stat {
+impl Default for Histogram {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Stat {
+impl Histogram {
     pub fn new() -> Self {
         Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             count: AtomicU64::new(0),
-            total: AtomicU64::new(0),
+            sum: AtomicU64::new(0),
             min: AtomicU64::new(u64::MAX),
             max: AtomicU64::new(0),
         }
     }
 
+    /// Index of the first bucket whose bound is `>= ms` (the last one is `+Inf`).
+    fn bucket_index(ms: u64) -> usize {
+        BUCKET_BOUNDS_MS
+            .iter()
+            .position(|&b| ms <= b)
+            .unwrap_or(BUCKETS - 1)
+    }
+
     pub fn record(&self, ms: u64) {
+        self.buckets[Self::bucket_index(ms)].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.total.fetch_add(ms, Ordering::Relaxed);
+        self.sum.fetch_add(ms, Ordering::Relaxed);
         self.min.fetch_min(ms, Ordering::Relaxed);
         self.max.fetch_max(ms, Ordering::Relaxed);
     }
@@ -41,13 +58,22 @@ impl Stat {
         self.count.load(Ordering::Relaxed)
     }
 
+    pub fn sum(&self) -> u64 {
+        self.sum.load(Ordering::Relaxed)
+    }
+
+    /// Samples in each bucket (not cumulative), `BUCKET_BOUNDS_MS` order then `+Inf`.
+    pub fn bucket_counts(&self) -> [u64; BUCKETS] {
+        std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed))
+    }
+
     /// Average in ms (0.0 when nothing was recorded).
     pub fn avg(&self) -> f64 {
         let c = self.count();
         if c == 0 {
             0.0
         } else {
-            self.total.load(Ordering::Relaxed) as f64 / c as f64
+            self.sum() as f64 / c as f64
         }
     }
 
@@ -65,23 +91,53 @@ impl Stat {
     }
 }
 
+/// Why a request was not served by inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    QueueFull,
+    Timeout,
+    /// Answered at once because the model was still compiling.
+    Initializing,
+    /// The model failed to load.
+    Failed,
+    /// The worker thread is gone or dropped the request without replying.
+    WorkerGone,
+}
+
+impl DropReason {
+    pub const ALL: [DropReason; 5] = [
+        DropReason::QueueFull,
+        DropReason::Timeout,
+        DropReason::Initializing,
+        DropReason::Failed,
+        DropReason::WorkerGone,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DropReason::QueueFull => "queue_full",
+            DropReason::Timeout => "timeout",
+            DropReason::Initializing => "initializing",
+            DropReason::Failed => "failed",
+            DropReason::WorkerGone => "worker_gone",
+        }
+    }
+}
+
 /// Per-model counters plus the device/provider strings, which start as the configured device
 /// and an empty provider and are updated by the worker once the model has been compiled.
 #[derive(Debug)]
 pub struct ModelMetrics {
     pub name: String,
-    /// Device requested in the config (`GPU`, `GPU.1`, `CPU`).
-    pub requested_device: String,
+    /// Device requested in the config (`GPU`, `GPU.1`, `CPU`); refreshed on every (re)load.
+    requested_device: RwLock<String>,
     device: RwLock<String>,
     execution_provider: RwLock<String>,
     pub requests: AtomicU64,
-    pub dropped: AtomicU64,
-    /// Requests answered at once with "initializing" (model still compiling); counted in
-    /// `requests`, not in `dropped`.
-    pub rejected_initializing: AtomicU64,
-    pub inference_ms: Stat,
-    pub process_ms: Stat,
-    pub round_trip_ms: Stat,
+    dropped: [AtomicU64; DropReason::ALL.len()],
+    pub inference_ms: Histogram,
+    pub process_ms: Histogram,
+    pub round_trip_ms: Histogram,
 }
 
 impl ModelMetrics {
@@ -93,16 +149,46 @@ impl ModelMetrics {
         let device = device.into();
         Self {
             name: name.into(),
-            requested_device: device.clone(),
+            requested_device: RwLock::new(device.clone()),
             device: RwLock::new(device),
             execution_provider: RwLock::new(execution_provider.into()),
             requests: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            rejected_initializing: AtomicU64::new(0),
-            inference_ms: Stat::new(),
-            process_ms: Stat::new(),
-            round_trip_ms: Stat::new(),
+            dropped: std::array::from_fn(|_| AtomicU64::new(0)),
+            inference_ms: Histogram::new(),
+            process_ms: Histogram::new(),
+            round_trip_ms: Histogram::new(),
         }
+    }
+
+    /// Count one request that was not served by inference.
+    pub fn record_drop(&self, reason: DropReason) {
+        self.dropped[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dropped(&self, reason: DropReason) -> u64 {
+        self.dropped[reason as usize].load(Ordering::Relaxed)
+    }
+
+    /// Drops that count as failures (everything except answers while initializing).
+    pub fn dropped_failures(&self) -> u64 {
+        DropReason::ALL
+            .iter()
+            .filter(|r| **r != DropReason::Initializing)
+            .map(|r| self.dropped(*r))
+            .sum()
+    }
+
+    /// Device requested in the config.
+    pub fn requested_device(&self) -> String {
+        read_string(&self.requested_device)
+    }
+
+    /// A (re)load starts: the counters stay, the device/provider restart from the request.
+    pub fn begin_load(&self, requested_device: impl Into<String>) {
+        let d = requested_device.into();
+        write_string(&self.requested_device, d.clone());
+        write_string(&self.device, d);
+        write_string(&self.execution_provider, String::new());
     }
 
     /// Device the model actually runs on (the requested device until it is loaded).
@@ -173,7 +259,10 @@ pub struct ModelGauges {
 pub struct Metrics {
     pub started: Instant,
     pub version: String,
+    /// Every model seen since the process started (removed models keep their series).
     pub models: RwLock<Vec<Arc<ModelMetrics>>>,
+    /// Registry generations started after the first one.
+    pub restarts: AtomicU64,
 }
 
 impl Metrics {
@@ -182,7 +271,27 @@ impl Metrics {
             started: Instant::now(),
             version: version.into(),
             models: RwLock::new(Vec::new()),
+            restarts: AtomicU64::new(0),
         }
+    }
+
+    /// The entry for `name` (keyed by [`crate::registry::normalize_name`]), created on first use
+    /// so counters survive registry restarts.
+    pub fn model(&self, name: &str) -> Arc<ModelMetrics> {
+        let key = crate::registry::normalize_name(name);
+        let mut g = match self.models.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if let Some(m) = g
+            .iter()
+            .find(|m| crate::registry::normalize_name(&m.name) == key)
+        {
+            return m.clone();
+        }
+        let m = Arc::new(ModelMetrics::new(name, "", ""));
+        g.push(m.clone());
+        m
     }
 
     pub fn uptime(&self) -> Duration {
@@ -222,38 +331,48 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
     let _ = writeln!(out, "# TYPE {PREFIX}uptime_seconds gauge");
     let _ = writeln!(out, "{PREFIX}uptime_seconds {}", m.uptime().as_secs());
 
-    let counter = |out: &mut String, name: &str, help: &str, f: &dyn Fn(&ModelMetrics) -> u64| {
-        let _ = writeln!(out, "# HELP {PREFIX}{name} {help}");
-        let _ = writeln!(out, "# TYPE {PREFIX}{name} counter");
-        for mm in &models {
-            let _ = writeln!(
-                out,
-                "{PREFIX}{name}{{model=\"{}\"}} {}",
-                escape_label(&mm.name),
-                f(mm)
-            );
-        }
-    };
-    counter(
-        &mut out,
-        "requests_total",
-        "Detection requests received.",
-        &|mm| mm.requests.load(Ordering::Relaxed),
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}restarts_total Registry restarts since the process started."
     );
-    counter(
-        &mut out,
-        "dropped_total",
-        "Requests dropped (queue full or timeout).",
-        &|mm| mm.dropped.load(Ordering::Relaxed),
-    );
-    counter(
-        &mut out,
-        "rejected_initializing_total",
-        "Requests answered at once because the model was still initializing.",
-        &|mm| mm.rejected_initializing.load(Ordering::Relaxed),
+    let _ = writeln!(out, "# TYPE {PREFIX}restarts_total counter");
+    let _ = writeln!(
+        out,
+        "{PREFIX}restarts_total {}",
+        m.restarts.load(Ordering::Relaxed)
     );
 
-    type Getter = fn(&ModelMetrics) -> &Stat;
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}requests_total Detection requests received."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}requests_total counter");
+    for mm in &models {
+        let _ = writeln!(
+            out,
+            "{PREFIX}requests_total{{model=\"{}\"}} {}",
+            escape_label(&mm.name),
+            mm.requests.load(Ordering::Relaxed)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}dropped_total Requests not served by inference, by reason (queue_full|timeout|initializing|failed|worker_gone)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}dropped_total counter");
+    for mm in &models {
+        for reason in DropReason::ALL {
+            let _ = writeln!(
+                out,
+                "{PREFIX}dropped_total{{model=\"{}\",reason=\"{}\"}} {}",
+                escape_label(&mm.name),
+                reason.as_str(),
+                mm.dropped(reason)
+            );
+        }
+    }
+
+    type Getter = fn(&ModelMetrics) -> &Histogram;
     let stats: [(&str, &str, Getter); 3] = [
         ("inference_ms", "Model inference time in ms", |mm| {
             &mm.inference_ms
@@ -266,6 +385,27 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         }),
     ];
     for (base, help, get) in stats {
+        // The histogram keeps the `_ms` unit in its name (blue-onyx dashboard compatibility).
+        let _ = writeln!(out, "# HELP {PREFIX}{base} {help} (histogram).");
+        let _ = writeln!(out, "# TYPE {PREFIX}{base} histogram");
+        for mm in &models {
+            let h = get(mm);
+            let label = escape_label(&mm.name);
+            let counts = h.bucket_counts();
+            let mut cum = 0u64;
+            for (i, c) in counts.iter().enumerate() {
+                cum += c;
+                let le = BUCKET_BOUNDS_MS
+                    .get(i)
+                    .map_or_else(|| "+Inf".to_string(), |b| b.to_string());
+                let _ = writeln!(
+                    out,
+                    "{PREFIX}{base}_bucket{{model=\"{label}\",le=\"{le}\"}} {cum}"
+                );
+            }
+            let _ = writeln!(out, "{PREFIX}{base}_sum{{model=\"{label}\"}} {}", h.sum());
+            let _ = writeln!(out, "{PREFIX}{base}_count{{model=\"{label}\"}} {cum}");
+        }
         for suffix in ["avg", "min", "max"] {
             let name = format!("{base}_{suffix}");
             let _ = writeln!(out, "# HELP {PREFIX}{name} {help} ({suffix}).");
@@ -349,8 +489,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stat_basics() {
-        let s = Stat::new();
+    fn histogram_basics() {
+        let s = Histogram::new();
         assert_eq!((s.count(), s.min(), s.max()), (0, 0, 0));
         assert_eq!(s.avg(), 0.0);
         s.record(10);
@@ -367,17 +507,36 @@ mod tests {
         let m = Metrics::new("1.2.3");
         let mm = Arc::new(ModelMetrics::new("ipcam\"x", "CPU", "OpenVINO CPU"));
         mm.requests.fetch_add(5, Ordering::Relaxed);
-        mm.dropped.fetch_add(1, Ordering::Relaxed);
-        mm.rejected_initializing.fetch_add(2, Ordering::Relaxed);
+        mm.record_drop(DropReason::QueueFull);
+        mm.record_drop(DropReason::Initializing);
+        mm.record_drop(DropReason::Initializing);
+        m.restarts.fetch_add(1, Ordering::Relaxed);
         mm.inference_ms.record(12);
         mm.inference_ms.record(8);
         m.models.write().unwrap().push(mm);
         let text = render_prometheus(&m, &[]);
         assert!(text.contains("blue_onyx_prism_requests_total{model=\"ipcam\\\"x\"} 5"));
-        assert!(text.contains("blue_onyx_prism_dropped_total{model=\"ipcam\\\"x\"} 1"));
+        assert!(text.contains(
+            "blue_onyx_prism_dropped_total{model=\"ipcam\\\"x\",reason=\"queue_full\"} 1"
+        ));
+        assert!(text.contains(
+            "blue_onyx_prism_dropped_total{model=\"ipcam\\\"x\",reason=\"initializing\"} 2"
+        ));
+        assert!(text.contains("blue_onyx_prism_restarts_total 1"));
+        assert!(text.contains("# TYPE blue_onyx_prism_inference_ms histogram"));
         assert!(
-            text.contains("blue_onyx_prism_rejected_initializing_total{model=\"ipcam\\\"x\"} 2")
+            text.contains("blue_onyx_prism_inference_ms_bucket{model=\"ipcam\\\"x\",le=\"10\"} 1")
         );
+        assert!(
+            text.contains("blue_onyx_prism_inference_ms_bucket{model=\"ipcam\\\"x\",le=\"20\"} 2")
+        );
+        assert!(
+            text.contains(
+                "blue_onyx_prism_inference_ms_bucket{model=\"ipcam\\\"x\",le=\"+Inf\"} 2"
+            )
+        );
+        assert!(text.contains("blue_onyx_prism_inference_ms_sum{model=\"ipcam\\\"x\"} 20"));
+        assert!(text.contains("blue_onyx_prism_inference_ms_count{model=\"ipcam\\\"x\"} 2"));
         assert!(text.contains("blue_onyx_prism_inference_ms_avg{model=\"ipcam\\\"x\"} 10.000"));
         assert!(text.contains("blue_onyx_prism_inference_ms_min{model=\"ipcam\\\"x\"} 8"));
         assert!(text.contains("blue_onyx_prism_inference_ms_max{model=\"ipcam\\\"x\"} 12"));
@@ -390,11 +549,11 @@ mod tests {
     #[test]
     fn device_and_provider_update_after_load() {
         let mm = ModelMetrics::new("m", "GPU", "");
-        assert_eq!(mm.requested_device, "GPU");
+        assert_eq!(mm.requested_device(), "GPU");
         assert_eq!(mm.device(), "GPU");
         assert_eq!(mm.execution_provider(), "");
         mm.set_loaded("CPU", "OpenVINO CPU (Apple M2, fallback)");
-        assert_eq!(mm.requested_device, "GPU");
+        assert_eq!(mm.requested_device(), "GPU");
         assert_eq!(mm.device(), "CPU");
         assert_eq!(mm.execution_provider(), "OpenVINO CPU (Apple M2, fallback)");
     }
@@ -470,5 +629,31 @@ mod tests {
             let v = l.rsplit(' ').next().unwrap();
             assert!(v.parse::<f64>().is_ok(), "bad sample line {l:?}");
         }
+    }
+
+    #[test]
+    fn histogram_bucket_boundaries() {
+        let h = Histogram::new();
+        for ms in [0, 1, 2, 3, 5000, 5001] {
+            h.record(ms);
+        }
+        let c = h.bucket_counts();
+        assert_eq!(c[0], 2, "0 and 1 ms land in le=1");
+        assert_eq!(c[1], 1, "2 ms lands in le=2");
+        assert_eq!(c[2], 1, "3 ms lands in le=5");
+        assert_eq!(c[11], 1, "5000 ms lands in le=5000");
+        assert_eq!(c[12], 1, "5001 ms lands in +Inf");
+        assert_eq!(c.iter().sum::<u64>(), 6);
+        assert_eq!((h.count(), h.sum()), (6, 10_007));
+    }
+
+    #[test]
+    fn model_entry_is_shared_by_normalized_name() {
+        let m = Metrics::new("0");
+        let a = m.model("IPcam-General");
+        let b = m.model("ipcam-general.onnx");
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(m.models.read().unwrap().len(), 1);
+        assert!(!Arc::ptr_eq(&a, &m.model("other")));
     }
 }

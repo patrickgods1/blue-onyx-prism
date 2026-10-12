@@ -178,14 +178,20 @@ pub fn run_server_with(
     ));
     let mut adopt: Option<&'static str> = None;
     let mut first = true;
+    // Process-lifetime metrics: counters and histograms survive generation restarts.
+    let metrics = Arc::new(Metrics::new(crate::VERSION));
     loop {
+        if !first {
+            metrics
+                .restarts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // One generation = one registry + one `AppState`, served through `shared`.
         // `POST /config/restart` (or an installed runtime) cancels the generation token; the
         // next generation is built while the old one keeps answering, then swapped in, and the
         // old workers stop once its requests have drained. Cancelling `shutdown` stops all.
         let generation = shutdown.child_token();
         let workers = shutdown.child_token();
-        let metrics = Arc::new(Metrics::new(crate::VERSION));
         let provision = Arc::new(provisioner.prepare(&config, loaded_ort));
         let registry = match ModelRegistry::start_with_benchmark(
             &config,
@@ -222,7 +228,7 @@ pub fn run_server_with(
 
         let state = Arc::new(AppState {
             registry: registry.clone(),
-            metrics,
+            metrics: metrics.clone(),
             config: store.clone(),
             running: Arc::new({
                 let mut c = config.clone();

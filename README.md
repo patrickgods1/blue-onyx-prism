@@ -549,6 +549,19 @@ Open `http://<host>:32168/` in a browser:
 | `/logs` | The last 2,000 log events of this process, live (polls `/logs.json`), with level filter, search, pause/follow, Copy and Download .txt, and the server log level (applies immediately; `POST /config/loglevel` with `level=debug`, form or query) |
 | `/prometheus` | Prometheus metrics (`blue_onyx_prism_*{model="..."}`), linked in the footer with the JSON endpoints |
 
+#### Prometheus metrics
+
+Counters and histograms live for the whole process and survive in-process restarts; a model removed
+from the config keeps its series. Per model: `blue_onyx_prism_requests_total`,
+`blue_onyx_prism_dropped_total{reason="queue_full|timeout|initializing|failed|worker_gone"}`, and the
+histograms `blue_onyx_prism_inference_ms`, `blue_onyx_prism_process_ms` and
+`blue_onyx_prism_round_trip_ms` (`_bucket{le=...}`, `_sum`, `_count`; bounds 1, 2, 5, 10, 20, 50,
+100, 200, 500, 1000, 2000, 5000 ms and `+Inf`). The histograms keep the `_ms` unit in their names
+instead of the Prometheus-conventional `_seconds`, for compatibility with existing blue-onyx
+dashboards; the `_avg`/`_min`/`_max` gauges are still exported. Process level:
+`blue_onyx_prism_restarts_total`. Gauges: `model_info`, `model_ready`, `queue_length`,
+`queue_capacity`. (`rejected_initializing_total` is now `dropped_total{reason="initializing"}`.)
+
 `log_path`, `port` and `bind_address` changes need a full process restart. The UI has no
 authentication: do not expose the port beyond your LAN.
 
@@ -665,6 +678,10 @@ and diffs detections), `--cache-dir` (`""` disables), `--threads`, `--classes`, 
 `--config` (enabled models from the config when no `--model`), `--json`, `-v`.
 If GPU latency is not clearly below CPU latency, the GPU was probably not used (check the log) or
 the FP32 path is active.
+
+## Releasing
+
+Tagging steps and the manual NVIDIA benchmark check are in [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
 
 ## Test client
 

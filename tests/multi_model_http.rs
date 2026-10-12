@@ -92,6 +92,16 @@ fn prom_value(text: &str, metric: &str, model: &str) -> f64 {
         .expect("numeric sample")
 }
 
+/// `dropped_total{model, reason}`.
+fn prom_reason(text: &str, model: &str, reason: &str) -> f64 {
+    let prefix = format!("blue_onyx_prism_dropped_total{{model=\"{model}\",reason=\"{reason}\"}} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no {prefix:?} in:\n{text}"))
+        .parse()
+        .expect("numeric sample")
+}
+
 /// The `model_info` line for `model`.
 fn prom_info<'a>(text: &'a str, model: &str) -> &'a str {
     let prefix = format!("blue_onyx_prism_model_info{{model=\"{model}\",");
@@ -394,14 +404,13 @@ async fn multiple_models_served_concurrently() {
         assert_eq!(row["requests"], want, "{n}: {row}");
         assert_eq!(row["dropped"], 0, "{n}: {row}");
         assert_eq!(prom_value(&prom, "requests_total", n), want as f64);
-        assert_eq!(prom_value(&prom, "dropped_total", n), 0.0);
+        for reason in ["queue_full", "timeout", "failed", "worker_gone"] {
+            assert_eq!(prom_reason(&prom, n, reason), 0.0, "{n} {reason}");
+        }
         assert_eq!(prom_value(&prom, "queue_length", n), 0.0);
         let rej = rejected.get(n.as_str()).copied().unwrap_or(0);
         assert_eq!(row["rejectedInitializing"], rej, "{n}: {row}");
-        assert_eq!(
-            prom_value(&prom, "rejected_initializing_total", n),
-            rej as f64
-        );
+        assert_eq!(prom_reason(&prom, n, "initializing"), rej as f64);
         assert_eq!(row["inferenceMs"]["count"], want - rej, "{n}: {row}");
     }
 

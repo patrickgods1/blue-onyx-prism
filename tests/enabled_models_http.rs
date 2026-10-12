@@ -349,6 +349,22 @@ async fn wait_serving(client: &reqwest::Client, base: &str, names: &[&str]) {
     .await;
 }
 
+/// `requests_total` of `model` from `/prometheus` (None when the series is absent).
+async fn prom_requests(client: &reqwest::Client, base: &str, model: &str) -> Option<u64> {
+    let text = client
+        .get(format!("{base}/prometheus"))
+        .send()
+        .await
+        .expect("GET /prometheus")
+        .text()
+        .await
+        .expect("prometheus text");
+    let prefix = format!("blue_onyx_prism_requests_total{{model=\"{model}\"}} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .map(|v| v.parse().expect("numeric sample"))
+}
+
 async fn post_form(client: &reqwest::Client, url: &str, body: &str) -> String {
     let resp = client
         .post(url)
@@ -430,6 +446,13 @@ async fn switch_models_with_restart() {
         "generation 1 (IPcam-general) ready after {:?}",
         t0.elapsed()
     );
+    let r = post_image(&client, &format!("{base}/v1/vision/detection"), &image).await;
+    assert!(r.success, "detection failed: {r:?}");
+    // Counters are process-lifetime: they must survive the restarts below.
+    let gen1_requests = prom_requests(&client, &base, "IPcam-general")
+        .await
+        .expect("IPcam-general series");
+    assert!(gen1_requests >= 1);
 
     // Switch to rt-detrv2-s and restart in-process.
     let t1 = Instant::now();
@@ -553,8 +576,24 @@ async fn switch_models_with_restart() {
         "generation 3 (IPcam-general) ready after {:?}",
         t2.elapsed()
     );
+    let count_before = prom_requests(&client, &base, "IPcam-general")
+        .await
+        .expect("IPcam-general series");
+    assert!(
+        count_before >= gen1_requests,
+        "request counter reset by the restarts: {count_before} < {gen1_requests}"
+    );
+    // The model that was switched off keeps its series.
+    assert!(
+        prom_requests(&client, &base, "rt-detrv2-s").await.is_some(),
+        "series of the removed model disappeared"
+    );
     let r = post_image(&client, &format!("{base}/v1/vision/detection"), &image).await;
     assert!(r.success && !r.predictions.is_empty(), "{r:?}");
+    let count_after = prom_requests(&client, &base, "IPcam-general")
+        .await
+        .expect("IPcam-general series");
+    assert_eq!(count_after, count_before + 1);
 
     served.stop();
 }

@@ -7,7 +7,7 @@
 
 use crate::backend::{CoreOptions, DeviceSpec, LoadRequest, OrtOptions, Runtimes, Selection};
 use crate::config::{Config, ModelConfig};
-use crate::metrics::{Metrics, ModelGauges, ModelMetrics};
+use crate::metrics::{Metrics, ModelGauges};
 use crate::worker::{LoadGate, WorkerConfig, WorkerHandle, spawn_worker_after};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -256,14 +256,9 @@ impl ModelRegistry {
             let name = m.effective_name();
             let path = config.data_path(&m.path);
             let load = load_request(config, m, path.clone());
-            let mm = Arc::new(ModelMetrics::new(
-                name.clone(),
-                load.requested.clone(),
-                String::new(),
-            ));
-            if let Ok(mut g) = metrics.models.write() {
-                g.push(mm.clone());
-            }
+            // Counters live for the whole process; the device/provider restart on each load.
+            let mm = metrics.model(&name);
+            mm.begin_load(load.requested.clone());
 
             // Downloads this model waits for (phase 7.3).
             if let Some(p) = provision

@@ -42,53 +42,55 @@ jobs:
         run: cargo run --release -- setup-openvino --dest target/release/openvino
       - name: Download smallest model
         run: cargo run --release -- download-models --name ipcam-bird --dir target/release/models
-      - name: Smoke test (CPU)
+      # Each smoke run uses its own port so a slow shutdown of the previous server cannot collide.
+      # scripts/ci/smoke.sh <bin> <client> <port> <provider substring> <server args...>
+      - name: Smoke test (OpenVINO CPU)
         shell: bash
         run: |
           set -euo pipefail
           EXE=""
           case "$RUNNER_OS" in Windows) EXE=".exe";; esac
-          BIN="target/release/blue-onyx-prism$EXE"
-          CLIENT="target/release/test-blue-onyx-prism$EXE"
-          LOG="$RUNNER_TEMP/blue-onyx-server.log"
-          IMG=tests/data/dog_bike_car.jpg
-          URL=http://127.0.0.1:32168
-
-          "$BIN" --config "$RUNNER_TEMP/smoke_config.json" \
+          scripts/ci/smoke.sh "target/release/blue-onyx-prism$EXE" "target/release/test-blue-onyx-prism$EXE" \
+            32168 "OpenVINO" \
             --model target/release/models/ipcam-bird.onnx --family yolo5 --force-cpu \
-            --port 32168 --cache-dir target/release/cache >"$LOG" 2>&1 &
-          PID=$!
-          cleanup() {
-            kill "$PID" 2>/dev/null || true
-            if [ "$RUNNER_OS" = "Windows" ]; then
-              taskkill //F //IM blue-onyx-prism.exe >/dev/null 2>&1 || true
-            fi
-            echo "---- server log ----"; tail -n 50 "$LOG" || true
-          }
-          trap cleanup EXIT
-
-          for i in $(seq 1 60); do
-            curl -sf "$URL/" >/dev/null && break
-            sleep 2
-          done
-
-          OUT=""
-          for i in $(seq 1 60); do
-            OUT=$(curl -s -F image=@"$IMG" -F min_confidence=0.2 "$URL/v1/vision/detection" || true)
-            echo "$OUT" | grep -q '"success":true' && break
-            sleep 2
-          done
-          echo "detection: $OUT"
-          echo "$OUT" | grep -q '"success":true'
-
-          LIST=$(curl -s -X POST "$URL/v1/vision/custom/list")
-          echo "list: $LIST"
-          echo "$LIST" | grep -q 'ipcam-bird'
-
-          OUT=$(curl -s -F image=@"$IMG" -F min_confidence=0.2 "$URL/v1/vision/custom/ipcam-bird")
-          echo "custom: $OUT"
-          echo "$OUT" | grep -q '"success":true'
-
-          "$CLIENT" --repeat 5 --parallel 2
-          "$CLIENT" --model ipcam-bird --repeat 3
-          "$CLIENT" --list
+            --cache-dir target/release/cache
+      - name: Fetch ONNX Runtime (CPU)
+        run: cargo run --release -- setup-onnxruntime --flavor cpu --dir target/release/onnxruntime
+      - name: Smoke test (ONNX Runtime CPU)
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=""
+          case "$RUNNER_OS" in Windows) EXE=".exe";; esac
+          scripts/ci/smoke.sh "target/release/blue-onyx-prism$EXE" "target/release/test-blue-onyx-prism$EXE" \
+            32169 "ONNX Runtime" \
+            --model target/release/models/ipcam-bird.onnx --family yolo5 --device ort:cpu \
+            --onnxruntime-dir target/release/onnxruntime --cache-dir target/release/cache
+      # The hosted macOS runners are Apple Silicon. The IPcam YOLOv5 model is the one the CoreML
+      # rewrite path (onnx_rewrite.rs) exists for. The ORT build is the CPU flavor fetched above
+      # (the macOS package includes the CoreML provider).
+      - name: Smoke test (ONNX Runtime CoreML)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/ci/smoke.sh target/release/blue-onyx-prism target/release/test-blue-onyx-prism \
+            32170 "CoreML" \
+            --model target/release/models/ipcam-bird.onnx --family yolo5 --device ort:coreml \
+            --onnxruntime-dir target/release/onnxruntime --cache-dir target/release/cache
+      # DirectML runs on the WARP software adapter on hosted runners. Not required yet: it is made
+      # a required step once it proves stable (drop continue-on-error then).
+      - name: Fetch ONNX Runtime (DirectML)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: cargo run --release -- setup-onnxruntime --flavor directml --dir target/release/onnxruntime-directml
+      - name: Smoke test (ONNX Runtime DirectML, WARP)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/ci/smoke.sh target/release/blue-onyx-prism.exe target/release/test-blue-onyx-prism.exe \
+            32171 "DirectML" \
+            --model target/release/models/ipcam-bird.onnx --family yolo5 --device ort:directml \
+            --onnxruntime-dir target/release/onnxruntime-directml --cache-dir target/release/cache
