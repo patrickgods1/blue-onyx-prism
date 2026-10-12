@@ -33,8 +33,9 @@ use tracing::{error, info, warn};
 
 /// Maximum accepted request body (multipart image upload).
 pub const BODY_LIMIT: usize = 32 * 1024 * 1024;
-/// How long a handler waits for the worker's reply.
-pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Added to the worker's request timeout while a handler waits for its reply, so the worker's
+/// own "waited longer than the timeout" answer wins the race and reaches the client.
+pub const RESPONSE_GRACE: Duration = Duration::from_millis(500);
 /// Delay between answering `POST /config/restart` and stopping the server, so the reply gets out.
 const RESTART_DELAY: Duration = Duration::from_millis(250);
 
@@ -290,6 +291,9 @@ fn state_view(w: &WorkerHandle) -> (String, &'static str, Option<String>) {
             ("Lazy".into(), "lazy", Some("loads on first request".into()))
         }
         ModelState::Initializing => match w.state.detail() {
+            Some(d) if d.starts_with(crate::worker::COMPILING_ON) => {
+                ("Loading".into(), "loading", Some(d))
+            }
             Some(d) => ("Waiting for download".into(), "wait", Some(d)),
             None => ("Loading".into(), "loading", None),
         },
@@ -675,12 +679,31 @@ async fn dispatch(
 
     match handle.state.get() {
         ModelState::Ready => {}
-        ModelState::Initializing if handle.accepts_while_initializing() => {}
         ModelState::Initializing => {
-            return VisionDetectionResponse::error(match handle.state.detail() {
-                Some(d) => format!("Model '{name}' is initializing ({d})"),
-                None => format!("Model '{name}' is initializing"),
+            // Never queued: a lazy model's first request starts its compile and every request
+            // until it is ready is answered at once.
+            if handle.trigger_load() {
+                info!(model = %name, "first request: compiling lazy model");
+            }
+            // The worker names the candidate it compiles on; until it got that far, a lazy
+            // model is headed for its planned device.
+            let detail = handle.state.detail().or_else(|| {
+                handle.lazy.then(|| {
+                    format!(
+                        "{} {}",
+                        crate::worker::COMPILING_ON,
+                        handle.planned_device_text()
+                    )
+                })
             });
+            handle
+                .metrics
+                .rejected_initializing
+                .fetch_add(1, Ordering::Relaxed);
+            return VisionDetectionResponse::error(crate::worker::initializing_message(
+                name,
+                detail.as_deref(),
+            ));
         }
         ModelState::Failed(m) => {
             return VisionDetectionResponse::error(format!("Model '{name}' failed to load: {m}"));
@@ -694,7 +717,10 @@ async fn dispatch(
     }
 
     let (tx, rx) = tokio::sync::oneshot::channel();
-    match handle.sender.try_send((req, tx, start)) {
+    match handle
+        .sender
+        .try_send(crate::worker::WorkItem::Detect(req, tx, start))
+    {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             handle.metrics.dropped.fetch_add(1, Ordering::Relaxed);
@@ -706,7 +732,7 @@ async fn dispatch(
         }
     }
 
-    match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
+    match tokio::time::timeout(handle.request_timeout() + RESPONSE_GRACE, rx).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             warn!(model = %name, "worker dropped the request without replying");
@@ -901,6 +927,7 @@ async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
                 "queueCapacity": w.queue_capacity(),
                 "requests": m.requests.load(Ordering::Relaxed),
                 "dropped": m.dropped.load(Ordering::Relaxed),
+                "rejectedInitializing": m.rejected_initializing.load(Ordering::Relaxed),
                 "inferenceMs": stat(&m.inference_ms),
                 "processMs": stat(&m.process_ms),
                 "roundTripMs": stat(&m.round_trip_ms),

@@ -26,12 +26,17 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// A queued detection request: the request, where to send the reply, and when it arrived.
-pub type WorkItem = (
-    VisionDetectionRequest,
-    tokio::sync::oneshot::Sender<VisionDetectionResponse>,
-    Instant,
-);
+/// A message for a worker thread.
+pub enum WorkItem {
+    /// A queued detection request: the request, where to send the reply, and when it arrived.
+    Detect(
+        VisionDetectionRequest,
+        tokio::sync::oneshot::Sender<VisionDetectionResponse>,
+        Instant,
+    ),
+    /// Compile a lazy model now (sent once by [`WorkerHandle::trigger_load`]).
+    Load,
+}
 
 /// Hard capacity of the channel when the queue is auto-sized.
 pub const MAX_AUTO_QUEUE: usize = 64;
@@ -123,6 +128,7 @@ pub struct WorkerHandle {
     soft_capacity: Arc<AtomicUsize>,
     gate: LoadGate,
     load_started: Arc<AtomicBool>,
+    request_timeout: Duration,
 }
 
 impl WorkerHandle {
@@ -151,6 +157,40 @@ impl WorkerHandle {
             soft_capacity: Arc::new(AtomicUsize::new(0)),
             gate,
             load_started: Arc::new(AtomicBool::new(true)),
+            request_timeout: Duration::from_secs(
+                crate::config::Config::default().request_timeout_secs,
+            ),
+        }
+    }
+
+    /// How long a request may wait in the queue plus processing (`request_timeout_secs`); the
+    /// server waits this plus a short grace for the worker's reply.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Ask a lazy model that has not started compiling to compile now. Only the first call
+    /// sends [`WorkItem::Load`] (compare-and-swap on `load_started`); returns true when this call
+    /// sent it. Never blocks: when the message cannot be queued the flag is reset so a later
+    /// request tries again.
+    pub fn trigger_load(&self) -> bool {
+        if !self.lazy
+            || self
+                .load_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        match self.sender.try_send(WorkItem::Load) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(model = %self.name, "could not start the lazy load: {e}");
+                if matches!(e, crossbeam_channel::TrySendError::Full(_)) {
+                    self.load_started.store(false, Ordering::Release);
+                }
+                false
+            }
         }
     }
 
@@ -169,9 +209,10 @@ impl WorkerHandle {
         self.gate.clone()
     }
 
-    /// True for a lazy model that has not started compiling: the server may enqueue to trigger it.
+    /// True for a lazy model that has not started compiling (the server triggers its load with
+    /// [`Self::trigger_load`] on the first request).
     pub fn accepts_while_initializing(&self) -> bool {
-        self.lazy && !self.load_started.load(Ordering::Relaxed)
+        self.lazy && !self.load_started.load(Ordering::Acquire)
     }
 
     /// Lifecycle state for metrics: a lazy model that has not started compiling is `Lazy`.
@@ -217,6 +258,16 @@ impl WorkerHandle {
         }
     }
 
+    /// Where the model is headed, for messages: the planned label, else the planned spec,
+    /// else "its device".
+    pub fn planned_device_text(&self) -> String {
+        match (&self.planned_label, &self.planned) {
+            (Some(l), _) => l.clone(),
+            (None, Some(s)) => planned_spec_label(s),
+            (None, None) => "its device".to_string(),
+        }
+    }
+
     /// Record where the model is headed (see [`Self::planned_label`]).
     pub fn set_planned(&mut self, spec: DeviceSpec, label: Option<String>) {
         self.planned = Some(spec);
@@ -232,6 +283,17 @@ impl WorkerHandle {
         {
             error!("worker thread panicked");
         }
+    }
+}
+
+/// Prefix of the state detail while a candidate compiles ("compiling on openvino:gpu").
+pub const COMPILING_ON: &str = "compiling on";
+
+/// "Model 'x' is initializing (compiling on openvino:gpu)" (detail omitted when unknown).
+pub fn initializing_message(name: &str, detail: Option<&str>) -> String {
+    match detail {
+        Some(d) => format!("Model '{name}' is initializing ({d})"),
+        None => format!("Model '{name}' is initializing"),
     }
 }
 
@@ -349,6 +411,7 @@ pub fn spawn_worker_after(
         soft_capacity,
         gate: handle_gate,
         load_started,
+        request_timeout: cfg.request_timeout,
     }
 }
 
@@ -429,31 +492,32 @@ impl WorkerCtx {
             if self.shutdown.is_cancelled() {
                 break;
             }
-            let (req, reply, enqueued) = item;
+            let (req, reply, enqueued) = match item {
+                WorkItem::Load => {
+                    if engine.is_none() && !matches!(self.state.get(), ModelState::Failed(_)) {
+                        // Lazy model: compile now; requests meanwhile are answered
+                        // "initializing" by the server.
+                        engine = self.try_load();
+                    }
+                    continue;
+                }
+                WorkItem::Detect(req, reply, enqueued) => (req, reply, enqueued),
+            };
 
             if engine.is_none() {
-                if let ModelState::Failed(msg) = self.state.get() {
-                    let _ = reply.send(self.error_response(
-                        format!("Model '{name}' failed to load: {msg}"),
-                        0,
-                        0,
-                    ));
-                    continue;
-                }
-                // Lazy model: the first request triggers the compile and is then served.
-                engine = self.try_load();
-                if engine.is_none() {
-                    let msg = match self.state.get() {
-                        ModelState::Failed(m) => m,
-                        _ => "load failed".to_string(),
-                    };
-                    let _ = reply.send(self.error_response(
-                        format!("Model '{name}' failed to load: {msg}"),
-                        0,
-                        0,
-                    ));
-                    continue;
-                }
+                // Only reachable for a lazy model (between the server's trigger and the state
+                // update) or after a failed load: answer at once, never block.
+                let msg = match self.state.get() {
+                    ModelState::Failed(msg) => format!("Model '{name}' failed to load: {msg}"),
+                    _ => {
+                        self.metrics
+                            .rejected_initializing
+                            .fetch_add(1, Ordering::Relaxed);
+                        initializing_message(&name, self.state.detail().as_deref())
+                    }
+                };
+                let _ = reply.send(self.error_response(msg, 0, 0));
+                continue;
             } else {
                 let waited = enqueued.elapsed();
                 if waited > self.cfg.request_timeout {
@@ -521,7 +585,7 @@ impl WorkerCtx {
 
     /// Load + warm up, updating state/device/soft capacity. Returns None on failure.
     fn try_load(&self) -> Option<Engine> {
-        self.load_started.store(true, Ordering::Relaxed);
+        self.load_started.store(true, Ordering::Release);
         self.state.set(ModelState::Initializing);
         match self.load() {
             Ok(engine) => {
@@ -588,6 +652,8 @@ impl WorkerCtx {
     /// Compile (under the runtimes lock), create the request and warm up on one candidate.
     /// Returns the engine with its compile and warm-up times.
     fn load_on(&self, cand: &Candidate) -> Result<(Engine, u64, u64)> {
+        self.state
+            .set_initializing(format!("{COMPILING_ON} {}", cand.device));
         let compiled = {
             let mut rt = self.runtimes.lock().unwrap_or_else(|e| e.into_inner());
             rt.compile(cand, &self.cfg.load)?
@@ -792,6 +858,76 @@ mod tests {
         assert!(!h.accepts_while_initializing());
         assert!(h.load_gate().is_open());
         h.join();
+    }
+
+    /// A lazy handle with no thread; the test reads its channel.
+    fn lazy_handle(cap: usize) -> (WorkerHandle, Receiver<WorkItem>) {
+        let (sender, rx) = crossbeam_channel::bounded(cap);
+        let mut h = WorkerHandle::failed(
+            "lazy",
+            "unused",
+            Arc::new(ModelMetrics::new("lazy", "CPU", "")),
+        );
+        h.sender = sender;
+        h.state = StateHandle::new();
+        h.lazy = true;
+        h.load_started = Arc::new(AtomicBool::new(false));
+        (h, rx)
+    }
+
+    #[test]
+    fn trigger_load_is_idempotent() {
+        let (h, rx) = lazy_handle(4);
+        assert!(h.accepts_while_initializing());
+        assert!(h.trigger_load());
+        assert!(!h.accepts_while_initializing());
+        assert!(!h.trigger_load());
+        assert!(!h.trigger_load());
+        assert_eq!(rx.len(), 1);
+        assert!(matches!(rx.try_recv(), Ok(WorkItem::Load)));
+
+        // Concurrent triggers send exactly one Load.
+        let (h, rx) = lazy_handle(64);
+        let h = Arc::new(h);
+        let sent: usize = (0..8)
+            .map(|_| {
+                let h = h.clone();
+                std::thread::spawn(move || h.trigger_load())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| usize::from(t.join().unwrap()))
+            .sum();
+        assert_eq!(sent, 1);
+        assert_eq!(rx.len(), 1);
+
+        // A full channel does not block and leaves the trigger armed for the next request.
+        let (h, rx) = lazy_handle(1);
+        let (tx, _r) = tokio::sync::oneshot::channel();
+        h.sender
+            .try_send(WorkItem::Detect(
+                VisionDetectionRequest::default(),
+                tx,
+                Instant::now(),
+            ))
+            .unwrap();
+        assert!(!h.trigger_load());
+        assert!(h.accepts_while_initializing());
+        drop(rx.try_recv());
+        assert!(h.trigger_load());
+
+        // Eager models and failed handles never send Load.
+        let m = Arc::new(ModelMetrics::new("x", "CPU", ""));
+        assert!(!WorkerHandle::failed("x", "boom", m).trigger_load());
+    }
+
+    #[test]
+    fn initializing_text() {
+        assert_eq!(
+            initializing_message("m", Some("compiling on openvino:gpu")),
+            "Model 'm' is initializing (compiling on openvino:gpu)"
+        );
+        assert_eq!(initializing_message("m", None), "Model 'm' is initializing");
     }
 
     #[test]

@@ -202,7 +202,7 @@ against the executable directory. The Windows service reads `blue_onyx_prism_con
 | Field | Default | Meaning |
 |---|---|---|
 | `port` | `32168` | HTTP listen port (binds `0.0.0.0`) |
-| `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing |
+| `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout) |
 | `worker_queue_size` | `0` | Per-model queue length; 0 = auto from timeout and measured inference time |
 | `device` | `"auto"` | Device spec (`auto`, `openvino:gpu`, `ort:cuda`, ..., or legacy `GPU`/`CPU`); see [Hardware and device selection](#hardware-and-device-selection). Falls back to CPU when the device cannot run |
 | `gpu_index` | `0` | GPU to use when several are present |
@@ -415,7 +415,8 @@ List any number of models in `models[]` of the config file:
 - `GET`/`POST /v1/vision/custom/list` returns the loaded (enabled) model names.
 - An unknown model name returns HTTP 200 with `success: false` and an error message.
 - Per-model overrides: `device` (any device spec, see below), `confidence_threshold`, `object_filter`,
-  `lazy` (compile on first request instead of at startup) and `gpu_precision` (`f16` default, `f32`).
+  `lazy` (compile on first request instead of at startup; requests are answered "initializing"
+  at once until it is ready) and `gpu_precision` (`f16` default, `f32`).
 - `blue-onyx-prism download-models --name IPcam-general --add-to-config` downloads and appends the
   model (family and classes file filled in) to the config, skipping names or paths already present.
   New entries are added disabled when the config already has an enabled model (otherwise the first

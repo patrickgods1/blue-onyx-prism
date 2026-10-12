@@ -129,7 +129,8 @@ pub struct ModelConfig {
     #[serde(serialize_with = "thr::ser_opt")]
     pub confidence_threshold: Option<f32>,
     pub object_filter: Option<Vec<String>>,
-    /// Compile on first request instead of at startup.
+    /// Compile on first request instead of at startup. That request (and every one until the
+    /// model is ready) is answered at once with "Model 'x' is initializing", never queued.
     pub lazy: bool,
     /// Per-model inference precision hint on GPU ("f16" default, "f32" escape hatch).
     pub gpu_precision: Option<String>,
@@ -170,7 +171,8 @@ impl ModelConfig {
 #[serde(default)]
 pub struct Config {
     pub port: u16,
-    /// How long a request may wait in the queue + processing before it is dropped.
+    /// How long a request may wait in the queue + processing before it is dropped (the only
+    /// request timeout; the HTTP handler waits this plus a 500 ms grace for the worker).
     pub request_timeout_secs: u64,
     /// 0 = auto-size from timeout and measured inference time.
     pub worker_queue_size: usize,

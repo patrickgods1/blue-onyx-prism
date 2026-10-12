@@ -329,17 +329,51 @@ async fn multiple_models_served_concurrently() {
         avg(&i)
     );
 
-    // Lazy model: Initializing -> Ready after its first request.
+    // Lazy model: the first request is answered at once ("initializing") and starts the
+    // compile; a later request succeeds. Nothing is queued meanwhile.
+    let mut rejected: HashMap<&str, u64> = HashMap::new();
     if let Some(lazy) = &lazy_name {
+        let url = format!("{base}/v1/vision/custom/{lazy}");
         let t = Instant::now();
-        let r = post_image(&client, &format!("{base}/v1/vision/custom/{lazy}"), &image).await;
-        eprintln!(
-            "{lazy}: first request (compile + infer) took {:?}",
-            t.elapsed()
+        let r = post_image(&client, &url, &image).await;
+        let first = t.elapsed();
+        eprintln!("{lazy}: first request answered after {first:?}: {r:?}");
+        assert!(!r.success, "{lazy}: {r:?}");
+        let msg = r.error.as_deref().unwrap_or_default();
+        assert!(msg.contains("initializing"), "{lazy}: {r:?}");
+        assert!(msg.contains("compiling on"), "{lazy}: {r:?}");
+        assert!(
+            first < Duration::from_secs(2),
+            "{lazy}: first request took {first:?}"
         );
-        assert!(r.success, "{lazy}: {r:?}");
-        assert!(r.predictions.iter().any(|p| p.label == "dog"), "{r:?}");
         *sent.entry(lazy.as_str()).or_default() += 1;
+        *rejected.entry(lazy.as_str()).or_default() += 1;
+
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let r = loop {
+            let t = Instant::now();
+            let r = post_image(&client, &url, &image).await;
+            *sent.entry(lazy.as_str()).or_default() += 1;
+            if r.success {
+                break r;
+            }
+            let msg = r.error.as_deref().unwrap_or_default();
+            assert!(msg.contains("initializing"), "{lazy}: {r:?}");
+            assert!(
+                t.elapsed() < Duration::from_secs(2),
+                "{lazy}: an initializing answer took {:?}",
+                t.elapsed()
+            );
+            *rejected.entry(lazy.as_str()).or_default() += 1;
+            assert!(Instant::now() < deadline, "{lazy} did not become ready");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        eprintln!(
+            "{lazy}: ready and served after {:?} ({} initializing answers)",
+            t.elapsed(),
+            rejected[lazy.as_str()]
+        );
+        assert!(r.predictions.iter().any(|p| p.label == "dog"), "{r:?}");
         let stats = get_stats(&client, &base).await;
         assert_eq!(stats_model(&stats, lazy)["state"], "Ready");
         let prom = get_prometheus(&client, &base).await;
@@ -361,7 +395,13 @@ async fn multiple_models_served_concurrently() {
         assert_eq!(prom_value(&prom, "requests_total", n), want as f64);
         assert_eq!(prom_value(&prom, "dropped_total", n), 0.0);
         assert_eq!(prom_value(&prom, "queue_length", n), 0.0);
-        assert_eq!(row["inferenceMs"]["count"], want, "{n}: {row}");
+        let rej = rejected.get(n.as_str()).copied().unwrap_or(0);
+        assert_eq!(row["rejectedInitializing"], rej, "{n}: {row}");
+        assert_eq!(
+            prom_value(&prom, "rejected_initializing_total", n),
+            rej as f64
+        );
+        assert_eq!(row["inferenceMs"]["count"], want - rej, "{n}: {row}");
     }
 
     token.cancel();

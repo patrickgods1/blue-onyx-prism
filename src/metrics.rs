@@ -76,6 +76,9 @@ pub struct ModelMetrics {
     execution_provider: RwLock<String>,
     pub requests: AtomicU64,
     pub dropped: AtomicU64,
+    /// Requests answered at once with "initializing" (model still compiling); counted in
+    /// `requests`, not in `dropped`.
+    pub rejected_initializing: AtomicU64,
     pub inference_ms: Stat,
     pub process_ms: Stat,
     pub round_trip_ms: Stat,
@@ -95,6 +98,7 @@ impl ModelMetrics {
             execution_provider: RwLock::new(execution_provider.into()),
             requests: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            rejected_initializing: AtomicU64::new(0),
             inference_ms: Stat::new(),
             process_ms: Stat::new(),
             round_trip_ms: Stat::new(),
@@ -242,6 +246,12 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         "Requests dropped (queue full or timeout).",
         &|mm| mm.dropped.load(Ordering::Relaxed),
     );
+    counter(
+        &mut out,
+        "rejected_initializing_total",
+        "Requests answered at once because the model was still initializing.",
+        &|mm| mm.rejected_initializing.load(Ordering::Relaxed),
+    );
 
     type Getter = fn(&ModelMetrics) -> &Stat;
     let stats: [(&str, &str, Getter); 3] = [
@@ -358,12 +368,16 @@ mod tests {
         let mm = Arc::new(ModelMetrics::new("ipcam\"x", "CPU", "OpenVINO CPU"));
         mm.requests.fetch_add(5, Ordering::Relaxed);
         mm.dropped.fetch_add(1, Ordering::Relaxed);
+        mm.rejected_initializing.fetch_add(2, Ordering::Relaxed);
         mm.inference_ms.record(12);
         mm.inference_ms.record(8);
         m.models.write().unwrap().push(mm);
         let text = render_prometheus(&m, &[]);
         assert!(text.contains("blue_onyx_prism_requests_total{model=\"ipcam\\\"x\"} 5"));
         assert!(text.contains("blue_onyx_prism_dropped_total{model=\"ipcam\\\"x\"} 1"));
+        assert!(
+            text.contains("blue_onyx_prism_rejected_initializing_total{model=\"ipcam\\\"x\"} 2")
+        );
         assert!(text.contains("blue_onyx_prism_inference_ms_avg{model=\"ipcam\\\"x\"} 10.000"));
         assert!(text.contains("blue_onyx_prism_inference_ms_min{model=\"ipcam\\\"x\"} 8"));
         assert!(text.contains("blue_onyx_prism_inference_ms_max{model=\"ipcam\\\"x\"} 12"));
