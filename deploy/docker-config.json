@@ -1,5 +1,6 @@
 {
   "port": 32168,
+  "allow_remote_admin": true,
   "device": "auto",
   "auto_download": false,
   "allow_large_downloads": false,

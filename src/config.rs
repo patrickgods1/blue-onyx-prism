@@ -129,7 +129,8 @@ pub struct ModelConfig {
     #[serde(serialize_with = "thr::ser_opt")]
     pub confidence_threshold: Option<f32>,
     pub object_filter: Option<Vec<String>>,
-    /// Compile on first request instead of at startup.
+    /// Compile on first request instead of at startup. That request (and every one until the
+    /// model is ready) is answered at once with "Model 'x' is initializing", never queued.
     pub lazy: bool,
     /// Per-model inference precision hint on GPU ("f16" default, "f32" escape hatch).
     pub gpu_precision: Option<String>,
@@ -170,7 +171,15 @@ impl ModelConfig {
 #[serde(default)]
 pub struct Config {
     pub port: u16,
-    /// How long a request may wait in the queue + processing before it is dropped.
+    /// Address the HTTP listener binds (`0.0.0.0` = every IPv4 interface, plus `[::1]` for
+    /// `localhost`). `127.0.0.1` keeps the service local to this machine. Process restart.
+    pub bind_address: std::net::IpAddr,
+    /// Serve the admin pages and actions (Config, Test, Logs, Benchmark, resources, restart)
+    /// to other machines too. Off: only loopback clients get them (403 otherwise); detection,
+    /// `/stats.json`, `/prometheus`, `/v1/devices` and `/v1/config` stay open. Applies at once.
+    pub allow_remote_admin: bool,
+    /// How long a request may wait in the queue + processing before it is dropped (the only
+    /// request timeout; the HTTP handler waits this plus a 500 ms grace for the worker).
     pub request_timeout_secs: u64,
     /// 0 = auto-size from timeout and measured inference time.
     pub worker_queue_size: usize,
@@ -318,6 +327,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             port: crate::DEFAULT_PORT,
+            bind_address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            allow_remote_admin: false,
             request_timeout_secs: 15,
             worker_queue_size: 0,
             device: "auto".to_string(),
@@ -553,6 +564,8 @@ impl Config {
 /// `false`/`off`/`0`, and false when absent (browsers omit unchecked boxes).
 pub const FORM_FIELDS: &[&str] = &[
     "port",
+    "bind_address",
+    "allow_remote_admin",
     "request_timeout_secs",
     "worker_queue_size",
     "device",
@@ -608,6 +621,16 @@ pub fn parse_config_form(
         if c.port == 0 {
             bail!("port: must be 1-65535");
         }
+    }
+    if let Some(v) = get("bind_address") {
+        c.bind_address = v.parse().map_err(|_| {
+            anyhow::anyhow!("bind_address: '{v}' is not an IP address (e.g. 0.0.0.0 or 127.0.0.1)")
+        })?;
+    }
+    // A checkbox, changed only by forms that show it (hidden `access_settings` field), so other
+    // form posts never turn remote administration off or on by omission.
+    if form.contains_key("access_settings") {
+        c.allow_remote_admin = checkbox("allow_remote_admin");
     }
     if let Some(v) = get("request_timeout_secs") {
         c.request_timeout_secs = num("request_timeout_secs", v)?;
@@ -1202,6 +1225,44 @@ mod tests {
     }
 
     #[test]
+    fn access_settings() {
+        let d = Config::default();
+        assert_eq!(d.bind_address.to_string(), "0.0.0.0");
+        assert!(!d.allow_remote_admin);
+        // Old files without the fields get the defaults; the values round-trip.
+        let c: Config = serde_json::from_str(r#"{"port": 1234}"#).unwrap();
+        assert_eq!(
+            (c.bind_address, c.allow_remote_admin),
+            (d.bind_address, false)
+        );
+        let c: Config =
+            serde_json::from_str(r#"{"bind_address": "::1", "allow_remote_admin": true}"#).unwrap();
+        assert_eq!(c.bind_address.to_string(), "::1");
+        assert!(c.allow_remote_admin);
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["bind_address"], "::1");
+
+        let mut c = with_model();
+        apply_config_form(
+            &mut c,
+            &form(&[
+                ("bind_address", "127.0.0.1"),
+                ("access_settings", "1"),
+                ("allow_remote_admin", "on"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(c.bind_address.to_string(), "127.0.0.1");
+        assert!(c.allow_remote_admin);
+        // A form without the access section leaves the flag alone.
+        apply_config_form(&mut c, &form(&[("port", "4000")])).unwrap();
+        assert!(c.allow_remote_admin);
+        // The access section without the checkbox turns it off.
+        apply_config_form(&mut c, &form(&[("access_settings", "1")])).unwrap();
+        assert!(!c.allow_remote_admin);
+    }
+
+    #[test]
     fn config_form_rejects_invalid_input_atomically() {
         let original = with_model();
         let cases: &[(&str, &str, &str)] = &[
@@ -1229,6 +1290,7 @@ mod tests {
                 "must be enabled",
             ),
             ("default_model", "nope", "default_model"),
+            ("bind_address", "localhost", "bind_address"),
         ];
         for (field, value, needle) in cases {
             let mut c = original.clone();

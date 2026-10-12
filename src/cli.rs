@@ -127,6 +127,14 @@ pub struct Cli {
     /// HTTP listen port.
     #[arg(long)]
     pub port: Option<u16>,
+    /// Address to listen on (config `bind_address`, default 0.0.0.0; 127.0.0.1 = this machine
+    /// only).
+    #[arg(long)]
+    pub bind_address: Option<std::net::IpAddr>,
+    /// Serve the admin pages (Config, Test, Logs, Benchmark, resources) to other machines too
+    /// (config `allow_remote_admin`; default: loopback clients only).
+    #[arg(long)]
+    pub allow_remote_admin: bool,
     /// Model file (.xml OpenVINO IR or .onnx). Replaces the configured model list unless
     /// already present in it.
     #[arg(long)]
@@ -303,6 +311,12 @@ fn parse_device_arg(s: &str) -> Result<String, String> {
 fn merge_cli(config: &mut Config, cli: &Cli) {
     if let Some(v) = cli.port {
         config.port = v;
+    }
+    if let Some(v) = cli.bind_address {
+        config.bind_address = v;
+    }
+    if cli.allow_remote_admin {
+        config.allow_remote_admin = true;
     }
     if let Some(v) = &cli.default_model {
         config.default_model = Some(v.clone());
@@ -618,6 +632,26 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn access_flags_are_merged_only_when_given() {
+        let cli = Cli::try_parse_from(["x", "--bind-address", "127.0.0.1", "--allow-remote-admin"])
+            .unwrap();
+        let mut cfg = Config::default();
+        merge_cli(&mut cfg, &cli);
+        assert_eq!(cfg.bind_address.to_string(), "127.0.0.1");
+        assert!(cfg.allow_remote_admin);
+        // Absent flags keep the config's values.
+        let mut cfg = Config {
+            bind_address: "::".parse().unwrap(),
+            allow_remote_admin: true,
+            ..Default::default()
+        };
+        merge_cli(&mut cfg, &Cli::default());
+        assert_eq!(cfg.bind_address.to_string(), "::");
+        assert!(cfg.allow_remote_admin);
+        assert!(Cli::try_parse_from(["x", "--bind-address", "localhost"]).is_err());
     }
 
     #[test]

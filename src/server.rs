@@ -33,8 +33,9 @@ use tracing::{error, info, warn};
 
 /// Maximum accepted request body (multipart image upload).
 pub const BODY_LIMIT: usize = 32 * 1024 * 1024;
-/// How long a handler waits for the worker's reply.
-pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Added to the worker's request timeout while a handler waits for its reply, so the worker's
+/// own "waited longer than the timeout" answer wins the race and reaches the client.
+pub const RESPONSE_GRACE: Duration = Duration::from_millis(500);
 /// Delay between answering `POST /config/restart` and stopping the server, so the reply gets out.
 const RESTART_DELAY: Duration = Duration::from_millis(250);
 
@@ -61,8 +62,8 @@ pub struct AppState {
     pub config_path: PathBuf,
     /// Runtime log level control; `None` when logging was not initialized by this process.
     pub log_reload: Option<LogReloadHandle>,
-    /// Cancelled by `POST /config/restart`. [`serve`] stops when it fires; the main binary
-    /// uses a child of the shutdown token so it also stops the workers of this generation.
+    /// This generation's token, cancelled by `POST /config/restart`: the run loop
+    /// (`runner`) then builds the next generation and swaps it in ([`Shared::swap`]).
     pub restart: CancellationToken,
     /// Download manager and this generation's provisioning plan (None in tests that do not
     /// exercise resources).
@@ -108,8 +109,12 @@ impl AppState {
     }
 }
 
-pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+/// The router. Every handler reads the generation that is current when its request arrives
+/// (see [`Shared`]); a plain `Arc<AppState>` works for tests and makes a fixed one.
+pub fn router(state: impl Into<Shared>) -> Router {
+    let shared: Shared = state.into();
+    // Open to every client: Blue Iris (often on another machine), monitoring and read-only JSON.
+    let open = Router::new()
         .route("/", get(welcome))
         .route("/v1/vision/detection", post(detection_default))
         .route("/v1/vision/custom/list", get(custom_list).post(custom_list))
@@ -117,6 +122,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/status/updateavailable", get(update_available))
         .route("/v1/devices", get(devices_json))
         .route("/v1/config", get(live::config_json))
+        .route("/stats.json", get(stats_json))
+        .route("/prometheus", get(prometheus))
+        .route("/static/style.css", get(style_css))
+        .route("/static/live.js", get(live_js))
+        .route("/favicon.ico", get(favicon));
+    // Administration: loopback clients only unless `allow_remote_admin` ([`admin_only`]).
+    let admin = Router::new()
         .route("/v1/resources", get(resources_json))
         .route("/v1/resources/download", post(resources_download))
         .route("/v1/resources/remove", post(resources_remove))
@@ -126,8 +138,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/resources/export", post(resources_export))
         .route("/v1/resources/export/cancel", post(resources_export_cancel))
         .route("/stats", get(stats_page))
-        .route("/stats.json", get(stats_json))
-        .route("/prometheus", get(prometheus))
         .route("/test", get(test_page).post(test_submit))
         .route("/config", get(config_page).post(config_submit))
         .route("/config/models", post(config_models))
@@ -153,67 +163,194 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/benchmark/settings", post(benchmark::settings))
         .route("/v1/benchmark/images", get(benchmark::images_detail))
         .route("/v1/benchmark/image", get(benchmark::image_file))
-        .route("/static/style.css", get(style_css))
-        .route("/static/live.js", get(live_js))
-        .route("/favicon.ico", get(favicon))
+        .route_layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            admin_only,
+        ));
+    open.merge(admin)
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .with_state(state)
+        .with_state(shared)
 }
 
-/// Bind `0.0.0.0:port` (and `[::1]:port`, best effort) and serve until `shutdown` or
-/// `state.restart` is cancelled.
-pub async fn serve(
-    state: Arc<AppState>,
+/// Whether a client may use the admin routes: a loopback peer, or anyone with
+/// `allow_remote_admin`. A request without a peer address (not from [`serve_on`]) is refused.
+fn admin_allowed(peer: Option<std::net::SocketAddr>, allow_remote_admin: bool) -> bool {
+    allow_remote_admin
+        || peer.is_some_and(|a| match a.ip() {
+            std::net::IpAddr::V4(ip) => ip.is_loopback(),
+            // `::1`, or an IPv4 loopback client on a dual-stack socket (`::ffff:127.0.0.1`).
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        })
+}
+
+/// Middleware of the admin routes: 403 (an HTML page for browsers, else JSON) for a client
+/// that is not on this machine, unless `allow_remote_admin` is set (read per request, so it
+/// applies at once).
+async fn admin_only(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0);
+    let allow_remote = state.config_read().allow_remote_admin;
+    if admin_allowed(peer, allow_remote) {
+        return next.run(req).await;
+    }
+    let who = peer.map_or_else(|| "unknown".to_string(), |a| a.ip().to_string());
+    warn!(peer = %who, path = %req.uri().path(), "admin route refused for a remote client");
+    let msg = format!(
+        "Administration is only available from this machine (your address: {who}). Set \
+         \"allow_remote_admin\": true in the config (or start with --allow-remote-admin, or \
+         check \"Allow remote administration\" on the Config page from this machine) to allow it."
+    );
+    if wants_html(req.headers()) {
+        let page = MessageTemplate {
+            nav: "",
+            version: crate::VERSION,
+            heading: "Forbidden".into(),
+            message: msg,
+            refresh_secs: 0,
+            refresh_url: String::new(),
+            restarting: false,
+            generation: 0,
+        };
+        (StatusCode::FORBIDDEN, render(&page)).into_response()
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
+        )
+            .into_response()
+    }
+}
+
+/// The process-wide router state: the generation (`AppState`) that is current. A generation
+/// restart swaps it ([`Shared::swap`]); the listener stays up. Handlers extract
+/// `State<Arc<AppState>>` as before ([`axum::extract::FromRef`]), one `Arc` clone per request,
+/// so an in-flight request keeps its generation (and its workers) alive until it finishes.
+#[derive(Clone)]
+pub struct Shared {
+    current: Arc<std::sync::RwLock<Arc<AppState>>>,
+}
+
+impl Shared {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self {
+            current: Arc::new(std::sync::RwLock::new(state)),
+        }
+    }
+
+    /// The generation new requests are served by.
+    pub fn current(&self) -> Arc<AppState> {
+        self.current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Make `state` current; returns the previous generation.
+    pub fn swap(&self, state: Arc<AppState>) -> Arc<AppState> {
+        let mut g = self.current.write().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *g, state)
+    }
+}
+
+impl From<Arc<AppState>> for Shared {
+    fn from(state: Arc<AppState>) -> Self {
+        Self::new(state)
+    }
+}
+
+impl axum::extract::FromRef<Shared> for Arc<AppState> {
+    fn from_ref(shared: &Shared) -> Self {
+        shared.current()
+    }
+}
+
+/// The process's HTTP listeners (bound once, see [`bind`]).
+pub struct Listeners {
+    v4: tokio::net::TcpListener,
+    v6: Option<tokio::net::TcpListener>,
     port: u16,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()> {
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    // A few retries cover a just-closed listener from the previous generation on restart.
-    let mut attempt = 0;
-    let listener = loop {
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => break l,
-            Err(e) if attempt < 5 && e.kind() == std::io::ErrorKind::AddrInUse => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            Err(e) => {
-                anyhow::bail!("binding {addr}: {e} (is another instance running on port {port}?)")
-            }
-        }
-    };
+}
+
+impl Listeners {
+    /// The bound port (useful after binding port 0).
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Bind `address:port`; for `0.0.0.0` and `127.0.0.1` also `[::1]:port` (best effort,
+/// `localhost` may resolve to it). Called once per process run: a port in use is a startup
+/// error.
+pub async fn bind(address: std::net::IpAddr, port: u16) -> anyhow::Result<Listeners> {
+    let addr = std::net::SocketAddr::new(address, port);
+    let v4 = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        anyhow::anyhow!("binding {addr}: {e} (is another instance running on port {port}?)")
+    })?;
+    let port = v4.local_addr().map(|a| a.port()).unwrap_or(port);
     // `localhost` may resolve to ::1 first, and some clients do not fall back to 127.0.0.1.
-    let loopback6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
-    let listener6 = match tokio::net::TcpListener::bind(loopback6).await {
-        Ok(l) => Some(l),
-        Err(e) => {
-            warn!("not listening on {loopback6}: {e}");
-            None
+    let v6 = match address {
+        std::net::IpAddr::V4(a) if a.is_unspecified() || a.is_loopback() => {
+            let loopback6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+            match tokio::net::TcpListener::bind(loopback6).await {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    warn!("not listening on {loopback6}: {e}");
+                    None
+                }
+            }
         }
+        _ => None,
     };
     info!("listening on {addr}; open http://localhost:{port}/");
-    let restart = state.restart.clone();
-    let stopped = move || {
-        let (shutdown, restart) = (shutdown.clone(), restart.clone());
-        async move {
-            tokio::select! {
-                _ = shutdown.cancelled() => {}
-                _ = restart.cancelled() => {}
-            }
-        }
+    Ok(Listeners { v4, v6, port })
+}
+
+/// Serve `shared` on `listeners` until `shutdown` is cancelled (in-flight requests finish).
+/// Runs for the whole process: generation restarts swap `shared` instead of stopping it.
+pub async fn serve_on(
+    listeners: Listeners,
+    shared: Shared,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let app = router(shared);
+    let stopped = |t: CancellationToken| async move { t.cancelled().await };
+    // The peer address feeds the admin-route check ([`admin_only`]).
+    let service = || {
+        app.clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()
     };
-    let app = router(state);
-    let v4 = axum::serve(listener, app.clone()).with_graceful_shutdown(stopped());
-    match listener6 {
+    let v4 = axum::serve(listeners.v4, service()).with_graceful_shutdown(stopped(shutdown.clone()));
+    match listeners.v6 {
         Some(l6) => {
-            let v6 = axum::serve(l6, app).with_graceful_shutdown(stopped());
+            let v6 = axum::serve(l6, service()).with_graceful_shutdown(stopped(shutdown));
             tokio::try_join!(v4.into_future(), v6.into_future())?;
         }
         None => v4.await?,
     }
     info!("HTTP server stopped");
     Ok(())
+}
+
+/// Run blocking handler work (file reads and walks, runtime library probes, page rendering) on
+/// tokio's blocking pool so a slow page never holds up the detection routes. A panic in `f` is
+/// resumed in the handler (axum answers 500 as for any handler panic).
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => match e.try_into_panic() {
+            Ok(p) => std::panic::resume_unwind(p),
+            Err(e) => panic!("blocking handler task did not finish: {e}"),
+        },
+    }
 }
 
 /// State text for the HTML pages and `/stats`: "Initializing (downloading ...)", "Ready", ...;
@@ -290,6 +427,9 @@ fn state_view(w: &WorkerHandle) -> (String, &'static str, Option<String>) {
             ("Lazy".into(), "lazy", Some("loads on first request".into()))
         }
         ModelState::Initializing => match w.state.detail() {
+            Some(d) if d.starts_with(crate::worker::COMPILING_ON) => {
+                ("Loading".into(), "loading", Some(d))
+            }
             Some(d) => ("Waiting for download".into(), "wait", Some(d)),
             None => ("Loading".into(), "loading", None),
         },
@@ -476,23 +616,26 @@ fn devices_snapshot(state: &AppState) -> DevicesSnapshot {
 
 /// `GET /v1/devices`: detected hardware, runtimes and every device option with `auto`'s pick.
 async fn devices_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let snap = devices_snapshot(&state);
-    Json(serde_json::json!({
-        "success": true,
-        "hardware": snap.hardware,
-        "runtimes": {
-            "openvino": {
-                "version": snap.openvino_version,
-                "devices": snap.openvino_devices,
+    blocking(move || {
+        let snap = devices_snapshot(&state);
+        Json(serde_json::json!({
+            "success": true,
+            "hardware": snap.hardware,
+            "runtimes": {
+                "openvino": {
+                    "version": snap.openvino_version,
+                    "devices": snap.openvino_devices,
+                },
+                "onnxruntime": snap.onnxruntime.as_ref().map(|o| serde_json::json!({
+                    "version": o.version,
+                    "flavor": o.flavor,
+                })),
             },
-            "onnxruntime": snap.onnxruntime.as_ref().map(|o| serde_json::json!({
-                "version": o.version,
-                "flavor": o.flavor,
-            })),
-        },
-        "selection": snap.selection,
-        "autoPick": snap.selection.auto_pick().map(|o| o.spec.to_string()),
-    }))
+            "selection": snap.selection,
+            "autoPick": snap.selection.auto_pick().map(|o| o.spec.to_string()),
+        }))
+    })
+    .await
 }
 
 fn default_name(reg: &ModelRegistry) -> String {
@@ -502,57 +645,60 @@ fn default_name(reg: &ModelRegistry) -> String {
 }
 
 async fn welcome(State(state): State<Arc<AppState>>) -> Response {
-    let reg = &state.registry;
-    let snap = devices_snapshot(&state);
-    let default = default_name(reg);
-    let pending = crate::config_merge::pending(&state.running, &state.config_read());
-    let models = reg
-        .workers()
-        .iter()
-        .map(|w| {
-            let (state, state_class, state_detail) = state_view(w);
-            ModelRow {
-                pending: pending.for_model(&w.name).join("; "),
-                name: w.name.clone(),
-                is_default: w.name == default,
-                state,
-                state_class,
-                state_detail,
-                provider: w.execution_provider(),
-                requests: w.metrics.requests.load(Ordering::Relaxed),
-                queue: format!("{}/{}", w.sender.len(), w.queue_capacity()),
-            }
+    blocking(move || {
+        let reg = &state.registry;
+        let snap = devices_snapshot(&state);
+        let default = default_name(reg);
+        let pending = crate::config_merge::pending(&state.running, &state.config_read());
+        let models = reg
+            .workers()
+            .iter()
+            .map(|w| {
+                let (state, state_class, state_detail) = state_view(w);
+                ModelRow {
+                    pending: pending.for_model(&w.name).join("; "),
+                    name: w.name.clone(),
+                    is_default: w.name == default,
+                    state,
+                    state_class,
+                    state_detail,
+                    provider: w.execution_provider(),
+                    requests: w.metrics.requests.load(Ordering::Relaxed),
+                    queue: format!("{}/{}", w.sender.len(), w.queue_capacity()),
+                }
+            })
+            .collect();
+        let in_use = providers_in_use(reg);
+        let force_cpu_note = force_cpu_note(&state.config_read(), &snap);
+        render(&WelcomeTemplate {
+            nav: "home",
+            version: crate::VERSION,
+            openvino_version: if reg.runtime_info.openvino_version.is_empty() {
+                "not available (run setup-openvino)".to_string()
+            } else {
+                reg.runtime_info.openvino_version.clone()
+            },
+            onnxruntime: snap.onnxruntime_label(),
+            devices: if reg.runtime_info.available_devices.is_empty() {
+                "none".to_string()
+            } else {
+                reg.runtime_info.available_devices.join(", ")
+            },
+            gpus: snap.hardware.gpus.iter().map(|g| g.to_string()).collect(),
+            auto_pick: snap.auto_pick_label(),
+            in_use: if in_use.is_empty() {
+                "nothing loaded yet".to_string()
+            } else {
+                in_use.join("; ")
+            },
+            force_cpu_note,
+            uptime: format_uptime(state.started.elapsed()),
+            port: state.config_read().port,
+            default_model: default,
+            models,
         })
-        .collect();
-    let in_use = providers_in_use(reg);
-    let force_cpu_note = force_cpu_note(&state.config_read(), &snap);
-    render(&WelcomeTemplate {
-        nav: "home",
-        version: crate::VERSION,
-        openvino_version: if reg.runtime_info.openvino_version.is_empty() {
-            "not available (run setup-openvino)".to_string()
-        } else {
-            reg.runtime_info.openvino_version.clone()
-        },
-        onnxruntime: snap.onnxruntime_label(),
-        devices: if reg.runtime_info.available_devices.is_empty() {
-            "none".to_string()
-        } else {
-            reg.runtime_info.available_devices.join(", ")
-        },
-        gpus: snap.hardware.gpus.iter().map(|g| g.to_string()).collect(),
-        auto_pick: snap.auto_pick_label(),
-        in_use: if in_use.is_empty() {
-            "nothing loaded yet".to_string()
-        } else {
-            in_use.join("; ")
-        },
-        force_cpu_note,
-        uptime: format_uptime(state.started.elapsed()),
-        port: state.config_read().port,
-        default_model: default,
-        models,
     })
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -675,12 +821,31 @@ async fn dispatch(
 
     match handle.state.get() {
         ModelState::Ready => {}
-        ModelState::Initializing if handle.accepts_while_initializing() => {}
         ModelState::Initializing => {
-            return VisionDetectionResponse::error(match handle.state.detail() {
-                Some(d) => format!("Model '{name}' is initializing ({d})"),
-                None => format!("Model '{name}' is initializing"),
+            // Never queued: a lazy model's first request starts its compile and every request
+            // until it is ready is answered at once.
+            if handle.trigger_load() {
+                info!(model = %name, "first request: compiling lazy model");
+            }
+            // The worker names the candidate it compiles on; until it got that far, a lazy
+            // model is headed for its planned device.
+            let detail = handle.state.detail().or_else(|| {
+                handle.lazy.then(|| {
+                    format!(
+                        "{} {}",
+                        crate::worker::COMPILING_ON,
+                        handle.planned_device_text()
+                    )
+                })
             });
+            handle
+                .metrics
+                .rejected_initializing
+                .fetch_add(1, Ordering::Relaxed);
+            return VisionDetectionResponse::error(crate::worker::initializing_message(
+                name,
+                detail.as_deref(),
+            ));
         }
         ModelState::Failed(m) => {
             return VisionDetectionResponse::error(format!("Model '{name}' failed to load: {m}"));
@@ -694,7 +859,10 @@ async fn dispatch(
     }
 
     let (tx, rx) = tokio::sync::oneshot::channel();
-    match handle.sender.try_send((req, tx, start)) {
+    match handle
+        .sender
+        .try_send(crate::worker::WorkItem::Detect(req, tx, start))
+    {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             handle.metrics.dropped.fetch_add(1, Ordering::Relaxed);
@@ -706,7 +874,7 @@ async fn dispatch(
         }
     }
 
-    match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
+    match tokio::time::timeout(handle.request_timeout() + RESPONSE_GRACE, rx).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             warn!(model = %name, "worker dropped the request without replying");
@@ -901,6 +1069,7 @@ async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
                 "queueCapacity": w.queue_capacity(),
                 "requests": m.requests.load(Ordering::Relaxed),
                 "dropped": m.dropped.load(Ordering::Relaxed),
+                "rejectedInitializing": m.rejected_initializing.load(Ordering::Relaxed),
                 "inferenceMs": stat(&m.inference_ms),
                 "processMs": stat(&m.process_ms),
                 "roundTripMs": stat(&m.round_trip_ms),
@@ -933,23 +1102,26 @@ async fn prometheus(State(state): State<Arc<AppState>>) -> Response {
 /// `GET /v1/resources`: every downloadable resource for this platform with its state, size,
 /// what it provides and which models wait for it.
 async fn resources_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let cfg = state.config_read().clone();
-    let rows = crate::resources::status::rows(state.resources.as_ref(), &cfg);
-    let hw = crate::backend::detect::hardware();
-    let manual = state
-        .resources
-        .as_ref()
-        .and_then(|r| r.provision.resolution.manual_message());
-    Json(serde_json::json!({
-        "success": true,
-        "platform": format!("{}-{}", hw.os, hw.arch),
-        "autoDownload": cfg.auto_download,
-        "allowLargeDownloads": cfg.allow_large_downloads,
-        "downloadRoot": cfg.data_root().display().to_string(),
-        "manualMessage": manual,
-        "resources": rows,
-        "localModels": crate::resources::status::local_models(state.resources.as_ref(), &cfg),
-    }))
+    blocking(move || {
+        let cfg = state.config_read().clone();
+        let rows = crate::resources::status::rows(state.resources.as_ref(), &cfg);
+        let hw = crate::backend::detect::hardware();
+        let manual = state
+            .resources
+            .as_ref()
+            .and_then(|r| r.provision.resolution.manual_message());
+        Json(serde_json::json!({
+            "success": true,
+            "platform": format!("{}-{}", hw.os, hw.arch),
+            "autoDownload": cfg.auto_download,
+            "allowLargeDownloads": cfg.allow_large_downloads,
+            "downloadRoot": cfg.data_root().display().to_string(),
+            "manualMessage": manual,
+            "resources": rows,
+            "localModels": crate::resources::status::local_models(state.resources.as_ref(), &cfg),
+        }))
+    })
+    .await
 }
 
 /// Form (or urlencoded API) fields of the resource actions: `id`, optional `confirm_large`.
@@ -1024,14 +1196,17 @@ async fn resources_download(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, confirm) = action_fields(&form);
-    let cfg = state.config_read().clone();
-    let result = match &state.resources {
-        Some(ctx) => crate::resources::status::download(ctx, &cfg, &id, confirm),
-        None => Err(no_manager()),
-    };
-    action_response(&state, &headers, &id, result)
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, confirm) = action_fields(&form);
+        let cfg = state.config_read().clone();
+        let result = match &state.resources {
+            Some(ctx) => crate::resources::status::download(ctx, &cfg, &id, confirm),
+            None => Err(no_manager()),
+        };
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 /// `POST /v1/resources/remove` (`id`).
@@ -1040,11 +1215,14 @@ async fn resources_remove(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, _) = action_fields(&form);
-    let cfg = state.config_read().clone();
-    let result = crate::resources::status::remove(state.resources.as_ref(), &cfg, &id);
-    action_response(&state, &headers, &id, result)
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, _) = action_fields(&form);
+        let cfg = state.config_read().clone();
+        let result = crate::resources::status::remove(state.resources.as_ref(), &cfg, &id);
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 /// `POST /v1/resources/add-to-config` (`id` of an installed model): appends it to `models` and
@@ -1054,27 +1232,30 @@ async fn resources_add_to_config(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, _) = action_fields(&form);
-    let mut outcome = String::new();
-    let saved = save_config(&state, "resources add-to-config", |c| {
-        outcome = crate::resources::status::add_to_config(state.resources.as_ref(), c, &id)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(())
-    });
-    let result = match saved {
-        Ok(_) => Ok(format!(
-            "{outcome}. Saved to {}.",
-            state.config_path.display()
-        )),
-        Err(e) => match e.downcast::<crate::resources::status::ActionError>() {
-            Ok(a) => Err(a),
-            Err(e) => Err(crate::resources::status::ActionError::Failed(format!(
-                "{e:#}"
-            ))),
-        },
-    };
-    action_response(&state, &headers, &id, result)
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, _) = action_fields(&form);
+        let mut outcome = String::new();
+        let saved = save_config(&state, "resources add-to-config", |c| {
+            outcome = crate::resources::status::add_to_config(state.resources.as_ref(), c, &id)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok(())
+        });
+        let result = match saved {
+            Ok(_) => Ok(format!(
+                "{outcome}. Saved to {}.",
+                state.config_path.display()
+            )),
+            Err(e) => match e.downcast::<crate::resources::status::ActionError>() {
+                Ok(a) => Err(a),
+                Err(e) => Err(crate::resources::status::ActionError::Failed(format!(
+                    "{e:#}"
+                ))),
+            },
+        };
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 /// `POST /v1/models/add` (`path`, optional `name`, `family`, `classes`): appends a custom model
@@ -1084,51 +1265,56 @@ async fn models_add(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    use crate::resources::status::{ActionError, CUSTOM_MODEL_ROW, CustomModel};
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let field = |k: &str| {
-        form.get(k)
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
-    };
-    let some = |s: String| (!s.is_empty()).then_some(s);
-    let family = match field("family").to_ascii_lowercase().as_str() {
-        "" => Ok(crate::model::ModelFamilyKind::Auto),
-        f => <crate::model::ModelFamilyKind as clap::ValueEnum>::from_str(f, true).map_err(|_| {
-            ActionError::BadRequest(format!(
-                "unknown family '{f}'; valid: {}",
-                family_names().join(", ")
-            ))
-        }),
-    };
-    let req = family.map(|family| CustomModel {
-        path: field("path"),
-        name: some(field("name")),
-        family,
-        classes: some(field("classes")),
-    });
-    let result = match req {
-        Err(e) => Err(e),
-        Ok(req) => {
-            let mut outcome = String::new();
-            let saved = save_config(&state, "config page (add model by path)", |c| {
-                outcome = crate::resources::status::add_custom_model(c, &req)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                Ok(())
-            });
-            match saved {
-                Ok(_) => Ok(format!(
-                    "{outcome}. Saved to {}; restart to load it.",
-                    state.config_path.display()
-                )),
-                Err(e) => match e.downcast::<ActionError>() {
-                    Ok(a) => Err(a),
-                    Err(e) => Err(ActionError::Failed(format!("{e:#}"))),
+    blocking(move || {
+        use crate::resources::status::{ActionError, CUSTOM_MODEL_ROW, CustomModel};
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let field = |k: &str| {
+            form.get(k)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let some = |s: String| (!s.is_empty()).then_some(s);
+        let family = match field("family").to_ascii_lowercase().as_str() {
+            "" => Ok(crate::model::ModelFamilyKind::Auto),
+            f => <crate::model::ModelFamilyKind as clap::ValueEnum>::from_str(f, true).map_err(
+                |_| {
+                    ActionError::BadRequest(format!(
+                        "unknown family '{f}'; valid: {}",
+                        family_names().join(", ")
+                    ))
                 },
+            ),
+        };
+        let req = family.map(|family| CustomModel {
+            path: field("path"),
+            name: some(field("name")),
+            family,
+            classes: some(field("classes")),
+        });
+        let result = match req {
+            Err(e) => Err(e),
+            Ok(req) => {
+                let mut outcome = String::new();
+                let saved = save_config(&state, "config page (add model by path)", |c| {
+                    outcome = crate::resources::status::add_custom_model(c, &req)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    Ok(())
+                });
+                match saved {
+                    Ok(_) => Ok(format!(
+                        "{outcome}. Saved to {}; restart to load it.",
+                        state.config_path.display()
+                    )),
+                    Err(e) => match e.downcast::<ActionError>() {
+                        Ok(a) => Err(a),
+                        Err(e) => Err(ActionError::Failed(format!("{e:#}"))),
+                    },
+                }
             }
-        }
-    };
-    action_response(&state, &headers, CUSTOM_MODEL_ROW, result)
+        };
+        action_response(&state, &headers, CUSTOM_MODEL_ROW, result)
+    })
+    .await
 }
 
 fn family_names() -> Vec<String> {
@@ -1174,33 +1360,38 @@ async fn resources_export(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, confirm) = action_fields(&form);
-    let add = form.get("add_to_config").is_some_and(|v| {
-        !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "off"
-        )
-    });
-    let cfg = state.config_read().clone();
-    let on_done: Option<crate::resources::export::OnDone> = add.then(|| {
-        let config = state.config.clone();
-        let id = id.clone();
-        Box::new(move |_: &crate::resources::export::ExportOutput| {
-            add_export_to_config(&config, &id)
-        }) as crate::resources::export::OnDone
-    });
-    let result = match &state.resources {
-        Some(ctx) => crate::resources::status::export(ctx, &cfg, &id, confirm, on_done).map(|m| {
-            if add {
-                format!("{m}; it is added to the config when done")
-            } else {
-                m
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, confirm) = action_fields(&form);
+        let add = form.get("add_to_config").is_some_and(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off"
+            )
+        });
+        let cfg = state.config_read().clone();
+        let on_done: Option<crate::resources::export::OnDone> = add.then(|| {
+            let config = state.config.clone();
+            let id = id.clone();
+            Box::new(move |_: &crate::resources::export::ExportOutput| {
+                add_export_to_config(&config, &id)
+            }) as crate::resources::export::OnDone
+        });
+        let result = match &state.resources {
+            Some(ctx) => {
+                crate::resources::status::export(ctx, &cfg, &id, confirm, on_done).map(|m| {
+                    if add {
+                        format!("{m}; it is added to the config when done")
+                    } else {
+                        m
+                    }
+                })
             }
-        }),
-        None => Err(no_manager()),
-    };
-    action_response(&state, &headers, &id, result)
+            None => Err(no_manager()),
+        };
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 /// After an export: append the model to the config (through the config store, which first
@@ -1224,13 +1415,16 @@ async fn resources_export_cancel(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, _) = action_fields(&form);
-    let result = match &state.resources {
-        Some(ctx) => crate::resources::status::cancel_export(ctx, &id),
-        None => Err(no_manager()),
-    };
-    action_response(&state, &headers, &id, result)
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, _) = action_fields(&form);
+        let result = match &state.resources {
+            Some(ctx) => crate::resources::status::cancel_export(ctx, &id),
+            None => Err(no_manager()),
+        };
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1382,6 +1576,8 @@ async fn test_submit(
 #[derive(serde::Serialize)]
 struct ConfigView {
     port: String,
+    bind_address: String,
+    allow_remote_admin: bool,
     request_timeout_secs: String,
     worker_queue_size: String,
     device: String,
@@ -1410,6 +1606,8 @@ impl ConfigView {
         };
         Self {
             port: c.port.to_string(),
+            bind_address: c.bind_address.to_string(),
+            allow_remote_admin: c.allow_remote_admin,
             request_timeout_secs: c.request_timeout_secs.to_string(),
             worker_queue_size: c.worker_queue_size.to_string(),
             device: c.device.clone(),
@@ -1440,12 +1638,15 @@ impl ConfigView {
                 "save_ref_image" => self.save_ref_image = v.is_some(),
                 "auto_download" | "allow_large_downloads"
                     if !form.contains_key("download_settings") => {}
+                "allow_remote_admin" if !form.contains_key("access_settings") => {}
+                "allow_remote_admin" => self.allow_remote_admin = v.is_some(),
                 "auto_download" => self.auto_download = v.is_some(),
                 "allow_large_downloads" => self.allow_large_downloads = v.is_some(),
                 _ => {
                     let Some(v) = v else { continue };
                     let slot = match key {
                         "port" => &mut self.port,
+                        "bind_address" => &mut self.bind_address,
                         "request_timeout_secs" => &mut self.request_timeout_secs,
                         "worker_queue_size" => &mut self.worker_queue_size,
                         "device" => &mut self.device,
@@ -1920,7 +2121,7 @@ fn config_template_at(
 }
 
 async fn config_page(State(state): State<Arc<AppState>>) -> Response {
-    render(&config_template(&state, None, None, None))
+    blocking(move || render(&config_template(&state, None, None, None))).await
 }
 
 /// Apply `edit` to the current config through the config store (one writer for everything:
@@ -1971,6 +2172,7 @@ async fn config_submit(
     headers: HeaderMap,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
 ) -> Response {
+    blocking(move || {
     let json = live::wants_json(&headers);
     let pairs = match form {
         Ok(Form(f)) => f,
@@ -2059,6 +2261,8 @@ async fn config_submit(
             ))
         }
     }
+    })
+    .await
 }
 
 /// The Models card: `enabled` (repeated, one per checked model), `default_model` (radio),
@@ -2070,50 +2274,53 @@ async fn config_models(
     headers: HeaderMap,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
 ) -> Response {
-    let json = live::wants_json(&headers);
-    let form = match form {
-        Ok(Form(f)) => f,
-        Err(e) => {
-            let msg = format!("Invalid form submission: {e}");
-            if json {
-                return live::error_json(StatusCode::BAD_REQUEST, msg);
+    blocking(move || {
+        let json = live::wants_json(&headers);
+        let form = match form {
+            Ok(Form(f)) => f,
+            Err(e) => {
+                let msg = format!("Invalid form submission: {e}");
+                if json {
+                    return live::error_json(StatusCode::BAD_REQUEST, msg);
+                }
+                return render(&config_template(&state, None, Some(msg), None));
             }
-            return render(&config_template(&state, None, Some(msg), None));
+        };
+        let restart = form.iter().any(|(k, a)| k == "action" && a == "restart");
+        let result = live::FormMeta::parse(&form).and_then(|meta| {
+            save_config(&state, "config page (Models card)", |c| {
+                live::models_card_edit(c, &form, &meta)
+            })
+        });
+        match result {
+            Ok(msg) if restart => {
+                if json {
+                    schedule_restart(&state);
+                    return live::saved_json(&state, msg, true);
+                }
+                restart_response(&state, "models")
+            }
+            Ok(msg) if json => live::saved_json(&state, msg, false),
+            Ok(msg) => render(&config_template_at(&state, Some(msg), None, None, "models")),
+            Err(e) => {
+                if let Some(conflicts) = live::conflicts_of(&e) {
+                    warn!("Models card conflicts with newer changes: {e}");
+                    return if json {
+                        live::conflict_json(&state, conflicts)
+                    } else {
+                        live::conflict_page(&state, "/config/models", "models", conflicts, &form)
+                    };
+                }
+                warn!("rejected models selection: {e:#}");
+                let msg = format!("Models not saved: {e:#}");
+                if json {
+                    return live::error_json(StatusCode::BAD_REQUEST, msg);
+                }
+                render(&config_template_at(&state, None, Some(msg), None, "models"))
+            }
         }
-    };
-    let restart = form.iter().any(|(k, a)| k == "action" && a == "restart");
-    let result = live::FormMeta::parse(&form).and_then(|meta| {
-        save_config(&state, "config page (Models card)", |c| {
-            live::models_card_edit(c, &form, &meta)
-        })
-    });
-    match result {
-        Ok(msg) if restart => {
-            if json {
-                schedule_restart(&state);
-                return live::saved_json(&state, msg, true);
-            }
-            restart_response(&state, "models")
-        }
-        Ok(msg) if json => live::saved_json(&state, msg, false),
-        Ok(msg) => render(&config_template_at(&state, Some(msg), None, None, "models")),
-        Err(e) => {
-            if let Some(conflicts) = live::conflicts_of(&e) {
-                warn!("Models card conflicts with newer changes: {e}");
-                return if json {
-                    live::conflict_json(&state, conflicts)
-                } else {
-                    live::conflict_page(&state, "/config/models", "models", conflicts, &form)
-                };
-            }
-            warn!("rejected models selection: {e:#}");
-            let msg = format!("Models not saved: {e:#}");
-            if json {
-                return live::error_json(StatusCode::BAD_REQUEST, msg);
-            }
-            render(&config_template_at(&state, None, Some(msg), None, "models"))
-        }
-    }
+    })
+    .await
 }
 
 fn apply_log_level(state: &AppState, level: LogLevel) -> anyhow::Result<()> {
@@ -2135,10 +2342,14 @@ struct MessageTemplate {
     /// The server is restarting: poll until it answers, then go to `refresh_url` (the meta
     /// refresh stays as the no-JS fallback).
     restarting: bool,
+    /// Config-store generation when the restart was requested; the page waits until
+    /// `/v1/config` reports another one (the listener stays up across a restart).
+    generation: u64,
 }
 
-/// Stops the HTTP server and the workers of this generation; the main binary then reloads the
-/// config file and starts again.
+/// Ends this generation: the run loop (`runner`) reloads the config file, starts the next
+/// generation and swaps it in; the listener stays up and the old workers stop once their
+/// requests have drained.
 /// `back` (query): the Config page section to return to (`models`, `server`, `restart`).
 async fn config_restart(
     State(state): State<Arc<AppState>>,
@@ -2196,6 +2407,7 @@ fn restart_response_to(state: &AppState, message: String, url: String) -> Respon
         refresh_secs: 5,
         refresh_url: url,
         restarting: true,
+        generation: state.config.generation(),
     })
 }
 
@@ -2208,47 +2420,50 @@ async fn config_loglevel(
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let level = form
-        .ok()
-        .and_then(|Form(f)| f.get("level").cloned())
-        .or_else(|| query.ok().and_then(|Query(q)| q.get("level").cloned()));
-    let result = (|| -> anyhow::Result<LogLevel> {
-        let raw = level.ok_or_else(|| anyhow::anyhow!("missing field 'level'"))?;
-        let level: LogLevel = raw.trim().parse()?;
-        apply_log_level(&state, level)?;
-        state.config.update("log level", |c| {
-            c.log_level = level;
-            Ok(())
-        })?;
-        Ok(level)
-    })();
-    let html = wants_html(&headers);
-    match result {
-        Ok(level) => {
-            info!(level = level.as_str(), "log level changed from the web UI");
-            let msg = format!("Log level set to {} and saved.", level.as_str());
-            if html {
-                render(&config_template(&state, Some(msg), None, None))
-            } else {
-                Json(
+    blocking(move || {
+        let level = form
+            .ok()
+            .and_then(|Form(f)| f.get("level").cloned())
+            .or_else(|| query.ok().and_then(|Query(q)| q.get("level").cloned()));
+        let result = (|| -> anyhow::Result<LogLevel> {
+            let raw = level.ok_or_else(|| anyhow::anyhow!("missing field 'level'"))?;
+            let level: LogLevel = raw.trim().parse()?;
+            apply_log_level(&state, level)?;
+            state.config.update("log level", |c| {
+                c.log_level = level;
+                Ok(())
+            })?;
+            Ok(level)
+        })();
+        let html = wants_html(&headers);
+        match result {
+            Ok(level) => {
+                info!(level = level.as_str(), "log level changed from the web UI");
+                let msg = format!("Log level set to {} and saved.", level.as_str());
+                if html {
+                    render(&config_template(&state, Some(msg), None, None))
+                } else {
+                    Json(
                     serde_json::json!({ "success": true, "message": msg, "level": level.as_str() }),
                 )
                 .into_response()
+                }
+            }
+            Err(e) => {
+                let msg = format!("Log level not changed: {e:#}");
+                if html {
+                    render(&config_template(&state, None, Some(msg), None))
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "success": false, "message": msg })),
+                    )
+                        .into_response()
+                }
             }
         }
-        Err(e) => {
-            let msg = format!("Log level not changed: {e:#}");
-            if html {
-                render(&config_template(&state, None, Some(msg), None))
-            } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "success": false, "message": msg })),
-                )
-                    .into_response()
-            }
-        }
-    }
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2404,7 +2619,7 @@ async fn fallback(uri: axum::http::Uri) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::ModelConfig;
     use crate::metrics::ModelMetrics;
@@ -2454,7 +2669,10 @@ mod tests {
     }
 
     async fn call(state: &Arc<AppState>, req: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
-        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        let resp = router(state.clone())
+            .oneshot(from_peer(req, LOCAL))
+            .await
+            .unwrap();
         let status = resp.status();
         let headers = resp.headers().clone();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -2462,6 +2680,65 @@ mod tests {
             .unwrap()
             .to_vec();
         (status, headers, body)
+    }
+
+    const LOCAL: &str = "127.0.0.1:50000";
+    const REMOTE: &str = "10.0.0.5:50000";
+
+    /// `req` as if it came from `peer` (what `serve_on` adds), unless it already names one.
+    pub(crate) fn from_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
+        let ext = req.extensions_mut();
+        if ext
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .is_none()
+        {
+            ext.insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                peer.parse().unwrap(),
+            ));
+        }
+        req
+    }
+
+    /// `/v1/vision/custom/list` names through `app`.
+    async fn listed(app: &Router) -> Vec<String> {
+        let req = Request::get("/v1/vision/custom/list")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        serde_json::from_value(v["models"].clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_swap_serves_the_new_generation() {
+        let a = test_state();
+        let mm = Arc::new(ModelMetrics::new("next", "CPU", ""));
+        let registry = ModelRegistry::from_handles(
+            vec![WorkerHandle::failed("next", "x", mm)],
+            Some(0),
+            RuntimeInfo::default(),
+        );
+        let b = Arc::new(AppState::new(
+            Arc::new(registry),
+            Arc::new(Metrics::new("0.0.0")),
+            Config::default(),
+            a.config_path.clone(),
+        ));
+        let shared = Shared::new(a.clone());
+        let app = router(shared.clone());
+        assert_eq!(listed(&app).await, ["ipcam-general", "<b>evil</b>"]);
+
+        // Same router (= same listener): the next request sees the new generation.
+        let prev = shared.swap(b.clone());
+        assert!(Arc::ptr_eq(&prev, &a));
+        assert!(Arc::ptr_eq(&shared.current(), &b));
+        assert_eq!(listed(&app).await, ["next"]);
+        // Nothing but the caller holds the old generation once its requests are done.
+        drop(prev);
+        assert_eq!(Arc::strong_count(&a), 1);
     }
 
     async fn get_text(state: &Arc<AppState>, uri: &str) -> (StatusCode, String) {
@@ -2515,6 +2792,136 @@ mod tests {
             )
             .body(Body::from(body))
             .unwrap()
+    }
+
+    /// `method uri` from `peer` (an empty urlencoded body for POST), optionally as a browser.
+    fn from(peer: &str, method: &str, uri: &str, html: bool) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(uri);
+        if method == "POST" {
+            b = b.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        }
+        if html {
+            b = b.header(header::ACCEPT, "text/html");
+        }
+        from_peer(b.body(Body::empty()).unwrap(), peer)
+    }
+
+    #[test]
+    fn loopback_peers_are_local() {
+        let ok = |a: &str| admin_allowed(Some(a.parse().unwrap()), false);
+        assert!(ok("127.0.0.1:1"));
+        assert!(ok("127.8.9.10:1"));
+        assert!(ok("[::1]:1"));
+        assert!(ok("[::ffff:127.0.0.1]:1"));
+        assert!(!ok("10.0.0.5:1"));
+        assert!(!ok("192.168.1.20:1"));
+        assert!(!ok("[fe80::1]:1"));
+        assert!(!ok("[::ffff:10.0.0.5]:1"));
+        assert!(!admin_allowed(None, false));
+        assert!(admin_allowed(Some("10.0.0.5:1".parse().unwrap()), true));
+    }
+
+    #[tokio::test]
+    async fn admin_routes_answer_loopback_only() {
+        let state = test_state();
+        let admin = [
+            ("GET", "/config"),
+            ("POST", "/config"),
+            ("GET", "/v1/fs/browse"),
+            ("POST", "/v1/resources/export"),
+            ("POST", "/config/restart"),
+        ];
+        for (method, uri) in admin {
+            // A remote client gets 403 with the setting that enables remote administration.
+            let (s, h, b) = call(&state, from(REMOTE, method, uri, false)).await;
+            let body = String::from_utf8_lossy(&b).to_string();
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}: {body}");
+            assert!(
+                h[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json"),
+                "{method} {uri}"
+            );
+            let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            assert_eq!(j["success"], false);
+            assert!(
+                j["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("allow_remote_admin"),
+                "{j}"
+            );
+            assert!(j["message"].as_str().unwrap().contains("10.0.0.5"), "{j}");
+            // Browsers get a page.
+            let (s, h, b) = call(&state, from(REMOTE, method, uri, true)).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert!(
+                h[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html")
+            );
+            let html = String::from_utf8_lossy(&b);
+            assert!(html.contains("Forbidden") && html.contains("allow_remote_admin"));
+            // This machine gets the route.
+            let (s, _, b) = call(&state, from(LOCAL, method, uri, true)).await;
+            assert_ne!(
+                s,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}: {}",
+                String::from_utf8_lossy(&b)
+            );
+            let (s, _, _) = call(&state, from("[::1]:50000", method, uri, true)).await;
+            assert_ne!(s, StatusCode::FORBIDDEN, "{method} {uri} from ::1");
+        }
+
+        // Read-only and Blue Iris routes stay open to remote clients.
+        for uri in [
+            "/",
+            "/stats.json",
+            "/prometheus",
+            "/v1/devices",
+            "/v1/config",
+            "/static/style.css",
+            "/favicon.ico",
+            "/v1/vision/custom/list",
+        ] {
+            let (s, _, _) = call(&state, from(REMOTE, "GET", uri, false)).await;
+            assert_eq!(s, StatusCode::OK, "{uri}");
+        }
+        let (s, _, b) = call(
+            &state,
+            from_peer(
+                Request::post("/v1/vision/detection")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=XBOUNDARYX",
+                    )
+                    .body(Body::from(
+                        "--XBOUNDARYX\r\nContent-Disposition: form-data; name=\"image\"; \
+                         filename=\"t.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nxx\r\n--XBOUNDARYX--\r\n",
+                    ))
+                    .unwrap(),
+                REMOTE,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let r: VisionDetectionResponse = serde_json::from_slice(&b).unwrap();
+        assert!(!r.success, "the test models failed to load: {r:?}");
+        assert!(r.error.unwrap().contains("ipcam-general"));
+
+        // `allow_remote_admin` applies at once.
+        state
+            .config
+            .update("test", |c| {
+                c.allow_remote_admin = true;
+                Ok(())
+            })
+            .unwrap();
+        let (s, _, _) = call(&state, from(REMOTE, "GET", "/config", true)).await;
+        assert_eq!(s, StatusCode::OK);
     }
 
     #[test]
@@ -4204,7 +4611,10 @@ mod tests {
         assert_eq!(j["revision"], 3);
         assert_eq!(j["changes"][1]["source"], "file changed on disk");
         assert_eq!(j["changes"][1]["summary"], "Port \u{2192} 4321");
-        assert_eq!(j["pending"]["global"][0], "Port: 32168 \u{2192} 4321");
+        assert_eq!(
+            j["pending"]["process"][0],
+            "Port: 32168 \u{2192} 4321 (needs a process restart)"
+        );
         assert_eq!(j["pendingCount"], 2);
         assert_eq!(state.config_read().port, 4321);
     }

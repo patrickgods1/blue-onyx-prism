@@ -201,8 +201,10 @@ against the executable directory. The Windows service reads `blue_onyx_prism_con
 
 | Field | Default | Meaning |
 |---|---|---|
-| `port` | `32168` | HTTP listen port (binds `0.0.0.0`) |
-| `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing |
+| `port` | `32168` | HTTP listen port (process restart) |
+| `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only (process restart). See [Remote access](#remote-access) |
+| `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines too (applies at once). See [Remote access](#remote-access) |
+| `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout) |
 | `worker_queue_size` | `0` | Per-model queue length; 0 = auto from timeout and measured inference time |
 | `device` | `"auto"` | Device spec (`auto`, `openvino:gpu`, `ort:cuda`, ..., or legacy `GPU`/`CPU`); see [Hardware and device selection](#hardware-and-device-selection). Falls back to CPU when the device cannot run |
 | `gpu_index` | `0` | GPU to use when several are present |
@@ -415,7 +417,8 @@ List any number of models in `models[]` of the config file:
 - `GET`/`POST /v1/vision/custom/list` returns the loaded (enabled) model names.
 - An unknown model name returns HTTP 200 with `success: false` and an error message.
 - Per-model overrides: `device` (any device spec, see below), `confidence_threshold`, `object_filter`,
-  `lazy` (compile on first request instead of at startup) and `gpu_precision` (`f16` default, `f32`).
+  `lazy` (compile on first request instead of at startup; requests are answered "initializing"
+  at once until it is ready) and `gpu_precision` (`f16` default, `f32`).
 - `blue-onyx-prism download-models --name IPcam-general --add-to-config` downloads and appends the
   model (family and classes file filled in) to the config, skipping names or paths already present.
   New entries are added disabled when the config already has an enabled model (otherwise the first
@@ -541,13 +544,29 @@ Open `http://<host>:32168/` in a browser:
 | `/` | Models (state badge with download progress or failure reason, device, requests, queue), the execution providers *in use*, the `auto` pick, runtimes and GPUs, uptime, API usage; warns when *Force CPU* overrides the device; shows a hint when a newer release exists |
 | `/stats` | Per-model state, runtime, device, CPU fallback, requests, dropped, queue, inference/process/round-trip avg/min/max; updates in place every 5 s from `/stats.json` |
 | `/test` | Pick, drop or paste an image, choose a model and `min_confidence`; the page posts to `/v1/vision/custom/{model}` and draws the boxes client-side, with a detections table and the raw JSON (same code path and metrics as the API; without JavaScript the form posts to `/test` and the server draws the image) |
-| `/config` | Models card (which models load, the default model, **Save and restart**), Resources, server/inference/logging settings with "applies now" / "needs restart" tags and the `models` list as JSON under *Advanced*; **Restart server** reloads the file, recompiles the enabled models and rebinds the port without restarting the process (the page waits for the server and reloads) |
+| `/config` | Models card (which models load, the default model, **Save and restart**), Resources, server/inference/logging settings with "applies now" / "needs restart" tags and the `models` list as JSON under *Advanced*; **Restart server** reloads the file and recompiles the enabled models without restarting the process; the listener stays up and the old models answer until the new ones are swapped in (a `port` or `log_path` change needs a process restart) |
 | `/benchmark` | Benchmark models x devices x datasets in the background (progress, ETA, cancel); grade cards, model ranking, sortable per-device tables (fastest, recommended and configured marked), breakdowns by dataset/tag/class/size/resolution, per-image drill-down with ground truth and predictions drawn; **Use <device>** / **Apply recommended to all** write per-model devices; best confidence threshold per model with a P/R/F1 vs threshold chart, **Apply threshold** / **Apply all thresholds**; **Confidence search** over the stored predictions (filters, objective, chart with hover values, tables, CSV) |
 | `/logs` | The last 2,000 log events of this process, live (polls `/logs.json`), with level filter, search, pause/follow, Copy and Download .txt, and the server log level (applies immediately; `POST /config/loglevel` with `level=debug`, form or query) |
 | `/prometheus` | Prometheus metrics (`blue_onyx_prism_*{model="..."}`), linked in the footer with the JSON endpoints |
 
-`log_path` changes need a full process restart. The UI has no authentication: do not expose the port
-beyond your LAN.
+`log_path`, `port` and `bind_address` changes need a full process restart. The UI has no
+authentication: do not expose the port beyond your LAN.
+
+### Remote access
+
+Blue Iris may run on another machine, so the service listens on every interface by default
+(`bind_address` `0.0.0.0`, plus `[::1]` for `localhost`). Administration is answered for clients on
+this machine only: from another machine the admin pages and actions (`/config`, `/test`, `/logs`,
+`/stats`, `/benchmark`, `/v1/resources*`, `/v1/models/add`, `/v1/fs/browse`, `/v1/benchmark*`,
+`/config/*`) return **403** with a short page (browsers) or JSON. Open to every client: the
+detection API (`/v1/vision/*`), `/v1/status/updateavailable`, the home page `/`, `/stats.json`,
+`/prometheus`, `/v1/devices`, `/v1/config` (read-only) and the static files.
+
+- To administer from another machine, set `"allow_remote_admin": true` (or check *Allow remote
+  administration* on the Config page from this machine, or start with `--allow-remote-admin`). It
+  applies at once.
+- To keep everything on this machine (Blue Iris on the same PC), set `"bind_address": "127.0.0.1"`
+  (or `--bind-address 127.0.0.1`); it applies when the process restarts.
 
 ## Running as a service
 
@@ -585,6 +604,11 @@ RENDER_GID=$(getent group render | cut -d: -f3) docker compose up -d --build
 ```
 
 Put models in `deploy/models` and a `blue_onyx_prism_config.json` in `deploy/config`.
+In Docker every client, the host's browser included, reaches the service from the bridge
+network, not loopback: `deploy/docker-config.json` therefore ships with `"allow_remote_admin": true`
+so the Config, Test, Logs and Benchmark pages work; keep it in your own config, and publish the port
+on the host's loopback only (`-p 127.0.0.1:32168:32168`) if the host should be the only admin (see
+[Remote access](#remote-access)).
 
 ## HTTP API
 
@@ -616,6 +640,9 @@ Put models in `deploy/models` and a `blue_onyx_prism_config.json` in `deploy/con
 The detection response is byte-compatible with CodeProject.AI: `success, message, error, predictions
 [{x_min, y_min, x_max, y_max, confidence, label}], count, command, moduleId, executionProvider,
 canUseGPU, inferenceMs, processMs, analysisRoundTripMs`.
+
+The admin routes (pages and actions) answer clients on this machine only unless
+`allow_remote_admin` is set; others get 403 (see [Remote access](#remote-access)).
 
 ## Benchmark
 

@@ -373,7 +373,8 @@ pub(super) async fn config_json(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let body = payload(&state);
+    // Reads the config file when it changed on disk, `benchmark.json`, and probes devices.
+    let body = super::blocking(move || payload(&state)).await;
     let text = body.to_string();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);

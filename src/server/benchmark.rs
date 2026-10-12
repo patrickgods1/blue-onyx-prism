@@ -309,48 +309,51 @@ fn dataset_rows(state: &AppState, c: &Config) -> Vec<DatasetRow> {
 
 /// `GET /benchmark`.
 pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
-    let snap = devices_snapshot(&state);
-    let cfg = state.config_read().clone();
-    let b = &cfg.benchmark;
-    use crate::benchmark::grade::{
-        ACCURACY_THRESHOLDS as A, ROC_AUC_THRESHOLDS as U, SPEED_THRESHOLDS_MS as S,
-    };
-    render(&BenchmarkTemplate {
-        nav: "benchmark",
-        version: crate::VERSION,
-        models: model_options(&cfg),
-        devices: device_rows(&snap, &cfg),
-        datasets: dataset_rows(&state, &cfg),
-        reference_models: cfg
-            .models
-            .iter()
-            .filter(|m| cfg.data_path(&m.path).is_file())
-            .map(|m| {
-                let n = m.effective_name();
-                let sel = b.reference_model.as_deref() == Some(n.as_str());
-                (n, sel)
-            })
-            .collect(),
-        repeat: b.repeat_per_image.max(1),
-        warmup: b.warmup,
-        max_images: b.max_images_per_dataset,
-        accuracy_weight: format!("{:.2}", b.weights.accuracy_share()),
-        warning: LIVE_WARNING,
-        force_cpu: cfg.force_cpu,
-        results_file: results_path(&state.config_path).display().to_string(),
-        speed_thresholds: format!("A < {} ms, B < {}, C < {}, D < {}", S[0], S[1], S[2], S[3]),
-        accuracy_thresholds: format!(
-            "A \u{2265} {:.2}, B \u{2265} {:.2}, C \u{2265} {:.2}, D \u{2265} {:.2}",
-            A[0], A[1], A[2], A[3]
-        ),
-        auc_thresholds: format!(
-            "A \u{2265} {:.2}, B \u{2265} {:.2}, C \u{2265} {:.2}, D \u{2265} {:.2}",
-            U[0], U[1], U[2], U[3]
-        ),
-        objectives: objective_options(b.threshold_objective),
-        accuracy_metrics: metric_options(b.accuracy_metric),
-        blue_iris_note: BLUE_IRIS_THRESHOLD_NOTE,
+    super::blocking(move || {
+        let snap = devices_snapshot(&state);
+        let cfg = state.config_read().clone();
+        let b = &cfg.benchmark;
+        use crate::benchmark::grade::{
+            ACCURACY_THRESHOLDS as A, ROC_AUC_THRESHOLDS as U, SPEED_THRESHOLDS_MS as S,
+        };
+        render(&BenchmarkTemplate {
+            nav: "benchmark",
+            version: crate::VERSION,
+            models: model_options(&cfg),
+            devices: device_rows(&snap, &cfg),
+            datasets: dataset_rows(&state, &cfg),
+            reference_models: cfg
+                .models
+                .iter()
+                .filter(|m| cfg.data_path(&m.path).is_file())
+                .map(|m| {
+                    let n = m.effective_name();
+                    let sel = b.reference_model.as_deref() == Some(n.as_str());
+                    (n, sel)
+                })
+                .collect(),
+            repeat: b.repeat_per_image.max(1),
+            warmup: b.warmup,
+            max_images: b.max_images_per_dataset,
+            accuracy_weight: format!("{:.2}", b.weights.accuracy_share()),
+            warning: LIVE_WARNING,
+            force_cpu: cfg.force_cpu,
+            results_file: results_path(&state.config_path).display().to_string(),
+            speed_thresholds: format!("A < {} ms, B < {}, C < {}, D < {}", S[0], S[1], S[2], S[3]),
+            accuracy_thresholds: format!(
+                "A \u{2265} {:.2}, B \u{2265} {:.2}, C \u{2265} {:.2}, D \u{2265} {:.2}",
+                A[0], A[1], A[2], A[3]
+            ),
+            auc_thresholds: format!(
+                "A \u{2265} {:.2}, B \u{2265} {:.2}, C \u{2265} {:.2}, D \u{2265} {:.2}",
+                U[0], U[1], U[2], U[3]
+            ),
+            objectives: objective_options(b.threshold_objective),
+            accuracy_metrics: metric_options(b.accuracy_metric),
+            blue_iris_note: BLUE_IRIS_THRESHOLD_NOTE,
+        })
     })
+    .await
 }
 
 /// Normalized model name -> spec of the device it is loaded on (this generation).
@@ -520,29 +523,32 @@ fn saved_view(
 /// threshold in the config, the counts there, exact from the stored predictions) and each
 /// model's `configured` is the device the config resolves to now.
 pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let snap = devices_snapshot(&state);
-    let path = results_path(&state.config_path);
-    let config = config_view(&state, &snap);
-    let (revision, cfg) = state.config.snapshot();
-    let now = models_now(&state, &cfg, &snap);
-    let saved = saved_view(&state, revision, &now);
-    let mut run = state.benchmark.status();
-    for m in &mut run.models {
-        if let Some(n) = now.get(&crate::registry::normalize_name(&m.model)) {
-            crate::benchmark::current::rebase_model(m, &[], None, n);
+    super::blocking(move || {
+        let snap = devices_snapshot(&state);
+        let path = results_path(&state.config_path);
+        let config = config_view(&state, &snap);
+        let (revision, cfg) = state.config.snapshot();
+        let now = models_now(&state, &cfg, &snap);
+        let saved = saved_view(&state, revision, &now);
+        let mut run = state.benchmark.status();
+        for m in &mut run.models {
+            if let Some(n) = now.get(&crate::registry::normalize_name(&m.model)) {
+                crate::benchmark::current::rebase_model(m, &[], None, n);
+            }
         }
-    }
-    Json(serde_json::json!({
-        "success": true,
-        "state": run.state,
-        "running": run.running,
-        "run": run,
-        "results": saved.results,
-        "ranking": saved.ranking,
-        "resultsFile": path.display().to_string(),
-        "config": config,
-        "warning": LIVE_WARNING,
-    }))
+        Json(serde_json::json!({
+            "success": true,
+            "state": run.state,
+            "running": run.running,
+            "run": run,
+            "results": saved.results,
+            "ranking": saved.ranking,
+            "resultsFile": path.display().to_string(),
+            "config": config,
+            "warning": LIVE_WARNING,
+        }))
+    })
+    .await
 }
 
 fn json_error(status: StatusCode, message: String) -> Response {
@@ -1176,7 +1182,7 @@ mod tests {
     }
 
     async fn call(state: &Arc<AppState>, req: Request<Body>) -> (StatusCode, serde_json::Value) {
-        let resp = router(state.clone()).oneshot(req).await.unwrap();
+        let resp = router(state.clone()).oneshot(local(req)).await.unwrap();
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1186,15 +1192,22 @@ mod tests {
         (status, v)
     }
 
+    /// Requests come from this machine (the admin routes refuse remote clients).
+    fn local(req: Request<Body>) -> Request<Body> {
+        crate::server::tests::from_peer(req, "127.0.0.1:50000")
+    }
+
     fn post(uri: &str, body: &str) -> Request<Body> {
-        Request::post(uri)
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(body.to_string()))
-            .unwrap()
+        local(
+            Request::post(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
     }
 
     fn get(uri: &str) -> Request<Body> {
-        Request::get(uri).body(Body::empty()).unwrap()
+        local(Request::get(uri).body(Body::empty()).unwrap())
     }
 
     #[tokio::test]

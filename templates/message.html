@@ -7,14 +7,16 @@
 {% if restarting %}
 <p class="muted" id="restart-status">Waiting for the server&hellip;</p>
 <script>
-// Poll until the restarted server answers, then go back (the old one stops ~250 ms after replying).
+// Poll until the next generation serves (the server keeps answering during the restart; the
+// generation changes once the new config is swapped in), then go back.
 (function () {
-  var target = "{{ refresh_url }}", started = Date.now(), status = document.getElementById("restart-status");
+  var target = "{{ refresh_url }}", gen = {{ generation }}, started = Date.now(), status = document.getElementById("restart-status");
   function poll() {
-    fetch("/stats.json", {cache: "no-store"}).then(function (r) {
+    fetch("/v1/config", {cache: "no-store"}).then(function (r) {
       if (!r.ok) throw new Error(r.status);
       return r.json();
-    }).then(function () {
+    }).then(function (j) {
+      if (j.generation === gen) throw new Error("same generation");
       status.textContent = "Server is back; reloading…";
       location.href = target;
     }).catch(function () {
