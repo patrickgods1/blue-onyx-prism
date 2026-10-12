@@ -39,9 +39,12 @@ pub fn ensure_models(config: &Config, config_path: &std::path::Path) -> Result<(
     Ok(())
 }
 
-/// Build the current-thread tokio runtime the server runs on.
+/// Build the tokio runtime the server runs on: two worker threads (handlers are short; the point
+/// is that one slow handler cannot stall the detection routes) plus the blocking pool that
+/// [`server::blocking`] work runs on.
 pub fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .context("building tokio runtime")

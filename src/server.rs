@@ -217,6 +217,19 @@ pub async fn serve(
     Ok(())
 }
 
+/// Run blocking handler work (file reads and walks, runtime library probes, page rendering) on
+/// tokio's blocking pool so a slow page never holds up the detection routes. A panic in `f` is
+/// resumed in the handler (axum answers 500 as for any handler panic).
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => match e.try_into_panic() {
+            Ok(p) => std::panic::resume_unwind(p),
+            Err(e) => panic!("blocking handler task did not finish: {e}"),
+        },
+    }
+}
+
 /// State text for the HTML pages and `/stats`: "Initializing (downloading ...)", "Ready", ...;
 /// a lazy model that has not been requested yet says so.
 fn state_label(w: &WorkerHandle) -> String {
@@ -480,23 +493,26 @@ fn devices_snapshot(state: &AppState) -> DevicesSnapshot {
 
 /// `GET /v1/devices`: detected hardware, runtimes and every device option with `auto`'s pick.
 async fn devices_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let snap = devices_snapshot(&state);
-    Json(serde_json::json!({
-        "success": true,
-        "hardware": snap.hardware,
-        "runtimes": {
-            "openvino": {
-                "version": snap.openvino_version,
-                "devices": snap.openvino_devices,
+    blocking(move || {
+        let snap = devices_snapshot(&state);
+        Json(serde_json::json!({
+            "success": true,
+            "hardware": snap.hardware,
+            "runtimes": {
+                "openvino": {
+                    "version": snap.openvino_version,
+                    "devices": snap.openvino_devices,
+                },
+                "onnxruntime": snap.onnxruntime.as_ref().map(|o| serde_json::json!({
+                    "version": o.version,
+                    "flavor": o.flavor,
+                })),
             },
-            "onnxruntime": snap.onnxruntime.as_ref().map(|o| serde_json::json!({
-                "version": o.version,
-                "flavor": o.flavor,
-            })),
-        },
-        "selection": snap.selection,
-        "autoPick": snap.selection.auto_pick().map(|o| o.spec.to_string()),
-    }))
+            "selection": snap.selection,
+            "autoPick": snap.selection.auto_pick().map(|o| o.spec.to_string()),
+        }))
+    })
+    .await
 }
 
 fn default_name(reg: &ModelRegistry) -> String {
@@ -506,57 +522,60 @@ fn default_name(reg: &ModelRegistry) -> String {
 }
 
 async fn welcome(State(state): State<Arc<AppState>>) -> Response {
-    let reg = &state.registry;
-    let snap = devices_snapshot(&state);
-    let default = default_name(reg);
-    let pending = crate::config_merge::pending(&state.running, &state.config_read());
-    let models = reg
-        .workers()
-        .iter()
-        .map(|w| {
-            let (state, state_class, state_detail) = state_view(w);
-            ModelRow {
-                pending: pending.for_model(&w.name).join("; "),
-                name: w.name.clone(),
-                is_default: w.name == default,
-                state,
-                state_class,
-                state_detail,
-                provider: w.execution_provider(),
-                requests: w.metrics.requests.load(Ordering::Relaxed),
-                queue: format!("{}/{}", w.sender.len(), w.queue_capacity()),
-            }
+    blocking(move || {
+        let reg = &state.registry;
+        let snap = devices_snapshot(&state);
+        let default = default_name(reg);
+        let pending = crate::config_merge::pending(&state.running, &state.config_read());
+        let models = reg
+            .workers()
+            .iter()
+            .map(|w| {
+                let (state, state_class, state_detail) = state_view(w);
+                ModelRow {
+                    pending: pending.for_model(&w.name).join("; "),
+                    name: w.name.clone(),
+                    is_default: w.name == default,
+                    state,
+                    state_class,
+                    state_detail,
+                    provider: w.execution_provider(),
+                    requests: w.metrics.requests.load(Ordering::Relaxed),
+                    queue: format!("{}/{}", w.sender.len(), w.queue_capacity()),
+                }
+            })
+            .collect();
+        let in_use = providers_in_use(reg);
+        let force_cpu_note = force_cpu_note(&state.config_read(), &snap);
+        render(&WelcomeTemplate {
+            nav: "home",
+            version: crate::VERSION,
+            openvino_version: if reg.runtime_info.openvino_version.is_empty() {
+                "not available (run setup-openvino)".to_string()
+            } else {
+                reg.runtime_info.openvino_version.clone()
+            },
+            onnxruntime: snap.onnxruntime_label(),
+            devices: if reg.runtime_info.available_devices.is_empty() {
+                "none".to_string()
+            } else {
+                reg.runtime_info.available_devices.join(", ")
+            },
+            gpus: snap.hardware.gpus.iter().map(|g| g.to_string()).collect(),
+            auto_pick: snap.auto_pick_label(),
+            in_use: if in_use.is_empty() {
+                "nothing loaded yet".to_string()
+            } else {
+                in_use.join("; ")
+            },
+            force_cpu_note,
+            uptime: format_uptime(state.started.elapsed()),
+            port: state.config_read().port,
+            default_model: default,
+            models,
         })
-        .collect();
-    let in_use = providers_in_use(reg);
-    let force_cpu_note = force_cpu_note(&state.config_read(), &snap);
-    render(&WelcomeTemplate {
-        nav: "home",
-        version: crate::VERSION,
-        openvino_version: if reg.runtime_info.openvino_version.is_empty() {
-            "not available (run setup-openvino)".to_string()
-        } else {
-            reg.runtime_info.openvino_version.clone()
-        },
-        onnxruntime: snap.onnxruntime_label(),
-        devices: if reg.runtime_info.available_devices.is_empty() {
-            "none".to_string()
-        } else {
-            reg.runtime_info.available_devices.join(", ")
-        },
-        gpus: snap.hardware.gpus.iter().map(|g| g.to_string()).collect(),
-        auto_pick: snap.auto_pick_label(),
-        in_use: if in_use.is_empty() {
-            "nothing loaded yet".to_string()
-        } else {
-            in_use.join("; ")
-        },
-        force_cpu_note,
-        uptime: format_uptime(state.started.elapsed()),
-        port: state.config_read().port,
-        default_model: default,
-        models,
     })
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -960,23 +979,26 @@ async fn prometheus(State(state): State<Arc<AppState>>) -> Response {
 /// `GET /v1/resources`: every downloadable resource for this platform with its state, size,
 /// what it provides and which models wait for it.
 async fn resources_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let cfg = state.config_read().clone();
-    let rows = crate::resources::status::rows(state.resources.as_ref(), &cfg);
-    let hw = crate::backend::detect::hardware();
-    let manual = state
-        .resources
-        .as_ref()
-        .and_then(|r| r.provision.resolution.manual_message());
-    Json(serde_json::json!({
-        "success": true,
-        "platform": format!("{}-{}", hw.os, hw.arch),
-        "autoDownload": cfg.auto_download,
-        "allowLargeDownloads": cfg.allow_large_downloads,
-        "downloadRoot": cfg.data_root().display().to_string(),
-        "manualMessage": manual,
-        "resources": rows,
-        "localModels": crate::resources::status::local_models(state.resources.as_ref(), &cfg),
-    }))
+    blocking(move || {
+        let cfg = state.config_read().clone();
+        let rows = crate::resources::status::rows(state.resources.as_ref(), &cfg);
+        let hw = crate::backend::detect::hardware();
+        let manual = state
+            .resources
+            .as_ref()
+            .and_then(|r| r.provision.resolution.manual_message());
+        Json(serde_json::json!({
+            "success": true,
+            "platform": format!("{}-{}", hw.os, hw.arch),
+            "autoDownload": cfg.auto_download,
+            "allowLargeDownloads": cfg.allow_large_downloads,
+            "downloadRoot": cfg.data_root().display().to_string(),
+            "manualMessage": manual,
+            "resources": rows,
+            "localModels": crate::resources::status::local_models(state.resources.as_ref(), &cfg),
+        }))
+    })
+    .await
 }
 
 /// Form (or urlencoded API) fields of the resource actions: `id`, optional `confirm_large`.
@@ -1051,14 +1073,17 @@ async fn resources_download(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, confirm) = action_fields(&form);
-    let cfg = state.config_read().clone();
-    let result = match &state.resources {
-        Some(ctx) => crate::resources::status::download(ctx, &cfg, &id, confirm),
-        None => Err(no_manager()),
-    };
-    action_response(&state, &headers, &id, result)
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, confirm) = action_fields(&form);
+        let cfg = state.config_read().clone();
+        let result = match &state.resources {
+            Some(ctx) => crate::resources::status::download(ctx, &cfg, &id, confirm),
+            None => Err(no_manager()),
+        };
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 /// `POST /v1/resources/remove` (`id`).
@@ -1067,11 +1092,14 @@ async fn resources_remove(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, _) = action_fields(&form);
-    let cfg = state.config_read().clone();
-    let result = crate::resources::status::remove(state.resources.as_ref(), &cfg, &id);
-    action_response(&state, &headers, &id, result)
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, _) = action_fields(&form);
+        let cfg = state.config_read().clone();
+        let result = crate::resources::status::remove(state.resources.as_ref(), &cfg, &id);
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 /// `POST /v1/resources/add-to-config` (`id` of an installed model): appends it to `models` and
@@ -1081,27 +1109,30 @@ async fn resources_add_to_config(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, _) = action_fields(&form);
-    let mut outcome = String::new();
-    let saved = save_config(&state, "resources add-to-config", |c| {
-        outcome = crate::resources::status::add_to_config(state.resources.as_ref(), c, &id)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(())
-    });
-    let result = match saved {
-        Ok(_) => Ok(format!(
-            "{outcome}. Saved to {}.",
-            state.config_path.display()
-        )),
-        Err(e) => match e.downcast::<crate::resources::status::ActionError>() {
-            Ok(a) => Err(a),
-            Err(e) => Err(crate::resources::status::ActionError::Failed(format!(
-                "{e:#}"
-            ))),
-        },
-    };
-    action_response(&state, &headers, &id, result)
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, _) = action_fields(&form);
+        let mut outcome = String::new();
+        let saved = save_config(&state, "resources add-to-config", |c| {
+            outcome = crate::resources::status::add_to_config(state.resources.as_ref(), c, &id)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok(())
+        });
+        let result = match saved {
+            Ok(_) => Ok(format!(
+                "{outcome}. Saved to {}.",
+                state.config_path.display()
+            )),
+            Err(e) => match e.downcast::<crate::resources::status::ActionError>() {
+                Ok(a) => Err(a),
+                Err(e) => Err(crate::resources::status::ActionError::Failed(format!(
+                    "{e:#}"
+                ))),
+            },
+        };
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 /// `POST /v1/models/add` (`path`, optional `name`, `family`, `classes`): appends a custom model
@@ -1111,51 +1142,56 @@ async fn models_add(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    use crate::resources::status::{ActionError, CUSTOM_MODEL_ROW, CustomModel};
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let field = |k: &str| {
-        form.get(k)
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default()
-    };
-    let some = |s: String| (!s.is_empty()).then_some(s);
-    let family = match field("family").to_ascii_lowercase().as_str() {
-        "" => Ok(crate::model::ModelFamilyKind::Auto),
-        f => <crate::model::ModelFamilyKind as clap::ValueEnum>::from_str(f, true).map_err(|_| {
-            ActionError::BadRequest(format!(
-                "unknown family '{f}'; valid: {}",
-                family_names().join(", ")
-            ))
-        }),
-    };
-    let req = family.map(|family| CustomModel {
-        path: field("path"),
-        name: some(field("name")),
-        family,
-        classes: some(field("classes")),
-    });
-    let result = match req {
-        Err(e) => Err(e),
-        Ok(req) => {
-            let mut outcome = String::new();
-            let saved = save_config(&state, "config page (add model by path)", |c| {
-                outcome = crate::resources::status::add_custom_model(c, &req)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                Ok(())
-            });
-            match saved {
-                Ok(_) => Ok(format!(
-                    "{outcome}. Saved to {}; restart to load it.",
-                    state.config_path.display()
-                )),
-                Err(e) => match e.downcast::<ActionError>() {
-                    Ok(a) => Err(a),
-                    Err(e) => Err(ActionError::Failed(format!("{e:#}"))),
+    blocking(move || {
+        use crate::resources::status::{ActionError, CUSTOM_MODEL_ROW, CustomModel};
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let field = |k: &str| {
+            form.get(k)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        let some = |s: String| (!s.is_empty()).then_some(s);
+        let family = match field("family").to_ascii_lowercase().as_str() {
+            "" => Ok(crate::model::ModelFamilyKind::Auto),
+            f => <crate::model::ModelFamilyKind as clap::ValueEnum>::from_str(f, true).map_err(
+                |_| {
+                    ActionError::BadRequest(format!(
+                        "unknown family '{f}'; valid: {}",
+                        family_names().join(", ")
+                    ))
                 },
+            ),
+        };
+        let req = family.map(|family| CustomModel {
+            path: field("path"),
+            name: some(field("name")),
+            family,
+            classes: some(field("classes")),
+        });
+        let result = match req {
+            Err(e) => Err(e),
+            Ok(req) => {
+                let mut outcome = String::new();
+                let saved = save_config(&state, "config page (add model by path)", |c| {
+                    outcome = crate::resources::status::add_custom_model(c, &req)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    Ok(())
+                });
+                match saved {
+                    Ok(_) => Ok(format!(
+                        "{outcome}. Saved to {}; restart to load it.",
+                        state.config_path.display()
+                    )),
+                    Err(e) => match e.downcast::<ActionError>() {
+                        Ok(a) => Err(a),
+                        Err(e) => Err(ActionError::Failed(format!("{e:#}"))),
+                    },
+                }
             }
-        }
-    };
-    action_response(&state, &headers, CUSTOM_MODEL_ROW, result)
+        };
+        action_response(&state, &headers, CUSTOM_MODEL_ROW, result)
+    })
+    .await
 }
 
 fn family_names() -> Vec<String> {
@@ -1201,33 +1237,38 @@ async fn resources_export(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, confirm) = action_fields(&form);
-    let add = form.get("add_to_config").is_some_and(|v| {
-        !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "off"
-        )
-    });
-    let cfg = state.config_read().clone();
-    let on_done: Option<crate::resources::export::OnDone> = add.then(|| {
-        let config = state.config.clone();
-        let id = id.clone();
-        Box::new(move |_: &crate::resources::export::ExportOutput| {
-            add_export_to_config(&config, &id)
-        }) as crate::resources::export::OnDone
-    });
-    let result = match &state.resources {
-        Some(ctx) => crate::resources::status::export(ctx, &cfg, &id, confirm, on_done).map(|m| {
-            if add {
-                format!("{m}; it is added to the config when done")
-            } else {
-                m
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, confirm) = action_fields(&form);
+        let add = form.get("add_to_config").is_some_and(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off"
+            )
+        });
+        let cfg = state.config_read().clone();
+        let on_done: Option<crate::resources::export::OnDone> = add.then(|| {
+            let config = state.config.clone();
+            let id = id.clone();
+            Box::new(move |_: &crate::resources::export::ExportOutput| {
+                add_export_to_config(&config, &id)
+            }) as crate::resources::export::OnDone
+        });
+        let result = match &state.resources {
+            Some(ctx) => {
+                crate::resources::status::export(ctx, &cfg, &id, confirm, on_done).map(|m| {
+                    if add {
+                        format!("{m}; it is added to the config when done")
+                    } else {
+                        m
+                    }
+                })
             }
-        }),
-        None => Err(no_manager()),
-    };
-    action_response(&state, &headers, &id, result)
+            None => Err(no_manager()),
+        };
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 /// After an export: append the model to the config (through the config store, which first
@@ -1251,13 +1292,16 @@ async fn resources_export_cancel(
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let form = form.map(|Form(f)| f).unwrap_or_default();
-    let (id, _) = action_fields(&form);
-    let result = match &state.resources {
-        Some(ctx) => crate::resources::status::cancel_export(ctx, &id),
-        None => Err(no_manager()),
-    };
-    action_response(&state, &headers, &id, result)
+    blocking(move || {
+        let form = form.map(|Form(f)| f).unwrap_or_default();
+        let (id, _) = action_fields(&form);
+        let result = match &state.resources {
+            Some(ctx) => crate::resources::status::cancel_export(ctx, &id),
+            None => Err(no_manager()),
+        };
+        action_response(&state, &headers, &id, result)
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1947,7 +1991,7 @@ fn config_template_at(
 }
 
 async fn config_page(State(state): State<Arc<AppState>>) -> Response {
-    render(&config_template(&state, None, None, None))
+    blocking(move || render(&config_template(&state, None, None, None))).await
 }
 
 /// Apply `edit` to the current config through the config store (one writer for everything:
@@ -1998,6 +2042,7 @@ async fn config_submit(
     headers: HeaderMap,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
 ) -> Response {
+    blocking(move || {
     let json = live::wants_json(&headers);
     let pairs = match form {
         Ok(Form(f)) => f,
@@ -2086,6 +2131,8 @@ async fn config_submit(
             ))
         }
     }
+    })
+    .await
 }
 
 /// The Models card: `enabled` (repeated, one per checked model), `default_model` (radio),
@@ -2097,50 +2144,53 @@ async fn config_models(
     headers: HeaderMap,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
 ) -> Response {
-    let json = live::wants_json(&headers);
-    let form = match form {
-        Ok(Form(f)) => f,
-        Err(e) => {
-            let msg = format!("Invalid form submission: {e}");
-            if json {
-                return live::error_json(StatusCode::BAD_REQUEST, msg);
+    blocking(move || {
+        let json = live::wants_json(&headers);
+        let form = match form {
+            Ok(Form(f)) => f,
+            Err(e) => {
+                let msg = format!("Invalid form submission: {e}");
+                if json {
+                    return live::error_json(StatusCode::BAD_REQUEST, msg);
+                }
+                return render(&config_template(&state, None, Some(msg), None));
             }
-            return render(&config_template(&state, None, Some(msg), None));
+        };
+        let restart = form.iter().any(|(k, a)| k == "action" && a == "restart");
+        let result = live::FormMeta::parse(&form).and_then(|meta| {
+            save_config(&state, "config page (Models card)", |c| {
+                live::models_card_edit(c, &form, &meta)
+            })
+        });
+        match result {
+            Ok(msg) if restart => {
+                if json {
+                    schedule_restart(&state);
+                    return live::saved_json(&state, msg, true);
+                }
+                restart_response(&state, "models")
+            }
+            Ok(msg) if json => live::saved_json(&state, msg, false),
+            Ok(msg) => render(&config_template_at(&state, Some(msg), None, None, "models")),
+            Err(e) => {
+                if let Some(conflicts) = live::conflicts_of(&e) {
+                    warn!("Models card conflicts with newer changes: {e}");
+                    return if json {
+                        live::conflict_json(&state, conflicts)
+                    } else {
+                        live::conflict_page(&state, "/config/models", "models", conflicts, &form)
+                    };
+                }
+                warn!("rejected models selection: {e:#}");
+                let msg = format!("Models not saved: {e:#}");
+                if json {
+                    return live::error_json(StatusCode::BAD_REQUEST, msg);
+                }
+                render(&config_template_at(&state, None, Some(msg), None, "models"))
+            }
         }
-    };
-    let restart = form.iter().any(|(k, a)| k == "action" && a == "restart");
-    let result = live::FormMeta::parse(&form).and_then(|meta| {
-        save_config(&state, "config page (Models card)", |c| {
-            live::models_card_edit(c, &form, &meta)
-        })
-    });
-    match result {
-        Ok(msg) if restart => {
-            if json {
-                schedule_restart(&state);
-                return live::saved_json(&state, msg, true);
-            }
-            restart_response(&state, "models")
-        }
-        Ok(msg) if json => live::saved_json(&state, msg, false),
-        Ok(msg) => render(&config_template_at(&state, Some(msg), None, None, "models")),
-        Err(e) => {
-            if let Some(conflicts) = live::conflicts_of(&e) {
-                warn!("Models card conflicts with newer changes: {e}");
-                return if json {
-                    live::conflict_json(&state, conflicts)
-                } else {
-                    live::conflict_page(&state, "/config/models", "models", conflicts, &form)
-                };
-            }
-            warn!("rejected models selection: {e:#}");
-            let msg = format!("Models not saved: {e:#}");
-            if json {
-                return live::error_json(StatusCode::BAD_REQUEST, msg);
-            }
-            render(&config_template_at(&state, None, Some(msg), None, "models"))
-        }
-    }
+    })
+    .await
 }
 
 fn apply_log_level(state: &AppState, level: LogLevel) -> anyhow::Result<()> {
@@ -2235,47 +2285,50 @@ async fn config_loglevel(
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let level = form
-        .ok()
-        .and_then(|Form(f)| f.get("level").cloned())
-        .or_else(|| query.ok().and_then(|Query(q)| q.get("level").cloned()));
-    let result = (|| -> anyhow::Result<LogLevel> {
-        let raw = level.ok_or_else(|| anyhow::anyhow!("missing field 'level'"))?;
-        let level: LogLevel = raw.trim().parse()?;
-        apply_log_level(&state, level)?;
-        state.config.update("log level", |c| {
-            c.log_level = level;
-            Ok(())
-        })?;
-        Ok(level)
-    })();
-    let html = wants_html(&headers);
-    match result {
-        Ok(level) => {
-            info!(level = level.as_str(), "log level changed from the web UI");
-            let msg = format!("Log level set to {} and saved.", level.as_str());
-            if html {
-                render(&config_template(&state, Some(msg), None, None))
-            } else {
-                Json(
+    blocking(move || {
+        let level = form
+            .ok()
+            .and_then(|Form(f)| f.get("level").cloned())
+            .or_else(|| query.ok().and_then(|Query(q)| q.get("level").cloned()));
+        let result = (|| -> anyhow::Result<LogLevel> {
+            let raw = level.ok_or_else(|| anyhow::anyhow!("missing field 'level'"))?;
+            let level: LogLevel = raw.trim().parse()?;
+            apply_log_level(&state, level)?;
+            state.config.update("log level", |c| {
+                c.log_level = level;
+                Ok(())
+            })?;
+            Ok(level)
+        })();
+        let html = wants_html(&headers);
+        match result {
+            Ok(level) => {
+                info!(level = level.as_str(), "log level changed from the web UI");
+                let msg = format!("Log level set to {} and saved.", level.as_str());
+                if html {
+                    render(&config_template(&state, Some(msg), None, None))
+                } else {
+                    Json(
                     serde_json::json!({ "success": true, "message": msg, "level": level.as_str() }),
                 )
                 .into_response()
+                }
+            }
+            Err(e) => {
+                let msg = format!("Log level not changed: {e:#}");
+                if html {
+                    render(&config_template(&state, None, Some(msg), None))
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "success": false, "message": msg })),
+                    )
+                        .into_response()
+                }
             }
         }
-        Err(e) => {
-            let msg = format!("Log level not changed: {e:#}");
-            if html {
-                render(&config_template(&state, None, Some(msg), None))
-            } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "success": false, "message": msg })),
-                )
-                    .into_response()
-            }
-        }
-    }
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------------------------

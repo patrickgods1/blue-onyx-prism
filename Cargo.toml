@@ -40,7 +40,7 @@ openvino-sys = { version = "=0.11.0", features = ["runtime-linking"] }
 anyhow = "1"
 thiserror = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "multipart", "tokio", "query", "form"] }
-tokio = { version = "1", features = ["rt", "macros", "sync", "time", "signal", "fs"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 crossbeam-channel = "0.5"
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
