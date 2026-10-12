@@ -679,6 +679,10 @@ and diffs detections), `--cache-dir` (`""` disables), `--threads`, `--classes`, 
 If GPU latency is not clearly below CPU latency, the GPU was probably not used (check the log) or
 the FP32 path is active.
 
+## Releasing
+
+Tagging steps and the manual NVIDIA benchmark check are in [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
+
 ## Test client
 
 ```sh
