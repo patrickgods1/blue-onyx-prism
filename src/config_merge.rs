@@ -719,6 +719,99 @@ mod tests {
         assert!(model_reloads(&running, &back).is_empty());
     }
 
+    type Edit = Box<dyn Fn(&mut Config)>;
+
+    /// Phase 3 classification: live globals and per-model live fields are never pending;
+    /// every runtime-level global is, one reason each.
+    #[test]
+    fn pending_lists_only_runtime_level_fields() {
+        let running = cfg();
+        let live: Vec<Edit> = vec![
+            Box::new(|c| c.confidence_threshold = 0.3),
+            Box::new(|c| c.nms_iou = 0.6),
+            Box::new(|c| c.object_filter = vec!["person".into()]),
+            Box::new(|c| c.save_image_path = Some("shots".into())),
+            Box::new(|c| c.save_ref_image = true),
+            Box::new(|c| c.request_timeout_secs = 3),
+            Box::new(|c| c.log_level = crate::config::LogLevel::Trace),
+            Box::new(|c| c.allow_remote_admin = true),
+            Box::new(|c| c.default_model = Some("yolo26s".into())),
+            Box::new(|c| c.benchmark.repeat_per_image = 7),
+            Box::new(|c| c.models[0].confidence_threshold = Some(0.2)),
+            Box::new(|c| c.models[1].object_filter = Some(vec!["car".into()])),
+        ];
+        for (i, edit) in live.iter().enumerate() {
+            let mut c = running.clone();
+            edit(&mut c);
+            c.normalize();
+            assert_ne!(c, running, "edit {i} changes something");
+            let p = pending(&running, &c);
+            assert!(!p.restart_needed(), "edit {i} is live: {p:?}");
+        }
+        let runtime: Vec<(&str, Edit)> = vec![
+            ("port", Box::new(|c| c.port = 4000)),
+            (
+                "bind_address",
+                Box::new(|c| c.bind_address = "127.0.0.1".parse().unwrap()),
+            ),
+            ("log_path", Box::new(|c| c.log_path = Some("logs".into()))),
+            (
+                "openvino_dir",
+                Box::new(|c| c.openvino_dir = Some("ov".into())),
+            ),
+            (
+                "onnxruntime_dir",
+                Box::new(|c| c.onnxruntime_dir = Some("ort".into())),
+            ),
+            ("cache_dir", Box::new(|c| c.cache_dir = "c2".into())),
+            ("intra_threads", Box::new(|c| c.intra_threads = 2)),
+            (
+                "download_dir",
+                Box::new(|c| c.download_dir = Some("dl".into())),
+            ),
+            ("models_dir", Box::new(|c| c.models_dir = "m2".into())),
+            ("worker_queue_size", Box::new(|c| c.worker_queue_size = 4)),
+            ("preprocess_threads", Box::new(|c| c.preprocess_threads = 2)),
+            ("inflight", Box::new(|c| c.inflight = 2)),
+            ("ort_sessions", Box::new(|c| c.ort_sessions = 2)),
+            (
+                "auto_download",
+                Box::new(|c| c.auto_download = !c.auto_download),
+            ),
+            (
+                "allow_large_downloads",
+                Box::new(|c| c.allow_large_downloads = !c.allow_large_downloads),
+            ),
+            ("gpu_index", Box::new(|c| c.gpu_index = 1)),
+        ];
+        for (k, edit) in &runtime {
+            assert!(!live_global(k), "{k}");
+            let mut c = running.clone();
+            edit(&mut c);
+            let p = pending(&running, &c);
+            assert_eq!(p.global.len() + p.process.len(), 1, "{k}: {p:?}");
+            assert!(p.models.is_empty(), "{k}: {p:?}");
+        }
+        // The global device and force_cpu also show on every model they move.
+        for edit in [
+            Box::new(|c: &mut Config| c.device = "openvino:cpu".into()) as Edit,
+            Box::new(|c: &mut Config| c.force_cpu = true),
+        ] {
+            let mut c = running.clone();
+            edit(&mut c);
+            let p = pending(&running, &c);
+            assert_eq!(p.global.len(), 1, "{p:?}");
+            assert_eq!(p.models.len(), 2, "{p:?}");
+        }
+        // Per-model structural changes stay pending until the model reloads.
+        let mut c = running.clone();
+        c.models[1].lazy = true;
+        c.models[0].enabled = false;
+        let p = pending(&running, &c);
+        assert_eq!(p.for_model("yolo26s"), ["lazy changed"]);
+        assert_eq!(p.for_model("IPcam-general"), ["disabled; still loaded"]);
+    }
+
     #[test]
     fn pending_restart_reasons() {
         let running = cfg();
