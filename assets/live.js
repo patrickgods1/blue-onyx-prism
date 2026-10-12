@@ -224,8 +224,8 @@
   function sortTable(table, col, asc) {
     var tb = table.tBodies[0]; if (!tb) return;
     var rows = Array.prototype.slice.call(tb.rows);
-    table.querySelectorAll("th").forEach(function (h) { delete h.dataset.dir; });
-    var th = table.tHead && table.tHead.rows[0].cells[col]; if (th) th.dataset.dir = asc ? "asc" : "desc";
+    table.querySelectorAll("th").forEach(function (h) { delete h.dataset.dir; h.removeAttribute("aria-sort"); });
+    var th = table.tHead && table.tHead.rows[0].cells[col]; if (th) { th.dataset.dir = asc ? "asc" : "desc"; th.setAttribute("aria-sort", asc ? "ascending" : "descending"); }
     rows.sort(function (a, b) {
       var x = a.cells[col], y = b.cells[col]; if (!x || !y) return 0;
       var vx = x.dataset.v, vy = y.dataset.v;
@@ -287,6 +287,58 @@
     Object.keys(old).forEach(function (k) { old[k].remove(); });
   }
 
+  // ---- tabs ---------------------------------------------------------------------------------
+  // `<nav class="tabs" role="tablist">` with `<a role="tab" href="#panel">` links: one panel
+  // shows at a time, the chosen one in the URL's #fragment. Any #anchor inside a panel opens
+  // that panel first and then scrolls to the anchor, so deep links keep working. Without
+  // JavaScript every panel is in the page, stacked.
+  function tabs(nav) {
+    if (!nav) return null;
+    if (nav._tabs) return nav._tabs;
+    var links = Array.prototype.slice.call(nav.querySelectorAll('a[role="tab"]'));
+    var panels = links.map(function (a) { return document.getElementById((a.getAttribute("href") || "").slice(1)); });
+    if (!links.length || panels.some(function (p) { return !p; })) return null;
+    var current = null;
+    function indexOf(id) {
+      if (!id) return null;
+      var t = document.getElementById(id); if (!t) return null;
+      for (var i = 0; i < panels.length; i++) if (panels[i] === t || panels[i].contains(t)) return i;
+      return null;
+    }
+    function select(i) {
+      links.forEach(function (a, k) { var on = k === i; a.setAttribute("aria-selected", on ? "true" : "false"); a.tabIndex = on ? 0 : -1; panels[k].hidden = !on; });
+      current = i;
+    }
+    function fromHash() {
+      var id = location.hash.slice(1), i = indexOf(id);
+      if (i === null) { if (current === null) select(0); return; }
+      select(i);
+      var t = document.getElementById(id);
+      if (t && t !== panels[i]) t.scrollIntoView(); else nav.scrollIntoView();
+    }
+    links.forEach(function (a, i) {
+      a.addEventListener("click", function (e) {
+        e.preventDefault(); select(i);
+        if (history.replaceState) history.replaceState(null, "", a.getAttribute("href")); else location.hash = a.getAttribute("href");
+      });
+      a.addEventListener("keydown", function (e) {
+        var d = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0; if (!d) return;
+        e.preventDefault(); var n = (i + d + links.length) % links.length; links[n].click(); links[n].focus();
+      });
+    });
+    window.addEventListener("hashchange", fromHash);
+    fromHash();
+    nav._tabs = {
+      select: select,
+      current: function () { return current; },
+      // Show the panel that holds the element `id` (a panel id or any anchor inside one).
+      show: function (id) { var i = indexOf(id); if (i !== null) select(i); return i !== null; },
+      indexOf: indexOf
+    };
+    return nav._tabs;
+  }
+  document.addEventListener("DOMContentLoaded", function () { document.querySelectorAll("nav.tabs").forEach(tabs); });
+
   // ---- forms without leaving the page ----------------------------------------------------------
   // `<form data-ajax>`: submitted with fetch (Accept: application/json) instead of navigating,
   // so the page keeps its scroll position; the clicked button is disabled while the request
@@ -340,6 +392,7 @@
     keep: keep,
     patch: patch,
     sortTable: sortTable,
+    tabs: tabs,
     view: {capture: capture, restore: restore, busy: busyIn},
     ui: {edited: edited, current: current, baseline: baseline, same: same, set: set, flash: flash, note: note, refresh: refresh, markEdits: markEdits}
   };

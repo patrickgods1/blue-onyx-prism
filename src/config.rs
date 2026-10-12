@@ -593,8 +593,11 @@ impl Config {
 /// JSON). `default_model` and the per-model `enabled` flags are owned by the Models card
 /// (`POST /config/models`, see [`apply_models_selection`]); `apply_config_form` still accepts a
 /// `default_model` field for API clients.
-/// Checkboxes (`force_cpu`, `save_ref_image`) are true when present with any value but
-/// `false`/`off`/`0`, and false when absent (browsers omit unchecked boxes).
+/// Checkboxes (`force_cpu`, `save_ref_image`, `allow_remote_admin`, `auto_download`,
+/// `allow_large_downloads`) are true when present with any value but `false`/`off`/`0`, and
+/// false when absent (browsers omit unchecked boxes); each is read only when its form's marker
+/// field (`inference_settings`, `image_settings`, `access_settings`, `download_settings`) is
+/// posted too, so a form that does not show the box never clears it.
 pub const FORM_FIELDS: &[&str] = &[
     "port",
     "bind_address",
@@ -681,7 +684,11 @@ pub fn parse_config_form(
     if let Some(v) = get("gpu_index") {
         c.gpu_index = num("gpu_index", v)?;
     }
-    c.force_cpu = checkbox("force_cpu");
+    // Checkboxes changed only by forms that show them (hidden `inference_settings` /
+    // `image_settings` markers), so a post of other fields never clears them by omission.
+    if form.contains_key("inference_settings") {
+        c.force_cpu = checkbox("force_cpu");
+    }
     if let Some(v) = get("cache_dir") {
         c.cache_dir = v.to_string();
     }
@@ -714,7 +721,9 @@ pub fn parse_config_form(
     if let Some(v) = get("save_image_path") {
         c.save_image_path = opt_path(v);
     }
-    c.save_ref_image = checkbox("save_ref_image");
+    if form.contains_key("image_settings") {
+        c.save_ref_image = checkbox("save_ref_image");
+    }
     // Download settings are checkboxes too, but only forms that show them (marked with the
     // hidden `download_settings` field) change them, so older form posts keep their values.
     if form.contains_key("download_settings") {
@@ -1206,6 +1215,23 @@ mod tests {
     }
 
     #[test]
+    fn checkboxes_change_only_with_their_marker() {
+        let mut c = with_model();
+        c.force_cpu = true;
+        c.save_ref_image = true;
+        // A post without the markers (e.g. the models JSON form) leaves both boxes alone.
+        apply_config_form(&mut c, &form(&[("port", "4000")])).unwrap();
+        assert!(c.force_cpu && c.save_ref_image);
+        // With the markers an absent box means unchecked.
+        apply_config_form(
+            &mut c,
+            &form(&[("inference_settings", "1"), ("image_settings", "1")]),
+        )
+        .unwrap();
+        assert!(!c.force_cpu && !c.save_ref_image);
+    }
+
+    #[test]
     fn config_form_applies_all_fields() {
         let mut c = with_model();
         let models = r#"[{"name":"a","path":"m/a.xml","family":"yolo26"},
@@ -1216,6 +1242,7 @@ mod tests {
             ("worker_queue_size", "8"),
             ("device", "GPU.1"),
             ("gpu_index", "1"),
+            ("inference_settings", "1"),
             ("force_cpu", "on"),
             ("cache_dir", ""),
             ("confidence_threshold", "0.35"),
@@ -1224,6 +1251,7 @@ mod tests {
             ("log_level", "DEBUG"),
             ("log_path", "logs"),
             ("save_image_path", ""),
+            ("image_settings", "1"),
             ("save_ref_image", "true"),
             ("intra_threads", "4"),
             ("default_model", "ipcam-general.onnx"),
@@ -1249,8 +1277,17 @@ mod tests {
         assert!(c.models[1].lazy);
         assert_eq!(c.default_model_index(), Some(1));
 
-        // Unchecked boxes are absent from the form; absent text fields keep their values.
-        apply_config_form(&mut c, &form(&[("default_model", "")])).unwrap();
+        // Unchecked boxes are absent from a form that shows them (marker fields); absent text
+        // fields keep their values.
+        apply_config_form(
+            &mut c,
+            &form(&[
+                ("default_model", ""),
+                ("inference_settings", "1"),
+                ("image_settings", "1"),
+            ]),
+        )
+        .unwrap();
         assert!(!c.force_cpu && !c.save_ref_image);
         assert_eq!(c.port, 4000);
         assert_eq!(c.default_model, None);

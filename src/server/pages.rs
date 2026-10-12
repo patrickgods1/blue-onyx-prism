@@ -728,8 +728,30 @@ mod tests {
         assert_eq!(cfg.matches("name=\"log_level\"").count(), 1);
         assert!(!cfg.contains("action=\"/config/loglevel\""));
         assert!(cfg.contains("<summary>Advanced: Models (JSON)</summary>"));
-        assert!(cfg.contains("nav class=\"toc\""));
+        assert!(cfg.contains("nav class=\"toc tabs\" role=\"tablist\""));
         assert!(cfg.contains("Local models (not in config)"));
+        // Tab panels and the deep-link anchors other pages and the README use.
+        for id in [
+            "tab-models",
+            "tab-resources",
+            "tab-server",
+            "at-models",
+            "at-server",
+            "at-restart",
+            "inference",
+            "logging",
+            "resources",
+            "local-models",
+            "custom-model",
+            "models-json",
+            "pending-box",
+        ] {
+            assert!(cfg.contains(&format!("id=\"{id}\"")), "missing #{id}");
+        }
+        // The models JSON has its own form; the Server form carries the checkbox markers.
+        assert!(cfg.contains("id=\"models-json-form\""));
+        assert!(cfg.contains("name=\"inference_settings\""));
+        assert!(cfg.contains("name=\"image_settings\""));
     }
 
     #[tokio::test]
@@ -838,7 +860,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert!(page.contains("id=\"logview\""));
         assert!(page.contains("<option value=\"info\" selected>info</option>"));
-        assert!(page.contains("class=\"active\">Logs</a>"));
+        assert!(page.contains("class=\"active\" aria-current=\"page\">Logs</a>"));
 
         let (s, body) = get_text(&state, "/logs.json").await;
         assert_eq!(s, StatusCode::OK);

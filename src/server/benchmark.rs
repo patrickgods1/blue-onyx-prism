@@ -1228,7 +1228,9 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(html.contains("<a href=\"/benchmark\" class=\"active\">Benchmark</a>"));
+        assert!(html.contains(
+            "<a href=\"/benchmark\" class=\"active\" aria-current=\"page\">Benchmark</a>"
+        ));
         assert!(
             html.contains("name=\"model\" value=\"ipcam-general\""),
             "{html}"
