@@ -2,10 +2,24 @@
 {% block title %}Benchmark{% endblock %}
 {% block content %}
 <h1>Benchmark</h1>
-<p class="muted">Runs each model on each device over the chosen datasets with the production pipeline (decode, preprocess, inference, postprocess), grades <strong>accuracy</strong> (AP@0.5, or the frame-level ROC AUC: how well a frame's top confidence separates frames with an object from frames without, which is Blue Iris's alert decision; against ground truth, or against a reference model where a dataset has none) and <strong>speed</strong> (full request p50), and checks that every device detects the same objects as the CPU. The recommended device of a model is its best-graded device whose detections agree with the CPU; within 5% of the best speed the configured device is kept. The same predictions are also scored at every confidence threshold (no extra inference) to find each model's <strong>best confidence threshold</strong> for the chosen objective. Speeds are per image, one at a time; the service pipelines decode, preprocessing and inference (and runs several inferences at once where the hardware profile allows), so its throughput is higher than 1000 / latency implies. Results: <code>{{ results_file }}</code> (the <code>benchmark</code> CLI writes the same file). JSON: <a href="/v1/benchmark"><code>/v1/benchmark</code></a>.</p>
+<p class="muted">Runs each model on each device over the chosen image sets with the production pipeline, grades <strong>accuracy</strong> and <strong>speed</strong>, and recommends a device and a confidence threshold per model. Results: <code>{{ results_file }}</code> &middot; JSON: <a href="/v1/benchmark"><code>/v1/benchmark</code></a>.</p>
+<details class="help"><summary>How grading works</summary>
+<p>Accuracy is AP@0.5, or the frame-level ROC AUC: how well a frame's top confidence separates frames with an object from frames without, which is Blue Iris's alert decision; against ground truth, or against a reference model where a dataset has none. Speed is the full request p50. Every device is checked to detect the same objects as the CPU. The recommended device of a model is its best-graded device whose detections agree with the CPU; within 5% of the best speed the configured device is kept. The same predictions are also scored at every confidence threshold (no extra inference) to find each model's best confidence threshold for the chosen objective. Speeds are per image, one at a time; the service pipelines decode, preprocessing and inference (and runs several inferences at once where the hardware profile allows), so its throughput is higher than 1000 / latency implies. The <code>benchmark</code> CLI writes the same results file.</p>
+</details>
 <p class="warn">{{ warning }}</p>
 {% if force_cpu %}<p class="warn">Force CPU is on: it overrides every per-model device until it is unchecked on the <a href="/config#inference">Config page</a>.</p>{% endif %}
 
+<nav class="toc tabs" role="tablist" aria-label="Sections">
+  <a role="tab" href="#tab-run">Run</a><a role="tab" href="#tab-results">Results</a><a role="tab" href="#tab-confidence">Confidence</a><a role="tab" href="#tab-models">Models</a>
+</nav>
+<div class="status-bar" id="status">
+  <div id="progress" hidden><progress id="bar" max="100"></progress> <span id="ptext" class="muted"></span> <button type="button" id="cancel" class="danger small" hidden>Cancel</button></div>
+  <p id="msg" class="muted" aria-live="polite"></p>
+  <p id="apply-msg" class="notice" hidden></p>
+  <ul id="warnings" class="warn-list"></ul>
+</div>
+
+<section class="panel" id="tab-run">
 <form id="bench-form" class="card primary" onsubmit="return false">
   <h2>Run</h2>
   <div class="bench-grid">
@@ -15,13 +29,13 @@
       <label class="check ds-{{ d.state }}">
         <input type="checkbox" name="dataset" value="{{ d.value }}"{% if d.checked && d.selectable %} checked{% endif %}{% if !d.selectable %} disabled{% endif %}>
         <span><strong>{{ d.title }}</strong> <span class="tag ds-state">{{ d.state_text }}</span><br><span class="muted">{{ d.detail }}</span>
-        {% if let Some(id) = d.download_id %}<br><button type="button" class="small" data-download="{{ id }}">Download</button>{% endif %}
+        {% if let Some(id) = d.download_id %}<br><button type="button" class="small secondary" data-download="{{ id }}">Download</button>{% endif %}
         {% if d.folder %} <button type="button" class="small danger" data-remove-folder="{{ d.value }}">Remove</button>{% endif %}</span>
       </label>
       {% endfor %}
       <label>Add a folder on the server (images, optional COCO JSON / YOLO labels / manifest.json)
         <input type="text" id="add-folder" placeholder="/path/to/BlueIris/Alerts"></label>
-      <p class="muted">Selected datasets that are not downloaded are fetched when the run starts (pinned, SHA-256 checked). A folder without ground truth is scored against the reference model.</p>
+      <details class="help"><summary>About datasets</summary><p>Selected datasets that are not downloaded are fetched when the run starts (pinned, SHA-256 checked). A folder without ground truth is scored against the reference model.</p></details>
     </fieldset>
     <fieldset>
       <legend>Models</legend>
@@ -55,22 +69,41 @@
         <select name="accuracy_metric">
           {% for m in accuracy_metrics %}<option value="{{ m.0 }}"{% if m.2 %} selected{% endif %}>{{ m.1 }}</option>{% endfor %}
         </select></label>
-      <p class="muted">Speed: {{ speed_thresholds }}. Accuracy score, AP50 (AP@0.5, 20% small-object recall when present): {{ accuracy_thresholds }}. ROC AUC (macro over classes, frame level; 0.5 is chance): {{ auc_thresholds }}.</p>
+      <details class="help"><summary>Grade thresholds</summary><p>Speed: {{ speed_thresholds }}. Accuracy score, AP50 (AP@0.5, 20% small-object recall when present): {{ accuracy_thresholds }}. ROC AUC (macro over classes, frame level; 0.5 is chance): {{ auc_thresholds }}.</p></details>
     </fieldset>
   </div>
   <div class="actions">
     <button type="button" id="start">Start benchmark</button>
-    <button type="button" id="cancel" class="danger" hidden>Cancel</button>
-    <button type="button" id="save-defaults">Save as default</button>
+    <button type="button" id="save-defaults" class="secondary">Save as default</button>
+    <span id="run-msg" class="muted" aria-live="polite"></span>
   </div>
-  <div id="progress" hidden><progress id="bar" max="100"></progress> <span id="ptext" class="muted"></span></div>
-  <p id="msg" class="muted" aria-live="polite"></p>
-  <ul id="warnings" class="warn-list"></ul>
 </form>
+</section>
+
+<section class="panel" id="tab-results">
+<section id="results">
+  <noscript><p class="muted">The results view needs JavaScript; see <a href="/v1/benchmark">/v1/benchmark</a>.</p></noscript>
+  <p id="no-results" class="empty" hidden>No results yet. Choose datasets, models and devices under <a href="#tab-run">Run</a> and start a benchmark.</p>
+  <div id="summary" class="cards"></div>
+  <div id="ranking"></div>
+  <div class="actions" id="apply-all-bar" hidden>
+    <button type="button" id="apply-all">Apply recommended devices to all models</button>
+    <span class="muted">Writes each model's <code>device</code> into the config; a restart loads them.</span>
+  </div>
+</section>
+</section>
+
+<section class="panel" id="tab-confidence">
+  <div id="thresholds"></div>
+  <div class="actions" id="apply-thr-bar" hidden>
+    <button type="button" id="apply-all-thr">Apply all thresholds</button>
+    <span class="muted">Writes each model's best threshold as its <code>confidence_threshold</code> in the config; a restart uses them. {{ blue_iris_note }}</span>
+  </div>
 
 <section class="card" id="search-card">
   <h2>Confidence search</h2>
-  <p class="muted">Finds the best confidence threshold from the predictions the last benchmark stored (<code>benchmark-preds.json</code>): every distinct confidence is evaluated exactly, no inference, so a search takes milliseconds. Filter by dataset, tag (e.g. <code>night</code>) and class, pick the objective, then apply the result. {{ blue_iris_note }}</p>
+  <p class="muted">Finds the best confidence threshold from the predictions the last benchmark stored: every distinct confidence is evaluated exactly, no inference, so a search takes milliseconds.</p>
+  <details class="help"><summary>How to use it</summary><p>Filter by dataset, tag (e.g. <code>night</code>) and class, pick the objective, then apply the result. Predictions come from <code>benchmark-preds.json</code>. {{ blue_iris_note }}</p></details>
   <p id="s-empty" class="muted" hidden></p>
   <form id="search-form" onsubmit="return false" hidden>
     <div class="bench-grid">
@@ -95,28 +128,17 @@
     <div class="actions">
       <button type="button" id="s-run">Search</button>
       <button type="button" id="s-apply-all" hidden>Apply all</button>
-      <button type="button" id="s-csv-copy" hidden>Copy as CSV</button>
-      <button type="button" id="s-csv-dl" hidden>Download CSV</button>
+      <button type="button" id="s-csv-copy" class="secondary" hidden>Copy as CSV</button>
+      <button type="button" id="s-csv-dl" class="secondary" hidden>Download CSV</button>
       <span id="s-msg" class="muted" aria-live="polite"></span>
     </div>
   </form>
   <div id="s-results"></div>
 </section>
+</section>
 
-<section id="results">
-  <noscript><p class="muted">The results view needs JavaScript; see <a href="/v1/benchmark">/v1/benchmark</a>.</p></noscript>
-  <div id="summary" class="cards"></div>
-  <div id="ranking"></div>
-  <div class="actions" id="apply-all-bar" hidden>
-    <button type="button" id="apply-all">Apply recommended devices to all models</button>
-    <span class="muted">Writes each model's <code>device</code> into the config; a restart loads them.</span>
-  </div>
-  <p id="apply-msg" class="notice" hidden></p>
-  <div id="thresholds"></div>
-  <div class="actions" id="apply-thr-bar" hidden>
-    <button type="button" id="apply-all-thr">Apply all thresholds</button>
-    <span class="muted">Writes each model's best threshold as its <code>confidence_threshold</code> in the config; a restart uses them. {{ blue_iris_note }}</span>
-  </div>
+<section class="panel" id="tab-models">
+  <p id="no-models" class="empty" hidden>No per-model results yet.</p>
   <div id="models"></div>
 </section>
 
@@ -148,41 +170,60 @@
     if (extra) Object.keys(extra).forEach(function (k) { b.append(k, extra[k]); });
     return b;
   }
+  var runMsg = $("run-msg");
   $("start").addEventListener("click", function () {
-    msg.textContent = "starting…";
-    post("/v1/benchmark", formBody()).then(function (j) { msg.textContent = j.message; if (j.success) poll(); });
+    msg.textContent = "starting…"; runMsg.textContent = "";
+    post("/v1/benchmark", formBody()).then(function (j) { msg.textContent = j.message; if (j.success) poll(); else runMsg.textContent = j.message; });
   });
   $("cancel").addEventListener("click", function () { post("/v1/benchmark/cancel", "").then(function (j) { msg.textContent = j.message; }); });
   $("save-defaults").addEventListener("click", function () {
     var b = formBody(); b.delete("dataset");
     form.querySelectorAll("input[name=dataset]:checked").forEach(function (c) { b.append("dataset", c.value); });
     var f = $("add-folder").value.trim(); if (f) b.append("add_folder", f);
-    post("/v1/benchmark/settings", b).then(function (j) { msg.textContent = j.message; if (j.success && f) location.reload(); });
+    post("/v1/benchmark/settings", b).then(function (j) { runMsg.textContent = j.message; if (j.success && f) L.reloadKeep(); });
   });
   form.querySelectorAll("[data-download]").forEach(function (b) {
     b.addEventListener("click", function () {
-      var body = new URLSearchParams({id: b.dataset.download});
-      post("/v1/resources/download", body).then(function (j) { msg.textContent = j.message; setTimeout(function () { location.reload(); }, 3000); });
+      var id = b.dataset.download, body = new URLSearchParams({id: id});
+      b.disabled = true;
+      post("/v1/resources/download", body).then(function (j) {
+        runMsg.textContent = j.message;
+        if (!j.success) { b.disabled = false; return; }
+        // Follow the download in the dataset's state text, then reload in place once it is done.
+        var row = b.closest("label"), state = row && row.querySelector(".ds-state");
+        (function tick() {
+          fetch("/v1/resources", {cache: "no-store"}).then(function (r) { return r.json(); }).then(function (j2) {
+            var r = (j2.resources || []).find(function (x) { return x.id === id; });
+            if (r && state) state.textContent = r.state_text;
+            if (r && r.busy) setTimeout(tick, 1500); else L.reloadKeep();
+          }).catch(function () { setTimeout(tick, 3000); });
+        })();
+      });
     });
   });
   form.querySelectorAll("[data-remove-folder]").forEach(function (b) {
     b.addEventListener("click", function () {
       var v = b.dataset.removeFolder, body = formBody(); body.delete("dataset");
       form.querySelectorAll("input[name=dataset]:checked").forEach(function (c) { if (c.value !== v) body.append("dataset", c.value); });
-      post("/v1/benchmark/settings", body).then(function (j) { msg.textContent = j.message; if (j.success) location.reload(); });
+      post("/v1/benchmark/settings", body).then(function (j) { runMsg.textContent = j.message; if (j.success) L.reloadKeep(); });
     });
   });
 
   // Sortable tables: click a header; numeric when the cell has data-v. The sort survives
   // re-renders (PrismLive.keep / patch carry it over by the table's key).
-  var L = window.PrismLive;
+  var L = window.PrismLive, T = L && L.tabs(document.querySelector("nav.tabs"));
   function sortable(table) {
     table.querySelectorAll("th").forEach(function (th, i) {
-      th.classList.add("sortable");
-      th.addEventListener("click", function () { L.sortTable(table, i, th.dataset.dir !== "asc"); });
+      th.classList.add("sortable"); th.tabIndex = 0; th.setAttribute("role", "button");
+      if (th.textContent) th.title = "Sort by " + th.textContent;
+      var sort = function () { L.sortTable(table, i, th.dataset.dir !== "asc"); };
+      th.addEventListener("click", sort);
+      th.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sort(); } });
     });
     return table;
   }
+  // "12 Oct 2026, 16:53" in the browser's time zone (results store RFC 3339 UTC).
+  function when(ts) { var d = ts ? new Date(ts) : null; return d && !isNaN(d) ? d.toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : (ts || ""); }
   function table(cls, head) {
     var t = el("table", "bench " + (cls || "")), tr = el("tr"); var th = el("thead");
     head.forEach(function (h) { tr.appendChild(el("th", null, h)); }); th.appendChild(tr); t.appendChild(th); t.appendChild(el("tbody")); return t;
@@ -425,12 +466,26 @@
     }
     return box;
   }
+  // Columns hidden until "More columns" (the table keeps them for sorting and copying).
+  var thrExpanded = false;
+  function markExtra(t, idx) {
+    var rows = [t.tHead.rows[0]].concat(Array.prototype.slice.call(t.tBodies[0].rows));
+    rows.forEach(function (r) { idx.forEach(function (i) { if (r.cells[i]) r.cells[i].classList.add("extra"); }); });
+    t.classList.toggle("compact", !thrExpanded);
+    return t;
+  }
+  function moreColumns(t, extraLabel) {
+    var tools = el("div", "table-tools"), b = el("button", "small secondary", thrExpanded ? "Fewer columns" : "More columns"); b.type = "button";
+    b.addEventListener("click", function () { thrExpanded = !thrExpanded; t.classList.toggle("compact", !thrExpanded); b.textContent = thrExpanded ? "Fewer columns" : "More columns"; });
+    tools.appendChild(b); tools.appendChild(el("span", "muted", extraLabel)); return tools;
+  }
   function renderThresholds(models) {
     var box = $("thresholds"); box.replaceChildren();
     var rows = models.filter(function (m) { return m.threshold; });
-    if (!rows.length) return;
+    if (!rows.length) { box.appendChild(el("h2", null, "Best confidence threshold")); box.appendChild(el("p", "empty", "No threshold results yet: a benchmark with ground truth (or a reference model) fills this table.")); return; }
     box.appendChild(el("h2", null, "Best confidence threshold"));
-    box.appendChild(el("p", "muted", "Exact best threshold per model on its recommended device (middle of the widest near-optimal range, rounded down to 0.01), compared with the threshold configured now (P / R / F1 there are exact, from the stored predictions). F2 favors recall; precision:0.9 limits false alerts; youden maximizes the frame alert rate minus the frame false-alert rate. Frame TPR / FPR: alert rate on frames with an object / on frames without one (a frame alerts when its top confidence reaches the threshold). Blue Iris may send its own min_confidence per request (it then replaces the server threshold) and each camera's minimum confidence filters again."));
+    box.appendChild(el("p", "muted", "Exact best threshold per model on its recommended device, compared with the threshold configured now. Gain is the objective's value at the best minus at the configured threshold."));
+    box.appendChild(el("details", "help")); var hd = box.lastChild; hd.appendChild(el("summary", null, "How to read it")); hd.appendChild(el("p", null, "The best threshold is the middle of the widest near-optimal range, rounded down to 0.01; P / R / F1 at the configured threshold are exact, from the stored predictions. F2 favors recall; precision:0.9 limits false alerts; youden maximizes the frame alert rate minus the frame false-alert rate. Frame TPR / FPR: alert rate on frames with an object / on frames without one (a frame alerts when its top confidence reaches the threshold). Blue Iris may send its own min_confidence per request (it then replaces the server threshold) and each camera's minimum confidence filters again."));
     var t = sortable(table("", ["Model", "Objective", "Now", "P", "R", "F1", "Best", "P", "R", "F1", "Gain", "F2 pick", "P≥90% pick", "Youden pick", "ROC AUC", "TPR / FPR now", "TPR / FPR best", ""]));
     rows.forEach(function (m) {
       var a = m.threshold, b = a.best, tr = el("tr"), n = nowOf(a), np = n.point;
@@ -455,6 +510,8 @@
       tr.appendChild(act);
       t.tBodies[0].appendChild(tr);
     });
+    markExtra(t, [3, 4, 5, 7, 8, 9, 11, 12, 13, 15, 16]);
+    box.appendChild(moreColumns(t, "precision / recall / F1 at both thresholds, the F2, P≥90% and Youden picks, frame TPR / FPR"));
     box.appendChild(wrap(t, "thr"));
   }
   $("apply-all").addEventListener("click", function () {
@@ -726,23 +783,35 @@
   }
   // One card per model, patched in place: only cards whose data changed are rebuilt (keeping
   // their scroll offsets, open <details> and sort order).
+  // One collapsible card per model. The first card (or the one the URL names) starts open; a
+  // rebuilt card keeps its open state.
   function renderModels(models, cfg) {
     var box = $("models");
+    $("no-models").hidden = models.length > 0;
     var cfgByName = {}; (cfg.models || []).forEach(function (c) { cfgByName[c.name.toLowerCase()] = c; });
-    L.patch(box, models.map(function (m) {
-      var c = cfgByName[m.model.toLowerCase()] || {};
-      return {key: m.model.toLowerCase(), sig: JSON.stringify([m, c, cfg.globalLabel]), build: function () { return modelCard(m, c, cfg); }};
+    var hashId = location.hash.slice(1), named = models.some(function (m) { return "m-" + encodeURIComponent(m.model) === hashId; });
+    L.patch(box, models.map(function (m, i) {
+      var c = cfgByName[m.model.toLowerCase()] || {}, id = "m-" + encodeURIComponent(m.model);
+      var was = document.getElementById(id), open = was ? was.open : (named ? id === hashId : i === 0);
+      return {key: m.model.toLowerCase(), sig: JSON.stringify([m, c, cfg.globalLabel]), build: function () { var d = modelCard(m, c, cfg); d.open = open; return d; }};
     }));
-    if (location.hash && !box.dataset.scrolled) { var t2 = document.getElementById(location.hash.slice(1)); if (t2) { t2.scrollIntoView(); box.dataset.scrolled = "1"; } }
+    if (location.hash && !box.dataset.scrolled) { var t2 = document.getElementById(hashId); if (t2) { if (t2.tagName === "DETAILS") t2.open = true; t2.scrollIntoView(); box.dataset.scrolled = "1"; } }
   }
   function modelCard(m, c, cfg) {
-    var card = el("section", "card"), key = m.model.toLowerCase(); card.id = "m-" + encodeURIComponent(m.model);
+    var det2 = el("details", "card model"), key = m.model.toLowerCase(); det2.id = "m-" + encodeURIComponent(m.model);
+    var card = el("div", "body");
     // The device the config resolves to now (not when the benchmark ran) and the loaded one.
     var configured = c.configuredDevice || m.configured, running = c.runningDevice;
-    var h = el("h2", null, m.model + " "); h.appendChild(el("span", "muted small", (m.datasets || []).join(", ") + " · " + (m.images || 0) + " images · " + m.timestamp));
-    card.appendChild(h);
+    var sum = el("summary"), rr0 = recRun(m);
+    sum.appendChild(el("span", "mname", m.model));
+    if (rr0 && rr0.grades) { sum.appendChild(gradeEl(rr0.grades.overall)); sum.appendChild(el("span", "muted", (m.recommended || "-") + " · " + ms(rr0.grades.p50_ms) + " ms")); }
+    else if (m.error) sum.appendChild(el("span", "error-text", "failed"));
+    else sum.appendChild(el("span", "muted", m.recommended || m.recommendation || "running…"));
+    if (c.restartNeeded) { var rb = el("span", "tag restart", "restart needed"); rb.title = (c.pending || []).join("; "); sum.appendChild(rb); }
+    sum.appendChild(el("span", "muted", (m.datasets || []).join(", ") + " · " + (m.images || 0) + " image" + (m.images === 1 ? "" : "s") + " · " + when(m.timestamp)));
+    det2.appendChild(sum); det2.appendChild(card);
     card.appendChild(el("p", "muted cfg-line", "Configured: " + (c.device ? c.device : "global (" + cfg.globalLabel + ")") + (configured ? " · resolves to " + configured : "") + (c.provider ? " · now: " + c.provider : "") + (c.restartNeeded ? " · restart needed (" + c.pending.join("; ") + ")" : "")));
-    if (m.error) { card.appendChild(el("p", "error", m.error)); return card; }
+    if (m.error) { card.appendChild(el("p", "error", m.error)); return det2; }
     card.appendChild(el("p", m.recommended ? "notice" : "warn", m.recommended ? "Recommended: " + m.recommended + " — " + m.recommendation : "No recommendation: " + m.recommendation));
     var t = sortable(table("devices", ["Device", "Load ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "req/s", "AP50", "AP50-95", "ROC AUC", "P", "R", "Grade", "Agreement", ""]));
     var okRuns = m.devices.filter(function (d) { return d.run && !d.run.fell_back; });
@@ -777,8 +846,13 @@
     if (m.skipped && m.skipped.length) card.appendChild(el("p", "muted", "Not runnable here: " + m.skipped.join("; ")));
     card.appendChild(thresholdBlock(m));
     var rr = recRun(m) || (fastest && fastest.run); if (rr) card.appendChild(details(key, rr));
-    return card;
+    return det2;
   }
+  // A link to #m-<model> (summary cards, the Config page) opens that model's card.
+  window.addEventListener("hashchange", function () {
+    var t2 = document.getElementById(location.hash.slice(1));
+    if (t2 && t2.tagName === "DETAILS" && t2.classList.contains("model")) { t2.open = true; t2.scrollIntoView(); }
+  });
 
   // Drill-down: draw ground truth and predictions on each image.
   var drillData = null;
@@ -815,9 +889,12 @@
 
   // Each section re-renders only when its data changed, keeping the user's scroll offsets,
   // open <details>, sort order and focus (PrismLive.keep / patch); progress updates in place.
+  var firstRender = true;
   function render(j) {
     var models = merged(j), sm = JSON.stringify(models), sc = JSON.stringify(j.config);
     lastConfig = j.config;
+    $("no-results").hidden = models.length > 0 || j.running;
+    if (firstRender) { firstRender = false; if (T && !location.hash) T.show(models.length ? "tab-results" : "tab-run"); else if (T && location.hash) renderModels(models, j.config), T.show(location.hash.slice(1)); }
     L.keep($("summary"), sm, function () { renderSummary(models); });
     L.keep($("ranking"), JSON.stringify(j.ranking), function () { renderRanking(j.ranking); });
     L.keep($("thresholds"), sm + sc, function () { renderThresholds(models); });

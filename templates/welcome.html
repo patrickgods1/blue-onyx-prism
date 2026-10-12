@@ -4,12 +4,12 @@
 <h1>Blue Onyx Prism {{ version }}</h1>
 <p id="update-hint" class="notice" hidden></p>
 <section class="facts">
-  <div><span class="k">In use</span> <span class="v">{{ in_use }}</span></div>
-  <div><span class="k">Auto picks</span> <span class="v">{{ auto_pick }}</span></div>
+  <div><span class="k">Running on</span> <span class="v">{{ in_use }}</span></div>
+  <div><span class="k">Auto device</span> <span class="v">{{ auto_pick }}</span></div>
   <div><span class="k">Hardware profile</span> <span class="v">{{ profile }}</span></div>
   <div><span class="k">OpenVINO</span> <span class="v">{{ openvino_version }}</span></div>
   <div><span class="k">ONNX Runtime</span> <span class="v">{{ onnxruntime }}</span></div>
-  <div><span class="k">OpenVINO can use</span> <span class="v">{{ devices }}</span></div>
+  <div><span class="k">OpenVINO devices</span> <span class="v">{{ devices }}</span></div>
   <div><span class="k">GPUs</span> <span class="v">{% if gpus.is_empty() %}none detected{% else %}{% for g in gpus %}{% if !loop.first %}; {% endif %}{{ g }}{% endfor %}{% endif %}</span></div>
   <div><span class="k">Uptime</span> <span class="v">{{ uptime }}</span></div>
 </section>

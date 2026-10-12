@@ -88,6 +88,8 @@ impl ConfigView {
         for &key in FORM_FIELDS {
             let v = form.get(key).cloned();
             match key {
+                "force_cpu" if !form.contains_key("inference_settings") => {}
+                "save_ref_image" if !form.contains_key("image_settings") => {}
                 "force_cpu" => self.force_cpu = v.is_some(),
                 "save_ref_image" => self.save_ref_image = v.is_some(),
                 "auto_download" | "allow_large_downloads"
@@ -132,6 +134,8 @@ struct ModelSelectRow {
     key: String,
     family: String,
     path: String,
+    /// The last path component, shown in the table (the full path is its tooltip).
+    file_name: String,
     /// The model file exists (resolved against the exe dir).
     exists: bool,
     enabled: bool,
@@ -284,6 +288,11 @@ fn model_choices(
                 key,
                 family: m.family.to_string(),
                 path: m.path.display().to_string(),
+                file_name: m
+                    .path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| m.path.display().to_string()),
                 exists,
                 needs_export,
                 enabled: m.enabled,
@@ -461,26 +470,38 @@ pub(super) fn config_template(
     let bench_summary = {
         let b = &cfg.benchmark;
         let datasets: Vec<String> = b.datasets.iter().map(|d| d.label()).collect();
+        let plural = |n: usize, one: &str, many: &str| {
+            if n == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{n} {many}")
+            }
+        };
         let last = match (*bench).as_ref() {
-            Some(r) => format!(
-                " Last results: {} model(s), updated {}.",
-                r.count, r.timestamp
-            ),
-            None => " No results yet.".to_string(),
+            Some(r) => {
+                let when = chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+                    .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|_| r.timestamp.clone());
+                format!(
+                    "Last benchmark: {}, {when}.",
+                    plural(r.count, "model", "models")
+                )
+            }
+            None => "No benchmark results yet.".to_string(),
+        };
+        let images = if b.max_images_per_dataset == 0 {
+            "all images".to_string()
+        } else {
+            plural(b.max_images_per_dataset, "image", "images")
         };
         format!(
-            "Datasets: {}; {} image(s) per dataset; {} timed run(s) per image; grades weigh accuracy {:.0}%.{last}",
+            "{last} Defaults: {}; {images} per dataset; {} per image; accuracy is {:.0}% of the grade.",
             if datasets.is_empty() {
-                "none".to_string()
+                "no datasets".to_string()
             } else {
                 datasets.join(", ")
             },
-            if b.max_images_per_dataset == 0 {
-                "all".to_string()
-            } else {
-                b.max_images_per_dataset.to_string()
-            },
-            b.repeat_per_image,
+            plural(b.repeat_per_image, "timed run", "timed runs"),
             b.weights.accuracy_share() * 100.0
         )
     };
@@ -972,7 +993,7 @@ mod tests {
         let models =
             r#"[{"name":"ipcam-general","path":"models/ipcam-general.onnx","family":"yolo5"}]"#;
         let good = format!(
-            "port=4000&request_timeout_secs=20&device=CPU&force_cpu=on&confidence_threshold=0.4\
+            "port=4000&request_timeout_secs=20&device=CPU&inference_settings=1&force_cpu=on&confidence_threshold=0.4\
              &object_filter={}&log_level=info&default_model=ipcam-general&models_json={}",
             urlencode("person, car"),
             urlencode(models)

@@ -186,8 +186,13 @@ pub(super) fn running_view(state: &AppState, name: &str) -> RunningView {
             Some(t) => format!("{provider} \u{b7} threshold {t:.2}"),
             None => provider.clone(),
         },
+        // The provider label already ends in "(loading)" while the model compiles; the state
+        // and its detail say the same, once.
         _ => match &detail {
-            Some(d) => format!("{provider} \u{b7} {st}: {d}"),
+            Some(d) => format!(
+                "{} \u{b7} {st}: {d}",
+                provider.trim_end_matches(" (loading)")
+            ),
             None => provider.clone(),
         },
     };
