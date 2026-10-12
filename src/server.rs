@@ -434,6 +434,45 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
 
+    /// Answers given before the image is used (unknown model, no usable default model) still
+    /// read the upload: otherwise hyper closes the connection, and a client that pooled it
+    /// (Blue Iris, reqwest) fails its next request (WSAECONNABORTED on Windows, a reset or
+    /// broken pipe elsewhere).
+    #[tokio::test]
+    async fn early_answers_keep_the_connection_usable() {
+        let listeners = bind([127, 0, 0, 1].into(), 0).await.unwrap();
+        let port = listeners.v4.local_addr().unwrap().port();
+        let token = CancellationToken::new();
+        let server = tokio::spawn(serve_on(listeners, test_state().into(), token.clone()));
+        // One pooled connection: every request reuses the one the previous answer left behind.
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(1)
+            .build()
+            .unwrap();
+        for i in 0..6 {
+            let path = if i % 2 == 0 {
+                "v1/vision/custom/no-such-model"
+            } else {
+                "v1/vision/detection"
+            };
+            let part = reqwest::multipart::Part::bytes(vec![0u8; 8 << 20])
+                .file_name("big.jpg")
+                .mime_str("image/jpeg")
+                .unwrap();
+            let form = reqwest::multipart::Form::new().part("image", part);
+            let resp = client
+                .post(format!("http://127.0.0.1:{port}/{path}"))
+                .multipart(form)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("request {i} ({path}): {e:?}"));
+            let r: VisionDetectionResponse = resp.json().await.unwrap();
+            assert!(!r.success, "{r:?}");
+        }
+        token.cancel();
+        server.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn shared_swap_serves_the_new_generation() {
         let a = test_state();

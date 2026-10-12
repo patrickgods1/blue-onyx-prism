@@ -83,12 +83,14 @@ pub(super) async fn detection_default(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Json<VisionDetectionResponse> {
     let start = Instant::now();
+    // Read the upload before any early answer: an unread body makes hyper close the
+    // connection, which breaks the client's next request on it.
+    let req = parse_detection_body(multipart).await.map(|(r, _)| r);
     let Some(handle) = state.registry.default_model() else {
         return Json(VisionDetectionResponse::error(
             "No default model: enable a model on the Config page",
         ));
     };
-    let req = parse_detection_body(multipart).await.map(|(r, _)| r);
     Json(run_detection(&state, &handle, req, start, "detect").await)
 }
 
@@ -98,13 +100,14 @@ pub(super) async fn detection_custom(
     multipart: Result<Multipart, MultipartRejection>,
 ) -> Json<VisionDetectionResponse> {
     let start = Instant::now();
+    // Read the upload first, as in [`detection_default`].
+    let req = parse_detection_body(multipart).await.map(|(r, _)| r);
     let Some(handle) = state.registry.by_name(&model) else {
         warn!("request for unknown model '{model}'");
         let mut r = VisionDetectionResponse::error(format!("Unknown model '{model}'"));
         r.command = "custom".into();
         return Json(r);
     };
-    let req = parse_detection_body(multipart).await.map(|(r, _)| r);
     Json(run_detection(&state, &handle, req, start, "custom").await)
 }
 
