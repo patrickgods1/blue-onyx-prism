@@ -32,10 +32,9 @@ jobs:
       - name: Build (OpenVINO only)
         if: matrix.os == 'ubuntu-latest'
         run: cargo build --locked --no-default-features
+      # Fixture-dependent tests are #[ignore]d here; they run in "Integration tests (real models)".
       - name: Unit tests (no OpenVINO needed)
         run: cargo test --locked
-        env:
-          BLUE_ONYX_SKIP_OPENVINO_TESTS: "1"
       - name: Build release (all binaries)
         run: cargo build --locked --release --bins
       - name: Fetch OpenVINO runtime
@@ -56,6 +55,16 @@ jobs:
             --cache-dir target/release/cache
       - name: Fetch ONNX Runtime (CPU)
         run: cargo run --locked --release -- setup-onnxruntime --flavor cpu --dir target/release/onnxruntime
+      - name: Download IPcam-general
+        run: cargo run --locked --release -- download-models --name IPcam-general --dir target/release/models
+      # The ignored tests need models/, openvino/ and onnxruntime/ (flat, as `--dir` installs it) under
+      # BLUE_ONYX_TEST_ROOT, which is where the steps above installed them. A missing fixture fails
+      # the test. They run on the debug test binaries (reusing the cargo cache); the runtime is found
+      # through the root, not through the binary's location.
+      - name: Integration tests (real models)
+        run: cargo test --locked -- --ignored --test-threads=1
+        env:
+          BLUE_ONYX_TEST_ROOT: ${{ github.workspace }}/target/release
       - name: Smoke test (ONNX Runtime CPU)
         shell: bash
         run: |

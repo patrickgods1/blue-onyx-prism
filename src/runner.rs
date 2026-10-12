@@ -82,6 +82,15 @@ pub fn run_server_on(
 /// How long a retired generation's in-flight requests may take before its workers are stopped.
 const DRAIN: Duration = Duration::from_secs(5);
 
+/// How long shutdown waits for the HTTP side to let go of the last generation's state after
+/// the server task has returned. The server task can return a moment before every connection
+/// task has dropped its copy of the router (axum 0.8 releases a connection's "still open" guard
+/// before dropping the connection and the service it owns), so the state, and through it the
+/// registry, can be shared for a few more microseconds; without this wait `finish` would skip
+/// `ModelRegistry::shutdown` (no worker join) whenever it lost that race. Normally the wait
+/// ends at once.
+const SHUTDOWN_LINGER: Duration = Duration::from_secs(1);
+
 /// A generation that is (or was) current: what has to be stopped once it is replaced.
 struct Generation {
     state: Arc<AppState>,
@@ -125,6 +134,207 @@ impl Generation {
     }
 }
 
+/// What lives for the whole run (every generation shares it).
+struct Process {
+    started: Instant,
+    config_path: PathBuf,
+    log: LogReloadHandle,
+    provisioner: Arc<Provisioner>,
+    /// The address bound at process start (a changed port or address shows as pending until
+    /// the process restarts).
+    bound_address: std::net::IpAddr,
+    bound_port: u16,
+    /// One benchmark runner for the process, so its last results survive a restart.
+    benchmark: Arc<crate::benchmark::service::BenchmarkService>,
+    /// The live config (revision, change log) is shared by every generation; a restart that
+    /// reloads the file (or restores the previous config) adopts it as a logged change.
+    store: Arc<crate::config_store::ConfigStore>,
+    /// Process-lifetime metrics: counters and histograms survive generation restarts.
+    metrics: Arc<Metrics>,
+}
+
+impl Process {
+    /// Start the registry of a generation (models compile in the background).
+    fn start_registry(
+        &self,
+        config: &Config,
+        workers: &CancellationToken,
+        provision: &Arc<Provision>,
+    ) -> Result<ModelRegistry> {
+        ModelRegistry::start_with_benchmark(
+            config,
+            &self.metrics,
+            workers.clone(),
+            Some(provision),
+            Some(&crate::benchmark::results_path(&self.config_path)),
+        )
+    }
+
+    /// The `AppState` of a generation running `config` on `registry`.
+    fn state_for(
+        &self,
+        config: &Config,
+        registry: &Arc<ModelRegistry>,
+        provision: &Arc<Provision>,
+        generation: &CancellationToken,
+        loaded_ort: Option<crate::resources::catalog::Flavor>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            registry: registry.clone(),
+            metrics: self.metrics.clone(),
+            config: self.store.clone(),
+            running: arc_swap::ArcSwap::from_pointee({
+                let mut c = config.clone();
+                c.normalize();
+                // What is running is the address bound at process start (a changed port or
+                // address shows as pending until the process restarts).
+                c.port = self.bound_port;
+                c.bind_address = self.bound_address;
+                c
+            }),
+            apply_lock: std::sync::Mutex::new(()),
+            applied_revision: std::sync::atomic::AtomicU64::new(0),
+            started: self.started,
+            config_path: self.config_path.clone(),
+            log_reload: Some(self.log.clone()),
+            restart: generation.clone(),
+            resources: Some(crate::resources::status::ResourcesCtx {
+                provisioner: self.provisioner.clone(),
+                provision: provision.clone(),
+                openvino_loaded: registry.runtimes().is_some_and(|rt| {
+                    rt.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .openvino()
+                        .is_some()
+                }),
+                ort_loaded: loaded_ort,
+            }),
+            benchmark: self.benchmark.clone(),
+        })
+    }
+
+    /// The config of the next generation after `POST /config/restart`: the config file again,
+    /// or `current` when it cannot be read or has no models. Applies a changed log level and
+    /// warns about the fields that need a process restart.
+    fn reload_config(&self, current: &Config) -> Config {
+        info!(config = %self.config_path.display(), "restarting: reloading the config file");
+        let next = match Config::load(&self.config_path) {
+            Ok(c) if !c.models.is_empty() => c,
+            Ok(_) => {
+                warn!("reloaded config has no models; keeping the current config");
+                current.clone()
+            }
+            Err(e) => {
+                warn!("{e:#}; keeping the current config");
+                current.clone()
+            }
+        };
+        if next.log_level != current.log_level
+            && let Err(e) = self.log.set_level(next.log_level)
+        {
+            warn!("{e:#}");
+        }
+        if next.log_path != current.log_path {
+            warn!("log_path changes take effect after the process is restarted");
+        }
+        if (next.port, next.bind_address) != (current.port, current.bind_address) {
+            warn!(
+                port = next.port,
+                bind_address = %next.bind_address,
+                "port and bind_address changes take effect after the process is restarted"
+            );
+        }
+        next
+    }
+}
+
+/// The HTTP side of a run: the listener (until the server starts), the server task, the
+/// swappable current state, and the generation being replaced.
+struct Run<'r> {
+    rt: &'r tokio::runtime::Runtime,
+    /// Bound once; taken when the server starts (it survives generation restarts).
+    listeners: Option<server::Listeners>,
+    /// Stops the HTTP server: on `shutdown`, or when the loop gives up.
+    server_stop: CancellationToken,
+    server_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    shared: Option<server::Shared>,
+    /// The generation being replaced (still current until the next one is swapped in), or, on
+    /// the way out, the last one.
+    old: Option<Generation>,
+}
+
+impl Run<'_> {
+    /// Make `state` current: swap it into the running server, or start the server with it.
+    fn serve(&mut self, state: Arc<AppState>) {
+        match &self.shared {
+            Some(sh) => {
+                drop(sh.swap(state));
+                info!("new generation is serving");
+            }
+            None => {
+                let sh = server::Shared::new(state);
+                let listeners = self.listeners.take().expect("listeners are used once");
+                self.server_task = Some(self.rt.spawn(server::serve_on(
+                    listeners,
+                    sh.clone(),
+                    self.server_stop.clone(),
+                )));
+                self.shared = Some(sh);
+            }
+        }
+    }
+
+    /// The replaced generation: in-flight requests finish (up to `DRAIN`), then its workers
+    /// stop.
+    fn retire_old(&mut self) {
+        if let Some(g) = self.old.take() {
+            g.retire(DRAIN);
+        }
+    }
+
+    /// Serve until a restart (None: `generation` was cancelled) or the server task ending
+    /// (Some: its result; the task is gone afterwards).
+    fn serve_until_event(&mut self, generation: &CancellationToken) -> Option<Result<()>> {
+        let task = self.server_task.as_mut().expect("server task is running");
+        let ended = self.rt.block_on(async {
+            tokio::select! {
+                biased;
+                _ = generation.cancelled() => None,
+                r = task => Some(r.unwrap_or_else(|e| Err(anyhow::anyhow!("HTTP server task: {e}")))),
+            }
+        });
+        if ended.is_some() {
+            // A finished `JoinHandle` must not be awaited again.
+            self.server_task = None;
+        }
+        ended
+    }
+
+    /// Stop the server and the last generation, and return `result`.
+    fn finish(self, result: Result<()>) -> Result<()> {
+        let Run {
+            rt,
+            server_stop,
+            server_task,
+            shared,
+            old,
+            ..
+        } = self;
+        server_stop.cancel();
+        let served = server_task.map(|t| {
+            rt.block_on(t)
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("HTTP server task: {e}")))
+        });
+        // The server (and its router) is gone; this was the last long-lived other holder of the
+        // state (connection tasks may still be dropping theirs, see `SHUTDOWN_LINGER`).
+        drop(shared);
+        if let Some(g) = old {
+            g.retire(SHUTDOWN_LINGER);
+        }
+        result.and(served.unwrap_or(Ok(())))
+    }
+}
+
 /// [`run_server_on`] with a given [`Provisioner`] (tests inject catalog entries through it).
 pub fn run_server_with(
     rt: &tokio::runtime::Runtime,
@@ -140,53 +350,37 @@ pub fn run_server_with(
     // The listener is bound once and survives generation restarts (a port change in the config
     // applies when the process restarts).
     let listeners = rt.block_on(server::bind(config.bind_address, config.port))?;
-    let (bound_address, bound_port) = (config.bind_address, listeners.port());
-    let mut listeners = Some(listeners);
-    // Stops the HTTP server: on `shutdown`, or when the loop gives up.
-    let server_stop = shutdown.child_token();
-    let mut shared: Option<server::Shared> = None;
-    let mut server_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
-    // The generation being replaced (still current until the next one is swapped in).
-    let mut old: Option<Generation> = None;
-    // Stop the server and the last generation, and return `result`.
-    let finish = |server_task: Option<tokio::task::JoinHandle<Result<()>>>,
-                  shared: Option<server::Shared>,
-                  old: Option<Generation>,
-                  result: Result<()>|
-     -> Result<()> {
-        server_stop.cancel();
-        let served = server_task.map(|t| {
-            rt.block_on(t)
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("HTTP server task: {e}")))
-        });
-        // The server (and its router) is gone; this was the last other holder of the state.
-        drop(shared);
-        if let Some(g) = old {
-            g.retire(Duration::ZERO);
-        }
-        result.and(served.unwrap_or(Ok(())))
+    let process = Process {
+        started,
+        bound_address: config.bind_address,
+        bound_port: listeners.port(),
+        store: Arc::new(crate::config_store::ConfigStore::new(
+            config.clone(),
+            config_path.clone(),
+        )),
+        config_path,
+        log,
+        provisioner,
+        benchmark: crate::benchmark::service::BenchmarkService::new(),
+        metrics: Arc::new(Metrics::new(crate::VERSION)),
+    };
+    let mut run = Run {
+        rt,
+        listeners: Some(listeners),
+        server_stop: shutdown.child_token(),
+        server_task: None,
+        shared: None,
+        old: None,
     };
     // Config to fall back to when a restart with the edited config fails to start.
     let mut previous: Option<Config> = None;
     // ONNX Runtime flavor loaded by an earlier generation (fixed for the process).
     let mut loaded_ort: Option<crate::resources::catalog::Flavor> = None;
-    // One benchmark runner for the process, so its last results survive a restart.
-    let benchmark = crate::benchmark::service::BenchmarkService::new();
-    // The live config (revision, change log) is shared by every generation; a restart that
-    // reloads the file (or restores the previous config) adopts it as a logged change.
-    let store = Arc::new(crate::config_store::ConfigStore::new(
-        config.clone(),
-        config_path.clone(),
-    ));
     let mut adopt: Option<&'static str> = None;
     let mut first = true;
-    // Process-lifetime metrics: counters and histograms survive generation restarts.
-    let metrics = Arc::new(Metrics::new(crate::VERSION));
     loop {
         if !first {
-            metrics
-                .restarts
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            process.metrics.restarts.fetch_add(1, Ordering::Relaxed);
         }
         // One generation = one registry + one `AppState`, served through `shared`.
         // `POST /config/restart` (or an installed runtime) cancels the generation token; the
@@ -194,14 +388,8 @@ pub fn run_server_with(
         // old workers stop once its requests have drained. Cancelling `shutdown` stops all.
         let generation = shutdown.child_token();
         let workers = shutdown.child_token();
-        let provision = Arc::new(provisioner.prepare(&config, loaded_ort));
-        let registry = match ModelRegistry::start_with_benchmark(
-            &config,
-            &metrics,
-            workers.clone(),
-            Some(&provision),
-            Some(&crate::benchmark::results_path(&config_path)),
-        ) {
+        let provision = Arc::new(process.provisioner.prepare(&config, loaded_ort));
+        let registry = match process.start_registry(&config, &workers, &provision) {
             Ok(r) => Arc::new(r),
             Err(e) => match previous.take() {
                 Some(prev) => {
@@ -213,45 +401,14 @@ pub fn run_server_with(
                     adopt = Some("restart failed: previous config restored");
                     continue;
                 }
-                None => return finish(server_task, shared, old.take(), Err(e)),
+                None => return run.finish(Err(e)),
             },
         };
         info!(models = ?registry.names(), "models registered (compiling in the background)");
         if loaded_ort.is_none() {
             loaded_ort = registry_ort_flavor(&registry);
         }
-        let state = Arc::new(AppState {
-            registry: registry.clone(),
-            metrics: metrics.clone(),
-            config: store.clone(),
-            running: arc_swap::ArcSwap::from_pointee({
-                let mut c = config.clone();
-                c.normalize();
-                // What is running is the address bound at process start (a changed port or
-                // address shows as pending until the process restarts).
-                c.port = bound_port;
-                c.bind_address = bound_address;
-                c
-            }),
-            apply_lock: std::sync::Mutex::new(()),
-            applied_revision: std::sync::atomic::AtomicU64::new(0),
-            started,
-            config_path: config_path.clone(),
-            log_reload: Some(log.clone()),
-            restart: generation.clone(),
-            resources: Some(crate::resources::status::ResourcesCtx {
-                provisioner: provisioner.clone(),
-                provision: provision.clone(),
-                openvino_loaded: registry.runtimes().is_some_and(|rt| {
-                    rt.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .openvino()
-                        .is_some()
-                }),
-                ort_loaded: loaded_ort,
-            }),
-            benchmark: benchmark.clone(),
-        });
+        let state = process.state_for(&config, &registry, &provision, &generation, loaded_ort);
         let resources_restart = Arc::new(AtomicBool::new(false));
         let watcher = spawn_watcher(
             provision.clone(),
@@ -262,28 +419,14 @@ pub fn run_server_with(
         // The store's generation (and adopted config) changes together with the swap, so pages
         // waiting for the restart see the new generation's models.
         if !first {
-            store.adopt(adopt.map(|_| config.clone()), adopt.unwrap_or("restart"));
+            process
+                .store
+                .adopt(adopt.map(|_| config.clone()), adopt.unwrap_or("restart"));
         }
         first = false;
         adopt = None;
-        match &shared {
-            Some(sh) => {
-                drop(sh.swap(state.clone()));
-                info!("new generation is serving");
-            }
-            None => {
-                let sh = server::Shared::new(state.clone());
-                let listeners = listeners.take().expect("listeners are used once");
-                server_task =
-                    Some(rt.spawn(server::serve_on(listeners, sh.clone(), server_stop.clone())));
-                shared = Some(sh);
-            }
-        }
-        // The replaced generation: in-flight requests finish (up to `DRAIN`), then its workers
-        // stop.
-        if let Some(g) = old.take() {
-            g.retire(DRAIN);
-        }
+        run.serve(state.clone());
+        run.retire_old();
         let current = Generation {
             state,
             registry,
@@ -292,69 +435,38 @@ pub fn run_server_with(
         };
 
         // Serve until a restart, a shutdown, or the server failing.
-        let server_failed = rt.block_on(async {
-            let task = server_task.as_mut().expect("server task is running");
-            tokio::select! {
-                biased;
-                _ = generation.cancelled() => None,
-                r = task => Some(r.unwrap_or_else(|e| Err(anyhow::anyhow!("HTTP server task: {e}")))),
-            }
-        });
-        if let Some(r) = server_failed {
+        let server_ended = run.serve_until_event(&generation);
+        // From here on `current` is the generation to retire (by the next one, or on the way
+        // out).
+        run.old = Some(current);
+        if let Some(r) = server_ended {
             if shutdown.is_cancelled() {
-                let r = finish(None, shared, Some(current), r);
+                let r = run.finish(r);
                 info!("bye");
                 return r;
             }
             // The listener is gone: nothing left to serve on.
             let r = r.and(Err(anyhow::anyhow!("HTTP server stopped unexpectedly")));
-            return finish(None, shared, Some(current), r);
+            return run.finish(r);
         }
         // A benchmark still running uses this generation's runtimes: stop it.
-        if benchmark.cancel() {
+        if process.benchmark.cancel() {
             info!("benchmark cancelled by the restart");
-            benchmark.wait_idle(Duration::from_secs(30));
+            process.benchmark.wait_idle(Duration::from_secs(30));
         }
 
         if shutdown.is_cancelled() {
-            let r = finish(server_task.take(), shared, Some(current), Ok(()));
+            let r = run.finish(Ok(()));
             info!("bye");
             return r;
         }
-        old = Some(current);
 
         if resources_restart.load(Ordering::SeqCst) {
             info!("restarting the registry to load downloaded resources");
             previous = None;
             continue;
         }
-        info!(config = %config_path.display(), "restarting: reloading the config file");
-        let next = match Config::load(&config_path) {
-            Ok(c) if !c.models.is_empty() => c,
-            Ok(_) => {
-                warn!("reloaded config has no models; keeping the current config");
-                config.clone()
-            }
-            Err(e) => {
-                warn!("{e:#}; keeping the current config");
-                config.clone()
-            }
-        };
-        if next.log_level != config.log_level
-            && let Err(e) = log.set_level(next.log_level)
-        {
-            warn!("{e:#}");
-        }
-        if next.log_path != config.log_path {
-            warn!("log_path changes take effect after the process is restarted");
-        }
-        if (next.port, next.bind_address) != (config.port, config.bind_address) {
-            warn!(
-                port = next.port,
-                bind_address = %next.bind_address,
-                "port and bind_address changes take effect after the process is restarted"
-            );
-        }
+        let next = process.reload_config(&config);
         previous = Some(std::mem::replace(&mut config, next));
         adopt = Some("restart (config file reloaded)");
     }

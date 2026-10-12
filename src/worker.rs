@@ -322,12 +322,7 @@ impl WorkerHandle {
     /// Execution provider string of the loaded model; before that, where it is headed:
     /// "<planned label> (loading)" ("not loaded" for a model that failed before planning).
     pub fn execution_provider(&self) -> String {
-        if let Some(p) = self
-            .device
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
-        {
+        if let Some(p) = loaded_provider(&self.device) {
             return p;
         }
         let failed = matches!(self.state.get(), ModelState::Failed(_));
@@ -619,6 +614,15 @@ struct WorkerCtx {
     shutdown: CancellationToken,
 }
 
+/// Execution provider string of the device the model loaded on (None before it has loaded, or
+/// when the lock is poisoned). `device` is the slot shared by [`WorkerHandle`] and the worker.
+fn loaded_provider(device: &RwLock<Option<DeviceInfo>>) -> Option<String> {
+    device
+        .read()
+        .ok()
+        .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
+}
+
 /// Elapsed milliseconds as the API's i32.
 fn ms(d: Duration) -> i32 {
     d.as_millis().min(i32::MAX as u128) as i32
@@ -899,12 +903,7 @@ impl WorkerCtx {
         r: Result<Result<Prepared>, crossbeam_channel::RecvError>,
         meta: &Meta,
     ) -> Stage {
-        let provider = self
-            .device
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
-            .unwrap_or_default();
+        let provider = loaded_provider(&self.device).unwrap_or_default();
         match r {
             Ok(Ok(prepared)) => Stage::Ready(prepared),
             Ok(Err(e)) => Stage::Answer(self.failure(meta, &provider, &e)),
@@ -1218,12 +1217,7 @@ impl WorkerCtx {
         inference_ms: i32,
         process_ms: i32,
     ) -> VisionDetectionResponse {
-        let provider = self
-            .device
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
-            .unwrap_or_default();
+        let provider = loaded_provider(&self.device).unwrap_or_default();
         VisionDetectionResponse {
             command: "detect".into(),
             executionProvider: provider,

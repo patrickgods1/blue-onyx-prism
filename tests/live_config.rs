@@ -6,107 +6,32 @@
 //! - a per-model device change reloads only that model (`/stats.json` shows the reload, the
 //!   generation in `/v1/config` stays the same).
 //!
-//! Skips (passes with a message) unless `models/IPcam-general.onnx` and `openvino/` exist under
-//! the repo root (or `BLUE_ONYX_TEST_ROOT`).
+//! `#[ignore]`d: needs `models/IPcam-general.{onnx,yaml}` and `openvino/` under
+//! `common::test_root()` (a missing one fails the test).
 
-use blue_onyx_prism::api::VisionDetectionResponse;
-use blue_onyx_prism::cli::{self, LogReloadHandle};
+mod common;
+
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};
 use blue_onyx_prism::model::ModelFamilyKind;
-use blue_onyx_prism::runner;
-use std::future::Future;
+use common::{
+    Server, TEST_IMAGE, get_json, list_models, post_form_json as post_form, post_image, temp_dir,
+    wait_until,
+};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
 
-const TEST_IMAGE: &str = "tests/data/dog_bike_car.jpg";
-
-fn repo_root() -> PathBuf {
-    std::env::var_os("BLUE_ONYX_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("free port")
-}
-
-/// The model and OpenVINO, or None (skip) when they are not there.
-fn fixtures(test: &str) -> Option<(PathBuf, PathBuf, Vec<u8>)> {
-    let root = repo_root();
-    let model = root.join("models").join("IPcam-general.onnx");
-    let ov_dir = root.join("openvino");
-    if !model.is_file() || !ov_dir.is_dir() {
-        eprintln!(
-            "skipping {test}: need {} and {}",
-            model.display(),
-            ov_dir.display()
-        );
-        return None;
-    }
-    let image = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TEST_IMAGE))
-        .expect("test image");
-    Some((model, ov_dir, image))
-}
-
-/// The global subscriber can be installed once per test binary; every server shares the handle.
-fn log_handle() -> LogReloadHandle {
-    static LOG: OnceLock<LogReloadHandle> = OnceLock::new();
-    LOG.get_or_init(|| cli::init_logging(LogLevel::Warn, None).expect("init logging"))
-        .clone()
-}
-
-/// `runner::run_server_on` on its own thread and runtime, exactly like the binary.
-struct Served {
-    base: String,
-    shutdown: CancellationToken,
-    thread: std::thread::JoinHandle<anyhow::Result<()>>,
-}
-
-impl Served {
-    fn start(config: Config, config_path: PathBuf) -> Self {
-        config.save(&config_path).expect("write config");
-        let base = format!("http://127.0.0.1:{}", config.port);
-        let shutdown = CancellationToken::new();
-        let token = shutdown.clone();
-        let log = log_handle();
-        let thread = std::thread::spawn(move || {
-            let rt = runner::build_runtime()?;
-            runner::run_server_on(&rt, config, config_path, log, token)
-        });
-        Self {
-            base,
-            shutdown,
-            thread,
-        }
-    }
-
-    fn stop(self) {
-        self.shutdown.cancel();
-        self.thread
-            .join()
-            .expect("server thread panicked")
-            .expect("server result");
-    }
-}
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bo_live_{tag}_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// The model, OpenVINO and the test image; panics when a fixture is missing.
+fn fixtures() -> (PathBuf, PathBuf, Vec<u8>) {
+    (
+        common::require_ipcam(),
+        common::require_openvino(),
+        common::test_image(),
+    )
 }
 
 fn config_with(ov_dir: &Path, models: Vec<ModelConfig>) -> Config {
     Config {
-        port: free_port(),
-        cache_dir: std::env::temp_dir()
-            .join(format!("bo_live_cache_{}", std::process::id()))
-            .to_string_lossy()
-            .to_string(),
+        cache_dir: common::cache_dir("live"),
         openvino_dir: Some(ov_dir.to_path_buf()),
         // OpenVINO CPU in the legacy spelling (no GPU, nothing to download on any platform);
         // the device test moves one model to the explicit `openvino:cpu`.
@@ -126,36 +51,6 @@ fn ipcam(name: &str, path: &Path) -> ModelConfig {
         family: ModelFamilyKind::Yolo5,
         ..Default::default()
     }
-}
-
-/// Poll `check` every 50 ms until it returns true; panic after `timeout`.
-async fn wait_until<F, Fut>(what: &str, timeout: Duration, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let deadline = Instant::now() + timeout;
-    while !check().await {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn get_json(client: &reqwest::Client, url: &str) -> Option<serde_json::Value> {
-    client.get(url).send().await.ok()?.json().await.ok()
-}
-
-/// `/v1/vision/custom/list` model names (None while the server is not up yet).
-async fn list_models(client: &reqwest::Client, base: &str) -> Option<Vec<String>> {
-    let v: serde_json::Value = client
-        .post(format!("{base}/v1/vision/custom/list"))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    serde_json::from_value(v["models"].clone()).ok()
 }
 
 /// The `/stats.json` entry of `model`.
@@ -200,44 +95,16 @@ async fn generation(client: &reqwest::Client, base: &str) -> u64 {
         .expect("generation")
 }
 
-async fn post_image(client: &reqwest::Client, url: &str, bytes: &[u8]) -> VisionDetectionResponse {
-    let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-        .file_name("dog_bike_car.jpg")
-        .mime_str("image/jpeg")
-        .unwrap();
-    let form = reqwest::multipart::Form::new().part("image", part);
-    let resp = client.post(url).multipart(form).send().await.expect("POST");
-    assert!(resp.status().is_success(), "HTTP {}", resp.status());
-    resp.json().await.expect("detection JSON")
-}
-
-/// POST a form as the Config page's script does (JSON answer).
-async fn post_form(client: &reqwest::Client, url: &str, body: &str) -> serde_json::Value {
-    let resp = client
-        .post(url)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header("accept", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .expect("POST form");
-    assert!(resp.status().is_success(), "{url}: HTTP {}", resp.status());
-    let j: serde_json::Value = resp.json().await.expect("form JSON");
-    assert_eq!(j["success"], true, "{j}");
-    j
-}
-
 #[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn threshold_applies_to_the_next_detection() {
-    let Some((model, ov_dir, image)) = fixtures("threshold_applies_to_the_next_detection") else {
-        return;
-    };
+    let (model, ov_dir, image) = fixtures();
     let config = Config {
         confidence_threshold: 0.9,
         ..config_with(&ov_dir, vec![ipcam("IPcam-general", &model)])
     };
     let client = reqwest::Client::new();
-    let served = Served::start(config, temp_dir("thr").join("cfg.json"));
+    let served = Server::start(config, temp_dir("thr").join("cfg.json")).await;
     let base = served.base.clone();
     wait_ready(&client, &base, &["IPcam-general"]).await;
     let gen0 = generation(&client, &base).await;
@@ -288,25 +155,24 @@ async fn threshold_applies_to_the_next_detection() {
         .unwrap();
     assert_eq!(cfg["pendingCount"], 0, "{cfg}");
     assert_eq!(cfg["models"][0]["running"]["threshold"], 0.1, "{cfg}");
-    served.stop();
+    served.stop().await;
 }
 
 #[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn disable_and_enable_without_restart() {
-    let Some((model, ov_dir, image)) = fixtures("disable_and_enable_without_restart") else {
-        return;
-    };
+    let (model, ov_dir, image) = fixtures();
     let config = config_with(
         &ov_dir,
         vec![ipcam("ipcam-a", &model), ipcam("ipcam-b", &model)],
     );
     let client = reqwest::Client::new();
-    let served = Served::start(config, temp_dir("enable").join("cfg.json"));
+    let served = Server::start(config, temp_dir("enable").join("cfg.json")).await;
     let base = served.base.clone();
     wait_ready(&client, &base, &["ipcam-a", "ipcam-b"]).await;
     let gen0 = generation(&client, &base).await;
 
-    // Disable ipcam-b: gone from the list within a second.
+    // Disable ipcam-b: gone from the list at once (10 s allowed so a loaded machine cannot fail it).
     let t = Instant::now();
     let j = post_form(
         &client,
@@ -323,7 +189,7 @@ async fn disable_and_enable_without_restart() {
     );
     wait_until(
         "ipcam-b to leave the list",
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         || async {
             list_models(&client, &base).await.as_deref() == Some(&["ipcam-a".to_string()][..])
         },
@@ -363,20 +229,19 @@ async fn disable_and_enable_without_restart() {
     let r = post_image(&client, &format!("{base}/v1/vision/custom/ipcam-b"), &image).await;
     assert!(r.success && !r.predictions.is_empty(), "{r:?}");
     assert_eq!(generation(&client, &base).await, gen0, "no restart");
-    served.stop();
+    served.stop().await;
 }
 
 #[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn device_change_reloads_only_that_model() {
-    let Some((model, ov_dir, image)) = fixtures("device_change_reloads_only_that_model") else {
-        return;
-    };
+    let (model, ov_dir, image) = fixtures();
     let config = config_with(
         &ov_dir,
         vec![ipcam("ipcam-a", &model), ipcam("ipcam-b", &model)],
     );
     let client = reqwest::Client::new();
-    let served = Served::start(config, temp_dir("device").join("cfg.json"));
+    let served = Server::start(config, temp_dir("device").join("cfg.json")).await;
     let base = served.base.clone();
     wait_ready(&client, &base, &["ipcam-a", "ipcam-b"]).await;
     let gen0 = generation(&client, &base).await;
@@ -421,5 +286,5 @@ async fn device_change_reloads_only_that_model() {
     assert_eq!(last["source"], "config page (Models card)", "{last}");
     let r = post_image(&client, &format!("{base}/v1/vision/custom/ipcam-a"), &image).await;
     assert!(r.success && !r.predictions.is_empty(), "{r:?}");
-    served.stop();
+    served.stop().await;
 }

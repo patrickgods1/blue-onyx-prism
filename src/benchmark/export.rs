@@ -7,12 +7,13 @@
 //! negative frame counts, frame TPR / FPR at the configured and the best threshold).
 
 use super::grade::{
-    ACCURACY_THRESHOLDS, ROC_AUC_THRESHOLDS, SMALL_RECALL_WEIGHT, SPEED_THRESHOLDS_MS,
+    ACCURACY_THRESHOLDS, AccuracyMetric, ROC_AUC_THRESHOLDS, SMALL_RECALL_WEIGHT,
+    SPEED_THRESHOLDS_MS,
 };
 use super::metrics::ThresholdPoint;
 use super::report::{BenchmarkResults, DeviceResult, ModelResult};
 use super::threshold::{GroupPick, Pick, ThresholdAdvice, table_points};
-use super::{Breakdown, RunResult};
+use super::{AccuracyReport, Breakdown, RunResult};
 use anyhow::{Context, Result, bail};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -418,10 +419,27 @@ fn threshold_tables(a: &ThresholdAdvice, paragraphs: &mut Vec<String>, tables: &
 }
 
 fn sections(r: &BenchmarkResults) -> Vec<Section> {
-    let mut out = Vec::new();
+    let mut out = vec![machine_section(r), datasets_section(r)];
+    let ranking = r.ranking();
+    let metric = r.accuracy_metric();
+    if !ranking.is_empty() {
+        out.push(ranking_section(&ranking, metric));
+    }
+    if let Some(s) = threshold_summary(r) {
+        out.push(s);
+    }
+    for m in &r.models {
+        out.push(model_section(m));
+    }
+    out.push(grades_section(metric));
+    out
+}
+
+/// Hardware and runtime versions.
+fn machine_section(r: &BenchmarkResults) -> Section {
     let hw = &r.hardware;
     let rt = &r.runtimes;
-    out.push(Section {
+    Section {
         heading: "Machine".into(),
         level: 2,
         paragraphs: vec![
@@ -449,8 +467,12 @@ fn sections(r: &BenchmarkResults) -> Vec<Section> {
             ),
         ],
         tables: vec![],
-    });
-    out.push(Section {
+    }
+}
+
+/// The image sets with their ground truth and licenses.
+fn datasets_section(r: &BenchmarkResults) -> Section {
+    Section {
         heading: "Datasets".into(),
         level: 2,
         paragraphs: vec![],
@@ -479,231 +501,250 @@ fn sections(r: &BenchmarkResults) -> Vec<Section> {
                 })
                 .collect(),
         }],
-    });
-    let ranking = r.ranking();
-    let metric = r.accuracy_metric();
-    if !ranking.is_empty() {
-        out.push(Section {
-            heading: "Best model for this machine".into(),
-            level: 2,
-            paragraphs: vec![format!(
-                "Each model on its recommended device, ranked by overall grade, then accuracy, then \
-                 speed; accuracy graded by {}. Models with no class in the datasets are not \
-                 scored for accuracy and rank last. Best: {} on {}.",
-                metric.label(),
-                ranking[0].model,
-                ranking[0].device
-            )],
-            tables: vec![Table {
-                title: String::new(),
-                head: [
-                    "#", "model", "device", "overall", "accuracy", "speed", "p50 ms", "AP50",
-                    "ROC AUC",
-                ]
-                .map(String::from)
-                .to_vec(),
-                rows: ranking
-                    .iter()
-                    .map(|k| {
-                        vec![
-                            k.rank.to_string(),
-                            k.model.clone(),
-                            k.device.clone(),
-                            if k.accuracy.is_none() {
-                                format!("{} (speed only)", k.overall)
-                            } else {
-                                k.overall.to_string()
-                            },
-                            k.accuracy.map_or("not scored".into(), |a| {
-                                if k.relative {
-                                    format!("{a}*")
-                                } else {
-                                    a.to_string()
-                                }
-                            }),
-                            k.speed.to_string(),
-                            msf(k.p50_ms),
-                            pct(k.ap50),
-                            pct(k.roc_auc),
-                        ]
-                    })
-                    .collect(),
-            }],
-        });
     }
-    if let Some(s) = threshold_summary(r) {
-        out.push(s);
-    }
-    for m in &r.models {
-        let mut paragraphs = vec![format!(
-            "{} | datasets {} ({} images) | {} timed run(s) per image after {} warm-up | {}",
-            m.path,
-            m.datasets.join(", "),
-            m.images,
-            m.repeat,
-            m.warmup,
-            m.timestamp
-        )];
-        if let Some(e) = &m.error {
-            paragraphs.push(format!("Not benchmarked: {e}"));
-        }
-        paragraphs.push(match &m.recommended {
-            Some(d) => format!("Recommended device: {d} ({})", m.recommendation),
-            None => format!("No recommendation: {}", m.recommendation),
-        });
-        if !m.skipped.is_empty() {
-            paragraphs.push(format!("Not runnable here: {}", m.skipped.join("; ")));
-        }
-        let mut tables = vec![Table {
-            title: "Devices".into(),
+}
+
+/// The models ranked on their recommended devices (`ranking` is not empty).
+fn ranking_section(ranking: &[super::report::RankRow], metric: AccuracyMetric) -> Section {
+    Section {
+        heading: "Best model for this machine".into(),
+        level: 2,
+        paragraphs: vec![format!(
+            "Each model on its recommended device, ranked by overall grade, then accuracy, then \
+             speed; accuracy graded by {}. Models with no class in the datasets are not \
+             scored for accuracy and rank last. Best: {} on {}.",
+            metric.label(),
+            ranking[0].model,
+            ranking[0].device
+        )],
+        tables: vec![Table {
+            title: String::new(),
             head: [
-                "device",
-                "load ms",
-                "infer p50",
-                "total p50",
-                "total p95",
-                "req/s",
-                "AP50",
-                "AP50-95",
-                "ROC AUC",
-                "P",
-                "R",
-                "overall",
-                "accuracy",
-                "speed",
-                "agreement",
+                "#", "model", "device", "overall", "accuracy", "speed", "p50 ms", "AP50", "ROC AUC",
             ]
             .map(String::from)
             .to_vec(),
-            rows: m.devices.iter().map(|d| device_row(m, d)).collect(),
-        }];
-        let best = m
-            .recommended
-            .as_ref()
-            .and_then(|rec| m.devices.iter().find(|d| &d.device == rec))
-            .and_then(|d| d.run.as_ref());
-        if let Some(run) = best {
-            if let Some(a) = &run.accuracy {
-                paragraphs.push(format!(
-                    "Accuracy of {} ({}; classes {}; P/R at confidence {:.2}, IoU 0.5).",
-                    run.requested_device,
-                    a.ground_truth,
-                    a.classes.join(", "),
-                    a.threshold
-                ));
-                tables.push(breakdown_table("By dataset", &a.by_dataset));
-                tables.push(breakdown_table("By tag", &a.by_tag));
-                tables.push(Table {
-                    title: "By class".into(),
-                    head: ["class", "objects", "AP50", "AP50-95", "P", "R"]
-                        .map(String::from)
-                        .to_vec(),
-                    rows: a
-                        .overall
-                        .per_class
-                        .iter()
-                        .map(|c| {
-                            vec![
-                                c.class.clone(),
-                                c.gt.to_string(),
-                                pct(c.ap50),
-                                pct(c.ap50_95),
-                                pct(c.precision),
-                                pct(c.recall),
-                            ]
-                        })
-                        .collect(),
-                });
-                if let Some(roc) = &a.frame_roc {
-                    paragraphs.push(format!(
-                        "Frame-level ROC AUC of {}: macro {}, micro {} ({} positive and {} negative frame samples; a frame counts once per class).",
-                        run.requested_device,
-                        pct(roc.auc),
-                        pct(roc.micro_auc),
-                        roc.positives,
-                        roc.negatives
-                    ));
-                    tables.push(Table {
-                        title: "Frame-level ROC by class".into(),
-                        head: ["class", "frames with", "frames without", "ROC AUC"]
-                            .map(String::from)
-                            .to_vec(),
-                        rows: roc
-                            .per_class
-                            .iter()
-                            .map(|c| {
-                                vec![
-                                    c.class.clone(),
-                                    c.positives.to_string(),
-                                    c.negatives.to_string(),
-                                    pct(c.auc),
-                                ]
-                            })
-                            .collect(),
-                    });
-                }
-                tables.push(Table {
-                    title: "Recall by object size".into(),
-                    head: ["size", "objects", "recall"].map(String::from).to_vec(),
-                    rows: a
-                        .overall
-                        .by_size
-                        .iter()
-                        .map(|b| vec![b.bucket.clone(), b.gt.to_string(), pct(b.recall)])
-                        .collect(),
-                });
-            } else if let Some(n) = &run.accuracy_note {
-                paragraphs.push(format!("Accuracy not scored: {n}."));
-            }
-            if !run.by_resolution.is_empty() {
-                tables.push(Table {
-                    title: format!("Speed by resolution on {} (ms)", run.requested_device),
-                    head: [
-                        "resolution",
-                        "images",
-                        "decode+pre p50",
-                        "infer p50",
-                        "post p50",
-                        "total p50",
-                        "total p95",
-                    ]
-                    .map(String::from)
-                    .to_vec(),
-                    rows: super::images::RESOLUTION_BUCKETS
-                        .iter()
-                        .map(|bucket| {
-                            match run.by_resolution.iter().find(|b| b.bucket == *bucket) {
-                                Some(b) => vec![
-                                    b.bucket.clone(),
-                                    b.images.to_string(),
-                                    msf(b.pre_p50),
-                                    msf(b.infer_p50),
-                                    msf(b.post_p50),
-                                    msf(b.total_p50),
-                                    msf(b.total_p95),
-                                ],
-                                None => {
-                                    let mut v = vec![bucket.to_string(), "0".into()];
-                                    v.resize(7, "n/a".into());
-                                    v
-                                }
+            rows: ranking
+                .iter()
+                .map(|k| {
+                    vec![
+                        k.rank.to_string(),
+                        k.model.clone(),
+                        k.device.clone(),
+                        if k.accuracy.is_none() {
+                            format!("{} (speed only)", k.overall)
+                        } else {
+                            k.overall.to_string()
+                        },
+                        k.accuracy.map_or("not scored".into(), |a| {
+                            if k.relative {
+                                format!("{a}*")
+                            } else {
+                                a.to_string()
                             }
-                        })
-                        .collect(),
-                });
-            }
+                        }),
+                        k.speed.to_string(),
+                        msf(k.p50_ms),
+                        pct(k.ap50),
+                        pct(k.roc_auc),
+                    ]
+                })
+                .collect(),
+        }],
+    }
+}
+
+/// One model: run settings, recommendation, device table, the recommended device's accuracy
+/// and speed breakdowns and the threshold tables.
+fn model_section(m: &ModelResult) -> Section {
+    let mut paragraphs = vec![format!(
+        "{} | datasets {} ({} images) | {} timed run(s) per image after {} warm-up | {}",
+        m.path,
+        m.datasets.join(", "),
+        m.images,
+        m.repeat,
+        m.warmup,
+        m.timestamp
+    )];
+    if let Some(e) = &m.error {
+        paragraphs.push(format!("Not benchmarked: {e}"));
+    }
+    paragraphs.push(match &m.recommended {
+        Some(d) => format!("Recommended device: {d} ({})", m.recommendation),
+        None => format!("No recommendation: {}", m.recommendation),
+    });
+    if !m.skipped.is_empty() {
+        paragraphs.push(format!("Not runnable here: {}", m.skipped.join("; ")));
+    }
+    let mut tables = vec![Table {
+        title: "Devices".into(),
+        head: [
+            "device",
+            "load ms",
+            "infer p50",
+            "total p50",
+            "total p95",
+            "req/s",
+            "AP50",
+            "AP50-95",
+            "ROC AUC",
+            "P",
+            "R",
+            "overall",
+            "accuracy",
+            "speed",
+            "agreement",
+        ]
+        .map(String::from)
+        .to_vec(),
+        rows: m.devices.iter().map(|d| device_row(m, d)).collect(),
+    }];
+    let best = m
+        .recommended
+        .as_ref()
+        .and_then(|rec| m.devices.iter().find(|d| &d.device == rec))
+        .and_then(|d| d.run.as_ref());
+    if let Some(run) = best {
+        if let Some(a) = &run.accuracy {
+            accuracy_tables(run, a, &mut paragraphs, &mut tables);
+        } else if let Some(n) = &run.accuracy_note {
+            paragraphs.push(format!("Accuracy not scored: {n}."));
         }
-        if let Some(a) = &m.threshold {
-            threshold_tables(a, &mut paragraphs, &mut tables);
+        if !run.by_resolution.is_empty() {
+            tables.push(resolution_table(run));
         }
-        out.push(Section {
-            heading: m.model.clone(),
-            level: 2,
-            paragraphs,
-            tables,
+    }
+    if let Some(a) = &m.threshold {
+        threshold_tables(a, &mut paragraphs, &mut tables);
+    }
+    Section {
+        heading: m.model.clone(),
+        level: 2,
+        paragraphs,
+        tables,
+    }
+}
+
+/// The accuracy `a` of the recommended device's `run`: by dataset, tag, class, frame-level ROC
+/// and object size.
+fn accuracy_tables(
+    run: &RunResult,
+    a: &AccuracyReport,
+    paragraphs: &mut Vec<String>,
+    tables: &mut Vec<Table>,
+) {
+    paragraphs.push(format!(
+        "Accuracy of {} ({}; classes {}; P/R at confidence {:.2}, IoU 0.5).",
+        run.requested_device,
+        a.ground_truth,
+        a.classes.join(", "),
+        a.threshold
+    ));
+    tables.push(breakdown_table("By dataset", &a.by_dataset));
+    tables.push(breakdown_table("By tag", &a.by_tag));
+    tables.push(Table {
+        title: "By class".into(),
+        head: ["class", "objects", "AP50", "AP50-95", "P", "R"]
+            .map(String::from)
+            .to_vec(),
+        rows: a
+            .overall
+            .per_class
+            .iter()
+            .map(|c| {
+                vec![
+                    c.class.clone(),
+                    c.gt.to_string(),
+                    pct(c.ap50),
+                    pct(c.ap50_95),
+                    pct(c.precision),
+                    pct(c.recall),
+                ]
+            })
+            .collect(),
+    });
+    if let Some(roc) = &a.frame_roc {
+        paragraphs.push(format!(
+            "Frame-level ROC AUC of {}: macro {}, micro {} ({} positive and {} negative frame samples; a frame counts once per class).",
+            run.requested_device,
+            pct(roc.auc),
+            pct(roc.micro_auc),
+            roc.positives,
+            roc.negatives
+        ));
+        tables.push(Table {
+            title: "Frame-level ROC by class".into(),
+            head: ["class", "frames with", "frames without", "ROC AUC"]
+                .map(String::from)
+                .to_vec(),
+            rows: roc
+                .per_class
+                .iter()
+                .map(|c| {
+                    vec![
+                        c.class.clone(),
+                        c.positives.to_string(),
+                        c.negatives.to_string(),
+                        pct(c.auc),
+                    ]
+                })
+                .collect(),
         });
     }
-    out.push(Section {
+    tables.push(Table {
+        title: "Recall by object size".into(),
+        head: ["size", "objects", "recall"].map(String::from).to_vec(),
+        rows: a
+            .overall
+            .by_size
+            .iter()
+            .map(|b| vec![b.bucket.clone(), b.gt.to_string(), pct(b.recall)])
+            .collect(),
+    });
+}
+
+/// Speed per resolution bucket of `run` (every bucket; one without images is n/a).
+fn resolution_table(run: &RunResult) -> Table {
+    Table {
+        title: format!("Speed by resolution on {} (ms)", run.requested_device),
+        head: [
+            "resolution",
+            "images",
+            "decode+pre p50",
+            "infer p50",
+            "post p50",
+            "total p50",
+            "total p95",
+        ]
+        .map(String::from)
+        .to_vec(),
+        rows: super::images::RESOLUTION_BUCKETS
+            .iter()
+            .map(
+                |bucket| match run.by_resolution.iter().find(|b| b.bucket == *bucket) {
+                    Some(b) => vec![
+                        b.bucket.clone(),
+                        b.images.to_string(),
+                        msf(b.pre_p50),
+                        msf(b.infer_p50),
+                        msf(b.post_p50),
+                        msf(b.total_p50),
+                        msf(b.total_p95),
+                    ],
+                    None => {
+                        let mut v = vec![bucket.to_string(), "0".into()];
+                        v.resize(7, "n/a".into());
+                        v
+                    }
+                },
+            )
+            .collect(),
+    }
+}
+
+/// How the speed, accuracy and overall grades are computed.
+fn grades_section(metric: AccuracyMetric) -> Section {
+    Section {
         heading: "How grades are computed".into(),
         level: 2,
         paragraphs: vec![
@@ -727,8 +768,7 @@ fn sections(r: &BenchmarkResults) -> Vec<Section> {
             "Overall: weighted mean of the grade points (A=4 .. F=0), default 60% accuracy, 40% speed (config benchmark.weights). Devices whose detections disagree with the CPU reference are never recommended.".into(),
         ],
         tables: vec![],
-    });
-    out
+    }
 }
 
 /// Markdown report.

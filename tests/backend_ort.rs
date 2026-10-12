@@ -1,7 +1,10 @@
-//! Real ONNX Runtime inference on `ort:cpu` (and CoreML on macOS). Skipped when the ONNX Runtime
-//! library or the model files are absent. The library is looked up in `ORT_DYLIB_PATH`,
-//! `<target>/debug/onnxruntime` (where `cargo run -- setup-onnxruntime` installs it) and
-//! `<repo>/onnxruntime`. Run with `cargo test --test backend_ort -- --nocapture` for timings.
+//! Real ONNX Runtime inference on `ort:cpu` (and CoreML on macOS).
+//!
+//! `#[ignore]`d: needs `models/IPcam-general.{onnx,yaml}`, `openvino/` and the ONNX Runtime
+//! library under `common::test_root()`; a missing one fails the tests. The library is looked up
+//! in `ORT_DYLIB_PATH`, then `<root>/onnxruntime/` (flat, or the flavor subfolder named by `active.txt`, as
+//! `cargo run -- setup-onnxruntime` lays it out). `rt-detrv2-s.onnx` / `yolo26n.xml` are
+//! optional extras. Run with `cargo test --test backend_ort -- --ignored --nocapture`.
 #![cfg(feature = "onnxruntime")]
 
 use blue_onyx_prism::backend::{
@@ -12,43 +15,48 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
-fn repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
+mod common;
 
-/// The ONNX Runtime library to use, if one is installed somewhere we know.
-fn ort_dir() -> Option<PathBuf> {
+/// The ONNX Runtime library (a hard failure when none is installed).
+fn ort_lib() -> PathBuf {
     let env = std::env::var_os(libs::ENV_ORT_DYLIB_PATH).map(PathBuf::from);
-    let target_dir = blue_onyx_prism::exe_dir()
-        .parent()
-        .map(|d| d.join(libs::ORT_DIR_NAME))
-        .unwrap_or_default();
-    for cand in env
-        .into_iter()
-        .chain([target_dir, repo().join(libs::ORT_DIR_NAME)])
-    {
-        if let Some(lib) = libs::find_onnxruntime_from(Some(&cand), None, &cand).library {
-            return Some(lib);
+    // `<root>/onnxruntime`, then where `cargo run -- setup-onnxruntime` installs by default
+    // (next to the executables, e.g. target/debug/onnxruntime) for local runs.
+    let dirs = [
+        common::test_root().join(libs::ORT_DIR_NAME),
+        blue_onyx_prism::exe_dir()
+            .parent()
+            .map(|d| d.join(libs::ORT_DIR_NAME))
+            .unwrap_or_default(),
+    ];
+    let mut checked = Vec::new();
+    for dir in &dirs {
+        let lookup = libs::find_onnxruntime_from(None, env.as_deref(), dir);
+        if let Some(lib) = lookup.library {
+            return lib;
         }
+        checked.extend(lookup.checked);
     }
-    None
+    panic!(
+        "required fixture missing: no ONNX Runtime library (run `cargo run -- setup-onnxruntime`, \
+         or set BLUE_ONYX_TEST_ROOT / {}); checked: {checked:?}",
+        libs::ENV_ORT_DYLIB_PATH
+    )
 }
 
 /// One `Runtimes` per test process is plenty (ONNX Runtime loads once anyway); tests share it.
 static RT: Mutex<Option<Runtimes>> = Mutex::new(None);
 
-fn with_runtimes<T>(f: impl FnOnce(&mut Runtimes) -> T) -> Option<T> {
-    let lib = ort_dir().or_else(|| {
-        eprintln!("skipping: no ONNX Runtime library (run `cargo run -- setup-onnxruntime`)");
-        None
-    })?;
+fn with_runtimes<T>(f: impl FnOnce(&mut Runtimes) -> T) -> T {
+    let lib = ort_lib();
+    let openvino_dir = common::require_openvino();
     let mut guard = RT.lock().unwrap_or_else(|e| e.into_inner());
     let rt = guard.get_or_insert_with(|| {
         Runtimes::new_with(
             &CoreOptions {
                 cache_dir: Some(std::env::temp_dir().join("bop-ort-test-cache")),
                 intra_threads: 0,
-                openvino_dir: Some(repo().join("openvino")),
+                openvino_dir: Some(openvino_dir),
             },
             &OrtOptions {
                 onnxruntime_dir: Some(lib),
@@ -61,17 +69,7 @@ fn with_runtimes<T>(f: impl FnOnce(&mut Runtimes) -> T) -> Option<T> {
         "ONNX Runtime failed to load: {:?}",
         rt.onnxruntime_error()
     );
-    Some(f(rt))
-}
-
-fn model(name: &str) -> Option<PathBuf> {
-    let p = repo().join("models").join(name);
-    if p.is_file() {
-        Some(p)
-    } else {
-        eprintln!("skipping: {} not present", p.display());
-        None
-    }
+    f(rt)
 }
 
 fn req(path: &std::path::Path, requested: &str) -> LoadRequest {
@@ -83,10 +81,9 @@ fn req(path: &std::path::Path, requested: &str) -> LoadRequest {
 }
 
 #[test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 fn yolo5_on_ort_cpu() {
-    let Some(path) = model("IPcam-general.onnx") else {
-        return;
-    };
+    let path = common::require_ipcam();
     with_runtimes(|rt| {
         println!("ONNX Runtime {:?}", rt.onnxruntime_version());
         let probe = rt.probe().ort.clone();
@@ -140,8 +137,11 @@ fn yolo5_on_ort_cpu() {
 }
 
 #[test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 fn rtdetr_on_ort_cpu_with_i64_input() {
-    let Some(path) = model("rt-detrv2-s.onnx") else {
+    // Optional extra model: the ONNX Runtime library is still required (hard failure).
+    let Some(path) = common::optional_model("rt-detrv2-s.onnx") else {
+        let _ = ort_lib();
         return;
     };
     with_runtimes(|rt| {
@@ -207,10 +207,9 @@ fn rtdetr_on_ort_cpu_with_i64_input() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 fn yolo5_on_coreml() {
-    let Some(path) = model("IPcam-general.onnx") else {
-        return;
-    };
+    let path = common::require_ipcam();
     with_runtimes(|rt| {
         if let Some(reason) = rt.probe().ort.ep_error(spec::Target::CoreMl) {
             eprintln!("skipping: CoreML not usable: {reason}");
@@ -281,8 +280,11 @@ fn yolo5_on_coreml() {
 }
 
 #[test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 fn xml_without_onnx_needs_export() {
-    let Some(path) = model("yolo26n.xml") else {
+    // Optional extra model: the ONNX Runtime library is still required (hard failure).
+    let Some(path) = common::optional_model("yolo26n.xml") else {
+        let _ = ort_lib();
         return;
     };
     if path.with_extension("onnx").is_file() {

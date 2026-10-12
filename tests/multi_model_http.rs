@@ -4,50 +4,27 @@
 //! plugin, e.g. macOS) + `IPcam-general.onnx` (family yolo5, device "CPU"), plus `yolo26n.xml`
 //! as a `lazy` third model when present. `default_model` = "yolo26s".
 //!
-//! Skips (passes with a message) when `openvino/` or the two required models are missing under
-//! the repo root. Set `BLUE_ONYX_TEST_ROOT` to point at another checkout that has them.
+//! `#[ignore]`d: needs `openvino/` and `models/IPcam-general.{onnx,yaml}` under
+//! `common::test_root()` (a missing one fails the test). `yolo26s.xml` and `yolo26n.xml` are
+//! optional: without `yolo26s.xml` the first model (still named "yolo26s") is a second copy of
+//! IPcam-general on "GPU" and the COCO label checks are skipped; without `yolo26n.xml` the lazy
+//! part is skipped.
+
+mod common;
 
 use blue_onyx_prism::api::VisionDetectionResponse;
 use blue_onyx_prism::config::{Config, ModelConfig};
-use blue_onyx_prism::metrics::Metrics;
 use blue_onyx_prism::model::ModelFamilyKind;
-use blue_onyx_prism::registry::ModelRegistry;
-use blue_onyx_prism::server::{self, AppState};
+use common::{Server, post_image_with};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
 
-const TEST_IMAGE: &str = "tests/data/dog_bike_car.jpg";
 const PER_MODEL: usize = 8;
 const IPCAM: &str = "IPcam-general";
 const IPCAM_CLASSES: [&str; 3] = ["person", "vehicle", "unknown"];
 
-fn repo_root() -> PathBuf {
-    std::env::var_os("BLUE_ONYX_TEST_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .expect("free port")
-}
-
 async fn post_image(client: &reqwest::Client, url: &str, bytes: &[u8]) -> VisionDetectionResponse {
-    let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-        .file_name("dog_bike_car.jpg")
-        .mime_str("image/jpeg")
-        .unwrap();
-    let form = reqwest::multipart::Form::new()
-        .part("image", part)
-        .text("min_confidence", "0.4");
-    let resp = client.post(url).multipart(form).send().await.expect("POST");
-    assert!(resp.status().is_success(), "{url}: HTTP {}", resp.status());
-    resp.json().await.expect("detection JSON")
+    post_image_with(client, url, bytes, Some("0.4")).await
 }
 
 async fn get_stats(client: &reqwest::Client, base: &str) -> serde_json::Value {
@@ -111,30 +88,24 @@ fn prom_info<'a>(text: &'a str, model: &str) -> &'a str {
 }
 
 #[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 async fn multiple_models_served_concurrently() {
-    let root = repo_root();
-    let ov_dir = root.join("openvino");
-    let models_dir = root.join("models");
-    let yolo26s = models_dir.join("yolo26s.xml");
-    let ipcam = models_dir.join("IPcam-general.onnx");
-    let yolo26n = models_dir.join("yolo26n.xml");
-    if !ov_dir.is_dir() || !yolo26s.is_file() || !ipcam.is_file() {
-        eprintln!(
-            "skipping multiple_models_served_concurrently: need {}, {} and {}",
-            ov_dir.display(),
-            yolo26s.display(),
-            ipcam.display()
-        );
-        return;
-    }
-    let image = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TEST_IMAGE))
-        .expect("test image");
+    let ov_dir = common::require_openvino();
+    let ipcam = common::require_ipcam();
+    let yolo26s = common::optional_model("yolo26s.xml");
+    let yolo26n = common::optional_model("yolo26n.xml");
+    let coco_primary = yolo26s.is_some();
+    let image = common::test_image();
 
     let mut models = vec![
         ModelConfig {
             name: Some("yolo26s".into()),
-            path: yolo26s,
-            family: ModelFamilyKind::Yolo26,
+            path: yolo26s.unwrap_or_else(|| ipcam.clone()),
+            family: if coco_primary {
+                ModelFamilyKind::Yolo26
+            } else {
+                ModelFamilyKind::Yolo5
+            },
             device: Some("GPU".into()),
             ..Default::default()
         },
@@ -146,11 +117,11 @@ async fn multiple_models_served_concurrently() {
             ..Default::default()
         },
     ];
-    let lazy_name = yolo26n.is_file().then(|| "yolo26n-lazy".to_string());
+    let lazy_name = yolo26n.is_some().then(|| "yolo26n-lazy".to_string());
     if let Some(name) = &lazy_name {
         models.push(ModelConfig {
             name: Some(name.clone()),
-            path: yolo26n,
+            path: yolo26n.unwrap(),
             family: ModelFamilyKind::Yolo26,
             device: Some("CPU".into()),
             lazy: true,
@@ -162,34 +133,16 @@ async fn multiple_models_served_concurrently() {
     let names: Vec<String> = models.iter().map(|m| m.effective_name()).collect();
     let eager = ["yolo26s", IPCAM];
 
-    let cache = std::env::temp_dir().join(format!("bo_multi_cache_{}", std::process::id()));
     let config = Config {
-        cache_dir: cache.to_string_lossy().to_string(),
+        cache_dir: common::cache_dir("multi"),
         openvino_dir: Some(ov_dir),
         default_model: Some("yolo26s".into()),
         models,
         ..Default::default()
     };
-    let token = CancellationToken::new();
-    let metrics = Arc::new(Metrics::new(blue_onyx_prism::VERSION));
     let t_start = Instant::now();
-    let registry =
-        Arc::new(ModelRegistry::start(&config, &metrics, token.clone()).expect("registry"));
-    let config_path = std::env::temp_dir().join(format!(
-        "bo_it_config_{}_{}.json",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let state = Arc::new(AppState::new(
-        registry.clone(),
-        metrics,
-        config,
-        config_path,
-    ));
-    let port = free_port();
-    let listeners = server::bind([0, 0, 0, 0].into(), port).await.expect("bind");
-    let server = tokio::spawn(server::serve_on(listeners, state.into(), token.clone()));
-    let base = format!("http://127.0.0.1:{port}");
+    let server = Server::start_in_process(config).await;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
 
     // Wait for the eager models; the lazy one must stay unloaded meanwhile.
@@ -264,7 +217,9 @@ async fn multiple_models_served_concurrently() {
     // Default route goes to default_model (yolo26s).
     let r = post_image(&client, &format!("{base}/v1/vision/detection"), &image).await;
     assert!(r.success, "default route: {r:?}");
-    assert!(r.predictions.iter().any(|p| p.label == "dog"), "{r:?}");
+    if coco_primary {
+        assert!(r.predictions.iter().any(|p| p.label == "dog"), "{r:?}");
+    }
     *sent.entry("yolo26s").or_default() += 1;
     let stats = get_stats(&client, &base).await;
     assert_eq!(stats_model(&stats, "yolo26s")["requests"], 1);
@@ -309,7 +264,9 @@ async fn multiple_models_served_concurrently() {
         assert_eq!(r.count as usize, r.predictions.len());
         assert!(r.count > 0, "{model}: nothing detected: {r:?}");
         match *model {
-            "yolo26s" => assert!(r.predictions.iter().any(|p| p.label == "dog"), "{r:?}"),
+            "yolo26s" if coco_primary => {
+                assert!(r.predictions.iter().any(|p| p.label == "dog"), "{r:?}")
+            }
             _ => {
                 assert!(
                     r.predictions
@@ -414,10 +371,5 @@ async fn multiple_models_served_concurrently() {
         assert_eq!(row["inferenceMs"]["count"], want - rej, "{n}: {row}");
     }
 
-    token.cancel();
-    server.await.unwrap().unwrap();
-    if let Ok(reg) = Arc::try_unwrap(registry) {
-        reg.shutdown();
-    }
-    std::fs::remove_dir_all(&cache).ok();
+    server.stop().await;
 }

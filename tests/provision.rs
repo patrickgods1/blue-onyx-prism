@@ -3,8 +3,11 @@
 //! Ready in the same registry generation; with `auto_download: false` it is Failed with the
 //! command to run. Plus the "downloadable" device state.
 //!
-//! The load test needs `models/IPcam-general.{onnx,yaml}` and `openvino/` in the repo (served
-//! by the fixture / used as the runtime) and skips with a message otherwise.
+//! The load test is `#[ignore]`d: it needs `models/IPcam-general.{onnx,yaml}` and `openvino/`
+//! under `common::test_root()` (served by the fixture / used as the runtime); a missing one
+//! fails it.
+
+mod common;
 
 use blue_onyx_prism::backend::detect::{GpuAdapter, GpuVendor, HardwareInfo};
 use blue_onyx_prism::backend::select::{RuntimeProbe, select};
@@ -23,10 +26,6 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-
-fn repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
@@ -110,12 +109,6 @@ fn fixture_resource(base: &str, onnx: &[u8], yaml: &[u8]) -> &'static Resource {
     }))
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("bop-prov-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
 fn config(root: &Path, openvino_dir: Option<PathBuf>) -> Config {
     Config {
         download_dir: Some(root.to_path_buf()),
@@ -132,22 +125,11 @@ fn config(root: &Path, openvino_dir: Option<PathBuf>) -> Config {
 }
 
 #[test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
 fn model_download_goes_initializing_to_ready_without_restart() {
-    let models = repo().join("models");
-    let ov = repo().join("openvino");
-    let (onnx, yaml) = (
-        models.join("IPcam-general.onnx"),
-        models.join("IPcam-general.yaml"),
-    );
-    if !onnx.is_file() || !yaml.is_file() || !ov.is_dir() {
-        eprintln!(
-            "skipping: need {}, {} and {}",
-            onnx.display(),
-            yaml.display(),
-            ov.display()
-        );
-        return;
-    }
+    let onnx = common::require_ipcam();
+    let yaml = onnx.with_extension("yaml");
+    let ov = common::require_openvino();
     let (onnx, yaml) = (std::fs::read(onnx).unwrap(), std::fs::read(yaml).unwrap());
     let base = serve(
         vec![
@@ -157,7 +139,7 @@ fn model_download_goes_initializing_to_ready_without_restart() {
         Duration::from_millis(1500),
     );
     let res = fixture_resource(&base, &onnx, &yaml);
-    let root = tmp("ready");
+    let root = common::temp_dir("ready");
     let cfg = config(&root, Some(ov));
 
     let prov = Provisioner::with_options(ProvisionOptions {
@@ -216,7 +198,7 @@ fn model_download_goes_initializing_to_ready_without_restart() {
 #[test]
 fn auto_download_off_fails_with_the_command() {
     let res = fixture_resource("http://127.0.0.1:9", b"onnx", b"yaml");
-    let root = tmp("manual");
+    let root = common::temp_dir("manual");
     let mut cfg = config(&root, None);
     cfg.auto_download = false;
     let prov = Provisioner::with_options(ProvisionOptions {
