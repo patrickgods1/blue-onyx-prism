@@ -23,8 +23,11 @@
 //!   auto-detection is unchanged. Pinning is also what lets RT-DETR run on CoreML: an RT-DETR
 //!   model that keeps an unpinnable dynamic input dimension is refused there (see
 //!   [`unsupported_on`]).
-//! - [`OrtBackend::infer`] feeds the CHW image without copying, converts extra inputs to the
-//!   port's element type (i64/i32/f32) and copies every output into a [`NamedOutput`].
+//! - [`OrtBackend`] runs each session (`ort_sessions`, one model copy each) on its own thread,
+//!   one inference in flight per session (`Session::run` takes `&mut self`): `submit` copies the
+//!   CHW image into the slot's buffer and hands it over, the thread converts extra inputs to the
+//!   port's element type (i64/i32/f32), runs, copies every output into the slot's reused
+//!   [`NamedOutput`] buffers and signals a [`Completion`].
 
 use super::detect::{GpuVendor, HardwareInfo};
 #[cfg(test)]
@@ -34,7 +37,7 @@ use super::device::{
 };
 use super::select::{EpStatus, NEEDS_ONNX, OrtProbe, onnx_path_for};
 use super::spec::{Runtime, Target};
-use super::{Candidate, DeviceInfo, LoadRequest, ModelInfo, libs, onnx_rewrite};
+use super::{Candidate, Completion, DeviceInfo, LoadRequest, ModelInfo, libs, onnx_rewrite};
 use crate::model::{ExtraData, ExtraInput, NamedOutput, PortElem, PortSpec};
 use ::ort::ep::{self, ExecutionProvider};
 use ::ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
@@ -42,7 +45,7 @@ use ::ort::session::{Session, SessionInputValue};
 use ::ort::value::{DynValue, Tensor, TensorElementType, TensorRef, ValueType};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// The loaded ONNX Runtime library (process-wide).
@@ -395,8 +398,15 @@ impl OrtRuntime {
         &self.lib.path
     }
 
-    /// Create a session for `req` on exactly `cand.device` (an ONNX Runtime target).
-    pub fn compile(&self, cand: &Candidate, req: &LoadRequest) -> Result<OrtCompiled> {
+    /// Create `sessions` (at least 1) sessions for `req` on exactly `cand.device` (an ONNX
+    /// Runtime target). Each session runs one inference at a time on its own thread
+    /// ([`OrtBackend`]) and holds its own copy of the model.
+    pub fn compile(
+        &self,
+        cand: &Candidate,
+        req: &LoadRequest,
+        sessions: usize,
+    ) -> Result<OrtCompiled> {
         let target = cand.device.target;
         if cand.device.runtime != Runtime::Ort {
             bail!("{} is not an ONNX Runtime device", cand.device);
@@ -503,6 +513,10 @@ impl OrtRuntime {
             }
         }
         let (outputs, _) = ports(session.outputs());
+        let mut all = vec![session];
+        for _ in 1..sessions.max(1) {
+            all.push(self.build_session(target, index, &session_path, &overrides)?);
+        }
         let compile_ms = t0.elapsed().as_millis() as u64;
         let device = DeviceInfo {
             requested: req.requested.clone(),
@@ -513,9 +527,11 @@ impl OrtRuntime {
             spec: cand.device.to_string(),
         };
         tracing::info!(
-            "model {} loaded on {} in {compile_ms} ms; inputs {:?}, outputs {:?}",
+            "model {} loaded on {} in {compile_ms} ms ({} session{}); inputs {:?}, outputs {:?}",
             path.display(),
             device.execution_provider(),
+            all.len(),
+            if all.len() == 1 { "" } else { "s" },
             inputs
                 .iter()
                 .map(|p| (&p.name, &p.shape))
@@ -526,7 +542,7 @@ impl OrtRuntime {
                 .collect::<Vec<_>>()
         );
         Ok(OrtCompiled {
-            session,
+            sessions: all,
             info: ModelInfo {
                 path,
                 inputs,
@@ -962,13 +978,15 @@ pub(crate) fn dimension_overrides(
 
 // ---- compiled model and inference ------------------------------------------------------------
 
-/// An ONNX Runtime session plus its metadata. `Session` is `Send`, so this moves into the worker.
+/// ONNX Runtime sessions of one model plus its metadata. `Session` is `Send`, so this moves
+/// into the worker.
 pub struct OrtCompiled {
-    session: Session,
+    sessions: Vec<Session>,
     pub info: ModelInfo,
 }
 
 impl OrtCompiled {
+    /// Start one thread per session ([`OrtBackend`]).
     pub fn into_backend(self) -> Result<OrtBackend> {
         let image_idx = self
             .info
@@ -983,21 +1001,155 @@ impl OrtCompiled {
                 )
             })?;
         let image_shape = self.info.inputs[image_idx].shape.clone();
-        Ok(OrtBackend {
-            session: self.session,
-            info: self.info,
+        let run = Arc::new(RunCtx {
+            info: self.info.clone(),
             image_idx,
             image_shape,
+        });
+        let (done_tx, done_rx) = crossbeam_channel::unbounded();
+        let mut slots = Vec::with_capacity(self.sessions.len());
+        for (slot, session) in self.sessions.into_iter().enumerate() {
+            let (job_tx, job_rx) = crossbeam_channel::bounded::<OrtJob>(1);
+            let (res_tx, res_rx) = crossbeam_channel::bounded::<OrtResult>(1);
+            let (ctx, done) = (run.clone(), done_tx.clone());
+            let thread = std::thread::Builder::new()
+                .name(format!("ort-session-{slot}"))
+                .spawn(move || session_thread(session, &ctx, slot, &job_rx, &res_tx, &done))
+                .context("spawning an ONNX Runtime session thread")?;
+            slots.push(OrtSlot {
+                jobs: Some(job_tx),
+                results: res_rx,
+                thread: Some(thread),
+                chw: Vec::new(),
+                outs: Vec::new(),
+                busy: false,
+                seq: 0,
+            });
+        }
+        Ok(OrtBackend {
+            info: self.info,
+            slots,
+            done_rx,
         })
     }
 }
 
-/// Per-worker ONNX Runtime inference state.
-pub struct OrtBackend {
-    session: Session,
+/// What a session thread needs to feed its session.
+struct RunCtx {
     info: ModelInfo,
     image_idx: usize,
     image_shape: Vec<i64>,
+}
+
+/// One inference for a session thread; the buffers travel back in [`OrtResult`].
+struct OrtJob {
+    seq: u64,
+    chw: Vec<f32>,
+    extra: Vec<ExtraInput>,
+    outs: Vec<NamedOutput>,
+}
+
+struct OrtResult {
+    chw: Vec<f32>,
+    outs: Vec<NamedOutput>,
+    result: Result<()>,
+}
+
+/// A session thread and the buffers of its slot while idle.
+struct OrtSlot {
+    jobs: Option<crossbeam_channel::Sender<OrtJob>>,
+    results: crossbeam_channel::Receiver<OrtResult>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    chw: Vec<f32>,
+    outs: Vec<NamedOutput>,
+    busy: bool,
+    seq: u64,
+}
+
+/// Per-worker ONNX Runtime inference state: one session per slot, each on its own thread
+/// (`Session::run` takes `&mut self`, so one inference in flight per session).
+pub struct OrtBackend {
+    info: ModelInfo,
+    slots: Vec<OrtSlot>,
+    done_rx: crossbeam_channel::Receiver<Completion>,
+}
+
+fn session_thread(
+    mut session: Session,
+    ctx: &RunCtx,
+    slot: usize,
+    jobs: &crossbeam_channel::Receiver<OrtJob>,
+    results: &crossbeam_channel::Sender<OrtResult>,
+    done: &crossbeam_channel::Sender<Completion>,
+) {
+    while let Ok(mut job) = jobs.recv() {
+        let result = run_session(&mut session, ctx, &job.chw, &job.extra, &mut job.outs);
+        let at = Instant::now();
+        let r = OrtResult {
+            chw: job.chw,
+            outs: job.outs,
+            result,
+        };
+        if results.send(r).is_err() {
+            break;
+        }
+        let _ = done.send(Completion {
+            slot,
+            seq: job.seq,
+            at,
+        });
+    }
+}
+
+/// Run `session` on one image (+ extra inputs) and copy its outputs into `outs`.
+fn run_session(
+    session: &mut Session,
+    ctx: &RunCtx,
+    chw: &[f32],
+    extra: &[ExtraInput],
+    outs: &mut Vec<NamedOutput>,
+) -> Result<()> {
+    let info = &ctx.info;
+    let where_ = || format!("model {} on {}", info.path.display(), info.device.spec);
+    let expected: i64 = ctx.image_shape.iter().product();
+    if chw.len() as i64 != expected {
+        bail!(
+            "{}: input '{}' expects {expected} f32 values ({:?}), got {}",
+            where_(),
+            info.image_input,
+            ctx.image_shape,
+            chw.len()
+        );
+    }
+    let image = TensorRef::from_array_view((ctx.image_shape.clone(), chw))
+        .map_err(ort_err)
+        .with_context(|| format!("{}: creating the image tensor", where_()))?;
+    let mut inputs: Vec<(String, SessionInputValue<'_>)> = Vec::with_capacity(1 + extra.len());
+    inputs.push((info.image_input.clone(), image.into()));
+    for e in extra {
+        let i = extra_input_index(&info.inputs, ctx.image_idx, &e.name).with_context(|| {
+            format!(
+                "{}: extra input '{}' not among model inputs {:?}",
+                where_(),
+                e.name,
+                info.inputs.iter().map(|p| &p.name).collect::<Vec<_>>()
+            )
+        })?;
+        let port = &info.inputs[i];
+        let value = extra_value(port, e).with_context(where_)?;
+        inputs.push((port.name.clone(), value.into()));
+    }
+    let outputs = session
+        .run(inputs)
+        .map_err(|e| anyhow::anyhow!("{}: inference failed: {e}", where_()))?;
+    NamedOutput::resize_slots(outs, info.outputs.len());
+    for (spec, out) in info.outputs.iter().zip(outs.iter_mut()) {
+        let v = outputs
+            .get(&spec.name)
+            .with_context(|| format!("{}: missing output '{}'", where_(), spec.name))?;
+        read_output_into(&spec.name, v, out).with_context(where_)?;
+    }
+    Ok(())
 }
 
 /// An owned input tensor of `port`'s element type built from `extra` (converted as needed).
@@ -1092,7 +1244,104 @@ impl OrtBackend {
         &self.info
     }
 
-    /// Run one inference. `chw` must be `3 * w * h` f32 values in CHW order.
+    /// Number of sessions (slots).
+    pub fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Completions of submitted inferences.
+    pub fn completions(&self) -> &crossbeam_channel::Receiver<Completion> {
+        &self.done_rx
+    }
+
+    pub fn is_busy(&self, slot: usize) -> bool {
+        self.slots.get(slot).is_some_and(|s| s.busy)
+    }
+
+    /// Hand one inference to `slot`'s session thread (the image is copied into the slot's
+    /// buffer). Returns its sequence number.
+    pub fn submit(&mut self, slot: usize, chw: &[f32], extra: &[ExtraInput]) -> Result<u64> {
+        let n = self.slots.len();
+        let where_ = format!(
+            "model {} on {}",
+            self.info.path.display(),
+            self.info.device.spec
+        );
+        let s = self
+            .slots
+            .get_mut(slot)
+            .with_context(|| format!("{where_}: no session {slot} (have {n})"))?;
+        if s.busy {
+            bail!("{where_}: session {slot} is busy");
+        }
+        let mut buf = std::mem::take(&mut s.chw);
+        buf.clear();
+        buf.extend_from_slice(chw);
+        s.seq += 1;
+        let job = OrtJob {
+            seq: s.seq,
+            chw: buf,
+            extra: extra.to_vec(),
+            outs: std::mem::take(&mut s.outs),
+        };
+        s.jobs
+            .as_ref()
+            .with_context(|| format!("{where_}: session {slot} stopped"))?
+            .send(job)
+            .map_err(|_| anyhow::anyhow!("{where_}: session thread {slot} exited"))?;
+        s.busy = true;
+        Ok(s.seq)
+    }
+
+    /// The outputs of `slot`'s inference (waits for it); give the buffers back with
+    /// [`Self::recycle`].
+    pub fn collect(&mut self, slot: usize) -> Result<Vec<NamedOutput>> {
+        let where_ = format!(
+            "model {} on {}",
+            self.info.path.display(),
+            self.info.device.spec
+        );
+        let s = self
+            .slots
+            .get_mut(slot)
+            .with_context(|| format!("{where_}: no session {slot}"))?;
+        if !s.busy {
+            bail!("{where_}: session {slot} has no inference in flight");
+        }
+        s.busy = false;
+        let r = s
+            .results
+            .recv()
+            .map_err(|_| anyhow::anyhow!("{where_}: session thread {slot} exited"))?;
+        s.chw = r.chw;
+        match r.result {
+            Ok(()) => Ok(r.outs),
+            Err(e) => {
+                s.outs = r.outs;
+                Err(e)
+            }
+        }
+    }
+
+    /// Return output buffers lent by [`Self::collect`] to `slot`.
+    pub fn recycle(&mut self, slot: usize, outs: Vec<NamedOutput>) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.outs = outs;
+        }
+    }
+
+    /// Wait for every inference in flight and discard it (a running session cannot be
+    /// interrupted).
+    pub fn abort(&mut self) {
+        for slot in 0..self.slots.len() {
+            if self.slots[slot].busy {
+                let _ = self.collect(slot);
+            }
+        }
+    }
+
+    /// Run one inference synchronously on session 0. `chw` must be `3 * w * h` f32 values in
+    /// CHW order.
     pub fn infer(&mut self, chw: &[f32], extra: &[ExtraInput]) -> Result<Vec<NamedOutput>> {
         let mut outs = Vec::new();
         self.infer_into(chw, extra, &mut outs)?;
@@ -1106,55 +1355,28 @@ impl OrtBackend {
         extra: &[ExtraInput],
         outs: &mut Vec<NamedOutput>,
     ) -> Result<()> {
-        let where_ = || {
-            format!(
-                "model {} on {}",
-                self.info.path.display(),
-                self.info.device.spec
-            )
-        };
-        let expected: i64 = self.image_shape.iter().product();
-        if chw.len() as i64 != expected {
-            bail!(
-                "{}: input '{}' expects {expected} f32 values ({:?}), got {}",
-                where_(),
-                self.info.image_input,
-                self.image_shape,
-                chw.len()
-            );
-        }
-        let image = TensorRef::from_array_view((self.image_shape.clone(), chw))
-            .map_err(ort_err)
-            .with_context(|| format!("{}: creating the image tensor", where_()))?;
-        let mut inputs: Vec<(String, SessionInputValue<'_>)> = Vec::with_capacity(1 + extra.len());
-        inputs.push((self.info.image_input.clone(), image.into()));
-        for e in extra {
-            let i = extra_input_index(&self.info.inputs, self.image_idx, &e.name).with_context(
-                || {
-                    format!(
-                        "{}: extra input '{}' not among model inputs {:?}",
-                        where_(),
-                        e.name,
-                        self.info.inputs.iter().map(|p| &p.name).collect::<Vec<_>>()
-                    )
-                },
-            )?;
-            let port = &self.info.inputs[i];
-            let value = extra_value(port, e).with_context(where_)?;
-            inputs.push((port.name.clone(), value.into()));
-        }
-        let outputs = self
-            .session
-            .run(inputs)
-            .map_err(|e| anyhow::anyhow!("{}: inference failed: {e}", where_()))?;
-        NamedOutput::resize_slots(outs, self.info.outputs.len());
-        for (spec, out) in self.info.outputs.iter().zip(outs.iter_mut()) {
-            let v = outputs
-                .get(&spec.name)
-                .with_context(|| format!("{}: missing output '{}'", where_(), spec.name))?;
-            read_output_into(&spec.name, v, out).with_context(where_)?;
-        }
+        // Completions of earlier synchronous calls are never consumed; drop them.
+        while self.done_rx.try_recv().is_ok() {}
+        self.recycle(0, std::mem::take(outs));
+        self.submit(0, chw, extra)?;
+        *outs = self.collect(0)?;
         Ok(())
+    }
+}
+
+impl Drop for OrtBackend {
+    fn drop(&mut self) {
+        self.abort();
+        for s in &mut self.slots {
+            s.jobs = None;
+        }
+        for s in &mut self.slots {
+            if let Some(t) = s.thread.take()
+                && t.join().is_err()
+            {
+                tracing::warn!("ONNX Runtime session thread panicked");
+            }
+        }
     }
 }
 

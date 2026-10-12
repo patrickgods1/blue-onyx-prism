@@ -55,7 +55,7 @@ impl std::fmt::Display for ModelFamilyKind {
 }
 
 /// How the source image is fitted into the model input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResizeMode {
     /// Keep aspect ratio, pad with gray (114) and center. Used by YOLO families.
     Letterbox,

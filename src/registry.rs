@@ -30,6 +30,9 @@ pub struct ModelRegistry {
     /// Hardware profile of this generation and its decode + preprocess thread count (None for
     /// registries built from handles).
     profile: Option<(Profile, usize)>,
+    /// The generation's decode + preprocess pool (shared with the workers; its threads stop
+    /// when the last holder drops it).
+    _prep: Option<Arc<crate::prep::PrepPool>>,
 }
 
 /// Lowercase and strip a trailing `.onnx` / `.xml` (Blue Iris sends file stems, users may not).
@@ -274,6 +277,7 @@ impl ModelRegistry {
             profile = %profile.summary(prep_threads),
             "hardware profile"
         );
+        let prep = crate::prep::PrepPool::new(prep_threads);
         let runtimes = Arc::new(Mutex::new(runtimes));
 
         let mut workers = Vec::with_capacity(enabled.len());
@@ -383,6 +387,11 @@ impl ModelRegistry {
                 can_use_gpu: runtime_info.has_gpu,
                 model: resolved,
                 wait,
+                concurrency: Some(crate::worker::Concurrency {
+                    profile: profile.clone(),
+                    overrides: config.concurrency_overrides(m),
+                }),
+                prep: Some(prep.clone()),
             };
             let mut handle =
                 spawn_worker_after(runtimes.clone(), cfg, mm, shutdown.clone(), prev.take());
@@ -403,6 +412,7 @@ impl ModelRegistry {
             runtime_info,
             runtimes: Some(runtimes),
             profile: Some((profile, prep_threads)),
+            _prep: Some(prep),
         })
     }
 
@@ -426,6 +436,7 @@ impl ModelRegistry {
             runtime_info,
             runtimes: None,
             profile: None,
+            _prep: None,
         }
     }
 

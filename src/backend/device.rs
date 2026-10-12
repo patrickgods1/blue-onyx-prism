@@ -6,12 +6,15 @@
 //! whose ports have no tensor names still work.
 
 use super::spec::{Runtime, Target};
-use super::{Candidate, CoreOptions, LoadRequest, ModelInfo, OvBackend, OvCompiled};
+use super::{Candidate, Completion, CoreOptions, LoadRequest, ModelInfo, OvBackend, OvCompiled};
 use crate::model::{ExtraData, ExtraInput, NamedOutput, PortElem, PortSpec};
+use crate::profile::{DeviceTuning, PerfHint};
 use anyhow::{Context, Result};
+use crossbeam_channel::Sender;
 use openvino::{
     DeviceType, ElementType, Model, Node, PartialShape, PropertyKey, RwPropertyKey, Shape, Tensor,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Static input shape used when the image input has dynamic dimensions and nothing better is
@@ -372,9 +375,24 @@ fn compile_on(
     device: &str,
     gpu_precision: &str,
     needs_f32: bool,
+    hint: PerfHint,
     path: &std::path::Path,
 ) -> Result<openvino::CompiledModel> {
     let dt = DeviceType::from(device);
+    // A Core-wide setting like the precision hint: set before every compile so each model gets
+    // its own (THROUGHPUT for a discrete GPU or a many-core CPU, see `profile`).
+    match core_set_property(
+        core,
+        &dt,
+        &RwPropertyKey::HintPerformanceMode,
+        hint.as_str(),
+    ) {
+        Ok(()) => tracing::debug!("OpenVINO {device}: PERFORMANCE_HINT={}", hint.as_str()),
+        Err(e) => tracing::warn!(
+            "OpenVINO {device}: failed to set PERFORMANCE_HINT={}: {e}",
+            hint.as_str()
+        ),
+    }
     if device.eq_ignore_ascii_case("CPU") {
         set_cpu_precision(core, &dt, needs_f32);
     }
@@ -419,6 +437,7 @@ pub fn load_model(
     available: &[String],
     cand: &Candidate,
     req: &LoadRequest,
+    tuning: &DeviceTuning,
 ) -> Result<OvCompiled> {
     let mut primary = cand
         .device
@@ -479,9 +498,26 @@ pub fn load_model(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(if needs_f32 { "f32" } else { "f16" })
         .to_ascii_lowercase();
-    let compiled = compile_on(core, &model, &primary, &precision, needs_f32, path)?;
+    let compiled = compile_on(
+        core,
+        &model,
+        &primary,
+        &precision,
+        needs_f32,
+        tuning.hint,
+        path,
+    )?;
     let actual = primary;
     let compile_ms = t0.elapsed().as_millis() as u64;
+    // Streams the plugin created for the hint (THROUGHPUT: several); bounds `inflight`.
+    let read_count = |key: PropertyKey| {
+        compiled
+            .get_property(&key)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    };
+    let streams = read_count(PropertyKey::Rw(RwPropertyKey::NumStreams));
+    let optimal_requests = read_count(PropertyKey::OptimalNumberOfInferRequests);
     let device = DeviceInfo {
         requested: req.requested.clone(),
         full_name: full_device_name(core, &actual),
@@ -491,10 +527,14 @@ pub fn load_model(
         spec: cand.device.to_string(),
     };
     tracing::info!(
-        "model {} compiled on {} ({}) in {compile_ms} ms; inputs {:?}, outputs {:?}",
+        "model {} compiled on {} ({}) in {compile_ms} ms, PERFORMANCE_HINT={}, NUM_STREAMS={}, \
+         OPTIMAL_NUMBER_OF_INFER_REQUESTS={}; inputs {:?}, outputs {:?}",
         path.display(),
         device.actual,
         device.full_name,
+        tuning.hint.as_str(),
+        streams.map_or("?".to_string(), |n| n.to_string()),
+        optimal_requests.map_or("?".to_string(), |n| n.to_string()),
         inputs
             .iter()
             .map(|p| (&p.name, &p.shape))
@@ -506,6 +546,8 @@ pub fn load_model(
     );
     Ok(OvCompiled {
         compiled,
+        tuning: *tuning,
+        streams,
         info: ModelInfo {
             path: path.clone(),
             inputs,
@@ -532,10 +574,120 @@ fn image_index(model: &ModelInfo) -> Result<usize> {
         })
 }
 
+/// Context of one slot's completion callback: boxed in the slot, so its address is stable for
+/// the lifetime of the slot's `InferRequest`.
+pub(crate) struct CallbackCtx {
+    slot: usize,
+    /// Sequence number of the inference in flight (set by `submit` before `infer_async`).
+    seq: AtomicU64,
+    tx: Sender<Completion>,
+}
+
+/// `ov_callback_t` of a slot. Holds a raw pointer to the slot's own [`CallbackCtx`] only.
+pub(crate) struct CallbackBox {
+    _cb: Box<openvino_sys::ov_callback_t>,
+}
+
+// SAFETY: the only pointer inside is `args`, which points at the slot's boxed `CallbackCtx`
+// (an `AtomicU64` and a crossbeam `Sender`, both `Send + Sync`); it moves with the slot.
+unsafe impl Send for CallbackBox {}
+
+/// Called by OpenVINO on its own thread when an asynchronous inference finished (also after a
+/// failure or cancel). Never panics: it only reads the context and sends on an unbounded
+/// channel.
+unsafe extern "C" fn on_infer_done(args: *mut std::ffi::c_void) {
+    if args.is_null() {
+        return;
+    }
+    // SAFETY: `args` is the `CallbackCtx` boxed in the same slot as the request; the slot drops
+    // its request (which waits for running inferences) before the context.
+    let ctx = unsafe { &*(args as *const CallbackCtx) };
+    let _ = ctx.tx.send(Completion {
+        slot: ctx.slot,
+        seq: ctx.seq.load(Ordering::Acquire),
+        at: Instant::now(),
+    });
+}
+
+/// The `ov_infer_request_t` behind an `openvino::InferRequest`.
+fn raw_request(r: &openvino::InferRequest) -> *mut openvino_sys::ov_infer_request_t {
+    // `openvino::InferRequest` (0.11) is a struct whose only field is this pointer.
+    const _: () = assert!(
+        std::mem::size_of::<openvino::InferRequest>()
+            == std::mem::size_of::<*mut openvino_sys::ov_infer_request_t>()
+    );
+    // SAFETY: same size (asserted above) and the single field is the pointer; reading it does
+    // not transfer ownership (`r` still frees it).
+    unsafe { std::mem::transmute_copy(r) }
+}
+
+/// The last OpenVINO C API error message (empty when none).
+fn last_error() -> String {
+    // SAFETY: returns a pointer to a thread-local NUL-terminated string or null.
+    unsafe {
+        let p = openvino_sys::ov_get_last_err_msg();
+        if p.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Block until the request's current inference finished (`ov_infer_request_wait`). The crate
+/// only exposes `wait_for`, whose C wrapper reports success when the timeout expires, so it
+/// cannot tell "done" from "still running".
+fn wait_done(request: &mut openvino::InferRequest) -> Result<()> {
+    // SAFETY: the pointer is a live request owned by `request` (borrowed mutably for the call).
+    let status = unsafe { openvino_sys::ov_infer_request_wait(raw_request(request)) };
+    if status == openvino_sys::ov_status_e::OK {
+        Ok(())
+    } else {
+        let msg = last_error();
+        anyhow::bail!("{status:?}: {msg}")
+    }
+}
+
+/// Register `ctx` as the completion callback of `request`.
+fn set_callback(request: &mut openvino::InferRequest, ctx: &CallbackCtx) -> Result<CallbackBox> {
+    let cb = Box::new(openvino_sys::ov_callback_t {
+        callback_func: Some(on_infer_done),
+        args: ctx as *const CallbackCtx as *mut std::ffi::c_void,
+    });
+    // SAFETY: the C API keeps the `ov_callback_t` pointer (boxed and kept in the slot next to
+    // the request, dropped after it) and calls `on_infer_done(args)` on completion.
+    let status = unsafe {
+        openvino_sys::ov_infer_request_set_callback(raw_request(request), &*cb as *const _)
+    };
+    if status != openvino_sys::ov_status_e::OK {
+        anyhow::bail!(
+            "setting the completion callback: {status:?}: {}",
+            last_error()
+        );
+    }
+    Ok(CallbackBox { _cb: cb })
+}
+
+/// One `InferRequest` of a compiled model with its input tensor and output buffers.
+/// Field order matters: the request is dropped before its callback.
+pub(crate) struct OvSlot {
+    request: openvino::InferRequest,
+    input: Tensor,
+    /// Extra inputs of the inference in flight, alive until it completes.
+    extras: Vec<Tensor>,
+    /// Output buffers, lent out by `collect` and returned by `recycle`.
+    outputs: Vec<NamedOutput>,
+    busy: bool,
+    _callback: CallbackBox,
+    ctx: Box<CallbackCtx>,
+}
+
 pub fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
     let OvCompiled {
         mut compiled,
         info: model,
+        tuning,
+        streams,
     } = compiled;
     let idx = image_index(&model)?;
     let spec = &model.inputs[idx];
@@ -555,25 +707,59 @@ pub fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
             spec.name
         )
     })?;
-    let input_tensor = Tensor::new(ElementType::F32, &shape).with_context(|| {
-        format!(
-            "model {}: allocating f32 input tensor {:?} for '{}'",
-            model.path.display(),
-            spec.shape,
-            spec.name
-        )
-    })?;
-    let request = compiled.create_infer_request().with_context(|| {
-        format!(
-            "model {}: creating infer request on {}",
-            model.path.display(),
-            model.device.actual
-        )
-    })?;
+    let n = tuning.effective_inflight(streams);
+    let (done_tx, done_rx) = crossbeam_channel::unbounded();
+    let mut slots = Vec::with_capacity(n);
+    for slot in 0..n {
+        let input = Tensor::new(ElementType::F32, &shape).with_context(|| {
+            format!(
+                "model {}: allocating f32 input tensor {:?} for '{}'",
+                model.path.display(),
+                spec.shape,
+                spec.name
+            )
+        })?;
+        let mut request = compiled.create_infer_request().with_context(|| {
+            format!(
+                "model {}: creating infer request {slot} on {}",
+                model.path.display(),
+                model.device.actual
+            )
+        })?;
+        let ctx = Box::new(CallbackCtx {
+            slot,
+            seq: AtomicU64::new(0),
+            tx: done_tx.clone(),
+        });
+        let callback = set_callback(&mut request, &ctx).with_context(|| {
+            format!(
+                "model {}: infer request {slot} on {}",
+                model.path.display(),
+                model.device.actual
+            )
+        })?;
+        slots.push(OvSlot {
+            request,
+            input,
+            extras: Vec::new(),
+            outputs: Vec::new(),
+            busy: false,
+            _callback: callback,
+            ctx,
+        });
+    }
+    tracing::debug!(
+        "model {} on {}: {n} infer request(s) (PERFORMANCE_HINT={}, NUM_STREAMS={streams:?})",
+        model.path.display(),
+        model.device.actual,
+        tuning.hint.as_str()
+    );
     Ok(OvBackend {
         info: model,
-        request,
-        input_tensor,
+        slots,
+        done_rx,
+        tuning,
+        streams,
         _compiled: compiled,
     })
 }
@@ -731,19 +917,27 @@ pub(crate) fn read_outputs(
     Ok(())
 }
 
-/// Run one inference synchronously; the outputs go into `outs` (buffers reused).
-pub fn run_inference(
+/// Start an inference on `slot` (`infer_async`); its completion arrives on the backend's
+/// completion channel with the returned sequence number.
+pub(crate) fn submit(
     model: &ModelInfo,
-    request: &mut openvino::InferRequest,
-    input_tensor: &mut openvino::Tensor,
+    slots: &mut [OvSlot],
+    slot: usize,
     chw: &[f32],
     extra: &[ExtraInput],
-    outs: &mut Vec<NamedOutput>,
-) -> Result<()> {
+) -> Result<u64> {
     let where_ = || format!("model {} on {}", model.path.display(), model.device.actual);
+    let n = slots.len();
+    let s = slots
+        .get_mut(slot)
+        .with_context(|| format!("{}: no infer request {slot} (have {n})", where_()))?;
+    if s.busy {
+        anyhow::bail!("{}: infer request {slot} is busy", where_());
+    }
     let idx = image_index(model)?;
     {
-        let dst = input_tensor
+        let dst = s
+            .input
             .get_data_mut::<f32>()
             .with_context(|| format!("{}: mapping input '{}'", where_(), model.image_input))?;
         if dst.len() != chw.len() {
@@ -758,12 +952,12 @@ pub fn run_inference(
         }
         dst.copy_from_slice(chw);
     }
-    request
-        .set_input_tensor_by_index(idx, input_tensor)
+    s.request
+        .set_input_tensor_by_index(idx, &s.input)
         .with_context(|| format!("{}: setting input '{}'", where_(), model.image_input))?;
 
-    // Keep extra tensors alive until inference completes.
-    let mut extras = Vec::with_capacity(extra.len());
+    // Extra tensors stay alive in the slot until the inference completes.
+    s.extras.clear();
     for e in extra {
         let i = extra_input_index(&model.inputs, idx, &e.name).with_context(|| {
             format!(
@@ -774,17 +968,68 @@ pub fn run_inference(
             )
         })?;
         let t = extra_tensor(model, &model.inputs[i], e)?;
-        request
+        s.request
             .set_input_tensor_by_index(i, &t)
             .with_context(|| format!("{}: setting input '{}'", where_(), e.name))?;
-        extras.push(t);
+        s.extras.push(t);
     }
+    let seq = s.ctx.seq.fetch_add(1, Ordering::AcqRel) + 1;
+    s.request
+        .infer_async()
+        .with_context(|| format!("{}: starting inference", where_()))?;
+    s.busy = true;
+    Ok(seq)
+}
 
-    request
-        .infer()
-        .with_context(|| format!("{}: inference failed", where_()))?;
-    drop(extras);
-    read_outputs(model, request, outs)
+/// Wait for `slot`'s inference (immediate once its completion arrived) and read its outputs
+/// into the slot's buffers, which are lent to the caller (give them back with [`recycle`]).
+pub(crate) fn collect(
+    model: &ModelInfo,
+    slots: &mut [OvSlot],
+    slot: usize,
+) -> Result<Vec<NamedOutput>> {
+    let where_ = || format!("model {} on {}", model.path.display(), model.device.actual);
+    let s = slots
+        .get_mut(slot)
+        .with_context(|| format!("{}: no infer request {slot}", where_()))?;
+    if !s.busy {
+        anyhow::bail!(
+            "{}: infer request {slot} has no inference in flight",
+            where_()
+        );
+    }
+    s.busy = false;
+    let waited = wait_done(&mut s.request);
+    s.extras.clear();
+    waited.with_context(|| format!("{}: inference failed", where_()))?;
+    let mut outs = std::mem::take(&mut s.outputs);
+    read_outputs(model, &s.request, &mut outs)?;
+    Ok(outs)
+}
+
+/// Give output buffers lent by [`collect`] back to `slot`.
+pub(crate) fn recycle(slots: &mut [OvSlot], slot: usize, outs: Vec<NamedOutput>) {
+    if let Some(s) = slots.get_mut(slot) {
+        s.outputs = outs;
+    }
+}
+
+/// True while `slot` has an inference in flight.
+pub(crate) fn is_busy(slots: &[OvSlot], slot: usize) -> bool {
+    slots.get(slot).is_some_and(|s| s.busy)
+}
+
+/// Cancel every inference in flight and wait for it, so no request runs past this call.
+pub(crate) fn abort(slots: &mut [OvSlot]) {
+    for s in slots.iter_mut().filter(|s| s.busy) {
+        if let Err(e) = s.request.cancel() {
+            tracing::debug!("cancelling an inference: {e}");
+        }
+        // A cancelled request reports an error from `wait`; it is finished either way.
+        let _ = wait_done(&mut s.request);
+        s.busy = false;
+        s.extras.clear();
+    }
 }
 
 #[cfg(test)]

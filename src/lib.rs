@@ -8,6 +8,7 @@
 //! - [`config_merge`] field-level config view: change summaries, pending restart, 3-way form merge
 //! - [`backend`]   runtimes (OpenVINO today), device specs, load plans, inference backends
 //! - [`model`]     model families (yolo26, yolo5, yolo8, rtdetr): pre/post-processing
+//! - [`prep`]      process-wide decode + preprocess pool shared by the workers
 //! - [`profile`]   hardware profile (low/mid/high): defaults of the concurrency settings
 //! - [`registry`]  loads all configured models and owns their worker threads
 //! - [`worker`]    per-model inference thread
@@ -31,6 +32,7 @@ pub mod image;
 pub mod logbuf;
 pub mod metrics;
 pub mod model;
+pub mod prep;
 pub mod profile;
 pub mod registry;
 pub mod resources;
