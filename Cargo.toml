@@ -72,7 +72,7 @@ flate2 = "1"
 # SHA-256 of downloads (already in the tree via other crates).
 sha2 = "0.11"
 num_cpus = "1"
-base64 = "0.22"
+base64 = "0.23"
 # Same major as openvino-sys's runtime-linking dependency; used to preload libtbb/libopenvino
 # (Unix) and to probe the ONNX Runtime / CUDA libraries.
 libloading = "0.8"
