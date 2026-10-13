@@ -743,8 +743,8 @@ mod cuda_driver {
             .ok()
             .map(|p| unsafe { std::mem::transmute::<*const (), CuDeviceGetLuid>(p) });
 
-        // SAFETY (every driver call below): plain driver queries with the cuda.h signatures,
-        // writing into local out-parameters of the documented sizes.
+        // SAFETY: every driver call below is a plain query with its cuda.h signature, writing
+        // into local out-parameters of the documented sizes.
         check("cuInit", unsafe { init(0) })?;
         let mut n: c_int = 0;
         // SAFETY: see above.
