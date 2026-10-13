@@ -334,6 +334,66 @@ def ultralytics_model(name: str, args: argparse.Namespace):
     return YOLO(str(weights) if weights.exists() else f"{name}.pt")
 
 
+def top_detection_scores(a, k: int = 20):
+    """The `k` highest class scores of an Ultralytics detection output, sorted ascending, from
+    either layout: end-to-end `[1, N, 6]` (score in column 4) or the raw head `[1, 4 + C, A]`
+    (sigmoid class scores in rows 4..). The end-to-end head keeps the top (anchor, class) pairs,
+    so both layouts give the same top-k of the same model. None for an unknown layout."""
+    import numpy as np
+
+    a = np.asarray(a, dtype=np.float64)
+    if a.ndim == 3 and a.shape[0] == 1 and a.shape[2] == 6:
+        s = a[0, :, 4]
+    elif a.ndim == 3 and a.shape[0] == 1 and a.shape[1] == 4 + len(COCO80):
+        s = a[0, 4:, :].ravel()
+    else:
+        return None
+    return np.sort(s)[-k:]
+
+
+def check_ultralytics_numerics(name: str, yolo, onnx: Path, input_name: str, imgsz: int) -> None:
+    """Run the PyTorch model and the exported ONNX (ONNX Runtime, CPU) on the synthetic image and
+    fail when their top-20 detection scores differ by more than 1e-2 (as the RF-DETR / DEIMv2
+    recipes do). With the raw `[1, 84, A]` head in both, the boxes of the 20 best anchors must also
+    agree within 0.5 px. When the PyTorch eval output has another layout than the ONNX graph
+    (Ultralytics' export mode can reshape the end-to-end head), only the top scores are compared,
+    which both layouts carry."""
+    import numpy as np
+    import torch
+
+    x = synthetic_image(imgsz)
+    model = yolo.model.float().eval()
+    with torch.no_grad():
+        ref = model(torch.from_numpy(x))
+    # Eval mode returns (output, extras) in most heads; take the first tensor.
+    while isinstance(ref, (tuple, list)) and ref:
+        ref = ref[0]
+    if isinstance(ref, dict):
+        ref = ref.get("one2one", next(iter(ref.values()), None))
+        while isinstance(ref, (tuple, list)) and ref:
+            ref = ref[0]
+    if not isinstance(ref, torch.Tensor):
+        fail(f"{name}: the PyTorch model returned {type(ref).__name__}, not a tensor; cannot check the export")
+    ref = ref.detach().float().numpy()
+    got = compare_with_onnxruntime(name, onnx, {input_name: x}, {})
+    out = next(iter(got.values()))
+    a, b = top_detection_scores(ref), top_detection_scores(out)
+    if a is None or b is None:
+        fail(f"{name}: cannot compare PyTorch {ref.shape} with ONNX Runtime {out.shape} (unknown output layout)")
+    if ref.shape != out.shape:
+        log(f"{name}: PyTorch output {ref.shape} vs ONNX {out.shape}: comparing the top-20 scores only")
+    diff = float(np.abs(a - b).max())
+    log(f"{name}: top-20 score difference PyTorch vs ONNX Runtime: {diff:.2e}")
+    if diff > 1e-2:
+        fail(f"{name}: ONNX Runtime and PyTorch disagree (top scores differ by {diff:.3f})")
+    if ref.shape == out.shape and ref.shape[1] == 4 + len(COCO80):
+        best = np.argsort(ref[0, 4:, :].max(axis=0))[-20:]
+        box_diff = float(np.abs(ref[0, :4, best] - out[0, :4, best]).max())
+        log(f"{name}: box difference of the 20 best anchors: {box_diff:.2e} px")
+        if box_diff > 0.5:
+            fail(f"{name}: ONNX Runtime and PyTorch boxes disagree by {box_diff:.2f} px")
+
+
 def export_ultralytics(name: str, family: str, imgsz: int, args: argparse.Namespace) -> dict:
     out: dict = {}
     names: list[str] = []
@@ -366,6 +426,7 @@ def export_ultralytics(name: str, family: str, imgsz: int, args: argparse.Namesp
         onnx = Path(model.export(format="onnx", imgsz=imgsz, dynamic=False, nms=False, batch=1, opset=args.opset))
         inputs, outputs = onnx_ports(onnx)
         log(f"{name}: " + check_ports(name, family, inputs, outputs, imgsz))
+        check_ultralytics_numerics(name, ultralytics_model(name, args), onnx, list(inputs)[0], imgsz)
         out["onnx"] = args.out / f"{name}.onnx"
         shutil.copy2(onnx, out["onnx"])
         stamp_coreml_cache_key(out["onnx"])

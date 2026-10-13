@@ -98,6 +98,51 @@ impl Histogram {
     }
 }
 
+/// Process-wide download counters (bytes received and failed jobs), incremented by the
+/// resources manager and rendered by [`render_prometheus`].
+#[derive(Debug, Default)]
+pub struct DownloadCounters {
+    pub bytes: AtomicU64,
+    pub failures: AtomicU64,
+}
+
+pub static DOWNLOADS: DownloadCounters = DownloadCounters {
+    bytes: AtomicU64::new(0),
+    failures: AtomicU64::new(0),
+};
+
+/// Why a detection request was rejected before inference (`requests_rejected_total{reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The server-wide in-flight cap was reached (503).
+    Overloaded,
+    /// The upload exceeded the body limit.
+    BodyTooLarge,
+    /// The image could not be decoded or was rejected by its size (counted per model by the
+    /// worker, see [`ModelMetrics::record_decode_error`]).
+    DecodeError,
+    /// Not a multipart body, no `image` field, a malformed or stalled upload.
+    BadRequest,
+}
+
+impl RejectReason {
+    pub const ALL: [RejectReason; 4] = [
+        RejectReason::Overloaded,
+        RejectReason::BodyTooLarge,
+        RejectReason::DecodeError,
+        RejectReason::BadRequest,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RejectReason::Overloaded => "overloaded",
+            RejectReason::BodyTooLarge => "body_too_large",
+            RejectReason::DecodeError => "decode_error",
+            RejectReason::BadRequest => "bad_request",
+        }
+    }
+}
+
 /// Why a request was not served by inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
@@ -142,6 +187,8 @@ pub struct ModelMetrics {
     execution_provider: RwLock<String>,
     pub requests: AtomicU64,
     dropped: [AtomicU64; DropReason::ALL.len()],
+    /// Requests whose image failed to decode (or was rejected by its size) before inference.
+    decode_errors: AtomicU64,
     pub inference_ms: Histogram,
     pub process_ms: Histogram,
     pub round_trip_ms: Histogram,
@@ -161,6 +208,7 @@ impl ModelMetrics {
             execution_provider: RwLock::new(execution_provider.into()),
             requests: AtomicU64::new(0),
             dropped: std::array::from_fn(|_| AtomicU64::new(0)),
+            decode_errors: AtomicU64::new(0),
             inference_ms: Histogram::new(),
             process_ms: Histogram::new(),
             round_trip_ms: Histogram::new(),
@@ -178,6 +226,16 @@ impl ModelMetrics {
         self.dropped
             .get(reason as usize)
             .map_or(0, |d| d.load(Ordering::Relaxed))
+    }
+
+    /// Count one request whose image could not be decoded (called by the worker's prep
+    /// stage); rendered as `requests_rejected_total{reason="decode_error"}`, summed over models.
+    pub fn record_decode_error(&self) {
+        self.decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn decode_errors(&self) -> u64 {
+        self.decode_errors.load(Ordering::Relaxed)
     }
 
     /// Drops that count as failures (everything except answers while initializing).
@@ -272,6 +330,10 @@ pub struct Metrics {
     /// Detection requests answered 503 because the server-wide in-flight cap was reached
     /// (see [`Metrics::try_begin_detection`]).
     pub rejected_overloaded: AtomicU64,
+    /// Detection uploads larger than the body limit.
+    pub rejected_body_too_large: AtomicU64,
+    /// Detection requests without a usable multipart body (see [`RejectReason::BadRequest`]).
+    pub rejected_bad_request: AtomicU64,
     /// Fixed server-wide in-flight cap for detection requests; 0 (the default) derives it from
     /// the models' queue capacities on every request (see `server::detect::max_inflight`).
     pub inflight_limit: AtomicUsize,
@@ -344,6 +406,8 @@ impl Metrics {
             models: RwLock::new(Vec::new()),
             restarts: AtomicU64::new(0),
             rejected_overloaded: AtomicU64::new(0),
+            rejected_body_too_large: AtomicU64::new(0),
+            rejected_bad_request: AtomicU64::new(0),
             inflight_limit: AtomicUsize::new(0),
             overload_log: LogThrottle::default(),
             inflight: AtomicUsize::new(0),
@@ -359,6 +423,33 @@ impl Metrics {
             })
             .ok()
             .map(|_| InflightPermit(self.clone()))
+    }
+
+    /// Count one rejected detection request ([`RejectReason::DecodeError`] is counted per
+    /// model instead, see [`ModelMetrics::record_decode_error`]; recording it here is a no-op).
+    pub fn record_rejected(&self, reason: RejectReason) {
+        let c = match reason {
+            RejectReason::Overloaded => &self.rejected_overloaded,
+            RejectReason::BodyTooLarge => &self.rejected_body_too_large,
+            RejectReason::BadRequest => &self.rejected_bad_request,
+            RejectReason::DecodeError => return,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Rejected detection requests for `reason` (decode errors summed over every model).
+    pub fn rejected(&self, reason: RejectReason) -> u64 {
+        match reason {
+            RejectReason::Overloaded => self.rejected_overloaded.load(Ordering::Relaxed),
+            RejectReason::BodyTooLarge => self.rejected_body_too_large.load(Ordering::Relaxed),
+            RejectReason::BadRequest => self.rejected_bad_request.load(Ordering::Relaxed),
+            RejectReason::DecodeError => self
+                .models
+                .read_recover()
+                .iter()
+                .map(|m| m.decode_errors())
+                .sum(),
+        }
     }
 
     /// Detection requests being handled now.
@@ -392,6 +483,53 @@ impl Metrics {
     }
 }
 
+/// Process resource gauges that are cheap to read on this platform (`None`: not available
+/// here, so the series is left out). Linux reads `/proc/self/status` and `/proc/self/fd`;
+/// macOS and Windows expose neither through `std`, so both series are omitted there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessStats {
+    pub resident_memory_bytes: Option<u64>,
+    pub open_fds: Option<u64>,
+}
+
+impl ProcessStats {
+    #[cfg(target_os = "linux")]
+    pub fn read() -> Self {
+        let resident_memory_bytes = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| parse_vm_rss(&s));
+        // The count includes the descriptor `read_dir` itself holds open.
+        let open_fds = std::fs::read_dir("/proc/self/fd")
+            .ok()
+            .map(|d| d.count() as u64)
+            .map(|n| n.saturating_sub(1));
+        Self {
+            resident_memory_bytes,
+            open_fds,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn read() -> Self {
+        Self::default()
+    }
+}
+
+/// `VmRSS` of a `/proc/<pid>/status` text, in bytes (the kernel prints it in kB).
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "used on Linux and in tests")
+)]
+fn parse_vm_rss(status: &str) -> Option<u64> {
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let mut it = line.trim_start_matches("VmRSS:").split_whitespace();
+    let kb: u64 = it.next()?.parse().ok()?;
+    match it.next() {
+        Some("kB") | None => kb.checked_mul(1024),
+        Some(_) => None,
+    }
+}
+
 fn escape_label(v: &str) -> String {
     v.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -415,6 +553,18 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
     );
     let _ = writeln!(
         out,
+        "# HELP {PREFIX}build_info Build information: version, git commit and build date; value is always 1."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}build_info gauge");
+    let _ = writeln!(
+        out,
+        "{PREFIX}build_info{{version=\"{}\",git_sha=\"{}\",build_date=\"{}\"}} 1",
+        escape_label(&m.version),
+        escape_label(crate::GIT_SHA),
+        escape_label(crate::BUILD_DATE)
+    );
+    let _ = writeln!(
+        out,
         "# HELP {PREFIX}uptime_seconds Seconds since the service started."
     );
     let _ = writeln!(out, "# TYPE {PREFIX}uptime_seconds gauge");
@@ -433,14 +583,51 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
 
     let _ = writeln!(
         out,
-        "# HELP {PREFIX}requests_rejected_total Detection requests rejected before reaching a model, by reason (overloaded: the server-wide in-flight cap was reached)."
+        "# HELP {PREFIX}requests_rejected_total Detection requests rejected before inference, by reason (overloaded: the server-wide in-flight cap was reached; body_too_large: the upload exceeded the body limit; decode_error: the image could not be decoded; bad_request: no usable multipart image upload)."
     );
     let _ = writeln!(out, "# TYPE {PREFIX}requests_rejected_total counter");
-    let _ = writeln!(
-        out,
-        "{PREFIX}requests_rejected_total{{reason=\"overloaded\"}} {}",
-        m.rejected_overloaded.load(Ordering::Relaxed)
-    );
+    for reason in RejectReason::ALL {
+        let _ = writeln!(
+            out,
+            "{PREFIX}requests_rejected_total{{reason=\"{}\"}} {}",
+            reason.as_str(),
+            m.rejected(reason)
+        );
+    }
+    let downloads = [
+        (
+            "download_bytes_total",
+            "Bytes received by on-demand resource downloads.",
+            &DOWNLOADS.bytes,
+        ),
+        (
+            "download_failures_total",
+            "On-demand resource download jobs that failed.",
+            &DOWNLOADS.failures,
+        ),
+    ];
+    for (name, help, counter) in downloads {
+        let _ = writeln!(out, "# HELP {PREFIX}{name} {help}");
+        let _ = writeln!(out, "# TYPE {PREFIX}{name} counter");
+        let _ = writeln!(out, "{PREFIX}{name} {}", counter.load(Ordering::Relaxed));
+    }
+    let p = ProcessStats::read();
+    if let Some(rss) = p.resident_memory_bytes {
+        let _ = writeln!(
+            out,
+            "# HELP {PREFIX}process_resident_memory_bytes Resident memory of the process in bytes."
+        );
+        let _ = writeln!(out, "# TYPE {PREFIX}process_resident_memory_bytes gauge");
+        let _ = writeln!(out, "{PREFIX}process_resident_memory_bytes {rss}");
+    }
+    if let Some(fds) = p.open_fds {
+        let _ = writeln!(
+            out,
+            "# HELP {PREFIX}process_open_fds Open file descriptors of the process."
+        );
+        let _ = writeln!(out, "# TYPE {PREFIX}process_open_fds gauge");
+        let _ = writeln!(out, "{PREFIX}process_open_fds {fds}");
+    }
     let _ = writeln!(
         out,
         "# HELP {PREFIX}inflight_requests Detection requests being handled now (body read, queue wait, inference)."
@@ -630,6 +817,72 @@ mod tests {
         assert!(text.contains("blue_onyx_prism_requests_rejected_total{reason=\"overloaded\"} 3"));
         assert!(text.contains("# TYPE blue_onyx_prism_requests_rejected_total counter"));
         assert!(text.contains("blue_onyx_prism_inflight_requests 1"));
+    }
+
+    #[test]
+    fn prometheus_reject_reasons_build_info_and_downloads() {
+        let m = Arc::new(Metrics::new("9.8.7"));
+        m.record_rejected(RejectReason::BodyTooLarge);
+        m.record_rejected(RejectReason::BadRequest);
+        m.record_rejected(RejectReason::BadRequest);
+        m.record_rejected(RejectReason::DecodeError); // per model: no-op here
+        m.model("a").record_decode_error();
+        m.model("b").record_decode_error();
+        m.model("b").record_decode_error();
+        assert_eq!(m.rejected(RejectReason::DecodeError), 3);
+        let text = render_prometheus(&m, &[]);
+        let has = |line: &str| {
+            assert!(
+                text.lines().any(|l| l == line),
+                "missing line {line:?} in:\n{text}"
+            )
+        };
+        has("blue_onyx_prism_requests_rejected_total{reason=\"overloaded\"} 0");
+        has("blue_onyx_prism_requests_rejected_total{reason=\"body_too_large\"} 1");
+        has("blue_onyx_prism_requests_rejected_total{reason=\"decode_error\"} 3");
+        has("blue_onyx_prism_requests_rejected_total{reason=\"bad_request\"} 2");
+        has("blue_onyx_prism_info{version=\"9.8.7\"} 1");
+        has("# TYPE blue_onyx_prism_build_info gauge");
+        has(&format!(
+            "blue_onyx_prism_build_info{{version=\"9.8.7\",git_sha=\"{}\",build_date=\"{}\"}} 1",
+            crate::GIT_SHA,
+            crate::BUILD_DATE
+        ));
+        // Process-wide counters (other tests may add to them): present and numeric.
+        has("# TYPE blue_onyx_prism_download_bytes_total counter");
+        has("# TYPE blue_onyx_prism_download_failures_total counter");
+        for name in ["download_bytes_total", "download_failures_total"] {
+            let prefix = format!("blue_onyx_prism_{name} ");
+            let line = text.lines().find(|l| l.starts_with(&prefix)).unwrap();
+            assert!(line[prefix.len()..].parse::<u64>().is_ok(), "{line}");
+        }
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(
+            text.contains("blue_onyx_prism_process_resident_memory_bytes "),
+            linux
+        );
+        assert_eq!(text.contains("blue_onyx_prism_process_open_fds "), linux);
+        for l in text.lines().filter(|l| !l.starts_with('#')) {
+            let v = l.rsplit(' ').next().unwrap();
+            assert!(v.parse::<f64>().is_ok(), "bad sample line {l:?}");
+        }
+    }
+
+    #[test]
+    fn vm_rss_parsing() {
+        let status = "Name:\tblue\nVmPeak:\t  9999 kB\nVmRSS:\t   12345 kB\nThreads:\t4\n";
+        assert_eq!(parse_vm_rss(status), Some(12345 * 1024));
+        assert_eq!(parse_vm_rss("Name: x\n"), None);
+        assert_eq!(parse_vm_rss("VmRSS: lots kB\n"), None);
+        assert_eq!(parse_vm_rss("VmRSS: 5 MB\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_stats_on_linux() {
+        let p = ProcessStats::read();
+        assert!(p.resident_memory_bytes.is_some_and(|b| b > 0));
+        assert!(p.open_fds.is_some_and(|n| n >= 3));
     }
 
     #[test]

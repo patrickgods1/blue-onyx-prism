@@ -1067,6 +1067,9 @@ impl RunCtx<'_> {
         for w in warnings {
             report.warn(self.args.json, w);
         }
+        if let Some(w) = BenchmarkResults::merge_warning(prev.as_ref(), &results) {
+            report.warn(self.args.json, w);
+        }
         let mut merged = BenchmarkResults::merge(prev, results);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(self.metric, self.weights);

@@ -16,7 +16,20 @@
 //! 6. Optionally mark an ONNX Runtime flavor active (`onnxruntime/active.txt`).
 //!
 //! Failures are retried with a 30 s -> 5 min exponential backoff ([`backoff`]) when
-//! [`ManagerOptions::retry`] is set (the service); the CLI fails fast. Every state change is
+//! [`ManagerOptions::retry`] is set (the service); the CLI fails fast. Retries are bounded by
+//! [`ManagerOptions::max_attempts`] (the service uses [`SERVICE_MAX_ATTEMPTS`], 12 attempts over
+//! about 43 minutes): after the last one the job is `Failed { retry_at: None }` with the manual
+//! `fetch` command in its message, and a blocked model fails instead of waiting forever. Queuing
+//! the job again (the Download button of the Config page, a config save, a restart) starts a
+//! fresh series of attempts.
+//!
+//! If the worker thread cannot start its runtime or HTTP client, or panics, every job it will
+//! never run is marked `Failed { retry_at: None }` and later [`Manager::enqueue`] calls fail at
+//! once ([`Manager::is_alive`]), so nothing waits on a dead queue. [`Manager::shutdown`] sets the
+//! stop flag, which the download, hash and extraction loops check, and joins the worker for at
+//! most [`SHUTDOWN_JOIN`] before leaving it to finish in the background.
+//!
+//! Every state change is
 //! published in [`Status`] (shared, for `/stats` and `/v1/resources`), through the optional
 //! [`ManagerOptions::on_progress`] hook (CLI progress bars) and, for terminal states, as an
 //! [`Event`] to every [`Manager::subscribe`]r (the registry in phase 7.3).
@@ -59,6 +72,21 @@ pub const DOWNLOADS_DIR: &str = ".downloads";
 pub const BACKOFF_MIN: Duration = Duration::from_secs(30);
 /// Longest retry delay.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// Attempts per job in the service before it gives up (30 + 60 + 120 + 240 + 7 x 300 s of
+/// backoff between them: about 43 minutes).
+pub const SERVICE_MAX_ATTEMPTS: u32 = 12;
+/// How long [`Manager::shutdown`] waits for the worker before detaching it.
+pub const SHUTDOWN_JOIN: Duration = Duration::from_secs(5);
+
+/// Command that downloads `res` by hand (with `--allow-large` when it needs it).
+pub fn fetch_command(res: &Resource) -> String {
+    format!(
+        "blue-onyx-prism fetch --resource {}{}",
+        res.id,
+        if res.is_large() { " --allow-large" } else { "" }
+    )
+}
 
 /// Delay before retry number `attempt` (1-based): 30 s, 60 s, 120 s, 240 s, then 300 s.
 pub fn backoff(attempt: u32) -> Duration {
@@ -191,7 +219,11 @@ pub struct LockBusy;
 
 /// A downloaded file does not match its pinned hash (not retried automatically).
 #[derive(Debug, thiserror::Error)]
-#[error("hash mismatch for {file}: expected sha256 {expected}, got {actual}; the file was deleted")]
+#[error(
+    "hash mismatch for {file}: expected sha256 {expected}, got {actual}; the file was deleted. \
+     The server sent other bytes than the pinned release (a re-uploaded file, a proxy or \
+     antivirus rewriting downloads, or tampering); try again later, and report it if it persists"
+)]
 pub struct HashMismatch {
     pub file: String,
     pub expected: String,
@@ -201,7 +233,11 @@ pub struct HashMismatch {
 /// The server offers a file of another size than the pinned one (not retried automatically):
 /// the pin is stale or the URL was swapped; retrying would only download it again.
 #[derive(Debug, thiserror::Error)]
-#[error("size mismatch for {file}: the server offers {offered} bytes, pinned {expected}")]
+#[error(
+    "size mismatch for {file}: the server offers {offered} bytes, pinned {expected}. The release \
+     file changed upstream or a proxy serves another file; try again later, and report it if it \
+     persists"
+)]
 pub struct SizeMismatch {
     pub file: String,
     pub expected: u64,
@@ -221,7 +257,10 @@ fn retryable(e: &anyhow::Error) -> bool {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("refusing to download {0}: only https URLs are allowed")]
+#[error(
+    "refusing to download {0}: only https URLs are allowed; the pinned URL or a redirect left \
+     https (a changed server or an intercepting proxy); update Blue Onyx Prism or report it"
+)]
 struct UrlRefused(String);
 
 /// Most redirect hops followed for one download (GitHub and Hugging Face use one or two).
@@ -409,6 +448,9 @@ pub struct ManagerOptions {
     pub on_progress: Option<ProgressFn>,
     /// Retry schedule (tests shorten it).
     pub backoff: fn(u32) -> Duration,
+    /// With `retry`: give up after this many attempts of one job (None = retry forever). The
+    /// service uses [`SERVICE_MAX_ATTEMPTS`].
+    pub max_attempts: Option<u32>,
 }
 
 impl ManagerOptions {
@@ -419,6 +461,7 @@ impl ManagerOptions {
             lock_wait: None,
             on_progress: None,
             backoff,
+            max_attempts: None,
         }
     }
 }
@@ -429,6 +472,7 @@ impl std::fmt::Debug for ManagerOptions {
             .field("root", &self.root)
             .field("retry", &self.retry)
             .field("lock_wait", &self.lock_wait)
+            .field("max_attempts", &self.max_attempts)
             .finish_non_exhaustive()
     }
 }
@@ -439,6 +483,10 @@ struct Shared {
     changed: Condvar,
     subscribers: Mutex<Vec<Sender<Event>>>,
     stop: AtomicBool,
+    /// The worker thread has exited (stopped, or died: see `dead_reason`).
+    dead: AtomicBool,
+    /// Why the worker died (None after a normal stop).
+    dead_reason: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -468,6 +516,110 @@ impl Shared {
     fn emit(&self, ev: Event) {
         let mut subs = self.subscribers.lock_recover();
         subs.retain(|s| s.send(ev.clone()).is_ok());
+    }
+
+    /// Mark `job` failed for good (no retry) and tell the subscribers.
+    fn fail(&self, job: &Job, error: String, attempts: u32) {
+        crate::metrics::DOWNLOADS
+            .failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.set(
+            job,
+            State::Failed {
+                error: error.clone(),
+                retry_at: None,
+                attempts,
+            },
+        );
+        self.emit(Event::Failed {
+            key: job.key(),
+            id: job.resource.id,
+            error,
+            retry_at: None,
+        });
+    }
+
+    /// Text for jobs the dead worker will never run.
+    fn worker_gone_message(&self) -> String {
+        let reason = self.dead_reason.lock_recover().clone();
+        match reason {
+            Some(r) => format!(
+                "the download worker stopped ({r}); this is usually a missing TLS certificate \
+                 store or an exhausted thread/file limit; restart the service (or rerun the \
+                 command) after fixing it"
+            ),
+            None => "the download manager was stopped before this download finished; start it \
+                     again (restart the service or rerun the command)"
+                .to_string(),
+        }
+    }
+
+    /// Fail every job that is not final (the worker is gone and will never finish them).
+    fn fail_unfinished(&self) {
+        let error = self.worker_gone_message();
+        let pending: Vec<Status> = {
+            let map = self.statuses.lock_recover();
+            map.values()
+                .filter(|s| !s.state.is_final())
+                .cloned()
+                .collect()
+        };
+        for st in pending {
+            let attempts = match st.state {
+                State::Failed { attempts, .. } => attempts,
+                _ => 0,
+            };
+            crate::metrics::DOWNLOADS
+                .failures
+                .fetch_add(1, Ordering::Relaxed);
+            let state = State::Failed {
+                error: error.clone(),
+                retry_at: None,
+                attempts,
+            };
+            if let Some(hook) = &self.opts.on_progress {
+                hook(&Status {
+                    state: state.clone(),
+                    ..st.clone()
+                });
+            }
+            self.statuses.lock_recover().insert(
+                st.key.clone(),
+                Status {
+                    state,
+                    ..st.clone()
+                },
+            );
+            self.emit(Event::Failed {
+                key: st.key.clone(),
+                id: st.id,
+                error: error.clone(),
+                retry_at: None,
+            });
+        }
+        self.changed.notify_all();
+    }
+}
+
+/// Runs when the worker thread exits, normally or by panic: marks the manager dead and, unless
+/// it was stopped on purpose, fails every job it will never run (RS-04).
+struct WorkerExit<'a>(&'a Shared);
+
+impl Drop for WorkerExit<'_> {
+    fn drop(&mut self) {
+        let shared = self.0;
+        let stopping = shared.stop.load(Ordering::SeqCst);
+        if std::thread::panicking() {
+            let mut reason = shared.dead_reason.lock_recover();
+            reason.get_or_insert_with(|| "the worker thread panicked".to_string());
+        }
+        shared.dead.store(true, Ordering::SeqCst);
+        if !stopping {
+            tracing::error!("download manager: {}", shared.worker_gone_message());
+            shared.fail_unfinished();
+        } else {
+            shared.changed.notify_all();
+        }
     }
 }
 
@@ -515,6 +667,8 @@ impl Manager {
             changed: Condvar::new(),
             subscribers: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
+            dead_reason: Mutex::new(None),
         });
         let (tx, rx) = crossbeam_channel::unbounded();
         let worker = Arc::clone(&shared);
@@ -539,9 +693,21 @@ impl Manager {
         );
         if !busy {
             self.shared.set(&job, State::Queued);
-            let _ = self.tx.send(Msg::Job(Box::new(job)));
+            let sent = self.tx.send(Msg::Job(Box::new(job.clone()))).is_ok();
+            // Checked after the status is Queued: a worker dying concurrently either sees
+            // the Queued status in `fail_unfinished`, or has already set `dead` (SeqCst).
+            if !sent || self.shared.dead.load(Ordering::SeqCst) {
+                let error = self.shared.worker_gone_message();
+                tracing::warn!("download of {} not started: {error}", job.resource.id);
+                self.shared.fail(&job, error, 0);
+            }
         }
         key
+    }
+
+    /// The worker thread still runs (false after [`Self::shutdown`] or when it died).
+    pub fn is_alive(&self) -> bool {
+        !self.shared.dead.load(Ordering::SeqCst)
     }
 
     pub fn status(&self, key: &str) -> Option<Status> {
@@ -581,7 +747,7 @@ impl Manager {
             let done = keys
                 .iter()
                 .all(|k| map.get(k).is_some_and(|s| s.state.is_final()));
-            if done {
+            if done || self.shared.dead.load(Ordering::SeqCst) {
                 break;
             }
             let wait = match deadline {
@@ -601,13 +767,27 @@ impl Manager {
         keys.iter().filter_map(|k| map.get(k).cloned()).collect()
     }
 
-    /// Stop the worker (the current download is abandoned, its `.partial` kept) and join it.
+    /// Stop the worker (the current download is abandoned, its `.partial` kept) and join it
+    /// for at most [`SHUTDOWN_JOIN`]; a worker still busy after that (a hash or an extraction
+    /// between two stop checks, a stalled read) is detached and logged.
     pub fn shutdown(&self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.stop.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Msg::Stop);
         let handle = self.thread.lock_recover().take();
         if let Some(h) = handle {
-            let _ = h.join();
+            let until = Instant::now() + SHUTDOWN_JOIN;
+            while !h.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                tracing::warn!(
+                    "download worker still busy {} s after the stop request; leaving it to \
+                     finish in the background (an unfinished download resumes on the next start)",
+                    SHUTDOWN_JOIN.as_secs()
+                );
+            }
         }
     }
 }
@@ -678,7 +858,11 @@ pub fn install_all(opts: ManagerOptions, jobs: Vec<Job>) -> Result<Vec<Status>> 
         })
         .collect();
     if !failed.is_empty() {
-        bail!("{}", failed.join("; "));
+        bail!(
+            "{} (check the network connection and proxy, then run the command again; \
+             interrupted downloads resume)",
+            failed.join("; ")
+        );
     }
     Ok(statuses)
 }
@@ -694,20 +878,21 @@ fn unix_now() -> u64 {
 }
 
 fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
+    let _exit = WorkerExit(shared);
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
-            tracing::error!("download manager: creating tokio runtime: {e}");
+            *shared.dead_reason.lock_recover() = Some(format!("creating its async runtime: {e}"));
             return;
         }
     };
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("download manager: {e:#}");
+            *shared.dead_reason.lock_recover() = Some(format!("{e:#}"));
             return;
         }
     };
@@ -752,6 +937,10 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
         let Some((job, attempts)) = queue.pop_front() else {
             continue;
         };
+        #[cfg(test)]
+        if job.resource.id == TEST_PANIC_ID {
+            panic!("test: download worker panics");
+        }
         match run_job(shared, &client, &rt, &job) {
             Ok(()) => {
                 shared.set(&job, State::Installed);
@@ -766,8 +955,21 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
                     return;
                 }
                 let attempts = attempts + 1;
-                let error = format!("{e:#}");
-                let retry = shared.opts.retry && retryable(&e);
+                crate::metrics::DOWNLOADS
+                    .failures
+                    .fetch_add(1, Ordering::Relaxed);
+                let mut error = format!("{e:#}");
+                let retryable = retryable(&e);
+                let exhausted = shared.opts.max_attempts.is_some_and(|max| attempts >= max);
+                let retry = shared.opts.retry && retryable && !exhausted;
+                if shared.opts.retry && retryable && exhausted {
+                    error = format!(
+                        "{error} (gave up after {attempts} attempts; check the network \
+                         connection, proxy and firewall, then press Download on the Config page \
+                         or run `{}`)",
+                        fetch_command(job.resource)
+                    );
+                }
                 let delay = (shared.opts.backoff)(attempts);
                 let retry_at = retry.then(|| SystemTime::now() + delay);
                 tracing::warn!(
@@ -803,6 +1005,10 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
         }
     }
 }
+
+/// Resource id whose job panics the worker (tests of RS-04 only).
+#[cfg(test)]
+const TEST_PANIC_ID: &str = "model:test-worker-panic";
 
 /// `http://` to the loopback address is accepted only in the crate's own test build (the
 /// fixture server of the unit tests) or after [`allow_loopback_http_for_tests`]; otherwise the
@@ -849,7 +1055,10 @@ fn http_client() -> Result<reqwest::Client> {
 /// Why a redirect was not followed (wrapped in a `reqwest::Error` that `is_redirect()`).
 #[derive(Debug, thiserror::Error)]
 enum RedirectRefused {
-    #[error("redirect to {0} refused: only https URLs are allowed")]
+    #[error(
+        "redirect to {0} refused: only https URLs are allowed (a changed server or an \
+         intercepting proxy); update Blue Onyx Prism or report it"
+    )]
     Scheme(String),
     #[error("too many redirects (more than {MAX_REDIRECTS})")]
     TooMany,
@@ -903,7 +1112,7 @@ fn run_job(
         let mut files = Vec::new();
         for part in res.parts {
             let dest = job.target.join(part.file_name);
-            if file_matches(&dest, part.size, part.sha256)? {
+            if file_matches(&dest, part.size, part.sha256, &shared.stop)? {
                 done += part.size;
             } else {
                 let partial = job.target.join(format!("{}.partial", part.file_name));
@@ -911,7 +1120,7 @@ fn run_job(
                     progress(done + b, false)
                 }))?;
                 shared.set(job, State::Verifying);
-                verify(&partial, part)?;
+                verify(&partial, part, &shared.stop)?;
                 std::fs::rename(&partial, &dest)
                     .with_context(|| format!("renaming to {}", dest.display()))?;
                 done += part.size;
@@ -951,13 +1160,13 @@ fn run_job(
                 .with_context(|| format!("creating {}", downloads.display()))?;
             for part in res.parts {
                 let file = downloads.join(part.file_name);
-                if !file_matches(&file, part.size, part.sha256)? {
+                if !file_matches(&file, part.size, part.sha256, &shared.stop)? {
                     let partial = downloads.join(format!("{}.partial", part.file_name));
                     rt.block_on(download_part(client, part, &partial, &shared.stop, |b| {
                         progress(done + b, false)
                     }))?;
                     shared.set(job, State::Verifying);
-                    verify(&partial, part)?;
+                    verify(&partial, part, &shared.stop)?;
                     std::fs::rename(&partial, &file)
                         .with_context(|| format!("renaming to {}", file.display()))?;
                 }
@@ -986,13 +1195,17 @@ fn run_job(
                 None => part.archive,
             }
             .with_context(|| format!("{} is not an archive", archive.display()))?;
-            got.extend(extract::extract_part(
+            if shared.stop.load(Ordering::Relaxed) {
+                bail!("cancelled before extracting {}", archive.display());
+            }
+            got.extend(extract::extract_part_until(
                 archive,
                 kind,
                 part.layout,
                 res.flavor(),
                 target,
                 &staging,
+                &shared.stop,
             )?);
         }
         extract::finalize(res, job.version(), target, &staging, &mut got)?;
@@ -1205,11 +1418,19 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// Lowercase hex SHA-256 of a file.
 pub fn sha256_file(path: &Path) -> Result<String> {
+    sha256_file_until(path, &AtomicBool::new(false))
+}
+
+/// [`sha256_file`], giving up with "cancelled" as soon as `stop` is set (checked per MiB).
+pub fn sha256_file_until(path: &Path, stop: &AtomicBool) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
+        if stop.load(Ordering::Relaxed) {
+            bail!("cancelled while hashing {}", path.display());
+        }
         let n = f
             .read(&mut buf)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -1225,15 +1446,15 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 }
 
 /// `path` exists with exactly `size` bytes and the pinned hash.
-fn file_matches(path: &Path, size: u64, sha256: &str) -> Result<bool> {
+fn file_matches(path: &Path, size: u64, sha256: &str, stop: &AtomicBool) -> Result<bool> {
     match std::fs::metadata(path) {
-        Ok(m) if m.is_file() && m.len() == size => Ok(sha256_file(path)? == sha256),
+        Ok(m) if m.is_file() && m.len() == size => Ok(sha256_file_until(path, stop)? == sha256),
         _ => Ok(false),
     }
 }
 
 /// Check size and hash of a finished download; delete it on mismatch.
-fn verify(path: &Path, part: &super::catalog::Part) -> Result<()> {
+fn verify(path: &Path, part: &super::catalog::Part, stop: &AtomicBool) -> Result<()> {
     let len = std::fs::metadata(path)
         .with_context(|| format!("reading {}", path.display()))?
         .len();
@@ -1245,7 +1466,7 @@ fn verify(path: &Path, part: &super::catalog::Part) -> Result<()> {
             part.size
         );
     }
-    let actual = sha256_file(path)?;
+    let actual = sha256_file_until(path, stop)?;
     if actual != part.sha256 {
         let _ = std::fs::remove_file(path);
         return Err(anyhow!(HashMismatch {
@@ -1377,6 +1598,9 @@ async fn download_part(
         }
         f.write_all(&chunk)
             .with_context(|| format!("writing {}", partial.display()))?;
+        crate::metrics::DOWNLOADS
+            .bytes
+            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
         progress(have);
     }
     f.flush()?;
@@ -1919,6 +2143,131 @@ mod tests {
         failed_permanently(&run_once(res, &root), "size mismatch");
         nothing_left(&root);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RS-04: a worker that dies (here: panics on a job) fails every job it will never run,
+    /// later enqueues fail at once, and `wait(None)` returns instead of hanging.
+    #[test]
+    fn dead_worker_fails_jobs_instead_of_leaving_them_queued() {
+        let data = body();
+        let root = tmp("dead");
+        let panicking: &'static Resource = Box::leak(Box::new(Resource {
+            id: TEST_PANIC_ID,
+            ..*model_resource("http://127.0.0.1:9/x", &data, None)
+        }));
+        let other = model_resource("http://127.0.0.1:9/y", &data, None);
+        let m = Manager::start(ManagerOptions {
+            retry: true,
+            ..ManagerOptions::new(&root)
+        });
+        let events = m.subscribe();
+        let k1 = m.enqueue(Job::into_dir(panicking, root.join("a")));
+        let k2 = m.enqueue(Job::into_dir(other, root.join("b")));
+        let st = m.wait(&[k1.clone(), k2.clone()], None);
+        assert_eq!(st.len(), 2);
+        for s in &st {
+            match &s.state {
+                State::Failed {
+                    error, retry_at, ..
+                } => {
+                    assert!(error.contains("download worker stopped"), "{error}");
+                    assert!(error.contains("panicked"), "{error}");
+                    assert_eq!(*retry_at, None);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(!m.is_alive());
+        let ev = events.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(ev, Event::Failed { retry_at: None, .. }), "{ev:?}");
+        // A later job fails at once.
+        let k3 = m.enqueue(Job::into_dir(other, root.join("c")));
+        assert!(matches!(
+            m.status(&k3).unwrap().state,
+            State::Failed { retry_at: None, .. }
+        ));
+        m.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RS-06: with `max_attempts` the service stops retrying an unreachable URL and names the
+    /// manual command.
+    #[test]
+    fn retries_are_bounded_by_max_attempts() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let data = body();
+        let res = model_resource(&format!("http://127.0.0.1:{port}/gone"), &data, None);
+        let root = tmp("bounded");
+        let m = Manager::start(ManagerOptions {
+            retry: true,
+            backoff: |_| Duration::from_millis(10),
+            max_attempts: Some(3),
+            ..ManagerOptions::new(&root)
+        });
+        let events = m.subscribe();
+        let key = m.enqueue(Job::into_dir(res, root.join("models")));
+        let st = m.wait(std::slice::from_ref(&key), Some(Duration::from_secs(30)));
+        match &st[0].state {
+            State::Failed {
+                error,
+                retry_at,
+                attempts,
+            } => {
+                assert_eq!(*retry_at, None);
+                assert_eq!(*attempts, 3);
+                assert!(error.contains("gave up after 3 attempts"), "{error}");
+                assert!(
+                    error.contains("blue-onyx-prism fetch --resource model:test-model"),
+                    "{error}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let retried: Vec<_> = events.try_iter().collect();
+        assert_eq!(retried.len(), 3, "{retried:?}");
+        // Queuing it again (the Download button) starts a new series.
+        m.enqueue(Job::into_dir(res, root.join("models")));
+        assert!(!m.status(&key).unwrap().state.is_final());
+        m.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RS-10: hashing stops as soon as the stop flag is set.
+    #[test]
+    fn hashing_stops_on_the_stop_flag() {
+        let root = tmp("hash-stop");
+        let f = root.join("big.bin");
+        std::fs::write(&f, vec![7u8; 3 << 20]).unwrap();
+        let stop = AtomicBool::new(false);
+        assert_eq!(
+            sha256_file_until(&f, &stop).unwrap(),
+            sha256_file(&f).unwrap()
+        );
+        stop.store(true, Ordering::SeqCst);
+        let e = sha256_file_until(&f, &stop).unwrap_err();
+        assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_command_adds_allow_large_for_large_resources() {
+        let data = body();
+        let small = model_resource("https://x/y", &data, None);
+        assert_eq!(
+            fetch_command(small),
+            "blue-onyx-prism fetch --resource model:test-model"
+        );
+        let mut part = small.parts[0];
+        part.size = crate::resources::catalog::LARGE_DOWNLOAD_BYTES + 1;
+        let large: &'static Resource = Box::leak(Box::new(Resource {
+            parts: Box::leak(vec![part].into_boxed_slice()),
+            ..*small
+        }));
+        assert!(fetch_command(large).ends_with(" --allow-large"));
     }
 
     #[test]

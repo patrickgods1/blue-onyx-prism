@@ -32,17 +32,32 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Error for a config without models (the server has nothing to serve).
+/// Error for a config without models (the server has nothing to serve). The binaries give
+/// such a config the default model first (`cli::seed_default_model`), so this only fires for
+/// library callers.
 pub fn ensure_models(config: &Config, config_path: &std::path::Path) -> Result<()> {
     if config.models.is_empty() {
         anyhow::bail!(
-            "no models configured in {}. Start with `--model <path/to/model.onnx|.xml> --family yolo5` \
-             or fetch one first with `blue-onyx-prism download-models --name IPcam-general`",
+            "no models configured in {}, so there is nothing to serve. Add one with \
+             `blue-onyx-prism add-model --path <file>`, start with `--model <path/to/model.onnx> \
+             --family yolo5`, or fetch the default with `blue-onyx-prism download-models --name \
+             IPcam-general --add-to-config`",
             config_path.display()
         );
     }
     Ok(())
 }
+
+/// How long the HTTP server may take to close its connections after a shutdown request
+/// (a slow client holding a request); then its task is aborted (CO-12).
+pub const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long `Runtime::shutdown_timeout` waits for blocking tasks when a binary exits.
+pub const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Upper bound of a whole shutdown (CLI hard deadline; the Windows service stops waiting and
+/// reports Stopped after it).
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Build the tokio runtime the server runs on: two worker threads (handlers are short; the point
 /// is that one slow handler cannot stall the detection routes) plus the blocking pool that
@@ -64,7 +79,9 @@ pub fn run_server(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let rt = build_runtime()?;
-    run_server_on(&rt, config, config_path, log, shutdown)
+    let result = run_server_on(&rt, config, config_path, log, shutdown);
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result
 }
 
 /// Run registry + HTTP server generations on `rt` until `shutdown` is cancelled (returns the
@@ -265,11 +282,14 @@ impl Process {
         let next = match Config::load(&self.config_path) {
             Ok(c) if !c.models.is_empty() => c,
             Ok(_) => {
-                warn!("reloaded config has no models; keeping the current config");
+                warn!(
+                    "the reloaded config file has no models (removed by hand?); keeping the \
+                     running config. Add a model to the file and restart again"
+                );
                 current.clone()
             }
             Err(e) => {
-                warn!("{e:#}; keeping the current config");
+                warn!("{e:#}; keeping the running config until the file is fixed");
                 current.clone()
             }
         };
@@ -278,8 +298,11 @@ impl Process {
         {
             warn!("{e:#}");
         }
-        if next.log_path != current.log_path {
-            warn!("log_path changes take effect after the process is restarted");
+        if next.log_path != current.log_path || next.log_format != current.log_format {
+            warn!(
+                "log_path and log_format changes take effect after the process is restarted \
+                 (restart the service or the program)"
+            );
         }
         if (next.port, next.bind_address) != (current.port, current.bind_address) {
             warn!(
@@ -373,10 +396,7 @@ impl Run<'_> {
             ..
         } = self;
         server_stop.cancel();
-        let served = server_task.map(|t| {
-            rt.block_on(t)
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("HTTP server task: {e}")))
-        });
+        let served = server_task.map(|t| stop_server(rt, t, SERVER_STOP_TIMEOUT));
         // The server (and its router) is gone; this was the last long-lived other holder of the
         // state (connection tasks may still be dropping theirs, see `SHUTDOWN_LINGER`).
         drop(shared);
@@ -385,6 +405,29 @@ impl Run<'_> {
         }
         result.and(served.unwrap_or(Ok(())))
     }
+}
+
+/// Wait for the stopped server task, at most `timeout` (CO-12: a slow client must not hold
+/// the shutdown); on timeout the task is aborted and its connections dropped.
+fn stop_server(
+    rt: &tokio::runtime::Runtime,
+    mut task: tokio::task::JoinHandle<Result<()>>,
+    timeout: Duration,
+) -> Result<()> {
+    rt.block_on(async {
+        match tokio::time::timeout(timeout, &mut task).await {
+            Ok(r) => r.unwrap_or_else(|e| Err(anyhow::anyhow!("HTTP server task: {e}"))),
+            Err(_) => {
+                warn!(
+                    "open HTTP connections did not close within {} s of the shutdown; dropping \
+                     them",
+                    timeout.as_secs()
+                );
+                task.abort();
+                Ok(())
+            }
+        }
+    })
 }
 
 /// [`run_server_on`] with a given [`Provisioner`] (tests inject catalog entries through it).
@@ -669,4 +712,27 @@ fn spawn_watcher(
         })
         .map_err(|e| warn!("could not spawn the resource watcher: {e}"))
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_server_is_bounded() {
+        let rt = build_runtime().unwrap();
+        // A server task stuck on a slow client.
+        let stuck = rt.spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let t = Instant::now();
+        assert!(stop_server(&rt, stuck, Duration::from_millis(100)).is_ok());
+        assert!(t.elapsed() < Duration::from_secs(5));
+        // A task that ends in time reports its result.
+        let done = rt.spawn(async { Err(anyhow::anyhow!("bind failed")) });
+        let err = stop_server(&rt, done, Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("bind failed"));
+        rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    }
 }

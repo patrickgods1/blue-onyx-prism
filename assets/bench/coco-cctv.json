@@ -580,7 +580,8 @@
     {
      "label": "person",
      "bbox": [99, 37, 613, 179],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -660,7 +661,8 @@
     {
      "label": "chair",
      "bbox": [122, 78, 635, 426],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "bicycle",
@@ -1658,7 +1660,8 @@
     {
      "label": "person",
      "bbox": [0.0, 153, 639, 424],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -1786,7 +1789,8 @@
     {
      "label": "car",
      "bbox": [1, 182, 616, 203],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "car",
@@ -1970,7 +1974,8 @@
     {
      "label": "person",
      "bbox": [21, 333, 541, 373],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -2442,7 +2447,8 @@
     {
      "label": "sheep",
      "bbox": [262, 265, 530, 312],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "cow",
@@ -2555,7 +2561,8 @@
     {
      "label": "person",
      "bbox": [1, 175, 438, 334],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -3032,7 +3039,8 @@
     {
      "label": "person",
      "bbox": [489, 174, 639, 211],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -3258,7 +3266,8 @@
     {
      "label": "person",
      "bbox": [126, 109, 290, 264],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -3979,7 +3988,8 @@
     {
      "label": "bench",
      "bbox": [34, 111, 639, 354],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "dog",
@@ -4739,7 +4749,8 @@
     {
      "label": "person",
      "bbox": [1, 71, 639, 316],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -5203,7 +5214,8 @@
     {
      "label": "person",
      "bbox": [300, 280, 325, 334],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -5656,7 +5668,8 @@
     {
      "label": "person",
      "bbox": [462, 267, 592, 296],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -5896,7 +5909,8 @@
     {
      "label": "kite",
      "bbox": [35, 106, 639, 479],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "kite",
@@ -5991,7 +6005,8 @@
     {
      "label": "person",
      "bbox": [7, 370, 500, 442],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "person",
@@ -7507,7 +7522,8 @@
     {
      "label": "person",
      "bbox": [272, 142, 639, 319],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "truck",
@@ -7592,7 +7608,8 @@
     {
      "label": "horse",
      "bbox": [605, 184, 620, 220],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "horse",
@@ -8038,7 +8055,8 @@
     {
      "label": "person",
      "bbox": [375, 205, 472, 263],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "horse",
@@ -8391,7 +8409,8 @@
     {
      "label": "bird",
      "bbox": [38, 178, 480, 215],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "bird",
@@ -8827,7 +8846,8 @@
     {
      "label": "bird",
      "bbox": [55, 160, 370, 364],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "bird",
@@ -9304,7 +9324,8 @@
     {
      "label": "person",
      "bbox": [5, 247, 639, 328],
-     "ignore": true
+     "ignore": true,
+     "crowd": true
     },
     {
      "label": "car",

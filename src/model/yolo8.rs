@@ -44,7 +44,8 @@ impl Family for Yolo8 {
         }
         if self.num_classes > 0 && channels != 4 + self.num_classes {
             anyhow::bail!(
-                "yolo8: output `{}` has shape {:?}, expected [1, {}, A] for {} classes",
+                "yolo8: output `{}` has shape {:?}, expected [1, {}, A] for {} classes; the \
+                 classes file lists another number of classes than the model was trained with",
                 out.name,
                 out.shape,
                 4 + self.num_classes,

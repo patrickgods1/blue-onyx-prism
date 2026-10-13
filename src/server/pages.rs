@@ -1,7 +1,7 @@
 //! Read-only pages and assets: welcome, stats, test, logs, static files, fallback.
 
 use super::config_page::LevelChoice;
-use super::detect::{parse_detection_body, run_detection};
+use super::detect::{Upload, new_request_id, parse_detection_body, run_detection};
 use super::devices::{devices_snapshot, force_cpu_note, profile_view};
 use super::{AppState, blocking, default_name, render, state_view};
 use crate::config::LogLevel;
@@ -11,9 +11,8 @@ use crate::startup::ModelState;
 use crate::worker::WorkerHandle;
 use askama::Template;
 use axum::Json;
-use axum::extract::multipart::MultipartRejection;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
@@ -130,6 +129,8 @@ struct WelcomeTemplate {
     /// Distinct execution providers of the loaded models.
     in_use: String,
     force_cpu_note: Option<String>,
+    /// `openvino_dir` / bundled `./openvino` overridden by `OPENVINO_INSTALL_DIR` (BE-08).
+    openvino_note: Option<String>,
     uptime: String,
     port: u16,
     default_model: String,
@@ -171,6 +172,7 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
                 reg.runtime_info.openvino_version.clone()
             },
             onnxruntime: snap.onnxruntime_label(),
+            openvino_note: crate::backend::libs::openvino_dir_override_warning(),
             devices: if reg.runtime_info.available_devices.is_empty() {
                 "none".to_string()
             } else {
@@ -455,15 +457,23 @@ pub(super) async fn test_page(State(state): State<Arc<AppState>>) -> Response {
 
 /// Same dispatch path as the API (metrics and queues behave identically), then draws the
 /// predictions on the uploaded image off the async thread.
-pub(super) async fn test_submit(
-    State(state): State<Arc<AppState>>,
-    multipart: Result<Multipart, MultipartRejection>,
-) -> Response {
+pub(super) async fn test_submit(State(state): State<Arc<AppState>>, upload: Upload) -> Response {
     let start = Instant::now();
-    let (req, fields) = match parse_detection_body(multipart).await {
+    let id = new_request_id();
+    let (req, fields) = match parse_detection_body(upload).await {
         Ok(v) => v,
-        Err(e) => return render(&test_template(&state, "", String::new(), Some(e), None)),
+        Err(e) => {
+            e.record(&state);
+            return render(&test_template(
+                &state,
+                "",
+                String::new(),
+                Some(e.message),
+                None,
+            ));
+        }
     };
+
     let model = fields.get("model").map(|s| s.trim()).unwrap_or_default();
     let min_conf = fields.get("min_confidence").cloned().unwrap_or_default();
     let (handle, command) = if model.is_empty() {
@@ -481,7 +491,7 @@ pub(super) async fn test_submit(
     };
 
     let image = req.image_data.clone();
-    let resp = run_detection(&state, &handle, Ok(req), start, command).await;
+    let resp = run_detection(&state, &handle, Ok(req), start, command, &id).await;
     let json = serde_json::to_string_pretty(&resp).unwrap_or_default();
     let mut summary = if resp.success {
         format!(
@@ -714,6 +724,14 @@ mod tests {
         let (s, home) = get_text(&state, "/").await;
         assert_eq!(s, StatusCode::OK);
         assert!(home.contains("2026.0.0-test"), "{home}");
+        // The footer names the build: version, git commit and build date.
+        assert!(
+            home.contains(&format!(
+                "Blue Onyx Prism {} &middot;",
+                crate::long_version()
+            )),
+            "{home}"
+        );
         assert!(home.contains("<td>ipcam-general</td>"));
         // The HTTP integration tests poll for `<td>Ready</td>` / `Failed:` in this page.
         assert!(home.contains(

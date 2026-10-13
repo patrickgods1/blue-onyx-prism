@@ -82,6 +82,23 @@ pub mod update;
 pub mod worker;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Git commit the binary was built from, set by the release workflow through the
+/// `BLUE_ONYX_PRISM_GIT_SHA` environment variable at build time (no build script by
+/// convention); `"unknown"` for a local build.
+pub const GIT_SHA: &str = match option_env!("BLUE_ONYX_PRISM_GIT_SHA") {
+    Some(s) => s,
+    None => "unknown",
+};
+/// Build date (`YYYY-MM-DD`, UTC) from `BLUE_ONYX_PRISM_BUILD_DATE`; `"unknown"` locally.
+pub const BUILD_DATE: &str = match option_env!("BLUE_ONYX_PRISM_BUILD_DATE") {
+    Some(s) => s,
+    None => "unknown",
+};
+
+/// `<version> (<git sha>, <build date>)` for `--version`, the UI footer and the start-up log.
+pub fn long_version() -> String {
+    format!("{VERSION} ({GIT_SHA}, {BUILD_DATE})")
+}
 pub const MODULE_ID: &str = "ObjectDetectionPrism";
 pub const MODULE_NAME: &str = "Object Detection (Prism)";
 pub const PROCESSED_BY: &str = "BlueOnyxPrism";

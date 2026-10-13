@@ -503,12 +503,21 @@ pub(super) fn status_of<'a>(statuses: &'a [Status], id: &str) -> Option<&'a Stat
 /// Rows for `/v1/resources` and the Resources card.
 pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
     let hw = crate::backend::detect::hardware();
-    let installed = installed_snapshot(ctx, config);
-    let res: Resolution = resolve::needed(config, hw, &installed);
     let statuses: Vec<Status> = ctx
         .and_then(|c| c.provisioner.manager())
         .map(|m| m.statuses())
         .unwrap_or_default();
+    let installed = installed_snapshot(ctx, config);
+    let res: Resolution = resolve::needed(config, hw, &installed);
+    // Once per call, not per export row (RS-14).
+    let platform = Platform::current();
+    let paths = export::Paths::for_config(config);
+    let export_env = ExportEnv {
+        toolchain: export::toolchain_state(&paths, platform),
+        unsupported: export::unsupported_reason(platform.os, platform.arch),
+        paths,
+        platform,
+    };
     let ort_root = config.data_root().join(crate::backend::libs::ORT_DIR_NAME);
     let active_flavor = crate::backend::libs::read_active_flavor(&ort_root);
     let configured: Vec<PathBuf> = config
@@ -524,7 +533,7 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
         .filter(|r| r.id != catalog::DEIMV2_SRC_ID)
         .map(|r| {
             if matches!(r.kind, ResourceKind::ExportModel | ResourceKind::Tool) {
-                let mut row = export_row(ctx, config, r, &res, &statuses, &configured);
+                let mut row = export_row(ctx, config, r, &res, &statuses, &configured, &export_env);
                 row.recommended = recommended_for(&profile, r);
                 return row;
             }
@@ -671,6 +680,14 @@ pub fn export_confirm(res: &Resource, toolchain_ready: bool, p: Platform) -> Str
     )
 }
 
+/// What every export row shares, computed once per [`rows`] call.
+struct ExportEnv {
+    platform: Platform,
+    paths: export::Paths,
+    toolchain: export::ToolchainState,
+    unsupported: Option<String>,
+}
+
 /// Rows of the export group: exportable models and the `tool:uv` toolchain row.
 fn export_row(
     ctx: Option<&ResourcesCtx>,
@@ -679,11 +696,12 @@ fn export_row(
     resolution: &Resolution,
     statuses: &[Status],
     configured: &[PathBuf],
+    env: &ExportEnv,
 ) -> ResourceRow {
-    let platform = Platform::current();
-    let paths = export::Paths::for_config(config);
-    let toolchain = export::toolchain_state(&paths, platform);
-    let unsupported = export::unsupported_reason(platform.os, platform.arch);
+    let platform = env.platform;
+    let paths = &env.paths;
+    let toolchain = &env.toolchain;
+    let unsupported = env.unsupported.clone();
     let exporter = ctx.and_then(|c| c.provisioner.exporter());
     let mut row = ResourceRow {
         id: r.id,

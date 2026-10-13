@@ -27,6 +27,29 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Files the daemon creates are not world-readable (umask 027, written in decimal: the
+         config, logs and saved images are 0640 / 0750). -->
+    <key>Umask</key>
+    <integer>23</integer>
+    <!-- Seconds launchd waits after SIGTERM before SIGKILL: time for the graceful drain of
+         in-flight detections (the same 30 s as the Docker stop_grace_period). -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <!-- At most one restart every 10 s after a crash (the launchd default, stated explicitly). -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <!-- Standard (launchd's default, stated so it is not changed by accident): Background
+         would throttle CPU and I/O, which detections are sensitive to; Interactive would raise
+         the priority above what a daemon needs. -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+    <!-- Open-file soft limit (sockets, model, cache and log files): the macOS default of 256
+         is tight for many concurrent Blue Iris connections; 4096 is still a bound. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>/var/log/blue-onyx-prism/stdout.log</string>
     <key>StandardErrorPath</key>

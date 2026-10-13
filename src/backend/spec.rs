@@ -272,46 +272,81 @@ pub const SPEC_SYNTAX: &str = "auto, openvino:gpu[.N], openvino:cpu, openvino:np
     ort:cuda[:N], ort:tensorrt[:N], ort:directml[:N], ort:coreml, ort:cpu \
     (legacy GPU, GPU.N, CPU, NPU mean OpenVINO)";
 
-/// Decimal device index: ASCII digits only (no sign, no whitespace).
+/// Largest accepted device index (`gpu.N`, `cuda:N`, `directml:N`). Real machines have a handful
+/// of GPUs; the cap keeps a typo such as `cuda:4294967295` from reaching ONNX Runtime as a
+/// negative `device_id` (BE-07).
+pub const MAX_DEVICE_INDEX: u32 = 255;
+
+/// Decimal device index: ASCII digits only (no sign, no whitespace). Values too large for `u32`
+/// saturate so [`checked`] reports them as out of range rather than as bad syntax.
 fn parse_index(s: &str) -> Option<u32> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    s.parse().ok()
+    Some(s.parse().unwrap_or(u32::MAX))
 }
 
-/// OpenVINO `name` or `name.N` (`gpu.1`); only GPU takes an index.
-fn parse_openvino(s: &str) -> Option<Device> {
-    let (name, index) = match s.split_once('.') {
-        Some((n, i)) => (n, Some(parse_index(i)?)),
-        None => (s, None),
+/// `Ok(Some(device))` unless the index exceeds [`MAX_DEVICE_INDEX`] (an actionable error);
+/// `Ok(None)` when the combination is not a device (e.g. `cpu.0`).
+fn checked(spec: &str, runtime: Runtime, name: &str, index: Option<u32>) -> Result<Option<Device>> {
+    let Some(device) = Target::from_name(name).and_then(|t| Device::new(runtime, t, index).ok())
+    else {
+        return Ok(None);
     };
-    Device::new(Runtime::OpenVino, Target::from_name(name)?, index).ok()
+    if let Some(i) = index.filter(|i| *i > MAX_DEVICE_INDEX) {
+        let shown = if i == u32::MAX {
+            "too large".to_string()
+        } else {
+            i.to_string()
+        };
+        bail!(
+            "device '{spec}' has device index {shown}, above the maximum of {MAX_DEVICE_INDEX}; \
+             the index is probably mistyped; run `list-devices` and use one of the indexes it shows"
+        );
+    }
+    Ok(Some(device))
 }
 
-/// ONNX Runtime `ep` or `ep:N`.
-fn parse_ort(s: &str) -> Option<Device> {
-    let (name, index) = match s.split_once(':') {
-        Some((n, i)) => (n, Some(parse_index(i)?)),
-        None => (s, None),
-    };
-    Device::new(Runtime::Ort, Target::from_name(name)?, index).ok()
+/// OpenVINO `name` or `name.N` (`gpu.1`); only GPU takes an index. `Ok(None)` = not a device.
+fn parse_openvino(spec: &str, s: &str) -> Result<Option<Device>> {
+    match s.split_once('.') {
+        Some((n, i)) => match parse_index(i) {
+            Some(i) => checked(spec, Runtime::OpenVino, n, Some(i)),
+            None => Ok(None),
+        },
+        None => checked(spec, Runtime::OpenVino, s, None),
+    }
+}
+
+/// ONNX Runtime `ep` or `ep:N`. `Ok(None)` = not a device.
+fn parse_ort(spec: &str, s: &str) -> Result<Option<Device>> {
+    match s.split_once(':') {
+        Some((n, i)) => match parse_index(i) {
+            Some(i) => checked(spec, Runtime::Ort, n, Some(i)),
+            None => Ok(None),
+        },
+        None => checked(spec, Runtime::Ort, s, None),
+    }
 }
 
 /// Parse a device setting (case-insensitive, surrounding whitespace ignored).
 pub fn parse(s: &str) -> Result<DeviceSpec> {
-    let lower = s.trim().to_ascii_lowercase();
+    let spec = s.trim();
+    let lower = spec.to_ascii_lowercase();
     let parsed = match lower.split_once(':') {
         _ if lower == "auto" => Some(DeviceSpec::Auto),
-        Some(("openvino", rest)) => parse_openvino(rest).map(DeviceSpec::Device),
-        Some(("ort", rest)) => parse_ort(rest).map(DeviceSpec::Device),
+        Some(("openvino", rest)) => parse_openvino(spec, rest)?.map(DeviceSpec::Device),
+        Some(("ort", rest)) => parse_ort(spec, rest)?.map(DeviceSpec::Device),
         Some(_) => None,
         // Legacy bare OpenVINO names.
-        None => parse_openvino(&lower).map(DeviceSpec::Device),
+        None => parse_openvino(spec, &lower)?.map(DeviceSpec::Device),
     };
     match parsed {
         Some(spec) => Ok(spec),
-        None => bail!("unknown device '{}': expected {SPEC_SYNTAX}", s.trim()),
+        None => bail!(
+            "unknown device '{spec}': the setting is not one of the accepted forms; \
+             use one of {SPEC_SYNTAX}, or run `list-devices` to see what this machine offers"
+        ),
     }
 }
 
@@ -393,7 +428,6 @@ mod tests {
             "openvino:",
             "openvino:cuda",
             "openvino:gpu:1",
-            "openvino:gpu.99999999999",
             "ort",
             "ort:",
             "ort:gpu",
@@ -411,6 +445,32 @@ mod tests {
                 .unwrap_or_else(|| panic!("{bad:?} must fail"));
             assert!(format!("{err}").contains("openvino:gpu"), "{bad:?}: {err}");
         }
+    }
+
+    #[test]
+    fn index_is_capped() {
+        assert_eq!(
+            parse("ort:cuda:255").unwrap(),
+            ort(Target::Cuda, Some(MAX_DEVICE_INDEX))
+        );
+        assert_eq!(parse("gpu.255").unwrap(), ov(Target::Gpu, Some(255)));
+        for bad in [
+            "ort:cuda:256",
+            "ort:cuda:2147483648",
+            "ort:cuda:4294967295",
+            "ort:directml:99999999999999999999",
+            "openvino:gpu.99999",
+            "GPU.256",
+        ] {
+            let err = format!("{:#}", parse(bad).unwrap_err());
+            assert!(
+                err.contains("above the maximum of 255") && err.contains("list-devices"),
+                "{bad}: {err}"
+            );
+        }
+        // No index allowed at all stays the syntax error.
+        let err = format!("{:#}", parse("cpu.999").unwrap_err());
+        assert!(err.contains("unknown device"), "{err}");
     }
 
     #[test]

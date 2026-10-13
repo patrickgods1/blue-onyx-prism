@@ -482,20 +482,23 @@ fn compile_on(
 /// cards (e.g. an NVIDIA dGPU). A bare `GPU` request is resolved to the first Intel GPU so it never
 /// lands on an unsupported device. Explicit `GPU.N` requests are honoured as-is.
 fn prefer_intel_gpu(core: &openvino::Core, primary: &str, available: &[String]) -> Option<String> {
-    if !primary.eq_ignore_ascii_case("GPU") {
+    if !primary.eq_ignore_ascii_case("GPU") || !available.iter().any(|d| d.starts_with("GPU.")) {
         return None;
     }
-    let gpus: Vec<&String> = available.iter().filter(|d| d.starts_with("GPU.")).collect();
-    if gpus.is_empty() {
-        return None;
-    }
-    let default_name = full_device_name(core, "GPU");
-    if default_name.contains("Intel") {
-        return None;
-    }
-    gpus.into_iter()
-        .find(|d| full_device_name(core, d).contains("Intel"))
-        .cloned()
+    // Same resolution as `Runtimes::device_class` (through the probe), so the tuning class and
+    // the compiled device agree (BE-09).
+    let gpus: Vec<super::select::OvDevice> = available
+        .iter()
+        .filter(|d| d.starts_with("GPU."))
+        .map(|d| super::select::OvDevice {
+            name: d.clone(),
+            full_name: full_device_name(core, d),
+            device_type: None,
+        })
+        .collect();
+    super::select::bare_gpu_device(&gpus)
+        .filter(|d| d.name != "GPU.0")
+        .map(|d| d.name.clone())
 }
 
 /// Read, reshape to static, compile on exactly `cand.device` (an OpenVINO device; a bare `GPU`
@@ -1007,7 +1010,8 @@ pub(crate) fn read_outputs(
 }
 
 /// Start an inference on `slot` (`infer_async`); its completion arrives on the backend's
-/// completion channel with the returned sequence number.
+/// completion channel with the returned sequence number. On error the slot stays idle and the
+/// caller has nothing to collect (see the comment inside on stray completions).
 pub(crate) fn submit(
     model: &ModelInfo,
     slots: &mut [OvSlot],
@@ -1066,10 +1070,25 @@ pub(crate) fn submit(
             .with_context(|| format!("{}: setting input '{}'", where_(), e.name))?;
         s.extras.push(t);
     }
+    // The sequence number is set before `infer_async` because the callback may run before
+    // `infer_async` returns. A start that fails (BE-14) is owned by the backend: the slot stays
+    // idle, `wait_done` makes sure nothing still runs on the request, the extras are released
+    // and the failed start's `seq` is never returned. A completion the plugin may still send
+    // for it carries that unreturned `seq` (or, if it fires late, the next submit's `seq`, for
+    // which `collect` still waits on the request itself), so callers that match completions
+    // by (slot, seq) of a successful `submit` (as the worker does) can never act on it.
     let seq = s.ctx.seq.fetch_add(1, Ordering::AcqRel) + 1;
-    s.request
-        .infer_async()
-        .with_context(|| format!("{}: starting inference", where_()))?;
+    if let Err(e) = s.request.infer_async() {
+        let _ = wait_done(&mut s.request);
+        s.extras.clear();
+        return Err(e).with_context(|| {
+            format!(
+                "{}: starting inference failed; the GPU/device may have been reset or lost; \
+                 retry, and reload the model or restart the service if it persists",
+                where_()
+            )
+        });
+    }
     s.busy = true;
     Ok(seq)
 }

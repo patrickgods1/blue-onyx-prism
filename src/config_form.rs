@@ -166,6 +166,10 @@ pub fn parse_config_form(
     if let Some(v) = get("log_path") {
         c.log_path = dir("log_path", v)?;
     }
+    // Not on the Config page (not in `FORM_FIELDS`); accepted from API clients.
+    if let Some(v) = get("log_format") {
+        c.log_format = v.parse()?;
+    }
     if let Some(v) = get("save_image_path") {
         c.save_image_path = dir("save_image_path", v)?;
     }
@@ -782,5 +786,14 @@ mod tests {
         let models = r#"[{"path":"a.onnx","device":"XPU"}]"#;
         let err = apply_config_form(&mut c, &form(&[("models_json", models)])).unwrap_err();
         assert!(format!("{err:#}").contains("device"), "{err:#}");
+    }
+
+    #[test]
+    fn log_format_is_accepted_from_api_forms() {
+        let mut c = Config::default();
+        parse_config_form(&mut c, &form(&[("log_format", "json")])).unwrap();
+        assert_eq!(c.log_format, crate::config::LogFormat::Json);
+        let err = parse_config_form(&mut c, &form(&[("log_format", "xml")])).unwrap_err();
+        assert!(format!("{err:#}").contains("log_format"), "{err:#}");
     }
 }

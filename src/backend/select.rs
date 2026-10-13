@@ -79,6 +79,33 @@ impl OvDevice {
     }
 }
 
+/// The listed OpenVINO GPU that a bare `GPU` request compiles on (`device::load_model` resolves
+/// it the same way, BE-09): with numbered GPUs (`GPU.0`, `GPU.1`, ..) listed, `GPU.0` when it is
+/// an Intel GPU, else the first Intel `GPU.N` (OpenVINO's OpenCL plugin can list an NVIDIA card
+/// first), else `GPU.0`; otherwise the single `GPU`. None when no GPU is listed.
+pub fn bare_gpu_device(devices: &[OvDevice]) -> Option<&OvDevice> {
+    let numbered: Vec<&OvDevice> = devices
+        .iter()
+        .filter(|d| d.name.starts_with("GPU."))
+        .collect();
+    if numbered.is_empty() {
+        return devices.iter().find(|d| d.name == "GPU");
+    }
+    let first = numbered
+        .iter()
+        .find(|d| d.name == "GPU.0")
+        .or(numbered.first())
+        .copied();
+    if first.is_some_and(|d| d.full_name.contains("Intel")) {
+        return first;
+    }
+    numbered
+        .iter()
+        .find(|d| d.full_name.contains("Intel"))
+        .copied()
+        .or(first)
+}
+
 /// What OpenVINO offers on this machine.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpenVinoProbe {
@@ -842,6 +869,36 @@ pub fn format_auto(sel: &Selection) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ovd(name: &str, full: &str, ty: &str) -> OvDevice {
+        OvDevice {
+            name: name.into(),
+            full_name: full.into(),
+            device_type: Some(ty.into()),
+        }
+    }
+
+    #[test]
+    fn bare_gpu_prefers_intel() {
+        let nv = ovd("GPU.0", "NVIDIA GeForce RTX 3060 (dGPU)", "discrete");
+        let intel = ovd("GPU.1", "Intel(R) UHD Graphics 630 (iGPU)", "integrated");
+        let cpu = ovd("CPU", "Intel(R) Core(TM) i5-8500", "");
+        let devs = [cpu.clone(), nv.clone(), intel.clone()];
+        assert_eq!(bare_gpu_device(&devs), Some(&intel));
+        // Intel first: GPU.0.
+        let arc = ovd("GPU.1", "Intel(R) Arc(TM) A770 (dGPU)", "discrete");
+        let igpu0 = ovd("GPU.0", "Intel(R) UHD Graphics 630 (iGPU)", "integrated");
+        assert_eq!(bare_gpu_device(&[igpu0.clone(), arc]), Some(&igpu0));
+        // No Intel GPU: GPU.0 (what the plugin's default resolves to).
+        assert_eq!(bare_gpu_device(std::slice::from_ref(&nv)), Some(&nv));
+        // One unnumbered GPU.
+        let single = ovd("GPU", "Intel(R) UHD Graphics 630 (iGPU)", "integrated");
+        assert_eq!(
+            bare_gpu_device(&[cpu.clone(), single.clone()]),
+            Some(&single)
+        );
+        assert_eq!(bare_gpu_device(&[cpu]), None);
+    }
 
     #[test]
     fn ov_device_helpers() {

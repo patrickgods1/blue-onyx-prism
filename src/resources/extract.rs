@@ -24,9 +24,13 @@
 //!
 //! Layouts:
 //! - [`Layout::OpenVino`]: the toolkit's `runtime/...` libraries, layout preserved (what
-//!   `openvino-finder` expects under `OPENVINO_INSTALL_DIR`).
+//!   `openvino-finder` expects under `OPENVINO_INSTALL_DIR`), plus its license notices
+//!   (`docs/licensing/LICENSE`, the `*third-party-programs.txt` files of the runtime, oneDNN
+//!   and oneTBB, `runtime/3rdparty/tbb/TBB-LICENSE`).
 //! - [`Layout::OrtRelease`], [`Layout::NugetOrt`], [`Layout::NugetDirectMl`]: ONNX Runtime and
-//!   DirectML shared libraries, flat.
+//!   DirectML shared libraries, flat, plus the license notices under `licenses/onnxruntime/`
+//!   (`LICENSE`, `ThirdPartyNotices.txt`) and `licenses/directml/` (`LICENSE.txt`,
+//!   `ThirdPartyNotices.txt`) so a redistributed install keeps them (NR-17).
 //! - [`Layout::NvidiaWheel`]: CUDA/cuDNN shared libraries from `nvidia/<component>/{bin,lib}/`,
 //!   flat.
 //! - [`Layout::Uv`]: only the `uv` / `uv.exe` binary of a uv release archive (made executable;
@@ -41,6 +45,12 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// An extraction stopped because its stop flag was set (service shutdown).
+#[derive(Debug, thiserror::Error)]
+#[error("cancelled")]
+pub struct Cancelled;
 
 /// Target platform of an extraction (the resource's platform, normally this machine's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,11 +90,12 @@ impl Default for Limits {
     }
 }
 
-/// Bytes written so far against [`Limits`].
+/// Bytes written so far against [`Limits`], and the stop flag checked while writing.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Budget {
+pub(crate) struct Budget<'a> {
     limits: Limits,
     used: u64,
+    stop: Option<&'a AtomicBool>,
 }
 
 /// An archive exceeded a decompressed-size ceiling.
@@ -104,9 +115,21 @@ pub struct HostileEntry {
     pub why: &'static str,
 }
 
-impl Budget {
-    fn new(limits: Limits) -> Self {
-        Self { limits, used: 0 }
+impl<'a> Budget<'a> {
+    fn new(limits: Limits, stop: Option<&'a AtomicBool>) -> Self {
+        Self {
+            limits,
+            used: 0,
+            stop,
+        }
+    }
+
+    /// Fail with [`Cancelled`] once the stop flag is set.
+    fn check_stop(&self) -> Result<()> {
+        if self.stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            return Err(anyhow::Error::new(Cancelled));
+        }
+        Ok(())
     }
 
     /// Bytes one more entry may still write: the smaller of the per-file ceiling and what is
@@ -194,6 +217,28 @@ pub fn extract_part(
     )
 }
 
+/// [`extract_part`] that stops with [`Cancelled`] as soon as `stop` is set (checked between
+/// entries and every 256 KiB inside one), so a service stop does not wait for a large archive.
+pub fn extract_part_until(
+    archive: &Path,
+    kind: ArchiveKind,
+    layout: Layout,
+    flavor: Option<Flavor>,
+    target: Target<'_>,
+    dest: &Path,
+    stop: &AtomicBool,
+) -> Result<BTreeSet<String>> {
+    extract_impl(
+        archive,
+        kind,
+        layout,
+        flavor,
+        target,
+        dest,
+        Budget::new(Limits::default(), Some(stop)),
+    )
+}
+
 /// [`extract_part`] with explicit decompressed-size [`Limits`].
 pub fn extract_part_with(
     archive: &Path,
@@ -204,15 +249,36 @@ pub fn extract_part_with(
     dest: &Path,
     limits: Limits,
 ) -> Result<BTreeSet<String>> {
+    extract_impl(
+        archive,
+        kind,
+        layout,
+        flavor,
+        target,
+        dest,
+        Budget::new(limits, None),
+    )
+}
+
+fn extract_impl(
+    archive: &Path,
+    kind: ArchiveKind,
+    layout: Layout,
+    flavor: Option<Flavor>,
+    target: Target<'_>,
+    dest: &Path,
+    mut budget: Budget<'_>,
+) -> Result<BTreeSet<String>> {
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let windows = target.windows();
     let flavor = flavor.unwrap_or(Flavor::Cpu);
-    let mut budget = Budget::new(limits);
     let b = &mut budget;
     match layout {
         Layout::OpenVino => {
             let sel = selection_for(target.os)?;
-            let wanted = |e: &str| strip_top(e).and_then(|r| sel.wanted(&r));
+            let wanted = |e: &str| {
+                strip_top(e).and_then(|r| sel.wanted(&r).or_else(|| openvino_license_wanted(&r)))
+            };
             let link = |rel: &str, t: &str, hard: bool| {
                 let name = same_dir_link_target(rel, t, hard)?;
                 let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
@@ -438,8 +504,9 @@ pub(crate) fn write_entry(
     dest: &Path,
     rel: &str,
     reader: &mut dyn Read,
-    budget: &mut Budget,
+    budget: &mut Budget<'_>,
 ) -> Result<u64> {
+    budget.check_stop()?;
     let out = dest.join(rel);
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
@@ -450,7 +517,12 @@ pub(crate) fn write_entry(
         std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     let allowance = budget.allowance();
     // One byte more than allowed: reaching it proves the entry is too large.
-    let mut capped = reader.take(allowance.saturating_add(1));
+    let mut stoppable = StopRead {
+        inner: reader,
+        stop: budget.stop,
+        since_check: 0,
+    };
+    let mut capped = (&mut stoppable).take(allowance.saturating_add(1));
     let n =
         std::io::copy(&mut capped, &mut f).with_context(|| format!("writing {}", out.display()));
     let n = match n {
@@ -463,6 +535,7 @@ pub(crate) fn write_entry(
         Err(e) => {
             drop(f);
             let _ = std::fs::remove_file(&tmp);
+            budget.check_stop()?;
             return Err(e);
         }
     };
@@ -474,6 +547,27 @@ pub(crate) fn write_entry(
     }
     std::fs::rename(&tmp, &out).with_context(|| format!("renaming to {}", out.display()))?;
     Ok(n)
+}
+
+/// A reader that fails with [`Cancelled`] once `stop` is set (checked every 256 KiB).
+struct StopRead<'r, 's> {
+    inner: &'r mut dyn Read,
+    stop: Option<&'s AtomicBool>,
+    since_check: usize,
+}
+
+impl Read for StopRead<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.since_check >= 256 * 1024 || self.since_check == 0 {
+            self.since_check = 0;
+            if self.stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+                return Err(std::io::Error::other(Cancelled));
+            }
+        }
+        let n = self.inner.read(buf)?;
+        self.since_check = self.since_check.saturating_add(n.max(1));
+        Ok(n)
+    }
 }
 
 /// Split an archive entry name into clean components; None for suspicious ones.
@@ -496,7 +590,7 @@ fn extract_zip(
     archive: &Path,
     dest: &Path,
     wanted: impl Fn(&str) -> Option<String>,
-    budget: &mut Budget,
+    budget: &mut Budget<'_>,
 ) -> Result<BTreeSet<String>> {
     let file = std::fs::File::open(archive)
         .with_context(|| format!("opening archive {}", archive.display()))?;
@@ -504,6 +598,7 @@ fn extract_zip(
         .with_context(|| format!("reading zip {}", archive.display()))?;
     let mut got = BTreeSet::new();
     for i in 0..zip.len() {
+        budget.check_stop()?;
         // Filter on the central-directory metadata; only wanted entries are opened (seek,
         // local header, decompressor).
         let (name, rel) = {
@@ -543,7 +638,7 @@ fn extract_tgz(
     dest: &Path,
     wanted: impl Fn(&str) -> Option<String>,
     link: impl Fn(&str, &str, bool) -> Option<String>,
-    budget: &mut Budget,
+    budget: &mut Budget<'_>,
 ) -> Result<BTreeSet<String>> {
     let file = std::fs::File::open(archive)
         .with_context(|| format!("opening archive {}", archive.display()))?;
@@ -556,6 +651,7 @@ fn extract_tgz(
         .entries()
         .with_context(|| format!("reading tar {}", archive.display()))?
     {
+        budget.check_stop()?;
         let mut entry =
             entry.with_context(|| format!("reading tar entry in {}", archive.display()))?;
         // `Entry::path` already refuses `..` and absolute paths on GNU/ustar headers; the
@@ -802,6 +898,22 @@ impl Selection {
     }
 }
 
+/// License notices of the OpenVINO archive (path below the top folder), kept in place (NR-17).
+pub(crate) const OPENVINO_LICENSE_FILES: &[&str] = &[
+    "docs/licensing/LICENSE",
+    "docs/licensing/runtime-third-party-programs.txt",
+    "docs/licensing/onednn_third-party-programs.txt",
+    "docs/licensing/onetbb_third-party-programs.txt",
+    "runtime/3rdparty/tbb/TBB-LICENSE",
+];
+
+/// `rel` (top folder stripped) is one of [`OPENVINO_LICENSE_FILES`].
+pub(crate) fn openvino_license_wanted(rel: &str) -> Option<String> {
+    OPENVINO_LICENSE_FILES
+        .contains(&rel)
+        .then(|| rel.to_string())
+}
+
 /// On macOS, `(source rel, destination rel)` pairs that copy the bundled TBB/hwloc libraries
 /// next to `libopenvino_c` (empty elsewhere).
 ///
@@ -900,12 +1012,48 @@ fn stem_allowed(stem: &str, flavor: Flavor) -> bool {
     CORE_STEMS.contains(&stem) || (flavor == Flavor::Cuda && GPU_STEMS.contains(&stem))
 }
 
+/// Where the ONNX Runtime license notices go in an install directory.
+pub const ORT_LICENSE_DIR: &str = "licenses/onnxruntime";
+/// Where the DirectML license notices go in an install directory.
+pub const DIRECTML_LICENSE_DIR: &str = "licenses/directml";
+
+/// License notices of the ONNX Runtime / DirectML archives (NR-17): the release archives and the
+/// ONNX Runtime NuGet have `LICENSE` + `ThirdPartyNotices.txt` (below the top folder, or at the
+/// root of the package), the DirectML NuGet `LICENSE.txt` + `ThirdPartyNotices.txt` at its root.
+/// Returns the destination below `licenses/` (never flat, so the two packages of the DirectML
+/// flavor cannot overwrite each other's notices).
+fn ort_license_wanted(layout: Layout, dirs: &[&str], name: &str) -> Option<String> {
+    let (at_place, dir, names): (bool, &str, &[&str]) = match layout {
+        Layout::OrtRelease => (
+            dirs.len() == 1,
+            ORT_LICENSE_DIR,
+            &["LICENSE", "ThirdPartyNotices.txt"],
+        ),
+        Layout::NugetOrt => (
+            dirs.is_empty(),
+            ORT_LICENSE_DIR,
+            &["LICENSE", "ThirdPartyNotices.txt"],
+        ),
+        Layout::NugetDirectMl => (
+            dirs.is_empty(),
+            DIRECTML_LICENSE_DIR,
+            &["LICENSE.txt", "ThirdPartyNotices.txt"],
+        ),
+        _ => return None,
+    };
+    (at_place && names.contains(&name)).then(|| format!("{dir}/{name}"))
+}
+
 /// Decide whether an ONNX Runtime / DirectML archive entry belongs to the runtime subset.
-/// Returns the flat destination file name (the entry's last component, itself whitelisted).
+/// Returns the flat destination file name (the entry's last component, itself whitelisted), or
+/// `licenses/<component>/<name>` for a license notice.
 pub fn ort_wanted(layout: Layout, flavor: Flavor, windows: bool, entry: &str) -> Option<String> {
     let parts = components(entry)?;
     let (name, dirs) = parts.split_last()?;
     let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    if let Some(license) = ort_license_wanted(layout, &dirs, name) {
+        return Some(license);
+    }
     match layout {
         Layout::OrtRelease => {
             // `<top>/lib/<file>` (some Windows packages use `bin`).
@@ -1348,6 +1496,112 @@ mod tests {
         );
     }
 
+    /// NR-17: each runtime keeps its license notices (names as in the pinned 1.24.4 / 2026.4
+    /// archives and the DirectML 1.15.4 NuGet), under `licenses/` so the two DirectML packages
+    /// cannot collide; other top-level files are still dropped.
+    #[test]
+    fn license_notices_are_kept() {
+        for (layout, top) in [
+            (Layout::OrtRelease, "onnxruntime-linux-x64-1.24.4/"),
+            (Layout::OrtRelease, "onnxruntime-win-x64-1.24.4/"),
+            (Layout::NugetOrt, ""),
+        ] {
+            let w = |e: &str| ort_wanted(layout, Flavor::DirectMl, true, &format!("{top}{e}"));
+            assert_eq!(
+                w("LICENSE").as_deref(),
+                Some("licenses/onnxruntime/LICENSE")
+            );
+            assert_eq!(
+                w("ThirdPartyNotices.txt").as_deref(),
+                Some("licenses/onnxruntime/ThirdPartyNotices.txt")
+            );
+            assert!(w("README.md").is_none() && w("Privacy.md").is_none());
+            assert!(w("lib/LICENSE").is_none() && w("runtimes/LICENSE").is_none());
+        }
+        let d = |e: &str| ort_wanted(Layout::NugetDirectMl, Flavor::DirectMl, true, e);
+        assert_eq!(
+            d("LICENSE.txt").as_deref(),
+            Some("licenses/directml/LICENSE.txt")
+        );
+        assert_eq!(
+            d("ThirdPartyNotices.txt").as_deref(),
+            Some("licenses/directml/ThirdPartyNotices.txt")
+        );
+        assert!(d("LICENSE").is_none() && d("bin/LICENSE.txt").is_none());
+        // OpenVINO: layout kept below the top folder.
+        for rel in OPENVINO_LICENSE_FILES {
+            assert_eq!(openvino_license_wanted(rel).as_deref(), Some(*rel));
+        }
+        for rel in [
+            "docs/licensing/EULA.txt",
+            "docs/licensing/documentation-third-party-programs.txt",
+            "LICENSE",
+            "docs/licensing/../LICENSE",
+        ] {
+            assert!(openvino_license_wanted(rel).is_none(), "{rel}");
+        }
+    }
+
+    /// An ONNX Runtime release tarball with its notices extracts them under `licenses/` and the
+    /// install check still finds the library; a set stop flag cancels the extraction.
+    #[test]
+    fn ort_tgz_keeps_licenses_and_honors_the_stop_flag() {
+        let dir = TempDir::new("licenses");
+        let archive = dir.join("ort.tgz");
+        tgz_with(
+            &archive,
+            &[
+                TarEntry::File("ort-1/LICENSE", b"MIT", 0o644),
+                TarEntry::File("ort-1/ThirdPartyNotices.txt", b"notices", 0o644),
+                TarEntry::File("ort-1/README.md", b"no", 0o644),
+                TarEntry::File("ort-1/lib/libonnxruntime.so.1.24.4", b"lib", 0o644),
+            ],
+        );
+        let t = Target {
+            os: "linux",
+            arch: "x86_64",
+        };
+        let dest = dir.join("out");
+        let stop = AtomicBool::new(false);
+        let got = extract_part_until(
+            &archive,
+            ArchiveKind::TarGz,
+            Layout::OrtRelease,
+            Some(Flavor::Cpu),
+            t,
+            &dest,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            set(&[
+                "libonnxruntime.so.1.24.4",
+                "licenses/onnxruntime/LICENSE",
+                "licenses/onnxruntime/ThirdPartyNotices.txt",
+            ])
+        );
+        assert_eq!(
+            std::fs::read(dest.join("licenses/onnxruntime/LICENSE")).unwrap(),
+            b"MIT"
+        );
+        assert!(!dest.join("README.md").exists());
+        ort_check(Flavor::Cpu, false, &got).unwrap();
+
+        stop.store(true, Ordering::SeqCst);
+        let e = extract_part_until(
+            &archive,
+            ArchiveKind::TarGz,
+            Layout::OrtRelease,
+            Some(Flavor::Cpu),
+            t,
+            &dir.join("out2"),
+            &stop,
+        )
+        .unwrap_err();
+        assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+    }
+
     #[test]
     fn nuget_whitelist() {
         let o = |e: &str| ort_wanted(Layout::NugetOrt, Flavor::DirectMl, true, e);
@@ -1467,7 +1721,7 @@ mod tests {
         }
         let dest = dir.join("out");
         std::fs::create_dir_all(&dest).unwrap();
-        let mut budget = Budget::new(Limits::default());
+        let mut budget = Budget::new(Limits::default(), None);
         let got = extract_zip(
             &archive,
             &dest,

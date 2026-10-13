@@ -11,7 +11,8 @@ pub const MAX_CLASS_MAP_INDEX: u64 = 65_535;
 /// Load class names from a YAML file. Accepted forms:
 /// - `NAMES:` / `names:` as a list (`- person`),
 /// - `names:` as an index map (`{0: person, 1: bicycle}`, Ultralytics `metadata.yaml`), sorted by
-///   key (keys above [`MAX_CLASS_MAP_INDEX`] are rejected),
+///   key; the key is the class id, so gaps are filled with `class_{i}` (keys above
+///   [`MAX_CLASS_MAP_INDEX`] and duplicate keys are rejected),
 /// - a bare top-level list.
 pub fn load_class_names(path: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(path)
@@ -54,7 +55,27 @@ pub fn parse_class_names(text: &str) -> Result<Vec<String>> {
                 })
                 .collect::<Result<Vec<_>>>()?;
             pairs.sort_by_key(|(i, _)| *i);
-            Ok(pairs.into_iter().map(|(_, n)| n).collect())
+            // The key is the class id the model outputs: fill gaps (`{0: a, 1: b, 3: d}`) with
+            // `class_{i}` so later names keep their index instead of shifting down.
+            let len = pairs.last().map_or(0, |(i, _)| *i + 1);
+            let len = usize::try_from(len).context("class map key does not fit in memory")?;
+            let mut names: Vec<Option<String>> = vec![None; len];
+            for (i, n) in pairs {
+                let slot = usize::try_from(i).ok().and_then(|i| names.get_mut(i));
+                match slot {
+                    Some(Some(prev)) => anyhow::bail!(
+                        "class map key {i} appears twice ({prev:?} and {n:?}); keep one name per \
+                         class id"
+                    ),
+                    Some(slot) => *slot = Some(n),
+                    None => anyhow::bail!("class map key {i} is out of range"),
+                }
+            }
+            Ok(names
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| n.unwrap_or_else(|| format!("class_{i}")))
+                .collect())
         }
         other => anyhow::bail!("`names` must be a list or an index map, got {other:?}"),
     }
@@ -110,7 +131,20 @@ mod tests {
         let yaml =
             "description: x\nnames:\n  2: dog\n  0: person\n  1: bicycle\n  10: fire hydrant\n";
         let n = parse_class_names(yaml).unwrap();
-        assert_eq!(n, ["person", "bicycle", "dog", "fire hydrant"]);
+        assert_eq!(n.len(), 11);
+        assert_eq!(n[..3], ["person", "bicycle", "dog"]);
+        assert_eq!(n[3], "class_3");
+        assert_eq!(n[10], "fire hydrant");
+        // PL-08: a gap keeps later ids on their own names.
+        let n = parse_class_names("names: {0: person, 1: bicycle, 3: motorcycle}\n").unwrap();
+        assert_eq!(n, ["person", "bicycle", "class_2", "motorcycle"]);
+        // String keys count too; a key given twice is rejected.
+        let n = parse_class_names("names: {'1': b, 0: a}\n").unwrap();
+        assert_eq!(n, ["a", "b"]);
+        let e = parse_class_names("names: {'1': b, 1: c}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("appears twice"), "{e}");
     }
 
     #[test]

@@ -430,7 +430,7 @@
         poll(true);
         fire(!!j.success, j);
       })
-      .catch(function (e) { if (by) by.disabled = false; say(m, "error-text", "failed: " + e); fire(false, null); });
+      .catch(function (e) { if (by) by.disabled = false; say(m, "error-text", "failed: the server did not answer (" + e + "); it may be restarting or stopped, so check that it runs and try again."); fire(false, null); });
   }
   document.addEventListener("submit", function (e) {
     var form = e.target;

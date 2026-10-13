@@ -2,20 +2,23 @@
 
 use super::AppState;
 use crate::api::{VisionCustomListResponse, VisionDetectionRequest, VisionDetectionResponse};
-use crate::metrics::{DropReason, InflightPermit};
+use crate::metrics::{DropReason, InflightPermit, RejectReason};
 use crate::startup::ModelState;
 use crate::worker::WorkerHandle;
 use axum::Json;
-use axum::extract::multipart::MultipartRejection;
-use axum::extract::{Multipart, Path, State};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::multipart::{MultipartError, MultipartRejection};
+use axum::extract::{FromRequest, Multipart, Path, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use crossbeam_channel::TrySendError;
+use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Maximum accepted request body (multipart image upload).
 ///
@@ -54,6 +57,94 @@ pub const DISCARD_LIMIT: usize = BODY_LIMIT;
 /// unread and the connection closes.
 pub const DISCARD_TIMEOUT: Duration = MULTIPART_READ_TIMEOUT;
 
+/// Response header carrying the id of a detection request: the id the worker puts in its
+/// per-request log line ([`crate::worker::WorkItem::DetectWithId`]) and the handler in its
+/// debug line.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+pub(super) use crate::worker::new_request_id;
+
+/// `resp` with the [`REQUEST_ID_HEADER`] set to `id`.
+fn with_request_id(mut resp: Response, id: &str) -> Response {
+    if let Ok(v) = HeaderValue::from_str(id) {
+        resp.headers_mut().insert(REQUEST_ID_HEADER, v);
+    }
+    resp
+}
+
+/// Why a detection body could not be used: the answer text and the metric reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BodyError {
+    pub(super) reason: RejectReason,
+    pub(super) message: String,
+}
+
+impl BodyError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            reason: RejectReason::BadRequest,
+            message: message.into(),
+        }
+    }
+
+    /// From a multipart read error: too large (the body limit) or malformed.
+    fn from_multipart(e: &MultipartError, what: &str) -> Self {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            Self {
+                reason: RejectReason::BodyTooLarge,
+                message: format!(
+                    "The upload is larger than the {} MiB limit; send a smaller image \
+                     (e.g. a JPEG of the camera frame).",
+                    BODY_LIMIT / (1024 * 1024)
+                ),
+            }
+        } else {
+            Self::bad_request(format!(
+                "{what}: {}; the upload was cut off or is not valid multipart/form-data, \
+                 resend the image as the multipart field 'image'.",
+                e.body_text()
+            ))
+        }
+    }
+
+    /// Count this rejection in the server metrics.
+    pub(super) fn record(&self, state: &AppState) {
+        state.metrics.record_rejected(self.reason);
+    }
+}
+
+/// A detection upload: the multipart stream, or (not multipart/form-data) the rejection and the
+/// unread body, kept so it can be discarded before the answer (SV-13: a body left unread makes
+/// hyper close the connection, and a pooling client then fails its next request on it).
+pub(super) struct Upload(Result<Multipart, NotMultipart>);
+
+pub(super) struct NotMultipart {
+    rejection: MultipartRejection,
+    body: Body,
+}
+
+impl<S: Send + Sync> FromRequest<S> for Upload {
+    type Rejection = Infallible;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+        // `Multipart` rejects only on the content type: probe it on a body-less request so a
+        // rejected body stays here to be drained.
+        let mut probe = Request::new(Body::empty());
+        if let Some(ct) = parts.headers.get(header::CONTENT_TYPE) {
+            probe.headers_mut().insert(header::CONTENT_TYPE, ct.clone());
+        }
+        if let Err(rejection) = Multipart::from_request(probe, state).await {
+            return Ok(Self(Err(NotMultipart { rejection, body })));
+        }
+        let mp = Multipart::from_request(Request::from_parts(parts, body), state).await;
+        Ok(Self(mp.map_err(|rejection| NotMultipart {
+            rejection,
+            body: Body::empty(),
+        })))
+    }
+}
+
 /// The server-wide cap on detection requests in flight: a fixed `Metrics::inflight_limit` when
 /// set (tests), else the sum of the models' queue capacities plus [`INFLIGHT_MARGIN`], or
 /// [`DEFAULT_MAX_INFLIGHT`] when that sum is 0. Read per request, so it follows reloads and the
@@ -83,10 +174,7 @@ fn admit(state: &AppState, command: &str) -> Result<InflightPermit, Box<Response
     if let Some(p) = state.metrics.try_begin_detection(limit) {
         return Ok(p);
     }
-    state
-        .metrics
-        .rejected_overloaded
-        .fetch_add(1, Ordering::Relaxed);
+    state.metrics.record_rejected(RejectReason::Overloaded);
     if let Some(held_back) = state.metrics.overload_log.allow(state.metrics.now_ms()) {
         warn!(
             limit,
@@ -95,7 +183,8 @@ fn admit(state: &AppState, command: &str) -> Result<InflightPermit, Box<Response
         );
     }
     let mut r = VisionDetectionResponse::error(format!(
-        "Server is overloaded ({limit} detection requests in flight); retry later"
+        "Server is overloaded ({limit} detection requests in flight); more cameras send \
+         images than the models can serve, so retry later or lower the trigger rate."
     ));
     r.command = command.to_string();
     Err(Box::new(
@@ -106,21 +195,40 @@ fn admit(state: &AppState, command: &str) -> Result<InflightPermit, Box<Response
 /// Read and throw away the start of a body that will not be used: at most [`DISCARD_LIMIT`]
 /// bytes within [`DISCARD_TIMEOUT`]. A body that ends within both leaves the connection
 /// reusable; otherwise hyper closes it after the answer (it drains only what is buffered).
-async fn discard_body(multipart: Result<Multipart, MultipartRejection>) {
-    discard_body_within(multipart, DISCARD_TIMEOUT).await;
+async fn discard_body(upload: Upload) {
+    discard_body_within(upload, DISCARD_TIMEOUT).await;
 }
 
 /// [`discard_body`] with an explicit time limit.
-async fn discard_body_within(multipart: Result<Multipart, MultipartRejection>, limit: Duration) {
-    let Ok(mut mp) = multipart else { return };
-    let drain = async move {
-        let mut seen = 0usize;
-        while let Ok(Some(mut field)) = mp.next_field().await {
-            while let Ok(Some(chunk)) = field.chunk().await {
-                seen = seen.saturating_add(chunk.len());
-                if seen > DISCARD_LIMIT {
-                    return;
+async fn discard_body_within(upload: Upload, limit: Duration) {
+    match upload.0 {
+        Ok(mut mp) => {
+            let drain = async move {
+                let mut seen = 0usize;
+                while let Ok(Some(mut field)) = mp.next_field().await {
+                    while let Ok(Some(chunk)) = field.chunk().await {
+                        seen = seen.saturating_add(chunk.len());
+                        if seen > DISCARD_LIMIT {
+                            return;
+                        }
+                    }
                 }
+            };
+            let _ = tokio::time::timeout(limit, drain).await;
+        }
+        Err(not) => discard_raw_within(not.body, limit).await,
+    }
+}
+
+/// Read and drop a raw (not multipart) body: at most [`DISCARD_LIMIT`] bytes within `limit`.
+async fn discard_raw_within(body: Body, limit: Duration) {
+    let drain = async move {
+        let mut stream = body.into_data_stream();
+        let mut seen = 0usize;
+        while let Some(Ok(chunk)) = stream.next().await {
+            seen = seen.saturating_add(chunk.len());
+            if seen > DISCARD_LIMIT {
+                return;
             }
         }
     };
@@ -134,7 +242,7 @@ async fn discard_body_within(multipart: Result<Multipart, MultipartRejection>, l
 /// and any other text fields, returned in the map (e.g. `model` on the test page).
 async fn read_multipart(
     mut multipart: Multipart,
-) -> Result<(VisionDetectionRequest, HashMap<String, String>), String> {
+) -> Result<(VisionDetectionRequest, HashMap<String, String>), BodyError> {
     let mut req = VisionDetectionRequest::default();
     let mut fields = HashMap::new();
     let mut got_image = false;
@@ -142,7 +250,7 @@ async fn read_multipart(
         let field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return Err(format!("Invalid multipart body: {e}")),
+            Err(e) => return Err(BodyError::from_multipart(&e, "Invalid multipart body")),
         };
         match field.name().map(str::to_string) {
             Some(name) if name == "min_confidence" => {
@@ -157,7 +265,7 @@ async fn read_multipart(
                 req.image_data = field
                     .bytes()
                     .await
-                    .map_err(|e| format!("Reading image field: {e}"))?;
+                    .map_err(|e| BodyError::from_multipart(&e, "Reading the image field failed"))?;
                 got_image = true;
             }
             Some(name) => {
@@ -169,76 +277,108 @@ async fn read_multipart(
         }
     }
     if !got_image || req.image_data.is_empty() {
-        return Err("No image provided (expected multipart field 'image')".into());
+        return Err(BodyError::bad_request(
+            "No image provided: the upload has no (or an empty) multipart field 'image'; \
+             send the picture in a form field named 'image'.",
+        ));
     }
     Ok((req, fields))
 }
 
 /// Parse a detection upload within [`MULTIPART_READ_TIMEOUT`]. The image field is read into
 /// one `Bytes` (`Field::bytes`) that moves on to the worker without another copy.
+/// A body that is not multipart/form-data is discarded (bounded, see [`discard_body`]) before
+/// the error is returned, so the connection stays usable (SV-13).
 pub(super) async fn parse_detection_body(
-    multipart: Result<Multipart, MultipartRejection>,
-) -> Result<(VisionDetectionRequest, HashMap<String, String>), String> {
-    parse_body_within(multipart, MULTIPART_READ_TIMEOUT).await
+    upload: Upload,
+) -> Result<(VisionDetectionRequest, HashMap<String, String>), BodyError> {
+    parse_body_within(upload, MULTIPART_READ_TIMEOUT).await
 }
 
 /// [`parse_detection_body`] with an explicit time limit.
 async fn parse_body_within(
-    multipart: Result<Multipart, MultipartRejection>,
+    upload: Upload,
     limit: Duration,
-) -> Result<(VisionDetectionRequest, HashMap<String, String>), String> {
-    match multipart {
+) -> Result<(VisionDetectionRequest, HashMap<String, String>), BodyError> {
+    match upload.0 {
         Ok(mp) => tokio::time::timeout(limit, read_multipart(mp))
             .await
             .unwrap_or_else(|_| {
-                Err(format!(
-                    "Request body not received within {} s",
+                Err(BodyError::bad_request(format!(
+                    "Request body not received within {} s; the client stalled or the network \
+                     is too slow, so retry the request.",
                     limit.as_secs()
-                ))
+                )))
             }),
-        Err(e) => Err(format!("Expected a multipart/form-data body: {e}")),
+        Err(NotMultipart { rejection, body }) => {
+            discard_raw_within(body, limit.min(DISCARD_TIMEOUT)).await;
+            Err(BodyError::bad_request(format!(
+                "Expected a multipart/form-data body ({}); the image was probably posted raw, \
+                 so send it as the multipart form field 'image'.",
+                rejection.body_text()
+            )))
+        }
     }
 }
 
 pub(super) async fn detection_default(
     State(state): State<Arc<AppState>>,
-    multipart: Result<Multipart, MultipartRejection>,
+    upload: Upload,
 ) -> Response {
     let start = Instant::now();
+    let id = new_request_id();
     // The permit covers the whole request: body read, queue wait and the worker's reply.
     let _permit = match admit(&state, "detect") {
         Ok(p) => p,
-        Err(resp) => return *resp,
+        Err(resp) => return with_request_id(*resp, &id),
     };
     let Some(handle) = state.registry.default_model() else {
-        discard_body(multipart).await;
-        return Json(VisionDetectionResponse::error(
-            "No default model: enable a model on the Config page",
-        ))
-        .into_response();
+        discard_body(upload).await;
+        let resp = Json(VisionDetectionResponse::error(
+            "No default model: every model is disabled or none is configured; enable a model \
+             on the Config page.",
+        ));
+        return with_request_id(resp.into_response(), &id);
     };
-    Json(detect_on(&state, &handle, multipart, start, "detect").await).into_response()
+    let resp = detect_on(&state, &handle, upload, start, "detect", &id).await;
+    with_request_id(Json(resp).into_response(), &id)
 }
 
 pub(super) async fn detection_custom(
     State(state): State<Arc<AppState>>,
     Path(model): Path<String>,
-    multipart: Result<Multipart, MultipartRejection>,
+    upload: Upload,
 ) -> Response {
     let start = Instant::now();
+    let id = new_request_id();
     let _permit = match admit(&state, "custom") {
         Ok(p) => p,
-        Err(resp) => return *resp,
+        Err(resp) => return with_request_id(*resp, &id),
     };
     let Some(handle) = state.registry.by_name(&model) else {
-        discard_body(multipart).await;
+        discard_body(upload).await;
         // Client-chosen text: shortened and debug-escaped before it reaches the log.
-        warn!(model = ?short(&model), "request for unknown model");
-        let mut r = VisionDetectionResponse::error(format!("Unknown model '{model}'"));
+        warn!(model = ?short(&model), request_id = %id, "request for unknown model");
+        let mut r = VisionDetectionResponse::error(format!(
+            "Unknown model '{model}': it is not configured or not enabled; check the model \
+             name in Blue Iris against /v1/vision/custom/list."
+        ));
         r.command = "custom".into();
-        return Json(r).into_response();
+        return with_request_id(Json(r).into_response(), &id);
     };
-    Json(detect_on(&state, &handle, multipart, start, "custom").await).into_response()
+    let resp = detect_on(&state, &handle, upload, start, "custom", &id).await;
+    with_request_id(Json(resp).into_response(), &id)
+}
+
+/// Parse the upload, counting a rejection.
+async fn parse_counted(state: &AppState, upload: Upload) -> Result<VisionDetectionRequest, String> {
+    match parse_detection_body(upload).await {
+        Ok((r, _)) => Ok(r),
+        Err(e) => {
+            e.record(state);
+            Err(e.message)
+        }
+    }
 }
 
 /// A detection on `handle`. When the model cannot take it now (compiling, failed, queue full)
@@ -247,27 +387,27 @@ pub(super) async fn detection_custom(
 async fn detect_on(
     state: &AppState,
     handle: &WorkerHandle,
-    multipart: Result<Multipart, MultipartRejection>,
+    upload: Upload,
     start: Instant,
     command: &str,
+    request_id: &str,
 ) -> VisionDetectionResponse {
     if !matches!(handle.state.get(), ModelState::Ready) || handle.is_full() {
         handle.metrics.requests.fetch_add(1, Ordering::Relaxed);
         if let Some(early) = answer_without_inference(handle) {
-            discard_body(multipart).await;
-            return finish(state, handle, early, start, command);
+            discard_body(upload).await;
+            return finish(state, handle, early, start, command, request_id);
         }
         // It became ready (or got room) meanwhile: serve it normally (the request is
         // already counted).
-        let req = parse_detection_body(multipart).await.map(|(r, _)| r);
-        let resp = match req {
-            Ok(r) => send_to_worker(handle, r, start).await,
+        let resp = match parse_counted(state, upload).await {
+            Ok(r) => send_to_worker(handle, r, start, request_id).await,
             Err(e) => VisionDetectionResponse::error(e),
         };
-        return finish(state, handle, resp, start, command);
+        return finish(state, handle, resp, start, command, request_id);
     }
-    let req = parse_detection_body(multipart).await.map(|(r, _)| r);
-    run_detection(state, handle, req, start, command).await
+    let req = parse_counted(state, upload).await;
+    run_detection(state, handle, req, start, command, request_id).await
 }
 
 /// Longest client-chosen name written to the log.
@@ -290,19 +430,21 @@ pub(super) async fn run_detection(
     req: Result<VisionDetectionRequest, String>,
     start: Instant,
     command: &str,
+    request_id: &str,
 ) -> VisionDetectionResponse {
-    let resp = dispatch(handle, req, start).await;
-    finish(state, handle, resp, start, command)
+    let resp = dispatch(handle, req, start, request_id).await;
+    finish(state, handle, resp, start, command, request_id)
 }
 
 /// Stamp the command, round trip and GPU flag on `resp` (and record the round trip of a
-/// successful detection).
+/// successful detection); logs one debug line with the request id, model and timings.
 fn finish(
     state: &AppState,
     handle: &WorkerHandle,
     mut resp: VisionDetectionResponse,
     start: Instant,
     command: &str,
+    request_id: &str,
 ) -> VisionDetectionResponse {
     resp.command = command.to_string();
     resp.analysisRoundTripMs = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
@@ -313,6 +455,17 @@ fn finish(
             .record(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
     resp.canUseGPU = state.registry.runtime_info.has_gpu;
+    debug!(
+        request_id,
+        model = %handle.name,
+        command,
+        success = resp.success,
+        count = resp.count,
+        inference_ms = resp.inferenceMs,
+        process_ms = resp.processMs,
+        round_trip_ms = resp.analysisRoundTripMs,
+        "detection answered"
+    );
     resp
 }
 
@@ -320,6 +473,7 @@ pub(super) async fn dispatch(
     handle: &WorkerHandle,
     req: Result<VisionDetectionRequest, String>,
     start: Instant,
+    request_id: &str,
 ) -> VisionDetectionResponse {
     let req = match req {
         Ok(r) => r,
@@ -329,7 +483,7 @@ pub(super) async fn dispatch(
     if let Some(r) = answer_without_inference(handle) {
         return r;
     }
-    send_to_worker(handle, req, start).await
+    send_to_worker(handle, req, start, request_id).await
 }
 
 /// The immediate answer (and its drop metric) when `handle` cannot take a request now: a
@@ -363,9 +517,14 @@ fn answer_without_inference(handle: &WorkerHandle) -> Option<VisionDetectionResp
         }
         ModelState::Failed(m) => {
             handle.metrics.record_drop(DropReason::Failed);
-            return Some(VisionDetectionResponse::error(format!(
-                "Model '{name}' failed to load: {m}"
-            )));
+            // A stuck inference (worker::collect_watched) is reported with the worker's own
+            // wording, not as a load failure.
+            let text = if handle.is_stuck() {
+                format!("Model '{name}' is unavailable: {m}")
+            } else {
+                format!("Model '{name}' failed to load: {m}")
+            };
+            return Some(VisionDetectionResponse::error(text));
         }
     }
     if handle.is_full() {
@@ -381,13 +540,18 @@ async fn send_to_worker(
     handle: &WorkerHandle,
     req: VisionDetectionRequest,
     start: Instant,
+    request_id: &str,
 ) -> VisionDetectionResponse {
     let name = &handle.name;
     let (tx, rx) = tokio::sync::oneshot::channel();
     match handle
         .sender
-        .try_send(crate::worker::WorkItem::Detect(req, tx, start))
-    {
+        .try_send(crate::worker::WorkItem::DetectWithId(
+            req,
+            tx,
+            start,
+            request_id.to_string(),
+        )) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             handle.metrics.record_drop(DropReason::QueueFull);
@@ -439,16 +603,13 @@ pub(super) async fn custom_list(
 mod tests {
     use super::*;
     use crate::server::test_util::*;
-    use axum::body::{Body, Bytes};
-    use axum::extract::FromRequest;
-    use axum::http::{Request, header};
-    use futures_util::StreamExt;
+    use axum::body::Bytes;
 
     const IMAGE_HEAD: &str = "--XBOUNDARYX\r\nContent-Disposition: form-data; name=\"image\"; \
                               filename=\"t.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nxx";
 
     /// A multipart upload to `uri` that sends the start of its image and then stalls forever.
-    fn stalled(uri: &str) -> Request<Body> {
+    fn stalled(uri: &str) -> Request {
         let head = futures_util::stream::once(async {
             Ok::<_, std::io::Error>(Bytes::from_static(IMAGE_HEAD.as_bytes()))
         });
@@ -462,8 +623,117 @@ mod tests {
             .unwrap()
     }
 
-    async fn multipart_of(req: Request<Body>) -> Result<Multipart, MultipartRejection> {
-        Multipart::from_request(req, &()).await
+    async fn multipart_of(req: Request) -> Upload {
+        match Upload::from_request(req, &()).await {
+            Ok(u) => u,
+            Err(never) => match never {},
+        }
+    }
+
+    /// A body of `chunks` that sets the returned flag once it has been read to its end.
+    fn tracked_body(chunks: Vec<Bytes>) -> (Body, Arc<std::sync::atomic::AtomicBool>) {
+        let consumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = consumed.clone();
+        let stream = futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>))
+            .chain(futures_util::stream::poll_fn(move |_| {
+                flag.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(None)
+            }));
+        (Body::from_stream(stream), consumed)
+    }
+
+    /// SV-13: a raw (not multipart) image post is read to its end before the error answer, so
+    /// a keep-alive connection survives; the rejection is counted as `bad_request`.
+    #[tokio::test]
+    async fn raw_image_post_is_drained_and_counted() {
+        let (body, consumed) = tracked_body(vec![Bytes::from_static(b"\xFF\xD8 raw jpeg")]);
+        let req = Request::post("/")
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .body(body)
+            .unwrap();
+        let err = parse_detection_body(multipart_of(req).await)
+            .await
+            .unwrap_err();
+        assert!(consumed.load(Ordering::SeqCst), "body drained");
+        assert_eq!(err.reason, RejectReason::BadRequest);
+        assert!(
+            err.message
+                .starts_with("Expected a multipart/form-data body"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("field 'image'"), "{}", err.message);
+
+        // Through the router: a model that cannot take the request (unknown name, failed
+        // model) discards the raw body as well, and the answer carries a request id.
+        let state = test_state();
+        for uri in ["/v1/vision/custom/nope", "/v1/vision/detection"] {
+            let (body, consumed) = tracked_body(vec![Bytes::from_static(b"raw")]);
+            let req = Request::post(uri)
+                .header(header::CONTENT_TYPE, "image/jpeg")
+                .body(body)
+                .unwrap();
+            let (status, headers, _) = call(&state, req).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(consumed.load(Ordering::SeqCst), "{uri}: body drained");
+            let id = headers[REQUEST_ID_HEADER].to_str().unwrap();
+            assert!(
+                !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit()),
+                "{id}"
+            );
+        }
+    }
+
+    /// An upload over the body limit is counted as `body_too_large` (the extractor's default
+    /// limit of 2 MB applies here, without the router's `DefaultBodyLimit` layer).
+    #[tokio::test]
+    async fn oversized_upload_is_body_too_large() {
+        let mut body = IMAGE_HEAD.as_bytes().to_vec();
+        body.resize(body.len() + 3 * 1024 * 1024, b'x');
+        body.extend_from_slice(b"\r\n--XBOUNDARYX--\r\n");
+        let req = Request::post("/")
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=XBOUNDARYX",
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let err = parse_detection_body(multipart_of(req).await)
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason, RejectReason::BodyTooLarge, "{}", err.message);
+        assert!(err.message.contains("MiB limit"), "{}", err.message);
+
+        let state = test_state();
+        err.record(&state);
+        BodyError::bad_request("x").record(&state);
+        let text = crate::metrics::render_prometheus(&state.metrics, &[]);
+        assert!(
+            text.contains("blue_onyx_prism_requests_rejected_total{reason=\"body_too_large\"} 1")
+        );
+        assert!(text.contains("blue_onyx_prism_requests_rejected_total{reason=\"bad_request\"} 1"));
+    }
+
+    /// A multipart body without an `image` field is a `bad_request`.
+    #[tokio::test]
+    async fn missing_image_is_bad_request() {
+        let body = "--XBOUNDARYX\r\nContent-Disposition: form-data; name=\"min_confidence\"\r\n\r\n0.4\r\n--XBOUNDARYX--\r\n";
+        let req = Request::post("/")
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=XBOUNDARYX",
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let err = parse_detection_body(multipart_of(req).await)
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason, RejectReason::BadRequest);
+        assert!(
+            err.message.starts_with("No image provided"),
+            "{}",
+            err.message
+        );
     }
 
     async fn wait_inflight(state: &AppState, n: usize) {
@@ -511,7 +781,7 @@ mod tests {
             assert!(r.error.as_deref().unwrap().contains("overloaded"), "{r:?}");
             assert_eq!(r.command, command);
         }
-        assert_eq!(state.metrics.rejected_overloaded.load(Ordering::Relaxed), 2);
+        assert_eq!(state.metrics.rejected(RejectReason::Overloaded), 2);
         assert!(
             held.iter().all(|h| !h.is_finished()),
             "the first two still wait"
@@ -545,7 +815,13 @@ mod tests {
         let limit = Duration::from_millis(1500);
         let started = Instant::now();
         let err = parse_body_within(mp, limit).await.unwrap_err();
-        assert_eq!(err, "Request body not received within 1 s");
+        assert_eq!(err.reason, RejectReason::BadRequest);
+        assert!(
+            err.message
+                .starts_with("Request body not received within 1 s"),
+            "{}",
+            err.message
+        );
         assert!(started.elapsed() >= limit);
     }
 

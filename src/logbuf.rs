@@ -235,6 +235,54 @@ impl<S: Subscriber> Layer<S> for LogBuffer {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Messages from before logging is set up (CO-11)
+
+/// Most messages kept until logging starts (the rest are dropped; a run produces a handful).
+const MAX_EARLY: usize = 64;
+
+/// Messages logged before the global subscriber exists (config resolution runs before
+/// `cli::init_logging` because the config names the log level and directory).
+static EARLY: std::sync::Mutex<Vec<(Level, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn emit(level: Level, msg: &str) {
+    match level {
+        Level::ERROR => tracing::error!("{msg}"),
+        Level::WARN => tracing::warn!("{msg}"),
+        Level::INFO => tracing::info!("{msg}"),
+        Level::DEBUG => tracing::debug!("{msg}"),
+        _ => tracing::trace!("{msg}"),
+    }
+}
+
+/// Log `msg` at `level` now when logging is set up, else keep it until [`replay_early`]
+/// (called by `cli::init_logging_with` once the subscriber is installed).
+pub fn early(level: Level, msg: impl Into<String>) {
+    let msg = msg.into();
+    if tracing::dispatcher::has_been_set() {
+        emit(level, &msg);
+        return;
+    }
+    let mut q = EARLY.lock_recover();
+    if q.len() < MAX_EARLY {
+        q.push((level, msg));
+    }
+}
+
+/// Log (and forget) the messages [`early`] kept.
+pub fn replay_early() {
+    let pending = std::mem::take(&mut *EARLY.lock_recover());
+    for (level, msg) in pending {
+        emit(level, &msg);
+    }
+}
+
+/// Take the messages [`early`] kept without logging them (a command that never sets up
+/// logging prints them instead).
+pub fn take_early() -> Vec<(Level, String)> {
+    std::mem::take(&mut *EARLY.lock_recover())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

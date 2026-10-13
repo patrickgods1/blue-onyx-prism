@@ -1,7 +1,9 @@
 # Weekly check that every pinned download in the resource catalog (src/resources/catalog.rs) still
 # answers with its catalogued size: OpenVINO, ONNX Runtime, DirectML, the NVIDIA wheels and the
 # models, for every platform. Hashes are pinned in the binary; this catches moved or deleted
-# files before users hit them.
+# files before users hit them. A failed scheduled run opens an issue (or comments on the open one),
+# so it is seen by whoever watches the repository, not only by the cron's last editor. GitHub
+# disables a schedule after 60 days without repository activity: re-enable it on the Actions tab.
 name: Check catalog URLs
 
 on:
@@ -15,6 +17,11 @@ permissions:
 jobs:
   check-urls:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Only this job may open or comment on issues (the report below).
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
@@ -22,4 +29,30 @@ jobs:
           toolchain: 1.99.0 # keep equal to rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Check every catalog URL
-        run: cargo run --quiet -- list-resources --check-urls
+        run: |
+          set -o pipefail
+          cargo run --locked --quiet -- list-resources --check-urls 2>&1 | tee "$RUNNER_TEMP/check-urls.txt"
+      - name: Report the failure in an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Catalog URL check failed"
+          {
+            echo "The check of the pinned download URLs in src/resources/catalog.rs failed: $RUN_URL"
+            echo
+            echo "A moved or deleted file breaks first-run downloads for users. Update the pin (URL, size, SHA-256) in a reviewed commit, or re-run the workflow if it was a transient outage."
+            echo
+            echo '```'
+            tail -n 60 "$RUNNER_TEMP/check-urls.txt" 2>/dev/null || echo "(no output captured)"
+            echo '```'
+          } > "$RUNNER_TEMP/body.md"
+          num=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          fi

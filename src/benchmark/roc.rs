@@ -437,6 +437,7 @@ mod tests {
             label: label.into(),
             bbox: [0.0, 0.0, 10.0, 10.0],
             ignore,
+            crowd: false,
         }
     }
 

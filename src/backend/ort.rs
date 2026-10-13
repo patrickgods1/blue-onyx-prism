@@ -35,9 +35,11 @@ use super::device::DEFAULT_IMAGE_SHAPE;
 use super::device::{
     DEFAULT_TARGET_SIZES_SHAPE, dynamic_image_shape, extra_input_index, find_image_input,
 };
-use super::select::{EpStatus, NEEDS_ONNX, OrtProbe, onnx_path_for};
+use super::select::{EpStatus, NEEDS_ONNX, OrtProbe, cuda_ordinals, onnx_path_for};
 use super::spec::{Runtime, Target};
-use super::{Candidate, Completion, DeviceInfo, LoadRequest, ModelInfo, libs, onnx_rewrite};
+use super::{
+    Candidate, Completion, DeviceInfo, LoadRequest, ModelInfo, SessionDead, libs, onnx_rewrite,
+};
 use crate::model::{ExtraData, ExtraInput, NamedOutput, PortElem, PortSpec};
 use crate::sync::LockExt;
 use ::ort::ep::{self, ExecutionProvider};
@@ -113,7 +115,8 @@ fn load_library(path: &Path) -> Result<LoadedLib> {
     if let Some(lib) = slot.as_ref() {
         if lib.path != path {
             tracing::warn!(
-                "ONNX Runtime is already loaded from {}; {} is ignored until the process restarts",
+                "ONNX Runtime is already loaded from {}; {} is ignored because a process can load \
+                 only one ONNX Runtime flavor; restart the service to switch to it",
                 lib.path.display(),
                 path.display()
             );
@@ -581,25 +584,7 @@ impl OrtRuntime {
 
     /// GPU name for CUDA/TensorRT (NVIDIA ordinal) and DirectML (DXGI index); empty otherwise.
     fn full_name(&self, cand: &Candidate) -> String {
-        let index = cand.device.index.unwrap_or(0);
-        match cand.device.target {
-            Target::Cuda | Target::TensorRt => {
-                let mut nvidia: Vec<_> = self.hw.gpus_of(GpuVendor::Nvidia).collect();
-                nvidia.sort_by_key(|g| g.index);
-                nvidia
-                    .get(index as usize)
-                    .map(|g| g.name.clone())
-                    .unwrap_or_default()
-            }
-            Target::DirectMl => self
-                .hw
-                .gpus
-                .iter()
-                .find(|g| g.index == index)
-                .map(|g| g.name.clone())
-                .unwrap_or_default(),
-            _ => String::new(),
-        }
+        gpu_full_name(&self.hw, cand.device.target, cand.device.index.unwrap_or(0))
     }
 
     /// The model file a CoreML session loads: a cached rewrite of `path` (see
@@ -667,7 +652,9 @@ impl OrtRuntime {
             }
             Err(e) => {
                 tracing::warn!(
-                    "model {}: CoreML graph rewrite failed, loading the original: {e:#}",
+                    "model {}: CoreML graph rewrite failed, loading the original (ops CoreML \
+                     cannot run fall back to the CPU provider, slower): {e:#}; if it persists, \
+                     delete cache_dir/coreml or set BOP_COREML_REWRITE=0",
                     path.display()
                 );
                 path.to_path_buf()
@@ -708,7 +695,13 @@ impl OrtRuntime {
         for (name, value) in overrides {
             b = b.with_dimension_override(name, *value).map_err(ort_err)?;
         }
-        let device_id = index as i32;
+        // `spec::parse` caps indexes at `MAX_DEVICE_INDEX`; never wrap a larger one negative.
+        let device_id = i32::try_from(index).map_err(|_| {
+            anyhow::anyhow!(
+                "device index {index} is out of range for ONNX Runtime; it is probably mistyped; \
+                 run `list-devices` and use one of the indexes it shows"
+            )
+        })?;
         let eps = match target {
             Target::Cpu => Vec::new(),
             Target::Cuda => vec![
@@ -1074,12 +1067,14 @@ impl OrtCompiled {
                 outs: Vec::new(),
                 busy: false,
                 seq: 0,
+                dead: None,
             });
         }
         Ok(OrtBackend {
             info: self.info,
             slots,
             done_rx,
+            abort_timeout: ABORT_TIMEOUT,
         })
     }
 }
@@ -1114,7 +1109,26 @@ struct OrtSlot {
     outs: Vec<NamedOutput>,
     busy: bool,
     seq: u64,
+    /// Why the slot's session thread is gone (panicked, exited, or hung past
+    /// [`ABORT_TIMEOUT`]); every later `submit` fails with [`SessionDead`] (BE-10).
+    dead: Option<String>,
 }
+
+impl OrtSlot {
+    /// Mark the slot dead (first reason wins) and return the matching error.
+    fn kill(&mut self, slot: usize, reason: String) -> anyhow::Error {
+        let reason = self.dead.get_or_insert(reason).clone();
+        self.jobs = None;
+        self.busy = false;
+        SessionDead { slot, reason }.into()
+    }
+}
+
+/// How long [`OrtBackend::abort`] (and so `Drop`) waits for an inference in flight before it
+/// gives the session up as hung. A session wedged in `Session::run` (a driver hang) cannot be
+/// interrupted: its thread is detached and keeps the session (and its GPU memory) until the
+/// call returns, possibly for the rest of the process (BE-10).
+pub const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Per-worker ONNX Runtime inference state: one session per slot, each on its own thread
 /// (`Session::run` takes `&mut self`, so one inference in flight per session).
@@ -1122,6 +1136,8 @@ pub struct OrtBackend {
     info: ModelInfo,
     slots: Vec<OrtSlot>,
     done_rx: crossbeam_channel::Receiver<Completion>,
+    /// [`ABORT_TIMEOUT`]; shorter in tests.
+    abort_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for OrtBackend {
@@ -1141,8 +1157,34 @@ fn session_thread(
     results: &crossbeam_channel::Sender<OrtResult>,
     done: &crossbeam_channel::Sender<Completion>,
 ) {
+    serve_jobs(slot, jobs, results, done, |job| {
+        run_session(&mut session, ctx, &job.chw, &job.extra, &mut job.outs)
+    });
+}
+
+/// The job loop of a session thread, with `run` doing the inference.
+fn serve_jobs(
+    slot: usize,
+    jobs: &crossbeam_channel::Receiver<OrtJob>,
+    results: &crossbeam_channel::Sender<OrtResult>,
+    done: &crossbeam_channel::Sender<Completion>,
+    mut run: impl FnMut(&mut OrtJob) -> Result<()>,
+) {
     while let Ok(mut job) = jobs.recv() {
-        let result = run_session(&mut session, ctx, &job.chw, &job.extra, &mut job.outs);
+        // A panic inside `ort` (e.g. an assertion) must not leave the job without an answer
+        // or a completion: catch it, answer this job with `SessionDead` and stop the thread,
+        // since the session's state after a panic is unknown (BE-10).
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut job)));
+        let (result, panicked) = match ran {
+            Ok(r) => (r, false),
+            Err(payload) => {
+                let reason = format!(
+                    "session thread {slot} panicked during inference ({})",
+                    panic_message(payload.as_ref())
+                );
+                (Err(SessionDead { slot, reason }.into()), true)
+            }
+        };
         let at = Instant::now();
         let r = OrtResult {
             chw: job.chw,
@@ -1157,7 +1199,19 @@ fn session_thread(
             seq: job.seq,
             at,
         });
+        if panicked {
+            break;
+        }
     }
+}
+
+/// The text of a panic payload (`&str` or `String`), else a placeholder.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 /// Run `session` on one image (+ extra inputs) and copy its outputs into `outs`.
@@ -1341,8 +1395,20 @@ impl OrtBackend {
         self.slots.get(slot).is_some_and(|s| s.busy)
     }
 
+    /// False once any session thread is gone (panicked, exited or hung past
+    /// [`ABORT_TIMEOUT`]): that slot answers every `submit` with [`SessionDead`] until the
+    /// model is reloaded.
+    pub fn is_healthy(&self) -> bool {
+        self.slots.iter().all(|s| {
+            s.dead.is_none()
+                && s.jobs.is_some()
+                && s.thread.as_ref().is_some_and(|t| !t.is_finished())
+        })
+    }
+
     /// Hand one inference to `slot`'s session thread (the image is copied into the slot's
-    /// buffer). Returns its sequence number.
+    /// buffer). Returns its sequence number. A dead session thread fails with [`SessionDead`]
+    /// (see [`super::is_session_dead`]).
     pub fn submit(&mut self, slot: usize, chw: &[f32], extra: &[ExtraInput]) -> Result<u64> {
         let n = self.slots.len();
         let where_ = format!(
@@ -1357,6 +1423,13 @@ impl OrtBackend {
         if s.busy {
             bail!("{where_}: session {slot} is busy");
         }
+        if let Some(reason) = &s.dead {
+            let reason = reason.clone();
+            return Err(s.kill(slot, reason)).context(where_);
+        }
+        if s.thread.as_ref().is_none_or(|t| t.is_finished()) {
+            return Err(s.kill(slot, format!("session thread {slot} exited"))).context(where_);
+        }
         let mut buf = std::mem::take(&mut s.chw);
         buf.clear();
         buf.extend_from_slice(chw);
@@ -1367,11 +1440,13 @@ impl OrtBackend {
             extra: extra.to_vec(),
             outs: std::mem::take(&mut s.outs),
         };
-        s.jobs
-            .as_ref()
-            .with_context(|| format!("{where_}: session {slot} stopped"))?
-            .send(job)
-            .map_err(|_| anyhow::anyhow!("{where_}: session thread {slot} exited"))?;
+        let sent = match s.jobs.as_ref() {
+            Some(tx) => tx.send(job).is_ok(),
+            None => false,
+        };
+        if !sent {
+            return Err(s.kill(slot, format!("session thread {slot} exited"))).context(where_);
+        }
         s.busy = true;
         Ok(s.seq)
     }
@@ -1379,6 +1454,16 @@ impl OrtBackend {
     /// The outputs of `slot`'s inference (waits for it); give the buffers back with
     /// [`Self::recycle`].
     pub fn collect(&mut self, slot: usize) -> Result<Vec<NamedOutput>> {
+        self.collect_within(slot, None)
+    }
+
+    /// [`Self::collect`], giving up after `limit` (None = wait forever). On timeout the slot is
+    /// marked dead (hung session) and [`SessionDead`] is returned.
+    fn collect_within(
+        &mut self,
+        slot: usize,
+        limit: Option<std::time::Duration>,
+    ) -> Result<Vec<NamedOutput>> {
         let where_ = format!(
             "model {} on {}",
             self.info.path.display(),
@@ -1391,17 +1476,38 @@ impl OrtBackend {
         if !s.busy {
             bail!("{where_}: session {slot} has no inference in flight");
         }
+        let received = match limit {
+            None => s.results.recv().map_err(|_| None),
+            Some(t) => s
+                .results
+                .recv_timeout(t)
+                .map_err(|e| e.is_timeout().then_some(t)),
+        };
+        let r = match received {
+            Ok(r) => r,
+            Err(None) => {
+                return Err(s.kill(slot, format!("session thread {slot} exited"))).context(where_);
+            }
+            Err(Some(t)) => {
+                let reason = format!(
+                    "session {slot} still running after {} s (hung in Session::run?); its thread \
+                     is left behind",
+                    t.as_secs()
+                );
+                return Err(s.kill(slot, reason)).context(where_);
+            }
+        };
         s.busy = false;
-        let r = s
-            .results
-            .recv()
-            .map_err(|_| anyhow::anyhow!("{where_}: session thread {slot} exited"))?;
         s.chw = r.chw;
         match r.result {
             Ok(()) => Ok(r.outs),
             Err(e) => {
                 s.outs = r.outs;
-                Err(e)
+                if let Some(dead) = e.downcast_ref::<SessionDead>() {
+                    s.dead.get_or_insert_with(|| dead.reason.clone());
+                    s.jobs = None;
+                }
+                Err(e.context(where_))
             }
         }
     }
@@ -1414,13 +1520,23 @@ impl OrtBackend {
     }
 
     /// Wait for every inference in flight and discard it (a running session cannot be
-    /// interrupted).
+    /// interrupted). Waits at most [`ABORT_TIMEOUT`] in total (all slots together); a session still running then is
+    /// marked dead and logged, so shutdown and reloads never block on a hung session.
     pub fn abort(&mut self) {
+        let deadline = Instant::now() + self.abort_timeout;
         let busy: Vec<usize> = (0..self.slots.len())
             .filter(|&i| self.slots.get(i).is_some_and(|s| s.busy))
             .collect();
         for slot in busy {
-            let _ = self.collect(slot);
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Err(e) = self.collect_within(slot, Some(left))
+                && super::is_session_dead(&e)
+            {
+                tracing::warn!(
+                    "{e:#}; the inference was abandoned; if this repeats, the GPU driver is \
+                     probably hung: restart the service (or the machine)"
+                );
+            }
         }
     }
 
@@ -1449,18 +1565,56 @@ impl OrtBackend {
 }
 
 impl Drop for OrtBackend {
+    /// Bounded: [`Self::abort`] waits at most [`ABORT_TIMEOUT`], then the threads get a short
+    /// grace period to exit; a thread still running (hung in `Session::run`) is detached with
+    /// a warning instead of blocking the worker's shutdown or a config reload (BE-10).
     fn drop(&mut self) {
         self.abort();
         for s in &mut self.slots {
             s.jobs = None;
         }
-        for s in &mut self.slots {
-            if let Some(t) = s.thread.take()
-                && t.join().is_err()
-            {
-                tracing::warn!("ONNX Runtime session thread panicked");
+        let deadline = Instant::now() + JOIN_GRACE;
+        for (slot, s) in self.slots.iter_mut().enumerate() {
+            let Some(t) = s.thread.take() else { continue };
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if !t.is_finished() {
+                tracing::warn!(
+                    "model {}: ONNX Runtime session thread {slot} did not stop within {} ms \
+                     (probably hung in the driver); detaching it, its memory stays in use \
+                     until it returns; restart the service if GPU memory runs short",
+                    self.info.path.display(),
+                    JOIN_GRACE.as_millis()
+                );
+                drop(t);
+            } else if t.join().is_err() {
+                tracing::warn!("ONNX Runtime session thread {slot} panicked");
             }
         }
+    }
+}
+
+/// How long `Drop` waits for the session threads to exit after their job channels close.
+const JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// GPU name for `target` at device `index`: CUDA/TensorRT index = CUDA ordinal (the driver's
+/// order, [`cuda_ordinals`], not the platform order), DirectML index = DXGI adapter index.
+/// Empty for other targets or an unknown index.
+fn gpu_full_name(hw: &HardwareInfo, target: Target, index: u32) -> String {
+    match target {
+        Target::Cuda | Target::TensorRt => cuda_ordinals(hw)
+            .into_iter()
+            .find(|(o, _)| *o == index)
+            .map(|(_, g)| g.name.clone())
+            .unwrap_or_default(),
+        Target::DirectMl => hw
+            .gpus
+            .iter()
+            .find(|g| g.index == index)
+            .map(|g| g.name.clone())
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -1698,5 +1852,158 @@ mod tests {
         };
         let p = port("orig_target_sizes", &[1, 2], PortElem::U8);
         assert!(extra_value(&p, &e).is_err());
+    }
+
+    fn nvidia(name: &str, index: u32, ordinal: Option<u32>) -> super::super::detect::GpuAdapter {
+        use super::super::detect::{ComputeCapability, CudaInfo, GpuAdapter};
+        GpuAdapter {
+            vendor: GpuVendor::Nvidia,
+            name: name.into(),
+            vram_mb: 8060,
+            index,
+            discrete: true,
+            cuda: ordinal.map(|ordinal| CudaInfo {
+                ordinal,
+                compute_capability: ComputeCapability::new(8, 6),
+            }),
+        }
+    }
+
+    #[test]
+    fn full_name_follows_cuda_ordinals() {
+        use super::super::detect::GpuAdapter;
+        // DXGI lists the 3060 first (index 0), the driver the 4090 (ordinal 0, index 2).
+        let igpu = GpuAdapter {
+            vendor: GpuVendor::Intel,
+            name: "Intel(R) UHD Graphics 630".into(),
+            vram_mb: 128,
+            index: 1,
+            discrete: false,
+            cuda: None,
+        };
+        let hw = HardwareInfo::new(
+            "windows",
+            "x86_64",
+            vec![
+                nvidia("NVIDIA GeForce RTX 3060", 0, Some(1)),
+                igpu,
+                nvidia("NVIDIA GeForce RTX 4090", 2, Some(0)),
+            ],
+        );
+        assert_eq!(
+            gpu_full_name(&hw, Target::Cuda, 0),
+            "NVIDIA GeForce RTX 4090"
+        );
+        assert_eq!(
+            gpu_full_name(&hw, Target::TensorRt, 1),
+            "NVIDIA GeForce RTX 3060"
+        );
+        assert_eq!(gpu_full_name(&hw, Target::Cuda, 2), "");
+        // DirectML: the DXGI index.
+        assert_eq!(
+            gpu_full_name(&hw, Target::DirectMl, 0),
+            "NVIDIA GeForce RTX 3060"
+        );
+        assert_eq!(
+            gpu_full_name(&hw, Target::DirectMl, 1),
+            "Intel(R) UHD Graphics 630"
+        );
+        assert_eq!(gpu_full_name(&hw, Target::Cpu, 0), "");
+    }
+
+    /// An `OrtBackend` whose slots run `run` instead of a session.
+    fn fake_backend(
+        slots: usize,
+        run: impl Fn(&mut OrtJob) -> Result<()> + Send + Sync + Clone + 'static,
+    ) -> OrtBackend {
+        let (done_tx, done_rx) = crossbeam_channel::unbounded();
+        let slots = (0..slots)
+            .map(|slot| {
+                let (job_tx, job_rx) = crossbeam_channel::bounded::<OrtJob>(1);
+                let (res_tx, res_rx) = crossbeam_channel::bounded::<OrtResult>(1);
+                let (done, run) = (done_tx.clone(), run.clone());
+                let thread = std::thread::spawn(move || {
+                    serve_jobs(slot, &job_rx, &res_tx, &done, run);
+                });
+                OrtSlot {
+                    jobs: Some(job_tx),
+                    results: res_rx,
+                    thread: Some(thread),
+                    chw: Vec::new(),
+                    outs: Vec::new(),
+                    busy: false,
+                    seq: 0,
+                    dead: None,
+                }
+            })
+            .collect();
+        OrtBackend {
+            info: ModelInfo {
+                path: PathBuf::from("fake.onnx"),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                device: DeviceInfo {
+                    requested: "ort:cpu".into(),
+                    actual: "CPU".into(),
+                    full_name: String::new(),
+                    fell_back: false,
+                    runtime: Runtime::Ort,
+                    spec: "ort:cpu".into(),
+                },
+                image_input: "images".into(),
+                input_size: (1, 1),
+                compile_ms: 0,
+            },
+            slots,
+            done_rx,
+            abort_timeout: std::time::Duration::from_millis(100),
+        }
+    }
+
+    #[test]
+    fn panicking_session_is_reported_dead() {
+        let mut b = fake_backend(2, |job: &mut OrtJob| {
+            assert!(job.chw.first() != Some(&13.0), "ort assertion");
+            Ok(())
+        });
+        assert!(b.is_healthy());
+        let seq = b.submit(0, &[1.0], &[]).unwrap();
+        assert!(b.collect(0).is_ok());
+        assert_eq!(b.completions().recv().unwrap().seq, seq);
+        // The panic answers the job (and its completion) with SessionDead.
+        let seq = b.submit(0, &[13.0], &[]).unwrap();
+        let err = b.collect(0).unwrap_err();
+        assert!(super::super::is_session_dead(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("panicked"), "{err:#}");
+        assert_eq!(b.completions().recv().unwrap().seq, seq);
+        assert!(!b.is_healthy());
+        // The slot stays dead; the other one still works.
+        let err = b.submit(0, &[1.0], &[]).unwrap_err();
+        assert!(super::super::is_session_dead(&err), "{err:#}");
+        assert!(!b.is_busy(0));
+        b.submit(1, &[1.0], &[]).unwrap();
+        assert!(b.collect(1).is_ok());
+    }
+
+    #[test]
+    fn hung_session_does_not_block_abort_or_drop() {
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(0);
+        let mut b = fake_backend(1, move |_job: &mut OrtJob| {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+            Ok(())
+        });
+        b.submit(0, &[1.0], &[]).unwrap();
+        let t0 = Instant::now();
+        b.abort();
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!b.is_busy(0));
+        assert!(!b.is_healthy());
+        let err = b.submit(0, &[1.0], &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("still running"), "{err:#}");
+        let t0 = Instant::now();
+        drop(b);
+        // Bounded: abort (nothing busy any more) + JOIN_GRACE, then detached.
+        assert!(t0.elapsed() < JOIN_GRACE + std::time::Duration::from_secs(2));
+        drop(release_tx);
     }
 }

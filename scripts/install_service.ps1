@@ -5,6 +5,8 @@
 .DESCRIPTION
     - Creates the Application event log source "BlueOnyxPrism"
     - Raises ServicesPipeTimeout to 600000 ms so the service has time to compile models on first start
+      (machine-wide; the previous value is recorded under HKLM:\SOFTWARE\BlueOnyxPrism and
+      uninstall_service.ps1 restores it)
     - Registers the service (auto start) pointing at blue-onyx-prism-service.exe, running as the
       virtual account "NT SERVICE\BlueOnyxPrismService" by default (no password, no rights beyond
       what this script grants)
@@ -14,6 +16,9 @@
       keeps next to it, plus any download_dir / models_dir / cache_dir / save_image_path /
       log_path the config names. It can create new files in the install dir (staging dirs, the
       config's temp file) but cannot change the exe or the files shipped with it.
+    - Restricts the service token: service SID type "unrestricted" (the NT SERVICE\BlueOnyxPrismService
+      SID is in the token, so the ACL grants above apply under any account) and required
+      privileges SeChangeNotifyPrivilege only (every other privilege is removed from the process)
     - Configures automatic restart on failure and a firewall rule for the listening port
 .PARAMETER InstallDir
     Directory containing blue-onyx-prism-service.exe (default: the parent of this script's folder).
@@ -59,14 +64,19 @@ function Invoke-Icacls {
     }
 }
 
-# Stop and delete a service if present; wait until the SCM has really removed it.
+# Stop and delete a service if present; wait until the SCM has really removed it. While
+# services.msc, Event Viewer or another tool holds a handle, `sc.exe delete` only marks the
+# service for deletion and a new `sc.exe create` would fail with 1072, so this throws instead.
 function Remove-ServiceIfPresent([string]$Name) {
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $svc) { return }
     if ($svc.Status -ne "Stopped") { Stop-Service $Name -Force; Start-Sleep -Seconds 2 }
     Invoke-Sc delete $Name
-    for ($i = 0; $i -lt 20 -and (Get-Service -Name $Name -ErrorAction SilentlyContinue); $i++) {
+    for ($i = 0; $i -lt 60 -and (Get-Service -Name $Name -ErrorAction SilentlyContinue); $i++) {
         Start-Sleep -Milliseconds 500
+    }
+    if (Get-Service -Name $Name -ErrorAction SilentlyContinue) {
+        throw "Service $Name is marked for deletion but still registered after 30 s. Another program (services.msc, Event Viewer, Task Manager) probably holds it open. Close those windows (or reboot) and run this script again."
     }
 }
 
@@ -92,8 +102,24 @@ try {
     }
 } catch { Write-Warning "Could not create event log source: $_" }
 
-Write-Host "Setting ServicesPipeTimeout to 600000 ms (takes effect after reboot) ..."
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -Value 600000 -Type DWord
+# ServicesPipeTimeout is machine-wide (every service's start timeout). Record the value found
+# before the first install (-1 = not set) so uninstall_service.ps1 can put it back, and never
+# lower a larger value someone else set.
+$ControlKey = "HKLM:\SYSTEM\CurrentControlSet\Control"
+$StateKey = "HKLM:\SOFTWARE\BlueOnyxPrism"
+$PipeTimeoutMs = 600000
+$current = (Get-ItemProperty -Path $ControlKey -Name ServicesPipeTimeout -ErrorAction SilentlyContinue).ServicesPipeTimeout
+if (-not (Test-Path $StateKey)) { New-Item -Path $StateKey -Force | Out-Null }
+if ($null -eq (Get-ItemProperty -Path $StateKey -Name PreviousServicesPipeTimeout -ErrorAction SilentlyContinue)) {
+    $previous = if ($null -eq $current) { -1 } else { [int64]$current }
+    New-ItemProperty -Path $StateKey -Name PreviousServicesPipeTimeout -Value $previous -PropertyType QWord -Force | Out-Null
+}
+if ($null -eq $current -or [int64]$current -lt $PipeTimeoutMs) {
+    Write-Host "Setting ServicesPipeTimeout to $PipeTimeoutMs ms (takes effect after reboot; uninstall restores the previous value) ..."
+    Set-ItemProperty -Path $ControlKey -Name ServicesPipeTimeout -Value $PipeTimeoutMs -Type DWord
+} else {
+    Write-Host "ServicesPipeTimeout is already $current ms; left as is."
+}
 
 # Pre-rename service (Blue Onyx OpenVINO): remove it so the two don't fight over the port.
 if (Get-Service -Name "BlueOnyxOpenVINOService" -ErrorAction SilentlyContinue) {
@@ -115,12 +141,23 @@ if ($Account -and -not $useSystem) {
     Write-Host "Make sure $Account has the 'Log on as a service' right (secpol.msc > Local Policies > User Rights Assignment)."
 } else {
     Invoke-Sc create $ServiceName binPath= $binPath start= auto DisplayName= $DisplayName obj= LocalSystem
+    Invoke-Sc sidtype $ServiceName unrestricted
     if (-not $useSystem) {
         # Virtual account: created by the SCM for this service, no password.
         Invoke-Sc config $ServiceName obj= $VirtualAccount
     }
 }
 Invoke-Sc config $ServiceName type= own
+# Service SID in the token. "unrestricted", not "restricted": a restricted token would need an
+# explicit grant on every file, registry key and device (GPU driver) the process opens. Set again
+# here so the -Account path gets it too.
+Invoke-Sc sidtype $ServiceName unrestricted
+# Required privileges: the SCM removes every privilege not listed from the service process, so
+# even under LocalSystem it runs without SeDebug, SeImpersonate, SeBackup, ... SeChangeNotify
+# (bypass traverse checking) is the one the process needs to open files below folders it cannot
+# list. If a future Windows/driver needs another one, the service fails to start with an
+# access-denied error in the event log: add it here, separated by '/'.
+Invoke-Sc privs $ServiceName SeChangeNotifyPrivilege
 Invoke-Sc description $ServiceName "Blue Iris / CodeProject.AI compatible object detection (OpenVINO / ONNX Runtime)"
 Invoke-Sc failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000
 

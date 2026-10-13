@@ -631,7 +631,11 @@ def build_coco(work: Path, coco80: list[str], args) -> dict:
             box = clip_box(x, y, x + bw, y + bh, w, h)
             if box is None:
                 continue
-            objs.append({"label": cats[a["category_id"]], "bbox": box, "ignore": bool(a["iscrowd"])})
+            crowd = bool(a["iscrowd"])
+            obj = {"label": cats[a["category_id"]], "bbox": box, "ignore": crowd}
+            if crowd:
+                obj["crowd"] = True  # matched by intersection over the detection (pycocotools' crowd rule)
+            objs.append(obj)
         objs.sort(key=lambda o: (o["bbox"][1], o["bbox"][0], o["label"]))
         labels = {o["label"] for o in objs}
         if objs:
@@ -697,7 +701,7 @@ def validate(path: Path, coco80: list[str], work: Path | None, head: bool) -> di
         files.add(im["file"])
         assert re.fullmatch(r"[0-9a-f]{64}", im["sha256"])
         for o in im["objects"]:
-            assert set(o) == {"label", "bbox", "ignore"}
+            assert set(o) in ({"label", "bbox", "ignore"}, {"label", "bbox", "ignore", "crowd"})
             assert o["label"] in names, o["label"]
             x0, y0, x1, y1 = o["bbox"]
             assert 0 <= x0 < x1 <= im["width"] and 0 <= y0 < y1 <= im["height"], (im["file"], o)

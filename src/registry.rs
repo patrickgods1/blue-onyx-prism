@@ -11,7 +11,7 @@
 //! compiles as soon as the runtimes lock is free). The decode + preprocess pool and the runtimes
 //! belong to the generation: a reload uses them as they are.
 
-use crate::backend::{CoreOptions, DeviceSpec, LoadRequest, OrtOptions, Runtimes, Selection};
+use crate::backend::{CoreOptions, DeviceSpec, LoadRequest, OrtOptions, Runtimes};
 use crate::config::{Config, ModelConfig};
 use crate::metrics::{Metrics, ModelGauges};
 use crate::profile::Profile;
@@ -65,12 +65,15 @@ fn resolve_default(config: &Config) -> Option<usize> {
         .filter(|n| !n.trim().is_empty())
     {
         match config.default_model_index() {
-            None => {
-                warn!("default_model '{name}' is not configured; using the first enabled model")
-            }
-            Some(i) if !config.models.get(i).is_some_and(|m| m.enabled) => {
-                warn!("default_model '{name}' is disabled; using the first enabled model")
-            }
+            None => warn!(
+                "default_model '{name}' matches no configured model, so the first enabled model \
+                 serves /v1/vision/detection; the name may be misspelled or the model removed; \
+                 set default_model to one of the model names on the Config page"
+            ),
+            Some(i) if !config.models.get(i).is_some_and(|m| m.enabled) => warn!(
+                "default_model '{name}' is disabled, so the first enabled model serves \
+                 /v1/vision/detection; enable it or pick another default model on the Config page"
+            ),
             Some(_) => {}
         }
     }
@@ -261,6 +264,33 @@ fn try_lock_runtimes(rt: &Mutex<Runtimes>) -> Option<std::sync::MutexGuard<'_, R
     rt.try_lock_recover()
 }
 
+/// How long a reload waits for the runtimes lock before planning without it (PL-11): a model
+/// compiling on another worker holds the lock for the whole compile (minutes on a first GPU
+/// compile), and the config-save path must not wait for that.
+pub const RELOAD_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// [`try_lock_runtimes`], retried for at most `wait` (None: still busy).
+fn lock_runtimes_within(
+    rt: &Mutex<Runtimes>,
+    wait: Duration,
+) -> Option<std::sync::MutexGuard<'_, Runtimes>> {
+    try_lock_within(rt, wait)
+}
+
+/// Try to lock `m` for at most `wait`, polling (std has no timed mutex lock).
+fn try_lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<std::sync::MutexGuard<'_, T>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(g) = m.try_lock_recover() {
+            return Some(g);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 impl Spawner {
     /// Spawn the worker of a planned model (or a `Failed` handle when the plan failed: missing
     /// file, pending export, bad classes, downloads that must be fetched by hand). `after` is
@@ -348,6 +378,7 @@ impl Spawner {
 fn retire_worker(slot: WorkerSlot) -> Option<JoinHandle<()>> {
     let WorkerSlot { handle, stop, join } = slot;
     let name = handle.name.clone();
+    let stuck = handle.stuck_flag();
     let drain = handle
         .request_timeout()
         .saturating_add(Duration::from_secs(1));
@@ -364,6 +395,15 @@ fn retire_worker(slot: WorkerSlot) -> Option<JoinHandle<()>> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             stop.cancel();
+            if stuck.load(std::sync::atomic::Ordering::Acquire) && !join.is_finished() {
+                // Blocked in the runtime for good: joining would hang this thread and, through
+                // `ModelRegistry::shutdown`, the next generation swap or the exit.
+                warn!(
+                    model = %name,
+                    "previous worker is stuck in an inference; leaving its thread behind"
+                );
+                return;
+            }
             if join.join().is_err() {
                 error!(model = %name, "worker thread panicked");
             } else {
@@ -636,14 +676,6 @@ impl ModelRegistry {
         self.spawner.is_some()
     }
 
-    /// Device options and the `auto` ranking for `model` (None: any model), from the shared
-    /// runtimes. None for registries built with [`Self::from_handles`].
-    pub fn selection(&self, model: Option<&Path>) -> Option<Selection> {
-        let rt = self.runtimes()?;
-        let rt = rt.lock_recover();
-        Some(rt.selection(model))
-    }
-
     /// Live per-model gauges (state, device, queue) for `/prometheus`, in config order.
     pub fn gauges(&self) -> Vec<ModelGauges> {
         self.read()
@@ -855,6 +887,12 @@ impl ModelRegistry {
         let slots = std::mem::take(&mut *self.slots.write_recover());
         for WorkerSlot { handle, stop, join } in slots.workers {
             let name = handle.name.clone();
+            if handle.is_stuck() {
+                // Its thread may never return from the runtime: do not join it.
+                stop.cancel();
+                warn!(model = %name, "worker is stuck in an inference; not waiting for it");
+                continue;
+            }
             if Arc::try_unwrap(handle).is_err() {
                 // Someone still holds the sender: do not wait for the disconnect.
                 stop.cancel();
@@ -881,7 +919,10 @@ fn validate_names(config: &Config) -> Result<()> {
     for m in &config.models {
         let key = normalize_name(&m.effective_name());
         if !seen.insert(key.clone()) {
-            bail!("duplicate model name '{key}' in config; set a distinct `name` for each entry");
+            bail!(
+                "duplicate model name '{key}' in the config: two entries have the same `name` or \
+                 file stem; set a distinct `name` for each entry"
+            );
         }
     }
     Ok(())
@@ -890,6 +931,32 @@ fn validate_names(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_lock_wait_gives_up_on_a_busy_lock() {
+        let m = Arc::new(Mutex::new(1u32));
+        assert_eq!(
+            try_lock_within(&m, Duration::from_millis(10)).map(|g| *g),
+            Some(1)
+        );
+        // Held for the whole wait (a compiling model): give up after about `wait`.
+        let held = m.lock().unwrap();
+        let t = Instant::now();
+        assert!(try_lock_within(&m, Duration::from_millis(100)).is_none());
+        let waited = t.elapsed();
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        drop(held);
+        // Released during the wait: taken.
+        let m2 = m.clone();
+        let g = m.lock().unwrap();
+        let h =
+            std::thread::spawn(move || try_lock_within(&m2, Duration::from_secs(5)).map(|g| *g));
+        std::thread::sleep(Duration::from_millis(50));
+        drop(g);
+        assert_eq!(h.join().unwrap(), Some(1));
+        assert_eq!(RELOAD_LOCK_WAIT, Duration::from_secs(2));
+    }
 
     #[test]
     fn name_normalization() {
