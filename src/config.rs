@@ -217,6 +217,11 @@ pub struct Config {
     /// Save annotated images here (optional).
     pub save_image_path: Option<PathBuf>,
     pub save_ref_image: bool,
+    /// Delete saved images older than this many days (0 = keep forever). Applies at once.
+    pub save_image_max_age_days: u32,
+    /// Keep the saved-image folder under this many MB, oldest files deleted first
+    /// (0 = unlimited). Applies at once.
+    pub save_image_max_mb: u64,
     /// CPU inference threads (0 = OpenVINO default).
     pub intra_threads: usize,
     /// Decode + preprocess threads shared by every model (0 = from the hardware profile:
@@ -368,6 +373,8 @@ impl Default for Config {
             log_path: None,
             save_image_path: None,
             save_ref_image: false,
+            save_image_max_age_days: DEFAULT_SAVE_IMAGE_MAX_AGE_DAYS,
+            save_image_max_mb: DEFAULT_SAVE_IMAGE_MAX_MB,
             intra_threads: 0,
             preprocess_threads: 0,
             inflight: 0,
@@ -636,6 +643,14 @@ pub const MAX_REQUEST_TIMEOUT_SECS: u64 = 3600;
 /// Accepted range of `max_image_pixels`.
 pub const MIN_IMAGE_PIXELS: u64 = 1_000;
 pub const MAX_IMAGE_PIXELS: u64 = 1_000_000_000;
+/// Default of `save_image_max_age_days`.
+pub const DEFAULT_SAVE_IMAGE_MAX_AGE_DAYS: u32 = 30;
+/// Accepted range of `save_image_max_age_days` (10 years; 0 = unlimited).
+pub const MAX_SAVE_IMAGE_AGE_DAYS: u32 = 3650;
+/// Default of `save_image_max_mb`.
+pub const DEFAULT_SAVE_IMAGE_MAX_MB: u64 = 2048;
+/// Accepted range of `save_image_max_mb` (about 1 TB; 0 = unlimited).
+pub const MAX_SAVE_IMAGE_MB: u64 = 1_000_000;
 /// Accepted range of `benchmark.warmup` and `benchmark.repeat_per_image`.
 pub const MAX_BENCH_ITERATIONS: usize = 1000;
 
@@ -739,6 +754,18 @@ impl Config {
             self.max_image_pixels,
             MIN_IMAGE_PIXELS,
             MAX_IMAGE_PIXELS,
+        )?;
+        check_range(
+            "save_image_max_age_days",
+            self.save_image_max_age_days,
+            0,
+            MAX_SAVE_IMAGE_AGE_DAYS,
+        )?;
+        check_range(
+            "save_image_max_mb",
+            self.save_image_max_mb,
+            0,
+            MAX_SAVE_IMAGE_MB,
         )?;
         if self.models_dir.as_os_str().is_empty() {
             bail!("models_dir: must not be empty");
@@ -1467,6 +1494,32 @@ mod tests {
         assert!(err.contains("'b' confidence_threshold"), "{err}");
         c.models[1].confidence_threshold = Some(0.0);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_save_image_retention() {
+        let d = Config::default();
+        assert_eq!(d.save_image_max_age_days, 30);
+        assert_eq!(d.save_image_max_mb, 2048);
+        rejects(
+            |c| c.save_image_max_age_days = 3651,
+            "save_image_max_age_days",
+            "between 0 and 3650",
+        );
+        rejects(
+            |c| c.save_image_max_mb = 1_000_001,
+            "save_image_max_mb",
+            "between 0 and 1000000",
+        );
+        assert!(
+            check(|c| {
+                c.save_image_max_age_days = 0;
+                c.save_image_max_mb = 0;
+            })
+            .is_ok()
+        );
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.save_image_max_age_days, 30);
     }
 
     #[test]

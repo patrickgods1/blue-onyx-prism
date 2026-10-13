@@ -1831,10 +1831,59 @@ pub struct SweepOptions {
     pub threshold_objective: threshold::Objective,
 }
 
+/// The per-image details of a device run that [`ModelResult::summary`] drops.
+type RunDetails = (
+    Vec<ImageRun>,
+    Vec<Vec<PredBox>>,
+    Option<threshold::ThresholdSweep>,
+);
+
+/// The partial result of a sweep over the filled `slots`, finished ([`ModelResult::finish`] on
+/// the full runs) and returned in its [`ModelResult::summary`] form, without cloning any
+/// per-image data (BM-11): the runs move into `result` for `finish`, their details are moved
+/// aside while the summary is cloned, then everything moves back into `slots`.
+fn partial_summary(result: &mut ModelResult, slots: &mut [Option<DeviceResult>]) -> ModelResult {
+    let filled: Vec<usize> = (0..slots.len())
+        .filter(|&i| slots.get(i).is_some_and(Option::is_some))
+        .collect();
+    result.devices = slots.iter_mut().filter_map(Option::take).collect();
+    result.finish();
+    let details: Vec<Option<RunDetails>> = result
+        .devices
+        .iter_mut()
+        .map(|d| {
+            d.run.as_mut().map(|r| {
+                (
+                    std::mem::take(&mut r.per_image),
+                    std::mem::take(&mut r.eval_preds),
+                    r.accuracy.as_mut().and_then(|a| a.sweep.take()),
+                )
+            })
+        })
+        .collect();
+    let summary = result.clone();
+    for (d, det) in result.devices.iter_mut().zip(details) {
+        if let (Some(r), Some((per_image, eval_preds, sweep))) = (d.run.as_mut(), det) {
+            r.per_image = per_image;
+            r.eval_preds = eval_preds;
+            if let Some(a) = r.accuracy.as_mut() {
+                a.sweep = sweep;
+            }
+        }
+    }
+    for (i, d) in filled.into_iter().zip(result.devices.drain(..)) {
+        if let Some(slot) = slots.get_mut(i) {
+            *slot = Some(d);
+        }
+    }
+    summary
+}
+
 /// Run `job` on every chosen device, compare detections with the CPU reference device (OpenVINO
 /// CPU, else ONNX Runtime CPU, whichever ran) and recommend a device. The reference CPU devices
 /// run first so each later result can be judged as it arrives; the result lists devices in the
-/// selection's order. `on_device` sees the partial result after each device (live progress).
+/// selection's order. `on_device` sees the partial result after each device (live progress), in
+/// its [`ModelResult::summary`] form (no per-image details: BM-11).
 ///
 /// Errors only with [`Cancelled`]; device failures are recorded in the result.
 pub fn sweep(
@@ -1917,9 +1966,8 @@ pub fn sweep(
         if let Some(slot) = slots.get_mut(k) {
             *slot = Some(entry);
         }
-        result.devices = slots.iter().flatten().cloned().collect();
-        result.finish();
-        on_device(&result);
+        let partial = partial_summary(&mut result, &mut slots);
+        on_device(&partial);
     }
     result.devices = slots.into_iter().flatten().collect();
     result.finish();
@@ -2733,5 +2781,74 @@ mod tests {
         );
         assert_eq!(r.recommended, None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live partial view of a sweep equals the summary of the finished partial result,
+    /// and the slots keep their per-image details for the final result (BM-11).
+    #[test]
+    fn partial_summary_matches_the_summary_and_keeps_details() {
+        let run = |spec: &str, conf: f32| {
+            let mut r: RunResult = serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "device": spec,
+                "spec": spec,
+                "detections": [{"label": "dog", "confidence": conf,
+                    "x_min": 0, "y_min": 0, "x_max": 10, "y_max": 10}],
+            }))
+            .unwrap();
+            r.stages_ms.total.p50 = 10.0;
+            r.per_image = vec![ImageRun {
+                set: "s".into(),
+                file: "a.jpg".into(),
+                total_ms: 10.0,
+                infer_ms: 5.0,
+                preds: Vec::new(),
+                gt_matched: Vec::new(),
+                counts: None,
+            }];
+            r.eval_preds = vec![vec![PredBox {
+                label: "dog".into(),
+                confidence: conf,
+                bbox: [0.0, 0.0, 10.0, 10.0],
+            }]];
+            r
+        };
+        let dev = |spec: &str, conf: f32| {
+            let d = spec::parse(spec).unwrap();
+            DeviceResult::ran(d.device().unwrap(), spec, run(spec, conf))
+        };
+        let mut result = ModelResult::failed("m", "m.onnx", String::new());
+        result.error = None;
+        let mut slots = vec![
+            Some(dev("ort:cpu", 0.8)),
+            None,
+            Some(dev("openvino:cpu", 0.9)),
+        ];
+        let before = slots.clone();
+        // What the sweep did before: finish a full clone, then the caller summarized it.
+        let mut old = result.clone();
+        old.devices = slots.iter().flatten().cloned().collect();
+        old.finish();
+        let expected = old.summary();
+
+        let got = partial_summary(&mut result, &mut slots);
+        assert_eq!(got, expected);
+        assert!(
+            got.devices
+                .iter()
+                .all(|d| d.run.as_ref().unwrap().per_image.is_empty())
+        );
+        // The slots are where they were, with their details (and the finished agreement).
+        assert!(slots[1].is_none());
+        for (s, b) in slots.iter().zip(&before) {
+            let (Some(s), Some(b)) = (s, b) else { continue };
+            let (r, rb) = (s.run.as_ref().unwrap(), b.run.as_ref().unwrap());
+            assert_eq!(
+                (&r.per_image, &r.eval_preds),
+                (&rb.per_image, &rb.eval_preds)
+            );
+            assert!(r.agreement.is_some());
+        }
+        assert!(result.devices.is_empty());
     }
 }

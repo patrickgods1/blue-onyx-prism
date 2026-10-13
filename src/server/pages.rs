@@ -372,6 +372,8 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
         "uptime": format_uptime(state.started.elapsed()),
         "openvino": reg.runtime_info,
         "models": models,
+        "rejectedOverloaded": state.metrics.rejected_overloaded.load(Ordering::Relaxed),
+        "inflightRequests": state.metrics.inflight(),
     }))
 }
 

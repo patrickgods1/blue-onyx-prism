@@ -26,16 +26,22 @@ use super::metrics::{
 use super::report::{BenchmarkResults, ImageInfo, ImageSetInfo, ModelResult};
 use super::roc::{FrameRoc, ROC_POINTS};
 use super::threshold::{GroupPick, Objective, Pick, exact_pick};
+use crate::sync::LockExt;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// File name of the stored predictions, beside `benchmark.json`.
 pub const PREDS_FILE: &str = "benchmark-preds.json";
 /// Points of the exact curve a search returns.
 pub const SEARCH_EXACT_POINTS: usize = 200;
+/// Stored predictions per image of one run at most, the most confident ones (BQ-04: high-recall
+/// models at the evaluation threshold can make hundreds of boxes per image). A search at a
+/// threshold above an image's most confident dropped prediction sees exactly what was scored.
+pub const MAX_STORED_PREDS_PER_IMAGE: usize = 100;
 
 /// `benchmark-preds.json` beside `config_path`.
 pub fn preds_path(config_path: &Path) -> PathBuf {
@@ -143,16 +149,19 @@ impl StoredRun {
                 .map(|(img, preds)| StoredImage {
                     set: img.set.clone(),
                     file: img.file.clone(),
-                    preds: preds
-                        .iter()
-                        .filter_map(|p| {
-                            Some(StoredPred {
-                                class: *index.get(p.label.as_str())?,
-                                confidence: p.confidence,
-                                bbox: p.bbox,
+                    preds: most_confident(
+                        preds
+                            .iter()
+                            .filter_map(|p| {
+                                Some(StoredPred {
+                                    class: *index.get(p.label.as_str())?,
+                                    confidence: p.confidence,
+                                    bbox: p.bbox,
+                                })
                             })
-                        })
-                        .collect(),
+                            .collect(),
+                        MAX_STORED_PREDS_PER_IMAGE,
+                    ),
                 })
                 .collect(),
         })
@@ -176,6 +185,33 @@ impl StoredRun {
     }
 }
 
+/// The `max` most confident of `preds` (ties: the earlier first), kept in their order
+/// (post-processing order, which the scoring follows).
+fn most_confident(preds: Vec<StoredPred>, max: usize) -> Vec<StoredPred> {
+    if preds.len() <= max {
+        return preds;
+    }
+    let mut order: Vec<usize> = (0..preds.len()).collect();
+    // Stable: equal confidences keep their order. NaN sorts last (`total_cmp` on the negation
+    // would put it first).
+    order.sort_by(|&a, &b| {
+        let (ca, cb) = (
+            preds.get(a).map_or(f32::NAN, |p| p.confidence),
+            preds.get(b).map_or(f32::NAN, |p| p.confidence),
+        );
+        match (ca.is_nan(), cb.is_nan()) {
+            (false, false) => cb.total_cmp(&ca),
+            (a_nan, b_nan) => a_nan.cmp(&b_nan),
+        }
+    });
+    order.truncate(max);
+    order.sort_unstable();
+    order
+        .into_iter()
+        .filter_map(|i| preds.get(i).copied())
+        .collect()
+}
+
 /// The stored-predictions file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct StoredPreds {
@@ -194,6 +230,33 @@ impl StoredPreds {
             tracing::warn!("{w}");
         }
         Ok(r)
+    }
+
+    /// [`Self::load`] through a one-entry, process-wide cache keyed by the file's path,
+    /// modification time and length (BQ-04): repeated searches and options requests parse the
+    /// file (tens of MB) once until it changes. Load errors are not cached.
+    pub fn load_cached(path: &Path) -> Result<Option<Arc<Self>>> {
+        Self::load_cached_in(&PREDS_CACHE, path)
+    }
+
+    /// [`Self::load_cached`] with the cache given (tests).
+    fn load_cached_in(cache: &Mutex<PredsCache>, path: &Path) -> Result<Option<Arc<Self>>> {
+        let stamp = file_stamp(path);
+        let key = (path.to_path_buf(), stamp);
+        {
+            let cache = cache.lock_recover();
+            if let Some((k, v)) = cache.as_ref()
+                && *k == key
+            {
+                return Ok(v.clone());
+            }
+        }
+        // Parsed outside the lock (seconds for a large file): a concurrent request parses too.
+        let loaded = Self::load(path)?.map(Arc::new);
+        // The stamp taken before reading: a file replaced while it was read is parsed again
+        // next time instead of being cached under the new stamp.
+        *cache.lock_recover() = Some((key, loaded.clone()));
+        Ok(loaded)
     }
 
     /// [`Self::load`] returning the warnings: `runs` is deserialized entry by entry, so one bad
@@ -231,6 +294,14 @@ impl StoredPreds {
                 !new.iter().any(|m| key(&m.model) == key(&r.model))
                     && merged.find(&r.model).is_some()
             })
+            .map(|mut r| {
+                // Files written before the cap shrink on the next save.
+                for img in &mut r.images {
+                    img.preds =
+                        most_confident(std::mem::take(&mut img.preds), MAX_STORED_PREDS_PER_IMAGE);
+                }
+                r
+            })
             .collect();
         for m in new {
             for d in &m.devices {
@@ -256,6 +327,19 @@ impl StoredPreds {
             .collect()
     }
 }
+
+/// (modified, length) of a file; None when it does not exist.
+type FileStamp = Option<(Option<std::time::SystemTime>, u64)>;
+
+fn file_stamp(p: &Path) -> FileStamp {
+    std::fs::metadata(p)
+        .ok()
+        .map(|m| (m.modified().ok(), m.len()))
+}
+
+/// The last parsed stored-predictions file: (path, stamp) -> contents (None = no file).
+type PredsCache = Option<((PathBuf, FileStamp), Option<Arc<StoredPreds>>)>;
+static PREDS_CACHE: Mutex<PredsCache> = Mutex::new(None);
 
 /// Merge the predictions of `new` into the file beside `results_file`. Does not fail the
 /// benchmark: returns the warnings (also logged). A file that does not load is moved aside
@@ -1379,6 +1463,63 @@ pub(crate) mod tests {
             StoredPreds::load(&path).unwrap().is_some(),
             "a new file was saved"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stored_preds_keep_the_most_confident_in_order() {
+        let p = |c: f32| StoredPred {
+            class: 0,
+            confidence: c,
+            bbox: [c, 0.0, 1.0, 1.0],
+        };
+        let conf = |v: &[StoredPred]| v.iter().map(|p| p.confidence).collect::<Vec<_>>();
+        let few = vec![p(0.1), p(0.9)];
+        assert_eq!(most_confident(few.clone(), 2), few);
+        // Top 3 of 0.2 .9 .5 .9 .1 .7: .9 .9 .7, in their original order; ties keep the first.
+        let v = vec![p(0.2), p(0.9), p(0.5), p(0.9), p(0.1), p(0.7)];
+        assert_eq!(conf(&most_confident(v, 3)), [0.9, 0.9, 0.7]);
+        let v = vec![p(0.5), p(0.6), p(0.6), p(0.6)];
+        let kept = most_confident(v, 2);
+        assert_eq!(conf(&kept), [0.6, 0.6]);
+        assert_eq!(kept.len(), 2);
+        // NaN goes last.
+        assert_eq!(conf(&most_confident(vec![p(f32::NAN), p(0.3)], 1)), [0.3]);
+        // The per-image cap applies to previously stored runs on merge.
+        let many: Vec<StoredPred> = (0..250).map(|i| p(i as f32 / 1000.0)).collect();
+        let (results, mut preds) = fixture();
+        preds.runs[0].images[0].preds = many;
+        let merged = StoredPreds::merge(Some(preds), &results, &[]);
+        let img = &merged.runs[0].images[0].preds;
+        assert_eq!(img.len(), MAX_STORED_PREDS_PER_IMAGE);
+        assert_eq!(img[0].confidence, 0.15);
+        assert_eq!(img.last().unwrap().confidence, 0.249);
+    }
+
+    #[test]
+    fn stored_preds_cache_hits_until_the_file_changes() {
+        let dir = std::env::temp_dir().join(format!("bop-preds-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PREDS_FILE);
+        let cache = Mutex::new(None);
+        assert!(
+            StoredPreds::load_cached_in(&cache, &path)
+                .unwrap()
+                .is_none()
+        );
+        let (_, preds) = fixture();
+        preds.save(&path).unwrap();
+        let a = StoredPreds::load_cached_in(&cache, &path).unwrap().unwrap();
+        assert_eq!(*a, preds);
+        let b = StoredPreds::load_cached_in(&cache, &path).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "same stamp: no re-parse");
+        // A changed file (other length) is parsed again.
+        let mut fewer = preds.clone();
+        fewer.runs.truncate(1);
+        fewer.save(&path).unwrap();
+        let c = StoredPreds::load_cached_in(&cache, &path).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(*c, fewer);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -104,15 +104,22 @@ impl IntoResponse for BrowseError {
     }
 }
 
+/// `GET /v1/fs/browse`. The listing (`read_dir` + `metadata` per entry, up to
+/// [`MAX_ENTRIES`]) and the root probing (every drive letter on Windows) can block for seconds
+/// on a slow or disconnected drive, so they run on the blocking pool, never on one of the two
+/// runtime threads that serve detections (SV-07).
 pub(super) async fn browse(
     State(state): State<Arc<AppState>>,
     Query(q): Query<BrowseQuery>,
 ) -> Response {
-    let cfg = state.config_read().clone();
-    match list(&cfg, q.path.as_deref(), q.kind.as_deref()) {
-        Ok(l) => Json(l).into_response(),
-        Err(e) => e.into_response(),
-    }
+    super::blocking(move || {
+        let cfg = state.config_read().clone();
+        match list(&cfg, q.path.as_deref(), q.kind.as_deref()) {
+            Ok(l) => Json(l).into_response(),
+            Err(e) => e.into_response(),
+        }
+    })
+    .await
 }
 
 /// Display form of a path: canonical, without the Windows `\\?\` verbatim prefix.

@@ -8,6 +8,15 @@ services:
       context: ..
     container_name: blue-onyx-prism
     restart: unless-stopped
+    # Same check as the image's HEALTHCHECK (repeated so it survives a custom image).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:32168/v1/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    # Time for the graceful drain after SIGTERM before Docker sends SIGKILL.
+    stop_grace_period: 30s
     ports:
       # Default: this host only. Inside Docker every client (the host's browser too) arrives from
       # the bridge network, never loopback, so the admin pages answer 403 until

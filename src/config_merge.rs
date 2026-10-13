@@ -181,6 +181,8 @@ fn global_label(k: &str) -> String {
         "save_image_path" => "Save annotated images to".into(),
         "save_ref_image" => "Save the unannotated image".into(),
         "intra_threads" => "CPU threads".into(),
+        "save_image_max_age_days" => "Saved images: max age (days)".into(),
+        "save_image_max_mb" => "Saved images: max size (MB)".into(),
         "preprocess_threads" => "Preprocess threads".into(),
         "inflight" => "Inferences in flight".into(),
         "ort_sessions" => "ONNX Runtime sessions".into(),
@@ -374,6 +376,8 @@ pub fn live_global(k: &str) -> bool {
             | "object_filter"
             | "save_image_path"
             | "save_ref_image"
+            | "save_image_max_age_days"
+            | "save_image_max_mb"
             | "max_image_pixels"
     ) || k.starts_with("benchmark.")
 }
@@ -739,6 +743,8 @@ mod tests {
             Box::new(|c| c.object_filter = vec!["person".into()]),
             Box::new(|c| c.save_image_path = Some("shots".into())),
             Box::new(|c| c.save_ref_image = true),
+            Box::new(|c| c.save_image_max_age_days = 7),
+            Box::new(|c| c.save_image_max_mb = 100),
             Box::new(|c| c.request_timeout_secs = 3),
             Box::new(|c| c.log_level = crate::config::LogLevel::Trace),
             Box::new(|c| c.allow_remote_admin = true),

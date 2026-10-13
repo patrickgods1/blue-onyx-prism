@@ -20,6 +20,33 @@ use tracing_subscriber::layer::Context;
 pub const DEFAULT_CAPACITY: usize = 2000;
 /// Most entries one `/logs.json` reply returns.
 pub const MAX_PAGE: usize = 2000;
+/// Longest message stored per entry; the rest is cut on a char boundary and replaced by a
+/// `… [truncated N bytes]` marker (a request-controlled string can be hundreds of KiB).
+pub const MAX_MESSAGE_BYTES: usize = 4096;
+/// Longest `target` stored per entry.
+pub const MAX_TARGET_BYTES: usize = 256;
+/// Byte budget of the whole ring (messages + targets); the oldest entries are evicted beyond it,
+/// in addition to the entry cap.
+pub const MAX_RING_BYTES: usize = 8 * 1024 * 1024;
+
+/// `s` cut to at most `max` bytes on a char boundary, with a truncation marker when cut.
+fn truncate_text(mut s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = s.len() - cut;
+    s.truncate(cut);
+    let _ = write!(s, "… [truncated {dropped} bytes]");
+    s
+}
+
+fn entry_bytes(e: &LogEntry) -> usize {
+    e.message.len() + e.target.len()
+}
 
 /// One captured event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -41,6 +68,8 @@ struct Ring {
     capacity: usize,
     /// Sequence number of the last pushed entry (0 = none yet).
     last_seq: u64,
+    /// Sum of `entry_bytes` over `entries`.
+    bytes: usize,
 }
 
 /// Bounded log ring; cheap to clone (shared).
@@ -91,6 +120,7 @@ impl LogBuffer {
                 entries: VecDeque::with_capacity(capacity.min(4096)),
                 capacity,
                 last_seq: 0,
+                bytes: 0,
             })),
         }
     }
@@ -104,19 +134,28 @@ impl LogBuffer {
         let ts = chrono::Utc::now()
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
+        let entry = LogEntry {
+            seq: 0,
+            ts,
+            level: level.as_str(),
+            target: truncate_text(target.to_string(), MAX_TARGET_BYTES),
+            message: truncate_text(message, MAX_MESSAGE_BYTES),
+        };
         let mut r = self.lock();
         r.last_seq += 1;
         let seq = r.last_seq;
-        if r.entries.len() >= r.capacity {
-            r.entries.pop_front();
+        if r.entries.len() >= r.capacity
+            && let Some(old) = r.entries.pop_front()
+        {
+            r.bytes -= entry_bytes(&old);
         }
-        r.entries.push_back(LogEntry {
-            seq,
-            ts,
-            level: level.as_str(),
-            target: target.to_string(),
-            message,
-        });
+        r.bytes += entry_bytes(&entry);
+        r.entries.push_back(LogEntry { seq, ..entry });
+        while r.bytes > MAX_RING_BYTES && r.entries.len() > 1 {
+            if let Some(old) = r.entries.pop_front() {
+                r.bytes -= entry_bytes(&old);
+            }
+        }
         seq
     }
 
@@ -272,5 +311,46 @@ mod tests {
         assert_eq!(p.entries[1].target, "custom");
         assert_eq!(p.entries[1].message, "plain");
         assert!(p.entries[0].ts.ends_with('Z'));
+    }
+
+    #[test]
+    fn huge_message_is_truncated_on_a_char_boundary() {
+        let b = LogBuffer::new(10);
+        b.push(Level::INFO, &"t".repeat(1000), "é".repeat(200 * 1024));
+        let e = &b.since(0, None, 10).entries[0];
+        assert_eq!(
+            e.target.len(),
+            MAX_TARGET_BYTES + "… [truncated 744 bytes]".len()
+        );
+        assert!(
+            e.message.len() < MAX_MESSAGE_BYTES + 64,
+            "{}",
+            e.message.len()
+        );
+        assert!(e.message.contains("… [truncated "));
+        assert!(e.message.starts_with("éé"));
+        // Short messages are untouched.
+        b.push(Level::INFO, "t", "ok".into());
+        assert_eq!(b.since(1, None, 10).entries[0].message, "ok");
+    }
+
+    #[test]
+    fn ring_stays_under_the_byte_budget() {
+        // Entry cap above the byte cap: 3000 x 4 KiB would be 12 MiB.
+        let b = LogBuffer::new(4000);
+        for _ in 0..3000 {
+            b.push(Level::INFO, "t", "x".repeat(4096));
+        }
+        let bytes = b.lock().bytes;
+        assert!(bytes <= MAX_RING_BYTES, "{bytes}");
+        assert!(b.len() < 3000, "oldest entries were evicted by bytes");
+        let p = b.since(0, None, MAX_PAGE);
+        assert_eq!(p.last, 3000);
+        assert!(p.truncated);
+        // Paging still works from the cursor.
+        b.push(Level::INFO, "t", "new".into());
+        let p = b.since(3000, None, 10);
+        assert_eq!(p.entries.len(), 1);
+        assert_eq!(p.entries[0].seq, 3001);
     }
 }

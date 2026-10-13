@@ -782,3 +782,111 @@ fn detr_non_finite_rows_are_dropped() {
         (25, 13, 75, 38)
     );
 }
+
+// ---------------------------------------------------------------- PL-01: bounded NMS cost
+
+use blue_onyx_prism::model::nms::{MAX_DETS, MAX_NMS_CANDIDATES};
+
+const TINY: PostParams = PostParams {
+    confidence_threshold: 0.001,
+    nms_iou: 0.45,
+};
+
+/// Identity mapping 640x640 -> 640x640.
+fn identity_ctx() -> PreprocessCtx {
+    PreprocessCtx {
+        orig_w: 640,
+        orig_h: 640,
+        input_w: 640,
+        input_h: 640,
+        mode: ResizeMode::Letterbox,
+        scale: 1.0,
+        pad_x: 0.0,
+        pad_y: 0.0,
+    }
+}
+
+/// Anchor `i` of `n`: a small box on a 160x160 grid (cells of 4 px, boxes of 3 px, so no two
+/// boxes of the first 25600 overlap) with a distinct score in (0.001, 1].
+fn grid_anchor(i: usize, n: usize) -> (f32, f32, f32, f32, f32) {
+    let (cx, cy) = ((i % 160) as f32 * 4.0 + 1.5, (i / 160) as f32 * 4.0 + 1.5);
+    (cx, cy, 3.0, 3.0, 0.002 + 0.99 * (i as f32 + 1.0) / n as f32)
+}
+
+/// Scores of the `k` best grid anchors, best first.
+fn top_grid_scores(n: usize, k: usize) -> Vec<f32> {
+    (0..n).rev().take(k).map(|i| grid_anchor(i, n).4).collect()
+}
+
+#[test]
+fn yolo5_25200_anchors_tiny_threshold_is_bounded() {
+    const N: usize = 25_200;
+    const C: usize = 80;
+    let mut data = Vec::with_capacity(N * (5 + C));
+    for i in 0..N {
+        let (cx, cy, w, h, s) = grid_anchor(i, N);
+        data.extend_from_slice(&[cx, cy, w, h, 1.0]);
+        let mut cls = [0.0005; C];
+        cls[i % C] = s;
+        data.extend_from_slice(&cls);
+    }
+    let out = f32_out("output", &[1, N, 5 + C], data);
+    let t = std::time::Instant::now();
+    let dets = Yolo5::new(C)
+        .postprocess(&[out], &identity_ctx(), &TINY)
+        .unwrap();
+    let elapsed = t.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    assert_eq!(dets.len(), MAX_DETS);
+    let scores: Vec<f32> = dets.iter().map(|d| d.score).collect();
+    assert_eq!(scores, top_grid_scores(N, MAX_DETS));
+}
+
+#[test]
+fn yolo8_8400_anchors_tiny_threshold_is_bounded() {
+    const N: usize = 8_400;
+    const C: usize = 80;
+    let mut data = vec![0.0005_f32; (4 + C) * N];
+    for i in 0..N {
+        let (cx, cy, w, h, s) = grid_anchor(i, N);
+        for (c, v) in [cx, cy, w, h].into_iter().enumerate() {
+            data[c * N + i] = v;
+        }
+        data[(4 + i % C) * N + i] = s;
+    }
+    let out = f32_out("output0", &[1, 4 + C, N], data);
+    let t = std::time::Instant::now();
+    let dets = Yolo8::new(C)
+        .postprocess(&[out], &identity_ctx(), &TINY)
+        .unwrap();
+    let elapsed = t.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    assert_eq!(dets.len(), MAX_DETS);
+    let scores: Vec<f32> = dets.iter().map(|d| d.score).collect();
+    assert_eq!(scores, top_grid_scores(N, MAX_DETS));
+}
+
+#[test]
+fn yolo5_candidate_cap_keeps_top_scores() {
+    // The MAX_NMS_CANDIDATES best rows are all the same box and class (they collapse to one),
+    // 1000 weaker rows are disjoint boxes. Without the cap NMS would keep 1 + 1000 boxes; with
+    // it the weaker rows never reach NMS.
+    let strong = MAX_NMS_CANDIDATES;
+    let weak = 1000;
+    let mut data = Vec::new();
+    for i in 0..weak {
+        let (cx, cy, w, h, _) = grid_anchor(i, weak);
+        data.extend_from_slice(&[cx, cy, w, h, 1.0, 0.1]);
+    }
+    for i in 0..strong {
+        let s = 0.5 + 0.4 * i as f32 / strong as f32;
+        data.extend_from_slice(&[320.0, 320.0, 50.0, 50.0, 1.0, s]);
+    }
+    let out = f32_out("output", &[1, strong + weak, 6], data);
+    let dets = Yolo5::new(1)
+        .postprocess(&[out], &identity_ctx(), &TINY)
+        .unwrap();
+    assert_eq!(dets.len(), 1, "{:?}", &dets[..dets.len().min(3)]);
+    assert!((dets[0].score - (0.5 + 0.4 * (strong - 1) as f32 / strong as f32)).abs() < 1e-6);
+    assert_box(&dets[0], (295.0, 295.0, 345.0, 345.0));
+}

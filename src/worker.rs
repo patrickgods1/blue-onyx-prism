@@ -402,12 +402,20 @@ pub fn auto_queue_size(request_timeout: Duration, warmup_ms: u64) -> usize {
     usize::try_from(n).unwrap_or(MAX_AUTO_QUEUE)
 }
 
-/// Request `min_confidence` overrides the configured threshold when > 0.
+/// Request `min_confidence` overrides the configured threshold when > 0. The result is never
+/// below [`crate::model::nms::MIN_CONFIDENCE_FLOOR`] (0.01): a tiny request value or a configured
+/// 0.0 uses the floor, so a client cannot turn every anchor into an NMS candidate (PL-01).
 pub fn effective_threshold(min_confidence: f32, configured: f32) -> f32 {
-    if min_confidence > 0.0 && min_confidence.is_finite() {
+    let floor = crate::model::nms::MIN_CONFIDENCE_FLOOR;
+    let t = if min_confidence > 0.0 && min_confidence.is_finite() {
         min_confidence
     } else {
         configured
+    };
+    if t.is_finite() && t >= floor {
+        t
+    } else {
+        floor
     }
 }
 
@@ -1377,6 +1385,15 @@ mod tests {
         assert_eq!(effective_threshold(0.3, 0.5), 0.3);
         assert_eq!(effective_threshold(-1.0, 0.5), 0.5);
         assert_eq!(effective_threshold(f32::NAN, 0.5), 0.5);
+        // PL-01: never below the floor, whether from the request or the config.
+        let floor = crate::model::nms::MIN_CONFIDENCE_FLOOR;
+        assert_eq!(floor, 0.01);
+        assert_eq!(effective_threshold(0.000_001, 0.5), floor);
+        assert_eq!(effective_threshold(0.0, 0.0), floor);
+        assert_eq!(effective_threshold(0.0, 0.005), floor);
+        assert_eq!(effective_threshold(f32::INFINITY, f32::NAN), floor);
+        assert_eq!(effective_threshold(0.01, 0.5), 0.01);
+        assert_eq!(effective_threshold(0.0, 0.02), 0.02);
     }
 
     #[test]

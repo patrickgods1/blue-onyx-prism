@@ -40,6 +40,11 @@ use std::time::{Duration, Instant};
 
 pub const MAX_REPEAT: usize = 1000;
 pub const MAX_WARMUP: usize = 100;
+/// Images one run benchmarks at most, over all its datasets (BM-11: every device run keeps
+/// per-image results and evaluation predictions until its model is saved). `max_images` above
+/// it is refused; `max_images = 0` ("all") and several datasets are cut to it, spread over the
+/// datasets in proportion to their size (at least one image each), with a run warning.
+pub const MAX_IMAGES_PER_RUN: usize = 2000;
 
 /// What to benchmark.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,7 +54,7 @@ pub struct RunRequest {
     /// Device specs; empty = every runnable option of each model.
     pub devices: Vec<String>,
     pub datasets: Vec<DatasetRef>,
-    /// Images per dataset (0 = all).
+    /// Images per dataset (0 = all); a run takes at most [`MAX_IMAGES_PER_RUN`] in total.
     pub max_images: usize,
     /// Timed runs per image.
     pub repeat: usize,
@@ -149,6 +154,12 @@ impl RunRequest {
         }
         if self.warmup > MAX_WARMUP {
             bail!("warmup: must be 0-{MAX_WARMUP}");
+        }
+        if self.max_images > MAX_IMAGES_PER_RUN {
+            bail!(
+                "max_images: must be 0-{MAX_IMAGES_PER_RUN} (0 = all images of each dataset, \
+                 still at most {MAX_IMAGES_PER_RUN} per run)"
+            );
         }
         if self.datasets.is_empty() {
             bail!("choose at least one dataset");
@@ -633,8 +644,16 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         model_count: entries.len(),
         started: Instant::now(),
     };
+    // Summaries of the finished models (the full results are saved as each model finishes and
+    // dropped: BM-11).
     let mut finished: Vec<ModelResult> = Vec::new();
     let mut outcome: Result<()> = Ok(());
+    let mut saver = Saver {
+        hardware: HardwareSummary::current(),
+        versions,
+        retain_sets: None,
+        finalized: false,
+    };
 
     for (mi, (name, entry)) in entries.iter().enumerate() {
         if h.is_cancelled() {
@@ -642,7 +661,11 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
             break;
         }
         match run.bench_model(&sets, &overall, mi, name, entry.as_ref()) {
-            Ok(r) => finished.push(r),
+            Ok(r) => {
+                let last = mi + 1 == entries.len();
+                finished.push(r.summary());
+                run.save(&mut saver, &sets, r, last)?;
+            }
             Err(e) => {
                 outcome = Err(e);
                 break;
@@ -650,8 +673,8 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         }
     }
 
-    if !finished.is_empty() {
-        run.save(&sets, versions, &finished)?;
+    if !finished.is_empty() && !saver.finalized {
+        run.finalize(&saver)?;
     }
     outcome?;
     Ok(run_summary(
@@ -676,7 +699,36 @@ fn resolve_sets(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<Vec
     for w in &resolved.warnings {
         h.warn(w.clone());
     }
-    Ok(resolved.sets)
+    let mut sets = resolved.sets;
+    if let Some(w) = cap_images(&mut sets, MAX_IMAGES_PER_RUN) {
+        h.warn(w);
+    }
+    Ok(sets)
+}
+
+/// Cut `sets` to about `cap` images in total (evenly spread within each set, each set keeping
+/// a share proportional to its size and at least one image); the warning to show, or None when
+/// they fit.
+fn cap_images(sets: &mut [ImageSet], cap: usize) -> Option<String> {
+    let total: usize = sets.iter().map(|s| s.images.len()).sum();
+    if total <= cap || cap == 0 {
+        return None;
+    }
+    for s in sets.iter_mut() {
+        let len = s.images.len();
+        // len * cap / total < len because cap < total; no overflow for realistic sizes.
+        let quota = (len.saturating_mul(cap) / total).max(1);
+        s.limit(quota);
+    }
+    let kept: usize = sets.iter().map(|s| s.images.len()).sum();
+    Some(format!(
+        "the datasets have {total} images; a run benchmarks at most {cap} \
+         (max_images 0 = all, up to that cap): using {kept}, spread over {}",
+        sets.iter()
+            .map(|s| format!("{} ({})", s.id, s.images.len()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// The registry's shared runtimes, else dedicated ones from the config.
@@ -948,30 +1000,125 @@ impl ServiceRun<'_> {
         Ok(r)
     }
 
-    /// Merge the finished models into the results file (and the stored predictions).
+    /// Merge one finished model into the results file (and the stored predictions) as soon as
+    /// it finishes, so a run holds one model's full results at a time (BM-11). `last`: the
+    /// run's last model, whose save also drops the image sets no model refers to any more.
     fn save(
         &self,
+        saver: &mut Saver,
         sets: &[ImageSet],
-        versions: RuntimeVersions,
-        finished: &[ModelResult],
+        model: ModelResult,
+        last: bool,
     ) -> Result<()> {
         let (ctx, req) = (self.ctx, self.req);
+        let key = crate::registry::normalize_name(&model.model);
         let results =
-            BenchmarkResults::new(HardwareSummary::current(), versions, finished.to_vec())
+            BenchmarkResults::new(saver.hardware.clone(), saver.versions.clone(), vec![model])
                 .with_sets(sets);
         let (prev, warnings) = BenchmarkResults::load_for_merge(&ctx.results_path)?;
         for w in warnings {
             self.h.with(|g| g.warnings.push(w));
         }
-        let mut merged = BenchmarkResults::merge(prev, results);
+        let mut merged = saver.merge(prev, results, last);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(req.accuracy_metric, req.weights);
         merged.save(&ctx.results_path)?;
-        for w in super::search::save_beside(&ctx.results_path, &merged, finished) {
+        // The model's entry in `merged` still has its evaluation predictions (not serialized).
+        let new = merged
+            .models
+            .iter()
+            .find(|m| crate::registry::normalize_name(&m.model) == key);
+        for w in super::search::save_beside(
+            &ctx.results_path,
+            &merged,
+            new.map_or(&[][..], std::slice::from_ref),
+        ) {
             self.h.with(|g| g.warnings.push(w));
+        }
+        saver.finalized = last;
+        Ok(())
+    }
+
+    /// After a run that stopped before its last model: drop the image sets no model refers
+    /// to, like the last model's save would have.
+    fn finalize(&self, saver: &Saver) -> Result<()> {
+        if saver.retain_sets != Some(true) {
+            return Ok(());
+        }
+        let path = &self.ctx.results_path;
+        let Some(mut r) = BenchmarkResults::load(path)? else {
+            return Ok(());
+        };
+        let before = r.image_sets.len();
+        retain_referenced_sets(&mut r);
+        if r.image_sets.len() != before {
+            r.save(path)?;
         }
         Ok(())
     }
+}
+
+/// How a run merges its models into the results file one at a time (BM-11) so that the final
+/// file is the one a single merge of all its models would give ([`BenchmarkResults::merge`]):
+/// the image sets no model refers to are dropped only at the end, and only when the file the
+/// run started from was comparable (same hardware and runtimes), as the single merge does.
+struct Saver {
+    /// Taken once per run: a model merged with other hardware facts would drop the run's
+    /// earlier models as not comparable.
+    hardware: HardwareSummary,
+    versions: RuntimeVersions,
+    /// Whether the file the run started from existed and was comparable; None before the
+    /// first save.
+    retain_sets: Option<bool>,
+    /// The last save dropped the unreferenced image sets (nothing left to do at the end).
+    finalized: bool,
+}
+
+impl Saver {
+    fn merge(
+        &mut self,
+        prev: Option<BenchmarkResults>,
+        new: BenchmarkResults,
+        last: bool,
+    ) -> BenchmarkResults {
+        let comparable = prev
+            .as_ref()
+            .is_some_and(|p| p.hardware == new.hardware && p.runtimes == new.runtimes);
+        let retain = *self.retain_sets.get_or_insert(comparable);
+        // The sets before `merge` drops the unreferenced ones (kept until the end).
+        let sets = match prev.as_ref().filter(|_| comparable) {
+            Some(p) => upsert_sets(p.image_sets.clone(), new.image_sets.clone()),
+            None => new.image_sets.clone(),
+        };
+        let mut merged = BenchmarkResults::merge(prev, new);
+        merged.image_sets = sets;
+        if last && retain {
+            retain_referenced_sets(&mut merged);
+        }
+        merged
+    }
+}
+
+/// `sets` with each of `new` replacing the set of the same id in place, else appended (the
+/// order [`BenchmarkResults::merge`] gives).
+fn upsert_sets(
+    mut sets: Vec<super::report::ImageSetInfo>,
+    new: Vec<super::report::ImageSetInfo>,
+) -> Vec<super::report::ImageSetInfo> {
+    for s in new {
+        match sets.iter_mut().find(|p| p.id == s.id) {
+            Some(slot) => *slot = s,
+            None => sets.push(s),
+        }
+    }
+    sets
+}
+
+/// Keep only the image sets some model refers to (as [`BenchmarkResults::merge`] does).
+fn retain_referenced_sets(r: &mut BenchmarkResults) {
+    let models = &r.models;
+    r.image_sets
+        .retain(|s| models.iter().any(|m| m.datasets.contains(&s.id)));
 }
 
 fn phase_name(p: Phase) -> String {
@@ -1193,5 +1340,144 @@ mod tests {
             .unwrap();
         assert_eq!(saved.models.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_images_is_capped_per_run() {
+        let mut r = request(&[]);
+        r.max_images = MAX_IMAGES_PER_RUN;
+        r.validate().unwrap();
+        r.max_images = 0;
+        r.validate().unwrap();
+        r.max_images = MAX_IMAGES_PER_RUN + 1;
+        let e = r.validate().unwrap_err().to_string();
+        assert!(e.contains("max_images") && e.contains("0 = all"), "{e}");
+        let defaults = BenchmarkConfig::default();
+        assert!(RunRequest::from_form(&form(&[("max_images", "999999")]), &defaults).is_err());
+    }
+
+    fn set_of(id: &str, n: usize) -> ImageSet {
+        let mut s = ImageSet::sample();
+        s.id = id.into();
+        let img = s.images[0].clone();
+        s.images = (0..n)
+            .map(|i| {
+                let mut x = img.clone();
+                x.file = format!("{i}.jpg");
+                x
+            })
+            .collect();
+        s
+    }
+
+    #[test]
+    fn cap_images_spreads_the_cap_over_the_sets() {
+        let mut sets = vec![set_of("a", 10), set_of("b", 5)];
+        assert_eq!(cap_images(&mut sets, 15), None);
+        assert_eq!(sets[0].images.len() + sets[1].images.len(), 15);
+        let mut sets = vec![set_of("big", 3000), set_of("small", 30), set_of("one", 1)];
+        let w = cap_images(&mut sets, MAX_IMAGES_PER_RUN).unwrap();
+        assert!(w.contains("at most 2000"), "{w}");
+        let lens: Vec<usize> = sets.iter().map(|s| s.images.len()).collect();
+        // 3000 * 2000 / 3031 = 1979, 30 * 2000 / 3031 = 19, and at least one image.
+        assert_eq!(lens, [1979, 19, 1]);
+        assert!(lens.iter().sum::<usize>() <= MAX_IMAGES_PER_RUN);
+        // Evenly spread: the first and a late image of the big set are kept.
+        assert_eq!(sets[0].images[0].file, "0.jpg");
+        assert!(sets[0].images.last().unwrap().file != "1978.jpg");
+    }
+
+    fn model(name: &str, datasets: &[&str]) -> ModelResult {
+        let mut m = ModelResult::failed(name, "", String::new());
+        m.error = None;
+        m.datasets = datasets.iter().map(|d| d.to_string()).collect();
+        m
+    }
+
+    fn info(id: &str, title: &str) -> super::super::report::ImageSetInfo {
+        let mut s = super::super::report::ImageSetInfo::of(&ImageSet::sample());
+        s.id = id.into();
+        s.title = title.into();
+        s
+    }
+
+    fn results(
+        hw: &str,
+        models: Vec<ModelResult>,
+        sets: Vec<super::super::report::ImageSetInfo>,
+    ) -> BenchmarkResults {
+        let mut r = BenchmarkResults::new(
+            HardwareSummary {
+                cpu: hw.into(),
+                ..Default::default()
+            },
+            RuntimeVersions::default(),
+            models,
+        );
+        r.image_sets = sets;
+        r
+    }
+
+    /// Merging a run's models one at a time (each through the file) gives the single merge
+    /// of all of them, also where a merge of the first model alone would drop a set (BM-11).
+    #[test]
+    fn per_model_saves_equal_one_merge() {
+        let run_sets = || vec![info("s1", "new"), info("s3", "new")];
+        let run_models = || vec![model("a", &[]), model("c", &["s1", "s3"])];
+        let prevs = [
+            Some(results(
+                "hw",
+                vec![model("a", &["s1"]), model("b", &["s2"])],
+                vec![info("s1", "old"), info("s2", "old")],
+            )),
+            Some(results(
+                "other",
+                vec![model("b", &["s2"])],
+                vec![info("s2", "old")],
+            )),
+            None,
+        ];
+        for prev in prevs {
+            for models in [run_models(), vec![model("a", &[]), model("x", &[])]] {
+                let one = BenchmarkResults::merge(
+                    prev.clone(),
+                    results("hw", models.clone(), run_sets()),
+                );
+                let mut saver = Saver {
+                    hardware: HardwareSummary {
+                        cpu: "hw".into(),
+                        ..Default::default()
+                    },
+                    versions: RuntimeVersions::default(),
+                    retain_sets: None,
+                    finalized: false,
+                };
+                let mut file = prev.clone();
+                let n = models.len();
+                for (i, m) in models.into_iter().enumerate() {
+                    let new = results("hw", vec![m], run_sets());
+                    // Through JSON, like the file.
+                    let merged = saver.merge(file.take(), new, i + 1 == n);
+                    file = Some(
+                        serde_json::from_str(&serde_json::to_string(&merged).unwrap()).unwrap(),
+                    );
+                }
+                let file = file.unwrap();
+                assert_eq!(file.models, one.models);
+                assert_eq!(file.image_sets, one.image_sets, "{prev:?}");
+            }
+        }
+        // The case a naive per-model merge gets wrong: "a" alone drops s1 (only "a" referred
+        // to it), which then comes back after s2.
+        let one = BenchmarkResults::merge(
+            Some(results(
+                "hw",
+                vec![model("a", &["s1"]), model("b", &["s2"])],
+                vec![info("s1", "old"), info("s2", "old")],
+            )),
+            results("hw", run_models(), run_sets()),
+        );
+        let ids: Vec<&str> = one.image_sets.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["s1", "s2", "s3"]);
     }
 }

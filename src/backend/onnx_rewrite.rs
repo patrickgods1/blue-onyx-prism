@@ -67,8 +67,23 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
 }
 
 /// Split a message into its fields (groups, wire types 3/4, are not used by ONNX and rejected).
+///
+/// Stores one [`Field`] (40 bytes) per encoded field, so only for messages with few fields
+/// (model, graph, node, value info); weight tensors and attributes go through [`scan`] (BE-06).
 pub fn parse_fields(buf: &[u8]) -> Result<Vec<Field<'_>>> {
     let mut out = Vec::new();
+    scan(buf, |f| {
+        out.push(f);
+        Ok(())
+    })?;
+    #[cfg(test)]
+    tests::FIELDS_STORED.with(|c| c.set(c.get() + out.len()));
+    Ok(out)
+}
+
+/// Visit the fields of a message in order without storing them (same decoding and errors as
+/// [`parse_fields`]).
+fn scan<'a>(buf: &'a [u8], mut visit: impl FnMut(Field<'a>) -> Result<()>) -> Result<()> {
     let mut pos = 0;
     while pos < buf.len() {
         let start = pos;
@@ -112,9 +127,9 @@ pub fn parse_fields(buf: &[u8]) -> Result<Vec<Field<'_>>> {
         let raw = buf
             .get(start..pos)
             .context("field extends past the end of the message")?;
-        out.push(Field { num, value, raw });
+        visit(Field { num, value, raw })?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Protobuf encoder for the few field kinds the rewrite emits.
@@ -197,16 +212,6 @@ fn get_int(fields: &[Field<'_>], num: u32) -> Option<i64> {
         })
 }
 
-fn get_float(fields: &[Field<'_>], num: u32) -> Option<f32> {
-    fields
-        .iter()
-        .rev()
-        .find_map(|f| match (f.num == num, f.value) {
-            (true, Value::Fixed32(v)) => Some(f32::from_bits(v)),
-            _ => None,
-        })
-}
-
 fn rep_str<'a>(fields: &[Field<'a>], num: u32) -> Result<Vec<&'a str>> {
     fields
         .iter()
@@ -216,22 +221,37 @@ fn rep_str<'a>(fields: &[Field<'a>], num: u32) -> Result<Vec<&'a str>> {
         .collect()
 }
 
-/// Repeated int32/int64, packed or not.
-fn rep_int(fields: &[Field<'_>], num: u32) -> Result<Vec<i64>> {
-    let mut out = Vec::new();
-    for f in fields.iter().filter(|f| f.num == num) {
-        match f.value {
-            Value::Varint(v) => out.push(v as i64),
-            Value::Len(b) => {
-                let mut pos = 0;
-                while pos < b.len() {
-                    out.push(read_varint(b, &mut pos)? as i64);
-                }
+/// The integers of one occurrence of a repeated int32/int64 field (packed or not).
+fn int_values(f: &Field<'_>, out: &mut impl FnMut(i64)) -> Result<()> {
+    match f.value {
+        Value::Varint(v) => out(v as i64),
+        Value::Len(b) => {
+            let mut pos = 0;
+            while pos < b.len() {
+                out(read_varint(b, &mut pos)? as i64);
             }
-            _ => bail!("field {num}: unexpected wire type for an integer"),
         }
+        _ => bail!("field {}: unexpected wire type for an integer", f.num),
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Repeated int32/int64 field `num` of the message `msg`, read without storing its fields.
+/// `out` sees every value in order.
+fn scan_ints(msg: &[u8], num: u32, mut out: impl FnMut(i64)) -> Result<()> {
+    scan(msg, |f| {
+        if f.num == num {
+            int_values(&f, &mut out)?;
+        }
+        Ok(())
+    })
+}
+
+/// [`scan_ints`] collected (for the few values the rewrite reads).
+fn collect_ints(msg: &[u8], num: u32) -> Result<Vec<i64>> {
+    let mut v = Vec::new();
+    scan_ints(msg, num, |x| v.push(x))?;
+    Ok(v)
 }
 
 // ---- ONNX messages (only what the rewrite reads) -----------------------------------------------
@@ -299,25 +319,69 @@ fn is_float_type(t: i32) -> bool {
     matches!(t, 1 | 10 | 11 | 16..=20 | 23)
 }
 
+/// The string in the last field of a scanned message's field number (protobuf "last one wins";
+/// "" when that field is absent or not length-delimited, as [`get_str`]).
+fn str_of(last: Option<Value<'_>>) -> Result<&str> {
+    match last {
+        Some(Value::Len(b)) => as_str(b),
+        _ => Ok(""),
+    }
+}
+
+fn bytes_of(last: Option<Value<'_>>) -> Option<&[u8]> {
+    match last {
+        Some(Value::Len(b)) => Some(b),
+        _ => None,
+    }
+}
+
+/// An `AttributeProto`, scanned rather than split into stored fields: an attribute may carry
+/// large repeated values (`floats`, `ints`, a tensor), so `ints` is only decoded on demand
+/// (BE-06).
 #[derive(Debug)]
 struct Attr<'a> {
     name: &'a str,
     f: Option<f32>,
     i: Option<i64>,
-    ints: Vec<i64>,
     t: Option<&'a [u8]>,
     has_graph: bool,
+    /// The encoded message (for [`Attr::ints`]).
+    raw: &'a [u8],
 }
 
+impl Attr<'_> {
+    /// The `ints` values (validated by [`parse_attr`]).
+    fn ints(&self) -> Vec<i64> {
+        collect_ints(self.raw, ATTR_INTS).unwrap_or_default()
+    }
+}
+
+/// Same results and errors as splitting the message with [`parse_fields`] and reading the last
+/// occurrence of each singular field (protobuf "last one wins"), without storing a field per
+/// value.
 fn parse_attr(b: &[u8]) -> Result<Attr<'_>> {
-    let f = parse_fields(b)?;
+    let (mut name, mut f, mut i, mut t, mut has_graph) = (None, None, None, None, false);
+    scan(b, |x| {
+        match (x.num, x.value) {
+            (ATTR_NAME, v) => name = Some(v),
+            (ATTR_F, Value::Fixed32(v)) => f = Some(f32::from_bits(v)),
+            (ATTR_I, Value::Varint(v)) => i = Some(v as i64),
+            (ATTR_T, v) => t = Some(v),
+            (ATTR_G | ATTR_GRAPHS, _) => has_graph = true,
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let name = str_of(name)?;
+    // Malformed `ints` fail the parse here, as the eager decoding did.
+    scan_ints(b, ATTR_INTS, |_| {})?;
     Ok(Attr {
-        name: get_str(&f, ATTR_NAME)?,
-        f: get_float(&f, ATTR_F),
-        i: get_int(&f, ATTR_I),
-        ints: rep_int(&f, ATTR_INTS)?,
-        t: get_len(&f, ATTR_T),
-        has_graph: f.iter().any(|x| x.num == ATTR_G || x.num == ATTR_GRAPHS),
+        name,
+        f,
+        i,
+        t: bytes_of(t),
+        has_graph,
+        raw: b,
     })
 }
 
@@ -361,28 +425,53 @@ impl<'a> Node<'a> {
     }
 }
 
+/// A `TensorProto` (initializer or attribute tensor). Weights make up nearly all of a model, so
+/// the message is scanned once for the few scalar fields the rewrite needs and otherwise kept as
+/// its encoded bytes; dims and integer data are decoded on demand (BE-06). The tensor itself is
+/// always copied through unchanged.
 #[derive(Debug)]
 struct Tensor<'a> {
     name: &'a str,
     data_type: i32,
-    dims: Vec<i64>,
     external: bool,
-    fields: Vec<Field<'a>>,
+    /// Last `raw_data` field, if length-delimited.
+    raw_data: Option<&'a [u8]>,
+    /// The encoded message.
+    raw: &'a [u8],
 }
 
 impl<'a> Tensor<'a> {
+    /// Same results and errors as splitting the message with [`parse_fields`] and reading the
+    /// last occurrence of each singular field, without storing a field per value.
     fn parse(b: &'a [u8]) -> Result<Self> {
-        let fields = parse_fields(b)?;
+        let (mut name, mut data_type, mut location, mut raw_data, mut ext) =
+            (None, None, None, None, false);
+        scan(b, |f| {
+            match (f.num, f.value) {
+                (TENSOR_NAME, v) => name = Some(v),
+                (TENSOR_DATA_TYPE, Value::Varint(v)) => data_type = Some(v as i64),
+                (TENSOR_DATA_LOCATION, Value::Varint(v)) => location = Some(v as i64),
+                (TENSOR_RAW_DATA, v) => raw_data = Some(v),
+                (TENSOR_EXTERNAL_DATA, _) => ext = true,
+                _ => {}
+            }
+            Ok(())
+        })?;
+        let name = str_of(name)?;
+        // Malformed dims fail the parse here, as the eager decoding did.
+        scan_ints(b, TENSOR_DIMS, |_| {})?;
         Ok(Self {
-            name: get_str(&fields, TENSOR_NAME)?,
-            data_type: get_int(&fields, TENSOR_DATA_TYPE)
-                .and_then(|v| i32::try_from(v).ok())
-                .unwrap_or(0),
-            dims: rep_int(&fields, TENSOR_DIMS)?,
-            external: get_int(&fields, TENSOR_DATA_LOCATION) == Some(1)
-                || fields.iter().any(|f| f.num == TENSOR_EXTERNAL_DATA),
-            fields,
+            name,
+            data_type: data_type.and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
+            external: location == Some(1) || ext,
+            raw_data: bytes_of(raw_data),
+            raw: b,
         })
+    }
+
+    /// The dimensions (validated by [`Tensor::parse`]).
+    fn dims(&self) -> Vec<i64> {
+        collect_ints(self.raw, TENSOR_DIMS).unwrap_or_default()
     }
 
     /// Integer contents of an int64/int32 tensor (raw or typed data).
@@ -390,7 +479,7 @@ impl<'a> Tensor<'a> {
         if self.external {
             return None;
         }
-        let raw = get_len(&self.fields, TENSOR_RAW_DATA);
+        let raw = self.raw_data;
         match self.data_type {
             DT_INT64 => match raw {
                 Some(r) if r.len() % 8 == 0 => Some(
@@ -401,7 +490,7 @@ impl<'a> Tensor<'a> {
                         .collect(),
                 ),
                 Some(_) => None,
-                None => rep_int(&self.fields, TENSOR_INT64_DATA).ok(),
+                None => collect_ints(self.raw, TENSOR_INT64_DATA).ok(),
             },
             DT_INT32 => match raw {
                 Some(r) if r.len() % 4 == 0 => Some(
@@ -412,7 +501,7 @@ impl<'a> Tensor<'a> {
                         .collect(),
                 ),
                 Some(_) => None,
-                None => rep_int(&self.fields, TENSOR_INT32_DATA)
+                None => collect_ints(self.raw, TENSOR_INT32_DATA)
                     .ok()?
                     .into_iter()
                     .map(|x| i32::try_from(x).ok().map(i64::from))
@@ -651,7 +740,7 @@ impl<'a> Graph<'a> {
             .or_else(|| {
                 self.inits
                     .get(name)
-                    .map(|(_, t)| t.dims.iter().map(|d| Some(*d)).collect())
+                    .map(|(_, t)| t.dims().into_iter().map(Some).collect())
             })
     }
 
@@ -665,7 +754,7 @@ impl<'a> Graph<'a> {
             .iter()
             .find(|(_, n)| n.op_type == "Constant" && n.outputs.first() == Some(&name))?;
         if let Some(a) = n.attr("value_ints") {
-            return Some(a.ints.clone());
+            return Some(a.ints());
         }
         if let Some(a) = n.attr("value_int") {
             return a.i.map(|v| vec![v]);
@@ -882,7 +971,7 @@ fn emit_hard_sigmoid(
 fn split_sizes(g: &Graph<'_>, n: &Node<'_>, opset: i64, axis: i64) -> Result<Vec<i64>, String> {
     let outs = i64::try_from(n.outputs.len()).map_err(|_| "too many outputs".to_string())?;
     let explicit = if opset < 13 {
-        n.attr("split").map(|a| a.ints.clone())
+        n.attr("split").map(Attr::ints)
     } else if let Some(s) = n.input(1) {
         Some(
             g.const_ints(s)
@@ -1264,10 +1353,78 @@ pub fn cache_file_name(src: &Path, sha_hex: &str) -> String {
     format!("{stem}-{short}-v{REWRITER_VERSION}.onnx")
 }
 
+/// Largest model file [`rewrite_cached`] reads (512 MiB). The rewrite holds the file, its
+/// rewritten copy and the parsed graph in memory at once (about 2x the file size plus a small
+/// per-node overhead), so a bigger model loads unrewritten instead; models that large normally
+/// keep their weights in external data, which is never rewritten anyway (BE-06).
+pub const MAX_REWRITE_BYTES: u64 = 512 << 20;
+
+/// The contents of `path`, or `None` when it is larger than `max` bytes. The size is checked on
+/// the open handle and the read is capped, so a file that grows meanwhile is not read whole.
+fn read_capped(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > max {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= max).then_some(bytes))
+}
+
+/// Whether the file at `path` holds exactly `expected`, compared in chunks (the existing copy
+/// is never read into memory whole; a size mismatch is decided from the metadata).
+fn file_equals(path: &Path, expected: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = vec![0u8; 1 << 16];
+    let mut rest = expected;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(rest.is_empty());
+        }
+        let (Some(got), Some(want)) = (buf.get(..n), rest.get(..n)) else {
+            return Ok(false); // the file grew past the expected length
+        };
+        if got != want {
+            return Ok(false);
+        }
+        rest = rest.get(n..).unwrap_or_default();
+    }
+}
+
 /// Rewrite `src` into `dir/<stem>-<sha256 16 hex>-v<version>.onnx` (written to a temporary file
-/// and renamed into place; reused when it exists). `src` itself is never modified.
+/// and renamed into place; reused when it exists). `src` itself is never modified. A model
+/// larger than [`MAX_REWRITE_BYTES`] is not read and reported as [`Cached::Original`].
 pub fn rewrite_cached(src: &Path, dir: &Path, opts: &RewriteOptions) -> Result<Cached> {
-    let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    rewrite_cached_capped(src, dir, opts, MAX_REWRITE_BYTES)
+}
+
+fn rewrite_cached_capped(
+    src: &Path,
+    dir: &Path,
+    opts: &RewriteOptions,
+    max_bytes: u64,
+) -> Result<Cached> {
+    let Some(bytes) =
+        read_capped(src, max_bytes).with_context(|| format!("reading {}", src.display()))?
+    else {
+        let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+        tracing::info!(
+            "model {}: {size} bytes is over the CoreML rewrite limit of {max_bytes} bytes \
+             (MAX_REWRITE_BYTES); loading it without the graph rewrite",
+            src.display()
+        );
+        return Ok(Cached::Original {
+            skipped: Vec::new(),
+        });
+    };
     let r = match rewrite(&bytes, opts).with_context(|| format!("parsing {}", src.display()))? {
         Outcome::Unchanged { skipped } => return Ok(Cached::Original { skipped }),
         Outcome::ExternalData => return Ok(Cached::ExternalData),
@@ -1278,8 +1435,8 @@ pub fn rewrite_cached(src: &Path, dir: &Path, opts: &RewriteOptions) -> Result<C
     // A cache hit is trusted only when its bytes are exactly the rewrite just computed (the
     // rewrite is deterministic): a file somebody else put at this predictable path, or a
     // truncated / stale one, is replaced (BE-04).
-    match std::fs::read(&path) {
-        Ok(existing) if existing == r.bytes => {
+    match file_equals(&path, &r.bytes) {
+        Ok(true) => {
             return Ok(Cached::Rewritten {
                 path,
                 counts: r.counts,
@@ -1287,7 +1444,7 @@ pub fn rewrite_cached(src: &Path, dir: &Path, opts: &RewriteOptions) -> Result<C
                 created: false,
             });
         }
-        Ok(_) => tracing::warn!(
+        Ok(false) => tracing::warn!(
             "cached CoreML rewrite {} does not match the rewrite of {}; replacing it",
             path.display(),
             src.display()
@@ -1328,6 +1485,11 @@ pub fn rewrite_cached(src: &Path, dir: &Path, opts: &RewriteOptions) -> Result<C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Fields stored by [`parse_fields`] on this thread (BE-06 memory test).
+        pub(super) static FIELDS_STORED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     #[test]
     fn varints_round_trip() {
@@ -1586,17 +1748,15 @@ mod tests {
                         n.outputs.iter().map(|s| s.to_string()).collect(),
                         n.attrs
                             .iter()
-                            .map(|a| (a.name.to_string(), a.f, a.ints.clone()))
+                            .map(|a| (a.name.to_string(), a.f, a.ints()))
                             .collect(),
                     ));
                 }
                 GRAPH_INITIALIZER => {
                     let t = Tensor::parse(b).unwrap();
-                    let raw = get_len(&t.fields, TENSOR_RAW_DATA)
-                        .unwrap_or_default()
-                        .to_vec();
+                    let raw = t.raw_data.unwrap_or_default().to_vec();
                     v.inits
-                        .insert(t.name.to_string(), (t.data_type, t.dims.clone(), raw));
+                        .insert(t.name.to_string(), (t.data_type, t.dims(), raw));
                 }
                 _ => {}
             }
@@ -2307,6 +2467,480 @@ mod tests {
     fn garbage_is_an_error() {
         assert!(rewrite(b"not a model at all \xff\xff", &RewriteOptions::COREML).is_err());
         assert!(rewrite(&[], &RewriteOptions::COREML).is_err(), "no graph");
+    }
+
+    /// Every rewrite path over a corpus of synthetic models, as (label, model, options).
+    fn golden_corpus() -> Vec<(&'static str, Vec<u8>, RewriteOptions)> {
+        let all = RewriteOptions::ALL;
+        let coreml = RewriteOptions::COREML;
+        let mut c = Vec::new();
+        let hs = node(
+            "HardSigmoid",
+            "/act/HardSigmoid",
+            &["x"],
+            &["y"],
+            &[attr_f("alpha", 1.0 / 6.0), attr_f("beta", 0.5)],
+        );
+        c.push(("hs12", single(12, hs, &["y"], &[1, 4]), coreml));
+        let hs = node("HardSigmoid", "", &["x"], &["y"], &[]);
+        c.push(("hs10", single(10, hs, &["y"], &[2]), coreml));
+        let hs = node("HardSigmoid", "", &["x"], &["y"], &[]);
+        c.push(("hs6", single(6, hs, &["y"], &[2]), all));
+        let hs = node("HardSwish", "/act/HardSwish", &["x"], &["y"], &[]);
+        c.push(("hsw17", single(17, hs, &["y"], &[1, 8]), coreml));
+        for (label, dt) in [("hsw-f16", DT_FLOAT16), ("hsw-f64", DT_DOUBLE)] {
+            let g = G {
+                nodes: vec![node("HardSwish", "hs", &["x"], &["y"], &[])],
+                inputs: vec![value_info("x", dt, Some(&[4]))],
+                outputs: vec![value_info("y", dt, None)],
+                ..G::default()
+            };
+            c.push((label, model(14, &g, &[]), coreml));
+        }
+        let g = G {
+            nodes: vec![
+                node(
+                    "Cast",
+                    "c",
+                    &["x"],
+                    &["h"],
+                    &[attr_i("to", i64::from(DT_FLOAT16))],
+                ),
+                node("HardSigmoid", "hs", &["h"], &["y"], &[]),
+            ],
+            inputs: vec![value_info("x", DT_FLOAT, Some(&[4]))],
+            outputs: vec![value_info("y", DT_FLOAT16, None)],
+            ..G::default()
+        };
+        c.push(("mixed", model(13, &g, &[]), coreml));
+        // f16 weights make the untyped input's element type unknown.
+        let g = G {
+            nodes: vec![node("HardSigmoid", "hs", &["t"], &["y"], &[])],
+            inits: vec![tensor_f32("w", &[1], &[1.0], DT_FLOAT16)],
+            ..G::default()
+        };
+        c.push(("f16-weights", model(13, &g, &[]), coreml));
+        let sp = node(
+            "Split",
+            "split",
+            &["x"],
+            &["a", "b", "c"],
+            &[attr_i("axis", 4), attr_ints("split", &[2, 2, 4], false)],
+        );
+        c.push((
+            "split12",
+            single(12, sp, &["a", "b", "c"], &[1, 3, 80, 80, 8]),
+            coreml,
+        ));
+        let sp = node(
+            "Split",
+            "split",
+            &["x"],
+            &["a", "b"],
+            &[attr_i("axis", -1), attr_ints("split", &[3, 5], true)],
+        );
+        c.push(("split12-packed", single(12, sp, &["a", "b"], &[8]), coreml));
+        let sp = node(
+            "Split",
+            "split",
+            &["x"],
+            &["a", "b"],
+            &[attr_i("axis", 1), attr_ints("split", &[1, 3], false)],
+        );
+        c.push(("split9", single(9, sp, &["a", "b"], &[2, 4]), coreml));
+        let sp = node("Split", "s", &["x"], &["a", "b"], &[attr_i("axis", 1)]);
+        c.push(("split11-eq", single(11, sp, &["a", "b"], &[1, 6]), coreml));
+        let sp = node("Split", "s", &["x"], &["a", "b"], &[attr_i("axis", 1)]);
+        c.push(("split11-sym", single(11, sp, &["a", "b"], &[1, -1]), coreml));
+        for (label, raw, constant) in [
+            ("split13-raw", true, false),
+            ("split13-typed", false, false),
+            ("split13-const", true, true),
+        ] {
+            let sizes = tensor_i64("sizes", &[2, 6], raw);
+            let mut g = G {
+                nodes: vec![node(
+                    "Split",
+                    "s",
+                    &["x", "sizes"],
+                    &["a", "b"],
+                    &[attr_i("axis", 0)],
+                )],
+                inputs: vec![value_info("x", DT_FLOAT, Some(&[8]))],
+                outputs: vec![
+                    value_info("a", DT_FLOAT, None),
+                    value_info("b", DT_FLOAT, None),
+                ],
+                ..G::default()
+            };
+            if constant {
+                g.nodes.insert(
+                    0,
+                    node("Constant", "k", &[], &["sizes"], &[attr_t("value", sizes)]),
+                );
+            } else {
+                g.inits.push(sizes);
+            }
+            c.push((label, model(13, &g, &[]), all));
+        }
+        // int32 sizes, raw and typed (packed and not).
+        let i32_raw = msg(|w| {
+            w.int(TENSOR_DIMS, 2);
+            w.int(TENSOR_DATA_TYPE, i64::from(DT_INT32));
+            w.string(TENSOR_NAME, "sizes");
+            w.bytes(TENSOR_RAW_DATA, &[3, 0, 0, 0, 5, 0, 0, 0]);
+        });
+        let i32_typed = msg(|w| {
+            w.int(TENSOR_DIMS, 2);
+            w.int(TENSOR_DATA_TYPE, i64::from(DT_INT32));
+            w.int(TENSOR_INT32_DATA, 3);
+            w.int(TENSOR_INT32_DATA, 5);
+            w.string(TENSOR_NAME, "sizes");
+        });
+        for (label, t) in [("split13-i32raw", i32_raw), ("split13-i32typed", i32_typed)] {
+            let g = G {
+                nodes: vec![node("Split", "s", &["x", "sizes"], &["a", "b"], &[])],
+                inits: vec![t],
+                inputs: vec![value_info("x", DT_FLOAT, Some(&[8]))],
+                ..G::default()
+            };
+            c.push((label, model(13, &g, &[]), all));
+        }
+        let g = G {
+            nodes: vec![
+                node("Split", "s", &["x", "sizes"], &["a", "b"], &[]),
+                node("Identity", "i", &["sizes"], &["c"], &[]),
+            ],
+            inits: vec![tensor_i64("sizes", &[2, 6], true)],
+            inputs: vec![value_info("x", DT_FLOAT, Some(&[8]))],
+            ..G::default()
+        };
+        c.push(("split13-kept", model(13, &g, &[]), all));
+        let g = G {
+            nodes: vec![
+                node(
+                    "Constant",
+                    "k",
+                    &[],
+                    &["sizes"],
+                    &[attr_ints("value_ints", &[4, 4], false)],
+                ),
+                node("Split", "s", &["x", "sizes"], &["a", "b"], &[]),
+            ],
+            inputs: vec![value_info("x", DT_FLOAT, Some(&[8]))],
+            ..G::default()
+        };
+        c.push(("split13-value-ints", model(13, &g, &[]), all));
+        let sp = node(
+            "Split",
+            "s",
+            &["x"],
+            &["a", "b", "c"],
+            &[attr_i("axis", -1), attr_i("num_outputs", 3)],
+        );
+        c.push(("split18", single(18, sp, &["a", "b", "c"], &[2, 10]), all));
+        let g = G {
+            nodes: vec![
+                node("Relu", "r", &["x"], &["t"], &[]),
+                node(
+                    "Split",
+                    "s",
+                    &["t"],
+                    &["a", "b"],
+                    &[attr_i("axis", 0), attr_i("num_outputs", 2)],
+                ),
+            ],
+            inputs: vec![value_info("x", DT_FLOAT, None)],
+            value_info: vec![value_info("t", DT_FLOAT, Some(&[6, 2]))],
+            ..G::default()
+        };
+        c.push(("split18-vi", model(18, &g, &[]), all));
+        for (label, axis, dims) in [
+            ("flat-none", None, &[-1i64, 3, 4][..]),
+            ("flat0", Some(0), &[-1, 3][..]),
+            ("flat2", Some(2), &[2, 3, 4, 5][..]),
+            ("flat-1", Some(-1), &[2, 3, 4][..]),
+            ("flat2-sym", Some(2), &[-1, 3, 4][..]),
+        ] {
+            let attrs: Vec<_> = axis.map(|a| attr_i("axis", a)).into_iter().collect();
+            let f = node("Flatten", "f", &["x"], &["y"], &attrs);
+            c.push((label, single(13, f, &["y"], dims), all));
+        }
+        let mut unknown = Writer::default();
+        unknown.string(999, "keep me");
+        unknown.int(1000, 42);
+        let mut relu = node("Relu", "relu", &["y"], &["z"], &[]);
+        relu.extend_from_slice(&unknown.buf);
+        let g = G {
+            nodes: vec![node("HardSigmoid", "hs", &["x"], &["y"], &[]), relu],
+            inits: vec![tensor_f32("w", &[2], &[1.0, 2.0], DT_FLOAT)],
+            inputs: vec![value_info("x", DT_FLOAT, Some(&[1, 2]))],
+            outputs: vec![value_info("z", DT_FLOAT, None)],
+            extra: unknown.buf.clone(),
+            ..G::default()
+        };
+        c.push(("unknown-fields", model(13, &g, &unknown.buf), coreml));
+        let g = G {
+            nodes: vec![
+                node(
+                    "Relu",
+                    "bop_rewrite/const_0",
+                    &["x"],
+                    &["bop_rewrite/const_0"],
+                    &[],
+                ),
+                node("HardSigmoid", "hs", &["bop_rewrite/const_0"], &["y"], &[]),
+                msg(|w| {
+                    w.string(NODE_INPUT, "y");
+                    w.string(NODE_OUTPUT, "z");
+                    w.string(NODE_OP_TYPE, "HardSigmoid");
+                    w.string(NODE_DOMAIN, "com.example");
+                }),
+            ],
+            inputs: vec![value_info("x", DT_FLOAT, Some(&[2]))],
+            ..G::default()
+        };
+        c.push(("names", model(13, &g, &[]), all));
+        let ext = msg(|w| {
+            w.int(TENSOR_DIMS, 2);
+            w.int(TENSOR_DATA_TYPE, i64::from(DT_FLOAT));
+            w.string(TENSOR_NAME, "w");
+            w.int(TENSOR_DATA_LOCATION, 1);
+        });
+        let g = G {
+            nodes: vec![node("HardSigmoid", "hs", &["x"], &["y"], &[])],
+            inits: vec![ext],
+            inputs: vec![value_info("x", DT_FLOAT, Some(&[2]))],
+            ..G::default()
+        };
+        c.push(("external", model(13, &g, &[]), all));
+        c
+    }
+
+    fn outcome_digest(o: &Outcome) -> String {
+        match o {
+            Outcome::Unchanged { skipped } => format!("U {}", skipped.join(" | ")),
+            Outcome::ExternalData => "E".to_string(),
+            Outcome::Rewritten(r) => format!(
+                "R {} {} {}",
+                &sha256_hex(&r.bytes)[..16],
+                summary(&r.counts),
+                r.skipped.join(" | ")
+            ),
+        }
+    }
+
+    /// Outputs of the rewrite before the lazy tensor parsing (BE-06), pinned: the change must
+    /// not alter a single byte. Update only together with `REWRITER_VERSION`.
+    #[test]
+    fn golden_outputs_are_unchanged() {
+        let pinned: &[(&str, &str)] = &[
+            ("hs12", "R a77a31b4d2d8c1bf HardSigmoid x1 "),
+            ("hs10", "R 0a9aee423c9838d0 HardSigmoid x1 "),
+            ("hs6", "U HardSigmoid '<unnamed>': opset 6 < 7"),
+            ("hsw17", "R 4cde96fbab2c29d7 HardSwish x1 "),
+            ("hsw-f16", "R 35f089f09ee885d3 HardSwish x1 "),
+            ("hsw-f64", "R 85a4545f628bf961 HardSwish x1 "),
+            ("mixed", "U HardSigmoid 'hs': element type of 'h' unknown"),
+            (
+                "f16-weights",
+                "U HardSigmoid 'hs': element type of 't' unknown",
+            ),
+            ("split12", "R 9a4b08e172ad8a0c Split x1 "),
+            ("split12-packed", "R 8c1f347779b8b1e1 Split x1 "),
+            ("split9", "R 95443490b5fd1cff Split x1 "),
+            ("split11-eq", "R 9502f3a31b50ae9a Split x1 "),
+            (
+                "split11-sym",
+                "U Split 's': equal split of 'x' needs its shape along axis 1",
+            ),
+            ("split13-raw", "R d6daa6509ebd2e4d Split x1 "),
+            ("split13-typed", "R d6daa6509ebd2e4d Split x1 "),
+            ("split13-const", "R d6daa6509ebd2e4d Split x1 "),
+            ("split13-i32raw", "R 749801136f54bde7 Split x1 "),
+            ("split13-i32typed", "R 749801136f54bde7 Split x1 "),
+            ("split13-kept", "R 63f3a2d80367542b Split x1 "),
+            ("split13-value-ints", "R f958a38bdf4fe867 Split x1 "),
+            ("split18", "R 01c86dfa6bb9794c Split x1 "),
+            ("split18-vi", "R f50d5ff7cc9beb25 Split x1 "),
+            ("flat-none", "R 928df603336106b6 Flatten x1 "),
+            ("flat0", "R f20b1485b1607b9b Flatten x1 "),
+            ("flat2", "R dac212c2474a4045 Flatten x1 "),
+            ("flat-1", "R fd01ba03dadb06c9 Flatten x1 "),
+            (
+                "flat2-sym",
+                "U Flatten 'f': axis > 1 needs static leading dimensions",
+            ),
+            ("unknown-fields", "R fa1940d0e11b2b78 HardSigmoid x1 "),
+            ("names", "R be84ea42ab2c6f2f HardSigmoid x1 "),
+            ("external", "E"),
+        ];
+        let got: Vec<(&str, String)> = golden_corpus()
+            .into_iter()
+            .map(|(label, m, opts)| (label, outcome_digest(&rewrite(&m, &opts).unwrap())))
+            .collect();
+        assert_eq!(got.len(), pinned.len());
+        for ((label, d), (pl, pd)) in got.iter().zip(pinned) {
+            assert_eq!((*label, d.as_str()), (*pl, *pd));
+        }
+    }
+
+    /// A HardSwish model with a 100 MB raw f32 weight and a 1M-entry unpacked `float_data` weight
+    /// (one encoded field per value: the worst case for a per-field parse), or without weights.
+    fn big_model(weights: bool) -> Vec<u8> {
+        let raw = msg(|w| {
+            w.int(TENSOR_DIMS, 25 << 20);
+            w.int(TENSOR_DATA_TYPE, i64::from(DT_FLOAT));
+            w.string(TENSOR_NAME, "big_raw");
+            w.bytes(TENSOR_RAW_DATA, &vec![0x3f; 100 << 20]);
+        });
+        let unpacked = msg(|w| {
+            w.int(TENSOR_DIMS, 1 << 20);
+            w.int(TENSOR_DATA_TYPE, i64::from(DT_FLOAT));
+            w.string(TENSOR_NAME, "big_unpacked");
+            for i in 0..1u32 << 20 {
+                #[allow(clippy::cast_precision_loss, reason = "test values")]
+                w.float(4, i as f32);
+            }
+        });
+        let g = G {
+            nodes: vec![node("HardSwish", "hs", &["x"], &["y"], &[])],
+            inits: if weights {
+                vec![raw, unpacked]
+            } else {
+                Vec::new()
+            },
+            inputs: vec![value_info("x", DT_FLOAT, Some(&[1, 4]))],
+            outputs: vec![value_info("y", DT_FLOAT, None)],
+            ..G::default()
+        };
+        model(13, &g, &[])
+    }
+
+    /// Fields `parse_fields` stored while rewriting `m`.
+    fn stored_fields(m: &[u8]) -> (usize, Rewrite) {
+        FIELDS_STORED.with(|c| c.set(0));
+        let r = rewritten(m, &RewriteOptions::COREML);
+        (FIELDS_STORED.with(std::cell::Cell::get), r)
+    }
+
+    /// BE-06: weight tensors are scanned, not split into stored fields (before: 1,048,612
+    /// stored `Field`s, ~40 MB, for this model), and the output is byte-identical to the rewrite
+    /// before the change (length and digest pinned from the eager parser).
+    #[test]
+    fn big_initializers_are_not_materialized() {
+        let (stored, r) = stored_fields(&big_model(true));
+        let (without, _) = stored_fields(&big_model(false));
+        // Each initializer costs only its own graph-level field.
+        assert_eq!(
+            stored,
+            without + 2,
+            "stored {stored}, without weights {without}"
+        );
+        assert!(stored < 64, "{stored}");
+        assert_eq!(r.bytes.len(), 110_101_002);
+        assert_eq!(
+            sha256_hex(&r.bytes),
+            "c7b411a6d052a4fd95bcf7ca7465f23927270b603500acb14878e0965a615d63"
+        );
+    }
+
+    /// The lazy tensor/attribute parse keeps the eager parse's protobuf semantics: last
+    /// occurrence wins (and only with the expected wire type for numbers), and malformed
+    /// repeated integers still fail the parse.
+    #[test]
+    fn lazy_parse_matches_eager_semantics() {
+        let t = msg(|w| {
+            w.string(TENSOR_NAME, "first");
+            w.int(TENSOR_DATA_TYPE, i64::from(DT_INT64));
+            w.float(TENSOR_DATA_TYPE, 1.0); // wrong wire type: ignored, as get_int did
+            w.int(TENSOR_DIMS, 2);
+            w.bytes(TENSOR_RAW_DATA, &[0; 16]);
+            w.string(TENSOR_NAME, "last");
+            w.bytes(
+                TENSOR_RAW_DATA,
+                &[1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+            );
+        });
+        let p = Tensor::parse(&t).unwrap();
+        assert_eq!((p.name, p.data_type, p.dims()), ("last", DT_INT64, vec![2]));
+        assert_eq!(p.ints(), Some(vec![1, 2]));
+        // A trailing non-bytes name field hides the earlier one (get_str semantics).
+        let t2 = msg(|w| {
+            w.string(TENSOR_NAME, "n");
+            w.int(TENSOR_NAME, 3);
+        });
+        assert_eq!(Tensor::parse(&t2).unwrap().name, "");
+        let bad_dims = msg(|w| w.float(TENSOR_DIMS, 1.0));
+        assert!(Tensor::parse(&bad_dims).is_err());
+        let bad_name = msg(|w| w.bytes(TENSOR_NAME, &[0xff]));
+        assert!(Tensor::parse(&bad_name).is_err());
+        let bad_ints = msg(|w| {
+            w.string(ATTR_NAME, "split");
+            w.bytes(ATTR_INTS, &[0x80]); // truncated packed varint
+        });
+        assert!(parse_attr(&bad_ints).is_err());
+        let a = attr_ints("split", &[1, -2, 3], false);
+        let mut a2 = a.clone();
+        a2.extend(msg(|w| w.bytes(ATTR_INTS, &msg(|p| p.varint(4)))));
+        assert_eq!(parse_attr(&a2).unwrap().ints(), [1, -2, 3, 4]);
+        // The same model fails the rewrite as a whole, as before.
+        let sp = node("Split", "s", &["x"], &["a", "b"], &[bad_ints]);
+        assert!(rewrite(&single(12, sp, &["a", "b"], &[2]), &RewriteOptions::COREML).is_err());
+    }
+
+    #[test]
+    fn rewrite_size_limit() {
+        assert_eq!(MAX_REWRITE_BYTES, 512 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("bop-onnx-rewrite-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("m.onnx");
+        let m = single(
+            12,
+            node("HardSigmoid", "hs", &["x"], &["y"], &[]),
+            &["y"],
+            &[2],
+        );
+        std::fs::write(&src, &m).unwrap();
+        let len = m.len() as u64;
+        assert_eq!(read_capped(&src, len).unwrap().as_deref(), Some(&m[..]));
+        assert_eq!(read_capped(&src, len - 1).unwrap(), None);
+        let cache = dir.join("cache");
+        // Over the limit: the original, nothing read into the cache.
+        assert!(matches!(
+            rewrite_cached_capped(&src, &cache, &RewriteOptions::COREML, len - 1).unwrap(),
+            Cached::Original { ref skipped } if skipped.is_empty()
+        ));
+        assert!(!cache.exists());
+        // At the limit: rewritten.
+        assert!(matches!(
+            rewrite_cached_capped(&src, &cache, &RewriteOptions::COREML, len).unwrap(),
+            Cached::Rewritten { created: true, .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_equals_compares_in_chunks() {
+        let dir = std::env::temp_dir().join(format!("bop-onnx-rewrite-eq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("f");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &data).unwrap();
+        assert!(file_equals(&p, &data).unwrap());
+        let mut other = data.clone();
+        other[150_000] ^= 1;
+        assert!(
+            !file_equals(&p, &other).unwrap(),
+            "difference in a later chunk"
+        );
+        assert!(!file_equals(&p, &data[..1000]).unwrap(), "length differs");
+        assert!(file_equals(&dir.join("missing"), &data).is_err());
+        std::fs::write(&p, b"").unwrap();
+        assert!(file_equals(&p, b"").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

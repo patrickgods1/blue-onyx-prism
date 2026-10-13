@@ -35,9 +35,11 @@ RUN /app/blue-onyx-prism --config /app/docker-config.json fetch --for-config \
 RUN mkdir -p /app/models /app/cache /app/config && chown -R openvino:openvino /app
 USER openvino
 EXPOSE 32168
-# A detection-API route (open to every client): it answers as soon as the listener is up, while
-# models may still be compiling. curl is installed above.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -fsS -o /dev/null http://127.0.0.1:32168/v1/vision/custom/list || exit 1
+# GET /v1/status answers 200 when a model is ready (or degraded) and 503 while models download or
+# compile or when none loaded, so `docker ps` shows "starting" until the service can detect. The
+# start period covers the first model download + compile (--start-period only suppresses
+# failures; a healthy answer ends it early). curl is installed above.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
+    CMD curl -fsS -o /dev/null http://127.0.0.1:32168/v1/status || exit 1
 # The config lives in the /app/config volume; the image's default is copied there on first start.
 ENTRYPOINT ["/bin/sh", "-c", "[ -f /app/config/blue_onyx_prism_config.json ] || cp /app/docker-config.json /app/config/blue_onyx_prism_config.json; exec /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json --cache-dir /app/cache \"$@\"", "--"]

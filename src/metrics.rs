@@ -2,7 +2,7 @@
 
 use crate::sync::RwLockExt;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -269,6 +269,71 @@ pub struct Metrics {
     pub models: RwLock<Vec<Arc<ModelMetrics>>>,
     /// Registry generations started after the first one.
     pub restarts: AtomicU64,
+    /// Detection requests answered 503 because the server-wide in-flight cap was reached
+    /// (see [`Metrics::try_begin_detection`]).
+    pub rejected_overloaded: AtomicU64,
+    /// Fixed server-wide in-flight cap for detection requests; 0 (the default) derives it from
+    /// the models' queue capacities on every request (see `server::detect::max_inflight`).
+    pub inflight_limit: AtomicUsize,
+    /// Rate limit of the "server is overloaded" warning.
+    pub overload_log: LogThrottle,
+    /// Detection requests being handled now, process-wide (every generation counts: an
+    /// in-flight request of an old generation still holds its upload in memory).
+    inflight: AtomicUsize,
+}
+
+/// A detection request admitted under the server-wide in-flight cap; releases its slot when
+/// dropped (the handler holds it from before the body read until the reply is built).
+#[derive(Debug)]
+pub struct InflightPermit(Arc<Metrics>);
+
+impl Drop for InflightPermit {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Smallest gap between two warnings of the same rate-limited kind.
+pub const LOG_THROTTLE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Lets a repeated warning through at most once per [`LOG_THROTTLE_INTERVAL`] and counts the
+/// ones it held back, so a flood (e.g. every rejected request under overload) logs one line per
+/// interval instead of one per event.
+#[derive(Debug)]
+pub struct LogThrottle {
+    /// Time of the last warning let through, in ms since `Metrics::started` (`u64::MAX`: never).
+    last_ms: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl Default for LogThrottle {
+    fn default() -> Self {
+        Self {
+            last_ms: AtomicU64::new(u64::MAX),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+}
+
+impl LogThrottle {
+    /// At `now_ms` (any monotonic millisecond clock): `Some(n)` when the warning should be
+    /// logged now, `n` being how many were held back since the last one; `None` to skip it.
+    pub fn allow(&self, now_ms: u64) -> Option<u64> {
+        let interval = u64::try_from(LOG_THROTTLE_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+        let last = self.last_ms.load(Ordering::Acquire);
+        let due = last == u64::MAX || now_ms.saturating_sub(last) >= interval;
+        if due
+            && self
+                .last_ms
+                .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            Some(self.suppressed.swap(0, Ordering::AcqRel))
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
 }
 
 impl Metrics {
@@ -278,7 +343,32 @@ impl Metrics {
             version: version.into(),
             models: RwLock::new(Vec::new()),
             restarts: AtomicU64::new(0),
+            rejected_overloaded: AtomicU64::new(0),
+            inflight_limit: AtomicUsize::new(0),
+            overload_log: LogThrottle::default(),
+            inflight: AtomicUsize::new(0),
         }
+    }
+
+    /// Admit one more detection request when fewer than `limit` are in flight; `None` when the
+    /// server is at its cap (the caller answers 503 and counts it in `rejected_overloaded`).
+    pub fn try_begin_detection(self: &Arc<Self>, limit: usize) -> Option<InflightPermit> {
+        self.inflight
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < limit).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| InflightPermit(self.clone()))
+    }
+
+    /// Detection requests being handled now.
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Acquire)
+    }
+
+    /// Milliseconds since the process started (the clock of [`LogThrottle::allow`]).
+    pub fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// The entry for `name` (keyed by [`crate::registry::normalize_name`]), created on first use
@@ -340,6 +430,23 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         "{PREFIX}restarts_total {}",
         m.restarts.load(Ordering::Relaxed)
     );
+
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}requests_rejected_total Detection requests rejected before reaching a model, by reason (overloaded: the server-wide in-flight cap was reached)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}requests_rejected_total counter");
+    let _ = writeln!(
+        out,
+        "{PREFIX}requests_rejected_total{{reason=\"overloaded\"}} {}",
+        m.rejected_overloaded.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}inflight_requests Detection requests being handled now (body read, queue wait, inference)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}inflight_requests gauge");
+    let _ = writeln!(out, "{PREFIX}inflight_requests {}", m.inflight());
 
     let _ = writeln!(
         out,
@@ -486,6 +593,44 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inflight_permits_respect_the_limit() {
+        let m = Arc::new(Metrics::new("0"));
+        let a = m.try_begin_detection(2).expect("first");
+        let b = m.try_begin_detection(2).expect("second");
+        assert!(m.try_begin_detection(2).is_none());
+        assert_eq!(m.inflight(), 2);
+        drop(a);
+        assert_eq!(m.inflight(), 1);
+        let c = m.try_begin_detection(2).expect("slot freed");
+        drop((b, c));
+        assert_eq!(m.inflight(), 0);
+        assert!(m.try_begin_detection(0).is_none());
+    }
+
+    #[test]
+    fn log_throttle_once_per_interval() {
+        let t = LogThrottle::default();
+        let iv = u64::try_from(LOG_THROTTLE_INTERVAL.as_millis()).unwrap();
+        assert_eq!(t.allow(5), Some(0));
+        assert_eq!(t.allow(6), None);
+        assert_eq!(t.allow(5 + iv - 1), None);
+        assert_eq!(t.allow(5 + iv), Some(2));
+        assert_eq!(t.allow(5 + iv + 1), None);
+        assert_eq!(t.allow(5 + 3 * iv), Some(1));
+    }
+
+    #[test]
+    fn prometheus_rejected_and_inflight() {
+        let m = Arc::new(Metrics::new("0"));
+        m.rejected_overloaded.store(3, Ordering::Relaxed);
+        let _p = m.try_begin_detection(5).unwrap();
+        let text = render_prometheus(&m, &[]);
+        assert!(text.contains("blue_onyx_prism_requests_rejected_total{reason=\"overloaded\"} 3"));
+        assert!(text.contains("# TYPE blue_onyx_prism_requests_rejected_total counter"));
+        assert!(text.contains("blue_onyx_prism_inflight_requests 1"));
+    }
 
     #[test]
     fn histogram_basics() {

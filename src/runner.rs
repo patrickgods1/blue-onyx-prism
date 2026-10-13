@@ -140,6 +140,47 @@ impl Generation {
     }
 }
 
+/// The retention sweeper thread ([`crate::retention::spawn_sweeper`]) of one run: cancelled and
+/// joined on drop, so a server that stops for any reason takes it along.
+struct Sweeper {
+    stop: CancellationToken,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Sweeper {
+    fn spawn(store: Arc<crate::config_store::ConfigStore>, shutdown: &CancellationToken) -> Self {
+        let stop = shutdown.child_token();
+        let join = crate::retention::spawn_sweeper(
+            Arc::new(move || {
+                let (_, c) = store.snapshot();
+                crate::retention::SweeperConfig {
+                    save_image_dir: c.save_image_path.as_deref().map(crate::resolve_path),
+                    max_age_days: c.save_image_max_age_days,
+                    max_mb: c.save_image_max_mb,
+                    data_root: c.data_root(),
+                    min_free_mb: crate::retention::MIN_FREE_MB,
+                }
+            }),
+            stop.clone(),
+        );
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for Sweeper {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        if let Some(j) = self.join.take()
+            && j.join().is_err()
+        {
+            warn!("retention sweeper panicked");
+        }
+    }
+}
+
 /// What lives for the whole run (every generation shares it).
 struct Process {
     started: Instant,
@@ -361,6 +402,30 @@ pub fn run_server_with(
     // The listener is bound once and survives generation restarts (a port change in the config
     // applies when the process restarts).
     let listeners = rt.block_on(server::bind(config.bind_address, config.port))?;
+    // systemd `Type=notify`: the listener is up (models compile in the background; `/v1/status`
+    // reports readiness). The watchdog pings while the listener accepts connections, so a hung
+    // process is restarted but a model that compiles for minutes is not.
+    crate::sdnotify::notify("READY=1");
+    {
+        let port = listeners.port();
+        let ip = match config.bind_address {
+            std::net::IpAddr::V4(a) if a.is_unspecified() => std::net::IpAddr::from([127, 0, 0, 1]),
+            std::net::IpAddr::V6(a) if a.is_unspecified() => {
+                std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+            }
+            other => other,
+        };
+        crate::sdnotify::spawn_watchdog(
+            move || {
+                std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::new(ip, port),
+                    Duration::from_secs(5),
+                )
+                .is_ok()
+            },
+            shutdown.clone(),
+        );
+    }
     let process = Process {
         started,
         bound_address: config.bind_address,
@@ -375,6 +440,9 @@ pub fn run_server_with(
         benchmark: crate::benchmark::service::BenchmarkService::new(),
         metrics: Arc::new(Metrics::new(crate::VERSION)),
     };
+    // Disk retention (saved images, free-space warning): one sweeper per process, reading the
+    // current settings on every tick; stopped and joined when this function returns.
+    let _sweeper = Sweeper::spawn(process.store.clone(), &shutdown);
     let mut run = Run {
         rt,
         listeners: Some(listeners),
