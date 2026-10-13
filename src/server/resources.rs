@@ -619,16 +619,21 @@ mod tests {
 
         let (s, _) = post_action(&state, "/v1/models/add", &body).await;
         assert_eq!(s, StatusCode::CONFLICT);
-        // Outside every browsable root (SV-10): refused before the file is looked at.
-        let (s, b) = post_action(&state, "/v1/models/add", "path=%2Fno%2Fsuch.onnx").await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
-        assert!(
-            b["message"]
-                .as_str()
-                .unwrap()
-                .contains("outside the browsable folders"),
-            "{b}"
-        );
+        // Outside every browsable root (SV-10): refused before the file is looked at. (Unix
+        // only: on Windows `/no/such.onnx` is drive-relative, lands under the data root and
+        // every drive is a root of its own.)
+        #[cfg(unix)]
+        {
+            let (s, b) = post_action(&state, "/v1/models/add", "path=%2Fno%2Fsuch.onnx").await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+            assert!(
+                b["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("outside the browsable folders"),
+                "{b}"
+            );
+        }
         let (s, _) = post_action(&state, "/v1/models/add", "path=rf%2Fmissing.onnx").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         let (s, b) = post_action(
