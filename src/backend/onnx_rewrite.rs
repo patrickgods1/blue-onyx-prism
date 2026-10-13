@@ -1275,13 +1275,28 @@ pub fn rewrite_cached(src: &Path, dir: &Path, opts: &RewriteOptions) -> Result<C
     };
     let path = dir.join(cache_file_name(src, &sha256_hex(&bytes)));
     drop(bytes);
-    if std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0) {
-        return Ok(Cached::Rewritten {
-            path,
-            counts: r.counts,
-            skipped: r.skipped,
-            created: false,
-        });
+    // A cache hit is trusted only when its bytes are exactly the rewrite just computed (the
+    // rewrite is deterministic): a file somebody else put at this predictable path, or a
+    // truncated / stale one, is replaced (BE-04).
+    match std::fs::read(&path) {
+        Ok(existing) if existing == r.bytes => {
+            return Ok(Cached::Rewritten {
+                path,
+                counts: r.counts,
+                skipped: r.skipped,
+                created: false,
+            });
+        }
+        Ok(_) => tracing::warn!(
+            "cached CoreML rewrite {} does not match the rewrite of {}; replacing it",
+            path.display(),
+            src.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::debug!(
+            "cached rewrite {} unreadable ({e}); rewriting",
+            path.display()
+        ),
     }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2262,6 +2277,16 @@ mod tests {
             matches!(again, Cached::Rewritten { created: false, path: ref p, .. } if *p == path)
         );
         // No temporary files left behind.
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        // A planted or corrupted file at the cache path is not trusted: it is replaced by the
+        // real rewrite (BE-04).
+        std::fs::write(&path, b"not the rewrite").unwrap();
+        let replaced = rewrite_cached(&src, &cache, &RewriteOptions::COREML).unwrap();
+        assert!(
+            matches!(replaced, Cached::Rewritten { created: true, path: ref p, .. } if *p == path),
+            "{replaced:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), written);
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         // A model with nothing to do is not copied.
         let plain = dir.join("plain.onnx");

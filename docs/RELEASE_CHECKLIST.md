@@ -24,7 +24,11 @@ Releases are built by `.github/workflows/release.yml` (Windows, Linux, macOS arc
 
 4. `git tag X.Y.Z && git push origin X.Y.Z` (plain `X.Y.Z`, no `v` prefix). The workflow builds the
    archives and creates a **draft** release named after the version. `workflow_dispatch` does the
-   same for the `Cargo.toml` version without a tag.
+   same for the `Cargo.toml` version without a tag, and refuses to run once the tag `X.Y.Z` exists
+   (it would build `main` HEAD, not the tagged commit). Any run refuses when release `X.Y.Z` is
+   already published, so published archives and their `.sha256` files are never replaced; to redo
+   a published release, bump the version. Only the final `release` job gets a write token; the
+   build jobs run read-only.
 5. Check the draft: three archives and their `.sha256` files are attached, and the generated release
    notes are sensible.
 

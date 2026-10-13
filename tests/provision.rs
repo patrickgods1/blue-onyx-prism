@@ -5,7 +5,9 @@
 //!
 //! The load test is `#[ignore]`d: it needs `models/IPcam-general.{onnx,yaml}` and `openvino/`
 //! under `common::test_root()` (served by the fixture / used as the runtime); a missing one
-//! fails it.
+//! fails it. Its fixture serves plain `http://` on the loopback address, which the download
+//! manager refuses outside its own `cfg(test)` build; the tests call
+//! `manager::allow_loopback_http_for_tests()` first to opt in for this process.
 
 mod common;
 
@@ -127,6 +129,7 @@ fn config(root: &Path, openvino_dir: Option<PathBuf>) -> Config {
 #[test]
 #[ignore = "needs models/ and the runtime libraries; see tests/common"]
 fn model_download_goes_initializing_to_ready_without_restart() {
+    blue_onyx_prism::resources::manager::allow_loopback_http_for_tests();
     let onnx = common::require_ipcam();
     let yaml = onnx.with_extension("yaml");
     let ov = common::require_openvino();

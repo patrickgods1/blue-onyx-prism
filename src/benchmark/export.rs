@@ -771,28 +771,61 @@ fn grades_section(metric: AccuracyMetric) -> Section {
     }
 }
 
+/// Text for a Markdown heading, paragraph or table title: one line, inline HTML neutralized
+/// and leading block syntax escaped (BM-08: model names, dataset ids and runtime error strings
+/// are not ours).
+fn md_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut first = true;
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' => out.push(' '),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '#' | '*' | '_' | '`' | '[' | '|' | '-' | '+' if first => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+        first = first && c.is_whitespace();
+    }
+    out
+}
+
+/// Text for a Markdown table cell: [`md_text`] plus `\\` and `|` escaped (a `\` before `|`
+/// would otherwise defeat the `\|`).
+fn md_cell(s: &str) -> String {
+    md_text(&s.replace('\\', "\\\\").replace('|', "\\|"))
+}
+
 /// Markdown report.
 pub fn markdown(r: &BenchmarkResults) -> String {
-    let esc = |s: &str| s.replace('|', "\\|").replace('\n', " ");
     let mut out = String::from("# Blue Onyx Prism benchmark report\n\n");
     for s in sections(r) {
-        let _ = writeln!(out, "{} {}\n", "#".repeat(s.level as usize), s.heading);
+        let _ = writeln!(
+            out,
+            "{} {}\n",
+            "#".repeat(s.level as usize),
+            md_text(&s.heading)
+        );
         for p in &s.paragraphs {
-            let _ = writeln!(out, "{}\n", p);
+            let _ = writeln!(out, "{}\n", md_text(p));
         }
         for t in &s.tables {
             if t.rows.is_empty() {
                 continue;
             }
             if !t.title.is_empty() {
-                let _ = writeln!(out, "**{}**\n", t.title);
+                let _ = writeln!(out, "**{}**\n", md_text(&t.title));
             }
             let _ = writeln!(
                 out,
                 "| {} |",
                 t.head
                     .iter()
-                    .map(|h| esc(h))
+                    .map(|h| md_cell(h))
                     .collect::<Vec<_>>()
                     .join(" | ")
             );
@@ -801,7 +834,10 @@ pub fn markdown(r: &BenchmarkResults) -> String {
                 let _ = writeln!(
                     out,
                     "| {} |",
-                    row.iter().map(|c| esc(c)).collect::<Vec<_>>().join(" | ")
+                    row.iter()
+                        .map(|c| md_cell(c))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
                 );
             }
             out.push('\n');
@@ -890,8 +926,15 @@ mod tests {
             .with_sets(&[super::super::images::ImageSet::sample()]);
         let md = markdown(&r);
         assert!(md.starts_with("# Blue Onyx Prism benchmark report"));
-        assert!(md.contains("## <b>m</b>"));
+        assert!(md.contains("## &lt;b&gt;m&lt;/b&gt;"), "{md}");
+        assert!(!md.contains("<b>"), "{md}");
         assert!(md.contains("Not benchmarked: file | missing"));
+        // BM-08: block syntax, inline HTML and newlines in untrusted text are neutralized.
+        assert_eq!(md_text("# a\nb <c> & d"), "\\# a b &lt;c&gt; &amp; d");
+        assert_eq!(md_text("  * list"), "  \\* list");
+        assert_eq!(md_text("plain * mid"), "plain * mid");
+        assert_eq!(md_cell("a \\| b"), "a \\\\\\| b");
+        assert_eq!(md_cell("| x"), "\\| x");
         assert!(md.contains("| sample (Embedded sample"), "{md}");
         assert!(md.contains("How grades are computed"));
         let h = html(&r);

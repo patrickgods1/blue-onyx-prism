@@ -1,6 +1,10 @@
 //! `GET /v1/fs/browse`: a read-only, server-side file browser for the Config page's
 //! "Add a model by path" form. Lists folders plus model (`.onnx`/`.xml`) or classes
-//! (`.yaml`/`.yml`) files only, so the unauthenticated page discloses as little as possible.
+//! (`.yaml`/`.yml`) files only, and only inside the roots the page offers ([`roots`]: the
+//! data root, the models and download directories, the user's home and, on Windows, the
+//! drives), so the unauthenticated page discloses as little as possible (SV-10). A path is
+//! canonicalized first, so a symlink that leaves every root is refused like any other outside
+//! path; [`allowed_path`] is the same check for "Add a model by path".
 
 use super::AppState;
 use crate::config::Config;
@@ -83,6 +87,13 @@ pub(super) struct BrowseError {
     message: String,
 }
 
+impl BrowseError {
+    /// Status and message, for answers rendered elsewhere.
+    pub(super) fn into_parts(self) -> (StatusCode, String) {
+        (self.status, self.message)
+    }
+}
+
 impl IntoResponse for BrowseError {
     fn into_response(self) -> Response {
         (
@@ -133,23 +144,24 @@ fn human_size(n: u64) -> String {
     format!("{v:.1} {}", UNITS.get(i).copied().unwrap_or_default())
 }
 
-fn roots(cfg: &Config) -> Vec<Root> {
-    let mut out: Vec<Root> = Vec::new();
+/// The browsable roots (label, canonical path), which are also the only places a listing or
+/// an added model may come from.
+fn roots(cfg: &Config) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
     let mut add = |label: &str, p: PathBuf| {
-        if let Ok(c) = p.canonicalize() {
-            let path = display(&c);
-            if !out.iter().any(|r| r.path == path) {
-                out.push(Root {
-                    label: label.to_string(),
-                    path,
-                });
-            }
+        if let Ok(c) = p.canonicalize()
+            && !out.iter().any(|(_, r)| *r == c)
+        {
+            out.push((label.to_string(), c));
         }
     };
     add("Data root", cfg.data_root());
     let models = cfg.data_path(&cfg.models_dir);
     if models.is_dir() {
         add("Models", models);
+    }
+    if let Some(d) = &cfg.download_dir {
+        add("Downloads", crate::resolve_path(d));
     }
     for var in ["HOME", "USERPROFILE"] {
         if let Some(h) = std::env::var_os(var).map(PathBuf::from)
@@ -166,30 +178,71 @@ fn roots(cfg: &Config) -> Vec<Root> {
             add(&format!("{}:\\", letter as char), d);
         }
     }
-    #[cfg(not(windows))]
-    {
-        add("/", PathBuf::from("/"));
-        #[cfg(target_os = "macos")]
-        if Path::new("/Volumes").is_dir() {
-            add("/Volumes", PathBuf::from("/Volumes"));
-        }
-    }
     out
 }
 
-fn io_error(path: &Path, e: &std::io::Error) -> BrowseError {
+fn root_views(roots: &[(String, PathBuf)]) -> Vec<Root> {
+    roots
+        .iter()
+        .map(|(label, p)| Root {
+            label: label.clone(),
+            path: display(p),
+        })
+        .collect()
+}
+
+/// Lexically inside one of `roots` (the canonical roots, or the data root as configured).
+fn inside_any(p: &Path, roots: &[(String, PathBuf)], cfg: &Config) -> bool {
+    roots.iter().any(|(_, r)| p.starts_with(r)) || p.starts_with(cfg.data_root())
+}
+
+/// The canonical path of `raw` (quotes trimmed; relative to the data root) when it exists
+/// and lies inside one of [`roots`]; 400 for bad syntax, 404 when it does not exist inside a
+/// root, 403 otherwise (including a symlink whose target leaves every root). Error messages
+/// repeat what the client sent, not the resolved path.
+pub(super) fn allowed_path(cfg: &Config, raw: &str) -> Result<PathBuf, BrowseError> {
+    let raw = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    crate::config::check_path_syntax("path", raw).map_err(|e| BrowseError {
+        status: StatusCode::BAD_REQUEST,
+        message: e.to_string(),
+    })?;
+    let roots = roots(cfg);
+    let start = cfg.data_path(Path::new(raw));
+    let outside = || BrowseError {
+        status: StatusCode::FORBIDDEN,
+        message: format!(
+            "{raw} is outside the browsable folders ({})",
+            roots
+                .iter()
+                .map(|(_, r)| display(r))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    if !inside_any(&start, &roots, cfg) {
+        return Err(outside());
+    }
+    let canon = start.canonicalize().map_err(|e| io_error(raw, &e))?;
+    if !inside_any(&canon, &roots, cfg) {
+        return Err(outside());
+    }
+    Ok(canon)
+}
+
+/// `shown` is what the client asked for (never a path the server resolved).
+fn io_error(shown: &str, e: &std::io::Error) -> BrowseError {
     match e.kind() {
         std::io::ErrorKind::NotFound => BrowseError {
             status: StatusCode::NOT_FOUND,
-            message: format!("not found: {}", path.display()),
+            message: format!("not found: {shown}"),
         },
         std::io::ErrorKind::PermissionDenied => BrowseError {
             status: StatusCode::FORBIDDEN,
-            message: format!("permission denied: {}", path.display()),
+            message: format!("permission denied: {shown}"),
         },
         _ => BrowseError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("cannot read {}: {e}", path.display()),
+            message: format!("cannot read {shown}: {}", e.kind()),
         },
     }
 }
@@ -207,13 +260,15 @@ pub(super) fn list(
     let raw = path
         .map(|p| p.trim().trim_matches(|c| c == '"' || c == '\'').trim())
         .unwrap_or("");
-    let start = if raw.is_empty() {
+    let canon = if raw.is_empty() {
         let m = cfg.data_path(&cfg.models_dir);
-        if m.is_dir() { m } else { cfg.data_root() }
+        let start = if m.is_dir() { m } else { cfg.data_root() };
+        start
+            .canonicalize()
+            .map_err(|e| io_error(&display(&start), &e))?
     } else {
-        cfg.data_path(Path::new(raw))
+        allowed_path(cfg, raw)?
     };
-    let canon = start.canonicalize().map_err(|e| io_error(&start, &e))?;
     let (dir, selected) = if canon.is_dir() {
         (canon, None)
     } else {
@@ -223,7 +278,12 @@ pub(super) fn list(
             None => (canon, None),
         }
     };
-    let rd = std::fs::read_dir(&dir).map_err(|e| io_error(&dir, &e))?;
+    let shown = if raw.is_empty() {
+        display(&dir)
+    } else {
+        raw.to_string()
+    };
+    let rd = std::fs::read_dir(&dir).map_err(|e| io_error(&shown, &e))?;
     let mut dirs: Vec<Entry> = Vec::new();
     let mut files: Vec<Entry> = Vec::new();
     let mut truncated = false;
@@ -264,7 +324,7 @@ pub(super) fn list(
         path: display(&dir),
         parent: dir.parent().map(display),
         selected,
-        roots: roots(cfg),
+        roots: root_views(&roots(cfg)),
         entries: dirs,
         truncated,
     })
@@ -373,15 +433,99 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_root_has_no_parent() {
-        let (_root, cfg) = setup();
-        let top = std::env::current_dir()
-            .unwrap()
-            .ancestors()
-            .last()
-            .unwrap()
-            .to_path_buf();
-        let l = list(&cfg, Some(&top.to_string_lossy()), None).unwrap();
-        assert!(l.parent.is_none());
+    fn data_root_lists_with_its_parent_hidden_from_browsing() {
+        let (root, cfg) = setup();
+        let l = list(&cfg, Some(&root.to_string_lossy()), None).unwrap();
+        assert_eq!(l.path, display(&root));
+        assert!(l.roots.iter().all(|r| r.label != "/"), "{:?}", l.roots);
+        // The parent of a root is outside every root.
+        let parent = root.parent().unwrap();
+        let e = list(&cfg, Some(&parent.to_string_lossy()), None).unwrap_err();
+        assert_eq!(e.status, StatusCode::FORBIDDEN);
+        assert!(
+            e.message.contains("outside the browsable folders"),
+            "{}",
+            e.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn outside_paths_are_refused() {
+        let (root, cfg) = setup();
+        let top = root.ancestors().last().unwrap().to_path_buf();
+        for p in [
+            top.to_string_lossy().to_string(),
+            "/etc".into(),
+            "/no/such/dir".into(),
+        ] {
+            let e = list(&cfg, Some(&p), None).unwrap_err();
+            assert_eq!(e.status, StatusCode::FORBIDDEN, "{p}: {}", e.message);
+            // The resolved absolute path of the server is not in the message.
+            assert!(!e.message.contains("not found"), "{p}: {}", e.message);
+        }
+        // Missing inside a root: 404, naming only what was asked for.
+        let e = list(&cfg, Some("models/zzz"), None).unwrap_err();
+        assert_eq!(e.status, StatusCode::NOT_FOUND);
+        assert_eq!(e.message, "not found: models/zzz");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_a_root_is_refused() {
+        let (root, cfg) = setup();
+        let other = std::env::temp_dir().join(format!("bop-browse-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("m.onnx"), b"x").unwrap();
+        std::os::unix::fs::symlink(&other, root.join("models/link")).unwrap();
+        let e = list(&cfg, Some("models/link"), None).unwrap_err();
+        assert_eq!(e.status, StatusCode::FORBIDDEN, "{}", e.message);
+        let e = allowed_path(&cfg, "models/link/m.onnx").unwrap_err();
+        assert_eq!(e.status, StatusCode::FORBIDDEN);
+        // A symlink inside the root is fine.
+        std::os::unix::fs::symlink(root.join("models/adir"), root.join("models/inner")).unwrap();
+        assert!(list(&cfg, Some("models/inner"), None).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn bad_path_syntax_is_rejected() {
+        let (root, cfg) = setup();
+        for (p, needle) in [
+            (r"\\?\C:\x".to_string(), "verbatim"),
+            (r"\\server\share".to_string(), "UNC"),
+            ("C:models".to_string(), "drive-relative"),
+            ("models/\u{0}".to_string(), "NUL"),
+            ("x".repeat(300), "component"),
+            (format!("models/{}", "a/".repeat(2100)), "longer than"),
+            ("models/../etc".to_string(), "'..'"),
+        ] {
+            let e = list(&cfg, Some(&p), None).unwrap_err();
+            assert_eq!(e.status, StatusCode::BAD_REQUEST, "{needle}: {}", e.message);
+            assert!(e.message.contains(needle), "{needle}: {}", e.message);
+            let e = allowed_path(&cfg, &p).unwrap_err();
+            assert_eq!(e.status, StatusCode::BAD_REQUEST, "{needle}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn allowed_path_canonicalizes_inside_roots() {
+        let (root, cfg) = setup();
+        assert_eq!(
+            allowed_path(&cfg, " \"models/a.xml\" ").unwrap(),
+            root.join("models/a.xml")
+        );
+        assert_eq!(
+            allowed_path(&cfg, &root.join("models").to_string_lossy()).unwrap(),
+            root.join("models")
+        );
+        assert_eq!(
+            allowed_path(&cfg, "models/nope.onnx").unwrap_err().status,
+            StatusCode::NOT_FOUND
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

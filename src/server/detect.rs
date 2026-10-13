@@ -103,12 +103,27 @@ pub(super) async fn detection_custom(
     // Read the upload first, as in [`detection_default`].
     let req = parse_detection_body(multipart).await.map(|(r, _)| r);
     let Some(handle) = state.registry.by_name(&model) else {
-        warn!("request for unknown model '{model}'");
+        // Client-chosen text: shortened and debug-escaped before it reaches the log.
+        warn!(model = ?short(&model), "request for unknown model");
         let mut r = VisionDetectionResponse::error(format!("Unknown model '{model}'"));
         r.command = "custom".into();
         return Json(r);
     };
     Json(run_detection(&state, &handle, req, start, "custom").await)
+}
+
+/// Longest client-chosen name written to the log.
+const LOG_NAME_CHARS: usize = 64;
+
+/// `s` cut to [`LOG_NAME_CHARS`] characters (with an ellipsis) for the log.
+fn short(s: &str) -> String {
+    let mut it = s.chars();
+    let head: String = it.by_ref().take(LOG_NAME_CHARS).collect();
+    if it.next().is_some() {
+        format!("{head}\u{2026}")
+    } else {
+        head
+    }
 }
 
 pub(super) async fn run_detection(

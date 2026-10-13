@@ -89,7 +89,7 @@ raw-cpuid = "11"
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 tracing-layer-win-eventlog = "1"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_LibraryLoader"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_LibraryLoader", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 approx = "0.5"

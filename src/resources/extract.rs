@@ -1,10 +1,26 @@
 //! Whitelist-only extraction of downloaded archives, shared by the download manager and the
 //! `setup-*` commands. Dispatches on the catalog [`Layout`] of each part.
 //!
-//! Archive entries are untrusted data: only whitelisted file names are written, to destination
-//! paths built from our own whitelist (never taken verbatim from the entry path), links are
-//! only recreated when both ends are same-directory whitelisted files, and nothing from an
-//! archive is executed.
+//! # Trust model
+//!
+//! An archive reaches this module only after the download manager checked it against the
+//! catalog pin (`https://` URL, exact size, SHA-256; see `super::manager`), or when the user
+//! passed a local archive to a `setup-*` command. Its entries are still treated as untrusted
+//! data:
+//! - only whitelisted file names are written, to destination paths built from our own
+//!   whitelist (never taken verbatim from the entry path);
+//! - an entry whose path is absolute (`/x`, `C:/x`, `\\x`) or has a `..` component fails the
+//!   whole extraction, even when it is not whitelisted; a wanted entry carrying the setuid or
+//!   setgid bit fails it too;
+//! - symlinks and hard links are only recreated (as same-directory links) when both ends are
+//!   whitelisted files in the same directory, and never followed when writing;
+//! - decompressed data is counted while streaming (never trusted from headers), against
+//!   [`MAX_ENTRY_BYTES`] per file and [`MAX_TOTAL_BYTES`] per archive;
+//! - every archive is extracted into a staging directory (`super::manager::run_job`) that is
+//!   renamed into place only after every entry passed and the install was checked
+//!   ([`finalize`]); a failure removes the staging directory;
+//! - nothing from an archive is executed here. The `uv` binary and the DEIMv2 sources are run
+//!   only by a model export the user starts explicitly (`super::export`).
 //!
 //! Layouts:
 //! - [`Layout::OpenVino`]: the toolkit's `runtime/...` libraries, layout preserved (what
@@ -39,6 +55,124 @@ impl Target<'_> {
     }
 }
 
+/// Most decompressed bytes one extracted file may have (4 GiB). The largest real entry is a
+/// cuDNN engine library of about 1 GiB.
+pub const MAX_ENTRY_BYTES: u64 = 4 << 30;
+/// Most decompressed bytes one archive may produce in total (8 GiB). The largest real archive
+/// (the cuDNN wheel) extracts to about 1.5 GiB of whitelisted libraries.
+pub const MAX_TOTAL_BYTES: u64 = 8 << 30;
+
+/// Decompressed-size ceilings of one extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Per extracted file.
+    pub entry_bytes: u64,
+    /// Over every extracted file of the archive.
+    pub total_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            entry_bytes: MAX_ENTRY_BYTES,
+            total_bytes: MAX_TOTAL_BYTES,
+        }
+    }
+}
+
+/// Bytes written so far against [`Limits`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Budget {
+    limits: Limits,
+    used: u64,
+}
+
+/// An archive exceeded a decompressed-size ceiling.
+#[derive(Debug, thiserror::Error)]
+#[error("{entry}: extracted data exceeds {limit} bytes ({what}); the archive is refused")]
+pub struct OverLimit {
+    pub entry: String,
+    pub limit: u64,
+    pub what: &'static str,
+}
+
+/// An archive entry whose path or mode is not acceptable.
+#[derive(Debug, thiserror::Error)]
+#[error("archive entry {entry:?} is refused: {why}")]
+pub struct HostileEntry {
+    pub entry: String,
+    pub why: &'static str,
+}
+
+impl Budget {
+    fn new(limits: Limits) -> Self {
+        Self { limits, used: 0 }
+    }
+
+    /// Bytes one more entry may still write: the smaller of the per-file ceiling and what is
+    /// left of the total.
+    fn allowance(&self) -> u64 {
+        self.limits
+            .entry_bytes
+            .min(self.limits.total_bytes.saturating_sub(self.used))
+    }
+
+    fn over(&self, entry: &str) -> OverLimit {
+        if self.limits.total_bytes.saturating_sub(self.used) < self.limits.entry_bytes {
+            OverLimit {
+                entry: entry.to_string(),
+                limit: self.limits.total_bytes,
+                what: "archive total",
+            }
+        } else {
+            OverLimit {
+                entry: entry.to_string(),
+                limit: self.limits.entry_bytes,
+                what: "per file",
+            }
+        }
+    }
+}
+
+/// Refuse an entry path that is absolute or climbs out of the archive, whatever the
+/// whitelist says about it: a real release archive never has one.
+fn check_entry_path(entry: &str) -> Result<()> {
+    let e = entry.replace('\\', "/");
+    let why = if e.starts_with('/') {
+        Some("absolute path")
+    } else if e
+        .split('/')
+        .next()
+        .is_some_and(|first| first.len() == 2 && first.ends_with(':'))
+    {
+        Some("absolute path (drive letter)")
+    } else if e.split('/').any(|p| p == "..") {
+        Some("`..` path component")
+    } else {
+        None
+    };
+    match why {
+        Some(why) => Err(anyhow::Error::new(HostileEntry {
+            entry: entry.to_string(),
+            why,
+        })),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a wanted file with the setuid or setgid bit. (Entry modes are never applied to
+/// written files anyway; `uv` is made 0o755 explicitly. The zip reader strips these bits
+/// before they reach us, so this bites on tar headers.)
+fn check_entry_mode(entry: &str, mode: Option<u32>) -> Result<()> {
+    if mode.is_some_and(|m| m & 0o6000 != 0) {
+        return Err(anyhow::Error::new(HostileEntry {
+            entry: entry.to_string(),
+            why: "setuid/setgid bit set",
+        }));
+    }
+    Ok(())
+}
+
 /// Extract the whitelisted entries of one downloaded `archive` (a part with `layout`) into
 /// `dest`. Returns the written paths relative to `dest` (`/`-separated).
 pub fn extract_part(
@@ -49,9 +183,32 @@ pub fn extract_part(
     target: Target<'_>,
     dest: &Path,
 ) -> Result<BTreeSet<String>> {
+    extract_part_with(
+        archive,
+        kind,
+        layout,
+        flavor,
+        target,
+        dest,
+        Limits::default(),
+    )
+}
+
+/// [`extract_part`] with explicit decompressed-size [`Limits`].
+pub fn extract_part_with(
+    archive: &Path,
+    kind: ArchiveKind,
+    layout: Layout,
+    flavor: Option<Flavor>,
+    target: Target<'_>,
+    dest: &Path,
+    limits: Limits,
+) -> Result<BTreeSet<String>> {
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let windows = target.windows();
     let flavor = flavor.unwrap_or(Flavor::Cpu);
+    let mut budget = Budget::new(limits);
+    let b = &mut budget;
     match layout {
         Layout::OpenVino => {
             let sel = selection_for(target.os)?;
@@ -62,8 +219,8 @@ pub fn extract_part(
                 Some(format!("{dir}/{name}"))
             };
             match kind {
-                ArchiveKind::Zip => extract_zip(archive, dest, wanted),
-                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, link),
+                ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
+                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, link, b),
             }
         }
         Layout::OrtRelease | Layout::NugetOrt | Layout::NugetDirectMl => {
@@ -76,27 +233,27 @@ pub fn extract_part(
                     .then_some(tn)
             };
             match kind {
-                ArchiveKind::Zip => extract_zip(archive, dest, wanted),
-                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, link),
+                ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
+                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, link, b),
             }
         }
         Layout::NvidiaWheel => {
             let wanted = |e: &str| wheel_wanted(windows, e);
             match kind {
-                ArchiveKind::Zip => extract_zip(archive, dest, wanted),
-                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, |_, _, _| None),
+                ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
+                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, |_, _, _| None, b),
             }
         }
         Layout::Uv => {
             let wanted = |e: &str| uv_wanted(windows, e);
             match kind {
-                ArchiveKind::Zip => extract_zip(archive, dest, wanted),
-                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, |_, _, _| None),
+                ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
+                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, |_, _, _| None, b),
             }
         }
         Layout::SourceTree => match kind {
-            ArchiveKind::Zip => extract_zip(archive, dest, source_wanted),
-            ArchiveKind::TarGz => extract_tgz(archive, dest, source_wanted, |_, _, _| None),
+            ArchiveKind::Zip => extract_zip(archive, dest, source_wanted, b),
+            ArchiveKind::TarGz => extract_tgz(archive, dest, source_wanted, |_, _, _| None, b),
         },
         Layout::File => anyhow::bail!("{} is not an archive", archive.display()),
     }
@@ -274,8 +431,15 @@ pub(crate) fn same_dir_link_target(rel: &str, target: &str, hard: bool) -> Optio
     Some(name)
 }
 
-/// Write `reader` to `dest/rel` through a `.partial` file.
-pub(crate) fn write_entry(dest: &Path, rel: &str, reader: &mut dyn Read) -> Result<u64> {
+/// Write `reader` to `dest/rel` through a `.partial` file, counting the bytes against
+/// `budget` while streaming (the archive's own size fields are not trusted). An entry that
+/// goes over the allowance is removed and fails with [`OverLimit`].
+pub(crate) fn write_entry(
+    dest: &Path,
+    rel: &str,
+    reader: &mut dyn Read,
+    budget: &mut Budget,
+) -> Result<u64> {
     let out = dest.join(rel);
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)
@@ -284,7 +448,25 @@ pub(crate) fn write_entry(dest: &Path, rel: &str, reader: &mut dyn Read) -> Resu
     let tmp = out.with_extension("partial");
     let mut f =
         std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    let n = std::io::copy(reader, &mut f).with_context(|| format!("writing {}", out.display()))?;
+    let allowance = budget.allowance();
+    // One byte more than allowed: reaching it proves the entry is too large.
+    let mut capped = reader.take(allowance.saturating_add(1));
+    let n =
+        std::io::copy(&mut capped, &mut f).with_context(|| format!("writing {}", out.display()));
+    let n = match n {
+        Ok(n) if n <= allowance => n,
+        Ok(_) => {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow::Error::new(budget.over(rel)));
+        }
+        Err(e) => {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    budget.used = budget.used.saturating_add(n);
     f.flush()?;
     drop(f);
     if out.symlink_metadata().is_ok() {
@@ -308,11 +490,13 @@ fn components(entry: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
-/// Zip driver: regular files whose name `wanted` maps to a destination path.
+/// Zip driver: regular files whose name `wanted` maps to a destination path. Symlink entries
+/// are never recreated (no zip in the catalog has any); directories are implied by the files.
 fn extract_zip(
     archive: &Path,
     dest: &Path,
     wanted: impl Fn(&str) -> Option<String>,
+    budget: &mut Budget,
 ) -> Result<BTreeSet<String>> {
     let file = std::fs::File::open(archive)
         .with_context(|| format!("opening archive {}", archive.display()))?;
@@ -326,24 +510,27 @@ fn extract_zip(
             let meta = zip
                 .by_index_data(i)
                 .with_context(|| format!("reading zip entry #{i} of {}", archive.display()))?;
-            if meta.is_dir() || meta.is_symlink() {
-                continue;
-            }
             let name = meta.name().with_context(|| {
                 format!(
                     "reading the name of zip entry #{i} of {}",
                     archive.display()
                 )
             })?;
+            check_entry_path(&name)?;
+            if meta.is_dir() || meta.is_symlink() {
+                continue;
+            }
             let Some(rel) = wanted(&name) else {
                 continue;
             };
+            check_entry_mode(&name, meta.unix_mode())?;
             (name.into_owned(), rel)
         };
         let mut entry = zip
             .by_index(i)
             .with_context(|| format!("opening zip entry #{i} ({name}) of {}", archive.display()))?;
-        write_entry(dest, &rel, &mut entry).with_context(|| format!("extracting {name}"))?;
+        write_entry(dest, &rel, &mut entry, budget)
+            .with_context(|| format!("extracting {name}"))?;
         got.insert(rel);
     }
     Ok(got)
@@ -356,6 +543,7 @@ fn extract_tgz(
     dest: &Path,
     wanted: impl Fn(&str) -> Option<String>,
     link: impl Fn(&str, &str, bool) -> Option<String>,
+    budget: &mut Budget,
 ) -> Result<BTreeSet<String>> {
     let file = std::fs::File::open(archive)
         .with_context(|| format!("opening archive {}", archive.display()))?;
@@ -370,7 +558,12 @@ fn extract_tgz(
     {
         let mut entry =
             entry.with_context(|| format!("reading tar entry in {}", archive.display()))?;
+        // `Entry::path` already refuses `..` and absolute paths on GNU/ustar headers; the
+        // raw bytes are checked too so a PAX `path` record cannot sidestep that.
+        let raw = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+        check_entry_path(&raw)?;
         let path = entry.path()?.to_string_lossy().into_owned();
+        check_entry_path(&path)?;
         let Some(rel) = wanted(&path) else {
             continue;
         };
@@ -388,7 +581,9 @@ fn extract_tgz(
         if !ty.is_file() {
             continue;
         }
-        write_entry(dest, &rel, &mut entry).with_context(|| format!("extracting {path}"))?;
+        check_entry_mode(&path, entry.header().mode().ok())?;
+        write_entry(dest, &rel, &mut entry, budget)
+            .with_context(|| format!("extracting {path}"))?;
         got.insert(rel);
     }
     // Resolve link chains (a -> b -> real file) by repeated passes.
@@ -1272,13 +1467,20 @@ mod tests {
         }
         let dest = dir.join("out");
         std::fs::create_dir_all(&dest).unwrap();
-        let got = extract_zip(&archive, &dest, |name| {
-            assert!(!name.ends_with('/'), "directory entry offered: {name}");
-            name.strip_prefix("lib/")
-                .filter(|n| n.ends_with(".bin"))
-                .map(str::to_string)
-        })
+        let mut budget = Budget::new(Limits::default());
+        let got = extract_zip(
+            &archive,
+            &dest,
+            |name| {
+                assert!(!name.ends_with('/'), "directory entry offered: {name}");
+                name.strip_prefix("lib/")
+                    .filter(|n| n.ends_with(".bin"))
+                    .map(str::to_string)
+            },
+            &mut budget,
+        )
         .unwrap();
+        assert_eq!(budget.used, 4);
         assert_eq!(got, BTreeSet::from(["keep.bin".to_string()]));
         assert_eq!(std::fs::read(dest.join("keep.bin")).unwrap(), b"keep");
         assert!(!dest.join("skip.txt").exists());
@@ -1312,7 +1514,7 @@ mod tests {
                 ("nvidia/cudnn/include/cudnn.h", b"h"),
                 ("nvidia/cufft/lib/libcufft.so.11", b"fft"),
                 ("nvidia/curand/lib/libcurand.so.10", b"rand"),
-                ("nvidia/../evil/lib/libevil.so.1", b"x"),
+                ("nvidia/evil/include/libevil.so.1", b"x"),
             ],
         );
         let dest = dir.join("cuda-libs");
@@ -1613,5 +1815,366 @@ mod tests {
         assert!(dest.join("VERSION").is_file());
         let mut empty = BTreeSet::new();
         assert!(finalize(src, src.version, t, &dir.join("none"), &mut empty).is_err());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Refusals: crafted archives
+    // -----------------------------------------------------------------------------------------
+
+    /// A tar.gz built from `entries`: (path, kind, data or link target, mode).
+    enum TarEntry<'a> {
+        File(&'a str, &'a [u8], u32),
+        Symlink(&'a str, &'a str),
+        Hardlink(&'a str, &'a str),
+    }
+
+    fn tgz_with(path: &Path, entries: &[TarEntry<'_>]) {
+        let f = std::fs::File::create(path).unwrap();
+        let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        for e in entries {
+            let mut h = tar::Header::new_gnu();
+            match e {
+                TarEntry::File(name, data, mode) => {
+                    h.set_size(data.len() as u64);
+                    h.set_mode(*mode);
+                    // `set_path` refuses `..` and absolute names; a crafted archive has
+                    // them in the raw header, so write the bytes directly.
+                    let field = &mut h.as_gnu_mut().unwrap().name;
+                    field[..name.len()].copy_from_slice(name.as_bytes());
+                    h.set_cksum();
+                    tar.append(&h, *data).unwrap();
+                }
+                TarEntry::Symlink(name, target) => {
+                    h.set_entry_type(tar::EntryType::Symlink);
+                    h.set_size(0);
+                    h.set_mode(0o777);
+                    tar.append_link(&mut h, name, target).unwrap();
+                }
+                TarEntry::Hardlink(name, target) => {
+                    h.set_entry_type(tar::EntryType::Link);
+                    h.set_size(0);
+                    h.set_mode(0o644);
+                    tar.append_link(&mut h, name, target).unwrap();
+                }
+            }
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    /// The zip writer normalises `..` and absolute names away, so a crafted name is written
+    /// with a same-length placeholder (`..` -> `ZZ`, leading `/` -> `Z`) and patched into
+    /// the local header and the central directory afterwards (the CRC covers data only).
+    fn zip_with_modes(path: &Path, entries: &[(&str, &[u8], Option<u32>)]) {
+        let placeholder = |n: &str| {
+            n.replace("..", "ZZ")
+                .replacen('/', "Z", usize::from(n.starts_with('/')))
+        };
+        {
+            let f = std::fs::File::create(path).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            for (name, data, mode) in entries {
+                let mut o = zip::write::SimpleFileOptions::default();
+                if let Some(m) = mode {
+                    // `unix_permissions` masks to 0o777; the raw attributes keep the file
+                    // type and setuid/setgid bits.
+                    o = o.system(zip::System::Unix).external_attributes(m << 16);
+                }
+                z.start_file(placeholder(name), o).unwrap();
+                z.write_all(data).unwrap();
+            }
+            z.finish().unwrap();
+        }
+        let mut bytes = std::fs::read(path).unwrap();
+        for (name, _, _) in entries {
+            let from = placeholder(name);
+            if from == *name {
+                continue;
+            }
+            let mut at = 0;
+            while let Some(i) = bytes[at..]
+                .windows(from.len())
+                .position(|w| w == from.as_bytes())
+            {
+                bytes[at + i..at + i + from.len()].copy_from_slice(name.as_bytes());
+                at += i + from.len();
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    const LINUX: Target<'static> = Target {
+        os: "linux",
+        arch: "x86_64",
+    };
+
+    fn ort_tgz(archive: &Path, dest: &Path, limits: Limits) -> Result<BTreeSet<String>> {
+        extract_part_with(
+            archive,
+            ArchiveKind::TarGz,
+            Layout::OrtRelease,
+            Some(Flavor::Cpu),
+            LINUX,
+            dest,
+            limits,
+        )
+    }
+
+    fn wheel_zip(archive: &Path, dest: &Path, limits: Limits) -> Result<BTreeSet<String>> {
+        extract_part_with(
+            archive,
+            ArchiveKind::Zip,
+            Layout::NvidiaWheel,
+            None,
+            LINUX,
+            dest,
+            limits,
+        )
+    }
+
+    fn refused(r: Result<BTreeSet<String>>, why: &str) {
+        let err = r.expect_err("the archive must be refused");
+        let text = format!("{err:#}");
+        assert!(text.contains(why), "expected {why:?} in: {text}");
+    }
+
+    #[test]
+    fn hostile_paths_are_refused() {
+        for (entry, why) in [
+            ("/etc/passwd", "absolute path"),
+            ("C:/Windows/evil.dll", "drive letter"),
+            ("lib/../../x", "`..`"),
+            ("..", "`..`"),
+            ("nvidia/..\\evil/lib/libevil.so.1", "`..`"),
+        ] {
+            assert!(
+                format!("{}", check_entry_path(entry).unwrap_err()).contains(why),
+                "{entry}"
+            );
+        }
+        assert!(check_entry_path("ort-1/lib/libonnxruntime.so").is_ok());
+        assert!(check_entry_path("./lib/x").is_ok());
+        assert!(check_entry_path("a..b/c...").is_ok());
+        assert!(check_entry_mode("x", Some(0o755)).is_ok());
+        assert!(check_entry_mode("x", None).is_ok());
+        assert!(check_entry_mode("x", Some(0o4755)).is_err());
+        assert!(check_entry_mode("x", Some(0o2644)).is_err());
+    }
+
+    #[test]
+    fn tgz_refuses_dotdot_absolute_and_setuid_entries() {
+        let dir = TempDir::new("tgz-refuse");
+        let good = TarEntry::File("ort-1/lib/libonnxruntime.so", b"lib", 0o644);
+        // `..` in any entry, wanted or not, fails the whole archive and leaves nothing.
+        let a = dir.join("dotdot.tgz");
+        tgz_with(
+            &a,
+            &[
+                good,
+                TarEntry::File("ort-1/lib/../../evil.txt", b"x", 0o644),
+            ],
+        );
+        let dest = dir.join("dotdot");
+        refused(ort_tgz(&a, &dest, Limits::default()), "`..`");
+        assert!(!dir.join("evil.txt").exists());
+        // Absolute path.
+        let a = dir.join("abs.tgz");
+        tgz_with(&a, &[TarEntry::File("/tmp/evil.txt", b"x", 0o644)]);
+        refused(ort_tgz(&a, &dir.join("abs"), Limits::default()), "absolute");
+        // setuid / setgid on a wanted file.
+        for (name, mode) in [("suid.tgz", 0o4755), ("sgid.tgz", 0o2755)] {
+            let a = dir.join(name);
+            tgz_with(
+                &a,
+                &[TarEntry::File("ort-1/lib/libonnxruntime.so", b"lib", mode)],
+            );
+            let dest = dir.join(format!("{name}.out"));
+            refused(ort_tgz(&a, &dest, Limits::default()), "setuid/setgid");
+            assert!(!dest.join("libonnxruntime.so").exists());
+        }
+        // A plain archive still extracts, with the mode ignored.
+        let a = dir.join("ok.tgz");
+        tgz_with(
+            &a,
+            &[TarEntry::File("ort-1/lib/libonnxruntime.so", b"lib", 0o755)],
+        );
+        assert_eq!(
+            ort_tgz(&a, &dir.join("ok"), Limits::default()).unwrap(),
+            set(&["libonnxruntime.so"])
+        );
+    }
+
+    #[test]
+    fn tgz_links_outside_the_whitelist_are_not_created() {
+        let dir = TempDir::new("tgz-links");
+        let a = dir.join("links.tgz");
+        tgz_with(
+            &a,
+            &[
+                TarEntry::File("ort-1/lib/libonnxruntime.so.1", b"lib", 0o644),
+                // Symlink out of the tree, symlink to an absolute path.
+                TarEntry::Symlink("ort-1/lib/libonnxruntime.so", "../../../etc/passwd"),
+                TarEntry::Symlink(
+                    "ort-1/lib/libonnxruntime_providers_shared.so",
+                    "/etc/passwd",
+                ),
+                // Hard link to a file in another directory of the archive.
+                TarEntry::Hardlink(
+                    "ort-1/lib/libonnxruntime_providers_cuda.so",
+                    "ort-1/include/onnxruntime_c_api.h",
+                ),
+            ],
+        );
+        let dest = dir.join("out");
+        let got = ort_tgz(&a, &dest, Limits::default()).unwrap();
+        assert_eq!(got, set(&["libonnxruntime.so.1"]));
+        for no in [
+            "libonnxruntime.so",
+            "libonnxruntime_providers_shared.so",
+            "libonnxruntime_providers_cuda.so",
+        ] {
+            assert!(dest.join(no).symlink_metadata().is_err(), "{no}");
+        }
+        // A same-directory link to a whitelisted file is fine.
+        let a = dir.join("ok.tgz");
+        tgz_with(
+            &a,
+            &[
+                TarEntry::File("ort-1/lib/libonnxruntime.so.1", b"lib", 0o644),
+                TarEntry::Symlink("ort-1/lib/libonnxruntime.so", "libonnxruntime.so.1"),
+                TarEntry::Hardlink(
+                    "ort-1/lib/libonnxruntime_providers_shared.so",
+                    "ort-1/lib/libonnxruntime.so.1",
+                ),
+            ],
+        );
+        let dest = dir.join("ok");
+        let got = ort_tgz(&a, &dest, Limits::default()).unwrap();
+        // The symlink is recreated; the flat ORT layout never recreates hard links (only the
+        // OpenVINO layout maps them, within one directory).
+        assert_eq!(got, set(&["libonnxruntime.so", "libonnxruntime.so.1"]));
+        assert_eq!(
+            std::fs::read(dest.join("libonnxruntime.so")).unwrap(),
+            b"lib"
+        );
+        assert!(
+            dest.join("libonnxruntime_providers_shared.so")
+                .symlink_metadata()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn zip_refuses_dotdot_absolute_and_setuid_entries() {
+        let dir = TempDir::new("zip-refuse");
+        let good: (&str, &[u8], Option<u32>) =
+            ("nvidia/cudnn/lib/libcudnn.so.9", b"cudnn", Some(0o644));
+        let a = dir.join("dotdot.whl");
+        zip_with_modes(&a, &[good, ("nvidia/../evil/lib/libevil.so.1", b"x", None)]);
+        let dest = dir.join("dotdot");
+        refused(wheel_zip(&a, &dest, Limits::default()), "`..`");
+        assert!(!dest.join("libcudnn.so.9").exists() || !dir.join("evil").exists());
+        let a = dir.join("abs.whl");
+        zip_with_modes(&a, &[("/nvidia/cudnn/lib/libcudnn.so.9", b"x", None)]);
+        refused(
+            wheel_zip(&a, &dir.join("abs"), Limits::default()),
+            "absolute",
+        );
+        let a = dir.join("suid.whl");
+        zip_with_modes(
+            &a,
+            &[("nvidia/cudnn/lib/libcudnn.so.9", b"x", Some(0o4755))],
+        );
+        // The zip reader itself strips the special bits from `unix_mode()`, and no entry
+        // mode is ever applied to a written file: the file lands as a plain file.
+        let dest = dir.join("suid");
+        assert_eq!(
+            wheel_zip(&a, &dest, Limits::default()).unwrap(),
+            set(&["libcudnn.so.9"])
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dest.join("libcudnn.so.9"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o6000, 0, "{mode:o}");
+        }
+        // An unwanted entry's mode does not matter; a symlink entry is skipped.
+        let a = dir.join("ok.whl");
+        zip_with_modes(
+            &a,
+            &[
+                good,
+                ("nvidia/cudnn/include/tool", b"x", Some(0o4755)),
+                (
+                    "nvidia/cudnn/lib/libcudnn_link.so.9",
+                    b"libcudnn.so.9",
+                    Some(0o120777),
+                ),
+            ],
+        );
+        let dest = dir.join("ok");
+        assert_eq!(
+            wheel_zip(&a, &dest, Limits::default()).unwrap(),
+            set(&["libcudnn.so.9"])
+        );
+        assert!(dest.join("libcudnn_link.so.9").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn decompressed_size_ceilings_are_enforced_while_streaming() {
+        let dir = TempDir::new("limits");
+        let big = vec![0u8; 10_000];
+        let small = Limits {
+            entry_bytes: 4_000,
+            total_bytes: 1 << 20,
+        };
+        // Per-file ceiling, tar.gz: the file is removed and nothing is installed.
+        let a = dir.join("big.tgz");
+        tgz_with(
+            &a,
+            &[TarEntry::File("ort-1/lib/libonnxruntime.so", &big, 0o644)],
+        );
+        let dest = dir.join("tgz");
+        refused(ort_tgz(&a, &dest, small), "per file");
+        assert!(std::fs::read_dir(&dest).unwrap().next().is_none());
+        // Per-file ceiling, zip, with a header that lies (the zip writer stores the real
+        // size; the check counts bytes while streaming regardless).
+        let a = dir.join("big.whl");
+        zip_with_modes(&a, &[("nvidia/cudnn/lib/libcudnn.so.9", &big, None)]);
+        refused(wheel_zip(&a, &dir.join("zip"), small), "per file");
+        // Exactly the ceiling is fine.
+        let exact = Limits {
+            entry_bytes: big.len() as u64,
+            total_bytes: 1 << 20,
+        };
+        assert_eq!(
+            wheel_zip(&a, &dir.join("exact"), exact).unwrap(),
+            set(&["libcudnn.so.9"])
+        );
+        // Total ceiling across files.
+        let a = dir.join("many.whl");
+        zip_with_modes(
+            &a,
+            &[
+                ("nvidia/cudnn/lib/libcudnn.so.9", &big, None),
+                ("nvidia/cublas/lib/libcublas.so.12", &big, None),
+                ("nvidia/cufft/lib/libcufft.so.11", &big, None),
+            ],
+        );
+        let total = Limits {
+            entry_bytes: 1 << 20,
+            total_bytes: 25_000,
+        };
+        refused(wheel_zip(&a, &dir.join("total"), total), "archive total");
+        let roomy = Limits {
+            entry_bytes: 1 << 20,
+            total_bytes: 30_000,
+        };
+        assert_eq!(wheel_zip(&a, &dir.join("roomy"), roomy).unwrap().len(), 3);
+        // The defaults are generous enough for every pinned archive.
+        const { assert!(MAX_ENTRY_BYTES >= 2 << 30 && MAX_TOTAL_BYTES >= MAX_ENTRY_BYTES) };
     }
 }

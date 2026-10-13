@@ -3,10 +3,13 @@
 //! All appliers are atomic (the config is untouched on error) and validate through
 //! [`crate::config::validate_config`] / [`crate::config::validate_models`].
 
-use crate::config::{Config, check_threshold, round_threshold, thr, validate_config};
+use crate::config::{
+    Config, check_threshold, round_threshold, thr, validate_config, validate_dir_setting,
+};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::PathBuf;
+use tracing::warn;
 
 /// Fields edited by the main `/config` web form, besides `models_json` (the `models` array as
 /// JSON). `default_model` and the per-model `enabled` flags are owned by the Models card
@@ -41,7 +44,10 @@ pub const FORM_FIELDS: &[&str] = &[
 
 /// Apply a submitted `/config` form to `config`. All fields are validated first; on any error
 /// `config` is left untouched. Text fields that are absent keep their current value; empty
-/// optional paths / `default_model` become `None`.
+/// optional paths / `default_model` become `None`. The directory settings
+/// (`save_image_path`, `log_path`, `cache_dir`) go through
+/// [`crate::config::validate_dir_setting`] (stored absolute; relative ones under the data
+/// root), and a change of one is logged at warn level: it moves where the service writes.
 pub fn apply_config_form(
     config: &mut Config,
     form: &std::collections::HashMap<String, String>,
@@ -49,6 +55,24 @@ pub fn apply_config_form(
     let mut c = config.clone();
     parse_config_form(&mut c, form)?;
     validate_config(&c)?;
+    let show = |p: &Option<PathBuf>| {
+        p.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".into())
+    };
+    for (key, from, to) in [
+        (
+            "save_image_path",
+            show(&config.save_image_path),
+            show(&c.save_image_path),
+        ),
+        ("log_path", show(&config.log_path), show(&c.log_path)),
+        ("cache_dir", config.cache_dir.clone(), c.cache_dir.clone()),
+    ] {
+        if from != to {
+            warn!(key, %from, %to, "directory setting changed by a config form");
+        }
+    }
     *config = c;
     Ok(())
 }
@@ -69,7 +93,10 @@ pub fn parse_config_form(
     let checkbox = |k: &str| {
         get(k).is_some_and(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "0"))
     };
-    let opt_path = |v: &str| (!v.is_empty()).then(|| PathBuf::from(v));
+    // Directory settings: syntax-checked, relative ones resolved under the data root, system
+    // directories refused (SV-03). `download_dir` is not a form field, so the root is fixed.
+    let data_root = c.data_root();
+    let dir = |key: &str, v: &str| validate_dir_setting(key, v, &data_root);
 
     if let Some(v) = get("port") {
         c.port = num("port", v)?;
@@ -109,7 +136,9 @@ pub fn parse_config_form(
         c.force_cpu = checkbox("force_cpu");
     }
     if let Some(v) = get("cache_dir") {
-        c.cache_dir = v.to_string();
+        c.cache_dir = dir("cache_dir", v)?
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
     }
     for (field, slot) in [
         ("confidence_threshold", &mut c.confidence_threshold),
@@ -133,10 +162,10 @@ pub fn parse_config_form(
         c.log_level = v.parse().map_err(|e| anyhow::anyhow!("log_level: {e}"))?;
     }
     if let Some(v) = get("log_path") {
-        c.log_path = opt_path(v);
+        c.log_path = dir("log_path", v)?;
     }
     if let Some(v) = get("save_image_path") {
-        c.save_image_path = opt_path(v);
+        c.save_image_path = dir("save_image_path", v)?;
     }
     if form.contains_key("image_settings") {
         c.save_ref_image = checkbox("save_ref_image");
@@ -529,7 +558,8 @@ mod tests {
         assert_eq!(c.nms_iou, 0.6);
         assert_eq!(c.object_filter, vec!["person", "car", "dog"]);
         assert_eq!(c.log_level, LogLevel::Debug);
-        assert_eq!(c.log_path, Some(PathBuf::from("logs")));
+        // Relative directory settings are stored resolved under the data root.
+        assert_eq!(c.log_path, Some(c.data_root().join("logs")));
         assert_eq!(c.save_image_path, None);
         assert!(c.save_ref_image);
         assert_eq!(c.intra_threads, 4);
@@ -621,6 +651,16 @@ mod tests {
             ),
             ("default_model", "nope", "default_model"),
             ("bind_address", "localhost", "bind_address"),
+            ("save_image_path", "/etc/cron.d", "system directory"),
+            (
+                "save_image_path",
+                "C:\\Windows\\System32",
+                "system directory",
+            ),
+            ("log_path", "../../x", "'..'"),
+            ("log_path", "\\\\server\\share", "UNC"),
+            ("cache_dir", "C:cache", "drive-relative"),
+            ("cache_dir", "a\u{0}b", "NUL"),
         ];
         for (field, value, needle) in cases {
             let mut c = original.clone();
@@ -639,6 +679,36 @@ mod tests {
             );
             assert_eq!(c, original, "{field}={value} must not modify the config");
         }
+    }
+
+    #[test]
+    fn directory_settings_are_resolved_under_the_data_root() {
+        let mut c = with_model();
+        c.download_dir = Some(PathBuf::from("/srv/prism"));
+        apply_config_form(
+            &mut c,
+            &form(&[
+                ("cache_dir", "cache"),
+                ("log_path", " \"logs\" "),
+                ("save_image_path", "/var/lib/prism/shots/"),
+            ]),
+        )
+        .unwrap();
+        let root = PathBuf::from("/srv/prism");
+        assert_eq!(c.cache_dir, root.join("cache").display().to_string());
+        assert_eq!(c.log_path, Some(root.join("logs")));
+        assert_eq!(
+            c.save_image_path,
+            Some(PathBuf::from("/var/lib/prism/shots/"))
+        );
+        // Empty clears the optional ones and disables the cache.
+        apply_config_form(
+            &mut c,
+            &form(&[("cache_dir", ""), ("log_path", ""), ("save_image_path", "")]),
+        )
+        .unwrap();
+        assert_eq!(c.cache_dir, "");
+        assert_eq!((c.log_path, c.save_image_path), (None, None));
     }
 
     #[test]

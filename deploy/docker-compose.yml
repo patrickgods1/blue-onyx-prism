@@ -9,7 +9,15 @@ services:
     container_name: blue-onyx-prism
     restart: unless-stopped
     ports:
-      - "32168:32168"
+      # Default: this host only. Inside Docker every client (the host's browser too) arrives from
+      # the bridge network, never loopback, so the admin pages answer 403 until
+      # `"allow_remote_admin": true` is set in config/blue_onyx_prism_config.json; with this line
+      # that still reaches only this host (or an SSH tunnel to it).
+      - "127.0.0.1:32168:32168"
+      # Blue Iris on another machine: use this line instead. allow_remote_admin then opens the
+      # admin pages to the whole LAN: keep it false and edit the config file in ./config (then
+      # `docker compose restart`), or turn it on only while you use the web UI. See README, Docker.
+      # - "32168:32168"
     devices:
       - /dev/dri:/dev/dri
     # Numeric GID of the host's `render` group (`getent group render | cut -d: -f3`); group names

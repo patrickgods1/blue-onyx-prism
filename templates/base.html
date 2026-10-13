@@ -19,6 +19,7 @@
     <a href="/config"{% if nav == "config" %} class="active" aria-current="page"{% endif %}>Config</a>
     <a href="/logs"{% if nav == "logs" %} class="active" aria-current="page"{% endif %}>Logs</a>
   </nav>
+  <span id="live-status" class="live-status" role="status" hidden></span>
   <span id="pending-restart" class="pending-restart" hidden><a href="/config#models"></a> <button type="button" class="small danger" data-restart>Restart</button></span>
 </header>
 <script src="/static/live.js?v={{ version }}"></script>

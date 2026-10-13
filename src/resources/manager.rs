@@ -21,7 +21,19 @@
 //! [`ManagerOptions::on_progress`] hook (CLI progress bars) and, for terminal states, as an
 //! [`Event`] to every [`Manager::subscribe`]r (the registry in phase 7.3).
 //!
-//! Only `https://` URLs are fetched (plus `http://` to the loopback address, used by tests).
+//! # Trust model
+//!
+//! Everything downloadable is pinned in `super::catalog` (reviewed commits only): an `https://`
+//! URL, the exact size and the SHA-256 of every file. The client refuses any other scheme for
+//! the first URL and for every redirect hop (at most [`MAX_REDIRECTS`]); `http://` to the
+//! loopback address is accepted only in the crate's own test build, for the local fixture
+//! server. A response is failed, permanently, as soon as its `Content-Length` / `Content-Range`
+//! or the running byte count disagrees with the pinned size, so a swapped file never costs more
+//! than one attempt; a resumed download (`Range`) is hashed as a whole file again. A size or
+//! hash mismatch deletes the file and is not retried automatically. Nothing downloaded is
+//! executed by this module: archives go through the whitelist in [`super::extract`] into a
+//! staging directory that is swapped into place only after every entry passed; model files are
+//! read by the inference runtimes.
 
 use super::catalog::{ArchiveKind, Layout, Resource, ResourceKind};
 use super::extract::{self, Target};
@@ -186,14 +198,34 @@ pub struct HashMismatch {
     pub actual: String,
 }
 
-/// Retry this error later? Hash mismatches and refused URLs are permanent.
+/// The server offers a file of another size than the pinned one (not retried automatically):
+/// the pin is stale or the URL was swapped; retrying would only download it again.
+#[derive(Debug, thiserror::Error)]
+#[error("size mismatch for {file}: the server offers {offered} bytes, pinned {expected}")]
+pub struct SizeMismatch {
+    pub file: String,
+    pub expected: u64,
+    /// What the server offered, or `>expected` when the body simply kept coming.
+    pub offered: String,
+}
+
+/// Retry this error later? Hash and size mismatches and refused URLs are permanent.
 fn retryable(e: &anyhow::Error) -> bool {
-    !(e.downcast_ref::<HashMismatch>().is_some() || e.downcast_ref::<UrlRefused>().is_some())
+    !(e.downcast_ref::<HashMismatch>().is_some()
+        || e.downcast_ref::<SizeMismatch>().is_some()
+        || e.downcast_ref::<UrlRefused>().is_some()
+        || e.chain().any(|c| {
+            c.downcast_ref::<reqwest::Error>()
+                .is_some_and(|r| r.is_redirect())
+        }))
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("refusing to download {0}: only https URLs are allowed")]
 struct UrlRefused(String);
+
+/// Most redirect hops followed for one download (GitHub and Hugging Face use one or two).
+pub const MAX_REDIRECTS: usize = 5;
 
 // ---------------------------------------------------------------------------------------------
 // Jobs, status, events
@@ -771,20 +803,66 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
     }
 }
 
+/// `http://` to the loopback address is accepted only in the crate's own test build (the
+/// fixture server of the unit tests) or after [`allow_loopback_http_for_tests`]; otherwise the
+/// client is HTTPS-only.
+static LOOPBACK_HTTP_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(cfg!(test));
+
+fn loopback_http_allowed() -> bool {
+    LOOPBACK_HTTP_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Accept plain `http://127.0.0.1:*` / `http://localhost:*` download URLs for the rest of the
+/// process. Only for integration tests with a loopback fixture server; no config or CLI path
+/// reaches it. Must be called before the first download.
+pub fn allow_loopback_http_for_tests() {
+    LOOPBACK_HTTP_ALLOWED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The download client: HTTPS only (plus loopback `http://` under `cfg(test)`), the same
+/// rule applied to every redirect target, at most [`MAX_REDIRECTS`] hops.
 fn http_client() -> Result<reqwest::Client> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        // `previous` holds the initial URL and every hop so far.
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error(RedirectRefused::TooMany);
+        }
+        let next = attempt.url().to_string();
+        if url_allowed(&next) {
+            attempt.follow()
+        } else {
+            attempt.error(RedirectRefused::Scheme(next))
+        }
+    });
     reqwest::Client::builder()
         .user_agent(concat!("blue-onyx-prism/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(60))
+        .https_only(!loopback_http_allowed())
+        .redirect(policy)
         .build()
         .context("creating HTTP client")
 }
 
+/// Why a redirect was not followed (wrapped in a `reqwest::Error` that `is_redirect()`).
+#[derive(Debug, thiserror::Error)]
+enum RedirectRefused {
+    #[error("redirect to {0} refused: only https URLs are allowed")]
+    Scheme(String),
+    #[error("too many redirects (more than {MAX_REDIRECTS})")]
+    TooMany,
+}
+
+/// `https://`, or `http://` to the loopback address when [`loopback_http_allowed`].
+fn url_allowed(url: &str) -> bool {
+    url.starts_with("https://")
+        || (loopback_http_allowed()
+            && (url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:")))
+}
+
 fn check_url(url: &str) -> Result<()> {
-    let ok = url.starts_with("https://")
-        || url.starts_with("http://127.0.0.1:")
-        || url.starts_with("http://localhost:");
-    if ok {
+    if url_allowed(url) {
         Ok(())
     } else {
         Err(anyhow!(UrlRefused(url.to_string())))
@@ -1115,8 +1193,36 @@ fn verify(path: &Path, part: &super::catalog::Part) -> Result<()> {
     Ok(())
 }
 
+/// Total size from a `Content-Range: bytes a-b/total` header, when stated.
+fn content_range(resp: &reqwest::Response) -> Option<(u64, u64)> {
+    let v = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?;
+    let v = v.strip_prefix("bytes ")?;
+    let (range, total) = v.split_once('/')?;
+    let start = range.split('-').next()?.parse::<u64>().ok()?;
+    let total = total.parse::<u64>().ok()?;
+    Some((start, total))
+}
+
+fn size_mismatch(part: &super::catalog::Part, offered: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!(SizeMismatch {
+        file: part.file_name.to_string(),
+        expected: part.size,
+        offered: offered.to_string(),
+    })
+}
+
 /// Stream `part` into `partial`, resuming from its current length with a `Range` request.
 /// `progress` gets the bytes of this part on disk.
+///
+/// The response is checked against the pinned size before and while streaming: a
+/// `Content-Length` (or `Content-Range` total) that disagrees with it, or a body that keeps
+/// coming past it, is a permanent [`SizeMismatch`] (the `.partial` is deleted). A body that
+/// stops short is an interrupted transfer, resumed on the next attempt; the whole file is
+/// hashed by [`verify`] afterwards, resumed or not.
 async fn download_part(
     client: &reqwest::Client,
     part: &super::catalog::Part,
@@ -1142,19 +1248,22 @@ async fn download_part(
         .send()
         .await
         .with_context(|| format!("GET {}", part.url))?;
+    if !url_allowed(resp.url().as_str()) {
+        bail!(UrlRefused(resp.url().to_string()));
+    }
     let status = resp.status();
     let append = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        // Only append when the server resumed exactly where we are.
-        let start = resp
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("bytes "))
-            .and_then(|v| v.split('-').next())
-            .and_then(|v| v.parse::<u64>().ok());
-        if start != Some(have) {
+        // Only append when the server resumed exactly where we are, in a file of the
+        // pinned size.
+        let (start, total) = content_range(&resp)
+            .with_context(|| format!("GET {}: 206 without a usable Content-Range", part.url))?;
+        if total != part.size {
+            std::fs::remove_file(partial).ok();
+            return Err(size_mismatch(part, total));
+        }
+        if start != have {
             bail!(
-                "GET {}: server resumed at {start:?}, expected {have}",
+                "GET {}: server resumed at {start}, expected {have}",
                 part.url
             );
         }
@@ -1169,6 +1278,14 @@ async fn download_part(
     };
     if !append {
         have = 0;
+    }
+    // The announced body must be exactly what is still missing (when it is announced at all:
+    // chunked responses have no Content-Length and are checked by the running count).
+    if let Some(len) = resp.content_length()
+        && len != part.size - have
+    {
+        std::fs::remove_file(partial).ok();
+        return Err(size_mismatch(part, have + len));
     }
     if let Some(parent) = partial.parent() {
         std::fs::create_dir_all(parent)
@@ -1188,15 +1305,11 @@ async fn download_part(
             bail!("cancelled");
         }
         let chunk = chunk.with_context(|| format!("downloading {}", part.url))?;
-        have += chunk.len() as u64;
+        have = have.saturating_add(chunk.len() as u64);
         if have > part.size {
             drop(f);
             std::fs::remove_file(partial).ok();
-            bail!(
-                "{} is larger than the pinned {} bytes; the file was deleted",
-                part.url,
-                part.size
-            );
+            return Err(size_mismatch(part, format!(">{}", part.size)));
         }
         f.write_all(&chunk)
             .with_context(|| format!("writing {}", partial.display()))?;
@@ -1285,9 +1398,26 @@ mod tests {
             .collect()
     }
 
-    /// Minimal HTTP/1.1 file server: honors `Range: bytes=N-`; when `cut_first` is set, the
-    /// first full response is cut off after half the body (to exercise resume). Counts
-    /// requests and ranged requests.
+    /// How the fixture server misbehaves.
+    #[derive(Default, Clone)]
+    struct Mode {
+        /// Cut the first full response off after half the body (to exercise resume).
+        cut_first: bool,
+        /// Answer the first request with a 302 to this location.
+        redirect_first: Option<String>,
+        /// Serve a ranged request from this body instead (a file that changed upstream).
+        ranged_body: Option<Vec<u8>>,
+        /// Send this many extra bytes after the body, announced in `Content-Length`.
+        extra_announced: usize,
+        /// Send this many extra bytes after the body, not announced.
+        extra_silent: usize,
+        /// No `Content-Length` at all (body until the connection closes), so only the running
+        /// byte count can catch an oversize body.
+        no_length: bool,
+    }
+
+    /// Minimal HTTP/1.1 file server: honors `Range: bytes=N-`, misbehaves per [`Mode`].
+    /// Counts requests and ranged requests.
     struct Server {
         url: String,
         requests: Arc<AtomicUsize>,
@@ -1295,6 +1425,16 @@ mod tests {
     }
 
     fn serve(body: Vec<u8>, cut_first: bool) -> Server {
+        serve_with(
+            body,
+            Mode {
+                cut_first,
+                ..Mode::default()
+            },
+        )
+    }
+
+    fn serve_with(body: Vec<u8>, mode: Mode) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
@@ -1313,6 +1453,16 @@ mod tests {
                 }
                 let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
                 let n = rq.fetch_add(1, Ordering::SeqCst);
+                if n == 0
+                    && let Some(loc) = &mode.redirect_first
+                {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.flush();
+                    continue;
+                }
                 let start = head
                     .lines()
                     .find_map(|l| l.strip_prefix("range: bytes="))
@@ -1320,29 +1470,36 @@ mod tests {
                 let (status, slice, extra) = match start {
                     Some(st) => {
                         rg.fetch_add(1, Ordering::SeqCst);
+                        let src = mode.ranged_body.as_deref().unwrap_or(&body);
                         (
                             "206 Partial Content",
-                            &body[st..],
+                            &src[st.min(src.len())..],
                             format!(
                                 "Content-Range: bytes {st}-{}/{}\r\n",
-                                body.len() - 1,
-                                body.len()
+                                src.len().saturating_sub(1),
+                                src.len()
                             ),
                         )
                     }
                     None => ("200 OK", &body[..], String::new()),
                 };
+                let length = if mode.no_length {
+                    String::new()
+                } else {
+                    format!("Content-Length: {}\r\n", slice.len() + mode.extra_announced)
+                };
                 let _ = write!(
                     s,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
-                    slice.len()
+                    "HTTP/1.1 {status}\r\n{length}{extra}Connection: close\r\n\r\n"
                 );
-                let send = if cut_first && n == 0 {
+                let send = if mode.cut_first && n == 0 {
                     &slice[..slice.len() / 2]
                 } else {
                     slice
                 };
                 let _ = s.write_all(send);
+                let pad = vec![0u8; mode.extra_announced + mode.extra_silent];
+                let _ = s.write_all(&pad);
                 let _ = s.flush();
             }
         });
@@ -1504,6 +1661,174 @@ mod tests {
         let e = check_url("http://example.com/x").unwrap_err();
         assert!(!retryable(&e));
         assert!(retryable(&anyhow!("connection reset")));
+    }
+
+    /// Run one job without retries; the final state.
+    fn run_once(res: &'static Resource, root: &Path) -> State {
+        let m = Manager::start(ManagerOptions {
+            retry: true,
+            backoff: |_| Duration::from_millis(10),
+            ..ManagerOptions::new(root)
+        });
+        let key = m.enqueue(Job::into_dir(res, root.join("models")));
+        let st = m.wait(std::slice::from_ref(&key), Some(Duration::from_secs(20)));
+        m.shutdown();
+        st[0].state.clone()
+    }
+
+    fn failed_permanently(state: &State, text: &str) {
+        match state {
+            State::Failed {
+                error, retry_at, ..
+            } => {
+                assert!(error.contains(text), "expected {text:?} in: {error}");
+                assert_eq!(*retry_at, None, "must not be retried: {error}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn nothing_left(root: &Path) {
+        let models = root.join("models");
+        assert!(!models.join("test-model.onnx").exists());
+        assert!(!models.join("test-model.onnx.partial").exists());
+    }
+
+    /// RS-01: a redirect to a non-https host is refused (permanently); one to the loopback
+    /// test server is followed (test build only).
+    #[test]
+    fn redirects_off_https_are_refused() {
+        let data = body();
+        let server = serve_with(
+            data.clone(),
+            Mode {
+                redirect_first: Some("http://example.com/file.bin".into()),
+                ..Mode::default()
+            },
+        );
+        let res = model_resource(&server.url, &data, None);
+        let root = tmp("redirect-http");
+        failed_permanently(&run_once(res, &root), "redirect");
+        nothing_left(&root);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Loopback http is allowed in this build; the final URL is checked too.
+        let target = serve(data.clone(), false);
+        let front = serve_with(
+            Vec::new(),
+            Mode {
+                redirect_first: Some(target.url.clone()),
+                ..Mode::default()
+            },
+        );
+        let res = model_resource(&front.url, &data, None);
+        let root = tmp("redirect-ok");
+        assert_eq!(run_once(res, &root), State::Installed);
+        assert_eq!(target.requests.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(url_allowed("https://x/y") && !url_allowed("http://x/y"));
+        assert!(!url_allowed("ftp://127.0.0.1:1/x"));
+    }
+
+    /// RS-05: a `Content-Length` larger than the pin fails before streaming; a body without
+    /// a length that keeps coming past the pin fails during; neither is retried, nothing
+    /// stays on disk.
+    #[test]
+    fn oversize_bodies_fail_permanently() {
+        let data = body();
+        for mode in [
+            Mode {
+                extra_announced: 100,
+                ..Mode::default()
+            },
+            Mode {
+                extra_silent: 100,
+                no_length: true,
+                ..Mode::default()
+            },
+        ] {
+            let server = serve_with(data.clone(), mode);
+            let res = model_resource(&server.url, &data, None);
+            let root = tmp("oversize");
+            failed_permanently(&run_once(res, &root), "size mismatch");
+            nothing_left(&root);
+            assert_eq!(server.requests.load(Ordering::SeqCst), 1, "no retry");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // A pin smaller than the file: Content-Length catches it before any byte is read.
+        let server = serve(data.clone(), false);
+        let mut part = *model_resource(&server.url, &data, None)
+            .parts
+            .first()
+            .unwrap();
+        part.size = 10;
+        let res: &'static Resource = Box::leak(Box::new(Resource {
+            parts: Box::leak(vec![part].into_boxed_slice()),
+            ..*model_resource(&server.url, &data, None)
+        }));
+        let root = tmp("oversize-pin");
+        failed_permanently(&run_once(res, &root), "size mismatch");
+        nothing_left(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RS-15: a resumed download is hashed as a whole; when the upstream file changed between
+    /// the two halves the stitched file is rejected and deleted (a 206 with another total is
+    /// a size mismatch; the same size with other bytes is a hash mismatch).
+    #[test]
+    fn resumed_download_is_hashed_as_a_whole() {
+        let data = body();
+        let mut other = data.clone();
+        for b in other.iter_mut().skip(data.len() / 2 + 7).take(64) {
+            *b ^= 0xff;
+        }
+        let server = serve_with(
+            data.clone(),
+            Mode {
+                cut_first: true,
+                ranged_body: Some(other),
+                ..Mode::default()
+            },
+        );
+        let res = model_resource(&server.url, &data, None);
+        let root = tmp("resume-hash");
+        failed_permanently(&run_once(res, &root), "hash mismatch");
+        nothing_left(&root);
+        assert_eq!(server.ranged.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Another total in the Content-Range: refused before streaming, partial removed.
+        let mut longer = data.clone();
+        longer.extend_from_slice(&[1u8; 1000]);
+        let server = serve_with(
+            data.clone(),
+            Mode {
+                cut_first: true,
+                ranged_body: Some(longer),
+                ..Mode::default()
+            },
+        );
+        let res = model_resource(&server.url, &data, None);
+        let root = tmp("resume-size");
+        failed_permanently(&run_once(res, &root), "size mismatch");
+        nothing_left(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn content_range_parsing() {
+        let r = |v: &str| {
+            let resp = axum::http::Response::builder()
+                .header("Content-Range", v)
+                .body("")
+                .unwrap();
+            content_range(&reqwest::Response::from(resp))
+        };
+        assert_eq!(r("bytes 100-299/300"), Some((100, 300)));
+        assert_eq!(r("bytes 0-0/*"), None);
+        assert_eq!(r("items 1-2/3"), None);
+        assert_eq!(r("bytes x-2/3"), None);
     }
 
     /// An ONNX Runtime archive from local files: extracted into staging, swapped into place,

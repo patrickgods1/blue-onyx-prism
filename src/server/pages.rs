@@ -13,7 +13,7 @@ use askama::Template;
 use axum::Json;
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Multipart, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
@@ -22,8 +22,36 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-static STYLE_CSS: &str = include_str!("../../assets/style.css");
-static LIVE_JS: &str = include_str!("../../assets/live.js");
+const CSS: &str = "text/css; charset=utf-8";
+const JS: &str = "text/javascript; charset=utf-8";
+
+/// Files served under `/static/<name>`: name, Content-Type, body. Every page script lives here
+/// (the CSP allows `script-src 'self'` only: no inline scripts, handlers or style attributes);
+/// pages pass server values through `data-*` attributes.
+pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
+    ("style.css", CSS, include_str!("../../assets/style.css")),
+    ("live.js", JS, include_str!("../../assets/live.js")),
+    (
+        "benchmark.js",
+        JS,
+        include_str!("../../assets/benchmark.js"),
+    ),
+    ("config.js", JS, include_str!("../../assets/config.js")),
+    ("logs.js", JS, include_str!("../../assets/logs.js")),
+    ("stats.js", JS, include_str!("../../assets/stats.js")),
+    ("test.js", JS, include_str!("../../assets/test.js")),
+    ("welcome.js", JS, include_str!("../../assets/welcome.js")),
+];
+
+/// Body of the static file `name` (`"benchmark.js"`), for tests that check page code.
+#[cfg(test)]
+pub(super) fn static_file(name: &str) -> Option<&'static str> {
+    STATIC_FILES
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, _, body)| *body)
+}
+
 static FAVICON_ICO: &[u8] = include_bytes!("../../assets/favicon.ico");
 
 /// State text for the HTML pages and `/stats`: "Initializing (downloading ...)", "Ready", ...;
@@ -605,28 +633,41 @@ pub(super) async fn logs_json(
 // ---------------------------------------------------------------------------------------------
 // Static assets
 
+/// One entry of [`STATIC_FILES`]; 404 (JSON, like the router's fallback) for any other name.
+fn serve_static(name: &str) -> Response {
+    match STATIC_FILES.iter().find(|(n, _, _)| *n == name) {
+        Some((_, content_type, body)) => (
+            [
+                (header::CONTENT_TYPE, *content_type),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            *body,
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("Not found: /static/{name}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /static/{file}`: the page scripts and the stylesheet.
+pub(super) async fn static_asset(Path(file): Path<String>) -> Response {
+    serve_static(&file)
+}
+
 pub(super) async fn style_css() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
-        ],
-        STYLE_CSS,
-    )
-        .into_response()
+    serve_static("style.css")
 }
 
 /// Shared page script: polls `GET /v1/config` and keeps the header's pending-restart indicator
 /// (and the pages that listen) up to date.
 pub(super) async fn live_js() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
-        ],
-        LIVE_JS,
-    )
-        .into_response()
+    serve_static("live.js")
 }
 
 pub(super) async fn favicon() -> Response {
@@ -636,17 +677,6 @@ pub(super) async fn favicon() -> Response {
             (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         FAVICON_ICO,
-    )
-        .into_response()
-}
-
-pub(super) async fn fallback(uri: axum::http::Uri) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "success": false,
-            "error": format!("Not found: {}", uri.path()),
-        })),
     )
         .into_response()
 }
@@ -700,7 +730,8 @@ mod tests {
         let (s, stats) = get_text(&state, "/stats").await;
         assert_eq!(s, StatusCode::OK);
         assert!(!stats.contains("http-equiv=\"refresh\""));
-        assert!(stats.contains("fetch(\"/stats.json\""));
+        assert!(stats.contains("<script src=\"/static/stats.js?v="));
+        assert!(static_file("stats.js").is_some_and(|js| js.contains("fetch(\"/stats.json\"")));
         assert!(stats.contains("class=\"stats sticky-first\""));
         assert!(stats.contains("ipcam-general") && stats.contains("title=\"CPU\""));
         assert!(!stats.contains("<b>evil</b>"));
@@ -786,6 +817,172 @@ mod tests {
         );
         let (s, _) = get_text(&state, "/nope").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // Every page script and the stylesheet, with its Content-Type and cache policy.
+        for (name, content_type, body) in STATIC_FILES {
+            let (s, h, b) = call(
+                &state,
+                Request::get(format!("/static/{name}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{name}");
+            assert_eq!(h[header::CONTENT_TYPE], *content_type, "{name}");
+            assert_eq!(h[header::CACHE_CONTROL], "public, max-age=3600", "{name}");
+            assert_eq!(b, body.as_bytes(), "{name}");
+            if name.ends_with(".js") {
+                assert!(content_type.starts_with("text/javascript"), "{name}");
+                // Server values come from data-* attributes, never template tags.
+                assert!(!body.contains("{{") && !body.contains("{%"), "{name}");
+            }
+        }
+        for name in [
+            "live.js",
+            "benchmark.js",
+            "config.js",
+            "logs.js",
+            "stats.js",
+            "test.js",
+            "welcome.js",
+        ] {
+            assert!(static_file(name).is_some(), "{name}");
+        }
+        for uri in ["/static/nope.js", "/static/..%2Fsrc%2Fmain.rs"] {
+            let (s, _) = get_text(&state, uri).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// Attribute names of every tag in `html` (quoted values skipped), with the tag text.
+    fn tags(html: &str) -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        let mut rest = html;
+        while let Some(start) = rest.find('<') {
+            let after = &rest[start + 1..];
+            let mut end = after.len();
+            let mut quote: Option<char> = None;
+            for (i, c) in after.char_indices() {
+                match (quote, c) {
+                    (Some(q), c) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, '"' | '\'') => quote = Some(c),
+                    (None, '>') => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let tag = &after[..end];
+            rest = after.get(end + 1..).unwrap_or("");
+            // End tags, comments and the doctype carry no attributes.
+            if tag.starts_with(['/', '!']) {
+                continue;
+            }
+            let mut names = Vec::new();
+            let mut quote: Option<char> = None;
+            let mut word = String::new();
+            for c in tag.chars() {
+                match (quote, c) {
+                    (Some(q), c) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, '"' | '\'') => quote = Some(c),
+                    (None, '=') => {
+                        names.push(std::mem::take(&mut word).to_ascii_lowercase());
+                    }
+                    (None, c) if c.is_whitespace() || c == '/' => {
+                        if !word.is_empty() {
+                            names.push(std::mem::take(&mut word).to_ascii_lowercase());
+                        }
+                    }
+                    (None, c) => word.push(c),
+                }
+            }
+            if !word.is_empty() {
+                names.push(word.to_ascii_lowercase());
+            }
+            out.push((tag.to_string(), names));
+        }
+        out
+    }
+
+    /// The page works under `script-src 'self'; style-src 'self'`: every `<script>` loads a
+    /// file or is a JSON data block, and no tag carries an `on*=` handler or a `style=`.
+    fn assert_csp_clean(page: &str, html: &str) {
+        for (tag, attrs) in tags(html) {
+            // The first word is the element name; the rest are attributes.
+            let (name, attrs) = attrs
+                .split_first()
+                .map_or(("", &[][..]), |(n, a)| (n.as_str(), a));
+            if name == "script" {
+                assert!(
+                    attrs.iter().any(|a| a == "src") || tag.contains("type=\"application/json\""),
+                    "{page}: inline <{tag}>"
+                );
+            }
+            for a in attrs {
+                assert!(
+                    !(a.starts_with("on")
+                        && a.len() > 2
+                        && a[2..].bytes().all(|b| b.is_ascii_lowercase())),
+                    "{page}: handler attribute in <{tag}>"
+                );
+                assert!(a != "style", "{page}: style attribute in <{tag}>");
+            }
+        }
+        // Belt and braces on the raw text.
+        assert!(!html.contains("<script>"), "{page}: inline script");
+        assert!(!html.contains(" style=\""), "{page}: style attribute");
+    }
+
+    #[tokio::test]
+    async fn pages_need_no_inline_script_or_style() {
+        let state = test_state();
+        for page in ["/", "/stats", "/test", "/config", "/logs", "/benchmark"] {
+            let (s, html) = get_text(&state, page).await;
+            assert_eq!(s, StatusCode::OK, "{page}");
+            assert!(html.contains("<script src=\"/static/live.js?v="), "{page}");
+            assert_csp_clean(page, &html);
+        }
+        // A test result page (data: image, JSON in <pre>) and the logs page with capture.
+        let img = crate::image::RgbImage {
+            width: 8,
+            height: 8,
+            rgb: vec![100; 8 * 8 * 3],
+        };
+        let jpeg = crate::image::encode_jpeg(&img, 90).unwrap();
+        let mut req = multipart(&[("image", &jpeg), ("model", b"ipcam-general")]);
+        req.headers_mut()
+            .insert(header::HOST, header::HeaderValue::from_static("127.0.0.1"));
+        let (s, _, b) = call(&state, req).await;
+        let html = String::from_utf8(b).unwrap();
+        assert_eq!(s, StatusCode::OK, "{html}");
+        assert!(html.contains("id=\"server-result\""), "{html}");
+        assert_csp_clean("/test (POST)", &html);
+        let (_, html) = get_text(&logs_state(), "/logs").await;
+        assert!(html.contains("data-capacity=\"2000\""), "{html}");
+        assert_csp_clean("/logs", &html);
+
+        // The restart page passes its values as data attributes, HTML-escaped (SV-16).
+        let html = super::super::config_page::MessageTemplate {
+            nav: "config",
+            version: crate::VERSION,
+            heading: "Restarting".into(),
+            message: "m".into(),
+            refresh_secs: 5,
+            refresh_url: "/config\"></p><script>alert(1)</script>".into(),
+            restarting: true,
+            generation: 7,
+        }
+        .render()
+        .unwrap();
+        assert_csp_clean("message", &html);
+        assert!(html.contains("data-generation=\"7\""), "{html}");
+        assert!(
+            html.contains("data-target=\"/config&#34;&#62;&#60;/p&#62;&#60;script&#62;alert(1)&#60;/script&#62;\""),
+            "{html}"
+        );
     }
 
     #[tokio::test]

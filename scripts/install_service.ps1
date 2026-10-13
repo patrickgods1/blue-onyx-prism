@@ -5,14 +5,25 @@
 .DESCRIPTION
     - Creates the Application event log source "BlueOnyxPrism"
     - Raises ServicesPipeTimeout to 600000 ms so the service has time to compile models on first start
-    - Registers the service (auto start, LocalSystem) pointing at blue-onyx-prism-service.exe
+    - Registers the service (auto start) pointing at blue-onyx-prism-service.exe, running as the
+      virtual account "NT SERVICE\BlueOnyxPrismService" by default (no password, no rights beyond
+      what this script grants)
+    - Resets the install dir ACL: Administrators and SYSTEM full control, Users read and execute.
+      The service account gets Modify only on its data: models, cache, tools, the runtime
+      download dirs (openvino, onnxruntime, .downloads), the service config file and the files it
+      keeps next to it, plus any download_dir / models_dir / cache_dir / save_image_path /
+      log_path the config names. It can create new files in the install dir (staging dirs, the
+      config's temp file) but cannot change the exe or the files shipped with it.
     - Configures automatic restart on failure and a firewall rule for the listening port
 .PARAMETER InstallDir
     Directory containing blue-onyx-prism-service.exe (default: the parent of this script's folder).
 .PARAMETER Port
     TCP port to open in Windows Firewall (default 32168).
 .PARAMETER Account
-    Optional "DOMAIN\user" to run the service as, if GPU access fails under LocalSystem.
+    Account to run the service as. Default: the virtual account NT SERVICE\BlueOnyxPrismService.
+    "LocalSystem" restores the old behavior (full control of the machine; only if GPU access fails
+    under the virtual account). "DOMAIN\user" or ".\user": you are prompted for the password; the
+    account needs the "Log on as a service" right.
 .PARAMETER NoStart
     Do not start the service after installing.
 #>
@@ -27,7 +38,39 @@ $ErrorActionPreference = "Stop"
 $ServiceName = "BlueOnyxPrismService"
 $DisplayName = "Blue Onyx Prism"
 $EventSource = "BlueOnyxPrism"
+$VirtualAccount = "NT SERVICE\$ServiceName"
+$ConfigName = "blue_onyx_prism_config_service.json"
 
+# Run sc.exe and fail on a non-zero exit code (sc.exe never throws on its own; it reports
+# errors on stdout, so stderr is not redirected: under "Stop" Windows PowerShell would throw on
+# the first stderr line before the exit code could be read).
+function Invoke-Sc {
+    $out = & sc.exe @args
+    if ($LASTEXITCODE -ne 0) {
+        throw "sc.exe $($args -join ' ') failed (exit $LASTEXITCODE): $out"
+    }
+}
+
+# Run icacls and fail on a non-zero exit code.
+function Invoke-Icacls {
+    $out = & icacls.exe @args
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls $($args -join ' ') failed (exit $LASTEXITCODE): $out"
+    }
+}
+
+# Stop and delete a service if present; wait until the SCM has really removed it.
+function Remove-ServiceIfPresent([string]$Name) {
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) { return }
+    if ($svc.Status -ne "Stopped") { Stop-Service $Name -Force; Start-Sleep -Seconds 2 }
+    Invoke-Sc delete $Name
+    for ($i = 0; $i -lt 20 -and (Get-Service -Name $Name -ErrorAction SilentlyContinue); $i++) {
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+$InstallDir = (Resolve-Path $InstallDir).Path.TrimEnd('\')
 $exe = Join-Path $InstallDir "blue-onyx-prism-service.exe"
 if (-not (Test-Path $exe)) {
     throw "blue-onyx-prism-service.exe not found in '$InstallDir'. Pass -InstallDir."
@@ -35,6 +78,12 @@ if (-not (Test-Path $exe)) {
 if (-not (Test-Path (Join-Path $InstallDir "openvino"))) {
     Write-Warning "No 'openvino' folder next to the service exe. Run 'blue-onyx-prism setup-openvino' first."
 }
+if ($InstallDir -like "$env:SystemDrive\Users\*") {
+    Write-Warning "The install dir is under a user profile; its ACL is reset to Administrators/SYSTEM full and Users read-only. Prefer e.g. C:\Program Files\BlueOnyxPrism."
+}
+
+$useSystem = $Account -ieq "LocalSystem" -or $Account -ieq "NT AUTHORITY\SYSTEM"
+$runAs = if ($Account -and -not $useSystem) { $Account } elseif ($useSystem) { "LocalSystem" } else { $VirtualAccount }
 
 Write-Host "Creating event log source $EventSource ..."
 try {
@@ -47,34 +96,91 @@ Write-Host "Setting ServicesPipeTimeout to 600000 ms (takes effect after reboot)
 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -Value 600000 -Type DWord
 
 # Pre-rename service (Blue Onyx OpenVINO): remove it so the two don't fight over the port.
-$legacy = Get-Service -Name "BlueOnyxOpenVINOService" -ErrorAction SilentlyContinue
-if ($legacy) {
+if (Get-Service -Name "BlueOnyxOpenVINOService" -ErrorAction SilentlyContinue) {
     Write-Host "Removing the old BlueOnyxOpenVINOService ..."
-    if ($legacy.Status -ne "Stopped") { Stop-Service "BlueOnyxOpenVINOService" -Force; Start-Sleep -Seconds 2 }
-    sc.exe delete "BlueOnyxOpenVINOService" | Out-Null
-    Start-Sleep -Seconds 2
+    Remove-ServiceIfPresent "BlueOnyxOpenVINOService"
 }
-
-$existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($existing) {
+if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "Service already exists; stopping and deleting it first ..."
-    if ($existing.Status -ne "Stopped") { Stop-Service $ServiceName -Force; Start-Sleep -Seconds 2 }
-    sc.exe delete $ServiceName | Out-Null
-    Start-Sleep -Seconds 2
+    Remove-ServiceIfPresent $ServiceName
 }
 
-Write-Host "Registering service $ServiceName ..."
+Write-Host "Registering service $ServiceName (account: $runAs) ..."
 $binPath = "`"$exe`""
-if ($Account) {
-    $cred = Get-Credential -UserName $Account -Message "Password for $Account"
-    $pw = $cred.GetNetworkCredential().Password
-    sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= "$DisplayName" obj= $Account password= $pw | Out-Null
+if ($Account -and -not $useSystem) {
+    # The password goes to the SCM through a credential object, never on a command line.
+    $cred = Get-Credential -UserName $Account -Message "Password for $Account (service logon)"
+    New-Service -Name $ServiceName -BinaryPathName $binPath -DisplayName $DisplayName `
+        -StartupType Automatic -Credential $cred | Out-Null
+    Write-Host "Make sure $Account has the 'Log on as a service' right (secpol.msc > Local Policies > User Rights Assignment)."
 } else {
-    sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= "$DisplayName" obj= LocalSystem | Out-Null
+    Invoke-Sc create $ServiceName binPath= $binPath start= auto DisplayName= $DisplayName obj= LocalSystem
+    if (-not $useSystem) {
+        # Virtual account: created by the SCM for this service, no password.
+        Invoke-Sc config $ServiceName obj= $VirtualAccount
+    }
 }
-sc.exe config $ServiceName type= own | Out-Null
-sc.exe description $ServiceName "Blue Iris / CodeProject.AI compatible object detection (OpenVINO / ONNX Runtime)" | Out-Null
-sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+Invoke-Sc config $ServiceName type= own
+Invoke-Sc description $ServiceName "Blue Iris / CodeProject.AI compatible object detection (OpenVINO / ONNX Runtime)"
+Invoke-Sc failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000
+
+# --- Permissions --------------------------------------------------------------------------------
+# Well-known SIDs, so the script works on non-English Windows.
+$Admins = "*S-1-5-32-544"; $System = "*S-1-5-18"; $Users = "*S-1-5-32-545"; $CreatorOwner = "*S-1-3-0"
+
+Write-Host "Resetting the ACL of $InstallDir (Administrators/SYSTEM full, Users read+execute) ..."
+Invoke-Icacls $InstallDir /inheritance:r /grant:r "${Admins}:(OI)(CI)F" "${System}:(OI)(CI)F" "${Users}:(OI)(CI)RX" /Q
+# Everything below inherits that ACL again (explicit grants from earlier installs are dropped).
+Invoke-Icacls "$InstallDir\*" /reset /T /C /Q
+
+if (-not $useSystem) {
+    $svcAcct = $runAs
+    # The install dir itself: read, plus create files (WD) and folders (AD), this folder only. With
+    # CREATOR OWNER Modify (inherit only), what the service creates (staging dirs, the config's
+    # temp file, .installed.json, .downloads.lock, benchmark.json) stays writable for it, while the
+    # exe and the shipped files remain read-only.
+    Invoke-Icacls $InstallDir /grant "${svcAcct}:(OI)(CI)RX" "${svcAcct}:(WD,AD)" "${CreatorOwner}:(OI)(CI)(IO)M" /Q
+
+    # Data dirs (created when missing) and files: Modify, inherited by everything inside.
+    $dataDirs = [System.Collections.Generic.List[string]]::new()
+    foreach ($d in @("models", "cache", "tools", "openvino", "onnxruntime", ".downloads")) {
+        $dataDirs.Add((Join-Path $InstallDir $d))
+    }
+    # Paths the service config names (relative ones resolve against the install dir; models_dir
+    # against download_dir).
+    $configPath = Join-Path $InstallDir $ConfigName
+    if (Test-Path $configPath) {
+        try {
+            $cfg = Get-Content -Raw $configPath | ConvertFrom-Json
+            $resolve = {
+                param($p, $base)
+                if (-not $p) { return $null }
+                if ([System.IO.Path]::IsPathRooted($p)) { return $p }
+                return (Join-Path $base $p)
+            }
+            $root = & $resolve $cfg.download_dir $InstallDir
+            if (-not $root) { $root = $InstallDir }
+            foreach ($p in @(
+                    (& $resolve $cfg.download_dir $InstallDir),
+                    (& $resolve $cfg.models_dir $root),
+                    (& $resolve $cfg.cache_dir $InstallDir),
+                    (& $resolve $cfg.save_image_path $InstallDir),
+                    (& $resolve $cfg.log_path $InstallDir))) {
+                if ($p) { $dataDirs.Add($p) }
+            }
+        } catch { Write-Warning "Could not read $configPath ($_); grant Modify on its data paths by hand." }
+    }
+    foreach ($d in ($dataDirs | Select-Object -Unique)) {
+        if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        Invoke-Icacls $d /grant "${svcAcct}:(OI)(CI)M" /C /Q
+    }
+    foreach ($f in @($ConfigName, "benchmark.json", ".installed.json", ".downloads.lock")) {
+        $p = Join-Path $InstallDir $f
+        if (Test-Path $p) { Invoke-Icacls $p /grant "${svcAcct}:M" /Q }
+    }
+    Write-Host "Granted $svcAcct Modify on: $(($dataDirs | Select-Object -Unique) -join ', ') and the config file."
+    Write-Host "A save_image_path or log_path added later needs: icacls <dir> /grant `"${svcAcct}:(OI)(CI)M`""
+}
 
 Write-Host "Adding firewall rule for TCP $Port ..."
 $ruleName = "Blue Onyx Prism ($Port)"
@@ -88,8 +194,9 @@ if (-not $NoStart) {
     Start-Sleep -Seconds 3
     Get-Service $ServiceName | Format-Table -AutoSize
     Write-Host "First start compiles the models; watch http://127.0.0.1:$Port/ and the Application event log."
+    Write-Host "If the GPU is not used under $runAs, reinstall with -Account LocalSystem."
 }
 
 Write-Host ""
-Write-Host "Manage with:  net start $ServiceName | net stop $ServiceName | sc.exe delete $ServiceName"
-Write-Host "Config file:  $(Join-Path $InstallDir 'blue_onyx_prism_config_service.json')"
+Write-Host "Manage with:  net start $ServiceName | net stop $ServiceName | .\scripts\uninstall_service.ps1"
+Write-Host "Config file:  $(Join-Path $InstallDir $ConfigName)"

@@ -63,13 +63,33 @@ fn action_response(
     id: &str,
     result: Result<String, crate::resources::actions::ActionError>,
 ) -> Response {
-    if let Err(e) = &result {
-        warn!("resource action refused: {e}");
+    action_outcome(
+        state,
+        headers,
+        id,
+        result.map_err(|e| {
+            (
+                StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+        }),
+    )
+}
+
+/// [`action_response`] with the refusal as a status and message.
+fn action_outcome(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    result: Result<String, (StatusCode, String)>,
+) -> Response {
+    if let Err((status, e)) = &result {
+        warn!(%status, "resource action refused: {e}");
     }
     if wants_html(headers) {
         let (msg, err) = match result {
             Ok(m) => (Some(m), None),
-            Err(e) => (None, Some(e.to_string())),
+            Err((_, e)) => (None, Some(e)),
         };
         // Shown in the resource's row (the form posts to `#resource-<id>`), else at the top of
         // the Resources section (with that anchor) when the row is gone (added, removed).
@@ -91,9 +111,9 @@ fn action_response(
     }
     match result {
         Ok(m) => Json(serde_json::json!({"success": true, "message": m})).into_response(),
-        Err(e) => (
-            StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            Json(serde_json::json!({"success": false, "message": e.to_string()})),
+        Err((status, e)) => (
+            status,
+            Json(serde_json::json!({"success": false, "message": e})),
         )
             .into_response(),
     }
@@ -203,6 +223,24 @@ pub(super) async fn models_add(
             family,
             classes: some(field("classes")),
         });
+        let refused = |e: ActionError| {
+            (
+                StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+            )
+        };
+        // The same root check as the file browser (SV-10): the model and classes files must
+        // lie inside a browsable root; the message names only what the client sent.
+        let req = req.map_err(refused).and_then(|req| {
+            let cfg = state.config_read().clone();
+            for raw in std::iter::once(&req.path).chain(req.classes.iter()) {
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                super::browse::allowed_path(&cfg, raw).map_err(|e| e.into_parts())?;
+            }
+            Ok(req)
+        });
         let result = match req {
             Err(e) => Err(e),
             Ok(req) => {
@@ -215,13 +253,13 @@ pub(super) async fn models_add(
                 match saved {
                     Ok(msg) => Ok(format!("{outcome}. {msg}")),
                     Err(e) => match e.downcast::<ActionError>() {
-                        Ok(a) => Err(a),
-                        Err(e) => Err(ActionError::Failed(format!("{e:#}"))),
+                        Ok(a) => Err(refused(a)),
+                        Err(e) => Err(refused(ActionError::Failed(format!("{e:#}")))),
                     },
                 }
             }
         };
-        action_response(&state, &headers, CUSTOM_MODEL_ROW, result)
+        action_outcome(&state, &headers, CUSTOM_MODEL_ROW, result)
     })
     .await
 }
@@ -581,8 +619,27 @@ mod tests {
 
         let (s, _) = post_action(&state, "/v1/models/add", &body).await;
         assert_eq!(s, StatusCode::CONFLICT);
-        let (s, _) = post_action(&state, "/v1/models/add", "path=%2Fno%2Fsuch.onnx").await;
+        // Outside every browsable root (SV-10): refused before the file is looked at.
+        let (s, b) = post_action(&state, "/v1/models/add", "path=%2Fno%2Fsuch.onnx").await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("outside the browsable folders"),
+            "{b}"
+        );
+        let (s, _) = post_action(&state, "/v1/models/add", "path=rf%2Fmissing.onnx").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, b) = post_action(
+            &state,
+            "/v1/models/add",
+            &format!("path={}&classes=%2Fetc%2Fpasswd", enc(&dir)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        let (s, b) = post_action(&state, "/v1/models/add", "path=..%2Fx.onnx").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
         let (s, b) = post_action(
             &state,
             "/v1/models/add",

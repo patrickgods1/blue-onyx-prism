@@ -436,3 +436,10 @@ details.model > .body > h2, details.model > .body > h3 { margin-top: 0.8rem; }
 
 /* Home facts wrap into a two-column grid on narrow screens. */
 @media (max-width: 600px) { .facts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 1rem; } .facts div { display: flex; flex-direction: column; } }
+
+/* The `hidden` attribute wins over any display rule (the pages toggle it instead of inline styles). */
+[hidden] { display: none !important; }
+/* Header note while /v1/config does not answer (live.js backs off meanwhile). */
+.live-status { margin-left: auto; font-size: 0.85rem; color: var(--warn-fg); background: var(--warn-bg); padding: 0.15rem 0.6rem; border-radius: 6px; }
+.live-status:not([hidden]) + .pending-restart { margin-left: 0.75rem; }
+.restart-banner.gave-up { border-left-color: var(--err-fg); }

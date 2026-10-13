@@ -74,7 +74,7 @@ fn library_version(path: &Path) -> Result<String> {
     // the declared signature in every ONNX Runtime release (C API, `onnxruntime_c_api.h`), the
     // returned struct is static and `GetVersionString` returns a static NUL-terminated string.
     unsafe {
-        let lib = crate::backend::libs::open(path)
+        let lib = crate::backend::libs::open_path(path)
             .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))?;
         let get =
             crate::backend::libs::symbol::<GetApiBase>(&lib, b"OrtGetApiBase\0").map_err(|e| {
@@ -256,29 +256,20 @@ pub(crate) fn cuda_download_hint(os: &str, arch: &str) -> Option<String> {
     ))
 }
 
-/// Whether any of `names` loads (by name: system search path and libraries already preloaded
-/// from `cuda-libs`; or by path from one of `dirs`).
+/// Whether any of `names` loads by absolute path from one of `dirs` (the ONNX Runtime dir,
+/// `cuda-libs`) or from the enumerated system library directories
+/// ([`libs::cuda_search_dirs`]); never by bare name, so the working directory is never
+/// consulted (BE-01). A library that loads stays loaded (see [`libs::probe_cuda_library`]).
 fn any_loadable(names: &[&str], dirs: &[&Path]) -> bool {
-    names.iter().any(|n| {
-        let mut candidates: Vec<PathBuf> = dirs
-            .iter()
-            .map(|d| d.join(n))
-            .filter(|p| p.is_file())
-            .collect();
-        candidates.push(PathBuf::from(n));
-        candidates.iter().any(|p| {
-            // SAFETY: probing NVIDIA runtime libraries (cudart, cuDNN, TensorRT) that the CUDA
-            // execution provider would load itself when a session is created; the handle is
-            // dropped right away and no symbol is used.
-            match unsafe { libs::open(p) } {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::debug!("NVIDIA dependency probe: {}: {e}", p.display());
-                    false
-                }
+    names
+        .iter()
+        .any(|n| match libs::probe_cuda_library(n, dirs) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!("NVIDIA dependency probe: {e}");
+                false
             }
         })
-    })
 }
 
 fn nvidia_deps(target: Target, ort_dir: &Path, cuda_libs: Option<&Path>) -> Vec<Dep> {
@@ -354,6 +345,12 @@ impl OrtRuntime {
         hw: &HardwareInfo,
         cuda_libs: Option<&Path>,
     ) -> Result<Self> {
+        // The flavor dir holds the library's own imports (`onnxruntime_providers_shared`,
+        // `DirectML.dll`): make it part of the DLL search (Windows; a no-op elsewhere) since
+        // `PATH` and the working directory are not searched (BE-01).
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            libs::register_dll_dir(dir);
+        }
         let lib = load_library(path)
             .with_context(|| format!("loading ONNX Runtime from {}", path.display()))?;
         let ort_dir = lib.path.parent().unwrap_or(Path::new("."));
@@ -616,9 +613,15 @@ impl OrtRuntime {
             );
             return path.to_path_buf();
         }
-        let dir = match &self.cache_dir {
-            Some(c) => c.join("coreml"),
-            None => std::env::temp_dir().join("blue-onyx-prism-coreml"),
+        // Only the configured cache dir: a predictable path in the shared temp dir could be
+        // pre-created by another local user (BE-04).
+        let Some(dir) = self.cache_dir.as_ref().map(|c| c.join("coreml")) else {
+            tracing::warn!(
+                "model {}: CoreML graph rewrite skipped because cache_dir is empty (set it to \
+                 enable the rewritten copy; unsupported ops fall back to the CPU provider)",
+                path.display()
+            );
+            return path.to_path_buf();
         };
         let t0 = Instant::now();
         match onnx_rewrite::rewrite_cached(path, &dir, &onnx_rewrite::RewriteOptions::COREML) {

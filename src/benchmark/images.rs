@@ -446,9 +446,19 @@ impl ImageSet {
     }
 }
 
-/// A file name without directories (`a.jpg`, not `../a.jpg` or `x/a.jpg`).
+/// A plain file name (`a.jpg`): exactly one normal path component on every platform, so no
+/// directories, no `.`/`..`, no drive or stream syntax (`C:x.jpg`, `a.jpg:stream`; BQ-03) and
+/// no NUL.
 pub fn safe_file_name(f: &str) -> bool {
-    !f.is_empty() && !f.contains(['/', '\\']) && f != "." && f != ".." && !f.contains('\0')
+    use std::path::Component;
+    if f.is_empty() || f.contains(['/', '\\', ':', '\0']) {
+        return false;
+    }
+    let mut comps = Path::new(f).components();
+    matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(n)), None) if n == f
+    )
 }
 
 fn manifest_image(i: &ManifestImage, path: PathBuf) -> SetImage {
@@ -1136,7 +1146,18 @@ mod tests {
     #[test]
     fn file_names_are_checked() {
         assert!(safe_file_name("a.jpg"));
-        for bad in ["", "..", "../a.jpg", "x/a.jpg", "x\\a.jpg"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../a.jpg",
+            "x/a.jpg",
+            "x\\a.jpg",
+            "C:x.jpg",
+            "a.jpg:stream",
+            "a\0.jpg",
+            "/a.jpg",
+        ] {
             assert!(!safe_file_name(bad), "{bad}");
         }
     }

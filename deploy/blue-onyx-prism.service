@@ -4,16 +4,56 @@ After=network.target
 
 [Service]
 Type=simple
-# Install the release bundle (binary + openvino/ + models/) into this directory
-# (scripts/install_systemd.sh does this). Config: <dir>/blue_onyx_prism_config.json.
-WorkingDirectory=/opt/blue-onyx-prism
-ExecStart=/opt/blue-onyx-prism/blue-onyx-prism
+# Program (binary, openvino/, onnxruntime/) in /opt/blue-onyx-prism, owned by root and read-only
+# to the service. Everything the service writes (config, models, cache, downloads, benchmark.json,
+# model-export tools) lives in /var/lib/blue-onyx-prism, owned by the service user.
+# scripts/install_systemd.sh sets both up and seeds the config with download_dir, cache_dir and
+# the bundled runtime dirs.
+WorkingDirectory=/var/lib/blue-onyx-prism
+ExecStart=/opt/blue-onyx-prism/blue-onyx-prism --config /var/lib/blue-onyx-prism/blue_onyx_prism_config.json
 Restart=on-failure
 RestartSec=5
-# Needed for Intel GPU inference via /dev/dri (install intel-opencl-icd on the host).
-SupplementaryGroups=render video
 User=blueonyx
 Group=blueonyx
+# Needed for Intel GPU inference via /dev/dri (install intel-opencl-icd on the host).
+SupplementaryGroups=render video
+
+# --- Sandboxing -------------------------------------------------------------------------------
+# Creates /var/lib/blue-onyx-prism (owned by User=) if missing; the data root.
+StateDirectory=blue-onyx-prism
+StateDirectoryMode=0750
+# The service and its children (model export runs uv/Python) can never gain privileges
+# (setuid binaries, file capabilities).
+NoNewPrivileges=yes
+# The whole filesystem is read-only to the service (/opt, /usr, /etc included) ...
+ProtectSystem=strict
+# ... except the data root. (StateDirectory= already allows it; listed so it is explicit.)
+# Add a `save_image_path` / `log_path` outside it here, or writes there fail with EROFS.
+ReadWritePaths=/var/lib/blue-onyx-prism
+# /home, /root and /run/user are invisible: a config path there fails as "not found".
+ProtectHome=yes
+# A private /tmp and /var/tmp, emptied when the service stops.
+PrivateTmp=yes
+# Only the devices listed below can be opened. `char-drm` is /dev/dri/card* and renderD*
+# (Intel/AMD GPU through OpenVINO / OpenCL); without it the GPU disappears and `auto` falls back
+# to the CPU. NVIDIA (ort:cuda / ort:tensorrt) also needs its device nodes: uncomment the
+# char-nvidia lines. Removing DevicePolicy= lifts the device restriction entirely.
+DevicePolicy=closed
+DeviceAllow=char-drm rw
+#DeviceAllow=char-nvidia-frontend rw
+#DeviceAllow=char-nvidia-uvm rw
+#DeviceAllow=char-nvidia-caps rw
+# Sockets: IPv4/IPv6 (HTTP server, downloads) and Unix sockets. AF_NETLINK is not allowed;
+# add it if a GPU driver or runtime fails to enumerate devices.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# System calls a typical service needs (includes ioctl for the GPU drivers, mmap/mprotect,
+# thread affinity). A blocked call fails with EPERM instead of killing the process; if a GPU
+# runtime then misbehaves, check the journal and comment these two lines out first.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Must stay off: OpenVINO's CPU plugin and the GPU compiler generate code at run time (JIT),
+# which needs writable+executable memory. `yes` makes every inference device fail to load.
+MemoryDenyWriteExecute=no
 
 [Install]
 WantedBy=multi-user.target

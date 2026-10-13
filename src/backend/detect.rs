@@ -708,9 +708,10 @@ mod cuda_driver {
     }
 
     fn query() -> Result<Vec<CudaDevice>, String> {
-        // SAFETY: loads the NVIDIA driver library, the same one ONNX Runtime's CUDA provider
-        // loads; its initializers have no preconditions.
-        let lib = unsafe { crate::backend::libs::open(LIBRARY) }
+        // SAFETY: loads the NVIDIA driver library (an OS-provided one: `System32` / the
+        // driver's ld.so.conf dir, never the working directory), the same one ONNX Runtime's
+        // CUDA provider loads; its initializers have no preconditions.
+        let lib = unsafe { crate::backend::libs::open_system(LIBRARY) }
             .map_err(|e| format!("{LIBRARY}: {e}"))?;
         // Never unloaded: unloading the driver after cuInit is not supported, and the CUDA
         // provider uses it later anyway.

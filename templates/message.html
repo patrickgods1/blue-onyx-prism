@@ -5,27 +5,6 @@
 <h1>{{ heading }}</h1>
 <p{% if restarting %} class="notice" id="restart-banner"{% endif %}>{{ message }}</p>
 {% if restarting %}
-<p class="muted" id="restart-status">Waiting for the server&hellip;</p>
-<script>
-// Poll until the next generation serves (the server keeps answering during the restart; the
-// generation changes once the new config is swapped in), then go back.
-(function () {
-  var target = "{{ refresh_url }}", gen = {{ generation }}, started = Date.now(), status = document.getElementById("restart-status");
-  function poll() {
-    fetch("/v1/config", {cache: "no-store"}).then(function (r) {
-      if (!r.ok) throw new Error(r.status);
-      return r.json();
-    }).then(function (j) {
-      if (j.generation === gen) throw new Error("same generation");
-      status.textContent = "Server is back; reloading…";
-      location.href = target;
-    }).catch(function () {
-      status.textContent = "Waiting for the server… (" + Math.round((Date.now() - started) / 1000) + " s)";
-      setTimeout(poll, 1000);
-    });
-  }
-  setTimeout(poll, 1500);
-})();
-</script>
+<p class="muted" id="restart-status" data-target="{{ refresh_url }}" data-generation="{{ generation }}">Waiting for the server&hellip;</p>
 {% endif %}
 {% endblock %}

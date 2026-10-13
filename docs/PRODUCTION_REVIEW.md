@@ -3502,7 +3502,7 @@ Multipart parse (image `Bytes` copy, `HashMap` of text fields), one `oneshot`, r
 
 ## Per-finding status
 
-Updated at the end of each phase (phase 1: branch `review/phase-1-crash-safety`). Phase 0 leaves every finding open; the phase column is where the fix
+Updated at the end of each phase (phase 1: branch `review/phase-1-crash-safety`; phase 2: branch `review/phase-2-security`). Phase 0 leaves every finding open; the phase column is where the fix
 is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maintainability).
 
 | ID | Severity | Phase | Status |
@@ -3514,41 +3514,41 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | CO-02 | crash-or-data-loss | 1 | fixed in phase 1: Config::save writes .tmp, fsyncs and renames; unchanged config is not rewritten at start |
 | CO-03 | crash-or-data-loss | 1 | fixed in phase 1: Config::validate ranges every numeric field; queue clamped at spawn; saturating timeout math |
 | PL-07 | crash-or-data-loss | 1 | fixed in phase 1: worker_queue_size validated 0..=1024 and clamped at spawn |
-| BE-01 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| BE-04 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| BM-08 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| BQ-03 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| CO-07 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| NR-01 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| NR-02 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| NR-03 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| NR-04 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| NR-05 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| PL-09 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| RS-01 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| RS-07 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| RS-16 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| SV-01 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| SV-03 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| SV-05 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| SV-09 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| SV-10 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
-| BE-02 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| BE-01 | security-boundary | 2 | fixed in phase 2: Windows SetDefaultDllDirectories + AddDllDirectory for runtime dirs; CUDA probed by absolute path only (runtime behavior on Windows unverified here) |
+| BE-04 | security-boundary | 2 | fixed in phase 2: no temp-dir fallback for the CoreML cache; a cache hit is byte-compared with the fresh rewrite |
+| BM-08 | security-boundary | 2 | fixed in phase 2: Markdown report escapes HTML/Markdown in headings, paragraphs and cells |
+| BQ-03 | security-boundary | 2 | fixed in phase 2: safe_file_name requires one Normal component (rejects `:` and prefixes) |
+| CO-07 | security-boundary | 2 | fixed in phase 2: --allow-remote-admin/--force-cpu/--save-ref-image apply to the run only; remote admin logged at warn on start |
+| NR-01 | security-boundary | 2 | fixed in phase 2: docker-config ships allow_remote_admin false; compose publishes on 127.0.0.1 by default; README explains the LAN case |
+| NR-02 | security-boundary | 2 | fixed in phase 2: install_service.ps1 defaults to a virtual service account, resets the install dir ACL, checks exit codes, no password on the command line (not run here: no Windows) |
+| NR-03 | security-boundary | 2 | fixed in phase 2: launchd runs as _blueonyx with data under /usr/local/var and newsyslog rotation (not run here) |
+| NR-04 | security-boundary | 2 | fixed in phase 2: systemd unit hardened (NoNewPrivileges, ProtectSystem=strict, ProtectHome, PrivateTmp, ReadWritePaths, DevicePolicy, RestrictAddressFamilies, SystemCallFilter); binary root-owned, data in /var/lib |
+| NR-05 | security-boundary | 2 | fixed in phase 2: contents: read by default in every workflow; contents: write only on the release job |
+| PL-09 | security-boundary | 2 | fixed in phase 2: saved-image stems sanitized to [A-Za-z0-9._-], 64 chars, reserved device names fall back to a UUID |
+| RS-01 | security-boundary | 2 | fixed in phase 2: https_only, custom redirect policy (https targets only, 5 hops), final URL checked |
+| RS-07 | security-boundary | 2 | fixed in phase 2: env_clear plus an explicit allowlist for the export child |
+| RS-16 | security-boundary | 2 | fixed in phase 2: directory listings only echoed under the data root; class YAML capped at 1 MiB; add-by-path limited to the browse roots |
+| SV-01 | security-boundary | 2 | fixed in phase 2: same-origin check (Sec-Fetch-Site / Origin / Referer vs Host) on admin POST/PUT/PATCH/DELETE; header-less clients allowed (documented); router classification test |
+| SV-03 | security-boundary | 2 | fixed in phase 2: config::validate_dir_setting on save_image_path/log_path/cache_dir (NUL, overlong, verbatim, UNC, drive-relative, .., system dirs); changes warn-logged |
+| SV-05 | security-boundary | 2 | fixed in phase 2: /v1/config minimal for non-admin peers, no sync_config from remote |
+| SV-09 | security-boundary | 2 | fixed in phase 2: nosniff, Referrer-Policy, X-Frame-Options, CSP (no inline scripts/styles; all page scripts moved to /static), Cache-Control no-store on JSON |
+| SV-10 | security-boundary | 2 | fixed in phase 2: browse canonicalizes and requires a configured root (data root, models, downloads, home, Windows drives); symlink escapes refused |
+| BE-02 | resource-exhaustion | 3 | fixed in phase 2: system_cuda_present cached per process (OnceLock), libraries stay loaded |
 | BE-06 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | BM-04 | resource-exhaustion | 3 | fixed in phase 1: --repeat 1..=1000, --warmup 0..=100 (same bounds as the service) |
 | BM-11 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | BQ-04 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | BQ-05 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| CO-06 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| NR-06 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| CO-06 | resource-exhaustion | 3 | fixed in phase 2: log_path keeps the newest 14 daily files |
+| NR-06 | resource-exhaustion | 3 | fixed in phase 2: launchd stdout log rotated by newsyslog |
 | PL-01 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | PL-03 | resource-exhaustion | 3 | fixed in phase 1: header-first decode with the max_image_pixels ceiling on both decoders; zero dims rejected |
 | PL-04 | resource-exhaustion | 3 | fixed in phase 1: model input side <= 8192 and tensor <= 256 MiB, else the model fails to load |
-| RS-02 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| RS-03 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| RS-05 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| RS-08 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| RS-12 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| RS-02 | resource-exhaustion | 3 | fixed in phase 2: export children run in a process group (Unix) / Job Object (Windows) and the tree is killed on cancel, timeout and stop |
+| RS-03 | resource-exhaustion | 3 | fixed in phase 2: 4 GiB per entry / 8 GiB per archive decompressed ceilings enforced while streaming; hostile entries refuse the archive |
+| RS-05 | resource-exhaustion | 3 | fixed in phase 2: Content-Length / Content-Range / running count checked against the pin; mismatch is permanent, not retried |
+| RS-08 | resource-exhaustion | 3 | fixed in phase 2: child output lines capped at 4 KiB, 2000 lines buffered |
+| RS-12 | resource-exhaustion | 3 | fixed in phase 2: release-check body capped at 1 MiB, typed parse, fields truncated |
 | SV-04 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | SV-08 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | BE-03 | correctness | 4 | open (phase 0: identified, not yet fixed) |
@@ -3568,16 +3568,16 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | CO-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | CO-10 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | CO-14 | correctness | 5 | fixed in phase 1: test client uses total_cmp, nearest-rank p95, absolute start times with checked arithmetic |
-| NR-07 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| NR-07 | correctness | 4 | fixed in phase 2: release workflow refuses a manual run on an existing tag or published release |
 | NR-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| NR-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| NR-09 | correctness | 4 | fixed in phase 2: README Docker section matches the compose volumes |
 | NR-10 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | NR-11 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | PL-02 | correctness | 1 | fixed in phase 1: non-finite detections dropped before NMS and serialization, scores clamped, coords clamped |
 | PL-05 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | PL-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | RS-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| RS-15 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| RS-15 | correctness | 4 | fixed in phase 2: resumed downloads are hashed whole; a changed upstream file fails permanently (test added) |
 | SV-13 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | SV-14 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BE-08 | operability | 4 | open (phase 0: identified, not yet fixed) |
@@ -3597,7 +3597,7 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | NR-15 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | NR-16 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | NR-17 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-18 | operability | 4 | open (phase 0: identified, not yet fixed) |
+| NR-18 | operability | 4 | fixed in phase 2: Dockerfile HEALTHCHECK on /v1/vision/custom/list |
 | NR-19 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | NR-20 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | NR-21 | operability | 4 | open (phase 0: identified, not yet fixed) |
@@ -3610,7 +3610,7 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RS-14 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | SV-06 | operability | 3 | open (phase 0: identified, not yet fixed) |
 | SV-07 | operability | 3 | open (phase 0: identified, not yet fixed) |
-| SV-11 | operability | 4 | open (phase 0: identified, not yet fixed) |
+| SV-11 | operability | 4 | fixed in phase 2: live.js handles non-JSON/403, capped exponential backoff, waitRestart gives up after 2 min, timers paused while hidden |
 | SV-12 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | SV-15 | operability | 1 | fixed in phase 1: catch_panic middleware answers 500 (JSON or HTML) and the connection stays usable |
 | BE-11 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
@@ -3626,9 +3626,9 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | NR-22 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | NR-23 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | NR-24 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| NR-25 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
+| NR-25 | maintainability | 5 | fixed in phase 2: deny.toml ignores carry a reason and a review date |
 | NR-26 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | PL-10 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | PL-12 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | RS-13 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| SV-16 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
+| SV-16 | maintainability | 5 | fixed in phase 2: message.html passes values via data attributes |

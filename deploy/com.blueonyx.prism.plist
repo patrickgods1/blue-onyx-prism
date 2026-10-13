@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Installed by scripts/install_launchd.sh. The program dir (/usr/local/blue-onyx-prism) is owned
+  by root; the daemon runs as the _blueonyx role account and writes only to its data root
+  /usr/local/var/blue-onyx-prism (config, models, cache, downloads) and /var/log/blue-onyx-prism.
+  The config's log_path sends the log to daily files there (14 kept); stdout/stderr only carry
+  what is printed before logging starts (and panics), rotated by /etc/newsyslog.d/blue-onyx-prism.conf.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -7,16 +14,22 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/blue-onyx-prism/blue-onyx-prism</string>
+        <string>--config</string>
+        <string>/usr/local/var/blue-onyx-prism/blue_onyx_prism_config.json</string>
     </array>
+    <key>UserName</key>
+    <string>_blueonyx</string>
+    <key>GroupName</key>
+    <string>_blueonyx</string>
     <key>WorkingDirectory</key>
-    <string>/usr/local/blue-onyx-prism</string>
+    <string>/usr/local/var/blue-onyx-prism</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/usr/local/blue-onyx-prism/blue-onyx-prism.log</string>
+    <string>/var/log/blue-onyx-prism/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/usr/local/blue-onyx-prism/blue-onyx-prism.log</string>
+    <string>/var/log/blue-onyx-prism/stdout.log</string>
 </dict>
 </plist>

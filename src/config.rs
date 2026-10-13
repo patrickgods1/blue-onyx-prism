@@ -765,6 +765,150 @@ impl Config {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Path settings (SV-03) and the file browser's path syntax (SV-10)
+
+/// Longest accepted path setting, in bytes.
+pub const MAX_PATH_LEN: usize = 4096;
+/// Longest accepted path component, in bytes.
+pub const MAX_PATH_COMPONENT_LEN: usize = 255;
+
+/// The settings that name a directory and go through [`validate_dir_setting`].
+pub const DIR_SETTINGS: &[&str] = &[
+    "save_image_path",
+    "log_path",
+    "cache_dir",
+    "download_dir",
+    "models_dir",
+];
+
+/// Directory settings that must not be empty.
+const REQUIRED_DIR_SETTINGS: &[&str] = &["models_dir"];
+
+/// Directories the service must never write to or list from, as the target or an ancestor
+/// (matched on both platforms' spellings, so a Windows path typed on Linux is refused too).
+const SYSTEM_DIRS: &[&str] = &["/etc", "/bin", "/sbin", "/usr", "/system", "/library"];
+/// Windows system directories, matched on any drive letter: `<x>:/windows`,
+/// `<x>:/program files*`.
+const WINDOWS_SYSTEM_DIRS: &[&str] = &["windows", "program files"];
+
+/// `p` with `\` as `/`, lowercased, without a trailing separator (for prefix comparisons).
+fn normalized(p: &str) -> String {
+    let s = p.replace('\\', "/").to_ascii_lowercase();
+    let t = s.trim_end_matches('/');
+    if t.is_empty() { s } else { t.to_string() }
+}
+
+/// `C:` / `c:` at the start of `s` (a Windows drive).
+fn drive_prefix(s: &str) -> bool {
+    matches!(s.as_bytes(), [d, b':', ..] if d.is_ascii_alphabetic())
+}
+
+/// Absolute on either platform: `/x`, `\x`, `C:\x`, `C:/x`.
+pub fn is_absolute_path_text(s: &str) -> bool {
+    if s.starts_with('/') || s.starts_with('\\') {
+        return true;
+    }
+    drive_prefix(s)
+        && s.as_bytes()
+            .get(2)
+            .is_some_and(|c| *c == b'\\' || *c == b'/')
+}
+
+/// Syntax checks shared by the path settings and the file browser: no NUL bytes, at most
+/// [`MAX_PATH_LEN`] bytes and [`MAX_PATH_COMPONENT_LEN`] per component, no `..` component, no
+/// Windows verbatim (`\\?\`) or UNC (`\\server\share`) prefix and no drive-relative path
+/// (`C:foo`). `key` names the setting in the error.
+pub fn check_path_syntax(key: &str, raw: &str) -> Result<()> {
+    use anyhow::bail;
+    if raw.contains('\0') {
+        bail!("{key}: the path contains a NUL byte");
+    }
+    if raw.len() > MAX_PATH_LEN {
+        bail!("{key}: the path is longer than {MAX_PATH_LEN} bytes");
+    }
+    if raw.starts_with(r"\\?\") || raw.starts_with(r"\??\") || raw.starts_with("//?/") {
+        bail!("{key}: verbatim paths (\\\\?\\) are not accepted");
+    }
+    if raw.starts_with(r"\\") || raw.starts_with("//") {
+        bail!("{key}: UNC paths (\\\\server\\share) are not accepted");
+    }
+    if drive_prefix(raw) && !is_absolute_path_text(raw) {
+        bail!(
+            "{key}: drive-relative paths ({}) are not accepted; give the full path",
+            &raw[..2]
+        );
+    }
+    for part in raw.split(['/', '\\']) {
+        if part == ".." {
+            bail!("{key}: '..' is not accepted in a path");
+        }
+        if part.len() > MAX_PATH_COMPONENT_LEN {
+            bail!("{key}: a path component is longer than {MAX_PATH_COMPONENT_LEN} bytes");
+        }
+    }
+    Ok(())
+}
+
+/// Whether `p` (absolute, either platform's spelling) is one of the system directories or
+/// inside one (see [`SYSTEM_DIRS`], [`WINDOWS_SYSTEM_DIRS`]).
+pub fn is_system_dir(p: &Path) -> bool {
+    let n = normalized(&p.to_string_lossy());
+    let under = |dir: &str| n == dir || n.starts_with(&format!("{dir}/"));
+    if SYSTEM_DIRS.iter().any(|d| under(d)) {
+        return true;
+    }
+    // `c:/windows`, `c:/program files`, `c:/program files (x86)`.
+    let Some(rest) = n
+        .get(3..)
+        .filter(|_| drive_prefix(&n) && n.as_bytes().get(2) == Some(&b'/'))
+    else {
+        return false;
+    };
+    WINDOWS_SYSTEM_DIRS.iter().any(|d| {
+        rest == *d
+            || rest.starts_with(&format!("{d}/"))
+            || (*d == "program files" && rest.starts_with(d))
+    })
+}
+
+/// Validate a directory setting typed into the Config page (`key` is one of
+/// [`DIR_SETTINGS`]): `Ok(None)` for an empty value (an error for a required one),
+/// [`check_path_syntax`], relative paths resolved under `data_root`, and a path that is not
+/// under the data root must not be a system directory or inside one ([`is_system_dir`]).
+/// Returns the path to store (absolute).
+pub fn validate_dir_setting(key: &str, raw: &str, data_root: &Path) -> Result<Option<PathBuf>> {
+    use anyhow::bail;
+    let raw = raw.trim();
+    let raw = ['"', '\'']
+        .iter()
+        .find(|q| raw.len() >= 2 && raw.starts_with(**q) && raw.ends_with(**q))
+        .map_or(raw, |_| raw.get(1..raw.len() - 1).unwrap_or(raw).trim());
+    if raw.is_empty() {
+        if REQUIRED_DIR_SETTINGS.contains(&key) {
+            bail!("{key}: must not be empty");
+        }
+        return Ok(None);
+    }
+    check_path_syntax(key, raw)?;
+    let resolved = if is_absolute_path_text(raw) {
+        PathBuf::from(raw)
+    } else {
+        data_root.join(raw)
+    };
+    let under_root = !data_root.as_os_str().is_empty()
+        && normalized(&resolved.to_string_lossy())
+            .starts_with(&format!("{}/", normalized(&data_root.to_string_lossy())));
+    if !under_root && is_system_dir(&resolved) {
+        bail!(
+            "{key}: {} is a system directory; choose a folder of your own (for example under {})",
+            resolved.display(),
+            data_root.display()
+        );
+    }
+    Ok(Some(resolved))
+}
+
 /// Checks of a config the server runs with: [`Config::validate`], at least one model, at least
 /// one enabled model and a `default_model` that names a configured model.
 pub fn validate_config(c: &Config) -> Result<()> {
@@ -786,6 +930,132 @@ pub fn validate_config(c: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dir_setting_accepts_own_folders() {
+        use super::validate_dir_setting;
+        use std::path::{Path, PathBuf};
+        let root = Path::new("/srv/prism");
+        assert_eq!(validate_dir_setting("log_path", "", root).unwrap(), None);
+        assert_eq!(validate_dir_setting("cache_dir", "  ", root).unwrap(), None);
+        assert_eq!(
+            validate_dir_setting("log_path", "logs", root).unwrap(),
+            Some(root.join("logs"))
+        );
+        assert_eq!(
+            validate_dir_setting("save_image_path", "\"/data/shots\"", root).unwrap(),
+            Some(PathBuf::from("/data/shots"))
+        );
+        // Under the data root anything goes, even when the data root is under /usr.
+        let usr = Path::new("/usr/local/prism");
+        assert_eq!(
+            validate_dir_setting("cache_dir", "cache", usr).unwrap(),
+            Some(usr.join("cache"))
+        );
+        assert!(validate_dir_setting("cache_dir", "/usr/local/prism/x", usr).is_ok());
+        assert!(validate_dir_setting("models_dir", "C:\\prism\\models", root).is_ok());
+        assert!(validate_dir_setting("models_dir", "/home/me/Program Files", root).is_ok());
+        assert!(validate_dir_setting("models_dir", "/etcetera", root).is_ok());
+        let err = validate_dir_setting("models_dir", "", root).unwrap_err();
+        assert!(err.to_string().contains("models_dir: must not be empty"));
+    }
+
+    #[test]
+    fn dir_setting_rejects_nul() {
+        let e = super::validate_dir_setting("log_path", "a\0b", std::path::Path::new("/r"))
+            .unwrap_err();
+        assert!(e.to_string().contains("NUL"), "{e}");
+    }
+
+    #[test]
+    fn dir_setting_rejects_long_component() {
+        let long = "x".repeat(256);
+        let e =
+            super::validate_dir_setting("log_path", &long, std::path::Path::new("/r")).unwrap_err();
+        assert!(e.to_string().contains("component"), "{e}");
+        assert!(
+            super::validate_dir_setting("log_path", &"y".repeat(255), std::path::Path::new("/r"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn dir_setting_rejects_long_path() {
+        let long = "ab/".repeat(1400);
+        let e =
+            super::validate_dir_setting("log_path", &long, std::path::Path::new("/r")).unwrap_err();
+        assert!(e.to_string().contains("longer than 4096"), "{e}");
+    }
+
+    #[test]
+    fn dir_setting_rejects_verbatim_prefix() {
+        let r = std::path::Path::new("/r");
+        for p in [r"\\?\C:\x", r"\??\C:\x", "//?/C:/x"] {
+            let e = super::validate_dir_setting("log_path", p, r).unwrap_err();
+            assert!(e.to_string().contains("verbatim"), "{p}: {e}");
+        }
+    }
+
+    #[test]
+    fn dir_setting_rejects_unc_prefix() {
+        let r = std::path::Path::new("/r");
+        for p in [r"\\server\share\x", "//server/share"] {
+            let e = super::validate_dir_setting("log_path", p, r).unwrap_err();
+            assert!(e.to_string().contains("UNC"), "{p}: {e}");
+        }
+    }
+
+    #[test]
+    fn dir_setting_rejects_drive_relative() {
+        let r = std::path::Path::new("/r");
+        for p in ["C:foo", "c:", "D:..\\x"] {
+            let e = super::validate_dir_setting("log_path", p, r).unwrap_err();
+            assert!(e.to_string().contains("drive-relative"), "{p}: {e}");
+        }
+    }
+
+    #[test]
+    fn dir_setting_rejects_dot_dot() {
+        let r = std::path::Path::new("/r");
+        for p in ["../x", "a/../b", "/data/../etc", r"C:\x\..\y", ".."] {
+            let e = super::validate_dir_setting("log_path", p, r).unwrap_err();
+            assert!(e.to_string().contains("'..'"), "{p}: {e}");
+        }
+        // A name that merely contains dots is fine.
+        assert!(super::validate_dir_setting("log_path", "a/..b/...", r).is_ok());
+    }
+
+    #[test]
+    fn dir_setting_rejects_system_dirs() {
+        let r = std::path::Path::new("/srv/prism");
+        for p in [
+            "/etc",
+            "/etc/",
+            "/ETC/cron.d",
+            "/bin",
+            "/sbin/x",
+            "/usr",
+            "/usr/share/x",
+            "/System/Library",
+            "/Library/LaunchDaemons",
+            r"C:\Windows",
+            r"c:\windows\system32\drivers\etc",
+            "C:/Windows/Temp",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)\x",
+            r"D:\Program Files\y",
+        ] {
+            let e = super::validate_dir_setting("save_image_path", p, r).unwrap_err();
+            assert!(e.to_string().contains("system directory"), "{p}: {e}");
+        }
+        assert!(!super::is_system_dir(std::path::Path::new(
+            "/var/lib/prism"
+        )));
+        assert!(!super::is_system_dir(std::path::Path::new(
+            r"C:\Users\me\Program Files"
+        )));
+        assert!(!super::is_system_dir(std::path::Path::new(r"C:\Windowsx")));
+    }
+
     #[test]
     fn threshold_objective_parsing_and_defaults() {
         use crate::benchmark::threshold::Objective;
