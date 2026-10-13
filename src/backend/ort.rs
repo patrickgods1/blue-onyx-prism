@@ -270,7 +270,13 @@ fn any_loadable(names: &[&str], dirs: &[&Path]) -> bool {
             // SAFETY: probing NVIDIA runtime libraries (cudart, cuDNN, TensorRT) that the CUDA
             // execution provider would load itself when a session is created; the handle is
             // dropped right away and no symbol is used.
-            unsafe { libloading::Library::new(p) }.is_ok()
+            match unsafe { libs::open(p) } {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::debug!("NVIDIA dependency probe: {}: {e}", p.display());
+                    false
+                }
+            }
         })
     })
 }
