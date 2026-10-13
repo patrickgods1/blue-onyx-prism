@@ -342,7 +342,7 @@ fn extract_zip(
         };
         let mut entry = zip
             .by_index(i)
-            .with_context(|| format!("reading zip entry #{i} of {}", archive.display()))?;
+            .with_context(|| format!("opening zip entry #{i} ({name}) of {}", archive.display()))?;
         write_entry(dest, &rel, &mut entry).with_context(|| format!("extracting {name}"))?;
         got.insert(rel);
     }
@@ -895,6 +895,36 @@ fn wheel_check(windows: bool, dest: &Path, got: &mut BTreeSet<String>) -> Result
 mod tests {
     use super::*;
 
+    /// A fresh directory under the OS temp dir, removed on drop (also when a test panics).
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("bop-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn windows_selection() {
         let s = selection_for("windows").unwrap();
@@ -1176,8 +1206,7 @@ mod tests {
         assert!(l("nvidia/cuda_runtime/lib/libcudart.so.12").is_some());
         assert!(l("nvidia/cuda_runtime/lib/libcudart_static.a").is_none());
         assert!(l("nvidia/cudnn/bin/libcudnn.so.9").is_none());
-        let dir = std::env::temp_dir().join(format!("bop-wheelchk-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("wheelchk");
         let mut got = set(&["libcudart.so.12", "libcublas.so.12"]);
         let err = wheel_check(false, &dir, &mut got).unwrap_err();
         assert!(format!("{err}").contains("libcudnn.so.9"), "{err}");
@@ -1186,7 +1215,6 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(wheel_check(true, &dir, &mut got).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1229,8 +1257,7 @@ mod tests {
     /// files are skipped on their metadata.
     #[test]
     fn zip_extracts_only_wanted_files() {
-        let dir = std::env::temp_dir().join(format!("bop-zip-filter-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("zip-filter");
         let archive = dir.join("a.zip");
         {
             let f = std::fs::File::create(&archive).unwrap();
@@ -1256,15 +1283,13 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("keep.bin")).unwrap(), b"keep");
         assert!(!dest.join("skip.txt").exists());
         assert!(!dest.join("lib").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Synthetic Linux wheels: only shared libraries land (flat), headers / static libs /
     /// metadata do not, and a missing soname gets its link.
     #[test]
     fn linux_wheels_extract_flat_with_soname_links() {
-        let dir = std::env::temp_dir().join(format!("bop-wheel-l-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("wheel-l");
         let w1 = dir.join("rt.whl");
         zip_with(
             &w1,
@@ -1329,14 +1354,12 @@ mod tests {
         ] {
             assert!(!dest.join(no).exists(), "{no}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Synthetic Windows wheels: DLLs from `bin/`, never `.lib`, headers or other dirs.
     #[test]
     fn windows_wheels_extract_only_dlls() {
-        let dir = std::env::temp_dir().join(format!("bop-wheel-w-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("wheel-w");
         let w = dir.join("all.whl");
         let mut entries: Vec<(String, Vec<u8>)> = cuda_provider_needs(true)
             .iter()
@@ -1371,15 +1394,13 @@ mod tests {
         for no in ["cudnn.lib", "cudnn.h"] {
             assert!(!dest.join(no).exists(), "{no}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Build a small tar.gz with a library, a symlink to it, a link escaping the directory and
     /// a non-whitelisted file, and extract it with the ORT release layout.
     #[test]
     fn tgz_links_and_whitelist() {
-        let dir = std::env::temp_dir().join(format!("bop-extract-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("extract");
         let archive = dir.join("a.tgz");
         {
             let f = std::fs::File::create(&archive).unwrap();
@@ -1429,7 +1450,6 @@ mod tests {
         );
         assert!(!dest.join("libcustom.so").exists());
         assert!(!dest.join("libonnxruntime_providers_shared.so").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1449,8 +1469,7 @@ mod tests {
         assert_eq!(uv_wanted(true, "uvw.exe"), None);
         assert_eq!(uv_wanted(true, "uv"), None);
 
-        let dir = std::env::temp_dir().join(format!("bop-uv-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("uv");
         let mac = crate::resources::catalog::uv_for("macos", "aarch64").unwrap();
         // tar.gz with uv + uvx in a top folder.
         let archive = dir.join("uv.tgz");
@@ -1506,7 +1525,6 @@ mod tests {
         let empty = dir.join("empty");
         let mut got = extract_part(&zip, ArchiveKind::Zip, Layout::Uv, None, wt, &empty).unwrap();
         assert!(finalize(win, "0.12.19", wt, &empty, &mut got).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1544,8 +1562,7 @@ mod tests {
         }
 
         // A real tar.gz: only the whitelisted files land, paths kept.
-        let dir = std::env::temp_dir().join(format!("bop-src-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("src");
         let archive = dir.join("src.tar.gz");
         {
             let f = std::fs::File::create(&archive).unwrap();
@@ -1596,6 +1613,5 @@ mod tests {
         assert!(dest.join("VERSION").is_file());
         let mut empty = BTreeSet::new();
         assert!(finalize(src, src.version, t, &dir.join("none"), &mut empty).is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

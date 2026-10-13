@@ -816,15 +816,6 @@ pub(crate) fn dl_error(e: &libloading::Error) -> String {
 /// # Safety
 /// Same contract as [`libloading::Library::new`]: the library's initializers run, and the
 /// caller is responsible for them being sound to run.
-#[cfg_attr(
-    not(any(
-        windows,
-        target_os = "linux",
-        all(target_vendor = "apple", target_arch = "aarch64"),
-        feature = "onnxruntime"
-    )),
-    allow(dead_code)
-)]
 pub(crate) unsafe fn open(
     path: impl libloading::AsFilename,
 ) -> Result<libloading::Library, String> {
@@ -837,15 +828,8 @@ pub(crate) unsafe fn open(
 /// # Safety
 /// Same contract as [`libloading::Library::get`]: `T` must match the symbol's real type, and
 /// the caller is responsible for how the symbol is used.
-#[cfg_attr(
-    not(any(
-        windows,
-        target_os = "linux",
-        all(target_vendor = "apple", target_arch = "aarch64"),
-        feature = "onnxruntime"
-    )),
-    allow(dead_code)
-)]
+// Every caller is platform- or feature-gated; unused on other targets.
+#[allow(dead_code)]
 pub(crate) unsafe fn symbol<'a, T>(
     lib: &'a libloading::Library,
     name: &[u8],
@@ -889,7 +873,13 @@ pub fn system_cuda_present() -> bool {
     cuda_core_libs(cfg!(windows)).iter().all(|n| {
         // SAFETY: probing CUDA libraries by name, which the CUDA provider would load itself; the
         // handle is dropped right away and no symbol is used.
-        unsafe { libloading::Library::new(*n) }.is_ok()
+        match unsafe { open(*n) } {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!("system CUDA probe: {n}: {e}");
+                false
+            }
+        }
     })
 }
 
