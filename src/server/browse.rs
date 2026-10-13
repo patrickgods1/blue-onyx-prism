@@ -413,7 +413,9 @@ mod tests {
     fn file_path_lists_parent_and_selects() {
         let (root, cfg) = setup();
         let f = root.join("models/a.xml");
-        let l = list(&cfg, Some(&format!("\"{}\"", f.display())), None).unwrap();
+        // `display` strips the Windows verbatim prefix the canonical temp dir carries (the UI
+        // never sends one; the syntax check refuses it).
+        let l = list(&cfg, Some(&format!("\"{}\"", display(&f))), None).unwrap();
         assert_eq!(l.path, display(&root.join("models")));
         assert_eq!(l.selected.as_deref(), Some("a.xml"));
     }
@@ -442,34 +444,42 @@ mod tests {
     #[test]
     fn data_root_lists_with_its_parent_hidden_from_browsing() {
         let (root, cfg) = setup();
-        let l = list(&cfg, Some(&root.to_string_lossy()), None).unwrap();
+        let l = list(&cfg, Some(&display(&root)), None).unwrap();
         assert_eq!(l.path, display(&root));
         assert!(l.roots.iter().all(|r| r.label != "/"), "{:?}", l.roots);
-        // The parent of a root is outside every root.
-        let parent = root.parent().unwrap();
-        let e = list(&cfg, Some(&parent.to_string_lossy()), None).unwrap_err();
-        assert_eq!(e.status, StatusCode::FORBIDDEN);
-        assert!(
-            e.message.contains("outside the browsable folders"),
-            "{}",
-            e.message
-        );
+        // The parent of a root is outside every root (not on Windows, where every drive is
+        // a root of its own).
+        #[cfg(unix)]
+        {
+            let parent = root.parent().unwrap();
+            let e = list(&cfg, Some(&display(parent)), None).unwrap_err();
+            assert_eq!(e.status, StatusCode::FORBIDDEN);
+            assert!(
+                e.message.contains("outside the browsable folders"),
+                "{}",
+                e.message
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn outside_paths_are_refused() {
         let (root, cfg) = setup();
-        let top = root.ancestors().last().unwrap().to_path_buf();
-        for p in [
-            top.to_string_lossy().to_string(),
-            "/etc".into(),
-            "/no/such/dir".into(),
-        ] {
-            let e = list(&cfg, Some(&p), None).unwrap_err();
-            assert_eq!(e.status, StatusCode::FORBIDDEN, "{p}: {}", e.message);
-            // The resolved absolute path of the server is not in the message.
-            assert!(!e.message.contains("not found"), "{p}: {}", e.message);
+        // On Windows every drive is a browsable root, so nothing on a drive is "outside".
+        #[cfg(unix)]
+        {
+            let top = root.ancestors().last().unwrap().to_path_buf();
+            for p in [
+                top.to_string_lossy().to_string(),
+                "/etc".into(),
+                "/no/such/dir".into(),
+            ] {
+                let e = list(&cfg, Some(&p), None).unwrap_err();
+                assert_eq!(e.status, StatusCode::FORBIDDEN, "{p}: {}", e.message);
+                // The resolved absolute path of the server is not in the message.
+                assert!(!e.message.contains("not found"), "{p}: {}", e.message);
+            }
         }
         // Missing inside a root: 404, naming only what was asked for.
         let e = list(&cfg, Some("models/zzz"), None).unwrap_err();
@@ -526,7 +536,7 @@ mod tests {
             root.join("models/a.xml")
         );
         assert_eq!(
-            allowed_path(&cfg, &root.join("models").to_string_lossy()).unwrap(),
+            allowed_path(&cfg, &display(&root.join("models"))).unwrap(),
             root.join("models")
         );
         assert_eq!(

@@ -705,6 +705,8 @@ mod tests {
         }
     }
 
+    // Unix path layout (absolute `/...` paths, lib64 / ld.so.conf dirs).
+    #[cfg(unix)]
     #[test]
     fn directory_settings_are_resolved_under_the_data_root() {
         let mut c = with_model();

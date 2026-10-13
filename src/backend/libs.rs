@@ -922,6 +922,16 @@ pub(crate) fn dl_error(e: &libloading::Error) -> String {
 /// # Safety
 /// Same contract as [`libloading::Library::new`]: the library's initializers run, and the
 /// caller is responsible for them being sound to run.
+// Used by the ONNX Runtime backend, the Windows CUDA preload and the Apple arm64 property
+// fix; an OpenVINO-only Linux build has no caller.
+#[cfg_attr(
+    not(any(
+        windows,
+        feature = "onnxruntime",
+        all(target_vendor = "apple", target_arch = "aarch64")
+    )),
+    allow(dead_code)
+)]
 pub(crate) unsafe fn open_path(path: &Path) -> Result<libloading::Library, String> {
     #[cfg(windows)]
     {
@@ -1397,6 +1407,8 @@ mod tests {
         );
     }
 
+    // Unix path layout (absolute `/...` paths, lib64 / ld.so.conf dirs).
+    #[cfg(unix)]
     #[test]
     fn cuda_search_dirs_skip_relative_entries_and_dedupe() {
         use std::ffi::OsString;
