@@ -1,10 +1,11 @@
 # Blue Onyx Prism: Linux x86_64 image with Intel GPU support via /dev/dri.
 # Build:  docker build -t blue-onyx-prism .
-# Run:    docker run --rm -p 32168:32168 --device /dev/dri:/dev/dri \
+# Run:    docker run --rm -p 127.0.0.1:32168:32168 --device /dev/dri:/dev/dri \
 #           -v bop-models:/app/models -v $PWD/cache:/app/cache -v $PWD/config:/app/config \
 #           --group-add $(getent group render | cut -d: -f3) blue-onyx-prism
 # A named volume for /app/models starts with the models baked in at build time; a bind mount
-# (e.g. -v $PWD/models:/app/models) replaces them with your own.
+# (e.g. -v $PWD/models:/app/models) replaces them with your own. `-p 127.0.0.1:...` keeps the port
+# on this host; for a Blue Iris on another machine use `-p 32168:32168` (see README, Docker).
 
 FROM rust:1-bookworm AS builder
 WORKDIR /src
@@ -34,5 +35,9 @@ RUN /app/blue-onyx-prism --config /app/docker-config.json fetch --for-config \
 RUN mkdir -p /app/models /app/cache /app/config && chown -R openvino:openvino /app
 USER openvino
 EXPOSE 32168
+# A detection-API route (open to every client): it answers as soon as the listener is up, while
+# models may still be compiling. curl is installed above.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS -o /dev/null http://127.0.0.1:32168/v1/vision/custom/list || exit 1
 # The config lives in the /app/config volume; the image's default is copied there on first start.
 ENTRYPOINT ["/bin/sh", "-c", "[ -f /app/config/blue_onyx_prism_config.json ] || cp /app/docker-config.json /app/config/blue_onyx_prism_config.json; exec /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json --cache-dir /app/cache \"$@\"", "--"]

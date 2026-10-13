@@ -3,11 +3,11 @@ all-features = true
 
 [advisories]
 version = 2
+# Each ignore states why it is acceptable and when to look again; on that date check for a fixed
+# release or a replacement crate, then remove the ignore or move the date.
 ignore = [
-    # Unmaintained (no fix exists); only reached via ab_glyph, used to draw labels on saved images.
-    "RUSTSEC-2026-0192", # ttf-parser
-    # Unmaintained (repo archived, no fix exists); only reached via serde_yaml_ng, used for classes YAML.
-    "RUSTSEC-2024-0449", # unsafe-libyaml
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, no fix; only via ab_glyph to draw labels on saved images, parsing the embedded font only. Review by 2027-04-01" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (repo archived), no fix; only via serde_yaml_ng for local classes YAML files. Review by 2027-04-01" },
 ]
 
 [licenses]

@@ -30,7 +30,18 @@ pub fn set_max_pixels(pixels: u64) {
 
 /// The current decode ceiling in pixels (width x height).
 pub fn max_pixels() -> u64 {
+    #[cfg(test)]
+    if let Some(v) = TEST_LIMIT.with(std::cell::Cell::get) {
+        return v;
+    }
     MAX_IMAGE_PIXELS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread ceiling for tests: a small limit set through the process-wide value made
+    /// concurrently running decode tests fail.
+    static TEST_LIMIT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Tightly packed RGB8 image (`rgb.len() == width * height * 3`).
@@ -316,8 +327,51 @@ pub fn draw_predictions(img: &RgbImage, preds: &[Prediction]) -> RgbImage {
     out
 }
 
+/// Longest file stem [`save_annotated`] keeps from a client-supplied name.
+const MAX_STEM_LEN: usize = 64;
+
+/// Windows reserved device names: `CON.jpg` (any extension, any case) opens the device.
+fn is_windows_reserved(stem: &str) -> bool {
+    let base = stem.split('.').next().unwrap_or(stem).to_ascii_uppercase();
+    match base.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => {
+            let b = base.as_bytes();
+            b.len() == 4
+                && (base.starts_with("COM") || base.starts_with("LPT"))
+                && b.get(3).is_some_and(u8::is_ascii_digit)
+        }
+    }
+}
+
+/// The file stem of an untrusted (client-supplied) name, safe on every platform: characters
+/// outside `[A-Za-z0-9._-]` become `_`, leading/trailing dots are dropped, at most
+/// [`MAX_STEM_LEN`] characters; `None` when nothing usable is left or it names a Windows device.
+fn safe_stem(name: &str) -> Option<String> {
+    // Both separators, whatever the host OS (a Windows client may send `C:\cam\x.jpg`).
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = match file.rfind('.') {
+        Some(i) if i > 0 => file.get(..i).unwrap_or(file),
+        _ => file,
+    };
+    let clean: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(MAX_STEM_LEN)
+        .collect();
+    let clean = clean.trim_matches('.');
+    (!clean.is_empty() && !is_windows_reserved(clean)).then(|| clean.to_string())
+}
+
 /// Write `<stem>_od.jpg` (annotated) into `dir`, plus `<stem>.jpg` (unannotated) when
-/// `save_ref` is set. `name` is untrusted (client-supplied): only its file stem is used.
+/// `save_ref` is set. `name` is untrusted (client-supplied): only a sanitized form of its file
+/// stem is used ([`safe_stem`]), else a random `image_<uuid>` name.
 pub fn save_annotated(
     dir: &Path,
     name: &str,
@@ -325,11 +379,7 @@ pub fn save_annotated(
     preds: &[Prediction],
     save_ref: bool,
 ) -> Result<()> {
-    let stem = Path::new(name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty() && s != "." && s != "..")
-        .unwrap_or_else(|| format!("image_{}", uuid::Uuid::new_v4()));
+    let stem = safe_stem(name).unwrap_or_else(|| format!("image_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let annotated = draw_predictions(img, preds);
@@ -440,6 +490,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn saved_names_are_sanitized() {
+        assert_eq!(safe_stem("cam1.jpg").as_deref(), Some("cam1"));
+        assert_eq!(safe_stem("../evil/cam1.jpg").as_deref(), Some("cam1"));
+        assert_eq!(safe_stem("C:\\x\\cam 2.jpg").as_deref(), Some("cam_2"));
+        assert_eq!(safe_stem("a:b*c?.jpg").as_deref(), Some("a_b_c_"));
+        assert_eq!(safe_stem("caméra.jpg").as_deref(), Some("cam_ra"));
+        assert_eq!(safe_stem("v1.2.3.jpg").as_deref(), Some("v1.2.3"));
+        assert_eq!(safe_stem(".hidden").as_deref(), Some("hidden"));
+        let long = format!("{}.jpg", "x".repeat(200));
+        assert_eq!(safe_stem(&long).map(|s| s.len()), Some(MAX_STEM_LEN));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "...",
+            "/",
+            "CON.jpg",
+            "con",
+            "Nul.png",
+            "aux",
+            "PRN.x.jpg",
+            "COM1.jpg",
+            "lpt9",
+            "COM0.jpg",
+            "con..jpg",
+        ] {
+            assert_eq!(safe_stem(bad), None, "{bad:?}");
+        }
+        for ok in ["CONSOLE.jpg", "COM10.jpg", "LPTX.jpg", "con_od.jpg", "NULL"] {
+            assert!(safe_stem(ok).is_some(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_name_falls_back_to_uuid() {
+        let dir = std::env::temp_dir().join(format!("bo_img_test_{}", uuid::Uuid::new_v4()));
+        let img = synthetic(8, 8);
+        save_annotated(&dir, "CON.jpg", &img, &[], true).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().all(|n| n.starts_with("image_")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {
         let img = synthetic(w, h);
         let buf = image::RgbImage::from_raw(w, h, img.rgb).unwrap();
@@ -518,12 +616,11 @@ mod tests {
 
     #[test]
     fn max_pixels_setting_is_honoured() {
-        // Serialize against other tests touching the global ceiling.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap();
+        // Small limits go through this thread's override: the process-wide value is shared
+        // with every decode test running in parallel.
         let png = png_bytes(8, 8);
         let jpg = encode_jpeg(&synthetic(8, 8), 90).unwrap();
-        set_max_pixels(63);
+        TEST_LIMIT.with(|l| l.set(Some(63)));
         assert_eq!(max_pixels(), 63);
         let e = decode(&png).unwrap_err();
         assert!(
@@ -531,9 +628,13 @@ mod tests {
             "{e}"
         );
         assert!(decode(&jpg).unwrap_err().is::<SizeRejected>());
-        set_max_pixels(64);
+        TEST_LIMIT.with(|l| l.set(Some(64)));
         assert_eq!(decode(&png).unwrap(), synthetic(8, 8));
         assert_eq!(decode(&jpg).unwrap().width, 8);
+        TEST_LIMIT.with(|l| l.set(None));
+        // The process-wide setter, with values no other test's images come near.
+        set_max_pixels(MAX_IMAGE_PIXELS_DEFAULT * 2);
+        assert_eq!(max_pixels(), MAX_IMAGE_PIXELS_DEFAULT * 2);
         set_max_pixels(0);
         assert_eq!(max_pixels(), MAX_IMAGE_PIXELS_DEFAULT);
         assert!(decode(&png_bytes(16, 16)).is_ok());

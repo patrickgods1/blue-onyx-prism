@@ -17,7 +17,8 @@ if ($svc) {
         Start-Sleep -Seconds 2
     }
     Write-Host "Deleting $ServiceName ..."
-    sc.exe delete $ServiceName | Out-Null
+    $out = & sc.exe delete $ServiceName
+    if ($LASTEXITCODE -ne 0) { Write-Warning "sc.exe delete failed (exit $LASTEXITCODE): $out" }
 } else {
     Write-Host "Service $ServiceName not installed."
 }
@@ -35,4 +36,5 @@ try {
     }
 } catch { Write-Warning "Could not remove event log source: $_" }
 
-Write-Host "Done."
+Write-Host "Done. The install dir keeps its ACL (Administrators/SYSTEM full, Users read) and data;"
+Write-Host "delete the folder to remove everything."

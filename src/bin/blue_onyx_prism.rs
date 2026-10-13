@@ -363,6 +363,7 @@ fn run(cli: Cli) -> Result<()> {
     let (config, config_path) = cli::resolve_config(&cli)?;
     // Initialized once; later level changes go through the reload handle (web UI, restart).
     let log = cli::init_logging(config.log_level, config.log_path.as_deref())?;
+    cli::log_startup_warnings(&config);
     info!(
         version = blue_onyx_prism::VERSION,
         os = %system_info::os_description(),

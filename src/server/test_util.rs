@@ -74,7 +74,11 @@ pub(super) async fn call(
 pub(super) const LOCAL: &str = "127.0.0.1:50000";
 pub(super) const REMOTE: &str = "10.0.0.5:50000";
 
-/// `req` as if it came from `peer` (what `serve_on` adds), unless it already names one.
+/// The `Host` every real HTTP/1.1 client sends; added by [`from_peer`] when a test did not.
+pub(super) const TEST_HOST: &str = "localhost:32168";
+
+/// `req` as if it came from `peer` (what `serve_on` adds), unless it already names one, with
+/// a `Host` header when it has none (hyper's requests always carry one).
 pub(crate) fn from_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
     let ext = req.extensions_mut();
     if ext
@@ -84,6 +88,10 @@ pub(crate) fn from_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
         ext.insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
             peer.parse().unwrap(),
         ));
+    }
+    if !req.headers().contains_key(header::HOST) {
+        req.headers_mut()
+            .insert(header::HOST, header::HeaderValue::from_static(TEST_HOST));
     }
     req
 }

@@ -1324,7 +1324,13 @@ mod tests {
         assert!(html.contains("data-download=\"bench:coco-cctv\""));
         assert!(html.contains("name=\"dataset\" value=\"sample\">"));
         assert!(html.contains("competes") || html.contains("same CPU/GPU"));
-        assert!(html.contains("fetch(\"/v1/benchmark\""));
+        // The page script lives in `/static/benchmark.js` (CSP: no inline scripts).
+        assert!(
+            html.contains("<script src=\"/static/benchmark.js?v="),
+            "{html}"
+        );
+        let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
+        assert!(js.contains("fetch(\"/v1/benchmark\""));
         // Threshold objective (config default f1) and the threshold apply actions.
         assert!(
             html.contains("<select name=\"threshold_objective\">"),
@@ -1333,15 +1339,18 @@ mod tests {
         assert!(html.contains("<option value=\"f1\" selected>"), "{html}");
         assert!(html.contains("<option value=\"precision:0.9\">"), "{html}");
         assert!(html.contains("id=\"apply-all-thr\""));
-        assert!(html.contains("/v1/benchmark/apply-threshold"));
-        assert!(html.contains("min_confidence"));
+        assert!(
+            html.contains("/v1/benchmark/apply-threshold")
+                || js.contains("/v1/benchmark/apply-threshold")
+        );
+        assert!(html.contains("min_confidence") || js.contains("min_confidence"));
         // Accuracy metric (config default ap50), the frame objectives and the ROC chart code.
         assert!(html.contains("<select name=\"accuracy_metric\">"), "{html}");
         assert!(html.contains("<option value=\"ap50\" selected>"), "{html}");
         assert!(html.contains("<option value=\"roc_auc\">"), "{html}");
         assert!(html.contains("<option value=\"youden\">"), "{html}");
         assert!(html.contains("<option value=\"fpr:0.05\">"), "{html}");
-        assert!(html.contains("function rocSvg"));
+        assert!(js.contains("function rocSvg"));
     }
 
     #[tokio::test]
@@ -1816,8 +1825,13 @@ mod tests {
         let (s, page) = call(&st, get("/benchmark")).await;
         assert_eq!(s, StatusCode::OK);
         let page = page.as_str().unwrap();
-        assert!(page.contains("function nowOf(a)"));
-        assert!(page.contains("L.keep($(\"thresholds\")"));
+        assert!(
+            page.contains("<script src=\"/static/benchmark.js?v="),
+            "{page}"
+        );
+        let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
+        assert!(js.contains("function nowOf(a)"));
+        assert!(js.contains("L.keep($(\"thresholds\")"));
     }
 
     #[tokio::test]

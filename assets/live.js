@@ -1,15 +1,30 @@
 // Blue Onyx Prism: live config for every page. Polls GET /v1/config (ETag / If-None-Match, every
-// 2 s while the tab is visible and on focus), keeps the header's "pending changes - restart to
+// 2 s while the tab is visible and on focus; no timer runs while it is hidden; after a failure
+// the header says so and the period backs off to 30 s), keeps the header's "pending changes - restart to
 // apply" indicator current, and hands each new payload to the page scripts
 // (PrismLive.onConfig). Also the form helpers the pages use to refresh fields the user has not
 // edited while keeping (and marking) the ones they have.
 (function () {
   "use strict";
-  var PERIOD = 2000;
-  var listeners = [], etag = null, last = null, busy = null;
+  var PERIOD = 2000, MAX_PERIOD = 30000, RESTART_GIVE_UP_MS = 120000;
+  var listeners = [], etag = null, last = null, busy = null, failures = 0, timer = null;
 
   function emit(data, prev) {
     listeners.forEach(function (fn) { try { fn(data, prev); } catch (e) { if (window.console) console.error(e); } });
+  }
+  // Why a request failed, for the user: "HTTP 403", "not JSON (HTTP 200)", "no answer".
+  function why(e) { return (e && e.reason) || "no answer"; }
+  function failure(reason) { var e = new Error(reason); e.reason = reason; return e; }
+  // JSON body of a response; rejects with a readable reason on an error status or another body.
+  function json(r) {
+    if (!r.ok) return Promise.reject(failure("HTTP " + r.status + (r.statusText ? " " + r.statusText : "")));
+    return r.json().catch(function () { throw failure("not JSON (HTTP " + r.status + ")"); });
+  }
+  // Header note while the server does not answer usefully (empty text hides it).
+  function liveStatus(text) {
+    var s = document.getElementById("live-status");
+    if (!s) return;
+    s.hidden = !text; s.textContent = text || "";
   }
   // Fetch /v1/config; resolves to the payload (the last one on 304 or error).
   function poll(force) {
@@ -18,11 +33,23 @@
     if (etag && !force) h["If-None-Match"] = etag;
     busy = fetch("/v1/config", {headers: h, cache: "no-store"}).then(function (r) {
       if (r.status === 304) return last;
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      etag = r.headers.get("ETag");
-      return r.json().then(function (j) { var prev = last; last = j; emit(j, prev); return j; });
-    }).catch(function () { return last; }).then(function (j) { busy = null; return j; });
+      return json(r).then(function (j) { etag = r.headers.get("ETag"); var prev = last; last = j; emit(j, prev); return j; });
+    }).then(function (j) {
+      failures = 0; liveStatus(null); return j;
+    }, function (e) {
+      failures++;
+      liveStatus("Live updates: server " + (e && e.reason ? "answered " + why(e) : "not answering") + "; retrying in " + Math.round(delay() / 1000) + " s");
+      return last;
+    }).then(function (j) { busy = null; return j; });
     return busy;
+  }
+  // 2 s; after failures 4, 8, 16, then 30 s.
+  function delay() { return failures ? Math.min(MAX_PERIOD, PERIOD * Math.pow(2, Math.min(failures, 5))) : PERIOD; }
+  // One timer at a time, none while the tab is hidden.
+  function schedule() {
+    clearTimeout(timer); timer = null;
+    if (document.hidden) return;
+    timer = setTimeout(function () { timer = null; poll().then(schedule); }, delay());
   }
 
   // Header: "N pending changes - restart to apply".
@@ -69,23 +96,48 @@
     b.textContent = text || "Restarting\u2026 the page reloads (at the same place) when the server answers again.";
     return b;
   }
-  // Wait for the next registry generation, then reload in place.
+  // Restart buttons back to normal (the restart was refused or did not finish).
+  function restartButtons() {
+    document.querySelectorAll("[data-restart]").forEach(function (b) {
+      if (b.dataset.label !== undefined) { b.textContent = b.dataset.label; delete b.dataset.label; }
+      b.disabled = false;
+    });
+  }
+  function restartFailed(text) {
+    restarting(text).classList.add("gave-up");
+    restartButtons();
+  }
+  // Wait for the next registry generation, then reload in place; gives up after 2 minutes.
   function waitRestart(gen, epoch) {
-    setTimeout(function again() {
-      fetch("/v1/config", {cache: "no-store"}).then(function (r) { return r.json(); }).then(function (j) {
+    var started = Date.now();
+    function again() {
+      if (Date.now() - started > RESTART_GIVE_UP_MS) {
+        restartFailed("Still restarting after 2 minutes. Check the server log (or the service) and reload this page by hand.");
+        return;
+      }
+      fetch("/v1/config", {cache: "no-store", headers: {"Accept": "application/json"}}).then(json).then(function (j) {
         if (j.generation !== gen || j.epoch !== epoch) reloadKeep(); else setTimeout(again, 700);
-      }, function () { setTimeout(again, 700); });
-    }, 700);
+      }, function () { setTimeout(again, 1000); });
+    }
+    setTimeout(again, 700);
   }
   function afterRestart() { waitRestart(last ? last.generation : null, last ? last.epoch : null); }
   // Restart (existing POST /config/restart flow), then reload once the next generation answers.
   function restart(btn) {
     if (!confirm("Restart the server now? It reloads the config file and recompiles the enabled models.")) return;
     var gen = last ? last.generation : null, epoch = last ? last.epoch : null;
-    if (btn) { btn.disabled = true; btn.textContent = "Restarting…"; }
+    if (btn) { if (btn.dataset.label === undefined) btn.dataset.label = btn.textContent; btn.disabled = true; btn.textContent = "Restarting…"; }
     restarting();
     var done = function () { waitRestart(gen, epoch); };
-    fetch("/config/restart", {method: "POST", headers: {"Accept": "application/json"}}).then(done, done);
+    fetch("/config/restart", {method: "POST", headers: {"Accept": "application/json"}}).then(function (r) {
+      // Refused (403 from another machine, a rejected origin, ...): nothing restarts.
+      if (r.status >= 400 && r.status < 500) {
+        return r.json().catch(function () { return {}; }).then(function (j) {
+          restartFailed("Restart refused (HTTP " + r.status + ")" + (j && j.message ? ": " + j.message : "."));
+        });
+      }
+      done();
+    }, done);
   }
   document.addEventListener("click", function (e) {
     var b = e.target.closest && e.target.closest("[data-restart]");
@@ -367,7 +419,11 @@
     say(m, "muted", "working…");
     var fire = function (ok, j) { form.dispatchEvent(new CustomEvent("prism:action", {bubbles: true, detail: {ok: ok, json: j, button: by, message: m}})); };
     return fetch(url, {method: "POST", body: new URLSearchParams(data), headers: {"Accept": "application/json"}})
-      .then(function (r) { return r.json().then(function (j) { j._status = r.status; return j; }); })
+      .then(function (r) {
+        return r.json().then(function (j) { j._status = r.status; return j; }, function () {
+          return {success: false, _status: r.status, message: "the server answered HTTP " + r.status + (r.statusText ? " " + r.statusText : "") + (r.status === 403 ? " (not allowed from here)" : "")};
+        });
+      })
       .then(function (j) {
         if (by) { by.disabled = false; by.textContent = label; }
         say(m, j.success ? "ok-text" : "error-text", j.message || (j.success ? "done" : "failed"));
@@ -385,6 +441,34 @@
     submitAjax(form, by);
   });
 
+  // ---- the restart page (message.html) ---------------------------------------------------------
+  // `#restart-status[data-generation]`: poll until the next generation serves, then go to
+  // `data-target` (a path on this server; anything else goes home). Gives up after 2 minutes.
+  function restartPage() {
+    var status = document.getElementById("restart-status");
+    if (!status || status.dataset.generation === undefined) return;
+    var target = status.dataset.target || "/", gen = Number(status.dataset.generation), started = Date.now();
+    if (!/^\/(?![\/\\])/.test(target)) target = "/";
+    function tick() {
+      var secs = Math.round((Date.now() - started) / 1000);
+      if (Date.now() - started > RESTART_GIVE_UP_MS) {
+        status.textContent = "The server has not come back after " + secs + " s. Check the server log (or the service) and reload this page by hand.";
+        status.className = "error";
+        return;
+      }
+      fetch("/v1/config", {cache: "no-store", headers: {"Accept": "application/json"}}).then(json).then(function (j) {
+        if (j.generation === gen) throw failure("same generation");
+        status.textContent = "Server is back; reloading…";
+        location.href = target;
+      }).catch(function () {
+        status.textContent = "Waiting for the server… (" + secs + " s)";
+        setTimeout(tick, 1000);
+      });
+    }
+    setTimeout(tick, 1500);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", restartPage); else restartPage();
+
   window.PrismLive = {
     onConfig: function (fn) { listeners.push(fn); if (last) fn(last, null); },
     poll: poll,
@@ -401,8 +485,9 @@
     view: {capture: capture, restore: restore, busy: busyIn},
     ui: {edited: edited, current: current, baseline: baseline, same: same, set: set, flash: flash, note: note, refresh: refresh, markEdits: markEdits}
   };
-  poll();
-  setInterval(function () { if (!document.hidden) poll(); }, PERIOD);
-  window.addEventListener("focus", function () { poll(); });
-  document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
+  poll().then(schedule);
+  window.addEventListener("focus", function () { if (!document.hidden) poll(); });
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) { clearTimeout(timer); timer = null; } else poll().then(schedule);
+  });
 })();

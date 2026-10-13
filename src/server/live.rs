@@ -1,8 +1,10 @@
 //! Live config for the pages:
-//! - `GET /v1/config`: the effective config, its revision and change log, per model what is
-//!   configured vs what the running worker uses, what a restart would apply, and the main
-//!   form's field values the Config page refreshes untouched fields from (ETag /
-//!   If-None-Match);
+//! - `GET /v1/config`: for an admin peer ([`super::admin_allowed`]) the effective config, its
+//!   revision and change log, per model what is configured vs what the running worker uses,
+//!   what a restart would apply, and the main form's field values the Config page refreshes
+//!   untouched fields from (ETag / If-None-Match); for anyone else only the revision,
+//!   generation and epoch counters plus the pending-change count the pages' restart poller
+//!   and header indicator need ([`minimal_payload`]), read without touching the config file;
 //! - the Config page's forms ([`server_form_edit`], [`models_card_edit`]): applied as
 //!   submitted (last write wins; the change log keeps what changed).
 
@@ -367,13 +369,40 @@ fn pending_json(p: &Pending, cfg: &Config) -> Value {
     })
 }
 
-/// `GET /v1/config` with a weak ETag over the payload (If-None-Match answers 304).
+/// The `GET /v1/config` answer for a client that may not administer: the counters the restart
+/// poller (`live.js`, `message.html`) compares and the header's pending-change count. No file
+/// read, no model reload ([`super::sync_config`] is not called), nothing of the config itself.
+pub(super) fn minimal_payload(state: &AppState) -> Value {
+    let (revision, cfg) = state.config.snapshot();
+    let pending = config_merge::pending(&state.running(), &cfg);
+    json!({
+        "success": true,
+        "revision": revision,
+        "epoch": state.config.epoch(),
+        "generation": state.config.generation(),
+        "restartNeeded": pending.restart_needed(),
+        "pendingCount": pending.count(),
+    })
+}
+
+/// `GET /v1/config` with a weak ETag over the payload (If-None-Match answers 304). The full
+/// [`payload`] for admin peers, [`minimal_payload`] for everyone else (SV-05).
 pub(super) async fn config_json(
     State(state): State<Arc<AppState>>,
+    peer: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        axum::extract::rejection::ExtensionRejection,
+    >,
     headers: HeaderMap,
 ) -> Response {
-    // Reads the config file when it changed on disk, `benchmark.json`, and probes devices.
-    let body = super::blocking(move || payload(&state)).await;
+    let peer = peer.ok().map(|c| c.0);
+    let admin = super::admin_allowed(peer, state.config_read().allow_remote_admin);
+    let body = if admin {
+        // Reads the config file when it changed on disk, `benchmark.json`, and probes devices.
+        super::blocking(move || payload(&state)).await
+    } else {
+        minimal_payload(&state)
+    };
     let text = body.to_string();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);

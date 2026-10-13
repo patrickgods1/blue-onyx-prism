@@ -13,6 +13,7 @@ use super::status::{
 };
 use crate::config::Config;
 use crate::model::ModelFamilyKind;
+use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 
 /// Why an action was refused.
@@ -441,8 +442,39 @@ fn model_files_in(dir: &Path) -> Vec<(String, PathBuf)> {
     by_stem
 }
 
-/// The single model file in `dir` (or its `onnx/` subdirectory).
-fn pick_model_in_dir(dir: &Path) -> Result<PathBuf, ActionError> {
+/// Largest class-names YAML "Add a model by path" parses (RS-16: the path is admin input).
+pub const MAX_CLASSES_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Whether `p` is under `root` (either spelling: as given or canonical).
+fn under_root(p: &Path, root: &Path) -> bool {
+    if p.starts_with(root) {
+        return true;
+    }
+    match (p.canonicalize(), root.canonicalize()) {
+        (Ok(a), Ok(b)) => a.starts_with(b),
+        _ => false,
+    }
+}
+
+/// `load_class_names` behind a size cap, so the form cannot make the service parse an arbitrary
+/// large file as YAML.
+fn load_classes_capped(p: &Path) -> anyhow::Result<Vec<String>> {
+    let len = std::fs::metadata(p)
+        .with_context(|| format!("reading {}", p.display()))?
+        .len();
+    if len > MAX_CLASSES_FILE_BYTES {
+        anyhow::bail!(
+            "classes file {} is {len} bytes; the limit is {MAX_CLASSES_FILE_BYTES}",
+            p.display()
+        );
+    }
+    crate::model::classes::load_class_names(p)
+}
+
+/// The single model file in `dir` (or its `onnx/` subdirectory). The names found are only
+/// echoed when `dir` is under the data root (RS-16: no directory listing of arbitrary paths
+/// in error messages).
+fn pick_model_in_dir(dir: &Path, list_names: bool) -> Result<PathBuf, ActionError> {
     let mut found = model_files_in(dir);
     if found.is_empty() {
         found = model_files_in(&dir.join("onnx"));
@@ -453,15 +485,19 @@ fn pick_model_in_dir(dir: &Path) -> Result<PathBuf, ActionError> {
             dir.display()
         ))),
         1 => Ok(found.remove(0).1),
-        _ => {
+        n => {
             let names: Vec<String> = found
                 .iter()
                 .filter_map(|(_, p)| p.file_name().map(|n| n.to_string_lossy().to_string()))
                 .collect();
+            let which = if list_names {
+                format!(" ({})", names.join(", "))
+            } else {
+                String::new()
+            };
             Err(ActionError::Conflict(format!(
-                "{} holds several models ({}); give the path of the model file instead",
-                dir.display(),
-                names.join(", ")
+                "{} holds {n} model files{which}; give the path of the model file instead",
+                dir.display()
             )))
         }
     }
@@ -476,7 +512,7 @@ pub fn add_custom_model(config: &mut Config, req: &CustomModel) -> Result<String
     }
     let given = config.data_path(Path::new(raw));
     let file = if given.is_dir() {
-        pick_model_in_dir(&given)?
+        pick_model_in_dir(&given, under_root(&given, &config.data_root()))?
     } else if given.is_file() {
         if model_ext(&given).is_none() {
             return Err(ActionError::BadRequest(format!(
@@ -532,8 +568,7 @@ pub fn add_custom_model(config: &mut Config, req: &CustomModel) -> Result<String
                     p.display()
                 )));
             }
-            crate::model::classes::load_class_names(&p)
-                .map_err(|e| ActionError::BadRequest(format!("{e:#}")))?;
+            load_classes_capped(&p).map_err(|e| ActionError::BadRequest(format!("{e:#}")))?;
             Some(p)
         }
         None => {
@@ -544,7 +579,7 @@ pub fn add_custom_model(config: &mut Config, req: &CustomModel) -> Result<String
                 let ok: Vec<PathBuf> = ["classes.yaml", "classes.yml", "data.yaml", "names.yaml"]
                     .iter()
                     .map(|n| dir.join(n))
-                    .filter(|p| p.is_file() && crate::model::classes::load_class_names(p).is_ok())
+                    .filter(|p| p.is_file() && load_classes_capped(p).is_ok())
                     .collect();
                 match ok.as_slice() {
                     [only] => Some(only.clone()),
@@ -724,11 +759,49 @@ mod custom_model_tests {
     #[test]
     fn dir_with_two_stems_conflicts() {
         let (d, mut c) = setup();
+        // Outside the data root the names are not listed (RS-16), only the count.
         touch(&d.outside.join("a.onnx"));
         touch(&d.outside.join("b.onnx"));
         let e = add_custom_model(&mut c, &req(&d.outside)).unwrap_err();
         assert!(matches!(e, ActionError::Conflict(_)), "{e}");
-        assert!(e.message().contains("a.onnx") && e.message().contains("file"));
+        assert!(!e.message().contains("a.onnx"), "{e}");
+        assert!(e.message().contains("2 model files"), "{e}");
+        // Under the data root they are.
+        let inside = c.data_root().join("custom");
+        touch(&inside.join("a.onnx"));
+        touch(&inside.join("b.onnx"));
+        let e = add_custom_model(&mut c, &req(&inside)).unwrap_err();
+        assert!(matches!(e, ActionError::Conflict(_)), "{e}");
+        assert!(
+            e.message().contains("a.onnx") && e.message().contains("file"),
+            "{e}"
+        );
+        let e = add_custom_model(&mut c, &req(Path::new("custom"))).unwrap_err();
+        assert!(e.message().contains("b.onnx"), "{e}");
+    }
+
+    #[test]
+    fn classes_file_size_is_capped() {
+        let (d, mut c) = setup();
+        let f = d.outside.join("m.onnx");
+        touch(&f);
+        let big = d.outside.join("big.yaml");
+        let mut text = String::from("names:\n");
+        while (text.len() as u64) <= MAX_CLASSES_FILE_BYTES {
+            text.push_str("- aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        }
+        std::fs::write(&big, &text).unwrap();
+        let r = CustomModel {
+            classes: Some(big.to_string_lossy().to_string()),
+            ..req(&f)
+        };
+        let e = add_custom_model(&mut c, &r).unwrap_err();
+        assert_eq!(e.status(), 400);
+        assert!(e.message().contains("limit"), "{e}");
+        // An oversized sidecar is ignored instead of adopted.
+        std::fs::write(d.outside.join("data.yaml"), &text).unwrap();
+        add_custom_model(&mut c, &req(&f)).unwrap();
+        assert_eq!(c.models[0].classes, None);
     }
 
     #[test]

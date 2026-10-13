@@ -141,8 +141,9 @@ pub struct Cli {
     /// only).
     #[arg(long)]
     pub bind_address: Option<std::net::IpAddr>,
-    /// Serve the admin pages (Config, Test, Logs, Benchmark, resources) to other machines too
-    /// (config `allow_remote_admin`; default: loopback clients only).
+    /// Serve the admin pages (Config, Test, Logs, Benchmark, resources) to other machines too,
+    /// for this run only (not written to the config; set `allow_remote_admin` there to keep it;
+    /// default: loopback clients only).
     #[arg(long)]
     pub allow_remote_admin: bool,
     /// Model file (.xml OpenVINO IR or .onnx). Replaces the configured model list unless
@@ -164,7 +165,7 @@ pub struct Cli {
     /// Device index added to a GPU device spec that has none (GPU -> GPU.N, ort:cuda -> ort:cuda:N).
     #[arg(long)]
     pub gpu_index: Option<u32>,
-    /// Force CPU inference.
+    /// Force CPU inference, for this run only (not written to the config; see `force_cpu`).
     #[arg(long)]
     pub force_cpu: bool,
     #[arg(long)]
@@ -178,6 +179,8 @@ pub struct Cli {
     pub log_path: Option<PathBuf>,
     #[arg(long)]
     pub save_image_path: Option<PathBuf>,
+    /// Also save the unannotated image, for this run only (not written to the config; see
+    /// `save_ref_image`).
     #[arg(long)]
     pub save_ref_image: bool,
     #[arg(long)]
@@ -201,7 +204,9 @@ pub struct Cli {
 /// Load the config file (explicit `--config`, else the default path if it exists, else
 /// defaults), apply every CLI option that was given, validate the result
 /// ([`Config::validate`]; an invalid result is an error and the file is not written) and write
-/// it back when it differs from the file (or the file does not exist yet).
+/// it back when it differs from the file (or the file does not exist yet). The one-off flags
+/// (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`) apply to the returned config
+/// only and are never written back ([`without_one_off_flags`]).
 pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     let path = cli
         .config
@@ -221,11 +226,37 @@ pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     config
         .validate()
         .context("invalid command-line option (the config file was not changed)")?;
-    let unchanged = existed && config.saved_text()? == loaded.saved_text()?;
-    if !unchanged && let Err(e) = config.save(&path) {
+    let to_save = without_one_off_flags(&config, &loaded);
+    let unchanged = existed && to_save.saved_text()? == loaded.saved_text()?;
+    if !unchanged && let Err(e) = to_save.save(&path) {
         tracing::warn!("could not save merged config: {e:#}");
     }
     Ok((config, path))
+}
+
+/// `config` with the one-off boolean flags (`allow_remote_admin`, `force_cpu`,
+/// `save_ref_image`) put back to their values in `file`: what the CLI merge writes to disk. A
+/// test run with `--allow-remote-admin` must not leave the admin surface open on later starts.
+fn without_one_off_flags(config: &Config, file: &Config) -> Config {
+    Config {
+        allow_remote_admin: file.allow_remote_admin,
+        force_cpu: file.force_cpu,
+        save_ref_image: file.save_ref_image,
+        ..config.clone()
+    }
+}
+
+/// Log the settings of the starting config that widen what the service exposes or does (call
+/// once logging is up, at every start). `allow_remote_admin` is logged at warn.
+pub fn log_startup_warnings(config: &Config) {
+    if config.allow_remote_admin {
+        tracing::warn!(
+            "allow_remote_admin is on: the admin pages and actions (config editor, file browser, \
+             downloads, model export, restarts) answer every client that can reach port {} \
+             without authentication",
+            config.port
+        );
+    }
 }
 
 /// Whether two model paths name the same file: equal as given, or equal once both are
@@ -519,8 +550,11 @@ pub type LogBase = Layered<reload::Layer<EnvFilter, Registry>, Registry>;
 /// An additional log sink (e.g. the Windows event log in the service binary).
 pub type ExtraLogLayer = Box<dyn Layer<LogBase> + Send + Sync>;
 
+/// Daily log files kept under `log_path` (two weeks).
+pub const MAX_LOG_FILES: usize = 14;
+
 /// Initialize global tracing. Logs to stdout, or to a daily rolling file in `log_path`
-/// when given.
+/// when given (the newest [`MAX_LOG_FILES`] are kept).
 pub fn init_logging(level: LogLevel, log_path: Option<&Path>) -> Result<LogReloadHandle> {
     init_logging_with(level, log_path, None)
 }
@@ -544,7 +578,14 @@ pub fn init_logging_with(
         Some(dir) => {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating log dir {}", dir.display()))?;
-            let appender = tracing_appender::rolling::daily(dir, "blue_onyx_prism.log");
+            // `blue_onyx_prism.log.<date>`, one per day; the oldest beyond MAX_LOG_FILES are
+            // deleted, so a long-running service cannot fill the disk with logs.
+            let appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("blue_onyx_prism.log")
+                .max_log_files(MAX_LOG_FILES)
+                .build(dir)
+                .with_context(|| format!("opening the log file in {}", dir.display()))?;
             let (writer, guard) = tracing_appender::non_blocking(appender);
             registry
                 .with(
@@ -726,6 +767,49 @@ mod tests {
         assert_eq!(cfg.bind_address.to_string(), "::");
         assert!(cfg.allow_remote_admin);
         assert!(Cli::try_parse_from(["x", "--bind-address", "localhost"]).is_err());
+    }
+
+    #[test]
+    fn one_off_flags_are_not_written_back() {
+        let path = temp_cfg();
+        Config {
+            port: 4000,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let cli = Cli {
+            config: Some(path.clone()),
+            port: Some(5000),
+            allow_remote_admin: true,
+            force_cpu: true,
+            save_ref_image: true,
+            ..Default::default()
+        };
+        let (c, _) = resolve_config(&cli).unwrap();
+        // In memory: applied.
+        assert!(c.allow_remote_admin && c.force_cpu && c.save_ref_image);
+        // On disk: the ordinary option is written, the one-off flags are not.
+        let disk = Config::load(&path).unwrap();
+        assert_eq!(disk.port, 5000);
+        assert!(!disk.allow_remote_admin && !disk.force_cpu && !disk.save_ref_image);
+
+        // Flags alone do not rewrite an existing file; values set in the file stay.
+        let file = Config {
+            force_cpu: true,
+            ..Default::default()
+        };
+        file.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let cli = Cli {
+            config: Some(path.clone()),
+            allow_remote_admin: true,
+            ..Default::default()
+        };
+        let (c, _) = resolve_config(&cli).unwrap();
+        assert!(c.allow_remote_admin && c.force_cpu);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

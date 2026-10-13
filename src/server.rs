@@ -13,7 +13,7 @@ use askama::Template;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +27,7 @@ mod browse;
 mod config_page;
 mod detect;
 mod devices;
+mod guard;
 mod live;
 mod pages;
 mod resources;
@@ -44,7 +45,7 @@ use detect::{custom_list, detection_custom, detection_default};
 use devices::model_selection;
 use devices::{DevicesSnapshot, devices_json, devices_snapshot};
 use pages::{
-    fallback, favicon, live_js, logs_json, logs_page, prometheus, stats_json, stats_page,
+    favicon, live_js, logs_json, logs_page, prometheus, static_asset, stats_json, stats_page,
     style_css, test_page, test_submit, update_available, welcome,
 };
 use resources::{
@@ -138,60 +139,82 @@ impl AppState {
     }
 }
 
+/// The open routes: Blue Iris (often on another machine), monitoring, static files and the
+/// minimal `/v1/config` the pages' restart poller uses. Every path here answers remote peers;
+/// `router_classification` in the tests checks the list against the expected set.
+fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
+    vec![
+        ("/", get(welcome)),
+        ("/v1/vision/detection", post(detection_default)),
+        ("/v1/vision/custom/list", get(custom_list).post(custom_list)),
+        ("/v1/vision/custom/{model}", post(detection_custom)),
+        ("/v1/status/updateavailable", get(update_available)),
+        ("/v1/devices", get(devices_json)),
+        ("/v1/config", get(live::config_json)),
+        ("/stats.json", get(stats_json)),
+        ("/prometheus", get(prometheus)),
+        ("/static/style.css", get(style_css)),
+        ("/static/live.js", get(live_js)),
+        ("/static/{file}", get(static_asset)),
+        ("/favicon.ico", get(favicon)),
+    ]
+}
+
+/// The administration routes: loopback clients only unless `allow_remote_admin`
+/// ([`admin_only`]), and no cross-site state changes ([`guard::csrf`]).
+fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
+    vec![
+        ("/v1/resources", get(resources_json)),
+        ("/v1/resources/download", post(resources_download)),
+        ("/v1/resources/remove", post(resources_remove)),
+        ("/v1/resources/add-to-config", post(resources_add_to_config)),
+        ("/v1/models/add", post(models_add)),
+        ("/v1/fs/browse", get(browse::browse)),
+        ("/v1/resources/export", post(resources_export)),
+        ("/v1/resources/export/cancel", post(resources_export_cancel)),
+        ("/stats", get(stats_page)),
+        ("/test", get(test_page).post(test_submit)),
+        ("/config", get(config_page).post(config_submit)),
+        ("/config/models", post(config_models)),
+        ("/config/restart", post(config_restart)),
+        ("/config/loglevel", post(config_loglevel)),
+        ("/logs", get(logs_page)),
+        ("/logs.json", get(logs_json)),
+        ("/benchmark", get(benchmark::page)),
+        (
+            "/v1/benchmark",
+            get(benchmark::status).post(benchmark::start),
+        ),
+        ("/v1/benchmark/cancel", post(benchmark::cancel)),
+        ("/v1/benchmark/apply", post(benchmark::apply)),
+        (
+            "/v1/benchmark/apply-threshold",
+            post(benchmark::apply_threshold),
+        ),
+        (
+            "/v1/benchmark/threshold-search",
+            get(benchmark::search_options).post(benchmark::threshold_search),
+        ),
+        ("/v1/benchmark/settings", post(benchmark::settings)),
+        ("/v1/benchmark/images", get(benchmark::images_detail)),
+        ("/v1/benchmark/image", get(benchmark::image_file)),
+    ]
+}
+
 /// The router. Every handler reads the generation that is current when its request arrives
 /// (see [`Shared`]); a plain `Arc<AppState>` works for tests and makes a fixed one.
 pub fn router(state: impl Into<Shared>) -> Router {
     let shared: Shared = state.into();
-    // Open to every client: Blue Iris (often on another machine), monitoring and read-only JSON.
-    let open = Router::new()
-        .route("/", get(welcome))
-        .route("/v1/vision/detection", post(detection_default))
-        .route("/v1/vision/custom/list", get(custom_list).post(custom_list))
-        .route("/v1/vision/custom/{model}", post(detection_custom))
-        .route("/v1/status/updateavailable", get(update_available))
-        .route("/v1/devices", get(devices_json))
-        .route("/v1/config", get(live::config_json))
-        .route("/stats.json", get(stats_json))
-        .route("/prometheus", get(prometheus))
-        .route("/static/style.css", get(style_css))
-        .route("/static/live.js", get(live_js))
-        .route("/favicon.ico", get(favicon));
-    // Administration: loopback clients only unless `allow_remote_admin` ([`admin_only`]).
-    let admin = Router::new()
-        .route("/v1/resources", get(resources_json))
-        .route("/v1/resources/download", post(resources_download))
-        .route("/v1/resources/remove", post(resources_remove))
-        .route("/v1/resources/add-to-config", post(resources_add_to_config))
-        .route("/v1/models/add", post(models_add))
-        .route("/v1/fs/browse", get(browse::browse))
-        .route("/v1/resources/export", post(resources_export))
-        .route("/v1/resources/export/cancel", post(resources_export_cancel))
-        .route("/stats", get(stats_page))
-        .route("/test", get(test_page).post(test_submit))
-        .route("/config", get(config_page).post(config_submit))
-        .route("/config/models", post(config_models))
-        .route("/config/restart", post(config_restart))
-        .route("/config/loglevel", post(config_loglevel))
-        .route("/logs", get(logs_page))
-        .route("/logs.json", get(logs_json))
-        .route("/benchmark", get(benchmark::page))
-        .route(
-            "/v1/benchmark",
-            get(benchmark::status).post(benchmark::start),
-        )
-        .route("/v1/benchmark/cancel", post(benchmark::cancel))
-        .route("/v1/benchmark/apply", post(benchmark::apply))
-        .route(
-            "/v1/benchmark/apply-threshold",
-            post(benchmark::apply_threshold),
-        )
-        .route(
-            "/v1/benchmark/threshold-search",
-            get(benchmark::search_options).post(benchmark::threshold_search),
-        )
-        .route("/v1/benchmark/settings", post(benchmark::settings))
-        .route("/v1/benchmark/images", get(benchmark::images_detail))
-        .route("/v1/benchmark/image", get(benchmark::image_file))
+    let mut open = Router::new();
+    for (path, method) in open_routes() {
+        open = open.route(path, method);
+    }
+    let mut admin = Router::new();
+    for (path, method) in admin_routes() {
+        admin = admin.route(path, method);
+    }
+    let admin = admin
+        .route_layer(axum::middleware::from_fn(guard::csrf))
         .route_layer(axum::middleware::from_fn_with_state(
             shared.clone(),
             admin_only,
@@ -204,7 +227,29 @@ pub fn router(state: impl Into<Shared>) -> Router {
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(axum::middleware::from_fn(catch_panic))
+        .layer(axum::middleware::map_response(guard::security_headers))
         .with_state(shared)
+}
+
+/// 404 for an unknown path: JSON for API clients, a short page for browsers. The path is
+/// never echoed (not even escaped), so nothing a client sends appears in the answer.
+async fn fallback(headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        (
+            StatusCode::NOT_FOUND,
+            Html(
+                "<!doctype html><title>Not found</title><h1>Not found</h1>\
+                 <p>There is no page at this address. <a href=\"/\">Home</a></p>",
+            ),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "Not found" })),
+        )
+            .into_response()
+    }
 }
 
 /// Test-only route: a handler that panics.
@@ -653,6 +698,320 @@ mod tests {
         assert!(!ok("[::ffff:10.0.0.5]:1"));
         assert!(!admin_allowed(None, false));
         assert!(admin_allowed(Some("10.0.0.5:1".parse().unwrap()), true));
+    }
+
+    /// Every route of the router, classified. A new route must be added here: the test fails
+    /// when the router has a path this list does not (and the other way round), and probes
+    /// each path from a remote peer (admin routes answer 403, open ones never do).
+    #[tokio::test]
+    async fn router_classification() {
+        const OPEN: &[&str] = &[
+            "/",
+            "/v1/vision/detection",
+            "/v1/vision/custom/list",
+            "/v1/vision/custom/{model}",
+            "/v1/status/updateavailable",
+            "/v1/devices",
+            "/v1/config",
+            "/stats.json",
+            "/prometheus",
+            "/favicon.ico",
+        ];
+        const ADMIN: &[&str] = &[
+            "/v1/resources",
+            "/v1/resources/download",
+            "/v1/resources/remove",
+            "/v1/resources/add-to-config",
+            "/v1/models/add",
+            "/v1/fs/browse",
+            "/v1/resources/export",
+            "/v1/resources/export/cancel",
+            "/stats",
+            "/test",
+            "/config",
+            "/config/models",
+            "/config/restart",
+            "/config/loglevel",
+            "/logs",
+            "/logs.json",
+            "/benchmark",
+            "/v1/benchmark",
+            "/v1/benchmark/cancel",
+            "/v1/benchmark/apply",
+            "/v1/benchmark/apply-threshold",
+            "/v1/benchmark/threshold-search",
+            "/v1/benchmark/settings",
+            "/v1/benchmark/images",
+            "/v1/benchmark/image",
+        ];
+        // Static files are open as a group (`/static/*`).
+        let is_open = |p: &str| OPEN.contains(&p) || p.starts_with("/static/");
+        let open: Vec<&str> = open_routes().into_iter().map(|(p, _)| p).collect();
+        let admin: Vec<&str> = admin_routes().into_iter().map(|(p, _)| p).collect();
+        for p in &open {
+            assert!(is_open(p), "open route {p} is not in the expected open set");
+            assert!(!ADMIN.contains(p), "{p} is both open and admin");
+        }
+        for p in OPEN {
+            assert!(open.contains(p), "expected open route {p} is not routed");
+        }
+        for p in &admin {
+            assert!(
+                ADMIN.contains(p),
+                "admin route {p} is not in the expected admin set"
+            );
+        }
+        for p in ADMIN {
+            assert!(admin.contains(p), "expected admin route {p} is not routed");
+        }
+        let mut all: Vec<&str> = open.iter().chain(admin.iter()).copied().collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "a path is routed twice");
+
+        let state = test_state();
+        let probe = |p: &str| p.replace("{model}", "x").replace("{file}", "x.js");
+        for p in &admin {
+            for method in ["GET", "POST"] {
+                let (s, _, _) = call(&state, from(REMOTE, method, &probe(p), false)).await;
+                assert_eq!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
+            }
+        }
+        for p in &open {
+            for method in ["GET", "POST"] {
+                let (s, _, _) = call(&state, from(REMOTE, method, &probe(p), false)).await;
+                assert_ne!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
+            }
+        }
+    }
+
+    /// SV-01: a state-changing admin request from another site is refused, same-origin and
+    /// header-less ones reach the handler.
+    #[tokio::test]
+    async fn cross_site_admin_posts_are_refused() {
+        let state = test_state();
+        let post = |headers: &[(&str, &str)], html: bool| {
+            let mut b = Request::post("/config")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            if html {
+                b = b.header(header::ACCEPT, "text/html");
+            }
+            from_peer(b.body(Body::from("port=4000")).unwrap(), LOCAL)
+        };
+        let host = ("host", "localhost:32168");
+        // Cross-site: 403 as JSON, and as a page for browsers; the config is untouched.
+        for headers in [
+            vec![host, ("sec-fetch-site", "cross-site")],
+            vec![host, ("origin", "http://evil.example")],
+            vec![host, ("origin", "null")],
+            vec![host, ("referer", "http://evil.example/page")],
+            vec![host, ("origin", "http://localhost:8080")],
+        ] {
+            let (s, h, b) = call(&state, post(&headers, false)).await;
+            let body = String::from_utf8_lossy(&b).to_string();
+            assert_eq!(s, StatusCode::FORBIDDEN, "{headers:?}: {body}");
+            assert!(
+                h[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json")
+            );
+            let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            assert_eq!(j["success"], false);
+            assert!(j["message"].as_str().unwrap().contains("Cross-site"), "{j}");
+            let (s, h, b) = call(&state, post(&headers, true)).await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+            assert!(
+                h[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html")
+            );
+            assert!(String::from_utf8_lossy(&b).contains("Forbidden"));
+            assert_eq!(state.config_read().port, Config::default().port);
+        }
+        // Same-origin (Origin, Referer, Sec-Fetch-Site) and header-less: the handler runs.
+        for (i, headers) in [
+            vec![host, ("origin", "http://localhost:32168")],
+            vec![host, ("referer", "http://localhost:32168/config")],
+            vec![host, ("sec-fetch-site", "same-origin")],
+            vec![host],
+            vec![
+                host,
+                ("origin", "http://LOCALHOST:32168"),
+                ("sec-fetch-site", "none"),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let port = format!("port={}", 4001 + i);
+            let req = {
+                let mut b = Request::post("/config")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::ACCEPT, "application/json");
+                for (k, v) in &headers {
+                    b = b.header(*k, *v);
+                }
+                from_peer(b.body(Body::from(port)).unwrap(), LOCAL)
+            };
+            let (s, _, b) = call(&state, req).await;
+            assert_eq!(
+                s,
+                StatusCode::OK,
+                "{headers:?}: {}",
+                String::from_utf8_lossy(&b)
+            );
+            assert_eq!(state.config_read().port, 4001 + i as u16, "{headers:?}");
+        }
+        // GET is never checked (nothing changes, nothing is readable cross-site).
+        let req = from_peer(
+            Request::get("/config")
+                .header("host", "localhost:32168")
+                .header("origin", "http://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+            LOCAL,
+        );
+        let (s, _, _) = call(&state, req).await;
+        assert_eq!(s, StatusCode::OK);
+        // Detection and custom/list are never affected.
+        let req = from_peer(
+            Request::post("/v1/vision/custom/list")
+                .header("sec-fetch-site", "cross-site")
+                .header("origin", "http://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+            REMOTE,
+        );
+        let (s, _, _) = call(&state, req).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    /// SV-05: `GET /v1/config` gives a non-admin peer only the restart poller's counters.
+    #[tokio::test]
+    async fn config_json_is_minimal_for_non_admin_peers() {
+        let state = test_state();
+        let (s, h, b) = call(&state, from(REMOTE, "GET", "/v1/config", false)).await;
+        assert_eq!(s, StatusCode::OK);
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let mut keys: Vec<&str> = j.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "epoch",
+                "generation",
+                "pendingCount",
+                "restartNeeded",
+                "revision",
+                "success"
+            ]
+        );
+        assert!(j["revision"].is_u64() && j["generation"].is_u64() && j["epoch"].is_u64());
+        assert!(h.contains_key(header::ETAG));
+        // The ETag round-trips to 304.
+        let etag = h[header::ETAG].to_str().unwrap().to_string();
+        let req = from_peer(
+            Request::get("/v1/config")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .unwrap(),
+            REMOTE,
+        );
+        let (s, _, _) = call(&state, req).await;
+        assert_eq!(s, StatusCode::NOT_MODIFIED);
+        // Nothing of the config was read or written from disk for it.
+        assert!(!state.config_path.exists());
+        // This machine (and remote peers with `allow_remote_admin`) get the full payload.
+        let (_, _, b) = call(&state, from(LOCAL, "GET", "/v1/config", false)).await;
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(j["config"].is_object() && j["models"].is_array() && j["path"].is_string());
+        state
+            .config
+            .update("test", |c| {
+                c.allow_remote_admin = true;
+                Ok(())
+            })
+            .unwrap();
+        let (_, _, b) = call(&state, from(REMOTE, "GET", "/v1/config", false)).await;
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(j["config"].is_object());
+    }
+
+    /// SV-09: security headers on every answer, CSP on pages, no-store on JSON, a fallback
+    /// that never echoes the path, 405 for a method a path does not take.
+    #[tokio::test]
+    async fn security_headers_fallback_and_405() {
+        let state = test_state();
+        let (s, h, _) = call(&state, from(LOCAL, "GET", "/config", true)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(h["referrer-policy"], "no-referrer");
+        assert_eq!(h["x-frame-options"], "DENY");
+        assert_eq!(h["content-security-policy"], guard::CSP);
+        assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");
+        let (s, h, _) = call(&state, from(REMOTE, "GET", "/stats.json", false)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert!(!h.contains_key("content-security-policy"));
+        // `/v1/config` keeps its own cache policy (ETag revalidation).
+        let (_, h, _) = call(&state, from(REMOTE, "GET", "/v1/config", false)).await;
+        assert_eq!(h[header::CACHE_CONTROL], "no-cache");
+        // The 403 page and the panic page carry them too.
+        let (s, h, _) = call(&state, from(REMOTE, "GET", "/config", true)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(h["content-security-policy"], guard::CSP);
+        assert_eq!(h["x-frame-options"], "DENY");
+
+        // Fallback: the path (with markup) is not in the answer, as JSON or HTML.
+        let evil = "/no/such/%3Cscript%3Ealert(1)%3C/script%3E";
+        let (s, h, b) = call(&state, from(REMOTE, "GET", evil, false)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert!(
+            h[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let body = String::from_utf8_lossy(&b);
+        assert!(
+            !body.contains("script") && !body.contains("no/such"),
+            "{body}"
+        );
+        let (s, h, b) = call(&state, from(REMOTE, "GET", evil, true)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert!(
+            h[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let body = String::from_utf8_lossy(&b);
+        assert!(
+            !body.contains("script") && !body.contains("no/such"),
+            "{body}"
+        );
+        assert_eq!(h["content-security-policy"], guard::CSP);
+        let (s, _, _) = call(&state, from(REMOTE, "POST", "/nope", false)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // A method the path does not take: 405 (open route), 403 first on admin routes.
+        for (method, uri) in [
+            ("DELETE", "/v1/devices"),
+            ("PUT", "/"),
+            ("PATCH", "/stats.json"),
+        ] {
+            let (s, _, _) = call(&state, from(REMOTE, method, uri, false)).await;
+            assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+        }
+        let (s, _, _) = call(&state, from(LOCAL, "DELETE", "/logs", false)).await;
+        assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

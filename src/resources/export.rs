@@ -25,12 +25,37 @@
 //!   `TRANSFORMERS_OFFLINE=1` (nothing reaches the network or pip-installs anything), with its
 //!   settings and caches in our own `tools/export-config`.
 //! - **Contained**: everything lives under `<data root>/tools/` (see [`Paths`]); "Remove export
-//!   toolchain" deletes it. Inherited `PYTHON*`, `UV_*`, `PIP_*`, `CONDA_*`, `VIRTUAL_ENV`,
-//!   `YOLO_*`, `HF_*`, `TRANSFORMERS_*` and `TORCH_*` variables are dropped, uv runs with
-//!   `--no-config`.
-//! - Child processes run with captured output (streamed into the log), a timeout per stage and
-//!   cancellation (the child is killed). One export at a time ([`Exporter`] queues the rest; a
-//!   lock file serializes processes).
+//!   toolchain" deletes it. Each export runs in a fresh work directory under `tools/work/`.
+//!
+//! # Trust model of the child processes
+//!
+//! What runs, in order, and what each step trusts:
+//!
+//! 1. **Nothing executes before its hash is checked.** The `uv` binary (`tool:uv`), the
+//!    Python build uv installs (uv's own verification), every wheel (`--require-hashes` against
+//!    the embedded lock), the weights (catalog SHA-256 through the download manager) and, for
+//!    DEIMv2, the source archive (`tool:deimv2-src`, SHA-256, whitelist-extracted) are verified
+//!    before the stage that uses them starts. The export script is embedded in the binary.
+//! 2. **Minimal environment** (RS-07): the child starts from `env_clear()`; it inherits only
+//!    `PATH`, `HOME`/`USERPROFILE`, `SystemRoot` and the other Windows basics (`COMSPEC`,
+//!    `PATHEXT`, `APPDATA`, `LOCALAPPDATA`, `PROGRAMDATA`), `TEMP`/`TMP`/`TMPDIR`, `LANG`/`LC_*`,
+//!    the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, any case) and
+//!    `SSL_CERT_FILE`/`SSL_CERT_DIR` when the operator set them (a private CA for that proxy);
+//!    see [`inherited`]. Everything else (`PYTHON*`, `UV_*`, `PIP_*`, `CONDA_*`, `LD_*`,
+//!    `DYLD_*`, `REQUESTS_CA_BUNDLE`, `YOLO_*`, `HF_*`, `TORCH_*`, ...) never reaches it. On top
+//!    come the exporter's own [`Cmd::env`] entries: `UV_NO_CONFIG`, `UV_PYTHON_INSTALL_DIR`,
+//!    the offline switches and the cache dirs under `tools/`; uv also runs `--no-config`.
+//! 3. **Whole process tree is killed** (RS-02) on cancel, stage timeout and service stop: on
+//!    Unix the child leads its own process group and the group gets `SIGTERM`, then `SIGKILL`
+//!    after 1.5 s; on Windows the child is put in a Job Object with kill-on-close
+//!    ([`crate::backend::job`]), so helpers that uv or PyTorch spawn die with it, also when the
+//!    service process itself dies. Processes a child starts before the job assignment on
+//!    Windows (microseconds after spawn) are the one gap.
+//! 4. **Bounded output** (RS-08): stdout and stderr are read line by line (`\n` or `\r` ends a
+//!    line), each line is cut at [`MAX_OUTPUT_LINE`] bytes, and at most [`MAX_OUTPUT_LINES`]
+//!    lines wait between the reader threads and the log; a child that outruns the log blocks
+//!    on its pipe. The error message keeps the last 8 lines.
+//! 5. One export at a time ([`Exporter`] queues the rest; a lock file serializes processes).
 //!
 //! Stages ([`Stage`]): uv -> Python -> packages -> weights -> export -> install. The result,
 //! `models/<name>.onnx` + `.yaml`, is moved into place from a staging directory and recorded
@@ -556,64 +581,176 @@ pub trait Fetcher: Send + Sync {
     ) -> Result<()>;
 }
 
-/// Variables that could redirect Python, uv, pip, Ultralytics, Hugging Face or PyTorch; dropped
-/// from the child's environment.
-fn sanitized(key: &str) -> bool {
+/// Longest output line kept from a child (bytes); longer segments are cut and marked `...`
+/// (RS-08: progress bars rewrite one line for hours, a misbehaving child never emits a newline).
+pub const MAX_OUTPUT_LINE: usize = 4096;
+/// Output lines buffered between the reader threads and the runner; a child that outruns the
+/// log blocks on its pipe instead of growing memory.
+pub const MAX_OUTPUT_LINES: usize = 2000;
+
+/// Whether the child inherits `key` from the service's environment (RS-07). The child starts
+/// from an empty environment; only what a process needs to run, find its temp dir and reach the
+/// network through the operator's proxy comes through, plus [`Cmd::env`]. Everything that could
+/// redirect Python, uv, pip, the dynamic loader (`LD_*`, `DYLD_*`), the model libraries
+/// (`YOLO_*`, `HF_*`, `TORCH_*`) or the CA bundle of `requests`/curl is dropped.
+/// `SSL_CERT_FILE`/`SSL_CERT_DIR` pass through when the operator set them (a private CA for the
+/// proxy); nothing sets them by default.
+fn inherited(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
-    [
-        "PYTHON",
-        "UV_",
-        "PIP_",
-        "CONDA_",
-        "YOLO_",
-        "HF_",
-        "HUGGINGFACE_",
-        "TRANSFORMERS_",
-        "TORCH_",
-        "VIRTUAL_ENV",
-        "__PYVENV",
-    ]
-    .iter()
-    .any(|p| k.starts_with(p))
+    matches!(
+        k.as_str(),
+        "PATH"
+            | "HOME"
+            | "USERPROFILE"
+            | "SYSTEMROOT"
+            | "SYSTEMDRIVE"
+            | "COMSPEC"
+            | "PATHEXT"
+            | "APPDATA"
+            | "LOCALAPPDATA"
+            | "PROGRAMDATA"
+            | "TEMP"
+            | "TMP"
+            | "TMPDIR"
+            | "LANG"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "NO_PROXY"
+            | "ALL_PROXY"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+    ) || k.starts_with("LC_")
 }
 
 /// Spawns real processes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemRunner;
 
-impl CommandRunner for SystemRunner {
-    fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+/// A running child and the handle that kills its whole process tree: the process group on Unix
+/// (the child is its leader), a Job Object with kill-on-close on Windows ([`crate::backend::job`]).
+struct Tree {
+    child: std::process::Child,
+    #[cfg(windows)]
+    job: Option<crate::backend::job::Job>,
+}
+
+impl Tree {
+    fn spawn(cmd: &Cmd) -> Result<Self> {
         use std::process::{Command, Stdio};
         let mut c = Command::new(&cmd.program);
         c.args(&cmd.args)
             .current_dir(&cmd.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (k, _) in std::env::vars_os() {
-            if sanitized(&k.to_string_lossy()) {
-                c.env_remove(&k);
+            .stderr(Stdio::piped())
+            .env_clear();
+        for (k, v) in std::env::vars_os() {
+            if inherited(&k.to_string_lossy()) {
+                c.env(&k, &v);
             }
         }
         for (k, v) in &cmd.env {
             c.env(k, v);
         }
-        #[cfg(windows)]
+        #[cfg(unix)]
         {
+            use std::os::unix::process::CommandExt;
+            // Own process group (pgid = pid) so `kill_tree` reaches every descendant.
+            c.process_group(0);
+        }
+        #[cfg(windows)]
+        let job = {
             use std::os::windows::process::CommandExt;
             // CREATE_NO_WINDOW: no console window when the service runs it.
             c.creation_flags(0x0800_0000);
-        }
-        tracing::info!("running {}", cmd.display());
-        let mut child = c
+            match crate::backend::job::Job::new() {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    tracing::warn!("no job object for the export process tree: {e:#}");
+                    None
+                }
+            }
+        };
+        let child = c
             .spawn()
             .with_context(|| format!("starting {}", cmd.program.display()))?;
-        let (tx, rx) = crossbeam_channel::unbounded::<String>();
+        #[cfg(windows)]
+        if let Some(j) = &job
+            && let Err(e) = j.assign(&child)
+        {
+            tracing::warn!("export child not assigned to its job object: {e:#}");
+        }
+        Ok(Tree {
+            child,
+            #[cfg(windows)]
+            job,
+        })
+    }
+
+    /// Kill the child and every process it spawned, then reap the child.
+    fn kill_tree(&mut self) {
+        #[cfg(unix)]
+        {
+            // The group must be signalled before `wait` reaps the leader (the pgid lives on
+            // with the leader's zombie). TERM first, so uv can drop its temp files, KILL after
+            // a grace period.
+            let pgid = self.child.id();
+            signal_group(pgid, "TERM");
+            let until = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < until {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            signal_group(pgid, "KILL");
+        }
+        #[cfg(windows)]
+        if let Some(j) = &self.job {
+            let _ = j.kill();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Tree {
+    /// Kill what is left of the tree after the child itself exited (helpers still holding the
+    /// output pipes).
+    fn kill_orphans(&self) {
+        #[cfg(unix)]
+        signal_group(self.child.id(), "KILL");
+        #[cfg(windows)]
+        if let Some(j) = &self.job {
+            let _ = j.kill();
+        }
+    }
+}
+
+/// `kill -<signal> -- -<pgid>` through the `kill` binary (no libc binding needed here).
+#[cfg(unix)]
+fn signal_group(pgid: u32, signal: &str) {
+    use std::process::{Command, Stdio};
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pgid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+impl CommandRunner for SystemRunner {
+    fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+        tracing::info!("running {}", cmd.display());
+        let mut tree = Tree::spawn(cmd)?;
+        let (tx, rx) = crossbeam_channel::bounded::<String>(MAX_OUTPUT_LINES);
         let mut readers = Vec::new();
-        if let Some(out) = child.stdout.take() {
+        if let Some(out) = tree.child.stdout.take() {
             readers.push(spawn_reader(out, tx.clone()));
         }
-        if let Some(err) = child.stderr.take() {
+        if let Some(err) = tree.child.stderr.take() {
             readers.push(spawn_reader(err, tx.clone()));
         }
         drop(tx);
@@ -636,28 +773,45 @@ impl CommandRunner for SystemRunner {
                 }
             }
             if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
+                tree.kill_tree();
                 return Err(anyhow!(Cancelled));
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                tree.kill_tree();
                 bail!(
                     "{} timed out after {} min and was stopped",
                     cmd.program.display(),
                     cmd.timeout.as_secs() / 60
                 );
             }
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = tree.child.try_wait()? {
                 break status;
             }
         };
+        // Drain until both readers hang up (a bounded channel: the readers may still be
+        // blocked on `send`), then join them. A helper the child left behind still holding
+        // the pipes would keep them open forever: after a grace period the rest of the tree
+        // is killed (the group only gets a signal while it has members, so the pgid cannot
+        // have been reused).
+        let grace = Instant::now() + Duration::from_secs(2);
+        let mut orphans_killed = false;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => keep(line, on_line),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+            if !orphans_killed && Instant::now() >= grace {
+                tracing::warn!(
+                    "{} left helper processes behind; stopping them",
+                    cmd.display()
+                );
+                tree.kill_orphans();
+                orphans_killed = true;
+            }
+        }
         for r in readers {
             let _ = r.join();
-        }
-        while let Ok(line) = rx.try_recv() {
-            keep(line, on_line);
         }
         if !status.success() {
             let tail: Vec<String> = tail.into_iter().collect();
@@ -674,25 +828,60 @@ impl CommandRunner for SystemRunner {
     }
 }
 
+/// Reads one output stream line by line (`\n` and `\r` both end a line: progress bars rewrite
+/// one line with `\r`), keeping at most [`MAX_OUTPUT_LINE`] bytes of each, and sends the
+/// non-empty lines; returns when the stream or the receiver closes.
 fn spawn_reader(
     stream: impl std::io::Read + Send + 'static,
     tx: Sender<String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(stream);
-        // Split on \n and \r (progress bars rewrite one line with \r).
-        for chunk in reader.split(b'\n') {
-            let Ok(chunk) = chunk else { break };
-            for part in chunk.split(|b| *b == b'\r') {
-                let line = strip_ansi(&String::from_utf8_lossy(part))
-                    .trim_end()
-                    .to_string();
-                if !line.is_empty() && tx.send(line).is_err() {
-                    return;
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = Vec::with_capacity(256);
+        let mut cut = false;
+        loop {
+            let data = match reader.fill_buf() {
+                Ok(d) if !d.is_empty() => d,
+                _ => break,
+            };
+            let n = data.len();
+            let mut closed = false;
+            for &b in data {
+                if b == b'\n' || b == b'\r' {
+                    if !send_line(&tx, &line, cut) {
+                        closed = true;
+                        break;
+                    }
+                    line.clear();
+                    cut = false;
+                } else if line.len() < MAX_OUTPUT_LINE {
+                    line.push(b);
+                } else {
+                    cut = true;
                 }
             }
+            reader.consume(n);
+            if closed {
+                return;
+            }
         }
+        send_line(&tx, &line, cut);
     })
+}
+
+/// Send one captured line (ANSI stripped, trimmed, `...` when cut); false when the receiver is
+/// gone.
+fn send_line(tx: &Sender<String>, raw: &[u8], cut: bool) -> bool {
+    let mut line = strip_ansi(&String::from_utf8_lossy(raw))
+        .trim_end()
+        .to_string();
+    if line.is_empty() {
+        return true;
+    }
+    if cut {
+        line.push_str("...");
+    }
+    tx.send(line).is_ok()
 }
 
 /// `text` without ANSI escape sequences (Ultralytics colors its log lines).
@@ -2303,6 +2492,50 @@ mod tests {
             .unwrap();
         lines.sort();
         assert_eq!(lines, ["hello", "one", "two"]);
+        // RS-07: the child's environment is the allowlist plus `Cmd::env`, whatever the
+        // service inherited. RS-08: a line longer than MAX_OUTPUT_LINE is cut and marked.
+        #[cfg(unix)]
+        {
+            let mut lines = Vec::new();
+            let mut c = Cmd {
+                program: "env".into(),
+                args: vec![],
+                ..cmd("", Duration::from_secs(30))
+            };
+            c.env.push(("PYTHONPATH".into(), "/explicit".into()));
+            SystemRunner
+                .run(&c, &mut |l| lines.push(l.to_string()), &never)
+                .unwrap();
+            assert!(lines.iter().any(|l| l == "BOP_TEST=hello"), "{lines:?}");
+            assert!(
+                lines.iter().any(|l| l == "PYTHONPATH=/explicit"),
+                "{lines:?}"
+            );
+            assert!(lines.iter().any(|l| l.starts_with("PATH=")), "{lines:?}");
+            for l in &lines {
+                let key = l.split('=').next().unwrap_or_default();
+                assert!(
+                    inherited(key) || key == "BOP_TEST" || key == "PYTHONPATH",
+                    "leaked {l}"
+                );
+            }
+            let mut lines = Vec::new();
+            let script = format!(
+                "head -c {} /dev/zero | tr '\\0' 'x'; echo; echo tail",
+                MAX_OUTPUT_LINE * 3
+            );
+            SystemRunner
+                .run(
+                    &cmd(&script, Duration::from_secs(30)),
+                    &mut |l| lines.push(l.to_string()),
+                    &never,
+                )
+                .unwrap();
+            assert_eq!(lines.len(), 2, "{}", lines.len());
+            assert_eq!(lines[0].len(), MAX_OUTPUT_LINE + 3);
+            assert!(lines[0].ends_with("xxx..."));
+            assert_eq!(lines[1], "tail");
+        }
         #[cfg(unix)]
         let bad = "echo bad output; exit 3";
         #[cfg(windows)]
@@ -2338,12 +2571,73 @@ mod tests {
                 .unwrap_err();
             assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
             assert!(started.elapsed() < Duration::from_secs(10));
+
+            // RS-02: a grandchild (`sleep 30 &`, whose parent `sh` then waits on another sleep)
+            // dies with the process group on cancel.
+            let cancel = Arc::new(AtomicBool::new(false));
+            let c2 = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                c2.store(true, Ordering::Relaxed);
+            });
+            let mut lines = Vec::new();
+            let e = SystemRunner
+                .run(
+                    &cmd("sleep 30 & echo $!; sleep 30", Duration::from_secs(60)),
+                    &mut |l| lines.push(l.to_string()),
+                    &cancel,
+                )
+                .unwrap_err();
+            assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+            let grandchild = lines.first().expect("pid line").trim().to_string();
+            assert!(grandchild.parse::<u32>().is_ok(), "{grandchild}");
+            let alive = || {
+                std::process::Command::new("kill")
+                    .args(["-0", &grandchild])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            };
+            let until = Instant::now() + Duration::from_secs(5);
+            while alive() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(!alive(), "grandchild {grandchild} survived the cancel");
+
+            // A helper that outlives a successful child (holding the pipes) is stopped after
+            // the grace period instead of hanging the runner.
+            let started = Instant::now();
+            let mut lines = Vec::new();
+            SystemRunner
+                .run(
+                    &cmd("sleep 30 & echo $!; exit 0", Duration::from_secs(60)),
+                    &mut |l| lines.push(l.to_string()),
+                    &never,
+                )
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10));
+            let orphan = lines.first().expect("pid line").trim().to_string();
+            let alive = || {
+                std::process::Command::new("kill")
+                    .args(["-0", &orphan])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            };
+            let until = Instant::now() + Duration::from_secs(5);
+            while alive() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(!alive(), "orphan {orphan} survived");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn sanitized_variables_and_package_progress() {
+        // RS-07: the child starts from an empty environment plus this allowlist.
         for k in [
             "PYTHONPATH",
             "PYTHONHOME",
@@ -2353,11 +2647,38 @@ mod tests {
             "CONDA_PREFIX",
             "YOLO_CONFIG_DIR",
             "pythonpath",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "XDG_CONFIG_HOME",
+            "OMP_NUM_THREADS",
+            "HF_HOME",
+            "TORCH_HOME",
+            "",
         ] {
-            assert!(sanitized(k), "{k}");
+            assert!(!inherited(k), "{k}");
         }
-        for k in ["PATH", "HOME", "TMPDIR", "SYSTEMROOT"] {
-            assert!(!sanitized(k), "{k}");
+        for k in [
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "SYSTEMROOT",
+            "SystemRoot",
+            "LANG",
+            "LC_ALL",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ] {
+            assert!(inherited(k), "{k}");
         }
         let mut p = PackagesProgress::default();
         assert_eq!(p.line("Resolved 48 packages in 3ms"), None);

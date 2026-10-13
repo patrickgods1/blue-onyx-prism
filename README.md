@@ -173,7 +173,7 @@ Windows (PowerShell):
 ```powershell
 Expand-Archive blue-onyx-prism-*-windows-x86_64.zip .; cd blue-onyx-prism-*-windows-x86_64
 .\blue-onyx-prism.exe download-models --name IPcam-general --add-to-config
-.\blue-onyx-prism.exe            # GPU by default; add --force-cpu to stay on the CPU
+.\blue-onyx-prism.exe            # GPU by default; add --force-cpu to use the CPU for this run
 ```
 
 Linux / macOS:
@@ -196,7 +196,10 @@ the model is ready.
 
 `blue_onyx_prism_config.json` next to the executable (`--config <file>` to use another). A CLI
 flag overrides the file and the merged result is written back when it differs from the file (an
-invalid value is an error and the file is left untouched). Relative paths in the file resolve
+invalid value is an error and the file is left untouched). Three switches are one-off flags:
+`--allow-remote-admin`, `--force-cpu` and `--save-ref-image` apply to that run only and are never
+written to the file (set `allow_remote_admin`, `force_cpu` or `save_ref_image` there, or on the
+Config page, to keep them). Relative paths in the file resolve
 against the executable directory. The Windows service reads `blue_onyx_prism_config_service.json`
 (created with debug logging on first start).
 
@@ -220,7 +223,7 @@ against the executable directory. The Windows service reads `blue_onyx_prism_con
 | `nms_iou` | `0.5` | IoU threshold for NMS-based families, 0-1 |
 | `object_filter` | `[]` | Only report these labels (case-insensitive); empty = all |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error` |
-| `log_path` | `null` | Directory for daily rolling log files (default: stdout) |
+| `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout) |
 | `save_image_path` | `null` | Save annotated detections here |
 | `save_ref_image` | `false` | Also save the unannotated image |
 | `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. 1000 to 1000000000. Applies at once |
@@ -332,7 +335,14 @@ deletes its `.onnx` / `.yaml`. The YOLO26-only toolchain of earlier versions (`y
 replaced by the first export.
 
 This is the one feature that runs downloaded code (everything else is data loaded by whitelist); it
-only runs when you click Export or name the resource on the command line. Supported where PyTorch
+only runs when you click Export or name the resource on the command line. Export subprocesses run
+with a minimal environment: `PATH`, `HOME`, the temp dir, locale, `HTTP(S)_PROXY`/`NO_PROXY` and, if
+you set them, `SSL_CERT_FILE`/`SSL_CERT_DIR`; nothing else from the service's environment reaches uv
+or Python. Cancelling an export kills every helper process it started. Runtime libraries (OpenVINO,
+ONNX Runtime, CUDA) are loaded only from the configured runtime directories (`openvino_dir`,
+`onnxruntime_dir`, `<download root>/openvino`, `onnxruntime/<flavor>`, `onnxruntime/cuda-libs`) or
+the OS library directories, never from the working directory; anyone who can write those directories
+can run code as the service, so keep them writable by the service account and administrators only. Supported where PyTorch
 2.14 has CPU wheels: Windows x86_64, Linux x86_64 / aarch64, macOS arm64 (14+).
 
 RF-DETR large and DEIMv2 L/X overflow half precision (NaN or garbage with OpenVINO's f16, the
@@ -579,10 +589,20 @@ detection API (`/v1/vision/*`), `/v1/status/updateavailable`, the home page `/`,
 `/prometheus`, `/v1/devices`, `/v1/config` (read-only) and the static files.
 
 - To administer from another machine, set `"allow_remote_admin": true` (or check *Allow remote
-  administration* on the Config page from this machine, or start with `--allow-remote-admin`). It
-  applies at once. Be aware that this also opens the Config page's file browser
+  administration* on the Config page from this machine). It applies at once. `--allow-remote-admin`
+  does the same for one run only: it is not written to the config file, so the next plain start is
+  back to loopback-only. Be aware that remote admin opens the Config page's file browser
   (`GET /v1/fs/browse`, which lists folders and model/YAML file names across the whole filesystem)
-  and every admin action to anyone who can reach the port, so enable it only on a trusted network.
+  and every admin action (config writes, downloads, model export, restarts) to anyone who can
+  reach the port, without authentication, so enable it only on a trusted network. The service
+  logs a warning at every start while it is on.
+- Cross-site requests (CSRF): a web page on another site cannot drive the admin actions through
+  your browser. An admin request that changes something (POST, PUT, PATCH, DELETE) is refused with
+  403 when the browser marks it `Sec-Fetch-Site: cross-site`, or when its `Origin` (else
+  `Referer`) header names another host:port than the request's `Host` (`Origin: null` counts as
+  foreign). Requests with none of these headers are allowed, so `curl` and scripts on this machine
+  keep working; browsers always send `Origin` on cross-origin POSTs. The detection API is never
+  checked.
 - To keep everything on this machine (Blue Iris on the same PC), set `"bind_address": "127.0.0.1"`
   (or `--bind-address 127.0.0.1`); it applies when the process restarts.
 
@@ -595,9 +615,20 @@ detection API (`/v1/vision/*`), `/v1/status/updateavailable`, the home page `/`,
 .\scripts\uninstall_service.ps1
 ```
 
-The script raises `ServicesPipeTimeout` to 600000 ms (applies after a reboot) so the first start can
-compile models. If GPU access fails under LocalSystem, install with `-Account DOMAIN\user`.
-Logs go to the Application event log (source `BlueOnyxPrism`) and, with `log_path`, to files.
+The service runs as the virtual account `NT SERVICE\BlueOnyxPrismService`, not LocalSystem. The
+script resets the install dir's ACL (Administrators and SYSTEM full control, Users read and
+execute) and gives the service Modify only on its data: `models`, `cache`, `tools`, the runtime
+dirs `openvino`, `onnxruntime` and `.downloads` (so runtime downloads and updates keep working),
+`blue_onyx_prism_config_service.json` and the files it keeps next to it, plus any `download_dir`,
+`models_dir`, `cache_dir`, `save_image_path` and `log_path` the service config names. It can add
+new files to the install dir but cannot change the exe or the files shipped with it. A
+`save_image_path` or `log_path` set later needs the same grant:
+`icacls <dir> /grant "NT SERVICE\BlueOnyxPrismService:(OI)(CI)M"`.
+If GPU access fails under the virtual account, reinstall with `-Account LocalSystem` (full control of
+the machine) or `-Account DOMAIN\user` (you are prompted for the password; the account needs the
+"Log on as a service" right). The script raises `ServicesPipeTimeout` to 600000 ms (applies after a
+reboot) so the first start can compile models. Logs go to the Application event log (source
+`BlueOnyxPrism`) and, with `log_path`, to files.
 
 **Linux** (systemd):
 
@@ -607,26 +638,63 @@ sudo /opt/blue-onyx-prism/scripts/install_systemd.sh      # creates user blueony
 journalctl -u blue-onyx-prism -f
 ```
 
+The program in `/opt/blue-onyx-prism` stays owned by root. The service user `blueonyx` writes only
+to `/var/lib/blue-onyx-prism`: the config (`blue_onyx_prism_config.json`), models, cache, downloads,
+`benchmark.json` and the model-export tools. The script seeds that config with `download_dir` and
+`cache_dir` pointing there and with `openvino_dir` / `onnxruntime_dir` pointing at the bundled
+runtimes. Runtimes named that way are never downloaded or replaced by the service; to use another
+ONNX Runtime flavor (CUDA), remove `onnxruntime_dir` from the config, and the service downloads
+it into `/var/lib/blue-onyx-prism`. An existing `/opt/blue-onyx-prism/blue_onyx_prism_config.json`
+and `models/` are copied over on the first install. Run other commands against that config as the
+service user, e.g. `sudo -u blueonyx /opt/blue-onyx-prism/blue-onyx-prism --config
+/var/lib/blue-onyx-prism/blue_onyx_prism_config.json fetch --for-config`.
+The unit is sandboxed (`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `NoNewPrivileges`,
+`DevicePolicy=closed` with only `/dev/dri`, a system-call filter); `deploy/blue-onyx-prism.service`
+explains each line, which ones to relax for NVIDIA (`DeviceAllow` lines to uncomment) and where to
+add a `save_image_path` or `log_path` outside `/var/lib/blue-onyx-prism` (`ReadWritePaths=`).
+
 **macOS** (launchd):
 
 ```sh
 sudo cp -r blue-onyx-prism-<version>-macos-aarch64 /usr/local/blue-onyx-prism
-sudo /usr/local/blue-onyx-prism/scripts/install_launchd.sh   # KeepAlive; log in blue-onyx-prism.log
+sudo /usr/local/blue-onyx-prism/scripts/install_launchd.sh   # KeepAlive; runs as _blueonyx
 ```
+
+The daemon runs as the hidden role account `_blueonyx` (created by the script, UID below 500). The
+program in `/usr/local/blue-onyx-prism` stays owned by root; the daemon writes only to
+`/usr/local/var/blue-onyx-prism` (config, models, cache, downloads; seeded like the Linux one) and
+`/var/log/blue-onyx-prism`, where `log_path` writes daily files (the newest 14 are kept).
+stdout/stderr go to `/var/log/blue-onyx-prism/stdout.log`, rotated by
+`/etc/newsyslog.d/blue-onyx-prism.conf`.
 
 **Docker** (Linux, Intel GPU through `/dev/dri`; image based on `openvino/ubuntu24_runtime`):
 
 ```sh
-cd deploy && mkdir -p models cache config
+cd deploy && mkdir -p cache config
 RENDER_GID=$(getent group render | cut -d: -f3) docker compose up -d --build
 ```
 
-Put models in `deploy/models` and a `blue_onyx_prism_config.json` in `deploy/config`.
-In Docker every client, the host's browser included, reaches the service from the bridge
-network, not loopback: `deploy/docker-config.json` therefore ships with `"allow_remote_admin": true`
-so the Config, Test, Logs and Benchmark pages work; keep it in your own config, and publish the port
-on the host's loopback only (`-p 127.0.0.1:32168:32168`) if the host should be the only admin (see
-[Remote access](#remote-access)).
+The image contains IPcam-general; the compose file mounts it through the named volume `models`
+(at `/app/models`), so it is there on first start. To bring your own models, replace
+`models:/app/models` in `deploy/docker-compose.yml` with `./models:/app/models`, put the files in
+`deploy/models` and name them in `deploy/config/blue_onyx_prism_config.json` (copied there from
+`deploy/docker-config.json` on first start; edit it, then `docker compose restart`).
+
+The compose file publishes the port on the host's loopback only (`127.0.0.1:32168:32168`). Inside
+Docker every client, the host's browser included, arrives from the bridge network, never from
+loopback, so with the shipped `"allow_remote_admin": false` the admin pages (Config, Test, Logs,
+Benchmark) answer 403 and the detection API works:
+
+- Blue Iris on another machine: switch to the commented LAN line (`"32168:32168"`) in
+  `deploy/docker-compose.yml`. Detection is then reachable from the LAN; keep
+  `allow_remote_admin` false and change settings by editing the config file in `deploy/config`.
+- Web UI: set `"allow_remote_admin": true` in that config file. With the default loopback-only
+  port only this host reaches it; from your PC use an SSH tunnel
+  (`ssh -L 32168:127.0.0.1:32168 <docker host>`, then open `http://127.0.0.1:32168/`). With the
+  LAN line, every LAN client gets the admin pages (see [Remote access](#remote-access)): turn it
+  on only while you use them.
+
+The container's health check polls `/v1/vision/custom/list` (`docker ps` shows `healthy`).
 
 ## HTTP API
 

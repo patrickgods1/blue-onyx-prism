@@ -17,10 +17,30 @@
 //! find those dependencies among the already-loaded objects by soname. On macOS the same
 //! preload is harmless (dyld matches loaded images by install name) and `setup-openvino`
 //! additionally installs TBB next to libopenvino for `@rpath` resolution.
+//!
+//! # Trust boundary
+//!
+//! Every shared library this module (and `ort.rs` / `detect.rs` through it) loads runs its
+//! initializers with the privileges of the service: anyone who can write the runtime
+//! directories owns the process. Those directories are the configured `openvino_dir` /
+//! `onnxruntime_dir`, `<download root>/openvino`, `<download root>/onnxruntime/<flavor>` and
+//! `<download root>/onnxruntime/cuda-libs` (plus `ORT_DYLIB_PATH` and `OPENVINO_INSTALL_DIR`
+//! when set). Keep them writable by the service account and administrators only; the
+//! downloader verifies every archive's SHA-256 before extracting into them.
+//!
+//! Nothing is ever loaded from the current working directory: libraries are opened by absolute
+//! path ([`open_path`]) or, for OS-provided ones such as the NVIDIA driver, by bare name with
+//! the loader restricted to the system and registered directories ([`open_system`]). On
+//! Windows [`harden_dll_search`] removes the working directory and `PATH` from the process-wide
+//! default DLL search (`SetDefaultDllDirectories`), and the runtime directories are added with
+//! `AddDllDirectory` ([`register_dll_dir`]) so that the dependencies of a loaded DLL
+//! (`openvino.dll`, `tbb12.dll`, `DirectML.dll`, the CUDA DLLs) still resolve. CUDA libraries
+//! of a system install are probed by absolute path in the explicitly enumerated library path
+//! ([`cuda_search_dirs`]) and kept loaded, never by bare name.
 
 use crate::sync::LockExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 pub const BUNDLED_DIR_NAME: &str = "openvino";
 
@@ -80,6 +100,7 @@ fn note(s: String) {
 /// `explicit` (from config `openvino_dir`) wins over `<exe_dir>/openvino`; an already-set
 /// `OPENVINO_INSTALL_DIR` is left untouched.
 pub fn prepare_environment(explicit: Option<&Path>) {
+    harden_dll_search();
     if let Ok(mut n) = NOTES.lock() {
         n.clear();
     }
@@ -283,9 +304,92 @@ fn preload_dependencies(install_dir: &Path) {
     }
 }
 
-/// Prepend `dirs` to `PATH`, skipping entries already present.
+/// Result of the one-time `SetDefaultDllDirectories` call (Windows), for diagnostics.
+#[cfg(windows)]
+static DLL_SEARCH_HARDENED: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Restrict the process-wide default DLL search to the application directory, `System32` and
+/// the directories registered with [`register_dll_dir`]: the working directory and `PATH` are
+/// no longer consulted by bare-name `LoadLibrary` calls or when a loaded DLL's imports are
+/// resolved (BE-01). Idempotent; the first call does the work, later calls return at once.
+/// A no-op on other platforms (their loaders never search the working directory).
+pub fn harden_dll_search() {
+    #[cfg(windows)]
+    {
+        DLL_SEARCH_HARDENED.get_or_init(|| {
+            use windows::Win32::System::LibraryLoader::{
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
+            };
+            // SAFETY: a plain kernel32 call that only changes the loader's search policy for
+            // this process; it has no memory-safety preconditions.
+            let r = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) }
+                .map_err(|e| e.to_string());
+            match &r {
+                Ok(()) => tracing::debug!(
+                    "DLL search restricted to the application directory, System32 and \
+                     registered runtime directories"
+                ),
+                Err(e) => tracing::warn!("SetDefaultDllDirectories failed: {e}"),
+            }
+            r
+        });
+    }
+}
+
+/// Directories added to the DLL search with `AddDllDirectory` (Windows); the cookies are kept
+/// for the process lifetime.
+#[cfg(windows)]
+static DLL_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Make `dir` (absolute) part of the DLL search for bare-name loads and for the dependencies
+/// of DLLs loaded later (`AddDllDirectory`); registering a directory twice is a no-op. Call it
+/// for every runtime directory (OpenVINO bin dirs, the ONNX Runtime flavor dir, `cuda-libs`)
+/// because [`harden_dll_search`] takes `PATH` out of the search. A no-op on other platforms.
+pub fn register_dll_dir(dir: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::System::LibraryLoader::AddDllDirectory;
+        use windows::core::PCWSTR;
+        harden_dll_search();
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut known = DLL_DIRS.lock_recover();
+        let same = |a: &Path| a.as_os_str().eq_ignore_ascii_case(dir.as_os_str());
+        if known.iter().any(|d| same(d)) {
+            return;
+        }
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call; the loader
+        // copies the path, and the returned cookie is intentionally never removed.
+        let cookie = unsafe { AddDllDirectory(PCWSTR(wide.as_ptr())) };
+        if cookie.is_null() {
+            note(format!(
+                "AddDllDirectory({}) failed: {}",
+                dir.display(),
+                windows::core::Error::from_thread()
+            ));
+        } else {
+            note(format!("registered {} for DLL loading", dir.display()));
+            known.push(dir);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+    }
+}
+
+/// Prepend `dirs` to `PATH` (for child processes and anything that enumerates `PATH` itself)
+/// and register them for DLL loading ([`register_dll_dir`]), skipping entries already present.
 #[cfg(windows)]
 fn prepend_to_path(dirs: &[PathBuf]) {
+    for d in dirs {
+        register_dll_dir(d);
+    }
     let current = std::env::var_os("PATH").unwrap_or_default();
     let existing: Vec<PathBuf> = std::env::split_paths(&current).collect();
     let same = |a: &Path, b: &Path| a.as_os_str().eq_ignore_ascii_case(b.as_os_str());
@@ -343,7 +447,7 @@ pub(crate) fn core_set_property_variadic(
     // field is that pointer (size asserted above); `core` outlives the call and the C strings
     // are NUL-terminated and alive for the call.
     unsafe {
-        let lib = open(&path)?;
+        let lib = open_path(&path)?;
         let set = symbol::<SetProperty>(&lib, b"ov_core_set_property\0")?;
         let raw: *const c_void = std::mem::transmute_copy(core);
         let status = set(raw, device.as_ptr(), key.as_ptr(), value.as_ptr());
@@ -811,16 +915,64 @@ pub(crate) fn dl_error(e: &libloading::Error) -> String {
     text
 }
 
-/// [`libloading::Library::new`] with the OS cause in the error text ([`dl_error`]).
+/// Load the library at an explicit `path`, with the OS cause in the error text ([`dl_error`]).
+/// On Windows the DLL's own directory is searched first for its imports
+/// (`LOAD_WITH_ALTERED_SEARCH_PATH`), never the working directory.
 ///
 /// # Safety
 /// Same contract as [`libloading::Library::new`]: the library's initializers run, and the
 /// caller is responsible for them being sound to run.
-pub(crate) unsafe fn open(
-    path: impl libloading::AsFilename,
-) -> Result<libloading::Library, String> {
-    // SAFETY: upheld by the caller (see `# Safety`).
-    unsafe { libloading::Library::new(path) }.map_err(|e| dl_error(&e))
+pub(crate) unsafe fn open_path(path: &Path) -> Result<libloading::Library, String> {
+    #[cfg(windows)]
+    {
+        use libloading::os::windows::{LOAD_WITH_ALTERED_SEARCH_PATH, Library};
+        harden_dll_search();
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        // SAFETY: upheld by the caller (see `# Safety`).
+        unsafe { Library::load_with_flags(&path, LOAD_WITH_ALTERED_SEARCH_PATH) }
+            .map(libloading::Library::from)
+            .map_err(|e| dl_error(&e))
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: upheld by the caller (see `# Safety`).
+        unsafe { libloading::Library::new(path) }.map_err(|e| dl_error(&e))
+    }
+}
+
+/// Load an OS-provided library by bare `name` (`nvcuda.dll`, `libcuda.so.1`), with the OS
+/// cause in the error text ([`dl_error`]). On Windows the search is limited to the application
+/// directory, `System32` and the directories from [`register_dll_dir`]
+/// (`LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS`): never the working
+/// directory or `PATH`. On Unix `dlopen` by name never looks in the working directory.
+///
+/// # Safety
+/// Same contract as [`libloading::Library::new`]: the library's initializers run, and the
+/// caller is responsible for them being sound to run.
+// Every caller is platform- or feature-gated; unused on other targets.
+#[allow(dead_code)]
+pub(crate) unsafe fn open_system(name: &str) -> Result<libloading::Library, String> {
+    #[cfg(windows)]
+    {
+        use libloading::os::windows::{
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_USER_DIRS, Library,
+        };
+        harden_dll_search();
+        // SAFETY: upheld by the caller (see `# Safety`).
+        unsafe {
+            Library::load_with_flags(
+                name,
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS,
+            )
+        }
+        .map(libloading::Library::from)
+        .map_err(|e| dl_error(&e))
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: upheld by the caller (see `# Safety`).
+        unsafe { libloading::Library::new(name) }.map_err(|e| dl_error(&e))
+    }
 }
 
 /// [`libloading::Library::get`] with the OS cause in the error text ([`dl_error`]).
@@ -853,11 +1005,9 @@ fn open_cuda_lib(path: &Path) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        use libloading::os::windows::{LOAD_WITH_ALTERED_SEARCH_PATH, Library};
-        // SAFETY: as above. LOAD_WITH_ALTERED_SEARCH_PATH resolves the DLL's own imports from
-        // its directory first (the other CUDA DLLs next to it).
-        let lib = unsafe { Library::load_with_flags(path, LOAD_WITH_ALTERED_SEARCH_PATH) }
-            .map_err(|e| dl_error(&e))?;
+        // SAFETY: as above. `open_path` resolves the DLL's own imports from its directory
+        // first (the other CUDA DLLs next to it), never from the working directory.
+        let lib = unsafe { open_path(path) }?;
         std::mem::forget(lib);
         Ok(())
     }
@@ -867,19 +1017,101 @@ fn open_cuda_lib(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Whether the system (driver/toolkit install, `PATH` / `LD_LIBRARY_PATH`) already provides
-/// CUDA 12 and cuDNN 9: every [`cuda_core_libs`] name loads by name.
-pub fn system_cuda_present() -> bool {
-    cuda_core_libs(cfg!(windows)).iter().all(|n| {
-        // SAFETY: probing CUDA libraries by name, which the CUDA provider would load itself; the
-        // handle is dropped right away and no symbol is used.
-        match unsafe { open(*n) } {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::debug!("system CUDA probe: {n}: {e}");
-                false
-            }
+/// Directories a system CUDA install is looked for in, in order: `extra` (the ONNX Runtime
+/// dir, `cuda-libs`), `<CUDA_PATH|CUDA_HOME>/bin|lib64`, every absolute entry of the library
+/// path (`PATH` on Windows, else `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`; relative and empty
+/// entries, which would mean the working directory, are skipped) and on Linux the usual
+/// toolkit / distro locations. Pure: `env` is `(CUDA_PATH or CUDA_HOME, library path)`.
+pub fn cuda_search_dirs(
+    extra: &[&Path],
+    env: (Option<&std::ffi::OsStr>, Option<&std::ffi::OsStr>),
+    windows: bool,
+    linux: bool,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = extra.iter().map(|d| d.to_path_buf()).collect();
+    if let Some(home) = env.0.filter(|v| !v.is_empty()) {
+        let home = PathBuf::from(home);
+        if windows {
+            out.push(home.join("bin"));
+        } else {
+            out.push(home.join("lib64"));
+            out.push(home.join("lib"));
         }
+    }
+    if let Some(lp) = env.1 {
+        out.extend(std::env::split_paths(lp).filter(|d| d.is_absolute()));
+    }
+    if linux {
+        out.extend(
+            [
+                "/usr/local/cuda/lib64",
+                "/usr/local/cuda/targets/x86_64-linux/lib",
+                "/usr/local/cuda/targets/sbsa-linux/lib",
+                "/usr/lib/x86_64-linux-gnu",
+                "/usr/lib/aarch64-linux-gnu",
+                "/usr/lib64",
+                "/usr/lib",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|d| seen.insert(d.clone()));
+    out
+}
+
+/// [`cuda_search_dirs`] for this process and platform.
+fn cuda_search_dirs_here(extra: &[&Path]) -> Vec<PathBuf> {
+    let home = std::env::var_os("CUDA_PATH").or_else(|| std::env::var_os("CUDA_HOME"));
+    let lp = std::env::var_os(ENV_LIBRARY_PATH);
+    cuda_search_dirs(
+        extra,
+        (home.as_deref(), lp.as_deref()),
+        cfg!(windows),
+        cfg!(target_os = "linux"),
+    )
+}
+
+/// Find and load the CUDA library `name` (`cudart64_12.dll`, `libcudnn.so.9`) by absolute
+/// path in `extra` then the system directories ([`cuda_search_dirs`]); never by bare name, so
+/// the working directory is never a candidate. A loaded library stays loaded for the process
+/// (like `cuda-libs`), so the CUDA provider's own by-name imports resolve to it later; loading
+/// one that is already loaded is cheap. Returns the path loaded.
+pub fn probe_cuda_library(name: &str, extra: &[&Path]) -> Result<PathBuf, String> {
+    let dirs = cuda_search_dirs_here(extra);
+    let Some(path) = dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()) else {
+        return Err(format!(
+            "{name} not found in {}",
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    open_cuda_lib(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Whether the system (driver/toolkit install, library path) already provides CUDA 12 and
+/// cuDNN 9: every [`cuda_core_libs`] name exists in a [`cuda_search_dirs`] directory and loads
+/// from there. Probed once per process (the result is cached; libraries found stay loaded), so
+/// a toolkit installed while the service runs is seen after a restart.
+pub fn system_cuda_present() -> bool {
+    static PRESENT: OnceLock<bool> = OnceLock::new();
+    *PRESENT.get_or_init(|| {
+        cuda_core_libs(cfg!(windows))
+            .iter()
+            .all(|n| match probe_cuda_library(n, &[]) {
+                Ok(p) => {
+                    tracing::debug!("system CUDA probe: {n}: {}", p.display());
+                    true
+                }
+                Err(e) => {
+                    tracing::debug!("system CUDA probe: {e}");
+                    false
+                }
+            })
     })
 }
 
@@ -1163,6 +1395,43 @@ mod tests {
             crate::resources::catalog::CUDA_LIBS_DEST,
             format!("{ORT_DIR_NAME}/{CUDA_LIBS_DIR_NAME}")
         );
+    }
+
+    #[test]
+    fn cuda_search_dirs_skip_relative_entries_and_dedupe() {
+        use std::ffi::OsString;
+        let extra = PathBuf::from("/opt/ort/cuda");
+        let home = OsString::from("/opt/cuda");
+        let lp = std::env::join_paths([
+            PathBuf::from("/opt/ort/cuda"),
+            PathBuf::from("."),
+            PathBuf::from(""),
+            PathBuf::from("relative/dir"),
+            PathBuf::from("/usr/local/cuda/lib64"),
+            PathBuf::from("/home/me/lib"),
+        ])
+        .unwrap();
+        let dirs = cuda_search_dirs(&[&extra], (Some(&home), Some(&lp)), false, true);
+        assert_eq!(dirs[0], extra);
+        assert_eq!(dirs[1], PathBuf::from("/opt/cuda/lib64"));
+        assert_eq!(dirs[2], PathBuf::from("/opt/cuda/lib"));
+        assert_eq!(dirs[3], PathBuf::from("/usr/local/cuda/lib64"));
+        assert_eq!(dirs[4], PathBuf::from("/home/me/lib"));
+        assert!(dirs.contains(&PathBuf::from("/usr/lib/x86_64-linux-gnu")));
+        assert!(dirs.iter().all(|d| d.is_absolute()), "{dirs:?}");
+        assert_eq!(
+            dirs.iter().filter(|d| **d == extra).count(),
+            1,
+            "deduplicated"
+        );
+        // Windows: `<CUDA_PATH>/bin`, no Linux defaults; macOS: no defaults at all.
+        let win = cuda_search_dirs(&[], (Some(&home), None), true, false);
+        assert_eq!(win, vec![PathBuf::from("/opt/cuda").join("bin")]);
+        assert!(cuda_search_dirs(&[], (None, None), false, false).is_empty());
+        // A library that is not in any directory is not loaded (and nothing is probed by name).
+        let e = probe_cuda_library("bop-no-such-cuda-lib.so", &[&extra]).unwrap_err();
+        assert!(e.contains("not found in"), "{e}");
+        assert!(e.contains("/opt/ort/cuda"), "{e}");
     }
 
     #[test]

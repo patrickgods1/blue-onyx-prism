@@ -29,6 +29,8 @@
 
 pub mod detect;
 pub mod device;
+#[cfg(windows)]
+pub mod job;
 pub mod libs;
 pub mod onnx_rewrite;
 #[cfg(feature = "onnxruntime")]
