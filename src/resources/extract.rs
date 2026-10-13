@@ -320,24 +320,29 @@ fn extract_zip(
         .with_context(|| format!("reading zip {}", archive.display()))?;
     let mut got = BTreeSet::new();
     for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .with_context(|| format!("reading zip entry #{i} of {}", archive.display()))?;
-        if entry.is_dir() || entry.is_symlink() {
-            continue;
-        }
-        let name = entry
-            .name()
-            .with_context(|| {
+        // Filter on the central-directory metadata; only wanted entries are opened (seek,
+        // local header, decompressor).
+        let (name, rel) = {
+            let meta = zip
+                .by_index_data(i)
+                .with_context(|| format!("reading zip entry #{i} of {}", archive.display()))?;
+            if meta.is_dir() || meta.is_symlink() {
+                continue;
+            }
+            let name = meta.name().with_context(|| {
                 format!(
                     "reading the name of zip entry #{i} of {}",
                     archive.display()
                 )
-            })?
-            .into_owned();
-        let Some(rel) = wanted(&name) else {
-            continue;
+            })?;
+            let Some(rel) = wanted(&name) else {
+                continue;
+            };
+            (name.into_owned(), rel)
         };
+        let mut entry = zip
+            .by_index(i)
+            .with_context(|| format!("reading zip entry #{i} of {}", archive.display()))?;
         write_entry(dest, &rel, &mut entry).with_context(|| format!("extracting {name}"))?;
         got.insert(rel);
     }
@@ -1218,6 +1223,40 @@ mod tests {
             z.write_all(data).unwrap();
         }
         z.finish().unwrap();
+    }
+
+    /// Only wanted regular files are opened and extracted; directory entries and unwanted
+    /// files are skipped on their metadata.
+    #[test]
+    fn zip_extracts_only_wanted_files() {
+        let dir = std::env::temp_dir().join(format!("bop-zip-filter-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("a.zip");
+        {
+            let f = std::fs::File::create(&archive).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            z.add_directory("lib/", opts).unwrap();
+            z.start_file("lib/skip.txt", opts).unwrap();
+            z.write_all(b"skip").unwrap();
+            z.start_file("lib/keep.bin", opts).unwrap();
+            z.write_all(b"keep").unwrap();
+            z.finish().unwrap();
+        }
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let got = extract_zip(&archive, &dest, |name| {
+            assert!(!name.ends_with('/'), "directory entry offered: {name}");
+            name.strip_prefix("lib/")
+                .filter(|n| n.ends_with(".bin"))
+                .map(str::to_string)
+        })
+        .unwrap();
+        assert_eq!(got, BTreeSet::from(["keep.bin".to_string()]));
+        assert_eq!(std::fs::read(dest.join("keep.bin")).unwrap(), b"keep");
+        assert!(!dest.join("skip.txt").exists());
+        assert!(!dest.join("lib").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Synthetic Linux wheels: only shared libraries land (flat), headers / static libs /
