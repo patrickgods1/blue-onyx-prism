@@ -3531,6 +3531,13 @@ Multipart parse (image `Bytes` copy, `HashMap` of text fields), one `oneshot`, r
   cannot be aborted safely; a model stuck compiling shows as `initializing` on `/v1/status`, and
   the watchdog deliberately does not treat it as a hung process. Deferred to phase 4 as a
   "compiling for longer than N minutes" warning.
+- **Found by CI in this phase (not phase-3 scope, fixed here):** main's CI had been red on Linux
+  and Windows since phase 1: the crate-wide `undocumented_unsafe_blocks` lint fires on the CUDA
+  driver probe (`backend/detect.rs`, not compiled on macOS), `open_path` is dead in an
+  OpenVINO-only Linux build, and several unit tests assumed Unix path layouts. One real bug:
+  since phase 2 the file browser refused every explicit path on Windows with 403, because the
+  lexical root check compared a plain `C:\...` path with canonical roots carrying the `\\?\`
+  prefix (`browse::inside_any`); fixed and unit-tested for the Windows path forms.
 - **Not verified on this machine:** the systemd watchdog and `Type=notify` on Linux, the Docker
   healthcheck, Windows builds of `sdnotify`/`retention`, the listener timeouts under real Blue
   Iris load (unit-tested over loopback TCP only), the CoreML rewrite on a real > 512 MiB model.
