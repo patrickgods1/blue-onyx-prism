@@ -199,8 +199,12 @@ fn root_views(roots: &[(String, PathBuf)]) -> Vec<Root> {
 }
 
 /// Lexically inside one of `roots` (the canonical roots, or the data root as configured).
+/// Compared without the Windows verbatim prefix: a canonical root carries `\\?\`, a path the
+/// client sent (or the configured data root) does not, and `Path::starts_with` treats the
+/// prefix as a component of its own.
 fn inside_any(p: &Path, roots: &[(String, PathBuf)], cfg: &Config) -> bool {
-    roots.iter().any(|(_, r)| p.starts_with(r)) || p.starts_with(cfg.data_root())
+    let p = PathBuf::from(display(p));
+    roots.iter().any(|(_, r)| p.starts_with(display(r))) || p.starts_with(display(&cfg.data_root()))
 }
 
 /// The canonical path of `raw` (quotes trimmed; relative to the data root) when it exists
@@ -526,6 +530,21 @@ mod tests {
             assert_eq!(e.status, StatusCode::BAD_REQUEST, "{needle}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inside_any_ignores_the_verbatim_prefix() {
+        let cfg = Config {
+            download_dir: Some(PathBuf::from(r"C:\data")),
+            ..Default::default()
+        };
+        let roots = vec![("r".to_string(), PathBuf::from(r"\\?\C:\root"))];
+        assert!(inside_any(Path::new(r"C:\root\x"), &roots, &cfg));
+        assert!(inside_any(Path::new(r"\\?\C:\root\x"), &roots, &cfg));
+        assert!(inside_any(Path::new(r"\\?\C:\data\m"), &roots, &cfg));
+        assert!(!inside_any(Path::new(r"C:\rootx"), &roots, &cfg));
+        assert!(!inside_any(Path::new(r"D:\root\x"), &roots, &cfg));
     }
 
     #[test]
