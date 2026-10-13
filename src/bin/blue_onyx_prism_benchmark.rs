@@ -9,6 +9,23 @@
 //! blue-onyx-prism-benchmark --all-devices --apply                          # pick the best device per model
 //! ```
 
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::large_futures,
+        clippy::unused_async,
+        clippy::dbg_macro,
+        missing_debug_implementations
+    )
+)]
+#![deny(unsafe_code)]
+
 use blue_onyx_prism::benchmark::cli::{BenchArgs, main as bench_main};
 use clap::Parser;
 use std::process::ExitCode;

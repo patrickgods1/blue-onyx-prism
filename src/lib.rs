@@ -22,7 +22,34 @@
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
 
+//! # Lint policy
+//!
+//! Non-test code warns on every panicking or truncating construct so that a new `unwrap`, index
+//! or `as` cast must be justified at the site with `#[allow(..., reason = "...")]`; CI runs
+//! clippy with `-D warnings`, so a warning is a failure. Tests (`cfg(test)`) are exempt.
+//! `unsafe` is only permitted in [`backend`] (FFI into OpenVINO, ONNX Runtime, DXGI, CUDA and
+//! `libloading`), every block with a `// SAFETY:` comment.
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::large_futures,
+        clippy::unused_async,
+        clippy::dbg_macro,
+        clippy::undocumented_unsafe_blocks,
+        missing_debug_implementations
+    )
+)]
+#![warn(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_code)]
+
 pub mod api;
+#[allow(unsafe_code, reason = "FFI into OpenVINO, ONNX Runtime, DXGI, CUDA and libloading")]
 pub mod backend;
 pub mod benchmark;
 pub mod cli;

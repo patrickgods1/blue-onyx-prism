@@ -4,6 +4,23 @@
 //! times, optionally in parallel), prints the response or a latency summary and exits non-zero
 //! if any request failed.
 
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::large_futures,
+        clippy::unused_async,
+        clippy::dbg_macro,
+        missing_debug_implementations
+    )
+)]
+#![deny(unsafe_code)]
+
 use anyhow::{Context, Result, bail};
 use blue_onyx_prism::api::{Prediction, VisionDetectionResponse};
 use clap::Parser;

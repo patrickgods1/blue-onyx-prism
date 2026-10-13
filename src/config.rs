@@ -237,6 +237,10 @@ pub struct Config {
     /// Root for downloaded runtimes (`openvino/`, `onnxruntime/<flavor>/`, ...), relative to the
     /// exe dir. None = the exe dir. Model files go where each model's `path` points.
     pub download_dir: Option<PathBuf>,
+    /// Largest image accepted for decoding, in pixels (width x height), checked from the image
+    /// header before any pixel buffer is allocated; applies to detection requests, the test
+    /// page, saved images and benchmark datasets. Applies at once.
+    pub max_image_pixels: u64,
     /// Name of the model that serves `/v1/vision/detection`. None = first enabled entry.
     pub default_model: Option<String>,
     pub models: Vec<ModelConfig>,
@@ -369,6 +373,7 @@ impl Default for Config {
             auto_download: true,
             allow_large_downloads: false,
             download_dir: None,
+            max_image_pixels: crate::image::MAX_IMAGE_PIXELS_DEFAULT,
             default_model: None,
             models: Vec::new(),
             benchmark: BenchmarkConfig::default(),

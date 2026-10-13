@@ -56,6 +56,9 @@ pub enum WorkItem {
 
 /// Hard capacity of the channel when the queue is auto-sized.
 pub const MAX_AUTO_QUEUE: usize = 64;
+/// Largest `worker_queue_size` accepted (config validation) and applied at spawn; the bounded
+/// channel allocates every slot up front.
+pub const MAX_QUEUE_SIZE: usize = 1024;
 
 /// How often a blocked worker re-checks the shutdown token.
 const POLL: Duration = Duration::from_millis(250);

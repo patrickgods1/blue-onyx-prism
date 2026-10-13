@@ -222,6 +222,7 @@ against the executable directory. The Windows service reads `blue_onyx_prism_con
 | `log_path` | `null` | Directory for daily rolling log files (default: stdout) |
 | `save_image_path` | `null` | Save annotated detections here |
 | `save_ref_image` | `false` | Also save the unannotated image |
+| `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. Applies at once |
 | `intra_threads` | `0` | CPU inference threads (0 = OpenVINO default; try 4 of 6 cores) |
 | `models_dir` | `"models"` | Where `download-models` puts files |
 | `default_model` | `null` | Model serving `/v1/vision/detection`; default = first enabled entry |

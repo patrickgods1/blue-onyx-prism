@@ -13,6 +13,26 @@ use zune_jpeg::JpegDecoder;
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/roboto-mono-stripped.ttf");
 
+/// Default of `max_image_pixels` (config): 50 megapixels, about 8700 x 5700.
+pub const MAX_IMAGE_PIXELS_DEFAULT: u64 = 50_000_000;
+static MAX_IMAGE_PIXELS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(MAX_IMAGE_PIXELS_DEFAULT);
+
+/// Set the process-wide decode ceiling (config `max_image_pixels`); 0 restores the default.
+pub fn set_max_pixels(pixels: u64) {
+    let v = if pixels == 0 {
+        MAX_IMAGE_PIXELS_DEFAULT
+    } else {
+        pixels
+    };
+    MAX_IMAGE_PIXELS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current decode ceiling in pixels (width x height).
+pub fn max_pixels() -> u64 {
+    MAX_IMAGE_PIXELS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Tightly packed RGB8 image (`rgb.len() == width * height * 3`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RgbImage {
