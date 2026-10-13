@@ -716,8 +716,9 @@ mod cuda_driver {
         // Never unloaded: unloading the driver after cuInit is not supported, and the CUDA
         // provider uses it later anyway.
         let lib: &'static libloading::Library = Box::leak(Box::new(lib));
-        // SAFETY: the symbol types match the CUDA driver API (cuda.h) declarations.
         let sym = |name: &[u8]| -> Result<*const (), String> {
+            // SAFETY: `lib` stays loaded for the whole process (leaked above) and the symbol is
+            // read as a plain code pointer; it is cast to its cuda.h signature below.
             unsafe { crate::backend::libs::symbol::<*const ()>(lib, name) }
                 .map(|s| *s)
                 .map_err(|e| format!("{LIBRARY}: {e}"))
@@ -742,16 +743,19 @@ mod cuda_driver {
             .ok()
             .map(|p| unsafe { std::mem::transmute::<*const (), CuDeviceGetLuid>(p) });
 
-        // SAFETY (all calls below): plain driver queries writing into local out-parameters of
-        // the documented sizes.
+        // SAFETY: every driver call below is a plain query with its cuda.h signature, writing
+        // into local out-parameters of the documented sizes.
         check("cuInit", unsafe { init(0) })?;
         let mut n: c_int = 0;
+        // SAFETY: see above.
         check("cuDeviceGetCount", unsafe { count(&mut n) })?;
         let mut out = Vec::new();
         for ordinal in 0..n.max(0) {
             let mut dev: CuDevice = 0;
+            // SAFETY: see above.
             check("cuDeviceGet", unsafe { get(&mut dev, ordinal) })?;
             let (mut major, mut minor): (c_int, c_int) = (0, 0);
+            // SAFETY: see above.
             check("cuDeviceGetAttribute(major)", unsafe {
                 attr(
                     &mut major,
@@ -759,6 +763,7 @@ mod cuda_driver {
                     dev,
                 )
             })?;
+            // SAFETY: see above.
             check("cuDeviceGetAttribute(minor)", unsafe {
                 attr(
                     &mut minor,
@@ -767,6 +772,7 @@ mod cuda_driver {
                 )
             })?;
             let mut name_buf = [0 as c_char; 256];
+            // SAFETY: see above; the buffer length is passed with the pointer.
             check("cuDeviceGetName", unsafe {
                 name(
                     name_buf.as_mut_ptr(),
@@ -776,6 +782,7 @@ mod cuda_driver {
             })?;
             let mut bus_buf = [0 as c_char; 64];
             let bus_len = c_int::try_from(bus_buf.len()).unwrap_or(c_int::MAX);
+            // SAFETY: see above; the buffer length is passed with the pointer.
             let pci = (unsafe { bus(bus_buf.as_mut_ptr(), bus_len, dev) } == CUDA_SUCCESS)
                 .then(|| PciAddress::parse(&c_string(&bus_buf)))
                 .flatten();
@@ -783,6 +790,7 @@ mod cuda_driver {
             let luid = luid_fn.and_then(|f| {
                 let mut raw = [0 as c_char; 8];
                 let mut mask: c_uint = 0;
+                // SAFETY: see above; cuDeviceGetLuid writes exactly 8 bytes.
                 (unsafe { f(raw.as_mut_ptr(), &mut mask, dev) } == CUDA_SUCCESS)
                     .then(|| u64::from_le_bytes(raw.map(|c| u8::from_ne_bytes(c.to_ne_bytes()))))
             });

@@ -288,3 +288,63 @@ async fn device_change_reloads_only_that_model() {
     assert!(r.success && !r.predictions.is_empty(), "{r:?}");
     served.stop().await;
 }
+
+/// Reloading one model over and over must not accumulate threads or memory.
+#[tokio::test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
+async fn reload_model_n_times_does_not_leak() {
+    let (model, ov_dir, image) = fixtures();
+    let config = config_with(&ov_dir, vec![ipcam("ipcam-a", &model)]);
+    let client = reqwest::Client::new();
+    let served = Server::start(config, temp_dir("leak").join("cfg.json")).await;
+    let base = served.base.clone();
+    wait_ready(&client, &base, &["ipcam-a"]).await;
+
+    // Alternate the device spelling: each change reloads only this model.
+    let reload = |n: u64| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let dev = if n % 2 == 1 { "openvino:cpu" } else { "CPU" };
+            let j = post_form(
+                &client,
+                &format!("{base}/config/models"),
+                &format!("enabled=ipcam-a&default_model=ipcam-a&device.ipcam-a={dev}&action=save"),
+            )
+            .await;
+            let msg = j["message"].as_str().unwrap_or_default();
+            assert!(msg.contains("Reloading ipcam-a on"), "{j}");
+            wait_until("ipcam-a to reload", Duration::from_secs(120), || async {
+                let s = stats_of(&client, &base, "ipcam-a")
+                    .await
+                    .unwrap_or_default();
+                s["reloads"] == n && s["state"] == "Ready"
+            })
+            .await;
+        }
+    };
+
+    reload(1).await;
+    let threads0 = common::thread_count();
+    let rss0 = common::rss_kb();
+    for n in 2..=10 {
+        reload(n).await;
+    }
+    let threads1 = common::thread_count();
+    let rss1 = common::rss_kb();
+    eprintln!("after reload 1: threads {threads0:?}, rss {rss0:?} KiB");
+    eprintln!("after reload 10: threads {threads1:?}, rss {rss1:?} KiB");
+    match (threads0, threads1) {
+        (Some(a), Some(b)) => assert!(b <= a + 2, "threads grew from {a} to {b}"),
+        _ => eprintln!("thread count unavailable on this platform: assertion skipped"),
+    }
+    if let (Some(a), Some(b)) = (rss0, rss1) {
+        assert!(b * 4 <= a * 5, "RSS grew more than 25%: {a} -> {b} KiB");
+    }
+
+    let s = stats_of(&client, &base, "ipcam-a").await.unwrap();
+    assert_eq!(s["reloads"], 10, "{s}");
+    let r = post_image(&client, &format!("{base}/v1/vision/custom/ipcam-a"), &image).await;
+    assert!(r.success && !r.predictions.is_empty(), "{r:?}");
+    served.stop().await;
+}

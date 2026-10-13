@@ -193,13 +193,67 @@ fn partial_dims(ps: &PartialShape) -> Vec<i64> {
         .collect()
 }
 
-fn port_spec(node: &Node, idx: usize, kind: &str) -> Result<PortSpec> {
-    // `get_name` fails for ports without tensor names; synthesize one (IO is index-based).
-    let name = node.get_name().unwrap_or_else(|_| format!("{kind}{idx}"));
-    let ps = node
+/// A model port (`ov_output_const_port_t`) that is freed when dropped.
+///
+/// `openvino::Node` (0.11) has no `Drop`: the port it wraps is never freed. A port holds a
+/// reference to its node, and an output (`Result`) node holds its producers, so every leaked
+/// port kept the whole graph of the read `Model` alive, weights included: about 39 MB per
+/// reload of a 29 MB ONNX model, for as long as the process ran.
+struct Port(Node);
+
+impl Port {
+    fn raw(&self) -> *mut openvino_sys::ov_output_const_port_t {
+        // `openvino::Node` (0.11) is a struct whose only field is this pointer.
+        const _: () = assert!(
+            std::mem::size_of::<Node>()
+                == std::mem::size_of::<*mut openvino_sys::ov_output_const_port_t>()
+        );
+        // SAFETY: same size (asserted above) and the single field is the pointer; reading it
+        // does not transfer ownership (`Port` frees it once, on drop).
+        unsafe { std::mem::transmute_copy(&self.0) }
+    }
+
+    /// The port's tensor name (`Node::get_name` leaks the C string; this frees it).
+    fn name(&self) -> Option<String> {
+        let mut c_name: *mut std::ffi::c_char = std::ptr::null_mut();
+        // SAFETY: `self.raw()` is a live port; on success OpenVINO writes a NUL-terminated
+        // string allocated for the caller, freed with `ov_free` after copying it.
+        unsafe {
+            let status = openvino_sys::ov_port_get_any_name(self.raw(), &mut c_name);
+            if c_name.is_null() {
+                return None;
+            }
+            let name = (status == openvino_sys::ov_status_e::OK).then(|| {
+                std::ffi::CStr::from_ptr(c_name)
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            openvino_sys::ov_free(c_name);
+            name
+        }
+    }
+}
+
+impl Drop for Port {
+    fn drop(&mut self) {
+        let ptr = self.raw();
+        if !ptr.is_null() {
+            // SAFETY: the port was returned by `ov_model_const_*_by_index` and is freed only
+            // here (`Node` itself never frees it).
+            unsafe { openvino_sys::ov_output_const_port_free(ptr) }
+        }
+    }
+}
+
+fn port_spec(port: &Port, idx: usize, kind: &str) -> Result<PortSpec> {
+    // Ports without tensor names get a synthesized one (IO is index-based).
+    let name = port.name().unwrap_or_else(|| format!("{kind}{idx}"));
+    let ps = port
+        .0
         .get_partial_shape()
         .with_context(|| format!("reading shape of {kind} port {idx} ({name})"))?;
-    let elem = node
+    let elem = port
+        .0
         .get_element_type()
         .with_context(|| format!("reading element type of {kind} port {idx} ({name})"))?;
     Ok(PortSpec {
@@ -214,17 +268,21 @@ fn introspect(model: &Model) -> Result<(Vec<PortSpec>, Vec<PortSpec>)> {
     let n_out = model.get_outputs_len().context("counting model outputs")?;
     let mut inputs = Vec::with_capacity(n_in);
     for i in 0..n_in {
-        let node = model
-            .get_input_by_index(i)
-            .with_context(|| format!("getting input port {i}"))?;
-        inputs.push(port_spec(&node, i, "input")?);
+        let port = Port(
+            model
+                .get_input_by_index(i)
+                .with_context(|| format!("getting input port {i}"))?,
+        );
+        inputs.push(port_spec(&port, i, "input")?);
     }
     let mut outputs = Vec::with_capacity(n_out);
     for i in 0..n_out {
-        let node = model
-            .get_output_by_index(i)
-            .with_context(|| format!("getting output port {i}"))?;
-        outputs.push(port_spec(&node, i, "output")?);
+        let port = Port(
+            model
+                .get_output_by_index(i)
+                .with_context(|| format!("getting output port {i}"))?,
+        );
+        outputs.push(port_spec(&port, i, "output")?);
     }
     Ok((inputs, outputs))
 }

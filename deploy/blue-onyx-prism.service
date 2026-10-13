@@ -3,7 +3,20 @@ Description=Blue Onyx Prism object detection service (Blue Iris / CodeProject.AI
 After=network.target
 
 [Service]
-Type=simple
+# Type=notify: the service sends READY=1 (src/sdnotify.rs) as soon as the HTTP listener is bound,
+# so `systemctl start` returns while models still compile in the background; poll
+# `GET /v1/status` for model readiness. Needs NotifyAccess=main (only the main process notifies).
+Type=notify
+NotifyAccess=main
+# Watchdog: the service pings WATCHDOG=1 every WatchdogSec/2 while its HTTP listener accepts
+# connections (a loopback connect, checked by the ping thread). A model that is still downloading
+# or compiling (minutes on a first start) is NOT a hung process, so model readiness does not
+# gate the ping and WatchdogSec need not exceed the longest compile. A deadlocked or starved
+# server stops answering, the pings stop, and systemd restarts it (Restart=on-failure covers
+# watchdog kills).
+WatchdogSec=120
+# Seconds systemd waits after SIGTERM (graceful drain) before SIGKILL.
+TimeoutStopSec=30
 # Program (binary, openvino/, onnxruntime/) in /opt/blue-onyx-prism, owned by root and read-only
 # to the service. Everything the service writes (config, models, cache, downloads, benchmark.json,
 # model-export tools) lives in /var/lib/blue-onyx-prism, owned by the service user.

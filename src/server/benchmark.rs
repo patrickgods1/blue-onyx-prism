@@ -496,11 +496,11 @@ fn saved_view(
     let view = match BenchmarkResults::load_or_warn(&path) {
         Some(mut r) => {
             let ranking = serde_json::to_value(r.ranking()).unwrap_or_default();
-            let stored = StoredPreds::load(&preds)
+            let stored = StoredPreds::load_cached(&preds)
                 .map_err(|e| warn!("{e:#}"))
                 .ok()
                 .flatten();
-            crate::benchmark::current::rebase(&mut r, stored.as_ref(), now);
+            crate::benchmark::current::rebase(&mut r, stored.as_deref(), now);
             SavedView {
                 results: serde_json::to_value(r.summary()).unwrap_or_default(),
                 ranking,
@@ -575,7 +575,13 @@ pub(super) async fn start(
         Ok(Form(f)) => f,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
-    let req = match parse_request(&state, &form) {
+    super::blocking(move || start_blocking(&state, &form)).await
+}
+
+/// [`start`] off the runtime threads: checking the datasets stats directories and building the
+/// run context clones the config (SV-06).
+fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
+    let req = match parse_request(state, form) {
         Ok(r) => r,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
@@ -589,7 +595,7 @@ pub(super) async fn start(
         config: state.config_read().clone(),
         results_path: results_path(&state.config_path),
         runtimes: state.registry.runtimes().cloned(),
-        loaded: loaded_devices(&state),
+        loaded: loaded_devices(state),
         resources: state.resources.clone(),
     };
     info!(
@@ -638,11 +644,16 @@ pub(super) async fn settings(
             form.push(("dataset".into(), v));
         }
     }
-    let req = match parse_request(&state, &form) {
+    super::blocking(move || settings_blocking(&state, &form)).await
+}
+
+/// [`settings`] off the runtime threads: dataset checks and the config write (SV-06).
+fn settings_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response {
+    let req = match parse_request(state, form) {
         Ok(r) => r,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
-    match save_config(&state, "benchmark settings", |c| {
+    match save_config(state, "benchmark settings", |c| {
         req.to_config(&mut c.benchmark);
         Ok(())
     }) {
@@ -677,6 +688,11 @@ pub(super) async fn images_detail(
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Response {
     let q = query.map(|Query(q)| q).unwrap_or_default();
+    super::blocking(move || images_detail_blocking(&state, &q)).await
+}
+
+/// [`images_detail`] off the runtime threads: it parses `benchmark.json` (SV-06).
+fn images_detail_blocking(state: &AppState, q: &HashMap<String, String>) -> Response {
     let (Some(model), Some(device)) = (q.get("model"), q.get("device")) else {
         return json_error(StatusCode::BAD_REQUEST, "give `model` and `device`".into());
     };
@@ -753,25 +769,69 @@ pub(super) async fn image_file(
         )
             .into_response();
     }
-    let path = BenchmarkResults::load_or_warn(&results_path(&state.config_path))
-        .and_then(|r| r.image_set(set).and_then(|s| s.image_path(file)));
-    let Some(path) = path else {
-        return json_error(
-            StatusCode::NOT_FOUND,
-            "not an image of the saved results".into(),
-        );
-    };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            [
-                (header::CONTENT_TYPE, ctype(file)),
-                (header::CACHE_CONTROL, "private, max-age=600"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(e) => json_error(StatusCode::NOT_FOUND, format!("{}: {e}", path.display())),
+    let (set, file) = (set.clone(), file.clone());
+    super::blocking(move || {
+        let paths = image_paths(&results_path(&state.config_path));
+        let Some(path) = paths.get(&(set, file.clone())) else {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "not an image of the saved results".into(),
+            );
+        };
+        match std::fs::read(path) {
+            Ok(bytes) => (
+                [
+                    (header::CONTENT_TYPE, ctype(&file)),
+                    (header::CACHE_CONTROL, "private, max-age=600"),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => json_error(StatusCode::NOT_FOUND, format!("{}: {e}", path.display())),
+        }
+    })
+    .await
+}
+
+/// (dataset id, file) -> path of every image of the saved results that may be served
+/// ([`crate::benchmark::report::ImageSetInfo::image_path`]).
+type ImagePaths = HashMap<(String, String), std::path::PathBuf>;
+
+/// The last [`ImagePaths`] and the results file stamp it was built from: the drill-down asks
+/// for every image of a run, which must not parse `benchmark.json` (tens of MB) per image
+/// (SV-06).
+type ImagePathsCache = Option<(String, Arc<ImagePaths>)>;
+static IMAGE_PATHS: std::sync::Mutex<ImagePathsCache> = std::sync::Mutex::new(None);
+
+/// The servable images of the results at `path`, cached by the file's stamp.
+fn image_paths(path: &std::path::Path) -> Arc<ImagePaths> {
+    image_paths_in(&IMAGE_PATHS, path)
+}
+
+/// [`image_paths`] with the cache given (tests).
+fn image_paths_in(
+    cache: &std::sync::Mutex<ImagePathsCache>,
+    path: &std::path::Path,
+) -> Arc<ImagePaths> {
+    let key = format!("{}|{:?}", path.display(), file_stamp(path));
+    if let Some((k, v)) = cache.lock_recover().as_ref()
+        && *k == key
+    {
+        return v.clone();
     }
+    let mut map = ImagePaths::new();
+    if let Some(r) = BenchmarkResults::load_or_warn(path) {
+        for s in &r.image_sets {
+            for i in &s.images {
+                if let Some(p) = s.image_path(&i.file) {
+                    map.entry((s.id.clone(), i.file.clone())).or_insert(p);
+                }
+            }
+        }
+    }
+    let map = Arc::new(map);
+    *cache.lock_recover() = Some((key, map.clone()));
+    map
 }
 
 fn truthy(v: &str) -> bool {
@@ -796,13 +856,19 @@ pub(super) async fn apply(
         Ok(Form(f)) => f,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
-    let restart = form_field(&form, "restart").is_some_and(truthy);
-    let picks = match device_picks(&state, &form) {
+    super::blocking(move || apply_blocking(&state, &form)).await
+}
+
+/// [`apply`] off the runtime threads: it parses the results, writes the config and reloads
+/// the changed models (SV-06).
+fn apply_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response {
+    let restart = form_field(form, "restart").is_some_and(truthy);
+    let picks = match device_picks(state, form) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
     let mut changes: Vec<DeviceChange> = Vec::new();
-    let saved = save_config(&state, "benchmark apply", |c| {
+    let saved = save_config(state, "benchmark apply", |c| {
         changes = apply_model_devices(c, &picks)?;
         Ok(())
     });
@@ -810,7 +876,7 @@ pub(super) async fn apply(
         warn!("benchmark apply refused: {e:#}");
         return json_error(StatusCode::BAD_REQUEST, format!("{e:#}"));
     }
-    let (message, restarting) = device_apply_outcome(&state, &changes, restart);
+    let (message, restarting) = device_apply_outcome(state, &changes, restart);
     info!("benchmark apply: {message}");
     Json(serde_json::json!({
         "success": true,
@@ -958,7 +1024,7 @@ fn device_apply_outcome(
 /// The saved results and stored predictions, or a 400 telling to run a benchmark first.
 fn search_data(
     state: &AppState,
-) -> Result<(BenchmarkResults, crate::benchmark::search::StoredPreds), ApiError> {
+) -> Result<(BenchmarkResults, Arc<crate::benchmark::search::StoredPreds>), ApiError> {
     use crate::benchmark::search::{StoredPreds, preds_path};
     let none = || {
         ApiError::new(
@@ -977,7 +1043,7 @@ fn search_data(
             ));
         }
     };
-    match StoredPreds::load(&preds_path(&state.config_path)) {
+    match StoredPreds::load_cached(&preds_path(&state.config_path)) {
         Ok(Some(p)) if !p.runs.is_empty() => Ok((results, p)),
         Ok(_) => Err(none()),
         Err(e) => Err(ApiError::new(
@@ -1005,18 +1071,21 @@ fn current_thresholds(cfg: &Config) -> HashMap<String, f64> {
 /// `GET /v1/benchmark/threshold-search`: the searchable models (with their stored devices and
 /// recommended device), datasets, tags and classes, the configured objective and thresholds.
 pub(super) async fn search_options(State(state): State<Arc<AppState>>) -> Response {
-    let (results, preds) = match search_data(&state) {
-        Ok(d) => d,
-        Err(e) => return e.into_response(),
-    };
-    let cfg = state.config_read().clone();
-    Json(serde_json::json!({
-        "success": true,
-        "options": crate::benchmark::search::options(&results, &preds),
-        "objective": cfg.benchmark.threshold_objective,
-        "thresholds": current_thresholds(&cfg),
-    }))
-    .into_response()
+    super::blocking(move || {
+        let (results, preds) = match search_data(&state) {
+            Ok(d) => d,
+            Err(e) => return e.into_response(),
+        };
+        let cfg = state.config_read().clone();
+        Json(serde_json::json!({
+            "success": true,
+            "options": crate::benchmark::search::options(&results, &preds),
+            "objective": cfg.benchmark.threshold_objective,
+            "thresholds": current_thresholds(&cfg),
+        }))
+        .into_response()
+    })
+    .await
 }
 
 /// `POST /v1/benchmark/threshold-search` (urlencoded): `model` (repeated or comma separated;
@@ -1034,15 +1103,21 @@ pub(super) async fn threshold_search(
         Ok(Form(f)) => f,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
+    super::blocking(move || threshold_search_blocking(&state, &form)).await
+}
+
+/// [`threshold_search`] off the runtime threads: it parses the results and the stored
+/// predictions and runs the exhaustive search (SV-06, BQ-04).
+fn threshold_search_blocking(state: &AppState, form: &[(String, String)]) -> Response {
     let cfg = state.config_read().clone();
     let req = match crate::benchmark::search::SearchRequest::from_form(
-        &form,
+        form,
         cfg.benchmark.threshold_objective,
     ) {
         Ok(r) => r,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
-    let (results, preds) = match search_data(&state) {
+    let (results, preds) = match search_data(state) {
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };
@@ -1099,12 +1174,18 @@ pub(super) async fn apply_threshold(
         Ok(Form(f)) => f,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
-    let picks = match threshold_picks(&state, &form) {
+    super::blocking(move || apply_threshold_blocking(&state, &form)).await
+}
+
+/// [`apply_threshold`] off the runtime threads: it parses the results and writes the config
+/// (SV-06).
+fn apply_threshold_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response {
+    let picks = match threshold_picks(state, form) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
     let mut changes: Vec<ThresholdChange> = Vec::new();
-    if let Err(e) = save_config(&state, "benchmark apply-threshold", |c| {
+    if let Err(e) = save_config(state, "benchmark apply-threshold", |c| {
         changes = apply_model_thresholds(c, &picks)?;
         Ok(())
     }) {
@@ -1982,5 +2063,47 @@ mod tests {
         .unwrap();
         assert!(html.contains("Models not saved"), "{html}");
         assert_eq!(Config::load(&st.config_path).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn image_file_serves_only_listed_images_from_a_cached_index() {
+        let st = state();
+        let cfg_path = st.config_path.clone();
+        let dir = cfg_path.parent().unwrap().join("imgs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.jpg"), b"jpeg bytes").unwrap();
+        std::fs::write(dir.join("secret.jpg"), b"not listed").unwrap();
+        let (mut results, _) = crate::benchmark::search::tests::fixture();
+        results.image_sets[0].dir = Some(dir.clone());
+        let path = results_path(&cfg_path);
+        results.save(&path).unwrap();
+
+        let (s, v) = call(&st, get("/v1/benchmark/image?set=night-set&file=a.jpg")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v, serde_json::Value::String("jpeg bytes".into()));
+        for q in [
+            "set=night-set&file=secret.jpg",
+            "set=night-set&file=..%2Fimgs%2Fa.jpg",
+            "set=pseudo-set&file=a.jpg",
+        ] {
+            let (s, _) = call(&st, get(&format!("/v1/benchmark/image?{q}"))).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{q}");
+        }
+
+        // The index is built once per results file version.
+        let cache = std::sync::Mutex::new(None);
+        let a = image_paths_in(&cache, &path);
+        assert_eq!(
+            a.get(&("night-set".to_string(), "a.jpg".to_string())),
+            Some(&dir.join("a.jpg"))
+        );
+        // No directory (pseudo-set): nothing servable.
+        assert!(!a.keys().any(|(set, _)| set == "pseudo-set"));
+        assert!(Arc::ptr_eq(&a, &image_paths_in(&cache, &path)));
+        results.image_sets[0].images.truncate(1);
+        results.save(&path).unwrap();
+        let b = image_paths_in(&cache, &path);
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(b.len(), 1);
     }
 }

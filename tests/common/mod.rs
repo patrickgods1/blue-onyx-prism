@@ -395,3 +395,43 @@ impl Server {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Process resource probes (leak tests)
+
+/// Threads of this process; None where it cannot be counted (Windows).
+pub fn thread_count() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir("/proc/self/task").ok().map(|d| d.count())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-M", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        let lines = String::from_utf8_lossy(&out.stdout).lines().count();
+        lines.checked_sub(1)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Resident set size of this process in KiB; None on Windows.
+pub fn rss_kb() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}

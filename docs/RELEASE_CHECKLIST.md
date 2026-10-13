@@ -20,6 +20,10 @@ Releases are built by `.github/workflows/release.yml` (Windows, Linux, macOS arc
    Open `cuda.html` and confirm that every device's agreement with the CPU reference is `ok`.
    Keep the report for the release (step 6).
 
+   Also check readiness: `curl -fsS http://127.0.0.1:32168/v1/status` returns 200 with
+   `"ready": true` once the models are loaded (503 with `"status": "initializing"` while they
+   compile), and the Docker image reports `healthy`.
+
 ## Tagging
 
 4. `git tag X.Y.Z && git push origin X.Y.Z` (plain `X.Y.Z`, no `v` prefix). The workflow builds the

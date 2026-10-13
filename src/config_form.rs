@@ -37,6 +37,8 @@ pub const FORM_FIELDS: &[&str] = &[
     "log_path",
     "save_image_path",
     "save_ref_image",
+    "save_image_max_age_days",
+    "save_image_max_mb",
     "intra_threads",
     "auto_download",
     "allow_large_downloads",
@@ -166,6 +168,12 @@ pub fn parse_config_form(
     }
     if let Some(v) = get("save_image_path") {
         c.save_image_path = dir("save_image_path", v)?;
+    }
+    if let Some(v) = get("save_image_max_age_days") {
+        c.save_image_max_age_days = num("save_image_max_age_days", v)?;
+    }
+    if let Some(v) = get("save_image_max_mb") {
+        c.save_image_max_mb = num("save_image_max_mb", v)?;
     }
     if form.contains_key("image_settings") {
         c.save_ref_image = checkbox("save_ref_image");
@@ -521,6 +529,20 @@ mod tests {
     }
 
     #[test]
+    fn save_image_retention_fields_apply() {
+        let mut c = with_model();
+        apply_config_form(
+            &mut c,
+            &form(&[
+                ("save_image_max_age_days", "0"),
+                ("save_image_max_mb", "512"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!((c.save_image_max_age_days, c.save_image_max_mb), (0, 512));
+    }
+
+    #[test]
     fn config_form_applies_all_fields() {
         let mut c = with_model();
         let models = r#"[{"name":"a","path":"m/a.xml","family":"yolo26"},
@@ -630,6 +652,8 @@ mod tests {
             ("port", "70000", "port"),
             ("port", "abc", "port"),
             ("request_timeout_secs", "0", "request_timeout_secs"),
+            ("save_image_max_age_days", "3651", "save_image_max_age_days"),
+            ("save_image_max_mb", "x", "save_image_max_mb"),
             ("worker_queue_size", "-1", "worker_queue_size"),
             ("confidence_threshold", "1.5", "confidence_threshold"),
             ("nms_iou", "x", "nms_iou"),
@@ -681,6 +705,8 @@ mod tests {
         }
     }
 
+    // Unix path layout (absolute `/...` paths, lib64 / ld.so.conf dirs).
+    #[cfg(unix)]
     #[test]
     fn directory_settings_are_resolved_under_the_data_root() {
         let mut c = with_model();

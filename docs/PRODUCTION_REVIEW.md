@@ -3500,9 +3500,51 @@ Multipart parse (image `Bytes` copy, `HashMap` of text fields), one `oneshot`, r
 - Provenance and license of `tests/data/dog_bike_car.jpg`, which is embedded in the binaries.
 
 
+### Phase 3 notes (items from the brief without a finding ID)
+
+- **Reload leak (found by the new test `reload_model_n_times_does_not_leak`):** RSS grew ~39 MB per
+  model reload. Cause: `openvino::Node` (openvino crate 0.11) has no `Drop`, so the input/output
+  ports taken in `backend::device::introspect` leaked and kept the whole read graph (weights
+  included) alive. Fixed: a `Port` wrapper that frees the port (and its name string). Measured on
+  macOS arm64, OpenVINO CPU, 10 reloads: before 345 -> 693 MB; after 314 -> 357 MB, flat over 40
+  reloads. Threads stayed at 18 throughout (no thread leak).
+- **Buffer reuse:** already present (`prep::TensorPool`, one `Preprocessor` per model geometry per
+  prep thread; the image field is moved as `Bytes` without a copy). Not changed.
+- **Config change log / metrics:** bounded already (50 change records; fixed histogram buckets).
+  `benchmark.json` holds one result per model x device and no history. Not an issue.
+- **Outbound HTTP timeouts:** the download client has connect (30 s) and read (60 s) timeouts, the
+  release check 10 s. Not changed.
+- **Disk:** saved images pruned by age (`save_image_max_age_days`, default 30) and folder size
+  (`save_image_max_mb`, default 2048) by a per-process sweeper every 10 min; a warning when free
+  space under the data root drops below 1 GiB (at most hourly); stale `.partial` files (> 7 days)
+  and staging directories (> 1 h) removed at manager start; rolled logs capped at 14 (phase 2).
+- **Shutdown:** the existing drain (5 s per generation, 1 s linger) is kept; the listener now
+  stops through hyper's graceful shutdown with a 10 s deadline; the sweeper and watchdog threads
+  are cancelled and joined. Not changed otherwise; the graceful path is exercised by
+  `server::tests::slow_heads_and_idle_connections_are_closed` and the HTTP integration tests.
+- **Startup / readiness:** `GET /v1/status` (open route) returns `ready`, `status`
+  (ready / degraded / initializing / failed), per-model states and 200/503; the Docker
+  `HEALTHCHECK` and compose healthcheck poll it (`--start-period=300s`); the systemd unit is
+  `Type=notify` with `WatchdogSec=120` (`sdnotify.rs`: READY=1 once the listener is bound, the
+  watchdog pings while the listener accepts connections, STOPPING=1 on shutdown).
+- **Bounded compile wait:** not added. A compile is a blocking FFI call on the worker thread that
+  cannot be aborted safely; a model stuck compiling shows as `initializing` on `/v1/status`, and
+  the watchdog deliberately does not treat it as a hung process. Deferred to phase 4 as a
+  "compiling for longer than N minutes" warning.
+- **Found by CI in this phase (not phase-3 scope, fixed here):** main's CI had been red on Linux
+  and Windows since phase 1: the crate-wide `undocumented_unsafe_blocks` lint fires on the CUDA
+  driver probe (`backend/detect.rs`, not compiled on macOS), `open_path` is dead in an
+  OpenVINO-only Linux build, and several unit tests assumed Unix path layouts. One real bug:
+  since phase 2 the file browser refused every explicit path on Windows with 403, because the
+  lexical root check compared a plain `C:\...` path with canonical roots carrying the `\\?\`
+  prefix (`browse::inside_any`); fixed and unit-tested for the Windows path forms.
+- **Not verified on this machine:** the systemd watchdog and `Type=notify` on Linux, the Docker
+  healthcheck, Windows builds of `sdnotify`/`retention`, the listener timeouts under real Blue
+  Iris load (unit-tested over loopback TCP only), the CoreML rewrite on a real > 512 MiB model.
+
 ## Per-finding status
 
-Updated at the end of each phase (phase 1: branch `review/phase-1-crash-safety`; phase 2: branch `review/phase-2-security`). Phase 0 leaves every finding open; the phase column is where the fix
+Updated at the end of each phase (phase 1: branch `review/phase-1-crash-safety`; phase 2: branch `review/phase-2-security`; phase 3: branch `review/phase-3-resources-load`). Phase 0 leaves every finding open; the phase column is where the fix
 is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maintainability).
 
 | ID | Severity | Phase | Status |
@@ -3534,14 +3576,14 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | SV-09 | security-boundary | 2 | fixed in phase 2: nosniff, Referrer-Policy, X-Frame-Options, CSP (no inline scripts/styles; all page scripts moved to /static), Cache-Control no-store on JSON |
 | SV-10 | security-boundary | 2 | fixed in phase 2: browse canonicalizes and requires a configured root (data root, models, downloads, home, Windows drives); symlink escapes refused |
 | BE-02 | resource-exhaustion | 3 | fixed in phase 2: system_cuda_present cached per process (OnceLock), libraries stay loaded |
-| BE-06 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| BE-06 | resource-exhaustion | 3 | fixed in phase 3: CoreML rewrite skipped above 512 MiB (the original file is used); tensors and attributes parsed lazily; cached copy compared in chunks |
 | BM-04 | resource-exhaustion | 3 | fixed in phase 1: --repeat 1..=1000, --warmup 0..=100 (same bounds as the service) |
-| BM-11 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| BQ-04 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| BQ-05 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| BM-11 | resource-exhaustion | 3 | fixed in phase 3: max_images capped at 2000 per run (spread over the sets); each model merged and saved as it finishes, only summaries kept; sweep clones summaries only |
+| BQ-04 | resource-exhaustion | 3 | fixed in phase 3: stored predictions capped at 100 per image; parsed file cached by path+mtime+len; search handlers run on the blocking pool |
+| BQ-05 | resource-exhaustion | 3 | fixed in phase 1: benchmark image files checked against a size limit before the read |
 | CO-06 | resource-exhaustion | 3 | fixed in phase 2: log_path keeps the newest 14 daily files |
 | NR-06 | resource-exhaustion | 3 | fixed in phase 2: launchd stdout log rotated by newsyslog |
-| PL-01 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| PL-01 | resource-exhaustion | 3 | fixed in phase 3: effective threshold floored at 0.01; at most 3000 NMS candidates (O(n) top-k) and 300 detections; NMS compares against kept boxes only |
 | PL-03 | resource-exhaustion | 3 | fixed in phase 1: header-first decode with the max_image_pixels ceiling on both decoders; zero dims rejected |
 | PL-04 | resource-exhaustion | 3 | fixed in phase 1: model input side <= 8192 and tensor <= 256 MiB, else the model fails to load |
 | RS-02 | resource-exhaustion | 3 | fixed in phase 2: export children run in a process group (Unix) / Job Object (Windows) and the tree is killed on cancel, timeout and stop |
@@ -3549,8 +3591,8 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RS-05 | resource-exhaustion | 3 | fixed in phase 2: Content-Length / Content-Range / running count checked against the pin; mismatch is permanent, not retried |
 | RS-08 | resource-exhaustion | 3 | fixed in phase 2: child output lines capped at 4 KiB, 2000 lines buffered |
 | RS-12 | resource-exhaustion | 3 | fixed in phase 2: release-check body capped at 1 MiB, typed parse, fields truncated |
-| SV-04 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| SV-08 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| SV-04 | resource-exhaustion | 3 | fixed in phase 3: hyper served with a timer, 10 s header-read/idle timeout, 10 s graceful deadline; process-wide in-flight cap (sum of queue capacities + 16, default 64) answers 503 and counts requests_rejected_total{reason="overloaded"}; 30 s multipart read timeout; bodies discarded (not buffered) when the model is full, failed, initializing or unknown |
+| SV-08 | resource-exhaustion | 3 | fixed in phase 2 (name shortened) and phase 3: log ring messages capped at 4 KiB, targets at 256 bytes, ring at 8 MiB |
 | BE-03 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BE-05 | correctness | 1 | fixed in phase 1: checked arithmetic in the Split/Flatten emitters; overflow skips the node with a reason |
 | BE-07 | correctness | 4 | open (phase 0: identified, not yet fixed) |
@@ -3608,8 +3650,8 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RS-10 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | RS-11 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | RS-14 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| SV-06 | operability | 3 | open (phase 0: identified, not yet fixed) |
-| SV-07 | operability | 3 | open (phase 0: identified, not yet fixed) |
+| SV-06 | operability | 3 | fixed in phase 3: every benchmark handler's file/JSON/CPU work runs in server::blocking; image files served from a cached index |
+| SV-07 | operability | 3 | fixed in phase 3: the browse walk and drive probing run in server::blocking |
 | SV-11 | operability | 4 | fixed in phase 2: live.js handles non-JSON/403, capped exponential backoff, waitRestart gives up after 2 min, timers paused while hidden |
 | SV-12 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | SV-15 | operability | 1 | fixed in phase 1: catch_panic middleware answers 500 (JSON or HTML) and the connection stays usable |

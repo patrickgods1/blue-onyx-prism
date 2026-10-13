@@ -226,6 +226,8 @@ against the executable directory. The Windows service reads `blue_onyx_prism_con
 | `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout) |
 | `save_image_path` | `null` | Save annotated detections here |
 | `save_ref_image` | `false` | Also save the unannotated image |
+| `save_image_max_age_days` | `30` | Delete saved images (`.jpg`/`.jpeg`/`.png` directly in `save_image_path`) older than this many days, 0-3650 (0 = keep). Checked every 10 minutes. Applies at once |
+| `save_image_max_mb` | `2048` | Keep the saved-image folder under this many MB, deleting the oldest first, 0-1000000 (0 = unlimited). Applies at once |
 | `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. 1000 to 1000000000. Applies at once |
 | `intra_threads` | `0` | CPU inference threads, 0-256 (0 = OpenVINO default; try 4 of 6 cores) |
 | `models_dir` | `"models"` | Where `download-models` puts files (must not be empty) |
@@ -572,8 +574,10 @@ histograms `blue_onyx_prism_inference_ms`, `blue_onyx_prism_process_ms` and
 100, 200, 500, 1000, 2000, 5000 ms and `+Inf`). The histograms keep the `_ms` unit in their names
 instead of the Prometheus-conventional `_seconds`, for compatibility with existing blue-onyx
 dashboards; the `_avg`/`_min`/`_max` gauges are still exported. Process level:
-`blue_onyx_prism_restarts_total`. Gauges: `model_info`, `model_ready`, `queue_length`,
-`queue_capacity`. (`rejected_initializing_total` is now `dropped_total{reason="initializing"}`.)
+`blue_onyx_prism_restarts_total` and `blue_onyx_prism_requests_rejected_total{reason="overloaded"}`
+(detections answered 503 at once because more requests were in flight than every model's queue
+can hold plus 16; `stats.json` shows the same as `rejectedOverloaded` and `inflightRequests`).
+Gauges: `model_info`, `model_ready`, `queue_length`, `queue_capacity`, `inflight_requests`. (`rejected_initializing_total` is now `dropped_total{reason="initializing"}`.)
 
 `log_path`, `port` and `bind_address` changes need a full process restart. The UI has no
 authentication: do not expose the port beyond your LAN.
@@ -585,7 +589,7 @@ Blue Iris may run on another machine, so the service listens on every interface 
 this machine only: from another machine the admin pages and actions (`/config`, `/test`, `/logs`,
 `/stats`, `/benchmark`, `/v1/resources*`, `/v1/models/add`, `/v1/fs/browse`, `/v1/benchmark*`,
 `/config/*`) return **403** with a short page (browsers) or JSON. Open to every client: the
-detection API (`/v1/vision/*`), `/v1/status/updateavailable`, the home page `/`, `/stats.json`,
+detection API (`/v1/vision/*`), `/v1/status`, `/v1/status/updateavailable`, the home page `/`, `/stats.json`,
 `/prometheus`, `/v1/devices`, `/v1/config` (read-only) and the static files.
 
 - To administer from another machine, set `"allow_remote_admin": true` (or check *Allow remote
@@ -705,6 +709,7 @@ The container's health check polls `/v1/vision/custom/list` (`docker ps` shows `
 | POST, GET | `/v1/vision/custom/list` | configured model names |
 | POST | `/v1/models/add` | add a custom model by file or directory path to the config (`path`, `name`, `family`, `classes`) |
 | GET | `/v1/fs/browse` | read-only file browser behind the Config page's *Browse...* buttons: `?path=<dir>&kind=model` or `classes`; lists only folders and `.onnx`/`.xml` (or `.yaml`/`.yml`) files of the machine running the service |
+| GET | `/v1/status` | readiness for Blue Iris, Docker `HEALTHCHECK` or systemd: `{ready, status: ready/degraded/initializing/failed, models[{name,state,device,detail}], uptimeSecs, generation, version}`; HTTP 200 when ready or degraded (a failed model next to a usable one), 503 while a non-lazy model is still loading or nothing is usable |
 | GET | `/v1/status/updateavailable` | GitHub release check |
 | GET | `/`, `/stats`, `/stats.json`, `/prometheus` | UI and metrics |
 | GET | `/logs`, `/logs.json?after=<seq>&level=<min>` | log page; recent log events newer than `after` at `level` (`trace`..`error`) or more severe, with `last` as the next cursor |

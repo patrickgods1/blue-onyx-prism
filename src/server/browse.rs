@@ -104,15 +104,22 @@ impl IntoResponse for BrowseError {
     }
 }
 
+/// `GET /v1/fs/browse`. The listing (`read_dir` + `metadata` per entry, up to
+/// [`MAX_ENTRIES`]) and the root probing (every drive letter on Windows) can block for seconds
+/// on a slow or disconnected drive, so they run on the blocking pool, never on one of the two
+/// runtime threads that serve detections (SV-07).
 pub(super) async fn browse(
     State(state): State<Arc<AppState>>,
     Query(q): Query<BrowseQuery>,
 ) -> Response {
-    let cfg = state.config_read().clone();
-    match list(&cfg, q.path.as_deref(), q.kind.as_deref()) {
-        Ok(l) => Json(l).into_response(),
-        Err(e) => e.into_response(),
-    }
+    super::blocking(move || {
+        let cfg = state.config_read().clone();
+        match list(&cfg, q.path.as_deref(), q.kind.as_deref()) {
+            Ok(l) => Json(l).into_response(),
+            Err(e) => e.into_response(),
+        }
+    })
+    .await
 }
 
 /// Display form of a path: canonical, without the Windows `\\?\` verbatim prefix.
@@ -192,8 +199,12 @@ fn root_views(roots: &[(String, PathBuf)]) -> Vec<Root> {
 }
 
 /// Lexically inside one of `roots` (the canonical roots, or the data root as configured).
+/// Compared without the Windows verbatim prefix: a canonical root carries `\\?\`, a path the
+/// client sent (or the configured data root) does not, and `Path::starts_with` treats the
+/// prefix as a component of its own.
 fn inside_any(p: &Path, roots: &[(String, PathBuf)], cfg: &Config) -> bool {
-    roots.iter().any(|(_, r)| p.starts_with(r)) || p.starts_with(cfg.data_root())
+    let p = PathBuf::from(display(p));
+    roots.iter().any(|(_, r)| p.starts_with(display(r))) || p.starts_with(display(&cfg.data_root()))
 }
 
 /// The canonical path of `raw` (quotes trimmed; relative to the data root) when it exists
@@ -406,7 +417,9 @@ mod tests {
     fn file_path_lists_parent_and_selects() {
         let (root, cfg) = setup();
         let f = root.join("models/a.xml");
-        let l = list(&cfg, Some(&format!("\"{}\"", f.display())), None).unwrap();
+        // `display` strips the Windows verbatim prefix the canonical temp dir carries (the UI
+        // never sends one; the syntax check refuses it).
+        let l = list(&cfg, Some(&format!("\"{}\"", display(&f))), None).unwrap();
         assert_eq!(l.path, display(&root.join("models")));
         assert_eq!(l.selected.as_deref(), Some("a.xml"));
     }
@@ -435,34 +448,42 @@ mod tests {
     #[test]
     fn data_root_lists_with_its_parent_hidden_from_browsing() {
         let (root, cfg) = setup();
-        let l = list(&cfg, Some(&root.to_string_lossy()), None).unwrap();
+        let l = list(&cfg, Some(&display(&root)), None).unwrap();
         assert_eq!(l.path, display(&root));
         assert!(l.roots.iter().all(|r| r.label != "/"), "{:?}", l.roots);
-        // The parent of a root is outside every root.
-        let parent = root.parent().unwrap();
-        let e = list(&cfg, Some(&parent.to_string_lossy()), None).unwrap_err();
-        assert_eq!(e.status, StatusCode::FORBIDDEN);
-        assert!(
-            e.message.contains("outside the browsable folders"),
-            "{}",
-            e.message
-        );
+        // The parent of a root is outside every root (not on Windows, where every drive is
+        // a root of its own).
+        #[cfg(unix)]
+        {
+            let parent = root.parent().unwrap();
+            let e = list(&cfg, Some(&display(parent)), None).unwrap_err();
+            assert_eq!(e.status, StatusCode::FORBIDDEN);
+            assert!(
+                e.message.contains("outside the browsable folders"),
+                "{}",
+                e.message
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn outside_paths_are_refused() {
         let (root, cfg) = setup();
-        let top = root.ancestors().last().unwrap().to_path_buf();
-        for p in [
-            top.to_string_lossy().to_string(),
-            "/etc".into(),
-            "/no/such/dir".into(),
-        ] {
-            let e = list(&cfg, Some(&p), None).unwrap_err();
-            assert_eq!(e.status, StatusCode::FORBIDDEN, "{p}: {}", e.message);
-            // The resolved absolute path of the server is not in the message.
-            assert!(!e.message.contains("not found"), "{p}: {}", e.message);
+        // On Windows every drive is a browsable root, so nothing on a drive is "outside".
+        #[cfg(unix)]
+        {
+            let top = root.ancestors().last().unwrap().to_path_buf();
+            for p in [
+                top.to_string_lossy().to_string(),
+                "/etc".into(),
+                "/no/such/dir".into(),
+            ] {
+                let e = list(&cfg, Some(&p), None).unwrap_err();
+                assert_eq!(e.status, StatusCode::FORBIDDEN, "{p}: {}", e.message);
+                // The resolved absolute path of the server is not in the message.
+                assert!(!e.message.contains("not found"), "{p}: {}", e.message);
+            }
         }
         // Missing inside a root: 404, naming only what was asked for.
         let e = list(&cfg, Some("models/zzz"), None).unwrap_err();
@@ -511,6 +532,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn inside_any_ignores_the_verbatim_prefix() {
+        let cfg = Config {
+            download_dir: Some(PathBuf::from(r"C:\data")),
+            ..Default::default()
+        };
+        let roots = vec![("r".to_string(), PathBuf::from(r"\\?\C:\root"))];
+        assert!(inside_any(Path::new(r"C:\root\x"), &roots, &cfg));
+        assert!(inside_any(Path::new(r"\\?\C:\root\x"), &roots, &cfg));
+        assert!(inside_any(Path::new(r"\\?\C:\data\m"), &roots, &cfg));
+        assert!(!inside_any(Path::new(r"C:\rootx"), &roots, &cfg));
+        assert!(!inside_any(Path::new(r"D:\root\x"), &roots, &cfg));
+    }
+
     #[test]
     fn allowed_path_canonicalizes_inside_roots() {
         let (root, cfg) = setup();
@@ -519,7 +555,7 @@ mod tests {
             root.join("models/a.xml")
         );
         assert_eq!(
-            allowed_path(&cfg, &root.join("models").to_string_lossy()).unwrap(),
+            allowed_path(&cfg, &display(&root.join("models"))).unwrap(),
             root.join("models")
         );
         assert_eq!(

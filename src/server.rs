@@ -31,6 +31,7 @@ mod guard;
 mod live;
 mod pages;
 mod resources;
+mod status;
 #[cfg(test)]
 mod test_util;
 
@@ -148,6 +149,7 @@ fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/v1/vision/detection", post(detection_default)),
         ("/v1/vision/custom/list", get(custom_list).post(custom_list)),
         ("/v1/vision/custom/{model}", post(detection_custom)),
+        ("/v1/status", get(status::readiness)),
         ("/v1/status/updateavailable", get(update_available)),
         ("/v1/devices", get(devices_json)),
         ("/v1/config", get(live::config_json)),
@@ -454,30 +456,114 @@ pub async fn bind(address: std::net::IpAddr, port: u16) -> anyhow::Result<Listen
     Ok(Listeners { v4, v6, port })
 }
 
-/// Serve `shared` on `listeners` until `shutdown` is cancelled (in-flight requests finish).
-/// Runs for the whole process: generation restarts swap `shared` instead of stopping it.
+/// Longest a client may take to send a request head. With hyper 1.x HTTP/1 this timer also
+/// runs while a keep-alive connection waits for its next request (hyper restarts it as soon as
+/// a response is done: `proto/h1/conn.rs`, `poll_read_head`), so it is the idle timeout too: a
+/// connection silent for this long is closed (slowloris and idle keep-alive alike).
+pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a shutdown waits for in-flight requests to finish before closing their
+/// connections anyway.
+pub const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Pause after an accept error that is not about one connection (e.g. out of file
+/// descriptors), so the loop does not spin.
+const ACCEPT_ERROR_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Serve `shared` on `listeners` until `shutdown` is cancelled (in-flight requests finish,
+/// for at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]). Runs for the whole process: generation restarts
+/// swap `shared` instead of stopping it. Connections are HTTP/1.1 served by hyper with a
+/// timer, so [`HEADER_READ_TIMEOUT`] applies to request heads and idle keep-alive waits.
 pub async fn serve_on(
     listeners: Listeners,
     shared: Shared,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let app = router(shared);
-    let stopped = |t: CancellationToken| async move { t.cancelled().await };
-    // The peer address feeds the admin-route check ([`admin_only`]).
-    let service = || {
-        app.clone()
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()
-    };
-    let v4 = axum::serve(listeners.v4, service()).with_graceful_shutdown(stopped(shutdown.clone()));
     match listeners.v6 {
         Some(l6) => {
-            let v6 = axum::serve(l6, service()).with_graceful_shutdown(stopped(shutdown));
-            tokio::try_join!(v4.into_future(), v6.into_future())?;
+            tokio::join!(
+                accept_loop(listeners.v4, app.clone(), shutdown.clone()),
+                accept_loop(l6, app, shutdown)
+            );
         }
-        None => v4.await?,
+        None => accept_loop(listeners.v4, app, shutdown).await,
     }
     info!("HTTP server stopped");
     Ok(())
+}
+
+/// The hyper connection builder: HTTP/1.1 only (as before: axum's `http1` feature), keep-alive,
+/// [`HEADER_READ_TIMEOUT`] driven by tokio's timer.
+fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor> {
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .http1_only();
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .keep_alive(true);
+    builder
+}
+
+/// Accept connections on `listener` until `shutdown`, then let the open ones finish their
+/// requests (graceful shutdown, at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]).
+async fn accept_loop(listener: tokio::net::TcpListener, app: Router, shutdown: CancellationToken) {
+    let builder = connection_builder();
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    loop {
+        let (stream, peer) = tokio::select! {
+            () = shutdown.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok(c) => c,
+                Err(e) if is_connection_error(&e) => continue,
+                Err(e) => {
+                    error!("accepting an HTTP connection: {e}");
+                    tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
+                    continue;
+                }
+            },
+        };
+        let router = app.clone();
+        // The peer address feeds the admin-route check ([`admin_only`]).
+        let service =
+            hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer));
+                // `Router` is always ready (its `poll_ready` returns `Ready` at once).
+                tower::Service::call(&mut router.clone(), req)
+            });
+        let conn = builder
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+            .into_owned();
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!(%peer, "HTTP connection ended: {e}");
+            }
+        });
+    }
+    drop(listener);
+    if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        warn!(
+            "HTTP connections still busy {} s after shutdown; closing them",
+            GRACEFUL_SHUTDOWN_TIMEOUT.as_secs()
+        );
+    }
+}
+
+/// Accept errors about one connection (the next accept may well succeed), as axum's `serve`.
+fn is_connection_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 /// Run blocking handler work (file reads and walks, runtime library probes, page rendering) on
@@ -601,6 +687,57 @@ mod tests {
         server.await.unwrap().unwrap();
     }
 
+    /// SV-04: a client that never finishes its request head, and a keep-alive connection
+    /// left idle after its answer, are both closed after [`HEADER_READ_TIMEOUT`]; shutdown
+    /// still completes.
+    #[tokio::test]
+    async fn slow_heads_and_idle_connections_are_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listeners = bind([127, 0, 0, 1].into(), 0).await.unwrap();
+        let port = listeners.v4.local_addr().unwrap().port();
+        let token = CancellationToken::new();
+        let server = tokio::spawn(serve_on(listeners, test_state().into(), token.clone()));
+        /// Seconds until the server closes a connection that sent `send`.
+        async fn closed_after(port: u16, send: &'static [u8]) -> (f64, Vec<u8>) {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            s.write_all(send).await.unwrap();
+            let started = std::time::Instant::now();
+            let mut got = Vec::new();
+            let limit = HEADER_READ_TIMEOUT + std::time::Duration::from_secs(10);
+            tokio::time::timeout(limit, s.read_to_end(&mut got))
+                .await
+                .expect("the server should close the connection")
+                .ok();
+            (started.elapsed().as_secs_f64(), got)
+        }
+        let (slow, idle) = tokio::join!(
+            closed_after(port, b"GET / HTTP/1.1\r\nHost: localhost\r\n"),
+            closed_after(
+                port,
+                b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            ),
+        );
+        let t = HEADER_READ_TIMEOUT.as_secs_f64();
+        assert!(
+            slow.0 >= t - 0.5 && slow.0 < t + 5.0,
+            "slow head closed after {}",
+            slow.0
+        );
+        assert!(
+            idle.0 >= t - 0.5 && idle.0 < t + 5.0,
+            "idle closed after {}",
+            idle.0
+        );
+        assert!(
+            idle.1.starts_with(b"HTTP/1.1 200"),
+            "the full request was answered"
+        );
+        token.cancel();
+        server.await.unwrap().unwrap();
+    }
+
     /// SV-15: a panicking handler (directly or in its `blocking` work) answers 500 and the
     /// server, and the connection, keep serving.
     #[tokio::test]
@@ -710,6 +847,7 @@ mod tests {
             "/v1/vision/detection",
             "/v1/vision/custom/list",
             "/v1/vision/custom/{model}",
+            "/v1/status",
             "/v1/status/updateavailable",
             "/v1/devices",
             "/v1/config",

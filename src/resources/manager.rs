@@ -508,6 +508,7 @@ impl Manager {
                   process cannot work at all, so failing to spawn is a controlled abort"
     )]
     pub fn start(opts: ManagerOptions) -> Self {
+        cleanup_stale(&opts.root, SystemTime::now());
         let shared = Arc::new(Shared {
             opts,
             statuses: Mutex::new(BTreeMap::new()),
@@ -1038,6 +1039,69 @@ fn archive_kind_of(p: &Path) -> Option<ArchiveKind> {
     }
 }
 
+/// `.partial` files not touched for this long are leftovers of a download nobody resumed.
+pub const STALE_PARTIAL_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Staging / swap-aside directories (`.<name>.staging`, `.<name>.old-<pid>`) not touched for
+/// this long belong to an interrupted install (a live one is rewritten continuously and the
+/// download lock keeps a second process out).
+pub const STALE_STAGING_AGE: Duration = Duration::from_secs(60 * 60);
+/// How deep below the download root [`cleanup_stale`] looks.
+const CLEANUP_MAX_DEPTH: usize = 4;
+
+/// Startup cleanup under `root`: delete `*.partial` files older than [`STALE_PARTIAL_AGE`] and
+/// stale staging directories ([`STALE_STAGING_AGE`]) left by an interrupted install. Only plain
+/// files and directories are removed (symlinks are skipped); failures are ignored. Logs what
+/// was removed at info. Returns the number of entries removed.
+pub(crate) fn cleanup_stale(root: &Path, now: SystemTime) -> usize {
+    let mut removed = 0;
+    cleanup_dir(root, now, 0, &mut removed);
+    if removed > 0 {
+        tracing::info!(
+            "download cleanup: removed {removed} stale partial file(s) / staging dir(s) under {}",
+            root.display()
+        );
+    }
+    removed
+}
+
+fn is_staging_name(name: &str) -> bool {
+    name.starts_with('.') && (name.contains(".staging") || name.contains(".old-"))
+}
+
+fn older_than(meta: &std::fs::Metadata, now: SystemTime, age: Duration) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|m| now.duration_since(m).ok())
+        .is_some_and(|d| d >= age)
+}
+
+fn cleanup_dir(dir: &Path, now: SystemTime, depth: usize, removed: &mut usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let Ok(ft) = ent.file_type() else { continue };
+        let path = ent.path();
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = ent.metadata() else { continue };
+        if ft.is_file() && name.ends_with(".partial") {
+            if older_than(&meta, now, STALE_PARTIAL_AGE) && std::fs::remove_file(&path).is_ok() {
+                tracing::info!("removed stale partial download {}", path.display());
+                *removed += 1;
+            }
+        } else if ft.is_dir() {
+            if is_staging_name(&name) {
+                if older_than(&meta, now, STALE_STAGING_AGE) && remove_any(&path).is_ok() {
+                    tracing::info!("removed stale staging directory {}", path.display());
+                    *removed += 1;
+                }
+            } else if depth < CLEANUP_MAX_DEPTH {
+                cleanup_dir(&path, now, depth + 1, removed);
+            }
+        }
+    }
+}
+
 /// `<parent>/.<name>.<what>` next to `dir` (same filesystem, so renames are atomic).
 fn sibling(dir: &Path, what: &str) -> Result<PathBuf> {
     let name = dir
@@ -1371,6 +1435,47 @@ mod tests {
     use crate::resources::catalog::{Part, Platform, Provides};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
+
+    #[cfg(unix)]
+    fn age_file(p: &Path, by: Duration) {
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(SystemTime::now() - by).unwrap();
+    }
+
+    /// Unix only: setting a directory's mtime needs `File::open` on a directory.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_removes_stale_partials_and_staging_only() {
+        let root = tmp("cleanup");
+        let dl = root.join(".downloads");
+        let models = root.join("models");
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::create_dir_all(models.join(".yolo.staging/inner")).unwrap();
+        std::fs::create_dir_all(models.join(".yolo.old-123")).unwrap();
+        std::fs::create_dir_all(models.join(".fresh.staging")).unwrap();
+        std::fs::write(models.join(".yolo.staging/inner/f"), b"x").unwrap();
+        let old = dl.join("a.zip.partial");
+        let fresh = dl.join("b.zip.partial");
+        let other = dl.join("c.zip");
+        for p in [&old, &fresh, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        age_file(&old, STALE_PARTIAL_AGE + Duration::from_secs(60));
+        age_file(&other, STALE_PARTIAL_AGE * 2);
+        for d in [".yolo.staging", ".yolo.old-123"] {
+            let f = std::fs::File::open(models.join(d)).unwrap();
+            f.set_modified(SystemTime::now() - STALE_STAGING_AGE * 2)
+                .unwrap();
+        }
+        assert_eq!(cleanup_stale(&root, SystemTime::now()), 3);
+        assert!(!old.exists());
+        assert!(fresh.exists() && other.exists());
+        assert!(!models.join(".yolo.staging").exists());
+        assert!(!models.join(".yolo.old-123").exists());
+        assert!(models.join(".fresh.staging").exists());
+        assert_eq!(cleanup_stale(&root, SystemTime::now()), 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn backoff_schedule() {

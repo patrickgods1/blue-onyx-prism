@@ -82,6 +82,13 @@ libloading = "0.9"
 # No `api-NN` feature: any ONNX Runtime 1.17+ library loads (`setup-onnxruntime` pins 1.24.4).
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "load-dynamic", "tracing", "cuda", "tensorrt", "directml", "coreml"] }
 arc-swap = "1"
+fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+# The HTTP listener (`server::serve_on`): hyper with a timer, so request-head and idle
+# keep-alive timeouts apply, plus graceful shutdown. Already in the tree through axum/reqwest.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful", "http1"] }
+# `Service::call` on the router per connection; already a dependency of axum.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = "11"

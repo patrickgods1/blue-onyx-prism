@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use super::nms::nms;
+use super::nms::{MAX_DETS, MAX_NMS_CANDIDATES, nms_capped};
 use super::yolo26::{matrix_dims, meets, primary_f32_output};
 use super::{
     Detection, Family, ModelFamilyKind, NamedOutput, PostParams, PreprocessCtx, ResizeMode,
@@ -79,7 +79,7 @@ impl Family for Yolo5 {
                 class_id: cls,
             });
         }
-        nms(&mut dets, params.nms_iou);
+        nms_capped(&mut dets, params.nms_iou, MAX_NMS_CANDIDATES, MAX_DETS);
         Ok(dets)
     }
 }

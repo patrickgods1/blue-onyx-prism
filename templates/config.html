@@ -231,6 +231,8 @@
     </label>
     <label>Log directory (empty = stdout) <span class="tag restart">process restart</span> <input type="text" name="log_path" value="{{ c.log_path }}"></label>
     <label>Save annotated images to <input type="text" name="save_image_path" value="{{ c.save_image_path }}" placeholder="disabled"></label>
+    <label>Delete saved images older than (days, 0 = keep) <span class="tag now">applies now</span> <input type="number" name="save_image_max_age_days" min="0" max="3650" value="{{ c.save_image_max_age_days }}"></label>
+    <label>Max saved-image folder size (MB, 0 = unlimited) <span class="tag now">applies now</span> <input type="number" name="save_image_max_mb" min="0" max="1000000" value="{{ c.save_image_max_mb }}"></label>
     <label class="check"><input type="checkbox" name="save_ref_image"{% if c.save_ref_image %} checked{% endif %}> Also save the unannotated image</label>
     <p class="muted">Recent log lines: <a href="/logs">Logs</a>.</p>
   </fieldset>
