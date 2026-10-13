@@ -2227,8 +2227,19 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let retried: Vec<_> = events.try_iter().collect();
-        assert_eq!(retried.len(), 3, "{retried:?}");
+        // `set` runs before `emit`, so `wait` can return before the last event is delivered:
+        // receive the three attempts with a deadline instead of draining what is there now.
+        let mut retried = Vec::new();
+        while retried.len() < 3 {
+            match events.recv_timeout(Duration::from_secs(10)) {
+                Ok(ev) => retried.push(ev),
+                Err(e) => panic!("{e}: {retried:?}"),
+            }
+        }
+        assert!(
+            events.recv_timeout(Duration::from_millis(200)).is_err(),
+            "more than 3 attempts were reported"
+        );
         // Queuing it again (the Download button) starts a new series.
         m.enqueue(Job::into_dir(res, root.join("models")));
         assert!(!m.status(&key).unwrap().state.is_final());
