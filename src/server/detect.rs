@@ -120,12 +120,12 @@ pub(super) async fn run_detection(
 ) -> VisionDetectionResponse {
     let mut resp = dispatch(handle, req, start).await;
     resp.command = command.to_string();
-    resp.analysisRoundTripMs = start.elapsed().as_millis().min(i32::MAX as u128) as i32;
+    resp.analysisRoundTripMs = i32::try_from(start.elapsed().as_millis()).unwrap_or(i32::MAX);
     if resp.success {
         handle
             .metrics
             .round_trip_ms
-            .record(start.elapsed().as_millis() as u64);
+            .record(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
     resp.canUseGPU = state.registry.runtime_info.has_gpu;
     resp

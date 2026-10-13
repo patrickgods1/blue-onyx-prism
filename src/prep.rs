@@ -185,6 +185,7 @@ pub struct Prepared {
 }
 
 /// One request for the pool. The reply goes to a bounded(1) channel owned by the worker.
+#[derive(Debug)]
 pub struct PrepJob {
     pub image: bytes::Bytes,
     pub spec: PrepSpec,

@@ -103,7 +103,7 @@ pub struct BenchArgs {
     #[arg(long, requires = "threshold_search", value_parser = parse_device_arg)]
     pub search_device: Option<String>,
     /// --threshold-search: matching IoU (default 0.5).
-    #[arg(long, requires = "threshold_search")]
+    #[arg(long, requires = "threshold_search", value_parser = parse_unit_f32)]
     pub iou: Option<f32>,
     /// Implies --all-devices: also write a standalone report of the saved results (`.html` or
     /// `.md`).
@@ -141,13 +141,13 @@ pub struct BenchArgs {
     #[arg(long)]
     pub reference_model: Option<String>,
     /// Share of accuracy in the overall grade, 0..1 (default: benchmark.weights, 0.6).
-    #[arg(long)]
+    #[arg(long, value_parser = parse_unit_f64)]
     pub accuracy_weight: Option<f64>,
     /// Timed runs per image. Default: 100 for a single image, else benchmark.repeat_per_image.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_repeat_arg)]
     pub repeat: Option<usize>,
     /// Untimed warm-up iterations. Default: benchmark.warmup.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_warmup_arg)]
     pub warmup: Option<usize>,
     /// Also run on CPU and compare timings and detections.
     #[arg(long)]
@@ -159,7 +159,7 @@ pub struct BenchArgs {
     #[arg(long)]
     pub threads: Option<usize>,
     /// Confidence threshold. Default: the configured confidence_threshold.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_unit_f32)]
     pub min_confidence: Option<f32>,
     /// Config file for defaults (default: <exe_dir>/blue_onyx_prism_config.json if present).
     #[arg(long)]
@@ -178,6 +178,60 @@ fn parse_objective_arg(s: &str) -> Result<Objective, String> {
 
 fn parse_metric_arg(s: &str) -> Result<AccuracyMetric, String> {
     s.parse()
+}
+
+/// A finite number in 0..=1 (rejects `nan` and `inf`, which Rust's float parser accepts and
+/// which would be saved as `null` in benchmark.json).
+fn parse_unit_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{s}' is not a number (expected 0 to 1)"))?;
+    if v.is_finite() && (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!(
+            "'{s}' is out of range: expected a number from 0 to 1"
+        ))
+    }
+}
+
+/// [`parse_unit_f64`] as f32.
+fn parse_unit_f32(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{s}' is not a number (expected 0 to 1)"))?;
+    if v.is_finite() && (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!(
+            "'{s}' is out of range: expected a number from 0 to 1"
+        ))
+    }
+}
+
+/// An integer in `lo..=hi`.
+fn parse_bounded(s: &str, lo: usize, hi: usize) -> Result<usize, String> {
+    let v: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{s}' is not a whole number (expected {lo} to {hi})"))?;
+    if (lo..=hi).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("'{s}' is out of range: expected {lo} to {hi}"))
+    }
+}
+
+/// `--repeat`: 1..=[`super::service::MAX_REPEAT`] (the web UI's bound).
+fn parse_repeat_arg(s: &str) -> Result<usize, String> {
+    parse_bounded(s, 1, super::service::MAX_REPEAT)
+}
+
+/// `--warmup`: 0..=[`super::service::MAX_WARMUP`] (the web UI's bound).
+fn parse_warmup_arg(s: &str) -> Result<usize, String> {
+    parse_bounded(s, 0, super::service::MAX_WARMUP)
 }
 
 /// Default timed runs for a single image (the pre-dataset default).
@@ -1009,11 +1063,17 @@ impl RunCtx<'_> {
             return Ok(results);
         }
         let path = results_path(self.config_path);
-        let mut merged = BenchmarkResults::merge(BenchmarkResults::load_or_warn(&path), results);
+        let (prev, warnings) = BenchmarkResults::load_for_merge(&path)?;
+        for w in warnings {
+            report.warn(self.args.json, w);
+        }
+        let mut merged = BenchmarkResults::merge(prev, results);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(self.metric, self.weights);
         merged.save(&path)?;
-        super::search::save_beside(&path, &merged, swept);
+        for w in super::search::save_beside(&path, &merged, swept) {
+            report.warn(self.args.json, w);
+        }
         if !self.args.json {
             println!("\nresults saved to {}", path.display());
         }
@@ -2016,9 +2076,8 @@ mod tests {
             err.to_string()
                 .starts_with("--apply-threshold needs a config file")
         );
-        let err =
-            check_args(&parse(&["x", "--accuracy-weight", "1.5"]).unwrap(), missing).unwrap_err();
-        assert_eq!(err.to_string(), "--accuracy-weight must be between 0 and 1");
+        // Out-of-range weights are rejected by the argument parser.
+        assert!(parse(&["x", "--accuracy-weight", "1.5"]).is_err());
     }
 
     #[test]
@@ -2303,5 +2362,34 @@ mod tests {
         assert_eq!(agreement_text(&r), "BAD (0/3)");
         r.agreement = Some(a(Verdict::Reference, 3, 0, 0));
         assert_eq!(agreement_text(&r), "ref");
+    }
+
+    #[test]
+    fn float_and_count_flags_are_range_checked() {
+        for bad in ["nan", "inf", "-0.1", "1.5", "x"] {
+            let e = parse(&["x", &format!("--min-confidence={bad}")])
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("0 to 1"), "{bad}: {e}");
+            assert!(
+                parse(&["x", &format!("--accuracy-weight={bad}")]).is_err(),
+                "{bad}"
+            );
+            assert!(
+                parse(&["x", "--threshold-search", &format!("--iou={bad}")]).is_err(),
+                "{bad}"
+            );
+        }
+        let a = parse(&["x", "--min-confidence", "0.4", "--accuracy-weight", "1"]).unwrap();
+        assert_eq!(
+            (a.min_confidence, a.accuracy_weight),
+            (Some(0.4), Some(1.0))
+        );
+        assert!(parse(&["x", "--repeat", "0"]).is_err());
+        assert!(parse(&["x", "--repeat", "1001"]).is_err());
+        assert!(parse(&["x", "--repeat", "18446744073709551615"]).is_err());
+        assert!(parse(&["x", "--warmup", "101"]).is_err());
+        let a = parse(&["x", "--repeat", "1000", "--warmup", "0"]).unwrap();
+        assert_eq!((a.repeat, a.warmup), (Some(1000), Some(0)));
     }
 }

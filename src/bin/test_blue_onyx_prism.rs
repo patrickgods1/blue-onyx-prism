@@ -80,9 +80,9 @@ async fn send_one(
     url: &str,
     image: &[u8],
     min_confidence: f32,
-    delay: Duration,
+    start_at: tokio::time::Instant,
 ) -> Outcome {
-    tokio::time::sleep(delay).await;
+    tokio::time::sleep_until(start_at).await;
     let start = Instant::now();
     let part = reqwest::multipart::Part::bytes(image.to_vec()).file_name("image.jpg");
     let mut form = reqwest::multipart::Form::new().part("image", part);
@@ -136,15 +136,18 @@ fn stats(label: &str, mut v: Vec<f64>) {
     if v.is_empty() {
         return;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean = v.iter().sum::<f64>() / v.len() as f64;
-    let p95 = v[(((v.len() as f64) * 0.95).ceil() as usize).clamp(1, v.len()) - 1];
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    let mean = v.iter().sum::<f64>() / n as f64;
+    // Nearest-rank p95: ceil(0.95 * n) in integers, 1-based.
+    let rank = n.saturating_mul(95).div_ceil(100).clamp(1, n);
+    let at = |i: usize| v.get(i).copied().unwrap_or(f64::NAN);
     println!(
         "  {label:<22} min {:>8.1}  mean {:>8.1}  p95 {:>8.1}  max {:>8.1}",
-        v[0],
+        at(0),
         mean,
-        p95,
-        v[v.len() - 1]
+        at(rank - 1),
+        at(n - 1)
     );
 }
 
@@ -181,12 +184,25 @@ async fn run(args: Args) -> Result<bool> {
     let parallel = args.parallel.max(1);
     let interval = Duration::from_millis(args.interval_ms);
 
+    // Request i starts at `wall + interval * (i / parallel)` (absolute, so waiting for earlier
+    // requests does not add to the delay). Checked up front: a huge interval is an error.
+    let start = tokio::time::Instant::now();
+    let start_of = |i: usize| -> Option<tokio::time::Instant> {
+        let k = u32::try_from(i / parallel).ok()?;
+        start.checked_add(interval.checked_mul(k)?)
+    };
+    if start_of(repeat - 1).is_none() {
+        bail!(
+            "--interval-ms {} x --repeat {repeat} is too large",
+            args.interval_ms
+        );
+    }
     let wall = Instant::now();
     let outcomes: Vec<Outcome> = futures_util::stream::iter(0..repeat)
         .map(|i| {
-            let delay = interval * (i / parallel) as u32;
+            let at = start_of(i).unwrap_or(start);
             let (client, url, image) = (&client, &url, &image);
-            async move { send_one(client, url, image, args.min_confidence, delay).await }
+            async move { send_one(client, url, image, args.min_confidence, at).await }
         })
         .buffered(parallel)
         .collect()
@@ -194,8 +210,7 @@ async fn run(args: Args) -> Result<bool> {
     let wall_s = wall.elapsed().as_secs_f64();
 
     let failures = outcomes.iter().filter(|o| !o.ok).count();
-    if repeat == 1 {
-        let o = &outcomes[0];
+    if let (1, Some(o)) = (repeat, outcomes.first()) {
         match &o.response {
             Some(r) => println!("{}", serde_json::to_string_pretty(r)?),
             None => println!("{}", o.note),

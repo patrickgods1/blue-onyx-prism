@@ -48,7 +48,9 @@ impl Histogram {
     }
 
     pub fn record(&self, ms: u64) {
-        self.buckets[Self::bucket_index(ms)].fetch_add(1, Ordering::Relaxed);
+        if let Some(b) = self.buckets.get(Self::bucket_index(ms)) {
+            b.fetch_add(1, Ordering::Relaxed);
+        }
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum.fetch_add(ms, Ordering::Relaxed);
         self.min.fetch_min(ms, Ordering::Relaxed);
@@ -65,7 +67,11 @@ impl Histogram {
 
     /// Samples in each bucket (not cumulative), `BUCKET_BOUNDS_MS` order then `+Inf`.
     pub fn bucket_counts(&self) -> [u64; BUCKETS] {
-        std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed))
+        let mut out = [0; BUCKETS];
+        for (o, b) in out.iter_mut().zip(&self.buckets) {
+            *o = b.load(Ordering::Relaxed);
+        }
+        out
     }
 
     /// Average in ms (0.0 when nothing was recorded).
@@ -163,11 +169,15 @@ impl ModelMetrics {
 
     /// Count one request that was not served by inference.
     pub fn record_drop(&self, reason: DropReason) {
-        self.dropped[reason as usize].fetch_add(1, Ordering::Relaxed);
+        if let Some(d) = self.dropped.get(reason as usize) {
+            d.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn dropped(&self, reason: DropReason) -> u64 {
-        self.dropped[reason as usize].load(Ordering::Relaxed)
+        self.dropped
+            .get(reason as usize)
+            .map_or(0, |d| d.load(Ordering::Relaxed))
     }
 
     /// Drops that count as failures (everything except answers while initializing).

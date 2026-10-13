@@ -21,7 +21,7 @@ use anyhow::{Result, bail};
 use super::yolo26::meets;
 use super::{
     Detection, Family, ModelFamilyKind, NamedOutput, Normalization, PortSpec, PostParams,
-    PreprocessCtx, ResizeMode,
+    PreprocessCtx, ResizeMode, retain_finite,
 };
 
 /// Class count of a head indexed by COCO category id (RF-DETR on COCO).
@@ -41,7 +41,7 @@ pub const COCO80_CATEGORY_IDS: [u8; 80] = [
 pub fn coco80_index(category_id: usize) -> Option<usize> {
     COCO80_CATEGORY_IDS
         .iter()
-        .position(|&c| c as usize == category_id)
+        .position(|&c| usize::from(c) == category_id)
 }
 
 /// Port names of the family.
@@ -64,6 +64,7 @@ pub fn logits_classes(outputs: &[PortSpec]) -> Option<i64> {
         .filter(|&c| c > 0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detr {
     /// Number of class names (80 for the COCO fallback).
     pub num_classes: usize,
@@ -160,7 +161,8 @@ impl Family for Detr {
         let boxes = boxes_o
             .as_f32()
             .ok_or_else(|| anyhow::anyhow!("detr: output `pred_boxes` must be f32"))?;
-        if logits.len() != q * c || boxes.len() != 4 * q {
+        if c == 0 || Some(logits.len()) != q.checked_mul(c) || Some(boxes.len()) != q.checked_mul(4)
+        {
             bail!(
                 "detr: buffer lengths (logits {}, pred_boxes {}) do not match shapes {:?} {:?}",
                 logits.len(),
@@ -171,7 +173,7 @@ impl Family for Detr {
         }
         // Class index -> reported class id. A 91-wide head with the 80 COCO names is indexed by
         // COCO category id: map to COCO-80 and never report the unused ids.
-        let coco91 = c as i64 == COCO91_CLASSES && self.num_classes == 80;
+        let coco91 = i64::try_from(c) == Ok(COCO91_CLASSES) && self.num_classes == 80;
         let class_map: Vec<Option<usize>> = (0..c)
             .map(|k| if coco91 { coco80_index(k) } else { Some(k) })
             .collect();
@@ -182,7 +184,7 @@ impl Family for Detr {
             .iter()
             .enumerate()
             .filter_map(|(i, &l)| {
-                class_map[i % c]?;
+                class_map.get(i % c).copied().flatten()?;
                 let s = sigmoid(l);
                 meets(s, params.confidence_threshold).then_some((s, i))
             })
@@ -191,14 +193,17 @@ impl Family for Detr {
         cand.truncate(q);
 
         let (w, h) = (ctx.input_w as f32, ctx.input_h as f32);
+        let box_rows = boxes.as_chunks::<4>().0;
         let mut dets = Vec::with_capacity(cand.len());
         for (score, i) in cand {
             let (query, class) = (i / c, i % c);
-            let Some(class_id) = class_map[class] else {
+            let Some(class_id) = class_map.get(class).copied().flatten() else {
                 continue;
             };
-            let b = &boxes[4 * query..4 * query + 4];
-            let (cx, cy, bw, bh) = (b[0] * w, b[1] * h, b[2] * w, b[3] * h);
+            let Some(&[bcx, bcy, bbw, bbh]) = box_rows.get(query) else {
+                continue;
+            };
+            let (cx, cy, bw, bh) = (bcx * w, bcy * h, bbw * w, bbh * h);
             let (x1, y1, x2, y2) =
                 ctx.to_original(cx - 0.5 * bw, cy - 0.5 * bh, cx + 0.5 * bw, cy + 0.5 * bh);
             dets.push(Detection {
@@ -210,6 +215,7 @@ impl Family for Detr {
                 class_id,
             });
         }
+        retain_finite(&mut dets);
         Ok(dets)
     }
 }

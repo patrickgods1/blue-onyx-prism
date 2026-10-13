@@ -3502,18 +3502,18 @@ Multipart parse (image `Bytes` copy, `HashMap` of text fields), one `oneshot`, r
 
 ## Per-finding status
 
-Updated at the end of each phase. Phase 0 leaves every finding open; the phase column is where the fix
+Updated at the end of each phase (phase 1: branch `review/phase-1-crash-safety`). Phase 0 leaves every finding open; the phase column is where the fix
 is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maintainability).
 
 | ID | Severity | Phase | Status |
 |---|---|---|---|
-| BM-01 | crash-or-data-loss | 1 | open (phase 0: identified, not yet fixed) |
-| BQ-01 | crash-or-data-loss | 1 | open (phase 0: identified, not yet fixed) |
-| BQ-02 | crash-or-data-loss | 1 | open (phase 0: identified, not yet fixed) |
-| CO-01 | crash-or-data-loss | 1 | open (phase 0: identified, not yet fixed) |
-| CO-02 | crash-or-data-loss | 1 | open (phase 0: identified, not yet fixed) |
-| CO-03 | crash-or-data-loss | 1 | open (phase 0: identified, not yet fixed) |
-| PL-07 | crash-or-data-loss | 1 | open (phase 0: identified, not yet fixed) |
+| BM-01 | crash-or-data-loss | 1 | fixed in phase 1: unloadable benchmark.json is moved aside, bad entries dropped with a warning |
+| BQ-01 | crash-or-data-loss | 1 | fixed in phase 1: YOLO names map index bounded before allocation |
+| BQ-02 | crash-or-data-loss | 1 | fixed in phase 1: unloadable benchmark-preds.json is moved aside, bad runs dropped |
+| CO-01 | crash-or-data-loss | 1 | fixed in phase 1: --model matches resolved paths and appends instead of replacing the list |
+| CO-02 | crash-or-data-loss | 1 | fixed in phase 1: Config::save writes .tmp, fsyncs and renames; unchanged config is not rewritten at start |
+| CO-03 | crash-or-data-loss | 1 | fixed in phase 1: Config::validate ranges every numeric field; queue clamped at spawn; saturating timeout math |
+| PL-07 | crash-or-data-loss | 1 | fixed in phase 1: worker_queue_size validated 0..=1024 and clamped at spawn |
 | BE-01 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
 | BE-04 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
 | BM-08 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
@@ -3535,15 +3535,15 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | SV-10 | security-boundary | 2 | open (phase 0: identified, not yet fixed) |
 | BE-02 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | BE-06 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| BM-04 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| BM-04 | resource-exhaustion | 3 | fixed in phase 1: --repeat 1..=1000, --warmup 0..=100 (same bounds as the service) |
 | BM-11 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | BQ-04 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | BQ-05 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | CO-06 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | NR-06 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | PL-01 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| PL-03 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
-| PL-04 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
+| PL-03 | resource-exhaustion | 3 | fixed in phase 1: header-first decode with the max_image_pixels ceiling on both decoders; zero dims rejected |
+| PL-04 | resource-exhaustion | 3 | fixed in phase 1: model input side <= 8192 and tensor <= 256 MiB, else the model fails to load |
 | RS-02 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | RS-03 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | RS-05 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
@@ -3552,28 +3552,28 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | SV-04 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | SV-08 | resource-exhaustion | 3 | open (phase 0: identified, not yet fixed) |
 | BE-03 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BE-05 | correctness | 1 | open (phase 0: identified, not yet fixed) |
+| BE-05 | correctness | 1 | fixed in phase 1: checked arithmetic in the Split/Flatten emitters; overflow skips the node with a reason |
 | BE-07 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BE-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BE-14 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BM-02 | correctness | 1 | open (phase 0: identified, not yet fixed) |
+| BM-02 | correctness | 1 | fixed in phase 1: --min-confidence/--iou/--accuracy-weight require a finite 0..=1 value |
 | BM-03 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BM-10 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BQ-06 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BQ-07 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BQ-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | BQ-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| CO-04 | correctness | 1 | open (phase 0: identified, not yet fixed) |
+| CO-04 | correctness | 1 | fixed in phase 1: validate() runs at load, form, CLI merge (no write-back on error) and disk sync (not adopted) |
 | CO-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | CO-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | CO-10 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| CO-14 | correctness | 5 | open (phase 0: identified, not yet fixed) |
+| CO-14 | correctness | 5 | fixed in phase 1: test client uses total_cmp, nearest-rank p95, absolute start times with checked arithmetic |
 | NR-07 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | NR-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | NR-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | NR-10 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | NR-11 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| PL-02 | correctness | 1 | open (phase 0: identified, not yet fixed) |
+| PL-02 | correctness | 1 | fixed in phase 1: non-finite detections dropped before NMS and serialization, scores clamped, coords clamped |
 | PL-05 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | PL-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
 | RS-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
@@ -3612,16 +3612,16 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | SV-07 | operability | 3 | open (phase 0: identified, not yet fixed) |
 | SV-11 | operability | 4 | open (phase 0: identified, not yet fixed) |
 | SV-12 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| SV-15 | operability | 1 | open (phase 0: identified, not yet fixed) |
+| SV-15 | operability | 1 | fixed in phase 1: catch_panic middleware answers 500 (JSON or HTML) and the connection stays usable |
 | BE-11 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | BE-12 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | BM-07 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| BM-09 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| BQ-11 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
+| BM-09 | maintainability | 5 | fixed in phase 1: percentile/Stats handle empty slices and NaN |
+| BQ-11 | maintainability | 5 | fixed in phase 1: roc::auc groups equal scores with total_cmp, terminates on NaN |
 | BQ-12 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | BQ-13 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| CO-15 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| CO-16 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
+| CO-15 | maintainability | 5 | fixed in phase 1: crate-level lint policy in lib.rs and every binary; deny(unsafe_code) outside backend |
+| CO-16 | maintainability | 5 | fixed in phase 1: one check_threshold rule (finite, 0..=1) on every path |
 | CO-17 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | NR-22 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | NR-23 | maintainability | 5 | open (phase 0: identified, not yet fixed) |

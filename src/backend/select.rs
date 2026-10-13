@@ -388,6 +388,12 @@ fn gpu_label(target: Target, g: &GpuAdapter) -> String {
     }
 }
 
+/// Every caller passes a runtime/target pair from [`Target::supported_by`]'s table with an
+/// index only for targets that take one, so `Device::new` cannot fail here.
+#[allow(
+    clippy::expect_used,
+    reason = "callers use only the static runtime/target/index combinations Device::new accepts"
+)]
 fn device(runtime: Runtime, target: Target, index: Option<u32>) -> Device {
     Device::new(runtime, target, index).expect("valid runtime/target combination")
 }
@@ -507,8 +513,9 @@ impl Builder<'_> {
                 self.push(spec, ov_label("GPU", Some(d)), reason);
             }
         }
-        if ov_gpus.is_empty() && hw.has_vendor(GpuVendor::Intel) {
-            let intel = hw.gpus_of(GpuVendor::Intel).next().expect("has Intel");
+        if ov_gpus.is_empty()
+            && let Some(intel) = hw.gpus_of(GpuVendor::Intel).next()
+        {
             let reason = self.ov_reason().unwrap_or_else(|| {
                 "OpenVINO lists no GPU device (install the Intel graphics driver / compute runtime)"
                     .to_string()

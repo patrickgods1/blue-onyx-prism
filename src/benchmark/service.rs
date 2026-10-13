@@ -439,6 +439,14 @@ pub struct RunHandle {
     run_id: u64,
 }
 
+impl std::fmt::Debug for RunHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunHandle")
+            .field("run_id", &self.run_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RunHandle {
     pub fn cancel_flag(&self) -> &AtomicBool {
         &self.svc.cancel
@@ -488,6 +496,17 @@ pub struct RunContext {
     pub loaded: HashMap<String, String>,
     /// Download manager access (auto-download of built-in datasets).
     pub resources: Option<crate::resources::status::ResourcesCtx>,
+}
+
+impl std::fmt::Debug for RunContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunContext")
+            .field("results_path", &self.results_path)
+            .field("runtimes", &self.runtimes.is_some())
+            .field("loaded", &self.loaded)
+            .field("resources", &self.resources.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Default models of a run: the enabled config models whose files are present.
@@ -940,12 +959,17 @@ impl ServiceRun<'_> {
         let results =
             BenchmarkResults::new(HardwareSummary::current(), versions, finished.to_vec())
                 .with_sets(sets);
-        let mut merged =
-            BenchmarkResults::merge(BenchmarkResults::load_or_warn(&ctx.results_path), results);
+        let (prev, warnings) = BenchmarkResults::load_for_merge(&ctx.results_path)?;
+        for w in warnings {
+            self.h.with(|g| g.warnings.push(w));
+        }
+        let mut merged = BenchmarkResults::merge(prev, results);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(req.accuracy_metric, req.weights);
         merged.save(&ctx.results_path)?;
-        super::search::save_beside(&ctx.results_path, &merged, finished);
+        for w in super::search::save_beside(&ctx.results_path, &merged, finished) {
+            self.h.with(|g| g.warnings.push(w));
+        }
         Ok(())
     }
 }

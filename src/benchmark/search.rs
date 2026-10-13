@@ -70,6 +70,11 @@ impl From<(u32, f32, u32, u32, u32, u32)> for StoredPred {
 
 impl From<StoredPred> for (u32, f32, u32, u32, u32, u32) {
     fn from(p: StoredPred) -> Self {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to >= 0 (NaN -> 0 via f32::max); `as` saturates large values"
+        )]
         let c = |v: f32| v.max(0.0).round() as u32;
         (
             p.class,
@@ -88,6 +93,7 @@ pub struct StoredImage {
     /// Dataset id.
     pub set: String,
     pub file: String,
+    #[serde(default)]
     pub preds: Vec<StoredPred>,
 }
 
@@ -97,13 +103,16 @@ pub struct StoredRun {
     pub model: String,
     /// Device spec ("ort:coreml").
     pub device: String,
+    #[serde(default)]
     pub timestamp: String,
     /// Scored classes in the model's label space; predictions refer to them by index.
+    #[serde(default)]
     pub classes: Vec<String>,
     /// The run's configured confidence threshold.
     pub configured: f32,
     /// Lowest stored confidence (the evaluation threshold of the run).
     pub eval_confidence: f32,
+    #[serde(default)]
     pub images: Vec<StoredImage>,
 }
 
@@ -118,7 +127,7 @@ impl StoredRun {
             .classes
             .iter()
             .enumerate()
-            .map(|(i, c)| (c.as_str(), i as u32))
+            .filter_map(|(i, c)| Some((c.as_str(), u32::try_from(i).ok()?)))
             .collect();
         Some(Self {
             model: m.model.clone(),
@@ -151,8 +160,10 @@ impl StoredRun {
 
     /// The predictions of image `k` as scored boxes.
     fn preds(&self, k: usize) -> Vec<PredBox> {
-        self.images[k]
-            .preds
+        let Some(img) = self.images.get(k) else {
+            return Vec::new();
+        };
+        img.preds
             .iter()
             .filter_map(|p| {
                 Some(PredBox {
@@ -168,21 +179,33 @@ impl StoredRun {
 /// The stored-predictions file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct StoredPreds {
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub runs: Vec<StoredRun>,
 }
 
 impl StoredPreds {
-    /// The file at `path`; None when it does not exist.
+    /// The file at `path`; None when it does not exist. Run entries that do not load are
+    /// dropped (logged).
     pub fn load(path: &Path) -> Result<Option<Self>> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        let (r, warnings) = Self::load_with_warnings(path)?;
+        for w in warnings {
+            tracing::warn!("{w}");
+        }
+        Ok(r)
+    }
+
+    /// [`Self::load`] returning the warnings: `runs` is deserialized entry by entry, so one bad
+    /// entry drops only that run.
+    pub fn load_with_warnings(path: &Path) -> Result<(Option<Self>, Vec<String>)> {
+        let Some(text) = super::report::read_if_exists(path)? else {
+            return Ok((None, Vec::new()));
         };
-        serde_json::from_str(&text)
-            .map(Some)
-            .with_context(|| format!("parsing {}", path.display()))
+        let (mut r, runs, warnings) =
+            super::report::parse_lenient::<Self, StoredRun>(&text, "runs", path)?;
+        r.runs = runs;
+        Ok((Some(r), warnings))
     }
 
     /// Compact JSON through a temporary file and a rename.
@@ -234,20 +257,33 @@ impl StoredPreds {
     }
 }
 
-/// Merge the predictions of `new` into the file beside `results_file` (logs, does not fail the
-/// benchmark, on error).
-pub fn save_beside(results_file: &Path, merged: &BenchmarkResults, new: &[ModelResult]) {
+/// Merge the predictions of `new` into the file beside `results_file`. Does not fail the
+/// benchmark: returns the warnings (also logged). A file that does not load is moved aside
+/// (`<name>.bad-<timestamp>`) rather than overwritten; when that fails nothing is saved.
+pub fn save_beside(
+    results_file: &Path,
+    merged: &BenchmarkResults,
+    new: &[ModelResult],
+) -> Vec<String> {
     let path = results_file
         .parent()
         .map(|d| d.join(PREDS_FILE))
         .unwrap_or_else(|| PathBuf::from(PREDS_FILE));
-    let prev = StoredPreds::load(&path)
-        .map_err(|e| tracing::warn!("{e:#}"))
-        .ok()
-        .flatten();
+    let (prev, mut warnings) =
+        match super::report::load_or_move_aside(&path, StoredPreds::load_with_warnings) {
+            Ok(x) => x,
+            Err(e) => {
+                let w = format!("stored predictions not saved: {e:#}");
+                tracing::warn!("{w}");
+                return vec![w];
+            }
+        };
     if let Err(e) = StoredPreds::merge(prev, merged, new).save(&path) {
-        tracing::warn!("saving the stored predictions: {e:#}");
+        let w = format!("saving the stored predictions: {e:#}");
+        tracing::warn!("{w}");
+        warnings.push(w);
     }
+    warnings
 }
 
 /// What to search.
@@ -607,23 +643,30 @@ pub fn points_at(image_sets: &[ImageSetInfo], run: &StoredRun, t: f32) -> Option
         .iter()
         .map(|(_, _, e, fc)| SweepImage::of(e).with_frames(e, fc))
         .collect();
-    let real: Vec<usize> = (0..inputs.len())
-        .filter(|&k| inputs[k].0.ground_truth.is_real())
+    let real: Vec<usize> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.0.ground_truth.is_real())
+        .map(|(k, _)| k)
         .collect();
     let chosen: Vec<usize> = if real.is_empty() {
         (0..inputs.len()).collect()
     } else {
         real
     };
-    let refs = |ks: &[usize]| -> Vec<&SweepImage> { ks.iter().map(|&k| &matched[k]).collect() };
+    let refs =
+        |ks: &[usize]| -> Vec<&SweepImage> { ks.iter().filter_map(|&k| matched.get(k)).collect() };
     let overall = Breakpoints::new(&refs(&chosen), SweepScope::All);
     let mut by_dataset = HashMap::new();
     for (s, _, _, _) in &inputs {
         if by_dataset.contains_key(&s.id) {
             continue;
         }
-        let ks: Vec<usize> = (0..inputs.len())
-            .filter(|&k| inputs[k].0.id == s.id)
+        let ks: Vec<usize> = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.0.id == s.id)
+            .map(|(k, _)| k)
             .collect();
         let bp = Breakpoints::new(&refs(&ks), SweepScope::All);
         by_dataset.insert(s.id.clone(), bp.point_at(t));
@@ -633,7 +676,11 @@ pub fn points_at(image_sets: &[ImageSetInfo], run: &StoredRun, t: f32) -> Option
         let ks: Vec<usize> = chosen
             .iter()
             .copied()
-            .filter(|&k| inputs[k].1.tags.iter().any(|x| x == tag))
+            .filter(|&k| {
+                inputs
+                    .get(k)
+                    .is_some_and(|i| i.1.tags.iter().any(|x| x == tag))
+            })
             .collect();
         if !ks.is_empty() {
             let bp = Breakpoints::new(&refs(&ks), SweepScope::All);
@@ -672,8 +719,11 @@ fn search_run(
     if inputs.is_empty() {
         bail!("no scored images match these filters");
     }
-    let real: Vec<usize> = (0..inputs.len())
-        .filter(|&k| inputs[k].0.ground_truth.is_real())
+    let real: Vec<usize> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.0.ground_truth.is_real())
+        .map(|(k, _)| k)
         .collect();
     let (chosen, relative) = if real.is_empty() {
         ((0..inputs.len()).collect::<Vec<_>>(), true)
@@ -686,12 +736,15 @@ fn search_run(
         .collect();
     let roc_of = |ks: &[usize], classes: &[String], points: usize| {
         FrameRoc::of(
-            ks.iter().flat_map(|&k| matched[k].frames.iter()),
+            ks.iter()
+                .filter_map(|&k| matched.get(k))
+                .flat_map(|m| m.frames.iter()),
             classes,
             points,
         )
     };
-    let refs = |ks: &[usize]| -> Vec<&SweepImage> { ks.iter().map(|&k| &matched[k]).collect() };
+    let refs =
+        |ks: &[usize]| -> Vec<&SweepImage> { ks.iter().filter_map(|&k| matched.get(k)).collect() };
     let overall = Breakpoints::new(&refs(&chosen), SweepScope::All);
     if overall.npos == 0 {
         bail!("no ground-truth objects of these classes in the matching images");
@@ -715,8 +768,11 @@ fn search_run(
             continue;
         }
         seen.push(&s.id);
-        let ks: Vec<usize> = (0..inputs.len())
-            .filter(|&k| inputs[k].0.id == s.id)
+        let ks: Vec<usize> = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.0.id == s.id)
+            .map(|(k, _)| k)
             .collect();
         let bp = Breakpoints::new(&refs(&ks), SweepScope::All);
         if bp.npos > 0 {
@@ -798,7 +854,7 @@ fn ground_truth_desc(inputs: &[Input], chosen: &[usize], relative: bool) -> Stri
     if relative {
         let refs: std::collections::BTreeSet<String> = chosen
             .iter()
-            .filter_map(|&k| match &inputs[k].0.ground_truth {
+            .filter_map(|&k| match &inputs.get(k)?.0.ground_truth {
                 GroundTruth::Pseudo(r) => Some(r.clone()),
                 _ => None,
             })
@@ -1275,6 +1331,53 @@ pub(crate) mod tests {
         assert!(
             merged.runs.is_empty(),
             "re-run without stored runs replaces the old ones"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unloadable_preds_are_moved_aside_and_bad_runs_dropped() {
+        let (results, preds) = fixture();
+        let dir = std::env::temp_dir().join(format!("bop-preds-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PREDS_FILE);
+        preds.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        // One bad run: dropped with a warning naming it; the others load.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["runs"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"model": "broken", "device": "ort:cpu", "configured": "x"}));
+        std::fs::write(&path, v.to_string()).unwrap();
+        let (back, warnings) = StoredPreds::load_with_warnings(&path).unwrap();
+        assert_eq!(back.unwrap().runs, preds.runs);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("'broken' on ort:cpu"),
+            "{}",
+            warnings[0]
+        );
+
+        // Truncated: moved aside before the new file is written.
+        std::fs::write(&path, &text[..text.len() / 2]).unwrap();
+        let warnings = save_beside(&dir.join("benchmark.json"), &results, &[]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(".bad-"), "{}", warnings[0]);
+        let aside = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{PREDS_FILE}.bad-"))
+            })
+            .count();
+        assert_eq!(aside, 1);
+        assert!(
+            StoredPreds::load(&path).unwrap().is_some(),
+            "a new file was saved"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

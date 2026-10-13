@@ -306,6 +306,10 @@ pub struct ImageMatch {
 
 /// Greedy COCO matching of `preds` (any order; matched by descending confidence) against `gt`,
 /// same class, IoU >= `iou_thr`. Labels must already be in one label space.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "i < preds.len() (from 0..preds.len()) and j < gt.len() (from enumerate);               `out.pred`/`out.pred_gt` have preds.len() entries, `out.gt_matched` gt.len()"
+)]
 pub fn match_image(preds: &[PredBox], gt: &[GtBox], iou_thr: f32) -> ImageMatch {
     let mut order: Vec<usize> = (0..preds.len()).collect();
     order.sort_by(|&a, &b| preds[b].confidence.total_cmp(&preds[a].confidence));
@@ -368,9 +372,12 @@ pub fn average_precision(scored: &mut [(f32, bool)], npos: usize) -> Option<f64>
         precision.push(tp as f64 / (tp + fp) as f64);
     }
     // Monotone envelope from the right.
-    for i in (0..precision.len().saturating_sub(1)).rev() {
-        if precision[i + 1] > precision[i] {
-            precision[i] = precision[i + 1];
+    let mut right_max = f64::NEG_INFINITY;
+    for p in precision.iter_mut().rev() {
+        if right_max > *p {
+            *p = right_max;
+        } else {
+            right_max = *p;
         }
     }
     let mut sum = 0.0;
@@ -378,8 +385,8 @@ pub fn average_precision(scored: &mut [(f32, bool)], npos: usize) -> Option<f64>
         let r = k as f64 / 100.0;
         // First index with recall >= r (recall is non-decreasing).
         let idx = recall.partition_point(|&x| x < r - 1e-12);
-        if idx < precision.len() {
-            sum += precision[idx];
+        if let Some(p) = precision.get(idx) {
+            sum += p;
         }
     }
     Some(sum / 101.0)
@@ -517,15 +524,16 @@ pub fn evaluate(images: &[EvalImage], classes: &[String], threshold: f32) -> Sum
     for img in images {
         let (c, kept, m) = image_counts(img, threshold);
         counts.add(c);
-        for (j, g) in img.gt.iter().enumerate() {
+        // `gt_matched` has one entry per ground-truth box.
+        for (g, &hit) in img.gt.iter().zip(&m.gt_matched) {
             if g.ignore {
                 continue;
             }
             let e = size.entry(size_bucket(&g.bbox)).or_default();
             e.0 += 1;
-            e.1 += usize::from(m.gt_matched[j]);
+            e.1 += usize::from(hit);
             let cc = class_counts.entry(g.label.as_str()).or_default();
-            if m.gt_matched[j] {
+            if hit {
                 cc.tp += 1;
             } else {
                 cc.fn_ += 1;
@@ -572,7 +580,7 @@ pub fn evaluate(images: &[EvalImage], classes: &[String], threshold: f32) -> Sum
             }
             aps.push(average_precision(&mut scored, npos));
         }
-        let ap50 = aps[0];
+        let ap50 = aps.first().copied().flatten();
         let ap50_95 = ap50.map(|_| aps.iter().flatten().sum::<f64>() / IOU_THRESHOLDS.len() as f64);
         if let Some(a) = ap50 {
             ap50s.push(a);
@@ -724,7 +732,7 @@ impl SweepImage {
             .filter_map(|(p, (r, j))| {
                 let tp = (*r)?;
                 let small = match j {
-                    Some(j) => is_small(&img.gt[*j].bbox),
+                    Some(j) => img.gt.get(*j).is_some_and(|g| is_small(&g.bbox)),
                     None => is_small(&p.bbox),
                 };
                 Some(SweepPred {
@@ -893,10 +901,10 @@ impl Breakpoints {
     /// Counts with the predictions at or above `t` (binary search over the steps).
     pub fn counts_at(&self, t: f32) -> Counts {
         let n = self.steps.partition_point(|s| s.0 >= t);
-        let (tp, fp) = match n {
-            0 => (0, 0),
-            n => (self.steps[n - 1].1, self.steps[n - 1].2),
-        };
+        let (tp, fp) = n
+            .checked_sub(1)
+            .and_then(|i| self.steps.get(i))
+            .map_or((0, 0), |s| (s.1, s.2));
         Counts {
             tp,
             fp,
@@ -931,8 +939,9 @@ impl Breakpoints {
             return pts;
         }
         let last = pts.len() - 1;
+        // (i * last + (max-1)/2) / (max-1) <= last for i < max, so every index is in bounds.
         (0..max)
-            .map(|i| pts[(i * last + (max - 1) / 2) / (max - 1)])
+            .filter_map(|i| pts.get((i * last + (max - 1) / 2) / (max - 1)).copied())
             .collect()
     }
 }

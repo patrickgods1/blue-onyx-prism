@@ -72,6 +72,10 @@ impl std::str::FromStr for LogLevel {
 
 /// A confidence threshold rounded to 2 decimals (the precision the UI, the benchmark's
 /// "rounded down to 0.01" picks and the config file use), as the nearest `f32`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "narrowing the f64 form of an f32 back to f32 is the point (nearest f32)"
+)]
 pub fn round_threshold(t: f32) -> f32 {
     round_threshold_f64(t) as f32
 }
@@ -388,16 +392,41 @@ impl Config {
         let mut config: Config = serde_json::from_str(&text)
             .with_context(|| format!("parsing config {}", path.display()))?;
         config.normalize();
+        config
+            .validate()
+            .with_context(|| format!("invalid config {}", path.display()))?;
         Ok(config)
     }
 
-    /// Write the config as pretty JSON. Unnamed model entries are written with their
-    /// [`ModelConfig::effective_name`], so every model is named in the file.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    /// The text [`Self::save`] writes: pretty JSON with every model entry named
+    /// ([`ModelConfig::effective_name`]).
+    pub fn saved_text(&self) -> Result<String> {
         let mut named = self.clone();
         named.fill_model_names();
-        let text = serde_json::to_string_pretty(&named)?;
-        std::fs::write(path, text).with_context(|| format!("writing config {}", path.display()))
+        Ok(serde_json::to_string_pretty(&named)?)
+    }
+
+    /// Write the config as pretty JSON ([`Self::saved_text`]), atomically: the text goes to
+    /// `<path>.tmp` in the same directory, is flushed to disk, then renamed over `path`
+    /// (`std::fs::rename` replaces the target on Windows too). A crash or a full disk leaves
+    /// the previous file intact; on failure the temp file is removed.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let text = self.saved_text()?;
+        let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp = path.with_file_name(tmp_name);
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)
+        };
+        write().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::Error::new(e).context(format!("writing config {}", path.display()))
+        })
     }
 
     /// `<exe_dir>/blue_onyx_prism_config.json`, adopting a pre-rename config file if present.
@@ -456,7 +485,7 @@ impl Config {
     /// `default_model` when it names an enabled model, else the first enabled model.
     pub fn effective_default_index(&self) -> Option<usize> {
         self.default_model_index()
-            .filter(|&i| self.models[i].enabled)
+            .filter(|&i| self.models.get(i).is_some_and(|m| m.enabled))
             .or_else(|| self.models.iter().position(|m| m.enabled))
     }
 
@@ -594,13 +623,49 @@ impl Config {
     }
 }
 
-/// The models list on its own: at least one entry, every entry with a `path`, distinct names
-/// and valid per-model device specs.
-pub fn validate_models(models: &[ModelConfig]) -> Result<()> {
-    use anyhow::bail;
-    if models.is_empty() {
-        bail!("models: at least one model is required");
+/// Accepted range of `intra_threads` and `preprocess_threads`.
+pub const MAX_THREADS: usize = 256;
+/// Accepted range of `inflight` (global and per model).
+pub const MAX_INFLIGHT_SETTING: usize = 64;
+/// Accepted range of `ort_sessions`.
+pub const MAX_ORT_SESSIONS: usize = 16;
+/// Accepted range of `gpu_index`.
+pub const MAX_GPU_INDEX: u32 = 64;
+/// Accepted range of `request_timeout_secs`.
+pub const MAX_REQUEST_TIMEOUT_SECS: u64 = 3600;
+/// Accepted range of `max_image_pixels`.
+pub const MIN_IMAGE_PIXELS: u64 = 1_000;
+pub const MAX_IMAGE_PIXELS: u64 = 1_000_000_000;
+/// Accepted range of `benchmark.warmup` and `benchmark.repeat_per_image`.
+pub const MAX_BENCH_ITERATIONS: usize = 1000;
+
+/// `field` must lie in `lo..=hi`; the error names the key and the range.
+pub fn check_range<T: PartialOrd + std::fmt::Display>(
+    field: &str,
+    v: T,
+    lo: T,
+    hi: T,
+) -> Result<()> {
+    if v < lo || v > hi {
+        anyhow::bail!("{field}: must be between {lo} and {hi}, got {v}");
     }
+    Ok(())
+}
+
+/// The one rule for confidence thresholds and `nms_iou` (global and per model): a finite
+/// number in `0..=1`. 0 is allowed (report every box).
+pub fn check_threshold(field: &str, t: f32) -> Result<()> {
+    if !(t.is_finite() && (0.0..=1.0).contains(&t)) {
+        anyhow::bail!("{field}: must be between 0 and 1, got {t}");
+    }
+    Ok(())
+}
+
+/// Every model entry on its own (an empty list is fine here): a non-empty `path`, distinct
+/// names, valid per-model device specs, thresholds per [`check_threshold`] and `inflight` in
+/// range.
+pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
+    use anyhow::bail;
     let mut seen = std::collections::HashSet::new();
     for m in models {
         if m.path.as_os_str().is_empty() {
@@ -614,20 +679,100 @@ pub fn validate_models(models: &[ModelConfig]) -> Result<()> {
             crate::backend::spec::parse(d)
                 .map_err(|e| anyhow::anyhow!("models: '{key}' device: {e}"))?;
         }
-        if let Some(t) = m.confidence_threshold
-            && !(t.is_finite() && (0.0..=1.0).contains(&t))
-        {
-            bail!("models: '{key}' confidence_threshold: must be between 0 and 1, got {t}");
+        if let Some(t) = m.confidence_threshold {
+            check_threshold(&format!("models: '{key}' confidence_threshold"), t)?;
+        }
+        if let Some(n) = m.inflight {
+            check_range(
+                &format!("models: '{key}' inflight"),
+                n,
+                0,
+                MAX_INFLIGHT_SETTING,
+            )?;
         }
     }
     Ok(())
 }
 
-/// Cross-field checks of a whole config: [`validate_models`], at least one enabled model and a
-/// `default_model` that names a configured model.
+/// The models list on its own: at least one entry, and [`validate_model_entries`].
+pub fn validate_models(models: &[ModelConfig]) -> Result<()> {
+    if models.is_empty() {
+        anyhow::bail!("models: at least one model is required");
+    }
+    validate_model_entries(models)
+}
+
+impl Config {
+    /// Range-check every field (see the README's Configuration table). Each error names the key
+    /// and the accepted range, e.g. `confidence_threshold: must be between 0 and 1, got 5`.
+    /// An empty models list is fine here (first start); [`validate_config`] adds the checks a
+    /// config the server runs with must pass.
+    pub fn validate(&self) -> Result<()> {
+        use anyhow::bail;
+        check_range("port", self.port, 1, u16::MAX)?;
+        check_range(
+            "request_timeout_secs",
+            self.request_timeout_secs,
+            1,
+            MAX_REQUEST_TIMEOUT_SECS,
+        )?;
+        check_range(
+            "worker_queue_size",
+            self.worker_queue_size,
+            0,
+            crate::worker::MAX_QUEUE_SIZE,
+        )?;
+        check_threshold("confidence_threshold", self.confidence_threshold)?;
+        check_threshold("nms_iou", self.nms_iou)?;
+        check_range("intra_threads", self.intra_threads, 0, MAX_THREADS)?;
+        check_range(
+            "preprocess_threads",
+            self.preprocess_threads,
+            0,
+            MAX_THREADS,
+        )?;
+        check_range("inflight", self.inflight, 0, MAX_INFLIGHT_SETTING)?;
+        check_range("ort_sessions", self.ort_sessions, 0, MAX_ORT_SESSIONS)?;
+        check_range("gpu_index", self.gpu_index, 0, MAX_GPU_INDEX)?;
+        check_range(
+            "max_image_pixels",
+            self.max_image_pixels,
+            MIN_IMAGE_PIXELS,
+            MAX_IMAGE_PIXELS,
+        )?;
+        if self.models_dir.as_os_str().is_empty() {
+            bail!("models_dir: must not be empty");
+        }
+        crate::backend::spec::parse(&self.device).map_err(|e| anyhow::anyhow!("device: {e}"))?;
+        validate_model_entries(&self.models)?;
+        let b = &self.benchmark;
+        check_range("benchmark.warmup", b.warmup, 0, MAX_BENCH_ITERATIONS)?;
+        check_range(
+            "benchmark.repeat_per_image",
+            b.repeat_per_image,
+            0,
+            MAX_BENCH_ITERATIONS,
+        )?;
+        for (field, w) in [
+            ("benchmark.weights.accuracy", b.weights.accuracy),
+            ("benchmark.weights.speed", b.weights.speed),
+        ] {
+            if !(w.is_finite() && (0.0..=1.0).contains(&w)) {
+                bail!("{field}: must be between 0 and 1, got {w}");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Checks of a config the server runs with: [`Config::validate`], at least one model, at least
+/// one enabled model and a `default_model` that names a configured model.
 pub fn validate_config(c: &Config) -> Result<()> {
     use anyhow::bail;
-    validate_models(&c.models)?;
+    c.validate()?;
+    if c.models.is_empty() {
+        bail!("models: at least one model is required");
+    }
     if !c.models.iter().any(|m| m.enabled) {
         bail!("models: at least one model must be enabled");
     }
@@ -970,5 +1115,224 @@ mod tests {
         assert!(format!("{err:#}").contains("device"), "{err:#}");
         c.device = "nonsense".into();
         assert!(c.device_spec_for(&m).is_err());
+    }
+
+    /// `validate` on a default config with `edit` applied: Ok, or the error text.
+    fn check(edit: impl FnOnce(&mut Config)) -> std::result::Result<(), String> {
+        let mut c = Config::default();
+        edit(&mut c);
+        c.validate().map_err(|e| format!("{e:#}"))
+    }
+
+    /// The error names `key` and the range.
+    fn rejects(edit: impl FnOnce(&mut Config), key: &str, range: &str) {
+        let err = check(edit).unwrap_err();
+        assert!(err.contains(key), "{err}");
+        assert!(err.contains(range), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_defaults_and_an_empty_model_list() {
+        assert_eq!(check(|_| {}), Ok(()));
+        // `validate_config` (what the server runs with) still wants a model.
+        assert!(validate_config(&Config::default()).is_err());
+        assert!(validate_config(&three_models()).is_ok());
+    }
+
+    #[test]
+    fn validate_port() {
+        rejects(|c| c.port = 0, "port", "between 1 and 65535, got 0");
+        assert!(check(|c| c.port = 65535).is_ok());
+    }
+
+    #[test]
+    fn validate_request_timeout() {
+        rejects(
+            |c| c.request_timeout_secs = 0,
+            "request_timeout_secs",
+            "between 1 and 3600",
+        );
+        rejects(
+            |c| c.request_timeout_secs = u64::MAX,
+            "request_timeout_secs",
+            "between 1 and 3600",
+        );
+        assert!(check(|c| c.request_timeout_secs = 3600).is_ok());
+    }
+
+    #[test]
+    fn validate_worker_queue_size() {
+        rejects(
+            |c| c.worker_queue_size = 1_000_000_000,
+            "worker_queue_size",
+            "between 0 and 1024",
+        );
+        assert!(check(|c| c.worker_queue_size = 1024).is_ok());
+        assert!(check(|c| c.worker_queue_size = 0).is_ok());
+    }
+
+    #[test]
+    fn validate_thresholds_global_and_per_model() {
+        rejects(
+            |c| c.confidence_threshold = 5.0,
+            "confidence_threshold",
+            "must be between 0 and 1, got 5",
+        );
+        rejects(
+            |c| c.confidence_threshold = -1.0,
+            "confidence_threshold",
+            "0 and 1",
+        );
+        rejects(
+            |c| c.confidence_threshold = f32::NAN,
+            "confidence_threshold",
+            "0 and 1",
+        );
+        rejects(|c| c.nms_iou = 2.0, "nms_iou", "0 and 1");
+        assert!(check(|c| c.confidence_threshold = 0.0).is_ok());
+        assert!(check(|c| c.nms_iou = 1.0).is_ok());
+        let mut c = three_models();
+        c.models[1].confidence_threshold = Some(1.5);
+        let err = format!("{:#}", c.validate().unwrap_err());
+        assert!(err.contains("'b' confidence_threshold"), "{err}");
+        c.models[1].confidence_threshold = Some(0.0);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_thread_and_concurrency_counts() {
+        rejects(
+            |c| c.intra_threads = 257,
+            "intra_threads",
+            "between 0 and 256",
+        );
+        rejects(
+            |c| c.preprocess_threads = 10_000,
+            "preprocess_threads",
+            "between 0 and 256",
+        );
+        rejects(|c| c.inflight = 65, "inflight", "between 0 and 64");
+        rejects(|c| c.ort_sessions = 17, "ort_sessions", "between 0 and 16");
+        rejects(|c| c.gpu_index = 65, "gpu_index", "between 0 and 64");
+        assert!(
+            check(|c| {
+                c.intra_threads = 256;
+                c.preprocess_threads = 256;
+                c.inflight = 64;
+                c.ort_sessions = 16;
+                c.gpu_index = 64;
+            })
+            .is_ok()
+        );
+        let mut c = three_models();
+        c.models[0].inflight = Some(100);
+        let err = format!("{:#}", c.validate().unwrap_err());
+        assert!(
+            err.contains("'a' inflight") && err.contains("0 and 64"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_max_image_pixels() {
+        rejects(
+            |c| c.max_image_pixels = 0,
+            "max_image_pixels",
+            "between 1000 and 1000000000",
+        );
+        rejects(
+            |c| c.max_image_pixels = 2_000_000_000,
+            "max_image_pixels",
+            "1000000000",
+        );
+        assert!(check(|c| c.max_image_pixels = 1_000).is_ok());
+    }
+
+    #[test]
+    fn validate_paths() {
+        rejects(|c| c.models_dir = PathBuf::new(), "models_dir", "empty");
+        // An empty cache dir disables the cache.
+        assert!(check(|c| c.cache_dir = String::new()).is_ok());
+        let mut c = three_models();
+        c.models[2].path = PathBuf::new();
+        assert!(format!("{:#}", c.validate().unwrap_err()).contains("path"));
+        // Duplicate names.
+        let mut c = three_models();
+        c.models[1].name = Some("A".into());
+        assert!(format!("{:#}", c.validate().unwrap_err()).contains("duplicate"));
+    }
+
+    #[test]
+    fn validate_devices() {
+        rejects(|c| c.device = "xpu".into(), "device", "");
+        assert!(check(|c| c.device = "ort:cuda:1".into()).is_ok());
+        let mut c = three_models();
+        c.models[0].device = Some("G P U".into());
+        assert!(format!("{:#}", c.validate().unwrap_err()).contains("'a' device"));
+    }
+
+    #[test]
+    fn validate_benchmark_section() {
+        rejects(
+            |c| c.benchmark.warmup = 1001,
+            "benchmark.warmup",
+            "0 and 1000",
+        );
+        rejects(
+            |c| c.benchmark.repeat_per_image = 5000,
+            "benchmark.repeat_per_image",
+            "0 and 1000",
+        );
+        rejects(
+            |c| c.benchmark.weights.accuracy = 2.0,
+            "benchmark.weights.accuracy",
+            "0 and 1",
+        );
+        rejects(
+            |c| c.benchmark.weights.speed = f64::INFINITY,
+            "benchmark.weights.speed",
+            "0 and 1",
+        );
+        assert!(check(|c| c.benchmark.max_images_per_dataset = usize::MAX).is_ok());
+    }
+
+    #[test]
+    fn load_rejects_invalid_values_naming_the_key() {
+        let dir = std::env::temp_dir().join(format!("bop-cfg-val-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        std::fs::write(&path, r#"{"confidence_threshold":5}"#).unwrap();
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(
+            err.contains("confidence_threshold: must be between 0 and 1, got 5"),
+            "{err}"
+        );
+        std::fs::write(&path, r#"{"port":4000}"#).unwrap();
+        assert_eq!(Config::load(&path).unwrap().port, 4000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("bop-cfg-save-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        std::fs::write(&path, "old").unwrap();
+        let c = Config {
+            port: 4321,
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            c.saved_text().unwrap()
+        );
+        assert!(!dir.join("c.json.tmp").exists());
+        // A failed write (the target is a directory) keeps nothing behind.
+        let bad = dir.join("sub");
+        std::fs::create_dir_all(bad.join("x")).unwrap();
+        assert!(c.save(&bad).is_err());
+        assert!(!dir.join("sub.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

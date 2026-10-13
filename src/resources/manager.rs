@@ -452,8 +452,29 @@ pub struct Manager {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+impl std::fmt::Debug for Manager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Manager")
+            .field("root", &self.shared.opts.root)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `done` of `total` as a percent in 0..=100 (0 when `total` is 0).
+pub fn percent(done: u64, total: u64) -> u8 {
+    let p = (u128::from(done.min(total)) * 100)
+        .checked_div(u128::from(total))
+        .unwrap_or(0);
+    u8::try_from(p).unwrap_or(100)
+}
+
 impl Manager {
     /// Start the worker thread.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant: the OS can create one more thread at startup; without it the \
+                  process cannot work at all, so failing to spawn is a controlled abort"
+    )]
     pub fn start(opts: ManagerOptions) -> Self {
         let shared = Arc::new(Shared {
             opts,
@@ -467,7 +488,7 @@ impl Manager {
         let thread = std::thread::Builder::new()
             .name("downloads".into())
             .spawn(move || worker_loop(&worker, &rx))
-            .expect("spawning the download thread");
+            .expect("spawning the download thread (OS thread limit or out of memory)");
         Self {
             shared,
             tx,
@@ -1053,7 +1074,10 @@ pub fn sha256_file(path: &Path) -> Result<String> {
         if n == 0 {
             break;
         }
-        h.update(&buf[..n]);
+        h.update(
+            buf.get(..n)
+                .context("read returned more bytes than the buffer holds")?,
+        );
     }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }

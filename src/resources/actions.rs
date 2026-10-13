@@ -288,6 +288,9 @@ pub fn add_to_config(
         && let catalog::Provides::Model { name, family } = res.provides
     {
         // Not in the static catalog (e.g. an extra test model): same shape by hand.
+        let Some(first) = files.first() else {
+            return Err(ActionError::Conflict(format!("{} has no files", res.title)));
+        };
         let rel = |p: &Path| {
             p.strip_prefix(config.data_root())
                 .map(Path::to_path_buf)
@@ -295,7 +298,7 @@ pub fn add_to_config(
         };
         models.push(crate::config::ModelConfig {
             name: Some(name.to_string()),
-            path: rel(&files[0]),
+            path: rel(first),
             family,
             classes: files.get(1).map(|p| rel(p)),
             ..Default::default()
@@ -315,6 +318,9 @@ fn add_export_to_config(config: &mut Config, res: &Resource) -> Result<String, A
         )));
     }
     let files = model_paths(res, config);
+    let Some(first) = files.first() else {
+        return Err(ActionError::Conflict(format!("{} has no files", res.title)));
+    };
     let rel = |p: &Path| {
         p.strip_prefix(config.data_root())
             .map(Path::to_path_buf)
@@ -330,7 +336,7 @@ fn add_export_to_config(config: &mut Config, res: &Resource) -> Result<String, A
         config,
         vec![crate::config::ModelConfig {
             name: Some(name.to_string()),
-            path: rel(&files[0]),
+            path: rel(first),
             family,
             classes: files.get(1).filter(|p| p.is_file()).map(|p| rel(p)),
             ..Default::default()
@@ -540,7 +546,10 @@ pub fn add_custom_model(config: &mut Config, req: &CustomModel) -> Result<String
                     .map(|n| dir.join(n))
                     .filter(|p| p.is_file() && crate::model::classes::load_class_names(p).is_ok())
                     .collect();
-                (ok.len() == 1).then(|| ok[0].clone())
+                match ok.as_slice() {
+                    [only] => Some(only.clone()),
+                    _ => None,
+                }
             }
         }
     };

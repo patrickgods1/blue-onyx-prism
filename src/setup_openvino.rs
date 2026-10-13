@@ -113,7 +113,7 @@ pub fn run(opts: &SetupOptions) -> Result<PathBuf> {
             println!(
                 "Downloading OpenVINO {OPENVINO_VERSION} for {os}/{arch} ({})\n  {}",
                 catalog::format_size(resource.size()),
-                resource.parts[0].url
+                resource.parts.first().map_or("", |p| p.url)
             );
         }
     }

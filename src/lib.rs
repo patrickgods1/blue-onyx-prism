@@ -49,7 +49,10 @@
 #![deny(unsafe_code)]
 
 pub mod api;
-#[allow(unsafe_code, reason = "FFI into OpenVINO, ONNX Runtime, DXGI, CUDA and libloading")]
+#[allow(
+    unsafe_code,
+    reason = "FFI into OpenVINO, ONNX Runtime, DXGI, CUDA and libloading"
+)]
 pub mod backend;
 pub mod benchmark;
 pub mod cli;

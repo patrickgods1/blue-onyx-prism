@@ -116,7 +116,9 @@ pub fn auto_candidates(sel: &Selection) -> Vec<Candidate> {
         .enumerate()
         .map(|(i, d)| Candidate::new(*d, i > 0))
         .collect();
-    if out.len() == 1 && out[0].device.is_cpu() {
+    if let [only] = out.as_mut_slice()
+        && only.device.is_cpu()
+    {
         let blocked: Vec<String> = sel
             .options
             .iter()
@@ -130,10 +132,10 @@ pub fn auto_candidates(sel: &Selection) -> Vec<Candidate> {
             })
             .collect();
         if !blocked.is_empty() {
-            out[0].note = Some(format!(
+            only.note = Some(format!(
                 "no GPU option can run ({}); using {}",
                 blocked.join("; "),
-                out[0].device
+                only.device
             ));
         }
     }
@@ -211,10 +213,14 @@ pub fn try_candidates<T>(
             }
         }
     }
-    match failures.len() {
-        0 => anyhow::bail!("{label}: no device to try"),
+    match failures.as_slice() {
+        [] => anyhow::bail!("{label}: no device to try"),
         // A single candidate keeps its own error chain.
-        1 => Err(failures.pop().map(|(_, e)| e).expect("one failure")),
+        [_] => Err(failures
+            .into_iter()
+            .map(|(_, e)| e)
+            .next()
+            .unwrap_or_else(|| anyhow::anyhow!("{label}: no device to try"))),
         _ => {
             let list: Vec<String> = failures
                 .iter()

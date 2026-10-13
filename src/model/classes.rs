@@ -5,9 +5,13 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_yaml_ng::Value;
 
+/// Largest class index accepted in an index map (`names: {0: person, ...}`).
+pub const MAX_CLASS_MAP_INDEX: u64 = 65_535;
+
 /// Load class names from a YAML file. Accepted forms:
 /// - `NAMES:` / `names:` as a list (`- person`),
-/// - `names:` as an index map (`{0: person, 1: bicycle}`, Ultralytics `metadata.yaml`), sorted by key,
+/// - `names:` as an index map (`{0: person, 1: bicycle}`, Ultralytics `metadata.yaml`), sorted by
+///   key (keys above [`MAX_CLASS_MAP_INDEX`] are rejected),
 /// - a bare top-level list.
 pub fn load_class_names(path: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(path)
@@ -41,6 +45,11 @@ pub fn parse_class_names(text: &str) -> Result<Vec<String>> {
                     .with_context(|| {
                         format!("class map key {k:?} is not a non-negative integer")
                     })?;
+                    if idx > MAX_CLASS_MAP_INDEX {
+                        anyhow::bail!(
+                            "class map key {idx} is above the {MAX_CLASS_MAP_INDEX} limit"
+                        );
+                    }
                     Ok((idx, scalar_to_string(v)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -61,6 +70,10 @@ fn scalar_to_string(v: &Value) -> Result<String> {
 }
 
 /// The 80 COCO class names bundled with the binary.
+#[allow(
+    clippy::expect_used,
+    reason = "compile-time asset, parsed by the `coco` unit test"
+)]
 pub fn coco80() -> Vec<String> {
     parse_class_names(include_str!("../../assets/coco_classes.yaml"))
         .expect("bundled coco_classes.yaml is valid")
@@ -111,6 +124,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(parse_class_names("other: 1\n").is_err());
         assert!(parse_class_names("names: 5\n").is_err());
+        let e = parse_class_names("names:\n  0: a\n  99999999999: b\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("99999999999"), "{e}");
+        assert!(parse_class_names("names:\n  65535: a\n").is_ok());
     }
 
     #[test]

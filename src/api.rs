@@ -16,6 +16,17 @@ pub struct VisionDetectionRequest {
     pub image_name: String,
 }
 
+/// Prints the image size, not its bytes.
+impl Debug for VisionDetectionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VisionDetectionRequest")
+            .field("min_confidence", &self.min_confidence)
+            .field("image_bytes", &self.image_data.len())
+            .field("image_name", &self.image_name)
+            .finish()
+    }
+}
+
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "camelCase", default)]

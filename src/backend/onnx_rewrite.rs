@@ -80,9 +80,12 @@ pub fn parse_fields(buf: &[u8]) -> Result<Vec<Field<'_>>> {
         let value = match key & 7 {
             0 => Value::Varint(read_varint(buf, &mut pos)?),
             1 => {
-                let b = buf.get(pos..pos + 8).context("truncated fixed64")?;
+                let b = buf
+                    .get(pos..)
+                    .and_then(|r| r.first_chunk::<8>())
+                    .context("truncated fixed64")?;
                 pos += 8;
-                Value::Fixed64(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+                Value::Fixed64(u64::from_le_bytes(*b))
             }
             2 => {
                 let n = usize::try_from(read_varint(buf, &mut pos)?)?;
@@ -90,22 +93,26 @@ pub fn parse_fields(buf: &[u8]) -> Result<Vec<Field<'_>>> {
                     .checked_add(n)
                     .filter(|e| *e <= buf.len())
                     .context("truncated length-delimited field")?;
-                let v = &buf[pos..end];
+                let v = buf
+                    .get(pos..end)
+                    .context("truncated length-delimited field")?;
                 pos = end;
                 Value::Len(v)
             }
             5 => {
-                let b = buf.get(pos..pos + 4).context("truncated fixed32")?;
+                let b = buf
+                    .get(pos..)
+                    .and_then(|r| r.first_chunk::<4>())
+                    .context("truncated fixed32")?;
                 pos += 4;
-                Value::Fixed32(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+                Value::Fixed32(u32::from_le_bytes(*b))
             }
             wt => bail!("unsupported wire type {wt} (field {num})"),
         };
-        out.push(Field {
-            num,
-            value,
-            raw: &buf[start..pos],
-        });
+        let raw = buf
+            .get(start..pos)
+            .context("field extends past the end of the message")?;
+        out.push(Field { num, value, raw });
     }
     Ok(out)
 }
@@ -117,6 +124,10 @@ struct Writer {
 }
 
 impl Writer {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "only the low 7 bits of each group are written; the loop keeps the rest"
+    )]
     fn varint(&mut self, mut v: u64) {
         while v >= 0x80 {
             self.buf.push((v as u8) | 0x80);
@@ -136,6 +147,10 @@ impl Writer {
         self.bytes(num, s.as_bytes());
     }
     /// int32/int64/enum: negative values are sign-extended to 10 bytes, as protobuf does.
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "protobuf encodes int64 as its two's-complement bit pattern"
+    )]
     fn int(&mut self, num: u32, v: i64) {
         self.key(num, 0);
         self.varint(v as u64);
@@ -360,7 +375,9 @@ impl<'a> Tensor<'a> {
         let fields = parse_fields(b)?;
         Ok(Self {
             name: get_str(&fields, TENSOR_NAME)?,
-            data_type: get_int(&fields, TENSOR_DATA_TYPE).unwrap_or(0) as i32,
+            data_type: get_int(&fields, TENSOR_DATA_TYPE)
+                .and_then(|v| i32::try_from(v).ok())
+                .unwrap_or(0),
             dims: rep_int(&fields, TENSOR_DIMS)?,
             external: get_int(&fields, TENSOR_DATA_LOCATION) == Some(1)
                 || fields.iter().any(|f| f.num == TENSOR_EXTERNAL_DATA),
@@ -396,8 +413,10 @@ impl<'a> Tensor<'a> {
                 ),
                 Some(_) => None,
                 None => rep_int(&self.fields, TENSOR_INT32_DATA)
-                    .ok()
-                    .map(|v| v.into_iter().map(|x| i64::from(x as i32)).collect()),
+                    .ok()?
+                    .into_iter()
+                    .map(|x| i32::try_from(x).ok().map(i64::from))
+                    .collect(),
             },
             _ => None,
         }
@@ -420,7 +439,7 @@ fn parse_value_info(b: &[u8]) -> Result<(&str, ValueType)> {
         let tp = parse_fields(tp)?;
         if let Some(tt) = get_len(&tp, TYPE_TENSOR) {
             let tt = parse_fields(tt)?;
-            vt.elem = get_int(&tt, TT_ELEM_TYPE).map(|v| v as i32);
+            vt.elem = get_int(&tt, TT_ELEM_TYPE).and_then(|v| i32::try_from(v).ok());
             if let Some(shape) = get_len(&tt, TT_SHAPE) {
                 let shape = parse_fields(shape)?;
                 let mut dims = Vec::new();
@@ -576,8 +595,9 @@ impl<'a> Graph<'a> {
                     }
                     if matches!(n.op_type, "Cast" | "CastLike")
                         && let Some(to) = n.attr("to").and_then(|a| a.i)
+                        && let Ok(to) = i32::try_from(to)
                     {
-                        float_types.insert(to as i32);
+                        float_types.insert(to);
                     }
                     g.names.extend(n.inputs.iter().map(|s| s.to_string()));
                     g.names.extend(n.outputs.iter().map(|s| s.to_string()));
@@ -752,6 +772,11 @@ fn encode_node(
 }
 
 /// IEEE 754 binary16 bits of `x`, rounded to nearest even.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "e is in 1..=30 where cast to u32; r is at most 0x7c00 (+1) and sign is 0 or 0x8000, both fit u16"
+)]
 pub fn f32_to_f16_bits(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
@@ -834,8 +859,9 @@ fn emit_hard_sigmoid(
     e.node(&[x, &a], &[&mul], "mul", "Mul");
     e.node(&[&mul, &b], &[&add], "add", "Add");
     if opset >= 11 {
-        let lo = e.b.scalar(dtype, 0.0).expect("type checked above");
-        let hi = e.b.scalar(dtype, 1.0).expect("type checked above");
+        let (Some(lo), Some(hi)) = (e.b.scalar(dtype, 0.0), e.b.scalar(dtype, 1.0)) else {
+            return Err(format!("element type {dtype} not supported"));
+        };
         e.node(&[&add, &lo, &hi], &[&clip], "clip", "Clip");
     } else {
         e.node_with(
@@ -854,7 +880,7 @@ fn emit_hard_sigmoid(
 
 /// Split sizes along `axis` of a `Split` node, or why they are unknown.
 fn split_sizes(g: &Graph<'_>, n: &Node<'_>, opset: i64, axis: i64) -> Result<Vec<i64>, String> {
-    let outs = n.outputs.len() as i64;
+    let outs = i64::try_from(n.outputs.len()).map_err(|_| "too many outputs".to_string())?;
     let explicit = if opset < 13 {
         n.attr("split").map(|a| a.ints.clone())
     } else if let Some(s) = n.input(1) {
@@ -872,8 +898,8 @@ fn split_sizes(g: &Graph<'_>, n: &Node<'_>, opset: i64, axis: i64) -> Result<Vec
     let dim = g
         .shape(x)
         .and_then(|s| {
-            let r = s.len() as i64;
-            let a = if axis < 0 { axis + r } else { axis };
+            let r = i64::try_from(s.len()).ok()?;
+            let a = if axis < 0 { axis.checked_add(r)? } else { axis };
             s.get(usize::try_from(a).ok()?).copied().flatten()
         })
         .ok_or_else(|| format!("equal split of '{x}' needs its shape along axis {axis}"))?;
@@ -886,19 +912,22 @@ fn split_sizes(g: &Graph<'_>, n: &Node<'_>, opset: i64, axis: i64) -> Result<Vec
             return Err(format!("num_outputs {k} != {outs} outputs"));
         }
         // Chunks of ceil(dim / k); the last one is smaller when uneven.
-        let chunk = (dim + k - 1) / k;
+        let chunk = dim
+            .checked_add(k - 1)
+            .map(|t| t / k)
+            .ok_or_else(|| format!("dimension {dim} overflows when split into {k} chunks"))?;
         let mut v = Vec::new();
         let mut left = dim;
         for _ in 0..k {
             v.push(chunk.min(left).max(0));
-            left -= chunk;
+            left = left.saturating_sub(chunk);
         }
         return Ok(v);
     }
     if outs == 0 || dim % outs != 0 {
         return Err(format!("dimension {dim} does not split evenly into {outs}"));
     }
-    Ok(vec![dim / outs; outs as usize])
+    Ok(vec![dim / outs; n.outputs.len()])
 }
 
 fn emit_split(e: &mut Emit<'_, '_>, g: &Graph<'_>, n: &Node<'_>, opset: i64) -> Result<(), String> {
@@ -914,7 +943,9 @@ fn emit_split(e: &mut Emit<'_, '_>, g: &Graph<'_>, n: &Node<'_>, opset: i64) -> 
     }
     let mut start = 0i64;
     for (j, (size, out)) in sizes.iter().zip(&n.outputs).enumerate() {
-        let end = start + size;
+        let end = start
+            .checked_add(*size)
+            .ok_or_else(|| format!("split sizes {sizes:?} overflow i64"))?;
         if !out.is_empty() {
             let suffix = format!("slice{j}");
             if opset >= 10 {
@@ -950,8 +981,11 @@ fn emit_flatten(e: &mut Emit<'_, '_>, g: &Graph<'_>, n: &Node<'_>) -> Result<(),
         let r = shape
             .as_ref()
             .ok_or("negative axis needs the input rank")?
-            .len() as i64;
-        axis += r;
+            .len();
+        axis = i64::try_from(r)
+            .ok()
+            .and_then(|r| axis.checked_add(r))
+            .ok_or_else(|| format!("axis {axis} out of range"))?;
     }
     let target = match axis {
         0 => vec![1, -1],
@@ -959,14 +993,19 @@ fn emit_flatten(e: &mut Emit<'_, '_>, g: &Graph<'_>, n: &Node<'_>) -> Result<(),
         1 => vec![0, -1],
         a if a > 1 => {
             let dims = shape.ok_or("axis > 1 needs the input shape")?;
-            let lead: Option<Vec<i64>> = dims
-                .get(..a as usize)
+            let lead: Option<Vec<i64>> = usize::try_from(a)
+                .ok()
+                .and_then(|a| dims.get(..a))
                 .ok_or("axis beyond the input rank")?
                 .iter()
                 .copied()
                 .collect();
             let lead = lead.ok_or("axis > 1 needs static leading dimensions")?;
-            vec![lead.iter().product(), -1]
+            let product = lead
+                .iter()
+                .try_fold(1i64, |acc, d| acc.checked_mul(*d))
+                .ok_or_else(|| format!("leading dimensions {lead:?} overflow i64"))?;
+            vec![product, -1]
         }
         _ => return Err(format!("axis {axis} out of range")),
     };
@@ -981,7 +1020,10 @@ pub fn rewrite(model: &[u8], opts: &RewriteOptions) -> Result<Outcome> {
     let Some(gi) = mfields.iter().rposition(|f| f.num == MODEL_GRAPH) else {
         bail!("model has no graph");
     };
-    let gbytes = len_of(&mfields[gi]).context("graph field is not length-delimited")?;
+    let gbytes = mfields
+        .get(gi)
+        .and_then(len_of)
+        .context("graph field is not length-delimited")?;
     let opset = onnx_opset(&mfields)?;
     let mut g = Graph::parse(gbytes).context("parsing GraphProto")?;
     if g.external_data {
@@ -1103,7 +1145,7 @@ pub fn rewrite(model: &[u8], opts: &RewriteOptions) -> Result<Outcome> {
             if let Some((fi, _)) = g.inits.get(name) {
                 dropped.insert(*fi);
             } else if let Some((fi, _)) = g.nodes.iter().find(|(_, n)| {
-                n.op_type == "Constant" && n.outputs.len() == 1 && n.outputs[0] == name
+                n.op_type == "Constant" && n.outputs.len() == 1 && n.outputs.first() == Some(&name)
             }) {
                 dropped.insert(*fi);
             }
@@ -1181,7 +1223,7 @@ pub fn reencode(model: &[u8]) -> Result<Vec<u8>> {
         .iter()
         .rposition(|f| f.num == MODEL_GRAPH)
         .context("model has no graph")?;
-    let gfields = parse_fields(len_of(&mfields[gi]).context("graph field")?)?;
+    let gfields = parse_fields(mfields.get(gi).and_then(len_of).context("graph field")?)?;
     Ok(assemble(
         &mfields,
         gi,
@@ -2021,6 +2063,68 @@ mod tests {
             Outcome::Unchanged { skipped } => assert!(skipped[0].starts_with("Split 's'")),
             o => panic!("{o:?}"),
         }
+    }
+
+    /// BE-05: values parsed from the model near `i64::MAX` must skip the node with a reason, never
+    /// overflow (debug: panic; release: wrapped Slice/Reshape bounds in the cache file).
+    #[test]
+    fn overflowing_split_and_flatten_values_are_skipped() {
+        let skipped_of = |o: Outcome| match o {
+            Outcome::Unchanged { skipped } => skipped,
+            o => panic!("{o:?}"),
+        };
+        // Split(split=[i64::MAX, 1]) at opset 12 (attribute form, COREML options).
+        let sp = node(
+            "Split",
+            "big",
+            &["x"],
+            &["a", "b"],
+            &[attr_i("axis", 0), attr_ints("split", &[i64::MAX, 1], false)],
+        );
+        let s = skipped_of(
+            rewrite(&single(12, sp, &["a", "b"], &[8]), &RewriteOptions::COREML).unwrap(),
+        );
+        assert_eq!(s.len(), 1);
+        assert!(s[0].starts_with("Split 'big':"), "{s:?}");
+        assert!(s[0].contains("overflow"), "{s:?}");
+        // Opset 18 equal split of a dimension near i64::MAX: ceil(dim / k) overflows.
+        let sp = node(
+            "Split",
+            "eq",
+            &["x"],
+            &["a", "b"],
+            &[attr_i("axis", 0), attr_i("num_outputs", 2)],
+        );
+        let s = skipped_of(
+            rewrite(
+                &single(18, sp, &["a", "b"], &[i64::MAX]),
+                &RewriteOptions::ALL,
+            )
+            .unwrap(),
+        );
+        assert!(
+            s[0].starts_with("Split 'eq':") && s[0].contains("overflow"),
+            "{s:?}"
+        );
+        // Flatten(axis=3) whose leading dimensions multiply past i64::MAX.
+        let f = node("Flatten", "f", &["x"], &["y"], &[attr_i("axis", 3)]);
+        let s = skipped_of(
+            rewrite(
+                &single(13, f, &["y"], &[i64::MAX, 2, 2, 5]),
+                &RewriteOptions::ALL,
+            )
+            .unwrap(),
+        );
+        assert!(
+            s[0].starts_with("Flatten 'f':") && s[0].contains("overflow"),
+            "{s:?}"
+        );
+        // The same shapes without the overflow still rewrite (the guard is not over-eager).
+        let f = node("Flatten", "f", &["x"], &["y"], &[attr_i("axis", 3)]);
+        assert!(matches!(
+            rewrite(&single(13, f, &["y"], &[3, 2, 2, 5]), &RewriteOptions::ALL).unwrap(),
+            Outcome::Rewritten(_)
+        ));
     }
 
     #[test]

@@ -185,7 +185,7 @@ tar xzf blue-onyx-prism-*-linux-x86_64.tar.gz && cd blue-onyx-prism-*-linux-x86_
 ```
 
 Check it: open `http://127.0.0.1:32168/`, or `./test-blue-onyx-prism` (see [Test client](#test-client)).
-`--model <path> --family yolo5|yolo26|yolo8|rtdetr|auto` runs a single model without editing the config.
+`--model <path> --family yolo5|yolo26|yolo8|rtdetr|auto` enables that model (adding it to the config when it is not there yet).
 `blue-onyx-prism --help` lists every option; `list-models` shows the downloadable catalog.
 
 The first GPU start compiles each model (20-60 s on an iGPU) and stores the result in `cache/`;
@@ -195,19 +195,20 @@ the model is ready.
 ## Configuration
 
 `blue_onyx_prism_config.json` next to the executable (`--config <file>` to use another). A CLI
-flag overrides the file and the merged result is written back. Relative paths in the file resolve
+flag overrides the file and the merged result is written back when it differs from the file (an
+invalid value is an error and the file is left untouched). Relative paths in the file resolve
 against the executable directory. The Windows service reads `blue_onyx_prism_config_service.json`
 (created with debug logging on first start).
 
 | Field | Default | Meaning |
 |---|---|---|
-| `port` | `32168` | HTTP listen port (process restart) |
+| `port` | `32168` | HTTP listen port, 1-65535 (process restart) |
 | `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only (process restart). See [Remote access](#remote-access) |
 | `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines too (applies at once). See [Remote access](#remote-access) |
-| `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout) |
-| `worker_queue_size` | `0` | Per-model queue length; 0 = auto from timeout and measured inference time |
+| `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout), 1-3600 |
+| `worker_queue_size` | `0` | Per-model queue length, 0-1024; 0 = auto from timeout and measured inference time |
 | `device` | `"auto"` | Device spec (`auto`, `openvino:gpu`, `ort:cuda`, ..., or legacy `GPU`/`CPU`); see [Hardware and device selection](#hardware-and-device-selection). Falls back to CPU when the device cannot run |
-| `gpu_index` | `0` | GPU to use when several are present |
+| `gpu_index` | `0` | GPU to use when several are present, 0-64 |
 | `force_cpu` | `false` | Always use the CPU |
 | `cache_dir` | `"cache"` | Compiled-model cache; empty disables it |
 | `openvino_dir` | `null` | OpenVINO runtime dir; default `<exe_dir>/openvino`, else the system install |
@@ -215,16 +216,16 @@ against the executable directory. The Windows service reads `blue_onyx_prism_con
 | `auto_download` | `true` | Download missing runtimes and models at startup; see [First run](#first-run) |
 | `allow_large_downloads` | `false` | Allow downloads over 500 MB (NVIDIA CUDA libraries) |
 | `download_dir` | `null` | Root for downloaded runtimes and relative model paths (default: the executable's directory) |
-| `confidence_threshold` | `0.5` | Default minimum confidence (a request's `min_confidence` > 0 overrides it) |
-| `nms_iou` | `0.5` | IoU threshold for NMS-based families |
+| `confidence_threshold` | `0.5` | Default minimum confidence, 0-1 (a request's `min_confidence` > 0 overrides it) |
+| `nms_iou` | `0.5` | IoU threshold for NMS-based families, 0-1 |
 | `object_filter` | `[]` | Only report these labels (case-insensitive); empty = all |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error` |
 | `log_path` | `null` | Directory for daily rolling log files (default: stdout) |
 | `save_image_path` | `null` | Save annotated detections here |
 | `save_ref_image` | `false` | Also save the unannotated image |
-| `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. Applies at once |
-| `intra_threads` | `0` | CPU inference threads (0 = OpenVINO default; try 4 of 6 cores) |
-| `models_dir` | `"models"` | Where `download-models` puts files |
+| `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. 1000 to 1000000000. Applies at once |
+| `intra_threads` | `0` | CPU inference threads, 0-256 (0 = OpenVINO default; try 4 of 6 cores) |
+| `models_dir` | `"models"` | Where `download-models` puts files (must not be empty) |
 | `default_model` | `null` | Model serving `/v1/vision/detection`; default = first enabled entry |
 | `models` | `[]` | Model list, see [Multiple models](#multiple-models) |
 
@@ -424,7 +425,8 @@ List any number of models in `models[]` of the config file:
   model (family and classes file filled in) to the config, skipping names or paths already present.
   New entries are added disabled when the config already has an enabled model (otherwise the first
   one is enabled), so `download-models --all --add-to-config` does not load every model.
-- `--model <path>` always enables that model.
+- `--model <path>` always enables that model: an entry whose path resolves to the same file is
+  enabled, otherwise the model is appended as a new enabled entry; other entries are left as they are.
 
 Each model gets its own worker thread and compiled copy in memory. Expect a few hundred MB per model
 on the iGPU (shared system RAM); use `lazy` for rarely used models and `device: "CPU"` to keep the GPU

@@ -1048,9 +1048,14 @@ pub(super) async fn threshold_search(
     };
     let current = current_thresholds(&cfg);
     let lookup = |m: &str| {
-        current
-            .get(&crate::registry::normalize_name(m))
-            .map(|t| *t as f32)
+        current.get(&crate::registry::normalize_name(m)).map(|t| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "a confidence threshold (0..1); f32 is the precision the models use"
+            )]
+            let t = *t as f32;
+            t
+        })
     };
     match crate::benchmark::search::search(&results, &preds, &req, &lookup) {
         Ok(out) if out.results.is_empty() => json_error(

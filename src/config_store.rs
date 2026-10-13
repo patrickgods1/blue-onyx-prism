@@ -83,6 +83,12 @@ struct Inner {
 /// Read access to the current config.
 pub struct ConfigRef<'a>(RwLockReadGuard<'a, Inner>);
 
+impl std::fmt::Debug for ConfigRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ConfigRef").field(&self.0.config).finish()
+    }
+}
+
 impl std::ops::Deref for ConfigRef<'_> {
     type Target = Config;
     fn deref(&self) -> &Config {
@@ -112,6 +118,23 @@ pub struct ConfigStore {
     inner: RwLock<Inner>,
 }
 
+impl std::fmt::Debug for ConfigStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigStore")
+            .field("path", &self.path)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Make the process-wide decode ceiling follow a config change (`max_image_pixels` applies at
+/// once). Only set when the value changed, so unrelated saves never touch the global.
+fn apply_max_pixels(before: &Config, after: &Config) {
+    if before.max_image_pixels != after.max_image_pixels {
+        crate::image::set_max_pixels(after.max_image_pixels);
+    }
+}
+
 impl ConfigStore {
     /// A store holding `config` (normalized, see [`Config::normalize`]) for the file at `path`.
     pub fn new(mut config: Config, path: PathBuf) -> Self {
@@ -119,7 +142,8 @@ impl ConfigStore {
         let disk = std::fs::read(&path).ok().and_then(|b| stamp_of(&path, &b));
         let epoch = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok())
             .unwrap_or(0);
         Self {
             path,
@@ -222,15 +246,21 @@ impl ConfigStore {
         inner.disk = Some(stamp);
         let parsed = std::str::from_utf8(&bytes)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .and_then(|t| serde_json::from_str::<Config>(t).map_err(Into::into));
-        match parsed {
-            Ok(mut c) => {
+            .and_then(|t| serde_json::from_str::<Config>(t).map_err(Into::into))
+            .and_then(|mut c| {
                 c.normalize();
+                // A file that fails validation is not adopted (the in-memory config stays).
+                c.validate()?;
+                Ok(c)
+            });
+        match parsed {
+            Ok(c) => {
                 inner.disk_error = None;
                 if c == inner.config {
                     return None;
                 }
                 let before = std::mem::replace(&mut inner.config, c);
+                apply_max_pixels(&before, &inner.config);
                 let rec = Self::record(inner, SOURCE_DISK, &before);
                 if let Some(r) = &rec {
                     tracing::info!(
@@ -284,6 +314,9 @@ impl ConfigStore {
         let value = edit(&mut new)?;
         new.normalize();
         let changed = new != before;
+        if changed {
+            new.validate()?;
+        }
         if changed || !self.path.exists() {
             new.save(&self.path)?;
             let bytes = std::fs::read(&self.path)
@@ -292,6 +325,7 @@ impl ConfigStore {
             g.disk_error = None;
         }
         g.config = new;
+        apply_max_pixels(&before, &g.config);
         let record = Self::record(&mut g, source, &before);
         if let Some(r) = &record {
             tracing::info!(
@@ -436,6 +470,36 @@ mod tests {
             [SOURCE_DISK, SOURCE_DISK, "config page"]
         );
         assert_eq!(s.revision(), 4);
+    }
+
+    #[test]
+    fn invalid_values_are_not_adopted() {
+        let path = tmp();
+        let s = ConfigStore::new(cfg(), path.clone());
+        s.update("test", |_| Ok(())).unwrap();
+        // A hand edit with an out-of-range value: reported, the in-memory config stays.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            "\"worker_queue_size\": 0",
+            "\"worker_queue_size\": 1000000000",
+        );
+        std::fs::write(&path, text).unwrap();
+        assert!(s.check_disk().is_none());
+        let err = s.disk_error().expect("disk error recorded");
+        assert!(err.contains("worker_queue_size"), "{err}");
+        assert_eq!(s.read().worker_queue_size, 0);
+        assert_eq!(s.revision(), 1);
+        // An edit that makes the config invalid is refused and changes nothing.
+        let path2 = tmp();
+        let s = ConfigStore::new(cfg(), path2);
+        assert!(
+            s.update("x", |c| {
+                c.nms_iou = 3.0;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(s.read().nms_iou, 0.5);
     }
 
     #[test]

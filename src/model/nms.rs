@@ -16,20 +16,23 @@ pub fn iou(a: &Detection, b: &Detection) -> f32 {
 
 /// Greedy NMS: sort by score (descending) and drop every box whose IoU with a higher-scoring
 /// kept box of the same class is `>= iou_threshold`. The result stays sorted by score.
+/// Detections with a non-finite coordinate or score are dropped first (they would otherwise
+/// sort to the top and suppress nothing, or be suppressed by nothing).
 pub fn nms(dets: &mut Vec<Detection>, iou_threshold: f32) {
+    super::retain_finite(dets);
     dets.sort_by(|a, b| b.score.total_cmp(&a.score));
     let n = dets.len();
     let mut suppressed = vec![false; n];
     for i in 0..n {
-        if suppressed[i] {
+        if suppressed.get(i).is_none_or(|&s| s) {
             continue;
         }
-        for j in (i + 1)..n {
-            if !suppressed[j]
-                && dets[j].class_id == dets[i].class_id
-                && iou(&dets[i], &dets[j]) >= iou_threshold
-            {
-                suppressed[j] = true;
+        let Some(a) = dets.get(i) else {
+            break;
+        };
+        for (b, flag) in dets.iter().zip(suppressed.iter_mut()).skip(i + 1) {
+            if !*flag && b.class_id == a.class_id && iou(a, b) >= iou_threshold {
+                *flag = true;
             }
         }
     }
@@ -105,5 +108,19 @@ mod tests {
         let mut v = vec![x, y];
         nms(&mut v, 0.33);
         assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn non_finite_dropped_before_suppression() {
+        let good = d(0.0, 0.0, 10.0, 10.0, 0.9, 0);
+        let mut v = vec![
+            d(f32::NAN, 0.0, 10.0, 10.0, 0.99, 0),
+            d(0.0, 0.0, 10.0, 10.0, f32::INFINITY, 0),
+            d(0.0, 0.0, 10.0, 10.0, f32::NAN, 0),
+            d(0.0, 0.0, f32::INFINITY, 10.0, 0.95, 0),
+            good.clone(),
+        ];
+        nms(&mut v, 0.5);
+        assert_eq!(v, vec![good]);
     }
 }

@@ -55,6 +55,7 @@ impl std::fmt::Debug for ProvisionOptions {
 }
 
 /// Owns the download manager (and the YOLO26 exporter) across registry generations.
+#[derive(Debug)]
 pub struct Provisioner {
     manager: std::sync::Mutex<Option<Arc<Manager>>>,
     exporter: std::sync::Mutex<Option<Arc<super::export::Exporter>>>,

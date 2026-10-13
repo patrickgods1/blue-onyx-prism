@@ -95,21 +95,36 @@ impl Stats {
         let mut s = samples.to_vec();
         s.sort_by(f64::total_cmp);
         Self {
-            min: s[0],
+            min: s.first().copied().unwrap_or(0.0),
             mean: s.iter().sum::<f64>() / s.len() as f64,
             p50: percentile(&s, 50.0),
             p95: percentile(&s, 95.0),
-            max: s[s.len() - 1],
+            max: s.last().copied().unwrap_or(0.0),
         }
     }
 }
 
 /// Nearest-rank percentile of an ascending slice: the smallest value with at least `p`% of the
-/// samples at or below it.
+/// samples at or below it. 0.0 for an empty slice (like `Stats::default`); a non-finite `p` is
+/// treated as 0 (the minimum).
 pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     let n = sorted.len();
-    let rank = ((p / 100.0) * n as f64).ceil() as usize;
-    sorted[rank.clamp(1, n) - 1]
+    if n == 0 {
+        return 0.0;
+    }
+    let raw = ((p / 100.0) * n as f64).ceil();
+    // `as usize` saturates (NaN -> 0); the clamp keeps the rank in 1..=n.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is clamped to 0..=n before the cast"
+    )]
+    let rank = if raw.is_finite() {
+        raw.clamp(0.0, n as f64) as usize
+    } else {
+        0
+    };
+    sorted.get(rank.clamp(1, n) - 1).copied().unwrap_or(0.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -148,6 +163,11 @@ impl From<&Prediction> for Detection {
 
 impl From<&ImagePred> for Detection {
     fn from(p: &ImagePred) -> Self {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to >= 0 (NaN -> 0 via f32::max); `as` saturates large values"
+        )]
         let c = |v: f32| v.max(0.0).round() as usize;
         Self {
             label: p.label.clone(),
@@ -244,14 +264,19 @@ impl Breakdown {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccuracyReport {
     /// "ground truth" or "relative to <reference>, not ground truth".
+    #[serde(default)]
     pub ground_truth: String,
+    #[serde(default)]
     pub relative: bool,
     /// Scored classes in the model's label space.
+    #[serde(default)]
     pub classes: Vec<String>,
     /// Confidence threshold of precision / recall / F1.
     pub threshold: f32,
     pub overall: Summary,
+    #[serde(default)]
     pub by_dataset: Vec<Breakdown>,
+    #[serde(default)]
     pub by_tag: Vec<Breakdown>,
     /// AP over every class of the model (not only the CCTV ones), same images; None when the
     /// model has no other classes.
@@ -344,35 +369,51 @@ pub(crate) fn eval_input(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResult {
     pub model: String,
+    #[serde(default)]
     pub path: String,
+    #[serde(default)]
     pub family: String,
+    #[serde(default)]
     pub requested_device: String,
     /// Runtime device ("CPU", "GPU.0" for OpenVINO; "CoreML", ... for ONNX Runtime).
     pub device: String,
+    #[serde(default)]
     pub device_name: String,
     /// Canonical spec of the device that ran ("openvino:cpu", "ort:coreml").
     #[serde(default)]
     pub spec: String,
+    #[serde(default)]
     pub fell_back: bool,
+    #[serde(default)]
     pub input: String,
     /// Dataset ids (comma separated) or the image file.
+    #[serde(default)]
     pub image: String,
     /// "WxH" of a single image, else "N images".
+    #[serde(default)]
     pub image_size: String,
     #[serde(default)]
     pub images: usize,
     /// read + reshape + compile + request creation wall time.
+    #[serde(default)]
     pub compile_ms: f64,
     /// "disabled", "hit" (no new cache file written), "miss" (a blob was written) or "unknown".
+    #[serde(default)]
     pub cache: String,
+    #[serde(default)]
     pub warmup_iterations: usize,
+    #[serde(default)]
     pub warmup_ms: f64,
     /// Timed runs per image.
+    #[serde(default)]
     pub repeat: usize,
+    #[serde(default)]
     pub stages_ms: StageStats,
     /// Sequential requests per second over the timed loop (1 concurrent client).
+    #[serde(default)]
     pub throughput_fps: f64,
     /// Detections of the first image.
+    #[serde(default)]
     pub detections: Vec<Detection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub by_resolution: Vec<BucketSpeed>,
@@ -450,6 +491,10 @@ pub fn compare(primary: &[Detection], cpu: &[Detection], min_iou: f32) -> Compar
     let mut used_a = vec![false; primary.len()];
     let mut used_b = vec![false; cpu.len()];
     let mut diffs = Vec::new();
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "i < primary.len() and j < cpu.len(): both come from enumerate() above"
+    )]
     for (_, i, j) in pairs {
         if !used_a[i] && !used_b[j] {
             used_a[i] = true;
@@ -703,6 +748,24 @@ pub struct Bench<'a> {
     pub accuracy_metric: grade::AccuracyMetric,
 }
 
+impl std::fmt::Debug for Bench<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bench")
+            .field("sets", &self.sets.len())
+            .field("warmup", &self.warmup)
+            .field("repeat", &self.repeat)
+            .field("params", &self.params)
+            .field("object_filter", &self.object_filter)
+            .field("cache_dir", &self.cache_dir)
+            .field("cancel", &self.cancel)
+            .field("progress", &self.progress.is_some())
+            .field("weights", &self.weights)
+            .field("threshold_objective", &self.threshold_objective)
+            .field("accuracy_metric", &self.accuracy_metric)
+            .finish()
+    }
+}
+
 /// One request's timings (decode, preprocess, infer, postprocess; ms).
 struct Sample {
     stages: [f64; 4],
@@ -944,10 +1007,9 @@ impl<'a> Bench<'a> {
             fell_back: dev.fell_back,
             input: format!("{in_w}x{in_h}"),
             image: self.describe_sets(),
-            image_size: if all.len() == 1 {
-                format!("{}x{}", all[0].1.width, all[0].1.height)
-            } else {
-                format!("{} images", all.len())
+            image_size: match all.as_slice() {
+                [(_, one)] => format!("{}x{}", one.width, one.height),
+                _ => format!("{} images", all.len()),
             },
             images: all.len(),
             compile_ms,
@@ -996,7 +1058,7 @@ impl<'a> Bench<'a> {
         let t = Instant::now();
         self.report(job, requested, Phase::Warmup, 0, self.warmup, "");
         if self.warmup > 0 {
-            let first = all[0].1.bytes()?;
+            let first = all.first().context("no benchmark images")?.1.bytes()?;
             for i in 0..self.warmup {
                 self.check_cancel()?;
                 pipe.run(&first, false).context("warm-up inference")?;
@@ -1016,7 +1078,7 @@ impl<'a> Bench<'a> {
         pipe: &mut Pipeline,
         repeat: usize,
     ) -> Result<Timings> {
-        let total_iters = all.len() * repeat;
+        let total_iters = all.len().saturating_mul(repeat);
         let mut timed = Timings {
             samples: Default::default(),
             by_res: BTreeMap::new(),
@@ -1029,8 +1091,9 @@ impl<'a> Bench<'a> {
         self.report(job, requested, Phase::Timing, 0, total_iters, "");
         for (set, img) in all {
             let bytes = img.bytes()?;
-            let mut totals = Vec::with_capacity(repeat);
-            let mut infers = Vec::with_capacity(repeat);
+            // Not pre-sized by `repeat`: the CLI and service bound it, but stay safe regardless.
+            let mut totals = Vec::new();
+            let mut infers = Vec::new();
             let mut last: Option<Sample> = None;
             let bucket = img.resolution();
             for r in 0..repeat {
@@ -1048,7 +1111,7 @@ impl<'a> Bench<'a> {
                 self.report(job, requested, Phase::Timing, done, total_iters, &img.file);
             }
             timed.by_res.entry(bucket).or_default().1 += 1;
-            let last = last.expect("repeat >= 1");
+            let last = last.context("no timed run (repeat must be >= 1)")?;
             let (run, eval) = image_run(set, img, &last, &totals, &infers);
             timed.eval_preds.push(eval);
             timed.per_image.push(run);
@@ -1123,8 +1186,8 @@ impl Timings {
     /// Add one run's stage timings (overall and to its resolution bucket); returns its total.
     fn record(&mut self, bucket: &'static str, sample: &Sample) -> f64 {
         let total: f64 = sample.stages.iter().sum();
-        for (k, v) in sample.stages.iter().enumerate() {
-            self.samples[k].push(*v);
+        for (dst, v) in self.samples.iter_mut().zip(sample.stages) {
+            dst.push(v);
         }
         self.samples[4].push(total);
         let e = self.by_res.entry(bucket).or_default();
@@ -1232,13 +1295,15 @@ fn score(
     // Per image: the classes its dataset annotates (frame samples).
     let mut fclasses: Vec<Vec<String>> = Vec::with_capacity(all.len());
     for (k, (set, img)) in all.iter().enumerate() {
-        let Some(gt) = &img.gt else {
+        // `per_image` and `eval_preds` are parallel to `all`; a missing entry scores as
+        // "no ground truth" rather than panicking.
+        let (Some(gt), Some(preds), Some(run)) = (&img.gt, eval_preds.get(k), per_image.get_mut(k))
+        else {
             evals.push(None);
             fclasses.push(Vec::new());
             continue;
         };
-        let (eval, classes) =
-            score_image(&map, set, gt, &eval_preds[k], &mut per_image[k], threshold);
+        let (eval, classes) = score_image(&map, set, gt, preds, run, threshold);
         fclasses.push(classes);
         evals.push(Some(eval));
     }
@@ -1265,7 +1330,8 @@ fn score(
     // Per tag, over the images of the overall score.
     let mut tags: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for &k in chosen {
-        for t in &all[k].1.tags {
+        let Some((_, img)) = all.get(k) else { continue };
+        for t in &img.tags {
             tags.entry(t.as_str()).or_default().push(k);
         }
     }
@@ -1336,14 +1402,17 @@ fn score_image(
     let preds: Vec<PredBox> = scored.iter().map(|(_, p)| p.clone()).collect();
     let m = metrics::match_image(&preds, &gt_list, 0.5);
     for ((i, _), r) in scored.iter().zip(&m.pred) {
-        run.preds[*i].tp = *r;
+        if let Some(p) = run.preds.get_mut(*i) {
+            p.tp = *r;
+        }
     }
     let mut j = 0;
     run.gt_matched = mapped
         .iter()
         .map(|g| match g {
             Some(g) => {
-                let hit = m.gt_matched[j];
+                // One `gt_matched` entry per mapped ground-truth box, in order.
+                let hit = m.gt_matched.get(j).copied().unwrap_or_default();
                 j += 1;
                 (!g.ignore).then_some(hit)
             }
@@ -1370,16 +1439,10 @@ fn all_classes_ap(
             .chosen
             .iter()
             .filter_map(|&k| {
-                let gt = all[k].1.gt.as_ref()?;
-                Some(
-                    eval_input(
-                        &all_map,
-                        all[k].0.scored_labels.as_deref(),
-                        gt,
-                        &eval_preds[k],
-                    )
-                    .1,
-                )
+                let (set, img) = all.get(k)?;
+                let gt = img.gt.as_ref()?;
+                let preds = eval_preds.get(k)?;
+                Some(eval_input(&all_map, set.scored_labels.as_deref(), gt, preds).1)
             })
             .collect();
         let s = metrics::evaluate(&imgs, &all_map.classes, threshold);
@@ -1429,13 +1492,21 @@ impl<'a> Scored<'a> {
         evals: Vec<Option<EvalImage>>,
         frame_classes: Vec<Vec<String>>,
     ) -> Self {
-        let real: Vec<usize> = (0..all.len())
-            .filter(|&k| evals[k].is_some() && all[k].0.ground_truth.is_real())
+        let real: Vec<usize> = all
+            .iter()
+            .zip(&evals)
+            .enumerate()
+            .filter(|(_, ((s, _), e))| e.is_some() && s.ground_truth.is_real())
+            .map(|(k, _)| k)
             .collect();
         let (chosen, relative) = if real.is_empty() {
             (
-                (0..all.len())
-                    .filter(|&k| evals[k].is_some())
+                evals
+                    .iter()
+                    .take(all.len())
+                    .enumerate()
+                    .filter(|(_, e)| e.is_some())
+                    .map(|(k, _)| k)
                     .collect::<Vec<_>>(),
                 true,
             )
@@ -1459,13 +1530,15 @@ impl<'a> Scored<'a> {
 
     /// The eval inputs of the images `ks` (scored ones only).
     fn subset(&self, ks: &[usize]) -> Vec<EvalImage> {
-        ks.iter().filter_map(|&k| self.evals[k].clone()).collect()
+        ks.iter()
+            .filter_map(|&k| self.evals.get(k).cloned().flatten())
+            .collect()
     }
 
     /// Frame ROC over the frame samples of the images `ks`.
     fn frame_roc(&self, ks: &[usize], classes: &[String], curve: usize) -> roc::FrameRoc {
         roc::FrameRoc::of(
-            ks.iter().flat_map(|&k| self.frames[k].iter()),
+            ks.iter().filter_map(|&k| self.frames.get(k)).flatten(),
             classes,
             curve,
         )
@@ -1481,8 +1554,12 @@ impl<'a> Scored<'a> {
                 continue;
             }
             seen.push(&s.id);
-            let ks: Vec<usize> = (0..all.len())
-                .filter(|&k| all[k].0.id == s.id && self.evals[k].is_some())
+            let ks: Vec<usize> = all
+                .iter()
+                .zip(&self.evals)
+                .enumerate()
+                .filter(|(_, ((t, _), e))| t.id == s.id && e.is_some())
+                .map(|(k, _)| k)
                 .collect();
             if !ks.is_empty() {
                 out.push((*s, ks));
@@ -1522,7 +1599,10 @@ impl<'a> Scored<'a> {
             let ks: Vec<usize> = chosen
                 .iter()
                 .copied()
-                .filter(|&k| all[k].1.tags.iter().any(|t| t == tag))
+                .filter(|&k| {
+                    all.get(k)
+                        .is_some_and(|(_, i)| i.tags.iter().any(|t| t == tag))
+                })
                 .collect();
             if !ks.is_empty() {
                 by_tag.push(curves.curve(tag, &ks, SweepScope::All, relative));
@@ -1578,7 +1658,7 @@ impl CurveMaker<'_> {
     /// The sweep inputs of the scored images among `ks`.
     fn images(&self, ks: &[usize]) -> Vec<&metrics::SweepImage> {
         ks.iter()
-            .filter_map(|&k| self.matched[k].as_ref())
+            .filter_map(|&k| self.matched.get(k).and_then(Option::as_ref))
             .collect()
     }
 
@@ -1640,11 +1720,10 @@ pub fn pseudo_ground_truth(
     device: Device,
     sets: &mut [ImageSet],
 ) -> Result<Option<String>> {
-    let todo: Vec<usize> = (0..sets.len()).filter(|&i| !sets[i].annotated()).collect();
-    if todo.is_empty() {
+    let subset: Vec<ImageSet> = sets.iter().filter(|s| !s.annotated()).cloned().collect();
+    if subset.is_empty() {
         return Ok(None);
     }
-    let subset: Vec<ImageSet> = todo.iter().map(|&i| sets[i].clone()).collect();
     let mut job = reference.clone();
     job.confidence_threshold = Some(PSEUDO_IGNORE_CONFIDENCE);
     job.object_filter = Some(Vec::new());
@@ -1668,11 +1747,13 @@ pub fn pseudo_ground_truth(
         .run_exact(runtimes, &job, device)
         .with_context(|| format!("pseudo ground truth with {} on {device}", job.name))?;
     let desc = format!("{} on {device}", job.name);
-    let mut k = 0;
-    for &i in &todo {
-        for img in &mut sets[i].images {
-            let r = &run.per_image[k];
-            k += 1;
+    // `run.per_image` holds one entry per image of `subset`, in order.
+    let mut runs = run.per_image.iter();
+    for set in sets.iter_mut().filter(|s| !s.annotated()) {
+        for img in &mut set.images {
+            let r = runs
+                .next()
+                .context("pseudo ground truth run returned fewer images than requested")?;
             img.gt = Some(
                 r.preds
                     .iter()
@@ -1684,7 +1765,7 @@ pub fn pseudo_ground_truth(
                     .collect(),
             );
         }
-        sets[i].ground_truth = GroundTruth::Pseudo(desc.clone());
+        set.ground_truth = GroundTruth::Pseudo(desc.clone());
     }
     Ok(Some(desc))
 }
@@ -1785,9 +1866,13 @@ pub fn sweep(
         }
         Some(devices) => {
             for d in devices {
-                match selection.options.iter().position(|o| o.spec == *d) {
-                    Some(i) => {
-                        let o = &selection.options[i];
+                match selection
+                    .options
+                    .iter()
+                    .enumerate()
+                    .find(|(_, o)| o.spec == *d)
+                {
+                    Some((i, o)) => {
                         let why = (!o.runnable)
                             .then(|| o.reason.clone().unwrap_or_else(|| "not runnable".into()));
                         planned.push((i, o.spec, o.label.clone(), why));
@@ -1808,13 +1893,16 @@ pub fn sweep(
     order.sort_by_key(|&k| {
         REFERENCE_DEVICES
             .iter()
-            .position(|r| *r == planned[k].1)
+            .position(|r| planned.get(k).is_some_and(|p| *r == p.1))
             .unwrap_or(REFERENCE_DEVICES.len())
     });
 
     let mut slots: Vec<Option<DeviceResult>> = vec![None; planned.len()];
     for k in order {
-        let (_, device, label, why) = &planned[k];
+        // `order` is a permutation of 0..planned.len() and `slots` has the same length.
+        let (Some((_, device, label, why)), true) = (planned.get(k), k < slots.len()) else {
+            continue;
+        };
         let entry = match why {
             Some(reason) => DeviceResult::failed(device, label, reason.clone()),
             None => match bench.run_exact(runtimes, job, *device) {
@@ -1826,7 +1914,9 @@ pub fn sweep(
                 }
             },
         };
-        slots[k] = Some(entry);
+        if let Some(slot) = slots.get_mut(k) {
+            *slot = Some(entry);
+        }
         result.devices = slots.iter().flatten().cloned().collect();
         result.finish();
         on_device(&result);
@@ -1849,6 +1939,17 @@ mod tests {
             x_max: b[2],
             y_max: b[3],
         }
+    }
+
+    #[test]
+    fn stats_helpers_handle_empty_and_nan() {
+        assert_eq!(percentile(&[], 50.0), 0.0);
+        assert_eq!(percentile(&[1.0, 2.0], f64::NAN), 1.0);
+        assert_eq!(percentile(&[1.0, 2.0], 1e9), 2.0);
+        assert_eq!(percentile(&[1.0, 2.0], -5.0), 1.0);
+        assert_eq!(Stats::from_samples(&[]), Stats::default());
+        let s = Stats::from_samples(&[3.0, 1.0, 2.0]);
+        assert_eq!((s.min, s.p50, s.max), (1.0, 2.0, 3.0));
     }
 
     #[test]

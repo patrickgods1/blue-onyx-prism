@@ -773,13 +773,23 @@ macro_rules! wheel {
 /// Last path segment of a URL (const, for the wheel table).
 const fn wheel_file_name(url: &'static str) -> &'static str {
     let bytes = url.as_bytes();
-    let mut i = bytes.len();
-    while i > 0 && bytes[i - 1] != b'/' {
-        i -= 1;
+    let mut head = bytes;
+    while let [rest @ .., last] = head {
+        if *last == b'/' {
+            break;
+        }
+        head = rest;
     }
-    let (_, tail) = bytes.split_at(i);
+    let (_, tail) = bytes.split_at(head.len());
     match std::str::from_utf8(tail) {
         Ok(s) => s,
+        // Evaluated at compile time for the static wheel table, so this can only ever be a
+        // build error, never a runtime panic.
+        #[allow(
+            clippy::panic,
+            reason = "invariant: tail starts after an ASCII '/' (or at 0) of a &str, so it is \
+                      always valid UTF-8; const fn cannot return an error"
+        )]
         Err(_) => panic!("URL is not UTF-8"),
     }
 }

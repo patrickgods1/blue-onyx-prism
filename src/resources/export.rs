@@ -464,7 +464,7 @@ impl Stage {
     pub fn overall(self, pct: Option<u8>) -> u8 {
         let (a, b) = self.span();
         let p = u32::from(pct.unwrap_or(0).min(100));
-        a + ((u32::from(b - a) * p) / 100) as u8
+        a + u8::try_from((u32::from(b - a) * p) / 100).unwrap_or(b - a)
     }
 }
 
@@ -721,6 +721,7 @@ fn strip_ansi(text: &str) -> String {
 
 /// Verified downloads through the shared [`Manager`] (same queue, lock, resume and SHA-256 checks
 /// as every other download).
+#[derive(Debug)]
 pub struct ManagerFetcher {
     manager: Arc<Manager>,
 }
@@ -842,9 +843,10 @@ impl PackagesProgress {
     }
 
     fn percent(&self) -> u8 {
-        (self.downloaded.min(self.downloading) * 85)
+        let p = (self.downloaded.min(self.downloading).saturating_mul(85))
             .checked_div(self.downloading)
-            .unwrap_or(0) as u8
+            .unwrap_or(0);
+        u8::try_from(p).unwrap_or(85)
     }
 }
 
@@ -948,7 +950,7 @@ fn run_stages(
             uv_res,
             &p.uv_dir,
             &mut |b, t| {
-                let pct = (b * 100).checked_div(t).unwrap_or(0) as u8;
+                let pct = manager::percent(b, t);
                 let d = format!("{} of {} MB", mb(b), mb(t));
                 report(Progress::Stage {
                     stage: Stage::Uv,
@@ -1087,11 +1089,7 @@ fn run_stages(
         let mut done = 0u64;
         for (r, dir) in missing {
             let label = r.parts.first().map_or(r.title, |p| p.file_name);
-            enter!(
-                Stage::Weights,
-                Some((done * 100).checked_div(total).unwrap_or(0) as u8),
-                label
-            );
+            enter!(Stage::Weights, Some(manager::percent(done, total)), label);
             fetcher.fetch(
                 r,
                 dir,
@@ -1206,7 +1204,7 @@ fn run_stages(
             });
             lines += 1;
             // No real progress from the exporters: creep towards 90% with the output.
-            let pct = (lines.min(45) * 2) as u8;
+            let pct = u8::try_from(lines.min(45) * 2).unwrap_or(90);
             report(Progress::Stage {
                 stage: Stage::Export,
                 percent: Some(pct),
@@ -1423,7 +1421,18 @@ pub struct Exporter {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+impl std::fmt::Debug for Exporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Exporter").finish_non_exhaustive()
+    }
+}
+
 impl Exporter {
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant: the OS can create one more thread at startup; without it the \
+                  process cannot work at all, so failing to spawn is a controlled abort"
+    )]
     pub fn start(runner: Arc<dyn CommandRunner>, fetcher: Arc<dyn Fetcher>) -> Self {
         let shared = Arc::new(Shared {
             runner,
@@ -1439,7 +1448,7 @@ impl Exporter {
         let thread = std::thread::Builder::new()
             .name("model-export".into())
             .spawn(move || worker_loop(&worker, &rx))
-            .expect("spawning the export thread");
+            .expect("spawning the export thread (OS thread limit or out of memory)");
         Self {
             shared,
             tx,

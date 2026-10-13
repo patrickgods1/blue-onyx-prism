@@ -299,8 +299,7 @@ fn xml_without_onnx_needs_export() {
         };
         let err = rt
             .compile(&cand, &req(&path, "ort:cpu"))
-            .err()
-            .expect("needs .onnx");
+            .expect_err("needs .onnx");
         assert!(format!("{err:#}").contains("needs ONNX export"), "{err:#}");
     });
 }

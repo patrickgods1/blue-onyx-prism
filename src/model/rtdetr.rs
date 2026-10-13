@@ -10,9 +10,10 @@ use anyhow::Result;
 use super::yolo26::meets;
 use super::{
     Detection, ExtraData, ExtraInput, Family, ModelFamilyKind, NamedOutput, PostParams,
-    PreprocessCtx, ResizeMode,
+    PreprocessCtx, ResizeMode, retain_finite,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtDetr {
     pub num_classes: usize,
 }
@@ -37,19 +38,15 @@ fn find<'a>(outputs: &'a [NamedOutput], name: &str) -> Result<&'a NamedOutput> {
 
 /// Number of queries for `[1, N, ..tail]` or `[N, ..tail]`.
 fn queries(out: &NamedOutput, tail: &[usize], expected: &str) -> Result<usize> {
-    let s = out.shape.as_slice();
-    let n = if s.len() == tail.len() + 2 && s[0] == 1 && s[2..] == *tail {
-        s[1]
-    } else if s.len() == tail.len() + 1 && s[1..] == *tail {
-        s[0]
-    } else {
-        anyhow::bail!(
+    match out.shape.as_slice() {
+        [1, n, rest @ ..] if rest == tail => Ok(*n),
+        [n, rest @ ..] if rest == tail => Ok(*n),
+        _ => anyhow::bail!(
             "rtdetr: output `{}` has shape {:?}, expected {expected}",
             out.name,
             out.shape
-        );
-    };
-    Ok(n)
+        ),
+    }
 }
 
 impl Family for RtDetr {
@@ -63,7 +60,7 @@ impl Family for RtDetr {
         vec![ExtraInput {
             name: "orig_target_sizes".into(),
             shape: vec![1, 2],
-            data: ExtraData::I64(vec![ctx.input_w as i64, ctx.input_h as i64]),
+            data: ExtraData::I64(vec![i64::from(ctx.input_w), i64::from(ctx.input_h)]),
         }]
     }
     fn postprocess(
@@ -99,7 +96,7 @@ impl Family for RtDetr {
         let scores = scores_o
             .as_f32()
             .ok_or_else(|| anyhow::anyhow!("rtdetr: output `scores` must be f32"))?;
-        if labels.len() != n || boxes.len() != 4 * n || scores.len() != n {
+        if labels.len() != n || Some(boxes.len()) != n.checked_mul(4) || scores.len() != n {
             anyhow::bail!(
                 "rtdetr: buffer lengths (labels {}, boxes {}, scores {}) do not match shapes {:?} {:?} {:?}",
                 labels.len(),
@@ -112,22 +109,26 @@ impl Family for RtDetr {
         }
 
         let mut dets = Vec::new();
-        for i in 0..n {
-            let score = scores[i];
-            if !meets(score, params.confidence_threshold) || labels[i] < 0 {
+        let rows = scores.iter().zip(labels).zip(boxes.as_chunks::<4>().0);
+        for ((&score, &label), &[bx1, by1, bx2, by2]) in rows {
+            if !meets(score, params.confidence_threshold) {
                 continue;
             }
-            let b = &boxes[4 * i..4 * i + 4];
-            let (x1, y1, x2, y2) = ctx.to_original(b[0], b[1], b[2], b[3]);
+            // Negative labels (padding) and absurd ones are skipped.
+            let Some(class_id) = usize::try_from(label).ok().filter(|&c| c <= 1_000_000) else {
+                continue;
+            };
+            let (x1, y1, x2, y2) = ctx.to_original(bx1, by1, bx2, by2);
             dets.push(Detection {
                 x1,
                 y1,
                 x2,
                 y2,
                 score,
-                class_id: labels[i] as usize,
+                class_id,
             });
         }
+        retain_finite(&mut dets);
         Ok(dets)
     }
 }

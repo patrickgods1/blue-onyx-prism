@@ -105,7 +105,10 @@ pub fn agreement(device: &[Detection], reference: &[Detection], reference_spec: 
 /// Agreement of `device`'s detections with `reference`'s over every image both ran.
 pub fn run_agreement(device: &RunResult, reference: &RunResult, reference_spec: &str) -> Agreement {
     let dets = |r: &RunResult, k: usize| -> Vec<Detection> {
-        r.per_image[k].preds.iter().map(Detection::from).collect()
+        r.per_image
+            .get(k)
+            .map(|i| i.preds.iter().map(Detection::from).collect())
+            .unwrap_or_default()
     };
     if device.per_image.is_empty() || device.per_image.len() != reference.per_image.len() {
         return agreement(&device.detections, &reference.detections, reference_spec);
@@ -406,19 +409,25 @@ pub fn recommend(
 pub struct ModelResult {
     /// Model name (config `name` / file stem).
     pub model: String,
+    #[serde(default)]
     pub path: String,
     /// Configured family ("auto" when detected at load time; each run reports the actual one).
+    #[serde(default)]
     pub family: String,
     /// RFC 3339 time the sweep started.
+    #[serde(default)]
     pub timestamp: String,
     /// Dataset ids, comma separated.
+    #[serde(default)]
     pub image: String,
     /// Dataset ids.
     #[serde(default)]
     pub datasets: Vec<String>,
     #[serde(default)]
     pub images: usize,
+    #[serde(default)]
     pub warmup: usize,
+    #[serde(default)]
     pub repeat: usize,
     /// Device the model was configured to run on at benchmark time.
     #[serde(default)]
@@ -426,6 +435,7 @@ pub struct ModelResult {
     /// Device whose detections the others were compared with.
     #[serde(default)]
     pub reference: Option<String>,
+    #[serde(default)]
     pub devices: Vec<DeviceResult>,
     /// Options not tried because they cannot run here (sweeps over every runnable option).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -580,9 +590,13 @@ impl ModelResult {
 /// Host facts recorded with the results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardwareSummary {
+    #[serde(default)]
     pub os: String,
+    #[serde(default)]
     pub arch: String,
+    #[serde(default)]
     pub cpu: String,
+    #[serde(default)]
     pub gpus: Vec<String>,
 }
 
@@ -651,6 +665,7 @@ pub struct ImageInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageSetInfo {
     pub id: String,
+    #[serde(default)]
     pub title: String,
     pub kind: SetKind,
     /// Directory of the images (None for the embedded sample).
@@ -730,11 +745,16 @@ pub struct RankRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkResults {
     /// Blue Onyx Prism version that wrote the file.
+    #[serde(default)]
     pub version: String,
     /// RFC 3339 time of the last update.
+    #[serde(default)]
     pub timestamp: String,
+    #[serde(default)]
     pub hardware: HardwareSummary,
+    #[serde(default)]
     pub runtimes: RuntimeVersions,
+    #[serde(default)]
     pub models: Vec<ModelResult>,
     /// Datasets the models were run on (images, tags, ground truth).
     #[serde(default)]
@@ -747,6 +767,105 @@ fn wanted(only: Option<&[String]>, name: &str) -> bool {
         o.iter()
             .any(|n| crate::registry::normalize_name(n) == crate::registry::normalize_name(name))
     })
+}
+
+/// The text of `path`; None when it does not exist.
+pub(crate) fn read_if_exists(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Parse the JSON object `text` (the file `path`) as `T` with its array field `list` taken
+/// out and deserialized entry by entry as `E`. Entries that fail are dropped with a warning
+/// naming the file and the entry (its `model` and `device` when present, else its position).
+pub(crate) fn parse_lenient<T, E>(
+    text: &str,
+    list: &str,
+    path: &Path,
+) -> Result<(T, Vec<E>, Vec<String>)>
+where
+    T: serde::de::DeserializeOwned,
+    E: serde::de::DeserializeOwned,
+{
+    let ctx = || format!("parsing {}", path.display());
+    let mut v: serde_json::Value = serde_json::from_str(text).with_context(ctx)?;
+    let obj = v
+        .as_object_mut()
+        .with_context(|| format!("parsing {}: not a JSON object", path.display()))?;
+    let entries = match obj.remove(list) {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(a)) => a,
+        Some(_) => anyhow::bail!("parsing {}: `{list}` is not a list", path.display()),
+    };
+    let head: T = serde_json::from_value(v).with_context(ctx)?;
+    let mut items = Vec::with_capacity(entries.len());
+    let mut warnings = Vec::new();
+    for (i, e) in entries.into_iter().enumerate() {
+        let field = |k: &str| e.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        let name = match (field("model"), field("device")) {
+            (Some(m), Some(d)) => format!("#{} ('{m}' on {d})", i + 1),
+            (Some(m), None) => format!("#{} ('{m}')", i + 1),
+            _ => format!("#{}", i + 1),
+        };
+        match serde_json::from_value::<E>(e) {
+            Ok(x) => items.push(x),
+            Err(err) => warnings.push(format!(
+                "{}: dropped `{list}` entry {name}, which does not load: {err}",
+                path.display()
+            )),
+        }
+    }
+    Ok((head, items, warnings))
+}
+
+/// Rename `path` aside to `<name>.bad-<YYYYmmddTHHMMSS>` (local time) in the same directory;
+/// returns the new path.
+pub(crate) fn move_aside(path: &Path) -> Result<PathBuf> {
+    let ts = chrono::Local::now().format("%Y%m%dT%H%M%S");
+    let mut name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?
+        .to_os_string();
+    name.push(format!(".bad-{ts}"));
+    let dest = path.with_file_name(name);
+    std::fs::rename(path, &dest)
+        .with_context(|| format!("renaming {} to {}", path.display(), dest.display()))?;
+    Ok(dest)
+}
+
+/// `load(path)`, and when the file exists but does not load: rename it aside with a warning
+/// (logged and returned) and continue without it. Errors when the rename fails, so the caller
+/// does not overwrite the file.
+pub(crate) fn load_or_move_aside<T>(
+    path: &Path,
+    load: impl Fn(&Path) -> Result<(Option<T>, Vec<String>)>,
+) -> Result<(Option<T>, Vec<String>)> {
+    match load(path) {
+        Ok((v, warnings)) => {
+            for w in &warnings {
+                tracing::warn!("{w}");
+            }
+            Ok((v, warnings))
+        }
+        Err(e) => {
+            let dest = move_aside(path).with_context(|| {
+                format!(
+                    "{} does not load ({e:#}) and could not be moved aside; not overwriting it",
+                    path.display()
+                )
+            })?;
+            let w = format!(
+                "{} does not load ({e:#}); moved it aside to {} and started a new file",
+                path.display(),
+                dest.display()
+            );
+            tracing::warn!("{w}");
+            Ok((None, vec![w]))
+        }
+    }
 }
 
 fn now() -> String {
@@ -869,16 +988,34 @@ impl BenchmarkResults {
         r
     }
 
-    /// The file at `path`; None when it does not exist.
+    /// The file at `path`; None when it does not exist. Model entries that do not load are
+    /// dropped (logged); see [`Self::load_with_warnings`].
     pub fn load(path: &Path) -> Result<Option<Self>> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        let (r, warnings) = Self::load_with_warnings(path)?;
+        for w in warnings {
+            tracing::warn!("{w}");
+        }
+        Ok(r)
+    }
+
+    /// [`Self::load`] returning the warnings instead of logging them: the `models` list is
+    /// deserialized entry by entry, so one bad entry drops only that entry (with a warning
+    /// naming it). An unreadable or unparsable file is an error.
+    pub fn load_with_warnings(path: &Path) -> Result<(Option<Self>, Vec<String>)> {
+        let Some(text) = read_if_exists(path)? else {
+            return Ok((None, Vec::new()));
         };
-        serde_json::from_str(&text)
-            .map(Some)
-            .with_context(|| format!("parsing {}", path.display()))
+        let (mut r, models, warnings) = parse_lenient::<Self, ModelResult>(&text, "models", path)?;
+        r.models = models;
+        Ok((Some(r), warnings))
+    }
+
+    /// The previous results to merge a new run into before saving: like
+    /// [`Self::load_with_warnings`], but a file that exists and does not load is renamed aside
+    /// ([`move_aside`]) with a warning instead of being overwritten by the next save. Errors
+    /// only when that rename fails (the caller must then not save).
+    pub fn load_for_merge(path: &Path) -> Result<(Option<Self>, Vec<String>)> {
+        load_or_move_aside(path, Self::load_with_warnings)
     }
 
     /// [`Self::load`], logging (not returning) errors.
@@ -1327,6 +1464,64 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert!(BenchmarkResults::load(&path).is_err());
         assert!(BenchmarkResults::load_or_warn(&path).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unloadable_results_are_moved_aside_and_bad_entries_dropped() {
+        let dir = std::env::temp_dir().join(format!("bop-bench-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RESULTS_FILE);
+        let mut a = model(vec![dev("openvino:cpu", 37.0, scene())], None);
+        a.model = "IPcam-general".into();
+        let mut b = model(vec![dev("ort:cpu", 44.0, scene())], None);
+        b.model = "dfine-s".into();
+        let r = BenchmarkResults::new(
+            HardwareSummary::default(),
+            RuntimeVersions::default(),
+            vec![a.clone(), b],
+        );
+        r.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        // One bad entry (devices is not a list): only that entry is dropped, with a warning.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["models"][1]["devices"] = serde_json::json!("oops");
+        std::fs::write(&path, v.to_string()).unwrap();
+        let (back, warnings) = BenchmarkResults::load_for_merge(&path).unwrap();
+        let back = back.unwrap();
+        assert_eq!(back.models, vec![a.clone()]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("dfine-s"), "{}", warnings[0]);
+        assert!(path.is_file(), "a partly bad file is not moved");
+
+        // Missing optional fields load (older/newer writers).
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["models"][0]["devices"][0]["run"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache");
+        v.as_object_mut().unwrap().remove("timestamp");
+        std::fs::write(&path, v.to_string()).unwrap();
+        let (back, warnings) = BenchmarkResults::load_with_warnings(&path).unwrap();
+        assert_eq!(back.unwrap().models.len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Truncated: moved aside to `benchmark.json.bad-<ts>`, with a warning naming it.
+        std::fs::write(&path, &text[..text.len() / 2]).unwrap();
+        let (back, warnings) = BenchmarkResults::load_for_merge(&path).unwrap();
+        assert!(back.is_none());
+        assert!(!path.exists());
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&format!("{RESULTS_FILE}.bad-")))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(aside[0].len(), RESULTS_FILE.len() + ".bad-".len() + 15);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(&aside[0]), "{}", warnings[0]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

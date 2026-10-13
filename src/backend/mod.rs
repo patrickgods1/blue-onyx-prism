@@ -48,6 +48,7 @@ use crate::profile::{DeviceClass, DeviceTuning, PerfHint};
 use anyhow::Result;
 use spec::Device;
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Options applied once per runtime.
@@ -128,6 +129,15 @@ pub struct OvCore {
     core: openvino::Core,
     opts: CoreOptions,
     available: Vec<String>,
+}
+
+impl fmt::Debug for OvCore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OvCore")
+            .field("opts", &self.opts)
+            .field("available", &self.available)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OvCore {
@@ -246,6 +256,27 @@ pub struct OvBackend {
     pub(crate) _compiled: openvino::CompiledModel,
 }
 
+impl fmt::Debug for OvCompiled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OvCompiled")
+            .field("info", &self.info)
+            .field("tuning", &self.tuning)
+            .field("streams", &self.streams)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for OvBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OvBackend")
+            .field("info", &self.info)
+            .field("slots", &self.slots.len())
+            .field("tuning", &self.tuning)
+            .field("streams", &self.streams)
+            .finish_non_exhaustive()
+    }
+}
+
 impl OvBackend {
     pub fn new(model: OvCompiled) -> Result<Self> {
         device::create_backend(model)
@@ -286,6 +317,7 @@ impl Drop for OvBackend {
 }
 
 /// A compiled model of any runtime, before its inference request exists. `Send`.
+#[derive(Debug)]
 pub enum Compiled {
     OpenVino(OvCompiled),
     #[cfg(feature = "onnxruntime")]
@@ -314,6 +346,7 @@ impl Compiled {
 /// Inference state of one model on one worker thread: [`Self::slots`] inferences can be in
 /// flight at once ([`Self::submit`] / [`Self::collect`]); [`Self::infer`] runs one
 /// synchronously on slot 0.
+#[derive(Debug)]
 pub enum Backend {
     OpenVino(OvBackend),
     #[cfg(feature = "onnxruntime")]
@@ -443,6 +476,7 @@ pub const ORT_NOT_INSTALLED: &str = "ONNX Runtime library not found (run `setup-
 pub const OV_UNAVAILABLE: &str = "OpenVINO runtime not loadable (run `setup-openvino`)";
 
 /// Every runtime this process can use. Shared behind a mutex; models compile one at a time.
+#[derive(Debug)]
 pub struct Runtimes {
     ov: Option<OvCore>,
     /// Why OpenVINO could not be initialized (`{e:#}`).

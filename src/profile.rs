@@ -342,7 +342,8 @@ const MID_SIZES: &[ModelSize] = &[ModelSize::S, ModelSize::M];
 const HIGH_SIZES: &[ModelSize] = &[ModelSize::M, ModelSize::L, ModelSize::X];
 
 fn gb_text(gb: f64) -> String {
-    format!("{} GB", gb.round() as u64)
+    // Whole gigabytes; a negative or NaN input shows as 0.
+    format!("{:.0} GB", gb.round().max(0.0))
 }
 
 /// Classify `facts` (see the module docs).

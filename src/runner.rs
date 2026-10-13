@@ -268,7 +268,9 @@ struct Run<'r> {
 
 impl Run<'_> {
     /// Make `state` current: swap it into the running server, or start the server with it.
-    fn serve(&mut self, state: Arc<AppState>) {
+    /// Errors only when the server has to start and the listener was already used (it is
+    /// taken once, by the first generation).
+    fn serve(&mut self, state: Arc<AppState>) -> Result<()> {
         match &self.shared {
             Some(sh) => {
                 drop(sh.swap(state));
@@ -276,7 +278,10 @@ impl Run<'_> {
             }
             None => {
                 let sh = server::Shared::new(state);
-                let listeners = self.listeners.take().expect("listeners are used once");
+                let listeners = self
+                    .listeners
+                    .take()
+                    .context("the HTTP listener was already used")?;
                 self.server_task = Some(self.rt.spawn(server::serve_on(
                     listeners,
                     sh.clone(),
@@ -285,6 +290,7 @@ impl Run<'_> {
                 self.shared = Some(sh);
             }
         }
+        Ok(())
     }
 
     /// The replaced generation: in-flight requests finish (up to `DRAIN`), then its workers
@@ -298,7 +304,9 @@ impl Run<'_> {
     /// Serve until a restart (None: `generation` was cancelled) or the server task ending
     /// (Some: its result; the task is gone afterwards).
     fn serve_until_event(&mut self, generation: &CancellationToken) -> Option<Result<()>> {
-        let task = self.server_task.as_mut().expect("server task is running");
+        let Some(task) = self.server_task.as_mut() else {
+            return Some(Err(anyhow::anyhow!("the HTTP server is not running")));
+        };
         let ended = self.rt.block_on(async {
             tokio::select! {
                 biased;
@@ -389,6 +397,9 @@ pub fn run_server_with(
         // `POST /config/restart` (or an installed runtime) cancels the generation token; the
         // next generation is built while the old one keeps answering, then swapped in, and the
         // old workers stop once its requests have drained. Cancelling `shutdown` stops all.
+        // The decode ceiling follows the generation's config (and every later config change,
+        // see `ConfigStore`).
+        crate::image::set_max_pixels(config.max_image_pixels);
         let generation = shutdown.child_token();
         let workers = shutdown.child_token();
         let provision = Arc::new(process.provisioner.prepare(&config, loaded_ort));
@@ -428,7 +439,16 @@ pub fn run_server_with(
         }
         first = false;
         adopt = None;
-        run.serve(state.clone());
+        if let Err(e) = run.serve(state.clone()) {
+            run.retire_old();
+            run.old = Some(Generation {
+                state,
+                registry,
+                workers,
+                watcher,
+            });
+            return run.finish(Err(e));
+        }
         run.retire_old();
         let current = Generation {
             state,
