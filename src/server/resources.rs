@@ -636,13 +636,17 @@ mod tests {
         }
         let (s, _) = post_action(&state, "/v1/models/add", "path=rf%2Fmissing.onnx").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
-        let (s, b) = post_action(
-            &state,
-            "/v1/models/add",
-            &format!("path={}&classes=%2Fetc%2Fpasswd", enc(&dir)),
-        )
-        .await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        // A classes file outside every root (Unix only, as above).
+        #[cfg(unix)]
+        {
+            let (s, b) = post_action(
+                &state,
+                "/v1/models/add",
+                &format!("path={}&classes=%2Fetc%2Fpasswd", enc(&dir)),
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        }
         let (s, b) = post_action(&state, "/v1/models/add", "path=..%2Fx.onnx").await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
         let (s, b) = post_action(
