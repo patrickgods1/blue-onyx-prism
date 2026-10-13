@@ -495,7 +495,9 @@ impl OrtRuntime {
             }
         };
         // Report (and feed) static shapes for the image and `orig_target_sizes` inputs.
-        let img = &mut inputs[image_idx];
+        let img = inputs
+            .get_mut(image_idx)
+            .with_context(|| format!("model {}: image input index out of range", path.display()))?;
         if img.shape.len() != 4 {
             bail!(
                 "model {}: image input '{}' has rank {} (expected 4-D NCHW, shape {:?})",
@@ -514,10 +516,23 @@ impl OrtRuntime {
                 img.elem
             );
         }
-        let input_size = (img.shape[3] as u32, img.shape[2] as u32);
+        let input_size = match img.shape.as_slice() {
+            [_, _, h, w] => (u32::try_from(*w).ok(), u32::try_from(*h).ok()),
+            _ => (None, None),
+        };
+        let (Some(w), Some(h)) = input_size else {
+            bail!(
+                "model {}: image input '{}' has non-static shape {:?}",
+                path.display(),
+                img.name,
+                img.shape
+            );
+        };
+        let input_size = (w, h);
         let image_input = img.name.clone();
-        if let Some(i) = extra_idx {
-            let p = &mut inputs[i];
+        if let Some(i) = extra_idx
+            && let Some(p) = inputs.get_mut(i)
+        {
             if p.shape.is_empty() {
                 p.shape = DEFAULT_TARGET_SIZES_SHAPE.to_vec();
             } else {
@@ -529,7 +544,7 @@ impl OrtRuntime {
         for _ in 1..sessions.max(1) {
             all.push(self.build_session(target, index, &session_path, &overrides)?);
         }
-        let compile_ms = t0.elapsed().as_millis() as u64;
+        let compile_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
         let device = DeviceInfo {
             requested: req.requested.clone(),
             actual: device_actual(cand),
@@ -997,6 +1012,15 @@ pub struct OrtCompiled {
     pub info: ModelInfo,
 }
 
+impl std::fmt::Debug for OrtCompiled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrtCompiled")
+            .field("sessions", &self.sessions.len())
+            .field("info", &self.info)
+            .finish()
+    }
+}
+
 impl OrtCompiled {
     /// Start one thread per session ([`OrtBackend`]).
     pub fn into_backend(self) -> Result<OrtBackend> {
@@ -1012,7 +1036,18 @@ impl OrtCompiled {
                     self.info.image_input
                 )
             })?;
-        let image_shape = self.info.inputs[image_idx].shape.clone();
+        let image_shape = self
+            .info
+            .inputs
+            .get(image_idx)
+            .with_context(|| {
+                format!(
+                    "model {}: image input index out of range",
+                    self.info.path.display()
+                )
+            })?
+            .shape
+            .clone();
         let run = Arc::new(RunCtx {
             info: self.info.clone(),
             image_idx,
@@ -1086,6 +1121,15 @@ pub struct OrtBackend {
     done_rx: crossbeam_channel::Receiver<Completion>,
 }
 
+impl std::fmt::Debug for OrtBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrtBackend")
+            .field("info", &self.info)
+            .field("slots", &self.slots.len())
+            .finish_non_exhaustive()
+    }
+}
+
 fn session_thread(
     mut session: Session,
     ctx: &RunCtx,
@@ -1147,7 +1191,10 @@ fn run_session(
                 info.inputs.iter().map(|p| &p.name).collect::<Vec<_>>()
             )
         })?;
-        let port = &info.inputs[i];
+        let port = info
+            .inputs
+            .get(i)
+            .with_context(|| format!("{}: input index {i} out of range", where_()))?;
         let value = extra_value(port, e).with_context(where_)?;
         inputs.push((port.name.clone(), value.into()));
     }
@@ -1165,6 +1212,11 @@ fn run_session(
 }
 
 /// An owned input tensor of `port`'s element type built from `extra` (converted as needed).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "extra inputs are small image-size values built by the model family code; `as` keeps ONNX Cast semantics (saturating float->int, wrapping int64->int32) when the port type differs"
+)]
 pub(crate) fn extra_value(port: &PortSpec, extra: &ExtraInput) -> Result<DynValue> {
     let n: usize = extra.shape.iter().product();
     let len = match &extra.data {
@@ -1244,7 +1296,23 @@ fn read_output_into(name: &str, v: &DynValue, out: &mut NamedOutput) -> Result<(
         other => bail!("output '{name}': unsupported element type {other:?}"),
     };
     out.shape.clear();
-    out.shape.extend(shape.iter().map(|&d| d.max(0) as usize));
+    out.shape
+        .extend(shape.iter().map(|&d| usize::try_from(d).unwrap_or(0)));
+    // Element count must match the shape before any consumer indexes by it.
+    let expected = out
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d));
+    let len = out.data.len();
+    if expected != Some(len) {
+        bail!(
+            "output '{name}': {len} values but shape {:?} ({})",
+            out.shape,
+            expected.map_or("element count overflows".to_string(), |n| format!(
+                "{n} elements"
+            ))
+        );
+    }
     if out.name != name {
         out.name = name.to_string();
     }
@@ -1345,10 +1413,11 @@ impl OrtBackend {
     /// Wait for every inference in flight and discard it (a running session cannot be
     /// interrupted).
     pub fn abort(&mut self) {
-        for slot in 0..self.slots.len() {
-            if self.slots[slot].busy {
-                let _ = self.collect(slot);
-            }
+        let busy: Vec<usize> = (0..self.slots.len())
+            .filter(|&i| self.slots.get(i).is_some_and(|s| s.busy))
+            .collect();
+        for slot in busy {
+            let _ = self.collect(slot);
         }
     }
 

@@ -150,8 +150,9 @@ impl Grade {
     fn at_least(v: f64, bounds: &[f64; 4]) -> Self {
         bounds
             .iter()
-            .position(|&b| v >= b)
-            .map_or(Grade::F, |i| Self::ALL[i])
+            .zip(Self::ALL)
+            .find(|(b, _)| v >= **b)
+            .map_or(Grade::F, |(_, g)| g)
     }
 
     /// Grade of an AP50 accuracy score.
@@ -167,8 +168,9 @@ impl Grade {
     pub fn speed(p50_ms: f64) -> Self {
         SPEED_THRESHOLDS_MS
             .iter()
-            .position(|&b| p50_ms < b)
-            .map_or(Grade::F, |i| Self::ALL[i])
+            .zip(Self::ALL)
+            .find(|(b, _)| p50_ms < **b)
+            .map_or(Grade::F, |(_, g)| g)
     }
 
     pub fn from_points(p: f64) -> Self {

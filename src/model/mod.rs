@@ -320,6 +320,35 @@ pub struct Detection {
     pub class_id: usize,
 }
 
+impl Detection {
+    /// Every coordinate and the score is a finite number. Non-finite outputs (fp16 overflow,
+    /// a broken export) must never reach NMS or the response (see `to_predictions`).
+    pub fn is_finite(&self) -> bool {
+        [self.x1, self.y1, self.x2, self.y2, self.score]
+            .iter()
+            .all(|v| v.is_finite())
+    }
+}
+
+/// Drop every detection with a non-finite coordinate or score.
+pub fn retain_finite(dets: &mut Vec<Detection>) {
+    dets.retain(Detection::is_finite);
+}
+
+/// Largest class index a model output is allowed to name (anything above is a broken export).
+pub const MAX_CLASS_INDEX: f32 = 1_000_000.0;
+
+/// A class id emitted as a float: finite, non-negative and plausible, else None.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "checked finite and clamped to 0..=MAX_CLASS_INDEX before the cast"
+)]
+pub(crate) fn class_index(v: f32) -> Option<usize> {
+    let r = v.round();
+    (r.is_finite() && (0.0..=MAX_CLASS_INDEX).contains(&r)).then_some(r as u32 as usize)
+}
+
 /// Thresholds applied during post-processing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PostParams {
@@ -391,18 +420,19 @@ pub fn detect_family(
     {
         return Ok(ModelFamilyKind::RtDetr);
     }
-    if outputs.len() == 1 {
-        let s = &outputs[0].shape;
-        if s.len() >= 2 {
-            let last = s[s.len() - 1];
-            let prev = s[s.len() - 2];
+    if let [only] = outputs
+        && let [.., prev, last] = only.shape.as_slice()
+    {
+        let (prev, last) = (*prev, *last);
+        let classes = i64::try_from(num_classes).ok().filter(|&c| c > 0);
+        {
             if last == 6 {
                 return Ok(ModelFamilyKind::Yolo26);
             }
-            if num_classes > 0 && prev == 4 + num_classes as i64 && last > prev {
+            if classes.is_some_and(|c| prev == 4 + c) && last > prev {
                 return Ok(ModelFamilyKind::Yolo8);
             }
-            if num_classes > 0 && last == 5 + num_classes as i64 {
+            if classes.is_some_and(|c| last == 5 + c) {
                 return Ok(ModelFamilyKind::Yolo5);
             }
             // Fallbacks when the class count is unknown.
@@ -480,7 +510,9 @@ pub fn parse_hf_preprocessor_size(text: &str) -> Option<(u32, u32)> {
 }
 
 /// Common post-step: class filter (case-insensitive), clamp to the image, round to pixels.
-/// Confidence thresholds are applied by the families themselves.
+/// Confidence thresholds are applied by the families themselves. Detections with a non-finite
+/// coordinate or score are dropped and the score is clamped to `0..=1`, so the JSON never holds
+/// `null` or a `(0,0,0,0)` box (PL-02).
 pub fn to_predictions(
     dets: &[Detection],
     ctx: &PreprocessCtx,
@@ -501,6 +533,9 @@ pub fn to_predictions(
             {
                 return None;
             }
+            if !d.is_finite() {
+                return None;
+            }
             let x1 = d.x1.clamp(0.0, w);
             let y1 = d.y1.clamp(0.0, h);
             let x2 = d.x2.clamp(0.0, w);
@@ -509,15 +544,25 @@ pub fn to_predictions(
                 return None;
             }
             Some(crate::api::Prediction {
-                x_min: x1.round() as usize,
-                y_min: y1.round() as usize,
-                x_max: x2.round() as usize,
-                y_max: y2.round() as usize,
-                confidence: d.score,
+                x_min: pixel(x1),
+                y_min: pixel(y1),
+                x_max: pixel(x2),
+                y_max: pixel(y2),
+                confidence: d.score.clamp(0.0, 1.0),
                 label,
             })
         })
         .collect()
+}
+
+/// A finite coordinate already clamped to `0..=side` (a `u32` image side) as a pixel index.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "caller clamps to 0..=image side (u32), so the rounded value fits usize"
+)]
+fn pixel(v: f32) -> usize {
+    v.round().max(0.0) as usize
 }
 
 #[cfg(test)]
@@ -784,5 +829,52 @@ mod tests {
         assert_eq!(p[0].label, "person");
         assert_eq!((p[0].x_min, p[0].y_max), (0, 50));
         assert_eq!(to_predictions(&dets, &ctx, &names, None).len(), 2);
+    }
+
+    #[test]
+    fn predictions_drop_non_finite_and_clamp_score() {
+        let ctx = PreprocessCtx {
+            orig_w: 100,
+            orig_h: 50,
+            input_w: 640,
+            input_h: 640,
+            mode: ResizeMode::Stretch,
+            scale: 1.0,
+            pad_x: 0.0,
+            pad_y: 0.0,
+        };
+        let d = |x1, y1, x2, y2, score| Detection {
+            x1,
+            y1,
+            x2,
+            y2,
+            score,
+            class_id: 0,
+        };
+        let dets = vec![
+            d(f32::NAN, 0.0, 10.0, 10.0, 0.9),
+            d(0.0, f32::INFINITY, 10.0, 10.0, 0.9),
+            d(0.0, 0.0, f32::NEG_INFINITY, 10.0, 0.9),
+            d(0.0, 0.0, 10.0, f32::NAN, 0.9),
+            d(0.0, 0.0, 10.0, 10.0, f32::NAN),
+            d(0.0, 0.0, 10.0, 10.0, f32::INFINITY),
+            d(0.0, 0.0, 10.0, 10.0, 1.5),
+            d(-1e30, -1e30, 1e30, 1e30, -0.5),
+        ];
+        let p = to_predictions(&dets, &ctx, &["a".to_string()], None);
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].x_max, p[0].y_max, p[0].confidence), (10, 10, 1.0));
+        assert_eq!((p[1].x_max, p[1].y_max, p[1].confidence), (100, 50, 0.0));
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("null"), "{json}");
+        assert_eq!(class_index(2.4), Some(2));
+        assert_eq!(class_index(-0.4), Some(0));
+        assert_eq!(class_index(-1.0), None);
+        assert_eq!(class_index(f32::NAN), None);
+        assert_eq!(class_index(f32::INFINITY), None);
+        assert_eq!(class_index(1e9), None);
+        let mut v = dets.clone();
+        retain_finite(&mut v);
+        assert_eq!(v.len(), 2);
     }
 }

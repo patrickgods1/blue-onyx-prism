@@ -62,6 +62,7 @@ pub enum PlanOutcome {
 }
 
 /// Everything [`super::Spawner::spawn_model`] needs to start the worker of one model.
+#[derive(Debug)]
 pub struct ModelPlan {
     pub name: String,
     /// Absolute model path.

@@ -3,7 +3,7 @@
 //! All appliers are atomic (the config is untouched on error) and validate through
 //! [`crate::config::validate_config`] / [`crate::config::validate_models`].
 
-use crate::config::{Config, round_threshold, thr, validate_config};
+use crate::config::{Config, check_threshold, round_threshold, thr, validate_config};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -117,9 +117,7 @@ pub fn parse_config_form(
     ] {
         if let Some(v) = get(field) {
             let x: f32 = num(field, v)?;
-            if !(0.0..=1.0).contains(&x) {
-                bail!("{field}: must be between 0 and 1, got {x}");
-            }
+            check_threshold(field, x)?;
             *slot = x;
         }
     }
@@ -183,8 +181,8 @@ pub fn apply_models_selection(
     };
     let mut on = vec![false; c.models.len()];
     for name in enabled {
-        match index_of(name) {
-            Some(i) => on[i] = true,
+        match index_of(name).and_then(|i| on.get_mut(i)) {
+            Some(slot) => *slot = true,
             None => bail!("'{name}' is not one of the configured models"),
         }
     }
@@ -196,8 +194,8 @@ pub fn apply_models_selection(
         },
         None => None,
     };
-    if let Some(i) = default_idx {
-        on[i] = true;
+    if let Some(slot) = default_idx.and_then(|i| on.get_mut(i)) {
+        *slot = true;
     }
     if !on.iter().any(|&b| b) {
         bail!("select at least one model to load");
@@ -205,7 +203,9 @@ pub fn apply_models_selection(
     for (m, e) in c.models.iter_mut().zip(on) {
         m.enabled = e;
     }
-    c.default_model = default_idx.map(|i| c.models[i].effective_name());
+    c.default_model = default_idx
+        .and_then(|i| c.models.get(i))
+        .map(|m| m.effective_name());
     *config = c;
     Ok(())
 }
@@ -311,9 +311,9 @@ pub fn apply_model_thresholds(
     let global = c.confidence_threshold;
     let mut changes = Vec::new();
     for (name, t) in thresholds {
-        if !(t.is_finite() && *t > 0.0 && *t <= 1.0) {
-            anyhow::bail!("model '{name}': confidence threshold {t} is not in (0, 1]");
-        }
+        // The shared range ([`check_threshold`]); a benchmark pick of 0 (report every box)
+        // is never a useful recommendation, so this applier also wants it above 0.
+        check_threshold(&format!("model '{name}': confidence_threshold"), *t)?;
         let t = &round_threshold(*t);
         if *t <= 0.0 {
             anyhow::bail!("model '{name}': confidence threshold rounds to 0");

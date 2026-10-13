@@ -130,7 +130,7 @@ fn human_size(n: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    format!("{v:.1} {}", UNITS[i])
+    format!("{v:.1} {}", UNITS.get(i).copied().unwrap_or_default())
 }
 
 fn roots(cfg: &Config) -> Vec<Root> {

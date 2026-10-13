@@ -535,11 +535,7 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
             let (state, progress, error, retry_in) = match status.map(|s| &s.state) {
                 Some(State::Downloading { bytes, total }) => (
                     "downloading",
-                    Some(if *total > 0 {
-                        (bytes * 100 / total) as u8
-                    } else {
-                        0
-                    }),
+                    Some(super::manager::percent(*bytes, *total)),
                     None,
                     None,
                 ),
@@ -737,7 +733,7 @@ fn export_row(
             row.busy = true;
             row.state_text = s.state.describe();
             if let State::Downloading { bytes, total } = s.state {
-                row.progress = Some((bytes * 100).checked_div(total).unwrap_or(0) as u8);
+                row.progress = Some(super::manager::percent(bytes, total));
             }
         } else if toolchain.present {
             row.state = "installed";

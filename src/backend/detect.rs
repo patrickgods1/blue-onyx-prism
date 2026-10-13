@@ -205,7 +205,7 @@ pub fn detect() -> HardwareInfo {
     let hw = HardwareInfo::new(std::env::consts::OS, std::env::consts::ARCH, gpus);
     tracing::debug!(
         gpus = ?hw.gpus,
-        ms = t.elapsed().as_millis() as u64,
+        ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX),
         "hardware detection"
     );
     hw
@@ -318,6 +318,10 @@ pub struct CudaDevice {
 /// Matching, each CUDA device used at most once: by LUID / PCI address; then, in platform
 /// order, by name; then a single adapter left with a single device left. Adapters that do not
 /// match stay unknown. Pure.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "every index is drawn from 0..gpus.len() (`nvidia`, `pick`) or 0..cuda.len() (`used`, `cuda`) and the slices are not resized"
+)]
 pub fn attach_cuda(gpus: &mut [GpuAdapter], keys: &[AdapterKey], cuda: &[CudaDevice]) {
     let nvidia: Vec<usize> = (0..gpus.len())
         .filter(|&i| gpus[i].vendor == GpuVendor::Nvidia)
@@ -434,8 +438,8 @@ pub fn adapter_from_ids(
 
 /// UTF-16 DXGI description (NUL padded) to a String.
 pub fn utf16_name(raw: &[u16]) -> String {
-    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-    String::from_utf16_lossy(&raw[..end]).trim().to_string()
+    let name = raw.split(|&c| c == 0).next().unwrap_or(raw);
+    String::from_utf16_lossy(name).trim().to_string()
 }
 
 /// `0x8086\n` (sysfs `vendor`/`device`) or `8086` to a number.
@@ -627,15 +631,15 @@ mod dxgi {
                     continue;
                 }
             };
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0.cast_unsigned() != 0
                 || desc.VendorId == VENDOR_MICROSOFT
             {
                 continue;
             }
             let vram_mb = desc.DedicatedVideoMemory as u64 / (1024 * 1024);
             let name = utf16_name(&desc.Description);
-            let luid =
-                (desc.AdapterLuid.HighPart as u32 as u64) << 32 | desc.AdapterLuid.LowPart as u64;
+            let luid = (u64::from(desc.AdapterLuid.HighPart.cast_unsigned()) << 32)
+                | u64::from(desc.AdapterLuid.LowPart);
             out.push((
                 adapter_from_ids(i, desc.VendorId, desc.DeviceId, Some(&name), vram_mb),
                 luid,
@@ -694,7 +698,10 @@ mod cuda_driver {
     }
 
     fn c_string(buf: &[c_char]) -> String {
-        let bytes: Vec<u8> = buf.iter().map(|&c| c as u8).collect();
+        let bytes: Vec<u8> = buf
+            .iter()
+            .map(|c| u8::from_ne_bytes(c.to_ne_bytes()))
+            .collect();
         CStr::from_bytes_until_nul(&bytes)
             .map(|s| s.to_string_lossy().trim().to_string())
             .unwrap_or_default()
@@ -760,11 +767,15 @@ mod cuda_driver {
             })?;
             let mut name_buf = [0 as c_char; 256];
             check("cuDeviceGetName", unsafe {
-                name(name_buf.as_mut_ptr(), name_buf.len() as c_int, dev)
+                name(
+                    name_buf.as_mut_ptr(),
+                    c_int::try_from(name_buf.len()).unwrap_or(c_int::MAX),
+                    dev,
+                )
             })?;
             let mut bus_buf = [0 as c_char; 64];
-            let pci = (unsafe { bus(bus_buf.as_mut_ptr(), bus_buf.len() as c_int, dev) }
-                == CUDA_SUCCESS)
+            let bus_len = c_int::try_from(bus_buf.len()).unwrap_or(c_int::MAX);
+            let pci = (unsafe { bus(bus_buf.as_mut_ptr(), bus_len, dev) } == CUDA_SUCCESS)
                 .then(|| PciAddress::parse(&c_string(&bus_buf)))
                 .flatten();
             #[cfg(windows)]
@@ -772,16 +783,16 @@ mod cuda_driver {
                 let mut raw = [0 as c_char; 8];
                 let mut mask: c_uint = 0;
                 (unsafe { f(raw.as_mut_ptr(), &mut mask, dev) } == CUDA_SUCCESS)
-                    .then(|| u64::from_le_bytes(raw.map(|c| c as u8)))
+                    .then(|| u64::from_le_bytes(raw.map(|c| u8::from_ne_bytes(c.to_ne_bytes()))))
             });
             #[cfg(not(windows))]
             let luid = None;
             out.push(CudaDevice {
-                ordinal: ordinal as u32,
+                ordinal: u32::try_from(ordinal).unwrap_or_default(),
                 name: c_string(&name_buf),
                 compute_capability: ComputeCapability::new(
-                    major.max(0) as u32,
-                    minor.max(0) as u32,
+                    u32::try_from(major).unwrap_or_default(),
+                    u32::try_from(minor).unwrap_or_default(),
                 ),
                 luid,
                 pci,

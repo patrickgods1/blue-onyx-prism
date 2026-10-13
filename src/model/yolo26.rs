@@ -5,8 +5,10 @@ use anyhow::Result;
 
 use super::{
     Detection, Family, ModelFamilyKind, NamedOutput, PostParams, PreprocessCtx, ResizeMode,
+    class_index, retain_finite,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Yolo26 {
     pub num_classes: usize,
 }
@@ -60,12 +62,13 @@ pub(crate) fn matrix_dims(
             out.shape
         ),
     };
-    if dims.0 * dims.1 != len {
+    let implied = dims.0.checked_mul(dims.1);
+    if implied != Some(len) {
         anyhow::bail!(
             "{family}: output `{}` shape {:?} implies {} values but the buffer has {len}",
             out.name,
             out.shape,
-            dims.0 * dims.1
+            implied.map_or_else(|| "too many".to_string(), |n| n.to_string())
         );
     }
     Ok(dims)
@@ -94,25 +97,24 @@ impl Family for Yolo26 {
             );
         }
         let mut dets = Vec::new();
-        for row in data.as_chunks::<6>().0 {
-            let conf = row[4];
+        for &[bx1, by1, bx2, by2, conf, cls] in data.as_chunks::<6>().0 {
             if !meets(conf, params.confidence_threshold) {
                 continue;
             }
-            let cls = row[5];
-            if !cls.is_finite() || cls < 0.0 {
+            let Some(class_id) = class_index(cls) else {
                 continue;
-            }
-            let (x1, y1, x2, y2) = ctx.to_original(row[0], row[1], row[2], row[3]);
+            };
+            let (x1, y1, x2, y2) = ctx.to_original(bx1, by1, bx2, by2);
             dets.push(Detection {
                 x1,
                 y1,
                 x2,
                 y2,
                 score: conf,
-                class_id: cls.round() as usize,
+                class_id,
             });
         }
+        retain_finite(&mut dets);
         Ok(dets)
     }
 }

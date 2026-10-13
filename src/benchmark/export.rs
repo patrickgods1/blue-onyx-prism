@@ -514,8 +514,8 @@ fn ranking_section(ranking: &[super::report::RankRow], metric: AccuracyMetric) -
              speed; accuracy graded by {}. Models with no class in the datasets are not \
              scored for accuracy and rank last. Best: {} on {}.",
             metric.label(),
-            ranking[0].model,
-            ranking[0].device
+            ranking.first().map_or("-", |r| r.model.as_str()),
+            ranking.first().map_or("-", |r| r.device.as_str())
         )],
         tables: vec![Table {
             title: String::new(),

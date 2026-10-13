@@ -278,9 +278,9 @@ pub(crate) fn extra_input_index(
     if let Some(i) = inputs.iter().position(|p| p.name == name) {
         return Some(i);
     }
-    let mut others = (0..inputs.len()).filter(|&i| i != image_idx);
+    let mut others = inputs.iter().enumerate().filter(|&(i, _)| i != image_idx);
     match (others.next(), others.next()) {
-        (Some(i), None) if inputs[i].shape.is_empty() || inputs[i].shape.len() == 2 => Some(i),
+        (Some((i, p)), None) if p.shape.is_empty() || p.shape.len() == 2 => Some(i),
         _ => None,
     }
 }
@@ -294,7 +294,9 @@ fn make_static(
     path: &std::path::Path,
 ) -> Result<bool> {
     let mut targets: Vec<(usize, Vec<i64>)> = Vec::new();
-    let img = &inputs[image_idx];
+    let img = inputs
+        .get(image_idx)
+        .with_context(|| format!("model {}: image input index out of range", path.display()))?;
     if img.shape.len() != 4 && !img.shape.is_empty() {
         anyhow::bail!(
             "model {}: image input '{}' has rank {} (expected 4-D NCHW, shape {:?})",
@@ -305,16 +307,19 @@ fn make_static(
         );
     }
     if img.shape.is_empty() || img.shape.iter().any(|&d| d < 0) {
-        let dims: Vec<i64> = (0..4)
-            .map(|i| match img.shape.get(i) {
+        let dims: Vec<i64> = image_default
+            .iter()
+            .enumerate()
+            .map(|(i, &default)| match img.shape.get(i) {
                 Some(&d) if d >= 0 => d,
-                _ => image_default[i],
+                _ => default,
             })
             .collect();
         targets.push((image_idx, dims));
     }
     if let Some(i) = extra_input_index(inputs, image_idx, "orig_target_sizes")
-        && (inputs[i].shape.is_empty() || inputs[i].shape.iter().any(|&d| d < 0))
+        && let Some(p) = inputs.get(i)
+        && (p.shape.is_empty() || p.shape.iter().any(|&d| d < 0))
     {
         targets.push((i, DEFAULT_TARGET_SIZES_SHAPE.to_vec()));
     }
@@ -330,23 +335,23 @@ fn make_static(
         })
         .collect::<Result<_>>()?;
     let refs: Vec<(usize, &PartialShape)> = shapes.iter().map(|(i, s)| (*i, s)).collect();
+    let named = || {
+        targets
+            .iter()
+            .map(|(i, d)| (inputs.get(*i).map_or("?", |p| p.name.as_str()), d))
+            .collect::<Vec<_>>()
+    };
     model.reshape_by_port_indexes(&refs).with_context(|| {
         format!(
             "model {}: reshaping dynamic inputs to {:?}",
             path.display(),
-            targets
-                .iter()
-                .map(|(i, d)| (inputs[*i].name.as_str(), d))
-                .collect::<Vec<_>>()
+            named()
         )
     })?;
     tracing::info!(
         "model {}: reshaped dynamic inputs {:?}",
         path.display(),
-        targets
-            .iter()
-            .map(|(i, d)| (inputs[*i].name.as_str(), d))
-            .collect::<Vec<_>>()
+        named()
     );
     Ok(true)
 }
@@ -473,16 +478,27 @@ pub fn load_model(
     } else {
         introspect(&model).with_context(|| format!("introspecting model {}", path.display()))?
     };
-    let img = &inputs[image_idx];
-    if img.shape.len() != 4 || img.shape.iter().any(|&d| d <= 0) {
+    let img = inputs.get(image_idx).with_context(|| {
+        format!(
+            "model {}: image input disappeared after reshape",
+            path.display()
+        )
+    })?;
+    let input_size = match img.shape.as_slice() {
+        [_, _, h, w] if img.shape.iter().all(|&d| d > 0) => {
+            (u32::try_from(*w).ok(), u32::try_from(*h).ok())
+        }
+        _ => (None, None),
+    };
+    let (Some(w), Some(h)) = input_size else {
         anyhow::bail!(
             "model {}: image input '{}' has non-static shape {:?} after reshape",
             path.display(),
             img.name,
             img.shape
         );
-    }
-    let input_size = (img.shape[3] as u32, img.shape[2] as u32);
+    };
+    let input_size = (w, h);
     let image_input = img.name.clone();
 
     if let Some(intel) = prefer_intel_gpu(core, &primary, available) {
@@ -513,7 +529,7 @@ pub fn load_model(
         path,
     )?;
     let actual = primary;
-    let compile_ms = t0.elapsed().as_millis() as u64;
+    let compile_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
     // Streams the plugin created for the hint (THROUGHPUT: several); bounds `inflight`.
     let read_count = |key: PropertyKey| {
         compiled
@@ -695,7 +711,12 @@ pub fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
         streams,
     } = compiled;
     let idx = image_index(&model)?;
-    let spec = &model.inputs[idx];
+    let spec = model.inputs.get(idx).with_context(|| {
+        format!(
+            "model {}: image input index out of range",
+            model.path.display()
+        )
+    })?;
     if spec.elem != PortElem::F32 {
         anyhow::bail!(
             "model {}: image input '{}' has element type {:?}; only f32 is supported",
@@ -769,6 +790,11 @@ pub fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
     })
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "extra inputs are small image-size values built by the model family code; `as` keeps ONNX Cast semantics (saturating float->int, wrapping int64->int32) when the port type differs"
+)]
 fn extra_tensor(model: &ModelInfo, port: &PortSpec, extra: &ExtraInput) -> Result<Tensor> {
     let ctx = || {
         format!(
@@ -865,7 +891,7 @@ fn read_output_into(
             .with_context(ctx)?
             .get_dimensions()
             .iter()
-            .map(|&d| d.max(0) as usize),
+            .map(|&d| usize::try_from(d).unwrap_or(0)),
     );
     let elem = tensor.get_element_type().with_context(ctx)?;
     let n: usize = out.shape.iter().product();
@@ -951,7 +977,7 @@ pub(crate) fn submit(
                 where_(),
                 model.image_input,
                 dst.len(),
-                model.inputs[idx].shape,
+                model.inputs.get(idx).map(|p| &p.shape),
                 chw.len()
             );
         }
@@ -972,7 +998,11 @@ pub(crate) fn submit(
                 model.inputs.iter().map(|p| &p.name).collect::<Vec<_>>()
             )
         })?;
-        let t = extra_tensor(model, &model.inputs[i], e)?;
+        let port = model
+            .inputs
+            .get(i)
+            .with_context(|| format!("{}: input index {i} out of range", where_()))?;
+        let t = extra_tensor(model, port, e)?;
         s.request
             .set_input_tensor_by_index(i, &t)
             .with_context(|| format!("{}: setting input '{}'", where_(), e.name))?;

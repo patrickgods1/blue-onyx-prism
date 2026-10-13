@@ -85,21 +85,13 @@ pub fn auc(samples: &[(f32, bool)]) -> Option<f64> {
     // per group of equal scores; twice U is an integer, so the sum is exact in f64.
     let mut u2: u128 = 0;
     let mut neg_below: u128 = 0;
-    let mut i = 0;
-    while i < s.len() {
-        let mut j = i;
-        let (mut p, mut n) = (0u128, 0u128);
-        while j < s.len() && s[j].0 == s[i].0 {
-            if s[j].1 {
-                p += 1;
-            } else {
-                n += 1;
-            }
-            j += 1;
-        }
+    // `chunk_by` with `total_cmp` equality: a NaN score forms its own group instead of
+    // looping forever (NaN != NaN).
+    for group in s.chunk_by(|a, b| a.0.total_cmp(&b.0).is_eq()) {
+        let p = group.iter().filter(|x| x.1).count() as u128;
+        let n = group.len() as u128 - p;
         u2 += p * (2 * neg_below + n);
         neg_below += n;
-        i = j;
     }
     Some(u2 as f64 / (2.0 * pos as f64 * neg as f64))
 }
@@ -178,10 +170,10 @@ impl FrameSteps {
     /// Rates when frames scoring at or above `t` alert.
     pub fn rates_at(&self, t: f32) -> FrameRates {
         let n = self.steps.partition_point(|s| s.0 >= t);
-        let (tp, fp) = match n {
-            0 => (0, 0),
-            n => (self.steps[n - 1].1, self.steps[n - 1].2),
-        };
+        let (tp, fp) = n
+            .checked_sub(1)
+            .and_then(|i| self.steps.get(i))
+            .map_or((0, 0), |s| (s.1, s.2));
         FrameRates::new(tp, fp, self.positives, self.negatives)
     }
 
@@ -226,8 +218,9 @@ fn thin<T: Copy>(pts: Vec<T>, max: usize) -> Vec<T> {
         return pts;
     }
     let last = pts.len() - 1;
+    // (i * last + (max-1)/2) / (max-1) <= last for i < max, so every index is in bounds.
     (0..max)
-        .map(|i| pts[(i * last + (max - 1) / 2) / (max - 1)])
+        .filter_map(|i| pts.get((i * last + (max - 1) / 2) / (max - 1)).copied())
         .collect()
 }
 
@@ -364,6 +357,17 @@ mod tests {
             }
         }
         (den > 0.0).then(|| num / den)
+    }
+
+    #[test]
+    fn auc_with_nan_scores_terminates() {
+        let a = auc(&[
+            (f32::NAN, true),
+            (f32::NAN, false),
+            (0.5, true),
+            (0.1, false),
+        ]);
+        assert!(a.is_some_and(|v| (0.0..=1.0).contains(&v)), "{a:?}");
     }
 
     #[test]

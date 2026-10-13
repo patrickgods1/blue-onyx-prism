@@ -83,6 +83,17 @@ pub struct AppState {
     pub benchmark: Arc<crate::benchmark::service::BenchmarkService>,
 }
 
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("registry", &self.registry)
+            .field("config_path", &self.config_path)
+            .field("started", &self.started)
+            .field("restart", &self.restart)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AppState {
     /// State without a log reload handle and with a fresh restart token.
     pub fn new(
@@ -185,10 +196,78 @@ pub fn router(state: impl Into<Shared>) -> Router {
             shared.clone(),
             admin_only,
         ));
+    #[cfg(test)]
+    let open = open
+        .route("/__test/panic", get(test_panic))
+        .route("/__test/blocking-panic", get(test_blocking_panic));
     open.merge(admin)
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(axum::middleware::from_fn(catch_panic))
         .with_state(shared)
+}
+
+/// Test-only route: a handler that panics.
+#[cfg(test)]
+#[allow(clippy::unused_async, reason = "axum handlers are async")]
+async fn test_panic() -> &'static str {
+    std::panic::panic_any("test handler panic")
+}
+
+/// Test-only route: a handler whose [`blocking`] closure panics.
+#[cfg(test)]
+async fn test_blocking_panic() -> &'static str {
+    blocking(|| std::panic::panic_any("test blocking panic")).await
+}
+
+/// The panic payload's message (`panic!` with a literal or a format string), else a placeholder.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+/// Outermost middleware: a panic in a handler (or in its [`blocking`] work) becomes a 500
+/// answer instead of a dropped connection. The panic message is logged with the method and
+/// path (never the request body). API clients get `{"success":false,"error":"internal error"}`,
+/// browsers a short HTML page.
+async fn catch_panic(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use futures_util::FutureExt;
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let html = wants_html(req.headers());
+    match std::panic::AssertUnwindSafe(next.run(req))
+        .catch_unwind()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(p) => {
+            error!(
+                %method,
+                %path,
+                panic = panic_message(p.as_ref()),
+                "request handler panicked; answering 500"
+            );
+            if html {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Html(
+                        "<!doctype html><title>Internal error</title>\
+                         <h1>Internal error</h1><p>The server hit an internal error while \
+                         handling this page. Details are in the log.</p>",
+                    ),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": "internal error" })),
+                )
+                    .into_response()
+            }
+        }
+    }
 }
 
 /// Whether a client may use the admin routes: a loopback peer, or anyone with
@@ -252,7 +331,7 @@ pub(super) async fn admin_only(
 /// restart swaps it ([`Shared::swap`]); the listener stays up. Handlers extract
 /// `State<Arc<AppState>>` as before ([`axum::extract::FromRef`]), one `Arc` clone per request,
 /// so an in-flight request keeps its generation (and its workers) alive until it finishes.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Shared {
     current: Arc<std::sync::RwLock<Arc<AppState>>>,
 }
@@ -289,6 +368,7 @@ impl axum::extract::FromRef<Shared> for Arc<AppState> {
 }
 
 /// The process's HTTP listeners (bound once, see [`bind`]).
+#[derive(Debug)]
 pub struct Listeners {
     v4: tokio::net::TcpListener,
     v6: Option<tokio::net::TcpListener>,
@@ -356,14 +436,17 @@ pub async fn serve_on(
 }
 
 /// Run blocking handler work (file reads and walks, runtime library probes, page rendering) on
-/// tokio's blocking pool so a slow page never holds up the detection routes. A panic in `f` is
-/// resumed in the handler (axum answers 500 as for any handler panic).
+/// tokio's blocking pool so a slow page never holds up the detection routes. A panic in `f`
+/// (or a task cancelled by runtime shutdown) unwinds into the handler, and the router's
+/// [`catch_panic`] middleware turns it into a 500 answer; the connection stays usable.
 pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::task::spawn_blocking(f).await {
         Ok(v) => v,
         Err(e) => match e.try_into_panic() {
             Ok(p) => std::panic::resume_unwind(p),
-            Err(e) => panic!("blocking handler task did not finish: {e}"),
+            Err(e) => std::panic::resume_unwind(Box::new(format!(
+                "blocking handler task did not finish: {e}"
+            ))),
         },
     }
 }
@@ -468,6 +551,49 @@ mod tests {
                 .unwrap_or_else(|e| panic!("request {i} ({path}): {e:?}"));
             let r: VisionDetectionResponse = resp.json().await.unwrap();
             assert!(!r.success, "{r:?}");
+        }
+        token.cancel();
+        server.await.unwrap().unwrap();
+    }
+
+    /// SV-15: a panicking handler (directly or in its `blocking` work) answers 500 and the
+    /// server, and the connection, keep serving.
+    #[tokio::test]
+    async fn handler_panic_answers_500_and_server_keeps_serving() {
+        let listeners = bind([127, 0, 0, 1].into(), 0).await.unwrap();
+        let port = listeners.v4.local_addr().unwrap().port();
+        let token = CancellationToken::new();
+        let server = tokio::spawn(serve_on(listeners, test_state().into(), token.clone()));
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(1)
+            .build()
+            .unwrap();
+        for path in ["__test/panic", "__test/blocking-panic"] {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}/{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({ "success": false, "error": "internal error" })
+            );
+            let html = client
+                .get(format!("http://127.0.0.1:{port}/{path}"))
+                .header(header::ACCEPT, "text/html")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(html.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(html.text().await.unwrap().contains("Internal error"));
+            let ok = client
+                .get(format!("http://127.0.0.1:{port}/v1/vision/custom/list"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK, "after {path}");
         }
         token.cancel();
         server.await.unwrap().unwrap();

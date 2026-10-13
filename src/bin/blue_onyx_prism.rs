@@ -1,6 +1,23 @@
 //! Main binary: CLI subcommands (setup-openvino, setup-onnxruntime, download-models, list-models,
 //! fetch, list-resources, list-devices, benchmark) or the HTTP service.
 
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::large_futures,
+        clippy::unused_async,
+        clippy::dbg_macro,
+        missing_debug_implementations
+    )
+)]
+#![deny(unsafe_code)]
+
 use anyhow::{Context, Result};
 use blue_onyx_prism::backend::{CoreOptions, DeviceSpec, OrtOptions, Runtimes, select};
 use blue_onyx_prism::cli::{self, Cli, Command};

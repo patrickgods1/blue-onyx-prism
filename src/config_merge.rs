@@ -188,6 +188,7 @@ fn global_label(k: &str) -> String {
         "auto_download" => "Auto download".into(),
         "allow_large_downloads" => "Allow large downloads".into(),
         "default_model" => "Default model".into(),
+        "max_image_pixels" => "Max image pixels".into(),
         other => other.replace('_', " "),
     }
 }
@@ -359,7 +360,8 @@ impl Pending {
 /// the per-request settings go into every worker's live settings
 /// ([`crate::worker::LiveSettings`], through `ModelRegistry::apply_live`), `default_model`
 /// switches the registry's default at once, and the benchmark section is read when a
-/// benchmark starts. Every other global is runtime-level and needs a restart.
+/// benchmark starts. `max_image_pixels` is the process-wide decode ceiling, set again after
+/// every config change. Every other global is runtime-level and needs a restart.
 pub fn live_global(k: &str) -> bool {
     matches!(
         k,
@@ -372,6 +374,7 @@ pub fn live_global(k: &str) -> bool {
             | "object_filter"
             | "save_image_path"
             | "save_ref_image"
+            | "max_image_pixels"
     ) || k.starts_with("benchmark.")
 }
 
@@ -462,7 +465,11 @@ pub fn keep_model_from(target: &mut Config, source: &Config, name: &str) {
     let is = |m: &ModelConfig| normalize_name(&m.effective_name()) == key;
     let from = source.models.iter().find(|m| is(m)).cloned();
     match (target.models.iter().position(is), from) {
-        (Some(i), Some(m)) => target.models[i] = m,
+        (Some(i), Some(m)) => {
+            if let Some(slot) = target.models.get_mut(i) {
+                *slot = m;
+            }
+        }
         (Some(i), None) => {
             target.models.remove(i);
         }
@@ -735,6 +742,7 @@ mod tests {
             Box::new(|c| c.request_timeout_secs = 3),
             Box::new(|c| c.log_level = crate::config::LogLevel::Trace),
             Box::new(|c| c.allow_remote_admin = true),
+            Box::new(|c| c.max_image_pixels = 2_000_000),
             Box::new(|c| c.default_model = Some("yolo26s".into())),
             Box::new(|c| c.benchmark.repeat_per_image = 7),
             Box::new(|c| c.models[0].confidence_threshold = Some(0.2)),

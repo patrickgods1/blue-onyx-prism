@@ -68,13 +68,13 @@ fn resolve_default(config: &Config) -> Option<usize> {
             None => {
                 warn!("default_model '{name}' is not configured; using the first enabled model")
             }
-            Some(i) if !config.models[i].enabled => {
+            Some(i) if !config.models.get(i).is_some_and(|m| m.enabled) => {
                 warn!("default_model '{name}' is disabled; using the first enabled model")
             }
             Some(_) => {}
         }
     }
-    Some(config.models[..idx].iter().filter(|m| m.enabled).count())
+    Some(config.models.iter().take(idx).filter(|m| m.enabled).count())
 }
 
 /// What [`ModelRegistry::apply_live`] changed.
@@ -97,11 +97,8 @@ fn default_by_name(
 ) -> Option<usize> {
     config
         .effective_default_index()
-        .and_then(|i| {
-            by_name
-                .get(&normalize_name(&config.models[i].effective_name()))
-                .copied()
-        })
+        .and_then(|i| config.models.get(i))
+        .and_then(|m| by_name.get(&normalize_name(&m.effective_name())).copied())
         .or((served > 0).then_some(0))
 }
 
@@ -207,6 +204,21 @@ pub struct ModelRegistry {
     /// The `stop-{name}` helper threads of workers removed by a disable or reload
     /// ([`retire_worker`]); pruned of finished ones on each retire, joined by [`Self::shutdown`].
     retiring: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for ModelRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let models: Vec<String> = self
+            .slots
+            .read()
+            .map(|s| s.workers.iter().map(|w| w.handle.name.clone()).collect())
+            .unwrap_or_default();
+        f.debug_struct("ModelRegistry")
+            .field("models", &models)
+            .field("runtime_info", &self.runtime_info)
+            .field("can_reload", &self.spawner.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// What [`ModelRegistry::reload_model`] did.
@@ -336,7 +348,9 @@ impl Spawner {
 fn retire_worker(slot: WorkerSlot) -> Option<JoinHandle<()>> {
     let WorkerSlot { handle, stop, join } = slot;
     let name = handle.name.clone();
-    let drain = handle.request_timeout() + Duration::from_secs(1);
+    let drain = handle
+        .request_timeout()
+        .saturating_add(Duration::from_secs(1));
     drop(handle);
     let Some(join) = join else {
         stop.cancel();
@@ -536,8 +550,8 @@ impl ModelRegistry {
         }
 
         let default_idx = resolve_default(config);
-        if let Some(i) = default_idx {
-            info!(model = %workers[i].handle.name, "default model for /v1/vision/detection");
+        if let Some(w) = default_idx.and_then(|i| workers.get(i)) {
+            info!(model = %w.handle.name, "default model for /v1/vision/detection");
         }
 
         Ok(Self {
@@ -706,7 +720,9 @@ impl ModelRegistry {
         let new = default_by_name(config, &s.by_name, s.workers.len());
         if s.default_idx != new {
             s.default_idx = new;
-            out.default_model = new.map(|i| s.workers[i].handle.name.clone());
+            out.default_model = new
+                .and_then(|i| s.workers.get(i))
+                .map(|w| w.handle.name.clone());
             out.default_changed = true;
             info!(
                 model = out.default_model.as_deref().unwrap_or("none"),
@@ -752,10 +768,21 @@ impl ModelRegistry {
             }
             let old = {
                 let mut s = self.write();
-                let i = s.by_name[&key];
-                let old = s.workers.remove(i);
-                s.reindex(config);
-                old
+                let idx = s
+                    .by_name
+                    .get(&key)
+                    .copied()
+                    .filter(|&i| i < s.workers.len());
+                idx.map(|i| {
+                    let old = s.workers.remove(i);
+                    s.reindex(config);
+                    old
+                })
+            };
+            let Some(old) = old else {
+                return Ok(Reload::Unchanged {
+                    name: name.to_string(),
+                });
             };
             let name = old.handle.name.clone();
             info!(model = %name, "model disabled; stopping its worker");
@@ -901,9 +928,7 @@ mod tests {
     fn empty_config_is_an_error() {
         let c = Config::default();
         let m = Arc::new(Metrics::new("0"));
-        let err = ModelRegistry::start(&c, &m, CancellationToken::new())
-            .err()
-            .expect("must fail");
+        let err = ModelRegistry::start(&c, &m, CancellationToken::new()).expect_err("must fail");
         assert!(format!("{err:#}").contains("--model"));
     }
 
@@ -917,9 +942,7 @@ mod tests {
             });
         }
         let m = Arc::new(Metrics::new("0"));
-        let err = ModelRegistry::start(&c, &m, CancellationToken::new())
-            .err()
-            .expect("must fail");
+        let err = ModelRegistry::start(&c, &m, CancellationToken::new()).expect_err("must fail");
         assert!(format!("{err:#}").contains("duplicate"));
     }
 
@@ -981,9 +1004,7 @@ mod tests {
             });
         }
         let m = Arc::new(Metrics::new("0"));
-        let err = ModelRegistry::start(&c, &m, CancellationToken::new())
-            .err()
-            .expect("must fail");
+        let err = ModelRegistry::start(&c, &m, CancellationToken::new()).expect_err("must fail");
         assert!(format!("{err:#}").contains("duplicate"));
     }
 

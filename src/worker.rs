@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 /// A message for a worker thread.
+#[derive(Debug)]
 pub enum WorkItem {
     /// A queued detection request: the request, where to send the reply, and when it arrived.
     Detect(
@@ -56,6 +57,9 @@ pub enum WorkItem {
 
 /// Hard capacity of the channel when the queue is auto-sized.
 pub const MAX_AUTO_QUEUE: usize = 64;
+/// Largest `worker_queue_size` accepted (config validation) and applied at spawn; the bounded
+/// channel allocates every slot up front.
+pub const MAX_QUEUE_SIZE: usize = 1024;
 
 /// How often a blocked worker re-checks the shutdown token.
 const POLL: Duration = Duration::from_millis(250);
@@ -181,6 +185,7 @@ impl LoadGate {
 }
 
 /// HTTP-side handle to a worker thread.
+#[derive(Debug)]
 pub struct WorkerHandle {
     pub name: String,
     pub sender: Sender<WorkItem>,
@@ -392,8 +397,9 @@ pub fn planned_spec_label(spec: &DeviceSpec) -> String {
 
 /// `clamp(timeout_ms / max(warmup_ms, 1), 1, 64)`.
 pub fn auto_queue_size(request_timeout: Duration, warmup_ms: u64) -> usize {
-    let t = request_timeout.as_millis() as u64;
-    (t / warmup_ms.max(1)).clamp(1, MAX_AUTO_QUEUE as u64) as usize
+    let t = millis_u64(request_timeout);
+    let n = (t / warmup_ms.max(1)).clamp(1, MAX_AUTO_QUEUE as u64);
+    usize::try_from(n).unwrap_or(MAX_AUTO_QUEUE)
 }
 
 /// Request `min_confidence` overrides the configured threshold when > 0.
@@ -430,7 +436,16 @@ pub fn spawn_worker_after(
     after: Option<LoadGate>,
 ) -> WorkerHandle {
     let hard_cap = if cfg.queue_size > 0 {
-        cfg.queue_size
+        let clamped = cfg.queue_size.clamp(1, MAX_QUEUE_SIZE);
+        if clamped != cfg.queue_size {
+            warn!(
+                model = %cfg.name,
+                requested = cfg.queue_size,
+                applied = clamped,
+                "worker_queue_size is above the maximum; clamped"
+            );
+        }
+        clamped
     } else {
         MAX_AUTO_QUEUE
     };
@@ -566,7 +581,7 @@ impl Pipeline {
         let n = self.slots.len();
         let i = (0..n)
             .map(|k| (self.next + k) % n)
-            .find(|&i| self.slots[i].is_none())?;
+            .find(|&i| self.slots.get(i).is_some_and(Option::is_none))?;
         self.next = (i + 1) % n;
         Some(i)
     }
@@ -624,9 +639,14 @@ fn loaded_provider(device: &RwLock<Option<DeviceInfo>>) -> Option<String> {
         .and_then(|d| d.as_ref().map(|d| d.execution_provider()))
 }
 
-/// Elapsed milliseconds as the API's i32.
+/// Elapsed milliseconds as the API's i32 (saturating).
 fn ms(d: Duration) -> i32 {
-    d.as_millis().min(i32::MAX as u128) as i32
+    i32::try_from(d.as_millis()).unwrap_or(i32::MAX)
+}
+
+/// Milliseconds as u64 (saturating; a `Duration` can exceed u64 milliseconds).
+fn millis_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl WorkerCtx {
@@ -875,8 +895,8 @@ impl WorkerCtx {
         self.metrics.record_drop(DropReason::Timeout);
         warn!(
             model = %self.cfg.name,
-            waited_ms = waited.as_millis() as u64,
-            timeout_ms = timeout.as_millis() as u64,
+            waited_ms = millis_u64(waited),
+            timeout_ms = millis_u64(timeout),
             "dropping request that waited longer than the request timeout (server overloaded)"
         );
         Some(self.error_response(
@@ -967,7 +987,14 @@ impl WorkerCtx {
                         preprocess,
                         ..
                     } = prepared; // the tensor buffer goes back to the pool here
-                    p.slots[slot] = Some(InFlight {
+                    #[allow(
+                        clippy::indexing_slicing,
+                        reason = "slot was returned by p.free_slot() earlier in this loop iteration, \
+                                  which only yields indices < slots.len(); nothing resizes \
+                                  slots in between"
+                    )]
+                    let cell = &mut p.slots[slot];
+                    *cell = Some(InFlight {
                         meta,
                         ctx,
                         img,
@@ -1000,9 +1027,14 @@ impl WorkerCtx {
                         self.reply(meta, resp);
                     }
                 }
-                Some(&Done::Slot(i)) if p.slots[i].as_ref().is_some_and(|f| f.done.is_some()) => {
+                Some(&Done::Slot(i))
+                    if p.slots
+                        .get(i)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|f| f.done.is_some()) =>
+                {
                     p.order.pop_front();
-                    if let Some(f) = p.slots[i].take() {
+                    if let Some(f) = p.slots.get_mut(i).and_then(Option::take) {
                         self.finish(eng, i, f);
                     }
                 }
@@ -1017,7 +1049,7 @@ impl WorkerCtx {
     /// completion, collect it anyway (blocking), so a lost notification cannot stall the model.
     fn unstick(&self, p: &mut Pipeline) {
         if let Some(&Done::Slot(i)) = p.order.front()
-            && let Some(f) = p.slots[i].as_mut()
+            && let Some(f) = p.slots.get_mut(i).and_then(Option::as_mut)
             && f.done.is_none()
             && f.submitted.elapsed() > f.meta.live.request_timeout
         {
@@ -1188,7 +1220,7 @@ impl WorkerCtx {
         let extra = family.extra_inputs(&ctx);
         let t = Instant::now();
         backend.infer(chw, &extra).context("warm-up inference")?;
-        let warmup_ms = t.elapsed().as_millis() as u64;
+        let warmup_ms = millis_u64(t.elapsed());
         let others = 1..backend.slots();
         for s in others.clone() {
             backend
@@ -1260,15 +1292,15 @@ impl WorkerCtx {
         let process_d = f.decode + f.preprocess + infer_d + post_d;
         let resp = match result {
             Ok(predictions) => {
-                self.metrics.inference_ms.record(infer_d.as_millis() as u64);
-                self.metrics.process_ms.record(process_d.as_millis() as u64);
+                self.metrics.inference_ms.record(millis_u64(infer_d));
+                self.metrics.process_ms.record(millis_u64(process_d));
                 debug!(
                     model = %name,
                     image = %f.meta.image_name,
                     size = %format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
                     count = predictions.len(),
                     slot,
-                    queue_ms = f.submitted.saturating_duration_since(f.meta.enqueued).as_millis() as u64,
+                    queue_ms = millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
                     decode_ms = f.decode.as_secs_f64() * 1e3,
                     preprocess_ms = f.preprocess.as_secs_f64() * 1e3,
                     inference_ms = infer_d.as_secs_f64() * 1e3,
@@ -1297,7 +1329,7 @@ impl WorkerCtx {
                     success: true,
                     message: format!("Found {} objects", predictions.len()),
                     error: None,
-                    count: predictions.len() as i32,
+                    count: i32::try_from(predictions.len()).unwrap_or(i32::MAX),
                     predictions,
                     command: "detect".into(),
                     moduleId: crate::MODULE_ID.to_string(),

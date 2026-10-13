@@ -55,7 +55,14 @@ impl BenchFacts {
         let mut a = advice.clone();
         let n = crate::benchmark::current::ModelNow {
             threshold,
-            running: running.map(|r| r as f32),
+            running: running.map(|r| {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "a confidence threshold (0..1); f32 is the precision the models use"
+                )]
+                let r = r as f32;
+                r
+            }),
             device: None,
         };
         crate::benchmark::current::rebase_advice(
@@ -370,14 +377,15 @@ pub(super) async fn config_json(
     let text = body.to_string();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
-    let etag = format!("W/\"{}-{:016x}\"", body["revision"], h.finish());
+    // `Value::Null` (shown as `null`) when missing, as indexing gave.
+    let revision = body.get("revision").cloned().unwrap_or_default();
+    let etag = format!("W/\"{}-{:016x}\"", revision, h.finish());
     let matches = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
     let etag_value = HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("W/\"0\""));
-    let rev = HeaderValue::from_str(&body["revision"].to_string())
-        .unwrap_or(HeaderValue::from_static("0"));
+    let rev = HeaderValue::from_str(&revision.to_string()).unwrap_or(HeaderValue::from_static("0"));
     if matches {
         return (
             StatusCode::NOT_MODIFIED,

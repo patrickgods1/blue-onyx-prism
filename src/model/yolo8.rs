@@ -9,6 +9,7 @@ use super::{
     Detection, Family, ModelFamilyKind, NamedOutput, PostParams, PreprocessCtx, ResizeMode,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Yolo8 {
     pub num_classes: usize,
 }
@@ -53,30 +54,37 @@ impl Family for Yolo8 {
         let num_classes = channels - 4;
         let thr = params.confidence_threshold;
 
-        // Pass 1: per-anchor best class score, walking the class rows contiguously.
-        let mut best = vec![f32::NEG_INFINITY; anchors];
-        let mut best_cls = vec![0usize; anchors];
-        for c in 0..num_classes {
-            let row = &data[(4 + c) * anchors..(5 + c) * anchors];
-            for (j, &v) in row.iter().enumerate() {
-                if v > best[j] {
-                    best[j] = v;
-                    best_cls[j] = c;
+        // Pass 1: per-anchor best (score, class), walking the class rows contiguously.
+        let mut best = vec![(f32::NEG_INFINITY, 0usize); anchors];
+        for (c, row) in data
+            .chunks_exact(anchors)
+            .skip(4)
+            .take(num_classes)
+            .enumerate()
+        {
+            for (b, &v) in best.iter_mut().zip(row) {
+                if v > b.0 {
+                    *b = (v, c);
                 }
             }
         }
 
-        let (cxs, rest) = data.split_at(anchors);
-        let (cys, rest) = rest.split_at(anchors);
-        let (ws, rest) = rest.split_at(anchors);
-        let hs = &rest[..anchors];
+        let mut planes = data.chunks_exact(anchors);
+        let (Some(cxs), Some(cys), Some(ws), Some(hs)) =
+            (planes.next(), planes.next(), planes.next(), planes.next())
+        else {
+            anyhow::bail!(
+                "yolo8: output `{}` shape {:?} has fewer than 4 box rows",
+                out.name,
+                out.shape
+            );
+        };
         let mut dets = Vec::new();
-        for j in 0..anchors {
-            let conf = best[j];
+        let boxes = cxs.iter().zip(cys).zip(ws).zip(hs).zip(&best);
+        for ((((&cx, &cy), &w), &h), &(conf, class_id)) in boxes {
             if !meets(conf, thr) {
                 continue;
             }
-            let (cx, cy, w, h) = (cxs[j], cys[j], ws[j], hs[j]);
             let (x1, y1, x2, y2) =
                 ctx.to_original(cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0);
             dets.push(Detection {
@@ -85,7 +93,7 @@ impl Family for Yolo8 {
                 x2,
                 y2,
                 score: conf,
-                class_id: best_cls[j],
+                class_id,
             });
         }
         nms(&mut dets, params.nms_iou);

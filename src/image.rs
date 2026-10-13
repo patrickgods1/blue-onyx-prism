@@ -13,6 +13,26 @@ use zune_jpeg::JpegDecoder;
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/roboto-mono-stripped.ttf");
 
+/// Default of `max_image_pixels` (config): 50 megapixels, about 8700 x 5700.
+pub const MAX_IMAGE_PIXELS_DEFAULT: u64 = 50_000_000;
+static MAX_IMAGE_PIXELS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(MAX_IMAGE_PIXELS_DEFAULT);
+
+/// Set the process-wide decode ceiling (config `max_image_pixels`); 0 restores the default.
+pub fn set_max_pixels(pixels: u64) {
+    let v = if pixels == 0 {
+        MAX_IMAGE_PIXELS_DEFAULT
+    } else {
+        pixels
+    };
+    MAX_IMAGE_PIXELS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current decode ceiling in pixels (width x height).
+pub fn max_pixels() -> u64 {
+    MAX_IMAGE_PIXELS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Tightly packed RGB8 image (`rgb.len() == width * height * 3`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RgbImage {
@@ -21,40 +41,125 @@ pub struct RgbImage {
     pub rgb: Vec<u8>,
 }
 
+/// Error for an image rejected by the decode ceiling (`max_image_pixels`) or a zero size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizeRejected(pub String);
+
+impl std::fmt::Display for SizeRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SizeRejected {}
+
+/// Reject a zero-sized image or one over [`max_pixels`] before anything is allocated.
+fn check_dimensions(w: u64, h: u64) -> Result<()> {
+    if w == 0 || h == 0 {
+        return Err(SizeRejected(format!("image has a zero dimension ({w}x{h})")).into());
+    }
+    let limit = max_pixels();
+    let pixels = w.saturating_mul(h);
+    if pixels > limit {
+        return Err(SizeRejected(format!(
+            "image {w}x{h} ({pixels} pixels) exceeds the decode limit of {limit} pixels \
+             (max_image_pixels)"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// `w * h * 3`, the byte length of a packed RGB8 image, or an error on overflow.
+fn rgb_len(w: u32, h: u32) -> Result<usize> {
+    (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|p| p.checked_mul(3))
+        .ok_or_else(|| anyhow!("image {w}x{h} does not fit in memory"))
+}
+
 /// Decode JPEG (zune-jpeg) or any format the `image` crate understands (PNG, ...).
+///
+/// The header is read first: a zero-sized image or one whose pixel count exceeds
+/// [`max_pixels`] is rejected before any pixel buffer is allocated.
 pub fn decode(bytes: &[u8]) -> Result<RgbImage> {
     if bytes.starts_with(&[0xFF, 0xD8]) {
         match decode_jpeg(bytes) {
             Ok(img) => return Ok(img),
+            Err(e) if e.is::<SizeRejected>() => return Err(e),
             Err(e) => {
                 tracing::debug!("zune-jpeg failed ({e:#}), falling back to image crate");
             }
         }
     }
-    let dynimg = image::load_from_memory(bytes).context("decoding image")?;
-    let rgb = dynimg.to_rgb8();
+    decode_with_image_crate(bytes)
+}
+
+fn decode_with_image_crate(bytes: &[u8]) -> Result<RgbImage> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("detecting image format")?;
+    let format = reader
+        .format()
+        .ok_or_else(|| anyhow!("unrecognized image format"))?;
+    let (w, h) = reader
+        .into_dimensions()
+        .context("reading image dimensions")?;
+    check_dimensions(u64::from(w), u64::from(h))?;
+    let expected = rgb_len(w, h)?;
+
+    let mut reader = ImageReader::new(Cursor::new(bytes));
+    reader.set_format(format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(w);
+    limits.max_image_height = Some(h);
+    // Room for the decoder's working set plus a 16-bit RGBA frame of the ceiling.
+    limits.max_alloc = Some(max_pixels().saturating_mul(16));
+    reader.limits(limits);
+    let rgb = reader.decode().context("decoding image")?.into_rgb8();
+    if (rgb.width(), rgb.height()) != (w, h) {
+        bail!(
+            "decoded image is {}x{}, header said {w}x{h}",
+            rgb.width(),
+            rgb.height()
+        );
+    }
+    let rgb = rgb.into_raw();
+    if rgb.len() != expected {
+        bail!("unexpected RGB buffer size {} for {w}x{h}", rgb.len());
+    }
     Ok(RgbImage {
-        width: rgb.width(),
-        height: rgb.height(),
-        rgb: rgb.into_raw(),
+        width: w,
+        height: h,
+        rgb,
     })
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Result<RgbImage> {
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-    let rgb = decoder
-        .decode()
-        .map_err(|e| anyhow!("JPEG decode failed: {e:?}"))?;
+    decoder
+        .decode_headers()
+        .map_err(|e| anyhow!("JPEG header decode failed: {e:?}"))?;
     let (w, h) = decoder
         .dimensions()
         .ok_or_else(|| anyhow!("JPEG has no dimensions"))?;
-    if rgb.len() != w * h * 3 {
+    let w = u32::try_from(w).map_err(|_| anyhow!("JPEG width {w} is out of range"))?;
+    let h = u32::try_from(h).map_err(|_| anyhow!("JPEG height {h} is out of range"))?;
+    check_dimensions(u64::from(w), u64::from(h))?;
+    let expected = rgb_len(w, h)?;
+    let rgb = decoder
+        .decode()
+        .map_err(|e| anyhow!("JPEG decode failed: {e:?}"))?;
+    if rgb.len() != expected {
         bail!("unexpected JPEG output size {} for {w}x{h}", rgb.len());
     }
     Ok(RgbImage {
-        width: w as u32,
-        height: h as u32,
+        width: w,
+        height: h,
         rgb,
     })
 }
@@ -64,21 +169,16 @@ pub fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
     if img.width == 0 || img.height == 0 {
         bail!("cannot encode an empty image");
     }
-    if img.width > u16::MAX as u32 || img.height > u16::MAX as u32 {
+    let (Ok(w16), Ok(h16)) = (u16::try_from(img.width), u16::try_from(img.height)) else {
         bail!("image too large for JPEG ({}x{})", img.width, img.height);
-    }
-    if img.rgb.len() != img.width as usize * img.height as usize * 3 {
+    };
+    if img.rgb.len() != rgb_len(img.width, img.height)? {
         bail!("RGB buffer size does not match dimensions");
     }
     let mut out = Vec::new();
     let enc = jpeg_encoder::Encoder::new(&mut out, quality.clamp(1, 100));
-    enc.encode(
-        &img.rgb,
-        img.width as u16,
-        img.height as u16,
-        jpeg_encoder::ColorType::Rgb,
-    )
-    .map_err(|e| anyhow!("JPEG encode failed: {e}"))?;
+    enc.encode(&img.rgb, w16, h16, jpeg_encoder::ColorType::Rgb)
+        .map_err(|e| anyhow!("JPEG encode failed: {e}"))?;
     Ok(out)
 }
 
@@ -86,33 +186,60 @@ const BOX_COLOR: [u8; 3] = [255, 0, 0];
 const BAR_COLOR: [u8; 3] = [170, 0, 0];
 const TEXT_COLOR: [u8; 3] = [255, 255, 255];
 
+/// Round a geometry value to an integer; NaN maps to 0 and huge values saturate at +-1e9.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "clamped to +-1e9 (fits i64); NaN clamps to NaN and `as` maps it to 0"
+)]
+fn f2i(v: f32) -> i64 {
+    v.round().clamp(-1e9, 1e9) as i64
+}
+
+/// Clamp `v` into `0..=max` and convert to `usize` (never negative after the clamp).
+fn clamp_index(v: i64, max: u32) -> usize {
+    usize::try_from(v.clamp(0, i64::from(max))).unwrap_or(0)
+}
+
 fn fill_rect(img: &mut RgbImage, x0: i64, y0: i64, x1: i64, y1: i64, color: [u8; 3]) {
     // Half-open [x0, x1) x [y0, y1), clamped to the image.
-    let x0 = x0.clamp(0, img.width as i64) as usize;
-    let x1 = x1.clamp(0, img.width as i64) as usize;
-    let y0 = y0.clamp(0, img.height as i64) as usize;
-    let y1 = y1.clamp(0, img.height as i64) as usize;
+    let x0 = clamp_index(x0, img.width);
+    let x1 = clamp_index(x1, img.width);
+    let y0 = clamp_index(y0, img.height);
+    let y1 = clamp_index(y1, img.height);
     if x0 >= x1 || y0 >= y1 {
         return;
     }
-    let w = img.width as usize;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let i = (y * w + x) * 3;
-            img.rgb[i..i + 3].copy_from_slice(&color);
+    let Some(row_bytes) = (img.width as usize).checked_mul(3) else {
+        return;
+    };
+    for row in img.rgb.chunks_exact_mut(row_bytes).skip(y0).take(y1 - y0) {
+        if let Some(span) = row.get_mut(x0 * 3..x1 * 3) {
+            for px in span.as_chunks_mut::<3>().0 {
+                *px = color;
+            }
         }
     }
 }
 
 fn blend_pixel(img: &mut RgbImage, x: i64, y: i64, color: [u8; 3], coverage: f32) {
-    if x < 0 || y < 0 || x >= img.width as i64 || y >= img.height as i64 {
+    if x < 0 || y < 0 || x >= i64::from(img.width) || y >= i64::from(img.height) {
         return;
     }
-    let i = (y as usize * img.width as usize + x as usize) * 3;
+    let (x, y) = (clamp_index(x, img.width), clamp_index(y, img.height));
+    let i = (y * img.width as usize + x) * 3;
+    let Some(px3) = img.rgb.get_mut(i..i + 3) else {
+        return;
+    };
     let a = coverage.clamp(0.0, 1.0);
-    for (px, &src) in img.rgb[i..i + 3].iter_mut().zip(color.iter()) {
-        let dst = *px as f32;
-        *px = (dst + (src as f32 - dst) * a).round() as u8;
+    for (px, &src) in px3.iter_mut().zip(color.iter()) {
+        let dst = f32::from(*px);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a linear blend of two 0..=255 values with a 0..=1 weight, clamped again"
+        )]
+        let v = (dst + (f32::from(src) - dst) * a).round().clamp(0.0, 255.0) as u8;
+        *px = v;
     }
 }
 
@@ -125,7 +252,7 @@ fn draw_text(img: &mut RgbImage, font: &FontArc, px: f32, x: i64, y: i64, max_x:
         let glyph =
             gid.with_scale_and_position(PxScale::from(px), ab_glyph::point(caret, baseline));
         caret += scaled.h_advance(gid);
-        if caret as i64 > max_x {
+        if f2i(caret) > max_x {
             break;
         }
         if let Some(outlined) = font.outline_glyph(glyph) {
@@ -133,8 +260,8 @@ fn draw_text(img: &mut RgbImage, font: &FontArc, px: f32, x: i64, y: i64, max_x:
             outlined.draw(|gx, gy, cov| {
                 blend_pixel(
                     img,
-                    b.min.x as i64 + gx as i64,
-                    b.min.y as i64 + gy as i64,
+                    f2i(b.min.x) + i64::from(gx),
+                    f2i(b.min.y) + i64::from(gy),
                     TEXT_COLOR,
                     cov,
                 );
@@ -149,22 +276,23 @@ pub fn draw_predictions(img: &RgbImage, preds: &[Prediction]) -> RgbImage {
     let mut out = img.clone();
     if out.width == 0
         || out.height == 0
-        || out.rgb.len() != out.width as usize * out.height as usize * 3
+        || Some(out.rgb.len()) != rgb_len(out.width, out.height).ok()
     {
         return out;
     }
     let font = FontArc::try_from_slice(FONT_BYTES).ok();
     let scale = (out.width.max(out.height) as f32 / 640.0).max(0.5);
-    let thickness = scale.ceil().max(1.0) as i64;
+    let thickness = f2i(scale.ceil()).max(1);
     let font_px = (16.0 * scale).ceil().max(12.0);
-    let bar_h = font_px as i64;
+    let bar_h = f2i(font_px);
+    let coord = |v: usize| i64::try_from(v).unwrap_or(i64::MAX / 4);
 
     for p in preds {
         let (x0, y0, x1, y1) = (
-            p.x_min as i64,
-            p.y_min as i64,
-            p.x_max as i64,
-            p.y_max as i64,
+            coord(p.x_min),
+            coord(p.y_min),
+            coord(p.x_max),
+            coord(p.y_max),
         );
         if x1 > x0 && y1 > y0 {
             let t = thickness
@@ -178,8 +306,8 @@ pub fn draw_predictions(img: &RgbImage, preds: &[Prediction]) -> RgbImage {
         }
         if let Some(font) = &font {
             // Keep the bar on screen even when the box touches the top edge.
-            let bar_w = (x1 - x0).max(font_px as i64 * 6);
-            let bar_y = y0.clamp(0, (out.height as i64 - bar_h).max(0));
+            let bar_w = (x1 - x0).max(bar_h * 6);
+            let bar_y = y0.clamp(0, (i64::from(out.height) - bar_h).max(0));
             fill_rect(&mut out, x0, bar_y, x0 + bar_w, bar_y + bar_h, BAR_COLOR);
             let label = format!("{}   {:.0}%", p.label, p.confidence * 100.0);
             draw_text(&mut out, font, font_px - 1.0, x0, bar_y, x0 + bar_w, &label);
@@ -310,5 +438,122 @@ mod tests {
         assert!(dir.join("cam1_od.jpg").exists());
         assert!(dir.join("cam1.jpg").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = synthetic(w, h);
+        let buf = image::RgbImage::from_raw(w, h, img.rgb).unwrap();
+        let mut png = Vec::new();
+        buf.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    /// A PNG signature + IHDR claiming `w x h` (no pixel data): enough for the header read.
+    fn png_header_only(w: u32, h: u32) -> Vec<u8> {
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+        let crc = |data: &[u8]| {
+            // CRC-32 (ISO 3309), as the PNG spec requires over type + data.
+            let mut c: u32 = 0xFFFF_FFFF;
+            for &b in data {
+                c ^= u32::from(b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        };
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&crc(&ihdr).to_be_bytes());
+        // An empty IDAT chunk: the header reader stops here, before any pixel data.
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IDAT");
+        out.extend_from_slice(&crc(b"IDAT").to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn zero_size_png_rejected() {
+        // The PNG decoder itself refuses a zero dimension; our own check covers decoders
+        // that do not.
+        assert!(decode(&png_header_only(0, 10)).is_err());
+        let e = check_dimensions(0, 10).unwrap_err();
+        assert!(e.is::<SizeRejected>(), "{e:#}");
+        assert!(e.to_string().contains("0x10"), "{e}");
+        assert!(check_dimensions(10, 0).is_err());
+        assert!(check_dimensions(10, 10).is_ok());
+        assert!(check_dimensions(u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn oversize_header_rejected_before_decoding() {
+        // 20000 x 20000 = 400 MP > the 50 MP default; only the header exists, so a decoder that
+        // reached the pixel data would fail with a different (truncation) error.
+        let e = decode(&png_header_only(20000, 20000)).unwrap_err();
+        assert!(e.is::<SizeRejected>(), "{e:#}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("20000x20000") && msg.contains("50000000"),
+            "{msg}"
+        );
+        // Same for a JPEG whose SOF0 header claims 9000x9000 (81 MP): patch a real 8x8 file.
+        let mut jpg = encode_jpeg(&synthetic(8, 8), 90).unwrap();
+        let sof = jpg.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+        jpg[sof + 5..sof + 7].copy_from_slice(&9000u16.to_be_bytes());
+        jpg[sof + 7..sof + 9].copy_from_slice(&9000u16.to_be_bytes());
+        let e = decode(&jpg).unwrap_err();
+        assert!(e.is::<SizeRejected>(), "{e:#}");
+        assert!(e.to_string().contains("9000x9000"), "{e}");
+    }
+
+    #[test]
+    fn max_pixels_setting_is_honoured() {
+        // Serialize against other tests touching the global ceiling.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        let png = png_bytes(8, 8);
+        let jpg = encode_jpeg(&synthetic(8, 8), 90).unwrap();
+        set_max_pixels(63);
+        assert_eq!(max_pixels(), 63);
+        let e = decode(&png).unwrap_err();
+        assert!(
+            e.is::<SizeRejected>() && e.to_string().contains("8x8"),
+            "{e}"
+        );
+        assert!(decode(&jpg).unwrap_err().is::<SizeRejected>());
+        set_max_pixels(64);
+        assert_eq!(decode(&png).unwrap(), synthetic(8, 8));
+        assert_eq!(decode(&jpg).unwrap().width, 8);
+        set_max_pixels(0);
+        assert_eq!(max_pixels(), MAX_IMAGE_PIXELS_DEFAULT);
+        assert!(decode(&png_bytes(16, 16)).is_ok());
+    }
+
+    #[test]
+    fn encode_rejects_bad_buffers() {
+        let mut img = synthetic(4, 4);
+        img.rgb.pop();
+        assert!(encode_jpeg(&img, 90).is_err());
+        let huge = RgbImage {
+            width: 70_000,
+            height: 1,
+            rgb: Vec::new(),
+        };
+        assert!(
+            encode_jpeg(&huge, 90)
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
     }
 }

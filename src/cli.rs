@@ -20,10 +20,7 @@ pub(crate) fn family_parser() -> impl clap::builder::TypedValueParser<Value = Mo
     PossibleValuesParser::new(
         ModelFamilyKind::ALL.map(|k| PossibleValue::new(k.name()).help(k.description())),
     )
-    .map(|s| {
-        s.parse::<ModelFamilyKind>()
-            .expect("PossibleValuesParser only passes known family names")
-    })
+    .try_map(|s| s.parse::<ModelFamilyKind>().map_err(|e| e.to_string()))
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -202,25 +199,63 @@ pub struct Cli {
 }
 
 /// Load the config file (explicit `--config`, else the default path if it exists, else
-/// defaults), apply every CLI option that was given, and write the result back.
+/// defaults), apply every CLI option that was given, validate the result
+/// ([`Config::validate`]; an invalid result is an error and the file is not written) and write
+/// it back when it differs from the file (or the file does not exist yet).
 pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     let path = cli
         .config
         .clone()
         .unwrap_or_else(Config::default_config_path);
-    let mut config = if path.exists() {
+    let existed = path.exists();
+    let mut config = if existed {
         Config::load(&path)?
     } else {
         Config::default()
     };
+    let loaded = config.clone();
     let base = std::env::current_dir().context("reading current directory")?;
     merge_cli(&mut config, &cli.absolutized(&base));
     // Same names in memory as in the written file (a `--model` entry gets its file stem).
     config.fill_model_names();
-    if let Err(e) = config.save(&path) {
+    config
+        .validate()
+        .context("invalid command-line option (the config file was not changed)")?;
+    let unchanged = existed && config.saved_text()? == loaded.saved_text()?;
+    if !unchanged && let Err(e) = config.save(&path) {
         tracing::warn!("could not save merged config: {e:#}");
     }
     Ok((config, path))
+}
+
+/// Whether two model paths name the same file: equal as given, or equal once both are
+/// canonicalized (when both exist).
+fn same_model_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// `stem`, or `stem-2`, `stem-3`, ... : the first name no entry of `config` uses.
+fn unique_model_name(config: &Config, stem: &str) -> String {
+    use crate::registry::normalize_name;
+    let taken = |n: &str| {
+        config
+            .models
+            .iter()
+            .any(|m| normalize_name(&m.effective_name()) == normalize_name(n))
+    };
+    let mut name = stem.to_string();
+    let mut k = 2u32;
+    while taken(&name) {
+        name = format!("{stem}-{k}");
+        k = k.saturating_add(1);
+    }
+    name
 }
 
 /// `p` joined onto `base` when relative (no filesystem access, no canonicalization).
@@ -380,20 +415,31 @@ fn merge_cli(config: &mut Config, cli: &Cli) {
         config.onnxruntime_dir = Some(v.clone());
     }
     if let Some(model) = &cli.model {
-        // `--model` always loads that model: enable an existing entry, else replace the list.
-        let mut found = false;
-        for m in config.models.iter_mut().filter(|m| &m.path == model) {
+        // `--model` always loads that model: enable the entries whose resolved path (relative
+        // config paths resolve under `download_dir`, as the registry does) is that file, else
+        // append a new enabled entry. No other entry is changed.
+        let hits: Vec<bool> = config
+            .models
+            .iter()
+            .map(|m| same_model_file(&config.data_path(&m.path), model))
+            .collect();
+        for (m, _) in config.models.iter_mut().zip(&hits).filter(|(_, hit)| **hit) {
             m.enabled = true;
-            found = true;
         }
-        if !found {
-            config.models = vec![ModelConfig {
+        if !hits.contains(&true) {
+            let stem = model
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "model".to_string());
+            let name = unique_model_name(config, &stem);
+            config.models.push(ModelConfig {
+                name: Some(name),
                 path: model.clone(),
                 family: cli.family.unwrap_or(ModelFamilyKind::Auto),
                 classes: cli.classes.clone(),
                 enabled: true,
                 ..Default::default()
-            }];
+            });
         }
     }
 }
@@ -746,14 +792,22 @@ mod tests {
     }
 
     #[test]
-    fn model_creates_single_entry() {
+    fn model_is_appended_when_not_configured() {
         let path = temp_cfg();
         let existing = ModelConfig {
+            name: Some("old".into()),
             path: "models/old.xml".into(),
+            enabled: false,
+            ..Default::default()
+        };
+        let other = ModelConfig {
+            name: Some("other".into()),
+            path: "models/other.onnx".into(),
             ..Default::default()
         };
         Config {
-            models: vec![existing.clone(), existing.clone()],
+            models: vec![existing.clone(), other.clone()],
+            default_model: Some("other".into()),
             ..Default::default()
         }
         .save(&path)
@@ -767,14 +821,20 @@ mod tests {
         };
         let (c, _) = resolve_config(&cli).unwrap();
         let cwd = std::env::current_dir().unwrap();
-        assert_eq!(c.models.len(), 1);
-        assert_eq!(c.models[0].path, cwd.join("models/new.onnx"));
-        assert_eq!(c.models[0].family, ModelFamilyKind::Yolo5);
-        assert_eq!(c.models[0].classes, Some(cwd.join("c.yaml")));
+        // The other entries are kept as they were (CO-01), the new one is appended enabled.
+        assert_eq!(c.models.len(), 3);
+        assert_eq!(c.models[0], existing);
+        assert_eq!(c.models[1], other);
+        assert_eq!(c.default_model.as_deref(), Some("other"));
+        assert_eq!(c.models[2].path, cwd.join("models/new.onnx"));
+        assert_eq!(c.models[2].family, ModelFamilyKind::Yolo5);
+        assert_eq!(c.models[2].classes, Some(cwd.join("c.yaml")));
+        assert!(c.models[2].enabled);
+        assert_eq!(Config::load(&path).unwrap(), c);
 
-        assert!(c.models[0].enabled);
-
-        // Already present: list is untouched.
+        // Already present: list is untouched, and the file is not rewritten.
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
         let cli = Cli {
             config: Some(path.clone()),
             model: Some("models/new.onnx".into()),
@@ -782,34 +842,87 @@ mod tests {
         };
         let (c2, _) = resolve_config(&cli).unwrap();
         assert_eq!(c2.models, c.models);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
 
-        // Already present but disabled: it gets enabled, other entries are kept as they are.
-        let new_path = c.models[0].path.clone();
-        Config {
+        // A new file whose stem is taken by another entry gets a distinct name.
+        let mut cfg = c2.clone();
+        let cli = Cli {
+            model: Some(cwd.join("elsewhere/old.xml")),
+            ..Default::default()
+        };
+        merge_cli(&mut cfg, &cli);
+        assert_eq!(cfg.models.len(), 4);
+        assert_eq!(cfg.models[3].name.as_deref(), Some("old-2"));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn model_matches_a_relative_config_entry() {
+        // A relative entry (what `download-models --add-to-config` writes) resolves under
+        // `download_dir`; `--model` with the same file enables it instead of adding a copy.
+        let root = std::env::temp_dir().join(format!("bo_cli_root_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models/IPcam-general.onnx"), b"x").unwrap();
+        let mut cfg = Config {
+            download_dir: Some(root.clone()),
             models: vec![
                 ModelConfig {
-                    enabled: true,
-                    ..existing.clone()
+                    name: Some("IPcam-general".into()),
+                    path: "models/IPcam-general.onnx".into(),
+                    enabled: false,
+                    ..Default::default()
                 },
                 ModelConfig {
-                    path: new_path.clone(),
-                    enabled: false,
+                    name: Some("b".into()),
+                    path: "models/b.onnx".into(),
                     ..Default::default()
                 },
             ],
             ..Default::default()
+        };
+        let before = cfg.clone();
+        // The CLI path as `absolutized` makes it from the install dir (with a `.` segment that
+        // only canonicalization removes).
+        let cli = Cli {
+            model: Some(root.join(".").join("models/IPcam-general.onnx")),
+            ..Default::default()
+        };
+        merge_cli(&mut cfg, &cli);
+        assert_eq!(cfg.models.len(), 2);
+        assert!(cfg.models[0].enabled);
+        assert_eq!(cfg.models[0].path, before.models[0].path);
+        assert_eq!(cfg.models[1], before.models[1]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn invalid_cli_value_is_rejected_and_not_written() {
+        let path = temp_cfg();
+        Config {
+            port: 4000,
+            ..Default::default()
         }
         .save(&path)
         .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
         let cli = Cli {
-            config: Some(path),
-            model: Some("models/new.onnx".into()),
+            config: Some(path.clone()),
+            confidence_threshold: Some(7.0),
             ..Default::default()
         };
-        let (c3, _) = resolve_config(&cli).unwrap();
-        assert_eq!(c3.models.len(), 2);
-        assert!(c3.models[0].enabled && c3.models[1].enabled);
-        assert_eq!(c3.models[1].path, new_path);
+        let err = format!("{:#}", resolve_config(&cli).unwrap_err());
+        assert!(err.contains("confidence_threshold"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let cli = Cli {
+            config: Some(path.clone()),
+            worker_queue_size: Some(usize::MAX),
+            ..Default::default()
+        };
+        assert!(resolve_config(&cli).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]

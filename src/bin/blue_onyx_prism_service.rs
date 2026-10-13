@@ -10,6 +10,23 @@
 //! and, at INFO and above, to the Application event log under the source `BlueOnyxPrism`.
 //! Modeled on the blue-onyx service binary (MIT).
 
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::large_futures,
+        clippy::unused_async,
+        clippy::dbg_macro,
+        missing_debug_implementations
+    )
+)]
+#![deny(unsafe_code)]
+
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
     service::main()

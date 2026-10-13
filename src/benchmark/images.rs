@@ -204,6 +204,37 @@ impl GroundTruth {
     }
 }
 
+/// Largest dataset image file the benchmark reads (64 MiB).
+pub const MAX_IMAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read `path`, failing (with an error naming the file) when it is larger than `max` bytes.
+fn read_limited(path: &Path, max: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let len = f
+        .metadata()
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if len > max {
+        bail!(
+            "{} is {len} bytes, larger than the {max}-byte limit for benchmark images",
+            path.display()
+        );
+    }
+    let mut buf = Vec::new();
+    // `take` guards against a file that grows between the size check and the read.
+    f.take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if buf.len() as u64 > max {
+        bail!(
+            "{} is larger than the {max}-byte limit for benchmark images",
+            path.display()
+        );
+    }
+    Ok(buf)
+}
+
 /// One image of a set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetImage {
@@ -220,13 +251,12 @@ pub struct SetImage {
 }
 
 impl SetImage {
-    /// Encoded image bytes.
+    /// Encoded image bytes. Files larger than [`MAX_IMAGE_FILE_BYTES`] are rejected before
+    /// they are read; decoding goes through `crate::image::decode` (pixel ceiling).
     pub fn bytes(&self) -> Result<Cow<'static, [u8]>> {
         match &self.path {
             None => Ok(Cow::Borrowed(super::DEFAULT_IMAGE)),
-            Some(p) => std::fs::read(p)
-                .map(Cow::Owned)
-                .with_context(|| format!("reading {}", p.display())),
+            Some(p) => read_limited(p, MAX_IMAGE_FILE_BYTES).map(Cow::Owned),
         }
     }
 
@@ -298,8 +328,11 @@ pub struct ImageSet {
 impl ImageSet {
     /// The embedded sample image (no ground truth).
     pub fn sample() -> Self {
-        let (width, height) = image::load_from_memory(super::DEFAULT_IMAGE)
-            .map(|i| (i.width(), i.height()))
+        // Header only: no decode.
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(super::DEFAULT_IMAGE))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
             .unwrap_or((0, 0));
         let mut tags = vec!["day".to_string(), "general".to_string()];
         add_resolution_tag(&mut tags, width, height);
@@ -400,7 +433,10 @@ impl ImageSet {
         if n == 0 || n >= len {
             return;
         }
-        let picked: Vec<SetImage> = (0..n).map(|i| self.images[i * len / n].clone()).collect();
+        // i * len / n < len for i < n.
+        let picked: Vec<SetImage> = (0..n)
+            .filter_map(|i| self.images.get(i * len / n).cloned())
+            .collect();
         self.images = picked;
     }
 
@@ -628,7 +664,11 @@ pub fn parse_coco(text: &str) -> Result<Vec<(String, Vec<GtBox>)>> {
             continue;
         };
         let [x, y, w, h] = a.bbox;
-        out[i].1.push(GtBox {
+        // `index` values are positions in `out`.
+        let Some(entry) = out.get_mut(i) else {
+            continue;
+        };
+        entry.1.push(GtBox {
             label: name.to_string(),
             bbox: [x, y, x + w, y + h],
             ignore: a.iscrowd != 0,
@@ -691,7 +731,11 @@ pub fn yolo_class_names(dirs: &[&Path]) -> Result<Vec<String>> {
     Ok(crate::model::classes::coco80())
 }
 
-/// `names:` of a YOLO dataset YAML, as a list or an `index: name` map.
+/// Largest class index accepted in a YOLO `names:` map.
+pub const MAX_YOLO_CLASS_INDEX: u64 = 10_000;
+
+/// `names:` of a YOLO dataset YAML, as a list or an `index: name` map. A map index above
+/// [`MAX_YOLO_CLASS_INDEX`] or above 4x the entry count (at least 16) is an error.
 pub fn parse_yolo_yaml(text: &str) -> Result<Vec<String>> {
     let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(text)?;
     let names = v.get("names").context("no `names` in the dataset YAML")?;
@@ -707,10 +751,24 @@ pub fn parse_yolo_yaml(text: &str) -> Result<Vec<String>> {
             .filter_map(|(k, v)| Some((k.as_u64()?, v.as_str()?.to_string())))
             .collect();
         pairs.sort();
-        let len = pairs.last().map_or(0, |p| p.0 as usize + 1);
+        // Validate the largest index before allocating: the list is sized by it.
+        let max_index = pairs.last().map_or(0, |p| p.0);
+        let bound = MAX_YOLO_CLASS_INDEX.min((pairs.len() as u64).saturating_mul(4).max(16));
+        if max_index > bound {
+            bail!(
+                "class index {max_index} in `names` is too large ({} entries; at most {bound} allowed)",
+                pairs.len()
+            );
+        }
+        let len = usize::try_from(max_index)
+            .ok()
+            .and_then(|m| m.checked_add(1))
+            .context("class index out of range")?;
         let mut out = vec![String::new(); len];
         for (i, n) in pairs {
-            out[i as usize] = n;
+            if let Some(slot) = usize::try_from(i).ok().and_then(|i| out.get_mut(i)) {
+                *slot = n;
+            }
         }
         return Ok(out);
     }
@@ -726,17 +784,17 @@ pub fn parse_yolo(text: &str, names: &[String], w: u32, h: u32) -> Result<Vec<Gt
         if f.is_empty() {
             continue;
         }
-        if f.len() < 5 {
+        let [c, x, y, bw, bh, ..] = f.as_slice() else {
             bail!("line {}: expected `class cx cy w h`", n + 1);
-        }
-        let cls: usize = f[0]
+        };
+        let cls: usize = c
             .parse()
-            .with_context(|| format!("line {}: bad class '{}'", n + 1, f[0]))?;
-        let v: Vec<f32> = f[1..5]
-            .iter()
-            .map(|s| s.parse::<f32>())
-            .collect::<Result<_, _>>()
-            .with_context(|| format!("line {}: bad number", n + 1))?;
+            .with_context(|| format!("line {}: bad class '{c}'", n + 1))?;
+        let num = |s: &str| {
+            s.parse::<f32>()
+                .with_context(|| format!("line {}: bad number", n + 1))
+        };
+        let v = [num(x)?, num(y)?, num(bw)?, num(bh)?];
         let label = names
             .get(cls)
             .cloned()
@@ -1019,6 +1077,27 @@ mod tests {
             ["person", "car"]
         );
         assert!(parse_yolo_yaml("nc: 2").is_err());
+        // Index maps are bounded before anything is allocated.
+        assert_eq!(
+            parse_yolo_yaml("names:\n  0: a\n  15: b\n").unwrap().len(),
+            16
+        );
+        for huge in ["100000000000", "18446744073709551615", "10001"] {
+            let e = parse_yolo_yaml(&format!("names:\n  {huge}: x\n")).unwrap_err();
+            assert!(format!("{e:#}").contains("too large"), "{huge}: {e:#}");
+        }
+    }
+
+    #[test]
+    fn oversized_image_files_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("bop-img-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("big.jpg");
+        std::fs::write(&p, vec![0u8; 100]).unwrap();
+        assert_eq!(read_limited(&p, 100).unwrap().len(), 100);
+        let e = read_limited(&p, 99).unwrap_err();
+        assert!(format!("{e:#}").contains("big.jpg"), "{e:#}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

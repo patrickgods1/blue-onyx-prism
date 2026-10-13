@@ -239,6 +239,10 @@ pub struct Pick {
 }
 
 /// Round down to a multiple of 0.01 (a hair of tolerance so 0.35 stays 0.35 in f32).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a threshold in 0..=1: the f64 -> f32 narrowing only drops precision"
+)]
 pub fn floor_cent(t: f64) -> f32 {
     ((t * 100.0 + 1e-4).floor() / 100.0) as f32
 }
@@ -269,20 +273,22 @@ pub fn best_segment(segments: &[Segment]) -> Option<usize> {
 /// The widest contiguous run `(first, last)` of segments scoring at least `best - tol`
 /// (ties: the higher run). `segments` ascend and are contiguous.
 pub fn plateau(segments: &[Segment], tol: f64) -> Option<(usize, usize)> {
-    let best = segments[best_segment(segments)?].score?;
+    let best = segments.get(best_segment(segments)?)?.score?;
     let ok = |s: &Segment| s.score.is_some_and(|v| v >= best - tol - TIE);
     let mut out: Option<(usize, usize, f32)> = None;
     let mut i = 0;
-    while i < segments.len() {
-        if !ok(&segments[i]) {
+    while let Some(first) = segments.get(i) {
+        if !ok(first) {
             i += 1;
             continue;
         }
         let a = i;
-        while i + 1 < segments.len() && ok(&segments[i + 1]) {
+        let mut last = first;
+        while let Some(next) = segments.get(i + 1).filter(|s| ok(s)) {
+            last = next;
             i += 1;
         }
-        let width = segments[i].hi - segments[a].lo;
+        let width = last.hi - first.lo;
         if out.is_none_or(|(_, _, w)| width >= w - 1e-6) {
             out = Some((a, i, width));
         }
@@ -294,7 +300,10 @@ pub fn plateau(segments: &[Segment], tol: f64) -> Option<(usize, usize)> {
 /// The reported threshold of the run `(a, b)`: its midpoint rounded down to 0.01; when that
 /// falls out of the run, the run's top rounded down; at least [`MIN_THRESHOLD`].
 fn round_in(segments: &[Segment], a: usize, b: usize) -> f32 {
-    let (lo, hi) = (segments[a].lo, segments[b].hi);
+    let (Some(sa), Some(sb)) = (segments.get(a), segments.get(b)) else {
+        return MIN_THRESHOLD;
+    };
+    let (lo, hi) = (sa.lo, sb.hi);
     let r = floor_cent((lo as f64 + hi as f64) / 2.0);
     // The lowest segment includes its lower end.
     let inside = r > lo || (a == 0 && r >= lo);
@@ -360,15 +369,25 @@ pub fn exact_pick(bp: &Breakpoints, objective: Objective) -> Option<Pick> {
             exact_score: exact.1,
             plateau: Some(run),
         };
-    if let Some(best) = best_segment(&segs) {
+    // `best_segment` and `plateau` return indices into `segs`.
+    if let Some((best, sbest)) = best_segment(&segs).and_then(|i| Some((i, segs.get(i)?))) {
         let (a, b) = plateau(&segs, PLATEAU).unwrap_or((best, best));
+        let run = [
+            segs.get(a).map_or(sbest.lo, |s| s.lo),
+            segs.get(b).map_or(sbest.hi, |s| s.hi),
+        ];
         let mut t = round_in(&segs, a, b);
         let mut note = None;
         if objective.target_met(&bp.point_at(t)) == Some(false) {
             // Rounding down may let in enough false positives (false alerts) to miss the
             // target: take the next 0.01 step up that meets it.
             let meets = |t: f32| objective.target_met(&bp.point_at(t)) == Some(true);
-            let start = (t as f64 * 100.0).round() as u32 + 1;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "t is a threshold clamped to 0..=1, so the value is in 0..=100"
+            )]
+            let start = (f64::from(t).clamp(0.0, 1.0) * 100.0).round() as u32 + 1;
             match (start..=100).map(|k| k as f32 / 100.0).find(|&u| meets(u)) {
                 Some(up) => t = up,
                 None => {
@@ -380,7 +399,7 @@ pub fn exact_pick(bp: &Breakpoints, objective: Objective) -> Option<Pick> {
                     note = Some(format!(
                         "{name} {}% is met only between 0.01 steps (exact optimum {:.3})",
                         pct0(target),
-                        segs[best].hi
+                        sbest.hi
                     ))
                 }
             }
@@ -389,41 +408,35 @@ pub fn exact_pick(bp: &Breakpoints, objective: Objective) -> Option<Pick> {
         if p.counts.tp == 0 {
             note = Some("no threshold finds any object".to_string());
         }
-        return Some(make(
-            t,
-            true,
-            note,
-            (segs[best].hi, segs[best].score),
-            [segs[a].lo, segs[b].hi],
-        ));
+        return Some(make(t, true, note, (sbest.hi, sbest.score), run));
     }
     let (_, primary, secondary) = fallback_keys(objective)?;
     // Target not reached: the best range on the constrained metric (then the other metric,
     // then the higher threshold).
     let prim = |sg: &Segment| primary(&bp.point_at(sg.hi));
     let sec = |sg: &Segment| secondary(&bp.point_at(sg.hi)).unwrap_or(0.0);
-    let mut best: Option<usize> = None;
+    let mut best: Option<(usize, &Segment)> = None;
     for (i, sg) in segs.iter().enumerate() {
         let Some(v) = prim(sg) else { continue };
         let better = match best {
             None => true,
-            Some(b) => {
-                let bv = prim(&segs[b]).unwrap_or(0.0);
-                v > bv + TIE || ((v - bv).abs() <= TIE && sec(sg) >= sec(&segs[b]) - TIE)
+            Some((_, b)) => {
+                let bv = prim(b).unwrap_or(0.0);
+                v > bv + TIE || ((v - bv).abs() <= TIE && sec(sg) >= sec(b) - TIE)
             }
         };
         if better {
-            best = Some(i);
+            best = Some((i, sg));
         }
     }
-    let i = best?;
+    let (i, sg) = best?;
     let t = round_in(&segs, i, i);
     Some(make(
         t,
         false,
-        Some(unreached_note(objective, &bp.point_at(segs[i].hi))),
-        (segs[i].hi, None),
-        [segs[i].lo, segs[i].hi],
+        Some(unreached_note(objective, &bp.point_at(sg.hi))),
+        (sg.hi, None),
+        [sg.lo, sg.hi],
     ))
 }
 

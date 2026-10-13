@@ -9,6 +9,7 @@ use super::{
     Detection, Family, ModelFamilyKind, NamedOutput, PostParams, PreprocessCtx, ResizeMode,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Yolo5 {
     pub num_classes: usize,
 }
@@ -53,17 +54,20 @@ impl Family for Yolo5 {
         let thr = params.confidence_threshold;
         let mut dets = Vec::new();
         for row in data.chunks_exact(cols) {
-            let obj = row[4];
+            // `cols >= 6` was checked above, so every row has the 5 box fields and >= 1 class.
+            let &[cx, cy, w, h, obj, ref class_scores @ ..] = row else {
+                continue;
+            };
             // Early out: conf = obj * max_cls <= obj when scores are in 0..1.
             if !meets(obj, thr) {
                 continue;
             }
-            let (cls, best) = argmax(&row[5..]);
+            let (cls, best) = argmax(class_scores);
             let conf = obj * best;
-            if !meets(conf, thr) {
+            // `inf * x` and `NaN` never pass: the score must be a finite number.
+            if !conf.is_finite() || !meets(conf, thr) {
                 continue;
             }
-            let (cx, cy, w, h) = (row[0], row[1], row[2], row[3]);
             let (x1, y1, x2, y2) =
                 ctx.to_original(cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0);
             dets.push(Detection {

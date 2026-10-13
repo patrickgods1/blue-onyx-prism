@@ -714,7 +714,7 @@ pub fn ort_wanted(layout: Layout, flavor: Flavor, windows: bool, entry: &str) ->
     match layout {
         Layout::OrtRelease => {
             // `<top>/lib/<file>` (some Windows packages use `bin`).
-            if dirs.len() != 2 || !matches!(dirs[1], "lib" | "bin") {
+            if dirs.len() != 2 || !matches!(dirs.get(1), Some(&("lib" | "bin"))) {
                 return None;
             }
             let stem = lib_stem(name, windows)?;

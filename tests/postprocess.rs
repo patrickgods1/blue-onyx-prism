@@ -8,7 +8,7 @@ use blue_onyx_prism::model::yolo8::Yolo8;
 use blue_onyx_prism::model::yolo26::Yolo26;
 use blue_onyx_prism::model::{
     Detection, ExtraData, Family, ModelFamilyKind, NamedOutput, Normalization, OutputBuf, PortElem,
-    PortSpec, PostParams, PreprocessCtx, ResizeMode, make_family,
+    PortSpec, PostParams, PreprocessCtx, ResizeMode, make_family, to_predictions,
 };
 
 const PARAMS: PostParams = PostParams {
@@ -627,4 +627,158 @@ fn detr_preprocessor_for_family() {
     assert_eq!(p.normalization(), None);
     let (t, _) = p.run(&img, 2, 1).unwrap();
     assert!(t[..16].iter().all(|&x| x == 1.0) && t[16..].iter().all(|&x| x == 0.0));
+}
+
+// ---------------------------------------------------------------- non-finite outputs (PL-02)
+
+/// Run `fam` on `outputs`, convert to the wire shape and check that no box is `(0,0,0,0)`, no
+/// score is outside `0..=1` and the JSON contains no `null`. Returns the predictions.
+fn check_finite_response(
+    fam: &dyn Family,
+    outputs: &[NamedOutput],
+    ctx: &PreprocessCtx,
+) -> Vec<blue_onyx_prism::api::Prediction> {
+    let dets = fam.postprocess(outputs, ctx, &PARAMS).unwrap();
+    assert!(dets.iter().all(Detection::is_finite), "{dets:?}");
+    let names: Vec<String> = (0..100).map(|i| format!("c{i}")).collect();
+    let preds = to_predictions(&dets, ctx, &names, None);
+    for p in &preds {
+        assert_ne!((p.x_min, p.y_min, p.x_max, p.y_max), (0, 0, 0, 0), "{p:?}");
+        assert!(p.x_max > p.x_min && p.y_max > p.y_min, "{p:?}");
+        assert!((0.0..=1.0).contains(&p.confidence), "{p:?}");
+    }
+    let json = serde_json::to_string(&preds).unwrap();
+    assert!(!json.contains("null"), "{json}");
+    preds
+}
+
+#[test]
+fn yolo26_non_finite_rows_are_dropped() {
+    let nan = f32::NAN;
+    let inf = f32::INFINITY;
+    let rows: Vec<f32> = vec![
+        nan, 140.0, 640.0, 500.0, 0.9, 2.0, // NaN coordinate
+        0.0, 140.0, inf, 500.0, 0.9, 2.0, // inf coordinate
+        0.0, 140.0, 640.0, 500.0, inf, 2.0, // inf score
+        0.0, 140.0, 640.0, 500.0, nan, 2.0, // NaN score
+        0.0, 140.0, 640.0, 500.0, 0.9, nan, // NaN class
+        0.0, 140.0, 640.0, 500.0, 0.9, inf, // inf class
+        0.0, 140.0, 640.0, 500.0, 0.9, -inf, // -inf class
+        270.0, 270.0, 370.0, 370.0, 0.6, 0.0, // good
+    ];
+    let out = f32_out("output0", &[1, 8, 6], rows);
+    let p = check_finite_response(&Yolo26::new(80), &[out], &letterbox_ctx());
+    assert_eq!(p.len(), 1);
+    assert_eq!(
+        (p[0].x_min, p[0].y_min, p[0].label.as_str()),
+        (810, 390, "c0")
+    );
+}
+
+#[test]
+fn yolo5_non_finite_rows_are_dropped() {
+    let nan = f32::NAN;
+    let inf = f32::INFINITY;
+    let rows: Vec<f32> = vec![
+        // cx, cy, w, h, obj, c0, c1, c2
+        320.0, 320.0, 100.0, 100.0, inf, 0.1, 0.9, 0.2, // obj inf: conf = inf must not pass
+        320.0, 320.0, 100.0, 100.0, 0.9, inf, 0.1, 0.0, // class score inf
+        320.0, 320.0, 100.0, 100.0, 0.9, 0.0, nan, 0.0, // class score NaN (never wins)
+        nan, 320.0, 100.0, 100.0, 0.9, 0.0, 0.9, 0.0, // NaN center
+        320.0, 320.0, inf, 100.0, 0.9, 0.0, 0.9, 0.0, // inf width
+        320.0, 320.0, 100.0, nan, 0.9, 0.0, 0.9, 0.0, // NaN height
+        100.0, 300.0, 20.0, 20.0, 0.9, 0.0, 1.0, 0.0, // good: class 1, conf 0.9
+    ];
+    let out = f32_out("output", &[1, 7, 8], rows);
+    let p = check_finite_response(&Yolo5::new(3), &[out], &letterbox_ctx());
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0].label, "c1");
+    assert!((p[0].confidence - 0.9).abs() < 1e-6);
+}
+
+#[test]
+fn yolo8_non_finite_rows_are_dropped() {
+    let nan = f32::NAN;
+    let inf = f32::INFINITY;
+    let (shape, data) = channel_major(&[
+        vec![320.0, 320.0, 100.0, 100.0, 0.1, inf], // inf class score
+        vec![320.0, 320.0, 100.0, 100.0, nan, nan], // NaN scores: never pass
+        vec![nan, 320.0, 100.0, 100.0, 0.1, 0.9],   // NaN center
+        vec![320.0, 320.0, inf, 100.0, 0.1, 0.9],   // inf width
+        vec![320.0, 320.0, 100.0, -inf, 0.1, 0.9],  // -inf height
+        vec![100.0, 300.0, 20.0, 20.0, 0.9, 0.1],   // good: class 0, 0.9
+    ]);
+    let out = f32_out("output0", &shape, data);
+    let p = check_finite_response(&Yolo8::new(2), &[out], &letterbox_ctx());
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0].label, "c0");
+}
+
+#[test]
+fn rtdetr_non_finite_rows_are_dropped() {
+    let nan = f32::NAN;
+    let inf = f32::INFINITY;
+    let outs = vec![
+        NamedOutput {
+            name: "labels".into(),
+            shape: vec![1, 6],
+            data: OutputBuf::I64(vec![0, 1, 2, 3, -1, i64::MAX]),
+        },
+        f32_out(
+            "boxes",
+            &[1, 6, 4],
+            vec![
+                nan, 0.0, 640.0, 640.0, // NaN
+                0.0, 0.0, inf, 640.0, // inf
+                0.0, 0.0, 640.0, 640.0, // inf score
+                320.0, 320.0, 640.0, 640.0, // good
+                0.0, 0.0, 640.0, 640.0, // negative label
+                0.0, 0.0, 640.0, 640.0, // absurd label
+            ],
+        ),
+        f32_out("scores", &[1, 6], vec![0.95, 0.9, inf, 0.7, 0.9, 0.9]),
+    ];
+    let p = check_finite_response(&RtDetr::new(80), &outs, &stretch_ctx());
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(
+        (
+            p[0].x_min,
+            p[0].y_min,
+            p[0].x_max,
+            p[0].y_max,
+            p[0].label.as_str()
+        ),
+        (50, 25, 100, 50, "c3")
+    );
+}
+
+#[test]
+fn detr_non_finite_rows_are_dropped() {
+    let nan = f32::NAN;
+    let inf = f32::INFINITY;
+    // Q = 5, C = 3; +inf logits give a score of exactly 1.0 (kept), NaN logits never pass.
+    let mut outs = detr_outputs(
+        5,
+        3,
+        &[(0, 0, 0.9), (1, 1, 0.9), (3, 2, 0.8)],
+        &[
+            [nan, 0.5, 0.5, 0.5],
+            [0.5, 0.5, inf, 0.5],
+            [0.5, 0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5, 0.5],
+        ],
+    );
+    if let OutputBuf::F32(l) = &mut outs[1].data {
+        l[2 * 3] = inf; // query 2, class 0
+        l[4 * 3 + 1] = nan; // query 4, class 1
+    }
+    let p = check_finite_response(&Detr::new(80, false), &outs, &stretch_ctx());
+    assert_eq!(p.len(), 2, "{p:?}");
+    assert_eq!((p[0].label.as_str(), p[0].confidence), ("c0", 1.0));
+    assert_eq!(p[1].label, "c2");
+    assert_eq!(
+        (p[1].x_min, p[1].y_min, p[1].x_max, p[1].y_max),
+        (25, 13, 75, 38)
+    );
 }

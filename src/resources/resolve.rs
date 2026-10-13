@@ -323,7 +323,7 @@ pub fn needed(config: &Config, hw: &HardwareInfo, installed: &Installed) -> Reso
 fn ordered_models(config: &Config) -> Vec<&ModelConfig> {
     let first = config.effective_default_index();
     first
-        .map(|i| &config.models[i])
+        .and_then(|i| config.models.get(i))
         .into_iter()
         .chain(
             config
@@ -677,7 +677,10 @@ impl Resolver<'_> {
         }
         OrtProbe {
             error: None,
-            flavor: (flavors.len() == 1).then(|| flavors[0].as_str().to_string()),
+            flavor: match flavors.as_slice() {
+                [only] => Some(only.as_str().to_string()),
+                _ => None,
+            },
             providers,
         }
     }
