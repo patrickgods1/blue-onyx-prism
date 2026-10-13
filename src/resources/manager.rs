@@ -1436,6 +1436,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
 
+    #[cfg(unix)]
     fn age_file(p: &Path, by: Duration) {
         let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
         f.set_modified(SystemTime::now() - by).unwrap();
