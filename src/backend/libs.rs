@@ -96,6 +96,46 @@ fn note(s: String) {
     }
 }
 
+/// Set when `OPENVINO_INSTALL_DIR` overrides the configured `openvino_dir` or the bundled
+/// runtime (BE-08); see [`openvino_dir_override_warning`].
+static OVERRIDE_WARNING: Mutex<Option<String>> = Mutex::new(None);
+
+/// The warning of the last [`prepare_environment`] when an inherited `OPENVINO_INSTALL_DIR`
+/// made it ignore the configured `openvino_dir` (or the bundled `<download root>/openvino`),
+/// for the status page's runtime section; None when nothing was overridden. Also logged at
+/// `warn` when it happens.
+pub fn openvino_dir_override_warning() -> Option<String> {
+    OVERRIDE_WARNING.lock_recover().clone()
+}
+
+/// What happened / likely cause / next action when `env_dir` (`OPENVINO_INSTALL_DIR`) wins over
+/// the configured `explicit` dir or the `bundled` one. None when neither is set or they are the
+/// same directory.
+fn install_dir_override_warning(
+    env_dir: &Path,
+    explicit: Option<&Path>,
+    bundled: Option<&Path>,
+) -> Option<String> {
+    let (what, dir) = match (explicit, bundled) {
+        (Some(e), _) => ("configured openvino_dir", e),
+        (None, Some(b)) => ("bundled OpenVINO runtime", b),
+        (None, None) => return None,
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(dir) == canon(env_dir) {
+        return None;
+    }
+    Some(format!(
+        "{what} {} is ignored because {ENV_INSTALL_DIR} is set to {}, so OpenVINO loads from \
+         there; the variable was most likely exported by an Intel OpenVINO install's setupvars \
+         script and may be a different OpenVINO version; unset {ENV_INSTALL_DIR} for the service \
+         (or point it at {}) to use the {what}",
+        dir.display(),
+        env_dir.display(),
+        dir.display()
+    ))
+}
+
 /// Set up environment variables so the finder can locate the runtime.
 /// `explicit` (from config `openvino_dir`) wins over `<exe_dir>/openvino`; an already-set
 /// `OPENVINO_INSTALL_DIR` is left untouched.
@@ -104,6 +144,7 @@ pub fn prepare_environment(explicit: Option<&Path>) {
     if let Ok(mut n) = NOTES.lock() {
         n.clear();
     }
+    *OVERRIDE_WARNING.lock_recover() = None;
     let existing = std::env::var_os(ENV_INSTALL_DIR).filter(|v| !v.is_empty());
     let install_dir: Option<PathBuf> = if let Some(v) = existing {
         let p = PathBuf::from(&v);
@@ -111,12 +152,18 @@ pub fn prepare_environment(explicit: Option<&Path>) {
             "{ENV_INSTALL_DIR} already set to {} (left untouched)",
             p.display()
         ));
-        if let Some(e) = explicit {
-            note(format!(
-                "configured openvino_dir {} ignored because {ENV_INSTALL_DIR} is set",
-                e.display()
-            ));
+        let bundled = crate::exe_dir().join(BUNDLED_DIR_NAME);
+        let bundled = (explicit.is_none() && bundled.is_dir()).then_some(bundled);
+        let warning = install_dir_override_warning(
+            &p,
+            explicit.map(crate::resolve_path).as_deref(),
+            bundled.as_deref(),
+        );
+        if let Some(w) = &warning {
+            tracing::warn!("{w}");
+            note(w.clone());
         }
+        *OVERRIDE_WARNING.lock_recover() = warning;
         Some(p)
     } else {
         let chosen = match explicit {
@@ -383,6 +430,26 @@ pub fn register_dll_dir(dir: &Path) {
     }
 }
 
+/// `PATH` as it was before the first [`prepend_to_path`] (Windows), see [`original_path`].
+#[cfg(windows)]
+static ORIGINAL_PATH: OnceLock<std::ffi::OsString> = OnceLock::new();
+
+/// The process `PATH` from before this module prepended the runtime directories to it (BE-15),
+/// for child processes that must not resolve DLLs from the service's OpenVINO / TBB / CUDA
+/// copies first: `Command::env("PATH", original)` when this returns `Some`. None when `PATH`
+/// was never changed, which is always the case outside Windows (there the child inherits the
+/// unchanged `PATH`).
+pub fn original_path() -> Option<std::ffi::OsString> {
+    #[cfg(windows)]
+    {
+        ORIGINAL_PATH.get().cloned()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// Prepend `dirs` to `PATH` (for child processes and anything that enumerates `PATH` itself)
 /// and register them for DLL loading ([`register_dll_dir`]), skipping entries already present.
 #[cfg(windows)]
@@ -408,6 +475,7 @@ fn prepend_to_path(dirs: &[PathBuf]) {
             return;
         }
     };
+    ORIGINAL_PATH.get_or_init(|| current.clone());
     // SAFETY: see `prepare_environment`.
     unsafe { std::env::set_var("PATH", joined) };
     for d in &new {
@@ -1128,6 +1196,30 @@ pub fn system_cuda_present() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_dir_override_is_explained() {
+        let env = Path::new("/opt/intel/openvino_2024");
+        let cfg = Path::new("/srv/bop/openvino");
+        let w = install_dir_override_warning(env, Some(cfg), None).unwrap();
+        assert!(
+            w.contains("configured openvino_dir /srv/bop/openvino is ignored")
+                && w.contains("OPENVINO_INSTALL_DIR is set to /opt/intel/openvino_2024")
+                && w.contains("setupvars")
+                && w.contains("unset OPENVINO_INSTALL_DIR"),
+            "{w}"
+        );
+        let w = install_dir_override_warning(env, None, Some(cfg)).unwrap();
+        assert!(
+            w.starts_with("bundled OpenVINO runtime /srv/bop/openvino"),
+            "{w}"
+        );
+        assert_eq!(install_dir_override_warning(env, None, None), None);
+        assert_eq!(install_dir_override_warning(env, Some(env), None), None);
+        // Outside Windows PATH is never changed, so children need no override.
+        #[cfg(not(windows))]
+        assert_eq!(original_path(), None);
+    }
 
     #[test]
     fn dl_error_keeps_the_os_cause() {

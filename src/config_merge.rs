@@ -178,6 +178,7 @@ fn global_label(k: &str) -> String {
         "object_filter" => "Object filter".into(),
         "log_level" => "Log level".into(),
         "log_path" => "Log directory".into(),
+        "log_format" => "Log file format".into(),
         "save_image_path" => "Save annotated images to".into(),
         "save_ref_image" => "Save the unannotated image".into(),
         "intra_threads" => "CPU threads".into(),
@@ -337,7 +338,8 @@ pub struct Pending {
     pub global: Vec<String>,
     /// Reasons per model (normalized name), e.g. "device: auto → openvino:cpu".
     pub models: BTreeMap<String, Vec<String>>,
-    /// Changes only a process restart applies (`port`, `bind_address`, `log_path`).
+    /// Changes only a process restart applies (`port`, `bind_address`, `log_path`,
+    /// `log_format`).
     pub process: Vec<String>,
 }
 
@@ -502,7 +504,7 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
             value_text(k, x),
             value_text(k, y)
         );
-        if matches!(g, "port" | "bind_address" | "log_path") {
+        if matches!(g, "port" | "bind_address" | "log_path" | "log_format") {
             out.process
                 .push(format!("{text} (needs a process restart)"));
         } else {
@@ -537,15 +539,17 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
                 if dr != dc {
                     reasons.push(format!("device: {dr} \u{2192} {dc}"));
                 }
-                // Threshold and object filter apply live.
+                // Threshold and object filter apply live. Both sides' keys: a field serialized
+                // only when set (`inflight`) is absent from one side when removed (CO-09).
                 let (or, oc) = (model_object(&r), model_object(&c));
-                for (f, v) in &oc {
+                let fields: BTreeSet<&String> = or.keys().chain(oc.keys()).collect();
+                for f in fields {
                     if matches!(f.as_str(), "name" | "device" | "enabled")
                         || LIVE_MODEL_FIELDS.contains(&f.as_str())
                     {
                         continue;
                     }
-                    if or.get(f) != Some(v) {
+                    if or.get(f) != oc.get(f) {
                         reasons.push(format!("{} changed", field_label(f)));
                     }
                 }
@@ -770,6 +774,10 @@ mod tests {
             ),
             ("log_path", Box::new(|c| c.log_path = Some("logs".into()))),
             (
+                "log_format",
+                Box::new(|c| c.log_format = crate::config::LogFormat::Json),
+            ),
+            (
                 "openvino_dir",
                 Box::new(|c| c.openvino_dir = Some("ov".into())),
             ),
@@ -864,5 +872,31 @@ mod tests {
         let mut d = running.clone();
         d.confidence_threshold = 0.5000001;
         assert!(!pending(&running, &d).restart_needed());
+    }
+
+    #[test]
+    fn pending_reports_a_removed_or_added_optional_model_field() {
+        let mut running = cfg();
+        running.models[0].inflight = Some(2);
+        let current = cfg();
+        // `inflight` is not serialized when None: removing it must still show.
+        let p = pending(&running, &current);
+        assert_eq!(p.for_model("IPcam-general"), ["inflight changed"], "{p:?}");
+        let p = pending(&current, &running);
+        assert_eq!(p.for_model("IPcam-general"), ["inflight changed"], "{p:?}");
+        assert!(!pending(&running, &running).restart_needed());
+    }
+
+    #[test]
+    fn log_format_needs_a_process_restart() {
+        let running = cfg();
+        let mut c = running.clone();
+        c.log_format = crate::config::LogFormat::Json;
+        let p = pending(&running, &c);
+        assert_eq!(
+            p.process,
+            ["Log file format: text \u{2192} json (needs a process restart)"]
+        );
+        assert!(!live_global("log_format"));
     }
 }

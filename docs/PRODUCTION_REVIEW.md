@@ -26,7 +26,7 @@ found before anything was changed. Later phases append to the status table at th
 
 ## Coverage ledger
 
-205 rows, zero *not reviewed*. Files over 1500 lines have one row per section or line range.
+209 rows (4 added in phase 4), zero *not reviewed*. Files over 1500 lines have one row per section or line range.
 Binary fixtures (`.jpg`, `.png`, `.ico`, `.ttf`) are listed as reviewed by inspection of what reads them.
 
 | path | lines | category | reviewer | verdict |
@@ -34,6 +34,10 @@ Binary fixtures (`.jpg`, `.png`, `.ico`, `.ttf`) are listed as reviewed by inspe
 | .claude/agents/engineer.md | 20 | docs | non-Rust+tests (Opus subagent) | clean |
 | .claude/agents/porter.md | 19 | docs | non-Rust+tests (Opus subagent) | findings: NR-23 |
 | .dockerignore | 7 | build | non-Rust+tests (Opus subagent) | clean |
+| THIRD_PARTY_LICENSES.md | new in phase 4 | docs | lead (phase 4) | clean: third-party notices shipped in every release archive (NR-17) |
+| deploy/docker-entrypoint.sh | new in phase 4 | deploy | lead (phase 4) | clean: fails loudly when a volume is not writable (NR-19) |
+| scripts/uninstall_systemd.sh | new in phase 4 | script | lead (phase 4) | clean (NR-21) |
+| scripts/uninstall_launchd.sh | new in phase 4 | script | lead (phase 4) | clean (NR-21) |
 | .gitattributes | 6 | build | non-Rust+tests (Opus subagent) | clean |
 | .github/dependabot.yml | 16 | workflow | non-Rust+tests (Opus subagent) | clean |
 | .github/workflows/check-urls.yml | 25 | workflow | non-Rust+tests (Opus subagent) | findings: NR-20 |
@@ -3542,9 +3546,48 @@ Multipart parse (image `Bytes` copy, `HashMap` of text fields), one `oneshot`, r
   healthcheck, Windows builds of `sdnotify`/`retention`, the listener timeouts under real Blue
   Iris load (unit-tested over loopback TCP only), the CoreML rewrite on a real > 512 MiB model.
 
+### Phase 4 notes (items from the brief without a finding ID)
+
+- **Structured logging:** new config key `log_format` (`"text"` default, `"json"`): the file appender
+  writes one JSON object per line, the console stays text; needs a process restart. The per-request
+  debug line carries structured fields `model`, `device`, `request_id`, `inference_ms`, `process_ms`,
+  `round_trip_ms`; failures and drops carry `request_id` too; every detection response has an
+  `X-Request-Id` header (8 hex digits, `worker::new_request_id`). `set_level` logs "log level
+  changed from X to Y". Messages logged before the subscriber exists are held in `logbuf::early()`
+  and replayed.
+- **Metrics:** `requests_rejected_total{reason}` now has `overloaded|body_too_large|decode_error|bad_request`;
+  new `build_info{version,git_sha,build_date}` (the old `info{version}` stays), `download_bytes_total`,
+  `download_failures_total`, and on Linux only `process_resident_memory_bytes` and `process_open_fds`
+  (`std` has no cheap source on macOS/Windows; omitted there). `queue_length` per model existed.
+- **Config table:** rebuilt in README with type/range, apply mode (at once / model reload / restart /
+  process restart) and a UI column, plus per-model and `benchmark.*` tables;
+  `config::tests::readme_documents_every_config_key` fails when a `Config`, `ModelConfig` or
+  `BenchmarkConfig` key has no row.
+- **Deployment hardening:** systemd was done in phase 2. launchd gets `Umask`, `ExitTimeOut`,
+  `ThrottleInterval`, `ProcessType` and a file-descriptor limit; the Windows install sets
+  `sc.exe sidtype unrestricted` and `privs SeChangeNotifyPrivilege`; compose gets `read_only: true`,
+  tmpfs `/tmp`, `no-new-privileges`, `cap_drop: ALL`, a `data` volume (`download_dir: /app/data`) and a
+  commented `user:` line; the Dockerfile chowns only the mount points. Not run here (no Docker, no
+  Windows, launchd not loaded).
+- **Release integrity:** `--version`, the startup log and the UI footer show `<version> (<git sha>,
+  <build date>)` from `BLUE_ONYX_PRISM_GIT_SHA` / `BLUE_ONYX_PRISM_BUILD_DATE` (set by release.yml;
+  `unknown` locally; no build.rs). A new `attest` job runs `actions/attest-build-provenance` on the
+  archives; docs/RELEASE_CHECKLIST.md and README explain `sha256sum -c` and `gh attestation verify`.
+- **Slow compile warning (deferred from phase 3):** after 5 min a warn is logged every 5 min and the
+  model's state detail reads "compiling on <device> for N min" on `/v1/status` and the pages.
+- **Error messages:** rewritten to "what happened / likely cause / next action" in config validation,
+  the CLI, runner, startup, registry/plan, worker load failures, the download manager, provision,
+  the config page, the detection error texts and the device-fallback notes.
+- **Beyond the brief:** warm-up output now goes through `family.postprocess`, so a family or
+  class-count mismatch fails the load instead of a Ready model that errors on every request.
+- **Not verified on this machine:** everything Windows (service stop deadline, PATH snapshot,
+  PowerShell memory query, install scripts), Linux (process metrics, systemd), Docker, a real GPU
+  hang or ORT session panic (fake threads only), a real > 5 min compile (ms thresholds in tests),
+  the Ultralytics numeric check, the attestation job and issue-on-failure step (GitHub only).
+
 ## Per-finding status
 
-Updated at the end of each phase (phase 1: branch `review/phase-1-crash-safety`; phase 2: branch `review/phase-2-security`; phase 3: branch `review/phase-3-resources-load`). Phase 0 leaves every finding open; the phase column is where the fix
+Updated at the end of each phase (phase 1: branch `review/phase-1-crash-safety`; phase 2: branch `review/phase-2-security`; phase 3: branch `review/phase-3-resources-load`; phase 4: branch `review/phase-4-operability`). Phase 0 leaves every finding open; the phase column is where the fix
 is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maintainability).
 
 | ID | Severity | Phase | Status |
@@ -3593,67 +3636,67 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RS-12 | resource-exhaustion | 3 | fixed in phase 2: release-check body capped at 1 MiB, typed parse, fields truncated |
 | SV-04 | resource-exhaustion | 3 | fixed in phase 3: hyper served with a timer, 10 s header-read/idle timeout, 10 s graceful deadline; process-wide in-flight cap (sum of queue capacities + 16, default 64) answers 503 and counts requests_rejected_total{reason="overloaded"}; 30 s multipart read timeout; bodies discarded (not buffered) when the model is full, failed, initializing or unknown |
 | SV-08 | resource-exhaustion | 3 | fixed in phase 2 (name shortened) and phase 3: log ring messages capped at 4 KiB, targets at 256 bytes, ring at 8 MiB |
-| BE-03 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| BE-03 | correctness | 4 | fixed in phase 4: `full_name` looks the GPU up through `select::cuda_ordinals` (test with the 3060/4090 fixture) |
 | BE-05 | correctness | 1 | fixed in phase 1: checked arithmetic in the Split/Flatten emitters; overflow skips the node with a reason |
-| BE-07 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BE-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BE-14 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| BE-07 | correctness | 4 | fixed in phase 4: device index capped at 255 in `spec::parse` (error names `list-devices`); `i32::try_from` for the ORT device id; plan notes "no <ep> device with index N (have M)" |
+| BE-09 | correctness | 4 | fixed in phase 4: `select::bare_gpu_device` resolves bare `GPU` the same way in `prefer_intel_gpu` and `device_class` |
+| BE-14 | correctness | 4 | fixed in phase 4: the backend owns a failed `infer_async` start (wait_done, slot left idle, seq never returned); rule documented in `device::submit` |
 | BM-02 | correctness | 1 | fixed in phase 1: --min-confidence/--iou/--accuracy-weight require a finite 0..=1 value |
-| BM-03 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BM-10 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BQ-06 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BQ-07 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BQ-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BQ-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| BM-03 | correctness | 4 | fixed in phase 4: `merge` compares OS, arch, GPU index+name, runtime versions and CPU name; dropped models are named in a warning (CLI and UI) |
+| BM-10 | correctness | 4 | fixed in phase 4: the reference run keeps every prediction (`Bench::max_stored_preds`), so the pseudo ground truth is not truncated at 100 |
+| BQ-06 | correctness | 4 | fixed in phase 4: `GtBox::crowd` (COCO `iscrowd`) matches by intersection over the detection's area (pycocotools' crowd rule); coco-cctv manifest marks its 21 crowd regions; build_bench_sets.py emits the flag |
+| BQ-07 | correctness | 4 | fixed in phase 4: `met` reflects the rounded threshold, so `apply_value` refuses a target-violating pick; the note says it is not applied |
+| BQ-08 | correctness | 4 | fixed in phase 4: COCO JSON matched through a HashMap; no match is an error naming the likely split/file-name cause; unlisted images are left out with a warning; duplicate basenames warn |
+| BQ-09 | correctness | 4 | fixed in phase 4: YOLO labels must be finite in [0,1] (1e-3 clamp), polygons take their bounding box, other field counts error with file:line; images of unknown size are left out with a warning |
 | CO-04 | correctness | 1 | fixed in phase 1: validate() runs at load, form, CLI merge (no write-back on error) and disk sync (not adopted) |
-| CO-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| CO-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| CO-10 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| CO-08 | correctness | 4 | fixed in phase 4: `update()` always reads and hashes the file; only the `check_disk` poll keeps the stat shortcut (test pins the mtime) |
+| CO-09 | correctness | 4 | fixed in phase 4: `pending()` compares model fields over the union of both key sets |
+| CO-10 | correctness | 4 | fixed in phase 4: the CLI resolves `log_path` with `resolve_path`, like the service |
 | CO-14 | correctness | 5 | fixed in phase 1: test client uses total_cmp, nearest-rank p95, absolute start times with checked arithmetic |
 | NR-07 | correctness | 4 | fixed in phase 2: release workflow refuses a manual run on an existing tag or published release |
-| NR-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| NR-08 | correctness | 4 | fixed in phase 4: `check_ultralytics_numerics` compares PyTorch and ONNX Runtime top-20 scores (and boxes when the layouts match) after every Ultralytics export (not run here: no export env) |
 | NR-09 | correctness | 4 | fixed in phase 2: README Docker section matches the compose volumes |
-| NR-10 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| NR-11 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| NR-10 | correctness | 4 | fixed in phase 4: README says downloaded libraries are SHA-256 pinned and loaded into the process; no downloaded program runs except a user-started model export |
+| NR-11 | correctness | 4 | fixed in phase 4: README lines corrected; config table rebuilt with type/range, apply mode and UI column; per-model and `benchmark.*` tables added; `config::tests::readme_documents_every_config_key` fails when a key is missing |
 | PL-02 | correctness | 1 | fixed in phase 1: non-finite detections dropped before NMS and serialization, scores clamped, coords clamped |
-| PL-05 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| PL-08 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| RS-09 | correctness | 4 | open (phase 0: identified, not yet fixed) |
+| PL-05 | correctness | 4 | fixed in phase 4: class-count rules run first; `last == 6` is YOLOv5 only for a 1-class model with > 1000 or dynamic rows |
+| PL-08 | correctness | 4 | fixed in phase 4: index maps fill gaps with `class_{i}` up to the largest key; duplicate keys are rejected |
+| RS-09 | correctness | 4 | fixed in phase 4: manifest `.tmp` first, then `.yaml`, then `.onnx`, then the manifest rename; replaced files are set aside and restored on any failure (all-or-nothing test) |
 | RS-15 | correctness | 4 | fixed in phase 2: resumed downloads are hashed whole; a changed upstream file fails permanently (test added) |
-| SV-13 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| SV-14 | correctness | 4 | open (phase 0: identified, not yet fixed) |
-| BE-08 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| BE-10 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| BE-13 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| BE-15 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| BM-05 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| BM-06 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| BQ-10 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| CO-05 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| CO-11 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| CO-12 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| CO-13 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-12 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-13 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-14 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-15 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-16 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-17 | operability | 4 | open (phase 0: identified, not yet fixed) |
+| SV-13 | correctness | 4 | fixed in phase 4: the `Upload` extractor drains a non-multipart body (32 MiB / 30 s bound) before answering, also on the early-answer paths |
+| SV-14 | correctness | 4 | fixed in phase 4: the Models card checks per-model thresholds with the shared `config::check_threshold` (0..=1) and answers 400 with a three-part message |
+| BE-08 | operability | 4 | fixed in phase 4: the override is logged at warn with cause and next action and shown on the home page (`libs::openvino_dir_override_warning`) |
+| BE-10 | operability | 4 | fixed in phase 4: `backend::SessionDead` error + `Backend::is_healthy()`; a panicking ORT session thread is caught and reported, `abort` bounded at 10 s, `Drop` detaches a hung thread after 2 s with a warning; the worker marks the model Failed on a dead session |
+| BE-13 | operability | 4 | fixed in phase 4: `openvino:gpu.N` requires `GPU.N` in the device list, else only CPU with the "requested device GPU.N not available" note |
+| BE-15 | operability | 4 | fixed in phase 4: `libs::original_path()` snapshots PATH before the first prepend (Windows); the export child gets it as its PATH (not run on Windows here) |
+| BM-05 | operability | 4 | fixed in phase 4: the cancel flag is reset under the state lock before Running, and `cancel()` sets it under the same lock |
+| BM-06 | operability | 4 | fixed in phase 4: `DownloadWait` state machine: unknown key after 15 s and no progress for 5 min turn the remaining sets into warnings; cancel is checked between compile candidates and documented as taking effect after the current compile |
+| BQ-10 | operability | 4 | fixed in phase 4: a broken folder is skipped with a warning (fatal only when no dataset remains); a repeated set id warns |
+| CO-05 | operability | 4 | fixed in phase 4: a config with no models (service first start, CLI) is seeded with `IPcam-general` (`Config::seed_default_model`), saved, and warned about; the UI then serves while `auto_download` fetches it |
+| CO-11 | operability | 4 | fixed in phase 4: `logbuf::early()` holds messages logged before logging starts and replays them (or prints them to stderr); an unusable `log_path` falls back to stdout with a warning |
+| CO-12 | operability | 4 | fixed in phase 4: second Ctrl-C/SIGTERM exits 130, a 60 s deadline exits 1, server stop capped at 10 s, `rt.shutdown_timeout(5 s)`; the service gives up after 60 s with exit code 2 (not run on Windows here) |
+| CO-13 | operability | 4 | fixed in phase 4: absolute `powershell.exe` path, `-NonInteractive`, 5 s timeout with kill, cached once per process; `GlobalMemoryStatusEx` deferred because it needs `unsafe` outside backend/ (phase 5 may add a backend helper) |
+| NR-12 | operability | 4 | fixed in phase 4: the checklist's CUDA step runs on Turing-or-newer Windows or on Linux and fails without an `ort:cuda` row |
+| NR-13 | operability | 4 | fixed in phase 4: checklist step for the i5-8500 iGPU (`benchmark --all-devices --report igpu.html`, fails without an `openvino:gpu` row) |
+| NR-14 | operability | 4 | fixed in phase 4: CI downloads `rt-detrv2-s`; the lazy model is an IPcam copy when yolo26n is absent so the lazy flow always runs; YOLO26 stays a manual checklist step (AGPL export) |
+| NR-15 | operability | 4 | fixed in phase 4: smoke.sh extracts provider and count with fixed patterns, requires `count >= MIN_COUNT` and an optional `EXPECT_LABEL` (CI: IPcam-general, `vehicle`), fails as soon as the server dies |
+| NR-16 | operability | 4 | fixed in phase 4: install_service.ps1 polls up to 30 s for the old service to disappear after `sc.exe delete` and throws with the next action; exit codes and `New-Service -Credential` were already in place (not run here: no Windows) |
+| NR-17 | operability | 4 | fixed in phase 4: THIRD_PARTY_LICENSES.md (runtimes, DirectML, Roboto Mono, 362 crates) shipped in every archive; extraction keeps each runtime's LICENSE/notice files |
 | NR-18 | operability | 4 | fixed in phase 2: Dockerfile HEALTHCHECK on /v1/vision/custom/list |
-| NR-19 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-20 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| NR-21 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| PL-06 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| PL-11 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| RS-04 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| RS-06 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| RS-10 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| RS-11 | operability | 4 | open (phase 0: identified, not yet fixed) |
-| RS-14 | operability | 4 | open (phase 0: identified, not yet fixed) |
+| NR-19 | operability | 4 | fixed in phase 4: deploy/docker-entrypoint.sh fails loudly with uid/gid and the chown/`user:` fix when a volume is not writable; README documents it (not run here: no Docker) |
+| NR-20 | operability | 4 | fixed in phase 4: check-urls uses `--locked` and opens/updates an issue on failure (`issues: write` on that job only); every job in every workflow has `timeout-minutes` |
+| NR-21 | operability | 4 | fixed in phase 4: uninstall_systemd.sh / uninstall_launchd.sh added (`--purge`), `ServicesPipeTimeout` recorded and restored on Windows, install scripts +x in the index |
+| PL-06 | operability | 4 | fixed in phase 4: the blocking `collect` after a lost completion runs under a watchdog; a second request timeout marks the model `Failed("inference stuck on <device> ...")` (`WorkerHandle::is_stuck`), fast 503s follow, a late Ok result restores Ready; shutdown no longer joins a stuck worker |
+| PL-11 | operability | 4 | fixed in phase 4: `first_runnable_wait` waits at most 2 s for the runtimes lock and otherwise waits for downloads; the unused `ModelRegistry::selection` is removed |
+| RS-04 | operability | 4 | fixed in phase 4: a guard on the worker thread marks every unfinished job `Failed{retry_at: None}` and sets `dead`; `enqueue` fails at once afterwards; `wait`/`install_all`/`Wait::poll`/the exporter check `Manager::is_alive()` |
+| RS-06 | operability | 4 | fixed in phase 4: `ManagerOptions::max_attempts` (service: 12, about 43 min of backoff) after which the job is terminal with the manual `fetch` command; the Download button starts a fresh series |
+| RS-10 | operability | 4 | fixed in phase 4: the stop flag is checked per MiB hashed, per archive part/entry and every 256 KiB extracted; `shutdown()` waits at most 5 s and then leaves the worker |
+| RS-11 | operability | 4 | fixed in phase 4: Ctrl-C sets the export cancel flag (tree killed), a second Ctrl-C exits 130; the export lock wait is bounded at 10 min with a message |
+| RS-14 | operability | 4 | fixed in phase 4: platform, export paths, toolchain state and unsupported reason are computed once per `rows()`; a 1 s `detect_installed` cache was tried and dropped (stale manifest state broke a test); the heavy probes are already cached per process |
 | SV-06 | operability | 3 | fixed in phase 3: every benchmark handler's file/JSON/CPU work runs in server::blocking; image files served from a cached index |
 | SV-07 | operability | 3 | fixed in phase 3: the browse walk and drive probing run in server::blocking |
 | SV-11 | operability | 4 | fixed in phase 2: live.js handles non-JSON/403, capped exponential backoff, waitRestart gives up after 2 min, timers paused while hidden |
-| SV-12 | operability | 4 | open (phase 0: identified, not yet fixed) |
+| SV-12 | operability | 4 | fixed in phase 4: README says a local reverse proxy equals `allow_remote_admin: true` and `X-Forwarded-For` is ignored on purpose; the server warns once when a loopback admin request carries a forwarding header |
 | SV-15 | operability | 1 | fixed in phase 1: catch_panic middleware answers 500 (JSON or HTML) and the connection stays usable |
 | BE-11 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
 | BE-12 | maintainability | 5 | open (phase 0: identified, not yet fixed) |

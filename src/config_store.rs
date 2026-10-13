@@ -229,9 +229,13 @@ impl ConfigStore {
     }
 
     /// Reload the file when another process changed it (call with the write lock held).
-    fn sync_disk(&self, inner: &mut Inner) -> Option<ChangeRecord> {
+    /// `verify`: read and hash the file even when its length and mtime are unchanged. An edit
+    /// within the same mtime tick (1-2 s on FAT/exFAT, some SMB and bind mounts, HFS+) that
+    /// keeps the length (`4000` -> `4001`) is only seen that way (CO-08).
+    fn sync_disk(&self, inner: &mut Inner, verify: bool) -> Option<ChangeRecord> {
         let (modified, len) = stat(&self.path)?;
-        if let Some(d) = &inner.disk
+        if !verify
+            && let Some(d) = &inner.disk
             && d.modified == modified
             && d.len == len
         {
@@ -282,7 +286,8 @@ impl ConfigStore {
     }
 
     /// Pick up changes other processes made to the file (cheap when it did not change: one
-    /// `stat`). Returns the logged change.
+    /// `stat`; an edit that keeps both the length and the mtime tick is only seen by the next
+    /// [`Self::update`], which always hashes). Returns the logged change.
     pub fn check_disk(&self) -> Option<ChangeRecord> {
         // Cheap pre-check under the read lock.
         {
@@ -295,7 +300,7 @@ impl ConfigStore {
             }
         }
         let mut g = self.lock_write();
-        self.sync_disk(&mut g)
+        self.sync_disk(&mut g, false)
     }
 
     /// Apply `edit` to a copy of the current config (after picking up external file changes),
@@ -308,7 +313,9 @@ impl ConfigStore {
         edit: impl FnOnce(&mut Config) -> Result<R>,
     ) -> Result<Updated<R>> {
         let mut g = self.lock_write();
-        self.sync_disk(&mut g);
+        // Always hash here (rare, and about to overwrite the file): the stat-only shortcut of
+        // the poll can miss an external edit, which this write would then destroy.
+        self.sync_disk(&mut g, true);
         let before = g.config.clone();
         let mut new = before.clone();
         let value = edit(&mut new)?;
@@ -470,6 +477,50 @@ mod tests {
             [SOURCE_DISK, SOURCE_DISK, "config page"]
         );
         assert_eq!(s.revision(), 4);
+    }
+
+    /// CO-08: an external edit that keeps the length and the mtime (coarse-mtime filesystems)
+    /// is missed by the stat-only poll but picked up by `update`, never overwritten.
+    #[test]
+    fn same_length_same_mtime_edit_survives_an_update() {
+        let path = tmp();
+        let s = ConfigStore::new(
+            Config {
+                port: 4000,
+                ..cfg()
+            },
+            path.clone(),
+        );
+        s.update("test", |_| Ok(())).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        // An editor changes 4000 -> 4001 within the same mtime tick.
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"port\": 4000", "\"port\": 4001");
+        std::fs::write(&path, &text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        // The cheap poll does not see it (by design)...
+        assert!(s.check_disk().is_none());
+        assert_eq!(s.read().port, 4000);
+        // ...but a UI save starts from the edited file instead of overwriting it.
+        s.update("config page", |c| {
+            c.nms_iou = 0.45;
+            Ok(())
+        })
+        .unwrap();
+        let now = Config::load(&path).unwrap();
+        assert_eq!((now.port, now.nms_iou), (4001, 0.45));
+        assert_eq!(s.read().port, 4001);
+        let sources: Vec<String> = s.changes(10).into_iter().map(|c| c.source).collect();
+        assert_eq!(sources, [SOURCE_DISK, "config page"]);
     }
 
     #[test]

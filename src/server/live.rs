@@ -481,10 +481,21 @@ pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> any
             let t = if v.is_empty() {
                 None
             } else {
-                Some(
-                    v.parse::<f32>()
-                        .map_err(|_| anyhow::anyhow!("threshold: '{v}' is not a number"))?,
-                )
+                let t = v.parse::<f32>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "threshold for '{name}': '{v}' is not a number (probably a typo); enter a \
+                         value between 0 and 1 (e.g. 0.5) or leave it empty for the global one"
+                    )
+                })?;
+                // The same range check as the benchmark's threshold apply and config loading.
+                crate::config::check_threshold(name, t).map_err(|_| {
+                    anyhow::anyhow!(
+                        "threshold for '{name}': {v} is outside 0 to 1 (a confidence is never \
+                         above 1, so it would drop every detection); enter a value between 0 \
+                         and 1 or leave it empty for the global one"
+                    )
+                })?;
+                Some(t)
             };
             thresholds.push((name.to_string(), t));
         }
@@ -496,7 +507,10 @@ pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> any
             .iter_mut()
             .find(|m| normalize_name(&m.effective_name()) == key)
         else {
-            anyhow::bail!("'{name}' is not one of the configured models");
+            anyhow::bail!(
+                "'{name}' is not one of the configured models (it was removed or renamed \
+                 meanwhile); reload the Config page"
+            );
         };
         m.confidence_threshold = t;
     }

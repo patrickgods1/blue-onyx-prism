@@ -615,6 +615,41 @@ impl HardwareSummary {
                 .all(|(s, g)| s.starts_with(&format!("#{} {} (", g.index, g.name)))
     }
 
+    /// `#0 Name` of a recorded GPU string, without the trailing `(vendor, kind, VRAM, CUDA)`
+    /// facts ([`GpuAdapter`]'s Display; the facts themselves contain no parenthesis).
+    fn gpu_key(s: &str) -> &str {
+        s.rfind(" (").map_or(s, |i| &s[..i]).trim()
+    }
+
+    /// Why results recorded on `self` are not comparable with ones measured on `other`, or
+    /// None when they are: same OS/arch, the same GPUs (index and name, in order; VRAM and
+    /// CUDA facts may differ, like [`Self::same_gpus`]) and the same CPU when both name one.
+    pub fn difference(&self, other: &Self) -> Option<String> {
+        if self.os != other.os || self.arch != other.arch {
+            return Some(format!(
+                "the platform changed ({} {} -> {} {})",
+                self.os, self.arch, other.os, other.arch
+            ));
+        }
+        let (a, b) = (self.cpu.trim(), other.cpu.trim());
+        if !a.is_empty() && !b.is_empty() && a != b {
+            return Some(format!("the CPU changed ({a} -> {b})"));
+        }
+        let a: Vec<&str> = self.gpus.iter().map(|g| Self::gpu_key(g)).collect();
+        let b: Vec<&str> = other.gpus.iter().map(|g| Self::gpu_key(g)).collect();
+        if a != b {
+            let list = |v: &[&str]| {
+                if v.is_empty() {
+                    "none".to_string()
+                } else {
+                    v.join(", ")
+                }
+            };
+            return Some(format!("the GPUs changed ({} -> {})", list(&a), list(&b)));
+        }
+        None
+    }
+
     pub fn current() -> Self {
         let hw = crate::backend::detect::hardware();
         Self {
@@ -1037,12 +1072,68 @@ impl BenchmarkResults {
         std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
     }
 
+    /// Why `self`'s results (an earlier run) are not comparable with `new`'s, or None: the
+    /// hardware differs ([`HardwareSummary::difference`]) or a runtime version changed.
+    pub fn incomparable(&self, new: &Self) -> Option<String> {
+        if let Some(d) = self.hardware.difference(&new.hardware) {
+            return Some(d);
+        }
+        if self.runtimes != new.runtimes {
+            let v = |r: &RuntimeVersions| {
+                format!(
+                    "OpenVINO {}, ONNX Runtime {}{}",
+                    r.openvino.as_deref().unwrap_or("none"),
+                    r.onnxruntime.as_deref().unwrap_or("none"),
+                    r.onnxruntime_flavor
+                        .as_deref()
+                        .map(|f| format!(" ({f})"))
+                        .unwrap_or_default()
+                )
+            };
+            return Some(format!(
+                "the runtime versions changed ({} -> {})",
+                v(&self.runtimes),
+                v(&new.runtimes)
+            ));
+        }
+        None
+    }
+
+    /// The warning for a merge of `new` into `previous` that drops the previous results
+    /// ([`Self::merge`]), naming what changed and how many models are lost; None when they are
+    /// kept (or there are none).
+    pub fn merge_warning(previous: Option<&Self>, new: &Self) -> Option<String> {
+        let prev = previous?;
+        let reason = prev.incomparable(new)?;
+        let new_keys: Vec<String> = new
+            .models
+            .iter()
+            .map(|m| crate::registry::normalize_name(&m.model))
+            .collect();
+        let lost: Vec<&str> = prev
+            .models
+            .iter()
+            .filter(|m| !new_keys.contains(&crate::registry::normalize_name(&m.model)))
+            .map(|m| m.model.as_str())
+            .collect();
+        if lost.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "The earlier benchmark results of {} were dropped. They were measured with other \
+             hardware or runtimes: {reason}, so their timings are not comparable. Benchmark \
+             those models again to rank them with this run.",
+            lost.join(", ")
+        ))
+    }
+
     /// Fold `new` into the previous results: models in `new` replace their previous entries
     /// (matched by normalized name), other models are kept, unless the hardware or runtime
-    /// versions changed (then the previous results are dropped as not comparable).
+    /// versions changed ([`Self::incomparable`]; then the previous results are dropped as not
+    /// comparable, see [`Self::merge_warning`]).
     pub fn merge(previous: Option<Self>, new: Self) -> Self {
         let Some(prev) = previous else { return new };
-        if prev.hardware != new.hardware || prev.runtimes != new.runtimes {
+        if prev.incomparable(&new).is_some() {
             return new;
         }
         let key = |m: &ModelResult| crate::registry::normalize_name(&m.model);
@@ -1465,6 +1556,86 @@ mod tests {
         assert!(BenchmarkResults::load(&path).is_err());
         assert!(BenchmarkResults::load_or_warn(&path).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Results stay comparable when only GPU facts (VRAM, CUDA suffix) changed; another GPU,
+    /// CPU, platform or runtime drops them, with a warning naming the lost models (BM-03).
+    #[test]
+    fn merge_compares_gpus_by_index_and_name() {
+        let hw = |gpu: &str| HardwareSummary {
+            os: "windows".into(),
+            arch: "x86_64".into(),
+            cpu: "Intel(R) Core(TM) i5-8500 CPU @ 3.00GHz".into(),
+            gpus: vec![
+                gpu.into(),
+                "#1 Intel(R) UHD Graphics 630 (Intel, integrated, 128 MB VRAM)".into(),
+            ],
+        };
+        let old_gpu = "#0 NVIDIA GeForce GTX 1070 Ti (NVIDIA, discrete, 8060 MB VRAM)";
+        let new_gpu = "#0 NVIDIA GeForce GTX 1070 Ti (NVIDIA, discrete, 8192 MB VRAM, \
+                       CUDA device 0 compute capability 6.1)";
+        let named = |name: &str| {
+            let mut m = model(vec![dev("openvino:cpu", 37.0, scene())], None);
+            m.model = name.into();
+            m
+        };
+        let prev = BenchmarkResults::new(
+            hw(old_gpu),
+            RuntimeVersions::default(),
+            vec![named("a"), named("b")],
+        );
+        let new = BenchmarkResults::new(hw(new_gpu), RuntimeVersions::default(), vec![named("a")]);
+        assert_eq!(prev.incomparable(&new), None);
+        assert_eq!(BenchmarkResults::merge_warning(Some(&prev), &new), None);
+        assert_eq!(
+            BenchmarkResults::merge(Some(prev.clone()), new)
+                .models
+                .len(),
+            2
+        );
+
+        // Another GPU: dropped, and the warning names the lost model and the change.
+        let other = BenchmarkResults::new(
+            hw("#0 NVIDIA GeForce RTX 3060 (NVIDIA, discrete, 12288 MB VRAM)"),
+            RuntimeVersions::default(),
+            vec![named("a")],
+        );
+        let w = BenchmarkResults::merge_warning(Some(&prev), &other).unwrap();
+        assert!(w.contains(" b ") && !w.contains(" a,"), "{w}");
+        assert!(w.contains("RTX 3060"), "{w}");
+        assert_eq!(
+            BenchmarkResults::merge(Some(prev.clone()), other)
+                .models
+                .len(),
+            1
+        );
+
+        // A GPU without the facts suffix (older files) matches by index and name.
+        let mut bare = prev.clone();
+        bare.hardware.gpus[0] = "#0 NVIDIA GeForce GTX 1070 Ti".into();
+        let new = BenchmarkResults::new(hw(new_gpu), RuntimeVersions::default(), vec![]);
+        assert_eq!(bare.incomparable(&new), None);
+
+        // Another CPU (when both name one), platform or runtime is not comparable.
+        let mut cpu = new.clone();
+        cpu.hardware.cpu = "AMD Ryzen 5 5600X".into();
+        assert!(prev.incomparable(&cpu).unwrap().contains("CPU"));
+        cpu.hardware.cpu.clear();
+        assert_eq!(prev.incomparable(&cpu), None);
+        let mut os = new.clone();
+        os.hardware.os = "linux".into();
+        assert!(prev.incomparable(&os).unwrap().contains("platform"));
+        let mut rt = new.clone();
+        rt.runtimes.onnxruntime = Some("1.24.4".into());
+        assert!(
+            prev.incomparable(&rt)
+                .unwrap()
+                .contains("ONNX Runtime 1.24.4")
+        );
+        // Nothing lost (the new run re-measured every earlier model): no warning.
+        let mut all = rt.clone();
+        all.models = vec![named("A"), named("b")];
+        assert_eq!(BenchmarkResults::merge_warning(Some(&prev), &all), None);
     }
 
     #[test]

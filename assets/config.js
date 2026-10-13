@@ -316,7 +316,7 @@ document.addEventListener("click", function (e) {
         resetAfter = {form: form, rev: j.revision};
         L.poll(true);
       })
-      .catch(function (e) { done(); say(form, "error-text", "Not saved: " + e); });
+      .catch(function (e) { done(); say(form, "error-text", "Not saved: the server did not answer (" + e + "); it may be restarting or stopped, so check that it runs and save again."); });
   }
   document.addEventListener("submit", function (e) {
     var form = e.target;

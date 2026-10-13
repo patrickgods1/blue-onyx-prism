@@ -38,6 +38,8 @@ pub struct ProvisionOptions {
     pub extra_models: Vec<&'static Resource>,
     /// Retry schedule override for the manager.
     pub backoff: Option<fn(u32) -> Duration>,
+    /// Attempts per download before giving up (default [`manager::SERVICE_MAX_ATTEMPTS`]).
+    pub max_attempts: Option<u32>,
     /// Replaces the YOLO26 exporter's process runner and downloads (tests).
     pub export_hooks: Option<(
         Arc<dyn super::export::CommandRunner>,
@@ -127,6 +129,11 @@ impl Provisioner {
         }
         let mut mo = ManagerOptions::new(config.data_root());
         mo.retry = true;
+        mo.max_attempts = Some(
+            self.opts
+                .max_attempts
+                .unwrap_or(manager::SERVICE_MAX_ATTEMPTS),
+        );
         mo.lock_wait = Some(SERVICE_LOCK_WAIT);
         if let Some(b) = self.opts.backoff {
             mo.backoff = b;
@@ -332,11 +339,19 @@ impl Wait {
         let mut pending: Vec<String> = Vec::new();
         let mut runtime_installed: Option<&'static str> = None;
         for b in &self.blocks {
-            let state = self
-                .manager
-                .status(&b.key)
-                .map(|s| s.state)
-                .unwrap_or(State::Queued);
+            let state = match self.manager.status(&b.key) {
+                Some(s) => s.state,
+                // Never queued here and nobody left to run it.
+                None if !self.manager.is_alive() => {
+                    return WaitStatus::Failed(format!(
+                        "{} is missing and the download manager is not running; restart the \
+                         service, or run `{}`",
+                        b.resource.title,
+                        manager::fetch_command(b.resource)
+                    ));
+                }
+                None => State::Queued,
+            };
             match &state {
                 State::Installed => {
                     if b.is_runtime() {

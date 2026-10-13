@@ -9,12 +9,13 @@
 //!   speed order when it has one, `Selection::apply_measured_order`): the first candidate is not
 //!   a fallback, every later one (down to CPU) is. A machine whose ranking is CPU only loads CPU as
 //!   a regular pick, with a note when a GPU was found but nothing GPU-class can run.
-//! - `openvino:gpu[.N]` -> GPU, then CPU as a fallback. When OpenVINO lists no GPU at all, only
-//!   CPU is tried and it counts as a fallback (unchanged from the old `DeviceSelection`).
+//! - `openvino:gpu[.N]` -> GPU, then CPU as a fallback. When OpenVINO does not list the requested
+//!   GPU (no GPU at all for `gpu`, no `GPU.N` for `gpu.N`), only CPU is tried, with a note, and it
+//!   counts as a fallback (unchanged from the old `DeviceSelection`).
 //! - `openvino:cpu` / `openvino:npu` -> just that device (plus ONNX Runtime CPU as a fallback
 //!   when OpenVINO cannot run it, e.g. the OpenVINO runtime is missing).
-//! - `ort:*` -> that device, then the best other CPU option ([`best_cpu`]: OpenVINO CPU, else
-//!   ONNX Runtime CPU) as a fallback.
+//! - `ort:*` -> that device (with a note when the detected hardware has no such index), then
+//!   the best other CPU option ([`best_cpu`]: OpenVINO CPU, else ONNX Runtime CPU) as a fallback.
 //!
 //! "No GPU" fallbacks also use [`best_cpu`], so a legacy `GPU` config on a machine with only
 //! ONNX Runtime lands on `ort:cpu`.
@@ -106,7 +107,12 @@ fn fallback_cpu(sel: &Selection, device: Device) -> Option<Device> {
 pub fn auto_candidates(sel: &Selection) -> Vec<Candidate> {
     if sel.auto.is_empty() {
         return vec![Candidate {
-            note: Some("no runnable device found; trying OpenVINO CPU".to_string()),
+            note: Some(
+                "no runnable device found, because no inference runtime loaded (OpenVINO and \
+                 ONNX Runtime missing or failed to initialize); trying OpenVINO CPU so its error \
+                 is shown; run `setup-openvino` (or `setup-onnxruntime`) and check `list-devices`"
+                    .to_string(),
+            ),
             ..Candidate::new(Device::OPENVINO_CPU, false)
         }];
     }
@@ -133,7 +139,8 @@ pub fn auto_candidates(sel: &Selection) -> Vec<Candidate> {
             .collect();
         if !blocked.is_empty() {
             only.note = Some(format!(
-                "no GPU option can run ({}); using {}",
+                "no GPU option can run ({}); using {}; fix the reason shown for the GPU (or \
+                 download what `list-devices` offers) to use it",
                 blocked.join("; "),
                 only.device
             ));
@@ -152,7 +159,7 @@ fn explicit_candidates(
     match (device.runtime, device.target) {
         (Runtime::OpenVino, Target::Gpu) => {
             let cpu = best_cpu(sel);
-            if available_ov_devices.iter().any(|d| d.starts_with("GPU")) {
+            if ov_gpu_listed(available_ov_devices, device.index) {
                 vec![Candidate::new(device, false), fallback(cpu)]
             } else {
                 let requested = device.openvino_device().unwrap_or_default();
@@ -161,9 +168,15 @@ fn explicit_candidates(
                 } else {
                     cpu.to_string()
                 };
+                let cause = if available_ov_devices.iter().any(|d| is_ov_gpu(d)) {
+                    "the GPU index is probably wrong"
+                } else {
+                    "OpenVINO sees no GPU (Intel graphics driver / compute runtime missing?)"
+                };
                 vec![Candidate {
                     note: Some(format!(
-                        "requested device {requested} not available (devices: {available_ov_devices:?}); using {using}"
+                        "requested device {requested} not available (devices: {available_ov_devices:?}); \
+                         {cause}; using {using}; set `device` to a listed device or run `list-devices`"
                     )),
                     ..fallback(cpu)
                 }]
@@ -179,11 +192,64 @@ fn explicit_candidates(
             out
         }
         (Runtime::Ort, _) => {
-            let mut out = vec![Candidate::new(device, false)];
+            let mut out = vec![Candidate {
+                note: missing_index_note(device, sel),
+                ..Candidate::new(device, false)
+            }];
             out.extend(fallback_cpu(sel, device).map(fallback));
             out
         }
     }
+}
+
+/// An OpenVINO GPU device name: `GPU` or `GPU.N`.
+fn is_ov_gpu(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "GPU" || upper.starts_with("GPU.")
+}
+
+/// Whether OpenVINO lists the GPU `index` asks for: any GPU for a bare `openvino:gpu`; `GPU.N`
+/// for `openvino:gpu.N`, or a bare `GPU` for N = 0 when OpenVINO lists no numbered GPU (one GPU
+/// is listed as `GPU`, which is `GPU.0`).
+fn ov_gpu_listed(available: &[String], index: Option<u32>) -> bool {
+    let gpus: Vec<&String> = available.iter().filter(|d| is_ov_gpu(d)).collect();
+    match index {
+        None => !gpus.is_empty(),
+        Some(n) => {
+            let want = format!("GPU.{n}");
+            gpus.iter().any(|d| d.eq_ignore_ascii_case(&want))
+                || (n == 0
+                    && gpus.iter().any(|d| d.eq_ignore_ascii_case("GPU"))
+                    && !gpus.iter().any(|d| d.contains('.')))
+        }
+    }
+}
+
+/// For an explicit ONNX Runtime device with an index (`ort:cuda:3`): a note when the detected
+/// hardware lists devices of that kind but none with that index. The device is still tried
+/// (detection can miss a GPU), the note says why it will most likely fail.
+fn missing_index_note(device: Device, sel: &Selection) -> Option<String> {
+    let n = device.index?;
+    let have: Vec<String> = sel
+        .options
+        .iter()
+        .filter(|o| {
+            o.spec.runtime == device.runtime
+                && o.spec.target == device.target
+                && o.spec.index.is_some()
+        })
+        .map(|o| o.spec.to_string())
+        .collect();
+    if have.is_empty() || have.contains(&device.to_string()) {
+        return None;
+    }
+    Some(format!(
+        "no {} device with index {n} (have {}: {}); the index is probably wrong; trying it anyway, \
+         set `device` to a listed one or run `list-devices`",
+        device.target.as_str(),
+        have.len(),
+        have.join(", ")
+    ))
 }
 
 /// Run `attempt` on each candidate in order and return the first success. Failures are logged
@@ -268,6 +334,82 @@ mod tests {
         let c = plan_candidates(&parse("GPU").unwrap(), &devs(&["CPU"]));
         assert!(c[0].note.as_deref().unwrap().contains("GPU not available"));
         assert_eq!(plan("GPU.1", &[]), s(&[("openvino:cpu", true)]));
+    }
+
+    #[test]
+    fn gpu_index_must_be_listed() {
+        // GPU.3 on a machine listing only GPU.0: straight to the CPU, with a note.
+        assert_eq!(
+            plan("gpu.3", &["CPU", "GPU.0"]),
+            s(&[("openvino:cpu", true)])
+        );
+        let c = plan_candidates(&parse("gpu.3").unwrap(), &devs(&["CPU", "GPU.0"]));
+        let note = c[0].note.as_deref().unwrap();
+        assert!(
+            note.contains("GPU.3 not available") && note.contains("index is probably wrong"),
+            "{note}"
+        );
+        // One GPU listed as bare "GPU" is GPU.0.
+        assert_eq!(
+            plan("gpu.0", &["CPU", "GPU"]),
+            s(&[("openvino:gpu.0", false), ("openvino:cpu", true)])
+        );
+        assert_eq!(plan("gpu.1", &["CPU", "GPU"]), s(&[("openvino:cpu", true)]));
+        assert_eq!(
+            plan("gpu.1", &["CPU", "gpu.0", "GPU.1"]),
+            s(&[("openvino:gpu.1", false), ("openvino:cpu", true)])
+        );
+        assert!(ov_gpu_listed(&devs(&["GPU.0"]), None));
+        assert!(!ov_gpu_listed(&devs(&["CPU", "NPU"]), None));
+        assert!(!ov_gpu_listed(&devs(&["GPUX"]), Some(0)));
+    }
+
+    #[test]
+    fn ort_index_not_detected_gets_a_note() {
+        use crate::backend::detect::{GpuAdapter, GpuVendor};
+        use crate::backend::select::{EpStatus, OrtProbe};
+        let nvidia = GpuAdapter {
+            vendor: GpuVendor::Nvidia,
+            name: "NVIDIA GeForce RTX 3060".into(),
+            vram_mb: 12288,
+            index: 0,
+            discrete: true,
+            cuda: None,
+        };
+        let hw = HardwareInfo::new("linux", "x86_64", vec![nvidia]);
+        let ov = devs(&["CPU"]);
+        let mut probe = RuntimeProbe::openvino_only(&ov);
+        probe.ort = OrtProbe::installed(
+            "gpu",
+            vec![
+                EpStatus::usable(Target::Cuda),
+                EpStatus::usable(Target::Cpu),
+            ],
+        );
+        let sel = select(&hw, &probe, true);
+        let c = plan_for(&parse("ort:cuda:3").unwrap(), &sel, &ov);
+        assert_eq!(c[0].device.to_string(), "ort:cuda:3");
+        let note = c[0].note.as_deref().unwrap();
+        assert!(
+            note.contains("no cuda device with index 3 (have 1: ort:cuda:0)"),
+            "{note}"
+        );
+        assert!(
+            plan_for(&parse("ort:cuda:0").unwrap(), &sel, &ov)[0]
+                .note
+                .is_none()
+        );
+        assert!(
+            plan_for(&parse("ort:cuda").unwrap(), &sel, &ov)[0]
+                .note
+                .is_none()
+        );
+        // Nothing detected of that kind: no note (nothing to compare with).
+        assert!(
+            plan_for(&parse("ort:directml:5").unwrap(), &sel, &ov)[0]
+                .note
+                .is_none()
+        );
     }
 
     #[test]

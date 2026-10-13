@@ -24,6 +24,7 @@ cargo run -- --model models/IPcam-general.onnx --family yolo5 --force-cpu
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --device ort:cpu
 cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco-cctv|bmd45-cctv|exdark-night|dir:<p>] [--max-images 20]   # grade models x devices; benchmark.json next to the config
 cargo run -- benchmark --list-datasets       # built-in image sets (assets/bench/*.json, resource bench:<id>)
+cargo run -- --version                      # <version> (<git sha>, <build date>): BLUE_ONYX_PRISM_GIT_SHA / _BUILD_DATE at build time (release.yml), `unknown` locally
 cargo build --no-default-features            # OpenVINO-only build (drops the `onnxruntime` feature / `ort`)
 cargo test                                   # unit tests need no OpenVINO
 cargo clippy --all-targets -- -D warnings
@@ -102,6 +103,14 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   (port, bind address, runtime dirs, cache, threads, profile/concurrency) stay pending until a restart
   (`config_merge::pending`).
 - Windows service in `src/bin/blue_onyx_prism_service.rs` (cfg windows). systemd/launchd/Docker in `deploy/`.
+  Install/uninstall scripts in `scripts/` (`uninstall_systemd.sh`, `uninstall_launchd.sh`, `*_service.ps1`); the Docker
+  image starts through `deploy/docker-entrypoint.sh` (checks the volumes are writable). `THIRD_PARTY_LICENSES.md` ships in
+  every release archive; the release workflow attests the archives (`actions/attest-build-provenance`).
+- Operability: `log_format: text|json` (file appender only), per-request debug log with `model/device/request_id/
+  inference_ms/process_ms/round_trip_ms` and an `X-Request-Id` response header; a model whose inference never returns is
+  marked Failed("inference stuck ...") after a second request timeout (`worker::collect_watched`); a compile over 5 min warns;
+  downloads give up after 12 attempts in the service (`manager::SERVICE_MAX_ATTEMPTS`); a config with no models is seeded with
+  IPcam-general. Error messages state what happened, the likely cause and the next action.
 
 ## Conventions
 

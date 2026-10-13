@@ -44,7 +44,8 @@ impl Family for Yolo5 {
         }
         if self.num_classes > 0 && cols != 5 + self.num_classes {
             anyhow::bail!(
-                "yolo5: output `{}` has shape {:?}, expected [1, N, {}] for {} classes",
+                "yolo5: output `{}` has shape {:?}, expected [1, N, {}] for {} classes; the \
+                 classes file lists another number of classes than the model was trained with",
                 out.name,
                 out.shape,
                 5 + self.num_classes,

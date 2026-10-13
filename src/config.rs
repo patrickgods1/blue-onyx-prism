@@ -19,12 +19,26 @@ fn migrate_legacy(dir: &Path, current: &str, legacy: &str) -> PathBuf {
     let path = dir.join(current);
     let old = dir.join(legacy);
     if !path.exists() && old.is_file() {
+        // Logged through `logbuf::early`: this runs before logging is set up (CO-11).
         match std::fs::rename(&old, &path) {
-            Ok(()) => tracing::info!("renamed config {} -> {}", old.display(), path.display()),
+            Ok(()) => crate::logbuf::early(
+                tracing::Level::INFO,
+                format!(
+                    "renamed the config file {} -> {} (the project's old name); nothing to do",
+                    old.display(),
+                    path.display()
+                ),
+            ),
             Err(e) => {
-                tracing::warn!(
-                    "could not rename config {}: {e}; using it as is",
-                    old.display()
+                crate::logbuf::early(
+                    tracing::Level::WARN,
+                    format!(
+                        "could not rename the config file {} to {}: {e}. The folder is probably \
+                         read-only for this account; the old file is used as is (rename it by \
+                         hand to silence this warning)",
+                        old.display(),
+                        path.display()
+                    ),
                 );
                 return old;
             }
@@ -56,6 +70,44 @@ impl LogLevel {
     }
 }
 
+/// Format of the log files under `log_path` (`log_format`). The console always gets text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase", try_from = "String")]
+pub enum LogFormat {
+    /// Human-readable lines (the default).
+    #[default]
+    Text,
+    /// One JSON object per line (timestamp, level, target, fields), for log shippers.
+    Json,
+}
+
+impl LogFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogFormat::Text => "text",
+            LogFormat::Json => "json",
+        }
+    }
+}
+
+impl TryFrom<String> for LogFormat {
+    type Error = anyhow::Error;
+    fn try_from(s: String) -> Result<Self> {
+        s.parse()
+    }
+}
+
+impl std::str::FromStr for LogFormat {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text" => Ok(LogFormat::Text),
+            "json" => Ok(LogFormat::Json),
+            other => anyhow::bail!("log_format: must be \"text\" or \"json\", got '{other}'"),
+        }
+    }
+}
+
 impl std::str::FromStr for LogLevel {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -65,7 +117,9 @@ impl std::str::FromStr for LogLevel {
             "info" => LogLevel::Info,
             "warn" | "warning" => LogLevel::Warn,
             "error" => LogLevel::Error,
-            other => anyhow::bail!("unknown log level '{other}'"),
+            other => anyhow::bail!(
+                "unknown log level '{other}'; use one of trace, debug, info, warn, error"
+            ),
         })
     }
 }
@@ -213,7 +267,13 @@ pub struct Config {
     /// Only report these labels (case-insensitive). Empty = all.
     pub object_filter: Vec<String>,
     pub log_level: LogLevel,
+    /// Directory of the daily rolling log files (None = stdout only). Relative paths resolve
+    /// against the exe dir. Process restart.
     pub log_path: Option<PathBuf>,
+    /// Format of the log files under `log_path`: `"text"` (default) or `"json"` (one object
+    /// per line, for log shippers); the console stays text. An unknown value is a parse error
+    /// naming the key. Process restart.
+    pub log_format: LogFormat,
     /// Save annotated images here (optional).
     pub save_image_path: Option<PathBuf>,
     pub save_ref_image: bool,
@@ -371,6 +431,7 @@ impl Default for Config {
             object_filter: Vec::new(),
             log_level: LogLevel::Info,
             log_path: None,
+            log_format: LogFormat::Text,
             save_image_path: None,
             save_ref_image: false,
             save_image_max_age_days: DEFAULT_SAVE_IMAGE_MAX_AGE_DAYS,
@@ -394,15 +455,53 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
-        let mut config: Config = serde_json::from_str(&text)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        let text = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "could not read the config file {} (missing permission or a locked file?); \
+                 check the file, or pass --config <another file>",
+                path.display()
+            )
+        })?;
+        let mut config: Config = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "the config file {} is not valid config JSON (most likely a hand edit: a missing \
+                 comma or quote, or a misspelled value); fix the place named below or restore \
+                 a backup",
+                path.display()
+            )
+        })?;
         config.normalize();
-        config
-            .validate()
-            .with_context(|| format!("invalid config {}", path.display()))?;
+        config.validate().with_context(|| {
+            format!(
+                "the config file {} has a value out of range (most likely a hand edit); fix the \
+                 key named below or delete it to use its default",
+                path.display()
+            )
+        })?;
         Ok(config)
+    }
+
+    /// Give a config without any model the default catalog model ([`DEFAULT_MODEL_NAME`],
+    /// `<models_dir>/IPcam-general.onnx`, YOLOv5), so a first start serves the web UI and
+    /// `auto_download` fetches the file (CO-05). Returns the name of the added model, or None
+    /// when the config already has models.
+    pub fn seed_default_model(&mut self) -> Option<String> {
+        if !self.models.is_empty() {
+            return None;
+        }
+        let family = crate::download::find(DEFAULT_MODEL_NAME)
+            .and_then(|r| match r.provides {
+                crate::resources::catalog::Provides::Model { family, .. } => Some(family),
+                _ => None,
+            })
+            .unwrap_or(ModelFamilyKind::Yolo5);
+        self.models.push(ModelConfig {
+            name: Some(DEFAULT_MODEL_NAME.to_string()),
+            path: self.models_dir.join(format!("{DEFAULT_MODEL_NAME}.onnx")),
+            family,
+            ..Default::default()
+        });
+        Some(DEFAULT_MODEL_NAME.to_string())
     }
 
     /// The text [`Self::save`] writes: pretty JSON with every model entry named
@@ -630,6 +729,9 @@ impl Config {
     }
 }
 
+/// Catalog model a config without models starts with ([`Config::seed_default_model`]).
+pub const DEFAULT_MODEL_NAME: &str = "IPcam-general";
+
 /// Accepted range of `intra_threads` and `preprocess_threads`.
 pub const MAX_THREADS: usize = 256;
 /// Accepted range of `inflight` (global and per model).
@@ -662,7 +764,7 @@ pub fn check_range<T: PartialOrd + std::fmt::Display>(
     hi: T,
 ) -> Result<()> {
     if v < lo || v > hi {
-        anyhow::bail!("{field}: must be between {lo} and {hi}, got {v}");
+        anyhow::bail!("{field}: must be between {lo} and {hi}, got {v}; set a value in that range");
     }
     Ok(())
 }
@@ -671,7 +773,10 @@ pub fn check_range<T: PartialOrd + std::fmt::Display>(
 /// number in `0..=1`. 0 is allowed (report every box).
 pub fn check_threshold(field: &str, t: f32) -> Result<()> {
     if !(t.is_finite() && (0.0..=1.0).contains(&t)) {
-        anyhow::bail!("{field}: must be between 0 and 1, got {t}");
+        anyhow::bail!(
+            "{field}: must be between 0 and 1, got {t}; use a fraction such as 0.5 (not a \
+             percentage)"
+        );
     }
     Ok(())
 }
@@ -684,15 +789,22 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for m in models {
         if m.path.as_os_str().is_empty() {
-            bail!("models: every entry needs a `path`");
+            bail!(
+                "models: an entry has no `path`; set it to the model file (.onnx or .xml) or \
+                 remove the entry"
+            );
         }
         let key = crate::registry::normalize_name(&m.effective_name());
         if !seen.insert(key.clone()) {
             bail!("models: duplicate model name '{key}'; set a distinct `name` for each entry");
         }
         if let Some(d) = &m.device {
-            crate::backend::spec::parse(d)
-                .map_err(|e| anyhow::anyhow!("models: '{key}' device: {e}"))?;
+            crate::backend::spec::parse(d).map_err(|e| {
+                anyhow::anyhow!(
+                    "models: '{key}' device: {e}; run `blue-onyx-prism list-devices` for the \
+                     specs this machine accepts, or remove the key to use the global device"
+                )
+            })?;
         }
         if let Some(t) = m.confidence_threshold {
             check_threshold(&format!("models: '{key}' confidence_threshold"), t)?;
@@ -712,7 +824,7 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
 /// The models list on its own: at least one entry, and [`validate_model_entries`].
 pub fn validate_models(models: &[ModelConfig]) -> Result<()> {
     if models.is_empty() {
-        anyhow::bail!("models: at least one model is required");
+        anyhow::bail!("{NO_MODELS}");
     }
     validate_model_entries(models)
 }
@@ -768,9 +880,14 @@ impl Config {
             MAX_SAVE_IMAGE_MB,
         )?;
         if self.models_dir.as_os_str().is_empty() {
-            bail!("models_dir: must not be empty");
+            bail!("models_dir: must not be empty; set a folder such as \"models\"");
         }
-        crate::backend::spec::parse(&self.device).map_err(|e| anyhow::anyhow!("device: {e}"))?;
+        crate::backend::spec::parse(&self.device).map_err(|e| {
+            anyhow::anyhow!(
+                "device: {e}; run `blue-onyx-prism list-devices` for the specs this machine \
+                 accepts, or use \"auto\""
+            )
+        })?;
         validate_model_entries(&self.models)?;
         let b = &self.benchmark;
         check_range("benchmark.warmup", b.warmup, 0, MAX_BENCH_ITERATIONS)?;
@@ -936,21 +1053,32 @@ pub fn validate_dir_setting(key: &str, raw: &str, data_root: &Path) -> Result<Op
     Ok(Some(resolved))
 }
 
+/// Error of an empty models list.
+const NO_MODELS: &str = "models: at least one model is required; add one on the Config page \
+     (Add a model by path), with `blue-onyx-prism add-model --path <file>`, or fetch the default \
+     with `blue-onyx-prism download-models --name IPcam-general --add-to-config`";
+
 /// Checks of a config the server runs with: [`Config::validate`], at least one model, at least
 /// one enabled model and a `default_model` that names a configured model.
 pub fn validate_config(c: &Config) -> Result<()> {
     use anyhow::bail;
     c.validate()?;
     if c.models.is_empty() {
-        bail!("models: at least one model is required");
+        bail!("{NO_MODELS}");
     }
     if !c.models.iter().any(|m| m.enabled) {
-        bail!("models: at least one model must be enabled");
+        bail!(
+            "models: at least one model must be enabled; tick Load for a model on the Models \
+             card (or set \"enabled\": true)"
+        );
     }
     if let Some(name) = &c.default_model
         && c.default_model_index().is_none()
     {
-        bail!("default_model: '{name}' is not one of the configured models");
+        bail!(
+            "default_model: '{name}' is not one of the configured models (renamed or \
+             removed?); pick one of the configured models or clear default_model"
+        );
     }
     Ok(())
 }
@@ -1657,5 +1785,76 @@ mod tests {
         assert!(c.save(&bad).is_err());
         assert!(!dir.join("sub.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn log_format_parses_and_names_the_key_on_error() {
+        let c: Config = serde_json::from_str(r#"{"log_format":"json"}"#).unwrap();
+        assert_eq!(c.log_format, LogFormat::Json);
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.log_format, LogFormat::Text);
+        let err = serde_json::from_str::<Config>(r#"{"log_format":"xml"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("log_format") && err.contains("xml"), "{err}");
+        let text = serde_json::to_string(&Config::default()).unwrap();
+        assert!(text.contains(r#""log_format":"text""#), "{text}");
+        assert_eq!(" JSON ".parse::<LogFormat>().unwrap(), LogFormat::Json);
+    }
+
+    #[test]
+    fn seed_default_model_only_fills_an_empty_list() {
+        let mut c = Config::default();
+        assert_eq!(c.seed_default_model().as_deref(), Some(DEFAULT_MODEL_NAME));
+        assert_eq!(c.models.len(), 1);
+        let m = &c.models[0];
+        assert_eq!(m.path, Path::new("models").join("IPcam-general.onnx"));
+        assert_eq!(m.family, ModelFamilyKind::Yolo5);
+        assert!(m.enabled);
+        // The seeded config is one the server runs with.
+        assert!(validate_config(&c).is_ok());
+        assert_eq!(c.seed_default_model(), None);
+        assert_eq!(c.models.len(), 1);
+    }
+
+    /// Every config key (top level, model entry, `benchmark.*`) has a row `| `key` |` in the
+    /// README's configuration tables.
+    #[test]
+    fn readme_documents_every_config_key() {
+        let readme = include_str!("../README.md");
+        let keys = |v: serde_json::Value| -> Vec<String> {
+            match v {
+                serde_json::Value::Object(m) => m.keys().cloned().collect(),
+                _ => panic!("not an object"),
+            }
+        };
+        let mut missing = Vec::new();
+        let mut check = |key: String| {
+            if !readme.contains(&format!("| `{key}` |")) {
+                missing.push(key);
+            }
+        };
+        let top = keys(serde_json::to_value(Config::default()).unwrap());
+        assert!(top.contains(&"log_format".to_string()));
+        for k in top {
+            check(k);
+        }
+        // `Some` for the fields serialized only when set.
+        let model = ModelConfig {
+            inflight: Some(1),
+            ..Default::default()
+        };
+        let model_keys = keys(serde_json::to_value(model).unwrap());
+        assert!(model_keys.contains(&"inflight".to_string()));
+        for k in model_keys {
+            check(k);
+        }
+        for k in keys(serde_json::to_value(BenchmarkConfig::default()).unwrap()) {
+            check(format!("benchmark.{k}"));
+        }
+        assert!(
+            missing.is_empty(),
+            "README.md has no `| `key` |` row for: {missing:?}"
+        );
     }
 }

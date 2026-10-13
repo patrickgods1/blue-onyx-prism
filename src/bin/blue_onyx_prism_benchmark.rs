@@ -33,7 +33,7 @@ use std::process::ExitCode;
 #[derive(Debug, Parser)]
 #[command(
     name = "blue-onyx-prism-benchmark",
-    version = env!("CARGO_PKG_VERSION"),
+    version = blue_onyx_prism::cli::long_version_str(),
     about = "Benchmark Blue Onyx Prism models with the production pre/post-processing pipeline"
 )]
 struct Cli {

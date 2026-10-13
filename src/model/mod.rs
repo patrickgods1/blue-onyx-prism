@@ -404,8 +404,9 @@ pub fn make_family(
 /// Heuristic family detection from port shapes:
 /// - outputs `logits` + `pred_boxes` (input `pixel_values`) -> Detr (D-FINE, RF-DETR)
 /// - an input named `orig_target_sizes`, or 3 outputs including `boxes` -> RtDetr
-/// - single output `[.., N, 6]` -> Yolo26 (end-to-end)
 /// - single output `[.., 4+C, A]` with A > 4+C -> Yolo8
+/// - single output `[.., N, 6]` -> Yolo26 (end-to-end), except a 1-class model with N > 1000 or
+///   dynamic N, which is a 1-class YOLOv5 (`[.., A, 5+1]`)
 /// - single output `[.., A, 5+C]` -> Yolo5
 pub fn detect_family(
     inputs: &[PortSpec],
@@ -426,11 +427,19 @@ pub fn detect_family(
         let (prev, last) = (*prev, *last);
         let classes = i64::try_from(num_classes).ok().filter(|&c| c > 0);
         {
-            if last == 6 {
-                return Ok(ModelFamilyKind::Yolo26);
-            }
+            // Class-count rules first: a 1-class YOLOv5 export (`[1, 25200, 6]`) has the same
+            // last dim as YOLO26's `[1, 300, 6]`. YOLO26/YOLOv10 keep a fixed top-k of 300 rows,
+            // YOLOv5 has thousands of anchors (1008 even at 128 px) or a dynamic dim.
             if classes.is_some_and(|c| prev == 4 + c) && last > prev {
                 return Ok(ModelFamilyKind::Yolo8);
+            }
+            if last == 6 {
+                let yolo5_rows = !(0..=1000).contains(&prev);
+                return Ok(if classes == Some(1) && yolo5_rows {
+                    ModelFamilyKind::Yolo5
+                } else {
+                    ModelFamilyKind::Yolo26
+                });
             }
             if classes.is_some_and(|c| last == 5 + c) {
                 return Ok(ModelFamilyKind::Yolo5);
@@ -445,7 +454,9 @@ pub fn detect_family(
         }
     }
     anyhow::bail!(
-        "could not auto-detect model family from outputs {:?}; set `family` explicitly",
+        "could not auto-detect the model family from its outputs {:?}; the model is not a \
+         YOLOv5/v8/26, DETR or RT-DETR export, or its classes file has another class count; set \
+         `family` for this model (yolo5, yolo8, yolo26, detr, rfdetr, rtdetr)",
         outputs
             .iter()
             .map(|o| (&o.name, &o.shape))
@@ -605,6 +616,33 @@ mod tests {
             )
             .unwrap(),
             ModelFamilyKind::Yolo5
+        );
+        // PL-05: a 1-class YOLOv5 export has rows `cx,cy,w,h,obj,cls0` (last dim 6, like YOLO26).
+        let img = [port("images", &[1, 3, 640, 640])];
+        for rows in [25200, 6300, -1] {
+            assert_eq!(
+                detect_family(&img, &[port("output", &[1, rows, 6])], 1).unwrap(),
+                ModelFamilyKind::Yolo5,
+                "rows {rows}"
+            );
+        }
+        // A 1-class YOLO26 keeps its fixed 300 rows; a 1-class YOLOv8 is `[1, 5, 8400]`.
+        assert_eq!(
+            detect_family(&img, &[port("output0", &[1, 300, 6])], 1).unwrap(),
+            ModelFamilyKind::Yolo26
+        );
+        assert_eq!(
+            detect_family(&img, &[port("output0", &[1, 5, 8400])], 1).unwrap(),
+            ModelFamilyKind::Yolo8
+        );
+        // 2-class YOLOv8 `[1, 6, 8400]` is not YOLO26 either.
+        assert_eq!(
+            detect_family(&img, &[port("output0", &[1, 6, 8400])], 2).unwrap(),
+            ModelFamilyKind::Yolo8
+        );
+        assert_eq!(
+            detect_family(&img, &[port("output0", &[1, 300, 6])], 0).unwrap(),
+            ModelFamilyKind::Yolo26
         );
         assert_eq!(
             detect_family(

@@ -35,10 +35,13 @@ impl StateHandle {
     }
 
     pub fn get(&self) -> ModelState {
-        self.0
-            .read()
-            .map(|s| s.state.clone())
-            .unwrap_or(ModelState::Failed("poisoned".into()))
+        self.0.read().map(|s| s.state.clone()).unwrap_or_else(|_| {
+            ModelState::Failed(
+                "the model state is unreadable after a crash in another thread; this is a \
+                     bug; restart the service and report the log"
+                    .into(),
+            )
+        })
     }
 
     /// Set the state; clears the detail.

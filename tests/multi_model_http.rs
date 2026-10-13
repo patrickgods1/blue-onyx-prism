@@ -1,14 +1,15 @@
 //! Phase-3 milestone as a test: several models served concurrently from one process.
 //!
 //! `yolo26s.xml` (family yolo26, device "GPU", which falls back to CPU where there is no GPU
-//! plugin, e.g. macOS) + `IPcam-general.onnx` (family yolo5, device "CPU"), plus `yolo26n.xml`
-//! as a `lazy` third model when present. `default_model` = "yolo26s".
+//! plugin, e.g. macOS) + `IPcam-general.onnx` (family yolo5, device "CPU"), plus a `lazy` third
+//! model (`yolo26n.xml` when present). `default_model` = "yolo26s".
 //!
 //! `#[ignore]`d: needs `openvino/` and `models/IPcam-general.{onnx,yaml}` under
 //! `common::test_root()` (a missing one fails the test). `yolo26s.xml` and `yolo26n.xml` are
-//! optional: without `yolo26s.xml` the first model (still named "yolo26s") is a second copy of
-//! IPcam-general on "GPU" and the COCO label checks are skipped; without `yolo26n.xml` the lazy
-//! part is skipped.
+//! optional (YOLO26 is an AGPL export, so CI does not have them): without `yolo26s.xml` the first
+//! model (still named "yolo26s") is a second copy of IPcam-general on "GPU" and the COCO label
+//! checks are skipped; without `yolo26n.xml` the lazy model is another copy of IPcam-general, so
+//! the lazy flow always runs.
 
 mod common;
 
@@ -117,18 +118,34 @@ async fn multiple_models_served_concurrently() {
             ..Default::default()
         },
     ];
-    let lazy_name = yolo26n.is_some().then(|| "yolo26n-lazy".to_string());
+    // The lazy model: yolo26n when exported, else a copy of IPcam-general (its label is checked
+    // accordingly at the end).
+    let lazy_coco = yolo26n.is_some();
+    if !lazy_coco {
+        eprintln!("yolo26n.xml absent: the lazy model is a copy of {IPCAM}");
+    }
+    let lazy_name = Some(
+        if lazy_coco {
+            "yolo26n-lazy"
+        } else {
+            "ipcam-lazy"
+        }
+        .to_string(),
+    );
+    let lazy_path = yolo26n.unwrap_or_else(|| models[1].path.clone());
     if let Some(name) = &lazy_name {
         models.push(ModelConfig {
             name: Some(name.clone()),
-            path: yolo26n.unwrap(),
-            family: ModelFamilyKind::Yolo26,
+            path: lazy_path,
+            family: if lazy_coco {
+                ModelFamilyKind::Yolo26
+            } else {
+                ModelFamilyKind::Yolo5
+            },
             device: Some("CPU".into()),
             lazy: true,
             ..Default::default()
         });
-    } else {
-        eprintln!("yolo26n.xml absent: skipping the lazy-model part");
     }
     let names: Vec<String> = models.iter().map(|m| m.effective_name()).collect();
     let eager = ["yolo26s", IPCAM];
@@ -341,7 +358,8 @@ async fn multiple_models_served_concurrently() {
             t.elapsed(),
             rejected[lazy.as_str()]
         );
-        assert!(r.predictions.iter().any(|p| p.label == "dog"), "{r:?}");
+        let want = if lazy_coco { "dog" } else { "vehicle" };
+        assert!(r.predictions.iter().any(|p| p.label == want), "{r:?}");
         let stats = get_stats(&client, &base).await;
         assert_eq!(stats_model(&stats, lazy)["state"], "Ready");
         let prom = get_prometheus(&client, &base).await;

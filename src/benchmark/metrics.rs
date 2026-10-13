@@ -12,7 +12,8 @@
 //! Matching follows pycocotools: detections in descending confidence order take the unmatched
 //! ground-truth box of the same class with the highest IoU at or above the threshold; a
 //! detection that only overlaps an `ignore` region (crowd, "other" class) is neither a true nor
-//! a false positive; ignored ground truth is never a miss. AP is the mean, over the 101 recall
+//! a false positive (a COCO crowd region by intersection over the detection's area, like
+//! pycocotools; other ignore regions by IoU); ignored ground truth is never a miss. AP is the mean, over the 101 recall
 //! points 0, 0.01, .., 1, of the interpolated (monotone envelope) precision; classes without
 //! ground truth are left out of the mean.
 //!
@@ -147,6 +148,15 @@ pub fn iou(a: &BBox, b: &BBox) -> f32 {
     if union <= 0.0 { 0.0 } else { inter / union }
 }
 
+/// Intersection over the area of `det` (pycocotools' overlap with a crowd region): 1.0 for a
+/// detection entirely inside `region`, whatever the region's size.
+pub fn ioa(det: &BBox, region: &BBox) -> f32 {
+    let iw = (det[2].min(region[2]) - det[0].max(region[0])).max(0.0);
+    let ih = (det[3].min(region[3]) - det[1].max(region[1])).max(0.0);
+    let a = area(det);
+    if a <= 0.0 { 0.0 } else { iw * ih / a }
+}
+
 /// A ground-truth object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GtBox {
@@ -155,6 +165,11 @@ pub struct GtBox {
     /// Region that is neither required nor penalized (crowd, "other").
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ignore: bool,
+    /// A COCO crowd region (`iscrowd`, with `ignore`): a detection falls inside it by
+    /// intersection over the detection's own area ([`ioa`]), pycocotools' crowd rule; other
+    /// ignore regions (pseudo ground truth, "other" classes) use IoU.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub crowd: bool,
 }
 
 /// A prediction.
@@ -338,9 +353,18 @@ pub fn match_image(preds: &[PredBox], gt: &[GtBox], iou_thr: f32) -> ImageMatch 
                 out.pred_gt[i] = Some(j);
             }
             None => {
-                let in_ignored = gt
-                    .iter()
-                    .any(|g| g.ignore && g.label == p.label && iou(&p.bbox, &g.bbox) >= iou_thr);
+                // Crowd regions by intersection over the detection (pycocotools), other
+                // ignore regions by IoU.
+                let in_ignored = gt.iter().any(|g| {
+                    g.ignore && g.label == p.label && {
+                        let v = if g.crowd {
+                            ioa(&p.bbox, &g.bbox)
+                        } else {
+                            iou(&p.bbox, &g.bbox)
+                        };
+                        v >= iou_thr
+                    }
+                });
                 if in_ignored {
                     out.pred[i] = None;
                 }
@@ -955,6 +979,7 @@ mod tests {
             label: label.into(),
             bbox: b,
             ignore: false,
+            crowd: false,
         }
     }
 
@@ -964,6 +989,51 @@ mod tests {
             confidence: c,
             bbox: b,
         }
+    }
+
+    /// A COCO crowd region ignores a detection inside it by intersection over the detection's
+    /// area (pycocotools: `maskUtils.iou(d, g, iscrowd=[1])` = inter / area(d)), where IoU
+    /// with the large region would make it a false positive (BQ-06). Hand-computed values:
+    /// detection [10,10,50,90] (area 3200) inside region [0,0,200,100] (area 20000): IoU
+    /// 3200/20000 = 0.16, IoA 1.0; detection [180,0,240,100] (area 6000): intersection 2000,
+    /// IoA 1/3.
+    #[test]
+    fn crowd_regions_use_intersection_over_detection() {
+        let region = [0.0, 0.0, 200.0, 100.0];
+        let inside = [10.0, 10.0, 50.0, 90.0];
+        let edge = [180.0, 0.0, 240.0, 100.0];
+        assert!((iou(&inside, &region) - 0.16).abs() < 1e-6);
+        assert!((ioa(&inside, &region) - 1.0).abs() < 1e-6);
+        assert!((ioa(&edge, &region) - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(ioa(&[5.0, 5.0, 5.0, 9.0], &region), 0.0, "empty detection");
+        let crowd = vec![GtBox {
+            ignore: true,
+            crowd: true,
+            ..gt("person", region)
+        }];
+        let other = vec![GtBox {
+            ignore: true,
+            ..gt("person", region)
+        }];
+        let preds = [p("person", 0.9, inside), p("person", 0.8, edge)];
+        // Crowd: the detection inside is ignored, the one mostly outside is a false positive.
+        assert_eq!(match_image(&preds, &crowd, 0.5).pred, [None, Some(false)]);
+        // A non-crowd ignore region keeps IoU: both are false positives.
+        assert_eq!(
+            match_image(&preds, &other, 0.5).pred,
+            [Some(false), Some(false)]
+        );
+        // Several detections may fall in one crowd region (it is never "used up").
+        let many = [
+            p("person", 0.9, inside),
+            p("person", 0.7, [60.0, 10.0, 90.0, 90.0]),
+        ];
+        assert_eq!(match_image(&many, &crowd, 0.5).pred, [None, None]);
+        // A crowd box of another class does not apply.
+        assert_eq!(
+            match_image(&[p("car", 0.9, inside)], &crowd, 0.5).pred,
+            [Some(false)]
+        );
     }
 
     #[test]
@@ -1223,6 +1293,7 @@ mod tests {
                     label: classes[(rnd() * 2.0) as usize % 2].into(),
                     bbox: [x, y, x + w, y + w],
                     ignore: rnd() < 0.15,
+                    crowd: false,
                 });
             }
             for _ in 0..(rnd() * 10.0) as usize {

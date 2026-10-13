@@ -117,7 +117,10 @@ serves HTTP right away (models answer `Model initializing` with the download pro
 - **Where:** next to the executable (`openvino/`, `onnxruntime/<flavor>/` with `active.txt` naming
   the active flavor, `onnxruntime/cuda-libs/`, `models/`), or under `download_dir`. Every file is
   pinned by URL, size and SHA-256 in the binary (`src/resources/catalog.rs`), downloads resume after
-  an interruption, and only whitelisted libraries are extracted; nothing downloaded is executed.
+  an interruption, and only whitelisted files are extracted. Downloaded libraries (OpenVINO, ONNX
+  Runtime, DirectML, the NVIDIA CUDA libraries) are SHA-256 pinned and loaded into the service's
+  process, so they run with its rights; no downloaded program is run except by a model export you
+  start (see [Exporting models](#exporting-models)).
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -173,7 +176,7 @@ Windows (PowerShell):
 ```powershell
 Expand-Archive blue-onyx-prism-*-windows-x86_64.zip .; cd blue-onyx-prism-*-windows-x86_64
 .\blue-onyx-prism.exe download-models --name IPcam-general --add-to-config
-.\blue-onyx-prism.exe            # GPU by default; add --force-cpu to use the CPU for this run
+.\blue-onyx-prism.exe            # device "auto" (best GPU found); add --force-cpu to use the CPU for this run
 ```
 
 Linux / macOS:
@@ -181,11 +184,11 @@ Linux / macOS:
 ```sh
 tar xzf blue-onyx-prism-*-linux-x86_64.tar.gz && cd blue-onyx-prism-*-linux-x86_64
 ./blue-onyx-prism download-models --name IPcam-general --add-to-config
-./blue-onyx-prism                 # macOS: CPU is used automatically
+./blue-onyx-prism                 # device "auto": CoreML on Apple silicon, Intel GPU or CUDA where present, else CPU
 ```
 
 Check it: open `http://127.0.0.1:32168/`, or `./test-blue-onyx-prism` (see [Test client](#test-client)).
-`--model <path> --family yolo5|yolo26|yolo8|rtdetr|auto` enables that model (adding it to the config when it is not there yet).
+`--model <path> --family yolo5|yolo26|yolo8|rtdetr|detr|rfdetr|auto` enables that model (adding it to the config when it is not there yet).
 `blue-onyx-prism --help` lists every option; `list-models` shows the downloadable catalog.
 
 The first GPU start compiles each model (20-60 s on an iGPU) and stores the result in `cache/`;
@@ -203,41 +206,48 @@ Config page, to keep them). Relative paths in the file resolve
 against the executable directory. The Windows service reads `blue_onyx_prism_config_service.json`
 (created with debug logging on first start).
 
+"Applies" says when a change takes effect: *at once* (on save, from the Config page or an edit of
+the file), *model reload* (on save, only that model is reloaded), *restart* (the Config page's
+**Restart server**, which reloads the config in the same process, or a process restart) or *process
+restart* (stop and start the program or service). "UI" says whether the Config page has a field for
+it; every key can also be set in the file.
+
 | Field | Default | Meaning |
 |---|---|---|
-| `port` | `32168` | HTTP listen port, 1-65535 (process restart) |
-| `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only (process restart). See [Remote access](#remote-access) |
-| `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines too (applies at once). See [Remote access](#remote-access) |
-| `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout), 1-3600 |
-| `worker_queue_size` | `0` | Per-model queue length, 0-1024; 0 = auto from timeout and measured inference time |
-| `device` | `"auto"` | Device spec (`auto`, `openvino:gpu`, `ort:cuda`, ..., or legacy `GPU`/`CPU`); see [Hardware and device selection](#hardware-and-device-selection). Falls back to CPU when the device cannot run |
-| `gpu_index` | `0` | GPU to use when several are present, 0-64 |
-| `force_cpu` | `false` | Always use the CPU |
-| `cache_dir` | `"cache"` | Compiled-model cache; empty disables it |
-| `openvino_dir` | `null` | OpenVINO runtime dir; default `<exe_dir>/openvino`, else the system install |
-| `onnxruntime_dir` | `null` | ONNX Runtime dir (user-managed, never replaced); lookup order: this field, `ORT_DYLIB_PATH`, `onnxruntime/<flavor>/` named by `onnxruntime/active.txt`, `onnxruntime/` itself (older installs), any `onnxruntime/<flavor>/` |
-| `auto_download` | `true` | Download missing runtimes and models at startup; see [First run](#first-run) |
-| `allow_large_downloads` | `false` | Allow downloads over 500 MB (NVIDIA CUDA libraries) |
-| `download_dir` | `null` | Root for downloaded runtimes and relative model paths (default: the executable's directory) |
-| `confidence_threshold` | `0.5` | Default minimum confidence, 0-1 (a request's `min_confidence` > 0 overrides it) |
-| `nms_iou` | `0.5` | IoU threshold for NMS-based families, 0-1 |
-| `object_filter` | `[]` | Only report these labels (case-insensitive); empty = all |
-| `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error` |
-| `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout) |
-| `save_image_path` | `null` | Save annotated detections here |
-| `save_ref_image` | `false` | Also save the unannotated image |
-| `save_image_max_age_days` | `30` | Delete saved images (`.jpg`/`.jpeg`/`.png` directly in `save_image_path`) older than this many days, 0-3650 (0 = keep). Checked every 10 minutes. Applies at once |
-| `save_image_max_mb` | `2048` | Keep the saved-image folder under this many MB, deleting the oldest first, 0-1000000 (0 = unlimited). Applies at once |
-| `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. 1000 to 1000000000. Applies at once |
-| `intra_threads` | `0` | CPU inference threads, 0-256 (0 = OpenVINO default; try 4 of 6 cores) |
-| `models_dir` | `"models"` | Where `download-models` puts files (must not be empty) |
-| `default_model` | `null` | Model serving `/v1/vision/detection`; default = first enabled entry |
-| `models` | `[]` | Model list, see [Multiple models](#multiple-models) |
-
-Model entry fields: `name`, `path` (`.onnx` or IR `.xml`), `family` (`auto`, `yolo26`, `yolo5`, `yolo8`,
-`rtdetr`), `classes` (YAML with `NAMES:`; default `<stem>.yaml`, then COCO-80), `device`,
-`confidence_threshold`, `object_filter`, `lazy`, `gpu_precision`, `enabled` (default `true`; disabled
-models stay in the config but are not loaded or served).
+| `port` | `32168` | HTTP listen port. Integer 1-65535. Applies: process restart. UI: yes |
+| `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
+| `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines too. Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
+| `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout). Integer 1-3600. Applies: at once. UI: yes |
+| `worker_queue_size` | `0` | Per-model queue length; 0 = auto from timeout and measured inference time. Integer 0-1024. Applies: restart. UI: yes |
+| `device` | `"auto"` | Device spec (`auto`, `openvino:gpu`, `ort:cuda`, ..., or legacy `GPU`/`CPU`); see [Hardware and device selection](#hardware-and-device-selection). Falls back to CPU when the device cannot run. Applies: restart. UI: yes |
+| `gpu_index` | `0` | GPU to use when several are present. Integer 0-64. Applies: restart. UI: yes |
+| `force_cpu` | `false` | Always use the CPU (overrides every per-model device). Boolean. Applies: restart. UI: yes |
+| `cache_dir` | `"cache"` | Compiled-model cache; `""` disables it. Path. Applies: restart. UI: yes |
+| `openvino_dir` | `null` | OpenVINO runtime dir; default `<exe_dir>/openvino`, else the system install. Path. Applies: restart. UI: no |
+| `onnxruntime_dir` | `null` | ONNX Runtime dir (user-managed, never replaced); lookup order: this field, `ORT_DYLIB_PATH`, `onnxruntime/<flavor>/` named by `onnxruntime/active.txt`, `onnxruntime/` itself (older installs), any `onnxruntime/<flavor>/`. Path. Applies: process restart (a process loads one ONNX Runtime). UI: no |
+| `auto_download` | `true` | Download missing runtimes and models at startup; see [First run](#first-run). Boolean. Applies: restart. UI: yes |
+| `allow_large_downloads` | `false` | Allow downloads over 500 MB (NVIDIA CUDA libraries). Boolean. Applies: restart. UI: yes |
+| `download_dir` | `null` | Root for downloaded runtimes and relative model paths (default: the executable's directory). Path. Applies: restart. UI: no |
+| `confidence_threshold` | `0.5` | Default minimum confidence (a request's `min_confidence` > 0 overrides it). Number 0-1. Applies: at once. UI: yes |
+| `nms_iou` | `0.5` | IoU threshold for NMS-based families. Number 0-1. Applies: at once. UI: yes |
+| `object_filter` | `[]` | Only report these labels (case-insensitive); empty = all. List of strings. Applies: at once. UI: yes |
+| `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`. Applies: at once. UI: yes (also the Logs page) |
+| `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout only). Path. Applies: process restart. UI: yes |
+| `log_format` | `"text"` | Format of the log files under `log_path`: `"text"` or `"json"` (one JSON object per line, for log shippers); the console stays text. Applies: process restart. UI: no |
+| `save_image_path` | `null` | Save annotated detections here. Path. Applies: at once. UI: yes |
+| `save_ref_image` | `false` | Also save the unannotated image. Boolean. Applies: at once. UI: yes |
+| `save_image_max_age_days` | `30` | Delete saved images (`.jpg`/`.jpeg`/`.png` directly in `save_image_path`) older than this many days, 0 = keep; checked every 10 minutes. Integer 0-3650. Applies: at once. UI: yes |
+| `save_image_max_mb` | `2048` | Keep the saved-image folder under this many MB, deleting the oldest first, 0 = unlimited. Integer 0-1000000. Applies: at once. UI: yes |
+| `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. Integer 1000-1000000000. Applies: at once. UI: no |
+| `intra_threads` | `0` | CPU inference threads (0 = OpenVINO default; try 4 of 6 cores). Integer 0-256. Applies: restart. UI: yes |
+| `preprocess_threads` | `0` | Decode + preprocess threads shared by every model; 0 = from the hardware profile (half the cores, 1-8; at most 2 when every model runs on the CPU). Integer 0-256. Applies: restart. UI: no |
+| `inflight` | `0` | Concurrent inferences per model; 0 = from the hardware profile and the model's device. A model's own `inflight` wins. Integer 0-64. Applies: restart. UI: no |
+| `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model; 0 = from the hardware profile (2 on a high-spec machine with an NVIDIA GPU, else 1). Integer 0-16. Applies: restart. UI: no |
+| `hardware_profile` | `"auto"` | Hardware class the `0` defaults above come from: `auto` (classified from cores, RAM and GPUs) or forced `low`, `mid`, `high`. Applies: restart. UI: no |
+| `models_dir` | `"models"` | Where `download-models` and exports put files. Path, must not be empty. Applies: restart. UI: yes |
+| `default_model` | `null` | Model serving `/v1/vision/detection`; default = first enabled entry. Model name. Applies: at once. UI: yes (Models card) |
+| `models` | `[]` | Model list; per-entry keys in [Multiple models](#multiple-models). Applies: per key, see there. UI: yes (Models card, Models JSON) |
+| `benchmark` | see [Per-model devices and benchmarking](#per-model-devices-and-benchmarking) | Benchmark defaults (`benchmark.*` keys, listed there). Applies: at once (read when a benchmark starts). UI: yes (Benchmark page, **Save as default**) |
 
 ## Blue Iris setup
 
@@ -287,7 +297,7 @@ cargo run --release -- --model models/IPcam-general.onnx --family yolo5 --force-
 curl -F image=@test.jpg -F min_confidence=0.4 http://127.0.0.1:32168/v1/vision/detection
 ```
 
-Drop `--force-cpu` to use the Intel GPU (`--device GPU`, default). The first GPU start compiles the
+Drop `--force-cpu` to let `--device auto` (the default) pick the best device, e.g. the Intel GPU. The first GPU start compiles the
 model (20-60 s on an iGPU); later starts load from `cache/`.
 
 Development loop:
@@ -398,10 +408,10 @@ the locks with `scripts/model-export/gen_locks.sh <path to the pinned uv>`.
 ### Repository layout
 
 - `src/` Rust crate (see CLAUDE.md for the module map)
-- `scripts/` service install scripts (Windows PowerShell, systemd, launchd) and the model export script
-- `deploy/` systemd unit, launchd plist, docker-compose; `Dockerfile` at the root
+- `scripts/` service install and uninstall scripts (Windows PowerShell, systemd, launchd) and the model export script
+- `deploy/` systemd unit, launchd plist, docker-compose and the container entrypoint; `Dockerfile` at the root
 - `docs/PLAN.md` implementation plan and phase checklist
-- `.github/workflows/ci.yml` build, lint, test and a CPU smoke test on Windows, Linux and macOS; `release.yml` builds the per-OS archives and a draft release
+- `.github/workflows/ci.yml` build, lint, test and a CPU smoke test on Windows, Linux and macOS; `release.yml` builds the per-OS archives, attests their provenance and creates a draft release; `check-urls.yml` checks the pinned download URLs weekly and opens an issue when one fails
 - `.claude/` Claude Code project configuration (agent definitions)
 
 ## Multiple models
@@ -421,18 +431,35 @@ List any number of models in `models[]` of the config file:
 }
 ```
 
+Per-model keys (the Models card on the Config page edits `enabled`, `device`, `confidence_threshold`
+and the default model; every key is in the *Models JSON* under it):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `name` | file stem | Name in `/v1/vision/custom/{name}` and Blue Iris; unique, case-insensitive. Applies: model reload (a rename is a remove plus an add). UI: Models JSON |
+| `path` | (required) | `.onnx` or OpenVINO IR `.xml` (with its `.bin`); relative paths resolve against the executable directory (or `download_dir`). Applies: model reload. UI: Models JSON, *Add a model by path* |
+| `family` | `"auto"` | `auto`, `yolo26`, `yolo5`, `yolo8`, `rtdetr`, `detr`, `rfdetr` (see [Features](#features); fine-tuned RF-DETR needs `rfdetr`). Applies: model reload. UI: Models JSON, *Add a model by path* |
+| `classes` | `null` | YAML with `NAMES:`; default `<stem>.yaml` beside the model, then COCO-80. Path. Applies: model reload. UI: Models JSON, *Add a model by path* |
+| `device` | `null` | Device spec for this model (any spec of `list-devices`); `null` = the global `device`. Applies: model reload. UI: yes (Models card) |
+| `confidence_threshold` | `null` | Minimum confidence for this model; `null` = the global one. Number 0-1. Applies: at once. UI: yes (Models card) |
+| `object_filter` | `null` | Only report these labels; `null` = the global `object_filter`. List of strings. Applies: at once. UI: Models JSON |
+| `lazy` | `false` | Compile on first request instead of at startup; requests are answered "initializing" at once until it is ready. Boolean. Applies: model reload. UI: Models JSON |
+| `gpu_precision` | `null` | Inference precision on an OpenVINO GPU: `f16` (default) or `f32` (slower; for models that overflow f16). Applies: model reload. UI: Models JSON |
+| `enabled` | `true` | Load and serve this model; disabled models stay in the config but are not loaded. Boolean. Applies: model reload (start or stop). UI: yes (Models card *Load*) |
+| `inflight` | `null` | Concurrent inferences of this model; `null` or `0` = the global `inflight`. Integer 0-64. Applies: restart. UI: no |
+
 - Names: `name`, else the file stem. Matching is case-insensitive and a `.onnx`/`.xml` suffix is ignored,
   so `/v1/vision/custom/IPcam-General.onnx` reaches `IPcam-general`.
 - Only models with `enabled: true` (the default) are compiled and served. Pick them on the Config
-  page: the **Models** card has a *Load* checkbox and a *Default* radio per model; **Save and restart**
-  applies the selection. Disabled models stay listed so switching is a click plus a restart.
+  page: the **Models** card has a *Load* checkbox and a *Default* radio per model; **Save** applies
+  the selection at once (only the models that changed are loaded or stopped). Disabled models stay
+  listed so switching is a click.
 - `default_model` (or `--default-model <name>`) serves `/v1/vision/detection`; default is the first
   enabled entry (also used when `default_model` names a disabled model).
 - `GET`/`POST /v1/vision/custom/list` returns the loaded (enabled) model names.
 - An unknown model name returns HTTP 200 with `success: false` and an error message.
-- Per-model overrides: `device` (any device spec, see below), `confidence_threshold`, `object_filter`,
-  `lazy` (compile on first request instead of at startup; requests are answered "initializing"
-  at once until it is ready) and `gpu_precision` (`f16` default, `f32`).
+- Per-model overrides: `device`, `confidence_threshold`, `object_filter`, `lazy`, `gpu_precision`
+  and `inflight` (table above).
 - `blue-onyx-prism download-models --name IPcam-general --add-to-config` downloads and appends the
   model (family and classes file filled in) to the config, skipping names or paths already present.
   New entries are added disabled when the config already has an enabled model (otherwise the first
@@ -540,6 +567,22 @@ TPR / FPR at the configured and best thresholds), a summary and a 0.05-step tabl
 
 The `benchmark` config section holds the defaults (**Save as default** on the page writes it):
 
+| Field | Default | Meaning |
+|---|---|---|
+| `benchmark.datasets` | `["coco-cctv", "bmd45-cctv", "exdark-night"]` | Datasets to run: built-in ids, `sample`, `dir:<path>` or `{"dir", "gt", "name"}` objects. UI: yes |
+| `benchmark.max_images_per_dataset` | `0` | Images per dataset, evenly spread; 0 = all. Integer >= 0. UI: yes |
+| `benchmark.devices` | `[]` | Device specs to run; empty = every runnable option. UI: yes |
+| `benchmark.models` | `[]` | Model names; empty = the enabled models whose files are present. UI: yes |
+| `benchmark.warmup` | `3` | Untimed warm-up runs per model and device. Integer 0-1000. UI: yes |
+| `benchmark.repeat_per_image` | `1` | Timed runs per image. Integer 0-1000. UI: yes |
+| `benchmark.reference_model` | `null` | Model whose detections score datasets without ground truth; `null` = the most accurate installed one. UI: yes |
+| `benchmark.weights` | `{"accuracy": 0.6, "speed": 0.4}` | Weights of the overall grade, each 0-1. UI: yes (accuracy weight) |
+| `benchmark.auto_download_datasets` | `true` | Download the selected built-in datasets when a run starts (large ones still need `allow_large_downloads`). Boolean. UI: no |
+| `benchmark.threshold_objective` | `"f1"` | Best-threshold objective: `f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`. UI: yes |
+| `benchmark.accuracy_metric` | `"ap50"` | `ap50` or `roc_auc`: drives the accuracy grade, ranking and device recommendation. UI: yes |
+
+All of them apply at once: they are read when a benchmark starts.
+
 ```json
 "benchmark": {
   "datasets": ["coco-cctv", "bmd45-cctv", "exdark-night"],
@@ -559,7 +602,7 @@ Open `http://<host>:32168/` in a browser:
 | `/` | Models (state badge with download progress or failure reason, device, requests, queue), the execution providers *in use*, the `auto` pick, runtimes and GPUs, uptime, API usage; warns when *Force CPU* overrides the device; shows a hint when a newer release exists |
 | `/stats` | Per-model state, runtime, device, CPU fallback, requests, dropped, queue, inference/process/round-trip avg/min/max; updates in place every 5 s from `/stats.json` |
 | `/test` | Pick, drop or paste an image, choose a model and `min_confidence`; the page posts to `/v1/vision/custom/{model}` and draws the boxes client-side, with a detections table and the raw JSON (same code path and metrics as the API; without JavaScript the form posts to `/test` and the server draws the image) |
-| `/config` | Models card (which models load, the default model, **Save and restart**), Resources, server/inference/logging settings with "applies now" / "needs restart" tags and the `models` list as JSON under *Advanced*; **Restart server** reloads the file and recompiles the enabled models without restarting the process; the listener stays up and the old models answer until the new ones are swapped in (a `port` or `log_path` change needs a process restart) |
+| `/config` | Models card (which models load, the default model, device and threshold per model; **Save** applies at once), Resources, server/inference/logging settings with "applies now" / "needs restart" tags and the `models` list as JSON under *Advanced*; **Restart server** reloads the file and recompiles the enabled models without restarting the process; the listener stays up and the old models answer until the new ones are swapped in (a `port` or `log_path` change needs a process restart) |
 | `/benchmark` | Benchmark models x devices x datasets in the background (progress, ETA, cancel); grade cards, model ranking, sortable per-device tables (fastest, recommended and configured marked), breakdowns by dataset/tag/class/size/resolution, per-image drill-down with ground truth and predictions drawn; **Use <device>** / **Apply recommended to all** write per-model devices; best confidence threshold per model with a P/R/F1 vs threshold chart, **Apply threshold** / **Apply all thresholds**; **Confidence search** over the stored predictions (filters, objective, chart with hover values, tables, CSV) |
 | `/logs` | The last 2,000 log events of this process, live (polls `/logs.json`), with level filter, search, pause/follow, Copy and Download .txt, and the server log level (applies immediately; `POST /config/loglevel` with `level=debug`, form or query) |
 | `/prometheus` | Prometheus metrics (`blue_onyx_prism_*{model="..."}`), linked in the footer with the JSON endpoints |
@@ -577,7 +620,16 @@ dashboards; the `_avg`/`_min`/`_max` gauges are still exported. Process level:
 `blue_onyx_prism_restarts_total` and `blue_onyx_prism_requests_rejected_total{reason="overloaded"}`
 (detections answered 503 at once because more requests were in flight than every model's queue
 can hold plus 16; `stats.json` shows the same as `rejectedOverloaded` and `inflightRequests`).
-Gauges: `model_info`, `model_ready`, `queue_length`, `queue_capacity`, `inflight_requests`. (`rejected_initializing_total` is now `dropped_total{reason="initializing"}`.)
+Other `requests_rejected_total` reasons count detection requests refused before they reach a
+model (`body_too_large`, `decode_error`, `bad_request`). Gauges: `model_info`, `model_ready`,
+`queue_length`, `queue_capacity`, `inflight_requests`. (`rejected_initializing_total` is now
+`dropped_total{reason="initializing"}`.) Process and build:
+
+- `blue_onyx_prism_build_info{version,git_sha,build_date}`: always 1; the labels identify the binary (the older `info{version}` series stays).
+- `blue_onyx_prism_download_bytes_total`: bytes downloaded by the resource manager (runtimes, models, datasets).
+- `blue_onyx_prism_download_failures_total`: downloads that failed (network, size or SHA-256 mismatch).
+- `blue_onyx_prism_process_resident_memory_bytes`: resident memory of the process (omitted where the platform has no cheap source).
+- `blue_onyx_prism_process_open_fds`: open file descriptors (Linux only).
 
 `log_path`, `port` and `bind_address` changes need a full process restart. The UI has no
 authentication: do not expose the port beyond your LAN.
@@ -607,6 +659,11 @@ detection API (`/v1/vision/*`), `/v1/status`, `/v1/status/updateavailable`, the 
   foreign). Requests with none of these headers are allowed, so `curl` and scripts on this machine
   keep working; browsers always send `Origin` on cross-origin POSTs. The detection API is never
   checked.
+- A reverse proxy on this machine (nginx, Caddy, Traefik, e.g. for TLS) makes every proxied request
+  arrive from `127.0.0.1`, so everyone who can reach the proxy gets the admin pages: it is
+  equivalent to `"allow_remote_admin": true`. `X-Forwarded-For` and similar headers are ignored on
+  purpose (any client can send them). Restrict the admin paths in the proxy (or proxy only
+  `/v1/vision/*`) when it is reachable from other machines.
 - To keep everything on this machine (Blue Iris on the same PC), set `"bind_address": "127.0.0.1"`
   (or `--bind-address 127.0.0.1`); it applies when the process restarts.
 
@@ -630,8 +687,13 @@ new files to the install dir but cannot change the exe or the files shipped with
 `icacls <dir> /grant "NT SERVICE\BlueOnyxPrismService:(OI)(CI)M"`.
 If GPU access fails under the virtual account, reinstall with `-Account LocalSystem` (full control of
 the machine) or `-Account DOMAIN\user` (you are prompted for the password; the account needs the
-"Log on as a service" right). The script raises `ServicesPipeTimeout` to 600000 ms (applies after a
-reboot) so the first start can compile models. Logs go to the Application event log (source
+"Log on as a service" right). The service token carries the service SID (`sc.exe sidtype
+unrestricted`, so the grants above apply under any account) and only `SeChangeNotifyPrivilege`
+(`sc.exe privs`: every other privilege is removed, LocalSystem included). The script raises the
+machine-wide `ServicesPipeTimeout` to 600000 ms (applies after a reboot; a larger value is kept) so
+the first start can compile models; it records the previous value and `uninstall_service.ps1`
+restores it. A reinstall fails with a clear message, instead of half-registering the service,
+when services.msc or Event Viewer keeps the old one open. Logs go to the Application event log (source
 `BlueOnyxPrism`) and, with `log_path`, to files.
 
 **Linux** (systemd):
@@ -640,7 +702,11 @@ reboot) so the first start can compile models. Logs go to the Application event 
 sudo cp -r blue-onyx-prism-<version>-linux-x86_64 /opt/blue-onyx-prism
 sudo /opt/blue-onyx-prism/scripts/install_systemd.sh      # creates user blueonyx (render, video groups)
 journalctl -u blue-onyx-prism -f
+sudo /opt/blue-onyx-prism/scripts/uninstall_systemd.sh    # stop and remove the unit (--purge: also data and user)
 ```
+
+Re-running `install_systemd.sh` after copying a new release over `/opt/blue-onyx-prism` restarts the
+service on the new binary.
 
 The program in `/opt/blue-onyx-prism` stays owned by root. The service user `blueonyx` writes only
 to `/var/lib/blue-onyx-prism`: the config (`blue_onyx_prism_config.json`), models, cache, downloads,
@@ -662,6 +728,7 @@ add a `save_image_path` or `log_path` outside `/var/lib/blue-onyx-prism` (`ReadW
 ```sh
 sudo cp -r blue-onyx-prism-<version>-macos-aarch64 /usr/local/blue-onyx-prism
 sudo /usr/local/blue-onyx-prism/scripts/install_launchd.sh   # KeepAlive; runs as _blueonyx
+sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh # unload and remove (--purge: also data, logs, account)
 ```
 
 The daemon runs as the hidden role account `_blueonyx` (created by the script, UID below 500). The
@@ -677,6 +744,21 @@ stdout/stderr go to `/var/log/blue-onyx-prism/stdout.log`, rotated by
 cd deploy && mkdir -p cache config
 RENDER_GID=$(getent group render | cut -d: -f3) docker compose up -d --build
 ```
+
+Create `cache` and `config` yourself as above: the container runs as the image's non-root
+`openvino` user, and a directory docker creates for a missing bind mount is owned by root. If your
+user's uid differs from the image user's (`docker run --rm --entrypoint id blue-onyx-prism:latest`
+prints it), either `sudo chown -R <uid>:<gid> deploy/cache deploy/config` or set `user: "<uid>:<gid>"`
+(the directories' owner) in `deploy/docker-compose.yml`. The entrypoint checks this and exits with
+the uid in the message instead of starting with a config it cannot save.
+
+The compose file runs the container with a read-only root filesystem (`read_only: true`, a tmpfs at
+`/tmp`, `no-new-privileges`, all capabilities dropped). The service writes only to its volumes:
+`config` (the config file and `benchmark.json`), `cache`, `models` and the named volume `data` at
+`/app/data`, which the shipped config names as `download_dir` (web UI downloads, benchmark datasets,
+the model-export toolchain). A config created by an older image has no `download_dir`: add
+`"download_dir": "/app/data"` to it (the entrypoint warns until you do). The entrypoint needs no
+network; the image's default config has `auto_download: false`.
 
 The image contains IPcam-general; the compose file mounts it through the named volume `models`
 (at `/app/models`), so it is there on first start. To bring your own models, replace
@@ -698,7 +780,7 @@ Benchmark) answer 403 and the detection API works:
   LAN line, every LAN client gets the admin pages (see [Remote access](#remote-access)): turn it
   on only while you use them.
 
-The container's health check polls `/v1/vision/custom/list` (`docker ps` shows `healthy`).
+The container's health check polls `/v1/status` (`docker ps` shows `healthy` once a model is ready).
 
 ## HTTP API
 
@@ -724,7 +806,7 @@ The container's health check polls `/v1/vision/custom/list` (`docker ps` shows `
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
 | POST | `/v1/benchmark/apply` | `model` + `device` (`""`/`global` clears it), or `all=1` for every saved recommendation; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
-| GET, POST | `/v1/benchmark/threshold-search` | GET: searchable models/devices/datasets/tags/classes; POST: `model` (repeated or `all`), `device` (default recommended), `dataset`, `tag`, `class` (repeated), `objective` (`f1`, `f2`, `precision:<p>`, `recall:<r>`), `iou` (0.5): best threshold, P/R/F1/F2/FP per image at best vs configured, exact curve, 0.05 grid, per dataset/class, CSV; 400 when nothing is stored (run a benchmark first) |
+| GET, POST | `/v1/benchmark/threshold-search` | GET: searchable models/devices/datasets/tags/classes; POST: `model` (repeated or `all`), `device` (default recommended), `dataset`, `tag`, `class` (repeated), `objective` (`f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`), `iou` (0.5): best threshold, P/R/F1/F2/FP per image at best vs configured, exact curve, 0.05 grid, per dataset/class, CSV; 400 when nothing is stored (run a benchmark first) |
 | GET | `/v1/benchmark/images?model=&device=`, `/v1/benchmark/image?set=&file=` | per-image drill-down data; an image of the saved results |
 | POST | `/v1/resources/add-to-config` | form `id` of a downloaded model, or `local:<file>` for a model file in `models_dir` (family `auto`): append it to `models` |
 
@@ -759,7 +841,19 @@ the FP32 path is active.
 
 ## Releasing
 
-Tagging steps and the manual NVIDIA benchmark check are in [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
+Tagging steps and the manual NVIDIA (CUDA/TensorRT), Intel iGPU and YOLO26 checks are in
+[docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md). Release binaries carry the commit and build
+date (`blue-onyx-prism --version`, `build_info` metric). Each archive ships `LICENSE` and
+`THIRD_PARTY_LICENSES.md` (OpenVINO, ONNX Runtime, DirectML, the embedded font and the Rust
+crates) and has a `.sha256` file and a build-provenance attestation. Verify a download with:
+
+```sh
+sha256sum -c blue-onyx-prism-<version>-linux-x86_64.tar.gz.sha256   # macOS: shasum -a 256 -c ...
+gh attestation verify blue-onyx-prism-<version>-linux-x86_64.tar.gz --repo patrickgods1/blue-onyx-prism
+```
+
+(Windows: compare `Get-FileHash <zip>` with the `.sha256` file, then the same `gh attestation
+verify`.)
 
 ## Test client
 
@@ -797,7 +891,8 @@ response has `success: false` or a non-200 status.
 ## License
 
 MIT. Portions derived from [blue-onyx](https://github.com/xnorpx/blue-onyx) (MIT, Marcus Asteborg).
-See `LICENSE`. Ultralytics YOLO weights and the Ultralytics exporter are AGPL-3.0 and are not
+See `LICENSE`; third-party code in the archives and binaries is listed with its licenses in
+`THIRD_PARTY_LICENSES.md`. Ultralytics YOLO weights and the Ultralytics exporter are AGPL-3.0 and are not
 distributed with this project: the on-demand export downloads the official weights from
 Ultralytics' GitHub release on your request and exports them on your machine (see above), as it
 does for RF-DETR large (Apache-2.0) and DEIMv2 (non-commercial / personal use, see the license note above). The blue-onyx IPcam models and RT-DETRv2 models are downloaded from their own

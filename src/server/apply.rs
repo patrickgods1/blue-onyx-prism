@@ -303,6 +303,32 @@ mod tests {
         );
     }
 
+    /// SV-14: the Models card rejects a per-model threshold outside 0..=1 (the browser's
+    /// `max="1"` is not enforced by curl or a hand-typed value) and keeps the config.
+    #[tokio::test]
+    async fn models_card_rejects_out_of_range_threshold() {
+        let state = test_state();
+        let before = state.config_read().clone();
+        for bad in ["1.5", "-1", "NaN", "abc"] {
+            let form = format!(
+                "enabled=ipcam-general&threshold.ipcam-general={}&action=save",
+                urlencode(bad)
+            );
+            let (s, _, b) = call(&state, post_json("/config/models", &form)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+            let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            let msg = j["message"].as_str().unwrap();
+            assert!(msg.contains("threshold for 'ipcam-general'"), "{msg}");
+            assert!(msg.contains("between 0 and 1"), "{msg}");
+            assert_eq!(*state.config_read(), before, "{bad}");
+        }
+        for ok in ["0", "1"] {
+            let form = format!("enabled=ipcam-general&threshold.ipcam-general={ok}&action=save");
+            let (s, _, b) = call(&state, post_json("/config/models", &form)).await;
+            assert_eq!(s, StatusCode::OK, "{ok}: {}", String::from_utf8_lossy(&b));
+        }
+    }
+
     #[tokio::test]
     async fn config_endpoint_etag_pending_and_disk_changes() {
         let state = test_state();

@@ -15,7 +15,8 @@ on:
       - "[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
 
-# Read-only by default; only the release job, which builds nothing, gets write access.
+# Read-only by default; only the attest job (OIDC token + attestation write) and the release job
+# (contents write), neither of which builds anything, get more.
 permissions:
   contents: read
 
@@ -26,6 +27,7 @@ jobs:
   build:
     name: build (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +65,9 @@ jobs:
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "NAME=blue-onyx-prism-$VERSION-${{ matrix.label }}" >> "$GITHUB_ENV"
+          # Read by the binary with option_env! (`--version`, /v1/status, build_info metric).
+          echo "BLUE_ONYX_PRISM_GIT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          echo "BLUE_ONYX_PRISM_BUILD_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
 
       - name: Build release (default features, OpenVINO + ONNX Runtime)
         run: cargo build --release --locked --bins --target ${{ matrix.target }}
@@ -94,7 +99,9 @@ jobs:
             fi
           fi
           cp scripts/export_model.py scripts/convert_onnx_to_ir.py scripts/requirements-export.txt "$STAGE/scripts/"
-          cp README.md LICENSE "$STAGE/"
+          # LICENSE (this project) and the notices of everything the archive bundles: OpenVINO,
+          # ONNX Runtime, DirectML, the embedded font and the Rust crates in the binaries.
+          cp README.md LICENSE THIRD_PARTY_LICENSES.md "$STAGE/"
           mkdir -p "$STAGE/models"
           "$OUT/blue-onyx-prism" setup-openvino --dest "$STAGE/openvino"
           # Default ONNX Runtime flavor per OS (default features build the `ort` backend, load-dynamic).
@@ -127,10 +134,33 @@ jobs:
             dist/${{ env.NAME }}.${{ matrix.ext }}.sha256
           if-no-files-found: error
 
-  release:
-    name: draft release
+  # Build provenance (SLSA, signed through GitHub's OIDC token) for every archive, so a user can
+  # check a download with `gh attestation verify <file> --repo <owner/repo>` (docs/RELEASE_CHECKLIST.md).
+  attest:
+    name: attest build provenance
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+
+  release:
+    name: draft release
+    needs: [build, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:

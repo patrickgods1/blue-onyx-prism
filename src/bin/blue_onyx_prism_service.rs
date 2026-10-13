@@ -27,13 +27,34 @@
 )]
 #![deny(unsafe_code)]
 
+/// `--version` / `-V`: version, git sha and build date (the binary takes no other arguments).
+fn version_requested() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+}
+
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    if version_requested() {
+        println!(
+            "blue-onyx-prism-service {}",
+            blue_onyx_prism::cli::long_version_str()
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
     service::main()
 }
 
 #[cfg(not(windows))]
 fn main() -> std::process::ExitCode {
+    if version_requested() {
+        println!(
+            "blue-onyx-prism-service {}",
+            blue_onyx_prism::cli::long_version_str()
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
     eprintln!(
         "blue-onyx-prism-service is a Windows service binary and only runs on Windows. \
          On Linux/macOS run `blue-onyx-prism` under systemd or launchd (see deploy/)."
@@ -46,7 +67,7 @@ mod service {
     use anyhow::Result;
     use blue_onyx_prism::backend::libs;
     use blue_onyx_prism::cli::{self, ExtraLogLayer, LogReloadHandle};
-    use blue_onyx_prism::config::{Config, LogLevel};
+    use blue_onyx_prism::config::{Config, LogFormat, LogLevel};
     use blue_onyx_prism::sync::LockExt;
     use blue_onyx_prism::{resolve_path, runner, system_info};
     use std::ffi::OsString;
@@ -80,6 +101,8 @@ mod service {
     const START_WAIT_HINT: Duration = Duration::from_secs(600);
     const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
     const RETRY_DELAY: Duration = Duration::from_secs(5);
+    /// Service-specific exit code: the server did not stop within `runner::SHUTDOWN_DEADLINE`.
+    const EXIT_STOP_TIMED_OUT: u32 = 2;
 
     define_windows_service!(ffi_service_main, service_main);
 
@@ -135,26 +158,29 @@ mod service {
         }
     }
 
-    /// File log (when configured) + event log. Falls back to no file log if the log directory
-    /// cannot be created.
-    fn init_logging(level: LogLevel, log_path: Option<PathBuf>) -> Result<LogReloadHandle> {
-        if let Some(dir) = &log_path {
-            match std::fs::create_dir_all(dir) {
-                Ok(()) => return cli::init_logging_with(level, Some(dir), event_log_layer()),
-                Err(e) => eprintln!("could not create log dir {}: {e}", dir.display()),
-            }
-        }
-        cli::init_logging_with(level, None, event_log_layer())
+    /// File log (when configured, in `format`) + event log. A log directory that cannot be
+    /// created falls back to stdout (discarded for a service) with a warning that also reaches
+    /// the event log (`cli::init_logging_opts`).
+    fn init_logging(
+        level: LogLevel,
+        log_path: Option<PathBuf>,
+        format: LogFormat,
+    ) -> Result<LogReloadHandle> {
+        cli::init_logging_opts(level, log_path.as_deref(), format, event_log_layer())
     }
 
     fn service_main(_arguments: Vec<OsString>) {
         // Service working directory is System32: every path is resolved against the exe dir.
         let first = cli::for_service();
-        let (level, log_path) = match &first {
-            Ok((c, _)) => (c.log_level, c.log_path.as_deref().map(resolve_path)),
-            Err(_) => (LogLevel::Info, None),
+        let (level, log_path, format) = match &first {
+            Ok((c, _)) => (
+                c.log_level,
+                c.log_path.as_deref().map(resolve_path),
+                c.log_format,
+            ),
+            Err(_) => (LogLevel::Info, None, LogFormat::Text),
         };
-        let log = match init_logging(level, log_path) {
+        let log = match init_logging(level, log_path, format) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("{e:#}");
@@ -217,11 +243,14 @@ mod service {
 
         info!(
             version = blue_onyx_prism::VERSION,
+            git_sha = blue_onyx_prism::GIT_SHA,
+            build_date = blue_onyx_prism::BUILD_DATE,
             os = %system_info::os_description(),
             cpu = %system_info::cpu_name(),
             memory_gb = ?system_info::total_memory_gb(),
             config = %Config::service_config_path().display(),
-            "starting Blue Onyx Prism service"
+            "starting Blue Onyx Prism service {}",
+            blue_onyx_prism::long_version()
         );
         // Set OPENVINO_INSTALL_DIR (and the DLL search path) before any runtime/worker thread
         // exists; `OvCore::new` calls it again per generation and then leaves it untouched.
@@ -266,9 +295,12 @@ mod service {
         stop.cancel();
 
         // Workers finish their current inference (or compile) before exiting; keep the SCM
-        // informed while we wait.
+        // informed while we wait, at most `runner::SHUTDOWN_DEADLINE` (CO-12: a GPU compile
+        // can take minutes). Past it the service reports Stopped with
+        // `EXIT_STOP_TIMED_OUT` and the process ends with the server thread still running.
+        let deadline = std::time::Instant::now() + runner::SHUTDOWN_DEADLINE;
         let mut checkpoint = 1;
-        while !server.is_finished() {
+        while !server.is_finished() && std::time::Instant::now() < deadline {
             set_status(
                 &handle,
                 status(ServiceState::StopPending, STOP_WAIT_HINT, checkpoint),
@@ -276,10 +308,21 @@ mod service {
             checkpoint += 1;
             std::thread::sleep(Duration::from_millis(500));
         }
-        if server.join().is_err() {
-            error!("server thread panicked");
-        }
-        info!("service stopped");
+        let exit = if server.is_finished() {
+            if server.join().is_err() {
+                error!("server thread panicked");
+            }
+            info!("service stopped");
+            exit
+        } else {
+            error!(
+                "the server did not stop within {} s (a model compile or a request is still \
+                 running); reporting the service as stopped anyway. If this repeats, check the \
+                 log for the model that was loading",
+                runner::SHUTDOWN_DEADLINE.as_secs()
+            );
+            ServiceExitCode::ServiceSpecific(EXIT_STOP_TIMED_OUT)
+        };
         let mut s = status(ServiceState::Stopped, Duration::ZERO, 0);
         s.exit_code = exit;
         set_status(&handle, s);
@@ -357,5 +400,7 @@ mod service {
                 }
             });
         }
+        // Blocking tasks get a bounded grace period (CO-12).
+        rt.shutdown_timeout(runner::RUNTIME_SHUTDOWN_GRACE);
     }
 }

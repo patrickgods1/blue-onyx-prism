@@ -98,12 +98,17 @@ pub const TOOLS_DIR: &str = "tools";
 /// Marker written into the environment once every package is installed.
 pub const ENV_MARKER: &str = ".blue-onyx-prism-env.json";
 
+/// How long an export waits for another process's export to finish (see [`Timeouts::lock_wait`]).
+pub const EXPORT_LOCK_WAIT: Duration = Duration::from_secs(10 * 60);
+
 /// Stage timeouts (the child process is killed when one passes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub python: Duration,
     pub packages: Duration,
     pub export: Duration,
+    /// Longest wait for another process's export lock before failing (RS-11).
+    pub lock_wait: Duration,
 }
 
 impl Default for Timeouts {
@@ -112,6 +117,7 @@ impl Default for Timeouts {
             python: Duration::from_secs(15 * 60),
             packages: Duration::from_secs(60 * 60),
             export: Duration::from_secs(60 * 60),
+            lock_wait: EXPORT_LOCK_WAIT,
         }
     }
 }
@@ -392,7 +398,12 @@ struct ExportLock {
 }
 
 impl ExportLock {
-    fn acquire(path: &Path, cancel: &AtomicBool, mut waiting: impl FnMut()) -> Result<Self> {
+    fn acquire(
+        path: &Path,
+        cancel: &AtomicBool,
+        wait: Duration,
+        mut waiting: impl FnMut(),
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -405,6 +416,7 @@ impl ExportLock {
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
         let mut told = false;
+        let started = Instant::now();
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Self { _file: file }),
@@ -419,6 +431,15 @@ impl ExportLock {
             }
             if cancel.load(Ordering::Relaxed) {
                 return Err(anyhow!(Cancelled));
+            }
+            if started.elapsed() >= wait {
+                bail!(
+                    "another process (the service or a `fetch` command) has been exporting a \
+                     model for over {} min and holds {}; wait for it to finish (the Config \
+                     page shows its progress) or cancel it, then try again",
+                    wait.as_secs() / 60,
+                    path.display()
+                );
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -648,6 +669,11 @@ impl Tree {
             if inherited(&k.to_string_lossy()) {
                 c.env(&k, &v);
             }
+        }
+        // BE-15: the service prepends the runtime library dirs (OpenVINO, ONNX Runtime, CUDA) to
+        // PATH on Windows; the export's Python must not pick up those DLLs. None elsewhere.
+        if let Some(path) = crate::backend::libs::original_path() {
+            c.env("PATH", path);
         }
         for (k, v) in &cmd.env {
             c.env(k, v);
@@ -944,6 +970,11 @@ impl Fetcher for ManagerFetcher {
                     bail!("download of {} failed: {error}", res.title)
                 }
                 Some(DownloadState::Downloading { bytes, total }) => progress(bytes, total),
+                _ if !self.manager.is_alive() => bail!(
+                    "download of {} was not started: the download manager is not running; \
+                     restart the service (or rerun the command)",
+                    res.title
+                ),
                 _ => {}
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -1124,8 +1155,11 @@ fn run_stages(
 
     std::fs::create_dir_all(&p.tools).with_context(|| format!("creating {}", p.tools.display()))?;
     enter!(Stage::Uv, None, "checking the toolchain");
-    let _lock = ExportLock::acquire(&p.lock_file(), cancel, || {
-        tracing::info!("another process is exporting a model; waiting");
+    let _lock = ExportLock::acquire(&p.lock_file(), cancel, job.timeouts.lock_wait, || {
+        tracing::info!(
+            "another process is exporting a model; waiting up to {} min",
+            job.timeouts.lock_wait.as_secs() / 60
+        );
     })?;
 
     // 1. uv
@@ -1442,31 +1476,111 @@ fn install_outputs(
         bail!("{yaml_name} lists {classes} classes; the exportable COCO models have 80");
     }
     let shas = vec![manager::sha256_file(&onnx)?, manager::sha256_file(&yaml)?];
-    let mut files = Vec::new();
-    for (src, file) in [(&onnx, onnx_name), (&yaml, yaml_name)] {
-        let dst = models.join(file);
-        if std::fs::symlink_metadata(&dst).is_ok() {
-            std::fs::remove_file(&dst).with_context(|| format!("replacing {}", dst.display()))?;
-        }
-        std::fs::rename(src, &dst).with_context(|| format!("moving to {}", dst.display()))?;
-        files.push(file.to_string());
-    }
     let m = Manifest {
         id: res.id.to_string(),
         version: res.version.to_string(),
         sha256: shas,
-        files,
+        files: vec![onnx_name.to_string(), yaml_name.to_string()],
     };
+    std::fs::create_dir_all(models).with_context(|| format!("creating {}", models.display()))?;
     let path = manager::manifest_path(res, models);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&m).map_err(|e| anyhow!(e))?)
         .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+    // `.yaml` first, `.onnx` second (the `.onnx` is what makes the export "present"), the
+    // manifest last; on any failure everything moved so far is undone (RS-09).
+    let mut tx = InstallTx::default();
+    let result = (|| -> Result<()> {
+        tx.put(&yaml, &models.join(yaml_name))?;
+        tx.put(&onnx, &models.join(onnx_name))?;
+        #[cfg(test)]
+        if FAIL_MANIFEST_RENAME.with(std::cell::Cell::get) {
+            bail!("test: manifest rename fails");
+        }
+        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+    })();
+    if let Err(e) = result {
+        tx.rollback();
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.context(format!(
+            "installing the exported {onnx_name} into {} failed and was rolled back; check free \
+             disk space and that no other program (antivirus, an editor) holds the files, then \
+             export again",
+            models.display()
+        )));
+    }
+    tx.commit();
     Ok(ExportOutput {
         onnx: models.join(onnx_name),
         yaml: models.join(yaml_name),
         classes,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Make [`install_outputs`] fail at its last step (RS-09 test).
+    static FAIL_MANIFEST_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Files moved into the models directory by [`install_outputs`], undone on failure: each
+/// replaced file is first renamed aside (`.<name>.old-<pid>`) and restored by [`Self::rollback`].
+#[derive(Default)]
+struct InstallTx {
+    /// (destination, the previous file renamed aside, if there was one)
+    moved: Vec<(PathBuf, Option<PathBuf>)>,
+}
+
+impl InstallTx {
+    /// Move `src` to `dst`, keeping a previous `dst` aside.
+    fn put(&mut self, src: &Path, dst: &Path) -> Result<()> {
+        let name = dst
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parent = dst.parent().unwrap_or(Path::new("."));
+        let aside = if std::fs::symlink_metadata(dst).is_ok() {
+            let a = parent.join(format!(".{name}.old-{}", std::process::id()));
+            let _ = std::fs::remove_file(&a);
+            std::fs::rename(dst, &a).with_context(|| format!("replacing {}", dst.display()))?;
+            Some(a)
+        } else {
+            None
+        };
+        if let Err(e) = std::fs::rename(src, dst) {
+            if let Some(a) = &aside {
+                let _ = std::fs::rename(a, dst);
+            }
+            return Err(e).with_context(|| format!("moving to {}", dst.display()));
+        }
+        self.moved.push((dst.to_path_buf(), aside));
+        Ok(())
+    }
+
+    /// Remove what was moved in and restore the previous files, newest first.
+    fn rollback(&mut self) {
+        for (dst, aside) in self.moved.drain(..).rev() {
+            let _ = std::fs::remove_file(&dst);
+            if let Some(a) = aside
+                && let Err(e) = std::fs::rename(&a, &dst)
+            {
+                tracing::warn!(
+                    "could not restore {} from {}: {e}",
+                    dst.display(),
+                    a.display()
+                );
+            }
+        }
+    }
+
+    /// Delete the previous files.
+    fn commit(&mut self) {
+        for (_, aside) in self.moved.drain(..) {
+            if let Some(a) = aside {
+                let _ = std::fs::remove_file(a);
+            }
+        }
+    }
 }
 
 /// Number of names in a `NAMES:` class file.
@@ -1878,7 +1992,8 @@ pub fn export_now(
     fetcher: &dyn Fetcher,
     verbose: bool,
 ) -> Result<ExportOutput> {
-    let cancel = AtomicBool::new(false);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _ctrl_c = CtrlC::cancels(Arc::clone(&cancel));
     let mut last: Option<(Stage, u8)> = None;
     let name = job.resource.model_name().unwrap_or(job.resource.id);
     let mut report = |p: Progress<'_>| {
@@ -1922,6 +2037,76 @@ pub fn export_now(
             e.message
         )
     })
+}
+
+/// Ctrl-C handler of a CLI export (RS-11): the first Ctrl-C sets the cancel flag, so the running
+/// stage stops and its process tree is killed; a second one exits at once (status 130). Stops
+/// listening when dropped. Without it, Ctrl-C would end the CLI but leave `uv` / `python` (in
+/// their own process group) running.
+struct CtrlC {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CtrlC {
+    fn cancels(cancel: Arc<AtomicBool>) -> Self {
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("ctrl-c".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::warn!("Ctrl-C will not cancel the export cleanly: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    tokio::select! {
+                        _ = &mut rx => return,
+                        r = tokio::signal::ctrl_c() => if r.is_err() { return },
+                    }
+                    eprintln!(
+                        "Ctrl-C: cancelling the export and stopping its processes (press Ctrl-C \
+                         again to quit at once)"
+                    );
+                    cancel.store(true, Ordering::SeqCst);
+                    tokio::select! {
+                        _ = &mut rx => {}
+                        r = tokio::signal::ctrl_c() => if r.is_ok() {
+                            std::process::exit(130);
+                        },
+                    }
+                });
+            });
+        match thread {
+            Ok(t) => Self {
+                stop: Some(tx),
+                thread: Some(t),
+            },
+            Err(e) => {
+                tracing::warn!("Ctrl-C will not cancel the export cleanly: {e}");
+                Self {
+                    stop: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CtrlC {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// A [`ManagerFetcher`] on a fresh download manager for `root` (CLI).
@@ -2106,6 +2291,82 @@ mod tests {
 
     fn yolo26n() -> &'static Resource {
         catalog::export_model("yolo26n").unwrap()
+    }
+
+    /// RS-09: `install_outputs` moves `.yaml`, then `.onnx`, then the manifest; a failure at the
+    /// last step restores the previous files and leaves no new manifest.
+    #[test]
+    fn install_outputs_is_all_or_nothing() {
+        let root = tmp("install-tx");
+        let (staging, models) = (root.join("staging"), root.join("models"));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        let res = yolo26n();
+        let (onnx, yaml) = catalog::export_files(res).unwrap();
+        let (onnx, yaml) = (onnx.as_str(), yaml.as_str());
+        let names: String = (0..80).map(|i| format!("  - c{i}\n")).collect();
+        let stage = |tag: &str| {
+            std::fs::write(staging.join(onnx), vec![tag.as_bytes()[0]; 2048]).unwrap();
+            std::fs::write(staging.join(yaml), format!("NAMES:\n{names}# {tag}\n")).unwrap();
+        };
+        // A previous export by hand: old files, no manifest.
+        std::fs::write(models.join(onnx), b"old onnx").unwrap();
+        std::fs::write(models.join(yaml), b"old yaml").unwrap();
+        let manifest = manager::manifest_path(res, &models);
+
+        stage("new");
+        FAIL_MANIFEST_RENAME.with(|f| f.set(true));
+        let err = install_outputs(res, &staging, &models, onnx, yaml).unwrap_err();
+        FAIL_MANIFEST_RENAME.with(|f| f.set(false));
+        assert!(format!("{err:#}").contains("rolled back"), "{err:#}");
+        assert_eq!(std::fs::read(models.join(onnx)).unwrap(), b"old onnx");
+        assert_eq!(std::fs::read(models.join(yaml)).unwrap(), b"old yaml");
+        assert!(!manifest.exists());
+        let leftovers: Vec<String> = std::fs::read_dir(&models)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        stage("new");
+        let out = install_outputs(res, &staging, &models, onnx, yaml).unwrap();
+        assert_eq!(out.classes, 80);
+        assert_eq!(std::fs::read(models.join(onnx)).unwrap(), vec![b'n'; 2048]);
+        assert!(
+            std::fs::read_to_string(models.join(yaml))
+                .unwrap()
+                .contains("# new")
+        );
+        let m = manager::read_manifest(&manifest).unwrap();
+        assert_eq!(m.files, [onnx.to_string(), yaml.to_string()]);
+        assert!(is_exported(res, &models));
+        let leftovers = std::fs::read_dir(&models)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".old-"))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RS-11: the export lock wait is bounded and says why.
+    #[test]
+    fn export_lock_wait_is_bounded() {
+        let root = tmp("lock-wait");
+        let path = root.join("export.lock");
+        let never = AtomicBool::new(false);
+        let held = ExportLock::acquire(&path, &never, Duration::from_secs(1), || {}).unwrap();
+        let mut told = 0;
+        let e = ExportLock::acquire(&path, &never, Duration::from_millis(300), || told += 1)
+            .err()
+            .unwrap();
+        assert_eq!(told, 1);
+        assert!(format!("{e:#}").contains("another process"), "{e:#}");
+        drop(held);
+        ExportLock::acquire(&path, &never, Duration::from_millis(300), || {}).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     const MAC: Platform = Platform::MACOS_ARM64;

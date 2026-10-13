@@ -3,13 +3,14 @@
 //! and what the runtimes offer; no threads are started here ([`super::Spawner::spawn_model`]
 //! turns a [`ModelPlan`] into a worker).
 
-use super::{load_request, try_lock_runtimes, validate_names};
+use super::{
+    RELOAD_LOCK_WAIT, load_request, lock_runtimes_within, try_lock_runtimes, validate_names,
+};
 use crate::backend::spec::Device;
 use crate::backend::{DeviceSpec, LoadRequest, Runtimes};
 use crate::config::{Config, ModelConfig};
 use crate::model::classes::resolve_class_names;
 use crate::resources::provision::{Provision, Wait};
-use crate::sync::LockExt;
 use crate::worker::LiveSettings;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
@@ -24,7 +25,8 @@ pub trait PlanRuntimes {
     /// waiting for.
     fn first_runnable(&self, spec: &DeviceSpec, model: &Path) -> Option<(Device, String)>;
 
-    /// As [`Self::first_runnable`], but waits for busy runtimes.
+    /// As [`Self::first_runnable`], but may wait a little for busy runtimes (a reload waits at
+    /// most [`RELOAD_LOCK_WAIT`]; None when they stay busy).
     fn first_runnable_wait(&self, spec: &DeviceSpec, model: &Path) -> Option<(Device, String)> {
         self.first_runnable(spec, model)
     }
@@ -37,7 +39,10 @@ impl PlanRuntimes for Runtimes {
 }
 
 /// The generation's shared runtimes, for planning a reload while other models may compile:
-/// the label query only tries the lock, the interim-device query waits for it.
+/// the label query only tries the lock, the interim-device query waits for it at most
+/// [`RELOAD_LOCK_WAIT`] (PL-11: a reload runs on the config-save path and must not wait for a
+/// whole compile; when the lock stays busy the model waits for its downloads instead of
+/// loading on an interim device).
 pub(super) struct LockedRuntimes<'a>(pub &'a Mutex<Runtimes>);
 
 impl PlanRuntimes for LockedRuntimes<'_> {
@@ -46,8 +51,7 @@ impl PlanRuntimes for LockedRuntimes<'_> {
     }
 
     fn first_runnable_wait(&self, spec: &DeviceSpec, model: &Path) -> Option<(Device, String)> {
-        let rt = self.0.lock_recover();
-        rt.first_runnable(spec, model)
+        lock_runtimes_within(self.0, RELOAD_LOCK_WAIT)?.first_runnable(spec, model)
     }
 }
 
@@ -182,12 +186,21 @@ pub fn plan_model<R: PlanRuntimes + ?Sized>(
         }
         if !path.is_file() {
             bail!(
-                "model file not found: {} (download it with `download-models` or fix `path`)",
+                "model file not found: {}; it was not downloaded yet or `path` points to the \
+                 wrong place; download it with `download-models` (or the Resources page) or fix \
+                 `path` for this model",
                 path.display()
             );
         }
         let classes_path = m.classes.as_deref().map(|c| config.data_path(c));
-        Ok((device, resolve_class_names(&path, classes_path.as_deref())?))
+        let classes = resolve_class_names(&path, classes_path.as_deref()).map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}; the classes file is missing or not a YOLO-style `names:` list or map; \
+                 fix the file or the `classes` path of this model (or remove it to use \
+                 <model>.yaml or COCO-80)"
+            )
+        })?;
+        Ok((device, classes))
     })();
     match setup {
         Ok((device, classes)) => {

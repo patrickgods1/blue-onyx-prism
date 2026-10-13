@@ -51,8 +51,24 @@ pub enum WorkItem {
         tokio::sync::oneshot::Sender<VisionDetectionResponse>,
         Instant,
     ),
+    /// [`WorkItem::Detect`] with a request id chosen by the caller (see [`new_request_id`]),
+    /// so the server can return the same id in a response header; `Detect` gets one generated
+    /// by the worker.
+    DetectWithId(
+        VisionDetectionRequest,
+        tokio::sync::oneshot::Sender<VisionDetectionResponse>,
+        Instant,
+        String,
+    ),
     /// Compile a lazy model now (sent once by [`WorkerHandle::trigger_load`]).
     Load,
+}
+
+/// A short request id for the per-request log line (8 hex digits, random).
+pub fn new_request_id() -> String {
+    let mut id = uuid::Uuid::new_v4().simple().to_string();
+    id.truncate(8);
+    id
 }
 
 /// Hard capacity of the channel when the queue is auto-sized.
@@ -206,6 +222,8 @@ pub struct WorkerHandle {
     gate: LoadGate,
     load_started: Arc<AtomicBool>,
     live: Arc<ArcSwap<LiveSettings>>,
+    /// Set while an inference is stuck (see [`stuck_message`]); the thread may never return.
+    stuck: Arc<AtomicBool>,
 }
 
 impl WorkerHandle {
@@ -235,7 +253,20 @@ impl WorkerHandle {
             gate,
             load_started: Arc::new(AtomicBool::new(true)),
             live: LiveSettings::default().shared(),
+            stuck: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// True while the model's inference is stuck (the state is `Failed` with
+    /// [`stuck_message`]): its thread may be blocked in the runtime for good, so it must not be
+    /// joined.
+    pub fn is_stuck(&self) -> bool {
+        self.stuck.load(Ordering::Acquire)
+    }
+
+    /// The flag behind [`Self::is_stuck`], for code that outlives the handle.
+    pub fn stuck_flag(&self) -> Arc<AtomicBool> {
+        self.stuck.clone()
     }
 
     /// How long a request may wait in the queue plus processing (`request_timeout_secs`, live);
@@ -473,6 +504,7 @@ pub fn spawn_worker_after(
     };
     let after = if cfg.lazy { None } else { after };
     let load_started = Arc::new(AtomicBool::new(false));
+    let stuck = Arc::new(AtomicBool::new(false));
 
     let ctx = WorkerCtx {
         runtimes,
@@ -483,6 +515,7 @@ pub fn spawn_worker_after(
         soft_capacity: soft_capacity.clone(),
         gate: gate.clone(),
         load_started: load_started.clone(),
+        stuck: stuck.clone(),
         shutdown,
     };
     let name = cfg.name.clone();
@@ -492,7 +525,10 @@ pub fn spawn_worker_after(
     let join = match join {
         Ok(j) => Some(j),
         Err(e) => {
-            let msg = format!("could not spawn worker thread: {e}");
+            let msg = format!(
+                "could not start the model's worker thread ({e}); the system is out of threads or \
+                 memory; free resources or restart the service"
+            );
             error!(model = %name, "{msg}");
             state.set(ModelState::Failed(msg));
             gate.open();
@@ -513,6 +549,7 @@ pub fn spawn_worker_after(
         gate: handle_gate,
         load_started,
         live: cfg.live.clone(),
+        stuck,
     }
 }
 
@@ -523,6 +560,8 @@ struct Engine {
     /// Geometry the prep pool preprocesses this model's images for.
     spec: PrepSpec,
     provider: String,
+    /// Canonical spec of the device it loaded on ("openvino:gpu"), for logs.
+    device: String,
 }
 
 /// Where a request is between intake and reply.
@@ -543,6 +582,8 @@ struct Meta {
     min_confidence: f32,
     /// The live settings when the request arrived (used for its whole life).
     live: Arc<LiveSettings>,
+    /// Short id in every log line of this request (see [`new_request_id`]).
+    request_id: String,
 }
 
 struct Job {
@@ -561,6 +602,8 @@ struct InFlight {
     submitted: Instant,
     /// When the backend reported it finished.
     done: Option<Instant>,
+    /// No completion arrived within the request timeout: collected under the stuck watchdog.
+    overdue: bool,
 }
 
 /// Replies in request order: a slot to collect, or an answer decided earlier.
@@ -635,6 +678,8 @@ struct WorkerCtx {
     soft_capacity: Arc<AtomicUsize>,
     gate: LoadGate,
     load_started: Arc<AtomicBool>,
+    /// Shared with [`WorkerHandle::is_stuck`].
+    stuck: Arc<AtomicBool>,
     shutdown: CancellationToken,
 }
 
@@ -674,7 +719,11 @@ impl WorkerCtx {
                 ) {
                     Ok(c) => self.cfg.classes = c,
                     Err(e) => {
-                        let msg = format!("{e:#}");
+                        let msg = format!(
+                            "{e:#}; the classes file is missing or not a YOLO-style `names:` \
+                             list or map; fix or remove `classes` for this model and save the \
+                             config"
+                        );
                         error!(model = %name, "{msg}");
                         self.state.set(ModelState::Failed(msg));
                         return;
@@ -689,6 +738,9 @@ impl WorkerCtx {
         }
 
         let mut engine: Option<Engine> = None;
+        // The engine of a model whose inference got stuck and then failed (kept, not dropped,
+        // until the thread exits: dropping waits for whatever else is in flight).
+        let mut parked: Option<Engine> = None;
         if self.cfg.lazy {
             info!(model = %name, "lazy model: compiling on first request");
             self.gate.open();
@@ -717,6 +769,13 @@ impl WorkerCtx {
                     }
                     progressed |= self.reply_front(eng, &mut p);
                     progressed |= self.fill_slots(eng, &mut p);
+                }
+                if engine.is_some() && self.stuck.load(Ordering::Acquire) {
+                    // The stuck inference came back with an error (or the session died): stop
+                    // using the engine; requests are answered with the Failed state from now on.
+                    parked = engine.take();
+                    self.fail_pipeline(&mut p);
+                    progressed = true;
                 }
                 while !closed && self.has_room(engine.as_ref(), &p, &prep) {
                     match rx.try_recv() {
@@ -792,13 +851,24 @@ impl WorkerCtx {
             eng.backend.abort();
         }
         self.answer_remaining(p, &rx);
+        drop(parked);
         info!(model = %name, "worker exiting");
     }
 
     /// Shutdown: answer every request still in the pipeline or queued in the channel at once
     /// (instead of letting its HTTP handler wait for the request timeout).
     fn answer_remaining(&self, p: Pipeline, rx: &Receiver<WorkItem>) {
-        let msg = || format!("Model '{}' is shutting down", self.cfg.name);
+        let msg = format!("Model '{}' is shutting down", self.cfg.name);
+        self.answer_all(p, &msg);
+        while let Ok(item) = rx.try_recv() {
+            if let WorkItem::Detect(_, reply, _) | WorkItem::DetectWithId(_, reply, _, _) = item {
+                let _ = reply.send(self.error_response(msg.clone(), 0, 0));
+            }
+        }
+    }
+
+    /// Answer every request in the pipeline with `msg` at once.
+    fn answer_all(&self, p: Pipeline, msg: &str) {
         let mut metas: Vec<Meta> = Vec::new();
         for d in p.order {
             match d {
@@ -809,12 +879,27 @@ impl WorkerCtx {
         metas.extend(p.slots.into_iter().flatten().map(|f| f.meta));
         metas.extend(p.pending.into_iter().map(|j| j.meta));
         for m in metas {
-            let _ = m.reply.send(self.error_response(msg(), 0, 0));
+            let _ = m.reply.send(self.error_response(msg.to_string(), 0, 0));
         }
-        while let Ok(item) = rx.try_recv() {
-            if let WorkItem::Detect(_, reply, _) = item {
-                let _ = reply.send(self.error_response(msg(), 0, 0));
+    }
+
+    /// The engine was parked as stuck: answer the requests in the pipeline with the model's
+    /// `Failed` text now instead of letting them time out.
+    fn fail_pipeline(&self, p: &mut Pipeline) {
+        let msg = self.unavailable_message();
+        self.answer_all(std::mem::take(p), &msg);
+    }
+
+    /// The answer of a failed model: "failed to load" or, after a stuck inference,
+    /// "is unavailable".
+    fn unavailable_message(&self) -> String {
+        let name = &self.cfg.name;
+        match self.state.get() {
+            ModelState::Failed(msg) if self.stuck.load(Ordering::Acquire) => {
+                format!("Model '{name}' is unavailable: {msg}")
             }
+            ModelState::Failed(msg) => format!("Model '{name}' failed to load: {msg}"),
+            _ => format!("Model '{name}' is unavailable"),
         }
     }
 
@@ -837,7 +922,7 @@ impl WorkerCtx {
         prep: &PrepPool,
     ) {
         let name = &self.cfg.name;
-        let (req, reply, enqueued) = match item {
+        let (req, reply, enqueued, request_id) = match item {
             WorkItem::Load => {
                 if engine.is_none() && !matches!(self.state.get(), ModelState::Failed(_)) {
                     // Lazy model: compile now; requests meanwhile are answered
@@ -849,15 +934,16 @@ impl WorkerCtx {
                 }
                 return;
             }
-            WorkItem::Detect(req, reply, enqueued) => (req, reply, enqueued),
+            WorkItem::Detect(req, reply, enqueued) => (req, reply, enqueued, new_request_id()),
+            WorkItem::DetectWithId(req, reply, enqueued, id) => (req, reply, enqueued, id),
         };
         let Some(eng) = engine.as_ref() else {
             // Only reachable for a lazy model (between the server's trigger and the state
             // update) or after a failed load: answer at once, never block.
             let msg = match self.state.get() {
-                ModelState::Failed(msg) => {
+                ModelState::Failed(_) => {
                     self.metrics.record_drop(DropReason::Failed);
-                    format!("Model '{name}' failed to load: {msg}")
+                    self.unavailable_message()
                 }
                 _ => {
                     self.metrics.record_drop(DropReason::Initializing);
@@ -867,13 +953,20 @@ impl WorkerCtx {
             let _ = reply.send(self.error_response(msg, 0, 0));
             return;
         };
-        trace!(target: ORDER_TARGET, model = %name, image = %req.image_name, "accepted");
+        trace!(
+            target: ORDER_TARGET,
+            model = %name,
+            image = %req.image_name,
+            request_id = %request_id,
+            "accepted"
+        );
         let meta = Meta {
             reply,
             enqueued,
             image_name: req.image_name,
             min_confidence: req.min_confidence,
             live: self.cfg.live.load_full(),
+            request_id,
         };
         let stage = if let Some(resp) = self.timed_out(&meta) {
             Stage::Answer(resp)
@@ -903,6 +996,7 @@ impl WorkerCtx {
         self.metrics.record_drop(DropReason::Timeout);
         warn!(
             model = %self.cfg.name,
+            request_id = %meta.request_id,
             waited_ms = millis_u64(waited),
             timeout_ms = millis_u64(timeout),
             "dropping request that waited longer than the request timeout (server overloaded)"
@@ -920,7 +1014,12 @@ impl WorkerCtx {
 
     /// The error answer for a request that failed before inference (bad image, ...).
     fn failure(&self, meta: &Meta, provider: &str, e: &anyhow::Error) -> VisionDetectionResponse {
-        warn!(model = %self.cfg.name, image = %meta.image_name, "detection failed: {e:#}");
+        warn!(
+            model = %self.cfg.name,
+            request_id = %meta.request_id,
+            image = %meta.image_name,
+            "detection failed: {e:#}"
+        );
         let mut r = self.error_response(format!("{e:#}"), 0, 0);
         r.executionProvider = provider.to_string();
         r
@@ -935,7 +1034,10 @@ impl WorkerCtx {
         let provider = loaded_provider(&self.device).unwrap_or_default();
         match r {
             Ok(Ok(prepared)) => Stage::Ready(prepared),
-            Ok(Err(e)) => Stage::Answer(self.failure(meta, &provider, &e)),
+            Ok(Err(e)) => {
+                self.metrics.record_decode_error();
+                Stage::Answer(self.failure(meta, &provider, &e))
+            }
             Err(_) => Stage::Answer(self.failure(
                 meta,
                 &provider,
@@ -1011,6 +1113,7 @@ impl WorkerCtx {
                         seq,
                         submitted,
                         done: None,
+                        overdue: false,
                     });
                     p.order.push_back(Done::Slot(slot));
                 }
@@ -1054,7 +1157,13 @@ impl WorkerCtx {
     }
 
     /// A tick: if the oldest inference has run for longer than the request timeout without a
-    /// completion, collect it anyway (blocking), so a lost notification cannot stall the model.
+    /// completion, collect it anyway, so a lost notification cannot stall the model.
+    ///
+    /// The collect is a deliberate blocking wait on this thread: the runtimes offer no
+    /// non-blocking "is it done" check, and a lost completion returns at once. A hung inference
+    /// (driver hang, GPU reset) does not: [`collect_watched`] marks the model `Failed` with
+    /// [`stuck_message`] once the wait outlasts a second request timeout, so the server answers
+    /// at once instead of queuing behind it and the operator can reload the model.
     fn unstick(&self, p: &mut Pipeline) {
         if let Some(&Done::Slot(i)) = p.order.front()
             && let Some(f) = p.slots.get_mut(i).and_then(Option::as_mut)
@@ -1063,10 +1172,23 @@ impl WorkerCtx {
         {
             warn!(
                 model = %self.cfg.name,
+                request_id = %f.meta.request_id,
                 slot = i,
-                "no completion after the request timeout; waiting for the inference"
+                "no completion after the request timeout; waiting for the inference (the model \
+                 is marked failed if it takes another request timeout)"
             );
             f.done = Some(Instant::now());
+            f.overdue = true;
+        }
+    }
+
+    /// What the stuck watchdog of this worker needs (see [`collect_watched`]).
+    fn stuck_watch(&self, eng: &Engine) -> StuckWatch {
+        StuckWatch {
+            name: self.cfg.name.clone(),
+            device: eng.device.clone(),
+            state: self.state.clone(),
+            stuck: self.stuck.clone(),
         }
     }
 
@@ -1126,8 +1248,8 @@ impl WorkerCtx {
                 Some(engine)
             }
             Err(e) => {
-                let msg = format!("{e:#}");
-                error!(model = %self.cfg.name, "failed to load model: {msg}");
+                let msg = load_failure_message(&e);
+                error!(model = %self.cfg.name, "{msg}");
                 self.state.set(ModelState::Failed(msg));
                 None
             }
@@ -1205,10 +1327,19 @@ impl WorkerCtx {
         let compiled = {
             let mut rt = self.runtimes.lock_recover();
             let tuning = self.tuning_for(&rt, cand);
-            rt.compile_tuned(cand, &self.cfg.load, &tuning)?
+            let device = cand.device.to_string();
+            watch_slow_compile(
+                &self.cfg.name,
+                &device,
+                &self.state,
+                SlowCompile::DEFAULT,
+                || rt.compile_tuned(cand, &self.cfg.load, &tuning),
+            )
+            .0?
         };
         let info = compiled.info();
         let provider = info.device.execution_provider();
+        let device = info.device.spec.clone();
         let (in_w, in_h) = info.input_size;
         let compile_ms = info.compile_ms;
         let family = crate::model::make_family(
@@ -1227,8 +1358,22 @@ impl WorkerCtx {
         let (chw, ctx) = pre.run(&gray, in_w, in_h)?;
         let extra = family.extra_inputs(&ctx);
         let t = Instant::now();
-        backend.infer(chw, &extra).context("warm-up inference")?;
+        let outs = backend.infer(chw, &extra).context("warm-up inference")?;
         let warmup_ms = millis_u64(t.elapsed());
+        // A family or class-count mismatch fails here instead of on every request.
+        let params = PostParams {
+            confidence_threshold: 0.5,
+            nms_iou: 0.45,
+        };
+        family.postprocess(&outs, &ctx, &params).with_context(|| {
+            format!(
+                "the model's outputs do not fit family `{}` with {} classes; `family` or the \
+                 classes file does not match this model; set `family` (or `auto`) and point \
+                 `classes` at the model's own label file",
+                family.kind(),
+                self.cfg.classes.len()
+            )
+        })?;
         let others = 1..backend.slots();
         for s in others.clone() {
             backend
@@ -1246,6 +1391,7 @@ impl WorkerCtx {
                 family,
                 spec,
                 provider,
+                device,
             },
             compile_ms,
             warmup_ms,
@@ -1285,7 +1431,19 @@ impl WorkerCtx {
             ),
             nms_iou: live.nms_iou,
         };
-        let result = eng.backend.collect(slot).and_then(|outs| {
+        let collected = if f.overdue {
+            let watch = self.stuck_watch(eng);
+            let limit = live.request_timeout;
+            collect_watched(&watch, limit, || eng.backend.collect(slot))
+        } else {
+            eng.backend.collect(slot)
+        };
+        if let Err(e) = &collected
+            && session_dead(e)
+        {
+            self.stuck_watch(eng).mark(f.submitted.elapsed(), Some(e));
+        }
+        let result = collected.and_then(|outs| {
             let dets = eng.family.postprocess(&outs, &f.ctx, &params);
             eng.backend.recycle(slot, outs);
             let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
@@ -1298,12 +1456,16 @@ impl WorkerCtx {
         });
         let post_d = t.elapsed();
         let process_d = f.decode + f.preprocess + infer_d + post_d;
+        let round_trip = f.meta.enqueued.elapsed();
         let resp = match result {
             Ok(predictions) => {
                 self.metrics.inference_ms.record(millis_u64(infer_d));
                 self.metrics.process_ms.record(millis_u64(process_d));
+                // The one log line per detection (structured fields only).
                 debug!(
                     model = %name,
+                    device = %eng.device,
+                    request_id = %f.meta.request_id,
                     image = %f.meta.image_name,
                     size = %format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
                     count = predictions.len(),
@@ -1314,6 +1476,7 @@ impl WorkerCtx {
                     inference_ms = infer_d.as_secs_f64() * 1e3,
                     postprocess_ms = post_d.as_secs_f64() * 1e3,
                     process_ms = process_d.as_secs_f64() * 1e3,
+                    round_trip_ms = round_trip.as_secs_f64() * 1e3,
                     "detection done"
                 );
                 if let (Some(dir), Some(img)) = (&live.save_image_path, &f.img) {
@@ -1349,7 +1512,16 @@ impl WorkerCtx {
                 }
             }
             Err(e) => {
-                warn!(model = %name, image = %f.meta.image_name, "detection failed: {e:#}");
+                warn!(
+                    model = %name,
+                    device = %eng.device,
+                    request_id = %f.meta.request_id,
+                    image = %f.meta.image_name,
+                    inference_ms = infer_d.as_secs_f64() * 1e3,
+                    process_ms = process_d.as_secs_f64() * 1e3,
+                    round_trip_ms = round_trip.as_secs_f64() * 1e3,
+                    "detection failed: {e:#}"
+                );
                 let mut r = self.error_response(format!("{e:#}"), ms(infer_d), ms(process_d));
                 r.executionProvider = eng.provider.clone();
                 r
@@ -1363,6 +1535,177 @@ impl InFlight {
     fn min_confidence(&self) -> f32 {
         self.meta.min_confidence
     }
+}
+
+/// The `Failed` text of a model whose inference is stuck (PL-06).
+pub fn stuck_message(device: &str, waited: Duration) -> String {
+    format!(
+        "inference stuck on {device}: no result {} s after it started; the device driver may \
+         have hung or the GPU reset; reload the model (save it again on the Config page) or \
+         restart the service, and try another `device` if it happens again",
+        waited.as_secs()
+    )
+}
+
+/// Prefix of [`stuck_message`] (what a caller can match on).
+pub const STUCK_PREFIX: &str = "inference stuck on";
+
+/// The `Failed` text of a model that could not be loaded on any of its devices.
+fn load_failure_message(e: &anyhow::Error) -> String {
+    format!(
+        "{e:#}; the model file may be damaged, of another family than configured, or need a \
+         runtime that is not installed; check the log for each device's error, then fix \
+         `family` / `device` or download the model again and save the config to reload it"
+    )
+}
+
+/// True when a backend error means the runtime session is gone for good (no later inference
+/// can succeed), so the model takes the same `Failed` path as a stuck inference.
+fn session_dead(e: &anyhow::Error) -> bool {
+    crate::backend::is_session_dead(e)
+}
+
+/// Who to mark `Failed` when an inference is stuck (see [`collect_watched`]).
+#[derive(Debug, Clone)]
+struct StuckWatch {
+    name: String,
+    /// Canonical spec of the device ("openvino:gpu").
+    device: String,
+    state: StateHandle,
+    stuck: Arc<AtomicBool>,
+}
+
+impl StuckWatch {
+    /// Mark the model `Failed` with [`stuck_message`] (`waited`: since the inference started;
+    /// `cause`: the backend error, when the session reported its death).
+    fn mark(&self, waited: Duration, cause: Option<&anyhow::Error>) {
+        let mut msg = stuck_message(&self.device, waited);
+        if let Some(e) = cause {
+            msg = format!("{msg} (runtime error: {e:#})");
+        }
+        error!(model = %self.name, device = %self.device, "{msg}");
+        self.stuck.store(true, Ordering::Release);
+        self.state.set(ModelState::Failed(msg));
+    }
+
+    /// The stuck inference finished after all: serve again.
+    fn clear(&self, waited: Duration) {
+        self.stuck.store(false, Ordering::Release);
+        if matches!(self.state.get(), ModelState::Failed(m) if m.starts_with(STUCK_PREFIX)) {
+            self.state.set(ModelState::Ready);
+        }
+        info!(
+            model = %self.name,
+            device = %self.device,
+            waited_ms = millis_u64(waited),
+            "the stuck inference finished after all; the model is ready again"
+        );
+    }
+}
+
+/// Run `collect` (the blocking collect of an inference that is already a request timeout
+/// late) under a watchdog: when it has not returned after `limit`, the model is marked `Failed`
+/// (the worker thread stays blocked in `collect`; the server rejects requests at once from
+/// then on). If `collect` does return later, a success makes the model `Ready` again and an
+/// error leaves it `Failed` (the worker then stops using the engine).
+fn collect_watched<T>(
+    watch: &StuckWatch,
+    limit: Duration,
+    collect: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let started = Instant::now();
+    let (tx, rx) = crossbeam_channel::bounded::<()>(0);
+    std::thread::scope(|s| {
+        let watcher = std::thread::Builder::new()
+            .name(format!("stuck-{}", watch.name))
+            .spawn_scoped(s, || {
+                if rx.recv_timeout(limit) == Err(crossbeam_channel::RecvTimeoutError::Timeout) {
+                    // The inference started a request timeout before this wait.
+                    watch.mark(started.elapsed() + limit, None);
+                }
+            });
+        if let Err(e) = &watcher {
+            warn!(model = %watch.name, "could not start the stuck-inference watchdog: {e}");
+        }
+        let r = collect();
+        drop(tx);
+        if let Ok(w) = watcher {
+            let _ = w.join();
+        }
+        if watch.stuck.load(Ordering::Acquire) && r.is_ok() {
+            watch.clear(started.elapsed() + limit);
+        }
+        r
+    })
+}
+
+/// When a compile counts as slow and how often the watcher looks.
+#[derive(Debug, Clone, Copy)]
+struct SlowCompile {
+    /// Warn (and say "compiling for N min" in the state) after this long, and again every
+    /// time this much has passed since the last warning.
+    after: Duration,
+    tick: Duration,
+}
+
+impl SlowCompile {
+    const DEFAULT: Self = Self {
+        after: Duration::from_secs(5 * 60),
+        tick: Duration::from_secs(30),
+    };
+}
+
+/// "compiling on openvino:gpu for 7 min" (keeps the [`COMPILING_ON`] prefix the pages use).
+fn compiling_for(device: &str, elapsed: Duration) -> String {
+    format!("{COMPILING_ON} {device} for {} min", elapsed.as_secs() / 60)
+}
+
+/// Run `compile` (a model compile on `device`) and, from another thread, warn when it takes
+/// longer than `slow.after` (again at most every `slow.after`) and show "compiling for N min"
+/// in the model state. Returns the result and how many warnings were logged.
+fn watch_slow_compile<T>(
+    name: &str,
+    device: &str,
+    state: &StateHandle,
+    slow: SlowCompile,
+    compile: impl FnOnce() -> T,
+) -> (T, u32) {
+    let started = Instant::now();
+    let (tx, rx) = crossbeam_channel::bounded::<()>(0);
+    std::thread::scope(|s| {
+        let watcher = std::thread::Builder::new()
+            .name(format!("compile-{name}"))
+            .spawn_scoped(s, || {
+                let mut warned = 0u32;
+                let mut last_warn: Option<Duration> = None;
+                while rx.recv_timeout(slow.tick)
+                    == Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                {
+                    let elapsed = started.elapsed();
+                    if elapsed < slow.after {
+                        continue;
+                    }
+                    state.set_initializing(compiling_for(device, elapsed));
+                    if last_warn.is_none_or(|w| elapsed.saturating_sub(w) >= slow.after) {
+                        warn!(
+                            model = %name,
+                            device = %device,
+                            minutes = elapsed.as_secs() / 60,
+                            "still compiling on {device} after {} min; a first GPU compile can \
+                             take minutes, check the device and cache_dir if it never finishes",
+                            elapsed.as_secs() / 60
+                        );
+                        last_warn = Some(elapsed);
+                        warned += 1;
+                    }
+                }
+                warned
+            });
+        let r = compile();
+        drop(tx);
+        let warned = watcher.ok().and_then(|w| w.join().ok()).unwrap_or(0);
+        (r, warned)
+    })
 }
 
 #[cfg(test)]
@@ -1497,6 +1840,7 @@ mod tests {
                 image_name: String::new(),
                 min_confidence: 0.0,
                 live: Arc::new(LiveSettings::default()),
+                request_id: String::new(),
             },
             ctx: PreprocessCtx {
                 orig_w: 1,
@@ -1514,6 +1858,7 @@ mod tests {
             seq,
             submitted: Instant::now(),
             done: None,
+            overdue: false,
         }
     }
 
@@ -1560,6 +1905,133 @@ mod tests {
         assert_eq!(p.slots[2].as_ref().unwrap().done, Some(at));
         p.slots[0] = None;
         assert_eq!(p.free_slot(), Some(0));
+    }
+
+    fn watch() -> StuckWatch {
+        let state = StateHandle::new();
+        state.set(ModelState::Ready);
+        StuckWatch {
+            name: "m".into(),
+            device: "openvino:gpu".into(),
+            state,
+            stuck: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn stuck_watchdog_marks_failed_and_recovers() {
+        // Returns in time: nothing changes.
+        let w = watch();
+        let r = collect_watched(&w, Duration::from_secs(5), || Ok(7));
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(w.state.get(), ModelState::Ready);
+        assert!(!w.stuck.load(Ordering::Acquire));
+
+        // Outlasts the limit, then fails: the model stays Failed and is flagged stuck.
+        let w = watch();
+        let seen = Arc::new(Mutex::new(None));
+        let r: Result<()> = collect_watched(&w, Duration::from_millis(20), || {
+            let t = Instant::now();
+            while !w.stuck.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            *seen.lock().unwrap() = Some(w.state.get());
+            anyhow::bail!("device lost")
+        });
+        assert!(r.is_err());
+        let ModelState::Failed(msg) = w.state.get() else {
+            panic!("expected Failed");
+        };
+        assert!(msg.starts_with(STUCK_PREFIX), "{msg}");
+        assert!(msg.contains("openvino:gpu"), "{msg}");
+        assert!(msg.contains("reload the model"), "{msg}");
+        assert!(matches!(*seen.lock().unwrap(), Some(ModelState::Failed(_))));
+        assert!(w.stuck.load(Ordering::Acquire));
+
+        // Outlasts the limit, then succeeds: Ready again.
+        let w = watch();
+        let r = collect_watched(&w, Duration::from_millis(20), || {
+            let t = Instant::now();
+            while !w.stuck.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(1)
+        });
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(w.state.get(), ModelState::Ready);
+        assert!(!w.stuck.load(Ordering::Acquire));
+
+        // A dead session (marked directly) carries the runtime error.
+        let w = watch();
+        w.mark(
+            Duration::from_secs(3),
+            Some(&anyhow::anyhow!("session thread exited")),
+        );
+        let ModelState::Failed(msg) = w.state.get() else {
+            panic!("expected Failed");
+        };
+        assert!(msg.contains("session thread exited"), "{msg}");
+        assert!(!session_dead(&anyhow::anyhow!("x")));
+    }
+
+    #[test]
+    fn handle_reports_stuck() {
+        let m = Arc::new(ModelMetrics::new("x", "CPU", ""));
+        let h = WorkerHandle::failed("x", "boom", m);
+        assert!(!h.is_stuck());
+        h.stuck_flag().store(true, Ordering::Release);
+        assert!(h.is_stuck());
+        h.join();
+    }
+
+    #[test]
+    fn slow_compile_warns_and_shows_minutes() {
+        let state = StateHandle::new();
+        state.set_initializing(format!("{COMPILING_ON} openvino:gpu"));
+        let slow = SlowCompile {
+            after: Duration::from_millis(40),
+            tick: Duration::from_millis(5),
+        };
+        // Fast compile: no warning, detail untouched.
+        let (v, warned) = watch_slow_compile("m", "openvino:gpu", &state, slow, || 3);
+        assert_eq!((v, warned), (3, 0));
+        assert_eq!(state.detail().as_deref(), Some("compiling on openvino:gpu"));
+        // Slow compile: the first warning after `after`, repeated at most every `after`.
+        let t = Instant::now();
+        let (_, warned) = watch_slow_compile("m", "openvino:gpu", &state, slow, || {
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        // The sleep can overrun on a loaded CI runner, so bound the count by the time that
+        // actually passed: one warning per `after`, plus one for the first.
+        let max = u32::try_from(t.elapsed().as_millis() / 40).unwrap_or(u32::MAX) + 1;
+        assert!(
+            (1..=max).contains(&warned),
+            "{warned} warnings in {:?}",
+            t.elapsed()
+        );
+        let d = state.detail().unwrap();
+        assert!(d.starts_with(COMPILING_ON), "{d}");
+        assert_eq!(d, "compiling on openvino:gpu for 0 min");
+        assert_eq!(
+            compiling_for("ort:cuda", Duration::from_secs(7 * 60 + 5)),
+            "compiling on ort:cuda for 7 min"
+        );
+    }
+
+    #[test]
+    fn request_ids_are_short_and_distinct() {
+        let a = new_request_id();
+        let b = new_request_id();
+        assert_eq!(a.len(), 8);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn load_failure_says_what_to_do() {
+        let m = load_failure_message(&anyhow::anyhow!("every device failed"));
+        assert!(m.starts_with("every device failed; "), "{m}");
+        assert!(m.contains("check the log"), "{m}");
     }
 
     #[test]

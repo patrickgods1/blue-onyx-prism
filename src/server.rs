@@ -330,6 +330,29 @@ pub(super) fn admin_allowed(peer: Option<std::net::SocketAddr>, allow_remote_adm
         })
 }
 
+/// Set once the "local reverse proxy" warning was logged (SV-12).
+static LOCAL_PROXY_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a request carries a proxy's forwarding header (`X-Forwarded-For` or `Forwarded`).
+fn is_forwarded(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-forwarded-for") || headers.contains_key(header::FORWARDED)
+}
+
+/// Log, once per `flag` (once per process for [`LOCAL_PROXY_WARNED`]), that admin requests
+/// arrive through a reverse proxy on this machine: the admin guard trusts the peer address
+/// only, so every proxied client counts as local. True when this call logged it.
+fn warn_local_proxy_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    warn!(
+        "requests arrive through a local reverse proxy: every proxied client is treated as \
+         local admin; set allow_remote_admin or restrict the proxy"
+    );
+    true
+}
+
 /// Middleware of the admin routes: 403 (an HTML page for browsers, else JSON) for a client
 /// that is not on this machine, unless `allow_remote_admin` is set (read per request, so it
 /// applies at once).
@@ -344,6 +367,9 @@ pub(super) async fn admin_only(
         .map(|c| c.0);
     let allow_remote = state.config_read().allow_remote_admin;
     if admin_allowed(peer, allow_remote) {
+        if !allow_remote && is_forwarded(req.headers()) {
+            warn_local_proxy_once(&LOCAL_PROXY_WARNED);
+        }
         return next.run(req).await;
     }
     let who = peer.map_or_else(|| "unknown".to_string(), |a| a.ip().to_string());
@@ -835,6 +861,33 @@ mod tests {
         assert!(!ok("[::ffff:10.0.0.5]:1"));
         assert!(!admin_allowed(None, false));
         assert!(admin_allowed(Some("10.0.0.5:1".parse().unwrap()), true));
+    }
+
+    /// SV-12: a loopback admin request carrying a proxy's forwarding header logs the
+    /// "local reverse proxy" warning, once per process.
+    #[tokio::test]
+    async fn local_proxy_is_warned_once() {
+        let mut h = HeaderMap::new();
+        assert!(!is_forwarded(&h));
+        h.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        assert!(is_forwarded(&h));
+        let mut h = HeaderMap::new();
+        h.insert(header::FORWARDED, "for=203.0.113.9".parse().unwrap());
+        assert!(is_forwarded(&h));
+
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(warn_local_proxy_once(&flag));
+        assert!(!warn_local_proxy_once(&flag));
+
+        // Through the admin guard: the proxied loopback request is served and sets the
+        // process-wide flag.
+        let state = test_state();
+        let mut req = from("127.0.0.1:40000", "GET", "/config", true);
+        req.headers_mut()
+            .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        let (s, _, _) = call(&state, req).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(LOCAL_PROXY_WARNED.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// Every route of the router, classified. A new route must be added here: the test fails

@@ -653,7 +653,10 @@ pub(super) async fn config_submit(
         let pairs = match form {
             Ok(Form(f)) => f,
             Err(e) => {
-                let msg = format!("Invalid form submission: {e}");
+                let msg = format!(
+                    "Not saved: the form submission could not be read ({e}); the page is \
+                     probably out of date, so reload it and save again."
+                );
                 if json {
                     return live::error_json(StatusCode::BAD_REQUEST, msg);
                 }
@@ -673,7 +676,7 @@ pub(super) async fn config_submit(
             }
             Err(e) => {
                 warn!("rejected config form: {e:#}");
-                let msg = format!("Not saved: {e:#}");
+                let msg = format!("Not saved: {e:#}. Correct that value and save again.");
                 if json {
                     return live::error_json(StatusCode::BAD_REQUEST, msg);
                 }
@@ -703,7 +706,10 @@ pub(super) async fn config_models(
         let form = match form {
             Ok(Form(f)) => f,
             Err(e) => {
-                let msg = format!("Invalid form submission: {e}");
+                let msg = format!(
+                    "Not saved: the form submission could not be read ({e}); the page is \
+                     probably out of date, so reload it and save again."
+                );
                 if json {
                     return live::error_json(StatusCode::BAD_REQUEST, msg);
                 }
@@ -726,7 +732,7 @@ pub(super) async fn config_models(
             Ok(msg) => render(&config_template_at(&state, Some(msg), None, None, "models")),
             Err(e) => {
                 warn!("rejected models selection: {e:#}");
-                let msg = format!("Models not saved: {e:#}");
+                let msg = format!("Models not saved: {e:#}. Correct that entry and save again.");
                 if json {
                     return live::error_json(StatusCode::BAD_REQUEST, msg);
                 }
@@ -740,7 +746,10 @@ pub(super) async fn config_models(
 fn apply_log_level(state: &AppState, level: LogLevel) -> anyhow::Result<()> {
     match &state.log_reload {
         Some(h) => h.set_level(level),
-        None => anyhow::bail!("runtime log level control is not available"),
+        None => anyhow::bail!(
+            "runtime log level control is not available in this process (logging was set up \
+             elsewhere); set log_level in the config file and restart"
+        ),
     }
 }
 
@@ -835,7 +844,12 @@ pub(super) async fn config_loglevel(
             .and_then(|Form(f)| f.get("level").cloned())
             .or_else(|| query.ok().and_then(|Query(q)| q.get("level").cloned()));
         let result = (|| -> anyhow::Result<LogLevel> {
-            let raw = level.ok_or_else(|| anyhow::anyhow!("missing field 'level'"))?;
+            let raw = level.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the request has no 'level' field (the page is probably out of date); \
+                     reload the page and pick a level again"
+                )
+            })?;
             let level: LogLevel = raw.trim().parse()?;
             apply_log_level(&state, level)?;
             state.config.update("log level", |c| {
@@ -1132,7 +1146,11 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST);
         let (s, _, b) = call(&state, post_form("/config/loglevel", "", true)).await;
         assert_eq!(s, StatusCode::OK);
-        assert!(String::from_utf8(b).unwrap().contains("missing field"));
+        let page = String::from_utf8(b).unwrap();
+        assert!(
+            page.contains("level") && page.contains("reload the page"),
+            "{page}"
+        );
         assert!(!state.config_path.exists());
 
         assert!(!state.restart.is_cancelled());

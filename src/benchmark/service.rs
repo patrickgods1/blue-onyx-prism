@@ -343,10 +343,14 @@ impl BenchmarkService {
         self.lock().state == RunState::Running
     }
 
-    /// Ask a running benchmark to stop (it stops at the next iteration or device). Returns
-    /// whether one was running.
+    /// Ask a running benchmark to stop (it stops at the next iteration, device or dataset
+    /// download check; a model compile in progress is not interruptible, so a cancel issued
+    /// during it takes effect when that compile ends). Returns whether one was running.
     pub fn cancel(&self) -> bool {
-        let running = self.is_running();
+        // Under the state lock, so a cancel can not land between `start_job`'s reset of the
+        // flag and its state change (BM-05): either it sees no run, or the run sees it.
+        let g = self.lock();
+        let running = g.state == RunState::Running;
         if running {
             self.cancel.store(true, Ordering::SeqCst);
         }
@@ -364,6 +368,8 @@ impl BenchmarkService {
             if g.state == RunState::Running {
                 return Err(Busy);
             }
+            // Reset before the state says Running, inside the lock `cancel` takes (BM-05).
+            self.cancel.store(false, Ordering::SeqCst);
             g.run_id += 1;
             g.state = RunState::Running;
             g.request = Some(request);
@@ -377,7 +383,6 @@ impl BenchmarkService {
             g.finished_at = None;
             g.run_id
         };
-        self.cancel.store(false, Ordering::SeqCst);
         let me = self.clone();
         let spawned = std::thread::Builder::new()
             .name("benchmark".into())
@@ -556,47 +561,139 @@ fn download_datasets(ctx: &RunContext, ids: &[String], h: &RunHandle) -> Result<
         }
     }
     let manager = rctx.provisioner.manager_for(&ctx.config);
+    let mut wait = DownloadWait::new(Instant::now(), keys);
     loop {
         if h.is_cancelled() {
             return Err(super::Cancelled.into());
         }
-        let mut pending = Vec::new();
-        let (mut bytes, mut total) = (0u64, 0u64);
-        for (id, key) in &keys {
-            match manager.status(key).map(|s| s.state) {
-                Some(crate::resources::State::Installed) => {}
-                Some(crate::resources::State::Failed { error, .. }) => {
-                    warnings.push(format!("dataset {id}: download failed: {error}"));
-                    pending.push(None);
-                }
-                Some(crate::resources::State::Downloading { bytes: b, total: t }) => {
-                    bytes += b;
-                    total += t;
-                    pending.push(Some(id.clone()));
-                }
-                _ => pending.push(Some(id.clone())),
-            }
-        }
-        let waiting: Vec<String> = pending.into_iter().flatten().collect();
-        if waiting.is_empty() {
+        let step = wait.step(Instant::now(), |key| manager.status(key).map(|s| s.state));
+        warnings.extend(step.warnings);
+        if step.waiting.is_empty() {
             break;
         }
-        let pct = if total > 0 {
-            bytes as f64 * 100.0 / total as f64
+        let pct = if step.total > 0 {
+            step.bytes as f64 * 100.0 / step.total as f64
         } else {
             0.0
         };
         h.set_progress(ProgressView {
             stage: "download".into(),
             percent: 0.0,
-            text: format!("downloading datasets {} ({pct:.0}%)", waiting.join(", ")),
+            text: format!(
+                "downloading datasets {} ({pct:.0}%)",
+                step.waiting.join(", ")
+            ),
             ..Default::default()
         });
-        // Failed jobs are reported once and dropped from the wait.
-        keys.retain(|(id, _)| waiting.contains(id));
         std::thread::sleep(Duration::from_millis(250));
     }
     Ok(warnings)
+}
+
+/// How long the dataset downloads may make no progress at all (no state or byte count
+/// changes) before the run goes on without the remaining sets (BM-06).
+const DOWNLOAD_STALL: Duration = Duration::from_secs(5 * 60);
+/// How long the download manager may not know a queued dataset before it counts as failed
+/// (the key never appeared: a key mismatch, or the job was dropped).
+const DOWNLOAD_UNKNOWN_GRACE: Duration = Duration::from_secs(15);
+
+/// The wait for queued dataset downloads, as a pure state machine over the manager's job
+/// states (tested without a manager): a set ends installed, failed (a warning), unknown to
+/// the manager past [`DOWNLOAD_UNKNOWN_GRACE`] (a warning), or, when nothing moved for
+/// [`DOWNLOAD_STALL`], every remaining set becomes a warning.
+struct DownloadWait {
+    /// (dataset id, manager key) still waited for.
+    keys: Vec<(String, String)>,
+    last_change: Instant,
+    /// The states last seen (the stall detector compares these).
+    last_seen: Vec<(String, Option<crate::resources::State>)>,
+    /// Since when each id has had no state in the manager.
+    unknown_since: HashMap<String, Instant>,
+    stall: Duration,
+    unknown_grace: Duration,
+}
+
+/// One look at the downloads.
+#[derive(Debug, Default)]
+struct WaitStep {
+    /// Ids still downloading (empty: the wait is over).
+    waiting: Vec<String>,
+    /// New warnings (each set's failure is reported once).
+    warnings: Vec<String>,
+    bytes: u64,
+    total: u64,
+}
+
+impl DownloadWait {
+    fn new(now: Instant, keys: Vec<(String, String)>) -> Self {
+        Self {
+            keys,
+            last_change: now,
+            last_seen: Vec::new(),
+            unknown_since: HashMap::new(),
+            stall: DOWNLOAD_STALL,
+            unknown_grace: DOWNLOAD_UNKNOWN_GRACE,
+        }
+    }
+
+    fn step(
+        &mut self,
+        now: Instant,
+        status: impl Fn(&str) -> Option<crate::resources::State>,
+    ) -> WaitStep {
+        use crate::resources::State;
+        let mut step = WaitStep::default();
+        let mut seen = Vec::new();
+        for (id, key) in &self.keys {
+            let state = status(key);
+            seen.push((id.clone(), state.clone()));
+            match state {
+                Some(State::Installed) => {}
+                Some(State::Failed { error, .. }) => step.warnings.push(format!(
+                    "Dataset {id} could not be downloaded: {error}. The benchmark ran without \
+                     it; check the network or the Resources page and run it again."
+                )),
+                None => {
+                    let since = *self.unknown_since.entry(id.clone()).or_insert(now);
+                    if now.duration_since(since) >= self.unknown_grace {
+                        step.warnings.push(format!(
+                            "Dataset {id} was queued for download but the download manager \
+                             does not know it. The benchmark ran without it; download it from \
+                             the Resources page (or `blue-onyx-prism fetch --resource \
+                             bench:{id}`) and run it again."
+                        ));
+                    } else {
+                        step.waiting.push(id.clone());
+                    }
+                }
+                Some(other) => {
+                    self.unknown_since.remove(id);
+                    if let State::Downloading { bytes, total } = other {
+                        step.bytes += bytes;
+                        step.total += total;
+                    }
+                    step.waiting.push(id.clone());
+                }
+            }
+        }
+        if seen != self.last_seen {
+            self.last_seen = seen;
+            self.last_change = now;
+        } else if !step.waiting.is_empty() && now.duration_since(self.last_change) >= self.stall {
+            for id in std::mem::take(&mut step.waiting) {
+                step.warnings.push(format!(
+                    "Dataset {id} made no download progress for {} minutes. The download is \
+                     stalled or waits behind another large download, so the benchmark ran \
+                     without it; check the Resources page and run it again once it is \
+                     installed.",
+                    self.stall.as_secs() / 60
+                ));
+            }
+        }
+        // Finished and failed sets are reported once and dropped from the wait.
+        self.keys.retain(|(id, _)| step.waiting.contains(id));
+        step
+    }
 }
 
 /// Benchmark the requested models on the requested devices over the requested datasets,
@@ -1019,6 +1116,9 @@ impl ServiceRun<'_> {
         for w in warnings {
             self.h.with(|g| g.warnings.push(w));
         }
+        if let Some(w) = BenchmarkResults::merge_warning(prev.as_ref(), &results) {
+            self.h.warn(w);
+        }
         let mut merged = saver.merge(prev, results, last);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(req.accuracy_metric, req.weights);
@@ -1083,7 +1183,7 @@ impl Saver {
     ) -> BenchmarkResults {
         let comparable = prev
             .as_ref()
-            .is_some_and(|p| p.hardware == new.hardware && p.runtimes == new.runtimes);
+            .is_some_and(|p| p.incomparable(&new).is_none());
         let retain = *self.retain_sets.get_or_insert(comparable);
         // The sets before `merge` drops the unreferenced ones (kept until the end).
         let sets = match prev.as_ref().filter(|_| comparable) {
@@ -1280,6 +1380,119 @@ mod tests {
         svc.start_job(req, |_| panic!("test panic")).unwrap();
         assert!(svc.wait_idle(Duration::from_secs(5)));
         assert_eq!(svc.status().state, RunState::Failed);
+    }
+
+    fn wait_of(ids: &[&str]) -> DownloadWait {
+        DownloadWait::new(
+            Instant::now(),
+            ids.iter()
+                .map(|i| (i.to_string(), format!("key-{i}")))
+                .collect(),
+        )
+    }
+
+    /// The dataset wait ends: installed sets drop out, failures and keys the manager never
+    /// knew become warnings after the grace period, and a wait with no progress for the
+    /// stall time turns the remaining sets into warnings (BM-06).
+    #[test]
+    fn dataset_wait_has_deadlines() {
+        use crate::resources::State;
+        let t0 = Instant::now();
+        let s = |secs: u64| t0 + Duration::from_secs(secs);
+        let dl = |b: u64| State::Downloading {
+            bytes: b,
+            total: 100,
+        };
+
+        // Unknown key: waits during the grace period, then a warning.
+        let mut w = wait_of(&["a"]);
+        w.last_change = t0;
+        let step = w.step(s(0), |_| None);
+        assert_eq!(step.waiting, ["a"]);
+        let step = w.step(s(DOWNLOAD_UNKNOWN_GRACE.as_secs() + 1), |_| None);
+        assert!(step.waiting.is_empty());
+        assert_eq!(step.warnings.len(), 1);
+        assert!(
+            step.warnings[0].contains("does not know"),
+            "{:?}",
+            step.warnings
+        );
+
+        // Progress keeps the wait alive past the stall time; a later stall ends it.
+        let mut w = wait_of(&["a", "b"]);
+        let stall = DOWNLOAD_STALL.as_secs();
+        let step = w.step(s(0), |k| {
+            Some(if k == "key-a" { dl(10) } else { State::Queued })
+        });
+        assert_eq!((step.bytes, step.total), (10, 100));
+        let step = w.step(s(stall - 1), |k| {
+            Some(if k == "key-a" { dl(50) } else { State::Queued })
+        });
+        assert_eq!(step.waiting, ["a", "b"]);
+        let step = w.step(s(2 * stall - 2), |k| {
+            Some(if k == "key-a" { dl(50) } else { State::Queued })
+        });
+        assert_eq!(step.waiting, ["a", "b"], "not stalled yet");
+        let step = w.step(s(2 * stall), |k| {
+            Some(if k == "key-a" { dl(50) } else { State::Queued })
+        });
+        assert!(step.waiting.is_empty());
+        assert_eq!(step.warnings.len(), 2);
+        assert!(step.warnings[0].contains("no download progress"));
+
+        // Installed and failed sets leave the wait; a failure is reported once.
+        let mut w = wait_of(&["a", "b"]);
+        let step = w.step(s(0), |k| {
+            Some(if k == "key-a" {
+                State::Installed
+            } else {
+                State::Failed {
+                    error: "HTTP 404".into(),
+                    retry_at: None,
+                    attempts: 1,
+                }
+            })
+        });
+        assert!(step.waiting.is_empty());
+        assert_eq!(step.warnings.len(), 1);
+        assert!(step.warnings[0].contains("HTTP 404"));
+    }
+
+    /// A cancel that lands while `start_job` is still starting the run is never lost: a
+    /// `cancel()` that returned true is seen by the job (BM-05). A second thread spins on
+    /// `cancel()` so it hits the moment the state turns Running.
+    #[test]
+    fn cancel_right_after_start_is_not_lost() {
+        let svc = BenchmarkService::new();
+        let req = request(&["m"]);
+        for _ in 0..50 {
+            let s2 = svc.clone();
+            let canceller = std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                while t.elapsed() < Duration::from_secs(5) {
+                    if s2.cancel() {
+                        return true;
+                    }
+                    std::hint::spin_loop();
+                }
+                false
+            });
+            svc.start_job(req.clone(), |h| {
+                // Long enough for the spinning cancel to land.
+                let t = std::time::Instant::now();
+                while t.elapsed() < Duration::from_secs(5) {
+                    if h.is_cancelled() {
+                        return Err(super::super::Cancelled.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok("not cancelled".into())
+            })
+            .unwrap();
+            assert!(canceller.join().unwrap(), "cancel saw the run");
+            assert!(svc.wait_idle(Duration::from_secs(10)));
+            assert_eq!(svc.status().state, RunState::Cancelled);
+        }
     }
 
     #[test]

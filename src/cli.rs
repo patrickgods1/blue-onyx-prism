@@ -1,6 +1,6 @@
 //! Command line, config resolution and logging setup.
 
-use crate::config::{Config, LogLevel, ModelConfig};
+use crate::config::{Config, LogFormat, LogLevel, ModelConfig};
 use crate::model::ModelFamilyKind;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -124,10 +124,17 @@ pub enum Command {
     },
 }
 
+/// [`crate::long_version`] as a `&'static str` for clap's `version` (every binary's
+/// `--version`): version, git sha and build date.
+pub fn long_version_str() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(crate::long_version).as_str()
+}
+
 #[derive(Debug, Clone, Default, Parser)]
 #[command(
     name = "blue-onyx-prism",
-    version = env!("CARGO_PKG_VERSION"),
+    version = long_version_str(),
     about = "Blue Iris compatible object detection service on native OpenVINO"
 )]
 pub struct Cli {
@@ -229,9 +236,53 @@ pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     let to_save = without_one_off_flags(&config, &loaded);
     let unchanged = existed && to_save.saved_text()? == loaded.saved_text()?;
     if !unchanged && let Err(e) = to_save.save(&path) {
-        tracing::warn!("could not save merged config: {e:#}");
+        // Runs before logging is set up: kept until `init_logging` (CO-11).
+        crate::logbuf::early(
+            tracing::Level::WARN,
+            format!(
+                "could not save the merged config: {e:#}. The folder is probably read-only for \
+                 this account, so the command-line options apply to this run only; make the \
+                 file writable or pass --config <a writable file>"
+            ),
+        );
     }
     Ok((config, path))
+}
+
+/// CO-05: a config without models gets the default catalog model
+/// ([`Config::seed_default_model`]), written to `path`, so a first start binds the HTTP port,
+/// serves the web UI and downloads the model (`auto_download`). Messages go through
+/// [`crate::logbuf::early`] (this runs before logging is set up). Returns whether a model was
+/// added.
+pub fn seed_default_model(config: &mut Config, path: &Path) -> bool {
+    let Some(name) = config.seed_default_model() else {
+        return false;
+    };
+    let fetch = if config.auto_download {
+        "it is downloaded in the background now"
+    } else {
+        "auto_download is off, so fetch it with `blue-onyx-prism fetch --for-config`"
+    };
+    crate::logbuf::early(
+        tracing::Level::WARN,
+        format!(
+            "no models were configured in {} (first start?); added the default model '{name}' \
+             ({fetch}). Add or replace models on the Config page (Add a model by path) or with \
+             `blue-onyx-prism add-model --path <file>`",
+            path.display()
+        ),
+    );
+    if let Err(e) = config.save(path) {
+        crate::logbuf::early(
+            tracing::Level::WARN,
+            format!(
+                "could not save the default model to the config: {e:#}. The folder is probably \
+                 read-only for this account, so it is used for this run only; make the file \
+                 writable"
+            ),
+        );
+    }
+    true
 }
 
 /// `config` with the one-off boolean flags (`allow_remote_admin`, `force_cpu`,
@@ -476,21 +527,35 @@ fn merge_cli(config: &mut Config, cli: &Cli) {
 }
 
 /// Load `blue_onyx_prism_config_service.json`, creating a default one (log level debug)
-/// when missing.
+/// when missing. A config without models gets the default catalog model
+/// ([`seed_default_model`], CO-05): the service then binds its port and serves the web UI on
+/// the first start instead of failing in a retry loop.
 pub fn for_service() -> Result<(Config, PathBuf)> {
     let path = Config::service_config_path();
-    if path.exists() {
-        Ok((Config::load(&path)?, path))
+    for_service_at(&path).map(|c| (c, path))
+}
+
+/// [`for_service`] for the config file at `path`.
+pub fn for_service_at(path: &Path) -> Result<Config> {
+    let mut config = if path.exists() {
+        Config::load(path)?
     } else {
         let config = Config {
             log_level: LogLevel::Debug,
             ..Default::default()
         };
+        config.save(path).with_context(|| {
+            format!(
+                "could not create the default service config {} (the install folder is \
+                 probably read-only for the service account); grant it write access or create \
+                 the file by hand",
+                path.display()
+            )
+        })?;
         config
-            .save(&path)
-            .with_context(|| format!("creating default service config {}", path.display()))?;
-        Ok((config, path))
-    }
+    };
+    seed_default_model(&mut config, path);
+    Ok(config)
 }
 
 type FilterHandle = reload::Handle<EnvFilter, Registry>;
@@ -500,6 +565,8 @@ type FilterHandle = reload::Handle<EnvFilter, Registry>;
 #[derive(Clone)]
 pub struct LogReloadHandle {
     handle: FilterHandle,
+    /// The level the filter currently has (for the "changed from X to Y" line).
+    level: Arc<std::sync::Mutex<LogLevel>>,
     /// The in-memory ring behind the web UI's Logs page.
     buffer: crate::logbuf::LogBuffer,
     _guard: Option<Arc<tracing_appender::non_blocking::WorkerGuard>>,
@@ -513,12 +580,50 @@ impl std::fmt::Debug for LogReloadHandle {
     }
 }
 
+/// Whether `level` lets info events through.
+fn shows_info(level: LogLevel) -> bool {
+    matches!(level, LogLevel::Trace | LogLevel::Debug | LogLevel::Info)
+}
+
 impl LogReloadHandle {
-    /// Replace the global level filter; takes effect immediately for every thread.
+    /// Replace the global level filter; takes effect immediately for every thread. A change is
+    /// logged at info as "log level changed from X to Y", under whichever of the two levels
+    /// shows info (before the switch when the new level hides it).
     pub fn set_level(&self, level: LogLevel) -> Result<()> {
-        self.handle
-            .reload(filter_for(level))
-            .map_err(|e| anyhow::anyhow!("reloading log filter: {e}"))
+        use crate::sync::LockExt;
+        let mut current = self.level.lock_recover();
+        let from = *current;
+        let announce = || {
+            tracing::info!(
+                from = from.as_str(),
+                to = level.as_str(),
+                "log level changed from {} to {}",
+                from.as_str(),
+                level.as_str()
+            );
+        };
+        if from != level && !shows_info(level) {
+            announce();
+        }
+        self.handle.reload(filter_for(level)).map_err(|e| {
+            anyhow::anyhow!(
+                "could not change the log level to {}: {e} (the logging system was shut down); \
+                 restart the service to apply it",
+                level.as_str()
+            )
+        })?;
+        *current = level;
+        drop(current);
+        if from != level && shows_info(level) {
+            announce();
+        }
+        Ok(())
+    }
+
+    /// The level the filter has now.
+    pub fn level(&self) -> LogLevel {
+        use crate::sync::LockExt;
+        *self.level.lock_recover()
     }
 
     /// The recent log events (the Logs page).
@@ -532,6 +637,7 @@ impl LogReloadHandle {
         let (layer, handle) = reload::Layer::<EnvFilter, Registry>::new(filter_for(level));
         Self {
             handle,
+            level: Arc::new(std::sync::Mutex::new(level)),
             buffer: crate::logbuf::LogBuffer::default(),
             _guard: None,
             _detached: Some(Arc::new(layer)),
@@ -559,13 +665,41 @@ pub fn init_logging(level: LogLevel, log_path: Option<&Path>) -> Result<LogReloa
     init_logging_with(level, log_path, None)
 }
 
-/// [`init_logging`] plus an optional extra layer. The level filter (and thus
-/// [`LogReloadHandle::set_level`]) applies to every sink, including `extra` and the in-memory
-/// [`crate::logbuf::LogBuffer`] (always installed; see [`LogReloadHandle::buffer`]); `extra` may
-/// add its own per-layer filter on top.
+/// [`init_logging`] plus an optional extra layer, text log files.
 pub fn init_logging_with(
     level: LogLevel,
     log_path: Option<&Path>,
+    extra: Option<ExtraLogLayer>,
+) -> Result<LogReloadHandle> {
+    init_logging_opts(level, log_path, LogFormat::Text, extra)
+}
+
+/// The daily rolling appender under `dir` (created when missing).
+fn file_appender(dir: &Path) -> Result<tracing_appender::rolling::RollingFileAppender> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("could not create the log directory {}", dir.display()))?;
+    // `blue_onyx_prism.log.<date>`, one per day; the oldest beyond MAX_LOG_FILES are
+    // deleted, so a long-running service cannot fill the disk with logs.
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("blue_onyx_prism.log")
+        .max_log_files(MAX_LOG_FILES)
+        .build(dir)
+        .with_context(|| format!("could not open a log file in {}", dir.display()))
+}
+
+/// Install the global subscriber: the reloadable level filter (which also governs `extra` and
+/// the in-memory [`crate::logbuf::LogBuffer`] behind [`LogReloadHandle::buffer`]; `extra` may
+/// add its own per-layer filter on top), then either a daily rolling file in `log_path` in
+/// `format` (`json`: one object per line) or stdout (always text).
+///
+/// A `log_path` that cannot be created or opened does not stop the program (CO-11): logging
+/// falls back to stdout with a warning. Messages kept by [`crate::logbuf::early`] before this
+/// call are logged right after it.
+pub fn init_logging_opts(
+    level: LogLevel,
+    log_path: Option<&Path>,
+    format: LogFormat,
     extra: Option<ExtraLogLayer>,
 ) -> Result<LogReloadHandle> {
     let (filter, handle) = reload::Layer::new(filter_for(level));
@@ -574,39 +708,57 @@ pub fn init_logging_with(
         .with(filter)
         .with(extra)
         .with(buffer.clone());
-    let guard = match log_path {
-        Some(dir) => {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating log dir {}", dir.display()))?;
-            // `blue_onyx_prism.log.<date>`, one per day; the oldest beyond MAX_LOG_FILES are
-            // deleted, so a long-running service cannot fill the disk with logs.
-            let appender = tracing_appender::rolling::Builder::new()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("blue_onyx_prism.log")
-                .max_log_files(MAX_LOG_FILES)
-                .build(dir)
-                .with_context(|| format!("opening the log file in {}", dir.display()))?;
+    let appender = match log_path.map(|dir| (dir, file_appender(dir))) {
+        Some((_, Ok(a))) => Some(a),
+        Some((dir, Err(e))) => {
+            crate::logbuf::early(
+                tracing::Level::WARN,
+                format!(
+                    "{e:#}; logging to stdout instead. The folder is probably not writable by \
+                     this account or on a missing drive; fix log_path ({}) or its permissions \
+                     and restart",
+                    dir.display()
+                ),
+            );
+            None
+        }
+        None => None,
+    };
+    let init_err = |e: tracing_subscriber::util::TryInitError| {
+        anyhow::anyhow!(
+            "could not set up logging: {e} (logging was already set up in this process); \
+             this is a bug, please report it"
+        )
+    };
+    let guard = match appender {
+        Some(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
-            registry
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(writer)
-                        .with_ansi(false),
-                )
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("initializing logging: {e}"))?;
+            let file_layer = match format {
+                LogFormat::Text => tracing_subscriber::fmt::layer()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .boxed(),
+                LogFormat::Json => tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .boxed(),
+            };
+            registry.with(file_layer).try_init().map_err(init_err)?;
             Some(guard)
         }
         None => {
             registry
                 .with(tracing_subscriber::fmt::layer())
                 .try_init()
-                .map_err(|e| anyhow::anyhow!("initializing logging: {e}"))?;
+                .map_err(init_err)?;
             None
         }
     };
+    crate::logbuf::replay_early();
     Ok(LogReloadHandle {
         handle,
+        level: Arc::new(std::sync::Mutex::new(level)),
         buffer,
         _guard: guard.map(Arc::new),
         _detached: None,
@@ -1100,5 +1252,80 @@ mod tests {
         let (c, _) = resolve_config(&cli).unwrap();
         assert_eq!(c, Config::default());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn version_includes_sha_and_build_date() {
+        let v = long_version_str();
+        assert!(v.starts_with(crate::VERSION), "{v}");
+        assert!(
+            v.contains(crate::GIT_SHA) && v.contains(crate::BUILD_DATE),
+            "{v}"
+        );
+        let err = Cli::try_parse_from(["x", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(v), "{err}");
+    }
+
+    #[test]
+    fn seed_default_model_fills_and_saves_an_empty_config() {
+        let path = temp_cfg();
+        let mut c = Config::default();
+        assert!(seed_default_model(&mut c, &path));
+        assert_eq!(c.models.len(), 1);
+        assert_eq!(
+            c.models[0].name.as_deref(),
+            Some(crate::config::DEFAULT_MODEL_NAME)
+        );
+        assert_eq!(Config::load(&path).unwrap().models, c.models);
+        // A config with models is left alone.
+        assert!(!seed_default_model(&mut c, &path));
+        assert_eq!(c.models.len(), 1);
+    }
+
+    /// CO-05: the service's first start (no file) and a service config with an empty models
+    /// list both get the default model, so the server binds and serves the UI.
+    #[test]
+    fn service_config_is_seeded_with_the_default_model() {
+        let path = temp_cfg();
+        let c = for_service_at(&path).unwrap();
+        assert_eq!(c.log_level, LogLevel::Debug);
+        assert_eq!(c.models.len(), 1);
+        assert!(crate::config::validate_config(&c).is_ok());
+        assert_eq!(Config::load(&path).unwrap().models.len(), 1);
+        let path = temp_cfg();
+        Config {
+            port: 4000,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let c = for_service_at(&path).unwrap();
+        assert_eq!((c.port, c.models.len()), (4000, 1));
+    }
+
+    #[test]
+    fn set_level_tracks_the_current_level() {
+        let h = LogReloadHandle::detached(LogLevel::Info);
+        assert_eq!(h.level(), LogLevel::Info);
+        h.set_level(LogLevel::Warn).unwrap();
+        assert_eq!(h.level(), LogLevel::Warn);
+        h.set_level(LogLevel::Debug).unwrap();
+        h.set_level(LogLevel::Debug).unwrap();
+        assert_eq!(h.clone().level(), LogLevel::Debug);
+    }
+
+    /// CO-11: an unusable log directory is an error of the appender only; the caller falls
+    /// back to stdout.
+    #[cfg(unix)]
+    #[test]
+    fn unusable_log_dir_is_reported_not_panicking() {
+        let dir = temp_cfg().with_file_name("a-file");
+        std::fs::write(&dir, "x").unwrap();
+        let err = format!("{:#}", file_appender(&dir.join("logs")).unwrap_err());
+        assert!(err.contains("could not create the log directory"), "{err}");
+        let ok = temp_cfg().with_file_name("logs");
+        assert!(file_appender(&ok).is_ok());
+        assert!(ok.is_dir());
     }
 }

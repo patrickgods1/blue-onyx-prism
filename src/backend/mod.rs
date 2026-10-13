@@ -432,8 +432,20 @@ impl Backend {
         }
     }
 
-    /// Stop every inference in flight (OpenVINO: cancel and wait; ONNX Runtime: wait, a
-    /// running session cannot be interrupted). Their results are discarded.
+    /// False when a slot can no longer run inferences and the model must be reloaded (an ONNX
+    /// Runtime session thread died or hung; see [`SessionDead`]). OpenVINO is always healthy
+    /// here: its errors are per request.
+    pub fn is_healthy(&self) -> bool {
+        match self {
+            Backend::OpenVino(_) => true,
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.is_healthy(),
+        }
+    }
+
+    /// Stop every inference in flight (OpenVINO: cancel and wait; ONNX Runtime: wait at most
+    /// `ort::ABORT_TIMEOUT`, a running session cannot be interrupted; a hung one is marked dead).
+    /// Their results are discarded.
     pub fn abort(&mut self) {
         match self {
             Backend::OpenVino(b) => device::abort(&mut b.slots),
@@ -463,6 +475,35 @@ impl Backend {
             Backend::Ort(b) => b.infer_into(chw, extra, outs),
         }
     }
+}
+
+/// A backend slot whose runtime thread is gone: an ONNX Runtime session thread panicked,
+/// exited, or stayed hung in `Session::run` past `ort::ABORT_TIMEOUT` (BE-10). The slot answers
+/// every later `submit` with this error; only reloading the model brings it back. Detect it
+/// with [`is_session_dead`] (it survives `anyhow` context) or poll [`Backend::is_healthy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDead {
+    pub slot: usize,
+    /// What happened, e.g. "session thread 0 panicked during inference (...)".
+    pub reason: String,
+}
+
+impl std::fmt::Display for SessionDead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; the inference runtime is in an unknown state; reload the model (the worker \
+             does this automatically) or restart the service",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for SessionDead {}
+
+/// Whether `e` (anywhere in its chain) is a [`SessionDead`]: the model must be reloaded.
+pub fn is_session_dead(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<SessionDead>())
 }
 
 /// Reason given to ONNX Runtime options in a build without the `onnxruntime` feature.
@@ -538,7 +579,11 @@ impl Runtimes {
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
-                        tracing::warn!("ONNX Runtime unavailable: {msg}");
+                        tracing::warn!(
+                            "ONNX Runtime unavailable: {msg}; the installed library is \
+                             probably damaged or of an unsupported version; models fall back to \
+                             OpenVINO; run `setup-onnxruntime` to reinstall it"
+                        );
                         (
                             None,
                             Some(msg.clone()),
@@ -748,7 +793,9 @@ impl Runtimes {
             Runtime::OpenVino => {
                 let Some(core) = self.ov.as_mut() else {
                     anyhow::bail!(
-                        "OpenVINO is not available: {}",
+                        "OpenVINO is not available ({}); its runtime libraries are probably \
+                         missing or of another version; run `setup-openvino` or pick an `ort:*` \
+                         device",
                         self.ov_error.as_deref().unwrap_or("not initialized")
                     );
                 };
@@ -758,7 +805,8 @@ impl Runtimes {
             Runtime::Ort => {
                 let Some(rt) = self.ort.as_ref() else {
                     anyhow::bail!(
-                        "ONNX Runtime is not available: {}",
+                        "ONNX Runtime is not available ({}); its library is probably not \
+                         installed; run `setup-onnxruntime` or pick an `openvino:*` device",
                         self.ort_error.as_deref().unwrap_or("not initialized")
                     );
                 };
@@ -773,25 +821,14 @@ impl Runtimes {
     }
 
     /// The concurrency class of `device` ([`crate::profile::Profile::tuning_for`]): an
-    /// OpenVINO GPU is discrete when OpenVINO reports `DEVICE_TYPE=discrete` for it.
+    /// OpenVINO GPU is discrete when OpenVINO reports `DEVICE_TYPE=discrete` for the GPU the
+    /// spec compiles on (a bare `GPU` resolves like `load_model`, see [`ov_gpu_for`]).
     pub fn device_class(&self, device: &Device) -> DeviceClass {
         match (device.runtime, device.target) {
             (Runtime::OpenVino, spec::Target::Gpu) => {
-                let name = device
-                    .openvino_device()
-                    .unwrap_or_else(|| "GPU".to_string());
-                let gpus: Vec<&select::OvDevice> = self
-                    .probe
-                    .openvino
-                    .devices
-                    .iter()
-                    .filter(|d| d.is_gpu())
-                    .collect();
-                let found = gpus
-                    .iter()
-                    .find(|d| d.name.eq_ignore_ascii_case(&name))
-                    .or_else(|| gpus.first());
-                if found.is_some_and(|d| d.is_discrete()) {
+                if ov_gpu_for(&self.probe.openvino.devices, device.index)
+                    .is_some_and(|d| d.is_discrete())
+                {
                     DeviceClass::DiscreteGpu
                 } else {
                     DeviceClass::IntegratedGpu
@@ -813,5 +850,73 @@ impl Runtimes {
         try_candidates(&label, &candidates, |cand| {
             self.compile(cand, req)?.into_backend()
         })
+    }
+}
+
+/// The probed OpenVINO GPU `openvino:gpu[.N]` compiles on: bare `GPU` via
+/// [`select::bare_gpu_device`] (the Intel preference of `load_model`), `GPU.N` by name (`GPU`
+/// for N = 0 when only one unnumbered GPU is listed). None when it is not listed.
+fn ov_gpu_for(devices: &[select::OvDevice], index: Option<u32>) -> Option<&select::OvDevice> {
+    match index {
+        None => select::bare_gpu_device(devices),
+        Some(n) => {
+            let want = format!("GPU.{n}");
+            devices
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(&want))
+                .or_else(|| {
+                    (n == 0)
+                        .then(|| devices.iter().find(|d| d.name == "GPU"))
+                        .flatten()
+                })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ovd(name: &str, full: &str, ty: &str) -> select::OvDevice {
+        select::OvDevice {
+            name: name.into(),
+            full_name: full.into(),
+            device_type: Some(ty.into()),
+        }
+    }
+
+    #[test]
+    fn session_dead_is_detectable_through_context() {
+        let e: anyhow::Error = SessionDead {
+            slot: 1,
+            reason: "session thread 1 exited".into(),
+        }
+        .into();
+        let e = e.context("model m.onnx on ort:cuda");
+        assert!(is_session_dead(&e));
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("session thread 1 exited") && msg.contains("reload"),
+            "{msg}"
+        );
+        assert!(!is_session_dead(&anyhow::anyhow!("inference failed")));
+    }
+
+    #[test]
+    fn device_class_follows_the_compiled_gpu() {
+        // OpenCL lists the NVIDIA card first; a bare GPU compiles on the Intel iGPU (BE-09).
+        let devs = [
+            ovd("CPU", "Intel(R) Core(TM) i5-8500", ""),
+            ovd("GPU.0", "NVIDIA GeForce RTX 3060 (dGPU)", "discrete"),
+            ovd("GPU.1", "Intel(R) UHD Graphics 630 (iGPU)", "integrated"),
+        ];
+        assert_eq!(ov_gpu_for(&devs, None).unwrap().name, "GPU.1");
+        assert!(!ov_gpu_for(&devs, None).unwrap().is_discrete());
+        assert!(ov_gpu_for(&devs, Some(0)).unwrap().is_discrete());
+        assert_eq!(ov_gpu_for(&devs, Some(1)).unwrap().name, "GPU.1");
+        assert!(ov_gpu_for(&devs, Some(2)).is_none());
+        let single = [ovd("GPU", "Intel(R) Arc(TM) A770 (dGPU)", "discrete")];
+        assert_eq!(ov_gpu_for(&single, Some(0)).unwrap().name, "GPU");
+        assert!(ov_gpu_for(&single, Some(1)).is_none());
     }
 }

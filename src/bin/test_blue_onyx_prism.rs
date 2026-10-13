@@ -33,7 +33,7 @@ static DEFAULT_IMAGE: &[u8] = include_bytes!("../../tests/data/dog_bike_car.jpg"
 #[derive(Debug, Parser)]
 #[command(
     name = "test-blue-onyx-prism",
-    version,
+    version = blue_onyx_prism::cli::long_version_str(),
     about = "Send test images to a running Blue Onyx Prism server"
 )]
 struct Args {

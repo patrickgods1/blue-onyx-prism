@@ -17,6 +17,24 @@ services:
       start_period: 300s
     # Time for the graceful drain after SIGTERM before Docker sends SIGKILL.
     stop_grace_period: 30s
+    # Least privilege: the image's root filesystem (binaries, runtimes, default config) is
+    # read-only; the service writes only to the volumes below and /tmp. What breaks if tightened
+    # further: without the tmpfs, model export and some runtime temp files fail; without a
+    # writable ./config the config cannot be saved (the entrypoint refuses to start); without a
+    # writable ./cache every start recompiles the models; without the `data` volume web UI
+    # downloads, benchmark datasets and exports fail.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The image runs as its `openvino` user. ./cache and ./config must be writable by it: create
+    # them before the first `up` (`mkdir -p cache config`; docker creates missing ones as root)
+    # and, if your user's uid differs, either chown them to the image user's uid
+    # (`docker run --rm --entrypoint id blue-onyx-prism:latest`) or run as their owner:
+    # user: "1000:1000"
     ports:
       # Default: this host only. Inside Docker every client (the host's browser too) arrives from
       # the bridge network, never loopback, so the admin pages answer 403 until
@@ -38,6 +56,8 @@ services:
       # Named volume: starts with the models fetched at image build time (`fetch --for-config`
       # on deploy/docker-config.json). Use `./models:/app/models` instead to bring your own.
       - models:/app/models
+      # Data root (`download_dir` in the config): web UI downloads, benchmark datasets, exports.
+      - data:/app/data
       - ./cache:/app/cache
       # The default config (auto_download: false, IPcam-general on `auto`) is copied here on
       # first start; edit it, then restart the container.
@@ -45,3 +65,4 @@ services:
 
 volumes:
   models:
+  data:

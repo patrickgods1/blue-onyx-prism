@@ -23,6 +23,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 --------------------------------------------------------------------------------
+Third-party software
+
+The release archives also contain the OpenVINO runtime (Apache-2.0), ONNX Runtime
+(MIT), on Windows DirectML (Microsoft DirectML license), and the binaries embed
+the Roboto Mono font (Apache-2.0) and statically linked Rust crates. Their
+licenses, notices and the crate list are in THIRD_PARTY_LICENSES.md, shipped in
+every release archive; the runtimes' own LICENSE and third-party notice files
+are kept next to their libraries.
+
+--------------------------------------------------------------------------------
 Third-party benchmark data (assets/bench/*.json)
 
 The benchmark manifests reference images by URL with SHA-256 pins and carry

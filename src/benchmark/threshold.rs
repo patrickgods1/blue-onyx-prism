@@ -397,7 +397,9 @@ pub fn exact_pick(bp: &Breakpoints, objective: Objective) -> Option<Pick> {
                         _ => ("target", 0.0),
                     };
                     note = Some(format!(
-                        "{name} {}% is met only between 0.01 steps (exact optimum {:.3})",
+                        "{name} {}% is met only between 0.01 steps (exact optimum {:.3}), so no \
+                         configurable threshold meets it and it is not applied; choose a lower \
+                         target",
                         pct0(target),
                         sbest.hi
                     ))
@@ -408,7 +410,10 @@ pub fn exact_pick(bp: &Breakpoints, objective: Objective) -> Option<Pick> {
         if p.counts.tp == 0 {
             note = Some("no threshold finds any object".to_string());
         }
-        return Some(make(t, true, note, (sbest.hi, sbest.score), run));
+        // `met` describes the reported (rounded) threshold, so `apply_value` never writes a
+        // value that misses the target (BQ-07).
+        let met = objective.target_met(&p) != Some(false);
+        return Some(make(t, met, note, (sbest.hi, sbest.score), run));
     }
     let (_, primary, secondary) = fallback_keys(objective)?;
     // Target not reached: the best range on the constrained metric (then the other metric,
@@ -1456,7 +1461,10 @@ mod tests {
                     continue;
                 };
                 if !p.met {
-                    assert!(brute.is_none(), "seed {seed} {o}");
+                    // Unreachable, or reachable only between 0.01 steps (BQ-07).
+                    let between = (1..=100)
+                        .all(|k| o.target_met(&bp.point_at(k as f32 / 100.0)) != Some(true));
+                    assert!(brute.is_none() || between, "seed {seed} {o}");
                     continue;
                 }
                 let exact = p.exact_score.unwrap();
@@ -1492,6 +1500,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A precision target met only between two 0.01 steps is not marked met, so it is never
+    /// applied (BQ-07). Detections: FP .519, TP .515, FP .512: precision 0.5 holds only for
+    /// thresholds in (0.512, 0.515]; 0.51 keeps 1/3, 0.52 and above keep nothing.
+    #[test]
+    fn target_met_only_between_steps_is_not_applied() {
+        use super::super::metrics::{SweepImage, SweepPred, SweepScope};
+        let mut img = SweepImage::default();
+        img.gt.push(("person".into(), false));
+        for (c, tp) in [(0.519, false), (0.515, true), (0.512, false)] {
+            img.preds.push(SweepPred {
+                confidence: c,
+                class: "person".into(),
+                tp,
+                small: false,
+            });
+        }
+        let bp = Breakpoints::new(&[&img], SweepScope::All);
+        let o = Objective::Precision(0.5);
+        let p = exact_pick(&bp, o).unwrap();
+        assert_eq!(p.exact_threshold, Some(0.515));
+        assert!(!p.met, "{p:?}");
+        assert!(p.note.as_deref().unwrap().contains("between 0.01 steps"));
+        assert_eq!(o.target_met(&bp.point_at(p.threshold)), Some(false));
+        let mut advice = test_advice(0.5);
+        advice.best = Some(p.clone());
+        assert_eq!(advice.apply_value(), None);
+        // The same pick when the target holds is applied.
+        advice.best = Some(Pick { met: true, ..p });
+        assert!(advice.apply_value().is_some());
     }
 
     #[test]

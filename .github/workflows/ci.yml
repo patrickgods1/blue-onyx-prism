@@ -10,11 +10,17 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # scripts/ci/smoke.sh: the served model name and a label it must detect on the test image.
+  MODEL_NAME: IPcam-general
+  EXPECT_LABEL: vehicle
 
 jobs:
   check:
     name: build-test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A hung test (e.g. a provider deadlock) must not hold a runner for the default 6 h. A cold
+    # Windows build plus the release build and every test takes about 40 min.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -43,10 +49,19 @@ jobs:
         run: cargo build --locked --release --bins
       - name: Fetch OpenVINO runtime
         run: cargo run --locked --release -- setup-openvino --dest target/release/openvino
-      - name: Download smallest model
-        run: cargo run --locked --release -- download-models --name ipcam-bird --dir target/release/models
+      # IPcam-general detects the test image's car and bicycle as "vehicle", so every smoke run
+      # can require at least one prediction with that label (a provider that answers success with
+      # no boxes fails).
+      - name: Download IPcam-general
+        run: cargo run --locked --release -- download-models --name IPcam-general --dir target/release/models
+      # RT-DETRv2 (i64 orig_target_sizes input, stretch preprocessing, the CoreML pinned-batch
+      # path): without it the RT-DETR parts of the integration tests are skipped. YOLO26 needs an
+      # AGPL export and stays a manual release-checklist step.
+      - name: Download RT-DETRv2 small
+        run: cargo run --locked --release -- download-models --name rt-detrv2-s --dir target/release/models
       # Each smoke run uses its own port so a slow shutdown of the previous server cannot collide.
       # scripts/ci/smoke.sh <bin> <client> <port> <provider substring> <server args...>
+      # MODEL_NAME / EXPECT_LABEL are set for the whole job below.
       - name: Smoke test (OpenVINO CPU)
         shell: bash
         run: |
@@ -55,12 +70,10 @@ jobs:
           case "$RUNNER_OS" in Windows) EXE=".exe";; esac
           scripts/ci/smoke.sh "target/release/blue-onyx-prism$EXE" "target/release/test-blue-onyx-prism$EXE" \
             32168 "OpenVINO" \
-            --model target/release/models/ipcam-bird.onnx --family yolo5 --force-cpu \
+            --model target/release/models/IPcam-general.onnx --family yolo5 --force-cpu \
             --cache-dir target/release/cache
       - name: Fetch ONNX Runtime (CPU)
         run: cargo run --locked --release -- setup-onnxruntime --flavor cpu --dir target/release/onnxruntime
-      - name: Download IPcam-general
-        run: cargo run --locked --release -- download-models --name IPcam-general --dir target/release/models
       # The ignored tests need models/, openvino/ and onnxruntime/ (flat, as `--dir` installs it) under
       # BLUE_ONYX_TEST_ROOT, which is where the steps above installed them. A missing fixture fails
       # the test. They run on the debug test binaries (reusing the cargo cache); the runtime is found
@@ -77,7 +90,7 @@ jobs:
           case "$RUNNER_OS" in Windows) EXE=".exe";; esac
           scripts/ci/smoke.sh "target/release/blue-onyx-prism$EXE" "target/release/test-blue-onyx-prism$EXE" \
             32169 "ONNX Runtime" \
-            --model target/release/models/ipcam-bird.onnx --family yolo5 --device ort:cpu \
+            --model target/release/models/IPcam-general.onnx --family yolo5 --device ort:cpu \
             --onnxruntime-dir target/release/onnxruntime --cache-dir target/release/cache
       # The hosted macOS runners are Apple Silicon. The IPcam YOLOv5 model is the one the CoreML
       # rewrite path (onnx_rewrite.rs) exists for. The ORT build is the CPU flavor fetched above
@@ -89,7 +102,7 @@ jobs:
           set -euo pipefail
           scripts/ci/smoke.sh target/release/blue-onyx-prism target/release/test-blue-onyx-prism \
             32170 "CoreML" \
-            --model target/release/models/ipcam-bird.onnx --family yolo5 --device ort:coreml \
+            --model target/release/models/IPcam-general.onnx --family yolo5 --device ort:coreml \
             --onnxruntime-dir target/release/onnxruntime --cache-dir target/release/cache
       # DirectML runs on the WARP software adapter on hosted runners. Not required yet: it is made
       # a required step once it proves stable (drop continue-on-error then).
@@ -105,12 +118,13 @@ jobs:
           set -euo pipefail
           scripts/ci/smoke.sh target/release/blue-onyx-prism.exe target/release/test-blue-onyx-prism.exe \
             32171 "DirectML" \
-            --model target/release/models/ipcam-bird.onnx --family yolo5 --device ort:directml \
+            --model target/release/models/IPcam-general.onnx --family yolo5 --device ort:directml \
             --onnxruntime-dir target/release/onnxruntime-directml --cache-dir target/release/cache
 
   supply-chain:
     name: supply-chain (cargo-deny)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

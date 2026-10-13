@@ -746,6 +746,9 @@ pub struct Bench<'a> {
     pub threshold_objective: threshold::Objective,
     /// What the accuracy grade is computed from.
     pub accuracy_metric: grade::AccuracyMetric,
+    /// Stored predictions per image (most confident first; [`MAX_STORED_PREDS`]). The pseudo
+    /// ground truth run keeps all of them (BM-10).
+    pub max_stored_preds: usize,
 }
 
 impl std::fmt::Debug for Bench<'_> {
@@ -762,6 +765,7 @@ impl std::fmt::Debug for Bench<'_> {
             .field("weights", &self.weights)
             .field("threshold_objective", &self.threshold_objective)
             .field("accuracy_metric", &self.accuracy_metric)
+            .field("max_stored_preds", &self.max_stored_preds)
             .finish()
     }
 }
@@ -817,6 +821,7 @@ impl<'a> Bench<'a> {
             weights: Weights::default(),
             threshold_objective: threshold::Objective::default(),
             accuracy_metric: grade::AccuracyMetric::default(),
+            max_stored_preds: MAX_STORED_PREDS,
         }
     }
 
@@ -905,12 +910,17 @@ impl<'a> Bench<'a> {
         let t = Instant::now();
         let label = format!("model {}", job.name);
         // Compile under the runtimes lock (workers compile through the same lock), create the
-        // inference request outside it.
-        let backend = crate::backend::try_candidates(&label, candidates, |cand| {
+        // inference request outside it. A compile can not be interrupted: a cancel takes
+        // effect after the current compile, before the next fallback candidate (BM-06).
+        let loaded = crate::backend::try_candidates(&label, candidates, |cand| {
+            self.check_cancel()?;
             let compiled = lock(runtimes).compile(cand, &req)?;
             compiled.into_backend()
-        })
-        .with_context(|| format!("loading {}", job.path.display()))?;
+        });
+        // A cancel during the compiles is a cancel, not a load failure (the error of several
+        // failed candidates no longer carries `Cancelled`).
+        self.check_cancel()?;
+        let backend = loaded.with_context(|| format!("loading {}", job.path.display()))?;
         let compile_ms = ms(t.elapsed());
         let cache = match (self.cache_dir, before) {
             (None, _) | (_, None) => "disabled".to_string(),
@@ -1112,7 +1122,7 @@ impl<'a> Bench<'a> {
             }
             timed.by_res.entry(bucket).or_default().1 += 1;
             let last = last.context("no timed run (repeat must be >= 1)")?;
-            let (run, eval) = image_run(set, img, &last, &totals, &infers);
+            let (run, eval) = image_run(set, img, &last, &totals, &infers, self.max_stored_preds);
             timed.eval_preds.push(eval);
             timed.per_image.push(run);
         }
@@ -1230,13 +1240,14 @@ impl Timings {
 }
 
 /// The drill-down record of one image from its last run (stored predictions, most confident
-/// first, at most [`MAX_STORED_PREDS`]; p50 timings) and that run's evaluation predictions.
+/// first, at most `max_preds`; p50 timings) and that run's evaluation predictions.
 fn image_run(
     set: &ImageSet,
     img: &images::SetImage,
     last: &Sample,
     totals: &[f64],
     infers: &[f64],
+    max_preds: usize,
 ) -> (ImageRun, Vec<PredBox>) {
     let mut preds: Vec<ImagePred> = last
         .predictions
@@ -1252,7 +1263,7 @@ fn image_run(
         })
         .collect();
     preds.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
-    preds.truncate(MAX_STORED_PREDS);
+    preds.truncate(max_preds);
     let eval = last.eval.iter().map(to_pred).collect();
     let run = ImageRun {
         set: set.id.clone(),
@@ -1742,6 +1753,9 @@ pub fn pseudo_ground_truth(
         weights: bench.weights,
         threshold_objective: bench.threshold_objective,
         accuracy_metric: bench.accuracy_metric,
+        // Every reference detection >= PSEUDO_IGNORE_CONFIDENCE becomes ground truth, not
+        // only the 100 most confident (BM-10).
+        max_stored_preds: usize::MAX,
     };
     let run = pb
         .run_exact(runtimes, &job, device)
@@ -1754,20 +1768,25 @@ pub fn pseudo_ground_truth(
             let r = runs
                 .next()
                 .context("pseudo ground truth run returned fewer images than requested")?;
-            img.gt = Some(
-                r.preds
-                    .iter()
-                    .map(|p| GtBox {
-                        label: metrics::canonical_label(&p.label),
-                        bbox: p.bbox,
-                        ignore: p.confidence < PSEUDO_GT_CONFIDENCE,
-                    })
-                    .collect(),
-            );
+            img.gt = Some(pseudo_gt_boxes(&r.preds));
         }
         set.ground_truth = GroundTruth::Pseudo(desc.clone());
     }
     Ok(Some(desc))
+}
+
+/// Pseudo ground truth from a reference run's predictions of one image: confidence >=
+/// [`PSEUDO_GT_CONFIDENCE`] are objects, the rest ignore regions.
+fn pseudo_gt_boxes(preds: &[ImagePred]) -> Vec<GtBox> {
+    preds
+        .iter()
+        .map(|p| GtBox {
+            label: metrics::canonical_label(&p.label),
+            bbox: p.bbox,
+            ignore: p.confidence < PSEUDO_GT_CONFIDENCE,
+            crowd: false,
+        })
+        .collect()
 }
 
 /// CPU devices whose detections serve as the agreement reference, in order of preference.
@@ -2352,16 +2371,19 @@ mod tests {
                 label: "dog".into(),
                 bbox: [0.0, 0.0, 100.0, 100.0],
                 ignore: false,
+                crowd: false,
             },
             GtBox {
                 label: "umbrella".into(),
                 bbox: [0.0, 0.0, 10.0, 10.0],
                 ignore: false,
+                crowd: false,
             },
             GtBox {
                 label: "car".into(),
                 bbox: [300.0, 300.0, 400.0, 400.0],
                 ignore: false,
+                crowd: false,
             },
         ]);
         let mut pseudo = set.clone();
@@ -2478,11 +2500,13 @@ mod tests {
                 label: "car".into(),
                 bbox: [0.0, 0.0, 100.0, 100.0],
                 ignore: false,
+                crowd: false,
             },
             GtBox {
                 label: "person".into(),
                 bbox: [200.0, 0.0, 300.0, 100.0],
                 ignore: false,
+                crowd: false,
             },
         ]);
         let job = Job {
@@ -2589,6 +2613,7 @@ mod tests {
             label: l.into(),
             bbox: [0.0, 0.0, 100.0, 100.0],
             ignore,
+            crowd: false,
         };
         let p = |l: &str, c: f32| PredBox {
             label: l.into(),
@@ -2850,5 +2875,49 @@ mod tests {
             assert!(r.agreement.is_some());
         }
         assert!(result.devices.is_empty());
+    }
+
+    /// The stored drill-down predictions are capped, but the pseudo ground truth run keeps
+    /// every reference detection, so a crowded image's 101st object is still ground truth
+    /// (BM-10).
+    #[test]
+    fn pseudo_ground_truth_keeps_every_reference_detection() {
+        let set = ImageSet::sample();
+        let img = &set.images[0];
+        let n = MAX_STORED_PREDS + 50;
+        // Confidences from 0.99 down to 0.30: some objects, the rest ignore regions.
+        let predictions: Vec<Prediction> = (0..n)
+            .map(|i| Prediction {
+                x_min: i,
+                y_min: 0,
+                x_max: i + 10,
+                y_max: 10,
+                confidence: 0.99 - 0.69 * i as f32 / (n - 1) as f32,
+                label: "person".into(),
+            })
+            .collect();
+        let last = Sample {
+            stages: [1.0; 4],
+            predictions,
+            eval: Vec::new(),
+        };
+        let (capped, _) = image_run(&set, img, &last, &[4.0], &[1.0], MAX_STORED_PREDS);
+        assert_eq!(capped.preds.len(), MAX_STORED_PREDS);
+        let (all, _) = image_run(&set, img, &last, &[4.0], &[1.0], usize::MAX);
+        assert_eq!(all.preds.len(), n);
+        let gt = pseudo_gt_boxes(&all.preds);
+        assert_eq!(gt.len(), n);
+        let objects = gt.iter().filter(|g| !g.ignore).count();
+        let expected = all
+            .preds
+            .iter()
+            .filter(|p| p.confidence >= PSEUDO_GT_CONFIDENCE)
+            .count();
+        assert_eq!(objects, expected);
+        assert!(
+            gt.iter().any(|g| g.ignore),
+            "low confidences are ignore regions"
+        );
+        assert!(gt.iter().all(|g| g.label == "person"));
     }
 }

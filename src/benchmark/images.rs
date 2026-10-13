@@ -12,8 +12,11 @@
 //!                 "size": 123456, "width": 640, "height": 480,
 //!                 "tags": ["day", "cctv", "complexity:easy", "res:sd", "small-objects"],
 //!                 "objects": [ { "label": "person", "bbox": [x_min, y_min, x_max, y_max],
-//!                                "ignore": false } ] } ] }
+//!                                "ignore": false, "crowd": false } ] } ] }
 //! ```
+//!
+//! `crowd` marks a COCO `iscrowd` region (it implies `ignore`; detections inside it are
+//! ignored by intersection over the detection's area, like pycocotools).
 //!
 //! A user directory may hold just a JSON array of `images` entries in `manifest.json` (tags, and
 //! `objects` as ground truth). Without ground truth a set is scored against pseudo ground truth
@@ -63,6 +66,10 @@ pub struct ManifestObject {
     pub bbox: BBox,
     #[serde(default)]
     pub ignore: bool,
+    /// A COCO `iscrowd` region (implies `ignore`): a detection inside it is ignored by
+    /// intersection over the detection's area, as pycocotools does, not by IoU.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub crowd: bool,
 }
 
 /// One image of a manifest.
@@ -479,7 +486,8 @@ fn manifest_image(i: &ManifestImage, path: PathBuf) -> SetImage {
                 .map(|o| GtBox {
                     label: o.label.clone(),
                     bbox: o.bbox,
-                    ignore: o.ignore,
+                    ignore: o.ignore || o.crowd,
+                    crowd: o.crowd,
                 })
                 .collect()
         }),
@@ -507,7 +515,13 @@ fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
 /// ground truth from `manifest.json`, else ground truth from `gt` (a COCO JSON file, or a
 /// directory of YOLO txt labels) or found automatically (`_annotations.coco.json`,
 /// `annotations.json`, `instances*.json`; `labels/` or `<stem>.txt` beside the images).
-pub fn load_dir(dir: &Path, gt: Option<&Path>, name: Option<&str>) -> Result<ImageSet> {
+/// Returns the set and warnings (images left out because the ground truth does not cover
+/// them or their size is unknown, duplicate COCO file names).
+pub fn load_dir(
+    dir: &Path,
+    gt: Option<&Path>,
+    name: Option<&str>,
+) -> Result<(ImageSet, Vec<String>)> {
     if !dir.is_dir() {
         bail!("benchmark image directory {} does not exist", dir.display());
     }
@@ -556,6 +570,7 @@ pub fn load_dir(dir: &Path, gt: Option<&Path>, name: Option<&str>) -> Result<Ima
             }
         });
     }
+    let mut warnings = Vec::new();
     let mut ground_truth = if images.iter().all(|i| i.gt.is_some()) {
         GroundTruth::Manifest
     } else {
@@ -569,7 +584,7 @@ pub fn load_dir(dir: &Path, gt: Option<&Path>, name: Option<&str>) -> Result<Ima
             None => find_coco(dir),
         };
         if let Some(p) = coco {
-            apply_coco(&mut images, &p)?;
+            warnings.extend(apply_coco(&mut images, &p)?);
             ground_truth = GroundTruth::Coco;
         } else {
             let labels = match gt {
@@ -577,7 +592,7 @@ pub fn load_dir(dir: &Path, gt: Option<&Path>, name: Option<&str>) -> Result<Ima
                 _ => find_yolo_labels(dir, &img_dir, &images),
             };
             if let Some(l) = labels {
-                apply_yolo(&mut images, &l, dir)?;
+                warnings.extend(apply_yolo(&mut images, &l, dir)?);
                 ground_truth = GroundTruth::Yolo;
             }
         }
@@ -587,7 +602,7 @@ pub fn load_dir(dir: &Path, gt: Option<&Path>, name: Option<&str>) -> Result<Ima
         _ => format!("{DIR_PREFIX}{}", dir.display()),
     };
     let m = manifest.unwrap_or_default();
-    Ok(ImageSet {
+    let set = ImageSet {
         title: if m.title.is_empty() {
             id.clone()
         } else {
@@ -602,7 +617,8 @@ pub fn load_dir(dir: &Path, gt: Option<&Path>, name: Option<&str>) -> Result<Ima
         ground_truth,
         scored_labels: m.scored_labels,
         images,
-    })
+    };
+    Ok((set, warnings))
 }
 
 fn find_coco(dir: &Path) -> Option<PathBuf> {
@@ -682,26 +698,80 @@ pub fn parse_coco(text: &str) -> Result<Vec<(String, Vec<GtBox>)>> {
             label: name.to_string(),
             bbox: [x, y, x + w, y + h],
             ignore: a.iscrowd != 0,
+            crowd: a.iscrowd != 0,
         });
     }
     Ok(out)
 }
 
-fn apply_coco(images: &mut [SetImage], path: &Path) -> Result<()> {
+/// Up to three of `files`, comma separated (warnings).
+fn examples(files: &[String]) -> String {
+    files.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+}
+
+/// Apply a COCO JSON to the images of a folder, matched by file name (the JSON's
+/// `file_name` without folders). Images the JSON does not list are not part of the annotated
+/// set and are left out (with a warning): counting their detections as false positives would
+/// be wrong. A JSON that lists none of the images is an error (another split, or file names
+/// that differ from the files on disk; BQ-08). Returns warnings.
+fn apply_coco(images: &mut Vec<SetImage>, path: &Path) -> Result<Vec<String>> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let parsed = parse_coco(&text).with_context(|| format!("in {}", path.display()))?;
-    for img in images.iter_mut() {
-        // Images not listed in the JSON have no objects.
-        img.gt = Some(
-            parsed
-                .iter()
-                .find(|(f, _)| *f == img.file)
-                .map(|(_, b)| b.clone())
-                .unwrap_or_default(),
+    let mut warnings = Vec::new();
+    let mut by_file: std::collections::HashMap<String, Vec<GtBox>> =
+        std::collections::HashMap::with_capacity(parsed.len());
+    let mut duplicates: Vec<String> = Vec::new();
+    for (file, boxes) in parsed {
+        if by_file.contains_key(&file) {
+            if !duplicates.contains(&file) {
+                duplicates.push(file);
+            }
+            continue;
+        }
+        by_file.insert(file, boxes);
+    }
+    if !duplicates.is_empty() {
+        warnings.push(format!(
+            "{} lists {} file name(s) more than once in different folders (e.g. {}). Images \
+             are matched by file name only, so the first entry was used; give the images \
+             unique file names.",
+            path.display(),
+            duplicates.len(),
+            examples(&duplicates)
+        ));
+    }
+    let total = images.len();
+    let mut unlisted = Vec::new();
+    images.retain_mut(|img| match by_file.get(&img.file) {
+        Some(b) => {
+            img.gt = Some(b.clone());
+            true
+        }
+        None => {
+            unlisted.push(img.file.clone());
+            false
+        }
+    });
+    if images.is_empty() {
+        bail!(
+            "the COCO annotations {} list none of the {total} images in the folder. They are \
+             probably for another split or name the files differently (case, extension). Point \
+             `gt` at the annotation file of these images.",
+            path.display()
         );
     }
-    Ok(())
+    if !unlisted.is_empty() {
+        warnings.push(format!(
+            "{} of {total} images are not listed in the COCO annotations {} (e.g. {}) and were \
+             left out of the set. They may be unannotated or the file names differ; add them \
+             to the annotations to score them.",
+            unlisted.len(),
+            path.display(),
+            examples(&unlisted)
+        ));
+    }
+    Ok(warnings)
 }
 
 fn find_yolo_labels(dir: &Path, img_dir: &Path, images: &[SetImage]) -> Option<PathBuf> {
@@ -785,42 +855,94 @@ pub fn parse_yolo_yaml(text: &str) -> Result<Vec<String>> {
     bail!("`names` must be a list or a map")
 }
 
-/// Parse one YOLO label file (`class cx cy w h`, normalized) into boxes for a `w x h` image.
+/// How far outside [0, 1] a normalized YOLO value may be (float noise of exporters) before it
+/// is an error; values within it are clamped.
+const YOLO_TOLERANCE: f32 = 1e-3;
+
+/// Parse one YOLO label file into boxes for a `w x h` image: `class cx cy w h` (normalized),
+/// or a YOLO segmentation polygon `class x1 y1 x2 y2 x3 y3 ...` (normalized, at least three
+/// points), taken as its bounding box. Every value must be a finite number in [0, 1]; errors
+/// name the line (BQ-09).
 pub fn parse_yolo(text: &str, names: &[String], w: u32, h: u32) -> Result<Vec<GtBox>> {
     let (w, h) = (w as f32, h as f32);
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
+        let n = n + 1;
         let f: Vec<&str> = line.split_whitespace().collect();
-        if f.is_empty() {
+        let Some((c, values)) = f.split_first() else {
             continue;
-        }
-        let [c, x, y, bw, bh, ..] = f.as_slice() else {
-            bail!("line {}: expected `class cx cy w h`", n + 1);
         };
         let cls: usize = c
             .parse()
-            .with_context(|| format!("line {}: bad class '{c}'", n + 1))?;
-        let num = |s: &str| {
-            s.parse::<f32>()
-                .with_context(|| format!("line {}: bad number", n + 1))
+            .with_context(|| format!("line {n}: bad class '{c}'"))?;
+        let v = values
+            .iter()
+            .map(|s| {
+                let x: f32 = s
+                    .parse()
+                    .with_context(|| format!("line {n}: bad number '{s}'"))?;
+                if !x.is_finite() || !(-YOLO_TOLERANCE..=1.0 + YOLO_TOLERANCE).contains(&x) {
+                    bail!(
+                        "line {n}: '{s}' is not a normalized coordinate (YOLO labels hold \
+                         values in 0..1, relative to the image size)"
+                    );
+                }
+                Ok(x.clamp(0.0, 1.0))
+            })
+            .collect::<Result<Vec<f32>>>()?;
+        let bbox = match v.as_slice() {
+            [cx, cy, bw, bh] => {
+                let (cx, cy, bw, bh) = (cx * w, cy * h, bw * w, bh * h);
+                [cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0]
+            }
+            pts if pts.len() >= 6 && pts.len() % 2 == 0 => {
+                let xs = pts.iter().step_by(2);
+                let ys = pts.iter().skip(1).step_by(2);
+                let (x0, x1) = xs.fold((1f32, 0f32), |(a, b), &x| (a.min(x), b.max(x)));
+                let (y0, y1) = ys.fold((1f32, 0f32), |(a, b), &y| (a.min(y), b.max(y)));
+                [x0 * w, y0 * h, x1 * w, y1 * h]
+            }
+            _ => bail!(
+                "line {n}: expected `class cx cy w h` or a polygon `class x1 y1 x2 y2 x3 y3 \
+                 ...`, found {} values",
+                v.len()
+            ),
         };
-        let v = [num(x)?, num(y)?, num(bw)?, num(bh)?];
         let label = names
             .get(cls)
             .cloned()
             .unwrap_or_else(|| format!("class{cls}"));
-        let (cx, cy, bw, bh) = (v[0] * w, v[1] * h, v[2] * w, v[3] * h);
         out.push(GtBox {
             label,
-            bbox: [cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0],
+            bbox,
             ignore: false,
+            crowd: false,
         });
     }
     Ok(out)
 }
 
-fn apply_yolo(images: &mut [SetImage], labels: &Path, dir: &Path) -> Result<()> {
+/// Apply YOLO txt labels to the images of a folder. An image whose size could not be read
+/// (its normalized boxes can not be placed) is left out with a warning (BQ-09). Returns
+/// warnings.
+fn apply_yolo(images: &mut Vec<SetImage>, labels: &Path, dir: &Path) -> Result<Vec<String>> {
     let names = yolo_class_names(&[labels, dir])?;
+    let mut unreadable = Vec::new();
+    images.retain(|img| {
+        let ok = img.width > 0 && img.height > 0;
+        if !ok {
+            unreadable.push(img.file.clone());
+        }
+        ok
+    });
+    if images.is_empty() {
+        bail!(
+            "none of the images in {} could be read (e.g. {}). The files are probably damaged \
+             or not JPEG/PNG; replace them.",
+            dir.display(),
+            unreadable.first().map_or("", String::as_str)
+        );
+    }
     for img in images.iter_mut() {
         let stem = Path::new(&img.file)
             .file_stem()
@@ -834,7 +956,18 @@ fn apply_yolo(images: &mut [SetImage], labels: &Path, dir: &Path) -> Result<()> 
                 .with_context(|| format!("in {}", p.display()))?,
         );
     }
-    Ok(())
+    let mut warnings = Vec::new();
+    if !unreadable.is_empty() {
+        warnings.push(format!(
+            "{} image(s) in {} could not be read (e.g. {}) and were left out of the set: their \
+             YOLO boxes can not be placed without the image size. The files are probably \
+             damaged; replace them.",
+            unreadable.len(),
+            dir.display(),
+            examples(&unreadable)
+        ));
+    }
+    Ok(warnings)
 }
 
 /// Datasets resolved for a run.
@@ -912,18 +1045,38 @@ pub fn validate(refs: &[DatasetRef], data_root: &Path) -> Result<()> {
 
 /// Load the referenced datasets, each limited to `max_images` (0 = all). Built-in sets use the
 /// files present under `<data_root>/bench/<id>/`; a set with none is listed in
-/// [`Resolved::not_downloaded`]. When nothing is left, the embedded sample is used (with a
-/// warning), so a run always has an image.
+/// [`Resolved::not_downloaded`]. A folder that can not be loaded (no images, ground truth
+/// that does not parse or matches none of its images) is skipped with a warning like a
+/// missing built-in set, unless that leaves no dataset at all: then its error fails the run
+/// (benchmarking the sample instead of the user's own folder would mislead; BQ-10). A set
+/// whose id repeats an earlier one is skipped with a warning. When nothing is left otherwise,
+/// the embedded sample is used (with a warning), so a run always has an image.
 pub fn resolve(refs: &[DatasetRef], data_root: &Path, max_images: usize) -> Result<Resolved> {
     validate(refs, data_root)?;
     let mut out = Resolved::default();
+    let mut dir_error: Option<anyhow::Error> = None;
     for d in refs {
         let mut set = match dir_of(d, data_root) {
             Some((dir, gt, name)) => {
                 // The id stays as configured (`dir:<path>` or the name).
                 let id = name.unwrap_or_else(|| d.label());
-                load_dir(&dir, gt.as_deref(), Some(&id))
-                    .with_context(|| format!("dataset {}", d.label()))?
+                match load_dir(&dir, gt.as_deref(), Some(&id)) {
+                    Ok((set, warnings)) => {
+                        out.warnings
+                            .extend(warnings.into_iter().map(|w| format!("dataset {id}: {w}")));
+                        set
+                    }
+                    Err(e) => {
+                        let e = e.context(format!("dataset {}", d.label()));
+                        out.warnings.push(format!(
+                            "{}. The folder was skipped; fix it or remove it from the \
+                             benchmark datasets.",
+                            format!("{e:#}").trim_end_matches('.')
+                        ));
+                        dir_error.get_or_insert(e);
+                        continue;
+                    }
+                }
             }
             None => {
                 let id = d.label();
@@ -957,10 +1110,20 @@ pub fn resolve(refs: &[DatasetRef], data_root: &Path, max_images: usize) -> Resu
             }
         };
         if out.sets.iter().any(|s| s.id == set.id) {
+            out.warnings.push(format!(
+                "dataset {} is listed more than once (or two folders share the name {}); only \
+                 the first was used. Give each folder dataset a distinct name.",
+                set.id, set.id
+            ));
             continue;
         }
         set.limit(max_images);
         out.sets.push(set);
+    }
+    if out.sets.is_empty()
+        && let Some(e) = dir_error
+    {
+        return Err(e);
     }
     if out.sets.is_empty() {
         out.warnings
@@ -1065,6 +1228,11 @@ mod tests {
         assert_eq!(p[0].1[0].label, "car");
         assert_eq!(p[0].1[0].bbox, [10.0, 20.0, 40.0, 60.0]);
         assert!(p[0].1[1].ignore);
+        assert!(
+            p[0].1[1].crowd,
+            "iscrowd regions match by intersection over detection"
+        );
+        assert!(!p[0].1[0].crowd);
         assert!(parse_coco("{").is_err());
     }
 
@@ -1098,6 +1266,151 @@ mod tests {
         }
     }
 
+    /// YOLO values must be finite and normalized (the error names the line); polygons give
+    /// their bounding box; other field counts are errors (BQ-09).
+    #[test]
+    fn yolo_labels_are_validated() {
+        let names = vec!["person".to_string()];
+        for (text, line) in [
+            ("0 nan 0.5 0.1 0.1", 1),
+            ("0 0.5 0.5 0.1 0.1\n0 inf 0.5 0.1 0.1", 2),
+            ("0 0.5 -0.5 0.1 0.1", 1),
+            ("\n\n0 0.5 0.5 1.5 0.1", 3),
+            ("0 0.5 0.5 0.1 0.1 0.2", 1),
+            ("0 0.1 0.1 0.2 0.2", 0),
+        ] {
+            let r = parse_yolo(text, &names, 100, 100);
+            if line == 0 {
+                assert!(r.is_ok(), "{text}");
+                continue;
+            }
+            let e = format!("{:#}", r.unwrap_err());
+            assert!(e.contains(&format!("line {line}:")), "{text}: {e}");
+        }
+        // Exporter float noise just above 1 is clamped.
+        let b = parse_yolo("0 0.5 0.5 1.0005 1.0", &names, 100, 100).unwrap();
+        assert_eq!(b[0].bbox, [0.0, 0.0, 100.0, 100.0]);
+        // A segmentation polygon (triangle) becomes its bounding box.
+        let b = parse_yolo("0 0.1 0.2 0.5 0.9 0.3 0.4", &names, 200, 100).unwrap();
+        assert_eq!(b[0].bbox, [20.0, 20.0, 100.0, 90.0]);
+        assert!(
+            parse_yolo("0 0.1 0.2 0.5 0.9", &names, 200, 100).is_ok(),
+            "a plain box"
+        );
+        assert!(parse_yolo("0 0.1 0.2 0.5 0.9 0.3", &names, 200, 100).is_err());
+    }
+
+    /// A temp folder with `files` copied from the fixture image (or given bytes).
+    fn temp_set(files: &[(&str, Option<&[u8]>)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bop-set-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpg = std::fs::read(fixture().join("plain-dir/a.jpg")).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes.unwrap_or(&jpg)).unwrap();
+        }
+        dir
+    }
+
+    /// A COCO JSON is matched by file name: unlisted images are left out with a warning,
+    /// duplicate base names warn, and a JSON that lists none of the images is an error
+    /// (BQ-08).
+    #[test]
+    fn coco_json_must_match_the_images() {
+        let dir = temp_set(&[("a.jpg", None), ("b.jpg", None)]);
+        let coco = |files: &[&str]| {
+            let images: Vec<String> = files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| format!(r#"{{"id":{i},"file_name":"{f}"}}"#))
+                .collect();
+            format!(
+                r#"{{"images":[{}],"annotations":[{{"image_id":0,"category_id":1,"bbox":[1,1,5,5]}}],
+                   "categories":[{{"id":1,"name":"person"}}]}}"#,
+                images.join(",")
+            )
+        };
+        let ann = dir.join("annotations.json");
+        std::fs::write(&ann, coco(&["x/a.jpg", "y/a.jpg"])).unwrap();
+        let (set, warnings) = load_dir(&dir, None, Some("s")).unwrap();
+        assert_eq!(set.ground_truth, GroundTruth::Coco);
+        let files: Vec<&str> = set.images.iter().map(|i| i.file.as_str()).collect();
+        assert_eq!(files, ["a.jpg"]);
+        assert_eq!(
+            set.images[0].gt.as_ref().unwrap().len(),
+            1,
+            "first entry wins"
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("more than once")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("1 of 2 images") && w.contains("b.jpg"))
+        );
+
+        // Another split: nothing matches.
+        std::fs::write(&ann, coco(&["000000000139.jpg"])).unwrap();
+        let e = format!("{:#}", load_dir(&dir, None, None).unwrap_err());
+        assert!(e.contains("list none of the 2 images"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With YOLO labels, an image whose size can not be read is left out with a warning.
+    #[test]
+    fn yolo_images_of_unknown_size_are_left_out() {
+        let dir = temp_set(&[("a.jpg", None), ("bad.jpg", Some(b"not an image"))]);
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("labels/a.txt"), "0 0.5 0.5 0.5 0.5\n").unwrap();
+        std::fs::write(dir.join("labels/bad.txt"), "0 0.5 0.5 0.5 0.5\n").unwrap();
+        let (set, warnings) = load_dir(&dir, None, None).unwrap();
+        assert_eq!(set.ground_truth, GroundTruth::Yolo);
+        assert_eq!(set.images.len(), 1);
+        assert_eq!(set.images[0].file, "a.jpg");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bad.jpg"), "{warnings:?}");
+        // A bad value fails the folder with the file and line.
+        std::fs::write(dir.join("labels/a.txt"), "0 0.5 0.5 0.5 0.5\n0 nan 0 0 0\n").unwrap();
+        let e = format!("{:#}", load_dir(&dir, None, None).unwrap_err());
+        assert!(e.contains("a.txt") && e.contains("line 2"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A folder that does not load is skipped with a warning while other sets remain, and
+    /// fails the run when it was the only one; a repeated id warns (BQ-10).
+    #[test]
+    fn bad_folders_and_duplicate_ids() {
+        let empty = std::env::temp_dir().join(format!("bop-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let bad = DatasetRef::Id(format!("dir:{}", empty.display()));
+        let root = fixture();
+        let r = resolve(&[DatasetRef::Id("sample".into()), bad.clone()], &root, 0).unwrap();
+        assert_eq!(r.sets.len(), 1);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("no .jpg") && w.contains("skipped")),
+            "{:?}",
+            r.warnings
+        );
+        let e = format!("{:#}", resolve(&[bad], &root, 0).unwrap_err());
+        assert!(e.contains("no .jpg"), "{e}");
+
+        let named = |dir: &str| DatasetRef::Dir {
+            dir: dir.into(),
+            gt: None,
+            name: Some("mine".into()),
+        };
+        let r = resolve(&[named("coco-dir"), named("yolo-dir")], &root, 0).unwrap();
+        assert_eq!(r.sets.len(), 1);
+        assert_eq!(r.sets[0].ground_truth, GroundTruth::Coco);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("more than once")),
+            "{:?}",
+            r.warnings
+        );
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
     #[test]
     fn oversized_image_files_are_rejected() {
         let dir = std::env::temp_dir().join(format!("bop-img-{}", uuid::Uuid::new_v4()));
@@ -1112,7 +1425,9 @@ mod tests {
 
     #[test]
     fn user_dirs_with_coco_yolo_or_nothing() {
-        let coco = load_dir(&fixture().join("coco-dir"), None, Some("mine")).unwrap();
+        let coco = load_dir(&fixture().join("coco-dir"), None, Some("mine"))
+            .unwrap()
+            .0;
         assert_eq!(coco.id, "mine");
         assert_eq!(coco.ground_truth, GroundTruth::Coco);
         assert_eq!(coco.images.len(), 2);
@@ -1120,7 +1435,7 @@ mod tests {
         assert_eq!(coco.images[1].gt.as_ref().unwrap().len(), 0);
         assert_eq!(coco.images[0].gt.as_ref().unwrap()[0].label, "person");
 
-        let yolo = load_dir(&fixture().join("yolo-dir"), None, None).unwrap();
+        let yolo = load_dir(&fixture().join("yolo-dir"), None, None).unwrap().0;
         assert_eq!(yolo.ground_truth, GroundTruth::Yolo);
         assert!(yolo.id.starts_with(DIR_PREFIX));
         let gt = yolo.images[0].gt.as_ref().unwrap();
@@ -1128,7 +1443,9 @@ mod tests {
         // 64x48 image, box centered, half size.
         assert_eq!(gt[0].bbox, [16.0, 12.0, 48.0, 36.0]);
 
-        let plain = load_dir(&fixture().join("plain-dir"), None, None).unwrap();
+        let plain = load_dir(&fixture().join("plain-dir"), None, None)
+            .unwrap()
+            .0;
         assert_eq!(plain.ground_truth, GroundTruth::None);
         assert!(!plain.annotated());
 
@@ -1244,8 +1561,20 @@ mod tests {
                 for o in i.objects.iter().flatten() {
                     let c = super::super::metrics::canonical_label(&o.label);
                     assert!(coco.contains(&c), "{}: {}", m.id, o.label);
+                    assert!(!o.crowd || o.ignore, "a crowd region is an ignore region");
                 }
             }
         }
+        // coco-cctv's ignore regions are COCO `iscrowd` boxes: matched like pycocotools
+        // (intersection over the detection, BQ-06).
+        let coco_cctv = builtin_manifest("coco-cctv").unwrap();
+        let ignored: Vec<&ManifestObject> = coco_cctv
+            .images
+            .iter()
+            .flat_map(|i| i.objects.iter().flatten())
+            .filter(|o| o.ignore)
+            .collect();
+        assert!(!ignored.is_empty());
+        assert!(ignored.iter().all(|o| o.crowd));
     }
 }

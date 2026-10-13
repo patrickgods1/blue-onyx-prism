@@ -1053,6 +1053,7 @@ pub(crate) mod tests {
             label: label.into(),
             bbox: b,
             ignore,
+            crowd: false,
         }
     }
 

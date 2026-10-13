@@ -6,6 +6,7 @@
   "allow_large_downloads": false,
   "openvino_dir": "/opt/intel/openvino",
   "onnxruntime_dir": "/app/onnxruntime",
+  "download_dir": "/app/data",
   "models_dir": "/app/models",
   "cache_dir": "/app/cache",
   "models": [

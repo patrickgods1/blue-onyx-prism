@@ -39,14 +39,19 @@ fn main() -> ExitCode {
         Ok(cwd) => cli.absolutized(&cwd),
         Err(_) => cli,
     };
-    match run(cli) {
+    let code = match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e:#}");
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    };
+    // Commands that never set up logging still show what config handling had to say (CO-11).
+    for (level, msg) in blue_onyx_prism::logbuf::take_early() {
+        eprintln!("{level}: {msg}");
     }
+    code
 }
 
 /// `--config` or the default config path.
@@ -360,17 +365,34 @@ fn run(cli: Cli) -> Result<()> {
         None => {}
     }
 
-    let (config, config_path) = cli::resolve_config(&cli)?;
+    let (mut config, config_path) = cli::resolve_config(&cli)?;
+    // CO-05: no models -> the default catalog model, so the UI comes up (and it downloads).
+    cli::seed_default_model(&mut config, &config_path);
     // Initialized once; later level changes go through the reload handle (web UI, restart).
-    let log = cli::init_logging(config.log_level, config.log_path.as_deref())?;
+    // A relative `log_path` from the file resolves against the exe dir, as in the service
+    // (CO-10; a `--log-path` typed on the command line is already absolute). A log dir that
+    // cannot be created falls back to stdout with a warning (CO-11).
+    let log_path = config
+        .log_path
+        .as_deref()
+        .map(blue_onyx_prism::resolve_path);
+    let log = cli::init_logging_opts(
+        config.log_level,
+        log_path.as_deref(),
+        config.log_format,
+        None,
+    )?;
     cli::log_startup_warnings(&config);
     info!(
         version = blue_onyx_prism::VERSION,
+        git_sha = blue_onyx_prism::GIT_SHA,
+        build_date = blue_onyx_prism::BUILD_DATE,
         os = %system_info::os_description(),
         cpu = %system_info::cpu_name(),
         memory_gb = ?system_info::total_memory_gb(),
         config = %config_path.display(),
-        "starting Blue Onyx Prism"
+        "starting Blue Onyx Prism {}",
+        blue_onyx_prism::long_version()
     );
     runner::ensure_models(&config, &config_path)?;
 
@@ -380,11 +402,46 @@ fn run(cli: Cli) -> Result<()> {
         let token = shutdown.clone();
         rt.spawn(async move {
             wait_for_signal().await;
-            info!("shutdown requested");
+            info!(
+                "shutdown requested; waiting for running work to finish (press Ctrl-C again \
+                 to exit at once)"
+            );
             token.cancel();
+            spawn_shutdown_deadline();
+            // CO-12: a second signal exits at once.
+            wait_for_signal().await;
+            eprintln!("second interrupt: exiting without waiting for running work");
+            std::process::exit(130);
         });
     }
-    runner::run_server_on(&rt, config, config_path, log, shutdown)
+    let result = runner::run_server_on(&rt, config, config_path, log, shutdown);
+    // Blocking tasks (file browsing, a cancelled benchmark or export step) get a bounded
+    // grace period instead of holding the process.
+    rt.shutdown_timeout(runner::RUNTIME_SHUTDOWN_GRACE);
+    result
+}
+
+/// CO-12: after a shutdown request the process exits within [`runner::SHUTDOWN_DEADLINE`]
+/// even when a worker is stuck (e.g. a GPU compile that takes minutes).
+fn spawn_shutdown_deadline() {
+    let spawned = std::thread::Builder::new()
+        .name("shutdown-deadline".into())
+        .spawn(|| {
+            std::thread::sleep(runner::SHUTDOWN_DEADLINE);
+            error!(
+                "shutdown did not finish within {} s (a model compile or a request is still \
+                 running); exiting anyway",
+                runner::SHUTDOWN_DEADLINE.as_secs()
+            );
+            eprintln!(
+                "shutdown did not finish within {} s; exiting anyway",
+                runner::SHUTDOWN_DEADLINE.as_secs()
+            );
+            std::process::exit(1);
+        });
+    if let Err(e) = spawned {
+        error!("could not start the shutdown deadline thread: {e}");
+    }
 }
 
 async fn wait_for_signal() {
