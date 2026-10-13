@@ -1997,10 +1997,18 @@ mod tests {
         assert_eq!((v, warned), (3, 0));
         assert_eq!(state.detail().as_deref(), Some("compiling on openvino:gpu"));
         // Slow compile: the first warning after `after`, repeated at most every `after`.
+        let t = Instant::now();
         let (_, warned) = watch_slow_compile("m", "openvino:gpu", &state, slow, || {
             std::thread::sleep(Duration::from_millis(150));
         });
-        assert!((1..=3).contains(&warned), "{warned}");
+        // The sleep can overrun on a loaded CI runner, so bound the count by the time that
+        // actually passed: one warning per `after`, plus one for the first.
+        let max = u32::try_from(t.elapsed().as_millis() / 40).unwrap_or(u32::MAX) + 1;
+        assert!(
+            (1..=max).contains(&warned),
+            "{warned} warnings in {:?}",
+            t.elapsed()
+        );
         let d = state.detail().unwrap();
         assert!(d.starts_with(COMPILING_ON), "{d}");
         assert_eq!(d, "compiling on openvino:gpu for 0 min");
