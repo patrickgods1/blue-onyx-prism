@@ -343,10 +343,8 @@ pub(crate) fn core_set_property_variadic(
     // field is that pointer (size asserted above); `core` outlives the call and the C strings
     // are NUL-terminated and alive for the call.
     unsafe {
-        let lib = libloading::Library::new(&path).map_err(|e| dl_error(&e))?;
-        let set: libloading::Symbol<SetProperty> = lib
-            .get(b"ov_core_set_property\0")
-            .map_err(|e| dl_error(&e))?;
+        let lib = open(&path)?;
+        let set = symbol::<SetProperty>(&lib, b"ov_core_set_property\0")?;
         let raw: *const c_void = std::mem::transmute_copy(core);
         let status = set(raw, device.as_ptr(), key.as_ptr(), value.as_ptr());
         if status == 0 {
@@ -811,6 +809,49 @@ pub(crate) fn dl_error(e: &libloading::Error) -> String {
         cause = c.source();
     }
     text
+}
+
+/// [`libloading::Library::new`] with the OS cause in the error text ([`dl_error`]).
+///
+/// # Safety
+/// Same contract as [`libloading::Library::new`]: the library's initializers run, and the
+/// caller is responsible for them being sound to run.
+#[cfg_attr(
+    not(any(
+        windows,
+        target_os = "linux",
+        all(target_vendor = "apple", target_arch = "aarch64"),
+        feature = "onnxruntime"
+    )),
+    allow(dead_code)
+)]
+pub(crate) unsafe fn open(
+    path: impl libloading::AsFilename,
+) -> Result<libloading::Library, String> {
+    // SAFETY: upheld by the caller (see `# Safety`).
+    unsafe { libloading::Library::new(path) }.map_err(|e| dl_error(&e))
+}
+
+/// [`libloading::Library::get`] with the OS cause in the error text ([`dl_error`]).
+///
+/// # Safety
+/// Same contract as [`libloading::Library::get`]: `T` must match the symbol's real type, and
+/// the caller is responsible for how the symbol is used.
+#[cfg_attr(
+    not(any(
+        windows,
+        target_os = "linux",
+        all(target_vendor = "apple", target_arch = "aarch64"),
+        feature = "onnxruntime"
+    )),
+    allow(dead_code)
+)]
+pub(crate) unsafe fn symbol<'a, T>(
+    lib: &'a libloading::Library,
+    name: &[u8],
+) -> Result<libloading::Symbol<'a, T>, String> {
+    // SAFETY: upheld by the caller (see `# Safety`).
+    unsafe { lib.get(name) }.map_err(|e| dl_error(&e))
 }
 
 /// Load one CUDA library by absolute path and keep it loaded.

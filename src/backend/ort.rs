@@ -74,11 +74,12 @@ fn library_version(path: &Path) -> Result<String> {
     // the declared signature in every ONNX Runtime release (C API, `onnxruntime_c_api.h`), the
     // returned struct is static and `GetVersionString` returns a static NUL-terminated string.
     unsafe {
-        let lib = libloading::Library::new(path)
-            .with_context(|| format!("loading {}", path.display()))?;
-        let get: libloading::Symbol<GetApiBase> = lib
-            .get(b"OrtGetApiBase\0")
-            .with_context(|| format!("{} does not export OrtGetApiBase", path.display()))?;
+        let lib = crate::backend::libs::open(path)
+            .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))?;
+        let get =
+            crate::backend::libs::symbol::<GetApiBase>(&lib, b"OrtGetApiBase\0").map_err(|e| {
+                anyhow::anyhow!("{} does not export OrtGetApiBase: {e}", path.display())
+            })?;
         let base = get();
         if base.is_null() {
             bail!("{}: OrtGetApiBase returned null", path.display());
@@ -135,7 +136,11 @@ fn load_library(path: &Path) -> Result<LoadedLib> {
         if dml.is_file() {
             match ::ort::util::preload_dylib(&dml) {
                 Ok(()) => tracing::debug!("preloaded {}", dml.display()),
-                Err(e) => tracing::warn!("could not preload {}: {e}", dml.display()),
+                Err(e) => tracing::warn!(
+                    "could not preload {}: {}",
+                    dml.display(),
+                    crate::backend::libs::dl_error(&e)
+                ),
             }
         }
     }
