@@ -284,7 +284,9 @@ pub struct Config {
     /// Keep the saved-image folder under this many MB, oldest files deleted first
     /// (0 = unlimited). Applies at once.
     pub save_image_max_mb: u64,
-    /// CPU inference threads (0 = OpenVINO default).
+    /// CPU inference threads (0 = all physical cores but one on machines with at least 4 cores,
+    /// every core on smaller ones; the OS and the desktop keep a core; see
+    /// [`crate::backend::cpu_threads`]). Restart.
     pub intra_threads: usize,
     /// Decode + preprocess threads shared by every model (0 = from the hardware profile:
     /// `clamp(cores / 2, 1, 8)`, at most 2 when every model runs on the CPU). Restart.
@@ -293,8 +295,8 @@ pub struct Config {
     /// see [`crate::profile::Profile::tuning_for`]); a model's own `inflight` wins. Restart.
     pub inflight: usize,
     /// ONNX Runtime sessions per model, one inference in flight each (0 = from the hardware
-    /// profile: 2 on a high-spec machine with an NVIDIA GPU, else 1). Each session holds its own
-    /// copy of the model. Restart.
+    /// profile: 2 on a machine with a discrete GPU of at least 4 GB and 8 GB of memory, else 1).
+    /// Each session holds its own copy of the model, one inference in flight each. Restart.
     pub ort_sessions: usize,
     /// `auto` (classify the hardware) or a forced class: `low`, `mid`, `high`. Restart.
     pub hardware_profile: crate::profile::HardwareProfile,
@@ -391,6 +393,10 @@ pub struct BenchmarkConfig {
     /// What the accuracy grade, the ranking and the device recommendation use: `ap50` (default,
     /// box-level AP@0.5 with small-object recall) or `roc_auc` (macro frame-level ROC AUC).
     pub accuracy_metric: crate::benchmark::grade::AccuracyMetric,
+    /// Run benchmarks at below-normal process priority so the desktop stays responsive
+    /// (Windows: the whole service for the run, restored after; CLI on Unix: nice 10). Applies
+    /// at once.
+    pub low_priority: bool,
 }
 
 impl Default for BenchmarkConfig {
@@ -410,6 +416,7 @@ impl Default for BenchmarkConfig {
             auto_download_datasets: true,
             threshold_objective: Default::default(),
             accuracy_metric: Default::default(),
+            low_priority: true,
         }
     }
 }
@@ -1277,6 +1284,13 @@ mod tests {
         assert_eq!((c.benchmark.warmup, c.benchmark.repeat_per_image), (3, 1));
         assert!(c.benchmark.auto_download_datasets);
         assert!((c.benchmark.weights.accuracy - 0.6).abs() < 1e-12);
+        assert!(c.benchmark.low_priority);
+        let c: super::Config =
+            serde_json::from_str(r#"{"benchmark":{"low_priority":false}}"#).unwrap();
+        assert!(!c.benchmark.low_priority);
+        assert_eq!(c.benchmark.warmup, 3);
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(text.contains(r#""low_priority":false"#), "{text}");
         // Partial sections keep the other defaults; all dataset spellings parse.
         let c: super::Config = serde_json::from_str(
             r#"{"benchmark":{"datasets":["coco-cctv","dir:/srv/alerts",

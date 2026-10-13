@@ -150,12 +150,12 @@ pub(crate) fn apply_core_properties(
             set_prop(core, dev, RwPropertyKey::CacheDir, c);
         }
         set_prop(core, dev, RwPropertyKey::HintPerformanceMode, "LATENCY");
-        if *dev == DeviceType::CPU && opts.intra_threads > 0 {
+        if *dev == DeviceType::CPU {
             set_prop(
                 core,
                 dev,
                 RwPropertyKey::InferenceNumThreads,
-                &opts.intra_threads.to_string(),
+                &super::cpu_threads::effective(opts.intra_threads).to_string(),
             );
         }
     }

@@ -41,8 +41,11 @@ fails, and always ends on the CPU. Ranking: discrete GPUs first (larger VRAM fir
 runtimes in order: NVIDIA `ort:cuda`, `ort:tensorrt`, then `ort:directml` (Windows); Intel Arc
 `openvino:gpu.N`, then `ort:directml`; AMD/other `ort:directml` (Windows). Then integrated GPUs (Intel
 via OpenVINO; DirectML on Windows for the others), Apple silicon (CoreML), and the CPU (`openvino:cpu`,
-else `ort:cpu`). An NVIDIA GPU the pinned ONNX Runtime CUDA build has no kernels for (e.g. a Pascal GTX
-10xx on Windows) skips CUDA/TensorRT and starts at DirectML.
+else `ort:cpu`). An NVIDIA GPU the ONNX Runtime CUDA build has no kernels for skips CUDA: the 1.31.0 CUDA 12
+build covers compute capability 6.1 (GTX 10-series), 7.5, 8.6, 8.9 and 12.0 on Windows, and 6.0 through
+12.0 (10.0 excepted) on Linux; `list-devices` and the device dropdown show the reason, and an installed
+older build that lacks the kernels is offered as an update. TensorRT 10 needs 7.5+ (Turing or newer), and
+a driver that cannot run CUDA 12 (older than R525) skips both. Such a card starts at DirectML on Windows.
 
 When `benchmark.json` (written by `benchmark` next to the config) has results for a model, `auto` orders
 that model's devices by measured speed instead: the devices `benchmark` would recommend (ran, agree with
@@ -53,10 +56,10 @@ the models are (re)loaded. `list-devices` marks such a model's order "(benchmark
 | OS | GPU | `auto` picks | Setup | Notes |
 |---|---|---|---|---|
 | Windows | Intel iGPU/Arc | `openvino:gpu` | `setup-openvino` | Primary target. `ort:directml` is selectable. |
-| Windows | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12 and cuDNN 9 are installed by you (not bundled). Without them `auto` skips CUDA; with the DirectML flavor (or a Pascal card) it is `ort:directml`, ahead of an Intel iGPU. |
+| Windows | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12.8 and cuDNN 9.10 come from `nvidia-cuda-libs` (1.9 GB, `allow_large_downloads`) or your own install. Without them, or with the DirectML flavor loaded, `auto` is `ort:directml`, ahead of an Intel iGPU. GTX 10-series (Pascal, 6.1) cards run CUDA since the 1.31.0 build; TensorRT needs Turing or newer. |
 | Windows | AMD / other DX12 | `ort:directml` | `setup-onnxruntime --flavor directml` | |
 | Linux | Intel | `openvino:gpu` | `setup-openvino` | `intel-opencl-icd`, `render` group. |
-| Linux | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12 + cuDNN 9 user-installed. |
+| Linux | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12.8 + cuDNN 9.10 from `nvidia-cuda-libs` or your own install; Pascal (6.0) and newer. |
 | Linux | AMD | `openvino:cpu` | `setup-openvino` | No ROCm/MIGraphX in the stock ONNX Runtime packages: CPU. |
 | macOS arm64 | Apple GPU | `ort:coreml` | `setup-onnxruntime` | RT-DETRv2 runs on CoreML (~1.6-1.9x `openvino:cpu` on an M1) because its batch dimension is pinned to 1; an RT-DETR export with an unnamed dynamic dimension is refused there (MPSGraph would abort) and uses the CPU. YOLO26 needs the `.onnx` export. |
 | any | none | `openvino:cpu` | `setup-openvino` | `ort:cpu` if OpenVINO is missing. |
@@ -147,9 +150,15 @@ blue-onyx-prism fetch --all-for-platform  # everything for this OS/arch (large o
   JSON (each row has a `group`; local files are in `localModels`).
   Device options that need a download show "will download ... (size)" in the Device dropdown;
   choosing one and saving starts the download and switches when it is installed.
-- **NVIDIA CUDA libraries (opt-in):** `ort:cuda` needs CUDA 12 and cuDNN 9. If they are not
+- **Versions:** the `cpu`, `directml` and `coreml` flavors are ONNX Runtime 1.24.4, the last release
+  Microsoft publishes with the DirectML provider (the 1.25+ Windows packages have none; DirectML itself is
+  in sustained engineering). The `cuda` flavor is 1.31.0 (the `gpu_cuda12` archive), whose Windows build
+  has Pascal kernels again. A process loads one flavor, so the versions need not match; an installed
+  flavor older than the catalog's shows *update to ...* on the Resources card and `list-resources`.
+- **NVIDIA CUDA libraries (opt-in):** `ort:cuda` needs CUDA 12.8 and cuDNN 9. If they are not
   installed, the `nvidia-cuda-libs` resource (about 1.9 GB on Windows, 1.7 GB on Linux: cudart,
-  cuBLAS, cuDNN, cuFFT, cuRAND, nvJitLink, NVRTC from NVIDIA's PyPI wheels) provides them. It is
+  cuBLAS, cuDNN 9.10 (the last with kernels for GTX 10-series cards), cuFFT, cuRAND, nvJitLink, NVRTC
+  from NVIDIA's PyPI wheels) provides them. It is
   only downloaded with `allow_large_downloads`, `fetch --allow-large` or
   `fetch --resource nvidia-cuda-libs`, and the libraries are covered by the
   [NVIDIA Software License Agreement](https://docs.nvidia.com/cuda/eula/) (CUDA, cuDNN
@@ -239,10 +248,10 @@ it; every key can also be set in the file.
 | `save_image_max_age_days` | `30` | Delete saved images (`.jpg`/`.jpeg`/`.png` directly in `save_image_path`) older than this many days, 0 = keep; checked every 10 minutes. Integer 0-3650. Applies: at once. UI: yes |
 | `save_image_max_mb` | `2048` | Keep the saved-image folder under this many MB, deleting the oldest first, 0 = unlimited. Integer 0-1000000. Applies: at once. UI: yes |
 | `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. Integer 1000-1000000000. Applies: at once. UI: no |
-| `intra_threads` | `0` | CPU inference threads (0 = OpenVINO default; try 4 of 6 cores). Integer 0-256. Applies: restart. UI: yes |
+| `intra_threads` | `0` | CPU inference threads: 0 = all physical cores but one on machines with at least 4 cores (the OS, the HTTP threads and the desktop keep a core), every core on smaller ones; set it to use every core. Server and benchmark alike. Integer 0-256. Applies: restart. UI: yes |
 | `preprocess_threads` | `0` | Decode + preprocess threads shared by every model; 0 = from the hardware profile (half the cores, 1-8; at most 2 when every model runs on the CPU). Integer 0-256. Applies: restart. UI: no |
 | `inflight` | `0` | Concurrent inferences per model; 0 = from the hardware profile and the model's device. A model's own `inflight` wins. Integer 0-64. Applies: restart. UI: no |
-| `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model; 0 = from the hardware profile (2 on a high-spec machine with an NVIDIA GPU, else 1). Integer 0-16. Applies: restart. UI: no |
+| `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model; 0 = from the hardware profile (2 with a discrete GPU of at least 4 GB and 8 GB of memory, so the GPU overlaps one request's compute with the other's copy and NMS; else 1). Integer 0-16. Applies: restart. UI: no |
 | `hardware_profile` | `"auto"` | Hardware class the `0` defaults above come from: `auto` (classified from cores, RAM and GPUs) or forced `low`, `mid`, `high`. Applies: restart. UI: no |
 | `models_dir` | `"models"` | Where `download-models` and exports put files. Path, must not be empty. Applies: restart. UI: yes |
 | `default_model` | `null` | Model serving `/v1/vision/detection`; default = first enabled entry. Model name. Applies: at once. UI: yes (Models card) |
@@ -578,6 +587,7 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 | `benchmark.reference_model` | `null` | Model whose detections score datasets without ground truth; `null` = the most accurate installed one. UI: yes |
 | `benchmark.weights` | `{"accuracy": 0.6, "speed": 0.4}` | Weights of the overall grade, each 0-1. UI: yes (accuracy weight) |
 | `benchmark.auto_download_datasets` | `true` | Download the selected built-in datasets when a run starts (large ones still need `allow_large_downloads`). Boolean. UI: no |
+| `benchmark.low_priority` | `true` | Run benchmarks at below-normal process priority so the desktop stays responsive (Windows: the whole service for the run, restored after; CLI on Linux/macOS: nice 10). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
 | `benchmark.threshold_objective` | `"f1"` | Best-threshold objective: `f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`. UI: yes |
 | `benchmark.accuracy_metric` | `"ap50"` | `ap50` or `roc_auc`: drives the accuracy grade, ranking and device recommendation. UI: yes |
 
@@ -881,7 +891,19 @@ response has `success: false` or a non-200 status.
   `CoreML loads a rewritten copy (...)` shows the CoreML graph rewrite (see Hardware and device selection); `BOP_COREML_REWRITE=0`
   turns it off.
 - **`ort:*` device shows as unavailable:** run `list-devices` for the reason. Usually `setup-onnxruntime` has not
-  been run, or (NVIDIA) CUDA 12 / cuDNN 9 is not installed.
+  been run, or (NVIDIA) CUDA 12 / cuDNN 9 is not installed. A reason ending in `update onnxruntime-cuda ...
+  and restart` means the installed CUDA build is older than the catalog's and has no kernels for the card
+  (GTX 10-series needs 1.28+): press Update on the Config page's Resources card (or run
+  `blue-onyx-prism fetch --resource onnxruntime-cuda`), then restart.
+- **A CPU benchmark made the desktop unresponsive:** benchmarks run at below-normal priority
+  (`benchmark.low_priority`, `benchmark --no-low-priority` to opt out) and CPU inference keeps one core
+  free (`intra_threads` 0); ONNX Runtime's thread pools do not spin-wait between runs (`BOP_ORT_SPINNING=1`
+  restores the default spinning).
+- **GPU usage stays around 60 % with DirectML or CUDA:** Task Manager's GPU column shows the busiest engine
+  and under-reports compute work; look at the *Compute_0* / *3D* engine graphs or `nvidia-smi dmon -s u`.
+  The server runs two ONNX Runtime sessions per model on a discrete GPU (`ort_sessions`) so one request's
+  compute overlaps the other's copy and NMS; Blue Iris sends one request per trigger, so 100 % is not
+  expected, and the benchmark measures latency one request at a time by design.
 - **`Unable to find the openvino_c library`:** run `blue-onyx-prism setup-openvino` or set
   `openvino_dir` / `OPENVINO_INSTALL_DIR`. On Windows install the Visual C++ redistributable.
 - **Windows error 1053 / `ServicesPipeTimeout`:** the service did not report in time; reboot once after

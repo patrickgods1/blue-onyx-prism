@@ -48,7 +48,22 @@ fn every_shipped_platform_has_runtimes() {
         for f in flavors {
             let r = catalog::onnxruntime(p.os, p.arch, f).unwrap();
             assert_eq!(r.id, f.resource_id());
-            assert_eq!(r.version, catalog::ONNXRUNTIME_VERSION);
+            assert_eq!(r.version, catalog::onnxruntime_version(f));
+            if f == Flavor::Cuda {
+                assert_eq!(r.version, catalog::ONNXRUNTIME_CUDA_VERSION);
+                assert!(
+                    r.parts[0]
+                        .file_name
+                        .contains(&format!("gpu_cuda12-{}", r.version)),
+                    "{}",
+                    r.parts[0].file_name
+                );
+            } else {
+                assert_eq!(r.version, catalog::ONNXRUNTIME_VERSION);
+            }
+            for part in r.parts.iter().filter(|p| p.layout == Layout::OrtRelease) {
+                assert!(part.url.contains(r.version), "{}", part.url);
+            }
             // setup-onnxruntime reads the same table.
             let parts = blue_onyx_prism::setup_onnxruntime::packages_for(p.os, p.arch, f).unwrap();
             assert_eq!(parts.len(), r.parts.len());
@@ -298,7 +313,7 @@ fn fresh_windows_nvidia_without_large_downloads_falls_to_directml() {
     assert_eq!(opt, ["onnxruntime-cuda", CUDA_LIBS_ID]);
     let skipped = &r.model("IPcam-general").unwrap().skipped;
     assert!(
-        skipped[0].starts_with("ort:cuda:0: needs NVIDIA CUDA 12 + cuDNN 9 libraries"),
+        skipped[0].starts_with("ort:cuda:0: needs NVIDIA CUDA 12 + cuDNN 9.10 libraries"),
         "{skipped:?}"
     );
     assert!(skipped[0].contains("allow_large_downloads"));
@@ -331,56 +346,180 @@ fn pascal(index: u32) -> GpuAdapter {
 }
 
 #[test]
-fn pascal_gpu_never_plans_the_cuda_download() {
+fn pascal_gpu_plans_cuda_on_windows() {
+    // GTX 1070 Ti + UHD 630: the catalog's 1.31.0 CUDA build has Pascal kernels, so with large
+    // downloads allowed the NVIDIA GPU runs CUDA; TensorRT 10 never does (7.5+).
     let mut cfg = ipcam();
     cfg.allow_large_downloads = true;
-    let no_cuda = |r: &Resolution| {
-        r.needs
-            .iter()
-            .chain(&r.optional)
-            .all(|n| n.id() != "onnxruntime-cuda" && n.id() != CUDA_LIBS_ID)
-    };
-
-    // GTX 1070 Ti + UHD 630: the discrete GPU via DirectML before the iGPU, nothing for CUDA.
     let hw = win(vec![pascal(0), intel_igpu(1)]);
     let inst = files_only(&cfg);
     let r = needed(&cfg, &hw, &inst);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    assert_eq!(
+        ids(&r),
+        ["onnxruntime-cuda", CUDA_LIBS_ID, OPENVINO_RUNTIME_ID]
+    );
+    assert_eq!(
+        r.needs[0].resource.version,
+        catalog::ONNXRUNTIME_CUDA_VERSION
+    );
+    let offers = downloadable_options(&cfg, &hw, &inst, true);
+    let specs: Vec<String> = offers.iter().map(|d| d.device.to_string()).collect();
+    assert!(specs.contains(&"ort:cuda:0".to_string()), "{specs:?}");
+    assert!(specs.contains(&"ort:directml:0".to_string()), "{specs:?}");
+    assert!(
+        specs.iter().all(|s| !s.starts_with("ort:tensorrt")),
+        "{specs:?}"
+    );
+    let cuda = offers
+        .iter()
+        .find(|d| d.device.to_string() == "ort:cuda:0")
+        .unwrap();
+    assert!(
+        cuda.summary().starts_with(
+            "will download ONNX Runtime CUDA/TensorRT (CUDA 12) 1.31.0 (393 MB), NVIDIA CUDA 12 \
+             + cuDNN 9.10 libraries"
+        ),
+        "{}",
+        cuda.summary()
+    );
+    assert!(
+        cuda.summary().ends_with("; needs allow_large_downloads"),
+        "{}",
+        cuda.summary()
+    );
+
+    // Large downloads not allowed: DirectML runs the GPU, CUDA stays an optional download.
+    let mut small = cfg.clone();
+    small.allow_large_downloads = false;
+    let r = needed(&small, &hw, &inst);
     assert_eq!(pick(&r, "IPcam-general"), "ort:directml:0");
     assert_eq!(ids(&r), ["onnxruntime-directml", OPENVINO_RUNTIME_ID]);
-    assert!(no_cuda(&r), "{:?}", r.needs);
+    let opt: Vec<&str> = r.optional.iter().map(|n| n.id()).collect();
+    assert_eq!(opt, ["onnxruntime-cuda", CUDA_LIBS_ID]);
+    let skipped = &r.model("IPcam-general").unwrap().skipped;
+    assert!(
+        skipped[0].starts_with("ort:cuda:0: needs NVIDIA CUDA 12 + cuDNN 9.10 libraries"),
+        "{skipped:?}"
+    );
+
     // An .xml-only model: ONNX Runtime cannot load it, so the iGPU via OpenVINO.
     let mut xml = cfg.clone();
     xml.models[0].path = "models/IPcam-general.xml".into();
     let r = needed(&xml, &hw, &files_only(&xml));
     assert_eq!(pick(&r, "IPcam-general"), "openvino:gpu");
-    assert!(no_cuda(&r), "{:?}", r.needs);
-    // Downloadable options: DirectML for the NVIDIA GPU, never CUDA/TensorRT.
-    let offers = downloadable_options(&cfg, &hw, &inst, true);
-    let specs: Vec<String> = offers.iter().map(|d| d.device.to_string()).collect();
-    assert!(specs.contains(&"ort:directml:0".to_string()), "{specs:?}");
+
+    // TensorRT asked for explicitly: refused with the reason, no CUDA libraries planned.
+    cfg.models[0].device = Some("ort:tensorrt".into());
+    let r = needed(&cfg, &win(vec![pascal(0)]), &files_only(&cfg));
     assert!(
-        specs
+        r.needs
             .iter()
-            .all(|s| !s.starts_with("ort:cuda") && !s.starts_with("ort:tensorrt")),
-        "{specs:?}"
+            .chain(&r.optional)
+            .all(|n| n.id() != CUDA_LIBS_ID),
+        "{:?}",
+        ids(&r)
     );
-
-    // GTX 1070 Ti alone: DirectML is the NVIDIA path.
-    let r = needed(&cfg, &win(vec![pascal(0)]), &files_only(&cfg));
-    assert_eq!(pick(&r, "IPcam-general"), "ort:directml:0");
-    assert_eq!(ids(&r)[0], "onnxruntime-directml");
-    assert!(no_cuda(&r), "{:?}", r.needs);
-
-    // Asked for explicitly: refused with the reason, no download.
-    cfg.models[0].device = Some("ort:cuda".into());
-    let r = needed(&cfg, &win(vec![pascal(0)]), &files_only(&cfg));
-    assert!(no_cuda(&r), "{:?}", r.needs);
     let plan = r.model("IPcam-general").unwrap();
     assert!(
-        plan.skipped[0]
-            .starts_with("ort:cuda: NVIDIA GeForce GTX 1070 Ti is compute capability 6.1"),
+        plan.skipped[0].starts_with(
+            "ort:tensorrt: NVIDIA GeForce GTX 1070 Ti is compute capability 6.1; TensorRT 10 \
+             needs 7.5+"
+        ),
         "{plan:?}"
     );
+
+    // Maxwell (5.2): no CUDA build has kernels; DirectML, as before.
+    let mut cfg = ipcam();
+    cfg.allow_large_downloads = true;
+    let maxwell = win(vec![nvidia_cc("NVIDIA GeForce GTX 980", 0, 5, 2)]);
+    let r = needed(&cfg, &maxwell, &files_only(&cfg));
+    assert_eq!(pick(&r, "IPcam-general"), "ort:directml:0");
+    assert!(
+        r.needs
+            .iter()
+            .chain(&r.optional)
+            .all(|n| n.id() != "onnxruntime-cuda" && n.id() != CUDA_LIBS_ID),
+        "{:?}",
+        ids(&r)
+    );
+    assert!(
+        downloadable_options(&cfg, &maxwell, &files_only(&cfg), true)
+            .iter()
+            .all(|d| !d.device.to_string().starts_with("ort:cuda")),
+        "no CUDA offer for a Maxwell card"
+    );
+}
+
+#[test]
+fn outdated_cuda_flavor_is_updated() {
+    // DirectML active; onnxruntime/cuda holds the old 1.24.4 build (no Pascal kernels) and the
+    // libraries are installed: the plan updates the CUDA flavor, used after a restart.
+    let mut cfg = ipcam();
+    cfg.allow_large_downloads = true;
+    let hw = win(vec![pascal(0), intel_igpu(1)]);
+    let mut inst = files_only(&cfg)
+        .with_resources(&[
+            "onnxruntime-cuda",
+            "onnxruntime-directml",
+            CUDA_LIBS_ID,
+            OPENVINO_RUNTIME_ID,
+        ])
+        .with_version("onnxruntime-cuda", "1.24.4")
+        .with_version("onnxruntime-directml", "1.24.4");
+    inst.active_ort = Some(Flavor::DirectMl);
+    let r = needed(&cfg, &hw, &inst);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    assert_eq!(ids(&r), ["onnxruntime-cuda"]);
+    let n = &r.needs[0];
+    assert!(n.after_restart);
+    assert!(n.reason.ends_with("(update from 1.24.4)"), "{}", n.reason);
+    assert!(inst.outdated(n.resource));
+    assert_eq!(n.resource.version, "1.31.0");
+    // The current version installed: nothing to download.
+    let current = inst
+        .clone()
+        .with_version("onnxruntime-cuda", catalog::ONNXRUNTIME_CUDA_VERSION);
+    let r = needed(&cfg, &hw, &current);
+    assert!(r.is_satisfied(), "{:?}", ids(&r));
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    // Installed cuda-libs of another cuDNN still work: never re-planned.
+    let libs = current
+        .clone()
+        .with_version(CUDA_LIBS_ID, "cuda-12.8.1+cudnn-9.8.0.87");
+    let r = needed(&cfg, &hw, &libs);
+    assert!(r.is_satisfied(), "{:?}", ids(&r));
+
+    // The old CUDA flavor loaded by this process: judged by its own build (CUDA refused with the
+    // update hint), the update is planned for after a restart, DirectML is not downloaded.
+    let mut loaded = inst.clone();
+    loaded.active_ort = Some(Flavor::Cuda);
+    loaded.probe = Some(RuntimeProbe {
+        openvino: OpenVinoProbe::with_device_names(&["CPU".to_string(), "GPU".to_string()]),
+        ort: OrtProbe::installed(
+            "cuda",
+            vec![
+                EpStatus::usable(Target::Cuda),
+                EpStatus::usable(Target::TensorRt),
+                EpStatus::usable(Target::Cpu),
+            ],
+        )
+        .with_version("1.24.4"),
+    });
+    let r = needed(&cfg, &hw, &loaded);
+    assert_eq!(ids(&r), ["onnxruntime-cuda"]);
+    assert!(r.needs[0].after_restart);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    // With the current build loaded, the live probe decides and nothing is planned.
+    let mut live = loaded.clone();
+    live.versions.insert(
+        "onnxruntime-cuda".into(),
+        catalog::ONNXRUNTIME_CUDA_VERSION.into(),
+    );
+    live.probe.as_mut().unwrap().ort.version = Some(catalog::ONNXRUNTIME_CUDA_VERSION.into());
+    let r = needed(&cfg, &hw, &live);
+    assert!(r.is_satisfied(), "{:?}", ids(&r));
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
 }
 
 #[test]
@@ -839,11 +978,21 @@ fn detect_installed_reads_manifests() {
     write("onnxruntime/cuda-libs", CUDA_LIBS_ID);
     // A manifest for something else does not count.
     write("onnxruntime/cpu", "onnxruntime-cuda");
+    // A VERSION marker without a manifest (an older install) gives the version too.
+    std::fs::create_dir_all(root.join("onnxruntime/coreml")).unwrap();
+    std::fs::write(root.join("onnxruntime/coreml/flavor.txt"), "coreml\n").unwrap();
+    std::fs::write(root.join("onnxruntime/coreml/VERSION"), "1.20.0\n").unwrap();
     let inst = detect_installed(&Config::default(), &root, None);
     assert!(inst.has(OPENVINO_RUNTIME_ID));
     assert!(inst.has("onnxruntime-directml"));
     assert!(inst.has(CUDA_LIBS_ID));
     assert!(!inst.has("onnxruntime-cpu"));
+    assert_eq!(inst.installed_version("onnxruntime-directml"), Some("x"));
+    assert_eq!(inst.installed_version(CUDA_LIBS_ID), Some("x"));
+    assert_eq!(inst.installed_version("onnxruntime-coreml"), Some("1.20.0"));
+    assert_eq!(inst.installed_version("onnxruntime-cpu"), None);
+    let dml = catalog::onnxruntime("windows", "x86_64", Flavor::DirectMl).unwrap();
+    assert!(inst.outdated(dml));
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -139,7 +139,8 @@ pub fn download(
         )));
     }
     let installed = installed_snapshot(Some(ctx), config);
-    if is_installed(res, &installed, config) {
+    let update = installed.outdated(res);
+    if is_installed(res, &installed, config) && !update {
         return Ok(format!("{} is already installed", res.title));
     }
     if res.is_large() && !confirm_large && !config.allow_large_downloads {
@@ -154,18 +155,23 @@ pub fn download(
         ResourceKind::Model => Job::into_dir(res, target_dir(config, res)),
         _ => Job::new(res, &config.data_root()),
     };
-    job.activate_ort =
-        res.flavor().is_some() && installed.active_ort.is_none() && !installed.ort_pinned;
+    // A new flavor becomes active only when none is; an update keeps the active one active.
+    job.activate_ort = res.flavor().is_some()
+        && !installed.ort_pinned
+        && (installed.active_ort.is_none() || installed.active_ort == res.flavor());
     let manager = ctx.provisioner.manager_for(config);
     manager.forget(&job.key());
     manager.enqueue(job);
     Ok(format!(
         "downloading {} ({})",
         res.describe(),
-        if res.kind == ResourceKind::Model {
-            "add it to the config when it is installed"
-        } else {
-            "used after the next restart"
+        match (res.kind, update) {
+            (ResourceKind::Model, _) => "add it to the config when it is installed".to_string(),
+            (_, true) => format!(
+                "replaces the installed {}; used after the next restart",
+                installed.installed_version(res.id).unwrap_or("version")
+            ),
+            (_, false) => "used after the next restart".to_string(),
         }
     ))
 }

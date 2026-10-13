@@ -354,10 +354,15 @@ fn state_of(
     }
     if installed_now {
         let active = res.flavor().is_some() && res.flavor() == installed.active_ort;
-        return if active {
-            "installed (active)".to_string()
-        } else {
-            "installed".to_string()
+        let update = installed
+            .installed_version(res.id)
+            .filter(|v| *v != res.version)
+            .map(|old| format!("{old}, {} available", res.version));
+        return match (update, active) {
+            (Some(u), true) => format!("installed {u} (active)"),
+            (Some(u), false) => format!("installed {u}"),
+            (None, true) => "installed (active)".to_string(),
+            (None, false) => "installed".to_string(),
         };
     }
     if let Some(n) = r.needs.iter().find(|n| n.id() == res.id) {

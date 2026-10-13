@@ -11,7 +11,8 @@
 //!   errors, not a silent CPU fallback; the CPU fallback is the caller's candidate loop):
 //!   CUDA `device_id`; TensorRT fp16 with its engine cache in `cache/tensorrt` (CUDA behind it
 //!   for unsupported nodes); DirectML `device_id`, memory pattern off, sequential execution;
-//!   CoreML MLProgram, compute units ALL, cache in `cache/coreml`; `intra_threads` everywhere.
+//!   CoreML MLProgram, compute units ALL, cache in `cache/coreml`; `intra_threads` everywhere
+//!   (see [`super::cpu_threads`]) and thread spinning off (`BOP_ORT_SPINNING=1` turns it on).
 //! - CoreML loads a rewritten copy of the model when it has ops the CoreML EP cannot take but
 //!   that have exact equivalents (HardSigmoid/HardSwish, opset < 13 Split; see
 //!   [`super::onnx_rewrite`]), cached as `cache/coreml/<stem>-<sha256/16>-v<N>.onnx`. YOLOv5 then
@@ -247,13 +248,13 @@ pub(crate) fn missing_deps_reason_with(
 }
 
 /// "CUDA libraries missing — enable allow_large_downloads or run `blue-onyx-prism fetch
-/// --resource nvidia-cuda-libs` (1.9 GB), or install CUDA 12 and cuDNN 9" when the catalog has
+/// --resource nvidia-cuda-libs` (1.9 GB), or install CUDA 12.8+ and cuDNN 9 ..." when the catalog has
 /// them for this platform; None otherwise.
 pub(crate) fn cuda_download_hint(os: &str, arch: &str) -> Option<String> {
     let r = crate::resources::catalog::cuda_libs_for(os, arch)?;
     Some(format!(
         "CUDA libraries missing \u{2014} enable allow_large_downloads or run `blue-onyx-prism \
-         fetch --resource {}` ({}), or install CUDA 12 and cuDNN 9",
+         fetch --resource {}` ({}), or install CUDA 12.8+ and cuDNN 9 (9.10 or older for GTX          10-series cards)",
         r.id,
         crate::resources::catalog::format_size(r.size())
     ))
@@ -391,7 +392,7 @@ impl OrtRuntime {
         Ok(Self {
             lib,
             cache_dir: opts.cache_dir.clone(),
-            intra_threads: opts.intra_threads,
+            intra_threads: super::cpu_threads::effective(opts.intra_threads),
             probe,
             hw: hw.clone(),
         })
@@ -689,9 +690,21 @@ impl OrtRuntime {
         overrides: &[(String, i64)],
     ) -> Result<Session> {
         let mut b: SessionBuilder = Session::builder().map_err(ort_err)?;
-        if self.intra_threads > 0 {
-            b = b.with_intra_threads(self.intra_threads).map_err(ort_err)?;
-        }
+        // Every session, GPU EPs included (their CPU fallback ops run on this pool).
+        b = b.with_intra_threads(self.intra_threads).map_err(ort_err)?;
+        let spin = ort_spinning_enabled(std::env::var(ENV_ORT_SPINNING).ok().as_deref());
+        tracing::debug!(
+            "ONNX Runtime {} session for {}: {} intra-op threads, spinning {}",
+            target.display_name(),
+            path.display(),
+            self.intra_threads,
+            if spin { "on" } else { "off" }
+        );
+        b = b
+            .with_intra_op_spinning(spin)
+            .map_err(ort_err)?
+            .with_inter_op_spinning(spin)
+            .map_err(ort_err)?;
         for (name, value) in overrides {
             b = b.with_dimension_override(name, *value).map_err(ort_err)?;
         }
@@ -773,6 +786,21 @@ impl OrtRuntime {
             )
         })
     }
+}
+
+/// Environment variable that lets ONNX Runtime's thread pools spin-wait (`1`, `true`, `on`,
+/// `yes`). ORT's pools spin by default (`session.intra_op.allow_spinning`), which in a
+/// long-lived service keeps every core busy between runs; off costs tens of microseconds of
+/// wake-up latency per run.
+pub(crate) const ENV_ORT_SPINNING: &str = "BOP_ORT_SPINNING";
+
+/// Whether ORT's intra/inter-op pools spin, given the value of [`ENV_ORT_SPINNING`]
+/// (default off).
+pub(crate) fn ort_spinning_enabled(env: Option<&str>) -> bool {
+    matches!(
+        env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
 }
 
 /// Environment variable that turns the CoreML graph rewrite off (`0`, `false`, `off`, `no`).
@@ -901,6 +929,7 @@ fn probe_providers(lib: &LoadedLib, hw: &HardwareInfo, cuda_libs: Option<&Path>)
     OrtProbe {
         error: None,
         flavor,
+        version: Some(lib.version.clone()),
         providers,
     }
 }
@@ -1723,6 +1752,24 @@ mod tests {
         }
         for off in ["0", "false", "OFF", " no "] {
             assert!(!coreml_rewrite_enabled(Some(off)), "{off}");
+        }
+    }
+
+    #[test]
+    fn ort_spinning_switch() {
+        for on in [Some("1"), Some("true"), Some(" ON "), Some("yes")] {
+            assert!(ort_spinning_enabled(on), "{on:?}");
+        }
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("no"),
+            Some("2"),
+        ] {
+            assert!(!ort_spinning_enabled(off), "{off:?}");
         }
     }
 

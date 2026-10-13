@@ -299,8 +299,8 @@ fn nvidia_and_intel_igpu_with_cuda() {
 }
 
 #[test]
-fn pascal_dgpu_uses_directml_before_the_igpu() {
-    // GTX 1070 Ti (6.1): the pinned Windows CUDA build has no kernels for it.
+fn pascal_dgpu_uses_cuda_then_directml_before_the_igpu() {
+    // GTX 1070 Ti (6.1): the catalog's CUDA build (1.31.0) has kernels for it, TensorRT 10 not.
     let gtx = with_cuda(
         gpu(
             GpuVendor::Nvidia,
@@ -314,18 +314,47 @@ fn pascal_dgpu_uses_directml_before_the_igpu() {
         1,
     );
     let hw = HardwareInfo::new("windows", "x86_64", vec![gtx, uhd630(1)]);
-    for ort in [ort_everything(), ort_directml()] {
-        let probe = RuntimeProbe {
-            openvino: openvino_igpu(),
-            ort,
-        };
-        let sel = select(&hw, &probe, true);
-        assert!(!runnable(&sel, "ort:cuda:0") && !runnable(&sel, "ort:tensorrt:0"));
-        assert_eq!(
-            auto(&sel),
-            ["ort:directml:0", "openvino:gpu", "openvino:cpu"]
-        );
-    }
+    let probe = RuntimeProbe {
+        openvino: openvino_igpu(),
+        ort: ort_everything(),
+    };
+    let sel = select(&hw, &probe, true);
+    assert!(runnable(&sel, "ort:cuda:0") && !runnable(&sel, "ort:tensorrt:0"));
+    assert_eq!(
+        auto(&sel),
+        [
+            "ort:cuda:0",
+            "ort:directml:0",
+            "openvino:gpu",
+            "openvino:cpu"
+        ]
+    );
+    // The DirectML flavor loaded: no CUDA provider in it, so DirectML leads.
+    let probe = RuntimeProbe {
+        openvino: openvino_igpu(),
+        ort: ort_directml(),
+    };
+    let sel = select(&hw, &probe, true);
+    assert!(!runnable(&sel, "ort:cuda:0") && !runnable(&sel, "ort:tensorrt:0"));
+    assert_eq!(
+        auto(&sel),
+        ["ort:directml:0", "openvino:gpu", "openvino:cpu"]
+    );
+    // The old 1.24.4 CUDA flavor loaded: no kernels for Pascal, and no DirectML in that flavor.
+    let probe = RuntimeProbe {
+        openvino: openvino_igpu(),
+        ort: ort_gpu_flavor(None).with_version("1.24.4"),
+    };
+    let sel = select(&hw, &probe, true);
+    assert!(!runnable(&sel, "ort:cuda:0"));
+    let reason = sel
+        .option(&dev("ort:cuda:0"))
+        .unwrap()
+        .reason
+        .clone()
+        .unwrap();
+    assert!(reason.contains("update onnxruntime-cuda"), "{reason}");
+    assert_eq!(auto(&sel), ["openvino:gpu", "openvino:cpu"]);
     // An .xml-only model: ONNX Runtime cannot load it, so the iGPU leads.
     let probe = RuntimeProbe {
         openvino: openvino_igpu(),

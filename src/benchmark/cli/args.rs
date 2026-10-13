@@ -130,9 +130,14 @@ pub struct BenchArgs {
     /// Compiled-model cache directory ("" disables). Default: the configured cache dir.
     #[arg(long)]
     pub cache_dir: Option<String>,
-    /// CPU inference threads (0 = OpenVINO default). Default: the configured intra_threads.
+    /// CPU inference threads (0 = all physical cores but one on machines with at least 4).
+    /// Default: the configured intra_threads.
     #[arg(long)]
     pub threads: Option<usize>,
+    /// Keep the normal process priority (default: below normal so the desktop stays
+    /// responsive; also off with benchmark.low_priority = false).
+    #[arg(long)]
+    pub no_low_priority: bool,
     /// Confidence threshold. Default: the configured confidence_threshold.
     #[arg(long, value_parser = parse_unit_f32)]
     pub min_confidence: Option<f32>,

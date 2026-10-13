@@ -136,6 +136,7 @@ h4 { font-size: 0.95rem; margin: 0.8rem 0 0.3rem; }
 .hint { font-size: 0.8rem; color: var(--warn-fg); }
 .tag.now { background: var(--ok-bg); color: var(--ok-fg); border: 1px solid var(--ok-fg); }
 .tag.restart { background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-fg); }
+.tag.update { background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-fg); }
 h2 .tag, label .tag { vertical-align: middle; font-weight: normal; }
 form label > .tag { align-self: flex-start; }
 .card, .panel, fieldset { min-width: 0; max-width: 100%; }

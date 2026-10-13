@@ -96,6 +96,10 @@ windows-service = "0.8"
 tracing-layer-win-eventlog = "1"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_LibraryLoader", "Win32_Security", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
+[target.'cfg(unix)'.dependencies]
+# `setpriority` for low-priority CLI benchmarks (`backend::priority`).
+libc = "0.2"
+
 [dev-dependencies]
 # Router tests (`ServiceExt::oneshot`); already a transitive dependency of axum.
 tower = { version = "0.5", default-features = false, features = ["util"] }

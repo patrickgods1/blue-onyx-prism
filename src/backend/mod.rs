@@ -27,6 +27,7 @@
 //! backend.recycle(done.slot, outs);                           // buffers back to the slot
 //! ```
 
+pub mod cpu_threads;
 pub mod detect;
 pub mod device;
 #[cfg(test)]
@@ -39,6 +40,7 @@ pub mod onnx_rewrite;
 #[cfg(feature = "onnxruntime")]
 pub mod ort;
 pub mod plan;
+pub mod priority;
 pub mod select;
 pub mod spec;
 
@@ -61,7 +63,7 @@ use std::path::{Path, PathBuf};
 pub struct CoreOptions {
     /// Compiled-model cache directory; None disables caching.
     pub cache_dir: Option<PathBuf>,
-    /// CPU inference threads (0 = runtime default).
+    /// CPU inference threads (0 = all physical cores but one, see [`cpu_threads`]).
     pub intra_threads: usize,
     /// Explicit OpenVINO runtime directory (config `openvino_dir`).
     pub openvino_dir: Option<PathBuf>,
@@ -587,6 +589,10 @@ impl Runtimes {
     /// unavailable.
     pub fn new_with(opts: &CoreOptions, ort_opts: &OrtOptions) -> Self {
         let hw = detect::hardware().clone();
+        tracing::info!(
+            "CPU inference threads: {}",
+            cpu_threads::describe(opts.intra_threads)
+        );
         let (ov, ov_error) = match OvCore::new(opts) {
             Ok(core) => (Some(core), None),
             Err(e) => (None, Some(format!("{e:#}"))),

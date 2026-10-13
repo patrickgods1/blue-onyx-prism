@@ -114,6 +114,9 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) -> Result<()> {
     for g in &hw.gpus {
         println!("  {g}");
     }
+    if let Some(v) = &hw.cuda_driver {
+        println!("  NVIDIA driver: supports CUDA {v}");
+    }
     println!("Runtimes:");
     match rt.openvino() {
         Some(core) => println!(

@@ -129,7 +129,7 @@
   <tbody>
   {% for r in g.rows %}
   <tr id="resource-{{ r.id }}" data-id="{{ r.id }}" data-busy="{{ r.busy }}" data-state="{{ r.state }}">
-    <td>{{ r.title }} <code>{{ r.id }}</code>{% if r.recommended %} <span class="tag recommended" title="Model size suited to this machine's hardware profile (see the Home page); the Benchmark page measures it">recommended for this machine</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% endif %}</span></td>
+    <td>{{ r.title }} <code>{{ r.id }}</code>{% if r.recommended %} <span class="tag recommended" title="Model size suited to this machine's hardware profile (see the Home page); the Benchmark page measures it">recommended for this machine</span>{% endif %}{% if let Some(v) = r.update_available %} <span class="tag update" title="Installed in an older version; Update replaces it in place (a loaded runtime is used after a restart)">update to {{ v }}</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% endif %}</span></td>
     <td class="num">{{ r.size_text }}{% if let Some(n) = r.size_note %}<br><span class="muted">{{ n }}</span>{% else if r.large %}<br><span class="muted">large</span>{% endif %}</td>
     <td class="res-state"><span class="res-text">{{ r.state_text }}</span>{% if r.busy %}<br><progress max="100"{% if let Some(p) = r.progress %} value="{{ p }}"{% endif %}></progress>{% endif %}{% if r.active %} <span class="tag">active</span>{% endif %}{% if r.loaded %} <span class="tag">loaded</span>{% endif %}{% if !r.blocking.is_empty() %}<br><span class="muted">needed by {{ r.blocking.join(", ") }}</span>{% endif %}{% if !r.log.is_empty() %}<details class="res-log"><summary>output</summary><pre>{% for l in r.log %}{{ l }}
 {% endfor %}</pre></details>{% endif %}</td>
@@ -158,8 +158,8 @@
     {% else if r.busy %}<span class="muted">in progress</span>
     {% else if resources_enabled %}
       <form method="post" action="/v1/resources/download#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}">
-      {% if r.large %}<input type="hidden" name="confirm_large" value="1"><button type="submit" data-confirm="{{ r.title }} is {{ r.size_text }} ({{ r.license }}). Download it?">Download {{ r.size_text }} (large)</button>
-      {% else %}<button type="submit">Download</button>{% endif %}
+      {% if r.large %}<input type="hidden" name="confirm_large" value="1"><button type="submit" data-confirm="{{ r.title }} is {{ r.size_text }} ({{ r.license }}). Download it?">{% if r.update_available.is_some() %}Update{% else %}Download{% endif %} {{ r.size_text }} (large)</button>
+      {% else %}<button type="submit">{% if r.update_available.is_some() %}Update{% else %}Download{% endif %}</button>{% endif %}
       </form>
     {% endif %}
     {% if at_row == r.id %}{% call notices("resources-row") %}{% endcall %}{% endif %}

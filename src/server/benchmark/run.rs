@@ -68,6 +68,7 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         datasets = ?req.datasets.iter().map(DatasetRef::label).collect::<Vec<_>>(),
         repeat = req.repeat,
         warmup = req.warmup,
+        low_priority = req.low_priority,
         "benchmark started from the web UI"
     );
     match state.benchmark.start(ctx, req) {
@@ -312,7 +313,7 @@ mod tests {
             &st,
             post(
                 "/v1/benchmark/settings",
-                "dataset=sample&accuracy_metric=roc_auc&threshold_objective=youden",
+                "dataset=sample&accuracy_metric=roc_auc&threshold_objective=youden                 &low_priority=0&low_priority=1",
             ),
         )
         .await;
@@ -337,7 +338,10 @@ mod tests {
             c.benchmark.threshold_objective,
             crate::benchmark::threshold::Objective::Youden
         );
-        // The page now preselects them.
+        assert!(
+            c.benchmark.low_priority,
+            "checked checkbox after the hidden 0"
+        );
         let resp = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
         let html = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -354,6 +358,28 @@ mod tests {
             html.contains("<option value=\"youden\" selected>"),
             "{html}"
         );
+        assert!(
+            html.contains(r#"name="low_priority" value="1" checked>"#),
+            "{html}"
+        );
+        // Unchecked: only the hidden 0 is sent.
+        let (s, v) = call(
+            &st,
+            post("/v1/benchmark/settings", "dataset=sample&low_priority=0"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let c = crate::config::Config::load(&st.config_path).unwrap();
+        assert!(!c.benchmark.low_priority);
+        let resp = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
+        let html = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(r#"name="low_priority" value="1">"#), "{html}");
         let (s, _) = call(
             &st,
             post(
@@ -395,6 +421,7 @@ mod tests {
         // A held run: a second start is refused with 409, cancel ends it.
         let mut req = RunRequest::defaults(&crate::config::BenchmarkConfig::default());
         req.models = vec!["ipcam-general".into()];
+        req.low_priority = false;
         st.benchmark
             .start_job(req, |h| {
                 while !h.is_cancelled() {
@@ -422,7 +449,7 @@ mod tests {
             &st,
             post(
                 "/v1/benchmark",
-                "model=ipcam-general&device=openvino:cpu&repeat=1&warmup=0",
+                "model=ipcam-general&device=openvino:cpu&repeat=1&warmup=0&low_priority=0",
             ),
         )
         .await;

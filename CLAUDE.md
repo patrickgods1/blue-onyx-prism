@@ -53,10 +53,14 @@ reviewed commits. The service downloads what the config + hardware need at start
 true; `allow_large_downloads`, default false, gates > 500 MB; `download_dir`, default the exe dir).
 
 ONNX Runtime libs: `onnxruntime_dir` in the config, else `ORT_DYLIB_PATH`, else `onnxruntime/<flavor>/` named by
-`onnxruntime/active.txt`, else the old flat `onnxruntime/`, else any flavor dir. `ONNXRUNTIME_VERSION` 1.24.4 and
-`DIRECTML_VERSION` are in the catalog. The `ort` crate's api-level must stay <= the pinned ORT lib (1.24), because
-the DirectML NuGet stops there. A process loads one ORT flavor only. `onnxruntime/cuda-libs` (opt-in NVIDIA
-wheels, ~1.9 GB) is preloaded by path before the CUDA provider loads.
+`onnxruntime/active.txt`, else the old flat `onnxruntime/`, else any flavor dir. Versions are per flavor in the
+catalog: `ONNXRUNTIME_VERSION` 1.24.4 for cpu/directml/coreml (the last release with a DirectML package),
+`ONNXRUNTIME_CUDA_VERSION` 1.31.0 for cuda (`gpu_cuda12` archives; its Windows build has Pascal `sm_61` kernels
+again), `DIRECTML_VERSION`, `CUDNN_VERSION` 9.10.2.21 (the last cuDNN with Pascal kernels; must stay < 9.11 while the
+CUDA 12 lane covers Pascal, a test checks it). The `ort` crate is built without an `api-NN` feature, so any ORT 1.17+
+library loads; never add one above the oldest pinned flavor. A process loads one ORT flavor only; an outdated flavor
+is updated in place (used after a restart when loaded). `onnxruntime/cuda-libs` (opt-in NVIDIA wheels, ~1.9 GB) is
+preloaded by path before the CUDA provider loads.
 
 Device spec (`device` in config/model entry, `--device`): `auto` (default), `openvino:gpu[.N]`,
 `openvino:cpu`, `openvino:npu`, `ort:cuda[:N]`, `ort:tensorrt[:N]`, `ort:directml[:N]`, `ort:coreml`,
@@ -64,7 +68,11 @@ Device spec (`device` in config/model entry, `--device`): `auto` (default), `ope
 first), each with its runtimes in order (NVIDIA: `ort:cuda`, `ort:tensorrt` when its libs load, `ort:directml` on
 Windows; Intel Arc: `openvino:gpu.N`, then `ort:directml`; AMD/other: `ort:directml` on Windows), then integrated
 GPUs (Intel via OpenVINO, else DirectML), macOS arm64 (CoreML), CPU (`openvino:cpu`, else `ort:cpu`). An NVIDIA
-GPU whose compute capability has no kernels in the pinned ORT CUDA build (`src/resources/catalog/`) skips CUDA/TensorRT.
+GPU whose compute capability has no kernels in the ORT CUDA build that will load (`catalog::ORT_CUDA_BUILDS`, keyed by
+OS and version: 1.31.0 Windows = 6.1/7.5/8.6/8.9/12.0, Linux = 6.0..12.0 without 10.0) skips CUDA; TensorRT needs 7.5+;
+a driver below CUDA 12 skips both. `OrtProbe.version` is the loaded library's version (the resolver's hypothetical
+probe carries the version the plan installs). CPU inference uses all physical cores but one by default
+(`backend/cpu_threads.rs`), ORT thread pools do not spin, benchmarks run at below-normal priority (`backend/priority.rs`).
 A model with results in `benchmark.json` orders its `auto` devices by measured speed (fastest eligible first,
 then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim aborts MPSGraph in ORT 1.24.4). ORT needs `.onnx` files.
 

@@ -7,7 +7,7 @@
 //!   TensorRT's provider library (TensorRT itself is not downloadable), `directml` is two NuGet
 //!   packages (ONNX Runtime + `DirectML.dll`), `coreml` is the macOS package (which also serves
 //!   `cpu` there).
-//! - `CUDA_LIBS`: `nvidia-cuda-libs`, NVIDIA's CUDA 12.8 / cuDNN 9 redistributable wheels from
+//! - `CUDA_LIBS`: `nvidia-cuda-libs`, NVIDIA's CUDA 12.8 / cuDNN 9.10 redistributable wheels from
 //!   PyPI (Windows x64, Linux x64). Large and opt-in.
 //! - [`MODELS`]: the Hugging Face models of `download.rs` (`.onnx` + `.yaml` for YOLOv5 and
 //!   RT-DETRv2; `.onnx` only for D-FINE and RF-DETR), pinned to a repo commit so the hashes cannot
@@ -47,10 +47,69 @@ pub use tools::*;
 
 /// Pinned OpenVINO runtime version.
 pub const OPENVINO_VERSION: &str = "2026.4.0";
-/// Pinned ONNX Runtime version. The `ort` crate is built without `api-NN` features, so any ONNX
-/// Runtime 1.17+ library loads; 1.24.4 is the newest release that ships every package we use
-/// (the DirectML NuGet package stops at 1.24.x, and 1.25+ renamed the GPU archives).
+/// Pinned ONNX Runtime version of the `cpu`, `directml` and `coreml` flavors. The `ort` crate is
+/// built without `api-NN` features, so any ONNX Runtime 1.17+ library loads; 1.24.4 is the newest
+/// release with a DirectML package (`Microsoft.ML.OnnxRuntime.DirectML` on NuGet and
+/// `onnxruntime-directml` on PyPI stop at 1.24.4; the 1.25+ Windows packages have no DirectML
+/// provider, checked on their export tables). The CUDA flavor has its own pin,
+/// [`ONNXRUNTIME_CUDA_VERSION`]; one flavor loads per process, so they need not match.
 pub const ONNXRUNTIME_VERSION: &str = "1.24.4";
+/// Pinned ONNX Runtime version of the `cuda` flavor (the `gpu_cuda12` release archives, split
+/// from the CUDA 13 ones since 1.25). Newer than the other flavors on purpose: 1.23 through 1.27
+/// built the Windows package for Turing (7.5) and up, 1.28+ builds it with Pascal (`sm_61`)
+/// kernels again, so GTX 10-series cards run CUDA (see [`ORT_CUDA_BUILDS`]).
+pub const ONNXRUNTIME_CUDA_VERSION: &str = "1.31.0";
+
+/// Pinned ONNX Runtime version of `flavor`.
+pub const fn onnxruntime_version(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Cuda => ONNXRUNTIME_CUDA_VERSION,
+        Flavor::Cpu | Flavor::DirectMl | Flavor::CoreMl => ONNXRUNTIME_VERSION,
+    }
+}
+
+/// Which CUDA toolkit generation a CUDA flavor and its `nvidia-cuda-libs` belong to. One lane
+/// today. A CUDA 13 lane (Turing and newer only: CUDA 13 dropped Maxwell, Pascal and Volta;
+/// `gpu_cuda13` archives, `*_cu13` wheels, driver R580+) would be a second variant here plus its
+/// rows in [`ORT_CUDA_BUILDS`], the runtime table and the wheel table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CudaLane {
+    Cuda12,
+}
+
+impl CudaLane {
+    /// "CUDA 12".
+    pub const fn label(self) -> &'static str {
+        match self {
+            CudaLane::Cuda12 => "CUDA 12",
+        }
+    }
+
+    /// Tag in the ONNX Runtime archive names: `onnxruntime-win-x64-gpu_cuda12-<v>.zip`.
+    pub const fn archive_tag(self) -> &'static str {
+        match self {
+            CudaLane::Cuda12 => "gpu_cuda12",
+        }
+    }
+
+    /// Lowest CUDA version the NVIDIA driver must support (`cuDriverGetVersion`): CUDA 12.x
+    /// applications run on R525 and newer drivers under CUDA minor-version compatibility (the
+    /// build ships SASS for every supported GPU, so no PTX JIT by a newer driver is needed).
+    pub const fn min_driver_cuda(self) -> (u32, u32) {
+        match self {
+            CudaLane::Cuda12 => (12, 0),
+        }
+    }
+
+    /// The `nvidia-*-libs` resource of the lane.
+    pub const fn libs_id(self) -> &'static str {
+        match self {
+            CudaLane::Cuda12 => CUDA_LIBS_ID,
+        }
+    }
+}
+
 /// GPU code in a CUDA build: which compute capabilities its kernels run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CudaArchs {
@@ -95,41 +154,122 @@ const fn cc(major: u32, minor: u32) -> ComputeCapability {
     ComputeCapability::new(major, minor)
 }
 
-/// GPU code of the pinned ONNX Runtime 1.24.4 CUDA 12 build for Windows x64
-/// (`onnxruntime-win-x64-gpu-1.24.4.zip`): `CMAKE_CUDA_ARCHITECTURES=75-real;86-real;89-real;
-/// 90-virtual` (`CudaArchs` for CUDA 12.8 in `tools/ci_build/github/azure-pipelines/
-/// cuda-packaging-pipeline.yml` on branch rel-1.24.4). Checked on the shipped
-/// `onnxruntime_providers_cuda.dll`: its 200 embedded fatbinaries hold SASS for sm_75, sm_86 and
-/// sm_89 and PTX for compute_90 only. So 7.5 is the minimum, and 6.x (Pascal), 7.0/7.2 (Volta)
-/// and 8.0 (A100) fail at run time with `cudaErrorNoKernelImageForDevice`.
-pub(crate) const ORT_CUDA_ARCHS_WINDOWS: CudaArchs = CudaArchs {
-    sass: &[cc(7, 5), cc(8, 6), cc(8, 9)],
-    ptx: &[cc(9, 0)],
-};
-/// GPU code of the pinned ONNX Runtime 1.24.4 CUDA 12 build for Linux x64
-/// (`onnxruntime-linux-x64-gpu-1.24.4.tgz`): `CUDA_ARCHS="60-real;70-real;75-real;80-real;
-/// 90a-real;90-virtual"` for CUDA 12.8 in `tools/ci_build/github/linux/
-/// build_cuda_c_api_package.sh` on branch rel-1.24.4 (`sm_90a` runs on 9.0 only, as `9.0` here).
-/// Minimum 6.0.
-pub(crate) const ORT_CUDA_ARCHS_LINUX: CudaArchs = CudaArchs {
-    sass: &[cc(6, 0), cc(7, 0), cc(7, 5), cc(8, 0), cc(9, 0)],
-    ptx: &[cc(9, 0)],
-};
-
-/// GPU code of the pinned ONNX Runtime CUDA build for `os` (None: no CUDA package there).
-pub(crate) fn ort_cuda_archs(os: &str) -> Option<&'static CudaArchs> {
-    match os {
-        "windows" => Some(&ORT_CUDA_ARCHS_WINDOWS),
-        "linux" => Some(&ORT_CUDA_ARCHS_LINUX),
-        _ => None,
-    }
+/// GPU code of one ONNX Runtime CUDA release build, keyed by OS, lane and version, so both the
+/// catalog's build and an older installed one can be judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrtCudaBuild {
+    pub os: &'static str,
+    pub lane: CudaLane,
+    pub version: &'static str,
+    pub archs: CudaArchs,
 }
+
+/// The CUDA builds this program knows the GPU code of (each row says where its list comes from:
+/// `CMAKE_CUDA_ARCHITECTURES` of the ONNX Runtime packaging pipelines, checked on the shipped
+/// provider library's embedded fatbinaries).
+pub(crate) static ORT_CUDA_BUILDS: &[OrtCudaBuild] = &[
+    // Windows x64, 1.24.4 (`onnxruntime-win-x64-gpu-1.24.4.zip`): `CudaArchs` for CUDA 12.8 in
+    // `tools/ci_build/github/azure-pipelines/cuda-packaging-pipeline.yml` on rel-1.24.4 is
+    // `75-real;86-real;89-real;90-virtual`. The shipped `onnxruntime_providers_cuda.dll` holds 200
+    // fatbinaries, each with SASS for sm_75, sm_86 and sm_89 and PTX for compute_90. So 7.5 is the
+    // minimum; 6.x (Pascal), 7.0/7.2 (Volta) and 8.0 (A100) fail with
+    // `cudaErrorNoKernelImageForDevice`. Kept so an installed 1.24.4 is judged correctly.
+    OrtCudaBuild {
+        os: "windows",
+        lane: CudaLane::Cuda12,
+        version: "1.24.4",
+        archs: CudaArchs {
+            sass: &[cc(7, 5), cc(8, 6), cc(8, 9)],
+            ptx: &[cc(9, 0)],
+        },
+    },
+    // Windows x64, 1.31.0 (`onnxruntime-win-x64-gpu_cuda12-1.31.0.zip`): `CudaArchs` for CUDA 12.8
+    // in `tools/ci_build/github/azure-pipelines/c-api-noopenmp-packaging-pipelines.yml` on
+    // rel-1.31.0 is `61-real;75-real;86-real;89-real;120-real` (Pascal came back in 1.28.0; 1.29+
+    // ships no PTX). Checked on the shipped `onnxruntime_providers_cuda.dll` (607 fatbinaries):
+    // every kernel has SASS for sm_61, sm_75, sm_86, sm_89 and sm_120; a subset also carries
+    // sm_90 and PTX compute_120 (kernels compiled with their own architecture lists), which does
+    // not make 9.0 runnable. Minimum 6.1 (GTX 10-series); 7.0 (Volta), 8.0 (A100), 9.0 (H100)
+    // and 10.0 (B200) are gaps. Run on a GTX 1070 Ti with cuDNN 9.8 (RF-DETR, D-FINE, YOLO).
+    OrtCudaBuild {
+        os: "windows",
+        lane: CudaLane::Cuda12,
+        version: "1.31.0",
+        archs: CudaArchs {
+            sass: &[cc(6, 1), cc(7, 5), cc(8, 6), cc(8, 9), cc(12, 0)],
+            ptx: &[],
+        },
+    },
+    // Linux x64, 1.24.4 (`onnxruntime-linux-x64-gpu-1.24.4.tgz`): `CUDA_ARCHS="60-real;70-real;
+    // 75-real;80-real;90a-real;90-virtual"` for CUDA 12.8 in
+    // `tools/ci_build/github/linux/build_cuda_c_api_package.sh` on rel-1.24.4 (`sm_90a` runs on
+    // 9.0 only, as `9.0` here). Minimum 6.0.
+    OrtCudaBuild {
+        os: "linux",
+        lane: CudaLane::Cuda12,
+        version: "1.24.4",
+        archs: CudaArchs {
+            sass: &[cc(6, 0), cc(7, 0), cc(7, 5), cc(8, 0), cc(9, 0)],
+            ptx: &[cc(9, 0)],
+        },
+    },
+    // Linux x64, 1.31.0 (`onnxruntime-linux-x64-gpu_cuda12-1.31.0.tgz`): `CUDA_ARCHS="60-real;
+    // 70-real;75-real;80-real;86-real;89-real;90-real;120-real"` for CUDA 12 in
+    // `tools/ci_build/github/linux/build_cuda_c_api_package.sh` on rel-1.31.0. Checked on the
+    // shipped `libonnxruntime_providers_cuda.so` (609 fatbinaries): SASS for exactly these, no
+    // PTX. Minimum 6.0.
+    OrtCudaBuild {
+        os: "linux",
+        lane: CudaLane::Cuda12,
+        version: "1.31.0",
+        archs: CudaArchs {
+            sass: &[
+                cc(6, 0),
+                cc(7, 0),
+                cc(7, 5),
+                cc(8, 0),
+                cc(8, 6),
+                cc(8, 9),
+                cc(9, 0),
+                cc(12, 0),
+            ],
+            ptx: &[],
+        },
+    },
+];
+
+/// GPU code of the ONNX Runtime `version` CUDA build of `lane` for `os`; None when the catalog
+/// does not know that build (another OS, or a user-managed library of another version).
+pub(crate) fn ort_cuda_archs(
+    os: &str,
+    lane: CudaLane,
+    version: &str,
+) -> Option<&'static CudaArchs> {
+    ORT_CUDA_BUILDS
+        .iter()
+        .find(|b| b.os == os && b.lane == lane && b.version == version)
+        .map(|b| &b.archs)
+}
+
+/// GPU code of the catalog's CUDA build ([`ONNXRUNTIME_CUDA_VERSION`]) for `os`.
+pub(crate) fn ort_cuda_catalog_archs(os: &str) -> Option<&'static CudaArchs> {
+    ort_cuda_archs(os, CudaLane::Cuda12, ONNXRUNTIME_CUDA_VERSION)
+}
+
+/// Lowest compute capability TensorRT 10 (the `ort:tensorrt` provider's library) supports:
+/// Turing. TensorRT 10 never supported Pascal and dropped Volta in 10.5 (NVIDIA's support
+/// matrix), whatever the ONNX Runtime build has kernels for.
+pub const TENSORRT_MIN_CC: ComputeCapability = cc(7, 5);
 
 /// Pinned DirectML redistributable (NuGet `Microsoft.AI.DirectML`).
 pub const DIRECTML_VERSION: &str = "1.15.4";
-/// Version label of `nvidia-cuda-libs`: CUDA 12.8 Update 1 components (ONNX Runtime 1.24's CUDA
-/// 12 build needs CUDA >= 12.8) and cuDNN 9.8.
-pub(crate) const CUDA_LIBS_VERSION: &str = "cuda-12.8.1+cudnn-9.8.0.87";
+/// Pinned cuDNN of `nvidia-cuda-libs`. 9.10.x is the last cuDNN with kernels for GPUs before
+/// Turing (Maxwell, Pascal, Volta: deprecated in 9.9, removed in 9.11.0), so this must stay below
+/// 9.11 while the CUDA 12 lane of [`ORT_CUDA_BUILDS`] lists SASS below 7.5 (a test checks it).
+pub const CUDNN_VERSION: &str = "9.10.2.21";
+/// Version label of `nvidia-cuda-libs`: CUDA 12.8 Update 1 components (ONNX Runtime's CUDA 12
+/// build is compiled with CUDA 12.8 and needs CUDA >= 12.8) and cuDNN [`CUDNN_VERSION`].
+pub(crate) const CUDA_LIBS_VERSION: &str = "cuda-12.8.1+cudnn-9.10.2.21";
 
 /// Downloads larger than this need `allow_large_downloads` (or a click in the UI).
 pub const LARGE_DOWNLOAD_BYTES: u64 = 500 * 1024 * 1024;
@@ -659,11 +799,13 @@ mod tests {
 
     #[test]
     fn ort_cuda_compute_capabilities() {
-        let win = ort_cuda_archs("windows").unwrap();
-        let linux = ort_cuda_archs("linux").unwrap();
-        assert!(ort_cuda_archs("macos").is_none());
-        assert_eq!(win.min(), Some(cc(7, 5)));
-        assert_eq!(linux.min(), Some(cc(6, 0)));
+        let archs = |os: &str, v: &str| ort_cuda_archs(os, CudaLane::Cuda12, v).unwrap();
+        assert!(ort_cuda_archs("macos", CudaLane::Cuda12, "1.31.0").is_none());
+        assert!(ort_cuda_archs("windows", CudaLane::Cuda12, "1.30.0").is_none());
+        assert_eq!(
+            ort_cuda_catalog_archs("windows"),
+            Some(archs("windows", ONNXRUNTIME_CUDA_VERSION))
+        );
         let runs = |a: &CudaArchs, v: &[(u32, u32)]| -> Vec<bool> {
             v.iter().map(|&(m, n)| a.runs_on(cc(m, n))).collect()
         };
@@ -682,19 +824,79 @@ mod tests {
             (10, 0),
             (12, 0),
         ];
+        // 1.24.4: Windows from Turing with PTX for Hopper and up; Linux from Pascal.
+        let win_old = archs("windows", "1.24.4");
+        assert_eq!(win_old.min(), Some(cc(7, 5)));
         assert_eq!(
-            runs(win, &probe),
+            runs(win_old, &probe),
             [
                 false, false, false, false, false, true, false, true, true, true, true, true, true
             ]
         );
+        assert_eq!(win_old.describe(), "7.5, 8.6, 8.9 (PTX 9.0)");
+        let linux_old = archs("linux", "1.24.4");
+        assert_eq!(linux_old.min(), Some(cc(6, 0)));
         assert_eq!(
-            runs(linux, &probe),
+            runs(linux_old, &probe),
             [
                 false, true, true, true, true, true, true, true, true, true, true, true, true
             ]
         );
-        assert_eq!(win.describe(), "7.5, 8.6, 8.9 (PTX 9.0)");
+        // 1.31.0: Pascal is back on Windows; no PTX anywhere, so the gaps are real.
+        let win = archs("windows", "1.31.0");
+        assert_eq!(win.min(), Some(cc(6, 1)));
+        assert_eq!(
+            runs(win, &probe),
+            [
+                false, false, true, false, false, true, false, true, true, true, false, false, true
+            ]
+        );
+        assert_eq!(win.describe(), "6.1, 7.5, 8.6, 8.9, 12.0");
+        let linux = archs("linux", "1.31.0");
+        assert_eq!(linux.min(), Some(cc(6, 0)));
+        assert_eq!(
+            runs(linux, &probe),
+            [
+                false, true, true, true, true, true, true, true, true, true, true, false, true
+            ]
+        );
+        assert!(TENSORRT_MIN_CC > cc(6, 1) && TENSORRT_MIN_CC <= cc(7, 5));
+    }
+
+    /// cuDNN 9.11 removed the Maxwell/Pascal/Volta kernels: while the catalog's CUDA 12 build
+    /// targets GPUs below Turing, the cuDNN pin must stay below 9.11 (and be the one shipped).
+    #[test]
+    fn cudnn_pin_keeps_pascal_while_the_cuda12_lane_has_pascal_kernels() {
+        let parse = |v: &str| -> (u32, u32) {
+            let mut it = v.split('.').map(|n| n.parse::<u32>().unwrap());
+            (it.next().unwrap(), it.next().unwrap())
+        };
+        assert!(CUDA_LIBS_VERSION.ends_with(&format!("+cudnn-{CUDNN_VERSION}")));
+        for r in CUDA_LIBS {
+            let cudnn: Vec<&Part> = r
+                .parts
+                .iter()
+                .filter(|p| p.file_name.starts_with("nvidia_cudnn_cu12-"))
+                .collect();
+            assert_eq!(cudnn.len(), 1, "{}", r.id);
+            assert!(
+                cudnn[0]
+                    .file_name
+                    .starts_with(&format!("nvidia_cudnn_cu12-{CUDNN_VERSION}-")),
+                "{}",
+                cudnn[0].file_name
+            );
+        }
+        let pre_turing = ORT_CUDA_BUILDS.iter().any(|b| {
+            b.lane == CudaLane::Cuda12
+                && b.version == ONNXRUNTIME_CUDA_VERSION
+                && b.archs.sass.iter().any(|a| *a < cc(7, 5))
+        });
+        assert!(pre_turing, "the CUDA 12 lane is expected to cover Pascal");
+        assert!(
+            parse(CUDNN_VERSION) < (9, 11),
+            "cuDNN {CUDNN_VERSION} has no Pascal kernels"
+        );
     }
 
     #[test]
@@ -724,7 +926,7 @@ mod tests {
         );
         assert_eq!(
             find("onnxruntime-cuda", "windows", "x86_64").unwrap().parts[0].file_name,
-            "onnxruntime-win-x64-gpu-1.24.4.zip"
+            "onnxruntime-win-x64-gpu_cuda12-1.31.0.zip"
         );
         assert!(find("onnxruntime-cuda", "macos", "aarch64").is_none());
     }

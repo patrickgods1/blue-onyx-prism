@@ -44,13 +44,16 @@ pub struct Part {
     pub size: u64,
 }
 
-/// Flavor `--flavor auto` installs on this hardware. CUDA needs an NVIDIA GPU the pinned CUDA
-/// build has kernels for (or one of unknown compute capability).
+/// Flavor `--flavor auto` installs on this hardware. CUDA needs an NVIDIA GPU the catalog's CUDA
+/// build has kernels for (or one of unknown compute capability) and a driver that supports the
+/// CUDA 12 libraries (or one of unknown version).
 pub fn auto_flavor(hw: &crate::backend::detect::HardwareInfo) -> Flavor {
     use crate::backend::detect::GpuVendor;
-    let cuda_gpu = hw
-        .gpus_of(GpuVendor::Nvidia)
-        .any(|g| crate::backend::select::ort_cuda_unsupported(hw, g).is_none());
+    use crate::backend::select::{cuda_driver_unsupported, ort_cuda_unsupported};
+    let cuda_gpu = cuda_driver_unsupported(hw, catalog::CudaLane::Cuda12).is_none()
+        && hw
+            .gpus_of(GpuVendor::Nvidia)
+            .any(|g| ort_cuda_unsupported(hw, g, None).is_none());
     match (hw.os.as_str(), hw.arch.as_str()) {
         ("windows", "x86_64") if cuda_gpu => Flavor::Cuda,
         ("windows", _) => Flavor::DirectMl,
@@ -166,7 +169,8 @@ pub fn run(opts: &SetupOptions) -> Result<(PathBuf, Flavor)> {
     mopts.on_progress = Some(manager::cli_progress());
     manager::install_all(mopts, vec![job])?;
     println!(
-        "ONNX Runtime {ONNXRUNTIME_VERSION} ({flavor}; {:.1} MB) installed at {}{}",
+        "ONNX Runtime {} ({flavor}; {:.1} MB) installed at {}{}",
+        resource.version,
         dir_size(&dest) as f64 / 1e6,
         dest.display(),
         if opts.dest.is_none() {
@@ -216,7 +220,8 @@ mod tests {
         assert_eq!(auto_flavor(&hw("linux", "aarch64", &[n])), Flavor::Cpu);
         assert_eq!(auto_flavor(&hw("macos", "aarch64", &[])), Flavor::CoreMl);
 
-        // An NVIDIA GPU the CUDA build has no kernels for: not CUDA.
+        // An NVIDIA GPU the catalog's CUDA build has no kernels for: not CUDA. The 1.31.0
+        // Windows build covers 6.1, 7.5, 8.6, 8.9 and 12.0; Linux 6.0 and up (10.0 excepted).
         let with_cc = |os: &str, major: u32, minor: u32| {
             let mut h = hw(os, "x86_64", &[i, n]);
             h.gpus[1].cuda = Some(crate::backend::detect::CudaInfo {
@@ -225,15 +230,29 @@ mod tests {
             });
             h
         };
-        assert_eq!(auto_flavor(&with_cc("windows", 6, 1)), Flavor::DirectMl);
+        assert_eq!(auto_flavor(&with_cc("windows", 6, 1)), Flavor::Cuda);
+        assert_eq!(auto_flavor(&with_cc("windows", 5, 2)), Flavor::DirectMl);
+        assert_eq!(auto_flavor(&with_cc("windows", 7, 0)), Flavor::DirectMl);
         assert_eq!(auto_flavor(&with_cc("windows", 8, 6)), Flavor::Cuda);
+        assert_eq!(auto_flavor(&with_cc("windows", 9, 0)), Flavor::DirectMl);
+        assert_eq!(auto_flavor(&with_cc("windows", 12, 0)), Flavor::Cuda);
         assert_eq!(auto_flavor(&with_cc("linux", 5, 2)), Flavor::Cpu);
         assert_eq!(auto_flavor(&with_cc("linux", 6, 1)), Flavor::Cuda);
+        // A driver older than the CUDA 12 libraries need: not CUDA either.
+        assert_eq!(
+            auto_flavor(&with_cc("windows", 8, 6).with_cuda_driver(11, 8)),
+            Flavor::DirectMl
+        );
+        assert_eq!(
+            auto_flavor(&with_cc("windows", 8, 6).with_cuda_driver(12, 8)),
+            Flavor::Cuda
+        );
     }
 
     #[test]
     fn packages_per_platform() {
         let v = ONNXRUNTIME_VERSION;
+        let cv = catalog::ONNXRUNTIME_CUDA_VERSION;
         let one = |os, arch, f| {
             let p = packages_for(os, arch, f).unwrap();
             assert_eq!(p.len(), 1);
@@ -241,11 +260,11 @@ mod tests {
         };
         assert!(
             one("windows", "x86_64", Flavor::Cuda)
-                .ends_with(&format!("onnxruntime-win-x64-gpu-{v}.zip"))
+                .ends_with(&format!("onnxruntime-win-x64-gpu_cuda12-{cv}.zip"))
         );
         assert!(
             one("linux", "x86_64", Flavor::Cuda)
-                .ends_with(&format!("onnxruntime-linux-x64-gpu-{v}.tgz"))
+                .ends_with(&format!("onnxruntime-linux-x64-gpu_cuda12-{cv}.tgz"))
         );
         assert!(
             one("linux", "x86_64", Flavor::Cpu)

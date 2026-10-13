@@ -110,10 +110,12 @@ pub(crate) static OPENVINO: &[Resource] = &[
 // ---------------------------------------------------------------------------------------------
 
 macro_rules! ort_release {
-    ($file:literal, $kind:expr, $sha:literal, $size:literal) => {
+    ($ver:literal, $file:literal, $kind:expr, $sha:literal, $size:literal) => {
         Part {
             url: concat!(
-                "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/",
+                "https://github.com/microsoft/onnxruntime/releases/download/v",
+                $ver,
+                "/",
                 $file
             ),
             sha256: $sha,
@@ -157,7 +159,7 @@ const fn ort(
     Resource {
         id: flavor.resource_id(),
         kind: ResourceKind::OnnxRuntime(flavor),
-        version: ONNXRUNTIME_VERSION,
+        version: onnxruntime_version(flavor),
         platform: Some(platform),
         parts,
         dest: flavor.dest(),
@@ -172,6 +174,7 @@ const fn ort(
 }
 
 const ORT_OSX_ARM64: Part = ort_release!(
+    "1.24.4",
     "onnxruntime-osx-arm64-1.24.4.tgz",
     ArchiveKind::TarGz,
     "93787795f47e1eee369182e43ed51b9e5da0878ab0346aecf4258979b8bba989",
@@ -184,6 +187,7 @@ pub(crate) static ONNXRUNTIME: &[Resource] = &[
         Platform::WINDOWS_X64,
         Flavor::Cpu,
         &[ort_release!(
+            "1.24.4",
             "onnxruntime-win-x64-1.24.4.zip",
             ArchiveKind::Zip,
             "d2319fddfb6ea4db99ccc4b60c85c517bcd855721f5daa6a06d40d7cb2ee2357",
@@ -195,12 +199,13 @@ pub(crate) static ONNXRUNTIME: &[Resource] = &[
         Platform::WINDOWS_X64,
         Flavor::Cuda,
         &[ort_release!(
-            "onnxruntime-win-x64-gpu-1.24.4.zip",
+            "1.31.0",
+            "onnxruntime-win-x64-gpu_cuda12-1.31.0.zip",
             ArchiveKind::Zip,
-            "ef3337a0b8184eb8beec310f7c83bd50376b3eefc43aab84ac8e452f6987df0a",
-            280958859
+            "fa79097fa478961cbd31c297671ac169eb0d3f1dfdc9e8481e091850f8c4810b",
+            392994831
         )],
-        "ONNX Runtime CUDA/TensorRT",
+        "ONNX Runtime CUDA/TensorRT (CUDA 12)",
     ),
     ort(
         Platform::WINDOWS_X64,
@@ -227,6 +232,7 @@ pub(crate) static ONNXRUNTIME: &[Resource] = &[
         Platform::LINUX_X64,
         Flavor::Cpu,
         &[ort_release!(
+            "1.24.4",
             "onnxruntime-linux-x64-1.24.4.tgz",
             ArchiveKind::TarGz,
             "3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747",
@@ -238,17 +244,19 @@ pub(crate) static ONNXRUNTIME: &[Resource] = &[
         Platform::LINUX_X64,
         Flavor::Cuda,
         &[ort_release!(
-            "onnxruntime-linux-x64-gpu-1.24.4.tgz",
+            "1.31.0",
+            "onnxruntime-linux-x64-gpu_cuda12-1.31.0.tgz",
             ArchiveKind::TarGz,
-            "c5f804ff5d239b436fa59e9f2fb288a39f7eb9552f6a636c8b71e792e91a8808",
-            205429115
+            "62d3af5269af2143b5d37494337573f1ffb8885f3ad7477ae0cb1cc79c8dedfd",
+            450228883
         )],
-        "ONNX Runtime CUDA/TensorRT",
+        "ONNX Runtime CUDA/TensorRT (CUDA 12)",
     ),
     ort(
         Platform::LINUX_ARM64,
         Flavor::Cpu,
         &[ort_release!(
+            "1.24.4",
             "onnxruntime-linux-aarch64-1.24.4.tgz",
             ArchiveKind::TarGz,
             "866109a9248d057671a039b9d725be4bd86888e3754140e6701ec621be9d4d7e",
@@ -321,16 +329,17 @@ const fn cuda_libs(platform: Platform, parts: &'static [Part]) -> Resource {
         parts,
         dest: CUDA_LIBS_DEST,
         provides: Provides::CudaLibs,
-        title: "NVIDIA CUDA 12 + cuDNN 9 libraries",
+        title: "NVIDIA CUDA 12 + cuDNN 9.10 libraries",
         description: "CUDA runtime, cuBLAS, cuDNN, cuFFT, cuRAND for ort:cuda (large, opt-in)",
         license: "NVIDIA Software License Agreement (CUDA, cuDNN redistributables)",
     }
 }
 
-/// `nvidia-cuda-libs`: what ONNX Runtime's CUDA provider links (cudart, cuBLAS/cuBLASLt, cuDNN 9,
-/// cuFFT, cuRAND; checked against `libonnxruntime_providers_cuda.so` 1.24.4), plus nvJitLink
-/// (cuFFT's dependency) and NVRTC (cuDNN's runtime-compiled engines). The driver's `libcuda`
-/// / `nvcuda.dll` is not included.
+/// `nvidia-cuda-libs`: what ONNX Runtime's CUDA provider uses: cudart, cuBLAS/cuBLASLt, cuRAND
+/// and NVRTC are linked (import tables of the 1.31.0 provider libraries), cuDNN 9 and cuFFT are
+/// loaded at run time (linked in 1.24.4), plus nvJitLink (cuFFT's dependency). cuDNN stays at
+/// 9.10 (`CUDNN_VERSION`): the last with Pascal kernels. The driver's `libcuda` / `nvcuda.dll` is
+/// not included.
 pub(crate) static CUDA_LIBS: &[Resource] = &[
     cuda_libs(
         Platform::WINDOWS_X64,
@@ -346,9 +355,9 @@ pub(crate) static CUDA_LIBS: &[Resource] = &[
                 567544208
             ),
             wheel!(
-                "https://files.pythonhosted.org/packages/39/6a/5e9910b2b2c9dcddee9aaef372b3db0f08b9f7eaf1d462f859461a79caf9/nvidia_cudnn_cu12-9.8.0.87-py3-none-win_amd64.whl",
-                "b4b5cfddc32aa4180f9d390ee99e9a9f55a89e7087329b41aba4319327e22466",
-                684630375
+                "https://files.pythonhosted.org/packages/3d/90/0bd6e586701b3a890fd38aa71c387dab4883d619d6e5ad912ccbd05bfd67/nvidia_cudnn_cu12-9.10.2.21-py3-none-win_amd64.whl",
+                "c6288de7d63e6cf62988f0923f96dc339cea362decb1bf5b3141883392a7d65e",
+                692992268
             ),
             wheel!(
                 "https://files.pythonhosted.org/packages/7d/ec/ce1629f1e478bb5ccd208986b5f9e0316a78538dd6ab1d0484f012f8e2a1/nvidia_cufft_cu12-11.3.3.83-py3-none-win_amd64.whl",
@@ -386,9 +395,9 @@ pub(crate) static CUDA_LIBS: &[Resource] = &[
                 594346921
             ),
             wheel!(
-                "https://files.pythonhosted.org/packages/77/f0/8236c886a061d203e51247aec2b8e3a8f5350178251ab57237daf2140680/nvidia_cudnn_cu12-9.8.0.87-py3-none-manylinux_2_27_x86_64.whl",
-                "d6b02cd0e3e24aa31d0193a8c39fec239354360d7d81055edddb69f35d53a4c8",
-                697999707
+                "https://files.pythonhosted.org/packages/ba/51/e123d997aa098c61d029f76663dedbfb9bc8dcf8c60cbd6adbe42f76d049/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl",
+                "949452be657fa16687d0930933f032835951ef0892b37d2d53824d1a84dc97a8",
+                706758467
             ),
             wheel!(
                 "https://files.pythonhosted.org/packages/1f/13/ee4e00f30e676b66ae65b4f08cb5bcbb8392c03f54f2d5413ea99a5d1c80/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",

@@ -68,6 +68,23 @@ pub struct RunRequest {
     /// What the accuracy grade is computed from.
     #[serde(default)]
     pub accuracy_metric: AccuracyMetric,
+    /// Run at below-normal process priority (`benchmark.low_priority`, see
+    /// [`crate::backend::priority`]).
+    #[serde(default = "default_true")]
+    pub low_priority: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A form boolean: `1`/`on`/`true`/`yes` or `0`/`off`/`false`/`no` (case-insensitive).
+fn parse_form_bool(key: &str, v: &str) -> Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" | "yes" => Ok(true),
+        "0" | "off" | "false" | "no" => Ok(false),
+        _ => bail!("{key}: '{v}' is not a yes/no value (use 1 or 0)"),
+    }
 }
 
 impl RunRequest {
@@ -84,6 +101,7 @@ impl RunRequest {
             weights: b.weights,
             threshold_objective: b.threshold_objective,
             accuracy_metric: b.accuracy_metric,
+            low_priority: b.low_priority,
         }
     }
 
@@ -91,7 +109,8 @@ impl RunRequest {
     /// a given field replaces the default list), `max_images`, `repeat`, `warmup`,
     /// `reference_model` ("" = automatic), `accuracy_weight` (0..1), `threshold_objective`
     /// (`f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`), `accuracy_metric`
-    /// (`ap50`, `roc_auc`).
+    /// (`ap50`, `roc_auc`), `low_priority` (the last value wins: the page sends a hidden `0`
+    /// followed by the checkbox's `1`).
     pub fn from_form(form: &[(String, String)], defaults: &BenchmarkConfig) -> Result<Self> {
         let has = |k: &str| form.iter().any(|(key, _)| key == k);
         let all = |k: &str| -> Vec<String> {
@@ -144,6 +163,9 @@ impl RunRequest {
         if let Some(m) = one("accuracy_metric").filter(|m| !m.is_empty()) {
             req.accuracy_metric = m.parse().map_err(|e: String| anyhow::anyhow!(e))?;
         }
+        if let Some((_, v)) = form.iter().rev().find(|(key, _)| key == "low_priority") {
+            req.low_priority = parse_form_bool("low_priority", v)?;
+        }
         req.validate()?;
         Ok(req)
     }
@@ -185,6 +207,7 @@ impl RunRequest {
         b.weights = self.weights;
         b.threshold_objective = self.threshold_objective;
         b.accuracy_metric = self.accuracy_metric;
+        b.low_priority = self.low_priority;
     }
 }
 
@@ -363,6 +386,7 @@ impl BenchmarkService {
     where
         F: FnOnce(&RunHandle) -> Result<String> + Send + 'static,
     {
+        let low_priority = request.low_priority;
         let run_id = {
             let mut g = self.lock();
             if g.state == RunState::Running {
@@ -391,8 +415,11 @@ impl BenchmarkService {
                     svc: me.clone(),
                     run_id,
                 };
-                let outcome =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&handle)));
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Inside the closure: a panic unwinds through the guard, restoring too.
+                    let _prio = crate::backend::priority::lower_for_benchmark(low_priority, true);
+                    job(&handle)
+                }));
                 let mut g = me.lock();
                 if g.run_id != run_id {
                     return;
@@ -1251,6 +1278,8 @@ mod tests {
             weights: Weights::default(),
             threshold_objective: Objective::default(),
             accuracy_metric: AccuracyMetric::default(),
+            // Tests never change the test process's priority.
+            low_priority: false,
         }
     }
 
@@ -1286,6 +1315,7 @@ mod tests {
         assert!((r.weights.accuracy_share() - 0.8).abs() < 1e-12);
         assert_eq!(r.threshold_objective, Objective::Precision(0.9));
         assert_eq!(r.accuracy_metric, AccuracyMetric::RocAuc);
+        assert!(r.low_priority, "absent = the config default");
         let d = r.parsed_devices().unwrap().unwrap();
         assert_eq!(d.len(), 2);
         assert_eq!(d[1].to_string(), "ort:coreml");
@@ -1309,11 +1339,22 @@ mod tests {
                 ("repeat", "3"),
                 ("threshold_objective", "youden"),
                 ("accuracy_metric", "roc_auc"),
+                ("low_priority", "0"),
             ]),
             &b,
         )
         .unwrap();
+        assert!(!r.low_priority);
         r.to_config(&mut b);
+        assert!(!b.low_priority);
+        // Hidden 0 then the checked checkbox's 1: the last value wins.
+        let r = RunRequest::from_form(&form(&[("low_priority", "0"), ("low_priority", "1")]), &b)
+            .unwrap();
+        assert!(r.low_priority);
+        let r = RunRequest::from_form(&form(&[("low_priority", "0")]), &defaults).unwrap();
+        assert!(!r.low_priority);
+        let r = RunRequest::from_form(&form(&[("low_priority", " ON ")]), &b).unwrap();
+        assert!(r.low_priority);
         assert_eq!(b.accuracy_metric, AccuracyMetric::RocAuc);
         assert_eq!(b.repeat_per_image, 3);
         assert_eq!(b.threshold_objective, Objective::Youden);
@@ -1328,6 +1369,7 @@ mod tests {
             (form(&[("accuracy_weight", "2")]), "accuracy_weight"),
             (form(&[("dataset", "")]), "dataset"),
             (form(&[("threshold_objective", "f3")]), "objective"),
+            (form(&[("low_priority", "maybe")]), "low_priority"),
             (form(&[("accuracy_metric", "map")]), "accuracy metric"),
         ] {
             let e = RunRequest::from_form(&bad, &defaults).unwrap_err();
