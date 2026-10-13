@@ -108,9 +108,9 @@ impl std::str::FromStr for AccuracyMetric {
 /// Full-request p50 upper bounds (ms, exclusive) of A, B, C, D.
 pub const SPEED_THRESHOLDS_MS: [f64; 4] = [50.0, 100.0, 200.0, 400.0];
 /// Share of small-object recall in the accuracy score (when there are small objects).
-pub const SMALL_RECALL_WEIGHT: f64 = 0.2;
+pub(crate) const SMALL_RECALL_WEIGHT: f64 = 0.2;
 /// Default share of accuracy in the overall grade (speed gets the rest).
-pub const DEFAULT_ACCURACY_WEIGHT: f64 = 0.6;
+pub(crate) const DEFAULT_ACCURACY_WEIGHT: f64 = 0.6;
 /// Overall-points lower bounds of A, B, C, D.
 const OVERALL_THRESHOLDS: [f64; 4] = [3.5, 2.5, 1.5, 0.5];
 
@@ -214,11 +214,24 @@ impl Weights {
 }
 
 /// Accuracy score: AP@0.5 blended with small-object recall (see the module docs).
-pub fn accuracy_score(ap50: f64, small_recall: Option<f64>) -> f64 {
+pub(crate) fn accuracy_score(ap50: f64, small_recall: Option<f64>) -> f64 {
     match small_recall {
         Some(r) => (1.0 - SMALL_RECALL_WEIGHT) * ap50 + SMALL_RECALL_WEIGHT * r,
         None => ap50,
     }
+}
+
+/// Stand-in for a p50 that is not a finite number (serde_json writes those as `null`).
+const NO_P50_MS: f64 = f64::MAX;
+
+fn no_p50() -> f64 {
+    NO_P50_MS
+}
+
+fn p50_or_sentinel<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?
+        .filter(|v| v.is_finite())
+        .unwrap_or(NO_P50_MS))
 }
 
 /// The grades of one model on one device.
@@ -227,7 +240,9 @@ pub struct Grades {
     pub accuracy: Option<Grade>,
     pub accuracy_score: Option<f64>,
     pub speed: Grade,
-    /// Full-request p50 the speed grade is based on.
+    /// Full-request p50 the speed grade is based on. `f64::MAX` stands for a non-finite p50
+    /// (graded F); a stored `null` loads as that sentinel.
+    #[serde(default = "no_p50", deserialize_with = "p50_or_sentinel")]
     pub p50_ms: f64,
     pub overall: Grade,
     /// Weighted grade points, 0..4 (ranking key).
@@ -260,6 +275,14 @@ impl Grades {
         weights: Weights,
         relative: bool,
     ) -> Self {
+        // Non-finite values would round-trip through benchmark.json as `null`: a NaN/inf p50
+        // becomes the F-graded sentinel, a NaN/inf score means "unscored".
+        let p50_ms = if p50_ms.is_finite() {
+            p50_ms
+        } else {
+            NO_P50_MS
+        };
+        let accuracy_score = accuracy_score.filter(|s| s.is_finite());
         let speed = Grade::speed(p50_ms);
         let accuracy = accuracy_score.map(|s| Grade::accuracy_for(metric, s));
         let points = match accuracy {
@@ -301,6 +324,25 @@ impl Grades {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BQ-12: non-finite inputs are sanitized and an old `p50_ms: null` file still loads.
+    #[test]
+    fn non_finite_grade_inputs_are_sanitized() {
+        let w = Weights::default();
+        let g = Grades::new(Some(f64::NAN), f64::INFINITY, w, false);
+        assert_eq!(g.accuracy_score, None);
+        assert_eq!(g.accuracy, None);
+        assert_eq!(g.p50_ms, f64::MAX);
+        assert_eq!(g.speed, Grade::F);
+        let back: Grades = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(back, g);
+        let ok = Grades::new(Some(0.8), 30.0, w, false);
+        let mut v = serde_json::to_value(ok).unwrap();
+        v["p50_ms"] = serde_json::Value::Null;
+        let loaded: Grades = serde_json::from_value(v).unwrap();
+        assert_eq!(loaded.p50_ms, f64::MAX);
+        assert_eq!(loaded.accuracy_score, Some(0.8));
+    }
 
     #[test]
     fn speed_thresholds() {

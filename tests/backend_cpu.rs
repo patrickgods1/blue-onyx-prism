@@ -107,7 +107,8 @@ fn cpu_and_gpu_inference() {
         assert_eq!(outs[0].as_f32().expect("f32 output").len(), 25200 * 8);
     }
 
-    // ONNX Runtime is not in this build yet: the spec falls back to OpenVINO CPU.
+    // `Runtimes::new` configures no ONNX Runtime library here, so the `ort:cuda` spec falls back to
+    // OpenVINO CPU (the ORT backend itself is covered by tests/backend_ort.rs).
     let backend = rt
         .load(&spec::parse("ort:cuda").unwrap(), &req("ort:cuda"))
         .expect("ort:cuda falls back to CPU");

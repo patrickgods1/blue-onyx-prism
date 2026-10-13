@@ -85,11 +85,20 @@ fn total_memory_bytes() -> Option<u64> {
 #[cfg(windows)]
 const MEMORY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Windows: ask CIM through the system PowerShell, by absolute path (never the search path)
-/// and with [`MEMORY_QUERY_TIMEOUT`]; a hung or missing PowerShell gives `None` (logged).
-/// `GlobalMemoryStatusEx` would need `unsafe`, which the project keeps in `src/backend/`.
+/// Windows: `GlobalMemoryStatusEx` (`backend::memory`, no process spawned); only when that
+/// fails, the PowerShell fallback [`total_memory_bytes_powershell`].
 #[cfg(windows)]
 fn total_memory_bytes() -> Option<u64> {
+    crate::backend::memory::total_physical_bytes().or_else(|| {
+        tracing::debug!("GlobalMemoryStatusEx failed; asking CIM through PowerShell");
+        total_memory_bytes_powershell()
+    })
+}
+
+/// Windows fallback: ask CIM through the system PowerShell, by absolute path (never the search
+/// path) and with [`MEMORY_QUERY_TIMEOUT`]; a hung or missing PowerShell gives `None` (logged).
+#[cfg(windows)]
+fn total_memory_bytes_powershell() -> Option<u64> {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let exe = std::path::Path::new(&root)
         .join("System32")

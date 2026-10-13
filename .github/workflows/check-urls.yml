@@ -1,4 +1,4 @@
-# Weekly check that every pinned download in the resource catalog (src/resources/catalog.rs) still
+# Weekly check that every pinned download in the resource catalog (src/resources/catalog/) still
 # answers with its catalogued size: OpenVINO, ONNX Runtime, DirectML, the NVIDIA wheels and the
 # models, for every platform. Hashes are pinned in the binary; this catches moved or deleted
 # files before users hit them. A failed scheduled run opens an issue (or comments on the open one),
@@ -41,7 +41,7 @@ jobs:
           set -euo pipefail
           title="Catalog URL check failed"
           {
-            echo "The check of the pinned download URLs in src/resources/catalog.rs failed: $RUN_URL"
+            echo "The check of the pinned download URLs in src/resources/catalog/ failed: $RUN_URL"
             echo
             echo "A moved or deleted file breaks first-run downloads for users. Update the pin (URL, size, SHA-256) in a reviewed commit, or re-run the workflow if it was a transient outage."
             echo

@@ -195,7 +195,6 @@ fn model_download_goes_initializing_to_ready_without_restart() {
 
     token.cancel();
     reg.shutdown();
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -225,7 +224,6 @@ fn auto_download_off_fails_with_the_command() {
     }
     token.cancel();
     reg.shutdown();
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

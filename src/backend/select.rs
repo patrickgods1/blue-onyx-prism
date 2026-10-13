@@ -6,7 +6,7 @@
 //! 1. Discrete GPUs, larger VRAM first (ties: platform order), each with its runtimes in order:
 //!    - NVIDIA -> `ort:cuda:<ordinal>`, `ort:tensorrt:<ordinal>`, then (Windows)
 //!      `ort:directml:<DXGI index>`. A GPU whose compute capability the pinned ONNX Runtime CUDA
-//!      build has no kernels for (e.g. Pascal 6.1 on Windows, see [`ort_cuda_unsupported`]) is
+//!      build has no kernels for (e.g. Pascal 6.1 on Windows, see `ort_cuda_unsupported`) is
 //!      not runnable on CUDA/TensorRT, so DirectML is its first option
 //!    - Intel (Arc) -> `openvino:gpu.N` (OpenVINO's k-th discrete GPU), then `ort:directml:N`
 //!    - AMD and others -> `ort:directml:N` (Windows)
@@ -52,12 +52,12 @@ impl OvDevice {
         }
     }
 
-    pub fn is_gpu(&self) -> bool {
+    pub(crate) fn is_gpu(&self) -> bool {
         self.name.starts_with("GPU")
     }
 
     /// `DEVICE_TYPE=discrete`, or a full name marked "(dGPU)" when the type is unknown.
-    pub fn is_discrete(&self) -> bool {
+    pub(crate) fn is_discrete(&self) -> bool {
         match self.device_type.as_deref() {
             Some(t) => t.trim().eq_ignore_ascii_case("discrete"),
             None => self.full_name.contains("(dGPU)"),
@@ -66,7 +66,7 @@ impl OvDevice {
 
     /// Intel GPU, or unknown (OpenVINO's GPU plugin targets Intel; non-Intel OpenCL devices it may
     /// list are not picked by `auto`).
-    pub fn is_intel_or_unknown(&self) -> bool {
+    pub(crate) fn is_intel_or_unknown(&self) -> bool {
         self.full_name.is_empty() || self.full_name.contains("Intel")
     }
 
@@ -83,7 +83,7 @@ impl OvDevice {
 /// it the same way, BE-09): with numbered GPUs (`GPU.0`, `GPU.1`, ..) listed, `GPU.0` when it is
 /// an Intel GPU, else the first Intel `GPU.N` (OpenVINO's OpenCL plugin can list an NVIDIA card
 /// first), else `GPU.0`; otherwise the single `GPU`. None when no GPU is listed.
-pub fn bare_gpu_device(devices: &[OvDevice]) -> Option<&OvDevice> {
+pub(crate) fn bare_gpu_device(devices: &[OvDevice]) -> Option<&OvDevice> {
     let numbered: Vec<&OvDevice> = devices
         .iter()
         .filter(|d| d.name.starts_with("GPU."))
@@ -168,8 +168,8 @@ impl EpStatus {
     }
 }
 
-/// What ONNX Runtime offers. Phase 6.3 fills this from the loaded library; until then it is
-/// [`OrtProbe::not_in_build`].
+/// What ONNX Runtime offers: filled by `ort::probe_providers` from the loaded library;
+/// [`OrtProbe::not_in_build`] without the `onnxruntime` feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrtProbe {
     /// Why ONNX Runtime cannot be used at all (None = library loaded), e.g. "run
@@ -331,7 +331,7 @@ impl Selection {
     /// Mark `spec` downloadable with `offer`. A runnable option is left alone (and `auto` is
     /// never changed: it only ever holds runnable options); an option this machine's selection
     /// does not list (e.g. OpenVINO GPU before OpenVINO is installed) is added, not runnable.
-    pub fn offer_download(&mut self, spec: Device, label: &str, offer: DownloadOffer) {
+    pub(crate) fn offer_download(&mut self, spec: Device, label: &str, offer: DownloadOffer) {
         match self.options.iter_mut().find(|o| o.spec == spec) {
             Some(o) if o.runnable => {}
             Some(o) => o.download = Some(offer),
@@ -778,7 +778,7 @@ impl<'a> GpuRanking<'a> {
 /// The NVIDIA GPUs with their CUDA ordinals (what `ort:cuda:N` means), in ordinal order. The
 /// driver's ordinals when it reported every NVIDIA GPU ([`GpuAdapter::cuda`]); otherwise the
 /// position among the NVIDIA adapters in platform order (exact with one NVIDIA GPU).
-pub fn cuda_ordinals(hw: &HardwareInfo) -> Vec<(u32, &GpuAdapter)> {
+pub(crate) fn cuda_ordinals(hw: &HardwareInfo) -> Vec<(u32, &GpuAdapter)> {
     let mut nvidia: Vec<&GpuAdapter> = hw.gpus_of(GpuVendor::Nvidia).collect();
     nvidia.sort_by_key(|g| g.index);
     if nvidia.iter().all(|g| g.cuda.is_some()) {
@@ -796,7 +796,7 @@ pub fn cuda_ordinals(hw: &HardwareInfo) -> Vec<(u32, &GpuAdapter)> {
 /// Why the pinned ONNX Runtime CUDA build (CUDA and TensorRT providers) cannot run on NVIDIA GPU
 /// `g`: it has no kernels for the GPU's compute capability (see `catalog::ort_cuda_archs`).
 /// None when it can, or when the compute capability is unknown (no CUDA driver).
-pub fn ort_cuda_unsupported(hw: &HardwareInfo, g: &GpuAdapter) -> Option<String> {
+pub(crate) fn ort_cuda_unsupported(hw: &HardwareInfo, g: &GpuAdapter) -> Option<String> {
     let cc = g.cuda?.compute_capability;
     let archs = catalog::ort_cuda_archs(&hw.os)?;
     if archs.runs_on(cc) {

@@ -1,7 +1,7 @@
 //! ONNX Runtime backend (Cargo feature `onnxruntime`), built on the `ort` 2.x crate with
 //! `load-dynamic`: the ONNX Runtime shared library is opened at startup from config
 //! `onnxruntime_dir`, `ORT_DYLIB_PATH` or `<exe_dir>/onnxruntime` (see
-//! [`libs::find_onnxruntime`]), never linked. All `ort` crate code lives in this file.
+//! `libs::find_onnxruntime`), never linked. All `ort` crate code lives in this file.
 //!
 //! - [`OrtRuntime::new`] loads the library once per process (a process can hold only one ONNX
 //!   Runtime) and probes its execution providers into an [`OrtProbe`]: `is_available()` per EP,
@@ -22,7 +22,7 @@
 //!   OpenVINO reshape), so the ports reported in [`ModelInfo`] are static and `make_family`
 //!   auto-detection is unchanged. Pinning is also what lets RT-DETR run on CoreML: an RT-DETR
 //!   model that keeps an unpinnable dynamic input dimension is refused there (see
-//!   [`unsupported_on`]).
+//!   `unsupported_on`).
 //! - [`OrtBackend`] runs each session (`ort_sessions`, one model copy each) on its own thread,
 //!   one inference in flight per session (`Session::run` takes `&mut self`): `submit` copies the
 //!   CHW image into the slot's buffer and hands it over, the thread converts extra inputs to the
@@ -336,7 +336,7 @@ impl std::fmt::Debug for OrtRuntime {
 }
 
 impl OrtRuntime {
-    /// Load the library at `path` (from [`libs::find_onnxruntime`]), then probe its execution
+    /// Load the library at `path` (from `libs::find_onnxruntime`), then probe its execution
     /// providers.
     ///
     /// `cuda_libs`: the `onnxruntime/cuda-libs` directory of `nvidia-cuda-libs`. When it exists,
@@ -776,7 +776,7 @@ impl OrtRuntime {
 }
 
 /// Environment variable that turns the CoreML graph rewrite off (`0`, `false`, `off`, `no`).
-pub const ENV_COREML_REWRITE: &str = "BOP_COREML_REWRITE";
+pub(crate) const ENV_COREML_REWRITE: &str = "BOP_COREML_REWRITE";
 
 /// Whether the CoreML graph rewrite runs, given the value of [`ENV_COREML_REWRITE`].
 pub(crate) fn coreml_rewrite_enabled(env: Option<&str>) -> bool {
@@ -1019,7 +1019,7 @@ impl std::fmt::Debug for OrtCompiled {
 
 impl OrtCompiled {
     /// Start one thread per session ([`OrtBackend`]).
-    pub fn into_backend(self) -> Result<OrtBackend> {
+    pub(crate) fn into_backend(self) -> Result<OrtBackend> {
         let image_idx = self
             .info
             .inputs
@@ -1128,7 +1128,7 @@ impl OrtSlot {
 /// gives the session up as hung. A session wedged in `Session::run` (a driver hang) cannot be
 /// interrupted: its thread is detached and keeps the session (and its GPU memory) until the
 /// call returns, possibly for the rest of the process (BE-10).
-pub const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Per-worker ONNX Runtime inference state: one session per slot, each on its own thread
 /// (`Session::run` takes `&mut self`, so one inference in flight per session).
@@ -1387,18 +1387,18 @@ impl OrtBackend {
     }
 
     /// Completions of submitted inferences.
-    pub fn completions(&self) -> &crossbeam_channel::Receiver<Completion> {
+    pub(crate) fn completions(&self) -> &crossbeam_channel::Receiver<Completion> {
         &self.done_rx
     }
 
-    pub fn is_busy(&self, slot: usize) -> bool {
+    pub(crate) fn is_busy(&self, slot: usize) -> bool {
         self.slots.get(slot).is_some_and(|s| s.busy)
     }
 
     /// False once any session thread is gone (panicked, exited or hung past
     /// [`ABORT_TIMEOUT`]): that slot answers every `submit` with [`SessionDead`] until the
     /// model is reloaded.
-    pub fn is_healthy(&self) -> bool {
+    pub(crate) fn is_healthy(&self) -> bool {
         self.slots.iter().all(|s| {
             s.dead.is_none()
                 && s.jobs.is_some()
@@ -1409,7 +1409,7 @@ impl OrtBackend {
     /// Hand one inference to `slot`'s session thread (the image is copied into the slot's
     /// buffer). Returns its sequence number. A dead session thread fails with [`SessionDead`]
     /// (see [`super::is_session_dead`]).
-    pub fn submit(&mut self, slot: usize, chw: &[f32], extra: &[ExtraInput]) -> Result<u64> {
+    pub(crate) fn submit(&mut self, slot: usize, chw: &[f32], extra: &[ExtraInput]) -> Result<u64> {
         let n = self.slots.len();
         let where_ = format!(
             "model {} on {}",
@@ -1452,7 +1452,7 @@ impl OrtBackend {
     }
 
     /// The outputs of `slot`'s inference (waits for it); give the buffers back with
-    /// [`Self::recycle`].
+    /// `Self::recycle`.
     pub fn collect(&mut self, slot: usize) -> Result<Vec<NamedOutput>> {
         self.collect_within(slot, None)
     }
@@ -1513,14 +1513,14 @@ impl OrtBackend {
     }
 
     /// Return output buffers lent by [`Self::collect`] to `slot`.
-    pub fn recycle(&mut self, slot: usize, outs: Vec<NamedOutput>) {
+    pub(crate) fn recycle(&mut self, slot: usize, outs: Vec<NamedOutput>) {
         if let Some(s) = self.slots.get_mut(slot) {
             s.outs = outs;
         }
     }
 
     /// Wait for every inference in flight and discard it (a running session cannot be
-    /// interrupted). Waits at most [`ABORT_TIMEOUT`] in total (all slots together); a session still running then is
+    /// interrupted). Waits at most `ABORT_TIMEOUT` in total (all slots together); a session still running then is
     /// marked dead and logged, so shutdown and reloads never block on a hung session.
     pub fn abort(&mut self) {
         let deadline = Instant::now() + self.abort_timeout;
@@ -1565,7 +1565,7 @@ impl OrtBackend {
 }
 
 impl Drop for OrtBackend {
-    /// Bounded: [`Self::abort`] waits at most [`ABORT_TIMEOUT`], then the threads get a short
+    /// Bounded: [`Self::abort`] waits at most `ABORT_TIMEOUT`, then the threads get a short
     /// grace period to exit; a thread still running (hung in `Session::run`) is detached with
     /// a warning instead of blocking the worker's shutdown or a config reload (BE-10).
     fn drop(&mut self) {

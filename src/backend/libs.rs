@@ -29,20 +29,20 @@
 //! downloader verifies every archive's SHA-256 before extracting into them.
 //!
 //! Nothing is ever loaded from the current working directory: libraries are opened by absolute
-//! path ([`open_path`]) or, for OS-provided ones such as the NVIDIA driver, by bare name with
-//! the loader restricted to the system and registered directories ([`open_system`]). On
-//! Windows [`harden_dll_search`] removes the working directory and `PATH` from the process-wide
+//! path (`open_path`) or, for OS-provided ones such as the NVIDIA driver, by bare name with
+//! the loader restricted to the system and registered directories (`open_system`). On
+//! Windows `harden_dll_search` removes the working directory and `PATH` from the process-wide
 //! default DLL search (`SetDefaultDllDirectories`), and the runtime directories are added with
 //! `AddDllDirectory` ([`register_dll_dir`]) so that the dependencies of a loaded DLL
 //! (`openvino.dll`, `tbb12.dll`, `DirectML.dll`, the CUDA DLLs) still resolve. CUDA libraries
 //! of a system install are probed by absolute path in the explicitly enumerated library path
-//! ([`cuda_search_dirs`]) and kept loaded, never by bare name.
+//! (`cuda_search_dirs`) and kept loaded, never by bare name.
 
 use crate::sync::LockExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-pub const BUNDLED_DIR_NAME: &str = "openvino";
+pub(crate) const BUNDLED_DIR_NAME: &str = "openvino";
 
 const ENV_INSTALL_DIR: &str = "OPENVINO_INSTALL_DIR";
 const ENV_INTEL_DIR: &str = "INTEL_OPENVINO_DIR";
@@ -104,7 +104,7 @@ static OVERRIDE_WARNING: Mutex<Option<String>> = Mutex::new(None);
 /// made it ignore the configured `openvino_dir` (or the bundled `<download root>/openvino`),
 /// for the status page's runtime section; None when nothing was overridden. Also logged at
 /// `warn` when it happens.
-pub fn openvino_dir_override_warning() -> Option<String> {
+pub(crate) fn openvino_dir_override_warning() -> Option<String> {
     OVERRIDE_WARNING.lock_recover().clone()
 }
 
@@ -360,7 +360,7 @@ static DLL_SEARCH_HARDENED: OnceLock<Result<(), String>> = OnceLock::new();
 /// no longer consulted by bare-name `LoadLibrary` calls or when a loaded DLL's imports are
 /// resolved (BE-01). Idempotent; the first call does the work, later calls return at once.
 /// A no-op on other platforms (their loaders never search the working directory).
-pub fn harden_dll_search() {
+pub(crate) fn harden_dll_search() {
     #[cfg(windows)]
     {
         DLL_SEARCH_HARDENED.get_or_init(|| {
@@ -391,7 +391,7 @@ static DLL_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// Make `dir` (absolute) part of the DLL search for bare-name loads and for the dependencies
 /// of DLLs loaded later (`AddDllDirectory`); registering a directory twice is a no-op. Call it
 /// for every runtime directory (OpenVINO bin dirs, the ONNX Runtime flavor dir, `cuda-libs`)
-/// because [`harden_dll_search`] takes `PATH` out of the search. A no-op on other platforms.
+/// because `harden_dll_search` takes `PATH` out of the search. A no-op on other platforms.
 pub fn register_dll_dir(dir: &Path) {
     #[cfg(windows)]
     {
@@ -439,7 +439,7 @@ static ORIGINAL_PATH: OnceLock<std::ffi::OsString> = OnceLock::new();
 /// copies first: `Command::env("PATH", original)` when this returns `Some`. None when `PATH`
 /// was never changed, which is always the case outside Windows (there the child inherits the
 /// unchanged `PATH`).
-pub fn original_path() -> Option<std::ffi::OsString> {
+pub(crate) fn original_path() -> Option<std::ffi::OsString> {
     #[cfg(windows)]
     {
         ORIGINAL_PATH.get().cloned()
@@ -501,9 +501,13 @@ pub(crate) fn core_set_property_variadic(
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
     type SetProperty = unsafe extern "C" fn(*const c_void, *const c_char, ...) -> c_int;
     type LastErr = unsafe extern "C" fn() -> *const c_char;
-    // `openvino::Core` is a struct whose only field is the `*mut ov_core_t`.
-    const _: () =
-        assert!(std::mem::size_of::<openvino::Core>() == std::mem::size_of::<*const c_void>());
+    // `openvino::Core` (0.11) is a struct whose only field is the `*mut ov_core_t` and has no
+    // public getter for it. Cargo.toml pins `openvino` exactly (`=0.11.0`), so the layout cannot
+    // change under a `cargo update`; the asserts catch a deliberate bump (BE-11).
+    const _: () = assert!(
+        std::mem::size_of::<openvino::Core>() == std::mem::size_of::<*const c_void>()
+            && std::mem::align_of::<openvino::Core>() == std::mem::align_of::<*const c_void>()
+    );
 
     let path =
         loaded_openvino_c().ok_or_else(|| format!("{} not found", openvino_c_file_name()))?;
@@ -512,8 +516,8 @@ pub(crate) fn core_set_property_variadic(
     // SAFETY: `path` is the openvino_c library openvino-sys already loaded (Core exists), so
     // this only bumps its reference count. The symbol types match the C declarations in
     // ov_core.h / ov_common.h. The core pointer is read from `openvino::Core`, whose single
-    // field is that pointer (size asserted above); `core` outlives the call and the C strings
-    // are NUL-terminated and alive for the call.
+    // field is that pointer (size and alignment asserted above); `core` outlives the call and
+    // the C strings are NUL-terminated and alive for the call.
     unsafe {
         let lib = open_path(&path)?;
         let set = symbol::<SetProperty>(&lib, b"ov_core_set_property\0")?;
@@ -540,7 +544,7 @@ pub fn bundled_dir() -> Option<PathBuf> {
 }
 
 /// File name of the OpenVINO C library on this OS (`openvino_c.dll`, `libopenvino_c.so`, ...).
-pub fn openvino_c_file_name() -> String {
+pub(crate) fn openvino_c_file_name() -> String {
     format!(
         "{}openvino_c{}",
         std::env::consts::DLL_PREFIX,
@@ -585,7 +589,7 @@ fn find_openvino_c(checked: &mut Vec<String>) -> Option<PathBuf> {
 }
 
 /// Human readable summary of where the runtime was looked for (used in error messages).
-pub fn diagnostics() -> String {
+pub(crate) fn diagnostics() -> String {
     let mut checked = Vec::new();
     let found = find_openvino_c(&mut checked);
     let notes = NOTES.lock().map(|n| n.clone()).unwrap_or_default();
@@ -625,7 +629,7 @@ pub fn diagnostics() -> String {
 pub const ORT_DIR_NAME: &str = "onnxruntime";
 /// File in the ONNX Runtime folder naming the installed flavor (`cpu`, `cuda`, `directml`,
 /// `coreml`).
-pub const ORT_FLAVOR_FILE: &str = "flavor.txt";
+pub(crate) const ORT_FLAVOR_FILE: &str = "flavor.txt";
 /// Environment variable `ort` itself honors: the path of the ONNX Runtime library (or, for us, a
 /// directory holding it).
 pub const ENV_ORT_DYLIB_PATH: &str = "ORT_DYLIB_PATH";
@@ -634,7 +638,7 @@ pub const ENV_ORT_DYLIB_PATH: &str = "ORT_DYLIB_PATH";
 /// `libonnxruntime.so`, `libonnxruntime.dylib`). Installs may carry only a versioned name
 /// (`libonnxruntime.so.1.24.4`, `libonnxruntime.1.24.4.dylib`); [`find_ort_library_in`] accepts
 /// those too.
-pub fn ort_library_file_name() -> &'static str {
+pub(crate) fn ort_library_file_name() -> &'static str {
     if cfg!(windows) {
         "onnxruntime.dll"
     } else if cfg!(target_vendor = "apple") {
@@ -645,7 +649,7 @@ pub fn ort_library_file_name() -> &'static str {
 }
 
 /// `<exe_dir>/onnxruntime`.
-pub fn default_onnxruntime_dir() -> PathBuf {
+pub(crate) fn default_onnxruntime_dir() -> PathBuf {
     crate::exe_dir().join(ORT_DIR_NAME)
 }
 
@@ -653,7 +657,7 @@ pub fn default_onnxruntime_dir() -> PathBuf {
 /// ([`ort_library_file_name`]) when present, else the shortest versioned one
 /// (`libonnxruntime.so.1`, `libonnxruntime.1.24.4.dylib`). Provider libraries
 /// (`libonnxruntime_providers_cuda.so`) never match.
-pub fn pick_ort_library<'a>(names: &[&'a str], plain: &str) -> Option<&'a str> {
+pub(crate) fn pick_ort_library<'a>(names: &[&'a str], plain: &str) -> Option<&'a str> {
     if let Some(n) = names.iter().find(|n| n.eq_ignore_ascii_case(plain)) {
         return Some(n);
     }
@@ -666,7 +670,7 @@ pub fn pick_ort_library<'a>(names: &[&'a str], plain: &str) -> Option<&'a str> {
 }
 
 /// The ONNX Runtime library inside `dir`, if any.
-pub fn find_ort_library_in(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_ort_library_in(dir: &Path) -> Option<PathBuf> {
     let names: Vec<String> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok())
@@ -704,12 +708,12 @@ impl OrtLookup {
 }
 
 /// File in the ONNX Runtime folder naming the active flavor's subdirectory.
-pub const ORT_ACTIVE_FILE: &str = "active.txt";
+pub(crate) const ORT_ACTIVE_FILE: &str = "active.txt";
 /// Per-flavor subdirectories, in the order they are tried when `active.txt` is absent.
-pub const ORT_FLAVOR_DIRS: &[&str] = &["cuda", "directml", "coreml", "cpu"];
+pub(crate) const ORT_FLAVOR_DIRS: &[&str] = &["cuda", "directml", "coreml", "cpu"];
 
 /// The flavor named by `<ort_root>/active.txt` (trimmed, lowercase), when it is a known flavor.
-pub fn read_active_flavor(ort_root: &Path) -> Option<String> {
+pub(crate) fn read_active_flavor(ort_root: &Path) -> Option<String> {
     let f = std::fs::read_to_string(ort_root.join(ORT_ACTIVE_FILE)).ok()?;
     let f = f.trim().to_ascii_lowercase();
     ORT_FLAVOR_DIRS.contains(&f.as_str()).then_some(f)
@@ -717,7 +721,7 @@ pub fn read_active_flavor(ort_root: &Path) -> Option<String> {
 
 /// Make `flavor` the active one (`<ort_root>/active.txt`, replaced atomically). It is used from
 /// the next process start (a process keeps the ONNX Runtime library it loaded).
-pub fn write_active_flavor(ort_root: &Path, flavor: &str) -> std::io::Result<()> {
+pub(crate) fn write_active_flavor(ort_root: &Path, flavor: &str) -> std::io::Result<()> {
     if !ORT_FLAVOR_DIRS.contains(&flavor) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -732,7 +736,7 @@ pub fn write_active_flavor(ort_root: &Path, flavor: &str) -> std::io::Result<()>
 
 /// [`find_onnxruntime`] with another install root than `<exe_dir>/onnxruntime` (config
 /// `download_dir`).
-pub fn find_onnxruntime_with(explicit: Option<&Path>, default_dir: &Path) -> OrtLookup {
+pub(crate) fn find_onnxruntime_with(explicit: Option<&Path>, default_dir: &Path) -> OrtLookup {
     let env = std::env::var_os(ENV_ORT_DYLIB_PATH)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
@@ -745,14 +749,14 @@ pub fn find_onnxruntime_with(explicit: Option<&Path>, default_dir: &Path) -> Ort
 /// 3. `<exe_dir>/onnxruntime/<flavor>/` for the flavor in `onnxruntime/active.txt`;
 /// 4. `<exe_dir>/onnxruntime/` itself (the legacy flat layout);
 /// 5. the first installed `<exe_dir>/onnxruntime/<flavor>/` in [`ORT_FLAVOR_DIRS`] order.
-pub fn find_onnxruntime(explicit: Option<&Path>) -> OrtLookup {
+pub(crate) fn find_onnxruntime(explicit: Option<&Path>) -> OrtLookup {
     let env = std::env::var_os(ENV_ORT_DYLIB_PATH)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     find_onnxruntime_from(explicit, env.as_deref(), &default_onnxruntime_dir())
 }
 
-/// [`find_onnxruntime`] with the environment and the default folder passed in (testable).
+/// `find_onnxruntime` with the environment and the default folder passed in (testable).
 pub fn find_onnxruntime_from(
     explicit: Option<&Path>,
     env_path: Option<&Path>,
@@ -803,7 +807,7 @@ pub fn find_onnxruntime_from(
 }
 
 /// Installed flavor from `flavor.txt` next to the library (trimmed, lowercase), if present.
-pub fn read_ort_flavor(lib_dir: &Path) -> Option<String> {
+pub(crate) fn read_ort_flavor(lib_dir: &Path) -> Option<String> {
     std::fs::read_to_string(lib_dir.join(ORT_FLAVOR_FILE))
         .ok()
         .map(|s| s.trim().to_ascii_lowercase())
@@ -822,11 +826,11 @@ pub fn read_ort_flavor(lib_dir: &Path) -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 
 /// Subdirectory of the ONNX Runtime folder holding the NVIDIA libraries.
-pub const CUDA_LIBS_DIR_NAME: &str = "cuda-libs";
+pub(crate) const CUDA_LIBS_DIR_NAME: &str = "cuda-libs";
 
 /// Libraries that make a usable CUDA 12 / cuDNN 9 setup, by platform (any system install that
 /// can load all of these does not need `nvidia-cuda-libs`).
-pub fn cuda_core_libs(windows: bool) -> &'static [&'static str] {
+pub(crate) fn cuda_core_libs(windows: bool) -> &'static [&'static str] {
     if windows {
         &["cudart64_12.dll", "cublas64_12.dll", "cudnn64_9.dll"]
     } else {
@@ -902,7 +906,7 @@ pub struct CudaPreload {
 static CUDA_PRELOADED: Mutex<Option<(PathBuf, CudaPreload)>> = Mutex::new(None);
 
 /// The `cuda-libs` directory this process preloaded, if any (its files must not be removed).
-pub fn cuda_libs_preloaded() -> Option<PathBuf> {
+pub(crate) fn cuda_libs_preloaded() -> Option<PathBuf> {
     let slot = CUDA_PRELOADED.lock_recover();
     slot.as_ref()
         .filter(|(_, r)| !r.loaded.is_empty())
@@ -1100,7 +1104,7 @@ fn open_cuda_lib(path: &Path) -> Result<(), String> {
 /// path (`PATH` on Windows, else `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`; relative and empty
 /// entries, which would mean the working directory, are skipped) and on Linux the usual
 /// toolkit / distro locations. Pure: `env` is `(CUDA_PATH or CUDA_HOME, library path)`.
-pub fn cuda_search_dirs(
+pub(crate) fn cuda_search_dirs(
     extra: &[&Path],
     env: (Option<&std::ffi::OsStr>, Option<&std::ffi::OsStr>),
     windows: bool,
@@ -1156,7 +1160,7 @@ fn cuda_search_dirs_here(extra: &[&Path]) -> Vec<PathBuf> {
 /// the working directory is never a candidate. A loaded library stays loaded for the process
 /// (like `cuda-libs`), so the CUDA provider's own by-name imports resolve to it later; loading
 /// one that is already loaded is cheap. Returns the path loaded.
-pub fn probe_cuda_library(name: &str, extra: &[&Path]) -> Result<PathBuf, String> {
+pub(crate) fn probe_cuda_library(name: &str, extra: &[&Path]) -> Result<PathBuf, String> {
     let dirs = cuda_search_dirs_here(extra);
     let Some(path) = dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()) else {
         return Err(format!(
@@ -1175,7 +1179,7 @@ pub fn probe_cuda_library(name: &str, extra: &[&Path]) -> Result<PathBuf, String
 /// cuDNN 9: every [`cuda_core_libs`] name exists in a [`cuda_search_dirs`] directory and loads
 /// from there. Probed once per process (the result is cached; libraries found stay loaded), so
 /// a toolkit installed while the service runs is seen after a restart.
-pub fn system_cuda_present() -> bool {
+pub(crate) fn system_cuda_present() -> bool {
     static PRESENT: OnceLock<bool> = OnceLock::new();
     *PRESENT.get_or_init(|| {
         cuda_core_libs(cfg!(windows))

@@ -73,7 +73,7 @@ impl StateHandle {
         self.get() == ModelState::Ready
     }
 
-    /// "Initializing", "Initializing (downloading ...)", "Ready" or "Failed: <reason>".
+    /// "Initializing", "Initializing (downloading ...)", "Ready" or "Failed: `<reason>`".
     pub fn describe(&self) -> String {
         match (self.get(), self.detail()) {
             (ModelState::Initializing, Some(d)) => format!("Initializing ({d})"),

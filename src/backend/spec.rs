@@ -34,7 +34,7 @@ impl Runtime {
     }
 
     /// Human readable name, as used in `executionProvider`.
-    pub fn display_name(self) -> &'static str {
+    pub(crate) fn display_name(self) -> &'static str {
         match self {
             Runtime::OpenVino => "OpenVINO",
             Runtime::Ort => "ONNX Runtime",
@@ -69,7 +69,7 @@ impl Target {
     }
 
     /// Human readable name, as used in `executionProvider`.
-    pub fn display_name(self) -> &'static str {
+    pub(crate) fn display_name(self) -> &'static str {
         match self {
             Target::Gpu => "GPU",
             Target::Cpu => "CPU",
@@ -95,7 +95,7 @@ impl Target {
     }
 
     /// Whether `runtime` offers this target.
-    pub fn supported_by(self, runtime: Runtime) -> bool {
+    pub(crate) fn supported_by(self, runtime: Runtime) -> bool {
         match runtime {
             Runtime::OpenVino => matches!(self, Target::Gpu | Target::Cpu | Target::Npu),
             Runtime::Ort => matches!(
@@ -106,7 +106,7 @@ impl Target {
     }
 
     /// Whether a device index (`gpu.N` / `cuda:N`) is accepted.
-    pub fn takes_index(self) -> bool {
+    pub(crate) fn takes_index(self) -> bool {
         matches!(
             self,
             Target::Gpu | Target::Cuda | Target::TensorRt | Target::DirectMl
@@ -146,20 +146,20 @@ impl Device {
         })
     }
 
-    pub const OPENVINO_CPU: Device = Device {
+    pub(crate) const OPENVINO_CPU: Device = Device {
         runtime: Runtime::OpenVino,
         target: Target::Cpu,
         index: None,
     };
 
-    pub const OPENVINO_GPU: Device = Device {
+    pub(crate) const OPENVINO_GPU: Device = Device {
         runtime: Runtime::OpenVino,
         target: Target::Gpu,
         index: None,
     };
 
     /// OpenVINO device string ("GPU", "GPU.1", "CPU", "NPU"); None for ONNX Runtime.
-    pub fn openvino_device(&self) -> Option<String> {
+    pub(crate) fn openvino_device(&self) -> Option<String> {
         if self.runtime != Runtime::OpenVino {
             return None;
         }
@@ -170,12 +170,12 @@ impl Device {
         })
     }
 
-    pub fn is_cpu(&self) -> bool {
+    pub(crate) fn is_cpu(&self) -> bool {
         self.target == Target::Cpu
     }
 
     /// A GPU-class accelerator: OpenVINO GPU, CUDA, TensorRT, DirectML or CoreML.
-    pub fn is_gpu_like(&self) -> bool {
+    pub(crate) fn is_gpu_like(&self) -> bool {
         matches!(
             self.target,
             Target::Gpu | Target::Cuda | Target::TensorRt | Target::DirectMl | Target::CoreMl
@@ -183,7 +183,7 @@ impl Device {
     }
 
     /// This device with `index` filled in when it takes one and has none.
-    pub fn with_default_index(self, index: u32) -> Self {
+    pub(crate) fn with_default_index(self, index: u32) -> Self {
         if self.index.is_none() && self.target.takes_index() {
             Self {
                 index: Some(index),
@@ -216,7 +216,7 @@ pub enum DeviceSpec {
 }
 
 impl DeviceSpec {
-    pub const OPENVINO_CPU: DeviceSpec = DeviceSpec::Device(Device::OPENVINO_CPU);
+    pub(crate) const OPENVINO_CPU: DeviceSpec = DeviceSpec::Device(Device::OPENVINO_CPU);
 
     pub fn device(&self) -> Option<&Device> {
         match self {
@@ -238,12 +238,12 @@ impl DeviceSpec {
         self.device().is_some_and(Device::is_cpu)
     }
 
-    pub fn is_gpu_like(&self) -> bool {
+    pub(crate) fn is_gpu_like(&self) -> bool {
         self.device().is_some_and(Device::is_gpu_like)
     }
 
     /// See [`Device::with_default_index`]; `auto` is unchanged.
-    pub fn with_default_index(self, index: u32) -> Self {
+    pub(crate) fn with_default_index(self, index: u32) -> Self {
         match self {
             DeviceSpec::Auto => DeviceSpec::Auto,
             DeviceSpec::Device(d) => DeviceSpec::Device(d.with_default_index(index)),
@@ -268,14 +268,14 @@ impl std::str::FromStr for DeviceSpec {
 }
 
 /// Accepted forms, for error messages and help text.
-pub const SPEC_SYNTAX: &str = "auto, openvino:gpu[.N], openvino:cpu, openvino:npu, \
+pub(crate) const SPEC_SYNTAX: &str = "auto, openvino:gpu[.N], openvino:cpu, openvino:npu, \
     ort:cuda[:N], ort:tensorrt[:N], ort:directml[:N], ort:coreml, ort:cpu \
     (legacy GPU, GPU.N, CPU, NPU mean OpenVINO)";
 
 /// Largest accepted device index (`gpu.N`, `cuda:N`, `directml:N`). Real machines have a handful
 /// of GPUs; the cap keeps a typo such as `cuda:4294967295` from reaching ONNX Runtime as a
 /// negative `device_id` (BE-07).
-pub const MAX_DEVICE_INDEX: u32 = 255;
+pub(crate) const MAX_DEVICE_INDEX: u32 = 255;
 
 /// Decimal device index: ASCII digits only (no sign, no whitespace). Values too large for `u32`
 /// saturate so [`checked`] reports them as out of range rather than as bad syntax.

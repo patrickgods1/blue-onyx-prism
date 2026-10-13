@@ -687,24 +687,38 @@ def build_coco(work: Path, coco80: list[str], args) -> dict:
 
 
 def validate(path: Path, coco80: list[str], work: Path | None, head: bool) -> dict:
+    # Explicit checks that append to `errors` (not `assert`: `python -O` would skip them).
     m = json.loads(path.read_text(encoding="utf-8"))
+    errors: list[str] = []
     for k in ("id", "title", "description", "license", "attribution", "source", "revision", "images"):
-        assert k in m, f"{path.name}: missing {k}"
+        if k not in m:
+            errors.append(f"missing {k}")
+    if "images" not in m or "id" not in m:
+        raise SystemExit(f"{path.name}: " + "; ".join(errors[:10]))
     names = set(coco80)
-    if "scored_labels" in m:
-        assert set(m["scored_labels"]) <= names, m["scored_labels"]
+    if "scored_labels" in m and not set(m["scored_labels"]) <= names:
+        errors.append(f"scored_labels outside COCO-80: {sorted(set(m['scored_labels']) - names)}")
     files = set()
-    errors = []
+    image_keys = {"file", "url", "sha256", "size", "width", "height", "tags", "objects"}
+    object_keys = ({"label", "bbox", "ignore"}, {"label", "bbox", "ignore", "crowd"})
     for im in m["images"]:
-        assert set(im) == {"file", "url", "sha256", "size", "width", "height", "tags", "objects"}, im.keys()
-        assert im["file"] not in files, f"duplicate {im['file']}"
+        if set(im) != image_keys:
+            errors.append(f"image keys {sorted(im)} != {sorted(image_keys)}")
+            continue
+        if im["file"] in files:
+            errors.append(f"duplicate {im['file']}")
         files.add(im["file"])
-        assert re.fullmatch(r"[0-9a-f]{64}", im["sha256"])
+        if not re.fullmatch(r"[0-9a-f]{64}", im["sha256"]):
+            errors.append(f"{im['file']}: sha256 is not 64 lowercase hex digits")
         for o in im["objects"]:
-            assert set(o) in ({"label", "bbox", "ignore"}, {"label", "bbox", "ignore", "crowd"})
-            assert o["label"] in names, o["label"]
+            if set(o) not in object_keys:
+                errors.append(f"{im['file']}: object keys {sorted(o)}")
+                continue
+            if o["label"] not in names:
+                errors.append(f"{im['file']}: label {o['label']!r} is not a COCO-80 name")
             x0, y0, x1, y1 = o["bbox"]
-            assert 0 <= x0 < x1 <= im["width"] and 0 <= y0 < y1 <= im["height"], (im["file"], o)
+            if not (0 <= x0 < x1 <= im["width"] and 0 <= y0 < y1 <= im["height"]):
+                errors.append(f"{im['file']}: bbox {o['bbox']} outside {im['width']}x{im['height']}")
         if work is not None:
             p = work / m["id"] / "images" / im["file"]
             if p.exists():

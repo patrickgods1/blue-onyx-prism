@@ -213,7 +213,7 @@ pub struct Cli {
 /// ([`Config::validate`]; an invalid result is an error and the file is not written) and write
 /// it back when it differs from the file (or the file does not exist yet). The one-off flags
 /// (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`) apply to the returned config
-/// only and are never written back ([`without_one_off_flags`]).
+/// only and are never written back (`without_one_off_flags`).
 pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     let path = cli
         .config

@@ -11,8 +11,8 @@ Rules:
 - Own only the files named in your task. Do not edit shared interface files (`src/lib.rs`, `src/api.rs`,
   `src/config.rs`, `src/model/mod.rs`, `src/backend/mod.rs`) unless the task says so; if an interface
   must change, describe the change in your final report instead.
-- Reference code from blue-onyx (MIT) lives in the scratchpad path given in the task. Adapt it; never
-  copy ONNX Runtime specific code.
+- Reference code from blue-onyx (MIT) lives in the scratchpad path given in the task. Adapt it, ONNX Runtime usage
+  included; keep all `ort` code in `src/backend/ort.rs` (see CLAUDE.md).
 - Finish with `cargo build`, `cargo test` and `cargo clippy --all-targets -- -D warnings` passing for the
   whole crate (prefix PATH with `~/.cargo/bin` if cargo is not found).
 - Final report: files created/changed, public API you exposed, anything left undone, and the exact

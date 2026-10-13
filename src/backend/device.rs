@@ -58,7 +58,7 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    pub fn is_gpu(&self) -> bool {
+    pub(crate) fn is_gpu(&self) -> bool {
         match self.runtime {
             Runtime::OpenVino => self.actual.starts_with("GPU"),
             Runtime::Ort => super::spec::parse(&self.spec).is_ok_and(|s| s.is_gpu_like()),
@@ -120,7 +120,7 @@ fn set_prop(core: &mut openvino::Core, device: &DeviceType, key: RwPropertyKey, 
     }
 }
 
-pub fn apply_core_properties(
+pub(crate) fn apply_core_properties(
     core: &mut openvino::Core,
     opts: &CoreOptions,
     available: &[String],
@@ -162,7 +162,7 @@ pub fn apply_core_properties(
     Ok(())
 }
 
-pub fn full_device_name(core: &openvino::Core, device: &str) -> String {
+pub(crate) fn full_device_name(core: &openvino::Core, device: &str) -> String {
     core.get_property(&DeviceType::from(device), &PropertyKey::DeviceFullName)
         .map(|s| s.trim().to_string())
         .ok()
@@ -203,12 +203,16 @@ struct Port(Node);
 
 impl Port {
     fn raw(&self) -> *mut openvino_sys::ov_output_const_port_t {
-        // `openvino::Node` (0.11) is a struct whose only field is this pointer.
+        // `openvino::Node` (0.11) is a struct whose only field is this pointer; its accessor
+        // (`as_ptr`) is `pub(crate)`. Cargo.toml pins `openvino` exactly (`=0.11.0`), so the
+        // layout cannot change under a `cargo update`; the asserts catch a deliberate bump (BE-11).
         const _: () = assert!(
             std::mem::size_of::<Node>()
                 == std::mem::size_of::<*mut openvino_sys::ov_output_const_port_t>()
+                && std::mem::align_of::<Node>()
+                    == std::mem::align_of::<*mut openvino_sys::ov_output_const_port_t>()
         );
-        // SAFETY: same size (asserted above) and the single field is the pointer; reading it
+        // SAFETY: same size and alignment (asserted above) and the single field is the pointer; reading it
         // does not transfer ownership (`Port` frees it once, on drop).
         unsafe { std::mem::transmute_copy(&self.0) }
     }
@@ -503,7 +507,7 @@ fn prefer_intel_gpu(core: &openvino::Core, primary: &str, available: &[String]) 
 
 /// Read, reshape to static, compile on exactly `cand.device` (an OpenVINO device; a bare `GPU`
 /// may resolve to the first Intel `GPU.N`) and introspect ports. No fallback here.
-pub fn load_model(
+pub(crate) fn load_model(
     core: &mut openvino::Core,
     available: &[String],
     cand: &Candidate,
@@ -693,12 +697,16 @@ unsafe extern "C" fn on_infer_done(args: *mut std::ffi::c_void) {
 
 /// The `ov_infer_request_t` behind an `openvino::InferRequest`.
 fn raw_request(r: &openvino::InferRequest) -> *mut openvino_sys::ov_infer_request_t {
-    // `openvino::InferRequest` (0.11) is a struct whose only field is this pointer.
+    // `openvino::InferRequest` (0.11) is a struct whose only field is this pointer and has no
+    // public getter for it. Cargo.toml pins `openvino` exactly (`=0.11.0`), so the layout cannot
+    // change under a `cargo update`; the asserts catch a deliberate bump (BE-11).
     const _: () = assert!(
         std::mem::size_of::<openvino::InferRequest>()
             == std::mem::size_of::<*mut openvino_sys::ov_infer_request_t>()
+            && std::mem::align_of::<openvino::InferRequest>()
+                == std::mem::align_of::<*mut openvino_sys::ov_infer_request_t>()
     );
-    // SAFETY: same size (asserted above) and the single field is the pointer; reading it does
+    // SAFETY: same size and alignment (asserted above) and the single field is the pointer; reading it does
     // not transfer ownership (`r` still frees it).
     unsafe { std::mem::transmute_copy(r) }
 }
@@ -764,7 +772,7 @@ pub(crate) struct OvSlot {
     ctx: Box<CallbackCtx>,
 }
 
-pub fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
+pub(crate) fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
     let OvCompiled {
         mut compiled,
         info: model,

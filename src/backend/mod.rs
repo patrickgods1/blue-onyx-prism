@@ -29,9 +29,12 @@
 
 pub mod detect;
 pub mod device;
+#[cfg(test)]
+pub mod fake;
 #[cfg(windows)]
 pub mod job;
 pub mod libs;
+pub mod memory;
 pub mod onnx_rewrite;
 #[cfg(feature = "onnxruntime")]
 pub mod ort;
@@ -64,7 +67,7 @@ pub struct CoreOptions {
     pub openvino_dir: Option<PathBuf>,
 }
 
-/// Options for the ONNX Runtime library lookup (see [`libs::find_onnxruntime`]).
+/// Options for the ONNX Runtime library lookup (see `libs::find_onnxruntime`).
 #[derive(Debug, Clone, Default)]
 pub struct OrtOptions {
     /// Config `onnxruntime_dir`: a directory holding the library, or the library file. None =
@@ -324,6 +327,9 @@ pub enum Compiled {
     OpenVino(OvCompiled),
     #[cfg(feature = "onnxruntime")]
     Ort(self::ort::OrtCompiled),
+    /// Scripted test backend (see [`fake`]).
+    #[cfg(test)]
+    Fake(fake::FakeCompiled),
 }
 
 impl Compiled {
@@ -332,6 +338,8 @@ impl Compiled {
             Compiled::OpenVino(c) => &c.info,
             #[cfg(feature = "onnxruntime")]
             Compiled::Ort(c) => &c.info,
+            #[cfg(test)]
+            Compiled::Fake(c) => &c.info,
         }
     }
 
@@ -341,6 +349,8 @@ impl Compiled {
             Compiled::OpenVino(c) => Ok(Backend::OpenVino(OvBackend::new(c)?)),
             #[cfg(feature = "onnxruntime")]
             Compiled::Ort(c) => Ok(Backend::Ort(c.into_backend()?)),
+            #[cfg(test)]
+            Compiled::Fake(c) => Ok(Backend::Fake(c.into_backend())),
         }
     }
 }
@@ -353,6 +363,9 @@ pub enum Backend {
     OpenVino(OvBackend),
     #[cfg(feature = "onnxruntime")]
     Ort(self::ort::OrtBackend),
+    /// Scripted test backend (see [`fake`]).
+    #[cfg(test)]
+    Fake(fake::FakeBackend),
 }
 
 impl Backend {
@@ -361,6 +374,8 @@ impl Backend {
             Backend::OpenVino(b) => b.info(),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.info(),
+            #[cfg(test)]
+            Backend::Fake(b) => b.info(),
         }
     }
 
@@ -370,6 +385,8 @@ impl Backend {
             Backend::OpenVino(b) => b.slots.len(),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.slots(),
+            #[cfg(test)]
+            Backend::Fake(b) => b.slots(),
         }
     }
 
@@ -380,6 +397,8 @@ impl Backend {
             Backend::OpenVino(b) => (b.tuning.hint, b.streams),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(_) => (PerfHint::Latency, None),
+            #[cfg(test)]
+            Backend::Fake(_) => (PerfHint::Latency, None),
         }
     }
 
@@ -391,6 +410,8 @@ impl Backend {
             Backend::OpenVino(b) => device::submit(&b.info, &mut b.slots, slot, chw, extra),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.submit(slot, chw, extra),
+            #[cfg(test)]
+            Backend::Fake(b) => b.submit(slot, chw, extra),
         }
     }
 
@@ -400,6 +421,8 @@ impl Backend {
             Backend::OpenVino(b) => &b.done_rx,
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.completions(),
+            #[cfg(test)]
+            Backend::Fake(b) => b.completions(),
         }
     }
 
@@ -409,6 +432,8 @@ impl Backend {
             Backend::OpenVino(b) => device::is_busy(&b.slots, slot),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.is_busy(slot),
+            #[cfg(test)]
+            Backend::Fake(b) => b.is_busy(slot),
         }
     }
 
@@ -420,6 +445,8 @@ impl Backend {
             Backend::OpenVino(b) => device::collect(&b.info, &mut b.slots, slot),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.collect(slot),
+            #[cfg(test)]
+            Backend::Fake(b) => b.collect(slot),
         }
     }
 
@@ -429,6 +456,8 @@ impl Backend {
             Backend::OpenVino(b) => device::recycle(&mut b.slots, slot, outs),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.recycle(slot, outs),
+            #[cfg(test)]
+            Backend::Fake(b) => b.recycle(slot, outs),
         }
     }
 
@@ -440,6 +469,8 @@ impl Backend {
             Backend::OpenVino(_) => true,
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.is_healthy(),
+            #[cfg(test)]
+            Backend::Fake(b) => b.is_healthy(),
         }
     }
 
@@ -451,6 +482,8 @@ impl Backend {
             Backend::OpenVino(b) => device::abort(&mut b.slots),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.abort(),
+            #[cfg(test)]
+            Backend::Fake(b) => b.abort(),
         }
     }
 
@@ -473,6 +506,8 @@ impl Backend {
             Backend::OpenVino(b) => b.infer_into(chw, extra, outs),
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(b) => b.infer_into(chw, extra, outs),
+            #[cfg(test)]
+            Backend::Fake(b) => b.infer_into(chw, extra, outs),
         }
     }
 }
@@ -535,6 +570,9 @@ pub struct Runtimes {
     /// Measured `auto` order per model path (benchmark speed order, fastest first), see
     /// [`Self::set_measured_orders`].
     measured: HashMap<PathBuf, Vec<Device>>,
+    /// Test runtime: every plan is one `openvino:cpu` candidate compiled by this script.
+    #[cfg(test)]
+    fake: Option<fake::FakeScript>,
 }
 
 impl Runtimes {
@@ -621,6 +659,25 @@ impl Runtimes {
             hw,
             probe,
             measured: HashMap::new(),
+            #[cfg(test)]
+            fake: None,
+        }
+    }
+
+    /// A runtime set without OpenVINO or ONNX Runtime whose every plan is one `openvino:cpu`
+    /// candidate that "compiles" into a [`fake::FakeBackend`] played by `script`.
+    #[cfg(test)]
+    pub(crate) fn fake(script: fake::FakeScript) -> Self {
+        Self {
+            ov: None,
+            ov_error: Some("fake runtime".into()),
+            #[cfg(feature = "onnxruntime")]
+            ort: None,
+            ort_error: Some("fake runtime".into()),
+            hw: HardwareInfo::default(),
+            probe: RuntimeProbe::default(),
+            measured: HashMap::new(),
+            fake: Some(script),
         }
     }
 
@@ -754,6 +811,15 @@ impl Runtimes {
     /// Candidates for `spec` and the model at `model` on this machine, in the order they should
     /// be tried.
     pub fn plan(&self, spec: &DeviceSpec, model: &Path) -> Vec<Candidate> {
+        #[cfg(test)]
+        if self.fake.is_some() {
+            return vec![Candidate {
+                device: Device::new(Runtime::OpenVino, spec::Target::Cpu, None)
+                    .unwrap_or_else(|e| panic!("{e:#}")),
+                fell_back: false,
+                note: None,
+            }];
+        }
         match spec {
             DeviceSpec::Auto => auto_candidates(&self.selection(Some(model))),
             DeviceSpec::Device(_) => plan_for(
@@ -789,6 +855,11 @@ impl Runtimes {
         req: &LoadRequest,
         tuning: &DeviceTuning,
     ) -> Result<Compiled> {
+        #[cfg(test)]
+        if let Some(script) = &self.fake {
+            let device = cand.device.to_string();
+            return Ok(Compiled::Fake(script.compile(req, &device, cand.fell_back)));
+        }
         match cand.device.runtime {
             Runtime::OpenVino => {
                 let Some(core) = self.ov.as_mut() else {
@@ -822,7 +893,7 @@ impl Runtimes {
 
     /// The concurrency class of `device` ([`crate::profile::Profile::tuning_for`]): an
     /// OpenVINO GPU is discrete when OpenVINO reports `DEVICE_TYPE=discrete` for the GPU the
-    /// spec compiles on (a bare `GPU` resolves like `load_model`, see [`ov_gpu_for`]).
+    /// spec compiles on (a bare `GPU` resolves like `load_model`, see `ov_gpu_for`).
     pub fn device_class(&self, device: &Device) -> DeviceClass {
         match (device.runtime, device.target) {
             (Runtime::OpenVino, spec::Target::Gpu) => {

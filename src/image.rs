@@ -371,7 +371,7 @@ fn safe_stem(name: &str) -> Option<String> {
 
 /// Write `<stem>_od.jpg` (annotated) into `dir`, plus `<stem>.jpg` (unannotated) when
 /// `save_ref` is set. `name` is untrusted (client-supplied): only a sanitized form of its file
-/// stem is used ([`safe_stem`]), else a random `image_<uuid>` name.
+/// stem is used (`safe_stem`), else a random `image_<uuid>` name.
 pub fn save_annotated(
     dir: &Path,
     name: &str,

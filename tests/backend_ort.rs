@@ -232,16 +232,26 @@ fn yolo5_on_coreml() {
         let cache = std::env::temp_dir()
             .join("bop-ort-test-cache")
             .join("coreml");
+        // The cache is shared between runs: older rewriter versions or an older copy of the model
+        // may sit next to the current copy, so ask for at least one of this version.
+        let suffix = format!(
+            "-v{}.onnx",
+            blue_onyx_prism::backend::onnx_rewrite::REWRITER_VERSION
+        );
         let rewritten: Vec<_> = std::fs::read_dir(&cache)
             .map(|d| {
                 d.flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with("IPcam-general-") && n.ends_with(".onnx"))
+                    .filter(|n| n.starts_with("IPcam-general-") && n.ends_with(&suffix))
                     .collect()
             })
             .unwrap_or_default();
         if std::env::var_os("BOP_COREML_REWRITE").is_none() {
-            assert_eq!(rewritten.len(), 1, "rewritten copy in {}", cache.display());
+            assert!(
+                !rewritten.is_empty(),
+                "no rewritten copy ending in {suffix} in {}",
+                cache.display()
+            );
         }
 
         // A deterministic, non-constant image so the comparison exercises real detections.
