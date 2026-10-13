@@ -403,7 +403,7 @@ pub fn guess_discrete(vendor: GpuVendor, device_id: u32, vram_mb: u64) -> bool {
     }
 }
 
-/// Fallback adapter name when the platform gives none: "Intel GPU [8086:3e92]".
+/// Fallback adapter name when the platform gives none: `"Intel GPU [8086:3e92]"`.
 pub fn generic_name(vendor_id: u32, device_id: u32) -> String {
     let vendor = match GpuVendor::from_pci_id(vendor_id) {
         GpuVendor::Other(_) => "Unknown".to_string(),

@@ -2,7 +2,7 @@
 //!
 //! Every benchmark run keeps, per model and device, the predictions it made at the evaluation
 //! threshold ([`super::EVAL_CONFIDENCE`]) in a scored class, per image, in post-processing
-//! order. They are persisted in [`PREDS_FILE`] beside `benchmark.json` (kept out of the main
+//! order. They are persisted in `PREDS_FILE` beside `benchmark.json` (kept out of the main
 //! file so polling stays light) as `[class index, confidence, x_min, y_min, x_max, y_max]`
 //! (integer pixel boxes, exactly what was scored). The ground truth (or pseudo ground truth) is
 //! the one recorded in `benchmark.json`'s `image_sets`.
@@ -35,13 +35,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// File name of the stored predictions, beside `benchmark.json`.
-pub const PREDS_FILE: &str = "benchmark-preds.json";
+pub(crate) const PREDS_FILE: &str = "benchmark-preds.json";
 /// Points of the exact curve a search returns.
-pub const SEARCH_EXACT_POINTS: usize = 200;
+pub(crate) const SEARCH_EXACT_POINTS: usize = 200;
 /// Stored predictions per image of one run at most, the most confident ones (BQ-04: high-recall
 /// models at the evaluation threshold can make hundreds of boxes per image). A search at a
 /// threshold above an image's most confident dropped prediction sees exactly what was scored.
-pub const MAX_STORED_PREDS_PER_IMAGE: usize = 100;
+pub(crate) const MAX_STORED_PREDS_PER_IMAGE: usize = 100;
 
 /// `benchmark-preds.json` beside `config_path`.
 pub fn preds_path(config_path: &Path) -> PathBuf {
@@ -344,7 +344,7 @@ static PREDS_CACHE: Mutex<PredsCache> = Mutex::new(None);
 /// Merge the predictions of `new` into the file beside `results_file`. Does not fail the
 /// benchmark: returns the warnings (also logged). A file that does not load is moved aside
 /// (`<name>.bad-<timestamp>`) rather than overwritten; when that fails nothing is saved.
-pub fn save_beside(
+pub(crate) fn save_beside(
     results_file: &Path,
     merged: &BenchmarkResults,
     new: &[ModelResult],
@@ -465,7 +465,7 @@ pub struct SearchResult {
     pub device: String,
     pub objective: String,
     pub iou: f32,
-    /// "ground truth" or "relative to <reference>, not ground truth".
+    /// "ground truth" or "relative to `<reference>`, not ground truth".
     pub ground_truth: String,
     pub relative: bool,
     pub images: usize,
@@ -486,7 +486,7 @@ pub struct SearchResult {
     pub alternatives: Vec<Pick>,
     /// At [`SWEEP_THRESHOLDS`].
     pub grid: Vec<ThresholdPoint>,
-    /// The exact curve, thinned to [`SEARCH_EXACT_POINTS`].
+    /// The exact curve, thinned to `SEARCH_EXACT_POINTS`.
     pub exact: Vec<ThresholdPoint>,
     pub by_dataset: Vec<GroupPick>,
     pub per_class: Vec<GroupPick>,
@@ -621,7 +621,9 @@ pub fn search(
     } else {
         req.models.clone()
     };
-    names.dedup();
+    // One search per model: `a,b,a` and `YOLO` + `yolo` are the same model (first spelling wins).
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|n| seen.insert(crate::registry::normalize_name(n)));
     let sets: HashMap<&str, &ImageSetInfo> = results
         .image_sets
         .iter()
@@ -967,8 +969,8 @@ pub fn to_csv(out: &SearchOutput) -> String {
         s.push_str(&format!(
             "{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_field(&r.model),
-            r.device,
-            r.objective,
+            csv_field(&r.device),
+            csv_field(&r.objective),
             r.now.threshold,
             f(r.now.precision),
             f(r.now.recall),
@@ -1024,8 +1026,17 @@ pub fn to_csv(out: &SearchOutput) -> String {
     s
 }
 
+/// One CSV text field: quoted when it holds a separator or quote, and prefixed with `'` when a
+/// spreadsheet would read it as a formula (`=`, `+`, `-`, `@`, tab or CR first).
 fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n']) {
+    let guarded;
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        guarded = format!("'{s}");
+        guarded.as_str()
+    } else {
+        s
+    };
+    if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -1337,6 +1348,40 @@ pub(crate) mod tests {
         let csv = to_csv(&out_of(&results, &preds));
         assert!(csv.contains(",roc_auc,roc_auc_micro,"), "{csv}");
         assert!(csv.contains("\nm,car,1,1,1.0000\n"), "{csv}");
+    }
+
+    /// BQ-13: repeated or differently-cased model names search once.
+    #[test]
+    fn duplicate_model_names_search_once() {
+        let (results, preds) = fixture();
+        for names in [["m", "m", "m"], ["m", "M", "m"]] {
+            let req = SearchRequest {
+                models: names.iter().map(|n| n.to_string()).collect(),
+                ..Default::default()
+            };
+            let out = search(&results, &preds, &req, &|_| None).unwrap();
+            assert_eq!(out.results.len(), 1, "{names:?}");
+            assert!(out.errors.is_empty());
+        }
+    }
+
+    /// BQ-13: CSV text fields are quoted and neutralized against spreadsheet formulas.
+    #[test]
+    fn csv_fields_are_escaped_and_formula_safe() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("=cmd()"), "'=cmd()");
+        assert_eq!(csv_field("+1"), "'+1");
+        assert_eq!(csv_field("-1"), "'-1");
+        assert_eq!(csv_field("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(csv_field("\tx"), "'\tx");
+        assert_eq!(csv_field("=a,b"), "\"'=a,b\"");
+        let (results, preds) = fixture();
+        let mut out = out_of(&results, &preds);
+        out.results[0].device = "=evil,x".into();
+        out.results[0].objective = "@o".into();
+        let csv = to_csv(&out);
+        assert!(csv.contains(",\"'=evil,x\",'@o,"), "{csv}");
     }
 
     fn out_of(results: &BenchmarkResults, preds: &StoredPreds) -> SearchOutput {

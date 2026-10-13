@@ -41,7 +41,7 @@ use config_page::{
     ConfigView, MessageTemplate, config_loglevel, config_models, config_page, config_restart,
     config_submit, encode_uri_component, global_device_label, save_config, schedule_restart,
 };
-pub use detect::{BODY_LIMIT, RESPONSE_GRACE};
+pub(crate) use detect::BODY_LIMIT;
 use detect::{custom_list, detection_custom, detection_default};
 use devices::model_selection;
 use devices::{DevicesSnapshot, devices_json, devices_snapshot};
@@ -55,34 +55,34 @@ use resources::{
 };
 
 pub struct AppState {
-    pub registry: Arc<ModelRegistry>,
-    pub metrics: Arc<Metrics>,
+    pub(crate) registry: Arc<ModelRegistry>,
+    pub(crate) metrics: Arc<Metrics>,
     /// The live config (revision, change log, file sync). Every change goes through
     /// [`save_config`] / [`crate::config_store::ConfigStore::update`]. Shared by every
     /// generation of the process.
-    pub config: Arc<crate::config_store::ConfigStore>,
+    pub(crate) config: Arc<crate::config_store::ConfigStore>,
     /// What this generation runs: the config its registry was started with, updated as
     /// changes apply without a restart (live settings, per-model reloads; see
     /// [`apply_config`]). The pages compare it with `config` to show what a restart would
     /// apply. Read it with [`AppState::running`].
-    pub running: arc_swap::ArcSwap<Config>,
+    pub(crate) running: arc_swap::ArcSwap<Config>,
     /// One [`apply_config`] at a time.
-    pub apply_lock: std::sync::Mutex<()>,
+    pub(crate) apply_lock: std::sync::Mutex<()>,
     /// Config revision [`apply_config`] last applied (0: none yet).
-    pub applied_revision: std::sync::atomic::AtomicU64,
+    pub(crate) applied_revision: std::sync::atomic::AtomicU64,
     /// Process start (survives in-process restarts).
-    pub started: Instant,
-    pub config_path: PathBuf,
+    pub(crate) started: Instant,
+    pub(crate) config_path: PathBuf,
     /// Runtime log level control; `None` when logging was not initialized by this process.
-    pub log_reload: Option<LogReloadHandle>,
+    pub(crate) log_reload: Option<LogReloadHandle>,
     /// This generation's token, cancelled by `POST /config/restart`: the run loop
     /// (`runner`) then builds the next generation and swaps it in ([`Shared::swap`]).
-    pub restart: CancellationToken,
+    pub(crate) restart: CancellationToken,
     /// Download manager and this generation's provisioning plan (None in tests that do not
     /// exercise resources).
-    pub resources: Option<crate::resources::status::ResourcesCtx>,
+    pub(crate) resources: Option<crate::resources::status::ResourcesCtx>,
     /// Benchmark runner (one per process, shared by every generation).
-    pub benchmark: Arc<crate::benchmark::service::BenchmarkService>,
+    pub(crate) benchmark: Arc<crate::benchmark::service::BenchmarkService>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -126,7 +126,7 @@ impl AppState {
     }
 
     /// What this generation runs now (see [`AppState::running`](field@AppState::running)).
-    pub fn running(&self) -> Arc<Config> {
+    pub(crate) fn running(&self) -> Arc<Config> {
         self.running.load_full()
     }
 
@@ -205,7 +205,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
 
 /// The router. Every handler reads the generation that is current when its request arrives
 /// (see [`Shared`]); a plain `Arc<AppState>` works for tests and makes a fixed one.
-pub fn router(state: impl Into<Shared>) -> Router {
+pub(crate) fn router(state: impl Into<Shared>) -> Router {
     let shared: Shared = state.into();
     let mut open = Router::new();
     for (path, method) in open_routes() {
@@ -401,7 +401,7 @@ pub(super) async fn admin_only(
 }
 
 /// The process-wide router state: the generation (`AppState`) that is current. A generation
-/// restart swaps it ([`Shared::swap`]); the listener stays up. Handlers extract
+/// restart swaps it (`Shared::swap`); the listener stays up. Handlers extract
 /// `State<Arc<AppState>>` as before ([`axum::extract::FromRef`]), one `Arc` clone per request,
 /// so an in-flight request keeps its generation (and its workers) alive until it finishes.
 #[derive(Clone, Debug)]
@@ -410,19 +410,19 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(state: Arc<AppState>) -> Self {
+    pub(crate) fn new(state: Arc<AppState>) -> Self {
         Self {
             current: Arc::new(std::sync::RwLock::new(state)),
         }
     }
 
     /// The generation new requests are served by.
-    pub fn current(&self) -> Arc<AppState> {
+    pub(crate) fn current(&self) -> Arc<AppState> {
         self.current.read_recover().clone()
     }
 
     /// Make `state` current; returns the previous generation.
-    pub fn swap(&self, state: Arc<AppState>) -> Arc<AppState> {
+    pub(crate) fn swap(&self, state: Arc<AppState>) -> Arc<AppState> {
         let mut g = self.current.write_recover();
         std::mem::replace(&mut *g, state)
     }
@@ -450,7 +450,7 @@ pub struct Listeners {
 
 impl Listeners {
     /// The bound port (useful after binding port 0).
-    pub fn port(&self) -> u16 {
+    pub(crate) fn port(&self) -> u16 {
         self.port
     }
 }
@@ -486,20 +486,21 @@ pub async fn bind(address: std::net::IpAddr, port: u16) -> anyhow::Result<Listen
 /// runs while a keep-alive connection waits for its next request (hyper restarts it as soon as
 /// a response is done: `proto/h1/conn.rs`, `poll_read_head`), so it is the idle timeout too: a
 /// connection silent for this long is closed (slowloris and idle keep-alive alike).
-pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a shutdown waits for in-flight requests to finish before closing their
 /// connections anyway.
-pub const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 /// Pause after an accept error that is not about one connection (e.g. out of file
 /// descriptors), so the loop does not spin.
 const ACCEPT_ERROR_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Serve `shared` on `listeners` until `shutdown` is cancelled (in-flight requests finish,
-/// for at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]). Runs for the whole process: generation restarts
+/// for at most `GRACEFUL_SHUTDOWN_TIMEOUT`). Runs for the whole process: generation restarts
 /// swap `shared` instead of stopping it. Connections are HTTP/1.1 served by hyper with a
-/// timer, so [`HEADER_READ_TIMEOUT`] applies to request heads and idle keep-alive waits.
+/// timer, so `HEADER_READ_TIMEOUT` applies to request heads and idle keep-alive waits.
 pub async fn serve_on(
     listeners: Listeners,
     shared: Shared,

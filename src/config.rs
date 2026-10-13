@@ -1,6 +1,8 @@
 //! Service configuration: a JSON file next to the executable, merged with CLI flags.
-//! Merge rule (copied from blue-onyx): a CLI value overrides the file value only when it differs
-//! from the built-in default, and the merged result is written back to the file.
+//! Merge rule: a flag given on the command line overrides the file value (`cli::merge_cli`; an
+//! absent flag leaves the file value alone), the result is validated and written back to the
+//! file, except the one-off flags (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`),
+//! which apply to that run only and are never written back (`cli::without_one_off_flags`).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -995,7 +997,7 @@ pub fn check_path_syntax(key: &str, raw: &str) -> Result<()> {
 }
 
 /// Whether `p` (absolute, either platform's spelling) is one of the system directories or
-/// inside one (see [`SYSTEM_DIRS`], [`WINDOWS_SYSTEM_DIRS`]).
+/// inside one (see `SYSTEM_DIRS`, `WINDOWS_SYSTEM_DIRS`).
 pub fn is_system_dir(p: &Path) -> bool {
     let n = normalized(&p.to_string_lossy());
     let under = |dir: &str| n == dir || n.starts_with(&format!("{dir}/"));
@@ -1745,6 +1747,195 @@ mod tests {
             "0 and 1",
         );
         assert!(check(|c| c.benchmark.max_images_per_dataset = usize::MAX).is_ok());
+    }
+
+    // One test per validation rule of `Config::validate`, `validate_models` and `validate_config`
+    // (PR-5 test gap): break exactly one field of a valid config, assert the error names it.
+
+    /// `validate_config` on `three_models()` with `edit` applied: the error text.
+    fn run_err(edit: impl FnOnce(&mut Config)) -> String {
+        let mut c = three_models();
+        edit(&mut c);
+        format!("{:#}", validate_config(&c).unwrap_err())
+    }
+
+    #[test]
+    fn rule_port_zero() {
+        assert!(check(|c| c.port = 0).unwrap_err().contains("port:"));
+    }
+
+    #[test]
+    fn rule_request_timeout_secs_out_of_range() {
+        let e = check(|c| c.request_timeout_secs = 0).unwrap_err();
+        assert!(e.contains("request_timeout_secs:"), "{e}");
+    }
+
+    #[test]
+    fn rule_worker_queue_size_too_large() {
+        let e = check(|c| c.worker_queue_size = 5000).unwrap_err();
+        assert!(e.contains("worker_queue_size:"), "{e}");
+    }
+
+    #[test]
+    fn rule_confidence_threshold_above_one() {
+        let e = check(|c| c.confidence_threshold = 1.5).unwrap_err();
+        assert!(e.contains("confidence_threshold:"), "{e}");
+    }
+
+    #[test]
+    fn rule_nms_iou_not_finite() {
+        let e = check(|c| c.nms_iou = f32::INFINITY).unwrap_err();
+        assert!(e.contains("nms_iou:"), "{e}");
+    }
+
+    #[test]
+    fn rule_intra_threads_too_large() {
+        let e = check(|c| c.intra_threads = 300).unwrap_err();
+        assert!(e.contains("intra_threads:"), "{e}");
+    }
+
+    #[test]
+    fn rule_preprocess_threads_too_large() {
+        let e = check(|c| c.preprocess_threads = 300).unwrap_err();
+        assert!(e.contains("preprocess_threads:"), "{e}");
+    }
+
+    #[test]
+    fn rule_inflight_too_large() {
+        let e = check(|c| c.inflight = 65).unwrap_err();
+        assert!(e.contains("inflight:"), "{e}");
+    }
+
+    #[test]
+    fn rule_ort_sessions_too_large() {
+        let e = check(|c| c.ort_sessions = 17).unwrap_err();
+        assert!(e.contains("ort_sessions:"), "{e}");
+    }
+
+    #[test]
+    fn rule_gpu_index_too_large() {
+        let e = check(|c| c.gpu_index = 65).unwrap_err();
+        assert!(e.contains("gpu_index:"), "{e}");
+    }
+
+    #[test]
+    fn rule_max_image_pixels_too_small() {
+        let e = check(|c| c.max_image_pixels = 1).unwrap_err();
+        assert!(e.contains("max_image_pixels:"), "{e}");
+    }
+
+    #[test]
+    fn rule_save_image_max_age_days_too_large() {
+        let e = check(|c| c.save_image_max_age_days = 4000).unwrap_err();
+        assert!(e.contains("save_image_max_age_days:"), "{e}");
+    }
+
+    #[test]
+    fn rule_save_image_max_mb_too_large() {
+        let e = check(|c| c.save_image_max_mb = 2_000_000).unwrap_err();
+        assert!(e.contains("save_image_max_mb:"), "{e}");
+    }
+
+    #[test]
+    fn rule_models_dir_empty() {
+        let e = check(|c| c.models_dir = PathBuf::new()).unwrap_err();
+        assert!(e.contains("models_dir:"), "{e}");
+    }
+
+    #[test]
+    fn rule_device_unparsable() {
+        let e = check(|c| c.device = "xpu".into()).unwrap_err();
+        assert!(e.contains("device:"), "{e}");
+    }
+
+    #[test]
+    fn rule_benchmark_warmup_too_large() {
+        let e = check(|c| c.benchmark.warmup = 5000).unwrap_err();
+        assert!(e.contains("benchmark.warmup:"), "{e}");
+    }
+
+    #[test]
+    fn rule_benchmark_repeat_per_image_too_large() {
+        let e = check(|c| c.benchmark.repeat_per_image = 5000).unwrap_err();
+        assert!(e.contains("benchmark.repeat_per_image:"), "{e}");
+    }
+
+    #[test]
+    fn rule_benchmark_weights_accuracy_above_one() {
+        let e = check(|c| c.benchmark.weights.accuracy = 1.5).unwrap_err();
+        assert!(e.contains("benchmark.weights.accuracy:"), "{e}");
+    }
+
+    #[test]
+    fn rule_benchmark_weights_speed_negative() {
+        let e = check(|c| c.benchmark.weights.speed = -0.1).unwrap_err();
+        assert!(e.contains("benchmark.weights.speed:"), "{e}");
+    }
+
+    #[test]
+    fn rule_models_path_empty() {
+        let e = run_err(|c| c.models[0].path = PathBuf::new());
+        assert!(e.contains("models:") && e.contains("`path`"), "{e}");
+    }
+
+    #[test]
+    fn rule_models_name_duplicate() {
+        let e = run_err(|c| c.models[1].name = Some("A".into()));
+        assert!(e.contains("models:") && e.contains("duplicate"), "{e}");
+    }
+
+    #[test]
+    fn rule_models_device_unparsable() {
+        let e = run_err(|c| c.models[0].device = Some("xpu".into()));
+        assert!(e.contains("'a' device"), "{e}");
+    }
+
+    #[test]
+    fn rule_models_confidence_threshold_above_one() {
+        let e = run_err(|c| c.models[0].confidence_threshold = Some(2.0));
+        assert!(e.contains("'a' confidence_threshold"), "{e}");
+    }
+
+    #[test]
+    fn rule_models_inflight_too_large() {
+        let e = run_err(|c| c.models[0].inflight = Some(65));
+        assert!(e.contains("'a' inflight"), "{e}");
+    }
+
+    #[test]
+    fn rule_models_empty_list() {
+        let e = validate_models(&[]).unwrap_err().to_string();
+        assert!(e.contains("models: at least one model"), "{e}");
+        let e = run_err(|c| c.models.clear());
+        assert!(e.contains("models: at least one model"), "{e}");
+    }
+
+    #[test]
+    fn rule_models_none_enabled() {
+        let e = run_err(|c| c.models.iter_mut().for_each(|m| m.enabled = false));
+        assert!(e.contains("models:") && e.contains("enabled"), "{e}");
+    }
+
+    #[test]
+    fn rule_default_model_unknown() {
+        let e = run_err(|c| c.default_model = Some("nope".into()));
+        assert!(e.contains("default_model:"), "{e}");
+    }
+
+    #[test]
+    fn rule_check_threshold_and_range_helpers() {
+        assert!(
+            check_threshold("x", -0.5)
+                .unwrap_err()
+                .to_string()
+                .starts_with("x:")
+        );
+        assert!(
+            check_range("y", 9u32, 0, 3)
+                .unwrap_err()
+                .to_string()
+                .starts_with("y:")
+        );
     }
 
     #[test]

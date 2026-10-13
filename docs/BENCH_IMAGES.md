@@ -129,7 +129,7 @@ uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-bench.txt 
   - `--seed` (default `20261010`)
   - `--count` (target number of images)
   - `--max-mb` (per-set budget, default 150; BMD-45 hits it first)
-- Selection is deterministic: the same seed and pinned sources give byte-identical manifests.
+- Selection is deterministic: the same seed, pinned sources and the pinned Pillow (`scripts/requirements-bench.txt`) give byte-identical manifests.
 - Each run downloads every selected image, decodes it with Pillow and checks the decoded size
   against the annotations. For Hugging Face files it also checks the LFS SHA-256. It then writes
   the manifest in stable order and validates every set: schema, labels within COCO-80, boxes

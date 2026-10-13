@@ -8,6 +8,11 @@
 //! `#[ignore]`d: needs `models/IPcam-general.{onnx,yaml}` and `openvino/` under
 //! `common::test_root()` (a missing one fails the test). The second model is `models/yolo26n.xml`
 //! when present, else a second copy of IPcam-general.
+//!
+//! The run loop itself (FIFO replies across slots, a prep failure in the middle, the timeout
+//! before submit, shutdown with a busy slot, stuck and dead inferences) is covered without any
+//! fixture by the in-process tests on the scripted fake backend in `src/worker/run_tests.rs`
+//! (`cargo test --lib worker::run_tests`).
 
 mod common;
 

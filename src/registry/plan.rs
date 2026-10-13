@@ -1,6 +1,6 @@
 //! Planning the workers of a registry generation: for each enabled model, where it is headed
 //! and whether it can be spawned at all. Pure decisions over the config, the provisioning plan
-//! and what the runtimes offer; no threads are started here ([`super::Spawner::spawn_model`]
+//! and what the runtimes offer; no threads are started here (`Spawner::spawn_model`
 //! turns a [`ModelPlan`] into a worker).
 
 use super::{
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tracing::info;
 
-/// What the planner asks the runtimes. [`Runtimes`] answers it directly; [`LockedRuntimes`]
+/// What the planner asks the runtimes. [`Runtimes`] answers it directly; `LockedRuntimes`
 /// answers through the generation's mutex (reloads); tests use a fake.
 pub trait PlanRuntimes {
     /// The first runnable load candidate of `spec` for `model` and its option label; None when
@@ -65,7 +65,7 @@ pub enum PlanOutcome {
     Failed(String),
 }
 
-/// Everything [`super::Spawner::spawn_model`] needs to start the worker of one model.
+/// Everything `Spawner::spawn_model` needs to start the worker of one model.
 #[derive(Debug)]
 pub struct ModelPlan {
     pub name: String,

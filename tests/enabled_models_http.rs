@@ -243,7 +243,8 @@ async fn switch_models_with_restart() {
     };
     let real_rtdetr = rt_family == ModelFamilyKind::RtDetr;
     let image = common::test_image();
-    let config_path = temp_dir("switch").join("cfg.json");
+    let dir = temp_dir("switch");
+    let config_path = dir.join("cfg.json");
     let config = Config {
         models: vec![
             ModelConfig {
@@ -432,7 +433,8 @@ async fn restart_into_zero_enabled_models_keeps_http_up() {
     let model = common::require_ipcam();
     let ov_dir = common::require_openvino();
     let image = common::test_image();
-    let config_path = temp_dir("zero").join("cfg.json");
+    let dir = temp_dir("zero");
+    let config_path = dir.join("cfg.json");
     let config = Config {
         models: vec![ModelConfig {
             path: model,

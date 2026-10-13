@@ -11,7 +11,7 @@ Releases are built by `.github/workflows/release.yml` (Windows, Linux, macOS arc
 2. Update `version` in `Cargo.toml` (and `Cargo.lock`) and merge to `main`. The tag must equal that
    version, or the release workflow fails.
 3. Manual NVIDIA check (CUDA/TensorRT cannot run on hosted runners). The pinned Windows CUDA build
-   of ONNX Runtime has kernels for compute capability 7.5+ only (`catalog.rs`), so on Windows use a
+   of ONNX Runtime has kernels for compute capability 7.5+ only (`src/resources/catalog/`), so on Windows use a
    Turing or newer card (GTX 16xx, RTX 20xx or later); the GTX 1070 Ti (Pascal, 6.1) works only
    under Linux, whose CUDA build includes sm_60. With the release build and
    `setup-onnxruntime --flavor cuda` installed (plus CUDA 12 / cuDNN 9, or

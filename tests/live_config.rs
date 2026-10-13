@@ -104,7 +104,8 @@ async fn threshold_applies_to_the_next_detection() {
         ..config_with(&ov_dir, vec![ipcam("IPcam-general", &model)])
     };
     let client = reqwest::Client::new();
-    let served = Server::start(config, temp_dir("thr").join("cfg.json")).await;
+    let dir = temp_dir("thr");
+    let served = Server::start(config, dir.join("cfg.json")).await;
     let base = served.base.clone();
     wait_ready(&client, &base, &["IPcam-general"]).await;
     let gen0 = generation(&client, &base).await;
@@ -167,7 +168,8 @@ async fn disable_and_enable_without_restart() {
         vec![ipcam("ipcam-a", &model), ipcam("ipcam-b", &model)],
     );
     let client = reqwest::Client::new();
-    let served = Server::start(config, temp_dir("enable").join("cfg.json")).await;
+    let dir = temp_dir("enable");
+    let served = Server::start(config, dir.join("cfg.json")).await;
     let base = served.base.clone();
     wait_ready(&client, &base, &["ipcam-a", "ipcam-b"]).await;
     let gen0 = generation(&client, &base).await;
@@ -241,7 +243,8 @@ async fn device_change_reloads_only_that_model() {
         vec![ipcam("ipcam-a", &model), ipcam("ipcam-b", &model)],
     );
     let client = reqwest::Client::new();
-    let served = Server::start(config, temp_dir("device").join("cfg.json")).await;
+    let dir = temp_dir("device");
+    let served = Server::start(config, dir.join("cfg.json")).await;
     let base = served.base.clone();
     wait_ready(&client, &base, &["ipcam-a", "ipcam-b"]).await;
     let gen0 = generation(&client, &base).await;
@@ -296,7 +299,8 @@ async fn reload_model_n_times_does_not_leak() {
     let (model, ov_dir, image) = fixtures();
     let config = config_with(&ov_dir, vec![ipcam("ipcam-a", &model)]);
     let client = reqwest::Client::new();
-    let served = Server::start(config, temp_dir("leak").join("cfg.json")).await;
+    let dir = temp_dir("leak");
+    let served = Server::start(config, dir.join("cfg.json")).await;
     let base = served.base.clone();
     wait_ready(&client, &base, &["ipcam-a"]).await;
 

@@ -6,6 +6,8 @@
 #>
 param([int]$Port = 32168)
 
+Set-StrictMode -Version Latest
+# Best effort: a failing step warns and the rest of the cleanup still runs.
 $ErrorActionPreference = "Continue"
 $ServiceName = "BlueOnyxPrismService"
 $EventSource = "BlueOnyxPrism"

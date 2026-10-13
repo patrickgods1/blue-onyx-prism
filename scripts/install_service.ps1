@@ -39,6 +39,7 @@ param(
     [switch]$NoStart
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ServiceName = "BlueOnyxPrismService"
 $DisplayName = "Blue Onyx Prism"
@@ -189,20 +190,22 @@ if (-not $useSystem) {
     if (Test-Path $configPath) {
         try {
             $cfg = Get-Content -Raw $configPath | ConvertFrom-Json
+            # A key the config omits reads as $null (strict mode would otherwise throw on it).
+            $key = { param($n) $m = $cfg.PSObject.Properties[$n]; if ($m) { $m.Value } else { $null } }
             $resolve = {
                 param($p, $base)
                 if (-not $p) { return $null }
                 if ([System.IO.Path]::IsPathRooted($p)) { return $p }
                 return (Join-Path $base $p)
             }
-            $root = & $resolve $cfg.download_dir $InstallDir
+            $root = & $resolve (& $key "download_dir") $InstallDir
             if (-not $root) { $root = $InstallDir }
             foreach ($p in @(
-                    (& $resolve $cfg.download_dir $InstallDir),
-                    (& $resolve $cfg.models_dir $root),
-                    (& $resolve $cfg.cache_dir $InstallDir),
-                    (& $resolve $cfg.save_image_path $InstallDir),
-                    (& $resolve $cfg.log_path $InstallDir))) {
+                    (& $resolve (& $key "download_dir") $InstallDir),
+                    (& $resolve (& $key "models_dir") $root),
+                    (& $resolve (& $key "cache_dir") $InstallDir),
+                    (& $resolve (& $key "save_image_path") $InstallDir),
+                    (& $resolve (& $key "log_path") $InstallDir))) {
                 if ($p) { $dataDirs.Add($p) }
             }
         } catch { Write-Warning "Could not read $configPath ($_); grant Modify on its data paths by hand." }

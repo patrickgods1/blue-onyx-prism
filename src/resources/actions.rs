@@ -1,6 +1,6 @@
 //! What the web UI and `add-model` do with resources (phase 7.5): the Download / Remove /
 //! Add-to-config / Export / Cancel actions behind `POST /v1/resources/*`, the "Add a model by
-//! path" form and `add-model`. The rows they act on are built in [`super::status`], whose module
+//! path" form and `add-model`. The rows they act on are built in `super::status`, whose module
 //! docs describe when each action is refused.
 
 use super::catalog::{self, Platform, Resource, ResourceKind};

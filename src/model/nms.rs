@@ -42,7 +42,7 @@ pub fn nms(dets: &mut Vec<Detection>, iou_threshold: f32) {
 /// and returns at most `max_det` boxes. For inputs with at most `max_candidates` finite
 /// detections the result equals `nms` followed by `truncate(max_det)`.
 /// Cost: O(n + k log k + k * min(k, max_det)) IoU checks for `k = min(n, max_candidates)`.
-pub fn nms_capped(
+pub(crate) fn nms_capped(
     dets: &mut Vec<Detection>,
     iou_threshold: f32,
     max_candidates: usize,
@@ -303,5 +303,151 @@ mod tests {
         nms_capped(&mut v, 0.45, 1, 1);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].score, 0.3);
+    }
+
+    /// Seeded xorshift64 (no dependency; deterministic across platforms).
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        /// Uniform in [0, 1) with 24 bits.
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 24) as f32
+        }
+    }
+
+    /// 0..200 detections around a few anchors (so many overlap), 3 classes, scores on a coarse
+    /// grid (many ties), plus zero-area, inverted, out-of-image and non-finite boxes, and pairs
+    /// whose IoU is exactly 0.5 (`[x, y, x+w, y+h]` and `[x, y, x+2w, y+h]`).
+    fn random_set(rng: &mut XorShift) -> Vec<Detection> {
+        let n = rng.below(200) as usize;
+        let anchors: Vec<(f32, f32)> = (0..1 + rng.below(6))
+            .map(|_| (rng.unit() * 640.0, rng.unit() * 640.0))
+            .collect();
+        let mut v = Vec::with_capacity(n + 8);
+        while v.len() < n {
+            let (ax, ay) = anchors[rng.below(anchors.len() as u64) as usize];
+            let x = ax + (rng.unit() - 0.5) * 60.0;
+            let y = ay + (rng.unit() - 0.5) * 60.0;
+            let w = 1.0 + rng.unit() * 120.0;
+            let h = 1.0 + rng.unit() * 120.0;
+            let score = match rng.below(4) {
+                0 => [0.25, 0.5, 0.75][rng.below(3) as usize],
+                _ => (rng.unit() * 20.0).floor() / 20.0,
+            };
+            let class_id = rng.below(3) as usize;
+            let b = match rng.below(12) {
+                0 => d(x, y, x, y + h, score, class_id),     // zero width
+                1 => d(x, y, x + w, y, score, class_id),     // zero height
+                2 => d(x + w, y + h, x, y, score, class_id), // inverted
+                3 => d(-x - w, -y, -x, -y + h, score, class_id), // left of / above the image
+                4 => d(x + 700.0, y, x + 700.0 + w, y + h, score, class_id), // right of it
+                5 if rng.below(8) == 0 => d(x, y, x + w, y + h, f32::NAN, class_id),
+                6 => {
+                    // IoU exactly 0.5 with the next box (integer coordinates: exact in f32).
+                    let (x, y, w, h) = (x.floor(), y.floor(), w.floor().max(1.0), h.floor());
+                    v.push(d(x, y, x + 2.0 * w, y + h + 1.0, score, class_id));
+                    d(x, y, x + w, y + h + 1.0, score, class_id)
+                }
+                7 => v
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| d(x, y, x + w, y + h, score, class_id)),
+                _ => d(x, y, x + w, y + h, score, class_id),
+            };
+            v.push(b);
+        }
+        v
+    }
+
+    /// `sub` is a sub-multiset of `of`; returns `of` minus `sub`.
+    fn multiset_minus(of: &[Detection], sub: &[Detection]) -> Vec<Detection> {
+        let mut rest = of.to_vec();
+        for s in sub {
+            let i = rest
+                .iter()
+                .position(|r| r == s)
+                .unwrap_or_else(|| panic!("{s:?} is not in the input"));
+            rest.swap_remove(i);
+        }
+        rest
+    }
+
+    #[test]
+    fn nms_properties_on_random_sets() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut exact_half_seen = 0usize;
+        for case in 0..300 {
+            let input = random_set(&mut rng);
+            let finite: Vec<Detection> = input
+                .iter()
+                .filter(|d| {
+                    [d.x1, d.y1, d.x2, d.y2, d.score]
+                        .iter()
+                        .all(|v| v.is_finite())
+                })
+                .cloned()
+                .collect();
+            for thr in [0.3, 0.45, 0.5, 0.7] {
+                let mut out = input.clone();
+                nms(&mut out, thr);
+                let ctx = format!("case {case} thr {thr}");
+                // (a) A subset of the finite input, sorted by score.
+                let dropped = multiset_minus(&finite, &out);
+                assert!(out.windows(2).all(|w| w[0].score >= w[1].score), "{ctx}");
+                // (b) No two kept boxes of one class overlap with IoU >= the threshold.
+                for (i, a) in out.iter().enumerate() {
+                    for b in &out[i + 1..] {
+                        assert!(
+                            a.class_id != b.class_id || iou(a, b) < thr,
+                            "{ctx}: kept {a:?} and {b:?}"
+                        );
+                    }
+                }
+                // (c) Every dropped box overlaps a kept box of its class (IoU >= threshold)
+                // whose score is at least its own.
+                for x in &dropped {
+                    if thr == 0.5
+                        && out
+                            .iter()
+                            .any(|k| k.class_id == x.class_id && iou(k, x) == 0.5)
+                    {
+                        exact_half_seen += 1;
+                    }
+                    assert!(
+                        out.iter().any(|k| k.class_id == x.class_id
+                            && iou(k, x) >= thr
+                            && k.score >= x.score),
+                        "{ctx}: {x:?} dropped without a suppressor"
+                    );
+                }
+                // Idempotent: the kept set suppresses nothing further.
+                let mut again = out.clone();
+                nms(&mut again, thr);
+                assert_eq!(again, out, "{ctx}");
+                // (d) Below the candidate cap, nms_capped == nms followed by truncate(cap).
+                for cap in [0, 1, 7, 50, MAX_DETS] {
+                    let mut capped = input.clone();
+                    nms_capped(&mut capped, thr, finite.len().max(1), cap);
+                    let mut expected = out.clone();
+                    expected.truncate(cap);
+                    assert_eq!(capped, expected, "{ctx} cap {cap}");
+                }
+            }
+        }
+        // The IoU == threshold boundary (suppressed: `>=`) was exercised.
+        assert!(exact_half_seen > 0);
     }
 }

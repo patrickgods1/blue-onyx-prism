@@ -1,12 +1,12 @@
 #!/bin/sh
 # Regenerate the hashed package locks of the on-demand model export environment from
-# scripts/requirements-model-export.txt. The service embeds the locks (src/resources/export.rs)
+# scripts/requirements-model-export.txt. The service embeds the locks (src/resources/export/)
 # and installs them with `uv pip install --require-hashes --no-deps --only-binary :all:`, so every
 # wheel is checked against these hashes.
 #
 #   scripts/model-export/gen_locks.sh <path to uv> [exclude-newer timestamp]
 #
-# Use the pinned uv (catalog `tool:uv`, src/resources/catalog.rs). The timestamp freezes the
+# Use the pinned uv (catalog `tool:uv`, src/resources/catalog/). The timestamp freezes the
 # transitive dependencies; keep it at least two weeks in the past and update the pins in
 # requirements-model-export.txt in the same commit.
 #

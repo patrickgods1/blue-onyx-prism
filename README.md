@@ -116,7 +116,7 @@ serves HTTP right away (models answer `Model initializing` with the download pro
   used after the process restarts.
 - **Where:** next to the executable (`openvino/`, `onnxruntime/<flavor>/` with `active.txt` naming
   the active flavor, `onnxruntime/cuda-libs/`, `models/`), or under `download_dir`. Every file is
-  pinned by URL, size and SHA-256 in the binary (`src/resources/catalog.rs`), downloads resume after
+  pinned by URL, size and SHA-256 in the binary (`src/resources/catalog/`), downloads resume after
   an interruption, and only whitelisted files are extracted. Downloaded libraries (OpenVINO, ONNX
   Runtime, DirectML, the NVIDIA CUDA libraries) are SHA-256 pinned and loaded into the service's
   process, so they run with its rights; no downloaded program is run except by a model export you

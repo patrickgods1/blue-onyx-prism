@@ -31,7 +31,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-On-demand model export (`src/resources/export.rs`, the only code that runs downloaded programs; user-triggered
+On-demand model export (`src/resources/export/`, the only code that runs downloaded programs; user-triggered
 only, never by `auto_download`): `tool:uv` + `scripts/model-export/locks/*.txt` (hashed; regenerate with
 `scripts/model-export/gen_locks.sh`) + the embedded `scripts/export_model.py`; everything under `<data root>/tools/`.
 Recipes (`catalog::ExportRecipe`): Ultralytics YOLOv8/9/10/11/12/26 (`.pt`, AGPL-3.0), RF-DETR L (transformers,
@@ -48,7 +48,7 @@ OpenVINO libs are discovered through `openvino-finder`: `OPENVINO_INSTALL_DIR` (
 `backend/libs.rs` loads `openvino_c` by path) pointing at `<download root>/openvino` when present, or the OS library path.
 
 On-demand resources: pins, URLs, SHA-256 and sizes of everything downloadable (OpenVINO, ONNX Runtime
-flavors, DirectML, `nvidia-cuda-libs`, models) live in `src/resources/catalog.rs`; change them only in
+flavors, DirectML, `nvidia-cuda-libs`, models) live in `src/resources/catalog/`; change them only in
 reviewed commits. The service downloads what the config + hardware need at startup (`auto_download`, default
 true; `allow_large_downloads`, default false, gates > 500 MB; `download_dir`, default the exe dir).
 
@@ -64,12 +64,15 @@ Device spec (`device` in config/model entry, `--device`): `auto` (default), `ope
 first), each with its runtimes in order (NVIDIA: `ort:cuda`, `ort:tensorrt` when its libs load, `ort:directml` on
 Windows; Intel Arc: `openvino:gpu.N`, then `ort:directml`; AMD/other: `ort:directml` on Windows), then integrated
 GPUs (Intel via OpenVINO, else DirectML), macOS arm64 (CoreML), CPU (`openvino:cpu`, else `ort:cpu`). An NVIDIA
-GPU whose compute capability has no kernels in the pinned ORT CUDA build (`catalog.rs`) skips CUDA/TensorRT.
+GPU whose compute capability has no kernels in the pinned ORT CUDA build (`src/resources/catalog/`) skips CUDA/TensorRT.
 A model with results in `benchmark.json` orders its `auto` devices by measured speed (fastest eligible first,
 then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim aborts MPSGraph in ORT 1.24.4). ORT needs `.onnx` files.
 
 ## Architecture (see the plan in the repo history / README for detail)
 
+- Large modules are directories split by concern (`src/benchmark/{run,scoring,sweep}.rs`, `benchmark/cli/`,
+  `benchmark/report/`, `server/benchmark/`, `resources/{export,manager,catalog,extract}/`, `registry/`,
+  `backend/onnx_rewrite/`, `backend/memory.rs`); each file starts with a `//!` doc stating its responsibility.
 - `src/server.rs` axum HTTP (2-thread tokio runtime; fs-heavy handlers run in `server::blocking`). The
   listener is bound once per process (`bind` + `serve_on`) and serves `Shared`, the swappable current
   `AppState`; admin routes answer loopback peers only unless `allow_remote_admin`. Blue Iris calls
@@ -123,8 +126,11 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 - Keep the Blue Iris response shape byte-compatible with CodeProject.AI: `success, message, error,
   predictions[{x_min,y_min,x_max,y_max,confidence,label}], count, command, moduleId, executionProvider,
   canUseGPU, inferenceMs, processMs, analysisRoundTripMs`.
-- Tests: pure post-processing tests in `tests/postprocess.rs` with synthetic tensors; HTTP integration
-  test skips when `models/` is absent.
+- Tests: pure post-processing tests in `tests/postprocess.rs` with synthetic tensors; the HTTP and backend
+  integration tests (`tests/*_http.rs`, `backend_*.rs`, ...) are `#[ignore]`d and need the fixtures described in
+  `tests/common/mod.rs` (`models/IPcam-general.*`, `openvino/`, `onnxruntime/`; run with
+  `cargo test -- --ignored --test-threads=1`). `common::temp_dir` returns a guard that removes the folder
+  (keep with `BOP_KEEP_TEST_DIRS=1`).
 
 ## Working style for agents
 

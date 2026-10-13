@@ -115,17 +115,70 @@ pub fn free_port() -> u16 {
     }
 }
 
-/// A fresh, empty folder under the system temp dir.
-pub fn temp_dir(tag: &str) -> PathBuf {
+/// A fresh, empty folder under the system temp dir, removed when the guard drops (keep it for
+/// debugging with `BOP_KEEP_TEST_DIRS=1`). Derefs to the path; bind the guard to a local so it
+/// outlives everything that uses the folder.
+pub struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if std::env::var_os("BOP_KEEP_TEST_DIRS").is_none() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn new_test_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bo_test_{tag}_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
 
+/// A fresh, empty folder under the system temp dir (see [`TempDir`]).
+pub fn temp_dir(tag: &str) -> TempDir {
+    TempDir(new_test_dir(tag))
+}
+
 /// A fresh compile-cache folder (string form for `Config::cache_dir`). Tests do not share one,
-/// so parallel tests never write the same cache entries.
+/// so parallel tests never write the same cache entries. A `String` cannot own a guard, so these
+/// folders outlive the run; the first call of a process removes `bo_test_*` folders older than
+/// a day (unless `BOP_KEEP_TEST_DIRS=1`).
 pub fn cache_dir(tag: &str) -> String {
-    temp_dir(&format!("cache_{tag}"))
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(|| {
+        if std::env::var_os("BOP_KEEP_TEST_DIRS").is_some() {
+            return;
+        }
+        let day = Duration::from_secs(24 * 3600);
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let stale = e.file_name().to_string_lossy().starts_with("bo_test_")
+                && e.metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > day);
+            if stale {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
+    new_test_dir(&format!("cache_{tag}"))
         .to_string_lossy()
         .into_owned()
 }
@@ -251,6 +304,8 @@ pub struct Server {
     /// Metrics of the in-process server (None in runner mode: the run loop owns its own).
     metrics: Option<Arc<Metrics>>,
     mode: Mode,
+    /// Keeps the in-process server's config folder until the server is dropped.
+    _dir: Option<TempDir>,
 }
 
 impl Server {
@@ -278,6 +333,7 @@ impl Server {
                 token,
                 metrics: None,
                 mode: Mode::Runner { thread },
+                _dir: None,
             };
             match server.wait_http_or_exit().await {
                 Ok(()) => return server,
@@ -294,7 +350,8 @@ impl Server {
         let metrics = Arc::new(Metrics::new(blue_onyx_prism::VERSION));
         let registry =
             Arc::new(ModelRegistry::start(&config, &metrics, token.clone()).expect("registry"));
-        let config_path = temp_dir("config").join("config.json");
+        let dir = temp_dir("config");
+        let config_path = dir.join("config.json");
         let state = Arc::new(AppState::new(
             registry.clone(),
             metrics.clone(),
@@ -311,6 +368,7 @@ impl Server {
             token,
             metrics: Some(metrics),
             mode: Mode::InProcess { server, registry },
+            _dir: Some(dir),
         }
     }
 

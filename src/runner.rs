@@ -15,7 +15,7 @@
 //!
 //! The HTTP listener is bound once per run and serves [`server::Shared`]: a restart builds the
 //! next generation while the old one keeps answering, swaps it in, and stops the old workers
-//! once its in-flight requests have finished (at most [`DRAIN`]).
+//! once its in-flight requests have finished (at most `DRAIN`).
 
 use crate::cli::LogReloadHandle;
 use crate::config::Config;
@@ -61,7 +61,7 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Build the tokio runtime the server runs on: two worker threads (handlers are short; the point
 /// is that one slow handler cannot stall the detection routes) plus the blocking pool that
-/// [`server::blocking`] work runs on.
+/// `server::blocking` work runs on.
 pub fn build_runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

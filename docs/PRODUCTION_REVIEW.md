@@ -3585,6 +3585,77 @@ Multipart parse (image `Bytes` copy, `HashMap` of text fields), one `oneshot`, r
   hang or ORT session panic (fake threads only), a real > 5 min compile (ms thresholds in tests),
   the Ultralytics numeric check, the attestation job and issue-on-failure step (GitHub only).
 
+### Phase 5 notes (items from the brief without a finding ID)
+
+- **File splits (moves only):** every file the brief named, plus the four that had grown past
+  1900 lines in phases 1 to 4, is now a directory module split along its existing section seams.
+  Items moved verbatim (rustfmt only); each new file has a `//!` doc; the old paths keep resolving
+  through re-exports, so `tests/` and the bins change only where a `use` moved. Because one file
+  becomes several, `git diff -M` shows the originals as deleted and the parts as added; the
+  benchmark catalog move was checked by comparing every SHA-256 (109), URL, commit and size
+  literal before and after (identical, sorted), the worker and export moves by line-set diffs.
+
+  | old (lines) | new (lines) |
+  |---|---|
+  | `benchmark/mod.rs` (2923) | `mod.rs` 950, `run.rs` 641, `scoring.rs` 1109, `sweep.rs` 294 |
+  | `benchmark/cli.rs` (2398) | `cli/mod.rs` 1273, `cli/print.rs` 970, `cli/args.rs` 234 |
+  | `benchmark/report.rs` (2278) | `report/mod.rs` 1510, `report/recommend.rs` 619, `report/test_support.rs` 179 (test) |
+  | `server/benchmark.rs` (2109) | `benchmark/mod.rs` 935, `run.rs` 485, `apply.rs` 750 |
+  | `resources/export.rs` (3157) | `export/mod.rs` 569, `seams.rs` 427, `stages.rs` 613, `exporter.rs` 541, `fake.rs` 139 (test), `tests.rs` 876 |
+  | `resources/manager.rs` (2359) | `manager/mod.rs` 874, `worker.rs` 1460, `progress.rs` 37 |
+  | `resources/catalog.rs` (2510) | `catalog/mod.rs` 957, `runtimes.rs` 415, `models.rs` 1035, `tools.rs` 126 |
+  | `resources/extract.rs` (2434) | `extract/mod.rs` 1309, `openvino.rs` 396, `onnxruntime.rs` 373, `nvidia.rs` 299, `test_util.rs` 167, `fuzz_tests.rs` 583 (new) |
+  | `backend/onnx_rewrite.rs` (2954) | `onnx_rewrite/mod.rs` 1222, `proto.rs` 265, `onnx.rs` 367, `emit.rs` 624, `test_models.rs` 564 (test) |
+  | `worker.rs` (2072) | `worker/mod.rs` 764, `run.rs` 914, `pipeline.rs` 195, `watch.rs` 277, `run_tests.rs` 407 (new) |
+
+  Not split: `backend/ort.rs` (2009; CLAUDE.md keeps every `ort` call in one file) and
+  `config.rs` (2051 after the 28 new rule tests; the code part is 1100 lines).
+- **Visibility and docs:** about 150 `pub` items used only inside the crate are `pub(crate)` /
+  `pub(super)` (benchmark constants and helpers, server internals and `AppState` fields, detect.rs
+  limits, manager/export locks and timeouts, worker helpers, `nms_capped`). Items in public
+  signatures, used by `tests/` or the bins, or whose only users are `cfg(windows|linux)` code stay
+  `pub` (narrowing them trips `dead_code` / `private_interfaces` on one platform). `cargo doc
+  --no-deps --locked` warnings: 36 -> 0 (private intra-doc links became plain code spans; the clap
+  help text on `BenchArgs` carries an `allow` so `--help` is unchanged). Every module has a `//!`
+  doc; every `unsafe` block keeps its `// SAFETY:` line.
+- **Test gaps filled (brief):** NMS property test (`model::nms::tests::nms_properties_on_random_sets`:
+  300 seeded sets x 4 thresholds; subset and order, no kept same-class pair at or above the
+  threshold, every dropped box dominated, idempotent, `nms_capped` == `nms` + truncate; NaN,
+  zero-area, inverted and exact-0.5 pairs included); multipart fuzz tests
+  (`server::detect::tests::multipart_*`: 14 crafted bodies, the 32 MiB boundary, 200 seeded random
+  bodies, through the production `Upload` extractor; parser rejections answer 200 `success:false`
+  as CodeProject.AI does); extract fuzz tests (`resources::extract::fuzz_tests`, 9 tests: escaping
+  and absolute names, drive letters, dot/empty names, duplicates, lying size headers at the
+  ceilings, truncated archives, tar links, GNU long names, non-UTF-8 names, 200 x 4 byte-soup runs;
+  each asserts no panic, nothing outside the destination, no `.partial` left); one test per config
+  validation rule (`config::tests::rule_*`, 28 tests for 29 rule sites in `validate`,
+  `validate_model_entries`, `validate_models`, `validate_config`); router classification
+  (already existed, `server::tests::router_classification`); concurrency over the cap
+  (`burst_over_the_inflight_cap_is_rejected_fast`: cap 2, 10 stalled uploads, 8 x 503 within 2 s,
+  `requests_rejected_total{reason="overloaded"}` = 8, slots released on abort; plus
+  `admit_rejects_at_once_when_every_slot_is_held`, < 50 ms per rejection); and the worker run loop
+  in-process (PL-12, below).
+- **Non-Rust:** both `.ps1` scripts run under `Set-StrictMode -Version Latest` (a `$key` helper
+  reads omitted config keys as `$null`; the uninstall script keeps `Continue` on purpose); the
+  `.sh` scripts were reviewed by hand (`shellcheck` not installed): `set -euo pipefail` / `set -eu`
+  for POSIX `sh`, expansions quoted; every workflow job already had `permissions:` and
+  `timeout-minutes` (phase 4). Dependencies: `imageproc`, `mime`, `approx` and clap's `env`
+  feature removed (`cargo tree -e normal` 563 -> 519 lines, Cargo.lock -178 lines);
+  `openvino = "=0.11.0"` pinned; the `windows` crate gains `Win32_System_SystemInformation`.
+  Template escaping / CSP (SV-09, SV-16) and `live.js` (SV-11) were done in phase 2.
+- **Docs:** CLAUDE.md (ignored integration tests need the `tests/common` fixtures; directory modules;
+  `catalog/`, `export/` paths), `.claude/agents/porter.md` (ONNX Runtime code may be copied, kept
+  in `backend/ort.rs`), README, `docs/RELEASE_CHECKLIST.md`, `gen_locks.sh` and `check-urls.yml`
+  paths, `docs/BENCH_IMAGES.md` determinism claim ("with the pinned Pillow"), the `config.rs`
+  merge-rule doc (CO-17).
+- **Not verified on this machine:** everything ran on macOS arm64 only. Windows:
+  `GlobalMemoryStatusEx` (CO-13 follow-up; compiled with `clippy --target x86_64-pc-windows-msvc`
+  in a scratch crate, never run), the PowerShell strict-mode changes, the Windows branch of
+  `extract::fuzz_tests::non_utf8_names` (the RS-13 context message is reached only there), the
+  `dead_code` state of the visibility pass under `cfg(windows)` / `cfg(linux)` (CI). Linux: the
+  process-group code in `export/seams.rs`. The behavior-neutral claim rests on the gates and the
+  line-set / pin comparisons above, not on a Blue Iris run.
+
 ## Per-finding status
 
 Updated at the end of each phase (phase 1: branch `review/phase-1-crash-safety`; phase 2: branch `review/phase-2-security`; phase 3: branch `review/phase-3-resources-load`; phase 4: branch `review/phase-4-operability`). Phase 0 leaves every finding open; the phase column is where the fix
@@ -3675,7 +3746,7 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | CO-05 | operability | 4 | fixed in phase 4: a config with no models (service first start, CLI) is seeded with `IPcam-general` (`Config::seed_default_model`), saved, and warned about; the UI then serves while `auto_download` fetches it |
 | CO-11 | operability | 4 | fixed in phase 4: `logbuf::early()` holds messages logged before logging starts and replays them (or prints them to stderr); an unusable `log_path` falls back to stdout with a warning |
 | CO-12 | operability | 4 | fixed in phase 4: second Ctrl-C/SIGTERM exits 130, a 60 s deadline exits 1, server stop capped at 10 s, `rt.shutdown_timeout(5 s)`; the service gives up after 60 s with exit code 2 (not run on Windows here) |
-| CO-13 | operability | 4 | fixed in phase 4: absolute `powershell.exe` path, `-NonInteractive`, 5 s timeout with kill, cached once per process; `GlobalMemoryStatusEx` deferred because it needs `unsafe` outside backend/ (phase 5 may add a backend helper) |
+| CO-13 | operability | 4 | fixed in phase 4: absolute `powershell.exe` path, `-NonInteractive`, 5 s timeout with kill, cached once per process; `GlobalMemoryStatusEx` added in phase 5 as `backend::memory::total_physical_bytes` (Windows first choice, PowerShell fallback; compiled for the Windows target, not run) |
 | NR-12 | operability | 4 | fixed in phase 4: the checklist's CUDA step runs on Turing-or-newer Windows or on Linux and fails without an `ort:cuda` row |
 | NR-13 | operability | 4 | fixed in phase 4: checklist step for the i5-8500 iGPU (`benchmark --all-devices --report igpu.html`, fails without an `openvino:gpu` row) |
 | NR-14 | operability | 4 | fixed in phase 4: CI downloads `rt-detrv2-s`; the lazy model is an IPcam copy when yolo26n is absent so the lazy flow always runs; YOLO26 stays a manual checklist step (AGPL export) |
@@ -3698,22 +3769,22 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | SV-11 | operability | 4 | fixed in phase 2: live.js handles non-JSON/403, capped exponential backoff, waitRestart gives up after 2 min, timers paused while hidden |
 | SV-12 | operability | 4 | fixed in phase 4: README says a local reverse proxy equals `allow_remote_admin: true` and `X-Forwarded-For` is ignored on purpose; the server warns once when a loopback admin request carries a forwarding header |
 | SV-15 | operability | 1 | fixed in phase 1: catch_panic middleware answers 500 (JSON or HTML) and the connection stays usable |
-| BE-11 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| BE-12 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| BM-07 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
+| BE-11 | maintainability | 5 | fixed in phase 5: `openvino = "=0.11.0"` pinned; 0.11.0 has no public raw-pointer getter for `InferRequest`/`Core`, so the three `transmute_copy` sites keep the `size_of` assert and add an `align_of` assert plus a comment naming the exact pin |
+| BE-12 | maintainability | 5 | fixed in phase 5: `OrtProbe` doc says it is filled by `ort::probe_providers` (`not_in_build` without the feature) |
+| BM-07 | maintainability | 5 | fixed in phase 5: `agreement_text` uses `saturating_add`; `iou` computes areas and the intersection in f64 from the differences (tests near `usize::MAX`) |
 | BM-09 | maintainability | 5 | fixed in phase 1: percentile/Stats handle empty slices and NaN |
 | BQ-11 | maintainability | 5 | fixed in phase 1: roc::auc groups equal scores with total_cmp, terminates on NaN |
-| BQ-12 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| BQ-13 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
+| BQ-12 | maintainability | 5 | fixed in phase 5: `Grades::with_metric` maps a non-finite p50 to `f64::MAX` (graded F) and a non-finite score to `None`; `p50_ms: null` loads as the sentinel instead of failing |
+| BQ-13 | maintainability | 5 | fixed in phase 5: model names deduplicated by `registry::normalize_name` with a seen-set; `device`/`objective` go through `csv_field`, which prefixes `'` for a leading `=`, `+`, `-`, `@`, tab or CR |
 | CO-15 | maintainability | 5 | fixed in phase 1: crate-level lint policy in lib.rs and every binary; deny(unsafe_code) outside backend |
 | CO-16 | maintainability | 5 | fixed in phase 1: one check_threshold rule (finite, 0..=1) on every path |
-| CO-17 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| NR-22 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| NR-23 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| NR-24 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
+| CO-17 | maintainability | 5 | fixed in phase 5: `config.rs` module doc states the real rule (a given flag overrides; one-off flags are never written back); the README table was completed in phase 4 (NR-11) and is enforced by `readme_documents_every_config_key` |
+| NR-22 | maintainability | 5 | fixed in phase 5: `imageproc`, `mime`, `approx` and clap `env` removed; no other direct dependency is unreferenced; `cargo machete` not added to CI (no further candidates) |
+| NR-23 | maintainability | 5 | fixed in phase 5: CLAUDE.md, porter.md and the `tests/backend_cpu.rs` comment corrected; README/checklist/script/workflow paths follow the directory splits |
+| NR-24 | maintainability | 5 | fixed in phase 5: `tests/common::temp_dir` returns a `TempDir` guard (removed on drop; `BOP_KEEP_TEST_DIRS=1` keeps it); `cache_dir` sweeps `bo_test_*` older than 24 h; `backend_ort` asserts a copy ending in `-v{REWRITER_VERSION}.onnx` |
 | NR-25 | maintainability | 5 | fixed in phase 2: deny.toml ignores carry a reason and a review date |
-| NR-26 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| PL-10 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| PL-12 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
-| RS-13 | maintainability | 5 | open (phase 0: identified, not yet fixed) |
+| NR-26 | maintainability | 5 | fixed in phase 5: `validate` collects explicit errors (no `assert`), `Pillow==12.3.0`, BENCH_IMAGES.md claims determinism with the pinned Pillow |
+| PL-10 | maintainability | 5 | fixed in phase 5: `read_recover` / `write_recover` on the worker `device` lock |
+| PL-12 | maintainability | 5 | fixed in phase 5: `cfg(test)` `Backend::Fake` (`backend/fake.rs`, scripted Ok/Fail/Hang/Panic steps, call log) + `Runtimes::fake`; `worker::run_tests` drives `spawn_worker` in-process: FIFO across slots, prep failure mid-queue, timeout before submit, shutdown with a busy slot, stuck inference -> Failed and recovery, dead session, per-request failure |
+| RS-13 | maintainability | 5 | fixed in phase 5: the temp name is `<full file name>.partial`; the tar entry-name error names the archive (`reading an entry name in ...`); tests for both (the tar error branch runs only on Windows) |
 | SV-16 | maintainability | 5 | fixed in phase 2: message.html passes values via data attributes |
