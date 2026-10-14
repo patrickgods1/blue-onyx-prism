@@ -20,9 +20,10 @@ use crate::startup::{ModelState, StateHandle};
 use crate::sync::{LockExt, RwLockExt};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Select, TryRecvError};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
@@ -57,7 +58,19 @@ pub(super) struct WorkerCtx {
     /// Shared with [`WorkerHandle::is_stuck`].
     pub(super) stuck: Arc<AtomicBool>,
     pub(super) shutdown: CancellationToken,
+    /// Inferences in a row that returned an error (see [`MAX_CONSECUTIVE_ERRORS`]).
+    pub(super) consecutive_errors: Cell<u32>,
+    /// Inferences in a row whose outputs were degenerate (see [`outputs_degenerate`]).
+    pub(super) consecutive_degenerate: Cell<u32>,
 }
+
+/// Inference errors in a row after which the model counts as broken (a reset GPU makes every
+/// later `run` fail with the same CUDA / DirectML error; a single failure is per request).
+pub(crate) const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+/// Inferences in a row with [`outputs_degenerate`] outputs after which the model counts as
+/// broken (a reset device can hand back unwritten buffers without an error: "no objects"
+/// forever). Camera frames never produce that many all-zero raw outputs in a row.
+pub(crate) const MAX_CONSECUTIVE_DEGENERATE: u32 = 25;
 
 impl WorkerCtx {
     pub(super) fn run(mut self, rx: Receiver<WorkItem>, after: Option<LoadGate>) {
@@ -643,6 +656,7 @@ impl WorkerCtx {
         self.metrics
             .set_loaded(dev.actual.clone(), engine.provider.clone());
         let (hint, streams) = engine.backend.hint_and_streams();
+        super::warn_unknown_filter(name, &self.cfg.live.load().object_filter, &self.cfg.classes);
         info!(
             model = %name,
             family = %engine.family.kind(),
@@ -712,9 +726,22 @@ impl WorkerCtx {
         let mut pre = spec.preprocessor();
         let (chw, ctx) = pre.run(&gray, in_w, in_h)?;
         let extra = family.extra_inputs(&ctx);
-        let t = Instant::now();
-        let outs = backend.infer(chw, &extra).context("warm-up inference")?;
-        let warmup_ms = millis_u64(t.elapsed());
+        let outs = match warm_up(&mut backend, chw, &extra, WARMUP_TIMEOUT) {
+            Ok(outs) => outs,
+            Err(e) => {
+                if e.is::<WarmupTimeout>() {
+                    // The inference is still running on a device that does not answer.
+                    // Dropping the backend would wait for it (OpenVINO cancels and waits,
+                    // ONNX Runtime waits `ABORT_TIMEOUT`): leak it instead, so this thread
+                    // goes on to the next candidate (CPU last) and the model still serves.
+                    error!(model = %self.cfg.name, "{e:#}; abandoning the device");
+                    std::mem::forget(backend);
+                }
+                return Err(e);
+            }
+        };
+        let warmup_ms = outs.1;
+        let outs = outs.0;
         // A family or class-count mismatch fails here instead of on every request.
         let params = PostParams {
             confidence_threshold: 0.5,
@@ -729,17 +756,6 @@ impl WorkerCtx {
                 self.cfg.classes.len()
             )
         })?;
-        let others = 1..backend.slots();
-        for s in others.clone() {
-            backend
-                .submit(s, chw, &extra)
-                .context("warm-up inference")?;
-        }
-        for s in others {
-            let outs = backend.collect(s).context("warm-up inference")?;
-            backend.recycle(s, outs);
-        }
-        while backend.completions().try_recv().is_ok() {}
         Ok((
             Engine {
                 backend,
@@ -767,6 +783,41 @@ impl WorkerCtx {
             inferenceMs: inference_ms,
             processMs: process_ms,
             ..VisionDetectionResponse::error(msg)
+        }
+    }
+
+    /// Track the outcome of one inference: a streak of [`MAX_CONSECUTIVE_ERRORS`] errors or
+    /// [`MAX_CONSECUTIVE_DEGENERATE`] degenerate outputs marks the model broken (same path as a
+    /// stuck inference: parked, then reloaded by the supervisor). A good result resets both.
+    fn note_health(&self, eng: &Engine, error: Option<&anyhow::Error>, degenerate: bool) {
+        if self.stuck.load(Ordering::Acquire) {
+            return;
+        }
+        match error {
+            Some(e) => {
+                self.consecutive_degenerate.set(0);
+                let n = self.consecutive_errors.get().saturating_add(1);
+                self.consecutive_errors.set(n);
+                if n >= MAX_CONSECUTIVE_ERRORS {
+                    self.stuck_watch(eng).mark_broken(&format!(
+                        "the last {n} inferences failed (last error: {e:#})"
+                    ));
+                }
+            }
+            None if degenerate => {
+                self.consecutive_errors.set(0);
+                let n = self.consecutive_degenerate.get().saturating_add(1);
+                self.consecutive_degenerate.set(n);
+                if n >= MAX_CONSECUTIVE_DEGENERATE {
+                    self.stuck_watch(eng).mark_broken(&format!(
+                        "the last {n} inferences returned only zeros (or NaN) in every output"
+                    ));
+                }
+            }
+            None => {
+                self.consecutive_errors.set(0);
+                self.consecutive_degenerate.set(0);
+            }
         }
     }
 
@@ -798,7 +849,9 @@ impl WorkerCtx {
         {
             self.stuck_watch(eng).mark(f.submitted.elapsed(), Some(e));
         }
+        let mut degenerate = false;
         let result = collected.and_then(|outs| {
+            degenerate = outputs_degenerate(&outs);
             let dets = eng.family.postprocess(&outs, &f.ctx, &params);
             eng.backend.recycle(slot, outs);
             let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
@@ -809,6 +862,7 @@ impl WorkerCtx {
                 filter,
             ))
         });
+        self.note_health(eng, result.as_ref().err(), degenerate);
         let post_d = t.elapsed();
         let process_d = f.decode + f.preprocess + infer_d + post_d;
         let round_trip = f.meta.enqueued.elapsed();
@@ -886,6 +940,113 @@ impl WorkerCtx {
     }
 }
 
+/// Longest the warm-up inferences of one device candidate may take. A device that does not
+/// answer by then (a hung driver, a GPU that is not up yet after boot) is abandoned and the
+/// next candidate tried, instead of the worker thread waiting forever with the model
+/// "initializing". Generous: the first inference on a cold GPU can take many seconds.
+pub(crate) const WARMUP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// A warm-up inference that did not finish within [`WARMUP_TIMEOUT`]; the backend it ran on
+/// must not be dropped (see `load_on`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WarmupTimeout {
+    pub device: String,
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for WarmupTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "warm-up inference on {} did not finish within {} s; the device driver may have \
+             hung or the GPU is not available yet",
+            self.device,
+            self.waited.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for WarmupTimeout {}
+
+/// Warm every slot of `backend` up on one frame, within `timeout` in total: slot 0 first and
+/// timed (its outputs are returned, with the inference time in ms), then every other slot at
+/// once (first runs allocate per request / session). Waits on the backend's completion channel
+/// so a hung device yields [`WarmupTimeout`] instead of blocking in `collect`.
+pub(crate) fn warm_up(
+    backend: &mut Backend,
+    chw: &[f32],
+    extra: &[crate::model::ExtraInput],
+    timeout: Duration,
+) -> Result<(Vec<crate::model::NamedOutput>, u64)> {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let device = backend.info().device.spec.clone();
+    let wait = |backend: &Backend| -> Result<()> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match backend.completions().recv_timeout(left) {
+            Ok(_) => Ok(()),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(WarmupTimeout {
+                device: device.clone(),
+                waited: started.elapsed(),
+            }
+            .into()),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("the inference runtime stopped during the warm-up")
+            }
+        }
+    };
+    // Completions of earlier synchronous calls (none expected) must not count.
+    while backend.completions().try_recv().is_ok() {}
+    let t = Instant::now();
+    backend.submit(0, chw, extra).context("warm-up inference")?;
+    wait(backend).context("warm-up inference")?;
+    let outs = backend.collect(0).context("warm-up inference")?;
+    let warmup_ms = millis_u64(t.elapsed());
+    let others = 1..backend.slots();
+    for s in others.clone() {
+        backend.submit(s, chw, extra).context("warm-up inference")?;
+    }
+    for _ in others.clone() {
+        wait(backend).context("warm-up inference")?;
+    }
+    for s in others {
+        let o = backend.collect(s).context("warm-up inference")?;
+        backend.recycle(s, o);
+    }
+    while backend.completions().try_recv().is_ok() {}
+    Ok((outs, warmup_ms))
+}
+
+/// True when `outs` cannot come from a working inference: no output holds a single finite,
+/// non-zero value (every value is zero, NaN or infinite). A reset GPU hands back unwritten
+/// buffers (zeros) or garbage; a real frame always yields some finite non-zero coordinate or
+/// score. Empty outputs (a `[1,0,6]` end-to-end result) are fine, and so is an occasional
+/// overflowed (f16) logit among normal values.
+pub(crate) fn outputs_degenerate(outs: &[crate::model::NamedOutput]) -> bool {
+    use crate::model::OutputBuf;
+    let mut any_values = false;
+    for o in outs {
+        let normal = match &o.data {
+            OutputBuf::F32(v) => {
+                any_values |= !v.is_empty();
+                v.iter().any(|x| x.is_finite() && *x != 0.0)
+            }
+            OutputBuf::I64(v) => {
+                any_values |= !v.is_empty();
+                v.iter().any(|&x| x != 0)
+            }
+            OutputBuf::I32(v) => {
+                any_values |= !v.is_empty();
+                v.iter().any(|&x| x != 0)
+            }
+        };
+        if normal {
+            return false;
+        }
+    }
+    any_values
+}
+
 /// The `Failed` text of a model that could not be loaded on any of its devices.
 fn load_failure_message(e: &anyhow::Error) -> String {
     format!(
@@ -904,6 +1065,96 @@ pub(super) fn session_dead(e: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_backend(
+        slots: usize,
+        warmup_hangs: bool,
+    ) -> (Backend, crate::backend::fake::FakeScript) {
+        use crate::backend::LoadRequest;
+        let mut script = crate::backend::fake::FakeScript::new(slots, (64, 64));
+        script.warmup_hangs = warmup_hangs;
+        let req = LoadRequest {
+            path: std::path::PathBuf::from("models/fake.onnx"),
+            requested: "auto".into(),
+            gpu_precision: None,
+        };
+        let b = script.compile(&req, "openvino:cpu", false).into_backend();
+        (Backend::Fake(b), script)
+    }
+
+    #[test]
+    fn warm_up_covers_every_slot_and_leaves_no_completion_behind() {
+        use crate::backend::fake::Call;
+        let (mut backend, script) = fake_backend(3, false);
+        let chw = vec![0.0f32; 3 * 64 * 64];
+        let (outs, ms) = warm_up(&mut backend, &chw, &[], Duration::from_secs(5)).unwrap();
+        assert_eq!(outs.len(), 1);
+        assert!(ms < 1000);
+        let calls = script.calls();
+        assert_eq!(calls[0], Call::WarmupSubmit { slot: 0 });
+        assert_eq!(calls[1], Call::Collect { slot: 0 });
+        assert!(calls.contains(&Call::WarmupSubmit { slot: 1 }));
+        assert!(calls.contains(&Call::WarmupSubmit { slot: 2 }));
+        assert!(calls.contains(&Call::Collect { slot: 2 }));
+        assert!(backend.completions().try_recv().is_err());
+        assert!(!backend.is_busy(0) && !backend.is_busy(1) && !backend.is_busy(2));
+    }
+
+    #[test]
+    fn warm_up_gives_up_on_a_device_that_never_answers() {
+        let (mut backend, _script) = fake_backend(2, true);
+        let chw = vec![0.0f32; 3 * 64 * 64];
+        let t = Instant::now();
+        let err = warm_up(&mut backend, &chw, &[], Duration::from_millis(100)).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(err.is::<WarmupTimeout>(), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(text.contains("did not finish"), "{text}");
+        assert!(text.contains("openvino:cpu"), "{text}");
+        // Still in flight: the caller leaks the backend instead of waiting for it.
+        assert!(backend.is_busy(0));
+        std::mem::forget(backend);
+    }
+
+    #[test]
+    fn degenerate_outputs() {
+        use crate::model::{NamedOutput, OutputBuf};
+        let out = |data: OutputBuf| NamedOutput {
+            name: "o".into(),
+            shape: vec![],
+            data,
+        };
+        assert!(!outputs_degenerate(&[]));
+        assert!(!outputs_degenerate(&[out(OutputBuf::F32(vec![]))]));
+        assert!(outputs_degenerate(&[out(OutputBuf::F32(vec![0.0; 8]))]));
+        assert!(!outputs_degenerate(&[out(OutputBuf::F32(vec![
+            0.0, 0.0, 0.5
+        ]))]));
+        // One overflowed logit among normal values is a working model; only zeros and
+        // non-finite values everywhere are not.
+        assert!(!outputs_degenerate(&[out(OutputBuf::F32(vec![
+            1.0,
+            f32::NAN
+        ]))]));
+        assert!(outputs_degenerate(&[out(OutputBuf::F32(vec![
+            f32::INFINITY
+        ]))]));
+        assert!(outputs_degenerate(&[out(OutputBuf::F32(vec![
+            0.0,
+            f32::NAN,
+            0.0
+        ]))]));
+        // Zero labels with non-zero scores are a legitimate RT-DETR result.
+        assert!(!outputs_degenerate(&[
+            out(OutputBuf::I64(vec![0, 0, 0])),
+            out(OutputBuf::F32(vec![0.9, 0.2, 0.1]))
+        ]));
+        assert!(outputs_degenerate(&[
+            out(OutputBuf::I64(vec![0, 0])),
+            out(OutputBuf::I32(vec![0])),
+            out(OutputBuf::F32(vec![0.0]))
+        ]));
+    }
 
     #[test]
     fn load_failure_says_what_to_do() {

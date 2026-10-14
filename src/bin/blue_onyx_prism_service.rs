@@ -148,13 +148,17 @@ mod service {
         }
     }
 
-    fn event_log_layer() -> Option<ExtraLogLayer> {
+    /// The event log layer, or the reason it could not be opened (logged once the file log is
+    /// up: a service's stderr is discarded, and without this nobody learns why the event log
+    /// stays empty).
+    fn event_log_layer() -> Result<ExtraLogLayer, String> {
         match tracing_layer_win_eventlog::EventLogLayer::new(EVENT_SOURCE) {
-            Ok(layer) => Some(Box::new(layer.with_filter(LevelFilter::INFO))),
-            Err(e) => {
-                eprintln!("could not open event log source {EVENT_SOURCE}: {e}");
-                None
-            }
+            Ok(layer) => Ok(Box::new(layer.with_filter(LevelFilter::INFO))),
+            Err(e) => Err(format!(
+                "could not open the event log source {EVENT_SOURCE}: {e}; the Application event \
+                 log gets nothing from this service (run scripts/install_service.ps1 to create \
+                 the source); the file log is unaffected"
+            )),
         }
     }
 
@@ -166,7 +170,18 @@ mod service {
         log_path: Option<PathBuf>,
         format: LogFormat,
     ) -> Result<LogReloadHandle> {
-        cli::init_logging_opts(level, log_path.as_deref(), format, event_log_layer())
+        let (layer, problem) = match event_log_layer() {
+            Ok(l) => (Some(l), None),
+            Err(why) => {
+                eprintln!("{why}");
+                (None, Some(why))
+            }
+        };
+        let log = cli::init_logging_opts(level, log_path.as_deref(), format, layer)?;
+        if let Some(why) = problem {
+            warn!("{why}");
+        }
+        Ok(log)
     }
 
     fn service_main(_arguments: Vec<OsString>) {

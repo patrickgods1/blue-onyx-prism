@@ -76,6 +76,7 @@ pub mod server;
 pub mod setup_onnxruntime;
 pub mod setup_openvino;
 pub mod startup;
+pub mod supervisor;
 pub mod sync;
 pub mod system_info;
 pub mod update;

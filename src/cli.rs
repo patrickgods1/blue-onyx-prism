@@ -300,6 +300,11 @@ fn without_one_off_flags(config: &Config, file: &Config) -> Config {
 /// Log the settings of the starting config that widen what the service exposes or does (call
 /// once logging is up, at every start). `allow_remote_admin` is logged at warn.
 pub fn log_startup_warnings(config: &Config) {
+    for (what, t) in blocking_thresholds(config) {
+        tracing::warn!(
+            "{what} is {t}: no detection can reach it, so every request answers 0 objects; set a              threshold below 1 (0.4 to 0.6 is usual)"
+        );
+    }
     if config.allow_remote_admin {
         tracing::warn!(
             "allow_remote_admin is on: the admin pages and actions (config editor, file browser, \
@@ -308,6 +313,35 @@ pub fn log_startup_warnings(config: &Config) {
             config.port
         );
     }
+}
+
+/// The confidence thresholds (global and per enabled model) at or above 1.0, which no
+/// detection can pass: `("confidence_threshold", 1.0)` or `("model 'x' confidence_threshold",
+/// 1.0)`. Valid for the config, silent "0 objects" for every request.
+pub fn blocking_thresholds(config: &Config) -> Vec<(String, f32)> {
+    let mut out = Vec::new();
+    if config.confidence_threshold >= 1.0
+        && config
+            .models
+            .iter()
+            .any(|m| m.enabled && m.confidence_threshold.is_none())
+    {
+        out.push((
+            "confidence_threshold".to_string(),
+            config.confidence_threshold,
+        ));
+    }
+    for m in config.models.iter().filter(|m| m.enabled) {
+        if let Some(t) = m.confidence_threshold
+            && t >= 1.0
+        {
+            out.push((
+                format!("model '{}' confidence_threshold", m.effective_name()),
+                t,
+            ));
+        }
+    }
+    out
 }
 
 /// Whether two model paths name the same file: equal as given, or equal once both are
@@ -526,8 +560,12 @@ fn merge_cli(config: &mut Config, cli: &Cli) {
     }
 }
 
-/// Load `blue_onyx_prism_config_service.json`, creating a default one (log level debug)
-/// when missing. A config without models gets the default catalog model
+/// Log directory of a freshly created service config (relative to the exe dir).
+pub const SERVICE_LOG_DIR: &str = "logs";
+
+/// Load `blue_onyx_prism_config_service.json`, creating a default one (log level debug, file
+/// log in `logs/` next to the exe: a service's stdout is discarded, and the event log only gets
+/// INFO and above) when missing. A config without models gets the default catalog model
 /// ([`seed_default_model`], CO-05): the service then binds its port and serves the web UI on
 /// the first start instead of failing in a retry loop.
 pub fn for_service() -> Result<(Config, PathBuf)> {
@@ -542,6 +580,7 @@ pub fn for_service_at(path: &Path) -> Result<Config> {
     } else {
         let config = Config {
             log_level: LogLevel::Debug,
+            log_path: Some(PathBuf::from(SERVICE_LOG_DIR)),
             ..Default::default()
         };
         config.save(path).with_context(|| {
@@ -1290,6 +1329,7 @@ mod tests {
         let path = temp_cfg();
         let c = for_service_at(&path).unwrap();
         assert_eq!(c.log_level, LogLevel::Debug);
+        assert_eq!(c.log_path.as_deref(), Some(Path::new(SERVICE_LOG_DIR)));
         assert_eq!(c.models.len(), 1);
         assert!(crate::config::validate_config(&c).is_ok());
         assert_eq!(Config::load(&path).unwrap().models.len(), 1);
@@ -1302,6 +1342,39 @@ mod tests {
         .unwrap();
         let c = for_service_at(&path).unwrap();
         assert_eq!((c.port, c.models.len()), (4000, 1));
+    }
+
+    #[test]
+    fn thresholds_that_block_every_detection_are_reported() {
+        let mut c = Config::default();
+        c.models.push(crate::config::ModelConfig {
+            name: Some("a".into()),
+            ..Default::default()
+        });
+        c.models.push(crate::config::ModelConfig {
+            name: Some("b".into()),
+            confidence_threshold: Some(0.5),
+            ..Default::default()
+        });
+        assert!(blocking_thresholds(&c).is_empty());
+        c.confidence_threshold = 1.0;
+        assert_eq!(
+            blocking_thresholds(&c),
+            [("confidence_threshold".to_string(), 1.0)]
+        );
+        // Model b overrides the global one; a 1.0 override is reported for b alone.
+        c.confidence_threshold = 0.5;
+        c.models[1].confidence_threshold = Some(1.0);
+        assert_eq!(
+            blocking_thresholds(&c),
+            [("model 'b' confidence_threshold".to_string(), 1.0)]
+        );
+        // A disabled model does not count; a global 1.0 with every model overriding neither.
+        c.models[1].enabled = false;
+        assert!(blocking_thresholds(&c).is_empty());
+        c.confidence_threshold = 1.0;
+        c.models[0].confidence_threshold = Some(0.4);
+        assert!(blocking_thresholds(&c).is_empty());
     }
 
     #[test]
