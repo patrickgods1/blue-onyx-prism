@@ -108,6 +108,13 @@ bop_install_plist() {
 # (Re)load the daemon from $PLIST_DST.
 bop_bootstrap() {
   launchctl bootout system "$PLIST_DST" 2>/dev/null || true
+  # An upgrade boots out the running daemon: wait until it has exited (ExitTimeOut 30 s), or the
+  # bootstrap below fails with "Input/output error".
+  local i
+  for i in $(seq 1 40); do
+    launchctl print system/com.blueonyx.prism >/dev/null 2>&1 || break
+    sleep 1
+  done
   launchctl enable system/com.blueonyx.prism 2>/dev/null || true
   if ! launchctl bootstrap system "$PLIST_DST"; then
     echo "launchctl bootstrap failed for $PLIST_DST; see 'launchctl print system/com.blueonyx.prism' and /var/log/system.log." >&2

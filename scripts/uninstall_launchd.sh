@@ -27,7 +27,17 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if launchctl print system/com.blueonyx.prism >/dev/null 2>&1; then
-  launchctl bootout system/com.blueonyx.prism
+  launchctl bootout system/com.blueonyx.prism || true
+  # bootout returns before the daemon has exited (the plist allows ExitTimeOut 30 s); launchd
+  # keeps the job listed until then.
+  for _ in $(seq 1 40); do
+    launchctl print system/com.blueonyx.prism >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if launchctl print system/com.blueonyx.prism >/dev/null 2>&1; then
+    echo "com.blueonyx.prism is still loaded 40 s after bootout; check 'launchctl print system/com.blueonyx.prism'." >&2
+    exit 1
+  fi
 fi
 rm -f "$PLIST_DST" "$NEWSYSLOG_CONF"
 echo "Removed the com.blueonyx.prism daemon."
