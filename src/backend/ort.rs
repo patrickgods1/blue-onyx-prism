@@ -254,7 +254,8 @@ pub(crate) fn cuda_download_hint(os: &str, arch: &str) -> Option<String> {
     let r = crate::resources::catalog::cuda_libs_for(os, arch)?;
     Some(format!(
         "CUDA libraries missing \u{2014} enable allow_large_downloads or run `blue-onyx-prism \
-         fetch --resource {}` ({}), or install CUDA 12.8+ and cuDNN 9 (9.10 or older for GTX          10-series cards)",
+         fetch --resource {}` ({}), or install CUDA 12.8+ and cuDNN 9 (9.10 or older for GTX \
+         10-series cards)",
         r.id,
         crate::resources::catalog::format_size(r.size())
     ))
