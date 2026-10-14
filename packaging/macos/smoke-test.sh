@@ -10,8 +10,8 @@ fail() { echo "SMOKE TEST FAILED: $*" >&2; exit 1; }
 sudo installer -pkg "$PKG" -target / -verbose
 
 sudo launchctl print system/com.blueonyx.prism >/dev/null || fail "daemon not loaded"
-[ -f "$CONFIG" ] || fail "config $CONFIG missing"
-owner="$(stat -f %Su "$CONFIG")"
+sudo test -f "$CONFIG" || fail "config $CONFIG missing"
+owner="$(sudo stat -f %Su "$CONFIG")"
 [ "$owner" = "_blueonyx" ] || fail "config owned by $owner, expected _blueonyx"
 
 code=000

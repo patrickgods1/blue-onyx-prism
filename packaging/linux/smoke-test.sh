@@ -44,8 +44,8 @@ for _ in $(seq 1 120); do
 done
 case "$code" in 200 | 503) echo "status endpoint answered $code" ;; *) fail "/v1/status answered '$code'" ;; esac
 
-[ -f "$CONFIG" ] || fail "config $CONFIG missing"
-[ "$(stat -c %U:%G "$CONFIG")" = blueonyx:blueonyx ] || fail "config not owned by blueonyx"
+sudo test -f "$CONFIG" || fail "config $CONFIG missing"
+[ "$(sudo stat -c %U:%G "$CONFIG")" = blueonyx:blueonyx ] || fail "config not owned by blueonyx"
 sudo grep -q '"download_dir"' "$CONFIG" || fail "config lacks download_dir"
 if sudo grep -q 'openvino_dir\|onnxruntime_dir' "$CONFIG"; then fail "config names bundled runtimes"; fi
 
