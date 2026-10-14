@@ -13,8 +13,11 @@
 //! What a class changes is deliberately small: decode + preprocess threads are
 //! `clamp(cores / 2, 1, 8)` for every class (2 at most when every model runs on the CPU), and
 //! concurrent inference depends on the *device* a model runs on ([`Profile::tuning_for`]),
-//! not on the machine class. The class picks the recommended model sizes and, on High machines
-//! with an NVIDIA GPU, a second ONNX Runtime session per model.
+//! not on the machine class. The class picks the recommended model sizes. A discrete GPU of at
+//! least [`ORT_TWO_SESSIONS_VRAM_MB`] with at least [`ORT_TWO_SESSIONS_MEMORY_GB`] of memory (or
+//! unknown memory) gets a second ONNX Runtime session per model whatever the class: one session
+//! leaves the GPU idle while the host decodes, preprocesses and copies (a 6-core box with a
+//! GTX 1070 Ti is Low yet stays at ~60% GPU with DirectML).
 
 use crate::backend::detect::{GpuVendor, HardwareInfo};
 use serde::{Deserialize, Serialize};
@@ -24,7 +27,7 @@ use std::sync::OnceLock;
 pub const MAX_INFLIGHT: usize = 8;
 /// Upper bound of the decode + preprocess pool.
 pub const MAX_PREPROCESS_THREADS: usize = 8;
-/// Pool size when every model runs on the CPU (CPU inference already uses every core).
+/// Pool size when every model runs on the CPU (CPU inference already uses all cores but one).
 pub const CPU_ONLY_PREPROCESS_THREADS: usize = 2;
 /// Logical cores from which CPU inference is compiled for throughput (several streams).
 pub const CPU_THROUGHPUT_CORES: usize = 12;
@@ -32,6 +35,11 @@ pub const CPU_THROUGHPUT_CORES: usize = 12;
 pub const IGPU_INFLIGHT: usize = 2;
 /// In flight on a discrete OpenVINO GPU (Intel Arc), clamped to its `NUM_STREAMS`.
 pub const DGPU_INFLIGHT: usize = 4;
+
+/// VRAM from which a discrete GPU gets two ONNX Runtime sessions per model (each holds a copy).
+pub const ORT_TWO_SESSIONS_VRAM_MB: u64 = 4096;
+/// Physical memory needed for two ONNX Runtime sessions per model (unknown counts as enough).
+pub const ORT_TWO_SESSIONS_MEMORY_GB: f64 = 8.0;
 
 /// What kind of GPU the machine has (the most capable one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -399,13 +407,13 @@ pub fn classify_as(facts: &Facts, forced: Option<HardwareClass>) -> Profile {
         HardwareClass::Mid => MID_SIZES,
         HardwareClass::High => HIGH_SIZES,
     };
-    let nvidia = matches!(facts.gpu, GpuClass::Discrete { .. })
-        && facts.gpu_vendor == Some(GpuVendor::Nvidia);
-    let ort_sessions = if class == HardwareClass::High && nvidia {
-        2
-    } else {
-        1
-    };
+    // Deliberately not gated on the class (see the module doc).
+    let big_dgpu =
+        matches!(facts.gpu, GpuClass::Discrete { vram_mb } if vram_mb >= ORT_TWO_SESSIONS_VRAM_MB);
+    let enough_memory = facts
+        .memory_gb
+        .is_none_or(|g| g >= ORT_TWO_SESSIONS_MEMORY_GB);
+    let ort_sessions = if big_dgpu && enough_memory { 2 } else { 1 };
     let mut p = Profile {
         class,
         forced: forced.is_some(),
@@ -674,7 +682,8 @@ mod tests {
             )],
         ));
         assert_eq!(p.class, HardwareClass::High);
-        assert_eq!(p.ort_sessions, 1);
+        // ort:directml on the Arc: two sessions (16 GB VRAM).
+        assert_eq!(p.ort_sessions, 2);
         let t = p.tuning_for(DeviceClass::DiscreteGpu);
         assert_eq!(
             (t.hint, t.inflight, t.clamp_to_streams),
@@ -730,8 +739,93 @@ mod tests {
             )],
         ));
         assert_eq!(p.class, HardwareClass::Mid);
-        assert_eq!(p.ort_sessions, 1);
+        assert_eq!(p.ort_sessions, 1, "2 GB of VRAM: one copy of the model");
         assert_eq!(p.model_sizes, &[ModelSize::S, ModelSize::M]);
+    }
+
+    #[test]
+    fn low_class_box_with_1070ti_gets_two_sessions() {
+        let p = classify(&facts(
+            6,
+            16.0,
+            "x86_64",
+            vec![gpu(
+                GpuVendor::Nvidia,
+                "NVIDIA GeForce GTX 1070 Ti",
+                8192,
+                true,
+            )],
+        ));
+        assert_eq!(p.class, HardwareClass::Low);
+        assert_eq!(p.ort_sessions, 2);
+        let t = p.tuning_for(DeviceClass::Ort { gpu: true });
+        assert_eq!((t.inflight, t.ort_sessions), (2, 2));
+        assert_eq!(
+            p.tuning_for(DeviceClass::Ort { gpu: false }).ort_sessions,
+            1
+        );
+        assert!(p.summary(3).contains("2 in flight"), "{}", p.summary(3));
+    }
+
+    #[test]
+    fn small_vram_dgpu_keeps_one_session() {
+        let p = classify(&facts(
+            6,
+            16.0,
+            "x86_64",
+            vec![gpu(GpuVendor::Nvidia, "NVIDIA GeForce GT 1030", 2048, true)],
+        ));
+        assert_eq!(p.ort_sessions, 1);
+        assert_eq!(p.tuning_for(DeviceClass::Ort { gpu: true }).inflight, 1);
+    }
+
+    #[test]
+    fn dgpu_with_little_memory_keeps_one_session() {
+        let p = classify(&facts(
+            8,
+            4.0,
+            "x86_64",
+            vec![gpu(
+                GpuVendor::Nvidia,
+                "NVIDIA GeForce GTX 1650",
+                4096,
+                true,
+            )],
+        ));
+        assert_eq!(p.ort_sessions, 1);
+        // Unknown memory counts as enough.
+        let f = Facts::from_hardware(
+            8,
+            None,
+            &HardwareInfo::new(
+                "windows",
+                "x86_64",
+                vec![gpu(
+                    GpuVendor::Nvidia,
+                    "NVIDIA GeForce GTX 1650",
+                    4096,
+                    true,
+                )],
+            ),
+        );
+        assert_eq!(classify(&f).ort_sessions, 2);
+    }
+
+    #[test]
+    fn igpu_keeps_one_session() {
+        let p = classify(&facts(
+            12,
+            32.0,
+            "x86_64",
+            vec![gpu(
+                GpuVendor::Intel,
+                "Intel(R) UHD Graphics 770",
+                4096,
+                false,
+            )],
+        ));
+        assert_eq!(p.facts.gpu, GpuClass::Integrated);
+        assert_eq!(p.ort_sessions, 1);
     }
 
     #[test]

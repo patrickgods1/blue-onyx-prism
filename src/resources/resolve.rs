@@ -35,7 +35,7 @@ use crate::backend::select::{
 use crate::backend::spec::{Device, DeviceSpec, Runtime, Target};
 use crate::config::{Config, ModelConfig};
 use serde::{Serialize, Serializer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Command that downloads everything the config needs (for `auto_download: false`).
@@ -47,6 +47,10 @@ pub struct Installed {
     /// Ids of installed runtime/library resources (`openvino-runtime`, `onnxruntime-cuda`,
     /// `nvidia-cuda-libs`), whether downloaded by us or user-managed (`openvino_dir`).
     pub resources: BTreeSet<String>,
+    /// Installed version per resource id, when known (`.installed.json`, else the `VERSION`
+    /// file). A version other than the catalog's means an update is available
+    /// ([`Installed::outdated`]).
+    pub versions: BTreeMap<String, String>,
     /// ONNX Runtime flavor this process loads (or would load at startup); None = no ORT library.
     pub active_ort: Option<Flavor>,
     /// `onnxruntime_dir` / `ORT_DYLIB_PATH` is set: the active flavor is user-managed and never
@@ -74,6 +78,7 @@ impl Default for Installed {
     fn default() -> Self {
         Self {
             resources: BTreeSet::new(),
+            versions: BTreeMap::new(),
             active_ort: None,
             ort_pinned: false,
             files: BTreeSet::new(),
@@ -105,6 +110,30 @@ impl Installed {
         self.files
             .extend(files.iter().map(|p| p.as_ref().to_path_buf()));
         self
+    }
+
+    /// Record the installed version of resource `id` (builder).
+    pub fn with_version(mut self, id: &str, version: &str) -> Self {
+        self.versions.insert(id.to_string(), version.to_string());
+        self
+    }
+
+    /// The installed version of resource `id`, when known.
+    pub fn installed_version(&self, id: &str) -> Option<&str> {
+        self.versions.get(id).map(String::as_str)
+    }
+
+    /// `r` is installed in a version other than the catalog's (an update is available). An
+    /// install of unknown version never counts as outdated.
+    pub fn outdated(&self, r: &Resource) -> bool {
+        self.installed_version(r.id).is_some_and(|v| v != r.version)
+    }
+
+    /// The ONNX Runtime flavor this process has loaded (live probe), if any.
+    pub fn loaded_flavor(&self) -> Option<Flavor> {
+        self.live_ort()
+            .and_then(|o| o.flavor.as_deref())
+            .and_then(Flavor::parse)
     }
 
     /// OpenVINO can be used without downloading anything.
@@ -557,9 +586,17 @@ impl Resolver<'_> {
         model_dir: Option<PathBuf>,
     ) -> Need {
         let active = self.installed.active_flavor();
-        let after_restart = resource
-            .flavor()
-            .is_some_and(|f| active.is_some_and(|a| a != f));
+        let outdated = self.installed.outdated(resource);
+        // A flavor other than the active one is used after a restart; so is an update of the
+        // flavor this process has loaded (its new files land beside the mapped old ones).
+        let after_restart = resource.flavor().is_some_and(|f| {
+            active.is_some_and(|a| a != f)
+                || (outdated && self.installed.loaded_flavor() == Some(f))
+        });
+        let reason = match self.installed.installed_version(resource.id) {
+            Some(old) if outdated => format!("{reason} (update from {old})"),
+            _ => reason,
+        };
         Need {
             resource,
             reason,
@@ -675,12 +712,25 @@ impl Resolver<'_> {
                 }
             }
         }
+        // The CUDA build `select` judges NVIDIA GPUs by: the loaded CUDA flavor's when it is
+        // current (an outdated one gets updated by this plan, so the catalog's build applies,
+        // as it does when the flavor is not loaded).
+        let loaded_current_cuda = self.installed.loaded_flavor() == Some(Flavor::Cuda)
+            && !catalog::onnxruntime(self.os(), self.arch(), Flavor::Cuda)
+                .is_some_and(|r| self.installed.outdated(r));
+        let version = if loaded_current_cuda {
+            self.installed.live_ort().and_then(|o| o.version.clone())
+        } else {
+            None
+        };
         OrtProbe {
             error: None,
             flavor: match flavors.as_slice() {
                 [only] => Some(only.as_str().to_string()),
+                _ if version.is_some() => Some(Flavor::Cuda.as_str().to_string()),
                 _ => None,
             },
+            version,
             providers,
         }
     }
@@ -802,9 +852,14 @@ impl Resolver<'_> {
             ));
         }
         let mut missing = Vec::new();
-        if !self.installed.flavor_present(flavor) {
+        let package = catalog::onnxruntime(os, arch, flavor);
+        // Missing, or installed in another version than the catalog's (an update; the files
+        // are replaced in place and used after a restart when the flavor is loaded).
+        if !self.installed.flavor_present(flavor)
+            || package.is_some_and(|r| self.installed.outdated(r))
+        {
             missing.push(
-                catalog::onnxruntime(os, arch, flavor)
+                package
                     .ok_or_else(|| format!("no ONNX Runtime {flavor} package for {os}/{arch}"))?,
             );
         }
@@ -1011,6 +1066,14 @@ fn installed_in(dir: &Path, id: &str) -> bool {
     }
 }
 
+/// The `VERSION` marker of an install directory, when present and non-empty.
+fn version_file(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join("VERSION"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn dir_non_empty(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut rd| rd.next().is_some())
 }
@@ -1061,18 +1124,29 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
     }
     for f in Flavor::ALL {
         let dir = root.join(f.dest());
-        let by_manifest = super::manager::read_manifest(&dir.join(super::manager::MANIFEST_FILE))
-            .is_some_and(|m| m.id == f.resource_id());
-        if by_manifest || crate::backend::libs::read_ort_flavor(&dir).as_deref() == Some(f.as_str())
-        {
+        let manifest = super::manager::read_manifest(&dir.join(super::manager::MANIFEST_FILE))
+            .filter(|m| m.id == f.resource_id());
+        let by_marker = crate::backend::libs::read_ort_flavor(&dir).as_deref() == Some(f.as_str());
+        if manifest.is_some() || by_marker {
             out.resources.insert(f.resource_id().to_string());
+            let version = manifest.map(|m| m.version).or_else(|| version_file(&dir));
+            if let Some(v) = version {
+                out.versions.insert(f.resource_id().to_string(), v);
+            }
         }
     }
     let cuda_dir = root.join(catalog::CUDA_LIBS_DEST);
     let cuda_manifest =
-        super::manager::read_manifest(&cuda_dir.join(super::manager::MANIFEST_FILE));
-    if cuda_manifest.map_or(dir_non_empty(&cuda_dir), |m| m.id == catalog::CUDA_LIBS_ID) {
+        super::manager::read_manifest(&cuda_dir.join(super::manager::MANIFEST_FILE))
+            .filter(|m| m.id == catalog::CUDA_LIBS_ID);
+    if cuda_manifest.is_some() || dir_non_empty(&cuda_dir) {
         out.resources.insert(catalog::CUDA_LIBS_ID.to_string());
+        let version = cuda_manifest
+            .map(|m| m.version)
+            .or_else(|| version_file(&cuda_dir));
+        if let Some(v) = version {
+            out.versions.insert(catalog::CUDA_LIBS_ID.to_string(), v);
+        }
     }
 
     // Model files, spelled as in the config. An exported model's file from another version (the

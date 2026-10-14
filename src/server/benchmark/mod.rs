@@ -90,6 +90,8 @@ struct BenchmarkTemplate {
     reference_models: Vec<(String, bool)>,
     repeat: usize,
     warmup: usize,
+    /// `benchmark.low_priority`: the "Run at low priority" checkbox.
+    low_priority: bool,
     max_images: usize,
     accuracy_weight: String,
     warning: &'static str,
@@ -339,6 +341,7 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
                 .collect(),
             repeat: b.repeat_per_image.max(1),
             warmup: b.warmup,
+            low_priority: b.low_priority,
             max_images: b.max_images_per_dataset,
             accuracy_weight: format!("{:.2}", b.weights.accuracy_share()),
             warning: LIVE_WARNING,

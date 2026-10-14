@@ -14,6 +14,8 @@
   }
   function formBody(extra) {
     var b = new URLSearchParams();
+    // Hidden "0" before its checkbox: an unchecked box still sends its value (the last one wins).
+    form.querySelectorAll("input[type=hidden][name]").forEach(function (h) { b.append(h.name, h.value); });
     form.querySelectorAll("input[type=checkbox]:checked").forEach(function (c) { b.append(c.name, c.value); });
     ["max_images", "repeat", "warmup", "accuracy_weight", "threshold_objective", "accuracy_metric"].forEach(function (n) { b.append(n, form.elements[n].value); });
     b.append("reference_model", form.elements.reference_model.value);

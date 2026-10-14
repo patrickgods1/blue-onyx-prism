@@ -268,6 +268,12 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         return Ok(ok);
     }
     check_args(&args, &config_path)?;
+    // Before the runtimes exist, so their thread pools inherit the nice value on Unix; held to
+    // the end of the run.
+    let _prio = crate::backend::priority::lower_for_benchmark(
+        !args.no_low_priority && config.benchmark.low_priority,
+        false,
+    );
     let objective = args
         .threshold_objective
         .unwrap_or(config.benchmark.threshold_objective);
@@ -1029,7 +1035,8 @@ mod tests {
         assert!(a.compare_cpu && a.json);
         let a = parse(&["x"]).unwrap();
         assert_eq!(a.repeat, None);
-        assert!(!a.all_devices && !a.apply && !a.no_save);
+        assert!(!a.all_devices && !a.apply && !a.no_save && !a.no_low_priority);
+        assert!(parse(&["x", "--no-low-priority"]).unwrap().no_low_priority);
         let a = parse(&[
             "x",
             "--dataset",

@@ -117,6 +117,38 @@ pub struct CudaInfo {
     pub compute_capability: ComputeCapability,
 }
 
+/// A CUDA version, e.g. 12.8: the newest CUDA the installed NVIDIA driver supports
+/// (`cuDriverGetVersion`), which bounds the CUDA runtime libraries that can be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CudaVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl CudaVersion {
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+
+    /// From the driver API's encoding (`12080` = 12.8, `13000` = 13.0).
+    pub fn from_driver(v: i32) -> Self {
+        let v = u32::try_from(v).unwrap_or_default();
+        Self::new(v / 1000, (v % 1000) / 10)
+    }
+}
+
+impl fmt::Display for CudaVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+impl Serialize for CudaVersion {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
 /// Detected hardware.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct HardwareInfo {
@@ -126,6 +158,9 @@ pub struct HardwareInfo {
     pub os: String,
     /// `std::env::consts::ARCH`: "x86_64", "aarch64", ...
     pub arch: String,
+    /// Newest CUDA version the NVIDIA driver supports; None without an NVIDIA GPU / driver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_driver: Option<CudaVersion>,
 }
 
 impl HardwareInfo {
@@ -134,7 +169,14 @@ impl HardwareInfo {
             gpus,
             os: os.to_string(),
             arch: arch.to_string(),
+            cuda_driver: None,
         }
+    }
+
+    /// The same hardware with the driver's CUDA version (builder for tests).
+    pub fn with_cuda_driver(mut self, major: u32, minor: u32) -> Self {
+        self.cuda_driver = Some(CudaVersion::new(major, minor));
+        self
     }
 
     /// This platform with no GPUs (what the selection assumes when only OpenVINO's device list
@@ -198,11 +240,14 @@ pub fn hardware() -> &'static HardwareInfo {
 pub fn detect() -> HardwareInfo {
     let t = std::time::Instant::now();
     let (mut gpus, keys) = detect_gpus();
+    let mut driver = None;
     if gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) {
-        let cuda = cuda_driver::devices();
+        let (cuda, version) = cuda_driver::probe();
         attach_cuda(&mut gpus, &keys, &cuda);
+        driver = version;
     }
-    let hw = HardwareInfo::new(std::env::consts::OS, std::env::consts::ARCH, gpus);
+    let mut hw = HardwareInfo::new(std::env::consts::OS, std::env::consts::ARCH, gpus);
+    hw.cuda_driver = driver;
     tracing::debug!(
         gpus = ?hw.gpus,
         ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -673,18 +718,19 @@ mod cuda_driver {
     type CuDeviceGet = unsafe extern "system" fn(*mut CuDevice, c_int) -> CuResult;
     type CuDeviceGetAttribute = unsafe extern "system" fn(*mut c_int, c_int, CuDevice) -> CuResult;
     type CuDeviceGetString = unsafe extern "system" fn(*mut c_char, c_int, CuDevice) -> CuResult;
+    type CuDriverGetVersion = unsafe extern "system" fn(*mut c_int) -> CuResult;
     #[cfg(windows)]
     type CuDeviceGetLuid =
         unsafe extern "system" fn(*mut c_char, *mut c_uint, CuDevice) -> CuResult;
 
-    /// Every device the driver lists; empty (logged at debug level) when there is no driver or
-    /// any call fails.
-    pub fn devices() -> Vec<CudaDevice> {
+    /// Every device the driver lists plus the CUDA version the driver supports; empty / None
+    /// (logged at debug level) when there is no driver or any call fails.
+    pub fn probe() -> (Vec<CudaDevice>, Option<CudaVersion>) {
         match query() {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!("CUDA driver query failed, compute capability unknown: {e}");
-                Vec::new()
+                (Vec::new(), None)
             }
         }
     }
@@ -707,7 +753,7 @@ mod cuda_driver {
             .unwrap_or_default()
     }
 
-    fn query() -> Result<Vec<CudaDevice>, String> {
+    fn query() -> Result<(Vec<CudaDevice>, Option<CudaVersion>), String> {
         // SAFETY: loads the NVIDIA driver library (an OS-provided one: `System32` / the
         // driver's ld.so.conf dir, never the working directory), the same one ONNX Runtime's
         // CUDA provider loads; its initializers have no preconditions.
@@ -742,10 +788,19 @@ mod cuda_driver {
         let luid_fn = sym(b"cuDeviceGetLuid\0")
             .ok()
             .map(|p| unsafe { std::mem::transmute::<*const (), CuDeviceGetLuid>(p) });
+        // SAFETY: as above.
+        let version_fn = sym(b"cuDriverGetVersion\0")
+            .ok()
+            .map(|p| unsafe { std::mem::transmute::<*const (), CuDriverGetVersion>(p) });
 
         // SAFETY: every driver call below is a plain query with its cuda.h signature, writing
         // into local out-parameters of the documented sizes.
         check("cuInit", unsafe { init(0) })?;
+        let version = version_fn.and_then(|f| {
+            let mut v: c_int = 0;
+            // SAFETY: see above.
+            (unsafe { f(&mut v) } == CUDA_SUCCESS && v > 0).then(|| CudaVersion::from_driver(v))
+        });
         let mut n: c_int = 0;
         // SAFETY: see above.
         check("cuDeviceGetCount", unsafe { count(&mut n) })?;
@@ -807,16 +862,16 @@ mod cuda_driver {
                 pci,
             });
         }
-        tracing::debug!(devices = ?out, "CUDA driver devices");
-        Ok(out)
+        tracing::debug!(devices = ?out, ?version, "CUDA driver devices");
+        Ok((out, version))
     }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod cuda_driver {
     /// No CUDA on this platform.
-    pub fn devices() -> Vec<super::CudaDevice> {
-        Vec::new()
+    pub fn probe() -> (Vec<super::CudaDevice>, Option<super::CudaVersion>) {
+        (Vec::new(), None)
     }
 }
 
@@ -824,6 +879,21 @@ mod cuda_driver {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn cuda_version_from_the_driver_encoding() {
+        assert_eq!(CudaVersion::from_driver(12080).to_string(), "12.8");
+        assert_eq!(CudaVersion::from_driver(13000).to_string(), "13.0");
+        assert_eq!(CudaVersion::from_driver(11040), CudaVersion::new(11, 4));
+        assert!(CudaVersion::new(11, 8) < CudaVersion::new(12, 0));
+        assert_eq!(
+            serde_json::to_string(
+                &HardwareInfo::new("linux", "x86_64", vec![]).with_cuda_driver(12, 8)
+            )
+            .unwrap(),
+            r#"{"gpus":[],"os":"linux","arch":"x86_64","cuda_driver":"12.8"}"#
+        );
+    }
 
     #[test]
     fn vendor_mapping() {

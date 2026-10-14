@@ -25,7 +25,7 @@
 //! `.onnx` file: a model given as `.xml` uses a sibling `<stem>.onnx`, otherwise its ORT options
 //! are "needs ONNX export" and `auto` skips them.
 
-use super::detect::{GpuAdapter, GpuVendor, HardwareInfo};
+use super::detect::{CudaVersion, GpuAdapter, GpuVendor, HardwareInfo};
 use super::spec::{Device, Runtime, Target};
 use crate::resources::catalog;
 use serde::{Serialize, Serializer};
@@ -177,6 +177,10 @@ pub struct OrtProbe {
     pub error: Option<String>,
     /// Installed package flavor ("cpu", "gpu", "directml", "coreml"), when known.
     pub flavor: Option<String>,
+    /// Version of the library the statuses come from ("1.31.0"), when known. A hypothetical
+    /// probe (resolver) carries the version of the CUDA flavor it assumes, so the compute
+    /// capability gate judges the build that would actually load.
+    pub version: Option<String>,
     /// EPs the library reports. An EP missing from the list is not in the installed flavor.
     pub providers: Vec<EpStatus>,
 }
@@ -197,6 +201,7 @@ impl OrtProbe {
         Self {
             error: Some(reason.into()),
             flavor: None,
+            version: None,
             providers: Vec::new(),
         }
     }
@@ -205,8 +210,15 @@ impl OrtProbe {
         Self {
             error: None,
             flavor: Some(flavor.to_string()),
+            version: None,
             providers,
         }
+    }
+
+    /// The same probe with the library version set.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
     }
 
     pub fn is_available(&self) -> bool {
@@ -516,16 +528,28 @@ pub fn select(hw: &HardwareInfo, probe: &RuntimeProbe, has_onnx: bool) -> Select
 }
 
 impl Builder<'_> {
-    /// NVIDIA: CUDA and TensorRT per GPU, as (CUDA ordinal, GPU) in ordinal order.
+    /// NVIDIA: CUDA and TensorRT per GPU, as (CUDA ordinal, GPU) in ordinal order. The GPU's
+    /// compute capability is judged against the loaded CUDA flavor's build; with another flavor
+    /// loaded (or none) against the catalog's CUDA build, the one a download would install.
     fn push_nvidia(&mut self, hw: &HardwareInfo, nvidia: &[(u32, &GpuAdapter)]) {
+        let build = self
+            .probe
+            .ort
+            .flavor
+            .as_deref()
+            .and_then(catalog::Flavor::parse)
+            .filter(|f| *f == catalog::Flavor::Cuda)
+            .and_then(|_| self.probe.ort.version.clone());
+        let driver = cuda_driver_unsupported(hw, catalog::CudaLane::Cuda12);
         for target in [Target::Cuda, Target::TensorRt] {
             for (ordinal, g) in nvidia {
-                self.push_ort_unless(
-                    target,
-                    Some(*ordinal),
-                    gpu_label(target, g),
-                    ort_cuda_unsupported(hw, g),
-                );
+                let mut reason = driver
+                    .clone()
+                    .or_else(|| ort_cuda_unsupported(hw, g, build.as_deref()));
+                if target == Target::TensorRt {
+                    reason = reason.or_else(|| ort_tensorrt_unsupported(g));
+                }
+                self.push_ort_unless(target, Some(*ordinal), gpu_label(target, g), reason);
             }
         }
     }
@@ -793,12 +817,21 @@ pub(crate) fn cuda_ordinals(hw: &HardwareInfo) -> Vec<(u32, &GpuAdapter)> {
     }
 }
 
-/// Why the pinned ONNX Runtime CUDA build (CUDA and TensorRT providers) cannot run on NVIDIA GPU
-/// `g`: it has no kernels for the GPU's compute capability (see `catalog::ort_cuda_archs`).
-/// None when it can, or when the compute capability is unknown (no CUDA driver).
-pub(crate) fn ort_cuda_unsupported(hw: &HardwareInfo, g: &GpuAdapter) -> Option<String> {
+/// Why the ONNX Runtime CUDA provider cannot run on NVIDIA GPU `g`: the CUDA build (`build`: the
+/// version of the loaded CUDA flavor; None = the catalog's) has no kernels for the GPU's compute
+/// capability (see `catalog::ort_cuda_archs`). None when it can, when the compute capability is
+/// unknown (no CUDA driver), or when the build's GPU code is unknown (a user-managed library of
+/// another version: the provider decides at run time). When an older installed build is refused
+/// but the catalog's build would run the GPU, the reason says to update.
+pub(crate) fn ort_cuda_unsupported(
+    hw: &HardwareInfo,
+    g: &GpuAdapter,
+    build: Option<&str>,
+) -> Option<String> {
     let cc = g.cuda?.compute_capability;
-    let archs = catalog::ort_cuda_archs(&hw.os)?;
+    let pinned = catalog::ONNXRUNTIME_CUDA_VERSION;
+    let version = build.unwrap_or(pinned);
+    let archs = catalog::ort_cuda_archs(&hw.os, catalog::CudaLane::Cuda12, version)?;
     if archs.runs_on(cc) {
         return None;
     }
@@ -806,16 +839,58 @@ pub(crate) fn ort_cuda_unsupported(hw: &HardwareInfo, g: &GpuAdapter) -> Option<
         Some(min) if cc < min => format!("needs {min}+"),
         _ => format!("has kernels for {} only", archs.describe()),
     };
+    let catalog_runs =
+        version != pinned && catalog::ort_cuda_catalog_archs(&hw.os).is_some_and(|a| a.runs_on(cc));
+    if catalog_runs {
+        return Some(format!(
+            "{} is compute capability {cc}; the installed ONNX Runtime {version} CUDA build \
+             {needs}; ONNX Runtime {pinned} has kernels for it: update onnxruntime-cuda \
+             (Resources on the Config page, or `blue-onyx-prism fetch --resource \
+             onnxruntime-cuda`) and restart",
+            g.name
+        ));
+    }
     let instead = if hw.is_windows() {
         "use ort:directml or OpenVINO"
     } else {
         "use OpenVINO or ort:cpu"
     };
     Some(format!(
-        "{} is compute capability {cc}; the ONNX Runtime {} CUDA build {needs}; {instead}",
-        g.name,
-        catalog::ONNXRUNTIME_VERSION
+        "{} is compute capability {cc}; the ONNX Runtime {version} CUDA build {needs}; {instead}",
+        g.name
     ))
+}
+
+/// Why `ort:tensorrt` cannot run on NVIDIA GPU `g`: TensorRT 10 supports Turing (7.5) and newer
+/// only, whatever the ONNX Runtime build has kernels for. None when it can or the compute
+/// capability is unknown.
+pub(crate) fn ort_tensorrt_unsupported(g: &GpuAdapter) -> Option<String> {
+    let cc = g.cuda?.compute_capability;
+    (cc < catalog::TENSORRT_MIN_CC).then(|| {
+        format!(
+            "{} is compute capability {cc}; TensorRT 10 needs {}+ (Turing or newer); use ort:cuda",
+            g.name,
+            catalog::TENSORRT_MIN_CC
+        )
+    })
+}
+
+/// Why the CUDA libraries of `lane` cannot be used with the installed NVIDIA driver: it supports
+/// an older CUDA than they need (they would fail later with `cudaErrorInsufficientDriver`). None
+/// when they can, or when the driver's CUDA version is unknown.
+pub(crate) fn cuda_driver_unsupported(
+    hw: &HardwareInfo,
+    lane: catalog::CudaLane,
+) -> Option<String> {
+    let v = hw.cuda_driver?;
+    let (major, minor) = lane.min_driver_cuda();
+    (v < CudaVersion::new(major, minor)).then(|| {
+        format!(
+            "the NVIDIA driver supports CUDA {v}; the {} libraries need a driver with CUDA \
+             {major}.{minor} support (R525 or newer); update the NVIDIA driver",
+            lane.label()
+        )
+    })
 }
 
 /// Plain-text table of `sel` (for `list-devices`): spec, status, label and reason.
@@ -998,27 +1073,72 @@ mod tests {
         let cuda0 = device(Runtime::Ort, Target::Cuda, Some(0));
         let trt0 = device(Runtime::Ort, Target::TensorRt, Some(0));
 
-        // GTX 1070 Ti (6.1) on Windows: CUDA and TensorRT not runnable, DirectML takes the GPU.
+        // GTX 1070 Ti (6.1) on Windows: the catalog's CUDA build runs it; TensorRT 10 does not.
         let gpu = nvidia("NVIDIA GeForce GTX 1070 Ti", 0, Some((0, 6, 1)));
         let hw = HardwareInfo::new("windows", "x86_64", vec![gpu, uhd630(1)]);
         let sel = select(&hw, &probe, true);
-        for spec in [cuda0, trt0] {
-            let o = sel.option(&spec).unwrap();
-            assert!(!o.runnable, "{spec}");
-            assert_eq!(
-                o.reason.as_deref(),
-                Some(
-                    "NVIDIA GeForce GTX 1070 Ti is compute capability 6.1; the ONNX Runtime \
-                     1.24.4 CUDA build needs 7.5+; use ort:directml or OpenVINO"
-                )
-            );
-        }
+        assert!(sel.option(&cuda0).unwrap().runnable);
+        let trt = sel.option(&trt0).unwrap();
+        assert!(!trt.runnable);
+        assert_eq!(
+            trt.reason.as_deref(),
+            Some(
+                "NVIDIA GeForce GTX 1070 Ti is compute capability 6.1; TensorRT 10 needs 7.5+ \
+                 (Turing or newer); use ort:cuda"
+            )
+        );
+        assert_eq!(
+            auto_text(&sel),
+            "ort:cuda:0 -> ort:directml:0 -> openvino:gpu -> openvino:cpu"
+        );
+
+        // The same card with the old 1.24.4 CUDA flavor loaded: refused, with the update hint.
+        let old = RuntimeProbe {
+            ort: probe.ort.clone().with_version("1.24.4"),
+            ..probe.clone()
+        };
+        let sel = select(&hw, &old, true);
+        let o = sel.option(&cuda0).unwrap();
+        assert!(!o.runnable);
+        assert_eq!(
+            o.reason.as_deref(),
+            Some(
+                "NVIDIA GeForce GTX 1070 Ti is compute capability 6.1; the installed ONNX \
+                 Runtime 1.24.4 CUDA build needs 7.5+; ONNX Runtime 1.31.0 has kernels for it: \
+                 update onnxruntime-cuda (Resources on the Config page, or `blue-onyx-prism \
+                 fetch --resource onnxruntime-cuda`) and restart"
+            )
+        );
         assert_eq!(
             auto_text(&sel),
             "ort:directml:0 -> openvino:gpu -> openvino:cpu"
         );
+        // A CUDA library of a version the catalog does not know: the provider decides.
+        let other = RuntimeProbe {
+            ort: probe.ort.clone().with_version("1.20.0"),
+            ..probe.clone()
+        };
+        assert!(select(&hw, &other, true).option(&cuda0).unwrap().runnable);
+        // Another flavor loaded: its version says nothing about the CUDA build.
+        let dml = RuntimeProbe {
+            ort: OrtProbe::installed(
+                "directml",
+                [
+                    Target::Cuda,
+                    Target::TensorRt,
+                    Target::DirectMl,
+                    Target::Cpu,
+                ]
+                .into_iter()
+                .map(EpStatus::usable)
+                .collect(),
+            )
+            .with_version("1.24.4"),
+            ..probe.clone()
+        };
+        assert!(select(&hw, &dml, true).option(&cuda0).unwrap().runnable);
 
-        // 8.6 and unknown: CUDA first, as before.
+        // 8.6, 7.5, 12.0 and unknown: CUDA first, as before.
         for cuda in [Some((0, 8, 6)), Some((0, 7, 5)), Some((0, 12, 0)), None] {
             let gpu = nvidia("NVIDIA GeForce RTX 3060", 0, cuda);
             let hw = HardwareInfo::new("windows", "x86_64", vec![gpu, uhd630(1)]);
@@ -1032,31 +1152,81 @@ mod tests {
             );
         }
 
-        // 8.0 (A100) on Windows: above the minimum but in a gap of the Windows build.
+        // Gaps of the Windows build: A100 (8.0) and H100 (9.0) have no kernels.
+        for (name, cc) in [("NVIDIA A100", (0, 8, 0)), ("NVIDIA H100", (0, 9, 0))] {
+            let hw = HardwareInfo::new("windows", "x86_64", vec![nvidia(name, 0, Some(cc))]);
+            let reason = ort_cuda_unsupported(&hw, &hw.gpus[0], None).unwrap();
+            assert!(
+                reason.contains(
+                    "the ONNX Runtime 1.31.0 CUDA build has kernels for 6.1, 7.5, 8.6, 8.9, \
+                     12.0 only; use ort:directml or OpenVINO"
+                ),
+                "{reason}"
+            );
+        }
+        // Maxwell (5.2) on Windows: below the minimum of both builds, so no update hint.
         let hw = HardwareInfo::new(
             "windows",
             "x86_64",
-            vec![nvidia("NVIDIA A100", 0, Some((0, 8, 0)))],
+            vec![nvidia("NVIDIA GeForce GTX 980", 0, Some((0, 5, 2)))],
         );
-        let reason = ort_cuda_unsupported(&hw, &hw.gpus[0]).unwrap();
-        assert!(
-            reason.contains("has kernels for 7.5, 8.6, 8.9 (PTX 9.0) only"),
-            "{reason}"
+        assert_eq!(
+            ort_cuda_unsupported(&hw, &hw.gpus[0], None).as_deref(),
+            Some(
+                "NVIDIA GeForce GTX 980 is compute capability 5.2; the ONNX Runtime 1.31.0 CUDA \
+                 build needs 6.1+; use ort:directml or OpenVINO"
+            )
+        );
+        assert_eq!(
+            ort_cuda_unsupported(&hw, &hw.gpus[0], Some("1.24.4")).as_deref(),
+            Some(
+                "NVIDIA GeForce GTX 980 is compute capability 5.2; the ONNX Runtime 1.24.4 CUDA \
+                 build needs 7.5+; use ort:directml or OpenVINO"
+            )
         );
 
-        // Linux: the CUDA build has sm_60 code, so Pascal runs; Maxwell (5.2) does not.
+        // Linux: the CUDA build has sm_60 code, so Pascal runs; Maxwell (5.2) does not and
+        // B200 (10.0) is a gap.
         let linux = |cc: (u32, u32, u32)| {
             HardwareInfo::new("linux", "x86_64", vec![nvidia("NVIDIA GPU", 0, Some(cc))])
         };
         let hw = linux((0, 6, 1));
-        assert_eq!(ort_cuda_unsupported(&hw, &hw.gpus[0]), None);
+        assert_eq!(ort_cuda_unsupported(&hw, &hw.gpus[0], None), None);
         let hw = linux((0, 5, 2));
-        let reason = ort_cuda_unsupported(&hw, &hw.gpus[0]).unwrap();
+        let reason = ort_cuda_unsupported(&hw, &hw.gpus[0], None).unwrap();
         assert!(
             reason.contains("needs 6.0+; use OpenVINO or ort:cpu"),
             "{reason}"
         );
         assert!(!select(&hw, &probe, true).option(&cuda0).unwrap().runnable);
+        let hw = linux((0, 10, 0));
+        let reason = ort_cuda_unsupported(&hw, &hw.gpus[0], None).unwrap();
+        assert!(
+            reason.contains("has kernels for 6.0, 7.0, 7.5, 8.0, 8.6, 8.9, 9.0, 12.0 only"),
+            "{reason}"
+        );
+
+        // A driver too old for the CUDA 12 libraries refuses CUDA and TensorRT alike.
+        let hw = HardwareInfo::new(
+            "windows",
+            "x86_64",
+            vec![nvidia("NVIDIA GeForce RTX 3060", 0, Some((0, 8, 6)))],
+        )
+        .with_cuda_driver(11, 8);
+        let sel = select(&hw, &probe, true);
+        for spec in [cuda0, trt0] {
+            let o = sel.option(&spec).unwrap();
+            assert!(!o.runnable, "{spec}");
+            assert_eq!(
+                o.reason.as_deref(),
+                Some(
+                    "the NVIDIA driver supports CUDA 11.8; the CUDA 12 libraries need a driver \
+                     with CUDA 12.0 support (R525 or newer); update the NVIDIA driver"
+                )
+            );
+        }
+        let hw = hw.with_cuda_driver(12, 4);
+        assert!(select(&hw, &probe, true).option(&cuda0).unwrap().runnable);
     }
 
     #[test]

@@ -165,9 +165,11 @@ The input is `HardwareInfo` (detected GPUs) plus `RuntimeProbe` (OpenVINO `avail
 1. **Discrete GPUs**, larger VRAM first (ties in detection order), each with its runtimes in order:
    NVIDIA → `ort:cuda:<ordinal>`, `ort:tensorrt:<ordinal>`, then `ort:directml:<idx>` (Windows);
    Intel Arc → `openvino:gpu.N` (`DEVICE_TYPE=discrete`), then `ort:directml:<idx>`;
-   AMD or other → `ort:directml:<idx>` (Windows). An NVIDIA GPU whose compute capability the pinned
-   ORT CUDA build has no kernels for (Pascal on Windows) is not runnable on CUDA/TensorRT, so it starts
-   at DirectML.
+   AMD or other → `ort:directml:<idx>` (Windows). An NVIDIA GPU whose compute capability the ORT CUDA
+   build has no kernels for (`catalog::ORT_CUDA_BUILDS`: the loaded CUDA flavor's version, else the
+   catalog's 1.31.0 whose Windows build covers 6.1/7.5/8.6/8.9/12.0) is not runnable on CUDA, one below
+   7.5 not on TensorRT 10, and a driver below CUDA 12 runs neither; such a card starts at DirectML. An
+   installed older CUDA build is reported with an update hint and re-planned by the resolver.
 2. **Integrated GPUs**: Intel via OpenVINO (`openvino:gpu`), then DirectML on Windows for the ones
    OpenVINO does not cover (AMD APUs; Intel only when OpenVINO has no GPU).
 3. **macOS arm64** with the CoreML EP → `ort:coreml`
@@ -213,7 +215,7 @@ The result is shown on the welcome page.
 
 ### Getting ORT libraries (`src/setup_onnxruntime.rs`, `setup-onnxruntime` subcommand)
 
-The pin is ORT 1.24.4 (with DirectML 1.15.4) because the DirectML NuGet package stops at 1.24, and the `ort` crate's api-level must not exceed the pinned library. The constants live in `src/setup_onnxruntime.rs`.
+The pins live in `src/resources/catalog/`: ORT 1.24.4 (with DirectML 1.15.4) for the cpu/directml/coreml flavors, because the DirectML package stops at 1.24.4 (1.25+ ships no DirectML provider), and ORT 1.31.0 for the cuda flavor (`gpu_cuda12` archives), whose Windows build has Pascal kernels again (1.23-1.27 were Turing+). The `ort` crate is built without an `api-NN` feature (floor 1.17), so flavors of different versions load.
 
 This mirrors `setup_openvino.rs`: a pinned version constant, whitelisted extraction, and nothing executed. It installs to `<exe_dir>/onnxruntime`. A process can load only one ORT library, so `--flavor auto|cpu|cuda|directml` picks the package from `HardwareInfo`:
 - **Windows**: NVIDIA → `onnxruntime-win-x64-gpu` (CPU, CUDA and TensorRT). Otherwise the `Microsoft.ML.OnnxRuntime.DirectML` nupkg plus `DirectML.dll`.
@@ -288,9 +290,10 @@ The device options from phase 6.2 gain a third state, "downloadable", alongside 
 ### As built (phase 7, 2026-10)
 
 Phase 7 is implemented as planned, with these deviations:
-- **`nvidia-cuda-libs`** is larger than "around 1 GB": ONNX Runtime 1.24's CUDA provider links cudart,
-  cuBLAS/cuBLASLt, cuDNN 9, cuFFT and cuRAND, and cuFFT needs nvJitLink, so the set is seven CUDA 12.8 /
-  cuDNN 9.8 wheels (about 1.9 GB on Windows, 1.7 GB on Linux). The libraries are preloaded by absolute
+- **`nvidia-cuda-libs`** is larger than "around 1 GB": ONNX Runtime's CUDA provider uses cudart,
+  cuBLAS/cuBLASLt, cuDNN 9, cuFFT and cuRAND (1.31 links the first three and cuRAND/NVRTC, loading cuDNN and
+  cuFFT at run time), and cuFFT needs nvJitLink, so the set is seven CUDA 12.8 / cuDNN 9.10 wheels (about
+  1.9 GB on Windows, 1.7 GB on Linux; cuDNN stays below 9.11, which dropped Pascal). The libraries are preloaded by absolute
   path before the CUDA provider is used (no `LD_LIBRARY_PATH` re-exec); an existing CUDA 12 + cuDNN 9
   install on the library path skips the download.
 - **CPU first, then switch:** the resolver also fetches the plan's CPU-fallback runtime (it blocks

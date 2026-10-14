@@ -60,6 +60,7 @@
       <label>Images per dataset (0 = all) <input type="number" name="max_images" min="0" value="{{ max_images }}"></label>
       <label>Timed runs per image <input type="number" name="repeat" min="1" max="1000" value="{{ repeat }}"></label>
       <label>Warm-up runs <input type="number" name="warmup" min="0" max="100" value="{{ warmup }}"></label>
+      <label><input type="hidden" name="low_priority" value="0"><input type="checkbox" name="low_priority" value="1"{% if low_priority %} checked{% endif %}> Run at low priority (keeps the desktop responsive)</label>
       <label>Accuracy weight of the overall grade (0..1, speed gets the rest) <input type="number" name="accuracy_weight" min="0" max="1" step="0.05" value="{{ accuracy_weight }}"></label>
       <label>Best confidence threshold optimizes
         <select name="threshold_objective">

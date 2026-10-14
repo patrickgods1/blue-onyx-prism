@@ -114,6 +114,9 @@ pub struct ResourceRow {
     /// A model whose size the hardware profile recommends for this machine
     /// ([`crate::profile::Profile::recommends`]).
     pub recommended: bool,
+    /// Installed in another version than the catalog's: the catalog version Download installs
+    /// (the UI labels the button Update).
+    pub update_available: Option<&'static str>,
 }
 
 /// True for a model resource whose size `profile` recommends (the IPcam YOLOv5 models count
@@ -539,6 +542,7 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
             }
             let status = status_of(&statuses, r.id);
             let on_disk = is_installed(r, &installed, config);
+            let update = on_disk && installed.outdated(r);
             let need = res.needs.iter().find(|n| n.id() == r.id);
             let optional = res.optional.iter().any(|n| n.id() == r.id);
             let (state, progress, error, retry_in) = match status.map(|s| &s.state) {
@@ -569,17 +573,6 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                 _ if optional => ("optional", None, None, None),
                 _ => ("available", None, None, None),
             };
-            let state_text = match (status, state) {
-                (Some(s), "downloading" | "queued" | "verifying" | "extracting" | "failed") => {
-                    s.state.describe()
-                }
-                (_, "needed") => format!(
-                    "needed: {}",
-                    need.map_or(String::new(), |n| n.reason.clone())
-                ),
-                (_, "optional") => "would enable a better device (large download)".into(),
-                (_, s) => s.to_string(),
-            };
             let flavor = r.flavor();
             let loaded = match r.kind {
                 ResourceKind::OpenVinoRuntime => on_disk && ctx.is_some_and(|c| c.openvino_loaded),
@@ -589,6 +582,31 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                 | ResourceKind::BenchImages
                 | ResourceKind::ExportModel
                 | ResourceKind::Tool => false,
+            };
+            let state_text = match (status, state) {
+                (Some(s), "downloading" | "queued" | "verifying" | "extracting" | "failed") => {
+                    s.state.describe()
+                }
+                (_, "needed") => format!(
+                    "needed: {}",
+                    need.map_or(String::new(), |n| n.reason.clone())
+                ),
+                (_, "optional") => "would enable a better device (large download)".into(),
+                (_, "installed") if update => format!(
+                    "installed {}; {} available (Update replaces it{})",
+                    installed.installed_version(r.id).unwrap_or("?"),
+                    r.version,
+                    match need {
+                        Some(n) if loaded => format!(
+                            "; needed by {}, used after a restart",
+                            n.blocking_models.join(", ")
+                        ),
+                        Some(n) => format!("; needed by {}", n.blocking_models.join(", ")),
+                        None if loaded => "; used after a restart".to_string(),
+                        None => String::new(),
+                    }
+                ),
+                (_, s) => s.to_string(),
             };
             let blocked = if on_disk {
                 remove_blocked(ctx, r, config, status)
@@ -641,6 +659,7 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                 size_note: None,
                 log: Vec::new(),
                 recommended: recommended_for(&profile, r),
+                update_available: update.then_some(r.version),
             }
         })
         .collect()
@@ -740,6 +759,7 @@ fn export_row(
         size_note: None,
         log: Vec::new(),
         recommended: false,
+        update_available: None,
     };
     if r.kind == ResourceKind::Tool {
         let dl = status_of(statuses, r.id).filter(|s| !s.state.is_final());
