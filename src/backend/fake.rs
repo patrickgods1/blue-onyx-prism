@@ -97,6 +97,8 @@ pub(crate) struct FakeScript {
     pub(crate) slots: usize,
     /// (width, height) of the image input.
     pub(crate) input_size: (u32, u32),
+    /// Warm-up submits never complete (a hung device at load time).
+    pub(crate) warmup_hangs: bool,
 }
 
 impl FakeScript {
@@ -106,6 +108,7 @@ impl FakeScript {
             shared: Arc::default(),
             slots: slots.max(1),
             input_size,
+            warmup_hangs: false,
         }
     }
 
@@ -205,7 +208,8 @@ impl FakeCompiled {
         FakeBackend {
             info: self.info,
             slots: (0..slots).map(|_| Slot::Idle).collect(),
-            warmup_left: slots - 1,
+            // The worker warms every slot up through `submit` (slot 0 first, timed).
+            warmup_left: slots,
             script: self.script,
             done_tx,
             done_rx,
@@ -278,7 +282,11 @@ impl FakeBackend {
         let step = if self.warmup_left > 0 {
             self.warmup_left -= 1;
             self.script.log(Call::WarmupSubmit { slot });
-            Step::Ok(vec![yolo26_output(&[])], Duration::ZERO)
+            if self.script.warmup_hangs {
+                Step::Hang
+            } else {
+                Step::Ok(vec![yolo26_output(&[])], Duration::ZERO)
+            }
         } else {
             let mut st = self.script.shared.state.lock_recover();
             st.calls.push(Call::Submit { slot, seq });
@@ -424,7 +432,9 @@ mod tests {
     #[test]
     fn steps_play_in_order_with_completions() {
         let (script, mut b) = backend(2);
-        // Slot 1's warm-up submit does not consume a step.
+        // The warm-up submits (one per slot) do not consume a step.
+        b.submit(0, &[], &[]).unwrap();
+        b.collect(0).unwrap();
         b.submit(1, &[], &[]).unwrap();
         b.collect(1).unwrap();
         // The worker drops warm-up completions the same way.
@@ -456,6 +466,10 @@ mod tests {
     #[test]
     fn hang_blocks_until_released() {
         let (script, mut b) = backend(1);
+        // Warm-up first (it never hangs unless `warmup_hangs`).
+        b.submit(0, &[], &[]).unwrap();
+        b.collect(0).unwrap();
+        while b.completions().try_recv().is_ok() {}
         script.push([Step::Hang]);
         let seq = b.submit(0, &[], &[]).unwrap();
         assert!(b.completions().try_recv().is_err());

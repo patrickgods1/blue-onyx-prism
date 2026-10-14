@@ -195,8 +195,9 @@ fn replies_keep_request_order_across_slots() {
     assert!(got[1].1 - started >= Duration::from_millis(140));
     // Two slots were used, the request submits are in order and the warm-up covered slot 1.
     let calls = h.script.calls();
-    assert_eq!(calls[0], Call::Infer);
-    assert_eq!(calls[1], Call::WarmupSubmit { slot: 1 });
+    assert_eq!(calls[0], Call::WarmupSubmit { slot: 0 });
+    assert_eq!(calls[1], Call::Collect { slot: 0 });
+    assert_eq!(calls[2], Call::WarmupSubmit { slot: 1 });
     let submits: Vec<(usize, u64)> = calls
         .iter()
         .filter_map(|c| match c {
@@ -295,7 +296,15 @@ fn shutdown_with_a_busy_slot_answers_everything_and_exits() {
     }
     let calls = script.calls();
     assert!(calls.contains(&Call::Abort), "{calls:?}");
-    assert!(!calls.contains(&Call::Collect { slot: 0 }), "{calls:?}");
+    // The only collect of slot 0 is the warm-up's; the hung request was never collected.
+    let after_request = calls
+        .iter()
+        .position(|c| matches!(c, Call::Submit { .. }))
+        .unwrap();
+    assert!(
+        !calls[after_request..].contains(&Call::Collect { slot: 0 }),
+        "{calls:?}"
+    );
     assert_eq!(script.submits(), 1);
 }
 
@@ -384,6 +393,78 @@ fn dead_session_fails_the_model() {
     let r = h.send("b.jpg").wait();
     assert!(r.message.contains("is unavailable"), "{}", r.message);
     assert_eq!(h.script.submits(), 1);
+    h.stop();
+}
+
+/// A streak of inference errors (a reset GPU fails every `run`) marks the model broken, so
+/// the supervisor can reload it instead of every request failing for good.
+#[test]
+fn repeated_inference_errors_fail_the_model() {
+    use super::run::MAX_CONSECUTIVE_ERRORS;
+    use super::watch::BROKEN_PREFIX;
+    let h = Harness::start(1, Duration::from_secs(30));
+    let n = MAX_CONSECUTIVE_ERRORS as usize;
+    // One error short of the limit, then a success: still ready, streak reset.
+    h.script
+        .push(std::iter::repeat_n(Step::Fail("CUDA failure 700".into()), n - 1).chain([det(2, 0)]));
+    let got = wait_all((0..n).map(|i| h.send(&format!("a{i}.jpg"))).collect());
+    assert!(got[..n - 1].iter().all(|(r, _)| !r.success));
+    assert_eq!(label(&got[n - 1].0), "c2");
+    assert_eq!(h.handle.state.get(), ModelState::Ready);
+    assert!(!h.handle.is_stuck());
+    // The full streak: broken.
+    h.script.push(std::iter::repeat_n(
+        Step::Fail("CUDA failure 700".into()),
+        n,
+    ));
+    let got = wait_all((0..n).map(|i| h.send(&format!("b{i}.jpg"))).collect());
+    assert!(got.iter().all(|(r, _)| !r.success));
+    h.wait_for("the model to be marked broken", || h.handle.is_stuck());
+    let ModelState::Failed(msg) = h.handle.state.get() else {
+        panic!("expected Failed, got {:?}", h.handle.state.get());
+    };
+    assert!(msg.starts_with(BROKEN_PREFIX), "{msg}");
+    assert!(msg.contains("CUDA failure 700"), "{msg}");
+    assert!(msg.contains("reloaded automatically"), "{msg}");
+    let r = h.send("later.jpg").wait();
+    assert!(
+        r.message.contains("is unavailable: inference broken on"),
+        "{}",
+        r.message
+    );
+    assert_eq!(h.script.submits(), 2 * n, "the parked engine is not used");
+    h.stop();
+}
+
+/// A reset device can answer every inference with unwritten (all-zero) buffers and no error:
+/// enough of those in a row mark the model broken too.
+#[test]
+fn all_zero_outputs_fail_the_model() {
+    use super::run::MAX_CONSECUTIVE_DEGENERATE;
+    use super::watch::BROKEN_PREFIX;
+    let h = Harness::start(1, Duration::from_secs(30));
+    let n = MAX_CONSECUTIVE_DEGENERATE as usize;
+    let zeros = || Step::Ok(vec![yolo26_output(&[[0.0; 6]; 3])], Duration::ZERO);
+    // Empty results are not degenerate; a real detection resets the streak.
+    h.script
+        .push(std::iter::repeat_with(zeros).take(n - 1).chain([
+            Step::Ok(vec![yolo26_output(&[])], Duration::ZERO),
+            det(1, 0),
+        ]));
+    let got = wait_all((0..=n).map(|i| h.send(&format!("a{i}.jpg"))).collect());
+    assert!(got.iter().all(|(r, _)| r.success));
+    assert_eq!(h.handle.state.get(), ModelState::Ready);
+    h.script.push(std::iter::repeat_with(zeros).take(n));
+    let got = wait_all((0..n).map(|i| h.send(&format!("b{i}.jpg"))).collect());
+    assert!(got.iter().all(|(r, _)| r.success && r.count == 0));
+    h.wait_for("the model to be marked broken", || h.handle.is_stuck());
+    let ModelState::Failed(msg) = h.handle.state.get() else {
+        panic!("expected Failed");
+    };
+    assert!(
+        msg.starts_with(BROKEN_PREFIX) && msg.contains("only zeros"),
+        "{msg}"
+    );
     h.stop();
 }
 

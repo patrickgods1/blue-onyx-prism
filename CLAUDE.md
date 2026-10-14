@@ -119,7 +119,12 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   every release archive; the release workflow attests the archives (`actions/attest-build-provenance`).
 - Operability: `log_format: text|json` (file appender only), per-request debug log with `model/device/request_id/
   inference_ms/process_ms/round_trip_ms` and an `X-Request-Id` response header; a model whose inference never returns is
-  marked Failed("inference stuck ...") after a second request timeout (`worker::collect_watched`); a compile over 5 min warns;
+  marked Failed("inference stuck ...") after a second request timeout (`worker::collect_watched`); 5 inference errors in a
+  row or 25 all-zero/NaN outputs in a row (a reset GPU) mark it Failed("inference broken ...") (`worker::run::note_health`),
+  and a model that failed while serving (stuck, broken, or a dead ORT session) is reloaded by the generation's `supervisor`
+  thread with a doubling backoff
+  (10 s .. 1 h, reset after 10 min of service); a warm-up that does not finish in 3 min (`worker::WARMUP_TIMEOUT`) abandons
+  that device (backend leaked, next candidate tried); a compile over 5 min warns; the "queue full" warning is throttled;
   downloads give up after 12 attempts in the service (`manager::SERVICE_MAX_ATTEMPTS`); a config with no models is seeded with
   IPcam-general. Error messages state what happened, the likely cause and the next action.
 

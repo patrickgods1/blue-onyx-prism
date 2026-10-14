@@ -25,6 +25,10 @@ pub(crate) fn stuck_message(device: &str, waited: Duration) -> String {
 /// Prefix of [`stuck_message`] (what a caller can match on).
 pub(crate) const STUCK_PREFIX: &str = "inference stuck on";
 
+/// Prefix of the `Failed` text of a model whose inferences keep failing or returning nothing
+/// (see [`StuckWatch::mark_broken`]).
+pub(crate) const BROKEN_PREFIX: &str = "inference broken on";
+
 /// Who to mark `Failed` when an inference is stuck (see [`collect_watched`]).
 #[derive(Debug, Clone)]
 pub(super) struct StuckWatch {
@@ -43,6 +47,22 @@ impl StuckWatch {
         if let Some(e) = cause {
             msg = format!("{msg} (runtime error: {e:#})");
         }
+        error!(model = %self.name, device = %self.device, "{msg}");
+        self.stuck.store(true, Ordering::Release);
+        self.state.set(ModelState::Failed(msg));
+    }
+
+    /// Mark the model `Failed` because its inferences keep failing or returning degenerate
+    /// outputs (`reason`): the device was probably reset (a GPU timeout / TDR on Windows, a
+    /// driver crash) and the session will not recover by itself. Takes the same path as a
+    /// stuck inference: the worker parks the engine and the supervisor reloads the model.
+    pub(super) fn mark_broken(&self, reason: &str) {
+        let msg = format!(
+            "{BROKEN_PREFIX} {}: {reason}; the device was probably reset (GPU timeout) or its \
+             driver crashed; the model is reloaded automatically, and if this repeats try \
+             another `device` or update the driver",
+            self.device
+        );
         error!(model = %self.name, device = %self.device, "{msg}");
         self.stuck.store(true, Ordering::Release);
         self.state.set(ModelState::Failed(msg));

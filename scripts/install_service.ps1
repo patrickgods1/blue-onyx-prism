@@ -160,7 +160,9 @@ Invoke-Sc sidtype $ServiceName unrestricted
 # access-denied error in the event log: add it here, separated by '/'.
 Invoke-Sc privs $ServiceName SeChangeNotifyPrivilege
 Invoke-Sc description $ServiceName "Blue Iris / CodeProject.AI compatible object detection (OpenVINO / ONNX Runtime)"
-Invoke-Sc failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000
+# Restart on every failure (the SCM keeps applying the last action): at once, then after 30 s,
+# then every 2 min; the failure count resets after an hour without one.
+Invoke-Sc failure $ServiceName reset= 3600 actions= restart/5000/restart/30000/restart/120000
 
 # --- Permissions --------------------------------------------------------------------------------
 # Well-known SIDs, so the script works on non-English Windows.

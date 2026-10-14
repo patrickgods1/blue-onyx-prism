@@ -233,6 +233,47 @@ pub struct WorkerHandle {
     live: Arc<ArcSwap<LiveSettings>>,
     /// Set while an inference is stuck (see [`stuck_message`]); the thread may never return.
     stuck: Arc<AtomicBool>,
+    /// The model's class names (empty while unknown: a model waiting for its download), so a
+    /// live object filter can be checked against them.
+    classes: Vec<String>,
+}
+
+/// The labels of `filter` that name no class of `classes` (case-insensitive); empty when
+/// `classes` is unknown. A filter made only of such labels answers "0 objects" to every
+/// request, so the caller warns about them.
+pub fn unknown_filter_labels(filter: &[String], classes: &[String]) -> Vec<String> {
+    if classes.is_empty() {
+        return Vec::new();
+    }
+    filter
+        .iter()
+        .filter(|f| !classes.iter().any(|c| c.eq_ignore_ascii_case(f)))
+        .cloned()
+        .collect()
+}
+
+/// Warn when `filter` holds labels that are not among `classes` (see
+/// [`unknown_filter_labels`]).
+pub(crate) fn warn_unknown_filter(name: &str, filter: &[String], classes: &[String]) {
+    let unknown = unknown_filter_labels(filter, classes);
+    if unknown.is_empty() {
+        return;
+    }
+    if unknown.len() == filter.len() {
+        warn!(
+            model = %name,
+            labels = ?unknown,
+            classes = ?classes,
+            "object_filter names no class of this model: every request will answer 0 objects; \
+             fix the labels (the model's class names are listed) or clear the filter"
+        );
+    } else {
+        warn!(
+            model = %name,
+            labels = ?unknown,
+            "object_filter has labels that are not classes of this model; they never match"
+        );
+    }
 }
 
 impl WorkerHandle {
@@ -263,6 +304,7 @@ impl WorkerHandle {
             load_started: Arc::new(AtomicBool::new(true)),
             live: LiveSettings::default().shared(),
             stuck: Arc::new(AtomicBool::new(false)),
+            classes: Vec::new(),
         }
     }
 
@@ -294,6 +336,9 @@ impl WorkerHandle {
     pub fn set_live(&self, settings: LiveSettings) -> bool {
         let new = Arc::new(settings);
         let old = self.live.swap(new.clone());
+        if old.object_filter != new.object_filter {
+            warn_unknown_filter(&self.name, &new.object_filter, &self.classes);
+        }
         *old != *new
     }
 
@@ -445,10 +490,19 @@ pub(crate) fn auto_queue_size(request_timeout: Duration, warmup_ms: u64) -> usiz
 /// Request `min_confidence` overrides the configured threshold when > 0. The result is never
 /// below [`crate::model::nms::MIN_CONFIDENCE_FLOOR`] (0.01): a tiny request value or a configured
 /// 0.0 uses the floor, so a client cannot turn every anchor into an NMS candidate (PL-01).
+/// A value above 1 is a percentage (`40` = 0.4; CodeProject.AI takes a fraction, but a client
+/// that sends percent would otherwise get "0 objects" on every request without any error);
+/// above 100 it is ignored (configured threshold).
 pub(crate) fn effective_threshold(min_confidence: f32, configured: f32) -> f32 {
     let floor = crate::model::nms::MIN_CONFIDENCE_FLOOR;
     let t = if min_confidence > 0.0 && min_confidence.is_finite() {
-        min_confidence
+        if min_confidence <= 1.0 {
+            min_confidence
+        } else if min_confidence <= 100.0 {
+            min_confidence / 100.0
+        } else {
+            configured
+        }
     } else {
         configured
     };
@@ -526,6 +580,8 @@ pub fn spawn_worker_after(
         load_started: load_started.clone(),
         stuck: stuck.clone(),
         shutdown,
+        consecutive_errors: std::cell::Cell::new(0),
+        consecutive_degenerate: std::cell::Cell::new(0),
     };
     let name = cfg.name.clone();
     let join = std::thread::Builder::new()
@@ -559,6 +615,7 @@ pub fn spawn_worker_after(
         load_started,
         live: cfg.live.clone(),
         stuck,
+        classes: cfg.classes,
     }
 }
 
@@ -615,6 +672,25 @@ mod tests {
         assert_eq!(effective_threshold(f32::INFINITY, f32::NAN), floor);
         assert_eq!(effective_threshold(0.01, 0.5), 0.01);
         assert_eq!(effective_threshold(0.0, 0.02), 0.02);
+        // Percent from a client that does not send a fraction; nonsense above 100 ignored.
+        assert_eq!(effective_threshold(1.0, 0.5), 1.0);
+        assert_eq!(effective_threshold(40.0, 0.5), 0.4);
+        assert_eq!(effective_threshold(100.0, 0.5), 1.0);
+        assert_eq!(effective_threshold(101.0, 0.5), 0.5);
+        assert_eq!(effective_threshold(1e9, 0.5), 0.5);
+    }
+
+    #[test]
+    fn unknown_filter_labels_are_found() {
+        let classes = ["person".to_string(), "Car".to_string()];
+        assert!(unknown_filter_labels(&[], &classes).is_empty());
+        assert!(unknown_filter_labels(&["PERSON".into(), "car".into()], &classes).is_empty());
+        assert_eq!(
+            unknown_filter_labels(&["person".into(), "dog".into(), "cat".into()], &classes),
+            ["dog", "cat"]
+        );
+        // Unknown classes: nothing to check against.
+        assert!(unknown_filter_labels(&["dog".into()], &[]).is_empty());
     }
 
     #[test]

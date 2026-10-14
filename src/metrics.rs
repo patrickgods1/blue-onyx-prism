@@ -192,6 +192,12 @@ pub struct ModelMetrics {
     pub inference_ms: Histogram,
     pub process_ms: Histogram,
     pub round_trip_ms: Histogram,
+    /// Throttle of the "worker queue is full" warning (one line per
+    /// [`LOG_THROTTLE_INTERVAL`] instead of one per rejected request; the service writes
+    /// warnings to the Windows event log).
+    pub queue_full_log: LogThrottle,
+    /// Clock of [`Self::now_ms`].
+    started: Instant,
 }
 
 impl ModelMetrics {
@@ -212,7 +218,14 @@ impl ModelMetrics {
             inference_ms: Histogram::new(),
             process_ms: Histogram::new(),
             round_trip_ms: Histogram::new(),
+            queue_full_log: LogThrottle::default(),
+            started: Instant::now(),
         }
+    }
+
+    /// Milliseconds since these metrics were created (the clock of [`LogThrottle::allow`]).
+    pub fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Count one request that was not served by inference.

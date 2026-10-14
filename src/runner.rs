@@ -115,17 +115,20 @@ struct Generation {
     registry: Arc<ModelRegistry>,
     workers: CancellationToken,
     watcher: Option<std::thread::JoinHandle<()>>,
+    /// Reloads models that fail while serving ([`crate::supervisor`]).
+    supervisor: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Generation {
     /// Stop a generation that is no longer current: wait until its in-flight requests let go of
-    /// its state (at most `drain`), then stop its workers and watcher.
+    /// its state (at most `drain`), then stop its workers, watcher and supervisor.
     fn retire(self, drain: Duration) {
         let Generation {
             state,
             registry,
             workers,
             watcher,
+            supervisor,
         } = self;
         state.restart.cancel();
         let deadline = Instant::now() + drain;
@@ -144,6 +147,11 @@ impl Generation {
             && w.join().is_err()
         {
             warn!("resource watcher panicked");
+        }
+        if let Some(s) = supervisor
+            && s.join().is_err()
+        {
+            warn!("model supervisor panicked");
         }
         // Shut down in place even when a connection task still holds the generation's state
         // (axum drops a connection's router clone after signalling the server future, see
@@ -541,6 +549,7 @@ pub fn run_server_with(
             generation.clone(),
             resources_restart.clone(),
         );
+        let supervisor = crate::supervisor::spawn(Arc::downgrade(&state), generation.clone());
         // The store's generation (and adopted config) changes together with the swap, so pages
         // waiting for the restart see the new generation's models.
         if !first {
@@ -557,6 +566,7 @@ pub fn run_server_with(
                 registry,
                 workers,
                 watcher,
+                supervisor,
             });
             return run.finish(Err(e));
         }
@@ -566,6 +576,7 @@ pub fn run_server_with(
             registry,
             workers,
             watcher,
+            supervisor,
         };
 
         // Serve until a restart, a shutdown, or the server failing.

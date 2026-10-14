@@ -528,7 +528,16 @@ fn answer_without_inference(handle: &WorkerHandle) -> Option<VisionDetectionResp
         }
     }
     if handle.is_full() {
-        warn!(model = %name, "worker queue is full, server is overloaded; rejecting request");
+        // Throttled: under a sustained overload this would otherwise log (and, in the
+        // service, write to the event log) one line per rejected request.
+        if let Some(held_back) = handle.metrics.queue_full_log.allow(handle.metrics.now_ms()) {
+            warn!(
+                model = %name,
+                queue = handle.queue_capacity(),
+                similar_since_last_warning = held_back,
+                "worker queue is full, server is overloaded; rejecting request"
+            );
+        }
         handle.metrics.record_drop(DropReason::QueueFull);
         return Some(VisionDetectionResponse::error("Worker queue is full"));
     }
