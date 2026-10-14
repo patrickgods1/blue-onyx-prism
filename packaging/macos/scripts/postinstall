@@ -1,0 +1,28 @@
+#!/bin/bash
+# Installer postinstall (runs as root). $2 = install location, $3 = target volume.
+# Mirrors scripts/install_launchd.sh for the runtime-less pkg: the service downloads OpenVINO /
+# ONNX Runtime itself on first start into download_dir. An existing config is never overwritten.
+set -euo pipefail
+
+TARGET="${3:-/}"
+if [ "$TARGET" != "/" ]; then
+  echo "Blue Onyx Prism can only be installed on the startup disk (target '$TARGET' selected)." >&2
+  exit 1
+fi
+
+INSTALL_DIR=/usr/local/blue-onyx-prism
+COMMON="$INSTALL_DIR/scripts/launchd_common.sh"
+if [ ! -f "$COMMON" ]; then
+  echo "Package payload is incomplete: $COMMON is missing." >&2
+  exit 1
+fi
+# shellcheck source=scripts/launchd_common.sh
+. "$COMMON"
+
+bop_create_account
+bop_create_dirs
+bop_install_newsyslog
+bop_seed_config
+bop_install_plist "$PLIST_DST"
+bop_bootstrap
+exit 0

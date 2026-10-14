@@ -1,7 +1,9 @@
 # Release checklist
 
-Releases are built by `.github/workflows/release.yml` (Windows, Linux, macOS archives plus a
-`.sha256` each) and published by hand from the draft it creates.
+Releases are built by `.github/workflows/release.yml` (Windows, Linux, macOS archives plus the
+native installers: MSI, deb, rpm and pkg, with a `.sha256` each) and published by hand from the
+draft it creates. Each build job installs, checks and uninstalls its installers on the runner
+(`packaging/smoke-test-installers.sh`); a failed smoke test fails the release.
 
 ## Before tagging
 

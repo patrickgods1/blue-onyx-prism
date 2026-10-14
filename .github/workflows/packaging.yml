@@ -1,0 +1,74 @@
+# Builds the native installers (packaging/) and installs, checks and uninstalls them on each runner,
+# without releasing anything. release.yml runs the same two scripts for a release.
+name: packaging
+
+on:
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "deploy/**"
+      - "scripts/*systemd*"
+      - "scripts/*launchd*"
+      - "src/bin/blue_onyx_prism_service.rs"
+      - "Cargo.toml"
+      - ".github/workflows/packaging.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  installers:
+    name: installers (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+          - os: ubuntu-22.04 # same glibc floor as release.yml
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: 1.99.0 # keep equal to rust-toolchain.toml
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build release
+        run: cargo build --release --locked --bins --target ${{ matrix.target }}
+      - name: Lint shell scripts
+        if: runner.os == 'Linux'
+        run: |
+          shellcheck -x scripts/*systemd*.sh scripts/*launchd*.sh packaging/*.sh \
+            packaging/linux/*.sh packaging/linux/debian/* packaging/linux/rpm/*.sh \
+            packaging/macos/*.sh packaging/macos/scripts/*
+      - name: Build installers
+        shell: bash
+        run: packaging/build-installers.sh ${{ matrix.target }} dist
+      - name: Smoke-test installers
+        shell: bash
+        working-directory: dist
+        run: ../packaging/smoke-test-installers.sh .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: installers-${{ matrix.label }}
+          path: |
+            dist/*.msi
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg
+            dist/*.log
+          if-no-files-found: ignore

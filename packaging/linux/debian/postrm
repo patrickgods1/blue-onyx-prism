@@ -1,0 +1,26 @@
+#!/bin/sh
+# remove: forget the deleted unit. purge: like uninstall_systemd.sh --purge, delete the data root
+# (config, models, cache, downloads) and the service user.
+set -e
+case "$1" in
+  remove | purge)
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload || true
+      systemctl reset-failed blue-onyx-prism 2>/dev/null || true
+    fi
+    ;;
+esac
+if [ "$1" = purge ]; then
+  rm -rf /var/lib/blue-onyx-prism
+  if id -u blueonyx >/dev/null 2>&1; then
+    userdel blueonyx || true
+  fi
+  # userdel drops the user's own group; remove a leftover one (sysusers creates it).
+  if getent group blueonyx >/dev/null 2>&1; then
+    groupdel blueonyx 2>/dev/null || true
+  fi
+fi
+
+#DEBHELPER#
+
+exit 0

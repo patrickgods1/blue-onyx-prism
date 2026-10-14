@@ -1,0 +1,43 @@
+# Windows installer (MSI)
+
+Per-machine MSI built with WiX Toolset v7 (pinned 7.0.0; v4+ schema in `main.wxs`).
+
+## Build locally
+
+```powershell
+cargo build --release --locked --bins
+.\packaging\windows\build-msi.ps1 -Version 0.1.0 -BinDir target\release -OutFile dist\blue-onyx-prism-0.1.0.msi
+```
+
+`build-msi.ps1` installs the `wix` dotnet tool and the Util/Firewall/UI extensions (all 7.0.0) when
+`wix` is not on PATH, generates `obj\License.rtf` from `LICENSE`, and runs `wix build -acceptEula wix7`
+(WiX 7 requires accepting its OSMF EULA). Needs a .NET SDK (8+). `-Version` must be numeric `x.y.z`.
+
+## What it installs
+
+- `C:\Program Files\Blue Onyx Prism`: service exe, CLI, benchmark exe, LICENSE, THIRD_PARTY_LICENSES.md, README.md.
+- Service `BlueOnyxPrismService` (auto start, `NT AUTHORITY\LocalService`), started `--config "C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json"`;
+  restarts after 5 s / 30 s / 120 s (count reset after 1 h).
+- `C:\ProgramData\BlueOnyxPrism`: config, models, cache, logs; Administrators/SYSTEM full control, LocalService modify.
+- Application event log source `BlueOnyxPrism`, firewall rule `Blue Onyx Prism (<PORT>)` (TCP, any scope, all profiles),
+  Start Menu shortcut to `http://127.0.0.1:32168/`.
+
+## Properties
+
+`PORT` (default 32168): firewall rule port only; also set `port` in the config if you change it. Example:
+`msiexec /i blue-onyx-prism.msi /qn PORT=32169`. The install folder can be changed in the UI or with `INSTALLFOLDER=`.
+
+## Uninstall
+
+Removes program files, the service, the firewall rule, the event source and the shortcut. `C:\ProgramData\BlueOnyxPrism`
+is kept (config, downloaded runtimes, models). Delete it by hand for a clean slate.
+
+## Coexistence with scripts\install_service.ps1
+
+The MSI refuses to install when the service exists and was not installed by this MSI (marker value
+`HKLM\SOFTWARE\BlueOnyxPrism\Installer`). Run `scripts\uninstall_service.ps1` first. Upgrades of the MSI itself are not blocked.
+The MSI does not change `ServicesPipeTimeout`.
+
+## CI smoke test
+
+`smoke-test.ps1 -Msi <path> [-Port 32168]` (elevated): installs, checks service/account/HTTP/config, uninstalls, checks cleanup.

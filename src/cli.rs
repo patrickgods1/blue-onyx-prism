@@ -563,6 +563,63 @@ fn merge_cli(config: &mut Config, cli: &Cli) {
 /// Log directory of a freshly created service config (relative to the exe dir).
 pub const SERVICE_LOG_DIR: &str = "logs";
 
+/// The service binary's `--config <path>` / `--config=<path>` flag (from the process args, i.e.
+/// the service ImagePath; SCM start arguments are not used).
+pub const SERVICE_CONFIG_FLAG: &str = "--config";
+
+/// Config path named by the service process arguments `args` (without argv\[0\]):
+/// `--config <path>` or `--config=<path>`, a relative path resolved against `exe_dir` (a
+/// service starts in System32). `Ok(None)` when the flag is absent; other arguments (e.g.
+/// `--version`) are ignored. An empty or missing value, or the flag given twice, is an error.
+pub fn service_config_arg<I, S>(args: I, exe_dir: &Path) -> Result<Option<PathBuf>>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
+    let mut args = args.into_iter().map(Into::into);
+    let mut found: Option<PathBuf> = None;
+    let prefix = format!("{SERVICE_CONFIG_FLAG}=");
+    while let Some(arg) = args.next() {
+        let value = if arg == SERVICE_CONFIG_FLAG {
+            Some(args.next().with_context(|| {
+                format!(
+                    "{SERVICE_CONFIG_FLAG} needs a value: the path of the service config file \
+                     (fix the service command line, e.g. reinstall the service)"
+                )
+            })?)
+        } else {
+            arg.to_str()
+                .and_then(|s| s.strip_prefix(&prefix))
+                .map(std::ffi::OsString::from)
+        };
+        let Some(value) = value else { continue };
+        if value.is_empty() {
+            anyhow::bail!(
+                "{SERVICE_CONFIG_FLAG} was given an empty path; name the service config file \
+                 (fix the service command line, e.g. reinstall the service)"
+            );
+        }
+        if found.is_some() {
+            anyhow::bail!(
+                "{SERVICE_CONFIG_FLAG} was given more than once; keep one (fix the service \
+                 command line, e.g. reinstall the service)"
+            );
+        }
+        let p = PathBuf::from(value);
+        found = Some(if p.is_absolute() { p } else { exe_dir.join(p) });
+    }
+    Ok(found)
+}
+
+/// The service config path: `--config` from the process arguments ([`service_config_arg`],
+/// relative to the exe dir), else [`Config::service_config_path`].
+pub fn service_config_path_from_args() -> Result<PathBuf> {
+    Ok(
+        service_config_arg(std::env::args_os().skip(1), &crate::exe_dir())?
+            .unwrap_or_else(Config::service_config_path),
+    )
+}
+
 /// Load `blue_onyx_prism_config_service.json`, creating a default one (log level debug, file
 /// log in `logs/` next to the exe: a service's stdout is discarded, and the event log only gets
 /// INFO and above) when missing. A config without models gets the default catalog model
@@ -573,24 +630,67 @@ pub fn for_service() -> Result<(Config, PathBuf)> {
     for_service_at(&path).map(|c| (c, path))
 }
 
-/// [`for_service`] for the config file at `path`.
+/// [`for_service`] for the config file at `path`. A config created outside the exe dir (e.g.
+/// `--config C:\ProgramData\BlueOnyxPrism\config.json` from an MSI install) keeps its data
+/// next to it: see [`service_default_config`].
 pub fn for_service_at(path: &Path) -> Result<Config> {
+    for_service_at_in(path, &crate::exe_dir())
+}
+
+/// Whether `a` and `b` name the same directory (canonicalized when they exist).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => {
+            let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+            abs(a) == abs(b)
+        }
+    }
+}
+
+/// Default service config for a file created in `config_dir`: log level debug and a file log
+/// (a service's stdout is discarded). In `exe_dir` everything stays relative to the exe dir
+/// (`logs/`, `cache/`, downloads next to the exe). Elsewhere the data lives next to the config:
+/// absolute `download_dir = <config_dir>`, `cache_dir = <config_dir>/cache`,
+/// `log_path = <config_dir>/logs` (the install folder may be read-only, e.g. Program Files).
+pub fn service_default_config(config_dir: &Path, exe_dir: &Path) -> Config {
+    let mut config = Config {
+        log_level: LogLevel::Debug,
+        log_path: Some(PathBuf::from(SERVICE_LOG_DIR)),
+        ..Default::default()
+    };
+    if !same_dir(config_dir, exe_dir) {
+        let dir = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+        config.cache_dir = dir.join("cache").to_string_lossy().into_owned();
+        config.log_path = Some(dir.join(SERVICE_LOG_DIR));
+        config.download_dir = Some(dir);
+    }
+    config
+}
+
+/// [`for_service_at`] with the exe dir given (tests).
+fn for_service_at_in(path: &Path, exe_dir: &Path) -> Result<Config> {
     let mut config = if path.exists() {
         Config::load(path)?
     } else {
-        let config = Config {
-            log_level: LogLevel::Debug,
-            log_path: Some(PathBuf::from(SERVICE_LOG_DIR)),
-            ..Default::default()
-        };
-        config.save(path).with_context(|| {
-            format!(
-                "could not create the default service config {} (the install folder is \
-                 probably read-only for the service account); grant it write access or create \
-                 the file by hand",
-                path.display()
-            )
-        })?;
+        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let dir = abs
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| exe_dir.to_path_buf());
+        let config = service_default_config(&dir, exe_dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| config.save(path))
+            .with_context(|| {
+                format!(
+                    "could not create the default service config {} (its folder {} is probably \
+                     read-only for the service account, e.g. the install folder or the folder \
+                     named by --config); grant it write access or create the file by hand",
+                    path.display(),
+                    dir.display()
+                )
+            })?;
         config
     };
     seed_default_model(&mut config, path);
@@ -1327,7 +1427,8 @@ mod tests {
     #[test]
     fn service_config_is_seeded_with_the_default_model() {
         let path = temp_cfg();
-        let c = for_service_at(&path).unwrap();
+        let exe_dir = path.parent().unwrap().to_path_buf();
+        let c = for_service_at_in(&path, &exe_dir).unwrap();
         assert_eq!(c.log_level, LogLevel::Debug);
         assert_eq!(c.log_path.as_deref(), Some(Path::new(SERVICE_LOG_DIR)));
         assert_eq!(c.models.len(), 1);
@@ -1342,6 +1443,131 @@ mod tests {
         .unwrap();
         let c = for_service_at(&path).unwrap();
         assert_eq!((c.port, c.models.len()), (4000, 1));
+    }
+
+    /// A service config created next to the exe keeps today's relative defaults.
+    #[test]
+    fn service_config_in_the_exe_dir_keeps_relative_defaults() {
+        let path = temp_cfg();
+        let dir = path.parent().unwrap().to_path_buf();
+        // A differently spelled path to the same folder still counts as the exe dir.
+        let exe_dir = dir.join(".").join("sub").join("..");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let c = for_service_at_in(&path, &exe_dir).unwrap();
+        let d = Config::default();
+        assert_eq!(c.log_path.as_deref(), Some(Path::new(SERVICE_LOG_DIR)));
+        assert_eq!(c.cache_dir, d.cache_dir);
+        assert_eq!(c.download_dir, None);
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.download_dir, None);
+        assert_eq!(saved.cache_dir, d.cache_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A service config created outside the exe dir (`--config`, MSI data folder) keeps its
+    /// downloads, cache and logs next to it; the folder is created when missing.
+    #[test]
+    fn service_config_outside_the_exe_dir_keeps_data_next_to_it() {
+        let root = temp_cfg().parent().unwrap().to_path_buf();
+        let exe_dir = root.join("app");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let data = root.join("data").join("nested");
+        let path = data.join("cfg.json");
+        let c = for_service_at_in(&path, &exe_dir).unwrap();
+        assert!(path.is_file());
+        assert_eq!(c.log_level, LogLevel::Debug);
+        assert_eq!(c.download_dir.as_deref(), Some(data.as_path()));
+        assert_eq!(c.log_path, Some(data.join(SERVICE_LOG_DIR)));
+        assert_eq!(PathBuf::from(&c.cache_dir), data.join("cache"));
+        // Everything resolves under that folder, not the exe dir.
+        assert_eq!(c.data_root(), data);
+        assert_eq!(c.cache_dir_path(), Some(data.join("cache")));
+        assert_eq!(
+            c.data_path(Path::new("models/x.onnx")),
+            data.join("models/x.onnx")
+        );
+        assert_eq!(
+            c.ort_options().default_dir,
+            Some(data.join(crate::backend::libs::ORT_DIR_NAME))
+        );
+        std::fs::create_dir_all(data.join(crate::backend::libs::BUNDLED_DIR_NAME)).unwrap();
+        assert_eq!(
+            c.openvino_dir_effective(),
+            Some(data.join(crate::backend::libs::BUNDLED_DIR_NAME))
+        );
+        assert!(crate::config::validate_config(&c).is_ok());
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.download_dir, c.download_dir);
+        assert_eq!(saved.cache_dir, c.cache_dir);
+        assert_eq!(saved.log_path, c.log_path);
+        // An existing file is loaded as is (no seeding of paths).
+        let c2 = for_service_at_in(&path, &data).unwrap();
+        assert_eq!(c2.download_dir, c.download_dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn service_default_config_compares_directories() {
+        let exe = Path::new(if cfg!(windows) {
+            r"C:\nonexistent-bop\app"
+        } else {
+            "/nonexistent-bop/app"
+        });
+        let c = service_default_config(exe, exe);
+        assert_eq!((c.download_dir, c.cache_dir.as_str()), (None, "cache"));
+        let other = exe.parent().unwrap().join("data");
+        let c = service_default_config(&other, exe);
+        assert_eq!(c.download_dir.as_deref(), Some(other.as_path()));
+        assert_eq!(c.log_path, Some(other.join("logs")));
+        assert_eq!(c.log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn service_config_arg_parses_both_spellings() {
+        let exe = Path::new(if cfg!(windows) { r"C:\bop" } else { "/bop" });
+        let abs = if cfg!(windows) {
+            r"D:\data\cfg.json"
+        } else {
+            "/data/cfg.json"
+        };
+        let none: [&str; 0] = [];
+        assert_eq!(service_config_arg(none, exe).unwrap(), None);
+        assert_eq!(service_config_arg(["--version"], exe).unwrap(), None);
+        assert_eq!(
+            service_config_arg(["--config", abs], exe).unwrap(),
+            Some(PathBuf::from(abs))
+        );
+        assert_eq!(
+            service_config_arg([format!("--config={abs}")], exe).unwrap(),
+            Some(PathBuf::from(abs))
+        );
+        // Relative paths resolve against the exe dir (the service cwd is System32).
+        assert_eq!(
+            service_config_arg(["-V", "--config", "conf/c.json"], exe).unwrap(),
+            Some(exe.join("conf/c.json"))
+        );
+        assert_eq!(
+            service_config_arg(["--config=c.json", "--other"], exe).unwrap(),
+            Some(exe.join("c.json"))
+        );
+        // A path with spaces arrives as one argument.
+        assert_eq!(
+            service_config_arg(["--config", "my dir/c.json"], exe).unwrap(),
+            Some(exe.join("my dir/c.json"))
+        );
+        // `--configx` is not the flag.
+        assert_eq!(service_config_arg(["--configx=a"], exe).unwrap(), None);
+        for bad in [
+            vec!["--config"],
+            vec!["--config="],
+            vec!["--config", ""],
+            vec!["--config", "a", "--config=b"],
+        ] {
+            let e = service_config_arg(bad.clone(), exe)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("--config"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Stop and disable on removal (not on upgrade: postinst try-restarts).
+set -e
+case "$1" in
+  remove | deconfigure)
+    /opt/blue-onyx-prism/scripts/pkg_scriptlet.sh pre-remove
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

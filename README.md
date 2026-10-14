@@ -170,6 +170,43 @@ blue-onyx-prism fetch --all-for-platform  # everything for this OS/arch (large o
   config entry pointing at such a file that is not exported yet (or is outdated, like the earlier
   `rfdetr-large` download) shows "needs export"; nothing is exported automatically.
 
+## Install with an installer
+
+Each [release](https://github.com/patrickgods1/blue-onyx-prism/releases) also ships native
+installers that register the background service. They are small: the service downloads OpenVINO,
+ONNX Runtime and the default model on its first start (`auto_download`), so the machine needs
+internet access the first time, and the web UI shows the download progress.
+
+| OS | File | Program | Config and data |
+|---|---|---|---|
+| Windows 10/11 x64 | `blue-onyx-prism-<version>-windows-x86_64.msi` | `C:\Program Files\Blue Onyx Prism` | `C:\ProgramData\BlueOnyxPrism` |
+| Debian / Ubuntu 22.04+ | `blue-onyx-prism_<version>-1_amd64.deb` | `/opt/blue-onyx-prism` | `/var/lib/blue-onyx-prism` |
+| Fedora / RHEL 9+ | `blue-onyx-prism-<version>-1.x86_64.rpm` | `/opt/blue-onyx-prism` | `/var/lib/blue-onyx-prism` |
+| macOS (Apple silicon) | `blue-onyx-prism-<version>-macos-aarch64.pkg` | `/usr/local/blue-onyx-prism` | `/usr/local/var/blue-onyx-prism` |
+
+After installing, open `http://127.0.0.1:32168/`. The installers are not code-signed yet:
+
+- **Windows:** SmartScreen may show "Windows protected your PC". Click *More info*, then *Run anyway*.
+  The MSI installs the `BlueOnyxPrismService` service (runs as Local Service, starts automatically),
+  a firewall rule for TCP 32168 (`msiexec /i <file>.msi PORT=<n>` for another port's rule), and a
+  Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn`. Uninstall from
+  *Settings > Apps*. `C:\ProgramData\BlueOnyxPrism` (config, downloads, logs) is kept; delete it by
+  hand to remove everything. If you installed the service earlier with `scripts\install_service.ps1`,
+  run `scripts\uninstall_service.ps1` first; the MSI refuses to install over it. The console
+  `blue-onyx-prism.exe` in Program Files still looks for a config next to itself, so pass
+  `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json` to work on the
+  service's config (stop the service first).
+- **Linux:** `sudo apt install ./blue-onyx-prism_*.deb` or `sudo dnf install ./blue-onyx-prism-*.rpm`.
+  The package creates the `blueonyx` user and enables `blue-onyx-prism.service`. `apt remove` keeps
+  the data, `apt purge` removes it and the user; `dnf remove` keeps the data.
+- **macOS:** macOS blocks the unsigned package on first open. Open *System Settings > Privacy &
+  Security*, click *Open Anyway* next to the message about the package, and run it again. Uninstall
+  with `sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh` (add `--purge` to also delete
+  the data, logs and the `_blueonyx` account), then `sudo rm -rf /usr/local/blue-onyx-prism`.
+
+Every installer has a `.sha256` file and a build attestation (`gh attestation verify <file> --repo
+patrickgods1/blue-onyx-prism`). The archives below remain the portable option.
+
 ## Quick start
 
 Download the archive for your OS from the [releases page](https://github.com/patrickgods1/blue-onyx-prism/releases)

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Installer preinstall: stop the running daemon so its files can be replaced (upgrade).
+launchctl bootout system/com.blueonyx.prism >/dev/null 2>&1 || true
+exit 0

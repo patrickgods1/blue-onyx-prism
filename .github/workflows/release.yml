@@ -2,6 +2,8 @@
 # - Update `version` in Cargo.toml and merge to main
 # - git tag X.Y.Z && git push origin X.Y.Z
 # - Edit the draft release created by this workflow and publish it
+# Each build job also builds its native installers (packaging/: MSI, deb + rpm, pkg), installs,
+# checks and uninstalls them on the runner, and uploads them next to the archive.
 # (workflow_dispatch builds the archives and creates a draft for the Cargo.toml version, without a tag.
 #  It refuses to run when the tag X.Y.Z already exists: the archives would be built from main HEAD,
 #  not the tagged commit. Any run refuses when a published release X.Y.Z exists, so published
@@ -37,7 +39,9 @@ jobs:
             label: windows-x86_64
             ext: zip
             ort_flavor: directml
-          - os: ubuntu-latest
+          # 22.04, not latest: the binaries (and the deb/rpm) need the build runner's glibc or
+          # newer, and 2.35 covers Ubuntu 22.04+, Debian 12 and RHEL 9.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
             ext: tar.gz
@@ -126,15 +130,42 @@ jobs:
           fi
           cat "$NAME.${{ matrix.ext }}.sha256"
 
+      # The installers do not bundle OpenVINO / ONNX Runtime: the service downloads them on first
+      # start. Unsigned for now (packaging/build-installers.sh marks where signing goes).
+      - name: Build installers
+        shell: bash
+        run: packaging/build-installers.sh ${{ matrix.target }} dist
+
+      - name: Smoke-test installers (install, check the service answers, uninstall)
+        shell: bash
+        working-directory: dist
+        run: ../packaging/smoke-test-installers.sh .
+
+      - name: Upload installer logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer-logs-${{ matrix.label }}
+          path: dist/*.log
+          if-no-files-found: ignore
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.NAME }}
           path: |
             dist/${{ env.NAME }}.${{ matrix.ext }}
             dist/${{ env.NAME }}.${{ matrix.ext }}.sha256
+            dist/*.msi
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg
+            dist/*.msi.sha256
+            dist/*.deb.sha256
+            dist/*.rpm.sha256
+            dist/*.pkg.sha256
           if-no-files-found: error
 
-  # Build provenance (SLSA, signed through GitHub's OIDC token) for every archive, so a user can
+  # Build provenance (SLSA, signed through GitHub's OIDC token) for every archive and installer, so a user can
   # check a download with `gh attestation verify <file> --repo <owner/repo>` (docs/RELEASE_CHECKLIST.md).
   attest:
     name: attest build provenance
@@ -155,6 +186,10 @@ jobs:
           subject-path: |
             artifacts/*.zip
             artifacts/*.tar.gz
+            artifacts/*.msi
+            artifacts/*.deb
+            artifacts/*.rpm
+            artifacts/*.pkg
 
   release:
     name: draft release

@@ -5,7 +5,8 @@
 # Unloads the daemon and removes its plist and newsyslog entry. The program dir (e.g.
 # /usr/local/blue-onyx-prism) is left alone: delete it yourself. The data root
 # /usr/local/var/blue-onyx-prism, the logs in /var/log/blue-onyx-prism and the role account
-# _blueonyx are kept unless --purge is given.
+# _blueonyx are kept unless --purge is given. Never prompts, so it runs unattended (CI, scripts).
+# Also works from the .pkg install (/usr/local/blue-onyx-prism/scripts); it needs no other file.
 set -euo pipefail
 
 DATA_DIR=/usr/local/var/blue-onyx-prism
@@ -30,6 +31,12 @@ if launchctl print system/com.blueonyx.prism >/dev/null 2>&1; then
 fi
 rm -f "$PLIST_DST" "$NEWSYSLOG_CONF"
 echo "Removed the com.blueonyx.prism daemon."
+
+# Installed from the .pkg: drop the installer receipt so a later install is not seen as an upgrade.
+if pkgutil --pkg-info com.blueonyx.prism >/dev/null 2>&1; then
+  pkgutil --forget com.blueonyx.prism >/dev/null
+  echo "Forgot the installer receipt com.blueonyx.prism."
+fi
 
 if [ "$PURGE" -eq 1 ]; then
   rm -rf "$DATA_DIR" "$LOG_DIR"

@@ -1,0 +1,4 @@
+# Service user of the blue-onyx-prism package; render/video give /dev/dri access (Intel/AMD GPU).
+u blueonyx - "Blue Onyx Prism" /var/lib/blue-onyx-prism
+m blueonyx render
+m blueonyx video
