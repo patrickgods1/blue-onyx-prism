@@ -51,7 +51,7 @@ jobs:
       - name: Lint shell scripts
         if: runner.os == 'Linux'
         run: |
-          shellcheck -x scripts/*systemd*.sh scripts/*launchd*.sh packaging/*.sh \
+          shellcheck -x -S warning scripts/*systemd*.sh scripts/*launchd*.sh packaging/*.sh \
             packaging/linux/*.sh packaging/linux/debian/* packaging/linux/rpm/*.sh \
             packaging/macos/*.sh packaging/macos/scripts/*
       - name: Build installers

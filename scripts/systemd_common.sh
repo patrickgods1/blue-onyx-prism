@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # Shared helpers for the systemd install flows: scripts/install_systemd.sh (release archive) and
 # the .deb / .rpm maintainer scripts (packaging/linux/). Sourced, never executed. POSIX sh only
 # (Debian's /bin/sh is dash); the caller sets its own `set -eu` and must be root.
