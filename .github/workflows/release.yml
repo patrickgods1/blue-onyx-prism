@@ -111,10 +111,11 @@ jobs:
           # ONNX Runtime, DirectML, the embedded font and the Rust crates in the binaries.
           cp README.md LICENSE THIRD_PARTY_LICENSES.md "$STAGE/"
           mkdir -p "$STAGE/models"
-          "$OUT/blue-onyx-prism" setup-openvino --dest "$STAGE/openvino"
+          # Downloads retry (scripts/ci/retry.sh): the CLI fails fast on a network error by design.
+          scripts/ci/retry.sh 4 20 "$OUT/blue-onyx-prism" setup-openvino --dest "$STAGE/openvino"
           # Default ONNX Runtime flavor per OS (default features build the `ort` backend, load-dynamic).
           # NVIDIA users run `setup-onnxruntime --flavor cuda` to swap it.
-          "$OUT/blue-onyx-prism" setup-onnxruntime --flavor ${{ matrix.ort_flavor }} --dir "$STAGE/onnxruntime"
+          scripts/ci/retry.sh 4 20 "$OUT/blue-onyx-prism" setup-onnxruntime --flavor ${{ matrix.ort_flavor }} --dir "$STAGE/onnxruntime"
           find "$STAGE" -maxdepth 2 | sort
 
       - name: Archive
