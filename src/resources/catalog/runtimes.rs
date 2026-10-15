@@ -70,14 +70,17 @@ pub(crate) static OPENVINO: &[Resource] = &[
         )],
         OV_GPU_CPU,
     ),
+    // The RHEL 8 build: it needs glibc 2.27 and GLIBCXX_3.4.22 at most, so it loads on every
+    // distribution the deb/rpm support (Ubuntu 22.04+, Debian 12, RHEL 9+). The ubuntu24 build
+    // needs glibc 2.38 and fails to load there (the service then exits at every start).
     openvino(
         Platform::LINUX_X64,
         &[ov_part!(
             "linux",
-            "openvino_toolkit_ubuntu24_2026.4.0.22959.99c81491cc3_x86_64.tgz",
+            "openvino_toolkit_rhel8_2026.4.0.22959.99c81491cc3_x86_64.tgz",
             ArchiveKind::TarGz,
-            "0bd86d578beb1e8805655f593315c69bf909008e212f801ed76e3a350927736f",
-            120557925
+            "70e40134514d54b291b557ad26f85cc0ad554587ba49686285fee1e0cee8ab79",
+            80635452
         )],
         OV_GPU_CPU,
     ),

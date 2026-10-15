@@ -46,6 +46,20 @@ for _ in $(seq 1 120); do
 done
 case "$code" in 200 | 503) echo "status endpoint answered $code" ;; *) fail "/v1/status answered '$code'" ;; esac
 
+# Answering is not enough: the service must load the runtime it downloads and serve. A runtime
+# that cannot load (e.g. one built for a newer glibc) makes it exit and restart at every start,
+# while HTTP still answers between restarts.
+echo "== waiting until the service is ready (runtime + model downloaded, model compiled)"
+for _ in $(seq 1 180); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:32168/v1/status || true)"
+  [ "$code" = 200 ] && break
+  sleep 2
+done
+[ "$code" = 200 ] || fail "/v1/status not ready (200) within 6 min, last answer '$code'"
+restarts="$(systemctl show -p NRestarts --value "$UNIT")"
+[ "$restarts" = 0 ] || fail "the service restarted $restarts times"
+echo "service ready, no restarts"
+
 sudo test -f "$CONFIG" || fail "config $CONFIG missing"
 [ "$(sudo stat -c %U:%G "$CONFIG")" = blueonyx:blueonyx ] || fail "config not owned by blueonyx"
 sudo grep -q '"download_dir"' "$CONFIG" || fail "config lacks download_dir"

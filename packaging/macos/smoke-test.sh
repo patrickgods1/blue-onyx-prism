@@ -26,6 +26,18 @@ for _ in $(seq 1 60); do
 done
 case "$code" in 200 | 503) echo "/v1/status answered $code" ;; *) fail "/v1/status answered $code within 120 s" ;; esac
 
+# Ready means the downloaded runtime loads and the model serves; launchd must not have had to
+# restart the daemon (KeepAlive would hide a crash loop behind an answering port).
+for _ in $(seq 1 180); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:32168/v1/status || true)"
+  [ "$code" = 200 ] && break
+  sleep 2
+done
+[ "$code" = 200 ] || fail "/v1/status not ready (200) within 6 min, last answer $code"
+runs="$(sudo launchctl print system/com.blueonyx.prism | awk '/^\truns = / { print $3 }')"
+[ "$runs" = 1 ] || fail "the daemon was started $runs times (expected 1)"
+echo "daemon ready, started once"
+
 [ -d "$APP" ] || fail "$APP missing"
 codesign --verify --strict "$APP" || fail "$APP has an invalid signature"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = com.blueonyx.prism.uninstaller ] \
