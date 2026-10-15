@@ -507,6 +507,9 @@ pub fn run_server_with(
     // ONNX Runtime flavor loaded by an earlier generation (fixed for the process).
     let mut loaded_ort: Option<crate::resources::catalog::Flavor> = None;
     let mut adopt: Option<&'static str> = None;
+    // The store revision `config` was read at: a config saved while the next generation is being
+    // built is newer, and wins over `config` (see `ConfigStore::adopt`).
+    let mut based_on = process.store.revision();
     let mut first = true;
     loop {
         if !first {
@@ -552,10 +555,16 @@ pub fn run_server_with(
         let supervisor = crate::supervisor::spawn(Arc::downgrade(&state), generation.clone());
         // The store's generation (and adopted config) changes together with the swap, so pages
         // waiting for the restart see the new generation's models.
-        if !first {
-            process
-                .store
-                .adopt(adopt.map(|_| config.clone()), adopt.unwrap_or("restart"));
+        let restarted = !first;
+        if restarted {
+            process.store.adopt(
+                adopt.map(|_| config.clone()),
+                adopt.unwrap_or("restart"),
+                based_on,
+            );
+            // A config saved while this generation was built went to the previous one: apply it
+            // here too before serving, so a model switched off meanwhile never answers again.
+            server::apply_config(&state);
         }
         first = false;
         adopt = None;
@@ -571,6 +580,11 @@ pub fn run_server_with(
             return run.finish(Err(e));
         }
         run.retire_old();
+        if restarted {
+            // Saves that reached the previous generation while it drained (after the apply
+            // above): the previous generation is gone now, so this is the last one to catch.
+            server::apply_config(&state);
+        }
         let current = Generation {
             state,
             registry,
@@ -608,10 +622,12 @@ pub fn run_server_with(
 
         if resources_restart.load(Ordering::SeqCst) {
             info!("restarting the registry to load downloaded resources");
-            let next = config_for_resources_restart(&process.store);
+            let (revision, next) = config_for_resources_restart(&process.store);
+            based_on = revision;
             previous = Some(std::mem::replace(&mut config, next));
             continue;
         }
+        based_on = process.store.revision();
         let next = process.reload_config(&config);
         previous = Some(std::mem::replace(&mut config, next));
         adopt = Some("restart (config file reloaded)");
@@ -623,8 +639,8 @@ pub fn run_server_with(
 /// config the generation started with. Starting from that one served models the user had
 /// disabled (and dropped other live changes) until the next config sync, which only the web
 /// pages trigger.
-fn config_for_resources_restart(store: &crate::config_store::ConfigStore) -> Config {
-    store.snapshot().1
+fn config_for_resources_restart(store: &crate::config_store::ConfigStore) -> (u64, Config) {
+    store.snapshot()
 }
 
 /// The ONNX Runtime flavor `registry` loaded, if any.
@@ -763,7 +779,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let next = config_for_resources_restart(&store);
+        let (revision, next) = config_for_resources_restart(&store);
+        assert_eq!(revision, store.revision());
         let flags: Vec<bool> = next.models.iter().map(|m| m.enabled).collect();
         assert_eq!(flags, [true, false]);
         std::fs::remove_dir_all(&dir).ok();
