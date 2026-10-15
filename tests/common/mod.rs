@@ -414,6 +414,10 @@ impl Server {
     /// Shut down and wait for everything to stop: the HTTP tasks, then the workers (30 s at
     /// most, panics otherwise). In-flight handlers may still hold the registry for a moment
     /// after the listener is gone, so this waits for the last reference instead of assuming it.
+    /// Returns only once the registry is dropped (OpenVINO core, compiled models, preprocess
+    /// pool): a test that ends while another thread still releases them races the process's
+    /// exit handlers, which destroy the runtime libraries' globals (SIGSEGV after every test
+    /// passed, mostly with OpenVINO's RHEL 8 build).
     pub async fn stop(self) {
         self.token.cancel();
         match self.mode {
@@ -443,12 +447,15 @@ impl Server {
                     }
                 };
                 let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
+                let stopper = std::thread::spawn(move || {
                     reg.shutdown();
+                    // Before signalling, so nothing of the registry outlives `stop`.
+                    drop(reg);
                     let _ = tx.send(());
                 });
                 rx.recv_timeout(Duration::from_secs(30))
                     .expect("workers did not stop after the shutdown token was cancelled");
+                stopper.join().expect("registry shutdown thread panicked");
             }
         }
     }
