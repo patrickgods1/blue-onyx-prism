@@ -10,6 +10,7 @@ on:
       - "scripts/*systemd*"
       - "scripts/*launchd*"
       - "src/bin/blue_onyx_prism_service.rs"
+      - "src/bin/blue_onyx_prism_tray.rs"
       - "Cargo.toml"
       - ".github/workflows/packaging.yml"
       - ".github/workflows/release.yml"

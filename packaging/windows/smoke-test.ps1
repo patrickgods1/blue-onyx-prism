@@ -80,6 +80,18 @@ if (-not (Get-NetFirewallRule -DisplayName "Blue Onyx Prism ($Port)" -ErrorActio
     Fail "firewall rule 'Blue Onyx Prism ($Port)' missing after install" @($InstallLog)
 }
 
+# Tray: exe, start-at-login Run value, Start Menu shortcut (the tray itself is not run: no desktop session in CI).
+$TrayExe = Join-Path ${env:ProgramFiles} "Blue Onyx Prism\blue-onyx-prism-tray.exe"
+$RunKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+$StartMenu = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Blue Onyx Prism"
+if (-not (Test-Path $TrayExe)) { Fail "$TrayExe missing after install" @($InstallLog) }
+$run = (Get-ItemProperty -Path $RunKey -Name BlueOnyxPrismTray -ErrorAction SilentlyContinue).BlueOnyxPrismTray
+if (-not $run) { Fail "Run value BlueOnyxPrismTray missing after install" @($InstallLog) }
+if ($run -ne "`"$TrayExe`"") { Fail "Run value is '$run', expected '`"$TrayExe`"'" @($InstallLog) }
+if (-not (Test-Path (Join-Path $StartMenu "Blue Onyx Prism.lnk"))) { Fail "Start Menu shortcut 'Blue Onyx Prism' missing" @($InstallLog) }
+if (-not (Get-ChildItem -Path $StartMenu -Filter "Blue Onyx Prism Web UI*" -ErrorAction SilentlyContinue)) { Fail "Start Menu shortcut 'Blue Onyx Prism Web UI' missing" @($InstallLog) }
+Write-Host "Tray exe, Run value and Start Menu shortcuts present."
+
 # --- uninstall ----------------------------------------------------------------------------------
 Write-Host "Uninstalling ..."
 $rc = Run-Msiexec @("/x", "`"$Msi`"", "/qn", "/l*v", "`"$UninstallLog`"")
@@ -91,6 +103,9 @@ if (Get-Service $Service -ErrorAction SilentlyContinue) { Fail "service $Service
 if (Get-NetFirewallRule -DisplayName "Blue Onyx Prism ($Port)" -ErrorAction SilentlyContinue) {
     Fail "firewall rule 'Blue Onyx Prism ($Port)' still present after uninstall" @($UninstallLog)
 }
+if (Test-Path $TrayExe) { Fail "$TrayExe still present after uninstall" @($UninstallLog) }
+if (Get-ItemProperty -Path $RunKey -Name BlueOnyxPrismTray -ErrorAction SilentlyContinue) { Fail "Run value BlueOnyxPrismTray still present after uninstall" @($UninstallLog) }
+if (Test-Path $StartMenu) { Fail "Start Menu folder $StartMenu still present after uninstall" @($UninstallLog) }
 if (-not (Test-Path $DataDir)) { Fail "$DataDir was removed by the uninstall (must be kept)" @($UninstallLog) }
 
-Write-Host "SMOKE TEST PASSED (service, firewall rule and data folder behave as expected)."
+Write-Host "SMOKE TEST PASSED (service, firewall rule, tray and data folder behave as expected)."

@@ -84,7 +84,7 @@ jobs:
           STAGE="dist/$NAME"
           mkdir -p "$STAGE/scripts"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            for b in blue-onyx-prism blue-onyx-prism-service blue-onyx-prism-benchmark test-blue-onyx-prism; do
+            for b in blue-onyx-prism blue-onyx-prism-service blue-onyx-prism-tray blue-onyx-prism-benchmark test-blue-onyx-prism; do
               cp "$OUT/$b.exe" "$STAGE/"
             done
             cp scripts/*.ps1 "$STAGE/scripts/"
@@ -93,13 +93,17 @@ jobs:
             for b in blue-onyx-prism blue-onyx-prism-benchmark test-blue-onyx-prism; do
               cp "$OUT/$b" "$STAGE/"
             done
+            # The tray / menu bar app is for Windows and macOS only (a stub on Linux).
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              cp "$OUT/blue-onyx-prism-tray" "$STAGE/"
+            fi
             cp scripts/*.sh "$STAGE/scripts/"
             chmod +x "$STAGE"/blue-onyx-prism* "$STAGE"/test-blue-onyx-prism "$STAGE"/scripts/*.sh
             mkdir -p "$STAGE/deploy"
             if [ "$RUNNER_OS" = "Linux" ]; then
               cp deploy/blue-onyx-prism.service "$STAGE/deploy/"
             else
-              cp deploy/com.blueonyx.prism.plist "$STAGE/deploy/"
+              cp deploy/com.blueonyx.prism.plist deploy/com.blueonyx.prism.tray.plist "$STAGE/deploy/"
             fi
           fi
           cp scripts/export_model.py scripts/convert_onnx_to_ir.py scripts/requirements-export.txt "$STAGE/scripts/"

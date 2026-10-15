@@ -21,6 +21,10 @@ name = "blue-onyx-prism-service"
 path = "src/bin/blue_onyx_prism_service.rs"
 
 [[bin]]
+name = "blue-onyx-prism-tray"
+path = "src/bin/blue_onyx_prism_tray.rs"
+
+[[bin]]
 name = "blue-onyx-prism-benchmark"
 path = "src/bin/blue_onyx_prism_benchmark.rs"
 
@@ -95,6 +99,12 @@ raw-cpuid = "11"
 windows-service = "0.8"
 tracing-layer-win-eventlog = "1"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_System_LibraryLoader", "Win32_Security", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+# The tray / menu bar app (`blue-onyx-prism-tray`, src/tray/): Windows and macOS only (Blue Iris
+# Linux hosts are headless; systemctl is the control there).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = "0.26"
+tao = "0.37"
 
 [target.'cfg(unix)'.dependencies]
 # `setpriority` for low-priority CLI benchmarks (`backend::priority`).

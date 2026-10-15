@@ -54,6 +54,38 @@ fn main() -> ExitCode {
     code
 }
 
+/// `service start|stop|restart|status`: prints the resulting state. The exit code (`Ok`) is
+/// 0, or for `status` 3 when the service is not running (like `systemctl status`); start and
+/// restart that did not reach "running" in time also give 3, stop that did not stop gives 1.
+fn service_command(cmd: cli::ServiceCommand) -> Result<i32> {
+    use blue_onyx_prism::service_ctl::{self, Action, ServiceState};
+    let action = match cmd {
+        cli::ServiceCommand::Status => {
+            let state = service_ctl::query()?;
+            println!("Blue Onyx Prism service: {}", state.label());
+            return Ok(if state == ServiceState::Running { 0 } else { 3 });
+        }
+        cli::ServiceCommand::Start => Action::Start,
+        cli::ServiceCommand::Stop => Action::Stop,
+        cli::ServiceCommand::Restart => Action::Restart,
+    };
+    let state = service_ctl::control(action)?;
+    println!("Blue Onyx Prism service: {}", state.label());
+    let reached = match action {
+        Action::Stop => state == ServiceState::Stopped,
+        Action::Start | Action::Restart => state == ServiceState::Running,
+    };
+    if !reached {
+        eprintln!(
+            "warning: the service did not reach the expected state yet; check again with \
+             `blue-onyx-prism service status` and see the service log if it stays {}",
+            state.label()
+        );
+        return Ok(if action == Action::Stop { 1 } else { 3 });
+    }
+    Ok(0)
+}
+
 /// `--config` or the default config path.
 fn config_path(cli: &Cli) -> PathBuf {
     cli.config
@@ -363,6 +395,13 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::ListDevices { model }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
             list_devices(&cli, &model)?;
+            return Ok(());
+        }
+        Some(Command::Service { action }) => {
+            let code = service_command(action)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
             return Ok(());
         }
         None => {}
