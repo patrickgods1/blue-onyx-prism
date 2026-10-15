@@ -190,15 +190,17 @@ After installing, open `http://127.0.0.1:32168/`. The installers are not code-si
   The MSI installs the `BlueOnyxPrismService` service (runs as Local Service, starts automatically),
   a firewall rule for TCP 32168 (`msiexec /i <file>.msi PORT=<n>` for another port's rule), and a
   Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn`. Uninstall from
-  *Settings > Apps*. `C:\ProgramData\BlueOnyxPrism` (config, downloads, logs) is kept; delete it by
-  hand to remove everything. If you installed the service earlier with `scripts\install_service.ps1`,
+  *Settings > Apps*: it removes everything, including `C:\ProgramData\BlueOnyxPrism` (config,
+  downloads, logs); to keep that folder for a reinstall, uninstall with
+  `msiexec /x <file>.msi KEEPDATA=1` instead. Upgrading to a newer MSI always keeps it. If you installed the service earlier with `scripts\install_service.ps1`,
   run `scripts\uninstall_service.ps1` first; the MSI refuses to install over it. The console
   `blue-onyx-prism.exe` in Program Files still looks for a config next to itself, so pass
   `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json` to work on the
   service's config (stop the service first).
 - **Linux:** `sudo apt install ./blue-onyx-prism_*.deb` or `sudo dnf install ./blue-onyx-prism-*.rpm`.
   The package creates the `blueonyx` user and enables `blue-onyx-prism.service`. `apt remove` keeps
-  the data, `apt purge` removes it and the user; `dnf remove` keeps the data.
+  the data and the user for a reinstall, `apt purge` removes everything; `dnf remove` removes
+  everything (RPM has no purge).
 - **macOS:** macOS blocks the unsigned package on first open. Open *System Settings > Privacy &
   Security*, click *Open Anyway* next to the message about the package, and run it again. To
   uninstall, open *Uninstall Blue Onyx Prism* in *Applications*: choose *Keep My Data* (config,

@@ -28,6 +28,10 @@ Files:
   twice (`#DEBHELPER#` stays in the scripts but expands to nothing).
 
 Behavior: config is never overwritten; install enables and starts, upgrade only `try-restart`s;
-removal stops and disables (not on upgrade). `apt purge` deletes `/var/lib/blue-onyx-prism` and the
-user (like `uninstall_systemd.sh --purge`). RPM has no purge: erase keeps data and user.
+removal stops and disables (not on upgrade). `apt remove` also deletes what the program created in
+`/opt/blue-onyx-prism` and keeps `/var/lib/blue-onyx-prism` and the user for a reinstall; `apt purge`
+deletes those too (like `uninstall_systemd.sh --purge`). RPM has no purge, so an erase (`dnf remove`,
+not an upgrade) leaves nothing behind: `/opt/blue-onyx-prism`, `/var/lib/blue-onyx-prism` and the user
+and group. `smoke-test.sh` checks both, the RPM in a Fedora container, and searches the filesystem for
+leftovers (names and files owned by the deleted user).
 Scriptlets skip `systemctl` when systemd is not running (containers, chroots).

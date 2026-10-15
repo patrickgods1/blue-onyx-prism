@@ -21,8 +21,10 @@
     <Icon Id="AppIcon.ico" SourceFile="$(var.RepoRoot)\assets\favicon.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
 
-    <!-- Public properties (msiexec /i blue-onyx-prism.msi PORT=32169). -->
+    <!-- Public properties (msiexec /i blue-onyx-prism.msi PORT=32169). KEEPDATA=1 on uninstall
+         (msiexec /x blue-onyx-prism.msi KEEPDATA=1) keeps C:\ProgramData\BlueOnyxPrism. -->
     <Property Id="PORT" Value="32168" Secure="yes" />
+    <Property Id="KEEPDATA" Secure="yes" />
 
     <!-- Block when the service was installed by scripts\install_service.ps1 (no MSI marker value),
          but never block an upgrade/repair/uninstall of this MSI. -->
@@ -61,8 +63,27 @@
                   Directory="INSTALLFOLDER"
                   ExeCommand="&quot;[System64Folder]sc.exe&quot; failure BlueOnyxPrismService reset= 3600 actions= restart/5000/restart/30000/restart/120000"
                   Execute="deferred" Impersonate="no" Return="check" />
+    <!-- A full uninstall (not the removal of the old version during an upgrade) leaves nothing
+         behind: it deletes the data folder (config, downloaded runtimes and models, cache, logs,
+         tools) unless KEEPDATA is set, and the program folder with whatever the program created
+         in it (e.g. a config or downloads of the console exe run from there) when it is the
+         default folder. A folder the user picked may hold other files: there only the MSI's own
+         files go. Return="ignore": a file that cannot be deleted never blocks the uninstall. -->
+    <SetProperty Id="BOP_DEFAULT_INSTALLFOLDER" Value="[ProgramFiles64Folder]Blue Onyx Prism\" After="CostFinalize" Sequence="execute" />
+    <CustomAction Id="RemoveProgramFolder"
+                  Directory="CommonAppDataFolder"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c rmdir /s /q &quot;[INSTALLFOLDER]&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RemoveDataFolder"
+                  Directory="CommonAppDataFolder"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c rmdir /s /q &quot;[CommonAppDataFolder]BlueOnyxPrism&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="SetServiceFailureActions" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveProgramFolder" After="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND INSTALLFOLDER ~= BOP_DEFAULT_INSTALLFOLDER" />
+      <Custom Action="RemoveDataFolder" After="RemoveProgramFolder"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT KEEPDATA" />
     </InstallExecuteSequence>
 
     <!-- Program files and the service -->
@@ -121,10 +142,12 @@
       <!-- Marks the service as owned by this MSI (see the launch condition above). -->
       <Component Id="InstallMarkerComponent" Bitness="always64">
         <RegistryValue Root="HKLM" Key="SOFTWARE\BlueOnyxPrism" Name="Installer" Type="string" Value="[ProductVersion]" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="SOFTWARE\BlueOnyxPrism" Action="removeOnUninstall" />
       </Component>
     </ComponentGroup>
 
-    <!-- Data folder: kept on uninstall (config, models, cache, logs). LocalService gets Modify,
+    <!-- Data folder (config, models, cache, logs): Permanent, so an upgrade keeps it; a full
+         uninstall deletes it (RemoveDataFolder above) unless KEEPDATA. LocalService gets Modify,
          Administrators and SYSTEM full control; everything below inherits it. -->
     <ComponentGroup Id="DataFolder" Directory="DATADIR">
       <Component Id="DataDirComponent" Guid="2D8F6A14-5B7C-4E39-A0D1-93C4E7B15F68" Bitness="always64" Permanent="yes">
