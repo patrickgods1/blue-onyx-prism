@@ -352,12 +352,27 @@ impl ConfigStore {
     }
 
     /// Start a new registry generation with `config` (a restart reloaded the file or restored
-    /// the previous config). The in-memory config becomes `config` when `source` is given;
-    /// a difference is logged under `source`.
-    pub fn adopt(&self, config: Option<Config>, source: &str) -> Option<ChangeRecord> {
+    /// the previous config). The in-memory config becomes `config` when one is given and the
+    /// revision is still `based_on` (the revision the generation's config was read at); a
+    /// difference is logged under `source`. A config saved while the generation was being built
+    /// (a newer revision) is kept: the runner applies it to the new generation.
+    pub fn adopt(
+        &self,
+        config: Option<Config>,
+        source: &str,
+        based_on: u64,
+    ) -> Option<ChangeRecord> {
         let mut g = self.lock_write();
         g.generation += 1;
         let mut config = config?;
+        if g.revision != based_on {
+            tracing::info!(
+                revision = g.revision,
+                based_on,
+                "the config was saved while the server restarted; keeping the saved config ({source} not adopted)"
+            );
+            return None;
+        }
         config.normalize();
         let before = std::mem::replace(&mut g.config, config);
         if let Ok(bytes) = std::fs::read(&self.path) {
@@ -559,13 +574,36 @@ mod tests {
         let s = ConfigStore::new(cfg(), path.clone());
         assert_eq!(s.generation(), 1);
         // Resource restart: same config, new generation, no bump.
-        assert!(s.adopt(None, "restart").is_none());
+        assert!(s.adopt(None, "restart", 1).is_none());
         assert_eq!((s.generation(), s.revision()), (2, 1));
         let mut c = cfg();
         c.port = 5000;
-        let rec = s.adopt(Some(c), "restart (config file reloaded)").unwrap();
+        let rec = s
+            .adopt(Some(c), "restart (config file reloaded)", 1)
+            .unwrap();
         assert_eq!(rec.revision, 2);
         assert_eq!(s.generation(), 3);
         assert_eq!(s.read().port, 5000);
+    }
+
+    #[test]
+    fn adopt_keeps_a_config_saved_during_the_restart() {
+        let path = tmp();
+        let s = ConfigStore::new(cfg(), path.clone());
+        // The restart read the config at revision 1; a save lands while it builds.
+        let based_on = s.revision();
+        s.update("test", |c| {
+            c.port = 6000;
+            Ok(())
+        })
+        .unwrap();
+        let mut stale = cfg();
+        stale.port = 5000;
+        assert!(
+            s.adopt(Some(stale), "restart (config file reloaded)", based_on)
+                .is_none()
+        );
+        assert_eq!(s.read().port, 6000);
+        assert_eq!(s.generation(), 2);
     }
 }
