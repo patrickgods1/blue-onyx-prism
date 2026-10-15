@@ -47,18 +47,22 @@ jobs:
         run: cargo test --locked
       - name: Build release (all binaries)
         run: cargo build --locked --release --bins
+      # Downloads retry (scripts/ci/retry.sh): the CLI fails fast on a network error by design.
       - name: Fetch OpenVINO runtime
-        run: cargo run --locked --release -- setup-openvino --dest target/release/openvino
+        shell: bash
+        run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- setup-openvino --dest target/release/openvino
       # IPcam-general detects the test image's car and bicycle as "vehicle", so every smoke run
       # can require at least one prediction with that label (a provider that answers success with
       # no boxes fails).
       - name: Download IPcam-general
-        run: cargo run --locked --release -- download-models --name IPcam-general --dir target/release/models
+        shell: bash
+        run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- download-models --name IPcam-general --dir target/release/models
       # RT-DETRv2 (i64 orig_target_sizes input, stretch preprocessing, the CoreML pinned-batch
       # path): without it the RT-DETR parts of the integration tests are skipped. YOLO26 needs an
       # AGPL export and stays a manual release-checklist step.
       - name: Download RT-DETRv2 small
-        run: cargo run --locked --release -- download-models --name rt-detrv2-s --dir target/release/models
+        shell: bash
+        run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- download-models --name rt-detrv2-s --dir target/release/models
       # Each smoke run uses its own port so a slow shutdown of the previous server cannot collide.
       # scripts/ci/smoke.sh <bin> <client> <port> <provider substring> <server args...>
       # MODEL_NAME / EXPECT_LABEL are set for the whole job below.
@@ -73,7 +77,8 @@ jobs:
             --model target/release/models/IPcam-general.onnx --family yolo5 --force-cpu \
             --cache-dir target/release/cache
       - name: Fetch ONNX Runtime (CPU)
-        run: cargo run --locked --release -- setup-onnxruntime --flavor cpu --dir target/release/onnxruntime
+        shell: bash
+        run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- setup-onnxruntime --flavor cpu --dir target/release/onnxruntime
       # The ignored tests need models/, openvino/ and onnxruntime/ (flat, as `--dir` installs it) under
       # BLUE_ONYX_TEST_ROOT, which is where the steps above installed them. A missing fixture fails
       # the test. They run on the debug test binaries (reusing the cargo cache); the runtime is found
@@ -109,7 +114,8 @@ jobs:
       - name: Fetch ONNX Runtime (DirectML)
         if: runner.os == 'Windows'
         continue-on-error: true
-        run: cargo run --locked --release -- setup-onnxruntime --flavor directml --dir target/release/onnxruntime-directml
+        shell: bash
+        run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- setup-onnxruntime --flavor directml --dir target/release/onnxruntime-directml
       - name: Smoke test (ONNX Runtime DirectML, WARP)
         if: runner.os == 'Windows'
         continue-on-error: true
