@@ -25,4 +25,6 @@ bop_install_newsyslog
 bop_seed_config
 bop_install_plist "$PLIST_DST"
 bop_bootstrap
+# The menu bar app for the logged-in user (never fails the install).
+bop_tray_start
 exit 0

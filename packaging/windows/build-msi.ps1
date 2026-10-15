@@ -4,7 +4,8 @@
 .PARAMETER Version
     Numeric MSI version, x.y.z or x.y.z.w (strip any "v" prefix and pre-release suffix first).
 .PARAMETER BinDir
-    Folder with blue-onyx-prism-service.exe, blue-onyx-prism.exe and blue-onyx-prism-benchmark.exe.
+    Folder with blue-onyx-prism-service.exe, blue-onyx-prism.exe, blue-onyx-prism-tray.exe and
+    blue-onyx-prism-benchmark.exe.
 .PARAMETER OutFile
     Path of the .msi to write.
 .PARAMETER RepoRoot
@@ -27,7 +28,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
 }
 $BinDir = (Resolve-Path $BinDir).Path.TrimEnd('\')
 $RepoRoot = (Resolve-Path $RepoRoot).Path.TrimEnd('\')
-foreach ($f in "blue-onyx-prism-service.exe", "blue-onyx-prism.exe", "blue-onyx-prism-benchmark.exe") {
+foreach ($f in "blue-onyx-prism-service.exe", "blue-onyx-prism.exe", "blue-onyx-prism-tray.exe", "blue-onyx-prism-benchmark.exe") {
     if (-not (Test-Path (Join-Path $BinDir $f))) { throw "$f not found in $BinDir" }
 }
 

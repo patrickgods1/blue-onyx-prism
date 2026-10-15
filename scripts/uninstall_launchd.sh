@@ -4,7 +4,7 @@
 #
 # Unloads the daemon and removes its plist, newsyslog entry, installer receipt, the program dir
 # (the one the daemon ran from, e.g. /usr/local/blue-onyx-prism, including runtimes bundled there)
-# and the "Uninstall Blue Onyx Prism" app. The data root /usr/local/var/blue-onyx-prism (config,
+# the menu bar app ("Blue Onyx Prism" and its LaunchAgent) and the "Uninstall Blue Onyx Prism" app. The data root /usr/local/var/blue-onyx-prism (config,
 # models, downloads), the logs in /var/log/blue-onyx-prism and the role account _blueonyx are kept
 # for a reinstall unless --purge is given. --keep-program leaves the program dir in place. Never
 # prompts, so it runs unattended (CI, scripts, the uninstaller app); it needs no other file.
@@ -17,6 +17,9 @@ LABEL=com.blueonyx.prism
 PLIST_DST="/Library/LaunchDaemons/$LABEL.plist"
 NEWSYSLOG_CONF=/etc/newsyslog.d/blue-onyx-prism.conf
 UNINSTALLER_APP="/Applications/Uninstall Blue Onyx Prism.app"
+TRAY_LABEL=com.blueonyx.prism.tray
+TRAY_PLIST="/Library/LaunchAgents/$TRAY_LABEL.plist"
+TRAY_APP="/Applications/Blue Onyx Prism.app"
 PURGE=0
 KEEP_PROGRAM=0
 for arg in "$@"; do
@@ -66,6 +69,17 @@ echo "Removed the $LABEL daemon."
 if pkgutil --pkg-info "$LABEL" >/dev/null 2>&1; then
   pkgutil --forget "$LABEL" >/dev/null
   echo "Forgot the installer receipt $LABEL."
+fi
+
+# The menu bar app: stop it for the console user, then remove its LaunchAgent and bundle.
+console_uid="$(stat -f %u /dev/console 2>/dev/null || true)"
+if [ -n "$console_uid" ] && [ "$console_uid" != 0 ]; then
+  launchctl bootout "gui/$console_uid/$TRAY_LABEL" >/dev/null 2>&1 || true
+fi
+pkill -x blue-onyx-prism-tray >/dev/null 2>&1 || true
+if [ -e "$TRAY_PLIST" ] || [ -d "$TRAY_APP" ]; then
+  rm -rf "$TRAY_PLIST" "$TRAY_APP"
+  echo "Removed the menu bar app ($TRAY_APP) and its LaunchAgent."
 fi
 
 if [ -d "$UNINSTALLER_APP" ]; then

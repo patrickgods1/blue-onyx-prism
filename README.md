@@ -206,6 +206,13 @@ After installing, open `http://127.0.0.1:32168/`. The installers are not code-si
   Terminal: `sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh` (add `--purge` to also
   delete the data, logs and the `_blueonyx` account).
 
+**Tray / menu bar icon (Windows and macOS).** The Windows and macOS installers also install a small
+icon app that starts at login (Windows: system tray, macOS: menu bar) and shows whether the service is
+running. Its menu has *Start*, *Stop* and *Restart* (each asks for administrator rights: UAC on Windows,
+your password on macOS), *Open Web UI*, and *Quit Tray*, which only closes the icon and leaves the
+service running. To bring it back after quitting, open *Blue Onyx Prism* from the Start Menu (Windows)
+or from *Applications* (macOS). Linux has no tray; use `systemctl`.
+
 Every installer has a `.sha256` file and a build attestation (`gh attestation verify <file> --repo
 patrickgods1/blue-onyx-prism`). The archives below remain the portable option.
 
@@ -717,6 +724,19 @@ detection API (`/v1/vision/*`), `/v1/status`, `/v1/status/updateavailable`, the 
   (or `--bind-address 127.0.0.1`); it applies when the process restarts.
 
 ## Running as a service
+
+Once installed, control the background service with the same binary:
+`blue-onyx-prism service status` prints the state (`running`, `stopped`, `starting`, `stopping`,
+`not installed`) and exits 0 when it is running, 3 otherwise, so scripts can test it. Starting and
+stopping need administrator rights: run `sudo blue-onyx-prism service start|stop|restart` on macOS
+and Linux, or `blue-onyx-prism service start|stop|restart` from an administrator terminal on
+Windows. The command waits until the service has actually started or stopped (up to about a
+minute) and prints the result. It drives the platform's own service manager (the Windows service
+`BlueOnyxPrismService`, the launchd daemon `com.blueonyx.prism`, the systemd unit
+`blue-onyx-prism`), so `sc`/`services.msc`, `launchctl` and `systemctl` keep working as before.
+On macOS `stop` unloads the daemon until the next `start` or reboot; on Linux and Windows the
+service's start type is unchanged, so it starts again at boot. On Windows and macOS the tray /
+menu bar icon (`blue-onyx-prism-tray`) does the same from a menu.
 
 **Windows** (elevated PowerShell, from the extracted archive):
 

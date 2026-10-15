@@ -122,6 +122,26 @@ pub enum Command {
         #[arg(long)]
         model: Vec<PathBuf>,
     },
+    /// Start, stop, restart or query the installed background service (Windows service,
+    /// launchd daemon or systemd unit).
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
+}
+
+/// `blue-onyx-prism service ...`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum ServiceCommand {
+    /// Start the installed background service (needs administrator rights / sudo).
+    Start,
+    /// Stop the installed background service until the next start or reboot (needs
+    /// administrator rights / sudo).
+    Stop,
+    /// Restart the installed background service (needs administrator rights / sudo).
+    Restart,
+    /// Show the service state; exits 0 when running, 3 when stopped or not installed.
+    Status,
 }
 
 /// [`crate::long_version`] as a `&'static str` for clap's `version` (every binary's
@@ -446,7 +466,10 @@ impl Cli {
                 classes: abs(&classes),
             },
             Command::ListModels { dir } => Command::ListModels { dir: abs(&dir) },
-            Command::Fetch { .. } | Command::ListResources { .. } | Command::Benchmark(_) => cmd,
+            Command::Fetch { .. }
+            | Command::ListResources { .. }
+            | Command::Benchmark(_)
+            | Command::Service { .. } => cmd,
             Command::ListDevices { model } => Command::ListDevices {
                 model: model.iter().map(|p| absolutize(p, base)).collect(),
             },

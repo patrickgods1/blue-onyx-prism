@@ -15,12 +15,15 @@ cargo build --release --locked --bins
 
 ## What it installs
 
-- `C:\Program Files\Blue Onyx Prism`: service exe, CLI, benchmark exe, LICENSE, THIRD_PARTY_LICENSES.md, README.md.
+- `C:\Program Files\Blue Onyx Prism`: service exe, CLI, tray exe (`blue-onyx-prism-tray.exe`), benchmark exe, LICENSE, THIRD_PARTY_LICENSES.md, README.md.
 - Service `BlueOnyxPrismService` (auto start, `NT AUTHORITY\LocalService`), started `--config "C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json"`;
   restarts after 5 s / 30 s / 120 s (count reset after 1 h).
 - `C:\ProgramData\BlueOnyxPrism`: config, models, cache, logs; Administrators/SYSTEM full control, LocalService modify.
 - Application event log source `BlueOnyxPrism`, firewall rule `Blue Onyx Prism (<PORT>)` (TCP, any scope, all profiles),
-  Start Menu shortcut to `http://127.0.0.1:32168/`.
+  Start Menu shortcuts "Blue Onyx Prism" (the tray icon app) and "Blue Onyx Prism Web UI" (`http://127.0.0.1:32168/`).
+- Tray app: `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\BlueOnyxPrismTray` starts it at login for every user.
+  A running tray is terminated (WiX `CloseApplication`) before an upgrade or uninstall replaces/removes its exe. The
+  installer does not launch it at the end (it starts at the next login or from the Start Menu).
 
 ## Properties
 
@@ -29,7 +32,7 @@ cargo build --release --locked --bins
 
 ## Uninstall
 
-Removes program files, the service, the firewall rule, the event source and the shortcut. `C:\ProgramData\BlueOnyxPrism`
+Removes program files, the service, the firewall rule, the event source, the Run value and the shortcuts. `C:\ProgramData\BlueOnyxPrism`
 is kept (config, downloaded runtimes, models). Delete it by hand for a clean slate.
 
 ## Coexistence with scripts\install_service.ps1
@@ -40,4 +43,4 @@ The MSI does not change `ServicesPipeTimeout`.
 
 ## CI smoke test
 
-`smoke-test.ps1 -Msi <path> [-Port 32168]` (elevated): installs, checks service/account/HTTP/config, uninstalls, checks cleanup.
+`smoke-test.ps1 -Msi <path> [-Port 32168]` (elevated): installs, checks service/account/HTTP/config and the tray exe, Run value and shortcuts (the tray is not run), uninstalls, checks cleanup.

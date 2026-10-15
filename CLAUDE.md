@@ -24,6 +24,8 @@ cargo run -- --model models/IPcam-general.onnx --family yolo5 --force-cpu
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --device ort:cpu
 cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco-cctv|bmd45-cctv|exdark-night|dir:<p>] [--max-images 20]   # grade models x devices; benchmark.json next to the config
 cargo run -- benchmark --list-datasets       # built-in image sets (assets/bench/*.json, resource bench:<id>)
+cargo run -- service status|start|stop|restart   # control the installed service (start/stop/restart need admin)
+cargo run --bin blue-onyx-prism-tray -- [--port n] [--cli <path>]   # tray / menu bar app (Windows, macOS)
 cargo run -- --version                      # <version> (<git sha>, <build date>): BLUE_ONYX_PRISM_GIT_SHA / _BUILD_DATE at build time (release.yml), `unknown` locally
 cargo build --no-default-features            # OpenVINO-only build (drops the `onnxruntime` feature / `ort`)
 cargo test                                   # unit tests need no OpenVINO
@@ -121,6 +123,12 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `scripts/systemd_common.sh` / `scripts/launchd_common.sh` with the archive install scripts. The pkg also installs
   `/Applications/Uninstall Blue Onyx Prism.app` (`packaging/macos/uninstaller.applescript`, osacompile, not relocatable),
   which only runs `uninstall_launchd.sh` as root; that script removes the program dir too (`--keep-program` to keep it).
+- `src/service_ctl/` queries and starts/stops/restarts the installed service (Windows SCM, `launchctl`, `systemctl`;
+  pure output parsers tested everywhere) for `blue-onyx-prism service ...`. `src/tray/` + `src/bin/blue_onyx_prism_tray.rs`
+  is the tray / menu bar app (tray-icon + tao, Windows and macOS only; pure model/probe/icon/config/elevate parts are
+  tested on every OS): polls `service_ctl::query` and `/v1/status`, and runs `<cli> service <verb>` elevated (UAC via
+  PowerShell `-Verb RunAs`, macOS `osascript ... with administrator privileges`). Installed by the MSI (HKLM Run key,
+  Start Menu) and the pkg (`/Applications/Blue Onyx Prism.app`, LaunchAgent `com.blueonyx.prism.tray`).
 - Windows service in `src/bin/blue_onyx_prism_service.rs` (cfg windows). systemd/launchd/Docker in `deploy/`.
   Install/uninstall scripts in `scripts/` (`uninstall_systemd.sh`, `uninstall_launchd.sh`, `*_service.ps1`); the Docker
   image starts through `deploy/docker-entrypoint.sh` (checks the volumes are writable). `THIRD_PARTY_LICENSES.md` ships in

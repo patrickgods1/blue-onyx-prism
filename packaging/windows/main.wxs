@@ -51,6 +51,10 @@
       <Directory Id="StartMenuDir" Name="Blue Onyx Prism" />
     </StandardDirectory>
 
+    <!-- Close a running tray before its exe is replaced or removed (upgrade, uninstall, repair):
+         the tray has no window to ask, so it is terminated. -->
+    <util:CloseApplication Id="CloseTray" Target="blue-onyx-prism-tray.exe" CloseMessage="no" RebootPrompt="no" TerminateProcess="1" />
+
     <!-- Failure actions: restart after 5 s, 30 s, 120 s; reset the count after an hour. Same as
          install_service.ps1 (the built-in ServiceConfig has a single restart delay only). -->
     <CustomAction Id="SetServiceFailureActions"
@@ -96,6 +100,11 @@
       <Component Id="CliComponent" Bitness="always64">
         <File Id="CliExe" Source="$(var.BinDir)\blue-onyx-prism.exe" KeyPath="yes" />
       </Component>
+      <!-- Tray icon app (GUI subsystem); starts at login for every user through the Run key. -->
+      <Component Id="TrayComponent" Bitness="always64">
+        <File Id="TrayExe" Source="$(var.BinDir)\blue-onyx-prism-tray.exe" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run" Name="BlueOnyxPrismTray" Type="string" Value="&quot;[INSTALLFOLDER]blue-onyx-prism-tray.exe&quot;" />
+      </Component>
       <Component Id="BenchmarkComponent" Bitness="always64">
         <File Id="BenchmarkExe" Source="$(var.BinDir)\blue-onyx-prism-benchmark.exe" KeyPath="yes" />
       </Component>
@@ -129,7 +138,8 @@
 
     <ComponentGroup Id="Shortcuts" Directory="StartMenuDir">
       <Component Id="StartMenuComponent" Bitness="always64">
-        <util:InternetShortcut Id="WebUiShortcut" Name="Blue Onyx Prism" Target="http://127.0.0.1:32168/" />
+        <Shortcut Id="TrayShortcut" Name="Blue Onyx Prism" Description="Blue Onyx Prism tray icon (start, stop, restart, open the web UI)" Target="[#TrayExe]" WorkingDirectory="INSTALLFOLDER" />
+        <util:InternetShortcut Id="WebUiShortcut" Name="Blue Onyx Prism Web UI" Target="http://127.0.0.1:32168/" />
         <RemoveFolder Id="RemoveStartMenuDir" On="uninstall" />
         <RegistryValue Root="HKLM" Key="SOFTWARE\BlueOnyxPrism" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
       </Component>

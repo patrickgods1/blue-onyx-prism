@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the pkg, check the daemon answers and the uninstaller app is in place, uninstall keeping
+# Install the pkg, check the daemon answers the uninstaller app and the tray app are in place, uninstall keeping
 # the data (program and app gone, data kept), then purge. For a macOS CI runner (passwordless
 # sudo). Usage: packaging/macos/smoke-test.sh <pkg>
 set -euo pipefail
@@ -31,10 +31,24 @@ codesign --verify --strict "$APP" || fail "$APP has an invalid signature"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = com.blueonyx.prism.uninstaller ] \
   || fail "$APP has the wrong bundle id"
 
+TRAY_APP="/Applications/Blue Onyx Prism.app"
+TRAY_PLIST=/Library/LaunchAgents/com.blueonyx.prism.tray.plist
+[ -d "$TRAY_APP" ] || fail "$TRAY_APP missing"
+[ -x "$TRAY_APP/Contents/MacOS/blue-onyx-prism-tray" ] || fail "tray executable missing in $TRAY_APP"
+codesign --verify --strict "$TRAY_APP" || fail "$TRAY_APP has an invalid signature"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$TRAY_APP/Contents/Info.plist")" = com.blueonyx.prism.tray ] \
+  || fail "$TRAY_APP has the wrong bundle id"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$TRAY_APP/Contents/Info.plist")" = true ] \
+  || fail "$TRAY_APP is not LSUIElement"
+[ -f "$TRAY_PLIST" ] || fail "$TRAY_PLIST missing"
+plutil -lint "$TRAY_PLIST" >/dev/null || fail "$TRAY_PLIST is not a valid plist"
+
 # What the app runs for "Keep My Data".
 sudo "$PROG/scripts/uninstall_launchd.sh"
 [ ! -e "$PROG" ] || fail "$PROG left behind"
 [ ! -e "$APP" ] || fail "$APP left behind"
+[ ! -e "$TRAY_APP" ] || fail "$TRAY_APP left behind"
+[ ! -e "$TRAY_PLIST" ] || fail "$TRAY_PLIST left behind"
 sudo test -f "$CONFIG" || fail "config deleted without --purge"
 dscl . -read /Users/_blueonyx >/dev/null 2>&1 || fail "account _blueonyx deleted without --purge"
 

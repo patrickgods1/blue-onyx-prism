@@ -8,6 +8,7 @@ version = 2
 ignore = [
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, no fix; only via ab_glyph to draw labels on saved images, parsing the embedded font only. Review by 2027-04-01" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (repo archived), no fix; only via serde_yaml_ng for local classes YAML files. Review by 2027-04-01" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained, no fix; only via glib-macros in tray-icon/tao's Linux GTK deps, which are never built (the tray is Windows and macOS only; Cargo.toml gates tray-icon/tao to those targets). Review by 2027-04-01" },
 ]
 
 [licenses]

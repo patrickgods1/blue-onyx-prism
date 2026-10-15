@@ -10,6 +10,8 @@ CONFIG="${CONFIG:-$DATA_DIR/blue_onyx_prism_config.json}"
 SVC="${SVC:-_blueonyx}"
 PLIST_DST="${PLIST_DST:-/Library/LaunchDaemons/com.blueonyx.prism.plist}"
 NEWSYSLOG_CONF="${NEWSYSLOG_CONF:-/etc/newsyslog.d/blue-onyx-prism.conf}"
+TRAY_LABEL="${TRAY_LABEL:-com.blueonyx.prism.tray}"
+TRAY_PLIST="${TRAY_PLIST:-/Library/LaunchAgents/$TRAY_LABEL.plist}"
 
 # Role account _blueonyx (hidden, no shell, no password) with a group of the same name; one free
 # id below 500 serves as both UID and GID.
@@ -120,4 +122,34 @@ bop_bootstrap() {
     echo "launchctl bootstrap failed for $PLIST_DST; see 'launchctl print system/com.blueonyx.prism' and /var/log/system.log." >&2
     exit 1
   fi
+}
+
+# uid of the user logged in at the console; empty when nobody is (login window, CI, ssh only).
+bop_console_uid() {
+  local uid
+  uid="$(stat -f %u /dev/console 2>/dev/null || true)"
+  if [ -n "$uid" ] && [ "$uid" != 0 ]; then printf '%s' "$uid"; fi
+}
+
+# Stop the menu bar app of the console user and any other running copy. Never fails.
+bop_tray_stop() {
+  local uid
+  uid="$(bop_console_uid)"
+  if [ -n "$uid" ]; then
+    launchctl bootout "gui/$uid/$TRAY_LABEL" >/dev/null 2>&1 || true
+  fi
+  pkill -x blue-onyx-prism-tray >/dev/null 2>&1 || true
+}
+
+# (Re)start the menu bar app for the console user right away; other users get it at their next
+# login from the LaunchAgent. Never fails: a machine without a GUI session simply skips it.
+bop_tray_start() {
+  local uid
+  uid="$(bop_console_uid)"
+  [ -n "$uid" ] || return 0
+  [ -f "$TRAY_PLIST" ] || return 0
+  launchctl print "gui/$uid" >/dev/null 2>&1 || return 0
+  launchctl bootout "gui/$uid/$TRAY_LABEL" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$uid" "$TRAY_PLIST" >/dev/null 2>&1 || true
+  return 0
 }

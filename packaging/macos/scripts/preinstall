@@ -1,4 +1,10 @@
 #!/bin/bash
-# Installer preinstall: stop the running daemon so its files can be replaced (upgrade).
+# Installer preinstall: stop the running daemon and the menu bar app so their files can be
+# replaced (upgrade). Both are started again by the postinstall.
 launchctl bootout system/com.blueonyx.prism >/dev/null 2>&1 || true
+uid="$(stat -f %u /dev/console 2>/dev/null || true)"
+if [ -n "$uid" ] && [ "$uid" != 0 ]; then
+  launchctl bootout "gui/$uid/com.blueonyx.prism.tray" >/dev/null 2>&1 || true
+fi
+pkill -x blue-onyx-prism-tray >/dev/null 2>&1 || true
 exit 0
