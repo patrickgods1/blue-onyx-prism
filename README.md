@@ -200,9 +200,11 @@ After installing, open `http://127.0.0.1:32168/`. The installers are not code-si
   The package creates the `blueonyx` user and enables `blue-onyx-prism.service`. `apt remove` keeps
   the data, `apt purge` removes it and the user; `dnf remove` keeps the data.
 - **macOS:** macOS blocks the unsigned package on first open. Open *System Settings > Privacy &
-  Security*, click *Open Anyway* next to the message about the package, and run it again. Uninstall
-  with `sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh` (add `--purge` to also delete
-  the data, logs and the `_blueonyx` account), then `sudo rm -rf /usr/local/blue-onyx-prism`.
+  Security*, click *Open Anyway* next to the message about the package, and run it again. To
+  uninstall, open *Uninstall Blue Onyx Prism* in *Applications*: choose *Keep My Data* (config,
+  models and logs stay for a reinstall) or *Delete Everything*, and enter your password. From
+  Terminal: `sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh` (add `--purge` to also
+  delete the data, logs and the `_blueonyx` account).
 
 Every installer has a `.sha256` file and a build attestation (`gh attestation verify <file> --repo
 patrickgods1/blue-onyx-prism`). The archives below remain the portable option.
@@ -775,7 +777,7 @@ add a `save_image_path` or `log_path` outside `/var/lib/blue-onyx-prism` (`ReadW
 ```sh
 sudo cp -r blue-onyx-prism-<version>-macos-aarch64 /usr/local/blue-onyx-prism
 sudo /usr/local/blue-onyx-prism/scripts/install_launchd.sh   # KeepAlive; runs as _blueonyx
-sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh # unload and remove (--purge: also data, logs, account)
+sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh # unload, remove the daemon and the program dir (--purge: also data, logs, account; --keep-program: keep the program dir)
 ```
 
 The daemon runs as the hidden role account `_blueonyx` (created by the script, UID below 500). The
