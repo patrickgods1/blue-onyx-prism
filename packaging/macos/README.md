@@ -50,3 +50,10 @@ sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh --purge    # also d
 
 The script stops the daemon and removes its plist, the newsyslog entry, the installer receipt
 (`pkgutil --forget com.blueonyx.prism`), the menu bar app and its LaunchAgent, the program dir and the uninstaller app.
+
+macOS lets only some apps change user accounts, even as root: from the uninstaller app,
+deleting `_blueonyx` fails with `eDSPermissionError` while it works from Terminal. The script
+then removes everything else, prints the commands and exits 4, and the app offers *Remove in
+Terminal* (it opens a `.command` file that runs
+`sudo dscl . -delete /Users/_blueonyx; sudo dscl . -delete /Groups/_blueonyx`). The account is
+harmless if left; a reinstall reuses it.

@@ -8,6 +8,9 @@
 # models, downloads), the logs in /var/log/blue-onyx-prism and the role account _blueonyx are kept
 # for a reinstall unless --purge is given. --keep-program leaves the program dir in place. Never
 # prompts, so it runs unattended (CI, scripts, the uninstaller app); it needs no other file.
+# Exit status 4: everything was removed except the account, which macOS refused to delete
+# (eDSPermissionError: the calling app, e.g. the uninstaller app, may not change user accounts;
+# Terminal may). The uninstaller app then offers to finish in Terminal.
 set -euo pipefail
 
 DATA_DIR=/usr/local/var/blue-onyx-prism
@@ -104,13 +107,21 @@ fi
 
 if [ "$PURGE" -eq 1 ]; then
   rm -rf "$DATA_DIR" "$LOG_DIR"
-  if dscl . -read "/Users/$SVC" >/dev/null 2>&1; then
-    dscl . -delete "/Users/$SVC"
+  echo "Deleted $DATA_DIR and $LOG_DIR."
+  # Best effort: macOS lets only some apps change user accounts, whatever the user id.
+  account_left=0
+  if dscl . -read "/Users/$SVC" >/dev/null 2>&1 && ! dscl . -delete "/Users/$SVC"; then
+    account_left=1
   fi
-  if dscl . -read "/Groups/$SVC" >/dev/null 2>&1; then
-    dscl . -delete "/Groups/$SVC"
+  if dscl . -read "/Groups/$SVC" >/dev/null 2>&1 && ! dscl . -delete "/Groups/$SVC"; then
+    account_left=1
   fi
-  echo "Deleted $DATA_DIR, $LOG_DIR and the account $SVC."
+  if [ "$account_left" -eq 1 ]; then
+    echo "macOS did not allow deleting the hidden account $SVC (harmless; a reinstall reuses it). To remove it, run in Terminal:" >&2
+    echo "  sudo dscl . -delete /Users/$SVC; sudo dscl . -delete /Groups/$SVC" >&2
+    exit 4
+  fi
+  echo "Deleted the account $SVC."
 else
   echo "Kept $DATA_DIR (config, models, downloads), $LOG_DIR and the account $SVC for a reinstall; run with --purge to delete them."
 fi

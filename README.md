@@ -204,7 +204,9 @@ After installing, open `http://127.0.0.1:32168/`. The installers are not code-si
   uninstall, open *Uninstall Blue Onyx Prism* in *Applications*: choose *Keep My Data* (config,
   models and logs stay for a reinstall) or *Delete Everything*, and enter your password. From
   Terminal: `sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh` (add `--purge` to also
-  delete the data, logs and the `_blueonyx` account).
+  delete the data, logs and the `_blueonyx` account). macOS may not let the uninstaller app delete
+  the hidden `_blueonyx` account; it then offers *Remove in Terminal*, where you enter your password
+  once more (the account is harmless if you leave it, and a reinstall reuses it).
 
 **Tray / menu bar icon (Windows and macOS).** The Windows and macOS installers also install a small
 icon app that starts at login (Windows: system tray, macOS: menu bar) and shows whether the service is
