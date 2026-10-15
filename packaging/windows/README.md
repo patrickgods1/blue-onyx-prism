@@ -32,8 +32,14 @@ cargo build --release --locked --bins
 
 ## Uninstall
 
-Removes program files, the service, the firewall rule, the event source, the Run value and the shortcuts. `C:\ProgramData\BlueOnyxPrism`
-is kept (config, downloaded runtimes, models). Delete it by hand for a clean slate.
+A full uninstall leaves nothing behind: program files, the service, the firewall rule, the event
+source, the Run value, the shortcuts, `HKLM\SOFTWARE\BlueOnyxPrism`, the data folder
+`C:\ProgramData\BlueOnyxPrism` (config, downloaded runtimes, models, logs) and, when the program
+folder is the default `C:\Program Files\Blue Onyx Prism`, anything the program created there
+(a folder the user picked keeps files the MSI did not install). `msiexec /x <file>.msi KEEPDATA=1`
+keeps the data folder. Removing the old version during an upgrade keeps both folders' data. The
+tray's lock file in the user's temp folder is deleted when the tray exits (also when the
+uninstall terminates it). `smoke-test.ps1` checks all of this, with and without `KEEPDATA=1`.
 
 ## Coexistence with scripts\install_service.ps1
 

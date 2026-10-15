@@ -65,14 +65,24 @@ pub fn run(args: TrayArgs) -> ExitCode {
 }
 
 /// Take the exclusive lock on `path` (created if missing). `Ok(None)`: another process holds it.
-/// The lock lasts as long as the returned file is open.
+/// The lock lasts as long as the returned file is open. On Windows the file is deleted when the
+/// last handle closes, also when the tray is killed (an uninstall terminates it), so nothing is
+/// left in the user's temp folder; the uninstall script removes it on macOS.
 pub fn try_lock_file(path: &Path) -> std::io::Result<Option<File>> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+    let file = options.open(path)?;
     match fs4::FileExt::try_lock(&file) {
         Ok(()) => Ok(Some(file)),
         Err(fs4::TryLockError::WouldBlock) => Ok(None),

@@ -80,6 +80,8 @@ if [ -n "$console_uid" ] && [ "$console_uid" != 0 ]; then
   launchctl bootout "gui/$console_uid/$TRAY_LABEL" >/dev/null 2>&1 || true
 fi
 pkill -x blue-onyx-prism-tray >/dev/null 2>&1 || true
+# Its single-instance lock in each user's temp folder (/private/var/folders/<x>/<y>/T/).
+find /private/var/folders -maxdepth 4 -path '*/T/blue-onyx-prism-tray.lock' -delete 2>/dev/null || true
 if [ -e "$TRAY_PLIST" ] || [ -d "$TRAY_APP" ]; then
   rm -rf "$TRAY_PLIST" "$TRAY_APP"
   echo "Removed the menu bar app ($TRAY_APP) and its LaunchAgent."
@@ -107,6 +109,8 @@ fi
 
 if [ "$PURGE" -eq 1 ]; then
   rm -rf "$DATA_DIR" "$LOG_DIR"
+  # The parent the install created on a Mac without Homebrew; never one that holds anything.
+  rmdir "$(dirname "$DATA_DIR")" 2>/dev/null || true
   echo "Deleted $DATA_DIR and $LOG_DIR."
   # Best effort: macOS lets only some apps change user accounts, whatever the user id.
   account_left=0

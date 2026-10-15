@@ -1,6 +1,8 @@
 #!/bin/sh
-# remove: forget the deleted unit. purge: like uninstall_systemd.sh --purge, delete the data root
-# (config, models, cache, downloads) and the service user.
+# remove: forget the deleted unit and delete what the program created in /opt/blue-onyx-prism
+# (dpkg only removes its own files: e.g. a config or downloads of the CLI run from there).
+# purge: also, like uninstall_systemd.sh --purge, the data root (config, models, cache,
+# downloads) and the service user. Not on upgrade (postrm upgrade): the new version keeps both.
 set -e
 case "$1" in
   remove | purge)
@@ -8,6 +10,7 @@ case "$1" in
       systemctl daemon-reload || true
       systemctl reset-failed blue-onyx-prism 2>/dev/null || true
     fi
+    rm -rf /opt/blue-onyx-prism
     ;;
 esac
 if [ "$1" = purge ]; then

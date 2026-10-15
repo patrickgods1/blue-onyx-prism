@@ -60,4 +60,8 @@ if sudo launchctl print system/com.blueonyx.prism >/dev/null 2>&1; then fail "da
 [ ! -e /Library/LaunchDaemons/com.blueonyx.prism.plist ] || fail "plist still present"
 if dscl . -read /Users/_blueonyx >/dev/null 2>&1; then fail "account _blueonyx still present"; fi
 if pkgutil --pkg-info com.blueonyx.prism >/dev/null 2>&1; then fail "receipt still present"; fi
+left="$(sudo find /Applications /Library /usr/local /private/etc /private/var/db/receipts /private/var/log \
+  \( -iname '*blue-onyx-prism*' -o -iname '*blueonyx*' -o -iname 'Blue Onyx Prism*' -o -iname 'Uninstall Blue Onyx Prism*' \) \
+  -not -path '/private/var/log/install.log*' 2>/dev/null || true)"
+[ -z "$left" ] || fail "left behind after the purge: $left"
 echo "Smoke test passed."
