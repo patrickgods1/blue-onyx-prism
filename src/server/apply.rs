@@ -62,7 +62,18 @@ impl Applied {
 /// Runtime-level globals keep their running values until a restart. Idempotent; one at a
 /// time.
 pub(crate) fn apply_config(state: &AppState) -> Applied {
-    let _one = state.apply_lock.lock_recover();
+    let held = state.apply_lock.lock_recover();
+    apply_config_locked(state, &held)
+}
+
+/// [`apply_config`] for a caller that holds `state.apply_lock` (the guard proves it): a save
+/// writes and applies under one lock, so no other applier (a page's config sync, the runner
+/// after a restart) applies its edit in between and leaves its message without what it
+/// reloaded.
+pub(crate) fn apply_config_locked(
+    state: &AppState,
+    _held: &std::sync::MutexGuard<'_, ()>,
+) -> Applied {
     let (revision, current) = state.config.snapshot();
     let running = state.running();
     let mut next = crate::config_merge::runtime_overlay(&running, &current);

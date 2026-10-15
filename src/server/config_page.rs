@@ -1,6 +1,6 @@
 //! The config page and its writers (form, models, restart, log level).
 
-use super::apply::{apply_config, sync_config};
+use super::apply::{apply_config_locked, sync_config};
 use super::devices::{DevicesSnapshot, devices_snapshot, force_cpu_note};
 use super::pages::level_choices;
 use super::resources::{FamilyChoice, family_choices};
@@ -8,6 +8,7 @@ use super::{AppState, blocking, live, render, wants_html};
 use crate::backend::spec::{self, DeviceSpec};
 use crate::config::{Config, LogLevel};
 use crate::config_form::FORM_FIELDS;
+use crate::sync::LockExt;
 use askama::Template;
 use axum::Json;
 use axum::extract::rejection::{FormRejection, QueryRejection};
@@ -582,7 +583,7 @@ pub(super) async fn config_page(State(state): State<Arc<AppState>>) -> Response 
 
 /// Apply `edit` to the current config through the config store (one writer for everything:
 /// it bumps the revision and logs the change under `source`), write the file and apply what
-/// can be applied now ([`apply_config`]: live settings, per-model reloads, the log level).
+/// can be applied now ([`apply_config`](super::apply::apply_config): live settings, per-model reloads, the log level).
 /// Returns the message for the page ("Applied now: ...", "reloading x on y", "restart to
 /// apply ...").
 pub(super) fn save_config(
@@ -590,9 +591,15 @@ pub(super) fn save_config(
     source: &str,
     edit: impl FnOnce(&mut Config) -> anyhow::Result<()>,
 ) -> anyhow::Result<String> {
-    let up = state.config.update(source, edit)?;
-    // Also applies a change picked up from the file before the edit.
-    let applied = apply_config(state);
+    // Write and apply under the apply lock: another applier (a page's config sync, the runner
+    // after a restart) could otherwise apply this edit in between, and the message below would
+    // miss what it reloaded ("Saved." without "Loading x on y; stopping z.").
+    let (up, applied) = {
+        let held = state.apply_lock.lock_recover();
+        let up = state.config.update(source, edit)?;
+        // Also applies a change picked up from the file before the edit.
+        (up, apply_config_locked(state, &held))
+    };
     if !up.changed {
         return Ok(format!(
             "No changes: {} already has these values.",
@@ -638,7 +645,7 @@ pub(super) fn save_config(
 }
 
 /// Validate and save the form, as submitted (last write wins; the change log records what
-/// changed). Changes apply at once where they can ([`apply_config`]: live settings, per-model
+/// changed). Changes apply at once where they can ([`apply_config`](super::apply::apply_config): live settings, per-model
 /// reloads, the log level); runtime-level settings on restart. `default_model` and the
 /// `enabled` flags are only changed when the form carries them (the page's main form does
 /// not; the Models card posts to `/config/models`). Clients that send
