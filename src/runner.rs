@@ -9,7 +9,7 @@
 //! On-demand resources (phase 7.3): before each generation the [`Provisioner`] (which owns the
 //! download manager for the whole run) works out what the config is missing and queues it.
 //! When a runtime the generation can use gets installed, a watcher thread restarts the
-//! generation the same way `/config/restart` does, but keeps the in-memory config (runtime
+//! generation the same way `/config/restart` does, but starts from the live in-memory config (runtime
 //! libraries load once per generation); an installed model file reloads only the models that
 //! failed without it.
 //!
@@ -608,13 +608,23 @@ pub fn run_server_with(
 
         if resources_restart.load(Ordering::SeqCst) {
             info!("restarting the registry to load downloaded resources");
-            previous = None;
+            let next = config_for_resources_restart(&process.store);
+            previous = Some(std::mem::replace(&mut config, next));
             continue;
         }
         let next = process.reload_config(&config);
         previous = Some(std::mem::replace(&mut config, next));
         adopt = Some("restart (config file reloaded)");
     }
+}
+
+/// The config of the next generation after a resources restart: the live config (every
+/// change applied since the generation started, e.g. a model disabled with Save), not the
+/// config the generation started with. Starting from that one served models the user had
+/// disabled (and dropped other live changes) until the next config sync, which only the web
+/// pages trigger.
+fn config_for_resources_restart(store: &crate::config_store::ConfigStore) -> Config {
+    store.snapshot().1
 }
 
 /// The ONNX Runtime flavor `registry` loaded, if any.
@@ -728,6 +738,36 @@ fn spawn_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModelConfig;
+
+    #[test]
+    fn resources_restart_starts_from_the_live_config() {
+        let dir = std::env::temp_dir().join(format!("bop_runner_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = |name: &str, enabled: bool| ModelConfig {
+            name: Some(name.into()),
+            path: format!("models/{name}.onnx").into(),
+            enabled,
+            ..Default::default()
+        };
+        // The generation started with b enabled; b was then disabled and a enabled live.
+        let started = Config {
+            models: vec![model("a", false), model("b", true)],
+            ..Default::default()
+        };
+        let store = crate::config_store::ConfigStore::new(started.clone(), dir.join("cfg.json"));
+        store
+            .update("test", |c| {
+                c.models[0].enabled = true;
+                c.models[1].enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        let next = config_for_resources_restart(&store);
+        let flags: Vec<bool> = next.models.iter().map(|m| m.enabled).collect();
+        assert_eq!(flags, [true, false]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn stop_server_is_bounded() {
