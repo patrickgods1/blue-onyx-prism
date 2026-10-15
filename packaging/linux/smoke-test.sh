@@ -112,7 +112,8 @@ docker run --rm -v "${RPM%/*}:/pkg:ro" "$FEDORA" bash -euo pipefail -c '
   ! getent group blueonyx >/dev/null || { echo "group blueonyx left behind"; exit 1; }
   left="$(find / -xdev \( -iname "*blue-onyx-prism*" -o -iname "*blueonyx*" \) -not -path "/pkg/*" -not -path "/proc/*" 2>/dev/null || true)"
   [ -z "$left" ] || { echo "left behind after dnf remove: $left"; exit 1; }
-  orphans="$(find / -xdev \( -nouser -o -nogroup \) -not -path "/proc/*" 2>/dev/null || true)"
+  # /pkg is the host folder mounted read-only (owned by the runner user, unknown in here).
+  orphans="$(find / -xdev \( -nouser -o -nogroup \) -not -path "/proc/*" -not -path /pkg -not -path "/pkg/*" 2>/dev/null || true)"
   [ -z "$orphans" ] || { echo "files owned by the deleted user left behind: $orphans"; exit 1; }
   echo "dnf remove left nothing behind"
 ' || fail "rpm install / remove in Fedora"
