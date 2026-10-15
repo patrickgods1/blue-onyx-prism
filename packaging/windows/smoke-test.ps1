@@ -65,6 +65,7 @@ function Install-AndCheck([string]$Log) {
     while ((Get-Service $Service).Status -ne "Running" -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
     if ((Get-Service $Service).Status -ne "Running") { Fail "service is $((Get-Service $Service).Status), expected Running within 60 s" @($Log) }
     Write-Host "Service is Running."
+    $pidRunning = (Get-CimInstance Win32_Service -Filter "Name='$Service'").ProcessId
 
     # /v1/status answers 200 (ready) or 503 (models still initializing/downloading); only the listener matters.
     $url = "http://127.0.0.1:$Port/v1/status"
@@ -81,6 +82,22 @@ function Install-AndCheck([string]$Log) {
     }
     if ($code -ne 200 -and $code -ne 503) { Fail "$url did not answer 200/503 within 120 s (last: $code)" @($Log) }
     Write-Host "GET $url -> $code"
+
+    # Ready (200) means the downloaded runtime loads and the model serves; answering alone could
+    # hide a service that fails and is restarted by its failure actions.
+    $deadline = (Get-Date).AddSeconds(360)
+    while ($code -ne 200 -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        try {
+            $code = [int](Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5).StatusCode
+        } catch {
+            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        }
+    }
+    if ($code -ne 200) { Fail "$url not ready (200) within 6 min (last: $code)" @($Log) }
+    $pidNow = (Get-CimInstance Win32_Service -Filter "Name='$Service'").ProcessId
+    if ($pidNow -ne $pidRunning) { Fail "the service process changed ($pidRunning -> $pidNow): it was restarted" @($Log) }
+    Write-Host "Service ready, same process."
 
     if (-not (Test-Path $Config)) { Fail "$Config was not created" @($Log) }
     Write-Host "Config present: $Config"
