@@ -118,7 +118,9 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   in `release.yml` and `packaging.yml`; unsigned; runtimes are downloaded on first start. The MSI runs the service as
   LocalService with `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json` (a service config created
   outside the exe dir seeds `download_dir`/`cache_dir`/`log_path` beside it). The deb/rpm and pkg share
-  `scripts/systemd_common.sh` / `scripts/launchd_common.sh` with the archive install scripts.
+  `scripts/systemd_common.sh` / `scripts/launchd_common.sh` with the archive install scripts. The pkg also installs
+  `/Applications/Uninstall Blue Onyx Prism.app` (`packaging/macos/uninstaller.applescript`, osacompile, not relocatable),
+  which only runs `uninstall_launchd.sh` as root; that script removes the program dir too (`--keep-program` to keep it).
 - Windows service in `src/bin/blue_onyx_prism_service.rs` (cfg windows). systemd/launchd/Docker in `deploy/`.
   Install/uninstall scripts in `scripts/` (`uninstall_systemd.sh`, `uninstall_launchd.sh`, `*_service.ps1`); the Docker
   image starts through `deploy/docker-entrypoint.sh` (checks the volumes are writable). `THIRD_PARTY_LICENSES.md` ships in
