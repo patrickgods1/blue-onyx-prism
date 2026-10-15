@@ -14,6 +14,11 @@ use tokio::sync::oneshot;
 const INPUT: (u32, u32) = (64, 64);
 /// Generous bound for anything that should happen "at once" (CI runners are slow).
 const SOON: Duration = Duration::from_secs(10);
+/// Worker queue length. Tests submit with `try_send` (as the server does) and send up to
+/// `MAX_CONSECUTIVE_DEGENERATE + 1` requests before waiting, so the queue must hold a whole
+/// burst: with 16, a slow runner whose worker had not drained 10 of 26 yet got `Full`.
+const QUEUE: usize = 64;
+const _: () = assert!(QUEUE > super::run::MAX_CONSECUTIVE_DEGENERATE as usize + 1);
 
 fn classes() -> Vec<String> {
     (0..5).map(|i| format!("c{i}")).collect()
@@ -69,7 +74,7 @@ impl Harness {
                 ..LiveSettings::default()
             }
             .shared(),
-            queue_size: 16,
+            queue_size: QUEUE,
             lazy: false,
             can_use_gpu: false,
             wait: None,
