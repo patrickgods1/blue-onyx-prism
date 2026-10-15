@@ -113,6 +113,12 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   device, family, classes) reload only that model (`ModelRegistry::reload_model`), and only runtime-level fields
   (port, bind address, runtime dirs, cache, threads, profile/concurrency) stay pending until a restart
   (`config_merge::pending`).
+- Native installers in `packaging/` (WiX v7 MSI, cargo-deb/cargo-generate-rpm with metadata in Cargo.toml, pkgbuild pkg),
+  built and smoke-tested (install, `/v1/status`, uninstall) by `packaging/build-installers.sh` / `smoke-test-installers.sh`
+  in `release.yml` and `packaging.yml`; unsigned; runtimes are downloaded on first start. The MSI runs the service as
+  LocalService with `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json` (a service config created
+  outside the exe dir seeds `download_dir`/`cache_dir`/`log_path` beside it). The deb/rpm and pkg share
+  `scripts/systemd_common.sh` / `scripts/launchd_common.sh` with the archive install scripts.
 - Windows service in `src/bin/blue_onyx_prism_service.rs` (cfg windows). systemd/launchd/Docker in `deploy/`.
   Install/uninstall scripts in `scripts/` (`uninstall_systemd.sh`, `uninstall_launchd.sh`, `*_service.ps1`); the Docker
   image starts through `deploy/docker-entrypoint.sh` (checks the volumes are writable). `THIRD_PARTY_LICENSES.md` ships in

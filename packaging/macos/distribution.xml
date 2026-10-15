@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Blue Onyx Prism</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE" mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.blueonyx.prism"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.blueonyx.prism" visible="false">
+        <pkg-ref id="com.blueonyx.prism"/>
+    </choice>
+    <pkg-ref id="com.blueonyx.prism" auth="root">component.pkg</pkg-ref>
+</installer-gui-script>

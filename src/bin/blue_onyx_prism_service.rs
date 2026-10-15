@@ -1,9 +1,13 @@
 //! Windows service host for Blue Onyx Prism (`BlueOnyxPrismService`).
 //!
-//! Install with `scripts/install_service.ps1`. The service reads
-//! `blue_onyx_prism_config_service.json` next to the executable and runs the same server loop
-//! as the CLI binary ([`blue_onyx_prism::runner`]). Controls: Stop / Shutdown, Interrogate,
-//! and the user-defined codes 130 (stop) and 131 (restart: cancel the running server, reload the
+//! Installed by the MSI or `scripts/install_service.ps1`. The service reads the config named by
+//! `--config <path>` (or `--config=<path>`) on its command line (the service ImagePath; a
+//! relative path resolves against the exe dir), else `blue_onyx_prism_config_service.json` next
+//! to the executable, and runs the same server loop as the CLI binary
+//! ([`blue_onyx_prism::runner`]). A config created outside the exe dir keeps its downloads, cache
+//! and logs next to it ([`blue_onyx_prism::cli::service_default_config`]).
+//!
+//! Controls: Stop / Shutdown, Interrogate, and the user-defined codes 130 (stop) and 131 (restart: cancel the running server, reload the
 //! service config, start again), e.g. `sc.exe control BlueOnyxPrismService 131`.
 //!
 //! Logs go to the configured `log_path` (daily rolling file; stdout is discarded for services)
@@ -27,7 +31,8 @@
 )]
 #![deny(unsafe_code)]
 
-/// `--version` / `-V`: version, git sha and build date (the binary takes no other arguments).
+/// `--version` / `-V`: version, git sha and build date. The only other argument is
+/// `--config <path>` / `--config=<path>` ([`blue_onyx_prism::cli::service_config_arg`]).
 fn version_requested() -> bool {
     std::env::args()
         .skip(1)
@@ -112,8 +117,9 @@ mod service {
             Err(e) => {
                 eprintln!(
                     "could not connect to the Service Control Manager: {e}. This binary is started \
-                     by Windows as the '{SERVICE_NAME}' service (install it with \
-                     scripts/install_service.ps1); for a console server run blue-onyx-prism.exe."
+                     by Windows as the '{SERVICE_NAME}' service (install it with the Blue Onyx \
+                     Prism MSI or scripts/install_service.ps1); for a console server run \
+                     blue-onyx-prism.exe."
                 );
                 ExitCode::FAILURE
             }
@@ -156,8 +162,8 @@ mod service {
             Ok(layer) => Ok(Box::new(layer.with_filter(LevelFilter::INFO))),
             Err(e) => Err(format!(
                 "could not open the event log source {EVENT_SOURCE}: {e}; the Application event \
-                 log gets nothing from this service (run scripts/install_service.ps1 to create \
-                 the source); the file log is unaffected"
+                 log gets nothing from this service (reinstall with the MSI or run \
+                 scripts/install_service.ps1 to create the source); the file log is unaffected"
             )),
         }
     }
@@ -184,9 +190,20 @@ mod service {
         Ok(log)
     }
 
+    /// Load (or create) the service config at `path`; a bad `--config` argument fails every
+    /// attempt with the same error (the retry loop logs it once).
+    fn load_config(path: &std::result::Result<PathBuf, String>) -> Result<(Config, PathBuf)> {
+        match path {
+            Ok(p) => cli::for_service_at(p).map(|c| (c, p.clone())),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    }
+
     fn service_main(_arguments: Vec<OsString>) {
         // Service working directory is System32: every path is resolved against the exe dir.
-        let first = cli::for_service();
+        // `--config` comes from the process args (the ImagePath); SCM start arguments are ignored.
+        let config_path = cli::service_config_path_from_args().map_err(|e| format!("{e:#}"));
+        let first = load_config(&config_path);
         let (level, log_path, format) = match &first {
             Ok((c, _)) => (
                 c.log_level,
@@ -205,13 +222,14 @@ mod service {
         if let Ok((config, _)) = &first {
             cli::log_startup_warnings(config);
         }
-        if let Err(e) = run_service(first, log) {
+        if let Err(e) = run_service(first, config_path, log) {
             error!("service failed: {e:#}");
         }
     }
 
     fn run_service(
         first: Result<(Config, PathBuf)>,
+        config_path: std::result::Result<PathBuf, String>,
         log: LogReloadHandle,
     ) -> windows_service::Result<()> {
         let stop = CancellationToken::new();
@@ -263,7 +281,9 @@ mod service {
             os = %system_info::os_description(),
             cpu = %system_info::cpu_name(),
             memory_gb = ?system_info::total_memory_gb(),
-            config = %Config::service_config_path().display(),
+            config = %config_path
+                .as_ref()
+                .map_or_else(|e| format!("invalid --config ({e})"), |p| p.display().to_string()),
             "starting Blue Onyx Prism service {}",
             blue_onyx_prism::long_version()
         );
@@ -283,7 +303,7 @@ mod service {
             std::thread::Builder::new()
                 .name("server".into())
                 .spawn(move || {
-                    server_loop(first, log, stop, current, restart_requested);
+                    server_loop(first, config_path, log, stop, current, restart_requested);
                     let _ = tx.send(Event::ServerExited);
                 })
         };
@@ -348,6 +368,7 @@ mod service {
     /// (131) reload the service config and start again immediately.
     fn server_loop(
         first: Result<(Config, PathBuf)>,
+        config_path: std::result::Result<PathBuf, String>,
         log: LogReloadHandle,
         stop: CancellationToken,
         current: Arc<Mutex<CancellationToken>>,
@@ -368,7 +389,7 @@ mod service {
             *current.lock_recover() = attempt.clone();
             restart_requested.store(false, Ordering::SeqCst);
 
-            let result = match loaded.take().unwrap_or_else(cli::for_service) {
+            let result = match loaded.take().unwrap_or_else(|| load_config(&config_path)) {
                 Ok((config, path)) => {
                     if active_level.is_some_and(|l| l != config.log_level)
                         && let Err(e) = log.set_level(config.log_level)

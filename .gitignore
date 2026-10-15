@@ -1,6 +1,27 @@
 # Build output
 /target/
 
+# Release / installer output (packaging/build-installers.sh, release.yml stage dir)
+/dist/
+packaging/linux/build/
+packaging/windows/obj/
+*.msi
+*.wixpdb
+*.deb
+*.rpm
+*.pkg
+*.sha256
+/blue-onyx-prism-*.zip
+/blue-onyx-prism-*.tar.gz
+
+# Release executables copied out of target/ (and their debug symbols)
+/*.exe
+/*.pdb
+/blue-onyx-prism
+/blue-onyx-prism-benchmark
+/blue-onyx-prism-service
+/test-blue-onyx-prism
+
 # Runtime artifacts that live next to the binary
 /models/
 /cache/
@@ -8,6 +29,11 @@
 /onnxruntime/
 /bench/
 /tools/
+/logs/
+/.downloads/
+.installed.json
+.downloads.lock
+*.tmp
 benchmark.json
 *.log
 *_config*.json

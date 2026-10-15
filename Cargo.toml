@@ -109,3 +109,50 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Linux packages (packaging/linux/build.sh): `cargo deb` and `cargo generate-rpm`. Runtimes are not
+# bundled (the service downloads them into /var/lib/blue-onyx-prism on first start). The unit is
+# generated from deploy/blue-onyx-prism.service into packaging/linux/build/ by build.sh.
+[package.metadata.deb]
+maintainer = "Patrick Yu <60832092+patrickgods1@users.noreply.github.com>"
+copyright = "Patrick Yu"
+section = "net"
+priority = "optional"
+revision = "1"
+depends = "$auto, systemd"
+extended-description = """\
+Object-detection HTTP service for Blue Iris (CodeProject.AI-compatible API) on OpenVINO and \
+ONNX Runtime. Installs a systemd service running as the blueonyx user; config and data live in \
+/var/lib/blue-onyx-prism. OpenVINO / ONNX Runtime libraries are downloaded on first start."""
+maintainer-scripts = "packaging/linux/debian"
+assets = [
+    ["target/release/blue-onyx-prism", "opt/blue-onyx-prism/", "755"],
+    ["target/release/blue-onyx-prism-benchmark", "opt/blue-onyx-prism/", "755"],
+    ["LICENSE", "opt/blue-onyx-prism/", "644"],
+    ["THIRD_PARTY_LICENSES.md", "opt/blue-onyx-prism/", "644"],
+    ["README.md", "opt/blue-onyx-prism/", "644"],
+    ["scripts/systemd_common.sh", "opt/blue-onyx-prism/scripts/", "644"],
+    ["packaging/linux/pkg-scriptlet.sh", "opt/blue-onyx-prism/scripts/pkg_scriptlet.sh", "755"],
+    ["packaging/linux/build/blue-onyx-prism.service", "usr/lib/systemd/system/", "644"],
+    ["packaging/linux/blue-onyx-prism.sysusers", "usr/lib/sysusers.d/blue-onyx-prism.conf", "644"],
+]
+
+[package.metadata.generate-rpm]
+release = "1"
+assets = [
+    { source = "target/release/blue-onyx-prism", dest = "/opt/blue-onyx-prism/blue-onyx-prism", mode = "755" },
+    { source = "target/release/blue-onyx-prism-benchmark", dest = "/opt/blue-onyx-prism/blue-onyx-prism-benchmark", mode = "755" },
+    { source = "LICENSE", dest = "/opt/blue-onyx-prism/LICENSE", mode = "644" },
+    { source = "THIRD_PARTY_LICENSES.md", dest = "/opt/blue-onyx-prism/THIRD_PARTY_LICENSES.md", mode = "644" },
+    { source = "README.md", dest = "/opt/blue-onyx-prism/README.md", mode = "644" },
+    { source = "scripts/systemd_common.sh", dest = "/opt/blue-onyx-prism/scripts/systemd_common.sh", mode = "644" },
+    { source = "packaging/linux/pkg-scriptlet.sh", dest = "/opt/blue-onyx-prism/scripts/pkg_scriptlet.sh", mode = "755" },
+    { source = "packaging/linux/build/blue-onyx-prism.service", dest = "/usr/lib/systemd/system/blue-onyx-prism.service", mode = "644" },
+    { source = "packaging/linux/blue-onyx-prism.sysusers", dest = "/usr/lib/sysusers.d/blue-onyx-prism.conf", mode = "644" },
+]
+post_install_script = "packaging/linux/rpm/post_install.sh"
+pre_uninstall_script = "packaging/linux/rpm/pre_uninstall.sh"
+post_uninstall_script = "packaging/linux/rpm/post_uninstall.sh"
+
+[package.metadata.generate-rpm.requires]
+systemd = "*"

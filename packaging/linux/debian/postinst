@@ -1,0 +1,16 @@
+#!/bin/sh
+# Debian postinst: $1=configure, $2=previously configured version (empty on a first install).
+set -e
+case "$1" in
+  configure)
+    if [ -n "${2:-}" ]; then
+      /opt/blue-onyx-prism/scripts/pkg_scriptlet.sh post-upgrade
+    else
+      /opt/blue-onyx-prism/scripts/pkg_scriptlet.sh post-install
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0
