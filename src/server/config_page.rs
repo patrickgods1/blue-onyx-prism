@@ -328,6 +328,63 @@ pub(super) struct LevelChoice {
     pub(super) selected: bool,
 }
 
+/// An option of the "Log timestamp time zone" dropdown.
+struct TimezoneChoice {
+    value: String,
+    label: String,
+    selected: bool,
+}
+
+/// Time zones offered by the dropdown: `(log_timezone value, label)`.
+const LOG_TIMEZONES: &[(&str, &str)] = &[
+    ("utc", "UTC"),
+    ("local", "Local (this computer's time zone)"),
+    ("America/Los_Angeles", "Pacific (Los Angeles)"),
+    ("America/Denver", "Mountain (Denver)"),
+    ("America/Phoenix", "Arizona (Phoenix, no DST)"),
+    ("America/Chicago", "Central (Chicago)"),
+    ("America/New_York", "Eastern (New York)"),
+    ("America/Halifax", "Atlantic (Halifax)"),
+    ("America/Anchorage", "Alaska (Anchorage)"),
+    ("Pacific/Honolulu", "Hawaii (Honolulu)"),
+    ("America/Sao_Paulo", "Brazil (Sao Paulo)"),
+    ("Europe/London", "UK (London)"),
+    ("Europe/Berlin", "Central Europe (Berlin)"),
+    ("Europe/Helsinki", "Eastern Europe (Helsinki)"),
+    ("Asia/Kolkata", "India (Kolkata)"),
+    ("Asia/Shanghai", "China (Shanghai)"),
+    ("Asia/Tokyo", "Japan (Tokyo)"),
+    ("Australia/Sydney", "Australia East (Sydney)"),
+    ("Pacific/Auckland", "New Zealand (Auckland)"),
+];
+
+/// The dropdown's options with `current` selected. A value not in [`LOG_TIMEZONES`] (an offset or
+/// another IANA name set in the config file, or a rejected submission) is kept as a first
+/// "Custom" option so saving the page does not change it.
+fn timezone_choices(current: &str) -> Vec<TimezoneChoice> {
+    let current = current.trim();
+    let current = if current.is_empty() { "utc" } else { current };
+    let mut out: Vec<TimezoneChoice> = LOG_TIMEZONES
+        .iter()
+        .map(|&(value, label)| TimezoneChoice {
+            value: value.to_string(),
+            label: label.to_string(),
+            selected: value.eq_ignore_ascii_case(current),
+        })
+        .collect();
+    if !out.iter().any(|t| t.selected) {
+        out.insert(
+            0,
+            TimezoneChoice {
+                value: current.to_string(),
+                label: format!("Custom: {current}"),
+                selected: true,
+            },
+        );
+    }
+    out
+}
+
 #[derive(Template)]
 #[template(path = "config.html")]
 pub(super) struct ConfigTemplate {
@@ -337,6 +394,7 @@ pub(super) struct ConfigTemplate {
     c: ConfigView,
     models: Vec<ModelSelectRow>,
     log_levels: Vec<LevelChoice>,
+    log_timezones: Vec<TimezoneChoice>,
     device_choices: Vec<DeviceChoice>,
     message: Option<String>,
     error: Option<String>,
@@ -459,6 +517,7 @@ pub(super) fn config_template(
         c.overlay(form);
     }
     let log_levels = level_choices(&c.log_level);
+    let log_timezones = timezone_choices(&c.log_timezone);
     let device_choices = device_choices(&snap, &c.device, &c.gpu_index);
     let resource_groups = crate::resources::status::grouped(crate::resources::status::rows(
         state.resources.as_ref(),
@@ -553,6 +612,7 @@ pub(super) fn config_template(
         c,
         models,
         log_levels,
+        log_timezones,
         device_choices,
         message,
         error,
@@ -921,6 +981,39 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::Request;
+
+    #[test]
+    fn timezone_choices_select_the_current_value() {
+        let selected = |cur: &str| -> Vec<String> {
+            timezone_choices(cur)
+                .into_iter()
+                .filter(|t| t.selected)
+                .map(|t| format!("{}|{}", t.value, t.label))
+                .collect()
+        };
+        assert_eq!(selected("utc"), ["utc|UTC"]);
+        assert_eq!(selected(""), ["utc|UTC"]);
+        assert_eq!(
+            selected("local"),
+            ["local|Local (this computer's time zone)"]
+        );
+        assert_eq!(
+            selected("America/Los_Angeles"),
+            ["America/Los_Angeles|Pacific (Los Angeles)"]
+        );
+        // Values set in the config file stay selected as a custom option.
+        let custom = timezone_choices("+08:00");
+        assert_eq!(custom[0].value, "+08:00");
+        assert_eq!(custom[0].label, "Custom: +08:00");
+        assert!(custom[0].selected);
+        assert_eq!(custom.iter().filter(|t| t.selected).count(), 1);
+        // Every offered value is accepted by the config parser.
+        for (value, _) in LOG_TIMEZONES {
+            value
+                .parse::<crate::config::LogTimezone>()
+                .unwrap_or_else(|e| panic!("{value}: {e:#}"));
+        }
+    }
 
     fn snapshot(devices: &[&str]) -> DevicesSnapshot {
         use crate::backend::detect::{GpuAdapter, GpuVendor};
