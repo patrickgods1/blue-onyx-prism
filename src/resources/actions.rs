@@ -187,8 +187,13 @@ pub fn remove(
     let installed = installed_snapshot(ctx, config);
     let platform = Platform::current();
     let paths = export::Paths::for_config(config);
+    let cache_dir = config.cache_dir_path();
     let present = match res.kind {
         ResourceKind::Tool => export::toolchain_state(&paths, platform).present,
+        // Also an outdated export or what an earlier export left behind.
+        ResourceKind::ExportModel => {
+            !export::export_leftovers(res, &paths, cache_dir.as_deref()).is_empty()
+        }
         _ => is_installed(res, &installed, config),
     };
     if !present {
@@ -212,7 +217,8 @@ pub fn remove(
         |e: std::io::Error, p: &Path| ActionError::Failed(format!("removing {}: {e}", p.display()));
     match res.kind {
         ResourceKind::ExportModel => {
-            export::remove_export(res, &dir).map_err(|e| ActionError::Failed(format!("{e:#}")))?;
+            export::remove_export(res, &paths, cache_dir.as_deref())
+                .map_err(|e| ActionError::Failed(format!("{e:#}")))?;
             if let Some(e) = ctx.and_then(|c| c.provisioner.exporter()) {
                 e.forget(res.id);
             }

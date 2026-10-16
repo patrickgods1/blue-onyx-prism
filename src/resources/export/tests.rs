@@ -212,12 +212,73 @@ fn full_export_runs_every_stage_in_order() {
     assert!(cmds[0].contains("export_model.py"));
 
     // Remove: model files and toolchain.
-    remove_export(yolo26n(), &root.join("models")).unwrap();
+    remove_export(yolo26n(), &j.paths, None).unwrap();
     assert!(!is_exported(yolo26n(), &root.join("models")));
     assert!(manifest(yolo26n(), &root.join("models")).is_none());
     remove_toolchain(&j.paths).unwrap();
     assert!(!toolchain_state(&j.paths, MAC).present);
     assert!(!root.join("tools").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Remove deletes everything of one export (IR of earlier versions, weights, work and staging
+/// files, set-aside files, CoreML rewrites) and nothing of other models or the toolchain.
+#[test]
+fn remove_export_leaves_nothing_behind() {
+    let root = tmp("remove");
+    let j = job(&root, MAC);
+    let p = &j.paths;
+    let cache = root.join("cache");
+    let put = |f: &Path| {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, b"x").unwrap();
+    };
+    let ours = [
+        p.models.join("yolo26n.onnx"),
+        p.models.join("yolo26n.yaml"),
+        p.models.join("yolo26n.xml"),
+        p.models.join("yolo26n.bin"),
+        manager::manifest_path(yolo26n(), &p.models),
+        p.models.join(".yolo26n.onnx.old-1234"),
+        p.staging("yolo26n").join("yolo26n.onnx"),
+        p.weights_of("yolo26n").join("yolo26n.pt"),
+        p.work.join("yolo26n").join("x.tmp"),
+        p.tools.join("yolo26-weights/yolo26n.pt"),
+        cache.join("coreml/yolo26n-0123456789abcdef-v3.onnx"),
+    ];
+    let others = [
+        p.models.join("yolo26s.onnx"),
+        p.models.join("yolo26s.xml"),
+        p.models.join("yolo26nano.onnx"),
+        p.weights_of("yolo26s").join("yolo26s.pt"),
+        p.uv_exe(false),
+        cache.join("coreml/yolo26s-0123456789abcdef-v3.onnx"),
+        cache.join("coreml/yolo26n-extra-v3.onnx"),
+        cache.join("0123.blob"),
+    ];
+    for f in ours.iter().chain(&others) {
+        put(f);
+    }
+    assert_eq!(
+        export_leftovers(yolo26n(), p, Some(&cache)).len(),
+        // The staging, weights and work directories count once each.
+        ours.len(),
+    );
+    remove_export(yolo26n(), p, Some(&cache)).unwrap();
+    for f in &ours {
+        assert!(!f.exists(), "{} left behind", f.display());
+    }
+    for d in [
+        p.staging("yolo26n"),
+        p.weights_of("yolo26n"),
+        p.work.clone(),
+    ] {
+        assert!(!d.exists(), "{} left behind", d.display());
+    }
+    for f in &others {
+        assert!(f.exists(), "{} removed", f.display());
+    }
+    assert!(export_leftovers(yolo26n(), p, Some(&cache)).is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }
 

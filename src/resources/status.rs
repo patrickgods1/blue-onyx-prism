@@ -14,8 +14,9 @@
 //!
 //! - **Export** (Ultralytics YOLO, RF-DETR L, DEIMv2; [`super::actions::export`]): queues a
 //!   user-confirmed export on the [`super::export`] exporter (the toolchain download needs
-//!   `confirm_large` unless `allow_large_downloads`); **Cancel** stops it. Remove deletes the
-//!   exported files; removing `tool:uv` removes the whole export toolchain (including the DEIMv2
+//!   `confirm_large` unless `allow_large_downloads`); **Cancel** stops it. Remove deletes
+//!   everything of that one export (`export::export_leftovers`: files, IR of earlier versions,
+//!   weights, work files, CoreML rewrites), also when only leftovers are on disk; removing `tool:uv` removes the whole export toolchain (including the DEIMv2
 //!   source, which has no row of its own).
 //!
 //! Rows carry a `group` ([`group_of`]) so the UI shows Runtimes, GPU libraries and Models
@@ -429,9 +430,13 @@ fn ours(res: &Resource, config: &Config) -> bool {
     manager::read_manifest(&manager::manifest_path(res, &dir)).is_some_and(|m| m.id == res.id)
 }
 
-/// Enabled config models whose file is part of `res`.
+/// Enabled config models whose file is part of `res` (for an export also its IR, which Remove
+/// deletes too).
 fn models_using(res: &Resource, config: &Config) -> Vec<String> {
-    let files = model_paths(res, config);
+    let mut files = model_paths(res, config);
+    if let Some((xml, _)) = export::ir_files(res) {
+        files.push(target_dir(config, res).join(xml));
+    }
     config
         .enabled_models()
         .filter(|m| files.contains(&config.data_path(&m.path)))
@@ -873,6 +878,18 @@ fn export_row(
         row.can_add_to_config = !model_paths(r, config)
             .first()
             .is_some_and(|onnx| configured.contains(onnx));
+    } else if !row.busy {
+        // An outdated export, an interrupted one, or files of an earlier version (IR, weights).
+        let left = export::export_leftovers(r, paths, config.cache_dir_path().as_deref());
+        if !left.is_empty() {
+            let blocked = remove_blocked(ctx, r, config, None);
+            row.removable = blocked.is_none();
+            row.remove_blocked = blocked;
+            row.state_text.push_str(&format!(
+                "; {} leftover file(s) of an earlier export on disk (Remove deletes them)",
+                left.len()
+            ));
+        }
     }
     if let Some(why) = unsupported
         && !on_disk
