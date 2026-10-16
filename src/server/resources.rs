@@ -145,17 +145,41 @@ pub(super) async fn resources_download(
     .await
 }
 
-/// `POST /v1/resources/remove` (`id`).
+/// `POST /v1/resources/remove` (`id`). A model's disabled config entries go with its files
+/// (saved like the other config writers); an enabled one refuses the removal.
 pub(super) async fn resources_remove(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
     blocking(move || {
+        use crate::resources::actions;
         let form = form.map(|Form(f)| f).unwrap_or_default();
         let (id, _) = action_fields(&form);
         let cfg = state.config_read().clone();
-        let result = crate::resources::actions::remove(state.resources.as_ref(), &cfg, &id);
+        let result = actions::remove(state.resources.as_ref(), &cfg, &id).map(|removed| {
+            if removed.config_entries.is_empty() {
+                return removed.message;
+            }
+            let mut dropped = Vec::new();
+            match save_config(&state, "resources remove", |c| {
+                dropped = actions::drop_config_entries(c, &removed.config_entries);
+                Ok(())
+            }) {
+                // Enabled or removed meanwhile.
+                Ok(_) if dropped.is_empty() => removed.message,
+                Ok(msg) => format!("{}. {msg}", removed.describe(&dropped)),
+                Err(e) => {
+                    warn!("removed {id} but not its config entries: {e:#}");
+                    format!(
+                        "{}; its config entries ({}) were not removed: {e:#}. Remove them on \
+                         the Models card",
+                        removed.message,
+                        removed.config_entries.join(", ")
+                    )
+                }
+            }
+        });
         action_response(&state, &headers, &id, result)
     })
     .await
@@ -482,10 +506,23 @@ mod tests {
             false
         );
 
-        // The new entry is disabled (another model was enabled), so it can be removed.
+        // The new entry is disabled (another model was enabled), so it can be removed; its
+        // config entry goes with the files.
         let (s, b) = post_action(&state, "/v1/resources/remove", "id=model%3Afixture-model").await;
         assert_eq!(s, StatusCode::OK, "{b}");
         assert!(!root.join("models/fixture-model.onnx").exists());
+        let msg = b["message"].as_str().unwrap();
+        assert!(
+            msg.contains("and its config entry 'fixture-model'. Saved to"),
+            "{msg}"
+        );
+        let saved = Config::load(&state.config_path).unwrap();
+        assert_eq!(saved.models.len(), 1, "{:?}", saved.models);
+        assert_eq!(*state.config_read(), saved);
+        assert_eq!(
+            state.config.changes(1).pop().expect("logged").source,
+            "resources remove"
+        );
         assert_eq!(
             row(&resources(&state).await, "model:fixture-model")["state"],
             "available"
@@ -856,6 +893,29 @@ mod tests {
         std::fs::write(root.join("models/yolo26n.bin"), b"x").unwrap();
         let (s, b) = post_action(&state, "/v1/resources/remove", "id=model%3Ayolo26n").await;
         assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("and its config entry 'yolo26n'"),
+            "{b}"
+        );
+        assert!(
+            !state
+                .config_read()
+                .models
+                .iter()
+                .any(|m| m.effective_name() == "yolo26n"),
+            "the disabled entry went with the files"
+        );
+        assert!(
+            state
+                .config_read()
+                .models
+                .iter()
+                .any(|m| m.effective_name() == "yolo26s"),
+            "the enabled one stays"
+        );
         for f in ["yolo26n.onnx", "yolo26n.yaml", "yolo26n.xml", "yolo26n.bin"] {
             assert!(!root.join("models").join(f).exists(), "{f}");
         }

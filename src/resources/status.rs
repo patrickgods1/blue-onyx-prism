@@ -7,7 +7,8 @@
 //! - **Remove** deletes an install we made (a `.installed.json` manifest names it). It refuses
 //!   while the resource downloads, when this process has the runtime loaded (OpenVINO, the
 //!   loaded ONNX Runtime flavor, preloaded CUDA libraries: "restart required"), and when an
-//!   enabled model of the config uses the model files.
+//!   enabled model of the config uses the model files. Disabled config entries using them are
+//!   dropped with them (`actions::Removed::config_entries`, saved by the server's config writer).
 //! - **Add to config** appends an installed catalog model to `models` with the same rules as
 //!   `download-models --add-to-config`, or a model file found in `models_dir` that no config
 //!   entry references (id `local:<file>`, see [`local_models`]; family `auto`).
@@ -430,17 +431,34 @@ fn ours(res: &Resource, config: &Config) -> bool {
     manager::read_manifest(&manager::manifest_path(res, &dir)).is_some_and(|m| m.id == res.id)
 }
 
-/// Enabled config models whose file is part of `res` (for an export also its IR, which Remove
-/// deletes too).
-fn models_using(res: &Resource, config: &Config) -> Vec<String> {
+/// Config models (enabled or not) whose file is part of `res` (for an export also its IR, which
+/// Remove deletes too), as `(name, enabled)` in config order. Compared while the files exist
+/// ([`same_file`] also matches another spelling of the same file).
+pub(super) fn config_entries_using(res: &Resource, config: &Config) -> Vec<(String, bool)> {
+    if !res.kind.is_model() {
+        return Vec::new();
+    }
     let mut files = model_paths(res, config);
     if let Some((xml, _)) = export::ir_files(res) {
         files.push(target_dir(config, res).join(xml));
     }
     config
-        .enabled_models()
-        .filter(|m| files.contains(&config.data_path(&m.path)))
-        .map(|m| m.effective_name())
+        .models
+        .iter()
+        .filter(|m| {
+            let p = config.data_path(&m.path);
+            files.iter().any(|f| same_file(f, &p))
+        })
+        .map(|m| (m.effective_name(), m.enabled))
+        .collect()
+}
+
+/// Enabled config models whose file is part of `res` ([`config_entries_using`]).
+fn models_using(res: &Resource, config: &Config) -> Vec<String> {
+    config_entries_using(res, config)
+        .into_iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(n, _)| n)
         .collect()
 }
 
