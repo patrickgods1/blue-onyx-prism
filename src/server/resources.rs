@@ -145,17 +145,41 @@ pub(super) async fn resources_download(
     .await
 }
 
-/// `POST /v1/resources/remove` (`id`).
+/// `POST /v1/resources/remove` (`id`). A model's disabled config entries go with its files
+/// (saved like the other config writers); an enabled one refuses the removal.
 pub(super) async fn resources_remove(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     form: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
     blocking(move || {
+        use crate::resources::actions;
         let form = form.map(|Form(f)| f).unwrap_or_default();
         let (id, _) = action_fields(&form);
         let cfg = state.config_read().clone();
-        let result = crate::resources::actions::remove(state.resources.as_ref(), &cfg, &id);
+        let result = actions::remove(state.resources.as_ref(), &cfg, &id).map(|removed| {
+            if removed.config_entries.is_empty() {
+                return removed.message;
+            }
+            let mut dropped = Vec::new();
+            match save_config(&state, "resources remove", |c| {
+                dropped = actions::drop_config_entries(c, &removed.config_entries);
+                Ok(())
+            }) {
+                // Enabled or removed meanwhile.
+                Ok(_) if dropped.is_empty() => removed.message,
+                Ok(msg) => format!("{}. {msg}", removed.describe(&dropped)),
+                Err(e) => {
+                    warn!("removed {id} but not its config entries: {e:#}");
+                    format!(
+                        "{}; its config entries ({}) were not removed: {e:#}. Remove them on \
+                         the Models card",
+                        removed.message,
+                        removed.config_entries.join(", ")
+                    )
+                }
+            }
+        });
         action_response(&state, &headers, &id, result)
     })
     .await
@@ -482,10 +506,23 @@ mod tests {
             false
         );
 
-        // The new entry is disabled (another model was enabled), so it can be removed.
+        // The new entry is disabled (another model was enabled), so it can be removed; its
+        // config entry goes with the files.
         let (s, b) = post_action(&state, "/v1/resources/remove", "id=model%3Afixture-model").await;
         assert_eq!(s, StatusCode::OK, "{b}");
         assert!(!root.join("models/fixture-model.onnx").exists());
+        let msg = b["message"].as_str().unwrap();
+        assert!(
+            msg.contains("and its config entry 'fixture-model'. Saved to"),
+            "{msg}"
+        );
+        let saved = Config::load(&state.config_path).unwrap();
+        assert_eq!(saved.models.len(), 1, "{:?}", saved.models);
+        assert_eq!(*state.config_read(), saved);
+        assert_eq!(
+            state.config.changes(1).pop().expect("logged").source,
+            "resources remove"
+        );
         assert_eq!(
             row(&resources(&state).await, "model:fixture-model")["state"],
             "available"
@@ -851,10 +888,42 @@ mod tests {
         // yolo26s is used by an enabled model: Remove is refused. yolo26n can go.
         let (s, b) = post_action(&state, "/v1/resources/remove", "id=model%3Ayolo26s").await;
         assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        // OpenVINO IR of an earlier version beside it goes too (it would show up as a local model).
+        std::fs::write(root.join("models/yolo26n.xml"), b"x").unwrap();
+        std::fs::write(root.join("models/yolo26n.bin"), b"x").unwrap();
         let (s, b) = post_action(&state, "/v1/resources/remove", "id=model%3Ayolo26n").await;
         assert_eq!(s, StatusCode::OK, "{b}");
-        assert!(!root.join("models/yolo26n.onnx").exists());
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap()
+                .contains("and its config entry 'yolo26n'"),
+            "{b}"
+        );
+        assert!(
+            !state
+                .config_read()
+                .models
+                .iter()
+                .any(|m| m.effective_name() == "yolo26n"),
+            "the disabled entry went with the files"
+        );
+        assert!(
+            state
+                .config_read()
+                .models
+                .iter()
+                .any(|m| m.effective_name() == "yolo26s"),
+            "the enabled one stays"
+        );
+        for f in ["yolo26n.onnx", "yolo26n.yaml", "yolo26n.xml", "yolo26n.bin"] {
+            assert!(!root.join("models").join(f).exists(), "{f}");
+        }
         assert!(!root.join("models/.yolo26n.installed.json").exists());
+        assert!(!root.join("tools/export-weights/yolo26n").exists());
+        let j = resources(&state).await;
+        assert!(j["localModels"].as_array().unwrap().is_empty(), "{j}");
+        assert_eq!(row(&j, "model:yolo26n")["removable"], false, "nothing left");
         // Remove export toolchain.
         let (s, b) = post_action(&state, "/v1/resources/remove", "id=tool%3Auv").await;
         assert_eq!(s, StatusCode::OK, "{b}");
@@ -936,8 +1005,21 @@ mod tests {
         let j = resources(&state).await;
         let n = row(&j, "model:yolo26n");
         assert_eq!(n["state"], "available");
-        assert_eq!(n["state_text"], "export cancelled");
+        // The verified weights stay for a retry; Remove deletes them.
+        assert!(
+            n["state_text"]
+                .as_str()
+                .unwrap()
+                .starts_with("export cancelled; 1 leftover file(s)"),
+            "{n}"
+        );
+        assert_eq!(n["removable"], true);
         assert!(!root.join("models/yolo26n.onnx").exists());
+        let (_, html) = get_text(&state, "/config").await;
+        assert!(
+            html.contains("Remove the leftover YOLO26 nano files?"),
+            "{html}"
+        );
         // The page renders the Export button with the AGPL confirm.
         let (_, html) = get_text(&state, "/config").await;
         assert!(html.contains("action=\"/v1/resources/export#resource-model:yolo26n\""));
@@ -945,6 +1027,13 @@ mod tests {
             html.contains("data-confirm=\"Export YOLO26 nano?"),
             "{html}"
         );
+        let (s, b) = post_action(&state, "/v1/resources/remove", "id=model%3Ayolo26n").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(!root.join("tools/export-weights/yolo26n").exists());
+        let j = resources(&state).await;
+        let n = row(&j, "model:yolo26n");
+        assert_eq!(n["state_text"], "not exported");
+        assert_eq!(n["removable"], false);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

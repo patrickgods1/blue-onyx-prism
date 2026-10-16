@@ -8,8 +8,9 @@ use super::export;
 use super::manager::{self, Job, Status};
 use super::resolve;
 use super::status::{
-    LOCAL_ID_PREFIX, ResourcesCtx, find, installed_snapshot, is_installed, model_ext,
-    model_installed, model_paths, remove_blocked, same_file, status_of, target_dir, toolchain_cost,
+    LOCAL_ID_PREFIX, ResourcesCtx, config_entries_using, find, installed_snapshot, is_installed,
+    model_ext, model_installed, model_paths, remove_blocked, same_file, status_of, target_dir,
+    toolchain_cost,
 };
 use crate::config::Config;
 use crate::model::ModelFamilyKind;
@@ -176,19 +177,123 @@ pub fn download(
     ))
 }
 
-/// Delete our install of `id` (see the module docs for when it is refused).
+/// What [`remove`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    /// "removed <title> from <dir>".
+    pub message: String,
+    /// Names of the (disabled) config entries whose model file was removed: the caller drops
+    /// them with [`drop_config_entries`] through its config writer and tells the user with
+    /// [`Removed::describe`]. Enabled entries block the removal instead.
+    pub config_entries: Vec<String>,
+}
+
+impl Removed {
+    fn files(message: String) -> Self {
+        Removed {
+            message,
+            config_entries: Vec::new(),
+        }
+    }
+
+    /// The answer after `dropped` (from [`drop_config_entries`]) left the config:
+    /// "removed X from <dir> and its config entry 'x'".
+    pub fn describe(&self, dropped: &[String]) -> String {
+        match dropped {
+            [] => self.message.clone(),
+            [one] => format!("{} and its config entry '{one}'", self.message),
+            many => format!(
+                "{} and its config entries {}",
+                self.message,
+                many.iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+/// Drop the config entries named in `names` (normalized names) that are not enabled; a
+/// `default_model` naming one of them is cleared (the first enabled model serves
+/// `/v1/vision/detection`, as before: a disabled entry never did). Returns the dropped names.
+pub fn drop_config_entries(config: &mut Config, names: &[String]) -> Vec<String> {
+    let wanted: Vec<String> = names
+        .iter()
+        .map(|n| crate::registry::normalize_name(n))
+        .collect();
+    let mut dropped = Vec::new();
+    config.models.retain(|m| {
+        let name = m.effective_name();
+        let go = !m.enabled && wanted.contains(&crate::registry::normalize_name(&name));
+        if go {
+            dropped.push(name);
+        }
+        !go
+    });
+    if let Some(d) = &config.default_model
+        && dropped
+            .iter()
+            .any(|n| crate::registry::normalize_name(n) == crate::registry::normalize_name(d))
+    {
+        config.default_model = None;
+    }
+    dropped
+}
+
+/// Remove the config entry `name` (the Models card's Remove): only a disabled entry, never its
+/// files. Returns the answer for the user.
+pub fn remove_config_entry(config: &mut Config, name: &str) -> Result<String, ActionError> {
+    let norm = crate::registry::normalize_name(name.trim());
+    let Some(m) = config
+        .models
+        .iter()
+        .find(|m| crate::registry::normalize_name(&m.effective_name()) == norm)
+    else {
+        return Err(ActionError::NotFound(format!(
+            "no model named '{}' in the config; reload the page",
+            name.trim()
+        )));
+    };
+    let shown = m.effective_name();
+    if m.enabled {
+        return Err(ActionError::Conflict(format!(
+            "'{shown}' is enabled; disable it first (untick Load and save), then remove it"
+        )));
+    }
+    let file = config.data_path(&m.path);
+    let dropped = drop_config_entries(config, std::slice::from_ref(&shown));
+    debug_assert_eq!(dropped.len(), 1);
+    let files = if file.exists() {
+        format!(
+            "; its file {} stays (remove it under Resources if you no longer need it)",
+            file.display()
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!("removed '{shown}' from the config{files}"))
+}
+
+/// Delete our install of `id` (see the module docs for when it is refused). For a model, the
+/// disabled config entries using its files are returned in [`Removed::config_entries`].
 pub fn remove(
     ctx: Option<&ResourcesCtx>,
     config: &Config,
     id: &str,
-) -> Result<String, ActionError> {
+) -> Result<Removed, ActionError> {
     let res =
         find(ctx, id).ok_or_else(|| ActionError::NotFound(format!("unknown resource '{id}'")))?;
     let installed = installed_snapshot(ctx, config);
     let platform = Platform::current();
     let paths = export::Paths::for_config(config);
+    let cache_dir = config.cache_dir_path();
     let present = match res.kind {
         ResourceKind::Tool => export::toolchain_state(&paths, platform).present,
+        // Also an outdated export or what an earlier export left behind.
+        ResourceKind::ExportModel => {
+            !export::export_leftovers(res, &paths, cache_dir.as_deref()).is_empty()
+        }
         _ => is_installed(res, &installed, config),
     };
     if !present {
@@ -207,12 +312,19 @@ pub fn remove(
             res.title
         )));
     }
+    // Before the files go (the comparison also resolves other spellings of existing files).
+    let config_entries: Vec<String> = config_entries_using(res, config)
+        .into_iter()
+        .filter(|(_, enabled)| !enabled)
+        .map(|(n, _)| n)
+        .collect();
     let dir = target_dir(config, res);
     let fail =
         |e: std::io::Error, p: &Path| ActionError::Failed(format!("removing {}: {e}", p.display()));
     match res.kind {
         ResourceKind::ExportModel => {
-            export::remove_export(res, &dir).map_err(|e| ActionError::Failed(format!("{e:#}")))?;
+            export::remove_export(res, &paths, cache_dir.as_deref())
+                .map_err(|e| ActionError::Failed(format!("{e:#}")))?;
             if let Some(e) = ctx.and_then(|c| c.provisioner.exporter()) {
                 e.forget(res.id);
             }
@@ -229,10 +341,10 @@ pub fn remove(
                     m.forget(&s.key);
                 }
             }
-            return Ok(format!(
+            return Ok(Removed::files(format!(
                 "removed the model export toolchain from {}",
                 paths.tools.display()
-            ));
+            )));
         }
         ResourceKind::Model => {
             for p in res.parts {
@@ -258,7 +370,10 @@ pub fn remove(
             m.forget(&s.key);
         }
     }
-    Ok(format!("removed {} from {}", res.title, dir.display()))
+    Ok(Removed {
+        message: format!("removed {} from {}", res.title, dir.display()),
+        config_entries,
+    })
 }
 
 /// Append installed catalog model `id` to `config.models` (`download-models --add-to-config`
@@ -969,5 +1084,177 @@ mod custom_model_tests {
             assert_eq!(e.status(), 400, "{bad}");
         }
         assert!(c.models.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod remove_tests {
+    use super::*;
+    use crate::config::ModelConfig;
+
+    /// A data root with `download_dir` pointing at it; removed on drop.
+    struct Root(PathBuf);
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn setup(models: Vec<ModelConfig>) -> (Root, Config) {
+        let root = std::env::temp_dir().join(format!("bop-remove-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let config = Config {
+            download_dir: Some(root.clone()),
+            models,
+            ..Default::default()
+        };
+        (Root(root), config)
+    }
+
+    fn entry(name: &str, path: &str, enabled: bool) -> ModelConfig {
+        ModelConfig {
+            name: Some(name.into()),
+            path: path.into(),
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    fn names(c: &Config) -> Vec<String> {
+        c.models.iter().map(|m| m.effective_name()).collect()
+    }
+
+    fn dfine_m() -> &'static Resource {
+        catalog::model("dfine-m").expect("dfine-m is in the catalog")
+    }
+
+    fn install(root: &Path, res: &Resource) {
+        for p in res.parts {
+            std::fs::write(root.join("models").join(p.file_name), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn remove_returns_the_disabled_entries_of_its_files() {
+        let res = dfine_m();
+        let file = format!("models/{}", res.parts[0].file_name);
+        let (root, mut c) = setup(vec![
+            entry("ipcam", "models/ipcam.onnx", true),
+            entry("dfine-m", &file, false),
+            entry("unrelated", "models/unrelated.onnx", false),
+        ]);
+        c.default_model = Some("DFINE-M".into());
+        install(&root.0, res);
+        let removed = remove(None, &c, res.id).unwrap();
+        assert_eq!(removed.config_entries, ["dfine-m"]);
+        assert!(!root.0.join(&file).exists());
+
+        let dropped = drop_config_entries(&mut c, &removed.config_entries);
+        assert_eq!(dropped, ["dfine-m"]);
+        assert_eq!(names(&c), ["ipcam", "unrelated"]);
+        // The default named the dropped entry: cleared, the first enabled model serves.
+        assert_eq!(c.default_model, None);
+        assert_eq!(c.effective_default_index(), Some(0));
+        crate::config::validate_config(&c).unwrap();
+        assert!(
+            removed
+                .describe(&dropped)
+                .ends_with("and its config entry 'dfine-m'"),
+            "{}",
+            removed.describe(&dropped)
+        );
+    }
+
+    #[test]
+    fn an_enabled_entry_blocks_remove() {
+        let res = dfine_m();
+        let file = format!("models/{}", res.parts[0].file_name);
+        let (root, c) = setup(vec![entry("dfine-m", &file, true)]);
+        install(&root.0, res);
+        let e = remove(None, &c, res.id).unwrap_err();
+        assert_eq!(e.status(), 409, "{e}");
+        assert!(e.message().contains("disable them first"), "{e}");
+        assert!(root.0.join(&file).is_file(), "nothing removed");
+    }
+
+    #[test]
+    fn remove_without_config_entries_names_none() {
+        let res = dfine_m();
+        let (root, c) = setup(vec![entry("ipcam", "models/ipcam.onnx", true)]);
+        install(&root.0, res);
+        let removed = remove(None, &c, res.id).unwrap();
+        assert!(removed.config_entries.is_empty());
+        assert_eq!(removed.describe(&[]), removed.message);
+        assert!(
+            removed.message.starts_with("removed "),
+            "{}",
+            removed.message
+        );
+    }
+
+    #[test]
+    fn leftover_ir_of_an_export_takes_its_entry() {
+        let Some(res) = find(None, "model:yolo26n") else {
+            return; // no exports on this platform
+        };
+        let (root, mut c) = setup(vec![
+            entry("ipcam", "models/ipcam.onnx", true),
+            entry("yolo26n", "models/yolo26n.xml", false),
+        ]);
+        // Only the IR of an earlier export is left.
+        for f in ["yolo26n.xml", "yolo26n.bin"] {
+            std::fs::write(root.0.join("models").join(f), b"x").unwrap();
+        }
+        let removed = remove(None, &c, res.id).unwrap();
+        assert_eq!(removed.config_entries, ["yolo26n"]);
+        assert!(!root.0.join("models/yolo26n.xml").exists());
+        assert_eq!(
+            drop_config_entries(&mut c, &removed.config_entries),
+            ["yolo26n"]
+        );
+        assert_eq!(names(&c), ["ipcam"]);
+    }
+
+    #[test]
+    fn drop_config_entries_keeps_enabled_and_unnamed() {
+        let (_root, mut c) = setup(vec![
+            entry("a", "models/a.onnx", true),
+            entry("b", "models/b.onnx", false),
+            entry("c", "models/c.onnx", false),
+        ]);
+        c.default_model = Some("a".into());
+        let dropped = drop_config_entries(&mut c, &["A".into(), "B".into()]);
+        assert_eq!(dropped, ["b"]);
+        assert_eq!(names(&c), ["a", "c"]);
+        assert_eq!(c.default_model.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn remove_config_entry_rules() {
+        let (root, mut c) = setup(vec![
+            entry("a", "models/a.onnx", true),
+            entry("Gone", "models/gone.onnx", false),
+            entry("kept", "models/kept.onnx", false),
+        ]);
+        std::fs::write(root.0.join("models/kept.onnx"), b"x").unwrap();
+        c.default_model = Some("gone".into());
+
+        let e = remove_config_entry(&mut c, "nope").unwrap_err();
+        assert_eq!(e.status(), 404, "{e}");
+        let e = remove_config_entry(&mut c, "A").unwrap_err();
+        assert_eq!(e.status(), 409, "{e}");
+        assert!(e.message().contains("disable it first"), "{e}");
+        assert_eq!(c.models.len(), 3);
+
+        // Missing file: no word about files; the default naming it is cleared.
+        let msg = remove_config_entry(&mut c, " gone ").unwrap();
+        assert_eq!(msg, "removed 'Gone' from the config");
+        assert_eq!(c.default_model, None);
+        // An existing file stays and the answer says so.
+        let msg = remove_config_entry(&mut c, "kept").unwrap();
+        assert!(msg.contains("stays") && msg.contains("Resources"), "{msg}");
+        assert!(root.0.join("models/kept.onnx").is_file());
+        assert_eq!(names(&c), ["a"]);
     }
 }

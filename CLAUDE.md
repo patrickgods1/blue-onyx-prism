@@ -117,7 +117,8 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   export -> install, fake-able `CommandRunner`/`Fetcher`, one at a time, cancellable).
 - `src/config.rs` JSON config next to the exe; CLI overrides only non-default values and writes back.
   The server holds it in `config_store.rs` (revision + change log, detects edits on disk); every UI writer goes
-  through `save_config` (last write wins). A save applies live: per-request settings (thresholds, filters, timeout,
+  through `save_config` (last write wins). Resources Remove of a model also drops its disabled config entries (an enabled
+  one blocks it); the Models card's Remove (`POST /config/models/remove`, `name`) drops a disabled entry, never files. A save applies live: per-request settings (thresholds, filters, timeout,
   image saving, default model) swap into the workers (`LiveSettings`), structural model changes (enable/disable,
   device, family, classes) reload only that model (`ModelRegistry::reload_model`), and only runtime-level fields
   (port, bind address, runtime dirs, cache, threads, profile/concurrency) stay pending until a restart

@@ -28,7 +28,7 @@
   {% if c.force_cpu %}<p class="warn">Force CPU is on and overrides every per-model device. <a href="#inference">Change</a></p>{% endif %}
   <div class="scroll">
   <table class="model-card">
-  <thead><tr><th>Load</th><th>Default</th><th>Name</th><th>Family</th><th>Device</th><th>Threshold</th><th>Running</th><th>File</th></tr></thead>
+  <thead><tr><th>Load</th><th>Default</th><th>Name</th><th>Family</th><th>Device</th><th>Threshold</th><th>Running</th><th>File</th><th>Entry</th></tr></thead>
   <tbody>
   {% for m in models %}
   <tr data-model="{{ m.key }}"{% if !m.pending.is_empty() %} class="pending"{% endif %}>
@@ -44,6 +44,7 @@
       <span class="thr-hint sub">{% if let Some(t) = m.best_threshold %}benchmark best {{ t.0 }} ({{ t.1 }}){% if let Some(st) = t.2 %} {{ st }}{% else %} <button type="button" class="small secondary" data-use-threshold="{{ t.0 }}" title="Put {{ t.0 }} in the threshold field (then save)">use</button>{% endif %}{% endif %}</span></td>
     <td class="running st-{{ m.running_class }}">{{ m.running }}</td>
     <td class="file"><code title="{{ m.path }}">{{ m.file_name }}</code>{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-export" title="{{ x }}: exported on this machine on request">export it</a>{% else if !m.exists %} <span class="muted">(missing)</span>{% endif %}</td>
+    <td class="model-remove-cell"><button type="submit" class="small danger model-remove" form="model-remove" name="name" value="{{ m.name }}" data-confirm="Remove {{ m.name }} from the config? Its files stay; remove them under Resources."{% if m.enabled %} disabled title="Enabled: disable it first (untick Load and save), then remove it"{% else %} title="Remove this entry from the config; its files stay"{% endif %}>Remove</button></td>
   </tr>
   {% endfor %}
   </tbody>
@@ -57,6 +58,7 @@
   </div>
   <p class="muted">{{ bench_summary }} Measure and apply devices and thresholds on the <a href="/benchmark">Benchmark page</a>. More models: <a href="#tab-resources">download</a> them, add files from the models directory under <a href="#local-models">Local models</a>, or <a href="#custom-model">add a model by path</a>.</p>
 </form>
+<form method="post" action="/config/models/remove#at-models" id="model-remove" hidden></form>
 
 <section id="model-sources">
   <h2 id="custom-model">Add a model by path</h2>
@@ -129,7 +131,7 @@
   <tbody>
   {% for r in g.rows %}
   <tr id="resource-{{ r.id }}" data-id="{{ r.id }}" data-busy="{{ r.busy }}" data-state="{{ r.state }}">
-    <td>{{ r.title }} <code>{{ r.id }}</code>{% if r.recommended %} <span class="tag recommended" title="Model size suited to this machine's hardware profile (see the Home page); the Benchmark page measures it">recommended for this machine</span>{% endif %}{% if let Some(v) = r.update_available %} <span class="tag update" title="Installed in an older version; Update replaces it in place (a loaded runtime is used after a restart)">update to {{ v }}</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% endif %}</span></td>
+    <td>{{ r.title }} <code>{{ r.id }}</code>{% if let Some(v) = r.update_available %} <span class="tag update" title="Installed in an older version; Update replaces it in place (a loaded runtime is used after a restart)">update to {{ v }}</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% endif %}</span></td>
     <td class="num">{{ r.size_text }}{% if let Some(n) = r.size_note %}<br><span class="muted">{{ n }}</span>{% else if r.large %}<br><span class="muted">large</span>{% endif %}</td>
     <td class="res-state"><span class="res-text">{{ r.state_text }}</span>{% if r.busy %}<br><progress max="100"{% if let Some(p) = r.progress %} value="{{ p }}"{% endif %}></progress>{% endif %}{% if r.active %} <span class="tag">active</span>{% endif %}{% if r.loaded %} <span class="tag">loaded</span>{% endif %}{% if !r.blocking.is_empty() %}<br><span class="muted">needed by {{ r.blocking.join(", ") }}</span>{% endif %}{% if !r.log.is_empty() %}<details class="res-log"><summary>output</summary><pre>{% for l in r.log %}{{ l }}
 {% endfor %}</pre></details>{% endif %}</td>
@@ -145,6 +147,7 @@
         <button type="submit"{% if let Some(c) = r.confirm %} data-confirm="{{ c }}"{% endif %}>{% if r.state == "failed" %}Retry export{% else %}Export{% endif %}</button>
         <label class="check"><input type="checkbox" name="add_to_config" value="1" checked> and add to config</label>
         </form>
+        {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger" data-confirm="Remove the leftover {{ r.title }} files?">Remove</button></form>{% endif %}
       {% endif %}
     {% else if r.action == "toolchain" %}
       {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger"{% if let Some(c) = r.confirm %} data-confirm="{{ c }}"{% endif %}>Remove export toolchain</button></form>

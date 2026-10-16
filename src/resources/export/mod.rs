@@ -378,17 +378,101 @@ pub fn remove_toolchain(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// Delete the exported model files of `res` (and our manifest).
-pub fn remove_export(res: &Resource, models: &Path) -> Result<()> {
-    let (onnx, yaml) =
-        catalog::export_files(res).ok_or_else(|| anyhow!("{} is not exportable", res.id))?;
-    for f in [onnx, yaml] {
-        let p = models.join(f);
-        if p.exists() {
-            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
-        }
+/// OpenVINO IR of an export of `res` (`<name>.xml`, `<name>.bin`): written into the models
+/// directory by earlier versions and by `scripts/export_model.py` without `--no-openvino`.
+pub fn ir_files(res: &Resource) -> Option<(String, String)> {
+    catalog::export_files(res)?;
+    res.model_name()
+        .map(|n| (format!("{n}.xml"), format!("{n}.bin")))
+}
+
+/// `name` is a CoreML rewrite of the model `stem` (`<stem>-<16 hex>-v<N>.onnx`, any rewriter
+/// version; see `onnx_rewrite::cache_file_name`).
+fn is_coreml_copy_of(name: &str, stem: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(stem)
+        .and_then(|r| r.strip_prefix('-'))
+        .and_then(|r| r.strip_suffix(".onnx"))
+    else {
+        return false;
+    };
+    let Some((sha, v)) = rest.split_once("-v") else {
+        return false;
+    };
+    sha.len() == 16
+        && sha.bytes().all(|b| b.is_ascii_hexdigit())
+        && !v.is_empty()
+        && v.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Everything on disk that belongs to the export of `res` alone and exists: the `.onnx`, `.yaml`,
+/// manifest and IR in the models directory, files an interrupted install set aside, the staging
+/// and work directories, the downloaded weights (current and legacy layout) and the CoreML
+/// rewrites in `cache_dir`. The shared toolchain is not part of it.
+pub fn export_leftovers(res: &Resource, paths: &Paths, cache_dir: Option<&Path>) -> Vec<PathBuf> {
+    let (Some((onnx, yaml)), Some(name)) = (catalog::export_files(res), res.model_name()) else {
+        return Vec::new();
+    };
+    let models = &paths.models;
+    let mut files = vec![
+        models.join(&onnx),
+        models.join(&yaml),
+        manager::manifest_path(res, models),
+        paths.staging(name),
+        paths.weights_of(name),
+        paths.work.join(name),
+        paths
+            .tools
+            .join("yolo26-weights")
+            .join(format!("{name}.pt")),
+    ];
+    if let Some((xml, bin)) = ir_files(res) {
+        files.push(models.join(xml));
+        files.push(models.join(bin));
     }
-    let _ = std::fs::remove_file(manager::manifest_path(res, models));
+    // `.<file>.old-<pid>` from `InstallTx::put` and the manifest's `.json.tmp`.
+    let aside = [format!(".{onnx}.old-"), format!(".{yaml}.old-")];
+    let tmp = manager::manifest_path(res, models).with_extension("json.tmp");
+    files.push(tmp);
+    if let Ok(rd) = std::fs::read_dir(models) {
+        files.extend(
+            rd.flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    aside.iter().any(|a| n.starts_with(a.as_str()))
+                })
+                .map(|e| e.path()),
+        );
+    }
+    if let Some(Ok(rd)) = cache_dir.map(|c| std::fs::read_dir(c.join("coreml"))) {
+        files.extend(
+            rd.flatten()
+                .filter(|e| is_coreml_copy_of(&e.file_name().to_string_lossy(), name))
+                .map(|e| e.path()),
+        );
+    }
+    files.retain(|p| std::fs::symlink_metadata(p).is_ok());
+    files
+}
+
+/// Delete everything of the export of `res` ([`export_leftovers`]), then the per-model parent
+/// directories that are left empty.
+pub fn remove_export(res: &Resource, paths: &Paths, cache_dir: Option<&Path>) -> Result<()> {
+    if catalog::export_files(res).is_none() {
+        bail!("{} is not exportable", res.id);
+    }
+    for p in export_leftovers(res, paths, cache_dir) {
+        manager::remove_any(&p)?;
+    }
+    // Only when nothing else is in there.
+    for d in [
+        &paths.weights,
+        &paths.work,
+        &paths.tools.join("yolo26-weights"),
+    ] {
+        let _ = std::fs::remove_dir(d);
+    }
     Ok(())
 }
 
