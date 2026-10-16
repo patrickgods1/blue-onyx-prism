@@ -72,7 +72,7 @@ mod service {
     use anyhow::Result;
     use blue_onyx_prism::backend::libs;
     use blue_onyx_prism::cli::{self, ExtraLogLayer, LogReloadHandle};
-    use blue_onyx_prism::config::{Config, LogFormat, LogLevel};
+    use blue_onyx_prism::config::{Config, LogFormat, LogLevel, LogTimezone};
     use blue_onyx_prism::sync::LockExt;
     use blue_onyx_prism::{resolve_path, runner, system_info};
     use std::ffi::OsString;
@@ -175,6 +175,7 @@ mod service {
         level: LogLevel,
         log_path: Option<PathBuf>,
         format: LogFormat,
+        timezone: LogTimezone,
     ) -> Result<LogReloadHandle> {
         let (layer, problem) = match event_log_layer() {
             Ok(l) => (Some(l), None),
@@ -183,7 +184,7 @@ mod service {
                 (None, Some(why))
             }
         };
-        let log = cli::init_logging_opts(level, log_path.as_deref(), format, layer)?;
+        let log = cli::init_logging_opts(level, log_path.as_deref(), format, timezone, layer)?;
         if let Some(why) = problem {
             warn!("{why}");
         }
@@ -204,15 +205,16 @@ mod service {
         // `--config` comes from the process args (the ImagePath); SCM start arguments are ignored.
         let config_path = cli::service_config_path_from_args().map_err(|e| format!("{e:#}"));
         let first = load_config(&config_path);
-        let (level, log_path, format) = match &first {
+        let (level, log_path, format, timezone) = match &first {
             Ok((c, _)) => (
                 c.log_level,
                 c.log_path.as_deref().map(resolve_path),
                 c.log_format,
+                c.log_timezone,
             ),
-            Err(_) => (LogLevel::Info, None, LogFormat::Text),
+            Err(_) => (LogLevel::Info, None, LogFormat::Text, LogTimezone::Utc),
         };
-        let log = match init_logging(level, log_path, format) {
+        let log = match init_logging(level, log_path, format, timezone) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("{e:#}");
@@ -396,6 +398,7 @@ mod service {
                     {
                         warn!("{e:#}");
                     }
+                    log.set_timezone(config.log_timezone);
                     active_level = Some(config.log_level);
                     runner::run_server_on(&rt, config, path, log.clone(), attempt.clone())
                 }

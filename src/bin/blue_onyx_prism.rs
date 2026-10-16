@@ -422,6 +422,7 @@ fn run(cli: Cli) -> Result<()> {
         config.log_level,
         log_path.as_deref(),
         config.log_format,
+        config.log_timezone,
         None,
     )?;
     cli::log_startup_warnings(&config);

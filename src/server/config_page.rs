@@ -44,6 +44,7 @@ pub(super) struct ConfigView {
     nms_iou: String,
     object_filter: String,
     log_level: String,
+    log_timezone: String,
     log_path: String,
     save_image_path: String,
     save_ref_image: bool,
@@ -77,6 +78,7 @@ impl ConfigView {
             nms_iou: crate::config::clean_f32(c.nms_iou).to_string(),
             object_filter: c.object_filter.join(", "),
             log_level: c.log_level.as_str().to_string(),
+            log_timezone: c.log_timezone.to_string(),
             log_path: path(&c.log_path),
             save_image_path: path(&c.save_image_path),
             save_ref_image: c.save_ref_image,
@@ -118,6 +120,7 @@ impl ConfigView {
                         "nms_iou" => &mut self.nms_iou,
                         "object_filter" => &mut self.object_filter,
                         "log_level" => &mut self.log_level,
+                        "log_timezone" => &mut self.log_timezone,
                         "log_path" => &mut self.log_path,
                         "save_image_path" => &mut self.save_image_path,
                         "save_image_max_age_days" => &mut self.save_image_max_age_days,
@@ -631,6 +634,12 @@ pub(super) fn save_config(
     let pending = crate::config_merge::pending(&state.running(), &state.config_read());
     if pending.restart_needed() {
         msg.push_str(" Restart the server to apply the other changes.");
+    }
+    let tz = state.config_read().log_timezone;
+    if tz != up.before.log_timezone
+        && let Some(h) = &state.log_reload
+    {
+        h.set_timezone(tz);
     }
     if let Some(level) = level {
         match apply_log_level(state, level) {

@@ -1,6 +1,6 @@
 //! Command line, config resolution and logging setup.
 
-use crate::config::{Config, LogFormat, LogLevel, ModelConfig};
+use crate::config::{Config, LogFormat, LogLevel, LogTimezone, ModelConfig};
 use crate::model::ModelFamilyKind;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -731,6 +731,8 @@ pub struct LogReloadHandle {
     level: Arc<std::sync::Mutex<LogLevel>>,
     /// The in-memory ring behind the web UI's Logs page.
     buffer: crate::logbuf::LogBuffer,
+    /// The zone of log timestamps (shared with the timers and the buffer).
+    timezone: crate::logbuf::SharedTimezone,
     _guard: Option<Arc<tracing_appender::non_blocking::WorkerGuard>>,
     /// Keeps the filter layer of a [`Self::detached`] handle alive (reloads need it).
     _detached: Option<Arc<reload::Layer<EnvFilter, Registry>>>,
@@ -782,6 +784,25 @@ impl LogReloadHandle {
         Ok(())
     }
 
+    /// Change the time zone of log timestamps (file, console and the Logs page); applies to the
+    /// next event. A change is logged at info.
+    pub fn set_timezone(&self, tz: LogTimezone) {
+        let from = self.timezone();
+        if from == tz {
+            return;
+        }
+        *self
+            .timezone
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tz;
+        tracing::info!(from = %from, to = %tz, "log time zone changed from {from} to {tz}");
+    }
+
+    /// The time zone of log timestamps now.
+    pub fn timezone(&self) -> LogTimezone {
+        crate::logbuf::current_timezone(&self.timezone)
+    }
+
     /// The level the filter has now.
     pub fn level(&self) -> LogLevel {
         use crate::sync::LockExt;
@@ -797,10 +818,12 @@ impl LogReloadHandle {
     /// work but see no events unless `buffer` is fed directly (tests of the HTTP layer).
     pub fn detached(level: LogLevel) -> Self {
         let (layer, handle) = reload::Layer::<EnvFilter, Registry>::new(filter_for(level));
+        let buffer = crate::logbuf::LogBuffer::default();
         Self {
             handle,
             level: Arc::new(std::sync::Mutex::new(level)),
-            buffer: crate::logbuf::LogBuffer::default(),
+            timezone: buffer.timezone(),
+            buffer,
             _guard: None,
             _detached: Some(Arc::new(layer)),
         }
@@ -833,7 +856,7 @@ pub fn init_logging_with(
     log_path: Option<&Path>,
     extra: Option<ExtraLogLayer>,
 ) -> Result<LogReloadHandle> {
-    init_logging_opts(level, log_path, LogFormat::Text, extra)
+    init_logging_opts(level, log_path, LogFormat::Text, LogTimezone::Utc, extra)
 }
 
 /// The daily rolling appender under `dir` (created when missing).
@@ -853,7 +876,8 @@ fn file_appender(dir: &Path) -> Result<tracing_appender::rolling::RollingFileApp
 /// Install the global subscriber: the reloadable level filter (which also governs `extra` and
 /// the in-memory [`crate::logbuf::LogBuffer`] behind [`LogReloadHandle::buffer`]; `extra` may
 /// add its own per-layer filter on top), then either a daily rolling file in `log_path` in
-/// `format` (`json`: one object per line) or stdout (always text).
+/// `format` (`json`: one object per line) or stdout (always text). Timestamps are in
+/// `timezone` (changeable later with [`LogReloadHandle::set_timezone`]).
 ///
 /// A `log_path` that cannot be created or opened does not stop the program (CO-11): logging
 /// falls back to stdout with a warning. Messages kept by [`crate::logbuf::early`] before this
@@ -862,10 +886,16 @@ pub fn init_logging_opts(
     level: LogLevel,
     log_path: Option<&Path>,
     format: LogFormat,
+    timezone: LogTimezone,
     extra: Option<ExtraLogLayer>,
 ) -> Result<LogReloadHandle> {
     let (filter, handle) = reload::Layer::new(filter_for(level));
     let buffer = crate::logbuf::LogBuffer::default();
+    let tz_cell = buffer.timezone();
+    *tz_cell
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timezone;
+    let timer = crate::logbuf::LogTimer(tz_cell.clone());
     let registry = tracing_subscriber::registry()
         .with(filter)
         .with(extra)
@@ -897,11 +927,13 @@ pub fn init_logging_opts(
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let file_layer = match format {
                 LogFormat::Text => tracing_subscriber::fmt::layer()
+                    .with_timer(timer.clone())
                     .with_writer(writer)
                     .with_ansi(false)
                     .boxed(),
                 LogFormat::Json => tracing_subscriber::fmt::layer()
                     .json()
+                    .with_timer(timer.clone())
                     .with_writer(writer)
                     .with_ansi(false)
                     .boxed(),
@@ -911,7 +943,7 @@ pub fn init_logging_opts(
         }
         None => {
             registry
-                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().with_timer(timer))
                 .try_init()
                 .map_err(init_err)?;
             None
@@ -922,6 +954,7 @@ pub fn init_logging_opts(
         handle,
         level: Arc::new(std::sync::Mutex::new(level)),
         buffer,
+        timezone: tz_cell,
         _guard: guard.map(Arc::new),
         _detached: None,
     })

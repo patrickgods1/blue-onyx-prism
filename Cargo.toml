@@ -58,6 +58,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tracing-appender = "0.2"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4"] }
 fast_image_resize = { version = "6", features = ["image"] }
 zune-jpeg = "0.5"
