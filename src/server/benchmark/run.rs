@@ -85,7 +85,10 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
 }
 
 /// `POST /v1/benchmark/settings`: the same fields as a start, saved as the `benchmark` config
-/// defaults (plus `add_folder` = a directory to add as `dir:<path>`).
+/// defaults (plus `add_folder` = a directory to add as `dir:<path>`). The saved results are
+/// then re-graded for the accuracy metric and weight and their threshold advice recomputed for
+/// the objective ([`crate::benchmark::rescore`], no inference); `regraded` says whether they
+/// changed.
 pub(in crate::server) async fn settings(
     State(state): State<Arc<AppState>>,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
@@ -122,17 +125,97 @@ fn settings_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Respon
         req.to_config(&mut c.benchmark);
         Ok(())
     }) {
-        Ok(_) => Json(serde_json::json!({
-            "success": true,
-            "message": format!(
+        Ok(_) => {
+            let (regraded, note) = rescore_saved(state, &req);
+            let mut message = format!(
                 "Benchmark defaults saved to {} (datasets: {}).",
                 state.config_path.display(),
-                req.datasets.iter().map(DatasetRef::label).collect::<Vec<_>>().join(", ")
-            ),
-        }))
-        .into_response(),
+                req.datasets
+                    .iter()
+                    .map(DatasetRef::label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if regraded {
+                message.push_str(" The saved results were re-ranked for these settings.");
+            }
+            if let Some(n) = note {
+                message.push(' ');
+                message.push_str(&n);
+            }
+            Json(serde_json::json!({
+                "success": true,
+                "message": message,
+                "regraded": regraded,
+            }))
+            .into_response()
+        }
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
+}
+
+/// Re-grade the saved results for `req`'s metric, weight and objective and save them when
+/// they changed: (changed, a note when it was not done).
+fn rescore_saved(state: &AppState, req: &RunRequest) -> (bool, Option<String>) {
+    use crate::benchmark::search::{StoredPreds, preds_path};
+    if state.benchmark.is_running() {
+        return (
+            false,
+            Some(
+                "A benchmark is running; the saved results are re-ranked when it saves them."
+                    .into(),
+            ),
+        );
+    }
+    let path = results_path(&state.config_path);
+    let mut results = match BenchmarkResults::load_with_warnings(&path) {
+        Ok((Some(r), w)) if w.is_empty() => r,
+        Ok((None, _)) => return (false, None),
+        Ok((Some(_), w)) => {
+            return (
+                false,
+                Some(format!(
+                    "The saved results were not re-ranked: {} (run the benchmark again to                      replace the entries that do not load).",
+                    w.join("; ")
+                )),
+            );
+        }
+        Err(e) => {
+            return (
+                false,
+                Some(format!("The saved results were not re-ranked: {e:#}.")),
+            );
+        }
+    };
+    let preds = StoredPreds::load_cached(&preds_path(&state.config_path))
+        .map_err(|e| tracing::warn!("{e:#}"))
+        .ok()
+        .flatten();
+    let r = crate::benchmark::rescore::rescore(
+        &mut results,
+        preds.as_deref(),
+        req.accuracy_metric,
+        req.weights,
+        req.threshold_objective,
+    );
+    if !r.changed {
+        return (false, None);
+    }
+    if let Err(e) = results.save(&path) {
+        tracing::warn!("re-ranking the saved benchmark results: {e:#}");
+        return (
+            false,
+            Some(format!(
+                "The saved results were not re-ranked: {e:#}. Check that the folder is writable."
+            )),
+        );
+    }
+    info!(
+        exact = r.exact,
+        grid = r.grid,
+        "benchmark results re-ranked for new settings"
+    );
+    (true, None)
 }
 
 /// `POST /v1/benchmark/cancel`: 200 when a run was asked to stop, 409 when none runs.

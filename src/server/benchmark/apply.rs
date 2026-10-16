@@ -25,7 +25,8 @@ use tracing::{info, warn};
 ///
 /// The changed models reload on their new devices at once (per-model reload); `restart=1`
 /// restarts the server when a change could not be applied that way. Answers JSON with the
-/// changes; 400 on bad input, 404 when `all` finds no recommendation.
+/// changes and `previous` (model -> its device before, a spec or `global`: what Undo posts
+/// back as `device`); 400 on bad input, 404 when `all` finds no recommendation.
 pub(in crate::server) async fn apply(
     State(state): State<Arc<AppState>>,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
@@ -56,10 +57,21 @@ fn apply_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response 
     }
     let (message, restarting) = device_apply_outcome(state, &changes, restart);
     info!("benchmark apply: {message}");
+    // For Undo: POST `model=<m>&device=<previous>` (`global` = follow the global device).
+    let previous: serde_json::Map<String, serde_json::Value> = changes
+        .iter()
+        .map(|c| {
+            (
+                c.model.clone(),
+                c.from.clone().unwrap_or_else(|| "global".into()).into(),
+            )
+        })
+        .collect();
     Json(serde_json::json!({
         "success": true,
         "message": message,
         "changes": changes,
+        "previous": previous,
         "restarting": restarting,
     }))
     .into_response()
@@ -302,11 +314,13 @@ pub(super) const BLUE_IRIS_THRESHOLD_NOTE: &str = "Blue Iris may send its own mi
 
 /// `POST /v1/benchmark/apply-threshold`: set per-model `confidence_threshold` in the config.
 /// - `model=<name>&threshold=<0..1>`: one model (repeat the pair for several);
+///   `threshold=global` clears the model's own threshold (the Undo of a first apply);
 /// - `all=1` (optionally limited by repeated `model`): every best threshold of the saved results.
 ///
 /// Thresholds apply live (no restart; `restart=1` is accepted and ignored, `restarting` is
-/// always false). Answers JSON with the changes; 400 on bad input, 404 when `all` finds no
-/// best threshold.
+/// always false). Answers JSON with the changes and `previous` (model -> its own threshold
+/// before, `0.40` or `global`: what Undo posts back as `threshold`); 400 on bad input, 404
+/// when `all` finds no best threshold.
 pub(in crate::server) async fn apply_threshold(
     State(state): State<Arc<AppState>>,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
@@ -327,7 +341,17 @@ fn apply_threshold_blocking(state: &Arc<AppState>, form: &[(String, String)]) ->
     };
     let mut changes: Vec<ThresholdChange> = Vec::new();
     if let Err(e) = save_config(state, "benchmark apply-threshold", |c| {
-        changes = apply_model_thresholds(c, &picks)?;
+        let set: Vec<(String, f32)> = picks
+            .iter()
+            .filter_map(|(m, t)| Some((m.clone(), (*t)?)))
+            .collect();
+        let clear: Vec<String> = picks
+            .iter()
+            .filter(|(_, t)| t.is_none())
+            .map(|(m, _)| m.clone())
+            .collect();
+        changes = apply_model_thresholds(c, &set)?;
+        changes.extend(clear_model_thresholds(c, &clear)?);
         Ok(())
     }) {
         warn!("benchmark threshold apply refused: {e:#}");
@@ -354,31 +378,85 @@ fn apply_threshold_blocking(state: &Arc<AppState>, form: &[(String, String)]) ->
     message.push(' ');
     message.push_str(BLUE_IRIS_THRESHOLD_NOTE);
     info!("benchmark threshold apply: {message}");
+    // For Undo: POST `model=<m>&threshold=<previous>` (`global` = use the global threshold).
+    let previous: serde_json::Map<String, serde_json::Value> = changes
+        .iter()
+        .map(|c| {
+            (
+                c.model.clone(),
+                c.from
+                    .map_or_else(|| "global".to_string(), |t| format!("{t:.2}"))
+                    .into(),
+            )
+        })
+        .collect();
     Json(serde_json::json!({
         "success": true,
         "message": message,
         "changes": changes,
+        "previous": previous,
         "restarting": restarting,
     }))
     .into_response()
 }
 
+/// Clear the per-model `confidence_threshold` of the named models (they use the global one
+/// again): the Undo of a threshold apply on a model that had none. Every name is checked
+/// first; on error `config` is unchanged. Returns the entries that changed.
+fn clear_model_thresholds(
+    config: &mut Config,
+    names: &[String],
+) -> anyhow::Result<Vec<ThresholdChange>> {
+    use crate::registry::normalize_name;
+    let global = config.confidence_threshold;
+    for n in names {
+        if !config
+            .models
+            .iter()
+            .any(|m| normalize_name(&m.effective_name()) == normalize_name(n))
+        {
+            anyhow::bail!("'{n}' is not one of the configured models");
+        }
+    }
+    let mut changes = Vec::new();
+    for n in names {
+        let key = normalize_name(n);
+        for m in config
+            .models
+            .iter_mut()
+            .filter(|m| normalize_name(&m.effective_name()) == key)
+        {
+            if let Some(old) = m.confidence_threshold.take() {
+                changes.push(ThresholdChange {
+                    model: m.effective_name(),
+                    from: Some(old),
+                    to: global,
+                    global,
+                });
+            }
+        }
+    }
+    Ok(changes)
+}
+
 /// The (model, threshold) pairs of an apply-threshold form: `all=1` takes the saved best
 /// thresholds of the configured models (limited to the form's models, if any), else the
-/// `model` / `threshold` pairs.
+/// `model` / `threshold` pairs (`threshold=global`: None, the model's own threshold is
+/// cleared).
 fn threshold_picks(
     state: &AppState,
     form: &[(String, String)],
-) -> Result<Vec<(String, f32)>, ApiError> {
+) -> Result<Vec<(String, Option<f32>)>, ApiError> {
     let models = form_models(form);
     if form_field(form, "all").is_some_and(truthy) {
         let results = results_for_apply(state)?;
         let only = (!models.is_empty()).then_some(models.as_slice());
         let cfg = state.config_read().clone();
-        let picks: Vec<(String, f32)> = results
+        let picks: Vec<(String, Option<f32>)> = results
             .thresholds(only)
             .into_iter()
             .filter(|(m, _)| crate::benchmark::find_model(&cfg, m).is_some())
+            .map(|(m, t)| (m, Some(t)))
             .collect();
         if picks.is_empty() {
             return Err(ApiError::new(
@@ -402,8 +480,12 @@ fn threshold_picks(
     }
     let mut picks = Vec::new();
     for (m, t) in models.iter().zip(values) {
+        if t.eq_ignore_ascii_case("global") {
+            picks.push((m.clone(), None));
+            continue;
+        }
         match t.parse::<f32>() {
-            Ok(v) => picks.push((m.clone(), v)),
+            Ok(v) => picks.push((m.clone(), Some(v))),
             Err(_) => {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,

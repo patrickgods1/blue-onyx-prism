@@ -354,7 +354,11 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     bench.threshold_objective = objective;
     bench.accuracy_metric = metric;
 
-    let swept = ctx.run_jobs(&mut bench, &progress, &jobs, all_devices, &mut report)?;
+    let run_id = crate::benchmark::history::new_run_id();
+    let mut swept = ctx.run_jobs(&mut bench, &progress, &jobs, all_devices, &mut report)?;
+    for m in &mut swept {
+        m.run_id = Some(run_id.clone());
+    }
 
     if all_devices
         && !swept.is_empty()
@@ -723,7 +727,8 @@ impl RunCtx<'_> {
     }
 
     /// Merge `results` into `benchmark.json` (and the stored predictions) beside the config
-    /// unless `--no-save`; returns what was saved (`results` itself with `--no-save`).
+    /// and record the models in the run history unless `--no-save`; returns what was saved
+    /// (`results` itself with `--no-save`).
     fn save_results(
         &self,
         results: BenchmarkResults,
@@ -741,11 +746,20 @@ impl RunCtx<'_> {
         if let Some(w) = BenchmarkResults::merge_warning(prev.as_ref(), &results) {
             report.warn(self.args.json, w);
         }
+        // The results before this save seed the history of models that have none yet.
+        let seeds = prev
+            .as_ref()
+            .map(crate::benchmark::history::seed_entries)
+            .unwrap_or_default();
         let mut merged = BenchmarkResults::merge(prev, results);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(self.metric, self.weights);
         merged.save(&path)?;
         for w in crate::benchmark::search::save_beside(&path, &merged, swept) {
+            report.warn(self.args.json, w);
+        }
+        let names: Vec<String> = swept.iter().map(|m| m.model.clone()).collect();
+        for w in crate::benchmark::history::record(&path, &seeds, &merged, &names) {
             report.warn(self.args.json, w);
         }
         if !self.args.json {

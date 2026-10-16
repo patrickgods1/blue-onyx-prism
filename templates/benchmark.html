@@ -9,15 +9,44 @@
 <p class="warn">{{ warning }}</p>
 {% if force_cpu %}<p class="warn">Force CPU is on: it overrides every per-model device until it is unchecked on the <a href="/config#inference">Config page</a>.</p>{% endif %}
 
+<ol class="steps" id="steps" aria-label="How to use this page">
+  <li data-step="run"><a href="#tab-run"><span class="step-n" aria-hidden="true">1</span> Run<span class="step-sub">measure your models and devices</span></a></li>
+  <li data-step="review"><a href="#tab-overview"><span class="step-n" aria-hidden="true">2</span> Review<span class="step-sub">see what to use and what changed</span></a></li>
+  <li data-step="apply"><a href="#setup"><span class="step-n" aria-hidden="true">3</span> Apply<span class="step-sub">use the recommended device and confidence</span></a></li>
+</ol>
+
 <nav class="toc tabs" role="tablist" aria-label="Sections">
-  <a role="tab" href="#tab-run">Run</a><a role="tab" href="#tab-results">Results</a><a role="tab" href="#tab-confidence">Confidence</a><a role="tab" href="#tab-models">Models</a>
+  <a role="tab" href="#tab-overview">Overview</a><a role="tab" href="#tab-compare">Compare</a><a role="tab" href="#tab-confidence">Confidence</a><a role="tab" href="#tab-details">Details</a><a role="tab" href="#tab-run">Run</a>
 </nav>
 <div class="status-bar" id="status">
   <div id="progress" hidden><progress id="bar" max="100"></progress> <span id="ptext" class="muted"></span> <button type="button" id="cancel" class="danger small" hidden>Cancel</button></div>
   <p id="msg" class="muted" aria-live="polite"></p>
-  <p id="apply-msg" class="notice" hidden></p>
+  <div id="apply-msg" class="notice" role="status" hidden></div>
   <ul id="warnings" class="warn-list"></ul>
 </div>
+
+<section class="panel" id="tab-overview">
+  <noscript><p class="muted">The results view needs JavaScript; see <a href="/v1/benchmark">/v1/benchmark</a>.</p></noscript>
+  <p id="no-results" class="empty" hidden>No results yet. Choose datasets, models and devices under <a href="#tab-run">Run</a> and start a benchmark; this page then says which model, device and confidence to use.</p>
+  <div id="run-banner"></div>
+  <div id="preset"></div>
+  <div id="recommend"></div>
+  <div id="setup"></div>
+  <div id="ranking"></div>
+  <div class="actions" id="apply-all-bar" hidden>
+    <button type="button" id="apply-all">Apply recommended devices to all models</button>
+    <span class="muted">Writes each model's <code>device</code> into the config; the models reload on their new devices at once (no restart).</span>
+  </div>
+  <div id="glossary"></div>
+</section>
+
+<section class="panel" id="tab-compare">
+  <p class="muted">Compare models, devices and runtimes side by side, or one model across runs. The filters drive every chart and table here and are remembered in this browser.</p>
+  <div id="cmp-filters"></div>
+  <p id="cmp-empty" class="empty" hidden></p>
+  <section id="cmp-side"></section>
+  <section id="cmp-runs"></section>
+</section>
 
 <section class="panel" id="tab-run">
 <form id="bench-form" class="card primary">
@@ -58,7 +87,9 @@
     <fieldset>
       <legend>Settings</legend>
       <label>Images per dataset (0 = all) <input type="number" name="max_images" min="0" value="{{ max_images }}"></label>
+      <p class="field-hint">Small sets give noisy accuracy: aim for 200+ labelled objects (a few hundred images) before trusting a difference.</p>
       <label>Timed runs per image <input type="number" name="repeat" min="1" max="1000" value="{{ repeat }}"></label>
+      <p class="field-hint">More timed runs give steadier speeds (3 or more); accuracy does not change.</p>
       <label>Warm-up runs <input type="number" name="warmup" min="0" max="100" value="{{ warmup }}"></label>
       <label><input type="hidden" name="low_priority" value="0"><input type="checkbox" name="low_priority" value="1"{% if low_priority %} checked{% endif %}> Run at low priority (keeps the desktop responsive)</label>
       <label>Accuracy weight of the overall grade (0..1, speed gets the rest) <input type="number" name="accuracy_weight" min="0" max="1" step="0.05" value="{{ accuracy_weight }}"></label>
@@ -78,27 +109,18 @@
     <button type="button" id="save-defaults" class="secondary">Save as default</button>
     <span id="run-msg" class="muted" aria-live="polite"></span>
   </div>
+  <p id="estimate" class="muted" aria-live="polite"></p>
 </form>
 </section>
 
-<section class="panel" id="tab-results">
-<section id="results">
-  <noscript><p class="muted">The results view needs JavaScript; see <a href="/v1/benchmark">/v1/benchmark</a>.</p></noscript>
-  <p id="no-results" class="empty" hidden>No results yet. Choose datasets, models and devices under <a href="#tab-run">Run</a> and start a benchmark.</p>
-  <div id="summary" class="cards"></div>
-  <div id="ranking"></div>
-  <div class="actions" id="apply-all-bar" hidden>
-    <button type="button" id="apply-all">Apply recommended devices to all models</button>
-    <span class="muted">Writes each model's <code>device</code> into the config; a restart loads them.</span>
-  </div>
-</section>
-</section>
-
 <section class="panel" id="tab-confidence">
+  <div id="conf-pick"></div>
+  <div id="conf-best"></div>
+  <details class="bd more-detail" id="conf-more" data-keep="d:conf-more"><summary>More detail: every threshold number and the confidence search</summary>
   <div id="thresholds"></div>
   <div class="actions" id="apply-thr-bar" hidden>
     <button type="button" id="apply-all-thr">Apply all thresholds</button>
-    <span class="muted">Writes each model's best threshold as its <code>confidence_threshold</code> in the config; a restart uses them. {{ blue_iris_note }}</span>
+    <span class="muted">Writes each model's best threshold as its <code>confidence_threshold</code> in the config; the next detections use it (no restart). {{ blue_iris_note }}</span>
   </div>
 
 <section class="card" id="search-card">
@@ -136,10 +158,11 @@
   </form>
   <div id="s-results"></div>
 </section>
+  </details>
 </section>
 
-<section class="panel" id="tab-models">
-  <p id="no-models" class="empty" hidden>No per-model results yet.</p>
+<section class="panel" id="tab-details">
+  <p id="no-models" class="empty" hidden>No per-model results yet: start a benchmark under <a href="#tab-run">Run</a>.</p>
   <div id="models"></div>
 </section>
 
@@ -149,5 +172,8 @@
   <button type="button" id="drill-close">Close</button></div>
   <div id="drill-body" class="thumbs"></div></dialog>
 
+<script src="/static/bench-glossary.js?v={{ version }}"></script>
+<script src="/static/bench-charts.js?v={{ version }}"></script>
+<script src="/static/bench-compare.js?v={{ version }}"></script>
 <script src="/static/benchmark.js?v={{ version }}"></script>
 {% endblock %}

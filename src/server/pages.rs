@@ -31,6 +31,21 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     ("style.css", CSS, include_str!("../../assets/style.css")),
     ("live.js", JS, include_str!("../../assets/live.js")),
     (
+        "bench-glossary.js",
+        JS,
+        include_str!("../../assets/bench-glossary.js"),
+    ),
+    (
+        "bench-charts.js",
+        JS,
+        include_str!("../../assets/bench-charts.js"),
+    ),
+    (
+        "bench-compare.js",
+        JS,
+        include_str!("../../assets/bench-compare.js"),
+    ),
+    (
         "benchmark.js",
         JS,
         include_str!("../../assets/benchmark.js"),

@@ -1,17 +1,24 @@
 // Blue Onyx Prism: Benchmark page (served from /static/; no inline scripts under the CSP).
+// Overview (what to use, what changed), Confidence, Details, Run and the page wiring. The
+// vocabulary and tooltips are in bench-glossary.js, the charts in bench-charts.js and the
+// Compare tab in bench-compare.js, shared through window.PrismBench (loaded before this file).
 (function () {
+  var PB = window.PrismBench, C = PB.charts, F = PB.fmt, has = PB.has;
   var $ = function (id) { return document.getElementById(id); };
   var form = $("bench-form"), msg = $("msg"), bar = $("bar"), ptext = $("ptext");
-  var polling = null, lastState = null, lastConfig = null;
+  var polling = null, lastState = null, lastConfig = null, lastModels = [], lastStatus = null;
+  // Old links: #tab-results is the Overview now, #tab-models the Details tab. Rewritten before
+  // the tabs read the URL (and on later hash changes, before their listener runs).
+  var ALIAS = {"#tab-results": "#tab-overview", "#tab-models": "#tab-details"};
+  function alias() { var h = ALIAS[location.hash]; if (!h) return; if (history.replaceState) history.replaceState(null, "", h); else location.hash = h; }
+  alias(); window.addEventListener("hashchange", alias);
   // The forms are driven by their buttons; Enter in a field must not navigate.
   ["bench-form", "search-form"].forEach(function (id) { var f = $(id); if (f) f.addEventListener("submit", function (e) { e.preventDefault(); }); });
-  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined && text !== null) e.textContent = text; return e; }
+  var el = PB.el;
   function pct(v) { return v === null || v === undefined ? "-" : (v * 100).toFixed(1); }
   function ms(v) { return v === null || v === undefined ? "-" : v.toFixed(1); }
   function gradeEl(g, rel) { var s = el("span", "grade grade-" + (g || "none"), (g || "-") + (rel ? "*" : "")); if (rel) s.title = "relative to a reference model, not ground truth"; return s; }
-  function post(url, body) {
-    return fetch(url, {method: "POST", body: body, headers: {"Accept": "application/json"}}).then(function (r) { return r.json().then(function (j) { j._status = r.status; return j; }); });
-  }
+  var post = PB.post;
   function formBody(extra) {
     var b = new URLSearchParams();
     // Hidden "0" before its checkbox: an unchecked box still sends its value (the last one wins).
@@ -24,6 +31,13 @@
     if (extra) Object.keys(extra).forEach(function (k) { b.append(k, extra[k]); });
     return b;
   }
+  // The body of POST /v1/benchmark/settings: the Run form ("Save as default" sends the same).
+  function settingsBody() {
+    var b = formBody(); b.delete("dataset");
+    form.querySelectorAll("input[name=dataset]:checked").forEach(function (c) { b.append("dataset", c.value); });
+    var f = $("add-folder").value.trim(); if (f) b.append("add_folder", f);
+    return b;
+  }
   var runMsg = $("run-msg");
   $("start").addEventListener("click", function () {
     msg.textContent = "starting…"; runMsg.textContent = "";
@@ -31,10 +45,8 @@
   });
   $("cancel").addEventListener("click", function () { post("/v1/benchmark/cancel", "").then(function (j) { msg.textContent = j.message; }); });
   $("save-defaults").addEventListener("click", function () {
-    var b = formBody(); b.delete("dataset");
-    form.querySelectorAll("input[name=dataset]:checked").forEach(function (c) { b.append("dataset", c.value); });
-    var f = $("add-folder").value.trim(); if (f) b.append("add_folder", f);
-    post("/v1/benchmark/settings", b).then(function (j) { runMsg.textContent = j.message; if (j.success && f) L.reloadKeep(); });
+    var f = $("add-folder").value.trim();
+    post("/v1/benchmark/settings", settingsBody()).then(function (j) { runMsg.textContent = j.message; if (j.success && f) L.reloadKeep(); else if (j.success) refresh(); });
   });
   form.querySelectorAll("[data-download]").forEach(function (b) {
     b.addEventListener("click", function () {
@@ -64,7 +76,8 @@
   });
 
   // Sortable tables: click a header; numeric when the cell has data-v. The sort survives
-  // re-renders (PrismLive.keep / patch carry it over by the table's key).
+  // re-renders (PrismLive.keep / patch carry it over by the table's key). A term tooltip
+  // button inside a header does not sort (bench-glossary.js stops its events).
   var L = window.PrismLive, T = L && L.tabs(document.querySelector("nav.tabs"));
   function sortable(table) {
     table.querySelectorAll("th").forEach(function (th, i) {
@@ -72,15 +85,16 @@
       if (th.textContent) th.title = "Sort by " + th.textContent;
       var sort = function () { L.sortTable(table, i, th.dataset.dir !== "asc"); };
       th.addEventListener("click", sort);
-      th.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sort(); } });
+      th.addEventListener("keydown", function (e) { if (e.target !== th) return; if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sort(); } });
     });
     return table;
   }
-  // "12 Oct 2026, 16:53" in the browser's time zone (results store RFC 3339 UTC).
-  function when(ts) { var d = ts ? new Date(ts) : null; return d && !isNaN(d) ? d.toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : (ts || ""); }
+  PB.sortable = sortable;
+  var when = F.when;
+  // Headers: plain text, or "@id" for a LABELS column with its glossary tooltip.
   function table(cls, head) {
     var t = el("table", "bench " + (cls || "")), tr = el("tr"); var th = el("thead");
-    head.forEach(function (h) { tr.appendChild(el("th", null, h)); }); th.appendChild(tr); t.appendChild(th); t.appendChild(el("tbody")); return t;
+    head.forEach(function (h) { var c = el("th"); if (typeof h === "string" && h.charAt(0) === "@") c.appendChild(PB.head(h.slice(1))); else c.textContent = h; tr.appendChild(c); }); th.appendChild(tr); t.appendChild(th); t.appendChild(el("tbody")); return t;
   }
   function cell(tr, text, v, label) { var c = el("td", v !== undefined ? "num" : null, text); if (v !== undefined) c.dataset.v = v === null ? "" : v; if (label) c.dataset.label = label; tr.appendChild(c); return c; }
   // A horizontally scrolling wrapper; `key` names it (and its table) so its scroll position
@@ -104,19 +118,62 @@
     var total = a.matched + Math.max(a.only_device, a.only_reference);
     return {reference: "reference", agrees: "agrees", minor: "minor (" + a.matched + "/" + total + ")", disagrees: "DISAGREES (" + a.matched + "/" + total + ")"}[a.verdict] || a.verdict;
   }
+
+  // ---- apply, with before -> after and Undo ---------------------------------------------------
   function useDevice(model, device) {
-    return post("/v1/benchmark/apply", new URLSearchParams({model: model, device: device})).then(showApply);
+    return post("/v1/benchmark/apply", new URLSearchParams({model: model, device: device})).then(function (j) { showApply(j, "device"); });
   }
-  function showApply(j) {
-    var box = $("apply-msg"); box.hidden = false; box.className = j.success ? "notice" : "error"; box.replaceChildren(el("span", null, j.message + " "));
-    if (j.success && j.changes && j.changes.length && !j.restarting) {
-      var b = el("button", "danger", "Restart now"); b.type = "button";
+  function useThreshold(model, t) {
+    return post("/v1/benchmark/apply-threshold", new URLSearchParams({model: model, threshold: t.toFixed(2)})).then(function (j) { showApply(j, "threshold"); });
+  }
+  // The value before an apply: the answer's `previous` (newer servers), else the change's `from`
+  // (null = the global setting: "" for a device, the global value for a threshold).
+  function previousOf(j, c, kind) {
+    var p = j.previous && Object.prototype.hasOwnProperty.call(j.previous, c.model) ? j.previous[c.model] : undefined;
+    if (p === undefined) p = c.from;
+    // Newer servers answer "global" (follow the global setting) or "0.40"; both post back as is.
+    if (kind === "threshold") { if (p === null || p === undefined) p = c.global; return typeof p === "number" ? p.toFixed(2) : String(p); }
+    return p === null || p === undefined ? "global" : p;
+  }
+  function describeChange(c, kind) {
+    if (kind === "threshold") {
+      var from = has(c.from) ? F.thrBi(c.from) : (has(c.global) ? F.thrBi(c.global) + " (global)" : "global");
+      return c.model + ": confidence " + from + " → " + F.thrBi(c.to);
+    }
+    return c.model + ": device " + (c.from || "global") + " → " + (c.to || "global");
+  }
+  function showApply(j, kind, undone) {
+    var box = $("apply-msg"); box.hidden = false; box.className = j.success ? "notice apply-box" : "error apply-box"; box.replaceChildren();
+    var changes = (j.changes || []).filter(function (c) { return c && c.model; });
+    if (j.success && changes.length) {
+      box.appendChild(el("strong", null, undone ? "Undone: " : kind === "threshold" ? "Applied now: the next detections use it. " : "Applied: "));
+      var ul = el("ul", "apply-list"); changes.forEach(function (c) { ul.appendChild(el("li", null, describeChange(c, kind))); }); box.appendChild(ul);
+    }
+    box.appendChild(el("span", "muted", j.message + " "));
+    if (j.success && changes.length && !undone && kind) {
+      var u = el("button", "small secondary", "Undo"); u.type = "button";
+      u.addEventListener("click", function () { u.disabled = true; undo(j, kind, changes); });
+      box.appendChild(u);
+    }
+    if (j.success && /Restart the server to apply/.test(j.message || "") && !j.restarting) {
+      var b = el("button", "small danger", "Restart now"); b.type = "button";
       b.addEventListener("click", restart); box.appendChild(b);
     }
     if (j.restarting) waitForRestart();
     if (window.PrismLive) PrismLive.poll();
     refresh();
     refreshSearch();
+  }
+  function undo(j, kind, changes) {
+    if (kind === "threshold") {
+      var b = new URLSearchParams(); changes.forEach(function (c) { b.append("model", c.model); b.append("threshold", previousOf(j, c, kind)); });
+      return post("/v1/benchmark/apply-threshold", b).then(function (k) { showApply(k, kind, true); });
+    }
+    // Devices: one request per model, in order.
+    var last = null;
+    return changes.reduce(function (p, c) {
+      return p.then(function () { return post("/v1/benchmark/apply", new URLSearchParams({model: c.model, device: previousOf(j, c, kind)})).then(function (k) { last = k; }); });
+    }, Promise.resolve()).then(function () { if (last) showApply(last, kind, true); });
   }
   function restart() { L.restarting(); fetch("/config/restart", {method: "POST"}).then(waitForRestart, waitForRestart); }
   // Reload in place (same scroll position) once the next generation answers.
@@ -125,160 +182,54 @@
     L.restarting();
     L.afterRestart();
   }
-  function useThreshold(model, t) {
-    return post("/v1/benchmark/apply-threshold", new URLSearchParams({model: model, threshold: t.toFixed(2)})).then(showApply);
-  }
   $("apply-all-thr").addEventListener("click", function () {
-    if (!confirm("Write the best confidence threshold of every benchmarked model into the config?")) return;
-    post("/v1/benchmark/apply-threshold", new URLSearchParams({all: "1"})).then(showApply);
+    if (!confirm("Write the best confidence threshold of every benchmarked model into the config? It applies at once.")) return;
+    post("/v1/benchmark/apply-threshold", new URLSearchParams({all: "1"})).then(function (j) { showApply(j, "threshold"); });
   });
   function thr(v) { return v === null || v === undefined ? "-" : v.toFixed(2); }
   function applicable(a) { return a && a.best && a.best.met && a.best.point.tp > 0; }
-
-  // Confidence threshold: P / R / F1 vs threshold as an inline SVG line chart.
-  var SVGNS = "http://www.w3.org/2000/svg", chartId = 0;
-  function sv(tag, attrs, text) { var e = document.createElementNS(SVGNS, tag); Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); }); if (text !== undefined) e.textContent = text; return e; }
-  // opts: title, desc, points (ascending thresholds), configured (now), best, running (the
-  // loaded model's threshold while a restart is pending), f2 (draw F2).
-  function chartSvg(o) {
-    var W = 560, H = 290, L = 48, R = 16, T = 34, B = 44, pw = W - L - R, ph = H - T - B;
-    var X = function (t) { return L + t * pw; }, Y = function (v) { return T + (1 - v) * ph; };
-    var id = "thr-chart-" + (++chartId);
-    var svg = sv("svg", {viewBox: "0 0 " + W + " " + H, class: "thr-chart", role: "img", "aria-labelledby": id + "-t " + id + "-d"});
-    svg.appendChild(sv("title", {id: id + "-t"}, o.title));
-    svg.appendChild(sv("desc", {id: id + "-d"}, o.desc));
-    for (var k = 0; k <= 10; k += 2) {
-      var v = k / 10;
-      svg.appendChild(sv("line", {x1: L, x2: L + pw, y1: Y(v), y2: Y(v), class: "thr-grid"}));
-      svg.appendChild(sv("text", {x: L - 6, y: Y(v) + 4, "text-anchor": "end", class: "thr-tick"}, (v * 100).toFixed(0)));
-      svg.appendChild(sv("line", {x1: X(v), x2: X(v), y1: T + ph, y2: T + ph + 4, class: "thr-axis"}));
-      svg.appendChild(sv("text", {x: X(v), y: T + ph + 16, "text-anchor": "middle", class: "thr-tick"}, v.toFixed(1)));
-    }
-    svg.appendChild(sv("line", {x1: L, x2: L + pw, y1: T + ph, y2: T + ph, class: "thr-axis"}));
-    svg.appendChild(sv("line", {x1: L, x2: L, y1: T, y2: T + ph, class: "thr-axis"}));
-    svg.appendChild(sv("text", {x: L + pw / 2, y: H - 6, "text-anchor": "middle", class: "thr-label"}, "Confidence threshold"));
-    svg.appendChild(sv("text", {x: 12, y: T + ph / 2, "text-anchor": "middle", class: "thr-label", transform: "rotate(-90 12 " + (T + ph / 2) + ")"}, "%"));
-    var series = [["precision", "thr-p", "Precision"], ["recall", "thr-r", "Recall"], ["f1", "thr-f1", "F1"]];
-    if (o.f2) series.push(["f2", "thr-f2", "F2"]);
-    var lx = L + 4;
-    series.forEach(function (s) {
-      var d = "", pen = false;
-      o.points.forEach(function (p) { var v = p[s[0]]; if (v === null || v === undefined) { pen = false; return; } d += (pen ? "L" : "M") + X(p.threshold).toFixed(1) + " " + Y(v).toFixed(1); pen = true; });
-      if (d) svg.appendChild(sv("path", {d: d, class: "thr-line " + s[1]}));
-      svg.appendChild(sv("line", {x1: lx, x2: lx + 18, y1: 14, y2: 14, class: "thr-line " + s[1]}));
-      svg.appendChild(sv("text", {x: lx + 22, y: 18, class: "thr-tick"}, s[2])); lx += 84;
-    });
-    [["thr-mark-best", "best"], ["thr-mark-cfg", "configured"]].forEach(function (m) {
-      svg.appendChild(sv("line", {x1: lx, x2: lx + 18, y1: 14, y2: 14, class: m[0]}));
-      svg.appendChild(sv("text", {x: lx + 22, y: 18, class: "thr-tick"}, m[1])); lx += 90;
-    });
-    function mark(t, cls, text, dy) {
-      if (t === null || t === undefined) return;
-      svg.appendChild(sv("line", {x1: X(t), x2: X(t), y1: T, y2: T + ph, class: cls}));
-      svg.appendChild(sv("text", {x: Math.min(X(t) + 4, L + pw - 90), y: T + 12 + dy, class: "thr-tick"}, text));
-    }
-    mark(o.configured, "thr-mark-cfg", "configured " + thr(o.configured), 0);
-    mark(o.best, "thr-mark-best", "best " + thr(o.best), 14);
-    if (o.running !== null && o.running !== undefined && Math.abs(o.running - o.configured) > 1e-6) mark(o.running, "thr-mark-cfg", "running " + thr(o.running), 28);
-    // Hover: the nearest point's exact values.
-    var guide = sv("line", {y1: T, y2: T + ph, class: "thr-guide", visibility: "hidden"});
-    var tip = sv("g", {class: "thr-tip", visibility: "hidden"}), tipBg = sv("rect", {rx: 4, width: 150, height: 74}), tipText = sv("text", {});
-    tip.appendChild(tipBg); tip.appendChild(tipText); svg.appendChild(guide); svg.appendChild(tip);
-    var hit = sv("rect", {x: L, y: T, width: pw, height: ph, class: "thr-hit"}); svg.appendChild(hit);
-    function show(evt) {
-      var r = svg.getBoundingClientRect(); if (!r.width || !o.points.length) return;
-      var t = ((evt.clientX - r.left) * W / r.width - L) / pw;
-      var p = o.points.reduce(function (a, q) { return Math.abs(q.threshold - t) < Math.abs(a.threshold - t) ? q : a; });
-      var x = X(p.threshold); guide.setAttribute("x1", x); guide.setAttribute("x2", x); guide.setAttribute("visibility", "visible");
-      var lines = ["confidence " + p.threshold.toFixed(3), "P " + pct(p.precision) + "  R " + pct(p.recall), "F1 " + pct(p.f1) + "  F2 " + pct(p.f2), "TP " + p.tp + " FP " + p.fp + " FN " + p["fn"]];
-      tipText.replaceChildren(); lines.forEach(function (l, i) { tipText.appendChild(sv("tspan", {x: 0, dy: i ? 15 : 0}, l)); });
-      var tx = x + 160 > L + pw ? x - 158 : x + 8;
-      tip.setAttribute("transform", "translate(" + tx + "," + (T + 30) + ")"); tipBg.setAttribute("y", -13); tipBg.setAttribute("x", -6); tip.setAttribute("visibility", "visible");
-    }
-    hit.addEventListener("pointermove", show);
-    hit.addEventListener("pointerleave", function () { guide.setAttribute("visibility", "hidden"); tip.setAttribute("visibility", "hidden"); });
-    return svg;
+  // A best pick at which the model finds no object: no confidence setting helps.
+  function findsNothing(b) { return !!(b && b.point && (b.point.tp === 0 || b.point.recall === 0)); }
+  var FINDS_NOTHING = "This model finds no objects on these images, so no confidence setting helps; check the model, its classes or the dataset.";
+  // Models whose stored advice was found for another objective than the configured one.
+  function staleAdvice(j, models) {
+    var cfg = String((j && j.config && j.config.benchmark && j.config.benchmark.threshold_objective) || "f1");
+    return models.filter(function (m) { return m.threshold && m.threshold.objective && String(m.threshold.objective) !== cfg; });
   }
+  function staleNotice(j, models) {
+    var st = staleAdvice(j, models); if (!st.length) return null;
+    var cfg = String(j.config.benchmark.threshold_objective || "f1"), objs = [];
+    st.forEach(function (m) { var o = String(m.threshold.objective); if (objs.indexOf(o) < 0) objs.push(o); });
+    var p = el("div", "warn stale-notice");
+    p.appendChild(document.createTextNode("These confidences were found for " + objs.map(PB.objectiveName).join(", ") + " (" + st.length + " model" + (st.length === 1 ? "" : "s") + "); your setting is " + PB.objectiveName(cfg) + ". Save and re-rank to update them (no new run). "));
+    var b = el("button", "small", "Save and re-rank"); b.type = "button";
+    b.disabled = !!j.running;
+    b.addEventListener("click", function () { b.disabled = true; presetUi.msg = "saving\u2026"; saveSettings({threshold_objective: cfg}); });
+    p.appendChild(b); return p;
+  }
+
+  // ---- threshold detail (Details cards, Confidence > More detail) ------------------------------
   // Frame-level rates of a threshold point ("TPR / FPR" in %).
   function tf(p) { return p && p.frame ? pct(p.frame.tpr) + " / " + pct(p.frame.fpr) : "-"; }
-  // Frame-level ROC: false-alert rate (x) vs alert rate (y), chance diagonal, markers at the
-  // configured and the best threshold. opts: title, desc, curve [{t, tpr, fpr}], auc,
-  // configured / best (threshold points with .frame).
-  function rocSvg(o) {
-    var W = 330, H = 300, L = 44, R = 12, T = 30, B = 42, pw = W - L - R, ph = H - T - B;
-    var X = function (v) { return L + v * pw; }, Y = function (v) { return T + (1 - v) * ph; };
-    var id = "roc-chart-" + (++chartId);
-    var svg = sv("svg", {viewBox: "0 0 " + W + " " + H, class: "thr-chart roc-chart", role: "img", "aria-labelledby": id + "-t " + id + "-d"});
-    svg.appendChild(sv("title", {id: id + "-t"}, o.title));
-    svg.appendChild(sv("desc", {id: id + "-d"}, o.desc));
-    for (var k = 0; k <= 10; k += 2) {
-      var v = k / 10;
-      svg.appendChild(sv("line", {x1: L, x2: L + pw, y1: Y(v), y2: Y(v), class: "thr-grid"}));
-      svg.appendChild(sv("line", {x1: X(v), x2: X(v), y1: T, y2: T + ph, class: "thr-grid"}));
-      svg.appendChild(sv("text", {x: L - 6, y: Y(v) + 4, "text-anchor": "end", class: "thr-tick"}, (v * 100).toFixed(0)));
-      svg.appendChild(sv("text", {x: X(v), y: T + ph + 16, "text-anchor": "middle", class: "thr-tick"}, (v * 100).toFixed(0)));
-    }
-    svg.appendChild(sv("line", {x1: L, x2: L + pw, y1: T + ph, y2: T + ph, class: "thr-axis"}));
-    svg.appendChild(sv("line", {x1: L, x2: L, y1: T, y2: T + ph, class: "thr-axis"}));
-    svg.appendChild(sv("line", {x1: X(0), y1: Y(0), x2: X(1), y2: Y(1), class: "roc-diag"}));
-    svg.appendChild(sv("text", {x: L + pw / 2, y: H - 6, "text-anchor": "middle", class: "thr-label"}, "False-alert rate on frames without (%)"));
-    svg.appendChild(sv("text", {x: 12, y: T + ph / 2, "text-anchor": "middle", class: "thr-label", transform: "rotate(-90 12 " + (T + ph / 2) + ")"}, "Alert rate on frames with (%)"));
-    var pts = [{t: null, tpr: 0, fpr: 0}].concat(o.curve || []), d = "";
-    pts.forEach(function (p, i) { d += (i ? "L" : "M") + X(p.fpr).toFixed(1) + " " + Y(p.tpr).toFixed(1); });
-    svg.appendChild(sv("path", {d: d, class: "thr-line roc-line"}));
-    svg.appendChild(sv("text", {x: L + pw - 4, y: T + ph - 8, "text-anchor": "end", class: "thr-label"}, "AUC " + pct(o.auc) + "%"));
-    var lx = L + 2;
-    svg.appendChild(sv("line", {x1: lx, x2: lx + 18, y1: 14, y2: 14, class: "thr-line roc-line"}));
-    svg.appendChild(sv("text", {x: lx + 22, y: 18, class: "thr-tick"}, "ROC")); lx += 56;
-    [["roc-dot-best", "best"], ["roc-dot-cfg", "configured"]].forEach(function (m) {
-      svg.appendChild(sv("circle", {cx: lx + 5, cy: 14, r: 4.5, class: m[0]}));
-      svg.appendChild(sv("text", {x: lx + 14, y: 18, class: "thr-tick"}, m[1])); lx += 74;
-    });
-    svg.appendChild(sv("line", {x1: lx, x2: lx + 18, y1: 14, y2: 14, class: "roc-diag"}));
-    svg.appendChild(sv("text", {x: lx + 22, y: 18, class: "thr-tick"}, "chance"));
-    function dot(p, cls, label) {
-      var f = p && p.frame; if (!f || f.tpr === null || f.fpr === null) return;
-      var c = sv("circle", {cx: X(f.fpr), cy: Y(f.tpr), r: 5, class: cls});
-      c.appendChild(sv("title", {}, label + " " + thr(p.threshold) + ": TPR " + pct(f.tpr) + "%, FPR " + pct(f.fpr) + "%")); svg.appendChild(c);
-    }
-    dot(o.configured, "roc-dot-cfg", "configured"); dot(o.best, "roc-dot-best", "best");
-    // Hover: the nearest curve point's threshold and rates.
-    var hov = sv("circle", {r: 3.5, class: "roc-hover", visibility: "hidden"});
-    var tip = sv("g", {class: "thr-tip", visibility: "hidden"}), tipBg = sv("rect", {rx: 4, width: 150, height: 44}), tipText = sv("text", {});
-    tip.appendChild(tipBg); tip.appendChild(tipText); svg.appendChild(hov); svg.appendChild(tip);
-    var hit = sv("rect", {x: L, y: T, width: pw, height: ph, class: "thr-hit"}); svg.appendChild(hit);
-    hit.addEventListener("pointermove", function (evt) {
-      var r = svg.getBoundingClientRect(); if (!r.width || !(o.curve || []).length) return;
-      var mx = (evt.clientX - r.left) * W / r.width, my = (evt.clientY - r.top) * H / r.height;
-      var p = o.curve.reduce(function (a, q) { var da = Math.pow(X(a.fpr) - mx, 2) + Math.pow(Y(a.tpr) - my, 2), dq = Math.pow(X(q.fpr) - mx, 2) + Math.pow(Y(q.tpr) - my, 2); return dq < da ? q : a; });
-      hov.setAttribute("cx", X(p.fpr)); hov.setAttribute("cy", Y(p.tpr)); hov.setAttribute("visibility", "visible");
-      var lines = [p.t > 0 ? "confidence \u2265 " + p.t.toFixed(3) : "every frame (no detection \u2265 0.05)", "TPR " + pct(p.tpr) + "%  FPR " + pct(p.fpr) + "%"];
-      tipText.replaceChildren(); lines.forEach(function (l, i) { tipText.appendChild(sv("tspan", {x: 0, dy: i ? 15 : 0}, l)); });
-      var tx = X(p.fpr) + 160 > L + pw ? X(p.fpr) - 158 : X(p.fpr) + 8, ty = Math.min(Y(p.tpr) + 18, T + ph - 34);
-      tip.setAttribute("transform", "translate(" + tx + "," + ty + ")"); tipBg.setAttribute("y", -13); tipBg.setAttribute("x", -6); tip.setAttribute("visibility", "visible");
-    });
-    hit.addEventListener("pointerleave", function () { hov.setAttribute("visibility", "hidden"); tip.setAttribute("visibility", "hidden"); });
-    return svg;
-  }
-  function rocWrap(o) { var w = el("div", "thr-chart-wrap roc-chart-wrap"); w.appendChild(rocSvg(o)); return w; }
+  function rocWrap(o) { var w = el("div", "thr-chart-wrap roc-chart-wrap"); w.appendChild(C.rocSvg(o)); return w; }
   // Per-class frame ROC table (frames with / without the class, AUC).
   function rocTable(roc) {
-    var t = sortable(table("", ["Class", "Frames with", "Frames without", "ROC AUC"]));
+    var t = sortable(table("", ["Class", "Frames with", "Frames without", "@roc_auc"]));
     (roc.per_class || []).forEach(function (c) { var tr = el("tr"); cell(tr, c["class"]); cell(tr, c.positives, c.positives); cell(tr, c.negatives, c.negatives); cell(tr, pct(c.auc), c.auc === null ? null : -c.auc); t.tBodies[0].appendChild(tr); });
     var tr = el("tr"); cell(tr, "macro (micro " + pct(roc.micro_auc) + ")"); cell(tr, roc.positives, roc.positives); cell(tr, roc.negatives, roc.negatives); cell(tr, pct(roc.auc), roc.auc === null ? null : -roc.auc); t.tBodies[0].appendChild(tr);
     return t;
   }
   function thresholdChart(m, a) {
     var best = a.best, n = nowOf(a), np = n.point || {};
-    return chartSvg({
+    return C.chartSvg({
+      key: "thr:" + m.model.toLowerCase(),
       title: m.model + ": precision, recall and F1 vs confidence threshold on " + a.device,
       desc: "Best threshold " + (best ? thr(best.threshold) + " (" + a.objective + "): precision " + pct(best.point.precision) + "%, recall " + pct(best.point.recall) + "%, F1 " + pct(best.point.f1) + "%" : "none") + ". Configured " + nowText(n) + ": precision " + pct(np.precision) + "%, recall " + pct(np.recall) + "%, F1 " + pct(np.f1) + "%.",
       points: a.exact && a.exact.length > 1 ? a.exact : a.curve,
       configured: n.threshold, best: best ? best.threshold : null, running: isRunning(n) ? n.running : null, f2: a.objective === "f2"
     });
   }
-  // Apply button for the best threshold, or "in use" / "in config (restart to use)" when the
-  // config already has it.
+  // Apply button for the best threshold, or "in use" when the config already has it.
   function thrAction(model, a, label) {
     var b = a.best, n = nowOf(a);
     if (!applicable(a)) return null;
@@ -293,11 +244,12 @@
     if (b) {
       var cfgText = near(n.threshold, b.threshold) ? "the configured threshold" + (isRunning(n) ? "; running " + thr(n.running) + " until restart" : "")
         : "configured " + nowText(n) + ": " + (np ? "P " + pct(np.precision) + " R " + pct(np.recall) + " F1 " + pct(np.f1) + (np.frame ? ", frame TPR / FPR " + tf(np) : "") : "not evaluated");
-      p.textContent = "Best " + thr(b.threshold) + " for " + a.objective + " on " + a.device + ": P " + pct(b.point.precision) + " R " + pct(b.point.recall) + " F1 " + pct(b.point.f1) + (b.point.frame ? ", frame TPR / FPR " + tf(b.point) : "") + " (" + cfgText + ")" + (b.note ? ". " + b.note : "") + (b.plateau && b.exact_threshold !== null && b.exact_threshold !== undefined ? ". Exact optimum at confidence " + b.exact_threshold.toFixed(3) + "; near-optimal range " + b.plateau[0].toFixed(3) + "–" + b.plateau[1].toFixed(3) + ", rounded down to 0.01." : ".");
+      p.textContent = "Best " + F.thrBi(b.threshold) + " for " + a.objective + " on " + a.device + ": P " + pct(b.point.precision) + " R " + pct(b.point.recall) + " F1 " + pct(b.point.f1) + (b.point.frame ? ", frame TPR / FPR " + tf(b.point) : "") + " (" + cfgText + ")" + (b.note ? ". " + b.note : "") + (b.plateau && b.exact_threshold !== null && b.exact_threshold !== undefined ? ". Exact optimum at confidence " + b.exact_threshold.toFixed(3) + "; near-optimal range " + b.plateau[0].toFixed(3) + "–" + b.plateau[1].toFixed(3) + ", rounded down to 0.01." : ".");
     } else p.textContent = "No ground truth for a threshold curve.";
     box.appendChild(p);
     var row = el("div", "chart-row"), wrapC = el("div", "thr-chart-wrap"); wrapC.appendChild(thresholdChart(m, a)); row.appendChild(wrapC);
     if (a.roc && a.roc.curve && a.roc.curve.length) row.appendChild(rocWrap({
+      key: "roc:" + key,
       title: m.model + ": frame-level ROC on " + a.device,
       desc: "Frame ROC AUC " + pct(a.roc.auc) + "% (macro over classes). Configured " + thr(n.threshold) + ": TPR / FPR " + tf(np) + "%" + (b ? "; best " + thr(b.threshold) + ": " + tf(b.point) + "%" : "") + ".",
       curve: a.roc.curve, auc: a.roc.auc, configured: np ? Object.assign({}, np, {threshold: n.threshold}) : null, best: b ? b.point : null
@@ -338,9 +290,9 @@
     var rows = models.filter(function (m) { return m.threshold; });
     if (!rows.length) { box.appendChild(el("h2", null, "Best confidence threshold")); box.appendChild(el("p", "empty", "No threshold results yet: a benchmark with ground truth (or a reference model) fills this table.")); return; }
     box.appendChild(el("h2", null, "Best confidence threshold"));
-    box.appendChild(el("p", "muted", "Exact best threshold per model on its recommended device, compared with the threshold configured now. Gain is the objective's value at the best minus at the configured threshold."));
+    box.appendChild(el("p", "muted", "Exact best threshold per model on its recommended device, compared with the threshold configured now. Gain is the objective's value at the best minus at the configured threshold, in points."));
     box.appendChild(el("details", "help")); var hd = box.lastChild; hd.appendChild(el("summary", null, "How to read it")); hd.appendChild(el("p", null, "The best threshold is the middle of the widest near-optimal range, rounded down to 0.01; P / R / F1 at the configured threshold are exact, from the stored predictions. F2 favors recall; precision:0.9 limits false alerts; youden maximizes the frame alert rate minus the frame false-alert rate. Frame TPR / FPR: alert rate on frames with an object / on frames without one (a frame alerts when its top confidence reaches the threshold). Blue Iris may send its own min_confidence per request (it then replaces the server threshold) and each camera's minimum confidence filters again."));
-    var t = sortable(table("", ["Model", "Objective", "Now", "P", "R", "F1", "Best", "P", "R", "F1", "Gain", "F2 pick", "P≥90% pick", "Youden pick", "ROC AUC", "TPR / FPR now", "TPR / FPR best", ""]));
+    var t = sortable(table("", ["Model", "@objective", "Now", "@precision", "@recall", "@f1", "Best", "@precision", "@recall", "@f1", "Gain", "F2 pick", "P≥90% pick", "Youden pick", "@roc_auc", "TPR / FPR now", "TPR / FPR best", ""]));
     rows.forEach(function (m) {
       var a = m.threshold, b = a.best, tr = el("tr"), n = nowOf(a), np = n.point;
       tr.dataset.model = m.model;
@@ -356,7 +308,7 @@
       if (b && near(n.threshold, b.threshold)) gain = 0;
       else { var sb = b && objScore(a.objective, b.point), sc = objScore(a.objective, np); if (sb !== null && sb !== undefined && sc !== null && sc !== undefined) gain = (sb - sc) * 100; }
       var gc = cell(tr, gain === null ? "-" : (gain >= 0 ? "+" : "") + gain.toFixed(1) + " " + gainLabel(a.objective), gain === null ? null : -gain);
-      gc.title = gainLabel(a.objective) + " at the best minus at the configured threshold (" + thr(n.threshold) + ")";
+      gc.title = gainLabel(a.objective) + " at the best minus at the configured threshold (" + thr(n.threshold) + "), in points";
       cell(tr, alt("f2")); cell(tr, alt("precision:0.9")); cell(tr, alt("youden"));
       var auc = a.roc ? a.roc.auc : null; cell(tr, pct(auc), auc === null ? null : -auc);
       cell(tr, tf(np)); cell(tr, tf(b && b.point));
@@ -369,11 +321,11 @@
     box.appendChild(wrap(t, "thr"));
   }
   $("apply-all").addEventListener("click", function () {
-    if (!confirm("Write the recommended device of every benchmarked model into the config?")) return;
-    post("/v1/benchmark/apply", new URLSearchParams({all: "1"})).then(showApply);
+    if (!confirm("Write the recommended device of every benchmarked model into the config? The models reload on their new devices at once.")) return;
+    post("/v1/benchmark/apply", new URLSearchParams({all: "1"})).then(function (j) { showApply(j, "device"); });
   });
 
-  // Confidence search over the stored predictions.
+  // ---- confidence search over the stored predictions -----------------------------------------
   var search = {data: null, opts: null, thresholds: {}, selected: null, body: null};
   // Checkboxes for `values`; a refresh keeps what the user checked (new values get `checked`).
   function checks(box, name, values, checked) {
@@ -404,11 +356,12 @@
       var obj = String(j.objective || "f1"), kind = obj.split(":")[0];
       $("s-objective").value = kind; if (obj.indexOf(":") > 0) $("s-target").value = obj.split(":")[1];
       $("s-target-label").hidden = !hasTarget(kind);
-    });
+    }).catch(function () { /* older server or no results: the card keeps its empty state */ });
   }
   // The config changed (apply, another tab): refresh the options and redo the last search, so
   // its "configured" columns are at the threshold configured now.
   function refreshSearch() {
+    conf.cache = {};
     return loadSearch().then(function () { if (search.body) return runSearch(search.body, true); });
   }
   function hasTarget(k) { return k === "precision" || k === "recall" || k === "fpr"; }
@@ -456,9 +409,9 @@
   function applicableSearch(r) { return r.best && r.best.met && r.best.point.tp > 0; }
   $("s-apply-all").addEventListener("click", function () {
     var rs = search.data.results.filter(applicableSearch); if (!rs.length) return;
-    if (!confirm("Write the searched best threshold of " + rs.length + " model(s) into the config?")) return;
+    if (!confirm("Write the searched best threshold of " + rs.length + " model(s) into the config? It applies at once.")) return;
     var b = new URLSearchParams(); rs.forEach(function (r) { b.append("model", r.model); b.append("threshold", r.best.threshold.toFixed(2)); });
-    post("/v1/benchmark/apply-threshold", b).then(showApply);
+    post("/v1/benchmark/apply-threshold", b).then(function (j) { showApply(j, "threshold"); });
   });
   $("s-csv-copy").addEventListener("click", function () {
     if (navigator.clipboard) navigator.clipboard.writeText(search.data.csv).then(function () { $("s-msg").textContent = "CSV copied"; }, function () { $("s-msg").textContent = "copy failed; use Download CSV"; });
@@ -470,7 +423,7 @@
   function searchRunning(r) {
     var c = lastConfig && (lastConfig.models || []).find(function (x) { return x.name.toLowerCase() === r.model.toLowerCase(); });
     var t = c ? c.runningThreshold : null;
-    return t !== null && t !== undefined && !near(t, r.now.threshold) ? t : null;
+    return t !== null && t !== undefined && r.now && !near(t, r.now.threshold) ? t : null;
   }
   function drawSearch() { L.keep($("s-results"), undefined, drawSearchNow); }
   function drawSearchNow() {
@@ -479,7 +432,7 @@
     $("s-apply-all").hidden = !j || !j.results.some(applicableSearch);
     if (!j) return;
     var obj = j.results.length ? j.results[0].objective : "f1";
-    var t = sortable(table("", ["Model", "Device", "Images", "Objects", "Configured", "P", "R", "F1", "Best", "P", "R", "F1", gainLabel(obj) + " gain", "ROC AUC", "TPR / FPR configured", "TPR / FPR best", ""]));
+    var t = sortable(table("", ["Model", "Device", "Images", "Objects", "Configured", "@precision", "@recall", "@f1", "Best", "@precision", "@recall", "@f1", gainLabel(obj) + " gain", "@roc_auc", "TPR / FPR configured", "TPR / FPR best", ""]));
     j.results.forEach(function (r) {
       // "Configured": the threshold in the config now (r.now), not the run's.
       var tr = el("tr"), c = r.now || r.configured, b = r.best, run = searchRunning(r);
@@ -495,7 +448,7 @@
       var sb = b && objScore(r.objective, b.point), sc = objScore(r.objective, c);
       var gain = b && near(b.threshold, c.threshold) ? 0 : sb !== null && sb !== undefined && sc !== null && sc !== undefined ? (sb - sc) * 100 : null;
       var gc = cell(tr, gain === null ? (sb !== null && sb !== undefined ? "target met only at best" : "-") : (gain >= 0 ? "+" : "") + gain.toFixed(1), gain === null ? null : -gain);
-      gc.title = gainLabel(r.objective) + " at the best minus at the configured threshold (" + thr(c.threshold) + ")";
+      gc.title = gainLabel(r.objective) + " at the best minus at the configured threshold (" + thr(c.threshold) + "), in points";
       var auc = r.roc ? r.roc.auc : null, ac = cell(tr, pct(auc), auc === null ? null : -auc); if (r.roc) ac.title = "micro " + pct(r.roc.micro_auc);
       cell(tr, tf(c)); cell(tr, tf(b && b.point));
       var act = el("td", "actions-cell"), show = el("button", "small", "Chart"); show.type = "button";
@@ -508,9 +461,10 @@
     var r = j.results.find(function (x) { return x.model === search.selected; }); if (!r) return;
     var b = r.best, f2 = r.objective === "f2", c = r.now || r.configured, run = searchRunning(r);
     box.appendChild(el("h3", null, r.model + " on " + r.device + " (" + r.ground_truth + ", IoU " + r.iou + ")"));
-    if (b) box.appendChild(el("p", b.met ? "notice" : "warn", "Best " + thr(b.threshold) + " for " + r.objective + ": P " + pct(b.point.precision) + " R " + pct(b.point.recall) + " F1 " + pct(b.point.f1) + " F2 " + pct(b.point.f2) + " · " + b.point.fp_per_image.toFixed(2) + " false positives per image" + (b.point.frame ? " · frame TPR / FPR " + tf(b.point) + " (configured " + thr(c.threshold) + ": " + tf(c) + ")" : "") + ". Exact optimum at " + (b.exact_threshold !== null && b.exact_threshold !== undefined ? b.exact_threshold.toFixed(3) : "-") + (b.plateau ? ", near-optimal range " + b.plateau[0].toFixed(3) + "–" + b.plateau[1].toFixed(3) : "") + "." + (b.note ? " " + b.note + "." : "")));
+    if (b) box.appendChild(el("p", b.met ? "notice" : "warn", "Best " + F.thrBi(b.threshold) + " for " + r.objective + ": P " + pct(b.point.precision) + " R " + pct(b.point.recall) + " F1 " + pct(b.point.f1) + " F2 " + pct(b.point.f2) + " · " + b.point.fp_per_image.toFixed(2) + " false positives per image" + (b.point.frame ? " · frame TPR / FPR " + tf(b.point) + " (configured " + thr(c.threshold) + ": " + tf(c) + ")" : "") + ". Exact optimum at " + (b.exact_threshold !== null && b.exact_threshold !== undefined ? b.exact_threshold.toFixed(3) : "-") + (b.plateau ? ", near-optimal range " + b.plateau[0].toFixed(3) + "–" + b.plateau[1].toFixed(3) : "") + "." + (b.note ? " " + b.note + "." : "")));
     var crow = el("div", "chart-row"), cw = el("div", "thr-chart-wrap");
-    cw.appendChild(chartSvg({
+    cw.appendChild(C.chartSvg({
+      key: "s-thr",
       title: r.model + ": precision, recall, F1" + (f2 ? ", F2" : "") + " vs confidence threshold on " + r.device,
       desc: "Configured " + thr(c.threshold) + ": F1 " + pct(c.f1) + "%. Best " + (b ? thr(b.threshold) + ": F1 " + pct(b.point.f1) + "%" : "none") + ".",
       points: r.exact.length > 1 ? r.exact : r.grid, configured: c.threshold, best: b ? b.threshold : null,
@@ -518,6 +472,7 @@
     }));
     crow.appendChild(cw);
     if (r.roc && r.roc.curve && r.roc.curve.length) crow.appendChild(rocWrap({
+      key: "s-roc",
       title: r.model + ": frame-level ROC on " + r.device,
       desc: "Frame ROC AUC " + pct(r.roc.auc) + "%. Configured " + thr(c.threshold) + ": TPR / FPR " + tf(c) + "%" + (b ? "; best " + thr(b.threshold) + ": " + tf(b.point) + "%" : "") + ".",
       curve: r.roc.curve, auc: r.roc.auc, configured: c, best: b ? b.point : null
@@ -526,7 +481,7 @@
     if (r.roc && r.roc.per_class && r.roc.per_class.length) {
       var rd = det("s-roc", "Frame-level ROC AUC by class (macro " + pct(r.roc.auc) + ", micro " + pct(r.roc.micro_auc) + ")"); rd.appendChild(wrap(rocTable(r.roc), "s-roc")); box.appendChild(rd);
     }
-    var g = sortable(table("", ["Confidence", "P", "R", "F1", "F2", "FP / image", "TP", "FP", "FN", "Frame TPR", "Frame FPR", ""]));
+    var g = sortable(table("", ["Confidence", "@precision", "@recall", "@f1", "@f2", "@fp_per_image", "TP", "FP", "FN", "@tpr", "@fpr", ""]));
     var rows = r.grid.slice(); [c, b && b.point].forEach(function (p) { if (p && !rows.some(function (q) { return near(q.threshold, p.threshold); })) rows.push(p); });
     rows.sort(function (x, y) { return x.threshold - y.threshold; });
     rows.forEach(function (p) {
@@ -554,56 +509,357 @@
     }
   }
 
-  // Results: saved results overlaid with the models of the current run.
+  // ---- results ---------------------------------------------------------------------------------
+  // Saved results overlaid with the models of the current run.
   function merged(j) {
     var list = (j.results && j.results.models ? j.results.models.slice() : []);
-    (j.run.models || []).forEach(function (m) {
+    ((j.run && j.run.models) || []).forEach(function (m) {
       var i = list.findIndex(function (x) { return x.model.toLowerCase() === m.model.toLowerCase(); });
-      if (i >= 0) list[i] = m; else list.push(m);
+      // A model of the running benchmark is part of "this run" (the server marks it once saved).
+      var mm = j.running && m.this_run === undefined ? Object.assign({}, m, {this_run: true}) : m;
+      if (i >= 0) list[i] = mm; else list.push(mm);
     });
     return list;
   }
-  function recRun(m) { var d = m.devices.find(function (d) { return d.device === m.recommended; }); return d && d.run; }
-  function renderSummary(models) {
-    var box = $("summary"); box.replaceChildren();
-    models.forEach(function (m) {
-      var r = recRun(m), c = el("a", "gcard"); c.href = "#m-" + encodeURIComponent(m.model);
-      c.appendChild(el("div", "gname", m.model));
-      if (r && r.grades) {
-        var g = el("div", "gbig"); g.appendChild(gradeEl(r.grades.overall)); c.appendChild(g);
-        var sub = el("div", "gsub"); sub.append("accuracy" + metricTag(r.grades) + " ", gradeEl(r.grades.accuracy, r.grades.relative), " speed ", gradeEl(r.grades.speed)); c.appendChild(sub);
-        var auc = r.accuracy && r.accuracy.frame_roc ? r.accuracy.frame_roc.auc : null;
-        c.appendChild(el("div", "muted", m.recommended + " · " + ms(r.grades.p50_ms) + " ms" + (r.accuracy && r.accuracy.overall.ap50 !== null ? " · AP50 " + pct(r.accuracy.overall.ap50) : "") + (auc !== null && auc !== undefined ? " · AUC " + pct(auc) : "")));
-      } else c.appendChild(el("div", "muted", m.error || m.recommendation || "running…"));
-      box.appendChild(c);
-    });
-  }
+  function recDevice(m) { return (m.devices || []).find(function (d) { return d.device === m.recommended; }); }
+  function recRun(m) { var d = recDevice(m); return d && d.run; }
+  function cfgOf(cfg, name) { return ((cfg && cfg.models) || []).find(function (c) { return c.name.toLowerCase() === String(name).toLowerCase(); }) || {}; }
+  function modelOf(models, name) { return models.find(function (m) { return m.model.toLowerCase() === String(name).toLowerCase(); }); }
   // " (AUC)" / " (AP50)": which metric graded the accuracy.
   function metricTag(g) { return g && g.metric === "roc_auc" ? " (AUC)" : " (AP50)"; }
-  function renderRanking(rows) {
-    var box = $("ranking"); box.replaceChildren();
-    if (!rows || rows.length < 2) return;
-    var byAuc = rows[0].metric === "roc_auc";
-    box.appendChild(el("h2", null, "Best model for this machine"));
-    box.appendChild(el("p", "muted", "Accuracy graded by " + (byAuc ? "the frame-level ROC AUC (macro over classes)" : "AP@0.5 (with small-object recall)") + "; change it under Settings."));
-    var t = sortable(table("", ["#", "Model", "Device", "Overall", "Accuracy" + (byAuc ? " (AUC)" : " (AP50)"), "Speed", "p50 ms", "AP50", "ROC AUC"]));
-    rows.forEach(function (r) {
-      var tr = el("tr"); cell(tr, r.rank, r.rank); cell(tr, r.model); cell(tr, r.device);
-      var unscored = r.accuracy === null || r.accuracy === undefined;
-      var o = cell(tr, ""); o.appendChild(gradeEl(r.overall)); o.dataset.v = (unscored ? 10 : 0) + 4 - r.overall_points;
-      if (unscored) { o.append(" "); o.appendChild(el("span", "muted", "speed only")); }
-      var a = cell(tr, ""); if (unscored) { a.appendChild(el("span", "muted", "not scored")); a.title = "None of this model's classes are in the selected datasets"; } else a.appendChild(gradeEl(r.accuracy, r.relative));
-      var s = cell(tr, ""); s.appendChild(gradeEl(r.speed));
-      cell(tr, ms(r.p50_ms), r.p50_ms); cell(tr, pct(r.ap50), r.ap50 === null ? null : -r.ap50);
-      cell(tr, pct(r.roc_auc), r.roc_auc === null || r.roc_auc === undefined ? null : -r.roc_auc);
+  // The accuracy weight (0..1) of the config's benchmark settings.
+  function weightOf(b) { var w = (b && b.weights) || {}; return (w.accuracy || 0) + (w.speed || 0) > 0 ? w.accuracy / (w.accuracy + w.speed) : 0.6; }
+
+  // ---- Overview: run summary banner --------------------------------------------------------------
+  function renderBanner(j, models) {
+    var box = $("run-banner"); box.replaceChildren();
+    var p = j.run && j.run.progress;
+    if (j.running) {
+      // run.models holds the finished models plus the one in progress.
+      var total = p && p.modelCount ? p.modelCount : null, done = p && p.modelIndex ? p.modelIndex - 1 : Math.max(0, ((j.run && j.run.models) || []).length - 1);
+      box.appendChild(el("p", "notice banner", "Benchmark running: partial results" + (total ? ", " + Math.min(done, total) + " of " + total + " models done" : "") + "; changes appear as each model finishes."));
+      return;
+    }
+    var mine = models.filter(function (m) { return m.this_run; });
+    if (!mine.length) return;
+    var b = el("div", "card banner run-summary"), ts = j.latest_run_id || mine[0].timestamp;
+    b.appendChild(el("h2", null, "Latest run: " + when(ts) + " · " + mine.length + " model" + (mine.length === 1 ? "" : "s")));
+    var ul = el("ul", "change-list");
+    mine.forEach(function (m) {
+      var li = el("li"); li.appendChild(el("strong", null, m.model + ": "));
+      var ch = m.changes;
+      if (m.error) li.appendChild(el("span", "error-text", "failed: " + m.error));
+      else if (ch === undefined) li.appendChild(el("span", "muted", m.recommendation || ""));
+      else {
+        var rk = (j.ranking || []).find(function (r) { return r.model === m.model; }), metric = rk && rk.metric === "roc_auc" ? "roc_auc" : "ap50";
+        li.appendChild(document.createTextNode((ch && ch.summary) || (ch && ch.baseline ? "" : "first run of this model; the next run is compared with it") + " "));
+        li.appendChild(PB.changeChips(ch, m.recommended, metric));
+        var tc = ch && (ch.metrics || []).find(function (x) { return x.metric === "threshold"; });
+        if (tc && has(tc.before) && has(tc.after) && !near(tc.before, tc.after)) { li.appendChild(document.createTextNode(" confidence " + thr(tc.before) + " → " + thr(tc.after) + " ")); li.appendChild(PB.metricChip(tc)); }
+      }
+      ul.appendChild(li);
+    });
+    b.appendChild(ul);
+    var old = models.length - mine.length;
+    if (old > 0) b.appendChild(el("p", "muted", old + " other model" + (old === 1 ? " keeps its" : "s keep their") + " results from an earlier run (marked “earlier”)."));
+    box.appendChild(b);
+  }
+
+  // ---- Overview: "What matters most" -----------------------------------------------------------
+  var PRESETS = [
+    {id: "balanced", name: "Balanced", text: "Finding objects and avoiding false alerts count the same; speed counts half of the grade.", obj: "f1", w: 0.5},
+    {id: "miss", name: "Miss fewer objects", text: "Catching every person or car matters most; some extra false alerts are fine.", obj: "f2", w: 0.7},
+    {id: "false", name: "Fewer false alerts", text: "At least 9 in 10 detections must be right; then find as many objects as possible.", obj: "precision:0.9", w: 0.5},
+    {id: "fast", name: "Fastest / lightest", text: "Keep the CPU or GPU free for Blue Iris and other work: speed counts 80%.", obj: "f1", w: 0.2},
+    {id: "custom", name: "Custom", text: "Set the accuracy weight, the confidence objective and the accuracy metric yourself.", obj: null, w: null}
+  ];
+  var presetUi = {custom: false, msg: "", busy: false};
+  function presetOf(b) {
+    if (!b) return "custom";
+    var w = weightOf(b), o = String(b.threshold_objective || "f1");
+    var p = PRESETS.find(function (x) { return x.obj === o && Math.abs(x.w - w) < 0.011; });
+    return p ? p.id : "custom";
+  }
+  function saveSettings(fields, done) {
+    Object.keys(fields).forEach(function (k) { var c = form.elements[k]; if (c) { c.value = fields[k]; c.classList.remove("edited"); } });
+    presetUi.busy = true;
+    return post("/v1/benchmark/settings", settingsBody()).then(function (j) {
+      presetUi.busy = false;
+      presetUi.msg = j.success ? (j.regraded === true ? "Saved: the ranking and the recommended confidence are updated from the stored results (no new run)." : j.regraded === false ? "Saved. The ranking changes with the next run (the stored results cannot be regraded)." : "Saved as the benchmark default.") : (j.message || "not saved");
+      presetUi.ok = !!j.success;
+      if (done) done(j);
+      refresh(); refreshSearch();
+    });
+  }
+  function renderPreset(j) {
+    var box = $("preset"); box.replaceChildren();
+    if (!lastModels.length) return; // nothing to rank yet
+    var b = j.config && j.config.benchmark, cur = presetUi.custom ? "custom" : presetOf(b);
+    var card = el("div", "card preset-card");
+    var h = el("h2", null, "What matters most to you? ");
+    var sn = staleNotice(j, lastModels); h.appendChild(PB.term("?", "grade", "preset")); card.appendChild(h);
+    card.appendChild(el("p", "muted", "Ranks the results and picks the recommended confidence; it changes no inference, so no new run is needed."));
+    var fs = el("fieldset", "presets"); fs.appendChild(el("legend", "visually-hidden", "What matters most"));
+    PRESETS.forEach(function (p) {
+      var l = el("label", "preset" + (cur === p.id ? " on" : "")), i = el("input"); i.type = "radio"; i.name = "preset"; i.value = p.id; i.checked = cur === p.id; i.disabled = presetUi.busy || !!(j.running);
+      i.addEventListener("change", function () {
+        if (!i.checked) return;
+        if (p.id === "custom") { presetUi.custom = true; renderPreset(lastStatus); return; }
+        presetUi.custom = false; presetUi.msg = "saving…";
+        saveSettings({accuracy_weight: p.w.toFixed(2), threshold_objective: p.obj});
+        renderPreset(lastStatus);
+      });
+      var t = el("span", "preset-text"); t.appendChild(el("strong", null, p.name)); t.appendChild(el("span", "muted", p.text));
+      l.appendChild(i); l.appendChild(t); fs.appendChild(l);
+    });
+    card.appendChild(fs);
+    if (sn) card.appendChild(sn);
+    if (cur === "custom") card.appendChild(customFields(b));
+    if (j.running) card.appendChild(el("p", "muted", "Available when the benchmark finishes."));
+    var m = el("p", presetUi.ok === false ? "error-text" : "muted", presetUi.msg); m.setAttribute("aria-live", "polite"); card.appendChild(m);
+    box.appendChild(card);
+  }
+  function customFields(b) {
+    var d = el("div", "custom-fields bench-grid");
+    var wl = el("label", null, "Accuracy weight (0..1; speed gets the rest) "), w = el("input"); w.type = "number"; w.min = "0"; w.max = "1"; w.step = "0.05"; w.value = weightOf(b).toFixed(2); wl.appendChild(w); d.appendChild(wl);
+    var clone = function (name, text) { var l = el("label", null, text + " "), s = el("select"); Array.prototype.forEach.call(form.elements[name].options, function (o) { var x = el("option", null, o.textContent); x.value = o.value; s.appendChild(x); }); s.value = name === "threshold_objective" ? String((b && b.threshold_objective) || form.elements[name].value) : String((b && b[name]) || form.elements[name].value); l.appendChild(s); d.appendChild(l); return s; };
+    var o = clone("threshold_objective", "Best confidence optimizes"), m = clone("accuracy_metric", "Grade accuracy by");
+    var act = el("div", "actions"), save = el("button", "small", "Save and re-rank"); save.type = "button";
+    save.addEventListener("click", function () { presetUi.msg = "saving…"; saveSettings({accuracy_weight: w.value, threshold_objective: o.value, accuracy_metric: m.value}, function () { presetUi.custom = presetOf(lastStatus && lastStatus.config && lastStatus.config.benchmark) === "custom"; }); });
+    act.appendChild(save); d.appendChild(act);
+    return d;
+  }
+
+  // ---- Overview: recommendation, setup vs recommended ------------------------------------------
+  // "9 in 10" for a precision.
+  function inTen(p) { if (!has(p)) return null; var n = Math.round(p * 10); return n >= 10 ? "nearly all detections are" : n + " in 10 detections are"; }
+  // Recall / precision / threshold of a model on `device`: at the best threshold where the advice
+  // is for that device, else at the run's threshold.
+  function quality(m, device, row) {
+    var a = m.threshold, d = (m.devices || []).find(function (x) { return x.device === device; }), r = d && d.run, ov = r && r.accuracy && r.accuracy.overall;
+    if (row && (has(row.recall) || has(row.precision))) return {recall: row.recall, precision: row.precision, threshold: row.threshold, at: "best"};
+    if (a && a.best && a.device === device) return {recall: a.best.point.recall, precision: a.best.point.precision, threshold: a.best.threshold, at: "best"};
+    return ov ? {recall: ov.recall, precision: ov.precision, threshold: r.accuracy.threshold, at: "run"} : {};
+  }
+  function inUseTag() { return el("span", "tag now", "✓ in use"); }
+  function renderRecommend(j, models) {
+    var box = $("recommend"); box.replaceChildren();
+    var rows = j.ranking || [], top = rows.find(function (r) { return r.rank === 1; }) || rows[0];
+    var m = top ? modelOf(models, top.model) : models.find(function (x) { return x.recommended; });
+    if (!m) { if (models.length && !j.running) { var w = el("div", "card"); w.appendChild(el("h2", null, "No recommendation yet")); models.forEach(function (x) { w.appendChild(el("p", "muted", x.model + ": " + (x.error || x.recommendation || "no result"))); }); box.appendChild(w); } return; }
+    var device = top ? top.device : m.recommended, c = cfgOf(j.config, m.model), q = quality(m, device, top);
+    var card = el("div", "card primary recommend");
+    var h = el("h2"); h.appendChild(document.createTextNode("Use " + m.model + " on " + device + " "));
+    h.appendChild(PB.trustBadge((top && top.trust) || m.trust, "rec")); card.appendChild(h);
+    var p50 = top ? top.p50_ms : (recRun(m) && recRun(m).grades ? recRun(m).grades.p50_ms : null);
+    var parts = ["About " + F.ms(p50) + " per image"];
+    if (has(q.recall)) parts.push("finds " + F.pct(q.recall) + " of objects");
+    if (has(q.precision)) parts.push(inTen(q.precision) + " correct");
+    var s = el("p", "rec-text", parts.join(", ") + (has(q.threshold) ? " at confidence " + F.thrBi(q.threshold) : "") + ".");
+    card.appendChild(s);
+    if (top && top.relative) card.appendChild(el("p", "muted", "* Accuracy is relative to a reference model's detections (no human labels on these images), so it shows agreement, not true accuracy."));
+    var why = el("p", "muted"); why.appendChild(document.createTextNode((rows.length > 1 ? "Ranked first of " + rows.length + " models" : "The only ranked model") + " by " + (top && top.metric === "roc_auc" ? "alert separation (ROC AUC)" : "detection quality (AP50)") + " and speed, with accuracy counting " + Math.round(weightOf(j.config && j.config.benchmark) * 100) + "%. "));
+    why.appendChild(PB.runTag(m)); card.appendChild(why);
+    var act = el("div", "actions");
+    var configured = c.configuredDevice || m.configured;
+    if (c.device === device || (configured === device && !c.device)) { act.appendChild(el("span", "muted", "Device " + device + " ")); act.appendChild(inUseTag()); }
+    else { var ub = el("button", null, "Apply device " + device); ub.type = "button"; ub.addEventListener("click", function () { useDevice(m.model, device); }); act.appendChild(ub); }
+    var a = m.threshold;
+    if (applicable(a)) {
+      var n = nowOf(a);
+      if (near(n.threshold, a.best.threshold)) { act.appendChild(el("span", "muted", "Confidence " + thr(a.best.threshold) + " ")); act.appendChild(inUseTag()); }
+      else { var tb = el("button", null, "Apply confidence " + thr(a.best.threshold)); tb.type = "button"; tb.title = "now " + thr(n.threshold); tb.addEventListener("click", function () { useThreshold(m.model, a.best.threshold); }); act.appendChild(tb); }
+    }
+    card.appendChild(act);
+    var bt = applicable(a) ? a.best.threshold : q.threshold;
+    if (has(bt)) card.appendChild(el("p", "bi-line", "In Blue Iris, set each camera's minimum confidence (AI settings) to " + Math.round(bt * 100) + "% or lower; a higher value there filters the detections again."));
+    card.appendChild(el("p", "muted small-print", "Device and confidence changes apply at once: the model reloads on its new device, and the next detections use the new confidence (no restart)."));
+    box.appendChild(card);
+  }
+  function renderSetup(j, models) {
+    var box = $("setup"); box.replaceChildren();
+    var rows = models.filter(function (m) { return m.recommended || applicable(m.threshold); });
+    if (!rows.length) return;
+    box.appendChild(el("h2", null, "Your setup vs recommended"));
+    var t = table("stack setup-table", ["Model", "Device now", "Recommended device", "Confidence now", "Recommended confidence"]);
+    rows.forEach(function (m) {
+      var c = cfgOf(j.config, m.model), tr = el("tr"), configured = c.configuredDevice || m.configured;
+      cell(tr, m.model, undefined, "Model");
+      var dn = cell(tr, c.device ? c.device : (configured ? configured + " (global)" : "global" + (j.config && j.config.globalLabel ? " (" + j.config.globalLabel + ")" : "")), undefined, "Device now");
+      if (c.runningDevice && c.runningDevice !== configured) dn.appendChild(el("span", "muted", " running on " + c.runningDevice));
+      var dr = cell(tr, m.recommended || "-", undefined, "Recommended device");
+      if (m.recommended) {
+        if (c.device === m.recommended || (!c.device && configured === m.recommended)) dr.appendChild(inUseTag());
+        else { var u = el("button", "small", "Apply"); u.type = "button"; u.setAttribute("aria-label", "Apply device " + m.recommended + " to " + m.model); u.addEventListener("click", function () { useDevice(m.model, m.recommended); }); dr.appendChild(u); }
+      }
+      var a = m.threshold, n = a ? nowOf(a) : null;
+      cell(tr, n ? F.thrBi(n.threshold) : (has(c.confidenceThreshold) ? F.thrBi(c.confidenceThreshold) : "-"), undefined, "Confidence now");
+      var tc = cell(tr, applicable(a) && !findsNothing(a.best) ? F.thrBi(a.best.threshold) : a && findsNothing(a.best) ? "finds no objects" : "-", undefined, "Recommended confidence");
+      if (a && findsNothing(a.best)) tc.title = FINDS_NOTHING;
+      if (applicable(a) && !findsNothing(a.best)) {
+        if (near(n.threshold, a.best.threshold)) tc.appendChild(inUseTag());
+        else { var v = el("button", "small", "Apply"); v.type = "button"; v.setAttribute("aria-label", "Apply confidence " + thr(a.best.threshold) + " to " + m.model); v.addEventListener("click", function () { useThreshold(m.model, a.best.threshold); }); tc.appendChild(v); }
+      }
       t.tBodies[0].appendChild(tr);
     });
-    box.appendChild(wrap(t, "rank"));
+    box.appendChild(wrap(t, "setup"));
   }
+
+  // ---- Overview: ranking -------------------------------------------------------------------------
+  var onlyThisRun = !!PB.store.get("onlyThisRun", false);
+  // A ranking row's best trade-off flag: its own, else the matching top-level point.
+  function bestTradeoff(j, r) {
+    if (r.best_tradeoff !== undefined) return !!r.best_tradeoff;
+    var p = (j.points || []).find(function (x) { return x.model === r.model && x.device === r.device; });
+    return !!(p && p.best_tradeoff);
+  }
+  function renderRanking(j, models) {
+    var box = $("ranking"); box.replaceChildren();
+    var all = j.ranking || []; if (!all.length) return;
+    var hasOld = all.some(function (r) { var m = modelOf(models, r.model); return (r.this_run === false) || (m && m.this_run === false); });
+    var rows = all.filter(function (r) { if (!onlyThisRun || !hasOld) return true; var m = modelOf(models, r.model); return r.this_run === true || (r.this_run === undefined && m && m.this_run); });
+    var byAuc = all[0].metric === "roc_auc";
+    box.appendChild(el("h2", null, "All models, best first"));
+    var tools = el("div", "table-tools");
+    tools.appendChild(el("span", "muted", "Each model on its recommended device. Accuracy graded by " + (byAuc ? "alert separation (frame ROC AUC)" : "detection quality (AP50, with small-object recall)") + ". "));
+    if (hasOld) {
+      var l = el("label", "check inline"), i = el("input"); i.type = "checkbox"; i.checked = onlyThisRun;
+      i.addEventListener("change", function () { onlyThisRun = i.checked; PB.store.set("onlyThisRun", onlyThisRun); L.keep(box, undefined, function () { renderRanking(j, models); }); });
+      l.appendChild(i); l.appendChild(document.createTextNode(" Only this run")); tools.appendChild(l);
+    }
+    box.appendChild(tools);
+    var metricKey = byAuc ? "roc_auc" : "ap50";
+    var t = sortable(table("stack rank-table", ["@rank", "@model", "@device", "@overall", "@accuracy_grade", "@speed_grade", "@p50", "@recall", "@precision", "@threshold", byAuc ? "@roc_auc" : "@ap50", "@ran", "@change", "@trust"]));
+    rows.forEach(function (r) {
+      var m = modelOf(models, r.model) || {}, tr = el("tr"), q = m.devices ? quality(m, r.device, r) : {};
+      cell(tr, r.rank, r.rank, "#");
+      var name = cell(tr, r.model + (r.relative ? " *" : ""), undefined, "Model");
+      if (bestTradeoff(j, r)) name.appendChild(PB.tip("★ best trade-off", PB.tipText("best_tradeoff"), "tag best-tradeoff", "rank"));
+      cell(tr, r.device, undefined, "Device").title = PB.RUNTIME_NAMES[PB.runtimeOf(r.device, r.runtime)] || "";
+      var unscored = r.accuracy === null || r.accuracy === undefined;
+      var o = cell(tr, "", undefined, "Overall"); o.appendChild(gradeEl(r.overall)); o.dataset.v = (unscored ? 10 : 0) + 4 - r.overall_points;
+      if (unscored) { o.append(" "); o.appendChild(el("span", "muted", "speed only")); }
+      var a = cell(tr, "", undefined, "Accuracy"); if (unscored) { a.appendChild(el("span", "muted", "not scored")); a.title = "None of this model's classes are in the selected datasets"; } else a.appendChild(gradeEl(r.accuracy, r.relative));
+      var s = cell(tr, "", undefined, "Speed"); s.appendChild(gradeEl(r.speed));
+      cell(tr, F.ms(r.p50_ms), r.p50_ms, "Time per image");
+      cell(tr, F.pct(q.recall), has(q.recall) ? -q.recall : null, "Finds");
+      cell(tr, F.pct(q.precision), has(q.precision) ? -q.precision : null, "Correct");
+      cell(tr, has(q.threshold) ? thr(q.threshold) + " (" + Math.round(q.threshold * 100) + "%)" : "-", has(q.threshold) ? q.threshold : null, "Confidence");
+      var av = byAuc ? r.roc_auc : r.ap50; cell(tr, F.pct(av, 1), has(av) ? -av : null, byAuc ? "Alert separation" : "Detection quality");
+      var ran = cell(tr, "", undefined, "Ran"); ran.dataset.v = m.timestamp ? -new Date(m.timestamp).getTime() : ""; ran.appendChild(PB.runTag(m));
+      var ch = cell(tr, "", undefined, "Δ vs last run"); if (!m.changes) ch.textContent = "-"; else ch.appendChild(PB.changeChips(m.changes, r.device, metricKey));
+      var tt = cell(tr, "", undefined, "Trust"); tt.appendChild(PB.trustBadge(r.trust || m.trust, "rank"));
+      t.tBodies[0].appendChild(tr);
+    });
+    if (!rows.length) box.appendChild(el("p", "empty", "No model of the latest run is ranked yet; uncheck “Only this run”."));
+    else box.appendChild(wrap(t, "rank"));
+  }
+
+  // ---- Confidence tab ------------------------------------------------------------------------
+  var USES = [
+    ["f1", "Balanced", "Finds objects and avoids false alerts equally (F1)."],
+    ["f2", "Miss fewer objects", "Finds more objects and accepts more false alerts (F2)."],
+    ["precision:0.9", "Fewer false alerts", "At least 9 in 10 detections right, then finds as many objects as possible (precision ≥ 90%)."],
+    ["fpr:0.05", "Fewer false-alert frames", "At most 5 in 100 empty frames alert, then alerts on as many frames with objects as possible (false-alert rate ≤ 5%)."]
+  ];
+  var conf = {obj: null, cache: {}, pending: {}};
+  function savedObjective(j) { return String((j && j.config && j.config.benchmark && j.config.benchmark.threshold_objective) || "f1"); }
+  function confSearch(obj) {
+    if (conf.cache[obj] || conf.pending[obj]) return;
+    conf.pending[obj] = true;
+    var b = new URLSearchParams(); b.append("model", "all"); b.append("objective", obj); b.append("iou", "0.5");
+    post("/v1/benchmark/threshold-search", b).then(function (j) {
+      conf.pending[obj] = false; conf.cache[obj] = j.success ? j : {error: j.message || "the search failed"};
+      if (lastStatus) L.keep($("conf-best"), undefined, function () { renderConfBest(lastStatus, lastModels); });
+    }, function () { conf.pending[obj] = false; conf.cache[obj] = {error: "the server did not answer"}; });
+  }
+  function renderConfPick(j) {
+    var box = $("conf-pick"); box.replaceChildren();
+    var saved = savedObjective(j); if (!conf.obj) conf.obj = saved;
+    var card = el("div", "card");
+    var h = el("h2", null, "Best confidence for your cameras "); h.appendChild(PB.term("?", "threshold", "conf")); card.appendChild(h);
+    card.appendChild(el("p", "muted", "Pick what matters for your cameras: the best confidence comes from the stored predictions of the last run, so switching is instant (no inference)."));
+    var fs = el("fieldset", "presets"); fs.appendChild(el("legend", "visually-hidden", "Use case"));
+    var list = USES.slice(); if (!list.some(function (u) { return u[0] === saved; })) list.push([saved, "Saved setting", "The objective saved in the config: " + saved + "."]);
+    list.forEach(function (u) {
+      var l = el("label", "preset" + (conf.obj === u[0] ? " on" : "")), i = el("input"); i.type = "radio"; i.name = "conf-use"; i.value = u[0]; i.checked = conf.obj === u[0];
+      i.addEventListener("change", function () { if (!i.checked) return; conf.obj = u[0]; renderConfPick(lastStatus); L.keep($("conf-best"), undefined, function () { renderConfBest(lastStatus, lastModels); }); });
+      var t = el("span", "preset-text"); t.appendChild(el("strong", null, u[1] + (u[0] === saved ? " (saved)" : ""))); t.appendChild(el("span", "muted", u[2]));
+      l.appendChild(i); l.appendChild(t); fs.appendChild(l);
+    });
+    card.appendChild(fs);
+    if (conf.obj !== saved) {
+      var act = el("div", "actions"), sb = el("button", "small secondary", "Make this the default"); sb.type = "button";
+      var m = el("span", "muted"); m.setAttribute("aria-live", "polite");
+      sb.title = "Saves it as the benchmark's confidence objective: the Overview and the Apply buttons then use it";
+      sb.addEventListener("click", function () { sb.disabled = true; saveSettings({threshold_objective: conf.obj}, function (r) { m.textContent = r.message || ""; }); });
+      act.appendChild(sb); act.appendChild(m); card.appendChild(act);
+    }
+    var sn = lastStatus ? staleNotice(lastStatus, lastModels) : null; if (sn) card.appendChild(sn);
+    card.appendChild(el("p", "bi-line", "In Blue Iris, set each camera's minimum confidence (AI settings) at or below the percentage shown for its model; a higher value there filters the detections again."));
+    box.appendChild(card);
+  }
+  // The pick of `obj` for model m: the saved advice (same objective) or a search result.
+  function pickFor(m, obj, saved) {
+    var a = m.threshold;
+    if (a && String(a.objective) === obj) return {best: a.best, now: nowOf(a).point ? Object.assign({}, nowOf(a).point, {threshold: nowOf(a).threshold}) : {threshold: nowOf(a).threshold}, device: a.device, objective: a.objective, saved: true};
+    var s = conf.cache[obj];
+    // The search is not available (no stored predictions): show the stored advice, marked.
+    if (s && s.error && a) return {best: a.best, now: Object.assign({}, nowOf(a).point || {}, {threshold: nowOf(a).threshold}), device: a.device, objective: a.objective, saved: false, other: s.error};
+    if (!s || s.error) return s ? {error: s.error} : null;
+    var r = (s.results || []).find(function (x) { return x.model.toLowerCase() === m.model.toLowerCase(); });
+    return r ? {best: r.best, now: r.now || r.configured, device: r.device, objective: r.objective, saved: false} : null;
+  }
+  function renderConfBest(j, models) {
+    var box = $("conf-best"); box.replaceChildren();
+    var saved = savedObjective(j), obj = conf.obj || saved;
+    var withAdvice = models.filter(function (m) { return m.threshold; });
+    if (!withAdvice.length) { box.appendChild(el("p", "empty", models.length ? "No confidence results: the benchmark needs datasets with labels (or a reference model) to find the best confidence." : "No results yet: run a benchmark under Run; this tab then shows the best confidence for each model.")); return; }
+    if (withAdvice.some(function (m) { return String(m.threshold.objective) !== obj; })) confSearch(obj);
+    var grid = el("div", "conf-grid");
+    withAdvice.forEach(function (m) {
+      var pk = pickFor(m, obj, saved), card = el("div", "card conf-card");
+      var h = el("h3", null, m.model + " "); h.appendChild(el("span", "muted", pk && pk.device ? "on " + pk.device : "")); card.appendChild(h);
+      if (!pk) { card.appendChild(el("p", "muted", "searching…")); grid.appendChild(card); return; }
+      if (pk.error) { card.appendChild(el("p", "warn", pk.error)); grid.appendChild(card); return; }
+      var b = pk.best;
+      if (!b) { card.appendChild(el("p", "muted", "No best confidence: no labelled objects for this model.")); grid.appendChild(card); return; }
+      if (pk.other) card.appendChild(el("p", "muted", "Found for " + PB.objectiveName(pk.objective) + " (the search for " + PB.objectiveName(obj) + " is not available: " + pk.other + ")."));
+      if (findsNothing(b)) { card.appendChild(el("p", "warn", FINDS_NOTHING)); grid.appendChild(card); return; }
+      var big = el("p", "conf-big"); big.appendChild(el("span", "conf-value", thr(b.threshold))); big.appendChild(el("span", "conf-bi", " = " + Math.round(b.threshold * 100) + "% in Blue Iris")); card.appendChild(big);
+      if (b.plateau && has(b.plateau[0]) && has(b.plateau[1])) {
+        var lo = b.plateau[0].toFixed(2), hi = b.plateau[1].toFixed(2), pl = el("p");
+        pl.appendChild(document.createTextNode((lo === hi ? "Only values very close to " + lo : "Anything from " + lo + " to " + hi) + " scores within " + PB.noise.plateau_points + " "));
+        pl.appendChild(PB.term("points", "points", "conf")); pl.appendChild(document.createTextNode(lo === hi ? " of the best: this model is sensitive to the confidence. " : " of the best, so a 0.01 move of this value is rounding. "));
+        pl.appendChild(PB.term("Why?", "plateau", "conf")); card.appendChild(pl);
+      }
+      if (!b.met) card.appendChild(el("p", "warn", "The target is not reached at any confidence; this is the closest one." + (b.note ? " " + b.note : "")));
+      var pt = b.point || {};
+      card.appendChild(el("p", "muted", "At " + thr(b.threshold) + ": finds " + F.pct(pt.recall) + " of objects, " + (inTen(pt.precision) || "-") + " correct" + (pt.frame ? ", " + F.pct(pt.frame.fpr) + " of empty frames alert" : "") + "."));
+      var n = pk.now || {}, act = el("div", "actions");
+      act.appendChild(el("span", null, "Now " + F.thrBi(n.threshold) + (has(n.recall) ? " (finds " + F.pct(n.recall) + ", " + F.pct(n.precision) + " correct)" : "") + " "));
+      if (near(n.threshold, b.threshold)) act.appendChild(inUseTag());
+      else if (b.met && pt.tp > 0) { var u = el("button", "small", "Apply " + thr(b.threshold)); u.type = "button"; u.addEventListener("click", function () { useThreshold(m.model, b.threshold); }); act.appendChild(u); }
+      card.appendChild(act);
+      // Change since the last run (for the saved objective only: history is stored for it).
+      var ch = m.changes, tc = ch && ch.metrics ? ch.metrics.find(function (x) { return x.metric === "threshold"; }) : null, cl = el("p", "conf-change");
+      if (!ch) cl = null;
+      else if (!pk.saved) cl.appendChild(el("span", "muted", "Change since the last run: shown for the saved objective (" + saved + ")."));
+      else if (!ch.baseline) cl.appendChild(PB.chip("first", null, "No earlier run of this model to compare with; the next run is compared with this one."));
+      else if (!ch.comparable) { cl.appendChild(PB.chip("not_comparable", null, (ch.reasons || []).join("; "))); cl.appendChild(document.createTextNode(" since the run of " + F.when(ch.baseline.timestamp))); }
+      else if (tc) { cl.appendChild(document.createTextNode("Since the run of " + F.when(ch.baseline.timestamp) + ": " + thr(tc.before) + " → " + thr(tc.after) + " ")); cl.appendChild(PB.metricChip(tc)); if (tc.why) cl.appendChild(el("span", "muted", " " + tc.why)); }
+      else { cl.appendChild(PB.chip("same")); cl.appendChild(document.createTextNode(" no change recorded since " + F.when(ch.baseline.timestamp))); }
+      if (cl) card.appendChild(cl);
+      grid.appendChild(card);
+    });
+    box.appendChild(grid);
+  }
+
+  // ---- Details tab (one collapsible card per model) ---------------------------------------------
   function breakdown(key, title, rows) {
     var d = el("div"); if (!rows || !rows.length) return d;
     d.appendChild(el("h4", null, title));
-    var t = sortable(table("", ["", "Images", "Objects", "AP50", "AP50-95", "ROC AUC", "P", "R", "F1"]));
+    var t = sortable(table("", ["", "Images", "Objects", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@f1"]));
     rows.forEach(function (b) {
       var tr = el("tr"); cell(tr, b.key + (b.relative ? " (relative)" : "")); cell(tr, b.images, b.images); cell(tr, b.gt, b.gt);
       [b.ap50, b.ap50_95, b.roc_auc, b.precision, b.recall, b.f1].forEach(function (v) { cell(tr, pct(v), v === undefined ? null : v); });
@@ -635,23 +891,23 @@
     }
     return box;
   }
-  // One card per model, patched in place: only cards whose data changed are rebuilt (keeping
-  // their scroll offsets, open <details> and sort order).
-  // One collapsible card per model. The first card (or the one the URL names) starts open; a
-  // rebuilt card keeps its open state.
-  function renderModels(models, cfg) {
+  // One collapsible card per model, patched in place: only cards whose data changed are rebuilt
+  // (keeping their scroll offsets, open <details> and sort order). The first card (or the one
+  // the URL names) starts open; a rebuilt card keeps its open state.
+  function renderModels(models, cfg, ranking) {
     var box = $("models");
     $("no-models").hidden = models.length > 0;
     var cfgByName = {}; (cfg.models || []).forEach(function (c) { cfgByName[c.name.toLowerCase()] = c; });
     var hashId = location.hash.slice(1), named = models.some(function (m) { return "m-" + encodeURIComponent(m.model) === hashId; });
     L.patch(box, models.map(function (m, i) {
       var c = cfgByName[m.model.toLowerCase()] || {}, id = "m-" + encodeURIComponent(m.model);
+      var rk = (ranking || []).find(function (r) { return r.model === m.model; }), metric = rk && rk.metric === "roc_auc" ? "roc_auc" : "ap50";
       var was = document.getElementById(id), open = was ? was.open : (named ? id === hashId : i === 0);
-      return {key: m.model.toLowerCase(), sig: JSON.stringify([m, c, cfg.globalLabel]), build: function () { var d = modelCard(m, c, cfg); d.open = open; return d; }};
+      return {key: m.model.toLowerCase(), sig: JSON.stringify([m, c, cfg.globalLabel, metric]), build: function () { var d = modelCard(m, c, cfg, metric); d.open = open; return d; }};
     }));
     if (location.hash && !box.dataset.scrolled) { var t2 = document.getElementById(hashId); if (t2) { if (t2.tagName === "DETAILS") t2.open = true; t2.scrollIntoView(); box.dataset.scrolled = "1"; } }
   }
-  function modelCard(m, c, cfg) {
+  function modelCard(m, c, cfg, metric) {
     var det2 = el("details", "card model"), key = m.model.toLowerCase(); det2.id = "m-" + encodeURIComponent(m.model);
     var card = el("div", "body");
     // The device the config resolves to now (not when the benchmark ran) and the loaded one.
@@ -662,12 +918,28 @@
     else if (m.error) sum.appendChild(el("span", "error-text", "failed"));
     else sum.appendChild(el("span", "muted", m.recommended || m.recommendation || "running…"));
     if (c.restartNeeded) { var rb = el("span", "tag restart", "restart needed"); rb.title = (c.pending || []).join("; "); sum.appendChild(rb); }
+    sum.appendChild(PB.runTag(m));
+    var rd = recDevice(m); if ((rd && rd.trust) || m.trust) sum.appendChild(PB.trustBadge((rd && rd.trust) || m.trust, "card"));
+    if (m.changes !== undefined) sum.appendChild(PB.changeChips(m.changes, m.recommended, metric));
     sum.appendChild(el("span", "muted", (m.datasets || []).join(", ") + " · " + (m.images || 0) + " image" + (m.images === 1 ? "" : "s") + " · " + when(m.timestamp)));
     det2.appendChild(sum); det2.appendChild(card);
     card.appendChild(el("p", "muted cfg-line", "Configured: " + (c.device ? c.device : "global (" + cfg.globalLabel + ")") + (configured ? " · resolves to " + configured : "") + (c.provider ? " · now: " + c.provider : "") + (c.restartNeeded ? " · restart needed (" + c.pending.join("; ") + ")" : "")));
     if (m.error) { card.appendChild(el("p", "error", m.error)); return det2; }
     card.appendChild(el("p", m.recommended ? "notice" : "warn", m.recommended ? "Recommended: " + m.recommended + " — " + m.recommendation : "No recommendation: " + m.recommendation));
-    var t = sortable(table("devices", ["Device", "Load ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "req/s", "AP50", "AP50-95", "ROC AUC", "P", "R", "Grade", "Agreement", ""]));
+    if (m.changes && m.changes.baseline && m.changes.comparable && (m.changes.metrics || []).length) {
+      var cd = det("chg:" + key, "What changed since the run of " + when(m.changes.baseline.timestamp) + (m.changes.baseline.pinned ? " (pinned baseline)" : "") + (m.changes.summary ? ": " + m.changes.summary : ""));
+      var ct = table("stack", ["What", "Device", "Before", "After", "Change", "Why"]);
+      m.changes.metrics.forEach(function (mc) {
+        var tr = el("tr"); cell(tr, PB.METRIC_NAMES[mc.metric] || mc.metric, undefined, "What"); cell(tr, mc.device || "model", undefined, "Device");
+        cell(tr, PB.metricValue(mc.metric, mc.before), undefined, "Before").className = "num"; cell(tr, PB.metricValue(mc.metric, mc.after), undefined, "After").className = "num";
+        var cc = cell(tr, "", undefined, "Change"); cc.appendChild(PB.metricChip(mc)); cell(tr, mc.why || "", undefined, "Why");
+        ct.tBodies[0].appendChild(tr);
+      });
+      cd.appendChild(wrap(ct, "chg:" + key)); card.appendChild(cd);
+    } else if (m.changes && m.changes.baseline && !m.changes.comparable) {
+      card.appendChild(el("p", "muted", "⚠ Not compared with the run of " + when(m.changes.baseline.timestamp) + ": " + ((m.changes.reasons || []).join("; ") || "the runs differ") + "."));
+    }
+    var t = sortable(table("devices", ["Device", "@load_ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "@fps", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@grade", "@agreement", "@trust", ""]));
     var okRuns = m.devices.filter(function (d) { return d.run && !d.run.fell_back; });
     var fastest = okRuns.reduce(function (a, d) { return !a || d.run.stages_ms.total.p50 < a.run.stages_ms.total.p50 ? d : a; }, null);
     m.devices.forEach(function (d) {
@@ -678,7 +950,7 @@
       if (d.device === configured) name.appendChild(el("span", "tag cfg", "configured"));
       if (running && running !== configured && d.device === running) { var rt = el("span", "tag", "running"); rt.title = "loaded on this device until a restart"; name.appendChild(rt); }
       if (!r || r.fell_back) {
-        var e = el("td", "error-text", d.error || ("fell back to " + (r && r.device))); e.colSpan = 14; tr.classList.add("failed"); tr.appendChild(e);
+        var e = el("td", "error-text", d.error || ("fell back to " + (r && r.device))); e.colSpan = 15; tr.classList.add("failed"); tr.appendChild(e);
       } else {
         var acc = r.accuracy ? r.accuracy.overall : null;
         cell(tr, r.compile_ms.toFixed(0), r.compile_ms, "Load ms"); cell(tr, ms(r.stages_ms.infer.p50), r.stages_ms.infer.p50, "Infer p50"); cell(tr, ms(r.stages_ms.infer.mean), r.stages_ms.infer.mean, "Infer mean");
@@ -689,6 +961,7 @@
         if (r.grades) { g.append(gradeEl(r.grades.overall), " ", gradeEl(r.grades.accuracy, r.grades.relative), " ", gradeEl(r.grades.speed)); g.title = "overall / accuracy" + metricTag(r.grades) + " / speed"; }
         var ag = cell(tr, verdictText(r.agreement), undefined, "Agreement");
         if (r.agreement && r.agreement.verdict === "disagrees") { tr.classList.add("bad"); ag.title = "detections differ from " + r.agreement.reference + "; never recommended"; }
+        var tc = cell(tr, "", undefined, "Trust"); tc.appendChild(PB.trustBadge(d.trust, "dev"));
         var act = el("td", "actions-cell");
         if (!(c.device && c.device === d.device)) { var u = el("button", "small", "Use " + d.device); u.type = "button"; u.addEventListener("click", function () { useDevice(m.model, d.device); }); act.appendChild(u); }
         if (r.images) { var i = el("button", "small", "Images"); i.type = "button"; i.addEventListener("click", function () { drill(m.model, d.device); }); act.appendChild(i); }
@@ -702,7 +975,7 @@
     var rr = recRun(m) || (fastest && fastest.run); if (rr) card.appendChild(details(key, rr));
     return det2;
   }
-  // A link to #m-<model> (summary cards, the Config page) opens that model's card.
+  // A link to #m-<model> (the Config page) opens that model's card.
   window.addEventListener("hashchange", function () {
     var t2 = document.getElementById(location.hash.slice(1));
     if (t2 && t2.tagName === "DETAILS" && t2.classList.contains("model")) { t2.open = true; t2.scrollIntoView(); }
@@ -741,21 +1014,86 @@
   $("drill-filter").addEventListener("change", drawDrill);
   $("drill-close").addEventListener("click", function () { $("drill").close(); });
 
+  // ---- Run tab: estimated run time ---------------------------------------------------------------
+  // From the last run's time per image of each selected model x device (load + warm-up + timed
+  // runs); pairs without an earlier run are not counted.
+  function estimate() {
+    var out = $("estimate"); if (!out || !form) return;
+    var models = Array.prototype.map.call(form.querySelectorAll("input[name=model]:checked"), function (c) { return c.value; });
+    var devices = Array.prototype.map.call(form.querySelectorAll("input[name=device]:checked"), function (c) { return c.value; });
+    var nsets = form.querySelectorAll("input[name=dataset]:checked").length + ($("add-folder").value.trim() ? 1 : 0);
+    var maxImages = parseInt(form.elements.max_images.value, 10) || 0, repeat = Math.max(1, parseInt(form.elements.repeat.value, 10) || 1), warmup = Math.max(0, parseInt(form.elements.warmup.value, 10) || 0);
+    var total = 0, known = 0, pairs = models.length * devices.length;
+    models.forEach(function (name) {
+      var m = modelOf(lastModels, name); if (!m) return;
+      devices.forEach(function (dv) {
+        var d = (m.devices || []).find(function (x) { return x.device === dv; }), r = d && d.run; if (!r || !r.stages_ms || !r.stages_ms.total) return;
+        var n = maxImages > 0 ? maxImages * Math.max(1, nsets) : m.images; if (!n) return;
+        var per = r.stages_ms.total.mean || r.stages_ms.total.p50;
+        total += (r.compile_ms || 0) / 1000 + (warmup + repeat * n) * per / 1000; known++;
+      });
+    });
+    if (!pairs) { out.textContent = ""; return; }
+    if (!known) { out.textContent = "Estimated run time: unknown (no earlier run of these models on these devices)."; return; }
+    out.textContent = "Estimated run time: about " + F.duration(total) + (known < pairs ? " for " + known + " of " + pairs + " model × device pairs (the others have no earlier run)" : "") + ", from the last run's time per image" + (maxImages > 0 ? "" : " and image count") + ". Downloads and the reference model add to it.";
+  }
+  if (form) { form.addEventListener("input", estimate); form.addEventListener("change", estimate); }
+
+  // ---- step strip ------------------------------------------------------------------------------
+  function steps(j, models) {
+    var box = $("steps"); if (!box) return;
+    var hasResults = models.some(function (m) { return m.recommended || m.threshold; });
+    var pending = models.some(function (m) {
+      var c = cfgOf(j.config, m.model), configured = c.configuredDevice || m.configured;
+      var devOk = !m.recommended || c.device === m.recommended || (!c.device && configured === m.recommended);
+      var thrOk = !applicable(m.threshold) || near(nowOf(m.threshold).threshold, m.threshold.best.threshold);
+      return !(devOk && thrOk);
+    });
+    var cur = j.running || !hasResults ? "run" : pending ? "review" : "done";
+    var order = ["run", "review", "apply"];
+    box.querySelectorAll("li").forEach(function (li) {
+      var s = li.dataset.step, i = order.indexOf(s), ci = cur === "done" ? 3 : order.indexOf(cur);
+      li.classList.toggle("done", i < ci); li.classList.toggle("current", i === ci);
+      if (i === ci) li.setAttribute("aria-current", "step"); else li.removeAttribute("aria-current");
+    });
+  }
+
+  // ---- render loop ------------------------------------------------------------------------------
   // Each section re-renders only when its data changed, keeping the user's scroll offsets,
   // open <details>, sort order and focus (PrismLive.keep / patch); progress updates in place.
   var firstRender = true;
+  function compareShown() { if (T && T.current() === T.indexOf("tab-compare") && PB.compare) PB.compare.shown(); }
+  var nav = document.querySelector("nav.tabs");
+  if (nav) nav.addEventListener("click", function () { setTimeout(compareShown, 0); });
+  window.addEventListener("hashchange", function () { setTimeout(compareShown, 0); });
   function render(j) {
-    var models = merged(j), sm = JSON.stringify(models), sc = JSON.stringify(j.config);
-    lastConfig = j.config;
+    PB.setNoise(j.noise);
+    var models = merged(j), sm = JSON.stringify(models), sc = JSON.stringify(j.config), sr = JSON.stringify(j.ranking || []);
+    lastConfig = j.config; lastModels = models; lastStatus = j;
     $("no-results").hidden = models.length > 0 || j.running;
-    if (firstRender) { firstRender = false; if (T && !location.hash) T.show(models.length ? "tab-results" : "tab-run"); else if (T && location.hash) renderModels(models, j.config), T.show(location.hash.slice(1)); }
-    L.keep($("summary"), sm, function () { renderSummary(models); });
-    L.keep($("ranking"), JSON.stringify(j.ranking), function () { renderRanking(j.ranking); });
+    if (firstRender) {
+      firstRender = false;
+      if (T && !location.hash) T.show(models.length ? "tab-overview" : "tab-run");
+      else if (T && location.hash) { renderModels(models, j.config, j.ranking); T.show(location.hash.slice(1)); }
+    }
+    var running = j.running;
+    L.keep($("run-banner"), JSON.stringify([models.map(function (m) { return [m.model, m.this_run, m.changes, m.timestamp, m.error, m.recommendation]; }), running, j.run && j.run.progress && [j.run.progress.modelIndex, j.run.progress.modelCount], (j.run && j.run.models || []).length, j.latest_run_id, sr]), function () { renderBanner(j, models); });
+    var objs = JSON.stringify(models.map(function (m) { return m.threshold ? m.threshold.objective : null; }));
+    L.keep($("preset"), JSON.stringify([j.config && j.config.benchmark, presetUi, running, models.length > 0, objs]), function () { renderPreset(j); });
+    L.keep($("recommend"), sm + sc + sr, function () { renderRecommend(j, models); });
+    L.keep($("setup"), sm + sc, function () { renderSetup(j, models); });
+    L.keep($("ranking"), sm + sr + onlyThisRun, function () { renderRanking(j, models); });
+    L.keep($("glossary"), JSON.stringify(PB.noise), function () { var g = $("glossary"); g.replaceChildren(PB.glossaryDetails("overview")); });
+    L.keep($("conf-pick"), JSON.stringify([savedObjective(j), conf.obj, objs, running]), function () { renderConfPick(j); });
+    L.keep($("conf-best"), sm + sc + conf.obj + Object.keys(conf.cache).join(","), function () { renderConfBest(j, models); });
     L.keep($("thresholds"), sm + sc, function () { renderThresholds(models); });
-    renderModels(models, j.config);
-    $("apply-all-bar").hidden = !models.some(function (m) { return m.recommended; }) || j.running;
-    $("apply-thr-bar").hidden = j.running || !models.some(function (m) { return applicable(m.threshold); });
-    var p = j.run.progress, running = j.running;
+    renderModels(models, j.config, j.ranking);
+    if (PB.compare) PB.compare.render(j, models);
+    steps(j, models);
+    estimate();
+    $("apply-all-bar").hidden = !models.some(function (m) { return m.recommended; }) || running;
+    $("apply-thr-bar").hidden = running || !models.some(function (m) { return applicable(m.threshold); });
+    var p = j.run.progress;
     $("start").disabled = running; $("cancel").hidden = !running; $("progress").hidden = !running;
     if (running && p) {
       if (p.stage === "benchmark") {
@@ -763,11 +1101,13 @@
         ptext.textContent = p.model + " (" + p.modelIndex + "/" + p.modelCount + ") on " + p.device + " · " + p.phase + (p.total ? " " + p.done + "/" + p.total : "") + (p.image ? " · " + p.image : "") + " · " + p.percent.toFixed(0) + "%" + (p.etaSecs ? " · about " + Math.ceil(p.etaSecs) + " s left" : "");
       } else { bar.removeAttribute("value"); ptext.textContent = p.text || p.stage; }
     } else if (running) { bar.removeAttribute("value"); ptext.textContent = "starting…"; }
-    if (!running && lastState === "running") { msg.textContent = j.run.message || j.run.error || j.state; refreshSearch(); }
+    if (!running && lastState === "running") { msg.textContent = j.run.message || j.run.error || j.state; refreshSearch(); if (PB.compare) PB.compare.invalidate(); }
     else if (!running && !msg.textContent && j.run.state !== "idle") msg.textContent = j.run.message || j.run.error || "";
     var warnings = j.run.warnings || [];
     L.keep($("warnings"), JSON.stringify(warnings), function () { var w = $("warnings"); w.replaceChildren(); warnings.forEach(function (t) { w.appendChild(el("li", null, t)); }); });
     lastState = j.state;
+    compareShown();
+    PB.refreshTip();
     return running;
   }
   function refresh() {
@@ -776,6 +1116,7 @@
       return r.json();
     }).then(render);
   }
+  PB.refresh = refresh;
   function poll() {
     if (polling) return;
     polling = setInterval(function () {
