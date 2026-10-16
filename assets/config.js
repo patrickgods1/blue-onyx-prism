@@ -191,6 +191,8 @@ document.addEventListener("click", function (e) {
     j.models.forEach(function (m, i) {
       var tr = rows[i];
       upd(tr.querySelector("input[name=enabled]"), m.enabled);
+      var rm = tr.querySelector("button.model-remove");
+      if (rm) { rm.disabled = m.enabled; rm.title = m.enabled ? "Enabled: disable it first (untick Load and save), then remove it" : "Remove this entry from the config; its files stay"; }
       upd(tr.querySelector("select"), m.device || "");
       var thr = tr.querySelector("input[type=number]");
       upd(thr, fmtThr(m.threshold));
@@ -300,12 +302,15 @@ document.addEventListener("click", function (e) {
   // Save without leaving the page: JSON answers shown next to the button.
   function msgOf(form) { return form.querySelector(".form-msg"); }
   function say(form, cls, text) { var m = msgOf(form); m.className = "form-msg " + cls; m.textContent = text; }
-  // `by`: the clicked button, disabled while the request runs.
-  function send(form, data, by) {
-    say(form, "muted", "saving…");
+  // `by`: the clicked button, disabled while the request runs. `opts.url`: post there instead
+  // of the form's action; `opts.keep`: the form keeps its unsaved edits (the answer is still
+  // shown in it).
+  function send(form, data, by, opts) {
+    opts = opts || {};
+    say(form, "muted", opts.url ? "working…" : "saving…");
     if (by) by.disabled = true;
     var done = function () { if (by) by.disabled = false; };
-    return fetch(form.getAttribute("action").split("#")[0], {method: "POST", body: new URLSearchParams(data), headers: {"Accept": "application/json"}})
+    return fetch(opts.url || form.getAttribute("action").split("#")[0], {method: "POST", body: new URLSearchParams(data), headers: {"Accept": "application/json"}})
       .then(function (r) { return r.json().then(function (j) { j._status = r.status; return j; }); })
       .then(function (j) {
         done();
@@ -313,11 +318,24 @@ document.addEventListener("click", function (e) {
         own[j.revision] = true;
         say(form, "ok-text", j.message);
         if (j.restarting) { say(form, "ok-text", j.message + " Restarting…"); L.restarting(); L.afterRestart(); return; }
-        resetAfter = {form: form, rev: j.revision};
+        if (!opts.keep) resetAfter = {form: form, rev: j.revision};
         L.poll(true);
       })
       .catch(function (e) { done(); say(form, "error-text", "Not saved: the server did not answer (" + e + "); it may be restarting or stopped, so check that it runs and save again."); });
   }
+  // Remove on a Models card row: its button belongs to the empty #model-remove form (so it is
+  // not the card's default button); only `name` is sent, the answer shows in the card, the
+  // other rows keep their unsaved edits (the card re-renders as the model list changed).
+  var removeForm = $("model-remove");
+  document.addEventListener("submit", function (e) {
+    if (!removeForm || e.target !== removeForm) return;
+    var by = e.submitter;
+    e.preventDefault();
+    if (!by || !by.name) return;
+    var data = new FormData();
+    data.append(by.name, by.value);
+    send(card, data, by, {url: removeForm.getAttribute("action").split("#")[0], keep: true});
+  });
   document.addEventListener("submit", function (e) {
     var form = e.target;
     if (form !== serverForm && form !== card && form !== jsonForm) return;

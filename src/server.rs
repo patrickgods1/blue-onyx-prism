@@ -38,8 +38,9 @@ mod test_util;
 use apply::sync_config;
 pub(crate) use apply::{apply_config, reload_models};
 use config_page::{
-    ConfigView, MessageTemplate, config_loglevel, config_models, config_page, config_restart,
-    config_submit, encode_uri_component, global_device_label, save_config, schedule_restart,
+    ConfigView, MessageTemplate, config_loglevel, config_models, config_models_remove, config_page,
+    config_restart, config_submit, encode_uri_component, global_device_label, save_config,
+    schedule_restart,
 };
 pub(crate) use detect::BODY_LIMIT;
 use detect::{custom_list, detection_custom, detection_default};
@@ -178,6 +179,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/test", get(test_page).post(test_submit)),
         ("/config", get(config_page).post(config_submit)),
         ("/config/models", post(config_models)),
+        ("/config/models/remove", post(config_models_remove)),
         ("/config/restart", post(config_restart)),
         ("/config/loglevel", post(config_loglevel)),
         ("/logs", get(logs_page)),
@@ -922,6 +924,7 @@ mod tests {
             "/test",
             "/config",
             "/config/models",
+            "/config/models/remove",
             "/config/restart",
             "/config/loglevel",
             "/logs",
