@@ -659,9 +659,9 @@
     return out.sort();
   }
   // "Compare models on: [...]": changing it redraws everything that follows the selection.
-  function deviceSelector(models, scope) {
+  function deviceSelector(models, scope, text) {
     var l = el("label", "inline-label device-select"), s = el("select");
-    l.appendChild(document.createTextNode("Compare models on "));
+    l.appendChild(document.createTextNode((text || "Compare models on") + " "));
     var opts = [["rec", "Recommended device of each model"], ["all", "All devices"]].concat(devicesOf(models).map(function (d) { return [d, d + " (" + (PB.RUNTIME_NAMES[PB.runtimeOf(d)] || "") + ")"]; }));
     if (selDevice !== "rec" && selDevice !== "all" && !opts.some(function (o) { return o[0] === selDevice; })) opts.push([selDevice, selDevice + " (no results)"]);
     opts.forEach(function (o) { var x = el("option", null, o[1]); x.value = o[0]; if (o[0] === selDevice) x.selected = true; s.appendChild(x); });
@@ -725,7 +725,9 @@
           pick: pk, thr: pk ? pk.threshold : null, recall: pt ? pt.recall : ov ? ov.recall : null, precision: pt ? pt.precision : ov ? ov.precision : null,
           fpr: pt && pt.frame ? pt.frame.fpr : null, atBest: !!pt, pickState: bp.state, foundFor: bp.foundFor,
           trust: (p && p.trust) || d.trust || (rec ? m.trust : null), rec: rec, now: now === d.device, fellBack: !!r.fell_back, thisRun: m.this_run,
-          rank: isRk ? rk.rank : p ? p.rank : null, pointRank: p ? p.rank : null,
+          // One rank order per view (as step 4 picks): the model ranking for the recommended devices,
+          // else the rank among every model x device point.
+          rank: selDevice === "rec" && isRk ? rk.rank : p ? p.rank : isRk ? rk.rank : null, pointRank: p ? p.rank : null,
           best: selDevice === "rec" ? (isRk && rk.best_tradeoff !== undefined ? !!rk.best_tradeoff : !!(p && p.best_tradeoff)) : !!(p && p.best_tradeoff)
         });
       });
@@ -767,7 +769,12 @@
     b.title = label + (has(t) ? " (= " + Math.round(t * 100) + "% in Blue Iris)" : "") + " for " + r.model;
     b.setAttribute("aria-label", b.title);
     b.disabled = !!j.running || r.fellBack;
-    b.addEventListener("click", function () { b.disabled = true; if (r.now) useThreshold(r.model, t); else usePair(r.model, r.device, t); });
+    b.addEventListener("click", function () {
+      b.disabled = true;
+      // Choosing a device with "Use this" is the step-2 pick: steps 3 and 4 follow it.
+      if (r.device !== selDevice) { selDevice = r.device; PB.store.set("device", selDevice); redrawSelection(); }
+      if (r.now) useThreshold(r.model, t); else usePair(r.model, r.device, t);
+    });
     return b;
   }
   function renderRecommend(j, models) {
@@ -781,7 +788,12 @@
     }
     if (!pick) { var rl = $("rec-line"); if (rl) rl.replaceChildren(); if (models.length && !j.running) { var w = el("div", "card"); w.appendChild(el("h2", null, "No recommendation yet" + (selDevice !== "rec" && selDevice !== "all" ? " for " + selDevice : ""))); models.forEach(function (x) { w.appendChild(el("p", "muted", x.model + ": " + (x.error || x.recommendation || "no result"))); }); box.appendChild(w); } return; }
     var card = el("div", "card primary recommend");
+    var anyDev = selDevice === "rec" || selDevice === "all";
     var h = stepHead(4, "Your pick: " + pick.model + " on " + pick.device, PB.trustBadge(pick.trust, "rec")); card.appendChild(h);
+    var fl = el("p", "muted"), cl = el("a", null, "choose a device in step 2"); cl.href = "#devices";
+    fl.appendChild(document.createTextNode(anyDev ? "The best model on any device (each model on its recommended device); to pick for one device, " : "The best model on " + selDevice + ", the device chosen in step 2 ("));
+    fl.appendChild(cl); fl.appendChild(document.createTextNode(anyDev ? "." : ")."));
+    card.appendChild(fl);
     var parts = ["About " + F.ms(pick.p50) + " per image"];
     if (findsNothing(pick.pick)) parts.push("but it finds no objects on these images");
     else { if (has(pick.recall)) parts.push("finds " + F.pct(pick.recall) + " of objects"); if (has(pick.precision)) parts.push(inTen(pick.precision) + " correct"); }
@@ -805,8 +817,8 @@
     var rows = devRows(j, models); if (!rows.length) return;
     var card = el("div", "card");
     card.appendChild(stepHead(2, "Pick a device", PB.term("?", "p50", "dev")));
-    card.appendChild(el("p", "muted", "Each model on every device it ran on, at that device's best confidence. \u201cUse this\u201d sets the model's device and that confidence together (both apply at once; Undo reverts both). The device chosen here is the one steps 3 and 4 and the Confidence tab compare on."));
-    var tools = el("div", "chart-tools"); tools.appendChild(deviceSelector(models, "dev"));
+    card.appendChild(el("p", "muted", "Each model on every device it ran on, at that device's best confidence. Choose the device the models will run on: steps 3 and 4 and the Confidence tab follow it. \u201cUse this\u201d sets the model's device and that confidence together (both apply at once; Undo reverts both) and also makes that device your choice here."));
+    var tools = el("div", "chart-tools"); tools.appendChild(deviceSelector(models, "dev", "Device to use"));
     var bb = el("button", "small secondary", "Use the recommended device and confidence for all models"); bb.type = "button"; bb.id = "apply-all"; bb.disabled = !!j.running;
     bb.addEventListener("click", function () { if (!confirm("Set every benchmarked model to its recommended device and best confidence? Both apply at once.")) return; bb.disabled = true; useAllRecommended(); });
     tools.appendChild(bb); card.appendChild(tools);
@@ -840,17 +852,23 @@
   function renderRanking(j, models) {
     var box = $("ranking"); box.replaceChildren();
     var all = devRows(j, models); if (!all.length) return;
-    var rows = all.filter(selectedRow), byAuc = (((j.ranking || [])[0] || (j.points || [])[0] || {}).metric) === "roc_auc", metricKey = byAuc ? "roc_auc" : "ap50";
+    var rows = all.filter(selectedRow);
+    // Shown rank = the position among the rows of this view (1 = best on the chosen device).
+    var rankKey = function (r) { return has(r.rank) ? r.rank : has(r.overallPoints) ? 1000 - r.overallPoints : 1e9; };
+    rows.slice().sort(function (a, b) { return rankKey(a) - rankKey(b); }).forEach(function (r, i) { r.pos = i + 1; });
+    var byAuc = (((j.ranking || [])[0] || (j.points || [])[0] || {}).metric) === "roc_auc", metricKey = byAuc ? "roc_auc" : "ap50";
     var card = el("div", "card");
     card.appendChild(stepHead(3, "Compare models on " + selName()));
-    var tools = el("div", "chart-tools"); tools.appendChild(deviceSelector(models, "rank"));
+    var tools = el("div", "chart-tools"), chg = el("a", null, "change in step 2"); chg.href = "#devices";
+    var dl = el("span", "muted"); dl.appendChild(document.createTextNode("Device: " + selName() + " (")); dl.appendChild(chg); dl.appendChild(document.createTextNode(")"));
+    tools.appendChild(dl);
     tools.appendChild(el("span", "muted", "★ = best trade-off. Best first by the overall grade. Accuracy graded by " + (byAuc ? "alert separation (frame ROC AUC)" : "detection quality (AP50, with small-object recall)") + "; finds / correct at each device's best confidence."));
     card.appendChild(tools);
     card.appendChild(PB.dataTable({
       key: "ranking", cls: "stack rank-table", rows: rows, filters: FILTERS, sort: {col: "rank", dir: "asc"},
       text: function (r) { return r.model + " " + r.device + " " + r.runtime; }, empty: "No results on " + selName() + ": choose another device above.",
       columns: [
-        {id: "rank", head: "@rank", num: true, value: function (r) { return has(r.rank) ? r.rank : has(r.overallPoints) ? 1000 - r.overallPoints : null; }, render: function (r) { return has(r.rank) ? String(r.rank) : "-"; }},
+        {id: "rank", head: "@rank", num: true, value: function (r) { return r.pos; }, render: function (r) { return String(r.pos); }},
         {id: "model", head: "@model", value: function (r) { return r.model.toLowerCase(); }, render: function (r) {
           var s = el("span", "nowrap"); s.appendChild(document.createTextNode(r.model + (r.relative ? " *" : "")));
           if (r.best) { var bt = PB.tip("★", PB.tipText("best_tradeoff"), "tag best-tradeoff", "rank"); bt.setAttribute("aria-label", "best trade-off"); s.appendChild(bt); } return s; }},
