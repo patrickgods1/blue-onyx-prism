@@ -306,6 +306,9 @@ impl Process {
         {
             warn!("{e:#}");
         }
+        if next.log_timezone != current.log_timezone {
+            self.log.set_timezone(next.log_timezone);
+        }
         if next.log_path != current.log_path || next.log_format != current.log_format {
             warn!(
                 "log_path and log_format changes take effect after the process is restarted \

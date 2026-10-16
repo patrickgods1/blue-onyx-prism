@@ -178,6 +178,7 @@ fn global_label(k: &str) -> String {
         "object_filter" => "Object filter".into(),
         "log_level" => "Log level".into(),
         "log_path" => "Log directory".into(),
+        "log_timezone" => "Log timestamp time zone".into(),
         "log_format" => "Log file format".into(),
         "save_image_path" => "Save annotated images to".into(),
         "save_ref_image" => "Save the unannotated image".into(),
@@ -370,6 +371,7 @@ pub fn live_global(k: &str) -> bool {
     matches!(
         k,
         "log_level"
+            | "log_timezone"
             | "default_model"
             | "allow_remote_admin"
             | "request_timeout_secs"
@@ -751,6 +753,7 @@ mod tests {
             Box::new(|c| c.save_image_max_mb = 100),
             Box::new(|c| c.request_timeout_secs = 3),
             Box::new(|c| c.log_level = crate::config::LogLevel::Trace),
+            Box::new(|c| c.log_timezone = "America/Los_Angeles".parse().unwrap()),
             Box::new(|c| c.allow_remote_admin = true),
             Box::new(|c| c.max_image_pixels = 2_000_000),
             Box::new(|c| c.default_model = Some("yolo26s".into())),
@@ -885,6 +888,15 @@ mod tests {
         let p = pending(&current, &running);
         assert_eq!(p.for_model("IPcam-general"), ["inflight changed"], "{p:?}");
         assert!(!pending(&running, &running).restart_needed());
+    }
+
+    #[test]
+    fn log_timezone_is_live() {
+        let running = cfg();
+        let mut c = running.clone();
+        c.log_timezone = "+08:00".parse().unwrap();
+        assert!(!pending(&running, &c).restart_needed());
+        assert!(live_global("log_timezone"));
     }
 
     #[test]

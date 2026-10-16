@@ -110,6 +110,111 @@ impl std::str::FromStr for LogFormat {
     }
 }
 
+/// Time zone of log timestamps (`log_timezone`). Stored in the config as a string: `"utc"`
+/// (the default), `"local"` (the computer's zone), an IANA name (`"America/Los_Angeles"`) or a
+/// fixed offset (`"+08:00"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogTimezone {
+    /// UTC, `2026-10-16T00:54:59.580Z` (the default).
+    #[default]
+    Utc,
+    /// The computer's time zone.
+    Local,
+    /// An IANA zone (follows its daylight saving rules).
+    Named(chrono_tz::Tz),
+    /// A fixed offset from UTC.
+    Fixed(chrono::FixedOffset),
+}
+
+impl LogTimezone {
+    /// `t` as a timestamp: `...580Z` in UTC, else RFC 3339 with milliseconds and the numeric
+    /// offset (`2026-10-15T17:54:59.580-07:00`).
+    pub fn format(&self, t: chrono::DateTime<chrono::Utc>) -> String {
+        use chrono::SecondsFormat::Millis;
+        match self {
+            LogTimezone::Utc => t.to_rfc3339_opts(Millis, true),
+            LogTimezone::Local => t
+                .with_timezone(&chrono::Local)
+                .to_rfc3339_opts(Millis, false),
+            LogTimezone::Named(tz) => t.with_timezone(tz).to_rfc3339_opts(Millis, false),
+            LogTimezone::Fixed(o) => t.with_timezone(o).to_rfc3339_opts(Millis, false),
+        }
+    }
+}
+
+impl std::fmt::Display for LogTimezone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogTimezone::Utc => f.write_str("utc"),
+            LogTimezone::Local => f.write_str("local"),
+            LogTimezone::Named(tz) => f.write_str(tz.name()),
+            LogTimezone::Fixed(o) => {
+                let secs = o.local_minus_utc();
+                let (sign, a) = if secs < 0 { ('-', -secs) } else { ('+', secs) };
+                write!(f, "{sign}{:02}:{:02}", a / 3600, a % 3600 / 60)
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for LogTimezone {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let t = s.trim();
+        let bad = || {
+            anyhow::anyhow!(
+                "log_timezone: '{t}' is not a time zone. Use \"utc\", \"local\" (this computer's                  zone), an IANA name such as \"America/Los_Angeles\" or a fixed offset such as                  \"+08:00\" or \"-05:30\"; fix the value in the config file or on the Config page"
+            )
+        };
+        match t.to_ascii_lowercase().as_str() {
+            "utc" => return Ok(LogTimezone::Utc),
+            "local" => return Ok(LogTimezone::Local),
+            _ => {}
+        }
+        if let Some(sign @ ('+' | '-')) = t.chars().next() {
+            let digits = t.get(1..).unwrap_or_default().as_bytes();
+            let &[h1, h2, b':', m1, m2] = digits else {
+                return Err(bad());
+            };
+            if ![h1, h2, m1, m2].iter().all(u8::is_ascii_digit) {
+                return Err(bad());
+            }
+            let two = |a: u8, b: u8| i32::from(a - b'0') * 10 + i32::from(b - b'0');
+            let (h, m) = (two(h1, h2), two(m1, m2));
+            if h > 23 || m > 59 {
+                return Err(bad());
+            }
+            let secs = (h * 3600 + m * 60) * if sign == '-' { -1 } else { 1 };
+            return chrono::FixedOffset::east_opt(secs)
+                .map(LogTimezone::Fixed)
+                .ok_or_else(bad);
+        }
+        t.parse::<chrono_tz::Tz>()
+            .map(LogTimezone::Named)
+            .map_err(|_| bad())
+    }
+}
+
+impl TryFrom<String> for LogTimezone {
+    type Error = anyhow::Error;
+    fn try_from(s: String) -> Result<Self> {
+        s.parse()
+    }
+}
+
+impl Serialize for LogTimezone {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for LogTimezone {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 impl std::str::FromStr for LogLevel {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -276,6 +381,10 @@ pub struct Config {
     /// per line, for log shippers); the console stays text. An unknown value is a parse error
     /// naming the key. Process restart.
     pub log_format: LogFormat,
+    /// Time zone of log timestamps: `"utc"` (default), `"local"`, an IANA name
+    /// (`"America/Los_Angeles"`) or a fixed offset (`"+08:00"`). An unknown value is a parse
+    /// error naming the key. Applies at once.
+    pub log_timezone: LogTimezone,
     /// Save annotated images here (optional).
     pub save_image_path: Option<PathBuf>,
     pub save_ref_image: bool,
@@ -441,6 +550,7 @@ impl Default for Config {
             log_level: LogLevel::Info,
             log_path: None,
             log_format: LogFormat::Text,
+            log_timezone: LogTimezone::Utc,
             save_image_path: None,
             save_ref_image: false,
             save_image_max_age_days: DEFAULT_SAVE_IMAGE_MAX_AGE_DAYS,
@@ -1094,6 +1204,80 @@ pub fn validate_config(c: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn log_timezone_parses_every_form() {
+        assert_eq!(" UTC ".parse::<LogTimezone>().unwrap(), LogTimezone::Utc);
+        assert_eq!("Local".parse::<LogTimezone>().unwrap(), LogTimezone::Local);
+        let la: LogTimezone = "America/Los_Angeles".parse().unwrap();
+        assert!(matches!(la, LogTimezone::Named(_)));
+        assert_eq!(la.to_string(), "America/Los_Angeles");
+        for (s, shown) in [
+            ("+08:00", "+08:00"),
+            ("-05:30", "-05:30"),
+            ("+00:00", "+00:00"),
+        ] {
+            assert_eq!(s.parse::<LogTimezone>().unwrap().to_string(), shown);
+        }
+        for bad in [
+            "",
+            "mars",
+            "+8",
+            "+25:00",
+            "+08:60",
+            "08:00",
+            "+0800",
+            "Nowhere/City",
+        ] {
+            let e = bad.parse::<LogTimezone>().unwrap_err().to_string();
+            assert!(
+                e.contains("log_timezone") && e.contains("IANA"),
+                "{bad}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_timezone_formats_a_fixed_instant() {
+        use chrono::TimeZone;
+        let t = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 16, 0, 54, 59)
+            .unwrap()
+            + chrono::Duration::milliseconds(580);
+        let f = |s: &str| s.parse::<LogTimezone>().unwrap().format(t);
+        assert_eq!(f("utc"), "2026-10-16T00:54:59.580Z");
+        assert_eq!(f("+08:00"), "2026-10-16T08:54:59.580+08:00");
+        assert_eq!(f("-05:30"), "2026-10-15T19:24:59.580-05:30");
+        // DST: PDT (-07:00) in October, PST (-08:00) in January.
+        assert_eq!(f("America/Los_Angeles"), "2026-10-15T17:54:59.580-07:00");
+        let winter = chrono::Utc.with_ymd_and_hms(2026, 1, 16, 0, 0, 0).unwrap();
+        assert_eq!(
+            "America/Los_Angeles"
+                .parse::<LogTimezone>()
+                .unwrap()
+                .format(winter),
+            "2026-01-15T16:00:00.000-08:00"
+        );
+        assert!(chrono::DateTime::parse_from_rfc3339(&f("local")).is_ok());
+    }
+
+    #[test]
+    fn log_timezone_config_round_trip() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.log_timezone, LogTimezone::Utc);
+        let c: Config = serde_json::from_str(r#"{"log_timezone":"Europe/Berlin"}"#).unwrap();
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(text.contains(r#""log_timezone":"Europe/Berlin""#), "{text}");
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.log_timezone, c.log_timezone);
+        let err = serde_json::from_str::<Config>(r#"{"log_timezone":"mars"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("log_timezone") && err.contains("mars"),
+            "{err}"
+        );
+    }
     #[test]
     fn dir_setting_accepts_own_folders() {
         use super::validate_dir_setting;

@@ -878,6 +878,7 @@ impl WorkerCtx {
                     image = %f.meta.image_name,
                     size = %format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
                     count = predictions.len(),
+                    detections = %detections_summary(&predictions),
                     slot,
                     queue_ms = millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
                     decode_ms = f.decode.as_secs_f64() * 1e3,
@@ -1047,6 +1048,15 @@ pub(crate) fn outputs_degenerate(outs: &[crate::model::NamedOutput]) -> bool {
     any_values
 }
 
+/// What a detection found, for the log: `person 66%, car 91%` (response order), empty for none.
+fn detections_summary(predictions: &[crate::api::Prediction]) -> String {
+    predictions
+        .iter()
+        .map(|p| format!("{} {:.0}%", p.label, p.confidence * 100.0))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The `Failed` text of a model that could not be loaded on any of its devices.
 fn load_failure_message(e: &anyhow::Error) -> String {
     format!(
@@ -1065,6 +1075,23 @@ pub(super) fn session_dead(e: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detections_summary_lists_labels_with_percent() {
+        let p = |label: &str, confidence: f32| crate::api::Prediction {
+            x_max: 0,
+            x_min: 0,
+            y_max: 0,
+            y_min: 0,
+            confidence,
+            label: label.into(),
+        };
+        assert_eq!(
+            detections_summary(&[p("person", 0.664), p("car", 0.91)]),
+            "person 66%, car 91%"
+        );
+        assert_eq!(detections_summary(&[]), "");
+    }
 
     fn fake_backend(
         slots: usize,

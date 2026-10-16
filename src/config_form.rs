@@ -34,6 +34,7 @@ pub const FORM_FIELDS: &[&str] = &[
     "nms_iou",
     "object_filter",
     "log_level",
+    "log_timezone",
     "log_path",
     "save_image_path",
     "save_ref_image",
@@ -165,6 +166,9 @@ pub fn parse_config_form(
     }
     if let Some(v) = get("log_path") {
         c.log_path = dir("log_path", v)?;
+    }
+    if let Some(v) = get("log_timezone") {
+        c.log_timezone = v.parse()?;
     }
     // Not on the Config page (not in `FORM_FIELDS`); accepted from API clients.
     if let Some(v) = get("log_format") {
@@ -786,6 +790,15 @@ mod tests {
         let models = r#"[{"path":"a.onnx","device":"XPU"}]"#;
         let err = apply_config_form(&mut c, &form(&[("models_json", models)])).unwrap_err();
         assert!(format!("{err:#}").contains("device"), "{err:#}");
+    }
+
+    #[test]
+    fn log_timezone_is_parsed_from_the_form() {
+        let mut c = Config::default();
+        parse_config_form(&mut c, &form(&[("log_timezone", " America/New_York ")])).unwrap();
+        assert_eq!(c.log_timezone.to_string(), "America/New_York");
+        let err = parse_config_form(&mut c, &form(&[("log_timezone", "mars")])).unwrap_err();
+        assert!(format!("{err:#}").contains("log_timezone"), "{err:#}");
     }
 
     #[test]

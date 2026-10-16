@@ -291,6 +291,7 @@ it; every key can also be set in the file.
 | `nms_iou` | `0.5` | IoU threshold for NMS-based families. Number 0-1. Applies: at once. UI: yes |
 | `object_filter` | `[]` | Only report these labels (case-insensitive); empty = all. List of strings. Applies: at once. UI: yes |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`. Applies: at once. UI: yes (also the Logs page) |
+| `log_timezone` | `"utc"` | Time zone of log timestamps (files, console and the Logs page): `"utc"` (`2026-10-16T00:54:59.580Z`), `"local"` (this computer's zone), an IANA name such as `"America/Los_Angeles"`, or a fixed offset such as `"+08:00"`; others print RFC 3339 with the offset (`2026-10-15T17:54:59.580-07:00`). Applies: at once. UI: yes |
 | `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout only). Path. Applies: process restart. UI: yes |
 | `log_format` | `"text"` | Format of the log files under `log_path`: `"text"` or `"json"` (one JSON object per line, for log shippers); the console stays text. Applies: process restart. UI: no |
 | `save_image_path` | `null` | Save annotated detections here. Path. Applies: at once. UI: yes |
