@@ -145,6 +145,7 @@
         <button type="submit"{% if let Some(c) = r.confirm %} data-confirm="{{ c }}"{% endif %}>{% if r.state == "failed" %}Retry export{% else %}Export{% endif %}</button>
         <label class="check"><input type="checkbox" name="add_to_config" value="1" checked> and add to config</label>
         </form>
+        {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger" data-confirm="Remove the leftover {{ r.title }} files?">Remove</button></form>{% endif %}
       {% endif %}
     {% else if r.action == "toolchain" %}
       {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger"{% if let Some(c) = r.confirm %} data-confirm="{{ c }}"{% endif %}>Remove export toolchain</button></form>
