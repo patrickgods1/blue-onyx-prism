@@ -87,6 +87,39 @@ pub(super) fn inherited(key: &str) -> bool {
     ) || k.starts_with("LC_")
 }
 
+/// Output lines of a failed child kept for [`super::failure::classify`] (the cause of a Python
+/// failure is often far above its last lines: a faulthandler stack, then a long traceback).
+pub(crate) const FAILURE_LINES: usize = 200;
+/// Of those, the lines quoted in the error message.
+pub(crate) const FAILURE_TAIL: usize = 8;
+
+/// A child process exited unsuccessfully. Displays as "`program` failed (`status`); last output:
+/// <the last [`FAILURE_TAIL`] lines>"; [`Self::lines`] has up to [`FAILURE_LINES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildFailed {
+    /// File name of the program.
+    pub program: String,
+    /// "exit code: 255".
+    pub status: String,
+    /// The last output lines, oldest first.
+    pub lines: Vec<String>,
+}
+
+impl std::fmt::Display for ChildFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let from = self.lines.len().saturating_sub(FAILURE_TAIL);
+        write!(
+            f,
+            "{} failed ({}); last output: {}",
+            self.program,
+            self.status,
+            self.lines.get(from..).unwrap_or_default().join(" | ")
+        )
+    }
+}
+
+impl std::error::Error for ChildFailed {}
+
 /// Spawns real processes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemRunner;
@@ -228,7 +261,7 @@ impl CommandRunner for SystemRunner {
         let mut tail: VecDeque<String> = VecDeque::new();
         let mut keep = |line: String, on_line: &mut dyn FnMut(&str)| {
             on_line(&line);
-            if tail.len() == 8 {
+            if tail.len() == FAILURE_LINES {
                 tail.pop_front();
             }
             tail.push_back(line);
@@ -284,15 +317,14 @@ impl CommandRunner for SystemRunner {
             let _ = r.join();
         }
         if !status.success() {
-            let tail: Vec<String> = tail.into_iter().collect();
-            bail!(
-                "{} failed ({status}); last output: {}",
-                cmd.program.file_name().map_or_else(
+            return Err(anyhow::Error::new(ChildFailed {
+                program: cmd.program.file_name().map_or_else(
                     || cmd.program.display().to_string(),
-                    |n| n.to_string_lossy().into_owned()
+                    |n| n.to_string_lossy().into_owned(),
                 ),
-                tail.join(" | ")
-            );
+                status: status.to_string(),
+                lines: tail.into_iter().collect(),
+            }));
         }
         Ok(())
     }

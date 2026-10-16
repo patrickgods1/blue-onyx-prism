@@ -59,6 +59,11 @@ own license, which the README and the Config page name before the download:
 - NVIDIA CUDA and cuDNN libraries (`nvidia-cuda-libs`, opt-in): NVIDIA Software License
   Agreement, https://docs.nvidia.com/cuda/eula/ .
 - Other ONNX Runtime flavors (CUDA): MIT, as above, with their own `ThirdPartyNotices.txt`.
+- Microsoft Visual C++ 2015-2022 runtime DLLs 14.44 (`tool:vc-runtime`, Windows, only when a model
+  export finds the system runtime too old for PyTorch): unmodified Microsoft-signed files from the
+  `msvc-runtime` wheel on PyPI, redistributable under Microsoft's "Distributable Code for Visual
+  Studio 2022" terms, https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution .
+  Copied only next to the export's own Python under `tools/python/`.
 - Models: each under its own license (the blue-onyx IPcam models and RT-DETRv2 from their
   Hugging Face repositories; exported Ultralytics models AGPL-3.0; RF-DETR Apache-2.0; DEIMv2
   non-commercial). See the README, *Exporting models* and *License*.

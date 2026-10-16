@@ -1,5 +1,5 @@
-//! The stage machine: [`run_export`] runs uv -> Python -> packages -> weights -> export ->
-//! install over the two seams, reporting [`Progress`] and honoring cancellation. Installing the
+//! The stage machine: [`run_export`] runs uv -> Python -> packages -> Visual C++ runtime ->
+//! self-check -> weights -> export -> install over the two seams, reporting [`Progress`] and honoring cancellation. Installing the
 //! outputs is all-or-nothing (previous files are restored on failure).
 
 use super::*;
@@ -11,6 +11,9 @@ pub struct ExportJob {
     pub paths: Paths,
     pub platform: Platform,
     pub timeouts: Timeouts,
+    /// Where the system's Visual C++ runtime DLLs are probed on Windows (`%SystemRoot%\System32`;
+    /// None: treated as absent). Tests point it at a directory of their own.
+    pub system_dir: Option<PathBuf>,
 }
 
 impl ExportJob {
@@ -20,6 +23,7 @@ impl ExportJob {
             paths,
             platform: Platform::current(),
             timeouts: Timeouts::default(),
+            system_dir: vc_runtime::system_dir(),
         }
     }
 }
@@ -50,6 +54,57 @@ fn uv_cmd(job: &ExportJob, stage: Stage, timeout: Duration, args: &[&std::ffi::O
         cwd: p.tools.clone(),
         timeout,
     }
+}
+
+/// The environment's Python running `args` (the export script) as
+/// `python -X faulthandler -u -I <args>`, offline, with its settings and caches under `tools/`.
+/// `-X faulthandler` makes a native crash (an access violation while loading PyTorch's DLLs)
+/// print the Python stack instead of exiting silently.
+fn python_cmd(job: &ExportJob, stage: Stage, timeout: Duration, args: Vec<OsString>) -> Cmd {
+    let p = &job.paths;
+    let cfg = |sub: &str| p.yolo_config.join(sub).into_os_string();
+    let mut all: Vec<OsString> = vec!["-X".into(), "faulthandler".into(), "-u".into(), "-I".into()];
+    all.extend(args);
+    Cmd {
+        stage,
+        program: p.env_python(job.platform.os == "windows"),
+        args: all,
+        env: vec![
+            ("YOLO_OFFLINE".into(), "1".into()),
+            ("YOLO_AUTOINSTALL".into(), "false".into()),
+            (
+                "YOLO_CONFIG_DIR".into(),
+                p.yolo_config.clone().into_os_string(),
+            ),
+            ("HF_HUB_OFFLINE".into(), "1".into()),
+            ("TRANSFORMERS_OFFLINE".into(), "1".into()),
+            ("HF_HUB_DISABLE_TELEMETRY".into(), "1".into()),
+            ("HF_HOME".into(), cfg("huggingface")),
+            ("TORCH_HOME".into(), cfg("torch")),
+            ("MPLBACKEND".into(), "Agg".into()),
+        ],
+        cwd: p.work.clone(),
+        timeout,
+    }
+}
+
+/// `e` with its likely cause and next action when it is a recognized child failure (see
+/// `super::failure`). `msvcp140`: System32's version, once probed.
+fn explained(
+    e: anyhow::Error,
+    job: &ExportJob,
+    msvcp140: Option<vc_runtime::FileVersion>,
+    python_script: bool,
+) -> anyhow::Error {
+    failure::explain(
+        e,
+        &failure::FailureContext {
+            windows: job.platform.os == "windows",
+            system_msvcp140: msvcp140,
+            tools: &job.paths.tools,
+            python_script,
+        },
+    )
 }
 
 /// Progress of `uv pip install` from its output: "Downloading torch (75.3MiB)", " Downloaded
@@ -95,7 +150,7 @@ fn python_line(report: &mut dyn FnMut(Progress<'_>), line: &str) {
     });
 }
 
-fn mb(b: u64) -> String {
+pub(super) fn mb(b: u64) -> String {
     format!("{:.1}", b as f64 / 1e6)
 }
 
@@ -232,7 +287,9 @@ fn run_stages(
             py_args.push("--no-registry".as_ref());
         }
         let cmd = uv_cmd(job, Stage::Python, job.timeouts.python, &py_args);
-        runner.run(&cmd, &mut |l| python_line(report, l), cancel)?;
+        runner
+            .run(&cmd, &mut |l| python_line(report, l), cancel)
+            .map_err(|e| explained(e, job, None, false))?;
         check(cancel)?;
         enter!(Stage::Python, Some(60), "uv venv");
         let cmd = uv_cmd(
@@ -248,7 +305,9 @@ fn run_stages(
                 p.env.as_os_str(),
             ],
         );
-        runner.run(&cmd, &mut |l| python_line(report, l), cancel)?;
+        runner
+            .run(&cmd, &mut |l| python_line(report, l), cancel)
+            .map_err(|e| explained(e, job, None, false))?;
         check(cancel)?;
 
         enter!(Stage::Packages, Some(0), lock.name);
@@ -274,23 +333,25 @@ fn run_stages(
         }
         let cmd = uv_cmd(job, Stage::Packages, job.timeouts.packages, &args);
         let mut pp = PackagesProgress::default();
-        runner.run(
-            &cmd,
-            &mut |l| {
-                report(Progress::Line {
-                    stage: Stage::Packages,
-                    line: l,
-                });
-                if let Some((pct, detail)) = pp.line(l) {
-                    report(Progress::Stage {
+        runner
+            .run(
+                &cmd,
+                &mut |l| {
+                    report(Progress::Line {
                         stage: Stage::Packages,
-                        percent: Some(pct),
-                        detail: &detail,
+                        line: l,
                     });
-                }
-            },
-            cancel,
-        )?;
+                    if let Some((pct, detail)) = pp.line(l) {
+                        report(Progress::Stage {
+                            stage: Stage::Packages,
+                            percent: Some(pct),
+                            detail: &detail,
+                        });
+                    }
+                },
+                cancel,
+            )
+            .map_err(|e| explained(e, job, None, false))?;
         check(cancel)?;
         if !python.is_file() {
             bail!(
@@ -307,7 +368,67 @@ fn run_stages(
     }
     check(cancel)?;
 
-    // 4. Weights (and the code a recipe needs)
+    // 4. The Visual C++ runtime PyTorch needs (Windows; cheap, runs every export).
+    let mut msvcp140 = None;
+    if windows {
+        enter!(Stage::Runtime, Some(0), "probing the installed runtime");
+        let found = vc_runtime::ensure(job, fetcher, report, cancel)?;
+        msvcp140 = found
+            .iter()
+            .find(|f| f.name == "msvcp140.dll")
+            .and_then(|f| f.system);
+    } else {
+        enter!(Stage::Runtime, Some(100), &format!("not needed on {os}"));
+    }
+    check(cancel)?;
+
+    // 5. Self-check: import what the recipe needs (a broken library fails here in seconds).
+    enter!(
+        Stage::SelfCheck,
+        Some(0),
+        &format!("importing what {} needs", recipe.exporter())
+    );
+    std::fs::create_dir_all(&p.work).with_context(|| format!("creating {}", p.work.display()))?;
+    std::fs::create_dir_all(&p.yolo_config)
+        .with_context(|| format!("creating {}", p.yolo_config.display()))?;
+    let script = p.work.join(SCRIPT_NAME);
+    std::fs::write(&script, EXPORT_SCRIPT)
+        .with_context(|| format!("writing {}", script.display()))?;
+    let cmd = python_cmd(
+        job,
+        Stage::SelfCheck,
+        job.timeouts.python,
+        vec![
+            script.clone().into_os_string(),
+            "--self-check".into(),
+            "--recipe".into(),
+            recipe.as_str().into(),
+        ],
+    );
+    let mut imported = 0u8;
+    runner
+        .run(
+            &cmd,
+            &mut |l| {
+                report(Progress::Line {
+                    stage: Stage::SelfCheck,
+                    line: l,
+                });
+                imported = imported.saturating_add(10).min(90);
+                report(Progress::Stage {
+                    stage: Stage::SelfCheck,
+                    percent: Some(imported),
+                    detail: l,
+                });
+            },
+            cancel,
+        )
+        .map_err(|e| explained(e, job, msvcp140, true))
+        .context("the export environment's self-check failed")?;
+    enter!(Stage::SelfCheck, Some(100), "the environment loads");
+    check(cancel)?;
+
+    // 6. Weights (and the code a recipe needs)
     let weights_dir = p.weights_of(name);
     let mut downloads: Vec<(&'static Resource, PathBuf)> = vec![(res, weights_dir.clone())];
     for extra in catalog::export_extras(res) {
@@ -359,18 +480,12 @@ fn run_stages(
     }
     check(cancel)?;
 
-    // 5. Export
+    // 7. Export
     enter!(
         Stage::Export,
         Some(0),
         &format!("starting {}", recipe.exporter())
     );
-    std::fs::create_dir_all(&p.work).with_context(|| format!("creating {}", p.work.display()))?;
-    std::fs::create_dir_all(&p.yolo_config)
-        .with_context(|| format!("creating {}", p.yolo_config.display()))?;
-    let script = p.work.join(SCRIPT_NAME);
-    std::fs::write(&script, EXPORT_SCRIPT)
-        .with_context(|| format!("writing {}", script.display()))?;
     std::fs::create_dir_all(&p.models)
         .with_context(|| format!("creating {}", p.models.display()))?;
     let staging = p.staging(name);
@@ -390,8 +505,6 @@ fn run_stages(
         _ => weights_dir.clone(),
     };
     let mut args: Vec<OsString> = vec![
-        "-u".into(),
-        "-I".into(),
         script.clone().into_os_string(),
         "--recipe".into(),
         recipe.as_str().into(),
@@ -413,28 +526,7 @@ fn run_stages(
         args.push("--source".into());
         args.push(p.deimv2_src.clone().into_os_string());
     }
-    let cfg = |sub: &str| p.yolo_config.join(sub).into_os_string();
-    let cmd = Cmd {
-        stage: Stage::Export,
-        program: p.env_python(windows),
-        args,
-        env: vec![
-            ("YOLO_OFFLINE".into(), "1".into()),
-            ("YOLO_AUTOINSTALL".into(), "false".into()),
-            (
-                "YOLO_CONFIG_DIR".into(),
-                p.yolo_config.clone().into_os_string(),
-            ),
-            ("HF_HUB_OFFLINE".into(), "1".into()),
-            ("TRANSFORMERS_OFFLINE".into(), "1".into()),
-            ("HF_HUB_DISABLE_TELEMETRY".into(), "1".into()),
-            ("HF_HOME".into(), cfg("huggingface")),
-            ("TORCH_HOME".into(), cfg("torch")),
-            ("MPLBACKEND".into(), "Agg".into()),
-        ],
-        cwd: p.work.clone(),
-        timeout: job.timeouts.export,
-    };
+    let cmd = python_cmd(job, Stage::Export, job.timeouts.export, args);
     let mut lines = 0usize;
     let export = runner.run(
         &cmd,
@@ -458,11 +550,11 @@ fn run_stages(
     let _ = manager::remove_any(&work);
     if let Err(e) = export {
         let _ = manager::remove_any(&staging);
-        return Err(e);
+        return Err(explained(e, job, msvcp140, true));
     }
     check(cancel)?;
 
-    // 6. Install
+    // 8. Install
     enter!(Stage::Install, Some(0), "checking the output");
     let out = install_outputs(res, &staging, &p.models, &onnx_name, &yaml_name);
     let _ = manager::remove_any(&staging);

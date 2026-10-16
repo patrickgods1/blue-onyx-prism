@@ -14,15 +14,18 @@
 //! - **Pinned toolchain**: `tool:uv` (catalog, SHA-256 checked), Python 3.11 installed by that uv,
 //!   and the packages of `scripts/model-export/locks/*.txt`, installed with
 //!   `--require-hashes --no-deps --only-binary :all:` (every wheel hash-checked, nothing built from
-//!   source). On Linux and Windows torch comes from the PyTorch CPU index.
+//!   source). On Linux and Windows torch comes from the PyTorch CPU index. On Windows the export
+//!   also needs a current Microsoft Visual C++ runtime (PyTorch: `msvcp140.dll` 14.40+); when the
+//!   system's is older, `tool:vc-runtime` (Microsoft-signed DLLs from the `msvc-runtime` wheel,
+//!   each SHA-256 checked) is copied next to the export's own Python (see [`vc_runtime`]).
 //! - **Pinned weights and code**: the catalog's parts (`.pt`, or `model.safetensors` +
 //!   `config.json`) downloaded and verified by the download manager into
 //!   `tools/export-weights/<name>/`; for DEIMv2 also `tool:deimv2-src`, the official source at a
 //!   pinned commit (SHA-256 checked GitHub archive, only `engine/**/*.py` and `configs/**/*.yml`
 //!   extracted).
-//! - **Pinned script**: `scripts/export_model.py`, embedded in the binary, run as `python -u -I`
-//!   offline: `YOLO_OFFLINE=1`, `YOLO_AUTOINSTALL=false`, `HF_HUB_OFFLINE=1`,
-//!   `TRANSFORMERS_OFFLINE=1` (nothing reaches the network or pip-installs anything), with its
+//! - **Pinned script**: `scripts/export_model.py`, embedded in the binary, run as
+//!   `python -X faulthandler -u -I` (a native crash prints its stack) offline: `YOLO_OFFLINE=1`,
+//!   `YOLO_AUTOINSTALL=false`, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` (nothing reaches the network or pip-installs anything), with its
 //!   settings and caches in our own `tools/export-config`.
 //! - **Contained**: everything lives under `<data root>/tools/` (see [`Paths`]); "Remove export
 //!   toolchain" deletes it. Each export runs in a fresh work directory under `tools/work/`.
@@ -35,7 +38,12 @@
 //!    Python build uv installs (uv's own verification), every wheel (`--require-hashes` against
 //!    the embedded lock), the weights (catalog SHA-256 through the download manager) and, for
 //!    DEIMv2, the source archive (`tool:deimv2-src`, SHA-256, whitelist-extracted) are verified
-//!    before the stage that uses them starts. The export script is embedded in the binary.
+//!    before the stage that uses them starts. The export script is embedded in the binary. On
+//!    Windows the Visual C++ runtime DLLs (`tool:vc-runtime`) are loaded, never run: the wheel is
+//!    SHA-256 checked, only the pinned DLLs are extracted, each against its own SHA-256 (all
+//!    Microsoft-signed, unmodified), and they are copied only into our own `tools/python/<python>`
+//!    directory (the venv's `pyvenv.cfg` `home`, refused when it points outside `tools/python`),
+//!    each through a temporary file and a rename. System32 is only read.
 //! 2. **Minimal environment** (RS-07): the child starts from `env_clear()`; it inherits only
 //!    `PATH`, `HOME`/`USERPROFILE`, `SystemRoot` and the other Windows basics (`COMSPEC`,
 //!    `PATHEXT`, `APPDATA`, `LOCALAPPDATA`, `PROGRAMDATA`), `TEMP`/`TMP`/`TMPDIR`, `LANG`/`LC_*`,
@@ -54,13 +62,19 @@
 //! 4. **Bounded output** (RS-08): stdout and stderr are read line by line (`\n` or `\r` ends a
 //!    line), each line is cut at `MAX_OUTPUT_LINE` bytes, and at most `MAX_OUTPUT_LINES`
 //!    lines wait between the reader threads and the log; a child that outruns the log blocks
-//!    on its pipe. The error message keeps the last 8 lines.
+//!    on its pipe. A failed child keeps its last `FAILURE_LINES` (200) lines, which `failure`
+//!    classifies (outdated Visual C++ runtime, missing DLL or module, out of memory, disk full,
+//!    a silent native crash) into the likely cause and next action; the message quotes the last
+//!    8 lines.
 //! 5. One export at a time ([`Exporter`] queues the rest; a lock file serializes processes).
 //!
-//! Stages ([`Stage`]): uv -> Python -> packages -> weights -> export -> install. The result,
-//! `models/<name>.onnx` + `.yaml`, is moved into place from a staging directory and recorded
-//! in `models/.<name>.installed.json` like a downloaded model (an older version's manifest makes
-//! the file "needs export" again).
+//! Stages ([`Stage`]): uv -> Python -> packages -> Visual C++ runtime (Windows; probes System32
+//! and the base Python's directory, places the private runtime when needed, never touches the
+//! network otherwise) -> self-check (`export_model.py --self-check` imports what the recipe needs
+//! and prints the versions, so a broken environment fails in seconds, before the weights) ->
+//! weights -> export -> install. The result, `models/<name>.onnx` + `.yaml`, is moved into place
+//! from a staging directory and recorded in `models/.<name>.installed.json` like a downloaded
+//! model (an older version's manifest makes the file "needs export" again).
 //!
 //! `run_export` is the stage machine over two seams, [`CommandRunner`] (processes) and
 //! [`Fetcher`] (verified downloads), so it is tested without network or Python.
@@ -147,6 +161,8 @@ pub struct Paths {
     pub yolo_config: PathBuf,
     /// `tools/deimv2-src`: the DEIMv2 source code (`tool:deimv2-src`).
     pub deimv2_src: PathBuf,
+    /// `tools/vc-runtime`: the private Visual C++ runtime (`tool:vc-runtime`, Windows).
+    pub vc_runtime: PathBuf,
     /// The configured models directory (where the `.onnx` / `.yaml` go).
     pub models: PathBuf,
 }
@@ -163,6 +179,7 @@ impl Paths {
             work: tools.join("export-work"),
             yolo_config: tools.join("export-config"),
             deimv2_src: root.join(catalog::DEIMV2_SRC_DEST),
+            vc_runtime: root.join(catalog::VC_RUNTIME_DEST),
             tools,
             models,
         }
@@ -230,6 +247,7 @@ impl Paths {
             self.work.clone(),
             self.yolo_config.clone(),
             self.deimv2_src.clone(),
+            self.vc_runtime.clone(),
         ]
         .into_iter()
         .chain(self.legacy_dirs())
@@ -366,7 +384,7 @@ pub fn manifest(res: &Resource, models: &Path) -> Option<Manifest> {
 }
 
 /// Delete the export toolchain (uv, Python, the environment, weights, work files, the DEIMv2
-/// source).
+/// source, the private Visual C++ runtime).
 pub fn remove_toolchain(paths: &Paths) -> Result<()> {
     for d in paths.toolchain_dirs() {
         manager::remove_any(&d)?;
@@ -460,6 +478,11 @@ pub enum Stage {
     Python,
     /// `uv pip install --require-hashes` of the lock.
     Packages,
+    /// Windows: make sure the Visual C++ runtime PyTorch loads is new enough (places the private
+    /// `tool:vc-runtime` next to the export's Python when not); nothing elsewhere.
+    Runtime,
+    /// `export_model.py --self-check`: import what the recipe needs and print the versions.
+    SelfCheck,
     /// Download and verify the weights (and the DEIMv2 source).
     Weights,
     /// Run the export script.
@@ -469,10 +492,12 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Stage; 6] = [
+    pub const ALL: [Stage; 8] = [
         Stage::Uv,
         Stage::Python,
         Stage::Packages,
+        Stage::Runtime,
+        Stage::SelfCheck,
         Stage::Weights,
         Stage::Export,
         Stage::Install,
@@ -483,6 +508,8 @@ impl Stage {
             Stage::Uv => "downloading uv",
             Stage::Python => "installing Python 3.11",
             Stage::Packages => "installing the pinned Python packages",
+            Stage::Runtime => "checking the Visual C++ runtime",
+            Stage::SelfCheck => "checking the Python environment",
             Stage::Weights => "downloading the weights",
             Stage::Export => "exporting to ONNX",
             Stage::Install => "installing the model files",
@@ -500,8 +527,10 @@ impl Stage {
             Stage::Uv => (0, 4),
             Stage::Python => (4, 12),
             Stage::Packages => (12, 70),
-            Stage::Weights => (70, 78),
-            Stage::Export => (78, 97),
+            Stage::Runtime => (70, 71),
+            Stage::SelfCheck => (71, 73),
+            Stage::Weights => (73, 79),
+            Stage::Export => (79, 97),
             Stage::Install => (97, 100),
         }
     }
@@ -557,12 +586,14 @@ pub struct ExportOutput {
 }
 
 mod exporter;
+mod failure;
 #[cfg(test)]
 pub(crate) mod fake;
 mod seams;
 mod stages;
 #[cfg(test)]
 mod tests;
+pub mod vc_runtime;
 
 pub use exporter::*;
 pub use seams::*;

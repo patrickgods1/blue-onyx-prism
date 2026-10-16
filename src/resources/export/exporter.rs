@@ -48,7 +48,7 @@ impl ExportState {
         matches!(self, ExportState::Queued | ExportState::Running { .. })
     }
 
-    /// "exporting: installing the pinned Python packages (3/6): downloading torch".
+    /// "exporting: installing the pinned Python packages (3/8): downloading torch".
     pub fn describe(&self) -> String {
         match self {
             ExportState::Queued => "export queued".to_string(),

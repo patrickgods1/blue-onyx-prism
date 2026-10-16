@@ -532,8 +532,9 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
 
     platform_resources(ctx)
         .into_iter()
-        // The DEIMv2 source is part of the export toolchain (the `tool:uv` row).
-        .filter(|r| r.id != catalog::DEIMV2_SRC_ID)
+        // The DEIMv2 source and the Windows Visual C++ runtime are part of the export toolchain
+        // (the `tool:uv` row).
+        .filter(|r| r.id != catalog::DEIMV2_SRC_ID && r.id != catalog::VC_RUNTIME_ID)
         .map(|r| {
             if matches!(r.kind, ResourceKind::ExportModel | ResourceKind::Tool) {
                 let mut row = export_row(ctx, config, r, &res, &statuses, &configured, &export_env);

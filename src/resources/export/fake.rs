@@ -1,17 +1,21 @@
 //! A fake toolchain for tests (no network, no Python): records commands and writes what the
 //! real tools would.
 
+use super::vc_runtime::{FileVersion, synthetic_dll};
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
-/// Writes what the real tools would: manifests for fetched resources, the venv's python, the
-/// exporter's output. Records every command.
+/// Writes what the real tools would: manifests for fetched resources, the venv's python (and
+/// its `pyvenv.cfg` + base Python dir with uv's `vcruntime140*.dll`), the exporter's output.
+/// Records every command.
 #[derive(Default)]
 pub struct Fake {
     pub commands: Mutex<Vec<Cmd>>,
     pub fetched: Mutex<Vec<String>>,
     /// Fail the command whose display contains this.
     pub fail_on: Option<&'static str>,
+    /// Output of the failing command (default: "error: something broke").
+    pub fail_lines: Vec<&'static str>,
     /// Block in the command whose display contains this until cancelled.
     pub hang_on: Option<&'static str>,
     /// Classes the fake exporter writes.
@@ -43,6 +47,9 @@ pub fn arg_after(cmd: &Cmd, flag: &str) -> Option<PathBuf> {
     cmd.args.get(i + 1).map(PathBuf::from)
 }
 
+/// Directory of the fake base Python under `UV_PYTHON_INSTALL_DIR`.
+pub const FAKE_PYTHON: &str = "cpython-3.11.16-fake";
+
 impl CommandRunner for Fake {
     fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
         self.runs.fetch_add(1, Ordering::SeqCst);
@@ -55,11 +62,19 @@ impl CommandRunner for Fake {
             return Err(anyhow!(Cancelled));
         }
         if self.fail_on.is_some_and(|f| d.contains(f)) {
-            on_line("error: something broke");
-            bail!(
-                "{} failed (exit status: 2); last output: error: something broke",
-                d
-            );
+            let lines: Vec<String> = if self.fail_lines.is_empty() {
+                vec!["error: something broke".to_string()]
+            } else {
+                self.fail_lines.iter().map(|l| l.to_string()).collect()
+            };
+            for l in &lines {
+                on_line(l);
+            }
+            return Err(anyhow::Error::new(ChildFailed {
+                program: d,
+                status: "exit status: 2".into(),
+                lines,
+            }));
         }
         if d.contains(" venv ") {
             let env = PathBuf::from(cmd.args.last().unwrap());
@@ -71,6 +86,25 @@ impl CommandRunner for Fake {
             };
             std::fs::create_dir_all(py.parent().unwrap()).unwrap();
             std::fs::write(py, b"#!python").unwrap();
+            let installs = cmd
+                .env
+                .iter()
+                .find(|(k, _)| k == "UV_PYTHON_INSTALL_DIR")
+                .map(|(_, v)| PathBuf::from(v))
+                .unwrap();
+            let base = installs.join(FAKE_PYTHON);
+            std::fs::create_dir_all(&base).unwrap();
+            if windows {
+                // python-build-standalone ships these next to python.exe.
+                for dll in ["vcruntime140.dll", "vcruntime140_1.dll"] {
+                    std::fs::write(base.join(dll), synthetic_dll(FileVersion::PIN)).unwrap();
+                }
+            }
+            std::fs::write(
+                env.join("pyvenv.cfg"),
+                format!("home = {}\nversion_info = 3.11.16\n", base.display()),
+            )
+            .unwrap();
         }
         if d.contains(" pip install ") {
             on_line("Resolved 48 packages in 3ms");
@@ -78,6 +112,12 @@ impl CommandRunner for Fake {
             on_line(" Downloaded torch");
             on_line("Prepared 48 packages in 40s");
             on_line("Installed 48 packages in 2s");
+        }
+        if d.contains("--self-check") {
+            on_line("[export_model] self-check: importing torch");
+            on_line("[export_model] self-check: torch 2.14.0+cpu");
+            on_line("[export_model] self-check: ok");
+            return Ok(());
         }
         if d.contains(SCRIPT_NAME) {
             let name = arg_after(cmd, "--name").unwrap().display().to_string();
@@ -110,6 +150,11 @@ impl Fetcher for Fake {
             std::fs::write(dir.join("uv"), b"uv").unwrap();
             std::fs::write(dir.join("uv.exe"), b"uv").unwrap();
             files.push("uv".to_string());
+        } else if res.id == catalog::VC_RUNTIME_ID {
+            for (name, _, _) in catalog::VC_RUNTIME_DLLS {
+                std::fs::write(dir.join(name), synthetic_dll(FileVersion::PIN)).unwrap();
+                files.push(name.to_string());
+            }
         } else if res.kind == ResourceKind::Tool {
             std::fs::create_dir_all(dir.join("engine")).unwrap();
             std::fs::create_dir_all(dir.join("configs")).unwrap();

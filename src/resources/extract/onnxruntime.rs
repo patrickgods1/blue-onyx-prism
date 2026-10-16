@@ -103,9 +103,12 @@ pub(crate) fn ort_wanted(
         Layout::NugetDirectMl => {
             (dirs == ["bin", "x64-win"] && name == DIRECTML_DLL).then(|| name.clone())
         }
-        Layout::OpenVino | Layout::NvidiaWheel | Layout::Uv | Layout::SourceTree | Layout::File => {
-            None
-        }
+        Layout::OpenVino
+        | Layout::NvidiaWheel
+        | Layout::Uv
+        | Layout::SourceTree
+        | Layout::VcRuntime
+        | Layout::File => None,
     }
 }
 
