@@ -688,21 +688,27 @@ pub struct OrtLookup {
     pub library: Option<PathBuf>,
     /// Every place checked, in order, for error messages.
     pub checked: Vec<String>,
+    /// The install root that was searched (`<download_dir>/onnxruntime`): where an install
+    /// must go for this lookup to find it.
+    pub root: PathBuf,
 }
 
 impl OrtLookup {
-    /// Error text when nothing was found: where we looked and how to install it.
+    /// Error text when nothing was found: where we looked and how to install it (into the
+    /// root this process searches, which is not the exe dir when `download_dir` is set, e.g.
+    /// the Windows service).
     pub fn not_found_message(&self) -> String {
         format!(
-            "ONNX Runtime library ({}) not found; checked {}. Run `blue-onyx-prism \
-             setup-onnxruntime` to install it into {}",
+            "ONNX Runtime library ({}) not found; checked {}. Install it from the Resources \
+             card of the web UI, or run `blue-onyx-prism setup-onnxruntime` with the same \
+             --config as this process, to put it into {}",
             ort_library_file_name(),
             if self.checked.is_empty() {
                 "nothing".to_string()
             } else {
                 self.checked.join(", ")
             },
-            default_onnxruntime_dir().display()
+            self.root.display()
         )
     }
 }
@@ -762,7 +768,10 @@ pub fn find_onnxruntime_from(
     env_path: Option<&Path>,
     default_dir: &Path,
 ) -> OrtLookup {
-    let mut out = OrtLookup::default();
+    let mut out = OrtLookup {
+        root: default_dir.to_path_buf(),
+        ..OrtLookup::default()
+    };
     let mut try_path = |label: &str, p: &Path| -> Option<PathBuf> {
         let hit = if p.is_file() {
             Some(p.to_path_buf())
@@ -1409,6 +1418,9 @@ mod tests {
             "{:?}",
             none.checked
         );
+        // The install hint names the root that was searched, not the exe dir.
+        let msg = none.not_found_message();
+        assert!(msg.ends_with(&format!("into {}", a.display())), "{msg}");
         assert_eq!(read_ort_flavor(&c).as_deref(), Some("coreml"));
         assert_eq!(read_ort_flavor(&a), None);
         assert!(default_onnxruntime_dir().ends_with(ORT_DIR_NAME));
