@@ -111,7 +111,7 @@
     precision: ["Correct", "precision"], recall: ["Finds", "recall"], f1: ["Balance (F1)", "f1"], f2: ["Miss-fewer (F2)", "f2"],
     threshold: ["Confidence", "threshold"], grade: ["Grade", "grade"], agreement: ["Agreement", "agreement"],
     trust: ["Trust", "trust"], ran: ["Ran", "ran"], change: ["Δ vs last run", "change"], tradeoff: ["Trade-off", "best_tradeoff"],
-    accuracy_score: ["Accuracy score", "accuracy_score"], tpr: ["Alert rate", "tpr"], fpr: ["False alerts", "fpr"]
+    accuracy_score: ["Accuracy score", "accuracy_score"], range: ["Near-optimal range", "plateau"], best_conf: ["Best confidence", "threshold"], now_conf: ["Confidence now", "threshold"], tpr: ["Alert rate", "tpr"], fpr: ["False alerts", "fpr"]
   };
   function label(id) { return (LABELS[id] || [id])[0]; }
 

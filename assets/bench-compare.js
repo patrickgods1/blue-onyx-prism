@@ -203,42 +203,41 @@
   ];
   function compareTable(rows, y) {
     var cols = COLS.filter(function (c) { return rows.some(function (r) { return has(r[c[0]]); }); });
-    var t = el("table", "bench stack cmp-table"), th = el("thead"), tr = el("tr");
-    [["model"], ["device"], ["runtime"]].concat(cols.map(function (c) { return [c[1]]; })).concat([["grade"], ["trust"], ["tradeoff"]]).forEach(function (h) { var c = el("th"); c.appendChild(PB.head(h[0])); tr.appendChild(c); });
-    th.appendChild(tr); t.appendChild(th);
     var best = {};
     cols.forEach(function (c) {
       var vs = rows.filter(function (r) { return !r.fellBack; }).map(function (r) { return r[c[0]]; }).filter(has);
       best[c[0]] = vs.length ? (c[2] === "lower" ? Math.min.apply(null, vs) : Math.max.apply(null, vs)) : null;
     });
-    var tb = el("tbody");
-    rows.forEach(function (r) {
-      var row = el("tr"); row.dataset.key = r.key; if (r.key === S.selected) row.classList.add("hl");
-      var name = el("td"); name.dataset.label = "Model"; var sw = el("span", "swatch ser-" + PB.colorOf(r.model)); sw.setAttribute("aria-hidden", "true"); name.appendChild(sw); name.appendChild(document.createTextNode(" " + r.model + (r.relative ? " *" : "")));
-      if (r.recommended) name.appendChild(el("span", "tag rec", "recommended")); row.appendChild(name);
-      var dv = el("td", null, r.device); dv.dataset.label = "Device"; dv.title = r.devLabel || ""; if (r.fellBack) dv.appendChild(el("span", "tag restart", "fell back")); row.appendChild(dv);
-      var rt = el("td", null, PB.RUNTIME_NAMES[r.runtime] || r.runtime); rt.dataset.label = "Runtime"; row.appendChild(rt);
-      cols.forEach(function (c) {
-        var v = r[c[0]], td = el("td", "num"); td.dataset.label = PB.label(c[1]); td.dataset.v = has(v) ? (c[2] === "lower" ? v : -v) : "";
-        td.appendChild(document.createTextNode(c[3] === "ms" ? fmt.ms(v) : c[3] === "fps" ? (has(v) ? v.toFixed(1) + "/s" : "-") : fmt.pct(v, 1)));
-        var b = best[c[0]];
+    var columns = [
+      {id: "model", head: "@model", value: function (r) { return r.model.toLowerCase(); }, render: function (r) {
+        var s = el("span"), sw = el("span", "swatch ser-" + PB.colorOf(r.model)); sw.setAttribute("aria-hidden", "true"); s.appendChild(sw); s.appendChild(document.createTextNode(" " + r.model + (r.relative ? " *" : "")));
+        if (r.recommended) { var t0 = el("span", "tag rec", "best"); t0.title = "recommended device for this model"; s.appendChild(t0); } s.className = "nowrap"; return s; }},
+      {id: "device", head: "@device", value: function (r) { return r.device; }, render: function (r, td) { td.title = r.devLabel || ""; var s = el("span", "nowrap", r.device); if (r.fellBack) s.appendChild(el("span", "tag restart", "fell back")); return s; }},
+      {id: "runtime", head: "@runtime", value: function (r) { return r.runtime; }, render: function (r) { return PB.RUNTIME_NAMES[r.runtime] || r.runtime; }}
+    ].concat(cols.map(function (c) {
+      return {id: c[0], head: "@" + c[1], num: true, first: c[2] === "lower" ? "asc" : "desc", value: function (r) { return r[c[0]]; }, render: function (r, td) {
+        var v = r[c[0]], b = best[c[0]], s = el("span", null, c[3] === "ms" ? fmt.ms(v) : c[3] === "fps" ? (has(v) ? v.toFixed(1) + "/s" : "-") : fmt.pct(v, 1));
         if (has(v) && has(b) && !r.fellBack) {
           if (Math.abs(v - b) < 1e-9) { td.classList.add("best"); td.title = "best in this column"; }
-          else { var gap = c[3] === "pct" ? fmt.points(v - b) : c[3] === "ms" ? "+" + (v - b).toFixed(1) + " ms" : "−" + (b - v).toFixed(1) + "/s"; td.appendChild(el("span", "gap", gap)); }
+          else s.appendChild(el("span", "gap", c[3] === "pct" ? fmt.points(v - b) : c[3] === "ms" ? "+" + (v - b).toFixed(1) + " ms" : "−" + (b - v).toFixed(1) + "/s"));
         }
-        row.appendChild(td);
-      });
-      var g = el("td"); g.dataset.label = "Grade"; g.appendChild(el("span", "grade grade-" + (r.grade || "none"), r.grade || "-")); row.appendChild(g);
-      var tt = el("td"); tt.dataset.label = "Trust"; tt.appendChild(PB.trustBadge(r.trust, "cmp")); row.appendChild(tt);
-      var bt = el("td"); bt.dataset.label = "Trade-off"; if (r.front) bt.appendChild(PB.tip("★ best trade-off", PB.tipText("best_tradeoff"), "tag best-tradeoff", "cmp")); row.appendChild(bt);
-      row.addEventListener("click", function (e) { if (e.target.closest("button")) return; S.selected = r.key; highlight(); });
-      tb.appendChild(row);
-    });
-    t.appendChild(tb);
-    var w = el("div", "scroll"); w.dataset.keep = "w:cmp-table"; t.dataset.keep = "t:cmp-table"; w.appendChild(t);
-    var sortable = PB.sortable; if (sortable) sortable(t);
+        return s; }};
+    })).concat([
+      {id: "grade", head: "@grade", value: function (r) { return r.grade || null; }, render: function (r) { return el("span", "grade grade-" + (r.grade || "none"), r.grade || "-"); }},
+      {id: "trust", head: "@trust", value: function (r) { return r.trust ? {high: 0, medium: 1, low: 2}[r.trust.level] : null; }, render: function (r) { return PB.trustBadge(r.trust, "cmp"); }},
+      {id: "front", head: "@tradeoff", value: function (r) { return r.front ? 0 : 1; }, render: function (r) { return r.front ? PB.tip("★ best trade-off", PB.tipText("best_tradeoff"), "tag best-tradeoff", "cmp") : ""; }}
+    ]);
     var d = el("div"); d.appendChild(el("h3", null, "Comparison table")); d.appendChild(el("p", "muted", "Bold = best in its column; the small number is the gap to the best. Accuracy at the run's confidence threshold."));
-    d.appendChild(w); return d;
+    d.appendChild(PB.dataTable({
+      key: "compare", cls: "stack cmp-table", rows: rows, columns: columns,
+      filters: {model: function (r) { return r.model; }, device: function (r) { return r.device; }, runtime: function (r) { return PB.RUNTIME_NAMES[r.runtime] || r.runtime; }, thisRun: function (r) { return r.thisRun; }},
+      text: function (r) { return r.model + " " + r.device + " " + r.runtime; },
+      rowAttrs: function (r, tr) {
+        tr.dataset.key = r.key; if (r.key === S.selected) tr.classList.add("hl");
+        tr.addEventListener("click", function (e) { if (e.target.closest("button")) return; S.selected = r.key; highlight(); });
+      }
+    }));
+    return d;
   }
   function highlight() {
     document.querySelectorAll(".cmp-table tbody tr").forEach(function (r) { var on = r.dataset.key === S.selected; r.classList.toggle("hl", on); if (on) r.scrollIntoView({block: "nearest"}); });

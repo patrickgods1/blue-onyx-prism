@@ -12,11 +12,11 @@
 <ol class="steps" id="steps" aria-label="How to use this page">
   <li data-step="run"><a href="#tab-run"><span class="step-n" aria-hidden="true">1</span> Run<span class="step-sub">measure your models and devices</span></a></li>
   <li data-step="review"><a href="#tab-overview"><span class="step-n" aria-hidden="true">2</span> Review<span class="step-sub">see what to use and what changed</span></a></li>
-  <li data-step="apply"><a href="#setup"><span class="step-n" aria-hidden="true">3</span> Apply<span class="step-sub">use the recommended device and confidence</span></a></li>
+  <li data-step="apply"><a href="#devices"><span class="step-n" aria-hidden="true">3</span> Apply<span class="step-sub">use the recommended device and confidence</span></a></li>
 </ol>
 
 <nav class="toc tabs" role="tablist" aria-label="Sections">
-  <a role="tab" href="#tab-overview">Overview</a><a role="tab" href="#tab-compare">Compare</a><a role="tab" href="#tab-confidence">Confidence</a><a role="tab" href="#tab-details">Details</a><a role="tab" href="#tab-run">Run</a>
+  <a role="tab" href="#tab-run">Run</a><a role="tab" href="#tab-overview">Overview</a><a role="tab" href="#tab-compare">Compare</a><a role="tab" href="#tab-confidence">Confidence</a><a role="tab" href="#tab-details">Details</a>
 </nav>
 <div class="status-bar" id="status">
   <div id="progress" hidden><progress id="bar" max="100"></progress> <span id="ptext" class="muted"></span> <button type="button" id="cancel" class="danger small" hidden>Cancel</button></div>
@@ -29,14 +29,11 @@
   <noscript><p class="muted">The results view needs JavaScript; see <a href="/v1/benchmark">/v1/benchmark</a>.</p></noscript>
   <p id="no-results" class="empty" hidden>No results yet. Choose datasets, models and devices under <a href="#tab-run">Run</a> and start a benchmark; this page then says which model, device and confidence to use.</p>
   <div id="run-banner"></div>
+  <p id="rec-line" class="rec-line"></p>
   <div id="preset"></div>
-  <div id="recommend"></div>
-  <div id="setup"></div>
+  <div id="devices"></div>
   <div id="ranking"></div>
-  <div class="actions" id="apply-all-bar" hidden>
-    <button type="button" id="apply-all">Apply recommended devices to all models</button>
-    <span class="muted">Writes each model's <code>device</code> into the config; the models reload on their new devices at once (no restart).</span>
-  </div>
+  <div id="recommend"></div>
   <div id="glossary"></div>
 </section>
 
@@ -173,6 +170,7 @@
   <div id="drill-body" class="thumbs"></div></dialog>
 
 <script src="/static/bench-glossary.js?v={{ version }}"></script>
+<script src="/static/bench-table.js?v={{ version }}"></script>
 <script src="/static/bench-charts.js?v={{ version }}"></script>
 <script src="/static/bench-compare.js?v={{ version }}"></script>
 <script src="/static/benchmark.js?v={{ version }}"></script>
