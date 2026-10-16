@@ -130,19 +130,13 @@
   // was saved; `t` null = the device only).
   function usePair(model, device, t) {
     var steps = [];
+    // Applying a pair is also that model's device pick (step 2).
+    choose(model, device); redrawSelection();
     return applyDevice(model, device).then(function (j) {
       steps.push({j: j, kind: "device"});
       if (!j.success || !has(t)) return null;
       return applyThreshold(model, t).then(function (k) { steps.push({j: k, kind: "threshold"}); });
     }).then(function () { showApply(steps); });
-  }
-  // Every model: its recommended device and best confidence.
-  function useAllRecommended() {
-    var steps = [];
-    return post("/v1/benchmark/apply", new URLSearchParams({all: "1"})).then(function (j) {
-      steps.push({j: j, kind: "device"});
-      return post("/v1/benchmark/apply-threshold", new URLSearchParams({all: "1"}));
-    }).then(function (k) { steps.push({j: k, kind: "threshold"}); showApply(steps); });
   }
   // The value before an apply: the answer's `previous` (newer servers), else the change's `from`
   // (null = the global setting: "global" for a device, the global value for a threshold).
@@ -652,8 +646,25 @@
   // ---- the shared device selection (Overview steps 2-3, recommendation, Confidence) -------------
   // "rec" = the recommended device of each model, "all" = every device, else a device spec.
   // Remembered per browser.
-  var selDevice = PB.store.get("device", "rec") || "rec";
-  function selName() { return selDevice === "rec" ? "the recommended device of each model" : selDevice === "all" ? "every device" : selDevice; }
+  // "chosen" = the device picked for each model in step 2 (the default).
+  var selDevice = PB.store.get("view", "chosen") || "chosen";
+  function selName() { return selDevice === "chosen" ? "the chosen device of each model" : selDevice === "rec" ? "the recommended device of each model" : selDevice === "all" ? "every device" : selDevice; }
+  // Step 2: the device picked for each model ({model (lower case): device spec}), remembered per
+  // browser. Without a pick (or when the model did not run on it): the device it uses now when it
+  // ran there, else its recommended device, else the first device it ran on.
+  var choice = PB.store.get("choice", {}) || {};
+  function ranOn(m, device) { return (m.devices || []).some(function (d) { return d.device === device && d.run && !d.run.fell_back; }); }
+  function chosenDevice(j, m) {
+    var c = choice[m.model.toLowerCase()];
+    if (c && ranOn(m, c)) return c;
+    var now = nowDevice(j, m);
+    if (now && ranOn(m, now)) return now;
+    if (m.recommended && ranOn(m, m.recommended)) return m.recommended;
+    var d = (m.devices || []).find(function (x) { return x.run && !x.run.fell_back; });
+    return d ? d.device : null;
+  }
+  function choose(model, device) { choice[model.toLowerCase()] = device; PB.store.set("choice", choice); }
+  function choiceKey() { return JSON.stringify(choice); }
   function devicesOf(models) {
     var out = []; models.forEach(function (m) { (m.devices || []).forEach(function (d) { if (d.run && out.indexOf(d.device) < 0) out.push(d.device); }); });
     return out.sort();
@@ -662,11 +673,11 @@
   function deviceSelector(models, scope, text) {
     var l = el("label", "inline-label device-select"), s = el("select");
     l.appendChild(document.createTextNode((text || "Compare models on") + " "));
-    var opts = [["rec", "Recommended device of each model"], ["all", "All devices"]].concat(devicesOf(models).map(function (d) { return [d, d + " (" + (PB.RUNTIME_NAMES[PB.runtimeOf(d)] || "") + ")"]; }));
-    if (selDevice !== "rec" && selDevice !== "all" && !opts.some(function (o) { return o[0] === selDevice; })) opts.push([selDevice, selDevice + " (no results)"]);
+    var opts = [["chosen", "Chosen device of each model (step 2)"], ["rec", "Recommended device of each model"], ["all", "All devices"]].concat(devicesOf(models).map(function (d) { return [d, d + " (" + (PB.RUNTIME_NAMES[PB.runtimeOf(d)] || "") + ")"]; }));
+    if (!opts.some(function (o) { return o[0] === selDevice; })) opts.push([selDevice, selDevice + " (no results)"]);
     opts.forEach(function (o) { var x = el("option", null, o[1]); x.value = o[0]; if (o[0] === selDevice) x.selected = true; s.appendChild(x); });
     s.name = "device-select-" + scope;
-    s.addEventListener("change", function () { selDevice = s.value; PB.store.set("device", selDevice); redrawSelection(); });
+    s.addEventListener("change", function () { selDevice = s.value; PB.store.set("view", selDevice); redrawSelection(); });
     l.appendChild(s); return l;
   }
   function redrawSelection() {
@@ -711,7 +722,7 @@
   function devRows(j, models) {
     var out = [];
     models.forEach(function (m) {
-      var now = nowDevice(j, m), rk = rankOf(j, m.model);
+      var now = nowDevice(j, m), rk = rankOf(j, m.model), picked = chosenDevice(j, m);
       (m.devices || []).forEach(function (d) {
         var r = d.run; if (!r) return;
         var p = pointOf(j, m.model, d.device), g = r.grades || {}, acc = r.accuracy, ov = acc && acc.overall, bp = bestPick(j, m, d.device), pk = bp.pick;
@@ -724,7 +735,7 @@
           ap50: ov ? ov.ap50 : null, rocAuc: acc && acc.frame_roc ? acc.frame_roc.auc : null,
           pick: pk, thr: pk ? pk.threshold : null, recall: pt ? pt.recall : ov ? ov.recall : null, precision: pt ? pt.precision : ov ? ov.precision : null,
           fpr: pt && pt.frame ? pt.frame.fpr : null, atBest: !!pt, pickState: bp.state, foundFor: bp.foundFor,
-          trust: (p && p.trust) || d.trust || (rec ? m.trust : null), rec: rec, now: now === d.device, fellBack: !!r.fell_back, thisRun: m.this_run,
+          trust: (p && p.trust) || d.trust || (rec ? m.trust : null), rec: rec, now: now === d.device, chosen: picked === d.device, fellBack: !!r.fell_back, thisRun: m.this_run,
           // One rank order per view (as step 4 picks): the model ranking for the recommended devices,
           // else the rank among every model x device point.
           rank: selDevice === "rec" && isRk ? rk.rank : p ? p.rank : isRk ? rk.rank : null, pointRank: p ? p.rank : null,
@@ -734,7 +745,7 @@
     });
     return out;
   }
-  function selectedRow(r) { return selDevice === "all" ? true : selDevice === "rec" ? r.rec : r.device === selDevice; }
+  function selectedRow(r) { return selDevice === "all" ? true : selDevice === "chosen" ? r.chosen : selDevice === "rec" ? r.rec : r.device === selDevice; }
   // The tags of a device cell: recommended, now, fell back.
   function deviceCell(r) {
     var s = el("span", "nowrap"); s.appendChild(document.createTextNode(r.device));
@@ -771,8 +782,6 @@
     b.disabled = !!j.running || r.fellBack;
     b.addEventListener("click", function () {
       b.disabled = true;
-      // Choosing a device with "Use this" is the step-2 pick: steps 3 and 4 follow it.
-      if (r.device !== selDevice) { selDevice = r.device; PB.store.set("device", selDevice); redrawSelection(); }
       if (r.now) useThreshold(r.model, t); else usePair(r.model, r.device, t);
     });
     return b;
@@ -784,15 +793,17 @@
       var top = (j.ranking || []).find(function (r) { return r.rank === 1; }) || (j.ranking || [])[0];
       pick = top ? rows.find(function (r) { return r.model === top.model && r.device === top.device; }) : null;
     } else {
-      pick = rows.filter(function (r) { return r.device === selDevice; }).sort(function (a, b) { return (has(a.pointRank) ? a.pointRank : 1e9) - (has(b.pointRank) ? b.pointRank : 1e9) || (b.overallPoints || 0) - (a.overallPoints || 0); })[0] || null;
+      // The best-ranked of the chosen pairs (step 2), or of the models on one device.
+      pick = rows.filter(selectedRow).sort(function (a, b) { return (has(a.pointRank) ? a.pointRank : 1e9) - (has(b.pointRank) ? b.pointRank : 1e9) || (b.overallPoints || 0) - (a.overallPoints || 0); })[0] || null;
     }
-    if (!pick) { var rl = $("rec-line"); if (rl) rl.replaceChildren(); if (models.length && !j.running) { var w = el("div", "card"); w.appendChild(el("h2", null, "No recommendation yet" + (selDevice !== "rec" && selDevice !== "all" ? " for " + selDevice : ""))); models.forEach(function (x) { w.appendChild(el("p", "muted", x.model + ": " + (x.error || x.recommendation || "no result"))); }); box.appendChild(w); } return; }
+    if (!pick) { var rl = $("rec-line"); if (rl) rl.replaceChildren(); if (models.length && !j.running) { var w = el("div", "card"); w.appendChild(el("h2", null, "No recommendation yet" + (selDevice !== "rec" && selDevice !== "all" ? " for " + selName() : ""))); models.forEach(function (x) { w.appendChild(el("p", "muted", x.model + ": " + (x.error || x.recommendation || "no result"))); }); box.appendChild(w); } return; }
     var card = el("div", "card primary recommend");
     var anyDev = selDevice === "rec" || selDevice === "all";
     var h = stepHead(4, "Your pick: " + pick.model + " on " + pick.device, PB.trustBadge(pick.trust, "rec")); card.appendChild(h);
     var fl = el("p", "muted"), cl = el("a", null, "choose a device in step 2"); cl.href = "#devices";
-    fl.appendChild(document.createTextNode(anyDev ? "The best model on any device (each model on its recommended device); to pick for one device, " : "The best model on " + selDevice + ", the device chosen in step 2 ("));
-    fl.appendChild(cl); fl.appendChild(document.createTextNode(anyDev ? "." : ")."));
+    cl.textContent = "step 2";
+    fl.appendChild(document.createTextNode(selDevice === "chosen" ? "The best model of your choices, each model on the device you chose for it in " : anyDev ? "The best model on any device (each model on its recommended device); choose a device per model in " : "The best model on " + selDevice + " (as compared in step 3); choose a device per model in "));
+    fl.appendChild(cl); fl.appendChild(document.createTextNode("."));
     card.appendChild(fl);
     var parts = ["About " + F.ms(pick.p50) + " per image"];
     if (findsNothing(pick.pick)) parts.push("but it finds no objects on these images");
@@ -803,7 +814,7 @@
     if (pick.relative) card.appendChild(el("p", "muted", "* Accuracy is relative to a reference model's detections (no human labels on these images), so it shows agreement, not true accuracy."));
     var nRank = (j.ranking || []).length, metric = ((j.ranking || [])[0] || {}).metric;
     var why = el("p", "muted");
-    why.appendChild(document.createTextNode((selDevice === "rec" || selDevice === "all" ? (nRank > 1 ? "Ranked first of " + nRank + " models" : "The only ranked model") : "The best-ranked model on " + selDevice) + " by " + (metric === "roc_auc" ? "alert separation (ROC AUC)" : "detection quality (AP50)") + " and speed, with accuracy counting " + Math.round(weightOf(j.config && j.config.benchmark) * 100) + "%. "));
+    why.appendChild(document.createTextNode((selDevice === "rec" || selDevice === "all" ? (nRank > 1 ? "Ranked first of " + nRank + " models" : "The only ranked model") : "The best-ranked model on " + selName()) + " by " + (metric === "roc_auc" ? "alert separation (ROC AUC)" : "detection quality (AP50)") + " and speed, with accuracy counting " + Math.round(weightOf(j.config && j.config.benchmark) * 100) + "%. "));
     why.appendChild(PB.runTag(pick.m)); card.appendChild(why);
     var act = el("div", "actions"); act.appendChild(pairAction(j, pick, false)); card.appendChild(act);
     if (has(pick.thr) && !findsNothing(pick.pick)) card.appendChild(el("p", "bi-line", "In Blue Iris, set each camera's minimum confidence (AI settings) to " + Math.round(pick.thr * 100) + "% or lower; a higher value there filters the detections again."));
@@ -816,17 +827,35 @@
     var box = $("devices"); box.replaceChildren();
     var rows = devRows(j, models); if (!rows.length) return;
     var card = el("div", "card");
-    card.appendChild(stepHead(2, "Pick a device", PB.term("?", "p50", "dev")));
-    card.appendChild(el("p", "muted", "Each model on every device it ran on, at that device's best confidence. Choose the device the models will run on: steps 3 and 4 and the Confidence tab follow it. \u201cUse this\u201d sets the model's device and that confidence together (both apply at once; Undo reverts both) and also makes that device your choice here."));
-    var tools = el("div", "chart-tools"); tools.appendChild(deviceSelector(models, "dev", "Device to use"));
-    var bb = el("button", "small secondary", "Use the recommended device and confidence for all models"); bb.type = "button"; bb.id = "apply-all"; bb.disabled = !!j.running;
-    bb.addEventListener("click", function () { if (!confirm("Set every benchmarked model to its recommended device and best confidence? Both apply at once.")) return; bb.disabled = true; useAllRecommended(); });
-    tools.appendChild(bb); card.appendChild(tools);
+    card.appendChild(stepHead(2, "Pick a device for each model", PB.term("?", "p50", "dev")));
+    card.appendChild(el("p", "muted", "Each model on every device it ran on, at that device's best confidence. Choose one device per model under \u201cRun on\u201d (each model can use a different device or runtime); steps 3 and 4 and the Confidence tab use your choices. Then apply them: each model gets its chosen device and the best confidence for that model and device together (both apply at once; Undo reverts them)."));
+    // Quick picks for every model at once.
+    var tools = el("div", "chart-tools quick-pick");
+    tools.appendChild(el("span", "muted", "Choose for every model: "));
+    var pickAll = function (label, title, fn) {
+      var b = el("button", "small secondary", label); b.type = "button"; b.title = title;
+      b.addEventListener("click", function () {
+        models.forEach(function (m) { var own = rows.filter(function (r) { return r.m === m && !r.fellBack; }), r = fn(own, m); if (r) choose(m.model, r.device); });
+        redrawSelection();
+      });
+      tools.appendChild(b);
+    };
+    pickAll("recommended", "Each model's recommended device (the best grade that agrees with the CPU)", function (own) { return own.find(function (r) { return r.rec; }); });
+    pickAll("in use now", "The device each model uses now", function (own) { return own.find(function (r) { return r.now; }); });
+    pickAll("fastest", "Each model's fastest device", function (own) { return own.filter(function (r) { return has(r.p50); }).sort(function (a, b) { return a.p50 - b.p50; })[0]; });
+    devicesOf(models).forEach(function (d) { pickAll(d, "Every model on " + d + " where it ran there (the others keep their choice)", function (own) { return own.find(function (r) { return r.device === d; }); }); });
+    card.appendChild(tools);
     card.appendChild(PB.dataTable({
       key: "devices", cls: "stack dev-table", rows: rows, filters: FILTERS, sort: {col: "model", dir: "asc"},
       text: function (r) { return r.model + " " + r.device + " " + r.runtime; },
-      rowAttrs: function (r, tr) { if (r.now) tr.classList.add("hl"); if (r.fellBack) tr.classList.add("failed"); },
+      rowAttrs: function (r, tr) { if (r.chosen) tr.classList.add("hl"); if (r.fellBack) tr.classList.add("failed"); },
       columns: [
+        {id: "pick", head: "Run on", label: "Run on", value: function (r) { return r.chosen ? 0 : 1; }, render: function (r) {
+          if (r.fellBack) return "-";
+          var i = el("input"); i.type = "radio"; i.name = "run-on-" + r.model.toLowerCase(); i.checked = r.chosen;
+          i.setAttribute("aria-label", "Run " + r.model + " on " + r.device);
+          i.addEventListener("change", function () { if (i.checked) { choose(r.model, r.device); redrawSelection(); } });
+          return i; }},
         {id: "model", head: "@model", value: function (r) { return r.model.toLowerCase(); }, render: function (r) { return el("span", "nowrap", r.model + (r.relative ? " *" : "")); }},
         {id: "device", head: "@device", value: function (r) { return r.device; }, render: deviceCell},
         {id: "p50", head: "@p50", num: true, value: function (r) { return r.fellBack ? null : r.p50; }, render: function (r) { return F.ms(r.p50); }},
@@ -836,10 +865,49 @@
         {id: "thr", head: "@best_conf", num: true, value: function (r) { return r.thr; }, render: function (r, td) { if (findsNothing(r.pick)) td.title = FINDS_NOTHING; return confText(r); }},
         {id: "now", head: "@now_conf", num: true, value: function (r) { return nowThr(j, r); }, render: function (r) { return thrShort(nowThr(j, r)); }},
         {id: "trust", head: "@trust", value: function (r) { return r.trust ? {high: 0, medium: 1, low: 2}[r.trust.level] : null; }, render: function (r) { return PB.trustBadge(r.trust, "dev"); }},
-        {id: "act", head: "", label: "Action", render: function (r) { return r.fellBack ? "-" : pairAction(j, r, true); }}
+        {id: "act", head: "", label: "Action", render: function (r) { return r.fellBack || !r.chosen ? "" : pairAction(j, r, true); }}
       ]
     }));
+    card.appendChild(choicesPanel(j, rows.filter(function (r) { return r.chosen; })));
     box.appendChild(card);
+  }
+  // What applying the step-2 choices changes: per model its device and/or its confidence (the
+  // best one of the chosen model x device), with one button for all of them and one Undo.
+  function choicesPanel(j, chosen) {
+    var d = el("div", "choices"), todo = [], loading = false;
+    chosen.forEach(function (r) {
+      if (r.pickState === "loading") { loading = true; return; }
+      var t = usableT(r), n = nowThr(j, r), dev = !r.now, th = has(t) && !near(n, t);
+      if (dev || th) todo.push({r: r, t: has(t) ? t : null, dev: dev, th: th, n: n});
+    });
+    d.appendChild(el("h3", null, "Apply your choices"));
+    if (loading) { d.appendChild(el("p", "muted", "Finding the best confidence of each chosen device…")); return d; }
+    if (!todo.length) { d.appendChild(el("p", "muted", "Every model already runs on its chosen device with that pair's best confidence: nothing to apply.")); return d; }
+    var ul = el("ul", "change-list");
+    todo.forEach(function (x) {
+      var parts = [];
+      if (x.dev) parts.push("device " + (nowDevice(j, x.r.m) || "auto") + " → " + x.r.device);
+      if (x.th) parts.push("confidence " + F.thrBi(x.n) + " → " + F.thrBi(x.t));
+      else if (x.dev && !has(x.t)) parts.push("confidence unchanged (no usable best confidence on " + x.r.device + ")");
+      var li = el("li"); li.appendChild(el("strong", null, x.r.model + ": ")); li.appendChild(document.createTextNode(parts.join("; "))); ul.appendChild(li);
+    });
+    d.appendChild(ul);
+    var act = el("div", "actions"), b = el("button", null, "Apply " + todo.length + " change" + (todo.length === 1 ? "" : "s")); b.type = "button"; b.id = "apply-choices"; b.disabled = !!j.running;
+    b.addEventListener("click", function () { b.disabled = true; applyChoices(todo); });
+    act.appendChild(b);
+    act.appendChild(el("span", "muted", "Both apply at once: a model on a new device reloads there; the next detections use the new confidence (no restart)."));
+    d.appendChild(act);
+    return d;
+  }
+  // Applies each model's chosen device and confidence in turn; one message and one Undo for all.
+  function applyChoices(todo) {
+    var steps = [];
+    return todo.reduce(function (p, x) {
+      return p.then(function () {
+        var dev = x.dev ? applyDevice(x.r.model, x.r.device).then(function (j) { steps.push({j: j, kind: "device"}); return j.success; }) : Promise.resolve(true);
+        return dev.then(function (ok) { if (ok && x.th) return applyThreshold(x.r.model, x.t).then(function (k) { steps.push({j: k, kind: "threshold"}); }); });
+      });
+    }, Promise.resolve()).then(function () { showApply(steps); });
   }
 
   // ---- Overview step 3: compare models on the selected device ------------------------------------
@@ -859,9 +927,7 @@
     var byAuc = (((j.ranking || [])[0] || (j.points || [])[0] || {}).metric) === "roc_auc", metricKey = byAuc ? "roc_auc" : "ap50";
     var card = el("div", "card");
     card.appendChild(stepHead(3, "Compare models on " + selName()));
-    var tools = el("div", "chart-tools"), chg = el("a", null, "change in step 2"); chg.href = "#devices";
-    var dl = el("span", "muted"); dl.appendChild(document.createTextNode("Device: " + selName() + " (")); dl.appendChild(chg); dl.appendChild(document.createTextNode(")"));
-    tools.appendChild(dl);
+    var tools = el("div", "chart-tools"); tools.appendChild(deviceSelector(models, "rank"));
     tools.appendChild(el("span", "muted", "★ = best trade-off. Best first by the overall grade. Accuracy graded by " + (byAuc ? "alert separation (frame ROC AUC)" : "detection quality (AP50, with small-object recall)") + "; finds / correct at each device's best confidence."));
     card.appendChild(tools);
     card.appendChild(PB.dataTable({
@@ -1242,7 +1308,7 @@
     L.keep($("run-banner"), JSON.stringify([models.map(function (m) { return [m.model, m.this_run, m.changes, m.timestamp, m.error, m.recommendation]; }), running, j.run && j.run.progress && [j.run.progress.modelIndex, j.run.progress.modelCount], (j.run && j.run.models || []).length, j.latest_run_id, sr]), function () { renderBanner(j, models); });
     var objs = JSON.stringify(models.map(function (m) { return m.threshold ? m.threshold.objective : null; }));
     L.keep($("preset"), JSON.stringify([j.config && j.config.benchmark, presetUi, running, models.length > 0, objs]), function () { renderPreset(j); });
-    var sp = JSON.stringify(j.points || []), sel = "|" + selDevice + "|" + Object.keys(conf.cache).join(",");
+    var sp = JSON.stringify(j.points || []), sel = "|" + selDevice + "|" + choiceKey() + "|" + Object.keys(conf.cache).join(",");
     // The shared best-confidence searches belong to these results and this objective.
     var stamp = savedObjective(j) + "|" + (j.latest_run_id || "") + "|" + ((j.results && j.results.timestamp) || "") + "|" + sm.length;
     if (stamp !== conf.stamp) { conf.stamp = stamp; conf.cache = {}; conf.pending = {}; }
@@ -1250,7 +1316,7 @@
     L.keep($("devices"), sm + sc + sp + sel + running, function () { renderDevices(j, models); });
     L.keep($("ranking"), sm + sr + sp + sel, function () { renderRanking(j, models); });
     L.keep($("glossary"), JSON.stringify(PB.noise), function () { var g = $("glossary"); g.replaceChildren(PB.glossaryDetails("overview")); });
-    L.keep($("conf-pick"), JSON.stringify([savedObjective(j), conf.obj, objs, running, devicesOf(models), selDevice]), function () { renderConfPick(j); });
+    L.keep($("conf-pick"), JSON.stringify([savedObjective(j), conf.obj, objs, running, devicesOf(models), selDevice, choiceKey()]), function () { renderConfPick(j); });
     L.keep($("conf-best"), sm + sc + sp + conf.obj + sel + running + Object.keys(conf.cache).join(","), function () { renderConfBest(j, models); });
     L.keep($("thresholds"), sm + sc, function () { renderThresholds(models); });
     renderModels(models, j.config, j.ranking);
