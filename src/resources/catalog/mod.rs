@@ -18,8 +18,9 @@
 //!   config, exported with the official code, `DEIMV2_SRC_ID`). Never downloaded or exported
 //!   automatically.
 //! - [`TOOLS`]: `tool:uv`, Astral's uv per platform (it installs Python and the pinned packages of
-//!   `scripts/requirements-model-export.txt`), and `tool:deimv2-src`, the DEIMv2 source archive;
-//!   both used only by the model export.
+//!   `scripts/requirements-model-export.txt`), `tool:deimv2-src`, the DEIMv2 source archive, and
+//!   `tool:vc-runtime` (Windows x64), Microsoft's Visual C++ runtime DLLs from the `msvc-runtime`
+//!   wheel on PyPI; all used only by the model export.
 //!
 //! This is the single source of truth for the pinned versions and URLs: `setup_openvino` and
 //! `setup_onnxruntime` read their packages from here.
@@ -30,8 +31,9 @@
 //! downloaded and hashed (the yaml git blob ids match the Hugging Face tree); the GitHub release
 //! API `digest` for the Ultralytics weights (downloaded and hashed), Hugging Face LFS `oid`s for
 //! the RF-DETR / DEIMv2 safetensors (downloaded and hashed; their `config.json` files downloaded and
-//! hashed), the GitHub archive of the DEIMv2 commit (downloaded and hashed) and the release's
-//! `<archive>.sha256` files for uv (archives downloaded and checked against them).
+//! hashed), the GitHub archive of the DEIMv2 commit (downloaded and hashed), the release's
+//! `<archive>.sha256` files for uv (archives downloaded and checked against them), and the PyPI
+//! digest of the `msvc-runtime` wheel (downloaded and hashed, its DLLs hashed one by one).
 
 use crate::backend::detect::ComputeCapability;
 use crate::backend::spec::{Runtime, Target};
@@ -430,7 +432,8 @@ pub enum ResourceKind {
     /// `model.safetensors` + `config.json`, downloaded into the export toolchain's weights
     /// directory); the model files are produced by [`super::export`].
     ExportModel,
-    /// A helper of the model export (`tool:uv`, `tool:deimv2-src`), extracted from an archive.
+    /// A helper of the model export (`tool:uv`, `tool:deimv2-src`, `tool:vc-runtime`), extracted
+    /// from an archive.
     Tool,
 }
 
@@ -479,6 +482,9 @@ pub enum Layout {
     Uv,
     /// Python source archive (DEIMv2): `<top>/engine/**/*.py` and the license, paths kept.
     SourceTree,
+    /// The `msvc-runtime` wheel: only the pinned Visual C++ runtime DLLs
+    /// (`catalog::VC_RUNTIME_DLLS`), copied flat, each SHA-256 checked.
+    VcRuntime,
     /// A plain file saved as [`Part::file_name`].
     File,
 }
@@ -647,6 +653,7 @@ pub fn all() -> impl Iterator<Item = &'static Resource> {
         .chain(EXPORT_MODELS)
         .chain(TOOLS)
         .chain(DEIMV2_SOURCE)
+        .chain(VC_RUNTIME)
         .chain(bench_sets())
 }
 

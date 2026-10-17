@@ -232,8 +232,11 @@
       {% for l in log_levels %}<option value="{{ l.value }}"{% if l.selected %} selected{% endif %}>{{ l.value }}</option>{% endfor %}
       </select>
     </label>
-    <label>Log timestamp time zone <span class="tag now">applies now</span> <input type="text" name="log_timezone" list="log-timezones" value="{{ c.log_timezone }}" placeholder="utc" title="utc, local, an IANA name such as America/Los_Angeles, or an offset such as +08:00"></label>
-    <datalist id="log-timezones"><option value="utc"><option value="local"><option value="America/Los_Angeles"><option value="Europe/Berlin"><option value="+08:00"></datalist>
+    <label>Log timestamp time zone <span class="tag now">applies now</span>
+      <select name="log_timezone" title="Other IANA names (America/Los_Angeles) or offsets (+08:00) can be set as log_timezone in the config file">
+      {% for t in log_timezones %}<option value="{{ t.value }}"{% if t.selected %} selected{% endif %}>{{ t.label }}</option>{% endfor %}
+      </select>
+    </label>
     <label>Log directory (empty = stdout) <span class="tag restart">process restart</span> <input type="text" name="log_path" value="{{ c.log_path }}"></label>
     <label>Save annotated images to <input type="text" name="save_image_path" value="{{ c.save_image_path }}" placeholder="disabled"></label>
     <label>Delete saved images older than (days, 0 = keep) <span class="tag now">applies now</span> <input type="number" name="save_image_max_age_days" min="0" max="3650" value="{{ c.save_image_max_age_days }}"></label>

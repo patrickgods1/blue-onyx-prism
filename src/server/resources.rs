@@ -789,7 +789,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|r| r["id"] == crate::resources::catalog::DEIMV2_SRC_ID)
+                .any(|r| r["id"] == crate::resources::catalog::DEIMV2_SRC_ID
+                    || r["id"] == crate::resources::catalog::VC_RUNTIME_ID),
+            "part of the toolchain row"
         );
         let d = row(&j, "model:deimv2-n");
         assert!(
@@ -941,7 +943,7 @@ mod tests {
             return;
         }
         let fake = Arc::new(crate::resources::export::fake::Fake {
-            hang_on: Some("export_model.py"),
+            hang_on: Some(" --out-dir "),
             ..crate::resources::export::fake::Fake::new()
         });
         let (state, root) = export_state(fake);
@@ -969,7 +971,7 @@ mod tests {
             if n["state_text"]
                 .as_str()
                 .unwrap()
-                .starts_with("exporting: exporting to ONNX (5/6)")
+                .starts_with("exporting: exporting to ONNX (7/8)")
             {
                 break n;
             }

@@ -98,6 +98,7 @@ fn job(root: &Path, platform: Platform) -> ExportJob {
         paths: Paths::new(root, root.join("models")),
         platform,
         timeouts: Timeouts::default(),
+        system_dir: None,
     }
 }
 
@@ -141,7 +142,7 @@ fn full_export_runs_every_stage_in_order() {
     // Downloads went through the fetcher: uv and the weights.
     assert_eq!(*fake.fetched.lock().unwrap(), ["tool:uv", "model:yolo26n"]);
     let cmds = fake.cmds();
-    assert_eq!(cmds.len(), 4, "{cmds:#?}");
+    assert_eq!(cmds.len(), 5, "{cmds:#?}");
     assert!(
         cmds[0].contains(" python install 3.11 --install-dir "),
         "{}",
@@ -153,16 +154,26 @@ fn full_export_runs_every_stage_in_order() {
     assert!(cmds[2].contains(" pip install --python "));
     assert!(cmds[2].contains("--require-hashes --no-deps --only-binary :all: -r "));
     assert!(!cmds[2].contains("--torch-backend"), "macOS uses PyPI");
-    assert!(cmds[3].contains(" -u -I "));
     assert!(
-        cmds[3].contains("--recipe ultralytics --name yolo26n --family yolo26 --weights "),
+        cmds[3].contains(" -X faulthandler -u -I ")
+            && cmds[3].ends_with("export_model.py --self-check --recipe ultralytics"),
         "{}",
         cmds[3]
     );
-    assert!(cmds[3].contains("--imgsz 640 --no-openvino --out-dir "));
-    assert!(!cmds[3].contains("--source"));
+    assert!(cmds[4].contains(" -X faulthandler -u -I "));
+    assert!(
+        cmds[4].contains("--recipe ultralytics --name yolo26n --family yolo26 --weights "),
+        "{}",
+        cmds[4]
+    );
+    assert!(cmds[4].contains("--imgsz 640 --no-openvino --out-dir "));
+    assert!(!cmds[4].contains("--source"));
     let all = fake.commands.lock().unwrap().clone();
-    let export = &all[3];
+    assert_eq!(
+        all[3].env, all[4].env,
+        "the self-check runs in the export's environment"
+    );
+    let export = &all[4];
     assert_eq!(export.program, j.paths.env_python(false));
     for (k, v) in [
         ("YOLO_OFFLINE", "1"),
@@ -202,14 +213,16 @@ fn full_export_runs_every_stage_in_order() {
             .contains("ultralytics==8.4.163")
     );
 
-    // Second export: toolchain reused; only the export runs (weights are kept too).
+    // Second export: toolchain reused; only the self-check and the export run (weights are kept
+    // too).
     let fake2 = Fake::new();
     let (r, _) = run(&fake2, &j);
     r.unwrap();
     assert!(fake2.fetched.lock().unwrap().is_empty());
     let cmds = fake2.cmds();
-    assert_eq!(cmds.len(), 1);
-    assert!(cmds[0].contains("export_model.py"));
+    assert_eq!(cmds.len(), 2);
+    assert!(cmds[0].contains("--self-check"));
+    assert!(cmds[1].contains("export_model.py --recipe"));
 
     // Remove: model files and toolchain.
     remove_export(yolo26n(), &j.paths, None).unwrap();
@@ -298,7 +311,7 @@ fn linux_uses_the_torch_cpu_index_and_windows_paths() {
     assert!(all[0].display().contains("--no-registry"));
     assert_eq!(all[0].program, root.join("tools/uv/uv.exe"));
     assert_eq!(
-        all[3].program,
+        all[4].program,
         root.join("tools/export-env/Scripts/python.exe")
     );
 }
@@ -337,7 +350,7 @@ fn failures_name_the_stage_and_leave_no_partial_install() {
 
     // Exporter fails: staging removed, nothing installed.
     let fake = Fake {
-        fail_on: Some("export_model.py"),
+        fail_on: Some(" --out-dir "),
         ..Fake::new()
     };
     let e = run(&fake, &j).0.unwrap_err();
@@ -372,7 +385,7 @@ fn failures_name_the_stage_and_leave_no_partial_install() {
 fn exporter_queues_cancels_and_reports() {
     let root = tmp("exporter");
     let fake = Arc::new(Fake {
-        hang_on: Some("export_model.py"),
+        hang_on: Some(" --out-dir "),
         ..Fake::new()
     });
     let ex = Exporter::start(fake.clone(), fake.clone());
@@ -409,11 +422,11 @@ fn exporter_queues_cancels_and_reports() {
             ..
         } = &st.state
         {
-            assert_eq!((*step, *steps), (5, 6));
+            assert_eq!((*step, *steps), (7, 8));
             assert!(
                 st.state
                     .describe()
-                    .starts_with("exporting: exporting to ONNX (5/6)")
+                    .starts_with("exporting: exporting to ONNX (7/8)")
             );
             assert!(
                 st.log.iter().any(|l| l.contains("Downloaded torch")),
@@ -586,6 +599,20 @@ fn system_runner_streams_fails_times_out_and_cancels() {
         .run(&cmd(bad, Duration::from_secs(30)), &mut |_| {}, &never)
         .unwrap_err();
     assert!(format!("{e:#}").contains("bad output"), "{e:#}");
+    // A failure keeps up to FAILURE_LINES lines for the classifier; the message quotes the last 8.
+    #[cfg(unix)]
+    let many = "i=1; while [ $i -le 20 ]; do echo line$i; i=$((i+1)); done; exit 3";
+    #[cfg(windows)]
+    let many = "(for /L %i in (1,1,20) do @echo line%i)& exit 3";
+    let e = SystemRunner
+        .run(&cmd(many, Duration::from_secs(30)), &mut |_| {}, &never)
+        .unwrap_err();
+    let child = e.downcast_ref::<ChildFailed>().expect("a ChildFailed");
+    assert_eq!(child.lines.len(), 20, "{:?}", child.lines);
+    assert_eq!(child.lines[0], "line1");
+    let msg = format!("{e:#}");
+    assert!(msg.contains("last output: line13 | line14"), "{msg}");
+    assert!(msg.ends_with("line20") && !msg.contains("line12"), "{msg}");
     #[cfg(unix)]
     {
         let started = Instant::now();
@@ -934,4 +961,217 @@ fn legacy_toolchain_is_replaced() {
     }
     assert!(!root.join("tools/yolo26-requirements.lock.txt").exists());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A System32 stand-in holding every pinned runtime DLL at `v` (msvcp140 family; minus `skip`).
+fn system32(root: &Path, v: vc_runtime::FileVersion, skip: &[&str]) -> PathBuf {
+    let dir = root.join("System32");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, _, _) in catalog::VC_RUNTIME_DLLS {
+        if !skip.contains(name) {
+            std::fs::write(dir.join(name), vc_runtime::synthetic_dll(v)).unwrap();
+        }
+    }
+    dir
+}
+
+const OLD_RUNTIME: vc_runtime::FileVersion = vc_runtime::FileVersion([14, 26, 28720, 3]);
+const NEW_RUNTIME: vc_runtime::FileVersion = vc_runtime::FileVersion([14, 50, 35719, 0]);
+
+fn lines_of(
+    fake: &Fake,
+    j: &ExportJob,
+    stage: Stage,
+) -> (Result<ExportOutput, ExportError>, Vec<String>) {
+    let mut lines = Vec::new();
+    let cancel = AtomicBool::new(false);
+    let r = run_export(
+        j,
+        fake,
+        fake,
+        &mut |p| {
+            if let Progress::Line { stage: s, line } = p
+                && s == stage
+            {
+                lines.push(line.to_string());
+            }
+        },
+        &cancel,
+    );
+    (r, lines)
+}
+
+/// The incident machine: System32 has 14.26 and no `vcruntime140_threads.dll` /
+/// `msvcp140_atomic_wait.dll`. The export fetches `tool:vc-runtime`, places it next to the base
+/// Python, and later exports find it there (no download).
+#[test]
+fn windows_old_runtime_gets_the_private_copy() {
+    let root = tmp("vcrt-old");
+    let mut j = job(&root, Platform::WINDOWS_X64);
+    j.system_dir = Some(system32(
+        &root,
+        OLD_RUNTIME,
+        &["vcruntime140_threads.dll", "msvcp140_atomic_wait.dll"],
+    ));
+    let fake = Fake::new();
+    let (r, lines) = lines_of(&fake, &j, Stage::Runtime);
+    r.unwrap();
+    assert_eq!(
+        *fake.fetched.lock().unwrap(),
+        ["tool:uv", "tool:vc-runtime", "model:yolo26n"]
+    );
+    let base =
+        std::fs::canonicalize(root.join("tools/python").join(super::fake::FAKE_PYTHON)).unwrap();
+    for (name, _, _) in catalog::VC_RUNTIME_DLLS {
+        assert_eq!(
+            vc_runtime::file_version(&base.join(name)),
+            Some(vc_runtime::FileVersion::PIN),
+            "{name}"
+        );
+    }
+    let text = lines.join("\n");
+    assert!(
+        text.contains("msvcp140.dll 14.26.28720.3 (System32) is older than 14.44.35211.0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("vcruntime140_threads.dll is missing"),
+        "{text}"
+    );
+    assert!(
+        text.contains("placed concrt140.dll (was missing), msvcp140.dll (was missing)"),
+        "{text}"
+    );
+    // uv's own vcruntime140 (already the pin) is left alone.
+    assert!(!text.contains("vcruntime140.dll (was"), "{text}");
+    assert!(root.join("tools/vc-runtime/msvcp140.dll").is_file());
+    // The self-check runs after the runtime is in place, before the weights.
+    let cmds = fake.cmds();
+    assert!(
+        cmds[3].contains("--self-check --recipe ultralytics"),
+        "{}",
+        cmds[3]
+    );
+
+    // Next export: the private copy is effective; nothing fetched or placed.
+    let fake = Fake::new();
+    let (r, lines) = lines_of(&fake, &j, Stage::Runtime);
+    r.unwrap();
+    assert!(fake.fetched.lock().unwrap().is_empty());
+    assert!(lines.iter().all(|l| !l.contains("placed")), "{lines:?}");
+    // Remove export toolchain removes the private runtime and the copies with tools/python.
+    remove_toolchain(&j.paths).unwrap();
+    assert!(!root.join("tools").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A current system runtime: the stage never touches the network.
+#[test]
+fn windows_current_runtime_needs_no_download() {
+    let root = tmp("vcrt-new");
+    let mut j = job(&root, Platform::WINDOWS_X64);
+    j.system_dir = Some(system32(&root, NEW_RUNTIME, &[]));
+    let fake = Fake::new();
+    let (r, lines) = lines_of(&fake, &j, Stage::Runtime);
+    r.unwrap();
+    assert_eq!(*fake.fetched.lock().unwrap(), ["tool:uv", "model:yolo26n"]);
+    assert_eq!(
+        lines,
+        [
+            "Visual C++ runtime: msvcp140.dll 14.50.35719.0 (System32) is new enough (PyTorch needs 14.40)"
+        ]
+    );
+    let base = root.join("tools/python").join(super::fake::FAKE_PYTHON);
+    assert!(!base.join("msvcp140.dll").exists());
+    assert!(!root.join("tools/vc-runtime").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn windows_runtime_download_failure_says_what_to_do() {
+    let root = tmp("vcrt-fail");
+    let mut j = job(&root, Platform::WINDOWS_X64);
+    j.system_dir = Some(system32(&root, OLD_RUNTIME, &[]));
+    let fake = Fake {
+        fetch_fails: Some("tool:vc-runtime"),
+        ..Fake::new()
+    };
+    let e = run(&fake, &j).0.unwrap_err();
+    assert_eq!(e.stage, Some(Stage::Runtime));
+    for part in [
+        "downloading the private Visual C++ runtime (tool:vc-runtime) failed: hash mismatch",
+        "(msvcp140.dll 14.26.28720.3 in System32; PyTorch needs 14.40 or newer)",
+        "Check the network and proxy settings",
+        "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+    ] {
+        assert!(e.message.contains(part), "{part}: {}", e.message);
+    }
+    // Nothing ran after it.
+    assert!(!fake.cmds().iter().any(|c| c.contains("--self-check")));
+    let base = root.join("tools/python").join(super::fake::FAKE_PYTHON);
+    assert!(!base.join("msvcp140.dll").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The incident's output through the stage machine: the self-check fails with the classified
+/// cause, before any weights are downloaded.
+#[test]
+fn self_check_failure_is_classified() {
+    let root = tmp("selfcheck");
+    let mut j = job(&root, Platform::WINDOWS_X64);
+    j.system_dir = Some(system32(&root, NEW_RUNTIME, &[]));
+    let fake = Fake {
+        fail_on: Some("--self-check"),
+        fail_lines: vec![
+            "[export_model] self-check: importing torch",
+            "Windows fatal exception: access violation",
+            "  File \"<frozen importlib._bootstrap>\", line 241 in _call_with_frames_removed",
+            r#"OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed. Error loading "C:\t\torch\lib\c10.dll" or one of its dependencies."#,
+        ],
+        ..Fake::new()
+    };
+    let e = run(&fake, &j).0.unwrap_err();
+    assert_eq!(e.stage, Some(Stage::SelfCheck));
+    assert!(
+        e.message.starts_with(
+            "the export environment's self-check failed: Python could not load PyTorch's native libraries (c10.dll)"
+        ),
+        "{}",
+        e.message
+    );
+    assert!(
+        e.message
+            .contains("found msvcp140.dll 14.50.35719.0 in System32"),
+        "{}",
+        e.message
+    );
+    assert!(
+        !fake
+            .fetched
+            .lock()
+            .unwrap()
+            .contains(&"model:yolo26n".to_string())
+    );
+
+    // A silent exit of the export script on macOS.
+    let root2 = tmp("silent");
+    let fake = Fake {
+        fail_on: Some(" --out-dir "),
+        fail_lines: vec!["[export_model] yolo26n: exporting ONNX (opset 17)"],
+        ..Fake::new()
+    };
+    let e = run(&fake, &job(&root2, MAC)).0.unwrap_err();
+    assert_eq!(e.stage, Some(Stage::Export));
+    assert!(
+        e.message.starts_with("Python exited without an error message after \"[export_model] yolo26n: exporting ONNX (opset 17)\""),
+        "{}",
+        e.message
+    );
+    assert!(
+        e.message.contains("last output: [export_model] yolo26n"),
+        "{}",
+        e.message
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
 }

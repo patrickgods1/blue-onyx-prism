@@ -26,6 +26,10 @@ Usage (inside the project venv, see scripts/requirements-export.txt):
         --source path/to/DEIMv2
     python scripts/export_model.py --name yolov8n --out-dir C:/BlueOnyx/models
 
+Before an export the service runs `python -X faulthandler -u -I export_model.py --self-check --recipe <r>`,
+which only imports the modules the recipe needs and prints their versions (a broken package or a
+native library that cannot load fails in seconds, naming the module).
+
 The service runs this same file (embedded in the binary) for the Config page's "Export" button and
 `blue-onyx-prism fetch --resource model:<name>`, as `--recipe <r> --name <name> --family <f>
 --weights <verified file or dir> --imgsz <n> --no-openvino --out-dir <staging> --work <dir>
@@ -117,7 +121,7 @@ def family_for(name: str, recipe: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--name", nargs="+", required=True, help="model name(s): yolov8n, yolo26s, rfdetr-large, deimv2-n, ...")
+    p.add_argument("--name", nargs="+", default=None, help="model name(s): yolov8n, yolo26s, rfdetr-large, deimv2-n, ...")
     p.add_argument("--recipe", choices=RECIPES, default=None, help="default: from the name")
     p.add_argument("--family", choices=FAMILIES, default=None, help="expected family (checks the output shape); default: from the name")
     p.add_argument(
@@ -144,7 +148,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-onnx", action="store_true", help="skip the <name>.onnx export")
     p.add_argument("--no-openvino", action="store_true", help="skip the OpenVINO IR export (ONNX only)")
     p.add_argument("--work", type=Path, default=REPO / ".export_work", help="scratch directory")
+    p.add_argument(
+        "--self-check",
+        action="store_true",
+        help="only import what --recipe needs and print the versions (checks the environment; exports nothing)",
+    )
     args = p.parse_args()
+    if args.self_check:
+        if args.recipe is None:
+            p.error("--self-check needs --recipe")
+        return args
+    if not args.name:
+        p.error("the following arguments are required: --name")
     if args.out is None:
         args.out = default_out_dir()
     if args.no_onnx and args.no_openvino:
@@ -754,11 +769,57 @@ def finish_hf(name: str, onnx: Path, args: argparse.Namespace, out: dict, imgsz:
     return out
 
 
+# Modules each recipe imports, in import order (`--self-check`).
+SELF_CHECK_MODULES = {
+    "ultralytics": ["numpy", "torch", "torchvision", "onnx", "onnxruntime", "ultralytics"],
+    "rfdetr": ["numpy", "torch", "onnx", "onnxruntime", "safetensors", "transformers"],
+    "deimv2": ["numpy", "torch", "torchvision", "onnx", "onnxruntime", "safetensors", "yaml"],
+}
+
+
+def loaded_dll(name: str) -> str | None:
+    """Path of the DLL `name` loaded into this process (Windows), else None."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetModuleHandleW.restype = wintypes.HMODULE
+    k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    k32.GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+    handle = k32.GetModuleHandleW(name)
+    if not handle:
+        return None
+    buf = ctypes.create_unicode_buffer(1024)
+    n = k32.GetModuleFileNameW(handle, buf, len(buf))
+    return buf.value[:n] if n else None
+
+
+def self_check(recipe: str) -> int:
+    """Import what `recipe` needs, one module at a time, and print the versions: a broken package
+    or a native library that cannot load fails here in seconds, naming the module (run with
+    `-X faulthandler` so a native crash leaves a stack)."""
+    log(f"self-check: Python {sys.version.split()[0]} ({sys.executable})")
+    for mod in SELF_CHECK_MODULES[recipe]:
+        log(f"self-check: importing {mod}")
+        m = importlib.import_module(mod)
+        log(f"self-check: {mod} {getattr(m, '__version__', '?')}")
+    for dll in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+        path = loaded_dll(dll)
+        if path:
+            log(f"self-check: {dll} loaded from {path}")
+    log("self-check: ok")
+    return 0
+
+
 # ---------------------------------------------------------------------------------------------
 
 
 def main() -> int:
     args = parse_args()
+    if args.self_check:
+        return self_check(args.recipe)
     args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
     args.work = args.work.resolve()

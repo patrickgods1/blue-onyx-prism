@@ -336,6 +336,7 @@ pub fn remove(
                 for s in m.statuses().iter().filter(|s| {
                     s.id == res.id
                         || s.id == catalog::DEIMV2_SRC_ID
+                        || s.id == catalog::VC_RUNTIME_ID
                         || catalog::export_model(s.id).is_some()
                 }) {
                     m.forget(&s.key);

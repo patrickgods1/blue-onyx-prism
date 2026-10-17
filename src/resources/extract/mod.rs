@@ -20,7 +20,8 @@
 //!   renamed into place only after every entry passed and the install was checked
 //!   (`finalize`); a failure removes the staging directory;
 //! - nothing from an archive is executed here. The `uv` binary and the DEIMv2 sources are run
-//!   only by a model export the user starts explicitly (`super::export`).
+//!   only by a model export the user starts explicitly (`super::export`). The Visual C++ runtime
+//!   DLLs are only loaded by that export's Python.
 //!
 //! Layouts:
 //! - [`Layout::OpenVino`]: the toolkit's `runtime/...` libraries, layout preserved (what
@@ -38,9 +39,12 @@
 //! - [`Layout::SourceTree`]: the DEIMv2 source archive: `engine/**/*.py`, `configs/**/*.yml` and
 //!   the license, paths kept (plain path components only). Imported / read only by a DEIMv2
 //!   export the user starts.
+//! - [`Layout::VcRuntime`]: the `msvc-runtime` wheel: only the pinned Visual C++ runtime DLLs
+//!   (`catalog::VC_RUNTIME_DLLS`, exact entry paths), flat, each checked against its own pinned
+//!   SHA-256 after extraction. Copied next to the export's Python only by a model export.
 //! - [`Layout::File`]: not an archive; the manager moves the verified file into place.
 
-use super::catalog::{ArchiveKind, Flavor, Layout, Resource, ResourceKind};
+use super::catalog::{ArchiveKind, Flavor, Layout, Resource, ResourceKind, VC_RUNTIME_DLLS};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -333,6 +337,10 @@ fn extract_impl(
             ArchiveKind::Zip => extract_zip(archive, dest, source_wanted, b),
             ArchiveKind::TarGz => extract_tgz(archive, dest, source_wanted, |_, _, _| None, b),
         },
+        Layout::VcRuntime => match kind {
+            ArchiveKind::Zip => extract_zip(archive, dest, vc_runtime_wanted, b),
+            ArchiveKind::TarGz => extract_tgz(archive, dest, vc_runtime_wanted, |_, _, _| None, b),
+        },
         Layout::File => anyhow::bail!("{} is not an archive", archive.display()),
     }
 }
@@ -366,6 +374,33 @@ fn source_check(got: &BTreeSet<String>) -> Result<Vec<String>> {
         || !got.iter().any(|f| f.starts_with("configs/"))
     {
         anyhow::bail!("the source archive has no engine/ package or configs/");
+    }
+    Ok(Vec::new())
+}
+
+/// `msvc-runtime` wheel entries: exactly the pinned paths of `catalog::VC_RUNTIME_DLLS` (the
+/// `data/` DLLs and `data/Scripts/vcruntime140*.dll`), written flat under their file name.
+pub(crate) fn vc_runtime_wanted(entry: &str) -> Option<String> {
+    let e = entry.replace('\\', "/");
+    VC_RUNTIME_DLLS
+        .iter()
+        .find(|(_, path, _)| *path == e)
+        .map(|(name, _, _)| (*name).to_string())
+}
+
+/// Every pinned Visual C++ runtime DLL was extracted and has its pinned SHA-256.
+fn vc_runtime_check(dest: &Path, got: &BTreeSet<String>) -> Result<Vec<String>> {
+    for (name, _, sha) in VC_RUNTIME_DLLS {
+        if !got.contains(*name) {
+            anyhow::bail!("the Visual C++ runtime wheel has no {name}");
+        }
+        let actual = super::manager::sha256_file(&dest.join(name))?;
+        if !actual.eq_ignore_ascii_case(sha) {
+            anyhow::bail!(
+                "{name} from the Visual C++ runtime wheel has SHA-256 {actual}, pinned {sha}; \
+                 the download is refused"
+            );
+        }
     }
     Ok(Vec::new())
 }
@@ -426,6 +461,9 @@ pub(crate) fn finalize(
             w
         }
         ResourceKind::CudaLibs => wheel_check(target.windows(), dest, got)?,
+        ResourceKind::Tool if resource.parts.iter().all(|p| p.layout == Layout::VcRuntime) => {
+            vc_runtime_check(dest, got)?
+        }
         ResourceKind::Tool
             if resource
                 .parts
@@ -1025,6 +1063,89 @@ mod tests {
         assert!(dest.join("VERSION").is_file());
         let mut empty = BTreeSet::new();
         assert!(finalize(src, src.version, t, &dir.join("none"), &mut empty).is_err());
+    }
+
+    /// The `msvc-runtime` wheel: only the pinned DLL paths are written (flat), and every one must
+    /// match its pinned SHA-256.
+    #[test]
+    fn vc_runtime_wheel_extracts_only_pinned_dlls() {
+        use crate::resources::catalog::{VC_RUNTIME_DLLS, vc_runtime_for};
+        let data = "msvc_runtime-14.44.35112.data/data";
+        assert_eq!(
+            vc_runtime_wanted(&format!("{data}/msvcp140.dll")).as_deref(),
+            Some("msvcp140.dll")
+        );
+        assert_eq!(
+            vc_runtime_wanted(&format!("{data}\\Scripts\\vcruntime140_1.dll")).as_deref(),
+            Some("vcruntime140_1.dll")
+        );
+        for refused in [
+            format!("{data}/Scripts/msvcp140.dll"),
+            format!("{data}/vcamp140.dll"),
+            format!("{data}/vccorlib140.dll"),
+            "msvc_runtime.cp311-win_amd64.pyd".to_string(),
+            "msvc_runtime-14.44.35112.dist-info/licenses/LICENSE".to_string(),
+            "msvcp140.dll".to_string(),
+            format!("other/{data}/msvcp140.dll"),
+        ] {
+            assert_eq!(vc_runtime_wanted(&refused), None, "{refused}");
+        }
+
+        let dir = TempDir::new("vc-runtime");
+        let wheel = dir.join("msvc.whl");
+        let mut entries: Vec<(String, Vec<u8>)> = VC_RUNTIME_DLLS
+            .iter()
+            .map(|(name, path, _)| (path.to_string(), format!("MZ {name}").into_bytes()))
+            .collect();
+        for extra in [
+            "msvc_runtime.cp311-win_amd64.pyd",
+            "msvc_runtime-14.44.35112.data/data/vcamp140.dll",
+            "msvc_runtime-14.44.35112.data/data/Scripts/msvcp140.dll",
+        ] {
+            entries.push((extra.to_string(), b"MZ extra".to_vec()));
+        }
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        zip_with(&wheel, &refs);
+        let wt = Target {
+            os: "windows",
+            arch: "x86_64",
+        };
+        let dest = dir.join("out");
+        let mut got =
+            extract_part(&wheel, ArchiveKind::Zip, Layout::VcRuntime, None, wt, &dest).unwrap();
+        let names: BTreeSet<String> = VC_RUNTIME_DLLS
+            .iter()
+            .map(|(n, _, _)| n.to_string())
+            .collect();
+        assert_eq!(got, names);
+        assert_eq!(
+            std::fs::read(dest.join("msvcp140.dll")).unwrap(),
+            b"MZ msvcp140.dll",
+            "the data/ copy, not the Scripts/ duplicate"
+        );
+        assert!(!dest.join("vcamp140.dll").exists());
+        assert!(!dest.join("Scripts").exists());
+        // Synthetic bytes: the per-file pins refuse them.
+        let res = vc_runtime_for("windows", "x86_64").unwrap();
+        let e = finalize(res, res.version, wt, &dest, &mut got).unwrap_err();
+        assert!(format!("{e:#}").contains("pinned"), "{e:#}");
+        // A wheel without one of the DLLs is refused too.
+        zip_with(&wheel, &refs[1..]);
+        let short = dir.join("short");
+        let mut got = extract_part(
+            &wheel,
+            ArchiveKind::Zip,
+            Layout::VcRuntime,
+            None,
+            wt,
+            &short,
+        )
+        .unwrap();
+        let e = finalize(res, res.version, wt, &short, &mut got).unwrap_err();
+        assert!(format!("{e:#}").contains("has no concrt140.dll"), "{e:#}");
     }
 
     #[test]
