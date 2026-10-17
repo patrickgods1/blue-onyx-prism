@@ -792,6 +792,23 @@ pub fn points_at(image_sets: &[ImageSetInfo], run: &StoredRun, t: f32) -> Option
     })
 }
 
+/// The exact best threshold for `objective` over every scored image of a stored run (the
+/// run's own overall curve, IoU 0.5): what a run with that objective would have picked. None
+/// when nothing of the run is scored or the objective has no pick.
+pub(crate) fn exact_overall_pick(
+    image_sets: &[ImageSetInfo],
+    run: &StoredRun,
+    objective: Objective,
+) -> Option<Pick> {
+    let sets: HashMap<&str, &ImageSetInfo> =
+        image_sets.iter().map(|s| (s.id.as_str(), s)).collect();
+    let req = SearchRequest {
+        objective,
+        ..SearchRequest::default()
+    };
+    search_run(run, &sets, &req, None).ok()?.best
+}
+
 /// Search one stored run.
 fn search_run(
     run: &StoredRun,

@@ -38,8 +38,9 @@ mod test_util;
 use apply::sync_config;
 pub(crate) use apply::{apply_config, reload_models};
 use config_page::{
-    ConfigView, MessageTemplate, config_loglevel, config_models, config_page, config_restart,
-    config_submit, encode_uri_component, global_device_label, save_config, schedule_restart,
+    ConfigView, MessageTemplate, config_loglevel, config_models, config_models_remove, config_page,
+    config_restart, config_submit, encode_uri_component, global_device_label, save_config,
+    schedule_restart,
 };
 pub(crate) use detect::BODY_LIMIT;
 use detect::{custom_list, detection_custom, detection_default};
@@ -178,6 +179,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/test", get(test_page).post(test_submit)),
         ("/config", get(config_page).post(config_submit)),
         ("/config/models", post(config_models)),
+        ("/config/models/remove", post(config_models_remove)),
         ("/config/restart", post(config_restart)),
         ("/config/loglevel", post(config_loglevel)),
         ("/logs", get(logs_page)),
@@ -200,6 +202,16 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/v1/benchmark/settings", post(benchmark::settings)),
         ("/v1/benchmark/images", get(benchmark::images_detail)),
         ("/v1/benchmark/image", get(benchmark::image_file)),
+        ("/v1/benchmark/history", get(benchmark::history_get)),
+        (
+            "/v1/benchmark/history/compare",
+            get(benchmark::history_compare),
+        ),
+        ("/v1/benchmark/history/pin", post(benchmark::history_pin)),
+        (
+            "/v1/benchmark/history/delete",
+            post(benchmark::history_delete),
+        ),
     ]
 }
 
@@ -922,6 +934,7 @@ mod tests {
             "/test",
             "/config",
             "/config/models",
+            "/config/models/remove",
             "/config/restart",
             "/config/loglevel",
             "/logs",
@@ -935,6 +948,10 @@ mod tests {
             "/v1/benchmark/settings",
             "/v1/benchmark/images",
             "/v1/benchmark/image",
+            "/v1/benchmark/history",
+            "/v1/benchmark/history/compare",
+            "/v1/benchmark/history/pin",
+            "/v1/benchmark/history/delete",
         ];
         // Static files are open as a group (`/static/*`).
         let is_open = |p: &str| OPEN.contains(&p) || p.starts_with("/static/");

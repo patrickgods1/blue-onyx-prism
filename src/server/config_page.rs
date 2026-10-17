@@ -819,6 +819,58 @@ pub(super) async fn config_models(
     .await
 }
 
+/// `POST /config/models/remove` (`name`): the Models card's Remove. Drops the config entry of a
+/// disabled model (its files stay; Resources removes those) and saves like the other writers.
+/// 404 for an unknown name, 409 for an enabled model. JSON unless the client asks for HTML
+/// (then the config page at the Models card).
+pub(super) async fn config_models_remove(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    form: Result<Form<Vec<(String, String)>>, FormRejection>,
+) -> Response {
+    blocking(move || {
+        use crate::resources::actions::{ActionError, remove_config_entry};
+        let html = wants_html(&headers);
+        let name = form
+            .ok()
+            .and_then(|Form(f)| f.into_iter().find(|(k, _)| k == "name").map(|(_, v)| v))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        let result = if name.is_empty() {
+            Err(ActionError::BadRequest(
+                "no model name given (field `name`); reload the page and try again".into(),
+            ))
+        } else {
+            let mut outcome = String::new();
+            save_config(&state, "config page (remove model entry)", |c| {
+                outcome = remove_config_entry(c, &name).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(())
+            })
+            .map(|msg| format!("{outcome}. {msg}"))
+            .map_err(|e| match e.downcast::<ActionError>() {
+                Ok(a) => a,
+                Err(e) => ActionError::Failed(format!("{e:#}")),
+            })
+        };
+        match result {
+            Ok(msg) if html => render(&config_template_at(&state, Some(msg), None, None, "models")),
+            Ok(msg) => live::saved_json(&state, msg, false),
+            Err(e) => {
+                warn!("model entry not removed: {e}");
+                let msg = format!("Not removed: {e}.");
+                if html {
+                    return render(&config_template_at(&state, None, Some(msg), None, "models"));
+                }
+                live::error_json(
+                    StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    msg,
+                )
+            }
+        }
+    })
+    .await
+}
+
 fn apply_log_level(state: &AppState, level: LogLevel) -> anyhow::Result<()> {
     match &state.log_reload {
         Some(h) => h.set_level(level),
@@ -1151,6 +1203,97 @@ mod tests {
         );
         assert_eq!(Config::load(&path).unwrap(), saved);
         assert_eq!(*state.config_read(), saved);
+    }
+
+    /// `POST /config/models/remove`: a disabled entry goes (files stay), an enabled one and an
+    /// unknown name are refused, and only loopback peers (same-site) may call it.
+    #[tokio::test]
+    async fn config_models_remove_entry() {
+        let state = test_state_with(|c| {
+            c.models.push(crate::config::ModelConfig {
+                name: Some("dfine-m".into()),
+                path: "models/dfine-m.onnx".into(),
+                enabled: false,
+                ..Default::default()
+            });
+            c.default_model = Some("dfine-m".into());
+        });
+        let path = state.config_path.clone();
+        let (_, html) = get_text(&state, "/config").await;
+        assert!(
+            html.contains("action=\"/config/models/remove#at-models\" id=\"model-remove\""),
+            "{html}"
+        );
+        // Enabled rows: a disabled button with the reason; the disabled row can be removed.
+        assert!(html.contains(
+            "form=\"model-remove\" name=\"name\" value=\"ipcam-general\" data-confirm=\"Remove ipcam-general from the config? Its files stay; remove them under Resources.\" disabled title=\"Enabled: disable it first"
+        ), "{html}");
+        assert!(html.contains(
+            "value=\"dfine-m\" data-confirm=\"Remove dfine-m from the config? Its files stay; remove them under Resources.\" title=\"Remove this entry"
+        ), "{html}");
+
+        // A remote peer and a cross-site page are refused; nothing changes.
+        let remote = from_peer(
+            post_form("/config/models/remove", "name=dfine-m", false),
+            REMOTE,
+        );
+        let (s, _, _) = call(&state, remote).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let mut cross = post_form("/config/models/remove", "name=dfine-m", false);
+        cross
+            .headers_mut()
+            .insert("sec-fetch-site", "cross-site".parse().unwrap());
+        let (s, _, _) = call(&state, cross).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(state.config_read().models.len(), 3);
+
+        let post = |body: &'static str| {
+            let state = state.clone();
+            async move {
+                let (s, _, b) = call(&state, post_form("/config/models/remove", body, false)).await;
+                (s, serde_json::from_slice::<serde_json::Value>(&b).unwrap())
+            }
+        };
+        let (s, b) = post("name=nope").await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+        let (s, b) = post("name=").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        let (s, b) = post("name=ipcam-general").await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        assert!(
+            b["message"].as_str().unwrap().contains("disable it first"),
+            "{b}"
+        );
+        assert_eq!(state.config_read().models.len(), 3);
+
+        let (s, b) = post("name=DFINE-M").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["success"], true);
+        let msg = b["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("removed 'dfine-m' from the config. Saved to"),
+            "{msg}"
+        );
+        let saved = Config::load(&path).unwrap();
+        let names: Vec<String> = saved.models.iter().map(|m| m.effective_name()).collect();
+        assert_eq!(names, ["ipcam-general", "<b>evil</b>"]);
+        assert_eq!(saved.default_model, None, "the dangling default is cleared");
+        assert_eq!(*state.config_read(), saved);
+        let last = state.config.changes(1).pop().expect("logged");
+        assert_eq!(last.source, "config page (remove model entry)");
+
+        // Browsers get the page at the Models card.
+        let (s, _, b) = call(
+            &state,
+            post_form("/config/models/remove", "name=dfine-m", true),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let page = String::from_utf8(b).unwrap();
+        assert!(
+            page.contains("class=\"error\">Not removed: no model named &#39;dfine-m&#39;"),
+            "{page}"
+        );
     }
 
     #[tokio::test]

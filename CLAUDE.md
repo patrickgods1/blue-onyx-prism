@@ -102,6 +102,13 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 - `src/model/` model families: `yolo26` (YOLO26/YOLOv10 end-to-end `[1,300,6]`), `yolo5` (`[1,N,5+C]` + NMS),
   `yolo8` (YOLOv8/9/11/12 `[1,4+C,8400]` + NMS), `detr` (D-FINE: `pixel_values` -> `logits/pred_boxes`), `rfdetr` (same, ImageNet-normalized, COCO-91 head), `rtdetr` (RT-DETRv2, DEIMv2: `images` + i64 `orig_target_sizes`; `labels/boxes/scores`; input size from the model's static dims).
   Preprocess = letterbox (YOLO) or stretch (RT-DETR) to 640x640 RGB f32 0..1, CHW.
+- `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
+  baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;
+  a write failure only warns). `ModelResult.run_id` = the run's start time. Pure `comparable`/`compare` (speed counts at
+  >= max(5%, 0.5 ms), accuracy past 2 standard errors, a threshold inside the old plateau is rounding), `trust`, `pareto`;
+  `GET /v1/benchmark` carries `latest_run_id`, `noise`, per model `this_run`/`trust`/`changes`, `points`. Admin routes
+  `GET /v1/benchmark/history[/compare]`, `POST /v1/benchmark/history/{pin,delete}`; `POST /v1/benchmark/settings`
+  re-ranks the saved results (`benchmark/rescore.rs`, exact advice from `benchmark-preds.json`).
 - `src/resources/` on-demand resources: `catalog` (pins), `resolve` (pure needs from config + hardware +
   installed), `manager` (one download thread, Range resume, SHA-256, staging + atomic rename, `.installed.json`,
   `.downloads.lock`, backoff), `extract` (whitelist-only, nothing executed), `provision` (startup: models wait
@@ -110,7 +117,8 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   export -> install, fake-able `CommandRunner`/`Fetcher`, one at a time, cancellable).
 - `src/config.rs` JSON config next to the exe; CLI overrides only non-default values and writes back.
   The server holds it in `config_store.rs` (revision + change log, detects edits on disk); every UI writer goes
-  through `save_config` (last write wins). A save applies live: per-request settings (thresholds, filters, timeout,
+  through `save_config` (last write wins). Resources Remove of a model also drops its disabled config entries (an enabled
+  one blocks it); the Models card's Remove (`POST /config/models/remove`, `name`) drops a disabled entry, never files. A save applies live: per-request settings (thresholds, filters, timeout,
   image saving, default model) swap into the workers (`LiveSettings`), structural model changes (enable/disable,
   device, family, classes) reload only that model (`ModelRegistry::reload_model`), and only runtime-level fields
   (port, bind address, runtime dirs, cache, threads, profile/concurrency) stay pending until a restart

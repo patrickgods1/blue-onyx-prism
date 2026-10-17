@@ -527,11 +527,6 @@ impl Profile {
             .join("/")
     }
 
-    /// True when a catalog model of this name (family `yolo5` or not) has a recommended size.
-    pub fn recommends(&self, name: &str, yolo5: bool) -> bool {
-        model_size(name, yolo5).is_some_and(|s| self.model_sizes.contains(&s))
-    }
-
     /// One line for the welcome page and `list-devices`: "low-spec: 6 logical cores, 16 GB
     /// memory, integrated GPU (Intel(R) UHD Graphics 630) -> 3 preprocess threads, 2 in flight,
     /// recommended sizes n/s".
@@ -933,11 +928,6 @@ mod tests {
         for name in ["IPcam-general", "IPcam-dark", "delivery", "package"] {
             assert_eq!(model_size(name, true), Some(ModelSize::S), "{name}");
         }
-        let low = classify(&facts(6, 16.0, "x86_64", vec![]));
-        assert!(low.recommends("IPcam-general", true));
-        assert!(low.recommends("yolo26n", false));
-        assert!(!low.recommends("yolo26m", false));
-        assert!(!low.recommends("custom", false));
     }
 
     #[test]

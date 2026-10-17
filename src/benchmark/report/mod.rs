@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 mod recommend;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 pub use recommend::{ACCURACY_TIE, Recommendation, auto_orders, recommend, speed_order};
 
@@ -218,6 +218,10 @@ pub struct ModelResult {
     /// RFC 3339 time the sweep started.
     #[serde(default)]
     pub timestamp: String,
+    /// The run this result belongs to: the run's start time (RFC 3339, the same for every model
+    /// of one run; [`super::history::new_run_id`]). None in files of older versions.
+    #[serde(default)]
+    pub run_id: Option<String>,
     /// Dataset ids, comma separated.
     #[serde(default)]
     pub image: String,
@@ -263,6 +267,7 @@ impl ModelResult {
             path: job.path.display().to_string(),
             family: job.family.to_string(),
             timestamp: now(),
+            run_id: None,
             image: bench.describe_sets(),
             datasets: bench.sets.iter().map(|s| s.id.clone()).collect(),
             images: bench.image_count(),
@@ -287,6 +292,7 @@ impl ModelResult {
             path: path.to_string(),
             family: String::new(),
             timestamp: now(),
+            run_id: None,
             image: String::new(),
             datasets: Vec::new(),
             images: 0,
@@ -418,7 +424,7 @@ impl HardwareSummary {
 
     /// `#0 Name` of a recorded GPU string, without the trailing `(vendor, kind, VRAM, CUDA)`
     /// facts ([`GpuAdapter`]'s Display; the facts themselves contain no parenthesis).
-    fn gpu_key(s: &str) -> &str {
+    pub(crate) fn gpu_key(s: &str) -> &str {
         s.rfind(" (").map_or(s, |i| &s[..i]).trim()
     }
 
@@ -555,7 +561,8 @@ impl ImageSetInfo {
     }
 }
 
-/// One row of the cross-model ranking: a model on its recommended device.
+/// One row of the cross-model ranking: a model on its recommended device (or, in
+/// [`BenchmarkResults::points`], on any device that ran).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RankRow {
     pub rank: usize,
@@ -575,6 +582,97 @@ pub struct RankRow {
     pub accuracy_score: Option<f64>,
     pub relative: bool,
     pub datasets: Vec<String>,
+    /// `openvino` or `onnxruntime`.
+    pub runtime: String,
+    /// No other row of the same list is both at least as fast and at least as accurate
+    /// (and strictly better in one): [`super::history::pareto`].
+    pub best_tradeoff: bool,
+    /// The run the model's result is from.
+    pub run_id: Option<String>,
+    /// From the newest run of the results.
+    pub this_run: bool,
+    pub trust: super::history::Trust,
+    /// Recall / precision at the model's best confidence threshold on this device (the
+    /// advice), else at the run's configured threshold.
+    pub recall: Option<f64>,
+    pub precision: Option<f64>,
+    /// The threshold `recall` / `precision` are at.
+    pub threshold: Option<f32>,
+}
+
+impl RankRow {
+    /// The row of device `d` of `m`; None when it has no grades (did not run, fell back).
+    fn of(m: &ModelResult, d: &DeviceResult, latest: Option<&str>) -> Option<(Self, Grades)> {
+        let g = *d.grades()?;
+        let run = d.run.as_ref()?;
+        let acc = run.accuracy.as_ref();
+        // At the best threshold of this device when the advice has one, else the configured.
+        let best = m.threshold.as_ref().and_then(|a| {
+            if a.device == d.device {
+                a.best.clone()
+            } else {
+                a.by_device
+                    .iter()
+                    .find(|p| p.device == d.device)
+                    .and_then(|p| p.best.clone())
+            }
+        });
+        let (recall, precision, threshold) = match &best {
+            Some(b) => (b.point.recall, b.point.precision, Some(b.threshold)),
+            None => (
+                acc.and_then(|a| a.overall.recall),
+                acc.and_then(|a| a.overall.precision),
+                acc.map(|a| a.threshold),
+            ),
+        };
+        Some((
+            Self {
+                rank: 0,
+                model: m.model.clone(),
+                device: d.device.clone(),
+                overall: g.overall,
+                overall_points: g.overall_points,
+                accuracy: g.accuracy,
+                speed: g.speed,
+                p50_ms: g.p50_ms,
+                ap50: acc.and_then(|a| a.overall.ap50),
+                roc_auc: acc.and_then(|a| a.roc_auc()),
+                metric: g.metric,
+                accuracy_score: g.accuracy_score,
+                relative: g.relative,
+                datasets: m.datasets.clone(),
+                runtime: super::history::runtime_of(&d.device).to_string(),
+                best_tradeoff: false,
+                run_id: m.run_id.clone(),
+                this_run: latest.is_some() && m.run_id.as_deref() == latest,
+                trust: super::history::trust::device_trust(m, d),
+                recall,
+                precision,
+                threshold,
+            },
+            g,
+        ))
+    }
+}
+
+/// Rank `rows` (best first, [`Grades::rank_cmp`]) and mark the best trade-offs among them.
+fn ranked(mut rows: Vec<(RankRow, Grades)>) -> Vec<RankRow> {
+    rows.sort_by(|a, b| Grades::rank_cmp(&a.1, &b.1));
+    let marks = super::history::pareto(
+        &rows
+            .iter()
+            .map(|(r, _)| (r.p50_ms, r.accuracy_score))
+            .collect::<Vec<_>>(),
+    );
+    rows.into_iter()
+        .zip(marks)
+        .enumerate()
+        .map(|(i, ((mut r, _), best))| {
+            r.rank = i + 1;
+            r.best_tradeoff = best;
+            r
+        })
+        .collect()
 }
 
 /// The persisted results file: the latest sweep of every benchmarked model.
@@ -737,48 +835,34 @@ impl BenchmarkResults {
     /// Models ranked by the grades of their recommended device (best first): "the best model
     /// for this machine" is the first row.
     pub fn ranking(&self) -> Vec<RankRow> {
-        let mut rows: Vec<(RankRow, Grades)> = self
-            .models
-            .iter()
-            .filter_map(|m| {
-                let g = *m.recommended_grades()?;
-                let acc = m
-                    .devices
-                    .iter()
-                    .find(|d| Some(&d.device) == m.recommended.as_ref())
-                    .and_then(|d| d.run.as_ref())
-                    .and_then(|r| r.accuracy.as_ref());
-                let ap50 = acc.and_then(|a| a.overall.ap50);
-                let roc_auc = acc.and_then(|a| a.roc_auc());
-                Some((
-                    RankRow {
-                        rank: 0,
-                        model: m.model.clone(),
-                        device: m.recommended.clone()?,
-                        overall: g.overall,
-                        overall_points: g.overall_points,
-                        accuracy: g.accuracy,
-                        speed: g.speed,
-                        p50_ms: g.p50_ms,
-                        ap50,
-                        roc_auc,
-                        metric: g.metric,
-                        accuracy_score: g.accuracy_score,
-                        relative: g.relative,
-                        datasets: m.datasets.clone(),
-                    },
-                    g,
-                ))
-            })
-            .collect();
-        rows.sort_by(|a, b| Grades::rank_cmp(&a.1, &b.1));
-        rows.into_iter()
-            .enumerate()
-            .map(|(i, (mut r, _))| {
-                r.rank = i + 1;
-                r
-            })
-            .collect()
+        let latest = super::history::view::latest_run_id(self);
+        ranked(
+            self.models
+                .iter()
+                .filter_map(|m| {
+                    let rec = m.recommended.as_deref()?;
+                    let d = m.devices.iter().find(|d| d.device == rec)?;
+                    RankRow::of(m, d, latest.as_deref())
+                })
+                .collect(),
+        )
+    }
+
+    /// Every model on every device that ran (with grades), ranked like [`Self::ranking`], the
+    /// best trade-offs marked over all of them (the Compare scatter).
+    pub fn points(&self) -> Vec<RankRow> {
+        let latest = super::history::view::latest_run_id(self);
+        ranked(
+            self.models
+                .iter()
+                .flat_map(|m| {
+                    m.devices
+                        .iter()
+                        .filter_map(|d| RankRow::of(m, d, latest.as_deref()))
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+        )
     }
 
     /// The metric the grades were computed from (the first graded run's; AP50 without any).

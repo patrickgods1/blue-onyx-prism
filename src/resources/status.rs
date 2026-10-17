@@ -7,15 +7,17 @@
 //! - **Remove** deletes an install we made (a `.installed.json` manifest names it). It refuses
 //!   while the resource downloads, when this process has the runtime loaded (OpenVINO, the
 //!   loaded ONNX Runtime flavor, preloaded CUDA libraries: "restart required"), and when an
-//!   enabled model of the config uses the model files.
+//!   enabled model of the config uses the model files. Disabled config entries using them are
+//!   dropped with them (`actions::Removed::config_entries`, saved by the server's config writer).
 //! - **Add to config** appends an installed catalog model to `models` with the same rules as
 //!   `download-models --add-to-config`, or a model file found in `models_dir` that no config
 //!   entry references (id `local:<file>`, see [`local_models`]; family `auto`).
 //!
 //! - **Export** (Ultralytics YOLO, RF-DETR L, DEIMv2; [`super::actions::export`]): queues a
 //!   user-confirmed export on the [`super::export`] exporter (the toolchain download needs
-//!   `confirm_large` unless `allow_large_downloads`); **Cancel** stops it. Remove deletes the
-//!   exported files; removing `tool:uv` removes the whole export toolchain (including the DEIMv2
+//!   `confirm_large` unless `allow_large_downloads`); **Cancel** stops it. Remove deletes
+//!   everything of that one export (`export::export_leftovers`: files, IR of earlier versions,
+//!   weights, work files, CoreML rewrites), also when only leftovers are on disk; removing `tool:uv` removes the whole export toolchain (including the DEIMv2
 //!   source, which has no row of its own).
 //!
 //! Rows carry a `group` ([`group_of`]) so the UI shows Runtimes, GPU libraries and Models
@@ -111,23 +113,9 @@ pub struct ResourceRow {
     pub size_note: Option<String>,
     /// Last lines of output of a running or failed export.
     pub log: Vec<String>,
-    /// A model whose size the hardware profile recommends for this machine
-    /// ([`crate::profile::Profile::recommends`]).
-    pub recommended: bool,
     /// Installed in another version than the catalog's: the catalog version Download installs
     /// (the UI labels the button Update).
     pub update_available: Option<&'static str>,
-}
-
-/// True for a model resource whose size `profile` recommends (the IPcam YOLOv5 models count
-/// as `s`).
-pub fn recommended_for(profile: &crate::profile::Profile, r: &Resource) -> bool {
-    match r.provides {
-        catalog::Provides::Model { name, family } => {
-            profile.recommends(name, family == crate::model::ModelFamilyKind::Yolo5)
-        }
-        _ => false,
-    }
 }
 
 fn kind_str(k: ResourceKind) -> &'static str {
@@ -429,13 +417,34 @@ fn ours(res: &Resource, config: &Config) -> bool {
     manager::read_manifest(&manager::manifest_path(res, &dir)).is_some_and(|m| m.id == res.id)
 }
 
-/// Enabled config models whose file is part of `res`.
-fn models_using(res: &Resource, config: &Config) -> Vec<String> {
-    let files = model_paths(res, config);
+/// Config models (enabled or not) whose file is part of `res` (for an export also its IR, which
+/// Remove deletes too), as `(name, enabled)` in config order. Compared while the files exist
+/// ([`same_file`] also matches another spelling of the same file).
+pub(super) fn config_entries_using(res: &Resource, config: &Config) -> Vec<(String, bool)> {
+    if !res.kind.is_model() {
+        return Vec::new();
+    }
+    let mut files = model_paths(res, config);
+    if let Some((xml, _)) = export::ir_files(res) {
+        files.push(target_dir(config, res).join(xml));
+    }
     config
-        .enabled_models()
-        .filter(|m| files.contains(&config.data_path(&m.path)))
-        .map(|m| m.effective_name())
+        .models
+        .iter()
+        .filter(|m| {
+            let p = config.data_path(&m.path);
+            files.iter().any(|f| same_file(f, &p))
+        })
+        .map(|m| (m.effective_name(), m.enabled))
+        .collect()
+}
+
+/// Enabled config models whose file is part of `res` ([`config_entries_using`]).
+fn models_using(res: &Resource, config: &Config) -> Vec<String> {
+    config_entries_using(res, config)
+        .into_iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(n, _)| n)
         .collect()
 }
 
@@ -528,7 +537,6 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
         .iter()
         .map(|m| config.data_path(&m.path))
         .collect();
-    let profile = config.profile();
 
     platform_resources(ctx)
         .into_iter()
@@ -537,9 +545,7 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
         .filter(|r| r.id != catalog::DEIMV2_SRC_ID && r.id != catalog::VC_RUNTIME_ID)
         .map(|r| {
             if matches!(r.kind, ResourceKind::ExportModel | ResourceKind::Tool) {
-                let mut row = export_row(ctx, config, r, &res, &statuses, &configured, &export_env);
-                row.recommended = recommended_for(&profile, r);
-                return row;
+                return export_row(ctx, config, r, &res, &statuses, &configured, &export_env);
             }
             let status = status_of(&statuses, r.id);
             let on_disk = is_installed(r, &installed, config);
@@ -659,7 +665,6 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                 }),
                 size_note: None,
                 log: Vec::new(),
-                recommended: recommended_for(&profile, r),
                 update_available: update.then_some(r.version),
             }
         })
@@ -759,7 +764,6 @@ fn export_row(
         confirm: None,
         size_note: None,
         log: Vec::new(),
-        recommended: false,
         update_available: None,
     };
     if r.kind == ResourceKind::Tool {
@@ -874,6 +878,18 @@ fn export_row(
         row.can_add_to_config = !model_paths(r, config)
             .first()
             .is_some_and(|onnx| configured.contains(onnx));
+    } else if !row.busy {
+        // An outdated export, an interrupted one, or files of an earlier version (IR, weights).
+        let left = export::export_leftovers(r, paths, config.cache_dir_path().as_deref());
+        if !left.is_empty() {
+            let blocked = remove_blocked(ctx, r, config, None);
+            row.removable = blocked.is_none();
+            row.remove_blocked = blocked;
+            row.state_text.push_str(&format!(
+                "; {} leftover file(s) of an earlier export on disk (Remove deletes them)",
+                left.len()
+            ));
+        }
     }
     if let Some(why) = unsupported
         && !on_disk
@@ -882,40 +898,4 @@ fn export_row(
         row.state_text = why;
     }
     row
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_rows_marked_recommended_by_size() {
-        use crate::profile::HardwareProfile;
-        let dir = std::env::temp_dir().join(format!("bo_rec_{}", uuid::Uuid::new_v4()));
-        let mut config = Config {
-            download_dir: Some(dir.clone()),
-            hardware_profile: HardwareProfile::Low,
-            ..Config::default()
-        };
-        let rec = |config: &Config, id: &str| {
-            rows(None, config)
-                .into_iter()
-                .find(|r| r.id == id)
-                .map(|r| r.recommended)
-        };
-        // Low: n/s (IPcam YOLOv5 counts as s); runtimes are never marked.
-        assert_eq!(rec(&config, "model:IPcam-general"), Some(true));
-        assert_eq!(rec(&config, "model:rt-detrv2-s"), Some(true));
-        assert_eq!(rec(&config, "model:rt-detrv2-l"), Some(false));
-        assert!(
-            rows(None, &config)
-                .iter()
-                .filter(|r| !matches!(r.kind, "model" | "export-model"))
-                .all(|r| !r.recommended)
-        );
-        config.hardware_profile = HardwareProfile::High;
-        assert_eq!(rec(&config, "model:IPcam-general"), Some(false));
-        assert_eq!(rec(&config, "model:rt-detrv2-l"), Some(true));
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }
