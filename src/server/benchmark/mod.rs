@@ -11,18 +11,24 @@
 //! - `POST /v1/benchmark/settings`: save the form as the `benchmark` config defaults;
 //! - `GET /v1/benchmark/images?model=&device=`: per-image drill-down (ground truth and
 //!   predictions); `GET /v1/benchmark/image?set=&file=`: the image file itself (only files
-//!   listed in the saved results).
+//!   listed in the saved results);
+//! - `GET /v1/benchmark/history[?model=]`, `GET /v1/benchmark/history/compare?model=&a=&b=`,
+//!   `POST /v1/benchmark/history/pin`, `POST /v1/benchmark/history/delete`: the run history
+//!   (`benchmark-history.json`, [`crate::benchmark::history`]).
 //!
 //! The run itself is [`crate::benchmark::service`]. This module keeps the page, the status
 //! (`GET /v1/benchmark`) and the shared form/error helpers; `run` holds the start, settings,
-//! cancel and drill-down endpoints, `apply` the device/threshold apply and threshold search.
+//! cancel and drill-down endpoints, `apply` the device/threshold apply and threshold search,
+//! `history` the run history endpoints.
 
 mod apply;
+mod history;
 mod run;
 
 use apply::BLUE_IRIS_THRESHOLD_NOTE;
 
 pub(super) use apply::{apply, apply_threshold, search_options, threshold_search};
+pub(super) use history::{history_compare, history_delete, history_get, history_pin};
 pub(super) use run::{cancel, image_file, images_detail, settings, start};
 
 use super::{AppState, DevicesSnapshot, devices_snapshot, global_device_label, render};
@@ -460,16 +466,20 @@ pub(super) fn file_stamp(p: &std::path::Path) -> Option<(Option<std::time::Syste
         .map(|m| (m.modified().ok(), m.len()))
 }
 
-/// `results` and `ranking` of `GET /v1/benchmark`: the saved results rebased on the config now.
+/// `results`, `ranking`, `points` and `latest_run_id` of `GET /v1/benchmark`: the saved results
+/// rebased on the config now, with the history-derived fields
+/// ([`crate::benchmark::history::view`]).
 #[derive(Debug, Clone, Default)]
 struct SavedView {
     results: serde_json::Value,
     ranking: serde_json::Value,
+    points: serde_json::Value,
+    latest_run_id: Option<String>,
 }
 
-/// The last [`SavedView`] and what it was computed from: the results and stored-predictions
-/// files' stamps and the config revision with what it says about each model. Polling reads
-/// neither file (tens of MB) again until one of them or the config changes.
+/// The last [`SavedView`] and what it was computed from: the results, stored-predictions and
+/// history files' stamps and the config revision with what it says about each model. Polling
+/// reads none of the files (tens of MB) again until one of them or the config changes.
 type SavedCache = Option<(String, Arc<SavedView>)>;
 static SAVED_CACHE: std::sync::Mutex<SavedCache> = std::sync::Mutex::new(None);
 
@@ -481,16 +491,19 @@ fn saved_view(
     revision: u64,
     now: &HashMap<String, crate::benchmark::current::ModelNow>,
 ) -> Arc<SavedView> {
+    use crate::benchmark::history::{History, history_path, view};
     use crate::benchmark::search::{StoredPreds, preds_path};
     let path = results_path(&state.config_path);
     let preds = preds_path(&state.config_path);
+    let hist = history_path(&path);
     let mut sorted: Vec<_> = now.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     let key = format!(
-        "{}|{:?}|{:?}|{revision}|{sorted:?}",
+        "{}|{:?}|{:?}|{:?}|{revision}|{sorted:?}",
         path.display(),
         file_stamp(&path),
-        file_stamp(&preds)
+        file_stamp(&preds),
+        file_stamp(&hist)
     );
     let mut cache = SAVED_CACHE.lock_recover();
     if let Some((k, v)) = cache.as_ref()
@@ -502,14 +515,21 @@ fn saved_view(
     let view = match BenchmarkResults::load_or_warn(&path) {
         Some(mut r) => {
             let ranking = serde_json::to_value(r.ranking()).unwrap_or_default();
+            let points = serde_json::to_value(r.points()).unwrap_or_default();
             let stored = StoredPreds::load_cached(&preds)
                 .map_err(|e| warn!("{e:#}"))
                 .ok()
                 .flatten();
             crate::benchmark::current::rebase(&mut r, stored.as_deref(), now);
+            // No history file yet: seeded in memory (written by the next run, pin or delete).
+            let history = History::load_or_seed(&hist, Some(&r));
+            let mut results = serde_json::to_value(r.summary()).unwrap_or_default();
+            view::annotate(&mut results, &r, &history);
             SavedView {
-                results: serde_json::to_value(r.summary()).unwrap_or_default(),
+                results,
                 ranking,
+                points,
+                latest_run_id: view::latest_run_id(&r),
             }
         }
         None => SavedView::default(),
@@ -545,6 +565,9 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
             "run": run,
             "results": saved.results,
             "ranking": saved.ranking,
+            "points": saved.points,
+            "latest_run_id": saved.latest_run_id,
+            "noise": crate::benchmark::history::view::noise_json(),
             "resultsFile": path.display().to_string(),
             "config": config,
             "warning": LIVE_WARNING,
@@ -764,7 +787,11 @@ mod tests {
         assert!(html.contains("<option value=\"roc_auc\">"), "{html}");
         assert!(html.contains("<option value=\"youden\">"), "{html}");
         assert!(html.contains("<option value=\"fpr:0.05\">"), "{html}");
-        assert!(js.contains("function rocSvg"));
+        assert!(
+            super::super::pages::static_file("bench-charts.js")
+                .expect("bench-charts.js")
+                .contains("function rocSvg")
+        );
     }
 
     #[tokio::test]

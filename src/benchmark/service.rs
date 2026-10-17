@@ -742,6 +742,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
             nms_iou: ctx.config.nms_iou,
         },
         cache_dir: ctx.config.cache_dir_path(),
+        run_id: super::history::new_run_id(),
     };
     let image_count: usize = sets.iter().map(|s| s.images.len()).sum();
 
@@ -964,6 +965,8 @@ struct ServiceRun<'a> {
     devices: Option<Vec<Device>>,
     params: PostParams,
     cache_dir: Option<PathBuf>,
+    /// The run's id (its start time), stamped on every model result.
+    run_id: String,
 }
 
 impl ServiceRun<'_> {
@@ -1084,7 +1087,9 @@ impl ServiceRun<'_> {
     ) -> Result<ModelResult> {
         let (ctx, req, h) = (self.ctx, self.req, self.h);
         let Some(m) = entry else {
-            let r = ModelResult::failed(name, "", format!("'{name}' is not a configured model"));
+            let mut r =
+                ModelResult::failed(name, "", format!("'{name}' is not a configured model"));
+            r.run_id = Some(self.run_id.clone());
             h.push_done(r.clone());
             return Ok(r);
         };
@@ -1092,7 +1097,8 @@ impl ServiceRun<'_> {
             Ok(j) => j,
             Err(e) => {
                 let path = ctx.config.data_path(&m.path).display().to_string();
-                let r = ModelResult::failed(&m.effective_name(), &path, format!("{e:#}"));
+                let mut r = ModelResult::failed(&m.effective_name(), &path, format!("{e:#}"));
+                r.run_id = Some(self.run_id.clone());
                 h.push_done(r.clone());
                 return Ok(r);
             }
@@ -1116,17 +1122,23 @@ impl ServiceRun<'_> {
             configured,
             threshold_objective: req.threshold_objective,
         };
-        let r = sweep(&bench, &self.runtimes, &job, &opts, &mut |partial| {
+        let run_id = self.run_id.clone();
+        let mut r = sweep(&bench, &self.runtimes, &job, &opts, &mut |partial| {
             overall.runs_done.fetch_add(1, Ordering::Relaxed);
-            h.set_current(partial.summary());
+            let mut p = partial.summary();
+            p.run_id = Some(run_id.clone());
+            h.set_current(p);
         })?;
+        r.run_id = Some(self.run_id.clone());
         h.push_done(r.summary());
         Ok(r)
     }
 
     /// Merge one finished model into the results file (and the stored predictions) as soon as
-    /// it finishes, so a run holds one model's full results at a time (BM-11). `last`: the
-    /// run's last model, whose save also drops the image sets no model refers to any more.
+    /// it finishes, so a run holds one model's full results at a time (BM-11), and record it in
+    /// the run history (a failed model is not recorded; a history problem is only a warning).
+    /// `last`: the run's last model, whose save also drops the image sets no model refers to
+    /// any more.
     fn save(
         &self,
         saver: &mut Saver,
@@ -1146,10 +1158,19 @@ impl ServiceRun<'_> {
         if let Some(w) = BenchmarkResults::merge_warning(prev.as_ref(), &results) {
             self.h.warn(w);
         }
+        // The results before this save seed the history of models that have none yet.
+        let seeds = prev
+            .as_ref()
+            .map(super::history::seed_entries)
+            .unwrap_or_default();
+        let name = results.models.first().map(|m| m.model.clone());
         let mut merged = saver.merge(prev, results, last);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(req.accuracy_metric, req.weights);
         merged.save(&ctx.results_path)?;
+        for w in super::history::record(&ctx.results_path, &seeds, &merged, name.as_slice()) {
+            self.h.warn(w);
+        }
         // The model's entry in `merged` still has its evaluation predictions (not serialized).
         let new = merged
             .models
@@ -1594,6 +1615,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(saved.models.len(), 2);
+        // Both carry the run's id; failed models are not recorded in the history.
+        assert!(saved.models[0].run_id.is_some());
+        assert_eq!(saved.models[0].run_id, saved.models[1].run_id);
+        assert!(
+            !super::super::history::history_path(&dir.join("benchmark.json")).exists(),
+            "failed models make no history"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

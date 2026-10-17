@@ -4,7 +4,7 @@
 use super::*;
 use crate::benchmark::{StageStats, Stats};
 
-pub(super) fn det(label: &str, conf: f32, b: [usize; 4]) -> Detection {
+pub(crate) fn det(label: &str, conf: f32, b: [usize; 4]) -> Detection {
     Detection {
         label: label.into(),
         confidence: conf,
@@ -15,7 +15,7 @@ pub(super) fn det(label: &str, conf: f32, b: [usize; 4]) -> Detection {
     }
 }
 
-pub(super) fn scene() -> Vec<Detection> {
+pub(crate) fn scene() -> Vec<Detection> {
     vec![
         det("dog", 0.90, [0, 0, 100, 100]),
         det("car", 0.80, [200, 200, 300, 300]),
@@ -23,7 +23,7 @@ pub(super) fn scene() -> Vec<Detection> {
     ]
 }
 
-pub(super) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
+pub(crate) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
     let total = Stats {
         min: p50,
         mean: p50,
@@ -66,22 +66,23 @@ pub(super) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
     }
 }
 
-pub(super) fn dev(spec: &str, p50: f64, dets: Vec<Detection>) -> DeviceResult {
+pub(crate) fn dev(spec: &str, p50: f64, dets: Vec<Detection>) -> DeviceResult {
     let d = crate::backend::spec::parse(spec).unwrap();
     DeviceResult::ran(d.device().unwrap(), spec, run(spec, p50, dets))
 }
 
-pub(super) fn failed(spec: &str) -> DeviceResult {
+pub(crate) fn failed(spec: &str) -> DeviceResult {
     let d = crate::backend::spec::parse(spec).unwrap();
     DeviceResult::failed(d.device().unwrap(), spec, "compile failed".into())
 }
 
-pub(super) fn model(devices: Vec<DeviceResult>, configured: Option<&str>) -> ModelResult {
+pub(crate) fn model(devices: Vec<DeviceResult>, configured: Option<&str>) -> ModelResult {
     let mut m = ModelResult {
         model: "m".into(),
         path: "m.onnx".into(),
         family: "yolo5".into(),
         timestamp: now(),
+        run_id: None,
         image: "x".into(),
         datasets: vec!["sample".into()],
         images: 1,
@@ -101,13 +102,13 @@ pub(super) fn model(devices: Vec<DeviceResult>, configured: Option<&str>) -> Mod
     m
 }
 
-pub(super) fn graded(spec: &str, p50: f64, acc: Option<f64>) -> DeviceResult {
+pub(crate) fn graded(spec: &str, p50: f64, acc: Option<f64>) -> DeviceResult {
     let mut d = dev(spec, p50, scene());
     d.run.as_mut().unwrap().grades = Some(Grades::new(acc, p50, Default::default(), false));
     d
 }
 
-pub(super) fn graded_auc(spec: &str, p50: f64, auc: Option<f64>) -> DeviceResult {
+pub(crate) fn graded_auc(spec: &str, p50: f64, auc: Option<f64>) -> DeviceResult {
     let mut d = dev(spec, p50, scene());
     d.run.as_mut().unwrap().grades = Some(Grades::with_metric(
         AccuracyMetric::RocAuc,
@@ -121,7 +122,7 @@ pub(super) fn graded_auc(spec: &str, p50: f64, auc: Option<f64>) -> DeviceResult
 
 /// A run with an accuracy report whose sweep comes from `preds` (confidence, TP) over
 /// `objects` objects.
-pub(super) fn with_sweep(
+pub(crate) fn with_sweep(
     mut d: DeviceResult,
     objects: usize,
     preds: &[(f32, bool)],

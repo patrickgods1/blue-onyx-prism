@@ -15,6 +15,7 @@
 //! letter grades. [`sweep`] runs one model on every chosen device, checks each device's
 //! detections against a CPU reference device and recommends a device ([`report::recommend`]).
 //! [`report`] holds the persisted results (`benchmark.json` next to the config file),
+//! [`history`] the run history beside it (`benchmark-history.json`: what changed between runs),
 //! [`service`] the background run behind `/v1/benchmark`, [`cli`] the command line, and
 //! [`export`] the standalone HTML / Markdown report. [`threshold`] sweeps the confidence
 //! threshold over the same low-threshold predictions (no extra inference) and picks the best
@@ -28,9 +29,11 @@ pub mod cli;
 pub mod current;
 pub mod export;
 pub mod grade;
+pub mod history;
 pub mod images;
 pub mod metrics;
 pub mod report;
+pub mod rescore;
 pub mod roc;
 pub mod search;
 pub mod service;

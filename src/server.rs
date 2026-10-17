@@ -202,6 +202,16 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/v1/benchmark/settings", post(benchmark::settings)),
         ("/v1/benchmark/images", get(benchmark::images_detail)),
         ("/v1/benchmark/image", get(benchmark::image_file)),
+        ("/v1/benchmark/history", get(benchmark::history_get)),
+        (
+            "/v1/benchmark/history/compare",
+            get(benchmark::history_compare),
+        ),
+        ("/v1/benchmark/history/pin", post(benchmark::history_pin)),
+        (
+            "/v1/benchmark/history/delete",
+            post(benchmark::history_delete),
+        ),
     ]
 }
 
@@ -938,6 +948,10 @@ mod tests {
             "/v1/benchmark/settings",
             "/v1/benchmark/images",
             "/v1/benchmark/image",
+            "/v1/benchmark/history",
+            "/v1/benchmark/history/compare",
+            "/v1/benchmark/history/pin",
+            "/v1/benchmark/history/delete",
         ];
         // Static files are open as a group (`/static/*`).
         let is_open = |p: &str| OPEN.contains(&p) || p.starts_with("/static/");
