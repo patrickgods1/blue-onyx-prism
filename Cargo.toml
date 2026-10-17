@@ -1,6 +1,6 @@
 [package]
 name = "blue-onyx-prism"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Blue Iris compatible object detection service on OpenVINO and ONNX Runtime, with hardware-based device selection"
