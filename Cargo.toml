@@ -83,7 +83,7 @@ libloading = "0.9"
 # ONNX Runtime (feature `onnxruntime`): the shared library is loaded at runtime (`load-dynamic`),
 # so nothing is linked or downloaded at build time. All `ort` code lives in src/backend/ort.rs.
 # No `api-NN` feature: any ONNX Runtime 1.17+ library loads (`setup-onnxruntime` pins 1.24.4).
-ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "load-dynamic", "tracing", "cuda", "tensorrt", "directml", "coreml"] }
+ort = { version = "=2.0.0-rc.14", optional = true, default-features = false, features = ["std", "load-dynamic", "tracing", "cuda", "tensorrt", "directml", "coreml"] }
 arc-swap = "1"
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 # The HTTP listener (`server::serve_on`): hyper with a timer, so request-head and idle
