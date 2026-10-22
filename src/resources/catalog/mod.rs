@@ -708,22 +708,36 @@ pub(crate) fn bench_resource(m: &crate::benchmark::images::Manifest) -> Resource
     }
 }
 
-/// The benchmark image sets embedded in this build (`assets/bench/*.json`).
+/// The benchmark image sets embedded in this build (`assets/bench/*.json`). A set that reuses
+/// another set's images (`images_from`, e.g. `exdark-ir`) has no resource of its own: it is
+/// installed by that set's resource (see [`bench_set`]).
 pub(crate) fn bench_sets() -> &'static [Resource] {
     static SETS: std::sync::OnceLock<Vec<Resource>> = std::sync::OnceLock::new();
     SETS.get_or_init(|| {
         crate::benchmark::images::builtin_manifests()
             .iter()
+            .filter(|m| m.images_from.is_none())
             .map(bench_resource)
             .collect()
     })
 }
 
-/// The `bench:<set>` resource.
+/// The `bench:<set>` resource; for a set with `images_from`, the resource of that set.
 pub(crate) fn bench_set(set: &str) -> Option<&'static Resource> {
-    bench_sets()
-        .iter()
-        .find(|r| matches!(r.provides, Provides::BenchImages { set: s } if s.eq_ignore_ascii_case(set.trim())))
+    let set =
+        crate::benchmark::images::builtin_manifest(set).map_or(set.trim(), |m| m.images_set_id());
+    bench_sets().iter().find(
+        |r| matches!(r.provides, Provides::BenchImages { set: s } if s.eq_ignore_ascii_case(set)),
+    )
+}
+
+/// `bench:<set>` of a set that borrows another set's images (`images_from`): the resource that
+/// installs them. None for every other id.
+pub(crate) fn bench_alias(id: &str) -> Option<&'static Resource> {
+    let set = strip_prefix_ci(id.trim(), BENCH_ID_PREFIX)?;
+    crate::benchmark::images::builtin_manifest(set)
+        .filter(|m| m.images_from.is_some())
+        .and_then(|m| bench_set(&m.id))
 }
 
 /// Resources usable on `(os, arch)` (`fetch --all-for-platform`).
@@ -740,7 +754,9 @@ pub fn find(id: &str, os: &str, arch: &str) -> Option<&'static Resource> {
     if let Some(name) = strip_prefix_ci(id, MODEL_ID_PREFIX) {
         return model(name).or_else(|| export_model(name));
     }
-    for_platform(os, arch).find(|r| r.id.eq_ignore_ascii_case(id))
+    for_platform(os, arch)
+        .find(|r| r.id.eq_ignore_ascii_case(id))
+        .or_else(|| bench_alias(id))
 }
 
 /// `s` without `prefix`, compared ASCII case-insensitively.

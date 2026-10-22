@@ -1,0 +1,21 @@
+{
+ "id": "exdark-ir",
+ "title": "ExDark grayscale (NIR proxy)",
+ "description": "The 160 exdark-night images and ground truth, converted after decode to BT.601 luma replicated to three channels (\"transform\": \"grayscale\"). A rough proxy for night IR (near-infrared) monochrome, NOT real IR: IR illumination changes contrast and reflectance (foliage and skin turn bright, fabric differs), which grayscale visible-light photos do not show. Same scored labels and ignore regions as exdark-night; the images are those of exdark-night (downloaded once, into its folder).",
+ "license": "BSD-3-Clause (original ExDark, https://github.com/cs-chan/Exclusively-Dark-Image-Dataset/blob/master/LICENSE); authors ask that commercial use be cleared with Dr. Chee Seng Chan. Roboflow export labelled CC BY 4.0.",
+ "attribution": "ExDark (Exclusively Dark Image Dataset), Yuen Peng Loh and Chee Seng Chan, Universiti Malaya: 'Getting to Know Low-light Images with The Exclusively Dark Dataset', CVIU 178 (2019) 30-42, doi:10.1016/j.cviu.2018.10.010. YOLO export by Roboflow Universe workspace my-workspace-ohnbt (exclusively-dark-image v2), redistributed by dronefreak/ExDark on Hugging Face. Subset selection and class mapping by Blue Onyx Prism.",
+ "source": "https://huggingface.co/datasets/dronefreak/ExDark",
+ "revision": "exdark-night 980c106507f08ce9200b84b8308028eea1f41c97; transform grayscale (BT.601) v1",
+ "scored_labels": [
+  "person",
+  "bicycle",
+  "car",
+  "motorbike",
+  "bus",
+  "dog",
+  "cat"
+ ],
+ "transform": "grayscale",
+ "images_from": "exdark-night",
+ "images": []
+}

@@ -290,6 +290,13 @@ it; every key can also be set in the file.
 | `confidence_threshold` | `0.5` | Default minimum confidence (a request's `min_confidence` > 0 overrides it). Number 0-1. Applies: at once. UI: yes |
 | `nms_iou` | `0.5` | IoU threshold for NMS-based families. Number 0-1. Applies: at once. UI: yes |
 | `object_filter` | `[]` | Only report these labels (case-insensitive); empty = all. List of strings. Applies: at once. UI: yes |
+| `night_confidence_threshold` | `null` | Minimum confidence on night / IR frames (dark: mean luma < 50; IR: monochrome, also tinted); raises, never lowers, the threshold. `null` = off. Number 0-1. Applies: at once. UI: yes (Night / IR) |
+| `label_thresholds` | `{}` | Minimum confidence per label, e.g. `{"person": 0.6}` (case-insensitive). Numbers 0-1. Applies: at once. UI: Models JSON / config file |
+| `night_label_thresholds` | `{}` | Minimum confidence per label on night / IR frames. Numbers 0-1. Applies: at once. UI: yes for `person` (Night / IR) |
+| `person_aspect` | `null` | Allowed width / height of a `person` box, `[min, max]` (suggested `[0.2, 0.9]`); `null` = off. Applies: at once. UI: yes (Night / IR) |
+| `min_box_area_frac` | `null` | Drop boxes smaller than this share of the image area; `null` = off. Number 0-1. Applies: at once. UI: config file |
+| `suppress_overlaps` | `[]` | Drop a box that overlaps another label's box: `[{"drop": "person", "if_overlaps": "potted plant", "iou": 0.5, "night_only": false}]`; fires at IoU >= `iou` or when the other box covers 80% of it. Applies: at once. UI: yes for person / potted plant (Night / IR) |
+| `static_suppression` | off | Suppress a box seen at the same place in many requests of one camera (a rock or plant read as a person): `{"enabled": false, "iou": 0.85, "hits": 5, "window_minutes": 30, "labels": ["person"]}`; a request without the box releases it. The camera is the image file name without its timestamp, else the model and frame size. A person standing perfectly still is suppressed too. Applies: at once. UI: yes (on/off, Night / IR) |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`. Applies: at once. UI: yes (also the Logs page) |
 | `log_timezone` | `"utc"` | Time zone of log timestamps (files, console and the Logs page): `"utc"` (`2026-10-16T00:54:59.580Z`), `"local"` (this computer's zone), an IANA name such as `"America/Los_Angeles"`, or a fixed offset such as `"+08:00"`; others print RFC 3339 with the offset (`2026-10-15T17:54:59.580-07:00`). Applies: at once. UI: yes (a dropdown of UTC, local and common zones; other values set here show as "Custom") |
 | `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout only). Path. Applies: process restart. UI: yes |
@@ -507,6 +514,8 @@ and the default model; every key is in the *Models JSON* under it):
 | `gpu_precision` | `null` | Inference precision on an OpenVINO GPU: `f16` (default) or `f32` (slower; for models that overflow f16). Applies: model reload. UI: Models JSON |
 | `enabled` | `true` | Load and serve this model; disabled models stay in the config but are not loaded. Boolean. Applies: model reload (start or stop). UI: yes (Models card *Load*) |
 | `inflight` | `null` | Concurrent inferences of this model; `null` or `0` = the global `inflight`. Integer 0-64. Applies: restart. UI: no |
+| `night_confidence_threshold`, `person_aspect`, `min_box_area_frac`, `suppress_overlaps`, `static_suppression` | absent | Per-model night / IR rules (see the global keys); absent = the global value, a set value replaces it. Applies: at once. UI: Models JSON |
+| `label_thresholds`, `night_label_thresholds` | absent | Per-model label thresholds, merged over the global ones (this model's entries win; `0` turns a global entry off). Applies: at once. UI: Models JSON |
 
 - Names: `name`, else the file stem. Matching is case-insensitive and a `.onnx`/`.xml` suffix is ignored,
   so `/v1/vision/custom/IPcam-General.onnx` reaches `IPcam-general`.

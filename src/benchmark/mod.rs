@@ -349,7 +349,10 @@ pub(crate) fn frame_classes(map: &ClassMap, allowed: Option<&[String]>) -> Vec<S
 }
 
 /// One image in a class map's label space: ground truth per original object (None = not
-/// scored) and the evaluation input. Applies the set's `scored_labels`.
+/// scored) and the evaluation input. Applies the set's `scored_labels`. A wildlife box the
+/// model cannot score (a raccoon for a COCO model, [`metrics::WILDLIFE`]) adds ignore regions
+/// for the model's animal classes after the mapped boxes, so a `cat` on a raccoon is neither a
+/// hit nor a false positive (and the frame is excluded for those classes).
 pub(crate) fn eval_input(
     map: &ClassMap,
     scored_labels: Option<&[String]>,
@@ -367,8 +370,21 @@ pub(crate) fn eval_input(
             })
         })
         .collect();
+    let mut gt_eval: Vec<GtBox> = mapped.iter().flatten().cloned().collect();
+    for g in gt {
+        for c in map.wildlife_ignore(&g.label) {
+            if ok(c) {
+                gt_eval.push(GtBox {
+                    label: c.to_string(),
+                    bbox: g.bbox,
+                    ignore: true,
+                    crowd: false,
+                });
+            }
+        }
+    }
     let eval = EvalImage {
-        gt: mapped.iter().flatten().cloned().collect(),
+        gt: gt_eval,
         preds: map
             .map_preds(eval_preds)
             .into_iter()
@@ -949,5 +965,99 @@ mod tests {
         };
         assert!(pick_reference(&only, None).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Camera-trap wildlife a model cannot score (raccoon, opossum for a COCO model) is not a
+    /// miss, and an animal-class box on it is neither TP nor FP; a person box on it is still a
+    /// false positive. A model that has the class is scored on it.
+    #[test]
+    fn unscorable_wildlife_is_an_animal_ignore_region() {
+        let g = |l: &str, b: [f32; 4], ignore: bool| GtBox {
+            label: l.into(),
+            bbox: b,
+            ignore,
+            crowd: false,
+        };
+        let p = |l: &str, b: [f32; 4]| PredBox {
+            label: l.into(),
+            confidence: 0.9,
+            bbox: b,
+        };
+        let raccoon = [0.0, 0.0, 100.0, 100.0];
+        let opossum = [200.0, 0.0, 300.0, 100.0];
+        let gt = vec![
+            g("raccoon", raccoon, false),
+            g("Virginia Opossum", opossum, true),
+            g("dog", [400.0, 0.0, 500.0, 100.0], false),
+        ];
+        let preds = vec![
+            p("cat", raccoon),
+            p("dog", opossum),
+            p("person", raccoon),
+            p("dog", [400.0, 0.0, 500.0, 100.0]),
+        ];
+        let scored: Vec<String> = ["person", "car", "dog", "cat", "raccoon"]
+            .map(String::from)
+            .to_vec();
+        let coco = ClassMap::for_model(&crate::model::classes::coco80());
+        let (mapped, eval, allowed) = eval_input(&coco, Some(&scored), &gt, &preds);
+        assert_eq!(
+            allowed.as_deref(),
+            Some(&["car", "cat", "dog", "person"].map(String::from)[..])
+        );
+        assert!(
+            mapped[0].is_none() && mapped[1].is_none(),
+            "raccoon/opossum not scored"
+        );
+        // dog + 2 x (dog, cat) ignore regions (bird/horse/... are not scored on this set).
+        assert_eq!(eval.gt.len(), 5, "{:?}", eval.gt);
+        let (c, _, m) = metrics::image_counts(&eval, 0.5);
+        assert_eq!((c.tp, c.fp, c.fn_), (1, 1, 0), "{m:?}");
+        assert_eq!(m.pred, [None, None, Some(false), Some(true)]);
+        // Frame level: cat and dog are excluded / positive, person is a false alert.
+        let frames = roc::frame_samples(&eval, &frame_classes(&coco, allowed.as_deref()));
+        let classes: Vec<&str> = frames.iter().map(|f| f.class.as_str()).collect();
+        assert_eq!(
+            classes,
+            ["person", "car", "dog"],
+            "cat excluded: only an ignore region"
+        );
+
+        // A model with a raccoon class (all classes) is scored on it: no proxies for raccoon.
+        let mut labels = crate::model::classes::coco80();
+        labels.push("raccoon".into());
+        let all = ClassMap::all_classes(&labels);
+        let (mapped, eval, _) = eval_input(&all, Some(&scored), &gt, &preds);
+        assert_eq!(
+            mapped[0].as_ref().map(|g| g.label.as_str()),
+            Some("raccoon")
+        );
+        assert_eq!(
+            eval.gt.len(),
+            4,
+            "raccoon + dog + opossum's dog/cat regions"
+        );
+        // Models without animal classes get no regions; existing labels are not wildlife.
+        let ipcam = ClassMap::for_model(&["person".into(), "vehicle".into()]);
+        assert!(ipcam.wildlife_ignore("raccoon").is_empty());
+        for l in [
+            "dog",
+            "teddy bear",
+            "baseball bat",
+            "person",
+            "mouse",
+            "car",
+        ] {
+            assert!(!metrics::is_wildlife(l), "{l}");
+        }
+        for l in [
+            "mountain_lion",
+            "Striped Skunk",
+            "Eastern Gray Squirrel",
+            "animal",
+            "black bear",
+        ] {
+            assert!(metrics::is_wildlife(l), "{l}");
+        }
     }
 }

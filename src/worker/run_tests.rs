@@ -491,3 +491,61 @@ fn per_request_failure_keeps_the_model_ready() {
     assert_eq!(h.handle.state.get(), ModelState::Ready);
     h.stop();
 }
+
+/// A 64x48 gray JPEG (an IR frame for [`crate::image_stats`]).
+fn gray_jpeg() -> Vec<u8> {
+    let (w, h) = (64u32, 48u32);
+    let img = RgbImage {
+        width: w,
+        height: h,
+        rgb: (0..w * h).flat_map(|i| [(i % 200) as u8 + 30; 3]).collect(),
+    };
+    crate::image::encode_jpeg(&img, 90).unwrap()
+}
+
+#[test]
+fn night_rules_and_static_memory_apply_in_the_worker() {
+    use crate::model::filters::{FilterRules, SuppressReason};
+    let h = Harness::start(1, Duration::from_secs(30));
+    let mut live = LiveSettings {
+        request_timeout: Duration::from_secs(30),
+        ..LiveSettings::default()
+    };
+    live.filters = FilterRules {
+        night_confidence_threshold: Some(0.95),
+        label_thresholds: [("C1".to_string(), 0.95)].into_iter().collect(),
+        ..FilterRules::default()
+    };
+    live.static_suppression = crate::static_memory::StaticSuppression {
+        enabled: true,
+        hits: 2,
+        labels: vec!["c2".into()],
+        ..Default::default()
+    };
+    assert!(h.handle.set_live(live));
+    // Day frame: c0 (0.9) kept; c1 under its label threshold.
+    h.script.push([det(0, 0), det(1, 0)]);
+    assert_eq!(label(&h.send("a.jpg").wait()), "c0");
+    let r = h.send("a.jpg").wait();
+    assert!(r.success && r.predictions.is_empty(), "{r:?}");
+    // IR frame: the night threshold removes c0.
+    h.script.push([det(0, 0)]);
+    let r = h.send_at(gray_jpeg(), "a.jpg", Instant::now()).wait();
+    assert!(r.success && r.predictions.is_empty(), "{r:?}");
+    // The same c2 box from one camera: reported twice, then static.
+    h.script.push((0..4).map(|_| det(2, 0)));
+    let counts: Vec<usize> = (0..4)
+        .map(|_| {
+            h.send("Driveway.20240101_1200.jpg")
+                .wait()
+                .predictions
+                .len()
+        })
+        .collect();
+    assert_eq!(counts, [1, 1, 0, 0]);
+    let m = &h.handle.metrics;
+    assert_eq!(m.suppressed(SuppressReason::LabelThreshold), 1);
+    assert_eq!(m.suppressed(SuppressReason::NightThreshold), 1);
+    assert_eq!(m.suppressed(SuppressReason::Static), 2);
+    assert!(h.stop() < SOON);
+}

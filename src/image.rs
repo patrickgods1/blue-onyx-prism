@@ -52,6 +52,26 @@ pub struct RgbImage {
     pub rgb: Vec<u8>,
 }
 
+/// BT.601 luma of one RGB8 pixel, `(299 R + 587 G + 114 B) / 1000` rounded half up: exact
+/// integer arithmetic (the weights sum to 1000, so gray stays gray and 255 stays 255).
+pub fn luma601(r: u8, g: u8, b: u8) -> u8 {
+    let y = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b);
+    // At most (1000 * 255 + 500) / 1000 = 255.
+    u8::try_from((y + 500) / 1000).unwrap_or(u8::MAX)
+}
+
+impl RgbImage {
+    /// Replace every pixel by its BT.601 luma ([`luma601`]) in all three channels: a
+    /// monochrome (night IR-like) image in the same RGB8 layout. A trailing partial pixel (a
+    /// malformed buffer) is left as is.
+    pub fn to_gray3(&mut self) {
+        for [r, g, b] in self.rgb.as_chunks_mut::<3>().0 {
+            let y = luma601(*r, *g, *b);
+            (*r, *g, *b) = (y, y, y);
+        }
+    }
+}
+
 /// Error for an image rejected by the decode ceiling (`max_image_pixels`) or a zero size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SizeRejected(pub String);
@@ -410,6 +430,38 @@ mod tests {
             height: h,
             rgb,
         }
+    }
+
+    #[test]
+    fn gray3_is_bt601_luma_in_every_channel() {
+        assert_eq!(luma601(0, 0, 0), 0);
+        assert_eq!(luma601(255, 255, 255), 255);
+        assert_eq!(luma601(77, 77, 77), 77, "gray stays gray");
+        // Pure primaries: 0.299 * 255 = 76.245, 0.587 * 255 = 149.685, 0.114 * 255 = 29.07.
+        assert_eq!(luma601(255, 0, 0), 76);
+        assert_eq!(luma601(0, 255, 0), 150);
+        assert_eq!(luma601(0, 0, 255), 29);
+        // Half-up rounding: 299 * 10 + 587 * 0 + 114 * 5 = 3560 -> 3.56 -> 4.
+        assert_eq!(luma601(10, 0, 5), 4);
+        // Exhaustive against the exact rational value, rounded half up.
+        for r in (0..=255u32).step_by(5) {
+            for g in (0..=255u32).step_by(7) {
+                for b in (0..=255u32).step_by(3) {
+                    let exact = (299 * r + 587 * g + 114 * b) as f64 / 1000.0;
+                    let want = (exact + 0.5).floor() as u8;
+                    assert_eq!(luma601(r as u8, g as u8, b as u8), want, "{r},{g},{b}");
+                }
+            }
+        }
+        let mut img = RgbImage {
+            width: 2,
+            height: 1,
+            rgb: vec![255, 0, 0, 10, 20, 30],
+        };
+        img.to_gray3();
+        // 0.299 * 10 + 0.587 * 20 + 0.114 * 30 = 18.15 -> 18.
+        assert_eq!(img.rgb, [76, 76, 76, 18, 18, 18]);
+        assert_eq!((img.width, img.height), (2, 1));
     }
 
     #[test]

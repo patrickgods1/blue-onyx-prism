@@ -131,6 +131,10 @@ pub struct LiveSettings {
     pub save_ref_image: bool,
     /// How long a request may wait in the queue plus processing.
     pub request_timeout: Duration,
+    /// Night / IR false-positive rules applied before the object filter.
+    pub filters: crate::model::filters::FilterRules,
+    /// Static-box memory settings (the memory itself lives in the worker).
+    pub static_suppression: crate::static_memory::StaticSuppression,
 }
 
 impl LiveSettings {
@@ -149,12 +153,44 @@ impl LiveSettings {
             save_image_path: config.save_image_path.as_deref().map(crate::resolve_path),
             save_ref_image: config.save_ref_image,
             request_timeout: config.request_timeout(),
+            filters: filter_rules(config, m),
+            static_suppression: m
+                .static_suppression
+                .clone()
+                .unwrap_or_else(|| config.static_suppression.clone()),
         }
     }
 
     /// A shareable cell holding `self` (what [`WorkerConfig::live`] and the handle share).
     pub fn shared(self) -> Arc<ArcSwap<LiveSettings>> {
         Arc::new(ArcSwap::from_pointee(self))
+    }
+}
+
+/// The night / IR rules of model `m`: its own values over the global ones; the label maps are
+/// merged (the model's entries win).
+pub fn filter_rules(config: &Config, m: &ModelConfig) -> crate::model::filters::FilterRules {
+    let merged = |global: &std::collections::BTreeMap<String, f32>,
+                  own: &Option<std::collections::BTreeMap<String, f32>>| {
+        let mut out = global.clone();
+        for (k, v) in own.iter().flatten() {
+            out.retain(|g, _| !g.eq_ignore_ascii_case(k));
+            out.insert(k.clone(), *v);
+        }
+        out
+    };
+    crate::model::filters::FilterRules {
+        night_confidence_threshold: m
+            .night_confidence_threshold
+            .or(config.night_confidence_threshold),
+        label_thresholds: merged(&config.label_thresholds, &m.label_thresholds),
+        night_label_thresholds: merged(&config.night_label_thresholds, &m.night_label_thresholds),
+        person_aspect: m.person_aspect.or(config.person_aspect),
+        min_box_area_frac: m.min_box_area_frac.or(config.min_box_area_frac),
+        suppress_overlaps: m
+            .suppress_overlaps
+            .clone()
+            .unwrap_or_else(|| config.suppress_overlaps.clone()),
     }
 }
 
@@ -582,6 +618,7 @@ pub fn spawn_worker_after(
         shutdown,
         consecutive_errors: std::cell::Cell::new(0),
         consecutive_degenerate: std::cell::Cell::new(0),
+        static_memory: std::cell::RefCell::new(crate::static_memory::StaticMemory::new()),
     };
     let name = cfg.name.clone();
     let join = std::thread::Builder::new()
@@ -838,5 +875,45 @@ mod tests {
             "ONNX Runtime CoreML (Apple M1) (not loaded)"
         );
         h.join();
+    }
+
+    #[test]
+    fn live_settings_resolve_night_rules_per_model() {
+        use std::collections::BTreeMap;
+        let mut c = Config {
+            night_confidence_threshold: Some(0.6),
+            label_thresholds: BTreeMap::from([
+                ("Person".to_string(), 0.5),
+                ("car".to_string(), 0.7),
+            ]),
+            person_aspect: Some([0.2, 0.9]),
+            ..Config::default()
+        };
+        c.static_suppression.enabled = true;
+        let plain = ModelConfig::default();
+        let l = LiveSettings::for_model(&c, &plain);
+        assert_eq!(l.filters.night_confidence_threshold, Some(0.6));
+        assert_eq!(l.filters.person_aspect, Some([0.2, 0.9]));
+        assert_eq!(l.filters.label_thresholds.len(), 2);
+        assert!(l.static_suppression.enabled);
+        let own = ModelConfig {
+            night_confidence_threshold: Some(0.8),
+            label_thresholds: Some(BTreeMap::from([("person".to_string(), 0.65)])),
+            suppress_overlaps: Some(Vec::new()),
+            static_suppression: Some(crate::static_memory::StaticSuppression::default()),
+            ..ModelConfig::default()
+        };
+        let l = LiveSettings::for_model(&c, &own);
+        assert_eq!(l.filters.night_confidence_threshold, Some(0.8));
+        // Merged: the model's `person` replaces the global `Person`, `car` stays.
+        assert_eq!(
+            l.filters.label_thresholds,
+            BTreeMap::from([("car".to_string(), 0.7), ("person".to_string(), 0.65)])
+        );
+        assert_eq!(l.filters.person_aspect, Some([0.2, 0.9]));
+        assert!(!l.static_suppression.enabled);
+        // Defaults: nothing to do.
+        assert!(LiveSettings::default().filters.is_noop());
+        assert!(!LiveSettings::default().static_suppression.enabled);
     }
 }

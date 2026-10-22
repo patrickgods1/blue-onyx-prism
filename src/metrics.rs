@@ -1,5 +1,6 @@
 //! Request/latency counters and Prometheus text rendering.
 
+use crate::model::filters::{SuppressCounts, SuppressReason};
 use crate::sync::RwLockExt;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -189,6 +190,9 @@ pub struct ModelMetrics {
     dropped: [AtomicU64; DropReason::ALL.len()],
     /// Requests whose image failed to decode (or was rejected by its size) before inference.
     decode_errors: AtomicU64,
+    /// Detections removed by the night / IR rules and the static-box memory, per
+    /// [`SuppressReason`] (`detections_suppressed_total{reason}`).
+    suppressed: [AtomicU64; SuppressReason::ALL.len()],
     pub inference_ms: Histogram,
     pub process_ms: Histogram,
     pub round_trip_ms: Histogram,
@@ -215,6 +219,7 @@ impl ModelMetrics {
             requests: AtomicU64::new(0),
             dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             decode_errors: AtomicU64::new(0),
+            suppressed: std::array::from_fn(|_| AtomicU64::new(0)),
             inference_ms: Histogram::new(),
             process_ms: Histogram::new(),
             round_trip_ms: Histogram::new(),
@@ -245,6 +250,22 @@ impl ModelMetrics {
     /// stage); rendered as `requests_rejected_total{reason="decode_error"}`, summed over models.
     pub fn record_decode_error(&self) {
         self.decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add one request's suppressed detections.
+    pub fn record_suppressed(&self, counts: &SuppressCounts) {
+        for (r, n) in counts.nonzero() {
+            if let Some(c) = self.suppressed.get(r as usize) {
+                c.fetch_add(u64::from(n), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Detections removed for `reason` so far.
+    pub fn suppressed(&self, reason: SuppressReason) -> u64 {
+        self.suppressed
+            .get(reason as usize)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
     pub fn decode_errors(&self) -> u64 {
@@ -678,6 +699,23 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         }
     }
 
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}detections_suppressed_total Detections removed by the night / IR rules, by reason (night_threshold|label_threshold|aspect|min_area|overlap|static)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}detections_suppressed_total counter");
+    for mm in &models {
+        for reason in SuppressReason::ALL {
+            let _ = writeln!(
+                out,
+                "{PREFIX}detections_suppressed_total{{model=\"{}\",reason=\"{}\"}} {}",
+                escape_label(&mm.name),
+                reason.as_str(),
+                mm.suppressed(reason)
+            );
+        }
+    }
+
     type Getter = fn(&ModelMetrics) -> &Histogram;
     let stats: [(&str, &str, Getter); 3] = [
         ("inference_ms", "Model inference time in ms", |mm| {
@@ -819,6 +857,26 @@ mod tests {
         assert_eq!(t.allow(5 + iv), Some(2));
         assert_eq!(t.allow(5 + iv + 1), None);
         assert_eq!(t.allow(5 + 3 * iv), Some(1));
+    }
+
+    #[test]
+    fn prometheus_suppressed_by_reason() {
+        let m = Metrics::new("0");
+        let mm = m.model("a");
+        let mut c = SuppressCounts::default();
+        c.add(SuppressReason::Static, 2);
+        c.add(SuppressReason::NightThreshold, 1);
+        mm.record_suppressed(&c);
+        mm.record_suppressed(&c);
+        assert_eq!(mm.suppressed(SuppressReason::Static), 4);
+        let text = render_prometheus(&m, &[]);
+        assert!(text.contains("# TYPE blue_onyx_prism_detections_suppressed_total counter"));
+        assert!(text.contains(
+            "blue_onyx_prism_detections_suppressed_total{model=\"a\",reason=\"static\"} 4"
+        ));
+        assert!(text.contains(
+            "blue_onyx_prism_detections_suppressed_total{model=\"a\",reason=\"aspect\"} 0"
+        ));
     }
 
     #[test]

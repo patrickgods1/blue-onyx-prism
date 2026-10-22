@@ -102,6 +102,12 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 - `src/model/` model families: `yolo26` (YOLO26/YOLOv10 end-to-end `[1,300,6]`), `yolo5` (`[1,N,5+C]` + NMS),
   `yolo8` (YOLOv8/9/11/12 `[1,4+C,8400]` + NMS), `detr` (D-FINE: `pixel_values` -> `logits/pred_boxes`), `rfdetr` (same, ImageNet-normalized, COCO-91 head), `rtdetr` (RT-DETRv2, DEIMv2: `images` + i64 `orig_target_sizes`; `labels/boxes/scores`; input size from the model's static dims).
   Preprocess = letterbox (YOLO) or stretch (RT-DETR) to 640x640 RGB f32 0..1, CHW.
+- Night / IR: `image_stats.rs` (per-request `Scene` day|night|ir from a 64x64 sample: IR = chroma or tint spread < 3,
+  dark = BT.601 luma < 50, computed in `prep.rs` after decode), `model/filters.rs` (night/per-label thresholds, person
+  aspect, min area, overlap suppression; all default off, applied in `worker::run::finish` before `to_predictions`),
+  `static_memory.rs` (per-camera static-box suppression, key from the upload file name). Bench sets `exdark-ir`
+  (grayscale transform of exdark-night, `images_from`) and `nir-night` (LILA camera traps, night IR, no persons: person
+  scores only as FP; wildlife GT a model cannot emit becomes an animal ignore region) are opt-in (`DEFAULT_SET_IDS`).
 - `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
   baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;
   a write failure only warns). `ModelResult.run_id` = the run's start time. Pure `comparable`/`compare` (speed counts at

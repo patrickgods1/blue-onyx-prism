@@ -10,6 +10,8 @@
 //! - [`backend`]   runtimes (OpenVINO today), device specs, load plans, inference backends
 //! - [`model`]     model families (yolo26, yolo5, yolo8, rtdetr): pre/post-processing
 //! - [`prep`]      process-wide decode + preprocess pool shared by the workers
+//! - [`image_stats`] cheap per-frame luma / colour statistics and the day / night / IR scene
+//! - [`static_memory`] static-box memory: suppress boxes that repeat at the same place
 //! - [`profile`]   hardware profile (low/mid/high): defaults of the concurrency settings
 //! - [`registry`]  loads all configured models and owns their worker threads
 //! - [`worker`]    per-model inference thread
@@ -62,6 +64,7 @@ pub mod config_merge;
 pub mod config_store;
 pub mod download;
 pub mod image;
+pub mod image_stats;
 pub mod logbuf;
 pub mod metrics;
 pub mod model;
@@ -77,6 +80,7 @@ pub mod service_ctl;
 pub mod setup_onnxruntime;
 pub mod setup_openvino;
 pub mod startup;
+pub mod static_memory;
 pub mod supervisor;
 pub mod sync;
 pub mod system_info;

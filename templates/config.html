@@ -225,6 +225,18 @@
     <p class="muted">Per-model thresholds in the Models tab override the global threshold.</p>
   </fieldset>
 
+  <fieldset class="group" id="night">
+    <legend>Night / IR <span class="tag now">applies now</span></legend>
+    <input type="hidden" name="night_settings" value="1">
+    <label>Night / IR confidence threshold (empty = off) <input type="number" name="night_confidence_threshold" min="0" max="1" step="0.01" value="{{ c.night_confidence_threshold }}" placeholder="off"></label>
+    <label>Night / IR person threshold (empty = off) <input type="number" name="night_person_threshold" min="0" max="1" step="0.01" value="{{ c.night_person_threshold }}" placeholder="off"></label>
+    <label>Person width/height min <input type="number" name="person_aspect_min" min="0" max="20" step="0.01" value="{{ c.person_aspect_min }}" placeholder="off (e.g. 0.2)"></label>
+    <label>Person width/height max <input type="number" name="person_aspect_max" min="0" max="20" step="0.01" value="{{ c.person_aspect_max }}" placeholder="off (e.g. 0.9)"></label>
+    <label class="check"><input type="checkbox" name="drop_person_on_plant"{% if c.drop_person_on_plant %} checked{% endif %}> Drop a person box that overlaps a potted plant box</label>
+    <label class="check"><input type="checkbox" name="static_suppression"{% if c.static_suppression %} checked{% endif %}> Static-box suppression <span class="muted">(a person box at the same place in 5 requests in a row is background; a person standing perfectly still is suppressed too)</span></label>
+    <p class="muted">Night / IR rules apply to dark or monochrome (IR) frames and only remove boxes, never add them. Per-model values (<code>night_confidence_threshold</code>, <code>label_thresholds</code>, <code>night_label_thresholds</code>, <code>person_aspect</code>, <code>min_box_area_frac</code>, <code>suppress_overlaps</code>, <code>static_suppression</code>) go in the Models JSON.</p>
+  </fieldset>
+
   <fieldset class="group" id="logging">
     <legend>Logging and images <span class="tag now">applies now</span></legend>
     <label>Log level

@@ -12,15 +12,18 @@ use super::{
 };
 use crate::api::VisionDetectionResponse;
 use crate::backend::{Backend, Candidate, Completion, DeviceInfo, Runtimes};
+use crate::image_stats::Scene;
 use crate::metrics::{DropReason, ModelMetrics};
+use crate::model::filters::{SuppressCounts, SuppressReason};
 use crate::model::{Family, PostParams};
 use crate::prep::{PrepJob, PrepPool, PrepSpec, Prepared};
 use crate::profile::DeviceTuning;
 use crate::startup::{ModelState, StateHandle};
+use crate::static_memory::StaticMemory;
 use crate::sync::{LockExt, RwLockExt};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Select, TryRecvError};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -62,6 +65,9 @@ pub(super) struct WorkerCtx {
     pub(super) consecutive_errors: Cell<u32>,
     /// Inferences in a row whose outputs were degenerate (see [`outputs_degenerate`]).
     pub(super) consecutive_degenerate: Cell<u32>,
+    /// Static-box memory of this model (kept across live-settings swaps; a reload starts a new
+    /// worker and so an empty memory).
+    pub(super) static_memory: RefCell<StaticMemory>,
 }
 
 /// Inference errors in a row after which the model counts as broken (a reset GPU makes every
@@ -463,6 +469,7 @@ impl WorkerCtx {
                     let Prepared {
                         ctx,
                         img,
+                        stats,
                         decode,
                         preprocess,
                         ..
@@ -478,6 +485,7 @@ impl WorkerCtx {
                         meta,
                         ctx,
                         img,
+                        stats,
                         decode,
                         preprocess,
                         seq,
@@ -821,6 +829,31 @@ impl WorkerCtx {
         }
     }
 
+    /// The night / IR rules ([`crate::model::filters::apply`]), then the static-box memory, on
+    /// one request's detections; adds what each removed to `counts`.
+    fn filter_detections(
+        &self,
+        dets: Vec<crate::model::Detection>,
+        f: &InFlight,
+        scene: Scene,
+        live: &super::LiveSettings,
+        counts: &mut SuppressCounts,
+    ) -> Vec<crate::model::Detection> {
+        let (w, h) = (f.ctx.orig_w, f.ctx.orig_h);
+        let (dets, c) =
+            crate::model::filters::apply(dets, &self.cfg.classes, w, h, scene, &live.filters);
+        *counts = c;
+        let st = &live.static_suppression;
+        let mut memory = self.static_memory.borrow_mut();
+        if !st.enabled && memory.keys() == 0 {
+            return dets;
+        }
+        let key = crate::static_memory::camera_key(&self.cfg.name, &f.meta.image_name, w, h);
+        let (dets, n) = memory.apply(&key, dets, &self.cfg.classes, st, Instant::now());
+        counts.add(SuppressReason::Static, n);
+        dets
+    }
+
     /// Collect `slot`'s finished inference, postprocess on this thread and reply.
     fn finish(&self, eng: &mut Engine, slot: usize, f: InFlight) {
         let name = &self.cfg.name;
@@ -850,18 +883,22 @@ impl WorkerCtx {
             self.stuck_watch(eng).mark(f.submitted.elapsed(), Some(e));
         }
         let mut degenerate = false;
+        let scene = f.stats.scene();
+        let mut suppressed = SuppressCounts::default();
         let result = collected.and_then(|outs| {
             degenerate = outputs_degenerate(&outs);
             let dets = eng.family.postprocess(&outs, &f.ctx, &params);
             eng.backend.recycle(slot, outs);
+            let dets = self.filter_detections(dets?, &f, scene, &live, &mut suppressed);
             let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
             Ok(crate::model::to_predictions(
-                &dets?,
+                &dets,
                 &f.ctx,
                 &self.cfg.classes,
                 filter,
             ))
         });
+        self.metrics.record_suppressed(&suppressed);
         self.note_health(eng, result.as_ref().err(), degenerate);
         let post_d = t.elapsed();
         let process_d = f.decode + f.preprocess + infer_d + post_d;
@@ -877,7 +914,11 @@ impl WorkerCtx {
                     request_id = %f.meta.request_id,
                     image = %f.meta.image_name,
                     size = %format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
+                    scene = %scene,
+                    luma = f64::from(f.stats.mean_luma),
+                    chroma = f64::from(f.stats.chroma_spread.min(f.stats.tint_spread)),
                     count = predictions.len(),
+                    suppressed = %suppressed_summary(&suppressed),
                     detections = %detections_summary(&predictions),
                     slot,
                     queue_ms = millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
@@ -1053,6 +1094,14 @@ fn detections_summary(predictions: &[crate::api::Prediction]) -> String {
     predictions
         .iter()
         .map(|p| format!("{} {:.0}%", p.label, p.confidence * 100.0))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// "night_threshold 2, static 1" (empty when nothing was suppressed), for the request log.
+fn suppressed_summary(c: &SuppressCounts) -> String {
+    c.nonzero()
+        .map(|(r, n)| format!("{} {n}", r.as_str()))
         .collect::<Vec<_>>()
         .join(", ")
 }

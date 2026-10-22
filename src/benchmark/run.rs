@@ -383,10 +383,12 @@ impl<'a> Bench<'a> {
         let t = Instant::now();
         self.report(job, requested, Phase::Warmup, 0, self.warmup, "");
         if self.warmup > 0 {
-            let first = all.first().context("no benchmark images")?.1.bytes()?;
+            let (set, img) = all.first().context("no benchmark images")?;
+            let first = img.bytes()?;
             for i in 0..self.warmup {
                 self.check_cancel()?;
-                pipe.run(&first, false).context("warm-up inference")?;
+                pipe.run(&first, false, set.transform)
+                    .context("warm-up inference")?;
                 self.report(job, requested, Phase::Warmup, i + 1, self.warmup, "");
             }
         }
@@ -425,7 +427,7 @@ impl<'a> Bench<'a> {
                 self.check_cancel()?;
                 let t = Instant::now();
                 let sample = pipe
-                    .run(&bytes, r + 1 == repeat)
+                    .run(&bytes, r + 1 == repeat, set.transform)
                     .with_context(|| format!("image {}", img.file))?;
                 timed.loop_time += t.elapsed();
                 let total = timed.record(bucket, &sample);
@@ -459,11 +461,20 @@ pub(super) struct Pipeline<'j> {
 impl Pipeline<'_> {
     /// One request through the worker's stages, serially, with per-stage timings; with `eval`,
     /// the same outputs are post-processed again at the evaluation threshold (untimed,
-    /// unfiltered).
-    fn run(&mut self, bytes: &[u8], eval: bool) -> Result<Sample> {
+    /// unfiltered). The set's `transform` (an image-set property, not a production stage) is
+    /// applied after decode and is not part of any stage time.
+    fn run(
+        &mut self,
+        bytes: &[u8],
+        eval: bool,
+        transform: Option<images::ImageTransform>,
+    ) -> Result<Sample> {
         let t = Instant::now();
-        let img = crate::image::decode(bytes)?;
+        let mut img = crate::image::decode(bytes)?;
         let decode = ms(t.elapsed());
+        if let Some(tr) = transform {
+            tr.apply(&mut img);
+        }
 
         let t = Instant::now();
         let (chw, ctx) = self.pre.run(&img.rgb, img.width, img.height)?;

@@ -15,6 +15,16 @@
 //!                                "ignore": false, "crowd": false } ] } ] }
 //! ```
 //!
+//! Optional manifest fields:
+//!
+//! - `"transform": "grayscale"`: every image is converted after decode (before preprocessing)
+//!   to its BT.601 luma replicated to three channels ([`crate::image::RgbImage::to_gray3`]),
+//!   a rough proxy for night IR monochrome. Only the pixels the model sees change: downloads,
+//!   SHA-256 checks and the files on disk are those of the source images.
+//! - `"images_from": "<set id>"`: the set reuses another built-in set's images and download
+//!   directory (`bench/<that id>/`, resource `bench:<that id>`). An empty `images` list inherits
+//!   that set's images and ground truth (`exdark-ir` = `exdark-night` + `grayscale`).
+//!
 //! `crowd` marks a COCO `iscrowd` region (it implies `ignore`; detections inside it are
 //! ignored by intersection over the detection's area, like pycocotools).
 //!
@@ -31,7 +41,16 @@ use std::path::{Path, PathBuf};
 
 /// Built-in set ids the project curates (`assets/bench/<id>.json`). An id listed here whose
 /// manifest is not embedded in this build is skipped with a warning.
-pub const KNOWN_SET_IDS: [&str; 3] = ["coco-cctv", "bmd45-cctv", "exdark-night"];
+pub const KNOWN_SET_IDS: [&str; 5] = [
+    "coco-cctv",
+    "bmd45-cctv",
+    "exdark-night",
+    "exdark-ir",
+    "nir-night",
+];
+/// Sets a config without a `benchmark.datasets` key runs. The night/IR sets (`exdark-ir`,
+/// `nir-night`) are opt-in: they add ~68 MB of downloads and ~360 images per model.
+pub const DEFAULT_SET_IDS: [&str; 3] = ["coco-cctv", "bmd45-cctv", "exdark-night"];
 /// Id of the embedded sample image.
 pub const SAMPLE_ID: &str = "sample";
 /// Prefix of a user-directory dataset reference (`dir:/path/to/images`).
@@ -56,7 +75,31 @@ pub const BUILTIN_MANIFESTS: &[(&str, &str)] = &[
         "exdark-night",
         include_str!("../../assets/bench/exdark-night.json"),
     ),
+    (
+        "exdark-ir",
+        include_str!("../../assets/bench/exdark-ir.json"),
+    ),
+    (
+        "nir-night",
+        include_str!("../../assets/bench/nir-night.json"),
+    ),
 ];
+
+/// A per-set pixel transform applied after decode (manifest `transform`, see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageTransform {
+    /// BT.601 luma replicated to three channels (an NIR monochrome proxy).
+    Grayscale,
+}
+
+impl ImageTransform {
+    pub fn apply(self, img: &mut crate::image::RgbImage) {
+        match self {
+            ImageTransform::Grayscale => img.to_gray3(),
+        }
+    }
+}
 
 /// One object of a manifest image.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +158,13 @@ pub struct Manifest {
     /// vehicles only). None = every label.
     #[serde(default)]
     pub scored_labels: Option<Vec<String>>,
+    /// Pixel transform applied to every image after decode (see the module docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<ImageTransform>,
+    /// Built-in set whose images (and download directory) this set reuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images_from: Option<String>,
+    #[serde(default)]
     pub images: Vec<ManifestImage>,
 }
 
@@ -140,28 +190,77 @@ impl Manifest {
     pub fn has_ground_truth(&self) -> bool {
         !self.images.is_empty() && self.images.iter().all(|i| i.objects.is_some())
     }
+
+    /// Id of the set whose download directory holds this set's images: `images_from`, else
+    /// the set itself.
+    pub fn images_set_id(&self) -> &str {
+        match self.images_from.as_deref() {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => &self.id,
+        }
+    }
+}
+
+/// Parse the embedded manifests and resolve `images_from` (an empty `images` list inherits the
+/// source set's images). A set whose source is missing, itself borrowed, or that borrows from
+/// itself is dropped with an error log.
+fn parse_builtins(list: &[(&str, &str)]) -> Vec<Manifest> {
+    let mut out: Vec<Manifest> = list
+        .iter()
+        .filter_map(|(id, json)| match Manifest::parse(json) {
+            Ok(mut m) => {
+                if m.id.is_empty() {
+                    m.id = id.to_string();
+                }
+                Some(m)
+            }
+            Err(e) => {
+                tracing::error!("embedded benchmark manifest {id} is invalid: {e:#}");
+                None
+            }
+        })
+        .collect();
+    let sources: Vec<(String, Option<Vec<ManifestImage>>)> = out
+        .iter()
+        .map(|m| {
+            (
+                m.id.clone(),
+                m.images_from.is_none().then(|| m.images.clone()),
+            )
+        })
+        .collect();
+    out.retain_mut(|m| {
+        let Some(src) = m.images_from.clone() else {
+            return true;
+        };
+        let found = sources
+            .iter()
+            .find(|(id, _)| id.eq_ignore_ascii_case(src.trim()) && !id.eq_ignore_ascii_case(&m.id));
+        match found {
+            Some((id, Some(images))) => {
+                m.images_from = Some(id.clone());
+                if m.images.is_empty() {
+                    m.images = images.clone();
+                }
+                true
+            }
+            _ => {
+                tracing::error!(
+                    "embedded benchmark manifest {} takes its images from '{src}', which is not \
+                     an embedded set with its own images; the set is left out",
+                    m.id
+                );
+                false
+            }
+        }
+    });
+    out
 }
 
 /// The embedded built-in manifests, parsed once.
 pub fn builtin_manifests() -> &'static [Manifest] {
     static M: std::sync::OnceLock<Vec<Manifest>> = std::sync::OnceLock::new();
-    M.get_or_init(|| {
-        BUILTIN_MANIFESTS
-            .iter()
-            .filter_map(|(id, json)| match Manifest::parse(json) {
-                Ok(mut m) => {
-                    if m.id.is_empty() {
-                        m.id = id.to_string();
-                    }
-                    Some(m)
-                }
-                Err(e) => {
-                    tracing::error!("embedded benchmark manifest {id} is invalid: {e:#}");
-                    None
-                }
-            })
-            .collect()
-    })
+    M.get_or_init(|| parse_builtins(BUILTIN_MANIFESTS))
 }
 
 pub fn builtin_manifest(id: &str) -> Option<&'static Manifest> {
@@ -170,9 +269,11 @@ pub fn builtin_manifest(id: &str) -> Option<&'static Manifest> {
         .find(|m| m.id.eq_ignore_ascii_case(id.trim()))
 }
 
-/// Where a built-in set is downloaded to.
+/// Where a built-in set is downloaded to: `<data_root>/bench/<id>/`, or the directory of the
+/// set its images come from (`images_from`).
 pub fn builtin_dir(data_root: &Path, id: &str) -> PathBuf {
-    data_root.join(BENCH_DIR).join(id)
+    let dir_id = builtin_manifest(id).map_or(id, Manifest::images_set_id);
+    data_root.join(BENCH_DIR).join(dir_id)
 }
 
 /// Where the ground truth of a set came from.
@@ -329,6 +430,8 @@ pub struct ImageSet {
     pub ground_truth: GroundTruth,
     /// See [`Manifest::scored_labels`].
     pub scored_labels: Option<Vec<String>>,
+    /// See [`Manifest::transform`]: applied to every image after decode.
+    pub transform: Option<ImageTransform>,
     pub images: Vec<SetImage>,
 }
 
@@ -353,6 +456,7 @@ impl ImageSet {
             source: String::new(),
             ground_truth: GroundTruth::None,
             scored_labels: None,
+            transform: None,
             images: vec![SetImage {
                 file: super::DEFAULT_IMAGE_NAME.into(),
                 path: None,
@@ -380,6 +484,7 @@ impl ImageSet {
             source: String::new(),
             ground_truth: GroundTruth::None,
             scored_labels: None,
+            transform: None,
             images: vec![SetImage {
                 file: path
                     .file_name()
@@ -427,6 +532,7 @@ impl ImageSet {
                 source: m.source.clone(),
                 ground_truth: gt,
                 scored_labels: m.scored_labels.clone(),
+                transform: m.transform,
                 images,
             },
             missing,
@@ -616,6 +722,7 @@ pub fn load_dir(
         source: m.source,
         ground_truth,
         scored_labels: m.scored_labels,
+        transform: m.transform,
         images,
     };
     Ok((set, warnings))
@@ -1085,11 +1192,15 @@ pub fn resolve(refs: &[DatasetRef], data_root: &Path, max_images: usize) -> Resu
                 } else if let Some(m) = builtin_manifest(&id) {
                     let (set, missing) = ImageSet::from_manifest(m, &builtin_dir(data_root, &m.id));
                     if set.images.is_empty() {
-                        out.not_downloaded.push(m.id.clone());
+                        // A set borrowing another's images is fetched as that set.
+                        let dl = m.images_set_id().to_string();
                         out.warnings.push(format!(
-                            "dataset {} is not downloaded (resource bench:{})",
-                            m.id, m.id
+                            "dataset {} is not downloaded (resource bench:{dl})",
+                            m.id
                         ));
+                        if !out.not_downloaded.contains(&dl) {
+                            out.not_downloaded.push(dl);
+                        }
                         continue;
                     }
                     if missing > 0 {
@@ -1542,7 +1653,12 @@ mod tests {
             let r = crate::resources::catalog::bench_set(&m.id).unwrap();
             assert_eq!(r.parts.len(), m.images.len(), "{}", m.id);
             assert_eq!(r.size(), m.size());
-            assert_eq!(r.dest, format!("{BENCH_DIR}/{}", m.id));
+            // A set borrowing another's images is installed by that set's resource.
+            assert_eq!(r.dest, format!("{BENCH_DIR}/{}", m.images_set_id()));
+            assert_eq!(
+                builtin_dir(Path::new("/d"), &m.id),
+                Path::new("/d").join(r.dest)
+            );
             assert!(
                 r.parts
                     .iter()
@@ -1555,12 +1671,26 @@ mod tests {
                     .map(|r| r.id),
                 Some(r.id)
             );
-            // Every label is a COCO-80 label (any spelling), so models map onto it.
+            // Every label is a COCO-80 label (any spelling), so models map onto it, or
+            // camera-trap wildlife (an animal ignore region for models without the class).
+            for l in m.scored_labels.iter().flatten() {
+                let c = super::super::metrics::canonical_label(l);
+                assert!(
+                    coco.contains(&c) || super::super::metrics::is_wildlife(l),
+                    "{}: scored {l}",
+                    m.id
+                );
+            }
             for i in &m.images {
                 assert!(safe_file_name(&i.file));
                 for o in i.objects.iter().flatten() {
                     let c = super::super::metrics::canonical_label(&o.label);
-                    assert!(coco.contains(&c), "{}: {}", m.id, o.label);
+                    assert!(
+                        coco.contains(&c) || super::super::metrics::is_wildlife(&o.label),
+                        "{}: {}",
+                        m.id,
+                        o.label
+                    );
                     assert!(!o.crowd || o.ignore, "a crowd region is an ignore region");
                 }
             }
@@ -1576,5 +1706,91 @@ mod tests {
             .collect();
         assert!(!ignored.is_empty());
         assert!(ignored.iter().all(|o| o.crowd));
+    }
+
+    /// exdark-ir is exdark-night's images and ground truth with the grayscale transform, in
+    /// exdark-night's folder and fetched as `bench:exdark-night`; nir-night is real IR.
+    #[test]
+    fn exdark_ir_borrows_exdark_night() {
+        let night = builtin_manifest("exdark-night").unwrap();
+        let ir = builtin_manifest("exdark-ir").unwrap();
+        assert_eq!(ir.transform, Some(ImageTransform::Grayscale));
+        assert_eq!(ir.images_set_id(), "exdark-night");
+        assert_eq!(ir.images, night.images);
+        assert_eq!(ir.scored_labels, night.scored_labels);
+        assert!(night.transform.is_none());
+        let root = Path::new("/data");
+        assert_eq!(
+            builtin_dir(root, "exdark-ir"),
+            builtin_dir(root, "exdark-night")
+        );
+        let r = crate::resources::catalog::bench_set("exdark-ir").unwrap();
+        assert_eq!(r.id, "bench:exdark-night");
+        assert!(
+            crate::resources::catalog::bench_sets()
+                .iter()
+                .all(|r| r.id != "bench:exdark-ir"),
+            "no resource of its own"
+        );
+        assert_eq!(
+            crate::resources::catalog::find("bench:exdark-ir", "linux", "x86_64").map(|r| r.id),
+            Some("bench:exdark-night")
+        );
+        // Not downloaded: reported as the set that installs it.
+        let empty = std::env::temp_dir().join(format!("bop-ir-{}", uuid::Uuid::new_v4()));
+        let r = resolve(&[DatasetRef::Id("exdark-ir".into())], &empty, 0).unwrap();
+        assert_eq!(r.not_downloaded, ["exdark-night"]);
+        let (set, missing) = ImageSet::from_manifest(ir, &builtin_dir(&empty, &ir.id));
+        assert_eq!(set.transform, Some(ImageTransform::Grayscale));
+        assert_eq!(missing, ir.images.len());
+
+        let nir = builtin_manifest("nir-night").unwrap();
+        assert!(nir.images_from.is_none() && nir.transform.is_none());
+        assert!(nir.images.iter().all(|i| i.tags.iter().any(|t| t == "ir")));
+        assert!(
+            nir.images
+                .iter()
+                .any(|i| i.tags.iter().any(|t| t == "hard-negative"))
+        );
+        // coco-cctv tags its monochrome images.
+        let coco = builtin_manifest("coco-cctv").unwrap();
+        assert!(
+            coco.images
+                .iter()
+                .any(|i| i.tags.iter().any(|t| t == "grayscale"))
+        );
+    }
+
+    #[test]
+    fn images_from_and_transform_are_resolved() {
+        let base = r#"{"id":"a","images":[{"file":"x.jpg","objects":[]}]}"#;
+        let borrow = r#"{"id":"b","images_from":"A","transform":"grayscale","images":[]}"#;
+        let own = r#"{"id":"c","images_from":"a","images":[{"file":"y.jpg"}]}"#;
+        let missing = r#"{"id":"d","images_from":"nope"}"#;
+        let chained = r#"{"id":"e","images_from":"b"}"#;
+        let selfref = r#"{"id":"f","images_from":"f","images":[{"file":"z.jpg"}]}"#;
+        let ms = parse_builtins(&[
+            ("a", base),
+            ("b", borrow),
+            ("c", own),
+            ("d", missing),
+            ("e", chained),
+            ("f", selfref),
+        ]);
+        let ids: Vec<&str> = ms.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        assert_eq!(ms[1].images_from.as_deref(), Some("a"), "canonical id");
+        assert_eq!(ms[1].images, ms[0].images, "inherited");
+        assert_eq!(ms[1].transform, Some(ImageTransform::Grayscale));
+        assert_eq!(ms[2].images[0].file, "y.jpg", "own list kept");
+        assert!(Manifest::parse(r#"{"transform":"sepia","images":[]}"#).is_err());
+
+        let mut img = crate::image::RgbImage {
+            width: 1,
+            height: 1,
+            rgb: vec![255, 0, 0],
+        };
+        ImageTransform::Grayscale.apply(&mut img);
+        assert_eq!(img.rgb, [76, 76, 76]);
     }
 }

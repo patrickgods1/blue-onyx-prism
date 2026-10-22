@@ -112,8 +112,16 @@ fn hashes_urls_and_sizes_are_well_formed() {
             // Hugging Face `onnx-community` exports (D-FINE, RF-DETR) are all `onnx/model.onnx`
             // and get saved under the model's name.
             let hf_export = r.kind == ResourceKind::Model && p.url.ends_with("/onnx/model.onnx");
+            // Bench sets mixing several sources prefix the file name with the source
+            // (`cct-<id>.jpg`) so names from different datasets cannot collide; the extension
+            // may be lower-cased (`.JPG` -> `.jpg`).
+            let url_name = p.url.rsplit('/').next().unwrap_or_default();
+            let prefixed = r.kind == ResourceKind::BenchImages
+                && p.file_name
+                    .to_ascii_lowercase()
+                    .ends_with(&url_name.to_ascii_lowercase());
             assert!(
-                p.url.ends_with(p.file_name) || hf_export,
+                p.url.ends_with(p.file_name) || hf_export || prefixed,
                 "{} vs {}",
                 p.url,
                 p.file_name

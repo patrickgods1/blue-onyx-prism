@@ -1,0 +1,4510 @@
+{
+ "id": "nir-night",
+ "title": "Night IR camera traps (LILA BC)",
+ "description": "203 real night infrared (monochrome) frames from fixed outdoor camera traps, 68.4 MB (68376750 bytes) in total: 13 with vehicles, 30 dogs, 30 cats, 30 raccoons (by first scored class), 20 with only other wildlife (ignore regions) and 80 empty frames (hard negatives: vegetation, rocks, IR glare). Sources: Caltech Camera Traps (162; capture time 20:00-05:00), ENA24-detection (37) and NACTI (4); every frame passes the grayscale (IR) test (chroma spread < 3.0/255). LILA removed images of people from CCT and ENA24 and this build leaves out NACTI's person frames, so there is no person ground truth: person is scored only as false positives (every person box is a false positive). Vehicle (ENA24, NACTI) and car (CCT) boxes are scored as car. Raccoon is scored only for models that have the class; for other models raccoons, like the other wildlife boxes (opossum, skunk, coyote, deer, ...), are ignore regions for their animal classes (a cat box on a raccoon is neither right nor wrong). Camera-trap viewpoints are low and close (not a mounted CCTV view). LILA's empty labels can miss small animals; the empty frames were screened by hand.",
+ "license": "CDLA-Permissive-1.0 (Community Data License Agreement - Permissive, https://cdla.io/permissive-1-0/)",
+ "attribution": "Images and annotations from LILA BC (Labeled Information Library of Alexandria: Biology and Conservation, https://lila.science). Caltech Camera Traps: Sara Beery, Grant Van Horn, Pietro Perona, 'Recognition in Terra Incognita', ECCV 2018 (images courtesy of the USGS and NPS; Justin Brown, Erin Boydston). ENA24-detection: Hayder Yousif, Roland Kays, Zhihai He, 'Dynamic Programming Selection of Object Proposals for Sequence-Level Animal Species Classification in the Wild', IEEE TCSVT 2019. NACTI: Tabak et al., 'Machine learning to classify animal species in camera trap images: Applications in ecology', Methods in Ecology and Evolution 10(4):585-590, 2019. Subset selection, night/IR filtering and label mapping by Blue Onyx Prism.",
+ "source": "https://lila.science (caltech-camera-traps, ena24detection, nacti)",
+ "revision": "cct bboxes 9cc208db67b7, cct labels 976bd9bc9380, ena24 8b426c87c948, nacti bboxes e95ef551f8a4; seed 20261010; excluded 23",
+ "scored_labels": [
+  "person",
+  "car",
+  "dog",
+  "cat",
+  "raccoon"
+ ],
+ "images": [
+  {
+   "file": "cct-5858bfc5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5858bfc5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "c6e8f57dfd0974f8e5514534976189ebba42504d2aa135ad8b60c27dce9405c7",
+   "size": 320798,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5874d74d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5874d74d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "a2b67af9430dca280063b9ebab3b88d3374d9c37e052d9a6af1477a8ff629e4c",
+   "size": 371189,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1026.56, 486.4, 1387.52, 1198.08],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-585a6312-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/585a6312-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "c4e2d5dbba2e731d06ecb26ac0b15d498c9f7236b2a089c6d35aabb2475cf44d",
+   "size": 345982,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [833.57, 445.46, 1156.62, 773.28],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-585a64c5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/585a64c5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "7a33f2a119017f8a53f3d82ef1151b4e7f27873a0610b59dd6f2b7ea0fc2a040",
+   "size": 386306,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1821.89, 519.48, 2014.24, 741.27],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-586936ca-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/586936ca-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "a6c8ca7d7a2a69f686787bf43b244e84fadccc28af55c2c9c47d8b2e8389a16d",
+   "size": 244230,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58910d19-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58910d19-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d3471d28f0fcca844aee36d799b81bf72d05077ee54913bdce952eca60f4cd1b",
+   "size": 383297,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "opossum",
+     "bbox": [1180.16, 1082.88, 1612.8, 1285.12],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-586adf83-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/586adf83-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "02af9cd90d86b8f8b6e9dcb44534d7894b2ed716fbf5b8581ceb8835dc9e19aa",
+   "size": 367871,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58693778-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58693778-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "cfacf51e828f9930914f349bec08f6334d6078c8a8f8dd4deaf7630a9cb0fab8",
+   "size": 340353,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-586fdcb5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/586fdcb5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "93c67e4639fd0254b665f20fd3900b81446b87ce03b86761ef56987dc7bd26b6",
+   "size": 284772,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58a52f65-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58a52f65-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "7f137a36a202d10e0e5e84cf39b507340676965e3c387391d0780bd1e93ebb26",
+   "size": 364687,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [570.88, 581.12, 995.84, 1244.16],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-586ae149-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/586ae149-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "f4c04d104f479de9a06a87c6d12dd0fd22bf81bc2755ffd1b44170fd54dc7981",
+   "size": 348335,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1576.96, 1216.85, 2045.44, 1493.76],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58732e3e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58732e3e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "dabd3f6c187d61b7a8f03423d252308b978d726aadd7527c0cabb7a31d714bd1",
+   "size": 348309,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [744.96, 650.24, 1029.97, 855.04],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-588093aa-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/588093aa-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "2154ea9bfb441f87b271188eb4b1d29c2b11adf04c88dc3c3dceb15ddf422049",
+   "size": 228498,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-588716c3-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/588716c3-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "6371e6c8e703b5435de0695c1adfa872d443f52d08f17631cff5671efaf3fa6c",
+   "size": 339956,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-594b5d90-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/594b5d90-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "3e9484e64a0984c7d21846034b865f8066f81a74f06125fbfc48abea1003e07c",
+   "size": 323348,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "rabbit",
+     "bbox": [1318.62, 1282.89, 1945.45, 1494.0],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-588c122b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/588c122b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "9176c64447e39ed2c62b88b18f55c67b54697c4cfaf1a993c2d5cad3a9dd6491",
+   "size": 233343,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58ac0b6b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58ac0b6b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "5033c3cc0432c861727d903d8822a6ce861003eb0a812838d054d8eeaf923fc3",
+   "size": 342948,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [33.96, 529.92, 821.76, 919.22],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58b821c8-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58b821c8-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "c2c64c8ee6419e12cc715ad5f44a6eac407c976b246c34b7f5a043a1d1722709",
+   "size": 365566,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [593.92, 1185.28, 998.4, 1382.4],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58eacb73-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58eacb73-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "2dd6907a42f3467eec316f983e62f0b702c50d1e4d4512488fbde7d6361d4624",
+   "size": 387979,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [710.4, 462.08, 1100.8, 789.76],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-588dbd3b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/588dbd3b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "4c1fa5037596484943fb5d5ad883b8fb16b30fad574eb70d70537f523482005a",
+   "size": 357892,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58910d70-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58910d70-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "6194ba6a303800839634d8db5b0739ce40e7de2edb83afcef8c255574de5d2af",
+   "size": 363951,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-588f6804-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/588f6804-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "896634e9f590e01b061daff6d24bbf1023bc82435c237da4a8077fa6cd009a3b",
+   "size": 320684,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58ac0e9c-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58ac0e9c-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "0f91bd355042b01f87ad0cf99f0cde87308762f526bbc0ee2564fe69064ded83",
+   "size": 337153,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1335.62, 326.18, 1939.19, 741.28],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58f108d7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58f108d7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "8a685061b53d5d5eb0457da3f1f40235f394c32abfdb52538615aba5aad3fee3",
+   "size": 366449,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1175.04, 583.68, 1313.28, 816.64],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-590d2b26-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/590d2b26-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "1de2f511209ed7b5ef18a5f4906395622c8dd8c986124f22ff627f7309c77335",
+   "size": 379044,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1100.8, 1177.6, 1384.96, 1493.76],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58a1ca2e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58a1ca2e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "54935a1f58d3bdf09633ed0c953b08ac7ac8c4233b1d3ec1068a713bf8cbc31e",
+   "size": 334537,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-594ceceb-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/594ceceb-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "718c299e7e554d32b0669e2186a88e4860b4fa937b8b5d0ce1be3070208704c7",
+   "size": 343819,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "fox",
+     "bbox": [1738.79, 663.72, 2021.44, 1029.65],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-58aa58f3-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58aa58f3-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "23d167ab2ca993020087b888c6b911af0f06251d3fbb59db13ef49e32ec711c6",
+   "size": 384722,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58ac0bef-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58ac0bef-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "265f866b65dee158255d74a25ee5f6283da4b0142ffa6e8b65188b22bbe5b4d7",
+   "size": 336696,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58af74ba-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58af74ba-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "da99e9f4a3028a7ce51cacdacdd70db626fce0ae5694b7db299e45c4c69913cc",
+   "size": 379884,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [650.24, 30.72, 934.4, 673.28],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5903cc68-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5903cc68-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "66a58072787d9ce92cfc25838da34f4193254137e6af993897fae4ef65298ad9",
+   "size": 342795,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1093.12, 586.24, 1379.84, 773.12],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59279af7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59279af7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d32a497a75536281a3cf9dcd5b3d8ec1c777d0b449f22b212fc2c77deebc148d",
+   "size": 338458,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1254.4, 770.56, 1661.44, 1384.96],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58af77b8-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58af77b8-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "fe50c16a5a6e4e49cc9c2c451fb1b422f5af471904e8ce3a2a7e59cc9b1a3ab8",
+   "size": 349761,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58b9d7f6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58b9d7f6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "a70b99936452d928cb91987bb1395def0093846d570db40c3564e63365816593",
+   "size": 378825,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-595ade02-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/595ade02-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "c8114bc103bea8bb00f96e7d219ce32ddd635c5b54508ab008fae979aedc893b",
+   "size": 285333,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "coyote",
+     "bbox": [44.28, 705.16, 815.3, 1093.2],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-58bd1b0b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58bd1b0b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "c9bdf2ffe40ce44692ddcdc0fd726fdd90e1754f5eeb9544e7f18f224c30b6a2",
+   "size": 84943,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58b821b9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58b821b9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "6f17011adfced3c35fbff01c12e71a8d095fbb939ff2b6976c3db1df5ed76fe5",
+   "size": 387548,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [504.32, 732.16, 1090.56, 1331.2],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5903cd44-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5903cd44-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "de7729ed84b506c989845d1260be98960fc6d62c1e16f05caba439c0d14a3102",
+   "size": 389949,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1400.32, 1364.48, 1927.68, 1493.76],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5954a9ba-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5954a9ba-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "7b4ec51308c37f7e3338a935d22f2292f474465345b531b9c9437ee7e14a3412",
+   "size": 303130,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [455.2, 705.08, 1181.59, 1061.5],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58b82084-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58b82084-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "85fdef922b99121e099e2502efd597b65dec1c934f02e8ae2ec6f5a4c44a58b8",
+   "size": 355201,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58bd1c2a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58bd1c2a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "2bac245d237f44b73b8a836e26eec3d566b5004b5b33b5d819ad1273fa02ea27",
+   "size": 363313,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58c34d87-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58c34d87-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "fb22a5e2845f6a3f8e9119a0dcfb9050cd825d0ea858e614508a667c391db196",
+   "size": 268525,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58bd1af3-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58bd1af3-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "451a782116ddd5b949835982f2e8b3f7ee8ba0a745ceeb795304cebfe9ca3caa",
+   "size": 389130,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [762.88, 340.48, 970.24, 698.88],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59199782-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59199782-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "e5f0048b258712c26672f607d0d3fd22cf0d1866883bba5bffe3c1983c367c9a",
+   "size": 386094,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [698.88, 184.32, 936.96, 593.92],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5954ab06-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5954ab06-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "fe2f2995326103e90dd67b43637191b2c28174bd0d7929acad51aa8aef1f5183",
+   "size": 285539,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1407.57, 924.32, 2169.73, 1332.97],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58c7f102-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58c7f102-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "ae3ce477bcc67556e292a4c3a49976ce5665b498ea490cd9563e737b956bbc55",
+   "size": 407462,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-596bda29-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/596bda29-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "caba9d3986be6607c5112f6082940960a7dc91c982a910ad2a47b1db9178e067",
+   "size": 389469,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "rodent",
+     "bbox": [343.22, 1153.89, 859.0, 1383.62],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-58c97b1d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58c97b1d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "cfad36d5116449a586503d279e940d7655278e610be8a91725c8930376560318",
+   "size": 341513,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58c97c14-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58c97c14-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "c91601006632988764401df2e95669941518481bffa41120b362c537e137f725",
+   "size": 342962,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58d6152b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58d6152b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "ed7ed789042d96d5370f82d454008c9e768686c1d376ede544944e4a617c4469",
+   "size": 343832,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [796.16, 284.16, 1304.29, 718.95],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-592de60f-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/592de60f-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "2e95009b632b47457e5d4aec02e062b5e0de009584a8e9438939ba9beaf6e0c8",
+   "size": 366056,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [875.52, 535.04, 1059.84, 814.08],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5971facf-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5971facf-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "36733088f045be2d522ef37a40cdf2cacef7b42d509150a42634bf34895fda65",
+   "size": 358855,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1231.36, 750.08, 1505.28, 1118.72],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58d47bfa-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58d47bfa-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d8bb66792cc9e0fc36221aaf25349fdf0843598d3925c9c134439acee10d1912",
+   "size": 448199,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58d613e2-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58d613e2-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "cf32b830e854d04255676068dc05947731359517fbbf0d11efa1a94677775045",
+   "size": 346839,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58e724cb-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58e724cb-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "b3bc917006faa4676d8f76ab487b53afe48fd93ad683990f91eee2f154c5724e",
+   "size": 358712,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59910497-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59910497-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "1c7000c552ce86aff02c84a531847decaa3cfbecfd6ca4638a4866e781592056",
+   "size": 232638,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "deer",
+     "bbox": [1340.02, 655.01, 1721.02, 987.58],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-58dac07c-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58dac07c-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "5b3ca0a7f5bfcd92dbf0f28b19e18f2d2c57448eed25fbbfe4a5d0da97ac1c10",
+   "size": 277826,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5922ee1b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5922ee1b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "78f5e5a8c01eafbfb6c0e37bac71e43ad2aea505ba87e58faa6ba6a5446b56d0",
+   "size": 369466,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [581.12, 38.4, 1016.32, 645.12],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-592f7033-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/592f7033-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "b8b802f4e9bc985d7bff01407bae3856348c21a43ff7054ee6c2d13b73d7b9bb",
+   "size": 387861,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [138.24, 660.48, 460.8, 913.92],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-599be7b8-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/599be7b8-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "9d8f71a25d60bdd2b38064c9727336cf219e4762b826f293009f0d6c9565bff2",
+   "size": 338750,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:medium",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [805.33, 926.0, 1069.13, 1099.17],
+     "ignore": false
+    },
+    {
+     "label": "raccoon",
+     "bbox": [931.5, 1020.03, 1312.7, 1217.98],
+     "ignore": false
+    },
+    {
+     "label": "raccoon",
+     "bbox": [1699.86, 1137.05, 2048.0, 1382.27],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58e2803d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58e2803d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "90647df17268a92c9da5e0b55caa22fe71027babf6a1e6c699943ced56e71cc8",
+   "size": 359502,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58ede185-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58ede185-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "932a9f99b8ac50ea1e14953a6595cea87ecae9e9c1d71e6537e8e239cc1991b5",
+   "size": 293527,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-592c4bae-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/592c4bae-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "1f5c6219a91e33e475991f0b26cef0d30b272cbd8b5f46a1ccd6044f09fec057",
+   "size": 381083,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [335.36, 732.16, 908.8, 1423.36],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59439c16-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59439c16-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "ad7f5c0ffae6cd481c4e2d84f33837377b695705e9e9118d67615ac430951762",
+   "size": 387488,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [872.96, 552.96, 1320.96, 883.2],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59a17c78-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59a17c78-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "39eec79d1967ca75bb0fb0e20e59aee507e32e2468d61b0c16be0365723e5f8a",
+   "size": 397320,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1362.01, 785.35, 1673.22, 973.91],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-58ede283-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58ede283-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "b93a28161058c72288d1706efef923644b3e5ed46dbbb034943b09484692b43d",
+   "size": 357027,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59973db0-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59973db0-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "3ab37271dd401169322efdcc54536fc711e2b9f0d9c2d3612efcb9c4061c3139",
+   "size": 365001,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "deer",
+     "bbox": [1515.68, 775.32, 1936.0, 1344.98],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-58ff0cb4-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58ff0cb4-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "4f3e9cb98458fd6d955622f45ba5c0f38d7bd02c6379a7b3eb13a897b857970d",
+   "size": 285477,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5900a43f-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5900a43f-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "b1fc1114d865a314281f25b7ba2a62c01a64579124a82f56de63985261bd66ac",
+   "size": 327310,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-58f73fe6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/58f73fe6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "24ab5646432d98d4400cbab03243373a4408386d868d9d046eb8521701a53fb2",
+   "size": 342961,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5971fbc9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5971fbc9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "7bc15e7f9a430b44ee149e2306b0ec55566241890eff2c95d5e25315f8b894c6",
+   "size": 327315,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [30.72, 271.36, 716.8, 788.48],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5965ab07-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5965ab07-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "6cf6b9dc904ec3e78200c2b844219f29d68ea3ad8d0604f999fc77d85561f5da",
+   "size": 331520,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [176.64, 588.8, 540.16, 954.88],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59b12eb6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59b12eb6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "bfce9b03a008c91c4e7bd03525fc9ab8ef29bc0ba03465584d694209bbfc3a62",
+   "size": 158823,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [528.39, 811.39, 617.09, 954.75],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5903ccc9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5903ccc9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "057a44ec40425894835d978d03da06576d530a80b7823eee29af0dba39b30274",
+   "size": 387759,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5906f118-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5906f118-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "9ea28f84243834615f4edad4ac5115b25e3a0f6f518b28777788701fc063adde",
+   "size": 384028,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59a62ca2-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59a62ca2-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "49675ea17c785ad7c283b76cae95bdeab03a35bfabb46e80f5adabc4efc54890",
+   "size": 358466,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "deer",
+     "bbox": [143.85, 709.0, 1234.06, 1347.63],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-590ebcea-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/590ebcea-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d9691e7efd0b6ad8b21b7b730dfef47d9b56bfdd7f7bd747bc50d77823a68a85",
+   "size": 320725,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-598941ef-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/598941ef-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d5f235281a90d7f05a087c1ee28f3393bf419d737b39683cea52ae8236e56404",
+   "size": 347542,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1349.12, 906.24, 1973.76, 1282.56],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5976a2d0-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5976a2d0-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "43a3a23f6927f1924eccde0c97119a7013a6ff9ade4d351fc82a88b45c71f815",
+   "size": 297355,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1710.0, 660.12, 1879.0, 804.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59c99d24-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59c99d24-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "006b255889f47d077d1de78878e07aea33c4913b04ec08ba3e1ac024bf87f646",
+   "size": 367347,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1459.2, 660.48, 1784.32, 878.08],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59136633-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59136633-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "468e7bda1d5439a9c80b0ff87faf0e24c94d5380a246a84dc190699588bd7161",
+   "size": 345832,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59199963-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59199963-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "ae8199624dadd57f12bf02c94589cd50bb302d21df48768fb7189ef58e726536",
+   "size": 221531,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59941f10-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59941f10-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "61287319c569543930139aaec3923d155f5e3ee3f6b7efe8990d5db208af12ea",
+   "size": 322663,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [317.44, 391.68, 1034.24, 847.36],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-599a5b4c-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/599a5b4c-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "98a519f38649482c7e6a2ffd3cdd0c7250476c12aadf89ff622c4833e2a39139",
+   "size": 247743,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [570.88, 983.89, 1569.28, 1493.76],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59ddc0a9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59ddc0a9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "a10e0769747cd30dac48d2a93655de27226c315f57fb885c356149a6588ed685",
+   "size": 342488,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [7.68, 552.96, 284.16, 1443.84],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5938c1bd-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5938c1bd-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "fc3a10544f98d4483a09d8cef7c64ce81214c8cc3ada233cb003bd4c853b0c82",
+   "size": 315147,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59862391-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59862391-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "ea3ae50bd3973a55acdfb3d9e1e0b85200a28026d4505fb8500009fde5a7c602",
+   "size": 318620,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59b4849d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59b4849d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "6424d2eea99c8fb65fd6a1ee4d5c30d11da492bd644b84affa0b5c0f34858e04",
+   "size": 205633,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "fox",
+     "bbox": [1248.3, 514.87, 1821.25, 897.83],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-593d6a35-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/593d6a35-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "726487c4b713c130828e08bdd7445e0178b0398c4c86c0e8e3cfb11240e70a2b",
+   "size": 341097,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-593d6acd-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/593d6acd-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "320553c9bb13522198b242d2bca784ef8d7ff9e37dfbc406fcc370e3333817c5",
+   "size": 343257,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59a629f5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59a629f5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "a799ceff6f514cf195e9c0911b3254c2a5d7c54ffa32ede1053d9299a4079960",
+   "size": 339735,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [819.2, 355.84, 1428.48, 803.84],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59a17b94-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59a17b94-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "32eea3c59fa35846184044cad41dcf78da60539b78e6d42986462466ae40a7e1",
+   "size": 274462,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [893.44, 442.88, 1082.88, 808.96],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59e44027-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59e44027-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "4f940a74071e6f74afddd514808921373be1a3393776b7bd0d2da88cbb40ee37",
+   "size": 364448,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [219.04, 776.0, 612.2, 985.7],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59420ed9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59420ed9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "069813b1f1cd991195ed48f0d9f893da397793a54ca7a4cfab89dea12117e5b3",
+   "size": 68912,
+   "width": 800,
+   "height": 584,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:sd",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5946b7e9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5946b7e9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "b1bcb8c0ec49072544ee660d07550557e8e513eb95a91d58aa89a6f42393b217",
+   "size": 374505,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59cb3783-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59cb3783-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "6d3fa6f47b58e0b339979c5dc48a628974c4e2db89037cce54084f3d8e9cc369",
+   "size": 262147,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "rodent",
+     "bbox": [1624.26, 742.89, 1722.87, 825.6],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-594cea71-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/594cea71-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "e0ca841339e0b0eb32f78d1d21009d4193766582fee0dea1db46eca4bd370145",
+   "size": 94775,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59be424a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59be424a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "77f1f1444af352d0798a55d3a92f94797431843bd21c0297fddc64bddf177ec1",
+   "size": 337417,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [860.16, 299.52, 1489.92, 714.24],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59bac852-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59bac852-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "08ade11b7d98463076fe33a32a64ad989884c07d7dba91fb2cb7ad62692b521a",
+   "size": 364213,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [757.76, 601.6, 1052.16, 796.16],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59f46332-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59f46332-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "35a667bb576975db3c7117f488d24d8defb9fb59b935317f9a4ce7483194061f",
+   "size": 339551,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1203.79, 685.96, 1436.93, 833.91],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-594e7869-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/594e7869-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "24bc7c7e3811dc24de0067619a2766e0274fa765855f5eec202a8fafb2e87951",
+   "size": 322084,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59b4842e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59b4842e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "b45c46172db6ed43ef8d8588b537ac8c651bca62d78c14ff71d0c5e4bd0929b5",
+   "size": 307733,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5950035d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5950035d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "3a3658f91a23d82c49d73f99f1ec88138dea67c3f7ef0155683a7380c7a6a24f",
+   "size": 404616,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59c99c3b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59c99c3b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "75bfd5d017f85d0af37edef131433feba18105f375484545191c7d965de7cbd6",
+   "size": 314798,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1600.0, 1279.0, 1815.0, 1480.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59bac90a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59bac90a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "3ec6b0d6ed667cca5fba4c655fde25afbe6cbf5f30fd7925b4baca01058fb9aa",
+   "size": 331127,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [975.0, 516.71, 1155.24, 636.43],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5a015f0d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a015f0d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "beeebd0ae31f14245a59a029f6842c57b84dbdf0e4aaf71a03aae02ced889161",
+   "size": 318294,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [609.28, 588.8, 860.16, 793.6],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-595003e1-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/595003e1-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "6349e2416d499a25a4537674645daae3ecf5055b1f979f7fad8018df00fbcc4b",
+   "size": 291670,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59d5b567-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59d5b567-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "cbe61c0f9989ada632695b7cb46833186cdfa3d64c7da636f108b40976096a04",
+   "size": 222606,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "deer",
+     "bbox": [898.0, 33.0, 2048.0, 1489.97],
+     "ignore": true
+    },
+    {
+     "label": "deer",
+     "bbox": [165.0, 42.27, 850.83, 814.0],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-59531cd7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59531cd7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "3008c3e8407f0483202918df8b835ee136623c3cd127411617634de35a8466a0",
+   "size": 229833,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59641e4c-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59641e4c-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "ababc793232d75b18f62564bc64bed282d9416e12985ecb8c8f5f8908da51b16",
+   "size": 332176,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59d7513e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59d7513e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "10745c6dcf0054d7e53fe127d545bd29b529cb0bb70b108074b68512848889b9",
+   "size": 252991,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [166.4, 1030.4, 1632.0, 1728.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59ddc124-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59ddc124-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "f6ad55cac93c938b95ac43fd8b5ba5ec08cd5b5be82f13a15812c890126c67ee",
+   "size": 312037,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1377.87, 1110.63, 1666.0, 1337.96],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5a0630bb-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a0630bb-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "84bb74bc8b7e9aac842fc5b20960a9067fb9f3beba7c3f43c6257d1c30fe771a",
+   "size": 364401,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [970.24, 647.68, 1303.04, 880.64],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5965aac1-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5965aac1-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "8c177c013e606b53183d0c6f7543b1cb8b72fa9c2c9f730011f507b671d0e116",
+   "size": 337793,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-596d6525-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/596d6525-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "c8a452effb5365705f6f481d8adc81475edbcd63fb6d1feea54561f050843544",
+   "size": 287325,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5a0c9cac-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a0c9cac-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "5a33647071f489f63aedb45b46eb6ec8979742fd048991a6cc8dc873c3245afc",
+   "size": 294697,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "fox",
+     "bbox": [817.0, 368.0, 1071.71, 700.0],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-59bca5bc-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59bca5bc-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d397ea0a84a99ae93e79a7a4fc101c8e7280327c7ffd820e1ed28c58bb7fb47a",
+   "size": 306143,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-596d6614-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/596d6614-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "9edd0561c77535a10cd7e08c1eaa6534164327b1e4a3fe5d60e7df1ad7be8d0b",
+   "size": 377717,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59e105ae-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59e105ae-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "251b411d7882679ea3bf969e3822dda6a6fa5b1dc06edf5a82d1220c7d5fdadf",
+   "size": 280249,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [2.56, 791.04, 760.32, 1493.76],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59e5e02a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59e5e02a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d9fac62c9896e6956331712d75de989286c8fa3b64f812659d111e3610789b5a",
+   "size": 316022,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [455.68, 1244.16, 857.6, 1489.92],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5a2c83b6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a2c83b6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "bb64d97bc32f5fa5c7bca5d5492ef20504600d7ebede1d0bdf0800ba6ee56060",
+   "size": 368839,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [66.56, 1062.4, 540.16, 1364.48],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59782fd7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59782fd7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "511010f096a5568509a3e0e5fc7c161b49b74f9a1685de6aa3dc4d64dd6e3490",
+   "size": 407577,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-597fef3a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/597fef3a-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "6d19b6f9d69f90b7a270676d424be3fbaec95842e6d2f5adf6edc6e76aa8ed9c",
+   "size": 339865,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5a096946-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a096946-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "0a6ffbfe69d34f950ae7e0e8b2039c6f61e5c39ce1bce9ce631e23b833c976a2",
+   "size": 347572,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [17.92, 980.48, 350.72, 1377.28],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59f2c2e8-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59f2c2e8-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "013e82b818a8f194c592cd1d18fc2ff3bb3eb76c610cc3dec12aa6afca5826f3",
+   "size": 347153,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1482.24, 407.04, 1679.36, 619.52],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3692.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3692.jpg",
+   "sha256": "7c583f0440a5ef16344567884b311cac081cb6229bef05b232dff4c6fb881642",
+   "size": 239401,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1484.22, 939.76, 1832.48, 1045.57],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-598307e5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/598307e5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "117da6a6bbbdb19047da5e326ae1304f08efccdab0f73dc1f752ca26a1c80cf8",
+   "size": 338854,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5a27d7fe-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a27d7fe-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "3de7ada2875e4cfc957347a3e0cc35cc30d5569e4cb6097057a0ffe6a564a495",
+   "size": 255491,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "fox",
+     "bbox": [476.48, 96.03, 1540.48, 1304.03],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-598622cd-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/598622cd-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "7b7db4ee2bdd5538e11496d637aaf0fd667b6168ee417b861bef41b1baac7b38",
+   "size": 329334,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5989451f-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5989451f-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "2f46be87f0401553c747c0b6175a6995387b17f336c1b662de4e532127d55f6f",
+   "size": 361609,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5a096b79-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a096b79-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "7227ea6bccab9e862d405644ba6c2563ca32e97328b4429d4504b58a4119edd5",
+   "size": 339732,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1400.32, 332.8, 1771.52, 686.08],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59f946b5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59f946b5-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "f4c7e0e22d202723ff16c081826731e8058305e199f64e4d36ab857ef0726a79",
+   "size": 365666,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [0.0, 839.68, 166.4, 1134.08],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3739.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3739.jpg",
+   "sha256": "381c1e359422fac6e546f6cf7578f94b6511dcb708477a1ac7381ce0f062ee9a",
+   "size": 385782,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1094.36, 717.67, 1304.31, 1076.9],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59d0e493-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59d0e493-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "f3f9860e416ae28210d3929693ecb8afc1950e2289374f19a2a833c15b7dccac",
+   "size": 308767,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2560.0, 1920.0],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59941df9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59941df9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "bb83b5a216349f524ab4e055ccd5be49ac1eb3960360585e97b4d287c719e75f",
+   "size": 309254,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59941fd9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59941fd9-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "f753ae063e402c68ab243eb493c5847fb18e9def9ac5a79049fe59cfe5f5c32e",
+   "size": 382882,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5a27d9b6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a27d9b6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "2166b711f2e00855acdbfee005f0c04edb31c2f7f63e1bfe5de32cf9b37165d2",
+   "size": 359287,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "rabbit",
+     "bbox": [494.08, 698.88, 829.44, 1103.36],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-59942081-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59942081-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d6b95176cde5607eec53e528c4c15e09a9a698b19d29008ce3355d7b8f7c3745",
+   "size": 409525,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5334.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5334.jpg",
+   "sha256": "9d31263bd59d77abee79c920f335db763ce3aa72ac37f847940df3aadccb3dc3",
+   "size": 259339,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1024.61, 328.85, 1676.29, 1017.47],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59f947f7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59f947f7-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "1210b3702b1cf22419b9e8aa1f8169b798d7f6c84bf0c1af89f558845c7acc27",
+   "size": 389533,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1423.36, 998.4, 1710.08, 1236.48],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3775.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3775.jpg",
+   "sha256": "1bb91754ab67c35480b35f94f1e741d79699e95ca166ef1febadebe2064daf7e",
+   "size": 357109,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [343.02, 762.32, 738.31, 1265.26],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5995ae38-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5995ae38-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "ca42fcbe8832717d85d80bae2495b650b55c412b97087809cb416439900e3222",
+   "size": 307965,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59a179bb-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59a179bb-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "bcdc84b6f6adbd900ed8d89658829eb95857176e8ac7aea640711457c9d0da17",
+   "size": 317362,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5518.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5518.jpg",
+   "sha256": "f3452028849c7248f788f9d821588b550715969e2c2baac9c0ad5e855fd8b53d",
+   "size": 276019,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1.85, 456.24, 631.38, 1050.7],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-6663.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/6663.jpg",
+   "sha256": "24f29ca9b1e38951146ef3e8cede01ac2b99bdc392a9fcb016266537dfa3a024",
+   "size": 329056,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [409.21, 1143.84, 1091.83, 1511.98],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3787.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3787.jpg",
+   "sha256": "78ef089ae3094f166451f0bff3eb13a47c3105aac4ceb8d99f9284ef2065701e",
+   "size": 385679,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1386.1, 719.76, 1627.4, 977.66],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59a30ab6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59a30ab6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "502d76aa41f0581e7a03401d937cc940ce0daab272ae2fcba3720f3726d3067e",
+   "size": 347339,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-2018.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/2018.jpg",
+   "sha256": "c138c499fce32c7b6299829822d248f729f7c09fa0c9cf2bc08d51de0c6f9e14",
+   "size": 217580,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:fhd",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "opossum",
+     "bbox": [1349.29, 751.85, 1916.35, 1043.74],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "nacti-TAG-TC04_11_17_2015_TAG-TC04_0000866.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/nacti-unzipped/part2/sub291/TAG-TC04_11_17_2015_TAG-TC04_0000866.JPG",
+   "sha256": "a8eff092451f7a7435e421ead21670e4facda4a216bb1d639866746870cff558",
+   "size": 779839,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 0.0, 2048.0, 812],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59a7bdfe-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59a7bdfe-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "8cf101c7928d1c77a428aa2554253cf280b06f746607ae1fa61b740a964423dd",
+   "size": 316839,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59a94b59-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59a94b59-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "5138b04c764807918ae8d2c0a7071ab6f9e6b525c4bae06aab65c5d0b3c94d84",
+   "size": 290767,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5548.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5548.jpg",
+   "sha256": "a1a02aa0e89e2a1079ee7ca4eab7e43065e42cb176a47b79d2d899ab34aa81f8",
+   "size": 414382,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [435.2, 935.62, 657.72, 1185.72],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-6712.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/6712.jpg",
+   "sha256": "34653411f4bd7d7add77d08876782d0491ef58994b277a551e5642d8d13a1ddc",
+   "size": 323920,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1053.92, 1120.11, 1192.64, 1329.07],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3856.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3856.jpg",
+   "sha256": "5b46bcc92fa30b26038554c3688f9e446a8ac474d907d34c203a457b76e55c9e",
+   "size": 373153,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [788.08, 1162.28, 1049.43, 1471.99],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59b2e8ff-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59b2e8ff-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "0660ffe3986c3a62054dade0b4afd043b4902b8d93da209ec02436507209f92b",
+   "size": 82355,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59b61694-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59b61694-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "2873d098b689d704b62630e946d9c7aa566ec5e6026e04bcdae3e95b29a5faa8",
+   "size": 323874,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-2122.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/2122.jpg",
+   "sha256": "2a4fa13e56505f66c960e324b6c00e887a851728741561ec7cfe11ebeaae4bd0",
+   "size": 210874,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:fhd",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "opossum",
+     "bbox": [1381.16, 463.19, 1906.02, 938.4],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-59c17802-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59c17802-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "8f7606726232fddebc0755b3b4f7cee74bcfb2ee8ec0bbffb4e18963c5b51708",
+   "size": 408425,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5572.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5572.jpg",
+   "sha256": "3fe0a7e0addd4271d0c79695b5aff763d088e4912d55a06b55dbcd26b3b0295a",
+   "size": 230193,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1754.32, 960.74, 2047.3, 1321.7],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-6758.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/6758.jpg",
+   "sha256": "2c1f0ac8f04f7e1c099ecab49e9c3e6bbb97b2a3efcbefec332f6ef70a676322",
+   "size": 309817,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1656.73, 737.11, 1831.7, 1006.48],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3871.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3871.jpg",
+   "sha256": "60bda556f8a8ee8bdf0a3b0dfa79a3cfd783712511f12d9a29b0ca4bf08914c9",
+   "size": 386839,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [145.87, 793.52, 429.83, 1034.61],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59c31b23-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59c31b23-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "c2b61f1ebe7eec3a53bb07dd0cf646490fd7aaf4557f5052c97d3fff26efd706",
+   "size": 231557,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59cf4730-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59cf4730-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "06ab82a3c94ddf580c2c340609abb8912bc3456ce5c573ef034f8d8aa96526b9",
+   "size": 263122,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "nacti-TAG-TC06_11_17_2015_TAG-TC06_0000848.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/nacti-unzipped/part2/sub291/TAG-TC06_11_17_2015_TAG-TC06_0000848.JPG",
+   "sha256": "7caedab9b69a22f820289da5fbf01b67935310ea13ad651f35a813449cb40a8a",
+   "size": 783247,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [1561, 433, 2048.0, 925],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-5650.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5650.jpg",
+   "sha256": "94b607832c06b7e227a9f7e8929f0af78b8ddc1479f6f4a3fe396cc7800c940b",
+   "size": 273596,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1367.27, 507.14, 1548.45, 683.41],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-6848.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/6848.jpg",
+   "sha256": "22b5b1bc3fffa3321f7454d829e159289a783f565b5b55b2abe772dba2a5beaf",
+   "size": 408937,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [681.47, 747.4, 1085.67, 928.59],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3882.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3882.jpg",
+   "sha256": "f86deb0053f72d4f7c5797f5eadc48a0f69b4a1a45e9bea303ce795a09fc268c",
+   "size": 482469,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [136.14, 1098.77, 589.31, 1499.3],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59d41b2d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59d41b2d-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "86389bc8440aba169e5da0addb043cab12e93c6433b572facb15d96276590be1",
+   "size": 322024,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-3095.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3095.jpg",
+   "sha256": "daa61029a110d9ea61e844073647ea16cbd72f9016955f8df3bcf0a5801ad34c",
+   "size": 531325,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "skunk",
+     "bbox": [293.68, 709.91, 591.26, 941.29],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-59dc2772-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59dc2772-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "814f2da8ab50ed660a8dd12d41856749971a4b0b5555ac079e18857bbb272c59",
+   "size": 354590,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59ddc187-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59ddc187-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "014fed1d47404f88eb4b571c1c4a13806ab04d12ded953e8ad1081fab9a31322",
+   "size": 417679,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5686.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5686.jpg",
+   "sha256": "8ff2db3b12fdc7ebc2d2d4d45d9fd0bedbe74618c19f9a05918171e136289687",
+   "size": 288691,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [754.22, 695.38, 1150.03, 888.36],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-6885.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/6885.jpg",
+   "sha256": "1a87cd46523df23bddc079737440693c8975bffe9565f5594bd91a9c687da671",
+   "size": 396718,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [529.02, 729.35, 779.92, 917.94],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3897.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3897.jpg",
+   "sha256": "19619c0831141299c3fea711bcd9a42c2f423d6d7d72e61e365d2adcb471f65f",
+   "size": 270020,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1032.02, 640.57, 1376.64, 841.24],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59e2a599-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59e2a599-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "404a21aac0997ba7d3c9fdf4f6c367845a7f74312338ea9a0c52af5fbe847e98",
+   "size": 371364,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59e91aa1-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59e91aa1-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "b73483a96ac377987c70299fc921f411eed16bb93dac96b964f8baf69d763e62",
+   "size": 255534,
+   "width": 2560,
+   "height": 1920,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-3615.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3615.jpg",
+   "sha256": "75e47ab991eb39468c6e5c476066023986fcdfd260ebed1deaa744278bde8e39",
+   "size": 418213,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "fox",
+     "bbox": [1558.77, 1036.8, 2046.73, 1463.45],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-59ec5487-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59ec5487-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "9267c145574dd17ad09310db120dbfc199108829e9f1902a85789f1ff34b743e",
+   "size": 51999,
+   "width": 800,
+   "height": 584,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:sd",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5697.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5697.jpg",
+   "sha256": "24c33744b6dc5a2a76bc26f01ceaf7fa281c8051a85911857e58f898187db76e",
+   "size": 308714,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [1006.28, 709.17, 1161.85, 823.39],
+     "ignore": false
+    },
+    {
+     "label": "dog",
+     "bbox": [181.17, 722.95, 358.4, 937.59],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-6897.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/6897.jpg",
+   "sha256": "99c6eb09be39f6b5856c3c4005b44737d157f60c41fcc8e9f2e0f9aba7d43eb2",
+   "size": 406381,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [84.77, 713.96, 550.51, 1114.44],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3913.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3913.jpg",
+   "sha256": "807995cd70c1e82d4d94d47d8d8177426336447a8ae6719cc873040fbf8bb61b",
+   "size": 386409,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1123.73, 688.24, 1361.7, 913.17],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "nacti-TAG-TC30_10_07_2015_TAG-TC30_0000223.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/nacti-unzipped/part2/sub291/TAG-TC30_10_07_2015_TAG-TC30_0000223.JPG",
+   "sha256": "ea37fb9958c3f48eee886dc692dea1289c2159637eef15f1eb237232e77b16d7",
+   "size": 804913,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 171, 170, 421],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59f12a8e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59f12a8e-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "505b8c8228be4009a9f855e4e6526b11ac8359827c415704c55d10d707685152",
+   "size": 363696,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-59f79afc-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59f79afc-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "0961a429ab06fa1169d66ee6d9539715a3bf918e8f36e6d957ed72433e1f7b1e",
+   "size": 364732,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5710.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5710.jpg",
+   "sha256": "02e1fee20e958fbd62ed581c56b8587390bf34e190ecd6f31c2e1314dd59f05d",
+   "size": 309061,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [649.44, 694.56, 923.22, 1109.19],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-6909.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/6909.jpg",
+   "sha256": "a74002f99a9988d8a4513d69ed4707fb806128d96501ffbda003a93ec472b57f",
+   "size": 272963,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1686.6, 644.21, 1920.0, 1023.67],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3922.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3922.jpg",
+   "sha256": "f665cc6287885f83c3a9dca42ce58abfe715912efc6fc9076dd8f4c8f1fb31ba",
+   "size": 240568,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1126.05, 597.13, 1442.31, 775.67],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-59fc7e83-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59fc7e83-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "9896cce64e24a00fc32370fca0d0f87dd64d71f5f87795a561e7ab280fc59c57",
+   "size": 398778,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-7151.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/7151.jpg",
+   "sha256": "029fcd824367b04c6c377fe5a7fed6fa9816676b0914c770ea7d4293bd80413a",
+   "size": 335993,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "coyote",
+     "bbox": [338.42, 733.24, 816.87, 1009.34],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-59ffbbd4-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/59ffbbd4-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "014dda71f1dda6f744d0ecf256d3ea8b8fcb2670929bac700c016a0a1a8b280a",
+   "size": 375418,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "cct-5a0e34b3-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a0e34b3-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "f30d4d4216b1ccbe846ef0d83afd799499ae12e3a42f31ceebfb6295363f3109",
+   "size": 368735,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5778.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5778.jpg",
+   "sha256": "56c31f4613aa6c89d40e097414ccabcb1975c763c10adabce92b8d2177788d8e",
+   "size": 267244,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [236.3, 427.58, 840.85, 1232.99],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-7009.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/7009.jpg",
+   "sha256": "1d4d697fa9e0fcda317e4cb692a48dd483d627ab6f25d48bbf25f201498f446f",
+   "size": 207160,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [1121.38, 625.97, 1509.75, 782.86],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3950.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3950.jpg",
+   "sha256": "e33ec759ff1968e7ba1d2bb0ad2b8b96824c0123d9b2259b47eb583ef5bdbed0",
+   "size": 338509,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [18.39, 1103.42, 523.76, 1502.05],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5a0fd187-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a0fd187-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "d60f7a53b96afc2d03d0a786f3d48da0b47379aa6e1a6b40f7502d6240260fa2",
+   "size": 338754,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "nacti-TAG-TC31_10_01_2015_TAG-TC31_0000523.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/nacti-unzipped/part2/sub291/TAG-TC31_10_01_2015_TAG-TC31_0000523.JPG",
+   "sha256": "294384d5f4b0f87c62cfc2e4efd419da72da29cd73ba663d91604a249cf88c3d",
+   "size": 786121,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "car",
+     "bbox": [0.0, 37, 693, 1434],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5a1caf4b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a1caf4b-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "cd28083e16c0862ad09a36e2ea8152011122d764eeed4bc1e575ed52d2e1cf31",
+   "size": 217040,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-9377.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/9377.jpg",
+   "sha256": "024c259167adab162e52703a15d2b92360fcafaeb7363e7a68a44cbb94883e3e",
+   "size": 360946,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "res:4mp+",
+    "wildlife-only"
+   ],
+   "objects": [
+    {
+     "label": "black bear",
+     "bbox": [1400.34, 552.42, 2046.05, 1349.59],
+     "ignore": true
+    }
+   ]
+  },
+  {
+   "file": "cct-5a230ef6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a230ef6-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "5298f5d07c3e8b52c0021c354f65e26810574313bbf941b2550e2099de2a7200",
+   "size": 354441,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  },
+  {
+   "file": "ena24-5804.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/5804.jpg",
+   "sha256": "18b7765d2de99d11c44ea63638a20762eacdf279abbff28257dec62cd4b0a2fe",
+   "size": 267778,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "dog",
+     "bbox": [0.0, 561.47, 874.33, 1504.73],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-7099.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/7099.jpg",
+   "sha256": "907281bf76de9a0fd7fd1a63e16345db214282b5b4c4e067c62f1e0126cf3554",
+   "size": 250172,
+   "width": 1920,
+   "height": 1080,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:fhd"
+   ],
+   "objects": [
+    {
+     "label": "cat",
+     "bbox": [0.48, 569.0, 352.99, 828.13],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "ena24-3962.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/ena24/images/3962.jpg",
+   "sha256": "b84b169155c59357d4acff976cc5719dca283d18a45fc5709060b5c7c6593626",
+   "size": 492336,
+   "width": 2048,
+   "height": 1536,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "complexity:easy",
+    "res:4mp+"
+   ],
+   "objects": [
+    {
+     "label": "raccoon",
+     "bbox": [1168.9, 974.34, 1340.05, 1087.11],
+     "ignore": false
+    }
+   ]
+  },
+  {
+   "file": "cct-5a2c86f2-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "url": "https://storage.googleapis.com/public-datasets-lila/caltech-unzipped/cct_images/5a2c86f2-23d2-11e8-a6a3-ec086b02610b.jpg",
+   "sha256": "0272acaa4e04beac745d20a93a60800e6d1cb9ffae1eeb349ab70b15cb0c93f8",
+   "size": 346309,
+   "width": 2048,
+   "height": 1494,
+   "tags": [
+    "night",
+    "ir",
+    "grayscale",
+    "cctv",
+    "camera-trap",
+    "empty",
+    "res:4mp+",
+    "hard-negative"
+   ],
+   "objects": []
+  }
+ ]
+}

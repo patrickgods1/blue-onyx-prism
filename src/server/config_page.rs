@@ -54,6 +54,12 @@ pub(super) struct ConfigView {
     models_json: String,
     auto_download: bool,
     allow_large_downloads: bool,
+    night_confidence_threshold: String,
+    night_person_threshold: String,
+    person_aspect_min: String,
+    person_aspect_max: String,
+    drop_person_on_plant: bool,
+    static_suppression: bool,
 }
 
 impl ConfigView {
@@ -61,6 +67,10 @@ impl ConfigView {
         let path = |p: &Option<PathBuf>| {
             p.as_ref()
                 .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
+        let opt = |v: Option<f32>| {
+            v.map(|x| crate::config::clean_f32(x).to_string())
                 .unwrap_or_default()
         };
         Self {
@@ -88,6 +98,12 @@ impl ConfigView {
             models_json: serde_json::to_string_pretty(&c.models).unwrap_or_default(),
             auto_download: c.auto_download,
             allow_large_downloads: c.allow_large_downloads,
+            night_confidence_threshold: opt(c.night_confidence_threshold),
+            night_person_threshold: opt(crate::config_form::night_person_threshold(c)),
+            person_aspect_min: opt(c.person_aspect.map(|[lo, _]| lo)),
+            person_aspect_max: opt(c.person_aspect.map(|[_, hi]| hi)),
+            drop_person_on_plant: crate::config_form::has_plant_rule(c),
+            static_suppression: c.static_suppression.enabled,
         }
     }
 
@@ -105,6 +121,10 @@ impl ConfigView {
                 "allow_remote_admin" if !form.contains_key("access_settings") => {}
                 "allow_remote_admin" => self.allow_remote_admin = v.is_some(),
                 "auto_download" => self.auto_download = v.is_some(),
+                "drop_person_on_plant" | "static_suppression"
+                    if !form.contains_key("night_settings") => {}
+                "drop_person_on_plant" => self.drop_person_on_plant = v.is_some(),
+                "static_suppression" => self.static_suppression = v.is_some(),
                 "allow_large_downloads" => self.allow_large_downloads = v.is_some(),
                 _ => {
                     let Some(v) = v else { continue };
@@ -126,6 +146,10 @@ impl ConfigView {
                         "save_image_max_age_days" => &mut self.save_image_max_age_days,
                         "save_image_max_mb" => &mut self.save_image_max_mb,
                         "intra_threads" => &mut self.intra_threads,
+                        "night_confidence_threshold" => &mut self.night_confidence_threshold,
+                        "night_person_threshold" => &mut self.night_person_threshold,
+                        "person_aspect_min" => &mut self.person_aspect_min,
+                        "person_aspect_max" => &mut self.person_aspect_max,
                         _ => continue,
                     };
                     *slot = v;

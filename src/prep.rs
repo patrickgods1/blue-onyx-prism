@@ -180,6 +180,8 @@ pub struct Prepared {
     pub ctx: PreprocessCtx,
     /// The decoded image, kept only when the job asked for it (`save_image_path`).
     pub img: Option<RgbImage>,
+    /// Scene statistics of the decoded image (a strided sample, see [`crate::image_stats`]).
+    pub stats: crate::image_stats::ImageStats,
     pub decode: Duration,
     pub preprocess: Duration,
 }
@@ -266,6 +268,7 @@ impl PrepPool {
     ) -> Result<Prepared> {
         let t = Instant::now();
         let img = crate::image::decode(image)?;
+        let stats = crate::image_stats::ImageStats::compute(&img);
         let decode = t.elapsed();
         let t = Instant::now();
         let mut chw = tensors.take(spec.tensor_len());
@@ -275,6 +278,7 @@ impl PrepPool {
             chw,
             ctx,
             img: keep_image.then_some(img),
+            stats,
             decode,
             preprocess,
         })

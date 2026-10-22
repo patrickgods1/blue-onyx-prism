@@ -5,6 +5,7 @@
 
 pub mod classes;
 pub mod detr;
+pub mod filters;
 pub mod nms;
 pub mod preprocess;
 pub mod rtdetr;

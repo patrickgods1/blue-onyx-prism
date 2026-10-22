@@ -108,6 +108,68 @@ pub fn species_class(label: &str) -> Option<&'static str> {
         .map(|(class, _)| *class)
 }
 
+/// Words of animal labels that are not COCO classes (camera-trap wildlife: CCT, ENA24, NACTI),
+/// matched like [`SPECIES`]. A ground-truth box of one that the model cannot score is an
+/// ignore region for the model's [`ANIMAL_CLASSES`] (see [`ClassMap::wildlife_ignore`]): a COCO
+/// model that calls a raccoon a cat is neither right nor wrong, while a `person` box on it is
+/// still a false positive.
+pub const WILDLIFE: [&str; 40] = [
+    "animal",
+    "armadillo",
+    "badger",
+    "bear",
+    "beaver",
+    "boar",
+    "bobcat",
+    "chipmunk",
+    "cottontail",
+    "cougar",
+    "coyote",
+    "deer",
+    "elk",
+    "ermine",
+    "fox",
+    "groundhog",
+    "hare",
+    "jackrabbit",
+    "javelina",
+    "lion",
+    "lynx",
+    "marmot",
+    "marten",
+    "mink",
+    "moose",
+    "opossum",
+    "otter",
+    "peccary",
+    "porcupine",
+    "possum",
+    "puma",
+    "rabbit",
+    "raccoon",
+    "rodent",
+    "skunk",
+    "squirrel",
+    "weasel",
+    "wolf",
+    "wolverine",
+    "woodchuck",
+];
+
+/// COCO animal classes a detector may report for a [`WILDLIFE`] animal (`bear` too: a model
+/// scored on bears is scored on bear ground truth and gets no regions for it).
+pub const ANIMAL_CLASSES: [&str; 7] = ["dog", "cat", "bird", "horse", "sheep", "cow", "bear"];
+
+/// `label` names a [`WILDLIFE`] animal (any of its words, split on spaces and hyphens; COCO's
+/// `teddy bear` is not one). `bear` is listed so a COCO model without the `bear` class in its
+/// scored set treats a black bear like other wildlife.
+pub fn is_wildlife(label: &str) -> bool {
+    let l = canonical_label(label);
+    l != "teddy bear"
+        && l.split([' ', '-'])
+            .any(|w| !w.is_empty() && WILDLIFE.contains(&w))
+}
+
 /// IoU thresholds of AP@[0.5:0.95].
 pub const IOU_THRESHOLDS: [f32; 10] = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95];
 /// Detections kept per image and class for AP (COCO `maxDets`).
@@ -280,6 +342,25 @@ impl ClassMap {
     /// Scored class of a model label (None = not scored).
     pub fn pred_class(&self, label: &str) -> Option<&str> {
         self.pred.get(&canonical_label(label)).map(String::as_str)
+    }
+
+    /// The scored classes an unscored wildlife ground-truth box (`label`, see [`WILDLIFE`])
+    /// is an ignore region for: the model's [`ANIMAL_CLASSES`]. Empty when the model scores
+    /// `label` itself (a model with a `raccoon` class is scored on raccoons) or it is not a
+    /// wildlife label.
+    pub fn wildlife_ignore(&self, label: &str) -> Vec<&str> {
+        if self.gt_class(label).is_some() || !is_wildlife(label) {
+            return Vec::new();
+        }
+        ANIMAL_CLASSES
+            .iter()
+            .filter_map(|a| {
+                self.classes
+                    .iter()
+                    .find(|c| c.as_str() == *a)
+                    .map(String::as_str)
+            })
+            .collect()
     }
 
     /// Ground truth in the scored label space (unscored boxes dropped).
