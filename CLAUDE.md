@@ -130,6 +130,12 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   separate `tools/train-env` from `scripts/model-export/locks/train-*.txt`; families YOLO26/11/v8, RF-DETR n..l,
   RT-DETRv2, D-FINE (base pins in `catalog/train.rs`); head rows initialised from the base's COCO rows; static ONNX
   export + ORT check, install, benchmark on the held-out split; docs in `docs/TRAINING.md`.
+  `train import` (`training/import/`: video / image folder / URL via yt-dlp / pinned `import-data:meva-sample` into the
+  dataset folder, scene change + dHash + SigLIP k-center, licence confirmed) and `train autolabel` (`training/autolabel/`:
+  MM-Grounding-DINO + RF-DETR L, Qwen3-VL / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label)
+  are `task::Task`s on the same one-at-a-time queue, recorded in `<training dir>/tasks.json` beside `runs.json`; pins in
+  `catalog/autolabel.rs`. The public night subset (`train-data:lila-night`, 926 MB) and other > 500 MB downloads need
+  `--allow-large` / the page's box / `allow_large_downloads`.
 - `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
   baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;
   a write failure only warns). `ModelResult.run_id` = the run's start time. Pure `comparable`/`compare` (speed counts at

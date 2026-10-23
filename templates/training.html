@@ -92,7 +92,7 @@
   <div class="facts">
     <label>Scene <select name="scene">{% for (v, t) in scenes %}<option value="{{ v }}">{{ t }}</option>{% endfor %}</select></label>
     <label>Classes (comma-separated, head order; empty = all of the export) <input type="text" name="classes" size="40" placeholder="person, car, dog, cat, raccoon"></label>
-    <label class="check"><input type="checkbox" name="public"{% if !public_available %} disabled{% endif %}> Mix in the public night subset (LILA camera traps, CDLA){% if !public_available %} <span class="muted">(not pinned in this build)</span>{% endif %}</label>
+    <label class="check"><input type="checkbox" name="public"{% if !public_available %} disabled{% endif %}> Mix in the public night subset (LILA camera traps, CDLA){% if !public_available %} <span class="muted">(not pinned in this build)</span>{% else if !public_installed %} <span class="muted">(a {{ public_size }} download on the first run)</span>{% endif %}</label>
   </div>
 </div>
 
@@ -141,8 +141,8 @@
     <span class="k">Also benchmark on</span>
     {% for s in extra_sets %}<label class="check"><input type="checkbox" name="benchmark_set" value="{{ s }}"> <code>{{ s }}</code></label>{% endfor %}
   </div>
-  {% if !env_ready && !allow_large %}
-  <label class="check"><input type="checkbox" name="confirm_large"> Download the training environment ({{ env_note }})</label>
+  {% if !allow_large && (!env_ready || (public_available && !public_installed)) %}
+  <label class="check"><input type="checkbox" name="confirm_large"> Download what is missing (over 500 MB):{% if !env_ready %} the training environment ({{ env_note }}){% endif %}{% if !env_ready && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>
   {% endif %}
   <button type="submit">Queue training</button>
 </div>

@@ -15,8 +15,10 @@
 //! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops),
 //!    filter by scene, hold out review frames by camera + day (unless the export already did),
 //!    keep about `negative_share` frames without objects in training, take a validation split
-//!    from the training frames, and repeat the review frames `oversample` times when public
-//!    frames are mixed in. Public frames are only ever trained on.
+//!    of `val_share` of the review training frames (never a class's last training box), and
+//!    repeat the review frames `oversample` times when public frames are mixed in. Public frames
+//!    are only ever trained on. Seeded choices rank a frame by its path relative to its source
+//!    folder, so the plan is the same wherever the folders are (reproducible runs).
 //! 3. **Write** ([`write`]): `images/` + `labels/` (hard links, else copies), `classes.txt`,
 //!    `train.txt` / `valid.txt`, `data.yaml` (Ultralytics), `train.coco.json` /
 //!    `valid.coco.json` (category ids 0..C-1, for RF-DETR and transformers), the held-out set as
@@ -25,7 +27,7 @@
 use crate::benchmark::images::{self, Manifest};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Which frames a run trains on, by scene.
@@ -320,8 +322,8 @@ fn meta_from_name(stem: &str) -> Meta {
 }
 
 /// Tags of every image in a `manifest.json` of the folder (or its `benchmark/`), by file name.
-fn manifest_meta(dir: &Path) -> HashMap<String, Meta> {
-    let mut out = HashMap::new();
+fn manifest_meta(dir: &Path) -> BTreeMap<String, Meta> {
+    let mut out = BTreeMap::new();
     for p in [
         dir.join("manifest.json"),
         dir.join("benchmark").join("manifest.json"),
@@ -341,7 +343,7 @@ fn manifest_meta(dir: &Path) -> HashMap<String, Meta> {
     out
 }
 
-fn list_file(dir: &Path, names: &[&str]) -> Option<HashSet<String>> {
+fn list_file(dir: &Path, names: &[&str]) -> Option<BTreeSet<String>> {
     names.iter().find_map(|n| {
         let text = std::fs::read_to_string(dir.join(n)).ok()?;
         Some(
@@ -636,6 +638,18 @@ pub fn mapped_boxes<'a>(
     })
 }
 
+/// The stable identity of a frame for the plan's seeded choices: its image path relative to its
+/// source folder, with `/` separators. Never the absolute path: the plan must not change when
+/// the export folder moves (or a test runs in a fresh temporary folder), so that a run is
+/// reproducible.
+fn frame_key(s: &Source, f: &Frame) -> String {
+    let rel = f.image.strip_prefix(&s.dir).unwrap_or(&f.image);
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Decide the splits (see the module docs). Pure and deterministic for a given `seed`.
 pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     // 1. Classes.
@@ -705,6 +719,13 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         }
     }
     let frame = |r: FrameRef| -> Option<&Frame> { sources.get(r.0)?.frames.get(r.1) };
+    let key_of = |r: FrameRef| -> String {
+        sources
+            .get(r.0)
+            .zip(frame(r))
+            .map(|(s, f)| frame_key(s, f))
+            .unwrap_or_default()
+    };
     let positive = |r: FrameRef| -> bool {
         frame(r).is_some_and(|f| mapped_boxes(f, opts, &p.classes).next().is_some())
     };
@@ -743,7 +764,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                 held_groups.push((*k).clone());
             }
             p.stats.heldout_groups = held_groups;
-            let held_set: HashSet<FrameRef> = held.iter().copied().collect();
+            let held_set: BTreeSet<FrameRef> = held.iter().copied().collect();
             let rest = review
                 .iter()
                 .copied()
@@ -758,14 +779,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                     .into(),
             );
             let mut v = review.clone();
-            v.sort_by_key(|r| {
-                rank(
-                    opts.seed,
-                    &frame(*r)
-                        .map(|f| f.image.display().to_string())
-                        .unwrap_or_default(),
-                )
-            });
+            v.sort_by_key(|r| rank(opts.seed, &key_of(*r)));
             let n = share_of(v.len(), opts.heldout_share)
                 .max(1)
                 .min(v.len().saturating_sub(1));
@@ -799,10 +813,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             let f = frame(*r);
             (
                 !f.is_some_and(|f| f.hard_negative),
-                rank(
-                    opts.seed,
-                    &f.map(|f| f.image.display().to_string()).unwrap_or_default(),
-                ),
+                rank(opts.seed, &key_of(*r)),
             )
         });
         p.stats.negatives_dropped = neg.len() - want_neg;
@@ -819,15 +830,12 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     }
     let mut pool: Vec<FrameRef> = pos.into_iter().chain(neg).collect();
     pool.sort_unstable();
-    // 5. Validation: from the review frames of the pool when there are any.
-    let key = |r: &FrameRef| {
-        rank(
-            opts.seed ^ 0x5eed,
-            &frame(*r)
-                .map(|f| f.image.display().to_string())
-                .unwrap_or_default(),
-        )
-    };
+    // 5. Validation (the trainer's checkpoint choice): `val_share` of the review frames of the
+    // pool when there are any (else of the pool), never a frame holding the last training box of
+    // a class (so at least one positive frame stays in training). The size is a share of the
+    // frames it is taken from: a share of the whole pool, public frames included, once took
+    // every review frame, so a class only the review frames have was never trained.
+    let key = |r: &FrameRef| rank(opts.seed ^ 0x5eed, &key_of(*r));
     let mut cands: Vec<FrameRef> = pool
         .iter()
         .copied()
@@ -837,24 +845,41 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         cands = pool.clone();
     }
     cands.sort_by_key(key);
-    let n_val = if pool.len() >= 2 {
-        share_of(pool.len(), opts.val_share).clamp(1, pool.len() - 1)
+    let n_val = if cands.len() >= 2 {
+        share_of(cands.len(), opts.val_share).clamp(1, cands.len() - 1)
     } else {
         0
     };
-    // Keep at least one positive frame in training.
+    let boxes_per_class = |r: FrameRef| -> Vec<usize> {
+        let mut n = vec![0usize; p.classes.len()];
+        if let Some(f) = frame(r) {
+            for (i, _) in mapped_boxes(f, opts, &p.classes) {
+                if let Some(c) = n.get_mut(i) {
+                    *c += 1;
+                }
+            }
+        }
+        n
+    };
+    let mut left = vec![0usize; p.classes.len()];
+    for &r in &pool {
+        for (l, n) in left.iter_mut().zip(boxes_per_class(r)) {
+            *l += n;
+        }
+    }
     let mut valid: Vec<FrameRef> = Vec::new();
     for r in cands {
         if valid.len() >= n_val {
             break;
         }
-        let left_pos = pool
-            .iter()
-            .filter(|x| **x != r && !valid.contains(x) && positive(**x))
-            .count();
-        if left_pos > 0 {
-            valid.push(r);
+        let need = boxes_per_class(r);
+        if need.iter().zip(&left).any(|(n, l)| *n > 0 && l <= n) {
+            continue;
         }
+        for (l, n) in left.iter_mut().zip(&need) {
+            *l -= n;
+        }
+        valid.push(r);
     }
     valid.sort_unstable();
     if valid.is_empty() {
@@ -863,7 +888,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                 .into(),
         );
     }
-    let val_set: HashSet<FrameRef> = valid.iter().copied().collect();
+    let val_set: BTreeSet<FrameRef> = valid.iter().copied().collect();
     let mixed = !public.is_empty();
     for r in pool.into_iter().filter(|r| !val_set.contains(r)) {
         let is_public = sources.get(r.0).is_some_and(|s| s.public.is_some());
@@ -894,12 +919,43 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     } else {
         valid
     };
-    for c in &p.classes {
-        if !p.stats.train_boxes.contains_key(c) {
-            p.warnings.push(format!(
-                "class '{c}' has no training box: the model cannot learn it"
-            ));
+    let mut heldout_boxes: BTreeMap<&str, usize> = BTreeMap::new();
+    for &r in &p.heldout {
+        if let Some(f) = frame(r) {
+            for (i, _) in mapped_boxes(f, opts, &p.classes) {
+                if let Some(c) = p.classes.get(i) {
+                    *heldout_boxes.entry(c.as_str()).or_default() += 1;
+                }
+            }
         }
+    }
+    for c in &p.classes {
+        if p.stats.train_boxes.contains_key(c) {
+            continue;
+        }
+        p.warnings.push(match heldout_boxes.get(c.as_str()) {
+            Some(n) if hinted => format!(
+                "class '{c}' has no training box: its {n} box(es) are only in the held-out split \
+                 (the export's val split: cameras and days held out for the benchmark), so the \
+                 model cannot learn it; export again and hold out other cameras or days (Review \
+                 page export: holdout cameras / days), or review frames with it from the \
+                 training cameras and days"
+            ),
+            Some(n) => format!(
+                "class '{c}' has no training box: its {n} box(es) are only in the held-out \
+                 frames{}, so the model cannot learn it; review frames with it from other \
+                 cameras or days, or hold out fewer frames (training.heldout_share)",
+                if p.stats.heldout_groups.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", p.stats.heldout_groups.join(", "))
+                }
+            ),
+            None => format!(
+                "class '{c}' has no training box: no frame has a box of it (after the scene \
+                 filter), so the model cannot learn it; review frames with it or drop the class"
+            ),
+        });
     }
     Ok(p)
 }
@@ -1001,8 +1057,8 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
             .ok_or_else(|| anyhow::anyhow!("plan refers to a missing frame {r:?}"))
     };
     // Unique file names: `<source>-<name>`.
-    let mut names: HashMap<FrameRef, String> = HashMap::new();
-    let mut used: HashSet<String> = HashSet::new();
+    let mut names: BTreeMap<FrameRef, String> = BTreeMap::new();
+    let mut used: BTreeSet<String> = BTreeSet::new();
     let mut name_of = |r: FrameRef, f: &Frame| -> String {
         if let Some(n) = names.get(&r) {
             return n.clone();
@@ -1024,7 +1080,7 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         names.insert(r, n.clone());
         n
     };
-    let mut sizes: HashMap<FrameRef, (u32, u32)> = HashMap::new();
+    let mut sizes: BTreeMap<FrameRef, (u32, u32)> = BTreeMap::new();
     let mut size_of = |r: FrameRef, f: &Frame| -> Result<(u32, u32)> {
         if let Some(s) = sizes.get(&r) {
             return Ok(*s);
@@ -1043,8 +1099,8 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
             .map(|(i, b)| yolo_line(i, b))
             .collect()
     };
-    let mut written: HashSet<FrameRef> = HashSet::new();
-    let put = |r: FrameRef, f: &Frame, n: &str, written: &mut HashSet<FrameRef>| -> Result<()> {
+    let mut written: BTreeSet<FrameRef> = BTreeSet::new();
+    let put = |r: FrameRef, f: &Frame, n: &str, written: &mut BTreeSet<FrameRef>| -> Result<()> {
         if written.insert(r) {
             link_or_copy(&f.image, &out.join("images").join(n))?;
             let txt = out

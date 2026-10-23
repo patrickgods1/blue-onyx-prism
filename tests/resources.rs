@@ -149,10 +149,22 @@ fn url_check_covers_the_training_pins() {
     }
     let lila = catalog::lila_night().expect("the night training subset is pinned");
     assert!(ids.contains(lila.id), "{} is not URL-checked", lila.id);
+    for r in catalog::AUTOLABEL_WEIGHTS
+        .iter()
+        .chain(catalog::IMPORT_DATASETS)
+    {
+        assert!(ids.contains(r.id), "{} is not URL-checked", r.id);
+    }
+    assert!(!catalog::AUTOLABEL_WEIGHTS.is_empty() && !catalog::IMPORT_DATASETS.is_empty());
     assert!(catalog::all().all(|r| ids.contains(r.id)));
-    // The training pins: well-formed like the rest of the catalog.
+    // The training, labeler and footage pins: well-formed like the rest of the catalog.
     let mut files = BTreeSet::new();
-    for r in catalog::TRAIN_BASE_WEIGHTS.iter().chain([lila]) {
+    for r in catalog::TRAIN_BASE_WEIGHTS
+        .iter()
+        .chain([lila])
+        .chain(catalog::AUTOLABEL_WEIGHTS)
+        .chain(catalog::IMPORT_DATASETS)
+    {
         assert!(!r.parts.is_empty(), "{}", r.id);
         assert!(!r.dest.is_empty() && !r.dest.starts_with('/') && !r.dest.contains(".."));
         for p in r.parts {
@@ -170,6 +182,11 @@ fn url_check_covers_the_training_pins() {
             assert_eq!(p.layout, Layout::File, "{}", p.url);
             assert!(p.archive.is_none(), "{}", p.url);
             assert!(!p.file_name.contains('/') && !p.file_name.contains('\\'));
+            if r.id.starts_with(catalog::AUTOLABEL_PREFIX)
+                || r.id.starts_with(catalog::IMPORT_DATA_PREFIX)
+            {
+                assert!(p.url.ends_with(p.file_name), "{}", p.url);
+            }
             assert!(
                 files.insert((r.id, p.file_name)),
                 "duplicate {}",

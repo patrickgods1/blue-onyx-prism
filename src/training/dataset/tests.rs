@@ -305,17 +305,31 @@ fn writes_yolo_coco_and_a_loadable_heldout_set() {
         serde_json::from_slice(&std::fs::read(dir.join("train.coco.json")).unwrap()).unwrap();
     let images_json = coco["images"].as_array().unwrap();
     assert_eq!(images_json.len(), p.train.len());
-    let first_cat = coco["annotations"]
+    // A specific frame: the first training frame `<cam>-<day>-0.jpg` (one cat box). Frames
+    // `-1` also hold a cat box 12.8 px wide, so the box is looked up by its image, not its size.
+    let (r0, _) = p
+        .train
+        .iter()
+        .find(|(r, _)| file_name(&s[0].frames[r.1].image).ends_with("-0.jpg"))
+        .expect("a frame 0 in training");
+    let want = format!("images/s0-{}", file_name(&s[0].frames[r0.1].image));
+    let image_id = images_json
+        .iter()
+        .find(|i| i["file_name"] == want.as_str())
+        .unwrap_or_else(|| panic!("{want} in train.coco.json"))["id"]
+        .clone();
+    let anns: Vec<&serde_json::Value> = coco["annotations"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|a| a["category_id"] == 0 && a["bbox"][2] == 12.8)
-        .expect("a cat box of frame 0");
-    assert_eq!(
-        first_cat["bbox"],
-        serde_json::json!([25.6, 14.4, 12.8, 19.2])
-    );
-    assert_eq!(first_cat["area"], serde_json::json!(245.76));
+        .filter(|a| a["image_id"] == image_id)
+        .collect();
+    assert_eq!(anns.len(), 1, "{anns:?}");
+    assert_eq!(anns[0]["category_id"], 0);
+    assert_eq!(anns[0]["bbox"], serde_json::json!([25.6, 14.4, 12.8, 19.2]));
+    assert_eq!(anns[0]["area"], serde_json::json!(245.76));
+    // Deterministic: the same plan and the same files on every run.
+    assert_eq!(plan(&s, &opts).unwrap(), p);
     for img in images_json {
         assert!(dir.join(img["file_name"].as_str().unwrap()).is_file());
     }
@@ -541,4 +555,268 @@ fn scene_filters_parse() {
     let meta = meta_from_name("20261022T123456789Z_ab12");
     assert_eq!(meta.day.as_deref(), Some("2026-10-22"));
     assert_eq!(meta.camera, None);
+}
+
+/// The plan of a source does not depend on where its folder is (it once ranked frames by their
+/// absolute path, so the temp folder's random name moved frames between train and valid).
+#[test]
+fn the_plan_does_not_depend_on_the_folder_location() {
+    type Names = (Vec<(usize, String, u32)>, Vec<String>, Vec<String>);
+    let plans: Vec<Names> = (0..6)
+        .map(|i| {
+            let t = tmp(&format!("where-{i}"));
+            camera_export(&t.0);
+            let s = vec![read_export(&t.0).unwrap()];
+            let p = plan(&s, &Options::default()).unwrap();
+            let name = |r: &FrameRef| file_name(&s[r.0].frames[r.1].image);
+            (
+                p.train.iter().map(|(r, n)| (r.0, name(r), *n)).collect(),
+                p.valid.iter().map(name).collect(),
+                p.heldout.iter().map(name).collect(),
+            )
+        })
+        .collect();
+    for p in &plans[1..] {
+        assert_eq!(p, &plans[0]);
+    }
+}
+
+/// Pixel boxes `(label, [x0, y0, x1, y1])` of a reviewed frame.
+type PixelBoxes<'a> = &'a [(&'a str, [f32; 4])];
+/// `(scene, camera, date, stem, boxes)` of a reviewed frame.
+type ReviewedFrame<'a> = (&'a str, &'a str, &'a str, &'a str, PixelBoxes<'a>);
+
+/// A collector dataset folder with real frames (64x48 JPEG, sidecar) reviewed with `boxes`
+/// (`(label, [x0, y0, x1, y1])` in pixels), per frame `(scene, camera, date, stem, boxes)`.
+fn reviewed_dataset(dir: &Path, frames: &[ReviewedFrame<'_>]) {
+    use crate::collect::labels::{self as cl, BoxState, LabelBox, LabelFile, Status};
+    for (scene, camera, date, stem, boxes) in frames {
+        let day = dir.join(scene).join(camera).join(date);
+        jpg(&day.join(format!("{stem}.jpg")), 64, 48);
+        let mut r = crate::collect::record::empty_record();
+        r.id = (*stem).into();
+        r.scene = (*scene).into();
+        r.camera = (*camera).into();
+        r.timestamp = format!("{date}T01:02:03.004Z");
+        r.width = 64;
+        r.height = 48;
+        std::fs::write(
+            day.join(format!("{stem}.json")),
+            serde_json::to_vec(&r).unwrap(),
+        )
+        .unwrap();
+        let labels = LabelFile {
+            status: Status::Reviewed,
+            empty_confirmed: boxes.is_empty(),
+            boxes: boxes
+                .iter()
+                .map(|(label, bbox)| LabelBox {
+                    label: (*label).into(),
+                    bbox: *bbox,
+                    source: cl::Source::Human,
+                    score: None,
+                    state: BoxState::Added,
+                    origin: None,
+                    reason: None,
+                    model_label: None,
+                    auto: Default::default(),
+                })
+                .collect(),
+            ..LabelFile::default()
+        };
+        cl::write(&day.join(format!("{stem}.labels.json")), &labels).unwrap();
+    }
+}
+
+/// The review page's export of `dataset` into `out` (YOLO + benchmark, the page's split).
+fn review_export(
+    dataset: &Path,
+    out: &Path,
+    split: crate::collect::labels::export::SplitConfig,
+) -> crate::collect::labels::export::ExportReport {
+    use crate::collect::labels::export::{self, ExportRequest, Format};
+    let classes: Vec<String> = ["person", "car", "dog", "cat", "raccoon"]
+        .map(String::from)
+        .to_vec();
+    export::run(
+        dataset,
+        &classes,
+        &ExportRequest {
+            formats: vec![Format::Yolo, Format::Coco, Format::Benchmark],
+            out_dir: out.to_path_buf(),
+            split,
+            benchmark_split: Default::default(),
+            include_unreviewed: false,
+        },
+    )
+    .unwrap()
+}
+
+/// A stand-in for the LILA night subset: `n` public frames, animals only (raccoon, dog, cat).
+fn animal_public(dir: &Path, n: usize) -> Source {
+    let labels = ["raccoon", "dog", "cat"];
+    let images: Vec<serde_json::Value> = (0..n)
+        .map(|i| {
+            let file = format!("lila{i}.jpg");
+            jpg(&dir.join(&file), 100, 50);
+            serde_json::json!({"file": file, "width": 100, "height": 50, "tags": ["ir"],
+                "objects": [{"label": labels[i % 3], "bbox": [10, 10, 30, 40]}]})
+        })
+        .collect();
+    let m = Manifest::parse(
+        &serde_json::json!({"id": "lila-night", "license": "CDLA-Permissive-1.0",
+            "images": images})
+        .to_string(),
+    )
+    .unwrap();
+    read_public_set(dir, &m).unwrap()
+}
+
+/// Per frame `(camera, date, index, person?)` of a review dataset: every frame IR, a person box
+/// or confirmed empty.
+fn person_frames(groups: &[(&str, &str, usize)]) -> Vec<(String, String, String, bool)> {
+    let mut v = Vec::new();
+    for (cam, date, n) in groups {
+        for i in 0..*n {
+            let stem = format!("{}T01020{}004Z_{cam}{i}", date.replace('-', ""), i % 10);
+            v.push(((*cam).to_string(), (*date).to_string(), stem, i % 3 != 2));
+        }
+    }
+    v
+}
+
+fn put_person_frames(dir: &Path, frames: &[(String, String, String, bool)]) {
+    let person: &[(&str, [f32; 4])] = &[("person", [4.0, 4.0, 20.0, 40.0])];
+    let refs: Vec<ReviewedFrame<'_>> = frames
+        .iter()
+        .map(|(c, d, s, p)| {
+            (
+                "ir",
+                c.as_str(),
+                d.as_str(),
+                s.as_str(),
+                if *p { person } else { &[] },
+            )
+        })
+        .collect();
+    reviewed_dataset(dir, &refs);
+}
+
+/// The review agent's real export (`export::run`: `images/{train,val}/`, flat names) plus a
+/// public subset ten times its size: the trainer's validation split once took every review
+/// training frame (its size was a share of the whole pool, public frames included, but it only
+/// took review frames), so `person`, a class only the review frames have, had no training box
+/// and the review export showed `used_train: 0`.
+#[test]
+fn a_real_review_export_keeps_its_classes_in_training_beside_a_large_public_set() {
+    use crate::collect::labels::export::SplitConfig;
+    let (ds, out, pubd) = (tmp("rx-ds"), tmp("rx-out"), tmp("rx-pub"));
+    let frames = person_frames(&[
+        ("yard", "2026-10-01", 3),
+        ("yard", "2026-10-02", 3),
+        ("gate", "2026-10-01", 3),
+        ("gate", "2026-10-02", 3),
+        ("drive", "2026-10-01", 3),
+        ("drive", "2026-10-02", 3),
+    ]);
+    put_person_frames(&ds.0, &frames);
+    let x = out.0.join("export");
+    let report = review_export(
+        &ds.0,
+        &x,
+        SplitConfig {
+            holdout_days: vec!["2026-10-02".into()],
+            ..SplitConfig::default()
+        },
+    );
+    assert_eq!((report.train, report.val), (9, 9), "{:?}", report.splits);
+    assert!(x.join("images/train").is_dir() && x.join("images/val").is_dir());
+    let review = read_export(&x).unwrap();
+    assert_eq!(
+        review
+            .frames
+            .iter()
+            .filter(|f| f.split == SplitHint::Train)
+            .count(),
+        9
+    );
+    assert!(
+        review
+            .frames
+            .iter()
+            .all(|f| (f.split == SplitHint::Heldout) == (f.day == "2026-10-02")),
+        "the export's val split is its held-out day"
+    );
+    let s = vec![review, animal_public(&pubd.0, 120)];
+    let p = plan(&s, &Options::default()).unwrap();
+    assert!(
+        p.stats.train_boxes.get("person").copied().unwrap_or(0) > 0,
+        "{:?} {:?}",
+        p.stats,
+        p.warnings
+    );
+    assert!(
+        !p.warnings.iter().any(|w| w.contains("'person'")),
+        "{:?}",
+        p.warnings
+    );
+    // The export's val frames are the held-out set; its train frames train (and validate).
+    assert_eq!(p.heldout.len(), 9);
+    assert!(p.heldout.iter().all(|r| r.0 == 0));
+    let review_train = p.train.iter().filter(|(r, _)| r.0 == 0).count();
+    let review_valid = p.valid.iter().filter(|r| r.0 == 0).count();
+    assert!(review_train >= 5, "{review_train} of 9 review frames train");
+    assert!(review_valid >= 1);
+    assert_eq!(
+        review_train + review_valid,
+        9,
+        "no review frame is dropped (3 are hard negatives)"
+    );
+    let prep = write(&s, &p, &Options::default(), &out.0.join("data")).unwrap();
+    let summary = read_summary_sources(&out.0.join("data"));
+    assert_eq!(summary[0].used_train, review_train);
+    assert_eq!(summary[0].used_heldout, 9);
+    assert!(prep.warnings.iter().all(|w| !w.contains("'person'")));
+}
+
+/// When every frame of a class is in the export's val split (the held-out cameras and days),
+/// no training box of it is right; the warning says so and how to change the hold-out.
+#[test]
+fn a_class_only_in_the_heldout_split_says_so() {
+    use crate::collect::labels::export::SplitConfig;
+    let (ds, out, pubd) = (tmp("rxh-ds"), tmp("rxh-out"), tmp("rxh-pub"));
+    // Persons only on the held-out day; the training day has empty frames only.
+    let mut frames = person_frames(&[("yard", "2026-10-02", 4), ("gate", "2026-10-02", 2)]);
+    for i in 0..3 {
+        frames.push((
+            "yard".into(),
+            "2026-10-01".into(),
+            format!("20261001T01020{i}004Z_e{i}"),
+            false,
+        ));
+    }
+    put_person_frames(&ds.0, &frames);
+    let x = out.0.join("export");
+    let report = review_export(
+        &ds.0,
+        &x,
+        SplitConfig {
+            holdout_days: vec!["2026-10-02".into()],
+            ..SplitConfig::default()
+        },
+    );
+    assert_eq!((report.train, report.val), (3, 6));
+    let s = vec![read_export(&x).unwrap(), animal_public(&pubd.0, 20)];
+    let p = plan(&s, &Options::default()).unwrap();
+    assert!(!p.stats.train_boxes.contains_key("person"));
+    let w = p
+        .warnings
+        .iter()
+        .find(|w| w.contains("'person'"))
+        .unwrap_or_else(|| panic!("{:?}", p.warnings));
+    assert!(w.contains("only in the held-out"), "{w}");
+    assert!(w.contains("hold out"), "{w}");
+    // `car` has no box anywhere: a different message.
+    let car = p.warnings.iter().find(|w| w.contains("'car'")).unwrap();
+    assert!(car.contains("no frame"), "{car}");
 }

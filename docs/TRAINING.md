@@ -179,8 +179,13 @@ A missing label file means "no objects" (the Ultralytics convention).
    camera and day the frames are split one by one, with a warning that the benchmark is optimistic.
 4. **Hard negatives**: about `training.negative_share` (15%) of the training frames have no objects:
    extra empty frames are dropped (reviewer-confirmed ones are kept first); too few give a warning.
-5. **Validation**: 10% of the training frames (at least one, and at least one frame with objects
-   stays in training), for the trainer's checkpoint choice.
+5. **Validation**: 10% of your own training frames (of all training frames when there are none; at
+   least one), for the trainer's checkpoint choice. A frame holding the last training box of a
+   class stays in training. Seeded choices rank a frame by its path relative to its export folder,
+   so the same exports give the same split wherever they are.
+   A class with no training box gets a warning that says why: its boxes are only in the held-out
+   split (the export's `val`: hold out other cameras or days when exporting, or review frames with
+   it from the training cameras and days), or no frame has one.
 6. **Public subset**: optional, train only, never held out; your own frames then repeat
    `training.oversample` (3) times.
 
@@ -195,13 +200,35 @@ licences, counts, warnings). `train prepare --out <dir>` writes the same without
 
 `assets/train/lila-night.json` defines it: a benchmark-format manifest (per image `file`, `url`,
 `sha256`, `size`, `width`, `height`, `tags`, `objects` with `label` and pixel `bbox`), downloaded and
-verified by the download manager into `<data root>/train-data/lila-night/`. Source: LILA BC camera
-traps (CDLA-Permissive-1.0) night IR frames with raccoon, opossum, skunk, dog, cat and vehicle boxes
-plus empty frames, disjoint from the `nir-night` benchmark set. **This build ships the format only:
-the manifest lists no image yet**, so the option is disabled; build it with
-`scripts/build_bench_sets.py`-style code (LILA metadata, the night / grayscale test, label map, a
-hand screen of the empty frames) in a reviewed commit. Images with `ignore` regions are left out (an
-unlabelled animal would be trained as background).
+verified by the download manager into `<data root>/train-data/lila-night/` (one SHA-256 pinned part
+per image; `list-resources --check-urls` checks every URL). Built by
+`scripts/build_bench_sets.py --set lila-night-train` (seed 20261010) in a reviewed commit.
+
+- **Content**: 2714 night infrared (monochrome) frames of fixed outdoor camera traps at 462 camera
+  locations, **926 MB** (925,830,552 bytes). 2421 boxes: deer 577, fox 544, opossum 527, skunk 525,
+  raccoon 114, bird 107, cat 12, squirrel 9, dog 5, car 1; 407 empty frames (15%, tagged `empty`,
+  read as hard negatives). Labels are `collect.classes` names (species mapped: brocket deer and
+  muntjac are deer, gray and culpeo foxes fox, wildcats cat, vehicles car); frames with any other
+  animal (coyote, bobcat, rabbit, rodent, ...) are left out, so every animal in a frame is boxed.
+  No person boxes: a `person` class needs your own frames.
+- **Sources** (LILA BC, CDLA-Permissive-1.0, attribution in the manifest): Caltech Camera Traps (764)
+  and WCS Camera Traps (1059) by capture time 20:00-05:00, Channel Islands Camera Traps (890) and
+  NACTI (1) by a mean luma below 110 when there is no time; every frame passes the grayscale (IR)
+  test (chroma spread < 3.0/255). Not reviewed by hand: LILA's empty labels are per sequence, so a
+  few empty frames may hold a missed small animal.
+- **Leakage rule**: disjoint from the `nir-night` benchmark set by image and by camera location (none
+  of its cameras is used; ENA24, which has no camera ids, is left out entirely), so `nir-night`
+  stays a fair test of a model trained with the subset (a test checks the image side). In a run the
+  public frames are only trained on: never held out, never oversampled, in the validation split
+  only when none of your own frames trains; your own frames repeat `training.oversample` times beside them.
+- **Large-download gate**: over the 500 MB limit, so a run that mixes it in (`--public`, the page's
+  *Mix in the public night subset*) and has not downloaded it yet is refused unless
+  `allow_large_downloads` is on, `--allow-large` is given (`train run`, `train prepare`, which also
+  downloads it) or the page's *Download what is missing* box is ticked; the job checks again before
+  it downloads. Once installed, nothing is asked.
+
+Images with `ignore` or `crowd` regions would be left out by the reader (an unlabelled animal would be
+trained as background); the subset has none.
 
 ExDark is never used for training (its terms are non-commercial).
 
@@ -425,7 +452,7 @@ with animals (the text prompts are computed once).
 blue-onyx-prism train capability [--json]
 blue-onyx-prism train estimate --model rfdetr-small --images 2000 --epochs 50 [--batch 8] [--imgsz 512]
 blue-onyx-prism train prepare --dataset <export> [--dataset <export>] [--scene night+ir] \
-    [--classes person,car,dog,cat,raccoon] [--rename motorbike=motorcycle] [--public] --out <dir>
+    [--classes person,car,dog,cat,raccoon] [--rename motorbike=motorcycle] [--public [--allow-large]] --out <dir>
 blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> [--scene all|day|night+ir] \
     [--epochs 50] [--batch 16] [--imgsz 640] [--lr 0.001] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
     [--name n] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]

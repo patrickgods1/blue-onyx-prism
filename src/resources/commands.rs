@@ -412,11 +412,14 @@ async fn remote_size(client: &reqwest::Client, url: &str) -> Result<u64> {
 }
 
 /// Every pinned resource `--check-urls` checks: [`catalog::all`] plus the training pins that are
-/// not part of it (the `train-base:*` weights and the public night subset `train-data:lila-night`).
+/// not part of it (the `train-base:*` weights, the public night subset `train-data:lila-night`,
+/// the `autolabel:*` labeler checkpoints and the `import-data:*` footage).
 pub fn url_check_resources() -> impl Iterator<Item = &'static Resource> {
     catalog::all()
         .chain(catalog::TRAIN_BASE_WEIGHTS)
         .chain(catalog::lila_night())
+        .chain(catalog::AUTOLABEL_WEIGHTS)
+        .chain(catalog::IMPORT_DATASETS)
 }
 
 /// URLs checked at once.

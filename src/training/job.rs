@@ -115,6 +115,11 @@ pub struct TrainRequest {
     /// Built-in benchmark sets to run besides the held-out frames (`nir-night`, `exdark-ir`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benchmark_sets: Vec<String>,
+    /// Downloads over the large-download limit are allowed (`--allow-large`, the page's
+    /// confirmation, or `allow_large_downloads`; [`super::plan_job`] folds the config in). Gates
+    /// the public night subset ([`super::check_public_download`]).
+    #[serde(default)]
+    pub allow_large: bool,
 }
 
 /// One queued run.
@@ -464,7 +469,7 @@ fn stages(
     // 3. Weights (and the public subset).
     let wdir = paths.weights_dir(base);
     let mut downloads: Vec<(&'static Resource, PathBuf)> = vec![(base, wdir.clone())];
-    let public_dir = job.root.join(catalog::LILA_NIGHT_DEST);
+    let public_dir = super::public_subset_dir(&job.root);
     if job.request.include_public {
         let Some(public) = catalog::lila_night() else {
             bail!(
@@ -472,6 +477,7 @@ fn stages(
                  image); train without it"
             );
         };
+        super::check_public_download(&job.root, job.request.allow_large)?;
         downloads.push((public, public_dir.clone()));
     }
     let missing: Vec<_> = downloads

@@ -235,6 +235,7 @@ fn job(
             classes: None,
             rename: BTreeMap::new(),
             benchmark_sets: vec!["nir-night".into()],
+            allow_large: false,
         },
         name: format!("night-{}-test", family.base_name(size)),
         paths: TrainPaths::new(root, root.join("models")),
@@ -269,6 +270,42 @@ fn run(
         cancel,
     );
     (r, stages)
+}
+
+#[test]
+fn the_public_subset_is_not_downloaded_without_the_large_gate() {
+    let t = tmp("public-gate");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    j.request.include_public = true;
+    let fake = TrainFake::new();
+    let hooks = RecHooks::default();
+    let (r, _) = run(&j, &fake, &hooks, &AtomicBool::new(false));
+    let Err(e) = r else {
+        panic!("a run with the public subset was not refused")
+    };
+    let e = format!("{e:#}");
+    assert!(
+        e.contains("large download") && e.contains("--allow-large"),
+        "{e}"
+    );
+    let fetched = fake.inner.fetched.lock().unwrap().clone();
+    assert!(
+        !fetched.iter().any(|id| id == catalog::LILA_NIGHT_ID),
+        "{fetched:?}"
+    );
+    assert!(hooks.registered.lock().unwrap().is_empty());
+    // Allowed: the run downloads it.
+    j.request.allow_large = true;
+    let fake = TrainFake::new();
+    let (r, _) = run(&j, &fake, &hooks, &AtomicBool::new(false));
+    if let Err(e) = &r {
+        assert!(!format!("{e:#}").contains("--allow-large"), "{e:#}");
+    }
+    let fetched = fake.inner.fetched.lock().unwrap().clone();
+    assert!(
+        fetched.iter().any(|id| id == catalog::LILA_NIGHT_ID),
+        "{fetched:?}"
+    );
 }
 
 #[test]

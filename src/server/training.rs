@@ -189,6 +189,11 @@ pub(super) struct TrainingTemplate {
     epochs: u32,
     scenes: Vec<(&'static str, &'static str)>,
     public_available: bool,
+    /// The public night subset is downloaded (else mixing it in needs the large-download
+    /// confirmation).
+    public_installed: bool,
+    /// Its download size (`926 MB`).
+    public_size: String,
     extra_sets: Vec<&'static str>,
     runs: Vec<RunRow>,
     results: Vec<ResultRow>,
@@ -397,6 +402,10 @@ pub(super) fn view(
             })
             .collect(),
         public_available: catalog::lila_night().is_some(),
+        public_installed: crate::training::public_subset_installed(&config.data_root()),
+        public_size: catalog::lila_night()
+            .map(|r| catalog::format_size(r.size()))
+            .unwrap_or_default(),
         extra_sets: EXTRA_SETS.to_vec(),
         runs: run_rows,
         results,
@@ -524,6 +533,7 @@ pub(crate) fn requests_from_form(
             classes: (!classes.is_empty()).then(|| classes.clone()),
             rename: Default::default(),
             benchmark_sets: sets.clone(),
+            allow_large: field(f, "confirm_large").is_some(),
         });
     }
     Ok((out, name))
@@ -567,7 +577,7 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                     let (dl, _) = a.lane().estimate();
                     anyhow::bail!(
                         "the training environment is a large download (about {}): tick \"Download \
-                         the training environment\" to confirm, or enable allow_large_downloads",
+                         what is missing\" to confirm, or enable allow_large_downloads",
                         catalog::format_size(dl)
                     );
                 }
@@ -829,6 +839,20 @@ mod tests {
         );
         assert_eq!(r.benchmark_sets, ["nir-night"]);
         assert!(r.recipe.batch >= 1 && r.recipe.batch <= 16);
+        assert!(!r.include_public && !r.allow_large);
+        // The download confirmation also allows the public night subset.
+        let (reqs, _) = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("dataset", "/x"),
+                ("public", "on"),
+                ("confirm_large", "on"),
+            ]),
+            &mac(),
+            50,
+        )
+        .unwrap();
+        assert!(reqs[0].include_public && reqs[0].allow_large);
         let e = requests_from_form(&form(&[("dataset", "/x")]), &mac(), 50).unwrap_err();
         assert!(e.to_string().contains("no model ticked"));
         let e = requests_from_form(

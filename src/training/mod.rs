@@ -43,7 +43,7 @@ use crate::config::Config;
 use crate::resources::catalog::Platform;
 use crate::resources::export::train::TrainPaths;
 use anyhow::{Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// What this machine can train (detected hardware, cached).
@@ -84,6 +84,44 @@ pub fn discover_exports(config: &Config) -> Vec<PathBuf> {
     v
 }
 
+/// Install folder of the public night subset (`train-data:lila-night`) under the download root.
+pub fn public_subset_dir(root: &Path) -> PathBuf {
+    root.join(crate::resources::catalog::LILA_NIGHT_DEST)
+}
+
+/// Whether the public night subset is downloaded and complete under `root`.
+pub fn public_subset_installed(root: &Path) -> bool {
+    crate::resources::catalog::lila_night()
+        .is_some_and(|r| crate::resources::manager::is_installed(r, &public_subset_dir(root)))
+}
+
+/// The large-download gate of the public night subset (about 926 MB, over the 500 MB limit like
+/// the training environment): refuse a run that would download it unless `allowed`
+/// (`--allow-large`, the Training page's download confirmation, or `allow_large_downloads`).
+/// Nothing to refuse when it is downloaded already.
+pub fn check_public_download(root: &Path, allowed: bool) -> Result<()> {
+    use crate::resources::catalog;
+    let Some(r) = catalog::lila_night() else {
+        bail!(
+            "the public night subset is not pinned in this build (its manifest lists no image); \
+             train without it"
+        );
+    };
+    if allowed || !r.is_large() || public_subset_installed(root) {
+        return Ok(());
+    }
+    bail!(
+        "the public night subset ({}, {} images) is a large download ({}, over the 500 MB \
+         limit) and is not downloaded yet under {}: rerun with --allow-large (Training page: tick \
+         \"Download what is missing\"), enable allow_large_downloads, or train without the \
+         public subset",
+        r.id,
+        r.parts.len(),
+        catalog::format_size(r.size()),
+        public_subset_dir(root).display()
+    )
+}
+
 /// Data loader workers: none on macOS (spawned workers re-import the script; MPS runs were
 /// smoke-tested without), else half the cores, at most 4.
 fn workers() -> u32 {
@@ -115,6 +153,10 @@ pub fn plan_job(
             recipe.family.title(),
             f.why.as_deref().unwrap_or("not supported")
         );
+    }
+    request.allow_large |= config.allow_large_downloads;
+    if request.include_public {
+        check_public_download(&config.data_root(), request.allow_large)?;
     }
     if request.datasets.is_empty() {
         request.datasets = config.training.datasets.clone();
@@ -196,6 +238,7 @@ mod tests {
             classes: None,
             rename: Default::default(),
             benchmark_sets: Vec::new(),
+            allow_large: false,
         }
     }
 
@@ -223,6 +266,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(named.name, "raccoon-v1");
+    }
+
+    #[test]
+    fn the_public_subset_needs_the_large_download_gate() {
+        use crate::resources::export::Fetcher;
+        let Some(lila) = crate::resources::catalog::lila_night() else {
+            panic!("the public night subset is pinned");
+        };
+        assert!(
+            lila.is_large(),
+            "the subset is over the large-download limit"
+        );
+        let root = std::env::temp_dir().join(format!("bop-train-public-{}", uuid::Uuid::new_v4()));
+        let c = Config {
+            download_dir: Some(root.clone()),
+            ..Config::default()
+        };
+        let mut req = request(TrainFamily::Yolo26, "n");
+        req.include_public = true;
+        // Not downloaded, not allowed: refused with the way out.
+        let e = plan_job(&c, req.clone(), &mac(), None).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("large download"), "{msg}");
+        assert!(msg.contains("--allow-large"), "{msg}");
+        assert!(msg.contains("allow_large_downloads"), "{msg}");
+        assert!(msg.contains("train-data:lila-night"), "{msg}");
+        // Without the subset: no gate.
+        let mut plain = req.clone();
+        plain.include_public = false;
+        assert!(
+            !plan_job(&c, plain, &mac(), None)
+                .unwrap()
+                .request
+                .allow_large
+        );
+        // --allow-large / the page's confirmation.
+        let mut allowed = req.clone();
+        allowed.allow_large = true;
+        assert!(
+            plan_job(&c, allowed, &mac(), None)
+                .unwrap()
+                .request
+                .allow_large
+        );
+        // allow_large_downloads is folded into the request (the job re-checks it).
+        let open = Config {
+            allow_large_downloads: true,
+            ..c.clone()
+        };
+        let j = plan_job(&open, req.clone(), &mac(), None).unwrap();
+        assert!(j.request.allow_large);
+        // Downloaded already: nothing to gate.
+        let fake = crate::resources::export::fake::Fake::new();
+        fake.fetch(
+            lila,
+            &public_subset_dir(&root),
+            &mut |_, _| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(public_subset_installed(&root));
+        assert!(!plan_job(&c, req, &mac(), None).unwrap().request.allow_large);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

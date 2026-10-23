@@ -55,6 +55,10 @@ pub enum TrainCommand {
         /// Output folder (must not exist or be empty).
         #[arg(long)]
         out: PathBuf,
+        /// With --public: allow downloading the public night subset (about 926 MB, over the
+        /// 500 MB limit). Also config `allow_large_downloads`.
+        #[arg(long)]
+        allow_large: bool,
     },
     /// Train one model or several in a row, export, install, add to the config and benchmark.
     Run {
@@ -87,8 +91,8 @@ pub enum TrainCommand {
         /// Model name (only with one --model; default night-<model>-<stamp> or custom-...).
         #[arg(long)]
         name: Option<String>,
-        /// Allow the training environment download (over 500 MB; also config
-        /// `allow_large_downloads`).
+        /// Allow downloads over 500 MB: the training environment and, with --public, the public
+        /// night subset (about 926 MB). Also config `allow_large_downloads`.
         #[arg(long)]
         allow_large: bool,
         /// Install the model but do not add it to the config (and do not benchmark it).
@@ -447,7 +451,14 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             }
             Ok(true)
         }
-        TrainCommand::Prepare { data, out } => {
+        TrainCommand::Prepare {
+            data,
+            out,
+            allow_large,
+        } => {
+            if data.public {
+                fetch_public(&config, allow_large || config.allow_large_downloads)?;
+            }
             let (sources, opts) = read_sources(&config, &data)?;
             let plan = dataset::plan(&sources, &opts)?;
             let prepared = dataset::write(&sources, &plan, &opts, &out)?;
@@ -547,6 +558,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                     classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
                     rename: data.rename.iter().cloned().collect::<BTreeMap<_, _>>(),
                     benchmark_sets: benchmark_sets.clone(),
+                    allow_large,
                 };
                 let mut job = super::plan_job(&config, req, &cap, name.clone())?;
                 job.keep_work = keep_work;
@@ -769,6 +781,31 @@ pub fn capability_text(cap: &Capability) -> String {
     s
 }
 
+/// `train prepare --public`: download the public night subset when it is missing, behind the
+/// large-download gate ([`super::check_public_download`]).
+fn fetch_public(config: &Config, allowed: bool) -> Result<()> {
+    use crate::resources::export::Fetcher;
+    let root = config.data_root();
+    super::check_public_download(&root, allowed)?;
+    if super::public_subset_installed(&root) {
+        return Ok(());
+    }
+    let r = catalog::lila_night().context("the public night subset is not pinned in this build")?;
+    eprintln!(
+        "downloading {} ({})",
+        r.title,
+        catalog::format_size(r.size())
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _ctrl_c = crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the download");
+    crate::resources::export::cli_fetcher(&root).fetch(
+        r,
+        &super::public_subset_dir(&root),
+        &mut |_, _| {},
+        &cancel,
+    )
+}
+
 fn read_sources(
     config: &Config,
     data: &DataArgs,
@@ -792,7 +829,7 @@ fn read_sources(
             bail!("the public night subset is not pinned in this build");
         }
         sources.push(dataset::read_public_set(
-            &config.data_root().join(catalog::LILA_NIGHT_DEST),
+            &super::public_subset_dir(&config.data_root()),
             m,
         )?);
     }
