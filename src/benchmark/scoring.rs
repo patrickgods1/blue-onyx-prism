@@ -711,6 +711,7 @@ mod tests {
             gpu_precision: None,
             confidence_threshold: None,
             object_filter: None,
+            variant: None,
         };
         let pred = |l: &str, c: f32, b: [f32; 4]| PredBox {
             label: l.into(),
@@ -831,6 +832,7 @@ mod tests {
             gpu_precision: None,
             confidence_threshold: None,
             object_filter: None,
+            variant: None,
         };
         let p = |l: &str, b: [f32; 4]| PredBox {
             label: l.into(),
@@ -964,6 +966,7 @@ mod tests {
             gpu_precision: None,
             confidence_threshold: None,
             object_filter: None,
+            variant: None,
         };
         let eval = vec![
             vec![p("person", 0.9), p("vehicle", 0.4)],

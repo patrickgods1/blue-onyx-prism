@@ -201,6 +201,7 @@ mod tests {
             gpu_precision: None,
             confidence_threshold: None,
             object_filter: None,
+            variant: None,
         };
         let params = PostParams {
             confidence_threshold: 0.5,

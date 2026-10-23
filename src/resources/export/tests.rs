@@ -897,6 +897,108 @@ fn deimv2_export_fetches_the_source_and_passes_it() {
 }
 
 #[test]
+fn megadetector_exports_pass_the_weights_file() {
+    let root = tmp("mdv6");
+    let fake3 = || Fake {
+        classes: 3,
+        ..Fake::new()
+    };
+    // RT-DETR: the `.pth` file, the DEIMv2 source (its RT-DETRv2 modules) and `--recipe rtdetrv2`.
+    let fake = fake3();
+    let mut j = job(&root, LINUX);
+    j.resource = catalog::export_model("mdv6-rtdetr-c").unwrap();
+    let out = run(&fake, &j).0.unwrap();
+    assert_eq!(out.onnx, root.join("models/mdv6-rtdetr-c.onnx"));
+    assert_eq!(out.classes, 3);
+    assert_eq!(
+        *fake.fetched.lock().unwrap(),
+        ["tool:uv", "model:mdv6-rtdetr-c", "tool:deimv2-src"]
+    );
+    let all = fake.commands.lock().unwrap().clone();
+    let export = all.last().unwrap();
+    let d = export.display();
+    assert!(
+        d.contains("--recipe rtdetrv2 --name mdv6-rtdetr-c --family rtdetr"),
+        "{d}"
+    );
+    assert!(d.contains("--imgsz 640"), "{d}");
+    assert_eq!(
+        arg_after(export, "--weights").unwrap(),
+        root.join("tools/export-weights/mdv6-rtdetr-c/MDV6-apa-rtdetr-c.pth")
+    );
+    assert_eq!(
+        arg_after(export, "--source").unwrap(),
+        root.join("tools/deimv2-src")
+    );
+    // The self-check imports what the recipe needs.
+    assert!(
+        all.iter()
+            .any(|c| c.display().contains("--self-check --recipe rtdetrv2")),
+        "{all:?}"
+    );
+
+    // YOLOv9 / v10: Ultralytics with the Zenodo `.pt` (its own file name), no source.
+    for (name, file, family) in [
+        ("mdv6-yolov9-c", "MDV6-yolov9-c.pt", "yolo8"),
+        ("mdv6-yolov10-c", "MDV6-yolov10-c.pt", "yolo26"),
+    ] {
+        let fake = fake3();
+        j.resource = catalog::export_model(name).unwrap();
+        assert_eq!(run(&fake, &j).0.unwrap().classes, 3);
+        assert_eq!(*fake.fetched.lock().unwrap(), [format!("model:{name}")]);
+        let all = fake.commands.lock().unwrap().clone();
+        let export = all.last().unwrap();
+        let d = export.display();
+        assert!(
+            d.contains(&format!(
+                "--recipe ultralytics --name {name} --family {family}"
+            )),
+            "{d}"
+        );
+        assert!(!d.contains("--source"), "{d}");
+        assert_eq!(
+            arg_after(export, "--weights").unwrap(),
+            root.join(format!("tools/export-weights/{name}/{file}"))
+        );
+    }
+    // ExDark RF-DETR fine-tunes: the rfdetr recipe with the weights directory (checkpoint +
+    // config.json), their native size, 12 classes, no source.
+    for (name, size) in [("exdark-rfdetr-small", 512), ("exdark-rfdetr-nano", 384)] {
+        let fake = Fake {
+            classes: 12,
+            ..Fake::new()
+        };
+        j.resource = catalog::export_model(name).unwrap();
+        assert_eq!(run(&fake, &j).0.unwrap().classes, 12);
+        assert_eq!(*fake.fetched.lock().unwrap(), [format!("model:{name}")]);
+        let all = fake.commands.lock().unwrap().clone();
+        let export = all.last().unwrap();
+        let d = export.display();
+        assert!(
+            d.contains(&format!("--recipe rfdetr --name {name} --family rfdetr")),
+            "{d}"
+        );
+        assert!(
+            d.contains(&format!("--imgsz {size}")) && !d.contains("--source"),
+            "{d}"
+        );
+        let w = arg_after(export, "--weights").unwrap();
+        assert_eq!(w, root.join(format!("tools/export-weights/{name}")));
+        assert!(w.join("checkpoint_best_total.pth").is_file());
+        assert!(w.join("config.json").is_file());
+    }
+    // An 80-class YAML for a MegaDetector export is refused.
+    let fake = Fake::new();
+    j.resource = catalog::export_model("mdv6-yolov9-c").unwrap();
+    let e = run(&fake, &j).0.unwrap_err();
+    assert!(
+        format!("{e:#}").contains("lists 80 classes; mdv6-yolov9-c has 3"),
+        "{e:#}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn outdated_manifest_means_needs_export() {
     let root = tmp("outdated");
     let models = root.join("models");

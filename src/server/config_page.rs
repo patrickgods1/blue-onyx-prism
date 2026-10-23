@@ -54,6 +54,12 @@ pub(super) struct ConfigView {
     models_json: String,
     auto_download: bool,
     allow_large_downloads: bool,
+    night_confidence_threshold: String,
+    night_person_threshold: String,
+    person_aspect_min: String,
+    person_aspect_max: String,
+    drop_person_on_plant: bool,
+    static_suppression: bool,
 }
 
 impl ConfigView {
@@ -61,6 +67,10 @@ impl ConfigView {
         let path = |p: &Option<PathBuf>| {
             p.as_ref()
                 .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
+        let opt = |v: Option<f32>| {
+            v.map(|x| crate::config::clean_f32(x).to_string())
                 .unwrap_or_default()
         };
         Self {
@@ -88,6 +98,12 @@ impl ConfigView {
             models_json: serde_json::to_string_pretty(&c.models).unwrap_or_default(),
             auto_download: c.auto_download,
             allow_large_downloads: c.allow_large_downloads,
+            night_confidence_threshold: opt(c.night_confidence_threshold),
+            night_person_threshold: opt(crate::config_form::night_person_threshold(c)),
+            person_aspect_min: opt(c.person_aspect.map(|[lo, _]| lo)),
+            person_aspect_max: opt(c.person_aspect.map(|[_, hi]| hi)),
+            drop_person_on_plant: crate::config_form::has_plant_rule(c),
+            static_suppression: c.static_suppression.enabled,
         }
     }
 
@@ -105,6 +121,10 @@ impl ConfigView {
                 "allow_remote_admin" if !form.contains_key("access_settings") => {}
                 "allow_remote_admin" => self.allow_remote_admin = v.is_some(),
                 "auto_download" => self.auto_download = v.is_some(),
+                "drop_person_on_plant" | "static_suppression"
+                    if !form.contains_key("night_settings") => {}
+                "drop_person_on_plant" => self.drop_person_on_plant = v.is_some(),
+                "static_suppression" => self.static_suppression = v.is_some(),
                 "allow_large_downloads" => self.allow_large_downloads = v.is_some(),
                 _ => {
                     let Some(v) = v else { continue };
@@ -126,6 +146,10 @@ impl ConfigView {
                         "save_image_max_age_days" => &mut self.save_image_max_age_days,
                         "save_image_max_mb" => &mut self.save_image_max_mb,
                         "intra_threads" => &mut self.intra_threads,
+                        "night_confidence_threshold" => &mut self.night_confidence_threshold,
+                        "night_person_threshold" => &mut self.night_person_threshold,
+                        "person_aspect_min" => &mut self.person_aspect_min,
+                        "person_aspect_max" => &mut self.person_aspect_max,
                         _ => continue,
                     };
                     *slot = v;
@@ -155,6 +179,8 @@ struct ModelSelectRow {
     devices: Vec<DeviceChoice>,
     /// Per-model threshold as typed in the input ("" = global).
     threshold: String,
+    /// Night model select: "none" first, then the other models it may name.
+    night_models: Vec<DeviceChoice>,
     /// What the running worker uses ("OpenVINO CPU · threshold 0.50", "not loaded", ...).
     running: String,
     running_class: &'static str,
@@ -211,6 +237,52 @@ pub(super) fn global_device_label(c: &Config, snap: &DevicesSnapshot) -> String 
         Ok(d) => d.with_default_index(c.gpu_index).to_string(),
         Err(_) => c.device.trim().to_string(),
     }
+}
+
+/// Options of the Night model select of `models[me]`: "none", then every other model that has
+/// no night model of its own (night models do not chain; a disabled one is marked: the switch
+/// falls back to the model itself while it is off). A model this one already names is always
+/// listed (as "missing" when it is not configured).
+fn night_model_choices(models: &[crate::config::ModelConfig], me: usize) -> Vec<DeviceChoice> {
+    use crate::registry::normalize_name;
+    let Some(m) = models.get(me) else {
+        return Vec::new();
+    };
+    let current = m.night_model.as_deref().map(normalize_name);
+    let mut v = vec![DeviceChoice {
+        value: String::new(),
+        label: "none".to_string(),
+        selected: current.is_none(),
+        disabled: false,
+    }];
+    let mut found = false;
+    for (i, o) in models.iter().enumerate() {
+        let name = o.effective_name();
+        let selected = current.as_deref() == Some(normalize_name(&name).as_str());
+        if i == me || (o.night_model.is_some() && !selected) {
+            continue;
+        }
+        found |= selected;
+        v.push(DeviceChoice {
+            label: if o.enabled {
+                name.clone()
+            } else {
+                format!("{name} (disabled)")
+            },
+            value: name,
+            selected,
+            disabled: false,
+        });
+    }
+    if let (Some(n), false) = (m.night_model.as_deref(), found) {
+        v.push(DeviceChoice {
+            value: n.to_string(),
+            label: format!("{n} (missing)"),
+            selected: true,
+            disabled: false,
+        });
+    }
+    v
 }
 
 /// Options of a model's Device select. `current` None = follows the global device.
@@ -296,6 +368,7 @@ fn model_choices(
                 .map(|r| r.id.to_string());
             ModelSelectRow {
                 devices: model_device_choices(snap, m.device.as_deref(), &global),
+                night_models: night_model_choices(&c.models, i),
                 key,
                 family: m.family.to_string(),
                 path: m.path.display().to_string(),
@@ -501,6 +574,38 @@ fn device_choices(snap: &DevicesSnapshot, current: &str, gpu_index: &str) -> Vec
     out
 }
 
+/// The "About exports" notice, derived from the catalog so a new recipe or a restrictive model
+/// license cannot be left out: the notice of every [`ExportRecipe`] an exportable model uses
+/// (catalog order), then each non-commercial / personal-use license with the models under it.
+///
+/// [`ExportRecipe`]: crate::resources::catalog::ExportRecipe
+pub(super) fn export_notice() -> String {
+    use crate::resources::catalog;
+    let mut recipes: Vec<catalog::ExportRecipe> = Vec::new();
+    let mut restricted: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+    for res in catalog::all() {
+        let Some(recipe) = catalog::export_recipe(res) else {
+            continue;
+        };
+        if !recipes.contains(&recipe) {
+            recipes.push(recipe);
+        }
+        let license = res.license.to_ascii_lowercase();
+        if license.contains("non-commercial") || license.contains("personal use") {
+            let name = res.model_name().unwrap_or(res.title);
+            match restricted.iter_mut().find(|(l, _)| *l == res.license) {
+                Some((_, names)) => names.push(name),
+                None => restricted.push((res.license, vec![name])),
+            }
+        }
+    }
+    let mut parts: Vec<String> = recipes.iter().map(|r| r.notice().to_string()).collect();
+    for (license, names) in restricted {
+        parts.push(format!("{}: {license}.", names.join(", ")));
+    }
+    parts.join(" ")
+}
+
 pub(super) fn config_template(
     state: &AppState,
     message: Option<String>,
@@ -595,15 +700,7 @@ pub(super) fn config_template(
         model_path_example,
         models_dir,
         tools_dir,
-        export_notice: [
-            crate::resources::catalog::ExportRecipe::Ultralytics,
-            crate::resources::catalog::ExportRecipe::RfDetr,
-            crate::resources::catalog::ExportRecipe::DeimV2,
-        ]
-        .iter()
-        .map(|r| r.notice())
-        .collect::<Vec<_>>()
-        .join(" "),
+        export_notice: export_notice(),
         force_cpu_note,
         resources_enabled: state.resources.is_some(),
         nav: "config",
@@ -1538,5 +1635,33 @@ mod tests {
         let (_, _, b) = call(&state, post_form("/config/restart?back=models", "", true)).await;
         let b = String::from_utf8(b).unwrap();
         assert!(b.contains("/config#at-models"), "{b}");
+    }
+
+    /// The export notice covers every recipe and every restrictive license in the catalog.
+    #[test]
+    fn export_notice_is_derived_from_the_catalog() {
+        use crate::resources::catalog;
+        let n = super::export_notice();
+        let mut seen = std::collections::HashSet::new();
+        for res in catalog::all() {
+            let Some(r) = catalog::export_recipe(res) else {
+                continue;
+            };
+            if seen.insert(r) {
+                assert!(n.contains(r.notice()), "{r:?} notice missing: {n}");
+            }
+            if res.license.to_ascii_lowercase().contains("non-commercial") {
+                let name = res.model_name().unwrap();
+                assert!(n.contains(name), "{name} missing: {n}");
+                assert!(n.contains(res.license), "{} missing: {n}", res.license);
+            }
+        }
+        // The recipes added with the night work.
+        assert!(seen.contains(&catalog::ExportRecipe::RtDetrV2), "{seen:?}");
+        assert!(n.contains("MegaDetector v6 RT-DETR"), "{n}");
+        assert!(n.contains("exdark-rfdetr-small"), "{n}");
+        assert!(n.contains("trained on ExDark"), "{n}");
+        // Each notice once, however many models share it.
+        assert_eq!(n.matches("Ultralytics YOLO weights and").count(), 1, "{n}");
     }
 }

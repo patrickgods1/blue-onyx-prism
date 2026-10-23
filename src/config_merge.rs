@@ -158,6 +158,17 @@ fn field_label(field: &str) -> String {
         "enabled" => "load".into(),
         "gpu_precision" => "GPU precision".into(),
         "object_filter" => "object filter".into(),
+        "night_confidence_threshold" => "night threshold".into(),
+        "label_thresholds" => "label thresholds".into(),
+        "night_label_thresholds" => "night label thresholds".into(),
+        "person_aspect" => "person aspect".into(),
+        "min_box_area_frac" => "min box area".into(),
+        "suppress_overlaps" => "overlap suppression".into(),
+        "static_suppression" => "static-box suppression".into(),
+        "preprocess" => "preprocess".into(),
+        "night_preprocess" => "night preprocess".into(),
+        "night_model" => "night model".into(),
+        "verify" => "verifier".into(),
         other => other.replace('_', " "),
     }
 }
@@ -193,6 +204,18 @@ fn global_label(k: &str) -> String {
         "allow_large_downloads" => "Allow large downloads".into(),
         "default_model" => "Default model".into(),
         "max_image_pixels" => "Max image pixels".into(),
+        "night_confidence_threshold" => "Night / IR confidence threshold".into(),
+        "label_thresholds" => "Label thresholds".into(),
+        "night_label_thresholds" => "Night / IR label thresholds".into(),
+        "person_aspect" => "Person aspect (width/height)".into(),
+        "min_box_area_frac" => "Min box area (share of image)".into(),
+        "suppress_overlaps" => "Overlap suppression".into(),
+        "static_suppression" => "Static-box suppression".into(),
+        "preprocess" => "Image preprocessing".into(),
+        "night_preprocess" => "Night / IR image preprocessing".into(),
+        "verify" => "Verifier cascade".into(),
+        "collect" => "Dataset collector".into(),
+        "training" => "Training".into(),
         other => other.replace('_', " "),
     }
 }
@@ -213,6 +236,10 @@ pub fn label(key: &str, names: &BTreeMap<String, String>) -> String {
 /// Display text of a value of `key` (None = absent).
 pub fn value_text(key: &str, v: Option<&Value>) -> String {
     let (field, presence) = match parse_key(key) {
+        // A per-model rule that is absent follows the global value.
+        Key::Model { field, .. } if v.is_none() && NIGHT_MODEL_FIELDS.contains(&field) => {
+            return "global".into();
+        }
         Key::Model { field, .. } => (field, false),
         Key::Presence(_) => ("", true),
         Key::Global(k) => (k, false),
@@ -305,10 +332,11 @@ pub fn describe_changes(old: &Config, new: &Config) -> (Vec<FieldChange>, String
             Key::Presence(n) => {
                 model_part(n, "", if y.is_some() { "added" } else { "removed" }.into());
             }
-            // Fields of an added/removed model are covered by "added"/"removed".
-            Key::Model { name, .. } if x.is_none() || y.is_none() => {
-                let _ = name;
-            }
+            // Fields of an added/removed model are covered by "added"/"removed" (an optional
+            // field set or cleared on a model present in both is a change like any other).
+            Key::Model { name, .. }
+                if !(a.contains_key(&presence_key(name))
+                    && b.contains_key(&presence_key(name))) => {}
             Key::Model { field, name } => {
                 model_part(name, field, format!("{} \u{2192} {to}", field_label(field)));
             }
@@ -383,11 +411,51 @@ pub fn live_global(k: &str) -> bool {
             | "save_image_max_age_days"
             | "save_image_max_mb"
             | "max_image_pixels"
+            | "night_confidence_threshold"
+            | "label_thresholds"
+            | "night_label_thresholds"
+            | "person_aspect"
+            | "min_box_area_frac"
+            | "suppress_overlaps"
+            | "static_suppression"
+            | "preprocess"
+            | "night_preprocess"
+            | "verify"
+            | "collect"
+            | "training"
     ) || k.starts_with("benchmark.")
 }
 
 /// Model fields applied live (the worker reads them per request).
-pub const LIVE_MODEL_FIELDS: &[&str] = &["confidence_threshold", "object_filter"];
+pub const LIVE_MODEL_FIELDS: &[&str] = &[
+    "confidence_threshold",
+    "object_filter",
+    "night_model",
+    "night_confidence_threshold",
+    "label_thresholds",
+    "night_label_thresholds",
+    "person_aspect",
+    "min_box_area_frac",
+    "suppress_overlaps",
+    "static_suppression",
+    "preprocess",
+    "night_preprocess",
+    "verify",
+];
+
+/// The per-model night / IR rule fields (serialized only when set; absent = the global value).
+pub const NIGHT_MODEL_FIELDS: &[&str] = &[
+    "night_confidence_threshold",
+    "label_thresholds",
+    "night_label_thresholds",
+    "person_aspect",
+    "min_box_area_frac",
+    "suppress_overlaps",
+    "static_suppression",
+    "preprocess",
+    "night_preprocess",
+    "verify",
+];
 
 /// Labels of the changed fields that applied without a restart (live globals, the default
 /// model, per-model thresholds and object filters; the benchmark section is not listed: it is
@@ -910,5 +978,117 @@ mod tests {
             ["Log file format: text \u{2192} json (needs a process restart)"]
         );
         assert!(!live_global("log_format"));
+    }
+
+    #[test]
+    fn night_rules_apply_live_without_a_reload() {
+        let old = cfg();
+        let mut new = old.clone();
+        new.night_confidence_threshold = Some(0.6);
+        new.static_suppression.enabled = true;
+        new.models[0].person_aspect = Some([0.2, 0.9]);
+        new.models[1].label_thresholds = Some(std::collections::BTreeMap::from([(
+            "person".to_string(),
+            0.7,
+        )]));
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(p.global.is_empty() && p.process.is_empty(), "{p:?}");
+        assert!(p.models.is_empty(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        let live = applied_live(&changes);
+        assert_eq!(live.len(), 4, "{changes:?}");
+        assert!(
+            live.contains(&"Night / IR confidence threshold".to_string()),
+            "{live:?}"
+        );
+        assert!(
+            live.contains(&"IPcam-general \u{b7} person aspect".to_string()),
+            "{live:?}"
+        );
+        let c = changes
+            .iter()
+            .find(|c| c.label == "IPcam-general \u{b7} person aspect")
+            .unwrap();
+        assert_eq!((c.from.as_str(), c.to.as_str()), ("global", "[0.2,0.9]"));
+    }
+
+    #[test]
+    fn night_model_applies_live_without_a_reload() {
+        let old = cfg();
+        let mut new = old.clone();
+        new.models[0].night_model = Some("yolo26s".into());
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(p.models.is_empty() && p.global.is_empty(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        assert_eq!(
+            applied_live(&changes),
+            ["IPcam-general \u{b7} night model"],
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn verify_applies_live_without_a_reload() {
+        let old = cfg();
+        let mut new = old.clone();
+        new.models[0].verify = Some(crate::verify::VerifyConfig::with_model("yolo26s"));
+        new.verify = Some(crate::verify::VerifyConfig::with_model("yolo26s"));
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(p.models.is_empty() && p.global.is_empty(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        let live = applied_live(&changes);
+        assert!(
+            live.contains(&"Verifier cascade".to_string())
+                && live.contains(&"IPcam-general \u{b7} verifier".to_string()),
+            "{live:?}"
+        );
+        let c = changes
+            .iter()
+            .find(|c| c.label == "IPcam-general \u{b7} verifier")
+            .unwrap();
+        assert_eq!(c.from, "global");
+    }
+
+    #[test]
+    fn collect_applies_live_without_a_restart() {
+        let old = cfg();
+        let mut new = old.clone();
+        new.collect.enabled = true;
+        new.collect.buckets.empty.enabled = false;
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(!p.restart_needed(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        assert!(
+            applied_live(&changes).contains(&"Dataset collector".to_string()),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn preprocess_applies_live_and_absent_means_global() {
+        use crate::model::enhance::Preprocess;
+        let old = cfg();
+        let mut new = old.clone();
+        new.preprocess = Some(Preprocess::Gamma(0.6));
+        new.models[0].night_preprocess = Some(Preprocess::CLAHE);
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(p.models.is_empty() && p.global.is_empty(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        let live = applied_live(&changes);
+        assert!(
+            live.contains(&"Image preprocessing".to_string())
+                && live.contains(&"IPcam-general \u{b7} night preprocess".to_string()),
+            "{live:?}"
+        );
+        let c = changes
+            .iter()
+            .find(|c| c.label == "IPcam-general \u{b7} night preprocess")
+            .unwrap();
+        assert_eq!((c.from.as_str(), c.to.as_str()), ("global", "clahe"));
     }
 }

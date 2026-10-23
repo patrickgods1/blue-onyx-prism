@@ -43,7 +43,34 @@ pub const FORM_FIELDS: &[&str] = &[
     "intra_threads",
     "auto_download",
     "allow_large_downloads",
+    "night_confidence_threshold",
+    "night_person_threshold",
+    "person_aspect_min",
+    "person_aspect_max",
+    "drop_person_on_plant",
+    "static_suppression",
 ];
+
+/// The overlap rule behind the Config page's "drop person on potted plant" checkbox.
+pub const PLANT_RULE: (&str, &str) = ("person", "potted plant");
+
+/// The config has the [`PLANT_RULE`] overlap rule (any IoU, any night gating).
+pub fn has_plant_rule(c: &Config) -> bool {
+    c.suppress_overlaps.iter().any(is_plant_rule)
+}
+
+fn is_plant_rule(r: &crate::model::filters::OverlapRule) -> bool {
+    r.drop.trim().eq_ignore_ascii_case(PLANT_RULE.0)
+        && r.if_overlaps.trim().eq_ignore_ascii_case(PLANT_RULE.1)
+}
+
+/// The global `night_label_thresholds` entry of `person` (any case).
+pub fn night_person_threshold(c: &Config) -> Option<f32> {
+    c.night_label_thresholds
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(crate::model::filters::PERSON))
+        .map(|(_, v)| *v)
+}
 
 /// Apply a submitted `/config` form to `config`. All fields are validated first; on any error
 /// `config` is left untouched. Text fields that are absent keep their current value; empty
@@ -195,6 +222,7 @@ pub fn parse_config_form(
     if let Some(v) = get("intra_threads") {
         c.intra_threads = num("intra_threads", v)?;
     }
+    parse_night_fields(c, form)?;
     if let Some(v) = form.get("models_json") {
         c.models = serde_json::from_str(v).map_err(|e| anyhow::anyhow!("models: {e}"))?;
     }
@@ -202,6 +230,77 @@ pub fn parse_config_form(
         c.default_model = (!v.is_empty()).then(|| v.to_string());
     }
     c.normalize();
+    Ok(())
+}
+
+/// The "Night / IR" fieldset: `night_confidence_threshold` and `night_person_threshold`
+/// (empty = off), `person_aspect_min` / `person_aspect_max` (both or neither), and the
+/// `drop_person_on_plant` / `static_suppression` checkboxes, read only with the fieldset's
+/// `night_settings` marker. Only the parts the fieldset shows are changed: other label
+/// thresholds and overlap rules stay as configured.
+fn parse_night_fields(
+    c: &mut Config,
+    form: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    use anyhow::bail;
+    let get = |k: &str| form.get(k).map(|v| v.trim());
+    let opt = |field: &str| -> Result<Option<f32>> {
+        match get(field) {
+            None | Some("") => Ok(None),
+            Some(v) => {
+                let x: f32 = v
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("{field}: '{v}' is not a valid number"))?;
+                Ok(Some(x))
+            }
+        }
+    };
+    if form.contains_key("night_confidence_threshold") {
+        let t = opt("night_confidence_threshold")?;
+        if let Some(t) = t {
+            check_threshold("night_confidence_threshold", t)?;
+        }
+        c.night_confidence_threshold = t;
+    }
+    if form.contains_key("night_person_threshold") {
+        let t = opt("night_person_threshold")?;
+        c.night_label_thresholds
+            .retain(|k, _| !k.eq_ignore_ascii_case(crate::model::filters::PERSON));
+        if let Some(t) = t {
+            check_threshold("night_label_thresholds.person", t)?;
+            c.night_label_thresholds
+                .insert(crate::model::filters::PERSON.to_string(), t);
+        }
+    }
+    if form.contains_key("person_aspect_min") || form.contains_key("person_aspect_max") {
+        c.person_aspect = match (opt("person_aspect_min")?, opt("person_aspect_max")?) {
+            (None, None) => None,
+            (Some(lo), Some(hi)) => Some([lo, hi]),
+            _ => bail!(
+                "person_aspect: set both the minimum and the maximum width/height (e.g. 0.2 and \
+                 0.9), or clear both to turn the rule off"
+            ),
+        };
+    }
+    if form.contains_key("night_settings") {
+        let checkbox = |k: &str| {
+            get(k)
+                .is_some_and(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "0"))
+        };
+        let want = checkbox("drop_person_on_plant");
+        if want && !has_plant_rule(c) {
+            c.suppress_overlaps
+                .push(crate::model::filters::OverlapRule {
+                    drop: PLANT_RULE.0.to_string(),
+                    if_overlaps: PLANT_RULE.1.to_string(),
+                    iou: crate::model::filters::DEFAULT_OVERLAP_IOU,
+                    night_only: false,
+                });
+        } else if !want {
+            c.suppress_overlaps.retain(|r| !is_plant_rule(r));
+        }
+        c.static_suppression.enabled = checkbox("static_suppression");
+    }
     Ok(())
 }
 
@@ -808,5 +907,77 @@ mod tests {
         assert_eq!(c.log_format, crate::config::LogFormat::Json);
         let err = parse_config_form(&mut c, &form(&[("log_format", "xml")])).unwrap_err();
         assert!(format!("{err:#}").contains("log_format"), "{err:#}");
+    }
+
+    #[test]
+    fn night_fieldset_sets_and_clears_only_its_parts() {
+        let mut c = with_model();
+        c.night_label_thresholds.insert("car".into(), 0.8);
+        c.suppress_overlaps
+            .push(crate::model::filters::OverlapRule {
+                drop: "dog".into(),
+                if_overlaps: "cat".into(),
+                iou: 0.5,
+                night_only: false,
+            });
+        let on = form(&[
+            ("night_settings", "1"),
+            ("night_confidence_threshold", "0.6"),
+            ("night_person_threshold", "0.7"),
+            ("person_aspect_min", "0.2"),
+            ("person_aspect_max", "0.9"),
+            ("drop_person_on_plant", "on"),
+            ("static_suppression", "on"),
+        ]);
+        apply_config_form(&mut c, &on).unwrap();
+        assert_eq!(c.night_confidence_threshold, Some(0.6));
+        assert_eq!(night_person_threshold(&c), Some(0.7));
+        assert_eq!(c.night_label_thresholds.get("car"), Some(&0.8));
+        assert_eq!(c.person_aspect, Some([0.2, 0.9]));
+        assert!(has_plant_rule(&c));
+        assert_eq!(c.suppress_overlaps.len(), 2);
+        assert!(c.static_suppression.enabled);
+        // Posting it again adds no second plant rule.
+        apply_config_form(&mut c, &on).unwrap();
+        assert_eq!(c.suppress_overlaps.len(), 2);
+        // A form without the marker (another form, an API client) leaves the checkboxes.
+        apply_config_form(&mut c, &form(&[("port", "4000")])).unwrap();
+        assert!(has_plant_rule(&c) && c.static_suppression.enabled);
+        // Cleared fields and unchecked boxes turn the parts off; the rest stays.
+        let off = form(&[
+            ("night_settings", "1"),
+            ("night_confidence_threshold", ""),
+            ("night_person_threshold", ""),
+            ("person_aspect_min", ""),
+            ("person_aspect_max", ""),
+        ]);
+        apply_config_form(&mut c, &off).unwrap();
+        assert_eq!(c.night_confidence_threshold, None);
+        assert_eq!(night_person_threshold(&c), None);
+        assert_eq!(c.night_label_thresholds.get("car"), Some(&0.8));
+        assert_eq!(c.person_aspect, None);
+        assert!(!has_plant_rule(&c));
+        assert_eq!(c.suppress_overlaps.len(), 1, "the dog/cat rule stays");
+        assert!(!c.static_suppression.enabled);
+        // Errors leave the config untouched.
+        let before = c.clone();
+        for (k, v, want) in [
+            (
+                "night_confidence_threshold",
+                "2",
+                "night_confidence_threshold",
+            ),
+            ("night_person_threshold", "x", "night_person_threshold"),
+            ("person_aspect_min", "0.2", "person_aspect"),
+            ("person_aspect_max", "0.1", "person_aspect"),
+        ] {
+            let mut f = form(&[(k, v)]);
+            if k == "person_aspect_max" {
+                f.insert("person_aspect_min".into(), "0.5".into());
+            }
+            let e = format!("{:#}", apply_config_form(&mut c, &f).unwrap_err());
+            assert!(e.contains(want), "{k}: {e}");
+            assert_eq!(c, before);
+        }
     }
 }

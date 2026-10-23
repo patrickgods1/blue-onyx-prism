@@ -25,18 +25,21 @@ mod apply;
 mod benchmark;
 mod browse;
 mod config_page;
+mod dataset;
 mod detect;
 mod devices;
 mod guard;
 mod live;
 mod pages;
 mod resources;
+mod review;
 mod status;
 #[cfg(test)]
 mod test_util;
+mod training;
+mod training_tasks;
 
-use apply::sync_config;
-pub(crate) use apply::{apply_config, reload_models};
+pub(crate) use apply::{apply_config, reload_models, sync_config};
 use config_page::{
     ConfigView, MessageTemplate, config_loglevel, config_models, config_models_remove, config_page,
     config_restart, config_submit, encode_uri_component, global_device_label, save_config,
@@ -182,6 +185,43 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/config/models/remove", post(config_models_remove)),
         ("/config/restart", post(config_restart)),
         ("/config/loglevel", post(config_loglevel)),
+        ("/dataset", get(dataset::page)),
+        ("/dataset/settings", post(dataset::settings)),
+        ("/dataset/review", post(dataset::review)),
+        ("/dataset/resume", post(dataset::resume)),
+        ("/dataset/image", get(dataset::image)),
+        ("/dataset/sidecar", get(dataset::sidecar)),
+        ("/v1/dataset", get(dataset::json)),
+        ("/review", get(review::page)),
+        ("/v1/review/next", get(review::next)),
+        (
+            "/v1/review/labels",
+            get(review::labels_get)
+                .post(review::labels_post)
+                .layer(DefaultBodyLimit::max(review::LABELS_BODY_LIMIT)),
+        ),
+        (
+            "/v1/review/export",
+            post(review::export).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
+            "/v1/review/import",
+            post(review::import).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
+            "/v1/review/classes",
+            post(review::classes).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        ("/training", get(training::page)),
+        ("/v1/training", get(training::json)),
+        ("/training/queue", post(training::queue)),
+        ("/training/cancel", post(training::cancel)),
+        ("/training/remove", post(training::remove)),
+        ("/training/use", post(training::use_model)),
+        ("/training/datasets", post(training::datasets)),
+        ("/training/remove-env", post(training::remove_env)),
+        ("/training/import", post(training_tasks::import)),
+        ("/training/autolabel", post(training_tasks::autolabel)),
         ("/logs", get(logs_page)),
         ("/logs.json", get(logs_json)),
         ("/benchmark", get(benchmark::page)),
@@ -937,6 +977,29 @@ mod tests {
             "/config/models/remove",
             "/config/restart",
             "/config/loglevel",
+            "/dataset",
+            "/dataset/settings",
+            "/dataset/review",
+            "/dataset/resume",
+            "/dataset/image",
+            "/dataset/sidecar",
+            "/v1/dataset",
+            "/review",
+            "/v1/review/next",
+            "/v1/review/labels",
+            "/v1/review/export",
+            "/v1/review/import",
+            "/v1/review/classes",
+            "/training",
+            "/v1/training",
+            "/training/queue",
+            "/training/cancel",
+            "/training/remove",
+            "/training/use",
+            "/training/datasets",
+            "/training/remove-env",
+            "/training/import",
+            "/training/autolabel",
             "/logs",
             "/logs.json",
             "/benchmark",

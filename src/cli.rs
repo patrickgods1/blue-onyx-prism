@@ -115,6 +115,10 @@ pub enum Command {
     /// recommends the fastest agreeing device and saves `benchmark.json` (web UI Benchmark page);
     /// `--apply` also writes the recommended per-model `device` into the config file.
     Benchmark(Box<crate::benchmark::cli::BenchArgs>),
+    /// Train a custom model on reviewed frames (needs an NVIDIA GPU or Apple silicon; see
+    /// docs/TRAINING.md): `train capability`, `train estimate`, `train prepare`, `train run
+    /// --model yolo26n --dataset <review export>`, `train list`, `train remove-env`.
+    Train(Box<crate::training::cli::TrainArgs>),
     /// Show detected GPUs, every device option (runnable or why not) and what `auto` picks.
     ListDevices {
         /// Also show the load plan for this model file (repeatable; default: the enabled models
@@ -469,6 +473,7 @@ impl Cli {
             Command::Fetch { .. }
             | Command::ListResources { .. }
             | Command::Benchmark(_)
+            | Command::Train(_)
             | Command::Service { .. } => cmd,
             Command::ListDevices { model } => Command::ListDevices {
                 model: model.iter().map(|p| absolutize(p, base)).collect(),

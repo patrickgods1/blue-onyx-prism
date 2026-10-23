@@ -3,7 +3,7 @@
 //! ([`Done`]). Invariant: requests leave `pending` in FIFO order and are answered in the order
 //! they entered `order`, so replies keep the request order. Pure data: no I/O, no backend calls.
 
-use super::LiveSettings;
+use super::{LiveSettings, Reply};
 use crate::api::VisionDetectionResponse;
 use crate::backend::Completion;
 use crate::model::PreprocessCtx;
@@ -26,7 +26,7 @@ pub(super) enum Stage {
 
 /// Who asked and when.
 pub(super) struct Meta {
-    pub(super) reply: tokio::sync::oneshot::Sender<VisionDetectionResponse>,
+    pub(super) reply: Reply,
     pub(super) enqueued: Instant,
     pub(super) image_name: String,
     pub(super) min_confidence: f32,
@@ -34,6 +34,28 @@ pub(super) struct Meta {
     pub(super) live: Arc<LiveSettings>,
     /// Short id in every log line of this request (see [`super::new_request_id`]).
     pub(super) request_id: String,
+    /// What is left of the timeout of a request forwarded by another worker, counted from
+    /// `enqueued` (None: this worker's own request timeout).
+    pub(super) budget: Option<Duration>,
+    /// May still be forwarded to the night model (false once tried, and for requests that
+    /// were forwarded here: those are never forwarded again).
+    pub(super) forwardable: bool,
+    /// The model that forwarded this request here (None: it came from the HTTP layer).
+    pub(super) routed_from: Option<String>,
+    /// A verifier-cascade check from another worker ([`super::Purpose::Verify`]): raw
+    /// detections only, never verified, filtered or saved.
+    pub(super) verify_crop: bool,
+    /// The upload's encoded bytes, kept (a reference count, no copy) while the dataset
+    /// collector is on ([`crate::collect`]); None otherwise.
+    pub(super) original: Option<bytes::Bytes>,
+}
+
+impl Meta {
+    /// The request timeout of this request: the live one, capped by a forwarded budget.
+    pub(super) fn timeout(&self) -> Duration {
+        let own = self.live.request_timeout;
+        self.budget.map_or(own, |b| b.min(own))
+    }
 }
 
 pub(super) struct Job {
@@ -46,6 +68,7 @@ pub(super) struct InFlight {
     pub(super) meta: Meta,
     pub(super) ctx: PreprocessCtx,
     pub(super) img: Option<crate::image::RgbImage>,
+    pub(super) stats: crate::image_stats::ImageStats,
     pub(super) decode: Duration,
     pub(super) preprocess: Duration,
     pub(super) seq: u64,
@@ -121,12 +144,17 @@ mod tests {
         let (reply, _rx) = tokio::sync::oneshot::channel();
         InFlight {
             meta: Meta {
-                reply,
+                reply: Reply::Client(reply),
                 enqueued: Instant::now(),
                 image_name: String::new(),
                 min_confidence: 0.0,
                 live: Arc::new(LiveSettings::default()),
                 request_id: String::new(),
+                budget: None,
+                forwardable: true,
+                routed_from: None,
+                verify_crop: false,
+                original: None,
             },
             ctx: PreprocessCtx {
                 orig_w: 1,
@@ -139,6 +167,7 @@ mod tests {
                 pad_y: 0.0,
             },
             img: None,
+            stats: crate::image_stats::ImageStats::default(),
             decode: Duration::ZERO,
             preprocess: Duration::ZERO,
             seq,

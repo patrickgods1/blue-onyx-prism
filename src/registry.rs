@@ -17,7 +17,9 @@ use crate::metrics::{Metrics, ModelGauges};
 use crate::profile::Profile;
 use crate::resources::provision::Provision;
 use crate::sync::{LockExt, RwLockExt};
-use crate::worker::{LiveSettings, LoadGate, WorkerConfig, WorkerHandle, spawn_worker_after};
+use crate::worker::{
+    LiveSettings, LoadGate, Peers, WorkerConfig, WorkerHandle, spawn_worker_after,
+};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -142,12 +144,15 @@ struct Slots {
     default_idx: Option<usize>,
     /// Normalized name -> reloads of that model in this generation.
     reloads: HashMap<String, u64>,
+    /// What the workers see of each other (night model switch); republished with `by_name`.
+    peers: Peers,
 }
 
 impl Slots {
-    fn from_slots(workers: Vec<WorkerSlot>, default_idx: Option<usize>) -> Self {
+    fn from_slots(workers: Vec<WorkerSlot>, default_idx: Option<usize>, peers: Peers) -> Self {
         let mut s = Self {
             workers,
+            peers,
             ..Self::default()
         };
         s.rebuild_names();
@@ -162,6 +167,7 @@ impl Slots {
             .enumerate()
             .map(|(i, w)| (normalize_name(&w.handle.name), i))
             .collect();
+        self.peers.publish(self.workers.iter().map(|w| &w.handle));
     }
 
     /// Put the workers in `config` order (models it does not list keep their order at the end),
@@ -190,6 +196,8 @@ struct Spawner {
     profile: Profile,
     /// The generation's decode + preprocess pool (shared by every worker, reloads included).
     prep: Arc<crate::prep::PrepPool>,
+    /// The generation's worker directory (shared with [`Slots::peers`]).
+    peers: Peers,
     prep_threads: usize,
     best_cpu: DeviceSpec,
     can_use_gpu: bool,
@@ -340,6 +348,7 @@ impl Spawner {
             model,
             wait,
             prep: Some(self.prep.clone()),
+            peers: self.peers.clone(),
         };
         let mut handle = spawn_worker_after(self.runtimes.clone(), cfg, mm, stop, after);
         handle.set_planned(device, planned.map(|(_, label)| label));
@@ -565,6 +574,7 @@ impl ModelRegistry {
             shutdown,
             profile,
             prep: crate::prep::PrepPool::new(prep_threads),
+            peers: Peers::new(),
             prep_threads,
             best_cpu,
             can_use_gpu: runtime_info.has_gpu,
@@ -594,8 +604,9 @@ impl ModelRegistry {
             info!(model = %w.handle.name, "default model for /v1/vision/detection");
         }
 
+        let peers = spawner.peers.clone();
         Ok(Self {
-            slots: RwLock::new(Slots::from_slots(workers, default_idx)),
+            slots: RwLock::new(Slots::from_slots(workers, default_idx, peers)),
             runtime_info,
             spawner: Some(spawner),
             retiring: Mutex::new(Vec::new()),
@@ -621,7 +632,7 @@ impl ModelRegistry {
             })
             .collect();
         Self {
-            slots: RwLock::new(Slots::from_slots(workers, default_idx)),
+            slots: RwLock::new(Slots::from_slots(workers, default_idx, Peers::new())),
             runtime_info,
             spawner: None,
             retiring: Mutex::new(Vec::new()),
@@ -691,6 +702,11 @@ impl ModelRegistry {
         s.default_idx
             .and_then(|i| s.workers.get(i))
             .map(|w| w.handle.clone())
+    }
+
+    /// The directory of served workers the workers forward through (night model switch).
+    pub fn peers(&self) -> Peers {
+        self.read().peers.clone()
     }
 
     /// Case-insensitive lookup; a trailing `.onnx` / `.xml` is ignored.
@@ -884,7 +900,11 @@ impl ModelRegistry {
     pub fn shutdown(&self) {
         // Taken out of the registry (not consumed): a handler of a retired generation may still
         // hold an `Arc` of it while its connection winds down; it then sees no models.
-        let slots = std::mem::take(&mut *self.slots.write_recover());
+        let slots = {
+            let mut s = self.slots.write_recover();
+            s.peers.clear();
+            std::mem::take(&mut *s)
+        };
         for WorkerSlot { handle, stop, join } in slots.workers {
             let name = handle.name.clone();
             if handle.is_stuck() {
@@ -1164,6 +1184,35 @@ mod tests {
         assert!(reg.reload_model("a", &c, None).is_err());
         assert_eq!(reg.reloads("a"), 0);
         assert_eq!(reg.names(), ["a"]);
+    }
+
+    #[test]
+    fn peers_follow_the_served_workers() {
+        let metrics = Metrics::new("0");
+        let reg = ModelRegistry::from_handles(
+            vec![
+                WorkerHandle::failed("Day", "test", metrics.model("Day")),
+                WorkerHandle::failed("night", "test", metrics.model("night")),
+            ],
+            Some(0),
+            RuntimeInfo::default(),
+        );
+        let peers = reg.peers();
+        assert_eq!(peers.get("NIGHT.onnx").unwrap().name, "night");
+        assert_eq!(peers.get("day").unwrap().name, "Day");
+        assert!(peers.get("other").is_none());
+        // A worker taken out of the registry drops out of the directory with its last handle.
+        let night = {
+            let mut s = reg.write();
+            let i = s.by_name["night"];
+            let slot = s.workers.remove(i);
+            s.rebuild_names();
+            slot
+        };
+        assert!(peers.get("night").is_none());
+        drop(night);
+        reg.shutdown();
+        assert!(peers.get("day").is_none(), "cleared at shutdown");
     }
 
     #[test]

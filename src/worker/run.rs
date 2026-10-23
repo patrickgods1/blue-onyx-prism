@@ -5,22 +5,28 @@
 //! queued request); postprocessing runs on this thread.
 
 use super::pipeline::{Done, InFlight, Job, Meta, Pipeline, Stage};
+use super::verify::{Lane, LaneCtx, Pending};
 use super::watch::{SlowCompile, StuckWatch, collect_watched, watch_slow_compile};
 use super::{
-    COMPILING_ON, LoadGate, ORDER_TARGET, POLL, WorkItem, WorkerConfig, auto_queue_size,
-    effective_threshold, initializing_message, loaded_provider, millis_u64, ms, new_request_id,
+    COMPILING_ON, Decoded, LoadGate, ORDER_TARGET, POLL, Purpose, Reply, WorkItem, WorkerConfig,
+    WorkerHandle, auto_queue_size, effective_threshold, initializing_message, loaded_provider,
+    millis_u64, ms, new_request_id,
 };
 use crate::api::VisionDetectionResponse;
 use crate::backend::{Backend, Candidate, Completion, DeviceInfo, Runtimes};
-use crate::metrics::{DropReason, ModelMetrics};
+use crate::image_stats::Scene;
+use crate::metrics::{DropReason, ModelMetrics, RouteFallback};
+use crate::model::filters::{SuppressCounts, SuppressReason};
+use crate::model::preprocess::Preprocessor;
 use crate::model::{Family, PostParams};
 use crate::prep::{PrepJob, PrepPool, PrepSpec, Prepared};
 use crate::profile::DeviceTuning;
 use crate::startup::{ModelState, StateHandle};
+use crate::static_memory::StaticMemory;
 use crate::sync::{LockExt, RwLockExt};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Select, TryRecvError};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -62,6 +68,15 @@ pub(super) struct WorkerCtx {
     pub(super) consecutive_errors: Cell<u32>,
     /// Inferences in a row whose outputs were degenerate (see [`outputs_degenerate`]).
     pub(super) consecutive_degenerate: Cell<u32>,
+    /// Static-box memory of this model (kept across live-settings swaps; a reload starts a new
+    /// worker and so an empty memory).
+    pub(super) static_memory: RefCell<StaticMemory>,
+    /// Preprocessor for requests forwarded with a decoded image ([`WorkItem::DetectDecoded`]),
+    /// made on first use for the engine's geometry.
+    pub(super) decoded_pre: RefCell<Option<(PrepSpec, Preprocessor)>>,
+    /// The verifier-cascade continuation thread (started on the first verification; see
+    /// [`super::verify`]).
+    pub(super) verify_lane: RefCell<Option<Lane>>,
 }
 
 /// Inference errors in a row after which the model counts as broken (a reset GPU makes every
@@ -170,11 +185,13 @@ impl WorkerCtx {
                 let mut sel = Select::new();
                 let i_work =
                     (!closed && self.has_room(engine.as_ref(), &p, &prep)).then(|| sel.recv(&rx));
+                // The head's prep reply is awaited while a slot is free, or (no slot free) when
+                // it may be forwarded to the night model, which needs no slot here.
                 let head_prep = match p.pending.front() {
                     Some(Job {
                         stage: Stage::Prep(r),
-                        ..
-                    }) if p.slots.iter().any(Option::is_none) => Some(r),
+                        meta,
+                    }) if p.slots.iter().any(Option::is_none) || may_route(meta) => Some(r),
                     _ => None,
                 };
                 let i_prep = head_prep.map(|r| sel.recv(r));
@@ -221,6 +238,8 @@ impl WorkerCtx {
             eng.backend.abort();
         }
         self.answer_remaining(p, &rx);
+        // Answers the verifications still waiting (unverified) and joins the lane thread.
+        drop(self.verify_lane.borrow_mut().take());
         drop(parked);
         info!(model = %name, "worker exiting");
     }
@@ -231,9 +250,14 @@ impl WorkerCtx {
         let msg = format!("Model '{}' is shutting down", self.cfg.name);
         self.answer_all(p, &msg);
         while let Ok(item) = rx.try_recv() {
-            if let WorkItem::Detect(_, reply, _) | WorkItem::DetectWithId(_, reply, _, _) = item {
-                let _ = reply.send(self.error_response(msg.clone(), 0, 0));
-            }
+            let reply = match item {
+                WorkItem::Detect(_, reply, _) | WorkItem::DetectWithId(_, reply, _, _) => {
+                    Reply::Client(reply)
+                }
+                WorkItem::DetectDecoded(d) => d.reply,
+                WorkItem::Load => continue,
+            };
+            let _ = reply.send(self.error_response(msg.clone(), 0, 0));
         }
     }
 
@@ -292,7 +316,7 @@ impl WorkerCtx {
         prep: &PrepPool,
     ) {
         let name = &self.cfg.name;
-        let (req, reply, enqueued, request_id) = match item {
+        let (meta, input) = match item {
             WorkItem::Load => {
                 if engine.is_none() && !matches!(self.state.get(), ModelState::Failed(_)) {
                     // Lazy model: compile now; requests meanwhile are answered
@@ -304,8 +328,13 @@ impl WorkerCtx {
                 }
                 return;
             }
-            WorkItem::Detect(req, reply, enqueued) => (req, reply, enqueued, new_request_id()),
-            WorkItem::DetectWithId(req, reply, enqueued, id) => (req, reply, enqueued, id),
+            WorkItem::Detect(req, reply, enqueued) => {
+                self.intake(req, Reply::Client(reply), enqueued, new_request_id())
+            }
+            WorkItem::DetectWithId(req, reply, enqueued, id) => {
+                self.intake(req, Reply::Client(reply), enqueued, id)
+            }
+            WorkItem::DetectDecoded(d) => self.intake_decoded(*d),
         };
         let Some(eng) = engine.as_ref() else {
             // Only reachable for a lazy model (between the server's trigger and the state
@@ -320,32 +349,47 @@ impl WorkerCtx {
                     initializing_message(name, self.state.detail().as_deref())
                 }
             };
-            let _ = reply.send(self.error_response(msg, 0, 0));
+            let _ = meta.reply.send(self.error_response(msg, 0, 0));
             return;
         };
         trace!(
             target: ORDER_TARGET,
             model = %name,
-            image = %req.image_name,
-            request_id = %request_id,
+            image = %meta.image_name,
+            request_id = %meta.request_id,
             "accepted"
         );
-        let meta = Meta {
-            reply,
-            enqueued,
-            image_name: req.image_name,
-            min_confidence: req.min_confidence,
-            live: self.cfg.live.load_full(),
-            request_id,
+        let image_data = match input {
+            Input::Bytes(b) => b,
+            Input::Decoded { img, stats, decode } => {
+                let stage = if let Some(resp) = self.timed_out(&meta) {
+                    Stage::Answer(resp)
+                } else {
+                    match self.prepare_decoded(eng, prep, img, stats, &meta) {
+                        Ok(mut prepared) => {
+                            prepared.decode = decode;
+                            Stage::Ready(prepared)
+                        }
+                        Err(e) => Stage::Answer(self.failure(&meta, &eng.provider, &e)),
+                    }
+                };
+                p.pending.push_back(Job { meta, stage });
+                return;
+            }
         };
         let stage = if let Some(resp) = self.timed_out(&meta) {
             Stage::Answer(resp)
         } else {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let job = PrepJob {
-                image: req.image_data,
+                image: image_data,
                 spec: eng.spec,
-                keep_image: meta.live.save_image_path.is_some(),
+                // The decoded frame is forwarded when the night model takes it, and cropped
+                // for the verifier.
+                keep_image: meta.live.save_image_path.is_some()
+                    || may_route(&meta)
+                    || may_verify(&meta),
+                preprocess: meta.live.preprocess,
                 reply: tx,
             };
             match prep.submit(job) {
@@ -356,10 +400,264 @@ impl WorkerCtx {
         p.pending.push_back(Job { meta, stage });
     }
 
+    /// The bookkeeping of a request from the HTTP layer (live settings as of now).
+    fn intake(
+        &self,
+        req: crate::api::VisionDetectionRequest,
+        reply: Reply,
+        enqueued: Instant,
+        request_id: String,
+    ) -> (Meta, Input) {
+        let live = self.cfg.live.load_full();
+        let original = live.collect.enabled.then(|| req.image_data.clone());
+        let meta = Meta {
+            reply,
+            enqueued,
+            image_name: req.image_name,
+            min_confidence: req.min_confidence,
+            live,
+            request_id,
+            budget: None,
+            forwardable: true,
+            routed_from: None,
+            verify_crop: false,
+            original,
+        };
+        (meta, Input::Bytes(req.image_data))
+    }
+
+    /// The bookkeeping of a request another worker forwarded with its decoded image: this
+    /// model's live settings, the sender's deadline, never forwarded again.
+    fn intake_decoded(&self, d: Decoded) -> (Meta, Input) {
+        let Decoded {
+            img,
+            stats,
+            image_name,
+            min_confidence,
+            request_id,
+            enqueued,
+            deadline,
+            decode,
+            reply,
+            from,
+            purpose,
+            original,
+        } = d;
+        let meta = Meta {
+            reply,
+            enqueued,
+            image_name,
+            min_confidence,
+            live: self.cfg.live.load_full(),
+            request_id,
+            budget: Some(deadline.saturating_duration_since(enqueued)),
+            forwardable: false,
+            routed_from: Some(from),
+            verify_crop: purpose == Purpose::Verify,
+            original: original.filter(|_| purpose == Purpose::NightModel),
+        };
+        (meta, Input::Decoded { img, stats, decode })
+    }
+
+    /// Preprocess a forwarded, already decoded image for this model on this thread (the
+    /// letterbox / stretch of one frame, plus this model's enhancement for the frame's scene).
+    fn prepare_decoded(
+        &self,
+        eng: &Engine,
+        prep: &PrepPool,
+        img: crate::image::RgbImage,
+        stats: crate::image_stats::ImageStats,
+        meta: &Meta,
+    ) -> Result<Prepared> {
+        let mut cell = self.decoded_pre.borrow_mut();
+        let (spec, pre) = match cell.take() {
+            Some((spec, pre)) if spec == eng.spec => (spec, pre),
+            _ => (eng.spec, eng.spec.preprocessor()),
+        };
+        let mut pre = pre;
+        let keep = (meta.live.save_image_path.is_some() && !meta.verify_crop) || may_verify(meta);
+        // This model's own modes (the sender's scene statistics, its original frame).
+        let modes = meta.live.preprocess;
+        let tensors = prep.tensors();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PrepPool::prepare_image(&mut pre, tensors, img, stats, &spec, keep, modes)
+        }));
+        match result {
+            Ok(r) => {
+                *cell = Some((spec, pre));
+                r
+            }
+            // The preprocessor may be half-updated: the next request makes a new one.
+            Err(_) => Err(anyhow::anyhow!("preprocessing panicked")),
+        }
+    }
+
+    /// Night model switch for the request at the head of `pending` (decoded, a night / IR
+    /// frame, `night_model` set, not tried before): hand its decoded image to the night model's
+    /// worker when that one is ready and has room. None: forwarded (the night worker answers
+    /// it); `Some(job)`: run it here (a fallback is counted and warned about, throttled). Never
+    /// blocks: the send is a `try_send`, so two workers can never wait on each other.
+    fn route(&self, mut job: Job) -> Option<Job> {
+        job.meta.forwardable = false;
+        let Some(night) = job.meta.live.night_model.clone() else {
+            return Some(job);
+        };
+        let Job { meta, stage } = job;
+        let mut prepared = match stage {
+            Stage::Ready(p) => p,
+            stage => return Some(Job { meta, stage }),
+        };
+        let scene = prepared.stats.scene();
+        let late = meta.enqueued.elapsed() > meta.timeout();
+        let img = match prepared.img.take() {
+            // Day frame, or already too late (answered as a drop in its turn).
+            Some(img) if scene != Scene::Day && !late => img,
+            img => {
+                // Kept for routing only: drop it unless this model saves or verifies.
+                prepared.img =
+                    img.filter(|_| meta.live.save_image_path.is_some() || may_verify(&meta));
+                return Some(Job {
+                    meta,
+                    stage: Stage::Ready(prepared),
+                });
+            }
+        };
+        let target = match self.night_target(&night) {
+            Ok(h) => h,
+            Err(reason) => {
+                return Some(self.fall_back(meta, prepared, img, &night, reason));
+            }
+        };
+        let log_id = meta.request_id.clone();
+        let log_image = meta.image_name.clone();
+        let deadline = meta.enqueued + meta.timeout();
+        let Meta {
+            reply,
+            enqueued,
+            image_name,
+            min_confidence,
+            live,
+            request_id,
+            budget,
+            original,
+            ..
+        } = meta;
+        let decoded = Decoded {
+            img,
+            stats: prepared.stats,
+            image_name,
+            min_confidence,
+            request_id,
+            enqueued,
+            deadline,
+            decode: prepared.decode,
+            reply,
+            from: self.cfg.name.clone(),
+            purpose: Purpose::NightModel,
+            original,
+        };
+        let (back, reason) = match target
+            .sender
+            .try_send(WorkItem::DetectDecoded(Box::new(decoded)))
+        {
+            Ok(()) => {
+                self.metrics.record_night_routed();
+                // The primary's line of this request; the night model logs its own
+                // "detection done" with the same request id.
+                debug!(
+                    model = %self.cfg.name,
+                    routed_to = %target.name,
+                    request_id = %log_id,
+                    image = %log_image,
+                    scene = %scene,
+                    luma = f64::from(prepared.stats.mean_luma),
+                    chroma = f64::from(prepared.stats.chroma_spread.min(prepared.stats.tint_spread)),
+                    elapsed_ms = millis_u64(enqueued.elapsed()),
+                    decode_ms = prepared.decode.as_secs_f64() * 1e3,
+                    "detection routed to the night model"
+                );
+                return None;
+            }
+            Err(crossbeam_channel::TrySendError::Full(i)) => (i, RouteFallback::QueueFull),
+            Err(crossbeam_channel::TrySendError::Disconnected(i)) => (i, RouteFallback::Stopped),
+        };
+        let WorkItem::DetectDecoded(d) = back else {
+            // Not reachable (the item sent is the item returned); nothing to answer then.
+            return None;
+        };
+        let d = *d;
+        let meta = Meta {
+            reply: d.reply,
+            enqueued: d.enqueued,
+            image_name: d.image_name,
+            min_confidence: d.min_confidence,
+            live,
+            request_id: d.request_id,
+            budget,
+            forwardable: false,
+            routed_from: None,
+            verify_crop: false,
+            original: d.original,
+        };
+        Some(self.fall_back(meta, prepared, d.img, &night, reason))
+    }
+
+    /// The served, ready worker of `night` with room for one more request, or why not (a lazy
+    /// night model is asked to compile).
+    fn night_target(&self, night: &str) -> std::result::Result<Arc<WorkerHandle>, RouteFallback> {
+        use crate::registry::normalize_name;
+        let h = self
+            .cfg
+            .peers
+            .get(night)
+            .filter(|h| normalize_name(&h.name) != normalize_name(&self.cfg.name))
+            .ok_or(RouteFallback::Unknown)?;
+        if h.state.get() != ModelState::Ready {
+            h.trigger_load();
+            return Err(RouteFallback::NotReady);
+        }
+        if h.is_full() {
+            return Err(RouteFallback::QueueFull);
+        }
+        Ok(h)
+    }
+
+    /// Run a night / IR frame here after all: count and warn (throttled), and put the decoded
+    /// image back when this model saves images.
+    fn fall_back(
+        &self,
+        meta: Meta,
+        mut prepared: Prepared,
+        img: crate::image::RgbImage,
+        night: &str,
+        reason: RouteFallback,
+    ) -> Job {
+        self.metrics.record_night_fallback(reason);
+        if let Some(held_back) = self.metrics.night_fallback_log.allow(self.metrics.now_ms()) {
+            warn!(
+                model = %self.cfg.name,
+                night_model = %night,
+                reason = reason.as_str(),
+                request_id = %meta.request_id,
+                similar_since_last_warning = held_back,
+                "night / IR frame runs on this model: its night_model is {}; check that model \
+                 on the Models card (enabled, loaded) or clear night_model",
+                fallback_text(reason)
+            );
+        }
+        if meta.live.save_image_path.is_some() || may_verify(&meta) {
+            prepared.img = Some(img);
+        }
+        Job {
+            meta,
+            stage: Stage::Ready(prepared),
+        }
+    }
+
     /// The drop answer when `meta` waited longer than the request timeout.
     fn timed_out(&self, meta: &Meta) -> Option<VisionDetectionResponse> {
         let waited = meta.enqueued.elapsed();
-        let timeout = meta.live.request_timeout;
+        let timeout = meta.timeout();
         if waited <= timeout {
             return None;
         }
@@ -430,6 +728,23 @@ impl WorkerCtx {
                 job.stage = self.prep_stage(r, &job.meta);
                 moved = true;
             }
+            if matches!(job.stage, Stage::Ready(_)) && may_route(&job.meta) {
+                // Night model switch: a forwarded request leaves this pipeline without a
+                // slot or a place in the reply order.
+                let Some(job) = p.pending.pop_front() else {
+                    break;
+                };
+                match self.route(job) {
+                    None => {
+                        moved = true;
+                        continue;
+                    }
+                    Some(job) => p.pending.push_front(job),
+                }
+            }
+            let Some(job) = p.pending.front() else {
+                break;
+            };
             let slot = match &job.stage {
                 Stage::Answer(_) => None,
                 Stage::Ready(_) => match p.free_slot() {
@@ -463,6 +778,7 @@ impl WorkerCtx {
                     let Prepared {
                         ctx,
                         img,
+                        stats,
                         decode,
                         preprocess,
                         ..
@@ -478,6 +794,7 @@ impl WorkerCtx {
                         meta,
                         ctx,
                         img,
+                        stats,
                         decode,
                         preprocess,
                         seq,
@@ -538,7 +855,7 @@ impl WorkerCtx {
         if let Some(&Done::Slot(i)) = p.order.front()
             && let Some(f) = p.slots.get_mut(i).and_then(Option::as_mut)
             && f.done.is_none()
-            && f.submitted.elapsed() > f.meta.live.request_timeout
+            && f.submitted.elapsed() > f.meta.timeout()
         {
             warn!(
                 model = %self.cfg.name,
@@ -570,7 +887,7 @@ impl WorkerCtx {
             success = resp.success,
             "replied"
         );
-        if meta.reply.send(resp).is_err() {
+        if !meta.reply.send(resp) {
             debug!(model = %self.cfg.name, "client went away before the response was sent");
         }
     }
@@ -821,7 +1138,50 @@ impl WorkerCtx {
         }
     }
 
-    /// Collect `slot`'s finished inference, postprocess on this thread and reply.
+    /// The night / IR rules ([`crate::model::filters::apply`]), then the static-box memory, on
+    /// one request's detections; adds what each removed to `counts`, and the removed boxes
+    /// with their reasons to `removed` when given (dataset collector).
+    fn filter_detections(
+        &self,
+        dets: Vec<crate::model::Detection>,
+        f: &InFlight,
+        scene: Scene,
+        live: &super::LiveSettings,
+        counts: &mut SuppressCounts,
+        mut removed: Option<&mut Vec<(crate::model::Detection, SuppressReason)>>,
+    ) -> Vec<crate::model::Detection> {
+        let (w, h) = (f.ctx.orig_w, f.ctx.orig_h);
+        let (dets, c) = crate::model::filters::apply_recording(
+            dets,
+            &self.cfg.classes,
+            w,
+            h,
+            scene,
+            &live.filters,
+            removed.as_deref_mut(),
+        );
+        *counts = c;
+        let st = &live.static_suppression;
+        let mut memory = self.static_memory.borrow_mut();
+        if !st.enabled && memory.keys() == 0 {
+            return dets;
+        }
+        let key = crate::static_memory::camera_key(&self.cfg.name, &f.meta.image_name, w, h);
+        let before = removed.as_ref().map(|_| dets.clone());
+        let (dets, n) = memory.apply(&key, dets, &self.cfg.classes, st, Instant::now());
+        counts.add(SuppressReason::Static, n);
+        if let (Some(v), Some(before)) = (removed, before)
+            && n > 0
+        {
+            v.extend(super::collect::removed_by_static(&before, &dets));
+        }
+        dets
+    }
+
+    /// Collect `slot`'s finished inference, postprocess on this thread and reply. A request
+    /// with verifier candidates is handed to the verify lane instead ([`super::verify`]),
+    /// which replies once the verifier answered (or the request's deadline passed): this
+    /// thread never waits for another model.
     fn finish(&self, eng: &mut Engine, slot: usize, f: InFlight) {
         let name = &self.cfg.name;
         let infer_d = f
@@ -830,16 +1190,41 @@ impl WorkerCtx {
             .saturating_duration_since(f.submitted);
         let t = Instant::now();
         let live = f.meta.live.clone();
+        let threshold = effective_threshold(f.min_confidence(), live.confidence_threshold);
+        // Dataset collector: the record of this request (None: collection off). With the
+        // `near_threshold` bucket on, postprocessing runs `margin` below the threshold and the
+        // boxes under it are only recorded: greedy NMS and its caps keep the highest scores,
+        // so the boxes at or above the threshold are exactly those of a run at the threshold.
+        let near_margin = live
+            .collect
+            .wants_below_threshold()
+            .then(|| live.collect.buckets.near_margin());
+        let mut collect_job = super::collect::Job::start(
+            &f.meta,
+            &crate::collect::DraftInput {
+                model: name,
+                device: &eng.device,
+                request_id: &f.meta.request_id,
+                routed_from: f.meta.routed_from.as_deref(),
+                image_name: &f.meta.image_name,
+                stats: f.stats,
+                width: f.ctx.orig_w,
+                height: f.ctx.orig_h,
+                threshold,
+                near_margin,
+            },
+        );
+        let post_threshold = match (&collect_job, near_margin) {
+            (Some(_), Some(m)) => (threshold - m).max(crate::model::nms::MIN_CONFIDENCE_FLOOR),
+            _ => threshold,
+        };
         let params = PostParams {
-            confidence_threshold: effective_threshold(
-                f.min_confidence(),
-                live.confidence_threshold,
-            ),
+            confidence_threshold: post_threshold,
             nms_iou: live.nms_iou,
         };
         let collected = if f.overdue {
             let watch = self.stuck_watch(eng);
-            let limit = live.request_timeout;
+            let limit = f.meta.timeout();
             collect_watched(&watch, limit, || eng.backend.collect(slot))
         } else {
             eng.backend.collect(slot)
@@ -850,63 +1235,86 @@ impl WorkerCtx {
             self.stuck_watch(eng).mark(f.submitted.elapsed(), Some(e));
         }
         let mut degenerate = false;
+        let scene = f.stats.scene();
+        let crop = f.meta.verify_crop;
+        let mut suppressed = SuppressCounts::default();
         let result = collected.and_then(|outs| {
             degenerate = outputs_degenerate(&outs);
             let dets = eng.family.postprocess(&outs, &f.ctx, &params);
             eng.backend.recycle(slot, outs);
+            let dets = dets?;
+            if crop {
+                // A verifier check: the raw detections in the crop (see `Purpose::Verify`).
+                return Ok(crate::model::to_predictions(
+                    &dets,
+                    &f.ctx,
+                    &self.cfg.classes,
+                    None,
+                ));
+            }
+            let dets = match collect_job.as_mut() {
+                Some(job) => {
+                    let (raw, below): (Vec<_>, Vec<_>) =
+                        dets.into_iter().partition(|d| d.score >= threshold);
+                    let mut removed = Vec::new();
+                    let kept = self.filter_detections(
+                        raw.clone(),
+                        &f,
+                        scene,
+                        &live,
+                        &mut suppressed,
+                        Some(&mut removed),
+                    );
+                    job.draft
+                        .set_detections(&raw, &below, &removed, &self.cfg.classes);
+                    kept
+                }
+                None => self.filter_detections(dets, &f, scene, &live, &mut suppressed, None),
+            };
             let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
             Ok(crate::model::to_predictions(
-                &dets?,
+                &dets,
                 &f.ctx,
                 &self.cfg.classes,
                 filter,
             ))
         });
+        self.metrics.record_suppressed(&suppressed);
         self.note_health(eng, result.as_ref().err(), degenerate);
         let post_d = t.elapsed();
         let process_d = f.decode + f.preprocess + infer_d + post_d;
-        let round_trip = f.meta.enqueued.elapsed();
+        let line = DoneLine {
+            model: name.clone(),
+            device: eng.device.clone(),
+            request_id: f.meta.request_id.clone(),
+            routed_from: f.meta.routed_from.clone(),
+            verify_crop: crop,
+            image: f.meta.image_name.clone(),
+            size: format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
+            scene,
+            luma: f64::from(f.stats.mean_luma),
+            chroma: f64::from(f.stats.chroma_spread.min(f.stats.tint_spread)),
+            suppressed: suppressed_summary(&suppressed),
+            slot,
+            queue_ms: millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
+            decode_ms: f.decode.as_secs_f64() * 1e3,
+            preprocess_ms: f.preprocess.as_secs_f64() * 1e3,
+            inference_ms: infer_d.as_secs_f64() * 1e3,
+            postprocess_ms: post_d.as_secs_f64() * 1e3,
+            process: process_d,
+            enqueued: f.meta.enqueued,
+        };
+        let InFlight {
+            meta,
+            img,
+            ctx,
+            stats,
+            ..
+        } = f;
         let resp = match result {
             Ok(predictions) => {
                 self.metrics.inference_ms.record(millis_u64(infer_d));
-                self.metrics.process_ms.record(millis_u64(process_d));
-                // The one log line per detection (structured fields only).
-                debug!(
-                    model = %name,
-                    device = %eng.device,
-                    request_id = %f.meta.request_id,
-                    image = %f.meta.image_name,
-                    size = %format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
-                    count = predictions.len(),
-                    detections = %detections_summary(&predictions),
-                    slot,
-                    queue_ms = millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
-                    decode_ms = f.decode.as_secs_f64() * 1e3,
-                    preprocess_ms = f.preprocess.as_secs_f64() * 1e3,
-                    inference_ms = infer_d.as_secs_f64() * 1e3,
-                    postprocess_ms = post_d.as_secs_f64() * 1e3,
-                    process_ms = process_d.as_secs_f64() * 1e3,
-                    round_trip_ms = round_trip.as_secs_f64() * 1e3,
-                    "detection done"
-                );
-                if let (Some(dir), Some(img)) = (&live.save_image_path, &f.img) {
-                    let file_name =
-                        if f.meta.image_name.is_empty() || f.meta.image_name == "image.jpg" {
-                            format!("{}.jpg", uuid::Uuid::new_v4())
-                        } else {
-                            f.meta.image_name.clone()
-                        };
-                    if let Err(e) = crate::image::save_annotated(
-                        dir,
-                        &file_name,
-                        img,
-                        &predictions,
-                        live.save_ref_image,
-                    ) {
-                        warn!(model = %name, "could not save annotated image: {e:#}");
-                    }
-                }
-                VisionDetectionResponse {
+                let resp = VisionDetectionResponse {
                     success: true,
                     message: format!("Found {} objects", predictions.len()),
                     error: None,
@@ -919,17 +1327,57 @@ impl WorkerCtx {
                     inferenceMs: ms(infer_d),
                     processMs: ms(process_d),
                     analysisRoundTripMs: 0,
+                };
+                let plan = match (&live.verify, may_verify(&meta)) {
+                    (Some(cfg), true) => {
+                        crate::verify::plan(&resp.predictions, ctx.orig_w, ctx.orig_h, scene, cfg)
+                    }
+                    _ => crate::verify::Plan::default(),
+                };
+                if !plan.is_empty() {
+                    let deadline = meta.enqueued + meta.timeout();
+                    let pending = Box::new(Pending {
+                        reply: meta.reply,
+                        resp,
+                        img,
+                        stats,
+                        plan,
+                        live,
+                        request_id: meta.request_id,
+                        image_name: meta.image_name,
+                        enqueued: meta.enqueued,
+                        deadline,
+                        handed_off: Instant::now(),
+                        line,
+                        collect: collect_job.take(),
+                    });
+                    self.hand_off(pending);
+                    return;
                 }
+                self.metrics.process_ms.record(millis_u64(process_d));
+                line.emit(&resp.predictions, None);
+                if !crop && let (Some(dir), Some(img)) = (&live.save_image_path, &img) {
+                    save_annotated(
+                        name,
+                        dir,
+                        &meta.image_name,
+                        img,
+                        &resp.predictions,
+                        live.save_ref_image,
+                    );
+                }
+                resp
             }
             Err(e) => {
+                collect_job = None;
                 warn!(
                     model = %name,
                     device = %eng.device,
-                    request_id = %f.meta.request_id,
-                    image = %f.meta.image_name,
+                    request_id = %meta.request_id,
+                    image = %meta.image_name,
                     inference_ms = infer_d.as_secs_f64() * 1e3,
                     process_ms = process_d.as_secs_f64() * 1e3,
-                    round_trip_ms = round_trip.as_secs_f64() * 1e3,
+                    round_trip_ms = meta.enqueued.elapsed().as_secs_f64() * 1e3,
                     "detection failed: {e:#}"
                 );
                 let mut r = self.error_response(format!("{e:#}"), ms(infer_d), ms(process_d));
@@ -937,7 +1385,167 @@ impl WorkerCtx {
                 r
             }
         };
-        self.reply(f.meta, resp);
+        // The collector gets the frame after the reply went out (a `try_send`, never waits).
+        let collect = collect_job.map(|job| (job, resp.predictions.clone()));
+        self.reply(meta, resp);
+        if let Some((job, predictions)) = collect {
+            job.submit(&predictions);
+        }
+    }
+
+    /// Give a request with verifier candidates to the verify lane (started on first use). If
+    /// the lane cannot run, the request is answered here with its candidates unverified.
+    fn hand_off(&self, pending: Box<Pending>) {
+        let mut lane = self.verify_lane.borrow_mut();
+        if lane.is_none() {
+            match Lane::spawn(LaneCtx {
+                name: self.cfg.name.clone(),
+                metrics: self.metrics.clone(),
+                peers: self.cfg.peers.clone(),
+            }) {
+                Ok(l) => *lane = Some(l),
+                Err(e) => warn!(
+                    model = %self.cfg.name,
+                    "could not start the verifier thread ({e}); answering unverified"
+                ),
+            }
+        }
+        let pending = match lane.as_ref() {
+            Some(l) => match l.submit(pending) {
+                Ok(()) => return,
+                Err(p) => p,
+            },
+            None => pending,
+        };
+        super::verify::complete_unverified(
+            &LaneCtx {
+                name: self.cfg.name.clone(),
+                metrics: self.metrics.clone(),
+                peers: self.cfg.peers.clone(),
+            },
+            pending,
+            super::verify::Failure::Stopped,
+        );
+    }
+}
+
+/// Save `img` annotated with `predictions` under `dir` (a warning on failure).
+pub(super) fn save_annotated(
+    model: &str,
+    dir: &std::path::Path,
+    image_name: &str,
+    img: &crate::image::RgbImage,
+    predictions: &[crate::api::Prediction],
+    save_ref_image: bool,
+) {
+    let file_name = if image_name.is_empty() || image_name == "image.jpg" {
+        format!("{}.jpg", uuid::Uuid::new_v4())
+    } else {
+        image_name.to_string()
+    };
+    if let Err(e) = crate::image::save_annotated(dir, &file_name, img, predictions, save_ref_image)
+    {
+        warn!(model = %model, "could not save annotated image: {e:#}");
+    }
+}
+
+/// The one debug line per detection ("detection done"), built in `finish` and written there or,
+/// for a verified request, by the verify lane with the verifier's outcome.
+#[derive(Debug)]
+pub(super) struct DoneLine {
+    pub(super) model: String,
+    pub(super) device: String,
+    pub(super) request_id: String,
+    pub(super) routed_from: Option<String>,
+    pub(super) verify_crop: bool,
+    pub(super) image: String,
+    pub(super) size: String,
+    pub(super) scene: Scene,
+    pub(super) luma: f64,
+    pub(super) chroma: f64,
+    pub(super) suppressed: String,
+    pub(super) slot: usize,
+    pub(super) queue_ms: u64,
+    pub(super) decode_ms: f64,
+    pub(super) preprocess_ms: f64,
+    pub(super) inference_ms: f64,
+    pub(super) postprocess_ms: f64,
+    /// Decode + preprocess + inference + postprocess (the verifier's time is added by the lane).
+    pub(super) process: Duration,
+    pub(super) enqueued: Instant,
+}
+
+/// The verifier part of a [`DoneLine`].
+#[derive(Debug)]
+pub(super) struct VerifyLog {
+    pub(super) verifier: String,
+    pub(super) ms: f64,
+    /// "kept 1, rejected 2" (and the failure, e.g. "unverified 1 (timeout)").
+    pub(super) outcome: String,
+}
+
+impl DoneLine {
+    pub(super) fn emit(&self, predictions: &[crate::api::Prediction], verify: Option<&VerifyLog>) {
+        let process = self.process.as_secs_f64() * 1e3 + verify.map_or(0.0, |v| v.ms);
+        debug!(
+            model = %self.model,
+            device = %self.device,
+            request_id = %self.request_id,
+            routed_from = self.routed_from.as_deref(),
+            verify_crop = self.verify_crop.then_some(true),
+            image = %self.image,
+            size = %self.size,
+            scene = %self.scene,
+            luma = self.luma,
+            chroma = self.chroma,
+            count = predictions.len(),
+            suppressed = %self.suppressed,
+            detections = %detections_summary(predictions),
+            verifier = verify.map(|v| v.verifier.as_str()),
+            verify = verify.map(|v| v.outcome.as_str()),
+            verify_ms = verify.map(|v| v.ms),
+            slot = self.slot,
+            queue_ms = self.queue_ms,
+            decode_ms = self.decode_ms,
+            preprocess_ms = self.preprocess_ms,
+            inference_ms = self.inference_ms,
+            postprocess_ms = self.postprocess_ms,
+            process_ms = process,
+            round_trip_ms = self.enqueued.elapsed().as_secs_f64() * 1e3,
+            "detection done"
+        );
+    }
+}
+
+/// What a request brings: the encoded image (HTTP), or a frame another worker decoded.
+enum Input {
+    Bytes(bytes::Bytes),
+    Decoded {
+        img: crate::image::RgbImage,
+        stats: crate::image_stats::ImageStats,
+        decode: Duration,
+    },
+}
+
+/// True while `meta` may still go to the model's night model (it has one, the request came
+/// from the HTTP layer and was not tried yet).
+fn may_route(meta: &Meta) -> bool {
+    meta.forwardable && meta.live.night_model.is_some()
+}
+
+/// True when `meta`'s answer may go through the verifier cascade (`verify` is set and it is
+/// not itself a verifier check); whether it does depends on the scene and the candidates.
+pub(super) fn may_verify(meta: &Meta) -> bool {
+    !meta.verify_crop && meta.live.verify.is_some()
+}
+
+/// "not served", "not ready", ... for the fallback warning.
+fn fallback_text(reason: RouteFallback) -> &'static str {
+    match reason {
+        RouteFallback::Unknown => "not served (unknown name, disabled or removed)",
+        RouteFallback::NotReady => "not ready (loading, lazy or failed)",
+        RouteFallback::QueueFull => "busy (its queue is full)",
+        RouteFallback::Stopped => "stopping (being reloaded)",
     }
 }
 
@@ -1053,6 +1661,14 @@ fn detections_summary(predictions: &[crate::api::Prediction]) -> String {
     predictions
         .iter()
         .map(|p| format!("{} {:.0}%", p.label, p.confidence * 100.0))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// "night_threshold 2, static 1" (empty when nothing was suppressed), for the request log.
+fn suppressed_summary(c: &SuppressCounts) -> String {
+    c.nonzero()
+        .map(|(r, n)| format!("{} {n}", r.as_str()))
         .collect::<Vec<_>>()
         .join(", ")
 }

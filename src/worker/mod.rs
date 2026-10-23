@@ -43,10 +43,12 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
+mod collect;
 mod pipeline;
 mod run;
 #[cfg(test)]
 mod run_tests;
+mod verify;
 mod watch;
 
 use run::WorkerCtx;
@@ -69,8 +71,113 @@ pub enum WorkItem {
         Instant,
         String,
     ),
+    /// A request whose image another worker already decoded (see [`Decoded`]): it skips
+    /// decode and is never forwarded again.
+    DetectDecoded(Box<Decoded>),
     /// Compile a lazy model now (sent once by [`WorkerHandle::trigger_load`]).
     Load,
+}
+
+/// Where a worker sends the answer of a request.
+#[derive(Debug)]
+pub enum Reply {
+    /// Straight to the HTTP handler waiting for it.
+    Client(tokio::sync::oneshot::Sender<VisionDetectionResponse>),
+    /// To another worker thread (e.g. a cascade that merges a verifier's answer into its own):
+    /// a crossbeam channel it can `Select` on.
+    Worker(Sender<VisionDetectionResponse>),
+}
+
+impl Reply {
+    /// Send `resp`; false when the receiver is gone (the client went away).
+    pub fn send(self, resp: VisionDetectionResponse) -> bool {
+        match self {
+            Reply::Client(tx) => tx.send(resp).is_ok(),
+            Reply::Worker(tx) => tx.try_send(resp).is_ok(),
+        }
+    }
+}
+
+impl From<tokio::sync::oneshot::Sender<VisionDetectionResponse>> for Reply {
+    fn from(tx: tokio::sync::oneshot::Sender<VisionDetectionResponse>) -> Self {
+        Reply::Client(tx)
+    }
+}
+
+/// A request handed from one worker to another with its image already decoded: the night
+/// model switch (an IR / dark frame goes to the model's `night_model`) and the crops (or frame)
+/// sent to a verifier model ([`Purpose`]). The receiving worker preprocesses `img` for its own
+/// model, runs it with its own live settings and the scene of `stats`, and answers `reply` in
+/// its own request order. Never forwarded again.
+#[derive(Debug)]
+pub struct Decoded {
+    pub img: crate::image::RgbImage,
+    /// Scene statistics of `img` (computed by the sender at decode).
+    pub stats: crate::image_stats::ImageStats,
+    pub image_name: String,
+    pub min_confidence: f32,
+    /// The request id of the original request (same id in both workers' log lines).
+    pub request_id: String,
+    /// When the original request arrived (round-trip and queue times count from here).
+    pub enqueued: Instant,
+    /// The original request's timeout budget: the receiver drops it after
+    /// `min(deadline, enqueued + its own request timeout)`.
+    pub deadline: Instant,
+    /// Time the sender already spent decoding (part of `processMs`).
+    pub decode: Duration,
+    pub reply: Reply,
+    /// Name of the forwarding model (for the log).
+    pub from: String,
+    pub purpose: Purpose,
+    /// The request's encoded image as uploaded (for the dataset collector; None: not kept).
+    pub original: Option<bytes::Bytes>,
+}
+
+/// Why a [`Decoded`] request was handed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// The night model switch: the receiver answers the client like the sender would (its own
+    /// threshold, night rules, object filter, image saving and verifier).
+    NightModel,
+    /// A verifier-cascade check ([`crate::verify`]): the receiver reports its raw detections
+    /// at `min_confidence` (no night rules, static memory, object filter, image saving or
+    /// verifier of its own), in the coordinates of `img`.
+    Verify,
+}
+
+/// The served workers of a registry generation by normalized name, for workers that forward
+/// requests to other workers ([`Decoded`]). Holds weak references: a retired or reloaded worker
+/// drops out as soon as the registry lets go of it, and a lookup never keeps one alive. The
+/// registry republishes it whenever its set of workers changes.
+#[derive(Debug, Clone, Default)]
+pub struct Peers(Arc<RwLock<std::collections::HashMap<String, std::sync::Weak<WorkerHandle>>>>);
+
+impl Peers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The served worker named `name` (case-insensitive, `.onnx` / `.xml` ignored).
+    pub fn get(&self, name: &str) -> Option<Arc<WorkerHandle>> {
+        self.0
+            .read_recover()
+            .get(&crate::registry::normalize_name(name))
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Replace the directory with `handles`.
+    pub fn publish<'a>(&self, handles: impl IntoIterator<Item = &'a Arc<WorkerHandle>>) {
+        let map = handles
+            .into_iter()
+            .map(|h| (crate::registry::normalize_name(&h.name), Arc::downgrade(h)))
+            .collect();
+        *self.0.write_recover() = map;
+    }
+
+    /// Empty the directory (registry shutdown).
+    pub fn clear(&self) {
+        self.0.write_recover().clear();
+    }
 }
 
 /// A short request id for the per-request log line (8 hex digits, random).
@@ -115,6 +222,8 @@ pub struct WorkerConfig {
     pub concurrency: Option<Concurrency>,
     /// The generation's decode + preprocess pool (None: the worker starts a one-thread pool).
     pub prep: Option<Arc<PrepPool>>,
+    /// The generation's other workers, for the night model switch (empty: never forwards).
+    pub peers: Peers,
 }
 
 /// The per-model settings a config change applies without reloading the model (per-model
@@ -131,6 +240,19 @@ pub struct LiveSettings {
     pub save_ref_image: bool,
     /// How long a request may wait in the queue plus processing.
     pub request_timeout: Duration,
+    /// Night / IR false-positive rules applied before the object filter.
+    pub filters: crate::model::filters::FilterRules,
+    /// Static-box memory settings (the memory itself lives in the worker).
+    pub static_suppression: crate::static_memory::StaticSuppression,
+    /// Image enhancement modes, passed to the prep pool with each request.
+    pub preprocess: crate::model::enhance::PreprocessModes,
+    /// Served model that night / IR frames are forwarded to (`night_model`); None = run here.
+    pub night_model: Option<String>,
+    /// Verifier cascade (`verify`, the model's own over the global one; None = off, and
+    /// always None for the verifier model itself).
+    pub verify: Option<crate::verify::VerifyConfig>,
+    /// Dataset collector settings (`collect`, process-wide; see [`crate::collect`]).
+    pub collect: Arc<crate::collect::CollectSettings>,
 }
 
 impl LiveSettings {
@@ -149,12 +271,64 @@ impl LiveSettings {
             save_image_path: config.save_image_path.as_deref().map(crate::resolve_path),
             save_ref_image: config.save_ref_image,
             request_timeout: config.request_timeout(),
+            filters: filter_rules(config, m),
+            static_suppression: m
+                .static_suppression
+                .clone()
+                .unwrap_or_else(|| config.static_suppression.clone()),
+            preprocess: config.preprocess_modes(m),
+            night_model: m
+                .night_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string),
+            verify: verify_settings(config, m),
+            collect: Arc::new(crate::collect::CollectSettings::for_config(config)),
         }
     }
 
     /// A shareable cell holding `self` (what [`WorkerConfig::live`] and the handle share).
     pub fn shared(self) -> Arc<ArcSwap<LiveSettings>> {
         Arc::new(ArcSwap::from_pointee(self))
+    }
+}
+
+/// The verifier settings of model `m`: its own `verify` over the global one; None when off,
+/// without a model, or naming `m` itself (the global default never makes a model verify
+/// itself).
+pub fn verify_settings(config: &Config, m: &ModelConfig) -> Option<crate::verify::VerifyConfig> {
+    use crate::registry::normalize_name;
+    let v = m.verify.as_ref().or(config.verify.as_ref())?;
+    let target = normalize_name(v.model.trim());
+    (v.enabled && !v.model.trim().is_empty() && target != normalize_name(&m.effective_name()))
+        .then(|| v.clone())
+}
+
+/// The night / IR rules of model `m`: its own values over the global ones; the label maps are
+/// merged (the model's entries win).
+pub fn filter_rules(config: &Config, m: &ModelConfig) -> crate::model::filters::FilterRules {
+    let merged = |global: &std::collections::BTreeMap<String, f32>,
+                  own: &Option<std::collections::BTreeMap<String, f32>>| {
+        let mut out = global.clone();
+        for (k, v) in own.iter().flatten() {
+            out.retain(|g, _| !g.eq_ignore_ascii_case(k));
+            out.insert(k.clone(), *v);
+        }
+        out
+    };
+    crate::model::filters::FilterRules {
+        night_confidence_threshold: m
+            .night_confidence_threshold
+            .or(config.night_confidence_threshold),
+        label_thresholds: merged(&config.label_thresholds, &m.label_thresholds),
+        night_label_thresholds: merged(&config.night_label_thresholds, &m.night_label_thresholds),
+        person_aspect: m.person_aspect.or(config.person_aspect),
+        min_box_area_frac: m.min_box_area_frac.or(config.min_box_area_frac),
+        suppress_overlaps: m
+            .suppress_overlaps
+            .clone()
+            .unwrap_or_else(|| config.suppress_overlaps.clone()),
     }
 }
 
@@ -582,6 +756,9 @@ pub fn spawn_worker_after(
         shutdown,
         consecutive_errors: std::cell::Cell::new(0),
         consecutive_degenerate: std::cell::Cell::new(0),
+        static_memory: std::cell::RefCell::new(crate::static_memory::StaticMemory::new()),
+        decoded_pre: std::cell::RefCell::new(None),
+        verify_lane: std::cell::RefCell::new(None),
     };
     let name = cfg.name.clone();
     let join = std::thread::Builder::new()
@@ -838,5 +1015,45 @@ mod tests {
             "ONNX Runtime CoreML (Apple M1) (not loaded)"
         );
         h.join();
+    }
+
+    #[test]
+    fn live_settings_resolve_night_rules_per_model() {
+        use std::collections::BTreeMap;
+        let mut c = Config {
+            night_confidence_threshold: Some(0.6),
+            label_thresholds: BTreeMap::from([
+                ("Person".to_string(), 0.5),
+                ("car".to_string(), 0.7),
+            ]),
+            person_aspect: Some([0.2, 0.9]),
+            ..Config::default()
+        };
+        c.static_suppression.enabled = true;
+        let plain = ModelConfig::default();
+        let l = LiveSettings::for_model(&c, &plain);
+        assert_eq!(l.filters.night_confidence_threshold, Some(0.6));
+        assert_eq!(l.filters.person_aspect, Some([0.2, 0.9]));
+        assert_eq!(l.filters.label_thresholds.len(), 2);
+        assert!(l.static_suppression.enabled);
+        let own = ModelConfig {
+            night_confidence_threshold: Some(0.8),
+            label_thresholds: Some(BTreeMap::from([("person".to_string(), 0.65)])),
+            suppress_overlaps: Some(Vec::new()),
+            static_suppression: Some(crate::static_memory::StaticSuppression::default()),
+            ..ModelConfig::default()
+        };
+        let l = LiveSettings::for_model(&c, &own);
+        assert_eq!(l.filters.night_confidence_threshold, Some(0.8));
+        // Merged: the model's `person` replaces the global `Person`, `car` stays.
+        assert_eq!(
+            l.filters.label_thresholds,
+            BTreeMap::from([("car".to_string(), 0.7), ("person".to_string(), 0.65)])
+        );
+        assert_eq!(l.filters.person_aspect, Some([0.2, 0.9]));
+        assert!(!l.static_suppression.enabled);
+        // Defaults: nothing to do.
+        assert!(LiveSettings::default().filters.is_noop());
+        assert!(!LiveSettings::default().static_suppression.enabled);
     }
 }

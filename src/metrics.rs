@@ -1,5 +1,6 @@
 //! Request/latency counters and Prometheus text rendering.
 
+use crate::model::filters::{SuppressCounts, SuppressReason};
 use crate::sync::RwLockExt;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -176,6 +177,38 @@ impl DropReason {
     }
 }
 
+/// Why a night / IR frame was not routed to the model's `night_model` and ran on the model
+/// itself (`night_model_fallback_total{reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteFallback {
+    /// The night model is not served (unknown name, disabled, removed, or the model itself).
+    Unknown,
+    /// It is still compiling, lazy and not loaded yet, or failed.
+    NotReady,
+    /// Its queue is full.
+    QueueFull,
+    /// Its worker stopped (a reload replaced it between lookup and send).
+    Stopped,
+}
+
+impl RouteFallback {
+    pub const ALL: [RouteFallback; 4] = [
+        RouteFallback::Unknown,
+        RouteFallback::NotReady,
+        RouteFallback::QueueFull,
+        RouteFallback::Stopped,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteFallback::Unknown => "unknown",
+            RouteFallback::NotReady => "not_ready",
+            RouteFallback::QueueFull => "queue_full",
+            RouteFallback::Stopped => "stopped",
+        }
+    }
+}
+
 /// Per-model counters plus the device/provider strings, which start as the configured device
 /// and an empty provider and are updated by the worker once the model has been compiled.
 #[derive(Debug)]
@@ -189,6 +222,19 @@ pub struct ModelMetrics {
     dropped: [AtomicU64; DropReason::ALL.len()],
     /// Requests whose image failed to decode (or was rejected by its size) before inference.
     decode_errors: AtomicU64,
+    /// Detections removed by the night / IR rules and the static-box memory, per
+    /// [`SuppressReason`] (`detections_suppressed_total{reason}`).
+    suppressed: [AtomicU64; SuppressReason::ALL.len()],
+    /// Night / IR frames forwarded to this model's `night_model` (`night_model_routed_total`).
+    night_routed: AtomicU64,
+    /// Night / IR frames that ran here instead, per [`RouteFallback`].
+    night_fallback: [AtomicU64; RouteFallback::ALL.len()],
+    /// Throttle of the "night model unavailable" warning.
+    pub night_fallback_log: LogThrottle,
+    /// Verifier-cascade candidates per [`crate::verify::Outcome`] (`verify_total{outcome}`).
+    verify: [AtomicU64; crate::verify::Outcome::ALL.len()],
+    /// Throttle of the "verifier unavailable / late" warning.
+    pub verify_log: LogThrottle,
     pub inference_ms: Histogram,
     pub process_ms: Histogram,
     pub round_trip_ms: Histogram,
@@ -215,6 +261,12 @@ impl ModelMetrics {
             requests: AtomicU64::new(0),
             dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             decode_errors: AtomicU64::new(0),
+            suppressed: std::array::from_fn(|_| AtomicU64::new(0)),
+            night_routed: AtomicU64::new(0),
+            night_fallback: std::array::from_fn(|_| AtomicU64::new(0)),
+            night_fallback_log: LogThrottle::default(),
+            verify: std::array::from_fn(|_| AtomicU64::new(0)),
+            verify_log: LogThrottle::default(),
             inference_ms: Histogram::new(),
             process_ms: Histogram::new(),
             round_trip_ms: Histogram::new(),
@@ -245,6 +297,64 @@ impl ModelMetrics {
     /// stage); rendered as `requests_rejected_total{reason="decode_error"}`, summed over models.
     pub fn record_decode_error(&self) {
         self.decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add one request's suppressed detections.
+    pub fn record_suppressed(&self, counts: &SuppressCounts) {
+        for (r, n) in counts.nonzero() {
+            if let Some(c) = self.suppressed.get(r as usize) {
+                c.fetch_add(u64::from(n), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Detections removed for `reason` so far.
+    pub fn suppressed(&self, reason: SuppressReason) -> u64 {
+        self.suppressed
+            .get(reason as usize)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+
+    /// Add one request's verifier-cascade outcomes.
+    pub fn record_verify(&self, counts: &crate::verify::Counts) {
+        for (i, o) in crate::verify::Outcome::ALL.into_iter().enumerate() {
+            if let Some(c) = self.verify.get(i) {
+                c.fetch_add(u64::from(counts.get(o)), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Verifier-cascade candidates with outcome `o` so far.
+    pub fn verified(&self, o: crate::verify::Outcome) -> u64 {
+        crate::verify::Outcome::ALL
+            .iter()
+            .position(|x| *x == o)
+            .and_then(|i| self.verify.get(i))
+            .map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+
+    /// Count one night / IR frame forwarded to the night model.
+    pub fn record_night_routed(&self) {
+        self.night_routed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Night / IR frames forwarded to the night model so far.
+    pub fn night_routed(&self) -> u64 {
+        self.night_routed.load(Ordering::Relaxed)
+    }
+
+    /// Count one night / IR frame that ran on this model instead of its night model.
+    pub fn record_night_fallback(&self, reason: RouteFallback) {
+        if let Some(c) = self.night_fallback.get(reason as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Night-model fallbacks for `reason` so far.
+    pub fn night_fallback(&self, reason: RouteFallback) -> u64 {
+        self.night_fallback
+            .get(reason as usize)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
     pub fn decode_errors(&self) -> u64 {
@@ -624,6 +734,7 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         let _ = writeln!(out, "# TYPE {PREFIX}{name} counter");
         let _ = writeln!(out, "{PREFIX}{name} {}", counter.load(Ordering::Relaxed));
     }
+    crate::collect::metrics::render_prometheus(&mut out, PREFIX);
     let p = ProcessStats::read();
     if let Some(rss) = p.resident_memory_bytes {
         let _ = writeln!(
@@ -674,6 +785,70 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
                 escape_label(&mm.name),
                 reason.as_str(),
                 mm.dropped(reason)
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}detections_suppressed_total Detections removed by the night / IR rules and the verifier, by reason (night_threshold|label_threshold|aspect|min_area|overlap|static|verify)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}detections_suppressed_total counter");
+    for mm in &models {
+        for reason in SuppressReason::ALL {
+            let _ = writeln!(
+                out,
+                "{PREFIX}detections_suppressed_total{{model=\"{}\",reason=\"{}\"}} {}",
+                escape_label(&mm.name),
+                reason.as_str(),
+                mm.suppressed(reason)
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}night_model_routed_total Night / IR frames forwarded to the model's night_model."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}night_model_routed_total counter");
+    for mm in &models {
+        let _ = writeln!(
+            out,
+            "{PREFIX}night_model_routed_total{{model=\"{}\"}} {}",
+            escape_label(&mm.name),
+            mm.night_routed()
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}night_model_fallback_total Night / IR frames that ran on the model itself because its night_model was unavailable, by reason (unknown|not_ready|queue_full|stopped)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}night_model_fallback_total counter");
+    for mm in &models {
+        for reason in RouteFallback::ALL {
+            let _ = writeln!(
+                out,
+                "{PREFIX}night_model_fallback_total{{model=\"{}\",reason=\"{}\"}} {}",
+                escape_label(&mm.name),
+                reason.as_str(),
+                mm.night_fallback(reason)
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}verify_total Candidate boxes checked by the model's verifier (verify), by outcome (kept|rejected|unverified; unverified = the verifier was unavailable, busy, late or failed, or over max_crops, and the box was kept)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}verify_total counter");
+    for mm in &models {
+        for o in crate::verify::Outcome::ALL {
+            let _ = writeln!(
+                out,
+                "{PREFIX}verify_total{{model=\"{}\",outcome=\"{}\"}} {}",
+                escape_label(&mm.name),
+                o.as_str(),
+                mm.verified(o)
             );
         }
     }
@@ -819,6 +994,76 @@ mod tests {
         assert_eq!(t.allow(5 + iv), Some(2));
         assert_eq!(t.allow(5 + iv + 1), None);
         assert_eq!(t.allow(5 + 3 * iv), Some(1));
+    }
+
+    #[test]
+    fn prometheus_verify_outcomes() {
+        use crate::verify::{Counts, Outcome};
+        let m = Metrics::new("0");
+        let mm = m.model("a");
+        mm.record_verify(&Counts {
+            kept: 2,
+            rejected: 1,
+            unverified: 0,
+        });
+        mm.record_verify(&Counts {
+            kept: 0,
+            rejected: 1,
+            unverified: 3,
+        });
+        assert_eq!(mm.verified(Outcome::Kept), 2);
+        assert_eq!(mm.verified(Outcome::Rejected), 2);
+        assert_eq!(mm.verified(Outcome::Unverified), 3);
+        let text = render_prometheus(&m, &[]);
+        assert!(text.contains("# TYPE blue_onyx_prism_verify_total counter"));
+        assert!(text.contains("blue_onyx_prism_verify_total{model=\"a\",outcome=\"rejected\"} 2"));
+        assert!(
+            text.contains("blue_onyx_prism_verify_total{model=\"a\",outcome=\"unverified\"} 3")
+        );
+        assert!(text.contains(
+            "blue_onyx_prism_detections_suppressed_total{model=\"a\",reason=\"verify\"} 0"
+        ));
+    }
+
+    #[test]
+    fn prometheus_suppressed_by_reason() {
+        let m = Metrics::new("0");
+        let mm = m.model("a");
+        let mut c = SuppressCounts::default();
+        c.add(SuppressReason::Static, 2);
+        c.add(SuppressReason::NightThreshold, 1);
+        mm.record_suppressed(&c);
+        mm.record_suppressed(&c);
+        assert_eq!(mm.suppressed(SuppressReason::Static), 4);
+        let text = render_prometheus(&m, &[]);
+        assert!(text.contains("# TYPE blue_onyx_prism_detections_suppressed_total counter"));
+        assert!(text.contains(
+            "blue_onyx_prism_detections_suppressed_total{model=\"a\",reason=\"static\"} 4"
+        ));
+        assert!(text.contains(
+            "blue_onyx_prism_detections_suppressed_total{model=\"a\",reason=\"aspect\"} 0"
+        ));
+    }
+
+    #[test]
+    fn prometheus_night_model_routing() {
+        let m = Metrics::new("0");
+        let mm = m.model("a");
+        mm.record_night_routed();
+        mm.record_night_routed();
+        mm.record_night_fallback(RouteFallback::NotReady);
+        assert_eq!(mm.night_routed(), 2);
+        assert_eq!(mm.night_fallback(RouteFallback::NotReady), 1);
+        assert_eq!(mm.night_fallback(RouteFallback::QueueFull), 0);
+        let text = render_prometheus(&m, &[]);
+        assert!(text.contains("# TYPE blue_onyx_prism_night_model_routed_total counter"));
+        assert!(text.contains("blue_onyx_prism_night_model_routed_total{model=\"a\"} 2"));
+        assert!(text.contains(
+            "blue_onyx_prism_night_model_fallback_total{model=\"a\",reason=\"not_ready\"} 1"
+        ));
+        assert!(text.contains(
+            "blue_onyx_prism_night_model_fallback_total{model=\"a\",reason=\"unknown\"} 0"
+        ));
     }
 
     #[test]

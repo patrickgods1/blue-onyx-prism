@@ -611,7 +611,7 @@ pub struct ThresholdSweep {
 }
 
 /// Tags that get their own curve (when present).
-pub const SWEEP_TAGS: [&str; 3] = ["day", "night", "small-objects"];
+pub const SWEEP_TAGS: [&str; 5] = ["day", "night", "ir", "hard-negative", "small-objects"];
 /// Key of the small-object curve.
 pub const SMALL_KEY: &str = "size:small";
 

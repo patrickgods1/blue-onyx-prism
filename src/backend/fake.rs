@@ -76,6 +76,8 @@ pub(crate) enum Call {
 struct ScriptState {
     steps: VecDeque<Step>,
     calls: Vec<Call>,
+    /// The image tensor of every request `submit` (not the warm-ups), in order.
+    inputs: Vec<Vec<f32>>,
     /// Set by [`FakeScript::release`]: what hung inferences return.
     released: Option<Result<Vec<NamedOutput>, String>>,
     /// Hung inferences waiting for a release: their completion channel, slot and sequence.
@@ -123,6 +125,11 @@ impl FakeScript {
     }
 
     /// The request submits so far (warm-up excluded).
+    /// The image tensors the requests were submitted with, in order.
+    pub(crate) fn inputs(&self) -> Vec<Vec<f32>> {
+        self.shared.state.lock_recover().inputs.clone()
+    }
+
     pub(crate) fn submits(&self) -> usize {
         self.calls()
             .iter()
@@ -262,7 +269,7 @@ impl FakeBackend {
     pub(crate) fn submit(
         &mut self,
         slot: usize,
-        _chw: &[f32],
+        chw: &[f32],
         _extra: &[ExtraInput],
     ) -> Result<u64> {
         match self.slots.get(slot) {
@@ -290,6 +297,7 @@ impl FakeBackend {
         } else {
             let mut st = self.script.shared.state.lock_recover();
             st.calls.push(Call::Submit { slot, seq });
+            st.inputs.push(chw.to_vec());
             let step = st
                 .steps
                 .pop_front()

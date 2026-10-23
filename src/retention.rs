@@ -1,8 +1,10 @@
 //! Disk hygiene: retention of the saved-image folder and a low-free-space warning.
 //!
 //! [`plan_prune`] is the pure decision (which files go), [`prune_saved_images`] applies it to
-//! one folder, and [`spawn_sweeper`] runs both periodically on a background thread, reading the
-//! current settings each tick so a config change applies without a restart.
+//! one folder, [`prune_dataset`] to the dataset collector's folder tree ([`crate::collect`]),
+//! and [`spawn_sweeper`] runs them periodically on a background thread, reading the current
+//! settings each tick so a config change applies without a restart. The dataset is pruned on
+//! the collector's own thread (its only writer): the sweeper asks it to.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -135,6 +137,120 @@ pub fn prune_saved_images(dir: &Path, max_age_days: u32, max_mb: u64) -> Result<
     Ok(report)
 }
 
+/// Delete the oldest frames of the dataset folder `dir` (`<scene>/<camera>/<date>/<stem>.jpg`
+/// with its `.json` sidecar, see `docs/DATASET.md`) until none is older than `max_age_days`
+/// and the frames total at most `max_bytes` (0 disables a limit), then drop the deleted frames
+/// from their day's `index.jsonl` and remove emptied folders. Only those names are touched
+/// (no symlinks, nothing outside the layout, never `review-queue.jsonl`); temporary files of
+/// an interrupted write older than an hour go too. A missing folder is not an error. Run it
+/// only where nothing else writes the folder (the collector thread).
+pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<PruneReport> {
+    use crate::collect::layout;
+    if !dir.is_dir() {
+        return Ok(PruneReport::default());
+    }
+    let now = SystemTime::now();
+    let mut entries = Vec::new();
+    let days = layout::day_dirs(dir);
+    for day in &days {
+        let Ok(rd) = std::fs::read_dir(day) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let Ok(ft) = ent.file_type() else { continue };
+            if !ft.is_file() {
+                continue;
+            }
+            let path = ent.path();
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let Ok(meta) = ent.metadata() else { continue };
+            let modified = meta.modified().unwrap_or(now);
+            if name.starts_with('.') && name.ends_with(".tmp") {
+                let stale = now
+                    .duration_since(modified)
+                    .is_ok_and(|d| d > Duration::from_secs(3600));
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
+                continue;
+            }
+            // A frame someone labelled (`<stem>.labels.json`, written by the Review page) is
+            // training data: never pruned, and not counted against the cap.
+            if path.with_extension("labels.json").exists() {
+                continue;
+            }
+            let side = path.with_extension("json");
+            let side_len = std::fs::symlink_metadata(&side)
+                .ok()
+                .filter(|m| m.file_type().is_file())
+                .map_or(0, |m| m.len());
+            entries.push((path, modified, meta.len().saturating_add(side_len)));
+        }
+    }
+    let age =
+        (max_age_days > 0).then(|| Duration::from_secs(u64::from(max_age_days) * SECS_PER_DAY));
+    let cap = (max_bytes > 0).then_some(max_bytes);
+    let doomed = plan_prune(&entries, now, age, cap);
+    let mut report = PruneReport {
+        remaining: entries.len(),
+        ..PruneReport::default()
+    };
+    let mut touched: Vec<PathBuf> = Vec::new();
+    for path in doomed {
+        let size = entries.iter().find(|e| e.0 == path).map_or(0, |e| e.2);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                let side = path.with_extension("json");
+                if let Err(e) = std::fs::remove_file(&side)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::debug!("retention: removing {}: {e}", side.display());
+                }
+                report.deleted += 1;
+                report.freed_bytes = report.freed_bytes.saturating_add(size);
+                report.remaining = report.remaining.saturating_sub(1);
+                if let Some(day) = path.parent()
+                    && !touched.iter().any(|t| t == day)
+                {
+                    touched.push(day.to_path_buf());
+                }
+            }
+            Err(e) => {
+                report.failed += 1;
+                tracing::debug!("retention: removing {}: {e}", path.display());
+            }
+        }
+    }
+    for day in &touched {
+        if let Err(e) = layout::rewrite_index(day) {
+            tracing::warn!("dataset retention: {e:#}");
+        }
+        // Emptied day, camera and scene folders (remove_dir fails on a non-empty one).
+        let mut p = Some(day.as_path());
+        for _ in 0..3 {
+            let Some(d) = p else { break };
+            if std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            p = d.parent();
+        }
+    }
+    if report.deleted > 0 || report.failed > 0 {
+        tracing::info!(
+            "dataset in {}: deleted {} frame(s) ({} MB), {} failed, {} left",
+            dir.display(),
+            report.deleted,
+            report.freed_bytes / BYTES_PER_MB,
+            report.failed,
+            report.remaining
+        );
+    }
+    Ok(report)
+}
+
 /// A warning text when the file system holding `data_root` has less than `min_free_mb` MB
 /// available. None when there is enough, or when the space cannot be determined.
 pub fn free_space_warning(data_root: &Path, min_free_mb: u64) -> Option<String> {
@@ -168,6 +284,9 @@ pub struct SweeperConfig {
     pub data_root: PathBuf,
     /// Warn below this many MB free (normally [`MIN_FREE_MB`]).
     pub min_free_mb: u64,
+    /// The dataset collector's settings (`collect`): its folder is pruned on every tick (by
+    /// the collector thread) when it exists, whether collection is on or not.
+    pub dataset: Option<crate::collect::CollectSettings>,
 }
 
 /// True when a low-space warning may be logged now (never yet, or the last is old enough).
@@ -181,6 +300,9 @@ fn sweep(cfg: &SweeperConfig, last_warn: &mut Option<Instant>) {
         && let Err(e) = prune_saved_images(dir, cfg.max_age_days, cfg.max_mb)
     {
         tracing::warn!("saved-image retention: {e:#}");
+    }
+    if let Some(ds) = &cfg.dataset {
+        crate::collect::global().request_prune(ds.clone());
     }
     match free_space_warning(&cfg.data_root, cfg.min_free_mb) {
         Some(msg) => {
@@ -348,6 +470,101 @@ mod tests {
         assert_eq!(r.deleted, 0);
         assert!(outside.path().join("t.jpg").exists());
         assert!(d.path().join("l.jpg").symlink_metadata().is_ok());
+    }
+
+    /// A frame (`<stem>.jpg` + `.json` + its index line) in `<dir>/<rel_day>`, `age_days` old.
+    fn dataset_frame(dir: &Path, rel_day: &str, stem: &str, size: usize, age_days: u64) {
+        let day = dir.join(rel_day);
+        std::fs::create_dir_all(&day).unwrap();
+        let t = SystemTime::now() - Duration::from_secs(age_days * SECS_PER_DAY);
+        for ext in ["jpg", "json"] {
+            let p = day.join(format!("{stem}.{ext}"));
+            std::fs::write(&p, vec![0u8; size]).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        }
+        let line = crate::collect::record::IndexLine {
+            id: stem.into(),
+            timestamp: "t".into(),
+            scene: "ir".into(),
+            camera: "cam".into(),
+            model: "m".into(),
+            buckets: vec![crate::collect::Bucket::Empty],
+            labels: Vec::new(),
+            bytes: 2 * size as u64,
+        };
+        crate::collect::layout::append_line(
+            &day.join(crate::collect::layout::INDEX_FILE),
+            &serde_json::to_string(&line).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dataset_prune_keeps_labelled_frames() {
+        let d = Tmp::new();
+        let p = d.path();
+        dataset_frame(p, "ir/cam/2026-01-01", "labelled", 100, 200);
+        dataset_frame(p, "ir/cam/2026-01-01", "plain", 100, 200);
+        let day = p.join("ir/cam/2026-01-01");
+        std::fs::write(day.join("labelled.labels.json"), b"{}").unwrap();
+        let r = prune_dataset(p, 90, 1).unwrap();
+        assert_eq!((r.deleted, r.remaining), (1, 0));
+        for f in ["labelled.jpg", "labelled.json", "labelled.labels.json"] {
+            assert!(day.join(f).exists(), "{f}");
+        }
+        assert!(!day.join("plain.jpg").exists());
+    }
+
+    #[test]
+    fn dataset_prune_by_age_and_size_keeps_the_index_in_step() {
+        use crate::collect::layout::{INDEX_FILE, REVIEW_QUEUE_FILE, read_index};
+        let d = Tmp::new();
+        let p = d.path();
+        dataset_frame(p, "ir/cam/2026-01-01", "old", 100, 200);
+        dataset_frame(p, "ir/cam/2026-10-01", "a", 100, 3);
+        dataset_frame(p, "ir/cam/2026-10-01", "b", 100, 2);
+        dataset_frame(p, "day/cam/2026-10-02", "c", 100, 1);
+        std::fs::write(p.join(REVIEW_QUEUE_FILE), b"{}\n").unwrap();
+        std::fs::write(p.join("notes.jpg"), b"not in the layout").unwrap();
+        std::fs::write(p.join("ir/cam/2026-10-01/keep.txt"), b"x").unwrap();
+        // Age: only "old" goes, and its emptied day folder with it.
+        let r = prune_dataset(p, 90, 0).unwrap();
+        assert_eq!((r.deleted, r.remaining, r.freed_bytes), (1, 3, 200));
+        assert!(!p.join("ir/cam/2026-01-01").exists());
+        // Size: 3 frames of 200 bytes under a 450-byte cap: the oldest ("a") goes.
+        let r = prune_dataset(p, 0, 450).unwrap();
+        assert_eq!((r.deleted, r.remaining), (1, 2));
+        let idx = read_index(&p.join("ir/cam/2026-10-01").join(INDEX_FILE));
+        assert_eq!(idx.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["b"]);
+        assert!(!p.join("ir/cam/2026-10-01/a.json").exists());
+        assert!(p.join("ir/cam/2026-10-01/b.jpg").exists());
+        // Files outside the layout stay.
+        assert!(p.join(REVIEW_QUEUE_FILE).exists());
+        assert!(p.join("notes.jpg").exists());
+        assert!(p.join("ir/cam/2026-10-01/keep.txt").exists());
+        assert_eq!(
+            prune_dataset(&p.join("missing"), 1, 1).unwrap(),
+            PruneReport::default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dataset_prune_ignores_symlinked_frames() {
+        let d = Tmp::new();
+        let outside = Tmp::new();
+        std::fs::write(outside.path().join("t.jpg"), vec![0u8; 4096]).unwrap();
+        let day = d.path().join("ir/cam/2026-10-01");
+        std::fs::create_dir_all(&day).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("t.jpg"), day.join("l.jpg")).unwrap();
+        let r = prune_dataset(d.path(), 0, 1).unwrap();
+        assert_eq!(r.deleted, 0);
+        assert!(outside.path().join("t.jpg").exists());
     }
 
     #[test]

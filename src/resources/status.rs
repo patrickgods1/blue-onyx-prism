@@ -365,6 +365,7 @@ pub fn find(ctx: Option<&ResourcesCtx>, id: &str) -> Option<&'static Resource> {
     platform_resources(ctx)
         .into_iter()
         .find(|r| r.id.eq_ignore_ascii_case(id))
+        .or_else(|| catalog::bench_alias(id))
 }
 
 /// Install directory of `res` for `config`: models in `models_dir`, runtimes under the data

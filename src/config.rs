@@ -6,9 +6,13 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::model::ModelFamilyKind;
+use crate::model::enhance::{Preprocess, PreprocessModes};
+use crate::model::filters::OverlapRule;
+use crate::static_memory::StaticSuppression;
 
 pub const CONFIG_FILE: &str = "blue_onyx_prism_config.json";
 pub const SERVICE_CONFIG_FILE: &str = "blue_onyx_prism_config_service.json";
@@ -274,6 +278,41 @@ pub mod thr {
     pub fn ser_clean<S: Serializer>(t: &f32, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_f64(super::clean_f32(*t))
     }
+    pub fn ser_opt_clean<S: Serializer>(t: &Option<f32>, s: S) -> Result<S::Ok, S::Error> {
+        match t {
+            Some(t) => s.serialize_some(&super::clean_f32(*t)),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn ser_opt_pair_clean<S: Serializer>(
+        t: &Option<[f32; 2]>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match t {
+            Some([a, b]) => s.serialize_some(&[super::clean_f32(*a), super::clean_f32(*b)]),
+            None => s.serialize_none(),
+        }
+    }
+    fn clean_map(m: &super::BTreeMap<String, f32>) -> super::BTreeMap<&str, f64> {
+        m.iter()
+            .map(|(k, v)| (k.as_str(), super::clean_f32(*v)))
+            .collect()
+    }
+    pub fn ser_map_clean<S: Serializer>(
+        m: &super::BTreeMap<String, f32>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&clean_map(m), s)
+    }
+    pub fn ser_opt_map_clean<S: Serializer>(
+        m: &Option<super::BTreeMap<String, f32>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match m {
+            Some(m) => s.serialize_some(&clean_map(m)),
+            None => s.serialize_none(),
+        }
+    }
 }
 
 /// One model entry. Relative paths resolve against the executable directory.
@@ -305,6 +344,56 @@ pub struct ModelConfig {
     /// Concurrent inferences of this model (None = the global `inflight`). Restart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inflight: Option<usize>,
+    /// Night / IR false-positive rules ([`crate::model::filters`]); None = the global value.
+    /// Maps (`label_thresholds`, `night_label_thresholds`) are merged over the global ones
+    /// (this model's entries win); the other fields replace the global value. Applies at once.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_clean"
+    )]
+    pub night_confidence_threshold: Option<f32>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_map_clean"
+    )]
+    pub label_thresholds: Option<BTreeMap<String, f32>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_map_clean"
+    )]
+    pub night_label_thresholds: Option<BTreeMap<String, f32>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_pair_clean"
+    )]
+    pub person_aspect: Option<[f32; 2]>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_clean"
+    )]
+    pub min_box_area_frac: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppress_overlaps: Option<Vec<OverlapRule>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_suppression: Option<StaticSuppression>,
+    /// Image enhancement before the model's resize ([`crate::model::enhance`]); None = the
+    /// global `preprocess`. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preprocess: Option<Preprocess>,
+    /// Enhancement on night / IR frames, replacing `preprocess` there; None = the global
+    /// `night_preprocess`. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub night_preprocess: Option<Preprocess>,
+    /// Another configured model that answers this model's night / IR frames (scene `night` or
+    /// `ir`, see [`crate::image_stats`]): the decoded frame is forwarded to its worker and its
+    /// result returned. It must not have a `night_model` itself. Falls back to this model when
+    /// the night model is not served or not ready. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub night_model: Option<String>,
+    /// Verifier cascade ([`crate::verify`]): another configured model checks this model's
+    /// candidate boxes; None = the global `verify`. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::verify::VerifyConfig>,
 }
 
 impl Default for ModelConfig {
@@ -321,6 +410,28 @@ impl Default for ModelConfig {
             gpu_precision: None,
             enabled: true,
             inflight: None,
+            night_confidence_threshold: None,
+            label_thresholds: None,
+            night_label_thresholds: None,
+            person_aspect: None,
+            min_box_area_frac: None,
+            suppress_overlaps: None,
+            static_suppression: None,
+            preprocess: None,
+            night_preprocess: None,
+            night_model: None,
+            verify: None,
+        }
+    }
+}
+
+impl Config {
+    /// The enhancement modes of model `m`: its own `preprocess` / `night_preprocess` over the
+    /// global ones (each field separately; an unset night mode means `preprocess`).
+    pub fn preprocess_modes(&self, m: &ModelConfig) -> PreprocessModes {
+        PreprocessModes {
+            preprocess: m.preprocess.or(self.preprocess).unwrap_or_default(),
+            night_preprocess: m.night_preprocess.or(self.night_preprocess),
         }
     }
 }
@@ -373,6 +484,66 @@ pub struct Config {
     pub nms_iou: f32,
     /// Only report these labels (case-insensitive). Empty = all.
     pub object_filter: Vec<String>,
+    /// Minimum score on night / IR frames ([`crate::image_stats::Scene`]); raises, never lowers,
+    /// the threshold. None = off. Applies at once.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_clean"
+    )]
+    pub night_confidence_threshold: Option<f32>,
+    /// Minimum score per label (`{"person": 0.6}`, case-insensitive). Applies at once.
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "thr::ser_map_clean"
+    )]
+    pub label_thresholds: BTreeMap<String, f32>,
+    /// Minimum score per label on night / IR frames. Applies at once.
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "thr::ser_map_clean"
+    )]
+    pub night_label_thresholds: BTreeMap<String, f32>,
+    /// Allowed width / height of a `person` box, `[min, max]` (suggested `[0.2, 0.9]`). None =
+    /// off. Applies at once.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_pair_clean"
+    )]
+    pub person_aspect: Option<[f32; 2]>,
+    /// Drop boxes smaller than this share of the image area. None = off. Applies at once.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_clean"
+    )]
+    pub min_box_area_frac: Option<f32>,
+    /// Drop a box of one label that overlaps a box of another (`person` on `potted plant`).
+    /// Applies at once.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suppress_overlaps: Vec<OverlapRule>,
+    /// Suppress boxes that repeat at the same place ([`crate::static_memory`]). Off by
+    /// default. Applies at once.
+    #[serde(skip_serializing_if = "StaticSuppression::is_default")]
+    pub static_suppression: StaticSuppression,
+    /// Image enhancement before the model's resize: `none`, `grayscale`, `gamma:<g>`,
+    /// `clahe[:<clip>[,<tiles>]]` ([`crate::model::enhance`]). None = off. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preprocess: Option<Preprocess>,
+    /// Enhancement on night / IR frames, replacing `preprocess` there. None = `preprocess`.
+    /// Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub night_preprocess: Option<Preprocess>,
+    /// Verifier cascade for every model without its own `verify` ([`crate::verify`]); the
+    /// verifier model itself is never verified. None = off. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::verify::VerifyConfig>,
+    /// Dataset collector ([`crate::collect`], `docs/DATASET.md`): saves frames with what the
+    /// model saw for review and training. Off by default. Applies at once.
+    #[serde(skip_serializing_if = "crate::collect::CollectConfig::is_default")]
+    pub collect: crate::collect::CollectConfig,
+    /// Model training ([`crate::training`], `docs/TRAINING.md`): where runs go, the review
+    /// exports offered, dataset defaults. Read when a run is queued. Applies at once.
+    #[serde(skip_serializing_if = "crate::training::TrainingConfig::is_default")]
+    pub training: crate::training::TrainingConfig,
     pub log_level: LogLevel,
     /// Directory of the daily rolling log files (None = stdout only). Relative paths resolve
     /// against the exe dir. Process restart.
@@ -511,7 +682,7 @@ pub struct BenchmarkConfig {
 impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
-            datasets: crate::benchmark::images::KNOWN_SET_IDS
+            datasets: crate::benchmark::images::DEFAULT_SET_IDS
                 .iter()
                 .map(|s| DatasetRef::Id(s.to_string()))
                 .collect(),
@@ -547,6 +718,18 @@ impl Default for Config {
             confidence_threshold: 0.5,
             nms_iou: 0.5,
             object_filter: Vec::new(),
+            night_confidence_threshold: None,
+            label_thresholds: BTreeMap::new(),
+            night_label_thresholds: BTreeMap::new(),
+            person_aspect: None,
+            min_box_area_frac: None,
+            suppress_overlaps: Vec::new(),
+            static_suppression: StaticSuppression::default(),
+            preprocess: None,
+            night_preprocess: None,
+            verify: None,
+            collect: crate::collect::CollectConfig::default(),
+            training: crate::training::TrainingConfig::default(),
             log_level: LogLevel::Info,
             log_path: None,
             log_format: LogFormat::Text,
@@ -936,6 +1119,178 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
                 MAX_INFLIGHT_SETTING,
             )?;
         }
+        validate_filter_rules(
+            &format!("models: '{key}' "),
+            &FilterFields {
+                night_confidence_threshold: m.night_confidence_threshold,
+                label_thresholds: m.label_thresholds.as_ref(),
+                night_label_thresholds: m.night_label_thresholds.as_ref(),
+                person_aspect: m.person_aspect,
+                min_box_area_frac: m.min_box_area_frac,
+                suppress_overlaps: m.suppress_overlaps.as_deref(),
+                static_suppression: m.static_suppression.as_ref(),
+            },
+        )?;
+    }
+    validate_night_models(models)?;
+    for m in models {
+        if let Some(v) = &m.verify {
+            let key = crate::registry::normalize_name(&m.effective_name());
+            let field = format!("models: '{key}' verify");
+            v.validate(&field)?;
+            if v.enabled && crate::registry::normalize_name(&v.model) == key {
+                anyhow::bail!(
+                    "{field}.model: names the model itself; name another configured model (one \
+                     that makes different mistakes, e.g. another family) or remove `verify`"
+                );
+            }
+            check_verify_model(&field, v, models)?;
+        }
+    }
+    Ok(())
+}
+
+/// The global `verify`: ranges and a configured `model`.
+pub fn validate_verify(
+    v: Option<&crate::verify::VerifyConfig>,
+    models: &[ModelConfig],
+) -> Result<()> {
+    let Some(v) = v else {
+        return Ok(());
+    };
+    v.validate("verify")?;
+    check_verify_model("verify", v, models)
+}
+
+/// An enabled `verify` names a configured model (enabled or not: a disabled or unloaded
+/// verifier leaves the candidates unverified).
+fn check_verify_model(
+    field: &str,
+    v: &crate::verify::VerifyConfig,
+    models: &[ModelConfig],
+) -> Result<()> {
+    use crate::registry::normalize_name;
+    if !v.enabled {
+        return Ok(());
+    }
+    let key = normalize_name(&v.model);
+    if !models
+        .iter()
+        .any(|m| normalize_name(&m.effective_name()) == key)
+    {
+        anyhow::bail!(
+            "{field}.model: '{}' is not a configured model; add it to `models` first, or fix the \
+             name (see the Models card)",
+            v.model
+        );
+    }
+    Ok(())
+}
+
+/// `night_model` of every entry names another entry (any, enabled or not: a disabled night
+/// model only makes the switch fall back) that has no `night_model` itself (one hop: no chains
+/// or cycles).
+pub fn validate_night_models(models: &[ModelConfig]) -> Result<()> {
+    use crate::registry::normalize_name;
+    use anyhow::bail;
+    let night_of = |key: &str| {
+        models
+            .iter()
+            .find(|m| normalize_name(&m.effective_name()) == key)
+    };
+    for m in models {
+        let Some(night) = m.night_model.as_deref() else {
+            continue;
+        };
+        let key = normalize_name(&m.effective_name());
+        let field = format!("models: '{key}' night_model");
+        if night.trim().is_empty() {
+            bail!("{field}: is empty; name another model or remove the key");
+        }
+        let nkey = normalize_name(night);
+        if nkey == key {
+            bail!(
+                "{field}: names the model itself; name another configured model (e.g. one \
+                 trained on IR frames) or remove the key"
+            );
+        }
+        let Some(target) = night_of(&nkey) else {
+            bail!(
+                "{field}: '{night}' is not a configured model; add it to `models` first, or fix \
+                 the name (see the Models card)"
+            );
+        };
+        if target.night_model.is_some() {
+            bail!(
+                "{field}: '{night}' has a night_model of its own; night models do not chain, so \
+                 remove night_model from '{night}' or point '{key}' at a model without one"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Largest accepted `person_aspect` bound (width / height).
+pub const MAX_PERSON_ASPECT: f32 = 20.0;
+
+/// The night / IR rule fields of the config or of one model entry (see
+/// [`validate_filter_rules`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilterFields<'a> {
+    pub night_confidence_threshold: Option<f32>,
+    pub label_thresholds: Option<&'a BTreeMap<String, f32>>,
+    pub night_label_thresholds: Option<&'a BTreeMap<String, f32>>,
+    pub person_aspect: Option<[f32; 2]>,
+    pub min_box_area_frac: Option<f32>,
+    pub suppress_overlaps: Option<&'a [OverlapRule]>,
+    pub static_suppression: Option<&'a StaticSuppression>,
+}
+
+/// Range checks of the night / IR rules; errors start with `prefix` (empty for the globals,
+/// `models: 'x' ` for a model) and name the key.
+pub fn validate_filter_rules(prefix: &str, f: &FilterFields<'_>) -> Result<()> {
+    use anyhow::bail;
+    if let Some(t) = f.night_confidence_threshold {
+        check_threshold(&format!("{prefix}night_confidence_threshold"), t)?;
+    }
+    for (field, map) in [
+        ("label_thresholds", f.label_thresholds),
+        ("night_label_thresholds", f.night_label_thresholds),
+    ] {
+        for (label, t) in map.into_iter().flatten() {
+            if label.trim().is_empty() {
+                bail!("{prefix}{field}: has an empty label; use a class name such as \"person\"");
+            }
+            check_threshold(&format!("{prefix}{field}.{label}"), *t)?;
+        }
+    }
+    if let Some([lo, hi]) = f.person_aspect {
+        let field = format!("{prefix}person_aspect");
+        if !(lo.is_finite() && hi.is_finite() && lo >= 0.0 && hi <= MAX_PERSON_ASPECT && lo < hi) {
+            bail!(
+                "{field}: must be [min, max] width/height with 0 <= min < max <= \
+                 {MAX_PERSON_ASPECT}, got [{lo}, {hi}]; a standing person is about [0.2, 0.9]"
+            );
+        }
+    }
+    if let Some(a) = f.min_box_area_frac {
+        check_threshold(&format!("{prefix}min_box_area_frac"), a)?;
+    }
+    for (i, r) in f.suppress_overlaps.into_iter().flatten().enumerate() {
+        let field = format!("{prefix}suppress_overlaps[{i}]");
+        if r.drop.trim().is_empty() || r.if_overlaps.trim().is_empty() {
+            bail!(
+                "{field}: `drop` and `if_overlaps` must both name a label, e.g. \
+                 {{\"drop\": \"person\", \"if_overlaps\": \"potted plant\"}}"
+            );
+        }
+        check_threshold(&format!("{field}.iou"), r.iou)?;
+        if r.iou <= 0.0 {
+            bail!("{field}.iou: must be above 0 (0 would match boxes that do not touch), got 0");
+        }
+    }
+    if let Some(s) = f.static_suppression {
+        s.validate(&format!("{prefix}static_suppression"))?;
     }
     Ok(())
 }
@@ -1007,7 +1362,22 @@ impl Config {
                  accepts, or use \"auto\""
             )
         })?;
+        validate_filter_rules(
+            "",
+            &FilterFields {
+                night_confidence_threshold: self.night_confidence_threshold,
+                label_thresholds: Some(&self.label_thresholds),
+                night_label_thresholds: Some(&self.night_label_thresholds),
+                person_aspect: self.person_aspect,
+                min_box_area_frac: self.min_box_area_frac,
+                suppress_overlaps: Some(&self.suppress_overlaps),
+                static_suppression: Some(&self.static_suppression),
+            },
+        )?;
         validate_model_entries(&self.models)?;
+        validate_verify(self.verify.as_ref(), &self.models)?;
+        self.collect.validate(&self.data_root())?;
+        self.training.validate()?;
         let b = &self.benchmark;
         check_range("benchmark.warmup", b.warmup, 0, MAX_BENCH_ITERATIONS)?;
         check_range(
@@ -1797,6 +2167,53 @@ mod tests {
     }
 
     #[test]
+    fn validate_night_model_references() {
+        let entry = |name: &str, night: Option<&str>| ModelConfig {
+            name: Some(name.into()),
+            path: format!("{name}.onnx").into(),
+            night_model: night.map(str::to_string),
+            ..Default::default()
+        };
+        let err = |models: &[ModelConfig]| format!("{:#}", validate_models(models).unwrap_err());
+        // A plain reference (case-insensitive, `.onnx` ignored); a disabled target is fine.
+        let mut ok = vec![entry("day", Some("Night.onnx")), entry("night", None)];
+        validate_models(&ok).unwrap();
+        ok[1].enabled = false;
+        validate_models(&ok).unwrap();
+        // Two models may share one night model.
+        validate_models(&[
+            entry("a", Some("night")),
+            entry("b", Some("night")),
+            entry("night", None),
+        ])
+        .unwrap();
+        let e = err(&[entry("day", Some("nope")), entry("night", None)]);
+        assert!(e.contains("'nope' is not a configured model"), "{e}");
+        let e = err(&[entry("day", Some("DAY"))]);
+        assert!(e.contains("names the model itself"), "{e}");
+        let e = err(&[entry("day", Some("  "))]);
+        assert!(e.contains("night_model: is empty"), "{e}");
+        // Chains and cycles.
+        let e = err(&[
+            entry("a", Some("b")),
+            entry("b", Some("c")),
+            entry("c", None),
+        ]);
+        assert!(
+            e.contains("'a' night_model: 'b' has a night_model of its own"),
+            "{e}"
+        );
+        let e = err(&[entry("a", Some("b")), entry("b", Some("a"))]);
+        assert!(e.contains("do not chain"), "{e}");
+        // Round trip: written only when set.
+        let text = serde_json::to_string(&entry("day", None)).unwrap();
+        assert!(!text.contains("night_model"), "{text}");
+        let back: ModelConfig =
+            serde_json::from_str(&serde_json::to_string(&ok[0]).unwrap()).unwrap();
+        assert_eq!(back.night_model.as_deref(), Some("Night.onnx"));
+    }
+
+    #[test]
     fn validate_thresholds_global_and_per_model() {
         rejects(
             |c| c.confidence_threshold = 5.0,
@@ -2223,15 +2640,18 @@ mod tests {
                 missing.push(key);
             }
         };
-        let top = keys(serde_json::to_value(Config::default()).unwrap());
+        let top = keys(serde_json::to_value(night_rules_config()).unwrap());
         assert!(top.contains(&"log_format".to_string()));
+        assert!(top.contains(&"static_suppression".to_string()));
         for k in top {
             check(k);
         }
         // `Some` for the fields serialized only when set.
         let model = ModelConfig {
             inflight: Some(1),
-            ..Default::default()
+            night_model: Some("night".into()),
+            verify: Some(crate::verify::VerifyConfig::with_model("night")),
+            ..night_rules_model()
         };
         let model_keys = keys(serde_json::to_value(model).unwrap());
         assert!(model_keys.contains(&"inflight".to_string()));
@@ -2244,6 +2664,338 @@ mod tests {
         assert!(
             missing.is_empty(),
             "README.md has no `| `key` |` row for: {missing:?}"
+        );
+    }
+
+    /// A config with every night / IR rule set (globals and one model).
+    fn night_rules_config() -> Config {
+        Config {
+            night_confidence_threshold: Some(0.6),
+            label_thresholds: BTreeMap::from([("car".to_string(), 0.7)]),
+            night_label_thresholds: BTreeMap::from([("person".to_string(), 0.65)]),
+            person_aspect: Some([0.2, 0.9]),
+            min_box_area_frac: Some(0.001),
+            suppress_overlaps: vec![OverlapRule {
+                drop: "person".into(),
+                if_overlaps: "potted plant".into(),
+                iou: 0.45,
+                night_only: true,
+            }],
+            static_suppression: StaticSuppression {
+                enabled: true,
+                ..Default::default()
+            },
+            preprocess: Some(Preprocess::Gamma(0.8)),
+            night_preprocess: Some(Preprocess::CLAHE),
+            verify: Some(crate::verify::VerifyConfig::with_model("m")),
+            models: vec![night_rules_model()],
+            ..Config::default()
+        }
+    }
+
+    fn night_rules_model() -> ModelConfig {
+        ModelConfig {
+            name: Some("m".into()),
+            path: "m.onnx".into(),
+            night_confidence_threshold: Some(0.7),
+            label_thresholds: Some(BTreeMap::from([("person".to_string(), 0.55)])),
+            night_label_thresholds: Some(BTreeMap::new()),
+            person_aspect: Some([0.25, 0.8]),
+            min_box_area_frac: Some(0.0005),
+            suppress_overlaps: Some(Vec::new()),
+            static_suppression: Some(StaticSuppression::default()),
+            preprocess: Some(Preprocess::None),
+            night_preprocess: Some(Preprocess::Clahe {
+                clip: 3.0,
+                tiles: 4,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn old_config_without_night_rules_round_trips_unchanged() {
+        let mut c = Config::default();
+        c.models.push(ModelConfig {
+            name: Some("a".into()),
+            path: "models/a.onnx".into(),
+            ..Default::default()
+        });
+        let text = c.saved_text().unwrap();
+        for key in [
+            "night_confidence_threshold",
+            "label_thresholds",
+            "night_label_thresholds",
+            "person_aspect",
+            "min_box_area_frac",
+            "suppress_overlaps",
+            "static_suppression",
+            "\"preprocess\"",
+            "night_preprocess",
+            "verify",
+        ] {
+            assert!(!text.contains(key), "{key} written by default: {text}");
+        }
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(back.saved_text().unwrap(), text);
+    }
+
+    #[test]
+    fn night_rules_round_trip_with_clean_numbers() {
+        let c = night_rules_config();
+        c.validate().unwrap();
+        let text = c.saved_text().unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(back.saved_text().unwrap(), text);
+        // Through serde_json::Value (what config_merge compares) the numbers stay as typed.
+        let v = serde_json::to_value(&c).unwrap().to_string();
+        for want in [
+            r#""night_confidence_threshold":0.6"#,
+            r#""person_aspect":[0.2,0.9]"#,
+            r#""min_box_area_frac":0.001"#,
+            r#""night_label_thresholds":{"person":0.65}"#,
+            r#""iou":0.45"#,
+            r#""iou":0.85"#,
+            r#""preprocess":"gamma:0.8""#,
+            r#""night_preprocess":"clahe""#,
+            r#""night_preprocess":"clahe:3,4""#,
+        ] {
+            assert!(v.contains(want), "{want} not in {v}");
+        }
+        // A static_suppression with only `enabled` gets the defaults.
+        let c: Config = serde_json::from_str(r#"{"static_suppression":{"enabled":true}}"#).unwrap();
+        assert!(c.static_suppression.enabled);
+        assert_eq!(c.static_suppression.hits, 5);
+    }
+
+    #[test]
+    fn validate_verify_references() {
+        use crate::verify::VerifyConfig;
+        let entry = |name: &str, verify: Option<VerifyConfig>| ModelConfig {
+            name: Some(name.into()),
+            path: format!("{name}.onnx").into(),
+            verify,
+            ..Default::default()
+        };
+        let check = |c: Config| c.validate().map_err(|e| format!("{e:#}"));
+        let v = |m: &str| Some(VerifyConfig::with_model(m));
+        let ok = Config {
+            models: vec![entry("a", v("B.onnx")), entry("b", None)],
+            ..Config::default()
+        };
+        check(ok.clone()).unwrap();
+        // Unknown, itself, out of range.
+        let e = check(Config {
+            models: vec![entry("a", v("c")), entry("b", None)],
+            ..Config::default()
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("'a' verify.model: 'c' is not a configured model"),
+            "{e}"
+        );
+        let e = check(Config {
+            models: vec![entry("a", v("A"))],
+            ..Config::default()
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("'a' verify.model: names the model itself"),
+            "{e}"
+        );
+        let bad = VerifyConfig {
+            max_crops: 0,
+            ..VerifyConfig::with_model("b")
+        };
+        let e = check(Config {
+            models: vec![entry("a", Some(bad)), entry("b", None)],
+            ..Config::default()
+        })
+        .unwrap_err();
+        assert!(e.contains("models: 'a' verify.max_crops"), "{e}");
+        // A disabled entry is not checked; verifiers may verify each other (checks never
+        // cascade).
+        let off = VerifyConfig {
+            enabled: false,
+            ..VerifyConfig::default()
+        };
+        check(Config {
+            models: vec![
+                entry("a", Some(off)),
+                entry("b", v("a")),
+                entry("c", v("a")),
+            ],
+            ..ok.clone()
+        })
+        .unwrap();
+        check(Config {
+            models: vec![entry("a", v("b")), entry("b", v("a"))],
+            ..Config::default()
+        })
+        .unwrap();
+        // The global default names a configured model (it never verifies that model itself).
+        check(Config {
+            verify: v("b"),
+            ..ok.clone()
+        })
+        .unwrap();
+        let e = check(Config {
+            verify: v("zzz"),
+            ..ok.clone()
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("verify.model: 'zzz' is not a configured model"),
+            "{e}"
+        );
+        let e = check(Config {
+            verify: Some(VerifyConfig {
+                pad: -1.0,
+                ..VerifyConfig::with_model("b")
+            }),
+            ..ok
+        })
+        .unwrap_err();
+        assert!(e.starts_with("verify.pad"), "{e}");
+    }
+
+    #[test]
+    fn verify_round_trips_and_resolves_per_model() {
+        use crate::verify::VerifyConfig;
+        let text = r#"{"verify":{"model":"b","aliases":{"vehicle":"car"}},"models":[
+            {"name":"a","path":"a.onnx"},
+            {"name":"b","path":"b.onnx"},
+            {"name":"c","path":"c.onnx","verify":{"enabled":false}},
+            {"name":"d","path":"d.onnx","verify":{"model":"a","mode":"frame","night_only":false}}]}"#;
+        let c: Config = serde_json::from_str(text).unwrap();
+        c.validate().unwrap();
+        let back: Config = serde_json::from_str(&c.saved_text().unwrap()).unwrap();
+        assert_eq!(back, c);
+        let live = |i: usize| crate::worker::verify_settings(&c, &c.models[i]);
+        let a = live(0).unwrap();
+        assert_eq!(a.model, "b");
+        assert_eq!(a.aliases.get("vehicle").map(String::as_str), Some("car"));
+        assert_eq!(live(1), None, "the verifier is never verified by itself");
+        assert_eq!(live(2), None, "turned off for this model");
+        let d = live(3).unwrap();
+        assert_eq!(
+            (d.model.as_str(), d.mode, d.night_only),
+            ("a", crate::verify::VerifyMode::Frame, false)
+        );
+        assert_eq!(d.labels, VerifyConfig::default().labels);
+    }
+
+    #[test]
+    fn preprocess_modes_resolve_per_field() {
+        let mut c = Config::default();
+        let mut m = ModelConfig::default();
+        assert!(c.preprocess_modes(&m).is_noop());
+        c.preprocess = Some(Preprocess::Grayscale);
+        c.night_preprocess = Some(Preprocess::CLAHE);
+        let g = c.preprocess_modes(&m);
+        assert_eq!(g.preprocess, Preprocess::Grayscale);
+        assert_eq!(g.night_preprocess, Some(Preprocess::CLAHE));
+        // The model's own value wins per field; `none` turns a global mode off.
+        m.preprocess = Some(Preprocess::None);
+        let own = c.preprocess_modes(&m);
+        assert_eq!(own.preprocess, Preprocess::None);
+        assert_eq!(own.night_preprocess, Some(Preprocess::CLAHE));
+        m.night_preprocess = Some(Preprocess::Gamma(0.6));
+        assert_eq!(
+            c.preprocess_modes(&m).night_preprocess,
+            Some(Preprocess::Gamma(0.6))
+        );
+        // A bad mode is a parse error that lists the accepted forms.
+        let e = serde_json::from_str::<Config>(r#"{"preprocess":"sharpen"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not a mode") && e.contains("clahe"), "{e}");
+    }
+
+    #[test]
+    fn validate_night_rules() {
+        let night = |f: fn(&mut Config)| {
+            let mut c = Config::default();
+            f(&mut c);
+            c.validate().map_err(|e| format!("{e:#}"))
+        };
+        assert!(night(|c| *c = night_rules_config()).is_ok());
+        let e = night(|c| c.night_confidence_threshold = Some(1.5)).unwrap_err();
+        assert!(
+            e.contains("night_confidence_threshold: must be between 0 and 1"),
+            "{e}"
+        );
+        let e = night(|c| {
+            c.label_thresholds.insert("person".into(), -0.1);
+        })
+        .unwrap_err();
+        assert!(e.contains("label_thresholds.person"), "{e}");
+        let e = night(|c| {
+            c.night_label_thresholds.insert(" ".into(), 0.5);
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("night_label_thresholds: has an empty label"),
+            "{e}"
+        );
+        for bad in [
+            [0.9, 0.2],
+            [0.5, 0.5],
+            [-0.1, 0.9],
+            [0.2, 50.0],
+            [f32::NAN, 1.0],
+        ] {
+            let c = Config {
+                person_aspect: Some(bad),
+                ..Config::default()
+            };
+            let e = format!("{:#}", c.validate().unwrap_err());
+            assert!(e.contains("person_aspect: must be [min, max]"), "{e}");
+        }
+        let e = night(|c| c.min_box_area_frac = Some(2.0)).unwrap_err();
+        assert!(e.contains("min_box_area_frac"), "{e}");
+        let rule = |drop: &str, iou: f32| OverlapRule {
+            drop: drop.into(),
+            if_overlaps: "potted plant".into(),
+            iou,
+            night_only: false,
+        };
+        let mut c = Config {
+            suppress_overlaps: vec![rule("person", 0.5), rule("", 0.5)],
+            ..Config::default()
+        };
+        let e = format!("{:#}", c.validate().unwrap_err());
+        assert!(e.contains("suppress_overlaps[1]"), "{e}");
+        c.suppress_overlaps = vec![rule("person", 0.0)];
+        let e = format!("{:#}", c.validate().unwrap_err());
+        assert!(
+            e.contains("suppress_overlaps[0].iou: must be above 0"),
+            "{e}"
+        );
+        let e = night(|c| c.static_suppression.hits = 0).unwrap_err();
+        assert!(e.contains("static_suppression.hits"), "{e}");
+        // Per model: the error names the model.
+        let mut c = Config::default();
+        c.models.push(ModelConfig {
+            person_aspect: Some([1.0, 0.5]),
+            ..night_rules_model()
+        });
+        let e = format!("{:#}", c.validate().unwrap_err());
+        assert!(e.contains("models: 'm' person_aspect"), "{e}");
+        let mut c = Config::default();
+        c.models.push(ModelConfig {
+            static_suppression: Some(StaticSuppression {
+                window_minutes: 0,
+                ..Default::default()
+            }),
+            ..night_rules_model()
+        });
+        let e = format!("{:#}", c.validate().unwrap_err());
+        assert!(
+            e.contains("models: 'm' static_suppression.window_minutes"),
+            "{e}"
         );
     }
 }

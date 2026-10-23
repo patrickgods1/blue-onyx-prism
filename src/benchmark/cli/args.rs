@@ -147,9 +147,22 @@ pub struct BenchArgs {
     /// Print machine-readable JSON instead of tables.
     #[arg(long)]
     pub json: bool,
+    /// Pipeline variants, a comma list (each model runs once per variant, results named
+    /// `<model>+<variant>`): none (the plain pipeline), filters (the model's night / IR filter
+    /// rules from the config, else the night-default preset: night threshold 0.5, night
+    /// person 0.6, person width/height 0.2..0.9, drop person on potted plant), pre:<mode>
+    /// (enhance every frame), night-pre:<mode> (night / IR frames only); join parts with +
+    /// (filters+night-pre:clahe). <mode>: none, grayscale, gamma:<g>, clahe[:<clip>[,<tiles>]].
+    /// Default: none. --apply / --apply-threshold use the plain results only.
+    #[arg(long, value_parser = parse_variants_arg)]
+    pub variants: Option<crate::benchmark::variant::VariantList>,
     /// Show info-level logs (on stderr).
     #[arg(long, short)]
     pub verbose: bool,
+}
+
+fn parse_variants_arg(s: &str) -> Result<crate::benchmark::variant::VariantList, String> {
+    crate::benchmark::variant::parse_variants(s).map(crate::benchmark::variant::VariantList)
 }
 
 fn parse_objective_arg(s: &str) -> Result<Objective, String> {

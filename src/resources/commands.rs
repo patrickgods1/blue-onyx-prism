@@ -411,10 +411,26 @@ async fn remote_size(client: &reqwest::Client, url: &str) -> Result<u64> {
     Ok(n)
 }
 
-/// `list-resources --check-urls`: every distinct catalog URL (all platforms) must answer with
-/// exactly the pinned size. Prints one line per URL; an error lists the failures.
+/// Every pinned resource `--check-urls` checks: [`catalog::all`] plus the training pins that are
+/// not part of it (the `train-base:*` weights, the public night subset `train-data:lila-night`,
+/// the `autolabel:*` labeler checkpoints and the `import-data:*` footage).
+pub fn url_check_resources() -> impl Iterator<Item = &'static Resource> {
+    catalog::all()
+        .chain(catalog::TRAIN_BASE_WEIGHTS)
+        .chain(catalog::lila_night())
+        .chain(catalog::AUTOLABEL_WEIGHTS)
+        .chain(catalog::IMPORT_DATASETS)
+}
+
+/// URLs checked at once.
+const CHECK_CONCURRENCY: usize = 16;
+
+/// `list-resources --check-urls`: every distinct pinned URL ([`url_check_resources`], all
+/// platforms) must answer with exactly the pinned size. Prints one line per URL (in URL order;
+/// [`CHECK_CONCURRENCY`] requests in flight); an error lists the failures.
 pub fn check_urls() -> Result<()> {
-    let mut parts: Vec<(&'static str, u64)> = catalog::all()
+    use futures_util::StreamExt;
+    let mut parts: Vec<(&'static str, u64)> = url_check_resources()
         .flat_map(|r| r.parts.iter().map(|p| (p.url, p.size)))
         .collect();
     parts.sort();
@@ -428,20 +444,28 @@ pub fn check_urls() -> Result<()> {
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let mut failures = Vec::new();
-    for (url, size) in &parts {
-        let got = rt.block_on(remote_size(&client, url));
-        match got {
-            Ok(n) if n == *size => println!("ok    {size:>11}  {url}"),
-            Ok(n) => {
-                println!("FAIL  {size:>11}  {url} (server says {n} bytes)");
-                failures.push(format!("{url}: size {n}, pinned {size}"));
-            }
-            Err(e) => {
-                println!("FAIL  {size:>11}  {url} ({e:#})");
-                failures.push(format!("{url}: {e:#}"));
+    rt.block_on(async {
+        let client = &client;
+        let mut results = futures_util::stream::iter(
+            parts
+                .iter()
+                .map(|&(url, size)| async move { (url, size, remote_size(client, url).await) }),
+        )
+        .buffered(CHECK_CONCURRENCY);
+        while let Some((url, size, got)) = results.next().await {
+            match got {
+                Ok(n) if n == size => println!("ok    {size:>11}  {url}"),
+                Ok(n) => {
+                    println!("FAIL  {size:>11}  {url} (server says {n} bytes)");
+                    failures.push(format!("{url}: size {n}, pinned {size}"));
+                }
+                Err(e) => {
+                    println!("FAIL  {size:>11}  {url} ({e:#})");
+                    failures.push(format!("{url}: {e:#}"));
+                }
             }
         }
-    }
+    });
     println!("{} URLs checked, {} failed", parts.len(), failures.len());
     if !failures.is_empty() {
         bail!("catalog URLs failed: {}", failures.join("; "));

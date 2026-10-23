@@ -23,12 +23,12 @@
   <h2>Models <span class="tag now">applies now</span></h2>
   <p class="muted">Checked models are compiled and served; the default model answers <code>/v1/vision/detection</code>. Saving applies at once.</p>
   <details class="help"><summary>How this works</summary>
-  <p>Each model can run on its own device (OpenVINO and ONNX Runtime models run side by side; one ONNX Runtime flavor per process) and have its own confidence threshold (empty = the global {{ global_threshold }}); the <a href="/benchmark">Benchmark</a> measures which device and threshold suit each model best. <em>Running</em> is what the loaded worker uses now. Thresholds apply without a reload, other changes reload only that model; a <span class="tag restart">restart needed</span> badge means the saved config differs from what runs and needs a server restart. Other per-model settings (classes, object filter, lazy, GPU precision) are in the <a href="#models-json">Models JSON</a> below, which stays in sync with this card.</p>
+  <p>Each model can run on its own device (OpenVINO and ONNX Runtime models run side by side; one ONNX Runtime flavor per process) and have its own confidence threshold (empty = the global {{ global_threshold }}); the <a href="/benchmark">Benchmark</a> measures which device and threshold suit each model best. <em>Running</em> is what the loaded worker uses now. Thresholds apply without a reload, other changes reload only that model; a <span class="tag restart">restart needed</span> badge means the saved config differs from what runs and needs a server restart. <em>Night model</em> names another model that answers this model's night / IR frames (dark or monochrome; the frame is decoded once and handed over; while that model is not loaded the frame runs here); night models do not chain. Other per-model settings (classes, object filter, lazy, GPU precision) are in the <a href="#models-json">Models JSON</a> below, which stays in sync with this card.</p>
   </details>
   {% if c.force_cpu %}<p class="warn">Force CPU is on and overrides every per-model device. <a href="#inference">Change</a></p>{% endif %}
   <div class="scroll">
   <table class="model-card">
-  <thead><tr><th>Load</th><th>Default</th><th>Name</th><th>Family</th><th>Device</th><th>Threshold</th><th>Running</th><th>File</th><th>Entry</th></tr></thead>
+  <thead><tr><th>Load</th><th>Default</th><th>Name</th><th>Family</th><th>Device</th><th>Threshold</th><th title="Model that answers this model's night / IR frames">Night model</th><th>Running</th><th>File</th><th>Entry</th></tr></thead>
   <tbody>
   {% for m in models %}
   <tr data-model="{{ m.key }}"{% if !m.pending.is_empty() %} class="pending"{% endif %}>
@@ -42,6 +42,9 @@
       <span class="bench-hint sub">{% if let Some(b) = m.bench %}<a href="{{ b.href }}" title="{{ b.title }}">{{ b.text }}</a>{% endif %}</span></td>
     <td class="model-thr"><input type="number" data-key="model:confidence_threshold:{{ m.key }}" name="threshold.{{ m.name }}" min="0" max="1" step="0.01" value="{{ m.threshold }}" placeholder="{{ global_threshold }}" aria-label="Confidence threshold of {{ m.name }} (empty = global)">
       <span class="thr-hint sub">{% if let Some(t) = m.best_threshold %}benchmark best {{ t.0 }} ({{ t.1 }}){% if let Some(st) = t.2 %} {{ st }}{% else %} <button type="button" class="small secondary" data-use-threshold="{{ t.0 }}" title="Put {{ t.0 }} in the threshold field (then save)">use</button>{% endif %}{% endif %}</span></td>
+    <td class="model-night"><select data-key="model:night_model:{{ m.key }}" name="night.{{ m.name }}" aria-label="Night model of {{ m.name }}" title="Night / IR frames of {{ m.name }} are answered by this model (falls back to {{ m.name }} while it is not loaded)">
+      {% for d in m.night_models %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}>{{ d.label }}</option>{% endfor %}
+      </select></td>
     <td class="running st-{{ m.running_class }}">{{ m.running }}</td>
     <td class="file"><code title="{{ m.path }}">{{ m.file_name }}</code>{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-export" title="{{ x }}: exported on this machine on request">export it</a>{% else if !m.exists %} <span class="muted">(missing)</span>{% endif %}</td>
     <td class="model-remove-cell"><button type="submit" class="small danger model-remove" form="model-remove" name="name" value="{{ m.name }}" data-confirm="Remove {{ m.name }} from the config? Its files stay; remove them under Resources."{% if m.enabled %} disabled title="Enabled: disable it first (untick Load and save), then remove it"{% else %} title="Remove this entry from the config; its files stay"{% endif %}>Remove</button></td>
@@ -106,7 +109,7 @@
   <form method="post" action="/config#at-models" id="models-json-form">
   <textarea name="models_json" rows="14" spellcheck="false">{{ c.models_json }}</textarea>
   <p class="muted">Merged per model and field with changes made elsewhere (the Models card, Benchmark apply). Each entry: <code>path</code> (required), <code>family</code>, <code>name</code>, <code>classes</code>, <code>device</code>,
-  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>.</p>
+  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>).</p>
   <div class="actions"><button type="submit">Save models JSON</button> <span class="form-msg" aria-live="polite"></span></div>
   </form>
 </details>
@@ -119,7 +122,7 @@
   {% call notices("resources") %}{% endcall %}
   <p class="muted">Pinned, SHA-256 checked downloads for this platform: runtimes, GPU libraries, models and benchmark image sets. Live JSON: <a href="/v1/resources"><code>/v1/resources</code></a>.</p>
   <details class="help"><summary>How downloads and exports work</summary>
-  <p>With <em>auto download</em> on (<a href="#tab-server">Server</a> tab), whatever the config needs is fetched at startup. A new runtime is used after a restart (automatic when a model waits for it). Ultralytics YOLO (AGPL-3.0), RF-DETR large and DEIMv2 (non-commercial / personal use only) are not downloadable as ONNX: use Export in the <a href="#res-models-export">exported models</a> section, or export by hand with <code>scripts/export_model.py --out-dir "{{ models_dir }}"</code> (see the README); other model files show up under <a href="#local-models">Local models</a>. The NVIDIA CUDA/cuDNN libraries (for <code>ort:cuda</code> without a CUDA 12 / cuDNN 9 install) are covered by NVIDIA's license.</p>
+  <p>With <em>auto download</em> on (<a href="#tab-server">Server</a> tab), whatever the config needs is fetched at startup. A new runtime is used after a restart (automatic when a model waits for it). Some models are not downloadable as ONNX (licenses per recipe under <a href="#res-models-export">About exports</a>): use Export in the <a href="#res-models-export">exported models</a> section, or export by hand with <code>scripts/export_model.py --out-dir "{{ models_dir }}"</code> (see the README); other model files show up under <a href="#local-models">Local models</a>. The NVIDIA CUDA/cuDNN libraries (for <code>ort:cuda</code> without a CUDA 12 / cuDNN 9 install) are covered by NVIDIA's license.</p>
   </details>
   {% if !resources_enabled %}<p class="muted">This server has no download manager; use <code>blue-onyx-prism fetch</code>.</p>{% endif %}
   {% for g in resource_groups %}
@@ -223,6 +226,18 @@
     <label>NMS IoU <input type="number" name="nms_iou" min="0" max="1" step="0.01" value="{{ c.nms_iou }}" required></label>
     <label>Object filter (comma separated, empty = all) <input type="text" name="object_filter" value="{{ c.object_filter }}"></label>
     <p class="muted">Per-model thresholds in the Models tab override the global threshold.</p>
+  </fieldset>
+
+  <fieldset class="group" id="night">
+    <legend>Night / IR <span class="tag now">applies now</span></legend>
+    <input type="hidden" name="night_settings" value="1">
+    <label>Night / IR confidence threshold (empty = off) <input type="number" name="night_confidence_threshold" min="0" max="1" step="0.01" value="{{ c.night_confidence_threshold }}" placeholder="off"></label>
+    <label>Night / IR person threshold (empty = off) <input type="number" name="night_person_threshold" min="0" max="1" step="0.01" value="{{ c.night_person_threshold }}" placeholder="off"></label>
+    <label>Person width/height min <input type="number" name="person_aspect_min" min="0" max="20" step="0.01" value="{{ c.person_aspect_min }}" placeholder="off (e.g. 0.2)"></label>
+    <label>Person width/height max <input type="number" name="person_aspect_max" min="0" max="20" step="0.01" value="{{ c.person_aspect_max }}" placeholder="off (e.g. 0.9)"></label>
+    <label class="check"><input type="checkbox" name="drop_person_on_plant"{% if c.drop_person_on_plant %} checked{% endif %}> Drop a person box that overlaps a potted plant box</label>
+    <label class="check"><input type="checkbox" name="static_suppression"{% if c.static_suppression %} checked{% endif %}> Static-box suppression <span class="muted">(a person box at the same place in 5 requests in a row is background; a person standing perfectly still is suppressed too)</span></label>
+    <p class="muted">Night / IR rules apply to dark or monochrome (IR) frames and only remove boxes, never add them. Per-model values (<code>night_confidence_threshold</code>, <code>label_thresholds</code>, <code>night_label_thresholds</code>, <code>person_aspect</code>, <code>min_box_area_frac</code>, <code>suppress_overlaps</code>, <code>static_suppression</code>) go in the Models JSON.</p>
   </fieldset>
 
   <fieldset class="group" id="logging">

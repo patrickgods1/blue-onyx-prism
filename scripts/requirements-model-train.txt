@@ -1,0 +1,54 @@
+# Pinned Python packages of the on-demand training environment (Training page, or
+# `blue-onyx-prism train run ...`): Ultralytics YOLO (YOLO26 / YOLO11 / YOLOv8), RF-DETR (the
+# `rfdetr` package with its training extra) and Hugging Face transformers (RT-DETRv2, D-FINE)
+# fine-tuning, then the same static-ONNX export and ONNX Runtime check as the model export.
+# Every release is at least two weeks old.
+#
+# This is the input of the hashed locks scripts/model-export/locks/train-*.txt, which the service
+# installs with `uv pip install --require-hashes --no-deps --only-binary :all:` into
+# <data root>/tools/train-env (a separate environment from tools/export-env). Regenerate them after
+# changing a pin with scripts/model-export/gen_train_locks.sh.
+#
+# torch / torchvision: GPU builds. macOS arm64 from PyPI (Metal / MPS). Windows and Linux x86_64
+# from the PyTorch CUDA indexes (`--torch-backend cu126` for compute capability 6.1 to 9.0, i.e.
+# Pascal to Hopper; `--torch-backend cu130` for 10.0 / 12.0, Blackwell, which needs a CUDA 13
+# driver). The CUDA wheels are about 2.5 GB; the environment is a large download.
+#
+# The shared pins (ultralytics, torch, onnx, onnxruntime, transformers, ...) are the model export's
+# (requirements-model-export.txt), so a trained model is exported exactly like a downloaded one.
+ultralytics==8.4.163
+torch==2.14.0
+torchvision==0.29.0
+onnx==1.22.0
+onnxslim==0.1.96
+onnxruntime==1.29.0
+transformers==5.17.0
+safetensors==0.8.0
+huggingface-hub==1.33.0
+pyyaml==6.0.3
+# transformers.Trainer (RT-DETRv2, D-FINE).
+accelerate==1.15.0
+# RF-DETR (Apache-2.0; the Plus XL / 2XL models are not offered). Its `train` extra minus
+# `roboflow` (only used to upload to Roboflow, and it pins a second OpenCV build that would
+# overwrite Ultralytics' cv2).
+rfdetr==1.11.2
+peft==0.21.2
+pytorch-lightning==2.6.6
+torchmetrics[detection]==1.8.2
+hotcoco==1.0.1
+faster-coco-eval==1.8.0
+ultrafast-pycocotools==0.1.13
+vernier==0.5.4
+pycocotools==2.0.11
+scipy==1.17.1
+simplejpeg==1.9.0
+torch-hungarian==0.1.0rc0
+# Footage import and auto-labelling (blue-onyx-prism train import / train autolabel,
+# scripts/import_footage.py and scripts/autolabel.py). PyAV decodes video and runs FFmpeg's
+# `select` scene-change filter in-process: its wheels bundle an FFmpeg build that reports
+# LGPL-3.0-or-later (`av._core.library_meta`), so no separate ffmpeg binary is pinned. yt-dlp
+# (Unlicense) downloads a video URL the user confirmed the licence of; video-only formats, so it
+# never needs an ffmpeg binary to merge streams. The auto-labelers (MM-Grounding-DINO, Qwen3-VL,
+# SigLIP 2) run on transformers above; RF-DETR on rfdetr above.
+av==18.1.0
+yt-dlp==2026.8.19

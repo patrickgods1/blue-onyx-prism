@@ -8,6 +8,14 @@
 //!
 //! The store is shared by every registry generation of the process (restarts keep the revision
 //! and the log).
+//!
+//! Edits on disk: each generation runs a disk watch ([`spawn_disk_watch`], every
+//! [`DISK_POLL`]) that calls `server::sync_config`, which applies a changed file exactly like a
+//! Save (live settings swap, per-model reload, runtime-level fields pending until a restart).
+//! The pages and `GET /v1/config` sync as well. A file that does not parse or validate is not
+//! adopted: the running config stays, the reason is logged once per content and shown as
+//! `fileError` in `GET /v1/config`. A file caught mid-write (in-place rewrite) is retried for
+//! [`SETTLE`] before it counts as broken.
 
 use crate::config::Config;
 use crate::config_merge::{FieldChange, describe_changes};
@@ -25,6 +33,48 @@ pub const CHANGE_LOG_LEN: usize = 50;
 
 /// Source of changes found in the file.
 pub const SOURCE_DISK: &str = "file changed on disk";
+
+/// How often the disk watch looks at the config file (one `stat` when it did not change).
+pub const DISK_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A file modified this recently that ends before its JSON does may still be being written (an
+/// editor truncates and rewrites in place): it is read again on the next poll before being
+/// reported.
+pub const SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run `tick` every `interval` on a thread named `config-watch` until `cancel` is cancelled or
+/// `tick` returns false (its state is gone). The runner passes `server::sync_config` of the
+/// generation, so a file edited on disk applies without any page open.
+pub fn spawn_disk_watch(
+    interval: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+    mut tick: impl FnMut() -> bool + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    let step = interval.min(std::time::Duration::from_millis(250));
+    std::thread::Builder::new()
+        .name("config-watch".into())
+        .spawn(move || {
+            loop {
+                let next = std::time::Instant::now() + interval;
+                while std::time::Instant::now() < next {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    std::thread::sleep(step);
+                }
+                if cancel.is_cancelled() || !tick() {
+                    return;
+                }
+            }
+        })
+        .map_err(|e| {
+            tracing::warn!(
+                "could not start the config file watch ({e}); edits on disk apply when a page \
+                 is opened or the service restarts"
+            )
+        })
+        .ok()
+}
 
 /// One logged change.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -69,6 +119,27 @@ fn stamp_of(path: &Path, bytes: &[u8]) -> Option<DiskStamp> {
         len,
         hash: hash_bytes(bytes),
     })
+}
+
+/// `bytes` end before the JSON does (empty, or cut off): what a reader sees while an editor
+/// rewrites the file in place. Validation errors and other syntax errors are never this.
+fn looks_incomplete(bytes: &[u8]) -> bool {
+    bytes.iter().all(u8::is_ascii_whitespace)
+        || serde_json::from_slice::<serde::de::IgnoredAny>(bytes)
+            .err()
+            .is_some_and(|e| e.is_eof())
+}
+
+/// The warning (and `fileError`) for a config file edited on disk that cannot be adopted.
+fn rejected_message(path: &Path, e: &anyhow::Error) -> String {
+    format!(
+        "config file {} changed on disk but was not applied: {e:#}. The service keeps running \
+         with the previous config. Fix the file (valid JSON; values as the Config page \
+         accepts them) and save it again: it is re-read within {} s. A save from the web pages \
+         replaces the file with the running config.",
+        path.display(),
+        DISK_POLL.as_secs()
+    )
 }
 
 struct Inner {
@@ -247,7 +318,6 @@ impl ConfigStore {
             inner.disk = Some(stamp);
             return None;
         }
-        inner.disk = Some(stamp);
         let parsed = std::str::from_utf8(&bytes)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .and_then(|t| serde_json::from_str::<Config>(t).map_err(Into::into))
@@ -257,6 +327,21 @@ impl ConfigStore {
                 c.validate()?;
                 Ok(c)
             });
+        let settling = !verify
+            && parsed.is_err()
+            && looks_incomplete(&bytes)
+            && modified
+                .and_then(|m| SystemTime::now().duration_since(m).ok())
+                .is_some_and(|age| age < SETTLE);
+        if settling {
+            // Possibly half written: leave the stamp so the next poll reads it again.
+            tracing::debug!(
+                "config file {} changed but does not parse yet; reading it again shortly",
+                self.path.display()
+            );
+            return None;
+        }
+        inner.disk = Some(stamp);
         match parsed {
             Ok(c) => {
                 inner.disk_error = None;
@@ -277,8 +362,8 @@ impl ConfigStore {
                 rec
             }
             Err(e) => {
-                let msg = format!("{} is not a valid config: {e:#}", self.path.display());
-                tracing::warn!("{msg}; keeping the config in memory");
+                let msg = rejected_message(&self.path, &e);
+                tracing::warn!("{msg}");
                 inner.disk_error = Some(msg);
                 None
             }
@@ -605,5 +690,118 @@ mod tests {
         );
         assert_eq!(s.read().port, 6000);
         assert_eq!(s.generation(), 2);
+    }
+
+    /// An editor that truncates and rewrites in place: a poll between the two sees an empty or
+    /// cut-off file, which is read again instead of being reported; once written, it applies.
+    #[test]
+    fn half_written_file_is_read_again() {
+        let path = tmp();
+        let s = ConfigStore::new(cfg(), path.clone());
+        s.update("test", |_| Ok(())).unwrap();
+        let mut edited = s.read().clone();
+        edited.port = 4321;
+        let full = serde_json::to_string_pretty(&edited).unwrap();
+        for partial in ["", "  ", &full[..full.len() / 2]] {
+            std::fs::write(&path, partial).unwrap();
+            assert!(s.check_disk().is_none());
+            assert_eq!(s.disk_error(), None, "{partial:?} reported while settling");
+        }
+        std::fs::write(&path, &full).unwrap();
+        let rec = s.check_disk().expect("the finished write applies");
+        assert_eq!(rec.source, SOURCE_DISK);
+        assert_eq!(s.read().port, 4321);
+
+        // Still cut off after SETTLE: reported, with what failed and what to do.
+        std::fs::write(&path, &full[..full.len() / 2]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - SETTLE - std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(s.check_disk().is_none());
+        let err = s.disk_error().expect("reported after SETTLE");
+        assert!(err.contains("changed on disk but was not applied"), "{err}");
+        assert!(err.contains("EOF while parsing"), "{err}");
+        assert!(
+            err.contains("keeps running with the previous config"),
+            "{err}"
+        );
+        assert!(err.contains("re-read within 2 s"), "{err}");
+        assert_eq!(s.read().port, 4321);
+    }
+
+    #[test]
+    fn incomplete_json_is_told_apart_from_broken_json() {
+        assert!(looks_incomplete(b""));
+        assert!(looks_incomplete(b" \n"));
+        assert!(looks_incomplete(b"{\"port\": 32"));
+        assert!(looks_incomplete(b"{\"models\": ["));
+        assert!(!looks_incomplete(b"{ not json"));
+        assert!(!looks_incomplete(b"{\"port\": 1}"));
+        assert!(!looks_incomplete(b"{\"port\": 1}}"));
+    }
+
+    /// The per-model fields of the night / verifier work are part of the compared config: an
+    /// edit on disk to them alone is a change.
+    #[test]
+    fn edits_to_new_model_fields_on_disk_are_changes() {
+        let path = tmp();
+        let mut c = cfg();
+        c.models.push(ModelConfig {
+            name: Some("verifier".into()),
+            path: "models/verifier.onnx".into(),
+            ..Default::default()
+        });
+        let s = ConfigStore::new(c, path.clone());
+        s.update("test", |_| Ok(())).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["models"][1]["enabled"] = false.into();
+        v["models"][0]["night_confidence_threshold"] = 0.2.into();
+        v["models"][0]["verify"] = serde_json::json!({"model": "verifier"});
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        let rec = s.check_disk().expect("change detected");
+        assert_eq!(rec.source, SOURCE_DISK);
+        let keys: Vec<&str> = rec.fields.iter().map(|f| f.key.as_str()).collect();
+        for k in ["enabled", "night_confidence_threshold", "verify"] {
+            assert!(
+                keys.iter().any(|x| x.contains(k)),
+                "{k} missing from {keys:?}"
+            );
+        }
+        let now = s.read();
+        assert!(!now.models[1].enabled);
+        assert_eq!(now.models[0].verify.as_ref().unwrap().model, "verifier");
+    }
+
+    #[test]
+    fn disk_watch_ticks_until_cancelled_or_done() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let ms = std::time::Duration::from_millis;
+        let n = Arc::new(AtomicU32::new(0));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let counter = n.clone();
+        let h = spawn_disk_watch(ms(10), cancel.clone(), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while n.load(Ordering::SeqCst) < 3 {
+            assert!(std::time::Instant::now() < deadline, "watch did not tick");
+            std::thread::sleep(ms(5));
+        }
+        cancel.cancel();
+        h.join().unwrap();
+        let after = n.load(Ordering::SeqCst);
+        std::thread::sleep(ms(50));
+        assert_eq!(n.load(Ordering::SeqCst), after, "ticked after cancel");
+        // A tick returning false (its state is gone) ends the thread.
+        let h =
+            spawn_disk_watch(ms(1), tokio_util::sync::CancellationToken::new(), || false).unwrap();
+        h.join().unwrap();
     }
 }

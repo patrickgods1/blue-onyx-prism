@@ -112,8 +112,16 @@ fn hashes_urls_and_sizes_are_well_formed() {
             // Hugging Face `onnx-community` exports (D-FINE, RF-DETR) are all `onnx/model.onnx`
             // and get saved under the model's name.
             let hf_export = r.kind == ResourceKind::Model && p.url.ends_with("/onnx/model.onnx");
+            // Bench sets mixing several sources prefix the file name with the source
+            // (`cct-<id>.jpg`) so names from different datasets cannot collide; the extension
+            // may be lower-cased (`.JPG` -> `.jpg`).
+            let url_name = p.url.rsplit('/').next().unwrap_or_default();
+            let prefixed = r.kind == ResourceKind::BenchImages
+                && p.file_name
+                    .to_ascii_lowercase()
+                    .ends_with(&url_name.to_ascii_lowercase());
             assert!(
-                p.url.ends_with(p.file_name) || hf_export,
+                p.url.ends_with(p.file_name) || hf_export || prefixed,
                 "{} vs {}",
                 p.url,
                 p.file_name
@@ -128,6 +136,127 @@ fn hashes_urls_and_sizes_are_well_formed() {
             assert!(!p.url.contains("/resolve/main/"), "{}", p.url);
             assert!(p.url.contains(r.version), "{}", p.url);
         }
+    }
+}
+
+#[test]
+fn url_check_covers_the_training_pins() {
+    use blue_onyx_prism::resources::commands::url_check_resources;
+    let checked: Vec<_> = url_check_resources().collect();
+    let ids: BTreeSet<&str> = checked.iter().map(|r| r.id).collect();
+    for r in catalog::TRAIN_BASE_WEIGHTS {
+        assert!(ids.contains(r.id), "{} is not URL-checked", r.id);
+    }
+    let lila = catalog::lila_night().expect("the night training subset is pinned");
+    assert!(ids.contains(lila.id), "{} is not URL-checked", lila.id);
+    for r in catalog::AUTOLABEL_WEIGHTS
+        .iter()
+        .chain(catalog::IMPORT_DATASETS)
+    {
+        assert!(ids.contains(r.id), "{} is not URL-checked", r.id);
+    }
+    assert!(!catalog::AUTOLABEL_WEIGHTS.is_empty() && !catalog::IMPORT_DATASETS.is_empty());
+    assert!(catalog::all().all(|r| ids.contains(r.id)));
+    // The training, labeler and footage pins: well-formed like the rest of the catalog.
+    let mut files = BTreeSet::new();
+    for r in catalog::TRAIN_BASE_WEIGHTS
+        .iter()
+        .chain([lila])
+        .chain(catalog::AUTOLABEL_WEIGHTS)
+        .chain(catalog::IMPORT_DATASETS)
+    {
+        assert!(!r.parts.is_empty(), "{}", r.id);
+        assert!(!r.dest.is_empty() && !r.dest.starts_with('/') && !r.dest.contains(".."));
+        for p in r.parts {
+            assert_eq!(p.sha256.len(), 64, "{} {}", r.id, p.url);
+            assert!(
+                p.sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{} sha256 must be lowercase hex: {}",
+                r.id,
+                p.sha256
+            );
+            assert!(p.url.starts_with("https://"), "{}", p.url);
+            assert!(p.size > 0, "{}", p.url);
+            assert_eq!(p.layout, Layout::File, "{}", p.url);
+            assert!(p.archive.is_none(), "{}", p.url);
+            assert!(!p.file_name.contains('/') && !p.file_name.contains('\\'));
+            if r.id.starts_with(catalog::AUTOLABEL_PREFIX)
+                || r.id.starts_with(catalog::IMPORT_DATA_PREFIX)
+            {
+                assert!(p.url.ends_with(p.file_name), "{}", p.url);
+            }
+            assert!(
+                files.insert((r.id, p.file_name)),
+                "duplicate {}",
+                p.file_name
+            );
+            // Hugging Face downloads are pinned to a commit (`hf-<40 hex>` version).
+            if p.url.starts_with("https://huggingface.co/") {
+                let rev = r.version.strip_prefix("hf-").unwrap_or_default();
+                assert!(
+                    rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{} version {}",
+                    r.id,
+                    r.version
+                );
+                assert!(p.url.contains(&format!("/resolve/{rev}/")), "{}", p.url);
+            }
+        }
+    }
+    // Over the large threshold: a training run asks before it downloads it.
+    assert_eq!(lila.is_large(), lila.size() > catalog::LARGE_DOWNLOAD_BYTES);
+}
+
+#[test]
+fn night_training_subset_is_trainable_and_disjoint_from_nir_night() {
+    use blue_onyx_prism::benchmark::images::Manifest;
+    use blue_onyx_prism::collect::config::DEFAULT_CLASSES;
+    let m = catalog::lila_night_manifest().expect("assets/train/lila-night.json parses");
+    let r = catalog::lila_night().expect("pinned");
+    // Every image becomes a download part (the training reader skips missing ones).
+    assert_eq!(r.parts.len(), m.images.len());
+    assert_eq!(r.size(), m.size());
+    assert!(m.license.starts_with("CDLA-Permissive-1.0"));
+    assert!(m.attribution.contains("LILA BC"));
+    let mut empty = 0usize;
+    let mut cameras = BTreeSet::new();
+    for i in &m.images {
+        let objects = i
+            .objects
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} unannotated", i.file));
+        let (w, h) = (
+            i.width.expect("width") as f32,
+            i.height.expect("height") as f32,
+        );
+        // The reader drops images with ignore regions: there must be none.
+        for o in objects {
+            assert!(!o.ignore && !o.crowd, "{}", i.file);
+            assert!(DEFAULT_CLASSES.contains(&o.label.as_str()), "{}", o.label);
+            let [x0, y0, x1, y1] = o.bbox;
+            assert!(0.0 <= x0 && x0 < x1 && x1 <= w && 0.0 <= y0 && y0 < y1 && y1 <= h);
+        }
+        assert!(i.tags.iter().any(|t| t == "ir"), "{}", i.file);
+        let cam = i.tags.iter().find_map(|t| t.strip_prefix("camera:"));
+        cameras.insert(cam.unwrap_or_else(|| panic!("{} has no camera tag", i.file)));
+        if objects.is_empty() {
+            empty += 1;
+            assert!(i.tags.iter().any(|t| t == "empty"), "{}", i.file);
+        }
+    }
+    let share = empty as f64 / m.images.len() as f64;
+    assert!((0.10..=0.20).contains(&share), "empty share {share}");
+    assert!(cameras.len() >= 50, "{} cameras", cameras.len());
+    // No image of the nir-night benchmark set (camera locations are checked by the builder,
+    // which has the source metadata).
+    let nir = Manifest::parse(include_str!("../assets/bench/nir-night.json")).unwrap();
+    let nir_files: BTreeSet<&str> = nir.images.iter().map(|i| i.file.as_str()).collect();
+    let nir_urls: BTreeSet<&str> = nir.images.iter().filter_map(|i| i.url.as_deref()).collect();
+    for i in &m.images {
+        assert!(!nir_files.contains(i.file.as_str()), "{}", i.file);
+        assert!(!nir_urls.contains(i.url.as_deref().unwrap_or_default()));
     }
 }
 
@@ -1079,15 +1208,27 @@ fn yolo26_exports_and_uv_are_pinned() {
             continue;
         }
         assert_eq!(r.license, "AGPL-3.0");
-        assert_eq!(r.version, catalog::ULTRALYTICS_EXPORT_VERSION);
         assert!(r.platform.is_none());
         assert_eq!(r.parts.len(), 1);
         let p = &r.parts[0];
-        assert_eq!(
-            p.url,
-            format!("https://github.com/ultralytics/assets/releases/download/v8.4.0/{name}.pt")
-        );
-        assert_eq!(p.file_name, format!("{name}.pt"));
+        // MegaDetector v6 (Microsoft's Zenodo record, its own file names) or the Ultralytics
+        // release assets.
+        let mdv6 = name.starts_with("mdv6-");
+        if mdv6 {
+            assert_eq!(r.version, "ultralytics-8.4.163+zenodo-15398270");
+            assert!(p.file_name.starts_with("MDV6-") && p.file_name.ends_with(".pt"));
+            assert_eq!(
+                p.url,
+                format!("https://zenodo.org/records/15398270/files/{}", p.file_name)
+            );
+        } else {
+            assert_eq!(r.version, catalog::ULTRALYTICS_EXPORT_VERSION);
+            assert_eq!(
+                p.url,
+                format!("https://github.com/ultralytics/assets/releases/download/v8.4.0/{name}.pt")
+            );
+            assert_eq!(p.file_name, format!("{name}.pt"));
+        }
         assert_eq!(p.layout, Layout::File);
         assert!(
             p.size > 4_000_000 && p.size < 150_000_000,
@@ -1095,7 +1236,9 @@ fn yolo26_exports_and_uv_are_pinned() {
             p.size
         );
         assert!(!r.is_large(), "the weights alone are small");
-        let e2e = name.starts_with("yolov10") || name.starts_with("yolo26");
+        let e2e = ["yolov10", "yolo26", "mdv6-yolov10"]
+            .iter()
+            .any(|p| name.starts_with(p));
         assert!(
             matches!(
                 r.provides,

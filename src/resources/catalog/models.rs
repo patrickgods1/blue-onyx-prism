@@ -134,13 +134,23 @@ pub(crate) const MODEL_INPUT_SIZES: &[(&str, u32)] = &[
     ("rfdetr-large", 704),
     ("deimv2-atto", 320),
     ("deimv2-femto", 416),
+    ("exdark-rfdetr-nano", 384),
+    ("exdark-rfdetr-small", 512),
 ];
 
 /// Models whose activations overflow half precision: OpenVINO's f16 inference (the GPU default,
 /// and the CPU default on ARM) gives NaN (DEIMv2 L/X, DINOv3 ViT-S backbones) or garbage (RF-DETR
-/// L) where f32 matches PyTorch. The OpenVINO backend compiles them with
-/// `INFERENCE_PRECISION_HINT=f32` (a model's explicit `gpu_precision` still wins on GPU).
-pub(crate) const F32_MODELS: &[&str] = &["rfdetr-large", "deimv2-l", "deimv2-x"];
+/// L) where f32 matches PyTorch. The ExDark RF-DETR fine-tunes lose most of their confidence in
+/// f16 (OpenVINO CPU on an M1: best person score 0.50 vs 0.885 in f32 and PyTorch, AP50 13 vs
+/// the f32 run's). The OpenVINO backend compiles them with `INFERENCE_PRECISION_HINT=f32` (a
+/// model's explicit `gpu_precision` still wins on GPU).
+pub(crate) const F32_MODELS: &[&str] = &[
+    "rfdetr-large",
+    "deimv2-l",
+    "deimv2-x",
+    "exdark-rfdetr-small",
+    "exdark-rfdetr-nano",
+];
 
 /// The model at file name / name `name` (`deimv2-l.onnx`) needs f32 inference ([`F32_MODELS`]).
 pub(crate) fn needs_f32(name: &str) -> bool {
@@ -371,11 +381,17 @@ pub enum ExportRecipe {
     /// Ultralytics' exporter on an official `.pt` (YOLOv8/9/10/11/12/26). AGPL-3.0.
     Ultralytics,
     /// Hugging Face transformers `RfDetrForObjectDetection` + `torch.onnx` (static input,
-    /// `pixel_values` -> `logits`, `pred_boxes`). Apache-2.0.
+    /// `pixel_values` -> `logits`, `pred_boxes`). Apache-2.0. Also loads `rfdetr`-package
+    /// training checkpoints (`.pth` + `config.json`, the ExDark fine-tunes) into the same class.
     RfDetr,
     /// The official DEIMv2 code (`DEIMV2_SRC_ID`) + `torch.onnx`, deploy mode (`images`,
     /// `orig_target_sizes` -> `labels`, `boxes`, `scores`).
     DeimV2,
+    /// An RT-DETRv2 training checkpoint (`.pth`, lyuwenyu/RT-DETR layout: MegaDetector v6
+    /// `MDV6-apa-rtdetr-c`) built with the RT-DETRv2 modules of the same pinned DEIMv2 source
+    /// (`DEIMV2_SRC_ID`; copied from RT-DETR, Apache-2.0) + `torch.onnx`, deploy mode like
+    /// [`ExportRecipe::DeimV2`] (family `rtdetr`).
+    RtDetrV2,
 }
 
 impl ExportRecipe {
@@ -385,6 +401,7 @@ impl ExportRecipe {
             ExportRecipe::Ultralytics => "ultralytics",
             ExportRecipe::RfDetr => "rfdetr",
             ExportRecipe::DeimV2 => "deimv2",
+            ExportRecipe::RtDetrV2 => "rtdetrv2",
         }
     }
 
@@ -394,6 +411,9 @@ impl ExportRecipe {
             ExportRecipe::Ultralytics => "Ultralytics' exporter",
             ExportRecipe::RfDetr => "Hugging Face transformers and torch.onnx",
             ExportRecipe::DeimV2 => "the official DEIMv2 code (pinned commit) and torch.onnx",
+            ExportRecipe::RtDetrV2 => {
+                "the RT-DETRv2 modules of the DEIMv2 code (pinned commit) and torch.onnx"
+            }
         }
     }
 
@@ -403,7 +423,19 @@ impl ExportRecipe {
             ExportRecipe::Ultralytics => ULTRALYTICS_NOTICE,
             ExportRecipe::RfDetr => RFDETR_NOTICE,
             ExportRecipe::DeimV2 => DEIMV2_NOTICE,
+            ExportRecipe::RtDetrV2 => RTDETRV2_NOTICE,
         }
+    }
+
+    /// The recipe takes one weights file (`--weights <file>`), not a directory of
+    /// `model.safetensors` + `config.json`.
+    pub const fn takes_file(self) -> bool {
+        matches!(self, ExportRecipe::Ultralytics | ExportRecipe::RtDetrV2)
+    }
+
+    /// The recipe builds the model with the DEIMv2 source (`--source`, [`DEIMV2_SRC_ID`]).
+    pub const fn needs_deimv2_source(self) -> bool {
+        matches!(self, ExportRecipe::DeimV2 | ExportRecipe::RtDetrV2)
     }
 }
 
@@ -418,8 +450,8 @@ pub const ULTRALYTICS_EXPORT_VERSION: &str = "ultralytics-8.4.163+assets-v8.4.0"
 pub(crate) const ULTRALYTICS_LICENSE: &str = "AGPL-3.0";
 const ULTRALYTICS_NOTICE: &str = "Ultralytics YOLO weights and the Ultralytics exporter are \
     licensed AGPL-3.0. Blue Onyx Prism does not redistribute them: on your request it downloads the \
-    official weights from Ultralytics' GitHub release (SHA-256 pinned) and runs Ultralytics' \
-    exporter on this machine in its own Python environment.";
+    official weights (Ultralytics' GitHub release; MegaDetector from Microsoft's Zenodo record, \
+    SHA-256 pinned) and runs Ultralytics' exporter on this machine in its own Python environment.";
 /// transformers version of the export environment (RF-DETR).
 pub const TRANSFORMERS_VERSION: &str = "5.17.0";
 /// `Roboflow/rf-detr-large` commit of the RF-DETR L weights.
@@ -440,6 +472,55 @@ const DEIMV2_NOTICE: &str = "DEIMv2 is exported on this machine from Intellindus
     DEIMv2 code pinned to commit add5bcd, the last Apache-2.0 release; the repository has since \
     moved to a non-commercial license. The DINOv3 variants (S/M/L/X) also carry Meta's DINOv3 \
     License for the backbone.";
+
+/// Version recorded for a MegaDetector v6 Ultralytics export.
+pub(crate) const MDV6_ULTRALYTICS_VERSION: &str = "ultralytics-8.4.163+zenodo-15398270";
+/// Version recorded for the MegaDetector v6 RT-DETR export (DEIMv2 code + Zenodo weights).
+pub(crate) const MDV6_RTDETR_VERSION: &str = "deimv2-add5bcd+zenodo-15398270";
+const RTDETRV2_NOTICE: &str = "MegaDetector v6 RT-DETR (Microsoft AI for Good Lab, Apache-2.0) is \
+    published as a PyTorch training checkpoint: on your request Blue Onyx Prism downloads it from \
+    Microsoft's Zenodo record (SHA-256 pinned; the deposit asks for attribution, CC-BY-4.0) and \
+    builds it on this machine with the RT-DETRv2 modules of the pinned DEIMv2 source (Apache-2.0), \
+    reading only tensors from the checkpoint, then exports it with torch.onnx. Classes: animal, \
+    person, vehicle.";
+
+/// A file of Zenodo record 15398270, the PytorchWildlife model weights (MegaDetector v6,
+/// 2025-05-13; the deposit is CC-BY-4.0, the model zoo gives each model its code's license).
+macro_rules! zenodo_part {
+    ($file:literal, $sha:literal, $size:literal) => {
+        Part {
+            url: concat!("https://zenodo.org/records/15398270/files/", $file),
+            sha256: $sha,
+            size: $size,
+            file_name: $file,
+            archive: None,
+            layout: Layout::File,
+        }
+    };
+}
+
+/// A MegaDetector v6 model exported with Ultralytics' exporter (AGPL-3.0, like the code it was
+/// trained with). 3 classes: `animal`, `person`, `vehicle` (MegaDetector's own `vehicle`, not
+/// COCO's `car`).
+macro_rules! mdv6_ultralytics {
+    ($name:literal, $family:expr, $title:literal, $desc:literal, $file:literal, $sha:literal, $bytes:literal) => {
+        Resource {
+            id: concat!("model:", $name),
+            kind: ResourceKind::ExportModel,
+            version: MDV6_ULTRALYTICS_VERSION,
+            platform: None,
+            parts: &[zenodo_part!($file, $sha, $bytes)],
+            dest: "models",
+            provides: Provides::Model {
+                name: $name,
+                family: $family,
+            },
+            title: $title,
+            description: $desc,
+            license: ULTRALYTICS_LICENSE,
+        }
+    };
+}
 
 macro_rules! ultralytics {
     ($name:literal, $family:expr, $title:literal, $desc:literal, $sha:literal, $bytes:literal) => {
@@ -500,6 +581,60 @@ macro_rules! hf_part {
     };
 }
 
+/// DetectionBench's ExDark fine-tunes are marked non-commercial / personal use: the model cards
+/// say Apache-2.0, but they are trained on ExDark, whose authors ask that commercial use be
+/// cleared with them.
+const EXDARK_LICENSE: &str =
+    "Non-commercial / personal use only (trained on ExDark; weights published as Apache-2.0)";
+/// The 12 ExDark classes in head order, in COCO spelling (People -> person, Motorbike ->
+/// motorcycle, Table -> dining table). They cannot report truck or the other COCO classes.
+pub const EXDARK_CLASSES: [&str; 12] = [
+    "bicycle",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cup",
+    "dog",
+    "motorcycle",
+    "person",
+    "dining table",
+];
+
+/// A DetectionBench RF-DETR fine-tune on ExDark (`dronefreak/exdark-rfdetr-<size>`): the
+/// `rfdetr` training checkpoint + its `config.json`, family `rfdetr`.
+macro_rules! exdark_rfdetr {
+    ($name:literal, $repo:literal, $rev:literal, $title:literal, $desc:literal,
+     $pth_sha:literal, $pth_size:literal, $cfg_sha:literal, $cfg_size:literal) => {
+        Resource {
+            id: concat!("model:", $name),
+            kind: ResourceKind::ExportModel,
+            version: concat!("transformers-5.17.0+", $name, "-", $rev),
+            platform: None,
+            parts: &[
+                hf_part!(
+                    $repo,
+                    $rev,
+                    "checkpoint_best_total.pth",
+                    $pth_sha,
+                    $pth_size
+                ),
+                hf_part!($repo, $rev, "config.json", $cfg_sha, $cfg_size),
+            ],
+            dest: "models",
+            provides: Provides::Model {
+                name: $name,
+                family: ModelFamilyKind::RfDetr,
+            },
+            title: $title,
+            description: $desc,
+            license: EXDARK_LICENSE,
+        }
+    };
+}
+
 /// A DEIMv2 COCO model (`Intellindust/DEIMv2_<variant>_COCO`): `model.safetensors` +
 /// `config.json` (PyTorchModelHubMixin), family `rtdetr`.
 macro_rules! deimv2 {
@@ -545,10 +680,10 @@ const DEIMV2_DINOV3_LICENSE: &str =
     "Non-commercial / personal use only (DEIMv2 License) + DINOv3 License (backbone)";
 
 /// Models exported on this machine on request ([`crate::resources::export`]): the parts are the official
-/// weights (and configs); the export writes `models/<name>.onnx` + `models/<name>.yaml` (80 COCO
-/// names). All COCO 80 classes. YOLOv10 and YOLO26 are end-to-end (`[1,300,6]`, family
-/// `yolo26`); the other YOLOs are raw heads (family `yolo8`). Never downloaded or exported
-/// automatically.
+/// weights (and configs); the export writes `models/<name>.onnx` + `models/<name>.yaml` (the
+/// head's class names: 80 COCO names, or MegaDetector's `animal`, `person`, `vehicle`). YOLOv10
+/// and YOLO26 are end-to-end (`[1,300,6]`, family `yolo26`); the other YOLOs are raw heads
+/// (family `yolo8`). Never downloaded or exported automatically.
 pub static EXPORT_MODELS: &[Resource] = &[
     // YOLOv8
     yolo_raw!(
@@ -932,6 +1067,76 @@ pub static EXPORT_MODELS: &[Resource] = &[
         "456e2f740828eb52bc3dcc789de28af67f366cdf2b415f2338bc3b4e2f28fae4",
         1382
     ),
+    // RF-DETR fine-tuned on ExDark (DetectionBench, a random 80/10/10 split of all of ExDark:
+    // the exdark-night bench set may overlap its training images, so its scores there are
+    // optimistic). 12 classes. For benchmarking night models.
+    exdark_rfdetr!(
+        "exdark-rfdetr-small",
+        "dronefreak/exdark-rfdetr-small",
+        "985a4e1b8d1ee840be35f10153ff3ca932772cf6",
+        "RF-DETR small (ExDark low-light fine-tune)",
+        "RF-DETR small fine-tuned on ExDark low-light photos (DetectionBench), 12 classes \
+         (person, bicycle, car, motorcycle, bus, boat, dog, cat, ...), 512x512; no truck",
+        "84154da003aad8e970b232cf2d0a9de6a1f0c04dedd8218e7593834cc65d1502",
+        127524263,
+        "6decbab5d1116c5dd78f12ed48423edafdacfc3227fb4742bb05fc778861b265",
+        4118
+    ),
+    exdark_rfdetr!(
+        "exdark-rfdetr-nano",
+        "dronefreak/exdark-rfdetr-nano",
+        "24cd4533d99667285d879829fc0eb459e84c6932",
+        "RF-DETR nano (ExDark low-light fine-tune)",
+        "RF-DETR nano fine-tuned on ExDark low-light photos (DetectionBench), 12 classes \
+         (person, bicycle, car, motorcycle, bus, boat, dog, cat, ...), 384x384; no truck",
+        "d9a4a6dacd4da1c0f8fe2ba8ff03d4659f2a933840550c2a3a9a2b27d155a35a",
+        120939963,
+        "1a3d7fcc1fa5f7374efbb3cec1f4ae0174c5c72847b1e4d2edc2f1d23f3801a3",
+        4114
+    ),
+    // MegaDetector v6 (Microsoft, camera traps; animal / person / vehicle), 640x640, trained on
+    // camera-trap images incl. night IR. Model zoo: mAP50 (all classes) 91.0 / 87.9 / 87.2.
+    Resource {
+        id: "model:mdv6-rtdetr-c",
+        kind: ResourceKind::ExportModel,
+        version: MDV6_RTDETR_VERSION,
+        platform: None,
+        parts: &[zenodo_part!(
+            "MDV6-apa-rtdetr-c.pth",
+            "4814cdbc9a0dbf20e4b04495f060176d8340b00d182fc98ce808a4d14a2a6fce",
+            322443686
+        )],
+        dest: "models",
+        provides: Provides::Model {
+            name: "mdv6-rtdetr-c",
+            family: ModelFamilyKind::RtDetr,
+        },
+        title: "MegaDetector v6 RT-DETR compact",
+        description: "MegaDetector v6 Apache RT-DETR compact (Microsoft, RT-DETRv2 r18, 20M params): \
+                      animal, person, vehicle; camera traps incl. night IR, 640x640. The checkpoint \
+                      download is 322 MB (training state included); the model is 80 MB",
+        license: "Apache-2.0",
+    },
+    mdv6_ultralytics!(
+        "mdv6-yolov9-c",
+        ModelFamilyKind::Yolo8,
+        "MegaDetector v6 YOLOv9 compact",
+        "MegaDetector v6 Ultralytics YOLOv9 compact (Microsoft, 25.5M params): animal, person, \
+         vehicle; camera traps incl. night IR, 640x640",
+        "MDV6-yolov9-c.pt",
+        "daa6cd5d2e3fd52754889cd9c702f73c0349a8388318952e6eaf83e0667543e4",
+        51572347
+    ),
+    mdv6_ultralytics!(
+        "mdv6-yolov10-c",
+        ModelFamilyKind::Yolo26,
+        "MegaDetector v6 YOLOv10 compact",
+        "MegaDetector v6 Ultralytics YOLOv10 compact (Microsoft, 2.3M params, NMS-free): animal, \
+         person, vehicle; tiny and fast, 640x640",
+        "MDV6-yolov10-c.pt",
+        "21ee78a2d4887128e2a4920937d3295b493f44d788d13e1a635378c16dd74ef7",
+        5752051
+    ),
 ];
 
 /// The recipe of an exportable model (keyed on its name; every [`EXPORT_MODELS`] entry has one,
@@ -941,15 +1146,42 @@ pub fn export_recipe(res: &Resource) -> Option<ExportRecipe> {
         return None;
     }
     let name = res.model_name()?;
-    if name.starts_with("yolo") {
+    if name.starts_with("yolo") || name.starts_with("mdv6-yolo") {
         Some(ExportRecipe::Ultralytics)
-    } else if name.starts_with("rfdetr") {
+    } else if name.starts_with("mdv6-rtdetr") {
+        Some(ExportRecipe::RtDetrV2)
+    } else if name.starts_with("rfdetr") || name.starts_with("exdark-rfdetr") {
         Some(ExportRecipe::RfDetr)
     } else if name.starts_with("deimv2") {
         Some(ExportRecipe::DeimV2)
     } else {
         None
     }
+}
+
+/// MegaDetector v6's classes, in head order (PytorchWildlife `CLASS_NAMES`). `vehicle` is
+/// MegaDetector's own class (cars, trucks, ATVs, ...), not COCO's `car`; the benchmark scores it
+/// on car / truck / bus ground truth (`benchmark::metrics::CLASS_GROUPS`), like IPcam-general's.
+pub const MDV6_CLASSES: [&str; 3] = ["animal", "person", "vehicle"];
+
+/// Class names an export of `res` writes into its YAML, when they are not the 80 COCO names.
+pub fn export_class_names(res: &Resource) -> Option<&'static [&'static str]> {
+    let name = res.model_name()?;
+    if res.kind != ResourceKind::ExportModel {
+        None
+    } else if name.starts_with("mdv6-") {
+        Some(&MDV6_CLASSES[..])
+    } else if name.starts_with("exdark-") {
+        Some(&EXDARK_CLASSES[..])
+    } else {
+        None
+    }
+}
+
+/// Number of classes the YAML of an export of `res` must list (80 COCO names unless
+/// [`export_class_names`] says otherwise).
+pub fn export_class_count(res: &Resource) -> usize {
+    export_class_names(res).map_or(80, <[_]>::len)
 }
 
 /// Square input side an export of `res` uses (`--imgsz`): [`MODEL_INPUT_SIZES`], else 640.
@@ -962,7 +1194,7 @@ pub(crate) fn export_input_size(res: &Resource) -> u32 {
 /// Other resources an export of `res` needs besides its weights (the DEIMv2 source code).
 pub(crate) fn export_extras(res: &Resource) -> Vec<&'static Resource> {
     match export_recipe(res) {
-        Some(ExportRecipe::DeimV2) => deimv2_source().into_iter().collect(),
+        Some(r) if r.needs_deimv2_source() => deimv2_source().into_iter().collect(),
         _ => Vec::new(),
     }
 }

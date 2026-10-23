@@ -1,11 +1,11 @@
 {
  "id": "coco-cctv",
  "title": "COCO val2017 CCTV-relevant subset",
- "description": "180 COCO val2017 images with CCTV-relevant content (street scenes, people from single to crowds, vehicles, bicycles, motorbikes, animals, yards and parking), 31.5 MB (31492283 bytes) in total. All 80 COCO labels are scored (coco80 spellings); iscrowd regions are ignore. CCTV focus classes: person, bicycle, car, motorbike, bus, truck, bird, cat, dog, horse. COCO images are at most 640 px on the long side (res:sd). Day/night is estimated from mean luminance (< 50/255) or a night/dark caption. Empty images are val2017 images with no annotations.",
+ "description": "180 COCO val2017 images with CCTV-relevant content (street scenes, people from single to crowds, vehicles, bicycles, motorbikes, animals, yards and parking), 31.5 MB (31492283 bytes) in total. All 80 COCO labels are scored (coco80 spellings); iscrowd regions are ignore. CCTV focus classes: person, bicycle, car, motorbike, bus, truck, bird, cat, dog, horse. COCO images are at most 640 px on the long side (res:sd). Day/night is estimated from mean luminance (< 50/255) or a night/dark caption. Empty images are val2017 images with no annotations. Monochrome images (chroma spread below 3.0/255, the service's IR test) are tagged grayscale.",
  "license": "Annotations: CC BY 4.0 (COCO Consortium). Images: individual Flickr licences as listed in instances_val2017.json (CC BY / BY-SA / BY-NC / BY-NC-SA / BY-ND / BY-NC-ND 2.0 and others); images are fetched from the COCO host, not redistributed.",
  "attribution": "Microsoft COCO: Common Objects in Context (Lin et al., ECCV 2014), https://cocodataset.org; images by their Flickr authors. Subset selection and label mapping by Blue Onyx Prism.",
  "source": "https://cocodataset.org (val2017, annotations_trainval2017.zip)",
- "revision": "val2017; annotations_trainval2017.zip sha256 113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268",
+ "revision": "val2017; annotations_trainval2017.zip sha256 113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268; tags r2 (grayscale)",
  "images": [
   {
    "file": "000000007386.jpg",
@@ -359,6 +359,7 @@
    "height": 333,
    "tags": [
     "day",
+    "grayscale",
     "general",
     "complexity:hard",
     "res:sd",
@@ -1039,6 +1040,7 @@
    "height": 425,
    "tags": [
     "day",
+    "grayscale",
     "general",
     "complexity:hard",
     "res:sd",
@@ -2300,6 +2302,7 @@
    "height": 425,
    "tags": [
     "day",
+    "grayscale",
     "general",
     "complexity:hard",
     "res:sd",
@@ -2551,6 +2554,7 @@
    "height": 335,
    "tags": [
     "day",
+    "grayscale",
     "general",
     "complexity:hard",
     "res:sd",
@@ -4149,6 +4153,7 @@
    "height": 428,
    "tags": [
     "day",
+    "grayscale",
     "general",
     "complexity:hard",
     "res:sd",
@@ -4257,6 +4262,7 @@
    "height": 640,
    "tags": [
     "day",
+    "grayscale",
     "general",
     "complexity:hard",
     "res:sd",
@@ -4873,6 +4879,7 @@
    "height": 640,
    "tags": [
     "day",
+    "grayscale",
     "general",
     "complexity:medium",
     "res:sd"
@@ -7667,6 +7674,7 @@
    "height": 478,
    "tags": [
     "night",
+    "grayscale",
     "general",
     "complexity:easy",
     "res:sd"
@@ -9649,6 +9657,7 @@
    "height": 426,
    "tags": [
     "day",
+    "grayscale",
     "general",
     "complexity:easy",
     "res:sd"

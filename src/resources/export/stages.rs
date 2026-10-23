@@ -189,7 +189,6 @@ fn run_stages(
     let res = job.resource;
     let p = &job.paths;
     let (os, arch) = (job.platform.os, job.platform.arch);
-    let windows = os == "windows";
     if res.kind != ResourceKind::ExportModel {
         bail!("{} is not an exportable model", res.id);
     }
@@ -235,151 +234,8 @@ fn run_stages(
         );
     })?;
 
-    // 1. uv
-    let uv_res = catalog::uv_for(os, arch).ok_or_else(|| anyhow!("no uv for {os}/{arch}"))?;
-    let uv = p.uv_exe(windows);
-    if manager::is_installed(uv_res, &p.uv_dir) && uv.is_file() {
-        enter!(Stage::Uv, Some(100), "uv is installed");
-    } else {
-        enter!(Stage::Uv, Some(0), uv_res.title);
-        fetcher.fetch(
-            uv_res,
-            &p.uv_dir,
-            &mut |b, t| {
-                let pct = manager::percent(b, t);
-                let d = format!("{} of {} MB", mb(b), mb(t));
-                report(Progress::Stage {
-                    stage: Stage::Uv,
-                    percent: Some(pct),
-                    detail: &d,
-                });
-            },
-            cancel,
-        )?;
-        if !uv.is_file() {
-            bail!("{} is missing after installing uv", uv.display());
-        }
-    }
-    check(cancel)?;
-
-    // 2 + 3. Python and the packages
-    if env_ready(p, job.platform, &lock) {
-        enter!(Stage::Python, Some(100), "reusing the Python environment");
-        enter!(Stage::Packages, Some(100), "packages already installed");
-    } else {
-        let _ = std::fs::remove_file(p.env.join(ENV_MARKER));
-        // The YOLO26-only toolchain of earlier versions (same tools, older names) is replaced.
-        for d in p.legacy_dirs() {
-            if let Err(e) = manager::remove_any(&d) {
-                tracing::warn!("removing the old export toolchain: {e:#}");
-            }
-        }
-        enter!(Stage::Python, Some(0), "uv python install 3.11");
-        let mut py_args: Vec<&std::ffi::OsStr> = vec![
-            "python".as_ref(),
-            "install".as_ref(),
-            PYTHON_VERSION.as_ref(),
-            "--install-dir".as_ref(),
-            p.python_installs.as_os_str(),
-            "--no-bin".as_ref(),
-        ];
-        if windows {
-            py_args.push("--no-registry".as_ref());
-        }
-        let cmd = uv_cmd(job, Stage::Python, job.timeouts.python, &py_args);
-        runner
-            .run(&cmd, &mut |l| python_line(report, l), cancel)
-            .map_err(|e| explained(e, job, None, false))?;
-        check(cancel)?;
-        enter!(Stage::Python, Some(60), "uv venv");
-        let cmd = uv_cmd(
-            job,
-            Stage::Python,
-            job.timeouts.python,
-            &[
-                "venv".as_ref(),
-                "--python".as_ref(),
-                PYTHON_VERSION.as_ref(),
-                "--managed-python".as_ref(),
-                "--clear".as_ref(),
-                p.env.as_os_str(),
-            ],
-        );
-        runner
-            .run(&cmd, &mut |l| python_line(report, l), cancel)
-            .map_err(|e| explained(e, job, None, false))?;
-        check(cancel)?;
-
-        enter!(Stage::Packages, Some(0), lock.name);
-        let lockfile = p.tools.join(LOCKFILE_NAME);
-        std::fs::write(&lockfile, lock.text)
-            .with_context(|| format!("writing {}", lockfile.display()))?;
-        let python = p.env_python(windows);
-        let mut args: Vec<&std::ffi::OsStr> = vec![
-            "pip".as_ref(),
-            "install".as_ref(),
-            "--python".as_ref(),
-            python.as_os_str(),
-            "--require-hashes".as_ref(),
-            "--no-deps".as_ref(),
-            "--only-binary".as_ref(),
-            ":all:".as_ref(),
-            "-r".as_ref(),
-            lockfile.as_os_str(),
-        ];
-        if lock.torch_cpu_index {
-            args.push(std::ffi::OsStr::new("--torch-backend"));
-            args.push(std::ffi::OsStr::new("cpu"));
-        }
-        let cmd = uv_cmd(job, Stage::Packages, job.timeouts.packages, &args);
-        let mut pp = PackagesProgress::default();
-        runner
-            .run(
-                &cmd,
-                &mut |l| {
-                    report(Progress::Line {
-                        stage: Stage::Packages,
-                        line: l,
-                    });
-                    if let Some((pct, detail)) = pp.line(l) {
-                        report(Progress::Stage {
-                            stage: Stage::Packages,
-                            percent: Some(pct),
-                            detail: &detail,
-                        });
-                    }
-                },
-                cancel,
-            )
-            .map_err(|e| explained(e, job, None, false))?;
-        check(cancel)?;
-        if !python.is_file() {
-            bail!(
-                "{} is missing after creating the environment",
-                python.display()
-            );
-        }
-        // The wheels are installed (copied, hard-linked or cloned); the cache is not needed.
-        let _ = std::fs::remove_dir_all(&p.uv_cache);
-        let marker = serde_json::to_vec_pretty(&marker_for(&lock)).map_err(|e| anyhow!(e))?;
-        std::fs::write(p.env.join(ENV_MARKER), marker)
-            .with_context(|| format!("writing the marker in {}", p.env.display()))?;
-        enter!(Stage::Packages, Some(100), "packages installed");
-    }
-    check(cancel)?;
-
-    // 4. The Visual C++ runtime PyTorch needs (Windows; cheap, runs every export).
-    let mut msvcp140 = None;
-    if windows {
-        enter!(Stage::Runtime, Some(0), "probing the installed runtime");
-        let found = vc_runtime::ensure(job, fetcher, report, cancel)?;
-        msvcp140 = found
-            .iter()
-            .find(|f| f.name == "msvcp140.dll")
-            .and_then(|f| f.system);
-    } else {
-        enter!(Stage::Runtime, Some(100), &format!("not needed on {os}"));
-    }
+    // 1-4. uv, Python, the packages, the Visual C++ runtime
+    let msvcp140 = prepare_env(job, &lock, true, runner, fetcher, report, cancel, current)?;
     check(cancel)?;
 
     // 5. Self-check: import what the recipe needs (a broken library fails here in seconds).
@@ -493,16 +349,17 @@ fn run_stages(
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let work = p.work.join(name);
     manager::remove_any(&work)?;
-    // Ultralytics takes the `.pt` file; the Hugging Face recipes the directory with
-    // `model.safetensors` + `config.json`.
-    let weights_arg = match recipe {
-        catalog::ExportRecipe::Ultralytics => weights_dir.join(
+    // Ultralytics and RT-DETRv2 take the weights file (`.pt` / `.pth`); the Hugging Face recipes
+    // the directory with `model.safetensors` + `config.json`.
+    let weights_arg = if recipe.takes_file() {
+        weights_dir.join(
             res.parts
                 .first()
                 .ok_or_else(|| anyhow!("{} has no weights", res.id))?
                 .file_name,
-        ),
-        _ => weights_dir.clone(),
+        )
+    } else {
+        weights_dir.clone()
     };
     let mut args: Vec<OsString> = vec![
         script.clone().into_os_string(),
@@ -522,7 +379,7 @@ fn run_stages(
         "--work".into(),
         work.clone().into_os_string(),
     ];
-    if recipe == catalog::ExportRecipe::DeimV2 {
+    if recipe.needs_deimv2_source() {
         args.push("--source".into());
         args.push(p.deimv2_src.clone().into_os_string());
     }
@@ -563,6 +420,195 @@ fn run_stages(
     Ok(out)
 }
 
+/// Stages 1-4 shared by the model export and training ([`crate::resources::export::train`]): `tool:uv`
+/// (downloaded and verified when missing), Python 3.11 + the virtual environment `job.paths.env`
+/// and the packages of `lock` (skipped when the environment's marker matches `lock`), then on
+/// Windows the Visual C++ runtime PyTorch needs. `remove_legacy`: delete the YOLO26-only
+/// toolchain of earlier versions while building (the export environment only). Reports
+/// [`Stage::Uv`] .. [`Stage::Runtime`] and returns System32's `msvcp140.dll` version once probed.
+/// The caller holds the export lock.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_env(
+    job: &ExportJob,
+    lock: &PackageLock,
+    remove_legacy: bool,
+    runner: &dyn CommandRunner,
+    fetcher: &dyn Fetcher,
+    report: &mut dyn FnMut(Progress<'_>),
+    cancel: &AtomicBool,
+    current: &mut Option<Stage>,
+) -> Result<Option<vc_runtime::FileVersion>> {
+    let p = &job.paths;
+    let (os, arch) = (job.platform.os, job.platform.arch);
+    let windows = os == "windows";
+    let check = |cancel: &AtomicBool| -> Result<()> {
+        if cancel.load(Ordering::Relaxed) {
+            Err(anyhow!(Cancelled))
+        } else {
+            Ok(())
+        }
+    };
+    macro_rules! enter {
+        ($stage:expr, $pct:expr, $detail:expr) => {{
+            *current = Some($stage);
+            report(Progress::Stage {
+                stage: $stage,
+                percent: $pct,
+                detail: $detail,
+            });
+        }};
+    }
+    // 1. uv
+    let uv_res = catalog::uv_for(os, arch).ok_or_else(|| anyhow!("no uv for {os}/{arch}"))?;
+    let uv = p.uv_exe(windows);
+    if manager::is_installed(uv_res, &p.uv_dir) && uv.is_file() {
+        enter!(Stage::Uv, Some(100), "uv is installed");
+    } else {
+        enter!(Stage::Uv, Some(0), uv_res.title);
+        fetcher.fetch(
+            uv_res,
+            &p.uv_dir,
+            &mut |b, t| {
+                let pct = manager::percent(b, t);
+                let d = format!("{} of {} MB", mb(b), mb(t));
+                report(Progress::Stage {
+                    stage: Stage::Uv,
+                    percent: Some(pct),
+                    detail: &d,
+                });
+            },
+            cancel,
+        )?;
+        if !uv.is_file() {
+            bail!("{} is missing after installing uv", uv.display());
+        }
+    }
+    check(cancel)?;
+
+    // 2 + 3. Python and the packages
+    if env_ready(p, job.platform, lock) {
+        enter!(Stage::Python, Some(100), "reusing the Python environment");
+        enter!(Stage::Packages, Some(100), "packages already installed");
+    } else {
+        let _ = std::fs::remove_file(p.env.join(ENV_MARKER));
+        // The YOLO26-only toolchain of earlier versions (same tools, older names) is replaced.
+        if remove_legacy {
+            for d in p.legacy_dirs() {
+                if let Err(e) = manager::remove_any(&d) {
+                    tracing::warn!("removing the old export toolchain: {e:#}");
+                }
+            }
+        }
+        enter!(Stage::Python, Some(0), "uv python install 3.11");
+        let mut py_args: Vec<&std::ffi::OsStr> = vec![
+            "python".as_ref(),
+            "install".as_ref(),
+            PYTHON_VERSION.as_ref(),
+            "--install-dir".as_ref(),
+            p.python_installs.as_os_str(),
+            "--no-bin".as_ref(),
+        ];
+        if windows {
+            py_args.push("--no-registry".as_ref());
+        }
+        let cmd = uv_cmd(job, Stage::Python, job.timeouts.python, &py_args);
+        runner
+            .run(&cmd, &mut |l| python_line(report, l), cancel)
+            .map_err(|e| explained(e, job, None, false))?;
+        check(cancel)?;
+        enter!(Stage::Python, Some(60), "uv venv");
+        let cmd = uv_cmd(
+            job,
+            Stage::Python,
+            job.timeouts.python,
+            &[
+                "venv".as_ref(),
+                "--python".as_ref(),
+                PYTHON_VERSION.as_ref(),
+                "--managed-python".as_ref(),
+                "--clear".as_ref(),
+                p.env.as_os_str(),
+            ],
+        );
+        runner
+            .run(&cmd, &mut |l| python_line(report, l), cancel)
+            .map_err(|e| explained(e, job, None, false))?;
+        check(cancel)?;
+
+        enter!(Stage::Packages, Some(0), lock.name);
+        let lockfile = p.tools.join(LOCKFILE_NAME);
+        std::fs::write(&lockfile, lock.text)
+            .with_context(|| format!("writing {}", lockfile.display()))?;
+        let python = p.env_python(windows);
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "pip".as_ref(),
+            "install".as_ref(),
+            "--python".as_ref(),
+            python.as_os_str(),
+            "--require-hashes".as_ref(),
+            "--no-deps".as_ref(),
+            "--only-binary".as_ref(),
+            ":all:".as_ref(),
+            "-r".as_ref(),
+            lockfile.as_os_str(),
+        ];
+        if let Some(backend) = lock.torch_backend {
+            args.push(std::ffi::OsStr::new("--torch-backend"));
+            args.push(std::ffi::OsStr::new(backend));
+        }
+        let cmd = uv_cmd(job, Stage::Packages, job.timeouts.packages, &args);
+        let mut pp = PackagesProgress::default();
+        runner
+            .run(
+                &cmd,
+                &mut |l| {
+                    report(Progress::Line {
+                        stage: Stage::Packages,
+                        line: l,
+                    });
+                    if let Some((pct, detail)) = pp.line(l) {
+                        report(Progress::Stage {
+                            stage: Stage::Packages,
+                            percent: Some(pct),
+                            detail: &detail,
+                        });
+                    }
+                },
+                cancel,
+            )
+            .map_err(|e| explained(e, job, None, false))?;
+        check(cancel)?;
+        if !python.is_file() {
+            bail!(
+                "{} is missing after creating the environment",
+                python.display()
+            );
+        }
+        // The wheels are installed (copied, hard-linked or cloned); the cache is not needed.
+        let _ = std::fs::remove_dir_all(&p.uv_cache);
+        let marker = serde_json::to_vec_pretty(&marker_for(lock)).map_err(|e| anyhow!(e))?;
+        std::fs::write(p.env.join(ENV_MARKER), marker)
+            .with_context(|| format!("writing the marker in {}", p.env.display()))?;
+        enter!(Stage::Packages, Some(100), "packages installed");
+    }
+    check(cancel)?;
+
+    // 4. The Visual C++ runtime PyTorch needs (Windows; cheap, runs every export).
+    let mut msvcp140 = None;
+    if windows {
+        enter!(Stage::Runtime, Some(0), "probing the installed runtime");
+        let found = vc_runtime::ensure(job, fetcher, report, cancel)?;
+        msvcp140 = found
+            .iter()
+            .find(|f| f.name == "msvcp140.dll")
+            .and_then(|f| f.system);
+    } else {
+        enter!(Stage::Runtime, Some(100), &format!("not needed on {os}"));
+    }
+    check(cancel)?;
+    Ok(msvcp140)
+}
+
 /// Check the staged `.onnx` / `.yaml`, move them into `models` and write the manifest.
 pub(super) fn install_outputs(
     res: &Resource,
@@ -582,8 +628,12 @@ pub(super) fn install_outputs(
     let text = std::fs::read_to_string(&yaml)
         .with_context(|| format!("the exporter wrote no {yaml_name}"))?;
     let classes = class_count(&text)?;
-    if classes != 80 {
-        bail!("{yaml_name} lists {classes} classes; the exportable COCO models have 80");
+    let want = catalog::export_class_count(res);
+    if classes != want {
+        bail!(
+            "{yaml_name} lists {classes} classes; {} has {want}",
+            res.model_name().unwrap_or(res.id)
+        );
     }
     let shas = vec![manager::sha256_file(&onnx)?, manager::sha256_file(&yaml)?];
     let m = Manifest {

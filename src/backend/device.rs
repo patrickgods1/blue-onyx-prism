@@ -145,7 +145,12 @@ pub(crate) fn apply_core_properties(
     if has_device(available, "GPU") {
         devices.push(DeviceType::GPU);
     }
+    if let Some(dir) = &opts.cache_dir {
+        prune_legacy_blobs(dir);
+    }
     for dev in &devices {
+        // CACHE_DIR is set per compile to a per-precision folder (`compile_on`, `ov_cache_dir`);
+        // the root is only the startup default until the first compile replaces it.
         if let Some(c) = &cache {
             set_prop(core, dev, RwPropertyKey::CacheDir, c);
         }
@@ -441,8 +446,127 @@ fn set_cpu_precision(core: &mut openvino::Core, dt: &DeviceType, needs_f32: bool
     }
 }
 
+/// The OpenVINO device class a device name belongs to (`GPU.1` -> `GPU`): Core-level properties
+/// such as CACHE_DIR are kept per plugin.
+fn device_class(device: &str) -> String {
+    device
+        .split('.')
+        .next()
+        .unwrap_or(device)
+        .to_ascii_uppercase()
+}
+
+/// The OpenVINO model cache folder for compiles on `device` with inference precision
+/// `precision`: `<root>/openvino-<class>-<precision>` (`openvino-cpu-f32`, `openvino-gpu-f16`).
+///
+/// OpenVINO's blob hash covers only the plugin's `CACHING_PROPERTIES`; for CPU that is just
+/// FULL_DEVICE_NAME, so a blob compiled with INFERENCE_PRECISION_HINT=f16 (the transformed,
+/// f16-converted graph) was served again after the model moved to f32. One folder per precision
+/// means a precision change can never reuse a blob compiled for another one.
+pub(crate) fn ov_cache_dir(
+    root: &std::path::Path,
+    device: &str,
+    precision: &str,
+) -> std::path::PathBuf {
+    let clean = |s: &str| {
+        let t: String = s
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        if t.is_empty() {
+            "default".to_string()
+        } else {
+            t
+        }
+    };
+    root.join(format!(
+        "openvino-{}-{}",
+        clean(&device_class(device)),
+        clean(precision)
+    ))
+}
+
+/// `true` for a blob OpenVINO wrote directly into the cache root before the per-precision
+/// folders (`<decimal hash>.blob`).
+fn is_legacy_blob(name: &str) -> bool {
+    name.strip_suffix(".blob")
+        .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Removes the OpenVINO blobs of older versions from the cache root: they were keyed without
+/// the precision (see [`ov_cache_dir`]) and are never read again.
+fn prune_legacy_blobs(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut removed = 0u32;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if is_legacy_blob(name) && e.path().is_file() && std::fs::remove_file(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            "OpenVINO cache {}: removed {removed} compiled blob(s) of an older version (cached \
+             without their inference precision); models compile once more into openvino-<device>-<precision>/",
+            root.display()
+        );
+    }
+}
+
+/// Points CACHE_DIR of `device`'s plugin at the folder for the precision it compiles with now
+/// (read back from the Core). Caching is switched off when that fails, so a blob of another
+/// precision is never imported.
+fn select_cache_dir(
+    core: &mut openvino::Core,
+    cache_root: Option<&std::path::Path>,
+    device: &str,
+    wanted: &str,
+) {
+    let Some(root) = cache_root else { return };
+    let class_name = device_class(device);
+    let class = DeviceType::from(class_name.as_str());
+    let precision = core
+        .get_property(
+            &class,
+            &PropertyKey::Rw(RwPropertyKey::HintInferencePrecision),
+        )
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| wanted.to_string());
+    let dir = ov_cache_dir(root, device, &precision);
+    let set = std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating OpenVINO cache dir {}", dir.display()))
+        .and_then(|()| {
+            let s = dir
+                .to_str()
+                .with_context(|| format!("cache dir {} is not valid UTF-8", dir.display()))?;
+            core_set_property(core, &class, &RwPropertyKey::CacheDir, s)
+        });
+    match set {
+        Ok(()) => tracing::debug!("OpenVINO {class}: CACHE_DIR={}", dir.display()),
+        Err(e) => {
+            tracing::warn!(
+                "OpenVINO {class}: could not use the model cache {} ({e:#}); compiling without \
+                 a cache (check that the cache dir is writable)",
+                dir.display()
+            );
+            if let Err(e) = core_set_property(core, &class, &RwPropertyKey::CacheDir, "") {
+                tracing::warn!("OpenVINO {class}: failed to switch the model cache off: {e:#}");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compile_on(
     core: &mut openvino::Core,
+    cache_root: Option<&std::path::Path>,
     model: &Model,
     device: &str,
     gpu_precision: &str,
@@ -478,6 +602,17 @@ fn compile_on(
         .with_context(|| format!("setting INFERENCE_PRECISION_HINT={gpu_precision} on {device}"))?;
         tracing::info!("OpenVINO {device}: INFERENCE_PRECISION_HINT={gpu_precision}");
     }
+    // Fallback key when the Core cannot report the hint it compiles with.
+    let wanted = if device.to_ascii_uppercase().starts_with("GPU") {
+        gpu_precision
+    } else if needs_f32 {
+        "f32"
+    } else {
+        CPU_DEFAULT_PRECISION
+            .get()
+            .map_or("default", String::as_str)
+    };
+    select_cache_dir(core, cache_root, device, wanted);
     core.compile_model(model, dt)
         .with_context(|| format!("compiling model {} on {device}", path.display()))
 }
@@ -509,6 +644,7 @@ fn prefer_intel_gpu(core: &openvino::Core, primary: &str, available: &[String]) 
 /// may resolve to the first Intel `GPU.N`) and introspect ports. No fallback here.
 pub(crate) fn load_model(
     core: &mut openvino::Core,
+    cache_root: Option<&std::path::Path>,
     available: &[String],
     cand: &Candidate,
     req: &LoadRequest,
@@ -586,6 +722,7 @@ pub(crate) fn load_model(
         .to_ascii_lowercase();
     let compiled = compile_on(
         core,
+        cache_root,
         &model,
         &primary,
         &precision,
@@ -1305,5 +1442,66 @@ mod tests {
             Some(1)
         );
         assert_eq!(find_image_input(&[p("a", &[1, 2])]), None);
+    }
+
+    #[test]
+    fn cache_dir_is_partitioned_by_device_class_and_precision() {
+        let root = std::path::Path::new("cache");
+        let cpu32 = ov_cache_dir(root, "CPU", "f32");
+        let cpu16 = ov_cache_dir(root, "CPU", "f16");
+        assert_eq!(cpu32, root.join("openvino-cpu-f32"));
+        assert_eq!(cpu16, root.join("openvino-cpu-f16"));
+        assert_ne!(cpu32, cpu16);
+        // GPU.N share their plugin's CACHE_DIR; OpenVINO's GPU hash keys the card itself.
+        assert_eq!(
+            ov_cache_dir(root, "GPU.1", "f16"),
+            root.join("openvino-gpu-f16")
+        );
+        assert_eq!(
+            ov_cache_dir(root, "gpu", " F32 "),
+            root.join("openvino-gpu-f32")
+        );
+        assert_ne!(
+            ov_cache_dir(root, "GPU", "f16"),
+            ov_cache_dir(root, "GPU", "f32")
+        );
+        assert_ne!(
+            ov_cache_dir(root, "CPU", "f32"),
+            ov_cache_dir(root, "GPU", "f32")
+        );
+        // Nothing in a precision string can leave the cache root.
+        assert_eq!(
+            ov_cache_dir(root, "CPU", "../x"),
+            root.join("openvino-cpu-___x")
+        );
+        assert_eq!(
+            ov_cache_dir(root, "CPU", ""),
+            root.join("openvino-cpu-default")
+        );
+    }
+
+    #[test]
+    fn legacy_blobs_are_pruned_and_nothing_else() {
+        assert!(is_legacy_blob("4574847747418676496.blob"));
+        assert!(!is_legacy_blob(".blob") && !is_legacy_blob("model.blob"));
+        assert!(!is_legacy_blob("123.onnx") && !is_legacy_blob("123.blob.tmp"));
+        let root = std::env::temp_dir().join(format!("bop-ovcache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("openvino-cpu-f32")).unwrap();
+        std::fs::create_dir_all(root.join("coreml")).unwrap();
+        for f in [
+            "123.blob",
+            "openvino-cpu-f32/456.blob",
+            "coreml/m.onnx",
+            "notes.blob",
+        ] {
+            std::fs::write(root.join(f), b"x").unwrap();
+        }
+        prune_legacy_blobs(&root);
+        assert!(!root.join("123.blob").exists());
+        for f in ["openvino-cpu-f32/456.blob", "coreml/m.onnx", "notes.blob"] {
+            assert!(root.join(f).exists(), "{f} removed");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

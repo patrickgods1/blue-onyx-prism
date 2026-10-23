@@ -392,6 +392,13 @@ fn run(cli: Cli) -> Result<()> {
             }
             return Ok(());
         }
+        Some(Command::Train(args)) => {
+            let code = blue_onyx_prism::training::cli::main(*args, cli.config.clone());
+            if code != ExitCode::SUCCESS {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Command::ListDevices { model }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
             list_devices(&cli, &model)?;

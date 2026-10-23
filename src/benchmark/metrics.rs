@@ -5,8 +5,11 @@
 //! Class mapping. Every label goes through [`canonical_label`] (lowercase; VOC/YOLO aliases such
 //! as `motorbike`, `aeroplane`, `tvmonitor` become the COCO spelling). Accuracy is scored on the
 //! CCTV classes ([`CCTV_CLASSES`]) the model can output, plus the class groups of
-//! [`CLASS_GROUPS`]: a model with a `vehicle` class (IPcam-general) is scored on ground-truth
-//! car/truck/bus boxes relabelled `vehicle`. Ground truth of classes the model cannot output is
+//! [`CLASS_GROUPS`]: a model with a `vehicle` class (IPcam-general, MegaDetector) is scored on
+//! ground-truth car/truck/bus boxes relabelled `vehicle`, and one with an `animal` class
+//! (MegaDetector) on every animal box: the COCO animals of [`ANIMAL_GROUP`] and any
+//! [`WILDLIFE`] label (raccoon, fox, deer, ...; a wildlife box marked `ignore` stays an ignore
+//! region, now for `animal`). Ground truth of classes the model cannot output is
 //! dropped (not a miss), and so are predictions of classes outside the scored set.
 //!
 //! Matching follows pycocotools: detections in descending confidence order take the unmatched
@@ -46,8 +49,18 @@ pub const CCTV_CLASSES: [&str; 10] = [
     "horse",
 ];
 
-/// Model labels that stand for several ground-truth classes.
-pub const CLASS_GROUPS: [(&str, &[&str]); 1] = [("vehicle", &["car", "truck", "bus"])];
+/// Model labels that stand for several ground-truth classes. `animal` also takes every
+/// [`WILDLIFE`] label (see [`ClassMap::gt_class`]).
+pub const CLASS_GROUPS: [(&str, &[&str]); 2] = [
+    ("vehicle", &["car", "truck", "bus"]),
+    ("animal", &ANIMAL_GROUP),
+];
+
+/// The COCO animal classes a model's `animal` label stands for (MegaDetector's animal class
+/// covers every animal, birds included).
+pub const ANIMAL_GROUP: [&str; 10] = [
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+];
 
 /// Fine-grained model labels that stand for one scored class: a label any of whose words
 /// (split on spaces and hyphens) is listed counts as that class. ipcam-bird labels bird
@@ -106,6 +119,68 @@ pub fn species_class(label: &str) -> Option<&'static str> {
         .iter()
         .find(|(_, names)| words.iter().any(|w| names.contains(w)))
         .map(|(class, _)| *class)
+}
+
+/// Words of animal labels that are not COCO classes (camera-trap wildlife: CCT, ENA24, NACTI),
+/// matched like [`SPECIES`]. A ground-truth box of one that the model cannot score is an
+/// ignore region for the model's [`ANIMAL_CLASSES`] (see [`ClassMap::wildlife_ignore`]): a COCO
+/// model that calls a raccoon a cat is neither right nor wrong, while a `person` box on it is
+/// still a false positive.
+pub const WILDLIFE: [&str; 40] = [
+    "animal",
+    "armadillo",
+    "badger",
+    "bear",
+    "beaver",
+    "boar",
+    "bobcat",
+    "chipmunk",
+    "cottontail",
+    "cougar",
+    "coyote",
+    "deer",
+    "elk",
+    "ermine",
+    "fox",
+    "groundhog",
+    "hare",
+    "jackrabbit",
+    "javelina",
+    "lion",
+    "lynx",
+    "marmot",
+    "marten",
+    "mink",
+    "moose",
+    "opossum",
+    "otter",
+    "peccary",
+    "porcupine",
+    "possum",
+    "puma",
+    "rabbit",
+    "raccoon",
+    "rodent",
+    "skunk",
+    "squirrel",
+    "weasel",
+    "wolf",
+    "wolverine",
+    "woodchuck",
+];
+
+/// COCO animal classes a detector may report for a [`WILDLIFE`] animal (`bear` too: a model
+/// scored on bears is scored on bear ground truth and gets no regions for it).
+pub const ANIMAL_CLASSES: [&str; 7] = ["dog", "cat", "bird", "horse", "sheep", "cow", "bear"];
+
+/// `label` names a [`WILDLIFE`] animal (any of its words, split on spaces and hyphens; COCO's
+/// `teddy bear` is not one). `bear` is listed so a COCO model without the `bear` class in its
+/// scored set treats a black bear like other wildlife.
+pub fn is_wildlife(label: &str) -> bool {
+    let l = canonical_label(label);
+    l != "teddy bear"
+        && l.split([' ', '-'])
+            .any(|w| !w.is_empty() && WILDLIFE.contains(&w))
 }
 
 /// IoU thresholds of AP@[0.5:0.95].
@@ -201,6 +276,8 @@ pub struct ClassMap {
     gt: HashMap<String, String>,
     /// Canonical model label -> scored class.
     pred: HashMap<String, String>,
+    /// The model has an `animal` group class: [`WILDLIFE`] ground truth is scored as `animal`.
+    animal_group: bool,
 }
 
 impl ClassMap {
@@ -236,6 +313,7 @@ impl ClassMap {
                     m.gt.entry(member.to_string())
                         .or_insert_with(|| group.to_string());
                 }
+                m.animal_group |= group == "animal";
             }
         }
         m
@@ -272,14 +350,39 @@ impl ClassMap {
         v
     }
 
-    /// Scored class of a ground-truth label (None = not scored).
+    /// Scored class of a ground-truth label (None = not scored). With an `animal` group class,
+    /// a [`WILDLIFE`] label the model has no exact class for is `animal`.
     pub fn gt_class(&self, label: &str) -> Option<&str> {
-        self.gt.get(&canonical_label(label)).map(String::as_str)
+        let l = canonical_label(label);
+        match self.gt.get(&l) {
+            Some(c) => Some(c.as_str()),
+            None if self.animal_group && is_wildlife(&l) => Some("animal"),
+            None => None,
+        }
     }
 
     /// Scored class of a model label (None = not scored).
     pub fn pred_class(&self, label: &str) -> Option<&str> {
         self.pred.get(&canonical_label(label)).map(String::as_str)
+    }
+
+    /// The scored classes an unscored wildlife ground-truth box (`label`, see [`WILDLIFE`])
+    /// is an ignore region for: the model's [`ANIMAL_CLASSES`]. Empty when the model scores
+    /// `label` itself (a model with a `raccoon` class is scored on raccoons) or it is not a
+    /// wildlife label.
+    pub fn wildlife_ignore(&self, label: &str) -> Vec<&str> {
+        if self.gt_class(label).is_some() || !is_wildlife(label) {
+            return Vec::new();
+        }
+        ANIMAL_CLASSES
+            .iter()
+            .filter_map(|a| {
+                self.classes
+                    .iter()
+                    .find(|c| c.as_str() == *a)
+                    .map(String::as_str)
+            })
+            .collect()
     }
 
     /// Ground truth in the scored label space (unscored boxes dropped).
@@ -1063,6 +1166,64 @@ mod tests {
         assert_eq!(both.gt_class("bus"), Some("vehicle"));
         // No scored classes (package model).
         assert!(ClassMap::for_model(&["package".into()]).is_empty());
+        // MegaDetector: animal / person / vehicle. Every animal ground-truth box is `animal`
+        // (COCO animals and camera-trap wildlife), car/truck/bus are `vehicle`; nothing is a
+        // wildlife ignore region any more (the model is scored on those animals).
+        let md = ClassMap::for_model(&["animal".into(), "person".into(), "vehicle".into()]);
+        assert_eq!(md.classes, ["person", "vehicle", "animal"]);
+        for l in [
+            "dog",
+            "cat",
+            "bird",
+            "horse",
+            "Raccoon",
+            "black bear",
+            "red fox",
+            "deer",
+        ] {
+            assert_eq!(md.gt_class(l), Some("animal"), "{l}");
+            assert!(md.wildlife_ignore(l).is_empty(), "{l}");
+        }
+        assert_eq!(md.gt_class("car"), Some("vehicle"));
+        assert_eq!(md.gt_class("bus"), Some("vehicle"));
+        assert_eq!(md.gt_class("motorbike"), None);
+        assert_eq!(md.gt_class("teddy bear"), None);
+        assert_eq!(md.pred_class("animal"), Some("animal"));
+        assert_eq!(
+            md.restrict(&[
+                "person".into(),
+                "dog".into(),
+                "cat".into(),
+                "car".into(),
+                "bicycle".into()
+            ]),
+            ["animal", "person", "vehicle"]
+        );
+        let mapped = md.map_gt(&[
+            gt("raccoon", [0.0; 4]),
+            GtBox {
+                ignore: true,
+                ..gt("opossum", [0.0; 4])
+            },
+            gt("umbrella", [0.0; 4]),
+        ]);
+        assert_eq!(mapped.len(), 2);
+        assert!(mapped.iter().all(|g| g.label == "animal"));
+        assert!(
+            !mapped[0].ignore && mapped[1].ignore,
+            "ignore regions stay ignore regions"
+        );
+        // A COCO model keeps its exact animal classes and the wildlife ignore regions.
+        let coco = ClassMap::for_model(&crate::model::classes::coco80());
+        assert_eq!(coco.gt_class("raccoon"), None);
+        assert_eq!(
+            coco.wildlife_ignore("raccoon"),
+            ["dog", "cat", "bird", "horse"]
+        );
+        // A model with both `dog` and `animal` scores dogs as dogs.
+        let both = ClassMap::for_model(&["dog".into(), "animal".into()]);
+        assert_eq!(both.gt_class("dog"), Some("dog"));
+        assert_eq!(both.gt_class("cat"), Some("animal"));
         // ipcam-bird: species labels count as bird; a squirrel does not.
         let birds = ClassMap::for_model(&[
             "Blue Jay".into(),

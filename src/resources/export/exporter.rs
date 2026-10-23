@@ -448,13 +448,18 @@ pub fn export_now(
 /// stage stops and its process tree is killed; a second one exits at once (status 130). Stops
 /// listening when dropped. Without it, Ctrl-C would end the CLI but leave `uv` / `python` (in
 /// their own process group) running.
-struct CtrlC {
+pub(crate) struct CtrlC {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CtrlC {
     fn cancels(cancel: Arc<AtomicBool>) -> Self {
+        Self::cancels_named(cancel, "the export")
+    }
+
+    /// [`Self::cancels`] for another long CLI job (`what`: "the training").
+    pub(crate) fn cancels_named(cancel: Arc<AtomicBool>, what: &'static str) -> Self {
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("ctrl-c".into())
@@ -475,7 +480,7 @@ impl CtrlC {
                         r = tokio::signal::ctrl_c() => if r.is_err() { return },
                     }
                     eprintln!(
-                        "Ctrl-C: cancelling the export and stopping its processes (press Ctrl-C \
+                        "Ctrl-C: cancelling {what} and stopping its processes (press Ctrl-C \
                          again to quit at once)"
                     );
                     cancel.store(true, Ordering::SeqCst);

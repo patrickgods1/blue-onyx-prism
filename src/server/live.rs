@@ -461,7 +461,7 @@ fn field<'a>(form: &'a [(String, String)], k: &'a str) -> impl Iterator<Item = &
 
 /// The Models card over the current config `c`, applied as submitted: `enabled` (repeated; the
 /// listed models are enabled, the others disabled), `default_model`, `device.<name>` ("" =
-/// global) and `threshold.<name>` ("" = global).
+/// global), `threshold.<name>` ("" = global) and `night.<name>` (the night model, "" = none).
 pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> anyhow::Result<()> {
     let enabled: Vec<String> = field(form, "enabled").map(str::to_string).collect();
     let default = field(form, "default_model").next();
@@ -513,6 +513,24 @@ pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> any
             );
         };
         m.confidence_threshold = t;
+    }
+    for (k, v) in form {
+        let Some(name) = k.strip_prefix("night.") else {
+            continue;
+        };
+        let key = normalize_name(name);
+        let Some(m) = c
+            .models
+            .iter_mut()
+            .find(|m| normalize_name(&m.effective_name()) == key)
+        else {
+            anyhow::bail!(
+                "'{name}' is not one of the configured models (it was removed or renamed \
+                 meanwhile); reload the Config page"
+            );
+        };
+        let v = v.trim();
+        m.night_model = (!v.is_empty()).then(|| v.to_string());
     }
     validate_config(c)
 }
