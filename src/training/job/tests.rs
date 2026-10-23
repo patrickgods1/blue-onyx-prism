@@ -460,13 +460,22 @@ fn cancel_kills_the_training_and_installs_nothing() {
         ..TrainFake::new()
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let c2 = cancel.clone();
-    let stopper = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
-        c2.store(true, Ordering::Relaxed);
+    let (r, _) = std::thread::scope(|s| {
+        // Cancel once the training command is running, however slow the earlier stages are.
+        s.spawn(|| {
+            while !fake
+                .train_cmds
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| !c.display().contains("--self-check"))
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            cancel.store(true, Ordering::Relaxed);
+        });
+        run(&j, &fake, &NoHooks, &cancel)
     });
-    let (r, _) = run(&j, &fake, &NoHooks, &cancel);
-    stopper.join().unwrap();
     let e = r.unwrap_err();
     assert!(e.cancelled, "{e:?}");
     assert_eq!(e.stage, Some(TrainStage::Train));
