@@ -3,7 +3,7 @@
 //! the self-training loop.
 
 use super::*;
-use crate::backend::detect::{HardwareInfo, apple_gpu};
+use crate::backend::detect::HardwareInfo;
 use crate::collect::labels::{BoxState, Source, Status};
 use crate::resources::export::fake::{Fake, arg_after};
 use crate::resources::export::{Cmd, CommandRunner, Fetcher};
@@ -27,11 +27,9 @@ fn tmp(tag: &str) -> Tmp {
     Tmp(d)
 }
 
-fn mac() -> Capability {
-    capability::capability(
-        &HardwareInfo::new("macos", "aarch64", vec![apple_gpu("Apple M1")]),
-        Some(16.0),
-    )
+fn host() -> Capability {
+    // The host's platform: a job finds the training environment of the OS it runs on.
+    capability::host_for_tests()
 }
 
 /// `n` imported 64x48 frames (gray = IR, else colour) in `<root>/dataset`; returns their paths.
@@ -160,7 +158,7 @@ fn labelers_propose_triaged_pending_boxes_and_queue_the_frames() {
     let t = tmp("label");
     let rels = frames(&t.0, 2, true);
     let cfg = config(&t.0);
-    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &mac()).unwrap();
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
     let fake = LabelFake::default();
     let out = run_job(&job, &fake).unwrap();
     let rep = &out.result;
@@ -231,7 +229,8 @@ fn labelers_propose_triaged_pending_boxes_and_queue_the_frames() {
         crate::collect::layout::read_review(&dir.join(crate::collect::layout::REVIEW_QUEUE_FILE));
     assert_eq!(q.len(), 2);
     // A second run proposes the same boxes: all covered, nothing added.
-    let job2 = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &mac()).unwrap();
+    let job2 =
+        plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
     let out2 = run_job(&job2, &fake).unwrap();
     assert_eq!(out2.result["added"], 0);
     assert_eq!(out2.result["dropped"], 4);
@@ -355,7 +354,7 @@ fn planning_refuses_unknown_models_missing_gpus_and_empty_selections() {
     let mut req = AutolabelRequest::new(FrameFilter::default());
     req.with_model = Some("nope".into());
     assert!(
-        plan_autolabel(&cfg, req, &mac())
+        plan_autolabel(&cfg, req, &host())
             .unwrap_err()
             .to_string()
             .contains("no configured model")
@@ -370,13 +369,13 @@ fn planning_refuses_unknown_models_missing_gpus_and_empty_selections() {
     let e = plan_autolabel(
         &small,
         AutolabelRequest::new(FrameFilter::default()),
-        &mac(),
+        &host(),
     )
     .unwrap_err()
     .to_string();
     assert!(e.contains("--allow-large"), "{e}");
     // No frames: the run fails with a hint.
-    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &mac()).unwrap();
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
     let e = run_job(&job, &LabelFake::default())
         .unwrap_err()
         .to_string();

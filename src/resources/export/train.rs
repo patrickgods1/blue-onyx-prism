@@ -483,7 +483,7 @@ mod train_env_tests {
         assert!(pip.contains("--torch-backend cu126"), "{pip}");
         assert!(pip.contains("--require-hashes"), "{pip}");
         assert!(
-            pip.contains(&root.join("tools/train-env").display().to_string()),
+            pip.contains(&root.join("tools").join("train-env").display().to_string()),
             "{pip}"
         );
         assert!(train_env_ready(&p, Platform::LINUX_X64, TrainLane::Cu126));
@@ -521,7 +521,14 @@ mod train_env_tests {
             Duration::from_secs(5),
             vec!["x.py".into()],
         );
-        assert_eq!(c.program, PathBuf::from("/d/tools/train-env/bin/python"));
+        assert_eq!(
+            c.program,
+            Path::new("/d")
+                .join("tools")
+                .join("train-env")
+                .join("bin")
+                .join("python")
+        );
         assert_eq!(
             c.args[..4],
             ["-X", "faulthandler", "-u", "-I"].map(OsString::from)
@@ -532,7 +539,13 @@ mod train_env_tests {
         assert_eq!(get("PYTORCH_ENABLE_MPS_FALLBACK"), Some("1".into()));
         assert_eq!(
             get("HF_HOME"),
-            Some(OsString::from("/d/tools/train-config/huggingface"))
+            Some(
+                Path::new("/d")
+                    .join("tools")
+                    .join("train-config")
+                    .join("huggingface")
+                    .into_os_string()
+            )
         );
     }
 }

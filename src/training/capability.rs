@@ -371,6 +371,36 @@ fn family_fit(f: TrainFamily, accel: Option<&Accelerator>) -> FamilyFit {
     }
 }
 
+/// A capability for the machine the tests run on, so jobs planned with it find a training
+/// environment for this platform: the M1 on macOS arm64, else an RTX 3060 (8.6, 12 GB, CUDA 12.8
+/// driver) on this OS.
+#[cfg(test)]
+pub(crate) fn host_for_tests() -> Capability {
+    use crate::backend::detect::{CudaInfo, GpuAdapter, apple_gpu};
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let hw = if os == "macos" && arch == "aarch64" {
+        HardwareInfo::new(os, arch, vec![apple_gpu("Apple M1")])
+    } else {
+        HardwareInfo::new(
+            os,
+            arch,
+            vec![GpuAdapter {
+                vendor: GpuVendor::Nvidia,
+                name: "NVIDIA GeForce RTX 3060".into(),
+                vram_mb: 12288,
+                index: 0,
+                discrete: true,
+                cuda: Some(CudaInfo {
+                    ordinal: 0,
+                    compute_capability: ComputeCapability::new(8, 6),
+                }),
+            }],
+        )
+        .with_cuda_driver(12, 8)
+    };
+    capability(&hw, Some(16.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

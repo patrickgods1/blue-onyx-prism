@@ -3,7 +3,7 @@
 //! URL and writes embeddings.
 
 use super::*;
-use crate::backend::detect::{HardwareInfo, apple_gpu};
+use crate::backend::detect::HardwareInfo;
 use crate::config::Config;
 use crate::resources::export::fake::{Fake, arg_after};
 use crate::resources::export::{Cmd, CommandRunner, Fetcher};
@@ -167,11 +167,9 @@ impl Fetcher for ImportFake {
     }
 }
 
-fn mac() -> Capability {
-    capability::capability(
-        &HardwareInfo::new("macos", "aarch64", vec![apple_gpu("Apple M1")]),
-        Some(16.0),
-    )
+fn host() -> Capability {
+    // The host's platform: a job finds the training environment of the OS it runs on.
+    capability::host_for_tests()
 }
 
 fn config(root: &Path) -> Config {
@@ -234,7 +232,7 @@ fn a_folder_import_extracts_dedups_selects_and_writes_reviewable_frames() {
     let mut req = ImportRequest::new(ImportSource::Path(clips.clone()));
     req.license_confirmed = true;
     req.frames = 4;
-    let job = plan_import(&cfg, req, &mac()).unwrap();
+    let job = plan_import(&cfg, req, &host()).unwrap();
     let fake = ImportFake::new(8, 3);
     let (r, stages) = run(&job, &fake);
     let out = r.unwrap();
@@ -313,7 +311,7 @@ fn duplicates_are_dropped_and_dhash_selection_runs_without_embeddings() {
     req.selection = Selection::Dhash;
     // Any time apart (the fake's frames are 10 s apart, the default window).
     req.dedup_window_s = 0.0;
-    let job = plan_import(&config(root), req, &mac()).unwrap();
+    let job = plan_import(&config(root), req, &host()).unwrap();
     let mut fake = ImportFake::new(6, 0);
     fake.duplicates = true;
     let (r, _) = run(&job, &fake);
@@ -378,7 +376,7 @@ fn a_url_import_records_the_site_and_the_confirmed_licence() {
     req.license_confirmed = true;
     req.selection = Selection::Dhash;
     req.frames = 2;
-    let job = plan_import(&config(root), req, &mac()).unwrap();
+    let job = plan_import(&config(root), req, &host()).unwrap();
     let fake = ImportFake::new(4, 0);
     let (r, _) = run(&job, &fake);
     let out = r.unwrap();
@@ -411,7 +409,7 @@ fn pinned_footage_is_downloaded_and_attributed() {
     let mut req = ImportRequest::new(ImportSource::Dataset("meva-sample".into()));
     req.selection = Selection::Dhash;
     req.frames = 5;
-    let job = plan_import(&config(root), req, &mac()).unwrap();
+    let job = plan_import(&config(root), req, &host()).unwrap();
     let fake = ImportFake::new(2, 1);
     let (r, _) = run(&job, &fake);
     let out = r.unwrap();
@@ -456,7 +454,7 @@ fn imports_run_on_the_training_queue_and_can_be_cancelled_while_queued() {
         Arc::new(crate::training::job::NoHooks),
         Some(root.join("training/runs.json")),
     );
-    let j1 = plan_import(&cfg, req.clone(), &mac()).unwrap();
+    let j1 = plan_import(&cfg, req.clone(), &host()).unwrap();
     let id = svc.enqueue_task(Box::new(j1)).unwrap();
     let rec = svc.wait_task(&id, Duration::from_secs(30)).unwrap();
     assert_eq!(rec.state, RunState::Done, "{}", rec.describe());
