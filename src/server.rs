@@ -25,6 +25,7 @@ mod apply;
 mod benchmark;
 mod browse;
 mod config_page;
+mod dataset;
 mod detect;
 mod devices;
 mod guard;
@@ -181,6 +182,13 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/config/models/remove", post(config_models_remove)),
         ("/config/restart", post(config_restart)),
         ("/config/loglevel", post(config_loglevel)),
+        ("/dataset", get(dataset::page)),
+        ("/dataset/settings", post(dataset::settings)),
+        ("/dataset/review", post(dataset::review)),
+        ("/dataset/resume", post(dataset::resume)),
+        ("/dataset/image", get(dataset::image)),
+        ("/dataset/sidecar", get(dataset::sidecar)),
+        ("/v1/dataset", get(dataset::json)),
         ("/logs", get(logs_page)),
         ("/logs.json", get(logs_json)),
         ("/benchmark", get(benchmark::page)),
@@ -936,6 +944,13 @@ mod tests {
             "/config/models/remove",
             "/config/restart",
             "/config/loglevel",
+            "/dataset",
+            "/dataset/settings",
+            "/dataset/review",
+            "/dataset/resume",
+            "/dataset/image",
+            "/dataset/sidecar",
+            "/v1/dataset",
             "/logs",
             "/logs.json",
             "/benchmark",

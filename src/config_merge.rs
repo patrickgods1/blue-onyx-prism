@@ -214,6 +214,7 @@ fn global_label(k: &str) -> String {
         "preprocess" => "Image preprocessing".into(),
         "night_preprocess" => "Night / IR image preprocessing".into(),
         "verify" => "Verifier cascade".into(),
+        "collect" => "Dataset collector".into(),
         other => other.replace('_', " "),
     }
 }
@@ -419,6 +420,7 @@ pub fn live_global(k: &str) -> bool {
             | "preprocess"
             | "night_preprocess"
             | "verify"
+            | "collect"
     ) || k.starts_with("benchmark.")
 }
 
@@ -1046,6 +1048,22 @@ mod tests {
             .find(|c| c.label == "IPcam-general \u{b7} verifier")
             .unwrap();
         assert_eq!(c.from, "global");
+    }
+
+    #[test]
+    fn collect_applies_live_without_a_restart() {
+        let old = cfg();
+        let mut new = old.clone();
+        new.collect.enabled = true;
+        new.collect.buckets.empty.enabled = false;
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(!p.restart_needed(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        assert!(
+            applied_live(&changes).contains(&"Dataset collector".to_string()),
+            "{changes:?}"
+        );
     }
 
     #[test]

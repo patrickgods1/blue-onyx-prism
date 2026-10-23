@@ -408,17 +408,20 @@ impl WorkerCtx {
         enqueued: Instant,
         request_id: String,
     ) -> (Meta, Input) {
+        let live = self.cfg.live.load_full();
+        let original = live.collect.enabled.then(|| req.image_data.clone());
         let meta = Meta {
             reply,
             enqueued,
             image_name: req.image_name,
             min_confidence: req.min_confidence,
-            live: self.cfg.live.load_full(),
+            live,
             request_id,
             budget: None,
             forwardable: true,
             routed_from: None,
             verify_crop: false,
+            original,
         };
         (meta, Input::Bytes(req.image_data))
     }
@@ -438,6 +441,7 @@ impl WorkerCtx {
             reply,
             from,
             purpose,
+            original,
         } = d;
         let meta = Meta {
             reply,
@@ -450,6 +454,7 @@ impl WorkerCtx {
             forwardable: false,
             routed_from: Some(from),
             verify_crop: purpose == Purpose::Verify,
+            original: original.filter(|_| purpose == Purpose::NightModel),
         };
         (meta, Input::Decoded { img, stats, decode })
     }
@@ -534,6 +539,7 @@ impl WorkerCtx {
             live,
             request_id,
             budget,
+            original,
             ..
         } = meta;
         let decoded = Decoded {
@@ -548,6 +554,7 @@ impl WorkerCtx {
             reply,
             from: self.cfg.name.clone(),
             purpose: Purpose::NightModel,
+            original,
         };
         let (back, reason) = match target
             .sender
@@ -590,6 +597,7 @@ impl WorkerCtx {
             forwardable: false,
             routed_from: None,
             verify_crop: false,
+            original: d.original,
         };
         Some(self.fall_back(meta, prepared, d.img, &night, reason))
     }
@@ -1131,7 +1139,8 @@ impl WorkerCtx {
     }
 
     /// The night / IR rules ([`crate::model::filters::apply`]), then the static-box memory, on
-    /// one request's detections; adds what each removed to `counts`.
+    /// one request's detections; adds what each removed to `counts`, and the removed boxes
+    /// with their reasons to `removed` when given (dataset collector).
     fn filter_detections(
         &self,
         dets: Vec<crate::model::Detection>,
@@ -1139,10 +1148,18 @@ impl WorkerCtx {
         scene: Scene,
         live: &super::LiveSettings,
         counts: &mut SuppressCounts,
+        mut removed: Option<&mut Vec<(crate::model::Detection, SuppressReason)>>,
     ) -> Vec<crate::model::Detection> {
         let (w, h) = (f.ctx.orig_w, f.ctx.orig_h);
-        let (dets, c) =
-            crate::model::filters::apply(dets, &self.cfg.classes, w, h, scene, &live.filters);
+        let (dets, c) = crate::model::filters::apply_recording(
+            dets,
+            &self.cfg.classes,
+            w,
+            h,
+            scene,
+            &live.filters,
+            removed.as_deref_mut(),
+        );
         *counts = c;
         let st = &live.static_suppression;
         let mut memory = self.static_memory.borrow_mut();
@@ -1150,8 +1167,14 @@ impl WorkerCtx {
             return dets;
         }
         let key = crate::static_memory::camera_key(&self.cfg.name, &f.meta.image_name, w, h);
+        let before = removed.as_ref().map(|_| dets.clone());
         let (dets, n) = memory.apply(&key, dets, &self.cfg.classes, st, Instant::now());
         counts.add(SuppressReason::Static, n);
+        if let (Some(v), Some(before)) = (removed, before)
+            && n > 0
+        {
+            v.extend(super::collect::removed_by_static(&before, &dets));
+        }
         dets
     }
 
@@ -1167,11 +1190,36 @@ impl WorkerCtx {
             .saturating_duration_since(f.submitted);
         let t = Instant::now();
         let live = f.meta.live.clone();
+        let threshold = effective_threshold(f.min_confidence(), live.confidence_threshold);
+        // Dataset collector: the record of this request (None: collection off). With the
+        // `near_threshold` bucket on, postprocessing runs `margin` below the threshold and the
+        // boxes under it are only recorded: greedy NMS and its caps keep the highest scores,
+        // so the boxes at or above the threshold are exactly those of a run at the threshold.
+        let near_margin = live
+            .collect
+            .wants_below_threshold()
+            .then(|| live.collect.buckets.near_margin());
+        let mut collect_job = super::collect::Job::start(
+            &f.meta,
+            &crate::collect::DraftInput {
+                model: name,
+                device: &eng.device,
+                request_id: &f.meta.request_id,
+                routed_from: f.meta.routed_from.as_deref(),
+                image_name: &f.meta.image_name,
+                stats: f.stats,
+                width: f.ctx.orig_w,
+                height: f.ctx.orig_h,
+                threshold,
+                near_margin,
+            },
+        );
+        let post_threshold = match (&collect_job, near_margin) {
+            (Some(_), Some(m)) => (threshold - m).max(crate::model::nms::MIN_CONFIDENCE_FLOOR),
+            _ => threshold,
+        };
         let params = PostParams {
-            confidence_threshold: effective_threshold(
-                f.min_confidence(),
-                live.confidence_threshold,
-            ),
+            confidence_threshold: post_threshold,
             nms_iou: live.nms_iou,
         };
         let collected = if f.overdue {
@@ -1204,7 +1252,25 @@ impl WorkerCtx {
                     None,
                 ));
             }
-            let dets = self.filter_detections(dets, &f, scene, &live, &mut suppressed);
+            let dets = match collect_job.as_mut() {
+                Some(job) => {
+                    let (raw, below): (Vec<_>, Vec<_>) =
+                        dets.into_iter().partition(|d| d.score >= threshold);
+                    let mut removed = Vec::new();
+                    let kept = self.filter_detections(
+                        raw.clone(),
+                        &f,
+                        scene,
+                        &live,
+                        &mut suppressed,
+                        Some(&mut removed),
+                    );
+                    job.draft
+                        .set_detections(&raw, &below, &removed, &self.cfg.classes);
+                    kept
+                }
+                None => self.filter_detections(dets, &f, scene, &live, &mut suppressed, None),
+            };
             let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
             Ok(crate::model::to_predictions(
                 &dets,
@@ -1283,6 +1349,7 @@ impl WorkerCtx {
                         deadline,
                         handed_off: Instant::now(),
                         line,
+                        collect: collect_job.take(),
                     });
                     self.hand_off(pending);
                     return;
@@ -1302,6 +1369,7 @@ impl WorkerCtx {
                 resp
             }
             Err(e) => {
+                collect_job = None;
                 warn!(
                     model = %name,
                     device = %eng.device,
@@ -1317,7 +1385,12 @@ impl WorkerCtx {
                 r
             }
         };
+        // The collector gets the frame after the reply went out (a `try_send`, never waits).
+        let collect = collect_job.map(|job| (job, resp.predictions.clone()));
         self.reply(meta, resp);
+        if let Some((job, predictions)) = collect {
+            job.submit(&predictions);
+        }
     }
 
     /// Give a request with verifier candidates to the verify lane (started on first use). If

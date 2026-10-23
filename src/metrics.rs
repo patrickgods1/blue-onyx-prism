@@ -734,6 +734,7 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         let _ = writeln!(out, "# TYPE {PREFIX}{name} counter");
         let _ = writeln!(out, "{PREFIX}{name} {}", counter.load(Ordering::Relaxed));
     }
+    crate::collect::metrics::render_prometheus(&mut out, PREFIX);
     let p = ProcessStats::read();
     if let Some(rss) = p.resident_memory_bytes {
         let _ = writeln!(

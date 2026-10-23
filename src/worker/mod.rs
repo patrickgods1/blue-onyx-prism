@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
+mod collect;
 mod pipeline;
 mod run;
 #[cfg(test)]
@@ -128,6 +129,8 @@ pub struct Decoded {
     /// Name of the forwarding model (for the log).
     pub from: String,
     pub purpose: Purpose,
+    /// The request's encoded image as uploaded (for the dataset collector; None: not kept).
+    pub original: Option<bytes::Bytes>,
 }
 
 /// Why a [`Decoded`] request was handed over.
@@ -248,6 +251,8 @@ pub struct LiveSettings {
     /// Verifier cascade (`verify`, the model's own over the global one; None = off, and
     /// always None for the verifier model itself).
     pub verify: Option<crate::verify::VerifyConfig>,
+    /// Dataset collector settings (`collect`, process-wide; see [`crate::collect`]).
+    pub collect: Arc<crate::collect::CollectSettings>,
 }
 
 impl LiveSettings {
@@ -279,6 +284,7 @@ impl LiveSettings {
                 .filter(|n| !n.is_empty())
                 .map(str::to_string),
             verify: verify_settings(config, m),
+            collect: Arc::new(crate::collect::CollectSettings::for_config(config)),
         }
     }
 

@@ -12,6 +12,7 @@
 //! - [`prep`]      process-wide decode + preprocess pool shared by the workers
 //! - [`image_stats`] cheap per-frame luma / colour statistics and the day / night / IR scene
 //! - [`static_memory`] static-box memory: suppress boxes that repeat at the same place
+//! - [`collect`]   dataset collector: frames + sidecar JSON for review and training
 //! - [`verify`]    verifier cascade: candidate crops and the keep / reject rule (pure)
 //! - [`profile`]   hardware profile (low/mid/high): defaults of the concurrency settings
 //! - [`registry`]  loads all configured models and owns their worker threads
@@ -59,6 +60,7 @@ pub mod api;
 pub mod backend;
 pub mod benchmark;
 pub mod cli;
+pub mod collect;
 pub mod config;
 pub mod config_form;
 pub mod config_merge;

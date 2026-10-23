@@ -66,6 +66,8 @@ pub(super) struct Pending {
     pub(super) deadline: Instant,
     pub(super) handed_off: Instant,
     pub(super) line: DoneLine,
+    /// The dataset collector's record of the request (None: collection off).
+    pub(super) collect: Option<super::collect::Job>,
 }
 
 /// Why candidates stayed unverified.
@@ -380,6 +382,7 @@ fn start(ctx: &LaneCtx, p: Box<Pending>, active: &mut Vec<Active>) {
                             reply: Reply::Worker(tx),
                             from: ctx.name.clone(),
                             purpose: Purpose::Verify,
+                            original: None,
                         }));
                         match h.sender.try_send(item) {
                             Ok(()) => a.waits.push((k, rx)),
@@ -463,12 +466,23 @@ fn complete(
         image_name,
         handed_off,
         line,
+        mut collect,
         ..
     } = *p;
     let outcomes = match &live.verify {
         Some(cfg) => crate::verify::outcomes(&plan, found, cfg),
         None => Vec::new(),
     };
+    if let (Some(job), Some(cfg)) = (collect.as_mut(), &live.verify) {
+        job.draft.set_verify(super::collect::verify_info(
+            &resp.predictions,
+            &outcomes,
+            found,
+            cfg,
+            &verifier,
+            failure.map(Failure::as_str),
+        ));
+    }
     let (kept, counts) = crate::verify::apply(std::mem::take(&mut resp.predictions), &outcomes);
     ctx.metrics.record_verify(&counts);
     let mut suppressed = SuppressCounts::default();
@@ -535,7 +549,12 @@ fn complete(
         success = resp.success,
         "replied"
     );
+    let collect = collect.map(|job| (job, resp.predictions.clone()));
     if !reply.send(resp) {
         tracing::debug!(model = %ctx.name, "client went away before the response was sent");
+    }
+    // After the reply (a `try_send`, never waits).
+    if let Some((job, predictions)) = collect {
+        job.submit(&predictions);
     }
 }

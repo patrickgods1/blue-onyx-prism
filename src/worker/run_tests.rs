@@ -806,6 +806,7 @@ fn decoded_frames_can_be_answered_to_another_worker() {
             reply,
             from: "primary".into(),
             purpose: super::Purpose::Verify,
+            original: None,
         }))
     };
     h.script.push([det(4, 0)]);
@@ -1145,4 +1146,136 @@ fn routed_night_frames_use_the_night_models_verifier() {
     day.stop();
     night.stop();
     checker.stop();
+}
+
+/// Dataset collector end to end on the fake runtime: requests produce sidecars with the right
+/// buckets (positive, suppressed, empty, near-threshold below the threshold, verifier
+/// rejection), and a collector that cannot keep up (paused, its queue full) never delays a
+/// reply. The only test that drives the process-wide collector.
+#[test]
+fn collected_frames_get_their_buckets_and_a_full_queue_never_delays_replies() {
+    use crate::collect::metrics::{Dropped, METRICS};
+    use crate::collect::{Bucket, CollectConfig, CollectSettings, Record};
+    use crate::model::filters::FilterRules;
+    let dir = std::env::temp_dir().join(format!("bop-collect-e2e-{}", uuid::Uuid::new_v4()));
+    let collect = Arc::new(CollectSettings::from_config(
+        &CollectConfig {
+            enabled: true,
+            dir: Some(dir.clone()),
+            ..CollectConfig::default()
+        },
+        &dir,
+    ));
+    let mut live = live_verified("checker", |_| {});
+    live.collect = collect.clone();
+    live.filters = FilterRules {
+        label_thresholds: [("c2".to_string(), 0.95)].into_iter().collect(),
+        ..FilterRules::default()
+    };
+    let checker_live = LiveSettings {
+        request_timeout: Duration::from_secs(30),
+        ..LiveSettings::default()
+    };
+    let (primary, checker, _peers) = primary_and_checker(live, checker_live);
+
+    // 1. The collector is stuck: every reply still arrives at once, the overflow is counted.
+    crate::collect::PAUSE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let full_before = METRICS.dropped(Dropped::QueueFull);
+    let n = crate::collect::QUEUE + 12;
+    primary.script.push((0..n).map(|_| nothing()));
+    let t = Instant::now();
+    let replies: Vec<Reply> = (0..n)
+        .map(|i| primary.send(&format!("flood{i}.jpg")))
+        .collect();
+    for (r, _) in wait_all(replies) {
+        assert!(r.success, "{}", r.message);
+    }
+    assert!(t.elapsed() < SOON);
+    let dropped = METRICS.dropped(Dropped::QueueFull) - full_before;
+    assert!(
+        dropped >= (n - crate::collect::QUEUE - 1) as u64,
+        "dropped {dropped}"
+    );
+    crate::collect::PAUSE.store(false, std::sync::atomic::Ordering::Relaxed);
+    // The flood frames share the camera `flood` (trailing digits are not part of the camera):
+    // one is saved (`empty`), the others are rate limited. Wait until the queue drained.
+    primary.wait_for("the collector to drain", || {
+        crate::collect::global().pending() == 0
+    });
+
+    // 2. One request per camera and outcome.
+    primary.script.push([det(0, 0)]); // positive
+    assert_eq!(label(&primary.send("front.jpg").wait()), "c0");
+    primary.script.push([det(2, 0)]); // c2 under its label threshold: suppressed
+    assert!(primary.send("side.jpg").wait().predictions.is_empty());
+    primary.script.push([nothing()]); // empty
+    assert!(primary.send("back.jpg").wait().predictions.is_empty());
+    primary.script.push([whole(0, 0.45, 0)]); // below 0.5, within 0.1: empty + near
+    assert!(primary.send("yard.jpg").wait().predictions.is_empty());
+    // An IR c1 candidate the checker does not confirm: rejected by the verifier.
+    primary.script.push([whole(1, 0.9, 0)]);
+    checker.script.push([nothing()]);
+    assert!(ir(&primary, "gate.jpg").wait().predictions.is_empty());
+
+    let sidecar = |scene: &str, camera: &str| -> Record {
+        let t = Instant::now();
+        loop {
+            let base = dir.join(scene).join(camera);
+            let found = std::fs::read_dir(&base).ok().and_then(|days| {
+                days.flatten().find_map(|d| {
+                    std::fs::read_dir(d.path()).ok()?.flatten().find_map(|f| {
+                        let p = f.path();
+                        (p.extension()? == "json")
+                            .then(|| std::fs::read(&p).ok())
+                            .flatten()
+                    })
+                })
+            });
+            if let Some(bytes) = found {
+                return serde_json::from_slice(&bytes).unwrap();
+            }
+            assert!(
+                t.elapsed() < SOON,
+                "no sidecar for {scene}/{camera}; drops {:?}; files {:?}",
+                Dropped::ALL.map(|d| (d.as_str(), METRICS.dropped(d))),
+                crate::collect::layout::day_dirs(&dir)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let r = sidecar("day", "front");
+    assert_eq!(r.buckets, vec![Bucket::Positive]);
+    assert_eq!(r.model, "primary");
+    assert_eq!(r.raw.len(), 1);
+    assert_eq!(r.predictions[0].label, "c0");
+    assert_eq!(r.camera_key, "primary|cam:front");
+    assert!(r.image.original);
+    let r = sidecar("day", "side");
+    assert_eq!(r.buckets, vec![Bucket::Suppressed]);
+    assert_eq!(r.suppressed[0].reason, "label_threshold");
+    assert_eq!(r.suppressed[0].label, "c2");
+    let r = sidecar("day", "back");
+    assert_eq!(r.buckets, vec![Bucket::Empty]);
+    let r = sidecar("day", "yard");
+    assert_eq!(r.buckets, vec![Bucket::Empty, Bucket::NearThreshold]);
+    assert!(r.raw.is_empty());
+    assert_eq!(r.below_threshold.len(), 1);
+    assert!((r.below_threshold[0].score - 0.45).abs() < 1e-4);
+    let r = sidecar("ir", "gate");
+    assert_eq!(
+        r.buckets,
+        vec![Bucket::VerifyRejected, Bucket::Disagreement]
+    );
+    let v = r.verify.as_ref().unwrap();
+    assert_eq!(v.verifier, "checker");
+    assert_eq!(v.candidates[0].outcome, "rejected");
+    assert!(r.suppressed.iter().any(|s| s.reason == "verify"));
+    let r = sidecar("day", "flood");
+    assert_eq!(r.buckets, vec![Bucket::Empty]);
+    let summary = crate::collect::Summary::scan(&dir);
+    assert_eq!(summary.by_camera["flood"].frames, 1);
+    assert_eq!(summary.frames, 6);
+    primary.stop();
+    checker.stop();
+    let _ = std::fs::remove_dir_all(&dir);
 }

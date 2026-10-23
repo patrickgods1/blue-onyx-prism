@@ -116,6 +116,12 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `verify` (`src/verify.rs` pure decision, `worker/verify.rs` per-worker continuation lane): night person candidates
   re-checked by another model (crop or frame), fail-open, never blocks the inference thread; MegaDetector v6 and the
   ExDark RF-DETRs are export recipes (ExDark ones in `F32_MODELS`, non-commercial); benchmark `animal` class group.
+- `src/collect/` dataset collector (`collect` config, default off, live): after the reply, the worker `try_send`s the
+  original upload + a v1 sidecar record (raw/suppressed boxes, scene, camera, verify outcomes) to one collector thread
+  (buckets positive/empty/suppressed/verify_*/near_threshold/disagreement, per-camera rate limits, dHash dedup, atomic
+  writes under `<data root>/dataset/<scene>/<camera>/<date>/`, `retention::prune_dataset`, disk guard); admin `/dataset`
+  page and `review-queue.jsonl`; format in `docs/DATASET.md`. OpenVINO CACHE_DIR is `<cache>/openvino-<device>-<prec>`
+  (the CPU cache hash ignores precision); `config_store::spawn_disk_watch` applies on-disk config edits within 2 s.
 - `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
   baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;
   a write failure only warns). `ModelResult.run_id` = the run's start time. Pure `comparable`/`compare` (speed counts at

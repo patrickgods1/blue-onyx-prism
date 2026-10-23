@@ -300,6 +300,7 @@ dialog#drill::backdrop { background: rgba(0, 0, 0, 0.5); }
 .thumbs-note { grid-column: 1 / -1; }
 figure.thumb { margin: 0; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem; }
 figure.thumb canvas { width: 100%; height: auto; display: block; }
+figure.thumb img { width: 100%; height: auto; display: block; }
 figure.thumb figcaption { font-size: 0.78rem; color: var(--muted); word-break: break-all; }
 .lg-gt { color: #2e9e4f; } .lg-miss { color: #e53935; } .lg-tp { color: #1f6fe0; } .lg-fp { color: #f08c00; } .lg-un { color: #8a93a5; }
 @media (max-width: 700px) {

@@ -45,6 +45,9 @@ pub(super) struct Meta {
     /// A verifier-cascade check from another worker ([`super::Purpose::Verify`]): raw
     /// detections only, never verified, filtered or saved.
     pub(super) verify_crop: bool,
+    /// The upload's encoded bytes, kept (a reference count, no copy) while the dataset
+    /// collector is on ([`crate::collect`]); None otherwise.
+    pub(super) original: Option<bytes::Bytes>,
 }
 
 impl Meta {
@@ -151,6 +154,7 @@ mod tests {
                 forwardable: true,
                 routed_from: None,
                 verify_crop: false,
+                original: None,
             },
             ctx: PreprocessCtx {
                 orig_w: 1,

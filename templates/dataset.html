@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Dataset{% endblock %}
+{% block content %}
+<h1>Dataset</h1>
+<p class="warn">The collector saves frames Blue Iris sends to this machine, with what the model saw, for review and training. They contain whatever your cameras see. They stay on this machine in the folder below and are never uploaded anywhere. Format: <code>docs/DATASET.md</code>.</p>
+{% if let Some(m) = message %}<p class="notice">{{ m }}</p>{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+{% if let Some(d) = disabled %}
+<div class="card">
+  <p class="error">Collection stopped: {{ d }}</p>
+  <form method="post" action="/dataset/resume" class="inline"><button type="submit">Resume</button> <span class="muted">after freeing space or lowering the size cap</span></form>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Status</h2>
+  <div class="facts">
+    <div><span class="k">Collection</span> {% if enabled %}on{% else %}off{% endif %}</div>
+    <div><span class="k">Folder</span> <code>{{ dir }}</code></div>
+    <div><span class="k">Frames</span> {{ frames }}</div>
+    <div><span class="k">Disk used</span> {{ used_mb }} MB of {{ max_gb }} GB</div>
+    <div><span class="k">Review queue</span> {{ queued }} frame(s)</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Settings <span class="tag now">applies now</span></h2>
+  <form method="post" action="/dataset/settings">
+    <label class="check"><input type="checkbox" name="enabled"{% if enabled %} checked{% endif %}> Collect frames</label>
+    <div class="scroll">
+    <table>
+      <thead><tr><th>Bucket</th><th>Saved when</th><th>On</th><th>Rate (0..1)</th><th>Min interval per camera (s)</th><th>Saved</th></tr></thead>
+      <tbody>
+      {% for b in buckets %}
+      <tr>
+        <td><code>{{ b.key }}</code></td>
+        <td>{{ b.describe }}</td>
+        <td><input type="checkbox" name="{{ b.key }}.enabled" aria-label="{{ b.key }} on"{% if b.enabled %} checked{% endif %}></td>
+        <td><input type="number" name="{{ b.key }}.rate" aria-label="{{ b.key }} rate" min="0" max="1" step="0.01" value="{{ b.rate }}"></td>
+        <td><input type="number" name="{{ b.key }}.interval" aria-label="{{ b.key }} interval" min="0" step="1" value="{{ b.interval }}"></td>
+        <td class="num">{{ b.saved }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <div class="facts">
+      <label>Near-threshold margin <input type="number" name="near_threshold.margin" min="0.01" max="0.5" step="0.01" value="{{ near_margin }}"></label>
+      <label>Max size (GB) <input type="number" name="max_gb" min="0.1" step="0.1" value="{{ max_gb }}"></label>
+      <label>Max age (days, 0 = keep) <input type="number" name="max_age_days" min="0" step="1" value="{{ max_age_days }}"></label>
+      <label>Dedup distance (dHash bits) <input type="number" name="dedup_hamming" min="0" max="32" step="1" value="{{ dedup_hamming }}"></label>
+      <label>Folder (empty = <code>dataset</code> under the data folder) <input type="text" name="dir" value="{{ dir_setting }}"></label>
+    </div>
+    <button type="submit">Save</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Frames by scene and bucket</h2>
+  <p class="muted">A frame counts once in each bucket it was kept for.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Scene</th>{% for n in bucket_names %}<th>{{ n }}</th>{% endfor %}</tr></thead>
+    <tbody>
+    {% for s in scenes %}<tr><td>{{ s.scene }}</td>{% for c in s.counts %}<td class="num">{{ c }}</td>{% endfor %}</tr>{% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Cameras</h2>
+  {% if cameras.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
+  <table>
+    <thead><tr><th>Camera</th><th>Frames</th><th>MB</th><th>Newest (UTC)</th></tr></thead>
+    <tbody>
+    {% for c in cameras %}<tr><td>{{ c.name }}</td><td class="num">{{ c.frames }}</td><td class="num">{{ c.mb }}</td><td>{{ c.newest }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Newest frames</h2>
+  {% if groups.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
+  <form method="post" action="/dataset/review">
+    {% for g in groups %}
+    <h3><code>{{ g.key }}</code> <span class="muted">{{ g.describe }}</span></h3>
+    <div class="thumbs">
+      {% for t in g.thumbs %}
+      <figure class="thumb">
+        <a href="{{ t.image_url }}"><img src="{{ t.image_url }}" alt="{{ t.caption }}" loading="lazy"></a>
+        <figcaption><label class="check"><input type="checkbox" name="frame" value="{{ t.rel }}"> {{ t.caption }}</label> <a href="{{ t.sidecar_url }}">sidecar</a></figcaption>
+      </figure>
+      {% endfor %}
+    </div>
+    {% endfor %}
+    <p><button type="submit">Send to review</button> <span class="muted">appends the ticked frames to <code>review-queue.jsonl</code> in the dataset folder</span></p>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

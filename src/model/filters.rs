@@ -200,6 +200,20 @@ pub fn apply(
     scene: Scene,
     rules: &FilterRules,
 ) -> (Vec<Detection>, SuppressCounts) {
+    apply_recording(dets, class_names, img_w, img_h, scene, rules, None)
+}
+
+/// [`apply`] that also pushes every removed detection with its reason onto `removed` (the
+/// dataset collector's record, [`crate::collect`]).
+pub fn apply_recording(
+    dets: Vec<Detection>,
+    class_names: &[String],
+    img_w: u32,
+    img_h: u32,
+    scene: Scene,
+    rules: &FilterRules,
+    mut removed: Option<&mut Vec<(Detection, SuppressReason)>>,
+) -> (Vec<Detection>, SuppressCounts) {
     let mut counts = SuppressCounts::default();
     if rules.is_noop() || dets.is_empty() {
         return (dets, counts);
@@ -275,7 +289,12 @@ pub fn apply(
             None
         };
         match reason {
-            Some(r) => counts.add(r, 1),
+            Some(r) => {
+                counts.add(r, 1);
+                if let Some(v) = removed.as_deref_mut() {
+                    v.push((d.clone(), r));
+                }
+            }
             None => keep.push(d.clone()),
         }
     }
@@ -319,6 +338,31 @@ mod tests {
         rules: &FilterRules,
     ) -> (Vec<Detection>, SuppressCounts) {
         apply(dets, &names(), 1000, 800, scene, rules)
+    }
+
+    #[test]
+    fn apply_recording_lists_each_removed_box_with_its_reason() {
+        let rules = FilterRules {
+            night_confidence_threshold: Some(0.6),
+            person_aspect: Some([0.2, 0.4]),
+            ..FilterRules::default()
+        };
+        let mut removed = Vec::new();
+        let (kept, c) = apply_recording(
+            sample(),
+            &names(),
+            1000,
+            800,
+            Scene::Ir,
+            &rules,
+            Some(&mut removed),
+        );
+        assert_eq!(kept, run(sample(), Scene::Ir, &rules).0);
+        assert_eq!(removed.len() as u32, c.total());
+        assert_eq!(
+            removed[0],
+            (sample()[0].clone(), SuppressReason::NightThreshold)
+        );
     }
 
     #[test]
