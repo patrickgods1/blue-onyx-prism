@@ -250,9 +250,11 @@ mod tests {
         };
         let j = plan_job(&c, request(TrainFamily::Yolo26, "n"), &mac(), None).unwrap();
         assert!(j.name.starts_with("night-yolo26n-"), "{}", j.name);
-        assert_eq!(j.request.datasets, [PathBuf::from("/data/exports/a")]);
+        // The data root as the config resolves it ("/data" is "D:/data" on Windows).
+        let root = c.data_root();
+        assert_eq!(j.request.datasets, [root.join("exports").join("a")]);
         assert!(
-            j.run_dir.starts_with("/data/training"),
+            j.run_dir.starts_with(root.join("training")),
             "{}",
             j.run_dir.display()
         );
