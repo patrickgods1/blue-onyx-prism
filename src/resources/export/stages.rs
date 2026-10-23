@@ -493,16 +493,17 @@ fn run_stages(
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let work = p.work.join(name);
     manager::remove_any(&work)?;
-    // Ultralytics takes the `.pt` file; the Hugging Face recipes the directory with
-    // `model.safetensors` + `config.json`.
-    let weights_arg = match recipe {
-        catalog::ExportRecipe::Ultralytics => weights_dir.join(
+    // Ultralytics and RT-DETRv2 take the weights file (`.pt` / `.pth`); the Hugging Face recipes
+    // the directory with `model.safetensors` + `config.json`.
+    let weights_arg = if recipe.takes_file() {
+        weights_dir.join(
             res.parts
                 .first()
                 .ok_or_else(|| anyhow!("{} has no weights", res.id))?
                 .file_name,
-        ),
-        _ => weights_dir.clone(),
+        )
+    } else {
+        weights_dir.clone()
     };
     let mut args: Vec<OsString> = vec![
         script.clone().into_os_string(),
@@ -522,7 +523,7 @@ fn run_stages(
         "--work".into(),
         work.clone().into_os_string(),
     ];
-    if recipe == catalog::ExportRecipe::DeimV2 {
+    if recipe.needs_deimv2_source() {
         args.push("--source".into());
         args.push(p.deimv2_src.clone().into_os_string());
     }
@@ -582,8 +583,12 @@ pub(super) fn install_outputs(
     let text = std::fs::read_to_string(&yaml)
         .with_context(|| format!("the exporter wrote no {yaml_name}"))?;
     let classes = class_count(&text)?;
-    if classes != 80 {
-        bail!("{yaml_name} lists {classes} classes; the exportable COCO models have 80");
+    let want = catalog::export_class_count(res);
+    if classes != want {
+        bail!(
+            "{yaml_name} lists {classes} classes; {} has {want}",
+            res.model_name().unwrap_or(res.id)
+        );
     }
     let shas = vec![manager::sha256_file(&onnx)?, manager::sha256_file(&yaml)?];
     let m = Manifest {

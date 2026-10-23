@@ -42,6 +42,9 @@ pub(super) struct Meta {
     pub(super) forwardable: bool,
     /// The model that forwarded this request here (None: it came from the HTTP layer).
     pub(super) routed_from: Option<String>,
+    /// A verifier-cascade check from another worker ([`super::Purpose::Verify`]): raw
+    /// detections only, never verified, filtered or saved.
+    pub(super) verify_crop: bool,
 }
 
 impl Meta {
@@ -147,6 +150,7 @@ mod tests {
                 budget: None,
                 forwardable: true,
                 routed_from: None,
+                verify_crop: false,
             },
             ctx: PreprocessCtx {
                 orig_w: 1,

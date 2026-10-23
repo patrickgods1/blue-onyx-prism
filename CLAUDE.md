@@ -113,6 +113,9 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   (`WorkItem::DetectDecoded`, `worker::Peers` of weak handles published by the registry; never re-forwarded; falls back
   to the model itself). `benchmark --variants` (`benchmark/variant.rs`) runs stats -> enhance -> filters like the
   service. Results and defaults: `docs/NIGHT_IR.md`.
+  `verify` (`src/verify.rs` pure decision, `worker/verify.rs` per-worker continuation lane): night person candidates
+  re-checked by another model (crop or frame), fail-open, never blocks the inference thread; MegaDetector v6 and the
+  ExDark RF-DETRs are export recipes (ExDark ones in `F32_MODELS`, non-commercial); benchmark `animal` class group.
 - `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
   baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;
   a write failure only warns). `ModelResult.run_id` = the run's start time. Pure `comparable`/`compare` (speed counts at

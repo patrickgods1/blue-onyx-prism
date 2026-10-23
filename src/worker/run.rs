@@ -5,9 +5,10 @@
 //! queued request); postprocessing runs on this thread.
 
 use super::pipeline::{Done, InFlight, Job, Meta, Pipeline, Stage};
+use super::verify::{Lane, LaneCtx, Pending};
 use super::watch::{SlowCompile, StuckWatch, collect_watched, watch_slow_compile};
 use super::{
-    COMPILING_ON, Decoded, LoadGate, ORDER_TARGET, POLL, Reply, WorkItem, WorkerConfig,
+    COMPILING_ON, Decoded, LoadGate, ORDER_TARGET, POLL, Purpose, Reply, WorkItem, WorkerConfig,
     WorkerHandle, auto_queue_size, effective_threshold, initializing_message, loaded_provider,
     millis_u64, ms, new_request_id,
 };
@@ -73,6 +74,9 @@ pub(super) struct WorkerCtx {
     /// Preprocessor for requests forwarded with a decoded image ([`WorkItem::DetectDecoded`]),
     /// made on first use for the engine's geometry.
     pub(super) decoded_pre: RefCell<Option<(PrepSpec, Preprocessor)>>,
+    /// The verifier-cascade continuation thread (started on the first verification; see
+    /// [`super::verify`]).
+    pub(super) verify_lane: RefCell<Option<Lane>>,
 }
 
 /// Inference errors in a row after which the model counts as broken (a reset GPU makes every
@@ -234,6 +238,8 @@ impl WorkerCtx {
             eng.backend.abort();
         }
         self.answer_remaining(p, &rx);
+        // Answers the verifications still waiting (unverified) and joins the lane thread.
+        drop(self.verify_lane.borrow_mut().take());
         drop(parked);
         info!(model = %name, "worker exiting");
     }
@@ -378,8 +384,11 @@ impl WorkerCtx {
             let job = PrepJob {
                 image: image_data,
                 spec: eng.spec,
-                // The decoded frame is forwarded when the night model takes it.
-                keep_image: meta.live.save_image_path.is_some() || may_route(&meta),
+                // The decoded frame is forwarded when the night model takes it, and cropped
+                // for the verifier.
+                keep_image: meta.live.save_image_path.is_some()
+                    || may_route(&meta)
+                    || may_verify(&meta),
                 preprocess: meta.live.preprocess,
                 reply: tx,
             };
@@ -409,6 +418,7 @@ impl WorkerCtx {
             budget: None,
             forwardable: true,
             routed_from: None,
+            verify_crop: false,
         };
         (meta, Input::Bytes(req.image_data))
     }
@@ -427,6 +437,7 @@ impl WorkerCtx {
             decode,
             reply,
             from,
+            purpose,
         } = d;
         let meta = Meta {
             reply,
@@ -438,6 +449,7 @@ impl WorkerCtx {
             budget: Some(deadline.saturating_duration_since(enqueued)),
             forwardable: false,
             routed_from: Some(from),
+            verify_crop: purpose == Purpose::Verify,
         };
         (meta, Input::Decoded { img, stats, decode })
     }
@@ -458,7 +470,7 @@ impl WorkerCtx {
             _ => (eng.spec, eng.spec.preprocessor()),
         };
         let mut pre = pre;
-        let keep = meta.live.save_image_path.is_some();
+        let keep = (meta.live.save_image_path.is_some() && !meta.verify_crop) || may_verify(meta);
         // This model's own modes (the sender's scene statistics, its original frame).
         let modes = meta.live.preprocess;
         let tensors = prep.tensors();
@@ -496,8 +508,9 @@ impl WorkerCtx {
             // Day frame, or already too late (answered as a drop in its turn).
             Some(img) if scene != Scene::Day && !late => img,
             img => {
-                // Kept for routing only: drop it unless this model saves images.
-                prepared.img = img.filter(|_| meta.live.save_image_path.is_some());
+                // Kept for routing only: drop it unless this model saves or verifies.
+                prepared.img =
+                    img.filter(|_| meta.live.save_image_path.is_some() || may_verify(&meta));
                 return Some(Job {
                     meta,
                     stage: Stage::Ready(prepared),
@@ -534,6 +547,7 @@ impl WorkerCtx {
             decode: prepared.decode,
             reply,
             from: self.cfg.name.clone(),
+            purpose: Purpose::NightModel,
         };
         let (back, reason) = match target
             .sender
@@ -575,6 +589,7 @@ impl WorkerCtx {
             budget,
             forwardable: false,
             routed_from: None,
+            verify_crop: false,
         };
         Some(self.fall_back(meta, prepared, d.img, &night, reason))
     }
@@ -622,7 +637,7 @@ impl WorkerCtx {
                 fallback_text(reason)
             );
         }
-        if meta.live.save_image_path.is_some() {
+        if meta.live.save_image_path.is_some() || may_verify(&meta) {
             prepared.img = Some(img);
         }
         Job {
@@ -1140,7 +1155,10 @@ impl WorkerCtx {
         dets
     }
 
-    /// Collect `slot`'s finished inference, postprocess on this thread and reply.
+    /// Collect `slot`'s finished inference, postprocess on this thread and reply. A request
+    /// with verifier candidates is handed to the verify lane instead ([`super::verify`]),
+    /// which replies once the verifier answered (or the request's deadline passed): this
+    /// thread never waits for another model.
     fn finish(&self, eng: &mut Engine, slot: usize, f: InFlight) {
         let name = &self.cfg.name;
         let infer_d = f
@@ -1170,12 +1188,23 @@ impl WorkerCtx {
         }
         let mut degenerate = false;
         let scene = f.stats.scene();
+        let crop = f.meta.verify_crop;
         let mut suppressed = SuppressCounts::default();
         let result = collected.and_then(|outs| {
             degenerate = outputs_degenerate(&outs);
             let dets = eng.family.postprocess(&outs, &f.ctx, &params);
             eng.backend.recycle(slot, outs);
-            let dets = self.filter_detections(dets?, &f, scene, &live, &mut suppressed);
+            let dets = dets?;
+            if crop {
+                // A verifier check: the raw detections in the crop (see `Purpose::Verify`).
+                return Ok(crate::model::to_predictions(
+                    &dets,
+                    &f.ctx,
+                    &self.cfg.classes,
+                    None,
+                ));
+            }
+            let dets = self.filter_detections(dets, &f, scene, &live, &mut suppressed);
             let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
             Ok(crate::model::to_predictions(
                 &dets,
@@ -1188,53 +1217,38 @@ impl WorkerCtx {
         self.note_health(eng, result.as_ref().err(), degenerate);
         let post_d = t.elapsed();
         let process_d = f.decode + f.preprocess + infer_d + post_d;
-        let round_trip = f.meta.enqueued.elapsed();
+        let line = DoneLine {
+            model: name.clone(),
+            device: eng.device.clone(),
+            request_id: f.meta.request_id.clone(),
+            routed_from: f.meta.routed_from.clone(),
+            verify_crop: crop,
+            image: f.meta.image_name.clone(),
+            size: format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
+            scene,
+            luma: f64::from(f.stats.mean_luma),
+            chroma: f64::from(f.stats.chroma_spread.min(f.stats.tint_spread)),
+            suppressed: suppressed_summary(&suppressed),
+            slot,
+            queue_ms: millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
+            decode_ms: f.decode.as_secs_f64() * 1e3,
+            preprocess_ms: f.preprocess.as_secs_f64() * 1e3,
+            inference_ms: infer_d.as_secs_f64() * 1e3,
+            postprocess_ms: post_d.as_secs_f64() * 1e3,
+            process: process_d,
+            enqueued: f.meta.enqueued,
+        };
+        let InFlight {
+            meta,
+            img,
+            ctx,
+            stats,
+            ..
+        } = f;
         let resp = match result {
             Ok(predictions) => {
                 self.metrics.inference_ms.record(millis_u64(infer_d));
-                self.metrics.process_ms.record(millis_u64(process_d));
-                // The one log line per detection (structured fields only).
-                debug!(
-                    model = %name,
-                    device = %eng.device,
-                    request_id = %f.meta.request_id,
-                    routed_from = f.meta.routed_from.as_deref(),
-                    image = %f.meta.image_name,
-                    size = %format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
-                    scene = %scene,
-                    luma = f64::from(f.stats.mean_luma),
-                    chroma = f64::from(f.stats.chroma_spread.min(f.stats.tint_spread)),
-                    count = predictions.len(),
-                    suppressed = %suppressed_summary(&suppressed),
-                    detections = %detections_summary(&predictions),
-                    slot,
-                    queue_ms = millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
-                    decode_ms = f.decode.as_secs_f64() * 1e3,
-                    preprocess_ms = f.preprocess.as_secs_f64() * 1e3,
-                    inference_ms = infer_d.as_secs_f64() * 1e3,
-                    postprocess_ms = post_d.as_secs_f64() * 1e3,
-                    process_ms = process_d.as_secs_f64() * 1e3,
-                    round_trip_ms = round_trip.as_secs_f64() * 1e3,
-                    "detection done"
-                );
-                if let (Some(dir), Some(img)) = (&live.save_image_path, &f.img) {
-                    let file_name =
-                        if f.meta.image_name.is_empty() || f.meta.image_name == "image.jpg" {
-                            format!("{}.jpg", uuid::Uuid::new_v4())
-                        } else {
-                            f.meta.image_name.clone()
-                        };
-                    if let Err(e) = crate::image::save_annotated(
-                        dir,
-                        &file_name,
-                        img,
-                        &predictions,
-                        live.save_ref_image,
-                    ) {
-                        warn!(model = %name, "could not save annotated image: {e:#}");
-                    }
-                }
-                VisionDetectionResponse {
+                let resp = VisionDetectionResponse {
                     success: true,
                     message: format!("Found {} objects", predictions.len()),
                     error: None,
@@ -1247,17 +1261,55 @@ impl WorkerCtx {
                     inferenceMs: ms(infer_d),
                     processMs: ms(process_d),
                     analysisRoundTripMs: 0,
+                };
+                let plan = match (&live.verify, may_verify(&meta)) {
+                    (Some(cfg), true) => {
+                        crate::verify::plan(&resp.predictions, ctx.orig_w, ctx.orig_h, scene, cfg)
+                    }
+                    _ => crate::verify::Plan::default(),
+                };
+                if !plan.is_empty() {
+                    let deadline = meta.enqueued + meta.timeout();
+                    let pending = Box::new(Pending {
+                        reply: meta.reply,
+                        resp,
+                        img,
+                        stats,
+                        plan,
+                        live,
+                        request_id: meta.request_id,
+                        image_name: meta.image_name,
+                        enqueued: meta.enqueued,
+                        deadline,
+                        handed_off: Instant::now(),
+                        line,
+                    });
+                    self.hand_off(pending);
+                    return;
                 }
+                self.metrics.process_ms.record(millis_u64(process_d));
+                line.emit(&resp.predictions, None);
+                if !crop && let (Some(dir), Some(img)) = (&live.save_image_path, &img) {
+                    save_annotated(
+                        name,
+                        dir,
+                        &meta.image_name,
+                        img,
+                        &resp.predictions,
+                        live.save_ref_image,
+                    );
+                }
+                resp
             }
             Err(e) => {
                 warn!(
                     model = %name,
                     device = %eng.device,
-                    request_id = %f.meta.request_id,
-                    image = %f.meta.image_name,
+                    request_id = %meta.request_id,
+                    image = %meta.image_name,
                     inference_ms = infer_d.as_secs_f64() * 1e3,
                     process_ms = process_d.as_secs_f64() * 1e3,
-                    round_trip_ms = round_trip.as_secs_f64() * 1e3,
+                    round_trip_ms = meta.enqueued.elapsed().as_secs_f64() * 1e3,
                     "detection failed: {e:#}"
                 );
                 let mut r = self.error_response(format!("{e:#}"), ms(infer_d), ms(process_d));
@@ -1265,7 +1317,130 @@ impl WorkerCtx {
                 r
             }
         };
-        self.reply(f.meta, resp);
+        self.reply(meta, resp);
+    }
+
+    /// Give a request with verifier candidates to the verify lane (started on first use). If
+    /// the lane cannot run, the request is answered here with its candidates unverified.
+    fn hand_off(&self, pending: Box<Pending>) {
+        let mut lane = self.verify_lane.borrow_mut();
+        if lane.is_none() {
+            match Lane::spawn(LaneCtx {
+                name: self.cfg.name.clone(),
+                metrics: self.metrics.clone(),
+                peers: self.cfg.peers.clone(),
+            }) {
+                Ok(l) => *lane = Some(l),
+                Err(e) => warn!(
+                    model = %self.cfg.name,
+                    "could not start the verifier thread ({e}); answering unverified"
+                ),
+            }
+        }
+        let pending = match lane.as_ref() {
+            Some(l) => match l.submit(pending) {
+                Ok(()) => return,
+                Err(p) => p,
+            },
+            None => pending,
+        };
+        super::verify::complete_unverified(
+            &LaneCtx {
+                name: self.cfg.name.clone(),
+                metrics: self.metrics.clone(),
+                peers: self.cfg.peers.clone(),
+            },
+            pending,
+            super::verify::Failure::Stopped,
+        );
+    }
+}
+
+/// Save `img` annotated with `predictions` under `dir` (a warning on failure).
+pub(super) fn save_annotated(
+    model: &str,
+    dir: &std::path::Path,
+    image_name: &str,
+    img: &crate::image::RgbImage,
+    predictions: &[crate::api::Prediction],
+    save_ref_image: bool,
+) {
+    let file_name = if image_name.is_empty() || image_name == "image.jpg" {
+        format!("{}.jpg", uuid::Uuid::new_v4())
+    } else {
+        image_name.to_string()
+    };
+    if let Err(e) = crate::image::save_annotated(dir, &file_name, img, predictions, save_ref_image)
+    {
+        warn!(model = %model, "could not save annotated image: {e:#}");
+    }
+}
+
+/// The one debug line per detection ("detection done"), built in `finish` and written there or,
+/// for a verified request, by the verify lane with the verifier's outcome.
+#[derive(Debug)]
+pub(super) struct DoneLine {
+    pub(super) model: String,
+    pub(super) device: String,
+    pub(super) request_id: String,
+    pub(super) routed_from: Option<String>,
+    pub(super) verify_crop: bool,
+    pub(super) image: String,
+    pub(super) size: String,
+    pub(super) scene: Scene,
+    pub(super) luma: f64,
+    pub(super) chroma: f64,
+    pub(super) suppressed: String,
+    pub(super) slot: usize,
+    pub(super) queue_ms: u64,
+    pub(super) decode_ms: f64,
+    pub(super) preprocess_ms: f64,
+    pub(super) inference_ms: f64,
+    pub(super) postprocess_ms: f64,
+    /// Decode + preprocess + inference + postprocess (the verifier's time is added by the lane).
+    pub(super) process: Duration,
+    pub(super) enqueued: Instant,
+}
+
+/// The verifier part of a [`DoneLine`].
+#[derive(Debug)]
+pub(super) struct VerifyLog {
+    pub(super) verifier: String,
+    pub(super) ms: f64,
+    /// "kept 1, rejected 2" (and the failure, e.g. "unverified 1 (timeout)").
+    pub(super) outcome: String,
+}
+
+impl DoneLine {
+    pub(super) fn emit(&self, predictions: &[crate::api::Prediction], verify: Option<&VerifyLog>) {
+        let process = self.process.as_secs_f64() * 1e3 + verify.map_or(0.0, |v| v.ms);
+        debug!(
+            model = %self.model,
+            device = %self.device,
+            request_id = %self.request_id,
+            routed_from = self.routed_from.as_deref(),
+            verify_crop = self.verify_crop.then_some(true),
+            image = %self.image,
+            size = %self.size,
+            scene = %self.scene,
+            luma = self.luma,
+            chroma = self.chroma,
+            count = predictions.len(),
+            suppressed = %self.suppressed,
+            detections = %detections_summary(predictions),
+            verifier = verify.map(|v| v.verifier.as_str()),
+            verify = verify.map(|v| v.outcome.as_str()),
+            verify_ms = verify.map(|v| v.ms),
+            slot = self.slot,
+            queue_ms = self.queue_ms,
+            decode_ms = self.decode_ms,
+            preprocess_ms = self.preprocess_ms,
+            inference_ms = self.inference_ms,
+            postprocess_ms = self.postprocess_ms,
+            process_ms = process,
+            round_trip_ms = self.enqueued.elapsed().as_secs_f64() * 1e3,
+            "detection done"
+        );
     }
 }
 
@@ -1283,6 +1458,12 @@ enum Input {
 /// from the HTTP layer and was not tried yet).
 fn may_route(meta: &Meta) -> bool {
     meta.forwardable && meta.live.night_model.is_some()
+}
+
+/// True when `meta`'s answer may go through the verifier cascade (`verify` is set and it is
+/// not itself a verifier check); whether it does depends on the scene and the candidates.
+pub(super) fn may_verify(meta: &Meta) -> bool {
+    !meta.verify_crop && meta.live.verify.is_some()
 }
 
 /// "not served", "not ready", ... for the fallback warning.

@@ -109,7 +109,7 @@
   <form method="post" action="/config#at-models" id="models-json-form">
   <textarea name="models_json" rows="14" spellcheck="false">{{ c.models_json }}</textarea>
   <p class="muted">Merged per model and field with changes made elsewhere (the Models card, Benchmark apply). Each entry: <code>path</code> (required), <code>family</code>, <code>name</code>, <code>classes</code>, <code>device</code>,
-  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>, <code>night_model</code>.</p>
+  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>).</p>
   <div class="actions"><button type="submit">Save models JSON</button> <span class="form-msg" aria-live="polite"></span></div>
   </form>
 </details>

@@ -390,6 +390,10 @@ pub struct ModelConfig {
     /// the night model is not served or not ready. Applies at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub night_model: Option<String>,
+    /// Verifier cascade ([`crate::verify`]): another configured model checks this model's
+    /// candidate boxes; None = the global `verify`. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::verify::VerifyConfig>,
 }
 
 impl Default for ModelConfig {
@@ -416,6 +420,7 @@ impl Default for ModelConfig {
             preprocess: None,
             night_preprocess: None,
             night_model: None,
+            verify: None,
         }
     }
 }
@@ -527,6 +532,10 @@ pub struct Config {
     /// Applies at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub night_preprocess: Option<Preprocess>,
+    /// Verifier cascade for every model without its own `verify` ([`crate::verify`]); the
+    /// verifier model itself is never verified. None = off. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::verify::VerifyConfig>,
     pub log_level: LogLevel,
     /// Directory of the daily rolling log files (None = stdout only). Relative paths resolve
     /// against the exe dir. Process restart.
@@ -710,6 +719,7 @@ impl Default for Config {
             static_suppression: StaticSuppression::default(),
             preprocess: None,
             night_preprocess: None,
+            verify: None,
             log_level: LogLevel::Info,
             log_path: None,
             log_format: LogFormat::Text,
@@ -1112,7 +1122,59 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
             },
         )?;
     }
-    validate_night_models(models)
+    validate_night_models(models)?;
+    for m in models {
+        if let Some(v) = &m.verify {
+            let key = crate::registry::normalize_name(&m.effective_name());
+            let field = format!("models: '{key}' verify");
+            v.validate(&field)?;
+            if v.enabled && crate::registry::normalize_name(&v.model) == key {
+                anyhow::bail!(
+                    "{field}.model: names the model itself; name another configured model (one \
+                     that makes different mistakes, e.g. another family) or remove `verify`"
+                );
+            }
+            check_verify_model(&field, v, models)?;
+        }
+    }
+    Ok(())
+}
+
+/// The global `verify`: ranges and a configured `model`.
+pub fn validate_verify(
+    v: Option<&crate::verify::VerifyConfig>,
+    models: &[ModelConfig],
+) -> Result<()> {
+    let Some(v) = v else {
+        return Ok(());
+    };
+    v.validate("verify")?;
+    check_verify_model("verify", v, models)
+}
+
+/// An enabled `verify` names a configured model (enabled or not: a disabled or unloaded
+/// verifier leaves the candidates unverified).
+fn check_verify_model(
+    field: &str,
+    v: &crate::verify::VerifyConfig,
+    models: &[ModelConfig],
+) -> Result<()> {
+    use crate::registry::normalize_name;
+    if !v.enabled {
+        return Ok(());
+    }
+    let key = normalize_name(&v.model);
+    if !models
+        .iter()
+        .any(|m| normalize_name(&m.effective_name()) == key)
+    {
+        anyhow::bail!(
+            "{field}.model: '{}' is not a configured model; add it to `models` first, or fix the \
+             name (see the Models card)",
+            v.model
+        );
+    }
+    Ok(())
 }
 
 /// `night_model` of every entry names another entry (any, enabled or not: a disabled night
@@ -1303,6 +1365,7 @@ impl Config {
             },
         )?;
         validate_model_entries(&self.models)?;
+        validate_verify(self.verify.as_ref(), &self.models)?;
         let b = &self.benchmark;
         check_range("benchmark.warmup", b.warmup, 0, MAX_BENCH_ITERATIONS)?;
         check_range(
@@ -2575,6 +2638,7 @@ mod tests {
         let model = ModelConfig {
             inflight: Some(1),
             night_model: Some("night".into()),
+            verify: Some(crate::verify::VerifyConfig::with_model("night")),
             ..night_rules_model()
         };
         let model_keys = keys(serde_json::to_value(model).unwrap());
@@ -2611,6 +2675,7 @@ mod tests {
             },
             preprocess: Some(Preprocess::Gamma(0.8)),
             night_preprocess: Some(Preprocess::CLAHE),
+            verify: Some(crate::verify::VerifyConfig::with_model("m")),
             models: vec![night_rules_model()],
             ..Config::default()
         }
@@ -2655,6 +2720,7 @@ mod tests {
             "static_suppression",
             "\"preprocess\"",
             "night_preprocess",
+            "verify",
         ] {
             assert!(!text.contains(key), "{key} written by default: {text}");
         }
@@ -2690,6 +2756,123 @@ mod tests {
         let c: Config = serde_json::from_str(r#"{"static_suppression":{"enabled":true}}"#).unwrap();
         assert!(c.static_suppression.enabled);
         assert_eq!(c.static_suppression.hits, 5);
+    }
+
+    #[test]
+    fn validate_verify_references() {
+        use crate::verify::VerifyConfig;
+        let entry = |name: &str, verify: Option<VerifyConfig>| ModelConfig {
+            name: Some(name.into()),
+            path: format!("{name}.onnx").into(),
+            verify,
+            ..Default::default()
+        };
+        let check = |c: Config| c.validate().map_err(|e| format!("{e:#}"));
+        let v = |m: &str| Some(VerifyConfig::with_model(m));
+        let ok = Config {
+            models: vec![entry("a", v("B.onnx")), entry("b", None)],
+            ..Config::default()
+        };
+        check(ok.clone()).unwrap();
+        // Unknown, itself, out of range.
+        let e = check(Config {
+            models: vec![entry("a", v("c")), entry("b", None)],
+            ..Config::default()
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("'a' verify.model: 'c' is not a configured model"),
+            "{e}"
+        );
+        let e = check(Config {
+            models: vec![entry("a", v("A"))],
+            ..Config::default()
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("'a' verify.model: names the model itself"),
+            "{e}"
+        );
+        let bad = VerifyConfig {
+            max_crops: 0,
+            ..VerifyConfig::with_model("b")
+        };
+        let e = check(Config {
+            models: vec![entry("a", Some(bad)), entry("b", None)],
+            ..Config::default()
+        })
+        .unwrap_err();
+        assert!(e.contains("models: 'a' verify.max_crops"), "{e}");
+        // A disabled entry is not checked; verifiers may verify each other (checks never
+        // cascade).
+        let off = VerifyConfig {
+            enabled: false,
+            ..VerifyConfig::default()
+        };
+        check(Config {
+            models: vec![
+                entry("a", Some(off)),
+                entry("b", v("a")),
+                entry("c", v("a")),
+            ],
+            ..ok.clone()
+        })
+        .unwrap();
+        check(Config {
+            models: vec![entry("a", v("b")), entry("b", v("a"))],
+            ..Config::default()
+        })
+        .unwrap();
+        // The global default names a configured model (it never verifies that model itself).
+        check(Config {
+            verify: v("b"),
+            ..ok.clone()
+        })
+        .unwrap();
+        let e = check(Config {
+            verify: v("zzz"),
+            ..ok.clone()
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("verify.model: 'zzz' is not a configured model"),
+            "{e}"
+        );
+        let e = check(Config {
+            verify: Some(VerifyConfig {
+                pad: -1.0,
+                ..VerifyConfig::with_model("b")
+            }),
+            ..ok
+        })
+        .unwrap_err();
+        assert!(e.starts_with("verify.pad"), "{e}");
+    }
+
+    #[test]
+    fn verify_round_trips_and_resolves_per_model() {
+        use crate::verify::VerifyConfig;
+        let text = r#"{"verify":{"model":"b","aliases":{"vehicle":"car"}},"models":[
+            {"name":"a","path":"a.onnx"},
+            {"name":"b","path":"b.onnx"},
+            {"name":"c","path":"c.onnx","verify":{"enabled":false}},
+            {"name":"d","path":"d.onnx","verify":{"model":"a","mode":"frame","night_only":false}}]}"#;
+        let c: Config = serde_json::from_str(text).unwrap();
+        c.validate().unwrap();
+        let back: Config = serde_json::from_str(&c.saved_text().unwrap()).unwrap();
+        assert_eq!(back, c);
+        let live = |i: usize| crate::worker::verify_settings(&c, &c.models[i]);
+        let a = live(0).unwrap();
+        assert_eq!(a.model, "b");
+        assert_eq!(a.aliases.get("vehicle").map(String::as_str), Some("car"));
+        assert_eq!(live(1), None, "the verifier is never verified by itself");
+        assert_eq!(live(2), None, "turned off for this model");
+        let d = live(3).unwrap();
+        assert_eq!(
+            (d.model.as_str(), d.mode, d.night_only),
+            ("a", crate::verify::VerifyMode::Frame, false)
+        );
+        assert_eq!(d.labels, VerifyConfig::default().labels);
     }
 
     #[test]

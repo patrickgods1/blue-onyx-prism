@@ -82,16 +82,19 @@ pub enum SuppressReason {
     Overlap,
     /// Static-box memory ([`crate::static_memory`]), counted by the worker.
     Static,
+    /// Rejected by the verifier model ([`crate::verify`]), counted by the worker.
+    Verify,
 }
 
 impl SuppressReason {
-    pub const ALL: [SuppressReason; 6] = [
+    pub const ALL: [SuppressReason; 7] = [
         SuppressReason::NightThreshold,
         SuppressReason::LabelThreshold,
         SuppressReason::Aspect,
         SuppressReason::MinArea,
         SuppressReason::Overlap,
         SuppressReason::Static,
+        SuppressReason::Verify,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -102,6 +105,7 @@ impl SuppressReason {
             SuppressReason::MinArea => "min_area",
             SuppressReason::Overlap => "overlap",
             SuppressReason::Static => "static",
+            SuppressReason::Verify => "verify",
         }
     }
 }

@@ -47,6 +47,7 @@ mod pipeline;
 mod run;
 #[cfg(test)]
 mod run_tests;
+mod verify;
 mod watch;
 
 use run::WorkerCtx;
@@ -103,10 +104,10 @@ impl From<tokio::sync::oneshot::Sender<VisionDetectionResponse>> for Reply {
 }
 
 /// A request handed from one worker to another with its image already decoded: the night
-/// model switch (an IR / dark frame goes to the model's `night_model`) and, later, crops sent
-/// to a verifier model. The receiving worker preprocesses `img` for its own model, runs it with
-/// its own live settings (threshold, filters, object filter) and the scene of `stats`, and
-/// answers `reply` in its own request order. Never forwarded again.
+/// model switch (an IR / dark frame goes to the model's `night_model`) and the crops (or frame)
+/// sent to a verifier model ([`Purpose`]). The receiving worker preprocesses `img` for its own
+/// model, runs it with its own live settings and the scene of `stats`, and answers `reply` in
+/// its own request order. Never forwarded again.
 #[derive(Debug)]
 pub struct Decoded {
     pub img: crate::image::RgbImage,
@@ -126,6 +127,19 @@ pub struct Decoded {
     pub reply: Reply,
     /// Name of the forwarding model (for the log).
     pub from: String,
+    pub purpose: Purpose,
+}
+
+/// Why a [`Decoded`] request was handed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// The night model switch: the receiver answers the client like the sender would (its own
+    /// threshold, night rules, object filter, image saving and verifier).
+    NightModel,
+    /// A verifier-cascade check ([`crate::verify`]): the receiver reports its raw detections
+    /// at `min_confidence` (no night rules, static memory, object filter, image saving or
+    /// verifier of its own), in the coordinates of `img`.
+    Verify,
 }
 
 /// The served workers of a registry generation by normalized name, for workers that forward
@@ -231,6 +245,9 @@ pub struct LiveSettings {
     pub preprocess: crate::model::enhance::PreprocessModes,
     /// Served model that night / IR frames are forwarded to (`night_model`); None = run here.
     pub night_model: Option<String>,
+    /// Verifier cascade (`verify`, the model's own over the global one; None = off, and
+    /// always None for the verifier model itself).
+    pub verify: Option<crate::verify::VerifyConfig>,
 }
 
 impl LiveSettings {
@@ -261,6 +278,7 @@ impl LiveSettings {
                 .map(str::trim)
                 .filter(|n| !n.is_empty())
                 .map(str::to_string),
+            verify: verify_settings(config, m),
         }
     }
 
@@ -268,6 +286,17 @@ impl LiveSettings {
     pub fn shared(self) -> Arc<ArcSwap<LiveSettings>> {
         Arc::new(ArcSwap::from_pointee(self))
     }
+}
+
+/// The verifier settings of model `m`: its own `verify` over the global one; None when off,
+/// without a model, or naming `m` itself (the global default never makes a model verify
+/// itself).
+pub fn verify_settings(config: &Config, m: &ModelConfig) -> Option<crate::verify::VerifyConfig> {
+    use crate::registry::normalize_name;
+    let v = m.verify.as_ref().or(config.verify.as_ref())?;
+    let target = normalize_name(v.model.trim());
+    (v.enabled && !v.model.trim().is_empty() && target != normalize_name(&m.effective_name()))
+        .then(|| v.clone())
 }
 
 /// The night / IR rules of model `m`: its own values over the global ones; the label maps are
@@ -723,6 +752,7 @@ pub fn spawn_worker_after(
         consecutive_degenerate: std::cell::Cell::new(0),
         static_memory: std::cell::RefCell::new(crate::static_memory::StaticMemory::new()),
         decoded_pre: std::cell::RefCell::new(None),
+        verify_lane: std::cell::RefCell::new(None),
     };
     let name = cfg.name.clone();
     let join = std::thread::Builder::new()

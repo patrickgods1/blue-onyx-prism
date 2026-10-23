@@ -1028,22 +1028,86 @@ mod tests {
                 assert!(p.size > 0);
             }
             assert!(!r.is_large(), "{name}");
+            let mdv6 = name.starts_with("mdv6-");
+            let exdark = name.starts_with("exdark-");
+            assert_eq!(
+                export_class_count(r),
+                if mdv6 {
+                    3
+                } else if exdark {
+                    12
+                } else {
+                    80
+                },
+                "{name}"
+            );
+            if mdv6 {
+                assert_eq!(export_class_names(r), Some(&MDV6_CLASSES[..]));
+                let url = r.parts[0].url;
+                assert!(url.starts_with("https://zenodo.org/records/"), "{url}");
+                assert!(url.contains("/15398270/files/MDV6-"), "{url}");
+                assert_eq!(export_input_size(r), 640);
+            }
             match recipe {
                 ExportRecipe::Ultralytics => {
                     assert_eq!(r.parts.len(), 1);
-                    assert_eq!(r.parts[0].file_name, format!("{name}.pt"));
-                    assert_eq!(r.version, ULTRALYTICS_EXPORT_VERSION);
                     assert_eq!(r.license, ULTRALYTICS_LICENSE);
                     // End-to-end heads (v10, 26) vs raw heads with NMS.
-                    let e2e = name.starts_with("yolov10") || name.starts_with("yolo26");
+                    let e2e = ["yolov10", "yolo26", "mdv6-yolov10"]
+                        .iter()
+                        .any(|p| name.starts_with(p));
                     let want = if e2e {
                         ModelFamilyKind::Yolo26
                     } else {
                         ModelFamilyKind::Yolo8
                     };
                     assert_eq!(family, want, "{name}");
-                    assert!(r.parts[0].url.contains(ULTRALYTICS_ASSETS_RELEASE));
-                    assert_eq!(export_input_size(r), 640);
+                    if mdv6 {
+                        assert_eq!(r.version, MDV6_ULTRALYTICS_VERSION);
+                        assert!(r.parts[0].file_name.ends_with(".pt"));
+                    } else {
+                        assert_eq!(r.parts[0].file_name, format!("{name}.pt"));
+                        assert_eq!(r.version, ULTRALYTICS_EXPORT_VERSION);
+                        assert!(r.parts[0].url.contains(ULTRALYTICS_ASSETS_RELEASE));
+                        assert_eq!(export_input_size(r), 640);
+                    }
+                }
+                ExportRecipe::RtDetrV2 => {
+                    assert!(mdv6, "{name}");
+                    assert_eq!(family, ModelFamilyKind::RtDetr);
+                    assert_eq!(r.version, MDV6_RTDETR_VERSION);
+                    assert!(r.version.contains(&DEIMV2_COMMIT[..7]));
+                    assert_eq!(r.parts.len(), 1);
+                    assert!(r.parts[0].file_name.ends_with(".pth"));
+                    assert_eq!(r.license, "Apache-2.0");
+                    assert_eq!(export_extras(r), [deimv2_source().unwrap()]);
+                    assert!(recipe.takes_file() && recipe.needs_deimv2_source());
+                }
+                ExportRecipe::RfDetr if exdark => {
+                    assert_eq!(family, ModelFamilyKind::RfDetr);
+                    assert!(r.version.contains(TRANSFORMERS_VERSION));
+                    assert_eq!(export_class_names(r), Some(&EXDARK_CLASSES[..]));
+                    let files: Vec<_> = r.parts.iter().map(|p| p.file_name).collect();
+                    assert_eq!(files, ["checkpoint_best_total.pth", "config.json"]);
+                    for p in r.parts {
+                        assert!(p.url.contains("huggingface.co/dronefreak/exdark-rfdetr-"));
+                        // Pinned to a commit, not a branch.
+                        assert!(!p.url.contains("/resolve/main/"), "{}", p.url);
+                        assert!(r.version.ends_with(p.url.split('/').nth(6).unwrap()));
+                    }
+                    assert!(r.license.starts_with("Non-commercial"), "{name}");
+                    let want = if name.ends_with("nano") { 384 } else { 512 };
+                    assert_eq!(export_input_size(r), want);
+                    // Every ExDark class has a COCO spelling.
+                    let coco = crate::model::classes::coco80();
+                    for c in EXDARK_CLASSES {
+                        let c = crate::benchmark::metrics::canonical_label(c);
+                        assert!(
+                            coco.iter()
+                                .any(|n| crate::benchmark::metrics::canonical_label(n) == c),
+                            "{c}"
+                        );
+                    }
                 }
                 ExportRecipe::RfDetr => {
                     assert_eq!(family, ModelFamilyKind::RfDetr);
@@ -1062,7 +1126,7 @@ mod tests {
                 }
             }
             let files: Vec<_> = r.parts.iter().map(|p| p.file_name).collect();
-            if recipe != ExportRecipe::Ultralytics {
+            if !recipe.takes_file() && !exdark {
                 assert_eq!(files, ["model.safetensors", "config.json"], "{name}");
                 if recipe == ExportRecipe::DeimV2 {
                     assert!(r.license.starts_with("Non-commercial"), "{name}");
@@ -1113,10 +1177,15 @@ mod tests {
             "deimv2-m",
             "deimv2-l",
             "deimv2-x",
+            "mdv6-rtdetr-c",
+            "mdv6-yolov9-c",
+            "mdv6-yolov10-c",
+            "exdark-rfdetr-small",
+            "exdark-rfdetr-nano",
         ] {
             assert!(names.contains(n), "{n}");
         }
-        assert_eq!(names.len(), 40);
+        assert_eq!(names.len(), 45);
         assert_eq!(export_model("YOLOV8N.onnx").unwrap().id, "model:yolov8n");
         assert_eq!(
             find("model:deimv2-s", "linux", "x86_64").unwrap().id,

@@ -231,6 +231,10 @@ pub struct ModelMetrics {
     night_fallback: [AtomicU64; RouteFallback::ALL.len()],
     /// Throttle of the "night model unavailable" warning.
     pub night_fallback_log: LogThrottle,
+    /// Verifier-cascade candidates per [`crate::verify::Outcome`] (`verify_total{outcome}`).
+    verify: [AtomicU64; crate::verify::Outcome::ALL.len()],
+    /// Throttle of the "verifier unavailable / late" warning.
+    pub verify_log: LogThrottle,
     pub inference_ms: Histogram,
     pub process_ms: Histogram,
     pub round_trip_ms: Histogram,
@@ -261,6 +265,8 @@ impl ModelMetrics {
             night_routed: AtomicU64::new(0),
             night_fallback: std::array::from_fn(|_| AtomicU64::new(0)),
             night_fallback_log: LogThrottle::default(),
+            verify: std::array::from_fn(|_| AtomicU64::new(0)),
+            verify_log: LogThrottle::default(),
             inference_ms: Histogram::new(),
             process_ms: Histogram::new(),
             round_trip_ms: Histogram::new(),
@@ -306,6 +312,24 @@ impl ModelMetrics {
     pub fn suppressed(&self, reason: SuppressReason) -> u64 {
         self.suppressed
             .get(reason as usize)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+
+    /// Add one request's verifier-cascade outcomes.
+    pub fn record_verify(&self, counts: &crate::verify::Counts) {
+        for (i, o) in crate::verify::Outcome::ALL.into_iter().enumerate() {
+            if let Some(c) = self.verify.get(i) {
+                c.fetch_add(u64::from(counts.get(o)), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Verifier-cascade candidates with outcome `o` so far.
+    pub fn verified(&self, o: crate::verify::Outcome) -> u64 {
+        crate::verify::Outcome::ALL
+            .iter()
+            .position(|x| *x == o)
+            .and_then(|i| self.verify.get(i))
             .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
@@ -766,7 +790,7 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
 
     let _ = writeln!(
         out,
-        "# HELP {PREFIX}detections_suppressed_total Detections removed by the night / IR rules, by reason (night_threshold|label_threshold|aspect|min_area|overlap|static)."
+        "# HELP {PREFIX}detections_suppressed_total Detections removed by the night / IR rules and the verifier, by reason (night_threshold|label_threshold|aspect|min_area|overlap|static|verify)."
     );
     let _ = writeln!(out, "# TYPE {PREFIX}detections_suppressed_total counter");
     for mm in &models {
@@ -807,6 +831,23 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
                 escape_label(&mm.name),
                 reason.as_str(),
                 mm.night_fallback(reason)
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}verify_total Candidate boxes checked by the model's verifier (verify), by outcome (kept|rejected|unverified; unverified = the verifier was unavailable, busy, late or failed, or over max_crops, and the box was kept)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}verify_total counter");
+    for mm in &models {
+        for o in crate::verify::Outcome::ALL {
+            let _ = writeln!(
+                out,
+                "{PREFIX}verify_total{{model=\"{}\",outcome=\"{}\"}} {}",
+                escape_label(&mm.name),
+                o.as_str(),
+                mm.verified(o)
             );
         }
     }
@@ -952,6 +993,35 @@ mod tests {
         assert_eq!(t.allow(5 + iv), Some(2));
         assert_eq!(t.allow(5 + iv + 1), None);
         assert_eq!(t.allow(5 + 3 * iv), Some(1));
+    }
+
+    #[test]
+    fn prometheus_verify_outcomes() {
+        use crate::verify::{Counts, Outcome};
+        let m = Metrics::new("0");
+        let mm = m.model("a");
+        mm.record_verify(&Counts {
+            kept: 2,
+            rejected: 1,
+            unverified: 0,
+        });
+        mm.record_verify(&Counts {
+            kept: 0,
+            rejected: 1,
+            unverified: 3,
+        });
+        assert_eq!(mm.verified(Outcome::Kept), 2);
+        assert_eq!(mm.verified(Outcome::Rejected), 2);
+        assert_eq!(mm.verified(Outcome::Unverified), 3);
+        let text = render_prometheus(&m, &[]);
+        assert!(text.contains("# TYPE blue_onyx_prism_verify_total counter"));
+        assert!(text.contains("blue_onyx_prism_verify_total{model=\"a\",outcome=\"rejected\"} 2"));
+        assert!(
+            text.contains("blue_onyx_prism_verify_total{model=\"a\",outcome=\"unverified\"} 3")
+        );
+        assert!(text.contains(
+            "blue_onyx_prism_detections_suppressed_total{model=\"a\",reason=\"verify\"} 0"
+        ));
     }
 
     #[test]

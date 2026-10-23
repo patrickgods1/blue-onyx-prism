@@ -1087,15 +1087,27 @@ fn yolo26_exports_and_uv_are_pinned() {
             continue;
         }
         assert_eq!(r.license, "AGPL-3.0");
-        assert_eq!(r.version, catalog::ULTRALYTICS_EXPORT_VERSION);
         assert!(r.platform.is_none());
         assert_eq!(r.parts.len(), 1);
         let p = &r.parts[0];
-        assert_eq!(
-            p.url,
-            format!("https://github.com/ultralytics/assets/releases/download/v8.4.0/{name}.pt")
-        );
-        assert_eq!(p.file_name, format!("{name}.pt"));
+        // MegaDetector v6 (Microsoft's Zenodo record, its own file names) or the Ultralytics
+        // release assets.
+        let mdv6 = name.starts_with("mdv6-");
+        if mdv6 {
+            assert_eq!(r.version, "ultralytics-8.4.163+zenodo-15398270");
+            assert!(p.file_name.starts_with("MDV6-") && p.file_name.ends_with(".pt"));
+            assert_eq!(
+                p.url,
+                format!("https://zenodo.org/records/15398270/files/{}", p.file_name)
+            );
+        } else {
+            assert_eq!(r.version, catalog::ULTRALYTICS_EXPORT_VERSION);
+            assert_eq!(
+                p.url,
+                format!("https://github.com/ultralytics/assets/releases/download/v8.4.0/{name}.pt")
+            );
+            assert_eq!(p.file_name, format!("{name}.pt"));
+        }
         assert_eq!(p.layout, Layout::File);
         assert!(
             p.size > 4_000_000 && p.size < 150_000_000,
@@ -1103,7 +1115,9 @@ fn yolo26_exports_and_uv_are_pinned() {
             p.size
         );
         assert!(!r.is_large(), "the weights alone are small");
-        let e2e = name.starts_with("yolov10") || name.starts_with("yolo26");
+        let e2e = ["yolov10", "yolo26", "mdv6-yolov10"]
+            .iter()
+            .any(|p| name.starts_with(p));
         assert!(
             matches!(
                 r.provides,

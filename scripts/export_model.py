@@ -8,12 +8,25 @@ Recipes (`--recipe`, default: from the model name):
                the others the raw `[1, 84, 8400]` head (family `yolo8`, NMS in the service).
   rfdetr       RF-DETR (Hugging Face transformers `RfDetrForObjectDetection`, safetensors, Apache-2.0)
                to a static `pixel_values [1,3,S,S]` -> `logits [1,300,91]`, `pred_boxes [1,300,4]`
-               graph (family `rfdetr`; ImageNet normalization is done by the service).
+               graph (family `rfdetr`; ImageNet normalization is done by the service). A weights
+               directory with an `rfdetr`-package training checkpoint (`*.pth` + its `config.json`,
+               DetectionBench's `exdark-rfdetr-small` / `-nano`) is loaded into the same transformers
+               class; its YAML lists the fine-tune's own classes in COCO spelling.
   deimv2       DEIMv2 (Intellindust, PyTorchModelHubMixin safetensors + config.json) with the official
                DEIMv2 code (`--source`, a checkout of github.com/Intellindust-AI-Lab/DEIMv2): deploy
                mode, inputs `images [1,3,S,S]` (RGB 0..1; the DINOv3 variants' ImageNet normalization
                is part of the graph) and `orig_target_sizes [1,2]` (int64), outputs `labels`, `boxes`,
                `scores` (family `rtdetr`, labels are COCO-80 indices).
+  rtdetrv2     An RT-DETRv2 training checkpoint (`.pth`, lyuwenyu/RT-DETR layout; MegaDetector v6
+               `MDV6-apa-rtdetr-c`, Apache-2.0) built with the RT-DETRv2 modules of the same DEIMv2
+               source (`--source`; PResNet, HybridEncoder `rt_detrv2`, RTDETRTransformerv2,
+               PostProcessor) and the model's own class list ([`RTDETRV2_MODELS`]): deploy mode,
+               `images [1,3,S,S]` (RGB 0..1, no normalization) + `orig_target_sizes [1,2]` ->
+               `labels`, `boxes`, `scores` (family `rtdetr`).
+
+MegaDetector v6 (Microsoft, classes `animal`, `person`, `vehicle`): `mdv6-yolov9-c` / `mdv6-yolov10-c`
+go through the Ultralytics recipe (AGPL-3.0; 3-class heads `[1, 7, A]` / `[1, 300, 6]`),
+`mdv6-rtdetr-c` through `rtdetrv2`. Their YAML lists the model's own three names.
 
 Usage (inside the project venv, see scripts/requirements-export.txt):
 
@@ -25,6 +38,8 @@ Usage (inside the project venv, see scripts/requirements-export.txt):
     python scripts/export_model.py --name deimv2-s --weights path/to/DEIMv2_DINOv3_S_COCO \\
         --source path/to/DEIMv2
     python scripts/export_model.py --name yolov8n --out-dir C:/BlueOnyx/models
+    python scripts/export_model.py --name mdv6-rtdetr-c --weights MDV6-apa-rtdetr-c.pth \\
+        --source path/to/DEIMv2
 
 Before an export the service runs `python -X faulthandler -u -I export_model.py --self-check --recipe <r>`,
 which only imports the modules the recipe needs and prints their versions (a broken package or a
@@ -65,7 +80,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-RECIPES = ("ultralytics", "rfdetr", "deimv2")
+RECIPES = ("ultralytics", "rfdetr", "deimv2", "rtdetrv2")
 FAMILIES = ("yolo26", "yolo8", "rfdetr", "rtdetr")
 
 # COCO-80 names in the order of the 80-class heads (Ultralytics, DEIMv2) and of the service's
@@ -82,6 +97,21 @@ COCO80 = [
     "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
     "teddy bear", "hair drier", "toothbrush",
 ]
+# MegaDetector v6 classes (PytorchWildlife `CLASS_NAMES`). `vehicle` is MegaDetector's own class
+# (cars, trucks, ATVs, ...), not COCO's `car`.
+MDV6_NAMES = ["animal", "person", "vehicle"]
+# RT-DETRv2 checkpoints of the `rtdetrv2` recipe: the DEIMv2 training config with the same
+# architecture (relative to --source) and the class names of the head. MDV6-apa-rtdetr-c is
+# CameraTraps' `rtdetrv2_r18vd_120e_megadetector.yml`: r18vd, 3 decoder layers, 3 classes, 640.
+RTDETRV2_MODELS = {
+    "mdv6-rtdetr-c": {
+        "config": "configs/deim_rtdetrv2/rtdetrv2_r18vd_120e_coco.yml",
+        "names": MDV6_NAMES,
+        "imgsz": 640,
+    },
+}
+# Class names of RF-DETR fine-tunes in COCO spelling (ExDark: People, Motorbike, Table).
+RFDETR_CLASS_TO_COCO = {"people": "person", "motorbike": "motorcycle", "table": "dining table"}
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -102,12 +132,14 @@ def default_out_dir() -> Path:
 
 def recipe_for(name: str) -> str:
     n = name.lower()
-    if n.startswith("yolo"):
+    if n.startswith(("yolo", "mdv6-yolo")):
         return "ultralytics"
     if n.startswith("rfdetr"):
         return "rfdetr"
     if n.startswith("deimv2"):
         return "deimv2"
+    if n in RTDETRV2_MODELS:
+        return "rtdetrv2"
     fail(f"no recipe for {name!r}; pass --recipe")
     return ""
 
@@ -115,8 +147,8 @@ def recipe_for(name: str) -> str:
 def family_for(name: str, recipe: str) -> str:
     n = name.lower()
     if recipe == "ultralytics":
-        return "yolo26" if n.startswith(("yolov10", "yolo26")) else "yolo8"
-    return {"rfdetr": "rfdetr", "deimv2": "rtdetr"}[recipe]
+        return "yolo26" if n.startswith(("yolov10", "yolo26", "mdv6-yolov10")) else "yolo8"
+    return {"rfdetr": "rfdetr", "deimv2": "rtdetr", "rtdetrv2": "rtdetr"}[recipe]
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,10 +160,12 @@ def parse_args() -> argparse.Namespace:
         "--weights",
         type=Path,
         default=None,
-        help="local weights of one model: the .pt (ultralytics) or the directory with model.safetensors + config.json "
-        "(rfdetr, deimv2); nothing is downloaded when given",
+        help="local weights of one model: the .pt (ultralytics), the .pth or its directory (rtdetrv2) or the directory "
+        "with model.safetensors + config.json (rfdetr, deimv2); nothing is downloaded when given",
     )
-    p.add_argument("--source", type=Path, default=None, help="DEIMv2 source checkout (the directory with engine/)")
+    p.add_argument(
+        "--source", type=Path, default=None, help="DEIMv2 source checkout (the directory with engine/; deimv2, rtdetrv2)"
+    )
     p.add_argument("--imgsz", type=int, default=None, help="square input size (default: 640; RF-DETR L 704; DEIMv2 from config.json)")
     p.add_argument(
         "--out-dir",
@@ -190,15 +224,16 @@ def onnx_ports(path: Path) -> tuple[dict, dict]:
     )
 
 
-def check_ports(name: str, family: str, inputs: dict, outputs: dict, imgsz: int) -> str:
-    """Fail unless the ports are what the service's `family` expects; returns a summary."""
+def check_ports(name: str, family: str, inputs: dict, outputs: dict, imgsz: int, nc: int = len(COCO80)) -> str:
+    """Fail unless the ports are what the service's `family` expects (`nc` classes); returns a
+    summary."""
     shapes = list(outputs.values())
     if family == "yolo26":
         ok = len(shapes) == 1 and len(shapes[0]) == 3 and shapes[0][0] == 1 and shapes[0][2] == 6
         want = "one output [1, N, 6] (NMS-free)"
     elif family == "yolo8":
-        ok = len(shapes) == 1 and shapes[0][:2] == [1, 4 + len(COCO80)] and shapes[0][2] > 4 + len(COCO80)
-        want = f"one output [1, {4 + len(COCO80)}, A]"
+        ok = len(shapes) == 1 and shapes[0][:2] == [1, 4 + nc] and shapes[0][2] > 4 + nc
+        want = f"one output [1, {4 + nc}, A]"
     elif family == "rfdetr":
         lg, bx = outputs.get("logits"), outputs.get("pred_boxes")
         ok = (
@@ -309,9 +344,10 @@ def stamp_coreml_cache_key(path: Path) -> None:
     onnx.save(model, str(path))
 
 
-def write_names(out: Path, name: str, names: list[str]) -> Path:
-    if len(names) != len(COCO80):
-        fail(f"{name}: {len(names)} class names; expected the 80 COCO classes")
+def write_names(out: Path, name: str, names: list[str], nc: int = len(COCO80)) -> Path:
+    """`<name>.yaml` with the `nc` class names of the head, in head order."""
+    if len(names) != nc or not all(isinstance(n, str) and n.strip() for n in names):
+        fail(f"{name}: {len(names)} class names; expected {nc} (the classes of the model's head)")
     path = out / f"{name}.yaml"
     path.write_text("NAMES:\n" + "".join(f"  - {n}\n" for n in names), encoding="utf-8")
     return path
@@ -349,7 +385,7 @@ def ultralytics_model(name: str, args: argparse.Namespace):
     return YOLO(str(weights) if weights.exists() else f"{name}.pt")
 
 
-def top_detection_scores(a, k: int = 20):
+def top_detection_scores(a, k: int = 20, nc: int = len(COCO80)):
     """The `k` highest class scores of an Ultralytics detection output, sorted ascending, from
     either layout: end-to-end `[1, N, 6]` (score in column 4) or the raw head `[1, 4 + C, A]`
     (sigmoid class scores in rows 4..). The end-to-end head keeps the top (anchor, class) pairs,
@@ -359,14 +395,14 @@ def top_detection_scores(a, k: int = 20):
     a = np.asarray(a, dtype=np.float64)
     if a.ndim == 3 and a.shape[0] == 1 and a.shape[2] == 6:
         s = a[0, :, 4]
-    elif a.ndim == 3 and a.shape[0] == 1 and a.shape[1] == 4 + len(COCO80):
+    elif a.ndim == 3 and a.shape[0] == 1 and a.shape[1] == 4 + nc:
         s = a[0, 4:, :].ravel()
     else:
         return None
     return np.sort(s)[-k:]
 
 
-def check_ultralytics_numerics(name: str, yolo, onnx: Path, input_name: str, imgsz: int) -> None:
+def check_ultralytics_numerics(name: str, yolo, onnx: Path, input_name: str, imgsz: int, nc: int = len(COCO80)) -> None:
     """Run the PyTorch model and the exported ONNX (ONNX Runtime, CPU) on the synthetic image and
     fail when their top-20 detection scores differ by more than 1e-2 (as the RF-DETR / DEIMv2
     recipes do). With the raw `[1, 84, A]` head in both, the boxes of the 20 best anchors must also
@@ -378,6 +414,15 @@ def check_ultralytics_numerics(name: str, yolo, onnx: Path, input_name: str, img
 
     x = synthetic_image(imgsz)
     model = yolo.model.float().eval()
+    got = compare_with_onnxruntime(name, onnx, {input_name: x}, {})
+    out = next(iter(got.values()))
+    # A YOLOv10 head pickled by an older Ultralytics (MegaDetector's MDV6-yolov10-c, 8.3) has
+    # `end2end` False, so PyTorch eval runs its one-to-many head while the exporter writes the
+    # one-to-one head ([1, 300, 6]): compare the head that was exported.
+    head = model.model[-1] if hasattr(model, "model") else None
+    if out.ndim == 3 and out.shape[2] == 6 and getattr(head, "one2one_cv2", None) is not None and not getattr(head, "end2end", True):
+        head.end2end = True
+        log(f"{name}: comparing the exported one-to-one head (end2end) in PyTorch")
     with torch.no_grad():
         ref = model(torch.from_numpy(x))
     # Eval mode returns (output, extras) in most heads; take the first tensor.
@@ -390,9 +435,7 @@ def check_ultralytics_numerics(name: str, yolo, onnx: Path, input_name: str, img
     if not isinstance(ref, torch.Tensor):
         fail(f"{name}: the PyTorch model returned {type(ref).__name__}, not a tensor; cannot check the export")
     ref = ref.detach().float().numpy()
-    got = compare_with_onnxruntime(name, onnx, {input_name: x}, {})
-    out = next(iter(got.values()))
-    a, b = top_detection_scores(ref), top_detection_scores(out)
+    a, b = top_detection_scores(ref, nc=nc), top_detection_scores(out, nc=nc)
     if a is None or b is None:
         fail(f"{name}: cannot compare PyTorch {ref.shape} with ONNX Runtime {out.shape} (unknown output layout)")
     if ref.shape != out.shape:
@@ -401,7 +444,7 @@ def check_ultralytics_numerics(name: str, yolo, onnx: Path, input_name: str, img
     log(f"{name}: top-20 score difference PyTorch vs ONNX Runtime: {diff:.2e}")
     if diff > 1e-2:
         fail(f"{name}: ONNX Runtime and PyTorch disagree (top scores differ by {diff:.3f})")
-    if ref.shape == out.shape and ref.shape[1] == 4 + len(COCO80):
+    if ref.shape == out.shape and ref.shape[1] == 4 + nc:
         best = np.argsort(ref[0, 4:, :].max(axis=0))[-20:]
         box_diff = float(np.abs(ref[0, :4, best] - out[0, :4, best]).max())
         log(f"{name}: box difference of the 20 best anchors: {box_diff:.2e} px")
@@ -409,9 +452,16 @@ def check_ultralytics_numerics(name: str, yolo, onnx: Path, input_name: str, img
             fail(f"{name}: ONNX Runtime and PyTorch boxes disagree by {box_diff:.2f} px")
 
 
+def ultralytics_names(yolo) -> list[str]:
+    """The class names of an Ultralytics model, in head order (80 COCO names, or MegaDetector's 3)."""
+    names = yolo.names
+    return [names[k] for k in sorted(names, key=int)] if isinstance(names, dict) else list(names)
+
+
 def export_ultralytics(name: str, family: str, imgsz: int, args: argparse.Namespace) -> dict:
     out: dict = {}
-    names: list[str] = []
+    names = ultralytics_names(ultralytics_model(name, args))
+    nc = len(names)
     if not args.no_openvino:
         log(f"{name}: exporting OpenVINO IR")
         model = ultralytics_model(name, args)
@@ -431,7 +481,7 @@ def export_ultralytics(name: str, family: str, imgsz: int, args: argparse.Namesp
         export_dir = res if res.is_dir() else res.parent
         xml = next(export_dir.glob("*.xml"))
         shape = ir_output_shape(xml)
-        check_ports(name, family, {}, {"output0": shape}, imgsz)
+        check_ports(name, family, {}, {"output0": shape}, imgsz, nc)
         out["xml"] = args.out / f"{name}.xml"
         shutil.copy2(xml, out["xml"])
         shutil.copy2(xml.with_suffix(".bin"), args.out / f"{name}.bin")
@@ -440,14 +490,13 @@ def export_ultralytics(name: str, family: str, imgsz: int, args: argparse.Namesp
         model = ultralytics_model(name, args)
         onnx = Path(model.export(format="onnx", imgsz=imgsz, dynamic=False, nms=False, batch=1, opset=args.opset))
         inputs, outputs = onnx_ports(onnx)
-        log(f"{name}: " + check_ports(name, family, inputs, outputs, imgsz))
-        check_ultralytics_numerics(name, ultralytics_model(name, args), onnx, list(inputs)[0], imgsz)
+        log(f"{name}: " + check_ports(name, family, inputs, outputs, imgsz, nc))
+        check_ultralytics_numerics(name, ultralytics_model(name, args), onnx, list(inputs)[0], imgsz, nc)
         out["onnx"] = args.out / f"{name}.onnx"
         shutil.copy2(onnx, out["onnx"])
         stamp_coreml_cache_key(out["onnx"])
-    model_names = ultralytics_model(name, args).names
-    names = [model_names[k] for k in sorted(model_names, key=int)] if isinstance(model_names, dict) else list(model_names)
-    out["yaml"] = write_names(args.out, name, names)
+    out["yaml"] = write_names(args.out, name, names, nc)
+    out["names"] = names
     return out
 
 
@@ -456,13 +505,13 @@ def export_ultralytics(name: str, family: str, imgsz: int, args: argparse.Namesp
 # ---------------------------------------------------------------------------------------------
 
 
-def weights_dir(name: str, args: argparse.Namespace) -> Path:
+def weights_dir(name: str, args: argparse.Namespace, files: tuple = ("model.safetensors", "config.json")) -> Path:
     if args.weights is None:
-        fail(f"{name}: --weights <dir with model.safetensors and config.json> is required (nothing is downloaded)")
+        fail(f"{name}: --weights <dir with {' and '.join(files)}> is required (nothing is downloaded)")
     d = args.weights.resolve()
     if d.is_file():
         d = d.parent
-    for f in ("model.safetensors", "config.json"):
+    for f in files:
         if not (d / f).is_file():
             fail(f"{name}: {d / f} is missing")
     return d
@@ -485,16 +534,103 @@ def torch_export(model, inputs: tuple, input_names: list[str], output_names: lis
         )
 
 
+def rfdetr_from_training_checkpoint(name: str, src: Path, imgsz: int):
+    """An RF-DETR fine-tune saved by the `rfdetr` package (`checkpoint_best_total.pth` +
+    `config.json` with `model_config` and `class_names`, e.g. DetectionBench's ExDark models) in
+    transformers' `RfDetrForObjectDetection`: the config is rebuilt from `model_config` the way
+    transformers' `convert_rf_detr_weights_to_hf.py` builds it, and transformers maps the original
+    state dict onto its modules (`from_pretrained(None, state_dict=...)`; nothing may be missing,
+    mismatched or unexpected but the empty keypoint mask). The checkpoint is read with
+    `torch.load(weights_only=True)`. Returns (model, class names in head order mapped to COCO
+    spellings, number of logits)."""
+    import torch
+    from transformers import RfDetrConfig, RfDetrForObjectDetection
+
+    cfg = json.loads((src / "config.json").read_text(encoding="utf-8"))
+    mc = cfg.get("model_config") or {}
+    names = cfg.get("class_names") or []
+    if mc.get("encoder") != "dinov2_windowed_small":
+        fail(f"{name}: unsupported RF-DETR encoder {mc.get('encoder')!r} (only dinov2_windowed_small)")
+    if mc.get("projector_scale") != ["P4"] or not mc.get("two_stage") or not mc.get("bbox_reparam"):
+        fail(f"{name}: unsupported RF-DETR layout (projector {mc.get('projector_scale')}, two_stage, bbox_reparam)")
+    if mc.get("resolution") != imgsz:
+        fail(f"{name}: --imgsz {imgsz} but the model was trained at {mc.get('resolution')}")
+    if len(names) != mc.get("num_classes"):
+        fail(f"{name}: {len(names)} class names for num_classes {mc.get('num_classes')}")
+    coco = [RFDETR_CLASS_TO_COCO.get(n.lower(), n.lower()) for n in names]
+    unknown = [n for n in coco if n not in COCO80]
+    if unknown:
+        fail(f"{name}: class names without a COCO spelling: {unknown}")
+    backbone = {
+        "model_type": "rf_detr_dinov2",
+        "attention_probs_dropout_prob": 0.0,
+        "drop_path_rate": 0.0,
+        "hidden_act": "gelu",
+        "hidden_dropout_prob": 0.0,
+        "hidden_size": 384,
+        "image_size": imgsz,
+        "initializer_range": 0.02,
+        "layer_norm_eps": 1e-06,
+        "layerscale_value": 1.0,
+        "mlp_ratio": 4,
+        "num_channels": 3,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 6,
+        "num_windows": mc["num_windows"],
+        "out_features": [f"stage{i}" for i in mc["out_feature_indexes"]],
+        "patch_size": mc["patch_size"],
+        "qkv_bias": True,
+        "use_swiglu_ffn": False,
+    }
+    nl = int(mc["num_classes"]) + 1
+    config = RfDetrConfig(
+        d_model=mc["hidden_dim"],
+        num_queries=mc["num_queries"],
+        decoder_self_attention_heads=mc["sa_nheads"],
+        decoder_cross_attention_heads=mc["ca_nheads"],
+        decoder_n_points=mc["dec_n_points"],
+        projector_scale_factors=[1.0],
+        intermediate_size=1024,
+        decoder_layers=mc["dec_layers"],
+        backbone_config=backbone,
+        num_labels=nl,
+    )
+    found = sorted(src.glob("*.pth"))
+    if len(found) != 1:
+        fail(f"{name}: expected exactly one .pth in {src}, found {len(found)}")
+    ck = torch.load(str(found[0]), map_location="cpu", weights_only=True)
+    state = ck.get("model") if isinstance(ck, dict) else None
+    if not isinstance(state, dict):
+        fail(f"{name}: {found[0].name} has no `model` state dict")
+    model, info = RfDetrForObjectDetection.from_pretrained(None, config=config, state_dict=state, output_loading_info=True)
+    unexpected = [k for k in info["unexpected_keys"] if not k.endswith("_kp_active_mask")]
+    if info["missing_keys"] or unexpected or info["mismatched_keys"]:
+        fail(
+            f"{name}: the checkpoint does not fit RfDetrForObjectDetection (missing {sorted(info['missing_keys'])[:5]}, "
+            f"unexpected {unexpected[:5]}, mismatched {info['mismatched_keys'][:5]})"
+        )
+    log(f"{name}: {found[0].name} (rfdetr {ck.get('rfdetr_version', '?')}, {len(state)} tensors): {nl} logits, classes {coco}")
+    return model.eval(), coco, nl
+
+
 def export_rfdetr(name: str, family: str, imgsz: int, args: argparse.Namespace) -> dict:
     import torch
     from transformers import RfDetrForObjectDetection
 
-    src = weights_dir(name, args)
-    log(f"{name}: loading {src} with transformers")
-    model = RfDetrForObjectDetection.from_pretrained(str(src), local_files_only=True).eval()
-    labels = model.config.id2label
-    if len(labels) != 91 or labels.get(1) != "person":
-        fail(f"{name}: expected a COCO head (91 category ids), got {len(labels)} labels")
+    names = None
+    wdir = args.weights.resolve() if args.weights is not None else None
+    if wdir is not None and wdir.is_dir() and any(wdir.glob("*.pth")):
+        # A fine-tune saved by the rfdetr package (DetectionBench ExDark): its own classes.
+        src = weights_dir(name, args, ("config.json",))
+        log(f"{name}: loading the rfdetr training checkpoint in {src} with transformers")
+        model, names, nl = rfdetr_from_training_checkpoint(name, src, imgsz)
+    else:
+        src = weights_dir(name, args)
+        log(f"{name}: loading {src} with transformers")
+        model = RfDetrForObjectDetection.from_pretrained(str(src), local_files_only=True).eval()
+        labels = model.config.id2label
+        if len(labels) != 91 or labels.get(1) != "person":
+            fail(f"{name}: expected a COCO head (91 category ids), got {len(labels)} labels")
     # With a static input the backbone's position embeddings are a constant: compute them once in
     # eager mode (exact) instead of tracing the antialiased bicubic resize, which the ONNX exporter
     # cannot express.
@@ -540,7 +676,11 @@ def export_rfdetr(name: str, family: str, imgsz: int, args: argparse.Namespace) 
     log(f"{name}: top-20 score difference PyTorch vs ONNX Runtime: {diff:.2e}")
     if diff > 1e-2:
         fail(f"{name}: ONNX Runtime and PyTorch disagree (top scores differ by {diff:.3f})")
-    return finish_hf(name, onnx, args, out)
+    if names is not None and got["logits"].shape[-1] != nl:
+        fail(f"{name}: logits have {got['logits'].shape[-1]} classes, expected {nl}")
+    # A fine-tune's YAML lists its own classes (COCO spellings) in head order; the extra last logit
+    # (rfdetr's num_classes + 1) has no name and is never reported as a known label.
+    return finish_hf(name, onnx, args, out, names=names)
 
 
 def load_yml(path: Path) -> dict:
@@ -573,6 +713,29 @@ def deimv2_yml(name: str, src: Path, dinov3: bool) -> Path:
     return path
 
 
+def deim_engine(name: str, src: Path, wanted: dict) -> dict:
+    """Import the classes `wanted` (`class name -> module`) from the DEIMv2 source tree `src`,
+    without running `engine/__init__.py` (data, optim, solver: training dependencies)."""
+    eng = src.resolve() / "engine"
+    if not (eng / "deim" / "postprocessor.py").is_file():
+        fail(f"{name}: {src} is not a DEIMv2 source tree (engine/deim/postprocessor.py missing)")
+
+    def package(mod_name: str, path: Path) -> types.ModuleType:
+        m = sys.modules.get(mod_name)
+        if m is None:
+            m = types.ModuleType(mod_name)
+            m.__path__ = [str(path)]
+            sys.modules[mod_name] = m
+        return m
+
+    package("engine", eng)
+    core = package("engine.core", eng / "core")
+    package("engine.backbone", eng / "backbone")
+    package("engine.deim", eng / "deim")
+    core.register = importlib.import_module("engine.core.workspace").register
+    return {cls: getattr(importlib.import_module(mod), cls) for cls, mod in wanted.items()}
+
+
 def load_deimv2(name: str, src: Path, wdir: Path):
     """The DEIMv2 model of `wdir` (config.json + model.safetensors) built with the official code in
     `src`, importing only the modules the model needs (not the training stack). Module arguments
@@ -584,29 +747,19 @@ def load_deimv2(name: str, src: Path, wdir: Path):
 
     import torch.nn as nn
 
-    eng = src.resolve() / "engine"
-    if not (eng / "deim" / "postprocessor.py").is_file():
-        fail(f"{name}: {src} is not a DEIMv2 source tree (engine/deim/postprocessor.py missing)")
-
-    # Package stubs so `engine/__init__.py` (data, optim, solver: training dependencies) is not run.
-    def package(mod_name: str, path: Path) -> types.ModuleType:
-        m = types.ModuleType(mod_name)
-        m.__path__ = [str(path)]
-        sys.modules[mod_name] = m
-        return m
-
-    package("engine", eng)
-    core = package("engine.core", eng / "core")
-    package("engine.backbone", eng / "backbone")
-    package("engine.deim", eng / "deim")
-    core.register = importlib.import_module("engine.core.workspace").register
-    HGNetv2 = importlib.import_module("engine.backbone.hgnetv2").HGNetv2
-    DINOv3STAs = importlib.import_module("engine.backbone.dinov3_adapter").DINOv3STAs
-    HybridEncoder = importlib.import_module("engine.deim.hybrid_encoder").HybridEncoder
-    LiteEncoder = importlib.import_module("engine.deim.lite_encoder").LiteEncoder
-    DEIMTransformer = importlib.import_module("engine.deim.deim_decoder").DEIMTransformer
-    DFINETransformer = importlib.import_module("engine.deim.dfine_decoder").DFINETransformer
-    PostProcessor = importlib.import_module("engine.deim.postprocessor").PostProcessor
+    classes = deim_engine(
+        name,
+        src,
+        {
+            "HGNetv2": "engine.backbone.hgnetv2",
+            "DINOv3STAs": "engine.backbone.dinov3_adapter",
+            "HybridEncoder": "engine.deim.hybrid_encoder",
+            "LiteEncoder": "engine.deim.lite_encoder",
+            "DEIMTransformer": "engine.deim.deim_decoder",
+            "DFINETransformer": "engine.deim.dfine_decoder",
+            "PostProcessor": "engine.deim.postprocessor",
+        },
+    )
 
     hf = json.loads((wdir / "config.json").read_text(encoding="utf-8"))
     hf = hf.get("config", hf)
@@ -614,15 +767,6 @@ def load_deimv2(name: str, src: Path, wdir: Path):
     yml_path = deimv2_yml(name, src, dinov3)
     yml = load_yml(yml_path)
     log(f"{name}: training config {yml_path.relative_to(src)}")
-    classes = {
-        "HGNetv2": HGNetv2,
-        "DINOv3STAs": DINOv3STAs,
-        "HybridEncoder": HybridEncoder,
-        "LiteEncoder": LiteEncoder,
-        "DEIMTransformer": DEIMTransformer,
-        "DFINETransformer": DFINETransformer,
-        "PostProcessor": PostProcessor,
-    }
     deim = yml.get("DEIM", {})
     roles = {"backbone": deim.get("backbone"), "encoder": deim.get("encoder"), "decoder": deim.get("decoder")}
     for role, cls in roles.items():
@@ -755,7 +899,192 @@ def export_deimv2(name: str, family: str, imgsz: int | None, args: argparse.Name
     return finish_hf(name, onnx, args, {}, imgsz)
 
 
-def finish_hf(name: str, onnx: Path, args: argparse.Namespace, out: dict, imgsz: int | None = None) -> dict:
+def rtdetrv2_checkpoint(name: str, args: argparse.Namespace) -> Path:
+    """The `.pth` of an `rtdetrv2` export: --weights itself, or the one `.pth` in that directory."""
+    if args.weights is None:
+        fail(f"{name}: --weights <the .pth checkpoint or its directory> is required (nothing is downloaded)")
+    w = args.weights.resolve()
+    if w.is_dir():
+        found = sorted(w.glob("*.pth"))
+        if len(found) != 1:
+            fail(f"{name}: expected exactly one .pth in {w}, found {len(found)}")
+        w = found[0]
+    if not w.is_file():
+        fail(f"{name}: --weights {w} does not exist")
+    return w
+
+
+def load_rtdetrv2(name: str, src: Path, ckpt: Path, spec: dict):
+    """An RT-DETRv2 checkpoint built with the DEIMv2 code's RT-DETRv2 modules (copied from
+    lyuwenyu/RT-DETR): the training config `spec["config"]` with `num_classes` from the class list,
+    loaded strictly from the checkpoint's EMA weights (else `model`). The checkpoint is read with
+    `torch.load(weights_only=True)` (tensors and plain containers only, no pickled code)."""
+    import inspect
+    from collections import OrderedDict
+
+    import torch
+    import torch.nn as nn
+
+    classes = deim_engine(
+        name,
+        src,
+        {
+            "PResNet": "engine.backbone.presnet",
+            "HybridEncoder": "engine.deim.hybrid_encoder",
+            "RTDETRTransformerv2": "engine.deim.rtdetrv2_decoder",
+            "PostProcessor": "engine.deim.postprocessor",
+        },
+    )
+    yml_path = src / spec["config"]
+    if not yml_path.is_file():
+        fail(f"{name}: no training config {yml_path}")
+    yml = load_yml(yml_path)
+    log(f"{name}: training config {yml_path.relative_to(src)}")
+    # The checkpoint's dataset settings (CameraTraps megadetector_detection.yml).
+    yml["num_classes"] = len(spec["names"])
+    yml["remap_mscoco_category"] = False
+    yml["eval_spatial_size"] = [spec["imgsz"], spec["imgsz"]]
+    deim = yml.get("DEIM", {})
+    roles = [deim.get("backbone"), deim.get("encoder"), deim.get("decoder")]
+    if roles != ["PResNet", "HybridEncoder", "RTDETRTransformerv2"]:
+        fail(f"{name}: {yml_path.name} is not an RT-DETRv2 config ({roles})")
+
+    def build(key: str, **force):
+        cls = classes[key]
+        params = inspect.signature(cls.__init__).parameters
+        kw = {k: v for k, v in yml.get(key, {}).items() if k in params}
+        for k in getattr(cls, "__share__", []):
+            if k in yml and k in params:
+                kw.setdefault(k, yml[k])
+        kw.update(force)
+        return cls(**kw)
+
+    class RTDETRv2(nn.Module):
+        """RT-DETR's `RTDETR` module layout: backbone, encoder, decoder (checkpoint key prefixes)."""
+
+        def __init__(self):
+            super().__init__()
+            self.backbone = build("PResNet", pretrained=False)
+            self.encoder = build("HybridEncoder")
+            self.decoder = build("RTDETRTransformerv2")
+
+    model = RTDETRv2()
+    # RT-DETRv2 projects every level with a 1x1 conv + BN, also when its width already equals
+    # hidden_dim (the r18vd 256-channel level); DEIM's copy uses an identity there.
+    hidden = model.encoder.hidden_dim
+    for i, proj in enumerate(model.encoder.input_proj):
+        if isinstance(proj, nn.Identity):
+            model.encoder.input_proj[i] = nn.Sequential(
+                OrderedDict(
+                    [
+                        ("conv", nn.Conv2d(model.encoder.in_channels[i], hidden, kernel_size=1, bias=False)),
+                        ("norm", nn.BatchNorm2d(hidden)),
+                    ]
+                )
+            )
+    post = build("PostProcessor")
+    ck = torch.load(str(ckpt), map_location="cpu", weights_only=True)
+    if not isinstance(ck, dict):
+        fail(f"{name}: {ckpt.name} is not an RT-DETR training checkpoint")
+    if isinstance(ck.get("ema"), dict) and "module" in ck["ema"]:
+        state, which = ck["ema"]["module"], "EMA"
+    elif "model" in ck:
+        state, which = ck["model"], "model"
+    else:
+        fail(f"{name}: {ckpt.name} has neither `ema` nor `model` weights ({sorted(ck)[:8]})")
+    head = state.get("decoder.enc_score_head.weight")
+    if head is None or head.shape[0] != len(spec["names"]):
+        fail(f"{name}: the checkpoint's head has {None if head is None else head.shape[0]} classes, expected {len(spec['names'])}")
+    model.load_state_dict(state, strict=True)
+    log(f"{name}: loaded the {which} weights of {ckpt.name} ({len(state)} tensors, strict)")
+    if post.num_classes != len(spec["names"]) or post.remap_mscoco_category:
+        fail(f"{name}: post-processor has {post.num_classes} classes (remap {post.remap_mscoco_category})")
+    return model, post
+
+
+def export_rtdetrv2(name: str, family: str, imgsz: int | None, args: argparse.Namespace) -> dict:
+    import numpy as np
+    import torch
+
+    spec = RTDETRV2_MODELS.get(name.lower())
+    if spec is None:
+        fail(f"{name}: not an RT-DETRv2 checkpoint this script knows ({sorted(RTDETRV2_MODELS)})")
+    if args.source is None:
+        fail(f"{name}: --source <DEIMv2 source checkout> is required (its RT-DETRv2 modules build the model)")
+    if imgsz is not None and imgsz != spec["imgsz"]:
+        fail(f"{name}: --imgsz {imgsz} but the model was trained at {spec['imgsz']}")
+    imgsz = spec["imgsz"]
+    ckpt = rtdetrv2_checkpoint(name, args)
+    log(f"{name}: loading {ckpt} with the RT-DETRv2 modules of the DEIMv2 code in {args.source}")
+    model, post = load_rtdetrv2(name, args.source, ckpt, spec)
+    model.eval()
+    for m in model.modules():
+        if hasattr(m, "convert_to_deploy"):
+            m.convert_to_deploy()
+    post.deploy()
+
+    class Deploy(torch.nn.Module):
+        """`images` (RGB 0..1, stretched to S x S like PytorchWildlife's `Resize`) +
+        `orig_target_sizes` ([w, h]) -> labels, boxes (xyxy in target-size pixels), scores."""
+
+        def __init__(self, m, p):
+            super().__init__()
+            self.m = m
+            self.p = p
+
+        def forward(self, images, orig_target_sizes):
+            return self.p(self.m.decoder(self.m.encoder(self.m.backbone(images))), orig_target_sizes)
+
+    deploy = Deploy(model, post).eval()
+    x = synthetic_image(imgsz)
+    sizes = np.array([[imgsz, imgsz]], dtype=np.int64)
+    with torch.no_grad():
+        labels, boxes, scores = deploy(torch.from_numpy(x), torch.from_numpy(sizes))
+    onnx = args.work / f"{name}.onnx"
+    log(f"{name}: exporting ONNX (opset {args.opset}, {imgsz}x{imgsz})")
+    torch_export(
+        deploy,
+        (torch.from_numpy(x), torch.from_numpy(sizes)),
+        ["images", "orig_target_sizes"],
+        ["labels", "boxes", "scores"],
+        onnx,
+        args.opset,
+    )
+    got = compare_with_onnxruntime(
+        name,
+        onnx,
+        {"images": x, "orig_target_sizes": sizes},
+        {"labels": labels.numpy(), "boxes": boxes.numpy(), "scores": scores.numpy()},
+    )
+    pin_output_shapes(name, onnx, got)
+    inputs, outputs = onnx_ports(onnx)
+    log(f"{name}: " + check_ports(name, family, inputs, outputs, imgsz))
+    nc = len(spec["names"])
+    if got["labels"].min() < 0 or got["labels"].max() >= nc:
+        fail(f"{name}: labels outside 0..{nc - 1}")
+    diff = float(np.abs(np.sort(got["scores"].ravel())[-20:] - np.sort(scores.numpy().ravel())[-20:]).max())
+    log(f"{name}: top-20 score difference PyTorch vs ONNX Runtime: {diff:.2e}")
+    if diff > 1e-2:
+        fail(f"{name}: ONNX Runtime and PyTorch disagree (top scores differ by {diff:.3f})")
+    # The boxes of the 20 best PyTorch detections, each against the closest ONNX Runtime box of
+    # the same label among its 50 best (near-equal scores may swap places in the top-k).
+    ref_b, ref_l, ref_s = boxes.numpy()[0], labels.numpy()[0], scores.numpy()[0]
+    got_b, got_l, got_s = got["boxes"][0], got["labels"][0], got["scores"][0]
+    cand = np.argsort(got_s)[-50:]
+    box_diff = 0.0
+    for i in np.argsort(ref_s)[-20:]:
+        same = [j for j in cand if got_l[j] == ref_l[i]]
+        d = min((float(np.abs(got_b[j] - ref_b[i]).max()) for j in same), default=float("inf"))
+        box_diff = max(box_diff, d)
+    log(f"{name}: box difference of the 20 best detections: {box_diff:.2e} px")
+    if box_diff > 0.5:
+        fail(f"{name}: ONNX Runtime and PyTorch boxes disagree by {box_diff:.2f} px")
+    return finish_hf(name, onnx, args, {}, imgsz, spec["names"])
+
+
+def finish_hf(
+    name: str, onnx: Path, args: argparse.Namespace, out: dict, imgsz: int | None = None, names: list[str] | None = None
+) -> dict:
     if not args.no_onnx:
         out["onnx"] = args.out / f"{name}.onnx"
         shutil.copy2(onnx, out["onnx"])
@@ -763,7 +1092,9 @@ def finish_hf(name: str, onnx: Path, args: argparse.Namespace, out: dict, imgsz:
     if not args.no_openvino:
         log(f"{name}: converting to OpenVINO IR")
         out["xml"] = onnx_to_ir(onnx, args.out, name, args.fp32)
-    out["yaml"] = write_names(args.out, name, COCO80)
+    names = names or COCO80
+    out["yaml"] = write_names(args.out, name, names, len(names))
+    out["names"] = names
     if imgsz is not None:
         out["imgsz"] = imgsz
     return out
@@ -774,6 +1105,7 @@ SELF_CHECK_MODULES = {
     "ultralytics": ["numpy", "torch", "torchvision", "onnx", "onnxruntime", "ultralytics"],
     "rfdetr": ["numpy", "torch", "onnx", "onnxruntime", "safetensors", "transformers"],
     "deimv2": ["numpy", "torch", "torchvision", "onnx", "onnxruntime", "safetensors", "yaml"],
+    "rtdetrv2": ["numpy", "torch", "torchvision", "onnx", "onnxruntime", "yaml"],
 }
 
 
@@ -832,11 +1164,13 @@ def main() -> int:
             out = export_ultralytics(name, family, args.imgsz or 640, args)
         elif recipe == "rfdetr":
             out = export_rfdetr(name, family, args.imgsz or 704, args)
+        elif recipe == "rtdetrv2":
+            out = export_rtdetrv2(name, family, args.imgsz, args)
         else:
             out = export_deimv2(name, family, args.imgsz, args)
         # The .onnx runs on both runtimes (OpenVINO and ONNX Runtime, incl. CoreML); the IR only on OpenVINO.
         model_file = out.get("onnx") or out.get("xml")
-        print(f"{name}: {recipe} -> {model_file} (family {family}, {len(COCO80)} classes)", flush=True)
+        print(f"{name}: {recipe} -> {model_file} (family {family}, {len(out.get('names', COCO80))} classes)", flush=True)
         snippets.append(
             {"name": name, "path": f"models/{model_file.name}", "family": family, "classes": f"models/{name}.yaml"}
         )

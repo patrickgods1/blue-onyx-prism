@@ -12,6 +12,7 @@
 //! - [`prep`]      process-wide decode + preprocess pool shared by the workers
 //! - [`image_stats`] cheap per-frame luma / colour statistics and the day / night / IR scene
 //! - [`static_memory`] static-box memory: suppress boxes that repeat at the same place
+//! - [`verify`]    verifier cascade: candidate crops and the keep / reject rule (pure)
 //! - [`profile`]   hardware profile (low/mid/high): defaults of the concurrency settings
 //! - [`registry`]  loads all configured models and owns their worker threads
 //! - [`worker`]    per-model inference thread
@@ -86,6 +87,7 @@ pub mod sync;
 pub mod system_info;
 pub mod tray;
 pub mod update;
+pub mod verify;
 pub mod worker;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

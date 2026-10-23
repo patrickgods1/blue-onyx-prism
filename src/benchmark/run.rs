@@ -250,7 +250,36 @@ impl<'a> Bench<'a> {
                 }
             }
         };
-        self.time(job, requested, backend, compile_ms, cache)
+        let verifier = match job.variant.as_ref().and_then(|v| v.verify.as_ref()) {
+            Some(v) => Some(self.load_verifier(runtimes, &v.job, &backend.info().device.spec)?),
+            None => None,
+        };
+        self.time(job, requested, backend, verifier, compile_ms, cache)
+    }
+
+    /// Compile the verifier of a `verify:<model>` variant on `device` (the spec the verified
+    /// model loaded on; falls back like the service would).
+    fn load_verifier(
+        &self,
+        runtimes: &Mutex<Runtimes>,
+        vjob: &Job,
+        device: &str,
+    ) -> Result<Backend> {
+        let spec = spec::parse(device)?;
+        let candidates = lock(runtimes).plan(&spec, &vjob.path);
+        let req = LoadRequest {
+            path: vjob.path.clone(),
+            requested: device.to_string(),
+            gpu_precision: vjob.gpu_precision.clone(),
+        };
+        let label = format!("verifier {}", vjob.name);
+        let loaded = crate::backend::try_candidates(&label, &candidates, |cand| {
+            self.check_cancel()?;
+            let compiled = lock(runtimes).compile(cand, &req)?;
+            compiled.into_backend()
+        });
+        self.check_cancel()?;
+        loaded.with_context(|| format!("loading the verifier {}", vjob.path.display()))
     }
 
     /// Warm up and time `backend` over every image, then score its detections.
@@ -259,6 +288,7 @@ impl<'a> Bench<'a> {
         job: &Job,
         requested: &str,
         backend: Backend,
+        verifier: Option<Backend>,
         compile_ms: f64,
         cache: String,
     ) -> Result<RunResult> {
@@ -285,6 +315,13 @@ impl<'a> Bench<'a> {
             classes: &job.classes,
             filter: self.object_filter_for(job),
             variant: job.variant.as_ref(),
+            verifier: match (
+                verifier,
+                job.variant.as_ref().and_then(|v| v.verify.as_ref()),
+            ) {
+                (Some(b), Some(v)) => Some(Verifier::new(b, v, self.params)?),
+                _ => None,
+            },
         };
 
         let all: Vec<(&ImageSet, &images::SetImage)> = self
@@ -459,6 +496,115 @@ pub(super) struct Pipeline<'j> {
     filter: Option<&'j [String]>,
     /// Enhancement and filter rules on top of the plain stages ([`super::variant`]).
     variant: Option<&'j PipelineVariant>,
+    /// The verifier of a `verify:<model>` variant.
+    verifier: Option<Verifier<'j>>,
+}
+
+/// The second model of a `verify:<model>` variant: the stages the verifier's worker runs on a
+/// verifier check (`worker::Purpose::Verify`): its own enhancement for the frame's scene, the
+/// resize, inference, and its raw detections at `min_confidence` (no night rules, no object
+/// filter).
+pub(super) struct Verifier<'j> {
+    backend: Backend,
+    family: Box<dyn crate::model::Family>,
+    pre: Preprocessor,
+    params: PostParams,
+    classes: &'j [String],
+    variant: &'j super::variant::VerifyVariant,
+}
+
+impl<'j> Verifier<'j> {
+    fn new(
+        backend: Backend,
+        v: &'j super::variant::VerifyVariant,
+        bench: PostParams,
+    ) -> Result<Self> {
+        let info = backend.info();
+        let (in_w, in_h) = info.input_size;
+        let family = crate::model::make_family(
+            v.job.family,
+            &info.inputs,
+            &info.outputs,
+            v.job.classes.len(),
+        )?;
+        let configured = v
+            .job
+            .confidence_threshold
+            .unwrap_or(bench.confidence_threshold);
+        Ok(Self {
+            pre: Preprocessor::for_family(in_w, in_h, family.as_ref()),
+            family,
+            backend,
+            params: PostParams {
+                confidence_threshold: crate::worker::effective_threshold(
+                    v.config.min_confidence,
+                    configured,
+                ),
+                nms_iou: bench.nms_iou,
+            },
+            classes: &v.job.classes,
+            variant: v,
+        })
+    }
+
+    /// The verifier's predictions on `img` (a crop or the frame) of a frame of `scene`.
+    fn detect(
+        &mut self,
+        mut img: crate::image::RgbImage,
+        scene: crate::image_stats::Scene,
+    ) -> Result<Vec<Prediction>> {
+        crate::model::enhance::apply(&mut img, self.variant.modes.for_scene(scene));
+        let (chw, ctx) = self.pre.run(&img.rgb, img.width, img.height)?;
+        let extra = self.family.extra_inputs(&ctx);
+        let outputs = self.backend.infer(chw, &extra)?;
+        let dets = self.family.postprocess(&outputs, &ctx, &self.params)?;
+        Ok(crate::model::to_predictions(
+            &dets,
+            &ctx,
+            self.classes,
+            None,
+        ))
+    }
+
+    /// Check the candidates of `preds` ([`crate::verify::plan`]) on `frame` (the original,
+    /// not enhanced) and drop the rejected ones from `preds` and from `eval` (the same boxes
+    /// at the evaluation threshold; candidates are taken from `preds`, so evaluation boxes
+    /// below the production threshold stay unverified).
+    fn apply(
+        &mut self,
+        frame: crate::image::RgbImage,
+        scene: crate::image_stats::Scene,
+        preds: Vec<Prediction>,
+        eval: &mut Vec<Prediction>,
+    ) -> Result<Vec<Prediction>> {
+        use crate::verify::VerifyMode;
+        let cfg = &self.variant.config;
+        let plan = crate::verify::plan(&preds, frame.width, frame.height, scene, cfg);
+        if plan.is_empty() {
+            return Ok(preds);
+        }
+        let found: Vec<Option<Vec<Prediction>>> = match cfg.mode {
+            VerifyMode::Crop => {
+                let mut out = Vec::with_capacity(plan.checks.len());
+                for c in &plan.checks {
+                    out.push(match c.crop {
+                        Some(r) => Some(self.detect(crate::verify::crop(&frame, r), scene)?),
+                        None => None,
+                    });
+                }
+                out
+            }
+            VerifyMode::Frame => vec![Some(self.detect(frame, scene)?)],
+        };
+        let outcomes = crate::verify::outcomes(&plan, &found, &self.variant.config);
+        let rejected: Vec<Prediction> = outcomes
+            .iter()
+            .filter(|(_, o)| *o == crate::verify::Outcome::Rejected)
+            .filter_map(|(i, _)| preds.get(*i).cloned())
+            .collect();
+        eval.retain(|e| !rejected.contains(e));
+        Ok(crate::verify::apply(preds, &outcomes).0)
+    }
 }
 
 impl Pipeline<'_> {
@@ -483,6 +629,9 @@ impl Pipeline<'_> {
         if let Some(tr) = transform {
             tr.apply(&mut img);
         }
+        // The verifier crops the original frame, as the service does (not timed: the service
+        // keeps the decoded frame without a copy).
+        let original = self.verifier.is_some().then(|| img.clone());
 
         let t = Instant::now();
         let scene = match self.variant {
@@ -512,11 +661,20 @@ impl Pipeline<'_> {
         let dets = filtered(self.family.postprocess(&outputs, &ctx, &self.params)?);
         let preds = crate::model::to_predictions(&dets, &ctx, self.classes, self.filter);
         let postprocess = ms(t.elapsed());
-        let eval = if eval {
+        let mut eval = if eval {
             let dets = filtered(self.family.postprocess(&outputs, &ctx, &self.eval_params)?);
             crate::model::to_predictions(&dets, &ctx, self.classes, None)
         } else {
             Vec::new()
+        };
+        // The verifier cascade counts as postprocess time (the service adds it to processMs).
+        let (preds, postprocess) = match (self.verifier.as_mut(), original) {
+            (Some(v), Some(frame)) => {
+                let t = Instant::now();
+                let preds = v.apply(frame, scene, preds, &mut eval)?;
+                (preds, postprocess + ms(t.elapsed()))
+            }
+            _ => (preds, postprocess),
         };
         Ok(Sample {
             stages: [decode, preprocess, infer, postprocess],

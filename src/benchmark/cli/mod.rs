@@ -115,12 +115,18 @@ fn jobs(args: &BenchArgs, config: &Config, errors: &mut Vec<String>) -> Result<V
             p.job.confidence_threshold = Some(c);
         }
     }
-    Ok(with_variants(out, args, config))
+    Ok(with_variants(out, args, config, errors))
 }
 
 /// Every job once per `--variants` entry (in that order per model; the plain pipeline keeps
-/// the model's name, a variant is `<model>+<variant>`).
-fn with_variants(jobs: Vec<Planned>, args: &BenchArgs, config: &Config) -> Vec<Planned> {
+/// the model's name, a variant is `<model>+<variant>`). A variant that cannot be resolved (an
+/// unknown `verify:<model>`) is skipped with an error.
+fn with_variants(
+    jobs: Vec<Planned>,
+    args: &BenchArgs,
+    config: &Config,
+    errors: &mut Vec<String>,
+) -> Vec<Planned> {
     let Some(list) = &args.variants else {
         return jobs;
     };
@@ -128,7 +134,13 @@ fn with_variants(jobs: Vec<Planned>, args: &BenchArgs, config: &Config) -> Vec<P
     for p in jobs {
         for spec in &list.0 {
             let mut job = p.job.clone();
-            job.variant = spec.resolve(config, p.entry.as_ref());
+            job.variant = match spec.resolve(config, p.entry.as_ref(), &p.job.name) {
+                Ok(v) => v,
+                Err(e) => {
+                    errors.push(format!("{}+{}: {e:#}", p.job.name, spec.name));
+                    continue;
+                }
+            };
             if let Some(v) = &job.variant {
                 job.name = crate::benchmark::variant::variant_name(&job.name, v);
                 if !args.json {

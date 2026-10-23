@@ -168,6 +168,7 @@ fn field_label(field: &str) -> String {
         "preprocess" => "preprocess".into(),
         "night_preprocess" => "night preprocess".into(),
         "night_model" => "night model".into(),
+        "verify" => "verifier".into(),
         other => other.replace('_', " "),
     }
 }
@@ -212,6 +213,7 @@ fn global_label(k: &str) -> String {
         "static_suppression" => "Static-box suppression".into(),
         "preprocess" => "Image preprocessing".into(),
         "night_preprocess" => "Night / IR image preprocessing".into(),
+        "verify" => "Verifier cascade".into(),
         other => other.replace('_', " "),
     }
 }
@@ -416,6 +418,7 @@ pub fn live_global(k: &str) -> bool {
             | "static_suppression"
             | "preprocess"
             | "night_preprocess"
+            | "verify"
     ) || k.starts_with("benchmark.")
 }
 
@@ -433,6 +436,7 @@ pub const LIVE_MODEL_FIELDS: &[&str] = &[
     "static_suppression",
     "preprocess",
     "night_preprocess",
+    "verify",
 ];
 
 /// The per-model night / IR rule fields (serialized only when set; absent = the global value).
@@ -446,6 +450,7 @@ pub const NIGHT_MODEL_FIELDS: &[&str] = &[
     "static_suppression",
     "preprocess",
     "night_preprocess",
+    "verify",
 ];
 
 /// Labels of the changed fields that applied without a restart (live globals, the default
@@ -1018,6 +1023,29 @@ mod tests {
             ["IPcam-general \u{b7} night model"],
             "{changes:?}"
         );
+    }
+
+    #[test]
+    fn verify_applies_live_without_a_reload() {
+        let old = cfg();
+        let mut new = old.clone();
+        new.models[0].verify = Some(crate::verify::VerifyConfig::with_model("yolo26s"));
+        new.verify = Some(crate::verify::VerifyConfig::with_model("yolo26s"));
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(p.models.is_empty() && p.global.is_empty(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        let live = applied_live(&changes);
+        assert!(
+            live.contains(&"Verifier cascade".to_string())
+                && live.contains(&"IPcam-general \u{b7} verifier".to_string()),
+            "{live:?}"
+        );
+        let c = changes
+            .iter()
+            .find(|c| c.label == "IPcam-general \u{b7} verifier")
+            .unwrap();
+        assert_eq!(c.from, "global");
     }
 
     #[test]

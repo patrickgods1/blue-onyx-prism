@@ -805,6 +805,7 @@ fn decoded_frames_can_be_answered_to_another_worker() {
             decode: Duration::from_millis(3),
             reply,
             from: "primary".into(),
+            purpose: super::Purpose::Verify,
         }))
     };
     h.script.push([det(4, 0)]);
@@ -835,4 +836,313 @@ fn decoded_frames_can_be_answered_to_another_worker() {
     );
     assert_eq!(h.script.submits(), 1);
     h.stop();
+}
+
+// ---- Verifier cascade (`verify`) ----
+
+use crate::verify::{Outcome, VerifyConfig, VerifyMode};
+
+/// A box covering the whole model input: in a crop it is the whole crop, which overlaps the
+/// centred candidate box with IoU 1 / (1 + 2 * 0.2)^2 = 0.51 (pad 0.2).
+fn whole(class: usize, score: f32, delay_ms: u64) -> Step {
+    Step::detections(
+        &[[0.0, 0.0, 64.0, 64.0, score, class as f32]],
+        Duration::from_millis(delay_ms),
+    )
+}
+
+fn nothing() -> Step {
+    Step::detections(&[], Duration::ZERO)
+}
+
+/// Live settings of a primary verified by `verifier` (labels `c1`, the other defaults).
+fn live_verified(verifier: &str, tweak: impl FnOnce(&mut VerifyConfig)) -> LiveSettings {
+    let mut v = VerifyConfig {
+        labels: vec!["C1".into()],
+        ..VerifyConfig::with_model(verifier)
+    };
+    tweak(&mut v);
+    LiveSettings {
+        request_timeout: Duration::from_secs(30),
+        verify: Some(v),
+        ..LiveSettings::default()
+    }
+}
+
+/// "primary" verified by "checker" (`checker_live`), both in one [`Peers`] directory.
+fn primary_and_checker(
+    primary_live: LiveSettings,
+    checker_live: LiveSettings,
+) -> (Harness, Harness, Peers) {
+    let peers = Peers::new();
+    let checker = Harness::start_named("checker", 1, checker_live, peers.clone());
+    let primary = Harness::start_named("primary", 1, primary_live, peers.clone());
+    peers.publish([&primary.handle, &checker.handle]);
+    (primary, checker, peers)
+}
+
+fn ir(h: &Harness, name: &str) -> Reply {
+    h.send_at(gray_jpeg(), name, Instant::now())
+}
+
+fn labels(r: &VisionDetectionResponse) -> Vec<&str> {
+    assert!(r.success, "{}", r.message);
+    assert_eq!(r.count as usize, r.predictions.len());
+    assert_eq!(r.message, format!("Found {} objects", r.predictions.len()));
+    r.predictions.iter().map(|p| p.label.as_str()).collect()
+}
+
+#[test]
+fn verifier_keeps_confirmed_and_drops_rejected_candidates() {
+    use crate::model::filters::{FilterRules, SuppressReason};
+    // The checker's own rules must not apply to checks: a night threshold above every score,
+    // an object filter without c1, and a verifier of its own pointing back at the primary.
+    let mut checker_live = live_verified("primary", |_| {});
+    checker_live.filters = FilterRules {
+        night_confidence_threshold: Some(0.99),
+        ..FilterRules::default()
+    };
+    checker_live.object_filter = vec!["c4".into()];
+    let (primary, checker, _peers) =
+        primary_and_checker(live_verified("checker", |_| {}), checker_live);
+    // Confirmed; answered with nothing; confirmed with another label; confirmed too unsure.
+    checker.script.push([
+        whole(1, 0.9, 0),
+        nothing(),
+        whole(2, 0.9, 0),
+        whole(1, 0.3, 0),
+    ]);
+    primary.script.push((0..4).map(|_| det(1, 0)));
+    let got: Vec<Vec<String>> = (0..4)
+        .map(|i| {
+            labels(&ir(&primary, &format!("ir{i}.jpg")).wait())
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        })
+        .collect();
+    assert_eq!(got, [vec!["c1".to_string()], vec![], vec![], vec![]]);
+    // A non-candidate passes unchanged next to a rejected candidate.
+    checker.script.push([nothing()]);
+    primary.script.push([Step::detections(
+        &[
+            [10.0, 18.0, 30.0, 38.0, 0.9, 0.0],
+            [40.0, 18.0, 60.0, 38.0, 0.8, 1.0],
+        ],
+        Duration::ZERO,
+    )]);
+    assert_eq!(labels(&ir(&primary, "two.jpg").wait()), ["c0"]);
+    let m = &primary.handle.metrics;
+    assert_eq!(m.verified(Outcome::Kept), 1);
+    assert_eq!(m.verified(Outcome::Rejected), 4);
+    assert_eq!(m.verified(Outcome::Unverified), 0);
+    assert_eq!(m.suppressed(SuppressReason::Verify), 4);
+    assert_eq!(checker.script.submits(), 5, "one crop per candidate");
+    assert_eq!(
+        primary.script.submits(),
+        5,
+        "checks are never verified again"
+    );
+    // The checker saw the padded crop: 20x20 box + 4 px on each side.
+    let inputs = checker.script.inputs();
+    assert_eq!(inputs.len(), 5);
+    let frame = crate::image::decode(&gray_jpeg()).unwrap();
+    let stats = crate::image_stats::ImageStats::compute(&frame);
+    let rect = crate::verify::CropRect {
+        x: 6,
+        y: 6,
+        w: 28,
+        h: 28,
+    };
+    assert_eq!(
+        crate::verify::crop_rect([10.0, 10.0, 30.0, 30.0], 0.2, 64, 48),
+        rect
+    );
+    let spec =
+        crate::prep::PrepSpec::new(INPUT.0, INPUT.1, crate::model::ResizeMode::Letterbox, None);
+    let mut pre = spec.preprocessor();
+    let want = crate::prep::PrepPool::prepare_image(
+        &mut pre,
+        &crate::prep::TensorPool::new(),
+        crate::verify::crop(&frame, rect),
+        stats,
+        &spec,
+        false,
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(inputs[0], want.chw.to_vec());
+    assert_eq!(
+        checker
+            .handle
+            .metrics
+            .suppressed(SuppressReason::NightThreshold),
+        0
+    );
+    assert_eq!(checker.handle.metrics.verified(Outcome::Kept), 0);
+    primary.stop();
+    checker.stop();
+}
+
+#[test]
+fn day_frames_are_not_verified_when_night_only() {
+    let (primary, checker, _peers) =
+        primary_and_checker(live_verified("checker", |_| {}), live_with_night(None));
+    primary.script.push([det(1, 0)]);
+    assert_eq!(labels(&primary.send("day.jpg").wait()), ["c1"]);
+    assert_eq!(checker.script.submits(), 0);
+    assert_eq!(primary.handle.metrics.verified(Outcome::Kept), 0);
+    // With night_only off the day frame is checked too.
+    assert!(
+        primary
+            .handle
+            .set_live(live_verified("checker", |v| v.night_only = false))
+    );
+    checker.script.push([nothing()]);
+    primary.script.push([det(1, 0)]);
+    assert!(labels(&primary.send("day.jpg").wait()).is_empty());
+    assert_eq!(checker.script.submits(), 1);
+    primary.stop();
+    checker.stop();
+}
+
+#[test]
+fn unavailable_verifier_leaves_candidates_unverified() {
+    let peers = Peers::new();
+    let primary = Harness::start_named(
+        "primary",
+        1,
+        live_verified("checker", |_| {}),
+        peers.clone(),
+    );
+    // Not served.
+    primary.script.push([det(1, 0)]);
+    assert_eq!(labels(&ir(&primary, "a.jpg").wait()), ["c1"]);
+    // Failed (not ready).
+    let failed = Arc::new(WorkerHandle::failed(
+        "checker",
+        "broken",
+        Arc::new(ModelMetrics::new("checker", "auto", "")),
+    ));
+    peers.publish([&primary.handle, &failed]);
+    primary.script.push([det(1, 0)]);
+    assert_eq!(labels(&ir(&primary, "b.jpg").wait()), ["c1"]);
+    // The model itself is never its verifier.
+    assert!(primary.handle.set_live(live_verified("PRIMARY", |_| {})));
+    primary.script.push([det(1, 0)]);
+    assert_eq!(labels(&ir(&primary, "c.jpg").wait()), ["c1"]);
+    let m = &primary.handle.metrics;
+    assert_eq!(m.verified(Outcome::Unverified), 3);
+    assert_eq!(m.verified(Outcome::Rejected), 0);
+    drop(failed);
+    primary.stop();
+}
+
+#[test]
+fn verifier_past_the_deadline_leaves_candidates_unverified() {
+    let (primary, checker, _peers) =
+        primary_and_checker(live_verified("checker", |_| {}), live_with_night(None));
+    // The request arrived 29.5 s ago (timeout 30 s): 0.5 s are left, the checker needs 3 s.
+    checker.script.push([whole(1, 0.9, 3000)]);
+    primary.script.push([det(1, 0)]);
+    let enqueued = Instant::now()
+        .checked_sub(Duration::from_millis(29_500))
+        .unwrap_or_else(Instant::now);
+    let t = Instant::now();
+    let r = primary.send_at(gray_jpeg(), "late.jpg", enqueued).wait();
+    let waited = t.elapsed();
+    assert_eq!(labels(&r), ["c1"], "kept unverified");
+    assert!(waited >= Duration::from_millis(400), "{waited:?}");
+    assert!(waited < Duration::from_millis(2500), "{waited:?}");
+    assert_eq!(primary.handle.metrics.verified(Outcome::Unverified), 1);
+    assert!(r.processMs >= 400, "verify time counts: {}", r.processMs);
+    primary.stop();
+    checker.stop();
+}
+
+#[test]
+fn slow_verifier_does_not_delay_other_requests() {
+    let (primary, checker, _peers) =
+        primary_and_checker(live_verified("checker", |_| {}), live_with_night(None));
+    checker.script.push([whole(1, 0.9, 800)]);
+    // A has a candidate (slow check), B and C have none, D is a day frame.
+    primary
+        .script
+        .push([det(1, 0), det(0, 0), det(2, 0), det(1, 0)]);
+    let t = Instant::now();
+    let a = ir(&primary, "a.jpg");
+    let b = ir(&primary, "b.jpg");
+    let c = ir(&primary, "c.jpg");
+    let d = primary.send("d.jpg");
+    let got = wait_all(vec![a, b, c, d]);
+    assert_eq!(labels(&got[0].0), ["c1"], "confirmed");
+    assert_eq!(labels(&got[1].0), ["c0"]);
+    assert_eq!(labels(&got[2].0), ["c2"]);
+    assert_eq!(labels(&got[3].0), ["c1"], "day frame, not verified");
+    // B, C and D were answered while A's check was still running.
+    for (i, (_, at)) in got.iter().enumerate().skip(1) {
+        assert!(*at < got[0].1, "request {i} waited for the verification");
+    }
+    assert!(got[0].1 - t >= Duration::from_millis(750));
+    assert!(got[0].0.processMs >= 750, "{}", got[0].0.processMs);
+    primary.stop();
+    checker.stop();
+}
+
+#[test]
+fn frame_mode_matches_candidates_by_iou_on_the_whole_frame() {
+    let (primary, checker, _peers) = primary_and_checker(
+        live_verified("checker", |v| v.mode = VerifyMode::Frame),
+        live_with_night(None),
+    );
+    // The same place as the primary's c1 box (frame [10, 10, 30, 30]); then elsewhere.
+    checker.script.push([
+        det(1, 0),
+        Step::detections(&[[40.0, 18.0, 60.0, 38.0, 0.9, 1.0]], Duration::ZERO),
+    ]);
+    primary.script.push([det(1, 0), det(1, 0)]);
+    assert_eq!(labels(&ir(&primary, "a.jpg").wait()), ["c1"]);
+    assert!(labels(&ir(&primary, "b.jpg").wait()).is_empty());
+    // The whole frame went to the checker, letterboxed like an upload.
+    let want = {
+        let spec =
+            crate::prep::PrepSpec::new(INPUT.0, INPUT.1, crate::model::ResizeMode::Letterbox, None);
+        let mut pre = spec.preprocessor();
+        let tensors = crate::prep::TensorPool::new();
+        crate::prep::PrepPool::prepare_now(
+            &mut pre,
+            &tensors,
+            &gray_jpeg(),
+            &spec,
+            false,
+            Default::default(),
+        )
+        .unwrap()
+        .chw
+        .to_vec()
+    };
+    assert_eq!(checker.script.inputs()[0], want);
+    primary.stop();
+    checker.stop();
+}
+
+#[test]
+fn routed_night_frames_use_the_night_models_verifier() {
+    let peers = Peers::new();
+    let checker = Harness::start_named("checker", 1, live_with_night(None), peers.clone());
+    let night = Harness::start_named("night", 1, live_verified("checker", |_| {}), peers.clone());
+    // The primary's own verify is not used for frames the night model answers.
+    let mut day_live = live_verified("nobody", |_| {});
+    day_live.night_model = Some("night".into());
+    let day = Harness::start_named("day", 1, day_live, peers.clone());
+    peers.publish([&day.handle, &night.handle, &checker.handle]);
+    night.script.push([det(1, 0)]);
+    checker.script.push([nothing()]);
+    assert!(labels(&ir(&day, "ir.jpg").wait()).is_empty());
+    assert_eq!(night.handle.metrics.verified(Outcome::Rejected), 1);
+    assert_eq!(day.handle.metrics.verified(Outcome::Unverified), 0);
+    assert_eq!(checker.script.submits(), 1);
+    day.stop();
+    night.stop();
+    checker.stop();
 }
