@@ -117,6 +117,8 @@ struct Generation {
     watcher: Option<std::thread::JoinHandle<()>>,
     /// Reloads models that fail while serving ([`crate::supervisor`]).
     supervisor: Option<std::thread::JoinHandle<()>>,
+    /// Applies config file edits made on disk ([`crate::config_store::spawn_disk_watch`]).
+    disk_watch: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Generation {
@@ -129,6 +131,7 @@ impl Generation {
             workers,
             watcher,
             supervisor,
+            disk_watch,
         } = self;
         state.restart.cancel();
         let deadline = Instant::now() + drain;
@@ -152,6 +155,11 @@ impl Generation {
             && s.join().is_err()
         {
             warn!("model supervisor panicked");
+        }
+        if let Some(d) = disk_watch
+            && d.join().is_err()
+        {
+            warn!("config file watch panicked");
         }
         // Shut down in place even when a connection task still holds the generation's state
         // (axum drops a connection's router clone after signalling the server future, see
@@ -184,6 +192,7 @@ impl Sweeper {
                     max_mb: c.save_image_max_mb,
                     data_root: c.data_root(),
                     min_free_mb: crate::retention::MIN_FREE_MB,
+                    dataset: Some(crate::collect::CollectSettings::for_config(&c)),
                 }
             }),
             stop.clone(),
@@ -556,6 +565,19 @@ pub fn run_server_with(
             resources_restart.clone(),
         );
         let supervisor = crate::supervisor::spawn(Arc::downgrade(&state), generation.clone());
+        // Applies the config file when it is edited on disk, with no page open.
+        let disk_watch = {
+            let weak = Arc::downgrade(&state);
+            crate::config_store::spawn_disk_watch(
+                crate::config_store::DISK_POLL,
+                generation.clone(),
+                move || {
+                    weak.upgrade()
+                        .map(|state| server::sync_config(&state))
+                        .is_some()
+                },
+            )
+        };
         // The store's generation (and adopted config) changes together with the swap, so pages
         // waiting for the restart see the new generation's models.
         let restarted = !first;
@@ -579,6 +601,7 @@ pub fn run_server_with(
                 workers,
                 watcher,
                 supervisor,
+                disk_watch,
             });
             return run.finish(Err(e));
         }
@@ -594,6 +617,7 @@ pub fn run_server_with(
             workers,
             watcher,
             supervisor,
+            disk_watch,
         };
 
         // Serve until a restart, a shutdown, or the server failing.

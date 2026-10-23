@@ -574,6 +574,38 @@ fn device_choices(snap: &DevicesSnapshot, current: &str, gpu_index: &str) -> Vec
     out
 }
 
+/// The "About exports" notice, derived from the catalog so a new recipe or a restrictive model
+/// license cannot be left out: the notice of every [`ExportRecipe`] an exportable model uses
+/// (catalog order), then each non-commercial / personal-use license with the models under it.
+///
+/// [`ExportRecipe`]: crate::resources::catalog::ExportRecipe
+pub(super) fn export_notice() -> String {
+    use crate::resources::catalog;
+    let mut recipes: Vec<catalog::ExportRecipe> = Vec::new();
+    let mut restricted: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+    for res in catalog::all() {
+        let Some(recipe) = catalog::export_recipe(res) else {
+            continue;
+        };
+        if !recipes.contains(&recipe) {
+            recipes.push(recipe);
+        }
+        let license = res.license.to_ascii_lowercase();
+        if license.contains("non-commercial") || license.contains("personal use") {
+            let name = res.model_name().unwrap_or(res.title);
+            match restricted.iter_mut().find(|(l, _)| *l == res.license) {
+                Some((_, names)) => names.push(name),
+                None => restricted.push((res.license, vec![name])),
+            }
+        }
+    }
+    let mut parts: Vec<String> = recipes.iter().map(|r| r.notice().to_string()).collect();
+    for (license, names) in restricted {
+        parts.push(format!("{}: {license}.", names.join(", ")));
+    }
+    parts.join(" ")
+}
+
 pub(super) fn config_template(
     state: &AppState,
     message: Option<String>,
@@ -668,15 +700,7 @@ pub(super) fn config_template(
         model_path_example,
         models_dir,
         tools_dir,
-        export_notice: [
-            crate::resources::catalog::ExportRecipe::Ultralytics,
-            crate::resources::catalog::ExportRecipe::RfDetr,
-            crate::resources::catalog::ExportRecipe::DeimV2,
-        ]
-        .iter()
-        .map(|r| r.notice())
-        .collect::<Vec<_>>()
-        .join(" "),
+        export_notice: export_notice(),
         force_cpu_note,
         resources_enabled: state.resources.is_some(),
         nav: "config",
@@ -1611,5 +1635,33 @@ mod tests {
         let (_, _, b) = call(&state, post_form("/config/restart?back=models", "", true)).await;
         let b = String::from_utf8(b).unwrap();
         assert!(b.contains("/config#at-models"), "{b}");
+    }
+
+    /// The export notice covers every recipe and every restrictive license in the catalog.
+    #[test]
+    fn export_notice_is_derived_from_the_catalog() {
+        use crate::resources::catalog;
+        let n = super::export_notice();
+        let mut seen = std::collections::HashSet::new();
+        for res in catalog::all() {
+            let Some(r) = catalog::export_recipe(res) else {
+                continue;
+            };
+            if seen.insert(r) {
+                assert!(n.contains(r.notice()), "{r:?} notice missing: {n}");
+            }
+            if res.license.to_ascii_lowercase().contains("non-commercial") {
+                let name = res.model_name().unwrap();
+                assert!(n.contains(name), "{name} missing: {n}");
+                assert!(n.contains(res.license), "{} missing: {n}", res.license);
+            }
+        }
+        // The recipes added with the night work.
+        assert!(seen.contains(&catalog::ExportRecipe::RtDetrV2), "{seen:?}");
+        assert!(n.contains("MegaDetector v6 RT-DETR"), "{n}");
+        assert!(n.contains("exdark-rfdetr-small"), "{n}");
+        assert!(n.contains("trained on ExDark"), "{n}");
+        // Each notice once, however many models share it.
+        assert_eq!(n.matches("Ultralytics YOLO weights and").count(), 1, "{n}");
     }
 }

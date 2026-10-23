@@ -191,7 +191,14 @@ impl OvCore {
         req: &LoadRequest,
         tuning: &DeviceTuning,
     ) -> Result<OvCompiled> {
-        device::load_model(&mut self.core, &self.available, cand, req, tuning)
+        device::load_model(
+            &mut self.core,
+            self.opts.cache_dir.as_deref(),
+            &self.available,
+            cand,
+            req,
+            tuning,
+        )
     }
 
     /// Human readable device description (FULL_DEVICE_NAME) for a device string.

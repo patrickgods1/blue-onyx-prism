@@ -35,8 +35,7 @@ mod status;
 #[cfg(test)]
 mod test_util;
 
-use apply::sync_config;
-pub(crate) use apply::{apply_config, reload_models};
+pub(crate) use apply::{apply_config, reload_models, sync_config};
 use config_page::{
     ConfigView, MessageTemplate, config_loglevel, config_models, config_models_remove, config_page,
     config_restart, config_submit, encode_uri_component, global_device_label, save_config,
