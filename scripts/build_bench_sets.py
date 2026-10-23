@@ -34,6 +34,14 @@ Usage (Python 3.10+, needs Pillow; see scripts/requirements-bench.txt):
   .venv/bin/python -I scripts/build_bench_sets.py --work /tmp/bench-src --set nir-night \
       --review-dir /tmp/nir-night-review [--exclude excluded.txt] [--nacti-persons]
 
+  .venv/bin/python -I scripts/build_bench_sets.py --work /tmp/bench-src --set lila-night-train
+
+lila-night-train builds the public night TRAINING subset assets/train/lila-night.json (not a
+benchmark set; `train --public`): ~3000 night IR frames from Caltech Camera Traps and NACTI with
+boxes for the collect.classes animals and vehicles plus ~15% empty frames, disjoint from
+nir-night by image and by camera location (ENA24, without camera ids, is left out). One line
+per image; `ignore` is omitted (false). Not screened by hand.
+
 nir-night picks a seeded, deterministic set; candidate negatives (LILA "empty" frames can hold
 unlabelled animals or people) are written to a review contact sheet (--review-dir). Put the file
 names to drop, one per line, in an --exclude file and re-run: the next candidates replace them.
@@ -1056,16 +1064,17 @@ def round_robin(cands: list[dict], seed: int) -> list[dict]:
 
 
 class NirFetcher:
-    """Downloads candidates into <work>/nir-night/images and records their pixel checks in
-    checks.json, keyed by GRAY_RULE (reruns reuse it; a rule change re-checks the cached files)."""
+    """Downloads candidates into <work>/<sub>/images (`sub`: nir-night, lila-night-train) and
+    records their pixel checks in checks.json, keyed by GRAY_RULE (reruns reuse it; a rule
+    change re-checks the cached files)."""
 
-    def __init__(self, work: Path):
-        self.dir = work / "nir-night" / "images"
+    def __init__(self, work: Path, sub: str = "nir-night"):
+        self.dir = work / sub / "images"
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = work / "nir-night" / "checks.json"
+        self.db_path = work / sub / "checks.json"
         self.db = json.loads(self.db_path.read_text()) if self.db_path.exists() else {}
         self.fetched = 0
-        self.exif_path = work / "nir-night" / "exif.json"
+        self.exif_path = work / sub / "exif.json"
         self.exif = json.loads(self.exif_path.read_text()) if self.exif_path.exists() else {}
 
     def prefetch(self, cands: list[dict]) -> None:
@@ -1357,6 +1366,487 @@ def interleave(items: list[dict]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------------------------
+# lila-night-train (training subset for `train --public`; disjoint from nir-night)
+
+TRAIN_OUT = REPO / "assets" / "train" / "lila-night.json"
+# CCT categories kept, named as collect.classes names them (src/collect/config.rs DEFAULT_CLASSES).
+# An image with any other category (coyote, bobcat, rabbit, rodent, badger, insect, ...) is left
+# out: its animal would be trained as background, and the training reader rejects ignore regions.
+LT_CCT_MAP = {
+    "opossum": "opossum", "raccoon": "raccoon", "deer": "deer", "skunk": "skunk", "fox": "fox", "cat": "cat",
+    "dog": "dog", "car": "car", "bird": "bird", "squirrel": "squirrel",
+}
+LT_CLASSES = ["car", "dog", "cat", "raccoon", "opossum", "skunk", "fox", "deer", "squirrel", "bird"]
+# WCS Camera Traps (species-level boxes, capture times, locations; 12 countries).
+WCS_BBOX_URL = f"{LILA}/wcs/wcs_20220205_bboxes_with_classes.zip"
+WCS_BBOX_SHA256 = "59f5e0b7774ea35a2fd250fbdb05d493a7738602aa1450ccfbaa8d7f5147b382"
+WCS_IMAGES = f"{LILA}/wcs-unzipped/"
+# Channel Islands Camera Traps (every animal boxed; no capture times: night by the grayscale test
+# and NO_TIME_MAX_LUMA).
+CIS_URL = f"{LILA}/channel-islands-camera-traps/channel-islands-camera-traps.json.zip"
+CIS_SHA256 = "9bdf2bfe330ad5917cf3abaa46d3f03dcebc1c5f959033631c4fd57a5be88cc4"
+CIS_IMAGES = f"{LILA}/channel-islands-camera-traps/images/"
+CIS_MAP = {"fox": "fox", "skunk": "skunk", "bird": "bird"}
+# WCS species (genus) -> class; any other species (peccary, ocelot, rodent, coyote, ...) leaves
+# the image out.
+WCS_SPECIES = {"canis familiaris": "dog", "vehicle": "car", "unknown bird": "bird", "ave desconocida": "bird",
+               "unknown opossum": "opossum", "unknown squirrel": "squirrel"}
+WCS_GENUS = {
+    "didelphis": "opossum", "philander": "opossum", "procyon": "raccoon", "conepatus": "skunk",
+    "mephitis": "skunk", "spilogale": "skunk", "vulpes": "fox", "urocyon": "fox", "cerdocyon": "fox",
+    "lycalopex": "fox", "otocyon": "fox", "odocoileus": "deer", "mazama": "deer", "muntiacus": "deer",
+    "capreolus": "deer", "cervus": "deer", "axis": "deer", "rusa": "deer", "dama": "deer", "pudu": "deer",
+    "blastocerus": "deer", "felis": "cat", "sciurus": "squirrel", "tamiasciurus": "squirrel",
+    "callosciurus": "squirrel", "funisciurus": "squirrel", "heliosciurus": "squirrel", "paraxerus": "squirrel",
+    "protoxerus": "squirrel", "sundasciurus": "squirrel", "microsciurus": "squirrel", "ratufa": "squirrel",
+    "xerus": "squirrel", "dremomys": "squirrel",
+}
+WCS_BIRD_GENERA = {
+    "meleagris", "mitu", "crax", "pauxi", "penelope", "ortalis", "aburria", "psophia", "tinamus", "crypturellus",
+    "coua", "argusianus", "lophotibis", "aramides", "polyplectron", "lophura", "burhinus", "neochen", "francolinus",
+    "geotrygon", "leptotila", "cisticola", "turtur", "geobiastes", "brachypteracias", "guttera", "numida",
+    "acryllium", "nesoenas", "columba", "streptopelia", "cochlearius", "buteogallus", "vanellus", "struthio",
+    "neomorphus", "gallus", "lamprotornis", "anhima", "circus", "ficedula", "odontophorus", "copsychus", "tyto",
+    "otus", "coragyps", "nisaetus", "alectoris", "pavo", "chalcophaps", "rollulus", "megapodius",
+}
+# Images that contain the class (an image counts toward every class it holds). The rare classes
+# (dog, car, bird, squirrel) take what passes the checks.
+LT_QUOTA = {
+    "opossum": 520, "raccoon": 520, "deer": 520, "skunk": 520, "fox": 520, "cat": 520, "car": 300, "dog": 300,
+    "bird": 300, "squirrel": 300,
+}
+LT_EMPTY_SHARE = 0.15  # of the final set
+LT_MAX_MB = 1450.0
+LT_GROUP_ORDER = ["squirrel", "bird", "dog", "car", "cat", "fox", "skunk", "deer", "raccoon", "opossum", "empty"]
+
+
+def nacti_camera(file_name: str) -> str:
+    """NACTI camera id from the file name (`part0/sub072/CA-28_08_03_2015_CA-28_0008862.jpg` ->
+    `CA-28`); the metadata's `location` is the study area (3 values), not the camera."""
+    return safe_name(file_name).split("_", 1)[0]
+
+
+def lt_cct(d: Path) -> tuple[list[dict], list[dict], dict[str, str]]:
+    """(night boxed candidates whose every box maps to LT_CLASSES, night empty candidates,
+    file -> location of every CCT image in either metadata file)."""
+    bb = json.loads(cached(d / "caltech_bboxes_20200316.json", CCT_BBOX_URL, CCT_BBOX_SHA256))
+    cats = {c["id"]: c["name"] for c in bb["categories"]}
+    by_img: dict[str, list] = {}
+    for a in bb["annotations"]:
+        by_img.setdefault(a["image_id"], []).append(a)
+    loc_of: dict[str, str] = {}
+    pos = []
+    for im in bb["images"]:
+        f = "cct-" + safe_name(im["file_name"])
+        loc_of[f] = f"cct:{im['location']}"
+        anns = by_img.get(im["id"], [])
+        names = {cats[a["category_id"]] for a in anns}
+        if not anns or not names <= set(LT_CCT_MAP) or any("bbox" not in a for a in anns):
+            continue
+        if night_hour(im.get("date_captured")) is not True:
+            continue
+        w, h = im["width"], im["height"]
+        objs = []
+        for a in anns:
+            x, y, bw, bh = a["bbox"]
+            box = clip_box(x, y, x + bw, y + bh, w, h)
+            if box is not None:
+                objs.append({"label": LT_CCT_MAP[cats[a["category_id"]]], "bbox": box, "ignore": False})
+        if not objs:
+            continue
+        pos.append({
+            "file": f, "url": CCT_IMAGES + safe_name(im["file_name"]), "width": w, "height": h, "objects": objs,
+            "source": "cct", "location": loc_of[f], "seq": im.get("seq_id"), "date": im.get("date_captured"),
+        })
+    z = zipfile.ZipFile(io.BytesIO(cached(d / "caltech_camera_traps.json.zip", CCT_LABELS_URL, CCT_LABELS_SHA256)))
+    lab = json.loads(z.read("caltech_images_20210113.json"))
+    lcats = {c["id"]: c["name"] for c in lab["categories"]}
+    labels_of: dict[str, set] = {}
+    for a in lab["annotations"]:
+        labels_of.setdefault(a["image_id"], set()).add(lcats[a["category_id"]])
+    neg = []
+    for im in lab["images"]:
+        f = "cct-" + safe_name(im["file_name"])
+        loc = f"cct:{im['location']}"
+        if loc_of.setdefault(f, loc) != loc:
+            raise SystemExit(f"CCT: {f} has two locations ({loc_of[f]}, {loc})")
+        if labels_of.get(im["id"]) != {"empty"} or night_hour(im.get("date_captured")) is not True:
+            continue
+        neg.append({
+            "file": f, "url": CCT_IMAGES + safe_name(im["file_name"]), "width": im["width"], "height": im["height"],
+            "objects": [], "source": "cct", "location": loc, "seq": im.get("seq_id"), "date": im.get("date_captured"),
+        })
+    return pos, neg, loc_of
+
+
+def lt_nacti_vehicles(d: Path) -> list[dict]:
+    """NACTI frames whose every box is a vehicle (car); night is decided by EXIF time or, without
+    one, by the grayscale test plus NO_TIME_MAX_LUMA. Location = the camera."""
+    z = zipfile.ZipFile(io.BytesIO(cached(d / "nacti_20230920_bboxes.zip", NACTI_BBOX_URL, NACTI_BBOX_SHA256)))
+    n = json.loads(z.read("nacti_20230920_bboxes.json"))
+    cats = {c["id"]: c["name"] for c in n["categories"]}
+    by_img: dict[str, list] = {}
+    for a in n["annotations"]:
+        by_img.setdefault(a["image_id"], []).append(a)
+    out = []
+    for im in n["images"]:
+        anns = by_img.get(im["id"], [])
+        if not anns or {cats[a["category_id"]] for a in anns} != {"vehicle"}:
+            continue
+        fn = im["file_name"]
+        if not re.fullmatch(r"part[0-9]/sub[0-9]{3}/[A-Za-z0-9][A-Za-z0-9._-]{0,200}", fn):
+            continue
+        w, h = im["width"], im["height"]
+        objs = []
+        for a in anns:
+            x, y, bw, bh = a["bbox"]
+            box = clip_box(x, y, x + bw, y + bh, w, h)
+            if box is not None:
+                objs.append({"label": "car", "bbox": box, "ignore": False})
+        if not objs:
+            continue
+        base = safe_name(fn)
+        out.append({
+            "file": "nacti-" + base.rsplit(".", 1)[0] + ".jpg" if base.lower().endswith(".jpg") else "nacti-" + base,
+            "url": NACTI_IMAGES + urllib.parse.quote(fn), "width": w, "height": h, "objects": objs,
+            "source": "nacti", "location": f"nacti:{nacti_camera(fn)}", "seq": "nacti:" + base.rsplit("_", 1)[0],
+            "date": None,
+        })
+    return out
+
+
+def wcs_label(name: str) -> str | None:
+    if name in WCS_SPECIES:
+        return WCS_SPECIES[name]
+    genus = name.split(" ", 1)[0]
+    if genus in WCS_BIRD_GENERA:
+        return "bird"
+    return WCS_GENUS.get(genus)
+
+
+def lt_wcs(d: Path) -> tuple[list[dict], list[dict]]:
+    """(night boxed candidates whose every box maps to LT_CLASSES, night empty candidates) of WCS
+    Camera Traps. Images in `humans/` (not public) and corrupt ones are left out."""
+    w = json.loads(zipfile.ZipFile(io.BytesIO(cached(d / "wcs_20220205_bboxes_with_classes.zip", WCS_BBOX_URL,
+                                                     WCS_BBOX_SHA256))).read("wcs_20220205_bboxes_with_classes.json"))
+    cats = {c["id"]: c["name"] for c in w["categories"]}
+    by_img: dict[str, list] = {}
+    for a in w["annotations"]:
+        by_img.setdefault(a["image_id"], []).append(a)
+    pos, neg = [], []
+    for im in w["images"]:
+        fn = im["file_name"]
+        dt = im.get("datetime") if isinstance(im.get("datetime"), str) else None
+        if im.get("corrupt") or not re.fullmatch(r"animals/[0-9]{4}/[0-9]{1,6}\.jpg", fn) or night_hour(dt) is not True:
+            continue
+        anns = by_img.get(im["id"], [])
+        names = {cats[a["category_id"]] for a in anns}
+        c = {
+            "file": "wcs-" + fn[len("animals/"):].replace("/", "-"), "url": WCS_IMAGES + fn, "width": im["width"],
+            "height": im["height"], "objects": [], "source": "wcs", "location": f"wcs:{im['location']}",
+            "seq": "wcs:" + str(im.get("seq_id")), "date": dt,
+        }
+        if names == {"empty"}:
+            neg.append(c)
+            continue
+        labels = {n: wcs_label(n) for n in names}
+        if not anns or None in labels.values() or any("bbox" not in a for a in anns):
+            continue
+        w_, h_ = im["width"], im["height"]
+        for a in anns:
+            x, y, bw, bh = a["bbox"]
+            box = clip_box(x, y, x + bw, y + bh, w_, h_)
+            if box is not None:
+                c["objects"].append({"label": labels[cats[a["category_id"]]], "bbox": box, "ignore": False})
+        if c["objects"]:
+            pos.append(c)
+    return pos, neg
+
+
+def lt_cis(d: Path) -> tuple[list[dict], list[dict]]:
+    """(fox / skunk / bird candidates, empty candidates) of Channel Islands Camera Traps. No
+    capture times: night is the grayscale test plus NO_TIME_MAX_LUMA (checked after download).
+    Images with a rodent, human or other box are left out."""
+    j = json.loads(zipfile.ZipFile(io.BytesIO(cached(d / "channel-islands-camera-traps.json.zip", CIS_URL,
+                                                     CIS_SHA256))).read("channel_islands_camera_traps.json"))
+    cats = {c["id"]: c["name"] for c in j["categories"]}
+    by_img: dict[str, list] = {}
+    for a in j["annotations"]:
+        by_img.setdefault(a["image_id"], []).append(a)
+    pos, neg = [], []
+    for im in j["images"]:
+        fn = im["file_name"]
+        if not re.fullmatch(r"loc-[0-9a-z]{1,40}/[0-9]{3}/[0-9]{3}\.jpg", fn):
+            continue
+        anns = by_img.get(im["id"], [])
+        names = {cats[a["category_id"]] for a in anns}
+        c = {
+            "file": "cis-" + fn[len("loc-"):].replace("/", "-"), "url": CIS_IMAGES + fn, "width": im["width"],
+            "height": im["height"], "objects": [], "source": "cis", "location": f"cis:{im['location']}",
+            "seq": "cis:" + str(im.get("seq_id")), "date": None,
+        }
+        if names == {"empty"}:
+            neg.append(c)
+            continue
+        if not anns or not names <= set(CIS_MAP) or any("bbox" not in a for a in anns):
+            continue
+        for a in anns:
+            x, y, bw, bh = a["bbox"]
+            box = clip_box(x, y, x + bw, y + bh, im["width"], im["height"])
+            if box is not None:
+                c["objects"].append({"label": CIS_MAP[cats[a["category_id"]]], "bbox": box, "ignore": False})
+        if c["objects"]:
+            pos.append(c)
+    return pos, neg
+
+
+def nir_night_footprint(cct_loc: dict[str, str]) -> tuple[set[str], set[str]]:
+    """(files, locations) of the nir-night benchmark set. ENA24 has no camera ids, so a single
+    ENA24 frame in nir-night puts all of ENA24 off limits (location `ena24`)."""
+    m = json.loads((OUT_DIR / "nir-night.json").read_text(encoding="utf-8"))
+    files, locs = set(), set()
+    for im in m["images"]:
+        f = im["file"]
+        files.add(f)
+        if f.startswith("cct-"):
+            if f not in cct_loc:
+                raise SystemExit(f"nir-night: {f} is in neither CCT metadata file")
+            locs.add(cct_loc[f])
+        elif f.startswith("nacti-"):
+            locs.add(f"nacti:{nacti_camera(f[len('nacti-'):])}")
+        elif f.startswith("ena24-"):
+            locs.add("ena24")
+        else:
+            raise SystemExit(f"nir-night: unknown source of {f}")
+    return files, locs
+
+
+def lt_group(c: dict) -> str:
+    """The rarest class of the image (LT_GROUP_ORDER), or `empty`."""
+    labels = {o["label"] for o in c["objects"]}
+    return next((g for g in LT_GROUP_ORDER if g in labels), "empty")
+
+
+def pick_train(pool: list[dict], fetch: NirFetcher, *, want, max_tries: int, used: set, seq_n: Counter,
+               per_seq: int, label: str) -> list[dict]:
+    """pick_nir with up to `per_seq` images per sequence (rare classes take several frames of one
+    visit; the common ones one)."""
+    out: list[dict] = []
+    tries = 0
+    prefetched = 0
+    for i, c in enumerate(pool):
+        if not want(out) or tries >= max_tries:
+            break
+        seq = c.get("seq") or c["file"]
+        if c["file"] in used or seq_n[seq] >= per_seq:
+            continue
+        if i >= prefetched:
+            batch = [x for x in pool[i:i + 96] if x["file"] not in used and seq_n[x.get("seq") or x["file"]] < per_seq]
+            fetch.prefetch(batch)
+            prefetched = i + 96
+        tries += 1
+        rec = fetch.check(c)
+        if not rec or not rec.get("ok"):
+            continue
+        if not c.get("date") and rec["luma"] > NO_TIME_MAX_LUMA:
+            continue
+        c = dict(c, **{k: rec[k] for k in ("sha256", "size", "width", "height", "spread", "luma")})
+        out.append(c)
+        used.add(c["file"])
+        seq_n[seq] += 1
+    log(f"  {label}: accepted {len(out)} after {tries} checks")
+    return out
+
+
+def build_lila_night_train(work: Path, coco80: list[str], args) -> dict:
+    d = work / "lila"
+    cct_pos, cct_neg, cct_loc = lt_cct(d)
+    nacti = lt_nacti_vehicles(d)
+    wcs_pos, wcs_neg = lt_wcs(d)
+    cis_pos, cis_neg = lt_cis(d)
+    nir_files, nir_locs = nir_night_footprint(cct_loc)
+    log(f"  nir-night footprint: {len(nir_files)} files, {len(nir_locs)} locations {sorted(nir_locs)}")
+
+    def allowed(c: dict) -> bool:
+        return c["file"] not in nir_files and c["location"] not in nir_locs
+
+    pos = [c for c in cct_pos + nacti + wcs_pos + cis_pos if allowed(c)]
+    neg = [c for c in cct_neg + wcs_neg + cis_neg if allowed(c)]
+    log(f"  candidates: CCT night boxed {len(cct_pos)} / empty {len(cct_neg)}, NACTI vehicle-only {len(nacti)}, "
+        f"WCS night boxed {len(wcs_pos)} / empty {len(wcs_neg)}, CIS boxed {len(cis_pos)} / empty {len(cis_neg)}; "
+        f"outside nir-night's locations: {len(pos)} boxed, {len(neg)} empty")
+    fetch = NirFetcher(work, "lila-night-train")
+    used: set[str] = set()
+    seq_n: Counter = Counter()
+    picked: list[dict] = []
+    try:
+        def has(c: dict, cls: str) -> bool:
+            return any(o["label"] == cls for o in c["objects"])
+
+        for cls in sorted(LT_CLASSES, key=lambda k: (sum(1 for c in pos if has(c, k)), k)):
+            have = sum(1 for c in picked if has(c, cls))
+            want_n = LT_QUOTA[cls] - have
+            cands = [c for c in pos if has(c, cls)]
+            per_seq = 1 if len(cands) >= 6 * LT_QUOTA[cls] else 3
+            picked += pick_train(round_robin(cands, args.seed + len(cls)), fetch,
+                                 want=lambda out, n=want_n: len(out) < n, max_tries=max(want_n, 0) * 8,
+                                 used=used, seq_n=seq_n, per_seq=per_seq, label=cls)
+        n_empty = round(len(picked) * LT_EMPTY_SHARE / (1 - LT_EMPTY_SHARE))
+        picked += pick_train(round_robin(neg, args.seed + 202), fetch, want=lambda out: len(out) < n_empty,
+                             max_tries=n_empty * 8, used=used, seq_n=seq_n, per_seq=1, label="empty")
+    finally:
+        fetch.save()
+    # Leakage check: nothing of nir-night, by file or by camera location.
+    leak = [c["file"] for c in picked if not allowed(c)]
+    if leak:
+        raise SystemExit(f"lila-night-train: {len(leak)} images overlap nir-night: {leak[:5]}")
+    total = sum(c["size"] for c in picked)
+    if total > args.max_mb * 1e6:
+        raise SystemExit(f"lila-night-train: {total / 1e6:.1f} MB exceeds the {args.max_mb} MB budget")
+    for c in picked:
+        c["group"] = lt_group(c)
+        c["objects"].sort(key=lambda o: (o["bbox"][1], o["bbox"][0], o["label"]))
+    picked.sort(key=lambda c: (LT_GROUP_ORDER.index(c["group"]), c["file"]))
+    # Spread the groups evenly (largest remainder), as interleave() does for nir-night.
+    groups: dict[str, list] = {}
+    for c in picked:
+        groups.setdefault(c["group"], []).append(c)
+    keyed = [((i + 0.5) / len(lst), LT_GROUP_ORDER.index(g), i) for g, lst in groups.items() for i in range(len(lst))]
+    picked = [groups[LT_GROUP_ORDER[gi]][i] for _, gi, i in sorted(keyed)]
+    images = []
+    for c in picked:
+        tags = ["ir", "camera:" + c["location"].replace(":", "-")] + (["empty"] if not c["objects"] else [])
+        images.append({
+            "file": c["file"], "url": c["url"], "sha256": c["sha256"], "size": c["size"], "width": c["width"],
+            "height": c["height"], "tags": tags,
+            # `ignore` defaults to false in the reader: left out to keep the manifest small.
+            "objects": [{"label": o["label"], "bbox": [round(v, 1) for v in o["bbox"]]} for o in c["objects"]],
+        })
+    per_class = Counter(o["label"] for c in picked for o in c["objects"])
+    img_class = Counter(lb for c in picked for lb in {o["label"] for o in c["objects"]})
+    srcs = Counter(c["source"] for c in picked)
+    locs = {c["location"] for c in picked}
+    n_empty = sum(1 for c in picked if not c["objects"])
+    counts = ", ".join(f"{img_class[k]} {k}" for k in sorted(img_class, key=lambda k: -img_class[k]))
+    return {
+        "id": "lila-night",
+        "title": "Night IR camera-trap training subset (LILA BC)",
+        "description": (
+            f"{len(images)} night infrared (monochrome) frames from fixed outdoor camera traps at {len(locs)} camera "
+            f"locations, {total / 1e6:.0f} MB ({total} bytes): images with {counts} ({sum(per_class.values())} boxes), "
+            f"and {n_empty} empty frames ({100 * n_empty / len(images):.0f}%, hard negatives). Sources: Caltech Camera "
+            f"Traps ({srcs.get('cct', 0)}) and WCS Camera Traps ({srcs.get('wcs', 0)}) by capture time 20:00-05:00, "
+            f"Channel Islands Camera Traps ({srcs.get('cis', 0)}; no capture times) and NACTI vehicle frames "
+            f"({srcs.get('nacti', 0)}; EXIF time where present) by a mean luma below {NO_TIME_MAX_LUMA:.0f} when "
+            "there is no time; every frame passes the grayscale "
+            f"(IR) test (chroma spread < {GRAY_SPREAD}/255). Every animal in a frame is boxed with one of these labels "
+            "(species mapped: e.g. brocket deer and muntjac are deer, gray and culpeo foxes fox, wildcats cat): frames "
+            "with other animals (coyote, bobcat, rabbit, rodent, peccary, ...) are left out. Disjoint from the nir-night "
+            "benchmark set by image and by camera location (none of its cameras is used; ENA24, which has no camera "
+            "ids, is left out entirely). Not reviewed by hand: the empty frames are those LILA labels empty, and LILA's "
+            "empty labels are per sequence, so a few may hold a missed (often small or distant) animal. Labels are "
+            "collect.classes names (vehicles are car); boxes are pixels [x_min, y_min, x_max, y_max]."
+        ),
+        "license": "CDLA-Permissive-1.0 (Community Data License Agreement - Permissive, https://cdla.io/permissive-1-0/)",
+        "attribution": (
+            "Images and annotations from LILA BC (Labeled Information Library of Alexandria: Biology and Conservation, "
+            "https://lila.science). Caltech Camera Traps: Sara Beery, Grant Van Horn, Pietro Perona, 'Recognition in "
+            "Terra Incognita', ECCV 2018 (images courtesy of the USGS and NPS; Justin Brown, Erin Boydston). WCS Camera "
+            "Traps: the Wildlife Conservation Society. Channel Islands Camera Traps: The Nature Conservancy of "
+            "California. NACTI: Tabak et al., 'Machine learning to classify animal species in camera trap images: "
+            "Applications in ecology', Methods in Ecology and Evolution 10(4):585-590, 2019. Subset selection, night/IR "
+            "filtering and label mapping by Blue Onyx Prism."
+        ),
+        "source": "https://lila.science (caltech-camera-traps, wcscameratraps, channel-islands-camera-traps, nacti)",
+        "revision": (
+            f"cct bboxes {CCT_BBOX_SHA256[:12]}, cct labels {CCT_LABELS_SHA256[:12]}, wcs bboxes {WCS_BBOX_SHA256[:12]}, "
+            f"cis {CIS_SHA256[:12]}, nacti bboxes {NACTI_BBOX_SHA256[:12]}; seed {args.seed}; minus nir-night "
+            f"{len(nir_files)} files / {len(nir_locs)} locations"
+        ),
+        "images": images,
+    }
+
+
+def write_train_manifest(manifest: dict) -> Path:
+    """One line per image (the manifest is embedded in the binary)."""
+    head = {k: v for k, v in manifest.items() if k != "images"}
+    lines = ["{"]
+    for k, v in head.items():
+        lines.append(f" {json.dumps(k)}: {json.dumps(v, ensure_ascii=False)},")
+    lines.append(' "images": [')
+    rows = [" " + json.dumps(im, ensure_ascii=False, separators=(",", ":")) for im in manifest["images"]]
+    lines.append(",\n".join(rows))
+    lines.append(" ]")
+    lines.append("}")
+    TRAIN_OUT.parent.mkdir(parents=True, exist_ok=True)
+    TRAIN_OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log(f"  wrote {TRAIN_OUT} ({len(manifest['images'])} images, {TRAIN_OUT.stat().st_size} bytes)")
+    return TRAIN_OUT
+
+
+def validate_train(path: Path, work: Path | None) -> dict:
+    """Format checks (as the training reader needs it: no ignore regions, every image with url,
+    sha256, size, dims and objects) plus the nir-night disjointness by file and camera tag."""
+    m = json.loads(path.read_text(encoding="utf-8"))
+    errors: list[str] = []
+    files: set[str] = set()
+    for im in m["images"]:
+        if set(im) != {"file", "url", "sha256", "size", "width", "height", "tags", "objects"}:
+            errors.append(f"image keys {sorted(im)}")
+            continue
+        if im["file"] in files:
+            errors.append(f"duplicate {im['file']}")
+        files.add(im["file"])
+        if safe_name(im["file"]) != im["file"] or not im["url"].startswith("https://"):
+            errors.append(f"{im['file']}: bad name or url")
+        if not re.fullmatch(r"[0-9a-f]{64}", im["sha256"]) or im["size"] <= 0:
+            errors.append(f"{im['file']}: sha256 / size")
+        if not any(t.startswith("camera:") for t in im["tags"]) or "ir" not in im["tags"]:
+            errors.append(f"{im['file']}: tags {im['tags']}")
+        if ("empty" in im["tags"]) != (not im["objects"]):
+            errors.append(f"{im['file']}: empty tag vs objects")
+        for o in im["objects"]:
+            if set(o) != {"label", "bbox"} or o["label"] not in LT_CLASSES:
+                errors.append(f"{im['file']}: object {o}")
+                continue
+            x0, y0, x1, y1 = o["bbox"]
+            if not (0 <= x0 < x1 <= im["width"] and 0 <= y0 < y1 <= im["height"]):
+                errors.append(f"{im['file']}: bbox {o['bbox']} outside {im['width']}x{im['height']}")
+        if work is not None:
+            p = work / "lila-night-train" / "images" / im["file"]
+            if p.exists():
+                data = p.read_bytes()
+                if hashlib.sha256(data).hexdigest() != im["sha256"] or len(data) != im["size"]:
+                    errors.append(f"{im['file']}: local copy sha/size mismatch")
+    if work is not None:
+        _, _, cct_loc = lt_cct(work / "lila")
+        nir_files, nir_locs = nir_night_footprint(cct_loc)
+        cams = {t[len("camera:"):] for im in m["images"] for t in im["tags"] if t.startswith("camera:")}
+        bad_locs = cams & {l.replace(":", "-") for l in nir_locs}
+        if files & nir_files or bad_locs:
+            errors.append(f"overlaps nir-night: files {sorted(files & nir_files)[:5]}, locations {sorted(bad_locs)}")
+        log(f"  leakage check: 0 of {len(nir_files)} nir-night files, 0 of {len(nir_locs)} nir-night locations "
+            f"among {len(cams)} cameras" if not (files & nir_files or bad_locs) else "  leakage check FAILED")
+    if errors:
+        raise SystemExit(f"{path.name}: " + "; ".join(errors[:10]))
+    return m
+
+
+def train_stats(m: dict) -> str:
+    total = sum(im["size"] for im in m["images"])
+    boxes = Counter(o["label"] for im in m["images"] for o in im["objects"])
+    imgs = Counter(lb for im in m["images"] for lb in {o["label"] for o in im["objects"]})
+    cams = Counter(t for im in m["images"] for t in im["tags"] if t.startswith("camera:"))
+    empty = sum(1 for im in m["images"] if not im["objects"])
+    return "\n".join([
+        f"== {m['id']}: {len(m['images'])} images, {total / 1e6:.1f} MB ({total} bytes), {empty} empty",
+        f"   images per class: {dict(imgs.most_common())}",
+        f"   boxes per class: {dict(boxes.most_common())}",
+        f"   cameras: {len(cams)} (most images at one: {cams.most_common(3)})",
+    ])
+
+
+# --------------------------------------------------------------------------------------------
 # validation / stats
 
 
@@ -1449,7 +1939,8 @@ def stats(m: dict) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", type=Path, required=True, help="download/cache directory (untrusted data)")
-    ap.add_argument("--set", choices=["all", *DEFAULTS], default="all")
+    ap.add_argument("--set", choices=["all", *DEFAULTS, "lila-night-train"], default="all",
+                    help="all = the benchmark sets; lila-night-train = assets/train/lila-night.json")
     ap.add_argument("--seed", type=int, default=20261010)
     ap.add_argument("--count", type=int, help="target image count (default per set)")
     ap.add_argument("--max-mb", type=float, help="byte budget in MB (default per set)")
@@ -1467,6 +1958,13 @@ def main() -> None:
     if args.retag_grayscale:
         write_manifest(retag_grayscale(args.retag_grayscale, work))
         print(stats(validate(OUT_DIR / f"{args.retag_grayscale}.json", coco80, work, False)))
+        return
+    if args.set == "lila-night-train":
+        if not args.validate:
+            log("building lila-night-train")
+            args.max_mb = args.max_mb or LT_MAX_MB
+            write_train_manifest(build_lila_night_train(work, coco80, args))
+        print(train_stats(validate_train(TRAIN_OUT, work)))
         return
     sets = list(DEFAULTS) if args.set == "all" else [args.set]
     builders = {"bmd45-cctv": build_bmd45, "exdark-night": build_exdark, "coco-cctv": build_coco,

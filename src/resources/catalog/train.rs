@@ -498,8 +498,9 @@ pub const LILA_NIGHT_ID: &str = "train-data:lila-night";
 pub const LILA_NIGHT_DEST: &str = "train-data/lila-night";
 
 /// The pinned public night subset (LILA BC camera traps, CDLA-Permissive-1.0): plain image files
-/// with their boxes in the manifest, installed into `train-data/lila-night/`. None when the
-/// embedded manifest lists no image (this build ships the format only; see docs/TRAINING.md).
+/// with their boxes in the manifest, installed into `train-data/lila-night/`. Built by
+/// `scripts/build_bench_sets.py --set lila-night-train`; over [`LARGE_DOWNLOAD_BYTES`], so
+/// [`Resource::is_large`]. None when the embedded manifest lists no image.
 pub fn lila_night() -> Option<&'static Resource> {
     static R: std::sync::OnceLock<Option<Resource>> = std::sync::OnceLock::new();
     R.get_or_init(|| {
