@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod dhash;
+pub mod labels;
 pub mod layout;
 pub mod metrics;
 pub mod record;

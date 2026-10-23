@@ -177,6 +177,11 @@ pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<Pr
             if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
                 continue;
             }
+            // A frame someone labelled (`<stem>.labels.json`, written by the Review page) is
+            // training data: never pruned, and not counted against the cap.
+            if path.with_extension("labels.json").exists() {
+                continue;
+            }
             let side = path.with_extension("json");
             let side_len = std::fs::symlink_metadata(&side)
                 .ok()
@@ -497,6 +502,22 @@ mod tests {
             &serde_json::to_string(&line).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn dataset_prune_keeps_labelled_frames() {
+        let d = Tmp::new();
+        let p = d.path();
+        dataset_frame(p, "ir/cam/2026-01-01", "labelled", 100, 200);
+        dataset_frame(p, "ir/cam/2026-01-01", "plain", 100, 200);
+        let day = p.join("ir/cam/2026-01-01");
+        std::fs::write(day.join("labelled.labels.json"), b"{}").unwrap();
+        let r = prune_dataset(p, 90, 1).unwrap();
+        assert_eq!((r.deleted, r.remaining), (1, 0));
+        for f in ["labelled.jpg", "labelled.json", "labelled.labels.json"] {
+            assert!(day.join(f).exists(), "{f}");
+        }
+        assert!(!day.join("plain.jpg").exists());
     }
 
     #[test]

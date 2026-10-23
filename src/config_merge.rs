@@ -215,6 +215,7 @@ fn global_label(k: &str) -> String {
         "night_preprocess" => "Night / IR image preprocessing".into(),
         "verify" => "Verifier cascade".into(),
         "collect" => "Dataset collector".into(),
+        "training" => "Training".into(),
         other => other.replace('_', " "),
     }
 }
@@ -421,6 +422,7 @@ pub fn live_global(k: &str) -> bool {
             | "night_preprocess"
             | "verify"
             | "collect"
+            | "training"
     ) || k.starts_with("benchmark.")
 }
 

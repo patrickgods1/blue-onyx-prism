@@ -1,0 +1,10 @@
+{
+  "id": "lila-night",
+  "title": "Night IR camera-trap training subset (LILA BC)",
+  "description": "Format only in this build: no image is pinned yet. Night infrared frames from LILA BC camera traps (raccoon, opossum, skunk, dog, cat, vehicle boxes, plus empty frames as hard negatives), disjoint from the nir-night benchmark set. Each entry is a benchmark-manifest image (file, url, sha256, size, width, height, tags, objects with label + bbox [x_min, y_min, x_max, y_max] in pixels); the training run maps the labels onto its class list. See docs/TRAINING.md.",
+  "license": "CDLA-Permissive-1.0 (Community Data License Agreement - Permissive, https://cdla.io/permissive-1-0/)",
+  "attribution": "Images and annotations from LILA BC (Labeled Information Library of Alexandria: Biology and Conservation, https://lila.science).",
+  "source": "https://lila.science",
+  "revision": "0",
+  "images": []
+}

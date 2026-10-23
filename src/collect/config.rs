@@ -27,6 +27,32 @@ pub const MAX_NEAR_MARGIN: f32 = 0.5;
 pub const MAX_INTERVAL_S: u32 = 7 * 24 * 3600;
 /// Folder name of the default dataset directory under the data root.
 pub const DEFAULT_DIR_NAME: &str = "dataset";
+/// Default review / training class list (`collect.classes`).
+pub const DEFAULT_CLASSES: [&str; 14] = [
+    "person",
+    "car",
+    "bicycle",
+    "motorcycle",
+    "truck",
+    "dog",
+    "cat",
+    "raccoon",
+    "opossum",
+    "skunk",
+    "fox",
+    "deer",
+    "squirrel",
+    "bird",
+];
+/// Most classes in `collect.classes`.
+pub const MAX_CLASSES: usize = 200;
+/// Longest class name.
+pub const MAX_CLASS_LEN: usize = 64;
+
+/// [`DEFAULT_CLASSES`] as owned strings.
+pub fn default_classes() -> Vec<String> {
+    DEFAULT_CLASSES.iter().map(|c| (*c).to_string()).collect()
+}
 
 /// One bucket's settings.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -191,6 +217,8 @@ pub struct CollectConfig {
     /// dHash Hamming distance (of 64 bits) at or below which a frame of the same camera within
     /// the dedup window counts as a near duplicate and is dropped.
     pub dedup_hamming: u32,
+    /// Classes of the Review page and the label exports (YOLO class ids follow this order).
+    pub classes: Vec<String>,
 }
 
 impl Default for CollectConfig {
@@ -202,6 +230,7 @@ impl Default for CollectConfig {
             max_gb: DEFAULT_MAX_GB,
             max_age_days: DEFAULT_MAX_AGE_DAYS,
             dedup_hamming: DEFAULT_DEDUP_HAMMING,
+            classes: default_classes(),
         }
     }
 }
@@ -259,6 +288,7 @@ impl CollectConfig {
             0,
             MAX_DEDUP_HAMMING,
         )?;
+        validate_classes(&self.classes)?;
         for b in Bucket::ALL {
             let c = self.buckets.get(b);
             let field = format!("collect.buckets.{}", b.as_str());
@@ -293,6 +323,37 @@ impl CollectConfig {
         }
         Ok(())
     }
+}
+
+/// `collect.classes`: 1 to [`MAX_CLASSES`] unique names of at most [`MAX_CLASS_LEN`]
+/// characters, no control characters, no leading or trailing spaces.
+pub fn validate_classes(classes: &[String]) -> anyhow::Result<()> {
+    use anyhow::bail;
+    if classes.is_empty() || classes.len() > MAX_CLASSES {
+        bail!(
+            "collect.classes: give 1 to {MAX_CLASSES} class names (the Review page's class list), \
+             got {}",
+            classes.len()
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for c in classes {
+        if c.is_empty()
+            || c.chars().count() > MAX_CLASS_LEN
+            || c.trim() != c
+            || c.chars().any(char::is_control)
+        {
+            bail!(
+                "collect.classes: '{}' is not a valid class name (1 to {MAX_CLASS_LEN} characters, \
+                 no control characters, no leading or trailing spaces)",
+                c.escape_debug()
+            );
+        }
+        if !seen.insert(c.as_str()) {
+            bail!("collect.classes: '{c}' is listed twice; class names must be unique");
+        }
+    }
+    Ok(())
 }
 
 /// The resolved settings the workers carry ([`crate::worker::LiveSettings::collect`]) and the
@@ -350,6 +411,8 @@ mod tests {
         assert_eq!(c.max_gb, 5.0);
         assert_eq!(c.max_age_days, 90);
         assert_eq!(c.dedup_hamming, 6);
+        assert_eq!(c.classes.len(), 14);
+        assert_eq!(c.classes[7], "raccoon");
         assert_eq!(c.buckets.empty.per_camera_min_interval_s, 600);
         assert_eq!(c.buckets.near_margin(), 0.1);
         assert!(Bucket::ALL.iter().all(|b| c.buckets.get(*b).enabled));
@@ -433,6 +496,10 @@ mod tests {
         );
         bad(&|c| c.dir = Some("../x".into()), "collect.dir");
         bad(&|c| c.dir = Some("/etc/frames".into()), "system directory");
+        bad(&|c| c.classes.clear(), "collect.classes");
+        bad(&|c| c.classes.push("person".into()), "listed twice");
+        bad(&|c| c.classes.push(" cow".into()), "not a valid class name");
+        bad(&|c| c.classes.push("a\nb".into()), "not a valid class name");
     }
 
     #[test]

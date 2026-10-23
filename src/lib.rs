@@ -24,6 +24,7 @@
 //! - [`logbuf`]    in-memory ring of recent log events for the web UI's Logs page
 //! - [`resources`] downloadable runtimes/models: pinned catalog and the needs resolver
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
+//! - [`training`]  in-app model training: capability, recipes, dataset assembly, the run queue
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
 
 //! # Lint policy
@@ -87,6 +88,7 @@ pub mod static_memory;
 pub mod supervisor;
 pub mod sync;
 pub mod system_info;
+pub mod training;
 pub mod tray;
 pub mod update;
 pub mod verify;

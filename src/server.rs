@@ -32,9 +32,11 @@ mod guard;
 mod live;
 mod pages;
 mod resources;
+mod review;
 mod status;
 #[cfg(test)]
 mod test_util;
+mod training;
 
 pub(crate) use apply::{apply_config, reload_models, sync_config};
 use config_page::{
@@ -189,6 +191,34 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/dataset/image", get(dataset::image)),
         ("/dataset/sidecar", get(dataset::sidecar)),
         ("/v1/dataset", get(dataset::json)),
+        ("/review", get(review::page)),
+        ("/v1/review/next", get(review::next)),
+        (
+            "/v1/review/labels",
+            get(review::labels_get)
+                .post(review::labels_post)
+                .layer(DefaultBodyLimit::max(review::LABELS_BODY_LIMIT)),
+        ),
+        (
+            "/v1/review/export",
+            post(review::export).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
+            "/v1/review/import",
+            post(review::import).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
+            "/v1/review/classes",
+            post(review::classes).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        ("/training", get(training::page)),
+        ("/v1/training", get(training::json)),
+        ("/training/queue", post(training::queue)),
+        ("/training/cancel", post(training::cancel)),
+        ("/training/remove", post(training::remove)),
+        ("/training/use", post(training::use_model)),
+        ("/training/datasets", post(training::datasets)),
+        ("/training/remove-env", post(training::remove_env)),
         ("/logs", get(logs_page)),
         ("/logs.json", get(logs_json)),
         ("/benchmark", get(benchmark::page)),
@@ -951,6 +981,20 @@ mod tests {
             "/dataset/image",
             "/dataset/sidecar",
             "/v1/dataset",
+            "/review",
+            "/v1/review/next",
+            "/v1/review/labels",
+            "/v1/review/export",
+            "/v1/review/import",
+            "/v1/review/classes",
+            "/training",
+            "/v1/training",
+            "/training/queue",
+            "/training/cancel",
+            "/training/remove",
+            "/training/use",
+            "/training/datasets",
+            "/training/remove-env",
             "/logs",
             "/logs.json",
             "/benchmark",

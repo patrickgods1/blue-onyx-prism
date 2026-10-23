@@ -193,7 +193,7 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
     also while collection is off, as long as the folder exists) and right after a write that crossed
     the size cap.
   - It deletes only frame pairs in the layout above. It never deletes `review-queue.jsonl` or anything
-    else. A frame in the review queue is pruned like any other until the review stage copies it out.
+    else. A frame in the review queue is pruned like any other until it is labelled.
 - **Low disk:** if free space under the folder drops below 1 GB (`retention::MIN_FREE_MB`, the same
   threshold as the low-space warning), or a write fails with a full disk or exhausted quota:
   - collection stops with a warning;
@@ -214,20 +214,227 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
 
 ## How the later stages use it
 
-- **Review page** (`/training`):
-  - reads `review-queue.jsonl` first, then any frame by bucket via the index files;
-  - shows `raw`, `suppressed` and `predictions` boxes from the sidecar;
-  - sorts by uncertainty: `near_threshold`, `disagreement`, the verifier outcome;
-  - writes YOLO `.txt` labels beside the frame (same stem).
-  - Suppressed and `verify_rejected` night boxes marked wrong become hard negatives. Reviewed `empty`
-    frames become negative images.
+- **Review page** (`/review`, see [Review labels](#review-labels)):
+  - reads `review-queue.jsonl` (or every indexed frame) and sorts it by uncertainty;
+  - shows the `predictions`, `suppressed`, `below_threshold` and `verify.found` boxes from the sidecar;
+  - writes `<stem>.labels.json` beside the frame; exports YOLO / COCO / X-AnyLabeling / a benchmark set.
+  - Rejected boxes are kept as hard-negative evidence. Frames confirmed empty become negative images.
 - **Auto-label** (offline, training env):
   - re-detects `empty` frames with the large labellers; a confident box is a candidate miss;
-  - uses `below_threshold` and `verify.found` as cheap hints.
-- **Dataset assembly:**
+  - uses `below_threshold` and `verify.found` as cheap hints;
+  - adds its boxes (`source: auto`) to the label files through the merge rule below.
+- **Dataset assembly** (the export does the first part):
   - splits by `camera` and date folder, so held-out frames come from cameras and days the model did not
     train on;
   - balances by `scene`;
   - uses `dhash` to drop near duplicates across days.
 - **Import:** imported footage uses the same layout and sidecar, with its own source and licence
   fields added (a later version).
+
+## Review labels
+
+The **Review** page (`/review`, admin only like `/dataset`) shows one frame at a time with its boxes.
+Each decision is saved in `<stem>.labels.json` beside the sidecar. The sidecar is never changed.
+
+### Label file (version 1)
+
+```json
+{
+  "version": 1,
+  "status": "reviewed",
+  "empty_confirmed": false,
+  "boxes": [
+    {"label": "person", "bbox": [812.0, 400.5, 870.2, 560.0], "source": "model", "score": 0.55,
+     "state": "accepted", "origin": "suppressed", "reason": "night_threshold"},
+    {"label": "raccoon", "bbox": [100.0, 700.0, 180.0, 760.0], "source": "model", "score": 0.43,
+     "state": "accepted", "origin": "below_threshold", "model_label": "cat"},
+    {"label": "dog", "bbox": [10.0, 10.0, 50.0, 90.0], "source": "model", "score": 0.71,
+     "state": "rejected", "origin": "prediction"},
+    {"label": "deer", "bbox": [600.0, 500.0, 900.0, 700.0], "source": "human", "state": "added"}
+  ],
+  "reviewed_at": "2026-10-22T13:05:00.000Z",
+  "classes_version": "3f2a9c0d1e4b5a68"
+}
+```
+
+- **`status`:** `unreviewed`, `reviewed` (every box decided, exported) or `skipped` (never exported).
+- **`bbox`:** `[x0, y0, x1, y1]` in pixels of the original frame. Boxes are ordered and clamped to the
+  frame on save, and both sides must be at least 1 px.
+- **`source`:** `model` (from the sidecar), `auto` (the auto-labeler) or `human` (drawn on the page).
+- **`state`:**
+  - `accepted`: a model or auto box that is a real object;
+  - `added`: a box the reviewer drew (a miss);
+  - `rejected`: a wrong box. It is kept as hard-negative evidence and never becomes a training label;
+  - `pending`: not decided yet. Only `unreviewed` and `skipped` files have pending boxes.
+- **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
+  `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
+- **`model_label`:** the label the model gave, when the reviewer changed it.
+- **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
+  cannot have accepted or added boxes.
+- **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
+  names joined by `\n`). The page flags a frame that was reviewed with another list.
+- **Writes** go through a temporary file and a rename. A newer `version` is refused. Unknown fields are
+  ignored.
+
+### Pre-fill and the save rule
+
+A frame without a label file starts with every sidecar box as `pending`, in this order:
+`predictions`, `suppressed`, `below_threshold`, `verify.found`. A box is left out if an earlier box has
+the same label and IoU >= 0.95 (for `verify.found`, IoU >= 0.5).
+
+When a frame is saved as `reviewed`, each `pending` box becomes:
+
+| Box | Becomes |
+|---|---|
+| A prediction | `accepted` |
+| An `auto` box | `accepted` |
+| A `human` box | `added` |
+| A suppressed, below-threshold or verifier-found box | `rejected` |
+
+In short, the reply's boxes are kept unless you reject them. A box the reply did not report must be
+restored explicitly. Restoring a wrongly suppressed person is false-negative evidence for that rule.
+
+Every accepted or added label must be in `collect.classes`. A box with any other label must be
+relabeled or rejected before the frame can be saved as reviewed.
+
+### Merge rule (auto-labeler, re-labelling)
+
+Later proposals (`source: auto` boxes, or a newer model's detections) are merged by
+`labels::merge_proposals`, never by overwriting the file. Each proposal is compared with the existing box
+of highest IoU at or above 0.5 (any label):
+
+| Match | Result |
+|---|---|
+| No box | The proposal is added as `pending`. |
+| A box with the same label | The proposal is dropped. The existing decision wins: a rejected box stays rejected. |
+| A box with another label that is decided (`accepted`, `added` or `rejected`) | The proposal is added as `pending`, as a disagreement. |
+| A box with another label that is still `pending` | The proposal is dropped. |
+
+A `reviewed` or `skipped` file that gains a box goes back to `unreviewed` and keeps its other decisions.
+This is how the self-training loop sends disagreements back to review.
+
+### Queue
+
+`GET /v1/review/next` lists the frames of `review-queue.jsonl`, or with `source=all` also every indexed
+frame. It accepts these filters: `bucket`, `scene`, `camera`, and `status` (default `unreviewed`; also
+`reviewed`, `skipped`, `any`). Frames are sorted most uncertain first:
+
+1. the near-threshold margin: the smallest `|top score - threshold|` over the labels of `raw` and
+   `below_threshold`, in hundredths;
+2. verifier disagreement (the `disagreement` bucket, or a rejected verifier candidate);
+3. more suppressed boxes;
+4. newest.
+
+`after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
+The answer also carries the counts: reviewed, remaining, skipped, confirmed empty, rejected boxes, and
+accepted boxes per class.
+
+### Keyboard
+
+| Key | Action |
+|---|---|
+| `a` | Accept every pending box. |
+| `r` | Reject or restore the selected box. |
+| `1`-`9`, `0` | Pick class 1-10: relabel the selected box, else set the class of new boxes. |
+| `j` / `k` | Select the next / previous box. |
+| `Delete` | Delete a drawn box, reject a model box. |
+| `e` | Confirmed empty (rejects every box). |
+| `z` | Undo. |
+| `s`, `Enter` | Save & next. |
+| `n` | Next without saving. |
+
+Click a box to select it. Drag on the image to draw a new one.
+
+### Export
+
+`POST /v1/review/export` exports the **reviewed** frames. Its body:
+
+```json
+{"formats": ["yolo", "coco", "xanylabeling", "benchmark"], "out_dir": "optional",
+ "holdout_cameras": [], "holdout_days": [], "holdout_fraction": 0.2,
+ "benchmark_split": "all", "include_unreviewed": false}
+```
+
+- **`formats`** (or `format`): one name, a list, or `all`. Default: all formats.
+- **`out_dir`:** a new or empty folder. Default: `<data root>/training/exports/<UTC time>`.
+- **Frames left out, with a warning:** frames with a training label outside the class list, and frames
+  whose image or sidecar is gone.
+- **File names:** every frame is exported as `<scene>.<camera>.<date>.<stem>.jpg`. No part contains a
+  `.`, so the name maps back to its frame.
+- **Images** are hard-linked where the file system allows it, else copied.
+
+```
+<out>/
+  images/{train,val}/<name>.jpg        YOLO and COCO share the images
+  labels/{train,val}/<name>.txt        YOLO: `class cx cy w h`, normalised, clamped to 0..1, 6 decimals; empty file = no object
+  classes.txt, data.yaml               class ids follow collect.classes; data.yaml is an Ultralytics dataset
+  annotations/instances_{train,val}.json   COCO: categories 1..K in class order, image / annotation ids from 1,
+                                       bbox [x, y, w, h] px (2 decimals), area = w * h, iscrowd 0
+  hard_negatives.json                  every rejected model / auto box (frame, label, bbox, origin, reason)
+  xanylabeling/<name>.jpg + .json      X-AnyLabeling files (below)
+  benchmark/images/<name>.jpg + manifest.json   a benchmark `dir:` set
+  export.json                          the report, written last
+```
+
+**Split.** Frames are split by camera and day (the date folder), so held-out frames come from cameras
+and days the model did not train on.
+
+- If `holdout_cameras` or `holdout_days` is given, a frame of a named camera or day goes to `val`, and
+  every other frame to `train`.
+- Otherwise a camera-day is held out when the first 8 bytes of SHA-256(`<camera>/<date>`), as a fraction
+  of 2^64, fall below `holdout_fraction`. This is deterministic, and stable when days are added.
+- Once there are two or more camera-days, at least one goes to each side.
+
+**Benchmark set.** `manifest.json` gives each frame its training boxes as ground truth. `scored_labels`
+is the class list, so predictions of other labels count neither way. The tags are:
+
+- `<scene>`, `camera:<c>`, `date:<d>`, `split:<s>`, and `bucket:<b>` for each bucket;
+- `hard-negative` for a frame confirmed empty.
+
+`benchmark_split` (`all`, `val`, `train`) picks the frames. Run the set with
+`blue-onyx-prism benchmark --dataset dir:<out>/benchmark`.
+
+### X-AnyLabeling
+
+X-AnyLabeling saves one LabelMe-style JSON per image, beside the image:
+
+- **File keys:** `version`, `flags`, `shapes`, `imagePath`, `imageData`, `imageHeight`, `imageWidth`,
+  `description`, `checked`.
+- **Shape keys:** `label`, `score`, `points`, `group_id`, `description`, `difficult`, `shape_type`,
+  `flags`, `attributes`, `kie_linking`.
+
+**Export** writes each frame's training boxes as `rectangle` shapes with four corner points (top-left,
+top-right, bottom-right, bottom-left), which is how X-AnyLabeling saves rectangles. Reviewed frames get
+`checked: true`. With `include_unreviewed`, the queue's unreviewed frames are added with the boxes a save
+would accept, and `checked: false`.
+
+**Import** (`POST /v1/review/import` with `{"dir": "...", "treat_unchecked_as_reviewed": false}`) reads
+every `*.json` in the folder. The frame comes from the `imagePath` file name, else the JSON's stem. A file
+counts only when `checked` is true, unless unchecked files are treated as reviewed. Its rectangles
+become the frame's complete set of training boxes:
+
+- **Rectangles:** two-point or four-point rectangles, and polygons as their bounding box, are read.
+  Other shapes are skipped with a warning.
+- **Matching:** a rectangle at IoU >= 0.9 of an existing box replaces that box. A box of the same label
+  is preferred. Its label and coordinates are taken, and the old label is kept in `model_label`.
+- **New and deleted boxes:** any other rectangle becomes a `human` box. An existing box no rectangle
+  matched is rejected (a model or auto box) or dropped (a human box).
+- **Result:** the frame is saved as `reviewed`. With no rectangle it is `empty_confirmed`.
+- **Refused files:** a file whose image size differs from the frame's (a resized copy), or whose labels
+  are not in the class list, is an error for that file only.
+
+### Safety
+
+- **Frame references:** every `frame` parameter goes through `layout::parse_rel` / `layout::resolve`.
+  The image and sidecar must be regular files inside the dataset folder, and the label file must not be
+  a symlink. Anything else is a 404.
+- **POST bodies** must be JSON (415 otherwise) and are capped: 256 KiB for labels, 16 KiB for export,
+  import and classes (413).
+- **Admin guard:** the routes sit behind the admin guard (loopback only unless `allow_remote_admin`) and
+  the cross-site check (403).
+- **Folders:** `out_dir` and the import `dir` are checked like the other folder settings (no system
+  folders).
+
+**Retention:** a frame that has a `.labels.json` (anything saved on the Review page) is never pruned and
+does not count toward `collect.max_gb`; only unlabelled frames age out or make room. Delete labelled
+frames yourself if they are no longer wanted.

@@ -534,7 +534,7 @@ def torch_export(model, inputs: tuple, input_names: list[str], output_names: lis
         )
 
 
-def rfdetr_from_training_checkpoint(name: str, src: Path, imgsz: int):
+def rfdetr_from_training_checkpoint(name: str, src: Path, imgsz: int, custom_classes: bool = False):
     """An RF-DETR fine-tune saved by the `rfdetr` package (`checkpoint_best_total.pth` +
     `config.json` with `model_config` and `class_names`, e.g. DetectionBench's ExDark models) in
     transformers' `RfDetrForObjectDetection`: the config is rebuilt from `model_config` the way
@@ -542,7 +542,9 @@ def rfdetr_from_training_checkpoint(name: str, src: Path, imgsz: int):
     state dict onto its modules (`from_pretrained(None, state_dict=...)`; nothing may be missing,
     mismatched or unexpected but the empty keypoint mask). The checkpoint is read with
     `torch.load(weights_only=True)`. Returns (model, class names in head order mapped to COCO
-    spellings, number of logits)."""
+    spellings, number of logits). With `custom_classes` (a model trained by
+    `scripts/train_model.py` on its own class list, e.g. `raccoon`) the names are kept as they are
+    instead of being mapped to COCO spellings."""
     import torch
     from transformers import RfDetrConfig, RfDetrForObjectDetection
 
@@ -557,10 +559,15 @@ def rfdetr_from_training_checkpoint(name: str, src: Path, imgsz: int):
         fail(f"{name}: --imgsz {imgsz} but the model was trained at {mc.get('resolution')}")
     if len(names) != mc.get("num_classes"):
         fail(f"{name}: {len(names)} class names for num_classes {mc.get('num_classes')}")
-    coco = [RFDETR_CLASS_TO_COCO.get(n.lower(), n.lower()) for n in names]
-    unknown = [n for n in coco if n not in COCO80]
-    if unknown:
-        fail(f"{name}: class names without a COCO spelling: {unknown}")
+    if custom_classes:
+        coco = [str(n).strip() for n in names]
+        if not all(coco):
+            fail(f"{name}: empty class name in {names}")
+    else:
+        coco = [RFDETR_CLASS_TO_COCO.get(n.lower(), n.lower()) for n in names]
+        unknown = [n for n in coco if n not in COCO80]
+        if unknown:
+            fail(f"{name}: class names without a COCO spelling: {unknown}")
     backbone = {
         "model_type": "rf_detr_dinov2",
         "attention_probs_dropout_prob": 0.0,
@@ -568,7 +575,9 @@ def rfdetr_from_training_checkpoint(name: str, src: Path, imgsz: int):
         "hidden_act": "gelu",
         "hidden_dropout_prob": 0.0,
         "hidden_size": 384,
-        "image_size": imgsz,
+        # The checkpoint's position embeddings cover `positional_encoding_size` patches per side
+        # (RF-DETR base: 37 x 14 = 518 px, trained at 560); the export interpolates them to imgsz.
+        "image_size": int(mc.get("positional_encoding_size") or imgsz // mc["patch_size"]) * mc["patch_size"],
         "initializer_range": 0.02,
         "layer_norm_eps": 1e-06,
         "layerscale_value": 1.0,
@@ -623,7 +632,7 @@ def export_rfdetr(name: str, family: str, imgsz: int, args: argparse.Namespace) 
         # A fine-tune saved by the rfdetr package (DetectionBench ExDark): its own classes.
         src = weights_dir(name, args, ("config.json",))
         log(f"{name}: loading the rfdetr training checkpoint in {src} with transformers")
-        model, names, nl = rfdetr_from_training_checkpoint(name, src, imgsz)
+        model, names, nl = rfdetr_from_training_checkpoint(name, src, imgsz, getattr(args, "custom_classes", False))
     else:
         src = weights_dir(name, args)
         log(f"{name}: loading {src} with transformers")

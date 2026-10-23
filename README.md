@@ -22,6 +22,7 @@ Modeled on [blue-onyx](https://github.com/xnorpx/blue-onyx) (MIT), adding multi-
 - Several models served at once, each with its own worker and metrics; per-model device, threshold, class filter and lazy loading.
 - Model families: YOLO26 / YOLOv10 (end-to-end), YOLOv5 (the blue-onyx IPcam models), YOLOv8/9/11/12, RT-DETRv2 and DEIMv2, D-FINE, RF-DETR. ONNX or OpenVINO IR.
 - Compiled-model cache (fast restarts), HTTP served while models compile, web UI (stats, test page, config editor), Prometheus metrics.
+- In-app training of custom models on your own reviewed frames (YOLO26 / YOLO11 / YOLOv8, RF-DETR, RT-DETRv2, D-FINE) on an NVIDIA GPU or Apple silicon, with a held-out benchmark ([docs/TRAINING.md](docs/TRAINING.md)).
 - Runs as a Windows service, systemd unit, launchd daemon or Docker container.
 
 ## Supported platforms
@@ -307,6 +308,15 @@ it; every key can also be set in the file.
 | `collect.max_gb` | `5` | Size cap of the dataset folder, oldest frames deleted first (above 0, at most 10000). Applies: at once. UI: Dataset page |
 | `collect.max_age_days` | `90` | Frames older than this are deleted, 0 = keep (0-3650). Applies: at once. UI: Dataset page |
 | `collect.dedup_hamming` | `6` | A frame whose 64-bit dHash is within this many bits of a frame of the same camera saved in the last 10 minutes is dropped as a near duplicate (0-32). Applies: at once. UI: Dataset page |
+| `collect.classes` | person, car, bicycle, motorcycle, truck, dog, cat, raccoon, opossum, skunk, fox, deer, squirrel, bird | Class list of the Review page and the label exports (YOLO class ids and COCO category ids follow this order; 1-200 unique names). Reviewed frames record its fingerprint (`classes_version`); a frame with a training label outside the list is left out of exports. Applies: at once. UI: Review page |
+| `training` | defaults | Model training ([docs/TRAINING.md](docs/TRAINING.md)): where runs go, the review exports offered, dataset defaults. Read when a run is queued. Applies: at once. UI: Training page |
+| `training.dir` | `null` | Folder of the training runs (prepared dataset, `train.log`, held-out benchmark set, `runs.json`); `null` = `training` under the data folder; relative paths resolve there. Applies: at once. UI: config file |
+| `training.datasets` | `[]` | Review export folders (YOLO layout) offered on the Training page and used by `train run` without `--dataset`. Applies: at once. UI: Training page |
+| `training.epochs` | `50` | Default epochs of a run (1-1000). Applies: at once. UI: Training page |
+| `training.negative_share` | `0.15` | Share of frames without objects (hard negatives) kept in the training split; extra empty frames are dropped, too few give a warning (0-0.9). Applies: at once. UI: config file |
+| `training.heldout_share` | `0.2` | Share of the review frames held out by camera and day for the benchmark when the export has no split of its own (0-0.9). Applies: at once. UI: config file |
+| `training.oversample` | `3` | How often each of your own frames repeats in the training split when the public night subset is mixed in (1-10). Applies: at once. UI: config file |
+| `training.timeout_hours` | `48` | A run is stopped after this many hours (1-336). Applies: at once. UI: config file |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`. Applies: at once. UI: yes (also the Logs page) |
 | `log_timezone` | `"utc"` | Time zone of log timestamps (files, console and the Logs page): `"utc"` (`2026-10-16T00:54:59.580Z`), `"local"` (this computer's zone), an IANA name such as `"America/Los_Angeles"`, or a fixed offset such as `"+08:00"`; others print RFC 3339 with the offset (`2026-10-15T17:54:59.580-07:00`). Applies: at once. UI: yes (a dropdown of UTC, local and common zones; other values set here show as "Custom") |
 | `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout only). Path. Applies: process restart. UI: yes |
@@ -695,6 +705,8 @@ Open `http://<host>:32168/` in a browser:
 | `/config` | Models card (which models load, the default model, device and threshold per model; **Save** applies at once), Resources, server/inference/logging settings with "applies now" / "needs restart" tags and the `models` list as JSON under *Advanced*; **Restart server** reloads the file and recompiles the enabled models without restarting the process; the listener stays up and the old models answer until the new ones are swapped in (a `port` or `log_path` change needs a process restart) |
 | `/benchmark` | Benchmark models x devices x datasets in the background (progress, ETA, cancel); grade cards, model ranking, sortable per-device tables (fastest, recommended and configured marked), breakdowns by dataset/tag/class/size/resolution, per-image drill-down with ground truth and predictions drawn; **Use <device>** / **Apply recommended to all** write per-model devices; best confidence threshold per model with a P/R/F1 vs threshold chart, **Apply threshold** / **Apply all thresholds**; **Confidence search** over the stored predictions (filters, objective, chart with hover values, tables, CSV) |
 | `/dataset` | Dataset collector (`collect`): on/off, per-bucket toggles, rates and intervals, the caps (applied at once); frames per scene x bucket and per camera, disk use, the newest frames per bucket with their sidecars, and **Send to review** (appends the ticked frames to `review-queue.jsonl`). Collection stops on its own on low disk space or a full disk; **Resume** re-arms it |
+| `/review` | Review the collected frames one at a time, most uncertain first (filters: bucket, scene, camera, status; the review queue or every frame): accept / reject / relabel each box, restore wrongly suppressed boxes, draw missed ones, confirm empty frames (keyboard: `a` accept all, `r` reject, digits pick a class, `e` empty, `z` undo, `s` save & next, `n` next); export the reviewed frames as YOLO, COCO, X-AnyLabeling and a benchmark `dir:` set split by camera and day; import X-AnyLabeling edits; edit `collect.classes`. Labels: `<stem>.labels.json` beside each frame ([docs/DATASET.md](docs/DATASET.md#review-labels)) |
+| `/training` | Train a custom model (needs an NVIDIA GPU or Apple silicon): what this machine can train and why not, review export folders, family x size picker with VRAM / time estimates and hardware fit, night augmentation, a queue of runs one at a time with live progress and cancel, the trained models with their held-out benchmark and **Default model** / **night model of** / **verifier of** actions ([docs/TRAINING.md](docs/TRAINING.md)) |
 | `/logs` | The last 2,000 log events of this process, live (polls `/logs.json`), with level filter, search, pause/follow, Copy and Download .txt, and the server log level (applies immediately; `POST /config/loglevel` with `level=debug`, form or query) |
 | `/prometheus` | Prometheus metrics (`blue_onyx_prism_*{model="..."}`), linked in the footer with the JSON endpoints |
 
@@ -909,6 +921,13 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | GET | `/v1/dataset` | dataset collector settings, summary (frames by scene x bucket, per camera, newest per bucket), review-queue length and why collection stopped, if it did |
 | GET | `/dataset/image?path=`, `/dataset/sidecar?path=` | a collected frame or its sidecar (`path` = `<scene>/<camera>/<date>/<stem>.jpg`; anything else is 404) |
 | POST | `/dataset/settings`, `/dataset/review`, `/dataset/resume` | the Dataset page's forms: `collect` settings; `frame=<path>` (repeated) to queue for review; re-arm after a disk stop |
+| GET | `/v1/review/next?bucket=&scene=&camera=&status=&source=&after=` | the most uncertain frame to review (after `after`), its position and the review counts (reviewed, remaining, skipped, per class) |
+| GET, POST | `/v1/review/labels?frame=<path>` | a frame's label file (saved, else pre-filled from the sidecar) with its size and sidecar summary; POST a label file (JSON, at most 256 KiB) to save it (`unreviewed`, `reviewed` or `skipped`; pending boxes resolved on `reviewed`) |
+| POST | `/v1/review/export` | `{formats, out_dir?, holdout_cameras?, holdout_days?, holdout_fraction?, benchmark_split?, include_unreviewed?}`: export the reviewed frames (YOLO, COCO, X-AnyLabeling, benchmark set) to a new folder, default `<data root>/training/exports/<UTC time>` |
+| POST | `/v1/review/import`, `/v1/review/classes` | `{dir, treat_unchecked_as_reviewed?}`: import X-AnyLabeling files; `{classes: [...]}`: save `collect.classes` |
+| GET | `/v1/training` | training capability (accelerator, families and sizes with estimates and fit, reasons) and the runs (state, stage, percent, progress, log tail, dataset counts, installed model, benchmark) |
+| POST | `/training/queue` | the Training page's form: `model` (repeated: `yolo26n`, `rfdetr-nano`, `rt-detrv2-s`, ...), `dataset` (repeated) / `dataset_path`, `scene`, `classes`, `epochs`, `batch`, `imgsz`, `lr`, `night_aug`, `aug_dark`, `aug_noise`, `aug_gray`, `public`, `benchmark_set`, `name`; `confirm_large=1` for the first environment download unless `allow_large_downloads` |
+| POST | `/training/cancel`, `/training/remove`, `/training/use`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; forget a finished one; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model; `add` / `remove`: a `training.datasets` folder; delete the training environment |
 | GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
@@ -946,6 +965,25 @@ and diffs detections), `--cache-dir` (`""` disables), `--threads`, `--classes`, 
 `--config` (enabled models from the config when no `--model`), `--json`, `-v`.
 If GPU latency is not clearly below CPU latency, the GPU was probably not used (check the log) or
 the FP32 path is active.
+
+## Training
+
+```sh
+blue-onyx-prism train capability                      # can this machine train, and what fits
+blue-onyx-prism train estimate --model rfdetr-small --images 2000 --epochs 50
+blue-onyx-prism train prepare --dataset <review export> --scene night+ir --out prep   # dataset only
+blue-onyx-prism train run --model yolo26n --model rfdetr-nano --dataset <review export> \
+    --scene night+ir --night-aug --epochs 50 --allow-large
+blue-onyx-prism train list
+blue-onyx-prism train remove-env
+```
+
+Fine-tunes a model on the frames reviewed on the Review page (export them in YOLO format), exports a
+static ONNX (checked against PyTorch with ONNX Runtime), installs `models/<name>.onnx` + `.yaml` +
+`<name>.provenance.json`, adds it to the config (disabled until you enable it or use it) and benchmarks
+it on the held-out frames. The pinned training environment (PyTorch CUDA 12.6 / 13.0 or macOS, the
+trainers; about 3 GB with CUDA) is set up under `<data root>/tools/train-env` on the first run. Families,
+licences, the dataset layout and the MPS results: [docs/TRAINING.md](docs/TRAINING.md).
 
 ## Releasing
 

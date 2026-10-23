@@ -261,8 +261,9 @@ pub(crate) struct PackageLock {
     /// File name under `scripts/model-export/locks/`.
     pub name: &'static str,
     pub text: &'static str,
-    /// torch / torchvision come from the PyTorch CPU index (`--torch-backend cpu`).
-    pub torch_cpu_index: bool,
+    /// torch / torchvision come from this PyTorch index (`--torch-backend cpu` for the export on
+    /// Linux and Windows, `cu126` / `cu130` for training there); None = PyPI.
+    pub torch_backend: Option<&'static str>,
 }
 
 /// The package lock for `(os, arch)`; None = models cannot be exported there (no PyTorch wheels).
@@ -271,12 +272,12 @@ pub(crate) fn package_lock(os: &str, arch: &str) -> Option<PackageLock> {
         ("macos", "aarch64") => Some(PackageLock {
             name: "macos-arm64.txt",
             text: LOCK_MACOS_ARM64,
-            torch_cpu_index: false,
+            torch_backend: None,
         }),
         ("linux", "x86_64") | ("linux", "aarch64") | ("windows", "x86_64") => Some(PackageLock {
             name: "torch-cpu-index.txt",
             text: LOCK_TORCH_CPU_INDEX,
-            torch_cpu_index: true,
+            torch_backend: Some("cpu"),
         }),
         _ => None,
     }
@@ -677,6 +678,7 @@ mod seams;
 mod stages;
 #[cfg(test)]
 mod tests;
+pub mod train;
 pub mod vc_runtime;
 
 pub use exporter::*;

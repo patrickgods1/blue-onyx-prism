@@ -540,6 +540,10 @@ pub struct Config {
     /// model saw for review and training. Off by default. Applies at once.
     #[serde(skip_serializing_if = "crate::collect::CollectConfig::is_default")]
     pub collect: crate::collect::CollectConfig,
+    /// Model training ([`crate::training`], `docs/TRAINING.md`): where runs go, the review
+    /// exports offered, dataset defaults. Read when a run is queued. Applies at once.
+    #[serde(skip_serializing_if = "crate::training::TrainingConfig::is_default")]
+    pub training: crate::training::TrainingConfig,
     pub log_level: LogLevel,
     /// Directory of the daily rolling log files (None = stdout only). Relative paths resolve
     /// against the exe dir. Process restart.
@@ -725,6 +729,7 @@ impl Default for Config {
             night_preprocess: None,
             verify: None,
             collect: crate::collect::CollectConfig::default(),
+            training: crate::training::TrainingConfig::default(),
             log_level: LogLevel::Info,
             log_path: None,
             log_format: LogFormat::Text,
@@ -1372,6 +1377,7 @@ impl Config {
         validate_model_entries(&self.models)?;
         validate_verify(self.verify.as_ref(), &self.models)?;
         self.collect.validate(&self.data_root())?;
+        self.training.validate()?;
         let b = &self.benchmark;
         check_range("benchmark.warmup", b.warmup, 0, MAX_BENCH_ITERATIONS)?;
         check_range(

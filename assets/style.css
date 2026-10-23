@@ -685,3 +685,30 @@ table.dt th { white-space: normal; }
 .rec-line:empty { display: none; }
 table.dt th, table.dt td { padding: 0.38rem 0.4rem; }
 table.dt td button.small { padding: 0.12rem 0.5rem; margin: 0; }
+/* Review page (templates/review.html, assets/review.js). */
+.review-counts { display: flex; flex-wrap: wrap; gap: 0.2rem 1.2rem; font-size: 0.92rem; }
+.review-counts .k { color: var(--muted); }
+.review-filters label { margin: 0.3rem 0; }
+.review-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(250px, 320px); gap: 1rem; align-items: start; }
+@media (max-width: 900px) { .review-grid { grid-template-columns: minmax(0, 1fr); } }
+.review-stage { min-width: 0; }
+.review-stage canvas { display: block; width: 100%; height: auto; background: #000; border-radius: 6px; cursor: crosshair; touch-action: none; }
+.review-stage canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.review-meta { font-size: 0.85rem; margin: 0 0 0.4rem; overflow-wrap: anywhere; }
+.review-side { margin: 0; min-width: 0; }
+.review-side > label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; color: var(--muted); }
+.review-side > label.check { flex-direction: row; align-items: center; gap: 0.5rem; color: var(--fg); margin: 0.4rem 0; }
+.review-boxes { list-style: none; padding: 0; margin: 0.5rem 0; max-height: 52vh; overflow-y: auto; }
+.review-boxes li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.15rem 0.45rem; align-items: center; padding: 0.35rem 0.45rem; border: 1px solid var(--border); border-radius: 6px; margin: 0 0 0.3rem; cursor: pointer; }
+.review-boxes li.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.review-boxes li.st-rejected .bx-label { text-decoration: line-through; opacity: 0.75; }
+.review-boxes select { max-width: 100%; min-width: 0; }
+.review-boxes .bx-note { grid-column: 1 / -1; font-size: 0.8rem; color: var(--muted); overflow-wrap: anywhere; }
+.review-boxes .bx-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 0.2rem; }
+.sw-pending { background: #f0b400; } .sw-hint { background: #f08c00; } .sw-accepted { background: #2e9e4f; }
+.sw-added { background: #1f6fe0; } .sw-rejected { background: #e53935; }
+.review-keys td { padding: 0.1rem 0.6rem 0.1rem 0; font-size: 0.85rem; }
+.review-keys td:first-child { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: nowrap; }
+.review-report { font-size: 0.9rem; overflow-wrap: anywhere; }
+.review-report ul { margin: 0.3rem 0; padding-left: 1.2rem; }
+label.grow { flex: 1 1 20rem; min-width: 0; }

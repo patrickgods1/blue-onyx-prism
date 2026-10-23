@@ -122,6 +122,14 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   writes under `<data root>/dataset/<scene>/<camera>/<date>/`, `retention::prune_dataset`, disk guard); admin `/dataset`
   page and `review-queue.jsonl`; format in `docs/DATASET.md`. OpenVINO CACHE_DIR is `<cache>/openvino-<device>-<prec>`
   (the CPU cache hash ignores precision); `config_store::spawn_disk_watch` applies on-disk config edits within 2 s.
+- Review (`src/collect/labels/`, `/review`, `assets/review.js`): per-frame `<stem>.labels.json` (v1; states pending/
+  accepted/rejected/added; `merge_proposals` for auto-labels), uncertainty-sorted queue, exports YOLO / COCO /
+  X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned.
+- Training (`src/training/`, `/training`, `blue-onyx-prism train ...`, `scripts/train_model.py`): user-triggered only;
+  `capability` gates by GPU (CUDA lanes cu126/cu130 by compute capability + driver; MPS on Apple, D-FINE CUDA-only),
+  separate `tools/train-env` from `scripts/model-export/locks/train-*.txt`; families YOLO26/11/v8, RF-DETR n..l,
+  RT-DETRv2, D-FINE (base pins in `catalog/train.rs`); head rows initialised from the base's COCO rows; static ONNX
+  export + ORT check, install, benchmark on the held-out split; docs in `docs/TRAINING.md`.
 - `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
   baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;
   a write failure only warns). `ModelResult.run_id` = the run's start time. Pure `comparable`/`compare` (speed counts at

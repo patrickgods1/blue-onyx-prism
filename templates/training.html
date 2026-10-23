@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block title %}Training{% endblock %}
+{% block content %}
+<h1>Training</h1>
+<p class="muted">Fine-tune a detection model on frames you reviewed on the <a href="/review">Review</a> page (exported in YOLO format), export it to ONNX, add it to the config and benchmark it on held-out frames from cameras and days it did not train on. Details and licences: <code>docs/TRAINING.md</code>.</p>
+{% if let Some(m) = message %}<p class="notice">{{ m }}</p>{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+
+<div class="card">
+  <h2>This machine</h2>
+  <p>{% if available %}{{ summary }}{% else %}<span class="error">{{ summary }}</span>{% endif %}</p>
+  {% if !reasons.is_empty() %}
+  <ul>{% for r in reasons %}<li class="muted">{{ r }}</li>{% endfor %}</ul>
+  {% endif %}
+  <div class="facts">
+    <div><span class="k">Training environment</span> {{ env_note }}</div>
+    <div><span class="k">Runs folder</span> <code>{{ training_dir }}</code></div>
+  </div>
+  {% if env_ready %}
+  <form method="post" action="/training/remove-env" class="inline"><button type="submit" class="small danger">Remove training environment</button> <span class="muted">(uv and Python stay for the model export)</span></form>
+  {% endif %}
+</div>
+
+{% if available %}
+<form method="post" action="/training/queue">
+<div class="card">
+  <h2>1. Datasets</h2>
+  <p class="muted">Review export folders (YOLO layout: <code>classes.txt</code>, <code>images/</code>, <code>labels/</code>): the saved ones and the Review page's exports under <code>{{ training_dir }}/exports</code>. The export's validation split (held out by camera and day) becomes the benchmark set.</p>
+  {% if datasets.is_empty() %}<p class="muted">No folder saved yet: add one below, or type a path.</p>{% endif %}
+  {% for d in datasets %}
+  <label class="check"><input type="checkbox" name="dataset" value="{{ d.path }}"{% if !d.exists %} disabled{% else if d.saved %} checked{% endif %}> <code>{{ d.path }}</code>{% if !d.exists %} <span class="error">(missing)</span>{% endif %}{% if !d.saved %} <span class="muted">(Review page export)</span>{% endif %}</label>
+  {% endfor %}
+  <label>Another folder <input type="text" name="dataset_path" size="60" placeholder="C:\BlueOnyx\exports\review-2026-10"></label>
+  <div class="facts">
+    <label>Scene <select name="scene">{% for (v, t) in scenes %}<option value="{{ v }}">{{ t }}</option>{% endfor %}</select></label>
+    <label>Classes (comma-separated, head order; empty = all of the export) <input type="text" name="classes" size="40" placeholder="person, car, dog, cat, raccoon"></label>
+    <label class="check"><input type="checkbox" name="public"{% if !public_available %} disabled{% endif %}> Mix in the public night subset (LILA camera traps, CDLA){% if !public_available %} <span class="muted">(not pinned in this build)</span>{% endif %}</label>
+  </div>
+</div>
+
+<div class="card">
+  <h2>2. Models</h2>
+  <p class="muted">Tick one or more; they train one after the other. Estimates are rough (GPU memory at the suggested batch, time per epoch per 100 images).</p>
+  {% for f in families %}
+  <h3>{{ f.title }} <span class="tag">{{ f.license }}</span></h3>
+  {% if !f.available %}<p class="muted">{{ f.why }}</p>{% else %}
+  <p class="muted small">{{ f.notice }}</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th></th><th>Size</th><th>Estimate</th><th>Inference</th></tr></thead>
+    <tbody>
+    {% for s in f.sizes %}
+    <tr>
+      <td><input type="checkbox" name="model" value="{{ s.label }}" aria-label="{{ s.label }}"{% if !s.fits %} disabled{% endif %}></td>
+      <td><code>{{ s.size }}</code></td>
+      <td>{% if s.fits %}{{ s.estimate }}{% else %}<span class="muted">{{ s.why }}</span>{% endif %}</td>
+      <td class="muted">{{ s.latency }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+  {% endfor %}
+</div>
+
+<div class="card">
+  <h2>3. Options</h2>
+  <div class="facts">
+    <label>Epochs <input type="number" name="epochs" min="1" max="1000" value="{{ epochs }}"></label>
+    <label>Batch (empty = suggested) <input type="number" name="batch" min="1" max="256"></label>
+    <label>Input size (empty = the size's own) <input type="number" name="imgsz" min="160" max="1536" step="32"></label>
+    <label>Learning rate (empty = default) <input type="text" name="lr" size="8"></label>
+    <label>Model name (one model; empty = night-/custom-&lt;model&gt;-&lt;date&gt;) <input type="text" name="name" size="30"></label>
+  </div>
+  <div class="facts">
+    <label class="check"><input type="checkbox" name="night_aug"> Night augmentation (darkness 0.5, noise 0.3, grayscale 0.5)</label>
+    <label>Darkness p <input type="number" name="aug_dark" min="0" max="1" step="0.05"></label>
+    <label>Noise p <input type="number" name="aug_noise" min="0" max="1" step="0.05"></label>
+    <label>Grayscale p <input type="number" name="aug_gray" min="0" max="1" step="0.05"></label>
+  </div>
+  <div class="facts">
+    <span class="k">Also benchmark on</span>
+    {% for s in extra_sets %}<label class="check"><input type="checkbox" name="benchmark_set" value="{{ s }}"> <code>{{ s }}</code></label>{% endfor %}
+  </div>
+  {% if !env_ready && !allow_large %}
+  <label class="check"><input type="checkbox" name="confirm_large"> Download the training environment ({{ env_note }})</label>
+  {% endif %}
+  <button type="submit">Queue training</button>
+</div>
+</form>
+{% endif %}
+
+<div class="card">
+  <h2>Queue</h2>
+  {% if runs.is_empty() %}<p class="muted">No queued, running or failed runs.</p>{% else %}
+  <div class="scroll">
+  <table id="training-runs">
+    <thead><tr><th>Run</th><th>Model</th><th>State</th><th>Progress</th><th></th></tr></thead>
+    <tbody>
+    {% for r in runs %}
+    <tr data-run="{{ r.id }}">
+      <td><code>{{ r.name }}</code><br><span class="muted small">{{ r.id }}</span></td>
+      <td>{{ r.model }}<br><span class="muted small">{{ r.dataset }}</span></td>
+      <td data-field="state">{{ r.state }}</td>
+      <td><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span>{% if !r.log_tail.is_empty() %}<pre class="small" data-field="log">{{ r.log_tail }}</pre>{% endif %}</td>
+      <td>
+        {% if r.busy %}<form method="post" action="/training/cancel" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small danger">Cancel</button></form>
+        {% else %}<form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small">Remove</button></form>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Trained models</h2>
+  {% if results.is_empty() %}<p class="muted">None yet.</p>{% else %}
+  <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark">Benchmark</a> page.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Model</th><th>Family</th><th>Licence</th><th>Classes</th><th>Held-out benchmark</th><th>Use as</th></tr></thead>
+    <tbody>
+    {% for r in results %}
+    <tr>
+      <td><code>{{ r.name }}</code>{% if !r.in_config %} <span class="muted">(not in config)</span>{% endif %}<br><span class="muted small">{{ r.finished }}</span></td>
+      <td>{{ r.family }}</td>
+      <td>{{ r.license }}</td>
+      <td>{{ r.classes }}</td>
+      <td>{{ r.benchmark }}</td>
+      <td>
+        <form method="post" action="/training/use" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="role" value="default"><button type="submit" class="small">Default model</button></form>
+        <form method="post" action="/training/use" class="inline"><input type="hidden" name="id" value="{{ r.id }}">
+          <select name="role" aria-label="role"><option value="night">night model of</option><option value="verify">verifier of</option></select>
+          <select name="target" aria-label="target">{% for m in models %}{% if m != &r.name %}<option value="{{ m }}"{% if m == &default_model %} selected{% endif %}>{{ m }}</option>{% endif %}{% endfor %}</select>
+          <button type="submit" class="small">Apply</button>
+        </form>
+        <form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small">Remove from list</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Dataset folders</h2>
+  <form method="post" action="/training/datasets" class="inline">
+    <label>Add a review export folder <input type="text" name="add" size="60"></label>
+    <button type="submit" class="small">Add</button>
+  </form>
+  {% for d in datasets %}{% if d.saved %}
+  <form method="post" action="/training/datasets" class="inline"><input type="hidden" name="remove" value="{{ d.path }}"><code>{{ d.path }}</code> <button type="submit" class="small">Remove</button></form>
+  {% endif %}{% endfor %}
+</div>
+<script src="/static/training.js?v={{ version }}"></script>
+{% endblock %}

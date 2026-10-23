@@ -59,6 +59,8 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     ("logs.js", JS, include_str!("../../assets/logs.js")),
     ("stats.js", JS, include_str!("../../assets/stats.js")),
     ("test.js", JS, include_str!("../../assets/test.js")),
+    ("training.js", JS, include_str!("../../assets/training.js")),
+    ("review.js", JS, include_str!("../../assets/review.js")),
     ("welcome.js", JS, include_str!("../../assets/welcome.js")),
 ];
 

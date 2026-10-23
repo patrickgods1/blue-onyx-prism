@@ -42,10 +42,12 @@ use serde::{Serialize, Serializer};
 mod models;
 mod runtimes;
 mod tools;
+mod train;
 
 pub use models::*;
 pub(crate) use runtimes::*;
 pub use tools::*;
+pub use train::*;
 
 /// Pinned OpenVINO runtime version.
 pub const OPENVINO_VERSION: &str = "2026.4.0";
