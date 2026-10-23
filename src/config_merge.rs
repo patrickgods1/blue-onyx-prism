@@ -165,6 +165,9 @@ fn field_label(field: &str) -> String {
         "min_box_area_frac" => "min box area".into(),
         "suppress_overlaps" => "overlap suppression".into(),
         "static_suppression" => "static-box suppression".into(),
+        "preprocess" => "preprocess".into(),
+        "night_preprocess" => "night preprocess".into(),
+        "night_model" => "night model".into(),
         other => other.replace('_', " "),
     }
 }
@@ -207,6 +210,8 @@ fn global_label(k: &str) -> String {
         "min_box_area_frac" => "Min box area (share of image)".into(),
         "suppress_overlaps" => "Overlap suppression".into(),
         "static_suppression" => "Static-box suppression".into(),
+        "preprocess" => "Image preprocessing".into(),
+        "night_preprocess" => "Night / IR image preprocessing".into(),
         other => other.replace('_', " "),
     }
 }
@@ -323,10 +328,11 @@ pub fn describe_changes(old: &Config, new: &Config) -> (Vec<FieldChange>, String
             Key::Presence(n) => {
                 model_part(n, "", if y.is_some() { "added" } else { "removed" }.into());
             }
-            // Fields of an added/removed model are covered by "added"/"removed".
-            Key::Model { name, .. } if x.is_none() || y.is_none() => {
-                let _ = name;
-            }
+            // Fields of an added/removed model are covered by "added"/"removed" (an optional
+            // field set or cleared on a model present in both is a change like any other).
+            Key::Model { name, .. }
+                if !(a.contains_key(&presence_key(name))
+                    && b.contains_key(&presence_key(name))) => {}
             Key::Model { field, name } => {
                 model_part(name, field, format!("{} \u{2192} {to}", field_label(field)));
             }
@@ -408,6 +414,8 @@ pub fn live_global(k: &str) -> bool {
             | "min_box_area_frac"
             | "suppress_overlaps"
             | "static_suppression"
+            | "preprocess"
+            | "night_preprocess"
     ) || k.starts_with("benchmark.")
 }
 
@@ -415,6 +423,7 @@ pub fn live_global(k: &str) -> bool {
 pub const LIVE_MODEL_FIELDS: &[&str] = &[
     "confidence_threshold",
     "object_filter",
+    "night_model",
     "night_confidence_threshold",
     "label_thresholds",
     "night_label_thresholds",
@@ -422,6 +431,8 @@ pub const LIVE_MODEL_FIELDS: &[&str] = &[
     "min_box_area_frac",
     "suppress_overlaps",
     "static_suppression",
+    "preprocess",
+    "night_preprocess",
 ];
 
 /// The per-model night / IR rule fields (serialized only when set; absent = the global value).
@@ -433,6 +444,8 @@ pub const NIGHT_MODEL_FIELDS: &[&str] = &[
     "min_box_area_frac",
     "suppress_overlaps",
     "static_suppression",
+    "preprocess",
+    "night_preprocess",
 ];
 
 /// Labels of the changed fields that applied without a restart (live globals, the default
@@ -989,5 +1002,45 @@ mod tests {
             .find(|c| c.label == "IPcam-general \u{b7} person aspect")
             .unwrap();
         assert_eq!((c.from.as_str(), c.to.as_str()), ("global", "[0.2,0.9]"));
+    }
+
+    #[test]
+    fn night_model_applies_live_without_a_reload() {
+        let old = cfg();
+        let mut new = old.clone();
+        new.models[0].night_model = Some("yolo26s".into());
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(p.models.is_empty() && p.global.is_empty(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        assert_eq!(
+            applied_live(&changes),
+            ["IPcam-general \u{b7} night model"],
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn preprocess_applies_live_and_absent_means_global() {
+        use crate::model::enhance::Preprocess;
+        let old = cfg();
+        let mut new = old.clone();
+        new.preprocess = Some(Preprocess::Gamma(0.6));
+        new.models[0].night_preprocess = Some(Preprocess::CLAHE);
+        assert!(model_reloads(&old, &new).is_empty());
+        let p = pending(&old, &new);
+        assert!(p.models.is_empty() && p.global.is_empty(), "{p:?}");
+        let (changes, _) = describe_changes(&old, &new);
+        let live = applied_live(&changes);
+        assert!(
+            live.contains(&"Image preprocessing".to_string())
+                && live.contains(&"IPcam-general \u{b7} night preprocess".to_string()),
+            "{live:?}"
+        );
+        let c = changes
+            .iter()
+            .find(|c| c.label == "IPcam-general \u{b7} night preprocess")
+            .unwrap();
+        assert_eq!((c.from.as_str(), c.to.as_str()), ("global", "clahe"));
     }
 }

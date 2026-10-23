@@ -7,6 +7,7 @@ use super::watch::STUCK_PREFIX;
 use super::*;
 use crate::backend::fake::{Call, FakeScript, Step, yolo26_output};
 use crate::image::RgbImage;
+use crate::metrics::RouteFallback;
 use crate::model::ModelFamilyKind;
 use tokio::sync::oneshot;
 
@@ -44,7 +45,8 @@ fn det(class: usize, delay_ms: u64) -> Step {
 }
 
 struct Harness {
-    handle: WorkerHandle,
+    /// Shared so a [`Peers`] directory can point at it (weakly).
+    handle: Arc<WorkerHandle>,
     script: FakeScript,
     shutdown: CancellationToken,
 }
@@ -52,11 +54,20 @@ struct Harness {
 impl Harness {
     /// Spawn a worker on the fake runtime and wait until its model is ready.
     fn start(slots: usize, request_timeout: Duration) -> Self {
+        let live = LiveSettings {
+            request_timeout,
+            ..LiveSettings::default()
+        };
+        Self::start_named("fake", slots, live, Peers::new())
+    }
+
+    /// [`Self::start`] for model `name` with `live` settings and the worker directory `peers`.
+    fn start_named(name: &str, slots: usize, live: LiveSettings, peers: Peers) -> Self {
         let script = FakeScript::new(slots, INPUT);
         let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
         let path = PathBuf::from("fake.onnx");
         let cfg = WorkerConfig {
-            name: "fake".into(),
+            name: name.into(),
             model: ModelConfig {
                 path: path.clone(),
                 family: ModelFamilyKind::Yolo26,
@@ -69,21 +80,18 @@ impl Harness {
                 gpu_precision: None,
             },
             classes: classes(),
-            live: LiveSettings {
-                request_timeout,
-                ..LiveSettings::default()
-            }
-            .shared(),
+            live: live.shared(),
             queue_size: QUEUE,
             lazy: false,
             can_use_gpu: false,
             wait: None,
             concurrency: None,
             prep: Some(PrepPool::new(2)),
+            peers,
         };
-        let metrics = Arc::new(ModelMetrics::new("fake", "auto", ""));
+        let metrics = Arc::new(ModelMetrics::new(name, "auto", ""));
         let shutdown = CancellationToken::new();
-        let handle = spawn_worker(runtimes, cfg, metrics, shutdown.clone());
+        let handle = Arc::new(spawn_worker(runtimes, cfg, metrics, shutdown.clone()));
         let h = Self {
             handle,
             script,
@@ -125,7 +133,10 @@ impl Harness {
     fn stop(self) -> Duration {
         let t = Instant::now();
         self.shutdown.cancel();
-        self.handle.join();
+        match Arc::try_unwrap(self.handle) {
+            Ok(h) => h.join(),
+            Err(_) => panic!("a test still holds the worker handle"),
+        }
         t.elapsed()
     }
 }
@@ -548,4 +559,280 @@ fn night_rules_and_static_memory_apply_in_the_worker() {
     assert_eq!(m.suppressed(SuppressReason::NightThreshold), 1);
     assert_eq!(m.suppressed(SuppressReason::Static), 2);
     assert!(h.stop() < SOON);
+}
+
+/// Live settings of a test model: a long timeout and `night_model`.
+fn live_with_night(night: Option<&str>) -> LiveSettings {
+    LiveSettings {
+        request_timeout: Duration::from_secs(30),
+        night_model: night.map(str::to_string),
+        ..LiveSettings::default()
+    }
+}
+
+/// A primary model "day" with `night_model: night` and the model "night", both served
+/// through one [`Peers`] directory (as the registry publishes it).
+fn day_and_night(night_live: LiveSettings) -> (Harness, Harness, Peers) {
+    let peers = Peers::new();
+    let night = Harness::start_named("night", 1, night_live, peers.clone());
+    let day = Harness::start_named("day", 1, live_with_night(Some("Night")), peers.clone());
+    peers.publish([&day.handle, &night.handle]);
+    (day, night, peers)
+}
+
+#[test]
+fn ir_frame_is_answered_by_the_night_model_and_day_frame_by_the_primary() {
+    let (day, night, _peers) = day_and_night(live_with_night(None));
+    night.script.push([det(3, 0)]);
+    day.script.push([det(1, 0)]);
+    // An IR frame first, a day frame right behind it: neither waits for the other.
+    let ir = day.send_at(gray_jpeg(), "ir.jpg", Instant::now());
+    let colour = day.send("day.jpg");
+    let got = wait_all(vec![ir, colour]);
+    assert_eq!(label(&got[0].0), "c3", "answered by the night model");
+    assert_eq!(label(&got[1].0), "c1", "answered by the primary");
+    // Same response shape: the night model's provider and timings, the module id.
+    let r = &got[0].0;
+    assert_eq!(r.executionProvider, "OpenVINO CPU (Fake CPU)");
+    assert_eq!(r.moduleId, crate::MODULE_ID);
+    assert_eq!(r.command, "detect");
+    assert_eq!(r.message, "Found 1 objects");
+    assert_eq!(night.script.submits(), 1);
+    assert_eq!(
+        day.script.submits(),
+        1,
+        "only the day frame ran on the primary"
+    );
+    assert_eq!(day.handle.metrics.night_routed(), 1);
+    assert_eq!(night.handle.metrics.night_routed(), 0);
+    assert_eq!(night.handle.metrics.inference_ms.count(), 1);
+    for r in RouteFallback::ALL {
+        assert_eq!(day.handle.metrics.night_fallback(r), 0, "{r:?}");
+    }
+    day.stop();
+    night.stop();
+}
+
+#[test]
+fn the_night_models_own_filters_apply_to_forwarded_frames() {
+    use crate::model::filters::{FilterRules, SuppressReason};
+    let mut live = live_with_night(None);
+    live.filters = FilterRules {
+        night_confidence_threshold: Some(0.95),
+        ..FilterRules::default()
+    };
+    let (day, night, _peers) = day_and_night(live);
+    night.script.push([det(0, 0)]);
+    let r = day.send_at(gray_jpeg(), "ir.jpg", Instant::now()).wait();
+    // The forwarded stats say IR: the night model's night threshold removed the 0.9 box.
+    assert!(r.success && r.predictions.is_empty(), "{r:?}");
+    assert_eq!(
+        night
+            .handle
+            .metrics
+            .suppressed(SuppressReason::NightThreshold),
+        1
+    );
+    assert_eq!(
+        day.handle
+            .metrics
+            .suppressed(SuppressReason::NightThreshold),
+        0
+    );
+    day.stop();
+    night.stop();
+}
+
+/// A forwarded frame is the original (not the primary's enhanced copy), preprocessed with
+/// the night model's own modes for the scene the primary measured.
+#[test]
+fn forwarded_frames_use_the_night_models_own_preprocessing() {
+    use crate::model::enhance::{Preprocess, PreprocessModes};
+    let modes = |night| PreprocessModes {
+        preprocess: Preprocess::None,
+        night_preprocess: Some(night),
+    };
+    let mut night_live = live_with_night(None);
+    night_live.preprocess = modes(Preprocess::Gamma(0.5));
+    let peers = Peers::new();
+    let night = Harness::start_named("night", 1, night_live, peers.clone());
+    let mut day_live = live_with_night(Some("night"));
+    // A strong darkening on the primary: visible in the tensor if it leaked into the frame.
+    day_live.preprocess = modes(Preprocess::Gamma(3.0));
+    let day = Harness::start_named("day", 1, day_live, peers.clone());
+    peers.publish([&day.handle, &night.handle]);
+    night.script.push([det(3, 0)]);
+    let r = day.send_at(gray_jpeg(), "ir.jpg", Instant::now()).wait();
+    assert_eq!(label(&r), "c3");
+    let want = |m| {
+        // The fake model is a YOLO26: letterbox, no normalization.
+        let spec =
+            crate::prep::PrepSpec::new(INPUT.0, INPUT.1, crate::model::ResizeMode::Letterbox, None);
+        let mut pre = spec.preprocessor();
+        let tensors = crate::prep::TensorPool::new();
+        let p = crate::prep::PrepPool::prepare_now(
+            &mut pre,
+            &tensors,
+            &gray_jpeg(),
+            &spec,
+            false,
+            modes(m),
+        )
+        .unwrap();
+        p.chw.to_vec()
+    };
+    let got = night.script.inputs();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0], want(Preprocess::Gamma(0.5)));
+    assert_ne!(got[0], want(Preprocess::None), "the enhancement ran");
+    assert_eq!(day.script.submits(), 0);
+    day.stop();
+    night.stop();
+}
+
+#[test]
+fn unavailable_night_model_falls_back_to_the_primary() {
+    use crossbeam_channel::bounded;
+    use std::sync::atomic::AtomicUsize;
+    let peers = Peers::new();
+    let day = Harness::start_named("day", 1, live_with_night(Some("night")), peers.clone());
+    let m = || Arc::new(ModelMetrics::new("night", "auto", ""));
+    let ir = |h: &Harness| h.send_at(gray_jpeg(), "ir.jpg", Instant::now());
+    // Unknown (nothing published yet).
+    day.script.push([det(0, 0)]);
+    assert_eq!(label(&ir(&day).wait()), "c0");
+    assert_eq!(day.handle.metrics.night_fallback(RouteFallback::Unknown), 1);
+    // Failed / loading.
+    let failed = Arc::new(WorkerHandle::failed("night", "broken", m()));
+    peers.publish([&day.handle, &failed]);
+    day.script.push([det(1, 0)]);
+    assert_eq!(label(&ir(&day).wait()), "c1");
+    assert_eq!(
+        day.handle.metrics.night_fallback(RouteFallback::NotReady),
+        1
+    );
+    // Ready but its queue is full.
+    let (tx, _keep_rx) = bounded(1);
+    let mut full = WorkerHandle::failed("night", "unused", m());
+    full.state.set(ModelState::Ready);
+    full.sender = tx;
+    full.soft_capacity = Arc::new(AtomicUsize::new(1));
+    let (tx2, _r) = oneshot::channel();
+    full.sender
+        .try_send(WorkItem::Detect(
+            VisionDetectionRequest::default(),
+            tx2,
+            Instant::now(),
+        ))
+        .unwrap();
+    let full = Arc::new(full);
+    peers.publish([&day.handle, &full]);
+    day.script.push([det(2, 0)]);
+    assert_eq!(label(&ir(&day).wait()), "c2");
+    assert_eq!(
+        day.handle.metrics.night_fallback(RouteFallback::QueueFull),
+        1
+    );
+    // Ready, room, but its worker is gone (a reload in between).
+    let (tx, rx) = bounded(4);
+    drop(rx);
+    let mut gone = WorkerHandle::failed("night", "unused", m());
+    gone.state.set(ModelState::Ready);
+    gone.sender = tx;
+    gone.soft_capacity = Arc::new(AtomicUsize::new(4));
+    let gone = Arc::new(gone);
+    peers.publish([&day.handle, &gone]);
+    day.script.push([det(3, 0)]);
+    assert_eq!(label(&ir(&day).wait()), "c3");
+    assert_eq!(day.handle.metrics.night_fallback(RouteFallback::Stopped), 1);
+    // A dropped handle (retired worker) is not kept alive by the directory.
+    drop(gone);
+    day.script.push([det(4, 0)]);
+    assert_eq!(label(&ir(&day).wait()), "c4");
+    assert_eq!(day.handle.metrics.night_fallback(RouteFallback::Unknown), 2);
+    assert_eq!(day.handle.metrics.night_routed(), 0);
+    assert_eq!(day.script.submits(), 5);
+    drop((failed, full));
+    day.stop();
+}
+
+#[test]
+fn forwarded_requests_are_never_forwarded_again() {
+    // A cycle the config validation rejects; the workers must still not bounce frames.
+    let (day, night, _peers) = day_and_night(live_with_night(Some("day")));
+    night.script.push([det(2, 0)]);
+    let r = day.send_at(gray_jpeg(), "ir.jpg", Instant::now()).wait();
+    assert_eq!(label(&r), "c2");
+    assert_eq!(day.script.submits(), 0);
+    assert_eq!(night.script.submits(), 1);
+    assert_eq!(day.handle.metrics.night_routed(), 1);
+    assert_eq!(night.handle.metrics.night_routed(), 0);
+    for r in RouteFallback::ALL {
+        assert_eq!(night.handle.metrics.night_fallback(r), 0, "{r:?}");
+    }
+    // Pointing at itself is ignored too.
+    let peers = Peers::new();
+    let me = Harness::start_named("me", 1, live_with_night(Some("ME")), peers.clone());
+    peers.publish([&me.handle]);
+    me.script.push([det(1, 0)]);
+    assert_eq!(
+        label(&me.send_at(gray_jpeg(), "ir.jpg", Instant::now()).wait()),
+        "c1"
+    );
+    assert_eq!(me.handle.metrics.night_fallback(RouteFallback::Unknown), 1);
+    me.stop();
+    day.stop();
+    night.stop();
+}
+
+/// The cascade API: another worker sends a decoded frame and gets the answer on a crossbeam
+/// channel; a spent deadline is a drop.
+#[test]
+fn decoded_frames_can_be_answered_to_another_worker() {
+    let h = Harness::start(1, Duration::from_secs(30));
+    let img = crate::image::decode(&gray_jpeg()).unwrap();
+    let stats = crate::image_stats::ImageStats::compute(&img);
+    assert_ne!(stats.scene(), crate::image_stats::Scene::Day);
+    let decoded = |deadline: Instant, reply: super::Reply| {
+        WorkItem::DetectDecoded(Box::new(Decoded {
+            img: img.clone(),
+            stats,
+            image_name: "crop.jpg".into(),
+            min_confidence: 0.0,
+            request_id: "abcd1234".into(),
+            enqueued: Instant::now(),
+            deadline,
+            decode: Duration::from_millis(3),
+            reply,
+            from: "primary".into(),
+        }))
+    };
+    h.script.push([det(4, 0)]);
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    h.handle
+        .sender
+        .try_send(decoded(Instant::now() + SOON, super::Reply::Worker(tx)))
+        .unwrap();
+    let r = rx.recv_timeout(SOON).unwrap();
+    assert_eq!(label(&r), "c4");
+    // Letterboxed for this model like a decoded upload: same box as from the JPEG.
+    assert_eq!(
+        (r.predictions[0].x_min, r.predictions[0].y_min),
+        (10, 10),
+        "{r:?}"
+    );
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    h.handle
+        .sender
+        .try_send(decoded(Instant::now(), super::Reply::Worker(tx)))
+        .unwrap();
+    let r = rx.recv_timeout(SOON).unwrap();
+    assert!(!r.success);
+    assert!(
+        r.message.starts_with("Request dropped: waited"),
+        "{}",
+        r.message
+    );
+    assert_eq!(h.script.submits(), 1);
+    h.stop();
 }

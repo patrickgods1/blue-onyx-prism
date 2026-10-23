@@ -7,14 +7,16 @@
 use super::pipeline::{Done, InFlight, Job, Meta, Pipeline, Stage};
 use super::watch::{SlowCompile, StuckWatch, collect_watched, watch_slow_compile};
 use super::{
-    COMPILING_ON, LoadGate, ORDER_TARGET, POLL, WorkItem, WorkerConfig, auto_queue_size,
-    effective_threshold, initializing_message, loaded_provider, millis_u64, ms, new_request_id,
+    COMPILING_ON, Decoded, LoadGate, ORDER_TARGET, POLL, Reply, WorkItem, WorkerConfig,
+    WorkerHandle, auto_queue_size, effective_threshold, initializing_message, loaded_provider,
+    millis_u64, ms, new_request_id,
 };
 use crate::api::VisionDetectionResponse;
 use crate::backend::{Backend, Candidate, Completion, DeviceInfo, Runtimes};
 use crate::image_stats::Scene;
-use crate::metrics::{DropReason, ModelMetrics};
+use crate::metrics::{DropReason, ModelMetrics, RouteFallback};
 use crate::model::filters::{SuppressCounts, SuppressReason};
+use crate::model::preprocess::Preprocessor;
 use crate::model::{Family, PostParams};
 use crate::prep::{PrepJob, PrepPool, PrepSpec, Prepared};
 use crate::profile::DeviceTuning;
@@ -68,6 +70,9 @@ pub(super) struct WorkerCtx {
     /// Static-box memory of this model (kept across live-settings swaps; a reload starts a new
     /// worker and so an empty memory).
     pub(super) static_memory: RefCell<StaticMemory>,
+    /// Preprocessor for requests forwarded with a decoded image ([`WorkItem::DetectDecoded`]),
+    /// made on first use for the engine's geometry.
+    pub(super) decoded_pre: RefCell<Option<(PrepSpec, Preprocessor)>>,
 }
 
 /// Inference errors in a row after which the model counts as broken (a reset GPU makes every
@@ -176,11 +181,13 @@ impl WorkerCtx {
                 let mut sel = Select::new();
                 let i_work =
                     (!closed && self.has_room(engine.as_ref(), &p, &prep)).then(|| sel.recv(&rx));
+                // The head's prep reply is awaited while a slot is free, or (no slot free) when
+                // it may be forwarded to the night model, which needs no slot here.
                 let head_prep = match p.pending.front() {
                     Some(Job {
                         stage: Stage::Prep(r),
-                        ..
-                    }) if p.slots.iter().any(Option::is_none) => Some(r),
+                        meta,
+                    }) if p.slots.iter().any(Option::is_none) || may_route(meta) => Some(r),
                     _ => None,
                 };
                 let i_prep = head_prep.map(|r| sel.recv(r));
@@ -237,9 +244,14 @@ impl WorkerCtx {
         let msg = format!("Model '{}' is shutting down", self.cfg.name);
         self.answer_all(p, &msg);
         while let Ok(item) = rx.try_recv() {
-            if let WorkItem::Detect(_, reply, _) | WorkItem::DetectWithId(_, reply, _, _) = item {
-                let _ = reply.send(self.error_response(msg.clone(), 0, 0));
-            }
+            let reply = match item {
+                WorkItem::Detect(_, reply, _) | WorkItem::DetectWithId(_, reply, _, _) => {
+                    Reply::Client(reply)
+                }
+                WorkItem::DetectDecoded(d) => d.reply,
+                WorkItem::Load => continue,
+            };
+            let _ = reply.send(self.error_response(msg.clone(), 0, 0));
         }
     }
 
@@ -298,7 +310,7 @@ impl WorkerCtx {
         prep: &PrepPool,
     ) {
         let name = &self.cfg.name;
-        let (req, reply, enqueued, request_id) = match item {
+        let (meta, input) = match item {
             WorkItem::Load => {
                 if engine.is_none() && !matches!(self.state.get(), ModelState::Failed(_)) {
                     // Lazy model: compile now; requests meanwhile are answered
@@ -310,8 +322,13 @@ impl WorkerCtx {
                 }
                 return;
             }
-            WorkItem::Detect(req, reply, enqueued) => (req, reply, enqueued, new_request_id()),
-            WorkItem::DetectWithId(req, reply, enqueued, id) => (req, reply, enqueued, id),
+            WorkItem::Detect(req, reply, enqueued) => {
+                self.intake(req, Reply::Client(reply), enqueued, new_request_id())
+            }
+            WorkItem::DetectWithId(req, reply, enqueued, id) => {
+                self.intake(req, Reply::Client(reply), enqueued, id)
+            }
+            WorkItem::DetectDecoded(d) => self.intake_decoded(*d),
         };
         let Some(eng) = engine.as_ref() else {
             // Only reachable for a lazy model (between the server's trigger and the state
@@ -326,32 +343,44 @@ impl WorkerCtx {
                     initializing_message(name, self.state.detail().as_deref())
                 }
             };
-            let _ = reply.send(self.error_response(msg, 0, 0));
+            let _ = meta.reply.send(self.error_response(msg, 0, 0));
             return;
         };
         trace!(
             target: ORDER_TARGET,
             model = %name,
-            image = %req.image_name,
-            request_id = %request_id,
+            image = %meta.image_name,
+            request_id = %meta.request_id,
             "accepted"
         );
-        let meta = Meta {
-            reply,
-            enqueued,
-            image_name: req.image_name,
-            min_confidence: req.min_confidence,
-            live: self.cfg.live.load_full(),
-            request_id,
+        let image_data = match input {
+            Input::Bytes(b) => b,
+            Input::Decoded { img, stats, decode } => {
+                let stage = if let Some(resp) = self.timed_out(&meta) {
+                    Stage::Answer(resp)
+                } else {
+                    match self.prepare_decoded(eng, prep, img, stats, &meta) {
+                        Ok(mut prepared) => {
+                            prepared.decode = decode;
+                            Stage::Ready(prepared)
+                        }
+                        Err(e) => Stage::Answer(self.failure(&meta, &eng.provider, &e)),
+                    }
+                };
+                p.pending.push_back(Job { meta, stage });
+                return;
+            }
         };
         let stage = if let Some(resp) = self.timed_out(&meta) {
             Stage::Answer(resp)
         } else {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let job = PrepJob {
-                image: req.image_data,
+                image: image_data,
                 spec: eng.spec,
-                keep_image: meta.live.save_image_path.is_some(),
+                // The decoded frame is forwarded when the night model takes it.
+                keep_image: meta.live.save_image_path.is_some() || may_route(&meta),
+                preprocess: meta.live.preprocess,
                 reply: tx,
             };
             match prep.submit(job) {
@@ -362,10 +391,250 @@ impl WorkerCtx {
         p.pending.push_back(Job { meta, stage });
     }
 
+    /// The bookkeeping of a request from the HTTP layer (live settings as of now).
+    fn intake(
+        &self,
+        req: crate::api::VisionDetectionRequest,
+        reply: Reply,
+        enqueued: Instant,
+        request_id: String,
+    ) -> (Meta, Input) {
+        let meta = Meta {
+            reply,
+            enqueued,
+            image_name: req.image_name,
+            min_confidence: req.min_confidence,
+            live: self.cfg.live.load_full(),
+            request_id,
+            budget: None,
+            forwardable: true,
+            routed_from: None,
+        };
+        (meta, Input::Bytes(req.image_data))
+    }
+
+    /// The bookkeeping of a request another worker forwarded with its decoded image: this
+    /// model's live settings, the sender's deadline, never forwarded again.
+    fn intake_decoded(&self, d: Decoded) -> (Meta, Input) {
+        let Decoded {
+            img,
+            stats,
+            image_name,
+            min_confidence,
+            request_id,
+            enqueued,
+            deadline,
+            decode,
+            reply,
+            from,
+        } = d;
+        let meta = Meta {
+            reply,
+            enqueued,
+            image_name,
+            min_confidence,
+            live: self.cfg.live.load_full(),
+            request_id,
+            budget: Some(deadline.saturating_duration_since(enqueued)),
+            forwardable: false,
+            routed_from: Some(from),
+        };
+        (meta, Input::Decoded { img, stats, decode })
+    }
+
+    /// Preprocess a forwarded, already decoded image for this model on this thread (the
+    /// letterbox / stretch of one frame, plus this model's enhancement for the frame's scene).
+    fn prepare_decoded(
+        &self,
+        eng: &Engine,
+        prep: &PrepPool,
+        img: crate::image::RgbImage,
+        stats: crate::image_stats::ImageStats,
+        meta: &Meta,
+    ) -> Result<Prepared> {
+        let mut cell = self.decoded_pre.borrow_mut();
+        let (spec, pre) = match cell.take() {
+            Some((spec, pre)) if spec == eng.spec => (spec, pre),
+            _ => (eng.spec, eng.spec.preprocessor()),
+        };
+        let mut pre = pre;
+        let keep = meta.live.save_image_path.is_some();
+        // This model's own modes (the sender's scene statistics, its original frame).
+        let modes = meta.live.preprocess;
+        let tensors = prep.tensors();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PrepPool::prepare_image(&mut pre, tensors, img, stats, &spec, keep, modes)
+        }));
+        match result {
+            Ok(r) => {
+                *cell = Some((spec, pre));
+                r
+            }
+            // The preprocessor may be half-updated: the next request makes a new one.
+            Err(_) => Err(anyhow::anyhow!("preprocessing panicked")),
+        }
+    }
+
+    /// Night model switch for the request at the head of `pending` (decoded, a night / IR
+    /// frame, `night_model` set, not tried before): hand its decoded image to the night model's
+    /// worker when that one is ready and has room. None: forwarded (the night worker answers
+    /// it); `Some(job)`: run it here (a fallback is counted and warned about, throttled). Never
+    /// blocks: the send is a `try_send`, so two workers can never wait on each other.
+    fn route(&self, mut job: Job) -> Option<Job> {
+        job.meta.forwardable = false;
+        let Some(night) = job.meta.live.night_model.clone() else {
+            return Some(job);
+        };
+        let Job { meta, stage } = job;
+        let mut prepared = match stage {
+            Stage::Ready(p) => p,
+            stage => return Some(Job { meta, stage }),
+        };
+        let scene = prepared.stats.scene();
+        let late = meta.enqueued.elapsed() > meta.timeout();
+        let img = match prepared.img.take() {
+            // Day frame, or already too late (answered as a drop in its turn).
+            Some(img) if scene != Scene::Day && !late => img,
+            img => {
+                // Kept for routing only: drop it unless this model saves images.
+                prepared.img = img.filter(|_| meta.live.save_image_path.is_some());
+                return Some(Job {
+                    meta,
+                    stage: Stage::Ready(prepared),
+                });
+            }
+        };
+        let target = match self.night_target(&night) {
+            Ok(h) => h,
+            Err(reason) => {
+                return Some(self.fall_back(meta, prepared, img, &night, reason));
+            }
+        };
+        let log_id = meta.request_id.clone();
+        let log_image = meta.image_name.clone();
+        let deadline = meta.enqueued + meta.timeout();
+        let Meta {
+            reply,
+            enqueued,
+            image_name,
+            min_confidence,
+            live,
+            request_id,
+            budget,
+            ..
+        } = meta;
+        let decoded = Decoded {
+            img,
+            stats: prepared.stats,
+            image_name,
+            min_confidence,
+            request_id,
+            enqueued,
+            deadline,
+            decode: prepared.decode,
+            reply,
+            from: self.cfg.name.clone(),
+        };
+        let (back, reason) = match target
+            .sender
+            .try_send(WorkItem::DetectDecoded(Box::new(decoded)))
+        {
+            Ok(()) => {
+                self.metrics.record_night_routed();
+                // The primary's line of this request; the night model logs its own
+                // "detection done" with the same request id.
+                debug!(
+                    model = %self.cfg.name,
+                    routed_to = %target.name,
+                    request_id = %log_id,
+                    image = %log_image,
+                    scene = %scene,
+                    luma = f64::from(prepared.stats.mean_luma),
+                    chroma = f64::from(prepared.stats.chroma_spread.min(prepared.stats.tint_spread)),
+                    elapsed_ms = millis_u64(enqueued.elapsed()),
+                    decode_ms = prepared.decode.as_secs_f64() * 1e3,
+                    "detection routed to the night model"
+                );
+                return None;
+            }
+            Err(crossbeam_channel::TrySendError::Full(i)) => (i, RouteFallback::QueueFull),
+            Err(crossbeam_channel::TrySendError::Disconnected(i)) => (i, RouteFallback::Stopped),
+        };
+        let WorkItem::DetectDecoded(d) = back else {
+            // Not reachable (the item sent is the item returned); nothing to answer then.
+            return None;
+        };
+        let d = *d;
+        let meta = Meta {
+            reply: d.reply,
+            enqueued: d.enqueued,
+            image_name: d.image_name,
+            min_confidence: d.min_confidence,
+            live,
+            request_id: d.request_id,
+            budget,
+            forwardable: false,
+            routed_from: None,
+        };
+        Some(self.fall_back(meta, prepared, d.img, &night, reason))
+    }
+
+    /// The served, ready worker of `night` with room for one more request, or why not (a lazy
+    /// night model is asked to compile).
+    fn night_target(&self, night: &str) -> std::result::Result<Arc<WorkerHandle>, RouteFallback> {
+        use crate::registry::normalize_name;
+        let h = self
+            .cfg
+            .peers
+            .get(night)
+            .filter(|h| normalize_name(&h.name) != normalize_name(&self.cfg.name))
+            .ok_or(RouteFallback::Unknown)?;
+        if h.state.get() != ModelState::Ready {
+            h.trigger_load();
+            return Err(RouteFallback::NotReady);
+        }
+        if h.is_full() {
+            return Err(RouteFallback::QueueFull);
+        }
+        Ok(h)
+    }
+
+    /// Run a night / IR frame here after all: count and warn (throttled), and put the decoded
+    /// image back when this model saves images.
+    fn fall_back(
+        &self,
+        meta: Meta,
+        mut prepared: Prepared,
+        img: crate::image::RgbImage,
+        night: &str,
+        reason: RouteFallback,
+    ) -> Job {
+        self.metrics.record_night_fallback(reason);
+        if let Some(held_back) = self.metrics.night_fallback_log.allow(self.metrics.now_ms()) {
+            warn!(
+                model = %self.cfg.name,
+                night_model = %night,
+                reason = reason.as_str(),
+                request_id = %meta.request_id,
+                similar_since_last_warning = held_back,
+                "night / IR frame runs on this model: its night_model is {}; check that model \
+                 on the Models card (enabled, loaded) or clear night_model",
+                fallback_text(reason)
+            );
+        }
+        if meta.live.save_image_path.is_some() {
+            prepared.img = Some(img);
+        }
+        Job {
+            meta,
+            stage: Stage::Ready(prepared),
+        }
+    }
+
     /// The drop answer when `meta` waited longer than the request timeout.
     fn timed_out(&self, meta: &Meta) -> Option<VisionDetectionResponse> {
         let waited = meta.enqueued.elapsed();
-        let timeout = meta.live.request_timeout;
+        let timeout = meta.timeout();
         if waited <= timeout {
             return None;
         }
@@ -436,6 +705,23 @@ impl WorkerCtx {
                 job.stage = self.prep_stage(r, &job.meta);
                 moved = true;
             }
+            if matches!(job.stage, Stage::Ready(_)) && may_route(&job.meta) {
+                // Night model switch: a forwarded request leaves this pipeline without a
+                // slot or a place in the reply order.
+                let Some(job) = p.pending.pop_front() else {
+                    break;
+                };
+                match self.route(job) {
+                    None => {
+                        moved = true;
+                        continue;
+                    }
+                    Some(job) => p.pending.push_front(job),
+                }
+            }
+            let Some(job) = p.pending.front() else {
+                break;
+            };
             let slot = match &job.stage {
                 Stage::Answer(_) => None,
                 Stage::Ready(_) => match p.free_slot() {
@@ -546,7 +832,7 @@ impl WorkerCtx {
         if let Some(&Done::Slot(i)) = p.order.front()
             && let Some(f) = p.slots.get_mut(i).and_then(Option::as_mut)
             && f.done.is_none()
-            && f.submitted.elapsed() > f.meta.live.request_timeout
+            && f.submitted.elapsed() > f.meta.timeout()
         {
             warn!(
                 model = %self.cfg.name,
@@ -578,7 +864,7 @@ impl WorkerCtx {
             success = resp.success,
             "replied"
         );
-        if meta.reply.send(resp).is_err() {
+        if !meta.reply.send(resp) {
             debug!(model = %self.cfg.name, "client went away before the response was sent");
         }
     }
@@ -872,7 +1158,7 @@ impl WorkerCtx {
         };
         let collected = if f.overdue {
             let watch = self.stuck_watch(eng);
-            let limit = live.request_timeout;
+            let limit = f.meta.timeout();
             collect_watched(&watch, limit, || eng.backend.collect(slot))
         } else {
             eng.backend.collect(slot)
@@ -912,6 +1198,7 @@ impl WorkerCtx {
                     model = %name,
                     device = %eng.device,
                     request_id = %f.meta.request_id,
+                    routed_from = f.meta.routed_from.as_deref(),
                     image = %f.meta.image_name,
                     size = %format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
                     scene = %scene,
@@ -979,6 +1266,32 @@ impl WorkerCtx {
             }
         };
         self.reply(f.meta, resp);
+    }
+}
+
+/// What a request brings: the encoded image (HTTP), or a frame another worker decoded.
+enum Input {
+    Bytes(bytes::Bytes),
+    Decoded {
+        img: crate::image::RgbImage,
+        stats: crate::image_stats::ImageStats,
+        decode: Duration,
+    },
+}
+
+/// True while `meta` may still go to the model's night model (it has one, the request came
+/// from the HTTP layer and was not tried yet).
+fn may_route(meta: &Meta) -> bool {
+    meta.forwardable && meta.live.night_model.is_some()
+}
+
+/// "not served", "not ready", ... for the fallback warning.
+fn fallback_text(reason: RouteFallback) -> &'static str {
+    match reason {
+        RouteFallback::Unknown => "not served (unknown name, disabled or removed)",
+        RouteFallback::NotReady => "not ready (loading, lazy or failed)",
+        RouteFallback::QueueFull => "busy (its queue is full)",
+        RouteFallback::Stopped => "stopping (being reloaded)",
     }
 }
 

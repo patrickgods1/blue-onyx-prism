@@ -284,6 +284,7 @@ impl<'a> Bench<'a> {
             },
             classes: &job.classes,
             filter: self.object_filter_for(job),
+            variant: job.variant.as_ref(),
         };
 
         let all: Vec<(&ImageSet, &images::SetImage)> = self
@@ -456,13 +457,20 @@ pub(super) struct Pipeline<'j> {
     eval_params: PostParams,
     classes: &'j [String],
     filter: Option<&'j [String]>,
+    /// Enhancement and filter rules on top of the plain stages ([`super::variant`]).
+    variant: Option<&'j PipelineVariant>,
 }
 
 impl Pipeline<'_> {
     /// One request through the worker's stages, serially, with per-stage timings; with `eval`,
-    /// the same outputs are post-processed again at the evaluation threshold (untimed,
-    /// unfiltered). The set's `transform` (an image-set property, not a production stage) is
-    /// applied after decode and is not part of any stage time.
+    /// the same outputs are post-processed again at the evaluation threshold (untimed, without
+    /// the object filter). The set's `transform` (an image-set property, not a production
+    /// stage) is applied after decode and is not part of any stage time.
+    ///
+    /// A variant adds what the service does with the same options: the scene statistics of the
+    /// (transformed) frame and its enhancement count as preprocess time, its filter rules run
+    /// on the family's detections (postprocess time) and on the evaluation detections too, so
+    /// AP, false positives and the threshold sweep see the filtered boxes.
     fn run(
         &mut self,
         bytes: &[u8],
@@ -477,6 +485,14 @@ impl Pipeline<'_> {
         }
 
         let t = Instant::now();
+        let scene = match self.variant {
+            Some(v) => {
+                let scene = crate::image_stats::ImageStats::compute(&img).scene();
+                crate::model::enhance::apply(&mut img, v.modes().for_scene(scene));
+                scene
+            }
+            None => crate::image_stats::Scene::Day,
+        };
         let (chw, ctx) = self.pre.run(&img.rgb, img.width, img.height)?;
         let extra = self.family.extra_inputs(&ctx);
         let preprocess = ms(t.elapsed());
@@ -485,12 +501,19 @@ impl Pipeline<'_> {
         let outputs = self.backend.infer(chw, &extra)?;
         let infer = ms(t.elapsed());
 
+        let rules = self.variant.and_then(|v| v.filters.as_ref());
+        let filtered = |dets: Vec<crate::model::Detection>| match rules {
+            Some(r) => {
+                crate::model::filters::apply(dets, self.classes, ctx.orig_w, ctx.orig_h, scene, r).0
+            }
+            None => dets,
+        };
         let t = Instant::now();
-        let dets = self.family.postprocess(&outputs, &ctx, &self.params)?;
+        let dets = filtered(self.family.postprocess(&outputs, &ctx, &self.params)?);
         let preds = crate::model::to_predictions(&dets, &ctx, self.classes, self.filter);
         let postprocess = ms(t.elapsed());
         let eval = if eval {
-            let dets = self.family.postprocess(&outputs, &ctx, &self.eval_params)?;
+            let dets = filtered(self.family.postprocess(&outputs, &ctx, &self.eval_params)?);
             crate::model::to_predictions(&dets, &ctx, self.classes, None)
         } else {
             Vec::new()

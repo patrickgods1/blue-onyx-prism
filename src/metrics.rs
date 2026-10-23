@@ -177,6 +177,38 @@ impl DropReason {
     }
 }
 
+/// Why a night / IR frame was not routed to the model's `night_model` and ran on the model
+/// itself (`night_model_fallback_total{reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteFallback {
+    /// The night model is not served (unknown name, disabled, removed, or the model itself).
+    Unknown,
+    /// It is still compiling, lazy and not loaded yet, or failed.
+    NotReady,
+    /// Its queue is full.
+    QueueFull,
+    /// Its worker stopped (a reload replaced it between lookup and send).
+    Stopped,
+}
+
+impl RouteFallback {
+    pub const ALL: [RouteFallback; 4] = [
+        RouteFallback::Unknown,
+        RouteFallback::NotReady,
+        RouteFallback::QueueFull,
+        RouteFallback::Stopped,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteFallback::Unknown => "unknown",
+            RouteFallback::NotReady => "not_ready",
+            RouteFallback::QueueFull => "queue_full",
+            RouteFallback::Stopped => "stopped",
+        }
+    }
+}
+
 /// Per-model counters plus the device/provider strings, which start as the configured device
 /// and an empty provider and are updated by the worker once the model has been compiled.
 #[derive(Debug)]
@@ -193,6 +225,12 @@ pub struct ModelMetrics {
     /// Detections removed by the night / IR rules and the static-box memory, per
     /// [`SuppressReason`] (`detections_suppressed_total{reason}`).
     suppressed: [AtomicU64; SuppressReason::ALL.len()],
+    /// Night / IR frames forwarded to this model's `night_model` (`night_model_routed_total`).
+    night_routed: AtomicU64,
+    /// Night / IR frames that ran here instead, per [`RouteFallback`].
+    night_fallback: [AtomicU64; RouteFallback::ALL.len()],
+    /// Throttle of the "night model unavailable" warning.
+    pub night_fallback_log: LogThrottle,
     pub inference_ms: Histogram,
     pub process_ms: Histogram,
     pub round_trip_ms: Histogram,
@@ -220,6 +258,9 @@ impl ModelMetrics {
             dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             decode_errors: AtomicU64::new(0),
             suppressed: std::array::from_fn(|_| AtomicU64::new(0)),
+            night_routed: AtomicU64::new(0),
+            night_fallback: std::array::from_fn(|_| AtomicU64::new(0)),
+            night_fallback_log: LogThrottle::default(),
             inference_ms: Histogram::new(),
             process_ms: Histogram::new(),
             round_trip_ms: Histogram::new(),
@@ -264,6 +305,30 @@ impl ModelMetrics {
     /// Detections removed for `reason` so far.
     pub fn suppressed(&self, reason: SuppressReason) -> u64 {
         self.suppressed
+            .get(reason as usize)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+
+    /// Count one night / IR frame forwarded to the night model.
+    pub fn record_night_routed(&self) {
+        self.night_routed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Night / IR frames forwarded to the night model so far.
+    pub fn night_routed(&self) -> u64 {
+        self.night_routed.load(Ordering::Relaxed)
+    }
+
+    /// Count one night / IR frame that ran on this model instead of its night model.
+    pub fn record_night_fallback(&self, reason: RouteFallback) {
+        if let Some(c) = self.night_fallback.get(reason as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Night-model fallbacks for `reason` so far.
+    pub fn night_fallback(&self, reason: RouteFallback) -> u64 {
+        self.night_fallback
             .get(reason as usize)
             .map_or(0, |c| c.load(Ordering::Relaxed))
     }
@@ -716,6 +781,36 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         }
     }
 
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}night_model_routed_total Night / IR frames forwarded to the model's night_model."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}night_model_routed_total counter");
+    for mm in &models {
+        let _ = writeln!(
+            out,
+            "{PREFIX}night_model_routed_total{{model=\"{}\"}} {}",
+            escape_label(&mm.name),
+            mm.night_routed()
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP {PREFIX}night_model_fallback_total Night / IR frames that ran on the model itself because its night_model was unavailable, by reason (unknown|not_ready|queue_full|stopped)."
+    );
+    let _ = writeln!(out, "# TYPE {PREFIX}night_model_fallback_total counter");
+    for mm in &models {
+        for reason in RouteFallback::ALL {
+            let _ = writeln!(
+                out,
+                "{PREFIX}night_model_fallback_total{{model=\"{}\",reason=\"{}\"}} {}",
+                escape_label(&mm.name),
+                reason.as_str(),
+                mm.night_fallback(reason)
+            );
+        }
+    }
+
     type Getter = fn(&ModelMetrics) -> &Histogram;
     let stats: [(&str, &str, Getter); 3] = [
         ("inference_ms", "Model inference time in ms", |mm| {
@@ -876,6 +971,27 @@ mod tests {
         ));
         assert!(text.contains(
             "blue_onyx_prism_detections_suppressed_total{model=\"a\",reason=\"aspect\"} 0"
+        ));
+    }
+
+    #[test]
+    fn prometheus_night_model_routing() {
+        let m = Metrics::new("0");
+        let mm = m.model("a");
+        mm.record_night_routed();
+        mm.record_night_routed();
+        mm.record_night_fallback(RouteFallback::NotReady);
+        assert_eq!(mm.night_routed(), 2);
+        assert_eq!(mm.night_fallback(RouteFallback::NotReady), 1);
+        assert_eq!(mm.night_fallback(RouteFallback::QueueFull), 0);
+        let text = render_prometheus(&m, &[]);
+        assert!(text.contains("# TYPE blue_onyx_prism_night_model_routed_total counter"));
+        assert!(text.contains("blue_onyx_prism_night_model_routed_total{model=\"a\"} 2"));
+        assert!(text.contains(
+            "blue_onyx_prism_night_model_fallback_total{model=\"a\",reason=\"not_ready\"} 1"
+        ));
+        assert!(text.contains(
+            "blue_onyx_prism_night_model_fallback_total{model=\"a\",reason=\"unknown\"} 0"
         ));
     }
 

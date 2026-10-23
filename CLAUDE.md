@@ -108,6 +108,11 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `static_memory.rs` (per-camera static-box suppression, key from the upload file name). Bench sets `exdark-ir`
   (grayscale transform of exdark-night, `images_from`) and `nir-night` (LILA camera traps, night IR, no persons: person
   scores only as FP; wildlife GT a model cannot emit becomes an animal ignore region) are opt-in (`DEFAULT_SET_IDS`).
+  `model/enhance.rs` (`preprocess`/`night_preprocess`: none|grayscale|gamma|clahe, in `prep.rs`; the kept frame is
+  always the original). `night_model` routes night/IR frames, decoded, to another model's worker
+  (`WorkItem::DetectDecoded`, `worker::Peers` of weak handles published by the registry; never re-forwarded; falls back
+  to the model itself). `benchmark --variants` (`benchmark/variant.rs`) runs stats -> enhance -> filters like the
+  service. Results and defaults: `docs/NIGHT_IR.md`.
 - `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
   baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;
   a write failure only warns). `ModelResult.run_id` = the run's start time. Pure `comparable`/`compare` (speed counts at

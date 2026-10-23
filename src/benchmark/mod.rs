@@ -38,6 +38,7 @@ pub mod roc;
 pub mod search;
 pub mod service;
 pub mod threshold;
+pub mod variant;
 
 mod run;
 mod scoring;
@@ -53,6 +54,7 @@ pub(crate) use scoring::{
     REFERENCE_DEVICES, no_pseudo_gt_device, pseudo_ground_truth, pseudo_gt_device,
 };
 pub use sweep::{SweepOptions, sweep};
+pub use variant::PipelineVariant;
 
 use crate::api::Prediction;
 use crate::backend::spec::{self, Device, Runtime, Target};
@@ -570,6 +572,9 @@ pub struct Job {
     pub confidence_threshold: Option<f32>,
     /// Per-model label filter (else the bench's).
     pub object_filter: Option<Vec<String>>,
+    /// Enhancement and filter rules on top of the plain pipeline ([`variant`]); `name` is then
+    /// `<model>+<variant>`.
+    pub variant: Option<PipelineVariant>,
 }
 
 /// Models to benchmark from a config: every enabled entry, in order.
@@ -613,6 +618,7 @@ pub(crate) fn job_for_file(
         gpu_precision: None,
         confidence_threshold: None,
         object_filter: None,
+        variant: None,
     })
 }
 
@@ -642,6 +648,7 @@ pub(crate) fn job_for_config(
         confidence_threshold: m.confidence_threshold,
         object_filter: m.object_filter.clone(),
         path,
+        variant: None,
     })
 }
 

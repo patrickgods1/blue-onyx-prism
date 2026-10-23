@@ -314,6 +314,48 @@ mod tests {
         );
     }
 
+    /// The Models card's Night model select: set, rejected when it would chain, cleared; the
+    /// page lists the other model as an option.
+    #[tokio::test]
+    async fn models_card_sets_the_night_model() {
+        let state = test_state();
+        let evil = urlencode("<b>evil</b>");
+        let form =
+            format!("enabled=ipcam-general&enabled={evil}&night.ipcam-general={evil}&action=save");
+        let (s, _, b) = call(&state, post_json("/config/models", &form)).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(
+            state.config_read().models[0].night_model.as_deref(),
+            Some("<b>evil</b>")
+        );
+        // Live: no reload, nothing pending.
+        let last = state.config.changes(1).pop().unwrap();
+        assert!(last.summary.contains("night model"), "{}", last.summary);
+        let (_, page) = get_text(&state, "/config").await;
+        assert!(page.contains("name=\"night.ipcam-general\""), "{page}");
+        assert!(
+            page.contains("<option value=\"&#60;b&#62;evil&#60;/b&#62;\" selected>"),
+            "{page}"
+        );
+        // A chain is rejected and keeps the config.
+        let before = state.config_read().clone();
+        let form =
+            format!("enabled=ipcam-general&enabled={evil}&night.{evil}=ipcam-general&action=save");
+        let (s, _, b) = call(&state, post_json("/config/models", &form)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(
+            j["message"].as_str().unwrap().contains("do not chain"),
+            "{j}"
+        );
+        assert_eq!(*state.config_read(), before);
+        // "" clears it.
+        let form = format!("enabled=ipcam-general&enabled={evil}&night.ipcam-general=&action=save");
+        let (s, _, _) = call(&state, post_json("/config/models", &form)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(state.config_read().models[0].night_model, None);
+    }
+
     /// SV-14: the Models card rejects a per-model threshold outside 0..=1 (the browser's
     /// `max="1"` is not enforced by curl or a hand-typed value) and keeps the config.
     #[tokio::test]

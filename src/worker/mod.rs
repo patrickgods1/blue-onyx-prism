@@ -69,8 +69,98 @@ pub enum WorkItem {
         Instant,
         String,
     ),
+    /// A request whose image another worker already decoded (see [`Decoded`]): it skips
+    /// decode and is never forwarded again.
+    DetectDecoded(Box<Decoded>),
     /// Compile a lazy model now (sent once by [`WorkerHandle::trigger_load`]).
     Load,
+}
+
+/// Where a worker sends the answer of a request.
+#[derive(Debug)]
+pub enum Reply {
+    /// Straight to the HTTP handler waiting for it.
+    Client(tokio::sync::oneshot::Sender<VisionDetectionResponse>),
+    /// To another worker thread (e.g. a cascade that merges a verifier's answer into its own):
+    /// a crossbeam channel it can `Select` on.
+    Worker(Sender<VisionDetectionResponse>),
+}
+
+impl Reply {
+    /// Send `resp`; false when the receiver is gone (the client went away).
+    pub fn send(self, resp: VisionDetectionResponse) -> bool {
+        match self {
+            Reply::Client(tx) => tx.send(resp).is_ok(),
+            Reply::Worker(tx) => tx.try_send(resp).is_ok(),
+        }
+    }
+}
+
+impl From<tokio::sync::oneshot::Sender<VisionDetectionResponse>> for Reply {
+    fn from(tx: tokio::sync::oneshot::Sender<VisionDetectionResponse>) -> Self {
+        Reply::Client(tx)
+    }
+}
+
+/// A request handed from one worker to another with its image already decoded: the night
+/// model switch (an IR / dark frame goes to the model's `night_model`) and, later, crops sent
+/// to a verifier model. The receiving worker preprocesses `img` for its own model, runs it with
+/// its own live settings (threshold, filters, object filter) and the scene of `stats`, and
+/// answers `reply` in its own request order. Never forwarded again.
+#[derive(Debug)]
+pub struct Decoded {
+    pub img: crate::image::RgbImage,
+    /// Scene statistics of `img` (computed by the sender at decode).
+    pub stats: crate::image_stats::ImageStats,
+    pub image_name: String,
+    pub min_confidence: f32,
+    /// The request id of the original request (same id in both workers' log lines).
+    pub request_id: String,
+    /// When the original request arrived (round-trip and queue times count from here).
+    pub enqueued: Instant,
+    /// The original request's timeout budget: the receiver drops it after
+    /// `min(deadline, enqueued + its own request timeout)`.
+    pub deadline: Instant,
+    /// Time the sender already spent decoding (part of `processMs`).
+    pub decode: Duration,
+    pub reply: Reply,
+    /// Name of the forwarding model (for the log).
+    pub from: String,
+}
+
+/// The served workers of a registry generation by normalized name, for workers that forward
+/// requests to other workers ([`Decoded`]). Holds weak references: a retired or reloaded worker
+/// drops out as soon as the registry lets go of it, and a lookup never keeps one alive. The
+/// registry republishes it whenever its set of workers changes.
+#[derive(Debug, Clone, Default)]
+pub struct Peers(Arc<RwLock<std::collections::HashMap<String, std::sync::Weak<WorkerHandle>>>>);
+
+impl Peers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The served worker named `name` (case-insensitive, `.onnx` / `.xml` ignored).
+    pub fn get(&self, name: &str) -> Option<Arc<WorkerHandle>> {
+        self.0
+            .read_recover()
+            .get(&crate::registry::normalize_name(name))
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Replace the directory with `handles`.
+    pub fn publish<'a>(&self, handles: impl IntoIterator<Item = &'a Arc<WorkerHandle>>) {
+        let map = handles
+            .into_iter()
+            .map(|h| (crate::registry::normalize_name(&h.name), Arc::downgrade(h)))
+            .collect();
+        *self.0.write_recover() = map;
+    }
+
+    /// Empty the directory (registry shutdown).
+    pub fn clear(&self) {
+        self.0.write_recover().clear();
+    }
 }
 
 /// A short request id for the per-request log line (8 hex digits, random).
@@ -115,6 +205,8 @@ pub struct WorkerConfig {
     pub concurrency: Option<Concurrency>,
     /// The generation's decode + preprocess pool (None: the worker starts a one-thread pool).
     pub prep: Option<Arc<PrepPool>>,
+    /// The generation's other workers, for the night model switch (empty: never forwards).
+    pub peers: Peers,
 }
 
 /// The per-model settings a config change applies without reloading the model (per-model
@@ -135,6 +227,10 @@ pub struct LiveSettings {
     pub filters: crate::model::filters::FilterRules,
     /// Static-box memory settings (the memory itself lives in the worker).
     pub static_suppression: crate::static_memory::StaticSuppression,
+    /// Image enhancement modes, passed to the prep pool with each request.
+    pub preprocess: crate::model::enhance::PreprocessModes,
+    /// Served model that night / IR frames are forwarded to (`night_model`); None = run here.
+    pub night_model: Option<String>,
 }
 
 impl LiveSettings {
@@ -158,6 +254,13 @@ impl LiveSettings {
                 .static_suppression
                 .clone()
                 .unwrap_or_else(|| config.static_suppression.clone()),
+            preprocess: config.preprocess_modes(m),
+            night_model: m
+                .night_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string),
         }
     }
 
@@ -619,6 +722,7 @@ pub fn spawn_worker_after(
         consecutive_errors: std::cell::Cell::new(0),
         consecutive_degenerate: std::cell::Cell::new(0),
         static_memory: std::cell::RefCell::new(crate::static_memory::StaticMemory::new()),
+        decoded_pre: std::cell::RefCell::new(None),
     };
     let name = cfg.name.clone();
     let join = std::thread::Builder::new()

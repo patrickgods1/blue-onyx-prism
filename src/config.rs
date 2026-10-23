@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::model::ModelFamilyKind;
+use crate::model::enhance::{Preprocess, PreprocessModes};
 use crate::model::filters::OverlapRule;
 use crate::static_memory::StaticSuppression;
 
@@ -375,6 +376,20 @@ pub struct ModelConfig {
     pub suppress_overlaps: Option<Vec<OverlapRule>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_suppression: Option<StaticSuppression>,
+    /// Image enhancement before the model's resize ([`crate::model::enhance`]); None = the
+    /// global `preprocess`. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preprocess: Option<Preprocess>,
+    /// Enhancement on night / IR frames, replacing `preprocess` there; None = the global
+    /// `night_preprocess`. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub night_preprocess: Option<Preprocess>,
+    /// Another configured model that answers this model's night / IR frames (scene `night` or
+    /// `ir`, see [`crate::image_stats`]): the decoded frame is forwarded to its worker and its
+    /// result returned. It must not have a `night_model` itself. Falls back to this model when
+    /// the night model is not served or not ready. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub night_model: Option<String>,
 }
 
 impl Default for ModelConfig {
@@ -398,6 +413,20 @@ impl Default for ModelConfig {
             min_box_area_frac: None,
             suppress_overlaps: None,
             static_suppression: None,
+            preprocess: None,
+            night_preprocess: None,
+            night_model: None,
+        }
+    }
+}
+
+impl Config {
+    /// The enhancement modes of model `m`: its own `preprocess` / `night_preprocess` over the
+    /// global ones (each field separately; an unset night mode means `preprocess`).
+    pub fn preprocess_modes(&self, m: &ModelConfig) -> PreprocessModes {
+        PreprocessModes {
+            preprocess: m.preprocess.or(self.preprocess).unwrap_or_default(),
+            night_preprocess: m.night_preprocess.or(self.night_preprocess),
         }
     }
 }
@@ -490,6 +519,14 @@ pub struct Config {
     /// default. Applies at once.
     #[serde(skip_serializing_if = "StaticSuppression::is_default")]
     pub static_suppression: StaticSuppression,
+    /// Image enhancement before the model's resize: `none`, `grayscale`, `gamma:<g>`,
+    /// `clahe[:<clip>[,<tiles>]]` ([`crate::model::enhance`]). None = off. Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preprocess: Option<Preprocess>,
+    /// Enhancement on night / IR frames, replacing `preprocess` there. None = `preprocess`.
+    /// Applies at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub night_preprocess: Option<Preprocess>,
     pub log_level: LogLevel,
     /// Directory of the daily rolling log files (None = stdout only). Relative paths resolve
     /// against the exe dir. Process restart.
@@ -671,6 +708,8 @@ impl Default for Config {
             min_box_area_frac: None,
             suppress_overlaps: Vec::new(),
             static_suppression: StaticSuppression::default(),
+            preprocess: None,
+            night_preprocess: None,
             log_level: LogLevel::Info,
             log_path: None,
             log_format: LogFormat::Text,
@@ -1072,6 +1111,49 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
                 static_suppression: m.static_suppression.as_ref(),
             },
         )?;
+    }
+    validate_night_models(models)
+}
+
+/// `night_model` of every entry names another entry (any, enabled or not: a disabled night
+/// model only makes the switch fall back) that has no `night_model` itself (one hop: no chains
+/// or cycles).
+pub fn validate_night_models(models: &[ModelConfig]) -> Result<()> {
+    use crate::registry::normalize_name;
+    use anyhow::bail;
+    let night_of = |key: &str| {
+        models
+            .iter()
+            .find(|m| normalize_name(&m.effective_name()) == key)
+    };
+    for m in models {
+        let Some(night) = m.night_model.as_deref() else {
+            continue;
+        };
+        let key = normalize_name(&m.effective_name());
+        let field = format!("models: '{key}' night_model");
+        if night.trim().is_empty() {
+            bail!("{field}: is empty; name another model or remove the key");
+        }
+        let nkey = normalize_name(night);
+        if nkey == key {
+            bail!(
+                "{field}: names the model itself; name another configured model (e.g. one \
+                 trained on IR frames) or remove the key"
+            );
+        }
+        let Some(target) = night_of(&nkey) else {
+            bail!(
+                "{field}: '{night}' is not a configured model; add it to `models` first, or fix \
+                 the name (see the Models card)"
+            );
+        };
+        if target.night_model.is_some() {
+            bail!(
+                "{field}: '{night}' has a night_model of its own; night models do not chain, so \
+                 remove night_model from '{night}' or point '{key}' at a model without one"
+            );
+        }
     }
     Ok(())
 }
@@ -2010,6 +2092,53 @@ mod tests {
     }
 
     #[test]
+    fn validate_night_model_references() {
+        let entry = |name: &str, night: Option<&str>| ModelConfig {
+            name: Some(name.into()),
+            path: format!("{name}.onnx").into(),
+            night_model: night.map(str::to_string),
+            ..Default::default()
+        };
+        let err = |models: &[ModelConfig]| format!("{:#}", validate_models(models).unwrap_err());
+        // A plain reference (case-insensitive, `.onnx` ignored); a disabled target is fine.
+        let mut ok = vec![entry("day", Some("Night.onnx")), entry("night", None)];
+        validate_models(&ok).unwrap();
+        ok[1].enabled = false;
+        validate_models(&ok).unwrap();
+        // Two models may share one night model.
+        validate_models(&[
+            entry("a", Some("night")),
+            entry("b", Some("night")),
+            entry("night", None),
+        ])
+        .unwrap();
+        let e = err(&[entry("day", Some("nope")), entry("night", None)]);
+        assert!(e.contains("'nope' is not a configured model"), "{e}");
+        let e = err(&[entry("day", Some("DAY"))]);
+        assert!(e.contains("names the model itself"), "{e}");
+        let e = err(&[entry("day", Some("  "))]);
+        assert!(e.contains("night_model: is empty"), "{e}");
+        // Chains and cycles.
+        let e = err(&[
+            entry("a", Some("b")),
+            entry("b", Some("c")),
+            entry("c", None),
+        ]);
+        assert!(
+            e.contains("'a' night_model: 'b' has a night_model of its own"),
+            "{e}"
+        );
+        let e = err(&[entry("a", Some("b")), entry("b", Some("a"))]);
+        assert!(e.contains("do not chain"), "{e}");
+        // Round trip: written only when set.
+        let text = serde_json::to_string(&entry("day", None)).unwrap();
+        assert!(!text.contains("night_model"), "{text}");
+        let back: ModelConfig =
+            serde_json::from_str(&serde_json::to_string(&ok[0]).unwrap()).unwrap();
+        assert_eq!(back.night_model.as_deref(), Some("Night.onnx"));
+    }
+
+    #[test]
     fn validate_thresholds_global_and_per_model() {
         rejects(
             |c| c.confidence_threshold = 5.0,
@@ -2445,6 +2574,7 @@ mod tests {
         // `Some` for the fields serialized only when set.
         let model = ModelConfig {
             inflight: Some(1),
+            night_model: Some("night".into()),
             ..night_rules_model()
         };
         let model_keys = keys(serde_json::to_value(model).unwrap());
@@ -2479,6 +2609,8 @@ mod tests {
                 enabled: true,
                 ..Default::default()
             },
+            preprocess: Some(Preprocess::Gamma(0.8)),
+            night_preprocess: Some(Preprocess::CLAHE),
             models: vec![night_rules_model()],
             ..Config::default()
         }
@@ -2495,6 +2627,11 @@ mod tests {
             min_box_area_frac: Some(0.0005),
             suppress_overlaps: Some(Vec::new()),
             static_suppression: Some(StaticSuppression::default()),
+            preprocess: Some(Preprocess::None),
+            night_preprocess: Some(Preprocess::Clahe {
+                clip: 3.0,
+                tiles: 4,
+            }),
             ..Default::default()
         }
     }
@@ -2516,6 +2653,8 @@ mod tests {
             "min_box_area_frac",
             "suppress_overlaps",
             "static_suppression",
+            "\"preprocess\"",
+            "night_preprocess",
         ] {
             assert!(!text.contains(key), "{key} written by default: {text}");
         }
@@ -2541,6 +2680,9 @@ mod tests {
             r#""night_label_thresholds":{"person":0.65}"#,
             r#""iou":0.45"#,
             r#""iou":0.85"#,
+            r#""preprocess":"gamma:0.8""#,
+            r#""night_preprocess":"clahe""#,
+            r#""night_preprocess":"clahe:3,4""#,
         ] {
             assert!(v.contains(want), "{want} not in {v}");
         }
@@ -2548,6 +2690,33 @@ mod tests {
         let c: Config = serde_json::from_str(r#"{"static_suppression":{"enabled":true}}"#).unwrap();
         assert!(c.static_suppression.enabled);
         assert_eq!(c.static_suppression.hits, 5);
+    }
+
+    #[test]
+    fn preprocess_modes_resolve_per_field() {
+        let mut c = Config::default();
+        let mut m = ModelConfig::default();
+        assert!(c.preprocess_modes(&m).is_noop());
+        c.preprocess = Some(Preprocess::Grayscale);
+        c.night_preprocess = Some(Preprocess::CLAHE);
+        let g = c.preprocess_modes(&m);
+        assert_eq!(g.preprocess, Preprocess::Grayscale);
+        assert_eq!(g.night_preprocess, Some(Preprocess::CLAHE));
+        // The model's own value wins per field; `none` turns a global mode off.
+        m.preprocess = Some(Preprocess::None);
+        let own = c.preprocess_modes(&m);
+        assert_eq!(own.preprocess, Preprocess::None);
+        assert_eq!(own.night_preprocess, Some(Preprocess::CLAHE));
+        m.night_preprocess = Some(Preprocess::Gamma(0.6));
+        assert_eq!(
+            c.preprocess_modes(&m).night_preprocess,
+            Some(Preprocess::Gamma(0.6))
+        );
+        // A bad mode is a parse error that lists the accepted forms.
+        let e = serde_json::from_str::<Config>(r#"{"preprocess":"sharpen"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not a mode") && e.contains("clahe"), "{e}");
     }
 
     #[test]

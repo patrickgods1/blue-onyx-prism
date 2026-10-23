@@ -1254,7 +1254,7 @@ def build_nir_night(work: Path, coco80: list[str], args) -> dict:
     budget = args.max_mb * 1e6
     try:
         classes = list(NIR_QUOTA) + (["person"] if args.nacti_persons else [])
-        quota = dict(NIR_QUOTA, **({"person": 30} if args.nacti_persons else {}))
+        quota = dict(NIR_QUOTA, **({"person": 50} if args.nacti_persons else {}))
         # Rarest class first, so images with several classes count toward all of them.
         for cls in sorted(classes, key=lambda k: sum(1 for c in pos if any(o["label"] == k and not o["ignore"] for o in c["objects"]))):
             have = sum(1 for c in picked if any(o["label"] == cls and not o["ignore"] for o in c["objects"]))

@@ -6,8 +6,14 @@
 //! inferring while the pool prepares the next frames. Each pool thread keeps one
 //! [`Preprocessor`] per distinct model geometry ([`PrepSpec`]), and the CHW tensors come from a
 //! [`TensorPool`] so steady state does not allocate 4.9 MB per request.
+//!
+//! Between decode and letterbox the pool applies the request's optional enhancement
+//! ([`crate::model::enhance`], chosen per request from the frame's scene); the scene statistics
+//! are always taken from the original frame.
 
 use crate::image::RgbImage;
+use crate::image_stats::ImageStats;
+use crate::model::enhance::{self, PreprocessModes};
 use crate::model::preprocess::Preprocessor;
 use crate::model::{Family, Normalization, PreprocessCtx, ResizeMode};
 use crate::sync::LockExt;
@@ -178,11 +184,13 @@ pub struct Prepared {
     /// CHW `f32` input tensor, `3 * input_w * input_h` values.
     pub chw: PooledBuf,
     pub ctx: PreprocessCtx,
-    /// The decoded image, kept only when the job asked for it (`save_image_path`).
+    /// The decoded image as received (before any enhancement), kept only when the job asked
+    /// for it (`save_image_path`, forwarding to another model).
     pub img: Option<RgbImage>,
     /// Scene statistics of the decoded image (a strided sample, see [`crate::image_stats`]).
     pub stats: crate::image_stats::ImageStats,
     pub decode: Duration,
+    /// Enhancement (when any) plus letterbox / stretch into the tensor.
     pub preprocess: Duration,
 }
 
@@ -193,6 +201,10 @@ pub struct PrepJob {
     pub spec: PrepSpec,
     /// Keep the decoded image in [`Prepared::img`].
     pub keep_image: bool,
+    /// Enhancement modes of this request (from the model's live settings when the request was
+    /// accepted; per request, so a config change applies to the next request). The pool picks
+    /// `night_preprocess` or `preprocess` from the decoded frame's scene.
+    pub preprocess: PreprocessModes,
     pub reply: Sender<Result<Prepared>>,
 }
 
@@ -258,28 +270,60 @@ impl PrepPool {
             .map_err(|_| anyhow::anyhow!("preprocess pool stopped"))
     }
 
-    /// Decode + preprocess `image` on the calling thread (what a pool thread does).
+    /// Decode + preprocess `image` on the calling thread (what a pool thread does): scene
+    /// statistics of the decoded frame, then [`PrepPool::prepare_image`].
     pub fn prepare_now(
         pre: &mut Preprocessor,
         tensors: &Arc<TensorPool>,
         image: &[u8],
         spec: &PrepSpec,
         keep_image: bool,
+        modes: PreprocessModes,
     ) -> Result<Prepared> {
         let t = Instant::now();
         let img = crate::image::decode(image)?;
-        let stats = crate::image_stats::ImageStats::compute(&img);
+        let stats = ImageStats::compute(&img);
         let decode = t.elapsed();
+        let mut p = Self::prepare_image(pre, tensors, img, stats, spec, keep_image, modes)?;
+        p.decode = decode;
+        Ok(p)
+    }
+
+    /// Preprocess an already decoded `img` whose statistics are `stats`: the enhancement of
+    /// `modes` for `stats.scene()` (on a copy when the original is kept), then the letterbox /
+    /// stretch into a pooled tensor. [`Prepared::decode`] is zero.
+    pub fn prepare_image(
+        pre: &mut Preprocessor,
+        tensors: &Arc<TensorPool>,
+        img: RgbImage,
+        stats: ImageStats,
+        spec: &PrepSpec,
+        keep_image: bool,
+        modes: PreprocessModes,
+    ) -> Result<Prepared> {
         let t = Instant::now();
+        let mode = modes.for_scene(stats.scene());
+        let mut img = img;
+        let mut enhanced = None;
+        if !mode.is_none() {
+            if keep_image {
+                let mut e = img.clone();
+                enhance::apply(&mut e, mode);
+                enhanced = Some(e);
+            } else {
+                enhance::apply(&mut img, mode);
+            }
+        }
+        let input = enhanced.as_ref().unwrap_or(&img);
         let mut chw = tensors.take(spec.tensor_len());
-        let ctx = pre.run_into(&img.rgb, img.width, img.height, chw.vec_mut())?;
+        let ctx = pre.run_into(&input.rgb, input.width, input.height, chw.vec_mut())?;
         let preprocess = t.elapsed();
         Ok(Prepared {
             chw,
             ctx,
             img: keep_image.then_some(img),
             stats,
-            decode,
+            decode: Duration::ZERO,
             preprocess,
         })
     }
@@ -304,11 +348,12 @@ fn pool_thread(rx: Receiver<PrepJob>, tensors: Arc<TensorPool>) {
             image,
             spec,
             keep_image,
+            preprocess,
             reply,
         } = job;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let pre = pres.entry(spec).or_insert_with(|| spec.preprocessor());
-            PrepPool::prepare_now(pre, &tensors, &image, &spec, keep_image)
+            PrepPool::prepare_now(pre, &tensors, &image, &spec, keep_image, preprocess)
         }));
         let result = match result {
             Ok(r) => r,
@@ -343,6 +388,7 @@ mod tests {
                 image: image.into(),
                 spec,
                 keep_image: keep,
+                preprocess: PreprocessModes::default(),
                 reply: tx,
             },
             rx,
@@ -369,6 +415,64 @@ mod tests {
         let (j, rx) = job(bytes, spec, false);
         pool.submit(j).unwrap();
         assert!(rx.recv().unwrap().unwrap().img.is_none());
+    }
+
+    #[test]
+    fn enhancement_follows_the_scene_and_keeps_the_original() {
+        use crate::model::enhance::Preprocess;
+        let spec = PrepSpec::new(32, 32, ResizeMode::Stretch, None);
+        let tensors = TensorPool::new();
+        let mut pre = spec.preprocessor();
+        // A monochrome (IR) frame and a colour (day) frame, both mid-bright.
+        let ir = RgbImage {
+            width: 32,
+            height: 32,
+            rgb: (0..32 * 32)
+                .flat_map(|i| [(i % 200) as u8 + 30; 3])
+                .collect(),
+        };
+        // Hues that do not follow brightness (a constant offset or gain would be tinted IR).
+        let mut day = ir.clone();
+        for (i, p) in day.rgb.chunks_mut(3).enumerate() {
+            p[1] = ((i * 7) % 200) as u8 + 30;
+            p[2] = ((i * 13) % 200) as u8 + 30;
+        }
+        let night_gamma = PreprocessModes {
+            preprocess: Preprocess::None,
+            night_preprocess: Some(Preprocess::Gamma(0.5)),
+        };
+        let tensor = |img: &RgbImage, mode: Preprocess, pre: &mut Preprocessor| {
+            let mut e = img.clone();
+            crate::model::enhance::apply(&mut e, mode);
+            pre.run(&e.rgb, e.width, e.height).unwrap().0.to_vec()
+        };
+        for (img, want_mode) in [(&ir, Preprocess::Gamma(0.5)), (&day, Preprocess::None)] {
+            let stats = ImageStats::compute(img);
+            for keep in [false, true] {
+                let p = PrepPool::prepare_image(
+                    &mut pre,
+                    &tensors,
+                    img.clone(),
+                    stats,
+                    &spec,
+                    keep,
+                    night_gamma,
+                )
+                .unwrap();
+                assert_eq!(&*p.chw, tensor(img, want_mode, &mut pre), "{want_mode}");
+                assert_eq!(p.stats, stats);
+                // The kept image is the frame as received.
+                assert_eq!(p.img.as_ref(), keep.then_some(img));
+            }
+        }
+        assert_eq!(
+            ImageStats::compute(&ir).scene(),
+            crate::image_stats::Scene::Ir
+        );
+        assert_eq!(
+            ImageStats::compute(&day).scene(),
+            crate::image_stats::Scene::Day
+        );
     }
 
     #[test]

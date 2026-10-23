@@ -179,6 +179,8 @@ struct ModelSelectRow {
     devices: Vec<DeviceChoice>,
     /// Per-model threshold as typed in the input ("" = global).
     threshold: String,
+    /// Night model select: "none" first, then the other models it may name.
+    night_models: Vec<DeviceChoice>,
     /// What the running worker uses ("OpenVINO CPU · threshold 0.50", "not loaded", ...).
     running: String,
     running_class: &'static str,
@@ -235,6 +237,52 @@ pub(super) fn global_device_label(c: &Config, snap: &DevicesSnapshot) -> String 
         Ok(d) => d.with_default_index(c.gpu_index).to_string(),
         Err(_) => c.device.trim().to_string(),
     }
+}
+
+/// Options of the Night model select of `models[me]`: "none", then every other model that has
+/// no night model of its own (night models do not chain; a disabled one is marked: the switch
+/// falls back to the model itself while it is off). A model this one already names is always
+/// listed (as "missing" when it is not configured).
+fn night_model_choices(models: &[crate::config::ModelConfig], me: usize) -> Vec<DeviceChoice> {
+    use crate::registry::normalize_name;
+    let Some(m) = models.get(me) else {
+        return Vec::new();
+    };
+    let current = m.night_model.as_deref().map(normalize_name);
+    let mut v = vec![DeviceChoice {
+        value: String::new(),
+        label: "none".to_string(),
+        selected: current.is_none(),
+        disabled: false,
+    }];
+    let mut found = false;
+    for (i, o) in models.iter().enumerate() {
+        let name = o.effective_name();
+        let selected = current.as_deref() == Some(normalize_name(&name).as_str());
+        if i == me || (o.night_model.is_some() && !selected) {
+            continue;
+        }
+        found |= selected;
+        v.push(DeviceChoice {
+            label: if o.enabled {
+                name.clone()
+            } else {
+                format!("{name} (disabled)")
+            },
+            value: name,
+            selected,
+            disabled: false,
+        });
+    }
+    if let (Some(n), false) = (m.night_model.as_deref(), found) {
+        v.push(DeviceChoice {
+            value: n.to_string(),
+            label: format!("{n} (missing)"),
+            selected: true,
+            disabled: false,
+        });
+    }
+    v
 }
 
 /// Options of a model's Device select. `current` None = follows the global device.
@@ -320,6 +368,7 @@ fn model_choices(
                 .map(|r| r.id.to_string());
             ModelSelectRow {
                 devices: model_device_choices(snap, m.device.as_deref(), &global),
+                night_models: night_model_choices(&c.models, i),
                 key,
                 family: m.family.to_string(),
                 path: m.path.display().to_string(),

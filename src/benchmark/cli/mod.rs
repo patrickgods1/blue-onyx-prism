@@ -115,7 +115,33 @@ fn jobs(args: &BenchArgs, config: &Config, errors: &mut Vec<String>) -> Result<V
             p.job.confidence_threshold = Some(c);
         }
     }
-    Ok(out)
+    Ok(with_variants(out, args, config))
+}
+
+/// Every job once per `--variants` entry (in that order per model; the plain pipeline keeps
+/// the model's name, a variant is `<model>+<variant>`).
+fn with_variants(jobs: Vec<Planned>, args: &BenchArgs, config: &Config) -> Vec<Planned> {
+    let Some(list) = &args.variants else {
+        return jobs;
+    };
+    let mut out = Vec::with_capacity(jobs.len() * list.0.len());
+    for p in jobs {
+        for spec in &list.0 {
+            let mut job = p.job.clone();
+            job.variant = spec.resolve(config, p.entry.as_ref());
+            if let Some(v) = &job.variant {
+                job.name = crate::benchmark::variant::variant_name(&job.name, v);
+                if !args.json {
+                    eprintln!("variant {}: {}", job.name, v.describe());
+                }
+            }
+            out.push(Planned {
+                job,
+                entry: p.entry.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// The datasets of a run: `--image`, else `--dataset`/`--images`, else the config's.
@@ -293,6 +319,11 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     }
     let mut errors = Vec::new();
     let jobs = jobs(&args, &config, &mut errors)?;
+    let variant_names: std::collections::HashSet<String> = jobs
+        .iter()
+        .filter(|p| p.job.variant.is_some())
+        .map(|p| p.job.name.clone())
+        .collect();
     let (mut sets, warnings) = load_sets(&args, &config)?;
     let (repeat, warmup, weights) = timing_settings(&args, &config, &sets);
     let cache_dir = cache_dir_arg(&args, &config);
@@ -337,6 +368,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         objective,
         metric,
         weights,
+        variant_names: &variant_names,
     };
 
     // Pseudo ground truth for datasets without it (accuracy relative to a reference model).
@@ -513,6 +545,8 @@ struct RunCtx<'a> {
     objective: Objective,
     metric: AccuracyMetric,
     weights: crate::benchmark::grade::Weights,
+    /// Names of the variant jobs (`<model>+<variant>`): never applied to the config.
+    variant_names: &'a std::collections::HashSet<String>,
 }
 
 impl RunCtx<'_> {
@@ -704,11 +738,17 @@ impl RunCtx<'_> {
             print_frame_roc(swept);
         }
         let merged = self.save_results(results, swept, report)?;
+        // Variants are measurements only: the config gets the plain pipeline's picks.
+        let plain: Vec<ModelResult> = swept
+            .iter()
+            .filter(|m| !self.variant_names.contains(&m.model))
+            .cloned()
+            .collect();
         if args.apply {
-            report.applied = self.apply_devices(swept)?;
+            report.applied = self.apply_devices(&plain)?;
         }
         if args.apply_threshold {
-            report.applied_thresholds = apply_thresholds(swept, self.config_path, args.json)?;
+            report.applied_thresholds = apply_thresholds(&plain, self.config_path, args.json)?;
         }
         if let Some(out) = &args.report {
             self.write_report(&merged, swept, out)?;
