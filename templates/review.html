@@ -49,9 +49,24 @@
           <tr><td>n</td><td>next without saving</td></tr>
         </tbody>
       </table>
-      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected</p>
+      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection) or <em>auto: review</em> with the reason; frames a trained model disagrees with come first.</p>
     </details>
   </aside>
+</div>
+
+<div class="card">
+  <h2>Auto-label these frames</h2>
+  <p class="muted">Proposes boxes for the frames the filters above select (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2): they appear here as pending <em>auto</em> boxes marked <em>accept</em> or <em>review</em>. Runs on the <a href="/training#autolabel">Training</a> page's queue (NVIDIA GPU or Apple silicon), where the labelers, a re-label with a trained model and the progress are.</p>
+  <form id="rv-autolabel" method="post" action="/training/autolabel" class="inline-row">
+    <input type="hidden" name="frames" value="">
+    <input type="hidden" name="gdino" value="tiny">
+    <input type="hidden" name="rfdetr" value="on">
+    <input type="hidden" name="vlm" value="2b">
+    <input type="hidden" name="siglip" value="on">
+    <label>At most <input type="number" name="limit" min="1" max="20000" value="50"> frames</label>
+    <label class="check"><input type="checkbox" name="confirm_large"> Download the labelers if missing (several GB)</label>
+    <button type="submit">Auto-label</button>
+  </form>
 </div>
 
 <div class="card">

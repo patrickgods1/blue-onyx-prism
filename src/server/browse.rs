@@ -1,6 +1,7 @@
 //! `GET /v1/fs/browse`: a read-only, server-side file browser for the Config page's
-//! "Add a model by path" form. Lists folders plus model (`.onnx`/`.xml`) or classes
-//! (`.yaml`/`.yml`) files only, and only inside the roots the page offers ([`roots`]: the
+//! "Add a model by path" form and the Training page's footage import. Lists folders plus model
+//! (`.onnx`/`.xml`), classes (`.yaml`/`.yml`) or, for the import picker only (`kind=video`),
+//! video (`.mp4`/`.mkv`/`.avi`/`.mov`) files, and only inside the roots the page offers ([`roots`]: the
 //! data root, the models and download directories, the user's home and, on Windows, the
 //! drives), so the unauthenticated page discloses as little as possible (SV-10). A path is
 //! canonicalized first, so a symlink that leaves every root is refused like any other outside
@@ -29,6 +30,8 @@ pub(super) struct BrowseQuery {
 pub(super) enum Kind {
     Model,
     Classes,
+    /// The footage import's picker: videos (folders of images are picked as folders).
+    Video,
 }
 
 impl Kind {
@@ -36,6 +39,7 @@ impl Kind {
         match s.map(str::trim) {
             None | Some("") | Some("model") => Some(Kind::Model),
             Some("classes") => Some(Kind::Classes),
+            Some("video") => Some(Kind::Video),
             _ => None,
         }
     }
@@ -49,6 +53,7 @@ impl Kind {
         match self {
             Kind::Model => ext == "onnx" || ext == "xml",
             Kind::Classes => ext == "yaml" || ext == "yml",
+            Kind::Video => crate::training::import::source::VIDEO_EXTS.contains(&ext.as_str()),
         }
     }
 }
@@ -266,7 +271,7 @@ pub(super) fn list(
 ) -> Result<Listing, BrowseError> {
     let kind = Kind::parse(kind).ok_or_else(|| BrowseError {
         status: StatusCode::BAD_REQUEST,
-        message: "unknown kind (use model or classes)".to_string(),
+        message: "unknown kind (use model, classes or video)".to_string(),
     })?;
     let raw = path
         .map(|p| p.trim().trim_matches(|c| c == '"' || c == '\'').trim())
@@ -410,6 +415,17 @@ mod tests {
         assert!(l.entries[0].dir && l.entries[0].size.is_none());
         let c = list(&cfg, None, Some("classes")).unwrap();
         assert_eq!(names(&c), ["adir", "Zdir", "c.yaml", "d.yml"]);
+        // Videos only for the import picker.
+        for f in ["clip.MP4", "b.mkv", "c.avi", "d.mov", "e.bvr"] {
+            std::fs::write(_root.join("models").join(f), b"x").unwrap();
+        }
+        let v = list(&cfg, None, Some("video")).unwrap();
+        assert_eq!(
+            names(&v),
+            ["adir", "Zdir", "b.mkv", "c.avi", "clip.MP4", "d.mov"]
+        );
+        let m = list(&cfg, None, Some("model")).unwrap();
+        assert!(!names(&m).contains(&"clip.MP4"), "not in the model picker");
         assert!(!l.truncated);
     }
 

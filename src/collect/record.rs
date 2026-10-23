@@ -202,6 +202,48 @@ pub struct Record {
     pub matched: Vec<Bucket>,
     /// 64-bit dHash of the frame (16 hex digits).
     pub dhash: String,
+    /// Where the frame came from when the service did not receive it from Blue Iris:
+    /// `import:<id>` for imported footage ([`crate::training::import`]). None = collected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Provenance of an imported frame (file or URL, licence and its confirmation, time offset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// Provenance of an imported frame (`docs/DATASET.md`, "Imported frames").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Provenance {
+    /// The import's id (`<UTC time>-<4 hex>`).
+    pub import_id: String,
+    /// `video | image | url | dataset`.
+    pub kind: String,
+    /// The local file the frame was read from (the video or the image).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The page or file URL of a downloaded video.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The pinned dataset resource (`import-data:meva-sample`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    /// The licence the user stated (or the pinned dataset's).
+    pub license: String,
+    /// The user confirmed they may use the footage under that licence (always true for a URL or
+    /// a file import, which is refused without the confirmation).
+    pub license_confirmed: bool,
+    /// When the licence was confirmed (UTC, RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<String>,
+    /// What the site reported (yt-dlp: title, uploader, licence, page URL), for URL imports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<serde_json::Value>,
+    /// Seconds from the start of the video (None for an image).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_offset_s: Option<f64>,
+    /// Attribution to show where the frame is used (CC BY).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<String>,
 }
 
 /// A record with nothing filled in (the worker fills it, the collector completes it).
@@ -232,6 +274,8 @@ pub(crate) fn empty_record() -> Record {
         buckets: Vec::new(),
         matched: Vec::new(),
         dhash: String::new(),
+        source: None,
+        provenance: None,
     }
 }
 

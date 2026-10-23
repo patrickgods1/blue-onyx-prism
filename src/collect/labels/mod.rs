@@ -127,6 +127,62 @@ pub struct LabelBox {
     /// The label the model or auto-labeler gave, when the reviewer relabeled the box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_label: Option<String>,
+    /// What the auto-labeler found out about the box (`agree`, `triage`, `vlm`, ...); empty for
+    /// other boxes. Flattened: the keys sit on the box itself.
+    #[serde(flatten)]
+    pub auto: AutoInfo,
+}
+
+/// The auto-labeler's triage of a box ([`crate::training::autolabel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Triage {
+    /// Both labelers agree at a high score and no check objects.
+    Accept,
+    /// A reviewer should look at it (single labeler, low score, a night person or animal, a VLM
+    /// or SigLIP objection).
+    Review,
+}
+
+/// The VLM crop check of a box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VlmCheck {
+    /// The checkpoint (`qwen3-vl-2b`).
+    pub model: String,
+    /// Its one-word answer, normalized (`person`, `vehicle`, `animal`, `statue`, `rock`, `plant`,
+    /// `nothing`, or what it said).
+    pub answer: String,
+    /// The answer that agrees with the box's label (`person`, `vehicle` or `animal`).
+    pub expected: String,
+    /// `answer == expected`.
+    pub ok: bool,
+}
+
+/// The auto-labeler's evidence on a box (all optional; empty for model and human boxes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AutoInfo {
+    /// Both labelers (MM-Grounding-DINO and RF-DETR) found the box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agree: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<Triage>,
+    /// Why the box goes to review (empty for `accept`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub why: Vec<String>,
+    /// Score of each labeler that found it (`gdino`, `rfdetr`, or a trained model's name).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labelers: std::collections::BTreeMap<String, f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlm: Option<VlmCheck>,
+    /// SigLIP's zero-shot probabilities of the animal classes on the crop (sum 1).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub species_scores: std::collections::BTreeMap<String, f32>,
+}
+
+impl AutoInfo {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl LabelBox {
@@ -145,6 +201,7 @@ impl LabelBox {
             origin: Some(origin),
             reason,
             model_label: None,
+            auto: AutoInfo::default(),
         }
     }
 }
@@ -167,6 +224,11 @@ pub struct LabelFile {
     /// [`classes_version`] of the class list the review used.
     #[serde(default)]
     pub classes_version: String,
+    /// Why the frame went back to review after a re-label with a trained model (its boxes
+    /// disagree with the reviewed labels); the Review queue lists these frames first. Cleared
+    /// when the frame is reviewed or skipped again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disagreement: Option<String>,
 }
 
 fn labels_version() -> u32 {
@@ -182,6 +244,7 @@ impl Default for LabelFile {
             boxes: Vec::new(),
             reviewed_at: None,
             classes_version: String::new(),
+            disagreement: None,
         }
     }
 }
@@ -358,6 +421,7 @@ pub fn normalize(
         if b.reason.as_ref().is_some_and(|r| r.chars().count() > 200) {
             bail!("box {n}: the reason is longer than 200 characters");
         }
+        check_auto(&b.auto).with_context(|| format!("box {n}"))?;
         b.bbox = clamp_box(b.bbox, w, h);
         if b.bbox[2] - b.bbox[0] < MIN_BOX_PX || b.bbox[3] - b.bbox[1] < MIN_BOX_PX {
             bail!(
@@ -411,7 +475,42 @@ pub fn normalize(
         Status::Skipped => f.reviewed_at = Some(now.to_string()),
         Status::Unreviewed => f.reviewed_at = None,
     }
+    if f.status != Status::Unreviewed {
+        f.disagreement = None;
+    }
+    if f.disagreement
+        .as_ref()
+        .is_some_and(|d| d.chars().count() > 500)
+    {
+        bail!("the disagreement note is longer than 500 characters");
+    }
     Ok(f)
+}
+
+/// Bounds of the auto-labeler fields a client sends back (they are only round-tripped).
+fn check_auto(a: &AutoInfo) -> Result<()> {
+    let short = |s: &str| s.chars().count() <= MAX_LABEL_LEN && !s.chars().any(char::is_control);
+    let score_ok = |s: f32| s.is_finite() && (0.0..=1.0).contains(&s);
+    if a.why.len() > 16 || a.why.iter().any(|w| w.chars().count() > 200) {
+        bail!("too many or too long triage reasons");
+    }
+    if a.labelers.len() > 16 || a.species_scores.len() > super::config::MAX_CLASSES {
+        bail!("too many labeler or species scores");
+    }
+    for (k, v) in a.labelers.iter().chain(&a.species_scores) {
+        if !short(k) || !score_ok(*v) {
+            bail!(
+                "'{}': not a name with a score between 0 and 1",
+                k.escape_debug()
+            );
+        }
+    }
+    if let Some(v) = &a.vlm
+        && !(short(&v.model) && short(&v.answer) && short(&v.expected))
+    {
+        bail!("the VLM check has a field longer than {MAX_LABEL_LEN} characters");
+    }
+    Ok(())
 }
 
 /// What [`merge_proposals`] did.
@@ -610,6 +709,27 @@ pub fn label_files(dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
+/// Test helpers shared by the label modules' tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// A pending auto box of `label` at a fixed place.
+    pub(crate) fn auto_box(label: &str) -> LabelBox {
+        LabelBox {
+            label: label.into(),
+            bbox: [10.0, 10.0, 50.0, 50.0],
+            source: Source::Auto,
+            score: Some(0.5),
+            state: BoxState::Pending,
+            origin: None,
+            reason: None,
+            model_label: None,
+            auto: AutoInfo::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -701,6 +821,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            auto: Default::default(),
         });
         let n = normalize(f.clone(), &classes(), 640, 480, now).unwrap();
         let states: Vec<BoxState> = n.boxes.iter().map(|b| b.state).collect();
@@ -749,6 +870,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            auto: Default::default(),
         });
         let n = normalize(f, &classes(), 640, 480, "now").unwrap();
         assert_eq!(n.boxes.len(), 4);
@@ -806,6 +928,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            auto: Default::default(),
         }
     }
 
@@ -842,6 +965,63 @@ mod tests {
         let r = merge_proposals(&mut g, vec![auto("cat", [10.0, 10.0, 50.0, 90.0])]);
         assert_eq!(r.added, 0, "another label on a pending box is dropped");
         assert!(!r.reopened);
+    }
+
+    #[test]
+    fn auto_info_round_trips_flat_and_disagreement_clears_on_review() {
+        let mut b = tests_support::auto_box("person");
+        b.auto = AutoInfo {
+            agree: Some(true),
+            triage: Some(Triage::Review),
+            why: vec!["night person".into()],
+            labelers: [("gdino".to_string(), 0.41), ("rfdetr".to_string(), 0.77)].into(),
+            vlm: Some(VlmCheck {
+                model: "qwen3-vl-2b".into(),
+                answer: "rock".into(),
+                expected: "person".into(),
+                ok: false,
+            }),
+            species_scores: Default::default(),
+        };
+        let v = serde_json::to_value(&b).unwrap();
+        assert_eq!(v["agree"], true);
+        assert_eq!(v["triage"], "review");
+        assert_eq!(v["vlm"]["answer"], "rock");
+        assert_eq!(v["labelers"]["rfdetr"], serde_json::json!(0.77f32));
+        assert!(v.get("species_scores").is_none(), "empty maps are left out");
+        let back: LabelBox = serde_json::from_value(v).unwrap();
+        assert_eq!(back, b);
+        // A plain box has none of the keys.
+        let plain = serde_json::to_value(LabelBox {
+            auto: AutoInfo::default(),
+            ..b.clone()
+        })
+        .unwrap();
+        assert!(plain.get("agree").is_none() && plain.get("triage").is_none());
+
+        let f = LabelFile {
+            boxes: vec![b.clone()],
+            disagreement: Some("model x: 1 class change".into()),
+            ..LabelFile::default()
+        };
+        let un = normalize(f.clone(), &classes(), 640, 480, "t").unwrap();
+        assert!(un.disagreement.is_some(), "kept while unreviewed");
+        let rev = normalize(
+            LabelFile {
+                status: Status::Reviewed,
+                ..f.clone()
+            },
+            &classes(),
+            640,
+            480,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(rev.disagreement, None);
+        assert_eq!(rev.boxes[0].state, BoxState::Accepted);
+        let mut bad = f;
+        bad.boxes[0].auto.labelers.insert("x".into(), 2.0);
+        assert!(normalize(bad, &classes(), 640, 480, "t").is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! `blue-onyx-prism train ...`: what this machine can train (`capability`), estimates
 //! (`estimate`), a dry run of the dataset assembly (`prepare`), one or several training runs in a
-//! row (`run`), past runs (`list`) and removing the training environment (`remove-env`).
+//! row (`run`), past runs (`list`), removing the training environment (`remove-env`), footage
+//! import (`import`) and auto-labelling (`autolabel`, also the self-training re-label).
 
 use super::capability::{self, Capability};
 use super::dataset::{self, SceneFilter};
@@ -107,10 +108,243 @@ pub enum TrainCommand {
         #[arg(long)]
         verbose: bool,
     },
+    /// Import frames from a video, an image folder (Blue Iris clips / alerts), a video URL or
+    /// pinned open footage into the dataset folder, queued for review.
+    Import(ImportArgs),
+    /// Propose boxes for dataset frames (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and
+    /// SigLIP 2), or re-label them with a trained model (--with-model).
+    Autolabel(AutolabelArgs),
     /// List the runs recorded in the training folder.
     List,
     /// Delete the training environment (tools/train-env, its base weights and settings).
     RemoveEnv,
+}
+
+/// `train import`.
+#[derive(Debug, Clone, clap::Args)]
+#[command(group(clap::ArgGroup::new("from").required(true).args(["path", "url", "dataset", "list_datasets"])))]
+pub struct ImportArgs {
+    /// A video (.mp4 .mkv .avi .mov), an image, or a folder of them (Blue Iris clip and alert
+    /// folders; .bvr clips must be exported to MP4 first).
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+    /// A video page or file URL (downloaded with yt-dlp; needs --license and --confirm-license).
+    #[arg(long)]
+    pub url: Option<String>,
+    /// Pinned open footage (`meva-sample`: MEVA, CC BY 4.0).
+    #[arg(long)]
+    pub dataset: Option<String>,
+    /// List the pinned footage and the imports so far.
+    #[arg(long)]
+    pub list_datasets: bool,
+    /// Camera folder of the frames (default: from the file names, else `import`).
+    #[arg(long)]
+    pub camera: Option<String>,
+    /// Frames to keep.
+    #[arg(long, default_value_t = super::import::DEFAULT_FRAMES)]
+    pub frames: usize,
+    /// FFmpeg scene-change threshold (0..1; 0.01 = motion in a fixed camera, 0.3 = cuts).
+    #[arg(long, default_value_t = super::import::DEFAULT_SCENE)]
+    pub scene: f32,
+    /// Most frames per second kept from scene changes (0 = no limit).
+    #[arg(long, default_value_t = super::import::DEFAULT_MAX_FPS)]
+    pub max_fps: f32,
+    /// Keep one frame every this many seconds anyway (0 = off).
+    #[arg(long, default_value_t = super::import::DEFAULT_EVERY_S)]
+    pub every: f32,
+    /// dHash bits at or below which two frames are duplicates.
+    #[arg(long, default_value_t = crate::collect::config::DEFAULT_DEDUP_HAMMING)]
+    pub dedup: u32,
+    /// Seconds within which two frames of a camera can be duplicates (0 = any time).
+    #[arg(long, default_value_t = super::import::DEFAULT_DEDUP_WINDOW_S)]
+    pub dedup_window: f32,
+    /// siglip (SigLIP 2 embeddings + k-center) or dhash (k-center on the dHashes, no Python for
+    /// image folders).
+    #[arg(long, default_value = "siglip", value_parser = parse_selection)]
+    pub select: super::import::Selection,
+    /// Do not share the frames out equally by scene (day / night / IR).
+    #[arg(long)]
+    pub no_balance: bool,
+    /// The footage's licence (default for files: "own footage").
+    #[arg(long, alias = "licence")]
+    pub license: Option<String>,
+    /// Confirm that you may use the footage for training under that licence.
+    #[arg(long, alias = "confirm-licence")]
+    pub confirm_license: bool,
+    /// Most frames extracted from one video before the selection.
+    #[arg(long, default_value_t = super::import::DEFAULT_MAX_CANDIDATES)]
+    pub max_candidates: usize,
+    /// Allow downloads over 500 MB (the training environment, SigLIP 2).
+    #[arg(long)]
+    pub allow_large: bool,
+    /// Keep the extracted candidates (<training dir>/imports/<id>).
+    #[arg(long)]
+    pub keep_work: bool,
+    /// Print the helper's output.
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+/// `train autolabel`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct AutolabelArgs {
+    /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, status
+    /// (unreviewed | reviewed | skipped | any), source (queue | all), import (<id> | any), limit.
+    #[arg(long, default_value = "")]
+    pub frames: String,
+    /// MM-Grounding-DINO size: tiny, base, large, or off.
+    #[arg(long, default_value = "tiny")]
+    pub gdino: String,
+    /// Do not run RF-DETR L.
+    #[arg(long)]
+    pub no_rfdetr: bool,
+    /// Qwen3-VL crop check: 2b, 4b, 8b, or off.
+    #[arg(long, default_value = "2b")]
+    pub vlm: String,
+    /// Do not rank species with SigLIP 2.
+    #[arg(long)]
+    pub no_siglip: bool,
+    /// Self-training: re-label with this configured (trained) model instead of the labelers;
+    /// frames whose reviewed labels it disagrees with go back to review first.
+    #[arg(long)]
+    pub with_model: Option<String>,
+    /// Score threshold of --with-model.
+    #[arg(long, default_value_t = 0.3)]
+    pub threshold: f32,
+    /// The class list (default collect.classes), comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    pub classes: Vec<String>,
+    /// Allow downloads over 500 MB (the environment and the labelers).
+    #[arg(long)]
+    pub allow_large: bool,
+    /// Print the labeler's output.
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+fn parse_selection(s: &str) -> Result<super::import::Selection, String> {
+    super::import::Selection::parse(s).ok_or_else(|| format!("'{s}' is not siglip or dhash"))
+}
+
+/// The import request of `a` (None for `--list-datasets`).
+pub fn import_request(a: &ImportArgs) -> Result<Option<super::import::ImportRequest>> {
+    use super::import::{ImportRequest, ImportSource};
+    let source = match (&a.path, &a.url, &a.dataset) {
+        (Some(p), None, None) => ImportSource::Path(p.clone()),
+        (None, Some(u), None) => ImportSource::Url(u.clone()),
+        (None, None, Some(d)) => ImportSource::Dataset(d.clone()),
+        (None, None, None) => return Ok(None),
+        _ => bail!("give one of --path, --url or --dataset"),
+    };
+    let mut r = ImportRequest::new(source);
+    r.camera = a.camera.clone();
+    r.frames = a.frames;
+    r.scene_threshold = a.scene;
+    r.max_fps = a.max_fps;
+    r.every_s = a.every;
+    r.dedup_hamming = a.dedup;
+    r.dedup_window_s = a.dedup_window;
+    r.selection = a.select;
+    r.balance = !a.no_balance;
+    r.license = a.license.clone();
+    r.license_confirmed = a.confirm_license;
+    r.max_candidates = a.max_candidates;
+    r.allow_large = a.allow_large;
+    r.keep_work = a.keep_work;
+    r.validate()?;
+    Ok(Some(r))
+}
+
+/// The auto-label request of `a`.
+pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::AutolabelRequest> {
+    use super::autolabel::{AutolabelRequest, FrameFilter, GdinoSize, VlmSize, default_status};
+    let mut r = AutolabelRequest::new(FrameFilter::parse(
+        &a.frames,
+        default_status(a.with_model.is_some()),
+    )?);
+    r.gdino = match a.gdino.trim() {
+        "off" | "none" | "" => None,
+        g => Some(
+            GdinoSize::parse(g)
+                .with_context(|| format!("--gdino: '{g}' is not tiny, base, large or off"))?,
+        ),
+    };
+    r.vlm = match a.vlm.trim() {
+        "off" | "none" | "" => None,
+        v => Some(
+            VlmSize::parse(v).with_context(|| format!("--vlm: '{v}' is not 2b, 4b, 8b or off"))?,
+        ),
+    };
+    r.rfdetr = !a.no_rfdetr;
+    r.siglip = !a.no_siglip;
+    r.with_model = a.with_model.clone();
+    r.threshold = a.threshold;
+    r.classes = (!a.classes.is_empty()).then(|| a.classes.clone());
+    r.allow_large = a.allow_large;
+    r.validate()?;
+    Ok(r)
+}
+
+/// Run one import or auto-label task on a queue of this process, printing its progress; true
+/// when it finished.
+fn run_task_cli(config: &Config, task: Box<dyn super::task::Task>, verbose: bool) -> Result<bool> {
+    let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
+    let svc = TrainingService::start(
+        Arc::new(crate::resources::export::SystemRunner),
+        fetcher,
+        Arc::new(super::job::NoHooks),
+        Some(super::runs_file(config)),
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _ctrl_c = crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the job");
+    let id = svc.enqueue_task(task).map_err(anyhow::Error::msg)?;
+    let mut last = String::new();
+    let mut last_step = usize::MAX;
+    let mut last_print = std::time::Instant::now();
+    let mut seen_log = 0usize;
+    let mut ok = false;
+    while let Some(r) = svc.wait_task(&id, Duration::from_secs(1)) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            svc.cancel(&id);
+        }
+        if verbose {
+            for l in r.log.iter().skip(seen_log.min(r.log.len())) {
+                eprintln!("    {l}");
+            }
+            seen_log = r.log.len();
+        }
+        // One line per stage, else at most every 10 s.
+        let line = format!("{:>3}% {}", r.percent, r.describe());
+        if r.state == RunState::Running
+            && line != last
+            && (r.step != last_step || last_print.elapsed() >= Duration::from_secs(10))
+        {
+            eprintln!("{line}");
+            last = line;
+            last_step = r.step;
+            last_print = std::time::Instant::now();
+        }
+        if !r.state.is_busy() {
+            println!("{}: {}", r.title, r.describe());
+            if let Some(res) = &r.result {
+                if let Some(w) = res["warnings"].as_array() {
+                    for x in w {
+                        println!("  warning: {}", x.as_str().unwrap_or_default());
+                    }
+                }
+                if let Some(s) = res["sample"].as_array().filter(|s| !s.is_empty()) {
+                    println!("  frames, for example:");
+                    for x in s.iter().take(5) {
+                        println!("    {}", x.as_str().unwrap_or_default());
+                    }
+                }
+            }
+            ok = r.state == RunState::Done;
+            break;
+        }
+    }
+    svc.shutdown();
+    Ok(ok)
 }
 
 /// What a run trains on.
@@ -376,6 +610,55 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             svc.shutdown();
             Ok(ok)
         }
+        TrainCommand::Import(a) => {
+            let Some(req) = import_request(&a)? else {
+                println!("Pinned footage (--dataset):");
+                for r in crate::resources::catalog::IMPORT_DATASETS {
+                    println!(
+                        "  {:<14} {} ({}, {}): {}",
+                        crate::resources::catalog::install_key(r),
+                        r.title,
+                        r.license,
+                        crate::resources::catalog::format_size(r.size()),
+                        r.description
+                    );
+                }
+                let dir = crate::collect::CollectSettings::for_config(&config).dir;
+                let imports = super::import::write::read_imports(&dir);
+                println!("Imports in {}: {}", dir.display(), imports.len());
+                for i in imports.iter().rev().take(20) {
+                    println!(
+                        "  {}  {} frames  {}  ({})",
+                        i.id, i.frames, i.source, i.license
+                    );
+                }
+                return Ok(true);
+            };
+            let cap = super::capability_now();
+            let job = super::import::plan_import(&config, req, &cap)?;
+            eprintln!(
+                "importing {} into {} (licence: {})",
+                job.request.source.describe(),
+                job.dataset_dir.display(),
+                if job.license.is_empty() {
+                    "the dataset's"
+                } else {
+                    &job.license
+                }
+            );
+            run_task_cli(&config, Box::new(job), a.verbose)
+        }
+        TrainCommand::Autolabel(a) => {
+            let req = autolabel_request(&a)?;
+            let cap = super::capability_now();
+            let job = super::autolabel::plan_autolabel(&config, req, &cap)?;
+            eprintln!(
+                "{} in {}",
+                super::task::Task::title(&job),
+                job.dataset_dir.display()
+            );
+            run_task_cli(&config, Box::new(job), a.verbose)
+        }
         TrainCommand::List => {
             let runs = service::load_records(&super::runs_file(&config));
             if runs.is_empty() {
@@ -605,6 +888,86 @@ mod tests {
         assert!(t.contains("D-FINE [Apache-2.0] (not here:"), "{t}");
         let none = capability::capability(&HardwareInfo::new("linux", "x86_64", vec![]), None);
         assert!(capability_text(&none).contains("train_model.py"));
+    }
+
+    #[derive(clap::Parser)]
+    struct T {
+        #[command(subcommand)]
+        c: TrainCommand,
+    }
+
+    fn parse(args: &[&str]) -> Result<TrainCommand, clap::Error> {
+        use clap::Parser;
+        T::try_parse_from(std::iter::once("train").chain(args.iter().copied())).map(|t| t.c)
+    }
+
+    #[test]
+    fn import_and_autolabel_flags_parse() {
+        let TrainCommand::Import(a) = parse(&[
+            "import",
+            "--path",
+            "clips",
+            "--frames",
+            "50",
+            "--select",
+            "dhash",
+            "--confirm-licence",
+            "--licence",
+            "CC BY 4.0",
+        ])
+        .unwrap() else {
+            panic!("not import")
+        };
+        let r = import_request(&a).unwrap().unwrap();
+        assert_eq!(r.frames, 50);
+        assert_eq!(r.selection, super::super::import::Selection::Dhash);
+        assert!(r.license_confirmed);
+        assert_eq!(r.license.as_deref(), Some("CC BY 4.0"));
+        assert!(parse(&["import"]).is_err(), "a source is required");
+        assert!(
+            parse(&["import", "--path", "a", "--url", "https://x/y"]).is_err(),
+            "one source only"
+        );
+        let TrainCommand::Import(l) = parse(&["import", "--list-datasets"]).unwrap() else {
+            panic!()
+        };
+        assert!(import_request(&l).unwrap().is_none());
+        assert!(parse(&["import", "--path", "a", "--select", "x"]).is_err());
+
+        let TrainCommand::Autolabel(a) = parse(&[
+            "autolabel",
+            "--frames",
+            "scene=ir,limit=20",
+            "--gdino",
+            "base",
+            "--vlm",
+            "off",
+            "--no-siglip",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        let r = autolabel_request(&a).unwrap();
+        assert_eq!(r.frames.limit, 20);
+        assert_eq!(r.frames.query["status"], "unreviewed");
+        assert_eq!(r.gdino, Some(super::super::autolabel::GdinoSize::Base));
+        assert_eq!(r.vlm, None);
+        assert!(!r.siglip && r.rfdetr);
+        let TrainCommand::Autolabel(m) =
+            parse(&["autolabel", "--with-model", "night-yolo26n-1"]).unwrap()
+        else {
+            panic!()
+        };
+        let r = autolabel_request(&m).unwrap();
+        assert_eq!(r.with_model.as_deref(), Some("night-yolo26n-1"));
+        assert_eq!(
+            r.frames.query["status"], "any",
+            "re-labels reviewed frames too"
+        );
+        let TrainCommand::Autolabel(bad) = parse(&["autolabel", "--gdino", "huge"]).unwrap() else {
+            panic!()
+        };
+        assert!(autolabel_request(&bad).is_err());
     }
 
     #[test]

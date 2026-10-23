@@ -81,6 +81,17 @@
 </div>
 
 <div class="card">
+  <h2>Imported footage</h2>
+  <p class="muted">Frames imported on the <a href="/training#import">Training</a> page or with <code>train import</code> (videos, image folders, Blue Iris clips, URLs, pinned open footage) are stored here like collected frames, with no bucket, and queued for review. Their sidecars carry the source and licence.</p>
+  {% if imports.is_empty() %}<p class="muted">No imports yet.</p>{% else %}
+  <div class="scroll"><table>
+    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Scenes</th><th>Cameras</th></tr></thead>
+    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}</td><td class="num">{{ i.frames }}</td><td>{% for (k, v) in i.scenes %}{{ k }} {{ v }} {% endfor %}</td><td>{{ i.cameras.join(", ") }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Newest frames</h2>
   {% if groups.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
   <form method="post" action="/dataset/review">

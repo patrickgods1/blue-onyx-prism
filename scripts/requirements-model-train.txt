@@ -43,3 +43,12 @@ pycocotools==2.0.11
 scipy==1.17.1
 simplejpeg==1.9.0
 torch-hungarian==0.1.0rc0
+# Footage import and auto-labelling (blue-onyx-prism train import / train autolabel,
+# scripts/import_footage.py and scripts/autolabel.py). PyAV decodes video and runs FFmpeg's
+# `select` scene-change filter in-process: its wheels bundle an FFmpeg build that reports
+# LGPL-3.0-or-later (`av._core.library_meta`), so no separate ffmpeg binary is pinned. yt-dlp
+# (Unlicense) downloads a video URL the user confirmed the licence of; video-only formats, so it
+# never needs an ffmpeg binary to merge streams. The auto-labelers (MM-Grounding-DINO, Qwen3-VL,
+# SigLIP 2) run on transformers above; RF-DETR on rfdetr above.
+av==18.1.0
+yt-dlp==2026.8.19

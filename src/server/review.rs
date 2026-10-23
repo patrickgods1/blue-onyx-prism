@@ -215,6 +215,8 @@ fn labels_answer(frame: &Frame, classes: &[String], message: Option<String>) -> 
             "threshold": rec.threshold,
             "buckets": rec.buckets,
             "routed_from": rec.routed_from,
+            "source": rec.source,
+            "provenance": rec.provenance,
         },
     }))
     .into_response()

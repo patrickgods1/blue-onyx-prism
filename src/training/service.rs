@@ -4,11 +4,14 @@
 //! stage, progress, log tail, dataset counts, the installed model, the benchmark) is kept in
 //! memory and saved to `<training dir>/runs.json`, so the Training page shows past runs after a
 //! restart; a run that was queued or running when the process stopped is marked interrupted.
+//! Footage imports and auto-label runs ([`super::task::Task`]) go through the same queue and
+//! thread (one GPU job at a time); their records are kept in `tasks.json`.
 
 use super::job::{
     BenchSummary, Hooks, TrainError, TrainJob, TrainOutput, TrainReport, TrainRequest, TrainStage,
 };
 use super::progress::TrainProgress;
+use super::task::{self, Task, TaskContext, TaskRecord, TaskReport};
 use crate::resources::export::{CommandRunner, Fetcher};
 use crate::sync::LockExt;
 use crossbeam_channel::{Receiver, Sender};
@@ -214,6 +217,9 @@ struct Inner {
     /// Serializes snapshot + write, so the file always ends with the latest state.
     persist_lock: Mutex<()>,
     stop: AtomicBool,
+    tasks: Mutex<Vec<TaskRecord>>,
+    /// `tasks.json` beside `store`.
+    tasks_store: Option<PathBuf>,
 }
 
 impl Inner {
@@ -233,10 +239,28 @@ impl Inner {
             save_records(p, &runs);
         }
     }
+
+    fn update_task(&self, id: &str, f: impl FnOnce(&mut TaskRecord)) {
+        let mut tasks = self.tasks.lock_recover();
+        if let Some(r) = tasks.iter_mut().find(|r| r.id == id) {
+            f(r);
+        }
+        drop(tasks);
+        self.changed.notify_all();
+    }
+
+    fn persist_tasks(&self) {
+        if let Some(p) = &self.tasks_store {
+            let _order = self.persist_lock.lock_recover();
+            let tasks = self.tasks.lock_recover().clone();
+            task::save_records(p, &tasks);
+        }
+    }
 }
 
 enum Msg {
     Job(Box<TrainJob>),
+    Task(Box<dyn Task>),
     Stop,
 }
 
@@ -269,6 +293,11 @@ impl TrainingService {
         store: Option<PathBuf>,
     ) -> Arc<Self> {
         let runs = store.as_deref().map(load_records).unwrap_or_default();
+        let tasks_store = store.as_deref().map(task::tasks_file);
+        let tasks = tasks_store
+            .as_deref()
+            .map(task::load_records)
+            .unwrap_or_default();
         let inner = Arc::new(Inner {
             runner,
             fetcher,
@@ -280,6 +309,8 @@ impl TrainingService {
             store,
             persist_lock: Mutex::new(()),
             stop: AtomicBool::new(false),
+            tasks: Mutex::new(tasks),
+            tasks_store,
         });
         let (tx, rx) = crossbeam_channel::unbounded();
         let worker = Arc::clone(&inner);
@@ -327,8 +358,84 @@ impl TrainingService {
         Ok(id)
     }
 
-    /// Cancel a queued or running run; returns whether there was one.
+    /// Queue an import or auto-label task (after the runs and tasks queued before it).
+    pub fn enqueue_task(&self, task: Box<dyn Task>) -> Result<String, String> {
+        let id = task.id().to_string();
+        {
+            let mut tasks = self.inner.tasks.lock_recover();
+            if tasks.iter().any(|r| r.id == id) {
+                return Err(format!("job {id} exists"));
+            }
+            tasks.push(TaskRecord::new(task.as_ref(), now()));
+            while tasks.len() > MAX_RECORDS {
+                match tasks.iter().position(|r| !r.state.is_busy()) {
+                    Some(i) => {
+                        tasks.remove(i);
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.inner.persist_tasks();
+        self.inner.changed.notify_all();
+        self.tx
+            .send(Msg::Task(task))
+            .map_err(|_| "the training thread has stopped".to_string())?;
+        Ok(id)
+    }
+
+    /// The import and auto-label records.
+    pub fn tasks(&self) -> Vec<TaskRecord> {
+        self.inner.tasks.lock_recover().clone()
+    }
+
+    pub fn get_task(&self, id: &str) -> Option<TaskRecord> {
+        self.inner
+            .tasks
+            .lock_recover()
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+    }
+
+    /// Block until task `id` is no longer busy or `timeout` passes.
+    pub fn wait_task(&self, id: &str, timeout: Duration) -> Option<TaskRecord> {
+        let deadline = Instant::now() + timeout;
+        let mut tasks = self.inner.tasks.lock_recover();
+        loop {
+            let r = tasks.iter().find(|r| r.id == id).cloned();
+            if r.as_ref().is_none_or(|r| !r.state.is_busy()) {
+                return r;
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return r;
+            };
+            tasks = self
+                .inner
+                .changed
+                .wait_timeout(tasks, left.min(Duration::from_secs(1)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// Cancel a queued or running run or task; returns whether there was one.
     pub fn cancel(&self, id: &str) -> bool {
+        if let Some(st) = self.get_task(id).map(|r| r.state) {
+            return match st {
+                RunState::Queued => {
+                    self.inner.cancelled.lock_recover().insert(id.to_string());
+                    self.inner.update_task(id, |r| {
+                        r.state = RunState::Cancelled;
+                        r.finished = Some(now());
+                    });
+                    self.inner.persist_tasks();
+                    true
+                }
+                RunState::Running => self.flag_current(id),
+                _ => false,
+            };
+        }
         let Some(st) = self.get(id).map(|r| r.state) else {
             return false;
         };
@@ -342,15 +449,18 @@ impl TrainingService {
                 self.inner.persist();
                 true
             }
-            RunState::Running => {
-                let cur = self.inner.current.lock_recover();
-                match cur.as_ref() {
-                    Some((cid, flag)) if cid == id => {
-                        flag.store(true, Ordering::Relaxed);
-                        true
-                    }
-                    _ => false,
-                }
+            RunState::Running => self.flag_current(id),
+            _ => false,
+        }
+    }
+
+    /// Set the cancel flag of the running job `id`.
+    fn flag_current(&self, id: &str) -> bool {
+        let cur = self.inner.current.lock_recover();
+        match cur.as_ref() {
+            Some((cid, flag)) if cid == id => {
+                flag.store(true, Ordering::Relaxed);
+                true
             }
             _ => false,
         }
@@ -369,17 +479,35 @@ impl TrainingService {
             .cloned()
     }
 
-    /// A run is queued or running.
+    /// A run or task is queued or running.
     pub fn busy(&self) -> bool {
         self.inner
             .runs
             .lock_recover()
             .iter()
             .any(|r| r.state.is_busy())
+            || self
+                .inner
+                .tasks
+                .lock_recover()
+                .iter()
+                .any(|r| r.state.is_busy())
     }
 
-    /// Forget a finished run (its files stay).
+    /// Forget a finished run or task (its files stay).
     pub fn remove(&self, id: &str) -> Result<(), String> {
+        {
+            let mut tasks = self.inner.tasks.lock_recover();
+            if let Some(i) = tasks.iter().position(|r| r.id == id) {
+                if tasks.get(i).is_some_and(|r| r.state.is_busy()) {
+                    return Err("the job is queued or running; cancel it first".into());
+                }
+                tasks.remove(i);
+                drop(tasks);
+                self.inner.persist_tasks();
+                return Ok(());
+            }
+        }
         let mut runs = self.inner.runs.lock_recover();
         match runs.iter().position(|r| r.id == id) {
             Some(i) if runs.get(i).is_some_and(|r| r.state.is_busy()) => {
@@ -440,6 +568,18 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
         let job = match msg {
             Msg::Stop => return,
             Msg::Job(j) => *j,
+            Msg::Task(t) => {
+                if inner.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !inner.cancelled.lock_recover().remove(t.id()) {
+                    run_task(inner, t.as_ref());
+                }
+                if inner.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                continue;
+            }
         };
         if inner.stop.load(Ordering::Relaxed) {
             return;
@@ -545,4 +685,90 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             return;
         }
     }
+}
+
+/// Run one task on the queue's thread (see [`worker_loop`]).
+fn run_task(inner: &Inner, t: &dyn Task) {
+    let id = t.id().to_string();
+    let flag = Arc::new(AtomicBool::new(false));
+    *inner.current.lock_recover() = Some((id.clone(), flag.clone()));
+    inner.update_task(&id, |r| r.state = RunState::Running);
+    inner.persist_tasks();
+    tracing::info!(job = %id, "{} started: {}", t.kind().as_str(), t.title());
+    let started = Instant::now();
+    let mut last_step = 0usize;
+    let mut last_save = Instant::now();
+    let mut report = |p: TaskReport<'_>| match p {
+        TaskReport::Stage {
+            stage,
+            step,
+            steps,
+            percent,
+            detail,
+        } => {
+            let new_step = step != last_step;
+            if new_step {
+                tracing::info!(job = %id, "stage {step}/{steps}: {stage}");
+                last_step = step;
+            }
+            inner.update_task(&id, |r| {
+                r.stage = Some(stage.to_string());
+                r.step = step;
+                r.steps = steps;
+                r.percent = percent;
+                r.detail = detail.chars().take(300).collect();
+            });
+            if new_step || last_save.elapsed() > Duration::from_secs(30) {
+                inner.persist_tasks();
+                last_save = Instant::now();
+            }
+        }
+        TaskReport::Line(l) => {
+            tracing::debug!(target: "blue_onyx_prism::training::child", job = %id, "{l}");
+            inner.update_task(&id, |r| {
+                if r.log.len() >= LOG_TAIL {
+                    r.log.remove(0);
+                }
+                r.log.push(l.chars().take(300).collect());
+            });
+        }
+    };
+    let ctx = TaskContext {
+        runner: inner.runner.as_ref(),
+        fetcher: inner.fetcher.as_ref(),
+    };
+    let result = t.run(ctx, &mut report, &flag);
+    *inner.current.lock_recover() = None;
+    match result {
+        Ok(out) => {
+            tracing::info!(job = %id, "{} finished in {:.0} s: {}", t.kind().as_str(), started.elapsed().as_secs_f64(), out.summary);
+            inner.update_task(&id, |r| {
+                r.state = RunState::Done;
+                r.percent = 100;
+                r.summary = Some(out.summary);
+                r.result = Some(out.result);
+                r.finished = Some(now());
+            });
+        }
+        Err(e)
+            if e.downcast_ref::<crate::resources::export::Cancelled>()
+                .is_some()
+                || flag.load(Ordering::Relaxed) =>
+        {
+            tracing::warn!(job = %id, "{} cancelled", t.kind().as_str());
+            inner.update_task(&id, |r| {
+                r.state = RunState::Cancelled;
+                r.finished = Some(now());
+            });
+        }
+        Err(e) => {
+            tracing::warn!(job = %id, "{} failed: {e:#}", t.kind().as_str());
+            inner.update_task(&id, |r| {
+                r.state = RunState::Failed;
+                r.error = Some(format!("{e:#}"));
+                r.finished = Some(now());
+            });
+        }
+    }
+    inner.persist_tasks();
 }

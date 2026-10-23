@@ -161,12 +161,27 @@
     return b;
   }
 
+  // The auto-labeler's evidence on a box: triage, why, the VLM answer, the top species.
+  function autoNote(b) {
+    var parts = [];
+    if (b.triage) parts.push(b.triage === 'accept' ? 'auto: accept' : 'auto: review' + (b.why && b.why.length ? ' (' + b.why.join('; ') + ')' : ''));
+    if (b.agree === false && !b.triage) parts.push('one labeler');
+    if (b.vlm) parts.push((b.vlm.model || 'VLM') + ': ' + (b.vlm.answer || 'nothing') + (b.vlm.ok ? '' : ' (!)'));
+    if (b.species_scores) {
+      var best = null;
+      Object.keys(b.species_scores).forEach(function (k) { if (!best || b.species_scores[k] > b.species_scores[best]) best = k; });
+      if (best) parts.push('SigLIP: ' + best + ' ' + fmtScore(b.species_scores[best]));
+    }
+    return parts;
+  }
+
   function note(b) {
     var parts = [b.source];
     if (b.origin) parts.push(b.origin.replace(/_/g, ' '));
     if (b.reason) parts.push(b.reason);
     if (b.score != null) parts.push('score ' + fmtScore(b.score));
     if (b.model_label && b.model_label !== b.label) parts.push('was ' + b.model_label);
+    parts = parts.concat(autoNote(b));
     var st = b.state === 'pending'
       ? 'pending (' + (b.source === 'human' ? 'added' : (isHint(b) ? 'rejected' : 'accepted')) + ' on save)'
       : b.state;
@@ -376,11 +391,30 @@
     var m = $('rv-meta');
     if (!cur) { m.textContent = ''; return; }
     var r = cur.record || {};
-    var parts = [cur.frame, r.timestamp, r.scene, r.camera, r.model + ' on ' + r.device,
-      'threshold ' + fmtScore(r.threshold), (r.buckets || []).join(', '),
+    var p = r.provenance;
+    var origin = p
+      ? 'imported (' + (p.url || p.dataset || p.path || r.source) + (p.time_offset_s != null ? ' at ' + p.time_offset_s + ' s' : '') + '; licence ' + (p.license || '?') + ')'
+      : r.model + ' on ' + r.device;
+    var parts = [cur.frame, r.timestamp, r.scene, r.camera, origin,
+      p ? '' : 'threshold ' + fmtScore(r.threshold), (r.buckets || []).join(', '),
       cur.saved ? ('saved: ' + cur.labels.status) : 'not reviewed yet'];
     if (cur.stale_classes) parts.push('reviewed with another class list');
+    if (cur.labels && cur.labels.disagreement) parts.push('back for review: ' + cur.labels.disagreement);
     m.textContent = parts.filter(Boolean).join(' · ');
+  }
+
+  // "Auto-label these frames": the filters of the queue become the job's frame filter.
+  var alForm = $('rv-autolabel');
+  if (alForm) {
+    alForm.addEventListener('submit', function () {
+      var parts = [];
+      Array.prototype.forEach.call(filtersForm.elements, function (el) {
+        if (el.name && el.value) parts.push(el.name + '=' + el.value);
+      });
+      var lim = alForm.elements.limit && alForm.elements.limit.value;
+      if (lim) parts.push('limit=' + lim);
+      alForm.elements.frames.value = parts.join(',');
+    });
   }
 
   function showNone(on) {

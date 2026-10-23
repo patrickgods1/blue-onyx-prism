@@ -21,6 +21,64 @@
   {% endif %}
 </div>
 
+<div class="card" id="import">
+  <h2>Import footage</h2>
+  <p class="muted">Frames from your own videos and image folders (Blue Iris clip and alert folders included), a video URL, or pinned open footage go into the dataset folder <code>{{ dataset_dir }}</code> and the Review queue, like collected frames. Scene changes are kept at a bounded rate (FFmpeg <code>select</code>), near duplicates dropped (dHash), and the frames picked by SigLIP 2 k-center, balanced by day / night / IR. Every frame records its source and the licence you confirm. Details: <code>docs/TRAINING.md</code>.</p>
+  <form method="post" action="/training/import">
+    <div class="facts">
+      <label>Source <select name="source"><option value="path">a video, an image or a folder on this machine</option><option value="url">a video URL (yt-dlp)</option><option value="dataset">pinned open footage</option></select></label>
+      <label>File or folder <span class="with-browse"><input type="text" name="path" size="60" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Browse&hellip;</button></span></label>
+      <label>URL <input type="url" name="url" size="60" placeholder="https://..."></label>
+      <label>Pinned footage <select name="dataset">{% for d in footage %}<option value="{{ d.key }}">{{ d.key }}: {{ d.title }} ({{ d.license }}, {{ d.size }})</option>{% endfor %}</select></label>
+    </div>
+    <div class="facts">
+      <label>Frames to keep <input type="number" name="frames" min="1" max="5000" value="200"></label>
+      <label>Selection <select name="select"><option value="siglip">SigLIP 2 embeddings, k-center</option><option value="dhash">dHash k-center (image folders: no GPU, no download)</option></select></label>
+      <label>Scene-change threshold (0.01 = motion in a fixed camera, 0.3 = cuts) <input type="number" name="scene" min="0" max="1" step="0.005" value="0.01"></label>
+      <label>Max frames per second <input type="number" name="max_fps" min="0" max="60" step="0.5" value="1"></label>
+      <label>Dedup window (s) <input type="number" name="dedup_window" min="0" max="86400" step="1" value="10"></label>
+      <label>One frame every (s) <input type="number" name="every" min="0" max="3600" step="1" value="10"></label>
+      <label>Camera folder (empty = from the file names) <input type="text" name="camera" size="20"></label>
+      <label class="check"><input type="checkbox" name="no_balance"> Do not balance by scene</label>
+    </div>
+    <div class="facts">
+      <label>Licence <input type="text" name="license" size="30" placeholder="own footage / CC BY 4.0"></label>
+      <label class="check"><input type="checkbox" name="confirm_license"> I may use this footage for training under that licence (stored with every frame; not needed for pinned footage)</label>
+      <label class="check"><input type="checkbox" name="confirm_large"> Download what is missing (the training environment, SigLIP 2: over 500 MB)</label>
+    </div>
+    <p class="muted small">Sites that list unsecured or private cameras (Insecam and the like) are refused, and live streams are never read. Blue Iris <code>.bvr</code> clips cannot be read: export them to MP4 in Blue Iris first.</p>
+    <button type="submit">Import</button>
+  </form>
+  {% if !imports.is_empty() %}
+  <h3>Recent imports</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Cameras</th></tr></thead>
+    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}{% if let Some(a) = i.attribution %}<br><span class="muted small">{{ a }}</span>{% endif %}</td><td class="num">{{ i.frames }}</td><td>{{ i.cameras.join(", ") }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+</div>
+
+<div class="card" id="autolabel">
+  <h2>Auto-label</h2>
+  <p class="muted">Proposes boxes for dataset frames as pending <em>auto</em> boxes on the <a href="/review">Review</a> page: MM-Grounding-DINO (open vocabulary, the class list plus <code>training.synonyms</code>) and RF-DETR L (COCO classes) fused, person and single-labeler boxes checked by Qwen3-VL, animals ranked by SigLIP 2. A box is marked <em>accept</em> only when both labelers agree at 0.6 or more and no check objects; night persons and animals are always <em>review</em>. Nothing is accepted or deleted for you. Needs an NVIDIA GPU or Apple silicon; re-labelling with a trained model (self-training) runs anywhere.</p>
+  <form method="post" action="/training/autolabel">
+    <div class="facts">
+      <label>Frames <input type="text" name="frames" size="50" placeholder="status=unreviewed,source=all,limit=200" value=""></label>
+      <label>MM-Grounding-DINO <select name="gdino"><option value="tiny">tiny (Swin-T, 0.7 GB)</option><option value="base">base (Swin-B, 0.9 GB)</option><option value="large">large (Swin-L, 1.4 GB)</option><option value="off">off</option></select></label>
+      <label class="check"><input type="checkbox" name="rfdetr" checked> RF-DETR L (COCO classes, 0.1 GB)</label>
+      <label>VLM check <select name="vlm"><option value="2b">Qwen3-VL 2B (4.3 GB)</option><option value="4b">Qwen3-VL 4B (8.9 GB)</option><option value="8b">Qwen3-VL 8B (17.5 GB)</option><option value="off">off</option></select></label>
+      <label class="check"><input type="checkbox" name="siglip" checked> SigLIP 2 species ranking (1.5 GB)</label>
+    </div>
+    <div class="facts">
+      <label>Or re-label with a trained model <select name="with_model"><option value="">(no: use the labelers above)</option>{% for m in models %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select></label>
+      <label>Its threshold <input type="number" name="threshold" min="0.01" max="1" step="0.05" value="0.3"></label>
+      <label class="check"><input type="checkbox" name="confirm_large"> Download what is missing (over 500 MB)</label>
+    </div>
+    <p class="muted small">Frames: <code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>scene</code> (day, night, ir), <code>camera</code>, <code>status</code> (unreviewed, reviewed, skipped, any), <code>source</code> (queue, all), <code>import</code> (an import id, or any), <code>limit</code>. A re-label looks at every frame by default and sends the ones whose reviewed labels the model disagrees with back to review, first in the queue.</p>
+    <button type="submit">Auto-label</button>
+  </form>
+</div>
+
 {% if available %}
 <form method="post" action="/training/queue">
 <div class="card">
@@ -117,6 +175,30 @@
 </div>
 
 <div class="card">
+  <h2>Import and auto-label jobs</h2>
+  {% if tasks.is_empty() %}<p class="muted">None yet.</p>{% else %}
+  <div class="scroll">
+  <table id="training-tasks">
+    <thead><tr><th>Job</th><th>State</th><th>Progress</th><th></th></tr></thead>
+    <tbody>
+    {% for r in tasks %}
+    <tr data-task="{{ r.id }}">
+      <td>{{ r.title }}<br><span class="muted small">{{ r.kind }} {{ r.id }} &middot; {{ r.created }}</span></td>
+      <td data-field="state">{{ r.state }}</td>
+      <td><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span>{% if !r.log_tail.is_empty() %}<pre class="small" data-field="log">{{ r.log_tail }}</pre>{% endif %}</td>
+      <td>
+        {% if r.busy %}<form method="post" action="/training/cancel" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small danger">Cancel</button></form>
+        {% else %}<form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small">Remove</button></form>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Trained models</h2>
   {% if results.is_empty() %}<p class="muted">None yet.</p>{% else %}
   <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark">Benchmark</a> page.</p>
@@ -158,5 +240,17 @@
   <form method="post" action="/training/datasets" class="inline"><input type="hidden" name="remove" value="{{ d.path }}"><code>{{ d.path }}</code> <button type="submit" class="small">Remove</button></form>
   {% endif %}{% endfor %}
 </div>
+<dialog id="browse-dialog">
+  <h3 id="browse-title">Choose a video or a folder</h3>
+  <div class="browse-bar">
+    <select id="browse-roots" aria-label="Places"></select>
+    <button type="button" id="browse-up" class="small">Up</button>
+  </div>
+  <div id="browse-path" class="browse-path"></div>
+  <div id="browse-list" class="browse-list"></div>
+  <p id="browse-msg" class="muted" role="status"></p>
+  <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
+</dialog>
 <script src="/static/training.js?v={{ version }}"></script>
+<script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

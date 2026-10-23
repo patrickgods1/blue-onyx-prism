@@ -37,6 +37,7 @@ mod status;
 #[cfg(test)]
 mod test_util;
 mod training;
+mod training_tasks;
 
 pub(crate) use apply::{apply_config, reload_models, sync_config};
 use config_page::{
@@ -219,6 +220,8 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/training/use", post(training::use_model)),
         ("/training/datasets", post(training::datasets)),
         ("/training/remove-env", post(training::remove_env)),
+        ("/training/import", post(training_tasks::import)),
+        ("/training/autolabel", post(training_tasks::autolabel)),
         ("/logs", get(logs_page)),
         ("/logs.json", get(logs_json)),
         ("/benchmark", get(benchmark::page)),
@@ -995,6 +998,8 @@ mod tests {
             "/training/use",
             "/training/datasets",
             "/training/remove-env",
+            "/training/import",
+            "/training/autolabel",
             "/logs",
             "/logs.json",
             "/benchmark",

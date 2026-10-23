@@ -46,6 +46,10 @@ pub struct TrainingConfig {
     pub oversample: u32,
     /// A run is stopped after this many hours.
     pub timeout_hours: u32,
+    /// Auto-label prompt phrases per class (`{"raccoon": ["raccoon", "trash panda"]}`), replacing
+    /// the built-in ones of that class (MM-Grounding-DINO prompts, SigLIP species prompts).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub synonyms: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for TrainingConfig {
@@ -58,6 +62,7 @@ impl Default for TrainingConfig {
             heldout_share: DEFAULT_HELDOUT_SHARE,
             oversample: DEFAULT_OVERSAMPLE,
             timeout_hours: DEFAULT_TIMEOUT_HOURS,
+            synonyms: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -109,6 +114,26 @@ impl TrainingConfig {
                 anyhow::bail!("training.datasets has an empty path");
             }
         }
+        if self.synonyms.len() > crate::collect::config::MAX_CLASSES {
+            anyhow::bail!(
+                "training.synonyms has more than {} classes",
+                crate::collect::config::MAX_CLASSES
+            );
+        }
+        for (class, phrases) in &self.synonyms {
+            let ok = |s: &str| {
+                !s.trim().is_empty()
+                    && s.chars().count() <= crate::collect::config::MAX_CLASS_LEN
+                    && !s.chars().any(|c| c.is_control() || c == '.')
+            };
+            if !ok(class) || phrases.len() > 16 || !phrases.iter().all(|p| ok(p)) {
+                anyhow::bail!(
+                    "training.synonyms.{class}: give at most 16 phrases of 1 to {} characters \
+                     without periods",
+                    crate::collect::config::MAX_CLASS_LEN
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -145,6 +170,10 @@ mod tests {
         assert!(bad(|c| c.oversample = 0).contains("training.oversample"));
         assert!(bad(|c| c.timeout_hours = 0).contains("training.timeout_hours"));
         assert!(bad(|c| c.datasets = vec![PathBuf::new()]).contains("training.datasets"));
+        assert!(
+            bad(|c| c.synonyms = [("raccoon".to_string(), vec!["a. b".to_string()])].into())
+                .contains("training.synonyms")
+        );
     }
 
     /// Every `training.*` key has a row in the README's configuration table.
@@ -154,6 +183,7 @@ mod tests {
         assert!(readme.contains("| `training` |"));
         let c = TrainingConfig {
             dir: Some("x".into()),
+            synonyms: [("raccoon".to_string(), vec!["raccoon".to_string()])].into(),
             ..TrainingConfig::default()
         };
         let v = serde_json::to_value(c).unwrap();

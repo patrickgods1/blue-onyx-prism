@@ -23,6 +23,14 @@ use super::*;
 pub(crate) static TRAIN_SCRIPT: &str = include_str!("../../../scripts/train_model.py");
 /// File name of the training script in the work directory.
 pub(crate) const TRAIN_SCRIPT_NAME: &str = "train_model.py";
+/// The footage import helpers (`scripts/import_footage.py`).
+pub(crate) static IMPORT_SCRIPT: &str = include_str!("../../../scripts/import_footage.py");
+/// File name of the import helpers in the work directory.
+pub(crate) const IMPORT_SCRIPT_NAME: &str = "import_footage.py";
+/// The auto-labeler (`scripts/autolabel.py`).
+pub(crate) static AUTOLABEL_SCRIPT: &str = include_str!("../../../scripts/autolabel.py");
+/// File name of the auto-labeler in the work directory.
+pub(crate) const AUTOLABEL_SCRIPT_NAME: &str = "autolabel.py";
 
 static LOCK_TRAIN_MACOS_ARM64: &str =
     include_str!("../../../scripts/model-export/locks/train-macos-arm64.txt");
@@ -349,6 +357,21 @@ pub fn write_scripts(paths: &TrainPaths) -> Result<(PathBuf, PathBuf)> {
     Ok((train, export))
 }
 
+/// Write the import and auto-label scripts into `tools/train-work`; returns their paths.
+pub fn write_task_scripts(paths: &TrainPaths) -> Result<(PathBuf, PathBuf)> {
+    std::fs::create_dir_all(&paths.scripts)
+        .with_context(|| format!("creating {}", paths.scripts.display()))?;
+    std::fs::create_dir_all(&paths.config)
+        .with_context(|| format!("creating {}", paths.config.display()))?;
+    let import = paths.scripts.join(IMPORT_SCRIPT_NAME);
+    let label = paths.scripts.join(AUTOLABEL_SCRIPT_NAME);
+    std::fs::write(&import, IMPORT_SCRIPT)
+        .with_context(|| format!("writing {}", import.display()))?;
+    std::fs::write(&label, AUTOLABEL_SCRIPT)
+        .with_context(|| format!("writing {}", label.display()))?;
+    Ok((import, label))
+}
+
 /// `e` with the likely cause and next action of a recognized child failure (out of memory, a
 /// missing DLL, disk full, ...), for a Python script of the training environment.
 pub fn explain_train_failure(
@@ -396,6 +419,9 @@ mod train_env_tests {
                 "transformers==",
                 "accelerate==",
                 "onnxruntime==",
+                // Footage import and auto-labelling.
+                "av==",
+                "yt-dlp==",
             ] {
                 assert!(l.text.contains(pkg), "{} lacks {pkg}", l.name);
             }

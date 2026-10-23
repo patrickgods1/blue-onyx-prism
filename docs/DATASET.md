@@ -146,6 +146,7 @@ the threshold (a unit test checks this). At most the 20 highest are kept.
   candidates stayed unverified (`timeout`, `busy`, `not ready`, ...).
 - `found` appears in frame mode only: crop-mode verifier boxes are in crop coordinates and are not
   kept.
+- `source` and `provenance` appear on imported frames only (below).
 
 **Detections:**
 
@@ -159,6 +160,39 @@ the threshold (a unit test checks this). At most the 20 highest are kept.
 
 **Versioning:** `version` is bumped when a field changes meaning or is removed. Adding a field keeps
 the version. Readers ignore unknown fields and skip records with a newer `version` than they know.
+
+### Imported frames
+
+Frames of a footage import (`train import`, docs/TRAINING.md "Footage import") use the same layout,
+file names `<UTC ms>_imp-<import id>-<n>.jpg`, and a version-1 sidecar with no detections (`raw`,
+`predictions`, `suppressed` empty, `buckets` empty, `model: "import"`, `threshold: 0`) plus:
+
+```json
+{
+  "source": "import:20261023-055526-88d5",
+  "provenance": {
+    "import_id": "20261023-055526-88d5",
+    "kind": "video",
+    "path": "/footage/2018-03-07.17-00-00.17-05-00.school.G419.r13.avi",
+    "license": "CC BY 4.0 (MEVA, mevadata.org)",
+    "license_confirmed": true,
+    "confirmed_at": "2026-10-23T05:41:02.115Z",
+    "time_offset_s": 36.0
+  }
+}
+```
+
+- `kind`: `video`, `image`, `url` (with `url` and `site`: what yt-dlp reported, such as the title,
+  uploader, page URL and the site's licence) or `dataset` (with `dataset`, the pinned resource, and
+  `attribution`; nothing to confirm).
+- `time_offset_s`: seconds from the start of the video (absent for an image). `timestamp` is the
+  recording time when the file name has one (Blue Iris, MEVA), else the file's modification time.
+- The camera folder is `--camera`, else the Blue Iris camera of the file name, `meva-<site>-<camera>`
+  for MEVA, a URL's host, or `import`.
+- The import appends its frames to `review-queue.jsonl` and one line to `<dir>/imports.jsonl` (id,
+  time, source, kind, licence, attribution, frames, cameras, frames per scene), which the Dataset page
+  lists. Imported frames have no bucket, so the scene x bucket table does not count them; the frame
+  total and the camera table do.
 
 ### `index.jsonl`
 
@@ -228,8 +262,8 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
     train on;
   - balances by `scene`;
   - uses `dhash` to drop near duplicates across days.
-- **Import:** imported footage uses the same layout and sidecar, with its own source and licence
-  fields added (a later version).
+- **Import:** imported footage uses the same layout and sidecar, with `source` and `provenance`
+  added ([Imported frames](#imported-frames)).
 
 ## Review labels
 
@@ -273,6 +307,25 @@ Each decision is saved in `<stem>.labels.json` beside the sidecar. The sidecar i
   cannot have accepted or added boxes.
 - **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
   names joined by `\n`). The page flags a frame that was reviewed with another list.
+- **`disagreement`:** set by a re-label with a trained model (`train autolabel --with-model`) when its
+  detections disagree with the reviewed labels (`"re-label by night-yolo26n: 1 new box, 1 missed"`); the
+  file goes back to `unreviewed` and the Review queue lists it first. Cleared when the frame is saved
+  as reviewed or skipped.
+- **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
+  box itself, all optional:
+
+  ```json
+  {"label": "dog", "bbox": [1036.8, 489.6, 1372.0, 1189.1], "source": "auto", "score": 0.7541,
+   "state": "pending", "reason": "auto: gdino + rfdetr", "agree": true, "triage": "review",
+   "why": ["an animal at night: always reviewed"], "labelers": {"gdino": 0.6372, "rfdetr": 0.871},
+   "vlm": {"model": "qwen3-vl-2b", "answer": "animal", "expected": "animal", "ok": true},
+   "species_scores": {"dog": 0.9932, "cat": 0.0034, "fox": 0.0021}}
+  ```
+
+  `agree`: both labelers found it; `triage`: `accept` or `review` with the reasons in `why`;
+  `labelers`: each labeler's (or the re-labelling model's) score; `vlm`: the crop check; `species_scores`:
+  SigLIP's probabilities of the animal classes. The page shows them in the box list; they never change
+  what saving does (a pending auto box is accepted on save unless rejected).
 - **Writes** go through a temporary file and a rename. A newer `version` is refused. Unknown fields are
   ignored.
 
@@ -319,11 +372,13 @@ This is how the self-training loop sends disagreements back to review.
 frame. It accepts these filters: `bucket`, `scene`, `camera`, and `status` (default `unreviewed`; also
 `reviewed`, `skipped`, `any`). Frames are sorted most uncertain first:
 
-1. the near-threshold margin: the smallest `|top score - threshold|` over the labels of `raw` and
+1. a re-label disagreement (the label file's `disagreement`, item field `relabel`);
+2. the near-threshold margin: the smallest `|top score - threshold|` over the labels of `raw` and
    `below_threshold`, in hundredths;
-2. verifier disagreement (the `disagreement` bucket, or a rejected verifier candidate);
-3. more suppressed boxes;
-4. newest.
+3. verifier disagreement (the `disagreement` bucket, or a rejected verifier candidate);
+4. more pending auto boxes triaged `review` (item field `auto_review`);
+5. more suppressed boxes;
+6. newest.
 
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
 The answer also carries the counts: reviewed, remaining, skipped, confirmed empty, rejected boxes, and

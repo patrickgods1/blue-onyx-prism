@@ -142,6 +142,14 @@ impl Store {
         self.publish();
     }
 
+    /// Rebuild the summary of `dir` when it is the folder in use (another writer added frames).
+    pub fn rescan(&mut self, dir: &Path) {
+        if self.dir.as_deref() == Some(dir) {
+            self.dir = None;
+            self.use_dir(dir);
+        }
+    }
+
     fn publish(&self) {
         METRICS.set_bytes(self.summary.bytes);
         METRICS.set_disabled(self.disabled.is_some());

@@ -219,6 +219,8 @@ enum Msg {
     Frame(Box<Frame>),
     Prune(Arc<CollectSettings>),
     Resume,
+    /// Rebuild the summary of a folder another writer added frames to (an import).
+    Rescan(PathBuf),
 }
 
 /// The process's collector: a lazily started thread and what it publishes.
@@ -234,6 +236,7 @@ impl std::fmt::Debug for Msg {
             Msg::Frame(_) => "Frame",
             Msg::Prune(_) => "Prune",
             Msg::Resume => "Resume",
+            Msg::Rescan(_) => "Rescan",
         })
     }
 }
@@ -293,6 +296,14 @@ impl Collector {
         }
         if let Some(tx) = self.sender() {
             let _ = tx.try_send(Msg::Prune(Arc::new(settings)));
+        }
+    }
+
+    /// Rebuild the summary of `dir` after frames were written there by an import (only when
+    /// the collector thread runs in this process; otherwise the page scans the folder itself).
+    pub fn rescan_if_running(&self, dir: &std::path::Path) {
+        if let Some(Some(tx)) = self.tx.get() {
+            let _ = tx.try_send(Msg::Rescan(dir.to_path_buf()));
         }
     }
 
@@ -365,6 +376,7 @@ fn run(rx: &Receiver<Msg>, status: Arc<Mutex<Status>>) {
                 last_prune = std::time::Instant::now();
             }
             Some(Msg::Resume) => st.resume(),
+            Some(Msg::Rescan(dir)) => st.rescan(&dir),
             None => {}
         }
         if last_prune.elapsed() >= PRUNE_INTERVAL

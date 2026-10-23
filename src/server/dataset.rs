@@ -167,6 +167,8 @@ struct DatasetTemplate {
     scenes: Vec<SceneRow>,
     cameras: Vec<CameraRow>,
     groups: Vec<ThumbGroup>,
+    /// Footage imports into this folder, newest first (`imports.jsonl`).
+    imports: Vec<crate::training::import::write::ImportLine>,
 }
 
 fn clean(x: f32) -> String {
@@ -264,6 +266,12 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
         near_margin: clean(c.buckets.near_margin()),
         disabled,
         queued: layout::read_review(&settings.dir.join(REVIEW_QUEUE_FILE)).len(),
+        imports: {
+            let mut v = crate::training::import::write::read_imports(&settings.dir);
+            v.reverse();
+            v.truncate(20);
+            v
+        },
         bucket_names: Bucket::ALL.iter().map(|b| b.as_str()).collect(),
         buckets,
         scenes,

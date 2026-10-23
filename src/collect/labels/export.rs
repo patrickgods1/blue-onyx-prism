@@ -761,6 +761,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            auto: Default::default(),
         }
     }
 

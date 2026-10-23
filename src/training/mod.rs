@@ -19,16 +19,20 @@
 //! code only from pinned, hashed sources, and keeps everything under `<data root>/tools` (the
 //! environment) and the training folder (`training.dir`, the runs).
 
+pub mod autolabel;
 pub mod bench;
 pub mod capability;
 pub mod cli;
 pub mod config;
 pub mod dataset;
 pub mod estimate;
+pub mod import;
 pub mod job;
 pub mod progress;
+pub mod pyenv;
 pub mod recipe;
 pub mod service;
+pub mod task;
 
 pub use capability::{Accelerator, Capability};
 pub use config::TrainingConfig;

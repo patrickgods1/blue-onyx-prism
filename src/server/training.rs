@@ -33,7 +33,7 @@ const EXTRA_SETS: [&str; 3] = ["nir-night", "exdark-ir", "exdark-night"];
 static SERVICE: OnceLock<Arc<TrainingService>> = OnceLock::new();
 
 /// The process's training queue, started on first use.
-fn service(shared: &Shared) -> Arc<TrainingService> {
+pub(super) fn service(shared: &Shared) -> Arc<TrainingService> {
     SERVICE
         .get_or_init(|| {
             let state = shared.current();
@@ -54,6 +54,16 @@ fn service(shared: &Shared) -> Arc<TrainingService> {
             )
         })
         .clone()
+}
+
+/// The import and auto-label jobs (the queue's, else `tasks.json`).
+fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> {
+    match SERVICE.get() {
+        Some(s) => s.tasks(),
+        None => crate::training::task::load_records(&crate::training::task::tasks_file(
+            &crate::training::runs_file(&state.config_read()),
+        )),
+    }
 }
 
 /// The queue if it was started (the page shows `runs.json` otherwise).
@@ -163,7 +173,7 @@ struct DatasetRow {
 
 #[derive(Template)]
 #[template(path = "training.html")]
-struct TrainingTemplate {
+pub(super) struct TrainingTemplate {
     nav: &'static str,
     version: &'static str,
     message: Option<String>,
@@ -185,6 +195,12 @@ struct TrainingTemplate {
     models: Vec<String>,
     default_model: String,
     training_dir: String,
+    /// Import and auto-label jobs.
+    tasks: Vec<super::training_tasks::TaskRow>,
+    footage: Vec<super::training_tasks::FootageRow>,
+    dataset_dir: String,
+    /// Imports listed in the dataset folder.
+    imports: Vec<crate::training::import::write::ImportLine>,
 }
 
 fn state_str(s: RunState) -> &'static str {
@@ -213,8 +229,13 @@ fn bench_text(b: Option<&BenchSummary>, err: Option<&str>) -> String {
     }
 }
 
-fn view(state: &AppState, message: Option<String>, error: Option<String>) -> TrainingTemplate {
+pub(super) fn view(
+    state: &AppState,
+    message: Option<String>,
+    error: Option<String>,
+) -> TrainingTemplate {
     let config = state.config_read().clone();
+    let dataset_dir = crate::collect::CollectSettings::for_config(&config).dir;
     let cap: Capability = crate::training::capability_now();
     let paths = TrainPaths::for_config(&config);
     let platform = Platform::current();
@@ -382,6 +403,15 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Tra
         models: names,
         default_model,
         training_dir: crate::training::training_dir(&config).display().to_string(),
+        tasks: super::training_tasks::task_rows(&tasks(state)),
+        footage: super::training_tasks::footage(),
+        imports: {
+            let mut v = crate::training::import::write::read_imports(&dataset_dir);
+            v.reverse();
+            v.truncate(10);
+            v
+        },
+        dataset_dir: dataset_dir.display().to_string(),
     }
 }
 
@@ -389,14 +419,14 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Tra
 // Forms
 // ---------------------------------------------------------------------------------------------
 
-fn field<'a>(f: &'a [(String, String)], k: &str) -> Option<&'a str> {
+pub(super) fn field<'a>(f: &'a [(String, String)], k: &str) -> Option<&'a str> {
     f.iter()
         .find(|(n, _)| n == k)
         .map(|(_, v)| v.trim())
         .filter(|v| !v.is_empty())
 }
 
-fn all<'a>(f: &'a [(String, String)], k: &str) -> Vec<&'a str> {
+pub(super) fn all<'a>(f: &'a [(String, String)], k: &str) -> Vec<&'a str> {
     f.iter()
         .filter(|(n, _)| n == k)
         .map(|(_, v)| v.trim())
@@ -404,7 +434,7 @@ fn all<'a>(f: &'a [(String, String)], k: &str) -> Vec<&'a str> {
         .collect()
 }
 
-fn num<T: std::str::FromStr>(
+pub(super) fn num<T: std::str::FromStr>(
     f: &[(String, String)],
     k: &str,
     what: &str,
@@ -512,6 +542,7 @@ pub(super) async fn json(State(state): State<Arc<AppState>>) -> Response {
             "capability": cap,
             "busy": SERVICE.get().is_some_and(|s| s.busy()),
             "runs": runs(&state),
+            "tasks": tasks(&state),
         }))
         .into_response()
     })

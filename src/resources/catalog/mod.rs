@@ -39,11 +39,13 @@ use crate::backend::detect::ComputeCapability;
 use crate::backend::spec::{Runtime, Target};
 use crate::model::ModelFamilyKind;
 use serde::{Serialize, Serializer};
+mod autolabel;
 mod models;
 mod runtimes;
 mod tools;
 mod train;
 
+pub use autolabel::*;
 pub use models::*;
 pub(crate) use runtimes::*;
 pub use tools::*;

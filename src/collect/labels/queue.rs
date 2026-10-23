@@ -99,7 +99,7 @@ pub struct Candidate {
 }
 
 /// The uncertainty of a frame from its sidecar.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
 pub struct Uncertainty {
     /// Smallest `|top score - threshold|` over the labels (top over `raw`, which holds the
     /// suppressed boxes, and `below_threshold`); None = no box at all.
@@ -108,6 +108,12 @@ pub struct Uncertainty {
     pub disagreement: bool,
     /// Boxes a rule or the verifier removed.
     pub suppressed: usize,
+    /// The label file's `disagreement`: a re-label with a trained model disagrees with the
+    /// reviewed labels. These frames come first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relabel: Option<String>,
+    /// Pending auto-labeler boxes triaged `review`.
+    pub auto_review: usize,
 }
 
 impl Uncertainty {
@@ -131,12 +137,43 @@ impl Uncertainty {
             margin,
             disagreement,
             suppressed: rec.suppressed.len(),
+            relabel: None,
+            auto_review: 0,
         }
     }
 
-    /// Sort key, most uncertain first: margin in hundredths (no box last), disagreement,
-    /// more suppressed boxes.
-    fn key(&self) -> (u32, bool, std::cmp::Reverse<usize>) {
+    /// Add what the frame's label file says: its re-label disagreement and the pending
+    /// auto-labeler boxes triaged `review`.
+    pub fn with_labels(mut self, labels: Option<&LabelFile>) -> Self {
+        if let Some(l) = labels {
+            self.relabel = l.disagreement.clone();
+            self.auto_review = l
+                .boxes
+                .iter()
+                .filter(|b| {
+                    b.state == super::BoxState::Pending
+                        && b.auto.triage == Some(super::Triage::Review)
+                })
+                .count();
+        }
+        self
+    }
+
+    /// Sort key, most uncertain first: a re-label disagreement, then the margin in hundredths
+    /// (no box last), verifier disagreement, more auto boxes to review, more suppressed boxes.
+    #[allow(
+        clippy::type_complexity,
+        reason = "a lexicographic sort key reads best as one tuple"
+    )]
+    fn key(
+        &self,
+    ) -> (
+        bool,
+        u32,
+        bool,
+        std::cmp::Reverse<usize>,
+        std::cmp::Reverse<usize>,
+    ) {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -145,7 +182,13 @@ impl Uncertainty {
         let m = self
             .margin
             .map_or(u32::MAX, |m| (m.clamp(0.0, 1.0) * 100.0).round() as u32);
-        (m, !self.disagreement, std::cmp::Reverse(self.suppressed))
+        (
+            self.relabel.is_none(),
+            m,
+            !self.disagreement,
+            std::cmp::Reverse(self.auto_review),
+            std::cmp::Reverse(self.suppressed),
+        )
     }
 }
 
@@ -295,7 +338,7 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
             buckets: c.buckets,
             status,
             queued: c.queued,
-            uncertainty: Uncertainty::of(&rec),
+            uncertainty: Uncertainty::of(&rec).with_labels(labels.as_ref()),
         });
     }
     sort_items(&mut q.items);
@@ -336,7 +379,42 @@ mod tests {
             margin,
             disagreement,
             suppressed,
+            relabel: None,
+            auto_review: 0,
         }
+    }
+
+    #[test]
+    fn relabel_disagreements_come_first_then_auto_boxes_to_review() {
+        let relabel = Uncertainty {
+            relabel: Some("model m: 1 new box".into()),
+            ..u(None, false, 0)
+        };
+        let auto = Uncertainty {
+            auto_review: 2,
+            ..u(Some(0.3), false, 0)
+        };
+        let mut items = vec![
+            item("plain", "9", u(Some(0.3), false, 0)),
+            item("closest", "0", u(Some(0.0), false, 0)),
+            item("auto", "0", auto),
+            item("relabel", "0", relabel),
+        ];
+        sort_items(&mut items);
+        let order: Vec<&str> = items.iter().map(|i| i.frame.as_str()).collect();
+        assert_eq!(order, ["relabel", "closest", "auto", "plain"]);
+        // From a label file.
+        let mut f = LabelFile {
+            disagreement: Some("x".into()),
+            ..LabelFile::default()
+        };
+        let mut b = super::super::tests_support::auto_box("dog");
+        b.auto.triage = Some(super::super::Triage::Review);
+        f.boxes.push(b.clone());
+        b.state = super::super::BoxState::Accepted;
+        f.boxes.push(b);
+        let x = u(None, false, 0).with_labels(Some(&f));
+        assert_eq!((x.relabel.as_deref(), x.auto_review), (Some("x"), 1));
     }
 
     #[test]
