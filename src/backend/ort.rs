@@ -57,6 +57,7 @@ use std::time::Instant;
 struct LoadedLib {
     path: PathBuf,
     version: String,
+    env: ::ort::environment::Environment,
 }
 
 /// Set once the library is loaded and the `ort` environment committed. Failures are not cached,
@@ -148,14 +149,12 @@ fn load_library(path: &Path) -> Result<LoadedLib> {
             }
         }
     }
-    let committed = ::ort::init_from(path)
+    let env = ::ort::init_from(path)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .with_name("blue-onyx-prism")
         .with_telemetry(false)
-        .commit();
-    if !committed {
-        tracing::debug!("ONNX Runtime environment was already configured");
-    }
+        .build()
+        .map_err(|e| anyhow::anyhow!("creating the ONNX Runtime environment: {e}"))?;
     // `ort` forwards every ONNX Runtime message to `tracing`, including the verbose/info ones it
     // prints per session; keep warnings and errors unless `ORT_LOG` asks for more.
     let level = match std::env::var("ORT_LOG").as_deref() {
@@ -165,13 +164,11 @@ fn load_library(path: &Path) -> Result<LoadedLib> {
         Ok("fatal") => ::ort::logging::LogLevel::Fatal,
         _ => ::ort::logging::LogLevel::Warning,
     };
-    match ::ort::environment::Environment::current() {
-        Ok(env) => env.set_log_level(level),
-        Err(e) => bail!("creating the ONNX Runtime environment: {e}"),
-    }
+    env.set_log_level(level);
     let lib = LoadedLib {
         path: path.to_path_buf(),
         version,
+        env,
     };
     *slot = Some(lib.clone());
     Ok(lib)
@@ -673,10 +670,19 @@ impl OrtRuntime {
         dir.to_str().map(str::to_string)
     }
 
+    /// A session builder on the process-wide environment (the library must be loaded).
+    fn session_builder() -> Result<SessionBuilder> {
+        let env = LOADED
+            .lock_recover()
+            .as_ref()
+            .map(|lib| lib.env.clone())
+            .ok_or_else(|| anyhow::anyhow!("ONNX Runtime is not loaded"))?;
+        Session::builder(&env).map_err(ort_err)
+    }
+
     /// An unoptimized CPU session, only to read the model's ports.
     fn metadata_session(&self, path: &Path) -> Result<Session> {
-        Session::builder()
-            .map_err(ort_err)?
+        Self::session_builder()?
             .with_optimization_level(GraphOptimizationLevel::Disable)
             .map_err(ort_err)?
             .commit_from_file(path)
@@ -690,7 +696,7 @@ impl OrtRuntime {
         path: &Path,
         overrides: &[(String, i64)],
     ) -> Result<Session> {
-        let mut b: SessionBuilder = Session::builder().map_err(ort_err)?;
+        let mut b: SessionBuilder = Self::session_builder()?;
         // Every session, GPU EPs included (their CPU fallback ops run on this pool).
         b = b.with_intra_threads(self.intra_threads).map_err(ort_err)?;
         let spin = ort_spinning_enabled(std::env::var(ENV_ORT_SPINNING).ok().as_deref());
@@ -895,19 +901,25 @@ fn probe_providers(lib: &LoadedLib, hw: &HardwareInfo, cuda_libs: Option<&Path>)
     let dir = lib.path.parent().unwrap_or(Path::new("."));
     let flavor = libs::read_ort_flavor(dir);
     let mut providers = vec![EpStatus::usable(Target::Cpu)];
-    let checks: [(Target, Box<dyn ExecutionProvider>); 4] = [
-        (Target::Cuda, Box::new(ep::CUDA::default())),
-        (Target::TensorRt, Box::new(ep::TensorRT::default())),
-        (Target::DirectMl, Box::new(ep::DirectML::default())),
-        (Target::CoreMl, Box::new(ep::CoreML::default())),
+    type Check = (Target, &'static str, fn() -> ::ort::Result<bool>);
+    let checks: [Check; 4] = [
+        (Target::Cuda, ep::CUDA::NAME, ep::CUDA::is_available),
+        (
+            Target::TensorRt,
+            ep::TensorRT::NAME,
+            ep::TensorRT::is_available,
+        ),
+        (
+            Target::DirectMl,
+            ep::DirectML::NAME,
+            ep::DirectML::is_available,
+        ),
+        (Target::CoreMl, ep::CoreML::NAME, ep::CoreML::is_available),
     ];
-    for (target, provider) in checks {
-        match provider.is_available() {
+    for (target, name, is_available) in checks {
+        match is_available() {
             Ok(false) => {}
-            Err(e) => providers.push(EpStatus::broken(
-                target,
-                format!("querying {}: {e}", provider.name()),
-            )),
+            Err(e) => providers.push(EpStatus::broken(target, format!("querying {name}: {e}"))),
             Ok(true) => {
                 let reason = match target {
                     Target::Cuda | Target::TensorRt if !hw.has_vendor(GpuVendor::Nvidia) => {
