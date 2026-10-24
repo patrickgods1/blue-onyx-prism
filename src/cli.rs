@@ -339,9 +339,10 @@ pub fn log_startup_warnings(config: &Config) {
     }
 }
 
-/// The confidence thresholds (global and per enabled model) at or above 1.0, which no
-/// detection can pass: `("confidence_threshold", 1.0)` or `("model 'x' confidence_threshold",
-/// 1.0)`. Valid for the config, silent "0 objects" for every request.
+/// The confidence thresholds (global, per enabled model and per device profile of an enabled
+/// model) at or above 1.0, which no detection can pass: `("confidence_threshold", 1.0)`,
+/// `("model 'x' confidence_threshold", 1.0)` or `("model 'x' confidence profile for
+/// ort:coreml", 1.0)` (a profile blocks only on that device). Valid for the config, silent "0 objects" for every request.
 pub fn blocking_thresholds(config: &Config) -> Vec<(String, f32)> {
     let mut out = Vec::new();
     if config.confidence_threshold >= 1.0
@@ -363,6 +364,17 @@ pub fn blocking_thresholds(config: &Config) -> Vec<(String, f32)> {
                 format!("model '{}' confidence_threshold", m.effective_name()),
                 t,
             ));
+        }
+        for (device, t) in &m.device_thresholds {
+            if *t >= 1.0 {
+                out.push((
+                    format!(
+                        "model '{}' confidence profile for {device}",
+                        m.effective_name()
+                    ),
+                    *t,
+                ));
+            }
         }
     }
     out
@@ -1662,6 +1674,25 @@ mod tests {
         c.confidence_threshold = 1.0;
         c.models[0].confidence_threshold = Some(0.4);
         assert!(blocking_thresholds(&c).is_empty());
+        // A device profile at 1.0 blocks on that device; below 1 it does not.
+        c.models[0]
+            .device_thresholds
+            .insert("ort:coreml".into(), 0.99);
+        assert!(blocking_thresholds(&c).is_empty());
+        c.models[0]
+            .device_thresholds
+            .insert("ort:coreml".into(), 1.0);
+        assert_eq!(
+            blocking_thresholds(&c),
+            [(
+                "model 'a' confidence profile for ort:coreml".to_string(),
+                1.0
+            )]
+        );
+        c.models[1]
+            .device_thresholds
+            .insert("openvino:cpu".into(), 1.0);
+        assert_eq!(blocking_thresholds(&c).len(), 1, "b is disabled");
     }
 
     #[test]

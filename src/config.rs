@@ -304,6 +304,17 @@ pub mod thr {
     ) -> Result<S::Ok, S::Error> {
         serde::Serialize::serialize(&clean_map(m), s)
     }
+    /// A map of thresholds with each value rounded like [`ser`] (`device_thresholds`).
+    pub fn ser_map<S: Serializer>(
+        m: &super::BTreeMap<String, f32>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let rounded: super::BTreeMap<&str, f64> = m
+            .iter()
+            .map(|(k, v)| (k.as_str(), super::round_threshold_f64(*v)))
+            .collect();
+        serde::Serialize::serialize(&rounded, s)
+    }
     pub fn ser_opt_map_clean<S: Serializer>(
         m: &Option<super::BTreeMap<String, f32>>,
         s: S,
@@ -332,6 +343,17 @@ pub struct ModelConfig {
     /// Per-model confidence threshold (None = global). Kept rounded to 2 decimals.
     #[serde(serialize_with = "thr::ser_opt")]
     pub confidence_threshold: Option<f32>,
+    /// Confidence profiles: the threshold to use when this model runs on a given device, keyed
+    /// by canonical device spec ([`device_threshold_key`], e.g. `ort:coreml`,
+    /// `openvino:gpu.1`). The device that actually loaded picks its entry
+    /// ([`ModelConfig::threshold_on`]); a device without one uses `confidence_threshold`, then
+    /// the global value. Kept rounded to 2 decimals. Applies at once.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "thr::ser_map"
+    )]
+    pub device_thresholds: BTreeMap<String, f32>,
     pub object_filter: Option<Vec<String>>,
     /// Compile on first request instead of at startup. That request (and every one until the
     /// model is ready) is answered at once with "Model 'x' is initializing", never queued.
@@ -405,6 +427,7 @@ impl Default for ModelConfig {
             classes: None,
             device: None,
             confidence_threshold: None,
+            device_thresholds: BTreeMap::new(),
             object_filter: None,
             lazy: false,
             gpu_precision: None,
@@ -436,7 +459,116 @@ impl Config {
     }
 }
 
+/// The canonical key of a confidence profile ([`ModelConfig::device_thresholds`]) for the
+/// device spec `raw`: parsed with [`crate::backend::spec::parse`] and printed in canonical form
+/// (`GPU` -> `openvino:gpu`, `ORT:CoreML` -> `ort:coreml`). `auto` is an error: a profile is
+/// for one device.
+pub fn device_threshold_key(raw: &str) -> Result<String> {
+    use crate::backend::spec::DeviceSpec;
+    match crate::backend::spec::parse(raw)? {
+        DeviceSpec::Auto => anyhow::bail!(
+            "'{}': a confidence profile is for one device, not auto; name the device it was \
+             measured on, e.g. openvino:cpu or ort:coreml",
+            raw.trim()
+        ),
+        DeviceSpec::Device(d) => Ok(d.to_string()),
+    }
+}
+
+/// The concrete device of a spec string with the index filled in (`openvino:gpu` and
+/// `openvino:gpu.0` compare equal); None for `auto` and specs that do not parse.
+fn profile_device(spec: &str) -> Option<crate::backend::spec::Device> {
+    crate::backend::spec::parse(spec)
+        .ok()?
+        .device()
+        .map(|d| d.with_default_index(0))
+}
+
+/// The profile entry of `map` ([`ModelConfig::device_thresholds`]) for `device` (a spec such as
+/// the loaded `DeviceInfo.spec`), with its key: the exact key first, then a key naming the same
+/// device, where no index means index 0 (`openvino:gpu` == `openvino:gpu.0`, `ort:cuda` ==
+/// `ort:cuda:0`) and any spelling `spec::parse` accepts (`GPU`). None when no entry matches or
+/// `device` is `auto` / not a spec.
+pub fn lookup_device_threshold_entry<'a>(
+    map: &'a BTreeMap<String, f32>,
+    device: &str,
+) -> Option<(&'a str, f32)> {
+    if let Some((k, t)) = map.get_key_value(device) {
+        return Some((k.as_str(), *t));
+    }
+    map.iter()
+        .find(|(k, _)| same_device(k, device))
+        .map(|(k, t)| (k.as_str(), *t))
+}
+
+/// Whether two device spec strings name the same concrete device: any spelling
+/// [`crate::backend::spec::parse`] accepts (`GPU` == `openvino:gpu`), no index = index 0
+/// (`openvino:gpu` == `openvino:gpu.0`, `ort:cuda` == `ort:cuda:0`). False when either is
+/// `auto` or does not parse.
+pub fn same_device(a: &str, b: &str) -> bool {
+    match (profile_device(a), profile_device(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The threshold of `map`'s profile for `device` ([`lookup_device_threshold_entry`]).
+pub fn lookup_device_threshold(map: &BTreeMap<String, f32>, device: &str) -> Option<f32> {
+    lookup_device_threshold_entry(map, device).map(|(_, t)| t)
+}
+
+/// Where an effective confidence threshold comes from ([`ModelConfig::threshold_on`]).
+/// Serializes as its [`ThresholdSource::label`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThresholdSource {
+    /// The model's profile for this device (the profile's key, canonical spec).
+    Device(String),
+    /// The model's own `confidence_threshold`.
+    Model,
+    /// The global `confidence_threshold`.
+    Global,
+}
+
+impl ThresholdSource {
+    /// "profile for ort:coreml", "model" or "global".
+    pub fn label(&self) -> String {
+        match self {
+            ThresholdSource::Device(d) => format!("profile for {d}"),
+            ThresholdSource::Model => "model".into(),
+            ThresholdSource::Global => "global".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ThresholdSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label())
+    }
+}
+
+impl Serialize for ThresholdSource {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.label())
+    }
+}
+
 impl ModelConfig {
+    /// The confidence threshold this model uses on `device` (the spec that loaded, e.g.
+    /// `DeviceInfo.spec`; None = not known yet), and where it comes from: the device's profile
+    /// ([`lookup_device_threshold_entry`]), else the model's `confidence_threshold`, else
+    /// `global`.
+    pub fn threshold_on(&self, device: Option<&str>, global: f32) -> (f32, ThresholdSource) {
+        if let Some((k, t)) =
+            device.and_then(|d| lookup_device_threshold_entry(&self.device_thresholds, d))
+        {
+            return (t, ThresholdSource::Device(k.to_string()));
+        }
+        match self.confidence_threshold {
+            Some(t) => (t, ThresholdSource::Model),
+            None => (global, ThresholdSource::Global),
+        }
+    }
+
     pub fn effective_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| {
             self.path
@@ -859,6 +991,7 @@ impl Config {
         self.confidence_threshold = round_threshold(self.confidence_threshold);
         for m in &mut self.models {
             m.confidence_threshold = m.confidence_threshold.map(round_threshold);
+            m.device_thresholds = normalized_profiles(&m.device_thresholds);
         }
     }
 
@@ -1058,6 +1191,31 @@ pub const MAX_SAVE_IMAGE_MB: u64 = 1_000_000;
 /// Accepted range of `benchmark.warmup` and `benchmark.repeat_per_image`.
 pub const MAX_BENCH_ITERATIONS: usize = 1000;
 
+/// `device_thresholds` with values rounded ([`round_threshold`]) and keys canonical
+/// ([`device_threshold_key`]). Keys that do not parse (or are `auto`) are kept as they are, and
+/// when two keys canonicalize to the same one every key is kept as written, so validation can
+/// name them.
+fn normalized_profiles(map: &BTreeMap<String, f32>) -> BTreeMap<String, f32> {
+    let canon: Vec<(String, f32)> = map
+        .iter()
+        .map(|(k, v)| {
+            (
+                device_threshold_key(k).unwrap_or_else(|_| k.clone()),
+                round_threshold(*v),
+            )
+        })
+        .collect();
+    let distinct: std::collections::BTreeSet<&str> =
+        canon.iter().map(|(k, _)| k.as_str()).collect();
+    if distinct.len() == canon.len() {
+        canon.into_iter().collect()
+    } else {
+        map.iter()
+            .map(|(k, v)| (k.clone(), round_threshold(*v)))
+            .collect()
+    }
+}
+
 /// `field` must lie in `lo..=hi`; the error names the key and the range.
 pub fn check_range<T: PartialOrd + std::fmt::Display>(
     field: &str,
@@ -1079,6 +1237,33 @@ pub fn check_threshold(field: &str, t: f32) -> Result<()> {
             "{field}: must be between 0 and 1, got {t}; use a fraction such as 0.5 (not a \
              percentage)"
         );
+    }
+    Ok(())
+}
+
+/// The confidence profiles of model `key`: every key a concrete device spec
+/// ([`device_threshold_key`]), no two keys naming the same device (`GPU` and `openvino:gpu`,
+/// or `openvino:gpu` and `openvino:gpu.0`), every value per [`check_threshold`].
+fn validate_profiles(key: &str, map: &BTreeMap<String, f32>) -> Result<()> {
+    let mut seen: std::collections::HashMap<crate::backend::spec::Device, &str> =
+        std::collections::HashMap::new();
+    for (k, t) in map {
+        let field = format!("models: '{key}' device_thresholds '{k}'");
+        let canon = device_threshold_key(k).map_err(|e| {
+            anyhow::anyhow!(
+                "{field}: {e}; run `blue-onyx-prism list-devices` for the specs this machine \
+                 accepts, or remove the entry"
+            )
+        })?;
+        if let Some(d) = profile_device(&canon)
+            && let Some(prev) = seen.insert(d, k)
+        {
+            anyhow::bail!(
+                "models: '{key}' device_thresholds: '{prev}' and '{k}' name the same device; \
+                 keep one of them"
+            );
+        }
+        check_threshold(&field, *t)?;
     }
     Ok(())
 }
@@ -1111,6 +1296,7 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
         if let Some(t) = m.confidence_threshold {
             check_threshold(&format!("models: '{key}' confidence_threshold"), t)?;
         }
+        validate_profiles(&key, &m.device_thresholds)?;
         if let Some(n) = m.inflight {
             check_range(
                 &format!("models: '{key}' inflight"),
@@ -3017,6 +3203,179 @@ mod tests {
         assert!(
             e.contains("models: 'm' static_suppression.window_minutes"),
             "{e}"
+        );
+    }
+
+    fn profiled(map: &[(&str, f32)]) -> Config {
+        let mut c = Config {
+            models: vec![ModelConfig {
+                name: Some("m".into()),
+                path: "models/m.onnx".into(),
+                device_thresholds: map.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        c.normalize();
+        c
+    }
+
+    #[test]
+    fn device_thresholds_round_trip_and_skip_when_empty() {
+        let c = profiled(&[]);
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(!text.contains("device_thresholds"), "{text}");
+        // An old file without the key loads with an empty map.
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert!(back.models[0].device_thresholds.is_empty());
+
+        let c = profiled(&[("ort:coreml", 0.299_999), ("openvino:cpu", 0.344)]);
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(
+            text.contains(r#""device_thresholds":{"openvino:cpu":0.34,"ort:coreml":0.3}"#),
+            "{text}"
+        );
+        let mut back: Config = serde_json::from_str(&text).unwrap();
+        back.normalize();
+        assert_eq!(back, c);
+        assert!(back.validate().is_ok());
+    }
+
+    #[test]
+    fn device_threshold_keys_are_canonical() {
+        for (raw, want) in [
+            ("GPU", "openvino:gpu"),
+            ("gpu.1", "openvino:gpu.1"),
+            (" ORT:CoreML ", "ort:coreml"),
+            ("ort:cuda:0", "ort:cuda:0"),
+            ("CPU", "openvino:cpu"),
+        ] {
+            assert_eq!(device_threshold_key(raw).unwrap(), want, "{raw}");
+        }
+        let e = format!("{:#}", device_threshold_key("auto").unwrap_err());
+        assert!(e.contains("one device"), "{e}");
+        assert!(device_threshold_key("nonsense").is_err());
+        assert!(device_threshold_key("ort:coreml:1").is_err());
+
+        // normalize canonicalizes keys and rounds values; bad keys stay for validation.
+        let c = profiled(&[("GPU", 0.333), ("auto", 0.5), ("bogus", 0.4)]);
+        let keys: Vec<&String> = c.models[0].device_thresholds.keys().collect();
+        assert_eq!(keys, ["auto", "bogus", "openvino:gpu"]);
+        assert_eq!(c.models[0].device_thresholds["openvino:gpu"], 0.33);
+        // Two spellings of one device: both kept as written, validation names them.
+        let c = profiled(&[("GPU", 0.3), ("openvino:gpu", 0.4)]);
+        let keys: Vec<&String> = c.models[0].device_thresholds.keys().collect();
+        assert_eq!(keys, ["GPU", "openvino:gpu"]);
+    }
+
+    #[test]
+    fn device_thresholds_validation() {
+        let err = |map: &[(&str, f32)]| format!("{:#}", profiled(map).validate().unwrap_err());
+        let e = err(&[("auto", 0.3)]);
+        assert!(
+            e.contains("models: 'm' device_thresholds 'auto'") && e.contains("one device"),
+            "{e}"
+        );
+        let e = err(&[("nonsense", 0.3)]);
+        assert!(e.contains("device_thresholds 'nonsense'"), "{e}");
+        let e = err(&[("GPU", 0.3), ("openvino:gpu", 0.4)]);
+        assert!(e.contains("name the same device"), "{e}");
+        let e = err(&[("openvino:gpu", 0.3), ("openvino:gpu.0", 0.4)]);
+        assert!(e.contains("name the same device"), "{e}");
+        let e = err(&[("ort:cpu", 1.5)]);
+        assert!(
+            e.contains("device_thresholds 'ort:cpu': must be between 0 and 1"),
+            "{e}"
+        );
+        assert!(profiled(&[("ort:cpu", f32::NAN)]).validate().is_err());
+        assert!(profiled(&[("ort:cpu", -0.1)]).validate().is_err());
+        // Distinct indices are distinct devices; 0 and 1 are in range.
+        let ok = profiled(&[
+            ("openvino:gpu", 0.0),
+            ("openvino:gpu.1", 1.0),
+            ("ort:cuda", 0.4),
+        ]);
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn threshold_on_prefers_profile_then_model_then_global() {
+        let mut m = profiled(&[
+            ("ort:coreml", 0.3),
+            ("openvino:gpu", 0.25),
+            ("ort:cuda:1", 0.2),
+        ])
+        .models
+        .remove(0);
+        let src = |s: &str| ThresholdSource::Device(s.into());
+        assert_eq!(
+            m.threshold_on(Some("ort:coreml"), 0.5),
+            (0.3, src("ort:coreml"))
+        );
+        // No model value: the global one.
+        assert_eq!(
+            m.threshold_on(Some("openvino:cpu"), 0.5),
+            (0.5, ThresholdSource::Global)
+        );
+        assert_eq!(m.threshold_on(None, 0.5), (0.5, ThresholdSource::Global));
+        assert_eq!(
+            m.threshold_on(Some("auto"), 0.5),
+            (0.5, ThresholdSource::Global)
+        );
+        m.confidence_threshold = Some(0.38);
+        assert_eq!(
+            m.threshold_on(Some("openvino:cpu"), 0.5),
+            (0.38, ThresholdSource::Model)
+        );
+        assert_eq!(m.threshold_on(None, 0.5), (0.38, ThresholdSource::Model));
+        // gpu == gpu.0, any spelling; gpu.1 is another device.
+        for d in ["openvino:gpu", "openvino:gpu.0", "GPU", "GPU.0"] {
+            assert_eq!(
+                m.threshold_on(Some(d), 0.5),
+                (0.25, src("openvino:gpu")),
+                "{d}"
+            );
+        }
+        assert_eq!(
+            m.threshold_on(Some("openvino:gpu.1"), 0.5).1,
+            ThresholdSource::Model
+        );
+        // ort:cuda:1 only matches index 1; ort:cuda (index 0) does not.
+        assert_eq!(m.threshold_on(Some("ort:cuda:1"), 0.5).0, 0.2);
+        assert_eq!(
+            m.threshold_on(Some("ort:cuda"), 0.5).1,
+            ThresholdSource::Model
+        );
+        assert_eq!(
+            lookup_device_threshold(&m.device_thresholds, "ort:coreml"),
+            Some(0.3)
+        );
+        assert_eq!(
+            lookup_device_threshold(&m.device_thresholds, "ort:cpu"),
+            None
+        );
+        // An exact key wins over a tolerant match.
+        let map: BTreeMap<String, f32> = [
+            ("openvino:gpu".to_string(), 0.1),
+            ("openvino:gpu.0".to_string(), 0.2),
+        ]
+        .into();
+        assert_eq!(lookup_device_threshold(&map, "openvino:gpu.0"), Some(0.2));
+        assert_eq!(lookup_device_threshold(&map, "openvino:gpu"), Some(0.1));
+    }
+
+    #[test]
+    fn threshold_source_labels_and_serializes() {
+        let d = ThresholdSource::Device("ort:coreml".into());
+        assert_eq!(d.label(), "profile for ort:coreml");
+        assert_eq!(ThresholdSource::Model.to_string(), "model");
+        assert_eq!(
+            serde_json::to_string(&ThresholdSource::Global).unwrap(),
+            r#""global""#
+        );
+        assert_eq!(
+            serde_json::to_string(&d).unwrap(),
+            r#""profile for ort:coreml""#
         );
     }
 }

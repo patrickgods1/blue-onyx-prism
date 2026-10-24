@@ -155,6 +155,7 @@ fn display_names(maps: &[&Fields]) -> BTreeMap<String, String> {
 fn field_label(field: &str) -> String {
     match field {
         "confidence_threshold" => "threshold".into(),
+        "device_thresholds" => "confidence per device".into(),
         "enabled" => "load".into(),
         "gpu_precision" => "GPU precision".into(),
         "object_filter" => "object filter".into(),
@@ -236,6 +237,20 @@ pub fn label(key: &str, names: &BTreeMap<String, String>) -> String {
 /// Display text of a value of `key` (None = absent).
 pub fn value_text(key: &str, v: Option<&Value>) -> String {
     let (field, presence) = match parse_key(key) {
+        // Confidence profiles: "ort:coreml 0.3, openvino:cpu 0.34"; none = the model default.
+        Key::Model {
+            field: "device_thresholds",
+            ..
+        } => {
+            return match v.and_then(Value::as_object).filter(|o| !o.is_empty()) {
+                Some(o) => o
+                    .iter()
+                    .map(|(d, t)| format!("{d} {}", value_text("", Some(t))))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => "none".into(),
+            };
+        }
         // A per-model rule that is absent follows the global value.
         Key::Model { field, .. } if v.is_none() && NIGHT_MODEL_FIELDS.contains(&field) => {
             return "global".into();
@@ -301,6 +316,7 @@ pub fn describe_changes(old: &Config, new: &Config) -> (Vec<FieldChange>, String
             "enabled",
             "device",
             "confidence_threshold",
+            "device_thresholds",
         ]
         .iter()
         .position(|x| *x == f)
@@ -429,6 +445,7 @@ pub fn live_global(k: &str) -> bool {
 /// Model fields applied live (the worker reads them per request).
 pub const LIVE_MODEL_FIELDS: &[&str] = &[
     "confidence_threshold",
+    "device_thresholds",
     "object_filter",
     "night_model",
     "night_confidence_threshold",
@@ -804,6 +821,39 @@ mod tests {
         assert!(model_reloads(&running, &back).is_empty());
     }
 
+    #[test]
+    fn device_thresholds_apply_live() {
+        let running = cfg();
+        let mut next = running.clone();
+        next.models[0].device_thresholds =
+            BTreeMap::from([("ort:coreml".into(), 0.3), ("openvino:cpu".into(), 0.34)]);
+        next.normalize();
+        // No reload, nothing pending, listed as applied live.
+        assert!(model_reloads(&running, &next).is_empty());
+        assert!(!pending(&running, &next).restart_needed());
+        let (changes, summary) = describe_changes(&running, &next);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(
+            changes[0].label,
+            "IPcam-general \u{b7} confidence per device"
+        );
+        assert_eq!(changes[0].from, "none");
+        assert_eq!(changes[0].to, "openvino:cpu 0.34, ort:coreml 0.3");
+        assert_eq!(
+            summary,
+            "IPcam-general confidence per device \u{2192} openvino:cpu 0.34, ort:coreml 0.3"
+        );
+        assert_eq!(
+            applied_live(&changes),
+            ["IPcam-general \u{b7} confidence per device"]
+        );
+        // Removing every profile is live too.
+        assert!(model_reloads(&next, &running).is_empty());
+        assert!(!pending(&next, &running).restart_needed());
+        let (changes, _) = describe_changes(&next, &running);
+        assert_eq!(changes[0].to, "none");
+    }
+
     type Edit = Box<dyn Fn(&mut Config)>;
 
     /// Phase 3 classification: live globals and per-model live fields are never pending;
@@ -828,6 +878,11 @@ mod tests {
             Box::new(|c| c.benchmark.repeat_per_image = 7),
             Box::new(|c| c.models[0].confidence_threshold = Some(0.2)),
             Box::new(|c| c.models[1].object_filter = Some(vec!["car".into()])),
+            Box::new(|c| {
+                c.models[0]
+                    .device_thresholds
+                    .insert("ort:coreml".into(), 0.3);
+            }),
         ];
         for (i, edit) in live.iter().enumerate() {
             let mut c = running.clone();

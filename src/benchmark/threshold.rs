@@ -831,11 +831,43 @@ impl ThresholdAdvice {
     /// finds objects (an unreachable precision target or a model that finds nothing changes
     /// nothing).
     pub fn apply_value(&self) -> Option<f32> {
-        self.best
-            .as_ref()
-            .filter(|b| b.met && b.point.counts.tp > 0)
-            .map(|b| b.threshold)
+        applicable(self.best.as_ref())
     }
+
+    /// The threshold to write into `device`'s confidence profile
+    /// ([`crate::config::ModelConfig::device_thresholds`]): that device's best
+    /// ([`ThresholdAdvice::by_device`]) under the rule of [`ThresholdAdvice::apply_value`].
+    /// `device` matches a row exactly, else as the same device ([`crate::config::same_device`]). None when the device did not run or its pick does not
+    /// apply.
+    pub fn apply_value_on(&self, device: &str) -> Option<f32> {
+        let pick = self
+            .by_device
+            .iter()
+            .find(|p| p.device == device)
+            .or_else(|| {
+                self.by_device
+                    .iter()
+                    .find(|p| crate::config::same_device(&p.device, device))
+            })?;
+        applicable(pick.best.as_ref())
+    }
+
+    /// `(device, threshold)` for every device row whose pick applies
+    /// ([`ThresholdAdvice::apply_value_on`]), in [`ThresholdAdvice::by_device`] order: the
+    /// profiles an "apply all" writes.
+    pub fn device_apply_values(&self) -> Vec<(String, f32)> {
+        self.by_device
+            .iter()
+            .filter_map(|p| Some((p.device.clone(), applicable(p.best.as_ref())?)))
+            .collect()
+    }
+}
+
+/// A pick's threshold when it may be written into the config: the objective was met and the
+/// model finds objects there.
+fn applicable(pick: Option<&Pick>) -> Option<f32> {
+    pick.filter(|b| b.met && b.point.counts.tp > 0)
+        .map(|b| b.threshold)
 }
 
 /// The sweep of a device row, when it ran and was scored.
@@ -1571,5 +1603,70 @@ mod tests {
         // Precision 1: highest recall is keeping {.92, .81} (R .5): (0.63, 0.81] -> 0.72.
         let p = exact_pick(&bp, Objective::Precision(1.0)).unwrap();
         assert_eq!((p.threshold, p.point.recall), (0.72, Some(0.5)));
+    }
+
+    #[test]
+    fn device_apply_values_keep_the_apply_rule() {
+        let base = test_advice(0.3);
+        let pick = |t: f32, met: bool, tp: usize| {
+            let mut p = base.best.clone().unwrap();
+            p.threshold = t;
+            p.met = met;
+            p.point.counts.tp = tp;
+            Some(p)
+        };
+        let mut a = base.clone();
+        a.by_device = vec![
+            DevicePick {
+                device: "ort:coreml".into(),
+                best: pick(0.3, true, 3),
+            },
+            DevicePick {
+                device: "openvino:cpu".into(),
+                best: pick(0.34, true, 3),
+            },
+            // Target not met: not applied.
+            DevicePick {
+                device: "openvino:gpu".into(),
+                best: pick(0.5, false, 3),
+            },
+            // Finds nothing: not applied.
+            DevicePick {
+                device: "ort:cuda:0".into(),
+                best: pick(0.6, true, 0),
+            },
+            DevicePick {
+                device: "ort:cpu".into(),
+                best: None,
+            },
+        ];
+        assert_eq!(a.apply_value_on("ort:coreml"), Some(0.3));
+        assert_eq!(a.apply_value_on("openvino:cpu"), Some(0.34));
+        assert_eq!(
+            a.apply_value_on("CPU"),
+            Some(0.34),
+            "same device, other spelling"
+        );
+        assert_eq!(a.apply_value_on("openvino:gpu"), None);
+        assert_eq!(a.apply_value_on("openvino:gpu.0"), None);
+        assert_eq!(a.apply_value_on("ort:cuda"), None);
+        assert_eq!(a.apply_value_on("ort:cpu"), None);
+        assert_eq!(a.apply_value_on("ort:directml"), None, "did not run");
+        assert_eq!(
+            a.device_apply_values(),
+            [
+                ("ort:coreml".to_string(), 0.3),
+                ("openvino:cpu".to_string(), 0.34)
+            ]
+        );
+        // The overall pick is independent of the device rows.
+        assert_eq!(a.apply_value(), Some(0.3));
+        a.by_device[1].best = pick(0.34, true, 3);
+        a.by_device.push(DevicePick {
+            device: "openvino:gpu.1".into(),
+            best: pick(0.41, true, 2),
+        });
+        assert_eq!(a.apply_value_on("openvino:gpu.1"), Some(0.41));
+        assert_eq!(a.device_apply_values().len(), 3);
     }
 }

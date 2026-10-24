@@ -485,6 +485,116 @@ pub fn apply_model_thresholds(
     Ok(changes)
 }
 
+/// A confidence profile change ([`crate::config::ModelConfig::device_thresholds`]) made by
+/// [`apply_device_thresholds`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProfileChange {
+    pub model: String,
+    /// Canonical device spec ([`crate::config::device_threshold_key`]).
+    pub device: String,
+    /// Previous profile value (None = no profile: the device used the model's default).
+    #[serde(serialize_with = "thr::ser_opt")]
+    pub from: Option<f32>,
+    /// New profile value (None = removed).
+    #[serde(serialize_with = "thr::ser_opt")]
+    pub to: Option<f32>,
+}
+
+impl ProfileChange {
+    /// "rfdetr-nano on ort:coreml: 0.38 -> 0.30", "... : none -> 0.34" (new),
+    /// "... : 0.30 -> none" (removed).
+    pub fn describe(&self) -> String {
+        let show = |t: Option<f32>| t.map_or_else(|| "none".to_string(), |t| format!("{t:.2}"));
+        format!(
+            "{} on {}: {} -> {}",
+            self.model,
+            self.device,
+            show(self.from),
+            show(self.to)
+        )
+    }
+}
+
+/// Set or remove confidence profiles: each entry is `(model, device, value)`, the model matched
+/// like `/v1/vision/custom/{model}`, the device any spec naming one device (stored under its
+/// canonical key, [`crate::config::device_threshold_key`]; an existing entry for the same device
+/// under another spelling, e.g. `openvino:gpu.0` for `openvino:gpu`, is replaced), and `None`
+/// removing the profile. Values must pass [`check_threshold`] and not round to 0. Every entry
+/// is validated first; on error `config` is unchanged. A later entry for the same model and
+/// device wins. Returns the profiles that actually changed, in first-touched order; the model's
+/// `confidence_threshold` is never changed.
+pub fn apply_device_thresholds(
+    config: &mut Config,
+    entries: &[(String, String, Option<f32>)],
+) -> Result<Vec<ProfileChange>> {
+    use crate::config::{device_threshold_key, lookup_device_threshold, same_device};
+    use crate::registry::normalize_name;
+    let mut c = config.clone();
+    // (model index, canonical device) in first-touched order.
+    let mut touched: Vec<(usize, String)> = Vec::new();
+    for (name, device, value) in entries {
+        let key = device_threshold_key(device)
+            .map_err(|e| anyhow::anyhow!("model '{name}' confidence profile: {e}"))?;
+        let value = match value {
+            Some(t) => {
+                check_threshold(&format!("model '{name}': confidence profile for {key}"), *t)?;
+                let t = round_threshold(*t);
+                if t <= 0.0 {
+                    anyhow::bail!("model '{name}': confidence profile for {key} rounds to 0");
+                }
+                Some(t)
+            }
+            None => None,
+        };
+        let wanted = normalize_name(name);
+        let Some((i, m)) = c
+            .models
+            .iter_mut()
+            .enumerate()
+            .find(|(_, m)| normalize_name(&m.effective_name()) == wanted)
+        else {
+            anyhow::bail!("'{name}' is not one of the configured models");
+        };
+        let map = &mut m.device_thresholds;
+        if same_value(lookup_device_threshold(map, &key), value) {
+            continue;
+        }
+        map.retain(|k, _| !(k == &key || same_device(k, &key)));
+        if let Some(t) = value {
+            map.insert(key.clone(), t);
+        }
+        if !touched.iter().any(|(j, k)| *j == i && *k == key) {
+            touched.push((i, key));
+        }
+    }
+    // Models are only edited, never added or removed, so `i` indexes both configs.
+    let changes = touched
+        .into_iter()
+        .filter_map(|(i, key)| {
+            let (old, new) = (config.models.get(i)?, c.models.get(i)?);
+            let from = lookup_device_threshold(&old.device_thresholds, &key);
+            let to = new.device_thresholds.get(&key).copied();
+            (!same_value(from, to)).then(|| ProfileChange {
+                model: new.effective_name(),
+                device: key,
+                from,
+                to,
+            })
+        })
+        .collect();
+    *config = c;
+    Ok(changes)
+}
+
+/// Two optional thresholds are equal (within `f32` noise).
+fn same_value(a: Option<f32>, b: Option<f32>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() <= 1e-6,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +653,92 @@ mod tests {
         // The value round-trips through the config file as written.
         let text = serde_json::to_string(&c).unwrap();
         assert!(text.contains(r#""confidence_threshold":0.35"#), "{text}");
+    }
+
+    #[test]
+    fn device_thresholds_set_remove_skip_and_stay_atomic() {
+        let mut c = three_models();
+        c.fill_model_names();
+        c.models[1].confidence_threshold = Some(0.38);
+        c.models[1]
+            .device_thresholds
+            .insert("ort:coreml".into(), 0.38);
+        let e = |m: &str, d: &str, t: Option<f32>| (m.to_string(), d.to_string(), t);
+        let changes = apply_device_thresholds(
+            &mut c,
+            &[
+                e("B", "ort:coreml", Some(0.30)),
+                e("b", "CPU", Some(0.344)),
+                // No profile to remove, and an unchanged value: skipped.
+                e("a", "ort:cpu", None),
+                e("c", "ort:cpu", None),
+            ],
+        )
+        .unwrap();
+        let text: Vec<String> = changes.iter().map(ProfileChange::describe).collect();
+        assert_eq!(
+            text,
+            [
+                "b on ort:coreml: 0.38 -> 0.30",
+                "b on openvino:cpu: none -> 0.34"
+            ]
+        );
+        let p = &c.models[1].device_thresholds;
+        assert_eq!(p.get("ort:coreml"), Some(&0.3));
+        assert_eq!(p.get("openvino:cpu"), Some(&0.34));
+        // The model default is left alone.
+        assert_eq!(c.models[1].confidence_threshold, Some(0.38));
+        assert!(c.models[0].device_thresholds.is_empty());
+        let json = serde_json::to_value(&changes[1]).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"model": "b", "device": "openvino:cpu", "from": null, "to": 0.34})
+        );
+
+        // The same value again: no change. Removing: from -> none.
+        assert!(
+            apply_device_thresholds(&mut c, &[e("b", "ort:coreml", Some(0.3))])
+                .unwrap()
+                .is_empty()
+        );
+        let changes = apply_device_thresholds(&mut c, &[e("b", "ort:coreml", None)]).unwrap();
+        assert_eq!(changes[0].describe(), "b on ort:coreml: 0.30 -> none");
+        assert!(!c.models[1].device_thresholds.contains_key("ort:coreml"));
+
+        // Another spelling of a saved device replaces that entry (gpu.0 == gpu).
+        c.models[2]
+            .device_thresholds
+            .insert("openvino:gpu.0".into(), 0.2);
+        let changes = apply_device_thresholds(&mut c, &[e("c", "GPU", Some(0.25))]).unwrap();
+        assert_eq!(changes[0].describe(), "c on openvino:gpu: 0.20 -> 0.25");
+        let keys: Vec<&String> = c.models[2].device_thresholds.keys().collect();
+        assert_eq!(keys, ["openvino:gpu"]);
+        // A later entry for the same device wins; set and back is no change.
+        let changes = apply_device_thresholds(
+            &mut c,
+            &[e("c", "openvino:gpu", Some(0.4)), e("c", "GPU", Some(0.25))],
+        )
+        .unwrap();
+        assert!(changes.is_empty(), "{changes:?}");
+        assert!(c.validate().is_ok());
+
+        // Bad input changes nothing.
+        let before = c.clone();
+        for bad in [
+            e("zzz", "ort:cpu", Some(0.3)),
+            e("a", "auto", Some(0.3)),
+            e("a", "nonsense", Some(0.3)),
+            e("a", "ort:cpu", Some(0.0)),
+            e("a", "ort:cpu", Some(0.004)),
+            e("a", "ort:cpu", Some(1.5)),
+            e("a", "ort:cpu", Some(f32::NAN)),
+        ] {
+            let r = apply_device_thresholds(&mut c, &[e("a", "ort:cpu", Some(0.3)), bad.clone()]);
+            assert!(r.is_err(), "{bad:?}");
+            assert_eq!(c, before, "{bad:?}");
+        }
+        let err = apply_device_thresholds(&mut c, &[e("a", "auto", Some(0.3))]).unwrap_err();
+        assert!(format!("{err:#}").contains("one device"), "{err:#}");
     }
 
     #[test]

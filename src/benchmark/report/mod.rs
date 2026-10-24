@@ -1081,6 +1081,21 @@ impl BenchmarkResults {
             .collect()
     }
 
+    /// `(model, device, best confidence threshold)` for every device that ran of every model
+    /// with threshold advice ([`ThresholdAdvice::device_apply_values`]: devices whose pick does
+    /// not apply are left out), optionally limited to `only` (normalized names). Models in
+    /// result order, devices in each model's [`ThresholdAdvice::by_device`] order. These are
+    /// the confidence profiles an "apply all" writes
+    /// ([`crate::config_form::apply_device_thresholds`]).
+    pub fn device_thresholds(&self, only: Option<&[String]>) -> Vec<(String, String, f32)> {
+        self.models
+            .iter()
+            .filter(|m| wanted(only, &m.model))
+            .filter_map(|m| Some((m, m.threshold.as_ref()?.device_apply_values())))
+            .flat_map(|(m, v)| v.into_iter().map(|(d, t)| (m.model.clone(), d, t)))
+            .collect()
+    }
+
     /// `(model, recommended device)` of every model with a recommendation, optionally limited
     /// to `only` (normalized names).
     pub fn recommendations(&self, only: Option<&[String]>) -> Vec<(String, String)> {
@@ -1562,6 +1577,30 @@ mod tests {
         let r = BenchmarkResults::new(Default::default(), Default::default(), vec![m.clone()]);
         assert_eq!(r.thresholds(None), [("m".to_string(), 0.27)]);
         assert!(r.thresholds(Some(&["other".into()])).is_empty());
+        // Per device: every scored device row whose pick applies.
+        let per_device = r.device_thresholds(None);
+        let by_device = &m.threshold.as_ref().unwrap().by_device;
+        assert!(!per_device.is_empty());
+        assert_eq!(
+            per_device.len(),
+            by_device
+                .iter()
+                .filter(|p| p
+                    .best
+                    .as_ref()
+                    .is_some_and(|b| b.met && b.point.counts.tp > 0))
+                .count()
+        );
+        for (model, device, t) in &per_device {
+            assert_eq!(model, "m");
+            assert_eq!(
+                Some(*t),
+                m.threshold.as_ref().unwrap().apply_value_on(device),
+                "{device}"
+            );
+        }
+        assert_eq!(r.device_thresholds(Some(&["M".into()])), per_device);
+        assert!(r.device_thresholds(Some(&["other".into()])).is_empty());
 
         // Another objective: F2 favors the lower threshold that finds everything.
         let mut m2 = m.clone();
