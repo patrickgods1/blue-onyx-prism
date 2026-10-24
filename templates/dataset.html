@@ -28,7 +28,7 @@
   <form method="post" action="/dataset/settings">
     <label class="check"><input type="checkbox" name="enabled"{% if enabled %} checked{% endif %}> Collect frames</label>
     <div class="scroll">
-    <table>
+    <table class="buckets">
       <thead><tr><th>Bucket</th><th>Saved when</th><th>On</th><th>Rate (0..1)</th><th>Min interval per camera (s)</th><th>Saved</th></tr></thead>
       <tbody>
       {% for b in buckets %}
@@ -44,14 +44,14 @@
       </tbody>
     </table>
     </div>
-    <div class="facts">
+    <div class="fields">
       <label>Near-threshold margin <input type="number" name="near_threshold.margin" min="0.01" max="0.5" step="0.01" value="{{ near_margin }}"></label>
       <label>Max size (GB) <input type="number" name="max_gb" min="0.1" step="0.1" value="{{ max_gb }}"></label>
       <label>Max age (days, 0 = keep) <input type="number" name="max_age_days" min="0" step="1" value="{{ max_age_days }}"></label>
       <label>Dedup distance (dHash bits) <input type="number" name="dedup_hamming" min="0" max="32" step="1" value="{{ dedup_hamming }}"></label>
-      <label>Folder (empty = <code>dataset</code> under the data folder) <span class="with-browse"><input type="text" name="dir" value="{{ dir_setting }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" hidden>Browse&hellip;</button></span></label>
+      <label class="wide">Folder <span class="with-browse"><input type="text" name="dir" value="{{ dir_setting }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" hidden>Browse&hellip;</button></span><span class="muted small">Empty = <span class="nowrap"><code>dataset</code></span> under the data folder.</span></label>
     </div>
-    <button type="submit">Save</button>
+    <div class="actions"><button type="submit">Save</button></div>
   </form>
 </div>
 

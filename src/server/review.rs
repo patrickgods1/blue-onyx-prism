@@ -804,6 +804,12 @@ mod tests {
             "nav"
         );
         assert!(page.contains("/static/review.js"));
+        // Browse... on the export folder and the X-AnyLabeling folder (native picker, else the
+        // in-page browser of this dialog).
+        assert!(page.contains("data-browse=\"folder\" data-target=\"out_dir\""));
+        assert!(page.contains("data-browse=\"folder\" data-target=\"dir\""));
+        assert!(page.contains("<dialog id=\"browse-dialog\">"));
+        assert!(page.contains("/static/browse.js?v="));
         assert!(page.contains("raccoon"));
         assert!(
             page.contains("<select name=\"label\" id=\"rv-label\">"),

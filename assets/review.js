@@ -436,7 +436,7 @@
     bs.forEach(function (b, i) { if (isReview(b)) order.push(i); });
     bs.forEach(function (b, i) { if (!isReview(b)) order.push(i); });
     order.forEach(function (i) { boxList.appendChild(boxItem(bs[i], i)); });
-    if (!bs.length) boxList.appendChild(el('li', 'muted', cur ? 'No box. Drag on the image to draw one.' : ''));
+    if (!bs.length && cur) boxList.appendChild(el('li', 'muted', 'No box. Drag on the image to draw one.'));
     emptyBox.checked = !!(cur && cur.labels.empty_confirmed);
   }
 

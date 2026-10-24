@@ -107,6 +107,12 @@ fn action_outcome(
             "resources"
         };
         t.at_row = id.to_string();
+        // The answer is in that row: its group opens.
+        for g in &mut t.resource_groups {
+            if g.rows.iter().any(|r| r.id == id) {
+                g.open = true;
+            }
+        }
         return render(&t);
     }
     match result {
@@ -580,7 +586,8 @@ mod tests {
 
         let (_, html) = get_text(&state, "/config").await;
         assert!(html.contains("value=\"local:mynet.onnx\""), "{html}");
-        assert!(html.contains("<h3 id=\"res-runtimes\">Runtimes</h3>"));
+        assert!(html.contains("id=\"res-runtimes\""));
+        assert!(html.contains("<summary><h3>Runtimes <span class=\"muted small res-count\">"));
 
         let (s, b) = post_action(
             &state,
@@ -1025,6 +1032,15 @@ mod tests {
         // The page renders the Export button with the AGPL confirm.
         let (_, html) = get_text(&state, "/config").await;
         assert!(html.contains("action=\"/v1/resources/export#resource-model:yolo26n\""));
+        // One "add to the config" box for the export group (copied into each form on submit;
+        // without JS each form adds), the toolchain cost stated once in the group.
+        assert!(
+            html.contains("id=\"export-add-to-config\" checked"),
+            "{html}"
+        );
+        assert!(html.contains("name=\"add_to_config\" value=\"1\" class=\"export-add\""));
+        assert!(!html.contains("and add to config"));
+        assert!(!html.contains("weights + export toolchain once"));
         assert!(
             html.contains("data-confirm=\"Export YOLO26 nano?"),
             "{html}"

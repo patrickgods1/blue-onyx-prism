@@ -1,12 +1,11 @@
-// Blue Onyx Prism: the Browse... buttons of the Training page's footage import (data-browse=video
-// or folder) and the Dataset page's folder field (folder). A button
-// `button.browse[data-browse][data-target]` fills the input named by data-target of its form.
+// Blue Onyx Prism: every page's Browse... buttons (Config, Training, Dataset, Review, Benchmark).
+// A button `button.browse[data-browse][data-target]` (kinds video, folder, model, classes; optional
+// data-title) fills the input named by data-target of its form.
 // Native first: when GET /v1/fs/pick says a desktop is reachable (this browser is on the server's
 // machine and the service can show a dialog), a click POSTs /v1/fs/pick and the OS file/folder
 // dialog opens on the server's screen. Without one (or when that answers 409 / fails), the
 // in-page server-side browser opens instead (GET /v1/fs/browse, the <dialog id="browse-dialog">
-// of the page; same dialog as the Config page's). Served from /static/ (no inline scripts under
-// the CSP).
+// of the page). Served from /static/ (no inline scripts under the CSP).
 (function () {
   "use strict";
   if (!window.fetch) return;
@@ -79,7 +78,7 @@
     if (!inPage) return;
     kind = TITLES[b.dataset.browse] ? b.dataset.browse : "video";
     target = t;
-    title.textContent = TITLES[kind];
+    title.textContent = b.dataset.title || TITLES[kind];
     list.textContent = ""; msg.textContent = "Loading…";
     dlg.showModal();
     go(target.value.trim(), "");
