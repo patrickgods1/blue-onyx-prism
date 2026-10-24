@@ -1165,6 +1165,39 @@ mod tests {
         assert_eq!(b.object_filter, ["person"]);
         // Idempotent.
         assert_eq!(reg.apply_live(&c), LiveApplied::default());
+        // A device profile is live too: swapped in, no reload.
+        c.models[0]
+            .device_thresholds
+            .insert("openvino:gpu".into(), 0.25);
+        let applied = reg.apply_live(&c);
+        assert_eq!(applied.models, ["a"]);
+        assert!(!applied.default_changed);
+        assert_eq!(reg.reloads("a"), 0);
+        let a = reg.by_name("a").unwrap();
+        assert_eq!(a.live().confidence_threshold, 0.3);
+        assert_eq!(
+            a.live().threshold_for("openvino:gpu.0"),
+            (
+                0.25,
+                crate::config::ThresholdSource::Device("openvino:gpu".into())
+            )
+        );
+        // Not loaded: the fallback.
+        assert_eq!(
+            a.effective_threshold(),
+            (0.3, crate::config::ThresholdSource::Global)
+        );
+        *a.device.write().unwrap() = Some(crate::backend::DeviceInfo {
+            spec: "openvino:gpu".into(),
+            ..Default::default()
+        });
+        assert_eq!(a.effective_threshold().0, 0.25);
+        c.models[0]
+            .device_thresholds
+            .insert("openvino:gpu".into(), 0.2);
+        assert_eq!(reg.apply_live(&c).models, ["a"]);
+        assert_eq!(a.effective_threshold().0, 0.2);
+        assert_eq!(reg.apply_live(&c), LiveApplied::default());
         // A default that is not served falls back to the first served model.
         c.default_model = Some("off".into());
         assert!(reg.apply_live(&c).default_changed);

@@ -37,7 +37,8 @@
     thr: function (v) { return has(v) ? v.toFixed(2) : "-"; },
     // "42% in Blue Iris": Blue Iris takes whole percents (thresholds are rounded down to 0.01).
     bi: function (v) { return has(v) ? Math.round(v * 100) + "% in Blue Iris" : ""; },
-    thrBi: function (v) { return has(v) ? v.toFixed(2) + " = " + Math.round(v * 100) + "% in Blue Iris" : "-"; },
+    // One confidence format everywhere: "0.30" (the "= 30% in Blue Iris" goes in a tooltip, see conf()).
+    thrBi: function (v) { return has(v) ? v.toFixed(2) : "-"; },
     // A difference of two fractions in percentage points: "+3.1 points".
     points: function (d, dp) { return has(d) ? (d > 0 ? "+" : d < 0 ? "−" : "±") + Math.abs(d * 100).toFixed(dp === undefined ? 1 : dp) + " points" : "-"; },
     signedMs: function (d) { return has(d) ? (d > 0 ? "+" : d < 0 ? "−" : "±") + Math.abs(d).toFixed(1) + " ms" : "-"; },
@@ -49,6 +50,13 @@
     duration: function (s) { if (!has(s)) return "-"; s = Math.max(1, Math.round(s)); if (s < 90) return s + " s"; var m = Math.round(s / 60); if (m < 90) return m + " min"; return (m / 60).toFixed(1) + " h"; }
   };
 
+  // A confidence as "0.30" with the tooltip "= 30% in Blue Iris" ("-" when absent).
+  function conf(v, cls) {
+    var s = el("span", "conf" + (cls ? " " + cls : ""), fmt.thr(v));
+    if (has(v)) s.title = "= " + Math.round(v * 100) + "% in Blue Iris";
+    return s;
+  }
+
   // ---- noise constants (from status.noise; defaults match the Rust constants) -------------------
   var noise = {speed_rel: 0.05, speed_abs_ms: 0.5, se_factor: 2, plateau_points: 0.2, trust_low_objects: 100, trust_medium_objects: 300};
   function setNoise(n) { if (n && typeof n === "object") Object.keys(noise).forEach(function (k) { if (typeof n[k] === "number") noise[k] = n[k]; }); }
@@ -57,6 +65,12 @@
   // name: plain words shown in headers; term: the expert term; meaning: one line; better:
   // "higher" | "lower" | null. Meanings may be functions (they quote the noise constants).
   var GLOSSARY = {
+    // Plain words of the Profiles and Apply steps.
+    finds: {name: "Finds", term: "recall", better: "higher", meaning: "Share of the real objects in the images that the model found, at the best confidence. 70% means it missed 3 in 10."},
+    correct: {name: "Correct", term: "precision", better: "higher", meaning: "Share of the model's detections that were a real object, at the best confidence. 90% means 9 in 10 detections were right."},
+    speed: {name: "Speed", term: "time per image", better: "lower", meaning: "The typical time for one image on this device, the whole request: decode, resize, detection and clean-up."},
+    best_conf: {name: "Best confidence", term: "best confidence threshold", better: null, meaning: "The confidence that suits your goal best on this device. Detections below it are dropped. 0.30 means 30% in Blue Iris."},
+    profile: {name: "Profile", term: "per-device confidence", better: null, meaning: "The confidence saved for one model on one device. The model uses the profile of the device it actually runs on (also with auto or after a fallback); devices without one use the model's default."},
     precision: {name: "Correct detections", term: "precision", better: "higher", meaning: "Of everything the model detected, the share that is a real object. 90% means 9 in 10 detections are right."},
     recall: {name: "Finds objects", term: "recall", better: "higher", meaning: "Of the real objects in the images, the share the model found. 87% means it missed 13 in 100."},
     f1: {name: "Balance score", term: "F1", better: "higher", meaning: "Precision and recall combined with equal weight (their harmonic mean): high only when both are high."},
@@ -88,7 +102,7 @@
     same: {name: "About the same", term: "within the noise floor", better: null, meaning: function () { return "Changes this small happen between identical runs. Speed changes under " + Math.round(noise.speed_rel * 100) + "% or " + noise.speed_abs_ms + " ms, accuracy changes within " + noise.se_factor + " standard errors (normal variation for that many objects), and a confidence that stays inside the old near-optimal range (" + noise.plateau_points + " points) count as about the same."; }},
     points: {name: "points", term: "percentage points", better: null, meaning: "The difference between two percentages: 87% to 90% is +3 points (not +3%)."},
     not_comparable: {name: "Not comparable", term: "not comparable", better: null, meaning: "The two runs differ in datasets, image count, reference model, hardware or runtime version, so their numbers are not compared."},
-    accuracy_score: {name: "Accuracy score", term: "accuracy score (ranking)", better: "higher", meaning: "The score the ranking uses: AP50 blended with small-object recall, or the frame ROC AUC, as chosen under Run > Settings."},
+    accuracy_score: {name: "Accuracy score", term: "accuracy score (ranking)", better: "higher", meaning: "The score the ranking uses: AP50 blended with small-object recall, or the frame ROC AUC, as chosen in the Custom goal (step 2)."},
     overall: {name: "Overall", term: "overall grade", better: "higher", meaning: "Accuracy and speed grades combined by the accuracy weight (\"What matters most\")."},
     speed_grade: {name: "Speed", term: "speed grade", better: "higher", meaning: "Graded from the time per image (p50, whole request)."},
     accuracy_grade: {name: "Accuracy", term: "accuracy grade", better: "higher", meaning: "Graded from the accuracy score (AP50 with small-object recall, or ROC AUC)."},
@@ -111,7 +125,7 @@
     precision: ["Correct", "precision"], recall: ["Finds", "recall"], f1: ["Balance (F1)", "f1"], f2: ["Miss-fewer (F2)", "f2"],
     threshold: ["Confidence", "threshold"], grade: ["Grade", "grade"], agreement: ["Agreement", "agreement"],
     trust: ["Trust", "trust"], ran: ["Ran", "ran"], change: ["Δ vs last run", "change"], tradeoff: ["Trade-off", "best_tradeoff"],
-    accuracy_score: ["Accuracy score", "accuracy_score"], range: ["Near-optimal range", "plateau"], best_conf: ["Best confidence", "threshold"], now_conf: ["Confidence now", "threshold"], tpr: ["Alert rate", "tpr"], fpr: ["False alerts", "fpr"]
+    accuracy_score: ["Accuracy score", "accuracy_score"], range: ["Near-optimal range", "plateau"], best_conf: ["Best confidence", "best_conf"], saved_conf: ["Saved", "profile"], finds: ["Finds", "finds"], correct: ["Correct", "correct"], speed: ["Speed", "speed"], run_on: ["Run on", null], now_conf: ["Confidence now", "threshold"], tpr: ["Alert rate", "tpr"], fpr: ["False alerts", "fpr"]
   };
   function label(id) { return (LABELS[id] || [id])[0]; }
 
@@ -274,11 +288,13 @@
 
   // ---- glossary list (the no-hover fallback) -------------------------------------------------
   var GLOSSARY_ORDER = ["threshold", "recall", "precision", "f1", "f2", "ap50", "ap50_95", "roc_auc", "tpr", "fpr", "youden", "frame", "iou", "fp_per_image", "p50", "p95", "mean", "infer", "load_ms", "fps", "grade", "relative", "agreement", "reference", "objective", "plateau", "trust", "best_tradeoff", "same", "not_comparable", "points"];
-  function glossaryDetails(key) {
+  var PLAIN_ORDER = ["finds", "correct", "speed", "best_conf", "profile"];
+  // `order`: "plain" (the Profiles words) or a list of keys; default every expert term.
+  function glossaryDetails(key, order) {
     var d = el("details", "help glossary"); d.dataset.keep = "d:gloss:" + (key || "");
     d.appendChild(el("summary", null, "What do these terms mean?"));
     var dl = el("dl", "gloss-list");
-    GLOSSARY_ORDER.forEach(function (k) {
+    (order === "plain" ? PLAIN_ORDER : order || GLOSSARY_ORDER).forEach(function (k) {
       var g = GLOSSARY[k]; if (!g) return;
       var dt = el("dt", null, g.name); if (g.term && g.term.toLowerCase() !== g.name.toLowerCase()) dt.appendChild(el("span", "muted", " (" + g.term + ")"));
       dl.appendChild(dt);
@@ -308,6 +324,7 @@
     return o;
   }
   PB.objectiveName = objectiveName;
+  PB.conf = conf;
   PB.el = el; PB.has = has; PB.post = post; PB.getJSON = getJSON; PB.store = store; PB.fmt = fmt;
   PB.noise = noise; PB.setNoise = setNoise;
   PB.GLOSSARY = GLOSSARY; PB.LABELS = LABELS; PB.label = label; PB.tipText = tipText; PB.meaning = meaning;

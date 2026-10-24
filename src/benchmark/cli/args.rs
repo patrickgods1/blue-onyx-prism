@@ -40,8 +40,11 @@ pub struct BenchArgs {
     #[arg(long, conflicts_with_all = ["device", "force_cpu", "compare_cpu", "model"])]
     pub apply: bool,
     /// Implies --all-devices: write each benchmarked config model's best confidence threshold
-    /// (see --threshold-objective) into its `confidence_threshold` in the config file and print
-    /// what changed. Independent of --apply (devices); both may be given.
+    /// on every device it ran on (see --threshold-objective) into its confidence profiles
+    /// (`device_thresholds` in the config file: the threshold used when the model runs on that
+    /// device) and print one line per device. The model's `confidence_threshold` (used on
+    /// devices without a profile) is left alone; a running server applies the profiles without
+    /// a restart. Independent of --apply (devices); both may be given.
     #[arg(long, conflicts_with_all = ["device", "force_cpu", "compare_cpu", "model", "min_confidence"])]
     pub apply_threshold: bool,
     /// What the best confidence threshold optimizes: f1 (balance), f2 (favor recall: fewer

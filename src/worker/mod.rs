@@ -27,7 +27,7 @@
 
 use crate::api::{VisionDetectionRequest, VisionDetectionResponse};
 use crate::backend::{DeviceInfo, DeviceSpec, LoadRequest, Runtimes};
-use crate::config::{Config, ModelConfig};
+use crate::config::{Config, ModelConfig, ThresholdSource};
 use crate::metrics::{ModelGauges, ModelMetrics, ModelStateLabel};
 use crate::prep::PrepPool;
 use crate::profile::{Overrides, Profile};
@@ -35,6 +35,7 @@ use crate::startup::{ModelState, StateHandle};
 use crate::sync::{LockExt, RwLockExt};
 use arc_swap::ArcSwap;
 use crossbeam_channel::Sender;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -231,7 +232,14 @@ pub struct WorkerConfig {
 /// it for that request's timeout, postprocessing and image saving.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveSettings {
+    /// The fallback threshold: the model's own `confidence_threshold`, else the global one.
+    /// What runs on a device is [`LiveSettings::threshold_for`] (a device profile wins).
     pub confidence_threshold: f32,
+    /// The model's per-device thresholds (`device_thresholds`, keyed by device spec).
+    pub device_thresholds: Arc<BTreeMap<String, f32>>,
+    /// Where `confidence_threshold` comes from ([`ThresholdSource::Model`] or
+    /// [`ThresholdSource::Global`]).
+    pub fallback_source: ThresholdSource,
     pub nms_iou: f32,
     /// Only report these labels (case-insensitive); empty = all.
     pub object_filter: Vec<String>,
@@ -259,10 +267,12 @@ impl LiveSettings {
     /// The settings of model `m` under `config` (the model's threshold and object filter win
     /// over the global ones).
     pub fn for_model(config: &Config, m: &ModelConfig) -> Self {
+        let (confidence_threshold, fallback_source) =
+            m.threshold_on(None, config.confidence_threshold);
         Self {
-            confidence_threshold: m
-                .confidence_threshold
-                .unwrap_or(config.confidence_threshold),
+            confidence_threshold,
+            device_thresholds: Arc::new(m.device_thresholds.clone()),
+            fallback_source,
             nms_iou: config.nms_iou,
             object_filter: m
                 .object_filter
@@ -285,6 +295,18 @@ impl LiveSettings {
                 .map(str::to_string),
             verify: verify_settings(config, m),
             collect: Arc::new(crate::collect::CollectSettings::for_config(config)),
+        }
+    }
+
+    /// The threshold that runs on `device` (a spec such as the loaded `DeviceInfo.spec`) and
+    /// where it comes from: the model's profile for that device
+    /// ([`crate::config::lookup_device_threshold_entry`]: `openvino:gpu` == `openvino:gpu.0`),
+    /// else the fallback ([`Self::confidence_threshold`]). A request's `min_confidence` still
+    /// wins over it.
+    pub fn threshold_for(&self, device: &str) -> (f32, ThresholdSource) {
+        match crate::config::lookup_device_threshold_entry(&self.device_thresholds, device) {
+            Some((k, t)) => (t, ThresholdSource::Device(k.to_string())),
+            None => (self.confidence_threshold, self.fallback_source.clone()),
         }
     }
 
@@ -503,6 +525,18 @@ impl WorkerHandle {
     /// The live settings in effect now (see [`LiveSettings`]).
     pub fn live(&self) -> Arc<LiveSettings> {
         self.live.load_full()
+    }
+
+    /// The threshold this model runs with now and where it comes from: the profile for the
+    /// device it loaded on (`DeviceInfo.spec`, so `auto` and a fallback count as the device
+    /// that actually loaded), else the fallback (also before the model has loaded).
+    pub fn effective_threshold(&self) -> (f32, ThresholdSource) {
+        let live = self.live.load();
+        let spec = self.device.read_recover().as_ref().map(|d| d.spec.clone());
+        match spec {
+            Some(spec) => live.threshold_for(&spec),
+            None => (live.confidence_threshold, live.fallback_source.clone()),
+        }
     }
 
     /// Swap in new live settings; requests that arrive from now on use them. True when they
@@ -1055,5 +1089,84 @@ mod tests {
         // Defaults: nothing to do.
         assert!(LiveSettings::default().filters.is_noop());
         assert!(!LiveSettings::default().static_suppression.enabled);
+    }
+
+    fn profiled(model: Option<f32>, profiles: &[(&str, f32)]) -> LiveSettings {
+        let m = ModelConfig {
+            confidence_threshold: model,
+            device_thresholds: profiles.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            ..ModelConfig::default()
+        };
+        LiveSettings::for_model(&Config::default(), &m)
+    }
+
+    #[test]
+    fn threshold_for_picks_the_profile_of_the_device() {
+        let dev = |s: &str| ThresholdSource::Device(s.into());
+        let l = profiled(
+            None,
+            &[
+                ("openvino:gpu", 0.25),
+                ("ort:coreml", 0.3),
+                ("ort:cuda:1", 0.2),
+            ],
+        );
+        let global = Config::default().confidence_threshold;
+        assert_eq!(l.confidence_threshold, global);
+        assert_eq!(l.fallback_source, ThresholdSource::Global);
+        assert_eq!(l.threshold_for("ort:coreml"), (0.3, dev("ort:coreml")));
+        // No index = index 0, any spelling.
+        for d in ["openvino:gpu", "openvino:gpu.0", "GPU", "GPU.0"] {
+            assert_eq!(l.threshold_for(d), (0.25, dev("openvino:gpu")), "{d}");
+        }
+        assert_eq!(l.threshold_for("ort:cuda:1"), (0.2, dev("ort:cuda:1")));
+        // Other devices and `auto`: the fallback.
+        for d in ["openvino:gpu.1", "ort:cuda", "openvino:cpu", "auto", ""] {
+            assert_eq!(l.threshold_for(d), (global, ThresholdSource::Global), "{d}");
+        }
+        let l = profiled(Some(0.4), &[("openvino:gpu.0", 0.25)]);
+        assert_eq!(l.fallback_source, ThresholdSource::Model);
+        assert_eq!(
+            l.threshold_for("openvino:gpu"),
+            (0.25, dev("openvino:gpu.0"))
+        );
+        assert_eq!(
+            l.threshold_for("openvino:cpu"),
+            (0.4, ThresholdSource::Model)
+        );
+        // A request's `min_confidence` still wins over the profile.
+        let (t, _) = l.threshold_for("openvino:gpu");
+        assert_eq!(effective_threshold(0.6, t), 0.6);
+        assert_eq!(effective_threshold(0.0, t), 0.25);
+    }
+
+    #[test]
+    fn set_live_sees_a_profile_change_and_effective_threshold_follows_the_device() {
+        let h = WorkerHandle::failed("m", "x", Arc::new(ModelMetrics::new("m", "CPU", "")));
+        // Same as the defaults: no change.
+        assert!(!h.set_live(profiled(None, &[])));
+        assert!(h.set_live(profiled(None, &[("openvino:cpu", 0.3)])));
+        assert!(!h.set_live(profiled(None, &[("openvino:cpu", 0.3)])));
+        assert!(h.set_live(profiled(None, &[("openvino:cpu", 0.35)])));
+        // Not loaded: the fallback.
+        let global = Config::default().confidence_threshold;
+        assert_eq!(h.effective_threshold(), (global, ThresholdSource::Global));
+        *h.device.write().unwrap() = Some(DeviceInfo {
+            requested: "auto".into(),
+            spec: "openvino:cpu".into(),
+            ..DeviceInfo::default()
+        });
+        assert_eq!(
+            h.effective_threshold(),
+            (0.35, ThresholdSource::Device("openvino:cpu".into()))
+        );
+        // A fallback to another device: its own value.
+        *h.device.write().unwrap() = Some(DeviceInfo {
+            requested: "openvino:cpu".into(),
+            spec: "ort:cpu".into(),
+            fell_back: true,
+            ..DeviceInfo::default()
+        });
+        assert_eq!(h.effective_threshold(), (global, ThresholdSource::Global));
     }
 }

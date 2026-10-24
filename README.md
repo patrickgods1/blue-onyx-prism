@@ -538,6 +538,7 @@ and the default model; every key is in the *Models JSON* under it):
 | `classes` | `null` | YAML with `NAMES:`; default `<stem>.yaml` beside the model, then COCO-80. Path. Applies: model reload. UI: Models JSON, *Add a model by path* |
 | `device` | `null` | Device spec for this model (any spec of `list-devices`); `null` = the global `device`. Applies: model reload. UI: yes (Models card) |
 | `confidence_threshold` | `null` | Minimum confidence for this model; `null` = the global one. Number 0-1. Applies: at once. UI: yes (Models card) |
+| `device_thresholds` | `{}` | Confidence profiles: minimum confidence per device spec (`{"ort:coreml": 0.30, "openvino:cpu": 0.34}`); the model uses the entry of the device it actually loaded on (`auto` and fallback included), else `confidence_threshold`, else the global one. Keys are concrete specs (`openvino:gpu` = `openvino:gpu.0`; no `auto`). Written by the Benchmark page's **Apply** step and `--apply-threshold`. Number 0-1 each. Applies: at once. UI: yes (Models card: the Threshold field edits the selected device's profile; *Confidence per device*) |
 | `object_filter` | `null` | Only report these labels; `null` = the global `object_filter`. List of strings. Applies: at once. UI: Models JSON |
 | `lazy` | `false` | Compile on first request instead of at startup; requests are answered "initializing" at once until it is ready. Boolean. Applies: model reload. UI: Models JSON |
 | `gpu_precision` | `null` | Inference precision on an OpenVINO GPU: `f16` (default) or `f32` (slower; for models that overflow f16). Applies: model reload. UI: Models JSON |
@@ -649,8 +650,18 @@ the CLI and the UI read and write the same file.
   request (when it does, it replaces the server threshold for that request), and each camera's
   minimum confidence filters the returned objects again on top.
 
+- **Confidence profiles**: the best confidence differs per device (a GPU's FP16 path scores a little
+  differently from the CPU), so it is saved per model and device in `device_thresholds`. The Benchmark
+  page is three steps: **1 Run** (datasets, models, devices), **2 Profiles** (choose the goal, the only
+  place it is set; then per model one row per device: speed, finds, correct, best confidence, saved
+  value, and the device to run on) and **3 Apply** (*Save profiles and use chosen devices* or *Save
+  profiles only*, one change with Undo). Compare, Confidence, Details and History are under
+  **Advanced**. On the Config page, choosing another device in a model's dropdown shows that device's
+  saved profile, or pre-fills its benchmark best (Save keeps it). `/v1/status` shows each model's
+  `threshold` and `thresholdSource` (e.g. `profile for ort:coreml`).
+
 ```sh
-blue-onyx-prism benchmark --all-devices --apply-threshold    # also write each model's best confidence_threshold
+blue-onyx-prism benchmark --all-devices --apply-threshold    # also save each model's best confidence per measured device (device_thresholds)
 blue-onyx-prism benchmark --apply --apply-threshold --threshold-objective f2
 blue-onyx-prism benchmark --threshold-search --tag night --threshold-objective recall:0.9   # stored predictions, no inference
 blue-onyx-prism benchmark --threshold-search --dataset exdark-night --class person --iou 0.6 --json
@@ -664,7 +675,7 @@ Benchmark page's **Confidence search** card runs the same search (models, device
 classes, objective with target, IoU) in milliseconds and shows P/R/F1(/F2) vs threshold with hover
 values, the configured and best thresholds marked, the frame ROC curve (with ROC AUC per class and frame
 TPR / FPR at the configured and best thresholds), a summary and a 0.05-step table, **Apply** /
-**Apply all** (writes `confidence_threshold`, same restart flow) and CSV copy/download.
+**Apply all** (saves the profile of the searched device, same restart flow) and CSV copy/download.
 
 The `benchmark` config section holds the defaults (**Save as default** on the page writes it):
 
@@ -936,7 +947,8 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
 | POST | `/v1/benchmark/apply` | `model` + `device` (`""`/`global` clears it), or `all=1` for every saved recommendation; `restart=1` restarts |
-| POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
+| POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable; a following `device` writes that device's profile instead, `threshold=none` removes it), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
+| POST | `/v1/benchmark/apply-profiles` | one config change: `all=1` (optionally with repeated `model`) saves the best confidence of every measured device, `use=<device>\|<model>` sets a device, `profile=<device>\|<0.xx or none>\|<model>` sets or removes one profile; answers `changes`, `undo` (form pairs that restore the previous values), `needsRestart` |
 | GET, POST | `/v1/benchmark/threshold-search` | GET: searchable models/devices/datasets/tags/classes; POST: `model` (repeated or `all`), `device` (default recommended), `dataset`, `tag`, `class` (repeated), `objective` (`f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`), `iou` (0.5): best threshold, P/R/F1/F2/FP per image at best vs configured, exact curve, 0.05 grid, per dataset/class, CSV; 400 when nothing is stored (run a benchmark first) |
 | GET | `/v1/benchmark/images?model=&device=`, `/v1/benchmark/image?set=&file=` | per-image drill-down data; an image of the saved results |
 | POST | `/v1/resources/add-to-config` | form `id` of a downloaded model, or `local:<file>` for a model file in `models_dir` (family `auto`): append it to `models` |

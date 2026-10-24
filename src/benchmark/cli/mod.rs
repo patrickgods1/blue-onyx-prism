@@ -25,7 +25,7 @@ use crate::benchmark::{
 };
 use crate::config::{Config, DatasetRef, ModelConfig};
 use crate::config_form::{
-    DeviceChange, ThresholdChange, apply_model_devices, apply_model_thresholds,
+    DeviceChange, ProfileChange, apply_device_thresholds, apply_model_devices,
 };
 use crate::model::PostParams;
 use crate::sync::LockExt;
@@ -956,26 +956,29 @@ fn search_request(args: &BenchArgs, config: &Config) -> crate::benchmark::search
     }
 }
 
-/// `--apply-threshold`: write the best thresholds of `swept` into the config file.
+/// `--apply-threshold`: write the best threshold of every device each config model of `swept`
+/// ran on into its confidence profiles (`device_thresholds`, [`apply_device_thresholds`]); the
+/// model's `confidence_threshold` is left alone. Prints one line per model and device.
 fn apply_thresholds(
     swept: &[ModelResult],
     config_path: &Path,
     quiet: bool,
-) -> Result<Vec<ThresholdChange>> {
-    let picks: Vec<(String, f32)> = swept
-        .iter()
-        .filter_map(|m| {
-            let t = m.threshold.as_ref()?.apply_value()?;
-            Some((m.model.clone(), t))
-        })
-        .collect();
+) -> Result<Vec<ProfileChange>> {
     let mut cfg = Config::load(config_path)?;
     // Results may name models that are not configured (--model files): skip those.
-    let picks: Vec<(String, f32)> = picks
-        .into_iter()
-        .filter(|(m, _)| crate::benchmark::find_model(&cfg, m).is_some())
+    let configured: Vec<&ModelResult> = swept
+        .iter()
+        .filter(|m| crate::benchmark::find_model(&cfg, &m.model).is_some())
         .collect();
-    let changes = apply_model_thresholds(&mut cfg, &picks)?;
+    let entries: Vec<(String, String, Option<f32>)> = configured
+        .iter()
+        .filter_map(|m| Some((m, m.threshold.as_ref()?.device_apply_values())))
+        .flat_map(|(m, v)| {
+            v.into_iter()
+                .map(move |(d, t)| (m.model.clone(), d, Some(t)))
+        })
+        .collect();
+    let changes = apply_device_thresholds(&mut cfg, &entries)?;
     if !changes.is_empty() {
         cfg.save(config_path)?;
     }
@@ -983,29 +986,51 @@ fn apply_thresholds(
         println!();
         if changes.is_empty() {
             println!(
-                "--apply-threshold: {} already uses the best thresholds; nothing changed",
+                "--apply-threshold: {} already has these confidence profiles; nothing changed",
                 config_path.display()
             );
         } else {
-            println!("--apply-threshold: updated {}:", config_path.display());
-            for c in &changes {
-                println!("  {}", c.describe());
-            }
-            println!("Restart the server to use the new thresholds.");
+            println!(
+                "--apply-threshold: updated the confidence profiles in {} (the threshold each \
+                 model uses on that device):",
+                config_path.display()
+            );
         }
-        for m in swept {
-            match &m.threshold {
-                None => println!("  {}: unchanged (no threshold curve)", m.model),
-                Some(a) if a.apply_value().is_none() => println!(
-                    "  {}: unchanged ({})",
-                    m.model,
-                    a.best
-                        .as_ref()
-                        .and_then(|b| b.note.clone())
-                        .unwrap_or_else(|| "no usable threshold".into())
-                ),
-                _ => {}
+        for m in &configured {
+            let Some(a) = &m.threshold else {
+                println!("  {}: unchanged (no threshold curve)", m.model);
+                continue;
+            };
+            for d in &m.devices {
+                let changed = changes.iter().find(|c| {
+                    crate::registry::normalize_name(&c.model)
+                        == crate::registry::normalize_name(&m.model)
+                        && crate::config::same_device(&c.device, &d.device)
+                });
+                match (changed, a.apply_value_on(&d.device)) {
+                    (Some(c), _) => println!("  {}", c.describe()),
+                    (None, Some(t)) => {
+                        println!("  {} on {}: {t:.2} (unchanged)", m.model, d.device)
+                    }
+                    (None, None) => println!(
+                        "  {} on {}: unchanged ({})",
+                        m.model,
+                        d.device,
+                        a.by_device
+                            .iter()
+                            .find(|p| crate::config::same_device(&p.device, &d.device))
+                            .and_then(|p| p.best.as_ref())
+                            .and_then(|b| b.note.clone())
+                            .unwrap_or_else(|| "no usable threshold".into())
+                    ),
+                }
             }
+        }
+        if !changes.is_empty() {
+            println!(
+                "A running server applies them from the file within seconds (no restart \
+                 needed); a device without a profile keeps the model's threshold."
+            );
         }
         println!("{BLUE_IRIS_NOTE}");
     }
@@ -1273,20 +1298,62 @@ mod tests {
             ..Default::default()
         };
         cfg.save(&path).unwrap();
+        // Advice with one best per device: CPU 0.31, CoreML 0.27, GPU not applicable.
         let mk = |name: &str, t: Option<f32>| {
             let mut m = ModelResult::failed(name, "", String::new());
-            m.threshold = t.map(crate::benchmark::threshold::test_advice);
+            m.threshold = t.map(|t| {
+                let mut a = crate::benchmark::threshold::test_advice(t);
+                let pick = |t: f32, met: bool| {
+                    let mut p = a.best.clone().unwrap();
+                    p.threshold = t;
+                    p.met = met;
+                    Some(p)
+                };
+                a.by_device = vec![
+                    crate::benchmark::threshold::DevicePick {
+                        device: "openvino:cpu".into(),
+                        best: pick(t, true),
+                    },
+                    crate::benchmark::threshold::DevicePick {
+                        device: "ort:coreml".into(),
+                        best: pick(0.27, true),
+                    },
+                    crate::benchmark::threshold::DevicePick {
+                        device: "openvino:gpu".into(),
+                        best: pick(0.6, false),
+                    },
+                ];
+                a
+            });
             m
         };
         let swept = [mk("a", Some(0.31)), mk("b", None), mk("c.onnx", Some(0.2))];
         let changes = apply_thresholds(&swept, &path, true).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].model, "a");
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| (c.model.as_str(), c.device.as_str(), c.from, c.to))
+                .collect::<Vec<_>>(),
+            [
+                ("a", "openvino:cpu", None, Some(0.31)),
+                ("a", "ort:coreml", None, Some(0.27))
+            ]
+        );
         let saved = Config::load(&path).unwrap();
-        assert_eq!(saved.models[0].confidence_threshold, Some(0.31));
+        assert_eq!(
+            saved.models[0].device_thresholds,
+            [
+                ("openvino:cpu".to_string(), 0.31),
+                ("ort:coreml".to_string(), 0.27)
+            ]
+            .into()
+        );
+        // The model thresholds (devices without a profile) are unchanged.
+        assert_eq!(saved.models[0].confidence_threshold, None);
         assert_eq!(saved.models[1].confidence_threshold, None);
-        // Again: nothing to change.
-        assert!(apply_thresholds(&swept, &path, true).unwrap().is_empty());
+        assert!(saved.models[1].device_thresholds.is_empty());
+        // Again: nothing to change (and printing works).
+        assert!(apply_thresholds(&swept, &path, false).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

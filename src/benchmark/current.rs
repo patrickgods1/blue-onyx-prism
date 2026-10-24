@@ -19,17 +19,47 @@ use super::search::{StoredPreds, points_at};
 use super::threshold::{NowSource, NowThreshold, ThresholdAdvice};
 use crate::config::{Config, ModelConfig};
 use crate::registry::normalize_name;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// What the config says about a model now.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelNow {
-    /// Effective confidence threshold (the model's own, else the global one).
+    /// Confidence threshold of a device without a profile (the model's own, else the global
+    /// one).
     pub threshold: f32,
     /// What the loaded model runs with, when known (differs while a restart is pending).
     pub running: Option<f32>,
     /// Canonical spec of the device the config resolves to ([`super::configured_device`]).
     pub device: Option<String>,
+    /// The model's confidence profiles ([`ModelConfig::device_thresholds`]): an advice is
+    /// compared with the profile of its own device ([`ModelNow::threshold_for`]).
+    pub device_thresholds: BTreeMap<String, f32>,
+}
+
+impl ModelNow {
+    /// No profiles: every device uses `threshold`.
+    pub fn new(threshold: f32, running: Option<f32>, device: Option<String>) -> Self {
+        Self {
+            threshold,
+            running,
+            device,
+            device_thresholds: BTreeMap::new(),
+        }
+    }
+
+    /// With the confidence profiles `map` ([`ModelConfig::device_thresholds`]).
+    #[must_use]
+    pub fn with_profiles(mut self, map: BTreeMap<String, f32>) -> Self {
+        self.device_thresholds = map;
+        self
+    }
+
+    /// The threshold the config gives the model on `device` (a spec): its profile for that
+    /// device ([`crate::config::lookup_device_threshold`]), else [`ModelNow::threshold`].
+    pub fn threshold_for(&self, device: &str) -> f32 {
+        crate::config::lookup_device_threshold(&self.device_thresholds, device)
+            .unwrap_or(self.threshold)
+    }
 }
 
 /// Normalized model name -> [`ModelNow`] of every configured model. `device` resolves a model's
@@ -50,6 +80,7 @@ pub fn from_config(
                     threshold: m.confidence_threshold.unwrap_or(cfg.confidence_threshold),
                     running: running(&name),
                     device: device(m),
+                    device_thresholds: m.device_thresholds.clone(),
                 },
             )
         })
@@ -88,8 +119,11 @@ pub fn rebase_model(
     }
 }
 
-/// Fill [`ThresholdAdvice::now`] of `model`'s advice for `n`; returns `recommendation` (which
-/// ends with the advice's summary, see `ModelResult::finish`) with that summary rewritten.
+/// Fill [`ThresholdAdvice::now`] of `model`'s advice for `n`, at the threshold the config gives
+/// the advice's device ([`ModelNow::threshold_for`] of [`ThresholdAdvice::device`]: its
+/// confidence profile, else the model's / global threshold), since the curves are that
+/// device's; returns `recommendation` (which ends with the advice's summary, see
+/// `ModelResult::finish`) with that summary rewritten.
 pub fn rebase_advice(
     a: &mut ThresholdAdvice,
     model: &str,
@@ -99,7 +133,7 @@ pub fn rebase_advice(
     n: &ModelNow,
 ) -> String {
     let old = a.summary();
-    let t = n.threshold;
+    let t = n.threshold_for(&a.device);
     let running = n.running.filter(|r| (r - t).abs() > 1e-6);
     a.now = None;
     if (t - a.configured.threshold).abs() < 1e-6 {
@@ -212,11 +246,7 @@ pub(crate) mod tests {
     }
 
     fn now(t: f32) -> ModelNow {
-        ModelNow {
-            threshold: t,
-            running: None,
-            device: None,
-        }
+        ModelNow::new(t, None, None)
     }
 
     #[test]
@@ -364,5 +394,49 @@ pub(crate) mod tests {
         let v = serde_json::to_value(m).unwrap();
         assert_eq!(v["threshold"]["now"]["source"], "preds");
         assert!(v["threshold"]["by_dataset"][0]["now"]["f1"].is_number());
+    }
+    #[test]
+    fn rebase_uses_the_profile_of_the_advice_device() {
+        let (results, preds) = advised_fixture();
+        let device = results.models[0].threshold.as_ref().unwrap().device.clone();
+        assert_eq!(device, "ort:coreml");
+        let at = |n: &ModelNow| {
+            let mut r = results.clone();
+            rebase_model(&mut r.models[0], &results.image_sets, Some(&preds), n);
+            r.models[0].threshold.clone().unwrap().now.unwrap()
+        };
+        // A profile for the advice's device (the curves' device) replaces the model threshold.
+        let profiled = now(0.5).with_profiles([("ort:coreml".to_string(), 0.35)].into());
+        assert_eq!(profiled.threshold_for("ort:coreml"), 0.35);
+        assert_eq!(profiled.threshold_for("openvino:cpu"), 0.5);
+        let n = at(&profiled);
+        assert_eq!((n.threshold, n.source), (0.35, NowSource::Preds));
+        let p = n.point.unwrap().counts;
+        assert_eq!((p.tp, p.fp, p.fn_), (3, 0, 0));
+        // A profile of another device does not: the model's 0.50, the run's own counts.
+        let other = now(0.5).with_profiles([("openvino:cpu".to_string(), 0.35)].into());
+        let n = at(&other);
+        assert_eq!((n.threshold, n.source), (0.5, NowSource::Run));
+
+        // from_config carries the profiles (any spelling the config canonicalized).
+        let mut cfg = Config::default();
+        cfg.models.push(ModelConfig {
+            name: Some("M".into()),
+            path: "m.onnx".into(),
+            device_thresholds: [("ort:coreml".to_string(), 0.35)].into(),
+            ..Default::default()
+        });
+        let map = from_config(&cfg, &|_| None, &|_| None);
+        let mut r = results.clone();
+        rebase(&mut r, Some(&preds), &map);
+        let n = r.models[0].threshold.as_ref().unwrap().now.clone().unwrap();
+        assert_eq!(n.threshold, 0.35);
+        assert!(
+            r.models[0]
+                .recommendation
+                .contains("(the configured threshold)"),
+            "{}",
+            r.models[0].recommendation
+        );
     }
 }

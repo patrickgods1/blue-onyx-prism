@@ -148,6 +148,11 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `GET /v1/benchmark` carries `latest_run_id`, `noise`, per model `this_run`/`trust`/`changes`, `points`. Admin routes
   `GET /v1/benchmark/history[/compare]`, `POST /v1/benchmark/history/{pin,delete}`; `POST /v1/benchmark/settings`
   re-ranks the saved results (`benchmark/rescore.rs`, exact advice from `benchmark-preds.json`).
+  Confidence profiles: `ModelConfig.device_thresholds` (canonical spec -> threshold) win over `confidence_threshold`
+  for the device the model actually loaded on (`LiveSettings::threshold_for(eng.device)`, so `auto`/fallback follow);
+  `POST /v1/benchmark/apply-profiles` / `--apply-threshold` save `ThresholdAdvice.by_device`; `GET /v1/benchmark`
+  `profiles` (`server/benchmark/profiles.rs`). The page is Run -> Profiles -> Apply + Advanced (`assets/bench-profiles.js`);
+  the Config page's device dropdown swaps the threshold field to that device's profile / benchmark best.
 - `src/resources/` on-demand resources: `catalog` (pins), `resolve` (pure needs from config + hardware +
   installed), `manager` (one download thread, Range resume, SHA-256, staging + atomic rename, `.installed.json`,
   `.downloads.lock`, backoff), `extract` (whitelist-only, nothing executed), `provision` (startup: models wait
