@@ -963,6 +963,8 @@
     if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
     var t = ev.target;
     if (typing(t)) return;
+    // The Browse dialog is modal: its keys are not review shortcuts.
+    if (document.querySelector('dialog[open]')) return;
     var k = ev.key;
     if (t && t.tagName === 'BUTTON' && (k === 'Enter' || k === ' ')) return;
     var handled = true;

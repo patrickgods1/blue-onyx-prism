@@ -10,10 +10,15 @@ does what needs the training environment's libraries:
              --max-frames. Writes f_<n>.jpg (quality 92) into --out and one `frame` event per frame
              (file, time in seconds, size). --hwaccel auto decodes on the platform's hardware
              decoder when this FFmpeg has one (d3d11va on Windows, cuda then vaapi on Linux; software
-             on macOS, where VideoToolbox measured slower), with PyAV's software fallback for streams it cannot take; a hardware
-             open or decode error reopens the video in software (frames already passed are
-             skipped). The `start` event names the decoder (`hw:<type>` or `sw`), a fallback
-             sends a `decoder` event.
+             on macOS, where VideoToolbox measured slower), with PyAV's software fallback for
+             streams it cannot take. A decoder that cannot open the video makes it try the next
+             one in that order, then software; a hardware decode error decodes the video again in
+             software from the start (no seek; the frames already passed are skipped by time, or
+             by count when frames carry no time). The `start` event names the decoder
+             (`hw:<type>` or `sw`), a fallback sends a `decoder` event. `done` reports `capped`
+             when the video had more than --max-frames to give (a further frame passed the
+             filter within LOOKAHEAD_S after the quota, or decoding stopped there with frames
+             left).
   fetch-url  Download one video with yt-dlp (no playlists, no live streams, video-only formats up to
              --max-height so no ffmpeg binary is needed to merge streams, at most --max-bytes).
              Prints a `fetched` event with the file and what the site reports (title, uploader,
@@ -88,7 +93,9 @@ def self_check() -> int:
     for k, v in meta.items():
         lic[k] = v.get("license")
     hw = hw_devices()
-    log(f"self-check: hardware decoders {', '.join(hw) or 'none'}; auto picks {pick_hwaccel('auto') or 'software'}")
+    order = hw_candidates("auto")
+    log(f"self-check: hardware decoders {', '.join(hw) or 'none'}; auto tries "
+        f"{', '.join(order + ['software']) if order else 'software only'}")
     event("self_check", ffmpeg_license=lic.get("libavcodec"), hwdevices=hw, **info)
     return 0
 
@@ -111,18 +118,16 @@ def hw_devices() -> list[str]:
         return []
 
 
-def pick_hwaccel(choice: str) -> str | None:
-    """The device type to decode with: None = software."""
+def hw_candidates(choice: str) -> list[str]:
+    """The hardware device types to try in order (software after them): none for `off`, the
+    named one when this FFmpeg has it, or the platform's HW_ORDER entries it has for `auto`."""
     if choice == "off":
-        return None
+        return []
     have = hw_devices()
     if choice != "auto":
-        return choice if choice in have else None
+        return [choice] if choice in have else []
     plat = "linux" if sys.platform.startswith("linux") else sys.platform
-    for t in HW_ORDER.get(plat, []):
-        if t in have:
-            return t
-    return None
+    return [t for t in HW_ORDER.get(plat, []) if t in have]
 
 
 def open_video(path: Path, hw: str | None):
@@ -144,26 +149,35 @@ def open_video(path: Path, hw: str | None):
     return container, stream, decoder
 
 
+# After --max-frames, decoding goes on this long (seconds of video, else frames) to see whether
+# the filter passes one more frame (capped) or the video ends (not capped).
+LOOKAHEAD_S = 12.0
+LOOKAHEAD_FRAMES = 360
+
+
+def open_first(video: Path, candidates: list[str]):
+    """Open `video` on the first hardware decoder of `candidates` that opens it, else in software."""
+    for hw in candidates:
+        try:
+            return open_video(video, hw)
+        except SystemExit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log(f"hardware decoder {hw} could not open {video.name} ({e}); trying the next")
+    try:
+        return open_video(video, None)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        fail(f"cannot open {video}: {e} (is it a video file? Blue Iris .bvr clips must be exported to MP4 first)")
+
+
 def extract(a) -> int:
     import av
     from PIL import Image  # noqa: F401  (frame.to_image needs Pillow)
 
     a.out.mkdir(parents=True, exist_ok=True)
-    hw = pick_hwaccel(a.hwaccel)
-    try:
-        container, stream, decoder = open_video(a.video, hw)
-    except SystemExit:
-        raise
-    except Exception as e:  # noqa: BLE001
-        if hw is None:
-            fail(f"cannot open {a.video}: {e} (is it a video file? Blue Iris .bvr clips must be exported to MP4 first)")
-        log(f"hardware decoder {hw} could not open {a.video.name} ({e}); decoding in software")
-        try:
-            container, stream, decoder = open_video(a.video, None)
-        except SystemExit:
-            raise
-        except Exception as e2:  # noqa: BLE001
-            fail(f"cannot open {a.video}: {e2} (is it a video file? Blue Iris .bvr clips must be exported to MP4 first)")
+    container, stream, decoder = open_first(a.video, hw_candidates(a.hwaccel))
     duration = None
     if stream.duration is not None and stream.time_base is not None:
         duration = float(stream.duration * stream.time_base)
@@ -182,6 +196,8 @@ def extract(a) -> int:
     last_report = time.time()
     t0 = None
     last_t = None
+    # The graph passed a frame beyond --max-frames (it is not written).
+    over = False
 
     def build(frame):
         nonlocal graph, gfmt
@@ -195,41 +211,67 @@ def extract(a) -> int:
         sel.link_to(sink)
         graph.configure()
 
-    def drain() -> bool:
-        nonlocal kept
-        while True:
+    def drain() -> None:
+        """Write the frames the graph has, up to --max-frames; a frame beyond it sets `over`."""
+        nonlocal kept, over
+        while not over:
             try:
                 f = graph.pull()
             except (av.error.BlockingIOError, av.error.EOFError, BlockingIOError, EOFError):
-                return True
+                return
+            if kept >= a.max_frames:
+                over = True
+                return
             t = float(f.time) if f.time is not None else 0.0
             name = f"f_{kept:06d}.jpg"
             f.to_image().save(a.out / name, quality=92)
             kept += 1
             event("frame", file=name, t=round(t - (t0 or 0.0), 3), w=f.width, h=f.height)
-            if kept >= a.max_frames:
-                return False
 
-    go = True
-    skip_until = None
+    # capped: the video had more to give than --max-frames: the graph passed a further frame, or
+    # decoding stopped LOOKAHEAD_S (else LOOKAHEAD_FRAMES frames) after the quota was reached
+    # with frames left in the stream (not examined).
+    capped = False
+    look_t = None
+    look_n = 0
+    # After a hardware failure the video is decoded again in software from the start: the frames
+    # already pushed are skipped by time (`last_t`) when the frames carry one, else by count.
+    skip_t = None
+    skip_n = 0
+    redecoded = 0
     frames = container.decode(stream)
     while True:
         try:
             frame = next(frames)
         except StopIteration:
             break
-        except Exception as e:  # noqa: BLE001
+        except av.error.FFmpegError as e:
             if decoder == "sw":
                 raise
-            log(f"hardware decoding of {a.video.name} failed ({e}); continuing in software")
+            log(f"hardware decoding of {a.video.name} failed ({e}); decoding again in software")
             container.close()
             container, stream, decoder = open_video(a.video, None)
             event("decoder", decoder=decoder, reason=str(e)[:200])
-            skip_until = last_t
+            skip_t, skip_n, redecoded = last_t, decoded, 0
             frames = container.decode(stream)
             continue
-        if skip_until is not None and frame.time is not None and float(frame.time) <= skip_until:
-            continue
+        if skip_n:
+            redecoded += 1
+            if frame.time is not None and skip_t is not None:
+                if float(frame.time) <= skip_t:
+                    continue
+            elif redecoded <= skip_n:
+                continue
+        if kept >= a.max_frames:
+            # Look a little further to tell "full" from "exactly enough": a frame the graph
+            # passes now is one too many; past the look-ahead the rest is left unread.
+            if look_n == 0:
+                look_t = None if frame.time is None else float(frame.time) + LOOKAHEAD_S
+            look_n += 1
+            if look_n > LOOKAHEAD_FRAMES or (look_t is not None and frame.time is not None
+                                              and float(frame.time) > look_t):
+                capped = True
+                break
         decoded += 1
         if frame.time is not None:
             last_t = float(frame.time)
@@ -240,20 +282,22 @@ def extract(a) -> int:
         elif (frame.width, frame.height, frame.format.name) != gfmt:
             frame = frame.reformat(width=gfmt[0], height=gfmt[1], format=gfmt[2])
         graph.push(frame)
-        if not drain():
-            go = False
+        drain()
+        if over:
+            capped = True
             break
         if time.time() - last_report > 2 and frame.time is not None:
             event("progress", t=round(float(frame.time) - (t0 or 0.0), 1), duration=duration, frames=kept)
             last_report = time.time()
-    if go and graph is not None:
+    if not capped and graph is not None:
         try:
             graph.push(None)
         except Exception:  # noqa: BLE001 - flushing an empty graph
             pass
         drain()
+        capped = over
     container.close()
-    event("done", frames=kept, decoded=decoded, duration=duration, capped=not go, decoder=decoder)
+    event("done", frames=kept, decoded=decoded, duration=duration, capped=capped, decoder=decoder)
     return 0
 
 

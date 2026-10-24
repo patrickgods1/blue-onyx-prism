@@ -78,8 +78,9 @@ pub const MAX_WORKERS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HwAccel {
-    /// The platform's hardware decoder when PyAV's FFmpeg has it (VideoToolbox on macOS,
-    /// D3D11VA on Windows, CUDA then VAAPI on Linux); software when there is none or it fails.
+    /// The platform's hardware decoder when PyAV's FFmpeg has it (D3D11VA on Windows, CUDA
+    /// then VAAPI on Linux); software when there is none or it fails. macOS decodes in software:
+    /// VideoToolbox measured slower there (docs/TRAINING.md).
     #[default]
     Auto,
     /// Software decoding only.

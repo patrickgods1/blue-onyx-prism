@@ -73,6 +73,8 @@ struct ImportFake {
     fail_on: Option<&'static str>,
     /// Once this many extractions run at once, set the cancel flag (and wait for it).
     cancel_at: usize,
+    /// Every extraction reports `capped` (it stopped at its `--max-frames`).
+    capped: bool,
 }
 
 impl ImportFake {
@@ -128,8 +130,8 @@ impl ImportFake {
         }
         on_line("[import_footage] some log line");
         on_line(&format!(
-            "@import {{\"event\":\"done\",\"frames\":{},\"capped\":false}}",
-            self.frames
+            "@import {{\"event\":\"done\",\"frames\":{},\"capped\":{}}}",
+            self.frames, self.capped
         ));
         Ok(())
     }
@@ -653,6 +655,55 @@ fn a_video_that_fails_is_a_warning() {
     assert!(
         w.iter().any(|w| w.starts_with("bad.mp4: not read")),
         "{w:?}"
+    );
+}
+
+#[test]
+fn videos_stopped_at_their_share_are_one_warning() {
+    let t = tmp("capped");
+    let root = &t.0;
+    videos(&root.join("clips"), 3);
+    let mut req = path_request(root.join("clips"));
+    req.workers = 2;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(2, 0);
+    fake.capped = true;
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    let w: Vec<&str> = rep["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let stopped: Vec<&&str> = w.iter().filter(|w| w.contains("stopped at")).collect();
+    assert_eq!(stopped.len(), 1, "{w:?}");
+    assert!(
+        stopped[0].starts_with("3 of 3 videos stopped at their share (1,500 frames each)"),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn the_capped_warning_names_counts_and_the_quota_range() {
+    assert_eq!(capped_warning(&[], 5, 1500), None);
+    let one = capped_warning(&[9999], 1, 1500).unwrap();
+    assert!(
+        one.starts_with(
+            "1 of 1 video stopped at their share (9,999 frames each); the rest of that video"
+        ),
+        "{one}"
+    );
+    let range = capped_warning(&[3333, 9999, 3333], 40, 10_000).unwrap();
+    assert!(
+        range.starts_with(
+            "3 of 40 videos stopped at their share (3,333-9,999 frames); the rest of those videos"
+        ),
+        "{range}"
+    );
+    assert!(
+        range.ends_with("at most 20,000 candidate frames, at most 10,000 per video)"),
+        "{range}"
     );
 }
 

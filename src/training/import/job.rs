@@ -133,6 +133,42 @@ fn base_time(p: &Path) -> SystemTime {
         .unwrap_or_else(SystemTime::now)
 }
 
+/// One warning for the videos that stopped at their share of the candidate budget (`quotas`,
+/// one per such video, of `read` videos extracted), instead of a line per video: "3 of 12 videos
+/// stopped at their share (1,500 frames each)".
+pub(super) fn capped_warning(
+    quotas: &[usize],
+    read: usize,
+    per_video_max: usize,
+) -> Option<String> {
+    let lo = quotas.iter().copied().min()?;
+    let hi = quotas.iter().copied().max().unwrap_or(lo);
+    let t = super::preview::thousands;
+    let share = if lo == hi {
+        format!("{} frames each", t(lo))
+    } else {
+        format!("{}-{} frames", t(lo), t(hi))
+    };
+    Some(format!(
+        "{} of {} {} stopped at their share ({share}); the rest of {} was not read (the import \
+         reads at most {} candidate frames, at most {} per video)",
+        t(quotas.len()),
+        t(read.max(quotas.len())),
+        if read.max(quotas.len()) == 1 {
+            "video"
+        } else {
+            "videos"
+        },
+        if quotas.len() == 1 {
+            "that video"
+        } else {
+            "those videos"
+        },
+        t(MAX_CANDIDATES_TOTAL),
+        t(per_video_max)
+    ))
+}
+
 fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -586,6 +622,7 @@ impl ImportJob {
                 cancel,
             );
             // In video order: the dedup keeps the first of near duplicates.
+            let mut capped: Vec<usize> = Vec::new();
             for (k, res) in results.into_iter().enumerate() {
                 let Some(((i, quota), res)) = todo.get(k).copied().zip(res) else {
                     continue;
@@ -604,13 +641,7 @@ impl ImportJob {
                     }
                 };
                 if ex.capped {
-                    warnings.push(format!(
-                        "{}: stopped after {quota} frames (its share of the {MAX_CANDIDATES_TOTAL} \
-                         candidate frames, at most {} per video); the rest of the video was not \
-                         read",
-                        file_name(&v.path),
-                        r.max_candidates
-                    ));
+                    capped.push(quota);
                 }
                 let out = self.work.join("frames").join(format!("v{i:04}"));
                 for (f, t) in ex.found {
@@ -628,6 +659,7 @@ impl ImportJob {
                     });
                 }
             }
+            warnings.extend(capped_warning(&capped, total, r.max_candidates));
             check(cancel)?;
         }
         for img in used_images {

@@ -269,10 +269,27 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
 /// nothing importable there is also 200, `{success: false, message}` (the page previews while the
 /// path is typed, so these are not request errors). The path
 /// goes through the same check as the import itself ([`super::browse::allowed_path`]).
+///
+/// The walk has a budget and runs one at a time ([`crate::training::import::preview`]): a large
+/// folder answers `truncated: true` with a "large folder: ..." summary, and a request replaced
+/// by a newer one while it waits or walks answers `{success: false, busy: true, message}` (the
+/// page drops answers to stale requests anyway). A browser request marked `Sec-Fetch-Site:
+/// cross-site` is 403: another site must not make the admin's browser walk the disks.
 pub(super) async fn import_preview(
     State(shared): State<Shared>,
+    headers: HeaderMap,
     Query(q): Query<Vec<(String, String)>>,
 ) -> Response {
+    if super::guard::fetch_site_cross(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "Cross-site request refused: the import preview answers this server's own pages only."
+            })),
+        )
+            .into_response();
+    }
     blocking(move || {
         let state = shared.current();
         let config = state.config_read().clone();
@@ -293,7 +310,8 @@ pub(super) async fn import_preview(
             Ok(n) => n.unwrap_or(0),
             Err(e) => return fail(e.to_string()),
         };
-        match crate::training::import::preview::preview(&path, field(&q, "camera"), per_video) {
+        use crate::training::import::preview;
+        match preview::preview_latest(&path, field(&q, "camera"), per_video) {
             Ok(p) => {
                 let mut v = serde_json::to_value(&p).unwrap_or_default();
                 if let Some(o) = v.as_object_mut() {
@@ -302,6 +320,10 @@ pub(super) async fn import_preview(
                 }
                 Json(v).into_response()
             }
+            Err(e) if e.downcast_ref::<preview::Busy>().is_some() => Json(serde_json::json!({
+                "success": false, "busy": true, "message": e.to_string()
+            }))
+            .into_response(),
             Err(e) => fail(format!("{e:#}")),
         }
     })
@@ -577,6 +599,19 @@ mod tests {
         let (s, json) = get_text(&state, "/v1/training/import/preview").await;
         assert_eq!(s, StatusCode::OK);
         assert!(json.contains("give a file or folder path"), "{json}");
+        // A cross-site GET is refused before anything is walked; same-origin passes.
+        for (site, want) in [
+            ("cross-site", StatusCode::FORBIDDEN),
+            ("same-origin", StatusCode::OK),
+            ("none", StatusCode::OK),
+        ] {
+            let req = axum::http::Request::get(format!("/v1/training/import/preview?path={q}"))
+                .header("sec-fetch-site", site)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (s, _, b) = call(&state, req).await;
+            assert_eq!(s, want, "{site}: {}", String::from_utf8_lossy(&b));
+        }
         let (s, json) = get_text(
             &state,
             &format!("/v1/training/import/preview?path={q}&max_candidates=x"),

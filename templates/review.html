@@ -98,7 +98,7 @@
       <label class="check"><input type="checkbox" name="fmt" value="benchmark" checked> Benchmark set</label>
     </div>
     <div class="fields">
-      <label class="wide">Folder <span class="with-browse"><input type="text" name="out_dir"><button type="button" class="browse secondary" data-browse="folder" data-target="out_dir" hidden>Browse&hellip;</button></span><span class="muted small">Empty = a new folder under <code>{{ exports_dir }}</code>.</span></label>
+      <label class="wide">Folder <span class="with-browse"><input type="text" name="out_dir"><button type="button" class="browse secondary" data-browse="folder" data-target="out_dir" data-title="Choose the export folder" hidden>Browse&hellip;</button></span><span class="muted small">Empty = a new folder under <code>{{ exports_dir }}</code>.</span></label>
       <label>Held-out cameras (comma separated) <input type="text" name="holdout_cameras"></label>
       <label>Held-out days (YYYY-MM-DD, comma separated) <input type="text" name="holdout_days"></label>
       <label>Else hold out this share of camera-days <input type="number" name="holdout_fraction" min="0" max="1" step="0.05" value="0.2"></label>
@@ -116,7 +116,7 @@
   <h2>Import from X-AnyLabeling</h2>
   <p class="muted">Reads the <code>.json</code> files of an exported <code>xanylabeling</code> folder after you edited them in X-AnyLabeling. A file counts once its image is checked there; its rectangles become the frame's boxes (boxes you deleted are kept as rejected).</p>
   <form id="rv-import" class="inline-row">
-    <label class="grow">Folder <span class="with-browse"><input type="text" name="dir" required><button type="button" class="browse secondary" data-browse="folder" data-target="dir" hidden>Browse&hellip;</button></span></label>
+    <label class="grow">Folder <span class="with-browse"><input type="text" name="dir" required><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the X-AnyLabeling folder" hidden>Browse&hellip;</button></span></label>
     <label class="check"><input type="checkbox" name="treat_unchecked_as_reviewed"> Import unchecked files too</label>
     <button type="submit">Import</button>
   </form>

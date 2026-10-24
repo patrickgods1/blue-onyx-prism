@@ -349,8 +349,11 @@ per-child priority yet.
 (`av.codec.hwaccel.hwdevices_available()`): D3D11VA on Windows, CUDA then VAAPI on Linux (macOS
 decodes in software, see the measurement below), opened with `HWAccel(device_type=..., allow_software_fallback=True)` (PyAV 18.1.0,
 pinned in the `train-*` locks); a stream the hardware decoder cannot take is decoded in software by
-PyAV itself. A hardware open or decode error reopens the video in software (frames already passed
-are skipped by time) and sends a `decoder` event. The filter graph's buffer takes the first decoded
+PyAV itself. A decoder that cannot open the video makes it try the next one of the platform's list,
+then software; a hardware decode error decodes the video again in software from the start (no seek;
+frames already passed are skipped by time, or by count when frames carry none) and sends a `decoder`
+event. `done` reports `capped` only when the video had more to give than its share: a further frame
+passed the filter within 12 s of video after the quota, or decoding stopped there with frames left. The filter graph's buffer takes the first decoded
 frame's size and pixel format (a hardware context reports the device's format, the frames arrive
 downloaded, e.g. `nv12`); a frame that differs is converted to it. The `start` event names the
 decoder (`hw:d3d11va`, `hw:cuda`, ... or `sw`), shown per video in the job's log with its candidate count; the

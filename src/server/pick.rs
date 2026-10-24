@@ -9,7 +9,10 @@
 //!   that is not this machine, the dialog failed to start) or 409 `{"busy": true, "message"}`
 //!   (one dialog at a time, process-wide). An admin route: loopback only unless
 //!   `allow_remote_admin`, and the POST passes the CSRF guard; even with `allow_remote_admin` a
-//!   remote peer gets "unavailable", since the dialog would open on a screen it cannot see.
+//!   remote peer gets "unavailable", since the dialog would open on a screen it cannot see. So
+//!   does a loopback peer reached indirectly: a request carrying `X-Forwarded-For`, `Forwarded`
+//!   or `X-Real-IP` (a reverse proxy on this machine), or whose `Host` is not `localhost`,
+//!   `127.0.0.1` or `[::1]` (any port; a DNS-rebound name, a proxy that keeps the peer local).
 //!
 //! Platforms (the command building and the output parsing are pure and tested on every OS):
 //! - macOS: `osascript` (AppleScript `choose file of type` / `choose folder`, activated so it
@@ -783,6 +786,52 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// A running dialog process as [`wait_for`] sees it (a fake in the tests).
+trait Waitable {
+    type Status;
+    fn try_wait(&mut self) -> std::io::Result<Option<Self::Status>>;
+    fn stop(&mut self);
+}
+
+impl Waitable for std::process::Child {
+    type Status = std::process::ExitStatus;
+    fn try_wait(&mut self) -> std::io::Result<Option<Self::Status>> {
+        std::process::Child::try_wait(self)
+    }
+    fn stop(&mut self) {
+        stop(self);
+    }
+}
+
+/// Wait until `p` exits, `timeout` passes or `abandoned` is set; in the last two cases, and
+/// when its state cannot be read, the process is stopped (the dialog is never left open).
+fn wait_for<W: Waitable>(
+    p: &mut W,
+    timeout: Duration,
+    abandoned: &AtomicBool,
+) -> std::io::Result<(Option<W::Status>, Ended)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match p.try_wait() {
+            Ok(Some(s)) => return Ok((Some(s), Ended::Exited)),
+            Ok(None) => {}
+            Err(e) => {
+                p.stop();
+                return Err(e);
+            }
+        }
+        if abandoned.load(Ordering::Relaxed) {
+            p.stop();
+            return Ok((None, Ended::Abandoned));
+        }
+        if Instant::now() >= deadline {
+            p.stop();
+            return Ok((None, Ended::TimedOut));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Run `cmd` until it exits, `timeout` passes or `abandoned` is set (then it is stopped).
 pub(super) fn run(
     cmd: &PickCommand,
@@ -810,21 +859,7 @@ pub(super) fn run(
     let mut child = c.spawn()?;
     let out = child.stdout.take().map(drain);
     let err = child.stderr.take().map(drain);
-    let deadline = Instant::now() + timeout;
-    let (status, ended) = loop {
-        if let Some(s) = child.try_wait()? {
-            break (Some(s), Ended::Exited);
-        }
-        if abandoned.load(Ordering::Relaxed) {
-            stop(&mut child);
-            break (None, Ended::Abandoned);
-        }
-        if Instant::now() >= deadline {
-            stop(&mut child);
-            break (None, Ended::TimedOut);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let (status, ended) = wait_for(&mut child, timeout, abandoned)?;
     let join = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
         h.and_then(|h| h.join().ok()).unwrap_or_default()
     };
@@ -869,6 +904,69 @@ fn remote_message() -> String {
     )
 }
 
+/// Headers a reverse proxy adds: a request carrying one did not come straight from a browser
+/// on this machine, whatever the TCP peer is.
+const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
+
+/// The host part of a `Host` value (`localhost:32168` -> `localhost`, `[::1]:80` -> `::1`,
+/// lowercased); None when it is not well formed.
+fn host_part(host: &str) -> Option<String> {
+    let h = host.trim();
+    let name = if let Some(rest) = h.strip_prefix('[') {
+        let (v6, after) = rest.split_once(']')?;
+        if !(after.is_empty() || after.starts_with(':')) {
+            return None;
+        }
+        v6
+    } else if h.matches(':').count() > 1 {
+        // A bare IPv6 literal (`::1`), no port.
+        h
+    } else {
+        h.split(':').next()?
+    };
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+/// Why a loopback request still must not open a dialog: it came through a proxy, or under a
+/// host name other than a loopback one (a DNS-rebound name, a reverse proxy that keeps the
+/// peer local). `None` = a direct local request. The `Host` is the header, else the request
+/// URI's authority (HTTP/2); a request with neither is refused too.
+fn indirect_reason(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> Option<String> {
+    if let Some(h) = PROXY_HEADERS.iter().find(|h| headers.contains_key(**h)) {
+        return Some(format!("the request came through a proxy ({h} header)"));
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| uri.authority().map(|a| a.as_str().to_string()));
+    let Some(host) = host else {
+        return Some("the request has no Host header".into());
+    };
+    match host_part(&host).as_deref() {
+        Some("localhost" | "127.0.0.1" | "::1") => None,
+        _ => Some(format!(
+            "the page was opened as {} rather than localhost or 127.0.0.1",
+            host.chars().take(100).collect::<String>()
+        )),
+    }
+}
+
+/// The reason a request gets "unavailable" before any dialog logic: a peer that is not this
+/// machine, or a local peer reached indirectly ([`indirect_reason`]).
+fn refusal(req: &axum::extract::Request) -> Option<String> {
+    let peer = peer_of(req.extensions().get::<ConnectInfo<SocketAddr>>());
+    if !local_peer(peer) {
+        return Some(remote_message());
+    }
+    indirect_reason(req.headers(), req.uri()).map(|why| {
+        format!(
+            "The file dialog would open on the server's screen, and {why}, so this browser may \
+             be on another machine: {FALLBACK}"
+        )
+    })
+}
+
 fn peer_of(ci: Option<&ConnectInfo<SocketAddr>>) -> Option<SocketAddr> {
     ci.map(|c| c.0)
 }
@@ -888,11 +986,10 @@ fn unavailable(message: String) -> Response {
 
 /// `GET /v1/fs/pick`: whether a native dialog can open (nothing is opened).
 pub(super) async fn status(req: axum::extract::Request) -> Response {
-    let peer = peer_of(req.extensions().get::<ConnectInfo<SocketAddr>>());
     let busy = BUSY.load(Ordering::Acquire);
-    if !local_peer(peer) {
+    if let Some(reason) = refusal(&req) {
         return Json(serde_json::json!({
-            "available": false, "reason": remote_message(), "busy": busy
+            "available": false, "reason": reason, "busy": busy
         }))
         .into_response();
     }
@@ -917,9 +1014,8 @@ pub(super) async fn pick(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
 ) -> Response {
-    let peer = peer_of(req.extensions().get::<ConnectInfo<SocketAddr>>());
-    if !local_peer(peer) {
-        return unavailable(remote_message());
+    if let Some(reason) = refusal(&req) {
+        return unavailable(reason);
     }
     let body = match axum::body::to_bytes(req.into_body(), BODY_LIMIT).await {
         Ok(b) => b,
@@ -1390,6 +1486,150 @@ mod tests {
         assert_eq!(out.ended, Ended::Abandoned);
     }
 
+    #[test]
+    fn host_parts() {
+        for (h, want) in [
+            ("localhost:32168", Some("localhost")),
+            ("LocalHost", Some("localhost")),
+            ("127.0.0.1:80", Some("127.0.0.1")),
+            ("[::1]:32168", Some("::1")),
+            ("[::1]", Some("::1")),
+            ("::1", Some("::1")),
+            ("evil.example:32168", Some("evil.example")),
+            ("localhost.evil.example", Some("localhost.evil.example")),
+            ("[::1]x", None),
+            ("", None),
+            (":80", None),
+        ] {
+            assert_eq!(host_part(h).as_deref(), want, "{h}");
+        }
+    }
+
+    /// Loopback peers reached through a proxy or under a foreign host name are refused.
+    #[test]
+    fn indirect_local_requests_are_refused() {
+        use super::super::test_util::*;
+        use axum::body::Body;
+        use axum::http::Request;
+        let req = |pairs: &[(&str, &str)]| {
+            let mut b = Request::get("/v1/fs/pick");
+            for (k, v) in pairs {
+                b = b.header(*k, *v);
+            }
+            from_peer(b.body(Body::empty()).unwrap(), LOCAL)
+        };
+        for host in [
+            "localhost:32168",
+            "127.0.0.1:32168",
+            "[::1]:32168",
+            "localhost",
+            "::1",
+        ] {
+            assert_eq!(refusal(&req(&[("host", host)])), None, "{host}");
+        }
+        // The test helper's default Host is local too.
+        assert_eq!(refusal(&req(&[])), None);
+        for (k, v) in [
+            ("x-forwarded-for", "10.0.0.5"),
+            ("forwarded", "for=10.0.0.5"),
+            ("x-real-ip", "10.0.0.5"),
+        ] {
+            let why = refusal(&req(&[(k, v)])).unwrap();
+            assert!(why.contains(&format!("proxy ({k} header)")), "{k}: {why}");
+        }
+        for host in [
+            "evil.example:32168",
+            "rebind.attacker.test",
+            "192.168.1.10:32168",
+            "localhost.evil.example",
+            "127.0.0.2:32168",
+        ] {
+            let why = refusal(&req(&[("host", host)])).unwrap();
+            assert!(why.contains("opened as"), "{host}: {why}");
+        }
+        // No Host at all (and no authority in the URI).
+        let mut r = req(&[]);
+        r.headers_mut().remove("host");
+        assert!(refusal(&r).unwrap().contains("no Host header"));
+        // HTTP/2: the authority of the URI stands in for Host.
+        let mut r = from_peer(
+            Request::get("http://localhost:32168/v1/fs/pick")
+                .body(Body::empty())
+                .unwrap(),
+            LOCAL,
+        );
+        r.headers_mut().remove("host");
+        assert_eq!(refusal(&r), None);
+        // The remote peer keeps its own message.
+        let r = from_peer(
+            Request::get("/v1/fs/pick").body(Body::empty()).unwrap(),
+            REMOTE,
+        );
+        assert!(refusal(&r).unwrap().contains("another machine"));
+    }
+
+    /// A process whose state cannot be read is stopped before the error is returned.
+    #[test]
+    fn wait_errors_stop_the_dialog() {
+        struct FakeProc {
+            calls: usize,
+            fail_at: usize,
+            stopped: bool,
+        }
+        impl Waitable for FakeProc {
+            type Status = i32;
+            fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+                self.calls += 1;
+                if self.calls >= self.fail_at {
+                    Err(std::io::Error::other("waitpid failed"))
+                } else {
+                    Ok(None)
+                }
+            }
+            fn stop(&mut self) {
+                self.stopped = true;
+            }
+        }
+        let never = AtomicBool::new(false);
+        for fail_at in [1, 2] {
+            let mut p = FakeProc {
+                calls: 0,
+                fail_at,
+                stopped: false,
+            };
+            let e = wait_for(&mut p, Duration::from_secs(60), &never).unwrap_err();
+            assert_eq!(e.to_string(), "waitpid failed");
+            assert!(p.stopped, "stopped after a try_wait error ({fail_at})");
+        }
+        // An exit is not stopped; a timeout is.
+        struct Exits(bool);
+        impl Waitable for Exits {
+            type Status = i32;
+            fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+                Ok(Some(0))
+            }
+            fn stop(&mut self) {
+                self.0 = true;
+            }
+        }
+        let mut p = Exits(false);
+        assert_eq!(
+            wait_for(&mut p, Duration::from_secs(60), &never).unwrap(),
+            (Some(0), Ended::Exited)
+        );
+        assert!(!p.0);
+        let mut p = FakeProc {
+            calls: 0,
+            fail_at: usize::MAX,
+            stopped: false,
+        };
+        assert_eq!(
+            wait_for(&mut p, Duration::ZERO, &never).unwrap(),
+            (None, Ended::TimedOut)
+        );
+        assert!(p.stopped);
+    }
+
     /// Remote peers (even with `allow_remote_admin`) never open a dialog; a held flag answers
     /// busy before anything is started; bad bodies are 400.
     #[tokio::test]
@@ -1449,6 +1689,35 @@ mod tests {
         }
         drop(g);
         assert!(BusyGuard::acquire().is_some(), "released by the guard");
+
+        // Local peers behind a proxy or under a foreign Host: unavailable, nothing opened.
+        let mut req = post(LOCAL, r#"{"kind":"folder"}"#);
+        req.headers_mut()
+            .insert("x-forwarded-for", "10.0.0.5".parse().unwrap());
+        let (s, _, b) = call(&state, req).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(j["available"], false);
+        assert!(j["message"].as_str().unwrap().contains("proxy"), "{j}");
+        let mut req = post(LOCAL, r#"{"kind":"folder"}"#);
+        req.headers_mut()
+            .insert(header::HOST, "rebind.attacker.test:32168".parse().unwrap());
+        let (s, _, b) = call(&state, req).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(j["message"].as_str().unwrap().contains("opened as"), "{j}");
+        let get = from_peer(
+            Request::get("/v1/fs/pick")
+                .header("forwarded", "for=10.0.0.5")
+                .body(Body::empty())
+                .unwrap(),
+            LOCAL,
+        );
+        let (s, _, b) = call(&state, get).await;
+        assert_eq!(s, StatusCode::OK);
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(j["available"], false);
+        assert!(j["reason"].as_str().unwrap().contains("proxy"), "{j}");
 
         // Cross-site POSTs are refused by the CSRF guard before the handler.
         let mut req = post(LOCAL, r#"{"kind":"folder"}"#);

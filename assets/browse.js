@@ -12,8 +12,8 @@
   var $ = function (id) { return document.getElementById(id); };
   var dlg = $("browse-dialog");
   var inPage = !!(dlg && typeof dlg.showModal === "function");
-  var buttons = document.querySelectorAll("button.browse[data-browse][data-target]");
-  if (!buttons.length) return;
+  var SEL = "button.browse[data-browse][data-target]";
+  if (!document.querySelector(SEL)) return;
   var KINDS = { video: 1, folder: 1, model: 1, classes: 1 };
   // null until GET /v1/fs/pick answers; a click before that uses the in-page browser.
   var native = null;
@@ -31,7 +31,7 @@
   // The in-page browser (server-side listing).
   var list, pathEl, msg, roots, up, use, title;
   var kind = "video", target = null, cur = null, seq = 0;
-  var TITLES = { video: "Choose a video or a folder", model: "Choose a model file or folder", classes: "Choose a classes YAML", folder: "Choose the dataset folder" };
+  var TITLES = { video: "Choose a video or a folder", model: "Choose a model file or folder", classes: "Choose a classes YAML", folder: "Choose a folder" };
   var EMPTY = { video: "No video here (choose this folder for its images).", folder: "No subfolders here.", model: "No model files here.", classes: "No classes YAML here." };
   function pick(path) {
     dlg.close();
@@ -70,7 +70,9 @@
       if (n !== seq) return;
       if (res.status === 200) { render(res.body); if (retry) msg.textContent = retry; return; }
       var m = (res.body && res.body.message) || "Cannot list that folder.";
-      if (res.status === 404 && path) { go("", m); return; }
+      // A folder that is gone, or outside the roots (e.g. picked natively before): the default
+      // folder, with the reason.
+      if ((res.status === 404 || res.status === 403) && path) { go("", m); return; }
       msg.textContent = m;
     }).catch(function () { if (n === seq) msg.textContent = "Cannot reach the server."; });
   }
@@ -106,9 +108,19 @@
     var k = KINDS[b.dataset.browse] ? b.dataset.browse : "video";
     var status = statusFor(b);
     b.disabled = true;
-    status.textContent = " Waiting for the file dialog on the server's screen…";
+    // Cancel aborts the request; the server then closes the dialog (it may have opened where
+    // nobody sees it, e.g. another Windows session).
+    var ctl = window.AbortController ? new AbortController() : null;
+    status.textContent = " Waiting for the file dialog on the server's screen… ";
+    if (ctl) {
+      var cancel = el("button", "small secondary", "Cancel");
+      cancel.type = "button";
+      cancel.addEventListener("click", function () { ctl.abort(); });
+      status.appendChild(cancel);
+    }
     var done = function (text) { b.disabled = false; status.textContent = text || ""; };
     fetch("/v1/fs/pick", {
+      signal: ctl ? ctl.signal : undefined,
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ kind: k, start: t.value.trim() })
@@ -123,20 +135,27 @@
       if (res.status === 409 && j.available === false) native = false;
       done(j.busy && j.message ? " " + j.message : "");
       openInPage(b, t);
-    }).catch(function () { done(""); openInPage(b, t); });
+    }).catch(function (e) {
+      done("");
+      if (!(e && e.name === "AbortError")) openInPage(b, t);
+    });
   }
 
+  function targetOf(b) { return b.form && b.form.elements[b.dataset.target]; }
   // Without the in-page dialog a button shows only once the native one is known to work.
+  // Buttons are found at each call: the Config page swaps server-rendered parts in later.
   function reveal() {
-    Array.prototype.forEach.call(buttons, function (b) { if (b._browseTarget) b.hidden = false; });
-  }
-  Array.prototype.forEach.call(buttons, function (b) {
-    var t = b.form && b.form.elements[b.dataset.target];
-    if (!t) return;
-    b._browseTarget = t;
-    b.addEventListener("click", function () {
-      if (native) openNative(b, t); else openInPage(b, t);
+    if (!inPage && !native) return;
+    Array.prototype.forEach.call(document.querySelectorAll(SEL), function (b) {
+      if (targetOf(b)) b.hidden = false;
     });
+  }
+  document.addEventListener("click", function (e) {
+    var b = e.target && e.target.closest ? e.target.closest(SEL) : null;
+    var t = b && targetOf(b);
+    if (!t) return;
+    if (native) openNative(b, t); else openInPage(b, t);
   });
-  if (inPage) reveal();
+  if (window.MutationObserver) new MutationObserver(reveal).observe(document.body, { childList: true, subtree: true });
+  reveal();
 })();

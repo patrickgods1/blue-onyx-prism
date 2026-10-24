@@ -1523,6 +1523,17 @@ pub fn validate_dir_setting(key: &str, raw: &str, data_root: &Path) -> Result<Op
         }
         return Ok(None);
     }
+    let verbatim = raw.starts_with(r"\\?\") || raw.starts_with(r"\??\") || raw.starts_with("//?/");
+    if !verbatim && (raw.starts_with(r"\\") || raw.starts_with("//")) {
+        // A network share picked in the native dialog arrives as `\\server\share\...`: the
+        // service (often LocalService) may not reach it, and its paths are not checked here.
+        bail!(
+            "{key}: UNC paths (\\\\server\\share) are not accepted for a folder setting; map the \
+             share to a drive letter (for example Z:, in File Explorer: This PC, Map network \
+             drive) and choose the folder on that drive instead (a drive mapped in your \
+             session is not visible to the installed service: use a local folder for it)"
+        );
+    }
     check_path_syntax(key, raw)?;
     let resolved = if is_absolute_path_text(raw) {
         PathBuf::from(raw)
@@ -1717,9 +1728,19 @@ mod tests {
     fn dir_setting_rejects_unc_prefix() {
         let r = std::path::Path::new("/r");
         for p in [r"\\server\share\x", "//server/share"] {
-            let e = super::validate_dir_setting("log_path", p, r).unwrap_err();
-            assert!(e.to_string().contains("UNC"), "{p}: {e}");
+            for key in ["log_path", "cache_dir", "save_image_path"] {
+                let e = super::validate_dir_setting(key, p, r)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.starts_with(&format!("{key}: UNC")), "{p}: {e}");
+                assert!(e.contains("map the share to a drive letter"), "{p}: {e}");
+            }
         }
+        // Verbatim paths keep their own message; other path fields keep the plain one.
+        let e = super::validate_dir_setting("log_path", r"\\?\UNC\s\x", r).unwrap_err();
+        assert!(e.to_string().contains("verbatim"), "{e}");
+        let e = super::check_path_syntax("path", r"\\server\share").unwrap_err();
+        assert!(!e.to_string().contains("drive letter"), "{e}");
     }
 
     #[test]

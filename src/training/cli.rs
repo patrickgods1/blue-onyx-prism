@@ -183,8 +183,9 @@ pub struct ImportArgs {
     /// Videos extracted at the same time (0 = half the physical cores, 1 to 4).
     #[arg(long, default_value_t = 0)]
     pub workers: usize,
-    /// Hardware video decoding: auto (VideoToolbox, D3D11VA, CUDA or VAAPI when PyAV's FFmpeg
-    /// has it; software when not or when it fails) or off.
+    /// Hardware video decoding: auto (D3D11VA on Windows, CUDA then VAAPI on Linux when PyAV's
+    /// FFmpeg has it; software when not or when it fails; macOS decodes in software, where
+    /// VideoToolbox measured slower) or off.
     #[arg(long, default_value = "auto", value_parser = parse_hwaccel)]
     pub hwaccel: super::import::HwAccel,
     /// Allow downloads over 500 MB (the training environment, SigLIP 2).

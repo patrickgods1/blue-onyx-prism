@@ -12,13 +12,16 @@
   }
 
   // Show the `[attr]` blocks of `form` whose space-separated list names `value`. A hidden
-  // block's fields still post; the server ignores the ones the choice does not use.
+  // block's fields are disabled (not posted, not validated: a stale value there must not block
+  // the form); the server ignores the fields the choice does not use anyway.
   function toggle(form, name, attr) {
     if (!form) return;
     var update = function () {
       var v = checked(form, name);
       form.querySelectorAll("[" + attr + "]").forEach(function (el) {
-        el.hidden = el.getAttribute(attr).split(" ").indexOf(v) < 0;
+        var off = el.getAttribute(attr).split(" ").indexOf(v) < 0;
+        el.hidden = off;
+        el.querySelectorAll("input, select, textarea").forEach(function (f) { f.disabled = off; });
       });
     };
     form.querySelectorAll('input[name="' + name + '"]').forEach(function (r) {
@@ -27,6 +30,26 @@
     update();
   }
   toggle(document.getElementById("import-form"), "source", "data-source");
+
+  // An invalid field inside a closed <details> (Sampling options, Advanced) cannot show its
+  // message: open it first.
+  document.querySelectorAll("form").forEach(function (f) {
+    f.addEventListener("invalid", function (ev) {
+      var d = ev.target.closest && ev.target.closest("details");
+      if (d && !d.open) d.open = true;
+    }, true);
+  });
+
+  // Enter in the Train form's "Another folder" saves the folder (the form's default button
+  // queues training).
+  var trainFolder = document.getElementById("train-folder");
+  if (trainFolder && trainFolder.form) {
+    trainFolder.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter") return;
+      var save = trainFolder.form.querySelector('button[name="save"]');
+      if (save) { ev.preventDefault(); save.click(); }
+    });
+  }
 
   // The import preview: what the path holds and the per-video budget, one line under the
   // field (GET /v1/training/import/preview), debounced; Browse fills the field and fires
@@ -156,7 +179,9 @@
         if (!data) return;
         var a = update(runs, "run", data.runs);
         var b = update(tasks, "task", data.tasks);
-        if (a || b) window.location.reload();
+        // Not reload(): the page may be the answer to a POST, and reloading it would ask to
+        // resubmit (and queue the job again).
+        if (a || b) window.location.assign("/training" + window.location.hash);
       })
       .catch(function () {});
   }

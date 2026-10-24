@@ -89,7 +89,7 @@
     </fieldset>
     <div class="tr-field" data-source="path">
       <label for="import-path">Video, image or folder</label>
-      <div class="with-browse tr-browse"><input type="text" id="import-path" name="path" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Video file&hellip;</button><button type="button" class="browse secondary" data-browse="folder" data-target="path" hidden>Folder&hellip;</button></div>
+      <div class="with-browse tr-browse"><input type="text" id="import-path" name="path" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Video file&hellip;</button><button type="button" class="browse secondary" data-browse="folder" data-target="path" data-title="Choose a clip or image folder" hidden>Folder&hellip;</button></div>
       <p class="muted small" id="import-preview" aria-live="polite" hidden></p>
       <p class="muted small">Blue Iris clip and alert folders work. <code>.bvr</code> clips cannot be read: export them to MP4 in Blue Iris first.</p>
     </div>
@@ -204,7 +204,7 @@
       </div>
       <div class="tr-field">
         <label for="al-threshold">Its threshold</label>
-        <input type="number" id="al-threshold" name="threshold" min="0.01" max="1" step="0.05" value="0.3">
+        <input type="number" id="al-threshold" name="threshold" min="0.01" max="1" step="0.01" value="0.3">
       </div>
     </div>
     <fieldset>
@@ -275,7 +275,7 @@
     {% endfor %}
     <div class="tr-field">
       <label for="train-folder">Another folder</label>
-      <div class="with-browse tr-browse"><input type="text" id="train-folder" name="dataset_path" autocomplete="off" placeholder="C:\BlueOnyx\exports\review-2026-10"><button type="button" class="browse secondary" data-browse="folder" data-target="dataset_path" hidden>Folder&hellip;</button><button type="submit" class="secondary" formaction="/training/datasets" formnovalidate name="save" value="1">Save folder</button></div>
+      <div class="with-browse tr-browse"><input type="text" id="train-folder" name="dataset_path" autocomplete="off" placeholder="C:\BlueOnyx\exports\review-2026-10"><button type="button" class="browse secondary" data-browse="folder" data-target="dataset_path" data-title="Choose a review export folder" hidden>Folder&hellip;</button><button type="submit" class="secondary" formaction="/training/datasets" formnovalidate name="save" value="1">Save folder</button></div>
       <p class="muted small">Used by this run when filled; Save folder keeps it in the list above.</p>
     </div>
     <div class="tr-grid">

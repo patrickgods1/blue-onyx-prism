@@ -77,6 +77,66 @@ pub fn is_image(p: &Path) -> bool {
     IMAGE_EXTS.contains(&ext_of(p).as_str())
 }
 
+/// Why a listing stopped before the end of the walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Stop {
+    /// [`MAX_FILES`] videos and images listed, with more entries left.
+    Files,
+    /// [`Budget::max_dirs`] folders read.
+    Folders,
+    /// [`Budget::deadline`] passed.
+    Time,
+    /// [`Budget::cancel`] said so (a newer preview).
+    Cancelled,
+}
+
+/// Limits of a walk on top of [`MAX_FILES`] and [`MAX_DEPTH`] (the preview's budget; an import
+/// lists with [`Budget::default`], no further limit).
+#[derive(Default)]
+pub struct Budget<'a> {
+    /// Most videos and images listed (None = [`MAX_FILES`]; smaller in tests).
+    pub max_files: Option<usize>,
+    /// Most folders read (`read_dir` calls).
+    pub max_dirs: Option<usize>,
+    /// The walk stops when this passes (checked per folder and every [`CHECK_EVERY`] entries).
+    pub deadline: Option<std::time::Instant>,
+    /// Stop when this answers true (checked like the deadline).
+    pub cancel: Option<&'a (dyn Fn() -> bool + Sync)>,
+    /// Sum the sizes of the videos and images into [`Discovered::bytes`].
+    pub sizes: bool,
+}
+
+/// Entries between two checks of the deadline and the cancel flag inside one folder.
+pub const CHECK_EVERY: usize = 256;
+
+impl std::fmt::Debug for Budget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Budget")
+            .field("max_files", &self.max_files)
+            .field("max_dirs", &self.max_dirs)
+            .field("deadline", &self.deadline)
+            .field("cancel", &self.cancel.is_some())
+            .field("sizes", &self.sizes)
+            .finish()
+    }
+}
+
+impl Budget<'_> {
+    fn interrupted(&self) -> Option<Stop> {
+        if self.cancel.is_some_and(|c| c()) {
+            return Some(Stop::Cancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Some(Stop::Time);
+        }
+        None
+    }
+}
+
 /// What a path holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Discovered {
@@ -86,8 +146,13 @@ pub struct Discovered {
     pub bvr: usize,
     /// Other files skipped.
     pub other: usize,
-    /// The listing stopped at [`MAX_FILES`].
+    /// The listing stopped early ([`Discovered::stopped`] says why).
     pub truncated: bool,
+    pub stopped: Option<Stop>,
+    /// Folders read.
+    pub dirs: usize,
+    /// Size of the videos and images (only with [`Budget::sizes`]).
+    pub bytes: u64,
 }
 
 impl Discovered {
@@ -102,23 +167,42 @@ impl Discovered {
                 self.bvr
             ));
         }
-        if self.truncated {
-            w.push(format!(
-                "only the first {MAX_FILES} files were listed; import sub-folders one at a time"
-            ));
+        match self.stopped {
+            Some(Stop::Files) => w.push(format!(
+                "only the first {MAX_FILES} videos and images are listed; import sub-folders one \
+                 at a time"
+            )),
+            Some(Stop::Folders | Stop::Time) => w.push(format!(
+                "a large folder: the preview counted the first {} folders only; an import lists \
+                 up to {MAX_FILES} videos and images",
+                self.dirs
+            )),
+            Some(Stop::Cancelled) | None => {}
         }
         w
     }
 }
 
 /// The videos and images at `path` (a file, or a folder walked [`MAX_DEPTH`] levels deep; hidden
-/// entries and symlinked folders skipped), sorted by path.
+/// entries and symlinked folders skipped), sorted by path. The walk stops as soon as
+/// [`MAX_FILES`] videos and images are listed.
 pub fn discover(path: &Path) -> Result<Discovered> {
+    discover_with(path, &Budget::default())
+}
+
+/// [`discover`] within `budget`: the walk stops (`truncated`, [`Discovered::stopped`]) at the
+/// first limit reached and never reads another folder after it. A cancelled walk answers what
+/// it found (maybe nothing) without an error; a walk stopped by the budget before finding
+/// anything is an error that says so.
+pub fn discover_with(path: &Path, budget: &Budget<'_>) -> Result<Discovered> {
     let meta = std::fs::metadata(path)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
     let mut d = Discovered::default();
     if meta.is_file() {
         classify(path, &mut d);
+        if budget.sizes && (!d.videos.is_empty() || !d.images.is_empty()) {
+            d.bytes = meta.len();
+        }
         if d.videos.is_empty() && d.images.is_empty() {
             if d.bvr > 0 {
                 bail!("{}", d.warnings().join("; "));
@@ -132,34 +216,25 @@ pub fn discover(path: &Path) -> Result<Discovered> {
         }
         return Ok(d);
     }
-    let mut stack = vec![(path.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut entries: Vec<_> = rd.flatten().collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for e in entries {
-            if e.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
-                if depth < MAX_DEPTH {
-                    stack.push((e.path(), depth + 1));
-                }
-            } else if ft.is_file() {
-                if d.videos.len() + d.images.len() >= MAX_FILES {
-                    d.truncated = true;
-                    continue;
-                }
-                classify(&e.path(), &mut d);
-            }
-        }
-    }
+    d.stopped = walk(path, budget, &mut d);
+    d.truncated = d.stopped.is_some();
     d.videos.sort();
     d.images.sort();
-    if d.videos.is_empty() && d.images.is_empty() {
+    let empty = d.videos.is_empty() && d.images.is_empty();
+    if d.stopped == Some(Stop::Cancelled) {
+        return Ok(d);
+    }
+    if empty && matches!(d.stopped, Some(Stop::Folders | Stop::Time)) {
+        bail!(
+            "{} is a large folder: no video ({}) or image ({}) files in the first {} folders the \
+             preview reads; choose the sub-folder that holds the clips",
+            path.display(),
+            VIDEO_EXTS.join(", "),
+            IMAGE_EXTS.join(", "),
+            d.dirs
+        );
+    }
+    if empty {
         let mut why = format!(
             "{} has no video ({}) or image ({}) files",
             path.display(),
@@ -173,6 +248,69 @@ pub fn discover(path: &Path) -> Result<Discovered> {
         bail!("{why}");
     }
     Ok(d)
+}
+
+/// The folder walk of [`discover_with`]: why it stopped early, None when it listed everything.
+fn walk(path: &Path, budget: &Budget<'_>, d: &mut Discovered) -> Option<Stop> {
+    let mut stack = vec![(path.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    let mut tick = |budget: &Budget<'_>| -> Option<Stop> {
+        seen += 1;
+        if seen.is_multiple_of(CHECK_EVERY) {
+            budget.interrupted()
+        } else {
+            None
+        }
+    };
+    while let Some((dir, depth)) = stack.pop() {
+        if let Some(stop) = budget.interrupted() {
+            return Some(stop);
+        }
+        if budget.max_dirs.is_some_and(|m| d.dirs >= m) {
+            return Some(Stop::Folders);
+        }
+        d.dirs += 1;
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries = Vec::new();
+        for e in rd.flatten() {
+            entries.push(e);
+            if let Some(stop) = tick(budget) {
+                return Some(stop);
+            }
+        }
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        let mut rest = entries.into_iter().peekable();
+        while let Some(e) = rest.next() {
+            if let Some(stop) = tick(budget) {
+                return Some(stop);
+            }
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < MAX_DEPTH {
+                    stack.push((e.path(), depth + 1));
+                }
+            } else if ft.is_file() {
+                let p = e.path();
+                let media = is_video(&p) || is_image(&p);
+                classify(&p, d);
+                if media && budget.sizes {
+                    d.bytes += e.metadata().map_or(0, |m| m.len());
+                }
+                if media && d.videos.len() + d.images.len() >= budget.max_files.unwrap_or(MAX_FILES)
+                {
+                    // Full: stop here; "more" when anything is left to look at.
+                    let more = rest.peek().is_some() || !stack.is_empty();
+                    return more.then_some(Stop::Files);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn classify(p: &Path, d: &mut Discovered) {
@@ -465,6 +603,110 @@ mod tests {
         assert!(e.to_string().contains(".bvr"), "{e}");
         assert!(discover(&dir.join("notes.txt")).is_err());
         assert!(discover(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_budget_stops_the_walk_without_reading_further_folders() {
+        let dir = std::env::temp_dir().join(format!("bop-import-budget-{}", uuid::Uuid::new_v4()));
+        // 30 folders of one clip each, plus a notes file.
+        for i in 0..30 {
+            let sub = dir.join(format!("d{i:02}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("Cam.20240101_010101.mp4"), b"vid").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let all = discover_with(
+            &dir,
+            &Budget {
+                sizes: true,
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((all.videos.len(), all.dirs, all.truncated), (30, 31, false));
+        assert_eq!(all.stopped, None);
+        assert_eq!(all.bytes, 90);
+        // At most 5 folders read: the root and 4 sub-folders.
+        let d = discover_with(
+            &dir,
+            &Budget {
+                max_dirs: Some(5),
+                sizes: true,
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((d.videos.len(), d.dirs), (4, 5));
+        assert_eq!(d.stopped, Some(Stop::Folders));
+        assert!(d.truncated);
+        assert_eq!(d.bytes, 12);
+        assert!(
+            d.warnings()[0].contains("first 5 folders"),
+            "{:?}",
+            d.warnings()
+        );
+        // A deadline in the past reads nothing; with nothing found that is an error that says
+        // the folder is large.
+        let e = discover_with(
+            &dir,
+            &Budget {
+                deadline: Some(std::time::Instant::now()),
+                ..Budget::default()
+            },
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("is a large folder"), "{e}");
+        // A cancelled walk answers what it has, without an error.
+        let yes = || true;
+        let c = discover_with(
+            &dir,
+            &Budget {
+                cancel: Some(&yes),
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (c.stopped, c.dirs, c.videos.len()),
+            (Some(Stop::Cancelled), 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_file_cap_stops_at_once_and_only_claims_more_when_there_is_more() {
+        let dir = std::env::temp_dir().join(format!("bop-import-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.join("a").join(format!("{i:02}.jpg")), b"").unwrap();
+        }
+        let cap = |n| Budget {
+            max_files: Some(n),
+            ..Budget::default()
+        };
+        // Exactly the cap: not truncated.
+        let d = discover_with(&dir, &cap(10)).unwrap();
+        assert_eq!((d.images.len(), d.truncated), (10, false));
+        // Entries left in the folder: more.
+        let d = discover_with(&dir, &cap(4)).unwrap();
+        assert_eq!((d.images.len(), d.stopped), (4, Some(Stop::Files)));
+        // Folders are read last-sorted first: `a`, then `0extra`, which is never read once `a`
+        // fills the cap (the walk stops at once), yet makes it "more".
+        std::fs::create_dir_all(dir.join("0extra/c")).unwrap();
+        std::fs::write(dir.join("0extra/c/x.mp4"), b"").unwrap();
+        let d = discover_with(&dir, &cap(10)).unwrap();
+        assert_eq!((d.images.len(), d.videos.len()), (10, 0));
+        assert_eq!(d.stopped, Some(Stop::Files));
+        assert_eq!(d.dirs, 2, "the root and `a` only");
+        assert!(
+            d.warnings()[0].contains("only the first 20000"),
+            "{:?}",
+            d.warnings()
+        );
+        // Without the cap everything is listed.
+        let d = discover(&dir).unwrap();
+        assert_eq!((d.images.len(), d.videos.len(), d.dirs), (10, 1, 4));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

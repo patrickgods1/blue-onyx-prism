@@ -797,7 +797,7 @@ ul.tr-legend { list-style: none; padding: 0; margin: 0.5rem 0; display: flex; fl
 
 /* ---- Cross-page fixes: labels, hints, grids, state cells, resources ------------------------ */
 /* A hint line under a field (inside its label, after the input). */
-form label > .muted.small, form label > .field-hint { display: block; font-size: 0.8rem; margin: 0; }
+.fields label > .muted.small, #bench-form label > .muted.small, #bench-form label > .field-hint { display: block; font-size: 0.8rem; margin: 0; }
 input.num-sm { width: 6rem; }
 /* Number and short text fields in an auto-fill grid (Dataset settings, Review export). */
 .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(14rem, 100%), 1fr)); gap: 0 1.2rem; align-items: end; }
