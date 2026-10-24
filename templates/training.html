@@ -1,157 +1,37 @@
 {% extends "base.html" %}
 {% block title %}Training{% endblock %}
 {% block content %}
+<div class="tr">
 <h1>Training</h1>
-<p class="muted">Fine-tune a detection model on frames you reviewed on the <a href="/review">Review</a> page (exported in YOLO format), export it to ONNX, add it to the config and benchmark it on held-out frames from cameras and days it did not train on. Details and licences: <code>docs/TRAINING.md</code>.</p>
+<p class="muted">Fine-tune a detection model on your own frames: import footage, let the auto-labelers propose boxes, review and export them on the <a href="/review">Review</a> page, train here, then use the model. Every trained model is exported to ONNX, added to the config and benchmarked on held-out frames from cameras and days it did not train on. Details and licences: <code>docs/TRAINING.md</code>.</p>
+<ol class="tr-steps">
+  <li><a href="#import">Import footage</a></li>
+  <li><a href="#autolabel">Auto-label</a></li>
+  <li><a href="/review">Review &amp; export</a></li>
+  <li><a href="#train">Train</a></li>
+  <li><a href="#use">Use</a></li>
+</ol>
 {% if let Some(m) = message %}<p class="notice">{{ m }}</p>{% endif %}
 {% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
 
-<div class="card">
+<div class="card tr-wrap" id="machine">
   <h2>This machine</h2>
   <p>{% if available %}{{ summary }}{% else %}<span class="error">{{ summary }}</span>{% endif %}</p>
   {% if !reasons.is_empty() %}
   <ul>{% for r in reasons %}<li class="muted">{{ r }}</li>{% endfor %}</ul>
   {% endif %}
-  <div class="facts">
-    <div><span class="k">Training environment</span> {{ env_note }}</div>
-    <div><span class="k">Runs folder</span> <code>{{ training_dir }}</code></div>
-  </div>
+  <p class="tr-fact"><span class="k">Training environment</span> {{ env_note }}</p>
+  <p class="tr-fact"><span class="k">Runs folder</span> <code>{{ training_dir }}</code></p>
   {% if env_ready %}
-  <form method="post" action="/training/remove-env" class="inline"><button type="submit" class="small danger">Remove training environment</button> <span class="muted">(uv and Python stay for the model export)</span></form>
+  <form method="post" action="/training/remove-env" class="inline"><button type="submit" class="small danger">Remove training environment</button> <span class="muted small">uv and Python stay for the model export</span></form>
   {% endif %}
 </div>
 
-<div class="card" id="import">
-  <h2>Import footage</h2>
-  <p class="muted">Frames from your own videos and image folders (Blue Iris clip and alert folders included), a video URL, or pinned open footage go into the dataset folder <code>{{ dataset_dir }}</code> and the Review queue, like collected frames. Scene changes are kept at a bounded rate (FFmpeg <code>select</code>), near duplicates dropped (dHash), and the frames picked by SigLIP 2 k-center, balanced by day / night / IR. Every frame records its source and the licence you confirm. Details: <code>docs/TRAINING.md</code>.</p>
-  <form method="post" action="/training/import">
-    <div class="facts">
-      <label>Source <select name="source"><option value="path">a video, an image or a folder on this machine</option><option value="url">a video URL (yt-dlp)</option><option value="dataset">pinned open footage</option></select></label>
-      <label>File or folder <span class="with-browse"><input type="text" name="path" size="60" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Browse&hellip;</button></span></label>
-      <label>URL <input type="url" name="url" size="60" placeholder="https://..."></label>
-      <label>Pinned footage <select name="dataset">{% for d in footage %}<option value="{{ d.key }}">{{ d.key }}: {{ d.title }} ({{ d.license }}, {{ d.size }})</option>{% endfor %}</select></label>
-    </div>
-    <div class="facts">
-      <label>Frames to keep <input type="number" name="frames" min="1" max="5000" value="200"></label>
-      <label>Selection <select name="select"><option value="siglip">SigLIP 2 embeddings, k-center</option><option value="dhash">dHash k-center (image folders: no GPU, no download)</option></select></label>
-      <label>Scene-change threshold (0.01 = motion in a fixed camera, 0.3 = cuts) <input type="number" name="scene" min="0" max="1" step="0.005" value="0.01"></label>
-      <label>Max frames per second <input type="number" name="max_fps" min="0" max="60" step="0.5" value="1"></label>
-      <label>Dedup window (s) <input type="number" name="dedup_window" min="0" max="86400" step="1" value="10"></label>
-      <label>One frame every (s) <input type="number" name="every" min="0" max="3600" step="1" value="10"></label>
-      <label>Camera folder (empty = from the file names) <input type="text" name="camera" size="20"></label>
-      <label class="check"><input type="checkbox" name="no_balance"> Do not balance by scene</label>
-    </div>
-    <div class="facts">
-      <label>Licence <input type="text" name="license" size="30" placeholder="own footage / CC BY 4.0"></label>
-      <label class="check"><input type="checkbox" name="confirm_license"> I may use this footage for training under that licence (stored with every frame; not needed for pinned footage)</label>
-      <label class="check"><input type="checkbox" name="confirm_large"> Download what is missing (the training environment, SigLIP 2: over 500 MB)</label>
-    </div>
-    <p class="muted small">Sites that list unsecured or private cameras (Insecam and the like) are refused, and live streams are never read. Blue Iris <code>.bvr</code> clips cannot be read: export them to MP4 in Blue Iris first.</p>
-    <button type="submit">Import</button>
-  </form>
-  {% if !imports.is_empty() %}
-  <h3>Recent imports</h3>
-  <div class="scroll"><table>
-    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Cameras</th></tr></thead>
-    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}{% if let Some(a) = i.attribution %}<br><span class="muted small">{{ a }}</span>{% endif %}</td><td class="num">{{ i.frames }}</td><td>{{ i.cameras.join(", ") }}</td></tr>{% endfor %}</tbody>
-  </table></div>
-  {% endif %}
-</div>
-
-<div class="card" id="autolabel">
-  <h2>Auto-label</h2>
-  <p class="muted">Proposes boxes for dataset frames as pending <em>auto</em> boxes on the <a href="/review">Review</a> page: MM-Grounding-DINO (open vocabulary, the class list plus <code>training.synonyms</code>) and RF-DETR L (COCO classes) fused, person and single-labeler boxes checked by Qwen3-VL, animals ranked by SigLIP 2. A box is marked <em>accept</em> only when both labelers agree at 0.6 or more and no check objects; night persons and animals are always <em>review</em>. Nothing is accepted or deleted for you. Needs an NVIDIA GPU or Apple silicon; re-labelling with a trained model (self-training) runs anywhere.</p>
-  <form method="post" action="/training/autolabel">
-    <div class="facts">
-      <label>Frames <input type="text" name="frames" size="50" placeholder="status=unreviewed,source=all,limit=200" value=""></label>
-      <label>MM-Grounding-DINO <select name="gdino"><option value="tiny">tiny (Swin-T, 0.7 GB)</option><option value="base">base (Swin-B, 0.9 GB)</option><option value="large">large (Swin-L, 1.4 GB)</option><option value="off">off</option></select></label>
-      <label class="check"><input type="checkbox" name="rfdetr" checked> RF-DETR L (COCO classes, 0.1 GB)</label>
-      <label>VLM check <select name="vlm"><option value="2b">Qwen3-VL 2B (4.3 GB)</option><option value="4b">Qwen3-VL 4B (8.9 GB)</option><option value="8b">Qwen3-VL 8B (17.5 GB)</option><option value="off">off</option></select></label>
-      <label class="check"><input type="checkbox" name="siglip" checked> SigLIP 2 species ranking (1.5 GB)</label>
-    </div>
-    <div class="facts">
-      <label>Or re-label with a trained model <select name="with_model"><option value="">(no: use the labelers above)</option>{% for m in models %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select></label>
-      <label>Its threshold <input type="number" name="threshold" min="0.01" max="1" step="0.05" value="0.3"></label>
-      <label class="check"><input type="checkbox" name="confirm_large"> Download what is missing (over 500 MB)</label>
-    </div>
-    <p class="muted small">Frames: <code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>scene</code> (day, night, ir), <code>camera</code>, <code>label</code> (a class), <code>status</code> (unreviewed, reviewed, skipped, any), <code>source</code> (queue, all; default all here, while the Review page's button uses its own filters), <code>auto</code> (review, accept, nothing, none: never auto-labelled), <code>import</code> (an import id, or any), <code>again=1</code> (also frames these labelers already looked at; skipped otherwise), <code>limit</code>. A re-label looks at every frame by default and sends the ones whose reviewed labels the model disagrees with back to review, first in the queue.</p>
-    <button type="submit">Auto-label</button>
-  </form>
-</div>
-
-{% if available %}
-<form method="post" action="/training/queue">
-<div class="card">
-  <h2>1. Datasets</h2>
-  <p class="muted">Review export folders (YOLO layout: <code>classes.txt</code>, <code>images/</code>, <code>labels/</code>): the saved ones and the Review page's exports under <code>{{ training_dir }}/exports</code>. The export's validation split (held out by camera and day) becomes the benchmark set.</p>
-  {% if datasets.is_empty() %}<p class="muted">No folder saved yet: add one below, or type a path.</p>{% endif %}
-  {% for d in datasets %}
-  <label class="check"><input type="checkbox" name="dataset" value="{{ d.path }}"{% if !d.exists %} disabled{% else if d.saved %} checked{% endif %}> <code>{{ d.path }}</code>{% if !d.exists %} <span class="error">(missing)</span>{% endif %}{% if !d.saved %} <span class="muted">(Review page export)</span>{% endif %}</label>
-  {% endfor %}
-  <label>Another folder <input type="text" name="dataset_path" size="60" placeholder="C:\BlueOnyx\exports\review-2026-10"></label>
-  <div class="facts">
-    <label>Scene <select name="scene">{% for (v, t) in scenes %}<option value="{{ v }}">{{ t }}</option>{% endfor %}</select></label>
-    <label>Classes (comma-separated, head order; empty = all of the export) <input type="text" name="classes" size="40" placeholder="person, car, dog, cat, raccoon"></label>
-    <label class="check"><input type="checkbox" name="public"{% if !public_available %} disabled{% endif %}> Mix in the public night subset (LILA camera traps, CDLA){% if !public_available %} <span class="muted">(not pinned in this build)</span>{% else if !public_installed %} <span class="muted">(a {{ public_size }} download on the first run)</span>{% endif %}</label>
-  </div>
-</div>
-
-<div class="card">
-  <h2>2. Models</h2>
-  <p class="muted">Tick one or more; they train one after the other. Estimates are rough (GPU memory at the suggested batch, time per epoch per 100 images).</p>
-  {% for f in families %}
-  <h3>{{ f.title }} <span class="tag">{{ f.license }}</span></h3>
-  {% if !f.available %}<p class="muted">{{ f.why }}</p>{% else %}
-  <p class="muted small">{{ f.notice }}</p>
-  <div class="scroll">
-  <table>
-    <thead><tr><th></th><th>Size</th><th>Estimate</th><th>Inference</th></tr></thead>
-    <tbody>
-    {% for s in f.sizes %}
-    <tr>
-      <td><input type="checkbox" name="model" value="{{ s.label }}" aria-label="{{ s.label }}"{% if !s.fits %} disabled{% endif %}></td>
-      <td><code>{{ s.size }}</code></td>
-      <td>{% if s.fits %}{{ s.estimate }}{% else %}<span class="muted">{{ s.why }}</span>{% endif %}</td>
-      <td class="muted">{{ s.latency }}</td>
-    </tr>
-    {% endfor %}
-    </tbody>
-  </table>
-  </div>
-  {% endif %}
-  {% endfor %}
-</div>
-
-<div class="card">
-  <h2>3. Options</h2>
-  <div class="facts">
-    <label>Epochs <input type="number" name="epochs" min="1" max="1000" value="{{ epochs }}"></label>
-    <label>Batch (empty = suggested) <input type="number" name="batch" min="1" max="256"></label>
-    <label>Input size (empty = the size's own) <input type="number" name="imgsz" min="160" max="1536" step="32"></label>
-    <label>Learning rate (empty = default) <input type="text" name="lr" size="8"></label>
-    <label>Model name (one model; empty = night-/custom-&lt;model&gt;-&lt;date&gt;) <input type="text" name="name" size="30"></label>
-  </div>
-  <div class="facts">
-    <label class="check"><input type="checkbox" name="night_aug"> Night augmentation (darkness 0.5, noise 0.3, grayscale 0.5)</label>
-    <label>Darkness p <input type="number" name="aug_dark" min="0" max="1" step="0.05"></label>
-    <label>Noise p <input type="number" name="aug_noise" min="0" max="1" step="0.05"></label>
-    <label>Grayscale p <input type="number" name="aug_gray" min="0" max="1" step="0.05"></label>
-  </div>
-  <div class="facts">
-    <span class="k">Also benchmark on</span>
-    {% for s in extra_sets %}<label class="check"><input type="checkbox" name="benchmark_set" value="{{ s }}"> <code>{{ s }}</code></label>{% endfor %}
-  </div>
-  {% if !allow_large && (!env_ready || (public_available && !public_installed)) %}
-  <label class="check"><input type="checkbox" name="confirm_large"> Download what is missing (over 500 MB):{% if !env_ready %} the training environment ({{ env_note }}){% endif %}{% if !env_ready && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>
-  {% endif %}
-  <button type="submit">Queue training</button>
-</div>
-</form>
-{% endif %}
-
-<div class="card">
-  <h2>Queue</h2>
-  {% if runs.is_empty() %}<p class="muted">No queued, running or failed runs.</p>{% else %}
+<div class="card" id="jobs">
+  <h2>Jobs</h2>
+  {% if runs.is_empty() && tasks.is_empty() %}<p class="muted">Nothing queued or running. Imports, auto-label runs and training runs show here with their progress.</p>{% endif %}
+  {% if !runs.is_empty() %}
+  <h3>Training runs</h3>
   <div class="scroll">
   <table id="training-runs">
     <thead><tr><th>Run</th><th>Model</th><th>State</th><th>Progress</th><th></th></tr></thead>
@@ -172,11 +52,9 @@
   </table>
   </div>
   {% endif %}
-</div>
-
-<div class="card">
-  <h2>Import and auto-label jobs</h2>
-  {% if tasks.is_empty() %}<p class="muted">None yet.</p>{% else %}
+  {% if !tasks.is_empty() %}
+  <details class="tr-tasks"{% if tasks_busy || runs.is_empty() %} open{% endif %}>
+  <summary>Import and auto-label jobs ({{ tasks.len() }})</summary>
   <div class="scroll">
   <table id="training-tasks">
     <thead><tr><th>Job</th><th>State</th><th>Progress</th><th></th></tr></thead>
@@ -195,12 +73,317 @@
     </tbody>
   </table>
   </div>
+  </details>
   {% endif %}
 </div>
 
-<div class="card">
-  <h2>Trained models</h2>
-  {% if results.is_empty() %}<p class="muted">None yet.</p>{% else %}
+<div class="card" id="import">
+  <h2>Import footage</h2>
+  <p class="muted">Frames from your own videos and image folders, a video URL or pinned open footage go into the dataset folder (<code>{{ dataset_dir }}</code>) and the Review queue, like collected frames. Scene changes are kept at a bounded rate, near duplicates dropped, and the frames picked by SigLIP 2, balanced by day / night / IR. Every frame records its source and licence.</p>
+  <form method="post" action="/training/import" class="tr-form" id="import-form">
+    <fieldset class="tr-radios">
+      <legend>Source</legend>
+      <label class="check"><input type="radio" name="source" value="path" checked> Files on this machine</label>
+      <label class="check"><input type="radio" name="source" value="url"> Video URL</label>
+      <label class="check"><input type="radio" name="source" value="dataset"> Pinned open footage</label>
+    </fieldset>
+    <div class="tr-field" data-source="path">
+      <label for="import-path">Video, image or folder</label>
+      <div class="with-browse tr-browse"><input type="text" id="import-path" name="path" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Video file&hellip;</button><button type="button" class="browse secondary" data-browse="folder" data-target="path" hidden>Folder&hellip;</button></div>
+      <p class="muted small">Blue Iris clip and alert folders work. <code>.bvr</code> clips cannot be read: export them to MP4 in Blue Iris first.</p>
+    </div>
+    <div class="tr-field" data-source="url">
+      <label for="import-url">Video URL</label>
+      <input type="url" id="import-url" name="url" placeholder="https://...">
+      <p class="muted small">Downloaded with yt-dlp. Sites that list unsecured or private cameras (Insecam and the like) are refused, and live streams are never read.</p>
+    </div>
+    <div class="tr-field" data-source="dataset">
+      <label for="import-dataset">Pinned footage</label>
+      <select id="import-dataset" name="dataset">{% for d in footage %}<option value="{{ d.key }}">{{ d.key }}: {{ d.title }} ({{ d.license }}, {{ d.size }})</option>{% endfor %}</select>
+      <p class="muted small">Its licence is recorded with every frame; no confirmation needed.</p>
+    </div>
+    <div class="tr-field" data-source="path url">
+      <label for="import-license">Licence</label>
+      <input type="text" id="import-license" name="license" placeholder="own footage / CC BY 4.0">
+      <label class="check"><input type="checkbox" name="confirm_license"> I may use this footage for training under that licence</label>
+      <p class="muted small">Stored with every frame.</p>
+    </div>
+    <div class="tr-field tr-narrow">
+      <label for="import-frames">Frames to keep</label>
+      <input type="number" id="import-frames" name="frames" min="1" max="5000" value="200">
+    </div>
+    <details class="tr-more">
+      <summary>Sampling options</summary>
+      <div class="tr-grid">
+        <div class="tr-field">
+          <label for="import-select">Selection</label>
+          <select id="import-select" name="select"><option value="siglip">SigLIP 2 embeddings, k-center</option><option value="dhash">dHash k-center</option></select>
+          <p class="muted small">dHash: image folders import without a GPU or a download.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-scene">Scene-change threshold</label>
+          <input type="number" id="import-scene" name="scene" min="0" max="1" step="0.005" value="0.01">
+          <p class="muted small">0.01 = motion in a fixed camera, 0.3 = cuts (FFmpeg <code>select</code>).</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-fps">Max frames per second</label>
+          <input type="number" id="import-fps" name="max_fps" min="0" max="60" step="0.5" value="1">
+          <p class="muted small">Scene changes kept at most at this rate.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-dedup">Dedup window (s)</label>
+          <input type="number" id="import-dedup" name="dedup_window" min="0" max="86400" step="1" value="10">
+          <p class="muted small">Near duplicates (dHash) within this time are dropped.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-every">One frame every (s)</label>
+          <input type="number" id="import-every" name="every" min="0" max="3600" step="1" value="10">
+          <p class="muted small">Also a periodic frame when nothing moves; 0 = off.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-camera">Camera folder</label>
+          <input type="text" id="import-camera" name="camera">
+          <p class="muted small">Empty = from the file names.</p>
+        </div>
+      </div>
+      <label class="check"><input type="checkbox" name="no_balance"> Do not balance by scene</label>
+      <p class="muted small">Without it, the picked frames are balanced by day / night / IR.</p>
+    </details>
+    {% if let Some(what) = import_large %}
+    <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB: {{ what }}</label>
+    {% endif %}
+    <div class="actions"><button type="submit">Import</button></div>
+  </form>
+  {% if !imports.is_empty() %}
+  <details class="tr-more">
+  <summary>Recent imports ({{ imports.len() }})</summary>
+  <div class="scroll"><table>
+    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Cameras</th></tr></thead>
+    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}{% if let Some(a) = i.attribution %}<br><span class="muted small">{{ a }}</span>{% endif %}</td><td class="num">{{ i.frames }}</td><td>{{ i.cameras.join(", ") }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  </details>
+  {% endif %}
+</div>
+
+<div class="card" id="autolabel">
+  <h2>Auto-label</h2>
+  <p class="muted">Proposes boxes for dataset frames as pending <em>auto</em> boxes on the <a href="/review">Review</a> page. Nothing is accepted or deleted for you: a box is marked <em>accept</em> only when both labelers agree at 0.6 or more and no check objects; night persons and animals are always <em>review</em>.</p>
+  <form method="post" action="/training/autolabel" class="tr-form" id="autolabel-form">
+    <fieldset class="tr-radios">
+      <legend>Labelers</legend>
+      <label class="check"><input type="radio" name="mode" value="labelers" checked> Open-vocabulary labelers <span class="muted small">(NVIDIA GPU or Apple silicon)</span></label>
+      <label class="check"><input type="radio" name="mode" value="model"> Re-label with a trained model <span class="muted small">(self-training, runs anywhere)</span></label>
+    </fieldset>
+    <div class="tr-grid" data-mode="labelers">
+      <div class="tr-field">
+        <label for="al-gdino">MM-Grounding-DINO</label>
+        <select id="al-gdino" name="gdino"><option value="tiny">tiny (Swin-T, 0.7 GB)</option><option value="base">base (Swin-B, 0.9 GB)</option><option value="large">large (Swin-L, 1.4 GB)</option><option value="off">off</option></select>
+        <p class="muted small">Open vocabulary: the class list plus <code>training.synonyms</code>.</p>
+      </div>
+      <div class="tr-field">
+        <label for="al-vlm">VLM check</label>
+        <select id="al-vlm" name="vlm"><option value="2b">Qwen3-VL 2B (4.3 GB)</option><option value="4b">Qwen3-VL 4B (8.9 GB)</option><option value="8b">Qwen3-VL 8B (17.5 GB)</option><option value="off">off</option></select>
+        <p class="muted small">Checks person and single-labeler boxes.</p>
+      </div>
+      <div class="tr-field tr-checks">
+        <label class="check"><input type="checkbox" name="rfdetr" checked> RF-DETR L <span class="muted small">(COCO classes, 0.1 GB)</span></label>
+        <label class="check"><input type="checkbox" name="siglip" checked> SigLIP 2 species ranking <span class="muted small">(1.5 GB)</span></label>
+      </div>
+    </div>
+    <div class="tr-grid" data-mode="model">
+      <div class="tr-field">
+        <label for="al-model">Trained model</label>
+        <select id="al-model" name="with_model"><option value="">(choose a model)</option>{% for m in models %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select>
+        <p class="muted small">Frames whose reviewed labels it disagrees with go back to review, first in the queue.</p>
+      </div>
+      <div class="tr-field">
+        <label for="al-threshold">Its threshold</label>
+        <input type="number" id="al-threshold" name="threshold" min="0.01" max="1" step="0.05" value="0.3">
+      </div>
+    </div>
+    <fieldset>
+      <legend>Which frames</legend>
+      <div class="tr-grid">
+        <div class="tr-field">
+          <label for="al-status">Status</label>
+          <select id="al-status" name="status"><option value="">default</option><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select>
+          <p class="muted small">Default: unreviewed; a re-label: any.</p>
+        </div>
+        <div class="tr-field">
+          <label for="al-scene">Scene</label>
+          <select id="al-scene" name="scene"><option value="">any</option><option value="day">day</option><option value="night">night</option><option value="ir">IR</option></select>
+        </div>
+        <div class="tr-field">
+          <label for="al-camera">Camera</label>
+          <input type="text" id="al-camera" name="camera" placeholder="any">
+        </div>
+        <div class="tr-field">
+          <label for="al-label">Class</label>
+          <input type="text" id="al-label" name="label" placeholder="any">
+        </div>
+        <div class="tr-field">
+          <label for="al-auto">Auto-labelled</label>
+          <select id="al-auto" name="auto"><option value="">any</option><option value="none">never</option><option value="review">marked review</option><option value="accept">marked accept</option><option value="nothing">found nothing</option></select>
+        </div>
+        <div class="tr-field">
+          <label for="al-limit">Limit</label>
+          <input type="number" id="al-limit" name="limit" min="1" max="20000" value="200">
+          <p class="muted small">Most frames, in queue order.</p>
+        </div>
+      </div>
+      <label class="check"><input type="checkbox" name="again" value="1"> Also frames these labelers already looked at</label>
+      <details class="tr-more">
+        <summary>Other filters</summary>
+        <div class="tr-field">
+          <label for="al-frames">Filter text</label>
+          <input type="text" id="al-frames" name="frames" placeholder="bucket=empty,import=any">
+          <p class="muted small"><code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>import</code> (an import id, or any), <code>source</code> (queue, all; default all here), and any key above (<code>scene</code> day, night, ir; <code>camera</code>; <code>label</code>; <code>status</code> unreviewed, reviewed, skipped, any; <code>auto</code> review, accept, nothing, none; <code>again=1</code>; <code>limit</code>). A key given here wins over its field.</p>
+        </div>
+      </details>
+    </fieldset>
+    {% if let Some(what) = autolabel_large %}
+    <label class="check tr-confirm" data-mode="labelers"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB: {{ what }}</label>
+    {% endif %}
+    <div class="actions"><button type="submit">Auto-label</button></div>
+  </form>
+</div>
+
+<div class="card" id="review">
+  <h2>Review &amp; export</h2>
+  <p>Accept, fix or reject the proposed boxes on the <a href="/review">Review</a> page, then export in YOLO format there. The export (split by camera and day) shows up under Train &rarr; Datasets below.</p>
+</div>
+
+<form method="post" action="/training/queue" class="card tr-form" id="train">
+  <button type="submit" class="tr-default-submit" tabindex="-1" aria-hidden="true"{% if !available %} disabled{% endif %}>Queue training</button>
+  <h2>Train</h2>
+  {% if !available %}<p class="muted">Training is not available on this machine (see This machine above); the saved dataset folders can still be managed.</p>{% endif %}
+  <fieldset class="tr-step" id="datasets">
+    <legend>1. Datasets</legend>
+    <p class="muted small">Review export folders (YOLO layout: <code>classes.txt</code>, <code>images/</code>, <code>labels/</code>): the saved ones and the Review page's exports under <code>{{ training_dir }}/exports</code>. The export's validation split (held out by camera and day) becomes the benchmark set.</p>
+    {% if datasets.is_empty() %}<p class="muted">No folder yet: export one on the Review page, or add one below.</p>{% endif %}
+    {% for d in datasets %}
+    <div class="tr-folder">
+      <label class="check"><input type="checkbox" name="dataset" value="{{ d.path }}"{% if !d.exists %} disabled{% else if d.saved %} checked{% endif %}> <code>{{ d.path }}</code>{% if !d.exists %} <span class="error-text small">missing</span>{% endif %}{% if !d.saved %} <span class="muted small">Review page export</span>{% endif %}</label>
+      {% if d.saved %}<button type="submit" class="small secondary" formaction="/training/datasets" formnovalidate name="remove" value="{{ d.path }}">Remove</button>{% endif %}
+    </div>
+    {% endfor %}
+    <div class="tr-field">
+      <label for="train-folder">Another folder</label>
+      <div class="with-browse tr-browse"><input type="text" id="train-folder" name="dataset_path" autocomplete="off" placeholder="C:\BlueOnyx\exports\review-2026-10"><button type="button" class="browse secondary" data-browse="folder" data-target="dataset_path" hidden>Folder&hellip;</button><button type="submit" class="secondary" formaction="/training/datasets" formnovalidate name="save" value="1">Save folder</button></div>
+      <p class="muted small">Used by this run when filled; Save folder keeps it in the list above.</p>
+    </div>
+    <div class="tr-grid">
+      <div class="tr-field">
+        <label for="train-scene">Scene</label>
+        <select id="train-scene" name="scene">{% for (v, t) in scenes %}<option value="{{ v }}">{{ t }}</option>{% endfor %}</select>
+      </div>
+      <div class="tr-field">
+        <label for="train-classes">Classes</label>
+        <input type="text" id="train-classes" name="classes" placeholder="person, car, dog, cat, raccoon">
+        <p class="muted small">Comma-separated, in head order; empty = all of the export.</p>
+      </div>
+    </div>
+    <label class="check"><input type="checkbox" name="public"{% if !public_available %} disabled{% endif %}> Mix in the public night subset (LILA camera traps, CDLA)</label>
+    {% if !public_available %}<p class="muted small">Not pinned in this build.</p>{% else if !public_installed %}<p class="muted small">A {{ public_size }} download on the first run.</p>{% endif %}
+  </fieldset>
+
+  {% if available %}
+  <fieldset class="tr-step" id="models">
+    <legend>2. Models</legend>
+    <p class="muted small">Tick one or more; they train one after the other. Each size shows a rough estimate: GPU memory at the suggested batch and time per epoch per 100 images.</p>
+    <div class="scroll">
+    <table class="tr-models">
+      <tbody>
+      {% for f in families %}
+      <tr>
+        <th scope="row">{{ f.title }}<br><span class="tag">{{ f.license }}</span></th>
+        {% if !f.available %}
+        <td colspan="{{ size_cols }}" class="muted small">{{ f.why }}</td>
+        {% else %}
+        {% for s in f.sizes %}
+        <td class="tr-size{% if !s.fits %} tr-unfit{% endif %}"{% if s.fits %} title="{{ s.estimate }}; {{ s.latency }}"{% else %} title="{{ s.why }}"{% endif %}>
+          <label class="check"><input type="checkbox" name="model" value="{{ s.label }}" aria-label="{{ s.label }}"{% if !s.fits %} disabled{% endif %}> <code>{{ s.size }}</code> <span class="tr-weight tr-{{ s.weight }}">{{ s.weight }}</span></label>
+          {% if s.fits %}<span class="muted small">{{ s.short }}</span>{% else %}<span class="muted small">{{ s.why }}</span>{% endif %}
+        </td>
+        {% endfor %}
+        {% for _ in 0..f.pad %}<td></td>{% endfor %}
+        {% endif %}
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <ul class="tr-legend small">
+      {% for l in latencies %}<li><span class="tr-weight tr-{{ l.weight }}">{{ l.weight }}</span> {{ l.text }}</li>{% endfor %}
+    </ul>
+    {% for n in notices %}<p class="muted small"><strong>{{ n.families }}:</strong> {{ n.notice }}</p>{% endfor %}
+  </fieldset>
+
+  <fieldset class="tr-step" id="options">
+    <legend>3. Options</legend>
+    <div class="tr-grid">
+      <div class="tr-field">
+        <label for="train-epochs">Epochs</label>
+        <input type="number" id="train-epochs" name="epochs" min="1" max="1000" value="{{ epochs }}">
+      </div>
+      <div class="tr-field">
+        <label for="train-name">Model name</label>
+        <input type="text" id="train-name" name="name">
+        <p class="muted small" id="train-name-hint">One ticked model only; empty = <code>night-</code>/<code>custom-&lt;model&gt;-&lt;date&gt;</code>.</p>
+      </div>
+    </div>
+    <label class="check"><input type="checkbox" name="night_aug" id="train-night"> Night augmentation</label>
+    <div class="tr-grid" id="train-night-fields">
+      <div class="tr-field">
+        <label for="train-dark">Darkness p</label>
+        <input type="number" id="train-dark" name="aug_dark" min="0" max="1" step="0.05">
+      </div>
+      <div class="tr-field">
+        <label for="train-noise">Noise p</label>
+        <input type="number" id="train-noise" name="aug_noise" min="0" max="1" step="0.05">
+      </div>
+      <div class="tr-field">
+        <label for="train-gray">Grayscale p</label>
+        <input type="number" id="train-gray" name="aug_gray" min="0" max="1" step="0.05">
+      </div>
+      <p class="muted small tr-span">Probability per training image. Empty = 0.5 / 0.3 / 0.5 with night augmentation, 0 without.</p>
+    </div>
+    <details class="tr-more">
+      <summary>Advanced</summary>
+      <div class="tr-grid">
+        <div class="tr-field">
+          <label for="train-batch">Batch</label>
+          <input type="number" id="train-batch" name="batch" min="1" max="256">
+          <p class="muted small">Empty = the suggested batch (at most 16).</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-imgsz">Input size</label>
+          <input type="number" id="train-imgsz" name="imgsz" min="160" max="1536" step="32">
+          <p class="muted small">Empty = the size's own.</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-lr">Learning rate</label>
+          <input type="text" id="train-lr" name="lr">
+          <p class="muted small">Empty = the trainer's default.</p>
+        </div>
+      </div>
+    </details>
+    <fieldset class="tr-sets">
+      <legend>Also benchmark on</legend>
+      {% for s in extra_sets %}<label class="check"><input type="checkbox" name="benchmark_set" value="{{ s }}"> <code>{{ s }}</code></label>{% endfor %}
+      <p class="muted small">The held-out frames of the export are always used.</p>
+    </fieldset>
+  </fieldset>
+  {% if !allow_large && (!env_ready || (public_available && !public_installed)) %}
+  <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB:{% if !env_ready %} {{ env_download }}{% endif %}{% if !env_ready && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>
+  {% endif %}
+  <div class="actions"><button type="submit">Queue training</button></div>
+  {% endif %}
+</form>
+
+<div class="card" id="use">
+  <h2>Use a trained model</h2>
+  {% if results.is_empty() %}<p class="muted">No trained model yet.</p>{% else %}
   <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark">Benchmark</a> page.</p>
   <div class="scroll">
   <table>
@@ -229,16 +412,6 @@
   </div>
   {% endif %}
 </div>
-
-<div class="card">
-  <h2>Dataset folders</h2>
-  <form method="post" action="/training/datasets" class="inline">
-    <label>Add a review export folder <input type="text" name="add" size="60"></label>
-    <button type="submit" class="small">Add</button>
-  </form>
-  {% for d in datasets %}{% if d.saved %}
-  <form method="post" action="/training/datasets" class="inline"><input type="hidden" name="remove" value="{{ d.path }}"><code>{{ d.path }}</code> <button type="submit" class="small">Remove</button></form>
-  {% endif %}{% endfor %}
 </div>
 <dialog id="browse-dialog">
   <h3 id="browse-title">Choose a video or a folder</h3>

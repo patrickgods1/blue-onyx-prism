@@ -738,3 +738,59 @@ table.dt td button.small { padding: 0.12rem 0.5rem; margin: 0; }
 #rv-al-progress { display: block; margin: 0.4rem 0 0.2rem; }
 #rv-al-progress[hidden] { display: none; }
 label.grow { flex: 1 1 20rem; min-width: 0; }
+
+/* Training page (templates/training.html), scoped under .tr */
+.tr [hidden] { display: none !important; }
+ol.tr-steps { display: flex; flex-wrap: wrap; gap: 0.4rem; list-style: none; padding: 0; margin: 0.5rem 0 1rem; counter-reset: trstep; }
+ol.tr-steps li { counter-increment: trstep; }
+ol.tr-steps li a { display: inline-block; padding: 0.25rem 0.75rem; border: 1px solid var(--border); border-radius: 999px; background: var(--card); text-decoration: none; font-size: 0.9rem; }
+ol.tr-steps li a::before { content: counter(trstep) ". "; color: var(--muted); }
+ol.tr-steps li a:hover { border-color: var(--accent); }
+.tr .card, .tr form.card { scroll-margin-top: 4rem; }
+.tr-wrap, .tr-wrap p, .tr .tr-fact { overflow-wrap: anywhere; }
+.tr .tr-fact { margin: 0.3rem 0; }
+.tr .tr-fact .k { color: var(--muted); margin-right: 0.4rem; }
+.tr .small { font-size: 0.82rem; }
+.tr p.small { margin: 0.15rem 0 0.4rem; }
+.tr-form input[type="text"], .tr-form input[type="url"], .tr-form select { width: 100%; max-width: 36rem; min-width: 0; }
+.tr-form input[type="number"] { width: 8rem; max-width: 100%; }
+.tr-form fieldset { margin: 0.75rem 0; }
+.tr-form legend { color: var(--fg); font-weight: 600; font-size: 0.95rem; }
+.tr-form label.check { margin: 0.3rem 0; align-items: flex-start; }
+.tr-form label.check input { margin-top: 0.3rem; flex: none; }
+.tr-form .tr-field { margin: 0.6rem 0; min-width: 0; }
+.tr-form .tr-field > label:not(.check) { display: block; margin: 0 0 0.2rem; color: var(--muted); font-size: 0.9rem; }
+.tr-form .tr-field > p.small { margin: 0.2rem 0 0; }
+.tr-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(15rem, 100%), 1fr)); gap: 0 1.5rem; }
+.tr-grid > .tr-span { grid-column: 1 / -1; }
+.tr-radios { display: flex; flex-wrap: wrap; gap: 0 1.5rem; }
+.tr-radios legend { width: 100%; }
+.tr-checks { display: flex; flex-direction: column; justify-content: center; }
+.tr-browse { flex-wrap: wrap; max-width: 44rem; }
+.tr-browse input { flex: 1 1 14rem; }
+.tr-browse button { margin: 0; }
+details.tr-more { margin: 0.5rem 0; }
+details.tr-more > summary { margin: 0.3rem 0; }
+details.tr-tasks > summary { color: var(--fg); font-weight: 600; }
+.tr-confirm { margin: 0.75rem 0 0 !important; }
+.tr-form .actions { margin-top: 0.6rem; }
+.tr-default-submit { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+.tr-step { padding: 0.6rem 1rem 0.8rem; }
+.tr-step > legend { font-size: 1.05rem; }
+.tr-folder { display: flex; flex-wrap: wrap; align-items: center; gap: 0 0.6rem; }
+.tr-folder label.check { flex: 1 1 18rem; min-width: 0; overflow-wrap: anywhere; }
+.tr-folder button.small { margin: 0; }
+table.tr-models th[scope="row"] { white-space: nowrap; color: var(--fg); font-size: 0.95rem; }
+table.tr-models td.tr-size { min-width: 8.5rem; }
+table.tr-models td.tr-size label.check { margin: 0 0 0.15rem; align-items: center; }
+table.tr-models td.tr-size label.check input { margin-top: 0; }
+table.tr-models td.tr-size label.check code { white-space: nowrap; overflow-wrap: normal; }
+table.tr-models td.tr-unfit { opacity: 0.7; }
+table.tr-models td .small { display: block; line-height: 1.3; }
+.tr-weight { font-size: 0.72rem; padding: 0 0.35rem; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.tr-weight.tr-light { background: var(--ok-bg); color: var(--ok-fg); border-color: transparent; }
+.tr-weight.tr-medium { background: var(--warn-bg); color: var(--warn-fg); border-color: transparent; }
+.tr-weight.tr-heavy { background: var(--err-bg); color: var(--err-fg); border-color: transparent; }
+ul.tr-legend { list-style: none; padding: 0; margin: 0.5rem 0; display: flex; flex-wrap: wrap; gap: 0.2rem 1.2rem; }
+.tr-sets { display: flex; flex-wrap: wrap; gap: 0 1.2rem; }
+.tr-sets legend, .tr-sets p { width: 100%; }

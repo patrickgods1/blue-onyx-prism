@@ -145,15 +145,57 @@ pub(crate) fn import_from_form(f: &[(String, String)]) -> anyhow::Result<ImportR
     Ok(r)
 }
 
-/// The auto-label run of a form: `frames` (the filter text), `gdino`, `vlm` (`off` = none),
-/// `rfdetr` / `siglip` (ticked = on; the Review page's form sends them), `with_model`,
-/// `threshold`, `confirm_large`.
+/// The frame-filter fields of the auto-label form, each a key of [`FrameFilter`].
+const FILTER_FIELDS: [&str; 6] = ["status", "scene", "camera", "label", "auto", "limit"];
+
+/// The frame filter text of an auto-label form: the raw `frames` text (the Training page's
+/// "Other filters", the Review page's and older forms' whole filter) followed by the structured
+/// fields `status`, `scene`, `camera`, `label`, `auto`, `limit` and `again` (ticked = `again=1`)
+/// whose key the raw text does not already name. A comma in a field's value is refused (it
+/// would split the filter).
+pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String> {
+    let raw = field(f, "frames").unwrap_or("");
+    let named: Vec<String> = raw
+        .split(',')
+        .filter_map(|p| p.split_once('='))
+        .map(|(k, _)| k.trim().to_ascii_lowercase())
+        .collect();
+    let mut parts: Vec<String> = Vec::new();
+    if !raw.is_empty() {
+        parts.push(raw.to_string());
+    }
+    for k in FILTER_FIELDS {
+        if let Some(v) = field(f, k)
+            && !named.iter().any(|n| n == k)
+        {
+            if v.contains(',') {
+                anyhow::bail!("{k}: '{v}' has a comma, which the frame filter cannot hold");
+            }
+            parts.push(format!("{k}={v}"));
+        }
+    }
+    if field(f, "again").is_some() && !named.iter().any(|n| n == "again") {
+        parts.push("again=1".into());
+    }
+    Ok(parts.join(","))
+}
+
+/// The auto-label run of a form: the frame filter ([`frame_filter_text`]), `mode` (`labelers`
+/// ignores `with_model`, `model` needs it; absent = `with_model` decides, as the Review page and
+/// older forms post), `gdino`, `vlm` (`off` = none), `rfdetr` / `siglip` (ticked = on; the
+/// Review page's form sends them), `with_model`, `threshold`, `confirm_large`.
 pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<AutolabelRequest> {
-    let with_model = field(f, "with_model").map(str::to_string);
-    let frames = FrameFilter::parse(
-        field(f, "frames").unwrap_or(""),
-        default_status(with_model.is_some()),
-    )?;
+    let with_model = match field(f, "mode") {
+        Some("labelers") => None,
+        Some("model") => Some(
+            field(f, "with_model")
+                .ok_or_else(|| anyhow::anyhow!("re-label: choose a trained model"))?
+                .to_string(),
+        ),
+        Some(m) => anyhow::bail!("mode: '{m}' is not labelers or model"),
+        None => field(f, "with_model").map(str::to_string),
+    };
+    let frames = FrameFilter::parse(&frame_filter_text(f)?, default_status(with_model.is_some()))?;
     let mut r = AutolabelRequest::new(frames);
     r.gdino = match field(f, "gdino").unwrap_or("tiny") {
         "off" => None,
@@ -335,6 +377,82 @@ mod tests {
         assert_eq!(m.frames.query["status"], "any");
         assert!(autolabel_from_form(&form(&[("frames", "colour=red")])).is_err());
         assert!(autolabel_from_form(&form(&[("gdino", "off"), ("vlm", "off")])).is_err());
+    }
+
+    #[test]
+    fn the_frame_fields_compose_the_filter() {
+        // The structured fields, in their order; empty ones are left out.
+        let t = frame_filter_text(&form(&[
+            ("status", "reviewed"),
+            ("scene", "night"),
+            ("camera", ""),
+            ("label", "person"),
+            ("auto", "none"),
+            ("limit", "40"),
+            ("again", "1"),
+            ("frames", ""),
+        ]))
+        .unwrap();
+        assert_eq!(
+            t,
+            "status=reviewed,scene=night,label=person,auto=none,limit=40,again=1"
+        );
+        let r = autolabel_from_form(&form(&[
+            ("scene", "ir"),
+            ("limit", "7"),
+            ("frames", "bucket=empty, import=any"),
+        ]))
+        .unwrap();
+        assert_eq!(r.frames.limit, 7);
+        assert_eq!(r.frames.query["scene"], "ir");
+        assert_eq!(r.frames.query["bucket"], "empty");
+        assert_eq!(r.frames.import(), Some("any"));
+        assert_eq!(r.frames.query["status"], "unreviewed");
+        assert!(!r.frames.again());
+        // A key of the raw text wins over its field (the Review page sends both `limit`s).
+        let t = frame_filter_text(&form(&[
+            ("frames", "scene=day,limit=50,again=1"),
+            ("limit", "200"),
+            ("scene", "night"),
+            ("again", "1"),
+        ]))
+        .unwrap();
+        assert_eq!(t, "scene=day,limit=50,again=1");
+        // Nothing given: the defaults.
+        assert_eq!(frame_filter_text(&form(&[("limit", "")])).unwrap(), "");
+        let e = frame_filter_text(&form(&[("camera", "a,b")])).unwrap_err();
+        assert!(e.to_string().contains("camera"), "{e}");
+        // A bad value is refused by the filter with its key.
+        let e = autolabel_from_form(&form(&[("auto", "maybe")])).unwrap_err();
+        assert!(e.to_string().contains("auto"), "{e}");
+    }
+
+    #[test]
+    fn the_mode_decides_between_labelers_and_a_model() {
+        // Labelers: a chosen model in the hidden select is ignored.
+        let r = autolabel_from_form(&form(&[
+            ("mode", "labelers"),
+            ("with_model", "night-x"),
+            ("gdino", "tiny"),
+            ("rfdetr", "on"),
+        ]))
+        .unwrap();
+        assert_eq!(r.with_model, None);
+        assert_eq!(r.frames.query["status"], "unreviewed");
+        // Model: the labeler fields are posted too and ignored, as with `with_model` alone.
+        let m = autolabel_from_form(&form(&[
+            ("mode", "model"),
+            ("with_model", "night-x"),
+            ("gdino", "off"),
+            ("vlm", "off"),
+        ]))
+        .unwrap();
+        assert_eq!(m.with_model.as_deref(), Some("night-x"));
+        assert_eq!(m.frames.query["status"], "any");
+        assert!(m.resources().is_empty());
+        let e = autolabel_from_form(&form(&[("mode", "model")])).unwrap_err();
+        assert!(e.to_string().contains("choose a trained model"), "{e}");
+        assert!(autolabel_from_form(&form(&[("mode", "both")])).is_err());
     }
 
     #[tokio::test]

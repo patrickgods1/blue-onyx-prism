@@ -31,6 +31,7 @@ mod devices;
 mod guard;
 mod live;
 mod pages;
+mod pick;
 mod resources;
 mod review;
 mod status;
@@ -176,6 +177,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/v1/resources/add-to-config", post(resources_add_to_config)),
         ("/v1/models/add", post(models_add)),
         ("/v1/fs/browse", get(browse::browse)),
+        ("/v1/fs/pick", get(pick::status).post(pick::pick)),
         ("/v1/resources/export", post(resources_export)),
         ("/v1/resources/export/cancel", post(resources_export_cancel)),
         ("/stats", get(stats_page)),
@@ -972,6 +974,7 @@ mod tests {
             "/v1/resources/add-to-config",
             "/v1/models/add",
             "/v1/fs/browse",
+            "/v1/fs/pick",
             "/v1/resources/export",
             "/v1/resources/export/cancel",
             "/stats",
