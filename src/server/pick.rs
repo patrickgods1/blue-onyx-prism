@@ -26,8 +26,17 @@
 //! The start folder, prompt and filters never become script source: they are argv elements
 //! (osascript `on run argv`, zenity/kdialog options) or environment variables (PowerShell).
 //! Output is UTF-8 with the trailing newline trimmed; empty output or a cancel exit code means
-//! cancelled. A picked path is not checked against [`super::browse::allowed_path`]; the
-//! consumer (Add a model by path, the footage import) checks it as it checks a typed path.
+//! cancelled.
+//!
+//! Picked paths are trusted: each one the dialog returns is recorded (canonical and as the
+//! dialog spelled it, process-wide, at most [`PICK_CAP`] entries for [`PICK_TTL`]), and
+//! [`super::browse::allowed_path`], the check of Add a model by path and the footage import,
+//! accepts it and anything under it even outside the browsable roots (another volume such as
+//! `/Volumes/...`, `/mnt/...`, a mapped drive or a `\\server\share`). This is safe because the
+//! path was chosen by the person at the server's own screen in an OS dialog, which only a
+//! loopback peer can open (see above): a remote client cannot add entries, and it gains only
+//! the paths that person chose, for an hour. The in-page listing (`GET /v1/fs/browse`) keeps
+//! the roots rule (SV-10 unchanged), so a pick never widens what the page can list.
 
 use super::{AppState, admin_allowed, blocking};
 use axum::Json;
@@ -39,8 +48,8 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -603,6 +612,115 @@ fn start_folder(cfg: &crate::config::Config, raw: Option<&str>) -> Option<String
     Some(strip_verbatim(c.to_string_lossy().into_owned()))
 }
 
+/// How long a picked path stays trusted (see the module doc).
+pub(super) const PICK_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Picked paths remembered at most (the oldest is dropped first).
+pub(super) const PICK_CAP: usize = 64;
+
+/// A path a dialog returned.
+#[derive(Debug, Clone)]
+struct PickedPath {
+    /// As the dialog spelled it, without a verbatim prefix (matches a path the page sends back
+    /// before it is canonicalized, e.g. `/tmp/x` for `/private/tmp/x`).
+    dialog: PathBuf,
+    /// Canonical, without a verbatim prefix.
+    canonical: PathBuf,
+    at: Instant,
+}
+
+/// The trusted picks, oldest first; expired entries are pruned on every insert and lookup.
+#[derive(Debug, Default)]
+pub(super) struct PickedPaths {
+    entries: Vec<PickedPath>,
+}
+
+impl PickedPaths {
+    pub(super) const fn new() -> PickedPaths {
+        PickedPaths {
+            entries: Vec::new(),
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.entries
+            .retain(|e| now.saturating_duration_since(e.at) < PICK_TTL);
+    }
+
+    /// Remember a pick (`dialog` as returned, `canonical` its canonical form) made at `now`;
+    /// a path picked again is refreshed, past [`PICK_CAP`] the oldest pick is dropped.
+    pub(super) fn record_at(&mut self, dialog: &Path, canonical: &Path, now: Instant) {
+        self.prune(now);
+        let canonical = plain(canonical);
+        let dialog = plain(dialog);
+        self.entries
+            .retain(|e| e.canonical != canonical || e.dialog != dialog);
+        while self.entries.len() >= PICK_CAP {
+            self.entries.remove(0);
+        }
+        self.entries.push(PickedPath {
+            dialog,
+            canonical,
+            at: now,
+        });
+    }
+
+    /// Whether `p` is an unexpired pick or under one, at `now`. Compared component-wise
+    /// without the Windows verbatim prefix (a canonical path carries `\\?\`, a path the page
+    /// sends does not). The dialog's spelling is a safe match for a canonical `p` too: a
+    /// prefix of a canonical path is itself canonical.
+    pub(super) fn covers_at(&mut self, p: &Path, now: Instant) -> bool {
+        self.prune(now);
+        let p = plain(p);
+        self.entries
+            .iter()
+            .any(|e| p.starts_with(&e.canonical) || p.starts_with(&e.dialog))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// The process-wide picks (see the module doc).
+static PICKED: Mutex<PickedPaths> = Mutex::new(PickedPaths::new());
+
+fn picked() -> std::sync::MutexGuard<'static, PickedPaths> {
+    PICKED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `p` without the Windows `\\?\` verbatim prefix (unchanged elsewhere).
+fn plain(p: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(strip_verbatim(p.to_string_lossy().into_owned()))
+    }
+    #[cfg(not(windows))]
+    {
+        p.to_path_buf()
+    }
+}
+
+/// Trust a path the dialog returned (ignored unless it is absolute and exists). Touches the
+/// file system: call it off the runtime threads.
+pub(super) fn record_pick(path: &str) {
+    let dialog = Path::new(path);
+    if !dialog.is_absolute() {
+        return;
+    }
+    match dialog.canonicalize() {
+        Ok(c) => picked().record_at(dialog, &c, Instant::now()),
+        Err(e) => warn!("the picked path {path} cannot be resolved ({e}); not trusted"),
+    }
+}
+
+/// Whether `p` (canonical, or as the page sent it) is a path the native dialog returned in the
+/// last [`PICK_TTL`], or under one.
+pub(super) fn picked_covers(p: &Path) -> bool {
+    picked().covers_at(p, Instant::now())
+}
+
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Ended {
@@ -850,7 +968,7 @@ pub(super) async fn pick(
                 cmd.program
             )
         })?;
-        Ok::<_, String>(match out.ended {
+        let outcome = match out.ended {
             Ended::Exited => parse_output(cmd.tool, out.code, &out.stdout, &out.stderr),
             Ended::TimedOut => {
                 warn!(
@@ -860,7 +978,11 @@ pub(super) async fn pick(
                 Outcome::Cancelled
             }
             Ended::Abandoned => Outcome::Cancelled,
-        })
+        };
+        if let Outcome::Picked(p) = &outcome {
+            record_pick(p);
+        }
+        Ok::<_, String>(outcome)
     })
     .await;
     match outcome {
@@ -1146,6 +1268,95 @@ mod tests {
         );
         assert_eq!(start_folder(&cfg, Some("  ")), None);
         assert_eq!(start_folder(&cfg, None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn picked_paths_cover_children_until_expiry() {
+        let mut picks = PickedPaths::new();
+        let t0 = Instant::now();
+        let base = std::env::temp_dir().join("bop-pick-cover");
+        let other = base.join("Volume");
+        assert!(!picks.covers_at(&other, t0), "nothing picked yet");
+        picks.record_at(&other, &other, t0);
+        assert!(picks.covers_at(&other, t0));
+        assert!(picks.covers_at(&other.join("clips/a.mp4"), t0), "a child");
+        assert!(!picks.covers_at(&base, t0), "the parent");
+        assert!(
+            !picks.covers_at(&base.join("Volume2"), t0),
+            "a sibling sharing a prefix"
+        );
+        let late = t0 + PICK_TTL - Duration::from_secs(1);
+        assert!(picks.covers_at(&other.join("x"), late));
+        assert!(!picks.covers_at(&other, t0 + PICK_TTL), "expired");
+        assert_eq!(picks.len(), 0, "pruned on lookup");
+    }
+
+    #[test]
+    fn picked_paths_match_the_dialog_spelling_and_refresh() {
+        let mut picks = PickedPaths::new();
+        let t0 = Instant::now();
+        let dialog = std::env::temp_dir().join("bop-pick-link");
+        let canon = std::env::temp_dir().join("bop-pick-real");
+        picks.record_at(&dialog, &canon, t0);
+        assert!(picks.covers_at(&dialog.join("m.onnx"), t0));
+        assert!(picks.covers_at(&canon.join("m.onnx"), t0));
+        // Picked again later: one entry, its clock restarted.
+        let t1 = t0 + Duration::from_secs(1800);
+        picks.record_at(&dialog, &canon, t1);
+        assert_eq!(picks.len(), 1);
+        assert!(picks.covers_at(&canon, t0 + PICK_TTL + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn picked_paths_evict_the_oldest_past_the_cap() {
+        let mut picks = PickedPaths::new();
+        let t0 = Instant::now();
+        let dir = |i: usize| std::env::temp_dir().join(format!("bop-pick-cap-{i}"));
+        for i in 0..=PICK_CAP {
+            let d = dir(i);
+            picks.record_at(&d, &d, t0 + Duration::from_millis(i as u64));
+        }
+        assert_eq!(picks.len(), PICK_CAP);
+        let now = t0 + Duration::from_secs(1);
+        assert!(!picks.covers_at(&dir(0), now), "the oldest was dropped");
+        assert!(picks.covers_at(&dir(1), now));
+        assert!(picks.covers_at(&dir(PICK_CAP), now));
+        // Insert prunes the expired first, so a late pick never evicts a live one.
+        let late = t0 + PICK_TTL + Duration::from_secs(5);
+        picks.record_at(&dir(999), &dir(999), late);
+        assert_eq!(picks.len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn picked_paths_ignore_the_verbatim_prefix() {
+        let mut picks = PickedPaths::new();
+        let t0 = Instant::now();
+        picks.record_at(
+            Path::new(r"\\nas\clips"),
+            Path::new(r"\\?\UNC\nas\clips"),
+            t0,
+        );
+        picks.record_at(Path::new(r"E:\footage"), Path::new(r"\\?\E:\footage"), t0);
+        assert!(picks.covers_at(Path::new(r"\\nas\clips\a.mp4"), t0));
+        assert!(picks.covers_at(Path::new(r"\\?\UNC\nas\clips\a"), t0));
+        assert!(picks.covers_at(Path::new(r"\\?\E:\footage\x"), t0));
+        assert!(picks.covers_at(Path::new(r"E:\footage\x"), t0));
+        assert!(!picks.covers_at(Path::new(r"E:\footage2"), t0));
+    }
+
+    #[test]
+    fn record_pick_needs_an_existing_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("bo_pick_rec_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!picked_covers(&dir));
+        record_pick(&dir.join("missing").to_string_lossy());
+        record_pick("relative/dir");
+        assert!(!picked_covers(&dir.join("missing")));
+        record_pick(&dir.to_string_lossy());
+        assert!(picked_covers(&dir.join("child")));
+        assert!(picked_covers(&dir.canonicalize().unwrap().join("child")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
