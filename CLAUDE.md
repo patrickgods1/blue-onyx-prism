@@ -123,7 +123,9 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   page (frames by detected class; Review queue and export filter by class) and `review-queue.jsonl`; format in `docs/DATASET.md`. OpenVINO CACHE_DIR is `<cache>/openvino-<device>-<prec>`
   (the CPU cache hash ignores precision); `config_store::spawn_disk_watch` applies on-disk config edits within 2 s.
 - Review (`src/collect/labels/`, `/review`, `assets/review.js`): per-frame `<stem>.labels.json` (v1; states pending/
-  accepted/rejected/added; `merge_proposals` for auto-labels), uncertainty-sorted queue, exports YOLO / COCO /
+  accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
+  `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk
+  accept of `auto=accept` frames `POST /v1/review/accept-auto`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
   X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned.
 - Training (`src/training/`, `/training`, `blue-onyx-prism train ...`, `scripts/train_model.py`): user-triggered only;
   `capability` gates by GPU (CUDA lanes cu126/cu130 by compute capability + driver; MPS on Apple, D-FINE CUDA-only),

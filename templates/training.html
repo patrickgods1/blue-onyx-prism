@@ -74,7 +74,7 @@
       <label>Its threshold <input type="number" name="threshold" min="0.01" max="1" step="0.05" value="0.3"></label>
       <label class="check"><input type="checkbox" name="confirm_large"> Download what is missing (over 500 MB)</label>
     </div>
-    <p class="muted small">Frames: <code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>scene</code> (day, night, ir), <code>camera</code>, <code>status</code> (unreviewed, reviewed, skipped, any), <code>source</code> (queue, all), <code>import</code> (an import id, or any), <code>limit</code>. A re-label looks at every frame by default and sends the ones whose reviewed labels the model disagrees with back to review, first in the queue.</p>
+    <p class="muted small">Frames: <code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>scene</code> (day, night, ir), <code>camera</code>, <code>label</code> (a class), <code>status</code> (unreviewed, reviewed, skipped, any), <code>source</code> (queue, all; default all here, while the Review page's button uses its own filters), <code>auto</code> (review, accept, nothing, none: never auto-labelled), <code>import</code> (an import id, or any), <code>again=1</code> (also frames these labelers already looked at; skipped otherwise), <code>limit</code>. A re-label looks at every frame by default and sends the ones whose reviewed labels the model disagrees with back to review, first in the queue.</p>
     <button type="submit">Auto-label</button>
   </form>
 </div>

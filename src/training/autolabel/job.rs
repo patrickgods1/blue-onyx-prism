@@ -2,7 +2,9 @@
 //! select the frames (the Review queue's order and filters) -> set up the training environment
 //! -> download the labelers (MM-Grounding-DINO, RF-DETR L, Qwen3-VL, SigLIP 2; SHA-256 pinned) ->
 //! label (`scripts/autolabel.py`, `@autolabel` events, proposals as JSONL) -> triage and merge
-//! into the label files (here, [`super::triage`]) and queue the frames for review. With
+//! into the label files (here, [`super::triage`]; every labelled frame gets an `auto_run`
+//! marker, so a later run of the same labelers skips it unless `again=1`) and queue the changed
+//! frames for review. With
 //! `with_model` the labelling is the service's own pipeline ([`super::relabel`]) and stages 2 and
 //! 3 are skipped.
 
@@ -74,6 +76,25 @@ struct Selected {
     height: u32,
 }
 
+/// What [`AutolabelJob::write_frame`] does with a frame's updated label file.
+#[derive(Debug, Clone, Copy, Default)]
+struct FrameWrite {
+    /// Write it.
+    write: bool,
+    /// The boxes changed: queue the frame for review.
+    queue: bool,
+}
+
+impl FrameWrite {
+    /// Write when `changed` and queue it.
+    fn changed(changed: bool) -> Self {
+        Self {
+            write: changed,
+            queue: changed,
+        }
+    }
+}
+
 /// The report of a finished run.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AutolabelReport {
@@ -89,6 +110,10 @@ pub struct AutolabelReport {
     pub dropped: usize,
     /// Existing boxes that got the auto-labeler's evidence.
     pub annotated: usize,
+    /// Pending boxes of another class that got the labelers' class as a suggestion.
+    pub class_suggestions: usize,
+    /// Matching frames left out: these labelers looked at them already (`again=1` to redo).
+    pub skipped_done: usize,
     /// Reviewed or skipped frames that went back to review.
     pub reopened: usize,
     /// Self-training: frames whose reviewed labels the model disagrees with.
@@ -110,10 +135,29 @@ impl AutolabelJob {
         stage(report, name, n, STAGES.len(), pct, detail);
     }
 
-    fn select(&self) -> Result<Vec<Selected>> {
+    /// The labelers of a labelers-mode run (`mm-gdino-tiny + rfdetr-large + ...`), as recorded
+    /// in the report and the frames' `auto_run`.
+    fn labeler(&self) -> String {
+        let r = &self.request;
+        [
+            r.gdino.map(|g| g.key().to_string()),
+            r.rfdetr.then(|| "rfdetr-large".to_string()),
+            r.vlm.map(|v| v.key().to_string()),
+            r.siglip.then(|| "siglip2-base".to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" + ")
+    }
+
+    /// The frames to label, in queue order, and how many matching frames were left out because
+    /// `skip_labeler` (Some in labelers mode without `again=1`) already looked at them.
+    fn select(&self, skip_labeler: Option<&str>) -> Result<(Vec<Selected>, usize)> {
         let f = &self.request.frames;
         let built = queue::build(&self.dataset_dir, &f.filters()?);
         let mut out = Vec::new();
+        let mut skipped = 0;
         for item in built.items {
             if out.len() >= f.limit {
                 break;
@@ -125,6 +169,17 @@ impl AutolabelJob {
             if !f.accepts_source(rec.source.as_deref()) {
                 continue;
             }
+            if let Some(l) = skip_labeler
+                && frame
+                    .labels()
+                    .ok()
+                    .flatten()
+                    .and_then(|x| x.auto_run)
+                    .is_some_and(|r| r.labeler == l)
+            {
+                skipped += 1;
+                continue;
+            }
             out.push(Selected {
                 rel: item.frame,
                 jpg: frame.jpg,
@@ -133,28 +188,36 @@ impl AutolabelJob {
                 height: rec.height,
             });
         }
-        Ok(out)
+        Ok((out, skipped))
     }
 
-    /// Merge `boxes` of one frame into its label file and write it when anything changed.
+    /// Update one frame's label file (the pre-fill when it has none) under the label write lock
+    /// ([`labels::update`]): `update` returns whether to write it and whether the frame changed
+    /// for the reviewer (then it is queued for review).
     fn write_frame(
         &self,
         sel: &Selected,
         rep: &mut AutolabelReport,
         changed: &mut Vec<String>,
-        update: impl FnOnce(&mut LabelFile, &mut AutolabelReport) -> bool,
+        update: impl FnOnce(&mut LabelFile, &mut AutolabelReport) -> FrameWrite,
     ) -> Result<()> {
         let frame = Frame::resolve(&self.dataset_dir, &sel.rel)
             .ok_or_else(|| anyhow!("{} is gone", sel.rel))?;
         let rec = frame.record()?;
-        let mut file = frame.labels()?.unwrap_or_else(|| labels::prefill(&rec));
-        let before = file.status;
-        if update(&mut file, rep) {
-            if before != file.status && file.status == labels::Status::Unreviewed {
-                rep.reopened += 1;
+        let mut outcome = FrameWrite::default();
+        let mut reopened = false;
+        let written = labels::update(&frame.labels, |cur| {
+            let mut file = cur.unwrap_or_else(|| labels::prefill(&rec));
+            let before = file.status;
+            outcome = update(&mut file, rep);
+            reopened = before != file.status && file.status == labels::Status::Unreviewed;
+            Ok(outcome.write.then_some(file))
+        })?;
+        if written {
+            rep.reopened += usize::from(reopened);
+            if outcome.queue {
+                changed.push(sel.rel.clone());
             }
-            labels::write(&frame.labels, &file)?;
-            changed.push(sel.rel.clone());
         }
         Ok(())
     }
@@ -175,7 +238,17 @@ impl AutolabelJob {
 
         // 1. Frames.
         self.step(report, 1, 0, &r.frames.describe());
-        let frames = self.select()?;
+        let labeler = self.labeler();
+        let skip = (r.with_model.is_none() && !r.frames.again()).then_some(labeler.as_str());
+        let (frames, skipped) = self.select(skip)?;
+        rep.skipped_done = skipped;
+        if frames.is_empty() && skipped > 0 {
+            bail!(
+                "all {skipped} frame(s) matching {} were auto-labelled by {labeler} already; add \
+                 again=1 to the frame filter (Review page: tick \"Label again\") to label them again",
+                r.frames.describe()
+            );
+        }
         if frames.is_empty() {
             bail!(
                 "no frame matches {} in {}; import footage or send frames to review first",
@@ -245,23 +318,14 @@ impl AutolabelJob {
                     if why.is_some() {
                         rep.disagreements += 1;
                     }
-                    m.added > 0 || why.is_some()
+                    FrameWrite::changed(m.added > 0 || why.is_some())
                 });
                 if let Err(e) = res {
                     rep.warnings.push(format!("{}: {e:#}", f.rel));
                 }
             }
         } else {
-            rep.labeler = [
-                r.gdino.map(|g| g.key().to_string()),
-                r.rfdetr.then(|| "rfdetr-large".to_string()),
-                r.vlm.map(|v| v.key().to_string()),
-                r.siglip.then(|| "siglip2-base".to_string()),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" + ");
+            rep.labeler = labeler.clone();
             // 2. Environment.
             let accel = self
                 .accelerator
@@ -491,15 +555,28 @@ impl AutolabelJob {
                         rep.vlm_objections += 1;
                     }
                 }
-                if boxes.is_empty() {
-                    continue;
-                }
+                // Every frame the labelers returned gets the marker, boxes or not.
+                let marker = labels::AutoRun {
+                    at: crate::collect::utc_rfc3339(std::time::SystemTime::now()),
+                    labeler: labeler.clone(),
+                };
                 let res = self.write_frame(sel, &mut rep, &mut changed, |file, rep| {
-                    let (m, annotated) = triage::apply(file, boxes);
-                    rep.added += m.added;
-                    rep.dropped += m.dropped;
-                    rep.annotated += annotated;
-                    m.added > 0 || annotated > 0
+                    file.auto_run = Some(marker);
+                    if boxes.is_empty() {
+                        return FrameWrite {
+                            write: true,
+                            queue: false,
+                        };
+                    }
+                    let a = triage::apply(file, boxes);
+                    rep.added += a.merge.added;
+                    rep.dropped += a.merge.dropped;
+                    rep.annotated += a.annotated;
+                    rep.class_suggestions += a.class_suggestions;
+                    FrameWrite {
+                        write: true,
+                        queue: a.merge.added > 0 || a.annotated > 0 || a.class_suggestions > 0,
+                    }
                 });
                 if let Err(e) = res {
                     rep.warnings.push(format!("{}: {e:#}", sel.rel));
@@ -519,17 +596,27 @@ impl AutolabelJob {
                 rep.frames, rep.labeler, rep.disagreements, rep.added
             )
         } else {
-            format!(
+            let mut s = format!(
                 "{} frames labelled ({}): {} boxes ({} accept, {} review), {} added to label \
-                 files, {} matched existing boxes; queued for review",
+                 files, {} matched existing boxes, {} class suggestions on existing boxes; {} \
+                 frames queued for review",
                 rep.frames,
                 rep.labeler,
                 rep.proposals,
                 rep.accept,
                 rep.review,
                 rep.added,
-                rep.dropped
-            )
+                rep.dropped,
+                rep.class_suggestions,
+                changed.len()
+            );
+            if rep.skipped_done > 0 {
+                s.push_str(&format!(
+                    "; {} frames skipped (labelled by these labelers before; again=1 to redo)",
+                    rep.skipped_done
+                ));
+            }
+            s
         };
         Ok(TaskOutcome {
             summary,

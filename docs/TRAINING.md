@@ -372,8 +372,17 @@ the script only returns proposals as JSONL), so the reviewer decides. Nothing is
 deleted automatically; confirmed empty frames (hard negatives) come only from the review.
 
 **Frames**: `--frames` takes the Review queue's filters as `key=value` pairs: `bucket`, `scene`, `camera`, `label`,
-`status` (default `unreviewed`), `source` (default `all`), `import=<id>|any`, `limit` (default 200). They
-are taken in the queue's order (most uncertain first).
+`status` (default `unreviewed`), `source` (default `all`), `auto` (`review`, `accept`, `nothing`, `none`;
+docs/DATASET.md "Queue"), `import=<id>|any`, `again=1`, `limit` (default 200). They are taken in the
+queue's order (most uncertain first). The Review page's button sends its own filters.
+
+**Marker**: every frame the labelers return (boxes or not) gets `auto_run: {at, labeler}` in its label
+file (a frame without one gets its pre-fill plus the marker). Only frames whose boxes changed are queued
+for review. A later run with the same labelers (`labeler`, e.g. `mm-gdino-tiny + rfdetr-large +
+qwen3-vl-2b + siglip2-base`) skips those frames (`skipped_done` in the report) unless the filter has
+`again=1` (Review page: **Label again**); when every matching frame was skipped the run fails saying so.
+Re-labelling with a trained model writes no marker and skips nothing. Writes take the label write lock,
+so a Review save with a stale `revision` gets a 409 instead of overwriting merged boxes.
 
 ### Labelers
 
@@ -416,7 +425,14 @@ safetensors, the small files downloaded and hashed) and downloaded by the downlo
    a person or an animal on a night or IR frame is always `review`. Every box gets `triage` and the
    reasons (`why`). A proposal that matches an existing box of the same label (IoU >= 0.5) is dropped
    by the merge rule, but its evidence (VLM answer, species) is put on that box: a model box the VLM
-   calls a rock shows it on the Review page.
+   calls a rock shows it on the Review page, and a suppressed / below-threshold / verifier-found box
+   triaged `accept` is accepted on save instead of rejected. A proposal on a *pending* box of another
+   label (and no box of its own label) becomes a **class suggestion** on that box (`auto_label`,
+   `auto_score`, triage `review`; `class_suggestions` in the report) instead of being lost.
+6. **Bulk accept**: frames whose triage alone settles them (`auto=accept`: boxes `accept`, nothing else
+   pending but unconfirmed model hints) can be saved as reviewed in one go from the Review page
+   (`POST /v1/review/accept-auto`, `bulk_accepted: true` in the file); everything else waits for a
+   reviewer.
 
 On Apple silicon everything runs on MPS (float16 for Qwen3-VL); `PYTORCH_ENABLE_MPS_FALLBACK=1` covers
 missing ops.

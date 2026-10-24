@@ -1,9 +1,11 @@
 //! The Review page (`/review`, admin only) and its JSON API over the dataset collector's
 //! frames ([`crate::collect::labels`]): `GET /v1/review/next` (the uncertainty-sorted queue
 //! with filters and counts), `GET`/`POST /v1/review/labels?frame=` (a frame's label file, or
-//! its pre-fill from the sidecar), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
-//! benchmark set), `POST /v1/review/import` (X-AnyLabeling files) and `POST
-//! /v1/review/classes` (`collect.classes`). Every frame reference goes through
+//! its pre-fill from the sidecar, with its revision; a save naming a stale revision is refused
+//! with 409), `POST /v1/review/accept-auto` (bulk accept of frames the auto-labeler's triage
+//! settles), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling / benchmark set), `POST
+//! /v1/review/import` (X-AnyLabeling files) and `POST /v1/review/classes` (`collect.classes`).
+//! Every frame reference goes through
 //! [`Frame::resolve`] (404 otherwise); POST bodies are JSON (415 otherwise) with per-route size
 //! caps (413); the admin guard and the cross-site check of the router apply.
 
@@ -135,9 +137,10 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&after=`: the most
-/// uncertain frame matching the filters (after `after`, the frame shown now, when given), its
-/// position, the counts and the cameras and classes for the filter lists.
+/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&after=`: the most
+/// uncertain frame matching the filters (after `after`, the frame shown now, when given; past
+/// the last one the first again with `wrapped`), its position, the counts and the cameras and
+/// classes for the filter lists.
 pub(super) async fn next(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
@@ -154,14 +157,15 @@ pub(super) async fn next(
         let found = queue::next_after(&built.items, after);
         Json(serde_json::json!({
             "success": true,
-            "item": found.map(|(_, i)| i),
-            "position": found.map(|(p, _)| p + 1),
+            "item": found.map(|(_, i, _)| i),
+            "position": found.map(|(p, _, _)| p + 1),
+            "wrapped": found.is_some_and(|(_, _, w)| w),
             "total": built.items.len(),
             "counts": built.counts,
             "cameras": built.cameras,
             "labels": built.labels,
             "unreadable": built.unreadable,
-            "upcoming": built.items.iter().skip(found.map_or(0, |(p, _)| p + 1)).take(5).map(|i| &i.frame).collect::<Vec<_>>(),
+            "upcoming": built.items.iter().skip(found.map_or(0, |(p, _, _)| p + 1)).take(5).map(|i| &i.frame).collect::<Vec<_>>(),
         }))
         .into_response()
     })
@@ -180,13 +184,14 @@ fn frame_param(q: &BTreeMap<String, String>) -> Result<String, Problem> {
         })
 }
 
-/// The labels answer for `frame` (saved, else pre-filled).
+/// The labels answer for `frame` (saved, else pre-filled), with the label file's revision
+/// (`""` = not saved yet) to send back with a save.
 fn labels_answer(frame: &Frame, classes: &[String], message: Option<String>) -> Response {
     let rec = match frame.record() {
         Ok(r) => r,
         Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
-    let saved = match frame.labels() {
+    let (saved, revision) = match labels::read_with_revision(&frame.labels) {
         Ok(l) => l,
         Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
@@ -203,6 +208,7 @@ fn labels_answer(frame: &Frame, classes: &[String], message: Option<String>) -> 
         "width": rec.width,
         "height": rec.height,
         "saved": is_saved,
+        "revision": revision,
         "stale_classes": is_saved && !file.classes_version.is_empty() && file.classes_version != version,
         "labels": file,
         "classes": classes,
@@ -244,18 +250,28 @@ pub(super) async fn labels_get(
     .await
 }
 
-/// `POST /v1/review/labels?frame=...` with a label file as JSON: checked
-/// ([`labels::normalize`]) and saved atomically; answers like the GET.
+/// Message of a save refused because the frame changed since the client read it.
+pub(super) const CONFLICT_MESSAGE: &str = "This frame changed since you opened it (an auto-label \
+     run or another tab saved it). Reload it to see the new boxes; your changes to it were not \
+     saved.";
+
+/// `POST /v1/review/labels?frame=...[&revision=<rev>]` with a label file as JSON: checked
+/// ([`labels::normalize`]) and saved atomically; answers like the GET. With `revision` (the one
+/// the GET answered; empty = not saved then) the save is refused with 409 and `conflict: true`
+/// when the file changed meanwhile; without it, it always overwrites (X-AnyLabeling and other
+/// clients).
 pub(super) async fn labels_post(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let rel = match frame_param(&query_map(query)) {
+    let q = query_map(query);
+    let rel = match frame_param(&q) {
         Ok(r) => r,
         Err((s, m)) => return fail(s, m),
     };
+    let expected = q.get("revision").map(|r| r.trim().to_string());
     let file: LabelFile = match json_body(&headers, body) {
         Ok(f) => f,
         Err((s, m)) => return fail(s, m),
@@ -274,11 +290,170 @@ pub(super) async fn labels_post(
             Ok(f) => f,
             Err(e) => return fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}")),
         };
-        if let Err(e) = labels::write(&frame.labels, &f) {
-            return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}"));
+        let written = match &expected {
+            Some(rev) => labels::write_checked(&frame.labels, &f, rev),
+            None => labels::write(&frame.labels, &f).map(Ok),
+        };
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(current)) => {
+                tracing::debug!(frame = %rel, current = %current, "review save refused: stale revision");
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "conflict": true,
+                        "message": CONFLICT_MESSAGE,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}")),
         }
         tracing::debug!(frame = %rel, status = status.as_str(), boxes = f.boxes.len(), "review labels saved");
         labels_answer(&frame, &classes, Some(format!("Saved as {}.", status.as_str())))
+    })
+    .await
+}
+
+/// Default most frames of one bulk accept.
+pub(super) const ACCEPT_AUTO_DEFAULT_LIMIT: usize = 500;
+/// Most frames of one bulk accept.
+pub(super) const ACCEPT_AUTO_MAX_LIMIT: usize = 20_000;
+/// Most frame names (accepted, failed) listed in a bulk accept's answer.
+const ACCEPT_AUTO_LISTED: usize = 20;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptAutoBody {
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    scene: Option<String>,
+    #[serde(default)]
+    camera: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Accept one frame the queue listed as eligible: re-checked under the write lock (it may have
+/// changed since), saved as reviewed ([`labels::normalize`]) with `bulk_accepted`. Ok(false)
+/// when it is not eligible any more.
+fn accept_one(
+    dir: &std::path::Path,
+    rel: &str,
+    classes: &[String],
+    now: &str,
+) -> anyhow::Result<bool> {
+    let frame = Frame::resolve(dir, rel).ok_or_else(|| anyhow::anyhow!("the frame is gone"))?;
+    let rec = frame.record()?;
+    labels::update(&frame.labels, |cur| {
+        let Some(mut f) = cur.filter(labels::auto_accept_eligible) else {
+            return Ok(None);
+        };
+        f.status = labels::Status::Reviewed;
+        let mut n = labels::normalize(f, classes, rec.width, rec.height, now)?;
+        n.bulk_accepted = true;
+        Ok(Some(n))
+    })
+}
+
+/// `POST /v1/review/accept-auto` with `{bucket?, scene?, camera?, label?, source?, dry_run,
+/// limit?}` (empty = any): the unreviewed frames of those filters whose auto-label triage alone
+/// settles them (`auto=accept`, [`labels::auto_accept_eligible`]) saved as reviewed, at most
+/// `limit` (default 500). `dry_run` only counts them.
+pub(super) async fn accept_auto(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: AcceptAutoBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
+    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        );
+    }
+    let mut q: BTreeMap<String, String> = [
+        ("bucket", b.bucket),
+        ("scene", b.scene),
+        ("camera", b.camera),
+        ("label", b.label),
+        ("source", b.source),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+    .collect();
+    q.insert("status".into(), "unreviewed".into());
+    q.insert("auto".into(), "accept".into());
+    let filters = match Filters::from_query(&q) {
+        Ok(f) => f,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let dry_run = b.dry_run;
+    blocking(move || {
+        let (dir, classes, _) = context(&state);
+        let built = queue::build(&dir, &filters);
+        let eligible = built.items.len();
+        if dry_run {
+            return Json(serde_json::json!({
+                "success": true,
+                "eligible": eligible,
+                "accepted": 0,
+                "frames": built.items.iter().take(ACCEPT_AUTO_LISTED).map(|i| &i.frame).collect::<Vec<_>>(),
+            }))
+            .into_response();
+        }
+        let now = now();
+        let (mut accepted, mut failed_n) = (Vec::new(), 0usize);
+        let mut failed = Vec::new();
+        for item in built.items.iter().take(limit) {
+            let outcome = match accept_one(&dir, &item.frame, &classes, &now) {
+                Ok(true) => {
+                    accepted.push(item.frame.clone());
+                    continue;
+                }
+                Ok(false) => "it changed since the list was built and needs a look; review it by hand".to_string(),
+                Err(e) => format!("{e:#}"),
+            };
+            failed_n += 1;
+            if failed.len() < ACCEPT_AUTO_LISTED {
+                failed.push(format!("{}: {outcome}", item.frame));
+            }
+        }
+        let mut message = format!(
+            "Accepted {} frame(s) the auto-labelers settled (saved as reviewed).",
+            accepted.len()
+        );
+        if failed_n > 0 {
+            message.push_str(&format!(" {failed_n} not accepted (listed); review them by hand."));
+        }
+        if eligible > limit {
+            message.push_str(&format!(
+                " {} more eligible beyond the limit of {limit}; run it again.",
+                eligible - limit
+            ));
+        }
+        tracing::info!(accepted = accepted.len(), failed = failed_n, eligible, "review: auto-labels bulk accepted");
+        Json(serde_json::json!({
+            "success": true,
+            "eligible": eligible,
+            "accepted": accepted.len(),
+            "failed": failed,
+            "frames": accepted.iter().take(ACCEPT_AUTO_LISTED).collect::<Vec<_>>(),
+            "message": message,
+        }))
+        .into_response()
     })
     .await
 }
@@ -1029,5 +1204,248 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(d.state.config_read().collect.classes, ["person", "fox"]);
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::get(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn saves_name_their_revision_and_stale_ones_are_refused() {
+        let d = ds();
+        let rel = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+        let q = encode_uri_component(&rel);
+        let (_, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(l["revision"], "", "not saved yet");
+        let file = l["labels"].to_string();
+        let uri = |rev: &str| format!("/v1/review/labels?frame={q}&revision={rev}");
+        let (s, saved) = json(&d.state, post_json(&uri(""), &file)).await;
+        assert_eq!(s, StatusCode::OK, "{saved}");
+        let r1 = saved["revision"].as_str().unwrap().to_string();
+        assert_eq!(r1.len(), 16);
+        let (_, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(l["revision"], r1.as_str());
+        // A tab that opened the frame before that save.
+        let (s, v) = json(&d.state, post_json(&uri(""), &file)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["conflict"], true);
+        assert_eq!(v["success"], false);
+        assert_eq!(v["message"], CONFLICT_MESSAGE);
+        // An auto-label run merges boxes meanwhile: the old revision is stale.
+        let path = d
+            .dir
+            .join("ir/drive/2026-10-21/20261021T010203004Z_a.labels.json");
+        labels::update(&path, |f| {
+            let mut f = f.unwrap();
+            f.auto_run = Some(labels::AutoRun {
+                at: "t".into(),
+                labeler: "x".into(),
+            });
+            Ok(Some(f))
+        })
+        .unwrap();
+        let (s, _) = json(&d.state, post_json(&uri(&r1), &file)).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let (_, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(l["labels"]["auto_run"]["labeler"], "x", "not overwritten");
+        let r2 = l["revision"].as_str().unwrap().to_string();
+        let mut file = l["labels"].clone();
+        file["status"] = "skipped".into();
+        let (s, v) = json(&d.state, post_json(&uri(&r2), &file.to_string())).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["labels"]["auto_run"]["labeler"], "x", "round-tripped");
+        // Without a revision a save always overwrites (other clients).
+        let (s, _) = json(
+            &d.state,
+            post_json(&format!("/v1/review/labels?frame={q}"), &file.to_string()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn next_wraps_past_the_last_frame() {
+        let d = ds();
+        let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.52);
+        let b = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_b", 0.95);
+        let next = |after: &str| format!("/v1/review/next?after={}", encode_uri_component(after));
+        let (_, v) = json(&d.state, get(&next(&a))).await;
+        assert_eq!(
+            (v["item"]["frame"].as_str(), v["wrapped"].as_bool()),
+            (Some(b.as_str()), Some(false))
+        );
+        let (_, v) = json(&d.state, get(&next(&b))).await;
+        assert_eq!(v["item"]["frame"], a.as_str());
+        assert_eq!(v["position"], 1);
+        assert_eq!(v["wrapped"], true);
+        let (_, v) = json(&d.state, get("/v1/review/next?camera=yard")).await;
+        assert_eq!(v["wrapped"], false);
+        let (_, v) = json(
+            &d.state,
+            get(&format!(
+                "/v1/review/next?camera=yard&after={}",
+                encode_uri_component(&b)
+            )),
+        )
+        .await;
+        assert_eq!(
+            (v["item"]["frame"].as_str(), v["wrapped"].as_bool()),
+            (Some(b.as_str()), Some(true)),
+            "one frame: itself again"
+        );
+        let (s, v) = json(&d.state, get("/v1/review/next?auto=maybe")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(v["message"].as_str().unwrap().starts_with("auto:"), "{v}");
+    }
+
+    /// Write `rel`'s pre-fill with its person prediction triaged `accept` by the labelers (or
+    /// left without evidence).
+    fn put_auto_labels(dir: &std::path::Path, rel: &str, accept: bool) {
+        let frame = Frame::resolve(dir, rel).unwrap();
+        let mut f = labels::prefill(&frame.record().unwrap());
+        if accept {
+            f.boxes[0].auto.triage = Some(labels::Triage::Accept);
+            f.boxes[0].auto.agree = Some(true);
+        }
+        f.auto_run = Some(labels::AutoRun {
+            at: "2026-10-22T00:00:00Z".into(),
+            labeler: "mm-gdino-tiny + rfdetr-large".into(),
+        });
+        labels::write(&frame.labels, &f).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_accept_saves_only_the_frames_the_triage_settles() {
+        let d = ds();
+        let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+        let b = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_b", 0.9);
+        let c = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.9);
+        let _never = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_n", 0.9);
+        put_auto_labels(&d.dir, &a, true);
+        // The model's person has no auto evidence: accepting unseen would trust the model.
+        put_auto_labels(&d.dir, &b, false);
+        put_auto_labels(&d.dir, &c, true);
+        let (_, v) = json(&d.state, get("/v1/review/next")).await;
+        assert_eq!(v["counts"]["auto_accept"], 2, "{v}");
+        assert_eq!(v["counts"]["auto_review"], 0);
+        for (auto, n) in [("accept", 2), ("nothing", 1), ("none", 1), ("review", 0)] {
+            let (_, v) = json(&d.state, get(&format!("/v1/review/next?auto={auto}"))).await;
+            assert_eq!(v["total"], n, "auto={auto}: {v}");
+        }
+
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/accept-auto",
+                r#"{"dry_run": true, "scene": ""}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["eligible"].as_u64(), v["accepted"].as_u64()),
+            (Some(2), Some(0))
+        );
+        assert_eq!(v["frames"].as_array().unwrap().len(), 2);
+        let fa = Frame::resolve(&d.dir, &a)
+            .unwrap()
+            .labels()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fa.status,
+            labels::Status::Unreviewed,
+            "a dry run writes nothing"
+        );
+        let (_, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/accept-auto",
+                r#"{"dry_run": true, "camera": "yard"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(v["frames"], serde_json::json!([c]), "the filters apply");
+
+        // At most `limit`.
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/accept-auto",
+                r#"{"dry_run": false, "limit": 1}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["eligible"].as_u64(), v["accepted"].as_u64()),
+            (Some(2), Some(1))
+        );
+        assert!(
+            v["message"].as_str().unwrap().contains("1 more eligible"),
+            "{v}"
+        );
+        let (_, v) = json(&d.state, post_json("/v1/review/accept-auto", "{}")).await;
+        assert_eq!(
+            (v["eligible"].as_u64(), v["accepted"].as_u64()),
+            (Some(1), Some(1)),
+            "{v}"
+        );
+        assert_eq!(v["failed"], serde_json::json!([]));
+        for rel in [&a, &c] {
+            let f = Frame::resolve(&d.dir, rel)
+                .unwrap()
+                .labels()
+                .unwrap()
+                .unwrap();
+            assert_eq!(f.status, labels::Status::Reviewed, "{rel}");
+            assert!(f.bulk_accepted);
+            assert!(f.reviewed_at.is_some());
+            let states: Vec<labels::BoxState> = f.boxes.iter().map(|b| b.state).collect();
+            assert_eq!(
+                states,
+                [labels::BoxState::Accepted, labels::BoxState::Rejected],
+                "the person accepted, the suppressed dog a hard negative"
+            );
+        }
+        let fb = Frame::resolve(&d.dir, &b)
+            .unwrap()
+            .labels()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fb.status, labels::Status::Unreviewed);
+        let (_, v) = json(&d.state, post_json("/v1/review/accept-auto", "{}")).await;
+        assert_eq!(
+            (v["eligible"].as_u64(), v["accepted"].as_u64()),
+            (Some(0), Some(0))
+        );
+
+        // The re-check under the lock: a frame that changed is left alone.
+        let (dir, classes, _) = context(&d.state);
+        assert!(!accept_one(&dir, &b, &classes, "t").unwrap());
+        assert!(accept_one(&dir, "ir/x/2026-10-22/nope.jpg", &classes, "t").is_err());
+
+        // Bad requests.
+        for (body, field) in [
+            (r#"{"dry_run": true, "colour": "red"}"#, "unknown field"),
+            (r#"{"limit": 0}"#, "limit"),
+            (r#"{"limit": 20001}"#, "limit"),
+            (r#"{"scene": "dusk"}"#, "scene"),
+        ] {
+            let (s, v) = json(&d.state, post_json("/v1/review/accept-auto", body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert!(
+                v["message"].as_str().unwrap().contains(field),
+                "{body}: {v}"
+            );
+        }
+        let mut req = post_json("/v1/review/accept-auto", "{}");
+        req.headers_mut()
+            .insert("origin", "http://evil.example".parse().unwrap());
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let big = format!(r#"{{"camera": "{}"}}"#, "x".repeat(SMALL_BODY_LIMIT));
+        let (s, _) = json(&d.state, post_json("/v1/review/accept-auto", &big)).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

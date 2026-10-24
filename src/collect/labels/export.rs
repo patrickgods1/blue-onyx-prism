@@ -867,6 +867,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: Default::default(),
         }
     }

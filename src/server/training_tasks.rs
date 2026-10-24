@@ -2,7 +2,9 @@
 //! `POST /training/autolabel`, also posted by the Review page) and the rows of their jobs.
 //! Both are planned like the CLI does ([`crate::training::import::plan_import`],
 //! [`crate::training::autolabel::plan_autolabel`]) and queued on the page's training queue
-//! (one GPU job at a time with the training runs). Admin only, like every training route.
+//! (one GPU job at a time with the training runs). Admin only, like every training route. The
+//! auto-label form answers JSON (`{success, message, id}`) to a client that accepts
+//! `application/json` (the Review page's fetch), else the Training page.
 
 use super::training::{all, field, num, service, view};
 use super::{Shared, blocking, render};
@@ -13,8 +15,10 @@ use crate::training::autolabel::{
 use crate::training::import::{ImportRequest, ImportSource, Selection};
 use crate::training::service::RunState;
 use crate::training::task::{TaskKind, TaskRecord};
+use axum::Json;
 use axum::extract::State;
-use axum::response::Response;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -212,13 +216,29 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
     .await
 }
 
-/// `POST /training/autolabel`.
-pub(super) async fn autolabel(State(shared): State<Shared>, body: axum::body::Bytes) -> Response {
+/// Whether the client asks for JSON (`Accept` names `application/json`).
+fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.to_ascii_lowercase().contains("application/json"))
+}
+
+/// `POST /training/autolabel`: the Training page, or with `Accept: application/json` 200
+/// `{success: true, message, id}` (the task id, polled in `GET /v1/training` `tasks[]`) / 400
+/// `{success: false, message}`.
+pub(super) async fn autolabel(
+    State(shared): State<Shared>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let json = wants_json(&headers);
     blocking(move || {
         let state = shared.current();
         let f = super::dataset::parse_form(&body);
         let config = state.config_read().clone();
-        let result = (|| -> anyhow::Result<String> {
+        let result = (|| -> anyhow::Result<(String, String)> {
             let req = autolabel_from_form(&f)?;
             let cap = crate::training::capability_now();
             let mut job = crate::training::autolabel::plan_autolabel(&config, req, &cap)?;
@@ -232,17 +252,30 @@ pub(super) async fn autolabel(State(shared): State<Shared>, body: axum::body::By
                 ));
             }
             let title = crate::training::task::Task::title(&job);
-            service(&shared)
+            let id = service(&shared)
                 .enqueue_task(Box::new(job))
                 .map_err(anyhow::Error::msg)?;
-            Ok(format!(
-                "Queued: {title}. The boxes appear on the Review page as pending auto boxes when \
-                 it is done."
+            Ok((
+                format!(
+                    "Queued: {title}. The boxes appear on the Review page as pending auto boxes \
+                     when it is done."
+                ),
+                id,
             ))
         })();
-        match result {
-            Ok(m) => render(&view(&state, Some(m), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not queued: {e:#}")))),
+        match (result, json) {
+            (Ok((m, id)), true) => {
+                Json(serde_json::json!({"success": true, "message": m, "id": id})).into_response()
+            }
+            (Err(e), true) => (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"success": false, "message": format!("Not queued: {e:#}")}),
+                ),
+            )
+                .into_response(),
+            (Ok((m, _)), false) => render(&view(&state, Some(m), None)),
+            (Err(e), false) => render(&view(&state, None, Some(format!("Not queued: {e:#}")))),
         }
     })
     .await
@@ -395,6 +428,69 @@ mod tests {
         assert!(done, "the import finished");
         let s = crate::collect::Summary::scan(&root.join("dataset"));
         assert_eq!(s.frames, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_autolabel_form_answers_json_when_asked() {
+        use crate::server::test_util::{call, test_state_with};
+        use axum::body::Body;
+        use axum::http::Request;
+        let root = std::env::temp_dir().join(format!("bop-train-al-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let post = |body: &str, accept: &str| {
+            Request::post("/training/autolabel")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::ACCEPT, accept)
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        // A bad filter: 400 with the reason.
+        let (s, _, b) = call(&state, post("frames=colour%3Dred", "application/json")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["success"], false);
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown frame filter 'colour'"),
+            "{v}"
+        );
+        // A re-label with a configured model needs no GPU: queued, with the task id.
+        let (s, _, b) = call(
+            &state,
+            post(
+                "with_model=ipcam-general&frames=limit%3D5",
+                "application/json, text/plain, */*",
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["success"], true, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().starts_with("Queued: "),
+            "{v}"
+        );
+        let id = v["id"].as_str().unwrap().to_string();
+        assert!(!id.is_empty());
+        let (_, json) = crate::server::test_util::get_text(&state, "/v1/training").await;
+        let t: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            t["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["id"] == id.as_str()),
+            "{t}"
+        );
+        // A browser form post still gets the page.
+        let (s, _, b) = call(&state, post("frames=colour%3Dred", "text/html")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8(b).unwrap().contains("Not queued"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
