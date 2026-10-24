@@ -49,7 +49,7 @@
       <label>Max size (GB) <input type="number" name="max_gb" min="0.1" step="0.1" value="{{ max_gb }}"></label>
       <label>Max age (days, 0 = keep) <input type="number" name="max_age_days" min="0" step="1" value="{{ max_age_days }}"></label>
       <label>Dedup distance (dHash bits) <input type="number" name="dedup_hamming" min="0" max="32" step="1" value="{{ dedup_hamming }}"></label>
-      <label>Folder (empty = <code>dataset</code> under the data folder) <input type="text" name="dir" value="{{ dir_setting }}"></label>
+      <label>Folder (empty = <code>dataset</code> under the data folder) <span class="with-browse"><input type="text" name="dir" value="{{ dir_setting }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" hidden>Browse&hellip;</button></span></label>
     </div>
     <button type="submit">Save</button>
   </form>
@@ -66,6 +66,21 @@
     </tbody>
   </table>
   </div>
+</div>
+
+<div class="card">
+  <h2>Frames by detected class</h2>
+  <p class="muted">The labels the model reported when the frame was collected (a frame counts once per class). Reviewed labels are counted on the <a href="/review">Review</a> page and in the export report.</p>
+  {% if labels.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Class</th><th>day</th><th>night</th><th>ir</th><th>Total</th></tr></thead>
+    <tbody>
+    {% for l in labels %}<tr><td>{{ l.label }}</td><td class="num">{{ l.day }}</td><td class="num">{{ l.night }}</td><td class="num">{{ l.ir }}</td><td class="num">{{ l.total }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -110,4 +125,16 @@
   </form>
   {% endif %}
 </div>
+<dialog id="browse-dialog">
+  <h3 id="browse-title">Choose a folder</h3>
+  <div class="browse-bar">
+    <select id="browse-roots" aria-label="Places"></select>
+    <button type="button" id="browse-up" class="small">Up</button>
+  </div>
+  <div id="browse-path" class="browse-path"></div>
+  <div id="browse-list" class="browse-list"></div>
+  <p id="browse-msg" class="muted" role="status"></p>
+  <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
+</dialog>
+<script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

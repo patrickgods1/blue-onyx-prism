@@ -1,5 +1,6 @@
 //! `GET /v1/fs/browse`: a read-only, server-side file browser for the Config page's
-//! "Add a model by path" form and the Training page's footage import. Lists folders plus model
+//! "Add a model by path" form, the Training page's footage import and the Dataset page's
+//! folder picker (`kind=folder`: folders only). Lists folders plus model
 //! (`.onnx`/`.xml`), classes (`.yaml`/`.yml`) or, for the import picker only (`kind=video`),
 //! video (`.mp4`/`.mkv`/`.avi`/`.mov`) files, and only inside the roots the page offers ([`roots`]: the
 //! data root, the models and download directories, the user's home and, on Windows, the
@@ -32,6 +33,8 @@ pub(super) enum Kind {
     Classes,
     /// The footage import's picker: videos (folders of images are picked as folders).
     Video,
+    /// The Dataset page's folder picker: folders only, no files.
+    Folder,
 }
 
 impl Kind {
@@ -40,6 +43,7 @@ impl Kind {
             None | Some("") | Some("model") => Some(Kind::Model),
             Some("classes") => Some(Kind::Classes),
             Some("video") => Some(Kind::Video),
+            Some("folder") => Some(Kind::Folder),
             _ => None,
         }
     }
@@ -54,6 +58,7 @@ impl Kind {
             Kind::Model => ext == "onnx" || ext == "xml",
             Kind::Classes => ext == "yaml" || ext == "yml",
             Kind::Video => crate::training::import::source::VIDEO_EXTS.contains(&ext.as_str()),
+            Kind::Folder => false,
         }
     }
 }
@@ -271,7 +276,7 @@ pub(super) fn list(
 ) -> Result<Listing, BrowseError> {
     let kind = Kind::parse(kind).ok_or_else(|| BrowseError {
         status: StatusCode::BAD_REQUEST,
-        message: "unknown kind (use model, classes or video)".to_string(),
+        message: "unknown kind (use model, classes, video or folder)".to_string(),
     })?;
     let raw = path
         .map(|p| p.trim().trim_matches(|c| c == '"' || c == '\'').trim())
@@ -427,6 +432,14 @@ mod tests {
         let m = list(&cfg, None, Some("model")).unwrap();
         assert!(!names(&m).contains(&"clip.MP4"), "not in the model picker");
         assert!(!l.truncated);
+    }
+
+    #[test]
+    fn folder_kind_lists_dirs_only() {
+        let (_root, cfg) = setup();
+        let l = list(&cfg, None, Some("folder")).unwrap();
+        assert_eq!(names(&l), ["adir", "Zdir"]);
+        assert!(l.entries.iter().all(|e| e.dir));
     }
 
     #[test]

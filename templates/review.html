@@ -11,6 +11,7 @@
     <label>Bucket <select name="bucket"><option value="">any</option>{% for b in buckets %}<option value="{{ b }}">{{ b }}</option>{% endfor %}</select></label>
     <label>Scene <select name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></label>
     <label>Camera <select name="camera" id="rv-camera"><option value="">any</option></select></label>
+    <label>Class <select name="label" id="rv-label"><option value="">any</option>{% for c in classes %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></label>
     <label>Status <select name="status"><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select></label>
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
   </form>
@@ -71,7 +72,7 @@
 
 <div class="card">
   <h2>Export reviewed frames</h2>
-  <p class="muted">Writes YOLO (<code>images/</code>, <code>labels/</code>, <code>data.yaml</code>), COCO (<code>annotations/</code>), X-AnyLabeling (<code>xanylabeling/</code>) and a benchmark set (<code>benchmark/</code>, run it with <code>benchmark --dataset dir:&lt;folder&gt;/benchmark</code>). The split holds out whole cameras or days.</p>
+  <p class="muted">Writes YOLO (<code>images/</code>, <code>labels/</code>, <code>data.yaml</code>), COCO (<code>annotations/</code>), X-AnyLabeling (<code>xanylabeling/</code>) and a benchmark set (<code>benchmark/</code>, run it with <code>benchmark --dataset dir:&lt;folder&gt;/benchmark</code>). The split holds out whole cameras or days. A class filter keeps the frames with a reviewed box of those classes; their other boxes stay labelled.</p>
   <form id="rv-export">
     <div class="inline-row">
       <label class="check"><input type="checkbox" name="fmt" value="yolo" checked> YOLO</label>
@@ -85,6 +86,8 @@
       <label>Held-out days (YYYY-MM-DD, comma separated) <input type="text" name="holdout_days"></label>
       <label>Else hold out this share of camera-days <input type="number" name="holdout_fraction" min="0" max="1" step="0.05" value="0.2"></label>
       <label>Benchmark set <select name="benchmark_split"><option value="all">all frames</option><option value="val">held-out frames</option><option value="train">training frames</option></select></label>
+      <label>Only frames with these classes (comma separated, empty = all) <input type="text" name="labels" placeholder="{{ classes_text }}"></label>
+      <label class="check"><input type="checkbox" name="include_empty" checked> Include confirmed-empty frames</label>
       <label class="check"><input type="checkbox" name="include_unreviewed"> X-AnyLabeling: also the unreviewed frames sent to review (pre-filled, unchecked)</label>
     </div>
     <button type="submit">Export</button>

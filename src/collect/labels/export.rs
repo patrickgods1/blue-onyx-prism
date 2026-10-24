@@ -11,6 +11,11 @@
 //! fraction of 2^64, are below `holdout_fraction` (stable when days are added), with at least
 //! one group on each side once there are two groups.
 //!
+//! Class filter ([`ClassFilter`]): with `labels`, only frames with a training box of one of
+//! them are exported (other-class boxes in a kept frame stay labelled, class ids still follow
+//! the class list); frames confirmed empty are exported while `include_empty` is set (default).
+//! Applied before the split, recorded in `export.json`.
+//!
 //! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`]) plus [`run`], which
 //! writes into an empty or new folder (images hard-linked, else copied) and writes
 //! `export.json` last.
@@ -337,6 +342,50 @@ pub enum BenchSplit {
     Val,
 }
 
+/// Which reviewed frames an export keeps (see the module doc).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ClassFilter {
+    /// Keep frames with a training box of one of these classes; empty = every class.
+    pub labels: Vec<String>,
+    /// Keep frames confirmed empty (hard-negative images).
+    pub include_empty: bool,
+}
+
+impl Default for ClassFilter {
+    fn default() -> Self {
+        Self {
+            labels: Vec::new(),
+            include_empty: true,
+        }
+    }
+}
+
+impl ClassFilter {
+    /// Every label must be in `classes` (exports name classes by their id in that list).
+    pub fn check(&self, classes: &[String]) -> Result<()> {
+        if let Some(l) = self.labels.iter().find(|l| !classes.contains(l)) {
+            bail!(
+                "labels: '{}' is not in the class list ({}); pick classes from the list, or add \
+                 '{}' to the class list on the Review page first",
+                l.escape_debug(),
+                classes.join(", "),
+                l.escape_debug()
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a frame with `labels` is exported: a frame confirmed empty when `include_empty`
+    /// is set; any other frame when no class is named, else only with a training box of a
+    /// named class.
+    pub fn keeps(&self, labels: &LabelFile) -> bool {
+        if labels.empty_confirmed {
+            return self.include_empty;
+        }
+        self.labels.is_empty() || labels.training().any(|b| self.labels.contains(&b.label))
+    }
+}
+
 /// An export request (`POST /v1/review/export`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportRequest {
@@ -371,6 +420,10 @@ pub struct ExportReport {
     pub unreviewed_frames: usize,
     pub warnings: Vec<String>,
     pub classes: Vec<String>,
+    /// The class filter applied.
+    pub class_filter: ClassFilter,
+    /// Reviewed frames the class filter left out.
+    pub filtered_out: usize,
 }
 
 /// One (camera, date) group of an export.
@@ -390,6 +443,20 @@ pub fn reviewed_frames(
     classes: &[String],
     split: &SplitConfig,
 ) -> (Vec<ExportFrame>, Vec<String>) {
+    let (frames, warnings, _) =
+        reviewed_frames_filtered(dir, classes, split, &ClassFilter::default());
+    (frames, warnings)
+}
+
+/// [`reviewed_frames`] that `filter` keeps, split after filtering (so both sides hold kept
+/// frames); also how many the filter left out.
+pub fn reviewed_frames_filtered(
+    dir: &Path,
+    classes: &[String],
+    split: &SplitConfig,
+    filter: &ClassFilter,
+) -> (Vec<ExportFrame>, Vec<String>, usize) {
+    let mut filtered_out = 0;
     let mut warnings = Vec::new();
     let mut frames = Vec::new();
     for (rel, _) in label_files(dir) {
@@ -428,6 +495,10 @@ pub fn reviewed_frames(
             warnings.push(format!("{rel}: reviewed but has pending boxes; left out"));
             continue;
         }
+        if !filter.keeps(&labels) {
+            filtered_out += 1;
+            continue;
+        }
         frames.push(ExportFrame {
             name: flat_name(&frame.rel),
             rel: frame.rel,
@@ -450,7 +521,7 @@ pub fn reviewed_frames(
             .copied()
             .unwrap_or(Split::Train);
     }
-    (frames, warnings)
+    (frames, warnings, filtered_out)
 }
 
 /// Hard-link `src` to `dst`, else copy it.
@@ -494,19 +565,43 @@ fn prepare_out(out: &Path) -> Result<()> {
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))
 }
 
-/// Export the reviewed frames of the dataset `dir` (see the module doc).
+/// Export the reviewed frames of the dataset `dir` (see the module doc), every class.
 pub fn run(dir: &Path, classes: &[String], req: &ExportRequest) -> Result<ExportReport> {
+    run_filtered(dir, classes, req, &ClassFilter::default())
+}
+
+/// [`run`] keeping only the frames `filter` keeps ([`ClassFilter::keeps`]; the queue's
+/// unreviewed X-AnyLabeling frames by the boxes a save would accept).
+pub fn run_filtered(
+    dir: &Path,
+    classes: &[String],
+    req: &ExportRequest,
+    filter: &ClassFilter,
+) -> Result<ExportReport> {
     if req.formats.is_empty() {
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
-    let (frames, mut warnings) = reviewed_frames(dir, classes, &req.split);
+    filter.check(classes)?;
+    let (frames, mut warnings, filtered_out) =
+        reviewed_frames_filtered(dir, classes, &req.split, filter);
     let unreviewed: Vec<(Frame, LabelFile, u32, u32)> =
         if req.include_unreviewed && req.formats.contains(&Format::XAnyLabeling) {
             unreviewed_queue_frames(dir, &mut warnings)
+                .into_iter()
+                .filter(|(_, labels, _, _)| filter.keeps(&preview(labels)))
+                .collect()
         } else {
             Vec::new()
         };
     if frames.is_empty() && unreviewed.is_empty() {
+        if filtered_out > 0 {
+            bail!(
+                "no reviewed frame of {} in {} ({filtered_out} reviewed frame(s) left out by the \
+                 class filter); clear the class filter or review frames of these classes first",
+                filter.labels.join(", "),
+                dir.display()
+            );
+        }
         bail!(
             "no reviewed frame to export in {}; review frames on the Review page first (save \
              them as reviewed)",
@@ -521,6 +616,8 @@ pub fn run(dir: &Path, classes: &[String], req: &ExportRequest) -> Result<Export
         frames: frames.len(),
         classes: classes.to_vec(),
         unreviewed_frames: unreviewed.len(),
+        class_filter: filter.clone(),
+        filtered_out,
         ..ExportReport::default()
     };
     let mut groups: BTreeMap<Group, (Split, usize)> = BTreeMap::new();
@@ -619,15 +716,7 @@ pub fn run(dir: &Path, classes: &[String], req: &ExportRequest) -> Result<Export
         for (frame, labels, w, h) in &unreviewed {
             let name = flat_name(&frame.rel);
             link_or_copy(&frame.jpg, &xdir.join(&name))?;
-            let preview: Vec<LabelBox> = labels
-                .boxes
-                .iter()
-                .map(|b| LabelBox {
-                    state: super::resolve_pending(b),
-                    ..b.clone()
-                })
-                .filter(LabelBox::is_training)
-                .collect();
+            let preview = preview(labels).boxes;
             let x = xany::to_xany(&name, *w, *h, &preview, false);
             let stem = name.trim_end_matches(".jpg");
             write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
@@ -693,6 +782,23 @@ pub fn run(dir: &Path, classes: &[String], req: &ExportRequest) -> Result<Export
     r.warnings = warnings;
     write_file(&out.join("export.json"), &json_bytes(&r)?)?;
     Ok(r)
+}
+
+/// An unreviewed frame's labels as a save would leave them: pending boxes resolved, training
+/// boxes only.
+fn preview(labels: &LabelFile) -> LabelFile {
+    LabelFile {
+        boxes: labels
+            .boxes
+            .iter()
+            .map(|b| LabelBox {
+                state: super::resolve_pending(b),
+                ..b.clone()
+            })
+            .filter(LabelBox::is_training)
+            .collect(),
+        ..labels.clone()
+    }
 }
 
 /// The review queue's frames that are not reviewed or skipped, with their labels (saved or
@@ -911,6 +1017,218 @@ mod tests {
         assert_eq!(x.values().filter(|s| **s == Split::Train).count(), 1);
         let one: BTreeSet<Group> = [g("a", "2026-01-01")].into_iter().collect();
         assert_eq!(assign_splits(&one, &cfg).len(), 1);
+    }
+
+    #[test]
+    fn the_class_filter_keeps_frames_with_a_training_box_of_a_named_class() {
+        let dog = frame(
+            vec![
+                lb("dog", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted),
+                lb("person", [20.0, 1.0, 29.0, 9.0], BoxState::Added),
+            ],
+            false,
+        );
+        let rejected_dog = frame(
+            vec![
+                lb("dog", [1.0, 1.0, 9.0, 9.0], BoxState::Rejected),
+                lb("person", [20.0, 1.0, 29.0, 9.0], BoxState::Accepted),
+            ],
+            false,
+        );
+        let empty = frame(vec![], true);
+        let all = ClassFilter::default();
+        assert!(
+            all.keeps(&dog.labels) && all.keeps(&rejected_dog.labels) && all.keeps(&empty.labels)
+        );
+        let only_dog = ClassFilter {
+            labels: vec!["dog".into()],
+            include_empty: true,
+        };
+        assert!(only_dog.keeps(&dog.labels));
+        assert!(
+            !only_dog.keeps(&rejected_dog.labels),
+            "a rejected box is no training box"
+        );
+        assert!(only_dog.keeps(&empty.labels));
+        let no_empty = ClassFilter {
+            include_empty: false,
+            ..only_dog.clone()
+        };
+        assert!(!no_empty.keeps(&empty.labels));
+        let every_class_no_empty = ClassFilter {
+            labels: vec![],
+            include_empty: false,
+        };
+        assert!(
+            every_class_no_empty.keeps(&dog.labels) && !every_class_no_empty.keeps(&empty.labels)
+        );
+        assert!(only_dog.check(&classes()).is_ok());
+        let e = ClassFilter {
+            labels: vec!["unicorn".into()],
+            include_empty: true,
+        }
+        .check(&classes())
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("'unicorn' is not in the class list") && e.contains("Review page"),
+            "{e}"
+        );
+    }
+
+    /// A reviewed frame (64x48 image, sidecar, label file) of `camera` on `date`.
+    fn put_reviewed(
+        dir: &Path,
+        camera: &str,
+        date: &str,
+        stem: &str,
+        boxes: Vec<LabelBox>,
+        empty: bool,
+    ) {
+        let day = dir.join("day").join(camera).join(date);
+        std::fs::create_dir_all(&day).unwrap();
+        image::RgbImage::from_pixel(64, 48, image::Rgb([90, 90, 90]))
+            .save(day.join(format!("{stem}.jpg")))
+            .unwrap();
+        let mut r = super::super::super::record::empty_record();
+        r.id = stem.into();
+        r.camera = camera.into();
+        r.width = 64;
+        r.height = 48;
+        std::fs::write(
+            day.join(format!("{stem}.json")),
+            serde_json::to_vec(&r).unwrap(),
+        )
+        .unwrap();
+        let f = LabelFile {
+            status: Status::Reviewed,
+            empty_confirmed: empty,
+            boxes,
+            ..LabelFile::default()
+        };
+        super::super::write(
+            &day.join(format!("{stem}{}", super::super::LABELS_SUFFIX)),
+            &f,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_filtered_export_keeps_other_class_boxes_and_records_the_filter() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "a",
+            vec![
+                lb("raccoon", [4.0, 4.0, 20.0, 20.0], BoxState::Accepted),
+                lb("person", [30.0, 4.0, 60.0, 40.0], BoxState::Added),
+            ],
+            false,
+        );
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "b",
+            vec![lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted)],
+            false,
+        );
+        put_reviewed(
+            &dir,
+            "yard",
+            "2026-10-22",
+            "c",
+            vec![lb("raccoon", [1.0, 1.0, 9.0, 9.0], BoxState::Rejected)],
+            true,
+        );
+        let req = |out: &str| ExportRequest {
+            formats: vec![Format::Yolo, Format::Benchmark],
+            out_dir: root.join(out),
+            split: SplitConfig {
+                holdout_cameras: vec!["yard".into()],
+                ..SplitConfig::default()
+            },
+            benchmark_split: BenchSplit::All,
+            include_unreviewed: false,
+        };
+        let filter = ClassFilter {
+            labels: vec!["raccoon".into()],
+            include_empty: true,
+        };
+        let r = run_filtered(&dir, &classes(), &req("one"), &filter).unwrap();
+        assert_eq!((r.frames, r.filtered_out, r.empty_confirmed), (2, 1, 1));
+        assert_eq!(
+            r.per_class.get("person"),
+            Some(&1),
+            "the kept frame's person stays labelled"
+        );
+        let txt = std::fs::read_to_string(root.join("one/labels/train/day.drive.2026-10-21.a.txt"))
+            .unwrap();
+        let ids: Vec<&str> = txt.lines().map(|l| &l[..1]).collect();
+        assert_eq!(ids, ["2", "0"], "class ids follow the class list");
+        assert!(
+            !root
+                .join("one/labels/train/day.drive.2026-10-21.b.txt")
+                .exists()
+        );
+        assert!(
+            root.join("one/labels/val/day.yard.2026-10-22.c.txt")
+                .is_file()
+        );
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("one/export.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            report["class_filter"],
+            serde_json::json!({"labels": ["raccoon"], "include_empty": true})
+        );
+        assert_eq!(report["filtered_out"], 1);
+        // Without confirmed-empty frames.
+        let r = run_filtered(
+            &dir,
+            &classes(),
+            &req("two"),
+            &ClassFilter {
+                include_empty: false,
+                ..filter.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!((r.frames, r.filtered_out, r.empty_confirmed), (1, 2, 0));
+        // No filter: every reviewed frame, as before.
+        let r = run(&dir, &classes(), &req("three")).unwrap();
+        assert_eq!((r.frames, r.filtered_out), (3, 0));
+        assert_eq!(r.class_filter, ClassFilter::default());
+        // A filter nothing matches says so; a label outside the class list is refused.
+        let e = run_filtered(
+            &dir,
+            &classes(),
+            &req("four"),
+            &ClassFilter {
+                labels: vec!["dog".into()],
+                include_empty: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("left out by the class filter"), "{e}");
+        assert!(
+            run_filtered(
+                &dir,
+                &classes(),
+                &req("five"),
+                &ClassFilter {
+                    labels: vec!["fox".into()],
+                    include_empty: true
+                }
+            )
+            .is_err()
+        );
+        assert!(!root.join("four").exists() && !root.join("five").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

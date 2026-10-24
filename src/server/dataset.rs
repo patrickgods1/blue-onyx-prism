@@ -1,10 +1,11 @@
 //! The Dataset page (`/dataset`, admin only) of the dataset collector ([`crate::collect`]):
 //! the collection and per-bucket toggles and limits (saved with [`save_config`], applied
-//! live), counts by scene x bucket and per camera, disk use, the newest frames per bucket and
+//! live), counts by scene x bucket, by detected class and per camera, disk use, the newest frames per bucket and
 //! "Send to review" (appends to `<dir>/review-queue.jsonl`). Frames and sidecars are served
 //! by `/dataset/image` and `/dataset/sidecar` only for paths that pass
 //! [`crate::collect::layout::resolve`] (no traversal, no symlinks). `GET /v1/dataset` is the
-//! same summary as JSON. Plain HTML forms: the page needs no script.
+//! same summary as JSON. Plain HTML forms: the page needs no script (`browse.js` only adds the
+//! folder field's Browse... button).
 
 use super::{AppState, blocking, encode_uri_component, render, save_config};
 use crate::collect::layout::{self, REVIEW_QUEUE_FILE, SCENES};
@@ -124,6 +125,42 @@ struct SceneRow {
     counts: Vec<u64>,
 }
 
+/// One row of "Frames by detected class".
+#[derive(Debug, PartialEq)]
+struct LabelRow {
+    label: String,
+    day: u64,
+    night: u64,
+    ir: u64,
+    total: u64,
+}
+
+/// Rows of "Frames by detected class": most frames first (ties by name), frames without a
+/// detection ([`layout::NO_DETECTION`]) last.
+fn label_rows(summary: &crate::collect::Summary) -> Vec<LabelRow> {
+    let mut rows: Vec<LabelRow> = summary
+        .by_label
+        .iter()
+        .map(|(label, by_scene)| {
+            let n = |s: &str| by_scene.get(s).copied().unwrap_or(0);
+            LabelRow {
+                label: label.clone(),
+                day: n("day"),
+                night: n("night"),
+                ir: n("ir"),
+                total: by_scene.values().sum(),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        (a.label == layout::NO_DETECTION)
+            .cmp(&(b.label == layout::NO_DETECTION))
+            .then(b.total.cmp(&a.total))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    rows
+}
+
 struct CameraRow {
     name: String,
     frames: u64,
@@ -165,6 +202,7 @@ struct DatasetTemplate {
     bucket_names: Vec<&'static str>,
     buckets: Vec<BucketRow>,
     scenes: Vec<SceneRow>,
+    labels: Vec<LabelRow>,
     cameras: Vec<CameraRow>,
     groups: Vec<ThumbGroup>,
     /// Footage imports into this folder, newest first (`imports.jsonl`).
@@ -275,6 +313,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
         bucket_names: Bucket::ALL.iter().map(|b| b.as_str()).collect(),
         buckets,
         scenes,
+        labels: label_rows(&summary),
         cameras,
         groups,
     }
@@ -491,15 +530,28 @@ mod tests {
 
     /// One frame (image + sidecar + index line) at `rel_day/stem`.
     fn put_frame(dir: &std::path::Path, rel_day: &str, stem: &str) -> String {
+        put_frame_with(dir, rel_day, stem, &[])
+    }
+
+    /// [`put_frame`] whose reply had predictions labelled `labels`.
+    fn put_frame_with(dir: &std::path::Path, rel_day: &str, stem: &str, labels: &[&str]) -> String {
         let day = dir.join(rel_day);
         std::fs::create_dir_all(&day).unwrap();
         std::fs::write(day.join(format!("{stem}.jpg")), b"\xFF\xD8jpeg").unwrap();
         let mut r = crate::collect::record::empty_record();
         r.id = stem.into();
         r.buckets = vec![Bucket::Suppressed];
-        r.scene = "ir".into();
         r.camera = "cam".into();
         r.timestamp = "2026-10-22T01:02:03.004Z".into();
+        r.scene = rel_day.split('/').next().unwrap_or("ir").into();
+        r.predictions = labels
+            .iter()
+            .map(|l| crate::collect::record::Det {
+                label: (*l).into(),
+                score: 0.9,
+                bbox: [1.0, 1.0, 5.0, 5.0],
+            })
+            .collect();
         std::fs::write(
             day.join(format!("{stem}.json")),
             serde_json::to_vec(&r).unwrap(),
@@ -591,6 +643,80 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["summary"]["frames"], 1);
         assert_eq!(v["summary"]["by_scene"]["ir"]["suppressed"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn label_rows_sort_by_total_with_no_detection_last() {
+        let mut s = crate::collect::Summary::default();
+        let set = |s: &mut crate::collect::Summary, l: &str, scene: &str, n: u64| {
+            s.by_label
+                .entry(l.into())
+                .or_default()
+                .insert(scene.into(), n);
+        };
+        set(&mut s, layout::NO_DETECTION, "day", 50);
+        set(&mut s, "car", "day", 2);
+        set(&mut s, "person", "night", 3);
+        set(&mut s, "person", "ir", 4);
+        set(&mut s, "dog", "ir", 2);
+        let rows = label_rows(&s);
+        let order: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(order, ["person", "car", "dog", layout::NO_DETECTION]);
+        assert_eq!(
+            rows[0],
+            LabelRow {
+                label: "person".into(),
+                day: 0,
+                night: 3,
+                ir: 4,
+                total: 7
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn page_shows_frames_by_detected_class_and_the_browse_button() {
+        let (state, dir) = dataset_state();
+        put_frame_with(
+            &dir,
+            "night/cam/2026-10-22",
+            "20261022T010203004Z_a",
+            &["person", "person"],
+        );
+        put_frame_with(
+            &dir,
+            "ir/cam/2026-10-22",
+            "20261022T010203005Z_b",
+            &["person", "car"],
+        );
+        put_frame(&dir, "day/cam/2026-10-22", "20261022T010203006Z_c");
+        let (s, page) = get_text(&state, "/dataset").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(page.contains("Frames by detected class"), "card");
+        assert!(page.contains("Reviewed labels are counted on the"), "note");
+        let person = page.find("<tr><td>person</td><td class=\"num\">0</td><td class=\"num\">1</td><td class=\"num\">1</td><td class=\"num\">2</td></tr>");
+        let car = page.find("<tr><td>car</td>");
+        let none = page.find("<tr><td>(none)</td><td class=\"num\">1</td>");
+        assert!(
+            person.is_some() && car.is_some() && none.is_some(),
+            "{page}"
+        );
+        assert!(person < car && car < none, "most frames first, (none) last");
+        let scene_card = page.find("Frames by scene and bucket").unwrap();
+        let class_card = page.find("Frames by detected class").unwrap();
+        let camera_card = page.find("<h2>Cameras</h2>").unwrap();
+        assert!(scene_card < class_card && class_card < camera_card);
+        assert!(
+            page.contains("data-browse=\"folder\" data-target=\"dir\""),
+            "browse button"
+        );
+        assert!(page.contains("<dialog id=\"browse-dialog\">"));
+        assert!(page.contains("/static/browse.js?v="));
+        let (_, json) = get_text(&state, "/v1/dataset").await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["summary"]["by_label"]["person"]["night"], 1);
+        assert_eq!(v["summary"]["by_label"]["(none)"]["day"], 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

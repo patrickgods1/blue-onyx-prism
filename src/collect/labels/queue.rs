@@ -1,5 +1,6 @@
 //! The review queue: the frames of `review-queue.jsonl` (and, with [`QueueSource::All`], every
-//! indexed frame), filtered by bucket, scene, camera and review status, and sorted by
+//! indexed frame), filtered by bucket, scene, camera, object class ([`frame_labels`]) and review
+//! status, and sorted by
 //! uncertainty ([`Uncertainty`]): the near-threshold margin first, then verifier disagreement,
 //! then the number of suppressed boxes, then newest. Also the counts the Review page shows.
 
@@ -41,12 +42,14 @@ pub struct Filters {
     pub bucket: Option<Bucket>,
     pub scene: Option<String>,
     pub camera: Option<String>,
+    /// Only frames with this class ([`frame_labels`]).
+    pub label: Option<String>,
     pub status: StatusFilter,
     pub source: QueueSource,
 }
 
 impl Filters {
-    /// From query parameters (`bucket`, `scene`, `camera`, `status` = `unreviewed|reviewed|
+    /// From query parameters (`bucket`, `scene`, `camera`, `label`, `status` = `unreviewed|reviewed|
     /// skipped|any`, `source` = `queue|all`); empty values mean "any". Errors name the field.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
@@ -71,6 +74,20 @@ impl Filters {
                 format!("status: '{s}' is not unreviewed, reviewed, skipped or any")
             })?),
         };
+        let label = match get("label") {
+            None => None,
+            Some(l) if super::super::config::validate_classes(&[l.to_string()]).is_ok() => {
+                Some(l.to_string())
+            }
+            Some(l) => {
+                return Err(format!(
+                    "label: '{}' is not a valid class name (1 to {} characters, no control \
+                     characters); pick a class from the list",
+                    l.escape_debug(),
+                    super::super::config::MAX_CLASS_LEN
+                ));
+            }
+        };
         let source = match get("source") {
             None | Some("queue") => QueueSource::Queue,
             Some("all") => QueueSource::All,
@@ -80,9 +97,25 @@ impl Filters {
             bucket,
             scene,
             camera: get("camera").map(str::to_string),
+            label,
             status,
             source,
         })
+    }
+}
+
+/// The object classes of a frame: with a label file, the labels of its boxes that are not
+/// rejected (accepted, added and still pending ones); without one, the labels of the reply's
+/// `predictions`.
+pub fn frame_labels(rec: &Record, labels: Option<&LabelFile>) -> BTreeSet<String> {
+    match labels {
+        Some(l) => l
+            .boxes
+            .iter()
+            .filter(|b| b.state != super::BoxState::Rejected)
+            .map(|b| b.label.clone())
+            .collect(),
+        None => rec.predictions.iter().map(|d| d.label.clone()).collect(),
     }
 }
 
@@ -258,6 +291,9 @@ pub struct Queue {
     pub counts: Counts,
     /// Cameras among the candidates (for the filter list).
     pub cameras: Vec<String>,
+    /// Classes ([`frame_labels`]) of the frames the bucket, scene and camera filters keep, before
+    /// the class filter (for the filter list).
+    pub labels: Vec<String>,
     /// Frames left out: unreadable sidecar or label file.
     pub unreadable: u64,
 }
@@ -307,6 +343,7 @@ pub fn candidates(dir: &Path, source: QueueSource) -> Vec<Candidate> {
 pub fn build(dir: &Path, f: &Filters) -> Queue {
     let mut q = Queue::default();
     let mut cameras = BTreeSet::new();
+    let mut seen_labels = BTreeSet::new();
     for c in candidates(dir, f.source) {
         cameras.insert(c.camera.clone());
         if f.scene.as_ref().is_some_and(|s| *s != c.scene)
@@ -322,6 +359,12 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
             q.unreadable += 1;
             continue;
         };
+        let classes = frame_labels(&rec, labels.as_ref());
+        let keep = f.label.as_ref().is_none_or(|l| classes.contains(l));
+        seen_labels.extend(classes);
+        if !keep {
+            continue;
+        }
         q.counts.add(labels.as_ref());
         let status = labels.as_ref().map_or(Status::Unreviewed, |l| l.status);
         if let StatusFilter::Is(s) = f.status
@@ -343,6 +386,7 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
     }
     sort_items(&mut q.items);
     q.cameras = cameras.into_iter().collect();
+    q.labels = seen_labels.into_iter().collect();
     q
 }
 
@@ -501,5 +545,121 @@ mod tests {
         assert!(q(&[("status", "done")]).unwrap_err().contains("status"));
         assert!(q(&[("source", "x")]).unwrap_err().contains("source"));
         assert_eq!(q(&[("bucket", "")]).unwrap().bucket, None);
+        assert_eq!(
+            q(&[("label", " fire hydrant ")]).unwrap().label.as_deref(),
+            Some("fire hydrant")
+        );
+        assert_eq!(q(&[("label", "")]).unwrap().label, None);
+        let e = q(&[("label", "a\u{7}b")]).unwrap_err();
+        assert!(
+            e.contains("label") && e.contains("not a valid class name"),
+            "{e}"
+        );
+        assert!(q(&[("label", &"x".repeat(65))]).is_err());
+    }
+
+    fn det(l: &str) -> Det {
+        Det {
+            label: l.into(),
+            score: 0.9,
+            bbox: [0.0, 0.0, 10.0, 10.0],
+        }
+    }
+
+    #[test]
+    fn frame_labels_use_the_label_file_else_the_predictions() {
+        let mut r = empty_record();
+        r.predictions = vec![det("person"), det("person"), det("car")];
+        r.raw = vec![det("dog")];
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(frame_labels(&r, None), set(&["car", "person"]));
+        let mut f = LabelFile::default();
+        assert!(frame_labels(&r, Some(&f)).is_empty(), "the label file wins");
+        let mut b = super::super::tests_support::auto_box("dog");
+        f.boxes.push(b.clone());
+        b.label = "cat".into();
+        b.state = super::super::BoxState::Rejected;
+        f.boxes.push(b.clone());
+        b.label = "deer".into();
+        b.state = super::super::BoxState::Added;
+        f.boxes.push(b.clone());
+        b.label = "car".into();
+        b.state = super::super::BoxState::Accepted;
+        f.boxes.push(b);
+        assert_eq!(frame_labels(&r, Some(&f)), set(&["car", "deer", "dog"]));
+    }
+
+    #[test]
+    fn the_class_filter_keeps_frames_with_that_class_and_lists_every_class() {
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let day = dir.join("night/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        let put = |stem: &str, labels: &[&str]| {
+            let mut r = empty_record();
+            r.id = stem.into();
+            r.scene = "night".into();
+            r.camera = "cam".into();
+            r.buckets = vec![Bucket::Positive];
+            r.timestamp = format!("2026-10-22T00:00:0{}Z", stem.len());
+            r.predictions = labels.iter().map(|l| det(l)).collect();
+            std::fs::write(day.join(format!("{stem}.jpg")), b"jpg").unwrap();
+            std::fs::write(
+                day.join(format!("{stem}.json")),
+                serde_json::to_vec(&r).unwrap(),
+            )
+            .unwrap();
+            let line = super::super::super::record::IndexLine::of(&r, 1);
+            layout::append_line(
+                &day.join(layout::INDEX_FILE),
+                &serde_json::to_string(&line).unwrap(),
+            )
+            .unwrap();
+        };
+        put("a", &["person"]);
+        put("bb", &["dog", "person"]);
+        put("ccc", &[]);
+        // A reviewed frame whose label file rejects the model's dog and adds a cat.
+        put("dddd", &["dog"]);
+        let mut f = LabelFile::default();
+        let mut b = super::super::tests_support::auto_box("dog");
+        b.state = super::super::BoxState::Rejected;
+        f.boxes.push(b.clone());
+        b.label = "cat".into();
+        b.state = super::super::BoxState::Added;
+        f.boxes.push(b);
+        std::fs::write(
+            day.join("dddd.labels.json"),
+            serde_json::to_vec(&f).unwrap(),
+        )
+        .unwrap();
+        let filters = |label: Option<&str>| Filters {
+            source: QueueSource::All,
+            status: StatusFilter::Any,
+            label: label.map(str::to_string),
+            ..Filters::default()
+        };
+        let frames = |q: &Queue| {
+            let mut v: Vec<String> = q
+                .items
+                .iter()
+                .map(|i| i.frame.rsplit('/').next().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        let all = build(&dir, &filters(None));
+        assert_eq!(all.items.len(), 4);
+        assert_eq!(all.labels, ["cat", "dog", "person"]);
+        let dog = build(&dir, &filters(Some("dog")));
+        assert_eq!(frames(&dog), ["bb.jpg"], "the rejected dog does not count");
+        assert_eq!(dog.counts.total, 1, "the counts follow the class filter");
+        assert_eq!(dog.labels, all.labels, "the list ignores the class filter");
+        assert_eq!(frames(&build(&dir, &filters(Some("cat")))), ["dddd.jpg"]);
+        assert_eq!(
+            frames(&build(&dir, &filters(Some("person")))),
+            ["a.jpg", "bb.jpg"]
+        );
+        assert!(build(&dir, &filters(Some("deer"))).items.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

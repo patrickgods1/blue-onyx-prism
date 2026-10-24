@@ -192,7 +192,7 @@ impl VlmSize {
 }
 
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
-/// `status`, `source`), `import=<id>|any` (imported frames) and `limit` (most frames, in queue
+/// `label`, `status`, `source`), `import=<id>|any` (imported frames) and `limit` (most frames, in queue
 /// order). Written `key=value` pairs separated by commas (`scene=ir,status=unreviewed,limit=20`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FrameFilter {
@@ -217,12 +217,12 @@ impl FrameFilter {
                         .parse()
                         .map_err(|_| anyhow::anyhow!("limit: '{v}' is not a number"))?;
                 }
-                "bucket" | "scene" | "camera" | "status" | "source" | "import" => {
+                "bucket" | "scene" | "camera" | "label" | "status" | "source" | "import" => {
                     query.insert(k, v);
                 }
                 other => bail!(
-                    "unknown frame filter '{other}' (bucket, scene, camera, status, source, \
-                     import, limit)"
+                    "unknown frame filter '{other}' (bucket, scene, camera, label, status, \
+                     source, import, limit)"
                 ),
             }
         }
@@ -468,6 +468,8 @@ mod tests {
         for bad in ["scene", "scene=dusk", "colour=red", "limit=0", "limit=x"] {
             assert!(FrameFilter::parse(bad, "any").is_err(), "{bad}");
         }
+        let l = FrameFilter::parse("label=person", "unreviewed").unwrap();
+        assert_eq!(l.filters().unwrap().label.as_deref(), Some("person"));
         assert!(f.describe().contains("scene=ir"));
     }
 

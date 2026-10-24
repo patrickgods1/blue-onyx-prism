@@ -1,5 +1,6 @@
 // Review page (/review): one frame at a time from GET /v1/review/next, its boxes from
 // GET /v1/review/labels, drawn on a canvas; decisions saved with POST /v1/review/labels.
+// Filters (bucket, scene, camera, class, status, source) go to /v1/review/next as query params.
 // Export / import / classes forms post JSON to /v1/review/{export,import,classes}.
 // No inline handlers (CSP): everything is wired here; server values come from data-*.
 (function () {
@@ -387,6 +388,19 @@
     sel.value = keep;
   }
 
+  // The Class filter: the class list plus the classes the queue saw (model labels outside the
+  // list too), the current choice kept.
+  function fillLabels(list) {
+    var sel = $('rv-label');
+    if (!sel) return;
+    var keep = sel.value;
+    var have = Array.prototype.map.call(sel.options, function (o) { return o.value; });
+    classes.concat(list || []).forEach(function (c) {
+      if (have.indexOf(c) < 0) { var o = el('option', null, c); o.value = c; sel.appendChild(o); have.push(c); }
+    });
+    sel.value = keep;
+  }
+
   function setMeta() {
     var m = $('rv-meta');
     if (!cur) { m.textContent = ''; return; }
@@ -444,6 +458,7 @@
     return api('/v1/review/next?' + p.toString()).then(function (j) {
       showCounts(j);
       fillCameras(j.cameras);
+      fillLabels(j.labels);
       if (!j.item) {
         cur = null; img = null; undo = []; dirty = false;
         showNone(true); setMeta(); refresh();
@@ -546,7 +561,9 @@
       holdout_days: list(f.elements.holdout_days.value),
       holdout_fraction: Number(f.elements.holdout_fraction.value || 0.2),
       benchmark_split: f.elements.benchmark_split.value,
-      include_unreviewed: f.elements.include_unreviewed.checked
+      include_unreviewed: f.elements.include_unreviewed.checked,
+      labels: list(f.elements.labels.value),
+      include_empty: f.elements.include_empty.checked
     };
     if (f.elements.out_dir.value.trim()) body.out_dir = f.elements.out_dir.value.trim();
     report(box, ['Exporting...']);
@@ -558,6 +575,12 @@
           r.empty_confirmed + ' confirmed empty) to ' + r.out_dir,
         'Boxes per class: ' + (per || 'none') + '; ' + r.hard_negative_boxes + ' rejected box(es) in hard_negatives.json'
       ];
+      var cf = r.class_filter || {};
+      if ((cf.labels && cf.labels.length) || cf.include_empty === false) {
+        lines.push('Class filter: ' + ((cf.labels && cf.labels.length) ? cf.labels.join(', ') : 'every class') +
+          (cf.include_empty === false ? ', without confirmed-empty frames' : ', with confirmed-empty frames') +
+          '; ' + (r.filtered_out || 0) + ' reviewed frame(s) left out');
+      }
       if (r.unreviewed_frames) lines.push(r.unreviewed_frames + ' unreviewed frame(s) added to the X-AnyLabeling folder');
       if (r.benchmark_dataset) lines.push('Benchmark: blue-onyx-prism benchmark --dataset "' + r.benchmark_dataset + '"');
       report(box, lines, r.warnings);

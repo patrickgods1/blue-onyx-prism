@@ -9,7 +9,9 @@
 
 use super::{AppState, blocking, encode_uri_component, render, save_config};
 use crate::collect::CollectSettings;
-use crate::collect::labels::export::{self, BenchSplit, ExportRequest, Format, SplitConfig};
+use crate::collect::labels::export::{
+    self, BenchSplit, ClassFilter, ExportRequest, Format, SplitConfig,
+};
 use crate::collect::labels::queue::{self, Filters};
 use crate::collect::labels::{self, Frame, LabelFile, xany};
 use crate::collect::{Bucket, layout};
@@ -133,9 +135,9 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&status=&source=&after=`: the most uncertain
-/// frame matching the filters (after `after`, the frame shown now, when given), its position,
-/// and the counts.
+/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&after=`: the most
+/// uncertain frame matching the filters (after `after`, the frame shown now, when given), its
+/// position, the counts and the cameras and classes for the filter lists.
 pub(super) async fn next(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
@@ -157,6 +159,7 @@ pub(super) async fn next(
             "total": built.items.len(),
             "counts": built.counts,
             "cameras": built.cameras,
+            "labels": built.labels,
             "unreadable": built.unreadable,
             "upcoming": built.items.iter().skip(found.map_or(0, |(p, _)| p + 1)).take(5).map(|i| &i.frame).collect::<Vec<_>>(),
         }))
@@ -303,6 +306,38 @@ struct ExportBody {
     benchmark_split: BenchSplit,
     #[serde(default)]
     include_unreviewed: bool,
+    /// Only frames with a training box of these classes; empty = every class.
+    #[serde(default)]
+    labels: Vec<String>,
+    /// Also frames confirmed empty.
+    #[serde(default = "default_true")]
+    include_empty: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The export's class filter: names trimmed, blanks and repeats dropped, every one in
+/// `classes` (else the message for a 400).
+fn class_filter(
+    labels: Vec<String>,
+    include_empty: bool,
+    classes: &[String],
+) -> Result<ClassFilter, String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in labels.iter().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        if !out.iter().any(|o| o == l) {
+            out.push(l.to_string());
+        }
+    }
+    let f = ClassFilter {
+        labels: out,
+        include_empty,
+    };
+    f.check(classes)
+        .map_err(|e| format!("Not exported: {e:#}"))?;
+    Ok(f)
 }
 
 fn parse_formats(f: Option<Formats>) -> Result<Vec<Format>, String> {
@@ -330,7 +365,7 @@ fn parse_formats(f: Option<Formats>) -> Result<Vec<Format>, String> {
 }
 
 /// `POST /v1/review/export` with `{format(s), out_dir?, holdout_cameras?, holdout_days?,
-/// holdout_fraction?, benchmark_split?, include_unreviewed?}`.
+/// holdout_fraction?, benchmark_split?, include_unreviewed?, labels?, include_empty?}`.
 pub(super) async fn export(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -355,6 +390,10 @@ pub(super) async fn export(
     }
     blocking(move || {
         let (dir, classes, root) = context(&state);
+        let filter = match class_filter(b.labels, b.include_empty, &classes) {
+            Ok(f) => f,
+            Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+        };
         let out_dir = match b.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => EXPORTS_DIR
                 .iter()
@@ -377,7 +416,7 @@ pub(super) async fn export(
             benchmark_split: b.benchmark_split,
             include_unreviewed: b.include_unreviewed,
         };
-        match export::run(&dir, &classes, &req) {
+        match export::run_filtered(&dir, &classes, &req, &filter) {
             Ok(r) => {
                 tracing::info!(out = %r.out_dir.display(), frames = r.frames, "review export written");
                 Json(serde_json::json!({ "success": true, "report": r })).into_response()
@@ -591,6 +630,18 @@ mod tests {
         );
         assert!(page.contains("/static/review.js"));
         assert!(page.contains("raccoon"));
+        assert!(
+            page.contains("<select name=\"label\" id=\"rv-label\">"),
+            "class filter"
+        );
+        assert!(
+            page.contains("Only frames with these classes"),
+            "export class filter"
+        );
+        assert!(
+            page.contains("name=\"include_empty\" checked"),
+            "include empty by default"
+        );
 
         let (s, v) = json(
             &d.state,
@@ -621,6 +672,35 @@ mod tests {
         )
         .await;
         assert_eq!(v3["total"], 1);
+        assert_eq!(
+            v3["labels"],
+            serde_json::json!(["person"]),
+            "unreviewed frames: the reply's labels"
+        );
+        let (_, v4) = json(
+            &d.state,
+            Request::get("/v1/review/next?label=person")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v4["total"], 2, "both frames predicted a person");
+        let (_, v4) = json(
+            &d.state,
+            Request::get("/v1/review/next?label=deer")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v4["total"], 0);
+        let (s, v4) = json(
+            &d.state,
+            Request::get("/v1/review/next?label=a%07b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v4}");
         let (s, _) = json(
             &d.state,
             Request::get("/v1/review/next?bucket=nope")
@@ -896,6 +976,43 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // Class filter: only frames with a raccoon (a, relabelled above), without the
+        // confirmed-empty frame (b).
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/export",
+                r#"{"format": "yolo", "labels": [" raccoon ", "raccoon", ""], "include_empty": false}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["report"]["frames"], 1);
+        assert_eq!(v["report"]["filtered_out"], 1);
+        assert_eq!(
+            v["report"]["class_filter"],
+            serde_json::json!({"labels": ["raccoon"], "include_empty": false})
+        );
+        let out2 = PathBuf::from(v["report"]["out_dir"].as_str().unwrap());
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out2.join("export.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["class_filter"]["labels"][0], "raccoon");
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/export",
+                r#"{"format": "yolo", "labels": ["unicorn"]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.contains("'unicorn' is not in the class list") && m.contains("add 'unicorn'"),
+            "{m}"
+        );
 
         // Classes.
         let (s, v) = json(
