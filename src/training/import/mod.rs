@@ -20,9 +20,20 @@
 //! - [`source`]: what an import reads, the URL denylist, the licence confirmation.
 //! - [`select`]: the pure selection steps.
 //! - [`write`]: the dataset layout of the imported frames.
+//! - [`preview`]: what an import of a path would read, before it is queued.
+//! - [`parallel`]: the worker pools of the extraction (one helper process per video) and the
+//!   analysis (decode, dHash, scene).
 //! - [`job`]: the stage machine ([`ImportJob`], a [`super::task::Task`]).
+//!
+//! Before anything is extracted, the candidate budget ([`MAX_CANDIDATES_TOTAL`]) is shared
+//! fairly by the cameras, their videos and the images ([`select::budget`]); each video's share
+//! is its `--max-frames`. Videos are extracted [`ImportRequest::workers`] at a time (default
+//! half the physical cores, 1..=4), decoded on the GPU when PyAV's FFmpeg offers a hardware
+//! decoder ([`HwAccel`], software otherwise or when it fails).
 
 pub mod job;
+pub mod parallel;
+pub mod preview;
 pub mod select;
 pub mod source;
 pub mod write;
@@ -60,6 +71,37 @@ pub const DEFAULT_MAX_CANDIDATES: usize = 1500;
 pub const MAX_CANDIDATES_TOTAL: usize = 20_000;
 /// Largest video downloaded from a URL.
 pub const MAX_URL_BYTES: u64 = 2_000_000_000;
+/// Most videos extracted at the same time (`--workers`).
+pub const MAX_WORKERS: usize = 16;
+
+/// Video decoding of the extraction (`import_footage.py extract --hwaccel`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HwAccel {
+    /// The platform's hardware decoder when PyAV's FFmpeg has it (D3D11VA on Windows, CUDA
+    /// then VAAPI on Linux); software when there is none or it fails. macOS decodes in software:
+    /// VideoToolbox measured slower there (docs/TRAINING.md).
+    #[default]
+    Auto,
+    /// Software decoding only.
+    Off,
+}
+
+impl HwAccel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "on" | "hw" => Some(HwAccel::Auto),
+            "off" | "none" | "sw" | "software" => Some(HwAccel::Off),
+            _ => None,
+        }
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HwAccel::Auto => "auto",
+            HwAccel::Off => "off",
+        }
+    }
+}
 
 /// How the frames are picked after the dedup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -117,6 +159,12 @@ pub struct ImportRequest {
     /// Keep the extracted candidates in the work folder.
     #[serde(default)]
     pub keep_work: bool,
+    /// Videos extracted at the same time; 0 = automatic ([`parallel::extract_workers`]).
+    #[serde(default)]
+    pub workers: usize,
+    /// Hardware video decoding.
+    #[serde(default)]
+    pub hwaccel: HwAccel,
 }
 
 fn default_window() -> f32 {
@@ -142,6 +190,8 @@ impl ImportRequest {
             max_candidates: DEFAULT_MAX_CANDIDATES,
             allow_large: false,
             keep_work: false,
+            workers: 0,
+            hwaccel: HwAccel::Auto,
         }
     }
 
@@ -182,6 +232,12 @@ impl ImportRequest {
         }
         if !(1..=MAX_CANDIDATES_TOTAL).contains(&self.max_candidates) {
             bail!("max candidates must be between 1 and {MAX_CANDIDATES_TOTAL}");
+        }
+        if self.workers > MAX_WORKERS {
+            bail!(
+                "workers must be between 0 (automatic) and {MAX_WORKERS}, got {}",
+                self.workers
+            );
         }
         Ok(())
     }
@@ -308,6 +364,7 @@ mod tests {
             |r: &mut ImportRequest| r.every_s = -1.0,
             |r: &mut ImportRequest| r.dedup_hamming = 40,
             |r: &mut ImportRequest| r.max_candidates = 0,
+            |r: &mut ImportRequest| r.workers = 17,
         ] {
             let mut x = r.clone();
             f(&mut x);
@@ -316,6 +373,16 @@ mod tests {
         assert_eq!(Selection::parse("SigLIP2"), Some(Selection::Siglip));
         assert_eq!(Selection::parse("dhash"), Some(Selection::Dhash));
         assert_eq!(Selection::parse("x"), None);
+        assert_eq!(HwAccel::parse(" OFF "), Some(HwAccel::Off));
+        assert_eq!(HwAccel::parse("auto"), Some(HwAccel::Auto));
+        assert_eq!(HwAccel::parse("cuda"), None);
+        // Requests saved before the fields existed still load.
+        let mut v = serde_json::to_value(&r).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("workers");
+        o.remove("hwaccel");
+        let back: ImportRequest = serde_json::from_value(v).unwrap();
+        assert_eq!((back.workers, back.hwaccel), (0, HwAccel::Auto));
     }
 
     #[test]

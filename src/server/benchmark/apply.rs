@@ -223,15 +223,26 @@ fn current_thresholds(cfg: &Config) -> HashMap<String, f64> {
 
 /// `GET /v1/benchmark/threshold-search`: the searchable models (with their stored devices and
 /// recommended device), datasets, tags and classes, the configured objective and thresholds.
+/// With nothing to search yet (no results or no stored predictions) it answers 200 with
+/// `available: false` and the message, so the page's empty state is not a console error.
 pub(in crate::server) async fn search_options(State(state): State<Arc<AppState>>) -> Response {
     crate::server::blocking(move || {
         let (results, preds) = match search_data(&state) {
             Ok(d) => d,
+            Err(e) if e.status == StatusCode::BAD_REQUEST => {
+                return Json(serde_json::json!({
+                    "success": true,
+                    "available": false,
+                    "message": e.message,
+                }))
+                .into_response();
+            }
             Err(e) => return e.into_response(),
         };
         let cfg = state.config_read().clone();
         Json(serde_json::json!({
             "success": true,
+            "available": true,
             "options": crate::benchmark::search::options(&results, &preds),
             "objective": cfg.benchmark.threshold_objective,
             "thresholds": current_thresholds(&cfg),
@@ -723,16 +734,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tab_browses_for_a_folder() {
+        let st = state();
+        let (s, page) = call(&st, get("/benchmark")).await;
+        assert_eq!(s, StatusCode::OK);
+        let page = page.as_str().unwrap();
+        assert!(page.contains("data-browse=\"folder\" data-target=\"add-folder\""));
+        assert!(page.contains("<dialog id=\"browse-dialog\">"));
+        assert!(page.contains("<script src=\"/static/browse.js?v="));
+        // The low-priority box is a check label; device ids keep their line.
+        assert!(
+            page.contains("<label class=\"check\"><input type=\"checkbox\" name=\"low_priority\"")
+        );
+        assert!(page.contains("class=\"bench-settings\""));
+    }
+
+    #[tokio::test]
     async fn threshold_search_endpoint() {
         let st = state();
         let cfg_path = st.config_path.clone();
-        // Nothing stored yet: 400 telling to run a benchmark.
-        for req in [
-            get("/v1/benchmark/threshold-search"),
-            post("/v1/benchmark/threshold-search", "model=all"),
+        // Nothing stored yet: the options GET answers 200 `available: false`, the search POST
+        // 400; both tell to run a benchmark.
+        for (req, status) in [
+            (get("/v1/benchmark/threshold-search"), StatusCode::OK),
+            (
+                post("/v1/benchmark/threshold-search", "model=all"),
+                StatusCode::BAD_REQUEST,
+            ),
         ] {
             let (s, v) = call(&st, req).await;
-            assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+            assert_eq!(s, status, "{v}");
             assert!(
                 v["message"]
                     .as_str()
@@ -740,18 +771,26 @@ mod tests {
                     .contains("run a benchmark first"),
                 "{v}"
             );
+            if status == StatusCode::OK {
+                assert_eq!(v["available"], false, "{v}");
+                assert!(v.get("options").is_none(), "{v}");
+            }
         }
         let (results, preds) = crate::benchmark::search::tests::fixture();
         results.save(&results_path(&cfg_path)).unwrap();
-        // Results but no stored predictions (an older version's results): still 400.
+        // Results but no stored predictions (an older version's results): still 400 / unavailable.
         let (s, _) = call(&st, post("/v1/benchmark/threshold-search", "")).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, v) = call(&st, get("/v1/benchmark/threshold-search")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["available"], false, "{v}");
         preds
             .save(&crate::benchmark::search::preds_path(&cfg_path))
             .unwrap();
 
         let (s, v) = call(&st, get("/v1/benchmark/threshold-search")).await;
         assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["available"], true, "{v}");
         assert_eq!(v["options"]["models"][0]["model"], "m");
         assert_eq!(
             v["options"]["models"][0]["devices"]

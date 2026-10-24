@@ -127,7 +127,12 @@ struct SizeCell {
     label: String,
     size: &'static str,
     fits: bool,
+    /// The full estimate (the cell's tooltip).
     estimate: String,
+    /// The compact one shown in the cell (`5.4 GB · batch 32 · 20 s`).
+    short: String,
+    /// `light` | `medium` | `heavy` (the legend explains them).
+    weight: &'static str,
     latency: &'static str,
     why: String,
 }
@@ -137,8 +142,21 @@ struct FamilyRow {
     license: &'static str,
     available: bool,
     why: String,
-    notice: &'static str,
     sizes: Vec<SizeCell>,
+    /// Empty cells after the sizes, so every row of the grid has as many cells.
+    pad: usize,
+}
+
+/// A licence notice shared by some families (shown once under the size grid).
+struct NoticeRow {
+    families: String,
+    notice: &'static str,
+}
+
+/// One inference-latency class of the legend (`light`, its explanation).
+struct LatencyRow {
+    weight: &'static str,
+    text: &'static str,
 }
 
 struct RunRow {
@@ -183,9 +201,20 @@ pub(super) struct TrainingTemplate {
     reasons: Vec<String>,
     env_ready: bool,
     env_note: String,
+    /// "the training environment (about 450 MB)": what the Train confirmation names.
+    env_download: String,
     allow_large: bool,
+    /// What an import may need over the large-download gate (`None` = the confirmation is not
+    /// shown: nothing large is missing, large downloads are allowed or there is no GPU).
+    import_large: Option<String>,
+    /// The same for the auto-labelers.
+    autolabel_large: Option<String>,
     datasets: Vec<DatasetRow>,
     families: Vec<FamilyRow>,
+    /// Most sizes of a family (the grid's size columns).
+    size_cols: usize,
+    notices: Vec<NoticeRow>,
+    latencies: Vec<LatencyRow>,
     epochs: u32,
     scenes: Vec<(&'static str, &'static str)>,
     public_available: bool,
@@ -202,6 +231,8 @@ pub(super) struct TrainingTemplate {
     training_dir: String,
     /// Import and auto-label jobs.
     tasks: Vec<super::training_tasks::TaskRow>,
+    /// A job is queued or running (its table starts open).
+    tasks_busy: bool,
     footage: Vec<super::training_tasks::FootageRow>,
     dataset_dir: String,
     /// Imports listed in the dataset folder.
@@ -232,6 +263,11 @@ fn bench_text(b: Option<&BenchSummary>, err: Option<&str>) -> String {
         (None, Some(e)) => format!("benchmark failed: {e}"),
         (None, None) => "not benchmarked".into(),
     }
+}
+
+/// `light: runs on a CPU ...` -> (`light`, `runs on a CPU ...`).
+fn latency_parts(hint: &'static str) -> (&'static str, &'static str) {
+    hint.split_once(": ").unwrap_or(("", hint))
 }
 
 pub(super) fn view(
@@ -268,7 +304,19 @@ pub(super) fn view(
         }
         None => (false, "not available on this machine".into()),
     };
-    let families = cap
+    let env_download = cap.accelerator.as_ref().map_or_else(String::new, |a| {
+        format!(
+            "the training environment (about {})",
+            catalog::format_size(a.lane().estimate().0)
+        )
+    });
+    let size_cols = cap
+        .families
+        .iter()
+        .map(|f| f.sizes.len())
+        .max()
+        .unwrap_or(0);
+    let families: Vec<FamilyRow> = cap
         .families
         .iter()
         .map(|f| FamilyRow {
@@ -276,28 +324,113 @@ pub(super) fn view(
             license: f.license,
             available: f.available,
             why: f.why.clone().unwrap_or_default(),
-            notice: f.family.notice(),
+            pad: size_cols.saturating_sub(f.sizes.len()),
             sizes: f
                 .sizes
                 .iter()
-                .map(|z| SizeCell {
-                    label: f.family.base_name(z.size),
-                    size: z.size,
-                    fits: z.fits,
-                    estimate: match (z.vram_mb, z.epoch_s_per_100, z.suggested_batch) {
-                        (Some(v), Some(t), Some(b)) => format!(
-                            "~{:.1} GB at batch {b}, ~{} / epoch / 100 images",
-                            v as f64 / 1024.0,
-                            estimate::format_duration(t)
-                        ),
-                        _ => String::new(),
-                    },
-                    latency: z.latency,
-                    why: z.why.clone().unwrap_or_default(),
+                .map(|z| {
+                    let (estimate, short) = match (z.vram_mb, z.epoch_s_per_100, z.suggested_batch)
+                    {
+                        (Some(v), Some(t), Some(b)) => {
+                            let gb = v as f64 / 1024.0;
+                            let t = estimate::format_duration(t);
+                            (
+                                format!("~{gb:.1} GB at batch {b}, ~{t} / epoch / 100 images"),
+                                format!("{gb:.1} GB \u{b7} batch {b} \u{b7} {t}"),
+                            )
+                        }
+                        _ => (String::new(), String::new()),
+                    };
+                    SizeCell {
+                        label: f.family.base_name(z.size),
+                        size: z.size,
+                        fits: z.fits,
+                        estimate,
+                        short,
+                        weight: latency_parts(z.latency).0,
+                        latency: z.latency,
+                        why: z.why.clone().unwrap_or_default(),
+                    }
                 })
                 .collect(),
         })
         .collect();
+    let mut notices: Vec<NoticeRow> = Vec::new();
+    for f in cap.families.iter().filter(|f| f.available) {
+        let n = f.family.notice();
+        match notices.iter_mut().find(|r| r.notice == n) {
+            Some(r) => {
+                r.families.push_str(", ");
+                r.families.push_str(f.title);
+            }
+            None => notices.push(NoticeRow {
+                families: f.title.to_string(),
+                notice: n,
+            }),
+        }
+    }
+    let mut latencies: Vec<LatencyRow> = Vec::new();
+    for z in cap.families.iter().flat_map(|f| f.sizes.iter()) {
+        let (weight, text) = latency_parts(z.latency);
+        if !latencies.iter().any(|l| l.weight == weight) {
+            latencies.push(LatencyRow { weight, text });
+        }
+    }
+    latencies.sort_by_key(|l| match l.weight {
+        "light" => 0,
+        "medium" => 1,
+        _ => 2,
+    });
+    let large = |parts: Vec<String>| (!parts.is_empty()).then(|| parts.join("; "));
+    let (import_large, autolabel_large) = match (&cap.accelerator, config.allow_large_downloads) {
+        (Some(_), false) => {
+            let env_part = (!env_ready).then(|| env_download.clone());
+            let missing = |keys: &[&str]| {
+                let list: Vec<_> = keys
+                    .iter()
+                    .filter_map(|k| catalog::autolabel_weights(k))
+                    .chain(
+                        keys.contains(&"rfdetr-large")
+                            .then(|| catalog::base_weights(catalog::TrainFamily::Rfdetr, "large"))
+                            .flatten(),
+                    )
+                    .map(|r| (r, crate::training::pyenv::weights_dir(&paths, r)))
+                    .collect();
+                crate::training::pyenv::missing_bytes(&list)
+            };
+            let mut import = env_part.iter().cloned().collect::<Vec<_>>();
+            let siglip = missing(&["siglip2-base"]);
+            if siglip > 0 {
+                import.push(format!(
+                    "SigLIP 2 ({}) for the SigLIP selection",
+                    catalog::format_size(siglip)
+                ));
+            }
+            let mut label = env_part.into_iter().collect::<Vec<_>>();
+            let defaults = missing(&[
+                "mm-gdino-tiny",
+                "rfdetr-large",
+                "qwen3-vl-2b",
+                "siglip2-base",
+            ]);
+            let others = missing(&[
+                "mm-gdino-base",
+                "mm-gdino-large",
+                "qwen3-vl-4b",
+                "qwen3-vl-8b",
+            ]);
+            if defaults > 0 {
+                label.push(format!(
+                    "the labeler weights ({} for the default set, more for larger sizes)",
+                    catalog::format_size(defaults)
+                ));
+            } else if others > 0 {
+                label.push("the weights of a larger labeler size if you pick one".into());
+            }
+            (large(import), large(label))
+        }
+        _ => (None, None),
+    };
     let all = runs(state);
     let run_rows = all
         .iter()
@@ -352,6 +485,8 @@ pub(super) fn view(
         .and_then(|i| config.models.get(i))
         .map(|m| m.effective_name())
         .unwrap_or_default();
+    let task_rows = super::training_tasks::task_rows(&tasks(state));
+    let tasks_busy = task_rows.iter().any(|t| t.busy);
     TrainingTemplate {
         nav: "training",
         version: crate::VERSION,
@@ -362,7 +497,10 @@ pub(super) fn view(
         reasons: cap.reasons.clone(),
         env_ready,
         env_note,
+        env_download,
         allow_large: config.allow_large_downloads,
+        import_large,
+        autolabel_large,
         datasets: {
             let mut v: Vec<DatasetRow> = config
                 .training
@@ -387,6 +525,9 @@ pub(super) fn view(
             v
         },
         families,
+        size_cols,
+        notices,
+        latencies,
         epochs: config.training.epochs,
         scenes: SceneFilter::ALL
             .iter()
@@ -412,7 +553,8 @@ pub(super) fn view(
         models: names,
         default_model,
         training_dir: crate::training::training_dir(&config).display().to_string(),
-        tasks: super::training_tasks::task_rows(&tasks(state)),
+        tasks: task_rows,
+        tasks_busy,
         footage: super::training_tasks::footage(),
         imports: {
             let mut v = crate::training::import::write::read_imports(&dataset_dir);
@@ -576,8 +718,8 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                 {
                     let (dl, _) = a.lane().estimate();
                     anyhow::bail!(
-                        "the training environment is a large download (about {}): tick \"Download \
-                         what is missing\" to confirm, or enable allow_large_downloads",
+                        "the training environment is a large download (about {}): tick \"Allow \
+                         downloads over 500 MB\" to confirm, or enable allow_large_downloads",
                         catalog::format_size(dl)
                     );
                 }
@@ -721,27 +863,47 @@ pub(crate) fn apply_use(
     Ok(())
 }
 
-/// `POST /training/datasets` (`add` = path | `remove` = path): the export folders offered.
+/// A change of the saved export folders.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DatasetEdit {
+    Add(PathBuf),
+    Remove(PathBuf),
+}
+
+/// The edit of a `POST /training/datasets` form: `remove` = path (a folder's Remove button)
+/// wins; else `add` = path, or the queue form's "Another folder" (`dataset_path`, its Save
+/// folder button). The queue form's other fields (ticked folders, models, options) are ignored.
+pub(crate) fn dataset_edit(f: &[(String, String)]) -> anyhow::Result<DatasetEdit> {
+    if let Some(p) = field(f, "remove") {
+        return Ok(DatasetEdit::Remove(PathBuf::from(p)));
+    }
+    field(f, "add")
+        .or_else(|| field(f, "dataset_path"))
+        .map(|p| DatasetEdit::Add(PathBuf::from(p)))
+        .ok_or_else(|| anyhow::anyhow!("another folder: type or browse to a review export folder"))
+}
+
+/// `POST /training/datasets` (see [`dataset_edit`]): the export folders offered.
 pub(super) async fn datasets(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Response {
     blocking(move || {
         let f = super::dataset::parse_form(&body);
-        let add = field(&f, "add").map(PathBuf::from);
-        let rm = field(&f, "remove").map(PathBuf::from);
-        let result = save_config(&state, "training page", |c| {
-            if let Some(p) = &add {
-                let dir = c.data_path(p);
-                crate::training::dataset::read_classes(&dir)?;
-                if !c.training.datasets.contains(p) {
-                    c.training.datasets.push(p.clone());
+        let result = dataset_edit(&f).and_then(|edit| {
+            save_config(&state, "training page", |c| {
+                match &edit {
+                    DatasetEdit::Add(p) => {
+                        let dir = c.data_path(p);
+                        crate::training::dataset::read_classes(&dir)?;
+                        if !c.training.datasets.contains(p) {
+                            c.training.datasets.push(p.clone());
+                        }
+                    }
+                    DatasetEdit::Remove(p) => c.training.datasets.retain(|d| d != p),
                 }
-            }
-            if let Some(p) = &rm {
-                c.training.datasets.retain(|d| d != p);
-            }
-            c.training.validate()
+                c.training.validate()
+            })
         });
         match result {
             Ok(m) => render(&view(&state, Some(m), None)),
@@ -872,6 +1034,47 @@ mod tests {
     }
 
     #[test]
+    fn the_datasets_form_reads_the_queue_forms_buttons() {
+        // A saved folder's Remove button inside the queue form: only that folder.
+        let f = form(&[
+            ("dataset", "/exports/a"),
+            ("dataset_path", "/exports/new"),
+            ("model", "yolo26n"),
+            ("epochs", "50"),
+            ("remove", "/exports/a"),
+        ]);
+        assert_eq!(
+            dataset_edit(&f).unwrap(),
+            DatasetEdit::Remove(PathBuf::from("/exports/a"))
+        );
+        // Save folder: the "Another folder" field.
+        let f = form(&[
+            ("dataset", "/exports/a"),
+            ("dataset_path", " /exports/new "),
+        ]);
+        assert_eq!(
+            dataset_edit(&f).unwrap(),
+            DatasetEdit::Add(PathBuf::from("/exports/new"))
+        );
+        // The older form's `add`.
+        assert_eq!(
+            dataset_edit(&form(&[("add", "/x")])).unwrap(),
+            DatasetEdit::Add(PathBuf::from("/x"))
+        );
+        let e = dataset_edit(&form(&[("dataset_path", ""), ("model", "yolo26n")])).unwrap_err();
+        assert!(e.to_string().contains("another folder"), "{e}");
+    }
+
+    #[test]
+    fn latency_hints_split_into_class_and_text() {
+        assert_eq!(
+            latency_parts("light: runs anywhere"),
+            ("light", "runs anywhere")
+        );
+        assert_eq!(latency_parts("odd"), ("", "odd"));
+    }
+
+    #[test]
     fn use_as_writes_the_default_night_and_verify_models() {
         let dir = std::env::temp_dir().join(format!("bop-train-use-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -952,6 +1155,48 @@ mod tests {
         )
         .await;
         assert!(String::from_utf8(b).unwrap().contains("Not saved"));
+        // Save folder from the queue form, with its other fields: the same check.
+        let (_, _, b) = call(
+            &state,
+            post_form(
+                "/training/datasets",
+                "dataset_path=%2Fno%2Fsuch%2Fdir&model=yolo26n&epochs=50&save=1",
+                true,
+            ),
+        )
+        .await;
+        assert!(String::from_utf8(b).unwrap().contains("Not saved"));
+        assert!(state.config_read().training.datasets.is_empty());
+        // A real export folder is saved, then removed by its button.
+        let export = root.join("exports/review-1");
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::write(export.join("classes.txt"), "person\n").unwrap();
+        let enc = super::super::encode_uri_component(&export.display().to_string());
+        let (_, _, b) = call(
+            &state,
+            post_form(
+                "/training/datasets",
+                &format!("dataset_path={enc}&model=yolo26n"),
+                true,
+            ),
+        )
+        .await;
+        let html = String::from_utf8(b).unwrap();
+        assert!(!html.contains("Not saved"), "{html}");
+        assert_eq!(
+            state.config_read().training.datasets,
+            std::slice::from_ref(&export)
+        );
+        assert!(html.contains("formaction=\"/training/datasets\" formnovalidate name=\"remove\""));
+        let (_, _, _) = call(
+            &state,
+            post_form(
+                "/training/datasets",
+                &format!("dataset={enc}&dataset_path=&remove={enc}"),
+                true,
+            ),
+        )
+        .await;
         assert!(state.config_read().training.datasets.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }

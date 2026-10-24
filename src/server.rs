@@ -31,6 +31,7 @@ mod devices;
 mod guard;
 mod live;
 mod pages;
+mod pick;
 mod resources;
 mod review;
 mod status;
@@ -176,6 +177,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/v1/resources/add-to-config", post(resources_add_to_config)),
         ("/v1/models/add", post(models_add)),
         ("/v1/fs/browse", get(browse::browse)),
+        ("/v1/fs/pick", get(pick::status).post(pick::pick)),
         ("/v1/resources/export", post(resources_export)),
         ("/v1/resources/export/cancel", post(resources_export_cancel)),
         ("/stats", get(stats_page)),
@@ -201,6 +203,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
                 .layer(DefaultBodyLimit::max(review::LABELS_BODY_LIMIT)),
         ),
         (
+            "/v1/review/accept-auto",
+            post(review::accept_auto).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
             "/v1/review/export",
             post(review::export).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
@@ -221,6 +227,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/training/datasets", post(training::datasets)),
         ("/training/remove-env", post(training::remove_env)),
         ("/training/import", post(training_tasks::import)),
+        (
+            "/v1/training/import/preview",
+            get(training_tasks::import_preview),
+        ),
         ("/training/autolabel", post(training_tasks::autolabel)),
         ("/logs", get(logs_page)),
         ("/logs.json", get(logs_json)),
@@ -968,6 +978,7 @@ mod tests {
             "/v1/resources/add-to-config",
             "/v1/models/add",
             "/v1/fs/browse",
+            "/v1/fs/pick",
             "/v1/resources/export",
             "/v1/resources/export/cancel",
             "/stats",
@@ -987,6 +998,7 @@ mod tests {
             "/review",
             "/v1/review/next",
             "/v1/review/labels",
+            "/v1/review/accept-auto",
             "/v1/review/export",
             "/v1/review/import",
             "/v1/review/classes",
@@ -999,6 +1011,7 @@ mod tests {
             "/training/datasets",
             "/training/remove-env",
             "/training/import",
+            "/v1/training/import/preview",
             "/training/autolabel",
             "/logs",
             "/logs.json",

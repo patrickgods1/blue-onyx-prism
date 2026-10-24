@@ -184,6 +184,8 @@ struct ModelSelectRow {
     /// What the running worker uses ("OpenVINO CPU · threshold 0.50", "not loaded", ...).
     running: String,
     running_class: &'static str,
+    /// Why the model failed, under "Failed" on one truncated line (full text on open).
+    running_detail: Option<String>,
     /// What a restart would change for this model (empty = nothing).
     pending: Vec<String>,
     /// Latest benchmark recommendation for this model.
@@ -385,6 +387,7 @@ fn model_choices(
                     .confidence_threshold
                     .map(|t| thr(t).to_string())
                     .unwrap_or_default(),
+                running_detail: run.detail.clone().filter(|_| run.state_class == "fail"),
                 running: run.text,
                 running_class: run.state_class,
                 pending: pending.for_model(&name).to_vec(),
@@ -503,6 +506,62 @@ pub(super) struct ConfigTemplate {
     /// `#fragment`, so a no-JS answer lands there.
     pub(super) at: &'static str,
     pub(super) at_row: String,
+}
+
+/// When a change of a global config field takes effect, as the Server tab's badges say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApplyWhen {
+    /// Live: [`crate::config_merge::live_global`].
+    Now,
+    /// A server restart (a new registry generation) applies it.
+    Restart,
+    /// Only a restart of the process applies it (the listener, the log file).
+    Process,
+}
+
+impl ApplyWhen {
+    /// The global config fields only a process restart applies; the same set
+    /// [`crate::config_merge::pending`] reports as "needs a process restart" (a test checks it).
+    const PROCESS: &[&str] = &["port", "bind_address", "log_path", "log_format"];
+
+    pub(super) fn of(key: &str) -> Self {
+        if crate::config_merge::live_global(key) {
+            Self::Now
+        } else if Self::PROCESS.contains(&key) {
+            Self::Process
+        } else {
+            Self::Restart
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Now => "<span class=\"tag now\">applies now</span>",
+            Self::Restart => "<span class=\"tag restart\">needs restart</span>",
+            Self::Process => "<span class=\"tag restart\">process restart</span>",
+        }
+    }
+}
+
+/// The badge of comma-separated global config `keys` when they all take effect alike, else
+/// "" (a group of mixed fields shows a badge on each field instead).
+pub(super) fn when_badge(keys: &str) -> &'static str {
+    let mut it = keys.split(',').map(str::trim).filter(|k| !k.is_empty());
+    let Some(first) = it.next().map(ApplyWhen::of) else {
+        return "";
+    };
+    if it.all(|k| ApplyWhen::of(k) == first) {
+        first.tag()
+    } else {
+        ""
+    }
+}
+
+impl ConfigTemplate {
+    /// Server tab badge of a group or a field (static HTML; see [`when_badge`]).
+    fn badge(&self, keys: &str) -> &'static str {
+        when_badge(keys)
+    }
 }
 
 /// One `<option>` of the Device select.
@@ -624,10 +683,10 @@ pub(super) fn config_template(
     let log_levels = level_choices(&c.log_level);
     let log_timezones = timezone_choices(&c.log_timezone);
     let device_choices = device_choices(&snap, &c.device, &c.gpu_index);
-    let resource_groups = crate::resources::status::grouped(crate::resources::status::rows(
-        state.resources.as_ref(),
-        &cfg,
-    ));
+    let resource_groups = crate::resources::status::grouped(
+        crate::resources::status::rows(state.resources.as_ref(), &cfg),
+        crate::resources::status::export_group_note(&cfg),
+    );
     let local_models = crate::resources::status::local_models(state.resources.as_ref(), &cfg);
     let models_path = cfg.data_path(&cfg.models_dir);
     let model_path_example = models_path
@@ -1517,6 +1576,56 @@ mod tests {
             .expect("restart token cancelled");
     }
 
+    #[test]
+    fn server_tab_badges_follow_the_merge_rules() {
+        use crate::config_merge::{flatten_all, pending};
+        // Process restart: exactly what `pending` reports as needing a process restart.
+        let base = Config::default();
+        let mut c = base.clone();
+        c.port = base.port.wrapping_add(1);
+        c.bind_address = "127.0.0.1".parse().unwrap();
+        c.log_path = Some("logs-elsewhere".into());
+        c.log_format = match base.log_format {
+            crate::config::LogFormat::Text => crate::config::LogFormat::Json,
+            crate::config::LogFormat::Json => crate::config::LogFormat::Text,
+        };
+        let p = pending(&base, &c);
+        assert_eq!(p.process.len(), ApplyWhen::PROCESS.len(), "{:?}", p.process);
+        assert!(p.global.is_empty(), "{:?}", p.global);
+        for k in ApplyWhen::PROCESS {
+            assert_eq!(ApplyWhen::of(k), ApplyWhen::Process, "{k}");
+        }
+        // A runtime-level field: a server restart; a live one: now.
+        let mut c = base.clone();
+        c.worker_queue_size += 3;
+        let p = pending(&base, &c);
+        assert_eq!((p.global.len(), p.process.len()), (1, 0), "{p:?}");
+        assert_eq!(ApplyWhen::of("worker_queue_size"), ApplyWhen::Restart);
+        assert_eq!(ApplyWhen::of("request_timeout_secs"), ApplyWhen::Now);
+        // Groups: one badge when the fields agree, none when they differ.
+        assert!(when_badge("confidence_threshold,nms_iou").contains("applies now"));
+        assert!(when_badge("device,cache_dir").contains("needs restart"));
+        assert_eq!(when_badge("port,request_timeout_secs"), "");
+        assert!(when_badge("port").contains("process restart"));
+        // Every key the template asks about is a real global config field (serialized, or one
+        // serialized only when set).
+        let known = flatten_all(&base);
+        let source = include_str!("../config.rs");
+        let tpl = include_str!("../../templates/config.html");
+        let mut n = 0;
+        for part in tpl.split("self.badge(\"").skip(1) {
+            let keys = &part[..part.find('"').unwrap()];
+            for k in keys.split(',') {
+                n += 1;
+                assert!(
+                    known.contains_key(k) || source.contains(&format!("    pub {k}: ")),
+                    "unknown config key {k} in a Server tab badge"
+                );
+            }
+        }
+        assert!(n > 20, "{n}");
+    }
+
     #[tokio::test]
     async fn config_page_has_browse_buttons() {
         let state = test_state();
@@ -1525,6 +1634,23 @@ mod tests {
         assert!(html.contains("data-browse=\"model\" data-target=\"path\""));
         assert!(html.contains("data-browse=\"classes\" data-target=\"classes\""));
         assert!(html.contains("id=\"browse-dialog\""));
+        // The folder settings of the Server tab browse folders; the shared picker script
+        // (native dialog, else the in-page browser) is loaded after config.js.
+        for target in ["cache_dir", "log_path", "save_image_path"] {
+            assert!(
+                html.contains(&format!("data-browse=\"folder\" data-target=\"{target}\"")),
+                "{target}"
+            );
+        }
+        let (cfg_js, browse_js) = (
+            html.find("/static/config.js?v=").unwrap(),
+            html.find("/static/browse.js?v=").unwrap(),
+        );
+        assert!(cfg_js < browse_js);
+        assert!(
+            super::super::pages::static_file("config.js")
+                .is_some_and(|js| !js.contains("/v1/fs/browse"))
+        );
         // The path hint is a file under the models dir in this OS's form (where Browse starts).
         let cfg = state.config_read().clone();
         let example = cfg
@@ -1549,6 +1675,17 @@ mod tests {
         let (s, html) = get_text(&state, "/config").await;
         assert_eq!(s, StatusCode::OK);
         assert!(html.contains("<h2>Resources</h2>"), "{html}");
+        // One collapsible group per kind with its counts, one filter box above them, one
+        // column layout.
+        assert!(
+            html.contains("<details class=\"res-group\" id=\"res-"),
+            "{html}"
+        );
+        assert!(html.contains("id=\"res-filter\""));
+        assert!(
+            html.contains("<col class=\"c-size\"><col class=\"c-state\"><col class=\"c-action\">")
+        );
+        assert!(html.contains(" resources") || html.contains("1 resource"));
         assert!(html.contains("model:fixture-model"));
         assert!(html.contains("action=\"/v1/resources/download#resource-"));
         assert!(

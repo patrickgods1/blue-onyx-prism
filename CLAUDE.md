@@ -98,7 +98,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   warm-up, falling down the list, CPU last); `ort.rs` is the ONNX Runtime backend (all `ort` code lives here).
   `onnx_rewrite.rs`: `ort:coreml` loads a cached copy without HardSigmoid/HardSwish/opset<13 Split (protobuf wire-level, `cache/coreml/<stem>-<sha16>-v<N>.onnx`, `BOP_COREML_REWRITE=0` off).
   `GET /v1/status` (readiness, 200/503; Docker HEALTHCHECK, systemd `Type=notify` + watchdog via `sdnotify.rs`); a process-wide in-flight cap on detections answers 503 (`metrics.rs`, `requests_rejected_total`); `retention.rs` prunes saved images and warns on low disk.
-  Also `GET /v1/devices` and the config-page device dropdown; `GET /v1/fs/browse` (`server/browse.rs`, folders + model/YAML files only) backs the Browse... buttons of "Add a model by path".
+  Also `GET /v1/devices` and the config-page device dropdown; Browse... buttons (`assets/browse.js`, every page) first try `GET|POST /v1/fs/pick` (`server/pick.rs`: native dialog on the server's screen via osascript / PowerShell WinForms / zenity|kdialog; loopback only, one at a time, killed after 10 min; no desktop, e.g. the Windows service in session 0 -> 409) and fall back to `GET /v1/fs/browse` (`server/browse.rs`, in-page, roots only). A natively picked path (and what is under it) passes `browse::allowed_path` for 1 h even outside the roots.
 - `src/model/` model families: `yolo26` (YOLO26/YOLOv10 end-to-end `[1,300,6]`), `yolo5` (`[1,N,5+C]` + NMS),
   `yolo8` (YOLOv8/9/11/12 `[1,4+C,8400]` + NMS), `detr` (D-FINE: `pixel_values` -> `logits/pred_boxes`), `rfdetr` (same, ImageNet-normalized, COCO-91 head), `rtdetr` (RT-DETRv2, DEIMv2: `images` + i64 `orig_target_sizes`; `labels/boxes/scores`; input size from the model's static dims).
   Preprocess = letterbox (YOLO) or stretch (RT-DETR) to 640x640 RGB f32 0..1, CHW.
@@ -123,7 +123,9 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   page (frames by detected class; Review queue and export filter by class) and `review-queue.jsonl`; format in `docs/DATASET.md`. OpenVINO CACHE_DIR is `<cache>/openvino-<device>-<prec>`
   (the CPU cache hash ignores precision); `config_store::spawn_disk_watch` applies on-disk config edits within 2 s.
 - Review (`src/collect/labels/`, `/review`, `assets/review.js`): per-frame `<stem>.labels.json` (v1; states pending/
-  accepted/rejected/added; `merge_proposals` for auto-labels), uncertainty-sorted queue, exports YOLO / COCO /
+  accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
+  `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk
+  accept of `auto=accept` frames `POST /v1/review/accept-auto`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
   X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned.
 - Training (`src/training/`, `/training`, `blue-onyx-prism train ...`, `scripts/train_model.py`): user-triggered only;
   `capability` gates by GPU (CUDA lanes cu126/cu130 by compute capability + driver; MPS on Apple, D-FINE CUDA-only),
@@ -131,7 +133,10 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   RT-DETRv2, D-FINE (base pins in `catalog/train.rs`); head rows initialised from the base's COCO rows; static ONNX
   export + ORT check, install, benchmark on the held-out split; docs in `docs/TRAINING.md`.
   `train import` (`training/import/`: video / image folder / URL via yt-dlp / pinned `import-data:meva-sample` into the
-  dataset folder, scene change + dHash + SigLIP k-center, licence confirmed) and `train autolabel` (`training/autolabel/`:
+  dataset folder, scene change + dHash + SigLIP k-center, licence confirmed; the 20k candidate budget split per camera then
+  per video before extraction (`select::budget`), videos extracted in parallel (`import/parallel.rs`, `--workers`, results
+  in video order), analysis on all cores but one, `--hwaccel auto|off` (D3D11VA / CUDA / VAAPI, software on macOS where
+  VideoToolbox measured slower); `GET /v1/training/import/preview` backs the page's preview line) and `train autolabel` (`training/autolabel/`:
   MM-Grounding-DINO + RF-DETR L, Qwen3-VL / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label)
   are `task::Task`s on the same one-at-a-time queue, recorded in `<training dir>/tasks.json` beside `runs.json`; pins in
   `catalog/autolabel.rs`. The public night subset (`train-data:lila-night`, 926 MB) and other > 500 MB downloads need

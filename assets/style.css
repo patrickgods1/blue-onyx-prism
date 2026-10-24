@@ -705,10 +705,165 @@ table.dt td button.small { padding: 0.12rem 0.5rem; margin: 0; }
 .review-boxes select { max-width: 100%; min-width: 0; }
 .review-boxes .bx-note { grid-column: 1 / -1; font-size: 0.8rem; color: var(--muted); overflow-wrap: anywhere; }
 .review-boxes .bx-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 0.2rem; }
-.sw-pending { background: #f0b400; } .sw-hint { background: #f08c00; } .sw-accepted { background: #2e9e4f; }
+.sw-pending { background: #e8d000; } .sw-review { background: #ffa000; box-shadow: inset 0 0 0 2px #000; } .sw-hint { background: #f08c00; } .sw-accepted { background: #2e9e4f; }
 .sw-added { background: #1f6fe0; } .sw-rejected { background: #e53935; }
 .review-keys td { padding: 0.1rem 0.6rem 0.1rem 0; font-size: 0.85rem; }
 .review-keys td:first-child { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: nowrap; }
 .review-report { font-size: 0.9rem; overflow-wrap: anywhere; }
 .review-report ul { margin: 0.3rem 0; padding-left: 1.2rem; }
+.review-stage canvas[data-cursor=move] { cursor: move; } .review-stage canvas[data-cursor=grab] { cursor: grab; }
+.review-stage canvas[data-cursor=grabbing] { cursor: grabbing; } .review-stage canvas[data-cursor=nwse] { cursor: nwse-resize; }
+.review-stage canvas[data-cursor=nesw] { cursor: nesw-resize; } .review-stage canvas[data-cursor=ns] { cursor: ns-resize; }
+.review-stage canvas[data-cursor=ew] { cursor: ew-resize; }
+.review-stage canvas[hidden] { display: none; }
+.review-meta-row { display: flex; align-items: flex-start; gap: 0.5rem; }
+.review-meta-row .review-meta { flex: 1 1 auto; min-width: 0; }
+.review-meta-row button.small { margin: 0; flex: none; }
+.review-zoom { font-size: 0.85rem; flex: none; }
+.review-crop { margin: 0.4rem 0; }
+.review-crop[hidden] { display: none; }
+.review-crop canvas { display: block; max-width: 100%; height: auto; background: #000; border-radius: 4px; }
+.review-crop figcaption { font-size: 0.8rem; margin-top: 0.2rem; }
+.review-boxes li.lk-review { border-color: #ffa000; }
+.review-boxes li.lk-review.sel { box-shadow: 0 0 0 1px #ffa000; }
+.review-boxes .bx-chips { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.rv-chip { font-size: 0.75rem; padding: 0 0.4rem; border-radius: 4px; border: 1px solid var(--border); overflow-wrap: anywhere; }
+.rv-chip.ok { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--ok-fg); }
+.rv-chip.warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
+.rv-chip.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(--err-fg); }
+.rv-chip.drawn { color: #1f6fe0; border-color: #1f6fe0; }
+.review-boxes .bx-suggest { grid-column: 1 / -1; font-size: 0.85rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; }
+.review-boxes .bx-suggest button.small { margin: 0; }
+#rv-msg button.small { margin-left: 0.4rem; }
+#rv-al-progress { display: block; margin: 0.4rem 0 0.2rem; }
+#rv-al-progress[hidden] { display: none; }
 label.grow { flex: 1 1 20rem; min-width: 0; }
+
+/* Training page (templates/training.html), scoped under .tr */
+.tr [hidden] { display: none !important; }
+ol.tr-steps { display: flex; flex-wrap: wrap; gap: 0.4rem; list-style: none; padding: 0; margin: 0.5rem 0 1rem; counter-reset: trstep; }
+ol.tr-steps li { counter-increment: trstep; }
+ol.tr-steps li a { display: inline-block; padding: 0.25rem 0.75rem; border: 1px solid var(--border); border-radius: 999px; background: var(--card); text-decoration: none; font-size: 0.9rem; }
+ol.tr-steps li a::before { content: counter(trstep) ". "; color: var(--muted); }
+ol.tr-steps li a:hover { border-color: var(--accent); }
+.tr .card, .tr form.card { scroll-margin-top: 4rem; }
+.tr-wrap, .tr-wrap p, .tr .tr-fact { overflow-wrap: anywhere; }
+.tr .tr-fact { margin: 0.3rem 0; }
+.tr .tr-fact .k { color: var(--muted); margin-right: 0.4rem; }
+.tr .small { font-size: 0.82rem; }
+.tr p.small { margin: 0.15rem 0 0.4rem; }
+.tr-form input[type="text"], .tr-form input[type="url"], .tr-form select { width: 100%; max-width: 36rem; min-width: 0; }
+.tr-form input[type="number"] { width: 8rem; max-width: 100%; }
+.tr-form fieldset { margin: 0.75rem 0; }
+.tr-form legend { color: var(--fg); font-weight: 600; font-size: 0.95rem; }
+.tr-form label.check { margin: 0.3rem 0; align-items: flex-start; }
+.tr-form label.check input { margin-top: 0.3rem; flex: none; }
+.tr-form .tr-field { margin: 0.6rem 0; min-width: 0; }
+.tr-form .tr-field > label:not(.check) { display: block; margin: 0 0 0.2rem; color: var(--muted); font-size: 0.9rem; }
+.tr-form .tr-field > p.small { margin: 0.2rem 0 0; }
+.tr-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(15rem, 100%), 1fr)); gap: 0 1.5rem; }
+.tr-grid > .tr-span { grid-column: 1 / -1; }
+.tr-radios { display: flex; flex-wrap: wrap; gap: 0 1.5rem; }
+.tr-radios legend { width: 100%; }
+.tr-checks { display: flex; flex-direction: column; justify-content: center; }
+.tr-browse { flex-wrap: wrap; max-width: 44rem; }
+.tr-browse input { flex: 1 1 14rem; }
+.tr-browse button { margin: 0; }
+details.tr-more { margin: 0.5rem 0; }
+details.tr-more > summary { margin: 0.3rem 0; }
+details.tr-tasks > summary { color: var(--fg); font-weight: 600; }
+.tr-confirm { margin: 0.75rem 0 0 !important; }
+.tr-form .actions { margin-top: 0.6rem; }
+.tr-default-submit { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+.tr-step { padding: 0.6rem 1rem 0.8rem; }
+.tr-step > legend { font-size: 1.05rem; }
+.tr-folder { display: flex; flex-wrap: wrap; align-items: center; gap: 0 0.6rem; }
+.tr-folder label.check { flex: 1 1 18rem; min-width: 0; overflow-wrap: anywhere; }
+.tr-folder button.small { margin: 0; }
+table.tr-models th[scope="row"] { white-space: nowrap; color: var(--fg); font-size: 0.95rem; }
+table.tr-models td.tr-size { min-width: 8.5rem; }
+table.tr-models td.tr-size label.check { margin: 0 0 0.15rem; align-items: center; }
+table.tr-models td.tr-size label.check input { margin-top: 0; }
+table.tr-models td.tr-size label.check code { white-space: nowrap; overflow-wrap: normal; }
+table.tr-models td.tr-unfit { opacity: 0.7; }
+table.tr-models td .small { display: block; line-height: 1.3; }
+.tr-weight { font-size: 0.72rem; padding: 0 0.35rem; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.tr-weight.tr-light { background: var(--ok-bg); color: var(--ok-fg); border-color: transparent; }
+.tr-weight.tr-medium { background: var(--warn-bg); color: var(--warn-fg); border-color: transparent; }
+.tr-weight.tr-heavy { background: var(--err-bg); color: var(--err-fg); border-color: transparent; }
+ul.tr-legend { list-style: none; padding: 0; margin: 0.5rem 0; display: flex; flex-wrap: wrap; gap: 0.2rem 1.2rem; }
+.tr-sets { display: flex; flex-wrap: wrap; gap: 0 1.2rem; }
+.tr-sets legend, .tr-sets p { width: 100%; }
+
+/* ---- Cross-page fixes: labels, hints, grids, state cells, resources ------------------------ */
+/* A hint line under a field (inside its label, after the input). */
+.fields label > .muted.small, #bench-form label > .muted.small, #bench-form label > .field-hint { display: block; font-size: 0.8rem; margin: 0; }
+input.num-sm { width: 6rem; }
+/* Number and short text fields in an auto-fill grid (Dataset settings, Review export). */
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(14rem, 100%), 1fr)); gap: 0 1.2rem; align-items: end; }
+#rv-import, #rv-classes { align-items: flex-end; }
+#rv-import > button, #rv-import > label.check, #rv-classes > button { margin-bottom: 0.5rem; }
+.fields > *, .fields .with-browse { min-width: 0; }
+.fields > .wide, .fields > label.check { grid-column: 1 / -1; }
+.fields > label.check { margin: 0.25rem 0; }
+table.buckets input[type="number"] { width: 6rem; }
+table.buckets td:first-child code { overflow-wrap: normal; white-space: nowrap; }
+
+/* Stats: the state cell wraps (short state, then its detail); two-row header ends level. */
+table.stats td.state { white-space: normal; min-width: 12rem; max-width: 26rem; overflow-wrap: anywhere; }
+table.stats td.state .detail { font-weight: normal; color: var(--muted); font-size: 0.85rem; }
+table.stats thead th[rowspan] { vertical-align: bottom; }
+
+/* Config Models card: the file name in full (path in the tooltip); a failure on one line. */
+table.model-card td.file { min-width: 7rem; max-width: 13rem; }
+table.model-card td.file code { max-width: none; overflow: visible; white-space: normal; display: inline; overflow-wrap: break-word; }
+table.model-card td.model-device select { max-width: 12rem; }
+table.model-card td.running { max-width: 12rem; min-width: 7rem; }
+table.model-card td.running .run-text { display: block; }
+details.run-detail > summary { color: inherit; margin: 0.1rem 0 0; font-size: 0.8rem; font-weight: normal; list-style-position: inside; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 12rem; }
+details.run-detail[open] > summary { white-space: normal; overflow-wrap: anywhere; }
+
+/* Benchmark Run: Settings spans the row with its own grid. */
+.bench-grid > fieldset.bench-settings { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(16rem, 100%), 1fr)); gap: 0 1.2rem; align-items: start; }
+fieldset.bench-settings > * { min-width: 0; }
+fieldset.bench-settings > details, fieldset.bench-settings > legend { grid-column: 1 / -1; }
+
+/* Review: the key table's first column may wrap on phones. */
+@media (max-width: 600px) { .review-keys td:first-child { white-space: normal; min-width: 3.5rem; } }
+
+/* Resources: one collapsible group per kind, one column layout, a filter. */
+.res-filter-row { margin: 0.5rem 0; display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.8rem; }
+.res-filter-row[hidden], .export-add-row[hidden] { display: none; }
+.res-filter-row input[type="search"] { width: min(20rem, 100%); }
+details.res-group { margin: 0.4rem 0; }
+details.res-group > summary { display: flex; align-items: baseline; gap: 0.4rem; list-style: none; color: var(--fg); margin: 0.6rem 0 0.4rem; }
+details.res-group > summary .res-count { font-weight: normal; margin-left: 0.3rem; white-space: nowrap; }
+.res-filter-row label { display: flex; flex-direction: row; align-items: center; gap: 0.4rem; margin: 0; }
+details.res-group > summary::-webkit-details-marker { display: none; }
+details.res-group > summary::before { content: "\25B8"; color: var(--muted); flex: none; width: 0.8rem; }
+details.res-group[open] > summary::before { content: "\25BE"; }
+details.res-group > summary h3 { margin: 0; font-size: 1.02rem; }
+details.res-group > summary:hover h3 { color: var(--accent); }
+details.res-group > summary:hover .res-count { color: var(--muted); }
+details.res-group[hidden] { display: none; }
+.res-note { margin: 0 0 0.3rem; }
+.export-add-row { margin: 0.2rem 0 0.5rem; }
+details.res-group table.resources { table-layout: fixed; }
+details.res-group table.resources col.c-size { width: 7rem; }
+details.res-group table.resources col.c-state { width: 15rem; }
+details.res-group table.resources col.c-action { width: 11rem; }
+details.res-group table.resources td { overflow-wrap: anywhere; }
+details.res-group table.resources td:first-child code { overflow-wrap: anywhere; }
+details.res-group table.resources td.res-action form.inline { display: inline-flex; gap: 0.4rem; margin: 0 0.3rem 0.3rem 0; }
+details.res-group table.resources td.res-action button { margin: 0; }
+details.res-group table.resources tr[hidden] { display: none; }
+@media (max-width: 700px) {
+  details.res-group table.resources, details.res-group table.resources tbody { display: block; }
+  details.res-group table.resources colgroup, details.res-group table.resources thead { display: none; }
+  details.res-group table.resources tr { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 0.8rem; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--border); }
+  details.res-group table.resources tr[hidden] { display: none; }
+  details.res-group table.resources tbody tr:last-child { border-bottom: none; }
+  details.res-group table.resources td { display: block; padding: 0; border: none; text-align: left; min-width: 0; }
+  details.res-group table.resources td:first-child, details.res-group table.resources td.res-action { grid-column: 1 / -1; }
+}
+.tag.ds-state { white-space: nowrap; }

@@ -1,7 +1,8 @@
 //! Frame selection of an import (pure): the FFmpeg `select` expression that keeps scene changes
 //! at a bounded rate ([`select_expr`]), near-duplicate removal by dHash ([`dedup`]), the
-//! per-scene quotas ([`quotas`]) and k-center greedy selection over embeddings
-//! ([`k_center`], cosine distance) or dHashes ([`k_center_hamming`]).
+//! per-scene quotas ([`quotas`]), k-center greedy selection over embeddings ([`k_center`],
+//! cosine distance) or dHashes ([`k_center_hamming`]), and the candidate budget of an import
+//! shared fairly by cameras, videos and images before anything is extracted ([`budget`]).
 
 use std::collections::BTreeMap;
 
@@ -99,6 +100,148 @@ pub fn quotas(available: &BTreeMap<String, usize>, total: usize) -> BTreeMap<Str
         }
     }
     out
+}
+
+/// Equal shares of `total` over slots of the given capacities (water filling): each open slot
+/// gets `left / open` (at least 1) up to its capacity, the rest handed out again until nothing
+/// is left or every slot is full; the 1-frame remainders go to the lowest slots first.
+fn fill(caps: &[usize], total: usize) -> Vec<usize> {
+    let mut out = vec![0usize; caps.len()];
+    let mut left = total.min(caps.iter().sum());
+    while left > 0 {
+        let open: Vec<usize> = (0..caps.len())
+            .filter(|i| out.get(*i) < caps.get(*i))
+            .collect();
+        if open.is_empty() {
+            break;
+        }
+        let share = (left / open.len()).max(1);
+        for i in open {
+            if left == 0 {
+                break;
+            }
+            let (Some(o), Some(c)) = (out.get_mut(i), caps.get(i)) else {
+                continue;
+            };
+            let take = share.min(c - *o).min(left);
+            *o += take;
+            left -= take;
+        }
+    }
+    out
+}
+
+/// `k` of `n` indices spread evenly (the middle of each of `k` equal strides), ascending; all of
+/// them when `k >= n`.
+pub fn stride(n: usize, k: usize) -> Vec<usize> {
+    if k >= n {
+        return (0..n).collect();
+    }
+    (0..k).map(|i| ((2 * i + 1) * n) / (2 * k)).collect()
+}
+
+/// The candidate budget of an import ([`budget`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Budget {
+    /// Frames each video may give (its `--max-frames`), in the order of the videos; 0 = the
+    /// video is skipped (more videos than the budget has frames).
+    pub per_video: Vec<usize>,
+    /// Images kept ([`stride`]-sampled when fewer than the images found).
+    pub images: usize,
+    /// Images found.
+    pub image_total: usize,
+}
+
+impl Budget {
+    /// Videos skipped.
+    pub fn skipped_videos(&self) -> usize {
+        self.per_video.iter().filter(|q| **q == 0).count()
+    }
+
+    /// The largest per-video quota (0 without videos).
+    pub fn max_per_video(&self) -> usize {
+        self.per_video.iter().copied().max().unwrap_or(0)
+    }
+
+    /// The smallest quota of a video that is read (0 without videos).
+    pub fn min_per_video(&self) -> usize {
+        self.per_video
+            .iter()
+            .copied()
+            .filter(|q| *q > 0)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Warnings for the report and the preview; `total` is the import's candidate budget.
+    pub fn warnings(&self, total: usize) -> Vec<String> {
+        let mut w = Vec::new();
+        let skipped = self.skipped_videos();
+        if skipped > 0 {
+            w.push(format!(
+                "{skipped} of {} videos skipped: the import reads at most {total} candidate \
+                 frames, one at least per video (an even spread of the videos per camera is \
+                 read); import fewer videos at a time",
+                self.per_video.len()
+            ));
+        }
+        if self.images < self.image_total {
+            w.push(format!(
+                "{} of {} images used (an even spread): the import reads at most {total} \
+                 candidate frames, shared fairly by the cameras' videos and the images",
+                self.images, self.image_total
+            ));
+        }
+        w
+    }
+}
+
+/// Share the candidate budget `total` of an import fairly: the cameras of the videos
+/// (`video_cameras`, one entry per video) and the images (as one more group) get equal shares
+/// (water filling: a group that cannot use its share, at most `per_video_max` per video or the
+/// images it has, leaves the rest to the others); each camera's share is split equally by its
+/// videos, at most `per_video_max` and at least 1 each. A camera with fewer frames than videos
+/// reads one frame of an even spread ([`stride`]) of them. Pure.
+pub fn budget(
+    video_cameras: &[&str],
+    n_images: usize,
+    total: usize,
+    per_video_max: usize,
+) -> Budget {
+    let per_video_max = per_video_max.max(1);
+    let mut cams: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, c) in video_cameras.iter().enumerate() {
+        cams.entry(c).or_default().push(i);
+    }
+    // The groups: the cameras in name order, then the images.
+    let mut caps: Vec<usize> = cams
+        .values()
+        .map(|v| v.len().saturating_mul(per_video_max))
+        .collect();
+    caps.push(n_images);
+    let shares = fill(&caps, total);
+    let mut per_video = vec![0usize; video_cameras.len()];
+    for (vids, share) in cams.values().zip(&shares) {
+        if *share < vids.len() {
+            for k in stride(vids.len(), *share) {
+                if let Some(q) = vids.get(k).and_then(|v| per_video.get_mut(*v)) {
+                    *q = 1;
+                }
+            }
+        } else {
+            let q = fill(&vec![per_video_max; vids.len()], *share);
+            for (v, n) in vids.iter().zip(q) {
+                if let Some(slot) = per_video.get_mut(*v) {
+                    *slot = n;
+                }
+            }
+        }
+    }
+    Budget {
+        per_video,
+        images: shares.last().copied().unwrap_or(0),
+        image_total: n_images,
+    }
 }
 
 /// Cosine distance of two L2-normalized vectors (`1 - a.b`, clamped to 0..2).
@@ -388,5 +531,78 @@ mod tests {
             .collect();
         let picked = pick(&groups, &hashes, Some(&e), 3, false);
         assert!(picked.contains(&2), "the outlier is covered: {picked:?}");
+    }
+
+    #[test]
+    fn stride_spreads_evenly() {
+        assert_eq!(stride(10, 3), [1, 5, 8]);
+        assert_eq!(stride(4, 4), [0, 1, 2, 3]);
+        assert_eq!(stride(3, 10), [0, 1, 2]);
+        assert!(stride(5, 0).is_empty());
+        let s = stride(1000, 7);
+        assert_eq!(s.len(), 7);
+        assert!(s.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn budget_is_fair_across_cameras_then_videos() {
+        // Camera a has 1 video, b has 9: each camera gets half of 1000, not 100 per video.
+        let mut cams = vec!["a"];
+        cams.extend(["b"; 9]);
+        let b = budget(&cams, 0, 1000, 1500);
+        assert_eq!(b.per_video[0], 500);
+        assert_eq!(b.per_video[1..].iter().sum::<usize>(), 500);
+        assert!(
+            b.per_video[1..].iter().all(|q| *q == 55 || *q == 56),
+            "{b:?}"
+        );
+        assert_eq!(b.images, 0);
+        // The per-video cap leaves the rest to the other camera.
+        let b = budget(&cams, 0, 1000, 100);
+        assert_eq!(b.per_video[0], 100);
+        assert!(b.per_video[1..].iter().all(|q| *q == 100), "{b:?}");
+        // Plenty of budget: everyone gets the cap.
+        let b = budget(&["x", "y"], 10, 20_000, 1500);
+        assert_eq!(b.per_video, [1500, 1500]);
+        assert_eq!((b.images, b.image_total), (10, 10));
+        assert!(b.warnings(20_000).is_empty());
+        assert_eq!((b.max_per_video(), b.min_per_video()), (1500, 1500));
+    }
+
+    #[test]
+    fn budget_keeps_images_when_videos_are_many() {
+        // 200 videos of 1500 each could fill 20 000 alone; the images keep a fair share.
+        let cams: Vec<&str> = (0..200).map(|i| ["c1", "c2", "c3", "c4"][i % 4]).collect();
+        let b = budget(&cams, 5000, 20_000, 1500);
+        assert_eq!(b.images, 4000, "one fifth: four cameras and the images");
+        assert_eq!(b.per_video.iter().sum::<usize>() + b.images, 20_000);
+        assert!(
+            b.per_video.iter().all(|q| *q == 80),
+            "{:?}",
+            &b.per_video[..4]
+        );
+        assert!(b.warnings(20_000)[0].contains("4000 of 5000 images"));
+        // Few images: all of them, the videos get the rest.
+        let b = budget(&cams, 30, 20_000, 1500);
+        assert_eq!(b.images, 30);
+        assert_eq!(b.per_video.iter().sum::<usize>(), 19_970);
+        assert_eq!(b.skipped_videos(), 0);
+    }
+
+    #[test]
+    fn budget_stride_samples_videos_beyond_the_budget() {
+        // 10 videos of one camera, 4 frames of budget: 4 videos spread over the 10, 1 each.
+        let b = budget(&["a"; 10], 0, 4, 1500);
+        assert_eq!(b.per_video.iter().sum::<usize>(), 4);
+        assert_eq!(b.skipped_videos(), 6);
+        let read: Vec<usize> = (0..10).filter(|i| b.per_video[*i] > 0).collect();
+        assert_eq!(read, stride(10, 4));
+        assert!(b.warnings(4)[0].contains("6 of 10 videos skipped"));
+        assert_eq!(b.min_per_video(), 1);
+        // Only images.
+        let b = budget(&[], 50, 20, 1500);
+        assert!(b.per_video.is_empty());
+        assert_eq!(b.images, 20);
+        assert_eq!(b.max_per_video(), 0);
     }
 }

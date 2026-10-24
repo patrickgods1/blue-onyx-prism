@@ -183,16 +183,60 @@ pub struct ResourceGroup {
     pub key: &'static str,
     pub title: &'static str,
     pub rows: Vec<ResourceRow>,
+    /// The group starts open: a row needs attention (needed, installed, failed, busy, an
+    /// update); groups of merely available downloads start collapsed.
+    pub open: bool,
+    /// Counts for the collapsed header ("7 resources · 1 needed · 2 installed").
+    pub summary: String,
+    /// One line for the whole group (the export toolchain cost, stated once).
+    pub note: Option<String>,
 }
 
-/// Split `rows` into the non-empty [`GROUPS`], in display order.
-pub fn grouped(rows: Vec<ResourceRow>) -> Vec<ResourceGroup> {
+/// A row the Resources card should not hide in a collapsed group.
+fn wants_attention(r: &ResourceRow) -> bool {
+    r.busy
+        || r.update_available.is_some()
+        || !r.blocking.is_empty()
+        || !matches!(r.state, "available" | "unavailable")
+}
+
+/// "7 resources · 1 needed · 2 installed · 1 failed".
+fn group_summary(rows: &[ResourceRow]) -> String {
+    let n = |f: &dyn Fn(&ResourceRow) -> bool| rows.iter().filter(|r| f(r)).count();
+    let mut parts = vec![if rows.len() == 1 {
+        "1 resource".to_string()
+    } else {
+        format!("{} resources", rows.len())
+    }];
+    for (count, what) in [
+        (
+            n(&|r| !r.busy && matches!(r.state, "needed" | "needs-export")),
+            "needed",
+        ),
+        (n(&|r| r.busy), "in progress"),
+        (n(&|r| r.state == "installed"), "installed"),
+        (n(&|r| r.update_available.is_some()), "update"),
+        (n(&|r| r.state == "failed"), "failed"),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {what}"));
+        }
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// Split `rows` into the non-empty [`GROUPS`], in display order. `export_note` is the line of
+/// the export group (see [`export_group_note`]).
+pub fn grouped(rows: Vec<ResourceRow>, export_note: Option<String>) -> Vec<ResourceGroup> {
     let mut out: Vec<ResourceGroup> = GROUPS
         .iter()
         .map(|&(key, title)| ResourceGroup {
             key,
             title,
             rows: Vec::new(),
+            open: false,
+            summary: String::new(),
+            note: None,
         })
         .collect();
     for r in rows {
@@ -201,7 +245,41 @@ pub fn grouped(rows: Vec<ResourceRow>) -> Vec<ResourceGroup> {
         }
     }
     out.retain(|g| !g.rows.is_empty());
+    for g in &mut out {
+        g.open = g.rows.iter().any(wants_attention);
+        g.summary = group_summary(&g.rows);
+        if g.key == EXPORT_GROUP {
+            g.note = export_note.clone();
+        }
+    }
     out
+}
+
+/// The export group's line: what the export toolchain costs (once), or that it is installed;
+/// None where exports cannot run (the rows say why).
+pub fn export_group_note(config: &Config) -> Option<String> {
+    let platform = Platform::current();
+    if export::unsupported_reason(platform.os, platform.arch).is_some() {
+        return None;
+    }
+    let paths = export::Paths::for_config(config);
+    Some(export_note_text(
+        export::toolchain_state(&paths, platform).ready(),
+        toolchain_cost(platform).as_deref(),
+    ))
+}
+
+fn export_note_text(toolchain_ready: bool, cost: Option<&str>) -> String {
+    if toolchain_ready {
+        "Export toolchain installed: an export downloads only the model's weights (the size shown)."
+            .to_string()
+    } else {
+        format!(
+            "The first export also sets up the export toolchain once ({}); later exports download \
+             only the model's weights (the size shown).",
+            cost.unwrap_or("large")
+        )
+    }
 }
 
 /// Id prefix of local model files (`local:yolo26s.onnx`).
@@ -821,14 +899,7 @@ fn export_row(
         .map(|m| m.model.clone())
         .collect();
     row.blocking = needed_by.clone();
-    row.size_note = Some(if toolchain.ready() {
-        "weights; export toolchain installed".to_string()
-    } else {
-        format!(
-            "weights + export toolchain once ({})",
-            toolchain_cost(platform).unwrap_or_else(|| "large".into())
-        )
-    });
+    // The toolchain cost is stated once, in the group's line ([`export_group_note`]).
     row.large = !toolchain.ready();
     row.confirm = Some(export_confirm(r, toolchain.ready(), platform));
     match st.as_ref().map(|s| &s.state) {
@@ -899,4 +970,107 @@ fn export_row(
         row.state_text = why;
     }
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &'static str, group: &'static str, state: &'static str) -> ResourceRow {
+        ResourceRow {
+            id,
+            title: id,
+            description: "",
+            kind: "model",
+            group,
+            version: "1",
+            license: "MIT",
+            size: 1,
+            size_text: "1 B".into(),
+            large: false,
+            state,
+            state_text: state.into(),
+            busy: false,
+            progress: None,
+            error: None,
+            retry_in: None,
+            provides: Vec::new(),
+            blocking: Vec::new(),
+            active: false,
+            loaded: false,
+            removable: false,
+            remove_blocked: None,
+            can_add_to_config: false,
+            target: String::new(),
+            action: "download",
+            cancellable: false,
+            confirm: None,
+            size_note: None,
+            log: Vec::new(),
+            update_available: None,
+        }
+    }
+
+    #[test]
+    fn groups_open_only_with_rows_that_need_attention() {
+        let mut busy = row("d", "models-rt-detr", "downloading");
+        busy.busy = true;
+        let mut update = row("u", "models-d-fine", "installed");
+        update.update_available = Some("2");
+        let rows = vec![
+            row("a", "models-yolov5", "available"),
+            row("b", "models-yolov5", "available"),
+            row("rt", "runtimes", "needed"),
+            busy,
+            update,
+            row("f", "bench-images", "failed"),
+            row("x", EXPORT_GROUP, "available"),
+        ];
+        let g = grouped(rows, Some("toolchain once".into()));
+        let by = |k: &str| g.iter().find(|g| g.key == k).unwrap();
+        assert!(!by("models-yolov5").open);
+        assert_eq!(by("models-yolov5").summary, "2 resources");
+        assert!(by("runtimes").open);
+        assert_eq!(by("runtimes").summary, "1 resource \u{b7} 1 needed");
+        assert!(by("models-rt-detr").open);
+        assert_eq!(
+            by("models-rt-detr").summary,
+            "1 resource \u{b7} 1 in progress"
+        );
+        assert!(by("models-d-fine").open);
+        assert_eq!(
+            by("models-d-fine").summary,
+            "1 resource \u{b7} 1 installed \u{b7} 1 update"
+        );
+        assert!(by("bench-images").open);
+        assert_eq!(by("bench-images").summary, "1 resource \u{b7} 1 failed");
+        // The toolchain line goes to the export group only.
+        assert!(!by(EXPORT_GROUP).open);
+        assert_eq!(by(EXPORT_GROUP).note.as_deref(), Some("toolchain once"));
+        assert!(by("runtimes").note.is_none());
+        // Empty groups are dropped, the display order kept.
+        let keys: Vec<_> = g.iter().map(|g| g.key).collect();
+        assert_eq!(
+            keys,
+            [
+                "runtimes",
+                "models-yolov5",
+                "models-rt-detr",
+                "models-d-fine",
+                EXPORT_GROUP,
+                "bench-images"
+            ]
+        );
+    }
+
+    #[test]
+    fn export_note_states_the_toolchain_cost_once() {
+        let t = export_note_text(false, Some("~375 MB download, ~1.3 GB on disk"));
+        assert!(
+            t.contains("once (~375 MB download, ~1.3 GB on disk)"),
+            "{t}"
+        );
+        assert!(export_note_text(false, None).contains("once (large)"));
+        assert!(export_note_text(true, None).starts_with("Export toolchain installed"));
+    }
 }

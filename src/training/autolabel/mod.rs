@@ -192,8 +192,10 @@ impl VlmSize {
 }
 
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
-/// `label`, `status`, `source`), `import=<id>|any` (imported frames) and `limit` (most frames, in queue
-/// order). Written `key=value` pairs separated by commas (`scene=ir,status=unreviewed,limit=20`).
+/// `label`, `status`, `source`, `auto`), `import=<id>|any` (imported frames), `again=1` (also
+/// frames these labelers already looked at, see [`crate::collect::labels::AutoRun`]) and `limit`
+/// (most frames, in queue order). Written `key=value` pairs separated by commas
+/// (`scene=ir,status=unreviewed,limit=20`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FrameFilter {
     pub query: BTreeMap<String, String>,
@@ -217,12 +219,22 @@ impl FrameFilter {
                         .parse()
                         .map_err(|_| anyhow::anyhow!("limit: '{v}' is not a number"))?;
                 }
-                "bucket" | "scene" | "camera" | "label" | "status" | "source" | "import" => {
+                "again" => {
+                    if !matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
+                        bail!(
+                            "again: '{v}' is not 1, true or yes (leave it out to skip frames \
+                               these labelers already looked at)"
+                        );
+                    }
+                    query.insert(k, "1".into());
+                }
+                "bucket" | "scene" | "camera" | "label" | "status" | "source" | "auto"
+                | "import" => {
                     query.insert(k, v);
                 }
                 other => bail!(
                     "unknown frame filter '{other}' (bucket, scene, camera, label, status, \
-                     source, import, limit)"
+                     source, auto, import, again, limit)"
                 ),
             }
         }
@@ -242,7 +254,13 @@ impl FrameFilter {
     pub fn filters(&self) -> Result<Filters> {
         let mut q = self.query.clone();
         q.remove("import");
+        q.remove("again");
         Filters::from_query(&q).map_err(anyhow::Error::msg)
+    }
+
+    /// `again=1`: label frames these labelers already looked at too.
+    pub fn again(&self) -> bool {
+        self.query.contains_key("again")
     }
 
     /// `import=` value: `any` or an import id.
@@ -470,6 +488,17 @@ mod tests {
         }
         let l = FrameFilter::parse("label=person", "unreviewed").unwrap();
         assert_eq!(l.filters().unwrap().label.as_deref(), Some("person"));
+        assert!(!l.again());
+        let a = FrameFilter::parse("auto=none,again=Yes", "unreviewed").unwrap();
+        assert!(a.again());
+        assert_eq!(a.query["again"], "1");
+        assert_eq!(
+            a.filters().unwrap().auto,
+            Some(crate::collect::labels::queue::AutoFilter::Never)
+        );
+        for bad in ["again=0", "again=", "auto=maybe"] {
+            assert!(FrameFilter::parse(bad, "any").is_err(), "{bad}");
+        }
         assert!(f.describe().contains("scene=ir"));
     }
 

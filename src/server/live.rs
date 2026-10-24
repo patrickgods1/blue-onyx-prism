@@ -163,7 +163,7 @@ pub(super) struct RunningView {
     pub device: Option<String>,
     /// Effective confidence threshold of the worker.
     pub threshold: Option<f64>,
-    /// One line for the Models card's Running column.
+    /// One line for the Models card's Running column ("Failed" alone: the reason is `detail`).
     pub text: String,
 }
 
@@ -191,7 +191,8 @@ pub(super) fn running_view(state: &AppState, name: &str) -> RunningView {
         w.live().confidence_threshold,
     ));
     let text = match w.state.get() {
-        ModelState::Failed(m) => format!("Failed: {m}"),
+        // The reason is `detail` (the card shows it on one truncated line under this).
+        ModelState::Failed(_) => "Failed".to_string(),
         ModelState::Ready => match threshold {
             Some(t) => format!("{provider} \u{b7} threshold {t:.2}"),
             None => provider.clone(),

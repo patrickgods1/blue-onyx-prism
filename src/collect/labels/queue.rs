@@ -1,12 +1,12 @@
 //! The review queue: the frames of `review-queue.jsonl` (and, with [`QueueSource::All`], every
-//! indexed frame), filtered by bucket, scene, camera, object class ([`frame_labels`]) and review
-//! status, and sorted by
+//! indexed frame), filtered by bucket, scene, camera, object class ([`frame_labels`]), review
+//! status and auto-label state ([`AutoFilter`]), and sorted by
 //! uncertainty ([`Uncertainty`]): the near-threshold margin first, then verifier disagreement,
 //! then the number of suppressed boxes, then newest. Also the counts the Review page shows.
 
 use super::super::layout::{self, REVIEW_QUEUE_FILE};
 use super::super::record::{Bucket, Record};
-use super::{Frame, LabelFile, Status};
+use super::{BoxState, Frame, LabelFile, Status, Triage};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -36,6 +36,54 @@ impl Default for StatusFilter {
     }
 }
 
+/// What the auto-labeler left on a frame (`auto=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoFilter {
+    /// At least one pending box triaged `review` (auto boxes, annotated model boxes, class
+    /// suggestions).
+    Review,
+    /// The triage alone settles the frame ([`super::auto_accept_eligible`]).
+    Accept,
+    /// Auto-labelled ([`LabelFile::auto_run`]) and no box carries auto evidence.
+    Nothing,
+    /// Never auto-labelled: no `auto_run` and no box with auto evidence (frames without a label
+    /// file too).
+    #[serde(rename = "none")]
+    Never,
+}
+
+impl AutoFilter {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "review" => Some(AutoFilter::Review),
+            "accept" => Some(AutoFilter::Accept),
+            "nothing" => Some(AutoFilter::Nothing),
+            "none" => Some(AutoFilter::Never),
+            _ => None,
+        }
+    }
+
+    /// Whether a frame with `labels` (None = no label file) passes.
+    pub fn matches(self, labels: Option<&LabelFile>) -> bool {
+        let evidence = labels.is_some_and(|l| l.boxes.iter().any(|b| !b.auto.is_empty()));
+        let ran = labels.is_some_and(|l| l.auto_run.is_some());
+        match self {
+            AutoFilter::Review => labels.is_some_and(has_auto_review),
+            AutoFilter::Accept => labels.is_some_and(super::auto_accept_eligible),
+            AutoFilter::Nothing => ran && !evidence,
+            AutoFilter::Never => !ran && !evidence,
+        }
+    }
+}
+
+/// A pending box triaged `review`.
+fn has_auto_review(l: &LabelFile) -> bool {
+    l.boxes
+        .iter()
+        .any(|b| b.state == BoxState::Pending && b.auto.triage == Some(Triage::Review))
+}
+
 /// Queue filters (`GET /v1/review/next?...`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Filters {
@@ -46,11 +94,14 @@ pub struct Filters {
     pub label: Option<String>,
     pub status: StatusFilter,
     pub source: QueueSource,
+    /// Only frames in this auto-label state.
+    pub auto: Option<AutoFilter>,
 }
 
 impl Filters {
     /// From query parameters (`bucket`, `scene`, `camera`, `label`, `status` = `unreviewed|reviewed|
-    /// skipped|any`, `source` = `queue|all`); empty values mean "any". Errors name the field.
+    /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none`); empty values
+    /// mean "any". Errors name the field.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let bucket = match get("bucket") {
@@ -93,6 +144,13 @@ impl Filters {
             Some("all") => QueueSource::All,
             Some(s) => return Err(format!("source: '{s}' is not queue or all")),
         };
+        let auto = match get("auto") {
+            None => None,
+            Some(a) => Some(
+                AutoFilter::parse(a)
+                    .ok_or_else(|| format!("auto: '{a}' is not review, accept, nothing or none"))?,
+            ),
+        };
         Ok(Self {
             bucket,
             scene,
@@ -100,6 +158,7 @@ impl Filters {
             label,
             status,
             source,
+            auto,
         })
     }
 }
@@ -251,7 +310,7 @@ pub fn sort_items(items: &mut [Item]) {
     });
 }
 
-/// Review counts over the frames matching the filters (the status filter aside).
+/// Review counts over the frames matching the filters (the status and auto filters aside).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Counts {
     pub total: u64,
@@ -264,6 +323,10 @@ pub struct Counts {
     pub per_class: BTreeMap<String, u64>,
     /// Rejected model boxes of reviewed frames (hard-negative evidence).
     pub rejected_boxes: u64,
+    /// Frames with a pending box triaged `review` ([`AutoFilter::Review`]).
+    pub auto_review: u64,
+    /// Frames the auto-labeler's triage alone settles ([`AutoFilter::Accept`]).
+    pub auto_accept: u64,
 }
 
 impl Counts {
@@ -274,6 +337,8 @@ impl Counts {
             Some(Status::Skipped) => self.skipped += 1,
             _ => self.remaining += 1,
         }
+        self.auto_review += u64::from(AutoFilter::Review.matches(labels));
+        self.auto_accept += u64::from(AutoFilter::Accept.matches(labels));
         if let Some(l) = labels.filter(|l| l.status == Status::Reviewed) {
             self.empty_confirmed += u64::from(l.empty_confirmed);
             for b in l.training() {
@@ -372,6 +437,9 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
         {
             continue;
         }
+        if f.auto.is_some_and(|a| !a.matches(labels.as_ref())) {
+            continue;
+        }
         q.items.push(Item {
             frame: c.rel,
             timestamp: rec.timestamp.clone(),
@@ -390,12 +458,16 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
     q
 }
 
-/// The item after `after` in `items` (the first one when `after` is None or not listed).
-pub fn next_after<'a>(items: &'a [Item], after: Option<&str>) -> Option<(usize, &'a Item)> {
-    let start = after
-        .and_then(|a| items.iter().position(|i| i.frame == a))
-        .map_or(0, |p| p + 1);
-    items.get(start).map(|i| (start, i))
+/// The item after `after` in `items` with its index: the first one when `after` is None or
+/// not listed; when `after` is the last one, the first again with `wrapped` = true (even
+/// `after` itself in a one-item list). None only for an empty list.
+pub fn next_after<'a>(items: &'a [Item], after: Option<&str>) -> Option<(usize, &'a Item, bool)> {
+    let pos = after.and_then(|a| items.iter().position(|i| i.frame == a));
+    match pos {
+        Some(p) if p + 1 < items.len() => items.get(p + 1).map(|i| (p + 1, i, false)),
+        Some(_) => items.first().map(|i| (0, i, true)),
+        None => items.first().map(|i| (0, i, false)),
+    }
 }
 
 #[cfg(test)]
@@ -488,8 +560,23 @@ mod tests {
         );
         assert_eq!(next_after(&items, None).unwrap().1.frame, "closest");
         assert_eq!(next_after(&items, Some("far")).unwrap().0, 6);
-        assert!(next_after(&items, Some("none")).is_none());
-        assert_eq!(next_after(&items, Some("gone")).unwrap().0, 0);
+        let (i, it, wrapped) = next_after(&items, Some("none")).unwrap();
+        assert_eq!(
+            (i, it.frame.as_str(), wrapped),
+            (0, "closest", true),
+            "wraps"
+        );
+        assert_eq!(
+            next_after(&items, Some("gone")).unwrap(),
+            (0, &items[0], false)
+        );
+        let one = &items[..1];
+        assert_eq!(
+            next_after(one, Some("closest")).unwrap(),
+            (0, &one[0], true)
+        );
+        assert!(next_after(&[], None).is_none());
+        assert!(next_after(&[], Some("x")).is_none());
     }
 
     #[test]
@@ -544,6 +631,16 @@ mod tests {
         assert!(q(&[("scene", "dusk")]).unwrap_err().contains("scene"));
         assert!(q(&[("status", "done")]).unwrap_err().contains("status"));
         assert!(q(&[("source", "x")]).unwrap_err().contains("source"));
+        assert_eq!(
+            q(&[("auto", "none")]).unwrap().auto,
+            Some(AutoFilter::Never)
+        );
+        assert_eq!(
+            q(&[("auto", "accept")]).unwrap().auto,
+            Some(AutoFilter::Accept)
+        );
+        assert_eq!(q(&[("auto", "")]).unwrap().auto, None);
+        assert!(q(&[("auto", "maybe")]).unwrap_err().contains("auto"));
         assert_eq!(q(&[("bucket", "")]).unwrap().bucket, None);
         assert_eq!(
             q(&[("label", " fire hydrant ")]).unwrap().label.as_deref(),
@@ -661,5 +758,59 @@ mod tests {
         );
         assert!(build(&dir, &filters(Some("deer"))).items.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_filters_and_counts() {
+        use super::super::{AutoRun, tests_support::auto_box};
+        let mut accept = auto_box("car");
+        accept.auto.triage = Some(Triage::Accept);
+        let mut review = auto_box("dog");
+        review.auto.triage = Some(Triage::Review);
+        let file = |boxes: Vec<super::super::LabelBox>, ran: bool| LabelFile {
+            boxes,
+            auto_run: ran.then(|| AutoRun {
+                at: "t".into(),
+                labeler: "l".into(),
+            }),
+            ..LabelFile::default()
+        };
+        let which = |l: Option<&LabelFile>| {
+            [
+                AutoFilter::Review,
+                AutoFilter::Accept,
+                AutoFilter::Nothing,
+                AutoFilter::Never,
+            ]
+            .into_iter()
+            .filter(|a| a.matches(l))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(which(None), [AutoFilter::Never]);
+        assert_eq!(which(Some(&file(vec![], false))), [AutoFilter::Never]);
+        assert_eq!(which(Some(&file(vec![], true))), [AutoFilter::Nothing]);
+        assert_eq!(
+            which(Some(&file(vec![accept.clone()], true))),
+            [AutoFilter::Accept]
+        );
+        assert_eq!(
+            which(Some(&file(vec![accept.clone(), review.clone()], false))),
+            [AutoFilter::Review]
+        );
+        // A plain model box carries no evidence: still "nothing" / "none".
+        let mut model = auto_box("person");
+        model.source = super::super::Source::Model;
+        model.origin = Some(super::super::Origin::Prediction);
+        assert_eq!(which(Some(&file(vec![model], true))), [AutoFilter::Nothing]);
+        // A decided review box does not count as one to review.
+        review.state = BoxState::Accepted;
+        assert_eq!(
+            which(Some(&file(vec![review], true))),
+            Vec::<AutoFilter>::new()
+        );
+        let mut c = Counts::default();
+        c.add(Some(&file(vec![accept], true)));
+        c.add(None);
+        assert_eq!((c.total, c.auto_accept, c.auto_review), (2, 1, 0));
     }
 }

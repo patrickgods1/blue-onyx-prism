@@ -352,7 +352,7 @@
   }
   function loadSearch() {
     return fetch("/v1/benchmark/threshold-search", {cache: "no-store"}).then(function (r) { return r.json(); }).then(function (j) {
-      if (!j.success) { $("s-empty").hidden = false; $("s-empty").textContent = j.message; $("search-form").hidden = true; return; }
+      if (!j.success || j.available === false) { $("s-empty").hidden = false; $("s-empty").textContent = j.message; $("search-form").hidden = true; return; }
       $("s-empty").hidden = true; $("search-form").hidden = false;
       var first = !search.opts;
       search.opts = j.options; search.thresholds = j.thresholds || {};

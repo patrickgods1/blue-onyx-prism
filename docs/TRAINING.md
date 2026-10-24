@@ -311,18 +311,80 @@ frames.
 subdomains included) whatever licence is claimed, and anything but `http://` / `https://` (a camera's
 `rtsp://` stream: record a clip and import the file). Scraping of cameras is not supported.
 
+### Preview and the candidate budget
+
+An import reads at most 20 000 candidate frames (`MAX_CANDIDATES_TOTAL`). Before anything is
+extracted, `select::budget` shares them fairly: the cameras of the videos (from the file names, or
+`--camera`) and the images (one more group) get equal shares, water-filled (a group that cannot use
+its share leaves the rest to the others); a camera's share is split equally by its videos, each at
+most `--max-candidates` (1500) and at least 1. Each video's share is its `--max-frames`. Images over
+their share are an even spread (stride-sampled, not cut from the end); with more videos than the
+budget has frames, a camera reads one frame of an even spread of its videos and the report warns.
+So 200 clips of four cameras plus 5 000 alert snapshots read 80 frames per clip and 4 000 snapshots,
+where before the first clips by name took everything and the snapshots none. The final cut to
+20 000 stays as a guard only.
+
+`GET /v1/training/import/preview?path=<p>[&camera=<c>][&max_candidates=<n>]` (admin, the same path
+check as the import, so natively picked folders work) answers what an import would read: the video
+and image counts, videos per camera, the total size, the `.bvr` and other files skipped, whether
+the listing was cut at 20 000 files, the largest and smallest per-video share, skipped videos, images
+used, the warnings and one `summary` line. The Training page shows that line under the path field
+(debounced, also after *Browse...* fills it), e.g. "12 videos from 4 cameras, 240 images (3.1 GB);
+2 .bvr skipped; up to 1,500 frames per video". *Candidates per video* in the page's Sampling options
+is `--max-candidates`.
+
+### Parallel extraction and hardware decoding
+
+Videos are extracted `--workers` at a time (default 0 = half the physical cores, 1 to 4; at most 16;
+never more than the videos), one `import_footage.py extract` process each, on scoped threads. The
+workers send their output lines and results to the job thread, which alone reports progress
+("videos 3/12 done; reading a.mp4, b.mp4"); the results are put back in video order before the dedup
+(which keeps the first of near duplicates), so the outcome does not depend on which video finished
+first. A video that fails is a warning (`<file>: not read (...)`); a cancel stops every worker (the
+running helpers are killed, no further video starts). The helpers run at normal priority:
+`backend/priority.rs` only lowers the service's own process, and the command runner has no
+per-child priority yet.
+
+`--hwaccel auto` (default) decodes on the platform's hardware decoder when PyAV's FFmpeg has it
+(`av.codec.hwaccel.hwdevices_available()`): D3D11VA on Windows, CUDA then VAAPI on Linux (macOS
+decodes in software, see the measurement below), opened with `HWAccel(device_type=..., allow_software_fallback=True)` (PyAV 18.1.0,
+pinned in the `train-*` locks); a stream the hardware decoder cannot take is decoded in software by
+PyAV itself. A decoder that cannot open the video makes it try the next one of the platform's list,
+then software; a hardware decode error decodes the video again in software from the start (no seek;
+frames already passed are skipped by time, or by count when frames carry none) and sends a `decoder`
+event. `done` reports `capped` only when the video had more to give than its share: a further frame
+passed the filter within 12 s of video after the quota, or decoding stopped there with frames left. The filter graph's buffer takes the first decoded
+frame's size and pixel format (a hardware context reports the device's format, the frames arrive
+downloaded, e.g. `nv12`); a frame that differs is converted to it. The `start` event names the
+decoder (`hw:d3d11va`, `hw:cuda`, ... or `sw`), shown per video in the job's log with its candidate count; the
+self-check lists the hardware decoders this FFmpeg has. `--hwaccel off` decodes in software.
+
+Measured on an M1 (PyAV 18.1.0 wheel, whose FFmpeg has `videotoolbox` only; synthetic 40 s 1080p
+15 fps clips at 4 Mbit/s with sensor-like noise; the helper's whole run): VideoToolbox decodes the
+same frames and keeps the same candidates, but one clip takes longer and uses about a third of the
+CPU: H.264 4.0 s wall / 1.8 s CPU against 1.1 s / 4.6 s in software, HEVC 3.8 s / 1.7 s against
+1.7 s / 4.7 s; four H.264 clips at once (4 workers) 4.0 s / 2.9 s against 2.6 s / 20 s. VideoToolbox is
+therefore not used: on Apple silicon `auto` decodes in software, the faster import. D3D11VA, CUDA and VAAPI are not measured yet.
+
+The analysis (decode, dHash, scene of every candidate) runs on all physical cores but one
+(work-stealing by index, results by index, so the order and the result are the same as on one
+thread). Measured on an M1 (4 performance + 4 efficiency cores, release build, 2 000 synthetic
+1280x720 JPEGs, `--select dhash`, 200 frames, stage times from `GET /v1/training`): analysis and
+selection 2.95-3.34 s on one thread, 0.65-0.66 s on seven; the whole job 5.0-5.4 s, then 2.7 s, of
+which writing the 200 frames (an fsync per file) is 2.0 s either way (3 runs each).
+
 ### Frame selection
 
 1. **Extraction** (`scripts/import_footage.py extract`, PyAV): FFmpeg's `select` filter keeps the
    first frame, a frame whose scene-change score is above `--scene` (default 0.01) at most
-   `--max-fps` times a second (1), and one frame every `--every` seconds anyway (10), at most
-   `--max-candidates` per video (1500):
+   `--max-fps` times a second (1), and one frame every `--every` seconds anyway (10), at most the
+   video's share of the budget (above; at most `--max-candidates`, 1500):
    `if(isnan(prev_selected_t),1,gt(scene,0.01)*gte(t-prev_selected_t,1)+gte(t-prev_selected_t,10))`.
    FFmpeg's score is the mean frame difference: a person crossing a fixed 1080 p camera scores about
    0.002-0.015 (measured on the MEVA day clip: p99 0.012, maximum 0.014), a cut in edited footage
    0.3 or more, so 0.3 would only ever keep the periodic frames of surveillance video.
-2. **Analysis** (Rust): every candidate is decoded once for its dHash (the collector's) and its scene
-   (`day | night | ir`, `image_stats`).
+2. **Analysis** (Rust, all cores but one): every candidate is decoded once for its dHash (the
+   collector's) and its scene (`day | night | ir`, `image_stats`).
 3. **Dedup**: a frame is dropped when its dHash is within `--dedup` bits (6) of a kept frame of the
    same camera at most `--dedup-window` seconds apart (10; 0 = any time). The window matters: a
    fixed camera's frames are near duplicates by dHash whatever moves in them (a person flips a few of
@@ -372,8 +434,17 @@ the script only returns proposals as JSONL), so the reviewer decides. Nothing is
 deleted automatically; confirmed empty frames (hard negatives) come only from the review.
 
 **Frames**: `--frames` takes the Review queue's filters as `key=value` pairs: `bucket`, `scene`, `camera`, `label`,
-`status` (default `unreviewed`), `source` (default `all`), `import=<id>|any`, `limit` (default 200). They
-are taken in the queue's order (most uncertain first).
+`status` (default `unreviewed`), `source` (default `all`), `auto` (`review`, `accept`, `nothing`, `none`;
+docs/DATASET.md "Queue"), `import=<id>|any`, `again=1`, `limit` (default 200). They are taken in the
+queue's order (most uncertain first). The Review page's button sends its own filters.
+
+**Marker**: every frame the labelers return (boxes or not) gets `auto_run: {at, labeler}` in its label
+file (a frame without one gets its pre-fill plus the marker). Only frames whose boxes changed are queued
+for review. A later run with the same labelers (`labeler`, e.g. `mm-gdino-tiny + rfdetr-large +
+qwen3-vl-2b + siglip2-base`) skips those frames (`skipped_done` in the report) unless the filter has
+`again=1` (Review page: **Label again**); when every matching frame was skipped the run fails saying so.
+Re-labelling with a trained model writes no marker and skips nothing. Writes take the label write lock,
+so a Review save with a stale `revision` gets a 409 instead of overwriting merged boxes.
 
 ### Labelers
 
@@ -416,7 +487,14 @@ safetensors, the small files downloaded and hashed) and downloaded by the downlo
    a person or an animal on a night or IR frame is always `review`. Every box gets `triage` and the
    reasons (`why`). A proposal that matches an existing box of the same label (IoU >= 0.5) is dropped
    by the merge rule, but its evidence (VLM answer, species) is put on that box: a model box the VLM
-   calls a rock shows it on the Review page.
+   calls a rock shows it on the Review page, and a suppressed / below-threshold / verifier-found box
+   triaged `accept` is accepted on save instead of rejected. A proposal on a *pending* box of another
+   label (and no box of its own label) becomes a **class suggestion** on that box (`auto_label`,
+   `auto_score`, triage `review`; `class_suggestions` in the report) instead of being lost.
+6. **Bulk accept**: frames whose triage alone settles them (`auto=accept`: boxes `accept`, nothing else
+   pending but unconfirmed model hints) can be saved as reviewed in one go from the Review page
+   (`POST /v1/review/accept-auto`, `bulk_accepted: true` in the file); everything else waits for a
+   reviewer.
 
 On Apple silicon everything runs on MPS (float16 for Qwen3-VL); `PYTORCH_ENABLE_MPS_FALLBACK=1` covers
 missing ops.
@@ -458,6 +536,7 @@ blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <e
     [--name n] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
+    [--max-candidates 1500] [--workers 0] [--hwaccel auto|off] \
     [--license "own footage"] --confirm-license [--allow-large] [--keep-work] [--verbose]
 blue-onyx-prism train import --url <video URL> --license "CC BY 4.0" --confirm-license [...]
 blue-onyx-prism train import --dataset meva-sample [...]

@@ -314,6 +314,8 @@ Each decision is saved in `<stem>.labels.json` beside the sidecar. The sidecar i
 - **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
   `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
 - **`model_label`:** the label the model gave, when the reviewer changed it.
+- **`orig_bbox`:** the proposed box before the reviewer moved or resized it (set by the page; checked
+  and clamped like `bbox`, dropped when equal to it).
 - **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
   cannot have accepted or added boxes.
 - **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
@@ -322,6 +324,12 @@ Each decision is saved in `<stem>.labels.json` beside the sidecar. The sidecar i
   detections disagree with the reviewed labels (`"re-label by night-yolo26n: 1 new box, 1 missed"`); the
   file goes back to `unreviewed` and the Review queue lists it first. Cleared when the frame is saved
   as reviewed or skipped.
+- **`auto_run`:** `{"at": "<RFC 3339>", "labeler": "mm-gdino-tiny + rfdetr-large + ..."}`, the last
+  labelers-mode auto-label run that looked at the frame, boxes found or not (a frame with nothing found
+  gets a label file with just this). A later run of the same labelers skips the frame unless its filter
+  has `again=1`. The page round-trips it.
+- **`bulk_accepted`:** `true` when the file was saved by the bulk accept (`POST /v1/review/accept-auto`)
+  rather than by a reviewer looking at the frame. Any other save clears it.
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
   box itself, all optional:
 
@@ -335,8 +343,10 @@ Each decision is saved in `<stem>.labels.json` beside the sidecar. The sidecar i
 
   `agree`: both labelers found it; `triage`: `accept` or `review` with the reasons in `why`;
   `labelers`: each labeler's (or the re-labelling model's) score; `vlm`: the crop check; `species_scores`:
-  SigLIP's probabilities of the animal classes. The page shows them in the box list; they never change
-  what saving does (a pending auto box is accepted on save unless rejected).
+  SigLIP's probabilities of the animal classes; `auto_label` / `auto_score`: a **class suggestion**, the
+  class (and fused score) the auto-labelers give a pending box that is labelled otherwise (triage is then
+  `review`, `why` says `"the auto-labelers say raccoon (0.90); the box says dog"`). The page shows them in
+  the box list. They change what saving does in one case only: see the save rule.
 - **Writes** go through a temporary file and a rename. A newer `version` is refused. Unknown fields are
   ignored.
 
@@ -353,10 +363,12 @@ When a frame is saved as `reviewed`, each `pending` box becomes:
 | A prediction | `accepted` |
 | An `auto` box | `accepted` |
 | A `human` box | `added` |
-| A suppressed, below-threshold or verifier-found box | `rejected` |
+| A suppressed, below-threshold or verifier-found box the auto-labelers confirmed (`triage: accept`, no `auto_label`) | `accepted` |
+| Any other suppressed, below-threshold or verifier-found box | `rejected` |
 
 In short, the reply's boxes are kept unless you reject them. A box the reply did not report must be
-restored explicitly. Restoring a wrongly suppressed person is false-negative evidence for that rule.
+restored explicitly, or confirmed by the auto-labelers. Restoring a wrongly suppressed person is
+false-negative evidence for that rule. The page applies the same rule before you save.
 
 Every accepted or added label must be in `collect.classes`. A box with any other label must be
 relabeled or rejected before the frame can be saved as reviewed.
@@ -374,14 +386,32 @@ of highest IoU at or above 0.5 (any label):
 | A box with another label that is decided (`accepted`, `added` or `rejected`) | The proposal is added as `pending`, as a disagreement. |
 | A box with another label that is still `pending` | The proposal is dropped. |
 
+The auto-labeler (`training::autolabel::triage::apply`) runs two steps before this rule, per proposal,
+against the boxes the file had before: the best box of the same label without auto evidence gets the
+proposal's evidence (then dropped by the rule above); when no box of the same label matches and the best
+box is a `pending` one of another label without auto evidence, that box gets the proposal's evidence as
+a class suggestion (`auto_label`, `auto_score`, triage `review`) and the proposal is dropped.
+
 A `reviewed` or `skipped` file that gains a box goes back to `unreviewed` and keeps its other decisions.
 This is how the self-training loop sends disagreements back to review.
 
 ### Queue
 
 `GET /v1/review/next` lists the frames of `review-queue.jsonl`, or with `source=all` also every indexed
-frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, and `status` (default
-`unreviewed`; also `reviewed`, `skipped`, `any`).
+frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` (default
+`unreviewed`; also `reviewed`, `skipped`, `any`) and `auto`:
+
+| `auto=` | Frames |
+|---|---|
+| `review` | a pending box triaged `review` (auto boxes, annotated model boxes, class suggestions) |
+| `accept` | the auto-labelers' triage alone settles the frame (below) |
+| `nothing` | `auto_run` set and no box carries auto evidence (the labelers found nothing) |
+| `none` | never auto-labelled: no `auto_run` and no auto evidence (frames without a label file too) |
+
+A frame is **accept-ready** (`labels::auto_accept_eligible`) when it is `unreviewed`, not confirmed
+empty, has no `disagreement`, has at least one pending box triaged `accept` without a class suggestion,
+and every other pending box is a suppressed, below-threshold or verifier-found model box without auto
+evidence (rejected on save). A pending prediction the labelers did not confirm keeps the frame out.
 
 **`label`** keeps the frames that have a box of that class. With a label file, these are its boxes
 that are not rejected (accepted, added and pending ones). Without one, they are the sidecar's
@@ -399,8 +429,25 @@ holds `collect.classes`). The auto-label form passes it on like the other filter
 6. newest.
 
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
-The answer also carries the counts: reviewed, remaining, skipped, confirmed empty, rejected boxes, and
-accepted boxes per class. The counts follow every filter except `status`.
+After the last frame it returns the first one again with `"wrapped": true`. The answer also carries the
+counts: reviewed, remaining, skipped, confirmed empty, rejected boxes, accepted boxes per class, and the
+frames to review (`auto_review`) and accept-ready (`auto_accept`) by the `auto` rules. The counts follow
+every filter except `status` and `auto`.
+
+### Saving, revisions and bulk accept
+
+`GET /v1/review/labels` answers the file's `revision`: the first 16 hex digits of the SHA-256 of its
+bytes, `""` when it is not saved yet. `POST /v1/review/labels?frame=...&revision=<rev>` saves only if the
+file is still at that revision (checked and written under one lock, which auto-label runs take too);
+otherwise it answers 409 `{"success": false, "conflict": true, "message": ...}` and writes nothing.
+Without `revision` a save always overwrites (X-AnyLabeling and scripts).
+
+`POST /v1/review/accept-auto` (JSON `{bucket?, scene?, camera?, label?, source?, dry_run, limit?}`, empty =
+any, `limit` 1..20000, default 500) takes the queue with those filters, `status=unreviewed` and
+`auto=accept`. `dry_run` answers `{success, eligible, accepted: 0, frames}` (the first 20). Otherwise
+each frame, re-checked under the lock, is saved as `reviewed` by the save rule with `bulk_accepted:
+true`: `{success, eligible, accepted, failed: ["<frame>: <why>", ...], frames, message}` (at most 20
+listed each).
 
 ### Keyboard
 

@@ -45,7 +45,7 @@
     <td class="model-night"><select data-key="model:night_model:{{ m.key }}" name="night.{{ m.name }}" aria-label="Night model of {{ m.name }}" title="Night / IR frames of {{ m.name }} are answered by this model (falls back to {{ m.name }} while it is not loaded)">
       {% for d in m.night_models %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}>{{ d.label }}</option>{% endfor %}
       </select></td>
-    <td class="running st-{{ m.running_class }}">{{ m.running }}</td>
+    <td class="running st-{{ m.running_class }}"><span class="run-text">{{ m.running }}</span>{% if let Some(d) = m.running_detail %}<details class="run-detail"><summary title="{{ d }}">{{ d }}</summary></details>{% endif %}</td>
     <td class="file"><code title="{{ m.path }}">{{ m.file_name }}</code>{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-export" title="{{ x }}: exported on this machine on request">export it</a>{% else if !m.exists %} <span class="muted">(missing)</span>{% endif %}</td>
     <td class="model-remove-cell"><button type="submit" class="small danger model-remove" form="model-remove" name="name" value="{{ m.name }}" data-confirm="Remove {{ m.name }} from the config? Its files stay; remove them under Resources."{% if m.enabled %} disabled title="Enabled: disable it first (untick Load and save), then remove it"{% else %} title="Remove this entry from the config; its files stay"{% endif %}>Remove</button></td>
   </tr>
@@ -125,47 +125,51 @@
   <p>With <em>auto download</em> on (<a href="#tab-server">Server</a> tab), whatever the config needs is fetched at startup. A new runtime is used after a restart (automatic when a model waits for it). Some models are not downloadable as ONNX (licenses per recipe under <a href="#res-models-export">About exports</a>): use Export in the <a href="#res-models-export">exported models</a> section, or export by hand with <code>scripts/export_model.py --out-dir "{{ models_dir }}"</code> (see the README); other model files show up under <a href="#local-models">Local models</a>. The NVIDIA CUDA/cuDNN libraries (for <code>ort:cuda</code> without a CUDA 12 / cuDNN 9 install) are covered by NVIDIA's license.</p>
   </details>
   {% if !resources_enabled %}<p class="muted">This server has no download manager; use <code>blue-onyx-prism fetch</code>.</p>{% endif %}
+  {% if !resource_groups.is_empty() %}<p class="res-filter-row" hidden><label class="inline-label">Filter <input type="search" id="res-filter" placeholder="name, id or state" autocomplete="off" aria-label="Filter resources"></label> <span id="res-filter-count" class="muted small" role="status"></span></p>{% endif %}
   {% for g in resource_groups %}
-  <h3 id="res-{{ g.key }}">{{ g.title }}</h3>
-  {% if g.key == "models-export" %}<details class="help"><summary>About exports</summary><p>{{ export_notice }} Export makes <code>&lt;name&gt;.onnx</code> + <code>.yaml</code> in <code>{{ models_dir }}</code> (runs on OpenVINO and ONNX Runtime incl. CoreML); the toolchain lives in <code>{{ tools_dir }}</code> (remove it with <em>Remove export toolchain</em>). Nothing is exported automatically. CLI: <code>blue-onyx-prism fetch --resource model:yolo11s --allow-large</code>; by hand: <code>scripts/export_model.py</code>.</p></details>{% endif %}
+  <details class="res-group" id="res-{{ g.key }}" data-group="{{ g.key }}"{% if g.open %} open{% endif %}>
+  <summary><h3>{{ g.title }} <span class="muted small res-count">{{ g.summary }}</span></h3></summary>
+  {% if g.key == "models-export" %}{% if let Some(n) = g.note %}<p class="muted small res-note">{{ n }}</p>{% endif %}<details class="help"><summary>About exports</summary><p>{{ export_notice }} Export makes <code>&lt;name&gt;.onnx</code> + <code>.yaml</code> in <code>{{ models_dir }}</code> (runs on OpenVINO and ONNX Runtime incl. CoreML); the toolchain lives in <code>{{ tools_dir }}</code> (remove it with <em>Remove export toolchain</em>). Nothing is exported automatically. CLI: <code>blue-onyx-prism fetch --resource model:yolo11s --allow-large</code>; by hand: <code>scripts/export_model.py</code>.</p></details>
+  <p class="export-add-row" hidden><label class="check"><input type="checkbox" id="export-add-to-config" checked> Add exported models to the config</label></p>{% endif %}
   <div class="scroll">
   <table class="resources">
+  <colgroup><col><col class="c-size"><col class="c-state"><col class="c-action"></colgroup>
   <thead><tr><th>Resource</th><th>Size</th><th>State</th><th>Action</th></tr></thead>
   <tbody>
   {% for r in g.rows %}
   <tr id="resource-{{ r.id }}" data-id="{{ r.id }}" data-busy="{{ r.busy }}" data-state="{{ r.state }}">
     <td>{{ r.title }} <code>{{ r.id }}</code>{% if let Some(v) = r.update_available %} <span class="tag update" title="Installed in an older version; Update replaces it in place (a loaded runtime is used after a restart)">update to {{ v }}</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% endif %}</span></td>
-    <td class="num">{{ r.size_text }}{% if let Some(n) = r.size_note %}<br><span class="muted">{{ n }}</span>{% else if r.large %}<br><span class="muted">large</span>{% endif %}</td>
+    <td class="num">{{ r.size_text }}{% if let Some(n) = r.size_note %}<br><span class="muted">{{ n }}</span>{% else if r.large && r.action != "export" %}<br><span class="muted">large</span>{% endif %}</td>
     <td class="res-state"><span class="res-text">{{ r.state_text }}</span>{% if r.busy %}<br><progress max="100"{% if let Some(p) = r.progress %} value="{{ p }}"{% endif %}></progress>{% endif %}{% if r.active %} <span class="tag">active</span>{% endif %}{% if r.loaded %} <span class="tag">loaded</span>{% endif %}{% if !r.blocking.is_empty() %}<br><span class="muted">needed by {{ r.blocking.join(", ") }}</span>{% endif %}{% if !r.log.is_empty() %}<details class="res-log"><summary>output</summary><pre>{% for l in r.log %}{{ l }}
 {% endfor %}</pre></details>{% endif %}</td>
-    <td>
+    <td class="res-action">
     {% if r.action == "export" %}
-      {% if r.busy %}<form method="post" action="/v1/resources/export/cancel#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger" data-confirm="Cancel the export of {{ r.title }}?">Cancel</button></form>
+      {% if r.busy %}<form method="post" action="/v1/resources/export/cancel#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger small" data-confirm="Cancel the export of {{ r.title }}?">Cancel</button></form>
       {% else if r.state == "installed" %}
-        {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger" data-confirm="Remove the exported {{ r.title }} files?">Remove</button></form>
+        {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger small" data-confirm="Remove the exported {{ r.title }} files?">Remove</button></form>
         {% else if let Some(why) = r.remove_blocked %}<span class="muted">{{ why }}</span>{% endif %}
-        {% if r.can_add_to_config %}<form method="post" action="/v1/resources/add-to-config#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit">Add to config</button></form>{% endif %}
+        {% if r.can_add_to_config %}<form method="post" action="/v1/resources/add-to-config#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small secondary">Add to config</button></form>{% endif %}
       {% else if resources_enabled %}
         <form method="post" action="/v1/resources/export#resource-{{ r.id }}" class="inline export" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="confirm_large" value="1">
-        <button type="submit"{% if let Some(c) = r.confirm %} data-confirm="{{ c }}"{% endif %}>{% if r.state == "failed" %}Retry export{% else %}Export{% endif %}</button>
-        <label class="check"><input type="checkbox" name="add_to_config" value="1" checked> and add to config</label>
+        <input type="hidden" name="add_to_config" value="1" class="export-add">
+        <button type="submit" class="small{% if r.state != "needs-export" %} secondary{% endif %}"{% if let Some(c) = r.confirm %} data-confirm="{{ c }}"{% endif %}>{% if r.state == "failed" %}Retry export{% else %}Export{% endif %}</button>
         </form>
-        {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger" data-confirm="Remove the leftover {{ r.title }} files?">Remove</button></form>{% endif %}
+        {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger small" data-confirm="Remove the leftover {{ r.title }} files?">Remove</button></form>{% endif %}
       {% endif %}
     {% else if r.action == "toolchain" %}
-      {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger"{% if let Some(c) = r.confirm %} data-confirm="{{ c }}"{% endif %}>Remove export toolchain</button></form>
+      {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger small"{% if let Some(c) = r.confirm %} data-confirm="{{ c }}"{% endif %}>Remove export toolchain</button></form>
       {% else if r.busy %}<span class="muted">in progress</span>
       {% else if let Some(why) = r.remove_blocked %}<span class="muted">{{ why }}</span>{% endif %}
     {% else if r.action == "none" %}<span class="muted">not available here</span>
     {% else if r.state == "installed" %}
-      {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger" data-confirm="Remove {{ r.title }}?">Remove</button></form>
+      {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger small" data-confirm="Remove {{ r.title }}?">Remove</button></form>
       {% else if let Some(why) = r.remove_blocked %}<span class="muted">{{ why }}</span>{% endif %}
-      {% if r.can_add_to_config %}<form method="post" action="/v1/resources/add-to-config#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit">Add to config</button></form>{% endif %}
+      {% if r.can_add_to_config %}<form method="post" action="/v1/resources/add-to-config#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small secondary">Add to config</button></form>{% endif %}
     {% else if r.busy %}<span class="muted">in progress</span>
     {% else if resources_enabled %}
       <form method="post" action="/v1/resources/download#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}">
-      {% if r.large %}<input type="hidden" name="confirm_large" value="1"><button type="submit" data-confirm="{{ r.title }} is {{ r.size_text }} ({{ r.license }}). Download it?">{% if r.update_available.is_some() %}Update{% else %}Download{% endif %} {{ r.size_text }} (large)</button>
-      {% else %}<button type="submit">{% if r.update_available.is_some() %}Update{% else %}Download{% endif %}</button>{% endif %}
+      {% if r.large %}<input type="hidden" name="confirm_large" value="1"><button type="submit" class="small{% if r.state != "needed" %} secondary{% endif %}" data-confirm="{{ r.title }} is {{ r.size_text }} ({{ r.license }}). Download it?">{% if r.update_available.is_some() %}Update{% else %}Download{% endif %} {{ r.size_text }} (large)</button>
+      {% else %}<button type="submit" class="small{% if r.state != "needed" %} secondary{% endif %}">{% if r.update_available.is_some() %}Update{% else %}Download{% endif %}</button>{% endif %}
       </form>
     {% endif %}
     {% if at_row == r.id %}{% call notices("resources-row") %}{% endcall %}{% endif %}
@@ -175,7 +179,9 @@
   </tbody>
   </table>
   </div>
+  </details>
   {% endfor %}
+  <p id="res-filter-none" class="muted" hidden>No resource matches the filter.</p>
 </section>
 </section>
 
@@ -184,23 +190,23 @@
 {% call notices("server") %}{% endcall %}
 <form method="post" action="/config#at-server" class="card" id="server">
   <h2>Server</h2>
-  <p class="muted">Each group says when its settings take effect: <span class="tag now">applies now</span> on save, <span class="tag restart">needs restart</span> after a server restart (the <em>Restart server</em> button), or a restart of the process for the port and the log directory.</p>
+  <p class="muted">Each group (or, where its fields differ, each field) says when a change takes effect: <span class="tag now">applies now</span> on save, <span class="tag restart">needs restart</span> after a server restart (the <em>Restart server</em> button), or a restart of the process for the port and the log directory.</p>
   <input type="hidden" name="access_settings" value="1">
   <input type="hidden" name="download_settings" value="1">
   <input type="hidden" name="inference_settings" value="1">
   <input type="hidden" name="image_settings" value="1">
 
   <fieldset class="group">
-    <legend>Network and access <span class="tag restart">needs restart</span></legend>
-    <label>Port <span class="tag restart">process restart</span> <input type="number" name="port" min="1" max="65535" value="{{ c.port }}" required></label>
-    <label>Bind address <span class="tag restart">process restart</span> <input type="text" name="bind_address" value="{{ c.bind_address }}" placeholder="0.0.0.0" required></label>
-    <label>Request timeout (s) <span class="tag now">applies now</span> <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
-    <label>Worker queue size (0 = auto) <input type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
-    <label class="check"><input type="checkbox" name="allow_remote_admin"{% if c.allow_remote_admin %} checked{% endif %}> Allow remote administration <span class="tag now">applies now</span> <span class="muted">(Config, Test, Logs, Benchmark and resource actions from other machines; off = this machine only)</span></label>
+    <legend>Network and access {{ self.badge("port,bind_address,request_timeout_secs,worker_queue_size,allow_remote_admin")|safe }}</legend>
+    <label>Port {{ self.badge("port")|safe }} <input type="number" name="port" min="1" max="65535" value="{{ c.port }}" required></label>
+    <label>Bind address {{ self.badge("bind_address")|safe }} <input type="text" name="bind_address" value="{{ c.bind_address }}" placeholder="0.0.0.0" required></label>
+    <label>Request timeout (s) {{ self.badge("request_timeout_secs")|safe }} <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
+    <label>Worker queue size (0 = auto) {{ self.badge("worker_queue_size")|safe }} <input type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
+    <label class="check"><input type="checkbox" name="allow_remote_admin"{% if c.allow_remote_admin %} checked{% endif %}> Allow remote administration {{ self.badge("allow_remote_admin")|safe }} <span class="muted">(Config, Test, Logs, Benchmark and resource actions from other machines; off = this machine only)</span></label>
   </fieldset>
 
   <fieldset class="group" id="inference">
-    <legend>Devices <span class="tag restart">needs restart</span></legend>
+    <legend>Devices {{ self.badge("device,gpu_index,intra_threads,cache_dir,force_cpu")|safe }}</legend>
     <label>Device
       <select name="device" id="device"{% if c.force_cpu %} disabled{% endif %}>
       {% for d in device_choices %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}{% if d.disabled %} disabled class="unavailable"{% endif %}>{{ d.label }}</option>{% endfor %}
@@ -209,19 +215,19 @@
     </label>
     <label>GPU index <input type="number" name="gpu_index" min="0" value="{{ c.gpu_index }}" required></label>
     <label>CPU threads (0 = default) <input type="number" name="intra_threads" min="0" value="{{ c.intra_threads }}" required></label>
-    <label>Cache dir (empty disables) <input type="text" name="cache_dir" value="{{ c.cache_dir }}"></label>
+    <label>Cache dir (empty disables) <span class="with-browse"><input type="text" name="cache_dir" value="{{ c.cache_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="cache_dir" data-title="Choose the cache folder" hidden>Browse&hellip;</button></span></label>
     <label class="check"><input type="checkbox" name="force_cpu" id="force-cpu"{% if c.force_cpu %} checked{% endif %}> Force CPU (overrides every device setting)</label>
     <p class="muted">"will download" options are fetched on save (models serve on what they can meanwhile; the server restarts once to load a new runtime when it is installed). Unavailable options are greyed out with the reason. Per-model devices: the Models tab. Live list: <a href="/v1/devices"><code>/v1/devices</code></a>.</p>
   </fieldset>
 
   <fieldset class="group">
-    <legend>Downloads <span class="tag restart">needs restart</span></legend>
+    <legend>Downloads {{ self.badge("auto_download,allow_large_downloads")|safe }}</legend>
     <label class="check"><input type="checkbox" name="auto_download"{% if c.auto_download %} checked{% endif %}> Auto download (missing runtimes and models at startup)</label>
     <label class="check"><input type="checkbox" name="allow_large_downloads"{% if c.allow_large_downloads %} checked{% endif %}> Allow large downloads (over 500 MB, e.g. NVIDIA CUDA libraries)</label>
   </fieldset>
 
   <fieldset class="group">
-    <legend>Detection defaults <span class="tag now">applies now</span></legend>
+    <legend>Detection defaults {{ self.badge("confidence_threshold,nms_iou,object_filter")|safe }}</legend>
     <label>Confidence threshold <input type="number" name="confidence_threshold" min="0" max="1" step="0.01" value="{{ c.confidence_threshold }}" required></label>
     <label>NMS IoU <input type="number" name="nms_iou" min="0" max="1" step="0.01" value="{{ c.nms_iou }}" required></label>
     <label>Object filter (comma separated, empty = all) <input type="text" name="object_filter" value="{{ c.object_filter }}"></label>
@@ -229,7 +235,7 @@
   </fieldset>
 
   <fieldset class="group" id="night">
-    <legend>Night / IR <span class="tag now">applies now</span></legend>
+    <legend>Night / IR {{ self.badge("night_confidence_threshold,night_label_thresholds,person_aspect,suppress_overlaps,static_suppression")|safe }}</legend>
     <input type="hidden" name="night_settings" value="1">
     <label>Night / IR confidence threshold (empty = off) <input type="number" name="night_confidence_threshold" min="0" max="1" step="0.01" value="{{ c.night_confidence_threshold }}" placeholder="off"></label>
     <label>Night / IR person threshold (empty = off) <input type="number" name="night_person_threshold" min="0" max="1" step="0.01" value="{{ c.night_person_threshold }}" placeholder="off"></label>
@@ -241,22 +247,22 @@
   </fieldset>
 
   <fieldset class="group" id="logging">
-    <legend>Logging and images <span class="tag now">applies now</span></legend>
-    <label>Log level
+    <legend>Logging and images {{ self.badge("log_level,log_timezone,log_path,save_image_path,save_image_max_age_days,save_image_max_mb,save_ref_image")|safe }}</legend>
+    <label>Log level {{ self.badge("log_level")|safe }}
       <select name="log_level">
       {% for l in log_levels %}<option value="{{ l.value }}"{% if l.selected %} selected{% endif %}>{{ l.value }}</option>{% endfor %}
       </select>
     </label>
-    <label>Log timestamp time zone <span class="tag now">applies now</span>
+    <label>Log timestamp time zone {{ self.badge("log_timezone")|safe }}
       <select name="log_timezone" title="Other IANA names (America/Los_Angeles) or offsets (+08:00) can be set as log_timezone in the config file">
       {% for t in log_timezones %}<option value="{{ t.value }}"{% if t.selected %} selected{% endif %}>{{ t.label }}</option>{% endfor %}
       </select>
     </label>
-    <label>Log directory (empty = stdout) <span class="tag restart">process restart</span> <input type="text" name="log_path" value="{{ c.log_path }}"></label>
-    <label>Save annotated images to <input type="text" name="save_image_path" value="{{ c.save_image_path }}" placeholder="disabled"></label>
-    <label>Delete saved images older than (days, 0 = keep) <span class="tag now">applies now</span> <input type="number" name="save_image_max_age_days" min="0" max="3650" value="{{ c.save_image_max_age_days }}"></label>
-    <label>Max saved-image folder size (MB, 0 = unlimited) <span class="tag now">applies now</span> <input type="number" name="save_image_max_mb" min="0" max="1000000" value="{{ c.save_image_max_mb }}"></label>
-    <label class="check"><input type="checkbox" name="save_ref_image"{% if c.save_ref_image %} checked{% endif %}> Also save the unannotated image</label>
+    <label>Log directory (empty = stdout) {{ self.badge("log_path")|safe }} <span class="with-browse"><input type="text" name="log_path" value="{{ c.log_path }}"><button type="button" class="browse secondary" data-browse="folder" data-target="log_path" data-title="Choose the log folder" hidden>Browse&hellip;</button></span></label>
+    <label>Save annotated images to {{ self.badge("save_image_path")|safe }} <span class="with-browse"><input type="text" name="save_image_path" value="{{ c.save_image_path }}" placeholder="disabled"><button type="button" class="browse secondary" data-browse="folder" data-target="save_image_path" data-title="Choose the folder for saved images" hidden>Browse&hellip;</button></span></label>
+    <label>Delete saved images older than (days, 0 = keep) {{ self.badge("save_image_max_age_days")|safe }} <input type="number" name="save_image_max_age_days" min="0" max="3650" value="{{ c.save_image_max_age_days }}"></label>
+    <label>Max saved-image folder size (MB, 0 = unlimited) {{ self.badge("save_image_max_mb")|safe }} <input type="number" name="save_image_max_mb" min="0" max="1000000" value="{{ c.save_image_max_mb }}"></label>
+    <label class="check"><input type="checkbox" name="save_ref_image"{% if c.save_ref_image %} checked{% endif %}> Also save the unannotated image {{ self.badge("save_ref_image")|safe }}</label>
     <p class="muted">Recent log lines: <a href="/logs">Logs</a>.</p>
   </fieldset>
 
@@ -275,4 +281,5 @@
   <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
 </dialog>
 <script src="/static/config.js?v={{ version }}"></script>
+<script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

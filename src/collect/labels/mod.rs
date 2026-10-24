@@ -2,9 +2,11 @@
 //! [`LABELS_VERSION`], `docs/DATASET.md` "Review labels"). Pure parts: the pre-fill from the
 //! sidecar ([`prefill`]), the save-time normalisation ([`normalize`]: clamping, pending boxes
 //! resolved, class check) and the merge of later proposals such as auto-labeler boxes
-//! ([`merge_proposals`]). IO: [`Frame::resolve`] (every frame reference goes through
-//! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`] and [`write`]
-//! (atomic). The review queue is in [`queue`], the YOLO / COCO / benchmark exporters in
+//! ([`merge_proposals`]), and whether the auto-labeler's triage alone settles a frame
+//! ([`auto_accept_eligible`]). IO: [`Frame::resolve`] (every frame reference goes through
+//! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
+//! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
+//! review queue is in [`queue`], the YOLO / COCO / benchmark exporters in
 //! [`export`] and the X-AnyLabeling interop in [`xany`].
 
 pub mod export;
@@ -127,6 +129,9 @@ pub struct LabelBox {
     /// The label the model or auto-labeler gave, when the reviewer relabeled the box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_label: Option<String>,
+    /// The proposed box before the reviewer moved or resized it (set by the Review page).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orig_bbox: Option<[f32; 4]>,
     /// What the auto-labeler found out about the box (`agree`, `triage`, `vlm`, ...); empty for
     /// other boxes. Flattened: the keys sit on the box itself.
     #[serde(flatten)]
@@ -177,6 +182,13 @@ pub struct AutoInfo {
     /// SigLIP's zero-shot probabilities of the animal classes on the crop (sum 1).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub species_scores: std::collections::BTreeMap<String, f32>,
+    /// A class suggestion: the class the auto-labelers give this box, which the box itself
+    /// labels otherwise (set on an existing pending box; triage is then `review`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_label: Option<String>,
+    /// The auto-labelers' fused score of `auto_label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_score: Option<f32>,
 }
 
 impl AutoInfo {
@@ -201,10 +213,24 @@ impl LabelBox {
             origin: Some(origin),
             reason,
             model_label: None,
+            orig_bbox: None,
             auto: AutoInfo::default(),
         }
     }
 }
+
+/// The last auto-label run (labelers mode) that looked at a frame, boxes found or not: a later
+/// run with the same labelers skips the frame unless asked to label it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoRun {
+    /// When (UTC, RFC 3339).
+    pub at: String,
+    /// The labelers (`mm-gdino-tiny + rfdetr-large + ...`).
+    pub labeler: String,
+}
+
+/// Longest [`AutoRun`] field.
+pub const MAX_AUTO_RUN_LEN: usize = 200;
 
 /// `<stem>.labels.json` (see the module doc).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -229,6 +255,13 @@ pub struct LabelFile {
     /// when the frame is reviewed or skipped again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disagreement: Option<String>,
+    /// The last auto-label run over the frame (round-tripped by the Review page).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_run: Option<AutoRun>,
+    /// Saved by the bulk accept of auto-labels (`POST /v1/review/accept-auto`), not by a
+    /// reviewer looking at the frame. [`normalize`] clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bulk_accepted: bool,
 }
 
 fn labels_version() -> u32 {
@@ -245,6 +278,8 @@ impl Default for LabelFile {
             reviewed_at: None,
             classes_version: String::new(),
             disagreement: None,
+            auto_run: None,
+            bulk_accepted: false,
         }
     }
 }
@@ -358,16 +393,48 @@ pub fn prefill(rec: &Record) -> LabelFile {
 
 /// What a pending box becomes when its frame is saved as reviewed: a human box is added; a
 /// prediction or an auto-labeler box is accepted (the reviewer rejects false boxes rather than
-/// confirming each true one); a suppressed, below-threshold or verifier-found box is rejected
-/// (it was not reported, so restoring it is an explicit decision).
+/// confirming each true one); a suppressed, below-threshold or verifier-found box is accepted
+/// when the auto-labelers confirmed it (`triage: accept`, no class suggestion), else rejected
+/// (it was not reported, so restoring it is an explicit decision). The Review page mirrors
+/// this rule.
 pub fn resolve_pending(b: &LabelBox) -> BoxState {
     match (b.state, b.source, b.origin) {
         (BoxState::Pending, Source::Human, _) => BoxState::Added,
         (BoxState::Pending, Source::Auto, _) => BoxState::Accepted,
         (BoxState::Pending, Source::Model, Some(Origin::Prediction)) => BoxState::Accepted,
+        (BoxState::Pending, Source::Model, _) if auto_accepted(b) => BoxState::Accepted,
         (BoxState::Pending, Source::Model, _) => BoxState::Rejected,
         (s, _, _) => s,
     }
+}
+
+/// The auto-labelers accept the box as labelled (`triage: accept`, no class suggestion).
+fn auto_accepted(b: &LabelBox) -> bool {
+    b.auto.triage == Some(Triage::Accept) && b.auto.auto_label.is_none()
+}
+
+/// Whether saving `f` as reviewed without looking would only confirm what the auto-labelers
+/// already settled: an unreviewed frame, not confirmed empty, without a re-label
+/// disagreement, with at least one pending box triaged `accept` (no class suggestion) and every
+/// other pending box a model hint the labelers did not confirm (suppressed, below threshold or
+/// verifier-found, no auto evidence: rejected on save). Decided boxes do not matter. Used by the
+/// queue's `auto=accept` filter and the bulk accept.
+pub fn auto_accept_eligible(f: &LabelFile) -> bool {
+    if f.status != Status::Unreviewed || f.empty_confirmed || f.disagreement.is_some() {
+        return false;
+    }
+    let mut any = false;
+    for b in f.boxes.iter().filter(|b| b.state == BoxState::Pending) {
+        if auto_accepted(b) {
+            any = true;
+        } else if !(b.source == Source::Model
+            && b.origin != Some(Origin::Prediction)
+            && b.auto.is_empty())
+        {
+            return false;
+        }
+    }
+    any
 }
 
 fn label_ok(l: &str) -> bool {
@@ -383,6 +450,8 @@ fn label_ok(l: &str) -> bool {
 /// - `reviewed`: pending boxes resolved ([`resolve_pending`]), every training label must be in
 ///   `classes`, and a frame confirmed empty must have none; `reviewed_at` = `now`;
 /// - `skipped`: `reviewed_at` = `now`; `unreviewed`: no `reviewed_at`;
+/// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
+///   (bounded), `bulk_accepted` cleared;
 /// - `version` and `classes_version` set.
 pub fn normalize(
     mut f: LabelFile,
@@ -423,6 +492,13 @@ pub fn normalize(
         }
         check_auto(&b.auto).with_context(|| format!("box {n}"))?;
         b.bbox = clamp_box(b.bbox, w, h);
+        if let Some(o) = b.orig_bbox {
+            if !o.iter().all(|v| v.is_finite()) {
+                bail!("box {n}: the original coordinates are not finite numbers");
+            }
+            let o = clamp_box(o, w, h);
+            b.orig_bbox = (o != b.bbox).then_some(o);
+        }
         if b.bbox[2] - b.bbox[0] < MIN_BOX_PX || b.bbox[3] - b.bbox[1] < MIN_BOX_PX {
             bail!(
                 "box {n} ({}): smaller than {MIN_BOX_PX} px inside the {w}x{h} frame",
@@ -445,6 +521,17 @@ pub fn normalize(
     f.boxes = boxes;
     f.version = LABELS_VERSION;
     f.classes_version = classes_version(classes);
+    f.bulk_accepted = false;
+    if let Some(r) = &f.auto_run
+        && [&r.at, &r.labeler]
+            .iter()
+            .any(|s| s.chars().count() > MAX_AUTO_RUN_LEN || s.chars().any(char::is_control))
+    {
+        bail!(
+            "auto_run: a field is longer than {MAX_AUTO_RUN_LEN} characters or holds control \
+             characters"
+        );
+    }
     match f.status {
         Status::Reviewed => {
             for b in &mut f.boxes {
@@ -509,6 +596,19 @@ fn check_auto(a: &AutoInfo) -> Result<()> {
         && !(short(&v.model) && short(&v.answer) && short(&v.expected))
     {
         bail!("the VLM check has a field longer than {MAX_LABEL_LEN} characters");
+    }
+    if let Some(l) = &a.auto_label
+        && !label_ok(l)
+    {
+        bail!(
+            "auto_label '{}' is not a valid label (1 to {MAX_LABEL_LEN} characters)",
+            l.escape_debug()
+        );
+    }
+    if let Some(s) = a.auto_score
+        && !score_ok(s)
+    {
+        bail!("auto_score {s} is not between 0 and 1");
     }
     Ok(())
 }
@@ -641,18 +741,67 @@ pub fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// The label file at `path`: None when it does not exist; an error when it does not parse or
-/// is of a newer version.
-pub fn read(path: &Path) -> Result<Option<LabelFile>> {
+/// The bytes of the label file at `path` (None when it does not exist; never through a
+/// symlink).
+fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         Ok(m) if !m.file_type().is_file() => bail!("{} is not a regular file", path.display()),
         Ok(_) => {}
     }
-    let bytes = read_capped(path, MAX_LABEL_FILE_BYTES)?;
+    match read_capped(path, MAX_LABEL_FILE_BYTES) {
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        r => r.map(Some),
+    }
+}
+
+/// The revision of file bytes (`""` = no file): the first 16 hex digits of their SHA-256.
+fn revision_of(bytes: Option<&[u8]>) -> String {
+    use sha2::Digest;
+    bytes.map_or_else(String::new, |b| {
+        sha2::Sha256::digest(b)
+            .iter()
+            .take(8)
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    })
+}
+
+/// The revision of the label file at `path`: `""` when it does not exist, else the first 16
+/// hex digits of the SHA-256 of its bytes. A client sends it back with a save
+/// ([`write_checked`]) so a frame changed meanwhile is not overwritten.
+pub fn revision(path: &Path) -> Result<String> {
+    Ok(revision_of(read_bytes(path)?.as_deref()))
+}
+
+/// The label file at `path` and its [`revision`], from one read.
+pub fn read_with_revision(path: &Path) -> Result<(Option<LabelFile>, String)> {
+    let bytes = read_bytes(path)?;
+    let rev = revision_of(bytes.as_deref());
+    match bytes {
+        None => Ok((None, rev)),
+        Some(b) => Ok((Some(parse(path, &b)?), rev)),
+    }
+}
+
+/// The label file at `path`: None when it does not exist; an error when it does not parse or
+/// is of a newer version.
+pub fn read(path: &Path) -> Result<Option<LabelFile>> {
+    match read_bytes(path)? {
+        None => Ok(None),
+        Some(b) => parse(path, &b).map(Some),
+    }
+}
+
+fn parse(path: &Path, bytes: &[u8]) -> Result<LabelFile> {
     let f: LabelFile =
-        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+        serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
     if f.version > LABELS_VERSION {
         bail!(
             "{}: label file version {} is newer than this build understands",
@@ -660,18 +809,54 @@ pub fn read(path: &Path) -> Result<Option<LabelFile>> {
             f.version
         );
     }
-    Ok(Some(f))
+    Ok(f)
 }
 
-/// Serializes label writes within the process (a save and an import of the same frame).
+/// Serializes label writes within the process (a save, an import and an auto-label run of the
+/// same frame). Not reentrant: only [`write`], [`update`] and [`write_checked`] take it.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Write `f` to `path` atomically; the caller holds [`WRITE_LOCK`].
+fn write_locked(path: &Path, f: &LabelFile) -> Result<()> {
+    let mut text = serde_json::to_vec_pretty(f)?;
+    text.push(b'\n');
+    layout::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()))
+}
 
 /// Write `f` to `path` atomically (temporary file + rename).
 pub fn write(path: &Path, f: &LabelFile) -> Result<()> {
-    let mut text = serde_json::to_vec_pretty(f)?;
-    text.push(b'\n');
-    let _held = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    layout::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()))
+    let _held = write_lock();
+    write_locked(path, f)
+}
+
+/// Read-modify-write of the label file at `path` under the write lock: `f` gets the current
+/// file (None when there is none) and returns the file to write (None = leave it). Returns
+/// whether it wrote.
+pub fn update(
+    path: &Path,
+    f: impl FnOnce(Option<LabelFile>) -> Result<Option<LabelFile>>,
+) -> Result<bool> {
+    let _held = write_lock();
+    match f(read(path)?)? {
+        Some(new) => write_locked(path, &new).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+/// Write `f` to `path` only when the file's [`revision`] is still `expected` (the one the
+/// client read; `""` = it did not exist). `Ok(Err(current))` when it changed meanwhile:
+/// nothing is written.
+pub fn write_checked(path: &Path, f: &LabelFile, expected: &str) -> Result<Result<(), String>> {
+    let _held = write_lock();
+    let current = revision(path)?;
+    if current != expected {
+        return Ok(Err(current));
+    }
+    write_locked(path, f).map(Ok)
 }
 
 /// Every label file under `dir` with its frame (`<scene>/<camera>/<date>/<stem>.jpg`), in day
@@ -725,6 +910,7 @@ pub(crate) mod tests_support {
             origin: None,
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: AutoInfo::default(),
         }
     }
@@ -821,6 +1007,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: Default::default(),
         });
         let n = normalize(f.clone(), &classes(), 640, 480, now).unwrap();
@@ -870,6 +1057,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: Default::default(),
         });
         let n = normalize(f, &classes(), 640, 480, "now").unwrap();
@@ -928,6 +1116,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: Default::default(),
         }
     }
@@ -982,6 +1171,8 @@ mod tests {
                 ok: false,
             }),
             species_scores: Default::default(),
+            auto_label: None,
+            auto_score: None,
         };
         let v = serde_json::to_value(&b).unwrap();
         assert_eq!(v["agree"], true);
@@ -1077,6 +1268,220 @@ mod tests {
             std::os::unix::fs::symlink("/etc/hosts", &f.labels).unwrap();
             assert!(Frame::resolve(&dir, &rel).is_none(), "symlinked label file");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pending model box of `origin` with `triage` (and a class suggestion when given).
+    fn hint(origin: Origin, triage: Option<Triage>, suggest: Option<&str>) -> LabelBox {
+        LabelBox {
+            label: "dog".into(),
+            bbox: [100.0, 100.0, 150.0, 140.0],
+            source: Source::Model,
+            score: Some(0.4),
+            state: BoxState::Pending,
+            origin: Some(origin),
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            auto: AutoInfo {
+                triage,
+                auto_label: suggest.map(str::to_string),
+                auto_score: suggest.map(|_| 0.9),
+                ..AutoInfo::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_hint_the_auto_labelers_accept_is_accepted_on_save() {
+        let accept = hint(Origin::Suppressed, Some(Triage::Accept), None);
+        assert_eq!(resolve_pending(&accept), BoxState::Accepted);
+        for o in [Origin::BelowThreshold, Origin::VerifyFound] {
+            assert_eq!(
+                resolve_pending(&hint(o, Some(Triage::Accept), None)),
+                BoxState::Accepted
+            );
+        }
+        // Triaged review, a class suggestion, or no evidence: still a hard negative.
+        for b in [
+            hint(Origin::Suppressed, Some(Triage::Review), None),
+            hint(Origin::Suppressed, Some(Triage::Accept), Some("raccoon")),
+            hint(Origin::Suppressed, None, None),
+            LabelBox {
+                origin: None,
+                ..hint(Origin::Suppressed, None, None)
+            },
+        ] {
+            assert_eq!(resolve_pending(&b), BoxState::Rejected, "{b:?}");
+        }
+        // Decided boxes keep their state.
+        let mut decided = accept;
+        decided.state = BoxState::Rejected;
+        assert_eq!(resolve_pending(&decided), BoxState::Rejected);
+        let mut f = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![
+                hint(Origin::Suppressed, Some(Triage::Accept), None),
+                hint(Origin::BelowThreshold, Some(Triage::Review), None),
+            ],
+            ..LabelFile::default()
+        };
+        f.boxes[1].bbox = [10.0, 10.0, 40.0, 40.0];
+        let n = normalize(f, &classes(), 640, 480, "t").unwrap();
+        assert_eq!(
+            n.boxes.iter().map(|b| b.state).collect::<Vec<_>>(),
+            [BoxState::Accepted, BoxState::Rejected]
+        );
+    }
+
+    #[test]
+    fn auto_accept_needs_accepted_boxes_and_only_unconfirmed_hints_besides() {
+        let mut acc = tests_support::auto_box("car");
+        acc.auto.triage = Some(Triage::Accept);
+        let mut rev = tests_support::auto_box("dog");
+        rev.auto.triage = Some(Triage::Review);
+        let plain_hint = hint(Origin::Suppressed, None, None);
+        let file = |boxes: Vec<LabelBox>| LabelFile {
+            boxes,
+            ..LabelFile::default()
+        };
+        assert!(auto_accept_eligible(&file(vec![acc.clone()])));
+        assert!(auto_accept_eligible(&file(vec![
+            acc.clone(),
+            plain_hint.clone()
+        ])));
+        // A confirmed hint counts as accepted.
+        assert!(auto_accept_eligible(&file(vec![hint(
+            Origin::VerifyFound,
+            Some(Triage::Accept),
+            None
+        )])));
+        assert!(!auto_accept_eligible(&file(vec![])), "nothing to accept");
+        assert!(!auto_accept_eligible(&file(vec![plain_hint.clone()])));
+        assert!(!auto_accept_eligible(&file(vec![acc.clone(), rev.clone()])));
+        // A model prediction without evidence would be accepted unseen: not eligible.
+        let pred = LabelBox {
+            auto: AutoInfo::default(),
+            ..hint(Origin::Prediction, None, None)
+        };
+        assert!(!auto_accept_eligible(&file(vec![acc.clone(), pred])));
+        // A class suggestion is never settled.
+        assert!(!auto_accept_eligible(&file(vec![
+            acc.clone(),
+            hint(Origin::Suppressed, Some(Triage::Accept), Some("cat"))
+        ])));
+        // Decided boxes are ignored.
+        let mut decided = rev;
+        decided.state = BoxState::Rejected;
+        assert!(auto_accept_eligible(&file(vec![acc.clone(), decided])));
+        // File-level conditions.
+        let mut f = file(vec![acc]);
+        f.empty_confirmed = true;
+        assert!(!auto_accept_eligible(&f));
+        f.empty_confirmed = false;
+        f.disagreement = Some("x".into());
+        assert!(!auto_accept_eligible(&f));
+        f.disagreement = None;
+        f.status = Status::Skipped;
+        assert!(!auto_accept_eligible(&f));
+    }
+
+    #[test]
+    fn orig_bbox_auto_run_and_bulk_flag_on_save() {
+        let mut b = tests_support::auto_box("car");
+        b.orig_bbox = Some([-5.0, 10.0, 50.0, 50.0]);
+        b.auto.auto_label = Some("truck".into());
+        b.auto.auto_score = Some(0.8);
+        let mut f = LabelFile {
+            boxes: vec![b],
+            auto_run: Some(AutoRun {
+                at: "2026-10-22T00:00:00Z".into(),
+                labeler: "mm-gdino-tiny + rfdetr-large".into(),
+            }),
+            bulk_accepted: true,
+            ..LabelFile::default()
+        };
+        let n = normalize(f.clone(), &classes(), 640, 480, "t").unwrap();
+        assert_eq!(
+            n.boxes[0].orig_bbox,
+            Some([0.0, 10.0, 50.0, 50.0]),
+            "clamped"
+        );
+        assert_eq!(n.auto_run, f.auto_run, "kept as sent");
+        assert!(!n.bulk_accepted, "only the bulk accept sets it");
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["boxes"][0]["auto_label"], "truck");
+        assert_eq!(v["auto_run"]["labeler"], "mm-gdino-tiny + rfdetr-large");
+        assert!(v.get("bulk_accepted").is_none());
+        assert_eq!(serde_json::from_value::<LabelFile>(v).unwrap(), n);
+        // Equal to the box (after clamping): dropped.
+        f.boxes[0].orig_bbox = Some([10.0, 10.0, 50.0, 50.0]);
+        let n = normalize(f.clone(), &classes(), 640, 480, "t").unwrap();
+        assert_eq!(n.boxes[0].orig_bbox, None);
+        f.boxes[0].orig_bbox = Some([f32::INFINITY, 0.0, 1.0, 1.0]);
+        assert!(normalize(f.clone(), &classes(), 640, 480, "t").is_err());
+        f.boxes[0].orig_bbox = None;
+        f.boxes[0].auto.auto_score = Some(1.5);
+        assert!(normalize(f.clone(), &classes(), 640, 480, "t").is_err());
+        f.boxes[0].auto.auto_score = None;
+        f.boxes[0].auto.auto_label = Some(String::new());
+        assert!(normalize(f.clone(), &classes(), 640, 480, "t").is_err());
+        f.boxes[0].auto.auto_label = None;
+        f.auto_run.as_mut().unwrap().labeler = "x".repeat(201);
+        let e = normalize(f, &classes(), 640, 480, "t").unwrap_err();
+        assert!(e.to_string().contains("auto_run"), "{e}");
+    }
+
+    #[test]
+    fn revisions_update_and_checked_writes() {
+        let dir = std::env::temp_dir().join(format!("bop-labels-rev-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.labels.json");
+        assert_eq!(revision(&p).unwrap(), "");
+        assert_eq!(read_with_revision(&p).unwrap(), (None, String::new()));
+        // A checked write against "no file yet".
+        let f = LabelFile::default();
+        assert_eq!(write_checked(&p, &f, "").unwrap(), Ok(()));
+        let r1 = revision(&p).unwrap();
+        assert_eq!(r1.len(), 16);
+        assert_eq!(
+            read_with_revision(&p).unwrap(),
+            (Some(f.clone()), r1.clone())
+        );
+        // A stale revision writes nothing and names the current one.
+        let g = LabelFile {
+            status: Status::Skipped,
+            ..LabelFile::default()
+        };
+        assert_eq!(write_checked(&p, &g, "").unwrap(), Err(r1.clone()));
+        assert_eq!(read(&p).unwrap(), Some(f));
+        // update: None leaves the file, Some writes it; the revision follows the bytes.
+        assert!(
+            !update(&p, |cur| {
+                assert!(cur.is_some());
+                Ok(None)
+            })
+            .unwrap()
+        );
+        assert_eq!(revision(&p).unwrap(), r1);
+        assert!(update(&p, |_| Ok(Some(g.clone()))).unwrap());
+        let r2 = revision(&p).unwrap();
+        assert_ne!(r1, r2);
+        assert_eq!(
+            write_checked(&p, &LabelFile::default(), &r2).unwrap(),
+            Ok(())
+        );
+        // An error inside update writes nothing.
+        assert!(update(&p, |_| -> Result<Option<LabelFile>> { bail!("no") }).is_err());
+        assert_eq!(revision(&p).unwrap(), r1);
+        let missing = dir.join("b.labels.json");
+        assert!(
+            update(&missing, |cur| {
+                assert!(cur.is_none());
+                Ok(Some(g.clone()))
+            })
+            .unwrap()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

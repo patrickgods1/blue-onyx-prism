@@ -256,8 +256,11 @@ impl TimingCells {
 struct StatsRow {
     name: String,
     is_default: bool,
+    /// Short state ("Ready", "Failed:", "Loading"), as on the Home page.
     state: String,
     state_class: &'static str,
+    /// The failure, download or compile detail under the short state.
+    state_detail: Option<String>,
     device: String,
     provider: String,
     /// "OpenVINO 2026.0.0", "ONNX Runtime 1.24.4"; "-" before the model has loaded.
@@ -317,11 +320,13 @@ pub(super) async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
         .map(|w| {
             let m = &w.metrics;
             let dev = w.device.read().ok().and_then(|d| d.clone());
+            let (state, state_class, state_detail) = state_view(w);
             StatsRow {
                 name: w.name.clone(),
                 is_default: w.name == default,
-                state: state_label(w),
-                state_class: state_view(w).1,
+                state,
+                state_class,
+                state_detail,
                 runtime: runtime_text(reg, &ortv, dev.as_ref()),
                 device: dev
                     .as_ref()
@@ -365,13 +370,17 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
             let stat = |s: &Histogram| {
                 serde_json::json!({ "count": s.count(), "avg": s.avg(), "min": s.min(), "max": s.max() })
             };
+            let (short, class, detail) = state_view(w);
             serde_json::json!({
                 "name": w.name,
                 "default": default.as_deref() == Some(w.name.as_str()),
                 "state": w.state.describe(),
-                "stateDetail": w.state.detail(),
+                // Short state + detail as the pages show them (Home, Stats): the failure,
+                // download or compile detail goes on its own line.
+                "stateShort": short,
+                "stateDetail": detail,
                 "stateText": state_label(w),
-                "stateClass": state_view(w).1,
+                "stateClass": class,
                 "runtime": runtime_text(reg, &ortv, dev.as_ref()),
                 "lazy": w.lazy,
                 "reloads": reg.reloads(&w.name),
@@ -778,6 +787,11 @@ mod tests {
         assert!(stats.contains("class=\"stats sticky-first\""));
         assert!(stats.contains("ipcam-general") && stats.contains("title=\"CPU\""));
         assert!(!stats.contains("<b>evil</b>"));
+        // Short state, the reason on its own line (as on Home).
+        assert!(
+            stats.contains("<td class=\"state\">Failed:<br><span class=\"detail\">"),
+            "{stats}"
+        );
 
         let (s, json) = get_text(&state, "/stats.json").await;
         assert_eq!(s, StatusCode::OK);
@@ -785,6 +799,13 @@ mod tests {
         assert_eq!(v["models"][0]["name"], "ipcam-general");
         assert_eq!(v["models"][0]["default"], true);
         assert_eq!(v["models"][0]["stateClass"], "fail");
+        assert_eq!(v["models"][0]["stateShort"], "Failed:");
+        assert!(
+            v["models"][0]["stateDetail"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty())
+        );
+        assert!(static_file("stats.js").is_some_and(|js| js.contains("m.stateShort")));
         assert_eq!(v["models"][0]["runtime"], "-");
         assert_eq!(v["models"][0]["executionProvider"], "not loaded");
 

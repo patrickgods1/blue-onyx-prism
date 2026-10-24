@@ -233,6 +233,7 @@ pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
                 origin: None,
                 reason: None,
                 model_label: None,
+                orig_bbox: None,
                 auto: Default::default(),
             }),
         }
@@ -385,6 +386,7 @@ mod tests {
             origin: Some(Origin::Prediction),
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: Default::default(),
         }
     }
@@ -495,6 +497,7 @@ mod tests {
             origin: None,
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: Default::default(),
         });
         let reviewed = normalize(reviewed, &classes, 640, 480, "t").unwrap();

@@ -1,72 +1,5 @@
 // Blue Onyx Prism: Config page (served from /static/; no inline scripts under the CSP).
-// Server-side file browser for the Path / Classes inputs (GET /v1/fs/browse).
-(function () {
-  var dlg = document.getElementById("browse-dialog");
-  if (!window.fetch || !dlg || typeof dlg.showModal !== "function") return;
-  var $ = function (id) { return document.getElementById(id); };
-  var list = $("browse-list"), pathEl = $("browse-path"), msg = $("browse-msg"), roots = $("browse-roots");
-  var up = $("browse-up"), use = $("browse-use"), title = $("browse-title");
-  var kind = "model", target = null, cur = null, seq = 0;
-  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
-  function pick(path) {
-    target.value = path;
-    target.dispatchEvent(new Event("input", { bubbles: true }));
-    dlg.close();
-    target.focus();
-  }
-  function render(j) {
-    cur = j;
-    pathEl.textContent = j.path;
-    msg.textContent = j.truncated ? "Only the first entries are shown." : (j.entries.length ? "" : "Nothing to choose here.");
-    up.disabled = !j.parent;
-    up.dataset.path = j.parent || "";
-    roots.textContent = "";
-    var here = el("option", null, "Places\u2026"); here.value = ""; roots.appendChild(here);
-    j.roots.forEach(function (r) { var o = el("option", null, r.label + "  " + r.path); o.value = r.path; roots.appendChild(o); });
-    roots.value = "";
-    use.hidden = kind !== "model";
-    list.textContent = "";
-    var sel = null;
-    j.entries.forEach(function (e) {
-      var b = el("button", "browse-item" + (e.dir ? " dir" : " file"));
-      b.type = "button";
-      b.appendChild(el("span", "browse-name", (e.dir ? "\uD83D\uDCC1 " : "") + e.name));
-      b.appendChild(el("span", "browse-size", e.dir ? "" : e.sizeText));
-      if (!e.dir && j.selected === e.name) { b.classList.add("selected"); sel = b; }
-      b.addEventListener("click", function () { if (e.dir) go(e.path, false); else pick(e.path); });
-      list.appendChild(b);
-    });
-    if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: "nearest" });
-  }
-  function go(path, retry) {
-    var n = ++seq;
-    var url = "/v1/fs/browse?kind=" + encodeURIComponent(kind) + (path ? "&path=" + encodeURIComponent(path) : "");
-    fetch(url, { headers: { Accept: "application/json" } }).then(function (r) {
-      return r.json().then(function (j) { return { status: r.status, body: j }; });
-    }).then(function (res) {
-      if (n !== seq) return;
-      if (res.status === 200) { render(res.body); if (retry) msg.textContent = retry; return; }
-      var m = (res.body && res.body.message) || "Cannot list that folder.";
-      if (res.status === 404 && path) { go("", m); return; }
-      msg.textContent = m;
-    }).catch(function () { if (n === seq) msg.textContent = "Cannot reach the server."; });
-  }
-  document.querySelectorAll("button.browse").forEach(function (b) {
-    b.hidden = false;
-    b.addEventListener("click", function () {
-      kind = b.dataset.browse === "classes" ? "classes" : "model";
-      target = b.form.elements[b.dataset.target];
-      title.textContent = kind === "classes" ? "Choose a classes YAML" : "Choose a model file or folder";
-      list.textContent = ""; msg.textContent = "Loading\u2026";
-      dlg.showModal();
-      go(target.value.trim(), "");
-    });
-  });
-  roots.addEventListener("change", function () { if (roots.value) go(roots.value, false); });
-  up.addEventListener("click", function () { if (up.dataset.path) go(up.dataset.path, false); });
-  use.addEventListener("click", function () { if (cur) pick(cur.path); });
-  $("browse-cancel").addEventListener("click", function () { dlg.close(); });
-})();
+// The Browse... buttons (model, classes, folders) are wired by /static/browse.js.
 // Confirmation for large downloads and removals (without JS the button label shows the size).
 // Delegated: the Resources section is re-rendered in place.
 document.addEventListener("click", function (e) {
@@ -197,7 +130,12 @@ document.addEventListener("click", function (e) {
       var thr = tr.querySelector("input[type=number]");
       upd(thr, fmtThr(m.threshold));
       thr.placeholder = j.globalThreshold.toFixed(2);
-      var run = tr.querySelector("td.running"); run.textContent = m.running.text; run.className = "running st-" + m.running.stateClass;
+      var run = tr.querySelector("td.running"); run.className = "running st-" + m.running.stateClass;
+      // "Failed" and its reason on one truncated line (opens to the full text; kept open across refreshes).
+      var fail = m.running.stateClass === "fail" && m.running.detail ? m.running.detail : null, old = run.querySelector("details.run-detail");
+      var keepOpen = !!(old && old.open && fail && old.querySelector("summary").textContent === fail);
+      run.replaceChildren(el("span", "run-text", m.running.text));
+      if (fail) { var dt = el("details", "run-detail"), sm = el("summary", null, fail); sm.title = fail; dt.appendChild(sm); dt.open = keepOpen; run.appendChild(dt); }
       var badge = tr.querySelector(".pending-badge"); badge.hidden = !m.restartNeeded; badge.title = m.reasons.join("; ");
       tr.classList.toggle("pending", m.restartNeeded);
       var bh = tr.querySelector(".bench-hint"); bh.replaceChildren();
@@ -346,4 +284,71 @@ document.addEventListener("click", function (e) {
     if (by && by.name) data.append(by.name, by.value);
     send(form, data, by);
   });
+})();
+// Resources: groups are <details> (open when a row needs attention); a filter box hides the
+// rows that do not match and opens the groups with hits; the export group's one "Add exported
+// models to the config" box sets every export form's add_to_config on submit. The section is
+// re-rendered in place (above), so the filter text and the box are kept here and re-applied.
+(function () {
+  var box = document.getElementById("resources");
+  if (!box) return;
+  var query = "", addExport = true;
+  function groups() { return box.querySelectorAll("details.res-group"); }
+  function apply() {
+    var terms = query.toLowerCase().split(/\s+/).filter(Boolean), total = 0;
+    groups().forEach(function (g) {
+      var hits = 0;
+      g.querySelectorAll("table.resources tbody tr").forEach(function (tr) {
+        var text = tr.textContent.toLowerCase();
+        var ok = terms.every(function (t) { return text.indexOf(t) >= 0; });
+        tr.hidden = !ok; if (ok) hits++;
+      });
+      total += hits;
+      if (terms.length) {
+        if (g.dataset.wasOpen === undefined) g.dataset.wasOpen = g.open ? "1" : "";
+        g.hidden = !hits; if (hits) g.open = true;
+      } else {
+        g.hidden = false;
+        if (g.dataset.wasOpen !== undefined) { g.open = !!g.dataset.wasOpen; delete g.dataset.wasOpen; }
+      }
+    });
+    var count = document.getElementById("res-filter-count"), none = document.getElementById("res-filter-none");
+    if (count) count.textContent = terms.length ? total + (total === 1 ? " match" : " matches") : "";
+    if (none) none.hidden = !terms.length || total > 0;
+  }
+  function wire() {
+    var f = document.getElementById("res-filter"), cb = document.getElementById("export-add-to-config");
+    if (f) { f.closest(".res-filter-row").hidden = false; if (f.value !== query) f.value = query; }
+    if (cb) { cb.closest(".export-add-row").hidden = false; cb.checked = addExport; }
+    if (query) apply();
+  }
+  box.addEventListener("input", function (e) {
+    if (e.target && e.target.id === "res-filter") { query = e.target.value; apply(); }
+  });
+  box.addEventListener("change", function (e) {
+    if (e.target && e.target.id === "export-add-to-config") addExport = e.target.checked;
+  });
+  // Capture phase: before the data-ajax handler builds the request from the form.
+  document.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (!form.matches || !form.matches("form.export")) return;
+    var add = form.querySelector("input.export-add");
+    if (add) add.value = addExport ? "1" : "0";
+  }, true);
+  if (window.MutationObserver) new MutationObserver(function (list) {
+    if (list.some(function (m) { return m.target === box; })) wire();
+  }).observe(box, {childList: true});
+  // A link or #fragment to a row or group inside a closed group opens it.
+  function reveal(hash) {
+    var id = hash && hash.charAt(0) === "#" ? decodeURIComponent(hash.slice(1)) : "";
+    var t = id && document.getElementById(id);
+    for (var d = t && t.closest("details"); d; d = d.parentElement && d.parentElement.closest("details")) d.open = true;
+  }
+  document.addEventListener("click", function (e) {
+    var a = e.target.closest && e.target.closest('a[href^="#"]');
+    if (a) reveal(a.getAttribute("href"));
+  });
+  window.addEventListener("hashchange", function () { reveal(location.hash); });
+  reveal(location.hash);
+  wire();
 })();

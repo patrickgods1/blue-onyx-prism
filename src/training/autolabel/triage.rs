@@ -1,7 +1,8 @@
 //! The service's half of auto-labelling (pure): the proposals `scripts/autolabel.py` returns
 //! ([`FrameProposals`]), the triage rule ([`triage`]), proposals to pending `source: auto` label
 //! boxes ([`to_boxes`]) and their merge into a label file ([`apply`]: evidence on boxes it
-//! confirms, then [`merge_proposals`]); and for the self-training loop, the disagreement of a
+//! confirms, class suggestions on pending boxes it labels otherwise, then [`merge_proposals`]);
+//! and for the self-training loop, the disagreement of a
 //! trained model's detections with the reviewed labels ([`disagreement`]).
 
 use super::Category;
@@ -157,6 +158,7 @@ pub fn to_boxes(
                     labelers.keys().cloned().collect::<Vec<_>>().join(" + ")
                 )),
                 model_label: None,
+                orig_bbox: None,
                 auto: AutoInfo {
                     agree: Some(p.agree),
                     triage: Some(t),
@@ -174,33 +176,92 @@ pub fn to_boxes(
                         .filter(|(_, s)| s.is_finite())
                         .map(|(k, s)| (k.clone(), round(s.clamp(0.0, 1.0), 1e4)))
                         .collect(),
+                    auto_label: None,
+                    auto_score: None,
                 },
             })
         })
         .collect()
 }
 
-/// Merge `boxes` into `f`: first, an existing box of the same label at IoU >= [`MATCH_IOU`]
-/// without auto-labeler evidence gets the proposal's (its state and decision unchanged: a model
-/// box the VLM calls a rock shows that on the Review page); then [`merge_proposals`] adds the
-/// rest by its rule. Returns the merge report and how many boxes got evidence.
-pub fn apply(f: &mut LabelFile, boxes: Vec<LabelBox>) -> (MergeReport, usize) {
-    let mut annotated = 0;
-    for p in &boxes {
-        let best = f
-            .boxes
-            .iter_mut()
-            .filter(|b| b.label == p.label && b.auto.is_empty())
-            .map(|b| (iou(&b.bbox, &p.bbox), b))
-            .filter(|(v, _)| *v >= MATCH_IOU)
-            .max_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, b)| b);
-        if let Some(b) = best {
-            b.auto = p.auto.clone();
-            annotated += 1;
-        }
+/// What [`apply`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    pub merge: MergeReport,
+    /// Existing boxes of the proposal's label that got its evidence.
+    pub annotated: usize,
+    /// Pending boxes of another label that got the proposal's class as a suggestion.
+    pub class_suggestions: usize,
+}
+
+/// Merge `boxes` into `f`. Per proposal, against the existing (pre-merge) boxes at IoU >=
+/// [`MATCH_IOU`]:
+///
+/// - the best one of the same label without auto-labeler evidence gets the proposal's (its
+///   state and decision unchanged: a model box the VLM calls a rock shows that on the Review
+///   page); [`merge_proposals`] then drops the proposal;
+/// - when no box of the same label matches and the best box is a pending one of another label
+///   without evidence, it gets the proposal's evidence as a class suggestion (`auto_label`,
+///   `auto_score`, triage `review`, a reason) and the proposal is dropped (no duplicate box);
+/// - everything else goes to [`merge_proposals`] by its rule.
+pub fn apply(f: &mut LabelFile, boxes: Vec<LabelBox>) -> ApplyReport {
+    /// Index of the existing box (the first `existing`) of highest IoU >= [`MATCH_IOU`] with
+    /// `p` among those `keep` accepts.
+    fn best(
+        f: &LabelFile,
+        existing: usize,
+        p: &LabelBox,
+        keep: impl Fn(&LabelBox) -> bool,
+    ) -> Option<usize> {
+        f.boxes
+            .iter()
+            .take(existing)
+            .enumerate()
+            .map(|(i, b)| (i, iou(&b.bbox, &p.bbox), b))
+            .filter(|(_, v, b)| *v >= MATCH_IOU && keep(b))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _, _)| i)
     }
-    (merge_proposals(f, boxes), annotated)
+    let existing = f.boxes.len();
+    let mut r = ApplyReport::default();
+    let mut rest = Vec::with_capacity(boxes.len());
+    for p in boxes {
+        let same_label = |b: &LabelBox| b.label == p.label;
+        if let Some(i) = best(f, existing, &p, |b| same_label(b) && b.auto.is_empty())
+            && let Some(b) = f.boxes.get_mut(i)
+        {
+            b.auto = p.auto.clone();
+            r.annotated += 1;
+            rest.push(p);
+            continue;
+        }
+        let suggest = if best(f, existing, &p, same_label).is_none() {
+            best(f, existing, &p, |_| true).filter(|i| {
+                f.boxes
+                    .get(*i)
+                    .is_some_and(|b| b.state == BoxState::Pending && b.auto.is_empty())
+            })
+        } else {
+            None
+        };
+        if let Some(b) = suggest.and_then(|i| f.boxes.get_mut(i)) {
+            let mut auto = p.auto.clone();
+            auto.triage = Some(Triage::Review);
+            let score = p.score.map(|s| format!(" ({s:.2})")).unwrap_or_default();
+            auto.why.push(format!(
+                "the auto-labelers say {}{score}; the box says {}",
+                p.label, b.label
+            ));
+            auto.auto_label = Some(p.label.clone());
+            auto.auto_score = p.score;
+            b.auto = auto;
+            r.class_suggestions += 1;
+            continue;
+        }
+        rest.push(p);
+    }
+    r.merge = merge_proposals(f, rest);
+    r
 }
 
 /// One detection of a trained model.
@@ -295,7 +356,7 @@ pub fn apply_relabel(
     h: u32,
 ) -> (MergeReport, Option<String>) {
     let why = disagreement(f, dets, model);
-    let (rep, _) = apply(f, model_boxes(dets, model, classes, w, h));
+    let rep = apply(f, model_boxes(dets, model, classes, w, h)).merge;
     if let Some(w) = &why {
         f.status = Status::Unreviewed;
         f.disagreement = Some(w.clone());
@@ -409,6 +470,7 @@ mod tests {
             origin: Some(labels::Origin::Prediction),
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: AutoInfo::default(),
         };
         let mut f = LabelFile {
@@ -425,14 +487,161 @@ mod tests {
         let mut dog = p("dog", 0.8, true);
         dog.bbox = [200.0, 200.0, 260.0, 260.0];
         let boxes = to_boxes(&[person, dog], &classes(), "day", 640, 480, ACCEPT_SCORE);
-        let (rep, annotated) = apply(&mut f, boxes);
-        assert_eq!((rep.added, rep.dropped, annotated), (1, 1, 1));
+        let rep = apply(&mut f, boxes);
+        assert_eq!(
+            (rep.merge.added, rep.merge.dropped, rep.annotated),
+            (1, 1, 1)
+        );
+        assert_eq!(rep.class_suggestions, 0);
         // The model's person box keeps its source and state, and shows the VLM's objection.
         assert_eq!(f.boxes[0].source, Source::Model);
         assert_eq!(f.boxes[0].state, BoxState::Pending);
         assert_eq!(f.boxes[0].auto.vlm.as_ref().unwrap().answer, "statue");
         assert_eq!(f.boxes[1].label, "dog");
         assert_eq!(f.boxes[1].source, Source::Auto);
+    }
+
+    /// A pending model box (`origin`) at the proposals' place.
+    fn model_box(label: &str, origin: labels::Origin, state: BoxState) -> LabelBox {
+        LabelBox {
+            label: label.into(),
+            bbox: [10.0, 10.0, 60.0, 90.0],
+            source: Source::Model,
+            score: Some(0.55),
+            state,
+            origin: Some(origin),
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            auto: AutoInfo::default(),
+        }
+    }
+
+    #[test]
+    fn a_proposal_of_another_class_on_a_pending_box_becomes_a_class_suggestion() {
+        let mut f = LabelFile {
+            boxes: vec![model_box(
+                "dog",
+                labels::Origin::Prediction,
+                BoxState::Pending,
+            )],
+            ..LabelFile::default()
+        };
+        let mut raccoon = p("raccoon", 0.9, true);
+        raccoon.bbox = [11.0, 10.0, 60.0, 90.0];
+        let boxes = to_boxes(
+            &[raccoon.clone()],
+            &classes(),
+            "day",
+            640,
+            480,
+            ACCEPT_SCORE,
+        );
+        assert_eq!(boxes[0].auto.triage, Some(Triage::Accept));
+        let rep = apply(&mut f, boxes.clone());
+        assert_eq!(
+            (
+                rep.class_suggestions,
+                rep.annotated,
+                rep.merge.added,
+                rep.merge.dropped
+            ),
+            (1, 0, 0, 0)
+        );
+        assert_eq!(f.boxes.len(), 1, "no duplicate box");
+        let b = &f.boxes[0];
+        assert_eq!(
+            (b.label.as_str(), b.source, b.state),
+            ("dog", Source::Model, BoxState::Pending)
+        );
+        assert_eq!(b.auto.auto_label.as_deref(), Some("raccoon"));
+        assert_eq!(b.auto.auto_score, Some(0.9));
+        assert_eq!(b.auto.triage, Some(Triage::Review), "forced to review");
+        assert_eq!(b.auto.agree, Some(true));
+        assert_eq!(
+            b.auto.why.last().map(String::as_str),
+            Some("the auto-labelers say raccoon (0.90); the box says dog")
+        );
+        // On save the dog prediction is still accepted as a dog; the reviewer relabels it.
+        assert_eq!(labels::resolve_pending(b), BoxState::Accepted);
+        // A second run: the box has evidence now, the proposal is dropped as covered.
+        let rep = apply(&mut f, boxes.clone());
+        assert_eq!((rep.class_suggestions, rep.merge.dropped), (0, 1));
+        assert_eq!(f.boxes.len(), 1);
+        // A decided box of another label: a disagreement box is added, the box is untouched.
+        let mut g = LabelFile {
+            boxes: vec![model_box(
+                "dog",
+                labels::Origin::Prediction,
+                BoxState::Accepted,
+            )],
+            ..LabelFile::default()
+        };
+        let rep = apply(&mut g, boxes.clone());
+        assert_eq!((rep.class_suggestions, rep.merge.added), (0, 1));
+        assert!(g.boxes[0].auto.is_empty());
+        // A box of the proposal's own label also matches: that one is annotated instead.
+        let mut h = LabelFile {
+            boxes: vec![
+                model_box("dog", labels::Origin::Prediction, BoxState::Pending),
+                LabelBox {
+                    bbox: [12.0, 10.0, 60.0, 92.0],
+                    ..model_box("raccoon", labels::Origin::Suppressed, BoxState::Pending)
+                },
+            ],
+            ..LabelFile::default()
+        };
+        let rep = apply(&mut h, boxes);
+        assert_eq!((rep.class_suggestions, rep.annotated), (0, 1));
+        assert!(h.boxes[0].auto.is_empty());
+        assert_eq!(h.boxes[1].auto.triage, Some(Triage::Accept));
+    }
+
+    #[test]
+    fn evidence_on_a_suppressed_box_of_the_same_class_accepts_it_on_save() {
+        let mut f = LabelFile {
+            boxes: vec![model_box(
+                "car",
+                labels::Origin::Suppressed,
+                BoxState::Pending,
+            )],
+            ..LabelFile::default()
+        };
+        let boxes = to_boxes(
+            &[p("car", 0.8, true)],
+            &classes(),
+            "day",
+            640,
+            480,
+            ACCEPT_SCORE,
+        );
+        let rep = apply(&mut f, boxes);
+        assert_eq!((rep.annotated, rep.merge.added), (1, 0));
+        assert_eq!(f.boxes[0].auto.triage, Some(Triage::Accept));
+        assert_eq!(labels::resolve_pending(&f.boxes[0]), BoxState::Accepted);
+        assert!(labels::auto_accept_eligible(&f));
+        // Triaged review (a single labeler): still rejected on save.
+        let mut g = LabelFile {
+            boxes: vec![model_box(
+                "car",
+                labels::Origin::BelowThreshold,
+                BoxState::Pending,
+            )],
+            ..LabelFile::default()
+        };
+        apply(
+            &mut g,
+            to_boxes(
+                &[p("car", 0.4, false)],
+                &classes(),
+                "day",
+                640,
+                480,
+                ACCEPT_SCORE,
+            ),
+        );
+        assert_eq!(g.boxes[0].auto.triage, Some(Triage::Review));
+        assert_eq!(labels::resolve_pending(&g.boxes[0]), BoxState::Rejected);
     }
 
     fn reviewed() -> LabelFile {
@@ -445,6 +654,7 @@ mod tests {
             origin: Some(labels::Origin::Prediction),
             reason: None,
             model_label: None,
+            orig_bbox: None,
             auto: AutoInfo::default(),
         };
         LabelFile {

@@ -59,8 +59,7 @@
         {% if d.folder %} <button type="button" class="small danger" data-remove-folder="{{ d.value }}">Remove</button>{% endif %}</span>
       </label>
       {% endfor %}
-      <label>Add a folder on the server (images, optional COCO JSON / YOLO labels / manifest.json)
-        <input type="text" id="add-folder" placeholder="/path/to/BlueIris/Alerts"></label>
+      <label>Add a folder on the server <span class="with-browse"><input type="text" id="add-folder" placeholder="/path/to/BlueIris/Alerts"><button type="button" class="browse secondary" data-browse="folder" data-target="add-folder" data-title="Choose an image folder" hidden>Browse&hellip;</button></span><span class="muted small">Images, optional COCO JSON / YOLO labels / manifest.json.</span></label>
       <details class="help"><summary>About datasets</summary><p>Selected datasets that are not downloaded are fetched when the run starts (pinned, SHA-256 checked). A folder without ground truth is scored against the reference model.</p></details>
     </fieldset>
     <fieldset>
@@ -78,17 +77,15 @@
     <fieldset>
       <legend>Devices</legend>
       {% for d in devices %}
-      <label class="check{% if !d.runnable %} unavailable{% endif %}"><input type="checkbox" name="device" value="{{ d.spec }}"{% if d.checked %} checked{% endif %}{% if !d.runnable %} disabled{% endif %}> <code>{{ d.spec }}</code> <span class="muted">{{ d.label }}{% if let Some(r) = d.reason %} &middot; {{ r }}{% endif %}</span></label>
+      <label class="check{% if !d.runnable %} unavailable{% endif %}"><input type="checkbox" name="device" value="{{ d.spec }}"{% if d.checked %} checked{% endif %}{% if !d.runnable %} disabled{% endif %}> <code class="nowrap">{{ d.spec }}</code> <span class="muted">{{ d.label }}{% if let Some(r) = d.reason %} &middot; {{ r }}{% endif %}</span></label>
       {% endfor %}
     </fieldset>
-    <fieldset>
+    <fieldset class="bench-settings">
       <legend>Settings</legend>
-      <label>Images per dataset (0 = all) <input type="number" name="max_images" min="0" value="{{ max_images }}"></label>
-      <p class="field-hint">Small sets give noisy accuracy: aim for 200+ labelled objects (a few hundred images) before trusting a difference.</p>
-      <label>Timed runs per image <input type="number" name="repeat" min="1" max="1000" value="{{ repeat }}"></label>
-      <p class="field-hint">More timed runs give steadier speeds (3 or more); accuracy does not change.</p>
+      <label>Images per dataset (0 = all) <input type="number" name="max_images" min="0" value="{{ max_images }}"><span class="field-hint">Small sets give noisy accuracy: aim for 200+ labelled objects (a few hundred images) before trusting a difference.</span></label>
+      <label>Timed runs per image <input type="number" name="repeat" min="1" max="1000" value="{{ repeat }}"><span class="field-hint">More timed runs give steadier speeds (3 or more); accuracy does not change.</span></label>
       <label>Warm-up runs <input type="number" name="warmup" min="0" max="100" value="{{ warmup }}"></label>
-      <label><input type="hidden" name="low_priority" value="0"><input type="checkbox" name="low_priority" value="1"{% if low_priority %} checked{% endif %}> Run at low priority (keeps the desktop responsive)</label>
+      <input type="hidden" name="low_priority" value="0"><label class="check"><input type="checkbox" name="low_priority" value="1"{% if low_priority %} checked{% endif %}> Run at low priority (keeps the desktop responsive)</label>
       <label>Accuracy weight of the overall grade (0..1, speed gets the rest) <input type="number" name="accuracy_weight" min="0" max="1" step="0.05" value="{{ accuracy_weight }}"></label>
       <label>Best confidence threshold optimizes
         <select name="threshold_objective">
@@ -169,9 +166,21 @@
   <button type="button" id="drill-close">Close</button></div>
   <div id="drill-body" class="thumbs"></div></dialog>
 
+<dialog id="browse-dialog">
+  <h3 id="browse-title">Choose a folder</h3>
+  <div class="browse-bar">
+    <select id="browse-roots" aria-label="Places"></select>
+    <button type="button" id="browse-up" class="small">Up</button>
+  </div>
+  <div id="browse-path" class="browse-path"></div>
+  <div id="browse-list" class="browse-list"></div>
+  <p id="browse-msg" class="muted" role="status"></p>
+  <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
+</dialog>
 <script src="/static/bench-glossary.js?v={{ version }}"></script>
 <script src="/static/bench-table.js?v={{ version }}"></script>
 <script src="/static/bench-charts.js?v={{ version }}"></script>
 <script src="/static/bench-compare.js?v={{ version }}"></script>
 <script src="/static/benchmark.js?v={{ version }}"></script>
+<script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

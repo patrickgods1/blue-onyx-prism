@@ -6,7 +6,15 @@
 //! data root, the models and download directories, the user's home and, on Windows, the
 //! drives), so the unauthenticated page discloses as little as possible (SV-10). A path is
 //! canonicalized first, so a symlink that leaves every root is refused like any other outside
-//! path; [`allowed_path`] is the same check for "Add a model by path".
+//! path.
+//!
+//! [`allowed_path`] is the check for the paths the forms submit ("Add a model by path", the
+//! footage import): inside a root as above, or a path the native file dialog of
+//! [`super::pick`] returned in the last hour, or anything under it (canonicalized too, so a
+//! symlink out of a picked folder is still refused). A pick is trusted because the person at
+//! the server's own screen chose it, in a dialog only a loopback peer can open; that lets a
+//! folder on another volume or share be used without widening the roots. The listing itself
+//! ([`list`]) never trusts picks: it stays inside the roots (SV-10 unchanged).
 
 use super::AppState;
 use crate::config::Config;
@@ -217,16 +225,47 @@ fn inside_any(p: &Path, roots: &[(String, PathBuf)], cfg: &Config) -> bool {
     roots.iter().any(|(_, r)| p.starts_with(display(r))) || p.starts_with(display(&cfg.data_root()))
 }
 
+/// The rest of a UNC path (`\\\\server\\share...` or `//server/share...`) after its leading
+/// separators; `None` for anything else, including the verbatim (`\\\\?\\`) and device
+/// (`\\\\.\\`) namespaces.
+fn unc_rest(raw: &str) -> Option<&str> {
+    let rest = raw.strip_prefix(r"\\").or_else(|| raw.strip_prefix("//"))?;
+    let mut chars = rest.chars();
+    let first = chars.next()?;
+    let second = chars.next();
+    if matches!(first, '?' | '.') && matches!(second, None | Some('\\' | '/')) {
+        return None;
+    }
+    if matches!(first, '\\' | '/') {
+        return None;
+    }
+    Some(rest)
+}
+
 /// The canonical path of `raw` (quotes trimmed; relative to the data root) when it exists
-/// and lies inside one of [`roots`]; 400 for bad syntax, 404 when it does not exist inside a
-/// root, 403 otherwise (including a symlink whose target leaves every root). Error messages
-/// repeat what the client sent, not the resolved path.
+/// and lies inside one of [`roots`] or, for the forms, is covered by a native pick
+/// ([`super::pick::picked_covers`]; a picked UNC share passes the syntax check too); 400 for
+/// bad syntax, 404 when it does not exist inside a root or pick, 403 otherwise (including a
+/// symlink whose target leaves every root and pick). Error messages repeat what the client
+/// sent, not the resolved path.
 pub(super) fn allowed_path(cfg: &Config, raw: &str) -> Result<PathBuf, BrowseError> {
+    resolve(cfg, raw, true)
+}
+
+/// [`allowed_path`], trusting native picks only when `trust_picked` (never for [`list`]).
+fn resolve(cfg: &Config, raw: &str, trust_picked: bool) -> Result<PathBuf, BrowseError> {
     let raw = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-    crate::config::check_path_syntax("path", raw).map_err(|e| BrowseError {
-        status: StatusCode::BAD_REQUEST,
-        message: e.to_string(),
-    })?;
+    let picked = |p: &Path| trust_picked && super::pick::picked_covers(p);
+    crate::config::check_path_syntax("path", raw)
+        .or_else(|e| match unc_rest(raw) {
+            // A share the person at the server's screen picked: the other checks still apply.
+            Some(rest) if picked(Path::new(raw)) => crate::config::check_path_syntax("path", rest),
+            _ => Err(e),
+        })
+        .map_err(|e| BrowseError {
+            status: StatusCode::BAD_REQUEST,
+            message: e.to_string(),
+        })?;
     let roots = roots(cfg);
     let start = cfg.data_path(Path::new(raw));
     let outside = || BrowseError {
@@ -240,11 +279,11 @@ pub(super) fn allowed_path(cfg: &Config, raw: &str) -> Result<PathBuf, BrowseErr
                 .join(", ")
         ),
     };
-    if !inside_any(&start, &roots, cfg) {
+    if !inside_any(&start, &roots, cfg) && !picked(&start) {
         return Err(outside());
     }
     let canon = start.canonicalize().map_err(|e| io_error(raw, &e))?;
-    if !inside_any(&canon, &roots, cfg) {
+    if !inside_any(&canon, &roots, cfg) && !picked(&canon) {
         return Err(outside());
     }
     Ok(canon)
@@ -288,7 +327,7 @@ pub(super) fn list(
             .canonicalize()
             .map_err(|e| io_error(&display(&start), &e))?
     } else {
-        allowed_path(cfg, raw)?
+        resolve(cfg, raw, false)?
     };
     let (dir, selected) = if canon.is_dir() {
         (canon, None)
@@ -574,6 +613,90 @@ mod tests {
         assert!(inside_any(Path::new(r"\\?\C:\data\m"), &roots, &cfg));
         assert!(!inside_any(Path::new(r"C:\rootx"), &roots, &cfg));
         assert!(!inside_any(Path::new(r"D:\root\x"), &roots, &cfg));
+    }
+
+    /// A folder outside every root (another volume, in real use) is refused until the native
+    /// dialog returns it; then it and its children are accepted by the forms' check, but the
+    /// page still cannot list it, and a symlink out of it is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn natively_picked_paths_are_trusted_by_the_forms_only() {
+        let (root, cfg) = setup();
+        let other = std::env::temp_dir().join(format!("bop-browse-pick-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(other.join("clips")).unwrap();
+        std::fs::write(other.join("clips/m.onnx"), b"x").unwrap();
+        let sibling = PathBuf::from(format!("{}-2", other.display()));
+        std::fs::create_dir_all(&sibling).unwrap();
+        let outside = std::env::temp_dir().join(format!("bop-browse-esc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, other.join("escape")).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+
+        let e = allowed_path(&cfg, &s(&other)).unwrap_err();
+        assert_eq!(e.status, StatusCode::FORBIDDEN, "{}", e.message);
+        let e = allowed_path(&cfg, &s(&other.join("nope"))).unwrap_err();
+        assert_eq!(e.status, StatusCode::FORBIDDEN, "no probing before a pick");
+
+        super::super::pick::record_pick(&s(&other));
+        let canon = other.canonicalize().unwrap();
+        assert_eq!(allowed_path(&cfg, &s(&other)).unwrap(), canon);
+        assert_eq!(
+            allowed_path(&cfg, &format!("\"{}\"", s(&other.join("clips/m.onnx")))).unwrap(),
+            canon.join("clips/m.onnx")
+        );
+        assert_eq!(
+            allowed_path(&cfg, &s(&canon.join("clips"))).unwrap(),
+            canon.join("clips")
+        );
+        assert_eq!(
+            allowed_path(&cfg, &s(&other.join("nope")))
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        for p in [
+            sibling.clone(),
+            other.parent().unwrap().to_path_buf(),
+            other.join("escape"),
+        ] {
+            let e = allowed_path(&cfg, &s(&p)).unwrap_err();
+            assert_eq!(
+                e.status,
+                StatusCode::FORBIDDEN,
+                "{}: {}",
+                p.display(),
+                e.message
+            );
+        }
+        // The page's listing keeps the roots rule.
+        let e = list(&cfg, Some(&s(&other)), Some("folder")).unwrap_err();
+        assert_eq!(e.status, StatusCode::FORBIDDEN);
+        for d in [&root, &other, &sibling, &outside] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn unc_rest_takes_shares_only() {
+        assert_eq!(unc_rest(r"\\nas\clips"), Some(r"nas\clips"));
+        assert_eq!(unc_rest("//nas/clips"), Some("nas/clips"));
+        for raw in [
+            r"\\?\C:\x",
+            r"\\.\pipe\x",
+            "//?/C:/x",
+            r"\\\x",
+            "/x",
+            r"C:\x",
+            r"\\",
+        ] {
+            assert_eq!(unc_rest(raw), None, "{raw}");
+        }
+        // An unpicked share is still refused by the syntax check.
+        let (root, cfg) = setup();
+        let e = allowed_path(&cfg, r"\\nas-never-picked\share\m.onnx").unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert!(e.message.contains("UNC"), "{}", e.message);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

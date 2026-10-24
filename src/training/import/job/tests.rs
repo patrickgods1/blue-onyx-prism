@@ -10,7 +10,7 @@ use crate::resources::export::{Cmd, CommandRunner, Fetcher};
 use crate::training::capability::{self, Capability};
 use crate::training::import::{ImportRequest, plan_import};
 use crate::training::service::{RunState, TrainingService};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 struct Tmp(PathBuf);
@@ -63,6 +63,18 @@ struct ImportFake {
     /// Every frame of a video is the same picture (dedup test).
     duplicates: bool,
     cmds: Mutex<Vec<Cmd>>,
+    /// Extractions running now and at most at once.
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    /// How long an extraction of `v<k>.mp4` takes: `(slow - k) * delay_ms` (later videos first).
+    delay_ms: u64,
+    slow: u64,
+    /// An extraction of a video whose path contains this fails.
+    fail_on: Option<&'static str>,
+    /// Once this many extractions run at once, set the cancel flag (and wait for it).
+    cancel_at: usize,
+    /// Every extraction reports `capped` (it stopped at its `--max-frames`).
+    capped: bool,
 }
 
 impl ImportFake {
@@ -73,6 +85,55 @@ impl ImportFake {
             gray,
             ..Default::default()
         }
+    }
+
+    /// The fake `import_footage.py extract`.
+    fn extract(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+        let video = arg_after(cmd, "--video").unwrap();
+        if self.cancel_at > 0 {
+            let t = std::time::Instant::now();
+            while self.active.load(Ordering::SeqCst) < self.cancel_at
+                && t.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if self.delay_ms > 0 {
+            let k: u64 = video
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.trim_start_matches('v').parse().ok())
+                .unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(
+                self.slow.saturating_sub(k) * self.delay_ms,
+            ));
+        }
+        crate::training::pyenv::check(cancel)?;
+        if let Some(bad) = self.fail_on
+            && video.to_string_lossy().contains(bad)
+        {
+            on_line("[import_footage] error: cannot open the video");
+            bail!("the helper failed (exit 1)");
+        }
+        let out = arg_after(cmd, "--out").unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        on_line(r#"@import {"event":"start","decoder":"hw:videotoolbox"}"#);
+        for i in 0..self.frames {
+            let name = format!("f_{i:06}.jpg");
+            let pat = if self.duplicates { 0 } else { i };
+            std::fs::write(out.join(&name), jpeg(pat, i < self.gray)).unwrap();
+            on_line(&format!(
+                "@import {{\"event\":\"frame\",\"file\":\"{name}\",\"t\":{}.5,\"w\":48,\"h\":32}}",
+                i * 10
+            ));
+        }
+        on_line("[import_footage] some log line");
+        on_line(&format!(
+            "@import {{\"event\":\"done\",\"frames\":{},\"capped\":{}}}",
+            self.frames, self.capped
+        ));
+        Ok(())
     }
 
     fn script_cmds(&self, sub: &str) -> Vec<Cmd> {
@@ -98,22 +159,11 @@ impl CommandRunner for ImportFake {
                 r#"@import {"event":"self_check","av":"18.1.0","yt_dlp":"2026.08.19","ffmpeg_license":"LGPL version 3 or later"}"#,
             );
         } else if cmd.args.iter().any(|a| a == "extract") {
-            let out = arg_after(cmd, "--out").unwrap();
-            std::fs::create_dir_all(&out).unwrap();
-            for i in 0..self.frames {
-                let name = format!("f_{i:06}.jpg");
-                let pat = if self.duplicates { 0 } else { i };
-                std::fs::write(out.join(&name), jpeg(pat, i < self.gray)).unwrap();
-                on_line(&format!(
-                    "@import {{\"event\":\"frame\",\"file\":\"{name}\",\"t\":{}.5,\"w\":48,\"h\":32}}",
-                    i * 10
-                ));
-            }
-            on_line("[import_footage] some log line");
-            on_line(&format!(
-                "@import {{\"event\":\"done\",\"frames\":{},\"capped\":false}}",
-                self.frames
-            ));
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let r = self.extract(cmd, on_line, cancel);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            r?;
         } else if cmd.args.iter().any(|a| a == "fetch-url") {
             let out = arg_after(cmd, "--out").unwrap();
             std::fs::create_dir_all(&out).unwrap();
@@ -469,4 +519,216 @@ fn imports_run_on_the_training_queue_and_can_be_cancelled_while_queued() {
     assert!(svc.remove(&id).is_ok());
     assert!(svc.tasks().is_empty());
     svc.shutdown();
+}
+
+/// `n` empty video files `v0.mp4`.. in `dir` (one camera: `import`).
+fn videos(dir: &Path, n: usize) {
+    std::fs::create_dir_all(dir).unwrap();
+    for k in 0..n {
+        std::fs::write(dir.join(format!("v{k}.mp4")), b"v").unwrap();
+    }
+}
+
+fn path_request(p: PathBuf) -> ImportRequest {
+    let mut req = ImportRequest::new(ImportSource::Path(p));
+    req.license_confirmed = true;
+    req.selection = Selection::Dhash;
+    req
+}
+
+#[test]
+fn videos_are_extracted_in_parallel_and_reassembled_in_video_order() {
+    let t = tmp("parallel");
+    let root = &t.0;
+    videos(&root.join("clips"), 6);
+    let mut req = path_request(root.join("clips"));
+    req.workers = 3;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    // Every video has the same two pictures at the same times: duplicates across videos, and
+    // the dedup keeps the first video's. v0 is the slowest, so it finishes last.
+    let mut fake = ImportFake::new(2, 0);
+    fake.delay_ms = 25;
+    fake.slow = 6;
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    let peak = fake.peak.load(Ordering::SeqCst);
+    assert!(peak > 1 && peak <= 3, "peak {peak}");
+    assert_eq!(rep["videos"], 6);
+    assert_eq!(rep["candidates"], 12);
+    assert_eq!(rep["unique"], 2, "{rep}");
+    let recs = records(&root.join("dataset"));
+    assert_eq!(recs.len(), 2);
+    for rec in &recs {
+        let p = rec.provenance.as_ref().unwrap().path.clone().unwrap();
+        assert!(
+            p.ends_with("v0.mp4"),
+            "the first video's frames are kept: {p}"
+        );
+    }
+    // Each video got its quota and the decoder choice.
+    let ex = fake.script_cmds("extract");
+    assert_eq!(ex.len(), 6);
+    for c in &ex {
+        assert_eq!(arg_after(c, "--max-frames").unwrap(), PathBuf::from("1500"));
+        assert_eq!(arg_after(c, "--hwaccel").unwrap(), PathBuf::from("auto"));
+    }
+}
+
+#[test]
+fn each_video_gets_its_share_of_the_budget_as_max_frames() {
+    let t = tmp("quota");
+    let root = &t.0;
+    let clips = root.join("clips");
+    std::fs::create_dir_all(&clips).unwrap();
+    for f in [
+        "Drive.20240101_010101.mp4",
+        "Porch.20240101_010101.mp4",
+        "Porch.20240101_020202.mp4",
+        "Porch.20240101_030303.mp4",
+    ] {
+        std::fs::write(clips.join(f), b"v").unwrap();
+    }
+    for i in 0..2 {
+        std::fs::write(
+            clips.join(format!("Gate.2024010{i}_120000.jpg")),
+            jpeg(i, false),
+        )
+        .unwrap();
+    }
+    let mut req = path_request(clips.clone());
+    req.max_candidates = MAX_CANDIDATES_TOTAL;
+    req.hwaccel = super::super::HwAccel::Off;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let fake = ImportFake::new(1, 0);
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    assert_eq!(rep["images"], 2);
+    // Drive, Porch and the images share 20 000 fairly: the images take their 2, the two
+    // cameras 9 999 each, Porch's split by its three videos.
+    let quota = |name: &str| -> String {
+        let c = fake
+            .script_cmds("extract")
+            .into_iter()
+            .find(|c| arg_after(c, "--video").unwrap().ends_with(name))
+            .unwrap();
+        assert_eq!(arg_after(&c, "--hwaccel").unwrap(), PathBuf::from("off"));
+        arg_after(&c, "--max-frames")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(quota("Drive.20240101_010101.mp4"), "9999");
+    for f in [
+        "Porch.20240101_010101.mp4",
+        "Porch.20240101_020202.mp4",
+        "Porch.20240101_030303.mp4",
+    ] {
+        assert_eq!(quota(f), "3333");
+    }
+    assert_eq!(
+        rep["candidates"],
+        4 + 2,
+        "one frame per video and the images"
+    );
+}
+
+#[test]
+fn a_video_that_fails_is_a_warning() {
+    let t = tmp("fail");
+    let root = &t.0;
+    videos(&root.join("clips"), 2);
+    std::fs::write(root.join("clips/bad.mp4"), b"v").unwrap();
+    let mut req = path_request(root.join("clips"));
+    req.workers = 2;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(2, 0);
+    fake.fail_on = Some("bad.mp4");
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    assert_eq!(rep["candidates"], 4, "{rep}");
+    let w: Vec<&str> = rep["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        w.iter().any(|w| w.starts_with("bad.mp4: not read")),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn videos_stopped_at_their_share_are_one_warning() {
+    let t = tmp("capped");
+    let root = &t.0;
+    videos(&root.join("clips"), 3);
+    let mut req = path_request(root.join("clips"));
+    req.workers = 2;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(2, 0);
+    fake.capped = true;
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    let w: Vec<&str> = rep["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let stopped: Vec<&&str> = w.iter().filter(|w| w.contains("stopped at")).collect();
+    assert_eq!(stopped.len(), 1, "{w:?}");
+    assert!(
+        stopped[0].starts_with("3 of 3 videos stopped at their share (1,500 frames each)"),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn the_capped_warning_names_counts_and_the_quota_range() {
+    assert_eq!(capped_warning(&[], 5, 1500), None);
+    let one = capped_warning(&[9999], 1, 1500).unwrap();
+    assert!(
+        one.starts_with(
+            "1 of 1 video stopped at their share (9,999 frames each); the rest of that video"
+        ),
+        "{one}"
+    );
+    let range = capped_warning(&[3333, 9999, 3333], 40, 10_000).unwrap();
+    assert!(
+        range.starts_with(
+            "3 of 40 videos stopped at their share (3,333-9,999 frames); the rest of those videos"
+        ),
+        "{range}"
+    );
+    assert!(
+        range.ends_with("at most 20,000 candidate frames, at most 10,000 per video)"),
+        "{range}"
+    );
+}
+
+#[test]
+fn a_cancel_stops_every_extraction() {
+    let t = tmp("cancel");
+    let root = &t.0;
+    videos(&root.join("clips"), 8);
+    let mut req = path_request(root.join("clips"));
+    req.workers = 2;
+    req.keep_work = false;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(2, 0);
+    fake.cancel_at = 2;
+    let (r, _) = run(&job, &fake);
+    let e = r.unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::resources::export::Cancelled>()
+            .is_some(),
+        "{e:#}"
+    );
+    assert_eq!(
+        fake.script_cmds("extract").len(),
+        2,
+        "no video started after the cancel"
+    );
+    assert!(!root.join("dataset/imports.jsonl").exists());
 }

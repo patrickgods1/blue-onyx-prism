@@ -31,7 +31,14 @@
           name.appendChild(document.createTextNode(" ")); name.appendChild(t);
         }
         tr.appendChild(name);
-        tr.appendChild(td(m.stateText));
+        // Short state, then the failure / download / compile detail on its own line (as Home).
+        var st = td(m.stateShort || m.stateText, "state");
+        if (m.stateShort && m.stateDetail) {
+          var d = document.createElement("span");
+          d.className = "detail"; d.textContent = m.stateDetail;
+          st.appendChild(document.createElement("br")); st.appendChild(d);
+        }
+        tr.appendChild(st);
         tr.appendChild(td(m.runtime));
         tr.appendChild(td(m.executionProvider, "trunc", m.device || m.requestedDevice));
         tr.appendChild(td(m.fellBack === null || m.fellBack === undefined ? "-" : (m.fellBack ? "yes" : "no")));

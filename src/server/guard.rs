@@ -91,11 +91,20 @@ fn normalize_authority(auth: &str, scheme: &str) -> String {
     }
 }
 
+/// Whether the browser marked the request `Sec-Fetch-Site: cross-site` (also used by GET
+/// routes whose answer leaks something or whose work is costly, such as the import preview).
+pub(crate) fn fetch_site_cross(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("cross-site"))
+}
+
 /// The cross-site decision for the request headers of a state-changing request (see the
 /// module doc). `Ok` passes.
 pub(crate) fn cross_site(headers: &HeaderMap) -> Result<(), CrossSite> {
     let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    if text("sec-fetch-site").is_some_and(|v| v.trim().eq_ignore_ascii_case("cross-site")) {
+    if fetch_site_cross(headers) {
         return Err(CrossSite::FetchSite);
     }
     let Some(host) = text("host").map(str::trim).filter(|h| !h.is_empty()) else {
