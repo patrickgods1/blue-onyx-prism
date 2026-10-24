@@ -175,9 +175,18 @@ pub struct ImportArgs {
     /// Confirm that you may use the footage for training under that licence.
     #[arg(long, alias = "confirm-licence")]
     pub confirm_license: bool,
-    /// Most frames extracted from one video before the selection.
+    /// Most frames extracted from one video before the selection (the 20,000 candidate frames
+    /// of an import are shared fairly by the cameras, their videos and the images; this caps one
+    /// video's share).
     #[arg(long, default_value_t = super::import::DEFAULT_MAX_CANDIDATES)]
     pub max_candidates: usize,
+    /// Videos extracted at the same time (0 = half the physical cores, 1 to 4).
+    #[arg(long, default_value_t = 0)]
+    pub workers: usize,
+    /// Hardware video decoding: auto (VideoToolbox, D3D11VA, CUDA or VAAPI when PyAV's FFmpeg
+    /// has it; software when not or when it fails) or off.
+    #[arg(long, default_value = "auto", value_parser = parse_hwaccel)]
+    pub hwaccel: super::import::HwAccel,
     /// Allow downloads over 500 MB (the training environment, SigLIP 2).
     #[arg(long)]
     pub allow_large: bool,
@@ -226,6 +235,10 @@ pub struct AutolabelArgs {
     pub verbose: bool,
 }
 
+fn parse_hwaccel(s: &str) -> Result<super::import::HwAccel, String> {
+    super::import::HwAccel::parse(s).ok_or_else(|| format!("'{s}' is not auto or off"))
+}
+
 fn parse_selection(s: &str) -> Result<super::import::Selection, String> {
     super::import::Selection::parse(s).ok_or_else(|| format!("'{s}' is not siglip or dhash"))
 }
@@ -253,6 +266,8 @@ pub fn import_request(a: &ImportArgs) -> Result<Option<super::import::ImportRequ
     r.license = a.license.clone();
     r.license_confirmed = a.confirm_license;
     r.max_candidates = a.max_candidates;
+    r.workers = a.workers;
+    r.hwaccel = a.hwaccel;
     r.allow_large = a.allow_large;
     r.keep_work = a.keep_work;
     r.validate()?;
@@ -960,6 +975,34 @@ mod tests {
         assert_eq!(r.selection, super::super::import::Selection::Dhash);
         assert!(r.license_confirmed);
         assert_eq!(r.license.as_deref(), Some("CC BY 4.0"));
+        assert_eq!(
+            (r.workers, r.hwaccel),
+            (0, super::super::import::HwAccel::Auto)
+        );
+        let TrainCommand::Import(w) = parse(&[
+            "import",
+            "--path",
+            "clips",
+            "--workers",
+            "2",
+            "--hwaccel",
+            "off",
+        ])
+        .unwrap() else {
+            panic!("not import")
+        };
+        let w = import_request(&w).unwrap().unwrap();
+        assert_eq!(
+            (w.workers, w.hwaccel),
+            (2, super::super::import::HwAccel::Off)
+        );
+        assert!(parse(&["import", "--path", "a", "--hwaccel", "cuda"]).is_err());
+        let TrainCommand::Import(many) =
+            parse(&["import", "--path", "a", "--workers", "99"]).unwrap()
+        else {
+            panic!("not import")
+        };
+        assert!(import_request(&many).is_err(), "at most 16 workers");
         assert!(parse(&["import"]).is_err(), "a source is required");
         assert!(
             parse(&["import", "--path", "a", "--url", "https://x/y"]).is_err(),

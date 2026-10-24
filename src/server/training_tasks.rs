@@ -1,5 +1,7 @@
 //! The Training page's footage import and auto-label forms (`POST /training/import`,
-//! `POST /training/autolabel`, also posted by the Review page) and the rows of their jobs.
+//! `POST /training/autolabel`, also posted by the Review page), the import preview
+//! (`GET /v1/training/import/preview`, the line under the path field) and the rows of their
+//! jobs.
 //! Both are planned like the CLI does ([`crate::training::import::plan_import`],
 //! [`crate::training::autolabel::plan_autolabel`]) and queued on the page's training queue
 //! (one GPU job at a time with the training runs). Admin only, like every training route. The
@@ -16,7 +18,7 @@ use crate::training::import::{ImportRequest, ImportSource, Selection};
 use crate::training::service::RunState;
 use crate::training::task::{TaskKind, TaskRecord};
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use std::path::PathBuf;
@@ -136,6 +138,9 @@ pub(crate) fn import_from_form(f: &[(String, String)]) -> anyhow::Result<ImportR
     if let Some(s) = field(f, "select") {
         r.selection = Selection::parse(s)
             .ok_or_else(|| anyhow::anyhow!("selection: '{s}' is not siglip or dhash"))?;
+    }
+    if let Some(n) = num(f, "max_candidates", "max candidates per video")? {
+        r.max_candidates = n;
     }
     r.balance = field(f, "no_balance").is_none();
     r.license = field(f, "license").map(str::to_string);
@@ -258,6 +263,51 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
     .await
 }
 
+/// `GET /v1/training/import/preview?path=<p>[&camera=<c>][&max_candidates=<n>]`: what an import
+/// of `path` would read ([`crate::training::import::preview::Preview`] plus `success` and the
+/// resolved `path`); a missing path, one outside the browsable (or natively picked) folders or
+/// nothing importable there is also 200, `{success: false, message}` (the page previews while the
+/// path is typed, so these are not request errors). The path
+/// goes through the same check as the import itself ([`super::browse::allowed_path`]).
+pub(super) async fn import_preview(
+    State(shared): State<Shared>,
+    Query(q): Query<Vec<(String, String)>>,
+) -> Response {
+    blocking(move || {
+        let state = shared.current();
+        let config = state.config_read().clone();
+        // A path being typed is not an error: 200 with success false and the reason.
+        let fail = |message: String| {
+            Json(serde_json::json!({"success": false, "message": message})).into_response()
+        };
+        let Some(raw) = field(&q, "path") else {
+            return fail("give a file or folder path".into());
+        };
+        let path = match super::browse::allowed_path(&config, raw) {
+            Ok(p) => p,
+            Err(e) => {
+                return fail(e.into_parts().1);
+            }
+        };
+        let per_video = match num::<usize>(&q, "max_candidates", "max candidates per video") {
+            Ok(n) => n.unwrap_or(0),
+            Err(e) => return fail(e.to_string()),
+        };
+        match crate::training::import::preview::preview(&path, field(&q, "camera"), per_video) {
+            Ok(p) => {
+                let mut v = serde_json::to_value(&p).unwrap_or_default();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("success".into(), true.into());
+                    o.insert("path".into(), path.display().to_string().into());
+                }
+                Json(v).into_response()
+            }
+            Err(e) => fail(format!("{e:#}")),
+        }
+    })
+    .await
+}
+
 /// Whether the client asks for JSON (`Accept` names `application/json`).
 fn wants_json(headers: &HeaderMap) -> bool {
     headers
@@ -352,6 +402,16 @@ mod tests {
         );
         assert!(r.license_confirmed && !r.allow_large);
         assert_eq!((r.frames, r.selection), (50, Selection::Dhash));
+        assert_eq!(
+            r.max_candidates,
+            crate::training::import::DEFAULT_MAX_CANDIDATES
+        );
+        let r = import_from_form(&form(&[("path", "clips"), ("max_candidates", "300")])).unwrap();
+        assert_eq!(r.max_candidates, 300);
+        let e = import_from_form(&form(&[("path", "x"), ("max_candidates", "0")])).unwrap_err();
+        assert!(e.to_string().contains("max candidates"), "{e}");
+        let e = import_from_form(&form(&[("path", "x"), ("max_candidates", "x")])).unwrap_err();
+        assert!(e.to_string().contains("max candidates per video"), "{e}");
         let e = import_from_form(&form(&[("source", "path")])).unwrap_err();
         assert!(e.to_string().contains("give a path"), "{e}");
         let e = import_from_form(&form(&[("path", "x"), ("frames", "many")])).unwrap_err();
@@ -484,6 +544,46 @@ mod tests {
         assert!(page.contains("Auto-label"), "the auto-label card");
         assert!(page.contains("meva-sample"));
         assert!(page.contains("/static/browse.js"));
+        assert!(page.contains("import-preview"), "the preview line");
+        // The preview of the folder: counts, the per-video budget and the summary line.
+        std::fs::write(root.join("snaps/Drive.20240101_120000.mp4"), b"v").unwrap();
+        let q = super::super::encode_uri_component(&root.join("snaps").display().to_string());
+        let (s, json) = get_text(
+            &state,
+            &format!("/v1/training/import/preview?path={q}&max_candidates=300"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["success"], true);
+        assert_eq!(
+            (v["videos"].as_u64(), v["images"].as_u64()),
+            (Some(1), Some(1))
+        );
+        assert_eq!(v["cameras"][0]["camera"], "drive");
+        assert_eq!(v["per_video"], 300);
+        assert!(
+            v["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("1 video from 1 camera, 1 image ("),
+            "{v}"
+        );
+        std::fs::remove_file(root.join("snaps/Drive.20240101_120000.mp4")).unwrap();
+        // Outside the browsable folders, no path, a bad number: refused with a message.
+        let (s, json) = get_text(&state, "/v1/training/import/preview?path=%2Fetc").await;
+        assert_eq!(s, StatusCode::OK, "{json}");
+        assert!(json.contains("\"success\":false"), "{json}");
+        let (s, json) = get_text(&state, "/v1/training/import/preview").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(json.contains("give a file or folder path"), "{json}");
+        let (s, json) = get_text(
+            &state,
+            &format!("/v1/training/import/preview?path={q}&max_candidates=x"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(json.contains("\"success\":false"), "{json}");
         // A denylisted URL is refused with the reason.
         let (_, _, b) = call(
             &state,

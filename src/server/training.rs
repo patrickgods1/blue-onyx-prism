@@ -1183,7 +1183,10 @@ mod tests {
         .await;
         let html = String::from_utf8(b).unwrap();
         assert!(!html.contains("Not saved"), "{html}");
-        assert_eq!(state.config_read().training.datasets, std::slice::from_ref(&export));
+        assert_eq!(
+            state.config_read().training.datasets,
+            std::slice::from_ref(&export)
+        );
         assert!(html.contains("formaction=\"/training/datasets\" formnovalidate name=\"remove\""));
         let (_, _, _) = call(
             &state,

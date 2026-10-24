@@ -90,6 +90,7 @@
     <div class="tr-field" data-source="path">
       <label for="import-path">Video, image or folder</label>
       <div class="with-browse tr-browse"><input type="text" id="import-path" name="path" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Video file&hellip;</button><button type="button" class="browse secondary" data-browse="folder" data-target="path" hidden>Folder&hellip;</button></div>
+      <p class="muted small" id="import-preview" aria-live="polite" hidden></p>
       <p class="muted small">Blue Iris clip and alert folders work. <code>.bvr</code> clips cannot be read: export them to MP4 in Blue Iris first.</p>
     </div>
     <div class="tr-field" data-source="url">
@@ -139,6 +140,11 @@
           <label for="import-every">One frame every (s)</label>
           <input type="number" id="import-every" name="every" min="0" max="3600" step="1" value="10">
           <p class="muted small">Also a periodic frame when nothing moves; 0 = off.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-max-candidates">Candidates per video</label>
+          <input type="number" id="import-max-candidates" name="max_candidates" min="1" max="20000" step="1" placeholder="1500">
+          <p class="muted small">At most this many frames read from one video; the 20,000 of an import are shared fairly by cameras, videos and images.</p>
         </div>
         <div class="tr-field">
           <label for="import-camera">Camera folder</label>

@@ -2,10 +2,13 @@
 //! [`Task`]): check the source -> set up the training environment (when videos, a URL or the
 //! SigLIP selection need it) -> download (the URL with yt-dlp, pinned footage and the SigLIP 2
 //! checkpoint through the download manager) -> extract frames (`import_footage.py extract`, one
-//! run per video) -> analyse (decode, dHash, scene, dedup; in Rust) -> select (SigLIP embeddings
+//! run per video, several at a time, each video's share of the candidate budget as its
+//! `--max-frames`) -> analyse (decode, dHash, scene on all cores but one, then the dedup; in
+//! Rust) -> select (SigLIP embeddings
 //! from `import_footage.py embed`, k-center per scene) -> write (the dataset layout, the review
 //! queue, `imports.jsonl`).
 
+use super::parallel;
 use super::select;
 use super::source::{self, ImportSource};
 use super::write::{self, ImportLine};
@@ -13,6 +16,7 @@ use super::{ImportRequest, MAX_CANDIDATES_TOTAL, MAX_URL_BYTES, Selection};
 use crate::collect::record::Provenance;
 use crate::image_stats::ImageStats;
 use crate::resources::catalog::{self, Platform, Resource};
+use crate::resources::export::CommandRunner;
 use crate::resources::export::train::TrainPaths;
 use crate::training::capability::Accelerator;
 use crate::training::pyenv::{self, check, stage};
@@ -77,6 +81,17 @@ struct Video {
     camera: String,
     base: SystemTime,
     kind: &'static str,
+}
+
+/// What one extraction found.
+#[derive(Debug, Default)]
+struct Extracted {
+    /// Frame files (in the video's output folder) and their time in seconds.
+    found: Vec<(String, f64)>,
+    /// Stopped at its `--max-frames`.
+    capped: bool,
+    /// `hw:<type>` or `sw` (the helper's `start` event; `sw` after a hardware fallback).
+    decoder: Option<String>,
 }
 
 /// The report of a finished import.
@@ -170,6 +185,78 @@ impl ImportJob {
         }
     }
 
+    /// Extract the frames of `video` into `out` (`import_footage.py extract`), at most `quota`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the per-video inputs of one helper run"
+    )]
+    fn extract_one(
+        &self,
+        runner: &dyn CommandRunner,
+        script: &OsString,
+        expr: &str,
+        video: &Path,
+        out: &Path,
+        quota: usize,
+        line: &mut dyn FnMut(&str),
+        cancel: &AtomicBool,
+    ) -> Result<Extracted> {
+        let mut ex = Extracted::default();
+        let text = |ev: &serde_json::Value, k: &str| {
+            ev.get(k)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        pyenv::run_script(
+            runner,
+            &self.paths,
+            self.platform,
+            &self.work,
+            self.timeout,
+            vec![
+                script.clone(),
+                "extract".into(),
+                "--video".into(),
+                video.as_os_str().to_owned(),
+                "--out".into(),
+                out.as_os_str().to_owned(),
+                "--select".into(),
+                expr.into(),
+                "--max-frames".into(),
+                quota.to_string().into(),
+                "--hwaccel".into(),
+                self.request.hwaccel.as_str().into(),
+            ],
+            "import",
+            &mut |ev, _| match ev.get("event").and_then(serde_json::Value::as_str) {
+                Some("frame") => {
+                    if let (Some(f), Some(t)) = (
+                        text(ev, "file"),
+                        ev.get("t").and_then(serde_json::Value::as_f64),
+                    ) {
+                        ex.found.push((f, t));
+                    }
+                }
+                Some("start" | "decoder") => {
+                    if let Some(d) = text(ev, "decoder") {
+                        ex.decoder = Some(d);
+                    }
+                }
+                Some("done") => {
+                    ex.capped = ev.get("capped").and_then(serde_json::Value::as_bool) == Some(true);
+                }
+                _ => {}
+            },
+            &mut |rep| {
+                if let TaskReport::Line(l) = rep {
+                    line(l);
+                }
+            },
+            cancel,
+        )?;
+        Ok(ex)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one linear stage machine reads best in one place"
@@ -250,8 +337,13 @@ impl ImportJob {
             let Some(ev) = seen else {
                 bail!("the import helpers' self-check printed no report; the script is damaged");
             };
+            let hw: Vec<&str> = ev
+                .get("hwdevices")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
             report(TaskReport::Line(&format!(
-                "PyAV {} (FFmpeg {}), yt-dlp {}",
+                "PyAV {} (FFmpeg {}), yt-dlp {}; hardware decoders: {}; video decoding: {}",
                 ev.get("av")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("?"),
@@ -260,7 +352,13 @@ impl ImportJob {
                     .unwrap_or("?"),
                 ev.get("yt_dlp")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?")
+                    .unwrap_or("?"),
+                if hw.is_empty() {
+                    "none".to_string()
+                } else {
+                    hw.join(", ")
+                },
+                r.hwaccel.as_str()
             )));
             Some(import)
         } else {
@@ -387,93 +485,152 @@ impl ImportJob {
         self.step(report, 3, 100, "done");
         check(cancel)?;
 
-        // 4. Extract.
+        // 4. Extract: the candidate budget shared fairly by the cameras, their videos and the
+        // images, then the videos `workers` at a time.
+        let cams: Vec<&str> = videos.iter().map(|v| v.camera.as_str()).collect();
+        let budget = select::budget(&cams, images.len(), MAX_CANDIDATES_TOTAL, r.max_candidates);
+        warnings.extend(budget.warnings(MAX_CANDIDATES_TOTAL));
+        let used_images: Vec<&PathBuf> = select::stride(images.len(), budget.images)
+            .into_iter()
+            .filter_map(|i| images.get(i))
+            .collect();
+        let todo: Vec<(usize, usize)> = budget
+            .per_video
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| **q > 0)
+            .map(|(i, q)| (i, *q))
+            .collect();
         let mut cands: Vec<Candidate> = Vec::new();
-        let expr = r.select_expr();
-        let nvid = videos.len();
-        for (i, v) in videos.iter().enumerate() {
-            let out = self.work.join("frames").join(format!("v{i:04}"));
-            let pct = u8::try_from(i * 100 / nvid.max(1)).unwrap_or(100);
+        if !todo.is_empty() {
+            let script = script()?;
+            let expr = r.select_expr();
+            let total = todo.len();
+            let workers = parallel::extract_workers(r.workers, total);
+            let names: Vec<String> = todo
+                .iter()
+                .map(|(i, _)| {
+                    videos
+                        .get(*i)
+                        .map(|v| file_name(&v.path))
+                        .unwrap_or_default()
+                })
+                .collect();
             self.step(
                 report,
                 4,
-                pct,
-                &format!("{} ({}/{nvid})", file_name(&v.path), i + 1),
+                0,
+                &format!(
+                    "{total} video(s), {workers} at a time, up to {} frames each",
+                    budget.max_per_video()
+                ),
             );
-            let mut found: Vec<(String, f64)> = Vec::new();
-            let mut done_ev = None;
-            let res = pyenv::run_script(
-                ctx.runner,
-                &self.paths,
-                self.platform,
-                &self.work,
-                self.timeout,
-                vec![
-                    script()?,
-                    "extract".into(),
-                    "--video".into(),
-                    v.path.clone().into_os_string(),
-                    "--out".into(),
-                    out.clone().into_os_string(),
-                    "--select".into(),
-                    expr.clone().into(),
-                    "--max-frames".into(),
-                    r.max_candidates.to_string().into(),
-                ],
-                "import",
-                &mut |ev, _| match ev.get("event").and_then(serde_json::Value::as_str) {
-                    Some("frame") => {
-                        if let (Some(f), Some(t)) = (
-                            ev.get("file").and_then(serde_json::Value::as_str),
-                            ev.get("t").and_then(serde_json::Value::as_f64),
-                        ) {
-                            found.push((f.to_string(), t));
+            let runner = ctx.runner;
+            let work = |k: usize, line: &mut dyn FnMut(&str)| -> Result<Extracted> {
+                let (i, quota) = todo
+                    .get(k)
+                    .copied()
+                    .ok_or_else(|| anyhow!("internal: no video {k}"))?;
+                let v = videos
+                    .get(i)
+                    .ok_or_else(|| anyhow!("internal: no video {i}"))?;
+                let name = file_name(&v.path);
+                let out = self.work.join("frames").join(format!("v{i:04}"));
+                let ex = self.extract_one(
+                    runner,
+                    &script,
+                    &expr,
+                    &v.path,
+                    &out,
+                    quota,
+                    &mut |l| line(&format!("{name}: {l}")),
+                    cancel,
+                )?;
+                line(&format!(
+                    "{name}: {} candidate frames ({})",
+                    ex.found.len(),
+                    ex.decoder.as_deref().unwrap_or("decoder not reported")
+                ));
+                Ok(ex)
+            };
+            let mut running: Vec<usize> = Vec::new();
+            let mut done = 0usize;
+            let results = parallel::run_with_lines(
+                total,
+                workers,
+                &work,
+                &mut |e| {
+                    match e {
+                        parallel::Event::Line(_, l) => {
+                            report(TaskReport::Line(l));
+                            return;
+                        }
+                        parallel::Event::Started(k) => running.push(k),
+                        parallel::Event::Finished(k) => {
+                            running.retain(|x| *x != k);
+                            done += 1;
                         }
                     }
-                    Some("done") => done_ev = Some(ev.clone()),
-                    _ => {}
+                    let reading: Vec<&str> = running
+                        .iter()
+                        .filter_map(|k| names.get(*k).map(String::as_str))
+                        .collect();
+                    let mut detail = format!("videos {done}/{total} done");
+                    if !reading.is_empty() {
+                        detail.push_str("; reading ");
+                        detail.push_str(&reading.join(", "));
+                    }
+                    let pct = u8::try_from(done * 100 / total.max(1)).unwrap_or(100);
+                    self.step(report, 4, pct, &detail);
                 },
-                report,
                 cancel,
             );
-            if let Err(e) = res {
-                if e.downcast_ref::<crate::resources::export::Cancelled>()
-                    .is_some()
-                {
-                    return Err(e);
-                }
-                warnings.push(format!("{}: not read ({e:#})", file_name(&v.path)));
-                continue;
-            }
-            if done_ev
-                .as_ref()
-                .and_then(|d| d.get("capped").and_then(serde_json::Value::as_bool))
-                == Some(true)
-            {
-                warnings.push(format!(
-                    "{}: stopped after {} frames (max candidates); the rest of the video was not \
-                     read",
-                    file_name(&v.path),
-                    r.max_candidates
-                ));
-            }
-            for (f, t) in found {
-                if f.contains(['/', '\\']) || f.contains("..") {
+            // In video order: the dedup keeps the first of near duplicates.
+            for (k, res) in results.into_iter().enumerate() {
+                let Some(((i, quota), res)) = todo.get(k).copied().zip(res) else {
                     continue;
+                };
+                let Some(v) = videos.get(i) else { continue };
+                let ex = match res {
+                    Ok(ex) => ex,
+                    Err(e) => {
+                        if e.downcast_ref::<crate::resources::export::Cancelled>()
+                            .is_some()
+                        {
+                            return Err(e);
+                        }
+                        warnings.push(format!("{}: not read ({e:#})", file_name(&v.path)));
+                        continue;
+                    }
+                };
+                if ex.capped {
+                    warnings.push(format!(
+                        "{}: stopped after {quota} frames (its share of the {MAX_CANDIDATES_TOTAL} \
+                         candidate frames, at most {} per video); the rest of the video was not \
+                         read",
+                        file_name(&v.path),
+                        r.max_candidates
+                    ));
                 }
-                cands.push(Candidate {
-                    file: out.join(f),
-                    origin: v.path.clone(),
-                    image_name: file_name(&v.path),
-                    camera: v.camera.clone(),
-                    base: v.base,
-                    offset: Some(t),
-                    kind: v.kind,
-                });
+                let out = self.work.join("frames").join(format!("v{i:04}"));
+                for (f, t) in ex.found {
+                    if f.contains(['/', '\\']) || f.contains("..") {
+                        continue;
+                    }
+                    cands.push(Candidate {
+                        file: out.join(f),
+                        origin: v.path.clone(),
+                        image_name: file_name(&v.path),
+                        camera: v.camera.clone(),
+                        base: v.base,
+                        offset: Some(t),
+                        kind: v.kind,
+                    });
+                }
             }
             check(cancel)?;
         }
-        for img in &images {
+        for img in used_images {
             cands.push(Candidate {
                 file: img.clone(),
                 origin: img.clone(),
@@ -484,6 +641,7 @@ impl ImportJob {
                 kind: "image",
             });
         }
+        // A guard only: the budget keeps the candidates within the total.
         if cands.len() > MAX_CANDIDATES_TOTAL {
             warnings.push(format!(
                 "{} candidate frames; only the first {MAX_CANDIDATES_TOTAL} are considered",
@@ -504,26 +662,43 @@ impl ImportJob {
         }
         check(cancel)?;
 
-        // 5. Analyse: decode, dHash, scene; dedup per camera.
+        // 5. Analyse: decode, dHash, scene (in parallel); dedup per camera.
         let n = cands.len();
+        let threads = parallel::analyse_threads(n);
+        self.step(report, 5, 0, &format!("0 of {n} ({threads} threads)"));
+        let analyse = |i: usize| -> Result<(u64, ImageStats, u32, u32)> {
+            let c = cands
+                .get(i)
+                .ok_or_else(|| anyhow!("internal: no candidate {i}"))?;
+            let b = std::fs::read(&c.file)?;
+            let img = crate::image::decode(&b)?;
+            Ok((
+                crate::collect::dhash::of_rgb(&img),
+                ImageStats::compute(&img),
+                img.width,
+                img.height,
+            ))
+        };
+        let analysed = parallel::map(
+            n,
+            threads,
+            &analyse,
+            &mut |done| {
+                let pct = u8::try_from(done * 100 / n.max(1)).unwrap_or(100);
+                self.step(
+                    report,
+                    5,
+                    pct,
+                    &format!("{done} of {n} ({threads} threads)"),
+                );
+            },
+            Duration::from_millis(250),
+            cancel,
+        );
+        check(cancel)?;
+        let analysed = analysed.ok_or_else(|| anyhow!("internal: the analysis stopped early"))?;
         let mut info: Vec<Option<(u64, ImageStats, u32, u32)>> = Vec::with_capacity(n);
-        for (i, c) in cands.iter().enumerate() {
-            if i % 25 == 0 {
-                let pct = u8::try_from(i * 100 / n.max(1)).unwrap_or(100);
-                self.step(report, 5, pct, &format!("{i} of {n}"));
-                check(cancel)?;
-            }
-            let a = std::fs::read(&c.file)
-                .map_err(anyhow::Error::from)
-                .and_then(|b| crate::image::decode(&b))
-                .map(|img| {
-                    (
-                        crate::collect::dhash::of_rgb(&img),
-                        ImageStats::compute(&img),
-                        img.width,
-                        img.height,
-                    )
-                });
+        for (c, a) in cands.iter().zip(analysed) {
             match a {
                 Ok(x) => info.push(Some(x)),
                 Err(e) => {

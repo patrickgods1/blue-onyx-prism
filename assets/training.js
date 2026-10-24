@@ -27,6 +27,51 @@
     update();
   }
   toggle(document.getElementById("import-form"), "source", "data-source");
+
+  // The import preview: what the path holds and the per-video budget, one line under the
+  // field (GET /v1/training/import/preview), debounced; Browse fills the field and fires
+  // `input`, so a picked path is previewed too.
+  var importForm = document.getElementById("import-form");
+  var preview = document.getElementById("import-preview");
+  if (importForm && preview) {
+    var pathField = importForm.elements.path;
+    var timer = null;
+    var seq = 0;
+    var show = function (text, warn) {
+      preview.textContent = text;
+      preview.hidden = !text;
+      preview.classList.toggle("error-text", !!warn);
+    };
+    var run = function () {
+      var p = pathField ? pathField.value.trim() : "";
+      var mine = ++seq;
+      if (!p) { show("", false); return; }
+      var q = "path=" + encodeURIComponent(p);
+      var mc = importForm.elements.max_candidates;
+      if (mc && mc.value.trim()) q += "&max_candidates=" + encodeURIComponent(mc.value.trim());
+      var cam = importForm.elements.camera;
+      if (cam && cam.value.trim()) q += "&camera=" + encodeURIComponent(cam.value.trim());
+      show("Checking\u2026", false);
+      fetch("/v1/training/import/preview?" + q, { headers: { Accept: "application/json" } })
+        .then(function (res) { return res.json(); })
+        .then(function (j) {
+          if (mine !== seq) return;
+          if (!j.success) { show(j.message || "Cannot read this path.", true); return; }
+          var w = (j.warnings || []).filter(function (x) { return x.indexOf(".bvr") < 0; });
+          show(j.summary + (w.length ? ". " + w.join(". ") : ""), false);
+        })
+        .catch(function () { if (mine === seq) show("", false); });
+    };
+    var later = function () {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(run, 400);
+    };
+    ["path", "max_candidates", "camera"].forEach(function (n) {
+      var el = importForm.elements[n];
+      if (el) { el.addEventListener("input", later); el.addEventListener("change", later); }
+    });
+    if (pathField && pathField.value.trim()) run();
+  }
   toggle(document.getElementById("autolabel-form"), "mode", "data-mode");
 
   var train = document.getElementById("train");

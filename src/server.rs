@@ -227,6 +227,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/training/datasets", post(training::datasets)),
         ("/training/remove-env", post(training::remove_env)),
         ("/training/import", post(training_tasks::import)),
+        (
+            "/v1/training/import/preview",
+            get(training_tasks::import_preview),
+        ),
         ("/training/autolabel", post(training_tasks::autolabel)),
         ("/logs", get(logs_page)),
         ("/logs.json", get(logs_json)),
@@ -1007,6 +1011,7 @@ mod tests {
             "/training/datasets",
             "/training/remove-env",
             "/training/import",
+            "/v1/training/import/preview",
             "/training/autolabel",
             "/logs",
             "/logs.json",
