@@ -1,5 +1,6 @@
 // Blue Onyx Prism: server-side file browser of the Training page's footage import
-// (GET /v1/fs/browse?kind=video): folders and video files of the machine running the service.
+// (GET /v1/fs/browse?kind=video) and the Dataset page's folder field (kind=folder, folders only):
+// folders and files of the machine running the service.
 // A button `button.browse[data-browse][data-target]` fills the input named by data-target of its
 // form. Same dialog as the Config page's (served from /static/; no inline scripts under the CSP).
 (function () {
@@ -10,7 +11,8 @@
   var list = $("browse-list"), pathEl = $("browse-path"), msg = $("browse-msg"), roots = $("browse-roots");
   var up = $("browse-up"), use = $("browse-use"), title = $("browse-title");
   var kind = "video", target = null, cur = null, seq = 0;
-  var TITLES = { video: "Choose a video or a folder", model: "Choose a model file or folder", classes: "Choose a classes YAML" };
+  var TITLES = { video: "Choose a video or a folder", model: "Choose a model file or folder", classes: "Choose a classes YAML", folder: "Choose the dataset folder" };
+  var EMPTY = { video: "No video here (choose this folder for its images).", folder: "No subfolders here.", model: "No model files here.", classes: "No classes YAML here." };
   function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
   function pick(path) {
     target.value = path;
@@ -21,7 +23,7 @@
   function render(j) {
     cur = j;
     pathEl.textContent = j.path;
-    msg.textContent = j.truncated ? "Only the first entries are shown." : (j.entries.length ? "" : "No video here (choose this folder for its images).");
+    msg.textContent = j.truncated ? "Only the first entries are shown." : (j.entries.length ? "" : EMPTY[kind]);
     up.disabled = !j.parent;
     up.dataset.path = j.parent || "";
     roots.textContent = "";

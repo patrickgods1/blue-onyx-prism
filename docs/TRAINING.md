@@ -371,7 +371,7 @@ its filters select) propose boxes for dataset frames. They land in the frames' l
 the script only returns proposals as JSONL), so the reviewer decides. Nothing is accepted, rejected or
 deleted automatically; confirmed empty frames (hard negatives) come only from the review.
 
-**Frames**: `--frames` takes the Review queue's filters as `key=value` pairs: `bucket`, `scene`, `camera`,
+**Frames**: `--frames` takes the Review queue's filters as `key=value` pairs: `bucket`, `scene`, `camera`, `label`,
 `status` (default `unreviewed`), `source` (default `all`), `import=<id>|any`, `limit` (default 200). They
 are taken in the queue's order (most uncertain first).
 

@@ -21,6 +21,8 @@ pub const REVIEW_VERSION: u32 = 1;
 pub const SCENES: [&str; 3] = ["day", "night", "ir"];
 /// Newest frames per bucket kept in the [`Summary`] (thumbnails).
 pub const NEWEST_PER_BUCKET: usize = 8;
+/// Key of [`Summary::by_label`] for a frame whose reply had no detection.
+pub const NO_DETECTION: &str = "(none)";
 /// Longest camera folder name.
 const MAX_CAMERA_LEN: usize = 64;
 /// Longest request id in a file name.
@@ -193,6 +195,9 @@ pub struct Summary {
     /// scene -> bucket -> frames (a frame counts once in each of its buckets).
     pub by_scene: BTreeMap<String, BTreeMap<Bucket, u64>>,
     pub by_camera: BTreeMap<String, CameraTotals>,
+    /// label -> scene -> frames: the reply's prediction labels at collection time (a frame
+    /// counts once per distinct label; a frame with none under [`NO_DETECTION`]).
+    pub by_label: BTreeMap<String, BTreeMap<String, u64>>,
     /// Newest frames per bucket, newest first.
     pub newest: BTreeMap<Bucket, VecDeque<FrameRef>>,
 }
@@ -211,6 +216,20 @@ impl Summary {
         cam.bytes = cam.bytes.saturating_add(line.bytes);
         if line.timestamp > cam.newest {
             cam.newest = line.timestamp.clone();
+        }
+        let labels: BTreeSet<&str> = line.labels.iter().map(String::as_str).collect();
+        let labels = if labels.is_empty() {
+            BTreeSet::from([NO_DETECTION])
+        } else {
+            labels
+        };
+        for l in labels {
+            *self
+                .by_label
+                .entry(l.to_string())
+                .or_default()
+                .entry(line.scene.clone())
+                .or_default() += 1;
         }
         let f = FrameRef::of(line, date);
         for b in &line.buckets {
@@ -519,5 +538,56 @@ mod tests {
         assert_eq!(newest.len(), NEWEST_PER_BUCKET);
         assert_eq!(newest[0].rel, "ir/cam/2026-10-22/f9.jpg");
         assert_eq!(s.by_camera["cam"].newest, "2026-10-22T00:00:09Z");
+        assert_eq!(s.by_label["person"]["ir"], 10);
+    }
+
+    fn index_line(id: &str, scene: &str, labels: &[&str]) -> IndexLine {
+        IndexLine {
+            id: id.into(),
+            timestamp: "2026-10-22T00:00:00Z".into(),
+            scene: scene.into(),
+            camera: "cam".into(),
+            model: "m".into(),
+            buckets: vec![Bucket::Positive],
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            bytes: 10,
+        }
+    }
+
+    #[test]
+    fn labels_count_once_per_frame_and_empty_frames_count_as_none() {
+        let mut s = Summary::default();
+        s.add(
+            &index_line("a", "day", &["person", "person", "car"]),
+            "2026-10-22",
+        );
+        s.add(&index_line("b", "night", &["person"]), "2026-10-22");
+        s.add(&index_line("c", "ir", &[]), "2026-10-22");
+        assert_eq!(
+            s.by_label["person"]["day"], 1,
+            "deduplicated within a frame"
+        );
+        assert_eq!(s.by_label["person"]["night"], 1);
+        assert_eq!(s.by_label["car"]["day"], 1);
+        assert_eq!(s.by_label[NO_DETECTION]["ir"], 1);
+        assert_eq!(s.by_label.len(), 3);
+    }
+
+    #[test]
+    fn scan_rebuilds_the_label_counts_from_the_index() {
+        let dir = std::env::temp_dir().join(format!("bop-layout-{}", uuid::Uuid::new_v4()));
+        let day = dir.join("night/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        for l in [
+            index_line("a", "night", &["dog", "dog"]),
+            index_line("b", "night", &[]),
+        ] {
+            append_line(&day.join(INDEX_FILE), &serde_json::to_string(&l).unwrap()).unwrap();
+        }
+        let s = Summary::scan(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(s.frames, 2);
+        assert_eq!(s.by_label["dog"]["night"], 1);
+        assert_eq!(s.by_label[NO_DETECTION]["night"], 1);
     }
 }

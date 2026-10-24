@@ -204,8 +204,19 @@ One JSON object per line, appended when a frame is saved:
 
 - `bytes` is the image plus the sidecar.
 - When frames are deleted, retention rewrites the day's index atomically.
-- At startup, the service rebuilds the Dataset page's summary (counts by scene x bucket and per camera,
-  bytes, the newest 8 frames per bucket) from the index files.
+- At startup, the service rebuilds the Dataset page's summary (counts by scene x bucket, by detected
+  class and per camera, bytes, the newest 8 frames per bucket) from the index files.
+
+### Frames by detected class
+
+The Dataset page's **Frames by detected class** table counts frames per class and scene (`by_label`
+in `GET /v1/dataset`).
+
+- The classes are the `labels` of the index line: the reply's predictions at collection time, not
+  reviewed labels. Reviewed labels are counted on the Review page and in the export report.
+- A frame counts once per class, however many boxes of that class it has.
+- A frame without a prediction counts under `(none)`.
+- Rows are sorted by total frames, most first. `(none)` is last.
 
 ### `review-queue.jsonl`
 
@@ -369,8 +380,15 @@ This is how the self-training loop sends disagreements back to review.
 ### Queue
 
 `GET /v1/review/next` lists the frames of `review-queue.jsonl`, or with `source=all` also every indexed
-frame. It accepts these filters: `bucket`, `scene`, `camera`, and `status` (default `unreviewed`; also
-`reviewed`, `skipped`, `any`). Frames are sorted most uncertain first:
+frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, and `status` (default
+`unreviewed`; also `reviewed`, `skipped`, `any`).
+
+**`label`** keeps the frames that have a box of that class. With a label file, these are its boxes
+that are not rejected (accepted, added and pending ones). Without one, they are the sidecar's
+`predictions`. The value must be a valid class name (1 to 64 characters, no control characters). It
+need not be in the class list, so a model label such as `class_7` works too. The answer's `labels`
+lists the classes of the frames the other filters keep, for the page's **Class** list (which also
+holds `collect.classes`). The auto-label form passes it on like the other filters. Frames are sorted most uncertain first:
 
 1. a re-label disagreement (the label file's `disagreement`, item field `relabel`);
 2. the near-threshold margin: the smallest `|top score - threshold|` over the labels of `raw` and
@@ -382,7 +400,7 @@ frame. It accepts these filters: `bucket`, `scene`, `camera`, and `status` (defa
 
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
 The answer also carries the counts: reviewed, remaining, skipped, confirmed empty, rejected boxes, and
-accepted boxes per class.
+accepted boxes per class. The counts follow every filter except `status`.
 
 ### Keyboard
 
@@ -407,11 +425,21 @@ Click a box to select it. Drag on the image to draw a new one.
 ```json
 {"formats": ["yolo", "coco", "xanylabeling", "benchmark"], "out_dir": "optional",
  "holdout_cameras": [], "holdout_days": [], "holdout_fraction": 0.2,
- "benchmark_split": "all", "include_unreviewed": false}
+ "benchmark_split": "all", "include_unreviewed": false,
+ "labels": [], "include_empty": true}
 ```
 
 - **`formats`** (or `format`): one name, a list, or `all`. Default: all formats.
 - **`out_dir`:** a new or empty folder. Default: `<data root>/training/exports/<UTC time>`.
+- **`labels`** (default empty = every class): export only the frames with a training box (accepted or
+  added) of one of these classes. The other boxes of a kept frame stay labelled, and class ids still
+  follow `collect.classes`. Every name must be in `collect.classes`; another one is a 400 that names
+  it.
+- **`include_empty`** (default true): also export the frames confirmed empty. With `labels` empty and
+  `include_empty` false, every frame but the confirmed-empty ones is exported.
+- The class filter applies before the split. `export.json` records it (`class_filter`) with the
+  number of reviewed frames it left out (`filtered_out`). With `include_unreviewed`, the unreviewed
+  X-AnyLabeling frames are filtered by the boxes a save would accept.
 - **Frames left out, with a warning:** frames with a training label outside the class list, and frames
   whose image or sidecar is gone.
 - **File names:** every frame is exported as `<scene>.<camera>.<date>.<stem>.jpg`. No part contains a

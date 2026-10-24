@@ -192,7 +192,7 @@ pub struct ImportArgs {
 /// `train autolabel`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct AutolabelArgs {
-    /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, status
+    /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, label, status
     /// (unreviewed | reviewed | skipped | any), source (queue | all), import (<id> | any), limit.
     #[arg(long, default_value = "")]
     pub frames: String,
