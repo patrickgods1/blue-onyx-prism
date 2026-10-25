@@ -540,7 +540,7 @@ mod tests {
     fn relative_path_is_under_data_root() {
         let (root, cfg) = setup();
         let l = list(&cfg, Some("models/adir"), None).unwrap();
-        assert_eq!(l.path, display(&root.join("models/adir")));
+        assert_eq!(l.path, display(&root.join("models").join("adir")));
         assert_eq!(l.parent, Some(display(&root.join("models"))));
     }
 

@@ -269,6 +269,9 @@ pub(crate) fn prepare_train_env(
     })
 }
 
+/// How long [`TrainLock::try_acquire`] retries a lock that looks held.
+pub const LOCK_GRACE: Duration = Duration::from_secs(1);
+
 /// Exclusive cross-process training lock; released on drop.
 #[derive(Debug)]
 pub struct TrainLock {
@@ -276,7 +279,12 @@ pub struct TrainLock {
 }
 
 impl TrainLock {
-    /// Take the lock, or fail at once naming the holder's likely identity.
+    /// Take the lock, or fail within [`LOCK_GRACE`] naming the holder's likely identity.
+    ///
+    /// A child process this process spawns at the moment a lock file is open shares that open
+    /// file (until the child execs), so a lock just released can look held for a moment; a real
+    /// holder (a training run) keeps it for minutes. Measured: 64-108 of 20,000 back-to-back
+    /// acquires failed while other threads spawned `sh -c true`, none with the grace.
     pub fn try_acquire(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -289,7 +297,15 @@ impl TrainLock {
             .write(true)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
-        match file.try_lock() {
+        let until = std::time::Instant::now() + LOCK_GRACE;
+        let mut res = file.try_lock();
+        while matches!(res, Err(std::fs::TryLockError::WouldBlock))
+            && std::time::Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(20));
+            res = file.try_lock();
+        }
+        match res {
             Ok(()) => Ok(Self { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => bail!(
                 "another process (the service or a `blue-onyx-prism train` command) is training \
