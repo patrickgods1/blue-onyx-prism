@@ -272,17 +272,27 @@ pub struct Det {
     pub bbox: [f32; 4],
 }
 
-/// How a trained model's detections disagree with a reviewed label file: a detection matching
-/// no training box (accepted or added) at IoU >= [`MATCH_IOU`] is new, one whose best match has
-/// another label is a class change, a training box no detection matches is missed. None when the
-/// file is not reviewed (there is nothing to disagree with) or everything matches.
-pub fn disagreement(previous: &LabelFile, dets: &[Det], model: &str) -> Option<String> {
+/// How a trained model's detections disagree with a reviewed label file, over the run's
+/// `classes` only (case-insensitive): a detection of one of them matching no training box
+/// (accepted or added, any class) at IoU >= [`MATCH_IOU`] is new, one whose best match has
+/// another label is a class change, a training box of one of them no detection matches is
+/// missed. Detections and training boxes of other classes are no disagreement: a run for a few
+/// classes does not flag what it did not look for. None when the file is not reviewed (there is
+/// nothing to disagree with) or everything matches.
+pub fn disagreement(
+    previous: &LabelFile,
+    dets: &[Det],
+    model: &str,
+    classes: &[String],
+) -> Option<String> {
     if previous.status != Status::Reviewed {
         return None;
     }
+    let in_run = |l: &str| classes.iter().any(|c| c.eq_ignore_ascii_case(l));
     let train: Vec<&LabelBox> = previous.training().collect();
+    let dets: Vec<&Det> = dets.iter().filter(|d| in_run(&d.label)).collect();
     let (mut new, mut changed) = (0usize, 0usize);
-    for d in dets {
+    for d in &dets {
         let best = train
             .iter()
             .map(|b| (iou(&b.bbox, &d.bbox), *b))
@@ -296,6 +306,7 @@ pub fn disagreement(previous: &LabelFile, dets: &[Det], model: &str) -> Option<S
     }
     let missed = train
         .iter()
+        .filter(|b| in_run(&b.label))
         .filter(|b| !dets.iter().any(|d| iou(&b.bbox, &d.bbox) >= MATCH_IOU))
         .count();
     if new + changed + missed == 0 {
@@ -355,7 +366,7 @@ pub fn apply_relabel(
     w: u32,
     h: u32,
 ) -> (MergeReport, Option<String>) {
-    let why = disagreement(f, dets, model);
+    let why = disagreement(f, dets, model, classes);
     let rep = apply(f, model_boxes(dets, model, classes, w, h)).merge;
     if let Some(w) = &why {
         f.status = Status::Unreviewed;
@@ -684,20 +695,45 @@ mod tests {
             d("person", [11.0, 10.0, 60.0, 90.0]),
             d("dog", [200.0, 201.0, 260.0, 260.0]),
         ];
-        assert_eq!(disagreement(&f, &same, "m"), None);
+        assert_eq!(disagreement(&f, &same, "m", &classes()), None);
         // A class change, a miss and a new box.
         let dets = [
             d("cat", [200.0, 200.0, 261.0, 260.0]),
             d("raccoon", [300.0, 300.0, 340.0, 340.0]),
         ];
         assert_eq!(
-            disagreement(&f, &dets, "night-yolo26n").as_deref(),
+            disagreement(&f, &dets, "night-yolo26n", &classes()).as_deref(),
             Some("re-label by night-yolo26n: 1 new box, 1 missed, 1 class change")
         );
+        // A run for some classes only counts those (detections and reviewed boxes alike).
+        let only = |c: &[&str]| -> Option<String> {
+            let c: Vec<String> = c.iter().map(|s| (*s).to_string()).collect();
+            disagreement(&f, &dets, "m", &c)
+        };
+        assert_eq!(
+            only(&["Raccoon"]).as_deref(),
+            Some("re-label by m: 1 new box")
+        );
+        assert_eq!(
+            only(&["person"]).as_deref(),
+            Some("re-label by m: 1 missed")
+        );
+        assert_eq!(
+            only(&["dog"]).as_deref(),
+            Some("re-label by m: 1 missed"),
+            "the cat is not looked at; the reviewed dog is missed"
+        );
+        assert_eq!(
+            only(&["cat"]).as_deref(),
+            Some("re-label by m: 1 class change"),
+            "a cat on the reviewed dog"
+        );
+        assert_eq!(only(&["truck"]), None);
+        assert_eq!(disagreement(&f, &same, "m", &["person".to_string()]), None);
         // Unreviewed files have nothing to disagree with.
         let mut un = reviewed();
         un.status = Status::Unreviewed;
-        assert_eq!(disagreement(&un, &dets, "m"), None);
+        assert_eq!(disagreement(&un, &dets, "m", &classes()), None);
 
         let mut g = reviewed();
         let (rep, why) = apply_relabel(&mut g, &dets, "night-yolo26n", &classes(), 640, 480);

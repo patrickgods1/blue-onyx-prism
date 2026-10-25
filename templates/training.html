@@ -207,6 +207,12 @@
         <label class="check"><input type="checkbox" name="siglip" checked> SigLIP 2 species ranking <span class="muted small">(1.5 GB)</span></label>
       </div>
     </div>
+    <fieldset class="tr-classes" data-mode="labelers" id="al-classes">
+      <legend>Classes to look for</legend>
+      <div id="al-picker"><p class="muted small">Without scripts the labelers use the class list and <code>training.synonyms</code>.</p></div>
+      <p class="muted small cp-note">Defaults to the classes your enabled models detect (within the class list, not hidden on Review): see <a href="/config#at-models">Config, Models, Classes</a>. A class outside the list is appended to it (after asking).</p>
+      <p id="al-classes-msg" class="form-msg" role="status"></p>
+    </fieldset>
     <div class="tr-grid" data-mode="model">
       <div class="tr-field">
         <label for="al-model">Trained model</label>
@@ -446,6 +452,7 @@
   <p id="browse-msg" class="muted" role="status"></p>
   <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
 </dialog>
+<script src="/static/class-picker.js?v={{ version }}"></script>
 <script src="/static/training.js?v={{ version }}"></script>
 <script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

@@ -28,7 +28,7 @@
   {% if c.force_cpu %}<p class="warn">Force CPU is on and overrides every per-model device. <a href="#inference">Change</a></p>{% endif %}
   <div class="scroll">
   <table class="model-card">
-  <thead><tr><th>Load</th><th>Default</th><th>Name</th><th>Family</th><th>Device</th><th>Threshold</th><th title="Model that answers this model's night / IR frames">Night model</th><th>Running</th><th>File</th><th>Entry</th></tr></thead>
+  <thead><tr><th>Load</th><th>Default</th><th>Name</th><th>Family</th><th>Device</th><th>Threshold</th><th title="Model that answers this model's night / IR frames">Night model</th><th title="Which classes this model reports (its object filter)">Classes</th><th>Running</th><th>File</th><th>Entry</th></tr></thead>
   <tbody>
   {% for m in models %}
   <tr data-model="{{ m.key }}"{% if !m.pending.is_empty() %} class="pending"{% endif %}>
@@ -52,6 +52,7 @@
       {% for d in m.night_models %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}>{{ d.label }}</option>{% endfor %}
       </select>
       <input type="number" class="night-thr" data-key="model:night_threshold:{{ m.key }}" name="night_threshold.{{ m.name }}" min="0" max="1" step="0.01" value="{{ m.night_threshold }}" placeholder="0.30" aria-label="Confidence threshold of {{ m.name }} on night / IR frames" title="Replaces the threshold of {{ m.name }} on night / IR frames (lower or higher)"{% if !m.night_self %} hidden{% endif %}></td>
+    <td class="model-classes"><input type="hidden" class="of-value" name="object_filter.{{ m.name }}" value="{{ m.object_filter }}"><span class="of-summary" data-model="{{ m.name }}">{{ m.object_filter_text }}</span> <button type="button" class="small secondary of-edit" data-model="{{ m.name }}" aria-label="Choose the classes of {{ m.name }}" hidden>Choose&hellip;</button></td>
     <td class="running st-{{ m.running_class }}"><span class="run-text">{{ m.running }}</span>{% if let Some(d) = m.running_detail %}<details class="run-detail"><summary title="{{ d }}">{{ d }}</summary></details>{% endif %}</td>
     <td class="file"><code title="{{ m.path }}">{{ m.file_name }}</code>{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-export" title="{{ x }}: exported on this machine on request">export it</a>{% else if !m.exists %} <span class="muted">(missing)</span>{% endif %}</td>
     <td class="model-remove-cell"><button type="submit" class="small danger model-remove" form="model-remove" name="name" value="{{ m.name }}" data-confirm="Remove {{ m.name }} from the config? Its files stay; remove them under Resources."{% if m.enabled %} disabled title="Enabled: disable it first (untick Load and save), then remove it"{% else %} title="Remove this entry from the config; its files stay"{% endif %}>Remove</button></td>
@@ -246,8 +247,8 @@
     <legend>Detection defaults {{ self.badge("confidence_threshold,nms_iou,object_filter")|safe }}</legend>
     <label>Confidence threshold <input type="number" name="confidence_threshold" min="0" max="1" step="0.01" value="{{ c.confidence_threshold }}" required></label>
     <label>NMS IoU <input type="number" name="nms_iou" min="0" max="1" step="0.01" value="{{ c.nms_iou }}" required></label>
-    <label>Object filter (comma separated, empty = all) <input type="text" name="object_filter" value="{{ c.object_filter }}"></label>
-    <p class="muted">Per-model thresholds in the Models tab override the global threshold.</p>
+    <label>Object filter (comma separated, empty = all) <span class="with-browse"><input type="text" name="object_filter" id="object-filter" value="{{ c.object_filter }}"><button type="button" class="secondary" id="of-global-edit" hidden>Choose&hellip;</button></span></label>
+    <p class="muted">Per-model thresholds in the Models tab override the global threshold. A model's own <em>Classes</em> choice (Models tab) replaces this filter for that model. The Review and Training auto-label forms default to the classes the enabled models detect.</p>
   </fieldset>
 
   <fieldset class="group" id="night">
@@ -296,6 +297,13 @@
   <p id="browse-msg" class="muted" role="status"></p>
   <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
 </dialog>
+<dialog id="class-dialog" aria-labelledby="class-dialog-title">
+  <h3 id="class-dialog-title">Choose classes</h3>
+  <div id="class-dialog-body"></div>
+  <p id="class-dialog-msg" class="form-msg" role="status"></p>
+  <div class="actions"><button type="button" id="class-dialog-ok">Use these</button><button type="button" id="class-dialog-cancel" class="secondary">Cancel</button></div>
+</dialog>
+<script src="/static/class-picker.js?v={{ version }}"></script>
 <script src="/static/config.js?v={{ version }}"></script>
 <script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

@@ -520,3 +520,131 @@ fn planning_refuses_unknown_models_missing_gpus_and_empty_selections() {
         .to_string();
     assert!(e.contains("no frame matches"), "{e}");
 }
+
+#[test]
+fn a_run_for_a_class_the_last_run_did_not_look_for_labels_the_frames_again() {
+    let t = tmp("subset");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    let mut cfg = config(&t.0);
+    cfg.collect.classes = vec!["person".into(), "car".into(), "raccoon".into()];
+    // A run for car only: the marker names it.
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.classes = Some(vec!["CAR".into()]);
+    let job = plan_autolabel(&cfg, req.clone(), &host()).unwrap();
+    assert_eq!(job.classes, ["car"], "the list's spelling");
+    let fake = LabelFake::default();
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(out.result["frames"], 2);
+    assert_eq!(
+        out.result["by_label"],
+        serde_json::json!({"car": 2}),
+        "car only"
+    );
+    let marker = |rel: &str| {
+        Frame::resolve(&dir, rel)
+            .unwrap()
+            .labels()
+            .unwrap()
+            .unwrap()
+            .auto_run
+            .unwrap()
+    };
+    assert_eq!(marker(&rels[0]).classes, ["car"]);
+    // car again: covered, skipped.
+    let e = run_job(&plan_autolabel(&cfg, req, &host()).unwrap(), &fake)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("all 2 frame(s)"), "{e}");
+    // The whole list: raccoon and person were not looked for, so the frames are labelled.
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(
+        (
+            out.result["frames"].as_u64(),
+            out.result["skipped_done"].as_u64()
+        ),
+        (Some(2), Some(0))
+    );
+    assert_eq!(marker(&rels[1]).classes, ["person", "car", "raccoon"]);
+    // Now a subset is covered by the full run.
+    let mut sub = AutolabelRequest::new(FrameFilter::default());
+    sub.classes = Some(vec!["raccoon".into()]);
+    let e = run_job(&plan_autolabel(&cfg, sub, &host()).unwrap(), &fake)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("all 2 frame(s)"), "{e}");
+    // A marker of an old file (no classes) covers every class.
+    let fr = Frame::resolve(&dir, &rels[0]).unwrap();
+    labels::update(&fr.labels, |f| {
+        let mut f = f.unwrap();
+        f.auto_run.as_mut().unwrap().classes.clear();
+        Ok(Some(f))
+    })
+    .unwrap();
+    cfg.collect.classes.push("package".into());
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(
+        (
+            out.result["frames"].as_u64(),
+            out.result["skipped_done"].as_u64()
+        ),
+        (Some(1), Some(1)),
+        "the old marker covers package; the other frame did not look for it"
+    );
+    // A class outside collect.classes is refused.
+    let mut bad = AutolabelRequest::new(FrameFilter::default());
+    bad.classes = Some(vec!["unicorn".into()]);
+    let e = plan_autolabel(&cfg, bad, &host()).unwrap_err().to_string();
+    assert!(
+        e.contains("unicorn") && e.contains("collect.classes"),
+        "{e}"
+    );
+}
+
+#[test]
+fn self_training_for_some_classes_ignores_the_others() {
+    let t = tmp("relabel-subset");
+    let rels = frames(&t.0, 1, false);
+    let dir = t.0.join("dataset");
+    let fr = Frame::resolve(&dir, &rels[0]).unwrap();
+    let mut f = labels::LabelFile {
+        status: Status::Reviewed,
+        ..Default::default()
+    };
+    // A reviewed dog the model will not see.
+    f.boxes.push(labels::LabelBox {
+        label: "dog".into(),
+        bbox: [35.0, 20.0, 60.0, 46.0],
+        source: Source::Human,
+        score: None,
+        state: BoxState::Added,
+        origin: None,
+        reason: None,
+        model_label: None,
+        orig_bbox: None,
+        auto: Default::default(),
+    });
+    labels::write(&fr.labels, &f).unwrap();
+    let cfg = config(&t.0);
+    let mut req =
+        AutolabelRequest::new(FrameFilter::parse("", super::super::default_status(true)).unwrap());
+    req.with_model = Some("IPcam-general".into());
+    req.classes = Some(vec!["car".into()]);
+    let none = capability::capability(&HardwareInfo::new("linux", "x86_64", vec![]), None);
+    let mut job = plan_autolabel(&cfg, req, &none).unwrap();
+    // The model sees a person (not in the run) and nothing else.
+    let dets: BTreeMap<String, Vec<Det>> = [(
+        rels[0].clone(),
+        vec![det("person", 0.9, [1.0, 1.0, 30.0, 20.0])],
+    )]
+    .into();
+    job.detector = Some(Arc::new(FakeDetector(dets)));
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    assert_eq!(out.result["disagreements"], 0, "{}", out.result);
+    let f = fr.labels().unwrap().unwrap();
+    assert_eq!(f.status, Status::Reviewed);
+    assert_eq!(f.disagreement, None);
+    assert_eq!(f.boxes.len(), 1, "the person is not proposed");
+}

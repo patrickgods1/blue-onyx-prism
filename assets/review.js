@@ -7,6 +7,11 @@
 // GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto.
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
 // a new folder reloads the page.
+// Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
+// filter (label=a,b), "Show boxes of" (display only), the auto-label form (repeated `classes`
+// fields; a class outside the list is appended after a confirm) and the Classes card (list in
+// order, "hide in Review" per class). Pickers, the new-box class select and the 1-0 keys use the
+// class list minus the hidden classes; saved labels and class ids never change with that.
 // No inline handlers (CSP): everything is wired here; server values come from data-*.
 (function () {
   'use strict';
@@ -14,6 +19,11 @@
   if (!root) return;
   var classes = [];
   try { classes = JSON.parse(root.getAttribute('data-classes') || '[]'); } catch (e) { classes = []; }
+  var CP = window.ClassPicker || null;
+  var CU = CP ? CP.util : null;
+  var hiddenClasses = [];  // collect.hidden_classes: not offered by the pickers and shortcuts
+  var catalog = null;      // GET /v1/review/class-catalog
+  var shownLabels = [];    // "Show boxes of": empty = every box
 
   var $ = function (id) { return document.getElementById(id); };
   var canvas = $('rv-canvas');
@@ -47,6 +57,7 @@
   var prefetchImg = null;
   var seenLabels = [];                 // classes the queue saw (Class filter)
   var lastNudge = null;                // {i, t}: arrow nudges in a row share one undo step
+  var labelPicker = null, showPicker = null, alPicker = null, classesPicker = null;
 
   var COLORS = {
     pending: '#e8d000', review: '#ffa000', hint: '#f08c00', accepted: '#2e9e4f',
@@ -138,6 +149,12 @@
 
   function fmtScore(s) { return (typeof s === 'number') ? s.toFixed(2) : ''; }
 
+  // The classes Review offers: the list minus the hidden ones.
+  function visible() { return classes.filter(function (c) { return hiddenClasses.indexOf(c) < 0; }); }
+
+  // "Show boxes of": a box of another class is dimmed (display only; saving keeps every box).
+  function isShown(b) { return !shownLabels.length || shownLabels.indexOf(b.label) >= 0; }
+
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
   function round1(v) { return Math.round(v * 10) / 10; }
@@ -218,7 +235,8 @@
       var color = COLORS[l] || '#ffffff';
       var dashed = l === 'rejected' || isHint(b);
       ctx.save();
-      ctx.globalAlpha = l === 'rejected' ? 0.7 : 1;
+      var shown = isShown(b);
+      ctx.globalAlpha = (l === 'rejected' ? 0.7 : 1) * (shown ? 1 : 0.2);
       if (i === selected) {
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = lw * 3.5;
@@ -246,7 +264,7 @@
         ctx.stroke();
       }
       ctx.setLineDash([]);
-      if (showTags) {
+      if (showTags && shown) {
         var text = tagText(b, i);
         var tw = ctx.measureText(text).width + 2 * pad;
         // Above the box; at the frame top below it when there is room; else inside its top.
@@ -382,10 +400,10 @@
     var sel = document.createElement('select');
     sel.className = 'bx-label';
     sel.setAttribute('aria-label', 'Class of box ' + (i + 1));
-    var names = classes.slice();
+    var names = visible();
     if (names.indexOf(b.label) < 0) names.unshift(b.label);
     names.forEach(function (c) {
-      var o = el('option', null, c + (classes.indexOf(c) < 0 ? ' (not a class)' : ''));
+      var o = el('option', null, c + (classes.indexOf(c) < 0 ? ' (not a class)' : (hiddenClasses.indexOf(c) >= 0 ? ' (hidden)' : '')));
       o.value = c;
       if (c === b.label) o.selected = true;
       sel.appendChild(o);
@@ -436,7 +454,14 @@
     var order = [];
     bs.forEach(function (b, i) { if (isReview(b)) order.push(i); });
     bs.forEach(function (b, i) { if (!isReview(b)) order.push(i); });
-    order.forEach(function (i) { boxList.appendChild(boxItem(bs[i], i)); });
+    var offScreen = 0;
+    order.forEach(function (i) {
+      if (!isShown(bs[i])) { offScreen++; return; }
+      boxList.appendChild(boxItem(bs[i], i));
+    });
+    if (offScreen) {
+      boxList.appendChild(el('li', 'muted', offScreen + ' box(es) of other classes hidden by "Show boxes of" (still saved).'));
+    }
     if (!bs.length && cur) boxList.appendChild(el('li', 'muted', 'No box. Drag on the image to draw one.'));
     emptyBox.checked = !!(cur && cur.labels.empty_confirmed);
   }
@@ -525,7 +550,7 @@
   }
 
   function pickClass(n) {
-    var c = classes[n];
+    var c = visible()[n];
     if (c == null) return;
     if (selected >= 0) relabel(selected, c);
     else { classSel.value = c; say('New boxes: ' + c); }
@@ -713,7 +738,7 @@
     if (!hideBoxes) {
       boxes().forEach(function (bx, i) {
         var a = (bx.bbox[2] - bx.bbox[0]) * (bx.bbox[3] - bx.bbox[1]);
-        if (g.x0 >= bx.bbox[0] && g.x0 <= bx.bbox[2] && g.y0 >= bx.bbox[1] && g.y0 <= bx.bbox[3] && a < area) {
+        if (isShown(bx) && g.x0 >= bx.bbox[0] && g.x0 <= bx.bbox[2] && g.y0 >= bx.bbox[1] && g.y0 <= bx.bbox[3] && a < area) {
           best = i; area = a;
         }
       });
@@ -781,40 +806,40 @@
     sel.value = keep;
   }
 
-  // The Class filter: the class list plus the classes the queue saw (model labels outside the
-  // list too), the current choice kept. `rebuild` drops the options of an old class list.
-  function fillLabels(list, rebuild) {
-    var sel = $('rv-label');
-    if (!sel) return;
-    (list || []).forEach(function (c) { if (seenLabels.indexOf(c) < 0) seenLabels.push(c); });
-    var keep = sel.value;
-    if (rebuild) {
-      Array.prototype.slice.call(sel.options).forEach(function (o) { if (o.value) sel.removeChild(o); });
-    }
-    var have = Array.prototype.map.call(sel.options, function (o) { return o.value; });
-    var names = classes.concat(seenLabels);
-    if (keep && names.indexOf(keep) < 0) names.push(keep);
-    names.forEach(function (c) {
-      if (have.indexOf(c) < 0) { var o = el('option', null, c); o.value = c; sel.appendChild(o); have.push(c); }
+  // The class pickers' chips: the catalog's entries, the class list and the classes the queue
+  // saw (model labels outside the list too).
+  function buildEntries() {
+    var base = catalog && catalog.entries ? catalog.entries : [];
+    if (!CU) return [];
+    var out = CU.mergeEntries(base, classes.concat(seenLabels));
+    out.forEach(function (e) {
+      if (classes.indexOf(e.name) >= 0) e.in_list = true;
+      e.hidden = hiddenClasses.indexOf(e.name) >= 0;
     });
-    sel.value = keep;
+    return out;
+  }
+
+  // The Class filter: remember the classes the queue saw.
+  function fillLabels(list) {
+    (list || []).forEach(function (c) { if (seenLabels.indexOf(c) < 0) seenLabels.push(c); });
+    if (labelPicker) labelPicker.setEntries(buildEntries());
   }
 
   function fillClassSelect() {
     var keep = classSel.value;
     classSel.textContent = '';
-    classes.forEach(function (c, i) {
+    visible().forEach(function (c, i) {
       var o = el('option', null, (i + 1) + '. ' + c);
       o.value = c;
       classSel.appendChild(o);
     });
-    if (classes.indexOf(keep) >= 0) classSel.value = keep;
+    if (visible().indexOf(keep) >= 0) classSel.value = keep;
   }
 
   function fillKeyHint() {
     var k = $('rv-key-classes');
     if (!k) return;
-    var shown = classes.slice(0, 10).map(function (c, i) { return ((i + 1) % 10) + ' ' + c; });
+    var shown = visible().slice(0, 10).map(function (c, i) { return ((i + 1) % 10) + ' ' + c; });
     k.textContent = shown.length ? ' (' + shown.join(', ') + ')' : '';
   }
 
@@ -831,6 +856,9 @@
       cur.saved ? ('saved: ' + cur.labels.status) : 'not reviewed yet'];
     var ar = cur.labels && cur.labels.auto_run;
     if (ar) parts.push('auto-labelled' + (ar.labeler ? ' by ' + ar.labeler : '') + (ar.at ? ' ' + ar.at : ''));
+    if (ar && ar.classes && ar.classes.length && !cur.labels.boxes.some(function (b) { return b.source === 'auto'; })) {
+      parts.push('auto-label found nothing of: ' + ar.classes.join(', '));
+    }
     if (cur.labels && cur.labels.bulk_accepted) parts.push('bulk accepted');
     if (cur.stale_classes) parts.push('reviewed with another class list');
     if (cur.labels && cur.labels.disagreement) parts.push('back for review: ' + cur.labels.disagreement);
@@ -952,7 +980,16 @@
   $('rv-undo').addEventListener('click', doUndo);
   $('rv-accept-all').addEventListener('click', acceptProposals);
   emptyBox.addEventListener('change', function () { confirmEmpty(emptyBox.checked); });
-  filtersForm.addEventListener('change', function () { loadNext(); });
+  var filterTimer = null;
+  function filterChanged() {
+    if (filterTimer) clearTimeout(filterTimer);
+    filterTimer = setTimeout(function () { filterTimer = null; loadNext(); }, 200);
+  }
+  filtersForm.addEventListener('change', function (ev) {
+    // The class picker reports through its own onChange (one reload per change).
+    if (ev.target && ev.target.closest && ev.target.closest('.cp')) return;
+    loadNext();
+  });
   filtersForm.addEventListener('submit', function (ev) { ev.preventDefault(); loadNext(); });
 
   function typing(t) {
@@ -967,7 +1004,7 @@
     // The Browse dialog is modal: its keys are not review shortcuts.
     if (document.querySelector('dialog[open]')) return;
     var k = ev.key;
-    if (t && t.tagName === 'BUTTON' && (k === 'Enter' || k === ' ')) return;
+    if (t && (t.tagName === 'BUTTON' || t.tagName === 'SUMMARY') && (k === 'Enter' || k === ' ')) return;
     var handled = true;
     if (k === ' ') {
       spaceDown = true;
@@ -1034,8 +1071,9 @@
   // The filters of the queue become the job's frame filter.
   function autolabelFrames() {
     var parts = [];
+    // `label` (a comma list) goes in the form's own `label` field, not in this comma list.
     Array.prototype.forEach.call(filtersForm.elements, function (e) {
-      if (e.name && e.value) parts.push(e.name + '=' + e.value);
+      if (e.name && e.name !== 'label' && e.value) parts.push(e.name + '=' + e.value);
     });
     var lim = alForm.elements.limit && alForm.elements.limit.value;
     if (lim) parts.push('limit=' + lim);
@@ -1089,27 +1127,39 @@
   if (alForm) {
     alForm.addEventListener('submit', function (ev) {
       alForm.elements.frames.value = autolabelFrames();
+      if (alForm.elements.label) alForm.elements.label.value = filtersForm.elements.label ? filtersForm.elements.label.value : '';
       if (!window.fetch || !window.URLSearchParams) return;   // the plain form post
       ev.preventDefault();
+      var picked = alPicker ? alPicker.getSelected() : [];
+      if (alPicker && !picked.length) {
+        alStatus.className = 'review-report error-text';
+        report(alStatus, ['Choose at least one class to look for.']);
+        return;
+      }
       var body = new URLSearchParams();
       Array.prototype.forEach.call(alForm.elements, function (e) {
         if (!e.name || e.disabled) return;
         if ((e.type === 'checkbox' || e.type === 'radio') && !e.checked) return;
         body.append(e.name, e.value);
       });
+      picked.forEach(function (c) { body.append('classes', c); });
       alStatus.className = 'review-report';
+      var ready = alPicker && catalog ? CP.ensureInList(picked, catalog) : Promise.resolve(catalog);
       report(alStatus, ['Queueing...']);
-      api('/training/autolabel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-        body: body.toString()
+      ready.then(function () {
+        if (alPicker) { refreshPickers(); }
+        return api('/training/autolabel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+          body: body.toString()
+        });
       }).then(function (j) {
         var m = j.message || 'Queued.';
         report(alStatus, [/^Queued/.test(m) ? m : 'Queued: ' + m]);
         if (j.id) pollTask(j.id);
       }).catch(function (e) {
         alStatus.className = 'review-report error-text';
-        report(alStatus, [e.message]);
+        report(alStatus, [e.cancelled ? 'Not queued: the class list was left as it is.' : e.message]);
       });
     });
   }
@@ -1226,20 +1276,6 @@
     }).catch(function (e) { report(box, [e.message]); });
   });
 
-  $('rv-classes').addEventListener('submit', function (ev) {
-    ev.preventDefault();
-    var box = $('rv-classes-msg');
-    postJson('/v1/review/classes', { classes: list(ev.target.elements.classes.value) }).then(function (j) {
-      classes = j.classes;
-      fillClassSelect();
-      fillLabels(null, true);
-      fillKeyHint();
-      box.textContent = j.message || 'Saved.';
-      box.className = 'form-msg ok-text';
-      refresh();
-    }).catch(function (e) { box.textContent = e.message; box.className = 'form-msg error-text'; });
-  });
-
   function setFolder(dir) {
     var box = $('rv-folder-msg');
     box.textContent = 'Switching...';
@@ -1257,6 +1293,131 @@
     $('rv-folder-reset').addEventListener('click', function () { setFolder(''); });
   }
 
+  // The Classes card. Without the picker the comma text field saves as before.
+  function afterClassesSaved(j) {
+    classes = j.classes;
+    if (j.hidden) hiddenClasses = j.hidden;
+    if (catalog) { catalog.classes = classes.slice(); catalog.hidden = hiddenClasses.slice(); }
+    hideSet = {};
+    classes.forEach(function (c) { hideSet[c] = hiddenClasses.indexOf(c) >= 0; });
+    fillClassSelect();
+    fillKeyHint();
+    refreshPickers();
+    refresh();
+  }
+
+  $('rv-classes').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var box = $('rv-classes-msg');
+    var body;
+    if (classesPicker) {
+      var list_ = classesPicker.getSelected();
+      if (!list_.length) {
+        box.textContent = 'Keep at least one class in the list.';
+        box.className = 'form-msg error-text';
+        return;
+      }
+      var change = CU.classChange(classes, list_);
+      if (change.idsChange && !window.confirm(
+        (change.removed.length ? 'Remove ' + change.removed.join(', ') + ' from the class list. ' : '') +
+        (change.reordered ? 'The order of the classes changes. ' : '') +
+        'YOLO class ids of later exports change (frames you exported before keep the old ids), and reviewed frames ' +
+        'labelled with a removed class keep their labels but are marked as reviewed with another class list. Continue?')) {
+        box.textContent = 'Not saved.';
+        box.className = 'form-msg';
+        return;
+      }
+      body = { classes: list_, hidden: hideChecked(list_) };
+    } else {
+      body = { classes: list(ev.target.elements.classes.value) };
+    }
+    postJson('/v1/review/classes', body).then(function (j) {
+      afterClassesSaved(j);
+      box.textContent = j.message || 'Saved.';
+      box.className = 'form-msg ok-text';
+    }).catch(function (e) { box.textContent = e.message; box.className = 'form-msg error-text'; });
+  });
+
+  // ---- class pickers ------------------------------------------------------------------------
+
+  var hideSet = {};   // Classes card: class -> "hide in Review" ticked
+
+  function hideChecked(selectedList) {
+    return selectedList.filter(function (c) { return hideSet[c]; });
+  }
+
+  function refreshPickers() {
+    var entries = buildEntries();
+    if (labelPicker) labelPicker.setEntries(entries);
+    if (showPicker) showPicker.setEntries(entries);
+    if (alPicker) {
+      alPicker.setEntries(entries);
+      if (catalog) alPicker.setQuickSets(CU.quickSetsFor(catalog));
+    }
+    if (classesPicker) classesPicker.setEntries(entries);
+  }
+
+  function initPickers() {
+    if (!CP) return;
+    var entries = buildEntries();
+    var labelHidden = $('rv-label');
+    var fb = $('rv-label-fallback');
+    var holder = $('rv-label-picker');
+    if (holder && labelHidden) {
+      var reload = filterChanged;
+      labelPicker = CP.create(holder, {
+        entries: entries, selected: [], mode: 'compact', label: 'Class', emptyText: 'any',
+        onChange: function (sel) { labelHidden.value = sel.join(','); reload(); }
+      });
+    }
+    var showHolder = $('rv-show-picker');
+    if (showHolder) {
+      showPicker = CP.create(showHolder, {
+        entries: entries, selected: [], mode: 'compact', emptyText: 'all classes',
+        onChange: function (sel) { shownLabels = sel; refresh(); }
+      });
+    }
+    var alHolder = $('rv-al-picker');
+    if (alHolder) {
+      alPicker = CP.create(alHolder, {
+        entries: entries, selected: catalog ? CU.defaultSelection(catalog) : visible(), mode: 'full', allowAdd: true,
+        quickSets: catalog ? CU.quickSetsFor(catalog) : []
+      });
+    }
+    var clsHolder = $('rv-classes-picker');
+    if (clsHolder) {
+      classes.forEach(function (c) { hideSet[c] = hiddenClasses.indexOf(c) >= 0; });
+      classesPicker = CP.create(clsHolder, {
+        entries: entries, selected: classes.slice(), mode: 'full', allowAdd: true,
+        extra: function (entry, chip) {
+          var lab = el('label', 'cp-extra');
+          var cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.checked = !!hideSet[entry.name];
+          cb.setAttribute('aria-label', 'Hide ' + entry.name + ' in Review');
+          cb.addEventListener('change', function () { hideSet[entry.name] = cb.checked; });
+          lab.appendChild(cb);
+          lab.appendChild(document.createTextNode('hide in Review'));
+          chip.appendChild(lab);
+        }
+      });
+      var plain = $('rv-classes').elements.classes;
+      if (plain) plain.hidden = true;
+    }
+  }
+
   fillKeyHint();
+  if (CP) {
+    CP.fetchCatalog().then(function (c) {
+      catalog = c;
+      if (Array.isArray(c.classes)) classes = c.classes;
+      hiddenClasses = Array.isArray(c.hidden) ? c.hidden : [];
+      fillClassSelect();
+      fillKeyHint();
+    }).catch(function () { catalog = null; }).then(function () {
+      initPickers();
+      refresh();
+    });
+  }
   loadNext();
 })();

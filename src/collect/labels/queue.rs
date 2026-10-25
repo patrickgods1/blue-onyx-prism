@@ -45,7 +45,9 @@ pub enum AutoFilter {
     Review,
     /// The triage alone settles the frame ([`super::auto_accept_eligible`]).
     Accept,
-    /// Auto-labelled ([`LabelFile::auto_run`]) and no box carries auto evidence.
+    /// Auto-labelled ([`LabelFile::auto_run`]) and no box carries auto evidence: the run found
+    /// nothing of the classes it looked for ([`super::AutoRun::classes`]; empty = the whole
+    /// class list of the time), which says nothing about the other classes.
     Nothing,
     /// Never auto-labelled: no `auto_run` and no box with auto evidence (frames without a label
     /// file too).
@@ -90,8 +92,8 @@ pub struct Filters {
     pub bucket: Option<Bucket>,
     pub scene: Option<String>,
     pub camera: Option<String>,
-    /// Only frames with this class ([`frame_labels`]).
-    pub label: Option<String>,
+    /// Only frames with any of these classes ([`frame_labels`]); empty = any frame.
+    pub label: BTreeSet<String>,
     pub status: StatusFilter,
     pub source: QueueSource,
     /// Only frames in this auto-label state.
@@ -99,7 +101,8 @@ pub struct Filters {
 }
 
 impl Filters {
-    /// From query parameters (`bucket`, `scene`, `camera`, `label`, `status` = `unreviewed|reviewed|
+    /// From query parameters (`bucket`, `scene`, `camera`, `label` = a comma list, any of
+    /// them, empty items ignored, `status` = `unreviewed|reviewed|
     /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none`); empty values
     /// mean "any". Errors name the field.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
@@ -125,12 +128,14 @@ impl Filters {
                 format!("status: '{s}' is not unreviewed, reviewed, skipped or any")
             })?),
         };
-        let label = match get("label") {
-            None => None,
-            Some(l) if super::super::config::validate_classes(&[l.to_string()]).is_ok() => {
-                Some(l.to_string())
-            }
-            Some(l) => {
+        let mut label = BTreeSet::new();
+        for l in get("label")
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            if super::super::config::validate_classes(&[l.to_string()]).is_err() {
                 return Err(format!(
                     "label: '{}' is not a valid class name (1 to {} characters, no control \
                      characters); pick a class from the list",
@@ -138,7 +143,8 @@ impl Filters {
                     super::super::config::MAX_CLASS_LEN
                 ));
             }
-        };
+            label.insert(l.to_string());
+        }
         let source = match get("source") {
             None | Some("queue") => QueueSource::Queue,
             Some("all") => QueueSource::All,
@@ -425,7 +431,7 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
             continue;
         };
         let classes = frame_labels(&rec, labels.as_ref());
-        let keep = f.label.as_ref().is_none_or(|l| classes.contains(l));
+        let keep = f.label.is_empty() || f.label.iter().any(|l| classes.contains(l));
         seen_labels.extend(classes);
         if !keep {
             continue;
@@ -642,11 +648,19 @@ mod tests {
         assert_eq!(q(&[("auto", "")]).unwrap().auto, None);
         assert!(q(&[("auto", "maybe")]).unwrap_err().contains("auto"));
         assert_eq!(q(&[("bucket", "")]).unwrap().bucket, None);
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
         assert_eq!(
-            q(&[("label", " fire hydrant ")]).unwrap().label.as_deref(),
-            Some("fire hydrant")
+            q(&[("label", " fire hydrant ")]).unwrap().label,
+            set(&["fire hydrant"])
         );
-        assert_eq!(q(&[("label", "")]).unwrap().label, None);
+        assert_eq!(
+            q(&[("label", "dog, ,cat,dog,")]).unwrap().label,
+            set(&["cat", "dog"]),
+            "a comma list, empty items ignored"
+        );
+        assert!(q(&[("label", "")]).unwrap().label.is_empty());
+        assert!(q(&[("label", " , ")]).unwrap().label.is_empty());
+        assert!(q(&[("label", "dog,a\u{7}b")]).is_err());
         let e = q(&[("label", "a\u{7}b")]).unwrap_err();
         assert!(
             e.contains("label") && e.contains("not a valid class name"),
@@ -732,7 +746,9 @@ mod tests {
         let filters = |label: Option<&str>| Filters {
             source: QueueSource::All,
             status: StatusFilter::Any,
-            label: label.map(str::to_string),
+            label: label
+                .map(|l| l.split(',').map(str::to_string).collect())
+                .unwrap_or_default(),
             ..Filters::default()
         };
         let frames = |q: &Queue| {
@@ -757,6 +773,12 @@ mod tests {
             ["a.jpg", "bb.jpg"]
         );
         assert!(build(&dir, &filters(Some("deer"))).items.is_empty());
+        assert_eq!(
+            frames(&build(&dir, &filters(Some("cat,dog")))),
+            ["bb.jpg", "dddd.jpg"],
+            "any of the classes"
+        );
+        assert_eq!(build(&dir, &filters(Some("cat,dog"))).counts.total, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -772,6 +794,7 @@ mod tests {
             auto_run: ran.then(|| AutoRun {
                 at: "t".into(),
                 labeler: "l".into(),
+                classes: vec![],
             }),
             ..LabelFile::default()
         };

@@ -27,9 +27,16 @@ fn tmp(tag: &str) -> Tmp {
     Tmp(d)
 }
 
-/// A synthetic frame: pattern `i` (distinct dHashes), gray (IR) or coloured (day).
+/// A synthetic frame: pattern `i` (distinct dHashes), gray (IR) or coloured (day); the size of
+/// the fake's candidates.
 fn jpeg(i: usize, gray: bool) -> Vec<u8> {
-    let (w, h) = (48u32, 32u32);
+    jpeg_sized(i, gray, 48, 32)
+}
+
+/// The fake video's full resolution (its candidates are [`jpeg`]'s 48x32).
+const FULL: (u32, u32) = (96, 64);
+
+fn jpeg_sized(i: usize, gray: bool, w: u32, h: u32) -> Vec<u8> {
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
     for y in 0..h {
         for x in 0..w {
@@ -75,6 +82,18 @@ struct ImportFake {
     cancel_at: usize,
     /// Every extraction reports `capped` (it stopped at its `--max-frames`).
     capped: bool,
+    /// Frames (file names) `frames` reports missing.
+    missing: Vec<&'static str>,
+    /// An extraction of a video whose path contains this fails with a full disk.
+    disk_full_on: Option<&'static str>,
+    /// Delete the video after extracting it (gone before the second pass).
+    delete_video: bool,
+    /// Check the cancel flag between frames (a helper the runner kills).
+    killable: bool,
+    /// Block every extraction until it is cancelled (at most 10 s).
+    block: bool,
+    /// The lists `frames` got.
+    lists: Mutex<Vec<serde_json::Value>>,
 }
 
 impl ImportFake {
@@ -116,17 +135,57 @@ impl ImportFake {
             on_line("[import_footage] error: cannot open the video");
             bail!("the helper failed (exit 1)");
         }
+        if let Some(bad) = self.disk_full_on
+            && video.to_string_lossy().contains(bad)
+        {
+            on_line(
+                "[import_footage] error: no space left on device writing f_000003.jpg ([Errno \
+                 28] No space left on device)",
+            );
+            return Err(crate::resources::export::ChildFailed {
+                program: "python".into(),
+                status: "exit code: 1".into(),
+                lines: vec![
+                    "[import_footage] error: no space left on device writing f_000003.jpg".into(),
+                ],
+            }
+            .into());
+        }
+        if self.block {
+            let t = std::time::Instant::now();
+            while !cancel.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            crate::training::pyenv::check(cancel)?;
+        }
         let out = arg_after(cmd, "--out").unwrap();
         std::fs::create_dir_all(&out).unwrap();
+        assert_eq!(
+            arg_after(cmd, "--max-side").unwrap(),
+            PathBuf::from(disk::CANDIDATE_MAX_SIDE.to_string())
+        );
         on_line(r#"@import {"event":"start","decoder":"hw:videotoolbox"}"#);
         for i in 0..self.frames {
+            if self.killable {
+                crate::training::pyenv::check(cancel)?;
+            }
             let name = format!("f_{i:06}.jpg");
             let pat = if self.duplicates { 0 } else { i };
             std::fs::write(out.join(&name), jpeg(pat, i < self.gray)).unwrap();
+            // The frame's own time (pts) and decode index (n, 25 fps) beside the time from the
+            // start; the source is FULL, the stored candidate 48x32.
             on_line(&format!(
-                "@import {{\"event\":\"frame\",\"file\":\"{name}\",\"t\":{}.5,\"w\":48,\"h\":32}}",
-                i * 10
+                "@import {{\"event\":\"frame\",\"file\":\"{name}\",\"t\":{}.5,\"w\":48,\"h\":32,\
+                 \"sw\":{},\"sh\":{},\"pts\":{}.5,\"n\":{},\"full\":false}}",
+                i * 10,
+                FULL.0,
+                FULL.1,
+                i * 10 + 100,
+                (i * 10 + 100) * 25 + 12
             ));
+        }
+        if self.delete_video {
+            std::fs::remove_file(&video).unwrap();
         }
         on_line("[import_footage] some log line");
         on_line(&format!(
@@ -134,6 +193,44 @@ impl ImportFake {
             self.frames, self.capped
         ));
         Ok(())
+    }
+
+    /// The fake `import_footage.py frames`: the listed frames at full resolution, the same
+    /// picture as the candidate of that number.
+    fn refetch(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str)) {
+        let list = arg_after(cmd, "--list").unwrap();
+        let out = arg_after(cmd, "--out").unwrap();
+        let items: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&list).unwrap()).unwrap();
+        self.lists.lock().unwrap().push(items.clone());
+        std::fs::create_dir_all(&out).unwrap();
+        for it in items.as_array().unwrap() {
+            let name = it["name"].as_str().unwrap();
+            if self.missing.contains(&name) {
+                on_line(&format!(
+                    "@import {}",
+                    serde_json::json!({"event": "missing", "name": name, "reason": "no frame at 1.000 s"})
+                ));
+                continue;
+            }
+            let i: usize = name
+                .trim_start_matches("f_")
+                .trim_end_matches(".jpg")
+                .parse()
+                .unwrap();
+            let pat = if self.duplicates { 0 } else { i };
+            std::fs::write(
+                out.join(name),
+                jpeg_sized(pat, i < self.gray, FULL.0, FULL.1),
+            )
+            .unwrap();
+            on_line(&format!(
+                "@import {}",
+                serde_json::json!({"event": "frame", "name": name, "pts": it["pts"], "n": it["n"],
+                    "w": FULL.0, "h": FULL.1})
+            ));
+        }
+        on_line(r#"@import {"event":"done"}"#);
     }
 
     fn script_cmds(&self, sub: &str) -> Vec<Cmd> {
@@ -164,6 +261,8 @@ impl CommandRunner for ImportFake {
             let r = self.extract(cmd, on_line, cancel);
             self.active.fetch_sub(1, Ordering::SeqCst);
             r?;
+        } else if cmd.args.iter().any(|a| a == "frames") {
+            self.refetch(cmd, on_line);
         } else if cmd.args.iter().any(|a| a == "fetch-url") {
             let out = arg_after(cmd, "--out").unwrap();
             std::fs::create_dir_all(&out).unwrap();
@@ -731,4 +830,307 @@ fn a_cancel_stops_every_extraction() {
         "no video started after the cancel"
     );
     assert!(!root.join("dataset/imports.jsonl").exists());
+}
+
+/// The size of a JPEG file.
+fn jpeg_size(p: &Path) -> (u32, u32) {
+    let img = crate::image::decode(&std::fs::read(p).unwrap()).unwrap();
+    (img.width, img.height)
+}
+
+fn warnings(rep: &serde_json::Value) -> Vec<String> {
+    rep["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn kept_frames_are_extracted_again_at_full_resolution_by_their_time() {
+    let t = tmp("twopass");
+    let root = &t.0;
+    std::fs::write(root.join("clip.mp4"), b"v").unwrap();
+    let mut req = path_request(root.join("clip.mp4"));
+    req.frames = 3;
+    req.keep_work = true;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let fake = ImportFake::new(8, 2);
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    assert_eq!(
+        (rep["candidates"].as_u64(), rep["frames"].as_u64()),
+        (Some(8), Some(3))
+    );
+    // One second pass for the video, with the kept frames only, by the video's own time.
+    let ex = fake.script_cmds("frames");
+    assert_eq!(ex.len(), 1);
+    assert!(arg_after(&ex[0], "--video").unwrap().ends_with("clip.mp4"));
+    assert_eq!(
+        arg_after(&ex[0], "--hwaccel").unwrap(),
+        PathBuf::from("auto")
+    );
+    let lists = fake.lists.lock().unwrap().clone();
+    let items = lists[0].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    for it in items {
+        let i: u64 = it["name"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("f_")
+            .trim_end_matches(".jpg")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            it["pts"].as_f64(),
+            Some((i * 10 + 100) as f64 + 0.5),
+            "{it}"
+        );
+        assert_eq!(it["n"].as_u64(), Some((i * 10 + 100) * 25 + 12), "{it}");
+    }
+    // The dataset has the full-resolution frames; the record says so.
+    let dir = root.join("dataset");
+    let recs = records(&dir);
+    assert_eq!(recs.len(), 3);
+    for rec in &recs {
+        assert_eq!((rec.width, rec.height), FULL);
+        // The time offset stays the one from the start of the video.
+        let off = rec.provenance.as_ref().unwrap().time_offset_s.unwrap();
+        assert!((off - 0.5) % 10.0 == 0.0, "{off}");
+    }
+    for c in crate::collect::labels::queue::candidates(
+        &dir,
+        crate::collect::labels::queue::QueueSource::Queue,
+    ) {
+        let f = crate::collect::labels::Frame::resolve(&dir, &c.rel).unwrap();
+        assert_eq!(jpeg_size(&f.jpg), FULL, "never a downscaled frame");
+    }
+    // Kept work: the candidates are the small ones, the full frames went to the dataset.
+    assert_eq!(
+        jpeg_size(&job.work.join("frames/v0000/f_000000.jpg")),
+        (48, 32)
+    );
+}
+
+#[test]
+fn a_frame_not_found_again_is_skipped_never_written_downscaled() {
+    let t = tmp("missing");
+    let root = &t.0;
+    std::fs::write(root.join("clip.mp4"), b"v").unwrap();
+    let mut req = path_request(root.join("clip.mp4"));
+    req.frames = 10;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(4, 0);
+    fake.missing = vec!["f_000001.jpg"];
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    assert_eq!(rep["frames"], 3, "{rep}");
+    let w = warnings(&rep);
+    assert!(
+        w.iter().any(|w| w
+            == "clip.mp4: 1 kept frame(s) not found again at full resolution and skipped (no \
+                frame at 1.000 s)"),
+        "{w:?}"
+    );
+    assert!(
+        records(&root.join("dataset"))
+            .iter()
+            .all(|r| (r.width, r.height) == FULL)
+    );
+    assert!(!job.work.exists());
+}
+
+#[test]
+fn a_video_gone_before_the_second_pass_is_a_warning_and_images_are_copied_as_they_are() {
+    let t = tmp("gone");
+    let root = &t.0;
+    let clips = root.join("clips");
+    std::fs::create_dir_all(&clips).unwrap();
+    std::fs::write(clips.join("Drive.20240101_010101.mp4"), b"v").unwrap();
+    let img = jpeg_sized(5, false, 80, 60);
+    std::fs::write(clips.join("Gate.20240102_120000.jpg"), &img).unwrap();
+    let mut req = path_request(clips);
+    req.frames = 10;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(3, 0);
+    fake.delete_video = true;
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    assert_eq!(rep["frames"], 1, "{rep}");
+    let w = warnings(&rep);
+    assert!(
+        w.iter().any(|w| w
+            == "Drive.20240101_010101.mp4: the video is gone, so its 3 kept frame(s) cannot be \
+                written at full resolution and were skipped"),
+        "{w:?}"
+    );
+    // The image: no second pass, the file as it is.
+    let dir = root.join("dataset");
+    let c = crate::collect::labels::queue::candidates(
+        &dir,
+        crate::collect::labels::queue::QueueSource::Queue,
+    );
+    assert_eq!(c.len(), 1);
+    let f = crate::collect::labels::Frame::resolve(&dir, &c[0].rel).unwrap();
+    assert_eq!(std::fs::read(&f.jpg).unwrap(), img);
+    assert!(fake.script_cmds("frames").is_empty());
+}
+
+#[test]
+fn a_full_disk_in_the_helper_ends_the_import_with_advice_and_removes_the_work_folder() {
+    let t = tmp("enospc");
+    let root = &t.0;
+    videos(&root.join("clips"), 3);
+    let mut req = path_request(root.join("clips"));
+    req.workers = 1;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(2, 0);
+    fake.disk_full_on = Some("v1.mp4");
+    let (r, _) = run(&job, &fake);
+    let e = r.unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::resources::export::Cancelled>()
+            .is_none()
+    );
+    let m = e.to_string();
+    assert!(
+        m.starts_with(&format!(
+            "the import stopped: the disk under {} is full (",
+            job.work.display()
+        )),
+        "{m}"
+    );
+    assert!(
+        m.contains("free some space, lower Candidates per video (--max-candidates)"),
+        "{m}"
+    );
+    assert!(m.ends_with("; the work folder was removed"), "{m}");
+    assert!(!m.contains("Errno"), "no raw OS error: {m}");
+    assert!(!job.work.exists());
+    assert!(!root.join("dataset/imports.jsonl").exists());
+    // Not a per-video warning: nothing after the full disk was started.
+    assert_eq!(fake.script_cmds("extract").len(), 2);
+}
+
+/// Free space for the guard tests: plenty for the first `GUARD_OK` probes, then nearly none.
+static PROBES: AtomicUsize = AtomicUsize::new(0);
+const GUARD_OK: usize = 2;
+
+fn filling(_: &Path) -> Option<disk::Space> {
+    let n = PROBES.fetch_add(1, Ordering::SeqCst);
+    Some(disk::Space {
+        available: if n < GUARD_OK {
+            500_000_000_000
+        } else {
+            10_000_000
+        },
+        total: 1_000_000_000_000,
+    })
+}
+
+#[test]
+fn the_guard_stops_the_helpers_before_the_disk_fills_up() {
+    let t = tmp("guard");
+    let root = &t.0;
+    videos(&root.join("clips"), 3);
+    let mut req = path_request(root.join("clips"));
+    req.workers = 1;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(200, 0);
+    fake.killable = true;
+    let cancel = AtomicBool::new(false);
+    // Probe 1: the first video's start; 2: its 20th frame; 3 (40th frame): low.
+    let r = job.run_guarded(
+        TaskContext {
+            runner: &fake,
+            fetcher: &fake,
+        },
+        &mut |_| {},
+        &cancel,
+        disk::Guard::with_probe(&job.work, &job.dataset_dir, filling),
+    );
+    let m = r.unwrap_err().to_string();
+    assert!(
+        m.starts_with(&format!(
+            "the import stopped before the disk filled up: 10 MB free under {}, below the 2.7 GB \
+             it keeps free while running; free some space, lower Candidates per video",
+            job.work.display()
+        )),
+        "{m}"
+    );
+    assert!(m.ends_with("; the work folder was removed"), "{m}");
+    assert_eq!(
+        fake.script_cmds("extract").len(),
+        1,
+        "no video after the trip"
+    );
+    assert!(!job.work.exists());
+    assert!(
+        !cancel.load(Ordering::SeqCst),
+        "the task itself was not cancelled"
+    );
+}
+
+#[test]
+fn the_task_cancel_reaches_the_running_helpers() {
+    let t = tmp("mirror");
+    let root = &t.0;
+    videos(&root.join("clips"), 2);
+    let mut req = path_request(root.join("clips"));
+    req.workers = 1;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(2, 0);
+    fake.block = true;
+    let cancel = AtomicBool::new(false);
+    let started = std::time::Instant::now();
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            while fake.active.load(Ordering::SeqCst) == 0
+                && started.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            cancel.store(true, Ordering::SeqCst);
+        });
+        job.run(
+            TaskContext {
+                runner: &fake,
+                fetcher: &fake,
+            },
+            &mut |_| {},
+            &cancel,
+        )
+    });
+    let e = r.unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::resources::export::Cancelled>()
+            .is_some(),
+        "{e:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(fake.script_cmds("extract").len(), 1);
+}
+
+#[test]
+fn extract_events_parse_with_and_without_the_source_fields() {
+    let ev = serde_json::json!({"event": "frame", "file": "f_000001.jpg", "t": 1.5, "w": 640,
+        "h": 360, "sw": 1920, "sh": 1080, "pts": 101.5, "n": 2537, "full": false});
+    assert_eq!(
+        Found::parse(&ev),
+        Some(Found {
+            file: "f_000001.jpg".into(),
+            t: 1.5,
+            pts: Some(101.5),
+            n: Some(2537),
+            width: 1920,
+            height: 1080,
+            full: false,
+        })
+    );
+    // An event without them: the stored frame is the full one.
+    let old = serde_json::json!({"event": "frame", "file": "f.jpg", "t": 2.0, "w": 48, "h": 32});
+    let f = Found::parse(&old).unwrap();
+    assert!(f.full && (f.width, f.height) == (48, 32) && f.pts.is_none());
+    assert!(Found::parse(&serde_json::json!({"file": "f.jpg"})).is_none());
 }

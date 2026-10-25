@@ -82,7 +82,8 @@ COCO_NAMES = {
     "teddy bear", "hair drier", "toothbrush",
 }
 ALIASES = {"motorbike": "motorcycle", "people": "person", "pedestrian": "person", "bike": "bicycle",
-           "sofa": "couch", "tvmonitor": "tv", "aeroplane": "airplane"}
+           "sofa": "couch", "tvmonitor": "tv", "aeroplane": "airplane",
+           "pottedplant": "potted plant", "diningtable": "dining table"}
 
 # Default synonyms of the default class list (the service passes its own map, `training.synonyms`).
 DEFAULT_SYNONYMS = {

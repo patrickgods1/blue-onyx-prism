@@ -157,8 +157,9 @@ const FILTER_FIELDS: [&str; 6] = ["status", "scene", "camera", "label", "auto", 
 /// The frame filter text of an auto-label form: the raw `frames` text (the Training page's
 /// "Other filters", the Review page's and older forms' whole filter) followed by the structured
 /// fields `status`, `scene`, `camera`, `label`, `auto`, `limit` and `again` (ticked = `again=1`)
-/// whose key the raw text does not already name. A comma in a field's value is refused (it
-/// would split the filter).
+/// whose key the raw text does not already name. `label` is a comma list of classes (any of
+/// them), written `label=a|b`; a comma in another field's value is refused (it would split the
+/// filter).
 pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String> {
     let raw = field(f, "frames").unwrap_or("");
     let named: Vec<String> = raw
@@ -174,10 +175,21 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
         if let Some(v) = field(f, k)
             && !named.iter().any(|n| n == k)
         {
-            if v.contains(',') {
+            // Class pickers post `label` as a comma list; the frame filter's any-of is `|`.
+            let v = if k == "label" {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            } else if v.contains(',') {
                 anyhow::bail!("{k}: '{v}' has a comma, which the frame filter cannot hold");
+            } else {
+                v.to_string()
+            };
+            if !v.is_empty() {
+                parts.push(format!("{k}={v}"));
             }
-            parts.push(format!("{k}={v}"));
         }
     }
     if field(f, "again").is_some() && !named.iter().any(|n| n == "again") {
@@ -522,6 +534,20 @@ mod tests {
         assert_eq!(frame_filter_text(&form(&[("limit", "")])).unwrap(), "");
         let e = frame_filter_text(&form(&[("camera", "a,b")])).unwrap_err();
         assert!(e.to_string().contains("camera"), "{e}");
+        // A class picker's comma list becomes the filter's any-of and reaches the job.
+        let t = frame_filter_text(&form(&[("label", "person, car,")])).unwrap();
+        assert_eq!(t, "label=person|car");
+        let r = autolabel_from_form(&form(&[("label", "person,car"), ("limit", "5")])).unwrap();
+        assert_eq!(r.frames.limit, 5, "not split into key=value pairs");
+        assert_eq!(
+            r.frames.query.get("label").map(String::as_str),
+            Some("person|car")
+        );
+        let want: std::collections::BTreeSet<String> =
+            ["person".to_string(), "car".to_string()].into();
+        assert_eq!(r.frames.filters().unwrap().label, want, "any of them");
+        assert_eq!(frame_filter_text(&form(&[("label", " , ")])).unwrap(), "");
+        assert!(autolabel_from_form(&form(&[("label", "ok,a\u{7}b")])).is_err());
         // A bad value is refused by the filter with its key.
         let e = autolabel_from_form(&form(&[("auto", "maybe")])).unwrap_err();
         assert!(e.to_string().contains("auto"), "{e}");

@@ -19,10 +19,13 @@
 //! Python side only returns proposals as JSONL. Nothing is deleted or accepted automatically:
 //! hard negatives come from the reviewer only.
 //!
+//! - [`catalog`]: the class catalog of the Review page's picker, [`catalog::coco_class`] and
+//!   the classes the enabled models report.
 //! - [`triage`]: pure: the triage rule, proposals to label boxes, the re-label disagreement.
 //! - [`relabel`]: detection with a configured model in this process.
 //! - [`job`]: the stage machine ([`AutolabelJob`], a [`super::task::Task`]).
 
+pub mod catalog;
 pub mod job;
 pub mod relabel;
 pub mod triage;
@@ -32,7 +35,7 @@ pub use job::AutolabelJob;
 use super::capability::Capability;
 use crate::collect::labels::queue::Filters;
 use crate::config::Config;
-use crate::resources::catalog::{self, Platform, Resource};
+use crate::resources::catalog::{self as res_catalog, Platform, Resource};
 use crate::resources::export::train::{self as env, TrainPaths};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -192,7 +195,8 @@ impl VlmSize {
 }
 
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
-/// `label`, `status`, `source`, `auto`), `import=<id>|any` (imported frames), `again=1` (also
+/// `label` (any of several classes, separated by `|`: `label=person|car`), `status`, `source`,
+/// `auto`), `import=<id>|any` (imported frames), `again=1` (also
 /// frames these labelers already looked at, see [`crate::collect::labels::AutoRun`]) and `limit`
 /// (most frames, in queue order). Written `key=value` pairs separated by commas
 /// (`scene=ir,status=unreviewed,limit=20`).
@@ -255,6 +259,11 @@ impl FrameFilter {
         let mut q = self.query.clone();
         q.remove("import");
         q.remove("again");
+        // `|` separates the classes here (a comma separates the filters); the queue takes a
+        // comma list.
+        if let Some(l) = q.get_mut("label") {
+            *l = l.replace('|', ",");
+        }
         Filters::from_query(&q).map_err(anyhow::Error::msg)
     }
 
@@ -368,19 +377,25 @@ impl AutolabelRequest {
             return Vec::new();
         }
         let mut v = Vec::new();
-        if let Some(g) = self.gdino.and_then(|g| catalog::autolabel_weights(g.key())) {
+        if let Some(g) = self
+            .gdino
+            .and_then(|g| res_catalog::autolabel_weights(g.key()))
+        {
             v.push(g);
         }
         if self.rfdetr
-            && let Some(r) = catalog::base_weights(catalog::TrainFamily::Rfdetr, "large")
+            && let Some(r) = res_catalog::base_weights(res_catalog::TrainFamily::Rfdetr, "large")
         {
             v.push(r);
         }
-        if let Some(q) = self.vlm.and_then(|q| catalog::autolabel_weights(q.key())) {
+        if let Some(q) = self
+            .vlm
+            .and_then(|q| res_catalog::autolabel_weights(q.key()))
+        {
             v.push(q);
         }
         if self.siglip
-            && let Some(s) = catalog::autolabel_weights("siglip2-base")
+            && let Some(s) = res_catalog::autolabel_weights("siglip2-base")
         {
             v.push(s);
         }
@@ -396,14 +411,7 @@ pub fn plan_autolabel(
     cap: &Capability,
 ) -> Result<AutolabelJob> {
     request.validate()?;
-    let classes = request
-        .classes
-        .clone()
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| config.collect.classes.clone());
-    if classes.is_empty() {
-        bail!("no classes: set collect.classes (Review page, Classes)");
-    }
+    let classes = run_classes(&config.collect.classes, request.classes.as_deref())?;
     let paths = TrainPaths::for_config(config);
     let platform = Platform::current();
     let allow_large = request.allow_large || config.allow_large_downloads;
@@ -431,7 +439,7 @@ pub fn plan_autolabel(
             bail!(
                 "the auto-labelers run in the training environment (about {} download); rerun \
                  with --allow-large (Training page: tick the download confirmation)",
-                catalog::format_size(dl)
+                res_catalog::format_size(dl)
             );
         }
         let list: Vec<(&'static Resource, std::path::PathBuf)> = request
@@ -457,6 +465,37 @@ pub fn plan_autolabel(
         config: Box::new(config.clone()),
         detector: None,
     })
+}
+
+/// The classes of a run: `requested` (None or empty = every class of `review_classes`), each
+/// matched case-insensitively to a class of `review_classes` (`collect.classes`) and given its
+/// spelling there, once each, in `review_classes` order. A class outside the list is refused: the
+/// reviewer could not accept its boxes.
+pub fn run_classes(review_classes: &[String], requested: Option<&[String]>) -> Result<Vec<String>> {
+    if review_classes.is_empty() {
+        bail!("no classes: set collect.classes (Review page, Classes)");
+    }
+    let Some(req) = requested.filter(|r| r.iter().any(|c| !c.trim().is_empty())) else {
+        return Ok(review_classes.to_vec());
+    };
+    let unknown: Vec<&str> = req
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty() && !review_classes.iter().any(|r| r.eq_ignore_ascii_case(c)))
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "class(es) {} are not in collect.classes ({}); add them to the class list first \
+             (Review page, Classes)",
+            unknown.join(", "),
+            review_classes.join(", ")
+        );
+    }
+    Ok(review_classes
+        .iter()
+        .filter(|r| req.iter().any(|c| c.trim().eq_ignore_ascii_case(r)))
+        .cloned()
+        .collect())
 }
 
 /// Whether a status filter would list reviewed frames (the self-training default).
@@ -487,7 +526,13 @@ mod tests {
             assert!(FrameFilter::parse(bad, "any").is_err(), "{bad}");
         }
         let l = FrameFilter::parse("label=person", "unreviewed").unwrap();
-        assert_eq!(l.filters().unwrap().label.as_deref(), Some("person"));
+        assert_eq!(l.filters().unwrap().label, ["person".to_string()].into());
+        let any = FrameFilter::parse("label=person| car |,status=any", "unreviewed").unwrap();
+        assert_eq!(
+            any.filters().unwrap().label,
+            ["person".to_string(), "car".into()].into()
+        );
+        assert!(FrameFilter::parse("label=ok|a\u{7}b", "any").is_err());
         assert!(!l.again());
         let a = FrameFilter::parse("auto=none,again=Yes", "unreviewed").unwrap();
         assert!(a.again());
@@ -500,6 +545,21 @@ mod tests {
             assert!(FrameFilter::parse(bad, "any").is_err(), "{bad}");
         }
         assert!(f.describe().contains("scene=ir"));
+    }
+
+    #[test]
+    fn run_classes_are_listed_classes_in_list_order() {
+        let list: Vec<String> = ["person", "car", "Raccoon"].map(String::from).to_vec();
+        assert_eq!(run_classes(&list, None).unwrap(), list);
+        assert_eq!(run_classes(&list, Some(&[])).unwrap(), list);
+        assert_eq!(run_classes(&list, Some(&[" ".into()])).unwrap(), list);
+        let req: Vec<String> = ["raccoon", " CAR ", "car"].map(String::from).to_vec();
+        assert_eq!(run_classes(&list, Some(&req)).unwrap(), ["car", "Raccoon"]);
+        let e = run_classes(&list, Some(&["dog".into(), "car".into()]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("dog") && e.contains("collect.classes"), "{e}");
+        assert!(run_classes(&[], None).is_err());
     }
 
     #[test]

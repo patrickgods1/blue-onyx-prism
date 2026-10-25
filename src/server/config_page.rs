@@ -212,6 +212,10 @@ struct ModelSelectRow {
     night_threshold: String,
     /// "same model" is chosen (the night threshold field shows).
     night_self: bool,
+    /// The hidden `object_filter.<name>` field: `__global__`, empty (all) or a comma list.
+    object_filter: String,
+    /// What the Classes cell shows before the script adds the counts: "global", "all", "person, car".
+    object_filter_text: String,
     /// What the running worker uses ("OpenVINO CPU · threshold 0.50", "not loaded", ...).
     running: String,
     running_class: &'static str,
@@ -281,6 +285,19 @@ pub(super) fn global_device_label(c: &Config, snap: &DevicesSnapshot) -> String 
 /// (`night_threshold`, no `night_model`); a model of that name cannot be chosen as a night
 /// model on the card (the JSON editor still can).
 pub(super) const NIGHT_SELF: &str = "@self";
+
+/// The value of the Models card's `object_filter.<name>` field for "no per-model filter: use the
+/// global Object filter" (`ModelConfig.object_filter` = `None`); empty = every class.
+pub(super) const OBJECT_FILTER_GLOBAL: &str = "__global__";
+
+/// `(field value, summary text)` of a model's Classes cell.
+fn object_filter_cell(filter: Option<&[String]>) -> (String, String) {
+    match filter {
+        None => (OBJECT_FILTER_GLOBAL.to_string(), "global".to_string()),
+        Some([]) => (String::new(), "all".to_string()),
+        Some(v) => (v.join(","), v.join(", ")),
+    }
+}
 
 fn night_model_choices(models: &[crate::config::ModelConfig], me: usize) -> Vec<DeviceChoice> {
     use crate::registry::normalize_name;
@@ -501,6 +518,8 @@ fn model_choices(
                 night_models: night_model_choices(&c.models, i),
                 night_threshold: m.night_threshold.map(live::fmt_thr).unwrap_or_default(),
                 night_self: m.night_model.is_none() && m.night_threshold.is_some(),
+                object_filter: object_filter_cell(m.object_filter.as_deref()).0,
+                object_filter_text: object_filter_cell(m.object_filter.as_deref()).1,
                 key,
                 family: m.family.to_string(),
                 path: m.path.display().to_string(),
@@ -2046,6 +2065,67 @@ mod tests {
             }
         }
         assert!(n > 20, "{n}");
+    }
+
+    #[tokio::test]
+    async fn config_page_renders_and_saves_the_per_model_classes() {
+        let state = test_state_with(|c| {
+            c.models[1].object_filter = Some(vec![]);
+        });
+        let (s, html) = get_text(&state, "/config").await;
+        assert_eq!(s, StatusCode::OK);
+        // No per-model filter = global; an empty one = all; both rendered in the hidden field.
+        assert!(
+            html.contains(
+                "class=\"of-value\" name=\"object_filter.ipcam-general\" value=\"__global__\""
+            ),
+            "{html}"
+        );
+        assert!(html.contains("class=\"of-summary\" data-model=\"ipcam-general\">global<"));
+        assert!(
+            html.contains("value=\"\"><span class=\"of-summary\""),
+            "{html}"
+        );
+        assert!(html.contains("id=\"of-global-edit\""));
+        assert!(html.contains("id=\"class-dialog\""));
+        let (picker, cfg) = (
+            html.find("/static/class-picker.js?v=").unwrap(),
+            html.find("/static/config.js?v=").unwrap(),
+        );
+        assert!(picker < cfg);
+
+        // A list, then empty, then global again round-trip into ModelConfig.object_filter.
+        for (value, want) in [
+            ("person%2C+car", Some(vec!["person", "car"])),
+            ("", Some(vec![])),
+            ("__global__", None),
+        ] {
+            let body = format!(
+                "enabled=ipcam-general&enabled=%3Cb%3Eevil%3C%2Fb%3E&object_filter.ipcam-general={value}&action=save"
+            );
+            let (s, _, b) = call(&state, post_form("/config/models", &body, false)).await;
+            assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            let saved = Config::load(&state.config_path).unwrap();
+            let want: Option<Vec<String>> = want.map(|v| v.into_iter().map(String::from).collect());
+            assert_eq!(saved.models[0].object_filter, want, "{value}");
+        }
+        // A list that names no class is refused; the saved value stays.
+        let body = "enabled=ipcam-general&object_filter.ipcam-general=%2C+%2C&action=save";
+        let (_, _, b) = call(&state, post_form("/config/models", body, false)).await;
+        let page = String::from_utf8(b).unwrap();
+        assert!(page.contains("Models not saved"), "{page}");
+        assert!(page.contains("names no class"), "{page}");
+        assert_eq!(
+            Config::load(&state.config_path).unwrap().models[0].object_filter,
+            None
+        );
+
+        // The saved list shows in the cell.
+        let body = "enabled=ipcam-general&object_filter.ipcam-general=person%2Ccar&action=save";
+        call(&state, post_form("/config/models", body, false)).await;
+        let (_, html) = get_text(&state, "/config").await;
+        assert!(html.contains("value=\"person,car\""), "{html}");
+        assert!(html.contains(">person, car</span>"), "{html}");
     }
 
     #[tokio::test]

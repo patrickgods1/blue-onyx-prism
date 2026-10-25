@@ -218,6 +218,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             "/v1/review/classes",
             post(review::classes).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
+        ("/v1/review/class-catalog", get(review::class_catalog)),
         (
             "/v1/review/folder",
             post(review::folder).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
@@ -1012,6 +1013,7 @@ mod tests {
             "/v1/review/export",
             "/v1/review/import",
             "/v1/review/classes",
+            "/v1/review/class-catalog",
             "/v1/review/folder",
             "/training",
             "/v1/training",

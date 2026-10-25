@@ -223,6 +223,10 @@ pub struct CollectConfig {
     pub dedup_hamming: u32,
     /// Classes of the Review page and the label exports (YOLO class ids follow this order).
     pub classes: Vec<String>,
+    /// Classes of `classes` the Review page's pickers leave out (rare ones); they stay in the
+    /// exports and keep their YOLO ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden_classes: Vec<String>,
 }
 
 impl Default for CollectConfig {
@@ -236,6 +240,7 @@ impl Default for CollectConfig {
             max_age_days: DEFAULT_MAX_AGE_DAYS,
             dedup_hamming: DEFAULT_DEDUP_HAMMING,
             classes: default_classes(),
+            hidden_classes: Vec::new(),
         }
     }
 }
@@ -267,6 +272,21 @@ impl CollectConfig {
             Some(d) => data_root.join(d),
             None => self.resolved_dir(data_root),
         }
+    }
+
+    /// `hidden_classes` without the names `classes` no longer lists (after a class list
+    /// change), in the spelling of `classes`.
+    pub fn prune_hidden(&mut self) {
+        let classes = &self.classes;
+        let mut kept: Vec<String> = Vec::new();
+        for h in &self.hidden_classes {
+            if let Some(c) = classes.iter().find(|c| c.eq_ignore_ascii_case(h.trim()))
+                && !kept.iter().any(|k| k.eq_ignore_ascii_case(c))
+            {
+                kept.push(c.clone());
+            }
+        }
+        self.hidden_classes = kept;
     }
 
     /// The size cap in bytes.
@@ -315,6 +335,7 @@ impl CollectConfig {
             MAX_DEDUP_HAMMING,
         )?;
         validate_classes(&self.classes)?;
+        validate_hidden(&self.hidden_classes, &self.classes)?;
         for b in Bucket::ALL {
             let c = self.buckets.get(b);
             let field = format!("collect.buckets.{}", b.as_str());
@@ -377,6 +398,25 @@ pub fn validate_classes(classes: &[String]) -> anyhow::Result<()> {
         }
         if !seen.insert(c.as_str()) {
             bail!("collect.classes: '{c}' is listed twice; class names must be unique");
+        }
+    }
+    Ok(())
+}
+
+/// `collect.hidden_classes`: each a class of `classes` (case-insensitive), once.
+pub fn validate_hidden(hidden: &[String], classes: &[String]) -> anyhow::Result<()> {
+    use anyhow::bail;
+    let mut seen = std::collections::BTreeSet::new();
+    for h in hidden {
+        if !classes.iter().any(|c| c.eq_ignore_ascii_case(h)) {
+            bail!(
+                "collect.hidden_classes: '{}' is not in collect.classes; only listed classes can \
+                 be hidden",
+                h.escape_debug()
+            );
+        }
+        if !seen.insert(h.to_lowercase()) {
+            bail!("collect.hidden_classes: '{h}' is listed twice");
         }
     }
     Ok(())
@@ -544,6 +584,40 @@ mod tests {
         bad(&|c| c.classes.push("person".into()), "listed twice");
         bad(&|c| c.classes.push(" cow".into()), "not a valid class name");
         bad(&|c| c.classes.push("a\nb".into()), "not a valid class name");
+        bad(
+            &|c| c.hidden_classes = vec!["unicorn".into()],
+            "collect.hidden_classes",
+        );
+        bad(
+            &|c| c.hidden_classes = vec!["bird".into(), "Bird".into()],
+            "listed twice",
+        );
+    }
+
+    #[test]
+    fn hidden_classes_are_listed_classes_and_pruned_with_them() {
+        let mut c = CollectConfig {
+            hidden_classes: vec!["BIRD".into(), "skunk".into()],
+            ..CollectConfig::default()
+        };
+        c.validate(Path::new("/data")).unwrap();
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(
+            text.contains("\"hidden_classes\":[\"BIRD\",\"skunk\"]"),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<CollectConfig>(&text).unwrap(), c);
+        assert!(
+            !serde_json::to_string(&CollectConfig::default())
+                .unwrap()
+                .contains("hidden_classes"),
+            "not written when empty"
+        );
+        c.classes.retain(|x| x != "skunk");
+        c.hidden_classes.push("bird".into());
+        c.prune_hidden();
+        assert_eq!(c.hidden_classes, ["bird"], "the list's spelling, once");
+        c.validate(Path::new("/data")).unwrap();
     }
 
     #[test]

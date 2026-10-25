@@ -24,13 +24,22 @@
 //! - [`parallel`]: the worker pools of the extraction (one helper process per video) and the
 //!   analysis (decode, dHash, scene).
 //! - [`job`]: the stage machine ([`ImportJob`], a [`super::task::Task`]).
+//! - [`disk`]: the space an import needs, checked before it is queued ([`plan_import`]) and
+//!   before each writing stage, and guarded while it runs (a full disk ends it with advice).
 //!
 //! Before anything is extracted, the candidate budget ([`MAX_CANDIDATES_TOTAL`]) is shared
 //! fairly by the cameras, their videos and the images ([`select::budget`]); each video's share
 //! is its `--max-frames`. Videos are extracted [`ImportRequest::workers`] at a time (default
 //! half the physical cores, 1..=4), decoded on the GPU when PyAV's FFmpeg offers a hardware
 //! decoder ([`HwAccel`], software otherwise or when it fails).
+//!
+//! Two passes: the candidates are stored downscaled ([`disk::CANDIDATE_MAX_SIDE`] px on the long
+//! side, which is all the analysis needs) with their source time and frame index; only the frames
+//! kept are then extracted again at full resolution (`import_footage.py frames`) and written to
+//! the dataset, the same files as a single full-resolution pass would write. Image folders are
+//! read in place in both.
 
+pub mod disk;
 pub mod job;
 pub mod parallel;
 pub mod preview;
@@ -268,6 +277,7 @@ pub fn plan_import(
         request.license_confirmed,
     )?;
     let mut needs_python = request.selection == Selection::Siglip;
+    let mut plan_sources = PlanSources::default();
     match &mut request.source {
         ImportSource::Url(u) => {
             *u = source::check_url(u)?;
@@ -277,6 +287,12 @@ pub fn plan_import(
             *p = config.data_path(p);
             let d = source::discover(p)?;
             needs_python |= !d.videos.is_empty();
+            plan_sources.cameras = d
+                .videos
+                .iter()
+                .map(|v| source::camera_of(v, request.camera.as_deref()))
+                .collect();
+            plan_sources.images = d.images;
         }
         ImportSource::Dataset(d) => {
             if catalog::import_dataset(d).is_none() {
@@ -322,6 +338,24 @@ pub fn plan_import(
     }
     request.allow_large = allow_large;
     let id = super::service::new_run_id();
+    match &request.source {
+        ImportSource::Path(_) => {}
+        ImportSource::Url(_) => plan_sources.cameras.push("url".into()),
+        ImportSource::Dataset(d) => {
+            if let Some(res) = catalog::import_dataset(d) {
+                plan_sources.cameras = res
+                    .parts
+                    .iter()
+                    .map(|p| {
+                        source::camera_of(
+                            std::path::Path::new(p.file_name),
+                            request.camera.as_deref(),
+                        )
+                    })
+                    .collect();
+            }
+        }
+    }
     let dataset_dir = match &request.out_dir {
         Some(d) => {
             let d = config.data_path(d);
@@ -335,8 +369,14 @@ pub fn plan_import(
         }
         None => crate::collect::CollectSettings::for_config(config).dir,
     };
+    let work = super::training_dir(config).join("imports").join(&id);
+    disk::check(
+        disk::estimate(&plan_sources.plan(&request)),
+        &work,
+        &dataset_dir,
+    )?;
     Ok(ImportJob {
-        work: super::training_dir(config).join("imports").join(&id),
+        work,
         id,
         request,
         license,
@@ -349,6 +389,48 @@ pub fn plan_import(
         timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
         needs_python,
     })
+}
+
+/// What [`plan_import`] knows of the source for the space estimate.
+#[derive(Debug, Default)]
+struct PlanSources {
+    /// The camera of each video.
+    cameras: Vec<String>,
+    images: Vec<PathBuf>,
+}
+
+impl PlanSources {
+    /// The [`disk::Plan`] of `r` (the same candidate budget as the job; the videos' size is not
+    /// known yet: [`disk::ASSUMED_SOURCE`]; the images' mean size from up to 200 of them).
+    fn plan(&self, r: &ImportRequest) -> disk::Plan {
+        let cams: Vec<&str> = self.cameras.iter().map(String::as_str).collect();
+        let b = select::budget(
+            &cams,
+            self.images.len(),
+            MAX_CANDIDATES_TOTAL,
+            r.max_candidates,
+        );
+        let used = select::stride(self.images.len(), b.images);
+        let sample: Vec<u64> = select::stride(used.len(), used.len().min(200))
+            .into_iter()
+            .filter_map(|i| {
+                let p = self.images.get(*used.get(i)?)?;
+                std::fs::metadata(p).ok().map(|m| m.len())
+            })
+            .collect();
+        disk::Plan {
+            video_candidates: b.per_video.iter().sum(),
+            image_candidates: b.images,
+            frames: r.frames,
+            source: None,
+            image_bytes: if sample.is_empty() {
+                0
+            } else {
+                sample.iter().sum::<u64>() / sample.len() as u64
+            },
+            download: 0,
+        }
+    }
 }
 
 /// `<data root>/<training dir>/imports`: the work folders of the imports.
@@ -471,6 +553,37 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("meva-sample"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_plan_counts_the_budget_and_the_images_mean_size() {
+        let root = std::env::temp_dir().join(format!("bop-import-est-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let images: Vec<PathBuf> = (0..4)
+            .map(|i| {
+                let p = root.join(format!("i{i}.jpg"));
+                std::fs::write(&p, vec![0u8; 1000 * (i + 1)]).unwrap();
+                p
+            })
+            .collect();
+        let s = PlanSources {
+            cameras: vec!["a".into(), "a".into(), "b".into()],
+            images,
+        };
+        let mut r = ImportRequest::new(ImportSource::Path(root.clone()));
+        r.max_candidates = 100;
+        let p = s.plan(&r);
+        assert_eq!(p.video_candidates, 300);
+        assert_eq!(p.image_candidates, 4);
+        assert_eq!(p.image_bytes, 2500);
+        let n = disk::estimate(&p);
+        assert_eq!(
+            n.work,
+            300 * disk::candidate_frame_bytes(1920, 1080)
+                + 200 * disk::full_frame_bytes(1920, 1080)
+        );
+        assert_eq!(n.dataset, 200 * disk::full_frame_bytes(1920, 1080));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

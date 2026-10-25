@@ -97,6 +97,58 @@
   }
   toggle(document.getElementById("autolabel-form"), "mode", "data-mode");
 
+  // Auto-label classes: the class picker (class-picker.js). The chosen classes post as repeated
+  // hidden `classes` fields; one outside the class list is appended to it first (after a confirm,
+  // POST /v1/review/classes, append only).
+  (function () {
+    var form = document.getElementById("autolabel-form"), CP = window.ClassPicker;
+    var holder = document.getElementById("al-picker"), msg = document.getElementById("al-classes-msg");
+    if (!form || !holder || !CP) return;
+    var picker = null, catalog = null, confirmed = false;
+    var say = function (t, bad) { if (msg) { msg.textContent = t || ""; msg.className = "form-msg" + (bad ? " error-text" : ""); } };
+    var entriesOf = function (cat) {
+      var out = CP.util.mergeEntries(cat.entries || [], (cat.classes || []));
+      out.forEach(function (e) { if ((cat.classes || []).indexOf(e.name) >= 0) e.in_list = true; e.hidden = (cat.hidden || []).indexOf(e.name) >= 0; });
+      return out;
+    };
+    CP.fetchCatalog().then(function (cat) {
+      catalog = cat;
+      picker = CP.create(holder, {
+        entries: entriesOf(cat), selected: CP.util.defaultSelection(cat), mode: "full", allowAdd: true,
+        quickSets: CP.util.quickSetsFor(cat)
+      });
+    }).catch(function (e) {
+      holder.textContent = "";
+      var p = document.createElement("p");
+      p.className = "muted small";
+      p.textContent = "The class list could not be read (" + e.message + "); the labelers use the class list and training.synonyms.";
+      holder.appendChild(p);
+    });
+    var mode = function () { var r = form.querySelector('input[name="mode"]:checked'); return r ? r.value : ""; };
+    var fields = function (names) {
+      form.querySelectorAll("input.cp-field").forEach(function (i) { i.remove(); });
+      names.forEach(function (n) {
+        var i = document.createElement("input");
+        i.type = "hidden"; i.name = "classes"; i.value = n; i.className = "cp-field";
+        form.appendChild(i);
+      });
+    };
+    form.addEventListener("submit", function (ev) {
+      if (!picker || mode() !== "labelers") { fields([]); return; }
+      var names = picker.getSelected();
+      if (!names.length) { ev.preventDefault(); say("Choose at least one class to look for.", true); return; }
+      say("", false);
+      fields(names);
+      if (confirmed || !CP.util.missingFrom(names, catalog.classes || []).length) { confirmed = false; return; }
+      ev.preventDefault();
+      var by = ev.submitter;
+      CP.ensureInList(names, catalog).then(function () {
+        confirmed = true;
+        if (form.requestSubmit) form.requestSubmit(by || undefined); else form.submit();
+      }).catch(function (e) { say(e.cancelled ? "Not queued: the class list was left as it is." : e.message, true); });
+    });
+  })();
+
   var train = document.getElementById("train");
   if (train) {
     // The model name: one ticked model only (the server refuses it with more).

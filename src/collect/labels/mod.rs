@@ -220,17 +220,35 @@ impl LabelBox {
 }
 
 /// The last auto-label run (labelers mode) that looked at a frame, boxes found or not: a later
-/// run with the same labelers skips the frame unless asked to label it again.
+/// run with the same labelers skips the frame unless asked to label it again, or unless it asks
+/// for a class this run did not look for ([`AutoRun::covers`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoRun {
     /// When (UTC, RFC 3339).
     pub at: String,
     /// The labelers (`mm-gdino-tiny + rfdetr-large + ...`).
     pub labeler: String,
+    /// The classes the run looked for; empty = the whole class list of the time (files written
+    /// before runs could pick classes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<String>,
 }
 
-/// Longest [`AutoRun`] field.
+impl AutoRun {
+    /// Whether this run looked for every class of `classes` (case-insensitive; a run without
+    /// a class list covers everything).
+    pub fn covers(&self, classes: &[String]) -> bool {
+        self.classes.is_empty()
+            || classes
+                .iter()
+                .all(|c| self.classes.iter().any(|r| r.eq_ignore_ascii_case(c)))
+    }
+}
+
+/// Longest [`AutoRun`] field (each class name of `classes` too).
 pub const MAX_AUTO_RUN_LEN: usize = 200;
+/// Most classes in [`AutoRun::classes`].
+pub const MAX_AUTO_RUN_CLASSES: usize = super::config::MAX_CLASSES;
 
 /// `<stem>.labels.json` (see the module doc).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -522,15 +540,23 @@ pub fn normalize(
     f.version = LABELS_VERSION;
     f.classes_version = classes_version(classes);
     f.bulk_accepted = false;
-    if let Some(r) = &f.auto_run
-        && [&r.at, &r.labeler]
-            .iter()
+    if let Some(r) = &f.auto_run {
+        if [&r.at, &r.labeler]
+            .into_iter()
+            .chain(&r.classes)
             .any(|s| s.chars().count() > MAX_AUTO_RUN_LEN || s.chars().any(char::is_control))
-    {
-        bail!(
-            "auto_run: a field is longer than {MAX_AUTO_RUN_LEN} characters or holds control \
-             characters"
-        );
+        {
+            bail!(
+                "auto_run: a field is longer than {MAX_AUTO_RUN_LEN} characters or holds control \
+                 characters"
+            );
+        }
+        if r.classes.len() > MAX_AUTO_RUN_CLASSES {
+            bail!(
+                "auto_run: {} classes; at most {MAX_AUTO_RUN_CLASSES}",
+                r.classes.len()
+            );
+        }
     }
     match f.status {
         Status::Reviewed => {
@@ -1397,6 +1423,7 @@ mod tests {
             auto_run: Some(AutoRun {
                 at: "2026-10-22T00:00:00Z".into(),
                 labeler: "mm-gdino-tiny + rfdetr-large".into(),
+                classes: vec!["person".into(), "car".into()],
             }),
             bulk_accepted: true,
             ..LabelFile::default()
@@ -1412,6 +1439,10 @@ mod tests {
         let v = serde_json::to_value(&n).unwrap();
         assert_eq!(v["boxes"][0]["auto_label"], "truck");
         assert_eq!(v["auto_run"]["labeler"], "mm-gdino-tiny + rfdetr-large");
+        assert_eq!(
+            v["auto_run"]["classes"],
+            serde_json::json!(["person", "car"])
+        );
         assert!(v.get("bulk_accepted").is_none());
         assert_eq!(serde_json::from_value::<LabelFile>(v).unwrap(), n);
         // Equal to the box (after clamping): dropped.
@@ -1427,9 +1458,40 @@ mod tests {
         f.boxes[0].auto.auto_label = Some(String::new());
         assert!(normalize(f.clone(), &classes(), 640, 480, "t").is_err());
         f.boxes[0].auto.auto_label = None;
+        f.auto_run.as_mut().unwrap().classes.push("a\nb".into());
+        let e = normalize(f.clone(), &classes(), 640, 480, "t").unwrap_err();
+        assert!(e.to_string().contains("auto_run"), "{e}");
+        f.auto_run.as_mut().unwrap().classes = vec!["x".repeat(201)];
+        assert!(normalize(f.clone(), &classes(), 640, 480, "t").is_err());
+        f.auto_run.as_mut().unwrap().classes = vec!["c".into(); MAX_AUTO_RUN_CLASSES + 1];
+        let e = normalize(f.clone(), &classes(), 640, 480, "t").unwrap_err();
+        assert!(e.to_string().contains("classes"), "{e}");
+        f.auto_run.as_mut().unwrap().classes.clear();
         f.auto_run.as_mut().unwrap().labeler = "x".repeat(201);
         let e = normalize(f, &classes(), 640, 480, "t").unwrap_err();
         assert!(e.to_string().contains("auto_run"), "{e}");
+    }
+
+    #[test]
+    fn auto_run_classes_cover_a_later_run() {
+        let r = |c: &[&str]| AutoRun {
+            at: "t".into(),
+            labeler: "l".into(),
+            classes: c.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let want = |c: &[&str]| c.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(
+            r(&[]).covers(&want(&["person", "anything"])),
+            "old files: everything"
+        );
+        assert!(r(&["Person", "car"]).covers(&want(&["person"])));
+        assert!(r(&["person", "car"]).covers(&want(&["CAR", "person"])));
+        assert!(!r(&["person"]).covers(&want(&["person", "dog"])));
+        assert!(r(&["person"]).covers(&[]));
+        // An old file without the field reads as an empty list and writes none.
+        let old: AutoRun = serde_json::from_str(r#"{"at":"t","labeler":"l"}"#).unwrap();
+        assert!(old.classes.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("classes"));
     }
 
     #[test]

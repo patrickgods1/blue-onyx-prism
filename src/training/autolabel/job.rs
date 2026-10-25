@@ -152,7 +152,9 @@ impl AutolabelJob {
     }
 
     /// The frames to label, in queue order, and how many matching frames were left out because
-    /// `skip_labeler` (Some in labelers mode without `again=1`) already looked at them.
+    /// `skip_labeler` (Some in labelers mode without `again=1`) already looked at them for every
+    /// class of this run ([`labels::AutoRun::covers`]; a run for a class it did not look for
+    /// labels the frame again).
     fn select(&self, skip_labeler: Option<&str>) -> Result<(Vec<Selected>, usize)> {
         let f = &self.request.frames;
         let built = queue::build(&self.dataset_dir, &f.filters()?);
@@ -175,7 +177,7 @@ impl AutolabelJob {
                     .ok()
                     .flatten()
                     .and_then(|x| x.auto_run)
-                    .is_some_and(|r| r.labeler == l)
+                    .is_some_and(|r| r.labeler == l && r.covers(&self.classes))
             {
                 skipped += 1;
                 continue;
@@ -244,8 +246,9 @@ impl AutolabelJob {
         rep.skipped_done = skipped;
         if frames.is_empty() && skipped > 0 {
             bail!(
-                "all {skipped} frame(s) matching {} were auto-labelled by {labeler} already; add \
-                 again=1 to the frame filter (Review page: tick \"Label again\") to label them again",
+                "all {skipped} frame(s) matching {} were auto-labelled by {labeler} for these \
+                 classes already; add again=1 to the frame filter (Review page: tick \"Label \
+                 again\") to label them again",
                 r.frames.describe()
             );
         }
@@ -559,6 +562,7 @@ impl AutolabelJob {
                 let marker = labels::AutoRun {
                     at: crate::collect::utc_rfc3339(std::time::SystemTime::now()),
                     labeler: labeler.clone(),
+                    classes: self.classes.clone(),
                 };
                 let res = self.write_frame(sel, &mut rep, &mut changed, |file, rep| {
                     file.auto_run = Some(marker);

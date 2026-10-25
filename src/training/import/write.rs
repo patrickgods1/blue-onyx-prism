@@ -3,7 +3,9 @@
 //! version-1 sidecar without detections, `source: "import:<id>"` and its provenance; then the
 //! frames are queued for review (`review-queue.jsonl`) and the import is listed in
 //! `<dir>/imports.jsonl`. Each file is written atomically, image first, then sidecar, then the
-//! index line, like the collector does.
+//! index line, like the collector does; when the sidecar or the index line fails (a full disk),
+//! the frame's files are removed again, so a frame is either complete or absent. A write that
+//! stops part way ([`write_frames_with`]) answers the frames written so far.
 
 use crate::collect::layout::{self, Rel};
 use crate::collect::record::{self, ImageInfo, IndexLine, Provenance, Record, Stats};
@@ -119,6 +121,53 @@ fn already_imported(day: &Path, ts: &str, hash: u64) -> bool {
 /// skipped as already imported (the same camera, millisecond and dHash). Frames of one import at
 /// the same millisecond get distinct numbers; an existing file is never overwritten.
 pub fn write_frames(dir: &Path, import_id: &str, frames: &[Frame]) -> Result<(Vec<String>, usize)> {
+    write_frames_with(dir, import_id, frames, &mut |_| Ok(())).map_err(|p| p.error)
+}
+
+/// What [`write_frames_with`] tells its caller around each frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Frame `n` is next; an error stops the write before it.
+    Before(usize),
+    /// Frame `n` is in the dataset (its image, sidecar and index line).
+    Written(usize),
+}
+
+/// A write that stopped part way: the frames written before `error` (complete, in the index).
+#[derive(Debug)]
+pub struct Partial {
+    pub rels: Vec<String>,
+    pub skipped: usize,
+    pub error: anyhow::Error,
+}
+
+/// [`write_frames`] with `hook` called before and after each frame (free-space checks, cleanup).
+pub fn write_frames_with(
+    dir: &Path,
+    import_id: &str,
+    frames: &[Frame],
+    hook: &mut dyn FnMut(Step) -> Result<()>,
+) -> std::result::Result<(Vec<String>, usize), Partial> {
+    let mut out = Vec::with_capacity(frames.len());
+    let mut skipped = 0;
+    match write_into(dir, import_id, frames, hook, &mut out, &mut skipped) {
+        Ok(()) => Ok((out, skipped)),
+        Err(error) => Err(Partial {
+            rels: out,
+            skipped,
+            error,
+        }),
+    }
+}
+
+fn write_into(
+    dir: &Path,
+    import_id: &str,
+    frames: &[Frame],
+    hook: &mut dyn FnMut(Step) -> Result<()>,
+    out: &mut Vec<String>,
+    skipped: &mut usize,
+) -> Result<()> {
     let id4: String = import_id
         .rsplit('-')
         .next()
@@ -127,14 +176,13 @@ pub fn write_frames(dir: &Path, import_id: &str, frames: &[Frame]) -> Result<(Ve
         .filter(char::is_ascii_alphanumeric)
         .take(8)
         .collect();
-    let mut out = Vec::with_capacity(frames.len());
-    let mut skipped = 0;
     for (n, f) in frames.iter().enumerate() {
+        hook(Step::Before(n))?;
         let scene = f.stats.scene().as_str().to_string();
         let date = crate::collect::utc_date(f.time);
         let ts = crate::collect::utc_file_ts(f.time);
         if already_imported(&dir.join(&scene).join(&f.camera).join(&date), &ts, f.dhash) {
-            skipped += 1;
+            *skipped += 1;
             continue;
         }
         let mut k = n;
@@ -178,14 +226,19 @@ pub fn write_frames(dir: &Path, import_id: &str, frames: &[Frame]) -> Result<(Ve
             return Err(e).with_context(|| format!("writing {}", side.display()));
         }
         let line = IndexLine::of(&rec, (bytes.len() + json.len()) as u64);
-        layout::append_line(
+        if let Err(e) = layout::append_line(
             &day.join(layout::INDEX_FILE),
             &serde_json::to_string(&line)?,
-        )
-        .with_context(|| format!("writing {}", day.join(layout::INDEX_FILE).display()))?;
+        ) {
+            let _ = std::fs::remove_file(&side);
+            let _ = std::fs::remove_file(&jpg);
+            return Err(e)
+                .with_context(|| format!("writing {}", day.join(layout::INDEX_FILE).display()));
+        }
         out.push(rel.jpg());
+        hook(Step::Written(n))?;
     }
-    Ok((out, skipped))
+    Ok(())
 }
 
 /// Append `line` to `<dir>/imports.jsonl`.
@@ -306,6 +359,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_imports(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_write_stopped_part_way_answers_the_complete_frames() {
+        let root =
+            std::env::temp_dir().join(format!("bop-import-partial-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("f.jpg");
+        let bytes = jpeg(false);
+        std::fs::write(&src, &bytes).unwrap();
+        let img = crate::image::decode(&bytes).unwrap();
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let frames: Vec<Frame> = (0u32..4)
+            .map(|i| Frame {
+                file: src.clone(),
+                image_name: "c.mp4".into(),
+                camera: "cam".into(),
+                time: frame_time(base, Some(f64::from(i))),
+                width: img.width,
+                height: img.height,
+                stats: ImageStats::compute(&img),
+                dhash: u64::from(i) * 0x0101_0101,
+                provenance: Provenance::default(),
+            })
+            .collect();
+        let mut steps = Vec::new();
+        let p = write_frames_with(&dir, "20261022-120000-ab12", &frames, &mut |s| {
+            steps.push(s);
+            if s == Step::Before(2) {
+                anyhow::bail!(std::io::Error::from(std::io::ErrorKind::StorageFull));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(p.rels.len(), 2);
+        assert_eq!(
+            steps,
+            [
+                Step::Before(0),
+                Step::Written(0),
+                Step::Before(1),
+                Step::Written(1),
+                Step::Before(2)
+            ]
+        );
+        assert!(crate::training::import::disk::is_disk_full(&p.error));
+        // Exactly the two frames: images, sidecars and index lines, no temporary files.
+        let day = LabelFrame::resolve(&dir, &p.rels[0])
+            .unwrap()
+            .jpg
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut names: Vec<String> = std::fs::read_dir(&day)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 5, "{names:?}");
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
+        assert_eq!(layout::read_index(&day.join(layout::INDEX_FILE)).len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
