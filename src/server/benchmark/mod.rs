@@ -4,7 +4,10 @@
 //!   datasets and the config's per-model devices;
 //! - `POST /v1/benchmark`: start a run; `POST /v1/benchmark/cancel`;
 //! - `POST /v1/benchmark/apply`: write per-model devices into the config;
-//! - `POST /v1/benchmark/apply-threshold`: write per-model confidence thresholds into the config;
+//! - `POST /v1/benchmark/apply-threshold`: write per-model confidence thresholds (or one device's
+//!   confidence profile) into the config;
+//! - `POST /v1/benchmark/apply-profiles`: write per-device confidence profiles and per-model
+//!   devices into the config in one save (one revision, one Undo);
 //! - `GET /v1/benchmark/threshold-search`: what can be searched (models, devices, datasets,
 //!   tags, classes); `POST /v1/benchmark/threshold-search`: the exact confidence-threshold
 //!   search over the stored predictions (no inference; [`crate::benchmark::search`]);
@@ -23,11 +26,12 @@
 
 mod apply;
 mod history;
+mod profiles;
 mod run;
 
 use apply::BLUE_IRIS_THRESHOLD_NOTE;
 
-pub(super) use apply::{apply, apply_threshold, search_options, threshold_search};
+pub(super) use apply::{apply, apply_profiles, apply_threshold, search_options, threshold_search};
 pub(super) use history::{history_compare, history_delete, history_get, history_pin};
 pub(super) use run::{cancel, image_file, images_detail, settings, start};
 
@@ -111,6 +115,9 @@ struct BenchmarkTemplate {
     /// (value, label, selected) of the accuracy metric select.
     accuracy_metrics: Vec<(String, String, bool)>,
     blue_iris_note: &'static str,
+    /// The benchmark goal's plain name ("Balanced", "Miss fewer objects", "Fewer false
+    /// alerts", "Fastest / lightest", "Custom"; [`profiles::goal_label`]).
+    goal_label: String,
 }
 
 /// Threshold objective choices; the configured one is added when it is not among them.
@@ -365,6 +372,7 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
             objectives: objective_options(b.threshold_objective),
             accuracy_metrics: metric_options(b.accuracy_metric),
             blue_iris_note: BLUE_IRIS_THRESHOLD_NOTE,
+            goal_label: profiles::goal_label(b).to_string(),
         })
     })
     .await
@@ -397,11 +405,21 @@ fn config_view(state: &AppState, snap: &DevicesSnapshot) -> serde_json::Value {
         .map(|m| {
             let name = m.effective_name();
             let key = crate::registry::normalize_name(&name);
-            let effective = loaded
-                .get(&key)
-                .cloned()
-                .filter(|_| m.enabled)
-                .or_else(|| configured_device(&cfg, m, &snap.model_selection(state, &cfg, m)));
+            let sel = snap.model_selection(state, &cfg, m);
+            let configured = configured_device(&cfg, m, &sel);
+            let loaded_spec = loaded.get(&key).cloned().filter(|_| m.enabled);
+            // Where the running threshold comes from: the worker's (its loaded device's
+            // profile, else the fallback), else the config's view for the loaded device.
+            let source = m
+                .enabled
+                .then(|| state.registry.by_name(&name))
+                .flatten()
+                .map(|w| w.effective_threshold().1)
+                .unwrap_or_else(|| {
+                    m.threshold_on(loaded_spec.as_deref(), cfg.confidence_threshold)
+                        .1
+                });
+            let effective = loaded_spec.or_else(|| configured.clone());
             let provider = m
                 .enabled
                 .then(|| state.registry.by_name(&name))
@@ -412,9 +430,15 @@ fn config_view(state: &AppState, snap: &DevicesSnapshot) -> serde_json::Value {
             serde_json::json!({
                 "name": name,
                 "enabled": m.enabled,
-                "configuredDevice": configured_device(&cfg, m, &snap.selection),
+                "configuredDevice": configured,
                 "confidenceThreshold": thr(m.confidence_threshold.unwrap_or(cfg.confidence_threshold)),
                 "ownThreshold": m.confidence_threshold.is_some(),
+                "deviceThresholds": m
+                    .device_thresholds
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::json!(thr(*v))))
+                    .collect::<serde_json::Map<_, _>>(),
+                "thresholdSource": source,
                 "device": m.device,
                 "effective": effective,
                 "provider": provider,
@@ -444,17 +468,18 @@ fn models_now(
     cfg: &Config,
     snap: &DevicesSnapshot,
 ) -> HashMap<String, crate::benchmark::current::ModelNow> {
-    // The threshold the served model's worker uses now (live settings); a model without a
-    // worker (disabled) runs with nothing.
+    // The threshold the served model's worker uses now (live settings: the profile of the
+    // device it loaded on, else the fallback); a model without a worker (disabled) runs with
+    // nothing.
     let running = |name: &str| {
         state
             .registry
             .by_name(name)
-            .map(|w| w.live().confidence_threshold)
+            .map(|w| w.effective_threshold().0)
     };
     crate::benchmark::current::from_config(
         cfg,
-        &|m| configured_device(cfg, m, &snap.selection),
+        &|m| configured_device(cfg, m, &snap.model_selection(state, cfg, m)),
         &running,
     )
 }
@@ -475,6 +500,10 @@ struct SavedView {
     ranking: serde_json::Value,
     points: serde_json::Value,
     latest_run_id: Option<String>,
+    /// The measured part of `profiles` ([`profiles::facts`]).
+    facts: Vec<profiles::ModelFacts>,
+    /// The hardware the results were measured on (`otherHardware`).
+    hardware: Option<crate::benchmark::report::HardwareSummary>,
 }
 
 /// The last [`SavedView`] and what it was computed from: the results, stored-predictions and
@@ -521,6 +550,7 @@ fn saved_view(
                 .ok()
                 .flatten();
             crate::benchmark::current::rebase(&mut r, stored.as_deref(), now);
+            let facts = profiles::facts(&r);
             // No history file yet: seeded in memory (written by the next run, pin or delete).
             let history = History::load_or_seed(&hist, Some(&r));
             let mut results = serde_json::to_value(r.summary()).unwrap_or_default();
@@ -530,6 +560,8 @@ fn saved_view(
                 ranking,
                 points,
                 latest_run_id: view::latest_run_id(&r),
+                facts,
+                hardware: Some(r.hardware.clone()),
             }
         }
         None => SavedView::default(),
@@ -543,7 +575,9 @@ fn saved_view(
 /// results (without per-image details), the ranking and the config's per-model devices. Results
 /// are shown against the config now: each threshold advice carries `now` (the effective
 /// threshold in the config, the counts there, exact from the stored predictions) and each
-/// model's `configured` is the device the config resolves to now.
+/// model's `configured` is the device the config resolves to now. `profiles` lists per model and
+/// device the measured best threshold and the saved confidence profile ([`profiles::profiles`]),
+/// `otherHardware` whether the results were measured on other GPUs, `goal` the benchmark goal.
 pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     super::blocking(move || {
         let snap = devices_snapshot(&state);
@@ -552,6 +586,17 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
         let (revision, cfg) = state.config.snapshot();
         let now = models_now(&state, &cfg, &snap);
         let saved = saved_view(&state, revision, &now);
+        let loaded = loaded_devices(&state);
+        let profile_rows = profiles::profiles(
+            &saved.facts,
+            &cfg,
+            &|name| loaded.get(&crate::registry::normalize_name(name)).cloned(),
+            &|m| configured_device(&cfg, m, &snap.model_selection(&state, &cfg, m)),
+        );
+        let other_hardware = saved
+            .hardware
+            .as_ref()
+            .is_some_and(|h| !h.same_gpus(&snap.hardware));
         let mut run = state.benchmark.status();
         for m in &mut run.models {
             if let Some(n) = now.get(&crate::registry::normalize_name(&m.model)) {
@@ -570,6 +615,12 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
             "noise": crate::benchmark::history::view::noise_json(),
             "resultsFile": path.display().to_string(),
             "config": config,
+            "profiles": profile_rows,
+            "otherHardware": other_hardware,
+            "goal": {
+                "label": profiles::goal_label(&cfg.benchmark),
+                "objective": cfg.benchmark.threshold_objective.to_string(),
+            },
             "warning": LIVE_WARNING,
         }))
     })
@@ -697,6 +748,87 @@ mod tests {
         ))
     }
 
+    /// Saved results for the profile tests: `ipcam-general` (configured, enabled) ran on
+    /// openvino:cpu (best 0.40, recommended), ort:cpu (best 0.33) and openvino:gpu (failed);
+    /// `dfine-s` (configured, disabled) on ort:coreml (best 0.30); `removed` (not configured)
+    /// on ort:cpu (0.25). `hardware` is where they were measured.
+    pub(super) fn profile_results(
+        hardware: crate::benchmark::report::HardwareSummary,
+    ) -> BenchmarkResults {
+        use crate::benchmark::report::test_support::{dev, failed, model, scene};
+        use crate::benchmark::threshold::{DevicePick, test_advice};
+        let mk = |name: &str, devs: Vec<crate::benchmark::DeviceResult>, picks: &[(&str, f32)]| {
+            let mut m = model(devs, None);
+            m.model = name.into();
+            let mut a = test_advice(picks[0].1);
+            a.device = picks[0].0.into();
+            a.by_device = picks
+                .iter()
+                .map(|(d, t)| DevicePick {
+                    device: d.to_string(),
+                    best: a.best.clone().map(|mut b| {
+                        b.threshold = *t;
+                        b
+                    }),
+                })
+                .collect();
+            m.threshold = Some(a);
+            m
+        };
+        BenchmarkResults::new(
+            hardware,
+            Default::default(),
+            vec![
+                mk(
+                    "ipcam-general",
+                    vec![
+                        dev("openvino:cpu", 20.0, scene()),
+                        dev("ort:cpu", 30.0, scene()),
+                        failed("openvino:gpu"),
+                    ],
+                    &[("openvino:cpu", 0.4), ("ort:cpu", 0.33)],
+                ),
+                mk(
+                    "dfine-s",
+                    vec![dev("ort:coreml", 15.0, scene())],
+                    &[("ort:coreml", 0.3)],
+                ),
+                mk(
+                    "removed",
+                    vec![dev("ort:cpu", 25.0, scene())],
+                    &[("ort:cpu", 0.25)],
+                ),
+            ],
+        )
+    }
+
+    /// `pairs` urlencoded (the `undo` list of an apply answer posted back).
+    pub(super) fn form_body(pairs: &serde_json::Value) -> String {
+        let enc = |s: &str| {
+            s.bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect::<String>()
+        };
+        pairs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}={}",
+                    enc(p[0].as_str().unwrap()),
+                    enc(p[1].as_str().unwrap())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
     pub(super) async fn call(
         state: &Arc<AppState>,
         req: Request<Body>,
@@ -768,9 +900,26 @@ mod tests {
         );
         let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
         assert!(js.contains("fetch(\"/v1/benchmark\""));
-        // Threshold objective (config default f1) and the threshold apply actions.
+        // The steps: Run, Profiles, Apply, Advanced.
+        for id in ["tab-run", "tab-profiles", "tab-apply", "tab-advanced"] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "{id}: {html}");
+            assert!(html.contains(&format!("href=\"#{id}\"")), "{id}: {html}");
+        }
+        // The goal's plain name (the default weights are the Balanced preset).
         assert!(
-            html.contains("<select name=\"threshold_objective\">"),
+            html.contains("<strong id=\"goal-label\">Balanced</strong>"),
+            "{html}"
+        );
+        // The profiles script.
+        assert!(
+            html.contains("<script src=\"/static/bench-profiles.js?v="),
+            "{html}"
+        );
+        assert!(super::super::pages::static_file("bench-profiles.js").is_some());
+        // Threshold objective (config default f1, in the Profiles step, part of the run form)
+        // and the threshold apply actions.
+        assert!(
+            html.contains("<select name=\"threshold_objective\" form=\"bench-form\""),
             "{html}"
         );
         assert!(html.contains("<option value=\"f1\" selected>"), "{html}");
@@ -782,7 +931,10 @@ mod tests {
         );
         assert!(html.contains("min_confidence") || js.contains("min_confidence"));
         // Accuracy metric (config default ap50), the frame objectives and the ROC chart code.
-        assert!(html.contains("<select name=\"accuracy_metric\">"), "{html}");
+        assert!(
+            html.contains("<select name=\"accuracy_metric\" form=\"bench-form\""),
+            "{html}"
+        );
         assert!(html.contains("<option value=\"ap50\" selected>"), "{html}");
         assert!(html.contains("<option value=\"roc_auc\">"), "{html}");
         assert!(html.contains("<option value=\"youden\">"), "{html}");
@@ -961,5 +1113,145 @@ mod tests {
         let js = crate::server::pages::static_file("benchmark.js").expect("benchmark.js");
         assert!(js.contains("function nowOf(a)"));
         assert!(js.contains("L.keep($(\"thresholds\")"));
+    }
+    #[tokio::test]
+    async fn status_lists_the_confidence_profiles() {
+        let st = state();
+        let cfg_path = st.config_path.clone();
+        // No results: no profiles; the goal is the config's.
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        assert_eq!(v["profiles"], serde_json::json!([]));
+        assert_eq!(v["otherHardware"], false);
+        assert_eq!(v["goal"]["label"], "Balanced");
+        assert_eq!(v["goal"]["objective"], "f1");
+        assert_eq!(
+            v["config"]["models"][0]["deviceThresholds"],
+            serde_json::json!({})
+        );
+        assert_eq!(v["config"]["models"][0]["thresholdSource"], "global");
+
+        // Measured on other hardware (an empty summary never matches this machine).
+        profile_results(Default::default())
+            .save(&results_path(&cfg_path))
+            .unwrap();
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        assert_eq!(v["otherHardware"], true);
+        let p = v["profiles"].as_array().unwrap();
+        assert_eq!(p.len(), 3);
+        let ip = &p[0];
+        assert_eq!(ip["model"], "ipcam-general");
+        assert_eq!(ip["configured"], true);
+        assert_eq!(ip["device"], "global");
+        assert_eq!(ip["running"], serde_json::Value::Null);
+        assert_eq!(ip["fallback"], 0.5);
+        assert_eq!(ip["fallbackSource"], "global");
+        assert_eq!(ip["status"], "unsaved");
+        let d = &ip["devices"];
+        assert_eq!(d.as_array().unwrap().len(), 3);
+        let cpu = &d[0];
+        assert_eq!(cpu["device"], "openvino:cpu");
+        assert_eq!(cpu["label"], "openvino:cpu");
+        assert_eq!(cpu["recommended"], true);
+        assert_eq!(cpu["ok"], true);
+        assert_eq!(cpu["error"], serde_json::Value::Null);
+        assert_eq!(cpu["fellBack"], false);
+        assert_eq!(cpu["ms"], 20.0);
+        // test_advice: TP 3, FP 1, FN 1 at the best threshold.
+        assert_eq!(cpu["finds"], 0.75);
+        assert_eq!(cpu["correct"], 0.75);
+        assert_eq!(cpu["best"], 0.4);
+        assert_eq!(cpu["saved"], serde_json::Value::Null);
+        assert_eq!(cpu["differs"], true);
+        assert!(cpu["now"].is_boolean());
+        assert_eq!(d[1]["best"], 0.33);
+        let gpu = &d[2];
+        assert_eq!(
+            (&gpu["ok"], &gpu["error"]),
+            (
+                &serde_json::json!(false),
+                &serde_json::json!("compile failed")
+            )
+        );
+        assert_eq!(
+            (&gpu["best"], &gpu["differs"], &gpu["ms"]),
+            (
+                &serde_json::Value::Null,
+                &serde_json::json!(false),
+                &serde_json::Value::Null
+            )
+        );
+        // Every field of the contract, nothing else.
+        let keys = |o: &serde_json::Value| {
+            let mut k: Vec<String> = o.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(ip),
+            [
+                "configured",
+                "device",
+                "devices",
+                "fallback",
+                "fallbackSource",
+                "model",
+                "running",
+                "status"
+            ]
+        );
+        assert_eq!(
+            keys(cpu),
+            [
+                "best",
+                "correct",
+                "device",
+                "differs",
+                "error",
+                "fellBack",
+                "finds",
+                "label",
+                "ms",
+                "now",
+                "ok",
+                "recommended",
+                "saved"
+            ]
+        );
+        assert_eq!(p[2]["model"], "removed");
+        assert_eq!(p[2]["configured"], false);
+
+        // Measured here; every profile applied: saved, and shown on the config models.
+        profile_results(crate::benchmark::report::HardwareSummary::current())
+            .save(&results_path(&cfg_path))
+            .unwrap();
+        let (s, j) = call(&st, post("/v1/benchmark/apply-profiles", "all=1")).await;
+        assert_eq!(s, StatusCode::OK, "{j}");
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        assert_eq!(v["otherHardware"], false);
+        assert_eq!(v["profiles"][0]["status"], "saved");
+        assert_eq!(v["profiles"][0]["devices"][0]["saved"], 0.4);
+        assert_eq!(v["profiles"][0]["devices"][0]["differs"], false);
+        assert_eq!(v["profiles"][1]["status"], "saved");
+        assert_eq!(
+            v["config"]["models"][0]["deviceThresholds"],
+            serde_json::json!({"openvino:cpu": 0.4, "ort:cpu": 0.33})
+        );
+        // One profile changed by hand: differs.
+        st.config
+            .update("test", |c| {
+                c.models[0].device_thresholds.insert("ort:cpu".into(), 0.5);
+                c.models[0].confidence_threshold = Some(0.45);
+                Ok(())
+            })
+            .unwrap();
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        let ip = &v["profiles"][0];
+        assert_eq!(ip["status"], "differs");
+        assert_eq!(
+            (&ip["fallback"], &ip["fallbackSource"]),
+            (&serde_json::json!(0.45), &serde_json::json!("model"))
+        );
+        assert_eq!(ip["devices"][1]["differs"], true);
+        assert_eq!(v["config"]["models"][0]["thresholdSource"], "model");
     }
 }

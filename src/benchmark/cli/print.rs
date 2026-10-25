@@ -7,7 +7,7 @@ use crate::benchmark::images::ImageSet;
 use crate::benchmark::report::{RuntimeVersions, Verdict};
 use crate::benchmark::threshold::{Objective, ThresholdAdvice};
 use crate::benchmark::{Comparison, MATCH_IOU, ModelResult, RunResult, Stats};
-use crate::config_form::{DeviceChange, ThresholdChange};
+use crate::config_form::{DeviceChange, ProfileChange};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use std::path::Path;
@@ -55,9 +55,9 @@ pub(super) struct Report {
     /// `--apply`: per-model device changes written to the config file.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) applied: Vec<DeviceChange>,
-    /// `--apply-threshold`: per-model threshold changes written to the config file.
+    /// `--apply-threshold`: per-device confidence profile changes written to the config file.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(super) applied_thresholds: Vec<ThresholdChange>,
+    pub(super) applied_thresholds: Vec<ProfileChange>,
     /// Datasets used (ids) and warnings about them.
     pub(super) datasets: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

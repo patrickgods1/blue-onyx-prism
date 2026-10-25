@@ -246,6 +246,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             post(benchmark::apply_threshold),
         ),
         (
+            "/v1/benchmark/apply-profiles",
+            post(benchmark::apply_profiles),
+        ),
+        (
             "/v1/benchmark/threshold-search",
             get(benchmark::search_options).post(benchmark::threshold_search),
         ),
@@ -1020,6 +1024,7 @@ mod tests {
             "/v1/benchmark/cancel",
             "/v1/benchmark/apply",
             "/v1/benchmark/apply-threshold",
+            "/v1/benchmark/apply-profiles",
             "/v1/benchmark/threshold-search",
             "/v1/benchmark/settings",
             "/v1/benchmark/images",

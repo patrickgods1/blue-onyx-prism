@@ -2,21 +2,12 @@
 {% block title %}Benchmark{% endblock %}
 {% block content %}
 <h1>Benchmark</h1>
-<p class="muted">Runs each model on each device over the chosen image sets with the production pipeline, grades <strong>accuracy</strong> and <strong>speed</strong>, and recommends a device and a confidence threshold per model. Results: <code>{{ results_file }}</code> &middot; JSON: <a href="/v1/benchmark"><code>/v1/benchmark</code></a>.</p>
-<details class="help"><summary>How grading works</summary>
-<p>Accuracy is AP@0.5, or the frame-level ROC AUC: how well a frame's top confidence separates frames with an object from frames without, which is Blue Iris's alert decision; against ground truth, or against a reference model where a dataset has none. Speed is the full request p50. Every device is checked to detect the same objects as the CPU. The recommended device of a model is its best-graded device whose detections agree with the CPU; within 5% of the best speed the configured device is kept. The same predictions are also scored at every confidence threshold (no extra inference) to find each model's best confidence threshold for the chosen objective. Speeds are per image, one at a time; the service pipelines decode, preprocessing and inference (and runs several inferences at once where the hardware profile allows), so its throughput is higher than 1000 / latency implies. The <code>benchmark</code> CLI writes the same results file.</p>
-</details>
+<p class="muted">Find the best model, the best device (GPU or CPU) for it, and the best confidence on each device, in three steps. Results: <code>{{ results_file }}</code> &middot; JSON: <a href="/v1/benchmark"><code>/v1/benchmark</code></a>.</p>
 <p class="warn">{{ warning }}</p>
 {% if force_cpu %}<p class="warn">Force CPU is on: it overrides every per-model device until it is unchecked on the <a href="/config#inference">Config page</a>.</p>{% endif %}
 
-<ol class="steps" id="steps" aria-label="How to use this page">
-  <li data-step="run"><a href="#tab-run"><span class="step-n" aria-hidden="true">1</span> Run<span class="step-sub">measure your models and devices</span></a></li>
-  <li data-step="review"><a href="#tab-overview"><span class="step-n" aria-hidden="true">2</span> Review<span class="step-sub">see what to use and what changed</span></a></li>
-  <li data-step="apply"><a href="#devices"><span class="step-n" aria-hidden="true">3</span> Apply<span class="step-sub">use the recommended device and confidence</span></a></li>
-</ol>
-
-<nav class="toc tabs" role="tablist" aria-label="Sections">
-  <a role="tab" href="#tab-run">Run</a><a role="tab" href="#tab-overview">Overview</a><a role="tab" href="#tab-compare">Compare</a><a role="tab" href="#tab-confidence">Confidence</a><a role="tab" href="#tab-details">Details</a>
+<nav class="toc tabs wizard" role="tablist" aria-label="Benchmark steps">
+  <a role="tab" href="#tab-run"><span class="step-n" aria-hidden="true">1</span> Run</a><a role="tab" href="#tab-profiles"><span class="step-n" aria-hidden="true">2</span> Profiles</a><a role="tab" href="#tab-apply"><span class="step-n" aria-hidden="true">3</span> Apply</a><a role="tab" href="#tab-advanced" class="tab-advanced">Advanced</a>
 </nav>
 <div class="status-bar" id="status">
   <div id="progress" hidden><progress id="bar" max="100"></progress> <span id="ptext" class="muted"></span> <button type="button" id="cancel" class="danger small" hidden>Cancel</button></div>
@@ -25,29 +16,11 @@
   <ul id="warnings" class="warn-list"></ul>
 </div>
 
-<section class="panel" id="tab-overview">
-  <noscript><p class="muted">The results view needs JavaScript; see <a href="/v1/benchmark">/v1/benchmark</a>.</p></noscript>
-  <p id="no-results" class="empty" hidden>No results yet. Choose datasets, models and devices under <a href="#tab-run">Run</a> and start a benchmark; this page then says which model, device and confidence to use.</p>
-  <div id="run-banner"></div>
-  <p id="rec-line" class="rec-line"></p>
-  <div id="preset"></div>
-  <div id="devices"></div>
-  <div id="ranking"></div>
-  <div id="recommend"></div>
-  <div id="glossary"></div>
-</section>
-
-<section class="panel" id="tab-compare">
-  <p class="muted">Compare models, devices and runtimes side by side, or one model across runs. The filters drive every chart and table here and are remembered in this browser.</p>
-  <div id="cmp-filters"></div>
-  <p id="cmp-empty" class="empty" hidden></p>
-  <section id="cmp-side"></section>
-  <section id="cmp-runs"></section>
-</section>
-
 <section class="panel" id="tab-run">
 <form id="bench-form" class="card primary">
-  <h2>Run</h2>
+  <h2>1 &middot; Run the benchmark</h2>
+  <p class="muted">Quick run: keep the defaults and press <strong>Start benchmark</strong>. It measures every checked model on every checked device; nothing in your config changes until step 3.</p>
+  <p class="goal-line">Goal: <strong id="goal-label">{{ goal_label }}</strong> &mdash; <a href="#tab-profiles">change in step 2</a></p>
   <div class="bench-grid">
     <fieldset>
       <legend>Datasets</legend>
@@ -60,7 +33,7 @@
       </label>
       {% endfor %}
       <label>Add a folder on the server <span class="with-browse"><input type="text" id="add-folder" placeholder="/path/to/BlueIris/Alerts"><button type="button" class="browse secondary" data-browse="folder" data-target="add-folder" data-title="Choose an image folder" hidden>Browse&hellip;</button></span><span class="muted small">Images, optional COCO JSON / YOLO labels / manifest.json.</span></label>
-      <details class="help"><summary>About datasets</summary><p>Selected datasets that are not downloaded are fetched when the run starts (pinned, SHA-256 checked). A folder without ground truth is scored against the reference model.</p></details>
+      <details class="help"><summary>About datasets</summary><p>Selected datasets that are not downloaded are fetched when the run starts (pinned, SHA-256 checked). A folder without labels is scored against the reference model.</p></details>
     </fieldset>
     <fieldset>
       <legend>Models</legend>
@@ -68,7 +41,7 @@
       <label class="check"><input type="checkbox" name="model" value="{{ m.name }}"{% if m.checked %} checked{% endif %}{% if !m.exists %} disabled{% endif %}> {{ m.name }} <span class="muted">{{ m.family }}{% if !m.enabled %} &middot; disabled{% endif %}{% if !m.exists %} &middot; file missing{% endif %}</span></label>
       {% endfor %}
       {% if models.is_empty() %}<p class="muted">No models configured.</p>{% endif %}
-      <label>Reference model (pseudo ground truth for datasets without it)
+      <label>Reference model (stand-in labels for datasets without them)
         <select name="reference_model">
           <option value="">Automatic (most accurate installed)</option>
           {% for r in reference_models %}<option value="{{ r.0 }}"{% if r.1 %} selected{% endif %}>{{ r.0 }}</option>{% endfor %}
@@ -82,20 +55,10 @@
     </fieldset>
     <fieldset class="bench-settings">
       <legend>Settings</legend>
-      <label>Images per dataset (0 = all) <input type="number" name="max_images" min="0" value="{{ max_images }}"><span class="field-hint">Small sets give noisy accuracy: aim for 200+ labelled objects (a few hundred images) before trusting a difference.</span></label>
+      <label>Images per dataset (0 = all) <input type="number" name="max_images" min="0" value="{{ max_images }}"><span class="field-hint">Small sets give noisy results: aim for a few hundred images with labelled objects before trusting a difference.</span></label>
       <label>Timed runs per image <input type="number" name="repeat" min="1" max="1000" value="{{ repeat }}"><span class="field-hint">More timed runs give steadier speeds (3 or more); accuracy does not change.</span></label>
       <label>Warm-up runs <input type="number" name="warmup" min="0" max="100" value="{{ warmup }}"></label>
       <input type="hidden" name="low_priority" value="0"><label class="check"><input type="checkbox" name="low_priority" value="1"{% if low_priority %} checked{% endif %}> Run at low priority (keeps the desktop responsive)</label>
-      <label>Accuracy weight of the overall grade (0..1, speed gets the rest) <input type="number" name="accuracy_weight" min="0" max="1" step="0.05" value="{{ accuracy_weight }}"></label>
-      <label>Best confidence threshold optimizes
-        <select name="threshold_objective">
-          {% for o in objectives %}<option value="{{ o.0 }}"{% if o.2 %} selected{% endif %}>{{ o.1 }}</option>{% endfor %}
-        </select></label>
-      <label>Grade accuracy, rank models and pick devices by
-        <select name="accuracy_metric">
-          {% for m in accuracy_metrics %}<option value="{{ m.0 }}"{% if m.2 %} selected{% endif %}>{{ m.1 }}</option>{% endfor %}
-        </select></label>
-      <details class="help"><summary>Grade thresholds</summary><p>Speed: {{ speed_thresholds }}. Accuracy score, AP50 (AP@0.5, 20% small-object recall when present): {{ accuracy_thresholds }}. ROC AUC (macro over classes, frame level; 0.5 is chance): {{ auc_thresholds }}.</p></details>
     </fieldset>
   </div>
   <div class="actions">
@@ -107,62 +70,130 @@
 </form>
 </section>
 
-<section class="panel" id="tab-confidence">
-  <div id="conf-pick"></div>
-  <div id="conf-best"></div>
-  <details class="bd more-detail" id="conf-more" data-keep="d:conf-more"><summary>More detail: every threshold number and the confidence search</summary>
-  <div id="thresholds"></div>
-  <div class="actions" id="apply-thr-bar" hidden>
-    <button type="button" id="apply-all-thr">Apply all thresholds</button>
-    <span class="muted">Writes each model's best threshold as its <code>confidence_threshold</code> in the config; the next detections use it (no restart). {{ blue_iris_note }}</span>
-  </div>
-
-<section class="card" id="search-card">
-  <h2>Confidence search</h2>
-  <p class="muted">Finds the best confidence threshold from the predictions the last benchmark stored: every distinct confidence is evaluated exactly, no inference, so a search takes milliseconds.</p>
-  <details class="help"><summary>How to use it</summary><p>Filter by dataset, tag (e.g. <code>night</code>) and class, pick the objective, then apply the result. Predictions come from <code>benchmark-preds.json</code>. {{ blue_iris_note }}</p></details>
-  <p id="s-empty" class="muted" hidden></p>
-  <form id="search-form" hidden>
-    <div class="bench-grid">
-      <fieldset><legend>Models</legend><div id="s-models"></div>
-        <label>Device <select id="s-device"><option value="">Recommended device of each model</option></select></label></fieldset>
-      <fieldset><legend>Images</legend><div id="s-datasets"></div>
-        <p class="muted">Only images with all of these tags:</p><div id="s-tags"></div></fieldset>
-      <fieldset><legend>Classes</legend><div id="s-classes"></div><p class="muted">None checked = all scored classes.</p></fieldset>
-      <fieldset><legend>Objective</legend>
-        <label>Optimize <select id="s-objective">
-          <option value="f1">F1: balance precision and recall</option>
-          <option value="f2">F2: favor recall (fewer missed objects)</option>
-          <option value="precision">Highest recall with precision at least…</option>
-          <option value="recall">Highest precision with recall at least…</option>
-          <option value="youden">Youden's J: frame alert rate minus false-alert rate</option>
-          <option value="fpr">Highest frame alert rate with false-alert rate at most…</option>
-        </select></label>
-        <label id="s-target-label" hidden>Target (0..1) <input type="number" id="s-target" min="0" max="1" step="0.01" value="0.9"></label>
-        <label>Match IoU <input type="number" id="s-iou" min="0.05" max="0.95" step="0.05" value="0.5"></label>
-      </fieldset>
+<section class="panel" id="tab-profiles">
+  <noscript><p class="muted">The results view needs JavaScript; see <a href="/v1/benchmark">/v1/benchmark</a>.</p></noscript>
+  <p id="no-results" class="empty" hidden>No results yet. Choose datasets, models and devices in <a href="#tab-run">1 Run</a> and start a benchmark; this step then shows the best device and confidence for each model.</p>
+  <div id="run-banner"></div>
+  <section class="card goal-card" id="goal">
+    <h2>2 &middot; What matters most to you?</h2>
+    <p class="muted">Your goal picks the best confidence on each device and orders the results. Changing it needs no new run.</p>
+    <div id="goal-presets"></div>
+    <div id="goal-custom" class="custom-fields" hidden>
+      <div class="bench-grid">
+        <label>Accuracy weight (0..1; speed gets the rest) <input type="number" name="accuracy_weight" form="bench-form" min="0" max="1" step="0.05" value="{{ accuracy_weight }}"></label>
+        <label>Best confidence optimizes
+          <select name="threshold_objective" form="bench-form">
+            {% for o in objectives %}<option value="{{ o.0 }}"{% if o.2 %} selected{% endif %}>{{ o.1 }}</option>{% endfor %}
+          </select></label>
+        <label>Grade accuracy by
+          <select name="accuracy_metric" form="bench-form">
+            {% for m in accuracy_metrics %}<option value="{{ m.0 }}"{% if m.2 %} selected{% endif %}>{{ m.1 }}</option>{% endfor %}
+          </select></label>
+      </div>
+      <div class="actions"><button type="button" id="goal-save" class="small">Save goal</button></div>
     </div>
+    <p id="goal-msg" class="muted" aria-live="polite"></p>
+  </section>
+  <div id="other-hw"></div>
+  <div id="stale-goal"></div>
+  <p class="muted plain-key"><strong>Finds</strong> = share of objects found; <strong>Correct</strong> = share of detections that were right; <strong>Speed</strong> = time per image. Pick the device each model should run on under <strong>Run on</strong>, then go to <a href="#tab-apply">3 Apply</a>.</p>
+  <div id="profiles"></div>
+  <div id="glossary"></div>
+  <p class="next-step"><a href="#tab-apply" class="button-link">Next: 3 Apply</a></p>
+</section>
+
+<section class="panel" id="tab-apply">
+  <section class="card primary">
+    <h2>3 &middot; Apply</h2>
+    <p class="muted">A profile is the best confidence of a model on one device; the model uses the profile of the device it actually runs on. Saving applies at once.</p>
+    <div id="ap-diff"></div>
     <div class="actions">
-      <button type="button" id="s-run">Search</button>
-      <button type="button" id="s-apply-all" hidden>Apply all</button>
-      <button type="button" id="s-csv-copy" class="secondary" hidden>Copy as CSV</button>
-      <button type="button" id="s-csv-dl" class="secondary" hidden>Download CSV</button>
-      <span id="s-msg" class="muted" aria-live="polite"></span>
+      <button type="button" id="ap-save-use">Save profiles and use chosen devices</button>
+      <button type="button" id="ap-save" class="secondary">Save profiles only</button>
     </div>
-  </form>
-  <div id="s-results"></div>
-</section>
-  </details>
+    <div id="ap-result" class="notice apply-box" role="status" hidden></div>
+    <p class="bi-line">In Blue Iris, set each camera's minimum confidence (AI settings) at or below the confidence of its model. {{ blue_iris_note }}</p>
+  </section>
 </section>
 
-<section class="panel" id="tab-details">
-  <p id="no-models" class="empty" hidden>No per-model results yet: start a benchmark under <a href="#tab-run">Run</a>.</p>
-  <div id="models"></div>
+<section class="panel" id="tab-advanced">
+  <p class="muted">Every number behind the profiles: compare models and devices, explore confidences, per-device details and the run history.</p>
+  <details class="card adv" id="adv-compare" data-keep="d:adv-compare"><summary>Compare</summary>
+    <p class="muted">Compare models, devices and runtimes side by side. The filters drive every chart and table here and are remembered in this browser.</p>
+    <div id="cmp-filters"></div>
+    <p id="cmp-empty" class="empty" hidden></p>
+    <section id="cmp-side"></section>
+  </details>
+
+  <details class="card adv" id="adv-confidence" data-keep="d:adv-confidence"><summary>Confidence</summary>
+    <div id="conf-pick"></div>
+    <div id="conf-best"></div>
+    <details class="bd more-detail" id="conf-more" data-keep="d:conf-more"><summary>More detail: every threshold number and the confidence search</summary>
+    <div id="thresholds"></div>
+    <div class="actions" id="apply-thr-bar" hidden>
+      <button type="button" id="apply-all-thr">Apply all thresholds</button>
+      <span class="muted">Writes each model's best confidence on its recommended device as the model's default <code>confidence_threshold</code> (used on devices without a profile); the next detections use it.</span>
+    </div>
+
+    <section class="card" id="search-card">
+      <h2>Confidence search</h2>
+      <p class="muted">Finds the best confidence from the predictions the last benchmark stored: every distinct confidence is evaluated exactly, no inference, so a search takes milliseconds.</p>
+      <details class="help"><summary>How to use it</summary><p>Filter by dataset, tag (e.g. <code>night</code>) and class, pick a goal, then apply the result. Predictions come from <code>benchmark-preds.json</code>.</p></details>
+      <p id="s-empty" class="muted" hidden></p>
+      <form id="search-form" hidden>
+        <div class="bench-grid">
+          <fieldset><legend>Models</legend><div id="s-models"></div>
+            <label>Device <select id="s-device"><option value="">Recommended device of each model</option></select></label></fieldset>
+          <fieldset><legend>Images</legend><div id="s-datasets"></div>
+            <p class="muted">Only images with all of these tags:</p><div id="s-tags"></div></fieldset>
+          <fieldset><legend>Classes</legend><div id="s-classes"></div><p class="muted">None checked = all scored classes.</p></fieldset>
+          <fieldset><legend>Goal</legend>
+            <label>Try another goal (doesn't change your saved goal) <select id="s-objective">
+              <option value="f1">Balanced: find objects and avoid false alerts equally (F1)</option>
+              <option value="f2">Miss fewer objects (F2)</option>
+              <option value="precision">Fewer false alerts: correct at least… (precision)</option>
+              <option value="recall">Find at least… (recall)</option>
+              <option value="youden">Alert rate minus false-alert rate (Youden's J)</option>
+              <option value="fpr">False-alert frames at most… (FPR)</option>
+            </select></label>
+            <label id="s-target-label" hidden>Target (0..1) <input type="number" id="s-target" min="0" max="1" step="0.01" value="0.9"></label>
+            <label>Match IoU <input type="number" id="s-iou" min="0.05" max="0.95" step="0.05" value="0.5"></label>
+          </fieldset>
+        </div>
+        <div class="actions">
+          <button type="button" id="s-run">Search</button>
+          <button type="button" id="s-apply-all" hidden>Apply all</button>
+          <button type="button" id="s-csv-copy" class="secondary" hidden>Copy as CSV</button>
+          <button type="button" id="s-csv-dl" class="secondary" hidden>Download CSV</button>
+          <span id="s-msg" class="muted" aria-live="polite"></span>
+        </div>
+      </form>
+      <div id="s-results"></div>
+    </section>
+    </details>
+  </details>
+
+  <details class="card adv" id="adv-details" data-keep="d:adv-details"><summary>Details</summary>
+    <p class="muted">One card per model with every device's numbers. &ldquo;Use&rdquo; sets the model's device; its confidence then follows the device through the saved profiles.</p>
+    <p id="no-models" class="empty" hidden>No per-model results yet: start a benchmark in <a href="#tab-run">1 Run</a>.</p>
+    <div id="models"></div>
+  </details>
+
+  <details class="card adv" id="adv-history" data-keep="d:adv-history"><summary>History</summary>
+    <p class="muted">One model across runs: compare two runs, pin a baseline, delete a run.</p>
+    <section id="cmp-runs"></section>
+  </details>
+
+  <details class="help"><summary>How grading works</summary>
+    <p>Accuracy is AP@0.5, or the frame-level ROC AUC: how well a frame's top confidence separates frames with an object from frames without, which is Blue Iris's alert decision; against labels, or against a reference model where a dataset has none. Speed is the full request p50. Every device is checked to detect the same objects as the CPU. The recommended device of a model is its best-graded device whose detections agree with the CPU; within 5% of the best speed the configured device is kept. The same predictions are scored at every confidence (no extra inference) to find each model's best confidence on each device for your goal. Speeds are per image, one at a time; the service pipelines decode, preprocessing and inference, so its throughput is higher than 1000 / latency implies. The <code>benchmark</code> CLI writes the same results file.</p>
+    <p>Grade thresholds. Speed: {{ speed_thresholds }}. Accuracy score, AP50 (AP@0.5, 20% small-object recall when present): {{ accuracy_thresholds }}. ROC AUC (macro over classes, frame level; 0.5 is chance): {{ auc_thresholds }}.</p>
+  </details>
+  <div id="adv-glossary"></div>
 </section>
 
 <dialog id="drill"><div class="drill-head"><strong id="drill-title"></strong>
   <label class="inline-label">Show <select id="drill-filter"><option value="all">all images</option><option value="miss">with misses</option><option value="fp">with false positives</option><option value="err">with misses or false positives</option></select></label>
-  <span class="muted" id="drill-legend">ground truth: <span class="lg-gt">matched</span> <span class="lg-miss">missed</span> &middot; predictions: <span class="lg-tp">true</span> <span class="lg-fp">false</span> <span class="lg-un">not scored</span></span>
+  <span class="muted" id="drill-legend">labels: <span class="lg-gt">matched</span> <span class="lg-miss">missed</span> &middot; predictions: <span class="lg-tp">true</span> <span class="lg-fp">false</span> <span class="lg-un">not scored</span></span>
   <button type="button" id="drill-close">Close</button></div>
   <div id="drill-body" class="thumbs"></div></dialog>
 
@@ -181,6 +212,7 @@
 <script src="/static/bench-table.js?v={{ version }}"></script>
 <script src="/static/bench-charts.js?v={{ version }}"></script>
 <script src="/static/bench-compare.js?v={{ version }}"></script>
+<script src="/static/bench-profiles.js?v={{ version }}"></script>
 <script src="/static/benchmark.js?v={{ version }}"></script>
 <script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

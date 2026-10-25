@@ -177,8 +177,22 @@ struct ModelSelectRow {
     is_default: bool,
     /// Per-model Device select: "Global (...)" first, then every device option.
     devices: Vec<DeviceChoice>,
-    /// Per-model threshold as typed in the input ("" = global).
+    /// The Threshold input: the profile for `threshold_key` ("" = none: the device uses
+    /// the fallback); with no key, the model's own threshold ("" = global).
     threshold: String,
+    /// The device the Threshold input is for (`threshold_key.<name>`; "" = not known).
+    threshold_key: String,
+    /// The input's placeholder: what a device without a profile uses ("0.38 model default").
+    threshold_placeholder: String,
+    /// The fallback value alone ("0.38") and its source ("model default" / "global").
+    threshold_fallback: String,
+    threshold_fallback_source: &'static str,
+    /// The model's own threshold, the default for devices without a profile ("" = global).
+    default_threshold: String,
+    /// The model's confidence profiles: (device, "0.30").
+    profiles: Vec<(String, String)>,
+    /// The threshold the loaded worker uses ("" = not loaded).
+    running_threshold: String,
     /// Night model select: "none" first, then the other models it may name.
     night_models: Vec<DeviceChoice>,
     /// What the running worker uses ("OpenVINO CPU · threshold 0.50", "not loaded", ...).
@@ -190,8 +204,9 @@ struct ModelSelectRow {
     pending: Vec<String>,
     /// Latest benchmark recommendation for this model.
     bench: Option<BenchHint>,
-    /// Best confidence threshold of the latest benchmark: (value "0.35", objective "f1",
-    /// "in use" / "configured; restart to use" when it is the configured threshold).
+    /// Best confidence threshold of the latest benchmark on `threshold_key`'s device (with no
+    /// key: the overall best): (value "0.35", objective "f1", "in use" / "set" when the device
+    /// already uses it).
     best_threshold: Option<(String, String, Option<&'static str>)>,
     /// The file is missing (or outdated) and made by exporting this resource (`model:yolo26s`).
     needs_export: Option<String>,
@@ -256,6 +271,7 @@ fn night_model_choices(models: &[crate::config::ModelConfig], me: usize) -> Vec<
         label: "none".to_string(),
         selected: current.is_none(),
         disabled: false,
+        ..Default::default()
     }];
     let mut found = false;
     for (i, o) in models.iter().enumerate() {
@@ -274,6 +290,7 @@ fn night_model_choices(models: &[crate::config::ModelConfig], me: usize) -> Vec<
             value: name,
             selected,
             disabled: false,
+            ..Default::default()
         });
     }
     if let (Some(n), false) = (m.night_model.as_deref(), found) {
@@ -282,6 +299,7 @@ fn night_model_choices(models: &[crate::config::ModelConfig], me: usize) -> Vec<
             label: format!("{n} (missing)"),
             selected: true,
             disabled: false,
+            ..Default::default()
         });
     }
     v
@@ -306,9 +324,62 @@ fn model_device_choices(
             label: format!("Global ({global})"),
             selected: current.is_none(),
             disabled: false,
+            ..Default::default()
         },
     );
     v
+}
+
+/// Fills in the per-model facts of a model's Device options (see [`DeviceChoice`]): the device
+/// each option resolves to for model `m` (`sel` = its selection; the selected option resolves to
+/// `running`, the device the model loaded on, when it is loaded), the confidence profile and the
+/// benchmark facts there, and labels with the benchmark's speed and best threshold
+/// ("ort:coreml — CoreML · 24 ms · best conf 0.30").
+fn annotate_model_devices(
+    choices: &mut [DeviceChoice],
+    c: &Config,
+    m: &crate::config::ModelConfig,
+    sel: &crate::backend::select::Selection,
+    running: Option<&str>,
+    facts: Option<&live::BenchFacts>,
+) {
+    let global_auto = !c.force_cpu && matches!(spec::parse(&c.device), Ok(DeviceSpec::Auto));
+    for o in choices.iter_mut() {
+        let mut probe = m.clone();
+        probe.device = (!o.value.is_empty()).then(|| o.value.clone());
+        let resolved = match running {
+            Some(r) if o.selected => Some(r.to_string()),
+            _ => crate::benchmark::configured_device(c, &probe, sel),
+        };
+        let key = live::device_key(resolved.as_deref());
+        let cell = live::ThresholdCell::new(m, c.confidence_threshold, &key);
+        o.thr = cell.profile.map(live::fmt_thr).unwrap_or_default();
+        o.src = cell.source_text();
+        let bench = facts.and_then(|f| (!key.is_empty()).then(|| f.best_on(&key)).flatten());
+        o.bench = bench.map(live::fmt_thr).unwrap_or_default();
+        if !key.is_empty() {
+            if o.value == "auto" {
+                o.label = format!("Auto \u{2014} currently: {key}");
+            } else if o.value.is_empty() && global_auto {
+                o.label = format!("Global (auto \u{2192} {key})");
+            }
+            let p50 = facts
+                .and_then(|f| f.device_fact(&key))
+                .and_then(|d| d.p50_ms);
+            if let Some(ms) = p50 {
+                if ms >= 10.0 {
+                    o.label.push_str(&format!(" \u{b7} {ms:.0} ms"));
+                } else {
+                    o.label.push_str(&format!(" \u{b7} {ms:.1} ms"));
+                }
+            }
+            if let Some(t) = bench {
+                o.label
+                    .push_str(&format!(" \u{b7} best conf {}", live::fmt_thr(t)));
+            }
+        }
+        o.key = key;
+    }
 }
 
 fn model_choices(
@@ -329,9 +400,9 @@ fn model_choices(
             let key = crate::registry::normalize_name(&name);
             let facts = bench.and_then(|b| b.models.get(&key));
             let run = live::running_view(state, &name);
+            let sel = snap.model_selection(state, c, m);
+            let configured = crate::benchmark::configured_device(c, m, &sel);
             let hint = facts.map(|r| {
-                let sel = snap.model_selection(state, c, m);
-                let configured = crate::benchmark::configured_device(c, m, &sel);
                 let text = match &r.recommended {
                     Some(d) if configured.as_deref() == Some(d.as_str()) => {
                         if run.device.as_deref() == Some(d.as_str()) {
@@ -346,30 +417,55 @@ fn model_choices(
                 BenchHint {
                     text,
                     title: r.recommendation_now(
-                        m.confidence_threshold.unwrap_or(c.confidence_threshold),
+                        m,
+                        c.confidence_threshold,
                         run.threshold,
+                        configured.clone(),
                     ),
                     href: format!("/benchmark#m-{}", encode_uri_component(&r.model)),
                 }
             });
-            let effective = thr(m.confidence_threshold.unwrap_or(c.confidence_threshold));
+            let mut devices = model_device_choices(snap, m.device.as_deref(), &global);
+            annotate_model_devices(&mut devices, c, m, &sel, run.device.as_deref(), facts);
+            // The cell follows the selected option's device.
+            let threshold_key = devices
+                .iter()
+                .find(|d| d.selected)
+                .map(|d| d.key.clone())
+                .unwrap_or_default();
+            let cell = live::ThresholdCell::new(m, c.confidence_threshold, &threshold_key);
+            let effective = thr(cell.effective());
             let best_threshold = facts.and_then(|f| {
-                let t = thr(f.best_threshold?);
+                let t = if threshold_key.is_empty() {
+                    f.best_threshold?
+                } else {
+                    f.best_on(&threshold_key)?
+                };
+                let t = thr(t);
                 let state = if t != effective {
                     None
                 } else if run.threshold == Some(t) {
                     Some("in use")
                 } else {
-                    Some("configured; restart to use")
+                    Some("set")
                 };
                 Some((format!("{t:.2}"), f.objective.clone(), state))
             });
+            let own = m
+                .confidence_threshold
+                .map(live::fmt_thr)
+                .unwrap_or_default();
+            let threshold = if threshold_key.is_empty() {
+                own.clone()
+            } else {
+                cell.profile.map(live::fmt_thr).unwrap_or_default()
+            };
             let exists = c.data_path(&m.path).is_file();
             // Missing, or from another version (the old RF-DETR large download).
             let needs_export = crate::resources::export::pending_export(&c.data_path(&m.path))
                 .map(|r| r.id.to_string());
             ModelSelectRow {
-                devices: model_device_choices(snap, m.device.as_deref(), &global),
+                devices,
                 night_models: night_model_choices(&c.models, i),
                 key,
                 family: m.family.to_string(),
@@ -383,10 +479,18 @@ fn model_choices(
                 needs_export,
                 enabled: m.enabled,
                 is_default: default == Some(i),
-                threshold: m
-                    .confidence_threshold
-                    .map(|t| thr(t).to_string())
-                    .unwrap_or_default(),
+                threshold,
+                threshold_placeholder: cell.placeholder(),
+                threshold_fallback: live::fmt_thr(cell.fallback),
+                threshold_fallback_source: cell.fallback_source,
+                threshold_key,
+                default_threshold: own,
+                profiles: m
+                    .device_thresholds
+                    .iter()
+                    .map(|(d, t)| (d.clone(), live::fmt_thr(*t)))
+                    .collect(),
+                running_threshold: run.threshold.map(|t| format!("{t:.2}")).unwrap_or_default(),
                 running_detail: run.detail.clone().filter(|_| run.state_class == "fail"),
                 running: run.text,
                 running_class: run.state_class,
@@ -565,11 +669,20 @@ impl ConfigTemplate {
 }
 
 /// One `<option>` of the Device select.
+#[derive(Debug, Clone, Default)]
 struct DeviceChoice {
     value: String,
     label: String,
     selected: bool,
     disabled: bool,
+    /// Per-model Device select only (else empty): the canonical device the option resolves to
+    /// for this model (`data-key`; "" = none), its confidence profile (`data-thr`, "" = none),
+    /// where the threshold on it comes from (`data-src`: "profile", "model default 0.38",
+    /// "global 0.50") and the benchmark's best threshold on it (`data-bench`, "" = none).
+    key: String,
+    thr: String,
+    src: String,
+    bench: String,
 }
 
 /// Options for the Device select: `auto` first, then every runnable option, then the ones that
@@ -587,6 +700,7 @@ fn device_choices(snap: &DevicesSnapshot, current: &str, gpu_index: &str) -> Vec
         label: format!("Auto \u{2014} currently: {}", snap.auto_pick_label()),
         selected: matches!(parsed, Some(DeviceSpec::Auto)),
         disabled: false,
+        ..Default::default()
     }];
     let (ok, bad): (Vec<_>, Vec<_>) = snap.selection.options.iter().partition(|o| o.runnable);
     for o in ok {
@@ -595,6 +709,7 @@ fn device_choices(snap: &DevicesSnapshot, current: &str, gpu_index: &str) -> Vec
             label: format!("{} \u{2014} {}", o.spec, o.label),
             selected: is_current(&o.spec),
             disabled: false,
+            ..Default::default()
         });
     }
     // Downloadable options are selectable (the download itself is started from the Resources
@@ -607,6 +722,7 @@ fn device_choices(snap: &DevicesSnapshot, current: &str, gpu_index: &str) -> Vec
             label: format!("{} \u{2014} {summary}", o.spec),
             selected: is_current(&o.spec),
             disabled: false,
+            ..Default::default()
         });
     }
     for o in bad {
@@ -620,6 +736,7 @@ fn device_choices(snap: &DevicesSnapshot, current: &str, gpu_index: &str) -> Vec
             ),
             selected,
             disabled: !selected,
+            ..Default::default()
         });
     }
     if !out.iter().any(|c| c.selected) {
@@ -628,6 +745,7 @@ fn device_choices(snap: &DevicesSnapshot, current: &str, gpu_index: &str) -> Vec
             label: format!("{} \u{2014} not a known option", current.trim()),
             selected: true,
             disabled: false,
+            ..Default::default()
         });
     }
     out
@@ -1308,6 +1426,165 @@ mod tests {
         let c = device_choices(&snap, "vulkan", "0");
         let last = c.last().unwrap();
         assert!(last.selected && last.value == "vulkan");
+    }
+
+    #[test]
+    fn model_device_options_carry_the_threshold_per_device() {
+        let snap = snapshot(&["CPU", "GPU.0"]);
+        let c = Config {
+            device: "auto".into(),
+            ..Default::default()
+        };
+        let m = crate::config::ModelConfig {
+            name: Some("m".into()),
+            path: "models/m.onnx".into(),
+            device: Some("openvino:gpu.0".into()),
+            confidence_threshold: Some(0.38),
+            device_thresholds: [("openvino:gpu".to_string(), 0.3)].into(),
+            ..Default::default()
+        };
+        let facts = live::BenchFacts {
+            devices: vec![
+                live::DeviceFact {
+                    device: "openvino:cpu".into(),
+                    p50_ms: Some(24.4),
+                    best: Some(0.34),
+                },
+                live::DeviceFact {
+                    device: "openvino:gpu.0".into(),
+                    p50_ms: Some(8.25),
+                    best: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut v = model_device_choices(&snap, m.device.as_deref(), "auto");
+        annotate_model_devices(&mut v, &c, &m, &snap.selection, None, Some(&facts));
+        let by = |value: &str| v.iter().find(|d| d.value == value).unwrap();
+        let cpu = by("openvino:cpu");
+        assert_eq!(cpu.key, "openvino:cpu");
+        assert_eq!((cpu.thr.as_str(), cpu.bench.as_str()), ("", "0.34"));
+        assert_eq!(cpu.src, "model default 0.38");
+        assert!(
+            cpu.label.ends_with(" \u{b7} 24 ms \u{b7} best conf 0.34"),
+            "{}",
+            cpu.label
+        );
+        // gpu.0 matches the `openvino:gpu` profile; a sub-10 ms speed keeps a decimal.
+        let gpu = by("openvino:gpu.0");
+        assert!(gpu.selected);
+        assert_eq!((gpu.thr.as_str(), gpu.src.as_str()), ("0.30", "profile"));
+        assert_eq!(gpu.bench, "");
+        assert!(gpu.label.ends_with(" \u{b7} 8.2 ms"), "{}", gpu.label);
+        // Auto and Global name the device they resolve to for this model.
+        let auto = by("auto");
+        assert!(!auto.key.is_empty());
+        assert!(
+            auto.label
+                .starts_with(&format!("Auto \u{2014} currently: {}", auto.key))
+        );
+        let global = by("");
+        assert_eq!(global.key, auto.key);
+        assert!(
+            global
+                .label
+                .starts_with(&format!("Global (auto \u{2192} {})", global.key)),
+            "{}",
+            global.label
+        );
+        // Loaded: the selected option is the device the model runs on (a fallback here).
+        let mut v = model_device_choices(&snap, m.device.as_deref(), "auto");
+        annotate_model_devices(
+            &mut v,
+            &c,
+            &m,
+            &snap.selection,
+            Some("openvino:cpu"),
+            Some(&facts),
+        );
+        let gpu = v.iter().find(|d| d.selected).unwrap();
+        assert_eq!(
+            (gpu.key.as_str(), gpu.bench.as_str()),
+            ("openvino:cpu", "0.34")
+        );
+        // A value that is not a device resolves to nothing.
+        let mut v = model_device_choices(&snap, Some("vulkan"), "auto");
+        annotate_model_devices(&mut v, &c, &m, &snap.selection, None, None);
+        let bad = v.iter().find(|d| d.selected).unwrap();
+        assert_eq!((bad.key.as_str(), bad.thr.as_str()), ("", ""));
+    }
+
+    #[tokio::test]
+    async fn models_card_threshold_follows_the_selected_device() {
+        let state = test_state_with(|c| {
+            let m = &mut c.models[0];
+            m.device = Some("openvino:cpu".into());
+            m.confidence_threshold = Some(0.38);
+            m.device_thresholds = [
+                ("openvino:cpu".to_string(), 0.3),
+                ("ort:coreml".to_string(), 0.25),
+            ]
+            .into();
+        });
+        live::tests::write_profiled_bench(&state);
+        let (_, html) = get_text(&state, "/config").await;
+        // The options carry the device, its profile, the threshold source and the benchmark's best.
+        assert!(
+            html.contains(
+                "<option value=\"openvino:cpu\" selected data-key=\"openvino:cpu\" data-thr=\"0.30\" data-src=\"profile\" data-bench=\"0.34\">"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("best conf 0.34</option>"), "{html}");
+        // The field shows the profile of the selected device; the placeholder the fallback.
+        assert!(
+            html.contains(
+                "name=\"threshold.ipcam-general\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0.30\" placeholder=\"0.38 model default\""
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<input type=\"hidden\" class=\"thr-key\" name=\"threshold_key.ipcam-general\" value=\"openvino:cpu\">"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("for <code>openvino:cpu</code>"), "{html}");
+        assert!(html.contains("benchmark best 0.34"), "{html}");
+        assert!(html.contains("data-use-threshold=\"0.34\""), "{html}");
+        // Every profile with a remove box, and the default for other devices.
+        assert!(
+            html.contains(
+                "<code>ort:coreml</code> 0.25 <label class=\"check small\"><input type=\"checkbox\" name=\"profile_remove.ipcam-general\" value=\"ort:coreml\"> remove</label>"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("Confidence per device (2)"), "{html}");
+        assert!(
+            html.contains("name=\"threshold_default.ipcam-general\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0.38\""),
+            "{html}"
+        );
+
+        // Saving the card for another device writes that device's profile only.
+        let body = "enabled=ipcam-general&enabled=%3Cb%3Eevil%3C%2Fb%3E&device.ipcam-general=openvino%3Acpu\
+                    &threshold.ipcam-general=0.34&threshold_key.ipcam-general=openvino%3Acpu\
+                    &threshold_default.ipcam-general=0.38&profile_remove.ipcam-general=ort%3Acoreml&action=save";
+        let (s, _, b) = call(&state, post_form("/config/models", body, false)).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let saved = Config::load(&state.config_path).unwrap();
+        assert_eq!(
+            saved.models[0].device_thresholds,
+            [("openvino:cpu".to_string(), 0.34)].into()
+        );
+        assert_eq!(saved.models[0].confidence_threshold, Some(0.38));
+        let (_, html) = get_text(&state, "/config").await;
+        assert!(html.contains("Confidence per device (1)"), "{html}");
+        // The device's profile now equals the benchmark's best: no "use" button.
+        assert!(!html.contains("data-use-threshold=\"0.34\""), "{html}");
+        assert!(
+            html.contains("benchmark best 0.34</span> <span class=\"muted\">set</span>"),
+            "{html}"
+        );
     }
 
     #[tokio::test]

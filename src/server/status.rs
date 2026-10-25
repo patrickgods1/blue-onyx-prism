@@ -81,11 +81,16 @@ pub(super) async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             ModelState::Initializing => (Kind::Initializing, "initializing", state_view(w).2),
         };
         kinds.push(kind);
+        // The threshold that runs: the profile for the device it loaded on, else the model's /
+        // global value (additive fields; the Blue Iris response shape is untouched).
+        let (threshold, source) = w.effective_threshold();
         models.push(json!({
             "name": w.name,
             "state": label,
             "device": w.metrics.device(),
             "detail": detail,
+            "threshold": crate::config::round_threshold_f64(threshold),
+            "thresholdSource": source.label(),
         }));
     }
     let overall = overall(&kinds);
@@ -208,5 +213,30 @@ mod tests {
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(v["status"], "initializing");
         assert_eq!(v["ready"], false);
+    }
+
+    #[tokio::test]
+    async fn reports_the_threshold_of_the_loaded_device() {
+        let state = state_with(&[("a", ModelState::Ready), ("b", ModelState::Ready)]);
+        let workers = state.registry.workers();
+        let mut m = crate::config::ModelConfig::default();
+        m.device_thresholds.insert("openvino:cpu".into(), 0.3);
+        workers[0].set_live(crate::worker::LiveSettings::for_model(
+            &Config::default(),
+            &m,
+        ));
+        *workers[0].device.write().unwrap() = Some(crate::backend::DeviceInfo {
+            spec: "openvino:cpu".into(),
+            ..crate::backend::DeviceInfo::default()
+        });
+        let (_, v) = get(&state).await;
+        assert_eq!(v["models"][0]["threshold"], 0.3);
+        assert_eq!(
+            v["models"][0]["thresholdSource"],
+            "profile for openvino:cpu"
+        );
+        // Not loaded: the fallback.
+        assert_eq!(v["models"][1]["threshold"], 0.5);
+        assert_eq!(v["models"][1]["thresholdSource"], "global");
     }
 }

@@ -211,7 +211,7 @@
     var columns = [
       {id: "model", head: "@model", value: function (r) { return r.model.toLowerCase(); }, render: function (r) {
         var s = el("span"), sw = el("span", "swatch ser-" + PB.colorOf(r.model)); sw.setAttribute("aria-hidden", "true"); s.appendChild(sw); s.appendChild(document.createTextNode(" " + r.model + (r.relative ? " *" : "")));
-        if (r.recommended) { var t0 = el("span", "tag rec", "best"); t0.title = "recommended device for this model"; s.appendChild(t0); } s.className = "nowrap"; return s; }},
+        if (r.recommended) { var t0 = el("span", "tag rec", "Recommended"); t0.title = "The best device for this model and your goal"; s.appendChild(t0); } s.className = "nowrap"; return s; }},
       {id: "device", head: "@device", value: function (r) { return r.device; }, render: function (r, td) { td.title = r.devLabel || ""; var s = el("span", "nowrap", r.device); if (r.fellBack) s.appendChild(el("span", "tag restart", "fell back")); return s; }},
       {id: "runtime", head: "@runtime", value: function (r) { return r.runtime; }, render: function (r) { return PB.RUNTIME_NAMES[r.runtime] || r.runtime; }}
     ].concat(cols.map(function (c) {

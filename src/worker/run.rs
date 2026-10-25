@@ -1190,7 +1190,15 @@ impl WorkerCtx {
             .saturating_duration_since(f.submitted);
         let t = Instant::now();
         let live = f.meta.live.clone();
-        let threshold = effective_threshold(f.min_confidence(), live.confidence_threshold);
+        // The profile for the device that actually loaded (`auto` and a fallback included),
+        // else the model's / global value; a request's `min_confidence` wins over both.
+        let (configured, source) = live.threshold_for(&eng.device);
+        let threshold = effective_threshold(f.min_confidence(), configured);
+        let threshold_source = if threshold == effective_threshold(0.0, configured) {
+            source.label()
+        } else {
+            "request".to_string()
+        };
         // Dataset collector: the record of this request (None: collection off). With the
         // `near_threshold` bucket on, postprocessing runs `margin` below the threshold and the
         // boxes under it are only recorded: greedy NMS and its caps keep the highest scores,
@@ -1295,6 +1303,8 @@ impl WorkerCtx {
             luma: f64::from(f.stats.mean_luma),
             chroma: f64::from(f.stats.chroma_spread.min(f.stats.tint_spread)),
             suppressed: suppressed_summary(&suppressed),
+            threshold,
+            threshold_source,
             slot,
             queue_ms: millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
             decode_ms: f.decode.as_secs_f64() * 1e3,
@@ -1464,6 +1474,11 @@ pub(super) struct DoneLine {
     pub(super) luma: f64,
     pub(super) chroma: f64,
     pub(super) suppressed: String,
+    /// The confidence threshold this request ran with.
+    pub(super) threshold: f32,
+    /// Where it came from: "profile for <device>", "model", "global" or "request"
+    /// (`min_confidence`).
+    pub(super) threshold_source: String,
     pub(super) slot: usize,
     pub(super) queue_ms: u64,
     pub(super) decode_ms: f64,
@@ -1500,6 +1515,8 @@ impl DoneLine {
             chroma = self.chroma,
             count = predictions.len(),
             suppressed = %self.suppressed,
+            threshold = crate::config::round_threshold_f64(self.threshold),
+            threshold_source = %self.threshold_source,
             detections = %detections_summary(predictions),
             verifier = verify.map(|v| v.verifier.as_str()),
             verify = verify.map(|v| v.outcome.as_str()),

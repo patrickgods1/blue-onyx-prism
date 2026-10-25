@@ -112,6 +112,144 @@ document.addEventListener("click", function (e) {
     var dev = $("device"), fc = $("force-cpu"); if (dev && fc) { dev.disabled = fc.checked; $("device-hint").hidden = !fc.checked; }
   }
 
+  // ---- Threshold per device. The Threshold field is for the device the row's Device option
+  // resolves to (option data-key; the hidden threshold_key.<model> field tells the server).
+  // Switching the device shows that device's profile (data-thr), else fills in the benchmark's
+  // best there (data-bench, marked as an edit: Save stores it as that device's profile), else
+  // empty with the fallback as placeholder. Values typed per (model, device) are kept while
+  // switching back and forth.
+  var typed = {};
+  function thrParts(tr) {
+    return {sel: tr.querySelector("td.model-device select"), cell: tr.querySelector("td.model-thr"), input: tr.querySelector("input.thr-input"),
+      key: tr.querySelector("input.thr-key"), hint: tr.querySelector(".thr-hint"), def: tr.querySelector("input.thr-default")};
+  }
+  // Same device: "openvino:gpu" == "openvino:gpu.0", "ort:cuda" == "ort:cuda:0".
+  function devId(d) { return String(d || "").replace(/([.:])0$/, ""); }
+  function lookup(map, key) {
+    if (!map || !key) return null;
+    if (Object.prototype.hasOwnProperty.call(map, key)) return map[key];
+    var id = devId(key), k = Object.keys(map).find(function (x) { return devId(x) === id; });
+    return k === undefined ? null : map[k];
+  }
+  function selectedOption(sel) { return sel && sel.selectedOptions && sel.selectedOptions[0]; }
+  function fallbackOf(r) { return {value: r.cell.dataset.fallback || "", src: r.cell.dataset.fallbackSrc || ""}; }
+  // The hint under the field: "for openvino:cpu · benchmark best 0.34 [use]".
+  function thrHint(tr, prefilled) {
+    var r = thrParts(tr), o = selectedOption(r.sel);
+    if (!r.hint || !o) return;
+    var key = r.key.value, bench = o.dataset.bench || "", thr = o.dataset.thr || "", fb = fallbackOf(r);
+    r.hint.replaceChildren();
+    if (key) { var f = el("span", "muted", "for "); f.append(el("code", null, key)); r.hint.append(f); }
+    if (!key || !bench) return;
+    r.hint.append(" · ", el("span", "muted", "benchmark best " + bench), " ");
+    var effective = thr !== "" ? thr : fb.value;
+    if (prefilled) r.hint.append(el("span", "muted", "for this device; Save to keep"));
+    else if (effective !== "" && parseFloat(effective) === parseFloat(bench)) {
+      var running = r.cell.dataset.runningThr, saved = o.defaultSelected;
+      r.hint.append(el("span", "muted", saved && running !== "" && parseFloat(running) === parseFloat(bench) ? "in use" : "set"));
+    } else {
+      var b = el("button", "small secondary", "use"); b.type = "button"; b.dataset.useThreshold = bench; b.title = "Put " + bench + " in the threshold field (then save)"; r.hint.append(b);
+    }
+  }
+  // Point the field at the selected option's device. `prefill`: a user's switch (fill in the
+  // benchmark's best when the device has no profile); `keepValue`: leave the value (carried over
+  // from an edit), only rebase the key, baseline and hint.
+  function applyDevice(tr, prefill, keepValue) {
+    var r = thrParts(tr), o = selectedOption(r.sel);
+    if (!r.input || !r.key || !o) return;
+    var key = o.dataset.key || "", thr = o.dataset.thr || "", bench = o.dataset.bench || "", fb = fallbackOf(r);
+    var mem = typed[tr.dataset.model + "\n" + key], value = r.input.value;
+    r.key.value = key;
+    // Without a device the field edits the model's default (as older pages did).
+    var base = key ? thr : (r.def ? r.def.defaultValue : "");
+    r.input.defaultValue = base;
+    var prefilled = false;
+    if (keepValue) r.input.value = value;
+    else if (mem !== undefined) r.input.value = mem;
+    else if (prefill && key && thr === "" && bench !== "") { r.input.value = bench; prefilled = true; }
+    else r.input.value = base;
+    r.input.placeholder = fb.value ? fb.value + " " + fb.src : "";
+    r.input.classList.toggle("edited", U.edited(r.input));
+    if (r.def) r.def.disabled = !key;
+    // A profile marked for removal on this device empties the field.
+    var rm = key && tr.querySelector('input[name^="profile_remove."][value="' + CSS.escape(key) + '"]');
+    if (rm && rm.checked && !keepValue) { r.input.value = ""; r.input.classList.toggle("edited", U.edited(r.input)); }
+    thrHint(tr, prefilled);
+  }
+  // The profiles list under "Confidence per device" (rebuilt when the saved profiles changed;
+  // boxes still listed keep their state unless `force`).
+  function refreshProfiles(tr, m, force) {
+    var list = tr.querySelector(".thr-profile-list"), none = tr.querySelector(".thr-profile-none"), sum = tr.querySelector(".thr-profiles summary");
+    if (!list) return;
+    var map = m.deviceThresholds || {}, keys = Object.keys(map).sort(), name = tr.querySelector("input.thr-input").name.slice("threshold.".length);
+    var sig = keys.map(function (k) { return k + "=" + Number(map[k]).toFixed(2); }).join(",");
+    if (list.dataset.sig === undefined) list.dataset.sig = Array.prototype.map.call(list.querySelectorAll("li"), function (li) { return li.dataset.device + "=" + li.dataset.thr; }).join(",");
+    if (list.dataset.sig !== sig || force) {
+      var checked = {};
+      if (!force) list.querySelectorAll("input[type=checkbox]").forEach(function (c) { checked[c.value] = c.checked; });
+      list.replaceChildren();
+      keys.forEach(function (k) {
+        var li = el("li"); li.dataset.device = k; li.dataset.thr = Number(map[k]).toFixed(2);
+        var cb = el("input"); cb.type = "checkbox"; cb.name = "profile_remove." + name; cb.value = k; cb.checked = !!checked[k];
+        var lab = el("label", "check small"); lab.append(cb, " remove");
+        li.append(el("code", null, k), " " + Number(map[k]).toFixed(2) + " ", lab); list.append(li);
+      });
+      list.dataset.sig = sig;
+    }
+    if (none) none.hidden = keys.length > 0;
+    if (sum) sum.textContent = "Confidence per device" + (keys.length ? " (" + keys.length + ")" : "");
+  }
+  // One row's threshold controls from the /v1/config model `m`.
+  function refreshThreshold(tr, m, j, force) {
+    var r = thrParts(tr);
+    if (!r.input) return;
+    if (force) Object.keys(typed).forEach(function (k) { if (k.indexOf(tr.dataset.model + "\n") === 0) delete typed[k]; });
+    r.cell.dataset.fallback = m.fallback ? Number(m.fallback.value).toFixed(2) : j.globalThreshold.toFixed(2);
+    r.cell.dataset.fallbackSrc = m.fallback ? m.fallback.source : "global";
+    r.cell.dataset.runningThr = m.running.threshold === null || m.running.threshold === undefined ? "" : Number(m.running.threshold).toFixed(2);
+    var fb = fallbackOf(r), byDev = (m.bench && m.bench.byDevice) || [];
+    Array.prototype.forEach.call(r.sel.options, function (o) {
+      // The saved option resolves to the device the model loaded on (auto, fallback).
+      if (o.defaultSelected && m.thresholdKey) o.dataset.key = m.thresholdKey;
+      var k = o.dataset.key || "", p = lookup(m.deviceThresholds, k);
+      o.dataset.thr = p === null ? "" : Number(p).toFixed(2);
+      o.dataset.src = p === null ? fb.src + " " + fb.value : "profile";
+      var b = k && byDev.find(function (d) { return d.device === k || devId(d.device) === devId(k); });
+      o.dataset.bench = b && b.best !== null && b.best !== undefined ? Number(b.best).toFixed(2) : "";
+    });
+    if (r.def) {
+      if (force) { U.set(r.def, fmtThr(m.threshold)); U.note(r.def, null); r.def.classList.remove("edited"); }
+      else U.refresh(r.def, fmtThr(m.threshold), show);
+      r.def.placeholder = j.globalThreshold.toFixed(2);
+    }
+    refreshProfiles(tr, m, force);
+    // The field: rebase on the selected device, then refresh it to the server's value there
+    // (an unsaved edit is kept).
+    var wasEdited = U.edited(r.input), before = r.input.value;
+    applyDevice(tr, false, true);
+    var key = r.key.value, v = key ? lookup(m.deviceThresholds, key) : m.threshold;
+    v = v === null || v === undefined ? "" : String(v);
+    if (force || !wasEdited) {
+      U.set(r.input, v); U.note(r.input, null); r.input.classList.remove("edited");
+      if (!force && !U.same(r.input, before, v)) U.flash(r.input);
+    } else U.refresh(r.input, v, function (x) { return x === "" ? "none (" + fb.value + " " + fb.src + ")" : x; });
+    thrHint(tr, false);
+  }
+  card.addEventListener("change", function (e) {
+    var t = e.target, tr = t.closest && t.closest("tr[data-model]");
+    if (!tr) return;
+    if (t.matches("td.model-device select")) applyDevice(tr, true, false);
+    else if (t.matches('input[name^="profile_remove."]')) {
+      var r = thrParts(tr);
+      if (t.value === r.key.value) { r.input.value = t.checked ? "" : r.input.defaultValue; r.input.classList.toggle("edited", U.edited(r.input)); thrHint(tr, false); }
+    }
+  });
+  card.addEventListener("input", function (e) {
+    var t = e.target, tr = t.closest && t.closest("tr[data-model]");
+    if (!tr || !t.matches("input.thr-input")) return;
+    typed[tr.dataset.model + "\n" + thrParts(tr).key.value] = t.value;
+  });
+
   // Models card: rows keyed by model; a new or removed model re-renders the card.
   function refreshCard(j, force) {
     var rows = card.querySelectorAll("tbody tr[data-model]");
@@ -126,10 +264,9 @@ document.addEventListener("click", function (e) {
       upd(tr.querySelector("input[name=enabled]"), m.enabled);
       var rm = tr.querySelector("button.model-remove");
       if (rm) { rm.disabled = m.enabled; rm.title = m.enabled ? "Enabled: disable it first (untick Load and save), then remove it" : "Remove this entry from the config; its files stay"; }
-      upd(tr.querySelector("select"), m.device || "");
-      var thr = tr.querySelector("input[type=number]");
-      upd(thr, fmtThr(m.threshold));
-      thr.placeholder = j.globalThreshold.toFixed(2);
+      var sel = tr.querySelector("td.model-device select");
+      upd(sel, m.device || "");
+      refreshThreshold(tr, m, j, force);
       var run = tr.querySelector("td.running"); run.className = "running st-" + m.running.stateClass;
       // "Failed" and its reason on one truncated line (opens to the full text; kept open across refreshes).
       var fail = m.running.stateClass === "fail" && m.running.detail ? m.running.detail : null, old = run.querySelector("details.run-detail");
@@ -143,13 +280,6 @@ document.addEventListener("click", function (e) {
         var rec = m.bench.recommended, used = rec && m.running.device === rec;
         var a = el("a", null, rec ? (m.bench.inUse ? "benchmark: " + rec + (used ? " (in use)" : " (configured; restart to use)") : "benchmark recommends " + rec) : "benchmark: no recommendation");
         a.href = m.bench.href; a.title = m.bench.recommendation; bh.append(el("br"), a);
-      }
-      var th = tr.querySelector(".thr-hint"); th.replaceChildren();
-      if (m.bench && m.bench.bestThreshold !== null && m.bench.bestThreshold !== undefined) {
-        var t = m.bench.bestThreshold.toFixed(2);
-        th.append(el("br"), el("span", "muted", "benchmark best " + t + " (" + m.bench.objective + ")"), " ");
-        if (m.bench.thresholdInUse) th.append(el("span", "muted", m.running.threshold === m.bench.bestThreshold ? "in use" : "configured; restart to use"));
-        else { var b = el("button", "small", "use"); b.type = "button"; b.dataset.useThreshold = t; b.title = "Put " + t + " in the threshold field (then save)"; th.append(b); }
       }
     });
     // Default radio group (one control).
@@ -184,7 +314,12 @@ document.addEventListener("click", function (e) {
       var st = L.view.capture(card);
       card.replaceChildren.apply(card, Array.prototype.slice.call(document.adoptNode(fresh).childNodes));
       L.view.restore(card, st);
-      card.querySelectorAll("tbody tr[data-model]").forEach(function (r) { if (!oldRows[r.dataset.model]) U.flash(r); });
+      card.querySelectorAll("tbody tr[data-model]").forEach(function (r) {
+        if (!oldRows[r.dataset.model]) U.flash(r);
+        // A carried-over device choice: point the threshold field at that device again.
+        var sel = r.querySelector("td.model-device select");
+        if (sel && U.edited(sel)) applyDevice(r, false, true);
+      });
     }).catch(function () {});
   }
 
@@ -233,8 +368,9 @@ document.addEventListener("click", function (e) {
   document.addEventListener("click", function (e) {
     var b = e.target.closest && e.target.closest("[data-use-threshold]");
     if (!b) return;
-    var input = b.closest("tr").querySelector("input[type=number]");
+    var tr = b.closest("tr"), input = tr.querySelector("input.thr-input");
     input.value = b.dataset.useThreshold; input.classList.toggle("edited", U.edited(input)); U.flash(input);
+    if (tr.dataset.model) typed[tr.dataset.model + "\n" + thrParts(tr).key.value] = input.value;
   });
 
   // Save without leaving the page: JSON answers shown next to the button.
