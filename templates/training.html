@@ -189,7 +189,7 @@
     <fieldset class="tr-radios">
       <legend>Labelers</legend>
       <label class="check"><input type="radio" name="mode" value="labelers" checked> Open-vocabulary labelers <span class="muted small">(NVIDIA GPU or Apple silicon)</span></label>
-      <label class="check"><input type="radio" name="mode" value="model"> Re-label with a trained model <span class="muted small">(self-training, runs anywhere)</span></label>
+      <label class="check"><input type="radio" name="mode" value="model"> Re-label with a model <span class="muted small">(any detector, runs anywhere)</span></label>
     </fieldset>
     <div class="tr-grid" data-mode="labelers">
       <div class="tr-field">
@@ -207,21 +207,30 @@
         <label class="check"><input type="checkbox" name="siglip" checked> SigLIP 2 species ranking <span class="muted small">(1.5 GB)</span></label>
       </div>
     </div>
-    <fieldset class="tr-classes" data-mode="labelers" id="al-classes">
+    <fieldset class="tr-classes" data-mode="labelers model" id="al-classes">
       <legend>Classes to look for</legend>
       <div id="al-picker"><p class="muted small">Without scripts the labelers use the class list and <code>training.synonyms</code>.</p></div>
       <p class="muted small cp-note">Defaults to the classes your enabled models detect (within the class list, not hidden on Review): see <a href="/config#at-models">Config, Models, Classes</a>. A class outside the list is appended to it (after asking).</p>
       <p id="al-classes-msg" class="form-msg" role="status"></p>
     </fieldset>
     <div class="tr-grid" data-mode="model">
-      <div class="tr-field">
-        <label for="al-model">Trained model</label>
-        <select id="al-model" name="with_model"><option value="">(choose a model)</option>{% for m in models %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select>
-        <p class="muted small">Frames whose reviewed labels it disagrees with go back to review, first in the queue.</p>
+      <div class="tr-field tr-wide">
+        <div id="al-model-picker"><p class="muted small">Loading the models&hellip; (needs scripts; without them use the labelers.)</p></div>
+        <p class="muted small">Its boxes are marked <em>review</em> unless pre-accepted below. With the self-training preset, frames whose reviewed labels it disagrees with go back to review, first in the queue.</p>
       </div>
       <div class="tr-field">
         <label for="al-threshold">Its threshold</label>
         <input type="number" id="al-threshold" name="threshold" min="0.01" max="1" step="0.01" value="0.3">
+      </div>
+      <div class="tr-field">
+        <label for="al-accept">Pre-accept boxes at score &ge;</label>
+        <input type="number" id="al-accept" name="model_accept_score" min="0.01" max="1" step="0.01" placeholder="off">
+        <p class="muted small">Empty = off; at least the threshold.</p>
+      </div>
+      <div class="tr-field">
+        <label for="al-preset">Preset</label>
+        <select id="al-preset"><option value="first-pass">First-pass labelling (unreviewed frames)</option><option value="self-training">Self-training check (all frames, flags disagreements)</option></select>
+        <p class="muted small">Sets the status below: unreviewed / any.</p>
       </div>
     </div>
     <fieldset>
@@ -230,7 +239,7 @@
         <div class="tr-field">
           <label for="al-status">Status</label>
           <select id="al-status" name="status"><option value="">default</option><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select>
-          <p class="muted small">Default: unreviewed; a re-label: any.</p>
+          <p class="muted small">Default: unreviewed. The model presets set it.</p>
         </div>
         <div class="tr-field">
           <label for="al-scene">Scene</label>
@@ -453,6 +462,7 @@
   <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
 </dialog>
 <script src="/static/class-picker.js?v={{ version }}"></script>
+<script src="/static/model-picker.js?v={{ version }}"></script>
 <script src="/static/training.js?v={{ version }}"></script>
 <script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

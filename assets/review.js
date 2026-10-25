@@ -1068,6 +1068,40 @@
   var alProgress = $('rv-al-progress');
   var polling = null;   // {id, timer}
 
+  // Label with: labelers (hidden fields, as before) or a model (model-picker.js: model, device,
+  // threshold, pre-accept score, the licence / large-download confirms). The blocks of the other
+  // mode are hidden and disabled, so they are not posted.
+  var MP = window.ModelPicker;
+  var alModelPicker = null;
+  function alMode() {
+    var r = alForm && alForm.querySelector('input[name="mode"]:checked');
+    return r ? r.value : 'labelers';
+  }
+  function applyAlMode() {
+    if (!alForm) return;
+    var m = alMode();
+    Array.prototype.forEach.call(alForm.querySelectorAll('[data-al-mode]'), function (blk) {
+      var off = blk.getAttribute('data-al-mode') !== m;
+      blk.hidden = off;
+      Array.prototype.forEach.call(blk.querySelectorAll('input, select, textarea'), function (f) { f.disabled = off; });
+    });
+  }
+  if (alForm) {
+    var mpHolder = $('rv-al-model-picker');
+    if (mpHolder && MP) {
+      alModelPicker = MP.create(mpHolder, {
+        onLoad: function (j) {
+          var t = alForm.elements.threshold;
+          if (t && j.default_threshold && t.value === t.defaultValue) t.value = j.default_threshold;
+        }
+      });
+    }
+    Array.prototype.forEach.call(alForm.querySelectorAll('input[name="mode"]'), function (r) {
+      r.addEventListener('change', applyAlMode);
+    });
+    applyAlMode();
+  }
+
   // The filters of the queue become the job's frame filter.
   function autolabelFrames() {
     var parts = [];
@@ -1135,6 +1169,16 @@
         alStatus.className = 'review-report error-text';
         report(alStatus, ['Choose at least one class to look for.']);
         return;
+      }
+      if (alMode() === 'model') {
+        var problem = !alModelPicker ? 'The model list is not available (reload the page).' :
+          (alModelPicker.problem() ||
+            MP.util.acceptProblem(alForm.elements.threshold.value, alForm.elements.model_accept_score.value));
+        if (problem) {
+          alStatus.className = 'review-report error-text';
+          report(alStatus, [problem]);
+          return;
+        }
       }
       var body = new URLSearchParams();
       Array.prototype.forEach.call(alForm.elements, function (e) {

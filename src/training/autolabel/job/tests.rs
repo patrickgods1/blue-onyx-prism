@@ -5,8 +5,11 @@
 use super::*;
 use crate::backend::detect::HardwareInfo;
 use crate::collect::labels::{BoxState, Source, Status};
+use crate::config::ModelConfig;
+use crate::resources::catalog::Platform;
 use crate::resources::export::fake::{Fake, arg_after};
 use crate::resources::export::{Cmd, CommandRunner, Fetcher};
+use crate::training::autolabel::models::{ConfigWriter, Install, Target};
 use crate::training::autolabel::triage::Det;
 use crate::training::autolabel::{FrameFilter, plan_autolabel};
 use crate::training::capability::{self, Capability};
@@ -374,26 +377,53 @@ fn empty_frames_get_the_marker_and_other_class_boxes_a_suggestion() {
     assert!(e.contains("no frame matches"), "{e}");
 }
 
-struct FakeDetector(BTreeMap<String, Vec<Det>>);
+/// Detections per frame; records the model, device and config it was asked for.
+#[derive(Default)]
+struct FakeDetector {
+    dets: BTreeMap<String, Vec<Det>>,
+    calls: Mutex<Vec<(String, Option<String>, bool)>>,
+}
+
+impl FakeDetector {
+    fn new(dets: BTreeMap<String, Vec<Det>>) -> Self {
+        Self {
+            dets,
+            calls: Mutex::default(),
+        }
+    }
+}
 
 impl Detector for FakeDetector {
     fn detect(
         &self,
-        model: &str,
+        config: &Config,
+        model: &ModelConfig,
+        device: Option<&str>,
         images: &[Image],
         _threshold: f32,
         _cancel: &AtomicBool,
-    ) -> Result<BTreeMap<String, Vec<Det>>> {
-        assert_eq!(model, "IPcam-general");
-        Ok(images
-            .iter()
-            .map(|i| {
-                (
-                    i.frame.clone(),
-                    self.0.get(&i.frame).cloned().unwrap_or_default(),
-                )
-            })
-            .collect())
+    ) -> Result<super::super::relabel::Detections> {
+        let name = model.effective_name();
+        assert!(
+            config.models.iter().any(|m| m.effective_name() == name),
+            "the entry is in the config the detector gets"
+        );
+        self.calls
+            .lock()
+            .unwrap()
+            .push((name, device.map(str::to_string), model.enabled));
+        Ok(super::super::relabel::Detections {
+            frames: images
+                .iter()
+                .map(|i| {
+                    (
+                        i.frame.clone(),
+                        self.dets.get(&i.frame).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            device: device.unwrap_or("openvino:cpu").to_string(),
+        })
     }
 }
 
@@ -432,8 +462,8 @@ fn self_training_sends_disagreeing_reviewed_frames_back_first() {
         labels::write(&fr.labels, &f).unwrap();
     }
     let cfg = config(&t.0);
-    let mut req =
-        AutolabelRequest::new(FrameFilter::parse("", super::super::default_status(true)).unwrap());
+    // Self-training: an explicit status=any (the default is unreviewed frames only).
+    let mut req = AutolabelRequest::new(FrameFilter::parse("status=any", "unreviewed").unwrap());
     req.with_model = Some("IPcam-general".into());
     // No GPU needed for a re-label with a configured model.
     let none = capability::capability(&HardwareInfo::new("linux", "x86_64", vec![]), None);
@@ -453,10 +483,12 @@ fn self_training_sends_disagreeing_reviewed_frames_back_first() {
         ),
     ]
     .into();
-    job.detector = Some(Arc::new(FakeDetector(dets)));
+    job.detector = Some(Arc::new(FakeDetector::new(dets)));
     let fake = LabelFake::default();
     let out = run_job(&job, &fake).unwrap();
     assert_eq!(out.result["disagreements"], 1, "{}", out.result);
+    assert_eq!(out.result["labeler"], "model:IPcam-general@auto");
+    assert_eq!(out.result["requested_device"], "auto");
     assert!(fake.cmds.lock().unwrap().is_empty(), "no Python ran");
     assert_eq!(fake.inner.runs.load(std::sync::atomic::Ordering::SeqCst), 0);
     let f0 = Frame::resolve(&dir, &rels[0])
@@ -466,7 +498,11 @@ fn self_training_sends_disagreeing_reviewed_frames_back_first() {
         .unwrap();
     assert_eq!(f0.status, Status::Reviewed);
     assert_eq!(f0.disagreement, None);
-    assert_eq!(f0.auto_run, None, "no marker for a re-label");
+    assert_eq!(
+        f0.auto_run.as_ref().map(|r| r.labeler.as_str()),
+        Some("model:IPcam-general@auto"),
+        "every frame the model looked at gets the marker"
+    );
     let f1 = Frame::resolve(&dir, &rels[1])
         .unwrap()
         .labels()
@@ -492,12 +528,8 @@ fn planning_refuses_unknown_models_missing_gpus_and_empty_selections() {
     let cfg = config(&t.0);
     let mut req = AutolabelRequest::new(FrameFilter::default());
     req.with_model = Some("nope".into());
-    assert!(
-        plan_autolabel(&cfg, req, &host())
-            .unwrap_err()
-            .to_string()
-            .contains("no configured model")
-    );
+    let e = plan_autolabel(&cfg, req, &host()).unwrap_err().to_string();
+    assert!(e.contains("not a configured model"), "{e}");
     let none = capability::capability(&HardwareInfo::new("linux", "x86_64", vec![]), None);
     let e = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &none)
         .unwrap_err()
@@ -628,8 +660,7 @@ fn self_training_for_some_classes_ignores_the_others() {
     });
     labels::write(&fr.labels, &f).unwrap();
     let cfg = config(&t.0);
-    let mut req =
-        AutolabelRequest::new(FrameFilter::parse("", super::super::default_status(true)).unwrap());
+    let mut req = AutolabelRequest::new(FrameFilter::parse("status=any", "unreviewed").unwrap());
     req.with_model = Some("IPcam-general".into());
     req.classes = Some(vec!["car".into()]);
     let none = capability::capability(&HardwareInfo::new("linux", "x86_64", vec![]), None);
@@ -640,11 +671,435 @@ fn self_training_for_some_classes_ignores_the_others() {
         vec![det("person", 0.9, [1.0, 1.0, 30.0, 20.0])],
     )]
     .into();
-    job.detector = Some(Arc::new(FakeDetector(dets)));
+    job.detector = Some(Arc::new(FakeDetector::new(dets)));
     let out = run_job(&job, &LabelFake::default()).unwrap();
     assert_eq!(out.result["disagreements"], 0, "{}", out.result);
+    assert_eq!(
+        out.result["dropped_other_class"], 1,
+        "the person is counted"
+    );
     let f = fr.labels().unwrap().unwrap();
     assert_eq!(f.status, Status::Reviewed);
     assert_eq!(f.disagreement, None);
     assert_eq!(f.boxes.len(), 1, "the person is not proposed");
+}
+
+/// The config file of a run that adds a model: kept in memory.
+struct MemWriter(Mutex<Config>);
+
+impl ConfigWriter for MemWriter {
+    fn update(&self, edit: &mut dyn FnMut(&mut Config) -> Result<()>) -> Result<(Config, String)> {
+        let mut c = self.0.lock().unwrap();
+        edit(&mut c)?;
+        Ok((c.clone(), "saved (test)".into()))
+    }
+}
+
+fn no_gpu() -> Capability {
+    capability::capability(&HardwareInfo::new("linux", "x86_64", vec![]), None)
+}
+
+fn labels_of(dir: &Path, rel: &str) -> labels::LabelFile {
+    Frame::resolve(dir, rel).unwrap().labels().unwrap().unwrap()
+}
+
+#[test]
+fn model_runs_mark_their_frames_map_labels_and_pre_accept_sure_boxes() {
+    let t = tmp("model-mark");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let dets: BTreeMap<String, Vec<Det>> = [
+        (
+            rels[0].clone(),
+            vec![
+                det("car", 0.9, [1.0, 1.0, 30.0, 20.0]),
+                det("motorbike", 0.85, [35.0, 20.0, 60.0, 46.0]),
+                det("tvmonitor", 0.95, [2.0, 25.0, 20.0, 46.0]),
+            ],
+        ),
+        (
+            rels[1].clone(),
+            vec![det("car", 0.5, [1.0, 1.0, 30.0, 20.0])],
+        ),
+    ]
+    .into();
+    let detector = Arc::new(FakeDetector::new(dets));
+    let plan = |filter: &str, device: Option<&str>| {
+        let mut req = AutolabelRequest::new(FrameFilter::parse(filter, "unreviewed").unwrap());
+        req.with_model = Some("IPcam-general".into());
+        req.model_accept_score = Some(0.8);
+        req.device = device.map(str::to_string);
+        let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+        job.detector = Some(detector.clone());
+        job
+    };
+    let job = plan("", None);
+    assert_eq!(job.steps(), MODEL_STAGES.len());
+    assert!(
+        job.title().starts_with("label with IPcam-general on auto"),
+        "{}",
+        job.title()
+    );
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    let rep = &out.result;
+    assert_eq!(
+        (
+            rep["proposals"].as_u64(),
+            rep["accept"].as_u64(),
+            rep["review"].as_u64()
+        ),
+        (Some(3), Some(2), Some(1)),
+        "{rep}"
+    );
+    assert_eq!(rep["dropped_other_class"], 1, "the tv: {rep}");
+    assert_eq!(
+        rep["renamed"],
+        serde_json::json!({"motorbike": "motorcycle"})
+    );
+    assert_eq!(
+        rep["by_label"],
+        serde_json::json!({"car": 2, "motorcycle": 1})
+    );
+    assert_eq!(rep["labeler"], "model:IPcam-general@auto");
+    assert_eq!(rep["device"], "openvino:cpu", "the device that ran");
+    assert!(
+        out.summary.contains("2 accept, 1 review"),
+        "{}",
+        out.summary
+    );
+    let f0 = labels_of(&dir, &rels[0]);
+    assert_eq!(f0.boxes.len(), 2);
+    assert!(
+        f0.boxes
+            .iter()
+            .all(|b| b.auto.triage == Some(Triage::Accept))
+    );
+    let moto = &f0.boxes[1];
+    assert_eq!(
+        (moto.label.as_str(), moto.model_label.as_deref()),
+        ("motorcycle", Some("motorbike"))
+    );
+    assert_eq!(moto.auto.why, ["model IPcam-general at 0.85 >= 0.80"]);
+    assert!(
+        labels::auto_accept_eligible(&f0),
+        "the bulk accept takes it"
+    );
+    let f1 = labels_of(&dir, &rels[1]);
+    assert_eq!(f1.boxes[0].auto.triage, Some(Triage::Review));
+    assert!(!labels::auto_accept_eligible(&f1));
+    for f in [&f0, &f1] {
+        let m = f.auto_run.as_ref().unwrap();
+        assert_eq!(m.labeler, "model:IPcam-general@auto");
+        assert_eq!(m.classes, cfg.collect.classes);
+    }
+    // `auto=` filters see the marker.
+    let q = queue::build(
+        &dir,
+        &queue::Filters::from_query(
+            &[
+                ("source".to_string(), "all".to_string()),
+                ("auto".to_string(), "accept".to_string()),
+            ]
+            .into(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        q.items.iter().map(|i| i.frame.clone()).collect::<Vec<_>>(),
+        [rels[0].clone()]
+    );
+    // The same model on the same device: skipped unless again=1.
+    let e = run_job(&plan("", None), &LabelFake::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("all 2 frame(s)") && e.contains("model:IPcam-general@auto"),
+        "{e}"
+    );
+    let again = run_job(&plan("again=1", None), &LabelFake::default()).unwrap();
+    assert_eq!(
+        (
+            again.result["frames"].as_u64(),
+            again.result["added"].as_u64()
+        ),
+        (Some(2), Some(0))
+    );
+    // Another device is another labeler; the detector gets the run's device.
+    let other = plan("", Some("CPU"));
+    assert!(
+        other.title().contains("on openvino:cpu"),
+        "{}",
+        other.title()
+    );
+    let out = run_job(&other, &LabelFake::default()).unwrap();
+    assert_eq!(out.result["frames"], 2);
+    assert_eq!(out.result["labeler"], "model:IPcam-general@openvino:cpu");
+    assert_eq!(out.result["requested_device"], "openvino:cpu");
+    let calls = detector.calls.lock().unwrap().clone();
+    assert_eq!(calls.last().unwrap().1.as_deref(), Some("openvino:cpu"));
+    assert_eq!(calls[0].1, None, "no override: the model's own device");
+}
+
+#[test]
+fn night_person_boxes_of_a_model_stay_in_review() {
+    let t = tmp("model-night");
+    let rels = frames(&t.0, 1, true);
+    let cfg = config(&t.0);
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.with_model = Some("IPcam-general".into());
+    req.model_accept_score = Some(0.5);
+    let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+    job.detector = Some(Arc::new(FakeDetector::new(
+        [(
+            rels[0].clone(),
+            vec![
+                det("person", 0.97, [1.0, 1.0, 30.0, 40.0]),
+                det("car", 0.97, [35.0, 20.0, 60.0, 46.0]),
+            ],
+        )]
+        .into(),
+    )));
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    assert_eq!(
+        (out.result["accept"].as_u64(), out.result["review"].as_u64()),
+        (Some(1), Some(1))
+    );
+    let f = labels_of(&t.0.join("dataset"), &rels[0]);
+    let person = f.boxes.iter().find(|b| b.label == "person").unwrap();
+    assert_eq!(person.auto.triage, Some(Triage::Review));
+    assert!(
+        person.auto.why.iter().any(|w| w.contains("at night")),
+        "{:?}",
+        person.auto.why
+    );
+}
+
+#[test]
+fn a_catalog_model_is_downloaded_added_disabled_and_used() {
+    let t = tmp("model-catalog");
+    let rels = frames(&t.0, 1, false);
+    let cfg = config(&t.0);
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.with_model = Some("resource:model:rfdetr-base".into());
+    let mut job = plan_autolabel(&cfg, req.clone(), &no_gpu()).unwrap();
+    assert_eq!(job.model.as_ref().unwrap().install, Some(Install::Download));
+    let det = Arc::new(FakeDetector::new(
+        [(
+            rels[0].clone(),
+            vec![det("car", 0.9, [1.0, 1.0, 30.0, 20.0])],
+        )]
+        .into(),
+    ));
+    job.detector = Some(det.clone());
+    let writer = Arc::new(MemWriter(Mutex::new(cfg.clone())));
+    job.config_writer = Some(writer.clone());
+    let fake = LabelFake::default();
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(
+        *fake.inner.fetched.lock().unwrap(),
+        ["model:rfdetr-base".to_string()]
+    );
+    assert!(
+        out.result["installed"]
+            .as_str()
+            .unwrap()
+            .starts_with("downloaded RF-DETR base"),
+        "{}",
+        out.result
+    );
+    assert!(
+        out.result["config_entry"]
+            .as_str()
+            .unwrap()
+            .contains("disabled")
+    );
+    assert_eq!(out.result["added"], 1);
+    let saved = writer.0.lock().unwrap().clone();
+    let m = saved
+        .models
+        .iter()
+        .find(|m| m.effective_name() == "rfdetr-base")
+        .unwrap();
+    assert!(!m.enabled, "never loaded for serving");
+    assert_eq!(
+        det.calls.lock().unwrap()[0],
+        ("rfdetr-base".to_string(), None, false)
+    );
+    assert!(t.0.join("models/rfdetr-base.onnx").is_file());
+    // Next time it is a configured model: nothing to install.
+    let again = plan_autolabel(&saved, req, &no_gpu()).unwrap();
+    let p = again.model.as_ref().unwrap();
+    assert!(matches!(p.target, Target::Config { .. }) && p.install.is_none());
+}
+
+#[test]
+fn an_export_model_is_exported_first_and_gated() {
+    let t = tmp("model-export");
+    let rels = frames(&t.0, 1, false);
+    let cfg = config(&t.0);
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.with_model = Some("resource:model:yolo26n".into());
+    let p = Platform::current();
+    if let Some(why) = crate::resources::export::unsupported_reason(p.os, p.arch) {
+        let e = plan_autolabel(&cfg, req, &no_gpu())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&why), "{e}");
+        return;
+    }
+    // Without the large-download permission the toolchain setup is refused.
+    let mut small = cfg.clone();
+    small.allow_large_downloads = false;
+    let e = plan_autolabel(&small, req.clone(), &no_gpu())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("--allow-large") && e.contains("export toolchain"),
+        "{e}"
+    );
+    let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+    assert_eq!(job.model.as_ref().unwrap().install, Some(Install::Export));
+    job.detector = Some(Arc::new(FakeDetector::new(
+        [(
+            rels[0].clone(),
+            vec![det("person", 0.9, [1.0, 1.0, 30.0, 40.0])],
+        )]
+        .into(),
+    )));
+    let writer = Arc::new(MemWriter(Mutex::new(cfg.clone())));
+    job.config_writer = Some(writer.clone());
+    let fake = LabelFake {
+        inner: Fake::new(),
+        ..LabelFake::default()
+    };
+    let mut stages: Vec<String> = Vec::new();
+    let out = job
+        .run(
+            TaskContext {
+                runner: &fake,
+                fetcher: &fake,
+            },
+            &mut |r| {
+                if let TaskReport::Stage { stage, detail, .. } = r {
+                    stages.push(format!("{stage}: {detail}"));
+                }
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        fake.inner
+            .cmds()
+            .iter()
+            .any(|c| c.contains("export_model.py")),
+        "{:?}",
+        fake.inner.cmds()
+    );
+    assert!(
+        stages
+            .iter()
+            .any(|s| s.starts_with("installing the model: exporting yolo26n")),
+        "{stages:?}"
+    );
+    assert!(
+        out.result["installed"]
+            .as_str()
+            .unwrap()
+            .contains("exported yolo26n")
+    );
+    assert!(t.0.join("models/yolo26n.onnx").is_file());
+    let saved = writer.0.lock().unwrap().clone();
+    assert!(
+        saved
+            .models
+            .iter()
+            .any(|m| m.effective_name() == "yolo26n" && !m.enabled)
+    );
+}
+
+#[test]
+fn restricted_licences_need_a_confirmation() {
+    let t = tmp("model-licence");
+    let cfg = config(&t.0);
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.with_model = Some("resource:model:deimv2-s".into());
+    let p = Platform::current();
+    let e = plan_autolabel(&cfg, req.clone(), &no_gpu())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("--confirm-license") && e.contains("Non-commercial"),
+        "{e}"
+    );
+    req.confirm_license = true;
+    let r = plan_autolabel(&cfg, req, &no_gpu());
+    if crate::resources::export::unsupported_reason(p.os, p.arch).is_none() {
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+}
+
+#[test]
+fn a_local_model_file_is_added_with_family_auto() {
+    let t = tmp("model-local");
+    let rels = frames(&t.0, 1, false);
+    std::fs::create_dir_all(t.0.join("models")).unwrap();
+    std::fs::write(t.0.join("models/mine.onnx"), b"onnx").unwrap();
+    let cfg = config(&t.0);
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.with_model = Some("local:mine.onnx".into());
+    let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+    job.detector = Some(Arc::new(FakeDetector::new(
+        [(
+            rels[0].clone(),
+            vec![det("Car", 0.9, [1.0, 1.0, 30.0, 20.0])],
+        )]
+        .into(),
+    )));
+    // No writer: the run uses the entry, says it was not saved.
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    assert_eq!(out.result["by_label"], serde_json::json!({"car": 1}));
+    assert!(
+        out.result["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("not saved"),
+        "{}",
+        out.result
+    );
+    let f = labels_of(&t.0.join("dataset"), &rels[0]);
+    assert_eq!(f.boxes[0].model_label, None, "a case-only change");
+    assert_eq!(f.auto_run.unwrap().labeler, "model:mine@auto");
+}
+
+#[test]
+fn a_failing_auto_family_names_the_fix() {
+    struct Broken;
+    impl Detector for Broken {
+        fn detect(
+            &self,
+            _: &Config,
+            _: &ModelConfig,
+            _: Option<&str>,
+            _: &[Image],
+            _: f32,
+            _: &AtomicBool,
+        ) -> Result<super::super::relabel::Detections> {
+            bail!("could not auto-detect the model family from its outputs")
+        }
+    }
+    let t = tmp("model-broken");
+    frames(&t.0, 1, false);
+    std::fs::create_dir_all(t.0.join("models")).unwrap();
+    std::fs::write(t.0.join("models/odd.onnx"), b"onnx").unwrap();
+    let cfg = config(&t.0);
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.with_model = Some("local:odd.onnx".into());
+    let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+    job.detector = Some(Arc::new(Broken));
+    let e = format!("{:#}", run_job(&job, &LabelFake::default()).unwrap_err());
+    assert!(
+        e.contains("family auto") && e.contains("Models card"),
+        "{e}"
+    );
 }

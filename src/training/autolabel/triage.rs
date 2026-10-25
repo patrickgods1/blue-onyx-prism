@@ -1,11 +1,13 @@
 //! The service's half of auto-labelling (pure): the proposals `scripts/autolabel.py` returns
 //! ([`FrameProposals`]), the triage rule ([`triage`]), proposals to pending `source: auto` label
-//! boxes ([`to_boxes`]) and their merge into a label file ([`apply`]: evidence on boxes it
-//! confirms, class suggestions on pending boxes it labels otherwise, then [`merge_proposals`]);
-//! and for the self-training loop, the disagreement of a
-//! trained model's detections with the reviewed labels ([`disagreement`]).
+//! boxes ([`to_boxes`], labels mapped onto the class list's spelling by [`map_label`]) and their
+//! merge into a label file ([`apply`]: evidence on boxes it confirms, class suggestions on
+//! pending boxes it labels otherwise, then [`merge_proposals`]); and for runs with a model
+//! ([`model_boxes`], [`model_triage`]: `review`, or `accept` at a pre-accept score), the
+//! disagreement of its detections with the reviewed labels ([`disagreement`]).
 
 use super::Category;
+use super::catalog::same_class;
 use crate::collect::labels::{
     self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, Source, Status, Triage,
     VlmCheck, iou, merge_proposals,
@@ -71,16 +73,8 @@ pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<Stri
     if p.score < accept_score {
         why.push(format!("score {:.2} below {accept_score:.2}", p.score));
     }
-    let cat = Category::of(&p.label);
-    if matches!(scene, "night" | "ir") && matches!(cat, Category::Person | Category::Animal) {
-        why.push(
-            if cat == Category::Person {
-                "a person at night: always reviewed"
-            } else {
-                "an animal at night: always reviewed"
-            }
-            .to_string(),
-        );
+    if let Some(n) = night_review(&p.label, scene) {
+        why.push(n.to_string());
     }
     if let Some(v) = &p.vlm
         && !v.ok
@@ -115,13 +109,52 @@ pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<Stri
     }
 }
 
+/// Why a `label` box on a `scene` frame is always reviewed: a person or an animal at night
+/// (`night` / `ir`). The labelers' [`triage`] and a model's [`model_triage`] share the rule.
+pub fn night_review(label: &str, scene: &str) -> Option<&'static str> {
+    if !matches!(scene, "night" | "ir") {
+        return None;
+    }
+    match Category::of(label) {
+        Category::Person => Some("a person at night: always reviewed"),
+        Category::Animal => Some("an animal at night: always reviewed"),
+        _ => None,
+    }
+}
+
 fn round(v: f32, scale: f32) -> f32 {
     (v * scale).round() / scale
 }
 
-/// The pending `source: auto` boxes of `proposals` for a `w` x `h` frame of `scene`: labels
-/// outside `classes` and boxes smaller than [`labels::MIN_BOX_PX`] after clamping are left out;
-/// coordinates rounded to 0.1 px, scores to 4 decimals.
+/// The class of `classes` a detection `label` is: the same name, else the same name ignoring
+/// case, else the same COCO class through the aliases (a VOC-spelled model's `motorbike`,
+/// `tvmonitor`, `pottedplant`, `aeroplane`, `sofa`, `diningtable` are the list's `motorcycle`,
+/// `tv`, `potted plant`, `airplane`, `couch`, `dining table`). None: not a class of the run.
+pub fn map_label<'a>(label: &str, classes: &'a [String]) -> Option<&'a str> {
+    let l = label.trim();
+    classes
+        .iter()
+        .find(|c| c.as_str() == l)
+        .or_else(|| classes.iter().find(|c| c.eq_ignore_ascii_case(l)))
+        .or_else(|| classes.iter().find(|c| same_class(c, l)))
+        .map(String::as_str)
+}
+
+/// [`to_boxes`] with what it left out and renamed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Boxes {
+    pub boxes: Vec<LabelBox>,
+    /// Proposals whose label is no class of the run, also after [`map_label`].
+    pub other_class: usize,
+    /// Labels given the class list's spelling: model label -> class (`motorbike` ->
+    /// `motorcycle`); a case-only change is not listed.
+    pub renamed: BTreeMap<String, String>,
+}
+
+/// The pending `source: auto` boxes of `proposals` for a `w` x `h` frame of `scene`. Each label
+/// is mapped onto `classes` ([`map_label`]; the original kept in `model_label` when it is not
+/// just another case): labels outside `classes` and boxes smaller than [`labels::MIN_BOX_PX`]
+/// after clamping are left out; coordinates rounded to 0.1 px, scores to 4 decimals.
 pub fn to_boxes(
     proposals: &[Proposal],
     classes: &[String],
@@ -130,58 +163,100 @@ pub fn to_boxes(
     h: u32,
     accept_score: f32,
 ) -> Vec<LabelBox> {
-    proposals
-        .iter()
-        .filter(|p| classes.iter().any(|c| c == &p.label))
-        .filter(|p| p.bbox.iter().all(|v| v.is_finite()) && p.score.is_finite())
-        .filter_map(|p| {
-            let b = labels::clamp_box(p.bbox, w, h).map(|v| round(v, 10.0));
-            if b[2] - b[0] < labels::MIN_BOX_PX || b[3] - b[1] < labels::MIN_BOX_PX {
-                return None;
+    to_boxes_counted(proposals, classes, scene, w, h, accept_score).boxes
+}
+
+/// [`to_boxes`], counting the proposals of other classes and the renamed labels.
+pub fn to_boxes_counted(
+    proposals: &[Proposal],
+    classes: &[String],
+    scene: &str,
+    w: u32,
+    h: u32,
+    accept_score: f32,
+) -> Boxes {
+    let mut out = Boxes::default();
+    for p in proposals {
+        if !(p.bbox.iter().all(|v| v.is_finite()) && p.score.is_finite()) {
+            continue;
+        }
+        let Some(class) = map_label(&p.label, classes) else {
+            out.other_class += 1;
+            continue;
+        };
+        let model_label = (!class.eq_ignore_ascii_case(p.label.trim())).then(|| {
+            p.label
+                .chars()
+                .take(labels::MAX_LABEL_LEN)
+                .collect::<String>()
+        });
+        let mapped;
+        let p = if class == p.label {
+            p
+        } else {
+            mapped = Proposal {
+                label: class.to_string(),
+                ..p.clone()
+            };
+            &mapped
+        };
+        if let Some(b) = proposal_box(p, scene, w, h, accept_score) {
+            if let Some(m) = &model_label {
+                out.renamed.insert(m.clone(), class.to_string());
             }
-            let (t, why) = triage(p, scene, accept_score);
-            let labelers: BTreeMap<String, f32> = p
-                .sources
+            out.boxes.push(LabelBox { model_label, ..b });
+        }
+    }
+    out
+}
+
+/// The box of one proposal whose label is a class of the run (None: too small).
+fn proposal_box(p: &Proposal, scene: &str, w: u32, h: u32, accept_score: f32) -> Option<LabelBox> {
+    let b = labels::clamp_box(p.bbox, w, h).map(|v| round(v, 10.0));
+    if b[2] - b[0] < labels::MIN_BOX_PX || b[3] - b[1] < labels::MIN_BOX_PX {
+        return None;
+    }
+    let (t, why) = triage(p, scene, accept_score);
+    let labelers: BTreeMap<String, f32> = p
+        .sources
+        .iter()
+        .filter(|(_, s)| s.is_finite())
+        .map(|(k, s)| (k.clone(), round(s.clamp(0.0, 1.0), 1e4)))
+        .collect();
+    Some(LabelBox {
+        label: p.label.clone(),
+        bbox: b,
+        source: Source::Auto,
+        score: Some(round(p.score.clamp(0.0, 1.0), 1e4)),
+        state: BoxState::Pending,
+        origin: None,
+        reason: Some(format!(
+            "auto: {}",
+            labelers.keys().cloned().collect::<Vec<_>>().join(" + ")
+        )),
+        model_label: None,
+        orig_bbox: None,
+        auto: AutoInfo {
+            agree: Some(p.agree),
+            triage: Some(t),
+            why,
+            labelers,
+            vlm: p.vlm.as_ref().map(|v| VlmCheck {
+                model: v.model.chars().take(labels::MAX_LABEL_LEN).collect(),
+                answer: v.answer.chars().take(labels::MAX_LABEL_LEN).collect(),
+                expected: v.expected.chars().take(labels::MAX_LABEL_LEN).collect(),
+                ok: v.ok,
+            }),
+            species_scores: p
+                .species_scores
                 .iter()
                 .filter(|(_, s)| s.is_finite())
                 .map(|(k, s)| (k.clone(), round(s.clamp(0.0, 1.0), 1e4)))
-                .collect();
-            Some(LabelBox {
-                label: p.label.clone(),
-                bbox: b,
-                source: Source::Auto,
-                score: Some(round(p.score.clamp(0.0, 1.0), 1e4)),
-                state: BoxState::Pending,
-                origin: None,
-                reason: Some(format!(
-                    "auto: {}",
-                    labelers.keys().cloned().collect::<Vec<_>>().join(" + ")
-                )),
-                model_label: None,
-                orig_bbox: None,
-                auto: AutoInfo {
-                    agree: Some(p.agree),
-                    triage: Some(t),
-                    why,
-                    labelers,
-                    vlm: p.vlm.as_ref().map(|v| VlmCheck {
-                        model: v.model.chars().take(labels::MAX_LABEL_LEN).collect(),
-                        answer: v.answer.chars().take(labels::MAX_LABEL_LEN).collect(),
-                        expected: v.expected.chars().take(labels::MAX_LABEL_LEN).collect(),
-                        ok: v.ok,
-                    }),
-                    species_scores: p
-                        .species_scores
-                        .iter()
-                        .filter(|(_, s)| s.is_finite())
-                        .map(|(k, s)| (k.clone(), round(s.clamp(0.0, 1.0), 1e4)))
-                        .collect(),
-                    auto_label: None,
-                    auto_score: None,
-                },
-            })
-        })
-        .collect()
+                .collect(),
+            auto_label: None,
+            auto_score: None,
+        },
+    })
 }
 
 /// What [`apply`] did.
@@ -272,8 +347,8 @@ pub struct Det {
     pub bbox: [f32; 4],
 }
 
-/// How a trained model's detections disagree with a reviewed label file, over the run's
-/// `classes` only (case-insensitive): a detection of one of them matching no training box
+/// How a model's detections disagree with a reviewed label file, over the run's `classes` only:
+/// each detection is mapped onto `classes` ([`map_label`]); one of them matching no training box
 /// (accepted or added, any class) at IoU >= [`MATCH_IOU`] is new, one whose best match has
 /// another label is a class change, a training box of one of them no detection matches is
 /// missed. Detections and training boxes of other classes are no disagreement: a run for a few
@@ -290,9 +365,12 @@ pub fn disagreement(
     }
     let in_run = |l: &str| classes.iter().any(|c| c.eq_ignore_ascii_case(l));
     let train: Vec<&LabelBox> = previous.training().collect();
-    let dets: Vec<&Det> = dets.iter().filter(|d| in_run(&d.label)).collect();
+    let dets: Vec<(&str, &Det)> = dets
+        .iter()
+        .filter_map(|d| map_label(&d.label, classes).map(|c| (c, d)))
+        .collect();
     let (mut new, mut changed) = (0usize, 0usize);
-    for d in &dets {
+    for (label, d) in &dets {
         let best = train
             .iter()
             .map(|b| (iou(&b.bbox, &d.bbox), *b))
@@ -300,14 +378,14 @@ pub fn disagreement(
             .max_by(|a, b| a.0.total_cmp(&b.0));
         match best {
             None => new += 1,
-            Some((_, b)) if b.label != d.label => changed += 1,
+            Some((_, b)) if !same_class(&b.label, label) => changed += 1,
             Some(_) => {}
         }
     }
     let missed = train
         .iter()
         .filter(|b| in_run(&b.label))
-        .filter(|b| !dets.iter().any(|d| iou(&b.bbox, &d.bbox) >= MATCH_IOU))
+        .filter(|b| !dets.iter().any(|(_, d)| iou(&b.bbox, &d.bbox) >= MATCH_IOU))
         .count();
     if new + changed + missed == 0 {
         return None;
@@ -328,46 +406,82 @@ pub fn disagreement(
     Some(format!("re-label by {model}: {}", parts.join(", ")))
 }
 
-/// The pending auto boxes of a trained model's detections (always `review`: a model is checked
-/// against the reviewer, not trusted).
-pub fn model_boxes(dets: &[Det], model: &str, classes: &[String], w: u32, h: u32) -> Vec<LabelBox> {
+/// A run with a model ([`model_boxes`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ModelRun<'a> {
+    /// The model's name (the boxes' labeler, the reasons).
+    pub model: &'a str,
+    /// The run's classes.
+    pub classes: &'a [String],
+    /// The frame's scene (`day` | `night` | `ir`).
+    pub scene: &'a str,
+    /// Pre-accept: boxes at or above this score are triaged `accept` (None: every box `review`).
+    pub accept_score: Option<f32>,
+}
+
+/// The triage of a model's `label` box at `score`: `review` ("re-label by <model>") unless the
+/// run pre-accepts at `accept_score` and the score reaches it ("model <name> at 0.87 >= 0.80");
+/// a person or an animal at night is always reviewed ([`night_review`], as for the labelers).
+pub fn model_triage(label: &str, score: f32, run: &ModelRun<'_>) -> (Triage, Vec<String>) {
+    let base = format!("re-label by {}", run.model);
+    let Some(min) = run.accept_score else {
+        return (Triage::Review, vec![base]);
+    };
+    if let Some(n) = night_review(label, run.scene) {
+        return (Triage::Review, vec![base, n.to_string()]);
+    }
+    if score >= min {
+        (
+            Triage::Accept,
+            vec![format!("model {} at {score:.2} >= {min:.2}", run.model)],
+        )
+    } else {
+        (
+            Triage::Review,
+            vec![base, format!("score {score:.2} below {min:.2}")],
+        )
+    }
+}
+
+/// The pending auto boxes of a model's detections on a `w` x `h` frame: labels mapped onto the
+/// run's classes ([`to_boxes_counted`]), triaged by [`model_triage`] (a model is checked against
+/// the reviewer, unless the run pre-accepts its sure boxes).
+pub fn model_boxes(dets: &[Det], run: &ModelRun<'_>, w: u32, h: u32) -> Boxes {
     let props: Vec<Proposal> = dets
         .iter()
         .map(|d| Proposal {
             label: d.label.clone(),
             bbox: d.bbox,
             score: d.score,
-            sources: [(model.to_string(), d.score)].into(),
+            sources: [(run.model.to_string(), d.score)].into(),
             agree: false,
             vlm: None,
             species_scores: BTreeMap::new(),
         })
         .collect();
-    to_boxes(&props, classes, "day", w, h, ACCEPT_SCORE)
-        .into_iter()
-        .map(|mut b| {
-            b.auto.agree = None;
-            b.auto.triage = Some(Triage::Review);
-            b.auto.why = vec![format!("re-label by {model}")];
-            b.reason = Some(format!("model {model}"));
-            b
-        })
-        .collect()
+    let mut out = to_boxes_counted(&props, run.classes, run.scene, w, h, ACCEPT_SCORE);
+    for b in &mut out.boxes {
+        let (t, why) = model_triage(&b.label, b.score.unwrap_or(0.0), run);
+        b.auto.agree = None;
+        b.auto.triage = Some(t);
+        b.auto.why = why;
+        b.reason = Some(format!("model {}", run.model));
+    }
+    out
 }
 
-/// Apply a trained model's detections to a frame's label file: the disagreement note (reviewed
-/// files only; the file goes back to `unreviewed`) and the detections as pending proposals.
-/// Returns the merge report and the disagreement.
+/// Apply a model's detections to a frame's label file: the disagreement note (reviewed files
+/// only; the file goes back to `unreviewed`) and `boxes` (its [`model_boxes`]) merged by
+/// [`apply`]. Returns what the merge did and the disagreement.
 pub fn apply_relabel(
     f: &mut LabelFile,
     dets: &[Det],
+    boxes: Vec<LabelBox>,
     model: &str,
     classes: &[String],
-    w: u32,
-    h: u32,
-) -> (MergeReport, Option<String>) {
+) -> (ApplyReport, Option<String>) {
     let why = disagreement(f, dets, model, classes);
-    let rep = apply(f, model_boxes(dets, model, classes, w, h)).merge;
+    let rep = apply(f, boxes);
     if let Some(w) = &why {
         f.status = Status::Unreviewed;
         f.disagreement = Some(w.clone());
@@ -679,6 +793,197 @@ mod tests {
         }
     }
 
+    /// [`apply_relabel`] with [`model_boxes`] of a day frame, no pre-accept.
+    fn relabel(
+        f: &mut LabelFile,
+        dets: &[Det],
+        model: &str,
+        classes: &[String],
+    ) -> (MergeReport, Option<String>) {
+        let run = ModelRun {
+            model,
+            classes,
+            scene: "day",
+            accept_score: None,
+        };
+        let boxes = model_boxes(dets, &run, 640, 480).boxes;
+        let (a, why) = apply_relabel(f, dets, boxes, model, classes);
+        (a.merge, why)
+    }
+
+    #[test]
+    fn model_labels_are_mapped_onto_the_class_list() {
+        let list: Vec<String> = [
+            "person",
+            "Motorcycle",
+            "car",
+            "tv",
+            "potted plant",
+            "raccoon",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(map_label("person", &list), Some("person"));
+        assert_eq!(map_label("PERSON", &list), Some("person"));
+        assert_eq!(map_label("motorbike", &list), Some("Motorcycle"));
+        assert_eq!(map_label("motorcycle", &list), Some("Motorcycle"));
+        assert_eq!(map_label("tvmonitor", &list), Some("tv"));
+        assert_eq!(map_label("pottedplant", &list), Some("potted plant"));
+        assert_eq!(map_label(" car ", &list), Some("car"));
+        assert_eq!(
+            map_label("aeroplane", &list),
+            None,
+            "airplane is not listed"
+        );
+        assert_eq!(map_label("dog", &list), None);
+        // An exact spelling wins over a case-insensitive one.
+        let two: Vec<String> = ["Car", "car"].map(String::from).to_vec();
+        assert_eq!(map_label("car", &two), Some("car"));
+        // Proposals: mapped, the model's spelling kept, others counted.
+        let props = vec![
+            p("motorbike", 0.8, true),
+            p("Person", 0.7, true),
+            p("aeroplane", 0.9, true),
+            p("sofa", 0.9, true),
+        ];
+        let out = to_boxes_counted(&props, &list, "day", 640, 480, ACCEPT_SCORE);
+        assert_eq!(out.other_class, 2, "aeroplane and sofa are not run classes");
+        assert_eq!(out.boxes.len(), 2);
+        let moto = &out.boxes[0];
+        assert_eq!(moto.label, "Motorcycle");
+        assert_eq!(moto.model_label.as_deref(), Some("motorbike"));
+        assert_eq!(moto.auto.triage, Some(Triage::Accept));
+        let person = &out.boxes[1];
+        assert_eq!(person.label, "person");
+        assert_eq!(
+            person.model_label, None,
+            "a case-only change is not a rename"
+        );
+        assert_eq!(
+            out.renamed,
+            [("motorbike".to_string(), "Motorcycle".to_string())].into()
+        );
+        let v = serde_json::to_value(moto).unwrap();
+        assert_eq!(v["model_label"], "motorbike");
+        // The night rule follows the mapped class (`people` is a person).
+        let night = to_boxes(&[p("people", 0.9, true)], &list, "ir", 640, 480, 0.6);
+        assert_eq!(night[0].label, "person");
+        assert_eq!(night[0].auto.triage, Some(Triage::Review));
+    }
+
+    #[test]
+    fn model_boxes_are_reviewed_unless_pre_accepted() {
+        let cls: Vec<String> = ["person", "motorcycle", "car", "raccoon"]
+            .map(String::from)
+            .to_vec();
+        let dets = [
+            Det {
+                label: "motorbike".into(),
+                score: 0.87,
+                bbox: [10.0, 10.0, 60.0, 90.0],
+            },
+            Det {
+                label: "car".into(),
+                score: 0.5,
+                bbox: [200.0, 10.0, 300.0, 90.0],
+            },
+            Det {
+                label: "person".into(),
+                score: 0.95,
+                bbox: [400.0, 10.0, 450.0, 90.0],
+            },
+            Det {
+                label: "tvmonitor".into(),
+                score: 0.95,
+                bbox: [500.0, 10.0, 550.0, 90.0],
+            },
+        ];
+        let mut run = ModelRun {
+            model: "rfdetr-large",
+            classes: &cls,
+            scene: "day",
+            accept_score: None,
+        };
+        let out = model_boxes(&dets, &run, 640, 480);
+        assert_eq!(out.other_class, 1, "the tv is not a run class");
+        assert_eq!(out.boxes.len(), 3);
+        assert!(
+            out.boxes
+                .iter()
+                .all(|b| b.auto.triage == Some(Triage::Review)
+                    && b.auto.why == ["re-label by rfdetr-large"]
+                    && b.auto.agree.is_none()
+                    && b.auto.labelers.contains_key("rfdetr-large"))
+        );
+        assert_eq!(out.boxes[0].label, "motorcycle");
+        assert_eq!(out.boxes[0].model_label.as_deref(), Some("motorbike"));
+        // Pre-accept at 0.8: the motorcycle and the person, not the car.
+        run.accept_score = Some(0.8);
+        let out = model_boxes(&dets, &run, 640, 480);
+        let t: Vec<Option<Triage>> = out.boxes.iter().map(|b| b.auto.triage).collect();
+        assert_eq!(
+            t,
+            [
+                Some(Triage::Accept),
+                Some(Triage::Review),
+                Some(Triage::Accept)
+            ]
+        );
+        assert_eq!(
+            out.boxes[0].auto.why,
+            ["model rfdetr-large at 0.87 >= 0.80"]
+        );
+        assert_eq!(
+            out.boxes[1].auto.why,
+            ["re-label by rfdetr-large", "score 0.50 below 0.80"]
+        );
+        // At the score itself: accepted.
+        assert_eq!(model_triage("car", 0.8, &run).0, Triage::Accept);
+        // A frame of only pre-accepted boxes is one the bulk accept takes.
+        let mut f = LabelFile::default();
+        let only = model_boxes(&dets[..1], &run, 640, 480).boxes;
+        apply(&mut f, only);
+        assert!(labels::auto_accept_eligible(&f));
+        // Night / IR: the person stays in review, the vehicles do not.
+        run.scene = "ir";
+        let out = model_boxes(&dets, &run, 640, 480);
+        assert_eq!(out.boxes[0].auto.triage, Some(Triage::Accept));
+        assert_eq!(out.boxes[2].auto.triage, Some(Triage::Review));
+        assert_eq!(
+            out.boxes[2].auto.why,
+            [
+                "re-label by rfdetr-large",
+                "a person at night: always reviewed"
+            ]
+        );
+        assert_eq!(
+            model_triage("raccoon", 0.99, &run).1[1],
+            "an animal at night: always reviewed"
+        );
+        // Without pre-accept the night rule adds nothing (every box is reviewed anyway).
+        run.accept_score = None;
+        assert_eq!(
+            model_triage("person", 0.99, &run).1,
+            ["re-label by rfdetr-large"]
+        );
+    }
+
+    #[test]
+    fn a_voc_spelled_model_agrees_with_reviewed_motorcycles() {
+        let cls: Vec<String> = ["person", "motorcycle"].map(String::from).to_vec();
+        let mut f = reviewed();
+        f.boxes[0].label = "motorcycle".into();
+        let dets = [d("motorbike", [11.0, 10.0, 60.0, 90.0])];
+        assert_eq!(disagreement(&f, &dets, "m", &cls), None);
+        // Before the mapping, the motorbike was dropped and the motorcycle missed.
+        let (rep, why) = relabel(&mut f, &dets, "m", &cls);
+        assert_eq!((rep.added, rep.dropped, why), (0, 1, None));
+        assert!(
+            f.boxes[0].auto.labelers.contains_key("m"),
+            "the reviewed motorcycle gets the model's evidence"
+        );
+    }
+
     fn d(label: &str, bbox: [f32; 4]) -> Det {
         Det {
             label: label.into(),
@@ -736,7 +1041,7 @@ mod tests {
         assert_eq!(disagreement(&un, &dets, "m", &classes()), None);
 
         let mut g = reviewed();
-        let (rep, why) = apply_relabel(&mut g, &dets, "night-yolo26n", &classes(), 640, 480);
+        let (rep, why) = relabel(&mut g, &dets, "night-yolo26n", &classes());
         assert!(why.is_some());
         assert_eq!(g.status, Status::Unreviewed);
         assert_eq!(g.disagreement, why);
@@ -754,7 +1059,7 @@ mod tests {
         assert_eq!(g.boxes[2].state, BoxState::Rejected);
         // Agreement: nothing changes but the evidence.
         let mut h = reviewed();
-        let (rep, why) = apply_relabel(&mut h, &same, "m", &classes(), 640, 480);
+        let (rep, why) = relabel(&mut h, &same, "m", &classes());
         assert_eq!((rep.added, why), (0, None));
         assert_eq!(h.status, Status::Reviewed);
     }

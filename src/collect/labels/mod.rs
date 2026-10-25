@@ -126,7 +126,9 @@ pub struct LabelBox {
     /// Suppression reason (`night_threshold`, `verify`, ...) or other provenance note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// The label the model or auto-labeler gave, when the reviewer relabeled the box.
+    /// The label the model or auto-labeler gave, when the reviewer relabeled the box, or the
+    /// model's own spelling when an auto-label run mapped it onto the class list (`motorbike` for
+    /// a `motorcycle` box; the Review page shows "was motorbike").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_label: Option<String>,
     /// The proposed box before the reviewer moved or resized it (set by the Review page).

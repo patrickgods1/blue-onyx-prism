@@ -101,7 +101,7 @@
   // hidden `classes` fields; one outside the class list is appended to it first (after a confirm,
   // POST /v1/review/classes, append only).
   (function () {
-    var form = document.getElementById("autolabel-form"), CP = window.ClassPicker;
+    var form = document.getElementById("autolabel-form"), CP = window.ClassPicker, MP = window.ModelPicker;
     var holder = document.getElementById("al-picker"), msg = document.getElementById("al-classes-msg");
     if (!form || !holder || !CP) return;
     var picker = null, catalog = null, confirmed = false;
@@ -124,6 +124,29 @@
       p.textContent = "The class list could not be read (" + e.message + "); the labelers use the class list and training.synonyms.";
       holder.appendChild(p);
     });
+    // Model mode: the model picker (model-picker.js) posts with_model / device / the confirms; the
+    // preset sets the status filter; the pre-accept score must reach the threshold.
+    var mpHolder = document.getElementById("al-model-picker");
+    var mp = mpHolder && MP ? MP.create(mpHolder, {
+      onLoad: function (j) {
+        var t = form.elements.threshold;
+        if (t && j.default_threshold && t.value === t.defaultValue) t.value = j.default_threshold;
+      }
+    }) : null;
+    var preset = document.getElementById("al-preset");
+    if (preset && form.elements.status) {
+      preset.addEventListener("change", function () {
+        form.elements.status.value = preset.value === "self-training" ? "any" : "unreviewed";
+      });
+    }
+    var modelProblemOk = function (ev) {
+      if (!mp) return true;
+      var p = mp.problem() || MP.util.acceptProblem(form.elements.threshold.value, form.elements.model_accept_score.value);
+      if (!p) return true;
+      ev.preventDefault();
+      mp.say(p, true);
+      return false;
+    };
     var mode = function () { var r = form.querySelector('input[name="mode"]:checked'); return r ? r.value : ""; };
     var fields = function (names) {
       form.querySelectorAll("input.cp-field").forEach(function (i) { i.remove(); });
@@ -134,7 +157,8 @@
       });
     };
     form.addEventListener("submit", function (ev) {
-      if (!picker || mode() !== "labelers") { fields([]); return; }
+      if (mode() === "model" && !modelProblemOk(ev)) return;
+      if (!picker) { fields([]); return; }
       var names = picker.getSelected();
       if (!names.length) { ev.preventDefault(); say("Choose at least one class to look for.", true); return; }
       say("", false);

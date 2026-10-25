@@ -179,8 +179,9 @@ fn contains_ci(list: &[String], name: &str) -> bool {
 }
 
 /// One class under two spellings: equal ignoring case, or the same COCO class through the
-/// aliases (a VOC-spelled model's `motorbike` is the list's `motorcycle`).
-fn same_class(a: &str, b: &str) -> bool {
+/// aliases (a VOC-spelled model's `motorbike` is the list's `motorcycle`). Also maps a detection
+/// label onto the class list ([`super::triage::map_label`]).
+pub(crate) fn same_class(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b) || coco_class(a).is_some_and(|c| coco_class(b) == Some(c))
 }
 

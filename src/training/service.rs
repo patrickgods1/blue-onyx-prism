@@ -666,7 +666,20 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
         let id = job.id.clone();
         let flag = Arc::new(AtomicBool::new(false));
         *inner.current.lock_recover() = Some((id.clone(), flag.clone()));
-        inner.update(&id, |r| r.state = RunState::Running);
+        // Queued -> Running under the runs lock: a cancel that marked it Cancelled after the
+        // `cancelled` check above wins (else Running would overwrite it and the cancel be lost).
+        let mut start = false;
+        inner.update(&id, |r| {
+            if r.state == RunState::Queued {
+                r.state = RunState::Running;
+                start = true;
+            }
+        });
+        if !start {
+            *inner.current.lock_recover() = None;
+            inner.cancelled.lock_recover().remove(&id);
+            continue;
+        }
         inner.persist();
         tracing::info!(run = %id, model = %job.name, "training started: {} on {}", job.request.recipe.label(), job.accelerator.describe());
         let started = Instant::now();
@@ -767,7 +780,19 @@ fn run_task(inner: &Inner, t: &dyn Task) {
     let id = t.id().to_string();
     let flag = Arc::new(AtomicBool::new(false));
     *inner.current.lock_recover() = Some((id.clone(), flag.clone()));
-    inner.update_task(&id, |r| r.state = RunState::Running);
+    // Queued -> Running under the tasks lock, so a cancel just before the start is not lost.
+    let mut start = false;
+    inner.update_task(&id, |r| {
+        if r.state == RunState::Queued {
+            r.state = RunState::Running;
+            start = true;
+        }
+    });
+    if !start {
+        *inner.current.lock_recover() = None;
+        inner.cancelled.lock_recover().remove(&id);
+        return;
+    }
     inner.persist_tasks();
     tracing::info!(job = %id, "{} started: {}", t.kind().as_str(), t.title());
     let started = Instant::now();

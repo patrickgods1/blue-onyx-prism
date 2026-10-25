@@ -226,13 +226,29 @@ pub struct AutolabelArgs {
     /// Do not rank species with SigLIP 2.
     #[arg(long)]
     pub no_siglip: bool,
-    /// Self-training: re-label with this configured (trained) model instead of the labelers;
-    /// frames whose reviewed labels it disagrees with go back to review first.
+    /// Label with this model instead of the labelers: a configured model's name, local:<file>
+    /// (a model file in the models folder) or resource:<catalog id> / a catalog model's name
+    /// (downloaded or exported first, then added to the config disabled). Labels unreviewed
+    /// frames unless --frames names a status; with status=any it is the self-training loop
+    /// (frames whose reviewed labels it disagrees with go back to review first).
     #[arg(long)]
     pub with_model: Option<String>,
     /// Score threshold of --with-model.
     #[arg(long, default_value_t = 0.3)]
     pub threshold: f32,
+    /// Device of --with-model for this run (auto, openvino:gpu, ort:cuda, openvino:cpu, ...;
+    /// default the model's configured device). Not saved.
+    #[arg(long)]
+    pub device: Option<String>,
+    /// Pre-accept --with-model's boxes at this score or more (at least --threshold): triaged
+    /// accept, so `POST /v1/review/accept-auto` and the Review page's bulk accept take them;
+    /// night / IR person and animal boxes stay in review. Default off (every box reviewed).
+    #[arg(long)]
+    pub accept_score_model: Option<f32>,
+    /// Confirm the licence of a non-commercial / personal-use catalog model --with-model
+    /// installs or adds.
+    #[arg(long)]
+    pub confirm_license: bool,
     /// The class list (default collect.classes), comma-separated.
     #[arg(long, value_delimiter = ',')]
     pub classes: Vec<String>,
@@ -308,6 +324,9 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
     r.siglip = !a.no_siglip;
     r.with_model = a.with_model.clone();
     r.threshold = a.threshold;
+    r.device = a.device.clone();
+    r.model_accept_score = a.accept_score_model;
+    r.confirm_license = a.confirm_license;
     r.classes = (!a.classes.is_empty()).then(|| a.classes.clone());
     r.allow_large = a.allow_large;
     r.validate()?;
@@ -690,7 +709,11 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
         TrainCommand::Autolabel(a) => {
             let req = autolabel_request(&a)?;
             let cap = super::capability_now();
-            let job = super::autolabel::plan_autolabel(&config, req, &cap)?;
+            let mut job = super::autolabel::plan_autolabel(&config, req, &cap)?;
+            // A local or catalog model is added to the config file (disabled).
+            job.config_writer = Some(Arc::new(super::autolabel::models::FileConfigWriter {
+                path: path.clone(),
+            }));
             eprintln!(
                 "{} in {}",
                 super::task::Task::title(&job),
@@ -1053,9 +1076,47 @@ mod tests {
         let r = autolabel_request(&m).unwrap();
         assert_eq!(r.with_model.as_deref(), Some("night-yolo26n-1"));
         assert_eq!(
-            r.frames.query["status"], "any",
-            "re-labels reviewed frames too"
+            r.frames.query["status"], "unreviewed",
+            "first-pass labelling by default; self-training is status=any"
         );
+        assert_eq!((r.device, r.model_accept_score), (None, None));
+        let TrainCommand::Autolabel(m) = parse(&[
+            "autolabel",
+            "--with-model",
+            "resource:model:rfdetr-large",
+            "--device",
+            "CPU",
+            "--accept-score-model",
+            "0.8",
+            "--confirm-license",
+            "--frames",
+            "status=any",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        let r = autolabel_request(&m).unwrap();
+        assert_eq!(r.device.as_deref(), Some("CPU"));
+        assert_eq!(r.model_accept_score, Some(0.8));
+        assert!(r.confirm_license);
+        assert_eq!(r.frames.query["status"], "any");
+        for bad in [
+            &[
+                "autolabel",
+                "--with-model",
+                "m",
+                "--accept-score-model",
+                "0.1",
+            ][..],
+            &["autolabel", "--with-model", "m", "--device", "tpu"],
+            &["autolabel", "--accept-score-model", "0.8"],
+            &["autolabel", "--device", "openvino:cpu"],
+        ] {
+            let TrainCommand::Autolabel(b) = parse(bad).unwrap() else {
+                panic!()
+            };
+            assert!(autolabel_request(&b).is_err(), "{bad:?}");
+        }
         let TrainCommand::Autolabel(bad) = parse(&["autolabel", "--gdino", "huge"]).unwrap() else {
             panic!()
         };

@@ -5,15 +5,20 @@
 //! into the label files (here, [`super::triage`]; every labelled frame gets an `auto_run`
 //! marker, so a later run of the same labelers skips it unless `again=1`) and queue the changed
 //! frames for review. With
-//! `with_model` the labelling is the service's own pipeline ([`super::relabel`]) and stages 2 and
-//! 3 are skipped.
+//! `with_model` the stages are [`MODEL_STAGES`]: select the frames -> install the model (a
+//! catalog model not on disk yet: downloaded, or exported with the export toolchain) -> add it
+//! to the config disabled (a local or catalog model, through the [`ConfigWriter`]) -> label with
+//! the service's own pipeline ([`super::relabel`]) -> map, triage and merge
+//! ([`triage::model_boxes`], [`triage::apply_relabel`]); every frame it looked at gets the
+//! `model:<name>@<device>` marker.
 
+use super::models::{self, ConfigWriter, Install, ModelPlan, Target};
 use super::relabel::{Detector, Image};
 use super::triage::{self, FrameProposals};
 use super::{AutolabelRequest, Category};
 use crate::collect::labels::{self, Frame, LabelFile, Triage, queue};
-use crate::config::Config;
-use crate::resources::catalog::{Platform, Resource};
+use crate::config::{Config, ModelConfig};
+use crate::resources::catalog::{Platform, Resource, ResourceKind};
 use crate::resources::export::train::TrainPaths;
 use crate::training::capability::Accelerator;
 use crate::training::pyenv::{self, check, stage};
@@ -36,6 +41,19 @@ pub const STAGES: [&str; 5] = [
     "writing labels",
 ];
 
+fn mb(b: u64) -> String {
+    format!("{:.1}", b as f64 / 1e6)
+}
+
+/// Stages of a run with a model.
+pub const MODEL_STAGES: [&str; 5] = [
+    "selecting frames",
+    "installing the model",
+    "adding the model to the config",
+    "labelling",
+    "writing labels",
+];
+
 /// A planned run ([`super::plan_autolabel`]).
 #[derive(Clone)]
 pub struct AutolabelJob {
@@ -52,8 +70,13 @@ pub struct AutolabelJob {
     /// `<training dir>/autolabel/<id>`: the frame list and the proposals (deleted at the end).
     pub work: PathBuf,
     pub config: Box<Config>,
+    /// The resolved `with_model` ([`models::resolve`]).
+    pub model: Option<ModelPlan>,
     /// Detector of `with_model` runs (None: [`super::relabel::LocalDetector`] on the config).
     pub detector: Option<Arc<dyn Detector>>,
+    /// Saves the config entry of a local or catalog model (None: the run uses the entry without
+    /// saving it, with a warning).
+    pub config_writer: Option<Arc<dyn ConfigWriter>>,
 }
 
 impl std::fmt::Debug for AutolabelJob {
@@ -85,16 +108,6 @@ struct FrameWrite {
     queue: bool,
 }
 
-impl FrameWrite {
-    /// Write when `changed` and queue it.
-    fn changed(changed: bool) -> Self {
-        Self {
-            write: changed,
-            queue: changed,
-        }
-    }
-}
-
 /// The report of a finished run.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AutolabelReport {
@@ -118,11 +131,24 @@ pub struct AutolabelReport {
     pub reopened: usize,
     /// Self-training: frames whose reviewed labels the model disagrees with.
     pub disagreements: usize,
+    /// Boxes per class (the class list's spelling).
     pub by_label: BTreeMap<String, usize>,
+    /// Proposals of a label that is no class of the run, also after mapping the spelling.
+    pub dropped_other_class: usize,
+    /// Labels given the class list's spelling: model label -> class (`motorbike` ->
+    /// `motorcycle`).
+    pub renamed: BTreeMap<String, String>,
     /// The VLM said "no" on these boxes.
     pub vlm_objections: usize,
     pub labeler: String,
+    /// The device that ran (a model: its canonical spec; the labelers: the training device).
     pub device: Option<String>,
+    /// A run with a model: the device it asked for (the run's `device`, else the model's).
+    pub requested_device: Option<String>,
+    /// A run with a model: its id and what the install and config stages did.
+    pub model: Option<String>,
+    pub installed: Option<String>,
+    pub config_entry: Option<String>,
     pub seconds: f64,
     /// The first changed frames (`<scene>/<camera>/<date>/<stem>.jpg`).
     pub sample: Vec<String>,
@@ -130,9 +156,18 @@ pub struct AutolabelReport {
 }
 
 impl AutolabelJob {
+    fn stage_names(&self) -> &'static [&'static str; 5] {
+        if self.model.is_some() {
+            &MODEL_STAGES
+        } else {
+            &STAGES
+        }
+    }
+
     fn step(&self, report: &mut dyn FnMut(TaskReport<'_>), n: usize, pct: u8, detail: &str) {
-        let name = STAGES.get(n.saturating_sub(1)).copied().unwrap_or("");
-        stage(report, name, n, STAGES.len(), pct, detail);
+        let names = self.stage_names();
+        let name = names.get(n.saturating_sub(1)).copied().unwrap_or("");
+        stage(report, name, n, names.len(), pct, detail);
     }
 
     /// The labelers of a labelers-mode run (`mm-gdino-tiny + rfdetr-large + ...`), as recorded
@@ -240,8 +275,11 @@ impl AutolabelJob {
 
         // 1. Frames.
         self.step(report, 1, 0, &r.frames.describe());
-        let labeler = self.labeler();
-        let skip = (r.with_model.is_none() && !r.frames.again()).then_some(labeler.as_str());
+        let labeler = match &self.model {
+            Some(m) => m.labeler(),
+            None => self.labeler(),
+        };
+        let skip = (!r.frames.again()).then_some(labeler.as_str());
         let (frames, skipped) = self.select(skip)?;
         rep.skipped_done = skipped;
         if frames.is_empty() && skipped > 0 {
@@ -266,67 +304,17 @@ impl AutolabelJob {
             crate::resources::export::train::TrainLock::try_acquire(&self.paths.train_lock_file())?;
         let mut changed: Vec<String> = Vec::new();
 
-        if let Some(model) = &r.with_model {
-            rep.labeler = format!("model {model}");
-            self.step(report, 2, 100, "not needed");
-            self.step(report, 3, 100, "not needed");
-            self.step(
+        if let Some(plan) = &self.model {
+            self.run_model(
+                plan,
+                &frames,
+                &labeler,
+                ctx,
                 report,
-                4,
-                0,
-                &format!("running {model} on {} frames", frames.len()),
-            );
-            let images: Vec<Image> = frames
-                .iter()
-                .map(|f| Image {
-                    frame: f.rel.clone(),
-                    path: f.jpg.clone(),
-                    width: f.width,
-                    height: f.height,
-                })
-                .collect();
-            let local;
-            let det: &dyn Detector = match &self.detector {
-                Some(d) => d.as_ref(),
-                None => {
-                    local = super::relabel::LocalDetector {
-                        config: (*self.config).clone(),
-                        runtimes: None,
-                    };
-                    &local
-                }
-            };
-            let dets = det.detect(model, &images, r.threshold, cancel)?;
-            self.step(report, 4, 100, &format!("{model}: done"));
-            check(cancel)?;
-            for (i, f) in frames.iter().enumerate() {
-                if i % 10 == 0 {
-                    let pct = u8::try_from(i * 100 / frames.len().max(1)).unwrap_or(100);
-                    self.step(report, 5, pct, &format!("{i} of {}", frames.len()));
-                }
-                let d = dets.get(&f.rel).cloned().unwrap_or_default();
-                if !d.is_empty() {
-                    rep.with_boxes += 1;
-                }
-                rep.proposals += d.len();
-                rep.review += d.len();
-                for x in &d {
-                    *rep.by_label.entry(x.label.clone()).or_default() += 1;
-                }
-                let res = self.write_frame(f, &mut rep, &mut changed, |file, rep| {
-                    let (m, why) =
-                        triage::apply_relabel(file, &d, model, &self.classes, f.width, f.height);
-                    rep.added += m.added;
-                    rep.dropped += m.dropped;
-                    if why.is_some() {
-                        rep.disagreements += 1;
-                    }
-                    FrameWrite::changed(m.added > 0 || why.is_some())
-                });
-                if let Err(e) = res {
-                    rep.warnings.push(format!("{}: {e:#}", f.rel));
-                }
-            }
+                cancel,
+                &mut rep,
+                &mut changed,
+            )?;
         } else {
             rep.labeler = labeler.clone();
             // 2. Environment.
@@ -536,7 +524,7 @@ impl AutolabelJob {
                         .push(format!("{}: not a selected frame; ignored", fp.frame));
                     continue;
                 };
-                let boxes = triage::to_boxes(
+                let out = triage::to_boxes_counted(
                     &fp.boxes,
                     &self.classes,
                     &sel.scene,
@@ -544,6 +532,9 @@ impl AutolabelJob {
                     sel.height,
                     r.accept_score,
                 );
+                rep.dropped_other_class += out.other_class;
+                rep.renamed.extend(out.renamed);
+                let boxes = out.boxes;
                 if !boxes.is_empty() {
                     rep.with_boxes += 1;
                 }
@@ -593,12 +584,36 @@ impl AutolabelJob {
         rep.seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
         let _ = crate::resources::manager::remove_any(&self.work);
         self.step(report, 5, 100, &format!("{} frames changed", changed.len()));
-        let summary = if r.with_model.is_some() {
-            format!(
-                "{} frames re-labelled by {}: {} disagree with their reviewed labels, {} boxes \
-                 added for review",
-                rep.frames, rep.labeler, rep.disagreements, rep.added
-            )
+        let summary = if let Some(plan) = &self.model {
+            let mut s = format!(
+                "{} frames labelled by {} on {}: {} boxes ({} accept, {} review), {} added to \
+                 label files, {} matched existing boxes; {} frames disagree with their reviewed \
+                 labels; {} frames queued for review",
+                rep.frames,
+                plan.name,
+                rep.device.as_deref().unwrap_or(&plan.device),
+                rep.proposals,
+                rep.accept,
+                rep.review,
+                rep.added,
+                rep.dropped,
+                rep.disagreements,
+                changed.len()
+            );
+            if rep.dropped_other_class > 0 {
+                s.push_str(&format!(
+                    "; {} detections of classes outside this run left out",
+                    rep.dropped_other_class
+                ));
+            }
+            if rep.skipped_done > 0 {
+                s.push_str(&format!(
+                    "; {} frames skipped (labelled by this model on this device before; again=1 \
+                     to redo)",
+                    rep.skipped_done
+                ));
+            }
+            s
         } else {
             let mut s = format!(
                 "{} frames labelled ({}): {} boxes ({} accept, {} review), {} added to label \
@@ -629,6 +644,332 @@ impl AutolabelJob {
     }
 }
 
+impl AutolabelJob {
+    /// Stages 2 to 5 of a run with a model.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the stage machine's state, passed down once"
+    )]
+    fn run_model(
+        &self,
+        plan: &ModelPlan,
+        frames: &[Selected],
+        labeler: &str,
+        ctx: TaskContext<'_>,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        cancel: &AtomicBool,
+        rep: &mut AutolabelReport,
+        changed: &mut Vec<String>,
+    ) -> Result<()> {
+        let r = &self.request;
+        rep.labeler = labeler.to_string();
+        rep.model = Some(plan.id.clone());
+        rep.requested_device = Some(plan.device.clone());
+        // 2. Install.
+        match (plan.install, plan.resource()) {
+            (Some(how), Some(res)) => {
+                let msg = self.install(res, how, ctx, report, cancel)?;
+                self.step(report, 2, 100, &msg);
+                rep.installed = Some(msg);
+            }
+            _ => self.step(report, 2, 100, "installed"),
+        }
+        check(cancel)?;
+        // 3. Config entry.
+        let (config, entry) = self.config_entry(plan, rep)?;
+        self.step(
+            report,
+            3,
+            100,
+            rep.config_entry.as_deref().unwrap_or("in the config"),
+        );
+        check(cancel)?;
+        // 4. Label.
+        let device_text = r.device.as_deref().unwrap_or(&plan.device);
+        self.step(
+            report,
+            4,
+            0,
+            &format!(
+                "running {} on {} frames ({device_text})",
+                plan.name,
+                frames.len()
+            ),
+        );
+        let images: Vec<Image> = frames
+            .iter()
+            .map(|f| Image {
+                frame: f.rel.clone(),
+                path: f.jpg.clone(),
+                width: f.width,
+                height: f.height,
+            })
+            .collect();
+        let local;
+        let det: &dyn Detector = match &self.detector {
+            Some(d) => d.as_ref(),
+            None => {
+                local = super::relabel::LocalDetector {
+                    config: config.clone(),
+                    runtimes: None,
+                };
+                &local
+            }
+        };
+        let dets = det
+            .detect(
+                &config,
+                &entry,
+                r.device.as_deref(),
+                &images,
+                r.threshold,
+                cancel,
+            )
+            .map_err(|e| {
+                if entry.family == crate::model::ModelFamilyKind::Auto
+                    && e.downcast_ref::<crate::resources::export::Cancelled>()
+                        .is_none()
+                {
+                    e.context(format!(
+                        "{} has family auto (detected from its outputs); if that is what \
+                         failed, set its family on the Config page (Models card) and run again",
+                        plan.name
+                    ))
+                } else {
+                    e
+                }
+            })?;
+        if !dets.device.is_empty() {
+            rep.device = Some(dets.device.clone());
+        }
+        self.step(report, 4, 100, &format!("{}: done", plan.name));
+        check(cancel)?;
+        // 5. Map, triage, merge; every frame gets the marker.
+        for (i, f) in frames.iter().enumerate() {
+            if i % 10 == 0 {
+                let pct = u8::try_from(i * 100 / frames.len().max(1)).unwrap_or(100);
+                self.step(report, 5, pct, &format!("{i} of {}", frames.len()));
+            }
+            let d = dets.frames.get(&f.rel).cloned().unwrap_or_default();
+            let run = triage::ModelRun {
+                model: &plan.name,
+                classes: &self.classes,
+                scene: &f.scene,
+                accept_score: r.model_accept_score,
+            };
+            let out = triage::model_boxes(&d, &run, f.width, f.height);
+            rep.dropped_other_class += out.other_class;
+            rep.renamed.extend(out.renamed);
+            if !out.boxes.is_empty() {
+                rep.with_boxes += 1;
+            }
+            rep.proposals += out.boxes.len();
+            for b in &out.boxes {
+                *rep.by_label.entry(b.label.clone()).or_default() += 1;
+                match b.auto.triage {
+                    Some(Triage::Accept) => rep.accept += 1,
+                    _ => rep.review += 1,
+                }
+            }
+            let marker = labels::AutoRun {
+                at: crate::collect::utc_rfc3339(std::time::SystemTime::now()),
+                labeler: labeler.to_string(),
+                classes: self.classes.clone(),
+            };
+            let res = self.write_frame(f, rep, changed, |file, rep| {
+                file.auto_run = Some(marker);
+                let (a, why) =
+                    triage::apply_relabel(file, &d, out.boxes, &plan.name, &self.classes);
+                rep.added += a.merge.added;
+                rep.dropped += a.merge.dropped;
+                rep.annotated += a.annotated;
+                rep.class_suggestions += a.class_suggestions;
+                if why.is_some() {
+                    rep.disagreements += 1;
+                }
+                FrameWrite {
+                    write: true,
+                    queue: a.merge.added > 0
+                        || a.annotated > 0
+                        || a.class_suggestions > 0
+                        || why.is_some(),
+                }
+            });
+            if let Err(e) = res {
+                rep.warnings.push(format!("{}: {e:#}", f.rel));
+            }
+        }
+        Ok(())
+    }
+
+    /// Download or export catalog model `res` into the models folder (stage 2); the export
+    /// toolchain's own stages show as the detail.
+    fn install(
+        &self,
+        res: &'static Resource,
+        how: Install,
+        ctx: TaskContext<'_>,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        cancel: &AtomicBool,
+    ) -> Result<String> {
+        let config = &self.config;
+        if models::catalog_installed(config, res) {
+            return Ok(format!("{} is installed", res.title));
+        }
+        match how {
+            Install::Download => {
+                let dir = crate::resources::status::target_dir(config, res);
+                self.step(report, 2, 0, &format!("downloading {}", res.describe()));
+                let mut last = 255u8;
+                ctx.fetcher
+                    .fetch(
+                        res,
+                        &dir,
+                        &mut |bytes, total| {
+                            let pct = u8::try_from(bytes.saturating_mul(100) / total.max(1))
+                                .unwrap_or(100)
+                                .min(99);
+                            if pct != last {
+                                last = pct;
+                                self.step(
+                                    report,
+                                    2,
+                                    pct,
+                                    &format!(
+                                        "downloading {}: {} of {} MB",
+                                        res.title,
+                                        mb(bytes),
+                                        mb(total)
+                                    ),
+                                );
+                            }
+                        },
+                        cancel,
+                    )
+                    .with_context(|| format!("downloading {}", res.title))?;
+                if !models::catalog_installed(config, res) {
+                    bail!(
+                        "{} was downloaded but its files are not in {}; check the Resources \
+                         card",
+                        res.title,
+                        dir.display()
+                    );
+                }
+                Ok(format!(
+                    "downloaded {} into {}",
+                    res.describe(),
+                    dir.display()
+                ))
+            }
+            Install::Export => {
+                if res.kind != ResourceKind::ExportModel {
+                    bail!("internal: {} is not exported", res.id);
+                }
+                let mut job = crate::resources::export::ExportJob::new(
+                    res,
+                    crate::resources::export::Paths::for_config(config),
+                );
+                job.platform = self.platform;
+                let name = res.model_name().unwrap_or(res.id);
+                let mut on = |p: crate::resources::export::Progress<'_>| match p {
+                    crate::resources::export::Progress::Stage {
+                        stage: st,
+                        percent,
+                        detail,
+                    } => self.step(
+                        report,
+                        2,
+                        st.overall(percent).min(99),
+                        &format!(
+                            "exporting {name}: {} ({}/{}){}",
+                            st.label(),
+                            st.number(),
+                            crate::resources::export::Stage::ALL.len(),
+                            if detail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {detail}")
+                            }
+                        ),
+                    ),
+                    crate::resources::export::Progress::Line { line, .. } => {
+                        report(TaskReport::Line(line));
+                    }
+                };
+                let out = crate::resources::export::run_export(
+                    &job,
+                    ctx.runner,
+                    ctx.fetcher,
+                    &mut on,
+                    cancel,
+                )
+                .map_err(|e| {
+                    if e.cancelled {
+                        anyhow!(crate::resources::export::Cancelled)
+                    } else {
+                        anyhow!(
+                            "export of {name} failed{}: {}",
+                            e.stage
+                                .map(|s| format!(" while {}", s.label()))
+                                .unwrap_or_default(),
+                            e.message
+                        )
+                    }
+                })?;
+                Ok(format!(
+                    "exported {name} ({}) to {}",
+                    res.license,
+                    out.onnx.display()
+                ))
+            }
+        }
+    }
+
+    /// The config and entry the run uses (stage 3): a configured model's, else the model added
+    /// disabled through the writer (without one, to this run's copy only).
+    fn config_entry(
+        &self,
+        plan: &ModelPlan,
+        rep: &mut AutolabelReport,
+    ) -> Result<(Config, ModelConfig)> {
+        let config = match &plan.target {
+            Target::Config { .. } => (*self.config).clone(),
+            Target::Local { .. } | Target::Catalog { .. } => {
+                let mut msg = String::new();
+                let mut edit = |c: &mut Config| -> Result<()> {
+                    msg = models::add_disabled(c, plan)?;
+                    Ok(())
+                };
+                match &self.config_writer {
+                    Some(w) => {
+                        let (c, saved) = w.update(&mut edit)?;
+                        rep.config_entry = Some(format!("{msg}; {saved}"));
+                        c
+                    }
+                    None => {
+                        let mut c = (*self.config).clone();
+                        edit(&mut c)?;
+                        rep.warnings.push(format!(
+                            "{} was not saved to the config file (this run only)",
+                            plan.name
+                        ));
+                        rep.config_entry = Some(msg);
+                        c
+                    }
+                }
+            }
+        };
+        let entry = models::entry_of(&config, plan).cloned().ok_or_else(|| {
+            anyhow!(
+                "{} is not in the config (any more); choose the model again on the Training \
+                 page",
+                plan.name
+            )
+        })?;
+        Ok((config, entry))
+    }
+}
+
 impl Task for AutolabelJob {
     fn id(&self) -> &str {
         &self.id
@@ -637,13 +978,18 @@ impl Task for AutolabelJob {
         TaskKind::Autolabel
     }
     fn title(&self) -> String {
-        match &self.request.with_model {
-            Some(m) => format!("re-label with {m} ({})", self.request.frames.describe()),
+        match &self.model {
+            Some(m) => format!(
+                "label with {} on {} ({})",
+                m.name,
+                m.device,
+                self.request.frames.describe()
+            ),
             None => format!("auto-label ({})", self.request.frames.describe()),
         }
     }
     fn steps(&self) -> usize {
-        STAGES.len()
+        self.stage_names().len()
     }
     fn run(
         &self,

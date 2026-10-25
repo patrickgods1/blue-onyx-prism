@@ -1,14 +1,15 @@
-//! Detection with a configured model in this process, for the self-training loop: the frames go
-//! through the benchmark's per-image pipeline ([`crate::benchmark::Bench`]: decode, preprocess,
-//! infer, postprocess, the code the workers run), at a given confidence, on the device the model
-//! is configured for. [`Detector`] is the seam the job uses (tests fake it).
+//! Detection with a model of the config in this process (labelling with a model, the
+//! self-training loop): the frames go through the benchmark's per-image pipeline
+//! ([`crate::benchmark::Bench`]: decode, preprocess, infer, postprocess, the code the workers
+//! run), at a given confidence, on the device the model is configured for or the run's device.
+//! [`Detector`] is the seam the job uses (tests fake it).
 
 use super::triage::Det;
 use crate::backend::{CoreOptions, Runtimes};
 use crate::benchmark::images::{GroundTruth, ImageSet, SetImage, SetKind};
-use crate::config::Config;
+use crate::config::{Config, ModelConfig};
 use crate::model::PostParams;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -24,17 +25,29 @@ pub struct Image {
     pub height: u32,
 }
 
-/// Runs a configured model over frames.
+/// What a [`Detector`] found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Detections {
+    /// Detections per frame (`<scene>/<camera>/<date>/<stem>.jpg`).
+    pub frames: BTreeMap<String, Vec<Det>>,
+    /// Canonical spec of the device that ran (`openvino:cpu`, `ort:coreml`; empty if unknown).
+    pub device: String,
+}
+
+/// Runs a model of the config over frames.
 pub trait Detector: Send + Sync {
-    /// Detections of `model` (a configured model's name) at `threshold` on each of `images`,
-    /// keyed by frame. Fails on cancel.
+    /// Detections of `model` (an entry of `config`, enabled or not) at `threshold` on each of
+    /// `images`, on `device` (a device spec; None = the model's configured device). Fails on
+    /// cancel.
     fn detect(
         &self,
-        model: &str,
+        config: &Config,
+        model: &ModelConfig,
+        device: Option<&str>,
         images: &[Image],
         threshold: f32,
         cancel: &AtomicBool,
-    ) -> Result<BTreeMap<String, Vec<Det>>>;
+    ) -> Result<Detections>;
 }
 
 /// The real [`Detector`]: the registry's runtimes when given (the service), else its own from
@@ -75,21 +88,18 @@ impl LocalDetector {
 impl Detector for LocalDetector {
     fn detect(
         &self,
-        model: &str,
+        config: &Config,
+        m: &ModelConfig,
+        device: Option<&str>,
         images: &[Image],
         threshold: f32,
         cancel: &AtomicBool,
-    ) -> Result<BTreeMap<String, Vec<Det>>> {
+    ) -> Result<Detections> {
         if images.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(Detections::default());
         }
-        let m = self
-            .config
-            .models
-            .iter()
-            .find(|m| m.effective_name().eq_ignore_ascii_case(model))
-            .ok_or_else(|| anyhow!("no configured model named {model}"))?;
-        let job = crate::benchmark::job_for_config(&self.config, m, None)?;
+        let model = m.effective_name();
+        let job = crate::benchmark::job_for_config(config, m, device)?;
         let set = ImageSet {
             id: "autolabel".into(),
             title: "frames to re-label".into(),
@@ -120,7 +130,7 @@ impl Detector for LocalDetector {
             1,
             PostParams {
                 confidence_threshold: threshold,
-                nms_iou: self.config.nms_iou,
+                nms_iou: config.nms_iou,
             },
         );
         bench.cancel = Some(cancel);
@@ -136,7 +146,12 @@ impl Detector for LocalDetector {
                 images.len()
             );
         }
-        Ok(run
+        let device = if run.spec.is_empty() {
+            run.device.clone()
+        } else {
+            run.spec.clone()
+        };
+        let frames = run
             .per_image
             .into_iter()
             .map(|r| {
@@ -152,6 +167,7 @@ impl Detector for LocalDetector {
                     .collect();
                 (r.file, dets)
             })
-            .collect())
+            .collect();
+        Ok(Detections { frames, device })
     }
 }

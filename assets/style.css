@@ -978,3 +978,14 @@ dialog#class-dialog { width: min(46rem, calc(100vw - 32px)); max-height: 90vh; o
 dialog#class-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 dialog#class-dialog h3 { margin: 0 0 0.5rem; }
 dialog#class-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+
+/* Model picker (model-picker.js) on the Review and Training auto-label forms */
+.mp { display: grid; gap: 0.35rem; max-width: 46rem; }
+.mp-label { color: var(--muted); font-size: 0.9rem; }
+.mp-select, .mp-device { max-width: 100%; }
+.mp-detail { margin: 0; }
+.mp-confirm { margin: 0.25rem 0 0; }
+.mp-msg { margin: 0; }
+.rv-al-mode { border: 0; padding: 0; margin: 0 0 0.5rem; }
+.rv-al-model { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: flex-end; }
+.tr-form .tr-wide { grid-column: 1 / -1; }

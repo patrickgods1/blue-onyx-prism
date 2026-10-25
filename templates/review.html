@@ -77,17 +77,29 @@
 
 <div class="card">
   <h2>Auto-label these frames</h2>
-  <p class="muted">Proposes boxes for the frames the filters above select (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2): they appear here as pending <em>auto</em> boxes marked <em>accept</em> or <em>review</em>. Runs on the <a href="/training#autolabel">Training</a> page's queue (NVIDIA GPU or Apple silicon), where the labelers, a re-label with a trained model and the progress are.</p>
+  <p class="muted">Proposes boxes for the frames the filters above select: they appear here as pending <em>auto</em> boxes. The <em>labelers</em> (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2; NVIDIA GPU or Apple silicon) mark each box <em>accept</em> or <em>review</em>. <em>A model</em> (any detector from your config, a model file or a downloadable one) runs on any device, CPU included (RF-DETR L on CPU takes about 1 s per frame); its boxes are <em>review</em> unless you pre-accept them above a score. Frames the filters leave open default to the unreviewed ones in model mode. Runs on the <a href="/training#autolabel">Training</a> page's queue, where the progress and a self-training check are.</p>
   <form id="rv-autolabel" method="post" action="/training/autolabel" class="inline-row">
     <input type="hidden" name="frames" value="">
-    <input type="hidden" name="gdino" value="tiny">
-    <input type="hidden" name="rfdetr" value="on">
-    <input type="hidden" name="vlm" value="2b">
-    <input type="hidden" name="siglip" value="on">
     <input type="hidden" name="label" value="">
+    <fieldset class="tr-radios rv-al-mode">
+      <legend>Label with</legend>
+      <label class="check"><input type="radio" name="mode" value="labelers" checked> Labelers <span class="muted small">(MM-Grounding-DINO + RF-DETR L; NVIDIA GPU or Apple silicon)</span></label>
+      <label class="check"><input type="radio" name="mode" value="model"> A model <span class="muted small">(runs anywhere)</span></label>
+    </fieldset>
+    <div class="rv-al-labelers" data-al-mode="labelers">
+      <input type="hidden" name="gdino" value="tiny">
+      <input type="hidden" name="rfdetr" value="on">
+      <input type="hidden" name="vlm" value="2b">
+      <input type="hidden" name="siglip" value="on">
+      <label class="check"><input type="checkbox" name="confirm_large"> Download the labelers if missing (several GB)</label>
+    </div>
+    <div class="rv-al-model" data-al-mode="model" hidden>
+      <div id="rv-al-model-picker"><p class="muted small">Loading the models&hellip;</p></div>
+      <label class="inline-label">Threshold <input type="number" name="threshold" min="0.01" max="1" step="0.01" value="0.3" class="num-sm"></label>
+      <label class="inline-label">Pre-accept boxes at score &ge; <input type="number" name="model_accept_score" min="0.01" max="1" step="0.01" placeholder="off" class="num-sm"></label>
+    </div>
     <div class="rv-al-classes"><span class="field-label" id="rv-al-classes-cap">Classes to look for</span> <div id="rv-al-picker" aria-labelledby="rv-al-classes-cap"></div></div>
     <label class="inline-label">At most <input type="number" name="limit" min="1" max="20000" value="50" class="num-sm"> frames</label>
-    <label class="check"><input type="checkbox" name="confirm_large"> Download the labelers if missing (several GB)</label>
     <label class="check"><input type="checkbox" id="rv-al-again"> Label again (frames already auto-labelled)</label>
     <button type="submit">Auto-label</button>
   </form>
@@ -160,6 +172,7 @@
   <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
 </dialog>
 <script src="/static/class-picker.js?v={{ version }}"></script>
+<script src="/static/model-picker.js?v={{ version }}"></script>
 <script src="/static/review.js?v={{ version }}"></script>
 <script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}
