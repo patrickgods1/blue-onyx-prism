@@ -1491,8 +1491,10 @@ mod tests {
         )
         .await;
         let html = String::from_utf8(b).unwrap();
+        // Refused either way: outside the roots, or (Windows: drive-relative, so under the
+        // data root) not found.
         assert!(
-            html.contains("Not queued: datasets: /no/such/export"),
+            html.contains("Not queued: datasets: ") && html.contains("/no/such/export"),
             "{html}"
         );
         let (_, _, b) = call(

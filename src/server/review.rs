@@ -711,7 +711,9 @@ pub(super) async fn folder(
                     format!("Folder not changed: {raw} is not a folder"),
                 );
             }
-            let same = dataset.canonicalize().is_ok_and(|d| d == p);
+            let same = dataset
+                .canonicalize()
+                .is_ok_and(|d| super::browse::plain(&d) == p);
             (!same).then_some(p)
         };
         let result = save_config(&state, "review page", |c| {
@@ -880,7 +882,9 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(
             d.state.config_read().collect.review_dir,
-            Some(imported.canonicalize().unwrap())
+            Some(super::super::browse::plain(
+                &imported.canonicalize().unwrap()
+            ))
         );
         assert_eq!(total(d.state.clone()).await, 1);
         // Its images are served too.

@@ -322,7 +322,14 @@ fn resolve(cfg: &Config, raw: &str, trust_picked: bool) -> Result<PathBuf, Brows
     if !inside_any(&canon, &roots, cfg) && !picked(&canon) {
         return Err(outside());
     }
-    Ok(canon)
+    // Windows: `C:\x`, not the verbatim `\\?\C:\x` of `canonicalize` (the folder settings
+    // refuse verbatim paths, and the forms store and show what this returns).
+    Ok(plain(&canon))
+}
+
+/// `p` without the Windows verbatim prefix ([`display`]); unchanged elsewhere.
+pub(super) fn plain(p: &Path) -> PathBuf {
+    PathBuf::from(display(p))
 }
 
 /// `shown` is what the client asked for (never a path the server resolved).
