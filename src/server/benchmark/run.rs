@@ -534,7 +534,8 @@ mod tests {
     #[tokio::test]
     async fn settings_add_folder_only_inside_the_browsable_folders() {
         let st = state();
-        let root = st.config_path.parent().unwrap().canonicalize().unwrap();
+        let root =
+            crate::server::browse::plain(&st.config_path.parent().unwrap().canonicalize().unwrap());
         let r = root.clone();
         crate::server::save_config(&st, "test", move |c| {
             c.download_dir = Some(r);

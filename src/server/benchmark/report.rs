@@ -141,7 +141,8 @@ mod tests {
     /// The state's folder as the data root (a browsable root).
     fn rooted() -> (Arc<AppState>, PathBuf) {
         let st = state();
-        let dir = st.config_path.parent().unwrap().canonicalize().unwrap();
+        let dir =
+            crate::server::browse::plain(&st.config_path.parent().unwrap().canonicalize().unwrap());
         let d = dir.clone();
         save_config(&st, "test", move |c| {
             c.download_dir = Some(d);

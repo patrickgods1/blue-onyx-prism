@@ -1463,10 +1463,12 @@ mod tests {
         assert!(!html.contains("Not saved"), "{html}");
         assert_eq!(
             state.config_read().training.datasets,
-            [export.canonicalize().unwrap()]
+            [super::super::browse::plain(&export.canonicalize().unwrap())]
         );
         let enc = super::super::encode_uri_component(
-            &export.canonicalize().unwrap().display().to_string(),
+            &super::super::browse::plain(&export.canonicalize().unwrap())
+                .display()
+                .to_string(),
         );
         assert!(html.contains("formaction=\"/training/datasets\" formnovalidate name=\"remove\""));
         let (_, _, _) = call(
@@ -1529,14 +1531,9 @@ mod tests {
         let html = String::from_utf8(b).unwrap();
         assert_eq!(s, StatusCode::OK);
         assert!(html.contains("stay there (not moved)"), "{html}");
-        assert_eq!(
-            state.config_read().training.dir,
-            Some(runs.canonicalize().unwrap())
-        );
-        assert_eq!(
-            crate::training::training_dir(&state.config_read()),
-            runs.canonicalize().unwrap()
-        );
+        let runs = super::super::browse::plain(&runs.canonicalize().unwrap());
+        assert_eq!(state.config_read().training.dir, Some(runs.clone()));
+        assert_eq!(crate::training::training_dir(&state.config_read()), runs);
         let (_, _, b) = call(
             &state,
             post_form("/training/dir", "training_dir=%2Fno%2Fsuch%2Fdir", true),

@@ -906,7 +906,12 @@ mod tests {
         let outside = std::env::temp_dir().join(format!("bop-review-out-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&outside).unwrap();
         let file = imported.join("ir/drive/2026-10-21/20261021T010203004Z_a.jpg");
-        for p in [file, d.root.join("nope"), outside.clone()] {
+        // (A folder outside the roots only on Unix: on Windows every drive is a root.)
+        let mut refused = vec![file, d.root.join("nope")];
+        if cfg!(unix) {
+            refused.push(outside.clone());
+        }
+        for p in refused {
             let body = serde_json::json!({ "dir": p.display().to_string() }).to_string();
             let (s, v) = json(&d.state, post_json("/v1/review/folder", &body)).await;
             assert_ne!(s, StatusCode::OK, "{} {v}", p.display());

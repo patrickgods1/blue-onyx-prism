@@ -438,9 +438,10 @@ mod tests {
     use super::*;
 
     fn setup() -> (PathBuf, Config) {
-        let root = std::env::temp_dir()
-            .join(format!("bop-browse-{}", uuid::Uuid::new_v4()))
-            .canonicalize_or_self();
+        let root = std::env::temp_dir().join(format!("bop-browse-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // What `allowed_path` returns: canonical, without Windows' `\\?\`.
+        let root = plain(&root.canonicalize().unwrap());
         std::fs::create_dir_all(root.join("models/Zdir")).unwrap();
         std::fs::create_dir_all(root.join("models/adir")).unwrap();
         for f in [
