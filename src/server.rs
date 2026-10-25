@@ -1241,7 +1241,7 @@ mod tests {
         let (s, h, _) = call(&state, from(LOCAL, "GET", "/config", true)).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(h["x-content-type-options"], "nosniff");
-        assert_eq!(h["referrer-policy"], "no-referrer");
+        assert_eq!(h["referrer-policy"], "same-origin");
         assert_eq!(h["x-frame-options"], "DENY");
         assert_eq!(h["content-security-policy"], guard::CSP);
         assert_eq!(h[header::CONTENT_TYPE], "text/html; charset=utf-8");

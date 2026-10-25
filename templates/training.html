@@ -16,7 +16,7 @@
 
 <div class="card tr-wrap" id="machine">
   <h2>This machine</h2>
-  <p>{% if available %}{{ summary }}{% else %}<span class="error">{{ summary }}</span>{% endif %}</p>
+  <p{% if !available %} class="error"{% endif %}>{{ summary }}</p>
   {% if !reasons.is_empty() %}
   <ul>{% for r in reasons %}<li class="muted">{{ r }}</li>{% endfor %}</ul>
   {% endif %}

@@ -11,7 +11,13 @@
 //!
 //! - `Sec-Fetch-Site: cross-site` (every current browser sends the header);
 //! - an `Origin` (else `Referer`) header whose scheme authority is not the request's `Host`
-//!   (`Origin: null` counts as foreign; `Host` must be present).
+//!   (`Origin: null` counts as foreign unless the browser marks the request
+//!   `Sec-Fetch-Site: same-origin`; `Host` must be present).
+//!
+//! A plain HTML form POST from a page served with `Referrer-Policy: no-referrer` carries
+//! `Origin: null` even to its own origin (the Fetch spec ties the serialized origin to the
+//! referrer policy), so pages are served with `same-origin` instead, and `null` with a
+//! same-origin `Sec-Fetch-Site` (a header pages cannot set) passes.
 //!
 //! A request with none of those headers passes. Non-browser clients (curl, scripts and tools on
 //! the machine, the CLI) send none of them, while a browser sends `Origin` on every cross-origin
@@ -21,8 +27,8 @@
 //!
 //! # Response headers
 //!
-//! [`security_headers`] adds `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`
-//! and `X-Frame-Options: DENY` to every answer, [`CSP`] to HTML pages (every script and style
+//! [`security_headers`] adds `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`
+//! (no referrer to other sites) and `X-Frame-Options: DENY` to every answer, [`CSP`] to HTML pages (every script and style
 //! must come from `/static/`), `charset=utf-8` to HTML without one, and `Cache-Control:
 //! no-store` to JSON that sets no cache policy of its own.
 
@@ -114,6 +120,11 @@ pub(crate) fn cross_site(headers: &HeaderMap) -> Result<(), CrossSite> {
     let Some(source) = source.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
+    let same_origin =
+        text("sec-fetch-site").is_some_and(|v| v.trim().eq_ignore_ascii_case("same-origin"));
+    if source.eq_ignore_ascii_case("null") && same_origin {
+        return Ok(());
+    }
     let Some((scheme, auth)) = authority(source) else {
         return Err(CrossSite::Mismatch(source.to_string(), host.to_string()));
     };
@@ -171,7 +182,7 @@ pub(super) async fn security_headers(mut resp: Response) -> Response {
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    h.insert("referrer-policy", HeaderValue::from_static("same-origin"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
     let ct = h
         .get(header::CONTENT_TYPE)
@@ -228,6 +239,16 @@ mod tests {
         );
         assert_eq!(
             cross_site(&headers(&[host, ("sec-fetch-site", "same-origin")])),
+            Ok(())
+        );
+        // A form POST from a page served with `Referrer-Policy: no-referrer` (an old page):
+        // `Origin: null`, but the browser vouches that it is same-origin.
+        assert_eq!(
+            cross_site(&headers(&[
+                host,
+                ("origin", "null"),
+                ("sec-fetch-site", "same-origin")
+            ])),
             Ok(())
         );
         // Default ports: `http://host` is `host:80`; TLS behind a proxy that keeps Host.
@@ -289,6 +310,14 @@ mod tests {
         // name that does not match the Host the page was served under.
         assert!(cross_site(&headers(&[host, ("origin", "http://localhost:8080")])).is_err());
         assert!(cross_site(&headers(&[host, ("origin", "null")])).is_err());
+        assert!(
+            cross_site(&headers(&[
+                host,
+                ("origin", "null"),
+                ("sec-fetch-site", "same-site")
+            ]))
+            .is_err()
+        );
         assert!(cross_site(&headers(&[host, ("referer", "http://attacker.test/x")])).is_err());
         assert!(cross_site(&headers(&[host, ("origin", "file://x")])).is_err());
         assert_eq!(
