@@ -16,6 +16,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# The HTTP status of a failed Invoke-WebRequest, 0 when there was none (refused, timed out,
+# connection closed). Under StrictMode a missing .Response property would throw instead.
+function Get-HttpCode($err) {
+    $r = $err.Exception.PSObject.Properties["Response"]
+    if ($r -and $r.Value) { return [int]$r.Value.StatusCode }
+    return 0
+}
 $Msi = (Resolve-Path $Msi).Path
 $Service = "BlueOnyxPrismService"
 $DataDir = Join-Path $env:ProgramData "BlueOnyxPrism"
@@ -75,7 +83,7 @@ function Install-AndCheck([string]$Log) {
         try {
             $code = [int](Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5).StatusCode
         } catch {
-            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+            $code = Get-HttpCode $_
         }
         if ($code -eq 200 -or $code -eq 503) { break }
         Start-Sleep -Seconds 2
@@ -91,7 +99,7 @@ function Install-AndCheck([string]$Log) {
         try {
             $code = [int](Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5).StatusCode
         } catch {
-            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+            $code = Get-HttpCode $_
         }
     }
     if ($code -ne 200) { Fail "$url not ready (200) within 6 min (last: $code)" @($Log) }
