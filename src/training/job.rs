@@ -7,10 +7,11 @@
 //! --self-check`: PyTorch imports and sees the GPU) -> weights (the pinned base weights, and the
 //! public subset when asked) -> dataset (assembled in Rust, [`super::dataset`]) -> train (the
 //! script trains and exports a static ONNX, checked against PyTorch with ONNX Runtime; progress
-//! from its `@train` events) -> install (`models/<name>.onnx`, `.yaml` and
-//! `<name>.provenance.json`) -> register ([`Hooks::register`], the `add-model` code) ->
-//! benchmark ([`Hooks::benchmark`] on the held-out `dir:` set; a failure there is reported but
-//! does not undo the model). Cancellation kills the child's process tree (the runner's job).
+//! from its `@train` events) -> install (`<name>.onnx`, `.yaml` and `<name>.provenance.json`
+//! in the models folder or the request's `install_dir`, [`TrainJob::install_dir`]) -> register
+//! ([`Hooks::register`], the `add-model` code, with the installed path) -> benchmark
+//! ([`Hooks::benchmark`] on the held-out `dir:` set; a failure there is reported but does not
+//! undo the model). Cancellation kills the child's process tree (the runner's job).
 
 use super::capability::Accelerator;
 use super::dataset::{self, Prepared, SceneFilter};
@@ -120,6 +121,10 @@ pub struct TrainRequest {
     /// the public night subset ([`super::check_public_download`]).
     #[serde(default)]
     pub allow_large: bool,
+    /// Folder the finished model is installed in; None = the models folder. [`super::plan_job`]
+    /// resolves a relative one against the data root (absolute in a queued job).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_dir: Option<PathBuf>,
 }
 
 /// One queued run.
@@ -127,7 +132,7 @@ pub struct TrainRequest {
 pub struct TrainJob {
     pub id: String,
     pub request: TrainRequest,
-    /// The trained model's name (`models/<name>.onnx`, `/v1/vision/custom/<name>`).
+    /// The trained model's name (`<install dir>/<name>.onnx`, `/v1/vision/custom/<name>`).
     pub name: String,
     pub paths: TrainPaths,
     /// `<training dir>/<id>`: the prepared dataset, the log, the held-out set.
@@ -141,6 +146,16 @@ pub struct TrainJob {
     pub workers: u32,
     /// Keep the checkpoints (`<run>/work`) after the run.
     pub keep_work: bool,
+}
+
+impl TrainJob {
+    /// Where the model is installed: the request's `install_dir`, else the models folder.
+    pub fn install_dir(&self) -> &Path {
+        self.request
+            .install_dir
+            .as_deref()
+            .unwrap_or(&self.paths.export.models)
+    }
 }
 
 /// What a run reports.
@@ -325,7 +340,7 @@ fn stages(
     recipe.validate()?;
     super::recipe::valid_model_name(&job.name)?;
     let paths = &job.paths;
-    let models = &paths.export.models;
+    let models = job.install_dir();
     let family = recipe.family;
     let base = recipe.base()?;
     let lane = job.accelerator.lane();
@@ -827,7 +842,7 @@ fn install(
     device: Option<&str>,
     seconds: Option<f64>,
 ) -> Result<TrainOutput> {
-    let models = &job.paths.export.models;
+    let models = job.install_dir();
     let name = &job.name;
     let (onnx_name, yaml_name) = (format!("{name}.onnx"), format!("{name}.yaml"));
     let src_onnx = staging.join(&onnx_name);

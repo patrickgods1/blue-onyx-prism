@@ -257,10 +257,13 @@ Stages (page and `train run` show them with percent and ETA):
    trainer reports it, `eval`, `phase`, `done`); everything else goes to `<run>/train.log` (capped
    at 20 MB). Out of GPU memory, missing kernels and unusable images get their own messages (lower the
    batch or input size, ...); other failures go through the export's classifier.
-6. **install**: `models/<name>.onnx`, `<name>.yaml` (the class names) and `<name>.provenance.json`
-   (licence and note, family, size, recipe, base weights with URL and SHA-256, datasets with their
-   licences and counts, `exdark_used: false`, device, training time, the ONNX's SHA-256, the Blue Onyx
-   Prism version). The checkpoints in `<run>/work` are deleted.
+6. **install**: `<name>.onnx`, `<name>.yaml` (the class names) and `<name>.provenance.json` into the
+   models folder, or the folder given in *Install the model in* / `--install-dir` (relative = under the
+   data root; the page accepts a browsable folder or one picked in the native dialog). The config entry,
+   the benchmark and *Use as* use the file where it was installed (an absolute path outside the data
+   root). The `.provenance.json` holds the licence and note, family, size, recipe, base weights with
+   URL and SHA-256, datasets with their licences and counts, `exdark_used: false`, device, training
+   time, the ONNX's SHA-256 and the Blue Onyx Prism version. The checkpoints in `<run>/work` are deleted.
 7. **register**: the same code as `add-model` adds the model to the config, disabled (enable it, or
    use one of the actions below, which also enable it).
 8. **benchmark**: the regular benchmark on the held-out `dir:` set (and `nir-night`, `exdark-ir`,
@@ -272,6 +275,18 @@ can be queued at once (one per ticked size, or `--model` repeated); they run one
 kills the process tree. Run records are kept in `<training dir>/runs.json`; a run interrupted by a
 stopped service is shown as failed. On Unix the trainer exits when the service process is gone; on
 Windows the job object does it.
+
+**Training folder** (`training.dir`, default `<data root>/training`; This machine card, with a
+Folder... button): run records (`runs.json`, `tasks.json`), prepared datasets, held-out sets, logs,
+import work and the Review page's exports. A new folder must exist and pass the same checks as other
+folder settings (no system folder, browsable or natively picked). It applies at once, without a
+restart: the queue switches to the new folder's records when no run, import or auto-label job is
+queued or running, and the page refuses the change (409) while one is. Runs, imports and exports in the
+old folder stay there and are not moved (set the old folder again to see them).
+
+The dataset folders a run uses are checked too: a ticked folder is used as is only when the page
+offered it (`training.datasets` or an export under `<training dir>/exports`); any other value, the typed
+*Another folder* and its *Save folder* must be a browsable folder or one picked in the native dialog.
 
 **Use as** (Trained models card): *Default model* sets `default_model`; *night model of* sets the
 chosen model's `night_model` (IR and dark frames go to the trained model); *verifier of* sets its
@@ -296,6 +311,12 @@ GPU; the benchmark at the end of the run measures it.
 sources into the dataset folder (`collect.dir`), in the collector's layout, so they show on the
 Dataset page (*Imported footage*) and on the Review page (they are queued for review) like collected
 frames.
+
+`--out-dir <dir>` (the page's *Save frames to*, with a native folder picker) writes them to another
+folder instead, in the same layout with its own `imports.jsonl` and review queue. The Dataset page
+shows only `collect.dir`; to review the frames, choose the folder on the Review page (*Folder under
+review*, `collect.review_dir`). The page accepts a browsable folder or one picked in the native
+dialog, like the source path.
 
 ### Sources
 
@@ -533,7 +554,7 @@ blue-onyx-prism train prepare --dataset <export> [--dataset <export>] [--scene n
     [--classes person,car,dog,cat,raccoon] [--rename motorbike=motorcycle] [--public [--allow-large]] --out <dir>
 blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> [--scene all|day|night+ir] \
     [--epochs 50] [--batch 16] [--imgsz 640] [--lr 0.001] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
-    [--name n] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
+    [--name n] [--install-dir <dir>] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
     [--max-candidates 1500] [--workers 0] [--hwaccel auto|off] \

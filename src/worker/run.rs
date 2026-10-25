@@ -1191,8 +1191,9 @@ impl WorkerCtx {
         let t = Instant::now();
         let live = f.meta.live.clone();
         // The profile for the device that actually loaded (`auto` and a fallback included),
-        // else the model's / global value; a request's `min_confidence` wins over both.
-        let (configured, source) = live.threshold_for(&eng.device);
+        // else the model's / global value, or on a night / IR frame the model's
+        // `night_threshold`; a request's `min_confidence` wins over all of them.
+        let (configured, source) = live.threshold_for_scene(&eng.device, f.stats.scene());
         let threshold = effective_threshold(f.min_confidence(), configured);
         let threshold_source = if threshold == effective_threshold(0.0, configured) {
             source.label()

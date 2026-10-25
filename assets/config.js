@@ -235,10 +235,18 @@ document.addEventListener("click", function (e) {
     } else U.refresh(r.input, v, function (x) { return x === "" ? "none (" + fb.value + " " + fb.src + ")" : x; });
     thrHint(tr, false);
   }
+  // Night model "same model" (@self): its threshold field shows beside the select.
+  function nightThr(tr, focus) {
+    var sel = tr.querySelector("td.model-night select"), thr = tr.querySelector("td.model-night input.night-thr");
+    if (!sel || !thr) return;
+    thr.hidden = sel.value !== "@self";
+    if (focus && !thr.hidden && !thr.value) thr.focus();
+  }
   card.addEventListener("change", function (e) {
     var t = e.target, tr = t.closest && t.closest("tr[data-model]");
     if (!tr) return;
     if (t.matches("td.model-device select")) applyDevice(tr, true, false);
+    else if (t.matches("td.model-night select")) nightThr(tr, true);
     else if (t.matches('input[name^="profile_remove."]')) {
       var r = thrParts(tr);
       if (t.value === r.key.value) { r.input.value = t.checked ? "" : r.input.defaultValue; r.input.classList.toggle("edited", U.edited(r.input)); thrHint(tr, false); }
@@ -319,6 +327,7 @@ document.addEventListener("click", function (e) {
         // A carried-over device choice: point the threshold field at that device again.
         var sel = r.querySelector("td.model-device select");
         if (sel && U.edited(sel)) applyDevice(r, false, true);
+        nightThr(r, false);
       });
     }).catch(function () {});
   }

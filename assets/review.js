@@ -5,7 +5,8 @@
 // params. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
 // The Auto-label card queues a job (POST /training/autolabel as JSON) and follows it on
 // GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto.
-// Export / import / classes forms post JSON to /v1/review/{export,import,classes}.
+// Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
+// a new folder reloads the page.
 // No inline handlers (CSP): everything is wired here; server values come from data-*.
 (function () {
   'use strict';
@@ -1238,6 +1239,23 @@
       refresh();
     }).catch(function (e) { box.textContent = e.message; box.className = 'form-msg error-text'; });
   });
+
+  function setFolder(dir) {
+    var box = $('rv-folder-msg');
+    box.textContent = 'Switching...';
+    box.className = 'form-msg';
+    postJson('/v1/review/folder', { dir: dir }).then(function () {
+      location.reload();
+    }).catch(function (e) { box.textContent = e.message; box.className = 'form-msg error-text'; });
+  }
+
+  $('rv-folder').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    setFolder(ev.target.elements.dir.value.trim());
+  });
+  if ($('rv-folder-reset')) {
+    $('rv-folder-reset').addEventListener('click', function () { setFolder(''); });
+  }
 
   fillKeyHint();
   loadNext();

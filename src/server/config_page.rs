@@ -40,6 +40,10 @@ pub(super) struct ConfigView {
     gpu_index: String,
     force_cpu: bool,
     cache_dir: String,
+    download_dir: String,
+    models_dir: String,
+    onnxruntime_dir: String,
+    openvino_dir: String,
     confidence_threshold: String,
     nms_iou: String,
     object_filter: String,
@@ -83,6 +87,10 @@ impl ConfigView {
             gpu_index: c.gpu_index.to_string(),
             force_cpu: c.force_cpu,
             cache_dir: c.cache_dir.clone(),
+            download_dir: path(&c.download_dir),
+            models_dir: c.models_dir.display().to_string(),
+            onnxruntime_dir: path(&c.onnxruntime_dir),
+            openvino_dir: path(&c.openvino_dir),
             confidence_threshold: crate::config::round_threshold_f64(c.confidence_threshold)
                 .to_string(),
             nms_iou: crate::config::clean_f32(c.nms_iou).to_string(),
@@ -136,6 +144,10 @@ impl ConfigView {
                         "device" => &mut self.device,
                         "gpu_index" => &mut self.gpu_index,
                         "cache_dir" => &mut self.cache_dir,
+                        "download_dir" => &mut self.download_dir,
+                        "models_dir" => &mut self.models_dir,
+                        "onnxruntime_dir" => &mut self.onnxruntime_dir,
+                        "openvino_dir" => &mut self.openvino_dir,
                         "confidence_threshold" => &mut self.confidence_threshold,
                         "nms_iou" => &mut self.nms_iou,
                         "object_filter" => &mut self.object_filter,
@@ -193,8 +205,13 @@ struct ModelSelectRow {
     profiles: Vec<(String, String)>,
     /// The threshold the loaded worker uses ("" = not loaded).
     running_threshold: String,
-    /// Night model select: "none" first, then the other models it may name.
+    /// Night model select: "none" first, "same model" ([`NIGHT_SELF`]), then the other models
+    /// it may name.
     night_models: Vec<DeviceChoice>,
+    /// The model's `night_threshold` ("" = none), the field beside "same model".
+    night_threshold: String,
+    /// "same model" is chosen (the night threshold field shows).
+    night_self: bool,
     /// What the running worker uses ("OpenVINO CPU · threshold 0.50", "not loaded", ...).
     running: String,
     running_class: &'static str,
@@ -260,19 +277,34 @@ pub(super) fn global_device_label(c: &Config, snap: &DevicesSnapshot) -> String 
 /// no night model of its own (night models do not chain; a disabled one is marked: the switch
 /// falls back to the model itself while it is off). A model this one already names is always
 /// listed (as "missing" when it is not configured).
+/// The Night model select's value for "the same model with its own night threshold"
+/// (`night_threshold`, no `night_model`); a model of that name cannot be chosen as a night
+/// model on the card (the JSON editor still can).
+pub(super) const NIGHT_SELF: &str = "@self";
+
 fn night_model_choices(models: &[crate::config::ModelConfig], me: usize) -> Vec<DeviceChoice> {
     use crate::registry::normalize_name;
     let Some(m) = models.get(me) else {
         return Vec::new();
     };
     let current = m.night_model.as_deref().map(normalize_name);
-    let mut v = vec![DeviceChoice {
-        value: String::new(),
-        label: "none".to_string(),
-        selected: current.is_none(),
-        disabled: false,
-        ..Default::default()
-    }];
+    let same = current.is_none() && m.night_threshold.is_some();
+    let mut v = vec![
+        DeviceChoice {
+            value: String::new(),
+            label: "none".to_string(),
+            selected: current.is_none() && !same,
+            disabled: false,
+            ..Default::default()
+        },
+        DeviceChoice {
+            value: NIGHT_SELF.to_string(),
+            label: "same model, night threshold".to_string(),
+            selected: same,
+            disabled: false,
+            ..Default::default()
+        },
+    ];
     let mut found = false;
     for (i, o) in models.iter().enumerate() {
         let name = o.effective_name();
@@ -467,6 +499,8 @@ fn model_choices(
             ModelSelectRow {
                 devices,
                 night_models: night_model_choices(&c.models, i),
+                night_threshold: m.night_threshold.map(live::fmt_thr).unwrap_or_default(),
+                night_self: m.night_model.is_none() && m.night_threshold.is_some(),
                 key,
                 family: m.family.to_string(),
                 path: m.path.display().to_string(),
@@ -586,6 +620,8 @@ pub(super) struct ConfigTemplate {
     family_choices: Vec<FamilyChoice>,
     /// Resolved data root (relative model paths are under it).
     data_root: String,
+    /// The program's directory (the default data root; relative runtime dirs are under it).
+    exe_dir: String,
     /// Placeholder of the model path field: a file under `models_dir` with this OS's separators
     /// (where Browse starts).
     model_path_example: String,
@@ -874,6 +910,7 @@ pub(super) fn config_template(
         local_models,
         family_choices: family_choices(),
         data_root: cfg.data_root().display().to_string(),
+        exe_dir: crate::exe_dir().display().to_string(),
         model_path_example,
         models_dir,
         tools_dir,
@@ -1014,7 +1051,12 @@ pub(super) async fn config_submit(
             }
         };
         let form: HashMap<String, String> = pairs.into_iter().collect();
-        match save_config(&state, "config page", |c| live::server_form_edit(c, &form)) {
+        let edit = |c: &mut Config| {
+            let before = c.clone();
+            live::server_form_edit(c, &form)?;
+            check_new_model_paths(&before, c, super::browse::allowed_or_missing_inside_roots)
+        };
+        match save_config(&state, "config page", edit) {
             Ok(msg) => {
                 // A device change to an option that needs a download was queued by
                 // `apply_config`: the model serves on what it can meanwhile; an installed runtime
@@ -1041,6 +1083,36 @@ pub(super) async fn config_submit(
         }
     })
     .await
+}
+
+/// Model files typed into the models JSON editor: every `path` / `classes` that is new or
+/// changed against `before` ([`crate::config_form::new_model_paths`]) must pass `allowed`
+/// (the server's [`super::browse::allowed_or_missing_inside_roots`]: inside the browsable
+/// folders, even when not downloaded yet, or covered by a recent native pick), like the
+/// "Add a model by path" form. It is checked against the roots of the saved config and of the
+/// edited one (a `download_dir` changed in the same post), and resolved under the edited
+/// config's data root. Unchanged entries are never re-checked.
+fn check_new_model_paths<E>(
+    before: &Config,
+    after: &Config,
+    mut allowed: impl FnMut(&Config, &str) -> Result<PathBuf, E>,
+) -> anyhow::Result<()> {
+    for n in crate::config_form::new_model_paths(before, after) {
+        let full = after.data_path(&n.path).display().to_string();
+        if allowed(before, &full).is_err() && allowed(after, &full).is_err() {
+            anyhow::bail!(
+                "models: the {} of model '{}' ({}) is outside the folders this page may use \
+                 (the data root {}, the models folder, the download folder and your home \
+                 folder); choose the file with Browse... under Add a model by path (or move \
+                 it into the models folder) and save again",
+                n.field,
+                n.model,
+                n.path.display(),
+                after.data_root().display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The Models card: `enabled` (repeated, one per checked model), `default_model` (radio),
@@ -1853,6 +1925,79 @@ mod tests {
             .expect("restart token cancelled");
     }
 
+    /// Models JSON paths: a new or changed file outside the browsable folders is refused
+    /// (naming the model and the field), an unchanged one is kept, and a missing file inside
+    /// the data root (a download still to come) is accepted.
+    #[test]
+    fn models_json_paths_must_stay_inside_the_roots() {
+        use super::super::browse::allowed_or_missing_inside_roots as allowed;
+        let root = std::env::temp_dir().join(format!("bop-cfg-roots-{}", uuid::Uuid::new_v4()));
+        // Not canonicalized: a Windows verbatim (`\\?\`) path is refused as typed input.
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let outside = std::env::temp_dir().join(format!("bop-cfg-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside = outside.canonicalize().unwrap();
+        let model = |name: &str, path: PathBuf| crate::config::ModelConfig {
+            name: Some(name.into()),
+            path,
+            ..Default::default()
+        };
+        let before = Config {
+            download_dir: Some(root.clone()),
+            models: vec![model("old", outside.join("old.onnx"))],
+            ..Default::default()
+        };
+        // Unchanged entry outside every root: kept.
+        let mut after = before.clone();
+        after.models[0].lazy = true;
+        check_new_model_paths(&before, &after, allowed).unwrap();
+        // New entry inside the data root, not downloaded yet: accepted (relative or absolute).
+        after
+            .models
+            .push(model("later", "models/later.onnx".into()));
+        after
+            .models
+            .push(model("abs", root.join("models/sub/abs.onnx")));
+        check_new_model_paths(&before, &after, allowed).unwrap();
+        // A changed path or classes file outside: refused, naming the model and the field.
+        let in_home = ["HOME", "USERPROFILE"].iter().any(|v| {
+            std::env::var_os(v)
+                .and_then(|h| PathBuf::from(h).canonicalize().ok())
+                .is_some_and(|h| outside.starts_with(h))
+        });
+        if !in_home {
+            let mut moved = after.clone();
+            moved.models[1].path = outside.join("later.onnx");
+            let e = check_new_model_paths(&before, &moved, allowed)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("path of model 'later'") && e.contains("Browse"),
+                "{e}"
+            );
+            let mut classes = after.clone();
+            classes.models[0].classes = Some(outside.join("c.yaml"));
+            let e = check_new_model_paths(&before, &classes, allowed)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("classes of model 'old'"), "{e}");
+        }
+        // The rule with a stand-in check: only the new paths are asked about.
+        let mut asked = Vec::new();
+        let _ = check_new_model_paths(&before, &after, |_, p: &str| {
+            asked.push(p.to_string());
+            Ok::<PathBuf, ()>(PathBuf::new())
+        });
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(
+            asked
+                .iter()
+                .all(|p| p.starts_with(&root.display().to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     #[test]
     fn server_tab_badges_follow_the_merge_rules() {
         use crate::config_merge::{flatten_all, pending};
@@ -1913,7 +2058,15 @@ mod tests {
         assert!(html.contains("id=\"browse-dialog\""));
         // The folder settings of the Server tab browse folders; the shared picker script
         // (native dialog, else the in-page browser) is loaded after config.js.
-        for target in ["cache_dir", "log_path", "save_image_path"] {
+        for target in [
+            "cache_dir",
+            "log_path",
+            "save_image_path",
+            "download_dir",
+            "models_dir",
+            "onnxruntime_dir",
+            "openvino_dir",
+        ] {
             assert!(
                 html.contains(&format!("data-browse=\"folder\" data-target=\"{target}\"")),
                 "{target}"

@@ -32,9 +32,13 @@ const EXTRA_SETS: [&str; 3] = ["nir-night", "exdark-ir", "exdark-night"];
 
 static SERVICE: OnceLock<Arc<TrainingService>> = OnceLock::new();
 
+/// Serializes the tests that queue jobs or move the process's queue ([`SERVICE`]).
+#[cfg(test)]
+pub(super) static QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The process's training queue, started on first use.
 pub(super) fn service(shared: &Shared) -> Arc<TrainingService> {
-    SERVICE
+    let svc = SERVICE
         .get_or_init(|| {
             let state = shared.current();
             let config = state.config_read().clone();
@@ -53,11 +57,26 @@ pub(super) fn service(shared: &Shared) -> Arc<TrainingService> {
                 Some(crate::training::runs_file(&config)),
             )
         })
-        .clone()
+        .clone();
+    let want = crate::training::runs_file(&shared.current().config_read());
+    sync_store(&svc, &want);
+    svc
+}
+
+/// Keep the started queue on the configured training folder (`training.dir` saved on this page,
+/// or edited on disk: then at the next queue, import, auto-label or remove): it moves when idle
+/// ([`TrainingService::set_store`]); while a job is queued or running it stays with the job and
+/// moves on a later call. Reads (the page, `GET /v1/training`) never move it.
+fn sync_store(svc: &TrainingService, want: &std::path::Path) {
+    if svc.store().as_deref() != Some(want)
+        && let Err(e) = svc.set_store(want)
+    {
+        tracing::debug!("training folder {} not used yet: {e}", want.display());
+    }
 }
 
 /// The import and auto-label jobs (the queue's, else `tasks.json`).
-fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> {
+pub(super) fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> {
     match SERVICE.get() {
         Some(s) => s.tasks(),
         None => crate::training::task::load_records(&crate::training::task::tasks_file(
@@ -227,12 +246,20 @@ pub(super) struct TrainingTemplate {
     runs: Vec<RunRow>,
     results: Vec<ResultRow>,
     models: Vec<String>,
+    /// The models folder (where a trained model goes by default).
+    models_dir: String,
     default_model: String,
     training_dir: String,
+    /// `training.dir` as configured (empty = the default folder).
+    training_dir_setting: String,
+    /// The default training folder (`<data root>/training`).
+    training_dir_default: String,
     /// Import and auto-label jobs.
     tasks: Vec<super::training_tasks::TaskRow>,
     /// A job is queued or running (its table starts open).
     tasks_busy: bool,
+    /// A run or task is queued or running (the training folder cannot change).
+    jobs_busy: bool,
     footage: Vec<super::training_tasks::FootageRow>,
     dataset_dir: String,
     /// Imports listed in the dataset folder.
@@ -487,6 +514,7 @@ pub(super) fn view(
         .unwrap_or_default();
     let task_rows = super::training_tasks::task_rows(&tasks(state));
     let tasks_busy = task_rows.iter().any(|t| t.busy);
+    let jobs_busy = tasks_busy || all.iter().any(|r| r.state.is_busy());
     TrainingTemplate {
         nav: "training",
         version: crate::VERSION,
@@ -553,8 +581,24 @@ pub(super) fn view(
         models: names,
         default_model,
         training_dir: crate::training::training_dir(&config).display().to_string(),
+        training_dir_setting: config
+            .training
+            .dir
+            .as_ref()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default(),
+        training_dir_default: crate::training::config::TrainingConfig::default()
+            .dir_in(&config.data_root())
+            .display()
+            .to_string(),
+        models_dir: TrainPaths::for_config(&config)
+            .export
+            .models
+            .display()
+            .to_string(),
         tasks: task_rows,
         tasks_busy,
+        jobs_busy,
         footage: super::training_tasks::footage(),
         imports: {
             let mut v = crate::training::import::write::read_imports(&dataset_dir);
@@ -599,7 +643,8 @@ pub(super) fn num<T: std::str::FromStr>(
 }
 
 /// The runs of a queue form: one [`TrainRequest`] per ticked model (`model=yolo26n`, repeated),
-/// sharing the dataset and options fields. Errors name the field.
+/// sharing the dataset and options fields. Errors name the field. The paths are taken as typed:
+/// [`queue`] checks them ([`checked_datasets`], [`checked_folder`]).
 pub(crate) fn requests_from_form(
     f: &[(String, String)],
     cap: &Capability,
@@ -676,9 +721,69 @@ pub(crate) fn requests_from_form(
             rename: Default::default(),
             benchmark_sets: sets.clone(),
             allow_large: field(f, "confirm_large").is_some(),
+            install_dir: field(f, "install_dir").map(PathBuf::from),
         });
     }
     Ok((out, name))
+}
+
+/// The dataset folders of a queue form: a ticked `dataset` is taken as is when it is one the
+/// page offers (`offered`: `training.datasets` and the Review page's exports), anything else and
+/// the typed `dataset_path` only when `allow` accepts it ([`super::browse::allowed_path`]: inside
+/// the browsable folders or picked in the native dialog), as the path it returns. Errors name the
+/// field.
+pub(crate) fn checked_datasets(
+    f: &[(String, String)],
+    offered: &[PathBuf],
+    allow: &dyn Fn(&str) -> Result<PathBuf, String>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for d in all(f, "dataset") {
+        let p = PathBuf::from(d);
+        if offered.contains(&p) {
+            out.push(p);
+        } else {
+            out.push(allow(d).map_err(|e| anyhow::anyhow!("datasets: {e}"))?);
+        }
+    }
+    if let Some(extra) = field(f, "dataset_path") {
+        out.push(allow(extra).map_err(|e| anyhow::anyhow!("another folder: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// The folders the Datasets list offers: `training.datasets`, then the Review page's exports.
+fn offered_datasets(config: &crate::config::Config) -> Vec<PathBuf> {
+    let mut v = config.training.datasets.clone();
+    v.extend(crate::training::discover_exports(config));
+    v
+}
+
+/// [`super::browse::allowed_path`] as a message.
+fn allow_in(config: &crate::config::Config) -> impl Fn(&str) -> Result<PathBuf, String> + '_ {
+    move |raw| super::browse::allowed_path(config, raw).map_err(|e| e.into_parts().1)
+}
+
+/// A folder setting of a form (`label` names the field): [`crate::config::validate_dir_setting`]
+/// (no system folder, no UNC path), then `allow` (an existing folder the page may use). None
+/// for an empty value.
+pub(crate) fn checked_folder(
+    label: &str,
+    raw: Option<&str>,
+    data_root: &std::path::Path,
+    allow: &dyn Fn(&str) -> Result<PathBuf, String>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(resolved) = crate::config::validate_dir_setting(label, raw, data_root)? else {
+        return Ok(None);
+    };
+    let p = allow(&resolved.to_string_lossy()).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+    if !p.is_dir() {
+        anyhow::bail!("{label}: {} is not a folder", p.display());
+    }
+    Ok(Some(p))
 }
 
 /// `GET /training`.
@@ -709,7 +814,20 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
         let config = state.config_read().clone();
         let cap = crate::training::capability_now();
         let result = (|| -> anyhow::Result<String> {
-            let (reqs, name) = requests_from_form(&f, &cap, config.training.epochs)?;
+            let (mut reqs, name) = requests_from_form(&f, &cap, config.training.epochs)?;
+            // Only folders the page offers, or ones the file browser may show / picked natively.
+            let allow = allow_in(&config);
+            let datasets = checked_datasets(&f, &offered_datasets(&config), &allow)?;
+            let install_dir = checked_folder(
+                "install the model in",
+                field(&f, "install_dir"),
+                &config.data_root(),
+                &allow,
+            )?;
+            for r in &mut reqs {
+                r.datasets.clone_from(&datasets);
+                r.install_dir.clone_from(&install_dir);
+            }
             if let Some(a) = &cap.accelerator {
                 let paths = TrainPaths::for_config(&config);
                 if !env::train_env_ready(&paths, Platform::current(), a.lane())
@@ -890,21 +1008,96 @@ pub(super) async fn datasets(
 ) -> Response {
     blocking(move || {
         let f = super::dataset::parse_form(&body);
-        let result = dataset_edit(&f).and_then(|edit| {
-            save_config(&state, "training page", |c| {
-                match &edit {
-                    DatasetEdit::Add(p) => {
-                        let dir = c.data_path(p);
-                        crate::training::dataset::read_classes(&dir)?;
-                        if !c.training.datasets.contains(p) {
-                            c.training.datasets.push(p.clone());
-                        }
-                    }
-                    DatasetEdit::Remove(p) => c.training.datasets.retain(|d| d != p),
-                }
-                c.training.validate()
+        let config = state.config_read().clone();
+        let result = dataset_edit(&f)
+            .and_then(|edit| match edit {
+                // The same check as the queue: a browsable folder or one picked natively.
+                DatasetEdit::Add(p) => allow_in(&config)(&p.to_string_lossy())
+                    .map(DatasetEdit::Add)
+                    .map_err(|e| anyhow::anyhow!("another folder: {e}")),
+                remove => Ok(remove),
             })
-        });
+            .and_then(|edit| {
+                save_config(&state, "training page", |c| {
+                    match &edit {
+                        DatasetEdit::Add(p) => {
+                            let dir = c.data_path(p);
+                            crate::training::dataset::read_classes(&dir)?;
+                            if !c.training.datasets.contains(p) {
+                                c.training.datasets.push(p.clone());
+                            }
+                        }
+                        DatasetEdit::Remove(p) => c.training.datasets.retain(|d| d != p),
+                    }
+                    c.training.validate()
+                })
+            });
+        match result {
+            Ok(m) => render(&view(&state, Some(m), None)),
+            Err(e) => render(&view(&state, None, Some(format!("Not saved: {e:#}")))),
+        }
+    })
+    .await
+}
+
+/// `POST /training/dir` (`training_dir`; empty = the default `<data root>/training`): the
+/// training folder (`training.dir`), saved with [`save_config`]. The folder must exist and pass
+/// [`checked_folder`]. Refused (409) while a run or task is queued or running; otherwise the
+/// queue moves to the new folder at once ([`sync_store`]): runs, imports and exports in the old
+/// folder stay there.
+pub(super) async fn set_dir(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    blocking(move || {
+        if SERVICE.get().is_some_and(|s| s.busy()) {
+            return (
+                StatusCode::CONFLICT,
+                render(&view(
+                    &state,
+                    None,
+                    Some(
+                        "Not saved: a training run, import or auto-label job is queued or \
+                         running; wait for it or cancel it, then change the training folder."
+                            .into(),
+                    ),
+                )),
+            )
+                .into_response();
+        }
+        let f = super::dataset::parse_form(&body);
+        let config = state.config_read().clone();
+        let result = (|| -> anyhow::Result<String> {
+            let root = config.data_root();
+            let new = checked_folder(
+                "training folder",
+                field(&f, "training_dir"),
+                &root,
+                &allow_in(&config),
+            )?;
+            // The default folder is kept as the default (it follows the data root).
+            let default = crate::training::config::TrainingConfig::default().dir_in(&root);
+            let new = new.filter(|p| default.canonicalize().ok().as_ref() != Some(p));
+            let old = crate::training::training_dir(&config);
+            let saved = save_config(&state, "training page", |c| {
+                c.training.dir.clone_from(&new);
+                Ok(())
+            })?;
+            let now = crate::training::training_dir(&state.config_read());
+            if let Some(svc) = SERVICE.get() {
+                sync_store(svc, &now.join(crate::training::service::RUNS_FILE));
+            }
+            Ok(if now == old {
+                saved
+            } else {
+                format!(
+                    "Training folder: {}. Runs, imports and exports in {} stay there (not moved). \
+                     {saved}",
+                    now.display(),
+                    old.display()
+                )
+            })
+        })();
         match result {
             Ok(m) => render(&view(&state, Some(m), None)),
             Err(e) => render(&view(&state, None, Some(format!("Not saved: {e:#}")))),
@@ -1015,6 +1208,14 @@ mod tests {
         )
         .unwrap();
         assert!(reqs[0].include_public && reqs[0].allow_large);
+        assert_eq!(reqs[0].install_dir, None);
+        let (reqs, _) = requests_from_form(
+            &form(&[("model", "yolo26n"), ("install_dir", " /srv/models ")]),
+            &mac(),
+            50,
+        )
+        .unwrap();
+        assert_eq!(reqs[0].install_dir, Some(PathBuf::from("/srv/models")));
         let e = requests_from_form(&form(&[("dataset", "/x")]), &mac(), 50).unwrap_err();
         assert!(e.to_string().contains("no model ticked"));
         let e = requests_from_form(
@@ -1031,6 +1232,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("one ticked model"));
+    }
+
+    #[test]
+    fn dataset_folders_are_offered_or_allowed() {
+        let offered = [PathBuf::from("/exports/a"), PathBuf::from("exports/rel")];
+        let allow = |raw: &str| -> Result<PathBuf, String> {
+            if raw.starts_with("/ok/") {
+                Ok(PathBuf::from(format!("/canon{raw}")))
+            } else {
+                Err(format!("{raw} is outside the browsable folders"))
+            }
+        };
+        // Offered ones as they are (a relative saved entry too), others through the check.
+        let f = form(&[
+            ("dataset", "/exports/a"),
+            ("dataset", "exports/rel"),
+            ("dataset", "/ok/b"),
+            ("dataset_path", "/ok/c"),
+        ]);
+        assert_eq!(
+            checked_datasets(&f, &offered, &allow).unwrap(),
+            [
+                PathBuf::from("/exports/a"),
+                PathBuf::from("exports/rel"),
+                PathBuf::from("/canon/ok/b"),
+                PathBuf::from("/canon/ok/c")
+            ]
+        );
+        // A ticked value the page did not offer.
+        let e = checked_datasets(&form(&[("dataset", "/etc/x")]), &offered, &allow).unwrap_err();
+        assert!(
+            e.to_string().starts_with("datasets: /etc/x is outside"),
+            "{e}"
+        );
+        // The typed folder is always checked, even when it is an offered one.
+        let e = checked_datasets(&form(&[("dataset_path", "/exports/a")]), &offered, &allow)
+            .unwrap_err();
+        assert!(e.to_string().starts_with("another folder:"), "{e}");
+        assert!(
+            checked_datasets(&form(&[("dataset_path", " ")]), &offered, &allow)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn folder_settings_are_checked() {
+        let dir = std::env::temp_dir().join(format!("bop-train-folder-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let allow = |raw: &str| -> Result<PathBuf, String> {
+            std::path::Path::new(raw)
+                .canonicalize()
+                .map_err(|_| format!("{raw} does not exist"))
+        };
+        let root = dir.as_path();
+        assert_eq!(checked_folder("x", None, root, &allow).unwrap(), None);
+        assert_eq!(checked_folder("x", Some("  "), root, &allow).unwrap(), None);
+        assert_eq!(
+            checked_folder("x", Some(&dir.display().to_string()), root, &allow).unwrap(),
+            Some(dir.canonicalize().unwrap())
+        );
+        // Relative: under the data root.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(
+            checked_folder("x", Some("sub"), root, &allow).unwrap(),
+            Some(dir.join("sub").canonicalize().unwrap())
+        );
+        let e = checked_folder("install the model in", Some("nope"), root, &allow).unwrap_err();
+        assert!(e.to_string().starts_with("install the model in: "), "{e}");
+        let e = checked_folder("x", Some(&file.display().to_string()), root, &allow).unwrap_err();
+        assert!(e.to_string().contains("is not a folder"), "{e}");
+        let e = checked_folder("training folder", Some("/usr/lib"), root, &allow).unwrap_err();
+        assert!(e.to_string().contains("system directory"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1116,6 +1393,7 @@ mod tests {
     #[tokio::test]
     async fn the_page_and_json_render_and_bad_forms_say_why() {
         use crate::server::test_util::{call, get_text, post_form, test_state_with};
+        let _queue = QUEUE_TEST_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!("bop-train-page-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let r2 = root.clone();
@@ -1185,7 +1463,12 @@ mod tests {
         assert!(!html.contains("Not saved"), "{html}");
         assert_eq!(
             state.config_read().training.datasets,
-            std::slice::from_ref(&export)
+            [super::super::browse::plain(&export.canonicalize().unwrap())]
+        );
+        let enc = super::super::encode_uri_component(
+            &super::super::browse::plain(&export.canonicalize().unwrap())
+                .display()
+                .to_string(),
         );
         assert!(html.contains("formaction=\"/training/datasets\" formnovalidate name=\"remove\""));
         let (_, _, _) = call(
@@ -1198,6 +1481,72 @@ mod tests {
         )
         .await;
         assert!(state.config_read().training.datasets.is_empty());
+        // Queue: a dataset the page did not offer, outside the browsable folders, is refused
+        // and named; so is an install folder outside them.
+        let (_, _, b) = call(
+            &state,
+            post_form(
+                "/training/queue",
+                "model=yolo26n&dataset=%2Fno%2Fsuch%2Fexport",
+                true,
+            ),
+        )
+        .await;
+        let html = String::from_utf8(b).unwrap();
+        // Refused either way: outside the roots, or (Windows: drive-relative, so under the
+        // data root) not found.
+        assert!(
+            html.contains("Not queued: datasets: ") && html.contains("/no/such/export"),
+            "{html}"
+        );
+        let (_, _, b) = call(
+            &state,
+            post_form(
+                "/training/queue",
+                &format!("model=yolo26n&dataset={enc}&install_dir=%2Fno%2Fsuch%2Fdir"),
+                true,
+            ),
+        )
+        .await;
+        let html = String::from_utf8(b).unwrap();
+        assert!(
+            html.contains("Not queued: install the model in: "),
+            "{html}"
+        );
+        // The training folder: shown, set to a folder under the data root, back to the default
+        // (once the process's queue is idle: another test's job may still run).
+        assert!(page.contains("action=\"/training/dir\""));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while SERVICE.get().is_some_and(|s| s.busy()) {
+            assert!(std::time::Instant::now() < deadline, "the queue stays busy");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let runs = root.join("my-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let (s, _, b) = call(
+            &state,
+            post_form("/training/dir", "training_dir=my-runs", true),
+        )
+        .await;
+        let html = String::from_utf8(b).unwrap();
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains("stay there (not moved)"), "{html}");
+        let runs = super::super::browse::plain(&runs.canonicalize().unwrap());
+        assert_eq!(state.config_read().training.dir, Some(runs.clone()));
+        assert_eq!(crate::training::training_dir(&state.config_read()), runs);
+        let (_, _, b) = call(
+            &state,
+            post_form("/training/dir", "training_dir=%2Fno%2Fsuch%2Fdir", true),
+        )
+        .await;
+        assert!(
+            String::from_utf8(b)
+                .unwrap()
+                .contains("Not saved: training folder: ")
+        );
+        assert!(state.config_read().training.dir.is_some());
+        let (_, _, _) = call(&state, post_form("/training/dir", "training_dir=", true)).await;
+        assert_eq!(state.config_read().training.dir, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

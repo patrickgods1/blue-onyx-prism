@@ -4,6 +4,7 @@
 //! stage, progress, log tail, dataset counts, the installed model, the benchmark) is kept in
 //! memory and saved to `<training dir>/runs.json`, so the Training page shows past runs after a
 //! restart; a run that was queued or running when the process stopped is marked interrupted.
+//! While idle the queue can move to another training folder ([`TrainingService::set_store`]).
 //! Footage imports and auto-label runs ([`super::task::Task`]) go through the same queue and
 //! thread (one GPU job at a time); their records are kept in `tasks.json`.
 
@@ -213,13 +214,29 @@ struct Inner {
     changed: Condvar,
     current: Mutex<Option<(String, Arc<AtomicBool>)>>,
     cancelled: Mutex<HashSet<String>>,
-    store: Option<PathBuf>,
-    /// Serializes snapshot + write, so the file always ends with the latest state.
+    /// `runs.json` and `tasks.json` beside it (None = memory only); moved by
+    /// [`TrainingService::set_store`] while idle.
+    stores: Mutex<Stores>,
+    /// Serializes snapshot + write, so the file always ends with the latest state (and a
+    /// store move never splits an update from its write).
     persist_lock: Mutex<()>,
     stop: AtomicBool,
     tasks: Mutex<Vec<TaskRecord>>,
-    /// `tasks.json` beside `store`.
-    tasks_store: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Stores {
+    runs: Option<PathBuf>,
+    tasks: Option<PathBuf>,
+}
+
+impl Stores {
+    fn new(runs: Option<PathBuf>) -> Self {
+        Self {
+            tasks: runs.as_deref().map(task::tasks_file),
+            runs,
+        }
+    }
 }
 
 impl Inner {
@@ -233,11 +250,24 @@ impl Inner {
     }
 
     fn persist(&self) {
-        if let Some(p) = &self.store {
-            let _order = self.persist_lock.lock_recover();
+        let _order = self.persist_lock.lock_recover();
+        self.write_runs();
+    }
+
+    /// Write the runs (the caller holds `persist_lock`).
+    fn write_runs(&self) {
+        if let Some(p) = self.stores.lock_recover().runs.clone() {
             let runs = self.runs.lock_recover().clone();
-            save_records(p, &runs);
+            save_records(&p, &runs);
         }
+    }
+
+    /// [`Self::update`] and [`Self::persist`] as one step: a record that stops being busy is
+    /// written before the store can move.
+    fn update_persist(&self, id: &str, f: impl FnOnce(&mut RunRecord)) {
+        let _order = self.persist_lock.lock_recover();
+        self.update(id, f);
+        self.write_runs();
     }
 
     fn update_task(&self, id: &str, f: impl FnOnce(&mut TaskRecord)) {
@@ -250,11 +280,23 @@ impl Inner {
     }
 
     fn persist_tasks(&self) {
-        if let Some(p) = &self.tasks_store {
-            let _order = self.persist_lock.lock_recover();
+        let _order = self.persist_lock.lock_recover();
+        self.write_tasks();
+    }
+
+    /// Write the tasks (the caller holds `persist_lock`).
+    fn write_tasks(&self) {
+        if let Some(p) = self.stores.lock_recover().tasks.clone() {
             let tasks = self.tasks.lock_recover().clone();
-            task::save_records(p, &tasks);
+            task::save_records(&p, &tasks);
         }
+    }
+
+    /// [`Self::update_task`] and [`Self::persist_tasks`] as one step.
+    fn update_persist_task(&self, id: &str, f: impl FnOnce(&mut TaskRecord)) {
+        let _order = self.persist_lock.lock_recover();
+        self.update_task(id, f);
+        self.write_tasks();
     }
 }
 
@@ -274,7 +316,7 @@ pub struct TrainingService {
 impl std::fmt::Debug for TrainingService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TrainingService")
-            .field("store", &self.inner.store)
+            .field("store", &self.inner.stores.lock_recover().runs)
             .finish_non_exhaustive()
     }
 }
@@ -292,9 +334,10 @@ impl TrainingService {
         hooks: Arc<dyn Hooks>,
         store: Option<PathBuf>,
     ) -> Arc<Self> {
-        let runs = store.as_deref().map(load_records).unwrap_or_default();
-        let tasks_store = store.as_deref().map(task::tasks_file);
-        let tasks = tasks_store
+        let stores = Stores::new(store);
+        let runs = stores.runs.as_deref().map(load_records).unwrap_or_default();
+        let tasks = stores
+            .tasks
             .as_deref()
             .map(task::load_records)
             .unwrap_or_default();
@@ -306,11 +349,10 @@ impl TrainingService {
             changed: Condvar::new(),
             current: Mutex::new(None),
             cancelled: Mutex::new(HashSet::new()),
-            store,
+            stores: Mutex::new(stores),
             persist_lock: Mutex::new(()),
             stop: AtomicBool::new(false),
             tasks: Mutex::new(tasks),
-            tasks_store,
         });
         let (tx, rx) = crossbeam_channel::unbounded();
         let worker = Arc::clone(&inner);
@@ -323,6 +365,42 @@ impl TrainingService {
             tx,
             thread: Mutex::new(Some(thread)),
         })
+    }
+
+    /// The `runs.json` the queue keeps (None = memory only).
+    pub fn store(&self) -> Option<PathBuf> {
+        self.inner.stores.lock_recover().runs.clone()
+    }
+
+    /// Keep the runs in `store` (and `tasks.json` beside it) from now on: the records shown
+    /// become that folder's (loaded like at start); the old folder's files stay where they are.
+    /// `Ok(false)` when it already is the store; refused while a run or task is queued or
+    /// running (its records belong to the old folder).
+    pub fn set_store(&self, store: &Path) -> Result<bool, String> {
+        let _order = self.inner.persist_lock.lock_recover();
+        let mut runs = self.inner.runs.lock_recover();
+        let mut tasks = self.inner.tasks.lock_recover();
+        let mut stores = self.inner.stores.lock_recover();
+        if stores.runs.as_deref() == Some(store) {
+            return Ok(false);
+        }
+        if runs.iter().any(|r| r.state.is_busy()) || tasks.iter().any(|r| r.state.is_busy()) {
+            return Err(
+                "a training run, import or auto-label job is queued or running; wait for it or \
+                 cancel it first"
+                    .into(),
+            );
+        }
+        *stores = Stores::new(Some(store.to_path_buf()));
+        *runs = load_records(store);
+        *tasks = stores
+            .tasks
+            .as_deref()
+            .map(task::load_records)
+            .unwrap_or_default();
+        drop((stores, tasks, runs));
+        self.inner.changed.notify_all();
+        Ok(true)
     }
 
     /// Queue a run. Refused while another queued or running run trains the same model name.
@@ -425,11 +503,10 @@ impl TrainingService {
             return match st {
                 RunState::Queued => {
                     self.inner.cancelled.lock_recover().insert(id.to_string());
-                    self.inner.update_task(id, |r| {
+                    self.inner.update_persist_task(id, |r| {
                         r.state = RunState::Cancelled;
                         r.finished = Some(now());
                     });
-                    self.inner.persist_tasks();
                     true
                 }
                 RunState::Running => self.flag_current(id),
@@ -442,11 +519,10 @@ impl TrainingService {
         match st {
             RunState::Queued => {
                 self.inner.cancelled.lock_recover().insert(id.to_string());
-                self.inner.update(id, |r| {
+                self.inner.update_persist(id, |r| {
                     r.state = RunState::Cancelled;
                     r.finished = Some(now());
                 });
-                self.inner.persist();
                 true
             }
             RunState::Running => self.flag_current(id),
@@ -651,7 +727,7 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
         match result {
             Ok(out) => {
                 tracing::info!(run = %id, model = %job.name, "training finished in {:.0} s: {}", started.elapsed().as_secs_f64(), out.output.onnx.display());
-                inner.update(&id, |r| {
+                inner.update_persist(&id, |r| {
                     r.state = RunState::Done;
                     r.percent = 100;
                     r.output = Some(out.output);
@@ -665,14 +741,14 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                 cancelled: true, ..
             }) => {
                 tracing::warn!(run = %id, "training cancelled");
-                inner.update(&id, |r| {
+                inner.update_persist(&id, |r| {
                     r.state = RunState::Cancelled;
                     r.finished = Some(now());
                 });
             }
             Err(e) => {
                 tracing::warn!(run = %id, "training failed{}: {}", e.stage.map(|s| format!(" while {}", s.label())).unwrap_or_default(), e.message);
-                inner.update(&id, |r| {
+                inner.update_persist(&id, |r| {
                     r.state = RunState::Failed;
                     r.stage = e.stage;
                     r.error = Some(e.message);
@@ -680,7 +756,6 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                 });
             }
         }
-        inner.persist();
         if inner.stop.load(Ordering::Relaxed) {
             return;
         }
@@ -742,7 +817,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
     match result {
         Ok(out) => {
             tracing::info!(job = %id, "{} finished in {:.0} s: {}", t.kind().as_str(), started.elapsed().as_secs_f64(), out.summary);
-            inner.update_task(&id, |r| {
+            inner.update_persist_task(&id, |r| {
                 r.state = RunState::Done;
                 r.percent = 100;
                 r.summary = Some(out.summary);
@@ -756,19 +831,18 @@ fn run_task(inner: &Inner, t: &dyn Task) {
                 || flag.load(Ordering::Relaxed) =>
         {
             tracing::warn!(job = %id, "{} cancelled", t.kind().as_str());
-            inner.update_task(&id, |r| {
+            inner.update_persist_task(&id, |r| {
                 r.state = RunState::Cancelled;
                 r.finished = Some(now());
             });
         }
         Err(e) => {
             tracing::warn!(job = %id, "{} failed: {e:#}", t.kind().as_str());
-            inner.update_task(&id, |r| {
+            inner.update_persist_task(&id, |r| {
                 r.state = RunState::Failed;
                 r.error = Some(format!("{e:#}"));
                 r.finished = Some(now());
             });
         }
     }
-    inner.persist_tasks();
 }

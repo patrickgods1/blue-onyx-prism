@@ -256,6 +256,9 @@ pub struct LiveSettings {
     pub preprocess: crate::model::enhance::PreprocessModes,
     /// Served model that night / IR frames are forwarded to (`night_model`); None = run here.
     pub night_model: Option<String>,
+    /// The threshold on night / IR frames run here (`night_threshold`), replacing the device's
+    /// ([`Self::threshold_for_scene`]); None = the same as by day.
+    pub night_threshold: Option<f32>,
     /// Verifier cascade (`verify`, the model's own over the global one; None = off, and
     /// always None for the verifier model itself).
     pub verify: Option<crate::verify::VerifyConfig>,
@@ -293,8 +296,22 @@ impl LiveSettings {
                 .map(str::trim)
                 .filter(|n| !n.is_empty())
                 .map(str::to_string),
+            night_threshold: m.night_threshold,
             verify: verify_settings(config, m),
             collect: Arc::new(crate::collect::CollectSettings::for_config(config)),
+        }
+    }
+
+    /// [`Self::threshold_for`] on a frame of `scene`: a night / IR frame uses `night_threshold`
+    /// when set (lower or higher than the day value).
+    pub fn threshold_for_scene(
+        &self,
+        device: &str,
+        scene: crate::image_stats::Scene,
+    ) -> (f32, ThresholdSource) {
+        match self.night_threshold {
+            Some(t) if scene.is_night() => (t, ThresholdSource::Night),
+            _ => self.threshold_for(device),
         }
     }
 
@@ -1098,6 +1115,35 @@ mod tests {
             ..ModelConfig::default()
         };
         LiveSettings::for_model(&Config::default(), &m)
+    }
+
+    #[test]
+    fn night_threshold_replaces_the_threshold_on_night_and_ir_frames() {
+        use crate::image_stats::Scene;
+        let mut l = profiled(Some(0.5), &[("ort:coreml", 0.45)]);
+        // Off: every scene uses the day value.
+        assert_eq!(l.threshold_for_scene("ort:coreml", Scene::Ir).0, 0.45);
+        l.night_threshold = Some(0.3);
+        assert_eq!(
+            l.threshold_for_scene("ort:coreml", Scene::Day),
+            (0.45, ThresholdSource::Device("ort:coreml".into()))
+        );
+        // Lower than the profile and the model value at night and on IR frames.
+        for s in [Scene::Night, Scene::Ir] {
+            assert_eq!(
+                l.threshold_for_scene("ort:coreml", s),
+                (0.3, ThresholdSource::Night)
+            );
+            assert_eq!(l.threshold_for_scene("openvino:cpu", s).0, 0.3);
+        }
+        // A request's `min_confidence` still wins.
+        assert_eq!(effective_threshold(0.6, 0.3), 0.6);
+        let m = ModelConfig {
+            night_threshold: Some(0.7),
+            ..ModelConfig::default()
+        };
+        let l = LiveSettings::for_model(&Config::default(), &m);
+        assert_eq!(l.threshold_for_scene("", Scene::Night).0, 0.7);
     }
 
     #[test]

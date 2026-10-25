@@ -696,7 +696,8 @@ fn card_model<'a>(
 
 /// The Models card over the current config `c`, applied as submitted: `enabled` (repeated; the
 /// listed models are enabled, the others disabled), `default_model`, `device.<name>` ("" =
-/// global), the thresholds and `night.<name>` (the night model, "" = none).
+/// global), the thresholds and `night.<name>` (the night model, "" = none; `@self` = this
+/// model with `night_threshold.<name>` on night / IR frames).
 ///
 /// Thresholds: `threshold.<name>` with a non-empty `threshold_key.<name>` (the device the cell
 /// shows) sets the model's confidence profile for that device (`device_thresholds`; "" removes
@@ -765,9 +766,23 @@ pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> any
         let Some(name) = k.strip_prefix("night.") else {
             continue;
         };
-        let m = card_model(c, name)?;
         let v = v.trim();
-        m.night_model = (!v.is_empty()).then(|| v.to_string());
+        let night_threshold = if v == super::config_page::NIGHT_SELF {
+            let key = format!("night_threshold.{name}");
+            let raw = field(form, &key).next().unwrap_or("");
+            let t = parse_card_threshold(name, "night threshold", raw, "to turn it off")?;
+            Some(t.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "night threshold for '{name}': give the threshold for night / IR frames \
+                     (0 to 1), or choose none in the Night model column"
+                )
+            })?)
+        } else {
+            None
+        };
+        let m = card_model(c, name)?;
+        m.night_model = (!v.is_empty() && night_threshold.is_none()).then(|| v.to_string());
+        m.night_threshold = night_threshold;
     }
     validate_config(c)
 }

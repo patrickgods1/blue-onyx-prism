@@ -180,11 +180,29 @@ pub fn plan_job(
         .unwrap_or_else(|| request.recipe.default_name(night, &stamp));
     recipe::valid_model_name(&name)?;
     let paths = TrainPaths::for_config(config);
-    if paths.export.models.join(format!("{name}.onnx")).exists() {
+    request.install_dir = request
+        .install_dir
+        .take()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| config.data_path(&d))
+        .filter(|d| *d != paths.export.models);
+    if let Some(d) = &request.install_dir
+        && d.exists()
+        && !d.is_dir()
+    {
         bail!(
-            "{} exists; choose another model name",
-            paths.export.models.join(format!("{name}.onnx")).display()
+            "install the model in: {} is not a folder; choose a folder or leave it empty for the \
+             models folder",
+            d.display()
         );
+    }
+    let install = request
+        .install_dir
+        .as_deref()
+        .unwrap_or(&paths.export.models)
+        .join(format!("{name}.onnx"));
+    if install.exists() {
+        bail!("{} exists; choose another model name", install.display());
     }
     if config
         .models
@@ -239,6 +257,7 @@ mod tests {
             rename: Default::default(),
             benchmark_sets: Vec::new(),
             allow_large: false,
+            install_dir: None,
         }
     }
 
@@ -268,6 +287,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(named.name, "raccoon-v1");
+    }
+
+    #[test]
+    fn plan_job_resolves_the_install_folder() {
+        let c = Config {
+            download_dir: Some("/data".into()),
+            ..Config::default()
+        };
+        let root = c.data_root();
+        let models = TrainPaths::for_config(&c).export.models;
+        // Default: the models folder.
+        let j = plan_job(&c, request(TrainFamily::Yolo26, "n"), &mac(), None).unwrap();
+        assert_eq!(j.request.install_dir, None);
+        assert_eq!(j.install_dir(), models.as_path());
+        // Relative: under the data root; absolute as given.
+        let mut r = request(TrainFamily::Yolo26, "n");
+        r.install_dir = Some("custom/models".into());
+        let j = plan_job(&c, r, &mac(), None).unwrap();
+        assert_eq!(j.install_dir(), root.join("custom").join("models"));
+        let abs = std::env::temp_dir().join("bop-install-elsewhere");
+        let mut r = request(TrainFamily::Yolo26, "n");
+        r.install_dir = Some(abs.clone());
+        assert_eq!(plan_job(&c, r, &mac(), None).unwrap().install_dir(), abs);
+        // The models folder itself or an empty path: the default.
+        for d in [models.clone(), PathBuf::new()] {
+            let mut r = request(TrainFamily::Yolo26, "n");
+            r.install_dir = Some(d);
+            assert_eq!(
+                plan_job(&c, r, &mac(), None).unwrap().request.install_dir,
+                None
+            );
+        }
+        // An existing model of that name in the chosen folder is refused; a file is no folder.
+        let dir = std::env::temp_dir().join(format!("bop-install-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("taken.onnx"), b"x").unwrap();
+        let mut r = request(TrainFamily::Yolo26, "n");
+        r.install_dir = Some(dir.clone());
+        let e = plan_job(&c, r, &mac(), Some("taken".into())).unwrap_err();
+        assert!(e.to_string().contains("taken.onnx exists"), "{e}");
+        let mut r = request(TrainFamily::Yolo26, "n");
+        r.install_dir = Some(dir.join("taken.onnx"));
+        let e = plan_job(&c, r, &mac(), None).unwrap_err();
+        assert!(e.to_string().contains("is not a folder"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

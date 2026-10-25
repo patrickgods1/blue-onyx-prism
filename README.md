@@ -284,11 +284,11 @@ it; every key can also be set in the file.
 | `gpu_index` | `0` | GPU to use when several are present. Integer 0-64. Applies: restart. UI: yes |
 | `force_cpu` | `false` | Always use the CPU (overrides every per-model device). Boolean. Applies: restart. UI: yes |
 | `cache_dir` | `"cache"` | Compiled-model cache; `""` disables it. Path. Applies: restart. UI: yes |
-| `openvino_dir` | `null` | OpenVINO runtime dir; default `<exe_dir>/openvino`, else the system install. Path. Applies: restart. UI: no |
-| `onnxruntime_dir` | `null` | ONNX Runtime dir (user-managed, never replaced); lookup order: this field, `ORT_DYLIB_PATH`, `onnxruntime/<flavor>/` named by `onnxruntime/active.txt`, `onnxruntime/` itself (older installs), any `onnxruntime/<flavor>/`. Path. Applies: process restart (a process loads one ONNX Runtime). UI: no |
+| `openvino_dir` | `null` | OpenVINO runtime dir; default `<exe_dir>/openvino`, else the system install. Path (relative = under the exe dir). Applies: restart. UI: yes (Server, Folders) |
+| `onnxruntime_dir` | `null` | ONNX Runtime dir (user-managed, never replaced); lookup order: this field, `ORT_DYLIB_PATH`, `onnxruntime/<flavor>/` named by `onnxruntime/active.txt`, `onnxruntime/` itself (older installs), any `onnxruntime/<flavor>/`. Path (relative = under the exe dir). Applies: process restart (a process loads one ONNX Runtime). UI: yes (Server, Folders) |
 | `auto_download` | `true` | Download missing runtimes and models at startup; see [First run](#first-run). Boolean. Applies: restart. UI: yes |
 | `allow_large_downloads` | `false` | Allow downloads over 500 MB (NVIDIA CUDA libraries). Boolean. Applies: restart. UI: yes |
-| `download_dir` | `null` | Root for downloaded runtimes and relative model paths (default: the executable's directory). Path. Applies: restart. UI: no |
+| `download_dir` | `null` | Root for downloaded runtimes and relative model paths (default: the executable's directory). Path. Applies: restart. Files already downloaded are not moved. UI: yes (Server, Folders) |
 | `confidence_threshold` | `0.5` | Default minimum confidence (a request's `min_confidence` > 0 overrides it). Number 0-1. Applies: at once. UI: yes |
 | `nms_iou` | `0.5` | IoU threshold for NMS-based families. Number 0-1. Applies: at once. UI: yes |
 | `object_filter` | `[]` | Only report these labels (case-insensitive); empty = all. List of strings. Applies: at once. UI: yes |
@@ -311,7 +311,7 @@ it; every key can also be set in the file.
 | `collect.dedup_hamming` | `6` | A frame whose 64-bit dHash is within this many bits of a frame of the same camera saved in the last 10 minutes is dropped as a near duplicate (0-32). Applies: at once. UI: Dataset page |
 | `collect.classes` | person, car, bicycle, motorcycle, truck, dog, cat, raccoon, opossum, skunk, fox, deer, squirrel, bird | Class list of the Review page and the label exports (YOLO class ids and COCO category ids follow this order; 1-200 unique names). Reviewed frames record its fingerprint (`classes_version`); a frame with a training label outside the list is left out of exports. Applies: at once. UI: Review page |
 | `training` | defaults | Model training ([docs/TRAINING.md](docs/TRAINING.md)): where runs go, the review exports offered, dataset defaults. Read when a run is queued. Applies: at once. UI: Training page |
-| `training.dir` | `null` | Folder of the training runs (prepared dataset, `train.log`, held-out benchmark set, `runs.json`); `null` = `training` under the data folder; relative paths resolve there. Applies: at once. UI: config file |
+| `training.dir` | `null` | Folder of the training runs (prepared dataset, `train.log`, held-out benchmark set, `runs.json`); `null` = `training` under the data folder; relative paths resolve there. Applies: at once (refused on the page while a training job is queued or running; old runs stay in the old folder). UI: Training page (This machine) |
 | `training.datasets` | `[]` | Review export folders (YOLO layout) offered on the Training page and used by `train run` without `--dataset`. Applies: at once. UI: Training page |
 | `training.epochs` | `50` | Default epochs of a run (1-1000). Applies: at once. UI: Training page |
 | `training.negative_share` | `0.15` | Share of frames without objects (hard negatives) kept in the training split; extra empty frames are dropped, too few give a warning (0-0.9). Applies: at once. UI: config file |
@@ -333,9 +333,9 @@ it; every key can also be set in the file.
 | `inflight` | `0` | Concurrent inferences per model; 0 = from the hardware profile and the model's device. A model's own `inflight` wins. Integer 0-64. Applies: restart. UI: no |
 | `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model; 0 = from the hardware profile (2 with a discrete GPU of at least 4 GB and 8 GB of memory, so the GPU overlaps one request's compute with the other's copy and NMS; else 1). Integer 0-16. Applies: restart. UI: no |
 | `hardware_profile` | `"auto"` | Hardware class the `0` defaults above come from: `auto` (classified from cores, RAM and GPUs) or forced `low`, `mid`, `high`. Applies: restart. UI: no |
-| `models_dir` | `"models"` | Where `download-models` and exports put files. Path, must not be empty. Applies: restart. UI: yes |
+| `models_dir` | `"models"` | Where `download-models` and exports put files (relative = under the data root). Path; empty on the Config page = `models`. Applies: restart. Files already there are not moved. UI: yes (Server, Folders) |
 | `default_model` | `null` | Model serving `/v1/vision/detection`; default = first enabled entry. Model name. Applies: at once. UI: yes (Models card) |
-| `models` | `[]` | Model list; per-entry keys in [Multiple models](#multiple-models). Applies: per key, see there. UI: yes (Models card, Models JSON) |
+| `models` | `[]` | Model list; per-entry keys in [Multiple models](#multiple-models). Applies: per key, see there. UI: yes (Models card, Models JSON; a new or changed `path` / `classes` there must be inside the data root, models or download folder or home folder, or picked with Browse...) |
 | `benchmark` | see [Per-model devices and benchmarking](#per-model-devices-and-benchmarking) | Benchmark defaults (`benchmark.*` keys, listed there). Applies: at once (read when a benchmark starts). UI: yes (Benchmark page, **Save as default**) |
 
 ## Blue Iris setup
@@ -548,6 +548,7 @@ and the default model; every key is in the *Models JSON* under it):
 | `label_thresholds`, `night_label_thresholds` | absent | Per-model label thresholds, merged over the global ones (this model's entries win; `0` turns a global entry off). Applies: at once. UI: Models JSON |
 | `preprocess`, `night_preprocess` | absent | Per-model image enhancement (see the global keys); absent = the global value, `"none"` turns a global mode off for this model. Applies: at once. UI: Models JSON |
 | `night_model` | absent | Name of another configured model that answers this model's night / IR frames (same scene test as `night_confidence_threshold`): the frame is decoded once and handed to that model's worker, which applies its own threshold, night rules and object filter; the response names its execution provider and timings, otherwise unchanged. Falls back to this model (`night_model_fallback_total{reason}`, a throttled warning) while the night model is not served, not loaded or busy. It must not have a `night_model` itself; it may be disabled (then it always falls back). Applies: at once. UI: yes (Models card *Night model*) |
+| `night_threshold` | absent | This model's confidence threshold on night / IR frames (same scene test), replacing its threshold and device profile there: lower or higher, unlike `night_confidence_threshold`, which only raises it. The Models card's Night model column sets it with *same model, night threshold*. On frames forwarded to a `night_model`, that model's own value applies. Number 0-1. Applies: at once. |
 | `verify` | absent | Per-model verifier cascade (see the global key); absent = the global value, a set value replaces it, `{"enabled": false}` turns a global one off for this model. `model` must name another configured model (it may be disabled: then candidates stay unverified). Two models may verify each other. If a frame goes to the `night_model`, the night model's `verify` applies. Applies: at once. UI: Models JSON |
 
 - Names: `name`, else the file stem. Matching is case-insensitive and a `.onnx`/`.xml` suffix is ignored,
@@ -597,7 +598,9 @@ Or open **Benchmark** in the web UI: choose datasets, models, devices and settin
 (runs in the background, one run at a time, cancelable, live progress and ETA), then **Use <device>**
 per row or **Apply recommended devices to all models** (offers a restart). Benchmarking while serving
 competes for the CPU/GPU with live requests. Results go to `benchmark.json` next to the config file;
-the CLI and the UI read and write the same file.
+the CLI and the UI read and write the same file (it stays there: `auto` device ordering reads it).
+**Advanced > Save report** writes the same standalone HTML report as `--report` into a folder you choose
+(Browse...) as `benchmark-report-<UTC time>.html`; a folder added as a dataset must also be browsable or picked.
 
 - **Datasets** (`benchmark.datasets`, CLI `--dataset`): the built-in, pinned and SHA-256-checked sets
   `coco-cctv` (COCO val2017 CCTV-relevant subset, 180 images), `bmd45-cctv` (real 1080p CCTV,
@@ -946,6 +949,7 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
+| POST | `/v1/benchmark/report` | `dir`: write the HTML report of the saved results there as `benchmark-report-<UTC time>.html` (folder inside the browsable folders or natively picked); `{success, path}`, 404 without results |
 | POST | `/v1/benchmark/apply` | `model` + `device` (`""`/`global` clears it), or `all=1` for every saved recommendation; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable; a following `device` writes that device's profile instead, `threshold=none` removes it), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-profiles` | one config change: `all=1` (optionally with repeated `model`) saves the best confidence of every measured device, `use=<device>\|<model>` sets a device, `profile=<device>\|<0.xx or none>\|<model>` sets or removes one profile; answers `changes`, `undo` (form pairs that restore the previous values), `needsRestart` |

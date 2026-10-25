@@ -169,6 +169,7 @@ fn field_label(field: &str) -> String {
         "preprocess" => "preprocess".into(),
         "night_preprocess" => "night preprocess".into(),
         "night_model" => "night model".into(),
+        "night_threshold" => "night threshold (same model)".into(),
         "verify" => "verifier".into(),
         other => other.replace('_', " "),
     }
@@ -448,6 +449,7 @@ pub const LIVE_MODEL_FIELDS: &[&str] = &[
     "device_thresholds",
     "object_filter",
     "night_model",
+    "night_threshold",
     "night_confidence_threshold",
     "label_thresholds",
     "night_label_thresholds",

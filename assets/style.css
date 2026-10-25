@@ -916,6 +916,8 @@ details.adv > .card { margin-left: 0; margin-right: 0; }
    (config.html: details.thr-profiles > ul.thr-profile-list; .profiles is the generic form). */
 td.model-thr input.thr-input { width: 11ch; }
 td.model-thr input.thr-default { width: 6ch; }
+td.model-night input.night-thr { width: 7ch; margin-top: 0.25rem; display: block; }
+td.model-night input.night-thr[hidden] { display: none; }
 details.thr-profiles { margin: 0.25rem 0 0; font-size: 0.85rem; }
 details.thr-profiles > summary { font-size: 0.8rem; color: var(--muted); cursor: pointer; }
 details.thr-profiles > p { margin: 0.2rem 0; }
