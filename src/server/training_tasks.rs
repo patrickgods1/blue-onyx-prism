@@ -146,6 +146,7 @@ pub(crate) fn import_from_form(f: &[(String, String)]) -> anyhow::Result<ImportR
     r.license = field(f, "license").map(str::to_string);
     r.license_confirmed = field(f, "confirm_license").is_some();
     r.allow_large = field(f, "confirm_large").is_some();
+    r.out_dir = field(f, "out_dir").map(PathBuf::from);
     r.validate()?;
     Ok(r)
 }
@@ -245,15 +246,30 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
                     .map_err(|e| anyhow::anyhow!("{}", e.into_parts().1))?;
                 req.source = ImportSource::Path(allowed);
             }
+            if let Some(d) = &req.out_dir {
+                // The same check: a browsable folder or one picked in the native dialog.
+                let allowed = super::browse::allowed_path(&config, &d.to_string_lossy())
+                    .map_err(|e| anyhow::anyhow!("save frames to: {}", e.into_parts().1))?;
+                req.out_dir = Some(allowed);
+            }
             let cap = crate::training::capability_now();
             let job = crate::training::import::plan_import(&config, req, &cap)?;
             let title = crate::training::task::Task::title(&job);
+            let shown = job.dataset_dir == crate::collect::CollectSettings::for_config(&config).dir;
+            let out = job.dataset_dir.display().to_string();
             service(&shared)
                 .enqueue_task(Box::new(job))
                 .map_err(anyhow::Error::msg)?;
-            Ok(format!(
-                "Queued: {title}. The frames appear on the Dataset and Review pages when it is done."
-            ))
+            Ok(if shown {
+                format!(
+                    "Queued: {title}. The frames appear on the Dataset and Review pages when it is done."
+                )
+            } else {
+                format!(
+                    "Queued: {title}. The frames are written to {out}; to review them, choose that \
+                     folder on the Review page."
+                )
+            })
         })();
         match result {
             Ok(m) => render(&view(&state, Some(m), None)),
@@ -429,7 +445,9 @@ mod tests {
             crate::training::import::DEFAULT_MAX_CANDIDATES
         );
         let r = import_from_form(&form(&[("path", "clips"), ("max_candidates", "300")])).unwrap();
-        assert_eq!(r.max_candidates, 300);
+        assert_eq!((r.max_candidates, r.out_dir), (300, None));
+        let r = import_from_form(&form(&[("path", "clips"), ("out_dir", "/data/frames")])).unwrap();
+        assert_eq!(r.out_dir, Some(PathBuf::from("/data/frames")));
         let e = import_from_form(&form(&[("path", "x"), ("max_candidates", "0")])).unwrap_err();
         assert!(e.to_string().contains("max candidates"), "{e}");
         let e = import_from_form(&form(&[("path", "x"), ("max_candidates", "x")])).unwrap_err();
@@ -539,6 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_forms_answer_with_the_page() {
+        let _queue = super::super::training::QUEUE_TEST_LOCK.lock().await;
         use crate::server::test_util::{call, get_text, post_form, test_state_with};
         use axum::http::StatusCode;
         let root = std::env::temp_dir().join(format!("bop-train-tasks-{}", uuid::Uuid::new_v4()));
@@ -686,6 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_autolabel_form_answers_json_when_asked() {
+        let _queue = super::super::training::QUEUE_TEST_LOCK.lock().await;
         use crate::server::test_util::{call, test_state_with};
         use axum::body::Body;
         use axum::http::Request;

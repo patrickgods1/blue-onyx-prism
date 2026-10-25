@@ -412,6 +412,16 @@ pub struct ModelConfig {
     /// the night model is not served or not ready. Applies at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub night_model: Option<String>,
+    /// This model's confidence threshold on night / IR frames, replacing its threshold (and its
+    /// device profile) there: lower or higher, unlike `night_confidence_threshold`, which only
+    /// raises it. The "same model, other threshold" choice of the Night model column; on frames
+    /// forwarded to a `night_model`, that model's own value applies. None = off. Kept rounded
+    /// to 2 decimals. Applies at once.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "thr::ser_opt_clean"
+    )]
+    pub night_threshold: Option<f32>,
     /// Verifier cascade ([`crate::verify`]): another configured model checks this model's
     /// candidate boxes; None = the global `verify`. Applies at once.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -443,6 +453,7 @@ impl Default for ModelConfig {
             preprocess: None,
             night_preprocess: None,
             night_model: None,
+            night_threshold: None,
             verify: None,
         }
     }
@@ -527,6 +538,8 @@ pub enum ThresholdSource {
     Model,
     /// The global `confidence_threshold`.
     Global,
+    /// The model's `night_threshold` (a night / IR frame).
+    Night,
 }
 
 impl ThresholdSource {
@@ -536,6 +549,7 @@ impl ThresholdSource {
             ThresholdSource::Device(d) => format!("profile for {d}"),
             ThresholdSource::Model => "model".into(),
             ThresholdSource::Global => "global".into(),
+            ThresholdSource::Night => "night threshold".into(),
         }
     }
 }
@@ -1320,6 +1334,10 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
     }
     validate_night_models(models)?;
     for m in models {
+        if let Some(t) = m.night_threshold {
+            let key = crate::registry::normalize_name(&m.effective_name());
+            check_threshold(&format!("models: '{key}' night_threshold"), t)?;
+        }
         if let Some(v) = &m.verify {
             let key = crate::registry::normalize_name(&m.effective_name());
             let field = format!("models: '{key}' verify");
@@ -1396,8 +1414,9 @@ pub fn validate_night_models(models: &[ModelConfig]) -> Result<()> {
         let nkey = normalize_name(night);
         if nkey == key {
             bail!(
-                "{field}: names the model itself; name another configured model (e.g. one \
-                 trained on IR frames) or remove the key"
+                "{field}: names the model itself; to run night / IR frames on this model with \
+                 another threshold set its night_threshold instead (Models card: Night model, \
+                 same model), or name another configured model (e.g. one trained on IR frames)"
             );
         }
         let Some(target) = night_of(&nkey) else {
@@ -2418,6 +2437,27 @@ mod tests {
         let back: ModelConfig =
             serde_json::from_str(&serde_json::to_string(&ok[0]).unwrap()).unwrap();
         assert_eq!(back.night_model.as_deref(), Some("Night.onnx"));
+    }
+
+    #[test]
+    fn night_threshold_validates_and_round_trips() {
+        let m = |t: Option<f32>| ModelConfig {
+            name: Some("day".into()),
+            path: "day.onnx".into(),
+            night_threshold: t,
+            ..Default::default()
+        };
+        validate_models(&[m(Some(0.3))]).unwrap();
+        let e = format!("{:#}", validate_models(&[m(Some(1.5))]).unwrap_err());
+        assert!(e.contains("'day' night_threshold"), "{e}");
+        assert!(
+            !serde_json::to_string(&m(None))
+                .unwrap()
+                .contains("night_threshold")
+        );
+        let back: ModelConfig =
+            serde_json::from_str(&serde_json::to_string(&m(Some(0.3))).unwrap()).unwrap();
+        assert_eq!(back.night_threshold, Some(0.3));
     }
 
     #[test]

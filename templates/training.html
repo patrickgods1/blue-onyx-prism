@@ -21,7 +21,13 @@
   <ul>{% for r in reasons %}<li class="muted">{{ r }}</li>{% endfor %}</ul>
   {% endif %}
   <p class="tr-fact"><span class="k">Training environment</span> {{ env_note }}</p>
-  <p class="tr-fact"><span class="k">Runs folder</span> <code>{{ training_dir }}</code></p>
+  <form method="post" action="/training/dir" class="tr-form" id="training-dir-form">
+    <div class="tr-field">
+      <label for="training-dir">Training folder</label>
+      <div class="with-browse tr-browse"><input type="text" id="training-dir" name="training_dir" value="{{ training_dir_setting }}" autocomplete="off" placeholder="{{ training_dir_default }}"{% if jobs_busy %} disabled{% endif %}><button type="button" class="browse secondary" data-browse="folder" data-target="training_dir" data-title="Choose the training folder" hidden{% if jobs_busy %} disabled{% endif %}>Folder&hellip;</button><button type="submit" class="secondary"{% if jobs_busy %} disabled{% endif %}>Save</button></div>
+      <p class="muted small">Now <code>{{ training_dir }}</code>: the run records (<code>runs.json</code>, <code>tasks.json</code>), prepared datasets, held-out sets, logs, import work and the Review page's exports. Empty = <code>{{ training_dir_default }}</code>. A new folder is used at once; runs, imports and exports in the old folder stay there and are not moved.{% if jobs_busy %} It cannot change while a job is queued or running.{% endif %}</p>
+    </div>
+  </form>
   {% if env_ready %}
   <form method="post" action="/training/remove-env" class="inline"><button type="submit" class="small danger">Remove training environment</button> <span class="muted small">uv and Python stay for the model export</span></form>
   {% endif %}
@@ -112,6 +118,11 @@
     <div class="tr-field tr-narrow">
       <label for="import-frames">Frames to keep</label>
       <input type="number" id="import-frames" name="frames" min="1" max="5000" value="200">
+    </div>
+    <div class="tr-field">
+      <label for="import-out">Save frames to</label>
+      <div class="with-browse tr-browse"><input type="text" id="import-out" name="out_dir" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="out_dir" data-title="Choose where to save the imported frames" hidden>Folder&hellip;</button></div>
+      <p class="muted small">Empty = the dataset folder, shown on the Dataset and Review pages. Another folder gets the same layout (<code>&lt;scene&gt;/&lt;camera&gt;/&lt;date&gt;/</code>, sidecars, review queue); review them by choosing this folder on the Review page.</p>
     </div>
     <details class="tr-more">
       <summary>Sampling options</summary>
@@ -337,6 +348,11 @@
         <input type="text" id="train-name" name="name">
         <p class="muted small" id="train-name-hint">One ticked model only; empty = <code>night-</code>/<code>custom-&lt;model&gt;-&lt;date&gt;</code>.</p>
       </div>
+    </div>
+    <div class="tr-field">
+      <label for="train-install">Install the model in</label>
+      <div class="with-browse tr-browse"><input type="text" id="train-install" name="install_dir" autocomplete="off" placeholder="{{ models_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="install_dir" data-title="Choose where to install the trained model" hidden>Folder&hellip;</button></div>
+      <p class="muted small">Empty = the models folder (<code>{{ models_dir }}</code>). The <code>.onnx</code>, its <code>.yaml</code> classes and <code>.provenance.json</code> go there, and the config entry points at that file.</p>
     </div>
     <label class="check"><input type="checkbox" name="night_aug" id="train-night"> Night augmentation</label>
     <div class="tr-grid" id="train-night-fields">

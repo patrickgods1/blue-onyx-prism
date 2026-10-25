@@ -561,6 +561,28 @@ fn night_rules_and_static_memory_apply_in_the_worker() {
     assert!(h.stop() < SOON);
 }
 
+#[test]
+fn night_threshold_runs_the_same_model_with_another_threshold() {
+    let h = Harness::start(1, Duration::from_secs(30));
+    let live = LiveSettings {
+        request_timeout: Duration::from_secs(30),
+        confidence_threshold: 0.95,
+        night_threshold: Some(0.5),
+        ..LiveSettings::default()
+    };
+    assert!(h.handle.set_live(live));
+    // Day frame: the 0.9 box is under the day threshold.
+    h.script.push([det(0, 0)]);
+    let r = h.send("a.jpg").wait();
+    assert!(r.success && r.predictions.is_empty(), "{r:?}");
+    // IR frame: the lower night threshold keeps it, on this model.
+    h.script.push([det(0, 0)]);
+    let r = h.send_at(gray_jpeg(), "a.jpg", Instant::now()).wait();
+    assert_eq!(label(&r), "c0");
+    assert_eq!(h.script.submits(), 2);
+    assert!(h.stop() < SOON);
+}
+
 /// Live settings of a test model: a long timeout and `night_model`.
 fn live_with_night(night: Option<&str>) -> LiveSettings {
     LiveSettings {

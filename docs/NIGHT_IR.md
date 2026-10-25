@@ -34,6 +34,9 @@ value wins. See the README config table for the exact keys.
   - A person who stands still for the whole window is suppressed too, so it stays opt-in.
 - **`preprocess` / `night_preprocess`:** `none | grayscale | gamma:<g> | clahe[:clip,tiles]`. The night variant
   replaces `preprocess` on night and IR frames.
+- **`night_threshold`** (per model): the same model answers night and IR frames with another confidence threshold, lower
+  or higher than its day threshold or device profile (`night_confidence_threshold` can only raise it). On the Config
+  page: Night model column, *same model, night threshold*. A request's `min_confidence` still wins.
 - **`night_model`:** night and IR frames are handed, already decoded, to another configured model. If that model is not
   available, the frame runs on the original model.
   - Metrics: `night_model_routed_total` and `night_model_fallback_total{reason}`.

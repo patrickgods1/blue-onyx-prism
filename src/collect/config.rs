@@ -208,6 +208,10 @@ pub struct CollectConfig {
     /// root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
+    /// Folder the Review page, its exports and the auto-labeler work on (an import saved
+    /// elsewhere); None = the dataset folder. Relative paths resolve against the data root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_dir: Option<PathBuf>,
     pub buckets: Buckets,
     /// Total size cap of the folder in GB; the oldest frames are deleted first.
     #[serde(serialize_with = "crate::config::thr::ser_clean")]
@@ -226,6 +230,7 @@ impl Default for CollectConfig {
         Self {
             enabled: false,
             dir: None,
+            review_dir: None,
             buckets: Buckets::default(),
             max_gb: DEFAULT_MAX_GB,
             max_age_days: DEFAULT_MAX_AGE_DAYS,
@@ -250,6 +255,20 @@ impl CollectConfig {
         }
     }
 
+    /// The Review page's folder: `review_dir` resolved against `data_root`, or the dataset
+    /// folder ([`Self::resolved_dir`]).
+    pub fn resolved_review_dir(&self, data_root: &Path) -> PathBuf {
+        match self
+            .review_dir
+            .as_deref()
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            Some(d) if d.is_absolute() => d.to_path_buf(),
+            Some(d) => data_root.join(d),
+            None => self.resolved_dir(data_root),
+        }
+    }
+
     /// The size cap in bytes.
     pub fn max_bytes(&self) -> u64 {
         let b = f64::from(self.max_gb.max(0.0)) * 1024.0 * 1024.0 * 1024.0;
@@ -268,6 +287,13 @@ impl CollectConfig {
         use anyhow::bail;
         if let Some(d) = &self.dir {
             crate::config::validate_dir_setting("collect.dir", &d.to_string_lossy(), data_root)?;
+        }
+        if let Some(d) = &self.review_dir {
+            crate::config::validate_dir_setting(
+                "collect.review_dir",
+                &d.to_string_lossy(),
+                data_root,
+            )?;
         }
         if !(self.max_gb.is_finite() && self.max_gb > 0.0 && self.max_gb <= MAX_MAX_GB) {
             bail!(
@@ -420,6 +446,24 @@ mod tests {
         assert_eq!(
             c.resolved_dir(Path::new("/data")),
             Path::new("/data").join("dataset")
+        );
+        assert_eq!(
+            c.resolved_review_dir(Path::new("/data")),
+            Path::new("/data").join("dataset")
+        );
+        let r = CollectConfig {
+            review_dir: Some("imports/drive".into()),
+            ..CollectConfig::default()
+        };
+        assert_eq!(
+            r.resolved_review_dir(Path::new("/data")),
+            Path::new("/data").join("imports/drive")
+        );
+        assert!(!r.is_default());
+        assert!(
+            !serde_json::to_string(&CollectConfig::default())
+                .unwrap()
+                .contains("review_dir")
         );
         assert_eq!(c.max_bytes(), 5 * 1024 * 1024 * 1024);
     }

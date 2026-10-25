@@ -50,7 +50,8 @@
       </details></td>
     <td class="model-night"><select data-key="model:night_model:{{ m.key }}" name="night.{{ m.name }}" aria-label="Night model of {{ m.name }}" title="Night / IR frames of {{ m.name }} are answered by this model (falls back to {{ m.name }} while it is not loaded)">
       {% for d in m.night_models %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}>{{ d.label }}</option>{% endfor %}
-      </select></td>
+      </select>
+      <input type="number" class="night-thr" data-key="model:night_threshold:{{ m.key }}" name="night_threshold.{{ m.name }}" min="0" max="1" step="0.01" value="{{ m.night_threshold }}" placeholder="0.30" aria-label="Confidence threshold of {{ m.name }} on night / IR frames" title="Replaces the threshold of {{ m.name }} on night / IR frames (lower or higher)"{% if !m.night_self %} hidden{% endif %}></td>
     <td class="running st-{{ m.running_class }}"><span class="run-text">{{ m.running }}</span>{% if let Some(d) = m.running_detail %}<details class="run-detail"><summary title="{{ d }}">{{ d }}</summary></details>{% endif %}</td>
     <td class="file"><code title="{{ m.path }}">{{ m.file_name }}</code>{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-export" title="{{ x }}: exported on this machine on request">export it</a>{% else if !m.exists %} <span class="muted">(missing)</span>{% endif %}</td>
     <td class="model-remove-cell"><button type="submit" class="small danger model-remove" form="model-remove" name="name" value="{{ m.name }}" data-confirm="Remove {{ m.name }} from the config? Its files stay; remove them under Resources."{% if m.enabled %} disabled title="Enabled: disable it first (untick Load and save), then remove it"{% else %} title="Remove this entry from the config; its files stay"{% endif %}>Remove</button></td>
@@ -115,7 +116,7 @@
   <form method="post" action="/config#at-models" id="models-json-form">
   <textarea name="models_json" rows="14" spellcheck="false">{{ c.models_json }}</textarea>
   <p class="muted">Merged per model and field with changes made elsewhere (the Models card, Benchmark apply). Each entry: <code>path</code> (required), <code>family</code>, <code>name</code>, <code>classes</code>, <code>device</code>,
-  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>).</p>
+  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>). A new or changed <code>path</code> / <code>classes</code> must be inside the data root, the models or download folder or your home folder (it may not exist yet), or chosen with Browse&hellip; under <a href="#custom-model">Add a model by path</a>.</p>
   <div class="actions"><button type="submit">Save models JSON</button> <span class="form-msg" aria-live="polite"></span></div>
   </form>
 </details>
@@ -224,6 +225,15 @@
     <label>Cache dir (empty disables) <span class="with-browse"><input type="text" name="cache_dir" value="{{ c.cache_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="cache_dir" data-title="Choose the cache folder" hidden>Browse&hellip;</button></span></label>
     <label class="check"><input type="checkbox" name="force_cpu" id="force-cpu"{% if c.force_cpu %} checked{% endif %}> Force CPU (overrides every device setting)</label>
     <p class="muted">"will download" options are fetched on save (models serve on what they can meanwhile; the server restarts once to load a new runtime when it is installed). Unavailable options are greyed out with the reason. Per-model devices: the Models tab. Live list: <a href="/v1/devices"><code>/v1/devices</code></a>.</p>
+  </fieldset>
+
+  <fieldset class="group" id="folders">
+    <legend>Folders {{ self.badge("download_dir,models_dir,onnxruntime_dir,openvino_dir")|safe }}</legend>
+    <label>Download folder (data root; empty = the program folder) <span class="with-browse"><input type="text" name="download_dir" value="{{ c.download_dir }}" placeholder="{{ exe_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="download_dir" data-title="Choose the download folder" hidden>Browse&hellip;</button></span></label>
+    <label>Models folder (empty = <code>models</code> under the data root) <span class="with-browse"><input type="text" name="models_dir" value="{{ c.models_dir }}" placeholder="models"><button type="button" class="browse secondary" data-browse="folder" data-target="models_dir" data-title="Choose the models folder" hidden>Browse&hellip;</button></span></label>
+    <label>ONNX Runtime folder (empty = <code>ORT_DYLIB_PATH</code>, else <code>onnxruntime/</code> in the data root) <span class="with-browse"><input type="text" name="onnxruntime_dir" value="{{ c.onnxruntime_dir }}" placeholder="automatic"><button type="button" class="browse secondary" data-browse="folder" data-target="onnxruntime_dir" data-title="Choose the ONNX Runtime folder" hidden>Browse&hellip;</button></span></label>
+    <label>OpenVINO folder (empty = <code>openvino/</code> in the data root, else the system) <span class="with-browse"><input type="text" name="openvino_dir" value="{{ c.openvino_dir }}" placeholder="automatic"><button type="button" class="browse secondary" data-browse="folder" data-target="openvino_dir" data-title="Choose the OpenVINO folder" hidden>Browse&hellip;</button></span></label>
+    <p class="muted">The data root (now <code>{{ data_root }}</code>) holds downloaded runtimes and models; relative model paths and the models folder (now <code>{{ models_dir }}</code>) are under it. Relative download, ONNX Runtime and OpenVINO folders are under the program folder <code>{{ exe_dir }}</code>. Changing the download or models folder does not move files already downloaded: move them yourself, or download them again. System folders are refused here.</p>
   </fieldset>
 
   <fieldset class="group">

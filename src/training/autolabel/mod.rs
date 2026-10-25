@@ -446,7 +446,7 @@ pub fn plan_autolabel(
     Ok(AutolabelJob {
         work: super::training_dir(config).join("autolabel").join(&id),
         id,
-        dataset_dir: crate::collect::CollectSettings::for_config(config).dir,
+        dataset_dir: config.collect.resolved_review_dir(&config.data_root()),
         synonyms: synonyms(&classes, &config.training.synonyms),
         classes,
         request,

@@ -184,6 +184,15 @@
     <section id="cmp-runs"></section>
   </details>
 
+  <details class="card adv" id="adv-report" data-keep="d:adv-report"><summary>Save report</summary>
+    <p class="muted">Writes a standalone HTML report of the saved results (the same report as <code>benchmark --report</code>) into a folder as <code>benchmark-report-&lt;UTC time&gt;.html</code>. The results themselves stay beside the config (<code>{{ results_file }}</code>), where <code>auto</code> device ordering reads them.</p>
+    <form id="report-form" class="actions">
+      <label>Folder <span class="with-browse"><input type="text" id="report-dir" name="report_dir" placeholder="/path/to/reports"><button type="button" class="browse secondary" data-browse="folder" data-target="report-dir" data-title="Choose a folder for the report" hidden>Browse&hellip;</button></span></label>
+      <button type="button" id="report-save">Save report</button>
+      <span id="report-msg" class="muted" aria-live="polite"></span>
+    </form>
+  </details>
+
   <details class="help"><summary>How grading works</summary>
     <p>Accuracy is AP@0.5, or the frame-level ROC AUC: how well a frame's top confidence separates frames with an object from frames without, which is Blue Iris's alert decision; against labels, or against a reference model where a dataset has none. Speed is the full request p50. Every device is checked to detect the same objects as the CPU. The recommended device of a model is its best-graded device whose detections agree with the CPU; within 5% of the best speed the configured device is kept. The same predictions are scored at every confidence (no extra inference) to find each model's best confidence on each device for your goal. Speeds are per image, one at a time; the service pipelines decode, preprocessing and inference, so its throughput is higher than 1000 / latency implies. The <code>benchmark</code> CLI writes the same results file.</p>
     <p>Grade thresholds. Speed: {{ speed_thresholds }}. Accuracy score, AP50 (AP@0.5, 20% small-object recall when present): {{ accuracy_thresholds }}. ROC AUC (macro over classes, frame level; 0.5 is chance): {{ auc_thresholds }}.</p>

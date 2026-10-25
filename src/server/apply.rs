@@ -356,6 +356,41 @@ mod tests {
         assert_eq!(state.config_read().models[0].night_model, None);
     }
 
+    /// The Night model select's "same model, night threshold": saves `night_threshold` without
+    /// a `night_model`, live; needs a value in range; another choice clears it.
+    #[tokio::test]
+    async fn models_card_sets_a_night_threshold_on_the_same_model() {
+        let state = test_state();
+        let save = |night: &str, thr: &str| {
+            format!(
+                "enabled=ipcam-general&night.ipcam-general={}&night_threshold.ipcam-general={thr}&action=save",
+                urlencode(night)
+            )
+        };
+        let (s, _, b) = call(&state, post_json("/config/models", &save("@self", "0.3"))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let m = state.config_read().models[0].clone();
+        assert_eq!((m.night_model, m.night_threshold), (None, Some(0.3)));
+        let last = state.config.changes(1).pop().unwrap();
+        assert!(last.summary.contains("night threshold"), "{}", last.summary);
+        let (_, page) = get_text(&state, "/config").await;
+        assert!(page.contains("<option value=\"@self\" selected>"), "{page}");
+        assert!(
+            page.contains("name=\"night_threshold.ipcam-general\""),
+            "{page}"
+        );
+        // Empty or out of range: refused, the config kept.
+        for thr in ["", "1.5", "x"] {
+            let (s, _, _) = call(&state, post_json("/config/models", &save("@self", thr))).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{thr}");
+            assert_eq!(state.config_read().models[0].night_threshold, Some(0.3));
+        }
+        // "none" clears it (a stale threshold field is ignored).
+        let (s, _, _) = call(&state, post_json("/config/models", &save("", "0.3"))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(state.config_read().models[0].night_threshold, None);
+    }
+
     /// SV-14: the Models card rejects a per-model threshold outside 0..=1 (the browser's
     /// `max="1"` is not enforced by curl or a hand-typed value) and keeps the config.
     #[tokio::test]

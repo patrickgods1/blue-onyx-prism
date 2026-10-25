@@ -30,6 +30,10 @@ pub const FORM_FIELDS: &[&str] = &[
     "gpu_index",
     "force_cpu",
     "cache_dir",
+    "download_dir",
+    "models_dir",
+    "onnxruntime_dir",
+    "openvino_dir",
     "confidence_threshold",
     "nms_iou",
     "object_filter",
@@ -75,7 +79,8 @@ pub fn night_person_threshold(c: &Config) -> Option<f32> {
 /// Apply a submitted `/config` form to `config`. All fields are validated first; on any error
 /// `config` is left untouched. Text fields that are absent keep their current value; empty
 /// optional paths / `default_model` become `None`. The directory settings
-/// (`save_image_path`, `log_path`, `cache_dir`) go through
+/// (`save_image_path`, `log_path`, `cache_dir`, `download_dir`, `models_dir`,
+/// `onnxruntime_dir`, `openvino_dir`) go through
 /// [`crate::config::validate_dir_setting`] (stored absolute; relative ones under the data
 /// root), and a change of one is logged at warn level: it moves where the service writes.
 pub fn apply_config_form(
@@ -98,6 +103,26 @@ pub fn apply_config_form(
         ),
         ("log_path", show(&config.log_path), show(&c.log_path)),
         ("cache_dir", config.cache_dir.clone(), c.cache_dir.clone()),
+        (
+            "download_dir",
+            show(&config.download_dir),
+            show(&c.download_dir),
+        ),
+        (
+            "models_dir",
+            config.models_dir.display().to_string(),
+            c.models_dir.display().to_string(),
+        ),
+        (
+            "onnxruntime_dir",
+            show(&config.onnxruntime_dir),
+            show(&c.onnxruntime_dir),
+        ),
+        (
+            "openvino_dir",
+            show(&config.openvino_dir),
+            show(&c.openvino_dir),
+        ),
     ] {
         if from != to {
             warn!(key, %from, %to, "directory setting changed by a config form");
@@ -124,7 +149,9 @@ pub fn parse_config_form(
         get(k).is_some_and(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "0"))
     };
     // Directory settings: syntax-checked, relative ones resolved under the data root, system
-    // directories refused (SV-03). `download_dir` is not a form field, so the root is fixed.
+    // directories refused (SV-03). `download_dir` (the data root itself) comes first, so the
+    // other relative settings of the same post resolve under the new root.
+    parse_runtime_dirs(c, form)?;
     let data_root = c.data_root();
     let dir = |key: &str, v: &str| validate_dir_setting(key, v, &data_root);
 
@@ -231,6 +258,84 @@ pub fn parse_config_form(
     }
     c.normalize();
     Ok(())
+}
+
+/// The "Folders" fieldset: `download_dir` (the data root), `models_dir`, `onnxruntime_dir` and
+/// `openvino_dir`, each through [`validate_dir_setting`]. `download_dir`, `onnxruntime_dir`
+/// and `openvino_dir` resolve against the exe dir (like [`crate::resolve_path`]), `models_dir`
+/// under the (possibly new) data root. Empty = the default (`None`; `models_dir`: `models`).
+/// A value equal to the current one, as the page shows it, is kept as stored, so saving the
+/// form unchanged never turns a relative setting into an absolute one (a spurious restart).
+fn parse_runtime_dirs(
+    c: &mut Config,
+    form: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let get = |k: &str| form.get(k).map(|v| v.trim());
+    let exe_dir = crate::exe_dir();
+    let unchanged = |v: &str, cur: &Option<PathBuf>| match cur {
+        Some(p) => p.display().to_string() == v,
+        None => v.is_empty(),
+    };
+    for (key, slot) in [
+        ("download_dir", &mut c.download_dir),
+        ("onnxruntime_dir", &mut c.onnxruntime_dir),
+        ("openvino_dir", &mut c.openvino_dir),
+    ] {
+        if let Some(v) = get(key)
+            && !unchanged(v, slot)
+        {
+            *slot = validate_dir_setting(key, v, &exe_dir)?;
+        }
+    }
+    if let Some(v) = get("models_dir")
+        && v != c.models_dir.display().to_string()
+    {
+        c.models_dir = if v.is_empty() {
+            Config::default().models_dir
+        } else {
+            let root = c.data_root();
+            validate_dir_setting("models_dir", v, &root)?.unwrap_or_else(|| root.join("models"))
+        };
+    }
+    Ok(())
+}
+
+/// A model file path (`path` or `classes`) of a models list that the saved config does not
+/// have yet: new or changed. See [`new_model_paths`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewModelPath {
+    /// Effective model name.
+    pub model: String,
+    /// `path` or `classes`.
+    pub field: &'static str,
+    /// The path as configured (relative ones are under the data root).
+    pub path: PathBuf,
+}
+
+/// The `path` / `classes` values of `after`'s models that no model of `before` uses (in either
+/// field): what a models JSON edit added or changed. Unchanged entries (and paths only moved
+/// between entries) are not listed, so existing configs are never re-checked.
+pub fn new_model_paths(before: &Config, after: &Config) -> Vec<NewModelPath> {
+    let known: std::collections::HashSet<&std::path::Path> = before
+        .models
+        .iter()
+        .flat_map(|m| std::iter::once(m.path.as_path()).chain(m.classes.as_deref()))
+        .collect();
+    let mut out = Vec::new();
+    for m in &after.models {
+        for (field, p) in [("path", Some(&m.path)), ("classes", m.classes.as_ref())] {
+            if let Some(p) = p
+                && !known.contains(p.as_path())
+            {
+                out.push(NewModelPath {
+                    model: m.effective_name(),
+                    field,
+                    path: p.clone(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The "Night / IR" fieldset: `night_confidence_threshold` and `night_person_threshold`
@@ -1175,5 +1280,148 @@ mod tests {
             assert!(e.contains(want), "{k}: {e}");
             assert_eq!(c, before);
         }
+    }
+
+    /// The Folders fieldset: relative runtime dirs resolve under the exe dir, `models_dir`
+    /// under the (new) data root; empty = the default; an unchanged value keeps its stored
+    /// (possibly relative) form; bad values are refused without touching the config.
+    #[test]
+    fn folder_fields_parse_default_and_validate() {
+        let exe = crate::exe_dir();
+        let base = std::env::temp_dir().join("bop-folders");
+        let dl = base.join("data");
+        let mut c = with_model();
+        apply_config_form(
+            &mut c,
+            &form(&[
+                ("download_dir", &dl.display().to_string()),
+                ("models_dir", "my-models"),
+                ("onnxruntime_dir", "rt/ort"),
+                ("openvino_dir", " \"ov\" "),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(c.download_dir, Some(dl.clone()));
+        assert_eq!(c.data_root(), dl);
+        assert_eq!(c.models_dir, dl.join("my-models"));
+        assert_eq!(c.onnxruntime_dir, Some(exe.join("rt/ort")));
+        assert_eq!(c.openvino_dir, Some(exe.join("ov")));
+
+        // Empty = the default.
+        let f = form(&[
+            ("download_dir", ""),
+            ("models_dir", " "),
+            ("onnxruntime_dir", ""),
+            ("openvino_dir", ""),
+        ]);
+        apply_config_form(&mut c, &f).unwrap();
+        let d = Config::default();
+        assert_eq!(
+            (
+                &c.download_dir,
+                &c.models_dir,
+                &c.onnxruntime_dir,
+                &c.openvino_dir
+            ),
+            (
+                &d.download_dir,
+                &d.models_dir,
+                &d.onnxruntime_dir,
+                &d.openvino_dir
+            )
+        );
+
+        // The page posts the shown values back: a relative stored value stays as it is.
+        let mut c = with_model();
+        c.models_dir = "models".into();
+        c.openvino_dir = Some("ov".into());
+        c.normalize();
+        let before = c.clone();
+        apply_config_form(
+            &mut c,
+            &form(&[
+                ("download_dir", ""),
+                ("models_dir", "models"),
+                ("onnxruntime_dir", ""),
+                ("openvino_dir", "ov"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(c, before);
+
+        for (field, value, needle) in [
+            ("download_dir", "/etc/prism", "system directory"),
+            ("models_dir", "/usr/share/models", "system directory"),
+            (
+                "onnxruntime_dir",
+                "C:\\Windows\\System32",
+                "system directory",
+            ),
+            ("openvino_dir", "../ov", "'..'"),
+            ("download_dir", "\\\\nas\\share", "UNC"),
+            ("models_dir", "C:models", "drive-relative"),
+        ] {
+            let mut c = with_model();
+            let e = format!(
+                "{:#}",
+                apply_config_form(&mut c, &form(&[(field, value)])).unwrap_err()
+            );
+            assert!(
+                e.contains(field) && e.contains(needle),
+                "{field}={value}: {e}"
+            );
+            assert_eq!(c, with_model());
+        }
+    }
+
+    #[test]
+    fn new_model_paths_lists_only_new_or_changed_files() {
+        let before = Config {
+            models: vec![
+                ModelConfig {
+                    path: "/far/away/a.onnx".into(),
+                    classes: Some("/far/away/a.yaml".into()),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    path: "models/b.onnx".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // Unchanged (also with other fields edited, or reordered): nothing to check.
+        let mut after = before.clone();
+        after.models[0].lazy = true;
+        after.models.swap(0, 1);
+        assert!(new_model_paths(&before, &after).is_empty());
+        // A changed path, a new classes file and a new entry are listed.
+        after.models[0].path = "/elsewhere/b.onnx".into();
+        after.models[1].classes = Some("/far/away/other.yaml".into());
+        after.models.push(ModelConfig {
+            name: Some("c".into()),
+            path: "/x/c.onnx".into(),
+            ..Default::default()
+        });
+        let got: Vec<(String, &str, PathBuf)> = new_model_paths(&before, &after)
+            .into_iter()
+            .map(|n| (n.model, n.field, n.path))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    after.models[0].effective_name(),
+                    "path",
+                    "/elsewhere/b.onnx".into()
+                ),
+                (
+                    after.models[1].effective_name(),
+                    "classes",
+                    "/far/away/other.yaml".into()
+                ),
+                ("c".to_string(), "path", "/x/c.onnx".into()),
+            ]
+        );
     }
 }

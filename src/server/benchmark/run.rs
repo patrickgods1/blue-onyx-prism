@@ -19,10 +19,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
-/// Parse a start/settings form over the configured defaults and check the datasets.
+/// Parse a start/settings form over the configured defaults and check the datasets: a folder
+/// set (`dir:<path>`) the config does not already list must be a browsable folder or one
+/// picked with Browse... ([`crate::server::browse::allowed_path`]), like `add_folder`.
 fn parse_request(state: &AppState, form: &[(String, String)]) -> anyhow::Result<RunRequest> {
     let cfg = state.config_read().clone();
     let req = RunRequest::from_form(form, &cfg.benchmark)?;
+    let configured: Vec<std::path::PathBuf> = cfg
+        .benchmark
+        .datasets
+        .iter()
+        .filter_map(|d| d.dir().map(|(dir, _, _)| cfg.data_path(&dir)))
+        .collect();
+    for d in &req.datasets {
+        let Some((dir, _, _)) = d.dir() else {
+            continue;
+        };
+        if configured.contains(&cfg.data_path(&dir)) {
+            continue;
+        }
+        crate::server::browse::allowed_path(&cfg, &dir.to_string_lossy()).map_err(|e| {
+            anyhow::anyhow!(
+                "dataset {}: {}; choose the folder with Browse... (or one inside the browsable \
+                 folders)",
+                d.label(),
+                e.into_parts().1
+            )
+        })?;
+    }
     images::validate(&req.datasets, &cfg.data_root())?;
     Ok(req)
 }
@@ -97,22 +121,55 @@ pub(in crate::server) async fn settings(
         Ok(Form(f)) => f,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
-    let folder: Option<String> = form
+    crate::server::blocking(move || {
+        if let Err(r) = add_folder(&state, &mut form) {
+            return *r;
+        }
+        settings_blocking(&state, &form)
+    })
+    .await
+}
+
+/// The form's `add_folder` (a typed or picked folder, with or without `dir:`) as a `dataset`
+/// field of its canonical path: only a directory inside the browsable folders or picked with
+/// Browse... in the last hour ([`crate::server::browse::allowed_path`]); otherwise the error
+/// answer.
+fn add_folder(state: &AppState, form: &mut Vec<(String, String)>) -> Result<(), Box<Response>> {
+    let Some(raw) = form
         .iter()
         .find(|(k, _)| k == "add_folder")
         .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    if let Some(f) = &folder {
-        let v = if f.starts_with(images::DIR_PREFIX) {
-            f.clone()
-        } else {
-            format!("{}{f}", images::DIR_PREFIX)
-        };
-        if !form.iter().any(|(k, x)| k == "dataset" && *x == v) {
-            form.push(("dataset".into(), v));
-        }
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(());
+    };
+    let shown = raw.strip_prefix(images::DIR_PREFIX).unwrap_or(&raw).trim();
+    let cfg = state.config_read().clone();
+    let path = crate::server::browse::allowed_path(&cfg, shown).map_err(|e| {
+        let (status, message) = e.into_parts();
+        Box::new(json_error(
+            status,
+            format!(
+                "The folder was not added: {message}. Choose it with Browse... (or type a folder \
+                 inside the browsable folders)."
+            ),
+        ))
+    })?;
+    if !path.is_dir() {
+        return Err(Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "The folder was not added: {shown} is a file, not a folder. Use Browse... to \
+                 choose the folder that holds the images."
+            ),
+        )));
     }
-    crate::server::blocking(move || settings_blocking(&state, &form)).await
+    let v = format!("{}{}", images::DIR_PREFIX, path.display());
+    form.retain(|(k, _)| k != "add_folder");
+    if !form.iter().any(|(k, x)| k == "dataset" && *x == v) {
+        form.push(("dataset".into(), v));
+    }
+    Ok(())
 }
 
 /// [`settings`] off the runtime threads: dataset checks and the config write (SV-06).
@@ -472,6 +529,92 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn settings_add_folder_only_inside_the_browsable_folders() {
+        let st = state();
+        let root = st.config_path.parent().unwrap().canonicalize().unwrap();
+        let r = root.clone();
+        crate::server::save_config(&st, "test", move |c| {
+            c.download_dir = Some(r);
+            Ok(())
+        })
+        .unwrap();
+        let enc =
+            |p: &std::path::Path| crate::server::encode_uri_component(&p.display().to_string());
+        let dirs = |st: &AppState| -> Vec<String> {
+            crate::config::Config::load(&st.config_path)
+                .unwrap()
+                .benchmark
+                .datasets
+                .iter()
+                .map(DatasetRef::label)
+                .collect()
+        };
+
+        // Inside the data root: added under its canonical path (a relative path resolves
+        // against the data root).
+        let imgs = root.join("imgs");
+        std::fs::create_dir_all(&imgs).unwrap();
+        let (s, v) = call(
+            &st,
+            post("/v1/benchmark/settings", "dataset=sample&add_folder=imgs"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let want = format!("{}{}", images::DIR_PREFIX, imgs.display());
+        assert!(dirs(&st).contains(&want), "{:?} lacks {want}", dirs(&st));
+
+        // A file is not a folder.
+        std::fs::write(root.join("f.jpg"), b"x").unwrap();
+        let (s, v) = call(
+            &st,
+            post(
+                "/v1/benchmark/settings",
+                &format!("dataset=sample&add_folder={}", enc(&root.join("f.jpg"))),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["message"].as_str().unwrap().contains("Browse..."), "{v}");
+
+        // Outside every root (Unix only: on Windows every drive is a root): refused, nothing
+        // saved.
+        #[cfg(unix)]
+        {
+            let outside = std::env::temp_dir()
+                .join(format!("bo_bench_out_{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&outside).unwrap();
+            let before = dirs(&st);
+            let (s, v) = call(
+                &st,
+                post(
+                    "/v1/benchmark/settings",
+                    &format!("dataset=sample&add_folder=dir%3A{}", enc(&outside)),
+                ),
+            )
+            .await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+            let m = v["message"].as_str().unwrap();
+            assert!(
+                m.contains("outside the browsable folders") && m.contains("Browse..."),
+                "{m}"
+            );
+            assert_eq!(dirs(&st), before);
+            // Start sends the typed folder as a `dir:` dataset: the same check.
+            let (s, v) = call(
+                &st,
+                post("/v1/benchmark", &format!("dataset=dir%3A{}", enc(&outside))),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+            let m = v["message"].as_str().unwrap();
+            assert!(m.contains("outside the browsable folders"), "{m}");
+            assert!(!st.benchmark.is_running());
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

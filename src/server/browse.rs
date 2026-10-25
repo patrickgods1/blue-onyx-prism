@@ -252,6 +252,42 @@ pub(super) fn allowed_path(cfg: &Config, raw: &str) -> Result<PathBuf, BrowseErr
     resolve(cfg, raw, true)
 }
 
+/// [`allowed_path`] for a path a form saves for later (a model typed into the Config page's
+/// models JSON whose download has not happened yet): also accepted when it does not exist,
+/// provided it lies inside one of [`roots`] (or a native pick) and its deepest existing
+/// ancestor, canonicalized, does too or is free of symlinks (so a symlinked folder cannot
+/// lead out of the roots).
+/// Returns the canonical path when it exists, else the resolved one.
+pub(super) fn allowed_or_missing_inside_roots(
+    cfg: &Config,
+    raw: &str,
+) -> Result<PathBuf, BrowseError> {
+    match allowed_path(cfg, raw) {
+        Err(e) if e.status == StatusCode::NOT_FOUND => {}
+        other => return other,
+    }
+    // `allowed_path` answers 404 only after the lexical check passed.
+    let raw = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    let start = cfg.data_path(Path::new(raw));
+    let roots = roots(cfg);
+    let mut ancestor = start.parent();
+    while let Some(a) = ancestor {
+        if let Ok(canon) = a.canonicalize() {
+            // No symlink on the way (a data root not created yet): the lexical check holds.
+            let plain = Path::new(&display(&canon)) == a;
+            if plain || inside_any(&canon, &roots, cfg) || super::pick::picked_covers(&canon) {
+                return Ok(start);
+            }
+            break;
+        }
+        ancestor = a.parent();
+    }
+    Err(BrowseError {
+        status: StatusCode::FORBIDDEN,
+        message: format!("{raw} leads outside the browsable folders"),
+    })
+}
+
 /// [`allowed_path`], trusting native picks only when `trust_picked` (never for [`list`]).
 fn resolve(cfg: &Config, raw: &str, trust_picked: bool) -> Result<PathBuf, BrowseError> {
     let raw = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
@@ -697,6 +733,46 @@ mod tests {
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
         assert!(e.message.contains("UNC"), "{}", e.message);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A missing file is accepted when it would land inside a root (a model not downloaded
+    /// yet), never outside one, nor through a symlink that leaves the roots.
+    #[test]
+    fn missing_paths_inside_roots_are_accepted_for_saving() {
+        let (root, cfg) = setup();
+        let ok = |raw: &str| allowed_or_missing_inside_roots(&cfg, raw);
+        assert_eq!(ok("models/a.xml").unwrap(), root.join("models/a.xml"));
+        assert_eq!(
+            ok("models/later.onnx").unwrap(),
+            root.join("models/later.onnx")
+        );
+        assert_eq!(
+            ok("not-yet/sub/later.onnx").unwrap(),
+            root.join("not-yet/sub/later.onnx")
+        );
+        let other = std::env::temp_dir()
+            .join(format!("bop-browse-miss-{}", uuid::Uuid::new_v4()))
+            .canonicalize_or_self();
+        std::fs::create_dir_all(&other).unwrap();
+        let in_home = ["HOME", "USERPROFILE"].iter().any(|v| {
+            std::env::var_os(v)
+                .and_then(|h| PathBuf::from(h).canonicalize().ok())
+                .is_some_and(|h| other.starts_with(h))
+        });
+        if !in_home {
+            let e = ok(&other.join("m.onnx").to_string_lossy()).unwrap_err();
+            assert_eq!(e.status, StatusCode::FORBIDDEN, "{}", e.message);
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&other, root.join("models/out")).unwrap();
+                let e = ok("models/out/new.onnx").unwrap_err();
+                assert_eq!(e.status, StatusCode::FORBIDDEN, "{}", e.message);
+            }
+        }
+        let e = ok("models/../../x.onnx").unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]

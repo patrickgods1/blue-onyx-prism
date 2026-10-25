@@ -86,11 +86,12 @@ fn query_map(
     q.map(|Query(m)| m).unwrap_or_default()
 }
 
-/// Dataset folder, classes and data root of the current config.
+/// Folder under review (`collect.review_dir`, else the dataset folder), classes and data root
+/// of the current config.
 fn context(state: &AppState) -> (PathBuf, Vec<String>, PathBuf) {
     let cfg = state.config_read();
     (
-        CollectSettings::for_config(&cfg).dir,
+        cfg.collect.resolved_review_dir(&cfg.data_root()),
         cfg.collect.classes.clone(),
         cfg.data_root(),
     )
@@ -112,16 +113,43 @@ struct ReviewTemplate {
     buckets: Vec<&'static str>,
     scenes: Vec<&'static str>,
     exports_dir: String,
+    /// The dataset folder (the collector's; the default of the folder under review).
+    dataset_dir: String,
+    /// `dir` is another folder than the dataset folder.
+    custom_dir: bool,
+    /// Folders the picker suggests: the dataset folder and where finished imports wrote.
+    known_dirs: Vec<String>,
+}
+
+/// The dataset folder and every folder a finished import wrote to (newest first), once each.
+fn known_dirs(state: &AppState, dataset: &std::path::Path) -> Vec<String> {
+    let mut v = vec![dataset.display().to_string()];
+    for t in super::training::tasks(state).iter().rev() {
+        if let Some(d) = t
+            .result
+            .as_ref()
+            .and_then(|r| r.get("dataset_dir"))
+            .and_then(|d| d.as_str())
+            && !v.iter().any(|k| k == d)
+        {
+            v.push(d.to_string());
+        }
+    }
+    v
 }
 
 /// `GET /review`.
 pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
         let (dir, classes, root) = context(&state);
+        let dataset = CollectSettings::for_config(&state.config_read()).dir;
         render(&ReviewTemplate {
             nav: "review",
             version: crate::VERSION,
             dir: dir.display().to_string(),
+            custom_dir: dir != dataset,
+            known_dirs: known_dirs(&state, &dataset),
+            dataset_dir: dataset.display().to_string(),
             classes_json: serde_json::to_string(&classes).unwrap_or_else(|_| "[]".into()),
             classes_text: classes.join(", "),
             classes,
@@ -646,6 +674,68 @@ pub(super) async fn import(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FolderBody {
+    dir: String,
+}
+
+/// `POST /v1/review/folder` with `{dir}`: the folder this page, its exports and the auto-labeler
+/// work on (`collect.review_dir`), for frames an import saved outside the dataset folder. Empty or
+/// the dataset folder itself = back to the dataset folder. Like the import's paths, it must be a
+/// browsable folder or one picked in the native dialog ([`super::browse::allowed_path`]).
+pub(super) async fn folder(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: FolderBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    blocking(move || {
+        let config = state.config_read().clone();
+        let dataset = CollectSettings::for_config(&config).dir;
+        let raw = b.dir.trim();
+        let chosen = if raw.is_empty() {
+            None
+        } else {
+            let p = match super::browse::allowed_path(&config, raw) {
+                Ok(p) => p,
+                Err(e) => {
+                    let (s, m) = e.into_parts();
+                    return fail(s, format!("Folder not changed: {m}"));
+                }
+            };
+            if !p.is_dir() {
+                return fail(
+                    StatusCode::BAD_REQUEST,
+                    format!("Folder not changed: {raw} is not a folder"),
+                );
+            }
+            let same = dataset.canonicalize().is_ok_and(|d| d == p);
+            (!same).then_some(p)
+        };
+        let result = save_config(&state, "review page", |c| {
+            c.collect.review_dir = chosen.clone();
+            c.collect.validate(&c.data_root())
+        });
+        match result {
+            Ok(msg) => Json(serde_json::json!({
+                "success": true,
+                "message": msg,
+                "dir": chosen.as_ref().unwrap_or(&dataset),
+            }))
+            .into_response(),
+            Err(e) => fail(
+                StatusCode::BAD_REQUEST,
+                format!("Folder not changed: {e:#}"),
+            ),
+        }
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClassesBody {
     classes: Vec<String>,
 }
@@ -763,6 +853,67 @@ mod tests {
         let rel = format!("ir/{camera}/{date}/{stem}.jpg");
         layout::append_review(dir, std::slice::from_ref(&rel)).unwrap();
         rel
+    }
+
+    #[tokio::test]
+    async fn the_folder_under_review_can_be_another_folder() {
+        let d = ds();
+        let imported = d.root.join("imported");
+        let rel = put_frame(
+            &imported,
+            "drive",
+            "2026-10-21",
+            "20261021T010203004Z_a",
+            0.9,
+        );
+        let total = |state: Arc<AppState>| async move {
+            let (_, v) = json(
+                &state,
+                Request::get("/v1/review/next").body(Body::empty()).unwrap(),
+            )
+            .await;
+            v["total"].clone()
+        };
+        assert_eq!(total(d.state.clone()).await, 0);
+        let body = serde_json::json!({ "dir": imported.display().to_string() }).to_string();
+        let (s, v) = json(&d.state, post_json("/v1/review/folder", &body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            d.state.config_read().collect.review_dir,
+            Some(imported.canonicalize().unwrap())
+        );
+        assert_eq!(total(d.state.clone()).await, 1);
+        // Its images are served too.
+        let (s, _, _) = call(
+            &d.state,
+            Request::get(format!(
+                "/dataset/image?path={}",
+                encode_uri_component(&rel)
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        // The page offers the dataset folder to go back to.
+        let (_, page) = get_text(&d.state, "/review").await;
+        assert!(page.contains("Back to the dataset folder"), "{page}");
+        // A file, a missing folder, a folder outside the browsable ones: refused, unchanged.
+        let outside = std::env::temp_dir().join(format!("bop-review-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = imported.join("ir/drive/2026-10-21/20261021T010203004Z_a.jpg");
+        for p in [file, d.root.join("nope"), outside.clone()] {
+            let body = serde_json::json!({ "dir": p.display().to_string() }).to_string();
+            let (s, v) = json(&d.state, post_json("/v1/review/folder", &body)).await;
+            assert_ne!(s, StatusCode::OK, "{} {v}", p.display());
+            assert!(d.state.config_read().collect.review_dir.is_some());
+        }
+        let _ = std::fs::remove_dir_all(&outside);
+        // Empty = back to the dataset folder.
+        let (s, _) = json(&d.state, post_json("/v1/review/folder", r#"{"dir": ""}"#)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(d.state.config_read().collect.review_dir, None);
+        assert_eq!(total(d.state.clone()).await, 0);
     }
 
     fn post_json(uri: &str, body: &str) -> Request<Body> {

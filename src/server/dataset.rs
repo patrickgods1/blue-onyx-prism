@@ -413,12 +413,20 @@ async fn serve(
             .into_response();
     };
     blocking(move || {
-        let dir = CollectSettings::for_config(&state.config_read()).dir;
+        let dirs = {
+            let cfg = state.config_read();
+            let root = cfg.data_root();
+            [
+                cfg.collect.resolved_review_dir(&root),
+                cfg.collect.resolved_dir(&root),
+            ]
+        };
         let Some(r) = layout::parse_rel(&rel).filter(|_| rel.ends_with(".jpg")) else {
             return not_found();
         };
         let wanted = if ext == "jpg" { r.jpg() } else { r.json() };
-        let Some(path) = layout::resolve(&dir, &wanted, ext) else {
+        // The Review page's folder first (an import saved elsewhere), then the dataset folder.
+        let Some(path) = dirs.iter().find_map(|d| layout::resolve(d, &wanted, ext)) else {
             return not_found();
         };
         match std::fs::read(&path) {

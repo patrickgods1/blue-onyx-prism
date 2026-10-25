@@ -281,6 +281,12 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
 The **Review** page (`/review`, admin only like `/dataset`) shows one frame at a time with its boxes.
 Each decision is saved in `<stem>.labels.json` beside the sidecar. The sidecar is never changed.
 
+The page works on the dataset folder, or on another folder in the same layout (an import saved with
+*Save frames to* / `train import --out-dir`): *Folder under review* (a native folder picker, `POST
+/v1/review/folder` with `{dir}`, empty = back to the dataset folder) saves it as `collect.review_dir`.
+The queue, the label saves, the exports, the X-AnyLabeling import and auto-label runs then use that
+folder; the collector and the Dataset page keep `collect.dir`.
+
 ### Label file (version 1)
 
 ```json

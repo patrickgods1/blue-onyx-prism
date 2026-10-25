@@ -236,6 +236,7 @@ fn job(
             rename: BTreeMap::new(),
             benchmark_sets: vec!["nir-night".into()],
             allow_large: false,
+            install_dir: None,
         },
         name: format!("night-{}-test", family.base_name(size)),
         paths: TrainPaths::new(root, root.join("models")),
@@ -558,6 +559,111 @@ fn a_class_mismatch_from_the_trainer_is_an_error() {
     let e = r.unwrap_err();
     assert!(e.message.contains("classes"), "{}", e.message);
     assert!(!t.0.join("models/night-yolo26n-test.onnx").exists());
+}
+
+#[test]
+fn a_run_installs_into_the_chosen_folder() {
+    let t = tmp("install-dir");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let elsewhere = t.0.join("elsewhere").join("models");
+    j.request.install_dir = Some(elsewhere.clone());
+    assert_eq!(j.install_dir(), elsewhere.as_path());
+    let fake = TrainFake::new();
+    let hooks = RecHooks::default();
+    let (r, _) = run(&j, &fake, &hooks, &AtomicBool::new(false));
+    let o = r.unwrap().output;
+    assert_eq!(o.onnx, elsewhere.join("night-yolo26n-test.onnx"));
+    assert_eq!(o.yaml, elsewhere.join("night-yolo26n-test.yaml"));
+    assert_eq!(
+        o.provenance,
+        elsewhere.join("night-yolo26n-test.provenance.json")
+    );
+    assert!(o.onnx.is_file() && o.yaml.is_file() && o.provenance.is_file());
+    assert!(!t.0.join("models/night-yolo26n-test.onnx").exists());
+    assert!(!elsewhere.join(".night-yolo26n-test.train-staging").exists());
+    // The hooks get the installed paths (registered and benchmarked from there).
+    assert_eq!(hooks.registered.lock().unwrap()[0].onnx, o.onnx);
+    // The config entry points at the real file (absolute: outside the data root here).
+    let mut c = crate::config::Config {
+        download_dir: Some(t.0.join("root")),
+        ..crate::config::Config::default()
+    };
+    crate::training::cli::add_trained_model(&mut c, &o).unwrap();
+    let m = c
+        .models
+        .iter()
+        .find(|m| m.effective_name() == "night-yolo26n-test")
+        .unwrap();
+    assert_eq!(
+        c.data_path(&m.path).canonicalize().unwrap(),
+        o.onnx.canonicalize().unwrap()
+    );
+    // The same name again in that folder is refused before anything runs.
+    let (again, _) = run(&j, &fake, &hooks, &AtomicBool::new(false));
+    assert!(again.unwrap_err().message.contains("already exists"));
+}
+
+#[test]
+fn requests_round_trip_and_old_records_load() {
+    let t = tmp("roundtrip");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    // Without an install folder the key is not written.
+    let text = serde_json::to_string(&j.request).unwrap();
+    assert!(!text.contains("install_dir"), "{text}");
+    j.request.install_dir = Some(t.0.join("dst"));
+    let text = serde_json::to_string(&j.request).unwrap();
+    let back: TrainRequest = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, j.request);
+    // A runs.json written before the field existed still loads.
+    let old = r#"[{"id":"20260101-000000-abcd","name":"night-x","created":"2026-01-01T00:00:00Z",
+        "request":{"recipe":RECIPE,"datasets":["/e"],"include_public":false,"scene":"all"},
+        "device":"mps","state":"done","stage":null,"step":8,"steps":8,"percent":100,
+        "detail":"","run_dir":"/t/run"}]"#
+        .replace("RECIPE", &serde_json::to_string(&j.request.recipe).unwrap());
+    let store = t.0.join("runs.json");
+    std::fs::write(&store, old).unwrap();
+    let recs = service::load_records(&store);
+    assert_eq!(recs.len(), 1, "the old record loads");
+    assert_eq!(recs[0].request.install_dir, None);
+}
+
+#[test]
+fn the_queue_moves_to_another_training_folder_only_when_idle() {
+    let t = tmp("store");
+    let fake = Arc::new(TrainFake {
+        hang: true,
+        ..TrainFake::new()
+    });
+    let old = t.0.join("old").join("runs.json");
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(old.clone()),
+    );
+    let mut a = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    a.run_dir = t.0.join("old/a");
+    let ida = svc.enqueue(a).unwrap();
+    let new = t.0.join("new").join("runs.json");
+    assert!(
+        svc.set_store(&new)
+            .unwrap_err()
+            .contains("queued or running")
+    );
+    assert_eq!(svc.store().as_deref(), Some(old.as_path()));
+    svc.cancel(&ida);
+    svc.wait(&ida, Duration::from_secs(10)).unwrap();
+    // Idle: the queue reads and writes the new folder; the old runs stay where they were.
+    assert!(svc.set_store(&new).unwrap());
+    assert!(!svc.set_store(&new).unwrap(), "already there");
+    assert_eq!(svc.store().as_deref(), Some(new.as_path()));
+    assert!(svc.runs().is_empty());
+    assert!(svc.tasks().is_empty());
+    assert_eq!(service::load_records(&old).len(), 1);
+    // And back: the old folder's runs show again.
+    assert!(svc.set_store(&old).unwrap());
+    assert_eq!(svc.runs().len(), 1);
+    svc.shutdown();
 }
 
 #[test]

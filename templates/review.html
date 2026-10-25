@@ -6,6 +6,16 @@
 
 <div id="review" data-classes="{{ classes_json }}">
 <div class="card">
+  <form id="rv-folder" class="inline-row">
+    <label class="grow">Folder under review <span class="with-browse"><input type="text" name="dir" value="{{ dir }}" list="rv-folders" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the folder of imported frames" hidden>Browse&hellip;</button></span></label>
+    <button type="submit">Review this folder</button>
+    {% if custom_dir %}<button type="button" id="rv-folder-reset" class="small secondary">Back to the dataset folder</button>{% endif %}
+  </form>
+  <datalist id="rv-folders">{% for d in known_dirs %}<option value="{{ d }}">{% endfor %}</datalist>
+  <p class="muted small">{% if custom_dir %}Reviewing another folder than the dataset folder (<code>{{ dataset_dir }}</code>). {% endif %}Choose where an import saved its frames (Training page, <em>Save frames to</em>); the queue, exports and auto-label runs of this page use it. Empty = the dataset folder.</p>
+  <div id="rv-folder-msg" class="form-msg" role="status"></div>
+</div>
+<div class="card">
   <div id="rv-counts" class="review-counts" role="status">Loading...</div>
   <form id="rv-filters" class="inline-row review-filters">
     <label>Bucket <select name="bucket"><option value="">any</option>{% for b in buckets %}<option value="{{ b }}">{{ b }}</option>{% endfor %}</select></label>

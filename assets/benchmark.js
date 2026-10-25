@@ -1030,6 +1030,25 @@
   }
   if (form) { form.addEventListener("input", estimate); form.addEventListener("change", estimate); }
 
+  // ---- Save report (Advanced) -------------------------------------------------------------------
+  // Writes the HTML report of the saved results into the chosen folder; the last folder used is
+  // remembered in this browser (PB.store wraps localStorage in try/catch).
+  (function () {
+    var rf = $("report-form"), dir = $("report-dir"), save = $("report-save"), out = $("report-msg");
+    if (!rf || !dir || !save) return;
+    rf.addEventListener("submit", function (e) { e.preventDefault(); });
+    if (!dir.value) dir.value = PB.store.get("reportDir", "") || "";
+    save.addEventListener("click", function () {
+      var d = dir.value.trim();
+      if (!d) { out.textContent = "Choose a folder first (Browse…)."; return; }
+      save.disabled = true; out.textContent = "saving…";
+      post("/v1/benchmark/report", new URLSearchParams({dir: d})).then(function (j) {
+        out.textContent = j.message || (j.success ? "Report saved to " + j.path + "." : "The report was not saved.");
+        if (j.success) PB.store.set("reportDir", d);
+      }).catch(function () { out.textContent = "Cannot reach the server."; }).then(function () { save.disabled = false; });
+    });
+  })();
+
   // ---- render loop ------------------------------------------------------------------------------
   // Each section re-renders only when its data changed, keeping the user's scroll offsets,
   // open <details>, sort order and focus (PrismLive.keep / patch); progress updates in place.

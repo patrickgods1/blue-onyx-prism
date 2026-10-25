@@ -111,7 +111,8 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `model/enhance.rs` (`preprocess`/`night_preprocess`: none|grayscale|gamma|clahe, in `prep.rs`; the kept frame is
   always the original). `night_model` routes night/IR frames, decoded, to another model's worker
   (`WorkItem::DetectDecoded`, `worker::Peers` of weak handles published by the registry; never re-forwarded; falls back
-  to the model itself). `benchmark --variants` (`benchmark/variant.rs`) runs stats -> enhance -> filters like the
+  to the model itself); `night_threshold` instead keeps the model and replaces its threshold on night/IR frames (can lower it;
+  `LiveSettings::threshold_for_scene`, Models card `@self`). `benchmark --variants` (`benchmark/variant.rs`) runs stats -> enhance -> filters like the
   service. Results and defaults: `docs/NIGHT_IR.md`.
   `verify` (`src/verify.rs` pure decision, `worker/verify.rs` per-worker continuation lane): night person candidates
   re-checked by another model (crop or frame), fail-open, never blocks the inference thread; MegaDetector v6 and the
@@ -126,7 +127,9 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
   `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk
   accept of `auto=accept` frames `POST /v1/review/accept-auto`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
-  X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned.
+  X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned. The page reviews `collect.review_dir`
+  (default `collect.dir`; *Folder under review*, `POST /v1/review/folder`), e.g. an import saved with `train import --out-dir`;
+  auto-label runs follow it.
 - Training (`src/training/`, `/training`, `blue-onyx-prism train ...`, `scripts/train_model.py`): user-triggered only;
   `capability` gates by GPU (CUDA lanes cu126/cu130 by compute capability + driver; MPS on Apple, D-FINE CUDA-only),
   separate `tools/train-env` from `scripts/model-export/locks/train-*.txt`; families YOLO26/11/v8, RF-DETR n..l,

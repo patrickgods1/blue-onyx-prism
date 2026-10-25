@@ -95,6 +95,10 @@ pub enum TrainCommand {
         /// night subset (about 926 MB). Also config `allow_large_downloads`.
         #[arg(long)]
         allow_large: bool,
+        /// Folder the model is installed in (default: the models folder; relative = under the
+        /// data root). The config entry points at the file there.
+        #[arg(long)]
+        install_dir: Option<PathBuf>,
         /// Install the model but do not add it to the config (and do not benchmark it).
         #[arg(long)]
         no_register: bool,
@@ -194,6 +198,10 @@ pub struct ImportArgs {
     /// Keep the extracted candidates (<training dir>/imports/<id>).
     #[arg(long)]
     pub keep_work: bool,
+    /// Dataset folder the frames are written to (default collect.dir, the folder the Dataset and
+    /// Review pages show; relative = under the data root).
+    #[arg(long)]
+    pub out_dir: Option<PathBuf>,
     /// Print the helper's output.
     #[arg(long)]
     pub verbose: bool,
@@ -271,6 +279,7 @@ pub fn import_request(a: &ImportArgs) -> Result<Option<super::import::ImportRequ
     r.hwaccel = a.hwaccel;
     r.allow_large = a.allow_large;
     r.keep_work = a.keep_work;
+    r.out_dir = a.out_dir.clone();
     r.validate()?;
     Ok(Some(r))
 }
@@ -507,6 +516,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             aug_gray,
             name,
             allow_large,
+            install_dir,
             no_register,
             no_benchmark,
             benchmark_sets,
@@ -575,6 +585,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                     rename: data.rename.iter().cloned().collect::<BTreeMap<_, _>>(),
                     benchmark_sets: benchmark_sets.clone(),
                     allow_large,
+                    install_dir: install_dir.clone(),
                 };
                 let mut job = super::plan_job(&config, req, &cap, name.clone())?;
                 job.keep_work = keep_work;
@@ -1049,6 +1060,21 @@ mod tests {
             panic!()
         };
         assert!(autolabel_request(&bad).is_err());
+    }
+
+    #[test]
+    fn run_takes_an_install_folder() {
+        let TrainCommand::Run { install_dir, .. } =
+            parse(&["run", "--model", "yolo26n", "--install-dir", "/srv/models"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(install_dir, Some(PathBuf::from("/srv/models")));
+        let TrainCommand::Run { install_dir, .. } = parse(&["run", "--model", "yolo26n"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(install_dir, None);
     }
 
     #[test]

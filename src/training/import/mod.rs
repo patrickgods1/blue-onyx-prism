@@ -165,6 +165,10 @@ pub struct ImportRequest {
     /// Hardware video decoding.
     #[serde(default)]
     pub hwaccel: HwAccel,
+    /// Dataset folder the frames are written to (relative = under the data root; default
+    /// `collect.dir`, the folder the Dataset and Review pages show).
+    #[serde(default)]
+    pub out_dir: Option<PathBuf>,
 }
 
 fn default_window() -> f32 {
@@ -192,6 +196,7 @@ impl ImportRequest {
             keep_work: false,
             workers: 0,
             hwaccel: HwAccel::Auto,
+            out_dir: None,
         }
     }
 
@@ -317,7 +322,19 @@ pub fn plan_import(
     }
     request.allow_large = allow_large;
     let id = super::service::new_run_id();
-    let dataset_dir = crate::collect::CollectSettings::for_config(config).dir;
+    let dataset_dir = match &request.out_dir {
+        Some(d) => {
+            let d = config.data_path(d);
+            if d.exists() && !d.is_dir() {
+                bail!(
+                    "the output folder {} is a file; choose a folder for the frames",
+                    d.display()
+                );
+            }
+            d
+        }
+        None => crate::collect::CollectSettings::for_config(config).dir,
+    };
     Ok(ImportJob {
         work: super::training_dir(config).join("imports").join(&id),
         id,
@@ -381,8 +398,10 @@ mod tests {
         let o = v.as_object_mut().unwrap();
         o.remove("workers");
         o.remove("hwaccel");
+        o.remove("out_dir");
         let back: ImportRequest = serde_json::from_value(v).unwrap();
         assert_eq!((back.workers, back.hwaccel), (0, HwAccel::Auto));
+        assert_eq!(back.out_dir, None);
     }
 
     #[test]
@@ -410,6 +429,16 @@ mod tests {
         assert_eq!(j.license, "own footage");
         assert!(j.work.starts_with(root.join("training/imports")));
         assert_eq!(j.dataset_dir, root.join("dataset"));
+        // Another output folder (relative = under the data root); a file is refused.
+        let mut o = r.clone();
+        o.out_dir = Some("picked".into());
+        assert_eq!(
+            plan_import(&c, o.clone(), &cap).unwrap().dataset_dir,
+            root.join("picked")
+        );
+        o.out_dir = Some("clips/a.jpg".into());
+        let e = plan_import(&c, o, &cap).unwrap_err().to_string();
+        assert!(e.contains("is a file"), "{e}");
         // A denylisted URL fails before anything is queued.
         let mut u = ImportRequest::new(ImportSource::Url(
             "http://www.insecam.org/en/view/1/".into(),
