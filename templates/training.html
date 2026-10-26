@@ -173,14 +173,28 @@
     {% if let Some(what) = import_large %}
     <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB: {{ what }}</label>
     {% endif %}
+    <label class="check"><input type="checkbox" name="autolabel" id="import-autolabel"> Auto-label the imported frames when the import finishes</label>
+    <p class="muted small">Uses the labelers, classes and run options of the <a href="#autolabel">Auto-label card</a>; its <em>Which frames</em> fields are ignored: the run labels this import's frames. It does not run when the import fails, is cancelled or writes no new frame.</p>
+    <div class="tr-sub" id="import-after">
+      <label class="check"><input type="checkbox" name="after_reject" id="import-after-reject"> <span>Then reject auto boxes scoring <span class="tr-keep">below <input type="number" name="after_reject_score" id="import-after-reject-score" class="al-num" min="0.01" max="1" step="0.01" value="0.3" aria-label="Reject auto boxes scoring below"></span></span></label>
+      <p class="muted small">Kept as hard negatives (<code>low_score</code>); a reviewer can still change them per frame.</p>
+      <label class="check"><input type="checkbox" name="after_accept" id="import-after-accept"> <span>Then accept frames whose boxes are all <em>auto: accept</em> (saved as reviewed)</span></label>
+      <p class="muted small">Those frames skip your look; leave it off until you trust the labelers on this footage.</p>
+    </div>
+    <div id="import-after-folder">
+      <label class="check"><input type="checkbox" name="after_review_folder" id="import-after-review-folder"> <span>Show this folder on the Review page when done</span></label>
+      <p class="muted small">Needs <em>Save frames to</em>; with or without auto-label.</p>
+    </div>
+    <p id="import-autolabel-msg" class="form-msg" role="status"></p>
     <div class="actions"><button type="submit">Import</button></div>
   </form>
   {% if !imports.is_empty() %}
   <details class="tr-more">
   <summary>Recent imports ({{ imports.len() }})</summary>
+  <p class="muted small">In <code>{{ imports_dir }}</code>, the folder auto-label works on (the Review page's).</p>
   <div class="scroll"><table>
-    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Cameras</th></tr></thead>
-    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}{% if let Some(a) = i.attribution %}<br><span class="muted small">{{ a }}</span>{% endif %}</td><td class="num">{{ i.frames }}</td><td>{{ i.cameras.join(", ") }}</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Cameras</th><th></th></tr></thead>
+    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}{% if let Some(a) = i.attribution %}<br><span class="muted small">{{ a }}</span>{% endif %}</td><td class="num">{{ i.frames }}</td><td>{{ i.cameras.join(", ") }}</td><td>{% if i.frames > 0 %}<button type="button" class="small secondary" data-al-import="{{ i.id }}" data-al-frames="{{ i.frames }}" hidden>Auto-label</button><a href="#autolabel" class="small" data-al-fallback>Auto-label (filter <code>import={{ i.id }}</code>)</a>{% endif %}</td></tr>{% endfor %}</tbody>
   </table></div>
   </details>
   {% endif %}

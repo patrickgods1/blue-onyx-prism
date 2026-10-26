@@ -485,6 +485,42 @@ like every other package. A `tool:ffmpeg` resource would have needed per-OS stat
 Windows / Linux builds, a third party for macOS), their hashes and an extractor for each; PyAV was
 already in the lock (a dependency of the trainers) and decodes every format the import reads.
 
+### Auto-label after import
+
+The Import footage card's **Auto-label the imported frames when the import finishes** box queues an
+[auto-label](#auto-label) run right behind the import, with the Auto-label card's labelers (or model),
+classes and run options (the page posts them as `al.<field>`); the card's *Which frames* fields are
+ignored: the run takes this import's frames (`import=<id>, status=any, source=all`, limit = Frames to
+keep) in the folder the import writes. Both are planned before anything is queued, so a bad auto-label
+setting (no labeler, no model chosen, a class outside the list, a GPU it cannot use) refuses the import
+too ("Not imported: auto-label: ..."). Follow-up options, after the run, in this order and scoped to the
+import's frames:
+
+- *Then reject auto boxes scoring below* (0.3): the pending auto boxes under that score on the unreviewed
+  frames become `rejected` with `reason: low_score` (hard negatives; a reviewer can still change them);
+- *Then accept frames whose boxes are all auto: accept* (off by default): those frames are saved as
+  reviewed, like the Review page's bulk accept; after the reject, a frame left with only `accept` boxes
+  qualifies;
+- *Show this folder on the Review page when done* (needs *Save frames to*; also without auto-label): sets
+  `collect.review_dir` to the import's folder.
+
+A failing step is a `warning:` line in the job's summary, not a failed job. The auto-label waits for the
+import (`Task::after`; the queue shows "queued (after import <id>)") and runs only when it ended Done
+with new frames: when the import failed or was cancelled it ends Cancelled "not run: the import it
+follows failed / was cancelled", when it wrote no new frame (all imported before) "not run: the import
+wrote no new frames"; cancelling the queued or running import cancels it too. The follow-up steps run
+after the last job of the chain, and only when it ended Done.
+
+**Recent imports** (under the card) lists the imports of the folder auto-label works on (the Review
+page's, `collect.review_dir` or the dataset folder); a row's **Auto-label** button fills the Auto-label
+card's filter with `import=<id>`, status `any` and the import's frame count.
+
+On the command line: `train import ... --autolabel` (the labelers with their defaults) or
+`--autolabel-with-model <name|local:<file>|resource:<id>>` (implies it), `--reject-below <0.01..1>` and
+`--accept-auto` (both need one of those), `--review-folder` (needs `--out-dir`; a model entry the run
+adds and the folder switch are saved to the config file). It runs the import, then the auto-label, and
+exits non-zero when either fails (a run skipped because nothing new was imported is not a failure).
+
 ### M1 run (debug build, MPS)
 
 | Import | Time | Result |
@@ -727,7 +763,9 @@ blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <e
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
     [--max-candidates 1500] [--workers 0] [--hwaccel auto|off] \
-    [--license "own footage"] --confirm-license [--allow-large] [--keep-work] [--verbose]
+    [--license "own footage"] --confirm-license [--allow-large] [--keep-work] [--verbose] \
+    [--out-dir <dir> [--review-folder]] [--autolabel | --autolabel-with-model <model>] \
+    [--reject-below 0.3] [--accept-auto]
 blue-onyx-prism train import --url <video URL> --license "CC BY 4.0" --confirm-license [...]
 blue-onyx-prism train import --dataset meva-sample [...]
 blue-onyx-prism train import --list-datasets

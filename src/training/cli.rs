@@ -207,9 +207,79 @@ pub struct ImportArgs {
     /// Review pages show; relative = under the data root).
     #[arg(long)]
     pub out_dir: Option<PathBuf>,
+    /// Auto-label the imported frames when the import finished (the labelers with their
+    /// defaults; they need an NVIDIA GPU or Apple silicon). Not run when the import fails or
+    /// writes no new frame.
+    #[arg(long)]
+    pub autolabel: bool,
+    /// Auto-label the imported frames with this model instead (implies --autolabel): a
+    /// configured model's name, local:<file> or a catalog model (see `train autolabel
+    /// --with-model`).
+    #[arg(long)]
+    pub autolabel_with_model: Option<String>,
+    /// After the auto-label: reject its pending boxes scoring below this (0.01..1) on the
+    /// imported frames (kept as hard negatives, reason low_score).
+    #[arg(long)]
+    pub reject_below: Option<f32>,
+    /// After the auto-label (and --reject-below): save the imported frames whose boxes are all
+    /// `auto: accept` as reviewed.
+    #[arg(long)]
+    pub accept_auto: bool,
+    /// When done: point the Review page at --out-dir (collect.review_dir).
+    #[arg(long)]
+    pub review_folder: bool,
     /// Print the helper's output.
     #[arg(long)]
     pub verbose: bool,
+}
+
+/// What `train import` runs after the import ([`import_chain`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportChain {
+    /// The auto-label run of the imported frames (its frames are set by
+    /// [`super::autolabel::follow_import`]).
+    pub autolabel: Option<super::autolabel::AutolabelRequest>,
+    pub reject_below: Option<f32>,
+    pub accept_auto: bool,
+    pub review_folder: bool,
+}
+
+/// The follow-up options of `a`, checked: --reject-below and --accept-auto need the
+/// auto-label, --review-folder needs --out-dir.
+pub fn import_chain(a: &ImportArgs) -> Result<ImportChain> {
+    use super::autolabel::{AutolabelRequest, FrameFilter};
+    let autolabel = a.autolabel || a.autolabel_with_model.is_some();
+    if !autolabel && a.reject_below.is_some() {
+        bail!("--reject-below applies to the auto-label of the import; add --autolabel");
+    }
+    if !autolabel && a.accept_auto {
+        bail!("--accept-auto applies to the auto-label of the import; add --autolabel");
+    }
+    if let Some(v) = a.reject_below
+        && !(v.is_finite() && (0.01..=1.0).contains(&v))
+    {
+        bail!("--reject-below must be between 0.01 and 1, got {v}");
+    }
+    if a.review_folder && a.out_dir.is_none() {
+        bail!(
+            "--review-folder points the Review page at the import's folder; give it with \
+             --out-dir (the default folder is the dataset folder the page shows already)"
+        );
+    }
+    let request = autolabel
+        .then(|| {
+            let mut r = AutolabelRequest::new(FrameFilter::default());
+            r.with_model = a.autolabel_with_model.clone();
+            r.allow_large = a.allow_large;
+            r.validate().map(|()| r)
+        })
+        .transpose()?;
+    Ok(ImportChain {
+        autolabel: request,
+        reject_below: a.reject_below,
+        accept_auto: a.accept_auto,
+        review_folder: a.review_folder,
+    })
 }
 
 /// `train autolabel`.
@@ -364,6 +434,21 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
 /// Run one import or auto-label task on a queue of this process, printing its progress; true
 /// when it finished.
 fn run_task_cli(config: &Config, task: Box<dyn super::task::Task>, verbose: bool) -> Result<bool> {
+    let recs = run_tasks_cli(config, vec![task], verbose)?;
+    Ok(recs
+        .first()
+        .and_then(Option::as_ref)
+        .is_some_and(|r| r.state == RunState::Done))
+}
+
+/// Run `tasks` in order on a queue of this process (a task that follows another is skipped
+/// there when that one failed), printing their progress; their final records (None when one
+/// vanished). Ctrl-C cancels the running one and the ones that follow it.
+fn run_tasks_cli(
+    config: &Config,
+    tasks: Vec<Box<dyn super::task::Task>>,
+    verbose: bool,
+) -> Result<Vec<Option<super::task::TaskRecord>>> {
     let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
     let svc = TrainingService::start(
         Arc::new(crate::resources::export::SystemRunner),
@@ -373,15 +458,41 @@ fn run_task_cli(config: &Config, task: Box<dyn super::task::Task>, verbose: bool
     );
     let cancel = Arc::new(AtomicBool::new(false));
     let _ctrl_c = crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the job");
-    let id = svc.enqueue_task(task).map_err(anyhow::Error::msg)?;
+    let mut ids = Vec::new();
+    for t in tasks {
+        match svc.enqueue_task(t) {
+            Ok(id) => ids.push(id),
+            Err(e) => {
+                for id in &ids {
+                    svc.cancel(id);
+                }
+                svc.shutdown();
+                bail!(e);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for id in &ids {
+        out.push(watch_task(&svc, id, &cancel, verbose));
+    }
+    svc.shutdown();
+    Ok(out)
+}
+
+/// Follow task `id` until it is no longer busy, printing its progress and outcome.
+fn watch_task(
+    svc: &TrainingService,
+    id: &str,
+    cancel: &AtomicBool,
+    verbose: bool,
+) -> Option<super::task::TaskRecord> {
     let mut last = String::new();
     let mut last_step = usize::MAX;
     let mut last_print = std::time::Instant::now();
     let mut seen_log = 0usize;
-    let mut ok = false;
-    while let Some(r) = svc.wait_task(&id, Duration::from_secs(1)) {
+    while let Some(r) = svc.wait_task(id, Duration::from_secs(1)) {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            svc.cancel(&id);
+            svc.cancel(id);
         }
         if verbose {
             for l in r.log.iter().skip(seen_log.min(r.log.len())) {
@@ -415,12 +526,21 @@ fn run_task_cli(config: &Config, task: Box<dyn super::task::Task>, verbose: bool
                     }
                 }
             }
-            ok = r.state == RunState::Done;
-            break;
+            return Some(r);
         }
     }
-    svc.shutdown();
-    Ok(ok)
+    None
+}
+
+/// Whether task `i` of an import chain ended well: Done, or (the auto-label) not run because
+/// the import wrote no new frame.
+fn chain_ok(i: usize, r: Option<&super::task::TaskRecord>) -> bool {
+    r.is_some_and(|r| {
+        r.state == RunState::Done
+            || (i > 0
+                && r.state == RunState::Cancelled
+                && r.summary.as_deref() == Some(super::autolabel::NO_NEW_FRAMES))
+    })
 }
 
 /// What a run trains on.
@@ -723,19 +843,60 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 }
                 return Ok(true);
             };
+            let chain = import_chain(&a)?;
             let cap = super::capability_now();
-            let job = super::import::plan_import(&config, req, &cap)?;
+            let mut job = super::import::plan_import(&config, req, &cap)?;
+            // The folder switch and a model the auto-label adds go to the config file.
+            let writer: Arc<dyn super::autolabel::models::ConfigWriter> =
+                Arc::new(super::autolabel::models::FileConfigWriter { path: path.clone() });
+            let finish = super::finish::Finish {
+                reject_below: chain.reject_below,
+                accept_auto: chain.accept_auto,
+                review_folder: chain.review_folder.then(|| job.dataset_dir.clone()),
+                config_writer: Some(writer.clone()),
+            };
+            let finish = (!finish.is_empty()).then_some(finish);
+            // Planned before anything runs: a bad auto-label setting imports nothing.
+            let autolabel = match chain.autolabel {
+                Some(r) => {
+                    let mut al = super::autolabel::plan_autolabel(&config, r, &cap)
+                        .context("auto-label of the import (nothing was imported)")?;
+                    super::autolabel::follow_import(&mut al, &job);
+                    al.config_writer = Some(writer);
+                    al.finish = finish;
+                    Some(al)
+                }
+                None => {
+                    job.finish = finish;
+                    None
+                }
+            };
             eprintln!(
-                "importing {} into {} (licence: {})",
+                "importing {} into {} (licence: {}){}",
                 job.request.source.describe(),
                 job.dataset_dir.display(),
                 if job.license.is_empty() {
                     "the dataset's"
                 } else {
                     &job.license
+                },
+                if autolabel.is_some() {
+                    ", then auto-labelling its frames"
+                } else {
+                    ""
                 }
             );
-            run_task_cli(&config, Box::new(job), a.verbose)
+            let mut tasks: Vec<Box<dyn super::task::Task>> = vec![Box::new(job)];
+            if let Some(al) = autolabel {
+                tasks.push(Box::new(al));
+            }
+            let n = tasks.len();
+            let recs = run_tasks_cli(&config, tasks, a.verbose)?;
+            Ok(recs.len() == n
+                && recs
+                    .iter()
+                    .enumerate()
+                    .all(|(i, r)| chain_ok(i, r.as_ref())))
         }
         TrainCommand::Autolabel(a) => {
             let req = autolabel_request(&a)?;
@@ -1180,6 +1341,91 @@ mod tests {
             panic!()
         };
         assert!(autolabel_request(&bad).is_err());
+    }
+
+    #[test]
+    fn import_follow_up_flags_parse_and_are_checked() {
+        let chain = |args: &[&str]| {
+            let mut v = vec!["import", "--path", "clips"];
+            v.extend_from_slice(args);
+            let TrainCommand::Import(a) = parse(&v).unwrap() else {
+                panic!("not import")
+            };
+            import_chain(&a)
+        };
+        let none = chain(&[]).unwrap();
+        assert_eq!(none.autolabel, None);
+        assert!(!none.accept_auto && !none.review_folder && none.reject_below.is_none());
+        let c = chain(&[
+            "--autolabel",
+            "--reject-below",
+            "0.3",
+            "--accept-auto",
+            "--allow-large",
+        ])
+        .unwrap();
+        let r = c.autolabel.unwrap();
+        assert_eq!(r.with_model, None);
+        assert!(r.allow_large && r.rfdetr);
+        assert_eq!((c.reject_below, c.accept_auto), (Some(0.3), true));
+        let m = chain(&["--autolabel-with-model", "ipcam-general"]).unwrap();
+        assert_eq!(
+            m.autolabel.unwrap().with_model.as_deref(),
+            Some("ipcam-general"),
+            "implies --autolabel"
+        );
+        let f = chain(&["--review-folder", "--out-dir", "picked"]).unwrap();
+        assert!(f.review_folder && f.autolabel.is_none());
+        for (bad, what) in [
+            (&["--review-folder"][..], "--out-dir"),
+            (&["--reject-below", "0.3"][..], "--autolabel"),
+            (&["--accept-auto"][..], "--autolabel"),
+            (
+                &["--autolabel", "--reject-below", "0"][..],
+                "between 0.01 and 1",
+            ),
+            (
+                &["--autolabel", "--reject-below", "1.5"][..],
+                "between 0.01 and 1",
+            ),
+        ] {
+            let e = chain(bad).unwrap_err().to_string();
+            assert!(e.contains(what), "{bad:?}: {e}");
+        }
+        assert!(parse(&["import", "--path", "a", "--reject-below", "x"]).is_err());
+        let ok = |i, st, summary: Option<&str>| {
+            let mut r = super::super::task::TaskRecord {
+                id: "x".into(),
+                kind: super::super::task::TaskKind::Autolabel,
+                title: String::new(),
+                created: String::new(),
+                state: st,
+                stage: None,
+                step: 0,
+                steps: 1,
+                percent: 0,
+                detail: String::new(),
+                log: vec![],
+                summary: None,
+                result: None,
+                error: None,
+                finished: None,
+                after: None,
+            };
+            r.summary = summary.map(str::to_string);
+            chain_ok(i, Some(&r))
+        };
+        let nothing_new = Some(super::super::autolabel::NO_NEW_FRAMES);
+        assert!(ok(0, RunState::Done, None));
+        assert!(ok(1, RunState::Cancelled, nothing_new));
+        assert!(!ok(0, RunState::Cancelled, nothing_new));
+        assert!(!ok(
+            1,
+            RunState::Cancelled,
+            Some("not run: the import it follows failed")
+        ));
+        assert!(!ok(1, RunState::Failed, None));
+        assert!(!chain_ok(0, None));
     }
 
     #[test]

@@ -4,7 +4,9 @@
 //! training environment is used by one job at a time, and each holds the cross-process
 //! training lock (`tools/.train.lock`) while it runs. A [`Task`] reports numbered stages and
 //! log lines; its [`TaskRecord`] (state, progress, log tail, result) is kept like a run's, in
-//! `<training dir>/tasks.json`.
+//! `<training dir>/tasks.json`. A task can follow another ([`Task::after`]: an auto-label run
+//! queued with its import): it runs only when that one finished as it needs
+//! ([`Task::skip_reason`]), else it ends Cancelled with the reason as its summary.
 
 use super::service::RunState;
 use crate::resources::export::{CommandRunner, Fetcher};
@@ -85,6 +87,31 @@ pub trait Task: Send {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> anyhow::Result<TaskOutcome>;
+    /// The task this one follows (queued before it): it runs only when that one allows it
+    /// ([`Self::skip_reason`]).
+    fn after(&self) -> Option<&str> {
+        None
+    }
+    /// Why this task does not run after `dep` (the record of [`Self::after`]); None = run. By
+    /// default it runs only after a finished (Done) task.
+    fn skip_reason(&self, dep: &TaskRecord) -> Option<String> {
+        default_skip_reason(dep)
+    }
+}
+
+/// [`Task::skip_reason`]'s default: "not run: the import it follows failed" unless `dep` is
+/// Done.
+pub fn default_skip_reason(dep: &TaskRecord) -> Option<String> {
+    let what = match dep.state {
+        RunState::Done => return None,
+        RunState::Cancelled => "was cancelled",
+        RunState::Failed => "failed",
+        RunState::Queued | RunState::Running | RunState::Paused => "did not finish",
+    };
+    Some(format!(
+        "not run: the {} it follows {what}",
+        dep.kind.as_str()
+    ))
 }
 
 /// One task as the Training page and the CLI show it.
@@ -112,6 +139,9 @@ pub struct TaskRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub finished: Option<String>,
+    /// The task it follows ([`Task::after`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 impl TaskRecord {
@@ -132,13 +162,17 @@ impl TaskRecord {
             result: None,
             error: None,
             finished: None,
+            after: task.after().map(str::to_string),
         }
     }
 
     /// "extracting frames (2/5): 12 of 40" / "failed while ...: ..." / "done: ...".
     pub fn describe(&self) -> String {
         match self.state {
-            RunState::Queued => "queued".into(),
+            RunState::Queued => match &self.after {
+                Some(a) => format!("queued (after {a})"),
+                None => "queued".into(),
+            },
             RunState::Running => match &self.stage {
                 Some(s) if self.detail.is_empty() => format!("{s} ({}/{})", self.step, self.steps),
                 Some(s) => format!("{s} ({}/{}): {}", self.step, self.steps, self.detail),
@@ -245,6 +279,7 @@ mod tests {
             result: None,
             error: None,
             finished: None,
+            after: None,
         };
         assert_eq!(r.describe(), "extracting frames (2/5): 12 frames");
         r.state = RunState::Paused;
@@ -280,6 +315,7 @@ mod tests {
             result: None,
             error: None,
             finished: None,
+            after: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains(r#""state":"paused""#), "{json}");

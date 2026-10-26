@@ -316,6 +316,7 @@ folder; the collector and the Dataset page keep `collect.dir`.
   - `accepted`: a model or auto box that is a real object;
   - `added`: a box the reviewer drew (a miss);
   - `rejected`: a wrong box. It is kept as hard-negative evidence and never becomes a training label;
+    a pending auto box rejected in bulk for its score has `reason: "low_score"`;
   - `pending`: not decided yet. Only `unreviewed` and `skipped` files have pending boxes.
 - **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
   `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
@@ -454,6 +455,16 @@ any, `limit` 1..20000, default 500) takes the queue with those filters, `status=
 each frame, re-checked under the lock, is saved as `reviewed` by the save rule with `bulk_accepted:
 true`: `{success, eligible, accepted, failed: ["<frame>: <why>", ...], frames, message}` (at most 20
 listed each).
+
+`POST /v1/review/reject-low` (JSON `{bucket?, scene?, camera?, label?, source?, min_score, dry_run,
+limit?}`, `min_score` required, 0.01..1; the Review page's *Reject auto boxes below*) takes the
+unreviewed frames of those filters and rejects their pending `source: auto` boxes scoring below
+`min_score` (`state: rejected`, `reason: "low_score"`); the frame's status, its other boxes and reviewed
+or skipped frames are left alone. `dry_run` answers `{success, eligible, boxes, rejected: 0, frames}`
+(frames with such boxes, the boxes on them); otherwise each frame is re-checked under the lock:
+`{success, eligible, boxes, rejected, failed, frames, message}` (`boxes` rejected, `rejected` frames
+changed). The auto-label chain's reject step (docs/TRAINING.md, "Auto-label after import") is the
+same code (`collect/labels/bulk.rs`), scoped to the import's frames.
 
 ### Keyboard
 

@@ -4,7 +4,8 @@
 // Filters (bucket, scene, camera, class, auto, status, source) go to /v1/review/next as query
 // params. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
 // The Auto-label card queues a job (POST /training/autolabel as JSON) and follows it on
-// GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto.
+// GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto and
+// "Reject auto boxes below" POST /v1/review/reject-low (both: dry run, confirm, run).
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
 // a new folder reloads the page.
 // Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
@@ -1257,6 +1258,49 @@
         box.className = 'review-report error-text';
         report(box, [e.message]);
       }).then(function () { bulkBtn.disabled = false; });
+    });
+  }
+
+  var rejectBtn = $('rv-reject-low');
+  if (rejectBtn) {
+    rejectBtn.addEventListener('click', function () {
+      var box = $('rv-reject-low-msg');
+      var score = parseFloat($('rv-reject-low-score').value);
+      box.className = 'review-report';
+      if (!(score >= 0.01 && score <= 1)) {
+        box.className = 'review-report error-text';
+        report(box, ['Enter a score between 0.01 and 1.']);
+        return;
+      }
+      var body = { min_score: score };
+      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
+        var e = filtersForm.elements[k];
+        if (e && e.value) body[k] = e.value;
+      });
+      body.dry_run = true;
+      report(box, ['Counting the boxes...']);
+      rejectBtn.disabled = true;
+      postJson('/v1/review/reject-low', body).then(function (j) {
+        var n = j.boxes || 0;
+        if (!n) { report(box, [j.message || ('No pending auto box below ' + score + ' on the unreviewed frames the filters select.')]); return null; }
+        if (!window.confirm('Reject ' + n + ' box(es) on ' + (j.eligible || 0) + ' frame(s): the pending auto boxes ' +
+          'scoring below ' + score + '? They are kept as hard negatives (reason low_score); the frames stay ' +
+          'unreviewed and a reviewer can still change them per frame.')) {
+          report(box, ['Nothing rejected.']);
+          return null;
+        }
+        body.dry_run = false;
+        return postJson('/v1/review/reject-low', body).then(function (r) {
+          var failed = r.failed || [];
+          report(box, [r.message || ('Rejected ' + (r.boxes || 0) + ' box(es).')],
+            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
+          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+          return reloadQueue();
+        });
+      }).catch(function (e) {
+        box.className = 'review-report error-text';
+        report(box, [e.message]);
+      }).then(function () { rejectBtn.disabled = false; });
     });
   }
 

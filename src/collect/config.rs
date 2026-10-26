@@ -464,10 +464,52 @@ impl CollectSettings {
     }
 }
 
+/// Point the Review page at `dir` (`collect.review_dir` of `config`; None or the dataset folder
+/// itself = the dataset folder) and check the section (`POST /v1/review/folder`, the
+/// auto-label chain's folder switch).
+pub fn set_review_dir(
+    config: &mut crate::config::Config,
+    dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let dataset = CollectSettings::for_config(config).dir;
+    let same = |d: &Path| {
+        let d = config.data_path(d);
+        match (d.canonicalize(), dataset.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => d == dataset,
+        }
+    };
+    let dir = dir.filter(|d| !d.as_os_str().is_empty() && !same(d));
+    config.collect.review_dir = dir;
+    config.collect.validate(&config.data_root())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_review_dir_keeps_another_folder_and_drops_the_dataset_folder() {
+        let root = std::env::temp_dir().join(format!("bop-review-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(DEFAULT_DIR_NAME)).unwrap();
+        let mut c = crate::config::Config {
+            download_dir: Some(root.clone()),
+            ..crate::config::Config::default()
+        };
+        let other = root.join("imports").join("a");
+        set_review_dir(&mut c, Some(other.clone())).unwrap();
+        assert_eq!(c.collect.review_dir, Some(other));
+        set_review_dir(&mut c, Some(root.join(DEFAULT_DIR_NAME))).unwrap();
+        assert_eq!(c.collect.review_dir, None, "the dataset folder itself");
+        set_review_dir(&mut c, Some(DEFAULT_DIR_NAME.into())).unwrap();
+        assert_eq!(c.collect.review_dir, None, "relative to the data root");
+        set_review_dir(&mut c, Some("imports/b".into())).unwrap();
+        assert_eq!(c.collect.review_dir, Some(PathBuf::from("imports/b")));
+        set_review_dir(&mut c, Some(PathBuf::new())).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(c.collect.review_dir, None);
+    }
 
     #[test]
     fn defaults() {

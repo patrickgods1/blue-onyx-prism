@@ -6,9 +6,10 @@
 //! ([`auto_accept_eligible`]). IO: [`Frame::resolve`] (every frame reference goes through
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
-//! review queue is in [`queue`], the YOLO / COCO / benchmark exporters in
-//! [`export`] and the X-AnyLabeling interop in [`xany`].
+//! review queue is in [`queue`], the bulk accept / low-score reject in [`bulk`], the YOLO /
+//! COCO / benchmark exporters in [`export`] and the X-AnyLabeling interop in [`xany`].
 
+pub mod bulk;
 pub mod export;
 pub mod queue;
 pub mod xany;

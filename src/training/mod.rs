@@ -12,6 +12,8 @@
 //! - [`job`]: one run's stage machine over the model export's seams (`CommandRunner`, `Fetcher`;
 //!   the environment is `tools/train-env`, [`crate::resources::export::train`]).
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
+//! - [`finish`]: the steps after an import chain (reject low-scoring auto boxes, accept the
+//!   settled frames, switch the Review folder).
 //! - [`bench`]: the benchmark at the end of a run.
 //! - [`cli`]: `blue-onyx-prism train ...`. The Training page is `crate::server` (`/training`).
 //!
@@ -26,6 +28,7 @@ pub mod cli;
 pub mod config;
 pub mod dataset;
 pub mod estimate;
+pub mod finish;
 pub mod import;
 pub mod job;
 pub mod progress;

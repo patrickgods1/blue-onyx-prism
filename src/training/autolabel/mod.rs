@@ -560,7 +560,31 @@ pub fn plan_autolabel(
         model,
         detector: None,
         config_writer: None,
+        after: None,
+        finish: None,
     })
+}
+
+/// [`super::task::Task::skip_reason`] of a run after an import that wrote no frame.
+pub const NO_NEW_FRAMES: &str =
+    "not run: the import wrote no new frames (all were imported before)";
+
+/// Make `job` (planned by [`plan_autolabel`]) label exactly the frames of `import`, after it:
+/// that import's folder, its frames whatever their review status (`import=<id>, status=any,
+/// source=all`), at most as many as it imports (capped at [`MAX_LIMIT`]). The labelers' marker
+/// still skips frames they looked at already (`again` is not set).
+pub fn follow_import(job: &mut AutolabelJob, import: &super::import::job::ImportJob) {
+    job.after = Some(import.id.clone());
+    job.dataset_dir = import.dataset_dir.clone();
+    job.request.frames = FrameFilter {
+        query: [
+            ("import".to_string(), import.id.clone()),
+            ("status".to_string(), "any".to_string()),
+            ("source".to_string(), "all".to_string()),
+        ]
+        .into(),
+        limit: import.request.frames.clamp(1, MAX_LIMIT),
+    };
 }
 
 /// The gates of a catalog model a run installs or adds: an export this platform cannot run, a

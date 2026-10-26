@@ -278,8 +278,11 @@ pub(super) struct TrainingTemplate {
     jobs_busy: bool,
     footage: Vec<super::training_tasks::FootageRow>,
     dataset_dir: String,
-    /// Imports listed in the dataset folder.
+    /// Imports listed in the folder auto-label runs on (`collect.resolved_review_dir`, the
+    /// Review page's folder), so their Auto-label buttons find the frames.
     imports: Vec<crate::training::import::write::ImportLine>,
+    /// That folder.
+    imports_dir: String,
 }
 
 fn state_str(s: RunState) -> &'static str {
@@ -321,6 +324,7 @@ pub(super) fn view(
 ) -> TrainingTemplate {
     let config = state.config_read().clone();
     let dataset_dir = crate::collect::CollectSettings::for_config(&config).dir;
+    let imports_dir = config.collect.resolved_review_dir(&config.data_root());
     let cap: Capability = crate::training::capability_now();
     let paths = TrainPaths::for_config(&config);
     let platform = Platform::current();
@@ -665,11 +669,12 @@ pub(super) fn view(
         jobs_busy,
         footage: super::training_tasks::footage(),
         imports: {
-            let mut v = crate::training::import::write::read_imports(&dataset_dir);
+            let mut v = crate::training::import::write::read_imports(&imports_dir);
             v.reverse();
             v.truncate(10);
             v
         },
+        imports_dir: imports_dir.display().to_string(),
         dataset_dir: dataset_dir.display().to_string(),
     }
 }
@@ -1754,6 +1759,7 @@ mod tests {
             result: None,
             error: None,
             finished: None,
+            after: None,
         };
         let (run, paused) = ("pause-test-running", "pause-test-paused");
         svc.put_task_record(rec(run, RunState::Running));
