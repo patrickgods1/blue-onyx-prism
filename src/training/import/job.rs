@@ -68,6 +68,9 @@ pub struct ImportJob {
     pub timeout: Duration,
     /// Videos, a URL or the SigLIP selection: the training environment is used.
     pub needs_python: bool,
+    /// Steps after a finished import that nothing follows ([`crate::training::finish`]; the
+    /// Review folder switch).
+    pub finish: Option<crate::training::finish::Finish>,
 }
 
 /// A frame before the selection.
@@ -1554,12 +1557,19 @@ impl Task for ImportJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
-        self.run_guarded(
+        let mut out = self.run_guarded(
             ctx,
             report,
             cancel,
             Guard::new(&self.work, &self.dataset_dir),
-        )
+        )?;
+        if let Some(fin) = self.finish.as_ref().filter(|f| !f.is_empty())
+            && !cancel.load(Ordering::Relaxed)
+        {
+            let lines = fin.apply(&self.dataset_dir, Some(&self.id), &[]);
+            crate::training::finish::append(&mut out, lines);
+        }
+        Ok(out)
     }
 }
 

@@ -13,6 +13,7 @@ use crate::training::autolabel::models::{ConfigWriter, Install, Target};
 use crate::training::autolabel::triage::Det;
 use crate::training::autolabel::{FrameFilter, plan_autolabel};
 use crate::training::capability::{self, Capability};
+use crate::training::service::RunState;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -1490,4 +1491,131 @@ fn a_cancelled_model_run_keeps_the_finished_frames() {
         })
         .collect();
     assert_eq!(marked.len(), 3, "{marked:?}");
+}
+
+/// An import of `<root>/clips` (one image, dHash, no Python) planned with the id the test
+/// frames carry.
+fn import_job(cfg: &Config, root: &Path, frames: usize) -> crate::training::import::job::ImportJob {
+    use crate::training::import::{ImportRequest, ImportSource, Selection, plan_import};
+    std::fs::create_dir_all(root.join("clips")).unwrap();
+    std::fs::copy(root.join("src.jpg"), root.join("clips/a.jpg")).unwrap();
+    let mut r = ImportRequest::new(ImportSource::Path(root.join("clips")));
+    r.license_confirmed = true;
+    r.selection = Selection::Dhash;
+    r.frames = frames;
+    let mut j = plan_import(cfg, r, &host()).unwrap();
+    j.id = "20261022-000000-abcd".into();
+    j
+}
+
+#[test]
+fn a_run_follows_an_import_and_is_skipped_when_it_wrote_nothing() {
+    let t = tmp("follow");
+    let _ = frames(&t.0, 1, true);
+    let cfg = config(&t.0);
+    let mut imp = import_job(&cfg, &t.0, 50);
+    imp.dataset_dir = t.0.join("elsewhere");
+    let mut job = plan_autolabel(
+        &cfg,
+        AutolabelRequest::new(FrameFilter::parse("scene=ir,again=1,limit=3", "any").unwrap()),
+        &host(),
+    )
+    .unwrap();
+    assert_eq!((job.after.as_deref(), job.finish.is_none()), (None, true));
+    super::super::follow_import(&mut job, &imp);
+    assert_eq!(job.after.as_deref(), Some("20261022-000000-abcd"));
+    assert_eq!(job.dataset_dir, t.0.join("elsewhere"));
+    let f = &job.request.frames;
+    assert_eq!(f.import(), Some("20261022-000000-abcd"));
+    assert_eq!(
+        (f.query["status"].as_str(), f.query["source"].as_str()),
+        ("any", "all")
+    );
+    assert!(!f.again() && !f.query.contains_key("scene"), "{f:?}");
+    assert_eq!(f.limit, 50);
+    assert_eq!(Task::after(&job), Some("20261022-000000-abcd"));
+    assert!(
+        job.title().contains("import 20261022-000000-abcd"),
+        "{}",
+        job.title()
+    );
+    let rec = TaskRecord::new(&job, String::new());
+    assert_eq!(rec.describe(), "queued (after 20261022-000000-abcd)");
+    // The limit follows the import's frame count, capped.
+    imp.request.frames = super::super::MAX_LIMIT + 5;
+    super::super::follow_import(&mut job, &imp);
+    assert_eq!(job.request.frames.limit, super::super::MAX_LIMIT);
+
+    // The import it follows.
+    let mut dep = TaskRecord::new(&imp, String::new());
+    dep.state = RunState::Done;
+    dep.result = Some(serde_json::json!({ "frames": 7 }));
+    assert_eq!(job.skip_reason(&dep), None);
+    dep.result = Some(serde_json::json!({ "frames": 0 }));
+    assert_eq!(
+        job.skip_reason(&dep).as_deref(),
+        Some(super::super::NO_NEW_FRAMES)
+    );
+    for (st, why) in [
+        (RunState::Failed, "not run: the import it follows failed"),
+        (
+            RunState::Cancelled,
+            "not run: the import it follows was cancelled",
+        ),
+    ] {
+        dep.state = st;
+        assert_eq!(job.skip_reason(&dep).as_deref(), Some(why));
+    }
+}
+
+#[test]
+fn a_chained_run_rejects_low_boxes_then_accepts_then_switches_the_folder() {
+    use crate::training::finish::Finish;
+    let t = tmp("finish");
+    let rels = frames(&t.0, 2, true);
+    let cfg = config(&t.0);
+    let imp = import_job(&cfg, &t.0, 2);
+    let mut job =
+        plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    super::super::follow_import(&mut job, &imp);
+    let writer = Arc::new(MemWriter(Mutex::new(cfg.clone())));
+    let folder = t.0.join("dataset");
+    let other = t.0.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    job.finish = Some(Finish {
+        reject_below: Some(0.5),
+        accept_auto: true,
+        review_folder: Some(other.clone()),
+        config_writer: Some(writer.clone()),
+    });
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    // The raccoon (0.31, review) is rejected; then the car (accept) alone settles the frames.
+    assert!(
+        out.summary
+            .contains("then: rejected 2 auto box(es) scoring below 0.5 on 2 frame(s) of import"),
+        "{}",
+        out.summary
+    );
+    assert!(
+        out.summary.contains("accepted 2 frame(s)"),
+        "{}",
+        out.summary
+    );
+    assert!(
+        out.summary.contains("the Review page now shows"),
+        "{}",
+        out.summary
+    );
+    assert_eq!(out.result["finish"].as_array().unwrap().len(), 3);
+    for rel in &rels {
+        let f = labels_of(&folder, rel);
+        assert_eq!(f.status, Status::Reviewed, "{rel}");
+        assert!(f.bulk_accepted);
+        let raccoon = f.boxes.iter().find(|b| b.label == "raccoon").unwrap();
+        assert_eq!(raccoon.state, BoxState::Rejected);
+        assert_eq!(raccoon.reason.as_deref(), Some("low_score"));
+        let car = f.boxes.iter().find(|b| b.label == "car").unwrap();
+        assert_eq!(car.state, BoxState::Accepted);
+    }
+    assert_eq!(writer.0.lock().unwrap().collect.review_dir, Some(other));
 }

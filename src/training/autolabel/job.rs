@@ -27,7 +27,7 @@ use crate::resources::catalog::{Platform, Resource, ResourceKind};
 use crate::resources::export::train::TrainPaths;
 use crate::training::capability::Accelerator;
 use crate::training::pyenv::{self, check, stage};
-use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskReport};
+use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskRecord, TaskReport};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -93,6 +93,11 @@ pub struct AutolabelJob {
     /// Saves the config entry of a local or catalog model (None: the run uses the entry without
     /// saving it, with a warning).
     pub config_writer: Option<Arc<dyn ConfigWriter>>,
+    /// The import this run follows ([`super::follow_import`]): it labels that import's frames
+    /// once the import is done, and is not run when it failed, was cancelled or wrote no frame.
+    pub after: Option<String>,
+    /// Steps after a finished run ([`crate::training::finish`]).
+    pub finish: Option<crate::training::finish::Finish>,
 }
 
 impl std::fmt::Debug for AutolabelJob {
@@ -101,6 +106,8 @@ impl std::fmt::Debug for AutolabelJob {
             .field("id", &self.id)
             .field("request", &self.request)
             .field("dataset_dir", &self.dataset_dir)
+            .field("after", &self.after)
+            .field("finish", &self.finish)
             .finish_non_exhaustive()
     }
 }
@@ -1062,21 +1069,23 @@ impl Task for AutolabelJob {
         TaskKind::Autolabel
     }
     fn title(&self) -> String {
-        match &self.model {
-            Some(m) => format!(
-                "label with {} on {} ({})",
-                m.name,
-                m.device,
-                self.request.frames.describe()
-            ),
+        // A run after an import names it instead of its frame filter.
+        let frames = match &self.after {
+            Some(id) => format!("import {id}"),
+            None => self.request.frames.describe(),
+        };
+        match (&self.model, &self.after) {
+            (Some(m), _) => format!("label with {} on {} ({frames})", m.name, m.device),
+            (None, Some(_)) => match (&self.request.gpu, &self.accelerator) {
+                (Some(_), Some(a)) => {
+                    format!("auto-label of {frames} on {}", a.device_arg())
+                }
+                _ => format!("auto-label of {frames}"),
+            },
             // A chosen GPU is named (the automatic pick is the page's "PyTorch on ...").
-            None => match (&self.request.gpu, &self.accelerator) {
-                (Some(_), Some(a)) => format!(
-                    "auto-label on {} ({})",
-                    a.device_arg(),
-                    self.request.frames.describe()
-                ),
-                _ => format!("auto-label ({})", self.request.frames.describe()),
+            (None, None) => match (&self.request.gpu, &self.accelerator) {
+                (Some(_), Some(a)) => format!("auto-label on {} ({frames})", a.device_arg()),
+                _ => format!("auto-label ({frames})"),
             },
         }
     }
@@ -1093,7 +1102,26 @@ impl Task for AutolabelJob {
         if r.is_err() {
             let _ = crate::resources::manager::remove_any(&self.work);
         }
-        r
+        let mut out = r?;
+        if let Some(fin) = self.finish.as_ref().filter(|f| !f.is_empty())
+            && !cancelled(cancel)
+            && out.result.get("cancelled") != Some(&serde_json::Value::Bool(true))
+        {
+            let scope = self.request.frames.import().filter(|i| *i != "any");
+            let lines = fin.apply(&self.dataset_dir, scope, &self.config.collect.classes);
+            crate::training::finish::append(&mut out, lines);
+        }
+        Ok(out)
+    }
+    fn after(&self) -> Option<&str> {
+        self.after.as_deref()
+    }
+    fn skip_reason(&self, dep: &TaskRecord) -> Option<String> {
+        crate::training::task::default_skip_reason(dep).or_else(|| {
+            let frames = dep.result.as_ref().and_then(|r| r.get("frames"));
+            (frames.and_then(serde_json::Value::as_u64) == Some(0))
+                .then(|| super::NO_NEW_FRAMES.to_string())
+        })
     }
 }
 

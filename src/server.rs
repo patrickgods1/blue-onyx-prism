@@ -207,6 +207,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             post(review::accept_auto).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
         (
+            "/v1/review/reject-low",
+            post(review::reject_low).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
             "/v1/review/export",
             post(review::export).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
@@ -1016,6 +1020,7 @@ mod tests {
             "/v1/review/next",
             "/v1/review/labels",
             "/v1/review/accept-auto",
+            "/v1/review/reject-low",
             "/v1/review/export",
             "/v1/review/import",
             "/v1/review/classes",

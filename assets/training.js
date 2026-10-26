@@ -2,8 +2,15 @@
 // the model name with several models ticked; without JS every field shows and works), live
 // progress of the queued and running training runs and import / auto-label jobs (polls
 // GET /v1/training) and a reload when one finishes, so the results show.
+// Auto-label after import: a ticked import posts the Auto-label card's fields as `al.<name>`
+// hidden inputs (its classes included); the box and its follow-up options are remembered in
+// localStorage. A Recent imports row's Auto-label button fills the card's filter (import=<id>).
 (function () {
   "use strict";
+
+  // Set by the auto-label classes block: the picker's selection, whether some are outside the
+  // class list, and the confirm that appends them (null without the picker).
+  var alClasses = null;
 
   // The value of the checked radio `name` of `form`.
   function checked(form, name) {
@@ -178,6 +185,15 @@
         form.appendChild(i);
       });
     };
+    alClasses = function () {
+      if (!picker) return null;
+      var names = picker.getSelected();
+      return {
+        names: names,
+        missing: CP.util.missingFrom(names, catalog.classes || []).length > 0,
+        ensure: function () { return CP.ensureInList(names, catalog); }
+      };
+    };
     form.addEventListener("submit", function (ev) {
       if (mode() === "model" && !modelProblemOk(ev)) return;
       if (!picker) { fields([]); return; }
@@ -192,6 +208,112 @@
         confirmed = true;
         if (form.requestSubmit) form.requestSubmit(by || undefined); else form.submit();
       }).catch(function (e) { say(e.cancelled ? "Not queued: the class list was left as it is." : e.message, true); });
+    });
+  })();
+
+  // Auto-label after import: the follow-up options show while the box is ticked (hidden ones
+  // are disabled, so not posted), the Review folder switch while "Save frames to" has a value.
+  (function () {
+    var form = document.getElementById("import-form");
+    var alForm = document.getElementById("autolabel-form");
+    var box = document.getElementById("import-autolabel");
+    if (!form || !box) return;
+    var after = document.getElementById("import-after");
+    var folder = document.getElementById("import-after-folder");
+    var out = form.elements.out_dir;
+    var msg = document.getElementById("import-autolabel-msg");
+    var KEY = "bop.training.importAfter";
+    var NAMES = ["autolabel", "after_reject", "after_accept", "after_review_folder"];
+    var say = function (t) { if (msg) { msg.textContent = t || ""; msg.className = "form-msg" + (t ? " error-text" : ""); } };
+    var show = function (el, on) {
+      if (!el) return;
+      el.hidden = !on;
+      el.querySelectorAll("input").forEach(function (i) { i.disabled = !on; });
+    };
+    var update = function () {
+      show(after, box.checked);
+      show(folder, !!(out && out.value.trim()));
+    };
+    var remember = function () {
+      var v = {};
+      NAMES.forEach(function (n) { var e = form.elements[n]; if (e) v[n] = !!e.checked; });
+      var sc = form.elements.after_reject_score;
+      if (sc) v.after_reject_score = sc.value;
+      try { window.localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) { /* private mode */ }
+    };
+    (function restore() {
+      var v = null;
+      try { v = JSON.parse(window.localStorage.getItem(KEY) || "null"); } catch (e) { v = null; }
+      if (!v || typeof v !== "object") return;
+      NAMES.forEach(function (n) { var e = form.elements[n]; if (e && typeof v[n] === "boolean") e.checked = v[n]; });
+      var sc = form.elements.after_reject_score;
+      if (sc && typeof v.after_reject_score === "string" && v.after_reject_score) sc.value = v.after_reject_score;
+    })();
+    NAMES.concat(["after_reject_score"]).forEach(function (n) {
+      var e = form.elements[n];
+      if (e) e.addEventListener("change", function () { remember(); update(); });
+    });
+    if (out) { out.addEventListener("input", update); out.addEventListener("change", update); }
+    update();
+
+    var confirmed = false;
+    form.addEventListener("submit", function (ev) {
+      form.querySelectorAll("input.al-injected").forEach(function (i) { i.remove(); });
+      say("");
+      remember();
+      if (!box.checked || !alForm) return;
+      var cls = alClasses ? alClasses() : null;
+      if (cls && !cls.names.length) {
+        ev.preventDefault();
+        say("Auto-label: choose at least one class to look for on the Auto-label card.");
+        return;
+      }
+      if (cls && cls.missing && !confirmed) {
+        ev.preventDefault();
+        var by = ev.submitter;
+        cls.ensure().then(function () {
+          confirmed = true;
+          if (form.requestSubmit) form.requestSubmit(by || undefined); else form.submit();
+        }).catch(function (e) { say(e.cancelled ? "Not imported: the class list was left as it is." : e.message); });
+        return;
+      }
+      confirmed = false;
+      var add = function (name, value) {
+        var i = document.createElement("input");
+        i.type = "hidden"; i.name = "al." + name; i.value = value; i.className = "al-injected";
+        form.appendChild(i);
+      };
+      new FormData(alForm).forEach(function (value, name) {
+        if (typeof value !== "string") return;
+        if (cls && name === "classes") return;
+        add(name, value);
+      });
+      if (cls) cls.names.forEach(function (n) { add("classes", n); });
+    });
+
+    // Recent imports: Auto-label fills the card's filter with the import and scrolls to it.
+    document.querySelectorAll("[data-al-fallback]").forEach(function (a) { a.hidden = true; });
+    document.querySelectorAll("button[data-al-import]").forEach(function (b) {
+      b.hidden = false;
+      b.addEventListener("click", function () {
+        if (!alForm) return;
+        var frames = document.getElementById("al-frames");
+        var status = document.getElementById("al-status");
+        var limit = document.getElementById("al-limit");
+        var n = parseInt(b.getAttribute("data-al-frames"), 10);
+        if (!(n >= 1)) n = 1;
+        if (frames) {
+          frames.value = "import=" + b.getAttribute("data-al-import");
+          var d = frames.closest("details");
+          if (d) d.open = true;
+        }
+        if (status) status.value = "any";
+        if (limit) limit.value = String(Math.min(n, 20000));
+        var card = document.getElementById("autolabel");
+        if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
+        var submit = alForm.querySelector('.actions button[type="submit"]');
+        if (submit) submit.focus({ preventScroll: true });
+      });
     });
   })();
 
@@ -246,8 +368,12 @@
     });
   });
   if (Object.keys(busy).length === 0) return;
-  function describe(r) {
-    if (r.state === "queued") return "queued";
+  function describe(r, list) {
+    if (r.state === "queued") {
+      if (!r.after) return "queued";
+      var dep = (list || []).filter(function (x) { return x.id === r.after; })[0];
+      return "queued (after " + (dep && dep.kind === "import" ? "import " : "") + r.after + ")";
+    }
     if (r.state !== "running" && r.state !== "paused") return r.state;
     var s = r.stage ? String(r.stage).replace(/_/g, " ") : "starting";
     if (r.state === "paused") return r.stage ? "paused (" + s + " " + r.step + "/" + r.steps + ")" + (r.detail ? ": " + r.detail : "") : "paused";
@@ -266,7 +392,7 @@
       };
       set("state", r.state);
       set("percent", r.percent);
-      set("describe", describe(r));
+      set("describe", describe(r, list));
       if (r.log && r.log.length) set("log", r.log.slice(-6).join("\n"));
       // Pause while running, Resume while paused (Cancel in both).
       var pause = tr.querySelector('[data-field="pause"]');

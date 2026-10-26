@@ -9,13 +9,14 @@
 //! `application/json` (the Review page's fetch), else the Training page.
 
 use super::training::{all, field, num, service, view};
-use super::{Shared, blocking, render};
+use super::{AppState, Shared, blocking, render};
 use crate::config::Config;
 use crate::resources::catalog;
 use crate::training::autolabel::models::{self as al_models, ConfigWriter};
 use crate::training::autolabel::{
-    AutolabelRequest, FrameFilter, GdinoSize, VlmSize, default_status,
+    AutolabelJob, AutolabelRequest, FrameFilter, GdinoSize, VlmSize, default_status,
 };
+use crate::training::finish::Finish;
 use crate::training::import::{ImportRequest, ImportSource, Selection};
 use crate::training::service::RunState;
 use crate::training::task::{TaskKind, TaskRecord};
@@ -70,6 +71,21 @@ fn state_str(s: RunState) -> &'static str {
     }
 }
 
+/// What a row says about `r`: [`TaskRecord::describe`], a queued job that follows an import
+/// as "queued (after import <id>)".
+fn describe_row(r: &TaskRecord, tasks: &[TaskRecord]) -> String {
+    match (&r.after, r.state) {
+        (Some(a), RunState::Queued)
+            if tasks
+                .iter()
+                .any(|t| &t.id == a && t.kind == TaskKind::Import) =>
+        {
+            format!("queued (after import {a})")
+        }
+        _ => r.describe(),
+    }
+}
+
 /// The newest jobs first, at most 30.
 pub(super) fn task_rows(tasks: &[TaskRecord]) -> Vec<TaskRow> {
     tasks
@@ -86,7 +102,7 @@ pub(super) fn task_rows(tasks: &[TaskRecord]) -> Vec<TaskRow> {
             state: state_str(r.state),
             busy: r.state.is_busy(),
             percent: r.percent,
-            describe: r.describe(),
+            describe: describe_row(r, tasks),
             log_tail: r
                 .log
                 .iter()
@@ -274,7 +290,76 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
     Ok(r)
 }
 
-/// `POST /training/import`.
+/// The auto-label form's fields an import posts with `al.` (prefix stripped), without its frame
+/// fields ([`FILTER_FIELDS`], `frames`, `again`): the run labels the import's frames
+/// ([`crate::training::autolabel::follow_import`]).
+fn chained_autolabel_fields(f: &[(String, String)]) -> Vec<(String, String)> {
+    f.iter()
+        .filter_map(|(k, v)| Some((k.strip_prefix("al.")?.to_string(), v.clone())))
+        .filter(|(k, _)| {
+            !FILTER_FIELDS.contains(&k.as_str()) && k.as_str() != "frames" && k.as_str() != "again"
+        })
+        .collect()
+}
+
+/// Default of `after_reject_score`.
+const AFTER_REJECT_DEFAULT: f32 = 0.3;
+
+/// The steps after an import of a form ([`Finish`]): `after_reject` (ticked; then
+/// `after_reject_score`, 0.01..=1, default 0.3) and `after_accept` need `autolabel`,
+/// `after_review_folder` needs `out_dir` (the import's folder `dataset_dir`). None when no step
+/// is ticked. Errors name the option.
+fn finish_from_form(
+    f: &[(String, String)],
+    chained: bool,
+    out_dir: Option<&std::path::Path>,
+    dataset_dir: &std::path::Path,
+) -> anyhow::Result<Option<Finish>> {
+    let reject = field(f, "after_reject").is_some();
+    let accept = field(f, "after_accept").is_some();
+    let folder = field(f, "after_review_folder").is_some();
+    if !chained && reject {
+        anyhow::bail!(
+            "reject auto boxes scoring below: needs Auto-label after import; tick \"Auto-label the \
+             imported frames\" or untick it"
+        );
+    }
+    if !chained && accept {
+        anyhow::bail!(
+            "accept frames whose boxes are all auto: accept: needs Auto-label after import; tick \
+             \"Auto-label the imported frames\" or untick it"
+        );
+    }
+    let reject_below = if reject {
+        let v = num::<f32>(f, "after_reject_score", "reject auto boxes scoring below")?
+            .unwrap_or(AFTER_REJECT_DEFAULT);
+        if !(v.is_finite() && (0.01..=1.0).contains(&v)) {
+            anyhow::bail!("reject auto boxes scoring below: must be between 0.01 and 1, got {v}");
+        }
+        Some(v)
+    } else {
+        None
+    };
+    if folder && out_dir.is_none() {
+        anyhow::bail!(
+            "show this folder on the Review page: give a folder in Save frames to (the default \
+             folder is the dataset folder the Review page shows already)"
+        );
+    }
+    let fin = Finish {
+        reject_below,
+        accept_auto: accept,
+        review_folder: folder.then(|| dataset_dir.to_path_buf()),
+        config_writer: None,
+    };
+    Ok((!fin.is_empty()).then_some(fin))
+}
+
+/// `POST /training/import`. With `autolabel` ticked, the auto-label card's fields (posted with
+/// an `al.` prefix) queue an auto-label of the import's frames right after it
+/// ([`chained_autolabel_fields`], [`crate::training::task::Task::after`]); the follow-up steps
+/// ([`finish_from_form`]) run after the last task. Everything is planned before anything is
+/// queued: a bad auto-label setting imports nothing.
 pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes) -> Response {
     blocking(move || {
         let state = shared.current();
@@ -294,24 +379,71 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
                     .map_err(|e| anyhow::anyhow!("save frames to: {}", e.into_parts().1))?;
                 req.out_dir = Some(allowed);
             }
+            let chained = field(&f, "autolabel").is_some();
+            let has_out_dir = req.out_dir.is_some();
             let cap = crate::training::capability_now();
-            let job = crate::training::import::plan_import(&config, req, &cap)?;
+            let mut job = crate::training::import::plan_import(&config, req, &cap)?;
+            let mut finish = finish_from_form(
+                &f,
+                chained,
+                has_out_dir.then_some(job.dataset_dir.as_path()),
+                &job.dataset_dir,
+            )?;
+            if let Some(fin) = &mut finish {
+                fin.config_writer = Some(Arc::new(ServerConfigWriter {
+                    shared: shared.clone(),
+                }));
+            }
+            let switches = finish.as_ref().is_some_and(|f| f.review_folder.is_some());
+            let autolabel = if chained {
+                let mut plan = || -> anyhow::Result<AutolabelJob> {
+                    let req = autolabel_from_form(&chained_autolabel_fields(&f))?;
+                    let mut al = crate::training::autolabel::plan_autolabel(&config, req, &cap)?;
+                    attach_seams(&state, &shared, &config, &mut al);
+                    crate::training::autolabel::follow_import(&mut al, &job);
+                    al.finish = finish.take();
+                    Ok(al)
+                };
+                Some(plan().map_err(|e| anyhow::anyhow!("auto-label: {e:#}"))?)
+            } else {
+                job.finish = finish.take();
+                None
+            };
             let title = crate::training::task::Task::title(&job);
             let shown = job.dataset_dir == crate::collect::CollectSettings::for_config(&config).dir;
             let out = job.dataset_dir.display().to_string();
-            service(&shared)
+            let svc = service(&shared);
+            let import_id = svc
                 .enqueue_task(Box::new(job))
                 .map_err(anyhow::Error::msg)?;
-            Ok(if shown {
-                format!(
-                    "Queued: {title}. The frames appear on the Dataset and Review pages when it is done."
-                )
+            let mut msg = match autolabel {
+                Some(al) => {
+                    let al_title = crate::training::task::Task::title(&al);
+                    if let Err(e) = svc.enqueue_task(Box::new(al)) {
+                        svc.cancel(&import_id);
+                        anyhow::bail!("auto-label: {e} (the import was cancelled too)");
+                    }
+                    format!(
+                        "Queued: {title}, then {al_title}. The auto-label runs only when the \
+                         import finishes with new frames; its boxes appear on the Review page as \
+                         pending auto boxes."
+                    )
+                }
+                None => format!("Queued: {title}."),
+            };
+            if switches {
+                msg.push_str(&format!(
+                    " The Review page switches to {out} when it is done."
+                ));
+            } else if shown {
+                msg.push_str(" The frames appear on the Dataset and Review pages when it is done.");
             } else {
-                format!(
-                    "Queued: {title}. The frames are written to {out}; to review them, choose that \
-                     folder on the Review page."
-                )
-            })
+                msg.push_str(&format!(
+                    " The frames are written to {out}; to review them, choose that folder on the \
+                     Review page."
+                ));
+            }
+            Ok(msg)
         })();
         match result {
             Ok(m) => render(&view(&state, Some(m), None)),
@@ -414,18 +546,7 @@ pub(super) async fn autolabel(
             let req = autolabel_from_form(&f)?;
             let cap = crate::training::capability_now();
             let mut job = crate::training::autolabel::plan_autolabel(&config, req, &cap)?;
-            if job.request.with_model.is_some() {
-                // The generation's runtimes (no second OpenVINO / ONNX Runtime instance).
-                job.detector = Some(Arc::new(
-                    crate::training::autolabel::relabel::LocalDetector {
-                        config: config.clone(),
-                        runtimes: state.registry.runtimes().cloned(),
-                    },
-                ));
-                job.config_writer = Some(Arc::new(ServerConfigWriter {
-                    shared: shared.clone(),
-                }));
-            }
+            attach_seams(&state, &shared, &config, &mut job);
             let title = crate::training::task::Task::title(&job);
             let id = service(&shared)
                 .enqueue_task(Box::new(job))
@@ -454,6 +575,22 @@ pub(super) async fn autolabel(
         }
     })
     .await
+}
+
+/// The server's seams of a run with a model: the generation's runtimes (no second OpenVINO /
+/// ONNX Runtime instance) and the config writer of the model entry it adds.
+fn attach_seams(state: &AppState, shared: &Shared, config: &Config, job: &mut AutolabelJob) {
+    if job.request.with_model.is_some() {
+        job.detector = Some(Arc::new(
+            crate::training::autolabel::relabel::LocalDetector {
+                config: config.clone(),
+                runtimes: state.registry.runtimes().cloned(),
+            },
+        ));
+        job.config_writer = Some(Arc::new(ServerConfigWriter {
+            shared: shared.clone(),
+        }));
+    }
 }
 
 /// Saves the config entry a run with a local or catalog model adds (disabled) through
@@ -1133,6 +1270,277 @@ mod tests {
         let (s, _, b) = call(&state, post("frames=colour%3Dred", "text/html")).await;
         assert_eq!(s, StatusCode::OK);
         assert!(String::from_utf8(b).unwrap().contains("Not queued"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn chained_fields_and_follow_ups_parse() {
+        let f = form(&[
+            ("al.mode", "model"),
+            ("al.with_model", "x"),
+            ("al.status", "reviewed"),
+            ("al.limit", "5"),
+            ("al.frames", "import=other"),
+            ("al.again", "1"),
+            ("al.classes", "person"),
+            ("frames", "40"),
+        ]);
+        let al = chained_autolabel_fields(&f);
+        assert_eq!(
+            al,
+            form(&[
+                ("mode", "model"),
+                ("with_model", "x"),
+                ("classes", "person")
+            ]),
+            "the frame fields are dropped, the import's own fields are not the run's"
+        );
+        let d = std::path::Path::new("/data/out");
+        assert!(
+            finish_from_form(&form(&[]), true, None, d)
+                .unwrap()
+                .is_none()
+        );
+        let fin = finish_from_form(
+            &form(&[
+                ("after_reject", "on"),
+                ("after_accept", "on"),
+                ("after_review_folder", "on"),
+            ]),
+            true,
+            Some(d),
+            d,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fin.reject_below, Some(0.3), "the default score");
+        assert!(fin.accept_auto);
+        assert_eq!(fin.review_folder.as_deref(), Some(d));
+        let fin = finish_from_form(
+            &form(&[("after_reject", "on"), ("after_reject_score", "0.45")]),
+            true,
+            None,
+            d,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fin.reject_below, Some(0.45));
+        // The score alone (box unticked) is no step.
+        assert!(
+            finish_from_form(&form(&[("after_reject_score", "0.5")]), false, None, d)
+                .unwrap()
+                .is_none()
+        );
+        // The folder switch alone, without auto-label.
+        let fin = finish_from_form(&form(&[("after_review_folder", "on")]), false, Some(d), d)
+            .unwrap()
+            .unwrap();
+        assert_eq!((fin.reject_below, fin.accept_auto), (None, false));
+        for (f, chained, out, want) in [
+            (
+                form(&[("after_reject", "on")]),
+                false,
+                None,
+                "needs Auto-label after import",
+            ),
+            (
+                form(&[("after_accept", "on")]),
+                false,
+                None,
+                "needs Auto-label after import",
+            ),
+            (
+                form(&[("after_reject", "on"), ("after_reject_score", "0")]),
+                true,
+                None,
+                "reject auto boxes scoring below: must be between 0.01 and 1",
+            ),
+            (
+                form(&[("after_reject", "on"), ("after_reject_score", "1.5")]),
+                true,
+                None,
+                "reject auto boxes scoring below",
+            ),
+            (
+                form(&[("after_reject", "on"), ("after_reject_score", "low")]),
+                true,
+                None,
+                "reject auto boxes scoring below: 'low' is not a number",
+            ),
+            (
+                form(&[("after_review_folder", "on")]),
+                true,
+                None,
+                "Save frames to",
+            ),
+        ] {
+            let e = finish_from_form(&f, chained, out, d)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(want), "{f:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_job_after_an_import_says_so() {
+        let rec = |id: &str, kind, state, after: Option<&str>| TaskRecord {
+            id: id.into(),
+            kind,
+            title: String::new(),
+            created: String::new(),
+            state,
+            stage: None,
+            step: 0,
+            steps: 1,
+            percent: 0,
+            detail: String::new(),
+            log: vec![],
+            summary: None,
+            result: None,
+            error: None,
+            finished: None,
+            after: after.map(str::to_string),
+        };
+        let tasks = vec![
+            rec("imp", TaskKind::Import, RunState::Running, None),
+            rec("al", TaskKind::Autolabel, RunState::Queued, Some("imp")),
+            rec("al2", TaskKind::Autolabel, RunState::Queued, Some("al")),
+            rec("al3", TaskKind::Autolabel, RunState::Queued, Some("gone")),
+            rec("al4", TaskKind::Autolabel, RunState::Done, Some("imp")),
+        ];
+        let rows = task_rows(&tasks);
+        let by = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .map(|r| r.describe.clone())
+                .unwrap()
+        };
+        assert_eq!(by("al"), "queued (after import imp)");
+        assert_eq!(by("al2"), "queued (after al)");
+        assert_eq!(by("al3"), "queued (after gone)");
+        assert!(by("al4").starts_with("done"), "{}", by("al4"));
+    }
+
+    #[tokio::test]
+    async fn an_import_can_queue_an_auto_label_of_its_frames() {
+        let _queue = super::super::training::QUEUE_TEST_LOCK.lock().await;
+        use crate::server::test_util::{call, get_text, post_form, test_state_with};
+        let root = std::env::temp_dir().join(format!("bop-train-chain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("chainsnaps")).unwrap();
+        let img = crate::image::RgbImage {
+            width: 32,
+            height: 24,
+            rgb: vec![90; 32 * 24 * 3],
+        };
+        std::fs::write(
+            root.join("chainsnaps/Gate.20240101_120000.jpg"),
+            crate::image::encode_jpeg(&img, 90).unwrap(),
+        )
+        .unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let (_, page) = get_text(&state, "/training").await;
+        assert!(page.contains("import-autolabel"), "the import card's box");
+        assert!(page.contains("import-after"), "its follow-up options");
+        let tasks = |state: Arc<AppState>| async move {
+            let (_, json) = get_text(&state, "/v1/training").await;
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v["tasks"].as_array().unwrap().clone()
+        };
+        let post = |state: Arc<AppState>, body: String| async move {
+            let (_, _, b) = call(&state, post_form("/training/import", &body, true)).await;
+            String::from_utf8(b).unwrap()
+        };
+        let src = format!(
+            "source=path&path={}&confirm_license=on&select=dhash&frames=5",
+            super::super::encode_uri_component(&root.join("chainsnaps").display().to_string())
+        );
+
+        // Bad auto-label settings, a follow-up without its option: nothing is queued.
+        let before = tasks(state.clone()).await.len();
+        for (extra, want) in [
+            (
+                "&autolabel=on&al.mode=labelers&al.gdino=off&al.vlm=off",
+                "Not imported: auto-label",
+            ),
+            ("&autolabel=on&al.mode=model", "Not imported: auto-label"),
+            ("&after_review_folder=on", "Save frames to"),
+            ("&after_reject=on", "needs Auto-label after import"),
+            (
+                "&autolabel=on&al.mode=model&al.with_model=ipcam-general&after_reject=on\
+                 &after_reject_score=2",
+                "reject auto boxes scoring below",
+            ),
+        ] {
+            let html = post(state.clone(), format!("{src}{extra}")).await;
+            assert!(
+                html.contains("Not imported") && html.contains(want),
+                "{extra}: {html}"
+            );
+        }
+        assert_eq!(tasks(state.clone()).await.len(), before, "nothing queued");
+
+        // A model run needs no GPU: the import, then the auto-label of its frames.
+        let html = post(
+            state.clone(),
+            format!(
+                "{src}&autolabel=on&al.mode=model&al.with_model=ipcam-general&al.status=reviewed\
+                 &al.limit=7&al.run_options=1&after_reject=on"
+            ),
+        )
+        .await;
+        assert!(
+            html.contains("Queued: import of chainsnaps") && html.contains(", then label with"),
+            "{html}"
+        );
+        let all = tasks(state.clone()).await;
+        let imp = all
+            .iter()
+            .find(|t| {
+                t["kind"] == "import"
+                    && t["title"]
+                        .as_str()
+                        .is_some_and(|x| x.contains("import of chainsnaps"))
+            })
+            .unwrap()
+            .clone();
+        let imp_id = imp["id"].as_str().unwrap().to_string();
+        let al = all
+            .iter()
+            .find(|t| t["after"] == imp_id.as_str())
+            .unwrap()
+            .clone();
+        let al_id = al["id"].as_str().unwrap().to_string();
+        assert_eq!(al["kind"], "autolabel");
+        assert!(
+            al["title"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("import {imp_id}")),
+            "{al}"
+        );
+        // Cancel the chain (the import's cancel takes the auto-label with it while it waits);
+        // the model run itself is not this test's business.
+        for id in [&imp_id, &al_id] {
+            let _ = call(
+                &state,
+                post_form("/training/cancel", &format!("id={id}"), true),
+            )
+            .await;
+        }
+        let mut settled = false;
+        for _ in 0..400 {
+            let all = tasks(state.clone()).await;
+            let busy = all.iter().any(|t| {
+                (t["id"] == imp_id.as_str() || t["id"] == al_id.as_str())
+                    && ["queued", "running", "paused"].contains(&t["state"].as_str().unwrap_or(""))
+            });
+            if !busy {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(settled, "the chain ended");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

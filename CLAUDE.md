@@ -126,7 +126,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 - Review (`src/collect/labels/`, `/review`, `assets/review.js`): per-frame `<stem>.labels.json` (v1; states pending/
   accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
   `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk
-  accept of `auto=accept` frames `POST /v1/review/accept-auto`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
+  accept of `auto=accept` frames `POST /v1/review/accept-auto`; bulk reject of pending auto boxes below a score `POST /v1/review/reject-low`, `reason: low_score`; both in `collect/labels/bulk.rs`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
   X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned. The page reviews `collect.review_dir`
   (default `collect.dir`; *Folder under review*, `POST /v1/review/folder`), e.g. an import saved with `train import --out-dir`;
   auto-label runs follow it. Class selection: a run may pick a subset of `collect.classes` (`AutoRun.classes`; skipped only when the
@@ -146,7 +146,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   preflight and running guard (`import/disk.rs`, ENOSPC -> one actionable error, work folder removed); `GET /v1/training/import/preview` backs the page's preview line) and `train autolabel` (`training/autolabel/`:
   MM-Grounding-DINO + RF-DETR L, Qwen3-VL / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label;
   run options: batched VLM check, `--vlm-min-score`, prefetch; a Cancel keeps the finished frames, a rerun resumes)
-  are `task::Task`s on the same one-at-a-time queue, recorded in `<training dir>/tasks.json` beside `runs.json`; pins in
+  are `task::Task`s on the same one-at-a-time queue (an import can queue an auto-label of its frames: `Task::after`, skipped unless the import is Done with new frames; post-steps reject-low / accept / review folder in `training/finish.rs`), recorded in `<training dir>/tasks.json` beside `runs.json`; pins in
   `catalog/autolabel.rs`. A running job pauses / resumes (`PausableRunner`: SIGSTOP/SIGCONT of the helper's process group,
   Windows: the job object's threads suspended; paused time does not count toward the timeout). Split Blue Iris exports
   (`Cam.<time>_N.mp4`) get per-part start times (`source::segment_offsets`). Several NVIDIA GPUs: `--gpu cuda:N` / the

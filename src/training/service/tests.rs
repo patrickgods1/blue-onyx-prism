@@ -219,3 +219,198 @@ fn paused_serializes_as_paused() {
     assert!(RunState::Paused.is_busy());
     assert!(!RunState::Queued.is_active());
 }
+
+/// A task that ends at once: Done, Failed, or (with `cancelled`) as a cancelled run; `after` =
+/// the task it follows. Counts its runs.
+struct QuickTask {
+    id: String,
+    after: Option<String>,
+    fail: bool,
+    cancelled: bool,
+    ran: Arc<AtomicUsize>,
+}
+
+impl QuickTask {
+    fn new(id: &str, after: Option<&str>, ran: &Arc<AtomicUsize>) -> Self {
+        Self {
+            id: id.into(),
+            after: after.map(str::to_string),
+            fail: false,
+            cancelled: false,
+            ran: ran.clone(),
+        }
+    }
+}
+
+impl Task for QuickTask {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn kind(&self) -> task::TaskKind {
+        if self.after.is_some() {
+            task::TaskKind::Autolabel
+        } else {
+            task::TaskKind::Import
+        }
+    }
+    fn title(&self) -> String {
+        format!("quick {}", self.id)
+    }
+    fn steps(&self) -> usize {
+        1
+    }
+    fn after(&self) -> Option<&str> {
+        self.after.as_deref()
+    }
+    fn run(
+        &self,
+        _ctx: TaskContext<'_>,
+        _report: &mut dyn FnMut(TaskReport<'_>),
+        _cancel: &AtomicBool,
+    ) -> Result<task::TaskOutcome> {
+        self.ran.fetch_add(1, Ordering::Relaxed);
+        if self.cancelled {
+            return Err(anyhow::anyhow!(Cancelled));
+        }
+        if self.fail {
+            anyhow::bail!("boom");
+        }
+        Ok(task::TaskOutcome {
+            summary: format!("{} done", self.id),
+            result: serde_json::json!({ "frames": 1 }),
+        })
+    }
+}
+
+fn quick_service() -> Arc<TrainingService> {
+    TrainingService::start(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        None,
+    )
+}
+
+#[test]
+fn a_task_after_a_failed_or_cancelled_one_is_not_run() {
+    let svc = quick_service();
+    let ran = Arc::new(AtomicUsize::new(0));
+    // A failed: B is Cancelled with the reason, never run.
+    let mut a = QuickTask::new("a1", None, &ran);
+    a.fail = true;
+    svc.enqueue_task(Box::new(a)).unwrap();
+    let b = QuickTask::new("b1", Some("a1"), &ran);
+    let rec = TaskRecord::new(&b, String::new());
+    assert_eq!(rec.after.as_deref(), Some("a1"));
+    assert_eq!(rec.describe(), "queued (after a1)");
+    svc.enqueue_task(Box::new(b)).unwrap();
+    let r = svc.wait_task("b1", Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Cancelled);
+    assert_eq!(
+        r.summary.as_deref(),
+        Some("not run: the import it follows failed")
+    );
+    assert!(r.finished.is_some());
+    assert_eq!(ran.load(Ordering::Relaxed), 1, "only A ran");
+    // A cancelled while running (the cancellation error): B is not run either.
+    let mut a = QuickTask::new("a2", None, &ran);
+    a.cancelled = true;
+    svc.enqueue_task(Box::new(a)).unwrap();
+    svc.enqueue_task(Box::new(QuickTask::new("b2", Some("a2"), &ran)))
+        .unwrap();
+    let r = svc.wait_task("b2", Duration::from_secs(10)).unwrap();
+    assert_eq!(state(&svc, "a2"), RunState::Cancelled);
+    assert_eq!(r.state, RunState::Cancelled);
+    assert_eq!(
+        r.describe(),
+        "cancelled: not run: the import it follows was cancelled"
+    );
+    assert_eq!(ran.load(Ordering::Relaxed), 2);
+    // The queue goes on.
+    svc.enqueue_task(Box::new(QuickTask::new("c", None, &ran)))
+        .unwrap();
+    assert_eq!(
+        svc.wait_task("c", Duration::from_secs(10)).unwrap().state,
+        RunState::Done
+    );
+    svc.shutdown();
+}
+
+#[test]
+fn a_task_after_a_done_or_removed_one_runs() {
+    let svc = quick_service();
+    let ran = Arc::new(AtomicUsize::new(0));
+    svc.enqueue_task(Box::new(QuickTask::new("a", None, &ran)))
+        .unwrap();
+    svc.enqueue_task(Box::new(QuickTask::new("b", Some("a"), &ran)))
+        .unwrap();
+    let r = svc.wait_task("b", Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Done);
+    assert_eq!(r.summary.as_deref(), Some("b done"));
+    // The record it follows is gone (removed after it finished): it runs.
+    svc.remove("a").unwrap();
+    svc.enqueue_task(Box::new(QuickTask::new("c", Some("a"), &ran)))
+        .unwrap();
+    assert_eq!(
+        svc.wait_task("c", Duration::from_secs(10)).unwrap().state,
+        RunState::Done
+    );
+    assert_eq!(ran.load(Ordering::Relaxed), 3);
+    svc.shutdown();
+}
+
+#[test]
+fn cancelling_a_task_cancels_the_queued_tasks_that_follow_it() {
+    let dir = std::env::temp_dir().join(format!("bop-train-after-{}", uuid::Uuid::new_v4()));
+    let runner = Arc::new(HoldRunner::default());
+    let svc = TrainingService::start(
+        runner.clone(),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        Some(dir.join("runs.json")),
+    );
+    let ran = Arc::new(AtomicUsize::new(0));
+    // A blocker holds the queue, so A and its followers stay queued.
+    svc.enqueue_task(Box::new(HoldTask {
+        id: "hold".into(),
+        keep: false,
+    }))
+    .unwrap();
+    for t in [
+        QuickTask::new("a", None, &ran),
+        QuickTask::new("b", Some("a"), &ran),
+        QuickTask::new("c", Some("b"), &ran),
+        QuickTask::new("other", None, &ran),
+    ] {
+        svc.enqueue_task(Box::new(t)).unwrap();
+    }
+    until("the blocker", || {
+        runner.started.load(Ordering::Relaxed) == 1
+    });
+    assert!(svc.cancel("a"));
+    for id in ["a", "b", "c"] {
+        assert_eq!(state(&svc, id), RunState::Cancelled, "{id}");
+    }
+    assert_eq!(
+        svc.get_task("b").unwrap().summary.as_deref(),
+        Some("not run: the import it follows was cancelled")
+    );
+    assert_eq!(state(&svc, "other"), RunState::Queued);
+    // Persisted.
+    let back = task::load_records(&dir.join(task::TASKS_FILE));
+    let c = back.iter().find(|r| r.id == "c").unwrap();
+    assert_eq!(
+        (c.state, c.after.as_deref()),
+        (RunState::Cancelled, Some("b"))
+    );
+    assert!(svc.cancel("hold"));
+    let r = svc.wait_task("other", Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Done);
+    assert_eq!(
+        ran.load(Ordering::Relaxed),
+        1,
+        "only the unrelated task ran"
+    );
+    svc.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

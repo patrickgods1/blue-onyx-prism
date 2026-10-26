@@ -388,6 +388,7 @@ pub fn plan_import(
         root: config.data_root(),
         timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
         needs_python,
+        finish: None,
     })
 }
 

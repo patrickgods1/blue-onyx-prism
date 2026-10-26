@@ -556,21 +556,22 @@ impl TrainingService {
         }
     }
 
-    /// Cancel a queued or running run or task; returns whether there was one.
+    /// Cancel a queued or running run or task; returns whether there was one. The queued tasks
+    /// that follow a cancelled task ([`Task::after`]) are cancelled with it.
     pub fn cancel(&self, id: &str) -> bool {
         if let Some(st) = self.get_task(id).map(|r| r.state) {
-            return match st {
+            let done = match st {
                 RunState::Queued => {
-                    self.inner.cancelled.lock_recover().insert(id.to_string());
-                    self.inner.update_persist_task(id, |r| {
-                        r.state = RunState::Cancelled;
-                        r.finished = Some(now());
-                    });
+                    self.cancel_queued_task(id, None);
                     true
                 }
                 RunState::Running | RunState::Paused => self.flag_current(id),
                 _ => false,
             };
+            if done {
+                self.cancel_followers(id);
+            }
+            return done;
         }
         let Some(st) = self.get(id).map(|r| r.state) else {
             return false;
@@ -586,6 +587,39 @@ impl TrainingService {
             }
             RunState::Running | RunState::Paused => self.flag_current(id),
             _ => false,
+        }
+    }
+
+    /// Mark the queued task `id` Cancelled (with `summary`) and drop it when the worker gets it.
+    fn cancel_queued_task(&self, id: &str, summary: Option<String>) {
+        self.inner.cancelled.lock_recover().insert(id.to_string());
+        self.inner.update_persist_task(id, |r| {
+            if r.state == RunState::Queued {
+                r.state = RunState::Cancelled;
+                r.summary = summary;
+                r.finished = Some(now());
+            }
+        });
+    }
+
+    /// Cancel the queued tasks that follow `id`, and the ones that follow those.
+    fn cancel_followers(&self, id: &str) {
+        let mut todo = vec![id.to_string()];
+        while let Some(dep) = todo.pop() {
+            let kind = self.get_task(&dep).map_or("task", |r| r.kind.as_str());
+            let followers: Vec<String> = self
+                .inner
+                .tasks
+                .lock_recover()
+                .iter()
+                .filter(|r| r.state == RunState::Queued && r.after.as_deref() == Some(&dep))
+                .map(|r| r.id.clone())
+                .collect();
+            for f in followers {
+                let why = format!("not run: the {kind} it follows was cancelled");
+                self.cancel_queued_task(&f, Some(why));
+                todo.push(f);
+            }
         }
     }
 
@@ -898,6 +932,28 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
 /// Run one task on the queue's thread (see [`worker_loop`]).
 fn run_task(inner: &Inner, t: &dyn Task) {
     let id = t.id().to_string();
+    // A task that follows another runs only when that one allows it (a record removed since
+    // does not stop it).
+    if let Some(dep) = t.after() {
+        let rec = inner
+            .tasks
+            .lock_recover()
+            .iter()
+            .find(|r| r.id == dep)
+            .cloned();
+        if let Some(why) = rec.and_then(|r| t.skip_reason(&r)) {
+            tracing::info!(job = %id, "{} {why}", t.kind().as_str());
+            inner.cancelled.lock_recover().remove(&id);
+            inner.update_persist_task(&id, |r| {
+                if r.state == RunState::Queued {
+                    r.state = RunState::Cancelled;
+                    r.summary = Some(why);
+                    r.finished = Some(now());
+                }
+            });
+            return;
+        }
+    }
     let cur = Current::new(&id);
     let (flag, pause) = (cur.cancel.clone(), cur.pause.clone());
     *inner.current.lock_recover() = Some(cur);
