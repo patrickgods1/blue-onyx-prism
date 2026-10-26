@@ -63,6 +63,7 @@ fn state_str(s: RunState) -> &'static str {
     match s {
         RunState::Queued => "queued",
         RunState::Running => "running",
+        RunState::Paused => "paused",
         RunState::Done => "done",
         RunState::Failed => "failed",
         RunState::Cancelled => "cancelled",
@@ -204,8 +205,12 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 /// ignores `with_model`, `model` needs it; absent = `with_model` decides, as the Review page and
 /// older forms post), `gdino`, `vlm` (`off` = none), `rfdetr` / `siglip` (ticked = on; the
 /// Review page's form sends them), `with_model` (any id of `GET /v1/autolabel/models`),
-/// `threshold`, and for a run with a model `device` (empty = the model's), `model_accept_score`
-/// (empty = off); `confirm_large`, `confirm_license` (ticked = confirmed).
+/// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick), and for
+/// a run with a model `device` (empty = the model's), `model_accept_score` (empty = off);
+/// `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
+/// `vlm_batch`, `prefetch` and `vlm_min_on` (ticked = on; then `vlm_min_score` applies) count
+/// only when the form posts `run_options` (the Training page's card); without it (the Review
+/// page, older forms) they keep the request's defaults.
 pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<AutolabelRequest> {
     let with_model = match field(f, "mode") {
         Some("labelers") => None,
@@ -232,10 +237,25 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
     };
     r.rfdetr = field(f, "rfdetr").is_some();
     r.siglip = field(f, "siglip").is_some();
+    if field(f, "run_options").is_some() {
+        r.keep_on_cancel = field(f, "keep_on_cancel").is_some();
+        r.vlm_batch = field(f, "vlm_batch").is_some();
+        r.prefetch = field(f, "prefetch").is_some();
+        r.vlm_min_score = if field(f, "vlm_min_on").is_some() {
+            Some(
+                num(f, "vlm_min_score", "VLM minimum score")?
+                    .unwrap_or(crate::training::autolabel::SUGGESTED_VLM_MIN_SCORE),
+            )
+        } else {
+            None
+        };
+    }
     if with_model.is_some() {
         // A model run's fields; the labelers' are ignored.
         r.device = field(f, "device").map(str::to_string);
         r.model_accept_score = num(f, "model_accept_score", "model accept score")?;
+    } else {
+        r.gpu = field(f, "gpu").map(str::to_string);
     }
     r.with_model = with_model;
     if let Some(t) = num(f, "threshold", "threshold")? {
@@ -495,7 +515,8 @@ pub(super) async fn autolabel_models(State(shared): State<Shared>) -> Response {
             "success": true,
             "models": models,
             "devices": device_choices(&snap.selection),
-            "default_threshold": al_models::DEFAULT_THRESHOLD,
+            // As the f64 0.3, not the f32's 0.30000001192092896 the forms would show.
+            "default_threshold": (f64::from(al_models::DEFAULT_THRESHOLD) * 100.0).round() / 100.0,
         }))
         .into_response()
     })
@@ -616,8 +637,84 @@ mod tests {
                 "{k}={v}: {e:#}"
             );
         }
+        // The labelers' GPU; a model run ignores it (it has its device).
+        let g = autolabel_from_form(&form(&[
+            ("mode", "labelers"),
+            ("rfdetr", "on"),
+            ("gpu", "cuda:1"),
+        ]))
+        .unwrap();
+        assert_eq!(g.gpu.as_deref(), Some("cuda:1"));
+        let g = autolabel_from_form(&form(&[("rfdetr", "on"), ("gpu", "")])).unwrap();
+        assert_eq!(g.gpu, None);
+        let m = autolabel_from_form(&form(&[
+            ("mode", "model"),
+            ("with_model", "x"),
+            ("gpu", "cuda:1"),
+        ]))
+        .unwrap();
+        assert_eq!(m.gpu, None);
+        let e = autolabel_from_form(&form(&[("rfdetr", "on"), ("gpu", "second")])).unwrap_err();
+        assert!(e.to_string().contains("is not cuda:N"), "{e:#}");
         assert!(autolabel_from_form(&form(&[("frames", "colour=red")])).is_err());
         assert!(autolabel_from_form(&form(&[("gdino", "off"), ("vlm", "off")])).is_err());
+    }
+
+    #[test]
+    fn autolabel_run_options_parse_ticked_and_unticked() {
+        // The Review page and older forms post no run options: the defaults.
+        let r = autolabel_from_form(&form(&[("rfdetr", "on")])).unwrap();
+        assert!(r.keep_on_cancel && r.vlm_batch && r.prefetch);
+        assert_eq!(r.vlm_min_score, None);
+        // The Training page with every box unticked (absent); the score alone is ignored.
+        let r = autolabel_from_form(&form(&[
+            ("rfdetr", "on"),
+            ("run_options", "1"),
+            ("vlm_min_score", "0.3"),
+        ]))
+        .unwrap();
+        assert!(!r.keep_on_cancel && !r.vlm_batch && !r.prefetch);
+        assert_eq!(r.vlm_min_score, None);
+        // Every box ticked.
+        let r = autolabel_from_form(&form(&[
+            ("rfdetr", "on"),
+            ("run_options", "1"),
+            ("keep_on_cancel", "on"),
+            ("vlm_batch", "on"),
+            ("prefetch", "on"),
+            ("vlm_min_on", "on"),
+            ("vlm_min_score", "0.25"),
+        ]))
+        .unwrap();
+        assert!(r.keep_on_cancel && r.vlm_batch && r.prefetch);
+        assert_eq!(r.vlm_min_score, Some(0.25));
+        // Ticked with an empty score: the suggested 0.2; a bad one names the field.
+        let r = autolabel_from_form(&form(&[
+            ("rfdetr", "on"),
+            ("run_options", "1"),
+            ("vlm_min_on", "on"),
+            ("vlm_min_score", ""),
+        ]))
+        .unwrap();
+        assert_eq!(r.vlm_min_score, Some(0.2));
+        for bad in ["0", "1.5", "low"] {
+            let e = autolabel_from_form(&form(&[
+                ("rfdetr", "on"),
+                ("run_options", "1"),
+                ("vlm_min_on", "on"),
+                ("vlm_min_score", bad),
+            ]))
+            .unwrap_err();
+            assert!(e.to_string().contains("VLM minimum score"), "{bad}: {e:#}");
+        }
+        // The keep box is shared by both modes (an unticked one is off in model mode too).
+        let m = autolabel_from_form(&form(&[
+            ("mode", "model"),
+            ("with_model", "x"),
+            ("run_options", "1"),
+        ]))
+        .unwrap();
+        assert!(!m.keep_on_cancel);
     }
 
     #[test]
@@ -870,7 +967,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{json}");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["success"], true);
-        assert_eq!(v["default_threshold"], serde_json::json!(0.3f32));
+        assert_eq!(v["default_threshold"], serde_json::json!(0.3));
         let models = v["models"].as_array().unwrap();
         assert_eq!(models[0]["source"], "config", "{v}");
         assert!(

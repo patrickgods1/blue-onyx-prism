@@ -47,9 +47,11 @@
       <td><code>{{ r.name }}</code><br><span class="muted small">{{ r.id }}</span></td>
       <td>{{ r.model }}<br><span class="muted small">{{ r.dataset }}</span></td>
       <td data-field="state">{{ r.state }}</td>
-      <td><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span>{% if !r.log_tail.is_empty() %}<pre class="small" data-field="log">{{ r.log_tail }}</pre>{% endif %}</td>
+      <td><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span>{% if !r.log_tail.is_empty() %}<pre class="small tr-log" data-field="log">{{ r.log_tail }}</pre>{% endif %}</td>
       <td>
-        {% if r.busy %}<form method="post" action="/training/cancel" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small danger">Cancel</button></form>
+        {% if r.busy %}<div class="inline-row"><form method="post" action="/training/pause" class="inline" data-field="pause"{% if r.state != "running" %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Suspend its processes where they are. Models stay loaded and GPU memory stays in use; nothing else on the queue starts until you resume or cancel it.">Pause</button></form>
+        <form method="post" action="/training/resume" class="inline" data-field="resume"{% if r.state != "paused" %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Continue exactly where it was paused.">Resume</button></form>
+        <form method="post" action="/training/cancel" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small danger">Cancel</button></form></div>
         {% else %}<form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small">Remove</button></form>{% endif %}
       </td>
     </tr>
@@ -69,9 +71,11 @@
     <tr data-task="{{ r.id }}">
       <td>{{ r.title }}<br><span class="muted small">{{ r.kind }} {{ r.id }} &middot; {{ r.created }}</span></td>
       <td data-field="state">{{ r.state }}</td>
-      <td><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span>{% if !r.log_tail.is_empty() %}<pre class="small" data-field="log">{{ r.log_tail }}</pre>{% endif %}</td>
+      <td><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span>{% if !r.log_tail.is_empty() %}<pre class="small tr-log" data-field="log">{{ r.log_tail }}</pre>{% endif %}</td>
       <td>
-        {% if r.busy %}<form method="post" action="/training/cancel" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small danger">Cancel</button></form>
+        {% if r.busy %}<div class="inline-row"><form method="post" action="/training/pause" class="inline" data-field="pause"{% if r.state != "running" %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Suspend its processes where they are. Models stay loaded and GPU memory stays in use; nothing else on the queue starts until you resume or cancel it.">Pause</button></form>
+        <form method="post" action="/training/resume" class="inline" data-field="resume"{% if r.state != "paused" %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Continue exactly where it was paused.">Resume</button></form>
+        <form method="post" action="/training/cancel" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small danger">Cancel</button></form></div>
         {% else %}<form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small">Remove</button></form>{% endif %}
       </td>
     </tr>
@@ -188,8 +192,8 @@
   <form method="post" action="/training/autolabel" class="tr-form" id="autolabel-form">
     <fieldset class="tr-radios">
       <legend>Labelers</legend>
-      <label class="check"><input type="radio" name="mode" value="labelers" checked> Open-vocabulary labelers <span class="muted small">(NVIDIA GPU or Apple silicon)</span></label>
-      <label class="check"><input type="radio" name="mode" value="model"> Re-label with a model <span class="muted small">(any detector, runs anywhere)</span></label>
+      <label class="check"><input type="radio" name="mode" value="labelers" checked> <span>Open-vocabulary labelers<span class="muted small tr-hint">Any class by name; {{ labeler_device }}.</span></span></label>
+      <label class="check"><input type="radio" name="mode" value="model"> <span>Label with a model you choose<span class="muted small tr-hint">A config model (enabled or not), a file in the models folder or a downloadable one, on CoreML, OpenVINO or ONNX Runtime.</span></span></label>
     </fieldset>
     <div class="tr-grid" data-mode="labelers">
       <div class="tr-field">
@@ -200,12 +204,25 @@
       <div class="tr-field">
         <label for="al-vlm">VLM check</label>
         <select id="al-vlm" name="vlm"><option value="2b">Qwen3-VL 2B (4.3 GB)</option><option value="4b">Qwen3-VL 4B (8.9 GB)</option><option value="8b">Qwen3-VL 8B (17.5 GB)</option><option value="off">off</option></select>
-        <p class="muted small">Checks person and single-labeler boxes.</p>
+        <p class="muted small">Checks person and single-labeler boxes; most of a frame's time (about 1 s per box).</p>
+        <div class="tr-sub" id="al-vlm-options">
+          <label class="check"><input type="checkbox" name="vlm_batch" checked> <span>Batch the check (up to 8 boxes per call)</span></label>
+          <label class="check"><input type="checkbox" name="vlm_min_on" id="al-vlm-min-on"> <span>Skip boxes scoring <span class="tr-keep">below <input type="number" name="vlm_min_score" class="al-num" min="0.01" max="1" step="0.01" value="0.2" aria-label="VLM check minimum score"></span></span></label>
+          <p class="muted small">Weak boxes are rarely confirmed but skipping can miss a few real ones; they still go to review.</p>
+        </div>
       </div>
       <div class="tr-field tr-checks">
-        <label class="check"><input type="checkbox" name="rfdetr" checked> RF-DETR L <span class="muted small">(COCO classes, 0.1 GB)</span></label>
-        <label class="check"><input type="checkbox" name="siglip" checked> SigLIP 2 species ranking <span class="muted small">(1.5 GB)</span></label>
+        <label class="check"><input type="checkbox" name="rfdetr" checked> <span>RF-DETR L <span class="muted small">(COCO classes, 0.1 GB)</span></span></label>
+        <label class="check"><input type="checkbox" name="siglip" checked> <span>SigLIP 2 species ranking <span class="muted small">(1.5 GB)</span></span></label>
+        <label class="check"><input type="checkbox" name="prefetch" checked> <span>Load the next frame while the GPU works</span></label>
       </div>
+      {% if let Some(auto) = gpu_choices.first() %}
+      <div class="tr-field">
+        <label for="al-gpu">GPU</label>
+        <select id="al-gpu" name="gpu"><option value="">Automatic: {{ auto.label }}</option>{% for g in gpu_choices %}<option value="{{ g.value }}">{{ g.label }}</option>{% endfor %}</select>
+        <p class="muted small">A GPU on another PyTorch build (cu126 / cu130) sets up that build's environment in place of the current one.</p>
+      </div>
+      {% endif %}
     </div>
     <fieldset class="tr-classes" data-mode="labelers model" id="al-classes">
       <legend>Classes to look for</legend>
@@ -229,8 +246,8 @@
       </div>
       <div class="tr-field">
         <label for="al-preset">Preset</label>
-        <select id="al-preset"><option value="first-pass">First-pass labelling (unreviewed frames)</option><option value="self-training">Self-training check (all frames, flags disagreements)</option></select>
-        <p class="muted small">Sets the status below: unreviewed / any.</p>
+        <select id="al-preset"><option value="first-pass">First pass</option><option value="self-training">Self-training check</option></select>
+        <p class="muted small">First pass: unreviewed frames. Self-training check: all frames, flagging where the model disagrees with your reviewed labels. Sets the status below.</p>
       </div>
     </div>
     <fieldset>
@@ -273,6 +290,9 @@
         </div>
       </details>
     </fieldset>
+    <input type="hidden" name="run_options" value="1">
+    <label class="check"><input type="checkbox" name="keep_on_cancel" checked> Keep finished frames if cancelled</label>
+    <p class="muted small">Cancel then saves the frames labelled so far for review; running the same auto-label again continues with the rest.</p>
     {% if let Some(what) = autolabel_large %}
     <label class="check tr-confirm" data-mode="labelers"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB: {{ what }}</label>
     {% endif %}
@@ -363,6 +383,13 @@
         <input type="text" id="train-name" name="name">
         <p class="muted small" id="train-name-hint">One ticked model only; empty = <code>night-</code>/<code>custom-&lt;model&gt;-&lt;date&gt;</code>.</p>
       </div>
+      {% if let Some(auto) = gpu_choices.first() %}
+      <div class="tr-field">
+        <label for="train-gpu">GPU</label>
+        <select id="train-gpu" name="gpu"><option value="">Automatic: {{ auto.label }}</option>{% for g in gpu_choices %}<option value="{{ g.value }}">{{ g.label }}</option>{% endfor %}</select>
+        <p class="muted small">The estimates above are for the automatic GPU; the batch is suggested for the chosen one. A GPU on another PyTorch build (cu126 / cu130) sets up that build's environment in place of the current one.</p>
+      </div>
+      {% endif %}
     </div>
     <div class="tr-field">
       <label for="train-install">Install the model in</label>
@@ -411,8 +438,8 @@
       <p class="muted small">The held-out frames of the export are always used.</p>
     </fieldset>
   </fieldset>
-  {% if !allow_large && (!env_ready || (public_available && !public_installed)) %}
-  <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB:{% if !env_ready %} {{ env_download }}{% endif %}{% if !env_ready && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>
+  {% if !allow_large && (!env_ready || other_env.is_some() || (public_available && !public_installed)) %}
+  <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB:{% if !env_ready %} {{ env_download }}{% endif %}{% if let Some(o) = other_env %}{% if !env_ready %};{% endif %} the training environment of another GPU if you choose it ({{ o }}){% endif %}{% if (!env_ready || other_env.is_some()) && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>
   {% endif %}
   <div class="actions"><button type="submit">Queue training</button></div>
   {% endif %}

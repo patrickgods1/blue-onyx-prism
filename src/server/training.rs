@@ -201,6 +201,14 @@ struct ResultRow {
     in_config: bool,
 }
 
+/// One GPU of the page's GPU selects (a PC with more than one usable NVIDIA GPU).
+struct GpuChoice {
+    /// `cuda:N` (the form's `gpu`).
+    value: String,
+    /// `NVIDIA GeForce RTX 3090 (cuda:1, 24 GB, PyTorch cu126)`.
+    label: String,
+}
+
 struct DatasetRow {
     path: String,
     exists: bool,
@@ -217,6 +225,8 @@ pub(super) struct TrainingTemplate {
     error: Option<String>,
     available: bool,
     summary: String,
+    /// Where the open-vocabulary labelers run (PyTorch on Metal or CUDA), or why they cannot.
+    labeler_device: String,
     reasons: Vec<String>,
     env_ready: bool,
     env_note: String,
@@ -228,6 +238,12 @@ pub(super) struct TrainingTemplate {
     import_large: Option<String>,
     /// The same for the auto-labelers.
     autolabel_large: Option<String>,
+    /// The GPUs the PyTorch jobs may run on, the automatic pick first; empty = nothing to choose
+    /// (one GPU, Apple silicon, none): the selects are not shown.
+    gpu_choices: Vec<GpuChoice>,
+    /// What a GPU on another PyTorch build than the automatic pick's would download
+    /// (`PyTorch cu130, about 3.1 GB, for NVIDIA GeForce RTX 5090`), when not set up.
+    other_env: Option<String>,
     datasets: Vec<DatasetRow>,
     families: Vec<FamilyRow>,
     /// Most sizes of a family (the grid's size columns).
@@ -270,6 +286,7 @@ fn state_str(s: RunState) -> &'static str {
     match s {
         RunState::Queued => "queued",
         RunState::Running => "running",
+        RunState::Paused => "paused",
         RunState::Done => "done",
         RunState::Failed => "failed",
         RunState::Cancelled => "cancelled",
@@ -337,6 +354,42 @@ pub(super) fn view(
             catalog::format_size(a.lane().estimate().0)
         )
     });
+    // A chosen GPU on another lane sets up that lane's environment (it replaces the other one).
+    let gpu_choices: Vec<GpuChoice> = if cap.has_gpu_choice() {
+        cap.cuda_options
+            .iter()
+            .map(|a| GpuChoice {
+                value: a.device_arg(),
+                label: a.choice_label(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let other_env = {
+        let auto_lane = cap.accelerator.as_ref().map(|a| a.lane());
+        let mut parts: Vec<String> = Vec::new();
+        for a in cap.cuda_options.iter().skip(1) {
+            let lane = a.lane();
+            if Some(lane) == auto_lane {
+                continue;
+            }
+            let name = a.name();
+            let tag = format!("PyTorch {}", lane.as_str());
+            match parts.iter_mut().find(|p| p.starts_with(&tag)) {
+                Some(p) => {
+                    p.push_str(", ");
+                    p.push_str(name);
+                }
+                None if !env::train_env_ready(&paths, platform, lane) => parts.push(format!(
+                    "{tag}, about {}, for {name}",
+                    catalog::format_size(lane.estimate().0)
+                )),
+                None => {}
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    };
     let size_cols = cap
         .families
         .iter()
@@ -434,6 +487,11 @@ pub(super) fn view(
                 ));
             }
             let mut label = env_part.into_iter().collect::<Vec<_>>();
+            if let Some(o) = &other_env {
+                label.push(format!(
+                    "the training environment of another GPU if you choose it ({o})"
+                ));
+            }
             let defaults = missing(&[
                 "mm-gdino-tiny",
                 "rfdetr-large",
@@ -522,10 +580,16 @@ pub(super) fn view(
         error,
         available: cap.available,
         summary: cap.summary(),
+        labeler_device: cap.accelerator.as_ref().map_or_else(
+            || "not available: needs an NVIDIA GPU or Apple silicon".to_string(),
+            |a| format!("PyTorch on {}", a.torch_backend()),
+        ),
         reasons: cap.reasons.clone(),
         env_ready,
         env_note,
         env_download,
+        gpu_choices,
+        other_env,
         allow_large: config.allow_large_downloads,
         import_large,
         autolabel_large,
@@ -643,7 +707,8 @@ pub(super) fn num<T: std::str::FromStr>(
 }
 
 /// The runs of a queue form: one [`TrainRequest`] per ticked model (`model=yolo26n`, repeated),
-/// sharing the dataset and options fields. Errors name the field. The paths are taken as typed:
+/// sharing the dataset and options fields (`gpu`: `cuda:N`, empty / `auto` = the automatic pick;
+/// the suggested batches are the chosen GPU's). Errors name the field. The paths are taken as typed:
 /// [`queue`] checks them ([`checked_datasets`], [`checked_folder`]).
 pub(crate) fn requests_from_form(
     f: &[(String, String)],
@@ -654,6 +719,8 @@ pub(crate) fn requests_from_form(
     if models.is_empty() {
         anyhow::bail!("no model ticked: choose at least one family and size");
     }
+    let gpu = crate::training::capability::gpu_arg(field(f, "gpu"))?;
+    let cap = &cap.for_gpu(gpu.as_deref())?;
     let mut datasets: Vec<PathBuf> = all(f, "dataset").into_iter().map(PathBuf::from).collect();
     if let Some(extra) = field(f, "dataset_path") {
         datasets.push(PathBuf::from(extra));
@@ -722,6 +789,7 @@ pub(crate) fn requests_from_form(
             benchmark_sets: sets.clone(),
             allow_large: field(f, "confirm_large").is_some(),
             install_dir: field(f, "install_dir").map(PathBuf::from),
+            gpu: gpu.clone(),
         });
     }
     Ok((out, name))
@@ -828,7 +896,8 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                 r.datasets.clone_from(&datasets);
                 r.install_dir.clone_from(&install_dir);
             }
-            if let Some(a) = &cap.accelerator {
+            // The chosen GPU's lane (another GPU may need the other PyTorch build).
+            if let Some(a) = &cap.resolve_gpu(field(&f, "gpu"))? {
                 let paths = TrainPaths::for_config(&config);
                 if !env::train_env_ready(&paths, Platform::current(), a.lane())
                     && !config.allow_large_downloads
@@ -836,8 +905,10 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                 {
                     let (dl, _) = a.lane().estimate();
                     anyhow::bail!(
-                        "the training environment is a large download (about {}): tick \"Allow \
-                         downloads over 500 MB\" to confirm, or enable allow_large_downloads",
+                        "the training environment (PyTorch {}) is a large download (about {}): \
+                         tick \"Allow downloads over 500 MB\" to confirm, or enable \
+                         allow_large_downloads",
+                        a.lane().as_str(),
                         catalog::format_size(dl)
                     );
                 }
@@ -846,7 +917,13 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
             let mut queued = Vec::new();
             for r in reqs {
                 let job = crate::training::plan_job(&config, r, &cap, name.clone())?;
-                let label = format!("{} ({})", job.name, job.request.recipe.label());
+                let on = job
+                    .request
+                    .gpu
+                    .as_ref()
+                    .map(|_| format!(" on {}", job.accelerator.device_arg()))
+                    .unwrap_or_default();
+                let label = format!("{} ({}{on})", job.name, job.request.recipe.label());
                 svc.enqueue(job).map_err(anyhow::Error::msg)?;
                 queued.push(label);
             }
@@ -877,6 +954,44 @@ pub(super) async fn cancel(
                 None,
                 Some(format!("No queued or running run {id}.")),
             ))
+        }
+    })
+    .await
+}
+
+/// `POST /training/pause` (`id`): suspend the running run or job's helper processes where they
+/// are (models stay loaded, GPU memory stays held); the queue keeps its place.
+pub(super) async fn pause(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+    pause_or_resume(state, body, true).await
+}
+
+/// `POST /training/resume` (`id`): continue a paused run or job.
+pub(super) async fn resume(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    pause_or_resume(state, body, false).await
+}
+
+async fn pause_or_resume(state: Arc<AppState>, body: axum::body::Bytes, pause: bool) -> Response {
+    blocking(move || {
+        let f = super::dataset::parse_form(&body);
+        let id = field(&f, "id").unwrap_or_default().to_string();
+        let ok = SERVICE
+            .get()
+            .is_some_and(|s| if pause { s.pause(&id) } else { s.resume(&id) });
+        match (ok, pause) {
+            (true, true) => render(&view(
+                &state,
+                Some(format!(
+                    "Paused {id}: its processes are suspended (models stay loaded and GPU memory \
+                     stays in use); nothing else starts until you resume or cancel it."
+                )),
+                None,
+            )),
+            (true, false) => render(&view(&state, Some(format!("Resumed {id}.")), None)),
+            (false, true) => render(&view(&state, None, Some(format!("No running job {id}.")))),
+            (false, false) => render(&view(&state, None, Some(format!("No paused job {id}.")))),
         }
     })
     .await
@@ -1152,6 +1267,62 @@ mod tests {
             &HardwareInfo::new("macos", "aarch64", vec![apple_gpu("Apple M1")]),
             Some(16.0),
         )
+    }
+
+    #[test]
+    fn the_queue_form_takes_a_gpu_and_suggests_its_batch() {
+        use crate::backend::detect::{ComputeCapability, CudaInfo, GpuAdapter, GpuVendor};
+        let gpu = |name: &str, vram_mb: u64, ordinal: u32| GpuAdapter {
+            vendor: GpuVendor::Nvidia,
+            name: name.into(),
+            vram_mb,
+            index: ordinal,
+            discrete: true,
+            cuda: Some(CudaInfo {
+                ordinal,
+                compute_capability: ComputeCapability::new(8, 6),
+            }),
+        };
+        let cap = crate::training::capability::capability(
+            &HardwareInfo::new(
+                "linux",
+                "x86_64",
+                vec![gpu("RTX 3090", 24576, 0), gpu("RTX 3050", 4096, 1)],
+            )
+            .with_cuda_driver(12, 8),
+            None,
+        );
+        let post = |g: &str| {
+            requests_from_form(
+                &form(&[("model", "rfdetr-medium"), ("dataset", "/x"), ("gpu", g)]),
+                &cap,
+                50,
+            )
+            .map(|(r, _)| r.into_iter().next().unwrap())
+        };
+        let auto = post("").unwrap();
+        assert_eq!(auto.gpu, None);
+        let small = post("cuda:1").unwrap();
+        assert_eq!(small.gpu.as_deref(), Some("cuda:1"));
+        assert!(
+            small.recipe.batch < auto.recipe.batch,
+            "4 GB suggests a smaller batch: {} vs {}",
+            small.recipe.batch,
+            auto.recipe.batch
+        );
+        let e = post("cuda:5").unwrap_err().to_string();
+        assert!(
+            e.contains("no such CUDA device") && e.contains("RTX 3050"),
+            "{e}"
+        );
+        let e = requests_from_form(
+            &form(&[("model", "yolo26n"), ("dataset", "/x"), ("gpu", "cuda:0")]),
+            &mac(),
+            50,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("no GPU to choose"), "{e}");
     }
 
     #[test]
@@ -1547,6 +1718,100 @@ mod tests {
         assert!(state.config_read().training.dir.is_some());
         let (_, _, _) = call(&state, post_form("/training/dir", "training_dir=", true)).await;
         assert_eq!(state.config_read().training.dir, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A running job shows Pause and Cancel, a paused one Resume and Cancel; the JSON says
+    /// `paused`; pausing a job that is not on the queue's thread is refused.
+    #[tokio::test]
+    async fn busy_jobs_show_pause_resume_and_cancel() {
+        use crate::server::test_util::{call, get_text, post_form, test_state_with};
+        use crate::training::task::{TaskKind, TaskRecord};
+        let _queue = QUEUE_TEST_LOCK.lock().await;
+        let root = std::env::temp_dir().join(format!("bop-train-pause-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while SERVICE.get().is_some_and(|s| s.busy()) {
+            assert!(std::time::Instant::now() < deadline, "the queue stays busy");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let svc = service(&Shared::from(state.clone()));
+        let rec = |id: &str, st: RunState| TaskRecord {
+            id: id.into(),
+            kind: TaskKind::Autolabel,
+            title: format!("auto-label {id}"),
+            created: String::new(),
+            state: st,
+            stage: Some("labelling".into()),
+            step: 2,
+            steps: 3,
+            percent: 40,
+            detail: "5 of 9 frames".into(),
+            log: vec![],
+            summary: None,
+            result: None,
+            error: None,
+            finished: None,
+        };
+        let (run, paused) = ("pause-test-running", "pause-test-paused");
+        svc.put_task_record(rec(run, RunState::Running));
+        svc.put_task_record(rec(paused, RunState::Paused));
+        let (s, page) = get_text(&state, "/training").await;
+        assert_eq!(s, StatusCode::OK);
+        let row = |id: &str| {
+            let i = page
+                .find(&format!("data-task=\"{id}\""))
+                .expect("the job's row");
+            let j = i + page[i..].find("</tr>").unwrap();
+            page[i..j].to_string()
+        };
+        let (r, p) = (row(run), row(paused));
+        let shown = |form: &str| {
+            format!("action=\"/training/{form}\" class=\"inline\" data-field=\"{form}\">")
+        };
+        let hidden = |form: &str| {
+            format!("action=\"/training/{form}\" class=\"inline\" data-field=\"{form}\" hidden>")
+        };
+        assert!(
+            r.contains(&shown("pause")) && r.contains(&hidden("resume")),
+            "{r}"
+        );
+        assert!(
+            p.contains(&hidden("pause")) && p.contains(&shown("resume")),
+            "{p}"
+        );
+        assert!(r.contains("/training/cancel") && p.contains("/training/cancel"));
+        assert!(p.contains("paused (labelling 2/3): 5 of 9 frames"), "{p}");
+        assert!(r.contains("GPU memory stays in use"), "the tooltip");
+        let (_, json) = get_text(&state, "/v1/training").await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let st = v["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == paused)
+            .map(|t| t["state"].clone());
+        assert_eq!(st, Some(serde_json::json!("paused")));
+        // Not the job on the queue's thread: nothing to pause or resume.
+        let (s, _, b) = call(
+            &state,
+            post_form("/training/pause", &format!("id={run}"), true),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8(b).unwrap().contains("No running job"));
+        let (_, _, b) = call(
+            &state,
+            post_form("/training/resume", &format!("id={paused}"), true),
+        )
+        .await;
+        assert!(String::from_utf8(b).unwrap().contains("No paused job"));
+        for id in [run, paused] {
+            svc.put_task_record(rec(id, RunState::Cancelled));
+            svc.remove(id).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

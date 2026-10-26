@@ -1,6 +1,7 @@
 //! Seams of the export stage machine: [`CommandRunner`] (child processes, the real
-//! [`SystemRunner`] with process-tree kill and bounded output) and [`Fetcher`] (verified downloads
-//! through the download manager). Tests swap both for the fake in `super::fake`.
+//! [`SystemRunner`] with process-tree kill, pause / resume and bounded output; [`PausableRunner`]
+//! binds a pause flag to any runner) and [`Fetcher`] (verified downloads through the download
+//! manager). Tests swap both for the fake in `super::fake`.
 
 use super::*;
 
@@ -31,6 +32,44 @@ pub trait CommandRunner: Send + Sync {
     /// Run `cmd` to completion, passing each output line (stdout and stderr) to `on_line`. Fails
     /// on a non-zero exit, on timeout and when `cancel` is set (the child is killed).
     fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()>;
+
+    /// [`Self::run`] that also follows `pause`: while it is set the child's whole process tree is
+    /// suspended (it keeps its memory, open files and GPU allocations) and continues where it was
+    /// when it clears; paused time does not count toward [`Cmd::timeout`]. Entered while `pause`
+    /// is set, it waits before starting the child. `cancel` works while paused. The default
+    /// ignores `pause` (test fakes).
+    fn run_pausable(
+        &self,
+        cmd: &Cmd,
+        on_line: &mut dyn FnMut(&str),
+        cancel: &AtomicBool,
+        pause: &AtomicBool,
+    ) -> Result<()> {
+        let _ = pause;
+        self.run(cmd, on_line, cancel)
+    }
+}
+
+/// A runner whose every child follows one pause flag ([`CommandRunner::run_pausable`]): the
+/// training queue hands it to its jobs, so their code needs no pause support of its own. (Its
+/// own `run_pausable` is the default: a second flag passed to it is ignored.)
+pub struct PausableRunner<'a> {
+    pub inner: &'a dyn CommandRunner,
+    pub pause: &'a AtomicBool,
+}
+
+impl std::fmt::Debug for PausableRunner<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PausableRunner")
+            .field("paused", &self.pause.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl CommandRunner for PausableRunner<'_> {
+    fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+        self.inner.run_pausable(cmd, on_line, cancel, self.pause)
+    }
 }
 
 /// Installs a verified resource (the real one goes through the download manager).
@@ -59,7 +98,9 @@ pub(crate) const MAX_OUTPUT_LINES: usize = 2000;
 /// redirect Python, uv, pip, the dynamic loader (`LD_*`, `DYLD_*`), the model libraries
 /// (`YOLO_*`, `HF_*`, `TORCH_*`) or the CA bundle of `requests`/curl is dropped.
 /// `SSL_CERT_FILE`/`SSL_CERT_DIR` pass through when the operator set them (a private CA for the
-/// proxy); nothing sets them by default.
+/// proxy); nothing sets them by default. `CUDA_VISIBLE_DEVICES`/`CUDA_DEVICE_ORDER` pass through
+/// so PyTorch numbers the GPUs as the service's CUDA probe did: the training GPU picker hands the
+/// child `--device cuda:N` with the probe's ordinal.
 pub(super) fn inherited(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
     matches!(
@@ -84,6 +125,8 @@ pub(super) fn inherited(key: &str) -> bool {
             | "ALL_PROXY"
             | "SSL_CERT_FILE"
             | "SSL_CERT_DIR"
+            | "CUDA_VISIBLE_DEVICES"
+            | "CUDA_DEVICE_ORDER"
     ) || k.starts_with("LC_")
 }
 
@@ -124,12 +167,16 @@ impl std::error::Error for ChildFailed {}
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemRunner;
 
-/// A running child and the handle that kills its whole process tree: the process group on Unix
-/// (the child is its leader), a Job Object with kill-on-close on Windows ([`crate::backend::job`]).
+/// A running child and the handle that kills (and suspends) its whole process tree: the process
+/// group on Unix (the child is its leader), a Job Object with kill-on-close on Windows
+/// ([`crate::backend::job`]).
 struct Tree {
     child: std::process::Child,
     #[cfg(windows)]
     job: Option<crate::backend::job::Job>,
+    /// The tree's threads while it is paused (resumed on drop).
+    #[cfg(windows)]
+    suspended: Option<crate::backend::job::Suspended>,
 }
 
 impl Tree {
@@ -187,7 +234,40 @@ impl Tree {
             child,
             #[cfg(windows)]
             job,
+            #[cfg(windows)]
+            suspended: None,
         })
+    }
+
+    /// Pause the child and every process it spawned (Unix: STOP to the group; Windows: every
+    /// thread of the job suspended).
+    fn suspend(&mut self) {
+        #[cfg(unix)]
+        signal_group(self.child.id(), "STOP");
+        #[cfg(windows)]
+        match &self.job {
+            Some(j) if self.suspended.is_none() => match j.suspend() {
+                Ok(s) => {
+                    tracing::debug!("paused {} threads of the process tree", s.len());
+                    self.suspended = Some(s);
+                }
+                Err(e) => tracing::warn!("the process tree was not paused: {e:#}"),
+            },
+            Some(_) => {}
+            None => tracing::warn!(
+                "the process tree cannot be paused: it has no job object (see the earlier warning)"
+            ),
+        }
+    }
+
+    /// Continue a tree paused by [`Self::suspend`].
+    fn resume(&mut self) {
+        #[cfg(unix)]
+        signal_group(self.child.id(), "CONT");
+        #[cfg(windows)]
+        if let Some(s) = self.suspended.take() {
+            s.resume();
+        }
     }
 
     /// Kill the child and every process it spawned, then reap the child.
@@ -199,6 +279,8 @@ impl Tree {
             // a grace period.
             let pgid = self.child.id();
             signal_group(pgid, "TERM");
+            // A paused (stopped) tree only acts on the TERM once it runs again.
+            signal_group(pgid, "CONT");
             let until = Instant::now() + Duration::from_millis(1500);
             while Instant::now() < until {
                 if matches!(self.child.try_wait(), Ok(Some(_))) {
@@ -214,6 +296,8 @@ impl Tree {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Windows: close the (now terminated) threads' handles.
+        self.resume();
     }
 }
 
@@ -244,8 +328,31 @@ fn signal_group(pgid: u32, signal: &str) {
         .status();
 }
 
+/// How often the runner looks at its pause / cancel flags and the child.
+const POLL: Duration = Duration::from_millis(100);
+
 impl CommandRunner for SystemRunner {
     fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+        self.run_pausable(cmd, on_line, cancel, &AtomicBool::new(false))
+    }
+
+    fn run_pausable(
+        &self,
+        cmd: &Cmd,
+        on_line: &mut dyn FnMut(&str),
+        cancel: &AtomicBool,
+        pause: &AtomicBool,
+    ) -> Result<()> {
+        // No new helper starts while the job is paused.
+        if pause.load(Ordering::Relaxed) {
+            tracing::info!("paused before running {}", cmd.display());
+            while pause.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(anyhow!(Cancelled));
+                }
+                std::thread::sleep(POLL);
+            }
+        }
         tracing::info!("running {}", cmd.display());
         let mut tree = Tree::spawn(cmd)?;
         let (tx, rx) = crossbeam_channel::bounded::<String>(MAX_OUTPUT_LINES);
@@ -257,7 +364,9 @@ impl CommandRunner for SystemRunner {
             readers.push(spawn_reader(err, tx.clone()));
         }
         drop(tx);
-        let deadline = Instant::now() + cmd.timeout;
+        let mut deadline = Instant::now() + cmd.timeout;
+        // Since when the tree is paused (that time is added to the deadline on resume).
+        let mut paused_at: Option<Instant> = None;
         let mut tail: VecDeque<String> = VecDeque::new();
         let mut keep = |line: String, on_line: &mut dyn FnMut(&str)| {
             on_line(&line);
@@ -267,7 +376,7 @@ impl CommandRunner for SystemRunner {
             tail.push_back(line);
         };
         let status = loop {
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            match rx.recv_timeout(POLL) {
                 Ok(line) => keep(line, on_line),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -279,7 +388,25 @@ impl CommandRunner for SystemRunner {
                 tree.kill_tree();
                 return Err(anyhow!(Cancelled));
             }
-            if Instant::now() >= deadline {
+            match (pause.load(Ordering::Relaxed), paused_at) {
+                (true, None) => {
+                    tracing::info!("pausing {}", cmd.display());
+                    tree.suspend();
+                    paused_at = Some(Instant::now());
+                }
+                (false, Some(since)) => {
+                    tracing::info!(
+                        "resuming {} after {:.0} s",
+                        cmd.display(),
+                        since.elapsed().as_secs_f64()
+                    );
+                    tree.resume();
+                    deadline += since.elapsed();
+                    paused_at = None;
+                }
+                _ => {}
+            }
+            if paused_at.is_none() && Instant::now() >= deadline {
                 tree.kill_tree();
                 bail!(
                     "{} timed out after {} min and was stopped",

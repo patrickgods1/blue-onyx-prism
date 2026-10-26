@@ -159,6 +159,8 @@ struct Extracted {
     capped: bool,
     /// `hw:<type>` or `sw` (the helper's `start` event; `sw` after a hardware fallback).
     decoder: Option<String>,
+    /// The video's length in seconds (`start` / `done` events), when its header has one.
+    duration: Option<f64>,
 }
 
 /// Frames between two free-space checks of a running helper.
@@ -381,9 +383,15 @@ impl ImportJob {
                     if let Some(d) = text(ev, "decoder") {
                         ex.decoder = Some(d);
                     }
+                    if let Some(d) = ev.get("duration").and_then(serde_json::Value::as_f64) {
+                        ex.duration = Some(d);
+                    }
                 }
                 Some("done") => {
                     ex.capped = ev.get("capped").and_then(serde_json::Value::as_bool) == Some(true);
+                    if let Some(d) = ev.get("duration").and_then(serde_json::Value::as_f64) {
+                        ex.duration = Some(d);
+                    }
                 }
                 _ => {}
             },
@@ -980,6 +988,7 @@ impl ImportJob {
             );
             // In video order: the dedup keeps the first of near duplicates.
             let mut capped: Vec<usize> = Vec::new();
+            let mut read: Vec<(usize, Extracted)> = Vec::new();
             for (k, res) in results.into_iter().enumerate() {
                 let Some(((i, quota), res)) = todo.get(k).copied().zip(res) else {
                     continue;
@@ -1004,6 +1013,33 @@ impl ImportJob {
                 if ex.capped {
                     capped.push(quota);
                 }
+                read.push((i, ex));
+            }
+            // The parts of a segmented Blue Iris recording all carry its start time: each part
+            // starts after the ones before it (a capped part's length is still its whole video).
+            let names: Vec<String> = read
+                .iter()
+                .filter_map(|(i, _)| {
+                    videos
+                        .get(*i)
+                        .map(|v| v.path.to_string_lossy().into_owned())
+                })
+                .collect();
+            let lengths: Vec<(&str, Option<f64>)> = names
+                .iter()
+                .zip(&read)
+                .map(|(n, (_, ex))| {
+                    let last = ex.found.iter().map(|f| f.t).reduce(f64::max);
+                    (n.as_str(), ex.duration.or(last))
+                })
+                .collect();
+            let shifts = source::segment_offsets(&lengths);
+            for ((i, ex), shift) in read.into_iter().zip(shifts) {
+                let Some(v) = videos.get(i) else { continue };
+                let base = Duration::try_from_secs_f64(shift)
+                    .ok()
+                    .and_then(|d| v.base.checked_add(d))
+                    .unwrap_or(v.base);
                 let out = self.work.join("frames").join(format!("v{i:04}"));
                 for f in ex.found {
                     if f.file.contains(['/', '\\']) || f.file.contains("..") {
@@ -1014,7 +1050,7 @@ impl ImportJob {
                         origin: v.path.clone(),
                         image_name: file_name(&v.path),
                         camera: v.camera.clone(),
-                        base: v.base,
+                        base,
                         offset: Some(f.t),
                         kind: v.kind,
                         at: Some(FrameRef {

@@ -125,6 +125,10 @@ pub struct TrainRequest {
     /// resolves a relative one against the data root (absolute in a queued job).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_dir: Option<PathBuf>,
+    /// The GPU to train on (`cuda:N`; None = the automatic pick, [`super::Capability::for_gpu`]).
+    /// [`super::plan_job`] stores the canonical device of the chosen GPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<String>,
 }
 
 /// One queued run.
@@ -436,6 +440,9 @@ fn stages(
             "--self-check".into(),
             "--trainer".into(),
             trainer.into(),
+            // The test kernel runs on the run's GPU (another GPU may have other kernels).
+            "--device".into(),
+            job.accelerator.device_arg().into(),
         ],
     );
     let mut seen: Option<TrainEvent> = None;

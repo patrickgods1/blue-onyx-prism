@@ -152,7 +152,7 @@ def device_info() -> dict:
     return info
 
 
-def self_check(trainer: str) -> int:
+def self_check(trainer: str, device: str = "auto") -> int:
     log(f"self-check: Python {sys.version.split()[0]} ({sys.executable})")
     for mod in SELF_CHECK_MODULES[trainer]:
         log(f"self-check: importing {mod}")
@@ -163,8 +163,14 @@ def self_check(trainer: str) -> int:
         # A GPU the wheel has no kernels for fails at the first kernel launch: try one now.
         import torch
 
-        x = torch.ones(8, device="cuda")
+        # On the run's GPU (--device cuda:N): another GPU of the machine may have other kernels.
+        want = device.strip().lower()
+        dev = want if want.startswith("cuda:") else "cuda"
+        if dev.startswith("cuda:") and int(dev[5:]) >= torch.cuda.device_count():
+            fail(f"--device {device}: PyTorch sees {torch.cuda.device_count()} CUDA device(s); is CUDA_VISIBLE_DEVICES different from the service's?")
+        x = torch.ones(8, device=dev)
         info["cuda_ok"] = float((x * 2).sum().item()) == 16.0
+        info["device"] = dev
     event("self_check", trainer=trainer, **info)
     log("self-check: ok")
     return 0
@@ -979,7 +985,7 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
 def main() -> int:
     a = parse_args()
     if a.self_check:
-        return self_check(a.trainer)
+        return self_check(a.trainer, a.device)
     for d in (a.out_dir, a.work):
         d.mkdir(parents=True, exist_ok=True)
     a.data, a.work, a.out_dir, a.weights = a.data.resolve(), a.work.resolve(), a.out_dir.resolve(), a.weights.resolve()

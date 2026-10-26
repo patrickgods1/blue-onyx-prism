@@ -15,7 +15,9 @@ Labelers, per frame (docs/TRAINING.md, "Auto-label"):
   4. Checks: Qwen3-VL (--vlm, optional) answers "what is this crop" in one word for every person box
      and every single-labeler box; SigLIP 2 (--siglip, optional) ranks the animal classes on the crop
      with day or night prompts (`species_scores`). Neither deletes a box: the service's triage turns a
-     "no" into "review".
+     "no" into "review". --vlm-min-score skips the VLM on boxes whose fused score is below it
+     (`vlm_skipped: "score"`); --vlm-batch N asks up to N crops of a frame in one `generate` call.
+     A reply ends after its first token when that is a whole answer word (one decode step less).
 
 Nothing is decided here: the service reads the JSONL output, triages each box (accept only when
 both labelers agree at a score >= 0.6 and no check objects; night person / animal boxes always go to
@@ -27,9 +29,10 @@ Input (`--frames`): JSONL, one object per frame: `{"frame": "<rel>", "path": "<i
 "rfdetr": s}, "agree", "vlm": {...}, "species_scores": {...}}], "ms": {...}}` (pixels of the frame).
 
 Progress: one stdout line `@autolabel {json}` per event (`start`, `model`, `frame`, `done`,
-`self_check`, `self_test`); everything else is log output. The service runs this file (embedded in
-the binary) in its training environment (<data root>/tools/train-env), offline, with weights it
-downloaded and SHA-256 checked.
+`self_check`, `self_test`); everything else is log output. Every finished frame is flushed to
+`--out` at once, so a stopped run keeps them; --prefetch decodes the next frames on a thread. The
+service runs this file (embedded in the binary) in its training environment
+(<data root>/tools/train-env), offline, with weights it downloaded and SHA-256 checked.
 
     python scripts/autolabel.py --self-test           # pure tests of the fusion code, no torch needed
     python scripts/autolabel.py --self-check          # imports and the device
@@ -43,8 +46,11 @@ import argparse
 import json
 import math
 import os
+import queue
 import sys
+import threading
 import time
+import warnings
 from pathlib import Path
 
 # ---------------------------------------------------------------------------------------------
@@ -275,6 +281,40 @@ def needs_vlm(b: dict) -> bool:
     return c != "object" and (c == "person" or not b.get("agree", False))
 
 
+def vlm_plan(b: dict, min_score: float):
+    """Whether the VLM checks box `b`: "ask", "score" (it would, but the fused score is below
+    `min_score`; 0 = no cutoff) or None (no check, see `needs_vlm`)."""
+    if not needs_vlm(b):
+        return None
+    return "score" if min_score > 0 and b["score"] < min_score else "ask"
+
+
+def answer_token_ids(tokenize) -> set:
+    """The token ids that are a whole VLM answer word on their own (`VLM_WORDS`, lower case and
+    capitalized; `tokenize(text)` -> ids without special tokens). The VLM stops after such a first
+    token (`Vlm.ask`): it would only add the end-of-turn token, and `vlm_answer` of the word alone is
+    the same. A word split into several tokens ("stat" + "ue") is not in the set and runs on."""
+    ids = set()
+    for w in VLM_WORDS:
+        for v in (w, w.capitalize()):
+            t = list(tokenize(v))
+            if len(t) == 1:
+                ids.add(int(t[0]))
+    return ids
+
+
+def first_token_done(new_tokens: list, ids: set) -> bool:
+    """Whether a reply of `new_tokens` (ids generated so far) is complete by `answer_token_ids`:
+    exactly one token, and it is an answer word."""
+    return len(new_tokens) == 1 and int(new_tokens[0]) in ids
+
+
+def chunks(items: list, n: int) -> list:
+    """`items` in consecutive lists of at most `n` (n < 1 counts as 1), order kept."""
+    n = max(1, int(n))
+    return [items[i:i + n] for i in range(0, len(items), n)]
+
+
 def self_test() -> int:
     n = 0
 
@@ -334,6 +374,81 @@ def self_test() -> int:
     check(crop_box([0, 0, 100, 100], 100, 100) == (0, 0, 100, 100), "crop clamp")
     check(needs_vlm({"label": "person", "agree": True}) and needs_vlm({"label": "dog", "agree": False}), "needs_vlm")
     check(not needs_vlm({"label": "dog", "agree": True}), "needs_vlm agreed animal")
+    check(vlm_plan({"label": "person", "agree": True, "score": 0.1}, 0.0) == "ask", "vlm_plan no cutoff")
+    check(vlm_plan({"label": "person", "agree": True, "score": 0.1}, 0.2) == "score", "vlm_plan below cutoff")
+    check(vlm_plan({"label": "dog", "agree": False, "score": 0.2}, 0.2) == "ask", "vlm_plan at cutoff asks")
+    check(vlm_plan({"label": "dog", "agree": True, "score": 0.05}, 0.2) is None, "vlm_plan no check wins")
+    check(vlm_plan({"label": "package", "agree": False, "score": 0.9}, 0.2) is None, "vlm_plan object class")
+    check(chunks([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]], "chunks")
+    check(chunks([1, 2, 3], 8) == [[1, 2, 3]] and chunks([], 4) == [], "chunks short / empty")
+    check(chunks([1, 2], 1) == [[1], [2]] and chunks([1, 2], 0) == [[1], [2]], "chunks of one")
+    # Answer words as single tokens: a fake tokenizer that splits "statue" in two.
+    vocab = {w: i for i, w in enumerate(["person", "Person", "vehicle", "animal", "rock", "plant", "nothing",
+                                          "stat", "ue", "Stat", "Vehicle"])}
+    fake_tok = lambda t: [vocab["stat" if t[0] == "s" else "Stat"], vocab["ue"]] if t.lower() == "statue" else \
+        ([vocab[t]] if t in vocab else [100, 101])
+    ids = answer_token_ids(fake_tok)
+    check(ids == {vocab[w] for w in ("person", "Person", "vehicle", "Vehicle", "animal", "rock", "plant", "nothing")},
+          f"answer_token_ids {sorted(ids)}")
+    check(first_token_done([vocab["person"]], ids) and first_token_done([vocab["Vehicle"]], ids), "first token done")
+    check(not first_token_done([vocab["stat"]], ids) and not first_token_done([], ids), "split word runs on")
+    check(not first_token_done([vocab["person"], vocab["ue"]], ids), "only the first token stops")
+    # vlm_check with fakes: batches of 2 of 3 crops, then a failing batch falls back to one at a time.
+    class FakeImage:
+        size = (100, 100)
+
+        def crop(self, box):
+            return box
+
+    class FakeVlm:
+        def __init__(self, fail):
+            self.fail, self.calls = fail, []
+
+        def ask(self, crop):
+            self.calls.append(1)
+            return "A person." if crop[0] < 50 else "rock"
+
+        def ask_many(self, crops):
+            if self.fail:
+                raise RuntimeError("out of memory")
+            self.calls.append(len(crops))
+            return ["A person." if c[0] < 50 else "rock" for c in crops]
+
+        def free(self):
+            pass
+
+    quiet, real_log = (lambda msg: None), globals()["log"]
+    for fail, calls in ((False, [2, 1]), (True, [1, 1, 1])):
+        fv, st = FakeVlm(fail), {}
+        bs = [{"label": "person", "bbox": [10, 10, 20, 20]}, {"label": "dog", "bbox": [60, 60, 70, 70]},
+              {"label": "person", "bbox": [5, 5, 9, 9]}]
+        globals()["log"] = quiet
+        try:
+            vlm_check(fv, FakeImage(), bs, 2, "fake", st)
+        finally:
+            globals()["log"] = real_log
+        check([(b["vlm"]["answer"], b["vlm"]["ok"]) for b in bs] == [("person", True), ("rock", False), ("person", True)],
+              f"vlm_check answers (fail={fail}) {bs}")
+        check(fv.calls == calls and st.get("fallbacks", 0) == (1 if fail else 0), f"vlm_check calls (fail={fail}) {fv.calls}")
+    got = list(FrameReader([{"path": "/nonexistent/a.jpg"}, {"path": "/nonexistent/b.jpg"}], True,
+                           opener=lambda path: path[-5]))
+    check([(i, img, err) for i, _, img, err in got] == [(0, "a", None), (1, "b", None)], f"prefetch order {got}")
+
+    def bad(path):
+        if path.endswith("b"):
+            raise OSError("broken")
+        return path
+
+    for pre in (False, True):
+        got = [(i, img, str(err) if err else None) for i, _, img, err in
+               FrameReader([{"path": "a"}, {"path": "b"}, {"path": "c"}], pre, opener=bad)]
+        check(got == [(0, "a", None), (1, None, "broken"), (2, "c", None)], f"reader errors (prefetch={pre}) {got}")
+    # Stopping early (an exception in the loop) ends the prefetch thread.
+    r = FrameReader([{"path": str(k)} for k in range(10)], True, opener=lambda path: path)
+    with r:
+        for item in r:
+            break
+    check(r.thread is not None and not r.thread.is_alive(), "prefetch thread stops on early exit")
     event("self_test", passed=n)
     log(f"self-test: {n} checks passed")
     return 0
@@ -465,6 +580,48 @@ class GroundingDino:
         return nms(found, self.nms_iou)
 
 
+def native_grid_sample_on_mps() -> bool:
+    """Make rfdetr's deformable attention use `F.grid_sample` on MPS while no gradient is needed.
+
+    On MPS (and XLA) rfdetr samples through a gather-based bilinear path, written for training
+    (grid_sample's backward has no MPS kernel); its forward has one, which gives the same values
+    (measured: identical boxes and scores) and RF-DETR L about 10% faster. With grad enabled, or on
+    another device, rfdetr's own function runs. Both are compared once on a random input first.
+    Returns False when nothing was patched (no such function in this rfdetr, or the two differ)."""
+    try:
+        import rfdetr.models.ops.functions.ms_deform_attn_func as msda
+    except ImportError:
+        return False
+    own = getattr(msda, "_bilinear_grid_sample", None)
+    if own is None or getattr(own, "_autolabel_native", False):
+        return own is not None
+    import torch
+    import torch.nn.functional as F
+
+    try:
+        g = torch.Generator().manual_seed(0)
+        x = torch.randn(2, 8, 13, 17, generator=g).to("mps")
+        grid = (torch.rand(2, 50, 4, 2, generator=g) * 2.4 - 1.2).to("mps")  # some points outside
+        with torch.no_grad():
+            diff = (own(x, grid, padding_mode="zeros", align_corners=False)
+                    - F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)).abs().max().item()
+    except Exception as e:  # noqa: BLE001 - keep rfdetr's own path
+        log(f"RF-DETR: grid_sample check failed ({type(e).__name__}: {e}); keeping rfdetr's sampling")
+        return False
+    if not diff <= 1e-4:
+        log(f"RF-DETR: grid_sample differs from rfdetr's sampling by {diff}; keeping rfdetr's")
+        return False
+
+    def bilinear(input, grid, padding_mode="zeros", align_corners=False):
+        if input.device.type == "mps" and not torch.is_grad_enabled():
+            return F.grid_sample(input, grid, mode="bilinear", padding_mode=padding_mode, align_corners=align_corners)
+        return own(input, grid, padding_mode=padding_mode, align_corners=align_corners)
+
+    bilinear._autolabel_native = True
+    msda._bilinear_grid_sample = bilinear
+    return True
+
+
 class RfDetr:
     """RF-DETR L (COCO) through the rfdetr package."""
 
@@ -475,6 +632,8 @@ class RfDetr:
         self.names = dict(COCO_CLASSES)
         self.model = rfdetr.RFDETRLarge(pretrain_weights=str(weights), device=device)
         self.threshold = threshold
+        if str(device).startswith("mps") and native_grid_sample_on_mps():
+            log("RF-DETR: deformable attention samples with grid_sample's MPS kernel")
 
     def detect(self, image, wanted: dict) -> list:
         det = self.model.predict(image, threshold=self.threshold, include_source_image=False)
@@ -493,7 +652,7 @@ class Vlm:
     QUESTION = ("What is in this image: a person, a vehicle, an animal, a statue, a rock, a plant, or "
                 "nothing? Answer with one word.")
 
-    def __init__(self, path: Path, device: str, name: str):
+    def __init__(self, path: Path, device: str, name: str, early_stop: bool = True):
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -505,22 +664,175 @@ class Vlm:
         self.model = AutoModelForImageTextToText.from_pretrained(str(path), dtype=dtype).to(device).eval()
         self.device = device
         self.name = name
+        tok = self.processor.tokenizer
+        ids = answer_token_ids(lambda t: tok.encode(t, add_special_tokens=False)) if early_stop else set()
+        self.answer_ids = torch.tensor(sorted(ids), device=device) if ids else None
+
+    def stopping(self, prompt_len: int) -> dict:
+        """`generate` kwargs that end a reply after its first token when that is an answer word
+        (`first_token_done`; the next token would be end-of-turn): one decode step less per crop, same
+        answer. Rows of a batch stop on their own."""
+        if self.answer_ids is None:
+            return {}
+        from transformers import StoppingCriteria, StoppingCriteriaList
+
+        torch, ids = self.torch, self.answer_ids
+
+        class FirstWord(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):
+                if input_ids.shape[1] != prompt_len + 1:
+                    return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+                return torch.isin(input_ids[:, -1], ids)
+
+        return {"stopping_criteria": StoppingCriteriaList([FirstWord()])}
 
     def ask(self, crop) -> str:
         torch = self.torch
+        crop = self.fit(crop)
+        messages = [{"role": "user", "content": [{"type": "image", "image": crop}, {"type": "text", "text": self.QUESTION}]}]
+        inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
+                                                    return_dict=True, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            out = self.model.generate(**inputs, max_new_tokens=5, do_sample=False,
+                                      **self.stopping(inputs["input_ids"].shape[1]))
+        text = self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+        return text.strip()
+
+    @staticmethod
+    def fit(crop):
+        """The crop as `ask` sends it: at most 448 px on the long side, at least 32 on the short."""
         if max(crop.size) > 448:
             s = 448 / max(crop.size)
             crop = crop.resize((max(1, round(crop.size[0] * s)), max(1, round(crop.size[1] * s))))
         if min(crop.size) < 32:
             s = 32 / min(crop.size)
             crop = crop.resize((max(32, round(crop.size[0] * s)), max(32, round(crop.size[1] * s))))
-        messages = [{"role": "user", "content": [{"type": "image", "image": crop}, {"type": "text", "text": self.QUESTION}]}]
-        inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
-                                                    return_dict=True, return_tensors="pt").to(self.device)
+        return crop
+
+    def ask_many(self, crops: list) -> list:
+        """`ask` for several crops in one `generate` call (left padding, the attention mask marks
+        the padding); one answer per crop, in order."""
+        if len(crops) == 1:
+            return [self.ask(crops[0])]
+        torch = self.torch
+        conversations = [[{"role": "user", "content": [{"type": "image", "image": self.fit(c)},
+                                                       {"type": "text", "text": self.QUESTION}]}] for c in crops]
+        inputs = self.processor.apply_chat_template(
+            conversations, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt",
+            processor_kwargs={"padding": True, "padding_side": "left"},
+        ).to(self.device)
         with torch.no_grad():
-            out = self.model.generate(**inputs, max_new_tokens=5, do_sample=False)
-        text = self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
-        return text.strip()
+            out = self.model.generate(**inputs, max_new_tokens=5, do_sample=False,
+                                      **self.stopping(inputs["input_ids"].shape[1]))
+        texts = self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        return [t.strip() for t in texts]
+
+    def free(self) -> None:
+        """Return cached device memory (after a failed batch)."""
+        torch = self.torch
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        elif self.device == "mps":
+            torch.mps.empty_cache()
+
+
+def vlm_check(vlm: Vlm, image, boxes: list, batch: int, name: str, state: dict) -> None:
+    """Sets `b["vlm"]` on every box of `boxes` (one frame) from the VLM's answer on its crop, `batch`
+    crops per `generate` call. A failed batched call (e.g. out of memory) asks that frame's crops one
+    at a time instead; the first failure of the run is logged, `state["fallbacks"]` counts them."""
+    w, h = image.size
+    crops = [image.crop(crop_box(b["bbox"], w, h)) for b in boxes]
+    answers = []
+    if batch > 1 and len(crops) > 1:
+        try:
+            for part in chunks(crops, batch):
+                answers.extend(vlm.ask_many(part))
+        except Exception as e:  # noqa: BLE001 - a batch that does not fit must not stop the run
+            state["fallbacks"] = state.get("fallbacks", 0) + 1
+            if state["fallbacks"] == 1:
+                log(f"VLM batch of {batch} failed ({type(e).__name__}: {str(e)[:200]}); asking one crop at a "
+                    "time for that frame (later failures are only counted)")
+            vlm.free()
+            answers = []
+    if len(answers) != len(crops):
+        answers = [vlm.ask(c) for c in crops]
+    for b, raw in zip(boxes, answers):
+        ans = vlm_answer(raw)
+        exp = category(b["label"])
+        b["vlm"] = {"model": name, "answer": ans, "expected": exp, "ok": ans == exp, "raw": raw[:40]}
+
+
+class FrameReader:
+    """The frames with their decoded RGB images, in order: `(index, frame, image, error)` (image None
+    and the exception when it cannot be read). With `prefetch`, a thread decodes up to two frames
+    ahead; leaving the `with` block (or exhausting it) stops the thread."""
+
+    DEPTH = 2
+
+    def __init__(self, frames: list, prefetch: bool, opener=None):
+        self.frames = frames
+        self.prefetch = prefetch
+        self.opener = opener or self.open_rgb
+        self.thread = None
+        self.stop = threading.Event()
+        self.q = queue.Queue(maxsize=self.DEPTH)
+
+    @staticmethod
+    def open_rgb(path):
+        from PIL import Image
+
+        return Image.open(path).convert("RGB")
+
+    def load(self, i: int, fr: dict):
+        try:
+            return i, fr, self.opener(fr["path"]), None
+        except Exception as e:  # noqa: BLE001 - one unreadable frame must not stop the run
+            return i, fr, None, e
+
+    def produce(self) -> None:
+        for i, fr in enumerate(self.frames):
+            item = self.load(i, fr)
+            while not self.stop.is_set():
+                try:
+                    self.q.put(item, timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
+            if self.stop.is_set():
+                return
+        while not self.stop.is_set():
+            try:
+                self.q.put(None, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join()
+
+    def __iter__(self):
+        if not self.prefetch:
+            for i, fr in enumerate(self.frames):
+                yield self.load(i, fr)
+            return
+        self.thread = threading.Thread(target=self.produce, name="frame-prefetch", daemon=True)
+        self.thread.start()
+        try:
+            while True:
+                item = self.q.get()
+                if item is None:
+                    return
+                yield item
+        finally:
+            self.close()
 
 
 class Siglip:
@@ -611,9 +923,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--nms-iou", type=float, default=0.6)
     p.add_argument("--wbf-iou", type=float, default=0.55)
     p.add_argument("--token-limit", type=int, default=200, help="most tokens of one MM-Grounding-DINO prompt (its encoder takes 256)")
+    p.add_argument("--vlm-batch", type=int, default=1, help="crops of one frame per VLM generate call (1 = one at a time)")
+    p.add_argument("--vlm-min-score", type=float, default=0.0,
+                   help="skip the VLM on boxes whose fused score is below this (0 = check every box needs_vlm picks)")
+    p.add_argument("--prefetch", action="store_true", help="decode the next frames on a background thread")
     a = p.parse_args()
     if a.self_test or a.self_check:
         return a
+    if a.vlm_batch < 1:
+        p.error("--vlm-batch must be at least 1")
+    if not 0.0 <= a.vlm_min_score <= 1.0:
+        p.error("--vlm-min-score must be between 0 and 1")
     missing = [k for k in ("frames", "out", "classes") if getattr(a, k) is None]
     if missing:
         p.error("missing: " + ", ".join("--" + m for m in missing))
@@ -624,12 +944,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     a = parse_args()
+    # The libraries' deprecation notices (transformers, torch.jit) would fill the job's log tail
+    # on the Training page instead of the progress lines.
+    warnings.filterwarnings("ignore", category=FutureWarning)
     if a.self_test:
         return self_test()
     if a.self_check:
         return self_check()
     watch_parent()
-    from PIL import Image
 
     classes = [c.strip() for c in json.loads(a.classes) if c.strip()]
     synonyms = dict(DEFAULT_SYNONYMS)
@@ -638,9 +960,11 @@ def main() -> int:
     if a.categories:
         CATEGORIES.update(json.loads(a.categories.read_text(encoding="utf-8")))
     frames = [json.loads(l) for l in a.frames.read_text(encoding="utf-8").splitlines() if l.strip()]
-    device = pick_device(a.device)
-    if device == "mps":
+    # torch reads this once, when it is imported (pick_device imports it): set later it does nothing. It
+    # only affects the MPS backend. No op of the four labelers needs it with torch 2.14 (measured).
+    if sys.platform == "darwin":
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    device = pick_device(a.device)
     event("start", frames=len(frames), classes=classes, device=device)
 
     phrase_to_class = {}
@@ -679,12 +1003,14 @@ def main() -> int:
     weights = {m: 1.0 for m in labelers}
     a.out.parent.mkdir(parents=True, exist_ok=True)
     totals = {"boxes": 0, "agreed": 0, "vlm": 0}
-    with open(a.out, "w", encoding="utf-8") as out:
-        for i, fr in enumerate(frames):
+    vlm_state = {}
+    if vlm is not None and (a.vlm_batch > 1 or a.vlm_min_score > 0):
+        log(f"VLM: {a.vlm_batch} crop(s) per call, skipped below fused score {a.vlm_min_score}")
+    reader = FrameReader(frames, a.prefetch)
+    with open(a.out, "w", encoding="utf-8") as out, reader:
+        for i, fr, image, e in reader:
             ms = {}
-            try:
-                image = Image.open(fr["path"]).convert("RGB")
-            except Exception as e:  # noqa: BLE001 - one unreadable frame must not stop the run
+            if image is None:
                 log(f"{fr.get('frame')}: cannot read the image ({e}); skipped")
                 event("frame", index=i + 1, frames=len(frames), frame=fr.get("frame"), boxes=0, error=str(e))
                 continue
@@ -700,16 +1026,20 @@ def main() -> int:
                 ms["rfdetr"] = round((time.time() - t) * 1000)
             fused = wbf(per, weights, a.wbf_iou, participants)
             night = fr.get("scene") in ("night", "ir")
-            for b in fused:
-                if vlm is not None and needs_vlm(b):
+            if vlm is not None:
+                ask = []
+                for b in fused:
+                    plan = vlm_plan(b, a.vlm_min_score)
+                    if plan == "ask":
+                        ask.append(b)
+                    elif plan == "score":
+                        b["vlm_skipped"] = "score"
+                if ask:
                     t = time.time()
-                    crop = image.crop(crop_box(b["bbox"], w, h))
-                    raw = vlm.ask(crop)
-                    ans = vlm_answer(raw)
-                    exp = category(b["label"])
-                    b["vlm"] = {"model": a.vlm_name, "answer": ans, "expected": exp, "ok": ans == exp, "raw": raw[:40]}
-                    ms["vlm"] = ms.get("vlm", 0) + round((time.time() - t) * 1000)
-                    totals["vlm"] += 1
+                    vlm_check(vlm, image, ask, a.vlm_batch, a.vlm_name, vlm_state)
+                    ms["vlm"] = round((time.time() - t) * 1000)
+                    totals["vlm"] += len(ask)
+            for b in fused:
                 if siglip is not None and b["label"] in animals and len(animals) > 1:
                     t = time.time()
                     crop = image.crop(crop_box(b["bbox"], w, h, 0.1))
@@ -721,6 +1051,8 @@ def main() -> int:
                                  separators=(",", ":")) + "\n")
             out.flush()
             event("frame", index=i + 1, frames=len(frames), frame=fr["frame"], boxes=len(fused), ms=ms)
+    if vlm_state.get("fallbacks"):
+        log(f"VLM: {vlm_state['fallbacks']} frame(s) fell back to one crop at a time")
     event("done", frames=len(frames), seconds=round(time.time() - t0, 1), device=device, **totals)
     return 0
 

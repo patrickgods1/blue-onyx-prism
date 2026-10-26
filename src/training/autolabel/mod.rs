@@ -336,6 +336,10 @@ pub struct AutolabelRequest {
     /// Device of `with_model` for this run only (a device spec; None = the model's device).
     #[serde(default)]
     pub device: Option<String>,
+    /// GPU of the labelers (`cuda:N` of [`Capability::cuda_options`]; None = the automatic
+    /// pick). [`plan_autolabel`] stores the device it resolved to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<String>,
     /// Pre-accept `with_model`'s boxes at this score or more (None = every box `review`).
     #[serde(default)]
     pub model_accept_score: Option<f32>,
@@ -352,6 +356,33 @@ pub struct AutolabelRequest {
     pub classes: Option<Vec<String>>,
     #[serde(default)]
     pub allow_large: bool,
+    /// A cancel while the frames are labelled keeps the finished ones: they are triaged and
+    /// written like a finished run's (with the `auto_run` marker, so a rerun of the same
+    /// labelers resumes after them) and the run ends with a "stopped by Cancel" summary. Off: a
+    /// cancel discards everything.
+    #[serde(default = "yes")]
+    pub keep_on_cancel: bool,
+    /// Ask Qwen3-VL about a frame's boxes in batches ([`VLM_BATCH`] per call) instead of one
+    /// by one.
+    #[serde(default = "yes")]
+    pub vlm_batch: bool,
+    /// Check only the boxes with a fused score of at least this with Qwen3-VL (None = every
+    /// eligible box).
+    #[serde(default)]
+    pub vlm_min_score: Option<f32>,
+    /// Load and decode the next frame on a background thread while the GPU labels this one.
+    #[serde(default = "yes")]
+    pub prefetch: bool,
+}
+
+/// Boxes per Qwen3-VL call when [`AutolabelRequest::vlm_batch`] is on.
+pub const VLM_BATCH: usize = 8;
+
+/// Default of [`AutolabelRequest::vlm_min_score`] the Training page suggests.
+pub const SUGGESTED_VLM_MIN_SCORE: f32 = 0.2;
+
+const fn yes() -> bool {
+    true
 }
 
 impl AutolabelRequest {
@@ -366,6 +397,7 @@ impl AutolabelRequest {
             with_model: None,
             threshold: models::DEFAULT_THRESHOLD,
             device: None,
+            gpu: None,
             model_accept_score: None,
             confirm_license: false,
             gdino_threshold: 0.2,
@@ -373,6 +405,10 @@ impl AutolabelRequest {
             accept_score: triage::ACCEPT_SCORE,
             classes: None,
             allow_large: false,
+            keep_on_cancel: true,
+            vlm_batch: true,
+            vlm_min_score: None,
+            prefetch: true,
         }
     }
 
@@ -411,6 +447,19 @@ impl AutolabelRequest {
                 );
             }
             models::canonical_device(d)?;
+        }
+        if let Some(g) = super::capability::gpu_arg(self.gpu.as_deref())?
+            && self.with_model.is_some()
+        {
+            bail!(
+                "a GPU ({g}) applies to the labelers; a run with a model (--with-model) takes a \
+                 device instead (--device ort:cuda:N, openvino:gpu.N, ...)"
+            );
+        }
+        if let Some(v) = self.vlm_min_score
+            && !(v.is_finite() && v > 0.0 && v <= 1.0)
+        {
+            bail!("VLM minimum score must be above 0 and at most 1, got {v}");
         }
         Ok(())
     }
@@ -460,6 +509,7 @@ pub fn plan_autolabel(
     let platform = Platform::current();
     let allow_large = request.allow_large || config.allow_large_downloads;
     let mut model = None;
+    let mut accelerator = cap.accelerator.clone();
     if let Some(m) = &request.with_model {
         if let Some(d) = &request.device {
             request.device = Some(models::canonical_device(d)?);
@@ -468,7 +518,8 @@ pub fn plan_autolabel(
         check_model_install(config, &plan, allow_large, request.confirm_license)?;
         model = Some(plan);
     } else {
-        let Some(a) = &cap.accelerator else {
+        // A chosen GPU: its device and its lane's environment.
+        let Some(a) = &cap.resolve_gpu(request.gpu.as_deref())? else {
             bail!(
                 "the auto-labelers need an NVIDIA GPU (Windows / Linux) or Apple silicon: {}; \
                  re-label with a trained model instead (--with-model <name>)",
@@ -489,6 +540,8 @@ pub fn plan_autolabel(
             .map(|r| (r, super::pyenv::weights_dir(&paths, r)))
             .collect();
         super::pyenv::check_large(&list, allow_large)?;
+        request.gpu = super::capability::gpu_arg(request.gpu.as_deref())?.map(|_| a.device_arg());
+        accelerator = Some(a.clone());
     }
     request.allow_large = allow_large;
     let id = super::service::new_run_id();
@@ -501,7 +554,7 @@ pub fn plan_autolabel(
         request,
         paths,
         platform,
-        accelerator: cap.accelerator.clone(),
+        accelerator,
         timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
         config: Box::new(config.clone()),
         model,
@@ -641,6 +694,38 @@ mod tests {
             assert!(FrameFilter::parse(bad, "any").is_err(), "{bad}");
         }
         assert!(f.describe().contains("scene=ir"));
+    }
+
+    #[test]
+    fn run_options_default_on_validate_and_parse_from_old_requests() {
+        let r = AutolabelRequest::new(FrameFilter::default());
+        assert!(r.keep_on_cancel && r.vlm_batch && r.prefetch);
+        assert_eq!(r.vlm_min_score, None);
+        // A request saved before the options existed (tasks.json) parses with the defaults.
+        let mut old = serde_json::to_value(&r).unwrap();
+        let obj = old.as_object_mut().unwrap();
+        for k in ["keep_on_cancel", "vlm_batch", "vlm_min_score", "prefetch"] {
+            assert!(obj.remove(k).is_some(), "{k}");
+        }
+        let back: AutolabelRequest = serde_json::from_value(old).unwrap();
+        assert_eq!(back, r);
+        let mut off = r.clone();
+        (off.keep_on_cancel, off.vlm_batch, off.prefetch) = (false, false, false);
+        off.vlm_min_score = Some(0.2);
+        let back: AutolabelRequest =
+            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert_eq!(back, off);
+        for ok in [0.01, 0.2, 1.0] {
+            let mut m = r.clone();
+            m.vlm_min_score = Some(ok);
+            assert!(m.validate().is_ok(), "{ok}");
+        }
+        for bad in [0.0, -0.1, 1.01, f32::NAN, f32::INFINITY] {
+            let mut m = r.clone();
+            m.vlm_min_score = Some(bad);
+            let e = m.validate().unwrap_err().to_string();
+            assert!(e.contains("VLM minimum score"), "{bad}: {e}");
+        }
     }
 
     #[test]

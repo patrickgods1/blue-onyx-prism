@@ -441,6 +441,64 @@ pub fn blue_iris_time(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
+/// The part of a Blue Iris recording exported in segments (`Back.20261010_160000_3.mp4`: every
+/// part carries the recording's start time, numbered `_1`, `_2`, ...): the input up to and
+/// including the time (folder, camera and time: the recording's key) and the part number; `None`
+/// for any other name.
+pub fn blue_iris_segment(name: &str) -> Option<(&str, u32)> {
+    let start = name.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let file = name.get(start..)?;
+    let mut at = file.find('.')? + 1;
+    for part in file.split('.').skip(1) {
+        let b = part.as_bytes();
+        let digits = |r: std::ops::Range<usize>| {
+            b.get(r)
+                .is_some_and(|d| !d.is_empty() && d.iter().all(u8::is_ascii_digit))
+        };
+        if b.len() > 16
+            && b.len() <= 21
+            && digits(0..8)
+            && b.get(8) == Some(&b'_')
+            && digits(9..15)
+            && b.get(15) == Some(&b'_')
+            && digits(16..b.len())
+        {
+            let n = part.get(16..)?.parse().ok()?;
+            return Some((name.get(..start + at + 15)?, n));
+        }
+        at += part.len() + 1;
+    }
+    None
+}
+
+/// Start offsets (seconds after the time in the name) of `videos` (path, length in seconds): the
+/// parts of one segmented Blue Iris recording ([`blue_iris_segment`], same folder, camera and
+/// time) follow each other in part order, each after the lengths of the lower parts in the list
+/// (a part of unknown length counts as 0); every other video starts at 0. Without this, all the
+/// parts of a recording claim the same minute and the dedup drops them as near duplicates.
+pub fn segment_offsets(videos: &[(&str, Option<f64>)]) -> Vec<f64> {
+    let mut by_rec: std::collections::BTreeMap<&str, Vec<(u32, usize)>> =
+        std::collections::BTreeMap::new();
+    for (i, (name, _)) in videos.iter().enumerate() {
+        if let Some((key, n)) = blue_iris_segment(name) {
+            by_rec.entry(key).or_default().push((n, i));
+        }
+    }
+    let mut out = vec![0.0; videos.len()];
+    for parts in by_rec.values_mut() {
+        parts.sort_unstable();
+        let mut at = 0.0;
+        for (_, i) in parts.iter() {
+            if let Some(o) = out.get_mut(*i) {
+                *o = at;
+            }
+            let len = videos.get(*i).and_then(|v| v.1);
+            at += len.filter(|d| d.is_finite() && *d > 0.0).unwrap_or(0.0);
+        }
+    }
+    out
+}
+
 /// The recording time of a MEVA clip name (`2018-03-11.23-55-00.00-00-00.school.G639.r13.avi`).
 pub fn meva_time(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
@@ -557,6 +615,27 @@ mod tests {
             "month 13"
         );
         assert!(blue_iris_time("clip.mp4").is_none());
+        let seg = "/v/Export/Back.20261010_160000_12.mp4";
+        assert!(blue_iris_time(seg).is_some());
+        assert_eq!(
+            blue_iris_segment(seg),
+            Some(("/v/Export/Back.20261010_160000", 12))
+        );
+        assert_eq!(
+            blue_iris_segment("D:\\Clips\\Front Door.20261010_160000_1.mp4"),
+            Some(("D:\\Clips\\Front Door.20261010_160000", 1))
+        );
+        for other in [
+            "Driveway.20240315_083012.mp4",
+            "Cam1.20240315_083012.123456.3-1.jpg",
+            "Back.20261010_160000_.mp4",
+            "Back.20261010_160000_x1.mp4",
+            "Back.20261010_160000_123456.mp4",
+            "20261010_160000_3.mp4",
+            "clip.mp4",
+        ] {
+            assert_eq!(blue_iris_segment(other), None, "{other}");
+        }
         let m = meva_time("2018-03-11.23-55-00.00-00-00.school.G639.r13.avi").unwrap();
         assert_eq!(m.to_rfc3339(), "2018-03-11T23:55:00+00:00");
         assert_eq!(
@@ -708,5 +787,28 @@ mod tests {
         let d = discover(&dir).unwrap();
         assert_eq!((d.images.len(), d.videos.len(), d.dirs), (10, 1, 4));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segments_of_one_recording_follow_each_other() {
+        // Out of order, a gap (no part 3), another recording, another folder, a plain clip and a
+        // part of unknown length.
+        let v = [
+            ("/e/Back.20261010_160000_2.mp4", Some(63.3)),
+            ("/e/Back.20261010_160000_1.mp4", Some(35.9)),
+            ("/e/Back.20261010_160000_4.mp4", Some(64.0)),
+            ("/e/Back.20261010_170042_1.mp4", Some(60.0)),
+            ("/e/Back.20261010_170042_2.mp4", None),
+            ("/e/Back.20261010_170042_3.mp4", Some(60.0)),
+            ("/f/Back.20261010_160000_2.mp4", Some(10.0)),
+            ("/e/Driveway.20261010_160000.mp4", Some(300.0)),
+        ];
+        let o = segment_offsets(&v);
+        let want = [35.9, 0.0, 35.9 + 63.3, 0.0, 60.0, 60.0, 0.0, 0.0];
+        assert_eq!(o.len(), want.len());
+        for (i, (a, b)) in o.iter().zip(want).enumerate() {
+            assert!((a - b).abs() < 1e-9, "{i}: {a} != {b}");
+        }
+        assert!(segment_offsets(&[]).is_empty());
     }
 }

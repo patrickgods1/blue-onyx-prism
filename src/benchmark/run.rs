@@ -56,6 +56,9 @@ pub struct Bench<'a> {
     pub cancel: Option<&'a AtomicBool>,
     /// Called at every phase change and after every iteration.
     pub progress: Option<&'a (dyn Fn(&Progress) + Sync)>,
+    /// Called with each image's result as soon as its timed runs end (a cancelled run's
+    /// finished images stay usable: the auto-labeler keeps them).
+    pub on_image: Option<&'a (dyn Fn(&ImageRun) + Sync)>,
     pub weights: Weights,
     /// What the best confidence threshold optimizes (exact picks are computed per run).
     pub threshold_objective: threshold::Objective,
@@ -77,6 +80,7 @@ impl std::fmt::Debug for Bench<'_> {
             .field("cache_dir", &self.cache_dir)
             .field("cancel", &self.cancel)
             .field("progress", &self.progress.is_some())
+            .field("on_image", &self.on_image.is_some())
             .field("weights", &self.weights)
             .field("threshold_objective", &self.threshold_objective)
             .field("accuracy_metric", &self.accuracy_metric)
@@ -133,6 +137,7 @@ impl<'a> Bench<'a> {
             cache_dir: None,
             cancel: None,
             progress: None,
+            on_image: None,
             weights: Weights::default(),
             threshold_objective: threshold::Objective::default(),
             accuracy_metric: grade::AccuracyMetric::default(),
@@ -478,6 +483,9 @@ impl<'a> Bench<'a> {
             timed.by_res.entry(bucket).or_default().1 += 1;
             let last = last.context("no timed run (repeat must be >= 1)")?;
             let (run, eval) = image_run(set, img, &last, &totals, &infers, self.max_stored_preds);
+            if let Some(f) = self.on_image {
+                f(&run);
+            }
             timed.eval_preds.push(eval);
             timed.per_image.push(run);
         }

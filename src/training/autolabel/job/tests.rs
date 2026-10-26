@@ -85,6 +85,9 @@ struct LabelFake {
     cmds: Mutex<Vec<Cmd>>,
     /// Frames the fake labelers find nothing in.
     empty: Vec<String>,
+    /// Cancel after writing this many proposal lines, the last one cut off mid-line (as the
+    /// real runner does: the flag set, the script killed, `Cancelled`).
+    stop_after: Option<usize>,
 }
 
 impl CommandRunner for LabelFake {
@@ -102,6 +105,16 @@ impl CommandRunner for LabelFake {
         let out = arg_after(cmd, "--out").unwrap();
         let mut text = String::new();
         for (i, l) in std::fs::read_to_string(list).unwrap().lines().enumerate() {
+            if let Some(k) = self.stop_after
+                && i + 1 == k
+            {
+                // Killed while writing line k.
+                let line = serde_json::json!({"frame": "x", "boxes": []}).to_string();
+                text.push_str(&line[..line.len() / 2]);
+                std::fs::write(&out, &text).unwrap();
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(anyhow!(crate::resources::export::Cancelled));
+            }
             let f: serde_json::Value = serde_json::from_str(l).unwrap();
             if self.empty.iter().any(|e| f["frame"] == e.as_str()) {
                 let line = serde_json::json!({"frame": f["frame"], "boxes": []});
@@ -382,6 +395,8 @@ fn empty_frames_get_the_marker_and_other_class_boxes_a_suggestion() {
 struct FakeDetector {
     dets: BTreeMap<String, Vec<Det>>,
     calls: Mutex<Vec<(String, Option<String>, bool)>>,
+    /// Cancel after this many frames (the flag set, the finished frames returned).
+    stop_after: Option<usize>,
 }
 
 impl FakeDetector {
@@ -389,6 +404,7 @@ impl FakeDetector {
         Self {
             dets,
             calls: Mutex::default(),
+            stop_after: None,
         }
     }
 }
@@ -401,9 +417,13 @@ impl Detector for FakeDetector {
         device: Option<&str>,
         images: &[Image],
         _threshold: f32,
-        _cancel: &AtomicBool,
+        cancel: &AtomicBool,
     ) -> Result<super::super::relabel::Detections> {
         let name = model.effective_name();
+        let n = self.stop_after.unwrap_or(images.len()).min(images.len());
+        if self.stop_after.is_some() {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         assert!(
             config.models.iter().any(|m| m.effective_name() == name),
             "the entry is in the config the detector gets"
@@ -413,7 +433,7 @@ impl Detector for FakeDetector {
             .unwrap()
             .push((name, device.map(str::to_string), model.enabled));
         Ok(super::super::relabel::Detections {
-            frames: images
+            frames: images[..n]
                 .iter()
                 .map(|i| {
                     (
@@ -423,6 +443,7 @@ impl Detector for FakeDetector {
                 })
                 .collect(),
             device: device.unwrap_or("openvino:cpu").to_string(),
+            cancelled: self.stop_after.is_some(),
         })
     }
 }
@@ -551,6 +572,120 @@ fn planning_refuses_unknown_models_missing_gpus_and_empty_selections() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("no frame matches"), "{e}");
+}
+
+/// Two NVIDIA GPUs on Linux: an RTX 3090 (24 GB, CUDA 12.6 build, the automatic pick) and an
+/// RTX 5060 (8 GB, Blackwell: CUDA 13.0 build).
+fn two_gpus() -> Capability {
+    use crate::backend::detect::{ComputeCapability, CudaInfo, GpuAdapter, GpuVendor};
+    let gpu = |name: &str, cc: (u32, u32), vram_mb: u64, ordinal: u32| GpuAdapter {
+        vendor: GpuVendor::Nvidia,
+        name: name.into(),
+        vram_mb,
+        index: ordinal,
+        discrete: true,
+        cuda: Some(CudaInfo {
+            ordinal,
+            compute_capability: ComputeCapability::new(cc.0, cc.1),
+        }),
+    };
+    capability::capability(
+        &HardwareInfo::new(
+            "linux",
+            "x86_64",
+            vec![
+                gpu("NVIDIA GeForce RTX 3090", (8, 6), 24576, 0),
+                gpu("NVIDIA GeForce RTX 5060", (12, 0), 8192, 1),
+            ],
+        )
+        .with_cuda_driver(13, 0),
+        None,
+    )
+}
+
+#[test]
+fn the_labelers_run_on_the_chosen_gpu_in_its_lanes_environment() {
+    let t = tmp("gpu");
+    frames(&t.0, 1, false);
+    let cfg = config(&t.0);
+    let cap = two_gpus();
+    let run = |gpu: Option<&str>| {
+        let mut req = AutolabelRequest::new(FrameFilter::parse("again=1", "unreviewed").unwrap());
+        req.gpu = gpu.map(str::to_string);
+        let mut job = plan_autolabel(&cfg, req, &cap).unwrap();
+        // The environment of the planned GPU's platform (the tests may run on a Mac).
+        job.platform = Platform::LINUX_X64;
+        let fake = LabelFake::default();
+        let out = run_job(&job, &fake).unwrap();
+        let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
+        let pip = fake
+            .inner
+            .cmds()
+            .into_iter()
+            .find(|c| c.contains(" pip install "))
+            .unwrap();
+        (job, out, cmd, pip)
+    };
+    let (job, out, cmd, pip) = run(Some("CUDA:1"));
+    assert_eq!(job.request.gpu.as_deref(), Some("cuda:1"), "canonical");
+    assert_eq!(
+        job.title(),
+        "auto-label on cuda:1 (again=1, source=all, status=unreviewed, limit 200)"
+    );
+    assert_eq!(
+        arg_after(&cmd, "--device").unwrap().to_str(),
+        Some("cuda:1")
+    );
+    assert!(pip.contains("--torch-backend cu130"), "{pip}");
+    assert_eq!(out.result["device"], "cuda:1");
+    // Automatic: the largest GPU and its lane; the title names no device.
+    let (job, out, cmd, pip) = run(None);
+    assert_eq!(job.request.gpu, None);
+    assert!(job.title().starts_with("auto-label ("), "{}", job.title());
+    assert_eq!(
+        arg_after(&cmd, "--device").unwrap().to_str(),
+        Some("cuda:0")
+    );
+    assert!(pip.contains("--torch-backend cu126"), "{pip}");
+    assert_eq!(out.result["device"], "cuda:0");
+}
+
+#[test]
+fn a_gpu_choice_is_checked_when_planned() {
+    let t = tmp("gpu-plan");
+    let cfg = config(&t.0);
+    let plan = |gpu: &str, cap: &Capability| {
+        let mut req = AutolabelRequest::new(FrameFilter::default());
+        req.gpu = Some(gpu.into());
+        plan_autolabel(&cfg, req, cap).map(|j| j.request.gpu)
+    };
+    let e = plan("cuda:2", &two_gpus()).unwrap_err().to_string();
+    assert!(
+        e.contains("no such CUDA device") && e.contains("RTX 5060 (cuda:1"),
+        "{e}"
+    );
+    let e = plan("gpu1", &two_gpus()).unwrap_err().to_string();
+    assert!(e.contains("is not cuda:N"), "{e}");
+    let mac = capability::capability(
+        &HardwareInfo::new(
+            "macos",
+            "aarch64",
+            vec![crate::backend::detect::apple_gpu("Apple M1")],
+        ),
+        Some(16.0),
+    );
+    let e = plan("cuda:0", &mac).unwrap_err().to_string();
+    assert!(e.contains("no GPU to choose"), "{e}");
+    assert_eq!(plan("mps", &mac).unwrap().as_deref(), Some("mps"));
+    assert_eq!(plan("auto", &two_gpus()).unwrap(), None);
+    // A run with a model takes a device, not a GPU.
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.with_model = Some("IPcam-general".into());
+    req.gpu = Some("cuda:1".into());
+    let e = plan_autolabel(&cfg, req, &two_gpus())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("--device"), "{e}");
 }
 
 #[test]
@@ -1102,4 +1237,257 @@ fn a_failing_auto_family_names_the_fix() {
         e.contains("family auto") && e.contains("Models card"),
         "{e}"
     );
+}
+
+fn run_cancellable(
+    job: &AutolabelJob,
+    fake: &LabelFake,
+    cancel: &AtomicBool,
+) -> Result<TaskOutcome> {
+    job.run(
+        TaskContext {
+            runner: fake,
+            fetcher: fake,
+        },
+        &mut |_| {},
+        cancel,
+    )
+}
+
+#[test]
+fn script_flags_follow_the_run_options() {
+    let t = tmp("flags");
+    frames(&t.0, 1, false);
+    let cfg = config(&t.0);
+    let fake = LabelFake::default();
+    let argv = |edit: &dyn Fn(&mut AutolabelRequest)| -> Vec<String> {
+        let mut req = AutolabelRequest::new(FrameFilter::parse("again=1", "unreviewed").unwrap());
+        edit(&mut req);
+        let job = plan_autolabel(&cfg, req, &host()).unwrap();
+        run_job(&job, &fake).unwrap();
+        let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
+        cmd.args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    let after = |a: &[String], flag: &str| {
+        a.iter()
+            .position(|x| x == flag)
+            .and_then(|i| a.get(i + 1).cloned())
+    };
+    let has = |a: &[String], flag: &str| a.iter().any(|x| x == flag);
+    // The defaults: batches of 8, every box checked, the next frame prefetched.
+    let a = argv(&|_| {});
+    assert_eq!(after(&a, "--vlm-batch").as_deref(), Some("8"), "{a:?}");
+    assert!(
+        !has(&a, "--vlm-min-score") && has(&a, "--prefetch"),
+        "{a:?}"
+    );
+    // Everything off.
+    let a = argv(&|r| {
+        r.vlm_batch = false;
+        r.prefetch = false;
+    });
+    assert_eq!(after(&a, "--vlm-batch").as_deref(), Some("1"), "{a:?}");
+    assert!(
+        !has(&a, "--vlm-min-score") && !has(&a, "--prefetch"),
+        "{a:?}"
+    );
+    // A minimum score.
+    let a = argv(&|r| r.vlm_min_score = Some(0.2));
+    assert_eq!(
+        after(&a, "--vlm-min-score").as_deref(),
+        Some("0.2"),
+        "{a:?}"
+    );
+    assert_eq!(after(&a, "--vlm-batch").as_deref(), Some("8"), "{a:?}");
+    // No VLM: no VLM flags, whatever the options say.
+    let a = argv(&|r| {
+        r.vlm = None;
+        r.vlm_min_score = Some(0.5);
+    });
+    assert!(
+        !has(&a, "--vlm") && !has(&a, "--vlm-batch") && !has(&a, "--vlm-min-score"),
+        "{a:?}"
+    );
+    assert!(has(&a, "--prefetch"), "{a:?}");
+}
+
+#[test]
+fn a_cancelled_labelers_run_keeps_the_finished_frames_and_a_rerun_resumes() {
+    let t = tmp("keep");
+    let rels = frames(&t.0, 5, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    // Four lines written: three frames, the fourth cut off by the kill.
+    let fake = LabelFake {
+        stop_after: Some(4),
+        ..LabelFake::default()
+    };
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let cancel = AtomicBool::new(false);
+    let out = run_cancellable(&job, &fake, &cancel).unwrap();
+    assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+    let rep = &out.result;
+    assert_eq!(rep["cancelled"], true, "{rep}");
+    assert_eq!(
+        (rep["frames_done"].as_u64(), rep["frames_total"].as_u64()),
+        (Some(3), Some(5)),
+        "{rep}"
+    );
+    assert_eq!(rep["frames"], 3);
+    assert_eq!(
+        rep["added"], 6,
+        "two class boxes on each of three frames: {rep}"
+    );
+    assert!(
+        rep["warnings"].as_array().unwrap().is_empty(),
+        "the cut-off line is no warning: {rep}"
+    );
+    assert!(
+        out.summary
+            .starts_with("stopped by Cancel after 3 of 5 frames; those 3 were saved for review"),
+        "{}",
+        out.summary
+    );
+    assert!(!job.work.exists(), "the work folder is removed");
+    let labeler = rep["labeler"].as_str().unwrap();
+    // The proposals follow the frame list's order: the first three are done.
+    let list: Vec<String> = queue::build(&dir, &job.request.frames.filters().unwrap())
+        .items
+        .into_iter()
+        .map(|i| i.frame)
+        .collect();
+    assert_eq!(list.len(), 5);
+    for rel in &list[..3] {
+        let f = labels_of(&dir, rel);
+        assert_eq!(f.boxes.len(), 2, "{rel}");
+        assert_eq!(f.auto_run.as_ref().unwrap().labeler, labeler);
+    }
+    for rel in &list[3..] {
+        let f = Frame::resolve(&dir, rel).unwrap().labels().unwrap();
+        assert!(f.is_none_or(|f| f.auto_run.is_none()), "{rel}");
+    }
+    // A rerun of the same labelers skips the three and labels the other two.
+    let job2 =
+        plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out2 = run_job(&job2, &LabelFake::default()).unwrap();
+    assert_eq!(
+        (
+            out2.result["frames"].as_u64(),
+            out2.result["skipped_done"].as_u64(),
+            out2.result["cancelled"].as_bool()
+        ),
+        (Some(2), Some(3), Some(false)),
+        "{}",
+        out2.result
+    );
+    for rel in &rels {
+        assert!(labels_of(&dir, rel).auto_run.is_some(), "{rel}");
+    }
+}
+
+#[test]
+fn a_cancelled_run_without_keep_on_cancel_writes_nothing() {
+    let t = tmp("discard");
+    let rels = frames(&t.0, 5, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let fake = LabelFake {
+        stop_after: Some(4),
+        ..LabelFake::default()
+    };
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.keep_on_cancel = false;
+    let job = plan_autolabel(&cfg, req, &host()).unwrap();
+    let e = run_cancellable(&job, &fake, &AtomicBool::new(false)).unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::resources::export::Cancelled>()
+            .is_some(),
+        "{e:#}"
+    );
+    for rel in &rels {
+        let f = Frame::resolve(&dir, rel).unwrap().labels().unwrap();
+        assert!(
+            f.is_none_or(|f| f.auto_run.is_none() && f.boxes.is_empty()),
+            "{rel}"
+        );
+    }
+    assert!(!job.work.exists());
+    // Cancelled before any frame finished: a plain cancel with keep_on_cancel too.
+    let first = LabelFake {
+        stop_after: Some(1),
+        ..LabelFake::default()
+    };
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let e = run_cancellable(&job, &first, &AtomicBool::new(false)).unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::resources::export::Cancelled>()
+            .is_some(),
+        "{e:#}"
+    );
+    assert!(!job.work.exists());
+}
+
+#[test]
+fn a_cancelled_model_run_keeps_the_finished_frames() {
+    let t = tmp("keep-model");
+    let rels = frames(&t.0, 4, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let dets: BTreeMap<String, Vec<Det>> = rels
+        .iter()
+        .map(|r| (r.clone(), vec![det("car", 0.9, [1.0, 1.0, 30.0, 20.0])]))
+        .collect();
+    let plan = |keep: bool| {
+        let mut req = AutolabelRequest::new(FrameFilter::default());
+        req.with_model = Some("IPcam-general".into());
+        req.keep_on_cancel = keep;
+        let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+        let mut d = FakeDetector::new(dets.clone());
+        d.stop_after = Some(3);
+        job.detector = Some(Arc::new(d));
+        job
+    };
+    // Without keep_on_cancel: nothing written.
+    let e =
+        run_cancellable(&plan(false), &LabelFake::default(), &AtomicBool::new(false)).unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::resources::export::Cancelled>()
+            .is_some(),
+        "{e:#}"
+    );
+    for rel in &rels {
+        let f = Frame::resolve(&dir, rel).unwrap().labels().unwrap();
+        assert!(f.is_none_or(|f| f.auto_run.is_none()), "{rel}");
+    }
+    let job = plan(true);
+    let cancel = AtomicBool::new(false);
+    let out = run_cancellable(&job, &LabelFake::default(), &cancel).unwrap();
+    let rep = &out.result;
+    assert_eq!(rep["cancelled"], true, "{rep}");
+    assert_eq!(
+        (rep["frames_done"].as_u64(), rep["frames_total"].as_u64()),
+        (Some(3), Some(4)),
+        "{rep}"
+    );
+    assert_eq!(rep["added"], 3, "{rep}");
+    assert!(
+        out.summary
+            .starts_with("stopped by Cancel after 3 of 4 frames"),
+        "{}",
+        out.summary
+    );
+    let marked: Vec<&String> = rels
+        .iter()
+        .filter(|r| {
+            Frame::resolve(&dir, r)
+                .unwrap()
+                .labels()
+                .unwrap()
+                .is_some_and(|f| f.auto_run.is_some())
+        })
+        .collect();
+    assert_eq!(marked.len(), 3, "{marked:?}");
 }
