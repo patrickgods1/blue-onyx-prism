@@ -21,12 +21,28 @@ of:
 | Apple silicon, macOS 14+ | PyPI (MPS) | The families that passed a 1-epoch MPS smoke run (below). |
 
 Not supported: Intel and AMD GPUs (no pinned PyTorch build), Intel Macs, Linux arm64, CPU-only
-machines. With several NVIDIA GPUs the qualifying one with the most VRAM is used. When training is
+machines. When training is
 not available the page and the CLI say why for every GPU and point at the by-hand path: run
 `scripts/train_model.py` in an environment from `scripts/requirements-model-train.txt` on another
 machine and copy the `.onnx` and `.yaml` into the models folder (Config page, *Add a model by path*).
 
 Sizes whose estimated memory does not fit the GPU even at batch 1 are shown but cannot be ticked.
+
+**Several NVIDIA GPUs.** Every qualifying GPU is an option (`cuda_options` in `GET /v1/training`
+and `train capability --json`, the one with the most VRAM first); that first one is the automatic
+pick. With more than one, the Training page shows a **GPU** select in the Auto-label card (labelers
+mode) and in the Train form (*Options*), and the CLI takes `--gpu cuda:N` (`train run`,
+`train autolabel`; `train capability` lists them). The choice is checked when the run is queued: an
+unknown ordinal, a GPU PyTorch cannot run on (with its reason) or a CUDA ordinal on a Mac is an
+error naming the usable GPUs; on Apple silicon and with one GPU there is nothing to choose (`mps` /
+empty only). The run records the device it resolved to (`gpu` in `runs.json` / the task's request;
+the auto-label title says `auto-label on cuda:N`), trains with `--device cuda:N`, and the self-check
+runs its test kernel on that GPU. A GPU on the other PyTorch build (a Blackwell `cu130` card next to
+a `cu126` one) sets up that build's environment, which replaces the other one in `tools/train-env`
+(the large-download confirmation names it). The batch is suggested for the chosen GPU's memory; the
+page's size grid shows the automatic pick's estimates. `N` is the CUDA driver's ordinal, which is
+PyTorch's because the child process inherits the service's `CUDA_VISIBLE_DEVICES` and
+`CUDA_DEVICE_ORDER` (the only GPU variables the export runner passes through).
 
 ## Families
 
@@ -276,6 +292,18 @@ kills the process tree. Run records are kept in `<training dir>/runs.json`; a ru
 stopped service is shown as failed. On Unix the trainer exits when the service process is gone; on
 Windows the job object does it.
 
+**Pause and resume.** A running training run, import or auto-label job has a **Pause** button on the
+Jobs card (Resume while paused, Cancel in both). Pause suspends the job's helper processes (Python,
+ffmpeg and what they started) where they are: Unix sends `SIGSTOP` to the process group, Windows
+suspends every thread of the job object's processes. Resume continues exactly where it stopped. While
+paused, the models stay loaded and the GPU memory stays in use (pause frees CPU and GPU time, not
+memory). The paused job keeps its place: nothing else on the queue starts until you resume or cancel it,
+and paused time does not count toward a stage's time limit. A helper that would start while the job is
+paused waits. Work the service does itself between helpers (analysing imported frames, the in-process
+benchmark of a trained model, a download) finishes first; the pause takes hold at the next helper.
+Cancel works while paused. A service restart while paused shows the job as interrupted, like a running
+one.
+
 **Training folder** (`training.dir`, default `<data root>/training`; This machine card, with a
 Folder... button): run records (`runs.json`, `tasks.json`), prepared datasets, held-out sets, logs,
 import work and the Review page's exports. A new folder must exist and pass the same checks as other
@@ -440,7 +468,10 @@ dataset.
    as is) with a version-1 sidecar without detections, `source: "import:<id>"` and its
    `provenance` (docs/DATASET.md, "Imported frames"), an `index.jsonl` line, a `review-queue.jsonl`
    line and the import's line in `<dataset>/imports.jsonl`. The date is the recording time (Blue Iris
-   / MEVA file names, else the file's modification time; a URL: the import time). A frame imported
+   / MEVA file names, else the file's modification time; a URL: the import time). The parts of a
+   Blue Iris recording exported in segments (`Back.20261010_160000_1.mp4`, `_2`, ...: every part
+   named after the recording's start) follow each other in part order, each after the lengths of
+   the lower parts present, so they neither claim the same minute nor dedup each other away. A frame imported
    before (same camera, millisecond and dHash) is skipped. The extracted candidates
    (`<training dir>/imports/<id>`) are deleted (`--keep-work` keeps them).
 
@@ -488,6 +519,32 @@ A run with a model writes the marker too, with `labeler: "model:<name>@<device>"
 for), so the same model on the same device skips the frames it looked at unless `again=1`, and `auto=`
 filters see them. Writes take the label write lock,
 so a Review save with a stale `revision` gets a 409 instead of overwriting merged boxes.
+
+**Run options** (Training page's Auto-label card; the Review page's button uses the defaults):
+
+| Option | Default | CLI | Script flag |
+|---|---|---|---|
+| Batch the VLM check: up to 8 of a frame's boxes per Qwen3-VL call | on | `--no-vlm-batch` | `--vlm-batch 8` (off: `1`) |
+| Skip the VLM check below a fused score (0 < x <= 1) | off (every eligible box) | `--vlm-min-score 0.2` | `--vlm-min-score X` |
+| Load the next frame on a background thread while the GPU works | on | `--no-prefetch` | `--prefetch` |
+| Keep finished frames if cancelled (both modes) | on | `--discard-on-cancel` | - |
+| GPU of the labelers (shown with more than one usable NVIDIA GPU) | automatic (most VRAM) | `--gpu cuda:N` | `--device cuda:N` |
+
+The VLM flags are left out when the VLM is off. Measured per frame on an M1 (MPS, median, one box per
+call): Qwen3-VL check 7.6 s (about 1 s per box, ~8 boxes), MM-Grounding-DINO 1.9 s, RF-DETR 0.2 s,
+SigLIP 0.07 s; 89% of the checked boxes had a fused score below 0.2, which is what the minimum score
+skips (such a box is triaged without a VLM answer).
+
+**Cancel** while the frames are labelled, with *Keep finished frames* on: the frames finished so far
+are not thrown away. The labelers' script writes `proposals.jsonl` line by line (flushed per frame);
+the run triages and writes those frames exactly like a finished run's (pending boxes, the `auto_run`
+marker, the review queue; a line cut off by the kill is skipped), removes its work folder and ends with
+`stopped by Cancel after 412 of 2,098 frames; those 412 were saved for review (...)`; its report has
+`cancelled: true`, `frames_done`, `frames_total`. A run with a model does the same with the frames the
+model finished. Running the same auto-label again **resumes**: the marker makes it skip the saved frames
+(`skipped_done`), and the frame limit counts only the frames it labels. A cancel before any frame
+finished, or in another stage (selecting frames, environment, downloads, installing a model), discards
+the run as before; so does any cancel with the option off.
 
 ### Choosing classes
 
@@ -666,7 +723,7 @@ blue-onyx-prism train prepare --dataset <export> [--dataset <export>] [--scene n
     [--classes person,car,dog,cat,raccoon] [--rename motorbike=motorcycle] [--public [--allow-large]] --out <dir>
 blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> [--scene all|day|night+ir] \
     [--epochs 50] [--batch 16] [--imgsz 640] [--lr 0.001] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
-    [--name n] [--install-dir <dir>] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
+    [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
     [--max-candidates 1500] [--workers 0] [--hwaccel auto|off] \
@@ -676,7 +733,7 @@ blue-onyx-prism train import --dataset meva-sample [...]
 blue-onyx-prism train import --list-datasets
 blue-onyx-prism train autolabel [--frames "scene=ir,status=unreviewed,import=any,limit=200"] \
     [--gdino tiny|base|large|off] [--no-rfdetr] [--vlm 2b|4b|8b|off] [--no-siglip] [--classes a,b] \
-    [--allow-large] [--verbose]
+    [--no-vlm-batch] [--vlm-min-score 0.2] [--no-prefetch] [--discard-on-cancel] [--gpu cuda:N] [--allow-large] [--verbose]
 blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
     [--device <spec>] [--accept-score-model 0.8] [--confirm-license] [--allow-large] [--frames "status=any,..."]
 blue-onyx-prism train list
@@ -694,6 +751,9 @@ Model labels: `yolo26n`..`yolo26x`, `yolo11n`.., `yolov8n`.., `rfdetr-nano|small
 
 - The CUDA locks install (`cu126` on Windows and Linux, `cu130` with a Blackwell card) and the
   self-check's test kernel passes on a Pascal card (GTX 10xx, `sm_61`).
+- The GPU picker on a multi-GPU PC: `cuda:N` of the service's probe is PyTorch's `cuda:N` (same
+  `CUDA_DEVICE_ORDER`), a second-GPU run lands on that GPU (`nvidia-smi`), and switching between a
+  `cu126` and a `cu130` GPU rebuilds the environment once each way.
 - 1-epoch runs of every family (D-FINE only trains there), and the estimate table against the real
   memory use (`nvidia-smi` during a run); adjust the constants.
 - RF-DETR base (patch 14, 560 px) through the transformers export (the other sizes use patch 16).

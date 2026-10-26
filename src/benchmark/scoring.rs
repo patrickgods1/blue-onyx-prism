@@ -477,6 +477,7 @@ pub(crate) fn pseudo_ground_truth(
         cache_dir: bench.cache_dir,
         cancel: bench.cancel,
         progress: bench.progress,
+        on_image: None,
         weights: bench.weights,
         threshold_objective: bench.threshold_objective,
         accuracy_metric: bench.accuracy_metric,

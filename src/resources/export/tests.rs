@@ -704,6 +704,141 @@ fn system_runner_streams_fails_times_out_and_cancels() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Pause / resume of a real process tree: no output while paused, output continues after it,
+/// paused time does not count toward the timeout, cancel works while paused, and a runner
+/// entered while paused waits before starting the child.
+#[cfg(unix)]
+#[test]
+fn system_runner_pauses_resumes_and_cancels_while_paused() {
+    use std::sync::Mutex;
+    let dir = tmp("pause");
+    let cmd = |script: &str, timeout: Duration| Cmd {
+        stage: Stage::Export,
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: vec![],
+        cwd: dir.clone(),
+        timeout,
+    };
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let count = || lines.lock().unwrap().len();
+    let wait_for = |n: usize, within: Duration| {
+        let until = Instant::now() + within;
+        while count() < n && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        count()
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    // A counter every 50 ms; 1.5 s of running time allowed, far less than the test's wall time.
+    let c = cmd(
+        "echo pid $$; i=0; while true; do echo $i; i=$((i+1)); sleep 0.05; done",
+        Duration::from_millis(1500),
+    );
+    let worker = {
+        let (lines, cancel, pause) = (lines.clone(), cancel.clone(), pause.clone());
+        std::thread::spawn(move || {
+            SystemRunner.run_pausable(
+                &c,
+                &mut |l| lines.lock().unwrap().push(l.to_string()),
+                &cancel,
+                &pause,
+            )
+        })
+    };
+    assert!(
+        wait_for(4, Duration::from_secs(5)) >= 4,
+        "the counter did not start"
+    );
+    pause.store(true, Ordering::Relaxed);
+    // Lines already in flight arrive within a poll or two; after that nothing.
+    std::thread::sleep(Duration::from_millis(300));
+    let paused = count();
+    std::thread::sleep(Duration::from_millis(1700));
+    assert_eq!(count(), paused, "output while paused");
+    assert!(
+        !worker.is_finished(),
+        "paused time counted toward the timeout"
+    );
+    pause.store(false, Ordering::Relaxed);
+    assert!(
+        wait_for(paused + 3, Duration::from_secs(3)) >= paused + 3,
+        "no output after resume"
+    );
+    let pid = lines.lock().unwrap()[0]
+        .strip_prefix("pid ")
+        .unwrap()
+        .to_string();
+    pause.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    cancel.store(true, Ordering::Relaxed);
+    let e = worker.join().unwrap().unwrap_err();
+    assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+    assert!(started.elapsed() < Duration::from_secs(4), "slow cancel");
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    assert!(!alive(), "the paused child {pid} survived the cancel");
+
+    // Entered while paused: nothing starts until the pause clears.
+    let out = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pause = Arc::new(AtomicBool::new(true));
+    let never = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (out, pause, never) = (out.clone(), pause.clone(), never.clone());
+        let c = cmd("echo started", Duration::from_secs(30));
+        std::thread::spawn(move || {
+            SystemRunner.run_pausable(
+                &c,
+                &mut |l| out.lock().unwrap().push(l.to_string()),
+                &never,
+                &pause,
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(out.lock().unwrap().is_empty() && !worker.is_finished());
+    pause.store(false, Ordering::Relaxed);
+    worker.join().unwrap().unwrap();
+    assert_eq!(*out.lock().unwrap(), ["started"]);
+    // ... and a cancel while waiting returns without starting it.
+    let pause = AtomicBool::new(true);
+    let cancel = AtomicBool::new(true);
+    let mut ran = false;
+    let e = SystemRunner
+        .run_pausable(
+            &cmd("echo started", Duration::from_secs(30)),
+            &mut |_| ran = true,
+            &cancel,
+            &pause,
+        )
+        .unwrap_err();
+    assert!(e.downcast_ref::<Cancelled>().is_some() && !ran, "{e:#}");
+    // The wrapper passes its flag to the inner runner.
+    let pause = AtomicBool::new(true);
+    let cancel = AtomicBool::new(true);
+    let wrapped = PausableRunner {
+        inner: &SystemRunner,
+        pause: &pause,
+    };
+    let e = wrapped
+        .run(
+            &cmd("echo started", Duration::from_secs(30)),
+            &mut |_| {},
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn sanitized_variables_and_package_progress() {
     // RS-07: the child starts from an empty environment plus this allowlist.
@@ -746,6 +881,9 @@ fn sanitized_variables_and_package_progress() {
         "NO_PROXY",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        // The GPU ordinals of `--device cuda:N` must mean what the service's CUDA probe saw.
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_DEVICE_ORDER",
     ] {
         assert!(inherited(k), "{k}");
     }

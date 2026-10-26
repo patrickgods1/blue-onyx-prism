@@ -99,6 +99,11 @@ pub enum TrainCommand {
         /// data root). The config entry points at the file there.
         #[arg(long)]
         install_dir: Option<PathBuf>,
+        /// GPU to train on, cuda:N (`train capability` lists the usable ones; default the one
+        /// with the most memory). A GPU on another PyTorch build (cu126 / cu130) sets up that
+        /// build's environment.
+        #[arg(long)]
+        gpu: Option<String>,
         /// Install the model but do not add it to the config (and do not benchmark it).
         #[arg(long)]
         no_register: bool,
@@ -226,6 +231,20 @@ pub struct AutolabelArgs {
     /// Do not rank species with SigLIP 2.
     #[arg(long)]
     pub no_siglip: bool,
+    /// Ask Qwen3-VL about one box per call instead of up to 8 of a frame's boxes at once.
+    #[arg(long)]
+    pub no_vlm_batch: bool,
+    /// Check only boxes with a fused score of at least this (0..1] with Qwen3-VL (default:
+    /// every eligible box; most of the check time goes to boxes below 0.2).
+    #[arg(long)]
+    pub vlm_min_score: Option<f32>,
+    /// Do not load the next frame on a background thread while the GPU labels this one.
+    #[arg(long)]
+    pub no_prefetch: bool,
+    /// On Ctrl-C while labelling, discard the frames already labelled (default: they are
+    /// written for review, and a rerun skips them).
+    #[arg(long)]
+    pub discard_on_cancel: bool,
     /// Label with this model instead of the labelers: a configured model's name, local:<file>
     /// (a model file in the models folder) or resource:<catalog id> / a catalog model's name
     /// (downloaded or exported first, then added to the config disabled). Labels unreviewed
@@ -252,6 +271,10 @@ pub struct AutolabelArgs {
     /// The class list (default collect.classes), comma-separated.
     #[arg(long, value_delimiter = ',')]
     pub classes: Vec<String>,
+    /// GPU of the labelers, cuda:N (`train capability` lists the usable ones; default the one
+    /// with the most memory). Not with --with-model (use --device).
+    #[arg(long)]
+    pub gpu: Option<String>,
     /// Allow downloads over 500 MB (the environment and the labelers).
     #[arg(long)]
     pub allow_large: bool,
@@ -322,9 +345,14 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
     };
     r.rfdetr = !a.no_rfdetr;
     r.siglip = !a.no_siglip;
+    r.vlm_batch = !a.no_vlm_batch;
+    r.vlm_min_score = a.vlm_min_score;
+    r.prefetch = !a.no_prefetch;
+    r.keep_on_cancel = !a.discard_on_cancel;
     r.with_model = a.with_model.clone();
     r.threshold = a.threshold;
     r.device = a.device.clone();
+    r.gpu = a.gpu.clone();
     r.model_accept_score = a.accept_score_model;
     r.confirm_license = a.confirm_license;
     r.classes = (!a.classes.is_empty()).then(|| a.classes.clone());
@@ -536,6 +564,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             name,
             allow_large,
             install_dir,
+            gpu,
             no_register,
             no_benchmark,
             benchmark_sets,
@@ -545,7 +574,8 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             if name.is_some() && models.len() > 1 {
                 bail!("--name needs exactly one --model");
             }
-            let cap = super::capability_now();
+            // A chosen GPU: its lane, memory and suggested batches.
+            let cap = super::capability_now().for_gpu(gpu.as_deref())?;
             eprintln!("{}", cap.summary());
             let Some(accel) = cap.accelerator.clone() else {
                 for r in &cap.reasons {
@@ -605,6 +635,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                     benchmark_sets: benchmark_sets.clone(),
                     allow_large,
                     install_dir: install_dir.clone(),
+                    gpu: gpu.clone(),
                 };
                 let mut job = super::plan_job(&config, req, &cap, name.clone())?;
                 job.keep_work = keep_work;
@@ -797,6 +828,12 @@ fn report_run(r: &service::RunRecord) {
 /// The capability as text (`train capability`).
 pub fn capability_text(cap: &Capability) -> String {
     let mut s = format!("{}\n", cap.summary());
+    if cap.has_gpu_choice() {
+        s.push_str("GPUs to choose from (--gpu; the first is the default):\n");
+        for a in &cap.cuda_options {
+            s.push_str(&format!("  {}\n", a.choice_label()));
+        }
+    }
     for r in &cap.reasons {
         s.push_str(&format!("  {r}\n"));
     }
@@ -973,6 +1010,7 @@ mod tests {
         assert!(t.contains("YOLO26 [AGPL-3.0]"), "{t}");
         assert!(t.contains("RF-DETR [Apache-2.0]"), "{t}");
         assert!(t.contains("D-FINE [Apache-2.0] (not here:"), "{t}");
+        assert!(!t.contains("--gpu"), "one GPU: nothing to choose: {t}");
         let none = capability::capability(&HardwareInfo::new("linux", "x86_64", vec![]), None);
         assert!(capability_text(&none).contains("train_model.py"));
     }
@@ -1068,6 +1106,27 @@ mod tests {
         assert_eq!(r.gdino, Some(super::super::autolabel::GdinoSize::Base));
         assert_eq!(r.vlm, None);
         assert!(!r.siglip && r.rfdetr);
+        assert!(r.vlm_batch && r.prefetch && r.keep_on_cancel);
+        assert_eq!(r.vlm_min_score, None);
+        let TrainCommand::Autolabel(o) = parse(&[
+            "autolabel",
+            "--no-vlm-batch",
+            "--vlm-min-score",
+            "0.2",
+            "--no-prefetch",
+            "--discard-on-cancel",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        let o = autolabel_request(&o).unwrap();
+        assert!(!o.vlm_batch && !o.prefetch && !o.keep_on_cancel);
+        assert_eq!(o.vlm_min_score, Some(0.2));
+        let TrainCommand::Autolabel(z) = parse(&["autolabel", "--vlm-min-score", "0"]).unwrap()
+        else {
+            panic!()
+        };
+        assert!(autolabel_request(&z).is_err(), "0 is not a minimum score");
         let TrainCommand::Autolabel(m) =
             parse(&["autolabel", "--with-model", "night-yolo26n-1"]).unwrap()
         else {
@@ -1121,6 +1180,36 @@ mod tests {
             panic!()
         };
         assert!(autolabel_request(&bad).is_err());
+    }
+
+    #[test]
+    fn the_gpu_flag_reaches_the_requests() {
+        let TrainCommand::Run { gpu, .. } =
+            parse(&["run", "--model", "yolo26n", "--gpu", "cuda:1"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(gpu.as_deref(), Some("cuda:1"));
+        let TrainCommand::Run { gpu, .. } = parse(&["run", "--model", "yolo26n"]).unwrap() else {
+            panic!("not run")
+        };
+        assert_eq!(gpu, None);
+        let TrainCommand::Autolabel(a) = parse(&["autolabel", "--gpu", "cuda:1"]).unwrap() else {
+            panic!("not autolabel")
+        };
+        assert_eq!(
+            autolabel_request(&a).unwrap().gpu.as_deref(),
+            Some("cuda:1")
+        );
+        for bad in [
+            &["autolabel", "--gpu", "fast"][..],
+            &["autolabel", "--with-model", "m", "--gpu", "cuda:0"],
+        ] {
+            let TrainCommand::Autolabel(b) = parse(bad).unwrap() else {
+                panic!()
+            };
+            assert!(autolabel_request(&b).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

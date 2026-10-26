@@ -132,17 +132,22 @@ fn workers() -> u32 {
     u32::try_from((cpus / 2).clamp(1, 4)).unwrap_or(2)
 }
 
-/// Build the job of `request` on `config` and `cap` (see the checks below). `name`: the model
-/// name, default `night-<model>-<stamp>` / `custom-<model>-<stamp>`.
+/// Build the job of `request` on `config` and `cap` (see the checks below; `request.gpu` picks
+/// one of `cap`'s GPUs, else the automatic pick). `name`: the model name, default
+/// `night-<model>-<stamp>` / `custom-<model>-<stamp>`.
 pub fn plan_job(
     config: &Config,
     mut request: TrainRequest,
     cap: &Capability,
     name: Option<String>,
 ) -> Result<TrainJob> {
+    // A chosen GPU: its accelerator, lane and fits.
+    let cap = &cap.for_gpu(request.gpu.as_deref())?;
     let Some(accel) = cap.accelerator.clone() else {
         bail!("{}", cap.summary());
     };
+    // Stored as the device it resolved to (`auto` / empty = the automatic pick, None).
+    request.gpu = capability::gpu_arg(request.gpu.as_deref())?.map(|_| accel.device_arg());
     let recipe = &request.recipe;
     recipe.validate()?;
     if let Some(f) = cap.family(recipe.family)
@@ -258,6 +263,7 @@ mod tests {
             benchmark_sets: Vec::new(),
             allow_large: false,
             install_dir: None,
+            gpu: None,
         }
     }
 
@@ -395,6 +401,58 @@ mod tests {
         assert!(public_subset_installed(&root));
         assert!(!plan_job(&c, req, &mac(), None).unwrap().request.allow_large);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_job_trains_on_the_chosen_gpu() {
+        use crate::backend::detect::{ComputeCapability, CudaInfo, GpuAdapter, GpuVendor};
+        let gpu = |name: &str, cc: (u32, u32), vram_mb: u64, ordinal: u32| GpuAdapter {
+            vendor: GpuVendor::Nvidia,
+            name: name.into(),
+            vram_mb,
+            index: ordinal,
+            discrete: true,
+            cuda: Some(CudaInfo {
+                ordinal,
+                compute_capability: ComputeCapability::new(cc.0, cc.1),
+            }),
+        };
+        let cap = capability::capability(
+            &HardwareInfo::new(
+                "linux",
+                "x86_64",
+                vec![
+                    gpu("RTX 3090", (8, 6), 24576, 0),
+                    gpu("RTX 5060", (12, 0), 8192, 1),
+                ],
+            )
+            .with_cuda_driver(13, 0),
+            None,
+        );
+        let c = Config::default();
+        let j = plan_job(&c, request(TrainFamily::Yolo26, "n"), &cap, None).unwrap();
+        assert_eq!(j.accelerator.device_arg(), "cuda:0");
+        assert_eq!(j.request.gpu, None);
+        let mut r = request(TrainFamily::Yolo26, "n");
+        r.gpu = Some(" CUDA:1".into());
+        let j = plan_job(&c, r, &cap, None).unwrap();
+        assert_eq!(j.accelerator.device_arg(), "cuda:1");
+        assert_eq!(
+            j.accelerator.lane(),
+            crate::resources::export::train::TrainLane::Cu130
+        );
+        assert_eq!(j.request.gpu.as_deref(), Some("cuda:1"), "canonical");
+        let mut r = request(TrainFamily::Yolo26, "n");
+        r.gpu = Some("cuda:4".into());
+        let e = plan_job(&c, r, &cap, None).unwrap_err().to_string();
+        assert!(
+            e.contains("no such CUDA device") && e.contains("RTX 5060"),
+            "{e}"
+        );
+        let mut r = request(TrainFamily::Yolo26, "n");
+        r.gpu = Some("cuda:0".into());
+        let e = plan_job(&c, r, &mac(), None).unwrap_err().to_string();
+        assert!(e.contains("no GPU to choose"), "{e}");
     }
 
     #[test]

@@ -237,6 +237,7 @@ fn job(
             benchmark_sets: vec!["nir-night".into()],
             allow_large: false,
             install_dir: None,
+            gpu: None,
         },
         name: format!("night-{}-test", family.base_name(size)),
         paths: TrainPaths::new(root, root.join("models")),
@@ -519,6 +520,50 @@ fn gpu_out_of_memory_says_to_lower_the_batch() {
         .find(|c| c.contains(" pip install "))
         .unwrap();
     assert!(pip.contains("--torch-backend cu126"), "{pip}");
+}
+
+#[test]
+fn a_chosen_gpu_trains_on_its_device_in_its_lanes_environment() {
+    let t = tmp("gpu");
+    // The second GPU of a machine, a Blackwell card: CUDA 13.0 build.
+    let accel = Accelerator::Cuda {
+        ordinal: 1,
+        name: "NVIDIA GeForce RTX 5090".into(),
+        compute_capability: ComputeCapability::new(12, 0),
+        vram_mb: 32768,
+        lane: TrainLane::Cu130,
+    };
+    let j = job(&t.0, TrainFamily::Yolo26, "n", accel, Platform::LINUX_X64);
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    r.unwrap();
+    let cmds = fake.train_cmds.lock().unwrap().clone();
+    assert_eq!(cmds.len(), 2, "self-check, training");
+    for c in &cmds {
+        assert_eq!(
+            arg_after(c, "--device").unwrap().to_str(),
+            Some("cuda:1"),
+            "{}",
+            c.display()
+        );
+    }
+    let pip = fake
+        .inner
+        .cmds()
+        .into_iter()
+        .find(|c| c.contains(" pip install "))
+        .unwrap();
+    assert!(pip.contains("--torch-backend cu130"), "{pip}");
+    assert!(env::train_env_ready(&j.paths, j.platform, TrainLane::Cu130));
+    assert!(!env::train_env_ready(
+        &j.paths,
+        j.platform,
+        TrainLane::Cu126
+    ));
 }
 
 #[test]

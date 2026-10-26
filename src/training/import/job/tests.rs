@@ -92,6 +92,8 @@ struct ImportFake {
     killable: bool,
     /// Block every extraction until it is cancelled (at most 10 s).
     block: bool,
+    /// The video length every extraction reports in its `done` event.
+    duration: Option<f64>,
     /// The lists `frames` got.
     lists: Mutex<Vec<serde_json::Value>>,
 }
@@ -188,8 +190,11 @@ impl ImportFake {
             std::fs::remove_file(&video).unwrap();
         }
         on_line("[import_footage] some log line");
+        let duration = self
+            .duration
+            .map_or(String::new(), |d| format!(",\"duration\":{d}"));
         on_line(&format!(
-            "@import {{\"event\":\"done\",\"frames\":{},\"capped\":{}}}",
+            "@import {{\"event\":\"done\",\"frames\":{},\"capped\":{}{duration}}}",
             self.frames, self.capped
         ));
         Ok(())
@@ -670,6 +675,51 @@ fn videos_are_extracted_in_parallel_and_reassembled_in_video_order() {
     for c in &ex {
         assert_eq!(arg_after(c, "--max-frames").unwrap(), PathBuf::from("1500"));
         assert_eq!(arg_after(c, "--hwaccel").unwrap(), PathBuf::from("auto"));
+    }
+}
+
+#[test]
+fn the_parts_of_a_segmented_blue_iris_recording_are_not_duplicates_of_each_other() {
+    let t = tmp("segments");
+    let root = &t.0;
+    let clips = root.join("clips");
+    std::fs::create_dir_all(&clips).unwrap();
+    // Six one-minute parts of one recording, all named after its start time (as Blue Iris
+    // exports them), each with the same two pictures of a fixed camera.
+    for k in 1..=6 {
+        std::fs::write(clips.join(format!("Back.20261010_160000_{k}.mp4")), b"v").unwrap();
+    }
+    let job = plan_import(&config(root), path_request(clips), &host()).unwrap();
+    let mut fake = ImportFake::new(2, 0);
+    fake.duration = Some(60.0);
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    assert_eq!(rep["candidates"], 12);
+    assert_eq!(
+        rep["unique"], 12,
+        "a minute apart, nothing is a duplicate: {rep}"
+    );
+    let recs = records(&root.join("dataset"));
+    assert_eq!(recs.len(), 12);
+    // Part k starts (k - 1) minutes after 16:00:00; its frames are 0.5 s and 10.5 s in.
+    let mut stamps: Vec<(String, String)> = recs
+        .iter()
+        .map(|rec| {
+            let p = rec.provenance.as_ref().unwrap().path.clone().unwrap();
+            let part = p
+                .rsplit('_')
+                .next()
+                .unwrap()
+                .trim_end_matches(".mp4")
+                .to_string();
+            (part, rec.timestamp.clone())
+        })
+        .collect();
+    stamps.sort();
+    for (part, ts) in &stamps {
+        let k: u32 = part.parse().unwrap();
+        let minute = format!("2026-10-10T16:{:02}:", k - 1);
+        assert!(ts.starts_with(&minute), "part {part}: {ts}");
     }
 }
 

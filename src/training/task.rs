@@ -77,7 +77,8 @@ pub trait Task: Send {
     /// Number of stages.
     fn steps(&self) -> usize;
     /// Run every stage. A cancelled run returns an error carrying
-    /// [`crate::resources::export::Cancelled`].
+    /// [`crate::resources::export::Cancelled`], or `Ok` when it stopped cleanly and kept partial
+    /// work: the record is then Cancelled with that outcome's summary and result.
     fn run(
         &self,
         ctx: TaskContext<'_>,
@@ -143,6 +144,13 @@ impl TaskRecord {
                 Some(s) => format!("{s} ({}/{}): {}", self.step, self.steps, self.detail),
                 None => "starting".into(),
             },
+            RunState::Paused => match &self.stage {
+                Some(s) if self.detail.is_empty() => {
+                    format!("paused ({s} {}/{})", self.step, self.steps)
+                }
+                Some(s) => format!("paused ({s} {}/{}): {}", self.step, self.steps, self.detail),
+                None => "paused".into(),
+            },
             RunState::Done => format!("done: {}", self.summary.as_deref().unwrap_or("")),
             RunState::Failed => format!(
                 "failed{}: {}",
@@ -152,7 +160,10 @@ impl TaskRecord {
                     .unwrap_or_default(),
                 self.error.as_deref().unwrap_or("unknown error")
             ),
-            RunState::Cancelled => "cancelled".into(),
+            RunState::Cancelled => match self.summary.as_deref() {
+                Some(s) if !s.is_empty() => format!("cancelled: {s}"),
+                _ => "cancelled".into(),
+            },
         }
     }
 }
@@ -236,6 +247,13 @@ mod tests {
             finished: None,
         };
         assert_eq!(r.describe(), "extracting frames (2/5): 12 frames");
+        r.state = RunState::Paused;
+        assert_eq!(r.describe(), "paused (extracting frames 2/5): 12 frames");
+        r.state = RunState::Cancelled;
+        assert_eq!(r.describe(), "cancelled");
+        r.summary = Some("kept 7 labelled frames".into());
+        assert_eq!(r.describe(), "cancelled: kept 7 labelled frames");
+        r.summary = None;
         r.state = RunState::Failed;
         r.error = Some("boom".into());
         assert_eq!(r.describe(), "failed while extracting frames: boom");
@@ -251,7 +269,7 @@ mod tests {
             kind: TaskKind::Autolabel,
             title: "t".into(),
             created: "c".into(),
-            state: RunState::Running,
+            state: RunState::Paused,
             stage: None,
             step: 0,
             steps: 3,
@@ -263,6 +281,9 @@ mod tests {
             error: None,
             finished: None,
         };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""state":"paused""#), "{json}");
+        assert_eq!(serde_json::from_str::<TaskRecord>(&json).unwrap(), r);
         save_records(&p, &[r]);
         let back = load_records(&p);
         assert_eq!(back.len(), 1);

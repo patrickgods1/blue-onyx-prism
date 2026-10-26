@@ -325,9 +325,7 @@
 
     function applySearch() {
       var q = query.toLowerCase();
-      GROUPS.forEach(function (g) {
-        var fs = groupsEl.querySelector('[data-group="' + g[0] + '"]');
-        if (!fs) return;
+      Array.prototype.forEach.call(groupsEl.querySelectorAll('[data-group]'), function (fs) {
         var any = false;
         Array.prototype.forEach.call(fs.querySelectorAll('.cp-chip'), function (chip) {
           var hit = !q || chip.getAttribute('data-name').toLowerCase().indexOf(q) >= 0;
@@ -336,9 +334,16 @@
         });
         fs.hidden = !any;
       });
+      // The classes outside the list: open while a search finds one of them.
+      var more = groupsEl.querySelector('.cp-more');
+      if (more) {
+        var found = more.querySelector('.cp-chip:not([hidden])');
+        more.hidden = !!q && !found;
+        if (q && found) more.open = true;
+      }
     }
 
-    function chipFor(entry) {
+    function chipFor(entry, inMore) {
       var inputId = id + '-' + Object.keys(inputs).length;
       var chip = el('span', 'cp-chip' + (entry.hidden ? ' cp-hidden' : '') + (entry.in_list === false ? ' cp-new' : ''));
       chip.setAttribute('data-name', entry.name);
@@ -366,7 +371,7 @@
           m.title = 'Detected by: ' + entry.models.join(', ');
           label.appendChild(m);
         }
-        if (entry.in_list === false) {
+        if (entry.in_list === false && !inMore) {
           var n = el('span', 'cp-badge cp-notlist', 'not in list');
           n.title = 'Not in the class list (collect.classes) yet: using it asks to append it.';
           label.appendChild(n);
@@ -380,21 +385,38 @@
       return chip;
     }
 
+    // The category fieldsets of `list` into `parent` (`key` prefixes their data-group).
+    function groupsInto(parent, list, key, inMore) {
+      var grouped = groupEntries(list);
+      GROUPS.forEach(function (g) {
+        var items = grouped[g[0]];
+        if (!items.length) return;
+        var fs = el('fieldset', 'cp-group');
+        fs.setAttribute('data-group', key + g[0]);
+        fs.appendChild(el('legend', null, g[1]));
+        var wrap = el('div', 'cp-chips');
+        items.forEach(function (e) { wrap.appendChild(chipFor(e, inMore)); });
+        fs.appendChild(wrap);
+        parent.appendChild(fs);
+      });
+    }
+
     function render() {
       groupsEl.textContent = '';
       inputs = {}; chips = {};
-      var grouped = groupEntries(entries);
-      GROUPS.forEach(function (g) {
-        var list = grouped[g[0]];
-        if (!list.length) return;
-        var fs = el('fieldset', 'cp-group');
-        fs.setAttribute('data-group', g[0]);
-        fs.appendChild(el('legend', null, g[1]));
-        var wrap = el('div', 'cp-chips');
-        list.forEach(function (e) { wrap.appendChild(chipFor(e)); });
-        fs.appendChild(wrap);
-        groupsEl.appendChild(fs);
-      });
+      // The full picker shows the class list first; the classes outside it (the labelers' whole
+      // vocabulary, 100 or so) wait in a closed section that opens for a selected one.
+      var outside = compact ? [] : entries.filter(function (e) { return e.in_list === false; });
+      groupsInto(groupsEl, compact ? entries : entries.filter(function (e) { return e.in_list !== false; }), '', false);
+      if (outside.length) {
+        var more = el('details', 'cp-more');
+        var sum = el('summary', null, 'More classes, not in your class list (' + outside.length + ')');
+        sum.title = 'Not in the class list (collect.classes) yet: using one asks to append it.';
+        more.appendChild(sum);
+        groupsInto(more, outside, 'more-', true);
+        more.open = outside.some(function (e) { return order.indexOf(e.name) >= 0; });
+        groupsEl.appendChild(more);
+      }
       if (!entries.length) groupsEl.appendChild(el('p', 'muted', 'No classes known yet.' + (opts.allowAdd ? ' Add one below.' : '')));
       applySearch();
       updateSummary();

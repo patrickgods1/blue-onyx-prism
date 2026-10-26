@@ -7,8 +7,10 @@
 use super::triage::Det;
 use crate::backend::{CoreOptions, Runtimes};
 use crate::benchmark::images::{GroundTruth, ImageSet, SetImage, SetKind};
+use crate::benchmark::{ImagePred, ImageRun};
 use crate::config::{Config, ModelConfig};
 use crate::model::PostParams;
+use crate::sync::LockExt;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -32,13 +34,15 @@ pub struct Detections {
     pub frames: BTreeMap<String, Vec<Det>>,
     /// Canonical spec of the device that ran (`openvino:cpu`, `ort:coreml`; empty if unknown).
     pub device: String,
+    /// The cancel flag stopped the run: `frames` holds the frames finished before it.
+    pub cancelled: bool,
 }
 
 /// Runs a model of the config over frames.
 pub trait Detector: Send + Sync {
     /// Detections of `model` (an entry of `config`, enabled or not) at `threshold` on each of
-    /// `images`, on `device` (a device spec; None = the model's configured device). Fails on
-    /// cancel.
+    /// `images`, on `device` (a device spec; None = the model's configured device). A cancel
+    /// ends it with the frames finished so far and [`Detections::cancelled`] set.
     fn detect(
         &self,
         config: &Config,
@@ -135,10 +139,25 @@ impl Detector for LocalDetector {
         );
         bench.cancel = Some(cancel);
         bench.max_stored_preds = 300;
+        // Each frame as it finishes, for a cancelled run.
+        let finished: Mutex<BTreeMap<String, Vec<Det>>> = Mutex::default();
+        let sink = |r: &ImageRun| {
+            finished
+                .lock_recover()
+                .insert(r.file.clone(), dets_of(&r.preds, threshold));
+        };
+        bench.on_image = Some(&sink);
         let rt = self.runtimes()?;
-        let run = bench
-            .run(&rt, &job, &job.device)
-            .with_context(|| format!("running {model} on the frames"))?;
+        let run = match bench.run(&rt, &job, &job.device) {
+            Err(e) if crate::benchmark::is_cancelled(&e) => {
+                return Ok(Detections {
+                    frames: finished.into_inner().unwrap_or_else(|p| p.into_inner()),
+                    device: String::new(),
+                    cancelled: true,
+                });
+            }
+            r => r.with_context(|| format!("running {model} on the frames"))?,
+        };
         if run.per_image.len() != images.len() {
             bail!(
                 "{model} returned results for {} of {} frames",
@@ -155,19 +174,27 @@ impl Detector for LocalDetector {
             .per_image
             .into_iter()
             .map(|r| {
-                let dets = r
-                    .preds
-                    .into_iter()
-                    .filter(|p| p.confidence >= threshold)
-                    .map(|p| Det {
-                        label: p.label,
-                        score: p.confidence,
-                        bbox: p.bbox,
-                    })
-                    .collect();
+                let dets = dets_of(&r.preds, threshold);
                 (r.file, dets)
             })
             .collect();
-        Ok(Detections { frames, device })
+        Ok(Detections {
+            frames,
+            device,
+            cancelled: false,
+        })
     }
+}
+
+/// The detections of an image's predictions at `threshold` or more.
+fn dets_of(preds: &[ImagePred], threshold: f32) -> Vec<Det> {
+    preds
+        .iter()
+        .filter(|p| p.confidence >= threshold)
+        .map(|p| Det {
+            label: p.label.clone(),
+            score: p.confidence,
+            bbox: p.bbox,
+        })
+        .collect()
 }

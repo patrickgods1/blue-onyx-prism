@@ -144,9 +144,13 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   in video order), analysis on all cores but one, `--hwaccel auto|off` (D3D11VA / CUDA / VAAPI, software on macOS where
   VideoToolbox measured slower); two-pass extraction (640 px candidates, then only the kept frames at full resolution) with a free-space
   preflight and running guard (`import/disk.rs`, ENOSPC -> one actionable error, work folder removed); `GET /v1/training/import/preview` backs the page's preview line) and `train autolabel` (`training/autolabel/`:
-  MM-Grounding-DINO + RF-DETR L, Qwen3-VL / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label)
+  MM-Grounding-DINO + RF-DETR L, Qwen3-VL / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label;
+  run options: batched VLM check, `--vlm-min-score`, prefetch; a Cancel keeps the finished frames, a rerun resumes)
   are `task::Task`s on the same one-at-a-time queue, recorded in `<training dir>/tasks.json` beside `runs.json`; pins in
-  `catalog/autolabel.rs`. The public night subset (`train-data:lila-night`, 926 MB) and other > 500 MB downloads need
+  `catalog/autolabel.rs`. A running job pauses / resumes (`PausableRunner`: SIGSTOP/SIGCONT of the helper's process group,
+  Windows: the job object's threads suspended; paused time does not count toward the timeout). Split Blue Iris exports
+  (`Cam.<time>_N.mp4`) get per-part start times (`source::segment_offsets`). Several NVIDIA GPUs: `--gpu cuda:N` / the
+  page's GPU select (`Capability::cuda_options`). The public night subset (`train-data:lila-night`, 926 MB) and other > 500 MB downloads need
   `--allow-large` / the page's box / `allow_large_downloads`.
 - `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
   baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;

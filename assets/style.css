@@ -748,6 +748,20 @@ ol.tr-steps li a::before { content: counter(trstep) ". "; color: var(--muted); }
 ol.tr-steps li a:hover { border-color: var(--accent); }
 .tr .card, .tr form.card { scroll-margin-top: 4rem; }
 .tr-wrap, .tr-wrap p, .tr .tr-fact { overflow-wrap: anywhere; }
+/* Job and run logs wrap inside their cell: long lines (paths, warnings) would widen the table past the card. */
+/* A radio's or checkbox's hint on its own line under the label text. */
+.tr-form .tr-hint { display: block; }
+/* Options that belong to the field above (the VLM check's). */
+.tr-sub { margin: 0.4rem 0 0 0.2rem; padding-left: 0.6rem; border-left: 2px solid var(--border); }
+.tr-sub label.check { margin: 0.2rem 0; }
+.tr-form input.al-num { width: 5.5em; margin-left: 0.3rem; }
+.tr-keep { white-space: nowrap; }
+.tr-sub input:disabled { opacity: 0.5; }
+/* Model mode: the class picker's labeler badges describe the open-vocabulary labelers only. */
+#autolabel-form[data-active="model"] .cp-badge.cp-both, #autolabel-form[data-active="model"] .cp-badge.cp-gdino { display: none; }
+.cp-more { margin: 0.2rem 0 0.4rem; }
+.cp-more > summary { cursor: pointer; color: var(--accent); margin: 0.2rem 0 0.4rem; }
+pre.tr-log { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.4rem 0 0; }
 .tr .tr-fact { margin: 0.3rem 0; }
 .tr .tr-fact .k { color: var(--muted); margin-right: 0.4rem; }
 .tr .small { font-size: 0.82rem; }

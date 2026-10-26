@@ -7,13 +7,20 @@
 //! While idle the queue can move to another training folder ([`TrainingService::set_store`]).
 //! Footage imports and auto-label runs ([`super::task::Task`]) go through the same queue and
 //! thread (one GPU job at a time); their records are kept in `tasks.json`.
+//!
+//! The running job can be paused ([`TrainingService::pause`]): its helper processes (Python,
+//! ffmpeg, run through the queue's [`CommandRunner`] wrapped in a [`PausableRunner`]) are
+//! suspended where they are, keeping their memory, loaded models and GPU allocations, and no new
+//! helper starts; work the service does itself between helpers (frame analysis, an in-process
+//! benchmark, a download) finishes first. The queue keeps the job's place (nothing else starts)
+//! until [`TrainingService::resume`] or a cancel.
 
 use super::job::{
     BenchSummary, Hooks, TrainError, TrainJob, TrainOutput, TrainReport, TrainRequest, TrainStage,
 };
 use super::progress::TrainProgress;
 use super::task::{self, Task, TaskContext, TaskRecord, TaskReport};
-use crate::resources::export::{CommandRunner, Fetcher};
+use crate::resources::export::{CommandRunner, Fetcher, PausableRunner};
 use crate::sync::LockExt;
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
@@ -36,6 +43,8 @@ const LOG_TAIL: usize = 60;
 pub enum RunState {
     Queued,
     Running,
+    /// Running, with its helper processes suspended ([`TrainingService::pause`]).
+    Paused,
     Done,
     Failed,
     Cancelled,
@@ -43,7 +52,15 @@ pub enum RunState {
 
 impl RunState {
     pub fn is_busy(self) -> bool {
-        matches!(self, RunState::Queued | RunState::Running)
+        matches!(
+            self,
+            RunState::Queued | RunState::Running | RunState::Paused
+        )
+    }
+
+    /// Running or paused: the job holds the queue's thread.
+    pub fn is_active(self) -> bool {
+        matches!(self, RunState::Running | RunState::Paused)
     }
 }
 
@@ -138,6 +155,19 @@ impl RunRecord {
                 ),
                 None => "starting".into(),
             },
+            RunState::Paused => match self.stage {
+                Some(s) if self.detail.is_empty() => {
+                    format!("paused ({} {}/{})", s.label(), self.step, self.steps)
+                }
+                Some(s) => format!(
+                    "paused ({} {}/{}): {}",
+                    s.label(),
+                    self.step,
+                    self.steps,
+                    self.detail
+                ),
+                None => "paused".into(),
+            },
             RunState::Done => format!(
                 "done: {}",
                 self.output
@@ -212,7 +242,7 @@ struct Inner {
     hooks: Arc<dyn Hooks>,
     runs: Mutex<Vec<RunRecord>>,
     changed: Condvar,
-    current: Mutex<Option<(String, Arc<AtomicBool>)>>,
+    current: Mutex<Option<Current>>,
     cancelled: Mutex<HashSet<String>>,
     /// `runs.json` and `tasks.json` beside it (None = memory only); moved by
     /// [`TrainingService::set_store`] while idle.
@@ -222,6 +252,24 @@ struct Inner {
     persist_lock: Mutex<()>,
     stop: AtomicBool,
     tasks: Mutex<Vec<TaskRecord>>,
+}
+
+/// The job on the queue's thread and its flags.
+struct Current {
+    id: String,
+    cancel: Arc<AtomicBool>,
+    /// Suspends the job's helper processes while set ([`PausableRunner`]).
+    pause: Arc<AtomicBool>,
+}
+
+impl Current {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -462,6 +510,17 @@ impl TrainingService {
         Ok(id)
     }
 
+    /// Put `r` in the task list as it is (replacing the record of its id): page tests show
+    /// busy jobs without running one.
+    #[cfg(test)]
+    pub(crate) fn put_task_record(&self, r: TaskRecord) {
+        let mut tasks = self.inner.tasks.lock_recover();
+        tasks.retain(|t| t.id != r.id);
+        tasks.push(r);
+        drop(tasks);
+        self.inner.changed.notify_all();
+    }
+
     /// The import and auto-label records.
     pub fn tasks(&self) -> Vec<TaskRecord> {
         self.inner.tasks.lock_recover().clone()
@@ -509,7 +568,7 @@ impl TrainingService {
                     });
                     true
                 }
-                RunState::Running => self.flag_current(id),
+                RunState::Running | RunState::Paused => self.flag_current(id),
                 _ => false,
             };
         }
@@ -525,21 +584,77 @@ impl TrainingService {
                 });
                 true
             }
-            RunState::Running => self.flag_current(id),
+            RunState::Running | RunState::Paused => self.flag_current(id),
             _ => false,
         }
     }
 
-    /// Set the cancel flag of the running job `id`.
+    /// Set the cancel flag of the running job `id` (a paused one is resumed by its runner
+    /// to be stopped).
     fn flag_current(&self, id: &str) -> bool {
         let cur = self.inner.current.lock_recover();
         match cur.as_ref() {
-            Some((cid, flag)) if cid == id => {
-                flag.store(true, Ordering::Relaxed);
+            Some(c) if c.id == id => {
+                c.cancel.store(true, Ordering::Relaxed);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Pause the running run or task `id` (see the module docs); false when it is not running
+    /// (queued, already paused, finished, unknown).
+    pub fn pause(&self, id: &str) -> bool {
+        self.set_paused(id, true)
+    }
+
+    /// Continue the paused run or task `id`; false when it is not paused.
+    pub fn resume(&self, id: &str) -> bool {
+        self.set_paused(id, false)
+    }
+
+    /// Flip the current job `id` between Running and Paused. Under the `current` lock, so the
+    /// flip cannot land after the worker finished the job (it clears `current` before writing
+    /// the final state, which then overwrites Paused).
+    fn set_paused(&self, id: &str, paused: bool) -> bool {
+        let (from, to) = if paused {
+            (RunState::Running, RunState::Paused)
+        } else {
+            (RunState::Paused, RunState::Running)
+        };
+        let cur = self.inner.current.lock_recover();
+        let Some(c) = cur.as_ref().filter(|c| c.id == id) else {
+            return false;
+        };
+        if c.cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut flipped = false;
+        let mut flip = |state: &mut RunState| {
+            if *state == from {
+                *state = to;
+                flipped = true;
+            }
+        };
+        let is_task = self.inner.tasks.lock_recover().iter().any(|r| r.id == id);
+        if is_task {
+            self.inner.update_task(id, |r| flip(&mut r.state));
+        } else {
+            self.inner.update(id, |r| flip(&mut r.state));
+        }
+        if flipped {
+            c.pause.store(paused, Ordering::Relaxed);
+        }
+        drop(cur);
+        if flipped {
+            tracing::info!(job = %id, "{}", if paused { "paused" } else { "resumed" });
+            if is_task {
+                self.inner.persist_tasks();
+            } else {
+                self.inner.persist();
+            }
+        }
+        flipped
     }
 
     pub fn runs(&self) -> Vec<RunRecord> {
@@ -623,8 +738,8 @@ impl TrainingService {
     /// Stop: the running run is cancelled (its processes killed), the thread joined.
     pub fn shutdown(&self) {
         self.inner.stop.store(true, Ordering::Relaxed);
-        if let Some((_, flag)) = self.inner.current.lock_recover().as_ref() {
-            flag.store(true, Ordering::Relaxed);
+        if let Some(c) = self.inner.current.lock_recover().as_ref() {
+            c.cancel.store(true, Ordering::Relaxed);
         }
         let _ = self.tx.send(Msg::Stop);
         if let Some(h) = self.thread.lock_recover().take() {
@@ -664,8 +779,9 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             continue;
         }
         let id = job.id.clone();
-        let flag = Arc::new(AtomicBool::new(false));
-        *inner.current.lock_recover() = Some((id.clone(), flag.clone()));
+        let cur = Current::new(&id);
+        let (flag, pause) = (cur.cancel.clone(), cur.pause.clone());
+        *inner.current.lock_recover() = Some(cur);
         // Queued -> Running under the runs lock: a cancel that marked it Cancelled after the
         // `cancelled` check above wins (else Running would overwrite it and the cancel be lost).
         let mut start = false;
@@ -728,9 +844,13 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                 });
             }),
         };
+        let runner = PausableRunner {
+            inner: inner.runner.as_ref(),
+            pause: &pause,
+        };
         let result = super::job::run_training(
             &job,
-            inner.runner.as_ref(),
+            &runner,
             inner.fetcher.as_ref(),
             inner.hooks.as_ref(),
             &mut report,
@@ -778,8 +898,9 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
 /// Run one task on the queue's thread (see [`worker_loop`]).
 fn run_task(inner: &Inner, t: &dyn Task) {
     let id = t.id().to_string();
-    let flag = Arc::new(AtomicBool::new(false));
-    *inner.current.lock_recover() = Some((id.clone(), flag.clone()));
+    let cur = Current::new(&id);
+    let (flag, pause) = (cur.cancel.clone(), cur.pause.clone());
+    *inner.current.lock_recover() = Some(cur);
     // Queued -> Running under the tasks lock, so a cancel just before the start is not lost.
     let mut start = false;
     inner.update_task(&id, |r| {
@@ -833,13 +954,27 @@ fn run_task(inner: &Inner, t: &dyn Task) {
             });
         }
     };
+    let runner = PausableRunner {
+        inner: inner.runner.as_ref(),
+        pause: &pause,
+    };
     let ctx = TaskContext {
-        runner: inner.runner.as_ref(),
+        runner: &runner,
         fetcher: inner.fetcher.as_ref(),
     };
     let result = t.run(ctx, &mut report, &flag);
     *inner.current.lock_recover() = None;
     match result {
+        // Cancelled, but the task stopped cleanly and kept what it had (its summary says what).
+        Ok(out) if flag.load(Ordering::Relaxed) => {
+            tracing::warn!(job = %id, "{} cancelled: {}", t.kind().as_str(), out.summary);
+            inner.update_persist_task(&id, |r| {
+                r.state = RunState::Cancelled;
+                r.summary = Some(out.summary);
+                r.result = Some(out.result);
+                r.finished = Some(now());
+            });
+        }
         Ok(out) => {
             tracing::info!(job = %id, "{} finished in {:.0} s: {}", t.kind().as_str(), started.elapsed().as_secs_f64(), out.summary);
             inner.update_persist_task(&id, |r| {
@@ -871,3 +1006,6 @@ fn run_task(inner: &Inner, t: &dyn Task) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

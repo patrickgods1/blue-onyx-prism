@@ -11,6 +11,11 @@
 //! the service's own pipeline ([`super::relabel`]) -> map, triage and merge
 //! ([`triage::model_boxes`], [`triage::apply_relabel`]); every frame it looked at gets the
 //! `model:<name>@<device>` marker.
+//!
+//! A cancel while labelling with [`AutolabelRequest::keep_on_cancel`] (the default) is not a
+//! failure: the frames finished so far (the script's flushed `proposals.jsonl`, the model's
+//! finished frames) go through the same triage and write stage, markers included, and the run
+//! returns `Ok` with a "stopped by Cancel" summary; a rerun skips them by their marker.
 
 use super::models::{self, ConfigWriter, Install, ModelPlan, Target};
 use super::relabel::{Detector, Image};
@@ -25,7 +30,7 @@ use crate::training::pyenv::{self, check, stage};
 use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskReport};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,6 +58,17 @@ pub const MODEL_STAGES: [&str; 5] = [
     "labelling",
     "writing labels",
 ];
+
+/// Whether `e` is a cancel ([`crate::resources::export::Cancelled`] or the benchmark's).
+fn is_cancel(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.is::<crate::resources::export::Cancelled>())
+        || crate::benchmark::is_cancelled(e)
+}
+
+fn cancelled(cancel: &AtomicBool) -> bool {
+    cancel.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A planned run ([`super::plan_autolabel`]).
 #[derive(Clone)]
@@ -153,6 +169,11 @@ pub struct AutolabelReport {
     /// The first changed frames (`<scene>/<camera>/<date>/<stem>.jpg`).
     pub sample: Vec<String>,
     pub warnings: Vec<String>,
+    /// Stopped by Cancel while labelling (`keep_on_cancel`): only `frames_done` of
+    /// `frames_total` frames were labelled and written.
+    pub cancelled: bool,
+    pub frames_done: usize,
+    pub frames_total: usize,
 }
 
 impl AutolabelJob {
@@ -303,8 +324,9 @@ impl AutolabelJob {
         let _lock =
             crate::resources::export::train::TrainLock::try_acquire(&self.paths.train_lock_file())?;
         let mut changed: Vec<String> = Vec::new();
-
-        if let Some(plan) = &self.model {
+        // `stopped`: a cancel while labelling with `keep_on_cancel`; the run wrote the
+        // `frames_done` frames finished so far.
+        let (stopped, frames_done) = if let Some(plan) = &self.model {
             self.run_model(
                 plan,
                 &frames,
@@ -314,7 +336,7 @@ impl AutolabelJob {
                 cancel,
                 &mut rep,
                 &mut changed,
-            )?;
+            )?
         } else {
             rep.labeler = labeler.clone();
             // 2. Environment.
@@ -444,6 +466,16 @@ impl AutolabelJob {
                 args.push(dir_of(v.key())?);
                 args.push("--vlm-name".into());
                 args.push(v.key().into());
+                let batch = if r.vlm_batch { super::VLM_BATCH } else { 1 };
+                args.push("--vlm-batch".into());
+                args.push(batch.to_string().into());
+                if let Some(m) = r.vlm_min_score {
+                    args.push("--vlm-min-score".into());
+                    args.push(m.to_string().into());
+                }
+            }
+            if r.prefetch {
+                args.push("--prefetch".into());
             }
             if r.siglip {
                 args.push("--siglip".into());
@@ -451,7 +483,7 @@ impl AutolabelJob {
             }
             let total = frames.len();
             let mut done_ev = None;
-            pyenv::run_script(
+            let labelled = pyenv::run_script(
                 ctx.runner,
                 &self.paths,
                 self.platform,
@@ -494,17 +526,28 @@ impl AutolabelJob {
                 },
                 report,
                 cancel,
-            )
-            .context("the auto-labeler failed")?;
-            if done_ev.is_none() {
-                bail!("the auto-labeler finished without its summary; the script is damaged");
+            );
+            // A cancel kills the script; with `keep_on_cancel` the frames it finished (it
+            // flushes `proposals.jsonl` after each) are written below like a finished run's.
+            let stopped = match labelled {
+                Err(e) if r.keep_on_cancel && is_cancel(&e) => true,
+                Err(e) => return Err(e.context("the auto-labeler failed")),
+                Ok(()) => r.keep_on_cancel && cancelled(cancel),
+            };
+            if !stopped {
+                if done_ev.is_none() {
+                    bail!("the auto-labeler finished without its summary; the script is damaged");
+                }
+                check(cancel)?;
             }
-            check(cancel)?;
-            // 5. Triage and write.
-            let text = std::fs::read_to_string(&out)
-                .with_context(|| format!("reading {}", out.display()))?;
+            // 5. Triage and write (no cancel checks: a stopped run writes what it has).
+            let text = match std::fs::read_to_string(&out) {
+                Err(e) if stopped && e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                t => t.with_context(|| format!("reading {}", out.display()))?,
+            };
             let by_rel: BTreeMap<&str, &Selected> =
                 frames.iter().map(|f| (f.rel.as_str(), f)).collect();
+            let mut done: BTreeSet<&str> = BTreeSet::new();
             let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
             for (i, line) in lines.iter().enumerate() {
                 if i % 10 == 0 {
@@ -513,6 +556,8 @@ impl AutolabelJob {
                 }
                 let fp: FrameProposals = match serde_json::from_str(line) {
                     Ok(x) => x,
+                    // The line the killed script was writing.
+                    Err(_) if stopped && i + 1 == lines.len() => continue,
                     Err(e) => {
                         rep.warnings
                             .push(format!("a proposals line does not parse: {e}"));
@@ -524,6 +569,7 @@ impl AutolabelJob {
                         .push(format!("{}: not a selected frame; ignored", fp.frame));
                     continue;
                 };
+                done.insert(sel.rel.as_str());
                 let out = triage::to_boxes_counted(
                     &fp.boxes,
                     &self.classes,
@@ -577,14 +623,39 @@ impl AutolabelJob {
                     rep.warnings.push(format!("{}: {e:#}", sel.rel));
                 }
             }
+            (stopped, done.len())
+        };
+        if stopped && frames_done == 0 {
+            // Nothing finished: a plain cancel.
+            return Err(anyhow!(crate::resources::export::Cancelled));
         }
+        rep.cancelled = stopped;
+        rep.frames_total = frames.len();
+        rep.frames_done = frames_done;
+        rep.frames = frames_done;
         crate::collect::layout::append_review(&self.dataset_dir, &changed)
             .context("queueing the labelled frames for review")?;
         rep.sample = changed.iter().take(20).cloned().collect();
         rep.seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
         let _ = crate::resources::manager::remove_any(&self.work);
         self.step(report, 5, 100, &format!("{} frames changed", changed.len()));
-        let summary = if let Some(plan) = &self.model {
+        let summary = if stopped {
+            let n = crate::training::import::preview::thousands;
+            format!(
+                "stopped by Cancel after {} of {} frames; those {} were saved for review ({} \
+                 boxes: {} accept, {} review; {} added to label files; {} frames queued for \
+                 review); run the same auto-label again to label the rest (it skips the frames \
+                 done)",
+                n(frames_done),
+                n(frames.len()),
+                n(frames_done),
+                n(rep.proposals),
+                n(rep.accept),
+                n(rep.review),
+                n(rep.added),
+                n(changed.len())
+            )
+        } else if let Some(plan) = &self.model {
             let mut s = format!(
                 "{} frames labelled by {} on {}: {} boxes ({} accept, {} review), {} added to \
                  label files, {} matched existing boxes; {} frames disagree with their reviewed \
@@ -645,7 +716,8 @@ impl AutolabelJob {
 }
 
 impl AutolabelJob {
-    /// Stages 2 to 5 of a run with a model.
+    /// Stages 2 to 5 of a run with a model; returns whether a cancel stopped the labelling
+    /// (`keep_on_cancel`) and the frames labelled.
     #[allow(
         clippy::too_many_arguments,
         reason = "the stage machine's state, passed down once"
@@ -660,7 +732,7 @@ impl AutolabelJob {
         cancel: &AtomicBool,
         rep: &mut AutolabelReport,
         changed: &mut Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<(bool, usize)> {
         let r = &self.request;
         rep.labeler = labeler.to_string();
         rep.model = Some(plan.id.clone());
@@ -742,13 +814,25 @@ impl AutolabelJob {
         if !dets.device.is_empty() {
             rep.device = Some(dets.device.clone());
         }
+        // A cancel with `keep_on_cancel`: the frames the model finished are written below
+        // (no cancel checks there), the others are left as they are.
+        let stopped = r.keep_on_cancel && (dets.cancelled || cancelled(cancel));
+        if dets.cancelled && !stopped {
+            return Err(anyhow!(crate::resources::export::Cancelled));
+        }
+        let todo: Vec<&Selected> = frames
+            .iter()
+            .filter(|f| !dets.cancelled || dets.frames.contains_key(&f.rel))
+            .collect();
         self.step(report, 4, 100, &format!("{}: done", plan.name));
-        check(cancel)?;
+        if !stopped {
+            check(cancel)?;
+        }
         // 5. Map, triage, merge; every frame gets the marker.
-        for (i, f) in frames.iter().enumerate() {
+        for (i, f) in todo.iter().copied().enumerate() {
             if i % 10 == 0 {
-                let pct = u8::try_from(i * 100 / frames.len().max(1)).unwrap_or(100);
-                self.step(report, 5, pct, &format!("{i} of {}", frames.len()));
+                let pct = u8::try_from(i * 100 / todo.len().max(1)).unwrap_or(100);
+                self.step(report, 5, pct, &format!("{i} of {}", todo.len()));
             }
             let d = dets.frames.get(&f.rel).cloned().unwrap_or_default();
             let run = triage::ModelRun {
@@ -799,7 +883,7 @@ impl AutolabelJob {
                 rep.warnings.push(format!("{}: {e:#}", f.rel));
             }
         }
-        Ok(())
+        Ok((stopped, todo.len()))
     }
 
     /// Download or export catalog model `res` into the models folder (stage 2); the export
@@ -985,7 +1069,15 @@ impl Task for AutolabelJob {
                 m.device,
                 self.request.frames.describe()
             ),
-            None => format!("auto-label ({})", self.request.frames.describe()),
+            // A chosen GPU is named (the automatic pick is the page's "PyTorch on ...").
+            None => match (&self.request.gpu, &self.accelerator) {
+                (Some(_), Some(a)) => format!(
+                    "auto-label on {} ({})",
+                    a.device_arg(),
+                    self.request.frames.describe()
+                ),
+                _ => format!("auto-label ({})", self.request.frames.describe()),
+            },
         }
     }
     fn steps(&self) -> usize {

@@ -96,6 +96,28 @@
     if (pathField && pathField.value.trim()) run();
   }
   toggle(document.getElementById("autolabel-form"), "mode", "data-mode");
+  // Auto-label: the VLM check's options only while it is on (and the minimum score only while
+  // ticked); the form's active mode for the CSS (labeler badges hide in model mode). Runs after
+  // the mode toggle above, which re-enables every field of the shown mode.
+  (function () {
+    var form = document.getElementById("autolabel-form");
+    if (!form) return;
+    var vlm = form.elements.vlm, minOn = form.elements.vlm_min_on, min = form.elements.vlm_min_score;
+    var opts = document.getElementById("al-vlm-options");
+    var update = function () {
+      form.dataset.active = checked(form, "mode");
+      if (!vlm || vlm.disabled) return;
+      var off = vlm.value === "off";
+      if (opts) {
+        opts.classList.toggle("muted", off);
+        opts.querySelectorAll("input").forEach(function (i) { i.disabled = off; });
+      }
+      if (min && minOn) min.disabled = off || !minOn.checked;
+    };
+    [vlm, minOn].forEach(function (e) { if (e) e.addEventListener("change", update); });
+    form.querySelectorAll('input[name="mode"]').forEach(function (r) { r.addEventListener("change", update); });
+    update();
+  })();
 
   // Auto-label classes: the class picker (class-picker.js). The chosen classes post as repeated
   // hidden `classes` fields; one outside the class list is appended to it first (after a confirm,
@@ -215,18 +237,20 @@
   var runs = document.getElementById("training-runs");
   var tasks = document.getElementById("training-tasks");
   var busy = {};
+  var isBusy = function (s) { return s === "queued" || s === "running" || s === "paused"; };
   [[runs, "run"], [tasks, "task"]].forEach(function (p) {
     if (!p[0]) return;
     p[0].querySelectorAll("tr[data-" + p[1] + "]").forEach(function (tr) {
       var st = tr.querySelector('[data-field="state"]');
-      if (st && (st.textContent === "queued" || st.textContent === "running")) busy[tr.dataset[p[1]]] = true;
+      if (st && isBusy(st.textContent)) busy[tr.dataset[p[1]]] = true;
     });
   });
   if (Object.keys(busy).length === 0) return;
   function describe(r) {
     if (r.state === "queued") return "queued";
-    if (r.state !== "running") return r.state;
+    if (r.state !== "running" && r.state !== "paused") return r.state;
     var s = r.stage ? String(r.stage).replace(/_/g, " ") : "starting";
+    if (r.state === "paused") return r.stage ? "paused (" + s + " " + r.step + "/" + r.steps + ")" + (r.detail ? ": " + r.detail : "") : "paused";
     return s + " (" + r.step + "/" + r.steps + ")" + (r.detail ? ": " + r.detail : "");
   }
   function update(table, attr, list) {
@@ -244,7 +268,12 @@
       set("percent", r.percent);
       set("describe", describe(r));
       if (r.log && r.log.length) set("log", r.log.slice(-6).join("\n"));
-      if (busy[r.id] && r.state !== "queued" && r.state !== "running") finished = true;
+      // Pause while running, Resume while paused (Cancel in both).
+      var pause = tr.querySelector('[data-field="pause"]');
+      var resume = tr.querySelector('[data-field="resume"]');
+      if (pause) pause.hidden = r.state !== "running";
+      if (resume) resume.hidden = r.state !== "paused";
+      if (busy[r.id] && !isBusy(r.state)) finished = true;
     });
     return finished;
   }
