@@ -148,6 +148,20 @@
     return -1;
   }
 
+  // The box to look at after `i` (wrapping; -1 for the first): the next review box, else the
+  // next pending one, else -1.
+  function nextUndecided(i) {
+    var bs = boxes();
+    var tests = [isReview, function (b) { return b.state === 'pending'; }];
+    for (var t = 0; t < tests.length; t++) {
+      for (var k = 1; k <= bs.length; k++) {
+        var j = (i + k + bs.length) % bs.length;
+        if (j !== i && tests[t](bs[j])) return j;
+      }
+    }
+    return -1;
+  }
+
   function fmtScore(s) { return (typeof s === 'number') ? s.toFixed(2) : ''; }
 
   // The classes Review offers: the list minus the hidden ones.
@@ -188,6 +202,17 @@
     view.oy = fy - cy / view.z;
     clampView();
     draw();
+  }
+
+  // Zoomed: pan so the box `b` is in view (centred when it is not).
+  function panTo(b) {
+    if (!b || view.z <= 1) return;
+    var vw = canvas.width / view.z, vh = canvas.height / view.z;
+    var bb = b.bbox;
+    if (bb[0] >= view.ox && bb[2] <= view.ox + vw && bb[1] >= view.oy && bb[3] <= view.oy + vh) return;
+    view.ox = (bb[0] + bb[2]) / 2 - vw / 2;
+    view.oy = (bb[1] + bb[3]) / 2 - vh / 2;
+    clampView();
   }
 
   function updateViewUi() {
@@ -469,20 +494,51 @@
 
   function refresh() { renderSide(); draw(); }
 
-  // ---- edits --------------------------------------------------------------------------------
-
-  function select(i) {
-    selected = (i >= 0 && i < boxes().length) ? i : -1;
-    refresh();
+  // Scrolls the box list so the selected box is in view; `page`: the page too, as little as needed
+  // (not on a canvas click, which would move the frame under the pointer).
+  function revealSelected(page) {
+    var li = boxList.querySelector('li.sel');
+    if (!li) return;
+    if (page) {
+      // The enlarged crop sits above the list: show it, then the entry.
+      if (cropWrap && !cropWrap.hidden) cropWrap.scrollIntoView({ block: 'nearest' });
+      li.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    var lr = li.getBoundingClientRect(), br = boxList.getBoundingClientRect();
+    if (lr.top < br.top) boxList.scrollTop += lr.top - br.top - 4;
+    else if (lr.bottom > br.bottom) boxList.scrollTop += lr.bottom - br.bottom + 4;
   }
 
+  // A new frame: the page shows the frame from its top, the box list starts at its top.
+  function revealFrame() {
+    boxList.scrollTop = 0;
+    revealSelected();
+    var grid = canvas.closest('.review-grid');
+    if (grid && grid.getBoundingClientRect().top < 0) {
+      grid.scrollIntoView({ block: 'start' });
+      revealSelected(true);
+    }
+  }
+
+  // ---- edits --------------------------------------------------------------------------------
+
+  function select(i, page) {
+    selected = (i >= 0 && i < boxes().length) ? i : -1;
+    panTo(boxes()[selected]);
+    refresh();
+    revealSelected(page);
+  }
+
+  // Deciding a box moves the selection on to the next box to review (if any).
   function setState(i, state) {
     var b = boxes()[i];
     if (!b) return;
     snapshot();
     b.state = state;
     if (state !== 'rejected' && cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
-    refresh();
+    var next = nextUndecided(i);
+    select(next >= 0 ? next : i, true);
   }
 
   function relabel(i, label) {
@@ -888,13 +944,14 @@
       canvas.width = j.width || 640;
       canvas.height = j.height || 360;
       view.z = 1; view.ox = 0; view.oy = 0;
-      selected = firstReview();
+      selected = nextUndecided(-1);
       img = new Image();
       img.onload = draw;
       img.src = j.image_url;
       showNone(false);
       setMeta();
       refresh();
+      revealFrame();
       prefetch();
     });
   }
@@ -947,7 +1004,7 @@
       if (n > 0 && !(guard && guard.frame === cur.frame && guard.count === n)) {
         guard = { frame: cur.frame, count: n };
         say(n + ' box(es) the auto-labeler flagged still need a decision (marked ?): accept or reject them, or save again to use the defaults.', true);
-        if (selected < 0 || !isReview(boxes()[selected])) select(firstReview());
+        select(selected >= 0 && isReview(boxes()[selected]) ? selected : firstReview(), true);
         return;
       }
     }
@@ -1028,8 +1085,8 @@
     else if (k === 'e') confirmEmpty(!(cur && cur.labels.empty_confirmed));
     else if (k === 'z') doUndo();
     else if (k === 's' || k === 'Enter') save('reviewed');
-    else if (k === 'j') select(boxes().length ? (selected + 1) % boxes().length : -1);
-    else if (k === 'k') select(boxes().length ? (selected - 1 + boxes().length) % boxes().length : -1);
+    else if (k === 'j') select(boxes().length ? (selected + 1) % boxes().length : -1, true);
+    else if (k === 'k') select(boxes().length ? (selected - 1 + boxes().length) % boxes().length : -1, true);
     else if (k === 'Delete' || k === 'Backspace') {
       if (selected >= 0) {
         if (boxes()[selected].source === 'human') removeBox(selected);
