@@ -21,7 +21,7 @@
     <label>Bucket <select name="bucket"><option value="">any</option>{% for b in buckets %}<option value="{{ b }}">{{ b }}</option>{% endfor %}</select></label>
     <label>Scene <select name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></label>
     <label>Camera <select name="camera" id="rv-camera"><option value="">any</option></select></label>
-    <label>Class <select name="label" id="rv-label"><option value="">any</option>{% for c in classes %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></label>
+    <div class="rv-label-filter"><span class="field-label" id="rv-label-cap">Class</span> <div id="rv-label-picker" aria-labelledby="rv-label-cap"><select id="rv-label-fallback" aria-label="Class"><option value="">any</option>{% for c in classes %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></div><input type="hidden" name="label" id="rv-label" value=""></div>
     <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option></select></label>
     <label>Status <select name="status"><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select></label>
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
@@ -35,6 +35,7 @@
     <p id="rv-none" class="empty" hidden>No frame matches the filters. Send frames to review from the <a href="/dataset">Dataset</a> page, or show all collected frames.</p>
   </div>
   <aside class="review-side card">
+    <div class="rv-show-of"><span class="field-label" id="rv-show-cap">Show boxes of</span> <div id="rv-show-picker" aria-labelledby="rv-show-cap"></div></div>
     <label>Class for new boxes <select id="rv-class">{% for c in classes %}<option value="{{ c }}">{{ loop.index }}. {{ c }}</option>{% endfor %}</select></label>
     <figure id="rv-crop-wrap" class="review-crop" hidden><canvas id="rv-crop" width="1" height="1" aria-label="The selected box, enlarged"></canvas><figcaption id="rv-crop-cap" class="muted"></figcaption></figure>
     <ol id="rv-boxes" class="review-boxes" aria-label="Boxes"></ol>
@@ -76,18 +77,33 @@
 
 <div class="card">
   <h2>Auto-label these frames</h2>
-  <p class="muted">Proposes boxes for the frames the filters above select (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2): they appear here as pending <em>auto</em> boxes marked <em>accept</em> or <em>review</em>. Runs on the <a href="/training#autolabel">Training</a> page's queue (NVIDIA GPU or Apple silicon), where the labelers, a re-label with a trained model and the progress are.</p>
+  <p class="muted">Proposes boxes for the frames the filters above select: they appear here as pending <em>auto</em> boxes. The <em>labelers</em> (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2; NVIDIA GPU or Apple silicon) mark each box <em>accept</em> or <em>review</em>. <em>A model</em> (any detector from your config, a model file or a downloadable one) runs on any device, CPU included (RF-DETR L on CPU takes about 1 s per frame); its boxes are <em>review</em> unless you pre-accept them above a score. Frames the filters leave open default to the unreviewed ones in model mode. Runs on the <a href="/training#autolabel">Training</a> page's queue, where the progress and a self-training check are.</p>
   <form id="rv-autolabel" method="post" action="/training/autolabel" class="inline-row">
     <input type="hidden" name="frames" value="">
-    <input type="hidden" name="gdino" value="tiny">
-    <input type="hidden" name="rfdetr" value="on">
-    <input type="hidden" name="vlm" value="2b">
-    <input type="hidden" name="siglip" value="on">
+    <input type="hidden" name="label" value="">
+    <fieldset class="tr-radios rv-al-mode">
+      <legend>Label with</legend>
+      <label class="check"><input type="radio" name="mode" value="labelers" checked> Labelers <span class="muted small">(MM-Grounding-DINO + RF-DETR L; NVIDIA GPU or Apple silicon)</span></label>
+      <label class="check"><input type="radio" name="mode" value="model"> A model <span class="muted small">(runs anywhere)</span></label>
+    </fieldset>
+    <div class="rv-al-labelers" data-al-mode="labelers">
+      <input type="hidden" name="gdino" value="tiny">
+      <input type="hidden" name="rfdetr" value="on">
+      <input type="hidden" name="vlm" value="2b">
+      <input type="hidden" name="siglip" value="on">
+      <label class="check"><input type="checkbox" name="confirm_large"> Download the labelers if missing (several GB)</label>
+    </div>
+    <div class="rv-al-model" data-al-mode="model" hidden>
+      <div id="rv-al-model-picker"><p class="muted small">Loading the models&hellip;</p></div>
+      <label class="inline-label">Threshold <input type="number" name="threshold" min="0.01" max="1" step="0.01" value="0.3" class="num-sm"></label>
+      <label class="inline-label">Pre-accept boxes at score &ge; <input type="number" name="model_accept_score" min="0.01" max="1" step="0.01" placeholder="off" class="num-sm"></label>
+    </div>
+    <div class="rv-al-classes"><span class="field-label" id="rv-al-classes-cap">Classes to look for</span> <div id="rv-al-picker" aria-labelledby="rv-al-classes-cap"></div></div>
     <label class="inline-label">At most <input type="number" name="limit" min="1" max="20000" value="50" class="num-sm"> frames</label>
-    <label class="check"><input type="checkbox" name="confirm_large"> Download the labelers if missing (several GB)</label>
     <label class="check"><input type="checkbox" id="rv-al-again"> Label again (frames already auto-labelled)</label>
     <button type="submit">Auto-label</button>
   </form>
+  <p class="muted cp-note">The classes default to the ones your enabled models detect, within the class list and not hidden in Review; change which models detect what on the <a href="/config#at-models">Config page</a> (Models, <em>Classes</em>).</p>
   <progress id="rv-al-progress" max="100" value="0" hidden></progress>
   <div id="rv-al-status" class="review-report" role="status"></div>
   <div class="inline-row">
@@ -135,10 +151,11 @@
 
 <div class="card">
   <h2>Classes <span class="tag now">applies now</span></h2>
-  <p class="muted">The class list of this page and of the exports (<code>collect.classes</code>); YOLO class ids follow this order, so append rather than reorder once you exported.</p>
-  <form id="rv-classes" class="inline-row">
-    <label class="grow">Classes (comma separated) <input type="text" name="classes" value="{{ classes_text }}"></label>
-    <button type="submit">Save classes</button>
+  <p class="muted">The class list of this page and of the exports (<code>collect.classes</code>); YOLO class ids follow this order, so append rather than reorder once you exported. <em>Hide in Review</em> only removes a class from this page's pickers and shortcuts (labels and ids stay). The auto-label defaults follow the classes the enabled models detect (<a href="/config#at-models">Config page</a>).</p>
+  <form id="rv-classes">
+    <div id="rv-classes-picker"></div>
+    <input type="text" name="classes" value="{{ classes_text }}" class="cp-fallback" aria-label="Classes (comma separated)">
+    <div class="inline-row"><button type="submit">Save classes</button></div>
   </form>
   <div id="rv-classes-msg" class="form-msg" role="status"></div>
 </div>
@@ -154,6 +171,8 @@
   <p id="browse-msg" class="muted" role="status"></p>
   <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
 </dialog>
+<script src="/static/class-picker.js?v={{ version }}"></script>
+<script src="/static/model-picker.js?v={{ version }}"></script>
 <script src="/static/review.js?v={{ version }}"></script>
 <script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

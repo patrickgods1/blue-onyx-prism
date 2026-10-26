@@ -1,7 +1,7 @@
 //! The Training page's footage import and auto-label forms (`POST /training/import`,
 //! `POST /training/autolabel`, also posted by the Review page), the import preview
-//! (`GET /v1/training/import/preview`, the line under the path field) and the rows of their
-//! jobs.
+//! (`GET /v1/training/import/preview`, the line under the path field), the models an auto-label
+//! run can use (`GET /v1/autolabel/models`) and the rows of their jobs.
 //! Both are planned like the CLI does ([`crate::training::import::plan_import`],
 //! [`crate::training::autolabel::plan_autolabel`]) and queued on the page's training queue
 //! (one GPU job at a time with the training runs). Admin only, like every training route. The
@@ -10,7 +10,9 @@
 
 use super::training::{all, field, num, service, view};
 use super::{Shared, blocking, render};
+use crate::config::Config;
 use crate::resources::catalog;
+use crate::training::autolabel::models::{self as al_models, ConfigWriter};
 use crate::training::autolabel::{
     AutolabelRequest, FrameFilter, GdinoSize, VlmSize, default_status,
 };
@@ -157,8 +159,9 @@ const FILTER_FIELDS: [&str; 6] = ["status", "scene", "camera", "label", "auto", 
 /// The frame filter text of an auto-label form: the raw `frames` text (the Training page's
 /// "Other filters", the Review page's and older forms' whole filter) followed by the structured
 /// fields `status`, `scene`, `camera`, `label`, `auto`, `limit` and `again` (ticked = `again=1`)
-/// whose key the raw text does not already name. A comma in a field's value is refused (it
-/// would split the filter).
+/// whose key the raw text does not already name. `label` is a comma list of classes (any of
+/// them), written `label=a|b`; a comma in another field's value is refused (it would split the
+/// filter).
 pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String> {
     let raw = field(f, "frames").unwrap_or("");
     let named: Vec<String> = raw
@@ -174,10 +177,21 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
         if let Some(v) = field(f, k)
             && !named.iter().any(|n| n == k)
         {
-            if v.contains(',') {
+            // Class pickers post `label` as a comma list; the frame filter's any-of is `|`.
+            let v = if k == "label" {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            } else if v.contains(',') {
                 anyhow::bail!("{k}: '{v}' has a comma, which the frame filter cannot hold");
+            } else {
+                v.to_string()
+            };
+            if !v.is_empty() {
+                parts.push(format!("{k}={v}"));
             }
-            parts.push(format!("{k}={v}"));
         }
     }
     if field(f, "again").is_some() && !named.iter().any(|n| n == "again") {
@@ -189,7 +203,9 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 /// The auto-label run of a form: the frame filter ([`frame_filter_text`]), `mode` (`labelers`
 /// ignores `with_model`, `model` needs it; absent = `with_model` decides, as the Review page and
 /// older forms post), `gdino`, `vlm` (`off` = none), `rfdetr` / `siglip` (ticked = on; the
-/// Review page's form sends them), `with_model`, `threshold`, `confirm_large`.
+/// Review page's form sends them), `with_model` (any id of `GET /v1/autolabel/models`),
+/// `threshold`, and for a run with a model `device` (empty = the model's), `model_accept_score`
+/// (empty = off); `confirm_large`, `confirm_license` (ticked = confirmed).
 pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<AutolabelRequest> {
     let with_model = match field(f, "mode") {
         Some("labelers") => None,
@@ -216,11 +232,17 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
     };
     r.rfdetr = field(f, "rfdetr").is_some();
     r.siglip = field(f, "siglip").is_some();
+    if with_model.is_some() {
+        // A model run's fields; the labelers' are ignored.
+        r.device = field(f, "device").map(str::to_string);
+        r.model_accept_score = num(f, "model_accept_score", "model accept score")?;
+    }
     r.with_model = with_model;
     if let Some(t) = num(f, "threshold", "threshold")? {
         r.threshold = t;
     }
     r.allow_large = field(f, "confirm_large").is_some();
+    r.confirm_license = field(f, "confirm_license").is_some();
     let classes: Vec<String> = all(f, "classes")
         .iter()
         .flat_map(|c| c.split(','))
@@ -380,6 +402,9 @@ pub(super) async fn autolabel(
                         runtimes: state.registry.runtimes().cloned(),
                     },
                 ));
+                job.config_writer = Some(Arc::new(ServerConfigWriter {
+                    shared: shared.clone(),
+                }));
             }
             let title = crate::training::task::Task::title(&job);
             let id = service(&shared)
@@ -407,6 +432,72 @@ pub(super) async fn autolabel(
             (Ok((m, _)), false) => render(&view(&state, Some(m), None)),
             (Err(e), false) => render(&view(&state, None, Some(format!("Not queued: {e:#}")))),
         }
+    })
+    .await
+}
+
+/// Saves the config entry a run with a local or catalog model adds (disabled) through
+/// [`super::save_config`], on the generation current at that moment.
+struct ServerConfigWriter {
+    shared: Shared,
+}
+
+impl ConfigWriter for ServerConfigWriter {
+    fn update(
+        &self,
+        edit: &mut dyn FnMut(&mut Config) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(Config, String)> {
+        let state = self.shared.current();
+        let saved = super::save_config(&state, "autolabel", |c| edit(c))?;
+        let c = state.config_read().clone();
+        Ok((c, saved))
+    }
+}
+
+/// One device choice of `GET /v1/autolabel/models`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(super) struct DeviceChoice {
+    pub value: String,
+    pub label: String,
+}
+
+/// `auto` (with what it picks now), then every runnable device option.
+fn device_choices(sel: &crate::backend::select::Selection) -> Vec<DeviceChoice> {
+    let pick = sel
+        .auto_pick()
+        .map_or_else(|| "nothing runnable".to_string(), |o| o.spec.to_string());
+    std::iter::once(DeviceChoice {
+        value: "auto".into(),
+        label: format!("auto ({pick})"),
+    })
+    .chain(
+        sel.options
+            .iter()
+            .filter(|o| o.runnable)
+            .map(|o| DeviceChoice {
+                value: o.spec.to_string(),
+                label: format!("{} \u{2014} {}", o.spec, o.label),
+            }),
+    )
+    .collect()
+}
+
+/// `GET /v1/autolabel/models`: `{success, models, devices, default_threshold}`: every model a
+/// run with a model can use ([`al_models::model_options`]: config, local files, catalog), the
+/// runnable devices (`auto` first) and the default score threshold.
+pub(super) async fn autolabel_models(State(shared): State<Shared>) -> Response {
+    blocking(move || {
+        let state = shared.current();
+        let config = state.config_read().clone();
+        let models = al_models::model_options(&config);
+        let snap = super::devices::devices_snapshot(&state);
+        Json(serde_json::json!({
+            "success": true,
+            "models": models,
+            "devices": device_choices(&snap.selection),
+            "default_threshold": al_models::DEFAULT_THRESHOLD,
+        }))
+        .into_response()
     })
     .await
 }
@@ -474,7 +565,57 @@ mod tests {
         assert_eq!(r.vlm, None);
         assert!(r.rfdetr && !r.siglip);
         let m = autolabel_from_form(&form(&[("with_model", "night-x")])).unwrap();
+        assert_eq!(
+            m.frames.query["status"], "unreviewed",
+            "first-pass labelling; self-training posts status=any"
+        );
+        assert_eq!((m.device.as_deref(), m.model_accept_score), (None, None));
+        assert!(!m.confirm_license);
+        // A model run's own fields.
+        let m = autolabel_from_form(&form(&[
+            ("mode", "model"),
+            ("with_model", "resource:model:rfdetr-large"),
+            ("device", "openvino:cpu"),
+            ("model_accept_score", "0.8"),
+            ("threshold", "0.4"),
+            ("confirm_license", "on"),
+            ("status", "any"),
+        ]))
+        .unwrap();
+        assert_eq!(m.with_model.as_deref(), Some("resource:model:rfdetr-large"));
+        assert_eq!(m.device.as_deref(), Some("openvino:cpu"));
+        assert_eq!(m.model_accept_score, Some(0.8));
+        assert!(m.confirm_license);
         assert_eq!(m.frames.query["status"], "any");
+        // Empty fields are off; the labelers ignore them.
+        let m = autolabel_from_form(&form(&[
+            ("with_model", "x"),
+            ("device", ""),
+            ("model_accept_score", ""),
+        ]))
+        .unwrap();
+        assert_eq!((m.device, m.model_accept_score), (None, None));
+        let l = autolabel_from_form(&form(&[
+            ("mode", "labelers"),
+            ("with_model", "x"),
+            ("device", "openvino:cpu"),
+            ("model_accept_score", "0.9"),
+            ("rfdetr", "on"),
+        ]))
+        .unwrap();
+        assert_eq!((l.device, l.model_accept_score), (None, None));
+        for (k, v) in [
+            ("model_accept_score", "0.1"),
+            ("model_accept_score", "1.5"),
+            ("model_accept_score", "high"),
+            ("device", "tpu"),
+        ] {
+            let e = autolabel_from_form(&form(&[("with_model", "x"), (k, v)])).unwrap_err();
+            assert!(
+                e.to_string().contains("accept score") || e.to_string().contains("device"),
+                "{k}={v}: {e:#}"
+            );
+        }
         assert!(autolabel_from_form(&form(&[("frames", "colour=red")])).is_err());
         assert!(autolabel_from_form(&form(&[("gdino", "off"), ("vlm", "off")])).is_err());
     }
@@ -522,6 +663,20 @@ mod tests {
         assert_eq!(frame_filter_text(&form(&[("limit", "")])).unwrap(), "");
         let e = frame_filter_text(&form(&[("camera", "a,b")])).unwrap_err();
         assert!(e.to_string().contains("camera"), "{e}");
+        // A class picker's comma list becomes the filter's any-of and reaches the job.
+        let t = frame_filter_text(&form(&[("label", "person, car,")])).unwrap();
+        assert_eq!(t, "label=person|car");
+        let r = autolabel_from_form(&form(&[("label", "person,car"), ("limit", "5")])).unwrap();
+        assert_eq!(r.frames.limit, 5, "not split into key=value pairs");
+        assert_eq!(
+            r.frames.query.get("label").map(String::as_str),
+            Some("person|car")
+        );
+        let want: std::collections::BTreeSet<String> =
+            ["person".to_string(), "car".to_string()].into();
+        assert_eq!(r.frames.filters().unwrap().label, want, "any of them");
+        assert_eq!(frame_filter_text(&form(&[("label", " , ")])).unwrap(), "");
+        assert!(autolabel_from_form(&form(&[("label", "ok,a\u{7}b")])).is_err());
         // A bad value is refused by the filter with its key.
         let e = autolabel_from_form(&form(&[("auto", "maybe")])).unwrap_err();
         assert!(e.to_string().contains("auto"), "{e}");
@@ -548,7 +703,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(m.with_model.as_deref(), Some("night-x"));
-        assert_eq!(m.frames.query["status"], "any");
+        assert_eq!(m.frames.query["status"], "unreviewed");
         assert!(m.resources().is_empty());
         let e = autolabel_from_form(&form(&[("mode", "model")])).unwrap_err();
         assert!(e.to_string().contains("choose a trained model"), "{e}");
@@ -701,6 +856,123 @@ mod tests {
         let s = crate::collect::Summary::scan(&root.join("dataset"));
         assert_eq!(s.frames, 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_models_route_lists_config_local_and_catalog_models() {
+        use crate::server::test_util::{get_text, test_state_with};
+        let root = std::env::temp_dir().join(format!("bop-al-models-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models/mine.onnx"), b"x").unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let (s, json) = get_text(&state, "/v1/autolabel/models").await;
+        assert_eq!(s, StatusCode::OK, "{json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["success"], true);
+        assert_eq!(v["default_threshold"], serde_json::json!(0.3f32));
+        let models = v["models"].as_array().unwrap();
+        assert_eq!(models[0]["source"], "config", "{v}");
+        assert!(
+            models
+                .iter()
+                .any(|m| m["id"] == "local:mine.onnx" && m["source"] == "local"),
+            "{v}"
+        );
+        let rf = models
+            .iter()
+            .find(|m| m["id"] == "resource:model:rfdetr-base")
+            .unwrap();
+        for k in [
+            "name",
+            "installed",
+            "in_config",
+            "enabled",
+            "family",
+            "classes",
+            "coco",
+            "size_bytes",
+            "needs_export",
+            "large",
+            "license",
+            "note",
+            "device",
+        ] {
+            assert!(rf.get(k).is_some(), "{k}: {rf}");
+        }
+        let devices = v["devices"].as_array().unwrap();
+        assert_eq!(devices[0]["value"], "auto");
+        assert!(
+            devices[0]["label"].as_str().unwrap().starts_with("auto ("),
+            "{v}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_server_writer_adds_disabled_entries_through_save_config() {
+        use crate::server::test_util::test_state_with;
+        let root = std::env::temp_dir().join(format!("bop-al-writer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models/mine.onnx"), b"x").unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let st = state.clone();
+        let (cfg, msg) = blocking(move || {
+            let w = ServerConfigWriter { shared: st.into() };
+            let c = w.update(&mut |_| Ok(())).unwrap().0;
+            let plan = al_models::resolve(&c, "local:mine.onnx", None).unwrap();
+            let mut msg = String::new();
+            let out = w
+                .update(&mut |c| {
+                    msg = al_models::add_disabled(c, &plan)?;
+                    Ok(())
+                })
+                .unwrap();
+            (out.0, format!("{msg} {}", out.1))
+        })
+        .await;
+        assert!(msg.contains("disabled") && msg.contains("Saved"), "{msg}");
+        let m = cfg
+            .models
+            .iter()
+            .find(|m| m.effective_name() == "mine")
+            .unwrap();
+        assert!(!m.enabled);
+        // In the live config and on disk.
+        assert!(
+            state
+                .config_read()
+                .models
+                .iter()
+                .any(|m| m.effective_name() == "mine")
+        );
+        let disk = Config::load(&state.config_path).unwrap();
+        assert!(
+            disk.models
+                .iter()
+                .any(|m| m.effective_name() == "mine" && !m.enabled)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn device_choices_are_auto_then_the_runnable_options() {
+        use crate::backend::select::{RuntimeProbe, select};
+        let hw = crate::backend::detect::HardwareInfo::new("linux", "x86_64", vec![]);
+        let probe = RuntimeProbe::openvino_only(&["CPU".to_string()]);
+        let sel = select(&hw, &probe, true);
+        let c = device_choices(&sel);
+        assert_eq!(c[0].value, "auto");
+        assert_eq!(c[0].label, "auto (openvino:cpu)");
+        assert!(c.iter().any(|d| d.value == "openvino:cpu"), "{c:?}");
+        assert!(
+            c.iter().skip(1).all(|d| sel
+                .options
+                .iter()
+                .any(|o| o.runnable && o.spec.to_string() == d.value)),
+            "{c:?}"
+        );
     }
 
     #[tokio::test]

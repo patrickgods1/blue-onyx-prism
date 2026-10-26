@@ -5,9 +5,17 @@
 //! run per video, several at a time, each video's share of the candidate budget as its
 //! `--max-frames`) -> analyse (decode, dHash, scene on all cores but one, then the dedup; in
 //! Rust) -> select (SigLIP embeddings
-//! from `import_footage.py embed`, k-center per scene) -> write (the dataset layout, the review
-//! queue, `imports.jsonl`).
+//! from `import_footage.py embed`, k-center per scene) -> write (the kept video frames again at
+//! full resolution with `import_footage.py frames`, then the dataset layout, the review queue,
+//! `imports.jsonl`).
+//!
+//! The candidates are stored downscaled ([`disk::CANDIDATE_MAX_SIDE`]); a kept video frame is
+//! written from its full-resolution extraction only, never from the candidate (a frame that cannot
+//! be extracted again is skipped with a warning). The space is checked before the extraction and
+//! before the write ([`disk::check`]) and watched while helpers run ([`disk::Guard`]): a trip or
+//! a full disk stops the helpers through the cancel flag and ends the import with advice.
 
+use super::disk::{self, Guard, Trip};
 use super::parallel;
 use super::select;
 use super::source::{self, ImportSource};
@@ -23,10 +31,10 @@ use crate::training::pyenv::{self, check, stage};
 use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskReport};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Stages of an import.
@@ -72,6 +80,65 @@ struct Candidate {
     base: SystemTime,
     offset: Option<f64>,
     kind: &'static str,
+    /// Where a video frame is in its video (`None`: an image, read in place).
+    at: Option<FrameRef>,
+}
+
+/// A candidate frame of a video: how to find it again at full resolution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FrameRef {
+    /// Index into the job's videos.
+    video: usize,
+    /// The frame's own time in the video (seconds), when it has one.
+    pts: Option<f64>,
+    /// Its decode index.
+    n: Option<u64>,
+    /// The video's frame size.
+    width: u32,
+    height: u32,
+    /// The candidate file is the full-resolution frame (the video is that small).
+    full: bool,
+}
+
+/// One `frame` event of `import_footage.py extract`.
+#[derive(Debug, Clone, PartialEq)]
+struct Found {
+    file: String,
+    t: f64,
+    pts: Option<f64>,
+    n: Option<u64>,
+    width: u32,
+    height: u32,
+    full: bool,
+}
+
+impl Found {
+    /// The event's fields; `None` without a file name or time. Without the source size the
+    /// stored size is the source's (`full`).
+    fn parse(ev: &serde_json::Value) -> Option<Found> {
+        let file = ev.get("file")?.as_str()?.to_string();
+        let t = ev.get("t")?.as_f64()?;
+        let dim = |k: &str| {
+            ev.get(k)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+        };
+        let (w, h) = (dim("w").unwrap_or(0), dim("h").unwrap_or(0));
+        let (width, height) = (dim("sw").unwrap_or(w), dim("sh").unwrap_or(h));
+        let full = ev
+            .get("full")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or((width, height) == (w, h));
+        Some(Found {
+            file,
+            t,
+            pts: ev.get("pts").and_then(serde_json::Value::as_f64),
+            n: ev.get("n").and_then(serde_json::Value::as_u64),
+            width,
+            height,
+            full,
+        })
+    }
 }
 
 /// A video to extract and where its frames go.
@@ -86,13 +153,16 @@ struct Video {
 /// What one extraction found.
 #[derive(Debug, Default)]
 struct Extracted {
-    /// Frame files (in the video's output folder) and their time in seconds.
-    found: Vec<(String, f64)>,
+    /// Frame files (in the video's output folder), their time and where they are in the video.
+    found: Vec<Found>,
     /// Stopped at its `--max-frames`.
     capped: bool,
     /// `hw:<type>` or `sw` (the helper's `start` event; `sw` after a hardware fallback).
     decoder: Option<String>,
 }
+
+/// Frames between two free-space checks of a running helper.
+const GUARD_EVERY: usize = 20;
 
 /// The report of a finished import.
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +239,35 @@ pub(super) fn capped_warning(
     ))
 }
 
+/// dHash, scene stats, width and height of a frame.
+type Analysis = (u64, ImageStats, u32, u32);
+
+/// Decode `p` and compute its [`Analysis`].
+fn analyse_file(p: &Path) -> Result<Analysis> {
+    let b = std::fs::read(p)?;
+    let img = crate::image::decode(&b)?;
+    Ok((
+        crate::collect::dhash::of_rgb(&img),
+        ImageStats::compute(&img),
+        img.width,
+        img.height,
+    ))
+}
+
+/// Mean size of `files` (up to 200 of them, an even spread; 0 without any).
+fn mean_size(files: &[&PathBuf]) -> u64 {
+    let k = select::stride(files.len(), files.len().min(200));
+    let sizes: Vec<u64> = k
+        .iter()
+        .filter_map(|i| std::fs::metadata(files.get(*i)?).ok().map(|m| m.len()))
+        .collect();
+    if sizes.is_empty() {
+        0
+    } else {
+        sizes.iter().sum::<u64>() / sizes.len() as u64
+    }
+}
+
 fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -221,7 +320,9 @@ impl ImportJob {
         }
     }
 
-    /// Extract the frames of `video` into `out` (`import_footage.py extract`), at most `quota`.
+    /// Extract the frames of `video` into `out` (`import_footage.py extract`), at most `quota`,
+    /// downscaled to [`disk::CANDIDATE_MAX_SIDE`]. The work folder's space is checked every
+    /// [`GUARD_EVERY`] frames (a trip stops the helper).
     #[allow(
         clippy::too_many_arguments,
         reason = "the per-video inputs of one helper run"
@@ -235,8 +336,9 @@ impl ImportJob {
         out: &Path,
         quota: usize,
         line: &mut dyn FnMut(&str),
-        cancel: &AtomicBool,
+        guard: &Guard,
     ) -> Result<Extracted> {
+        let cancel = &guard.stop;
         let mut ex = Extracted::default();
         let text = |ev: &serde_json::Value, k: &str| {
             ev.get(k)
@@ -262,15 +364,17 @@ impl ImportJob {
                 quota.to_string().into(),
                 "--hwaccel".into(),
                 self.request.hwaccel.as_str().into(),
+                "--max-side".into(),
+                disk::CANDIDATE_MAX_SIDE.to_string().into(),
             ],
             "import",
             &mut |ev, _| match ev.get("event").and_then(serde_json::Value::as_str) {
                 Some("frame") => {
-                    if let (Some(f), Some(t)) = (
-                        text(ev, "file"),
-                        ev.get("t").and_then(serde_json::Value::as_f64),
-                    ) {
-                        ex.found.push((f, t));
+                    if let Some(f) = Found::parse(ev) {
+                        ex.found.push(f);
+                        if ex.found.len() % GUARD_EVERY == 0 {
+                            guard.check_work();
+                        }
                     }
                 }
                 Some("start" | "decoder") => {
@@ -293,6 +397,233 @@ impl ImportJob {
         Ok(ex)
     }
 
+    /// Queue the written frames `rels` (of `frames`) for review and list the import in
+    /// `imports.jsonl`; returns the frames per scene and the cameras.
+    fn record_written(
+        &self,
+        frames: &[write::Frame],
+        rels: &[String],
+        license: &str,
+        kind: &str,
+        attribution: Option<String>,
+    ) -> Result<(BTreeMap<String, usize>, Vec<String>)> {
+        crate::collect::layout::append_review(&self.dataset_dir, rels)
+            .context("queueing the imported frames for review")?;
+        let mut scenes: BTreeMap<String, usize> = BTreeMap::new();
+        let mut cameras: Vec<String> = Vec::new();
+        for f in frames.iter().filter(|f| {
+            rels.iter()
+                .any(|r| r.contains(&crate::collect::utc_file_ts(f.time)) && r.contains(&f.camera))
+        }) {
+            *scenes
+                .entry(f.stats.scene().as_str().to_string())
+                .or_default() += 1;
+            if !cameras.contains(&f.camera) {
+                cameras.push(f.camera.clone());
+            }
+        }
+        write::append_import(
+            &self.dataset_dir,
+            &ImportLine {
+                id: self.id.clone(),
+                created: crate::collect::utc_rfc3339(SystemTime::now()),
+                source: self.request.source.describe(),
+                kind: kind.into(),
+                license: license.to_string(),
+                attribution,
+                frames: rels.len(),
+                cameras: cameras.clone(),
+                scenes: scenes.clone(),
+            },
+        )?;
+        Ok((scenes, cameras))
+    }
+
+    /// The kept video frames `chosen` (indices into `cands`) that are downscaled candidates,
+    /// extracted again at full resolution (`import_footage.py frames`, one run per video) into
+    /// `<work>/full/v<i>/`, and analysed: the file, dHash, scene stats and size per candidate.
+    /// A frame that is not found again, a video that is gone or fails, or a file whose size is
+    /// not the video's is a warning and the frame is skipped.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the second pass over the stage machine's state"
+    )]
+    fn full_frames(
+        &self,
+        runner: &dyn CommandRunner,
+        script: Option<OsString>,
+        videos: &[Video],
+        cands: &[Candidate],
+        chosen: &[usize],
+        report: &mut dyn FnMut(TaskReport<'_>),
+        guard: &Guard,
+        warnings: &mut Vec<String>,
+    ) -> Result<HashMap<usize, (PathBuf, Analysis)>> {
+        let cancel = &guard.stop;
+        let mut by_video: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for i in chosen {
+            if let Some(a) = cands.get(*i).and_then(|c| c.at)
+                && !a.full
+            {
+                by_video.entry(a.video).or_default().push(*i);
+            }
+        }
+        if by_video.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let script = script.ok_or_else(|| anyhow!("internal: no import script"))?;
+        let total: usize = by_video.values().map(Vec::len).sum();
+        let mut done = 0usize;
+        // (candidate, file, the video's size)
+        let mut files: Vec<(usize, PathBuf, u32, u32)> = Vec::new();
+        for (vi, idxs) in &by_video {
+            check(cancel)?;
+            let Some(v) = videos.get(*vi) else { continue };
+            let name = file_name(&v.path);
+            if !v.path.is_file() {
+                warnings.push(format!(
+                    "{name}: the video is gone, so its {} kept frame(s) cannot be written at full \
+                     resolution and were skipped",
+                    idxs.len()
+                ));
+                done += idxs.len();
+                continue;
+            }
+            let out = self.work.join("full").join(format!("v{vi:04}"));
+            std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+            let list = self.work.join("full").join(format!("v{vi:04}.json"));
+            let mut by_name: HashMap<String, usize> = HashMap::new();
+            let items: Vec<serde_json::Value> = idxs
+                .iter()
+                .filter_map(|i| {
+                    let c = cands.get(*i)?;
+                    let a = c.at?;
+                    let n = file_name(&c.file);
+                    by_name.insert(n.clone(), *i);
+                    Some(serde_json::json!({"name": n, "pts": a.pts, "n": a.n}))
+                })
+                .collect();
+            std::fs::write(&list, serde_json::to_vec(&items)?)
+                .with_context(|| format!("writing {}", list.display()))?;
+            let mut got: Vec<usize> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
+            let res = pyenv::run_script(
+                runner,
+                &self.paths,
+                self.platform,
+                &self.work,
+                self.timeout,
+                vec![
+                    script.clone(),
+                    "frames".into(),
+                    "--video".into(),
+                    v.path.as_os_str().to_owned(),
+                    "--out".into(),
+                    out.as_os_str().to_owned(),
+                    "--list".into(),
+                    list.into_os_string(),
+                    "--hwaccel".into(),
+                    self.request.hwaccel.as_str().into(),
+                ],
+                "import",
+                &mut |ev, report| {
+                    let text = |k: &str| ev.get(k).and_then(serde_json::Value::as_str);
+                    match text("event") {
+                        Some("frame") => {
+                            if let Some(i) = text("name").and_then(|n| by_name.get(n)) {
+                                got.push(*i);
+                                done += 1;
+                                guard.check_work();
+                                let pct = u8::try_from(done * 60 / total.max(1)).unwrap_or(60);
+                                stage(
+                                    report,
+                                    STAGES[6],
+                                    7,
+                                    STAGES.len(),
+                                    pct,
+                                    &format!("full resolution: {done} of {total} frames"),
+                                );
+                            }
+                        }
+                        Some("missing") => {
+                            done += 1;
+                            missing.push(text("reason").unwrap_or("not found").to_string());
+                        }
+                        _ => {}
+                    }
+                },
+                report,
+                cancel,
+            );
+            if let Err(e) = res {
+                if e.downcast_ref::<crate::resources::export::Cancelled>()
+                    .is_some()
+                {
+                    return Err(e);
+                }
+                if disk::is_disk_full(&e) {
+                    guard.trip(Trip::Full);
+                    return Err(e);
+                }
+                warnings.push(format!(
+                    "{name}: the kept frames could not be extracted again at full resolution \
+                     ({e:#}); {} frame(s) skipped",
+                    idxs.len().saturating_sub(got.len())
+                ));
+            } else if !missing.is_empty() {
+                warnings.push(format!(
+                    "{name}: {} kept frame(s) not found again at full resolution and skipped \
+                     ({})",
+                    missing.len(),
+                    missing.first().map_or("", String::as_str)
+                ));
+            }
+            for i in got {
+                let (Some(c), Some(a)) = (cands.get(i), cands.get(i).and_then(|c| c.at)) else {
+                    continue;
+                };
+                let f = out.join(file_name(&c.file));
+                if f.is_file() {
+                    files.push((i, f, a.width, a.height));
+                }
+            }
+        }
+        check(cancel)?;
+        let threads = parallel::analyse_threads(files.len());
+        let analysed = parallel::map(
+            files.len(),
+            threads,
+            &|k| {
+                files
+                    .get(k)
+                    .ok_or_else(|| anyhow!("internal: no frame {k}"))
+                    .and_then(|(_, p, _, _)| analyse_file(p))
+            },
+            &mut |_| {},
+            Duration::from_millis(250),
+            cancel,
+        );
+        check(cancel)?;
+        let analysed = analysed.ok_or_else(|| anyhow!("internal: the analysis stopped early"))?;
+        let mut out = HashMap::new();
+        for ((i, p, w, h), a) in files.into_iter().zip(analysed) {
+            match a {
+                Ok(x) if (x.2, x.3) == (w, h) => {
+                    out.insert(i, (p, x));
+                }
+                Ok(x) => warnings.push(format!(
+                    "{}: extracted again at {}x{}, not the video's {w}x{h}; skipped",
+                    p.display(),
+                    x.2,
+                    x.3
+                )),
+                Err(e) => warnings.push(format!("{}: not decoded ({e:#}); skipped", p.display())),
+            }
+        }
+        Ok(out)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one linear stage machine reads best in one place"
@@ -301,8 +632,9 @@ impl ImportJob {
         &self,
         ctx: TaskContext<'_>,
         report: &mut dyn FnMut(TaskReport<'_>),
-        cancel: &AtomicBool,
+        guard: &Guard,
     ) -> Result<TaskOutcome> {
+        let cancel = &guard.stop;
         let r = &self.request;
         let mut warnings: Vec<String> = Vec::new();
         let mut license = self.license.clone();
@@ -466,10 +798,16 @@ impl ImportJob {
                     "1080".into(),
                 ],
                 "import",
-                &mut |ev, _| {
-                    if ev.get("event").and_then(serde_json::Value::as_str) == Some("fetched") {
-                        fetched = Some(ev.clone());
+                &mut |ev, _| match ev.get("event").and_then(serde_json::Value::as_str) {
+                    Some("fetched") => fetched = Some(ev.clone()),
+                    Some("progress") => {
+                        let n = |k: &str| ev.get(k).and_then(serde_json::Value::as_u64);
+                        let rest = n("total")
+                            .unwrap_or(0)
+                            .saturating_sub(n("bytes").unwrap_or(0));
+                        guard.check_work_for(rest);
                     }
+                    _ => {}
                 },
                 report,
                 cancel,
@@ -537,6 +875,16 @@ impl ImportJob {
             .filter(|(_, q)| **q > 0)
             .map(|(i, q)| (i, *q))
             .collect();
+        // The space, now that the videos are known (and a download is on disk).
+        let plan = disk::Plan {
+            video_candidates: budget.per_video.iter().sum(),
+            image_candidates: budget.images,
+            frames: r.frames,
+            source: None,
+            image_bytes: mean_size(&used_images),
+            download: 0,
+        };
+        disk::check(disk::estimate(&plan), &self.work, &self.dataset_dir)?;
         let mut cands: Vec<Candidate> = Vec::new();
         if !todo.is_empty() {
             let script = script()?;
@@ -572,16 +920,25 @@ impl ImportJob {
                     .ok_or_else(|| anyhow!("internal: no video {i}"))?;
                 let name = file_name(&v.path);
                 let out = self.work.join("frames").join(format!("v{i:04}"));
-                let ex = self.extract_one(
-                    runner,
-                    &script,
-                    &expr,
-                    &v.path,
-                    &out,
-                    quota,
-                    &mut |l| line(&format!("{name}: {l}")),
-                    cancel,
-                )?;
+                guard.check_work();
+                check(cancel)?;
+                let ex = self
+                    .extract_one(
+                        runner,
+                        &script,
+                        &expr,
+                        &v.path,
+                        &out,
+                        quota,
+                        &mut |l| line(&format!("{name}: {l}")),
+                        guard,
+                    )
+                    .inspect_err(|e| {
+                        // At once, so no other video starts.
+                        if disk::is_disk_full(e) {
+                            guard.trip(Trip::Full);
+                        }
+                    })?;
                 line(&format!(
                     "{name}: {} candidate frames ({})",
                     ex.found.len(),
@@ -636,6 +993,10 @@ impl ImportJob {
                         {
                             return Err(e);
                         }
+                        if disk::is_disk_full(&e) {
+                            guard.trip(Trip::Full);
+                            return Err(e);
+                        }
                         warnings.push(format!("{}: not read ({e:#})", file_name(&v.path)));
                         continue;
                     }
@@ -644,18 +1005,26 @@ impl ImportJob {
                     capped.push(quota);
                 }
                 let out = self.work.join("frames").join(format!("v{i:04}"));
-                for (f, t) in ex.found {
-                    if f.contains(['/', '\\']) || f.contains("..") {
+                for f in ex.found {
+                    if f.file.contains(['/', '\\']) || f.file.contains("..") {
                         continue;
                     }
                     cands.push(Candidate {
-                        file: out.join(f),
+                        file: out.join(&f.file),
                         origin: v.path.clone(),
                         image_name: file_name(&v.path),
                         camera: v.camera.clone(),
                         base: v.base,
-                        offset: Some(t),
+                        offset: Some(f.t),
                         kind: v.kind,
+                        at: Some(FrameRef {
+                            video: i,
+                            pts: f.pts,
+                            n: f.n,
+                            width: f.width,
+                            height: f.height,
+                            full: f.full,
+                        }),
                     });
                 }
             }
@@ -671,6 +1040,7 @@ impl ImportJob {
                 base: base_time(img),
                 offset: None,
                 kind: "image",
+                at: None,
             });
         }
         // A guard only: the budget keeps the candidates within the total.
@@ -698,18 +1068,11 @@ impl ImportJob {
         let n = cands.len();
         let threads = parallel::analyse_threads(n);
         self.step(report, 5, 0, &format!("0 of {n} ({threads} threads)"));
-        let analyse = |i: usize| -> Result<(u64, ImageStats, u32, u32)> {
+        let analyse = |i: usize| -> Result<Analysis> {
             let c = cands
                 .get(i)
                 .ok_or_else(|| anyhow!("internal: no candidate {i}"))?;
-            let b = std::fs::read(&c.file)?;
-            let img = crate::image::decode(&b)?;
-            Ok((
-                crate::collect::dhash::of_rgb(&img),
-                ImageStats::compute(&img),
-                img.width,
-                img.height,
-            ))
+            analyse_file(&c.file)
         };
         let analysed = parallel::map(
             n,
@@ -729,7 +1092,7 @@ impl ImportJob {
         );
         check(cancel)?;
         let analysed = analysed.ok_or_else(|| anyhow!("internal: the analysis stopped early"))?;
-        let mut info: Vec<Option<(u64, ImageStats, u32, u32)>> = Vec::with_capacity(n);
+        let mut info: Vec<Option<Analysis>> = Vec::with_capacity(n);
         for (c, a) in cands.iter().zip(analysed) {
             match a {
                 Ok(x) => info.push(Some(x)),
@@ -874,21 +1237,64 @@ impl ImportJob {
         );
         check(cancel)?;
 
-        // 7. Write.
+        // 7. Write: the kept video frames again at full resolution, then into the dataset.
+        self.step(report, 7, 0, &format!("{} frames", chosen.len()));
+        if !r.keep_work {
+            // The candidates are done with, except the kept ones that are full frames.
+            let kept: HashSet<usize> = chosen.iter().copied().collect();
+            for (i, c) in cands.iter().enumerate() {
+                let keep = c.at.is_some_and(|a| a.full) && kept.contains(&i);
+                if c.at.is_some() && !keep {
+                    let _ = std::fs::remove_file(&c.file);
+                }
+            }
+        }
+        let mut need = disk::Need::default();
+        for c in chosen.iter().filter_map(|i| cands.get(*i)) {
+            match c.at {
+                Some(a) if !a.full => {
+                    let b = disk::full_frame_bytes(a.width, a.height);
+                    need.work = need.work.saturating_add(b);
+                    need.dataset = need.dataset.saturating_add(b);
+                }
+                _ => {
+                    let b = std::fs::metadata(&c.file).map_or(0, |m| m.len());
+                    need.dataset = need.dataset.saturating_add(b);
+                }
+            }
+        }
+        disk::check(need, &self.work, &self.dataset_dir)?;
+        let full = self.full_frames(
+            ctx.runner,
+            scripts.as_ref().map(|p| p.clone().into_os_string()),
+            &videos,
+            &cands,
+            &chosen,
+            report,
+            guard,
+            &mut warnings,
+        )?;
         let frames: Vec<write::Frame> = chosen
             .iter()
             .filter_map(|i| {
                 let c = cands.get(*i)?;
-                let (h, stats, w, hh) = info.get(*i)?.as_ref()?;
+                // A downscaled candidate is never written: only its full-resolution frame.
+                let (file, (h, stats, w, hh)) = match c.at {
+                    Some(a) if !a.full => {
+                        let (p, x) = full.get(i)?;
+                        (p.clone(), *x)
+                    }
+                    _ => (c.file.clone(), (*info.get(*i)?)?),
+                };
                 Some(write::Frame {
-                    file: c.file.clone(),
+                    file,
                     image_name: c.image_name.clone(),
                     camera: c.camera.clone(),
                     time: write::frame_time(c.base, c.offset),
-                    width: *w,
-                    height: *hh,
-                    stats: *stats,
-                    dhash: *h,
+                    width: w,
+                    height: hh,
+                    stats,
+                    dhash: h,
                     provenance: Provenance {
                         license: license.clone(),
                         ..self.provenance(c, url_info.as_ref())
@@ -896,48 +1302,61 @@ impl ImportJob {
                 })
             })
             .collect();
-        self.step(report, 7, 0, &format!("{} frames", frames.len()));
-        let (rels, skipped) = write::write_frames(&self.dataset_dir, &self.id, &frames)?;
+        let n_write = frames.len();
+        self.step(report, 7, 60, &format!("writing {n_write} frames"));
+        let full_dir = self.work.join("full");
+        let written =
+            write::write_frames_with(&self.dataset_dir, &self.id, &frames, &mut |st| match st {
+                write::Step::Before(k) => {
+                    if k % 10 == 0 {
+                        guard.check_dataset();
+                    }
+                    check(cancel)
+                }
+                write::Step::Written(k) => {
+                    if let Some(f) = frames.get(k)
+                        && !r.keep_work
+                        && f.file.starts_with(&full_dir)
+                    {
+                        let _ = std::fs::remove_file(&f.file);
+                    }
+                    Ok(())
+                }
+            });
+        let kind = match &r.source {
+            ImportSource::Path(_) => "path",
+            ImportSource::Url(_) => "url",
+            ImportSource::Dataset(_) => "dataset",
+        };
+        let attribution = dataset_res.map(|_| catalog::MEVA_ATTRIBUTION.to_string());
+        let (rels, skipped) = match written {
+            Ok(x) => x,
+            Err(p) => {
+                if !p.rels.is_empty() {
+                    let queued =
+                        self.record_written(&frames, &p.rels, &license, kind, attribution.clone());
+                    crate::collect::global().rescan_if_running(&self.dataset_dir);
+                    guard.note(format!(
+                        "{} frame(s) were written to {} before it stopped{}",
+                        p.rels.len(),
+                        self.dataset_dir.display(),
+                        if queued.is_ok() {
+                            " (queued for review)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                return Err(p.error);
+            }
+        };
         if skipped > 0 {
             warnings.push(format!(
                 "{skipped} frame(s) were imported before (same camera, time and picture) and \
                  skipped"
             ));
         }
-        crate::collect::layout::append_review(&self.dataset_dir, &rels)
-            .context("queueing the imported frames for review")?;
-        let mut scenes: BTreeMap<String, usize> = BTreeMap::new();
-        let mut cameras: Vec<String> = Vec::new();
-        for f in frames.iter().filter(|f| {
-            rels.iter()
-                .any(|r| r.contains(&crate::collect::utc_file_ts(f.time)) && r.contains(&f.camera))
-        }) {
-            *scenes
-                .entry(f.stats.scene().as_str().to_string())
-                .or_default() += 1;
-            if !cameras.contains(&f.camera) {
-                cameras.push(f.camera.clone());
-            }
-        }
-        write::append_import(
-            &self.dataset_dir,
-            &ImportLine {
-                id: self.id.clone(),
-                created: crate::collect::utc_rfc3339(SystemTime::now()),
-                source: r.source.describe(),
-                kind: match &r.source {
-                    ImportSource::Path(_) => "path",
-                    ImportSource::Url(_) => "url",
-                    ImportSource::Dataset(_) => "dataset",
-                }
-                .into(),
-                license: license.clone(),
-                attribution: dataset_res.map(|_| catalog::MEVA_ATTRIBUTION.to_string()),
-                frames: rels.len(),
-                cameras: cameras.clone(),
-                scenes: scenes.clone(),
-            },
-        )?;
+        let (scenes, cameras) = self.record_written(&frames, &rels, &license, kind, attribution)?;
         crate::collect::global().rescan_if_running(&self.dataset_dir);
         if !r.keep_work {
             let _ = crate::resources::manager::remove_any(&self.work);
@@ -1009,6 +1428,72 @@ pub fn read_embeddings(path: &Path, n: usize, dim: Option<u64>) -> Result<Vec<Ve
     Ok(all.chunks(d).map(<[f32]>::to_vec).collect())
 }
 
+/// Sets its flag when dropped (also when the stages panic).
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl ImportJob {
+    /// [`Task::run`] with `guard`: the task's `cancel` is mirrored into the guard's stop flag
+    /// (every helper and pool watches that one), a trip or a full disk becomes the actionable
+    /// error, and a failed run removes the work folder (unless `keep_work`).
+    fn run_guarded(
+        &self,
+        ctx: TaskContext<'_>,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        cancel: &AtomicBool,
+        guard: Guard,
+    ) -> Result<TaskOutcome> {
+        let finished = AtomicBool::new(false);
+        let r = std::thread::scope(|s| {
+            s.spawn(|| {
+                while !finished.load(Ordering::SeqCst) {
+                    if cancel.load(Ordering::Relaxed) {
+                        guard.stop.store(true, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let _done = SetOnDrop(&finished);
+            self.stages(ctx, report, &guard)
+        });
+        let r = r.map_err(|e| self.explain(e, &guard));
+        if r.is_err() && !self.request.keep_work {
+            let _ = crate::resources::manager::remove_any(&self.work);
+        }
+        r
+    }
+
+    /// The import's error for `e`: the guard's message when it tripped or the disk is full
+    /// (with what was written and the work folder's fate), else `e`.
+    fn explain(&self, e: anyhow::Error, guard: &Guard) -> anyhow::Error {
+        let trip = match guard.tripped() {
+            Some(t) => t,
+            None if disk::is_disk_full(&e) => Trip::Full,
+            None => return e,
+        };
+        let mut m = guard.message(trip);
+        for n in guard.notes() {
+            m.push_str("; ");
+            m.push_str(&n);
+        }
+        if self.request.keep_work {
+            m.push_str(&format!(
+                "; the work folder {} was kept (keep work)",
+                self.work.display()
+            ));
+        } else {
+            m.push_str("; the work folder was removed");
+        }
+        tracing::warn!("import {}: {m} ({e:#})", self.id);
+        anyhow!(m)
+    }
+}
+
 impl Task for ImportJob {
     fn id(&self) -> &str {
         &self.id
@@ -1033,11 +1518,12 @@ impl Task for ImportJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
-        let r = self.stages(ctx, report, cancel);
-        if r.is_err() && !self.request.keep_work {
-            let _ = crate::resources::manager::remove_any(&self.work);
-        }
-        r
+        self.run_guarded(
+            ctx,
+            report,
+            cancel,
+            Guard::new(&self.work, &self.dataset_dir),
+        )
     }
 }
 

@@ -497,3 +497,128 @@ document.addEventListener("click", function (e) {
   reveal(location.hash);
   wire();
 })();
+// Classes (class-picker.js): each Models card row's Classes cell shows that model's object filter
+// ("3 of 80 · person, car, truck", "all", "global") and opens the picker over the model's classes
+// in a dialog; the choice lands in the row's hidden `object_filter.<name>` field (`__global__` =
+// no per-model filter, empty = all classes, else a comma list), saved with the card. The global
+// Object filter field gets the picker over all models' classes. The class lists come from
+// GET /v1/review/class-catalog; without it (or without <dialog>) the fields stay as they were.
+(function () {
+  var CP = window.ClassPicker, card = document.getElementById("models"), dlg = document.getElementById("class-dialog");
+  if (!CP || !card || !dlg || typeof dlg.showModal !== "function" || !window.fetch) return;
+  var CU = CP.util, GLOBAL = "__global__", catalog = null, picker = null, apply = null;
+  var title = document.getElementById("class-dialog-title"), body = document.getElementById("class-dialog-body");
+  var msg = document.getElementById("class-dialog-msg");
+  var okBtn = document.getElementById("class-dialog-ok"), cancelBtn = document.getElementById("class-dialog-cancel");
+
+  function modelOf(name) {
+    var list = (catalog && catalog.models) || [];
+    for (var i = 0; i < list.length; i++) if (list[i].name === name) return list[i];
+    var low = String(name).toLowerCase();
+    return list.filter(function (m) { return String(m.name).toLowerCase() === low; })[0] || null;
+  }
+  function valueNames(v) { return v === GLOBAL ? [] : CU.parseList(v); }
+
+  // The one-line summary of a row, and a warning when a name is not a class of the model.
+  function summarize(cell) {
+    var input = cell.querySelector("input.of-value"), out = cell.querySelector(".of-summary");
+    if (!input || !out) return;
+    var v = input.value, m = modelOf(out.dataset.model), own = (m && m.classes) || [];
+    var names = valueNames(v), unknown = own.length ? names.filter(function (n) { return own.indexOf(n) < 0; }) : [];
+    out.textContent = v === GLOBAL ? "global" : CU.countText(names, own.length);
+    out.classList.toggle("warn", unknown.length > 0);
+    out.title = unknown.length ? unknown.join(", ") + (unknown.length === 1 ? " is" : " are") + " not a class of this model, so " + (unknown.length === 1 ? "it" : "they") + " never match." : "";
+    var b = cell.querySelector("button.of-edit");
+    if (b) b.hidden = !catalog;
+  }
+  function summarizeAll() { card.querySelectorAll("td.model-classes").forEach(summarize); }
+
+  function close() { if (dlg.open) dlg.close(); }
+  function say(t, bad) { msg.textContent = t || ""; msg.className = "form-msg" + (bad ? " error-text" : ""); }
+
+  // opts: {title, entries, selected, quickSets, own (names to check against), onApply(valueNames), onQuick(q)}
+  function open(opts) {
+    title.textContent = opts.title;
+    say("");
+    apply = opts.onApply;
+    picker = CP.create(body, {
+      entries: opts.entries, selected: opts.selected, mode: "full", allowAdd: true, quickSets: opts.quickSets,
+      onQuick: function (q) { return opts.onQuick ? opts.onQuick(q, picker) : false; },
+      onChange: check
+    });
+    function check(sel) {
+      var unknown = opts.own && opts.own.length ? sel.filter(function (n) { return opts.own.indexOf(n) < 0; }) : [];
+      okBtn.disabled = !sel.length;
+      if (!sel.length) say("Pick at least one class, or choose All (every class) or Use global instead.", true);
+      else if (unknown.length) say(unknown.join(", ") + (unknown.length === 1 ? " is" : " are") + " not a class of this model and never match.", true);
+      else say("");
+    }
+    check(picker.getSelected());
+    dlg.showModal();
+  }
+  okBtn.addEventListener("click", function () {
+    if (!picker) return;
+    var sel = picker.getSelected();
+    if (!sel.length) return;
+    var f = apply; close(); if (f) f(sel);
+  });
+  cancelBtn.addEventListener("click", close);
+
+  function entriesFor(names) {
+    var all = (catalog && catalog.entries) || [], keep = {};
+    names.forEach(function (n) { keep[n] = true; });
+    var list = all.filter(function (e) { return keep[e.name]; });
+    return CU.mergeEntries(list, names).map(function (e) { e.in_list = true; return e; });
+  }
+
+  // A model row's Choose... button.
+  card.addEventListener("click", function (e) {
+    var b = e.target.closest && e.target.closest("button.of-edit");
+    if (!b || !catalog) return;
+    var cell = b.closest("td.model-classes"), input = cell.querySelector("input.of-value"), name = b.dataset.model;
+    var m = modelOf(name) || { name: name, classes: [] }, own = m.classes || [];
+    var current = valueNames(input.value);
+    var entries = entriesFor(own.concat(current));
+    var finish = function (v) { input.value = v; summarize(cell); cell.classList.add("edited"); };
+    open({
+      title: "Classes of " + name,
+      entries: entries, selected: current, own: own,
+      quickSets: CU.modelQuickSets(catalog, name),
+      onApply: function (sel) { finish(sel.join(",")); },
+      onQuick: function (q) {
+        if (q.global) { close(); finish(GLOBAL); return true; }
+        if (!q.names || !q.names.length) { close(); finish(""); return true; }
+        return false;
+      }
+    });
+  });
+
+  // The global Object filter field.
+  var gInput = document.getElementById("object-filter"), gBtn = document.getElementById("of-global-edit");
+  if (gInput && gBtn) {
+    gBtn.addEventListener("click", function () {
+      if (!catalog) return;
+      var union = [], seen = {};
+      (catalog.models || []).forEach(function (m) { (m.classes || []).forEach(function (c) { if (!seen[c]) { seen[c] = true; union.push(c); } }); });
+      var current = CU.parseList(gInput.value);
+      var set = function (v) { gInput.value = v; gInput.dispatchEvent(new Event("input", { bubbles: true })); gInput.dispatchEvent(new Event("change", { bubbles: true })); };
+      open({
+        title: "Object filter (all models)",
+        entries: entriesFor(union.concat(current)), selected: current, own: union,
+        quickSets: [{ label: "All (no filter)", names: [] }].concat(CU.quickSetsFor({
+          classes: union, hidden: [], entries: (catalog.entries || []), models: []
+        }).filter(function (q) { return q.label !== "All classes"; })),
+        onApply: function (sel) { set(sel.join(", ")); },
+        onQuick: function (q) { if (!q.names || !q.names.length) { close(); set(""); return true; } return false; }
+      });
+    });
+  }
+
+  CP.fetchCatalog().then(function (c) {
+    catalog = c;
+    summarizeAll();
+    if (gBtn) gBtn.hidden = false;
+  }).catch(function () {});
+  // The Models card is re-rendered when models are added or removed.
+  if (window.MutationObserver) new MutationObserver(function () { if (catalog) summarizeAll(); }).observe(card, { childList: true });
+})();

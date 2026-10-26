@@ -678,6 +678,28 @@ fn parse_card_threshold(
 }
 
 /// The config entry of model `name` (matched like `/v1/vision/custom/{model}`).
+/// `object_filter.<name>` of the Models card: [`OBJECT_FILTER_GLOBAL`] = no per-model filter
+/// (`None`, the global one applies), empty = every class (`Some([])`), else a comma list.
+fn parse_card_object_filter(name: &str, v: &str) -> anyhow::Result<Option<Vec<String>>> {
+    let v = v.trim();
+    if v == super::config_page::OBJECT_FILTER_GLOBAL {
+        return Ok(None);
+    }
+    let names: Vec<String> = v
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() && !v.is_empty() {
+        anyhow::bail!(
+            "classes for '{name}': '{v}' names no class; list class names separated by \
+             commas, or leave it empty for every class"
+        );
+    }
+    Ok(Some(names))
+}
+
 fn card_model<'a>(
     c: &'a mut Config,
     name: &str,
@@ -762,6 +784,12 @@ pub(super) fn models_card_edit(c: &mut Config, form: &[(String, String)]) -> any
         }
     }
     crate::config_form::apply_device_thresholds(c, &profiles)?;
+    for (k, v) in form {
+        if let Some(name) = k.strip_prefix("object_filter.") {
+            let filter = parse_card_object_filter(name, v)?;
+            card_model(c, name)?.object_filter = filter;
+        }
+    }
     for (k, v) in form {
         let Some(name) = k.strip_prefix("night.") else {
             continue;
@@ -850,6 +878,29 @@ pub(super) mod tests {
         let mut c = c.clone();
         models_card_edit(&mut c, &form(pairs))?;
         Ok(c)
+    }
+
+    #[test]
+    fn card_object_filter_global_empty_and_list() {
+        let c = cfg();
+        let out = edit(&c, &[("object_filter.m", " Person, car ,")]).unwrap();
+        assert_eq!(
+            out.models[0].object_filter,
+            Some(vec!["Person".to_string(), "car".to_string()])
+        );
+        assert_eq!(out.models[1].object_filter, None);
+        // Empty = every class; `__global__` = no per-model filter.
+        let all = edit(&out, &[("object_filter.m", "")]).unwrap();
+        assert_eq!(all.models[0].object_filter, Some(vec![]));
+        let global = edit(&all, &[("object_filter.m", "__global__")]).unwrap();
+        assert_eq!(global.models[0].object_filter, None);
+        // A field for another model leaves this one alone; nothing named is refused.
+        assert_eq!(
+            edit(&out, &[("object_filter.n", "dog")]).unwrap().models[0].object_filter,
+            out.models[0].object_filter
+        );
+        assert!(edit(&c, &[("object_filter.m", " , ")]).is_err());
+        assert!(edit(&c, &[("object_filter.zzz", "dog")]).is_err());
     }
 
     #[test]

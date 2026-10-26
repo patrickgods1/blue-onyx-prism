@@ -66,6 +66,16 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     ("test.js", JS, include_str!("../../assets/test.js")),
     ("training.js", JS, include_str!("../../assets/training.js")),
     ("browse.js", JS, include_str!("../../assets/browse.js")),
+    (
+        "class-picker.js",
+        JS,
+        include_str!("../../assets/class-picker.js"),
+    ),
+    (
+        "model-picker.js",
+        JS,
+        include_str!("../../assets/model-picker.js"),
+    ),
     ("review.js", JS, include_str!("../../assets/review.js")),
     ("welcome.js", JS, include_str!("../../assets/welcome.js")),
 ];
@@ -909,6 +919,8 @@ mod tests {
         for name in [
             "live.js",
             "benchmark.js",
+            "class-picker.js",
+            "model-picker.js",
             "config.js",
             "logs.js",
             "stats.js",
@@ -1167,5 +1179,39 @@ mod tests {
         let (s, body) = get_text(&plain, "/logs.json").await;
         assert_eq!(s, StatusCode::OK);
         assert!(body.contains("\"success\":false"));
+    }
+
+    #[tokio::test]
+    async fn review_and_training_pages_load_the_class_picker() {
+        let state = test_state();
+        for (uri, own_js) in [
+            ("/review", "/static/review.js?v="),
+            ("/training", "/static/training.js?v="),
+            ("/config", "/static/config.js?v="),
+        ] {
+            let (s, html) = get_text(&state, uri).await;
+            assert_eq!(s, StatusCode::OK, "{uri}");
+            if uri != "/config" {
+                let mp = html.find("/static/model-picker.js?v=");
+                assert!(mp.is_some() && mp < html.find(own_js), "{uri}");
+            }
+            let picker = html.find("/static/class-picker.js?v=");
+            let own = html.find(own_js);
+            assert!(picker.is_some() && own.is_some(), "{uri}");
+            // The picker defines ClassPicker before the page script uses it.
+            assert!(picker < own, "{uri}");
+        }
+        let (_, review) = get_text(&state, "/review").await;
+        assert!(review.contains("id=\"rv-al-picker\""));
+        assert!(review.contains("name=\"mode\" value=\"labelers\""));
+        assert!(review.contains("name=\"mode\" value=\"model\""));
+        assert!(review.contains("id=\"rv-al-model-picker\""));
+        assert!(review.contains("id=\"rv-label-picker\""));
+        assert!(review.contains("id=\"rv-show-picker\""));
+        assert!(review.contains("id=\"rv-classes-picker\""));
+        let (_, training) = get_text(&state, "/training").await;
+        assert!(training.contains("id=\"al-picker\""));
+        assert!(training.contains("id=\"al-preset\""));
+        assert!(training.contains("id=\"al-model-picker\""));
     }
 }

@@ -4,7 +4,9 @@
 //! its pre-fill from the sidecar, with its revision; a save naming a stale revision is refused
 //! with 409), `POST /v1/review/accept-auto` (bulk accept of frames the auto-labeler's triage
 //! settles), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling / benchmark set), `POST
-//! /v1/review/import` (X-AnyLabeling files) and `POST /v1/review/classes` (`collect.classes`).
+//! /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes` (`collect.classes`
+//! and `collect.hidden_classes`) and `GET /v1/review/class-catalog` (the class picker's
+//! catalog, [`crate::training::autolabel::catalog`]).
 //! Every frame reference goes through
 //! [`Frame::resolve`] (404 otherwise); POST bodies are JSON (415 otherwise) with per-route size
 //! caps (413); the admin guard and the cross-site check of the router apply.
@@ -740,9 +742,14 @@ pub(super) async fn folder(
 #[serde(deny_unknown_fields)]
 struct ClassesBody {
     classes: Vec<String>,
+    /// `collect.hidden_classes`; absent = unchanged (pruned to the names still listed).
+    #[serde(default)]
+    hidden: Option<Vec<String>>,
 }
 
-/// `POST /v1/review/classes` with `{classes: [...]}`: saves `collect.classes`.
+/// `POST /v1/review/classes` with `{classes: [...], hidden?: [...]}`: saves `collect.classes`
+/// and, when given, `collect.hidden_classes` (each must be listed); hidden names no longer
+/// listed are dropped. Answers both.
 pub(super) async fn classes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -758,20 +765,50 @@ pub(super) async fn classes(
             .into_iter()
             .map(|c| c.trim().to_string())
             .collect();
+        let hidden_req: Option<Vec<String>> = b
+            .hidden
+            .map(|h| h.into_iter().map(|c| c.trim().to_string()).collect());
+        let mut hidden = Vec::new();
         let result = save_config(&state, "review page", |c| {
             c.collect.classes = classes.clone();
-            c.collect.validate(&c.data_root())
+            match &hidden_req {
+                Some(h) => c.collect.hidden_classes = h.clone(),
+                None => c.collect.prune_hidden(),
+            }
+            c.collect.validate(&c.data_root())?;
+            hidden = c.collect.hidden_classes.clone();
+            Ok(())
         });
         match result {
             Ok(msg) => Json(serde_json::json!({
                 "success": true,
                 "message": msg,
                 "classes": classes,
+                "hidden": hidden,
                 "classes_version": labels::classes_version(&classes),
             }))
             .into_response(),
             Err(e) => fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
         }
+    })
+    .await
+}
+
+/// `GET /v1/review/class-catalog`: the class list, the hidden classes, the classes the enabled
+/// models report, the models' classes and every class worth offering
+/// ([`crate::training::autolabel::catalog::ClassCatalog`]; reads the models' class files).
+pub(super) async fn class_catalog(State(state): State<Arc<AppState>>) -> Response {
+    blocking(move || {
+        let config = state.config_read().clone();
+        let cat = crate::training::autolabel::catalog::ClassCatalog::for_config(&config);
+        let mut v = match serde_json::to_value(&cat) {
+            Ok(v) => v,
+            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        };
+        if let Some(o) = v.as_object_mut() {
+            o.insert("success".into(), true.into());
+        }
+        Json(v).into_response()
     })
     .await
 }
@@ -972,7 +1009,7 @@ mod tests {
         assert!(page.contains("/static/browse.js?v="));
         assert!(page.contains("raccoon"));
         assert!(
-            page.contains("<select name=\"label\" id=\"rv-label\">"),
+            page.contains("name=\"label\" id=\"rv-label\""),
             "class filter"
         );
         assert!(
@@ -1370,6 +1407,63 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(d.state.config_read().collect.classes, ["person", "fox"]);
+        // Hidden classes: saved when given, refused when not listed, pruned with the list.
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/classes",
+                r#"{"classes": ["person", "fox", "bird"], "hidden": [" bird ", "fox"]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["hidden"], serde_json::json!(["bird", "fox"]));
+        assert_eq!(
+            d.state.config_read().collect.hidden_classes,
+            ["bird", "fox"]
+        );
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/classes",
+                r#"{"classes": ["person"], "hidden": ["fox"]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("hidden_classes"),
+            "{v}"
+        );
+        let (s, v) = json(
+            &d.state,
+            post_json("/v1/review/classes", r#"{"classes": ["person", "Bird"]}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["hidden"],
+            serde_json::json!(["Bird"]),
+            "absent = kept, pruned"
+        );
+        assert_eq!(d.state.config_read().collect.hidden_classes, ["Bird"]);
+        // The catalog.
+        let (s, v) = json(&d.state, get("/v1/review/class-catalog")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["classes"], serde_json::json!(["person", "Bird"]));
+        assert_eq!(v["hidden"], serde_json::json!(["Bird"]));
+        assert!(v["relevant"].is_array() && v["global_object_filter"].is_array());
+        assert!(v["models"].is_array());
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["name"], "person");
+        assert_eq!(entries[1]["name"], "Bird");
+        assert_eq!(entries[1]["hidden"], true);
+        assert_eq!(entries[1]["category"], "animal");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["name"] == "raccoon" && e["in_list"] == false)
+        );
     }
 
     fn get(uri: &str) -> Request<Body> {
@@ -1406,6 +1500,7 @@ mod tests {
             f.auto_run = Some(labels::AutoRun {
                 at: "t".into(),
                 labeler: "x".into(),
+                classes: vec!["person".into()],
             });
             Ok(Some(f))
         })
@@ -1420,6 +1515,11 @@ mod tests {
         let (s, v) = json(&d.state, post_json(&uri(&r2), &file.to_string())).await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["labels"]["auto_run"]["labeler"], "x", "round-tripped");
+        assert_eq!(
+            v["labels"]["auto_run"]["classes"],
+            serde_json::json!(["person"]),
+            "the run's classes round-trip (the page says what it found nothing of)"
+        );
         // Without a revision a save always overwrites (other clients).
         let (s, _) = json(
             &d.state,
@@ -1476,6 +1576,7 @@ mod tests {
         f.auto_run = Some(labels::AutoRun {
             at: "2026-10-22T00:00:00Z".into(),
             labeler: "mm-gdino-tiny + rfdetr-large".into(),
+            classes: vec![],
         });
         labels::write(&frame.labels, &f).unwrap();
     }

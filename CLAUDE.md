@@ -129,7 +129,10 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   accept of `auto=accept` frames `POST /v1/review/accept-auto`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
   X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned. The page reviews `collect.review_dir`
   (default `collect.dir`; *Folder under review*, `POST /v1/review/folder`), e.g. an import saved with `train import --out-dir`;
-  auto-label runs follow it.
+  auto-label runs follow it. Class selection: a run may pick a subset of `collect.classes` (`AutoRun.classes`; skipped only when the
+  same labelers already covered every picked class), `collect.hidden_classes` only hides Review pickers, `GET /v1/review/class-catalog`
+  (`training/autolabel/catalog.rs`, `coco_class` parity-tested against `scripts/autolabel.py`, default picks = classes the enabled models'
+  `object_filter`s keep; `assets/class-picker.js`, also the Config page's per-model Classes column).
 - Training (`src/training/`, `/training`, `blue-onyx-prism train ...`, `scripts/train_model.py`): user-triggered only;
   `capability` gates by GPU (CUDA lanes cu126/cu130 by compute capability + driver; MPS on Apple, D-FINE CUDA-only),
   separate `tools/train-env` from `scripts/model-export/locks/train-*.txt`; families YOLO26/11/v8, RF-DETR n..l,
@@ -139,7 +142,8 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   dataset folder, scene change + dHash + SigLIP k-center, licence confirmed; the 20k candidate budget split per camera then
   per video before extraction (`select::budget`), videos extracted in parallel (`import/parallel.rs`, `--workers`, results
   in video order), analysis on all cores but one, `--hwaccel auto|off` (D3D11VA / CUDA / VAAPI, software on macOS where
-  VideoToolbox measured slower); `GET /v1/training/import/preview` backs the page's preview line) and `train autolabel` (`training/autolabel/`:
+  VideoToolbox measured slower); two-pass extraction (640 px candidates, then only the kept frames at full resolution) with a free-space
+  preflight and running guard (`import/disk.rs`, ENOSPC -> one actionable error, work folder removed); `GET /v1/training/import/preview` backs the page's preview line) and `train autolabel` (`training/autolabel/`:
   MM-Grounding-DINO + RF-DETR L, Qwen3-VL / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label)
   are `task::Task`s on the same one-at-a-time queue, recorded in `<training dir>/tasks.json` beside `runs.json`; pins in
   `catalog/autolabel.rs`. The public night subset (`train-data:lila-night`, 926 MB) and other > 500 MB downloads need

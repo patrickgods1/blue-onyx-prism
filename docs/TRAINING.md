@@ -394,6 +394,25 @@ thread). Measured on an M1 (4 performance + 4 efficiency cores, release build, 2
 selection 2.95-3.34 s on one thread, 0.65-0.66 s on seven; the whole job 5.0-5.4 s, then 2.7 s, of
 which writing the 200 frames (an fsync per file) is 2.0 s either way (3 runs each).
 
+### Disk space
+
+An import first writes candidate frames into its work folder (`<training dir>/imports/<id>`). These are JPEGs at
+most 640 px on the long side, which is all the dedup, scene stats and SigLIP selection need. Each one records its
+time and frame index in the video. Only the kept frames are then extracted again from the video at full resolution
+and written to the dataset folder, so the stored frames are the same as before (byte-identical in a PyAV check)
+while the work folder is about 5-6x smaller for 1080p footage (much more for 4K). Image folders are read in place.
+
+Before an import is queued, after the downloads, and again before the full-resolution pass, it estimates the space
+it needs (`import/disk.rs`): about 190 kB per 1080p candidate, plus about 0.5 byte per pixel for each kept frame in
+both the work folder and the dataset (the two add up when they share a volume). It refuses to start unless each
+volume keeps 5 % of its size free (at least 1 GiB, at most 5 GiB), and the message says what to lower (Candidates per
+video, the sampling rate, Frames to keep) or where to move `training.dir` / Save frames to. While it runs it stops
+the helpers once free space falls below half that margin; a full disk (ENOSPC from Rust or the helper) ends the
+import with the same advice. The work folder is removed in both cases (unless keep work), and frames already
+written to the dataset stay complete and are queued for review. If a source video is gone or one of its kept
+frames cannot be found again, that frame is skipped with a warning; a downscaled candidate is never written to the
+dataset.
+
 ### Frame selection
 
 1. **Extraction** (`scripts/import_footage.py extract`, PyAV): FFmpeg's `select` filter keeps the
@@ -456,16 +475,52 @@ deleted automatically; confirmed empty frames (hard negatives) come only from th
 
 **Frames**: `--frames` takes the Review queue's filters as `key=value` pairs: `bucket`, `scene`, `camera`, `label`,
 `status` (default `unreviewed`), `source` (default `all`), `auto` (`review`, `accept`, `nothing`, `none`;
+`label=person|car` = frames with any of these classes; the queue's `label=` takes a comma list;
 docs/DATASET.md "Queue"), `import=<id>|any`, `again=1`, `limit` (default 200). They are taken in the
 queue's order (most uncertain first). The Review page's button sends its own filters.
 
-**Marker**: every frame the labelers return (boxes or not) gets `auto_run: {at, labeler}` in its label
+**Marker**: every frame the labelers return (boxes or not) gets `auto_run: {at, labeler, classes}` in its label
 file (a frame without one gets its pre-fill plus the marker). Only frames whose boxes changed are queued
 for review. A later run with the same labelers (`labeler`, e.g. `mm-gdino-tiny + rfdetr-large +
 qwen3-vl-2b + siglip2-base`) skips those frames (`skipped_done` in the report) unless the filter has
 `again=1` (Review page: **Label again**); when every matching frame was skipped the run fails saying so.
-Re-labelling with a trained model writes no marker and skips nothing. Writes take the label write lock,
+A run with a model writes the marker too, with `labeler: "model:<name>@<device>"` (the device it asked
+for), so the same model on the same device skips the frames it looked at unless `again=1`, and `auto=`
+filters see them. Writes take the label write lock,
 so a Review save with a stale `revision` gets a 409 instead of overwriting merged boxes.
+
+### Choosing classes
+
+A run looks for `collect.classes` unless it names some of them (`--classes a,b`; the pages' class
+picker): each must be in the list (matched case-insensitively, the list's spelling kept), anything else
+is refused before the run starts, because the reviewer could not accept its boxes. Proposals of other
+classes are dropped and counted (`dropped_other_class` in the report). A detection label is first
+mapped onto the list's spelling (`triage::map_label`: the same name, else the same name ignoring case,
+else the same COCO class through the aliases): a VOC-spelled model's `motorbike`, `tvmonitor`,
+`pottedplant`, `aeroplane`, `sofa`, `diningtable` count as the list's `motorcycle`, `tv`, `potted plant`,
+`airplane`, `couch`, `dining table`. The box gets the list's class and keeps the model's spelling in
+`model_label` (the Review page shows "was motorbike"); the report lists the renames (`renamed`) and
+counts boxes per mapped class (`by_label`). The marker records the run's classes (`auto_run.classes`; files written before
+runs could pick classes have none, which counts as the whole list), and the skip rule above becomes:
+a frame is skipped only when the same labelers looked at it for **every** class of this run. A run
+for `raccoon` after one for `person, car` labels the frames again; a run for `car` after the full list
+skips them. `auto=nothing` still means "auto-labelled, no auto evidence"; the Review page reads
+`auto_run.classes` to say which classes were found absent, which says nothing about the others.
+Self-training with `--classes` compares only detections and reviewed boxes of those classes (a
+detection of one may still match a reviewed box of another class: a class change).
+
+RF-DETR L proposes only COCO classes (`coco_class`, mirrored in Rust by
+`training::autolabel::catalog::coco_class` with a parity test against `scripts/autolabel.py`); every
+other class (`raccoon`, `opossum`, `package`) comes from MM-Grounding-DINO alone. Such boxes can never
+have both labelers agree, so the triage always says `review` for them: pick them for a run when there
+is time to review. `GET /v1/review/class-catalog` (admin) lists every class worth offering: the review
+list, the default phrases, vehicle and animal names, the 80 COCO classes and every configured model's
+classes, each with its category, prompt phrases, `coco` flag and the models that emit it, plus
+`relevant` (the review classes the enabled models report after their `object_filter`).
+
+`collect.hidden_classes` (subset of `collect.classes`; `POST /v1/review/classes` with `hidden`) hides
+rare classes from the Review page's pickers only: they stay in the exports and keep their YOLO class
+ids. Removing a class from the list drops it from the hidden list too.
 
 ### Labelers
 
@@ -520,18 +575,75 @@ safetensors, the small files downloaded and hashed) and downloaded by the downlo
 On Apple silicon everything runs on MPS (float16 for Qwen3-VL); `PYTORCH_ENABLE_MPS_FALLBACK=1` covers
 missing ops.
 
+### Label with any model
+
+`train autolabel --with-model <id>` (the Training page's *Label with a model*; `POST /training/autolabel`
+`with_model`) labels the frames with a detection model through the service's own pipeline (the
+benchmark's decode, preprocess, infer, postprocess; no Python, no training GPU needed), default
+threshold 0.3, by default over the **unreviewed** frames (first-pass labelling). Its boxes are pending
+`source: auto` boxes like the labelers'.
+
+**Sources** (`GET /v1/autolabel/models`, admin, `training::autolabel::models`):
+
+| `source` | What | `id` |
+|---|---|---|
+| `config` | every entry of `models`, enabled or not | its name |
+| `local` | a model file in `models_dir` no entry uses (the Config page's *Local models*), family `auto` | `local:<file>` |
+| `catalog` | a model resource of this platform no entry uses: downloaded, or exported on this machine (`needs_export`) | `resource:<catalog id>`, e.g. `resource:model:rfdetr-large` |
+
+```json
+{"success": true,
+ "models": [{"id": "rfdetr-large", "source": "config", "name": "rfdetr-large", "installed": true,
+             "in_config": true, "enabled": false, "family": "rfdetr", "classes": 80, "coco": true,
+             "size_bytes": 135795376, "needs_export": false, "large": false, "license": "Apache-2.0",
+             "note": "", "device": "auto"}],
+ "devices": [{"value": "auto", "label": "auto (openvino:gpu)"}, {"value": "openvino:cpu", "label": "..."}],
+ "default_threshold": 0.3}
+```
+
+Sorted config (enabled first), local, then catalog by size (bigger is usually more accurate).
+`classes` is null when the class names are not known before a download (the YOLOv5 models with their
+own class file); `coco` says every class is a COCO class (aliases applied). `size_bytes` is the file
+size, or for a catalog model the download (an export: its weights). `large` means installing it needs
+the large-download permission: over 500 MB, or an export whose toolchain is not set up yet. `devices`
+are `auto` (with what it picks now) and every runnable device option. The CLI also takes a catalog
+model's plain name (`--with-model rfdetr-base`).
+
+**Install on demand**: a catalog model that is not on disk is installed by the run itself, in its stage
+2, *installing the model*: downloaded by the download manager (SHA-256, resume), or exported with the
+export toolchain (`resources::export::run_export`, the export lock: one export at a time with the Config
+page's), with progress on the task and cancel. It is gated like the Config page: a large download needs
+`allow_large` (page: the download box; CLI `--allow-large`) or `allow_large_downloads`, an export this
+platform cannot run is refused, and a non-commercial / personal-use licence (DEIMv2, the ExDark
+RF-DETRs) needs `confirm_license` (CLI `--confirm-license`), refused before the run starts. Stage 3
+then adds a local or catalog model to the config **disabled** (the Config page's Add to config rules,
+through `save_config` in the service, the config file in the CLI), so it is never loaded for serving and
+the next run finds it as a config model. Nothing is downloaded outside a run the user started. A local
+model has family `auto` (detected from its outputs when it loads); when that fails the run says to set
+the family on the Config page (Models card).
+
+**Device per run**: `device` (CLI `--device`, any device spec, `auto` included) overrides the model's
+configured device for this run only (not saved); empty = the model's device. The report records the
+device asked for (`requested_device`) and the one that ran (`device`), and the marker uses the asked one
+(`model:<name>@<device>`). On a CPU, large models are slow: RF-DETR L takes about 1 s per frame, so
+pick a GPU device or a smaller model for big batches.
+
+**Pre-accept**: `model_accept_score` (CLI `--accept-score-model`, 0.01..1, at least the threshold;
+default off) triages boxes at or above it `accept` (why: "model <name> at 0.87 >= 0.80"), the others
+`review` ("score 0.55 below 0.80"); a person or an animal on a night or IR frame stays `review` (the
+labelers' rule). Without it every box is `review`. Pre-accepted frames are what the bulk accept
+(`auto=accept`, `POST /v1/review/accept-auto`) takes.
+
 ### Self-training
 
-`train autolabel --with-model <configured model>` (the page: *Or re-label with a trained model*)
-re-labels the frames with a trained model through the service's own pipeline (the benchmark's decode,
-preprocess, infer, postprocess; the device the model is configured for; no Python, no GPU needed),
-default threshold 0.3, by default over every frame (`status=any`). For a frame that was reviewed, its
-detections are compared with the training labels (accepted and added boxes): a detection matching
+Self-training is a run with a trained model over the reviewed frames too: an explicit `status=any`
+(the Training page's preset). For a frame that was reviewed, its detections (labels mapped onto the
+list) are compared with the training labels (accepted and added boxes): a detection matching
 none at IoU 0.5 is *new*, one whose best match has another label a *class change*, a training box no
 detection matches *missed*. Any of them puts the frame back to `unreviewed` with
 `disagreement: "re-label by <model>: 1 new box, 1 missed"`, and the Review queue lists such frames
-first. The detections are merged as pending auto boxes (always `review`). Train, re-label, review the
-disagreements, train again: 2-3 rounds, IR frames and rare species first.
+first. The detections are merged as pending auto boxes (`review`, or `accept` at a pre-accept score).
+Train, re-label, review the disagreements, train again: 2-3 rounds, IR frames and rare species first.
 
 ### M1 run (MPS)
 
@@ -565,7 +677,8 @@ blue-onyx-prism train import --list-datasets
 blue-onyx-prism train autolabel [--frames "scene=ir,status=unreviewed,import=any,limit=200"] \
     [--gdino tiny|base|large|off] [--no-rfdetr] [--vlm 2b|4b|8b|off] [--no-siglip] [--classes a,b] \
     [--allow-large] [--verbose]
-blue-onyx-prism train autolabel --with-model <trained model> [--threshold 0.3] [--frames ...]
+blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
+    [--device <spec>] [--accept-score-model 0.8] [--confirm-license] [--allow-large] [--frames "status=any,..."]
 blue-onyx-prism train list
 blue-onyx-prism train remove-env
 ```
