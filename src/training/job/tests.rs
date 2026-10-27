@@ -36,6 +36,9 @@ struct TrainFake {
     fail_lines: Vec<&'static str>,
     /// Report these classes instead of the dataset's.
     wrong_classes: Option<Vec<String>>,
+    /// Run out of GPU memory when `--batch` is above this, after `oom_epochs` finished epochs.
+    oom_above: Option<u32>,
+    oom_epochs: u32,
     train_cmds: Mutex<Vec<Cmd>>,
 }
 
@@ -72,6 +75,28 @@ impl CommandRunner for TrainFake {
                 std::thread::sleep(Duration::from_millis(5));
             }
             return Err(anyhow!(Cancelled));
+        }
+        let batch: u32 = arg_after(cmd, "--batch")
+            .and_then(|b| b.to_str().and_then(|b| b.parse().ok()))
+            .unwrap_or(0);
+        if self.oom_above.is_some_and(|max| batch > max) {
+            for e in 1..=self.oom_epochs {
+                on_line(&format!(
+                    "@train {{\"event\":\"epoch\",\"epoch\":{e},\"epochs\":9,\"loss\":1.0}}"
+                ));
+            }
+            let lines = vec![
+                "Traceback (most recent call last):".to_string(),
+                "RuntimeError: MPS backend out of memory (MPS allocated: 11.00 GiB)".to_string(),
+            ];
+            for l in &lines {
+                on_line(l);
+            }
+            return Err(anyhow::Error::new(ChildFailed {
+                program: "python".into(),
+                status: "exit status: 1".into(),
+                lines,
+            }));
         }
         if !self.fail_lines.is_empty() {
             for l in &self.fail_lines {
@@ -511,7 +536,17 @@ fn gpu_out_of_memory_says_to_lower_the_batch() {
     let e = r.unwrap_err();
     assert_eq!(e.stage, Some(TrainStage::Train));
     assert!(e.message.contains("GPU ran out of memory"), "{}", e.message);
-    assert!(e.message.contains("smaller batch (now 4)"), "{}", e.message);
+    // Retried at half the batch down to 1, then the advice names the last batch.
+    assert!(e.message.contains("smaller batch (now 1)"), "{}", e.message);
+    let batches: Vec<String> = fake
+        .train_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| !c.display().contains("--self-check"))
+        .map(|c| arg_after(c, "--batch").unwrap().display().to_string())
+        .collect();
+    assert_eq!(batches, ["4", "2", "1"]);
     // The CUDA lock came from the cu126 index.
     let pip = fake
         .inner
@@ -520,6 +555,170 @@ fn gpu_out_of_memory_says_to_lower_the_batch() {
         .find(|c| c.contains(" pip install "))
         .unwrap();
     assert!(pip.contains("--torch-backend cu126"), "{pip}");
+}
+
+/// The batches of the training commands `fake` ran (not the self-check).
+fn train_batches(fake: &TrainFake) -> Vec<u32> {
+    fake.train_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| !c.display().contains("--self-check"))
+        .map(|c| {
+            arg_after(c, "--batch")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn out_of_memory_early_retries_at_half_the_batch_and_keeps_the_batch_that_ran() {
+    let t = tmp("oom-retry");
+    let mut j = job(
+        &t.0,
+        TrainFamily::Rfdetr,
+        "nano",
+        mps(),
+        Platform::MACOS_ARM64,
+    );
+    j.request.recipe.batch = 16;
+    let fake = TrainFake {
+        oom_above: Some(4),
+        oom_epochs: 1,
+        ..TrainFake::new()
+    };
+    let mut lines = Vec::new();
+    let mut batches_reported = Vec::new();
+    let mut details = Vec::new();
+    let r = run_training(
+        &j,
+        &fake,
+        &fake,
+        &NoHooks,
+        &mut |p| match p {
+            TrainReport::Line(l) => lines.push(l.to_string()),
+            TrainReport::Batch(b) => batches_reported.push(b),
+            TrainReport::Progress(tp) => details.push(tp.describe()),
+            _ => {}
+        },
+        &AtomicBool::new(false),
+    );
+    let out = r.unwrap();
+    assert_eq!(train_batches(&fake), [16, 8, 4]);
+    assert_eq!(batches_reported, [8, 4]);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "out of GPU memory at batch 16, retrying with batch 8"),
+        "{lines:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("(out of GPU memory at batch 8, retrying with batch 4)")),
+        "{details:?}"
+    );
+    // The provenance records the batch that trained.
+    let prov: Provenance =
+        serde_json::from_slice(&std::fs::read(&out.output.provenance).unwrap()).unwrap();
+    assert_eq!(prov.recipe.batch, 4);
+    // macOS: the MPS allocator is capped, RF-DETR gets its multi-scale choice (9000 MB: auto
+    // keeps it on at batch 4).
+    let cmds = fake.train_cmds.lock().unwrap();
+    let train = cmds
+        .iter()
+        .rfind(|c| !c.display().contains("--self-check"))
+        .unwrap();
+    if std::env::var_os("PYTORCH_MPS_HIGH_WATERMARK_RATIO").is_none() {
+        assert!(
+            train
+                .env
+                .iter()
+                .any(|(k, v)| k == "PYTORCH_MPS_HIGH_WATERMARK_RATIO" && v == "1.0"),
+            "{:?}",
+            train.env
+        );
+    }
+    assert_eq!(
+        arg_after(train, "--multi-scale").unwrap().to_str(),
+        Some("on")
+    );
+}
+
+#[test]
+fn out_of_memory_after_the_first_epochs_or_at_batch_1_is_not_retried() {
+    let t = tmp("oom-late");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", cuda(), Platform::LINUX_X64);
+    j.request.recipe.batch = 16;
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        oom_above: Some(4),
+        oom_epochs: OOM_RETRY_EPOCHS as u32,
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert!(
+        e.message.contains("smaller batch (now 16)"),
+        "{}",
+        e.message
+    );
+    assert_eq!(train_batches(&fake), [16]);
+    // CUDA: no MPS settings, no RF-DETR option.
+    let cmds = fake.train_cmds.lock().unwrap();
+    let train = cmds
+        .iter()
+        .rfind(|c| !c.display().contains("--self-check"))
+        .unwrap();
+    assert!(
+        !train
+            .env
+            .iter()
+            .any(|(k, _)| k.starts_with("PYTORCH_MPS_HIGH"))
+    );
+    assert!(arg_after(train, "--multi-scale").is_none());
+    drop(cmds);
+    let t2 = tmp("oom-one");
+    let mut j = job(&t2.0, TrainFamily::Yolo26, "n", cuda(), Platform::LINUX_X64);
+    j.request.recipe.batch = 1;
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        oom_above: Some(0),
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    assert!(r.unwrap_err().message.contains("GPU ran out of memory"));
+    assert_eq!(train_batches(&fake), [1]);
+}
+
+#[test]
+fn multi_scale_auto_turns_off_when_batch_4_does_not_fit() {
+    let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano", 1).unwrap();
+    // 16 GB Mac share: batch 4 fits with multi-scale.
+    assert!(r.multi_scale_on(9830));
+    // 6 GB: batch 4 at 544 px does not (1500 + 4 x 650 x 2.0 = 6.7 GB > 5.4 GB).
+    assert!(!r.multi_scale_on(6144));
+    r.multi_scale = super::super::recipe::MultiScale::On;
+    assert!(r.multi_scale_on(6144));
+    r.multi_scale = super::super::recipe::MultiScale::Off;
+    assert!(!r.multi_scale_on(100_000));
+    let y = TrainRecipe::new(TrainFamily::Yolo26, "n", 1).unwrap();
+    assert!(!y.multi_scale_on(100_000));
+    // Stored only when not auto.
+    let text =
+        serde_json::to_string(&TrainRecipe::new(TrainFamily::Rfdetr, "nano", 1).unwrap()).unwrap();
+    assert!(!text.contains("multi_scale"), "{text}");
+    assert!(
+        serde_json::to_string(&r)
+            .unwrap()
+            .contains(r#""multi_scale":"off""#)
+    );
 }
 
 #[test]

@@ -4,10 +4,14 @@
 //! notes) and the 1-epoch smoke runs on an Apple M1 (docs/TRAINING.md); they are good to a factor
 //! of about 1.5 and only meant to hide choices that cannot fit and to set expectations.
 //!
-//! Model: `vram = base + per_image x batch x (imgsz / default)^2` MB, and
+//! Model: `vram = base + per_image x batch x (side / default)^2` MB, and
 //! `seconds per epoch = images / (images per second x gpu factor) x (imgsz / default)^2`, where
 //! images per second are a GTX 1080 class (Pascal) GPU's at the default size and the GPU factor
 //! scales them by generation ([`gpu_factor`]). On Apple MPS the per-second numbers are the M1's.
+//! `side` is the input size, except for RF-DETR trained multi-scale: rfdetr resizes every sample
+//! of a batch to its largest scale ([`rfdetr_max_side`], 544 px for a 384 px nano), so memory
+//! follows that side (time follows the input size: the per-second numbers were measured with
+//! multi-scale on).
 
 use crate::backend::detect::ComputeCapability;
 use crate::resources::catalog::TrainFamily;
@@ -46,7 +50,9 @@ pub fn cost(family: TrainFamily, size: &str) -> Option<Cost> {
         (Yolo26 | Yolo11 | Yolov8, "m") => c(1200, 450, 30.0, 1.2),
         (Yolo26 | Yolo11 | Yolov8, "l") => c(1400, 560, 22.0, 0.9),
         (Yolo26 | Yolo11 | Yolov8, "x") => c(1800, 800, 13.0, 0.5),
-        (Rfdetr, "nano") => c(1500, 450, 25.0, 1.0),
+        // Calibrated on an M1 16 GB run (batch 16 at 384 px, multi-scale up to 544 px: over
+        // 20.4 GB when it ran out of memory, 1500 + 16 x 650 x (544/384)^2 = 22.4 GB).
+        (Rfdetr, "nano") => c(1500, 650, 25.0, 1.0),
         (Rfdetr, "small") => c(1800, 650, 18.0, 0.7),
         (Rfdetr, "medium") => c(2000, 800, 14.0, 0.55),
         (Rfdetr, "base") => c(2000, 850, 12.0, 0.05),
@@ -96,8 +102,23 @@ pub struct Estimate {
     pub total_s: f64,
 }
 
-/// Estimate a run (see the module docs). None when the size is unknown or the family does not
-/// train on `target`.
+/// RF-DETR's patch size and window count per size (rfdetr's `RFDETR*Config`: base uses the
+/// DINOv2 14 px patches with 4 windows, every other size 16 px with 2).
+pub fn rfdetr_patch_windows(size: &str) -> (u32, u32) {
+    if size == "base" { (14, 4) } else { (16, 2) }
+}
+
+/// The largest side rfdetr trains an `imgsz` RF-DETR at with its default multi-scale
+/// (`expanded_scales`): `(imgsz / (patch x windows) + 5) x patch x windows`
+/// (`rfdetr.datasets.coco.compute_multi_scale_scales`; nano 384 -> 544).
+pub fn rfdetr_max_side(size: &str, imgsz: u32) -> u32 {
+    let (patch, windows) = rfdetr_patch_windows(size);
+    let block = patch * windows;
+    (imgsz / block + 5) * block
+}
+
+/// Estimate a run (see the module docs), RF-DETR with its default multi-scale training. None
+/// when the size is unknown or the family does not train on `target`.
 pub fn estimate(
     family: TrainFamily,
     size: &str,
@@ -107,12 +128,34 @@ pub fn estimate(
     epochs: u32,
     target: Target,
 ) -> Option<Estimate> {
+    estimate_with(family, size, imgsz, batch, images, epochs, target, true)
+}
+
+/// [`estimate`] with RF-DETR's multi-scale training on or off (ignored by the other families).
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_with(
+    family: TrainFamily,
+    size: &str,
+    imgsz: u32,
+    batch: u32,
+    images: usize,
+    epochs: u32,
+    target: Target,
+    multi_scale: bool,
+) -> Option<Estimate> {
     let cost = cost(family, size)?;
-    let scale = {
-        let r = f64::from(imgsz) / f64::from(family.default_imgsz(size));
+    let ratio2 = |side: u32| {
+        let r = f64::from(side) / f64::from(family.default_imgsz(size));
         r * r
     };
-    let vram = f64::from(cost.base_mb) + f64::from(cost.per_image_mb) * f64::from(batch) * scale;
+    let scale = ratio2(imgsz);
+    let mem_side = if family == TrainFamily::Rfdetr && multi_scale {
+        rfdetr_max_side(size, imgsz)
+    } else {
+        imgsz
+    };
+    let vram = f64::from(cost.base_mb)
+        + f64::from(cost.per_image_mb) * f64::from(batch) * ratio2(mem_side);
     let speed = match target {
         Target::Cuda(cc) => f64::from(cost.pascal_img_s) * f64::from(gpu_factor(cc)),
         Target::Mps => f64::from(cost.m1_img_s),
@@ -129,11 +172,22 @@ pub fn estimate(
 }
 
 /// The largest batch of 1, 2, 4, ..., 64 whose estimate fits `vram_mb` (90% of it, for the
-/// allocator's slack); None when even batch 1 does not.
+/// allocator's slack); None when even batch 1 does not. RF-DETR with multi-scale on.
 pub fn suggest_batch(family: TrainFamily, size: &str, imgsz: u32, vram_mb: u64) -> Option<u32> {
+    suggest_batch_with(family, size, imgsz, vram_mb, true)
+}
+
+/// [`suggest_batch`] with RF-DETR's multi-scale training on or off.
+pub fn suggest_batch_with(
+    family: TrainFamily,
+    size: &str,
+    imgsz: u32,
+    vram_mb: u64,
+    multi_scale: bool,
+) -> Option<u32> {
     let usable = vram_mb.saturating_mul(9) / 10;
     [64u32, 32, 16, 8, 4, 2, 1].into_iter().find(|b| {
-        estimate(
+        estimate_with(
             family,
             size,
             imgsz,
@@ -141,9 +195,26 @@ pub fn suggest_batch(family: TrainFamily, size: &str, imgsz: u32, vram_mb: u64) 
             1,
             1,
             Target::Cuda(ComputeCapability::new(8, 6)),
+            multi_scale,
         )
         .is_some_and(|e| e.vram_mb <= usable)
     })
+}
+
+/// The largest batch of 1, 2, 4, ..., 64 that fits `vram_mb` (90% of it) by a measured peak:
+/// an earlier run of the same model, input size and multi-scale setting on this GPU peaked at
+/// `peak_mb` with `batch` images. Linear in the batch over the fixed part `base_mb` (at most half
+/// the peak, so a small run still leaves a per-image cost). None when even batch 1 does not fit.
+pub fn batch_from_peak(base_mb: u32, batch: u32, peak_mb: f64, vram_mb: u64) -> Option<u32> {
+    if batch == 0 || !peak_mb.is_finite() || peak_mb <= 0.0 {
+        return None;
+    }
+    let base = f64::from(base_mb).min(peak_mb * 0.5);
+    let per_image = (peak_mb - base) / f64::from(batch);
+    let usable = vram_mb.saturating_mul(9) / 10;
+    [64u32, 32, 16, 8, 4, 2, 1]
+        .into_iter()
+        .find(|b| to_u64(base + per_image * f64::from(*b)) <= usable)
 }
 
 /// Inference speed to expect from a size on the service's devices (shown next to the choice).
@@ -249,14 +320,82 @@ mod tests {
         assert_eq!(suggest_batch(TrainFamily::Yolo26, "s", 640, 8192), Some(16));
         // 4 GB GTX 1650 class: RF-DETR large does not fit at all.
         assert_eq!(suggest_batch(TrainFamily::Rfdetr, "large", 704, 3000), None);
+        // RF-DETR nano 384 trains at up to 544 px: 1500 + 650 x 2 x 2.007 = 4109 MB > 3686.
         assert_eq!(
             suggest_batch(TrainFamily::Rfdetr, "nano", 384, 4096),
-            Some(4)
+            Some(1)
+        );
+        assert_eq!(
+            suggest_batch_with(TrainFamily::Rfdetr, "nano", 384, 4096, false),
+            Some(2)
         );
         assert_eq!(
             suggest_batch(TrainFamily::Yolo26, "n", 640, 100_000),
             Some(64)
         );
+    }
+
+    /// Run 20261027-071956-7f1c: RF-DETR nano 384 at batch 16 on a 16 GB M1 (the page suggested
+    /// 16) needed over 20 GB and ran out of memory; the share of a 16 GB Mac now suggests 4.
+    #[test]
+    fn rfdetr_nano_on_a_16_gb_mac_suggests_a_batch_that_fits() {
+        let mem = crate::training::estimate::to_u64(
+            16.0 * 1024.0 * crate::training::capability::MPS_MEMORY_SHARE,
+        );
+        let b = suggest_batch(TrainFamily::Rfdetr, "nano", 384, mem).unwrap();
+        assert!(b <= 4, "{b}");
+        assert_eq!(b, 4);
+        let e = estimate(TrainFamily::Rfdetr, "nano", 384, 16, 1, 1, Target::Mps).unwrap();
+        assert!(e.vram_mb > 20_000, "{e:?}");
+        // Multi-scale off: memory at the input size.
+        assert_eq!(
+            suggest_batch_with(TrainFamily::Rfdetr, "nano", 384, mem, false),
+            Some(8)
+        );
+        let off = estimate_with(
+            TrainFamily::Rfdetr,
+            "nano",
+            384,
+            4,
+            1,
+            1,
+            Target::Mps,
+            false,
+        );
+        assert_eq!(off.unwrap().vram_mb, 1500 + 650 * 4);
+        // Time follows the input size either way.
+        let on = estimate(TrainFamily::Rfdetr, "nano", 384, 4, 38, 1, Target::Mps).unwrap();
+        assert!((on.epoch_s - 38.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rfdetr_multi_scale_sides_follow_rfdetr() {
+        // compute_multi_scale_scales(resolution, expanded_scales=True, patch, windows)[-1]
+        assert_eq!(rfdetr_max_side("nano", 384), 544);
+        assert_eq!(rfdetr_max_side("small", 512), 672);
+        assert_eq!(rfdetr_max_side("medium", 576), 736);
+        assert_eq!(rfdetr_max_side("base", 560), 840);
+        assert_eq!(rfdetr_max_side("large", 704), 864);
+        // Other families ignore multi-scale.
+        let cc = Target::Cuda(ComputeCapability::new(8, 6));
+        assert_eq!(
+            estimate_with(TrainFamily::Yolo26, "n", 640, 8, 1, 1, cc, true),
+            estimate_with(TrainFamily::Yolo26, "n", 640, 8, 1, 1, cc, false)
+        );
+    }
+
+    #[test]
+    fn a_measured_peak_sets_the_batch() {
+        // 4 images peaked at 7 GB of a 16 GB share (9830 MB, 8847 usable): per image
+        // (7168 - 1500) / 4 = 1417 MB; batch 4 fits, 8 (12836 MB) does not.
+        assert_eq!(batch_from_peak(1500, 4, 7168.0, 9830), Some(4));
+        // Lower measured peak than the estimate: a larger batch.
+        assert_eq!(batch_from_peak(1500, 4, 3000.0, 9830), Some(16));
+        // Base at most half the peak: 1 image at 2000 MB costs 1000 MB per image.
+        assert_eq!(batch_from_peak(1500, 1, 2000.0, 4000), Some(2));
+        assert_eq!(batch_from_peak(1500, 4, 50_000.0, 9830), None);
+        assert_eq!(batch_from_peak(1500, 0, 1000.0, 9830), None);
+        assert_eq!(batch_from_peak(1500, 4, f64::NAN, 9830), None);
     }
 
     #[test]

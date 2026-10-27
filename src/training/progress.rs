@@ -1,8 +1,12 @@
 //! The training script's progress events (`@train {json}` lines on its stdout, see
 //! `scripts/train_model.py`) and the run's progress derived from them ([`TrainProgress`]:
-//! percent of the training stage, epoch, ETA). Pure.
+//! percent of the training stage, epoch, ETA, every scalar metric per epoch in
+//! [`TrainProgress::history`] and the best epoch). Raw metric keys of the trainers (rfdetr,
+//! Ultralytics, transformers) map to stable ids ([`canonical`], described by [`METRICS`]);
+//! unknown keys are kept under their raw name. Pure.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 
 /// Marker before every event.
 pub const MARKER: &str = "@train ";
@@ -51,12 +55,25 @@ pub enum TrainEvent {
         map: Option<f64>,
         #[serde(default)]
         elapsed_s: Option<f64>,
+        /// Every scalar metric of the epoch, raw key -> value ([`canonical`] maps the keys).
+        #[serde(
+            default,
+            deserialize_with = "finite_metrics",
+            skip_serializing_if = "BTreeMap::is_empty"
+        )]
+        metrics: BTreeMap<String, f64>,
     },
     Eval {
         #[serde(default)]
         epoch: u32,
         #[serde(default)]
         val_loss: Option<f64>,
+        #[serde(
+            default,
+            deserialize_with = "finite_metrics",
+            skip_serializing_if = "BTreeMap::is_empty"
+        )]
+        metrics: BTreeMap<String, f64>,
     },
     Phase {
         phase: String,
@@ -86,6 +103,276 @@ pub fn parse_line(line: &str) -> Option<TrainEvent> {
     serde_json::from_str(json).ok()
 }
 
+/// Longest metric key kept.
+pub const MAX_METRIC_KEY: usize = 64;
+/// Most metrics kept per epoch (known ids first, then raw keys in order).
+pub const MAX_METRICS_PER_EPOCH: usize = 64;
+/// Most epochs kept in [`TrainProgress::history`] (the oldest go first).
+pub const MAX_HISTORY: usize = super::config::MAX_EPOCHS as usize;
+
+/// How the page prints a metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricFormat {
+    /// Three decimals (`0.711`).
+    Fixed3,
+    /// Scientific (`1.0e-4`), learning rates.
+    Sci,
+    /// Percent of 0..1 (`71.1%`).
+    Pct,
+    /// Integer.
+    Int,
+    /// Gigabytes, one decimal.
+    Gb,
+    /// Per second, one decimal.
+    Rate,
+}
+
+/// One canonical metric id (`GET /v1/training` `metrics`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct MetricInfo {
+    pub id: &'static str,
+    /// "mAP 50-95".
+    pub label: &'static str,
+    /// Column header: "mAP".
+    pub short: &'static str,
+    /// Larger is better (true), smaller (false), neither (None: learning rate, memory).
+    pub higher_better: Option<bool>,
+    pub format: MetricFormat,
+}
+
+const fn m(
+    id: &'static str,
+    label: &'static str,
+    short: &'static str,
+    higher_better: Option<bool>,
+    format: MetricFormat,
+) -> MetricInfo {
+    MetricInfo {
+        id,
+        label,
+        short,
+        higher_better,
+        format,
+    }
+}
+
+/// Every canonical metric id, in the page's default order.
+pub const METRICS: &[MetricInfo] = {
+    use MetricFormat::*;
+    const UP: Option<bool> = Some(true);
+    const DOWN: Option<bool> = Some(false);
+    &[
+        m("map", "mAP 50-95", "mAP", UP, Fixed3),
+        m("map50", "mAP 50", "mAP50", UP, Fixed3),
+        m("map75", "mAP 75", "mAP75", UP, Fixed3),
+        m("mar", "mAR (max detections)", "mAR", UP, Fixed3),
+        m(
+            "precision",
+            "Precision (at the best F1 threshold)",
+            "P",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "recall",
+            "Recall (at the best F1 threshold)",
+            "R",
+            UP,
+            Fixed3,
+        ),
+        m("f1", "F1 (macro, best threshold)", "F1", UP, Fixed3),
+        m(
+            "f1_thr",
+            "Best F1 confidence threshold",
+            "F1 thr",
+            None,
+            Fixed3,
+        ),
+        m(
+            "f2",
+            "F2 (recall-weighted, best threshold)",
+            "F2",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f2_thr",
+            "Best F2 confidence threshold",
+            "F2 thr",
+            None,
+            Fixed3,
+        ),
+        m(
+            "f2_precision",
+            "Precision at the best F2 threshold",
+            "F2 P",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f2_recall",
+            "Recall at the best F2 threshold",
+            "F2 R",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f0_5",
+            "F0.5 (precision-weighted, best threshold)",
+            "F0.5",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f0_5_thr",
+            "Best F0.5 confidence threshold",
+            "F0.5 thr",
+            None,
+            Fixed3,
+        ),
+        m(
+            "f0_5_precision",
+            "Precision at the best F0.5 threshold",
+            "F0.5 P",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f0_5_recall",
+            "Recall at the best F0.5 threshold",
+            "F0.5 R",
+            UP,
+            Fixed3,
+        ),
+        m("loss", "Training loss", "Loss", DOWN, Fixed3),
+        m("val_loss", "Validation loss", "Val loss", DOWN, Fixed3),
+        m("lr", "Learning rate", "LR", None, Sci),
+        m("mem_gb", "Peak GPU memory (GB)", "Mem", None, Gb),
+        m("img_s", "Training images per second", "img/s", UP, Rate),
+        m("ema_map", "mAP 50-95 (EMA)", "EMA mAP", UP, Fixed3),
+        m("ema_map50", "mAP 50 (EMA)", "EMA mAP50", UP, Fixed3),
+        m("ema_map75", "mAP 75 (EMA)", "EMA mAP75", UP, Fixed3),
+        m("ema_mar", "mAR (EMA)", "EMA mAR", UP, Fixed3),
+    ]
+};
+
+/// The [`MetricInfo`] of `id`.
+pub fn metric(id: &str) -> Option<&'static MetricInfo> {
+    METRICS.iter().find(|m| m.id == id)
+}
+
+/// The stable id of a trainer's raw metric key (rfdetr `val/mAP_50_95`, Ultralytics
+/// `metrics/mAP50-95(B)`, transformers `eval_loss`, the script's own `f2`), None for keys
+/// without one (they are kept under their raw name). rfdetr's `val/ema_*` keys map to `ema_<id>`.
+pub fn canonical(raw: &str) -> Option<&'static str> {
+    if let Some(rest) = raw.strip_prefix("val/ema_") {
+        let id = canonical(&format!("val/{rest}"))?;
+        return METRICS
+            .iter()
+            .find(|m| m.id.strip_prefix("ema_") == Some(id))
+            .map(|m| m.id);
+    }
+    if let Some(m) = metric(raw) {
+        return Some(m.id);
+    }
+    Some(match raw {
+        // rfdetr (Lightning callback metrics).
+        "val/mAP_50_95" => "map",
+        "val/mAP_50" => "map50",
+        "val/mAP_75" => "map75",
+        "val/mAR" => "mar",
+        "val/F1" => "f1",
+        "val/precision" => "precision",
+        "val/recall" => "recall",
+        "val/loss" => "val_loss",
+        "train/loss" | "train/loss_epoch" => "loss",
+        "train/lr" => "lr",
+        // Ultralytics.
+        "metrics/mAP50-95(B)" => "map",
+        "metrics/mAP50(B)" => "map50",
+        "metrics/mAP75(B)" => "map75",
+        "metrics/precision(B)" => "precision",
+        "metrics/recall(B)" => "recall",
+        "lr/pg0" => "lr",
+        // transformers (Trainer logs and the script's compute_metrics).
+        "eval_loss" => "val_loss",
+        "learning_rate" => "lr",
+        "eval_map" => "map",
+        "eval_map_50" => "map50",
+        "eval_map_75" => "map75",
+        "eval_mar_100" => "mar",
+        "eval_precision" => "precision",
+        "eval_recall" => "recall",
+        "eval_f1" => "f1",
+        "eval_f1_thr" => "f1_thr",
+        "eval_f2" => "f2",
+        "eval_f2_thr" => "f2_thr",
+        "eval_f0_5" => "f0_5",
+        _ => return None,
+    })
+}
+
+/// Counters a trainer logs beside its metrics (transformers' `epoch`, Lightning's `step`); the
+/// history keys points by epoch already.
+const COUNTER_KEYS: &[&str] = &["epoch", "step", "global_step", "eval_epoch"];
+
+/// A JSON object of metrics, keeping finite numbers only (a `null`, a string or a NaN the
+/// script let through does not lose the whole event) and no [`COUNTER_KEYS`].
+fn finite_metrics<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, f64>, D::Error> {
+    let raw: Option<BTreeMap<String, serde_json::Value>> = Option::deserialize(d)?;
+    Ok(raw
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| !COUNTER_KEYS.contains(&k.as_str()))
+        .filter_map(|(k, v)| v.as_f64().filter(|f| f.is_finite()).map(|f| (k, f)))
+        .collect())
+}
+
+/// One finished epoch's metrics (canonical ids where known, raw keys otherwise).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct EpochPoint {
+    pub epoch: u32,
+    /// Seconds since training started when the epoch was reported.
+    pub elapsed_s: f64,
+    pub metrics: BTreeMap<String, f64>,
+}
+
+/// The best epoch on the primary metric (`map`, else `map50`, else the lowest `val_loss`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Best {
+    pub metric: String,
+    pub epoch: u32,
+    pub value: f64,
+}
+
+/// The primary metrics, in order of preference, with "larger is better".
+const PRIMARY: [(&str, bool); 3] = [("map", true), ("map50", true), ("val_loss", false)];
+
+/// The best epoch of `history` (see [`Best`]); the earliest epoch wins a tie.
+pub fn best_of(history: &[EpochPoint]) -> Option<Best> {
+    PRIMARY.iter().find_map(|&(id, up)| {
+        let mut best: Option<Best> = None;
+        for p in history {
+            let Some(&v) = p.metrics.get(id) else {
+                continue;
+            };
+            let better = best
+                .as_ref()
+                .is_none_or(|b| if up { v > b.value } else { v < b.value });
+            if better {
+                best = Some(Best {
+                    metric: id.to_string(),
+                    epoch: p.epoch,
+                    value: v,
+                });
+            }
+        }
+        best
+    })
+}
+
 /// What the run reports while the script trains.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -106,6 +393,14 @@ pub struct TrainProgress {
     pub phase: Option<String>,
     /// Loss per finished epoch.
     pub losses: Vec<f64>,
+    /// Every metric per epoch, merged by epoch (an `eval` event fills its epoch's row), at most
+    /// [`MAX_HISTORY`] points.
+    pub history: Vec<EpochPoint>,
+    /// The best epoch so far ([`best_of`]).
+    pub best: Option<Best>,
+    /// Why this attempt restarted ("out of GPU memory at batch 16, retrying with batch 8").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl TrainProgress {
@@ -133,7 +428,9 @@ impl TrainProgress {
                 epochs,
                 loss,
                 map50,
-                ..
+                map,
+                elapsed_s: at,
+                metrics,
             } => {
                 self.epoch = *epoch;
                 self.epochs = *epochs;
@@ -145,11 +442,19 @@ impl TrainProgress {
                 if map50.is_some() {
                     self.map50 = *map50;
                 }
+                let named = [("loss", *loss), ("map50", *map50), ("map", *map)];
+                self.merge(*epoch, at.unwrap_or(elapsed_s), metrics, &named);
             }
-            TrainEvent::Eval { val_loss, .. } => {
+            TrainEvent::Eval {
+                epoch,
+                val_loss,
+                metrics,
+            } => {
                 if val_loss.is_some() {
                     self.val_loss = *val_loss;
                 }
+                let e = if *epoch == 0 { self.epoch } else { *epoch };
+                self.merge(e, elapsed_s, metrics, &[("val_loss", *val_loss)]);
             }
             TrainEvent::Phase { phase, .. } => self.phase = Some(phase.clone()),
             TrainEvent::SelfCheck { .. } | TrainEvent::Done { .. } => {}
@@ -159,6 +464,78 @@ impl TrainProgress {
         if self.phase.is_some() {
             self.eta_s = None;
         }
+    }
+
+    /// Fold one event's metrics into `epoch`'s row of the history (created when new): raw keys
+    /// under their [`canonical`] id (the first key of an id wins), the event's named fields
+    /// (`loss`, `map50`, `map`, `val_loss`) over them.
+    fn merge(
+        &mut self,
+        epoch: u32,
+        elapsed_s: f64,
+        raw: &BTreeMap<String, f64>,
+        named: &[(&str, Option<f64>)],
+    ) {
+        if epoch == 0 {
+            return;
+        }
+        let mut known: BTreeMap<String, f64> = BTreeMap::new();
+        let mut other: Vec<(String, f64)> = Vec::new();
+        for (k, &v) in raw {
+            if !v.is_finite() || k.is_empty() || k.chars().count() > MAX_METRIC_KEY {
+                continue;
+            }
+            match canonical(k) {
+                Some(id) => {
+                    known.entry(id.to_string()).or_insert(v);
+                }
+                None => other.push((k.clone(), v)),
+            }
+        }
+        // The event's own fields are the script's choice among the trainer's keys: they win.
+        for (id, v) in named {
+            if let Some(v) = v.filter(|v| v.is_finite()) {
+                known.insert((*id).to_string(), v);
+            }
+        }
+        if known.is_empty() && other.is_empty() {
+            return;
+        }
+        let at = match self.history.iter().position(|p| p.epoch >= epoch) {
+            Some(i) if self.history.get(i).is_some_and(|p| p.epoch == epoch) => i,
+            Some(i) => {
+                self.history.insert(i, EpochPoint::default());
+                i
+            }
+            None => {
+                self.history.push(EpochPoint::default());
+                self.history.len() - 1
+            }
+        };
+        let newest = at + 1 == self.history.len();
+        let Some(p) = self.history.get_mut(at) else {
+            return;
+        };
+        p.epoch = epoch;
+        p.elapsed_s = p.elapsed_s.max(elapsed_s);
+        for (k, v) in known.into_iter().chain(other) {
+            if p.metrics.len() < MAX_METRICS_PER_EPOCH || p.metrics.contains_key(&k) {
+                p.metrics.insert(k, v);
+            }
+        }
+        // The newest epoch's values are the run's current ones.
+        if newest {
+            if let Some(&v) = p.metrics.get("map50") {
+                self.map50 = Some(v);
+            }
+            if let Some(&v) = p.metrics.get("val_loss") {
+                self.val_loss = Some(v);
+            }
+        }
+        while self.history.len() > MAX_HISTORY {
+            self.history.remove(0);
+        }
+        self.best = best_of(&self.history);
     }
 
     /// Share of the training done, 0..1: finished epochs plus the share of the current one.
@@ -180,8 +557,12 @@ impl TrainProgress {
         if let Some(p) = &self.phase {
             return format!("{p}: exporting the trained model to ONNX and checking it");
         }
+        let note = self
+            .note
+            .as_ref()
+            .map_or_else(String::new, |n| format!(" ({n})"));
         if self.epochs == 0 {
-            return "starting".into();
+            return format!("starting{note}");
         }
         let mut s = format!("epoch {}/{}", self.epoch.max(1), self.epochs);
         if self.batches > 0 && self.batch < self.batches {
@@ -193,12 +574,25 @@ impl TrainProgress {
         if let Some(m) = self.map50 {
             s.push_str(&format!(", val mAP50 {m:.3}"));
         }
+        if let Some(b) = &self.best {
+            let label = match b.metric.as_str() {
+                "map" => "mAP50-95",
+                "map50" => "mAP50",
+                "val_loss" => "val loss",
+                other => other,
+            };
+            s.push_str(&format!(
+                ", best {label} {:.3} @ epoch {}",
+                b.value, b.epoch
+            ));
+        }
         if let Some(e) = self.eta_s {
             s.push_str(&format!(
                 ", about {} left",
                 super::estimate::format_duration(e)
             ));
         }
+        s.push_str(&note);
         s
     }
 }
@@ -277,14 +671,16 @@ mod tests {
                 map50: Some(0.3),
                 map: None,
                 elapsed_s: None,
+                metrics: BTreeMap::new(),
             },
             20.0,
         );
         assert!((p.fraction() - 0.25).abs() < 1e-12);
         assert_eq!(p.losses, [2.5]);
         assert!(
-            p.describe()
-                .starts_with("epoch 1/4, loss 2.500, val mAP50 0.300, about 60 s left"),
+            p.describe().starts_with(
+                "epoch 1/4, loss 2.500, val mAP50 0.300, best mAP50 0.300 @ epoch 1, about 60 s left"
+            ),
             "{}",
             p.describe()
         );
@@ -307,5 +703,237 @@ mod tests {
         );
         assert_eq!(p.eta_s, None);
         assert!(p.describe().contains("exporting"));
+    }
+
+    fn epoch(e: u32, metrics: &[(&str, f64)]) -> TrainEvent {
+        TrainEvent::Epoch {
+            epoch: e,
+            epochs: 3,
+            loss: None,
+            map50: None,
+            map: None,
+            elapsed_s: Some(f64::from(e) * 10.0),
+            metrics: metrics
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn epoch_events_carry_metrics_and_drop_non_numbers() {
+        let e = parse_line(
+            r#"@train {"event":"epoch","epoch":1,"epochs":3,"loss":4.2,"metrics":{"val/mAP_50_95":0.711,"val/F1":0.8,"bad":null,"s":"x","val/AP/raccoon":0.5,"epoch":1.0}}"#,
+        )
+        .unwrap();
+        let TrainEvent::Epoch { metrics, .. } = &e else {
+            panic!("{e:?}")
+        };
+        assert_eq!(metrics.len(), 3, "{metrics:?}");
+        // Old events without metrics still parse.
+        assert!(matches!(
+            parse_line(r#"@train {"event":"eval","epoch":2,"val_loss":1.5}"#),
+            Some(TrainEvent::Eval { epoch: 2, val_loss: Some(_), ref metrics }) if metrics.is_empty()
+        ));
+        let mut p = TrainProgress::default();
+        p.apply(&e, 5.0);
+        let row = &p.history[0];
+        assert_eq!(row.epoch, 1);
+        assert_eq!(row.metrics["map"], 0.711);
+        assert_eq!(row.metrics["f1"], 0.8);
+        assert_eq!(row.metrics["loss"], 4.2);
+        // Unknown keys stay under their raw name.
+        assert_eq!(row.metrics["val/AP/raccoon"], 0.5);
+        assert_eq!(
+            p.best,
+            Some(Best {
+                metric: "map".into(),
+                epoch: 1,
+                value: 0.711
+            })
+        );
+        assert!(
+            p.describe().contains("best mAP50-95 0.711 @ epoch 1"),
+            "{}",
+            p.describe()
+        );
+    }
+
+    #[test]
+    fn raw_keys_map_to_stable_ids() {
+        for (raw, id) in [
+            // rfdetr
+            ("val/mAP_50_95", "map"),
+            ("val/mAP_50", "map50"),
+            ("val/mAP_75", "map75"),
+            ("val/mAR", "mar"),
+            ("val/F1", "f1"),
+            ("val/precision", "precision"),
+            ("val/recall", "recall"),
+            ("val/loss", "val_loss"),
+            ("train/loss", "loss"),
+            ("train/lr", "lr"),
+            ("val/ema_mAP_50_95", "ema_map"),
+            ("val/ema_mAP_50", "ema_map50"),
+            ("val/ema_mAR", "ema_mar"),
+            // Ultralytics
+            ("metrics/mAP50-95(B)", "map"),
+            ("metrics/mAP50(B)", "map50"),
+            ("metrics/precision(B)", "precision"),
+            ("metrics/recall(B)", "recall"),
+            ("lr/pg0", "lr"),
+            // transformers
+            ("eval_loss", "val_loss"),
+            ("learning_rate", "lr"),
+            ("eval_map", "map"),
+            ("eval_map_50", "map50"),
+            // the script's own
+            ("f2", "f2"),
+            ("f2_thr", "f2_thr"),
+            ("mem_gb", "mem_gb"),
+            ("img_s", "img_s"),
+        ] {
+            assert_eq!(canonical(raw), Some(id), "{raw}");
+        }
+        for raw in [
+            "val/ema_F1_bogus",
+            "val/AP/person",
+            "val/box_loss",
+            "",
+            "val/ema_",
+        ] {
+            assert_eq!(canonical(raw), None, "{raw}");
+        }
+        // Every id is described once.
+        let mut ids: Vec<&str> = METRICS.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), METRICS.len());
+        let j = serde_json::to_value(METRICS).unwrap();
+        assert_eq!(j[0]["id"], "map");
+        assert_eq!(j[0]["format"], "fixed3");
+        assert_eq!(j[0]["higher_better"], true);
+        let lr = METRICS.iter().position(|m| m.id == "lr").unwrap();
+        assert_eq!(j[lr]["format"], "sci");
+        assert!(j[lr]["higher_better"].is_null());
+    }
+
+    #[test]
+    fn eval_events_fill_the_same_epoch_and_best_follows_the_primary_metric() {
+        let mut p = TrainProgress::default();
+        // transformers: the epoch's loss, then its evaluation.
+        p.apply(&epoch(1, &[("loss", 3.0), ("learning_rate", 1e-4)]), 10.0);
+        p.apply(
+            &TrainEvent::Eval {
+                epoch: 1,
+                val_loss: Some(2.0),
+                metrics: [("eval_loss".to_string(), 2.0)].into(),
+            },
+            11.0,
+        );
+        assert_eq!(p.history.len(), 1);
+        assert_eq!(p.history[0].metrics["val_loss"], 2.0);
+        assert_eq!(p.history[0].metrics["lr"], 1e-4);
+        assert_eq!(p.history[0].elapsed_s, 11.0);
+        assert_eq!(p.best.as_ref().unwrap().metric, "val_loss");
+        p.apply(&epoch(2, &[("loss", 2.5)]), 20.0);
+        // An eval without an epoch goes to the current one.
+        p.apply(
+            &TrainEvent::Eval {
+                epoch: 0,
+                val_loss: Some(1.5),
+                metrics: BTreeMap::new(),
+            },
+            21.0,
+        );
+        p.apply(&epoch(3, &[("loss", 2.0)]), 30.0);
+        p.apply(
+            &TrainEvent::Eval {
+                epoch: 3,
+                val_loss: Some(1.8),
+                metrics: BTreeMap::new(),
+            },
+            31.0,
+        );
+        // Lowest val loss: epoch 2.
+        assert_eq!(
+            p.best,
+            Some(Best {
+                metric: "val_loss".into(),
+                epoch: 2,
+                value: 1.5
+            })
+        );
+        assert_eq!(p.val_loss, Some(1.8));
+        // mAP outranks the val loss once any epoch has it.
+        p.history[0].metrics.insert("map".into(), 0.2);
+        assert_eq!(best_of(&p.history).unwrap().metric, "map");
+        // map50 when there is no mAP50-95; a tie keeps the earlier epoch.
+        let h = [
+            EpochPoint {
+                epoch: 1,
+                elapsed_s: 1.0,
+                metrics: [("map50".to_string(), 0.4)].into(),
+            },
+            EpochPoint {
+                epoch: 2,
+                elapsed_s: 2.0,
+                metrics: [("map50".to_string(), 0.4)].into(),
+            },
+        ];
+        assert_eq!(best_of(&h).unwrap().epoch, 1);
+        assert_eq!(best_of(&[]), None);
+    }
+
+    #[test]
+    fn history_is_merged_in_epoch_order_and_capped() {
+        let mut p = TrainProgress::default();
+        p.apply(&epoch(2, &[("f1", 0.2)]), 1.0);
+        p.apply(&epoch(1, &[("f1", 0.1)]), 2.0);
+        assert_eq!(
+            p.history.iter().map(|h| h.epoch).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        // Over-long keys are dropped; a row keeps at most MAX_METRICS_PER_EPOCH keys.
+        let many: Vec<(String, f64)> = (0..100).map(|i| (format!("k{i:03}"), 1.0)).collect();
+        let long = "x".repeat(MAX_METRIC_KEY + 1);
+        let mut raw: BTreeMap<String, f64> = many.into_iter().collect();
+        raw.insert(long.clone(), 1.0);
+        raw.insert("val/mAP_50".into(), 0.5);
+        p.apply(
+            &TrainEvent::Epoch {
+                epoch: 3,
+                epochs: 3,
+                loss: None,
+                map50: None,
+                map: None,
+                elapsed_s: None,
+                metrics: raw,
+            },
+            3.0,
+        );
+        let row = &p.history[2];
+        assert_eq!(row.metrics.len(), MAX_METRICS_PER_EPOCH);
+        assert_eq!(row.metrics["map50"], 0.5, "known ids come first");
+        assert!(!row.metrics.contains_key(&long));
+        assert_eq!(p.map50, Some(0.5));
+        for e in 4..(MAX_HISTORY as u32 + 10) {
+            p.apply(&epoch(e, &[("loss", 1.0)]), 4.0);
+        }
+        assert_eq!(p.history.len(), MAX_HISTORY);
+        assert_eq!(p.history[0].epoch, 10);
+    }
+
+    #[test]
+    fn old_records_without_history_still_load() {
+        let old = r#"{"device":"mps","epoch":1,"epochs":50,"batch":10,"batches":10,"loss":4.19,
+            "val_loss":null,"map50":0.86,"elapsed_s":2117.9,"eta_s":100.0,"phase":null,"losses":[4.19]}"#;
+        let p: TrainProgress = serde_json::from_str(old).unwrap();
+        assert!(p.history.is_empty());
+        assert_eq!(p.best, None);
+        assert_eq!(p.losses, [4.19]);
+        let j = serde_json::to_value(&p).unwrap();
+        assert!(j["history"].as_array().unwrap().is_empty());
+        assert!(j["best"].is_null());
     }
 }

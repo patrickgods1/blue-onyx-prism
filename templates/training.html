@@ -47,7 +47,7 @@
       <td><code>{{ r.name }}</code><br><span class="muted small">{{ r.id }}</span></td>
       <td>{{ r.model }}<br><span class="muted small">{{ r.dataset }}</span></td>
       <td data-field="state">{{ r.state }}</td>
-      <td><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span>{% if !r.log_tail.is_empty() %}<pre class="small tr-log" data-field="log">{{ r.log_tail }}</pre>{% endif %}</td>
+      <td><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span><details class="tr-logbox" data-run="{{ r.id }}"{% if r.log_tail.is_empty() %} hidden{% endif %}><summary>Log</summary><pre class="small tr-log" data-field="log">{{ r.log_tail }}</pre></details></td>
       <td>
         {% if r.busy %}<div class="inline-row"><form method="post" action="/training/pause" class="inline" data-field="pause"{% if r.state != "running" %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Suspend its processes where they are. Models stay loaded and GPU memory stays in use; nothing else on the queue starts until you resume or cancel it.">Pause</button></form>
         <form method="post" action="/training/resume" class="inline" data-field="resume"{% if r.state != "paused" %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Continue exactly where it was paused.">Resume</button></form>
@@ -55,6 +55,7 @@
         {% else %}<form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small">Remove</button></form>{% endif %}
       </td>
     </tr>
+    <tr class="tr-metrics-row" hidden><td colspan="5"><div class="tr-metrics" data-run="{{ r.id }}"></div></td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -440,6 +441,15 @@
           <p class="muted small">Empty = the size's own.</p>
         </div>
         <div class="tr-field">
+          <label for="train-multi-scale">Multi-scale (RF-DETR)</label>
+          <select id="train-multi-scale" name="multi_scale">
+            <option value="auto" selected>auto</option>
+            <option value="on">on</option>
+            <option value="off">off</option>
+          </select>
+          <p class="muted small">Trains at up to about 1.4x the input size for accuracy; auto turns it off when batch 4 would not fit (half the GPU memory).</p>
+        </div>
+        <div class="tr-field">
           <label for="train-lr">Learning rate</label>
           <input type="text" id="train-lr" name="lr">
           <p class="muted small">Empty = the trainer's default.</p>
@@ -484,6 +494,7 @@
         <form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small">Remove from list</button></form>
       </td>
     </tr>
+    <tr class="tr-metrics-row" hidden><td colspan="6"><div class="tr-metrics" data-run="{{ r.id }}"></div></td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -504,6 +515,9 @@
 </dialog>
 <script src="/static/class-picker.js?v={{ version }}"></script>
 <script src="/static/model-picker.js?v={{ version }}"></script>
+<script src="/static/bench-glossary.js?v={{ version }}"></script>
+<script src="/static/bench-charts.js?v={{ version }}"></script>
+<script src="/static/train-metrics.js?v={{ version }}"></script>
 <script src="/static/training.js?v={{ version }}"></script>
 <script src="/static/browse.js?v={{ version }}"></script>
 {% endblock %}

@@ -37,6 +37,46 @@ impl Augment {
     }
 }
 
+/// RF-DETR multi-scale training (rfdetr resizes every batch to one of ~11 sizes up to about
+/// 1.4x the input size, see [`super::estimate::rfdetr_max_side`]): better accuracy, about twice
+/// the memory of the input size alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MultiScale {
+    /// On when the estimate fits a batch of at least [`MULTI_SCALE_MIN_BATCH`] with it on the
+    /// run's GPU, else off ([`TrainRecipe::multi_scale_on`]).
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// Smallest batch `auto` keeps multi-scale training for.
+pub const MULTI_SCALE_MIN_BATCH: u32 = 4;
+
+impl MultiScale {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Some(Self::Auto),
+            "on" | "true" | "1" => Some(Self::On),
+            "off" | "false" | "0" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
 /// One training run's model choice and hyper-parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainRecipe {
@@ -55,6 +95,9 @@ pub struct TrainRecipe {
     pub lr: Option<f32>,
     #[serde(default)]
     pub augment: Augment,
+    /// RF-DETR only (other families ignore it).
+    #[serde(default, skip_serializing_if = "MultiScale::is_auto")]
+    pub multi_scale: MultiScale,
 }
 
 impl TrainRecipe {
@@ -77,7 +120,32 @@ impl TrainRecipe {
             batch: if family == TrainFamily::Rfdetr { 4 } else { 8 },
             lr: None,
             augment: Augment::default(),
+            multi_scale: MultiScale::Auto,
         })
+    }
+
+    /// Whether RF-DETR trains multi-scale on a GPU with `memory_mb` for the estimate (0 =
+    /// unknown): `on` / `off` as set; `auto` = on when the estimate with it on fits a batch of at
+    /// least [`MULTI_SCALE_MIN_BATCH`]. Always false for the other families.
+    pub fn multi_scale_on(&self, memory_mb: u64) -> bool {
+        if self.family != TrainFamily::Rfdetr {
+            return false;
+        }
+        match self.multi_scale {
+            MultiScale::On => true,
+            MultiScale::Off => false,
+            MultiScale::Auto => {
+                memory_mb == 0
+                    || super::estimate::suggest_batch_with(
+                        self.family,
+                        &self.size,
+                        self.imgsz,
+                        memory_mb,
+                        true,
+                    )
+                    .is_some_and(|b| b >= MULTI_SCALE_MIN_BATCH)
+            }
+        }
     }
 
     /// `yolo26n`, `rfdetr-nano`, `rt-detrv2-s`, `dfine-s`.

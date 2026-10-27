@@ -325,7 +325,7 @@ pub(super) fn view(
     let config = state.config_read().clone();
     let dataset_dir = crate::collect::CollectSettings::for_config(&config).dir;
     let imports_dir = config.collect.resolved_review_dir(&config.data_root());
-    let cap: Capability = crate::training::capability_now();
+    let cap: Capability = crate::training::capability_with_runs(&runs(state));
     let paths = TrainPaths::for_config(&config);
     let platform = Platform::current();
     let (env_ready, env_note) = match &cap.accelerator {
@@ -758,6 +758,11 @@ pub(crate) fn requests_from_form(
     let batch: Option<u32> = num(f, "batch", "batch")?;
     let imgsz: Option<u32> = num(f, "imgsz", "input size")?;
     let lr: Option<f32> = num(f, "lr", "learning rate")?;
+    let multi_scale = match field(f, "multi_scale") {
+        Some(v) => recipe::MultiScale::parse(v)
+            .ok_or_else(|| anyhow::anyhow!("multi-scale: '{v}' is not auto, on or off"))?,
+        None => recipe::MultiScale::Auto,
+    };
     let name = field(f, "name").map(str::to_string);
     if name.is_some() && models.len() > 1 {
         anyhow::bail!("a model name works with one ticked model only; clear it or tick one");
@@ -784,6 +789,7 @@ pub(crate) fn requests_from_form(
         });
         r.lr = lr;
         r.augment = augment;
+        r.multi_scale = multi_scale;
         out.push(TrainRequest {
             recipe: r,
             datasets: datasets.clone(),
@@ -867,14 +873,90 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
 /// `GET /v1/training`: capability and runs as JSON (the page's poller).
 pub(super) async fn json(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
-        let cap = crate::training::capability_now();
+        let cap = crate::training::capability_with_runs(&runs(&state));
+        let columns = state.config_read().training.effective_metric_columns();
         Json(serde_json::json!({
             "capability": cap,
             "busy": SERVICE.get().is_some_and(|s| s.busy()),
             "runs": runs(&state),
             "tasks": tasks(&state),
+            "metric_columns": columns,
+            "metrics": crate::training::progress::METRICS,
         }))
         .into_response()
+    })
+    .await
+}
+
+/// Body of `POST /v1/training/metric-columns`.
+#[derive(serde::Deserialize)]
+struct MetricColumnsBody {
+    columns: Vec<String>,
+}
+
+/// A JSON error answer (`{success: false, message}`).
+fn json_fail(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "success": false, "message": message.into() })),
+    )
+        .into_response()
+}
+
+/// `POST /v1/training/metric-columns` with `{columns: ["map", "f2", ...]}`: saves the per-epoch
+/// table's columns (`training.metric_columns`, [`crate::training::config::
+/// validate_metric_columns`]; the default list is stored as empty) and answers the effective
+/// list. 415 without a JSON body, 400 on a bad list.
+pub(super) async fn metric_columns(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
+    if !is_json {
+        return json_fail(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "send the body as JSON (Content-Type: application/json)",
+        );
+    }
+    let b: MetricColumnsBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")),
+    };
+    blocking(move || {
+        use crate::training::config::{DEFAULT_METRIC_COLUMNS, validate_metric_columns};
+        let cols: Vec<String> = b.columns.iter().map(|c| c.trim().to_string()).collect();
+        if cols.is_empty() {
+            return json_fail(
+                StatusCode::BAD_REQUEST,
+                "Not saved: choose at least one column",
+            );
+        }
+        if let Err(e) = validate_metric_columns(&cols) {
+            return json_fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}"));
+        }
+        let stored = if cols == DEFAULT_METRIC_COLUMNS {
+            Vec::new()
+        } else {
+            cols.clone()
+        };
+        let result = save_config(&state, "training page", |c| {
+            c.training.metric_columns.clone_from(&stored);
+            c.training.validate()
+        });
+        match result {
+            Ok(msg) => Json(serde_json::json!({
+                "success": true,
+                "message": msg,
+                "columns": cols,
+            }))
+            .into_response(),
+            Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
+        }
     })
     .await
 }
@@ -885,7 +967,7 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
         let state = shared.current();
         let f = super::dataset::parse_form(&body);
         let config = state.config_read().clone();
-        let cap = crate::training::capability_now();
+        let cap = crate::training::capability_with_runs(&runs(&state));
         let result = (|| -> anyhow::Result<String> {
             let (mut reqs, name) = requests_from_form(&f, &cap, config.training.epochs)?;
             // Only folders the page offers, or ones the file browser may show / picked natively.
@@ -1728,6 +1810,102 @@ mod tests {
 
     /// A running job shows Pause and Cancel, a paused one Resume and Cancel; the JSON says
     /// `paused`; pausing a job that is not on the queue's thread is refused.
+    #[tokio::test]
+    async fn metric_columns_are_listed_saved_and_checked() {
+        use crate::server::test_util::{REMOTE, call, from_peer, get_text, test_state_with};
+        use axum::body::Body;
+        use axum::http::{Request, header};
+        let root = std::env::temp_dir().join(format!("bop-train-cols-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let post = |body: &str| {
+            Request::post("/v1/training/metric-columns")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let json = |b: Vec<u8>| -> serde_json::Value { serde_json::from_slice(&b).unwrap() };
+        let (s, text) = get_text(&state, "/v1/training").await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["metric_columns"],
+            serde_json::json!(["map", "map50", "f1", "f2", "precision", "recall", "loss"])
+        );
+        let metrics = v["metrics"].as_array().unwrap();
+        assert_eq!(metrics.len(), crate::training::progress::METRICS.len());
+        let map = metrics.iter().find(|m| m["id"] == "map").unwrap();
+        assert_eq!(map["label"], "mAP 50-95");
+        assert_eq!(map["short"], "mAP");
+        assert_eq!(map["higher_better"], true);
+        assert_eq!(map["format"], "fixed3");
+
+        // Saved (trimmed), raw names allowed, answered and served.
+        let (s, _, b) = call(
+            &state,
+            post(r#"{"columns": [" f2 ", "map", "val/AP/raccoon"]}"#),
+        )
+        .await;
+        let v = json(b);
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["success"], true);
+        assert_eq!(
+            v["columns"],
+            serde_json::json!(["f2", "map", "val/AP/raccoon"])
+        );
+        assert_eq!(
+            state.config_read().training.metric_columns,
+            ["f2", "map", "val/AP/raccoon"]
+        );
+        let (_, text) = get_text(&state, "/v1/training").await;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["metric_columns"],
+            serde_json::json!(["f2", "map", "val/AP/raccoon"])
+        );
+
+        // Bad lists: 400, nothing changes.
+        let too_many: Vec<String> = (0..21).map(|i| format!("m{i}")).collect();
+        for bad in [
+            r#"{"columns": []}"#.to_string(),
+            r#"{"columns": ["map", ""]}"#.to_string(),
+            r#"{"columns": ["map", "map"]}"#.to_string(),
+            format!(r#"{{"columns": ["{}"]}}"#, "x".repeat(65)),
+            serde_json::json!({ "columns": too_many }).to_string(),
+            r#"{"columns": "map"}"#.to_string(),
+        ] {
+            let (s, _, b) = call(&state, post(&bad)).await;
+            let v = json(b);
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+            assert_eq!(v["success"], false);
+            assert!(v["message"].as_str().is_some_and(|m| !m.is_empty()));
+        }
+        assert_eq!(
+            state.config_read().training.metric_columns,
+            ["f2", "map", "val/AP/raccoon"]
+        );
+        // Not JSON: 415.
+        let form = Request::post("/v1/training/metric-columns")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("columns=map"))
+            .unwrap();
+        let (s, _, _) = call(&state, form).await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        // Admin only: a remote peer is refused.
+        let (s, _, _) = call(&state, from_peer(post(r#"{"columns": ["map"]}"#), REMOTE)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        // The default list is stored as empty (not written to the config file).
+        let (s, _, _) = call(
+            &state,
+            post(r#"{"columns": ["map", "map50", "f1", "f2", "precision", "recall", "loss"]}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(state.config_read().training.metric_columns.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn busy_jobs_show_pause_resume_and_cancel() {
         use crate::server::test_util::{call, get_text, post_form, test_state_with};
