@@ -79,6 +79,10 @@ pub enum TrainCommand {
         /// Learning rate (default: the trainer's).
         #[arg(long)]
         lr: Option<f32>,
+        /// RF-DETR multi-scale training: auto (on when the estimate fits batch 4 with it), on
+        /// (rfdetr's default: batches up to ~1.4x the input size, about twice the memory) or off.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "on", "off"])]
+        multi_scale: String,
         /// Night augmentation preset: darkness 0.5, noise 0.3, grayscale 0.5.
         #[arg(long)]
         night_aug: bool,
@@ -677,6 +681,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             batch,
             imgsz,
             lr,
+            multi_scale,
             night_aug,
             aug_dark,
             aug_noise,
@@ -745,6 +750,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 });
                 r.lr = lr;
                 r.augment = augment;
+                r.multi_scale = recipe::MultiScale::parse(&multi_scale).unwrap_or_default();
                 let req = TrainRequest {
                     recipe: r,
                     datasets: data.datasets.clone(),

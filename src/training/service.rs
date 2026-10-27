@@ -867,6 +867,13 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                 });
             }
             TrainReport::Progress(tp) => inner.update(&id, |r| r.progress = Some(tp.clone())),
+            TrainReport::Batch(b) => {
+                tracing::warn!(run = %id, "out of GPU memory: retrying at batch {b}");
+                inner.update_persist(&id, |r| {
+                    r.request.recipe.batch = b;
+                    r.progress = None;
+                });
+            }
             TrainReport::Prepared(p) => inner.update(&id, |r| {
                 r.dataset = Some(DatasetCounts {
                     classes: p.classes.clone(),

@@ -178,6 +178,13 @@ pub struct SizeFit {
     pub vram_mb: Option<u64>,
     pub epoch_s_per_100: Option<f64>,
     pub latency: &'static str,
+    /// RF-DETR: whether `auto` trains multi-scale here (None for the other families).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_scale: Option<bool>,
+    /// `suggested_batch` comes from the peak memory of an earlier run here
+    /// ([`Capability::apply_measured`]), not the cost table.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub measured: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 }
@@ -279,6 +286,52 @@ impl Capability {
         })
     }
 
+    /// Suggest batches from measured peaks ([`estimate::batch_from_peak`]): for each size at its
+    /// default input size, the newest of `peaks` of the same family, size, input size and
+    /// (RF-DETR) multi-scale setting on this accelerator replaces the table's suggestion.
+    pub fn apply_measured(&mut self, peaks: &[MeasuredPeak]) {
+        let Some(accel) = &self.accelerator else {
+            return;
+        };
+        let (device, mem) = (accel.describe(), accel.memory_mb());
+        if mem == 0 {
+            return;
+        }
+        // MPS: the measured peak is the driver's allocation (with the allocator's cache), the
+        // memory already a conservative share of the RAM: no further 10% slack. CUDA: 90% of the
+        // VRAM, the CUDA context is not in the peak.
+        let budget = match accel {
+            Accelerator::Mps { .. } => mem.saturating_mul(10) / 9,
+            Accelerator::Cuda { .. } => mem,
+        };
+        for f in &mut self.families {
+            for s in &mut f.sizes {
+                if !f.available {
+                    continue;
+                }
+                let Some(p) = peaks.iter().rev().find(|p| {
+                    p.family == f.family
+                        && p.size == s.size
+                        && p.imgsz == s.default_imgsz
+                        && p.device == device
+                        && s.multi_scale.is_none_or(|m| m == p.multi_scale)
+                }) else {
+                    continue;
+                };
+                let Some(cost) = estimate::cost(f.family, s.size) else {
+                    continue;
+                };
+                if let Some(b) = estimate::batch_from_peak(cost.base_mb, p.batch, p.peak_mb, budget)
+                {
+                    s.suggested_batch = Some(b);
+                    s.fits = true;
+                    s.why = None;
+                    s.measured = true;
+                }
+            }
+        }
+    }
+
     /// One line for logs and the CLI.
     pub fn summary(&self) -> String {
         match &self.accelerator {
@@ -289,6 +342,21 @@ impl Capability {
             ),
         }
     }
+}
+
+/// The peak GPU memory one earlier run measured (`mem_gb` of its epochs), for
+/// [`Capability::apply_measured`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeasuredPeak {
+    pub family: TrainFamily,
+    pub size: String,
+    pub imgsz: u32,
+    /// RF-DETR trained multi-scale.
+    pub multi_scale: bool,
+    /// The accelerator's [`Accelerator::describe`].
+    pub device: String,
+    pub batch: u32,
+    pub peak_mb: f64,
 }
 
 /// The by-hand path, appended to "not available" answers.
@@ -469,13 +537,24 @@ fn family_fit(f: TrainFamily, accel: Option<&Accelerator>) -> FamilyFit {
         .map(|&size| {
             let imgsz = f.default_imgsz(size);
             let mem = accel.map_or(0, Accelerator::memory_mb);
-            let batch = if mem > 0 {
-                estimate::suggest_batch(f, size, imgsz, mem)
-            } else {
-                Some(8)
-            };
+            // RF-DETR's `auto` multi-scale: on when it fits batch 4, else off (and the batch
+            // suggested for off).
+            let fits = |ms: bool| estimate::suggest_batch_with(f, size, imgsz, mem, ms);
+            let multi_scale = f == TrainFamily::Rfdetr
+                && (mem == 0
+                    || fits(true).is_some_and(|b| b >= super::recipe::MULTI_SCALE_MIN_BATCH));
+            let batch = if mem > 0 { fits(multi_scale) } else { Some(8) };
             let est = accel.and_then(|a| {
-                estimate::estimate(f, size, imgsz, batch.unwrap_or(1), 100, 1, a.target())
+                estimate::estimate_with(
+                    f,
+                    size,
+                    imgsz,
+                    batch.unwrap_or(1),
+                    100,
+                    1,
+                    a.target(),
+                    multi_scale,
+                )
             });
             let (fits, why) = if !available {
                 (false, None)
@@ -498,6 +577,8 @@ fn family_fit(f: TrainFamily, accel: Option<&Accelerator>) -> FamilyFit {
                 vram_mb: est.map(|e| e.vram_mb),
                 epoch_s_per_100: est.map(|e| e.epoch_s),
                 latency: estimate::latency_hint(f, size),
+                multi_scale: (f == TrainFamily::Rfdetr).then_some(multi_scale),
+                measured: false,
                 why,
             }
         })

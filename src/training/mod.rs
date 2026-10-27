@@ -57,6 +57,54 @@ pub fn capability_now() -> Capability {
     )
 }
 
+/// [`capability_now`] with the batch suggestions of earlier runs' measured peaks
+/// ([`measured_peaks`] of `runs`).
+pub fn capability_with_runs(runs: &[service::RunRecord]) -> Capability {
+    let mut cap = capability_now();
+    let mem = cap
+        .accelerator
+        .as_ref()
+        .map_or(0, capability::Accelerator::memory_mb);
+    cap.apply_measured(&measured_peaks(runs, mem));
+    cap
+}
+
+/// The peak GPU memory of every run that reported `mem_gb` for a finished epoch, oldest first
+/// (by `created`); `memory_mb` resolves RF-DETR's `auto` multi-scale as the run did.
+pub fn measured_peaks(
+    runs: &[service::RunRecord],
+    memory_mb: u64,
+) -> Vec<capability::MeasuredPeak> {
+    let mut v: Vec<(&str, capability::MeasuredPeak)> = runs
+        .iter()
+        .filter_map(|r| {
+            let peak = r
+                .progress
+                .as_ref()?
+                .history
+                .iter()
+                .filter_map(|p| p.metrics.get("mem_gb").copied())
+                .filter(|g| g.is_finite() && *g > 0.0)
+                .fold(None, |m: Option<f64>, g| Some(m.map_or(g, |m| m.max(g))))?;
+            let recipe = &r.request.recipe;
+            Some((
+                r.created.as_str(),
+                capability::MeasuredPeak {
+                    family: recipe.family,
+                    size: recipe.size.clone(),
+                    imgsz: recipe.imgsz,
+                    multi_scale: recipe.multi_scale_on(memory_mb),
+                    device: r.device.clone(),
+                    batch: recipe.batch,
+                    peak_mb: peak * 1024.0,
+                },
+            ))
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(b.0));
+    v.into_iter().map(|(_, p)| p).collect()
+}
+
 /// The training folder of `config`.
 pub fn training_dir(config: &Config) -> PathBuf {
     config.training.dir_in(&config.data_root())
@@ -125,14 +173,15 @@ pub fn check_public_download(root: &Path, allowed: bool) -> Result<()> {
     )
 }
 
-/// Data loader workers: none on macOS (spawned workers re-import the script; MPS runs were
-/// smoke-tested without), else half the cores, at most 4.
+/// Data loader workers: none on macOS (measured on an M1: 2 or 4 spawned workers did not speed
+/// up RF-DETR nano, which is GPU-bound there, and Ultralytics uses none on MPS; docs/TRAINING.md),
+/// else all cores but one, at most 8 (CUDA GPUs outrun one decoding thread).
 fn workers() -> u32 {
     if cfg!(target_os = "macos") {
         return 0;
     }
     let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
-    u32::try_from((cpus / 2).clamp(1, 4)).unwrap_or(2)
+    u32::try_from(cpus.saturating_sub(1).clamp(1, 8)).unwrap_or(2)
 }
 
 /// Build the job of `request` on `config` and `cap` (see the checks below; `request.gpu` picks
@@ -253,6 +302,70 @@ mod tests {
             &HardwareInfo::new("macos", "aarch64", vec![apple_gpu("Apple M1")]),
             Some(16.0),
         )
+    }
+
+    /// A run record of `recipe` on `device` whose epochs peaked at `mem_gb`.
+    fn record(
+        created: &str,
+        recipe: &TrainRecipe,
+        device: &str,
+        mem_gb: &[f64],
+    ) -> service::RunRecord {
+        let history: Vec<serde_json::Value> = mem_gb
+            .iter()
+            .enumerate()
+            .map(|(i, g)| serde_json::json!({"epoch": i + 1, "elapsed_s": 1.0, "metrics": {"mem_gb": g}}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": created, "name": "x", "created": created,
+            "request": {"recipe": recipe, "datasets": []},
+            "device": device, "state": "done", "stage": null, "step": 8, "steps": 8, "percent": 100,
+            "detail": "", "progress": {"history": history}, "run_dir": "/tmp/x"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn measured_peaks_replace_the_table_batch() {
+        let mut cap = mac();
+        let accel = cap.accelerator.clone().unwrap();
+        let dev = accel.describe();
+        let size = |c: &Capability| {
+            c.family(TrainFamily::Rfdetr)
+                .unwrap()
+                .sizes
+                .iter()
+                .find(|s| s.size == "nano")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(size(&cap).suggested_batch, Some(4));
+        assert!(!size(&cap).measured);
+        let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano", 1).unwrap();
+        r.batch = 4;
+        let mut other = r.clone();
+        other.imgsz = 448;
+        let runs = vec![
+            // Newest of the matching ones wins: 3 GB at batch 4 -> 16.
+            record("2026-10-27T10:00:00Z", &r, &dev, &[2.0, 3.0]),
+            record("2026-10-26T10:00:00Z", &r, &dev, &[7.0]),
+            // Other input size, other GPU, no memory reported: ignored.
+            record("2026-10-28T10:00:00Z", &other, &dev, &[0.5]),
+            record("2026-10-28T11:00:00Z", &r, "NVIDIA X (cuda:0)", &[0.5]),
+            record("2026-10-28T12:00:00Z", &r, &dev, &[]),
+        ];
+        let peaks = measured_peaks(&runs, accel.memory_mb());
+        assert_eq!(peaks.len(), 4);
+        assert_eq!(peaks[0].peak_mb, 7.0 * 1024.0);
+        assert!(peaks[0].multi_scale);
+        cap.apply_measured(&peaks);
+        let s = size(&cap);
+        assert!(s.measured);
+        assert_eq!(s.suggested_batch, Some(16));
+        // Without runs the table stays.
+        let mut cap = mac();
+        cap.apply_measured(&[]);
+        assert!(!size(&cap).measured);
     }
 
     fn request(family: TrainFamily, size: &str) -> TrainRequest {

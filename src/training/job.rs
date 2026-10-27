@@ -173,6 +173,9 @@ pub enum TrainReport<'a> {
     Line(&'a str),
     Progress(&'a TrainProgress),
     Prepared(&'a Prepared),
+    /// The trainer ran out of GPU memory early and the run restarts at this batch
+    /// ([`OOM_RETRIES`]); the run record keeps the batch it finishes with.
+    Batch(u32),
 }
 
 /// The installed model.
@@ -265,6 +268,17 @@ pub const LOG_FILE: &str = "train.log";
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 /// Timeout of the self-check.
 const SELF_CHECK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Restarts of a run that ran out of GPU memory, each at half the batch (down to 1).
+pub const OOM_RETRIES: u32 = 3;
+/// Only an out-of-memory failure before this many finished epochs is retried (later, the batch
+/// had fitted; restarting would throw away the epochs).
+pub const OOM_RETRY_EPOCHS: usize = 3;
+/// MPS allocator limits on macOS (ratios of the recommended working set; see
+/// `scripts/train_model.py` `main`): an oversized batch fails in seconds instead of swapping.
+pub const MPS_WATERMARKS: [(&str, &str); 2] = [
+    ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0"),
+    ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.8"),
+];
 
 /// Run every stage of `job` (see the module docs).
 pub fn run_training(
@@ -597,90 +611,150 @@ fn stages(
                 .file_name,
         ),
     };
-    let mut args: Vec<OsString> = vec![
-        train_script.into_os_string(),
-        "--trainer".into(),
-        trainer.into(),
-        "--family".into(),
-        family.as_str().into(),
-        "--size".into(),
-        recipe.size.clone().into(),
-        "--name".into(),
-        job.name.clone().into(),
-        "--weights".into(),
-        weights_arg.into_os_string(),
-        "--data".into(),
-        data_dir.clone().into_os_string(),
-        "--imgsz".into(),
-        recipe.imgsz.to_string().into(),
-        "--epochs".into(),
-        recipe.epochs.to_string().into(),
-        "--batch".into(),
-        recipe.batch.to_string().into(),
-        "--device".into(),
-        job.accelerator.device_arg().into(),
-        "--workers".into(),
-        job.workers.to_string().into(),
-        "--seed".into(),
-        job.options.seed.to_string().into(),
-        "--aug-dark".into(),
-        recipe.augment.dark.to_string().into(),
-        "--aug-noise".into(),
-        recipe.augment.noise.to_string().into(),
-        "--aug-gray".into(),
-        recipe.augment.gray.to_string().into(),
-        "--out-dir".into(),
-        staging.clone().into_os_string(),
-        "--work".into(),
-        work.clone().into_os_string(),
-        "--export-script".into(),
-        export_script.into_os_string(),
-    ];
-    if let Some(lr) = recipe.lr {
-        args.push("--lr".into());
-        args.push(lr.to_string().into());
-    }
-    let cmd = env::train_python_cmd(
-        paths,
-        job.platform,
-        Stage::Export,
-        &job.run_dir,
-        job.timeout,
-        args,
-    );
-    let started = Instant::now();
-    let mut tp = TrainProgress::default();
-    let mut done: Option<TrainEvent> = None;
-    let res = runner.run(
-        &cmd,
-        &mut |l| {
-            log.line(l);
-            match progress::parse_line(l) {
-                Some(ev @ TrainEvent::Done { .. }) => done = Some(ev),
-                Some(ev) => {
-                    tp.apply(&ev, started.elapsed().as_secs_f64());
-                    let pct = super::estimate::to_u64(tp.fraction() * 100.0).min(100);
-                    let d = tp.describe();
-                    report(TrainReport::Stage {
-                        stage: TrainStage::Train,
-                        percent: u8::try_from(pct).unwrap_or(100),
-                        detail: &d,
-                    });
-                    report(TrainReport::Progress(&tp));
+    // RF-DETR's multi-scale training (`auto`: on when the estimate fits batch 4 with it).
+    let multi_scale = recipe.multi_scale_on(job.accelerator.memory_mb());
+    let train_args = |batch: u32| -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec![
+            train_script.clone().into_os_string(),
+            "--trainer".into(),
+            trainer.into(),
+            "--family".into(),
+            family.as_str().into(),
+            "--size".into(),
+            recipe.size.clone().into(),
+            "--name".into(),
+            job.name.clone().into(),
+            "--weights".into(),
+            weights_arg.clone().into_os_string(),
+            "--data".into(),
+            data_dir.clone().into_os_string(),
+            "--imgsz".into(),
+            recipe.imgsz.to_string().into(),
+            "--epochs".into(),
+            recipe.epochs.to_string().into(),
+            "--batch".into(),
+            batch.to_string().into(),
+            "--device".into(),
+            job.accelerator.device_arg().into(),
+            "--workers".into(),
+            job.workers.to_string().into(),
+            "--seed".into(),
+            job.options.seed.to_string().into(),
+            "--aug-dark".into(),
+            recipe.augment.dark.to_string().into(),
+            "--aug-noise".into(),
+            recipe.augment.noise.to_string().into(),
+            "--aug-gray".into(),
+            recipe.augment.gray.to_string().into(),
+            "--out-dir".into(),
+            staging.clone().into_os_string(),
+            "--work".into(),
+            work.clone().into_os_string(),
+            "--export-script".into(),
+            export_script.clone().into_os_string(),
+        ];
+        if let Some(lr) = recipe.lr {
+            args.push("--lr".into());
+            args.push(lr.to_string().into());
+        }
+        if family == TrainFamily::Rfdetr {
+            args.push("--multi-scale".into());
+            args.push(if multi_scale { "on" } else { "off" }.into());
+        }
+        args
+    };
+    let mut batch = recipe.batch;
+    let mut retries = 0;
+    let mut note: Option<String> = None;
+    let (res, done) = loop {
+        let mut cmd = env::train_python_cmd(
+            paths,
+            job.platform,
+            Stage::Export,
+            &job.run_dir,
+            job.timeout,
+            train_args(batch),
+        );
+        if matches!(job.accelerator, Accelerator::Mps { .. }) {
+            for (k, v) in MPS_WATERMARKS {
+                // A value in the service's own environment wins (e.g. 0.0 = no limit).
+                if std::env::var_os(k).is_none() {
+                    cmd.env.push((k.to_string(), v.into()));
                 }
-                None => report(TrainReport::Line(l)),
             }
-        },
-        cancel,
-    );
+        }
+        let started = Instant::now();
+        let mut tp = TrainProgress {
+            note: note.clone(),
+            ..TrainProgress::default()
+        };
+        let mut done: Option<TrainEvent> = None;
+        let res = runner.run(
+            &cmd,
+            &mut |l| {
+                log.line(l);
+                match progress::parse_line(l) {
+                    Some(ev @ TrainEvent::Done { .. }) => done = Some(ev),
+                    Some(ev) => {
+                        tp.apply(&ev, started.elapsed().as_secs_f64());
+                        let pct = super::estimate::to_u64(tp.fraction() * 100.0).min(100);
+                        let d = tp.describe();
+                        report(TrainReport::Stage {
+                            stage: TrainStage::Train,
+                            percent: u8::try_from(pct).unwrap_or(100),
+                            detail: &d,
+                        });
+                        report(TrainReport::Progress(&tp));
+                    }
+                    None => report(TrainReport::Line(l)),
+                }
+            },
+            cancel,
+        );
+        let oom = res.as_ref().err().is_some_and(|e| {
+            e.downcast_ref::<crate::resources::export::ChildFailed>()
+                .is_some_and(|c| out_of_memory_line(&c.lines).is_some())
+        });
+        if oom
+            && !cancel.load(Ordering::Relaxed)
+            && retries < OOM_RETRIES
+            && batch > 1
+            && tp.history.len() < OOM_RETRY_EPOCHS
+        {
+            let next = (batch / 2).max(1);
+            let msg = format!("out of GPU memory at batch {batch}, retrying with batch {next}");
+            tracing::warn!("training {}: {msg}", job.id);
+            log.line(&format!("# {msg}"));
+            report(TrainReport::Line(&msg));
+            report(TrainReport::Batch(next));
+            report(TrainReport::Stage {
+                stage: TrainStage::Train,
+                percent: 0,
+                detail: &msg,
+            });
+            let _ = manager::remove_any(&work);
+            manager::remove_any(&staging)?;
+            std::fs::create_dir_all(&staging)
+                .with_context(|| format!("creating {}", staging.display()))?;
+            batch = next;
+            retries += 1;
+            note = Some(msg);
+            continue;
+        }
+        break (res, done);
+    };
     if !job.keep_work {
         let _ = manager::remove_any(&work);
     }
+    let finished_recipe = TrainRecipe {
+        batch,
+        ..recipe.clone()
+    };
     if let Err(e) = res {
         let _ = manager::remove_any(&staging);
         if let Some(why) = e
             .downcast_ref::<crate::resources::export::ChildFailed>()
-            .and_then(|c| classify_train_failure(&c.lines, recipe))
+            .and_then(|c| classify_train_failure(&c.lines, &finished_recipe))
         {
             return Err(e.context(why));
         }
@@ -716,6 +790,7 @@ fn stages(
     enter!(TrainStage::Install, 0, "checking the output");
     let installed = install(
         job,
+        &finished_recipe,
         &staging,
         &prepared,
         base,
@@ -759,6 +834,21 @@ fn stages(
     })
 }
 
+/// The last line of `lines` that reports the GPU out of memory, if any.
+pub fn out_of_memory_line(lines: &[String]) -> Option<&String> {
+    const PATTERNS: [&str; 5] = [
+        "CUDA out of memory",
+        "MPS backend out of memory",
+        "torch.OutOfMemoryError",
+        "CUBLAS_STATUS_ALLOC_FAILED",
+        "cudaErrorMemoryAllocation",
+    ];
+    lines
+        .iter()
+        .rev()
+        .find(|l| PATTERNS.iter().any(|p| l.contains(p)))
+}
+
 /// The likely cause and next action of a failed training from its last output lines, for the
 /// failures the export's classifier does not know (GPU memory, an empty or broken dataset).
 pub fn classify_train_failure(lines: &[String], recipe: &TrainRecipe) -> Option<String> {
@@ -768,13 +858,7 @@ pub fn classify_train_failure(lines: &[String], recipe: &TrainRecipe) -> Option<
             .rev()
             .find(|l| pats.iter().any(|p| l.contains(p)))
     };
-    if let Some(l) = has(&[
-        "CUDA out of memory",
-        "MPS backend out of memory",
-        "torch.OutOfMemoryError",
-        "CUBLAS_STATUS_ALLOC_FAILED",
-        "cudaErrorMemoryAllocation",
-    ]) {
+    if let Some(l) = out_of_memory_line(lines) {
         return Some(format!(
             "the GPU ran out of memory ({}): train again with a smaller batch (now {}) or input \
              size (now {}), or a smaller model size; close other programs that use the GPU",
@@ -840,8 +924,10 @@ pub struct BaseWeights {
     pub files: Vec<(String, String)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install(
     job: &TrainJob,
+    recipe: &TrainRecipe,
     staging: &Path,
     prepared: &Prepared,
     base: &Resource,
@@ -870,7 +956,6 @@ fn install(
             prepared.classes
         );
     }
-    let recipe = &job.request.recipe;
     let fam = recipe.family;
     let prov = Provenance {
         version: 1,

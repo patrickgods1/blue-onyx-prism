@@ -229,6 +229,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ),
         ("/training", get(training::page)),
         ("/v1/training", get(training::json)),
+        (
+            "/v1/training/metric-columns",
+            post(training::metric_columns).layer(DefaultBodyLimit::max(16 * 1024)),
+        ),
         ("/training/queue", post(training::queue)),
         ("/training/cancel", post(training::cancel)),
         ("/training/pause", post(training::pause)),
@@ -1028,6 +1032,7 @@ mod tests {
             "/v1/review/folder",
             "/training",
             "/v1/training",
+            "/v1/training/metric-columns",
             "/training/queue",
             "/training/cancel",
             "/training/pause",

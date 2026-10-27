@@ -23,6 +23,11 @@ pub const MAX_OVERSAMPLE: u32 = 10;
 pub const DEFAULT_TIMEOUT_HOURS: u32 = 48;
 /// Most hours of a run.
 pub const MAX_TIMEOUT_HOURS: u32 = 24 * 14;
+/// The Training page's per-epoch table columns when `metric_columns` is empty.
+pub const DEFAULT_METRIC_COLUMNS: [&str; 7] =
+    ["map", "map50", "f1", "f2", "precision", "recall", "loss"];
+/// Most columns of the per-epoch table.
+pub const MAX_METRIC_COLUMNS: usize = 20;
 
 /// `training` in the config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -50,6 +55,11 @@ pub struct TrainingConfig {
     /// the built-in ones of that class (MM-Grounding-DINO prompts, SigLIP species prompts).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub synonyms: std::collections::BTreeMap<String, Vec<String>>,
+    /// Columns of the Training page's per-epoch metrics table, in order: metric ids
+    /// (`map`, `f2`, ... see `progress::METRICS`) or a trainer's raw metric names. Empty = the
+    /// default ([`DEFAULT_METRIC_COLUMNS`]). Applies at once.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metric_columns: Vec<String>,
 }
 
 impl Default for TrainingConfig {
@@ -63,6 +73,7 @@ impl Default for TrainingConfig {
             oversample: DEFAULT_OVERSAMPLE,
             timeout_hours: DEFAULT_TIMEOUT_HOURS,
             synonyms: std::collections::BTreeMap::new(),
+            metric_columns: Vec::new(),
         }
     }
 }
@@ -78,6 +89,18 @@ impl TrainingConfig {
             Some(d) if d.is_absolute() => d.clone(),
             Some(d) => root.join(d),
             None => root.join(DEFAULT_DIR_NAME),
+        }
+    }
+
+    /// The per-epoch table's columns: `metric_columns`, else the default.
+    pub fn effective_metric_columns(&self) -> Vec<String> {
+        if self.metric_columns.is_empty() {
+            DEFAULT_METRIC_COLUMNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            self.metric_columns.clone()
         }
     }
 
@@ -120,6 +143,7 @@ impl TrainingConfig {
                 crate::collect::config::MAX_CLASSES
             );
         }
+        validate_metric_columns(&self.metric_columns)?;
         for (class, phrases) in &self.synonyms {
             let ok = |s: &str| {
                 !s.trim().is_empty()
@@ -136,6 +160,37 @@ impl TrainingConfig {
         }
         Ok(())
     }
+}
+
+/// Check a `metric_columns` list: at most [`MAX_METRIC_COLUMNS`] distinct names of 1 to
+/// [`super::progress::MAX_METRIC_KEY`] characters without control characters (a known metric id
+/// or a trainer's raw metric name).
+pub fn validate_metric_columns(cols: &[String]) -> anyhow::Result<()> {
+    if cols.len() > MAX_METRIC_COLUMNS {
+        anyhow::bail!(
+            "training.metric_columns has {} entries; choose at most {MAX_METRIC_COLUMNS}",
+            cols.len()
+        );
+    }
+    let max = super::progress::MAX_METRIC_KEY;
+    for (i, c) in cols.iter().enumerate() {
+        if c.trim().is_empty() || c.trim() != c {
+            anyhow::bail!(
+                "training.metric_columns has an empty name or one with surrounding spaces"
+            );
+        }
+        if c.chars().count() > max || c.chars().any(char::is_control) {
+            anyhow::bail!(
+                "training.metric_columns: '{}' is not a metric name (1 to {max} characters, \
+                 no control characters)",
+                c.escape_debug()
+            );
+        }
+        if cols.iter().take(i).any(|x| x == c) {
+            anyhow::bail!("training.metric_columns lists '{c}' twice");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -174,6 +229,48 @@ mod tests {
             bad(|c| c.synonyms = [("raccoon".to_string(), vec!["a. b".to_string()])].into())
                 .contains("training.synonyms")
         );
+        assert!(bad(|c| c.metric_columns = vec![String::new()]).contains("metric_columns"));
+        assert!(bad(|c| c.metric_columns = vec!["x".repeat(65)]).contains("metric_columns"));
+        assert!(bad(|c| c.metric_columns = vec!["a\nb".into()]).contains("metric_columns"));
+        assert!(bad(|c| c.metric_columns = vec!["f2".into(), "f2".into()]).contains("twice"));
+        assert!(
+            bad(|c| c.metric_columns = (0..21).map(|i| format!("m{i}")).collect())
+                .contains("at most 20")
+        );
+    }
+
+    #[test]
+    fn metric_columns_default_round_trip_and_take_raw_names() {
+        let mut c = TrainingConfig::default();
+        assert_eq!(
+            c.effective_metric_columns(),
+            ["map", "map50", "f1", "f2", "precision", "recall", "loss"]
+        );
+        // Not written while empty.
+        assert!(
+            !serde_json::to_string(&c)
+                .unwrap()
+                .contains("metric_columns")
+        );
+        c.metric_columns = vec![
+            "f2".into(),
+            "val/AP/raccoon".into(),
+            "metrics/mAP50(B)".into(),
+        ];
+        c.validate().unwrap();
+        let text = serde_json::to_string(&c).unwrap();
+        let back: TrainingConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.effective_metric_columns(), c.metric_columns);
+        // Every known id is a valid column.
+        let ids: Vec<String> = crate::training::progress::METRICS
+            .iter()
+            .take(MAX_METRIC_COLUMNS)
+            .map(|m| m.id.to_string())
+            .collect();
+        validate_metric_columns(&ids).unwrap();
+        for d in DEFAULT_METRIC_COLUMNS {
+            assert!(crate::training::progress::metric(d).is_some(), "{d}");
+        }
     }
 
     /// Every `training.*` key has a row in the README's configuration table.
@@ -184,6 +281,7 @@ mod tests {
         let c = TrainingConfig {
             dir: Some("x".into()),
             synonyms: [("raccoon".to_string(), vec!["raccoon".to_string()])].into(),
+            metric_columns: vec!["map".into()],
             ..TrainingConfig::default()
         };
         let v = serde_json::to_value(c).unwrap();

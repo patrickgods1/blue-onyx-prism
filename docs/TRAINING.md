@@ -270,9 +270,20 @@ Stages (page and `train run` show them with percent and ETA):
 4. **dataset**: assembled as above.
 5. **train**: `train_model.py` trains, then exports and checks the ONNX. Progress: every event is one
    stdout line `@train {json}` (`start`, `batch`, `epoch` with loss and validation mAP50 where the
-   trainer reports it, `eval`, `phase`, `done`); everything else goes to `<run>/train.log` (capped
+   trainer reports it, `eval`, `phase`, `done`; `epoch` / `eval` also carry every scalar metric, see
+   [Metrics per epoch](#metrics-per-epoch)); everything else goes to `<run>/train.log` (capped
    at 20 MB). Out of GPU memory, missing kernels and unusable images get their own messages (lower the
-   batch or input size, ...); other failures go through the export's classifier.
+   batch or input size, ...); other failures go through the export's classifier. **Out of GPU memory
+   before 3 finished epochs** restarts the training at half the batch (down to 1, at most 3 restarts):
+   the log, the stage text and `describe()` say "out of GPU memory at batch 16, retrying with batch 8",
+   and the run record and the provenance keep the batch that trained. RF-DETR keeps its effective batch
+   16 through gradient accumulation (`grad_accum_steps = 16 / batch`), so a smaller batch only costs
+   speed. On macOS the trainer runs with `PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0` and
+   `PYTORCH_MPS_LOW_WATERMARK_RATIO=0.8` (unless the service's environment sets them): MPS may
+   otherwise allocate 1.7x its recommended working set, more than the RAM of a 16 GB Mac, and an
+   oversized batch then swaps for half an hour before it fails (run `20261027-071956-7f1c`: RF-DETR
+   nano 384, batch 16, 35 min for 148 images, then out of memory). With the cap, batch 16 fails in
+   about a minute and the retry takes over.
 6. **install**: `<name>.onnx`, `<name>.yaml` (the class names) and `<name>.provenance.json` into the
    models folder, or the folder given in *Install the model in* / `--install-dir` (relative = under the
    data root; the page accepts a browsable folder or one picked in the native dialog). The config entry,
@@ -320,11 +331,70 @@ offered it (`training.datasets` or an export under `<training dir>/exports`); an
 chosen model's `night_model` (IR and dark frames go to the trained model); *verifier of* sets its
 `verify` model. All go through the config page's save path and apply at once.
 
+### Metrics per epoch
+
+Each `epoch` and `eval` event has `metrics`: every scalar the trainer reports for the epoch under its
+own key, plus the script's own:
+
+| Trainer | Keys (examples) |
+|---|---|
+| RF-DETR (rfdetr 1.11 Lightning `callback_metrics`) | `val/mAP_50_95`, `val/mAP_50`, `val/mAP_75`, `val/mAR` (the EMA model by default), `val/ema_*`, `val/F1`, `val/precision`, `val/recall` (at the best macro-F1 confidence), `train/loss`, `train/lr`, `train/loss_ce`, ... |
+| Ultralytics (`trainer.metrics`, `tloss`, `lr`) | `metrics/mAP50-95(B)`, `metrics/mAP50(B)`, `metrics/precision(B)`, `metrics/recall(B)`, `val/box_loss`, `train/cls_loss`, `lr/pg0`, ...; `val_loss` = the sum of the `val/*_loss` |
+| transformers (RT-DETRv2, D-FINE) | `eval_loss`, `learning_rate`, and a detection evaluation after each `evaluate` (an extra pass over the validation split): mAP 50-95 / 50 / 75 and mAR@100 with torchmetrics (COCO rules), P / R / F-beta from a greedy IoU-0.5 matching swept over 101 confidences |
+| all (the script) | `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`, `f0_5`, `f0_5_thr`, ...: macro F-beta (`(1+b^2)PR/(b^2P+R)` per class, averaged over the classes with ground truth) at the best confidence of the sweep (rfdetr's own 101-threshold rows, Ultralytics' `p_curve` / `r_curve`); `mem_gb` (peak GPU memory: CUDA `max_memory_reserved`, MPS the driver's allocation sampled after every batch); `img_s` (training images per second, validation excluded) |
+
+F2 weighs recall four times precision ("don't miss a person"), F0.5 the other way; the `*_thr` columns
+are a starting confidence threshold for the trained model. NaN, infinite and non-numeric values are
+dropped; at most 64 metrics per epoch (the shortest keys first).
+
+The service maps the keys to stable ids (`src/training/progress.rs` `canonical`): `map`, `map50`,
+`map75`, `mar`, `precision`, `recall`, `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`,
+`f0_5`, `f0_5_thr`, `loss`, `val_loss`, `lr`, `mem_gb`, `img_s`, and `ema_map` ... for rfdetr's
+`val/ema_*`; unknown keys keep their raw name (`val/AP/raccoon`, `train/loss_ce`), so nothing is lost
+when a library renames one. Each run's `progress` in `runs.json` and `GET /v1/training` has
+`history` (one point per epoch: `epoch`, `elapsed_s`, `metrics`; an `eval` event fills its epoch's
+point; at most 1000 points) and `best` (`{metric, epoch, value}` on `map`, else `map50`, else the
+lowest `val_loss`), which the stage text shows as "best mAP50-95 0.711 @ epoch 3". `GET /v1/training`
+also has `metrics` (label, short label, `higher_better`, `format` of every id) and `metric_columns`.
+Records written before this keep loading (no `history`: the page shows no metrics block).
+
+**The metrics view** (Training page, every run with a history, running or finished): KPI tiles
+(epoch, ETA, best primary metric with its epoch, latest loss and validation loss with the change
+from the previous epoch), curves of the losses and of the quality metrics with the best epoch marked,
+and a per-epoch table, newest first. **Columns** picks the table's columns from every metric in the
+run's history (known ids by label, raw keys by name) and their order; the choice is saved as
+`training.metric_columns` (`POST /v1/training/metric-columns` with `{"columns": [...]}`: at most 20
+distinct names of 1-64 characters, known ids or raw names; answers the saved list, 400 otherwise) and
+applies at once. Empty (the default) = `map, map50, f1, f2, precision, recall, loss`. The raw trainer
+log is under a closed *Log* disclosure.
+
 ## Estimates
 
 The page and `train estimate` show GPU memory and time per epoch from a small table
-(`src/training/estimate.rs`): `vram = base + per_image x batch x (imgsz / default)^2` MB,
-`epoch = images / (images per second x GPU factor) x (imgsz / default)^2`, images per second for a GTX
+(`src/training/estimate.rs`): `vram = base + per_image x batch x (side / default)^2` MB, where `side`
+is the input size, except for RF-DETR trained multi-scale: rfdetr (`multi_scale="per-batch"`,
+`expanded_scales=True`) resizes every sample to its largest scale `(imgsz / (patch x windows) + 5) x
+patch x windows` (nano 384 -> 544, small 512 -> 672, medium 576 -> 736, base 560 -> 840, large 704
+-> 864), so its memory follows that side (about twice the input size's). RF-DETR nano's per-image cost
+(650 MB at 384 px) is calibrated on the run that ran out of memory on a 16 GB M1 (batch 16 needed over
+20.4 GB; the estimate now says 22.4 GB) and on the measurements below; a 16 GB Mac now gets batch 4
+suggested instead of 16. The other RF-DETR sizes keep their constants, now scaled by their multi-scale
+side, so their estimates rose 1.5-2.25x (conservative until measured).
+
+**RF-DETR multi-scale** (`multi_scale` in the recipe: page form field `multi_scale`, `train run
+--multi-scale auto|on|off`, script `--multi-scale on|off`): `auto` (default) keeps rfdetr's
+multi-scale training when the estimate fits batch 4 or more with it, else trains at the input size
+only (`multi_scale=False`), which halves the memory; `GET /v1/training` shows the choice per size
+(`multi_scale` of each RF-DETR size). Multi-scale is an augmentation: off may cost some accuracy.
+
+**Measured batches.** Once a run reported `mem_gb`, the suggested batch of that family, size and
+default input size (and RF-DETR multi-scale setting) on the same GPU comes from the measured peak
+(`measured: true` in `GET /v1/training`): linear in the batch above the table's fixed part (at most
+half the peak), 90% of the VRAM on CUDA, the whole MPS share on a Mac (the driver's allocation
+includes the allocator's cache, the share is already 60% of the RAM against PyTorch's own 74%).
+
+Time: `epoch = images / (images per second x GPU factor) x (imgsz / default)^2`, images per second
+for a GTX
 1080-class card (or an M1), the GPU factor by generation (Volta 2.0, Turing 1.6, A100 4.0, Ampere
 consumer 2.2, Ada 3.2, Hopper 6.0, Blackwell 4.5). The M1 numbers of yolo26n, rfdetr-nano and
 rt-detrv2-s come from the smoke runs above; everything else is a round number from public reports,
@@ -332,6 +402,43 @@ good to a factor of about 1.5. The suggested batch is the largest power of two w
 of the memory (capped at 16 when not given). The inference hint (light / medium / heavy) is the size
 class on the service's devices: nano / small run on a CPU or a UHD 630; medium and up want a discrete
 GPU; the benchmark at the end of the run measures it.
+
+### Speed and memory on an M1 (measured)
+
+Apple M1, 16 GB, macOS, PyTorch 2.14.0 (MPS), rfdetr 1.11.2, Ultralytics 8.4.163; the dataset of run
+`20261027-071956-7f1c` (148 training, 17 validation images, 17 classes). `train_model.py` run directly
+for 2-3 epochs (`img_s` and `mem_gb` from its epoch events; epoch time includes the validation). One
+run per row; repeats of the baseline varied by about 4% in `img_s`.
+
+| Change (RF-DETR nano, 384, batch 4) | Epoch time | `img_s` (epoch 1 / 2) | Peak `mem_gb` (epoch 1 / 2) | Adopted |
+|---|---|---|---|---|
+| Baseline: workers 0, multi-scale on, fp16 AMP | 86-90 s | 1.90-1.95 / 1.84-1.86 | 6.5 / 8.0-9.0 | - |
+| 2 data loader workers (`spawn`, persistent) | 85-91 s | 1.96 / 1.94 | 6.5 / 9.0 | no: within noise (GPU-bound) |
+| 4 workers | 85-93 s | 1.95 / 1.94 | 6.5 / 8.0 | no |
+| Multi-scale off (384 px only) | 84 s | 1.98 / 1.98 | 3.9 / 3.8 | as `auto` when batch 4 does not fit |
+| AMP off (fp32) | 88 s | 1.92 / 1.88 | 7.5 / 9.9 | no: no faster, more memory |
+| AMP bf16 | - | - | - | n/a: rfdetr keeps fp16 on MPS (warns) |
+| No `gc.collect()` + `empty_cache()` after validation | 87-89 s | 1.94 / 1.86 | 6.5 / 9.2 | kept the release (0.2-1.2 GB lower in epoch 2, same speed) |
+| Batch 16 (the failed run's), MPS cap 1.0 | - | - | out of memory after 52 s | the cap: fails fast instead of swapping 35 min |
+| Batch 8, MPS cap 1.0 | 86 s (through the CLI) | 1.97 | 11.4 (one run ran out of memory after 87 s) | batch 4 suggested |
+
+| Change (YOLO26n, 640, batch 16) | Epoch time (epochs 2-3) | `img_s` | Peak `mem_gb` | Adopted |
+|---|---|---|---|---|
+| Baseline: no image cache | 15.8 s | 11.0 | 5.4 | - |
+| `cache="ram"` (0.17 GB for 148 images) | 14.7-14.9 s | 11.5 | 5.4 | yes: `--cache auto` when the decoded set fits a quarter of the free RAM |
+| 2 workers | 15.7 s | 11.0 | 5.4 | n/a: Ultralytics uses no workers on MPS |
+
+Through the CLI (`train run --model rfdetr-nano --batch 16 --epochs 1`, debug build): out of memory
+at batch 16 after about a minute, retried at batch 8, trained (11.4 GB peak, 1.97 img/s, mAP50-95
+0.71) and exported: 2 min 48 s in total, against 35 min of swapping and a failure before.
+`train run --model rt-detrv2-s --epochs 2`: the detection evaluation added mAP 0.58 / 0.68, F2 0.62
+/ 0.82, 2.3-2.5 img/s, 7.1 GB.
+
+Not measurable here (no NVIDIA GPU), implemented behind the capability checks and unmeasured: TF32
+matmuls and cuDNN convolutions on compute capability 8.0+, `cudnn.benchmark` for Ultralytics (fixed
+input size), transformers `bf16` instead of `fp16` on 8.0+, `pin_memory` and persistent workers on
+CUDA, and Linux / Windows data loader workers raised from half the cores (at most 4) to all cores but
+one (at most 8).
 
 ## Footage import
 

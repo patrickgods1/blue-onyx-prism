@@ -367,6 +367,81 @@
       if (st && isBusy(st.textContent)) busy[tr.dataset[p[1]]] = true;
     });
   });
+
+  // Metrics (curves, per-epoch table, columns) of the runs that report a history: rendered on
+  // load for every run (finished ones too) and again when the history, batch or columns change.
+  var metricsState = { columns: [], metrics: [], data: null };
+  function logBoxes() {
+    // The Log <details> keeps its open state per run for this tab.
+    document.querySelectorAll("details.tr-logbox").forEach(function (d) {
+      var key = "prism.training.log." + d.dataset.run;
+      try { if (window.sessionStorage.getItem(key) === "1") d.open = true; } catch (e) { /* storage blocked */ }
+      d.addEventListener("toggle", function () {
+        try { window.sessionStorage.setItem(key, d.open ? "1" : "0"); } catch (e) { /* storage blocked */ }
+      });
+    });
+  }
+  logBoxes();
+  function availableKeys(data) {
+    var seen = {}, raw = [];
+    (data.runs || []).forEach(function (r) {
+      var h = r.progress && r.progress.history;
+      if (h) window.TrainMetrics.keysOf(h).forEach(function (k) { if (!seen[k]) { seen[k] = true; raw.push(k); } });
+    });
+    var known = (data.metrics || []).map(function (m) { return m.id; }).filter(function (id) { return seen[id]; });
+    return known.concat(raw.filter(function (k) { return known.indexOf(k) < 0; }).sort());
+  }
+  function saveColumns(list) {
+    return fetch("/v1/training/metric-columns", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ columns: list })
+    }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (j) {
+        if (!res.ok || !j || j.success === false) {
+          return { ok: false, message: (j && j.message) || "The server answered HTTP " + res.status + " (the columns were not saved)." };
+        }
+        metricsState.columns = j.columns || list;
+        // renderMetrics takes the columns from the last poll's answer: keep it current.
+        if (metricsState.data) metricsState.data.metric_columns = metricsState.columns;
+        renderMetrics(metricsState.data, true);
+        return { ok: true };
+      });
+    });
+  }
+  function renderMetrics(data, force) {
+    if (!data || !window.TrainMetrics) return;
+    metricsState.data = data;
+    if (data.metric_columns) metricsState.columns = data.metric_columns;
+    if (data.metrics) metricsState.metrics = data.metrics;
+    var avail = availableKeys(data);
+    var byId = {};
+    (data.runs || []).forEach(function (r) { byId[r.id] = r; });
+    document.querySelectorAll(".tr-metrics[data-run]").forEach(function (host) {
+      var r = byId[host.dataset.run];
+      var sig = r ? window.TrainMetrics.signature(r.progress, metricsState.columns) + "|" + r.state + "|" + avail.length : "";
+      var row = host.closest("tr");
+      if (!force && host.dataset.sig === sig) return;
+      host.dataset.sig = sig;
+      if (r && r.progress) {
+        window.TrainMetrics.render(host, r.progress, metricsState.columns, metricsState.metrics, {
+          runId: r.id, available: avail, running: r.state === "running", onColumns: saveColumns
+        });
+      } else {
+        host.replaceChildren();
+      }
+      if (row && row.classList.contains("tr-metrics-row")) row.hidden = host.childNodes.length === 0;
+    });
+  }
+  function loadMetrics() {
+    if (!window.TrainMetrics || !document.querySelector(".tr-metrics[data-run]")) return;
+    fetch("/v1/training", { headers: { Accept: "application/json" } })
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (data) { if (data) renderMetrics(data, false); })
+      .catch(function () {});
+  }
+  loadMetrics();
+
   if (Object.keys(busy).length === 0) return;
   function describe(r, list) {
     if (r.state === "queued") {
@@ -393,7 +468,12 @@
       set("state", r.state);
       set("percent", r.percent);
       set("describe", describe(r, list));
-      if (r.log && r.log.length) set("log", r.log.slice(-6).join("\n"));
+      if (r.log && r.log.length) {
+        var logEl = tr.querySelector('[data-field="log"]');
+        var box = logEl && logEl.closest("details.tr-logbox");
+        if (box) { box.hidden = false; set("log", r.log.slice(-40).join("\n")); }
+        else set("log", r.log.slice(-6).join("\n"));
+      }
       // Pause while running, Resume while paused (Cancel in both).
       var pause = tr.querySelector('[data-field="pause"]');
       var resume = tr.querySelector('[data-field="resume"]');
@@ -410,6 +490,7 @@
         if (!data) return;
         var a = update(runs, "run", data.runs);
         var b = update(tasks, "task", data.tasks);
+        renderMetrics(data, false);
         // Not reload(): the page may be the answer to a POST, and reloading it would ask to
         // resubmit (and queue the job again).
         if (a || b) window.location.assign("/training" + window.location.hash);

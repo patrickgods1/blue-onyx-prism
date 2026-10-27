@@ -30,8 +30,12 @@ Prepared dataset (`--data`, written by the service, see docs/TRAINING.md):
                                 file_name relative to the dataset dir; repeated images are
                                 separate image entries)
 
-Progress: every event is one line `@train {json}` on stdout (`start`, `epoch`, `batch`, `phase`,
-`done`); the service parses them, everything else is log output. Night augmentation
+Progress: every event is one line `@train {json}` on stdout (`start`, `epoch`, `eval`, `batch`,
+`phase`, `done`); the service parses them, everything else is log output. `epoch` and `eval` carry
+`metrics`: every scalar metric of the epoch under the trainer's own key (`val/mAP_50_95`,
+`metrics/mAP50(B)`, `eval_loss`, ...) plus this script's `f1`/`f2`/`f0_5` sweeps (`fbeta_sweep`),
+`mem_gb` (peak GPU memory) and `img_s` (training images per second); the service maps the keys to
+stable ids (src/training/progress.rs). Night augmentation
 (`--aug-dark`, `--aug-noise`, `--aug-gray`: per-image probabilities) is applied on the fly to the
 training batches (Ultralytics, transformers) or to one extra copy of each training image chosen by
 those probabilities (rfdetr).
@@ -103,6 +107,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="auto", help="auto, cuda, cuda:N, mps or cpu")
     p.add_argument("--allow-cpu", action="store_true", help="train on the CPU when no GPU is found (slow; smoke tests)")
     p.add_argument("--workers", type=int, default=2, help="data loader workers")
+    p.add_argument("--multi-scale", choices=("on", "off"), default="on",
+                   help="RF-DETR: rfdetr's multi-scale training (on: its default, every batch resized up to ~1.4x --imgsz; off: --imgsz only, much less memory)")
+    p.add_argument("--cache", choices=("auto", "ram", "off"), default="auto",
+                   help="Ultralytics: cache the decoded training images in RAM (auto: when they fit a quarter of the free memory)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--patience", type=int, default=0, help="stop after this many epochs without improvement (0 = off)")
     p.add_argument("--aug-dark", type=float, default=0.0, help="probability of the synthetic darkness augmentation")
@@ -321,6 +329,234 @@ def any_augment(a) -> bool:
 
 
 # ---------------------------------------------------------------------------------------------
+# Metrics (per-epoch `metrics` of the epoch / eval events), memory and speed
+# ---------------------------------------------------------------------------------------------
+
+MAX_METRICS = 64
+
+
+def scalar_metrics(d) -> dict:
+    """The finite scalar values of `d` (numbers, 0-d / 1-element tensors and arrays) as floats;
+    booleans, strings, NaN and inf are dropped."""
+    out = {}
+    for k, v in (d or {}).items():
+        if isinstance(v, (bool, str, bytes)) or not isinstance(k, str):
+            continue
+        try:
+            if hasattr(v, "numel"):  # torch
+                if v.numel() != 1:
+                    continue
+                f = float(v.detach().float().cpu().item())
+            elif hasattr(v, "item"):  # numpy
+                if getattr(v, "size", 1) != 1:
+                    continue
+                f = float(v.item())
+            else:
+                f = float(v)
+        except (TypeError, ValueError, RuntimeError):
+            continue
+        if math.isfinite(f):
+            out[k] = f
+    return out
+
+
+def fbeta_sweep(prec, rec, thresholds, betas=(0.5, 1.0, 2.0)) -> dict:
+    """Macro F-beta over a confidence sweep: `prec`, `rec` are `[classes, thresholds]` (classes
+    with ground truth only), `thresholds` the confidences. For each beta, the per-class
+    `(1 + b^2) P R / (b^2 P + R)` (0 where P = R = 0) is averaged over the classes at every
+    threshold and the best threshold kept (the lowest on a tie). Returns `f2`, `f2_thr`,
+    `f2_precision`, `f2_recall` (macro P / R at that threshold), the same for `f0_5` and `f1`
+    (plus `precision` / `recall` at the best F1 threshold)."""
+    import numpy as np
+
+    p = np.asarray(prec, dtype=np.float64)
+    r = np.asarray(rec, dtype=np.float64)
+    t = np.asarray(thresholds, dtype=np.float64)
+    if p.ndim != 2 or p.shape != r.shape or p.shape[0] == 0 or p.shape[1] != t.shape[0]:
+        return {}
+    out = {}
+    for b in betas:
+        b2 = b * b
+        den = b2 * p + r
+        f = np.divide((1 + b2) * p * r, den, out=np.zeros_like(den), where=den > 0)
+        macro = f.mean(axis=0)
+        i = int(np.argmax(macro))
+        name = {0.5: "f0_5", 1.0: "f1", 2.0: "f2"}.get(b, f"f{b:g}".replace(".", "_"))
+        out[name] = float(macro[i])
+        out[f"{name}_thr"] = float(t[i])
+        if name == "f1":
+            out["precision"] = float(p[:, i].mean())
+            out["recall"] = float(r[:, i].mean())
+        else:
+            out[f"{name}_precision"] = float(p[:, i].mean())
+            out[f"{name}_recall"] = float(r[:, i].mean())
+    return out
+
+
+def match_detections(preds, gts, iou_thr: float = 0.5):
+    """Per-class matching data for a P/R sweep (COCO-style greedy matching at `iou_thr`, by
+    score, each ground truth matched once): `preds` / `gts` are per image lists of
+    `(boxes [N,4] xyxy, labels [N], scores [N])` / `(boxes, labels)` numpy arrays. Returns
+    `{class: (scores, matched 0/1, ground truth count)}`."""
+    import numpy as np
+
+    data: dict[int, list] = {}
+    for (pb, pl, ps), (gb, gl) in zip(preds, gts):
+        for c in set(np.asarray(pl).tolist()) | set(np.asarray(gl).tolist()):
+            d = data.setdefault(int(c), [[], [], 0])
+            pi = np.where(pl == c)[0]
+            gi = np.where(gl == c)[0]
+            d[2] += len(gi)
+            order = pi[np.argsort(-ps[pi], kind="stable")]
+            used = np.zeros(len(gi), dtype=bool)
+            g = gb[gi]
+            for j in order:
+                m = 0
+                if len(gi):
+                    b = pb[j]
+                    x1 = np.maximum(b[0], g[:, 0]); y1 = np.maximum(b[1], g[:, 1])
+                    x2 = np.minimum(b[2], g[:, 2]); y2 = np.minimum(b[3], g[:, 3])
+                    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+                    union = (b[2] - b[0]) * (b[3] - b[1]) + (g[:, 2] - g[:, 0]) * (g[:, 3] - g[:, 1]) - inter
+                    iou = np.where(union > 0, inter / np.maximum(union, 1e-12), 0.0)
+                    iou[used] = -1
+                    k = int(np.argmax(iou))
+                    if iou[k] >= iou_thr:
+                        used[k] = True
+                        m = 1
+                d[0].append(float(ps[j]))
+                d[1].append(m)
+    return {c: (np.asarray(v[0]), np.asarray(v[1]), v[2]) for c, v in data.items()}
+
+
+def pr_sweep(matches: dict, thresholds):
+    """Per-class precision and recall at each threshold (`[classes with GT, thresholds]`) from
+    [`match_detections`]: a detection counts when its score >= the threshold; P = 0 without any
+    detection, as rfdetr's sweep."""
+    import numpy as np
+
+    t = np.asarray(thresholds, dtype=np.float64)
+    ps, rs = [], []
+    for c in sorted(matches):
+        scores, matched, n_gt = matches[c]
+        if n_gt <= 0:
+            continue
+        above = scores[None, :] >= t[:, None] if len(scores) else np.zeros((len(t), 0), dtype=bool)
+        tp = (above & (matched[None, :] == 1)).sum(axis=1).astype(np.float64)
+        n = above.sum(axis=1).astype(np.float64)
+        ps.append(np.divide(tp, n, out=np.zeros_like(tp), where=n > 0))
+        rs.append(tp / n_gt)
+    return np.array(ps), np.array(rs)
+
+
+class EpochMeter:
+    """Peak GPU memory (`mem_gb`) and training speed (`img_s`) of one epoch. MPS has no peak
+    counter: the driver's allocation is sampled after every batch and the largest kept."""
+
+    def __init__(self, device: str):
+        self.device = device
+        self.start = time.time()
+        self.train_end = None
+        self.peak = 0.0
+        self.images = 0
+
+    def epoch_start(self):
+        import torch
+
+        self.start, self.train_end, self.peak, self.images = time.time(), None, 0.0, 0
+        if self.device.startswith("cuda"):
+            try:
+                torch.cuda.reset_peak_memory_stats(self.device)
+            except Exception:
+                pass
+
+    def batch_end(self, images: int):
+        self.images += max(0, int(images))
+        if self.device == "mps":
+            import torch
+
+            try:
+                self.peak = max(self.peak, float(torch.mps.driver_allocated_memory()))
+            except Exception:
+                pass
+
+    def train_done(self):
+        if self.train_end is None:
+            self.train_end = time.time()
+
+    def metrics(self, images: int | None = None) -> dict:
+        import torch
+
+        out = {}
+        mem = self.peak
+        if self.device.startswith("cuda"):
+            try:
+                mem = float(torch.cuda.max_memory_reserved(self.device))
+            except Exception:
+                mem = 0.0
+        if mem > 0:
+            out["mem_gb"] = round(mem / 2**30, 3)
+        end = self.train_end or time.time()
+        n = images if images else self.images
+        if n and end > self.start:
+            out["img_s"] = round(n / (end - self.start), 3)
+        return out
+
+
+def free_memory(device: str) -> None:
+    """Return cached GPU memory after a validation (its activations are not reused by training)."""
+    import gc
+
+    import torch
+
+    gc.collect()
+    try:
+        if device == "mps":
+            torch.mps.empty_cache()
+        elif device.startswith("cuda"):
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def cuda_capability(device: str):
+    import torch
+
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.get_device_capability(device)
+    except Exception:
+        return None
+
+
+def tune_backend(device: str, fixed_size: bool) -> None:
+    """CUDA: TF32 matmuls / convolutions on Ampere and newer (compute capability >= 8.0), and
+    cuDNN autotuning when every batch has the same size (`fixed_size`, Ultralytics)."""
+    import torch
+
+    cc = cuda_capability(device)
+    if cc is None:
+        return
+    if cc[0] >= 8:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.allow_tf32 = True
+        log(f"CUDA compute capability {cc[0]}.{cc[1]}: TF32 matmuls on")
+    if fixed_size:
+        torch.backends.cudnn.benchmark = True
+
+
+def emit_metrics(kind: str, metrics: dict, **fields) -> None:
+    """An `epoch` / `eval` event with at most MAX_METRICS metrics (the shortest keys first, so a
+    long tail of per-class keys is what is cut)."""
+    m = scalar_metrics(metrics)
+    if len(m) > MAX_METRICS:
+        keep = sorted(m, key=lambda k: (k.count("/") > 1, len(k), k))[:MAX_METRICS]
+        m = {k: m[k] for k in keep}
+    event(kind, **fields, metrics=m)
+
+
+# ---------------------------------------------------------------------------------------------
 # Class head initialization from the COCO head
 # ---------------------------------------------------------------------------------------------
 
@@ -398,6 +634,64 @@ def report_head(names: list[str], rows: list, changed: int) -> None:
 # ---------------------------------------------------------------------------------------------
 # Ultralytics
 # ---------------------------------------------------------------------------------------------
+
+
+def free_ram_bytes() -> int | None:
+    """Memory the OS can hand out now (free + inactive / available), if known."""
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=10).stdout
+            page = 16384
+            pages = 0
+            for line in out.splitlines():
+                if "page size of" in line:
+                    page = int(line.split("page size of")[1].split()[0])
+                for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+                    if line.startswith(key + ":"):
+                        pages += int(line.split(":")[1].strip().rstrip("."))
+            return pages * page
+        if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names:
+            meminfo = Path("/proc/meminfo")
+            if meminfo.is_file():
+                for line in meminfo.read_text().splitlines():
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+            return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        if os.name == "nt":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                            ("avail", ctypes.c_ulonglong), ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong),
+                            ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ax", ctypes.c_ulonglong)]
+
+            ms = MS()
+            ms.len = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return int(ms.avail)
+    except Exception:
+        return None
+    return None
+
+
+def ultralytics_cache(a):
+    """`cache="ram"` when the decoded training images (unique images x imgsz^2 x 3 bytes, the
+    letterboxed size Ultralytics keeps) fit a quarter of the free memory, else None (no cache)."""
+    if a.cache == "off":
+        return None
+    unique = len(set(read_split(a.data, "train")))
+    need = unique * a.imgsz * a.imgsz * 3
+    if a.cache == "ram":
+        return "ram"
+    free = free_ram_bytes()
+    if free is None or need > free / 4:
+        log(f"image cache off: {unique} images need {need / 2**30:.1f} GB, a quarter of the free memory is "
+            f"{(free or 0) / 4 / 2**30:.1f} GB")
+        return None
+    log(f"image cache in RAM: {unique} images, {need / 2**30:.2f} GB")
+    return "ram"
 
 
 def train_ultralytics(a, device: str, names: list[str], em) -> dict:
@@ -486,32 +780,60 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     model = YOLO(str(weights))
     started = time.time()
     state = {"batches": 0}
+    meter = EpochMeter(device)
 
     def on_train_epoch_start(trainer):
         state["batches"] = 0
         state["epoch_started"] = time.time()
+        meter.epoch_start()
 
     def on_train_batch_end(trainer):
         state["batches"] += 1
+        meter.batch_end(0)
         nb = len(trainer.train_loader)
         if state["batches"] == nb or state["batches"] % max(1, nb // 10) == 0:
             event("batch", epoch=trainer.epoch + 1, epochs=trainer.epochs, batch=state["batches"], batches=nb)
+
+    def on_train_epoch_end(trainer):
+        meter.train_done()
 
     def on_fit_epoch_end(trainer):
         # Also called once more by the final validation of best.pt: report each epoch once.
         if trainer.epoch + 1 <= state.get("reported", 0) or trainer.epoch + 1 > trainer.epochs:
             return
         state["reported"] = trainer.epoch + 1
-        m = {k: float(v) for k, v in (trainer.metrics or {}).items() if isinstance(v, (int, float))}
+        m = scalar_metrics(trainer.metrics)
         tl = getattr(trainer, "tloss", None)
         if isinstance(tl, dict):
             loss = float(sum(float(v) for v in tl.values()))
+            m.update(scalar_metrics(trainer.label_loss_items(tl, prefix="train")))
         elif tl is not None:
             loss = float(tl.sum())
         else:
             loss = None
-        event(
+        if loss is not None and math.isfinite(loss):
+            m["loss"] = loss
+        val_losses = [v for k, v in m.items() if k.startswith("val/") and k.endswith("_loss")]
+        if val_losses:
+            m["val_loss"] = float(sum(val_losses))
+        m.update(scalar_metrics(getattr(trainer, "lr", None)))
+        box = getattr(getattr(getattr(trainer, "validator", None), "metrics", None), "box", None)
+        try:
+            if box is not None and len(getattr(box, "p_curve", [])):
+                m.update(fbeta_sweep(box.p_curve, box.r_curve, box.px))
+                # Ultralytics' own P / R (at its max-F1 confidence) are the ones reported.
+                m.pop("precision", None)
+                m.pop("recall", None)
+        except Exception as e:  # a changed Ultralytics internal: the other metrics still count
+            log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
+        try:
+            images = len(trainer.train_loader.dataset)
+        except Exception:
+            images = None
+        m.update(meter.metrics(images))
+        emit_metrics(
             "epoch",
+            m,
             epoch=trainer.epoch + 1,
             epochs=trainer.epochs,
             loss=loss,
@@ -522,6 +844,7 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
 
     model.add_callback("on_train_epoch_start", on_train_epoch_start)
     model.add_callback("on_train_batch_end", on_train_batch_end)
+    model.add_callback("on_train_epoch_end", on_train_epoch_end)
     model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
 
     base_model = base_yolo.model
@@ -562,6 +885,10 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     if a.lr is not None:
         kwargs["lr0"] = a.lr
         kwargs["optimizer"] = "AdamW"
+    cache = ultralytics_cache(a)
+    if cache:
+        kwargs["cache"] = cache
+    tune_backend(device, fixed_size=True)
     model.train(**kwargs)
     best = a.work / "run" / "weights" / "best.pt"
     if not best.is_file():
@@ -691,20 +1018,72 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
         fail(f"unknown RF-DETR size {a.size!r} (nano, small, medium, base, large)")
     data = rfdetr_layout(a, names)
     started = time.time()
+    meter = EpochMeter(device)
+
+    # rfdetr's validation sweeps confidence thresholds for its macro F1 (per-class precision and
+    # recall at np.linspace(0, 1, 101)); keep each sweep for the F2 / F0.5 of the same rows.
+    import rfdetr.training.callbacks.coco_eval as coco_eval
+
+    sweeps = {"n": 0, "used": 0, "last": {}}
+    orig_sweep = getattr(coco_eval, "sweep_confidence_thresholds", None)
+
+    def sweep(per_class_data, conf_thresholds, classes_with_gt, *args, **kw):
+        thresholds = list(conf_thresholds)
+        res = orig_sweep(per_class_data, thresholds, classes_with_gt, *args, **kw)
+        try:
+            idx = list(classes_with_gt)
+            if res and idx:
+                prec = np.array([r["per_class_prec"] for r in res]).T[idx]
+                rec = np.array([r["per_class_rec"] for r in res]).T[idx]
+                f = fbeta_sweep(prec, rec, [float(r["confidence_threshold"]) for r in res])
+                # rfdetr reports F1 and its P / R itself (the same rows, the same best threshold).
+                for k in ("f1", "precision", "recall"):
+                    f.pop(k, None)
+                sweeps["last"] = f
+                sweeps["n"] += 1
+        except Exception as e:  # a changed rfdetr internal: its own metrics still count
+            log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
+        return res
+
+    if orig_sweep is not None:
+        coco_eval.sweep_confidence_thresholds = sweep
 
     class Progress(Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            meter.epoch_start()
+
         def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
             nb = trainer.num_training_batches
             i = batch_idx + 1
+            try:
+                meter.batch_end(len(batch[1]))
+            except Exception:
+                meter.batch_end(a.batch)
+            if isinstance(nb, int) and nb > 0 and i == nb:
+                meter.train_done()
             if isinstance(nb, int) and nb > 0 and (i == nb or i % max(1, nb // 10) == 0):
                 event("batch", epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, batch=i, batches=nb)
 
+        def on_validation_start(self, trainer, pl_module):
+            meter.train_done()
+
+        def on_validation_end(self, trainer, pl_module):
+            # The first training step after the EMA validation is where MPS ran out of memory.
+            free_memory(device)
+
         def on_train_epoch_end(self, trainer, pl_module):
-            m = {k: float(v) for k, v in trainer.callback_metrics.items() if getattr(v, "numel", lambda: 0)() == 1}
+            # Bare `loss`, `loss_cls`, ... are the progress bar's last-step values; the epoch's are `train/...`.
+            m = {k: v for k, v in scalar_metrics(trainer.callback_metrics).items()
+                 if not k.endswith("_step") and not (k.startswith("loss") and "/" not in k)}
             loss = next((m[k] for k in ("train/loss", "train/loss_epoch", "loss") if k in m), None)
             mp = next((m[k] for k in ("val/mAP_50", "val/ema_mAP_50", "val/map50") if k in m), None)
-            event("epoch", epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, loss=loss, map50=mp,
-                  elapsed_s=round(time.time() - started, 1))
+            mp95 = next((m[k] for k in ("val/mAP_50_95", "val/ema_mAP_50_95") if k in m), None)
+            if sweeps["n"] > sweeps["used"]:
+                m.update(sweeps["last"])
+                sweeps["used"] = sweeps["n"]
+            m.update(meter.metrics())
+            emit_metrics("epoch", m, epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, loss=loss, map50=mp,
+                         map=mp95, elapsed_s=round(time.time() - started, 1))
 
     # rfdetr builds its Lightning trainer itself; add the progress callback to every trainer it builds.
     import pytorch_lightning as pl
@@ -731,16 +1110,26 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     if a.patience:
         kw["early_stopping"] = True
         kw["early_stopping_patience"] = a.patience
+    if a.multi_scale == "off":
+        kw["multi_scale"] = False
+    if a.workers > 0:
+        kw["persistent_workers"] = True
+        if device.startswith("cuda"):
+            kw["pin_memory"] = True
+    tune_backend(device, fixed_size=False)
     log(f"rfdetr {cls_name}.train({', '.join(f'{k}={v}' for k, v in kw.items())})")
     try:
         model.train(**kw)
     except TypeError as e:
         # A keyword this rfdetr version does not take: retry without the optional ones.
         log(f"rfdetr rejected an option ({e}); retrying with the basic options")
-        for k in ("seed", "early_stopping", "early_stopping_patience"):
+        for k in ("seed", "early_stopping", "early_stopping_patience", "multi_scale", "persistent_workers",
+                  "pin_memory"):
             kw.pop(k, None)
         model.train(**kw)
     pl.Trainer.__init__ = orig_init
+    if orig_sweep is not None:
+        coco_eval.sweep_confidence_thresholds = orig_sweep
     ckpt = out_dir / "checkpoint_best_total.pth"
     cfg = out_dir / "training_config.json"
     if not ckpt.is_file() or not cfg.is_file():
@@ -858,6 +1247,46 @@ def collate(batch):
     return {"pixel_values": torch.stack([b["pixel_values"] for b in batch]), "labels": [b["labels"] for b in batch]}
 
 
+def detection_metrics(model, ds, proc, batch: int, imgsz: int) -> dict:
+    """mAP 50-95 / 50 / 75 and mAR@100 (torchmetrics, COCO rules) plus the macro P / R / F-beta
+    sweep at IoU 0.5 ([`fbeta_sweep`]) of `model` on the prepared validation set `ds`, in the
+    model's input pixels (images are stretched to imgsz x imgsz, the labels are normalized)."""
+    import numpy as np
+    import torch
+    from torchmetrics.detection import MeanAveragePrecision
+
+    dev = next(model.parameters()).device
+    was_training = model.training
+    model.eval()
+    mean_ap = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+    preds, gts = [], []
+    try:
+        with torch.no_grad():
+            for i in range(0, len(ds), max(1, batch)):
+                items = [ds[j] for j in range(i, min(len(ds), i + max(1, batch)))]
+                pv = torch.stack([it["pixel_values"] for it in items]).to(dev)
+                out = model(pixel_values=pv)
+                res = proc.post_process_object_detection(out, threshold=0.0, target_sizes=[(imgsz, imgsz)] * len(items))
+                for it, r in zip(items, res):
+                    lab = it["labels"]
+                    cx, cy, w, h = (lab["boxes"].float().cpu() * imgsz).unbind(-1) if len(lab["boxes"]) else (torch.zeros(0),) * 4
+                    gb = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], -1) if len(lab["boxes"]) else torch.zeros((0, 4))
+                    gl = lab["class_labels"].long().cpu()
+                    pb, ps, pl = r["boxes"].float().cpu(), r["scores"].float().cpu(), r["labels"].long().cpu()
+                    mean_ap.update([{"boxes": pb, "scores": ps, "labels": pl}], [{"boxes": gb, "labels": gl}])
+                    preds.append((pb.numpy(), pl.numpy(), ps.numpy()))
+                    gts.append((gb.numpy(), gl.numpy()))
+    finally:
+        model.train(was_training)
+    r = mean_ap.compute()
+    m = {"map": r["map"], "map50": r["map_50"], "map75": r["map_75"], "mar": r["mar_100"]}
+    m = {k: float(v) for k, v in m.items() if float(v) >= 0}  # torchmetrics: -1 = no ground truth
+    thresholds = np.linspace(0, 1, 101)
+    prec, rec = pr_sweep(match_detections(preds, gts), thresholds)
+    m.update(fbeta_sweep(prec, rec, thresholds))
+    return m
+
+
 def train_transformers(a, device: str, names: list[str], em) -> dict:
     import numpy as np
     import torch
@@ -893,22 +1322,50 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
     val_ds = CocoDataset(a.data, "valid", proc, False, a)
     started = time.time()
     steps_per_epoch = max(1, math.ceil(len(train_ds) / a.batch))
+    meter = EpochMeter(device)
 
     class Progress(TrainerCallback):
+        def on_epoch_begin(self, args, state, control, **kw):
+            meter.epoch_start()
+
         def on_step_end(self, args, state, control, **kw):
+            meter.batch_end(0)
             i = ((state.global_step - 1) % steps_per_epoch) + 1
             if i == steps_per_epoch or i % max(1, steps_per_epoch // 10) == 0:
                 event("batch", epoch=math.ceil(state.global_step / steps_per_epoch), epochs=a.epochs, batch=i, batches=steps_per_epoch)
 
         def on_epoch_end(self, args, state, control, **kw):
+            meter.train_done()
             losses = [h["loss"] for h in state.log_history if "loss" in h]
-            event("epoch", epoch=round(state.epoch or 0), epochs=a.epochs, loss=losses[-1] if losses else None,
-                  elapsed_s=round(time.time() - started, 1))
+            lrs = [h["learning_rate"] for h in state.log_history if "learning_rate" in h]
+            m = {"loss": losses[-1]} if losses else {}
+            if lrs:
+                m["lr"] = lrs[-1]
+            m.update(meter.metrics(len(train_ds)))
+            emit_metrics("epoch", m, epoch=round(state.epoch or 0), epochs=a.epochs, loss=losses[-1] if losses else None,
+                         elapsed_s=round(time.time() - started, 1))
 
         def on_evaluate(self, args, state, control, metrics=None, **kw):
             if metrics and "eval_loss" in metrics:
-                event("eval", epoch=round(state.epoch or 0), epochs=a.epochs, val_loss=float(metrics["eval_loss"]))
+                emit_metrics("eval", {k: v for k, v in metrics.items() if k != "epoch" and not k.endswith(("_runtime", "_per_second"))},
+                             epoch=round(state.epoch or 0), epochs=a.epochs, val_loss=float(metrics["eval_loss"]))
 
+    class DetectionTrainer(Trainer):
+        """Trainer whose evaluation also scores the detections (mAP, P / R, F-beta)."""
+
+        def evaluate(self, *args, **kw):
+            out = super().evaluate(*args, **kw)
+            try:
+                m = detection_metrics(self.model, val_ds, proc, a.batch, a.imgsz)
+                emit_metrics("eval", m, epoch=round(self.state.epoch or 0), epochs=a.epochs)
+            except Exception as e:  # the loss still counts
+                log(f"detection metrics skipped ({type(e).__name__}: {e})")
+            free_memory(device)
+            return out
+
+    cc = cuda_capability(device)
+    bf16 = cc is not None and cc[0] >= 8
+    tune_backend(device, fixed_size=False)
     targs = TrainingArguments(
         output_dir=str(a.work / "hf-out"),
         num_train_epochs=a.epochs,
@@ -927,13 +1384,17 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
         eval_do_concat_batches=False,
         report_to=[],
         dataloader_num_workers=a.workers,
+        dataloader_pin_memory=device.startswith("cuda"),
+        dataloader_persistent_workers=a.workers > 0,
         seed=a.seed,
         use_cpu=device == "cpu",
-        fp16=device.startswith("cuda"),
+        # bf16 on Ampere and newer (no overflow in the DETR losses), fp16 on older CUDA GPUs.
+        bf16=bf16,
+        fp16=device.startswith("cuda") and not bf16,
         disable_tqdm=True,
     )
-    trainer = Trainer(model=model, args=targs, train_dataset=train_ds, eval_dataset=val_ds, data_collator=collate,
-                      callbacks=[Progress()])
+    trainer = DetectionTrainer(model=model, args=targs, train_dataset=train_ds, eval_dataset=val_ds, data_collator=collate,
+                               callbacks=[Progress()])
     trainer.train()
     event("phase", phase="export", detail="exporting to ONNX")
     model = trainer.model.eval().float().cpu()
@@ -984,6 +1445,13 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
 
 def main() -> int:
     a = parse_args()
+    if sys.platform == "darwin":
+        # MPS may otherwise allocate up to 1.7x the recommended working set (more than the RAM of
+        # a 16 GB Mac): an oversized batch then swaps for half an hour before it fails. 1.0 keeps
+        # allocations inside physical memory, so it fails in seconds (the service retries with a
+        # smaller batch). The low watermark must stay below the high one.
+        os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0")
+        os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.8")
     if a.self_check:
         return self_check(a.trainer, a.device)
     for d in (a.out_dir, a.work):

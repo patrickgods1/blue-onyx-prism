@@ -137,7 +137,10 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `capability` gates by GPU (CUDA lanes cu126/cu130 by compute capability + driver; MPS on Apple, D-FINE CUDA-only),
   separate `tools/train-env` from `scripts/model-export/locks/train-*.txt`; families YOLO26/11/v8, RF-DETR n..l,
   RT-DETRv2, D-FINE (base pins in `catalog/train.rs`); head rows initialised from the base's COCO rows; static ONNX
-  export + ORT check, install, benchmark on the held-out split; docs in `docs/TRAINING.md`.
+  export + ORT check, install, benchmark on the held-out split; `epoch`/`eval` events carry every scalar `metrics`
+  (raw keys -> ids by `progress::canonical`, F-beta sweeps, `mem_gb`, `img_s`), kept as `progress.history` + `best`,
+  table columns in `training.metric_columns` (`POST /v1/training/metric-columns`); an early GPU OOM retries at half the
+  batch (MPS watermark 1.0, RF-DETR memory at its multi-scale side); docs in `docs/TRAINING.md`.
   `train import` (`training/import/`: video / image folder / URL via yt-dlp / pinned `import-data:meva-sample` into the
   dataset folder, scene change + dHash + SigLIP k-center, licence confirmed; the 20k candidate budget split per camera then
   per video before extraction (`select::budget`), videos extracted in parallel (`import/parallel.rs`, `--workers`, results
