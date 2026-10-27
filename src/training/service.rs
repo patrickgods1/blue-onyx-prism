@@ -13,7 +13,8 @@
 //! suspended where they are, keeping their memory, loaded models and GPU allocations, and no new
 //! helper starts; work the service does itself between helpers (frame analysis, an in-process
 //! benchmark, a download) finishes first. The queue keeps the job's place (nothing else starts)
-//! until [`TrainingService::resume`] or a cancel.
+//! until [`TrainingService::resume`] or a cancel. A running run can also finish early
+//! ([`TrainingService::finish`]): the trainer stops after its current epoch and exports the best.
 
 use super::job::{
     BenchSummary, Hooks, TrainError, TrainJob, TrainOutput, TrainReport, TrainRequest, TrainStage,
@@ -634,6 +635,69 @@ impl TrainingService {
             }
             _ => false,
         }
+    }
+
+    /// Finish the running run `id` after its current epoch, exporting its best one: writes the
+    /// stop file the trainer checks after each epoch ([`super::job::stop_file`]); a paused run is
+    /// resumed first. Refused (with the reason) unless `id` is the run on the queue's thread in
+    /// its training stage.
+    pub fn finish(&self, id: &str) -> Result<String, String> {
+        let Some(r) = self.get(id) else {
+            return Err(if self.get_task(id).is_some() {
+                format!("{id} is an import or auto-label job; only a training run can finish early")
+            } else {
+                format!("no run {id}")
+            });
+        };
+        if !r.state.is_active() {
+            return Err(format!(
+                "run {id} is {}; only a running run can finish early",
+                r.describe()
+            ));
+        }
+        if r.stage != Some(TrainStage::Train) {
+            return Err(format!(
+                "run {id} is not training yet ({}); cancel it instead, or wait for its training \
+                 stage",
+                r.stage.map_or("starting", |s| s.label())
+            ));
+        }
+        let p = r.progress.as_ref();
+        if let Some(t) = p.and_then(TrainProgress::stop_text) {
+            return Err(format!("run {id} already stopped training: {t}"));
+        }
+        if p.is_some_and(|p| p.phase.is_some()) {
+            return Err(format!("run {id} has finished training and is exporting"));
+        }
+        let cancelling = {
+            let cur = self.inner.current.lock_recover();
+            match cur.as_ref().filter(|c| c.id == id) {
+                Some(c) => c.cancel.load(Ordering::Relaxed),
+                None => return Err(format!("run {id} is not the running job")),
+            }
+        };
+        if cancelling {
+            return Err(format!("run {id} is being cancelled"));
+        }
+        let path = super::job::stop_file(&r.run_dir);
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, now()));
+        if let Err(e) = written {
+            return Err(format!(
+                "cannot write the stop request {}: {e}",
+                path.display()
+            ));
+        }
+        if r.state == RunState::Paused {
+            self.resume(id);
+        }
+        tracing::info!(run = %id, "finish requested");
+        Ok(format!(
+            "Finishing {id} after the current epoch; its best epoch is exported, installed and \
+             benchmarked."
+        ))
     }
 
     /// Pause the running run or task `id` (see the module docs); false when it is not running

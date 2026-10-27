@@ -1037,3 +1037,30 @@ table.tr-mtable tr.best-epoch td { background: var(--ok-bg); }
 .tr-cols-list label.check { margin: 0; }
 .tr-cols-list button.small { margin: 0; padding: 0 0.4rem; }
 .tr-cols-msg:empty { display: none; }
+
+/* Train form: runs per scene, the class picker's counts and warnings, the family's
+   recommendation; the Comparison card. */
+.tr-scene-list { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 1.2rem; }
+.tr-scene-other { margin: 0.3rem 0; }
+.tr-scene-other > summary { color: var(--accent); cursor: pointer; }
+.tr-scene-other[open] { flex-basis: 100%; }
+.tr-scene-other label.check { display: inline-flex; margin-right: 1.2rem; }
+.tr-runs-line { margin: 0.3rem 0 0; padding: 0.3rem 0.6rem; border-left: 3px solid var(--accent); background: var(--code-bg); overflow-wrap: anywhere; }
+#train-picker .cp-compact > .cp-body { max-width: 48rem; max-height: none; }
+#train-picker .cp-label { flex-direction: row; align-items: center; text-align: left; margin: 0; color: var(--fg); gap: 0.35rem; }
+#train-picker .cp-chip { border-radius: 8px; }
+#train-epochs, #train-patience { width: 10rem; }
+.tr-cls-count { font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cp-badge.tr-cls-warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
+.cp-chip:not(:has(input[type=checkbox]:checked)) .tr-scene-warn { display: none; }
+#train-classes .tr-radios { align-items: baseline; gap: 0 1rem; }
+.tr-rec { white-space: nowrap; font-weight: normal; }
+details.tr-compare { margin: 0.4rem 0 0.8rem; }
+details.tr-compare > summary { cursor: pointer; font-weight: 600; margin: 0.2rem 0 0.4rem; overflow-wrap: anywhere; }
+table.tr-ctable { font-size: 0.85rem; width: auto; min-width: 100%; }
+table.tr-ctable th, table.tr-ctable td { padding: 0.3rem 0.5rem; vertical-align: top; }
+table.tr-ctable td.num, table.tr-ctable th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.tr-ctable th:last-child, table.tr-ctable td:last-child { padding-left: 1rem; white-space: nowrap; }
+table.tr-ctable td:first-child { min-width: 13rem; }
+table.tr-ctable td.best-val { font-weight: 700; background: var(--ok-bg); color: var(--ok-fg); }
+table.tr-ctable tr.tr-routed td { font-style: italic; background: var(--code-bg); border-top: 2px dashed var(--border); }

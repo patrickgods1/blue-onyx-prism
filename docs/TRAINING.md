@@ -184,15 +184,32 @@ A missing label file means "no objects" (the Ultralytics convention).
 
 ### Assembly (`src/training/dataset.rs`)
 
-1. **Classes**: the run's list (`--classes`, the page's field) in head order, else every class of the
-   exports in first-seen order. Labels are matched by name across exports (each export's ids are
-   remapped), `--rename from=to` renames, an empty `to` drops; boxes of other labels are dropped and
-   counted.
-2. **Scene filter**: `all`, `day` or `night+ir` (a night model). Frames without a scene tag are left
-   out by `day` / `night+ir`, with a warning.
-3. **Held out**: the export's split when it has one; else whole `camera/day` groups, in a seeded
-   hash order, until `training.heldout_share` (0.2) of the frames, never all groups. With a single
-   camera and day the frames are split one by one, with a warning that the benchmark is optimistic.
+1. **Classes**: the run's list (`--classes`, repeated or comma-separated; the page's class picker) in
+   head order, else every class of the exports in first-seen order. Labels are matched by name across
+   exports (each export's ids are remapped), `--rename from=to` renames, an empty `to` drops. What
+   happens to a box of a label that is not in the list is the **excluded mode** (`--excluded`, the
+   page's radio under the picker): `background` (default) keeps the frame and the object is
+   background (a frame left with no box is a negative, counted toward the negative share);
+   `drop-frame` leaves out every training / validation frame that holds such an object, so a
+   look-alike of a trained class (`dog` while training `cat`) is never taught as background. Dropped
+   frames are counted (`excluded_frames` in `dataset.json`) and a run that drops more than 30% of
+   its in-scope frames gets a warning. Held-out frames are never dropped, so a comparison stays fair.
+   See [Class inventory](#class-inventory).
+2. **Held out**: chosen from **all** review frames, *before* the scene filter: the export's split when
+   it has one; else whole `camera/day` groups, in a seeded hash order, until
+   `training.heldout_share` (0.2) of the frames, never all groups. With a single camera and day the
+   frames are split one by one, with a warning that the benchmark is optimistic. The held-out set
+   keeps every scene, so a day model is also measured on night frames, and the same exports give the
+   same held-out frames whatever the scene filter. `dataset.json` holds `heldout_fingerprint` (SHA-256
+   of the sorted held-out frame keys), copied into the run's benchmark summary; the held-out
+   `manifest.json` tags each frame with its scene plus `heldout:<scene>`, `heldout:all` and, for a
+   frame of the run's scenes, `heldout:in-scope`, which the benchmark summary reads for per-scene AP.
+3. **Scene filter** (training and validation frames only): `all`, or any combination of `day`,
+   `night` and `ir` joined by `+` (`day`, `night`, `ir`, `day+night`, `day+ir`, `night+ir`; the
+   page's checkboxes). Frames without a scene tag are left out by every filter but `all`, with a
+   warning. **Behaviour change**: `night` alone now means night frames only and `ir` IR frames only;
+   use `night+ir` for both (what `night` used to mean). Saved requests and configs with the old
+   spellings still load.
 4. **Hard negatives**: about `training.negative_share` (15%) of the training frames have no objects:
    extra empty frames are dropped (reviewer-confirmed ones are kept first); too few give a warning.
 5. **Validation**: 10% of your own training frames (of all training frames when there are none; at
@@ -211,6 +228,16 @@ Output in `<training dir>/<run id>/data/`: `images/`, `labels/` (hard links, els
 repeated frame is a separate image entry), `heldout/` (a benchmark `dir:` set: `images/`, YOLO
 `labels/`, `classes.txt`, `manifest.json` with tags and `scored_labels`) and `dataset.json` (sources,
 licences, counts, warnings). `train prepare --out <dir>` writes the same without training.
+
+### Class inventory
+
+`blue-onyx-prism train classes --dataset <export>... [--scene <s>] [--rename from=to] [--json]` lists
+the classes of the datasets after the renames: boxes, frames holding one, and boxes per scene (day,
+night, ir, unknown scene). With `--scene` an **in scope** column adds the boxes of those scenes
+(unknown-scene boxes count only for `all`). The Training page's class picker shows the same counts
+(`GET /v1/training/dataset-classes`) and warns about a class with fewer than 50 boxes (a fine-tuning
+floor, far below Ultralytics' best-case 10,000 instances) and about a class with no box in the
+scenes the run trains on (`person` with no night boxes in a night run).
 
 ### Public night subset (`train-data:lila-night`)
 
@@ -258,6 +285,63 @@ signal plus read noise, sigma 0.01-0.05. Applied on the fly to the training batc
 training loop is the `rfdetr` package's, one augmented copy of each training image the probabilities
 pick is added before training.
 
+## Starting points and convergence
+
+With nothing typed in, a run starts from the family's recommendation (`recipe::recommended`, shown
+beside each family on the page). With early stopping on, **epochs is a cap**: the run normally ends
+sooner.
+
+| Family | Epochs (cap) | Patience | Min epochs | Min delta | Learning rate |
+|---|---|---|---|---|---|
+| YOLO26 / YOLO11 / YOLOv8 | 100 | 15 | 10 | 0.001 | the trainer's |
+| RF-DETR | 100 | 10 | 10 | 0.001 | 1e-4 (rfdetr's default) |
+| RT-DETRv2 / D-FINE | 80 | 10 | 10 | 0.001 | 1e-4 |
+
+Sources: the Ultralytics fine-tuning guide (patience 10-20 when fine-tuning) and the `cfg` reference
+(<https://docs.ultralytics.com/guides/finetuning-guide>, <https://docs.ultralytics.com/usage/cfg>);
+the RF-DETR training docs (100 epochs, lr 1e-4, effective batch 16, early stopping patience 10 and
+min delta 0.001, <https://rfdetr.roboflow.com/learn/train/>). RT-DETRv2 and D-FINE converge in fewer
+epochs from COCO weights. Fine-tuning trains **all layers** (no frozen backbone):
+<https://docs.ultralytics.com/yolov5/tutorials/transfer-learning-with-frozen-layers>.
+
+**How much data.** Ultralytics' best-case targets are at least 1500 images and 10,000 instances per
+class, and varied images (different lighting, weather, cameras) matter more than their count
+(<https://docs.ultralytics.com/yolov5/tutorials/tips_for_best_training_results>); Frigate+ asks for
+at least 100 verified images per camera (<https://docs.frigate.video/plus>). Fewer still trains, but
+expect a noisy held-out AP.
+
+**The convergence rule** is one rule for every trainer (`Convergence` in `scripts/train_model.py`;
+its display twin is `progress::convergence_decision`), and the trainers' own early stopping is
+switched off so only this one decides:
+
+- The value is the validation **mAP50-95**, else mAP50 when the trainer reports no mAP50-95.
+- An improvement is a value above the best so far by more than `min_delta` (0.001).
+- The run stops once `epoch >= min_epochs` (10) and `patience` epochs passed since the last
+  improvement. `patience` 0 turns it off (the run trains all its epochs); it may not exceed the
+  epochs, and a patience that is not below the epochs never fires (a warning says so).
+- The **best checkpoint** is exported, not the last: Ultralytics `best.pt`, RF-DETR
+  `checkpoint_best_total.pth`, and for RT-DETRv2 / D-FINE (transformers) the best model state, which is
+  restored in memory before the export (the log names the exported epoch).
+
+**Finish now.** A run in its train stage can be stopped after the current epoch, keeping the best
+checkpoint (it then exports, installs and benchmarks as usual): the **Finish now** button beside Cancel
+on the Training page (loopback / admin, like Cancel; a paused run is resumed first), or create the file
+`<run dir>/work/stop-request` (the run dir is `<training dir>/<run id>`, see `train list`). The trainer
+checks the file after each epoch; a stale one is removed before training starts. Ctrl-C in the CLI still
+cancels.
+
+**The `stop` event.** When the rule (or the stop file) ends training the script prints
+`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v}`. The page shows
+"best epoch B, M epochs without improvement (stops at patience P)" while training and then
+"converged at epoch N (best B)" or "finished on request at epoch N (best B)"; `train run` prints the same
+in its progress lines.
+
+**Config.** `training.epochs` and `training.patience` are unset by default: unset means the family's
+recommendation, a number overrides it for every family. A config written by an older version that has
+`epochs: 50` (the old default, which every save wrote out) reads as unset. The CLI's `--epochs` and
+`--patience` and the page's blank fields follow the same order: the typed value, else the config, else
+the recommendation.
+
 ## A run
 
 Stages (page and `train run` show them with percent and ETA):
@@ -297,8 +381,10 @@ Stages (page and `train run` show them with percent and ETA):
    `exdark-night` when ticked), so the results are in `benchmark.json` and its history like any other
    run. A failed benchmark is reported but keeps the model.
 
-Default name: `night-<model>-<YYYYMMDD-HHMM>` for a `night+ir` run, else `custom-...`. Several models
-can be queued at once (one per ticked size, or `--model` repeated); they run one at a time. Cancel
+Default name: `<scene>-<model>-<YYYYMMDD-HHMM>`: `custom-` for `all`, `day-`, `night-` for `night+ir`,
+`night-only-`, `ir-`, `day-night-`, `day-ir-`. Several models can be queued at once (one per ticked
+size, or `--model` repeated), and several scenes queue one run per scene per model
+([Comparing](#comparing-day-nightir-and-mixed-models)); they run one at a time. Cancel
 kills the process tree. Run records are kept in `<training dir>/runs.json`; a run interrupted by a
 stopped service is shown as failed. On Unix the trainer exits when the service process is gone; on
 Windows the job object does it.
@@ -367,6 +453,45 @@ run's history (known ids by label, raw keys by name) and their order; the choice
 distinct names of 1-64 characters, known ids or raw names; answers the saved list, 400 otherwise) and
 applies at once. Empty (the default) = `map, map50, f1, f2, precision, recall, loss`. The raw trainer
 log is under a closed *Log* disclosure.
+
+## Comparing day, night/IR and mixed models
+
+Whether a night model or a mixed model serves a camera better is something to measure on your own
+frames: the research behind these defaults found no source that compared one mixed model against
+separate day and night models on CCTV near-infrared footage, which is why the comparison exists.
+
+**Queue it.** On the page tick several scene checkboxes (day, night, ir; each combination is a run), or
+repeat the flag:
+
+```sh
+blue-onyx-prism train run --model yolo26s --dataset <export> \
+    --scene day --scene night+ir --scene all
+```
+
+One run per scene per model is queued (several `--model` x several `--scene` = the product; identical
+scenes are queued once; the page lists the run names first) and they run one at a time in that order.
+They share a `compare_group` (`cmp-<YYYYMMDD-HHMMSS>`), the class list and the excluded mode.
+
+**Same held-out frames.** The held-out set is chosen before the scene filter, so every run of the
+group is benchmarked on the same frames, all scenes included. The fingerprint in each run's benchmark
+summary proves it. If the fingerprints differ (an export was edited between queuing and running) the
+comparison shows a warning instead of comparing.
+
+**The table.** The Comparison card of the Training page (one per group) and, at the end of a
+`train run` with several scenes, the CLI table have one row per run: model, scene filter, best epoch
+and the epoch it stopped at, held-out AP50-95 for `day`, `night`, `ir` and `all` frames
+(from the benchmark's per-tag results), the AP over the scenes the run trained on (**in-scope**, the
+run's headline), and the p50 time. The best value of each column is marked (`*` in the CLI). Runs
+that differ in classes or excluded mode get a warning.
+
+**The routed row.** When the group has a day run and a night or IR run, a **day + night routed** row
+puts the day run's day AP beside the night run's night / IR AP, which is what a service with
+`night_model` routing would score. The scenes are scored separately, so no combined AP is invented.
+
+**Deploying.** Either a day model as the `default_model` plus the night model as its `night_model`
+(Trained models card: *Default model*, *night model of*), or the mixed model alone, whichever the table
+favours on the scenes your cameras see most. A scene with few held-out frames has a noisy AP; read the
+frame counts (`images`) beside it.
 
 ## Estimates
 
@@ -861,11 +986,15 @@ with animals (the text prompts are computed once).
 
 ```sh
 blue-onyx-prism train capability [--json]
-blue-onyx-prism train estimate --model rfdetr-small --images 2000 --epochs 50 [--batch 8] [--imgsz 512]
+blue-onyx-prism train estimate --model rfdetr-small --images 2000 --epochs 100 [--batch 8] [--imgsz 512]
+blue-onyx-prism train classes --dataset <export> [--dataset <export>] [--scene night+ir] [--rename a=b] [--json]
 blue-onyx-prism train prepare --dataset <export> [--dataset <export>] [--scene night+ir] \
-    [--classes person,car,dog,cat,raccoon] [--rename motorbike=motorcycle] [--public [--allow-large]] --out <dir>
-blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> [--scene all|day|night+ir] \
-    [--epochs 50] [--batch 16] [--imgsz 640] [--lr 0.001] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
+    [--classes person,car,dog,cat,raccoon] [--excluded background|drop-frame] \
+    [--rename motorbike=motorcycle] [--public [--allow-large]] --out <dir>
+blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> \
+    [--scene all|day|night|ir|night+ir|day+ir ... (repeat for a comparison)] \
+    [--classes a,b] [--classes c] [--excluded background|drop-frame] \
+    [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
     [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
@@ -884,6 +1013,12 @@ blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [
 blue-onyx-prism train list
 blue-onyx-prism train remove-env
 ```
+
+`--epochs` and `--patience` default to the family's recommendation ([Starting points and
+convergence](#starting-points-and-convergence)). A running training is finished early, keeping its best
+checkpoint, by creating `<run dir>/work/stop-request` (or Finish now on the page). `--scene` is
+repeatable: several scenes (or models x scenes) run one after another on the same held-out frames and the
+comparison table is printed at the end. `night` alone is night frames only; use `night+ir` for both.
 
 Model labels: `yolo26n`..`yolo26x`, `yolo11n`.., `yolov8n`.., `rfdetr-nano|small|medium|base|large`,
 `rt-detrv2-s|m|l|x`, `dfine-s|m|l|x`.

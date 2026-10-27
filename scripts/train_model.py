@@ -31,7 +31,7 @@ Prepared dataset (`--data`, written by the service, see docs/TRAINING.md):
                                 separate image entries)
 
 Progress: every event is one line `@train {json}` on stdout (`start`, `epoch`, `eval`, `batch`,
-`phase`, `done`); the service parses them, everything else is log output. `epoch` and `eval` carry
+`stop`, `phase`, `done`); the service parses them, everything else is log output. `epoch` and `eval` carry
 `metrics`: every scalar metric of the epoch under the trainer's own key (`val/mAP_50_95`,
 `metrics/mAP50(B)`, `eval_loss`, ...) plus this script's `f1`/`f2`/`f0_5` sweeps (`fbeta_sweep`),
 `mem_gb` (peak GPU memory) and `img_s` (training images per second); the service maps the keys to
@@ -39,6 +39,11 @@ stable ids (src/training/progress.rs). Night augmentation
 (`--aug-dark`, `--aug-noise`, `--aug-gray`: per-image probabilities) is applied on the fly to the
 training batches (Ultralytics, transformers) or to one extra copy of each training image chosen by
 those probabilities (rfdetr).
+
+Convergence (`Convergence`, the same rule for every trainer; their own early stopping is off):
+after each validation, the run stops once `--min-epochs` passed and `--patience` epochs brought no
+mAP 50-95 (else mAP 50) gain above `--min-delta`, or at once when `--stop-file` exists (the
+service's Finish now); a `stop` event says why, and the best epoch's weights are exported.
 
 The service runs this file (embedded in the binary) inside its pinned training environment
 (<data root>/tools/train-env), offline: YOLO_OFFLINE=1, HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1;
@@ -91,6 +96,53 @@ def fail(msg: str) -> None:
     raise SystemExit(f"[train_model] error: {msg}")
 
 
+class Convergence:
+    """When to stop training (one rule for every trainer; src/training/progress.rs
+    `convergence_decision` is its twin, parity-tested). `update(epoch, value)` once per validated
+    epoch with its mAP (None when there is none): "finish" when the stop file exists, "converged"
+    once `epoch >= min_epochs` and `patience` epochs passed since the last gain above `min_delta`
+    (patience 0 = never), else None. A repeated or older epoch is ignored. `best` / `best_epoch`
+    are the last such gain; `top` / `top_epoch` the highest value, `improved` whether this epoch
+    set it (the checkpoint to keep). Pure, no torch."""
+
+    def __init__(self, patience: int = 0, min_epochs: int = 0, min_delta: float = 0.0, stop_file=None):
+        self.patience, self.min_epochs, self.min_delta = int(patience), int(min_epochs), float(min_delta)
+        self.stop_file = Path(stop_file) if stop_file else None
+        self.last = 0
+        self.best, self.best_epoch = None, 0
+        self.top, self.top_epoch = None, 0
+        self.improved = False
+        self.decision = None
+
+    def update(self, epoch: int, value) -> str | None:
+        epoch = int(epoch)
+        if epoch <= self.last or self.decision is not None:
+            return None
+        self.last = epoch
+        self.improved = False
+        if value is not None and math.isfinite(float(value)):
+            v = float(value)
+            if self.best is None or v > self.best + self.min_delta:
+                self.best, self.best_epoch = v, epoch
+            if self.top is None or v > self.top:
+                self.top, self.top_epoch, self.improved = v, epoch, True
+        if self.stop_file is not None and self.stop_file.exists():
+            self.decision = "finish"
+        elif self.patience > 0 and self.best is not None and epoch >= self.min_epochs and epoch - self.best_epoch >= self.patience:
+            self.decision = "converged"
+        return self.decision
+
+    def emit(self) -> None:
+        """The `stop` event of the decision (the best epoch is the one exported)."""
+        why = "no mAP gain above %g for %d epochs" % (self.min_delta, self.patience) if self.decision == "converged" else "finish requested"
+        log(f"stopping after epoch {self.last}: {why}; best epoch {self.top_epoch} (mAP {self.top})")
+        event("stop", reason=self.decision, epoch=self.last, best_epoch=self.top_epoch, best=self.top)
+
+
+def convergence(a) -> Convergence:
+    return Convergence(a.patience, a.min_epochs, a.min_delta, a.stop_file)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--trainer", choices=TRAINERS, required=True)
@@ -113,6 +165,9 @@ def parse_args() -> argparse.Namespace:
                    help="Ultralytics: cache the decoded training images in RAM (auto: when they fit a quarter of the free memory)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--patience", type=int, default=0, help="stop after this many epochs without improvement (0 = off)")
+    p.add_argument("--min-epochs", type=int, default=0, help="no convergence stop before this epoch")
+    p.add_argument("--min-delta", type=float, default=0.0, help="smallest validation mAP gain that counts as an improvement")
+    p.add_argument("--stop-file", type=Path, default=None, help="finish after the current epoch (keeping the best one) once this file exists")
     p.add_argument("--aug-dark", type=float, default=0.0, help="probability of the synthetic darkness augmentation")
     p.add_argument("--aug-noise", type=float, default=0.0, help="probability of the sensor noise augmentation")
     p.add_argument("--aug-gray", type=float, default=0.0, help="probability of the grayscale (IR-like) augmentation")
@@ -131,6 +186,8 @@ def parse_args() -> argparse.Namespace:
         if not 0.0 <= v <= 1.0:
             p.error(f"--{k.replace('_', '-')} must be between 0 and 1")
     # The input size step is the family's (32; RF-DETR base 56): checked by the trainers.
+    if a.patience < 0 or a.min_epochs < 0 or not (a.min_delta >= 0 and math.isfinite(a.min_delta)):
+        p.error("--patience, --min-epochs and --min-delta must not be negative")
     if a.epochs < 1 or a.batch < 1 or a.imgsz < 32:
         p.error("--epochs and --batch must be at least 1, --imgsz at least 32")
     return a
@@ -797,9 +854,12 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     def on_train_epoch_end(trainer):
         meter.train_done()
 
+    conv = convergence(a)
+
     def on_fit_epoch_end(trainer):
-        # Also called once more by the final validation of best.pt: report each epoch once.
-        if trainer.epoch + 1 <= state.get("reported", 0) or trainer.epoch + 1 > trainer.epochs:
+        # Also called once more by the final validation of best.pt (epoch + 1, after the loop):
+        # report each epoch once, nothing after a convergence stop.
+        if trainer.epoch + 1 <= state.get("reported", 0) or trainer.epoch + 1 > trainer.epochs or conv.decision:
             return
         state["reported"] = trainer.epoch + 1
         m = scalar_metrics(trainer.metrics)
@@ -841,6 +901,14 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
             map=m.get("metrics/mAP50-95(B)"),
             elapsed_s=round(time.time() - started, 1),
         )
+        # Runs after the epoch's checkpoints were saved and before the loop's `if self.stop:
+        # break` (ultralytics 8.4 engine/trainer.py `_do_train`): stop ends training here, then
+        # best.pt is validated and exported as always.
+        tm = getattr(trainer, "metrics", None) or {}
+        value = tm.get("metrics/mAP50-95(B)", tm.get("metrics/mAP50(B)"))
+        if conv.update(trainer.epoch + 1, value):
+            conv.emit()
+            trainer.stop = True
 
     model.add_callback("on_train_epoch_start", on_train_epoch_start)
     model.add_callback("on_train_batch_end", on_train_batch_end)
@@ -878,7 +946,8 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         plots=False,
         seed=a.seed,
         deterministic=False,
-        patience=a.patience or 100,
+        # Ultralytics' own early stopping off (Convergence decides; it would stop at epochs + 1).
+        patience=a.epochs + 1,
         trainer=NightTrainer,
         verbose=True,
     )
@@ -1048,6 +1117,8 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     if orig_sweep is not None:
         coco_eval.sweep_confidence_thresholds = sweep
 
+    conv = convergence(a)
+
     class Progress(Callback):
         def on_train_epoch_start(self, trainer, pl_module):
             meter.epoch_start()
@@ -1084,6 +1155,11 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             m.update(meter.metrics())
             emit_metrics("epoch", m, epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, loss=loss, map50=mp,
                          map=mp95, elapsed_s=round(time.time() - started, 1))
+            # Lightning runs the epoch's validation before on_train_epoch_end, so the mAP is this
+            # epoch's; should_stop ends fit after it (rfdetr's own early stopping is not enabled).
+            if not trainer.sanity_checking and conv.update(trainer.current_epoch + 1, mp95 if mp95 is not None else mp):
+                conv.emit()
+                trainer.should_stop = True
 
     # rfdetr builds its Lightning trainer itself; add the progress callback to every trainer it builds.
     import pytorch_lightning as pl
@@ -1107,9 +1183,6 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     )
     if a.lr is not None:
         kw["lr"] = a.lr
-    if a.patience:
-        kw["early_stopping"] = True
-        kw["early_stopping_patience"] = a.patience
     if a.multi_scale == "off":
         kw["multi_scale"] = False
     if a.workers > 0:
@@ -1123,8 +1196,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     except TypeError as e:
         # A keyword this rfdetr version does not take: retry without the optional ones.
         log(f"rfdetr rejected an option ({e}); retrying with the basic options")
-        for k in ("seed", "early_stopping", "early_stopping_patience", "multi_scale", "persistent_workers",
-                  "pin_memory"):
+        for k in ("seed", "multi_scale", "persistent_workers", "pin_memory"):
             kw.pop(k, None)
         model.train(**kw)
     pl.Trainer.__init__ = orig_init
@@ -1350,16 +1422,31 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
                 emit_metrics("eval", {k: v for k, v in metrics.items() if k != "epoch" and not k.endswith(("_runtime", "_per_second"))},
                              epoch=round(state.epoch or 0), epochs=a.epochs, val_loss=float(metrics["eval_loss"]))
 
+    conv = convergence(a)
+    best_state = {}
+
     class DetectionTrainer(Trainer):
-        """Trainer whose evaluation also scores the detections (mAP, P / R, F-beta)."""
+        """Trainer whose evaluation also scores the detections (mAP, P / R, F-beta), keeps the
+        best epoch's weights and stops on convergence (or a finish request)."""
 
         def evaluate(self, *args, **kw):
             out = super().evaluate(*args, **kw)
+            m = {}
+            epoch = round(self.state.epoch or 0)
             try:
                 m = detection_metrics(self.model, val_ds, proc, a.batch, a.imgsz)
-                emit_metrics("eval", m, epoch=round(self.state.epoch or 0), epochs=a.epochs)
+                emit_metrics("eval", m, epoch=epoch, epochs=a.epochs)
             except Exception as e:  # the loss still counts
                 log(f"detection metrics skipped ({type(e).__name__}: {e})")
+            if epoch >= 1:
+                decision = conv.update(epoch, m.get("map", m.get("map50")))
+                if conv.improved:
+                    best_state["epoch"], best_state["value"] = conv.top_epoch, conv.top
+                    best_state["sd"] = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                if decision:
+                    conv.emit()
+                    # Read after this evaluation by the epoch loop (transformers Trainer `train`).
+                    self.control.should_training_stop = True
             free_memory(device)
             return out
 
@@ -1396,6 +1483,12 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
     trainer = DetectionTrainer(model=model, args=targs, train_dataset=train_ds, eval_dataset=val_ds, data_collator=collate,
                                callbacks=[Progress()])
     trainer.train()
+    if best_state.get("sd") is not None:
+        # The best epoch, not the last one (save_strategy="no": nothing else keeps it).
+        trainer.model.load_state_dict(best_state["sd"])
+        log(f"exporting epoch {best_state['epoch']} (best mAP {best_state['value']:.4f}); the last epoch was {conv.last}")
+    else:
+        log("exporting the last epoch (no validation mAP was measured)")
     event("phase", phase="export", detail="exporting to ONNX")
     model = trainer.model.eval().float().cpu()
 

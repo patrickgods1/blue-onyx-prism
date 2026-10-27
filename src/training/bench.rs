@@ -1,8 +1,16 @@
 //! The benchmark at the end of a run: the trained model on its held-out frames (a `dir:` set)
 //! and optional built-in sets, through the regular [`BenchmarkService`] (so the results land in
 //! `benchmark.json` and its history like any other run), summarized for the Training page.
+//!
+//! Per-scene AP comes from the benchmark's per-tag breakdowns of the held-out manifest's own tags
+//! ([`dataset::heldout_tags`]: `heldout:day|night|ir|all|in-scope`), which are exact AP over
+//! those images and never mix in the built-in sets run beside it (their bare `day` / `night` tags
+//! would). Held-out sets of older versions only carry the bare scene tags: they are read when the
+//! held-out set was the only dataset of the run, and give no `in_scope`.
 
-use super::job::BenchSummary;
+use super::dataset;
+use super::job::{BenchSummary, SceneAp};
+use crate::benchmark::Breakdown;
 use crate::benchmark::report::ModelResult;
 use crate::benchmark::service::{BenchmarkService, RunContext, RunRequest, RunState};
 use crate::config::DatasetRef;
@@ -46,6 +54,10 @@ pub fn run(
     let c = ctx();
     let mut req = RunRequest::defaults(&c.config.benchmark);
     req.models = vec![name.to_string()];
+    let fingerprint = sets.iter().find_map(|s| match s {
+        DatasetRef::Dir { dir, .. } => dataset::read_heldout_fingerprint(dir),
+        _ => None,
+    });
     req.datasets = sets;
     req.devices = Vec::new();
     req.reference_model = None;
@@ -95,7 +107,10 @@ pub fn run(
     if let Some(e) = &m.error {
         bail!("benchmarking {name} failed: {e}");
     }
-    Ok(Some(summarize(m)))
+    Ok(Some(BenchSummary {
+        heldout_fingerprint: fingerprint,
+        ..summarize(m)
+    }))
 }
 
 /// The Training page's view of a benchmark result: the recommended device (else the first that
@@ -116,6 +131,40 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
         },
         None => (None, None),
     };
+    let tags: &[Breakdown] = acc.map(|a| a.by_tag.as_slice()).unwrap_or_default();
+    let ap = |b: &Breakdown| SceneAp {
+        ap50: b.ap50,
+        ap50_95: b.ap50_95,
+        images: b.images,
+    };
+    let tagged = |key: &str| tags.iter().find(|b| b.key == key).map(ap);
+    let mut by_scene = std::collections::BTreeMap::new();
+    let mut in_scope = None;
+    if tagged(dataset::HELDOUT_ALL).is_some() {
+        for s in ["day", "night", "ir", "all"] {
+            if let Some(a) = tagged(&format!("{}{s}", dataset::HELDOUT_TAG)) {
+                by_scene.insert(s.to_string(), a);
+            }
+        }
+        in_scope = tagged(dataset::HELDOUT_IN_SCOPE);
+    } else if m.datasets.len() == 1
+        && let Some(a) = acc
+    {
+        // An older held-out set alone: its bare scene tags are its own.
+        for s in ["day", "night", "ir"] {
+            if let Some(b) = tagged(s) {
+                by_scene.insert(s.to_string(), b);
+            }
+        }
+        by_scene.insert(
+            "all".into(),
+            SceneAp {
+                ap50: a.overall.ap50,
+                ap50_95: a.overall.ap50_95,
+                images: a.overall.images,
+            },
+        );
+    }
     BenchSummary {
         datasets: m.datasets.clone(),
         device: dev.map(|d| d.device.clone()),
@@ -123,6 +172,9 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
         ap50,
         ap50_95,
         images: m.images,
+        by_scene,
+        in_scope,
+        heldout_fingerprint: None,
     }
 }
 
@@ -148,5 +200,103 @@ mod tests {
         );
         assert_eq!(d[1], DatasetRef::Id("nir-night".into()));
         assert!(datasets("x", None, &[]).is_empty());
+    }
+
+    fn breakdown(key: &str, images: usize, ap: f64) -> Breakdown {
+        Breakdown {
+            key: key.into(),
+            images,
+            gt: images,
+            precision: None,
+            recall: None,
+            f1: None,
+            ap50: Some(ap + 0.2),
+            ap50_95: Some(ap),
+            relative: false,
+            roc_auc: None,
+        }
+    }
+
+    /// A trained model's result on its held-out set (+ `extra` datasets) with `tags`.
+    fn result(tags: Vec<Breakdown>, extra: bool) -> ModelResult {
+        use crate::benchmark::report::test_support::{dev, model, scene};
+        let mut d = dev("openvino:cpu", 12.0, scene());
+        let overall = crate::benchmark::metrics::Summary {
+            images: 30,
+            ap50: Some(0.7),
+            ap50_95: Some(0.4),
+            ..Default::default()
+        };
+        d.run.as_mut().unwrap().accuracy = Some(crate::benchmark::AccuracyReport {
+            ground_truth: "ground truth".into(),
+            relative: false,
+            classes: vec!["person".into()],
+            threshold: 0.5,
+            overall,
+            by_dataset: vec![],
+            by_tag: tags,
+            all_classes: None,
+            sweep: None,
+            frame_roc: None,
+        });
+        let mut m = model(vec![d], Some("openvino:cpu"));
+        m.datasets = vec!["heldout-x".into()];
+        if extra {
+            m.datasets.push("nir-night".into());
+        }
+        m
+    }
+
+    #[test]
+    fn summarize_reads_ap_per_scene_from_the_heldout_tags() {
+        // Bare tags mix in a built-in set run beside; the `heldout:` ones do not.
+        let tags = vec![
+            breakdown("day", 50, 0.9),
+            breakdown("night", 210, 0.1),
+            breakdown("heldout:all", 30, 0.45),
+            breakdown("heldout:day", 10, 0.6),
+            breakdown("heldout:night", 12, 0.3),
+            breakdown("heldout:ir", 8, 0.35),
+            breakdown("heldout:in-scope", 20, 0.32),
+            breakdown("res:sd", 30, 0.45),
+        ];
+        let b = summarize(&result(tags, true));
+        assert_eq!(b.by_scene.len(), 4);
+        let day = b.by_scene["day"];
+        assert_eq!(
+            (day.ap50_95, day.ap50, day.images),
+            (Some(0.6), Some(0.8), 10)
+        );
+        assert_eq!(b.by_scene["night"].ap50_95, Some(0.3));
+        assert_eq!(b.by_scene["ir"].images, 8);
+        assert_eq!(b.by_scene["all"].ap50_95, Some(0.45));
+        let s = b.in_scope.unwrap();
+        assert_eq!((s.ap50_95, s.images), (Some(0.32), 20));
+        assert_eq!(b.ms_p50, Some(12.0));
+        assert_eq!(
+            b.heldout_fingerprint, None,
+            "set by run() from dataset.json"
+        );
+        // Serialized only when present (old records stay as they were).
+        let j = serde_json::to_value(BenchSummary::default()).unwrap();
+        assert!(j.get("by_scene").is_none() && j.get("in_scope").is_none());
+        let back: BenchSummary = serde_json::from_str(
+            r#"{"datasets":[],"device":null,"ms_p50":null,"ap50":null,"ap50_95":null,"images":0}"#,
+        )
+        .unwrap();
+        assert!(back.by_scene.is_empty());
+    }
+
+    #[test]
+    fn older_heldout_sets_use_the_bare_tags_only_when_alone() {
+        let tags = vec![breakdown("day", 10, 0.6), breakdown("ir", 8, 0.35)];
+        let b = summarize(&result(tags.clone(), false));
+        assert_eq!(b.by_scene["day"].ap50_95, Some(0.6));
+        assert_eq!(b.by_scene["ir"].ap50_95, Some(0.35));
+        assert_eq!(b.by_scene["all"].ap50_95, Some(0.4));
+        assert!(!b.by_scene.contains_key("night"));
+        assert_eq!(b.in_scope, None);
+        // Beside a built-in set the bare tags are not the held-out set's.
+        assert!(summarize(&result(tags, true)).by_scene.is_empty());
     }
 }

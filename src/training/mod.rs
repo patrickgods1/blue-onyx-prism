@@ -25,6 +25,7 @@ pub mod autolabel;
 pub mod bench;
 pub mod capability;
 pub mod cli;
+pub mod compare;
 pub mod config;
 pub mod dataset;
 pub mod estimate;
@@ -186,7 +187,7 @@ fn workers() -> u32 {
 
 /// Build the job of `request` on `config` and `cap` (see the checks below; `request.gpu` picks
 /// one of `cap`'s GPUs, else the automatic pick). `name`: the model name, default
-/// `night-<model>-<stamp>` / `custom-<model>-<stamp>`.
+/// `<scene label>-<model>-<stamp>` (`custom-`, `day-`, `night-`, ...).
 pub fn plan_job(
     config: &Config,
     mut request: TrainRequest,
@@ -230,11 +231,10 @@ pub fn plan_job(
         .map(|d| config.data_path(d))
         .collect();
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
-    let night = request.scene == dataset::SceneFilter::NightIr;
     let name = name
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| request.recipe.default_name(night, &stamp));
+        .unwrap_or_else(|| request.recipe.default_name(request.scene.label(), &stamp));
     recipe::valid_model_name(&name)?;
     let paths = TrainPaths::for_config(config);
     request.install_dir = request
@@ -270,6 +270,7 @@ pub fn plan_job(
     }
     let id = service::new_run_id();
     let t = &config.training;
+    let excluded = request.excluded;
     Ok(TrainJob {
         run_dir: training_dir(config).join(&id),
         id,
@@ -282,6 +283,7 @@ pub fn plan_job(
             negative_share: t.negative_share,
             heldout_share: t.heldout_share,
             oversample: t.oversample,
+            excluded,
             ..dataset::Options::default()
         },
         root: config.data_root(),
@@ -341,7 +343,7 @@ mod tests {
         };
         assert_eq!(size(&cap).suggested_batch, Some(4));
         assert!(!size(&cap).measured);
-        let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano", 1).unwrap();
+        let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
         r.batch = 4;
         let mut other = r.clone();
         other.imgsz = 448;
@@ -370,16 +372,22 @@ mod tests {
 
     fn request(family: TrainFamily, size: &str) -> TrainRequest {
         TrainRequest {
-            recipe: TrainRecipe::new(family, size, 1).unwrap(),
+            recipe: TrainRecipe {
+                epochs: 1,
+                patience: 0,
+                ..TrainRecipe::new(family, size).unwrap()
+            },
             datasets: vec!["exports/a".into()],
             include_public: false,
-            scene: dataset::SceneFilter::NightIr,
+            scene: dataset::SceneFilter::NIGHT_IR,
             classes: None,
             rename: Default::default(),
             benchmark_sets: Vec::new(),
             allow_large: false,
             install_dir: None,
             gpu: None,
+            excluded: Default::default(),
+            compare_group: None,
         }
     }
 

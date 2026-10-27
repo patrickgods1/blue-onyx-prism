@@ -51,6 +51,7 @@
       <td>
         {% if r.busy %}<div class="inline-row"><form method="post" action="/training/pause" class="inline" data-field="pause"{% if r.state != "running" %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Suspend its processes where they are. Models stay loaded and GPU memory stays in use; nothing else on the queue starts until you resume or cancel it.">Pause</button></form>
         <form method="post" action="/training/resume" class="inline" data-field="resume"{% if r.state != "paused" %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Continue exactly where it was paused.">Resume</button></form>
+        <form method="post" action="/training/finish" class="inline" data-field="finish"{% if !r.can_finish %} hidden{% endif %}><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small" title="Stop after this epoch and keep the best checkpoint">Finish now</button></form>
         <form method="post" action="/training/cancel" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small danger">Cancel</button></form></div>
         {% else %}<form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small">Remove</button></form>{% endif %}
       </td>
@@ -339,17 +340,31 @@
       <div class="with-browse tr-browse"><input type="text" id="train-folder" name="dataset_path" autocomplete="off" placeholder="C:\BlueOnyx\exports\review-2026-10"><button type="button" class="browse secondary" data-browse="folder" data-target="dataset_path" data-title="Choose a review export folder" hidden>Folder&hellip;</button><button type="submit" class="secondary" formaction="/training/datasets" formnovalidate name="save" value="1">Save folder</button></div>
       <p class="muted small">Used by this run when filled; Save folder keeps it in the list above.</p>
     </div>
-    <div class="tr-grid">
-      <div class="tr-field">
-        <label for="train-scene">Scene</label>
-        <select id="train-scene" name="scene">{% for (v, t) in scenes %}<option value="{{ v }}">{{ t }}</option>{% endfor %}</select>
+    <fieldset class="tr-scenes" id="train-scenes">
+      <legend>Runs</legend>
+      <div class="tr-scene-list">
+      {% for c in scenes %}{% if c.preset %}<label class="check" title="{{ c.describe }}"><input type="checkbox" name="scene" value="{{ c.value }}" data-prefix="{{ c.prefix }}"{% if c.value == "all" %} checked{% endif %}> {{ c.title }}</label>{% endif %}{% endfor %}
+      <details class="tr-scene-other">
+        <summary>Other</summary>
+        {% for c in scenes %}{% if !c.preset %}<label class="check" title="{{ c.describe }}"><input type="checkbox" name="scene" value="{{ c.value }}" data-prefix="{{ c.prefix }}"> {{ c.title }}</label>{% endif %}{% endfor %}
+      </details>
       </div>
-      <div class="tr-field">
-        <label for="train-classes">Classes</label>
-        <input type="text" id="train-classes" name="classes" placeholder="person, car, dog, cat, raccoon">
-        <p class="muted small">Comma-separated, in head order; empty = all of the export.</p>
+      <p class="muted small">One run per ticked scene and model. Ticking several compares them: every run is benchmarked on the same held-out frames (all scenes), and a Comparison table shows their AP per scene. None ticked = all scenes.</p>
+      <p class="small tr-runs-line" id="train-runs-line" role="status" hidden></p>
+    </fieldset>
+    <fieldset class="tr-classes" id="train-classes">
+      <legend>Classes</legend>
+      <div id="train-picker">
+        <input type="text" name="classes" aria-label="Classes" placeholder="person, car, dog, cat, raccoon">
+        <p class="muted small">Comma-separated, in head order; empty = all of the export. (With scripts: a list of the ticked folders' classes and their boxes.)</p>
       </div>
-    </div>
+      <p class="small" id="train-classes-msg" role="status"></p>
+      <div class="tr-radios" role="radiogroup" aria-label="Objects of unticked classes">
+        <span class="muted small">Objects of unticked classes:</span>
+        <label class="check" title="The frame stays; the object is background (a frame left without a box is a negative). Right for unrelated objects (a bench)."><input type="radio" name="excluded" value="background" checked> treat as background</label>
+        <label class="check" title="Training and validation frames with such an object are left out, so a look-alike of a trained class (a dog when training cat) is never taught as background. The held-out frames stay."><input type="radio" name="excluded" value="drop-frame"> leave those frames out</label>
+      </div>
+    </fieldset>
     <label class="check"><input type="checkbox" name="public"{% if !public_available %} disabled{% endif %}> Mix in the public night subset (LILA camera traps, CDLA)</label>
     {% if !public_available %}<p class="muted small">Not pinned in this build.</p>{% else if !public_installed %}<p class="muted small">A {{ public_size }} download on the first run.</p>{% endif %}
   </fieldset>
@@ -363,7 +378,7 @@
       <tbody>
       {% for f in families %}
       <tr>
-        <th scope="row">{{ f.title }}<br><span class="tag">{{ f.license }}</span></th>
+        <th scope="row">{{ f.title }}<br><span class="tag">{{ f.license }}</span>{% if f.available %}<br><span class="muted small tr-rec" title="Recommended: what blank Epochs and Patience fields use (epochs is a cap: the run stops once it converges)">{{ f.recommended }}</span>{% endif %}</th>
         {% if !f.available %}
         <td colspan="{{ size_cols }}" class="muted small">{{ f.why }}</td>
         {% else %}
@@ -391,12 +406,18 @@
     <div class="tr-grid">
       <div class="tr-field">
         <label for="train-epochs">Epochs</label>
-        <input type="number" id="train-epochs" name="epochs" min="1" max="1000" value="{{ epochs }}">
+        <input type="number" id="train-epochs" name="epochs" min="1" max="1000" value="{{ epochs }}" placeholder="recommended">
+        <p class="muted small">Empty = each family's recommendation (shown under its name). A cap: the run stops once it converges.</p>
+      </div>
+      <div class="tr-field">
+        <label for="train-patience">Patience</label>
+        <input type="number" id="train-patience" name="patience" min="0" max="1000" value="{{ patience }}" placeholder="recommended">
+        <p class="muted small">Epochs without a validation mAP gain before the run stops and keeps its best epoch. Empty = recommended, 0 = off (train every epoch).</p>
       </div>
       <div class="tr-field">
         <label for="train-name">Model name</label>
         <input type="text" id="train-name" name="name">
-        <p class="muted small" id="train-name-hint">One ticked model only; empty = <code>night-</code>/<code>custom-&lt;model&gt;-&lt;date&gt;</code>.</p>
+        <p class="muted small" id="train-name-hint">One run only (one model, one scene); empty = <code>custom-</code>/<code>day-</code>/<code>night-&lt;model&gt;-&lt;date&gt;</code>.</p>
       </div>
       {% if let Some(auto) = gpu_choices.first() %}
       <div class="tr-field">
@@ -468,6 +489,37 @@
   <div class="actions"><button type="submit">Queue training</button></div>
   {% endif %}
 </form>
+
+{% if !comparisons.is_empty() %}
+<div class="card" id="compare">
+  <h2>Comparison</h2>
+  <p class="muted small">Runs queued together with several scenes, benchmarked on the same held-out frames. AP50-95 per scene of the held-out frames (AP50 beneath); <strong>bold</strong> = the best of the column. The routed row pairs the day run's day AP with the night run's night / IR AP, as a model with a night model would score (no combined AP is made up). JSON: <code>/v1/training/compare?group=&lt;group&gt;</code>.</p>
+  {% for g in comparisons %}
+  <details class="tr-compare"{% if g.open %} open{% endif %}>
+    <summary>{{ g.group }} <span class="muted small">({{ g.rows.len() }} rows)</span>{% if !g.comparable %} <span class="chip chip-nc">not comparable</span>{% endif %}</summary>
+    {% if !g.comparable %}<p class="warn small">Not comparable: the held-out frames differ.</p>{% endif %}
+    {% if !g.warnings.is_empty() %}<ul class="warn-list small">{% for w in g.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
+    <div class="scroll">
+    <table class="tr-ctable">
+      <thead><tr><th>Run</th><th>Scene</th><th class="num" title="AP50-95 on the day frames of the held-out set (AP50 beneath)">Day</th><th class="num" title="AP50-95 on the night frames">Night</th><th class="num" title="AP50-95 on the IR frames">IR</th><th class="num" title="AP50-95 on every held-out frame">All</th><th class="num" title="AP50-95 on the held-out frames of the scenes the run trained on">In scope</th><th class="num" title="Time per image, median">p50 ms</th><th>Epochs</th></tr></thead>
+      <tbody>
+      {% for r in g.rows %}
+      <tr{% if r.routed %} class="tr-routed"{% endif %}>
+        <td><code>{{ r.name }}</code><br><span class="muted small">{{ r.model }}{% if !r.state.is_empty() %} &middot; {{ r.state }}{% endif %}</span></td>
+        <td>{{ r.scene }}</td>
+        {% for c in r.cells %}<td class="num{% if c.best %} best-val{% endif %}"{% if c.images > 0 %} title="{{ c.images }} images"{% endif %}>{{ c.ap }}{% if !c.ap50.is_empty() %}<br><span class="muted small">AP50 {{ c.ap50 }}</span>{% endif %}</td>{% endfor %}
+        <td class="num">{{ r.in_scope }}</td>
+        <td class="num{% if r.ms_best %} best-val{% endif %}">{{ r.ms }}</td>
+        <td class="small">{{ r.epochs }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </details>
+  {% endfor %}
+</div>
+{% endif %}
 
 <div class="card" id="use">
   <h2>Use a trained model</h2>

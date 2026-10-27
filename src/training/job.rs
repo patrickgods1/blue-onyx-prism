@@ -129,6 +129,13 @@ pub struct TrainRequest {
     /// [`super::plan_job`] stores the canonical device of the chosen GPU.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<String>,
+    /// What a train / valid frame with a box of an untrained label becomes.
+    #[serde(default)]
+    pub excluded: dataset::Excluded,
+    /// Runs queued together to be compared (one per scene filter x model): the first run's id
+    /// stamp ([`super::compare`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare_group: Option<String>,
 }
 
 /// One queued run.
@@ -205,6 +212,25 @@ pub struct BenchSummary {
     pub ap50: Option<f64>,
     pub ap50_95: Option<f64>,
     pub images: usize,
+    /// AP on the held-out frames per scene: `day`, `night`, `ir`, and `all` (every held-out
+    /// frame) ([`super::bench::summarize`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_scene: BTreeMap<String, SceneAp>,
+    /// AP on the held-out frames of the scenes the run trained on (its headline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_scope: Option<SceneAp>,
+    /// [`dataset::Plan::heldout_fingerprint`] of the held-out set benchmarked; None for runs of
+    /// older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heldout_fingerprint: Option<String>,
+}
+
+/// AP of a subset of the held-out frames.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct SceneAp {
+    pub ap50: Option<f64>,
+    pub ap50_95: Option<f64>,
+    pub images: usize,
 }
 
 /// What the caller does for a run.
@@ -260,6 +286,12 @@ pub struct TrainError {
 /// `<models>/<name>.provenance.json`.
 pub fn provenance_path(models: &Path, name: &str) -> PathBuf {
     models.join(format!("{name}.provenance.json"))
+}
+
+/// The file whose presence asks the trainer to finish after the current epoch and export its
+/// best one (`train_model.py --stop-file`; written by [`super::TrainingService::finish`]).
+pub fn stop_file(run_dir: &Path) -> PathBuf {
+    run_dir.join("work").join("stop-request")
 }
 
 /// Log file of a run.
@@ -575,6 +607,7 @@ fn stages(
     opts.scene = job.request.scene;
     opts.classes = job.request.classes.clone();
     opts.rename = job.request.rename.clone();
+    opts.excluded = job.request.excluded;
     let plan = dataset::plan(&sources, &opts)?;
     let data_dir = job.run_dir.join("data");
     manager::remove_any(&data_dir)?;
@@ -598,6 +631,15 @@ fn stages(
 
     // 5. Train (the script also exports and checks the ONNX).
     enter!(TrainStage::Train, 0, "starting the trainer");
+    if !recipe.early_stopping() {
+        let w = format!(
+            "early stopping is off (patience {} of {} epochs): every epoch runs; the best one is \
+             still exported",
+            recipe.patience, recipe.epochs
+        );
+        log.line(&format!("# {w}"));
+        report(TrainReport::Line(&w));
+    }
     let staging = models.join(format!(".{}.train-staging", job.name));
     manager::remove_any(&staging)?;
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
@@ -657,6 +699,18 @@ fn stages(
             args.push("--lr".into());
             args.push(lr.to_string().into());
         }
+        // The convergence stop (one rule for every trainer, `Convergence` in the script).
+        let rec = super::recipe::recommended(family);
+        for (k, v) in [
+            ("--patience", recipe.patience.to_string()),
+            ("--min-epochs", rec.min_epochs.to_string()),
+            ("--min-delta", rec.min_delta.to_string()),
+        ] {
+            args.push(k.into());
+            args.push(v.into());
+        }
+        args.push("--stop-file".into());
+        args.push(stop_file(&job.run_dir).into_os_string());
         if family == TrainFamily::Rfdetr {
             args.push("--multi-scale".into());
             args.push(if multi_scale { "on" } else { "off" }.into());
@@ -683,9 +737,18 @@ fn stages(
                 }
             }
         }
+        // A finish request of an earlier attempt (or run) does not end this one at its first epoch.
+        let stop = stop_file(&job.run_dir);
+        if let Err(e) = std::fs::remove_file(&stop)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            bail!("cannot remove the old stop request {}: {e}", stop.display());
+        }
         let started = Instant::now();
         let mut tp = TrainProgress {
             note: note.clone(),
+            patience: recipe.patience,
+            min_delta: super::recipe::recommended(family).min_delta_f64(),
             ..TrainProgress::default()
         };
         let mut done: Option<TrainEvent> = None;

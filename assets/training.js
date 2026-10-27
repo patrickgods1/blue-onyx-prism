@@ -5,6 +5,8 @@
 // Auto-label after import: a ticked import posts the Auto-label card's fields as `al.<name>`
 // hidden inputs (its classes included); the box and its follow-up options are remembered in
 // localStorage. A Recent imports row's Auto-label button fills the card's filter (import=<id>).
+// Train: the runs line (one run per ticked scene per model, named before queuing), the class
+// picker of the ticked folders (counts per scene, warnings) and Finish now while training.
 (function () {
   "use strict";
 
@@ -319,22 +321,46 @@
 
   var train = document.getElementById("train");
   if (train) {
-    // The model name: one ticked model only (the server refuses it with more).
+    // The runs: one per ticked scene per ticked model. The line lists their names before
+    // queuing; the model name field works for one run only (the server refuses it with more).
     var name = document.getElementById("train-name");
     var hint = document.getElementById("train-name-hint");
+    var runsLine = document.getElementById("train-runs-line");
     var models = train.querySelectorAll('input[name="model"]');
+    var sceneBoxes = train.querySelectorAll('input[name="scene"]');
     var hintText = hint ? hint.innerHTML : "";
+    var tickedScenes = function () {
+      var out = [];
+      sceneBoxes.forEach(function (b) { if (b.checked) out.push(b); });
+      return out;
+    };
     var names = function () {
-      var n = 0;
-      models.forEach(function (m) { if (m.checked) n++; });
+      var ms = [];
+      models.forEach(function (m) { if (m.checked) ms.push(m.value); });
+      var sc = tickedScenes();
+      // None ticked = all scenes (the server's rule).
+      var prefixes = sc.length ? sc.map(function (b) { return b.getAttribute("data-prefix") || "custom"; }) : ["custom"];
+      var list = [];
+      ms.forEach(function (m) { prefixes.forEach(function (p) { list.push(p + "-" + m); }); });
+      var n = list.length;
+      if (runsLine) {
+        runsLine.hidden = n === 0;
+        runsLine.textContent = n === 0 ? "" :
+          "Queues " + n + " run" + (n === 1 ? "" : "s") + ": " + list.join(", ") +
+          (prefixes.length > 1 ? " (compared on the same held-out frames)" : "");
+      }
       if (!name) return;
       name.disabled = n > 1;
       if (hint) {
-        if (n > 1) hint.textContent = n + " models ticked: each gets its own name (night-/custom-<model>-<date>).";
+        if (n > 1) hint.textContent = n + " runs: each gets its own name (<scene>-<model>-<date>).";
         else hint.innerHTML = hintText;
       }
     };
     models.forEach(function (m) { m.addEventListener("change", names); });
+    sceneBoxes.forEach(function (b) { b.addEventListener("change", names); });
+    // Night only / IR only ticked: the Other section stays open.
+    var other = train.querySelector(".tr-scene-other");
+    if (other && other.querySelector("input:checked")) other.open = true;
     names();
 
     // Night augmentation: its probabilities show (and post) only when ticked; prefilled with
@@ -354,6 +380,212 @@
       aug(false);
     }
   }
+
+  // Train classes: the class picker (class-picker.js) over the classes of the ticked dataset
+  // folders (GET /v1/training/dataset-classes), each with its boxes per scene and warning chips
+  // (few boxes; none in a ticked scene). Starts with the last choice (localStorage), else what
+  // the enabled models detect (the auto-label default), else every class with boxes. The picked
+  // classes post as repeated `classes` fields, in the folders' class-list order.
+  (function () {
+    var form = document.getElementById("train"), CP = window.ClassPicker;
+    var holder = document.getElementById("train-picker"), msg = document.getElementById("train-classes-msg");
+    if (!form || !holder || !CP) return;
+    var KEY = "bop.training.classes";
+    var FEW = 50;
+    var picker = null, inv = null, byName = {}, catalog = null, seq = 0, timer = null, lastQuery = null;
+    var mk = function (tag, cls, text) {
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text != null) e.textContent = text;
+      return e;
+    };
+    var note = function (text) { holder.replaceChildren(mk("p", "muted small", text)); };
+    var stored = function () {
+      try {
+        var v = JSON.parse(window.localStorage.getItem(KEY) || "null");
+        return Array.isArray(v) ? v.filter(function (x) { return typeof x === "string"; }) : null;
+      } catch (e) { return null; }
+    };
+    var store = function (names) {
+      try { window.localStorage.setItem(KEY, JSON.stringify(names)); } catch (e) { /* storage blocked */ }
+    };
+    var datasets = function () {
+      var out = [];
+      form.querySelectorAll('input[name="dataset"]').forEach(function (b) { if (b.checked && !b.disabled) out.push(b.value); });
+      var extra = form.elements.dataset_path;
+      if (extra && extra.value.trim()) out.push(extra.value.trim());
+      return out;
+    };
+    var scenes = function () {
+      var out = [];
+      form.querySelectorAll('input[name="scene"]').forEach(function (b) { if (b.checked) out.push(b.value); });
+      return out.length ? out : ["all"];
+    };
+    var sceneText = function (v) { return v === "all" ? "all scenes" : v.split("+").map(function (k) { return k === "ir" ? "IR" : k; }).join(" + "); };
+    // Boxes of class count `c` in the scene filter `v` (`all`, `day`, `night+ir`, ...).
+    var boxesIn = function (c, v) {
+      if (v === "all") return c.boxes;
+      return v.split("+").reduce(function (n, k) { return n + ((c.by_scene || {})[k] || 0); }, 0);
+    };
+    var present = function () {
+      var withBoxes = (inv.classes || []).filter(function (c) { return c.boxes > 0; }).map(function (c) { return c.name; });
+      return withBoxes.length ? withBoxes : (inv.classes || []).map(function (c) { return c.name; });
+    };
+    var inOrder = function (names) {
+      var order = inv.order || [];
+      return names.slice().sort(function (a, b) { return order.indexOf(a) - order.indexOf(b); });
+    };
+    var only = function (names, within) { return (names || []).filter(function (n) { return within.indexOf(n) >= 0; }); };
+    var defaults = function () {
+      var p = present();
+      var last = only(stored(), p);
+      if (last.length) return last;
+      var rel = only((catalog && catalog.relevant) || [], p);
+      return rel.length ? rel : p;
+    };
+    var extra = function (entry, chip) {
+      var c = byName[entry.name];
+      if (!c) return;
+      var label = chip.querySelector(".cp-label") || chip;
+      var s = c.by_scene || {};
+      var count = mk("span", "tr-cls-count", c.boxes + " · day " + (s.day || 0) + " / night " + (s.night || 0) + " / IR " + (s.ir || 0));
+      count.title = c.boxes + " boxes in " + c.frames + " frames: " + (s.day || 0) + " day, " + (s.night || 0) + " night, " +
+        (s.ir || 0) + " IR" + (s.unknown ? ", " + s.unknown + " without a scene tag" : "");
+      label.appendChild(count);
+      if (c.boxes < FEW) {
+        var few = mk("span", "cp-badge tr-cls-warn", "few boxes: under " + FEW);
+        few.title = "Under " + FEW + " boxes is thin for fine-tuning; label more frames of it, or leave it out.";
+        label.appendChild(few);
+      }
+      scenes().forEach(function (v) {
+        if (v === "all" || boxesIn(c, v) > 0) return;
+        var none = mk("span", "cp-badge tr-cls-warn tr-scene-warn", "no " + sceneText(v) + " boxes");
+        none.title = "The " + sceneText(v) + " run has no box of " + c.name + " to learn from.";
+        label.appendChild(none);
+      });
+    };
+    var say = function () {
+      if (!msg) return;
+      msg.className = "small";
+      if (!inv) { msg.textContent = ""; return; }
+      var parts = [];
+      var f = inv.frames || {};
+      var total = (f.day || 0) + (f.night || 0) + (f.ir || 0) + (f.unknown || 0);
+      if (total) {
+        parts.push(total + " frames: " + (f.day || 0) + " day, " + (f.night || 0) + " night, " + (f.ir || 0) + " IR" +
+          (f.unknown ? ", " + f.unknown + " without a scene tag (only in all-scene runs)" : ""));
+      }
+      var names = picker ? picker.getSelected() : [];
+      var warn = [];
+      names.forEach(function (n) {
+        var c = byName[n];
+        if (!c) return;
+        scenes().forEach(function (v) {
+          if (v !== "all" && boxesIn(c, v) === 0) warn.push(n + " has no " + sceneText(v) + " boxes");
+        });
+      });
+      var errs = (inv.errors || []).map(function (e) { return e.dataset + ": " + e.message; });
+      if (picker && !names.length) warn.push("no class ticked");
+      msg.textContent = parts.concat(warn, errs).join(". ") + (parts.length || warn.length || errs.length ? "." : "");
+      if (warn.length || errs.length) msg.className = "small error-text";
+    };
+    // The picker's entries: the folders' classes in list order, grouped by the catalog's category.
+    var entriesNow = function () {
+      var cats = {};
+      ((catalog && catalog.entries) || []).forEach(function (e) { cats[e.name] = e.category; });
+      return (inv.order || []).filter(function (n) { return byName[n]; }).map(function (n) {
+        return { name: n, category: cats[n] || "object", in_list: true, coco: false, models: [] };
+      });
+    };
+    var build = function () {
+      byName = {};
+      (inv.classes || []).forEach(function (c) { byName[c.name] = c; });
+      var entries = entriesNow();
+      if (!entries.length) {
+        picker = null;
+        note((inv.errors || []).length ? "No classes could be read from the ticked folders." : "The ticked folders have no classes.");
+        say();
+        return;
+      }
+      var p = present();
+      var keep = picker ? only(picker.getSelected(), p) : [];
+      var sel = keep.length ? keep : defaults();
+      var rel = only((catalog && catalog.relevant) || [], p);
+      var quick = [{ label: "All with boxes", names: p }];
+      if (rel.length) quick.push({ label: "What your models detect", names: rel });
+      picker = CP.create(holder, {
+        entries: entries, selected: sel, mode: "compact", label: "Classes", emptyText: "none",
+        quickSets: quick, extra: extra,
+        onChange: function (names) { store(names); say(); }
+      });
+      picker.el.open = true;
+      say();
+    };
+    var load = function () {
+      var list = datasets();
+      var q = list.map(function (d) { return "dataset=" + encodeURIComponent(d); }).join("&");
+      if (q === lastQuery) return;
+      lastQuery = q;
+      var mine = ++seq;
+      if (!list.length) {
+        inv = null; picker = null;
+        note("Tick a dataset folder to list its classes; none ticked = every class of the export.");
+        say();
+        return;
+      }
+      if (!picker) note("Reading the classes of the ticked folders…");
+      var cat = catalog ? Promise.resolve(catalog) : CP.fetchCatalog().catch(function () { return {}; });
+      Promise.all([
+        cat,
+        fetch("/v1/training/dataset-classes?" + q, { headers: { Accept: "application/json" } })
+          .then(function (res) { return res.json(); })
+      ]).then(function (r) {
+        if (mine !== seq) return;
+        catalog = r[0] || {};
+        if (!r[1] || r[1].success === false) throw new Error((r[1] && r[1].message) || "no answer");
+        inv = r[1];
+        build();
+      }).catch(function (e) {
+        if (mine !== seq) return;
+        inv = null; picker = null; lastQuery = null;
+        note("The classes could not be read (" + e.message + "); every class of the export is used.");
+        say();
+      });
+    };
+    var later = function () {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(load, 500);
+    };
+    form.querySelectorAll('input[name="dataset"]').forEach(function (b) { b.addEventListener("change", load); });
+    var extraPath = form.elements.dataset_path;
+    if (extraPath) { extraPath.addEventListener("input", later); extraPath.addEventListener("change", later); }
+    // The scene warnings follow the ticked scenes.
+    form.querySelectorAll('input[name="scene"]').forEach(function (b) {
+      b.addEventListener("change", function () {
+        if (picker && inv) picker.setEntries(entriesNow());
+        say();
+      });
+    });
+    form.addEventListener("submit", function (ev) {
+      form.querySelectorAll("input.tr-cls-field").forEach(function (i) { i.remove(); });
+      // Save folder / Remove post to /training/datasets: no class check.
+      var by = ev.submitter;
+      if (by && by.getAttribute("formaction")) return;
+      if (!picker) return;
+      var names = inOrder(picker.getSelected());
+      if (!names.length) {
+        ev.preventDefault();
+        if (msg) { msg.textContent = "Choose at least one class to train."; msg.className = "small error-text"; }
+        return;
+      }
+      names.forEach(function (n) {
+        var i = document.createElement("input");
+        i.type = "hidden"; i.name = "classes"; i.value = n; i.className = "tr-cls-field";
+        form.appendChild(i);
+      });
+    });
+    load();
+  })();
 
   // Live progress.
   var runs = document.getElementById("training-runs");
@@ -479,6 +711,12 @@
       var resume = tr.querySelector('[data-field="resume"]');
       if (pause) pause.hidden = r.state !== "running";
       if (resume) resume.hidden = r.state !== "paused";
+      // Finish now: a run in its training stage that has not stopped or started exporting.
+      var finish = tr.querySelector('[data-field="finish"]');
+      if (finish) {
+        var p = r.progress || {};
+        finish.hidden = !((r.state === "running" || r.state === "paused") && r.stage === "train" && !p.stopped && !p.phase);
+      }
       if (busy[r.id] && !isBusy(r.state)) finished = true;
     });
     return finished;
