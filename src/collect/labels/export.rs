@@ -17,8 +17,8 @@
 //! Applied before the split, recorded in `export.json`.
 //!
 //! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`]) plus [`run`], which
-//! writes into an empty or new folder (images hard-linked, else copied) and writes
-//! `export.json` last.
+//! writes into an empty or new folder, or a new `export-<UTC time>` folder inside a non-empty
+//! one, never into the dataset (images hard-linked, else copied), and writes `export.json` last.
 
 use super::super::layout::{self, Rel};
 use super::super::record::Bucket;
@@ -547,22 +547,54 @@ fn json_bytes<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(b)
 }
 
-/// `out` must be a new folder or an empty one; it is created.
-fn prepare_out(out: &Path) -> Result<()> {
-    match std::fs::read_dir(out) {
-        Ok(mut rd) => {
-            if rd.next().is_some() {
-                bail!(
-                    "{} is not empty; choose a new folder (or leave it empty for a new one under \
-                     training/exports)",
-                    out.display()
-                );
-            }
+/// `p` with symlinks and `..` resolved through its deepest existing ancestor (the rest of
+/// the path appended as given), so a folder that does not exist yet compares too.
+fn resolved(p: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            return rest.iter().rev().fold(c, |acc, n| acc.join(n));
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {}", out.display())),
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
     }
-    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))
+}
+
+/// The folder an export to `out` writes into, created: `out` when it is new or empty, else a
+/// new `export-<UTC time>` folder inside it. Never the dataset `dir` or a folder inside it
+/// (the export would mix with the frames it reads).
+fn prepare_out(dir: &Path, out: &Path, now: std::time::SystemTime) -> Result<PathBuf> {
+    if resolved(out).starts_with(resolved(dir)) {
+        let hint = match dir.parent() {
+            Some(p) if !p.as_os_str().is_empty() => format!(" (e.g. {})", p.display()),
+            _ => String::new(),
+        };
+        bail!(
+            "{} is the dataset folder under review (or inside it); choose a folder outside \
+             it{hint}, or leave the field empty for a new one under training/exports",
+            out.display()
+        );
+    }
+    let target = match std::fs::read_dir(out).map(|mut rd| rd.next().is_some()) {
+        Ok(true) => {
+            let t = out.join(format!("export-{}", crate::collect::utc_file_ts(now)));
+            if t.exists() {
+                bail!("{} already exists; export again in a moment", t.display());
+            }
+            t
+        }
+        Ok(false) => out.to_path_buf(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => out.to_path_buf(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", out.display())),
+    };
+    std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
+    Ok(target)
 }
 
 /// Export the reviewed frames of the dataset `dir` (see the module doc), every class.
@@ -608,8 +640,7 @@ pub fn run_filtered(
             dir.display()
         );
     }
-    let out = &req.out_dir;
-    prepare_out(out)?;
+    let out = &prepare_out(dir, &req.out_dir, std::time::SystemTime::now())?;
     let mut r = ExportReport {
         out_dir: out.clone(),
         formats: req.formats.clone(),
@@ -1229,6 +1260,43 @@ mod tests {
             .is_err()
         );
         assert!(!root.join("four").exists() && !root.join("five").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn out_folder_new_empty_nonempty_or_dataset() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        std::fs::create_dir_all(dir.join("day")).unwrap();
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        // New and empty folders are used as they are.
+        let new = root.join("new");
+        assert_eq!(prepare_out(&dir, &new, now).unwrap(), new);
+        assert_eq!(prepare_out(&dir, &new, now).unwrap(), new);
+        // A non-empty one gets a new export-<UTC time> folder inside it.
+        std::fs::write(new.join("x.txt"), b"x").unwrap();
+        let sub = prepare_out(&dir, &new, now).unwrap();
+        assert_eq!(
+            sub,
+            new.join(format!("export-{}", crate::collect::utc_file_ts(now)))
+        );
+        assert!(sub.is_dir());
+        assert!(
+            prepare_out(&dir, &new, now).is_err(),
+            "that folder exists now"
+        );
+        // The dataset, a folder inside it (existing or not) and a `..` path into it are refused.
+        for out in [
+            dir.clone(),
+            dir.join("day"),
+            dir.join("exports/a"),
+            root.join("new/../dataset"),
+        ] {
+            let e = prepare_out(&dir, &out, now).unwrap_err().to_string();
+            assert!(e.contains("dataset folder under review"), "{e}");
+        }
+        // The dataset's parent is fine (non-empty, so a subfolder).
+        assert!(prepare_out(&dir, &root, now).unwrap().starts_with(&root));
         let _ = std::fs::remove_dir_all(&root);
     }
 

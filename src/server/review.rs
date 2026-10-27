@@ -1466,11 +1466,21 @@ mod tests {
         assert_eq!(l["labels"]["boxes"][0]["model_label"], "person");
         assert_eq!(l["labels"]["status"], "reviewed");
 
-        // A second export into the same, now non-empty folder is refused.
+        // A second export into the same, now non-empty folder goes into a new folder inside it.
         let body = serde_json::json!({"format": "coco", "out_dir": out}).to_string();
         let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let inner = PathBuf::from(v["report"]["out_dir"].as_str().unwrap());
+        assert_eq!(inner.parent(), Some(out.as_path()));
+        assert!(inner.join("export.json").is_file());
+        // The dataset folder itself is refused.
+        let body = serde_json::json!({"format": "coco", "out_dir": d.dir}).to_string();
+        let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(v["message"].as_str().unwrap().contains("not empty"));
+        assert!(
+            v["message"].as_str().unwrap().contains("dataset folder"),
+            "{v}"
+        );
         let (s, _) = json(
             &d.state,
             post_json("/v1/review/export", r#"{"format": "parquet"}"#),
