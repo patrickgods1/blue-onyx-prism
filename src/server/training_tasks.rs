@@ -374,9 +374,10 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
                 req.source = ImportSource::Path(allowed);
             }
             if let Some(d) = &req.out_dir {
-                // The same check: a browsable folder or one picked in the native dialog.
-                let allowed = super::browse::allowed_path(&config, &d.to_string_lossy())
-                    .map_err(|e| anyhow::anyhow!("save frames to: {}", e.into_parts().1))?;
+                // The same check (a browsable folder or one picked in the native dialog), or a
+                // folder an earlier import wrote to / under review.
+                let allowed = super::review::allowed_folder(&state, &config, &d.to_string_lossy())
+                    .map_err(|(_, m)| anyhow::anyhow!("save frames to: {m}"))?;
                 req.out_dir = Some(allowed);
             }
             let chained = field(&f, "autolabel").is_some();

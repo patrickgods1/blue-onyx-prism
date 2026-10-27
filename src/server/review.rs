@@ -143,6 +143,43 @@ fn known_dirs(state: &AppState, dataset: &std::path::Path) -> Vec<String> {
     v
 }
 
+/// [`super::browse::allowed_path`] for a folder of frames, also accepting a folder this server
+/// already works on: one a finished import wrote to ([`known_dirs`]) or the folder under review.
+/// Both passed that check when chosen, often as a native pick, which it trusts for an hour only;
+/// going back to one later must not need another pick. Exact folders only, canonicalized.
+pub(super) fn allowed_folder(
+    state: &AppState,
+    config: &crate::config::Config,
+    raw: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let err = match super::browse::allowed_path(config, raw) {
+        Ok(p) => return Ok(p),
+        Err(e) => e.into_parts(),
+    };
+    if err.0 != StatusCode::FORBIDDEN {
+        return Err(err);
+    }
+    let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    let Ok(canon) = config
+        .data_path(std::path::Path::new(trimmed))
+        .canonicalize()
+    else {
+        return Err(err);
+    };
+    let canon = super::browse::plain(&canon);
+    let dataset = CollectSettings::for_config(config).dir;
+    let mut trusted: Vec<PathBuf> = known_dirs(state, &dataset)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    trusted.push(config.collect.resolved_review_dir(&config.data_root()));
+    let known = trusted
+        .iter()
+        .filter_map(|k| k.canonicalize().ok())
+        .any(|k| super::browse::plain(&k) == canon);
+    if known { Ok(canon) } else { Err(err) }
+}
+
 /// `GET /review`.
 pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
@@ -768,7 +805,7 @@ struct FolderBody {
 /// `POST /v1/review/folder` with `{dir}`: the folder this page, its exports and the auto-labeler
 /// work on (`collect.review_dir`), for frames an import saved outside the dataset folder. Empty or
 /// the dataset folder itself = back to the dataset folder. Like the import's paths, it must be a
-/// browsable folder or one picked in the native dialog ([`super::browse::allowed_path`]).
+/// browsable folder, one picked in the native dialog or one already in use ([`allowed_folder`]).
 pub(super) async fn folder(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -785,12 +822,9 @@ pub(super) async fn folder(
         let chosen = if raw.is_empty() {
             None
         } else {
-            let p = match super::browse::allowed_path(&config, raw) {
+            let p = match allowed_folder(&state, &config, raw) {
                 Ok(p) => p,
-                Err(e) => {
-                    let (s, m) = e.into_parts();
-                    return fail(s, format!("Folder not changed: {m}"));
-                }
+                Err((s, m)) => return fail(s, format!("Folder not changed: {m}")),
             };
             if !p.is_dir() {
                 return fail(
@@ -1037,6 +1071,17 @@ mod tests {
             let (s, v) = json(&d.state, post_json("/v1/review/folder", &body)).await;
             assert_ne!(s, StatusCode::OK, "{} {v}", p.display());
             assert!(d.state.config_read().collect.review_dir.is_some());
+        }
+        // The folder already under review stays accepted outside the roots (it passed the check
+        // when chosen, often as a native pick, which expires after an hour).
+        if cfg!(unix) {
+            save_config(&d.state, "test", |c| {
+                crate::collect::config::set_review_dir(c, Some(outside.clone()))
+            })
+            .unwrap();
+            let body = serde_json::json!({ "dir": outside.display().to_string() }).to_string();
+            let (s, v) = json(&d.state, post_json("/v1/review/folder", &body)).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
         }
         let _ = std::fs::remove_dir_all(&outside);
         // Empty = back to the dataset folder.
