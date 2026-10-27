@@ -619,20 +619,23 @@ pub(super) fn view(
     message: Option<String>,
     error: Option<String>,
 ) -> TrainingTemplate {
-    view_with(state, message, error, runs(state))
+    let all = runs(state);
+    let cap = crate::training::capability_with_runs(&all);
+    view_with(state, message, error, all, cap)
 }
 
-/// [`view`] of the run records `all` (tests pass their own).
+/// [`view`] of the run records `all` on `cap` (tests pass their own, so the page does not
+/// depend on the machine they run on).
 fn view_with(
     state: &AppState,
     message: Option<String>,
     error: Option<String>,
     all: Vec<RunRecord>,
+    cap: Capability,
 ) -> TrainingTemplate {
     let config = state.config_read().clone();
     let dataset_dir = crate::collect::CollectSettings::for_config(&config).dir;
     let imports_dir = config.collect.resolved_review_dir(&config.data_root());
-    let cap: Capability = crate::training::capability_with_runs(&all);
     let paths = TrainPaths::for_config(&config);
     let platform = Platform::current();
     let (env_ready, env_note) = match &cap.accelerator {
@@ -3195,7 +3198,15 @@ mod tests {
             balance_summary: Some("209 → 412 images/epoch; raccoon 32→118 boxes".into()),
             ..Default::default()
         });
-        let page = view_with(&state, None, None, recs).render().unwrap();
+        let page = view_with(
+            &state,
+            None,
+            None,
+            recs,
+            crate::training::capability::host_for_tests(),
+        )
+        .render()
+        .unwrap();
         // The run's dataset line carries its balance summary.
         let i = page.find("<tr data-run=\"r9\"").unwrap();
         let j = i + page[i..].find("</tr>").unwrap();
@@ -3571,7 +3582,15 @@ mod tests {
                 cap_dominant: Some(2.5),
             });
         });
-        let page = view_with(&state, None, None, Vec::new()).render().unwrap();
+        let page = view_with(
+            &state,
+            None,
+            None,
+            Vec::new(),
+            crate::training::capability::host_for_tests(),
+        )
+        .render()
+        .unwrap();
         assert!(page.contains("<details class=\"tr-more tr-balance\" id=\"train-balance\" open>"));
         assert!(page.contains("name=\"balance\" value=\"scene\" checked>"));
         assert!(page.contains("name=\"balance\" value=\"camera-day\" checked>"));
