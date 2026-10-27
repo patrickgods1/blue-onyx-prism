@@ -27,6 +27,7 @@
 //! backend.recycle(done.slot, outs);                           // buffers back to the slot
 //! ```
 
+pub mod cpu_isa;
 pub mod cpu_threads;
 pub mod detect;
 pub mod device;

@@ -74,7 +74,9 @@ GPU whose compute capability has no kernels in the ORT CUDA build that will load
 OS and version: 1.31.0 Windows = 6.1/7.5/8.6/8.9/12.0, Linux = 6.0..12.0 without 10.0) skips CUDA; TensorRT needs 7.5+;
 a driver below CUDA 12 skips both. `OrtProbe.version` is the loaded library's version (the resolver's hypothetical
 probe carries the version the plan installs). CPU inference uses all physical cores but one by default
-(`backend/cpu_threads.rs`), ORT thread pools do not spin, benchmarks run at below-normal priority (`backend/priority.rs`).
+(`backend/cpu_threads.rs`), ORT thread pools do not spin, benchmarks run at below-normal priority (`backend/priority.rs`);
+on Windows a CPU with AMX but no AMX-FP16 (Sapphire/Emerald Rapids) gets `ONEDNN_MAX_CPU_ISA=AVX512_CORE_FP16` unless set
+(OpenVINO's AMX kernels raise #UD there; `backend/cpu_isa.rs`).
 A model with results in `benchmark.json` orders its `auto` devices by measured speed (fastest eligible first,
 then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim aborts MPSGraph in ORT 1.24.4). ORT needs `.onnx` files.
 
