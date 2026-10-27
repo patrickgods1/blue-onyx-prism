@@ -130,7 +130,7 @@
       <label class="check"><input type="checkbox" name="fmt" value="benchmark" checked> Benchmark set</label>
     </div>
     <div class="fields">
-      <label class="wide">Folder <span class="with-browse"><input type="text" name="out_dir"><button type="button" class="browse secondary" data-browse="folder" data-target="out_dir" data-title="Choose the export folder" hidden>Browse&hellip;</button></span><span class="muted small">Empty = a new folder under <code>{{ exports_dir }}</code>.</span></label>
+      <label class="wide">Folder <span class="with-browse"><input type="text" name="out_dir"><button type="button" class="browse secondary" data-browse="folder" data-target="out_dir" data-title="Choose the export folder" hidden>Browse&hellip;</button></span><span class="muted small">Empty = a new folder under <code>{{ exports_dir }}</code>; a folder with files in it gets a new <code>export-&lt;time&gt;</code> folder inside. Not the dataset folder itself.</span></label>
       <label>Held-out cameras (comma separated) <input type="text" name="holdout_cameras"></label>
       <label>Held-out days (YYYY-MM-DD, comma separated) <input type="text" name="holdout_days"></label>
       <label>Else hold out this share of camera-days <input type="number" name="holdout_fraction" min="0" max="1" step="0.05" value="0.2"></label>
