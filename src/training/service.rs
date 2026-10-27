@@ -74,6 +74,24 @@ pub struct DatasetCounts {
     pub heldout_images: usize,
     pub heldout_dir: Option<PathBuf>,
     pub warnings: Vec<String>,
+    /// [`super::dataset::BalanceReport::summary`] when the run balanced its training frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_summary: Option<String>,
+}
+
+impl DatasetCounts {
+    /// The counts of a prepared dataset (recorded when the job reports it).
+    pub fn of(p: &super::dataset::Prepared) -> Self {
+        Self {
+            classes: p.classes.clone(),
+            train_images: p.train_images,
+            valid_images: p.valid_images,
+            heldout_images: p.heldout_images,
+            heldout_dir: p.heldout_dir.clone(),
+            warnings: p.warnings.clone(),
+            balance_summary: p.balance_summary.clone(),
+        }
+    }
 }
 
 /// One run as the Training page and `train list` show it.
@@ -938,16 +956,9 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                     r.progress = None;
                 });
             }
-            TrainReport::Prepared(p) => inner.update(&id, |r| {
-                r.dataset = Some(DatasetCounts {
-                    classes: p.classes.clone(),
-                    train_images: p.train_images,
-                    valid_images: p.valid_images,
-                    heldout_images: p.heldout_images,
-                    heldout_dir: p.heldout_dir.clone(),
-                    warnings: p.warnings.clone(),
-                });
-            }),
+            TrainReport::Prepared(p) => {
+                inner.update(&id, |r| r.dataset = Some(DatasetCounts::of(p)));
+            }
         };
         let runner = PausableRunner {
             inner: inner.runner.as_ref(),

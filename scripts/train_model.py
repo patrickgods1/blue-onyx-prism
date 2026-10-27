@@ -995,7 +995,9 @@ def rfdetr_layout(a, names: list[str]) -> Path:
     """The COCO layout the rfdetr package reads (`train/`, `valid/`, `test/` with the images and
     `_annotations.coco.json`), from the prepared COCO JSON. `test` is the validation split
     (the held-out images are benchmarked by the service, never shown to the trainer). With night
-    augmentation, the training split gets one augmented copy of each image the probabilities pick."""
+    augmentation, the training split gets one augmented copy of each unique image the probabilities
+    pick: a frame repeated by oversampling or balancing (several COCO entries of one file) is
+    augmented once, so the repeats do not multiply its augmented copies."""
     import numpy as np
     import torch
     from PIL import Image
@@ -1015,13 +1017,15 @@ def rfdetr_layout(a, names: list[str]) -> Path:
             by_image.setdefault(ann["image_id"], []).append(ann)
         next_id = max([i["id"] for i in coco["images"]] + [0]) + 1
         next_ann = max([x["id"] for x in anns] + [0]) + 1
+        augmented: set[str] = set()
         for im in coco["images"]:
             src = a.data / im["file_name"]
             # One file per source image; repeated entries (oversampling) share it.
             flat = Path(im["file_name"]).name
             link_or_copy(src, d / flat)
             images.append({**im, "file_name": flat})
-            if split == "train" and any_augment(a):
+            if split == "train" and any_augment(a) and flat not in augmented:
+                augmented.add(flat)
                 with Image.open(src) as pil:
                     x = torch.from_numpy(np.asarray(pil.convert("RGB"), dtype=np.float32) / 255).permute(2, 0, 1)
                 y = night_augment(x, a.aug_dark, a.aug_noise, a.aug_gray, gen=gen)

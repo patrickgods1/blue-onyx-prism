@@ -72,6 +72,10 @@ pub struct TrainingConfig {
     /// default ([`DEFAULT_METRIC_COLUMNS`]). Applies at once.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub metric_columns: Vec<String>,
+    /// The Training page's and the CLI's default balancing of the training frames
+    /// ([`super::dataset::Balance`]); None = off. A run uses what its request says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<super::dataset::Balance>,
 }
 
 impl Default for TrainingConfig {
@@ -87,6 +91,7 @@ impl Default for TrainingConfig {
             timeout_hours: DEFAULT_TIMEOUT_HOURS,
             synonyms: std::collections::BTreeMap::new(),
             metric_columns: Vec::new(),
+            balance: None,
         }
     }
 }
@@ -180,6 +185,9 @@ impl TrainingConfig {
             );
         }
         validate_metric_columns(&self.metric_columns)?;
+        if let Some(b) = &self.balance {
+            b.validate().map_err(|e| anyhow::anyhow!("training.{e}"))?;
+        }
         for (class, phrases) in &self.synonyms {
             let ok = |s: &str| {
                 !s.trim().is_empty()
@@ -282,6 +290,30 @@ mod tests {
         assert!(bad(|c| c.metric_columns = vec!["x".repeat(65)]).contains("metric_columns"));
         assert!(bad(|c| c.metric_columns = vec!["a\nb".into()]).contains("metric_columns"));
         assert!(bad(|c| c.metric_columns = vec!["f2".into(), "f2".into()]).contains("twice"));
+        let balance = |f: fn(&mut crate::training::dataset::Balance)| {
+            let mut c = TrainingConfig::default();
+            let mut b = crate::training::dataset::Balance::default();
+            f(&mut b);
+            c.balance = Some(b);
+            c.validate().map_err(|e| e.to_string())
+        };
+        assert!(balance(|_| {}).is_ok());
+        let e = balance(|b| b.strength = 1.5).unwrap_err();
+        assert!(e.contains("training.balance.strength"), "{e}");
+        assert!(balance(|b| b.strength = f32::NAN).is_err());
+        assert!(
+            balance(|b| b.max_repeat = 0)
+                .unwrap_err()
+                .contains("training.balance.max_repeat")
+        );
+        assert!(balance(|b| b.max_repeat = 11).is_err());
+        assert!(
+            balance(|b| b.cap_dominant = Some(0.5))
+                .unwrap_err()
+                .contains("cap_dominant")
+        );
+        assert!(balance(|b| b.cap_dominant = Some(f32::INFINITY)).is_err());
+        assert!(balance(|b| b.cap_dominant = Some(1.0)).is_ok());
         assert!(
             bad(|c| c.metric_columns = (0..21).map(|i| format!("m{i}")).collect())
                 .contains("at most 20")
@@ -333,6 +365,7 @@ mod tests {
             metric_columns: vec!["map".into()],
             epochs: Some(30),
             patience: Some(5),
+            balance: Some(Default::default()),
             ..TrainingConfig::default()
         };
         let v = serde_json::to_value(c).unwrap();
@@ -371,6 +404,39 @@ mod tests {
         // A recommended patience above a small epochs override is capped by it.
         let small: TrainingConfig = serde_json::from_str(r#"{"epochs": 8}"#).unwrap();
         assert_eq!(small.patience_for(TrainFamily::Yolo26), 8);
+    }
+
+    #[test]
+    fn balance_defaults_off_and_round_trips() {
+        use crate::training::dataset::{Balance, BalanceAxis};
+        // An older config has no balance: off, and not written back.
+        let old: TrainingConfig = serde_json::from_str(r#"{"oversample": 2}"#).unwrap();
+        assert_eq!(old.balance, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("balance"));
+        let c: TrainingConfig = serde_json::from_str(
+            r#"{"balance": {"axes": ["class", "camera-day"], "strength": 1, "cap_dominant": 3}}"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        let b = c.balance.clone().unwrap();
+        assert_eq!(
+            b.axes.iter().copied().collect::<Vec<_>>(),
+            [BalanceAxis::Class, BalanceAxis::CameraDay]
+        );
+        assert_eq!(
+            (b.strength, b.max_repeat, b.cap_dominant),
+            (1.0, 4, Some(3.0))
+        );
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(
+            text.contains(
+                r#""axes":["class","camera-day"],"strength":1.0,"max_repeat":4,"cap_dominant":3.0"#
+            ),
+            "{text}"
+        );
+        let back: TrainingConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, c);
+        assert!(Balance::default().is_off());
     }
 
     #[test]

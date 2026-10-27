@@ -438,3 +438,33 @@ fn finish_is_refused_for_anything_but_a_training_run() {
     svc.wait_task(&id, Duration::from_secs(10)).unwrap();
     svc.shutdown();
 }
+
+#[test]
+fn the_run_records_the_balance_summary_of_its_dataset() {
+    let mut p = super::super::dataset::Prepared {
+        dir: PathBuf::from("/runs/r1/data"),
+        classes: vec!["person".into(), "raccoon".into()],
+        train_images: 412,
+        valid_images: 40,
+        heldout_dir: Some(PathBuf::from("/runs/r1/heldout")),
+        heldout_images: 60,
+        heldout_fingerprint: "f1".into(),
+        warnings: vec!["w".into()],
+        balance_summary: Some(
+            "209 → 412 images/epoch; person 443→443, raccoon 32→118 boxes".into(),
+        ),
+    };
+    let d = DatasetCounts::of(&p);
+    assert_eq!(d.train_images, 412);
+    assert_eq!(d.heldout_dir, p.heldout_dir);
+    assert_eq!(d.balance_summary, p.balance_summary);
+    let v = serde_json::to_value(&d).unwrap();
+    assert_eq!(v["balance_summary"], serde_json::json!(p.balance_summary));
+    // Unbalanced: no key written; older records without it read as None.
+    p.balance_summary = None;
+    let d = DatasetCounts::of(&p);
+    let v = serde_json::to_value(&d).unwrap();
+    assert!(v.get("balance_summary").is_none(), "{v}");
+    let back: DatasetCounts = serde_json::from_value(v).unwrap();
+    assert_eq!(back, d);
+}

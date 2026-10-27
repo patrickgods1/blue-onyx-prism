@@ -22,7 +22,9 @@
 //!    training box), and repeat the review frames `oversample` times when public frames are
 //!    mixed in. Public frames are only ever trained on. Seeded choices rank a frame by its path
 //!    relative to its source folder, so the plan is the same wherever the folders are
-//!    (reproducible runs).
+//!    (reproducible runs). Step 7, opt-in ([`Balance`], [`balance`]): repeat the training frames
+//!    of rare classes / scenes / cameras / camera days (and optionally drop frames of dominant
+//!    ones); validation and held-out frames are never balanced.
 //! 3. **Write** ([`write`]): `images/` + `labels/` (hard links, else copies), `classes.txt`,
 //!    `train.txt` / `valid.txt`, `data.yaml` (Ultralytics), `train.coco.json` /
 //!    `valid.coco.json` (category ids 0..C-1, for RF-DETR and transformers), the held-out set as
@@ -36,6 +38,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+pub mod balance;
+pub use balance::{Balance, BalanceAxis, BalanceCounts, BalanceReport};
 
 /// Which frames a run trains on, by scene: any combination of day, night and IR. None or all
 /// three = every frame (unknown scenes included). Serialized as its canonical string
@@ -726,6 +731,9 @@ pub struct Options {
     pub val_share: f32,
     pub oversample: u32,
     pub seed: u64,
+    /// Step 7 (off by default: the plan of older versions).
+    #[serde(default, skip_serializing_if = "Balance::is_off")]
+    pub balance: Balance,
 }
 
 impl Default for Options {
@@ -740,6 +748,7 @@ impl Default for Options {
             val_share: 0.1,
             oversample: super::config::DEFAULT_OVERSAMPLE,
             seed: 0,
+            balance: Balance::default(),
         }
     }
 }
@@ -760,6 +769,9 @@ pub struct Plan {
     pub heldout_fingerprint: String,
     pub stats: Stats,
     pub warnings: Vec<String>,
+    /// What balancing did (None when off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceReport>,
 }
 
 /// Counts of a plan.
@@ -780,6 +792,13 @@ pub struct Stats {
     pub public_frames: usize,
     /// `camera/day` groups held out by the plan (empty when the source chose).
     pub heldout_groups: Vec<String>,
+    /// Training frames the balance cap left out ([`Balance::cap_dominant`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub balance_dropped: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// SHA-256 of `seed` and `key` as a number, for deterministic choices.
@@ -1108,13 +1127,45 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     }
     let val_set: BTreeSet<FrameRef> = valid.iter().copied().collect();
     let mixed = !public.is_empty();
-    for r in pool.into_iter().filter(|r| !val_set.contains(r)) {
+    let base = |r: FrameRef| -> u32 {
         let is_public = sources.get(r.0).is_some_and(|s| s.public.is_some());
-        let repeats = if mixed && !is_public {
+        if mixed && !is_public {
             opts.oversample.max(1)
         } else {
             1
-        };
+        }
+    };
+    let train: Vec<FrameRef> = pool.into_iter().filter(|r| !val_set.contains(r)).collect();
+    // 7. Balance (opt-in): repeats per training frame, after the cap.
+    let mut repeats: Vec<u32> = train.iter().map(|&r| base(r)).collect();
+    let mut keep = vec![true; train.len()];
+    if !opts.balance.is_off() {
+        let items: Vec<balance::Item> = train
+            .iter()
+            .map(|&r| {
+                let f = frame(r);
+                balance::Item {
+                    key: key_of(r),
+                    base: base(r),
+                    scene: f
+                        .and_then(|f| f.scene.clone())
+                        .unwrap_or_else(|| UNKNOWN.into()),
+                    camera: f.map(|f| f.camera.clone()).unwrap_or_default(),
+                    day: f.map(|f| f.day.clone()).unwrap_or_default(),
+                    boxes: boxes_per_class(r),
+                    hard_negative: f.is_some_and(|f| f.hard_negative),
+                }
+            })
+            .collect();
+        let out = balance::apply(&items, &p.classes, &opts.balance, opts.seed);
+        repeats = out.repeats;
+        keep = out.keep;
+        p.stats.balance_dropped = out.report.dropped;
+        p.warnings.extend(out.warnings);
+        p.balance = Some(out.report);
+    }
+    for ((r, repeats), _) in train.into_iter().zip(repeats).zip(keep).filter(|(_, k)| *k) {
+        let is_public = sources.get(r.0).is_some_and(|s| s.public.is_some());
         if let Some(f) = frame(r) {
             let mut any = false;
             for (i, _) in mapped_boxes(f, opts, &p.classes) {
@@ -1196,6 +1247,9 @@ pub struct Prepared {
     /// [`Plan::heldout_fingerprint`].
     pub heldout_fingerprint: String,
     pub warnings: Vec<String>,
+    /// [`BalanceReport::summary`] when the run balanced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_summary: Option<String>,
 }
 
 /// `dataset.json`: what went into a prepared dataset.
@@ -1212,6 +1266,8 @@ pub struct Summary<'a> {
     pub heldout_images: usize,
     pub heldout_fingerprint: &'a str,
     pub warnings: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<&'a BalanceReport>,
 }
 
 /// One source in `dataset.json`.
@@ -1512,6 +1568,7 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         heldout_images: plan.heldout.len(),
         heldout_fingerprint: &plan.heldout_fingerprint,
         warnings: &warnings,
+        balance: plan.balance.as_ref(),
     };
     write_text("dataset.json", &serde_json::to_string_pretty(&summary)?)?;
     Ok(Prepared {
@@ -1523,6 +1580,7 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         heldout_images: plan.heldout.len(),
         heldout_fingerprint: plan.heldout_fingerprint.clone(),
         warnings,
+        balance_summary: plan.balance.as_ref().map(BalanceReport::summary),
     })
 }
 

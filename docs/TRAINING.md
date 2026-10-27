@@ -221,6 +221,53 @@ A missing label file means "no objects" (the Ultralytics convention).
    it from the training cameras and days), or no frame has one.
 6. **Public subset**: optional, train only, never held out; your own frames then repeat
    `training.oversample` (3) times.
+7. **Balance** (optional, off by default; `--balance`, the page's Balance fieldset, `training.balance`
+   for the default), on the training frames only. It repeats existing frames of rare groups (oversampling)
+   and can drop frames of dominant ones. The axes, which can be combined:
+   - `class`: a frame belongs to every class that has a box in it.
+   - `scene`: `day`, `night`, `ir` (`unknown` without a tag).
+   - `camera`: the frame's camera (a public frame: its source).
+   - `camera-day`: `camera/day`, compared only with the other days of the *same* camera.
+
+   A group `g` with `n_g` training frames gets the weight `w(g) = (n_max / n_g)^strength`, `n_max` being
+   the largest group of the axis (the largest day of the same camera for `camera-day`). `strength` is
+   0.5 by default, the square root, which evens out gently as in repeat-factor sampling; 1 equalises
+   fully. A frame's **class** factor is the largest weight over its classes (Gupta et al., "LVIS: A
+   Dataset for Large Vocabulary Instance Segmentation", CVPR 2019,
+   <https://arxiv.org/abs/1908.03195>); empty frames get 1. Boxes of a common class rise too when
+   they share a frame with a rare one (a person beside a raccoon), so balancing narrows the gap rather
+   than equalising box counts. The factors of the ticked axes multiply and
+   are capped at `--balance-max-repeat` (4 by default, at most 10). The repeats are `round(base x
+   factor)` (`base` is the `training.oversample` repeat of the public mix, else 1) with a **seeded
+   systematic rounding**: each frame rounds up with the probability of its fraction, so the total is
+   within +-1 of the exact sum and the same inputs give the same plan.
+
+   The optional **cap** (`--balance-cap r`, the page's "Cap dominant groups") first drops frames of
+   groups above `r x` the median group size, by seeded rank, down to that size: the frame-level axes
+   first, then `class`, where a frame leaves only when every class in it is above the limit. A
+   reviewer-confirmed hard negative, a frame holding the last training box of a class, and frames of a
+   group at or below the median are never dropped. Dropped frames are counted (`balance_dropped`).
+   Repeating raises only positive frames; the **negative share** (step 4) is then restored: the empty
+   frames repeat as much as needed (at most `max_repeat` times) to keep their share of the images per
+   epoch.
+
+   **Never touched**: the held-out frames, the validation frames, the scene filter, the class list.
+   The `balance` report in `dataset.json` has the counts before and after (boxes and frames per class,
+   frames per scene, camera and camera/day, images per epoch, the largest repeat, dropped frames), and
+   the same report is shown **before** a run: the Training page's preview panel, or
+   `train prepare --dry-run` (also without balancing: the split and the boxes per class). Warnings: a
+   group with a single frame repeated `max_repeat` times (only repeats, no new information), and
+   images per epoch more than doubled.
+
+   RF-DETR's night augmentation adds one augmented copy per *unique* training image, so repeats do not
+   multiply the augmented copies.
+
+**When to balance.** `class` when animals or other rare classes sit beside many people and cars;
+`scene` for a mixed model with few night frames; `camera` or `camera-day` when one camera or one busy
+day dominates the set. Repeats add no new information: they only make the trainer see the same frames
+more often, so collect more frames of rare groups when you can, and keep `max_repeat` low for groups of
+a few frames (they overfit first). Images per epoch grow, so epochs take longer; patience counts epochs.
+Try it with `--dry-run` first, and compare against an unbalanced run on the same held-out frames.
 
 Output in `<training dir>/<run id>/data/`: `images/`, `labels/` (hard links, else copies),
 `classes.txt`, `train.txt` / `valid.txt` (repeats as repeated lines), `data.yaml` (Ultralytics),
@@ -990,10 +1037,13 @@ blue-onyx-prism train estimate --model rfdetr-small --images 2000 --epochs 100 [
 blue-onyx-prism train classes --dataset <export> [--dataset <export>] [--scene night+ir] [--rename a=b] [--json]
 blue-onyx-prism train prepare --dataset <export> [--dataset <export>] [--scene night+ir] \
     [--classes person,car,dog,cat,raccoon] [--excluded background|drop-frame] \
-    [--rename motorbike=motorcycle] [--public [--allow-large]] --out <dir>
+    [--rename motorbike=motorcycle] [--public [--allow-large]] \
+    [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
+    (--out <dir> | --dry-run)
 blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> \
     [--scene all|day|night|ir|night+ir|day+ir ... (repeat for a comparison)] \
     [--classes a,b] [--classes c] [--excluded background|drop-frame] \
+    [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
     [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
     [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
@@ -1019,6 +1069,11 @@ convergence](#starting-points-and-convergence)). A running training is finished 
 checkpoint, by creating `<run dir>/work/stop-request` (or Finish now on the page). `--scene` is
 repeatable: several scenes (or models x scenes) run one after another on the same held-out frames and the
 comparison table is printed at the end. `night` alone is night frames only; use `night+ir` for both.
+`--balance` takes axes comma-separated and/or repeated (no flag: `training.balance`, else off); the
+strength, max repeat and cap flags change that default's values. See [Assembly](#assembly-srctrainingdatasetrs)
+step 7. `prepare --dry-run` writes nothing and prints images per epoch before -> after, boxes and frames per
+class, frames per scene, the top cameras (and camera-days), dropped frames and warnings; `prepare` and
+`run` print the balance summary.
 
 Model labels: `yolo26n`..`yolo26x`, `yolo11n`.., `yolov8n`.., `rfdetr-nano|small|medium|base|large`,
 `rt-detrv2-s|m|l|x`, `dfine-s|m|l|x`.

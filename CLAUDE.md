@@ -149,7 +149,10 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   filter (tags `heldout:<scene>|all|in-scope`, `heldout_fingerprint`), so runs queued with several scenes share a
   `compare_group` and compare per scene (`training/compare.rs`, Comparison card, `GET /v1/training/compare`). Class
   filter: `dataset::inventory` (`train classes`, `GET /v1/training/dataset-classes`, the page's picker) and
-  `Excluded` (background | drop-frame for objects of unpicked classes).
+  `Excluded` (background | drop-frame for objects of unpicked classes). Balancing `dataset::balance` (step 7 of
+  `dataset::plan`, opt-in: class / scene / camera / camera-day repeat factors capped at max repeat, optional cap of
+  dominant groups, negative share kept, held-out/valid untouched; `training::preview_plan`,
+  `POST /v1/training/balance-preview`, `train prepare --dry-run`).
   `train import` (`training/import/`: video / image folder / URL via yt-dlp / pinned `import-data:meva-sample` into the
   dataset folder, scene change + dHash + SigLIP k-center, licence confirmed; the 20k candidate budget split per camera then
   per video before extraction (`select::budget`), videos extracted in parallel (`import/parallel.rs`, `--workers`, results

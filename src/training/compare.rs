@@ -5,7 +5,7 @@
 //! `night_model` routing would score. Scenes are scored separately, so no combined AP is made
 //! up. Pure; the Training page and `train run --scene ... --scene ...` render it.
 
-use super::dataset::{Excluded, SceneFilter};
+use super::dataset::{Balance, Excluded, SceneFilter};
 use super::job::{BenchSummary, SceneAp};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -21,6 +21,8 @@ pub struct CompareRun {
     /// The run's classes (head order).
     pub classes: Vec<String>,
     pub excluded: Excluded,
+    /// How the run balanced its training frames (off for older runs).
+    pub balance: Balance,
     /// Best epoch (1-based) and the epoch training stopped at, when known.
     pub best_epoch: Option<u32>,
     pub stopped_epoch: Option<u32>,
@@ -185,6 +187,20 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
                  left out)"
                     .into(),
             );
+        }
+        if runs.iter().any(|r| r.balance != first.balance) {
+            let kinds = runs.iter().map(|r| r.balance.describe());
+            let mut uniq: Vec<String> = Vec::new();
+            for k in kinds {
+                if !uniq.contains(&k) {
+                    uniq.push(k);
+                }
+            }
+            c.warnings.push(format!(
+                "the runs balance their training frames differently ({}): AP differences may \
+                 come from the balancing",
+                uniq.join(" / ")
+            ));
         }
     }
     c.rows = runs.iter().map(row_of).collect();
@@ -351,6 +367,7 @@ mod tests {
             scene,
             classes: vec!["person".into()],
             excluded: Excluded::Background,
+            balance: Balance::default(),
             best_epoch: Some(12),
             stopped_epoch: Some(27),
             bench: Some(BenchSummary {
@@ -422,9 +439,19 @@ mod tests {
         b.bench.as_mut().unwrap().heldout_fingerprint = Some("other".into());
         b.classes.push("car".into());
         b.excluded = Excluded::DropFrame;
+        b.balance
+            .axes
+            .insert(crate::training::dataset::BalanceAxis::Class);
         let c = compare(&[run("day-a", SceneFilter::DAY, 0.6, 0.2, 0.1, 10.0), b]);
         assert!(!c.comparable);
-        assert_eq!(c.warnings.len(), 3, "{:?}", c.warnings);
+        assert_eq!(c.warnings.len(), 4, "{:?}", c.warnings);
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("balance") && w.contains("off / class, strength 0.5")),
+            "{:?}",
+            c.warnings
+        );
         assert!(
             c.render_text()
                 .contains("warning: the runs were benchmarked")

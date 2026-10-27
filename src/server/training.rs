@@ -14,7 +14,7 @@ use crate::resources::catalog::{self, Platform};
 use crate::resources::export::train::{self as env, TrainPaths};
 use crate::training::capability::Capability;
 use crate::training::compare::{self, CompareRun, Comparison};
-use crate::training::dataset::{Excluded, SceneFilter};
+use crate::training::dataset::{Balance, BalanceAxis, Excluded, SceneFilter};
 use crate::training::job::{BenchSummary, Hooks, TrainOutput, TrainRequest};
 use crate::training::recipe::{self, Augment, TrainRecipe};
 use crate::training::service::{RunRecord, RunState, TrainingService};
@@ -270,6 +270,62 @@ struct CompareCard {
     rows: Vec<CompareRowView>,
 }
 
+/// One axis checkbox of the Train form's Balance fieldset.
+struct BalanceChoice {
+    /// `class`, `scene`, `camera`, `camera-day` (the form's `balance`).
+    value: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    checked: bool,
+}
+
+/// The Balance fieldset's defaults: `training.balance` when set, else off.
+struct BalanceView {
+    axes: Vec<BalanceChoice>,
+    on: bool,
+    gentle: bool,
+    full: bool,
+    /// A configured strength other than 0.5 and 1 (a third radio, checked).
+    custom: Option<String>,
+    max_repeat: u32,
+    most: u32,
+    cap_on: bool,
+    cap: String,
+}
+
+impl BalanceView {
+    fn of(b: Option<&Balance>) -> Self {
+        use crate::training::dataset::balance::{DEFAULT_CAP, MAX_REPEAT};
+        let d = Balance::default();
+        let b = b.unwrap_or(&d);
+        let s = b.strength;
+        Self {
+            axes: BalanceAxis::ALL
+                .iter()
+                .map(|&a| BalanceChoice {
+                    value: a.as_str(),
+                    title: match a {
+                        BalanceAxis::Class => "Class",
+                        BalanceAxis::Scene => "Scene",
+                        BalanceAxis::Camera => "Camera",
+                        BalanceAxis::CameraDay => "Camera + day",
+                    },
+                    hint: a.describe(),
+                    checked: b.axes.contains(&a),
+                })
+                .collect(),
+            on: !b.is_off(),
+            gentle: s == 0.5,
+            full: s == 1.0,
+            custom: (s != 0.5 && s != 1.0).then(|| crate::config::clean_f32(s).to_string()),
+            max_repeat: b.max_repeat,
+            most: MAX_REPEAT,
+            cap_on: b.cap_dominant.is_some(),
+            cap: crate::config::clean_f32(b.cap_dominant.unwrap_or(DEFAULT_CAP)).to_string(),
+        }
+    }
+}
+
 struct DatasetRow {
     path: String,
     exists: bool,
@@ -316,6 +372,7 @@ pub(super) struct TrainingTemplate {
     /// `training.patience`, blank = each family's recommendation.
     patience: String,
     scenes: Vec<SceneChoice>,
+    balance: BalanceView,
     /// Day / night / mixed comparisons of runs queued together, the latest first.
     comparisons: Vec<CompareCard>,
     public_available: bool,
@@ -447,6 +504,7 @@ fn compare_run(r: &RunRecord) -> CompareRun {
         scene: r.request.scene,
         classes: r.request.classes.clone().unwrap_or_default(),
         excluded: r.request.excluded,
+        balance: r.request.balance.clone(),
         best_epoch: stop
             .map(|s| s.best_epoch)
             .or_else(|| p.and_then(|p| p.best.as_ref()).map(|b| b.epoch)),
@@ -787,10 +845,14 @@ fn view_with(
             percent: r.percent,
             describe: r.describe(),
             dataset: r.dataset.as_ref().map_or_else(String::new, |d| {
-                format!(
+                let mut t = format!(
                     "{} train / {} val / {} held out",
                     d.train_images, d.valid_images, d.heldout_images
-                )
+                );
+                if let Some(b) = &d.balance_summary {
+                    t.push_str(&format!(" \u{b7} balanced: {b}"));
+                }
+                t
             }),
             log_tail: r
                 .log
@@ -897,6 +959,7 @@ fn view_with(
                 preset: *preset,
             })
             .collect(),
+        balance: BalanceView::of(config.training.balance.as_ref()),
         comparisons: compare_cards(&all),
         public_available: catalog::lila_night().is_some(),
         public_installed: crate::training::public_subset_installed(&config.data_root()),
@@ -971,6 +1034,82 @@ pub(super) fn num<T: std::str::FromStr>(
         .transpose()
 }
 
+/// The dataset side of a queue form, shared with the balance preview ([`data_fields`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DataFields {
+    /// Ticked `dataset`s, then the typed `dataset_path`, as typed (see [`checked_datasets`]).
+    pub datasets: Vec<PathBuf>,
+    pub include_public: bool,
+    pub scenes: Vec<SceneFilter>,
+    /// Empty = every class of the datasets.
+    pub classes: Vec<String>,
+    pub excluded: Excluded,
+    pub balance: Balance,
+}
+
+/// The datasets, scenes ([`scenes_of`]), classes ([`classes_of`]), excluded mode, public mix
+/// and balance ([`balance_of`]) of a queue or preview form. Errors name the field.
+pub(crate) fn data_fields(
+    f: &[(String, String)],
+    training: &crate::training::config::TrainingConfig,
+) -> anyhow::Result<DataFields> {
+    let mut datasets: Vec<PathBuf> = all(f, "dataset").into_iter().map(PathBuf::from).collect();
+    if let Some(extra) = field(f, "dataset_path") {
+        datasets.push(PathBuf::from(extra));
+    }
+    let excluded = match field(f, "excluded") {
+        Some(v) => Excluded::parse(v).ok_or_else(|| {
+            anyhow::anyhow!("objects of unticked classes: '{v}' is not background or drop-frame")
+        })?,
+        None => Excluded::Background,
+    };
+    Ok(DataFields {
+        datasets,
+        include_public: field(f, "public").is_some(),
+        scenes: scenes_of(f)?,
+        classes: classes_of(f),
+        excluded,
+        balance: balance_of(f, training)?,
+    })
+}
+
+/// The Balance fieldset of a form: `balance` (repeated axis checkboxes and / or comma lists of
+/// `class`, `scene`, `camera`, `camera-day`), `balance_strength` (0..=1), `balance_max_repeat`
+/// (1..=10) and `balance_cap` (x the median group size), which applies only with the
+/// `balance_cap_on` checkbox (a blank cap = [`crate::training::dataset::balance::DEFAULT_CAP`]).
+/// A form without any `balance*` field (a script, a bookmark) gets `training.balance`, else
+/// off; no axis = off whatever the other fields say. Errors name the field.
+pub(crate) fn balance_of(
+    f: &[(String, String)],
+    training: &crate::training::config::TrainingConfig,
+) -> anyhow::Result<Balance> {
+    use crate::training::dataset::balance::DEFAULT_CAP;
+    if !f.iter().any(|(k, _)| k.starts_with("balance")) {
+        return Ok(training.balance.clone().unwrap_or_default());
+    }
+    let mut axes = std::collections::BTreeSet::new();
+    for v in all(f, "balance") {
+        axes.extend(Balance::parse_axes(v)?);
+    }
+    let d = Balance::default();
+    let strength: Option<f32> = num(f, "balance_strength", "balance strength")?;
+    let max_repeat: Option<u32> = num(f, "balance_max_repeat", "balance max repeat")?;
+    let cap: Option<f32> = num(f, "balance_cap", "balance cap")?;
+    let b = Balance {
+        axes,
+        strength: strength.unwrap_or(d.strength),
+        max_repeat: max_repeat.unwrap_or(d.max_repeat),
+        cap_dominant: field(f, "balance_cap_on")
+            .is_some()
+            .then(|| cap.unwrap_or(DEFAULT_CAP)),
+    };
+    if b.is_off() {
+        return Ok(Balance::default());
+    }
+    b.validate()?;
+    Ok(b)
+}
+
 /// The runs of a queue form: one [`TrainRequest`] per ticked model (`model=yolo26n`, repeated),
 /// sharing the dataset and options fields (`gpu`: `cuda:N`, empty / `auto` = the automatic pick;
 /// the suggested batches are the chosen GPU's; blank `epochs` / `patience` = `training`'s value,
@@ -987,18 +1126,8 @@ pub(crate) fn requests_from_form(
     }
     let gpu = crate::training::capability::gpu_arg(field(f, "gpu"))?;
     let cap = &cap.for_gpu(gpu.as_deref())?;
-    let mut datasets: Vec<PathBuf> = all(f, "dataset").into_iter().map(PathBuf::from).collect();
-    if let Some(extra) = field(f, "dataset_path") {
-        datasets.push(PathBuf::from(extra));
-    }
-    let scenes = scenes_of(f)?;
-    let classes = classes_of(f);
-    let excluded = match field(f, "excluded") {
-        Some(v) => Excluded::parse(v).ok_or_else(|| {
-            anyhow::anyhow!("objects of unticked classes: '{v}' is not background or drop-frame")
-        })?,
-        None => Excluded::Background,
-    };
+    let data = data_fields(f, training)?;
+    let scenes = &data.scenes;
     let night = field(f, "night_aug").is_some();
     let base = if night {
         Augment::NIGHT
@@ -1061,16 +1190,17 @@ pub(crate) fn requests_from_form(
         r.multi_scale = multi_scale;
         out.push(TrainRequest {
             recipe: r,
-            datasets: datasets.clone(),
-            include_public: field(f, "public").is_some(),
+            datasets: data.datasets.clone(),
+            include_public: data.include_public,
             scene,
-            classes: (!classes.is_empty()).then(|| classes.clone()),
+            classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
             rename: Default::default(),
             benchmark_sets: sets.clone(),
             allow_large: field(f, "confirm_large").is_some(),
             install_dir: field(f, "install_dir").map(PathBuf::from),
             gpu: gpu.clone(),
-            excluded,
+            excluded: data.excluded,
+            balance: data.balance.clone(),
             compare_group: compare_group.clone(),
         });
     }
@@ -1282,6 +1412,107 @@ pub(super) async fn dataset_classes(
             &allow_in(&config),
         ))
         .into_response()
+    })
+    .await
+}
+
+/// The balance preview of a queue form ([`data_fields`]; the models are not needed): one run
+/// per scene filter, each [`crate::training::preview_plan`] (the job's sources and options,
+/// nothing written) as `{scene, title, report, warnings, classes, train_frames, train_images,
+/// valid_frames, heldout_frames, dropped, error}` (`report` null when balancing is off; `error`
+/// set when that run cannot be planned). The folders are checked like the queue's
+/// ([`checked_datasets`]); a bad field or folder is an error naming it.
+pub(crate) fn balance_preview_json(
+    f: &[(String, String)],
+    config: &crate::config::Config,
+) -> anyhow::Result<serde_json::Value> {
+    let data = data_fields(f, &config.training)?;
+    let datasets = checked_datasets(f, &offered_datasets(config), &allow_in(config))?;
+    if datasets.is_empty() && config.training.datasets.is_empty() {
+        anyhow::bail!("no dataset: tick a review export folder or type one under Another folder");
+    }
+    // A placeholder model: the plan depends on the data fields only.
+    let recipe = TrainRecipe::new(catalog::TrainFamily::Yolo26, "n")?;
+    let runs: Vec<serde_json::Value> = data
+        .scenes
+        .iter()
+        .map(|&scene| {
+            let title = SCENE_CHOICES
+                .iter()
+                .find(|(s, _, _)| *s == scene)
+                .map_or_else(
+                    || scene.describe().to_string(),
+                    |(_, t, _)| (*t).to_string(),
+                );
+            let request = TrainRequest {
+                recipe: recipe.clone(),
+                datasets: datasets.clone(),
+                include_public: data.include_public,
+                scene,
+                classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
+                rename: Default::default(),
+                benchmark_sets: Vec::new(),
+                allow_large: false,
+                install_dir: None,
+                gpu: None,
+                excluded: data.excluded,
+                balance: data.balance.clone(),
+                compare_group: None,
+            };
+            match crate::training::preview_plan(config, &request) {
+                Ok(p) => serde_json::json!({
+                    "scene": scene.as_str(),
+                    "title": title,
+                    "report": p.balance,
+                    "warnings": p.warnings,
+                    "classes": p.classes,
+                    "train_frames": p.train.len(),
+                    "train_images": p.train.iter().map(|(_, n)| *n as usize).sum::<usize>(),
+                    "valid_frames": p.valid.len(),
+                    "heldout_frames": p.heldout.len(),
+                    "dropped": p.stats.balance_dropped,
+                    "error": null,
+                }),
+                Err(e) => serde_json::json!({
+                    "scene": scene.as_str(),
+                    "title": title,
+                    "report": null,
+                    "warnings": [],
+                    "error": format!("{e:#}"),
+                }),
+            }
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "success": true,
+        "balance": data.balance,
+        "runs": runs,
+    }))
+}
+
+/// `POST /v1/training/balance-preview` with the queue form's fields (urlencoded): what
+/// balancing would do to each run's training frames ([`balance_preview_json`]). 400 with
+/// `{success: false, message}` for a bad field or folder; a browser request marked
+/// `Sec-Fetch-Site: cross-site` is 403.
+pub(super) async fn balance_preview(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if super::guard::fetch_site_cross(&headers) {
+        return json_fail(
+            StatusCode::FORBIDDEN,
+            "Cross-site request refused: the balance preview answers this server's own pages \
+             only.",
+        );
+    }
+    blocking(move || {
+        let f = super::dataset::parse_form(&body);
+        let config = state.config_read().clone();
+        match balance_preview_json(&f, &config) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        }
     })
     .await
 }
@@ -2774,6 +3005,7 @@ mod tests {
             install_dir: None,
             gpu: None,
             excluded: Excluded::Background,
+            balance: Default::default(),
             compare_group: group.map(str::to_string),
         };
         let benchmark = ap.map(|(d, n, i)| BenchSummary {
@@ -2957,7 +3189,41 @@ mod tests {
             device: "mps".into(),
             train_seconds: 1.0,
         });
+        let r9 = recs.iter_mut().find(|r| r.id == "r9").unwrap();
+        r9.dataset = Some(crate::training::service::DatasetCounts {
+            train_images: 412,
+            balance_summary: Some("209 → 412 images/epoch; raccoon 32→118 boxes".into()),
+            ..Default::default()
+        });
         let page = view_with(&state, None, None, recs).render().unwrap();
+        // The run's dataset line carries its balance summary.
+        let i = page.find("<tr data-run=\"r9\"").unwrap();
+        let j = i + page[i..].find("</tr>").unwrap();
+        assert!(
+            page[i..j]
+                .contains("412 train / 0 val / 0 held out \u{b7} balanced: 209 → 412 images/epoch"),
+            "{}",
+            &page[i..j]
+        );
+        // The Balance fieldset (collapsed, off by default) and the preview's holder.
+        assert!(page.contains("<details class=\"tr-more tr-balance\" id=\"train-balance\">"));
+        for a in ["class", "scene", "camera", "camera-day"] {
+            assert!(
+                page.contains(&format!("name=\"balance\" value=\"{a}\">")),
+                "axis {a} unticked"
+            );
+        }
+        assert!(page.contains("evens out day / night / IR frame counts"));
+        assert!(page.contains("name=\"balance_strength\" value=\"0.5\" checked>"));
+        assert!(page.contains("name=\"balance_strength\" value=\"1\">"));
+        assert!(
+            page.contains(
+                "name=\"balance_max_repeat\" min=\"1\" max=\"10\" step=\"1\" value=\"4\">"
+            )
+        );
+        assert!(page.contains("name=\"balance_cap_on\" id=\"train-bal-cap-on\">"));
+        assert!(page.contains("name=\"balance_cap\" id=\"train-bal-cap\""));
+        assert!(page.contains("id=\"train-balance-preview\""));
         // Finish now: shown for the running run in its training stage only.
         let row = |id: &str| {
             let i = page
@@ -3053,5 +3319,268 @@ mod tests {
             "{}",
             bench_text(Some(&b), None)
         );
+    }
+
+    #[test]
+    fn balance_fields_parse_default_from_the_config_and_name_bad_values() {
+        use crate::training::config::TrainingConfig;
+        use std::collections::BTreeSet;
+        let t = TrainingConfig::default();
+        let axes = |v: &[BalanceAxis]| v.iter().copied().collect::<BTreeSet<_>>();
+        // Repeated checkboxes and a comma list, strength, max repeat and the gated cap.
+        let b = balance_of(
+            &form(&[
+                ("balance", "class"),
+                ("balance", "scene, camera-day"),
+                ("balance_strength", "1"),
+                ("balance_max_repeat", "6"),
+                ("balance_cap_on", "on"),
+                ("balance_cap", "2.5"),
+            ]),
+            &t,
+        )
+        .unwrap();
+        assert_eq!(
+            b.axes,
+            axes(&[
+                BalanceAxis::Class,
+                BalanceAxis::Scene,
+                BalanceAxis::CameraDay
+            ])
+        );
+        assert_eq!((b.strength, b.max_repeat), (1.0, 6));
+        assert_eq!(b.cap_dominant, Some(2.5));
+        // The cap applies only with its box; a blank cap is the default 3.
+        let b = balance_of(&form(&[("balance", "camera"), ("balance_cap", "2")]), &t).unwrap();
+        assert_eq!(b.cap_dominant, None);
+        assert_eq!((b.strength, b.max_repeat), (0.5, 4), "defaults");
+        let b = balance_of(
+            &form(&[
+                ("balance", "camera"),
+                ("balance_cap_on", "on"),
+                ("balance_cap", ""),
+            ]),
+            &t,
+        )
+        .unwrap();
+        assert_eq!(b.cap_dominant, Some(3.0));
+        // No balance field at all: training.balance, else off.
+        let configured = TrainingConfig {
+            balance: Some(Balance {
+                axes: axes(&[BalanceAxis::Class]),
+                strength: 1.0,
+                ..Balance::default()
+            }),
+            ..TrainingConfig::default()
+        };
+        let none = form(&[("dataset", "/x")]);
+        assert_eq!(
+            &balance_of(&none, &configured).unwrap(),
+            configured.balance.as_ref().unwrap()
+        );
+        assert!(balance_of(&none, &t).unwrap().is_off());
+        // A form with the fieldset but no axis ticked: off, whatever the config or the other
+        // fields say.
+        let off = form(&[("balance_strength", "7"), ("balance_max_repeat", "4")]);
+        assert_eq!(balance_of(&off, &configured).unwrap(), Balance::default());
+        // Bad values name the field.
+        let err = |pairs: &[(&str, &str)]| {
+            let mut v = vec![("balance", "class")];
+            v.extend_from_slice(pairs);
+            format!("{:#}", balance_of(&form(&v), &t).unwrap_err())
+        };
+        let e = format!(
+            "{:#}",
+            balance_of(&form(&[("balance", "class,colour")]), &t).unwrap_err()
+        );
+        assert!(e.contains("balance") && e.contains("'colour'"), "{e}");
+        let e = err(&[("balance_strength", "lots")]);
+        assert!(
+            e.contains("balance strength") && e.contains("'lots'"),
+            "{e}"
+        );
+        assert!(err(&[("balance_strength", "1.5")]).contains("balance.strength"));
+        assert!(err(&[("balance_strength", "NaN")]).contains("balance.strength"));
+        assert!(err(&[("balance_max_repeat", "0")]).contains("balance.max_repeat"));
+        assert!(err(&[("balance_max_repeat", "11")]).contains("balance.max_repeat"));
+        assert!(err(&[("balance_max_repeat", "-1")]).contains("balance max repeat"));
+        assert!(err(&[("balance_cap_on", "on"), ("balance_cap", "0.5")]).contains("cap_dominant"));
+        // Every run of a scenes x models batch gets the same balance.
+        let (reqs, _) = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("model", "yolo26s"),
+                ("scene", "day"),
+                ("scene", "night+ir"),
+                ("balance", "class,scene"),
+                ("balance_strength", "0.5"),
+                ("balance_max_repeat", "5"),
+            ]),
+            &mac(),
+            &t,
+        )
+        .unwrap();
+        assert_eq!(reqs.len(), 4);
+        for r in &reqs {
+            assert_eq!(
+                r.balance.axes,
+                axes(&[BalanceAxis::Class, BalanceAxis::Scene])
+            );
+            assert_eq!(r.balance.max_repeat, 5);
+        }
+        // A bad balance refuses the queue form.
+        let e = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("balance", "class"),
+                ("balance_max_repeat", "0"),
+            ]),
+            &mac(),
+            &t,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("balance.max_repeat"), "{e:#}");
+    }
+
+    /// A review export of 3 cameras x (9 day + 3 IR frames), every fourth one empty, a
+    /// raccoon in the first IR frame of each camera, persons elsewhere.
+    fn skewed_export(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("classes.txt"), "person\nraccoon\n").unwrap();
+        for cam in ["a", "b", "c"] {
+            for (scene, date, n) in [("day", "2026-10-01", 9), ("ir", "2026-10-02", 3)] {
+                for i in 0..n {
+                    let stem = format!("{scene}.{cam}.{date}.f{i}");
+                    std::fs::write(dir.join("images").join(format!("{stem}.jpg")), b"x").unwrap();
+                    let label = match (scene, i % 4) {
+                        (_, 3) => "",
+                        ("ir", 0) => "1 0.5 0.5 0.2 0.2\n",
+                        _ => "0 0.5 0.5 0.2 0.4\n",
+                    };
+                    std::fs::write(dir.join("labels").join(format!("{stem}.txt")), label).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_balance_preview_shows_before_and_after_per_run_and_checks_folders() {
+        use crate::server::test_util::{REMOTE, call, from_peer, post_form, test_state_with};
+        let root = std::env::temp_dir().join(format!("bop-train-bal-{}", uuid::Uuid::new_v4()));
+        let export = root.join("exports/review-1");
+        skewed_export(&export);
+        let (r2, e2) = (root.clone(), export.clone());
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(r2);
+            c.training.datasets = vec![e2];
+        });
+        let enc = super::super::encode_uri_component(&export.display().to_string());
+        let post = |body: String| post_form("/v1/training/balance-preview", &body, false);
+        let json = |b: &[u8]| -> serde_json::Value { serde_json::from_slice(b).unwrap() };
+        // Class balance over two runs (all scenes, day): the raccoon frames repeat.
+        let (s, _, b) = call(
+            &state,
+            post(format!(
+                "dataset={enc}&scene=all&scene=day&balance=class&balance_strength=1&\
+                 balance_max_repeat=4"
+            )),
+        )
+        .await;
+        let v = json(&b);
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["success"], true);
+        assert_eq!(v["balance"]["axes"], serde_json::json!(["class"]));
+        let runs = v["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["scene"], "all");
+        assert_eq!(runs[0]["title"], "All scenes (mixed)");
+        assert_eq!(runs[1]["scene"], "day");
+        let r = &runs[0];
+        assert!(r["error"].is_null(), "{r}");
+        let rep = &r["report"];
+        let before = rep["before"]["boxes_per_class"]["raccoon"]
+            .as_u64()
+            .unwrap();
+        let after = rep["after"]["boxes_per_class"]["raccoon"].as_u64().unwrap();
+        assert!(before > 0 && after > before, "{rep}");
+        assert_eq!(
+            rep["before"]["boxes_per_class"]["person"],
+            rep["after"]["boxes_per_class"]["person"]
+        );
+        assert!(rep["after"]["images"].as_u64() > rep["before"]["images"].as_u64());
+        assert_eq!(r["train_images"], rep["after"]["images"]);
+        assert!(r["train_frames"].as_u64().unwrap() > 0);
+        assert!(r["heldout_frames"].as_u64().unwrap() > 0, "{r}");
+        assert!(r["warnings"].is_array());
+        // Balance off: no report, the counts still.
+        let (s, _, b) = call(&state, post(format!("dataset={enc}&balance_strength=0.5"))).await;
+        let v = json(&b);
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let r = &v["runs"][0];
+        assert!(r["report"].is_null(), "{r}");
+        assert_eq!(r["train_images"], r["train_frames"]);
+        // A folder outside the offered and browsable ones, a bad field: 400 naming it.
+        let (s, _, b) = call(
+            &state,
+            post("dataset_path=%2Fno%2Fsuch%2Fexport&balance=class".into()),
+        )
+        .await;
+        let v = json(&b);
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["success"], false);
+        assert!(
+            v["message"].as_str().unwrap().contains("another folder"),
+            "{v}"
+        );
+        let (s, _, b) = call(&state, post(format!("dataset={enc}&balance=colour"))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(json(&b)["message"].as_str().unwrap().contains("'colour'"));
+        // A class the datasets do not have: that run's error.
+        let (_, _, b) = call(
+            &state,
+            post(format!("dataset={enc}&classes=zebra&balance=class")),
+        )
+        .await;
+        let v = json(&b);
+        assert!(
+            v["runs"][0]["error"]
+                .as_str()
+                .is_some_and(|e| !e.is_empty()),
+            "{v}"
+        );
+        // Cross-site browser requests and remote peers are refused.
+        let mut req = post(format!("dataset={enc}&balance=class"));
+        req.headers_mut()
+            .insert("sec-fetch-site", "cross-site".parse().unwrap());
+        let (s, _, _) = call(&state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = call(&state, from_peer(post(format!("dataset={enc}")), REMOTE)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_balance_fieldset_starts_from_training_balance() {
+        use askama::Template;
+        let state = crate::server::test_util::test_state_with(|c| {
+            c.training.balance = Some(Balance {
+                axes: Balance::parse_axes("scene,camera-day").unwrap(),
+                strength: 0.7,
+                max_repeat: 6,
+                cap_dominant: Some(2.5),
+            });
+        });
+        let page = view_with(&state, None, None, Vec::new()).render().unwrap();
+        assert!(page.contains("<details class=\"tr-more tr-balance\" id=\"train-balance\" open>"));
+        assert!(page.contains("name=\"balance\" value=\"scene\" checked>"));
+        assert!(page.contains("name=\"balance\" value=\"camera-day\" checked>"));
+        assert!(page.contains("name=\"balance\" value=\"class\">"));
+        // A configured strength that is neither preset: its own radio, checked.
+        assert!(page.contains("name=\"balance_strength\" value=\"0.5\">"));
+        assert!(page.contains("name=\"balance_strength\" value=\"0.7\" checked> Configured (0.7)"));
+        assert!(page.contains("value=\"6\">"));
+        assert!(page.contains("name=\"balance_cap_on\" id=\"train-bal-cap-on\" checked>"));
+        assert!(page.contains("value=\"2.5\""));
     }
 }

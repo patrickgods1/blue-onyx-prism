@@ -237,6 +237,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             "/v1/training/dataset-classes",
             get(training::dataset_classes),
         ),
+        (
+            "/v1/training/balance-preview",
+            post(training::balance_preview).layer(DefaultBodyLimit::max(256 * 1024)),
+        ),
         ("/v1/training/compare", get(training::compare_json)),
         ("/training/queue", post(training::queue)),
         ("/training/cancel", post(training::cancel)),
@@ -1040,6 +1044,7 @@ mod tests {
             "/v1/training",
             "/v1/training/metric-columns",
             "/v1/training/dataset-classes",
+            "/v1/training/balance-preview",
             "/v1/training/compare",
             "/training/queue",
             "/training/cancel",

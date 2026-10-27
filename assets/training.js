@@ -6,13 +6,16 @@
 // hidden inputs (its classes included); the box and its follow-up options are remembered in
 // localStorage. A Recent imports row's Auto-label button fills the card's filter (import=<id>).
 // Train: the runs line (one run per ticked scene per model, named before queuing), the class
-// picker of the ticked folders (counts per scene, warnings) and Finish now while training.
+// picker of the ticked folders (counts per scene, warnings), the balance preview (what the
+// Balance fieldset does to each run's training frames) and Finish now while training.
 (function () {
   "use strict";
 
   // Set by the auto-label classes block: the picker's selection, whether some are outside the
   // class list, and the confirm that appends them (null without the picker).
   var alClasses = null;
+  // Set by the train classes block: the picked classes in head order (null without the picker).
+  var trainClasses = null;
 
   // The value of the checked radio `name` of `form`.
   function checked(form, name) {
@@ -328,6 +331,7 @@
     var runsLine = document.getElementById("train-runs-line");
     var models = train.querySelectorAll('input[name="model"]');
     var sceneBoxes = train.querySelectorAll('input[name="scene"]');
+    var balanceBoxes = train.querySelectorAll('input[name="balance"]');
     var hintText = hint ? hint.innerHTML : "";
     var tickedScenes = function () {
       var out = [];
@@ -343,11 +347,14 @@
       var list = [];
       ms.forEach(function (m) { prefixes.forEach(function (p) { list.push(p + "-" + m); }); });
       var n = list.length;
+      var bal = [];
+      balanceBoxes.forEach(function (b) { if (b.checked) bal.push(b.value.replace("-", " + ")); });
       if (runsLine) {
         runsLine.hidden = n === 0;
         runsLine.textContent = n === 0 ? "" :
           "Queues " + n + " run" + (n === 1 ? "" : "s") + ": " + list.join(", ") +
-          (prefixes.length > 1 ? " (compared on the same held-out frames)" : "");
+          (prefixes.length > 1 ? " (compared on the same held-out frames)" : "") +
+          (bal.length ? "; training frames balanced by " + bal.join(", ") : "");
       }
       if (!name) return;
       name.disabled = n > 1;
@@ -358,6 +365,7 @@
     };
     models.forEach(function (m) { m.addEventListener("change", names); });
     sceneBoxes.forEach(function (b) { b.addEventListener("change", names); });
+    balanceBoxes.forEach(function (b) { b.addEventListener("change", names); });
     // Night only / IR only ticked: the Other section stays open.
     var other = train.querySelector(".tr-scene-other");
     if (other && other.querySelector("input:checked")) other.open = true;
@@ -400,6 +408,9 @@
       return e;
     };
     var note = function (text) { holder.replaceChildren(mk("p", "muted small", text)); };
+    // The balance preview follows the picked classes.
+    var changed = function () { form.dispatchEvent(new Event("tr-classes")); };
+    trainClasses = function () { return picker ? inOrder(picker.getSelected()) : null; };
     var stored = function () {
       try {
         var v = JSON.parse(window.localStorage.getItem(KEY) || "null");
@@ -465,6 +476,7 @@
       });
     };
     var say = function () {
+      changed();
       if (!msg) return;
       msg.className = "small";
       if (!inv) { msg.textContent = ""; return; }
@@ -585,6 +597,256 @@
       });
     });
     load();
+  })();
+
+  // Train balance: the fieldset's state in its summary and the preview of what balancing does
+  // to each run's training frames (POST /v1/training/balance-preview with the form's dataset,
+  // scene, class, excluded, public and balance fields; debounced, a stale answer is aborted or
+  // dropped), shown only while an axis is ticked: images per epoch before -> after, then boxes
+  // per class, frames per scene, the top cameras (and camera-days with that axis) with bars,
+  // and the warnings. Several scenes ticked: one tab per run.
+  (function () {
+    var form = document.getElementById("train");
+    var box = document.getElementById("train-balance");
+    var panel = document.getElementById("train-balance-preview");
+    var stateEl = document.getElementById("train-balance-state");
+    if (!form || !box || !panel) return;
+    var TOP = 8;
+    var LABEL = { "class": "class", scene: "scene", camera: "camera", "camera-day": "camera + day" };
+    var timer = null, ctrl = null, seq = 0, lastBody = null, tab = 0;
+    var capOn = document.getElementById("train-bal-cap-on"), cap = document.getElementById("train-bal-cap");
+    var mk = function (tag, cls, text) {
+      var e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text != null) e.textContent = text;
+      return e;
+    };
+    var axes = function () {
+      var out = [];
+      form.querySelectorAll('input[name="balance"]').forEach(function (b) { if (b.checked) out.push(b.value); });
+      return out;
+    };
+    // The cap's number posts (and is editable) only while its box is ticked.
+    var syncCap = function () { if (cap && capOn) cap.disabled = !capOn.checked; };
+    // The fields the preview needs, like the queue form posts them (classes from the picker).
+    var body = function () {
+      var p = new URLSearchParams();
+      form.querySelectorAll('input[name="dataset"]').forEach(function (b) { if (b.checked && !b.disabled) p.append("dataset", b.value); });
+      var extra = form.elements.dataset_path;
+      if (extra && extra.value.trim()) p.append("dataset_path", extra.value.trim());
+      form.querySelectorAll('input[name="scene"]:checked').forEach(function (b) { p.append("scene", b.value); });
+      var cls = trainClasses ? trainClasses() : null;
+      if (cls) cls.forEach(function (n) { p.append("classes", n); });
+      else {
+        var t = form.querySelector('#train-picker input[name="classes"]');
+        if (t && t.value.trim()) p.append("classes", t.value.trim());
+      }
+      ["excluded", "balance_strength"].forEach(function (n) {
+        var r = form.querySelector('input[name="' + n + '"]:checked');
+        if (r) p.append(n, r.value);
+      });
+      var pub = form.querySelector('input[name="public"]');
+      if (pub && pub.checked && !pub.disabled) p.append("public", "on");
+      axes().forEach(function (a) { p.append("balance", a); });
+      var max = form.elements.balance_max_repeat;
+      if (max && max.value !== "") p.append("balance_max_repeat", max.value);
+      if (capOn && capOn.checked) {
+        p.append("balance_cap_on", "on");
+        if (cap && cap.value !== "") p.append("balance_cap", cap.value);
+      }
+      return p.toString();
+    };
+    var say = function (text, cls) {
+      panel.replaceChildren(mk("p", cls || "muted small", text));
+    };
+    var pct = function (n, max) { return max > 0 ? Math.max(n > 0 ? 1 : 0, Math.round(1000 * n / max) / 10) : 0; };
+    // One before -> after table: rows [name, before, after], bars scaled to the table's largest.
+    var table = function (title, head, rows) {
+      var wrap = mk("div", "tr-bal-table");
+      wrap.appendChild(mk("h4", "tr-bal-h", title));
+      if (!rows.length) { wrap.appendChild(mk("p", "muted small", "none")); return wrap; }
+      var max = 0;
+      rows.forEach(function (r) { max = Math.max(max, r[1], r[2]); });
+      var t = mk("table", "tr-btable");
+      var tr = mk("tr");
+      [[head, ""], ["Before", "num"], ["After", "num"], ["", "tr-bal-bars"]].forEach(function (h) {
+        var th = mk("th", h[1] || null, h[0]);
+        th.scope = "col";
+        tr.appendChild(th);
+      });
+      var thead = mk("thead");
+      thead.appendChild(tr);
+      t.appendChild(thead);
+      var tb = mk("tbody");
+      rows.forEach(function (r) {
+        var row = mk("tr");
+        var name = mk("td", "tr-bal-name", r[0]);
+        name.title = r[0];
+        row.appendChild(name);
+        row.appendChild(mk("td", "num", String(r[1])));
+        var after = mk("td", "num" + (r[2] > r[1] ? " tr-bal-up" : r[2] < r[1] ? " tr-bal-down" : ""), String(r[2]));
+        if (r[1] > 0 && r[2] !== r[1]) after.title = "x" + (r[2] / r[1]).toFixed(2);
+        row.appendChild(after);
+        var bars = mk("td", "tr-bal-bars");
+        var b1 = mk("span", "tr-bal-bar tr-bal-before"), b2 = mk("span", "tr-bal-bar tr-bal-after");
+        b1.style.width = pct(r[1], max) + "%";
+        b2.style.width = pct(r[2], max) + "%";
+        bars.appendChild(b1);
+        bars.appendChild(b2);
+        row.appendChild(bars);
+        tb.appendChild(row);
+      });
+      t.appendChild(tb);
+      wrap.appendChild(t);
+      return wrap;
+    };
+    // Rows of two {name: n} maps: every name, the largest before first; at most `top`.
+    var rowsOf = function (before, after, top) {
+      var names = Object.keys(before || {});
+      Object.keys(after || {}).forEach(function (k) { if (names.indexOf(k) < 0) names.push(k); });
+      var rows = names.map(function (k) { return [k, (before || {})[k] || 0, (after || {})[k] || 0]; });
+      rows.sort(function (a, b) { return b[1] - a[1] || b[2] - a[2] || (a[0] < b[0] ? -1 : 1); });
+      return top ? rows.slice(0, top) : rows;
+    };
+    var share = function (x) { return Math.round(100 * (x || 0)) + "%"; };
+    var runPane = function (r) {
+      var d = mk("div", "tr-bal-run");
+      if (r.error) { d.appendChild(mk("p", "error-text small", r.error)); return d; }
+      var rep = r.report;
+      var counts = r.train_frames + " training frames, " + r.valid_frames + " validation, " + r.heldout_frames + " held out (never balanced).";
+      if (!rep) {
+        d.appendChild(mk("p", "muted small", counts + " Nothing to balance."));
+      } else {
+        var b = rep.before || {}, a = rep.after || {};
+        var kpi = mk("p", "tr-bal-kpi");
+        kpi.appendChild(mk("span", "k", "Images per epoch "));
+        kpi.appendChild(mk("strong", null, b.images + " → " + a.images));
+        if (b.images > 0) kpi.appendChild(mk("span", "muted small", " (×" + (a.images / b.images).toFixed(2) + ")"));
+        d.appendChild(kpi);
+        var facts = counts + " Largest repeat " + rep.max_repeat + "×; frames without a box " + share(b.negative_share) + " → " + share(a.negative_share) + ".";
+        d.appendChild(mk("p", "muted small", facts));
+        if (rep.dropped > 0) {
+          d.appendChild(mk("p", "small tr-bal-drop", "The cap leaves out " + rep.dropped + " training frame" + (rep.dropped === 1 ? "" : "s") +
+            " of dominant groups (" + rep.frames_before + " → " + rep.frames_after + " unique frames)."));
+        }
+        var grid = mk("div", "tr-bal-tables");
+        grid.appendChild(table("Boxes per class", "Class", rowsOf(b.boxes_per_class, a.boxes_per_class, 0)));
+        grid.appendChild(table("Frames per scene", "Scene", rowsOf(b.frames_per_scene, a.frames_per_scene, 0)));
+        var cams = rowsOf(b.frames_per_camera, a.frames_per_camera, TOP);
+        var nCams = Object.keys(b.frames_per_camera || {}).length;
+        grid.appendChild(table(nCams > TOP ? "Top " + TOP + " of " + nCams + " cameras" : "Frames per camera", "Camera", cams));
+        if (((rep.balance || {}).axes || []).indexOf("camera-day") >= 0) {
+          var after = {};
+          (a.camera_days || []).forEach(function (x) { after[x[0]] = x[1]; });
+          var days = (b.camera_days || []).slice(0, TOP).map(function (x) { return [x[0], x[1], after[x[0]] || 0]; });
+          grid.appendChild(table("Top camera-days", "Camera / day", days));
+        }
+        d.appendChild(grid);
+      }
+      var w = r.warnings || [];
+      if (w.length) {
+        var ul = mk("ul", "warn-list small");
+        w.forEach(function (x) { ul.appendChild(mk("li", null, x)); });
+        d.appendChild(ul);
+      }
+      return d;
+    };
+    var render = function (j) {
+      var runs = j.runs || [];
+      panel.replaceChildren();
+      if (!runs.length) { say("No run to preview."); return; }
+      var legend = mk("p", "small tr-bal-legend");
+      legend.appendChild(mk("span", "tr-bal-swatch tr-bal-before"));
+      legend.appendChild(document.createTextNode(" before "));
+      legend.appendChild(mk("span", "tr-bal-swatch tr-bal-after"));
+      legend.appendChild(document.createTextNode(" after balancing (repeats counted; per epoch)"));
+      if (tab >= runs.length) tab = 0;
+      var panes = runs.map(runPane);
+      if (runs.length > 1) {
+        var bar = mk("div", "tr-bal-tabs");
+        bar.setAttribute("role", "tablist");
+        var buttons = runs.map(function (r, i) {
+          var b = mk("button", "small" + (i === tab ? "" : " secondary"), r.title || r.scene);
+          b.type = "button";
+          b.setAttribute("role", "tab");
+          b.setAttribute("aria-selected", i === tab ? "true" : "false");
+          b.addEventListener("click", function () {
+            tab = i;
+            buttons.forEach(function (x, k) {
+              x.setAttribute("aria-selected", k === i ? "true" : "false");
+              x.className = "small" + (k === i ? "" : " secondary");
+            });
+            panes.forEach(function (p, k) { p.hidden = k !== i; });
+          });
+          bar.appendChild(b);
+          return b;
+        });
+        panel.appendChild(bar);
+      }
+      panel.appendChild(legend);
+      panes.forEach(function (p, i) { p.hidden = i !== tab; p.setAttribute("role", runs.length > 1 ? "tabpanel" : "region"); panel.appendChild(p); });
+    };
+    var run = function () {
+      timer = null;
+      var ax = axes();
+      if (stateEl) stateEl.textContent = ax.length ? "on: " + ax.map(function (a) { return LABEL[a] || a; }).join(" + ") : "off";
+      if (!ax.length) {
+        if (ctrl) ctrl.abort();
+        ctrl = null; seq++; lastBody = null;
+        panel.hidden = true;
+        panel.replaceChildren();
+        return;
+      }
+      var cls = trainClasses ? trainClasses() : null;
+      if (cls && !cls.length) {
+        lastBody = null;
+        panel.hidden = false;
+        say("Tick at least one class to preview the balance.", "small error-text");
+        return;
+      }
+      var b = body();
+      if (b === lastBody) return;
+      lastBody = b;
+      if (ctrl) ctrl.abort();
+      ctrl = typeof AbortController === "function" ? new AbortController() : null;
+      var mine = ++seq;
+      panel.hidden = false;
+      panel.classList.add("tr-bal-busy");
+      if (!panel.firstChild) say("Previewing the balance…");
+      fetch("/v1/training/balance-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        body: b,
+        signal: ctrl ? ctrl.signal : undefined
+      }).then(function (res) {
+        return res.json().catch(function () { return null; }).then(function (j) {
+          if (!res.ok || !j || j.success === false) throw new Error((j && j.message) || "the server answered HTTP " + res.status);
+          return j;
+        });
+      }).then(function (j) {
+        if (mine !== seq) return;
+        panel.classList.remove("tr-bal-busy");
+        render(j);
+      }).catch(function (e) {
+        if (mine !== seq || (e && e.name === "AbortError")) return;
+        panel.classList.remove("tr-bal-busy");
+        lastBody = null;
+        say("No preview: " + e.message, "small error-text");
+      });
+    };
+    var later = function () {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(run, 400);
+    };
+    // Every field of the Datasets step (folders, scenes, classes, excluded, public, balance);
+    // the class picker's changes come as tr-classes. An unchanged form asks nothing.
+    var step = document.getElementById("datasets") || form;
+    step.addEventListener("change", later);
+    step.addEventListener("input", later);
+    form.addEventListener("tr-classes", later);
+    if (capOn) capOn.addEventListener("change", syncCap);
+    syncCap();
+    later();
   })();
 
   // Live progress.

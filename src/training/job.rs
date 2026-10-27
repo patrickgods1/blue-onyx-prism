@@ -132,10 +132,41 @@ pub struct TrainRequest {
     /// What a train / valid frame with a box of an untrained label becomes.
     #[serde(default)]
     pub excluded: dataset::Excluded,
+    /// Balance the training frames (step 7 of [`dataset::plan`]); off by default.
+    #[serde(default, skip_serializing_if = "dataset::Balance::is_off")]
+    pub balance: dataset::Balance,
     /// Runs queued together to be compared (one per scene filter x model): the first run's id
     /// stamp ([`super::compare`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compare_group: Option<String>,
+}
+
+/// The sources of a run: the review exports `datasets` (absolute), then the public subset
+/// installed in `public` when given. The job and [`super::preview_plan`] read the same way.
+pub fn read_sources(datasets: &[PathBuf], public: Option<&Path>) -> Result<Vec<dataset::Source>> {
+    let mut sources = Vec::new();
+    for d in datasets {
+        sources.push(dataset::read_export(d).with_context(|| format!("reading {}", d.display()))?);
+    }
+    if let Some(dir) = public {
+        let m = catalog::lila_night_manifest()
+            .ok_or_else(|| anyhow!("the public subset's manifest does not parse"))?;
+        sources.push(dataset::read_public_set(dir, m)?);
+    }
+    Ok(sources)
+}
+
+/// `base` (the config's assembly defaults, [`TrainJob::options`]) with the request's own choices:
+/// scene filter, classes, renames, excluded mode and balance.
+pub fn request_options(base: &dataset::Options, request: &TrainRequest) -> dataset::Options {
+    dataset::Options {
+        scene: request.scene,
+        classes: request.classes.clone(),
+        rename: request.rename.clone(),
+        excluded: request.excluded,
+        balance: request.balance.clone(),
+        ..base.clone()
+    }
 }
 
 /// One queued run.
@@ -594,26 +625,20 @@ fn stages(
     if job.request.datasets.is_empty() {
         bail!("no dataset: choose at least one review export folder");
     }
-    let mut sources = Vec::new();
-    for d in &job.request.datasets {
-        sources.push(dataset::read_export(d).with_context(|| format!("reading {}", d.display()))?);
-    }
-    if job.request.include_public {
-        let m = catalog::lila_night_manifest()
-            .ok_or_else(|| anyhow!("the public subset's manifest does not parse"))?;
-        sources.push(dataset::read_public_set(&public_dir, m)?);
-    }
-    let mut opts = job.options.clone();
-    opts.scene = job.request.scene;
-    opts.classes = job.request.classes.clone();
-    opts.rename = job.request.rename.clone();
-    opts.excluded = job.request.excluded;
+    let sources = read_sources(
+        &job.request.datasets,
+        job.request.include_public.then_some(public_dir.as_path()),
+    )?;
+    let opts = request_options(&job.options, &job.request);
     let plan = dataset::plan(&sources, &opts)?;
     let data_dir = job.run_dir.join("data");
     manager::remove_any(&data_dir)?;
     let prepared = dataset::write(&sources, &plan, &opts, &data_dir)?;
     for w in &prepared.warnings {
         log.line(&format!("dataset: {w}"));
+    }
+    if let Some(b) = &prepared.balance_summary {
+        log.line(&format!("dataset: balanced: {b}"));
     }
     report(TrainReport::Prepared(&prepared));
     let detail = format!(
@@ -749,6 +774,7 @@ fn stages(
             note: note.clone(),
             patience: recipe.patience,
             min_delta: super::recipe::recommended(family).min_delta_f64(),
+            min_epochs: super::recipe::recommended(family).min_epochs,
             ..TrainProgress::default()
         };
         let mut done: Option<TrainEvent> = None;

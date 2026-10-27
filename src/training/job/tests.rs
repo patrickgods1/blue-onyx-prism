@@ -277,6 +277,7 @@ fn job(
             install_dir: None,
             gpu: None,
             excluded: Default::default(),
+            balance: Default::default(),
             compare_group: None,
         },
         name: format!("night-{}-test", family.base_name(size)),

@@ -474,6 +474,9 @@ pub struct TrainProgress {
     /// The run's min_delta (the convergence rule's), set with `patience`.
     #[serde(skip_serializing_if = "is_zero")]
     pub min_delta: f64,
+    /// The run's minimum epochs (the rule never stops before), set with `patience`.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub min_epochs: u32,
     /// Epochs since the last improvement of the rule's metric (mAP 50-95, else mAP 50): the run
     /// stops when this reaches `patience` (past the minimum epochs).
     pub since_best: u32,
@@ -484,6 +487,10 @@ pub struct TrainProgress {
 
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl TrainProgress {
@@ -655,6 +662,19 @@ impl TrainProgress {
         t.last.saturating_sub(t.best_epoch)
     }
 
+    /// The epoch the rule stops after when nothing improves from now on:
+    /// `max(min_epochs, last improvement + patience)`, at most the run's epochs.
+    pub fn stop_epoch(&self) -> u32 {
+        let last = self.history.last().map_or(self.epoch, |p| p.epoch);
+        let improved = last.saturating_sub(self.since_best);
+        let n = self.min_epochs.max(improved.saturating_add(self.patience));
+        if self.epochs > 0 {
+            n.min(self.epochs)
+        } else {
+            n
+        }
+    }
+
     /// Share of the training done, 0..1: finished epochs plus the share of the current one.
     pub fn fraction(&self) -> f64 {
         if self.stopped.is_some() {
@@ -727,9 +747,9 @@ impl TrainProgress {
         }
         if self.patience > 0 && self.patience < self.epochs && self.since_best > 0 {
             s.push_str(&format!(
-                ", {} without improvement (stops at {})",
+                ", {} without improvement (stops after epoch {} if no gain)",
                 plural(self.since_best, "epoch"),
-                self.patience
+                self.stop_epoch()
             ));
         }
         if let Some(e) = self.eta_s {
@@ -1124,9 +1144,22 @@ mod tests {
         assert_eq!(p.since_best, 2);
         assert!(
             p.describe()
-                .contains("2 epochs without improvement (stops at 3)"),
+                .contains("2 epochs without improvement (stops after epoch 5 if no gain)"),
             "{}",
             p.describe()
+        );
+        // The minimum epochs win over an earlier stale stop.
+        let floor = TrainProgress {
+            min_epochs: 8,
+            ..p.clone()
+        };
+        assert_eq!(floor.stop_epoch(), 8);
+        assert!(
+            floor
+                .describe()
+                .contains("(stops after epoch 8 if no gain)"),
+            "{}",
+            floor.describe()
         );
         assert!(p.fraction() < 1.0);
         p.apply(

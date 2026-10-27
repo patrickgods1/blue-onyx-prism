@@ -1257,3 +1257,190 @@ fn a_class_only_in_the_heldout_split_says_so() {
     let car = p.warnings.iter().find(|w| w.contains("'car'")).unwrap();
     assert!(car.contains("no frame"), "{car}");
 }
+
+/// Skewed footage: 4 cameras, a busy day (8 person frames + 1 empty) and a short IR night
+/// (2 frames, a raccoon on cameras a and b, + 1 empty) each.
+fn skewed_export(dir: &Path) {
+    let mut frames: Vec<(String, String, Vec<String>)> = Vec::new();
+    for cam in ["a", "b", "c", "d"] {
+        for (day, scene, n) in [("2026-10-01", "day", 8), ("2026-10-02", "ir", 2)] {
+            for i in 0..=n {
+                let label = match (scene, i) {
+                    (_, i) if i == n => "",
+                    ("ir", 0) if cam == "a" || cam == "b" => "1 0.5 0.5 0.2 0.2\n",
+                    _ => "0 0.5 0.5 0.2 0.4\n",
+                };
+                frames.push((
+                    format!("{cam}-{day}-{i}.jpg"),
+                    label.into(),
+                    vec![scene.into(), format!("camera:{cam}"), format!("date:{day}")],
+                ));
+            }
+        }
+    }
+    let tags: Vec<Vec<&str>> = frames
+        .iter()
+        .map(|(_, _, t)| t.iter().map(String::as_str).collect())
+        .collect();
+    let refs: Vec<(&str, &str, &[&str])> = frames
+        .iter()
+        .zip(&tags)
+        .map(|((n, l, _), t)| (n.as_str(), l.as_str(), t.as_slice()))
+        .collect();
+    flat_export(dir, &["person", "raccoon"], &refs);
+}
+
+fn balanced(axes: &str, cap: Option<f32>) -> Options {
+    Options {
+        balance: Balance {
+            axes: Balance::parse_axes(axes).unwrap(),
+            cap_dominant: cap,
+            ..Balance::default()
+        },
+        ..Options::default()
+    }
+}
+
+#[test]
+fn balance_off_is_the_old_plan() {
+    let t = tmp("bal-off");
+    skewed_export(&t.0);
+    let s = vec![read_export(&t.0).unwrap()];
+    let old = plan(&s, &Options::default()).unwrap();
+    // Every knob but the axes set: still off.
+    let off = Options {
+        balance: Balance {
+            axes: BTreeSet::new(),
+            strength: 1.0,
+            max_repeat: 9,
+            cap_dominant: Some(1.0),
+        },
+        ..Options::default()
+    };
+    assert_eq!(plan(&s, &off).unwrap(), old);
+    assert_eq!(old.balance, None);
+    assert_eq!(old.stats.balance_dropped, 0);
+    assert!(old.train.iter().all(|(_, r)| *r == 1));
+    // Options of older runs (no balance key) read as off and write no balance key.
+    let mut v = serde_json::to_value(Options::default()).unwrap();
+    assert!(v.get("balance").is_none(), "{v}");
+    v.as_object_mut().unwrap().remove("balance");
+    let back: Options = serde_json::from_value(v).unwrap();
+    assert!(back.balance.is_off());
+    assert_eq!(back, Options::default());
+}
+
+#[test]
+fn balance_repeats_rare_training_frames_and_never_touches_heldout_or_valid() {
+    let t = tmp("bal-on");
+    skewed_export(&t.0);
+    let s = vec![read_export(&t.0).unwrap()];
+    let old = plan(&s, &Options::default()).unwrap();
+    let opts = balanced("class,scene", None);
+    let p = plan(&s, &opts).unwrap();
+    assert_eq!(p.heldout, old.heldout);
+    assert_eq!(p.heldout_fingerprint, old.heldout_fingerprint);
+    assert_eq!(p.valid, old.valid);
+    assert_eq!(
+        p.train.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        old.train.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        "no cap: the same training frames"
+    );
+    let f = |r: FrameRef| &s[r.0].frames[r.1];
+    let mut raccoon_reps = 0;
+    let (mut ir, mut ir_reps) = (0, 0);
+    for (r, rep) in &p.train {
+        let fr = f(*r);
+        let raccoon = fr.boxes.iter().any(|b| b.class == "raccoon");
+        if raccoon {
+            raccoon_reps += rep;
+            assert!(*rep > 1, "raccoon frame {}", fr.image.display());
+        } else if fr.scene.as_deref() == Some("ir") && !fr.boxes.is_empty() {
+            // sqrt(day / ir) between 1 and 2: rounded up or down by rank.
+            assert!((1..=2).contains(rep), "IR frame {}", fr.image.display());
+            (ir, ir_reps) = (ir + 1, ir_reps + rep);
+        } else if fr.scene.as_deref() == Some("day") && !fr.boxes.is_empty() {
+            assert_eq!(*rep, 1, "day person frame {}", fr.image.display());
+        }
+    }
+    assert!(
+        ir > 0 && ir_reps > ir,
+        "{ir_reps} repeats of {ir} IR frames"
+    );
+    let report = p.balance.as_ref().unwrap();
+    assert_eq!(
+        report.after.boxes_per_class["raccoon"],
+        raccoon_reps as usize
+    );
+    assert!(report.after.images > report.before.images);
+    assert_eq!(
+        report.before.images,
+        old.train.iter().map(|(_, r)| *r as usize).sum::<usize>()
+    );
+    assert_eq!(
+        report.after.images,
+        p.train.iter().map(|(_, r)| *r as usize).sum::<usize>()
+    );
+    assert_eq!(
+        p.stats.train_boxes, old.stats.train_boxes,
+        "repeats count once"
+    );
+    // The same plan again (seeded), another seed may round otherwise but keeps the splits.
+    assert_eq!(plan(&s, &opts).unwrap(), p);
+    // Written: repeated lines and the report in dataset.json.
+    let out = tmp("bal-out");
+    let prep = write(&s, &p, &opts, &out.0.join("data")).unwrap();
+    assert_eq!(prep.train_images, report.after.images);
+    let summary = prep.balance_summary.as_deref().unwrap();
+    assert!(
+        summary.starts_with(&format!(
+            "{} → {} images/epoch",
+            report.before.images, report.after.images
+        )),
+        "{summary}"
+    );
+    let lines = std::fs::read_to_string(out.0.join("data").join("train.txt")).unwrap();
+    assert_eq!(lines.lines().count(), report.after.images);
+    let j: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.0.join("data").join("dataset.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        j["options"]["balance"]["axes"],
+        serde_json::json!(["class", "scene"])
+    );
+    assert_eq!(
+        j["balance"]["after"]["images"].as_u64(),
+        Some(report.after.images as u64)
+    );
+    // Unbalanced: no report, no summary.
+    let out2 = tmp("bal-out-off");
+    let prep = write(&s, &old, &Options::default(), &out2.0.join("data")).unwrap();
+    assert_eq!(prep.balance_summary, None);
+    let text = std::fs::read_to_string(out2.0.join("data").join("dataset.json")).unwrap();
+    assert!(!text.contains("\"balance"), "{text}");
+}
+
+#[test]
+fn the_balance_cap_drops_only_training_frames() {
+    let t = tmp("bal-cap");
+    skewed_export(&t.0);
+    let s = vec![read_export(&t.0).unwrap()];
+    let old = plan(&s, &Options::default()).unwrap();
+    let p = plan(&s, &balanced("scene,camera-day", Some(1.0))).unwrap();
+    assert_eq!(p.heldout_fingerprint, old.heldout_fingerprint);
+    assert_eq!(p.valid, old.valid);
+    assert!(p.stats.balance_dropped > 0);
+    assert_eq!(
+        p.train.len() + p.stats.balance_dropped,
+        old.train.len(),
+        "dropped frames leave training only"
+    );
+    assert!(p.stats.train_boxes.contains_key("raccoon"));
+    assert_eq!(p.balance.as_ref().unwrap().dropped, p.stats.balance_dropped);
+    let train: BTreeSet<FrameRef> = p.train.iter().map(|(r, _)| *r).collect();
+    assert!(
+        old.train
+            .iter()
+            .all(|(r, _)| train.contains(r) || s[r.0].frames[r.1].scene.as_deref() == Some("day"))
+    );
+}

@@ -54,8 +54,12 @@ pub enum TrainCommand {
         #[command(flatten)]
         data: DataArgs,
         /// Output folder (must not exist or be empty).
+        #[arg(long, required_unless_present = "dry_run")]
+        out: Option<PathBuf>,
+        /// Plan only: print the split and the balance report (images per epoch, boxes and frames
+        /// per class, frames per scene, top cameras) and write nothing.
         #[arg(long)]
-        out: PathBuf,
+        dry_run: bool,
         /// With --public: allow downloading the public night subset (about 926 MB, over the
         /// 500 MB limit). Also config `allow_large_downloads`.
         #[arg(long)]
@@ -594,9 +598,50 @@ pub struct DataArgs {
     /// Mix in the pinned public night subset (train-data:lila-night).
     #[arg(long)]
     pub public: bool,
+    /// Balance the training frames over these axes, comma-separated and/or repeated: `class`,
+    /// `scene`, `camera`, `camera-day` (the days within each camera), or `off`. Rare groups get
+    /// their existing frames repeated (oversampling, no new information): `class` in the style
+    /// of LVIS repeat-factor sampling (a frame takes the largest factor of its classes), `scene`
+    /// evens out day / night / IR, `camera` and `camera-day` even out cameras and the days of
+    /// each. A group g repeats (largest / g)^strength times. The share of empty frames is kept.
+    /// Held-out and validation frames are never balanced. Default: `training.balance`, else off.
+    #[arg(long, value_delimiter = ',')]
+    pub balance: Vec<String>,
+    /// How hard --balance equalises, 0..1: 0.5 (default) is the square root of the ratio, 1 full
+    /// equalisation.
+    #[arg(long)]
+    pub balance_strength: Option<f32>,
+    /// Most times balancing repeats one frame, 1..10 (default 4).
+    #[arg(long)]
+    pub balance_max_repeat: Option<u32>,
+    /// Also cap dominant groups: a group keeps at most this many times the median group size
+    /// (at least 1; 3 is a good start). The cap DROPS frames of the larger groups, never
+    /// reviewer-confirmed hard negatives and never the last box of a class.
+    #[arg(long)]
+    pub balance_cap: Option<f32>,
 }
 
 impl DataArgs {
+    /// The balancing of the run: the flags over `training.balance` (the default when no
+    /// `--balance` is given), else off. Validated.
+    pub fn balance(&self, config: &Config) -> Result<dataset::Balance> {
+        let mut b = config.training.balance.clone().unwrap_or_default();
+        if !self.balance.is_empty() {
+            b.axes = dataset::Balance::parse_axes(&self.balance.join(","))?;
+        }
+        if let Some(s) = self.balance_strength {
+            b.strength = s;
+        }
+        if let Some(m) = self.balance_max_repeat {
+            b.max_repeat = m;
+        }
+        if let Some(c) = self.balance_cap {
+            b.cap_dominant = Some(c);
+        }
+        b.validate()?;
+        Ok(b)
+    }
+
     /// The distinct scene filters in the order given; `all` when none was.
     pub fn scenes(&self) -> Vec<SceneFilter> {
         let mut v: Vec<SceneFilter> = Vec::new();
@@ -728,13 +773,23 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
         TrainCommand::Prepare {
             data,
             out,
+            dry_run,
             allow_large,
         } => {
-            if data.public {
+            if data.public && !dry_run {
                 fetch_public(&config, allow_large || config.allow_large_downloads)?;
             }
             let [scene] = data.scenes()[..] else {
                 bail!("prepare takes one --scene (train run compares several)");
+            };
+            if dry_run {
+                let request = preview_request(&config, &data, scene)?;
+                let plan = super::preview_plan(&config, &request)?;
+                println!("{}", dry_run_text(&plan, &request.balance));
+                return Ok(true);
+            }
+            let Some(out) = out else {
+                bail!("--out <folder> is required (or --dry-run)");
             };
             let (sources, opts) = read_sources(&config, &data, scene)?;
             let plan = dataset::plan(&sources, &opts)?;
@@ -747,6 +802,9 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 prepared.heldout_images,
                 prepared.classes.join(", ")
             );
+            if let Some(b) = &prepared.balance_summary {
+                println!("balanced: {b}");
+            }
             if let Some(h) = &prepared.heldout_dir {
                 println!("held-out benchmark set: dir:{}", h.display());
             }
@@ -818,6 +876,10 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 noise: aug_noise.unwrap_or(base.noise),
                 gray: aug_gray.unwrap_or(base.gray),
             };
+            let balance = data.balance(&config)?;
+            if !balance.is_off() {
+                eprintln!("balance: {}", balance.describe());
+            }
             let mut jobs = Vec::new();
             for m in &models {
                 let (family, size) = recipe::parse_label(m)
@@ -852,6 +914,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                         install_dir: install_dir.clone(),
                         gpu: gpu.clone(),
                         excluded: data.excluded,
+                        balance: balance.clone(),
                         compare_group: group.clone(),
                     };
                     let mut job = super::plan_job(&config, req, &cap, name.clone())?;
@@ -896,12 +959,14 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                             svc.cancel(i);
                         }
                     }
-                    if verbose {
-                        for l in r.log.iter().skip(seen_log.min(r.log.len())) {
+                    for l in r.log.iter().skip(seen_log.min(r.log.len())) {
+                        if verbose {
                             eprintln!("    {l}");
+                        } else if l.starts_with("dataset: balanced:") {
+                            eprintln!("[{}] {}", r.name, l.trim_start_matches("dataset: "));
                         }
-                        seen_log = r.log.len();
                     }
+                    seen_log = r.log.len();
                     // One line per stage or percent change, else at most every 10 s.
                     let line = format!("[{}] {:>3}% {}", r.name, r.percent, r.describe());
                     let key = (r.stage, r.percent, line.clone());
@@ -1089,6 +1154,7 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 |d| d.classes.clone(),
             ),
             excluded: r.request.excluded,
+            balance: r.request.balance.clone(),
             best_epoch: r
                 .progress
                 .as_ref()
@@ -1279,6 +1345,141 @@ fn fetch_public(config: &Config, allowed: bool) -> Result<()> {
     )
 }
 
+/// The request `train prepare --dry-run` plans: the data flags and the config's training
+/// defaults (the recipe does not matter for the plan).
+fn preview_request(config: &Config, data: &DataArgs, scene: SceneFilter) -> Result<TrainRequest> {
+    Ok(TrainRequest {
+        recipe: TrainRecipe::new(catalog::TrainFamily::Yolo26, "n")?,
+        datasets: data.datasets.clone(),
+        include_public: data.public,
+        scene,
+        classes: data.class_list(),
+        rename: data.rename.iter().cloned().collect(),
+        benchmark_sets: Vec::new(),
+        allow_large: false,
+        install_dir: None,
+        gpu: None,
+        excluded: data.excluded,
+        balance: data.balance(config)?,
+        compare_group: None,
+    })
+}
+
+/// Rows of a before / after table: `name  before -> after`, widest name first column.
+fn before_after<'a>(
+    out: &mut String,
+    title: &str,
+    unit: &str,
+    rows: impl IntoIterator<Item = (&'a str, usize, usize)>,
+) {
+    let rows: Vec<_> = rows.into_iter().collect();
+    if rows.is_empty() {
+        return;
+    }
+    let w = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
+    out.push_str(&format!("{title} ({unit}, before -> after):\n"));
+    for (name, b, a) in rows {
+        out.push_str(&format!("  {name:<w$}  {b:>7} -> {a:<7}\n"));
+    }
+}
+
+/// How many cameras / camera-days the dry run lists.
+const DRY_RUN_TOP: usize = 10;
+
+/// `train prepare --dry-run`: the split and, when balancing, what it does. Pure.
+pub fn dry_run_text(plan: &dataset::Plan, balance: &dataset::Balance) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "plan: {} training frames, {} validation, {} held-out; classes: {}\n",
+        plan.train.len(),
+        plan.valid.len(),
+        plan.heldout.len(),
+        plan.classes.join(", ")
+    ));
+    let Some(r) = &plan.balance else {
+        if !plan.stats.train_boxes.is_empty() {
+            out.push_str("training boxes per class:\n");
+            for (c, n) in &plan.stats.train_boxes {
+                out.push_str(&format!("  {c}: {n}\n"));
+            }
+        }
+        out.push_str("balance: off\n");
+        for w in &plan.warnings {
+            out.push_str(&format!("warning: {w}\n"));
+        }
+        return out;
+    };
+    out.push_str(&format!("balance: {}\n", balance.describe()));
+    out.push_str(&format!(
+        "images per epoch: {} -> {} ({} -> {} unique frames, {} capped, most repeats of a frame {})\n",
+        r.before.images, r.after.images, r.frames_before, r.frames_after, r.dropped, r.max_repeat
+    ));
+    out.push_str(&format!(
+        "empty frames: {:.1}% -> {:.1}% of the images\n",
+        r.before.negative_share * 100.0,
+        r.after.negative_share * 100.0
+    ));
+    let get = |m: &BTreeMap<String, usize>, k: &str| m.get(k).copied().unwrap_or(0);
+    let mut classes = String::new();
+    for c in r.before.boxes_per_class.keys() {
+        classes.push_str(&format!(
+            "  {c}: boxes {} -> {}, frames {} -> {}\n",
+            get(&r.before.boxes_per_class, c),
+            get(&r.after.boxes_per_class, c),
+            get(&r.before.frames_per_class, c),
+            get(&r.after.frames_per_class, c)
+        ));
+    }
+    if !classes.is_empty() {
+        out.push_str("per class:\n");
+        out.push_str(&classes);
+    }
+    before_after(
+        &mut out,
+        "frames per scene",
+        "images",
+        r.before
+            .frames_per_scene
+            .iter()
+            .map(|(k, b)| (k.as_str(), *b, get(&r.after.frames_per_scene, k))),
+    );
+    let mut cams: Vec<(&str, usize, usize)> = r
+        .before
+        .frames_per_camera
+        .iter()
+        .map(|(k, b)| (k.as_str(), *b, get(&r.after.frames_per_camera, k)))
+        .collect();
+    cams.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let more = cams.len().saturating_sub(DRY_RUN_TOP);
+    cams.truncate(DRY_RUN_TOP);
+    before_after(&mut out, "top cameras", "images", cams);
+    if more > 0 {
+        out.push_str(&format!("  ... and {more} more camera(s)\n"));
+    }
+    if balance.axes.contains(&dataset::BalanceAxis::CameraDay) {
+        let after: BTreeMap<&str, usize> = r
+            .after
+            .camera_days
+            .iter()
+            .map(|(k, n)| (k.as_str(), *n))
+            .collect();
+        before_after(
+            &mut out,
+            "top camera-days",
+            "images",
+            r.before
+                .camera_days
+                .iter()
+                .take(DRY_RUN_TOP)
+                .map(|(k, b)| (k.as_str(), *b, after.get(k.as_str()).copied().unwrap_or(0))),
+        );
+    }
+    for w in &plan.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
+}
+
 fn read_sources(
     config: &Config,
     data: &DataArgs,
@@ -1316,6 +1517,7 @@ fn read_sources(
         negative_share: t.negative_share,
         heldout_share: t.heldout_share,
         oversample: t.oversample,
+        balance: data.balance(config)?,
         ..dataset::Options::default()
     };
     Ok((sources, opts))
@@ -1853,5 +2055,182 @@ mod tests {
         assert_eq!(j[0]["name"], "person");
         assert_eq!(j[0]["in_scope"], 1);
         assert_eq!(j[0]["by_scene"]["ir"], 2);
+    }
+
+    fn prepare_data(args: &[&str]) -> DataArgs {
+        let mut v = vec!["prepare", "--out", "o"];
+        v.extend_from_slice(args);
+        let TrainCommand::Prepare { data, .. } = parse(&v).unwrap() else {
+            panic!("not prepare")
+        };
+        data
+    }
+
+    #[test]
+    fn balance_flags_parse() {
+        use dataset::BalanceAxis::*;
+        let cfg = Config::default();
+        let d = prepare_data(&["--balance", "class,scene", "--balance", "camera-day"]);
+        let b = d.balance(&cfg).unwrap();
+        assert_eq!(
+            b.axes.iter().copied().collect::<Vec<_>>(),
+            [Class, Scene, CameraDay]
+        );
+        assert_eq!((b.strength, b.max_repeat, b.cap_dominant), (0.5, 4, None));
+        let d = prepare_data(&[
+            "--balance",
+            "camera",
+            "--balance-strength",
+            "1",
+            "--balance-max-repeat",
+            "8",
+            "--balance-cap",
+            "2.5",
+        ]);
+        let b = d.balance(&cfg).unwrap();
+        assert_eq!(
+            (b.strength, b.max_repeat, b.cap_dominant),
+            (1.0, 8, Some(2.5))
+        );
+        assert!(
+            prepare_data(&["--balance", "off"])
+                .balance(&cfg)
+                .unwrap()
+                .is_off()
+        );
+        assert!(prepare_data(&[]).balance(&cfg).unwrap().is_off());
+    }
+
+    #[test]
+    fn balance_flags_reject_bad_values() {
+        let cfg = Config::default();
+        let e = prepare_data(&["--balance", "class,weather"])
+            .balance(&cfg)
+            .unwrap_err();
+        assert!(e.to_string().contains("'weather'"), "{e}");
+        assert!(
+            prepare_data(&["--balance", "class", "--balance-strength", "1.5"])
+                .balance(&cfg)
+                .is_err()
+        );
+        assert!(
+            prepare_data(&["--balance", "class", "--balance-max-repeat", "11"])
+                .balance(&cfg)
+                .is_err()
+        );
+        assert!(
+            prepare_data(&["--balance", "class", "--balance-cap", "0.5"])
+                .balance(&cfg)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn balance_defaults_to_the_config() {
+        let mut cfg = Config::default();
+        cfg.training.balance = Some(dataset::Balance {
+            axes: [dataset::BalanceAxis::Scene].into(),
+            max_repeat: 6,
+            ..Default::default()
+        });
+        let b = prepare_data(&[]).balance(&cfg).unwrap();
+        assert_eq!(b.axes.len(), 1);
+        assert_eq!(b.max_repeat, 6);
+        // A flag wins; `off` switches the config default off.
+        let b = prepare_data(&["--balance", "class", "--balance-strength", "1"])
+            .balance(&cfg)
+            .unwrap();
+        assert!(b.axes.contains(&dataset::BalanceAxis::Class) && b.axes.len() == 1);
+        assert_eq!((b.strength, b.max_repeat), (1.0, 6));
+        assert!(
+            prepare_data(&["--balance", "off"])
+                .balance(&cfg)
+                .unwrap()
+                .is_off()
+        );
+    }
+
+    #[test]
+    fn prepare_dry_run_needs_no_out() {
+        assert!(parse(&["prepare", "--dry-run"]).is_ok());
+        assert!(parse(&["prepare"]).is_err());
+    }
+
+    fn map(v: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        v.iter().map(|(k, n)| (k.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn dry_run_text_shows_before_and_after() {
+        let balance = dataset::Balance {
+            axes: [dataset::BalanceAxis::Class, dataset::BalanceAxis::CameraDay].into(),
+            cap_dominant: Some(3.0),
+            ..Default::default()
+        };
+        let report = dataset::BalanceReport {
+            balance: balance.clone(),
+            before: dataset::BalanceCounts {
+                images: 209,
+                boxes_per_class: map(&[("person", 443), ("raccoon", 32)]),
+                frames_per_class: map(&[("person", 150), ("raccoon", 20)]),
+                frames_per_scene: map(&[("day", 180), ("ir", 29)]),
+                frames_per_camera: map(&[("front", 150), ("yard", 59)]),
+                camera_days: vec![("front/2026-01-02".into(), 100)],
+                negative_share: 0.15,
+            },
+            after: dataset::BalanceCounts {
+                images: 412,
+                boxes_per_class: map(&[("person", 443), ("raccoon", 118)]),
+                frames_per_class: map(&[("person", 150), ("raccoon", 70)]),
+                frames_per_scene: map(&[("day", 250), ("ir", 162)]),
+                frames_per_camera: map(&[("front", 250), ("yard", 162)]),
+                camera_days: vec![("front/2026-01-02".into(), 130)],
+                negative_share: 0.14,
+            },
+            frames_before: 209,
+            frames_after: 200,
+            dropped: 9,
+            max_repeat: 4,
+        };
+        let plan = dataset::Plan {
+            classes: vec!["person".into(), "raccoon".into()],
+            train: vec![((0, 0), 1); 200],
+            valid: vec![(0, 1); 20],
+            heldout: vec![(0, 2); 40],
+            warnings: vec!["few unique frames".into()],
+            balance: Some(report),
+            ..Default::default()
+        };
+        let t = dry_run_text(&plan, &balance);
+        assert!(
+            t.contains("200 training frames, 20 validation, 40 held-out"),
+            "{t}"
+        );
+        assert!(t.contains("images per epoch: 209 -> 412"), "{t}");
+        assert!(t.contains("9 capped"), "{t}");
+        assert!(
+            t.contains("raccoon: boxes 32 -> 118, frames 20 -> 70"),
+            "{t}"
+        );
+        assert!(t.contains("person: boxes 443 -> 443"), "{t}");
+        assert!(t.contains("frames per scene"), "{t}");
+        assert!(t.contains("ir") && t.contains("29 -> 162"), "{t}");
+        assert!(t.contains("top cameras") && t.contains("front"), "{t}");
+        assert!(
+            t.contains("top camera-days") && t.contains("front/2026-01-02"),
+            "{t}"
+        );
+        assert!(t.contains("warning: few unique frames"), "{t}");
+        assert!(t.contains("15.0% -> 14.0%"), "{t}");
+        // Without balancing: the split and the boxes per class.
+        let mut plain = plan.clone();
+        plain.balance = None;
+        plain.stats.train_boxes = map(&[("person", 443)]);
+        let t = dry_run_text(&plain, &dataset::Balance::default());
+        assert!(
+            t.contains("person: 443") && t.contains("balance: off"),
+            "{t}"
+        );
+        assert!(!t.contains("images per epoch"), "{t}");
     }
 }

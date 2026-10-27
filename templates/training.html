@@ -367,6 +367,34 @@
     </fieldset>
     <label class="check"><input type="checkbox" name="public"{% if !public_available %} disabled{% endif %}> Mix in the public night subset (LILA camera traps, CDLA)</label>
     {% if !public_available %}<p class="muted small">Not pinned in this build.</p>{% else if !public_installed %}<p class="muted small">A {{ public_size }} download on the first run.</p>{% endif %}
+    <details class="tr-more tr-balance" id="train-balance"{% if balance.on %} open{% endif %}>
+      <summary>Balance <span class="muted small" id="train-balance-state">{% if balance.on %}on{% else %}off{% endif %}</span></summary>
+      <fieldset class="tr-bal">
+        <legend>Balance the training frames</legend>
+        <p class="muted small">Repeats the training frames of rare groups (and, with the cap, leaves out some frames of dominant ones) so each epoch sees them more evenly. Repeats add no new information: collect more frames of a rare group when you can. Validation and held-out frames are never balanced, so benchmarks stay comparable.</p>
+        <div class="tr-bal-axes">
+        {% for a in balance.axes %}<label class="check"><input type="checkbox" name="balance" value="{{ a.value }}"{% if a.checked %} checked{% endif %}> <span>{{ a.title }}<span class="muted small tr-hint">{{ a.hint }}</span></span></label>{% endfor %}
+        </div>
+        <div class="tr-grid">
+          <div class="tr-field">
+            <span class="tr-bal-k">Strength</span>
+            <div class="tr-radios" role="radiogroup" aria-label="Strength">
+              <label class="check" title="Weights are the square root of the size ratio (LVIS repeat-factor sampling): rare groups move closer without being repeated as often as the large ones."><input type="radio" name="balance_strength" value="0.5"{% if balance.gentle %} checked{% endif %}> Gentle (0.5)</label>
+              <label class="check" title="Weights are the full size ratio: every group as large as the largest (up to the max repeat)."><input type="radio" name="balance_strength" value="1"{% if balance.full %} checked{% endif %}> Full (1.0)</label>
+              {% if let Some(c) = balance.custom %}<label class="check"><input type="radio" name="balance_strength" value="{{ c }}" checked> Configured ({{ c }})</label>{% endif %}
+            </div>
+          </div>
+          <div class="tr-field">
+            <label for="train-bal-max">Max repeat</label>
+            <input type="number" id="train-bal-max" name="balance_max_repeat" min="1" max="{{ balance.most }}" step="1" value="{{ balance.max_repeat }}">
+            <p class="muted small">Most balancing repeats of one frame (1&ndash;{{ balance.most }}).</p>
+          </div>
+        </div>
+        <label class="check"><input type="checkbox" name="balance_cap_on" id="train-bal-cap-on"{% if balance.cap_on %} checked{% endif %}> <span>Cap dominant groups at <span class="tr-keep"><input type="number" name="balance_cap" id="train-bal-cap" class="al-num" min="1" max="100" step="0.5" value="{{ balance.cap }}" aria-label="Cap at this many times the median">&times; the median</span></span></label>
+        <p class="muted small">A group above that size leaves out frames down to it. Hard negatives and the last frames of a class always stay.</p>
+        <div class="tr-bal-preview" id="train-balance-preview" aria-live="polite" hidden></div>
+      </fieldset>
+    </details>
   </fieldset>
 
   {% if available %}
