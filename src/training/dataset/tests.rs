@@ -1099,6 +1099,7 @@ fn review_export(
             split,
             benchmark_split: Default::default(),
             include_unreviewed: false,
+            hidden_classes: Vec::new(),
         },
     )
     .unwrap()

@@ -223,8 +223,10 @@ pub struct CollectConfig {
     pub dedup_hamming: u32,
     /// Classes of the Review page and the label exports (YOLO class ids follow this order).
     pub classes: Vec<String>,
-    /// Classes of `classes` the Review page's pickers leave out (rare ones); they stay in the
-    /// exports and keep their YOLO ids.
+    /// Classes of `classes` the reviewer does not want (the Review page's "don't want"): left out
+    /// of the Review page (pickers, shortcuts, their boxes), of the pre-fill and of auto-label
+    /// runs, and their pending boxes rejected when a class becomes hidden
+    /// ([`super::labels::bulk::Wanted`]); they stay in the list and keep their YOLO ids.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hidden_classes: Vec<String>,
 }

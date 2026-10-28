@@ -504,7 +504,10 @@ pub fn plan_autolabel(
     cap: &Capability,
 ) -> Result<AutolabelJob> {
     request.validate()?;
-    let classes = run_classes(&config.collect.classes, request.classes.as_deref())?;
+    let classes = without_hidden(
+        run_classes(&config.collect.classes, request.classes.as_deref())?,
+        &config.collect.hidden_classes,
+    )?;
     let paths = TrainPaths::for_config(config);
     let platform = Platform::current();
     let allow_large = request.allow_large || config.allow_large_downloads;
@@ -669,6 +672,29 @@ pub fn run_classes(review_classes: &[String], requested: Option<&[String]>) -> R
         .collect())
 }
 
+/// A run's `classes` ([`run_classes`]) without those of `hidden` (`collect.hidden_classes`: the
+/// reviewer does not want their boxes, so a run neither looks for them nor writes them). An
+/// error when nothing is left.
+pub fn without_hidden(classes: Vec<String>, hidden: &[String]) -> Result<Vec<String>> {
+    let (gone, kept): (Vec<String>, Vec<String>) = classes
+        .into_iter()
+        .partition(|c| crate::collect::labels::is_hidden(c, hidden));
+    if kept.is_empty() {
+        bail!(
+            "class(es) {} are marked \"don't want\" in Review (collect.hidden_classes); untick it \
+             for a class to label (Review page, Classes) or pick another class",
+            gone.join(", ")
+        );
+    }
+    if !gone.is_empty() {
+        tracing::info!(
+            classes = %gone.join(", "),
+            "auto-label: unwanted (hidden) classes left out of the run"
+        );
+    }
+    Ok(kept)
+}
+
 /// The status filter of a run that does not name one: `unreviewed` for the labelers and for a
 /// model (first-pass labelling); self-training over reviewed frames is an explicit `status=any`
 /// (the Training page's preset).
@@ -765,6 +791,21 @@ mod tests {
             .to_string();
         assert!(e.contains("dog") && e.contains("collect.classes"), "{e}");
         assert!(run_classes(&[], None).is_err());
+    }
+
+    #[test]
+    fn runs_leave_out_hidden_classes() {
+        let list: Vec<String> = ["person", "car", "Raccoon"].map(String::from).to_vec();
+        let hidden = vec!["raccoon".to_string()];
+        assert_eq!(
+            without_hidden(list.clone(), &hidden).unwrap(),
+            ["person", "car"]
+        );
+        assert_eq!(without_hidden(list.clone(), &[]).unwrap(), list);
+        let e = without_hidden(vec!["Raccoon".into()], &hidden)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Raccoon") && e.contains("hidden_classes"), "{e}");
     }
 
     #[test]

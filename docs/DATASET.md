@@ -316,13 +316,13 @@ folder; the collector and the Dataset page keep `collect.dir`.
   - `accepted`: a model or auto box that is a real object;
   - `added`: a box the reviewer drew (a miss);
   - `rejected`: a wrong box. It is kept as hard-negative evidence and never becomes a training label;
-    a pending auto box rejected in bulk for its score has `reason: "low_score"`, a pending model box
-    rejected in bulk for a class outside the list `reason: "other_class"`;
+    a pending auto box rejected in bulk for its score has `reason: "low_score"`, a box rejected for an
+    unwanted class (outside the list, or in `collect.hidden_classes`) `reason: "other_class"`;
   - `pending`: not decided yet. Only `unreviewed` and `skipped` files have pending boxes.
 - **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
   `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
 - **`model_label`:** the label the model gave, when the reviewer changed it or it was mapped onto the
-  class list's spelling (pre-fill, auto-label runs, *Reject model boxes of other classes*).
+  class list's spelling (pre-fill, auto-label runs, *Reject boxes of unwanted classes*).
 - **`orig_bbox`:** the proposed box before the reviewer moved or resized it (set by the page; checked
   and clamped like `bbox`, dropped when equal to it).
 - **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
@@ -361,13 +361,14 @@ folder; the collector and the Dataset page keep `collect.dir`.
 
 ### Pre-fill and the save rule
 
-A frame without a label file starts with every sidecar box of a class of `collect.classes` as
-`pending`, in this order: `predictions`, `suppressed`, `below_threshold`, `verify.found`. Labels are
-mapped onto the list's spelling (exact, ignoring case, then the COCO / VOC aliases: a VOC-spelled
-model's `pottedplant` is `potted plant` when that is listed, with `model_label: "pottedplant"`); a box of
-no listed class is left out (the sidecar keeps it). A box is left out if an earlier box has the same
-(mapped) label and IoU >= 0.95 (for `verify.found`, IoU >= 0.5). Label files written before this rule
-can still hold model boxes of other classes: *Reject model boxes of other classes* clears them (below).
+A frame without a label file starts with every sidecar box of a wanted class as `pending`, in this
+order: `predictions`, `suppressed`, `below_threshold`, `verify.found`. Labels are mapped onto the list's
+spelling (exact, ignoring case, then the COCO / VOC aliases: a VOC-spelled model's `pottedplant` is
+`potted plant` when that is listed, with `model_label: "pottedplant"`); a box of no listed class, or of a
+hidden class (see "Unwanted classes" below), is left out (the sidecar keeps it). A box is left out if an
+earlier box has the same (mapped) label and IoU >= 0.95 (for `verify.found`, IoU >= 0.5). Label files
+written before this rule can still hold model boxes of other classes: *Reject boxes of unwanted
+classes* clears them (below).
 
 When a frame is saved as `reviewed`, each `pending` box becomes:
 
@@ -472,18 +473,48 @@ or skipped frames are left alone. `dry_run` answers `{success, eligible, boxes, 
 changed). The auto-label chain's reject step (docs/TRAINING.md, "Auto-label after import") is the
 same code (`collect/labels/bulk.rs`), scoped to the import's frames.
 
+### Unwanted classes
+
+A label is **unwanted** when it maps to no class of `collect.classes` (never listed, or removed) or to a
+class of `collect.hidden_classes` (the Classes card's *don't want (hide + reject)*; each a listed class,
+case-insensitive). Hiding keeps the class in the list, so exports and YOLO class ids do not change; it
+means "I do not review this class": the Review page leaves it out of its pickers and shortcuts and does
+not draw or list its boxes (nor rejected boxes of unlisted classes; they stay in the file, and a save
+from the page rejects pending model / auto boxes of a hidden class instead of resolving them), the
+pre-fill leaves its boxes out, auto-label runs leave it out of their classes (a run of hidden classes
+only is refused) and reject pending boxes of unwanted classes in every frame they write.
+
+When `POST /v1/review/classes` makes classes newly unwanted (removed or newly hidden; the answer's
+`newly_unwanted`), the server right away rejects, on every unreviewed label file of the folder under
+review, the pending `model` and `auto` boxes of unwanted classes (`reason: "other_class"`; an alias of a
+wanted class is renamed instead) and answers `auto_rejected: {frames, boxes, relabelled, failed}` and
+`reviewed_with_unwanted: {frames, boxes, classes}`: the reviewed frames whose accepted or added boxes are
+of unwanted classes (both zero when nothing became unwanted). Human pending boxes are left to the
+reviewer. A frame whose only pending boxes were unwanted leaves `auto=review` (and becomes accept-ready
+when an `accept` box remains); it stays unreviewed. Reviewed frames are changed only on request: the page
+asks "N reviewed frames have M accepted boxes of X, Y. Reject those too?" after a class save, after the
+reject button below, and when the auto-label form leaves listed classes unticked (it first offers to hide
+them: *Hide and auto-reject X, Y in Review? (Cancel = only skip them in this run)*).
+
 `POST /v1/review/reject-other-class` (JSON `{bucket?, scene?, camera?, label?, source?, dry_run,
-limit?}`; the Review page's *Reject model boxes of other classes*) takes the unreviewed frames of those
-filters and, on each pending `source: model` box whose label is not in `collect.classes`: when the label
-is a listed class under another spelling (ignoring case, or a COCO / VOC alias such as `pottedplant` for
-`potted plant`), renames it to the list's spelling (still `pending`; the old label in `model_label`
-unless only the case differs); otherwise rejects it (`state: rejected`, `reason: "other_class"`). Auto
-and human boxes, decided boxes, the frame's status and reviewed or skipped frames are left alone. It
-clears the predictions of other classes a save would otherwise accept and refuse, which also makes a
+limit?}`; the Review page's *Reject boxes of unwanted classes*) takes the unreviewed frames of those
+filters and, on each pending `source: model` or `source: auto` box whose label is not a wanted class in
+the list's spelling: when the label is a wanted class under another spelling (ignoring case, or a COCO /
+VOC alias such as `pottedplant` for `potted plant`), renames it to the list's spelling (still `pending`;
+the old label in `model_label` unless only the case differs); otherwise rejects it (`state: rejected`,
+`reason: "other_class"`). Human boxes, decided boxes, the frame's status and reviewed or skipped frames
+are left alone. It clears the boxes of other classes a save would otherwise accept, which also makes a
 frame accept-ready when they were all that kept it out. `dry_run` answers `{success, eligible, boxes,
-relabelled, rejected: 0, frames}`; otherwise `{success, eligible, boxes, relabelled, rejected, failed,
-frames, message}` (`boxes` rejected or renamed, `relabelled` the renamed ones among them, `rejected`
-frames changed).
+relabelled, rejected: 0, frames, reviewed_with_unwanted}`; otherwise `{success, eligible, boxes,
+relabelled, rejected, failed, frames, message, reviewed_with_unwanted}` (`boxes` rejected or renamed,
+`relabelled` the renamed ones among them, `rejected` frames changed).
+
+`POST /v1/review/reject-unwanted-reviewed` (JSON `{dry_run, limit?}`, `limit` 1..20000, default 20000)
+rejects the accepted and added boxes of unwanted classes on every reviewed label file of the folder under
+review (`reason: "other_class"`; a rejected `human` box is dropped at the frame's next save). The frames
+stay `reviewed`, and their remaining training boxes are all of listed classes, so they still save and
+export. `dry_run` answers `{success, eligible, boxes, classes, rejected: 0}`; otherwise `{success,
+eligible, boxes, rejected, failed, frames, message}`. Both routes are admin routes like reject-low.
 
 ### Keyboard
 

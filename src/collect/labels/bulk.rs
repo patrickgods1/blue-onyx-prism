@@ -2,11 +2,15 @@
 //! auto-labelers' triage alone settles as reviewed (`POST /v1/review/accept-auto`, the
 //! auto-label chain's accept step), [`bulk_reject_below`] rejects the pending auto boxes scoring
 //! below a minimum on unreviewed frames (`reason: low_score`; the reject-low route and the
-//! chain's reject step), [`bulk_reject_other_class`] rejects the pending model boxes of classes
-//! not in the class list on unreviewed frames (`reason: other_class`; an alias such as
-//! `pottedplant` is renamed to the list's spelling instead; `POST
-//! /v1/review/reject-other-class`). Each frame is re-checked under the label write lock
-//! ([`super::update`]); counts are exact, frame lists capped at [`LISTED`].
+//! chain's reject step), [`bulk_reject_other_class`] rejects the pending model and auto boxes
+//! of unwanted classes ([`Wanted`]: not in the class list, or in `collect.hidden_classes`) on
+//! unreviewed frames (`reason: other_class`; an alias such as `pottedplant` is renamed to the
+//! list's spelling instead; `POST /v1/review/reject-other-class`), [`bulk_reject_unwanted`]
+//! does the same over every label file of the folder (after a class list change) or, with
+//! [`Scope::Reviewed`], rejects the training boxes of unwanted classes on reviewed frames
+//! (`POST /v1/review/reject-unwanted-reviewed`; [`reviewed_with_unwanted`] counts them). Each
+//! frame is re-checked under the label write lock ([`super::update`]); counts are exact, frame
+//! lists capped at [`LISTED`].
 
 use super::queue::{self, AutoFilter, Filters, StatusFilter};
 use super::{BoxState, Frame, LabelFile, Source, Status};
@@ -118,30 +122,58 @@ pub fn bulk_reject_below(
     )
 }
 
-/// What [`reject_other_class`] does to `b`: None = nothing (not a pending model box, or its
-/// label is a class of `classes`); `Some(Some(class))` = renamed to `class` (the list's spelling
-/// of an alias, [`super::map_class`]); `Some(None)` = rejected.
-fn other_class_action<'a>(b: &super::LabelBox, classes: &'a [String]) -> Option<Option<&'a str>> {
-    if b.source != Source::Model || b.state != BoxState::Pending || classes.contains(&b.label) {
-        return None;
-    }
-    Some(super::map_class(&b.label, classes))
+/// The classes the reviewer wants: `classes` (`collect.classes`) without `hidden`
+/// (`collect.hidden_classes`). A label of no wanted class ([`super::wanted_class`]) is unwanted.
+#[derive(Debug, Clone, Copy)]
+pub struct Wanted<'a> {
+    pub classes: &'a [String],
+    pub hidden: &'a [String],
 }
 
-/// On an unreviewed frame, the pending model boxes (the serving model's, from the sidecar) whose
-/// label is not a class of `classes`: renamed to the class when it is one under another
-/// spelling ([`super::map_class`]: `pottedplant` -> `potted plant`, the old label kept in
-/// `model_label` unless only the case differs), else rejected with `reason: other_class` (kept
-/// as evidence; a save would otherwise accept a prediction of a class outside the list and
-/// fail). Auto and human boxes, decided boxes and reviewed or skipped frames are untouched; the
-/// frame's status is unchanged. Returns (rejected, renamed).
-pub fn reject_other_class(f: &mut LabelFile, classes: &[String]) -> (usize, usize) {
-    if f.status != Status::Unreviewed {
-        return (0, 0);
+impl<'a> Wanted<'a> {
+    /// The wanted class `label` is (the list's spelling), None when it is unwanted.
+    pub fn class_of(&self, label: &str) -> Option<&'a str> {
+        super::wanted_class(label, self.classes, self.hidden)
     }
+}
+
+/// Which boxes an unwanted-class reject looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// Pending model and auto-labeler boxes (proposals nobody decided yet).
+    Proposals,
+    /// Training boxes (accepted or added, any source).
+    Training,
+}
+
+/// What an unwanted-class reject does to `b`: None = nothing (not a box of `pick`, or of a
+/// wanted class in the list's spelling); `Some(Some(class))` = renamed to `class` (proposals
+/// only: the list's spelling of an alias, [`super::map_class`]); `Some(None)` = rejected.
+fn unwanted_action<'a>(
+    b: &super::LabelBox,
+    wanted: &Wanted<'a>,
+    pick: Pick,
+) -> Option<Option<&'a str>> {
+    let picked = match pick {
+        Pick::Proposals => b.state == BoxState::Pending && b.source != Source::Human,
+        Pick::Training => b.is_training(),
+    };
+    if !picked {
+        return None;
+    }
+    match wanted.class_of(&b.label) {
+        Some(c) if c == b.label => None,
+        Some(c) if pick == Pick::Proposals => Some(Some(c)),
+        Some(_) => None,
+        None => Some(None),
+    }
+}
+
+/// Apply [`unwanted_action`] to the boxes of `f`: (rejected, renamed).
+fn apply_unwanted(f: &mut LabelFile, wanted: &Wanted<'_>, pick: Pick) -> (usize, usize) {
     let (mut rejected, mut renamed) = (0, 0);
     for b in &mut f.boxes {
-        match other_class_action(b, classes) {
+        match unwanted_action(b, wanted, pick) {
             None => {}
             Some(Some(class)) => {
                 super::rename_to_class(b, class);
@@ -157,18 +189,65 @@ pub fn reject_other_class(f: &mut LabelFile, classes: &[String]) -> (usize, usiz
     (rejected, renamed)
 }
 
-/// What [`reject_other_class`] would do: (rejected, renamed).
-fn count_other_class(f: &LabelFile, classes: &[String]) -> (usize, usize) {
-    if f.status != Status::Unreviewed {
-        return (0, 0);
-    }
+/// What [`apply_unwanted`] would do: (rejected, renamed).
+fn count_unwanted(f: &LabelFile, wanted: &Wanted<'_>, pick: Pick) -> (usize, usize) {
     f.boxes
         .iter()
-        .filter_map(|b| other_class_action(b, classes))
+        .filter_map(|b| unwanted_action(b, wanted, pick))
         .fold((0, 0), |(r, n), a| match a {
             Some(_) => (r, n + 1),
             None => (r + 1, n),
         })
+}
+
+/// The pending model and auto-labeler boxes of `f` of an unwanted class rejected (`reason:
+/// other_class`), those of a wanted class under another spelling renamed, whatever the frame's
+/// status (a save of the Review page, which does not show them, and the auto-label run's writes).
+/// Returns (rejected, renamed).
+pub fn reject_unwanted_proposals(f: &mut LabelFile, wanted: &Wanted<'_>) -> (usize, usize) {
+    apply_unwanted(f, wanted, Pick::Proposals)
+}
+
+/// On an unreviewed frame, the pending model boxes (the serving model's, from the sidecar) and
+/// auto-labeler boxes whose label is no wanted class ([`Wanted`]: not in the class list, or a
+/// hidden class) rejected with `reason: other_class` (kept as evidence; a save would otherwise
+/// accept a box the reviewer cannot see or does not want), those of a wanted class under another
+/// spelling ([`super::map_class`]: `pottedplant` -> `potted plant`, the old label kept in
+/// `model_label` unless only the case differs) renamed instead. Human boxes, decided boxes and
+/// reviewed or skipped frames are untouched; the frame's status is unchanged. Returns
+/// (rejected, renamed).
+pub fn reject_other_class(f: &mut LabelFile, wanted: &Wanted<'_>) -> (usize, usize) {
+    if f.status != Status::Unreviewed {
+        return (0, 0);
+    }
+    apply_unwanted(f, wanted, Pick::Proposals)
+}
+
+/// What [`reject_other_class`] would do: (rejected, renamed).
+fn count_other_class(f: &LabelFile, wanted: &Wanted<'_>) -> (usize, usize) {
+    if f.status != Status::Unreviewed {
+        return (0, 0);
+    }
+    count_unwanted(f, wanted, Pick::Proposals)
+}
+
+/// On a reviewed frame, the training boxes (accepted or added, any source) of an unwanted class
+/// rejected with `reason: other_class`; the frame stays reviewed and its remaining training
+/// boxes are all of wanted classes, so it still passes [`super::normalize`] (a rejected human
+/// box is dropped at the next save). Other frames are untouched. Returns the boxes rejected.
+pub fn reject_unwanted_reviewed(f: &mut LabelFile, wanted: &Wanted<'_>) -> usize {
+    if f.status != Status::Reviewed {
+        return 0;
+    }
+    apply_unwanted(f, wanted, Pick::Training).0
+}
+
+/// The training boxes [`reject_unwanted_reviewed`] would reject.
+fn count_unwanted_reviewed(f: &LabelFile, wanted: &Wanted<'_>) -> usize {
+    if f.status != Status::Reviewed {
+        return 0;
+    }
+    count_unwanted(f, wanted, Pick::Training).0
 }
 
 /// [`reject_other_class`] on the unreviewed frames of `dir` that `filters` (status forced to
@@ -178,7 +257,7 @@ fn count_other_class(f: &LabelFile, classes: &[String]) -> (usize, usize) {
 pub fn bulk_reject_other_class(
     dir: &Path,
     filters: &Filters,
-    classes: &[String],
+    wanted: &Wanted<'_>,
     limit: usize,
     dry_run: bool,
     keep: &dyn Fn(&str) -> bool,
@@ -189,9 +268,84 @@ pub fn bulk_reject_other_class(
         limit,
         dry_run,
         keep,
-        &|l| count_other_class(l, classes),
-        &|l| reject_other_class(l, classes),
+        &|l| count_other_class(l, wanted),
+        &|l| reject_other_class(l, wanted),
     )
+}
+
+/// Which label files [`bulk_reject_unwanted`] edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Unreviewed frames: their pending model and auto boxes ([`reject_other_class`]).
+    Unreviewed,
+    /// Reviewed frames: their training boxes ([`reject_unwanted_reviewed`]).
+    Reviewed,
+}
+
+/// The unwanted-class reject of `scope` over every label file of `dir` ([`super::label_files`],
+/// queued or not; a frame without a label file is pre-filled without unwanted boxes anyway), at
+/// most `limit` frames. `dry_run` only counts. Each frame is edited again under the write lock.
+pub fn bulk_reject_unwanted(
+    dir: &Path,
+    wanted: &Wanted<'_>,
+    scope: Scope,
+    limit: usize,
+    dry_run: bool,
+) -> BulkOutcome {
+    let count = |l: &LabelFile| match scope {
+        Scope::Unreviewed => count_other_class(l, wanted),
+        Scope::Reviewed => (count_unwanted_reviewed(l, wanted), 0),
+    };
+    let edit = |l: &mut LabelFile| match scope {
+        Scope::Unreviewed => reject_other_class(l, wanted),
+        Scope::Reviewed => (reject_unwanted_reviewed(l, wanted), 0),
+    };
+    let mut eligible = Vec::new();
+    for (rel, path) in super::label_files(dir) {
+        let (n, renamed) = super::read(&path)
+            .ok()
+            .flatten()
+            .map_or((0, 0), |l| count(&l));
+        if n + renamed > 0 {
+            eligible.push((rel, n, renamed));
+        }
+    }
+    edit_listed(dir, eligible, limit, dry_run, &edit)
+}
+
+/// Reviewed frames holding training boxes of unwanted classes ([`reviewed_with_unwanted`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct ReviewedUnwanted {
+    pub frames: usize,
+    pub boxes: usize,
+    /// Their labels, sorted.
+    pub classes: Vec<String>,
+}
+
+/// The reviewed frames of `dir` whose training boxes include some of an unwanted class (what
+/// [`bulk_reject_unwanted`] with [`Scope::Reviewed`] would reject), with the boxes and labels.
+pub fn reviewed_with_unwanted(dir: &Path, wanted: &Wanted<'_>) -> ReviewedUnwanted {
+    let mut out = ReviewedUnwanted::default();
+    let mut labels = std::collections::BTreeSet::new();
+    for (_, path) in super::label_files(dir) {
+        let Some(l) = super::read(&path).ok().flatten() else {
+            continue;
+        };
+        if l.status != Status::Reviewed {
+            continue;
+        }
+        let mut any = false;
+        for b in &l.boxes {
+            if unwanted_action(b, wanted, Pick::Training) == Some(None) {
+                any = true;
+                out.boxes += 1;
+                labels.insert(b.label.clone());
+            }
+        }
+        out.frames += usize::from(any);
+    }
+    out.classes = labels.into_iter().collect();
+    out
 }
 
 /// The shared run of the box edits of unreviewed frames: `count` and `edit` return (boxes
@@ -209,17 +363,32 @@ fn edit_unreviewed(
     let mut f = filters.clone();
     f.status = StatusFilter::Is(Status::Unreviewed);
     let built = queue::build(dir, &f);
-    let mut out = BulkOutcome::default();
     let mut eligible = Vec::new();
-    for item in built.items.iter().filter(|i| keep(&i.frame)) {
+    for item in built.items.into_iter().filter(|i| keep(&i.frame)) {
         let (n, renamed) = Frame::resolve(dir, &item.frame)
             .and_then(|fr| fr.labels().ok().flatten())
             .map_or((0, 0), |l| count(&l));
         if n + renamed > 0 {
-            eligible.push((item.frame.as_str(), n, renamed));
+            eligible.push((item.frame, n, renamed));
         }
     }
-    out.eligible = eligible.len();
+    edit_listed(dir, eligible, limit, dry_run, edit)
+}
+
+/// Edit the frames `eligible` lists (rel, boxes rejected, boxes renamed as counted), at most
+/// `limit`, each re-checked under the write lock ([`super::update`]); `dry_run` only sums the
+/// counts.
+fn edit_listed(
+    dir: &Path,
+    eligible: Vec<(String, usize, usize)>,
+    limit: usize,
+    dry_run: bool,
+    edit: &dyn Fn(&mut LabelFile) -> (usize, usize),
+) -> BulkOutcome {
+    let mut out = BulkOutcome {
+        eligible: eligible.len(),
+        ..BulkOutcome::default()
+    };
     if dry_run {
         out.boxes = eligible.iter().map(|(_, n, r)| n + r).sum();
         out.relabelled = eligible.iter().map(|(_, _, r)| r).sum();
@@ -231,6 +400,7 @@ fn edit_unreviewed(
         return out;
     }
     for (rel, _, _) in eligible.into_iter().take(limit) {
+        let rel = rel.as_str();
         let Some(frame) = Frame::resolve(dir, rel) else {
             out.failed(rel, "the frame is gone");
             continue;
@@ -503,8 +673,13 @@ mod tests {
         ["person", "car", "potted plant"].map(String::from).to_vec()
     }
 
+    /// The wanted classes of `classes` without `hidden`.
+    fn wanted<'a>(classes: &'a [String], hidden: &'a [String]) -> Wanted<'a> {
+        Wanted { classes, hidden }
+    }
+
     #[test]
-    fn reject_other_class_touches_only_pending_model_boxes_off_the_list() {
+    fn reject_other_class_touches_only_pending_proposals_off_the_list() {
         let mut decided = model_box("clock", Origin::Prediction);
         decided.state = BoxState::Accepted;
         let mut human = model_box("clock", Origin::Prediction);
@@ -522,11 +697,18 @@ mod tests {
             ..LabelFile::default()
         };
         let before = f.clone();
-        assert_eq!(count_other_class(&f, &classes()), (1, 2));
-        assert_eq!(reject_other_class(&mut f, &classes()), (1, 2));
+        let cl = classes();
+        let w = wanted(&cl, &[]);
+        assert_eq!(count_other_class(&f, &w), (2, 2));
+        assert_eq!(reject_other_class(&mut f, &w), (2, 2));
         assert_eq!(f.boxes[1].state, BoxState::Rejected);
         assert_eq!(f.boxes[1].reason.as_deref(), Some(OTHER_CLASS_REASON));
         assert_eq!(f.boxes[1].label, "parking meter");
+        // An auto box of another class too.
+        assert_eq!(
+            (f.boxes[4].state, f.boxes[4].reason.as_deref()),
+            (BoxState::Rejected, Some(OTHER_CLASS_REASON))
+        );
         // An alias: renamed, still pending, the model's spelling kept.
         assert_eq!(
             (
@@ -541,18 +723,131 @@ mod tests {
             (f.boxes[3].label.as_str(), f.boxes[3].model_label.as_deref()),
             ("car", None)
         );
-        for i in [0, 4, 5, 6] {
+        for i in [0, 5, 6] {
             assert_eq!(f.boxes[i], before.boxes[i], "box {i}");
         }
         assert_eq!(f.status, Status::Unreviewed);
-        assert_eq!(reject_other_class(&mut f, &classes()), (0, 0), "done");
+        assert_eq!(reject_other_class(&mut f, &w), (0, 0), "done");
         // Reviewed and skipped frames are untouched.
         for s in [Status::Reviewed, Status::Skipped] {
             let mut r = before.clone();
             r.status = s;
-            assert_eq!(count_other_class(&r, &classes()), (0, 0));
-            assert_eq!(reject_other_class(&mut r, &classes()), (0, 0));
+            assert_eq!(count_other_class(&r, &w), (0, 0));
+            assert_eq!(reject_other_class(&mut r, &w), (0, 0));
             assert_eq!(r.boxes, before.boxes);
+        }
+    }
+
+    #[test]
+    fn pending_proposals_of_a_hidden_class_are_rejected_human_boxes_kept() {
+        let mut human = auto_box("car", 0.9, Triage::Review);
+        human.source = Source::Human;
+        human.score = None;
+        let mut decided = auto_box("car", 0.9, Triage::Accept);
+        decided.state = BoxState::Accepted;
+        let mut f = LabelFile {
+            boxes: vec![
+                model_box("person", Origin::Prediction),
+                model_box("Car", Origin::Prediction),
+                auto_box("car", 0.9, Triage::Accept),
+                model_box("pottedplant", Origin::BelowThreshold),
+                human,
+                decided,
+            ],
+            ..LabelFile::default()
+        };
+        let before = f.clone();
+        let cl = classes();
+        let hidden = vec!["CAR".to_string()];
+        let w = wanted(&cl, &hidden);
+        assert_eq!(count_other_class(&f, &w), (2, 1));
+        assert_eq!(reject_other_class(&mut f, &w), (2, 1));
+        let got: Vec<(&str, BoxState)> = f
+            .boxes
+            .iter()
+            .map(|b| (b.label.as_str(), b.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("person", BoxState::Pending),
+                ("Car", BoxState::Rejected),
+                ("car", BoxState::Rejected),
+                ("potted plant", BoxState::Pending),
+                ("car", BoxState::Pending),
+                ("car", BoxState::Accepted),
+            ]
+        );
+        assert_eq!(f.boxes[4], before.boxes[4], "a human box is the reviewer's");
+        assert_eq!(f.boxes[5], before.boxes[5], "a decided box stays");
+        // Whatever the status: the save of the Review page.
+        let mut r = before.clone();
+        r.status = Status::Reviewed;
+        assert_eq!(reject_unwanted_proposals(&mut r, &w), (2, 1));
+    }
+
+    #[test]
+    fn reviewed_training_boxes_of_unwanted_classes_only_on_request() {
+        let mut accepted_model = model_box("car", Origin::Prediction);
+        accepted_model.state = BoxState::Accepted;
+        let mut added = auto_box("dog", 0.9, Triage::Review);
+        added.source = Source::Human;
+        added.state = BoxState::Added;
+        added.score = None;
+        let mut person = model_box("person", Origin::Prediction);
+        person.state = BoxState::Accepted;
+        let mut rejected = model_box("car", Origin::Suppressed);
+        rejected.state = BoxState::Rejected;
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![person, accepted_model, added, rejected],
+            ..LabelFile::default()
+        };
+        // `dog` was dropped from the list, `car` is hidden.
+        let cl = classes();
+        let hidden = vec!["car".to_string()];
+        let w = wanted(&cl, &hidden);
+        let mut untouched = reviewed.clone();
+        assert_eq!(reject_other_class(&mut untouched, &w), (0, 0));
+        assert_eq!(untouched, reviewed, "the unreviewed reject leaves it alone");
+        assert_eq!(count_unwanted_reviewed(&reviewed, &w), 2);
+        let mut f = reviewed.clone();
+        assert_eq!(reject_unwanted_reviewed(&mut f, &w), 2);
+        assert_eq!(f.status, Status::Reviewed);
+        let got: Vec<(&str, BoxState)> = f
+            .boxes
+            .iter()
+            .map(|b| (b.label.as_str(), b.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("person", BoxState::Accepted),
+                ("car", BoxState::Rejected),
+                ("dog", BoxState::Rejected),
+                ("car", BoxState::Rejected),
+            ]
+        );
+        assert_eq!(f.boxes[1].reason.as_deref(), Some(OTHER_CLASS_REASON));
+        assert_eq!(f.boxes[3].reason, None, "already rejected: unchanged");
+        assert_eq!(reject_unwanted_reviewed(&mut f, &w), 0, "done");
+        // Still a valid reviewed file for the new list (the dog was dropped from it).
+        let n = super::super::normalize(f, &cl, 64, 48, "t").unwrap();
+        assert_eq!(n.status, Status::Reviewed);
+        assert_eq!(
+            n.training().map(|b| b.label.as_str()).collect::<Vec<_>>(),
+            ["person"]
+        );
+        assert_eq!(
+            n.boxes.len(),
+            3,
+            "the rejected human box is dropped at save"
+        );
+        // Unreviewed and skipped frames are not touched by the reviewed reject.
+        for s in [Status::Unreviewed, Status::Skipped] {
+            let mut r = reviewed.clone();
+            r.status = s;
+            assert_eq!(reject_unwanted_reviewed(&mut r, &w), 0);
         }
     }
 
@@ -567,7 +862,8 @@ mod tests {
             ..LabelFile::default()
         };
         assert!(!auto_accept_eligible(&f), "the clock would be accepted");
-        assert_eq!(reject_other_class(&mut f, &classes()), (2, 0));
+        let cl = classes();
+        assert_eq!(reject_other_class(&mut f, &wanted(&cl, &[])), (2, 0));
         assert!(auto_accept_eligible(&f));
         let n = super::super::normalize(
             LabelFile {
@@ -668,6 +964,80 @@ mod tests {
             (o.eligible, o.done_count),
             (1, 1),
             "a is reviewed: left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bulk_unwanted_rejects_on_disk_and_counts_reviewed_frames() {
+        let dir = std::env::temp_dir().join(format!("bop-bulk-{}", uuid::Uuid::new_v4()));
+        let u = put_frame(
+            &dir,
+            "u",
+            None,
+            vec![
+                auto_box("person", 0.9, Triage::Accept),
+                auto_box("car", 0.9, Triage::Review),
+                model_box("clock", Origin::Prediction),
+            ],
+        );
+        let keep = put_frame(
+            &dir,
+            "k",
+            None,
+            vec![auto_box("person", 0.9, Triage::Review)],
+        );
+        let r = put_frame(&dir, "r", None, vec![]);
+        let frame = Frame::resolve(&dir, &r).unwrap();
+        let mut accepted = auto_box("car", 0.9, Triage::Accept);
+        accepted.state = BoxState::Accepted;
+        let mut person = auto_box("person", 0.9, Triage::Accept);
+        person.state = BoxState::Accepted;
+        super::super::write(
+            &frame.labels,
+            &LabelFile {
+                status: Status::Reviewed,
+                boxes: vec![person, accepted.clone(), accepted],
+                ..LabelFile::default()
+            },
+        )
+        .unwrap();
+        let cl = vec!["person".to_string(), "car".into()];
+        let hidden = vec!["car".to_string()];
+        let w = wanted(&cl, &hidden);
+        let dry = bulk_reject_unwanted(&dir, &w, Scope::Unreviewed, usize::MAX, true);
+        assert_eq!((dry.eligible, dry.boxes, dry.done_count), (1, 2, 0));
+        assert_eq!(
+            reviewed_with_unwanted(&dir, &w),
+            ReviewedUnwanted {
+                frames: 1,
+                boxes: 2,
+                classes: vec!["car".into()],
+            }
+        );
+        let o = bulk_reject_unwanted(&dir, &w, Scope::Unreviewed, usize::MAX, false);
+        assert_eq!((o.eligible, o.boxes, o.done_count), (1, 2, 1));
+        assert_eq!(o.done, [u.as_str()]);
+        let lu = labels_of(&dir, &u);
+        assert_eq!(
+            lu.boxes.iter().map(|b| b.state).collect::<Vec<_>>(),
+            [BoxState::Pending, BoxState::Rejected, BoxState::Rejected]
+        );
+        assert!(
+            auto_accept_eligible(&lu),
+            "only the accept box is left pending"
+        );
+        assert_eq!(labels_of(&dir, &keep).boxes[0].state, BoxState::Pending);
+        assert_eq!(labels_of(&dir, &r).boxes[1].state, BoxState::Accepted);
+        // The reviewed frame, on request.
+        let o = bulk_reject_unwanted(&dir, &w, Scope::Reviewed, usize::MAX, false);
+        assert_eq!((o.eligible, o.boxes, o.done_count), (1, 2, 1));
+        let lr = labels_of(&dir, &r);
+        assert_eq!(lr.status, Status::Reviewed);
+        assert_eq!(lr.training().count(), 1);
+        assert_eq!(
+            reviewed_with_unwanted(&dir, &w),
+            ReviewedUnwanted::default()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

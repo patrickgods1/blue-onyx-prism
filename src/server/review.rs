@@ -5,10 +5,13 @@
 //! with 409), `POST /v1/review/accept-auto` (bulk accept of frames the auto-labeler's triage
 //! settles), `POST /v1/review/reject-low` (bulk reject of the pending auto boxes scoring
 //! below a minimum, `reason: low_score`), `POST /v1/review/reject-other-class` (bulk reject of
-//! the pending model boxes of classes outside `collect.classes`, `reason: other_class`; aliases
-//! renamed to the list's spelling), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling / benchmark set), `POST
-//! /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes` (`collect.classes`
-//! and `collect.hidden_classes`) and `GET /v1/review/class-catalog` (the class picker's
+//! the pending model and auto boxes of unwanted classes, outside `collect.classes` or in
+//! `collect.hidden_classes`, `reason: other_class`; aliases renamed to the list's spelling),
+//! `POST /v1/review/reject-unwanted-reviewed` (the accepted boxes of unwanted classes on
+//! reviewed frames, on request), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
+//! benchmark set), `POST /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes`
+//! (`collect.classes` and `collect.hidden_classes`; classes that become unwanted have their
+//! pending boxes rejected right away) and `GET /v1/review/class-catalog` (the class picker's
 //! catalog, [`crate::training::autolabel::catalog`]).
 //! Every frame reference goes through
 //! [`Frame::resolve`] (404 otherwise); POST bodies are JSON (415 otherwise) with per-route size
@@ -102,6 +105,12 @@ fn context(state: &AppState) -> (PathBuf, Vec<String>, PathBuf) {
         cfg.collect.classes.clone(),
         cfg.data_root(),
     )
+}
+
+/// `collect.hidden_classes` of the current config: with `collect.classes`, what the reviewer
+/// wants ([`bulk::Wanted`]).
+fn hidden(state: &AppState) -> Vec<String> {
+    state.config_read().collect.hidden_classes.clone()
 }
 
 fn now() -> String {
@@ -258,7 +267,12 @@ fn frame_param(q: &BTreeMap<String, String>) -> Result<String, Problem> {
 
 /// The labels answer for `frame` (saved, else pre-filled), with the label file's revision
 /// (`""` = not saved yet) to send back with a save.
-fn labels_answer(frame: &Frame, classes: &[String], message: Option<String>) -> Response {
+fn labels_answer(
+    frame: &Frame,
+    classes: &[String],
+    hidden: &[String],
+    message: Option<String>,
+) -> Response {
     let rec = match frame.record() {
         Ok(r) => r,
         Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
@@ -268,7 +282,7 @@ fn labels_answer(frame: &Frame, classes: &[String], message: Option<String>) -> 
         Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
     let is_saved = saved.is_some();
-    let file = saved.unwrap_or_else(|| labels::prefill(&rec, classes));
+    let file = saved.unwrap_or_else(|| labels::prefill(&rec, classes, hidden));
     let version = labels::classes_version(classes);
     let q = encode_uri_component(&frame.rel.jpg());
     Json(serde_json::json!({
@@ -284,6 +298,7 @@ fn labels_answer(frame: &Frame, classes: &[String], message: Option<String>) -> 
         "stale_classes": is_saved && !file.classes_version.is_empty() && file.classes_version != version,
         "labels": file,
         "classes": classes,
+        "hidden": hidden,
         "classes_version": version,
         "record": {
             "id": rec.id,
@@ -314,8 +329,9 @@ pub(super) async fn labels_get(
     };
     blocking(move || {
         let (dir, classes, _) = context(&state);
+        let hidden = hidden(&state);
         match Frame::resolve(&dir, &rel) {
-            Some(f) => labels_answer(&f, &classes, None),
+            Some(f) => labels_answer(&f, &classes, &hidden, None),
             None => not_found(),
         }
     })
@@ -350,6 +366,7 @@ pub(super) async fn labels_post(
     };
     blocking(move || {
         let (dir, classes, _) = context(&state);
+        let hidden = hidden(&state);
         let Some(frame) = Frame::resolve(&dir, &rel) else {
             return not_found();
         };
@@ -383,7 +400,12 @@ pub(super) async fn labels_post(
             Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}")),
         }
         tracing::debug!(frame = %rel, status = status.as_str(), boxes = f.boxes.len(), "review labels saved");
-        labels_answer(&frame, &classes, Some(format!("Saved as {}.", status.as_str())))
+        labels_answer(
+            &frame,
+            &classes,
+            &hidden,
+            Some(format!("Saved as {}.", status.as_str())),
+        )
     })
     .await
 }
@@ -632,12 +654,15 @@ struct RejectOtherClassBody {
 }
 
 /// `POST /v1/review/reject-other-class` with `{bucket?, scene?, camera?, label?, source?,
-/// dry_run, limit?}`: on the unreviewed frames of those filters, the pending model boxes whose
-/// label is not in `collect.classes` rejected with `reason: other_class` (kept as evidence), or
-/// renamed to the list's spelling when the label is a class under another name
-/// (`pottedplant` -> `potted plant`; [`bulk::bulk_reject_other_class`]), at most `limit` frames
-/// (default 500). `dry_run` only counts. `boxes` counts the boxes changed, `relabelled` the
-/// renamed ones among them, `rejected` the frames changed (as reject-low).
+/// dry_run, limit?}`: on the unreviewed frames of those filters, the pending model and auto boxes
+/// of unwanted classes (not in `collect.classes`, or in `collect.hidden_classes`) rejected with
+/// `reason: other_class` (kept as evidence), or renamed to the list's spelling when the label is
+/// a wanted class under another name (`pottedplant` -> `potted plant`;
+/// [`bulk::bulk_reject_other_class`]), at most `limit` frames (default 500). `dry_run` only
+/// counts. `boxes` counts the boxes changed, `relabelled` the renamed ones among them,
+/// `rejected` the frames changed (as reject-low); `reviewed_with_unwanted` the reviewed frames
+/// that still hold training boxes of unwanted classes
+/// ([`bulk::reviewed_with_unwanted`]; `POST /v1/review/reject-unwanted-reviewed` rejects them).
 pub(super) async fn reject_other_class(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -672,8 +697,14 @@ pub(super) async fn reject_other_class(
     let dry_run = b.dry_run;
     blocking(move || {
         let (dir, classes, _) = context(&state);
-        let o = bulk::bulk_reject_other_class(&dir, &filters, &classes, limit, dry_run, &|_| true);
+        let hidden = hidden(&state);
+        let wanted = bulk::Wanted {
+            classes: &classes,
+            hidden: &hidden,
+        };
+        let o = bulk::bulk_reject_other_class(&dir, &filters, &wanted, limit, dry_run, &|_| true);
         let eligible = o.eligible;
+        let reviewed = bulk::reviewed_with_unwanted(&dir, &wanted);
         if dry_run {
             return Json(serde_json::json!({
                 "success": true,
@@ -682,12 +713,13 @@ pub(super) async fn reject_other_class(
                 "relabelled": o.relabelled,
                 "rejected": 0,
                 "frames": o.done,
+                "reviewed_with_unwanted": reviewed,
             }))
             .into_response();
         }
         let mut message = format!(
-            "Rejected {} model box(es) of classes outside the class list on {} frame(s) (kept \
-             as evidence, reason other_class; the frames stay unreviewed).",
+            "Rejected {} pending box(es) of unwanted classes on {} frame(s) (kept as evidence, \
+             reason other_class; the frames stay unreviewed).",
             o.boxes - o.relabelled,
             o.done_count
         );
@@ -715,13 +747,104 @@ pub(super) async fn reject_other_class(
             frames = o.done_count,
             failed = o.failed_count,
             eligible,
-            "review: model boxes of other classes rejected"
+            "review: pending boxes of unwanted classes rejected"
         );
         Json(serde_json::json!({
             "success": true,
             "eligible": eligible,
             "boxes": o.boxes,
             "relabelled": o.relabelled,
+            "rejected": o.done_count,
+            "failed": o.failed,
+            "frames": o.done,
+            "message": message,
+            "reviewed_with_unwanted": reviewed,
+        }))
+        .into_response()
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectUnwantedReviewedBody {
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `POST /v1/review/reject-unwanted-reviewed` with `{dry_run, limit?}`: on the reviewed frames
+/// of the folder under review, the training boxes (accepted or added) of unwanted classes (not in
+/// `collect.classes`, or in `collect.hidden_classes`) rejected with `reason: other_class`; the
+/// frames stay reviewed ([`bulk::bulk_reject_unwanted`] with [`bulk::Scope::Reviewed`]), at most
+/// `limit` frames (default and most [`ACCEPT_AUTO_MAX_LIMIT`]). `dry_run` only counts: `eligible`
+/// frames, `boxes`, `classes` (their labels). The Review page asks before it calls this.
+pub(super) async fn reject_unwanted_reviewed(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: RejectUnwantedReviewedBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let limit = b.limit.unwrap_or(ACCEPT_AUTO_MAX_LIMIT);
+    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        );
+    }
+    let dry_run = b.dry_run;
+    blocking(move || {
+        let (dir, classes, _) = context(&state);
+        let hidden = hidden(&state);
+        let wanted = bulk::Wanted {
+            classes: &classes,
+            hidden: &hidden,
+        };
+        if dry_run {
+            let r = bulk::reviewed_with_unwanted(&dir, &wanted);
+            return Json(serde_json::json!({
+                "success": true,
+                "eligible": r.frames,
+                "boxes": r.boxes,
+                "classes": r.classes,
+                "rejected": 0,
+            }))
+            .into_response();
+        }
+        let o = bulk::bulk_reject_unwanted(&dir, &wanted, bulk::Scope::Reviewed, limit, false);
+        let eligible = o.eligible;
+        let mut message = format!(
+            "Rejected {} accepted box(es) of unwanted classes on {} reviewed frame(s) (kept as \
+             evidence, reason other_class; the frames stay reviewed).",
+            o.boxes, o.done_count
+        );
+        if o.failed_count > 0 {
+            message.push_str(&format!(
+                " {} frame(s) not changed (listed); fix them by hand.",
+                o.failed_count
+            ));
+        }
+        if eligible > limit {
+            message.push_str(&format!(
+                " {} more frame(s) beyond the limit of {limit}; run it again.",
+                eligible - limit
+            ));
+        }
+        tracing::info!(
+            boxes = o.boxes,
+            frames = o.done_count,
+            failed = o.failed_count,
+            eligible,
+            "review: accepted boxes of unwanted classes rejected on reviewed frames"
+        );
+        Json(serde_json::json!({
+            "success": true,
+            "eligible": eligible,
+            "boxes": o.boxes,
             "rejected": o.done_count,
             "failed": o.failed,
             "frames": o.done,
@@ -864,6 +987,7 @@ pub(super) async fn export(
             },
             benchmark_split: b.benchmark_split,
             include_unreviewed: b.include_unreviewed,
+            hidden_classes: hidden(&state),
         };
         match export::run_filtered(&dir, &classes, &req, &filter) {
             Ok(r) => {
@@ -907,7 +1031,15 @@ pub(super) async fn import(
             }
             Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
         };
-        match xany::import_dir(&dir, &src, &classes, b.treat_unchecked_as_reviewed, &now()) {
+        let hidden = hidden(&state);
+        match xany::import_dir(
+            &dir,
+            &src,
+            &classes,
+            &hidden,
+            b.treat_unchecked_as_reviewed,
+            &now(),
+        ) {
             Ok(r) => Json(serde_json::json!({ "success": true, "report": r })).into_response(),
             Err(e) => fail(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -987,9 +1119,25 @@ struct ClassesBody {
     hidden: Option<Vec<String>>,
 }
 
+/// The classes `old` wanted (its list without its hidden ones) that `new` does not: removed
+/// from the list or newly hidden, in the old list's order.
+fn newly_unwanted(old: &bulk::Wanted<'_>, new: &bulk::Wanted<'_>) -> Vec<String> {
+    old.classes
+        .iter()
+        .filter(|c| old.class_of(c).is_some() && new.class_of(c).is_none())
+        .cloned()
+        .collect()
+}
+
 /// `POST /v1/review/classes` with `{classes: [...], hidden?: [...]}`: saves `collect.classes`
-/// and, when given, `collect.hidden_classes` (each must be listed); hidden names no longer
-/// listed are dropped. Answers both.
+/// and, when given, `collect.hidden_classes` (each must be listed; "don't want": hidden from
+/// Review and their pending boxes rejected); hidden names no longer listed are dropped. Answers
+/// both. When the save makes classes unwanted (removed or newly hidden: `newly_unwanted`), the
+/// pending model and auto boxes of unwanted classes on the unreviewed frames of the folder under
+/// review are rejected right away (`auto_rejected: {frames, boxes, relabelled, failed}`,
+/// [`bulk::bulk_reject_unwanted`]) and `reviewed_with_unwanted: {frames, boxes, classes}` counts
+/// the reviewed frames still holding accepted boxes of unwanted classes (the page asks before
+/// `POST /v1/review/reject-unwanted-reviewed`); both zero otherwise.
 pub(super) async fn classes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1009,7 +1157,11 @@ pub(super) async fn classes(
             .hidden
             .map(|h| h.into_iter().map(|c| c.trim().to_string()).collect());
         let mut hidden = Vec::new();
+        let (mut old_classes, mut old_hidden) = (Vec::new(), Vec::new());
+        let mut dir = PathBuf::new();
         let result = save_config(&state, "review page", |c| {
+            old_classes = c.collect.classes.clone();
+            old_hidden = c.collect.hidden_classes.clone();
             c.collect.classes = classes.clone();
             match &hidden_req {
                 Some(h) => c.collect.hidden_classes = h.clone(),
@@ -1017,19 +1169,60 @@ pub(super) async fn classes(
             }
             c.collect.validate(&c.data_root())?;
             hidden = c.collect.hidden_classes.clone();
+            dir = c.collect.resolved_review_dir(&c.data_root());
             Ok(())
         });
-        match result {
-            Ok(msg) => Json(serde_json::json!({
-                "success": true,
-                "message": msg,
-                "classes": classes,
-                "hidden": hidden,
-                "classes_version": labels::classes_version(&classes),
-            }))
-            .into_response(),
-            Err(e) => fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
-        }
+        let msg = match result {
+            Ok(msg) => msg,
+            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
+        };
+        let wanted = bulk::Wanted {
+            classes: &classes,
+            hidden: &hidden,
+        };
+        let old = bulk::Wanted {
+            classes: &old_classes,
+            hidden: &old_hidden,
+        };
+        let gone = newly_unwanted(&old, &wanted);
+        let (rejected, reviewed) = if gone.is_empty() {
+            (
+                bulk::BulkOutcome::default(),
+                bulk::ReviewedUnwanted::default(),
+            )
+        } else {
+            let o = bulk::bulk_reject_unwanted(
+                &dir,
+                &wanted,
+                bulk::Scope::Unreviewed,
+                usize::MAX,
+                false,
+            );
+            tracing::info!(
+                classes = %gone.join(", "),
+                boxes = o.boxes,
+                frames = o.done_count,
+                failed = o.failed_count,
+                "review: classes no longer wanted; their pending boxes rejected"
+            );
+            (o, bulk::reviewed_with_unwanted(&dir, &wanted))
+        };
+        Json(serde_json::json!({
+            "success": true,
+            "message": msg,
+            "classes": classes,
+            "hidden": hidden,
+            "classes_version": labels::classes_version(&classes),
+            "newly_unwanted": gone,
+            "auto_rejected": {
+                "frames": rejected.done_count,
+                "boxes": rejected.boxes,
+                "relabelled": rejected.relabelled,
+                "failed": rejected.failed,
+            },
+            "reviewed_with_unwanted": reviewed,
+        }))
+        .into_response()
     })
     .await
 }
@@ -1838,6 +2031,7 @@ mod tests {
         let mut f = labels::prefill(
             &frame.record().unwrap(),
             &crate::collect::config::default_classes(),
+            &[],
         );
         if accept {
             f.boxes[0].auto.triage = Some(labels::Triage::Accept);
@@ -2117,7 +2311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_other_class_rejects_only_pending_model_boxes_off_the_list() {
+    async fn reject_other_class_rejects_only_pending_proposals_off_the_list() {
         use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
         use labels::{BoxState, Origin, Source, Triage};
         let model = |label: &str| labels::LabelBox {
@@ -2146,6 +2340,7 @@ mod tests {
         let frame = Frame::resolve(&d.dir, &reviewed).unwrap();
         let mut f = labels_of(&d.dir, &reviewed);
         f.status = labels::Status::Reviewed;
+        f.boxes[0].state = BoxState::Accepted;
         labels::write(&frame.labels, &f).unwrap();
 
         let uri = "/v1/review/reject-other-class";
@@ -2158,8 +2353,12 @@ mod tests {
                 v["relabelled"].as_u64(),
                 v["rejected"].as_u64()
             ),
-            (Some(2), Some(3), Some(1), Some(0)),
+            (Some(2), Some(4), Some(1), Some(0)),
             "{v}"
+        );
+        assert_eq!(
+            v["reviewed_with_unwanted"],
+            serde_json::json!({"frames": 1, "boxes": 1, "classes": ["clock"]})
         );
         assert_eq!(
             labels_of(&d.dir, &a).boxes[1].state,
@@ -2176,9 +2375,10 @@ mod tests {
                 v["relabelled"].as_u64(),
                 v["rejected"].as_u64()
             ),
-            (Some(2), Some(3), Some(1), Some(2)),
+            (Some(2), Some(4), Some(1), Some(2)),
             "{v}"
         );
+        assert_eq!(v["reviewed_with_unwanted"]["frames"], 1, "{v}");
         assert_eq!(v["failed"], serde_json::json!([]));
         assert!(
             v["message"].as_str().unwrap().contains("Renamed 1 box"),
@@ -2197,7 +2397,7 @@ mod tests {
                 ("person", BoxState::Pending),
                 ("clock", BoxState::Rejected),
                 ("potted plant", BoxState::Pending),
-                ("clock", BoxState::Pending),
+                ("clock", BoxState::Rejected),
             ]
         );
         assert_eq!(
@@ -2213,7 +2413,7 @@ mod tests {
         let fr = labels_of(&d.dir, &reviewed);
         assert_eq!(
             (fr.status, fr.boxes[0].state),
-            (labels::Status::Reviewed, BoxState::Pending),
+            (labels::Status::Reviewed, BoxState::Accepted),
             "a reviewed frame is left alone"
         );
         let (_, v) = json(&d.state, post_json(uri, "{}")).await;
@@ -2250,5 +2450,202 @@ mod tests {
         let big = format!(r#"{{"camera": "{}"}}"#, "x".repeat(SMALL_BODY_LIMIT));
         let (s, _) = json(&d.state, post_json(uri, &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn hiding_a_class_rejects_its_pending_boxes_and_asks_about_reviewed_ones() {
+        use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
+        use labels::{BoxState, Origin, Source, Status, Triage};
+        let model = |label: &str| labels::LabelBox {
+            source: Source::Model,
+            origin: Some(Origin::Prediction),
+            auto: Default::default(),
+            ..auto_box(label, 0.7, Triage::Review)
+        };
+        let d = ds_with(|c| {
+            c.collect.classes = ["person", "car", "dog"].map(String::from).to_vec();
+        });
+        let mut human = auto_box("car", 0.9, Triage::Review);
+        human.source = Source::Human;
+        human.score = None;
+        let u = put_frame(
+            &d.dir,
+            "u",
+            None,
+            vec![
+                model("person"),
+                model("car"),
+                auto_box("car", 0.9, Triage::Accept),
+                auto_box("dog", 0.8, Triage::Review),
+                human,
+            ],
+        );
+        let r = put_frame(&d.dir, "r", None, vec![model("person"), model("car")]);
+        let frame = Frame::resolve(&d.dir, &r).unwrap();
+        let mut f = labels_of(&d.dir, &r);
+        f.status = Status::Reviewed;
+        for b in &mut f.boxes {
+            b.state = BoxState::Accepted;
+        }
+        labels::write(&frame.labels, &f).unwrap();
+
+        // An unchanged save rejects nothing.
+        let uri = "/v1/review/classes";
+        let (s, v) = json(
+            &d.state,
+            post_json(uri, r#"{"classes": ["person", "car", "dog"]}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["auto_rejected"]["boxes"], 0, "{v}");
+        assert_eq!(v["reviewed_with_unwanted"]["frames"], 0, "{v}");
+        assert_eq!(labels_of(&d.dir, &u).boxes[1].state, BoxState::Pending);
+
+        // `car` hidden, `dog` dropped from the list.
+        let (s, v) = json(
+            &d.state,
+            post_json(uri, r#"{"classes": ["person", "car"], "hidden": ["car"]}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["hidden"], serde_json::json!(["car"]));
+        assert_eq!(v["newly_unwanted"], serde_json::json!(["car", "dog"]));
+        assert_eq!(
+            v["auto_rejected"],
+            serde_json::json!({"frames": 1, "boxes": 3, "relabelled": 0, "failed": []}),
+            "{v}"
+        );
+        assert_eq!(
+            v["reviewed_with_unwanted"],
+            serde_json::json!({"frames": 1, "boxes": 1, "classes": ["car"]})
+        );
+        let fu = labels_of(&d.dir, &u);
+        assert_eq!(fu.status, Status::Unreviewed);
+        let got: Vec<(&str, BoxState)> = fu
+            .boxes
+            .iter()
+            .map(|b| (b.label.as_str(), b.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("person", BoxState::Pending),
+                ("car", BoxState::Rejected),
+                ("car", BoxState::Rejected),
+                ("dog", BoxState::Rejected),
+                ("car", BoxState::Pending),
+            ],
+            "a human box is left to the reviewer"
+        );
+        assert!(
+            fu.boxes[1..4]
+                .iter()
+                .all(|b| b.reason.as_deref() == Some(bulk::OTHER_CLASS_REASON))
+        );
+        assert_eq!(
+            labels_of(&d.dir, &r).boxes[1].state,
+            BoxState::Accepted,
+            "reviewed frames wait for the question"
+        );
+        // A frame without a label file is pre-filled without the hidden class.
+        let fresh = put_frame_with_record(&d, "fresh", &["person", "car"]);
+        let q = encode_uri_component(&fresh);
+        let (_, v) = json(
+            &d.state,
+            Request::get(format!("/v1/review/labels?frame={q}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let labels: Vec<&str> = v["labels"]["boxes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, ["person"], "{v}");
+        assert_eq!(v["hidden"], serde_json::json!(["car"]));
+
+        // The reviewed frames, on request.
+        let uri = "/v1/review/reject-unwanted-reviewed";
+        let (s, v) = json(&d.state, post_json(uri, r#"{"dry_run": true}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (
+                v["eligible"].as_u64(),
+                v["boxes"].as_u64(),
+                v["rejected"].as_u64()
+            ),
+            (Some(1), Some(1), Some(0)),
+            "{v}"
+        );
+        assert_eq!(v["classes"], serde_json::json!(["car"]));
+        assert_eq!(labels_of(&d.dir, &r).boxes[1].state, BoxState::Accepted);
+        let (s, v) = json(&d.state, post_json(uri, "{}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (
+                v["eligible"].as_u64(),
+                v["boxes"].as_u64(),
+                v["rejected"].as_u64()
+            ),
+            (Some(1), Some(1), Some(1)),
+            "{v}"
+        );
+        assert_eq!(v["frames"], serde_json::json!([r.clone()]));
+        let fr = labels_of(&d.dir, &r);
+        assert_eq!(
+            (fr.status, fr.boxes[0].state, fr.boxes[1].state),
+            (Status::Reviewed, BoxState::Accepted, BoxState::Rejected)
+        );
+        let (_, v) = json(&d.state, post_json(uri, r#"{"dry_run": true}"#)).await;
+        assert_eq!(v["eligible"], 0, "{v}");
+
+        // Bad requests and the guards.
+        for (body, field) in [
+            (r#"{"scene": "day"}"#, "unknown field"),
+            (r#"{"limit": 0}"#, "limit"),
+            (r#"{"dry_run": "yes"}"#, "invalid JSON body"),
+        ] {
+            let (s, v) = json(&d.state, post_json(uri, body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert!(
+                v["message"].as_str().unwrap().contains(field),
+                "{body}: {v}"
+            );
+        }
+        let mut req = post_json(uri, "{}");
+        req.headers_mut()
+            .insert("origin", "http://evil.example".parse().unwrap());
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let req = super::super::test_util::from_peer(
+            post_json(uri, "{}"),
+            super::super::test_util::REMOTE,
+        );
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let big = format!(r#"{{"limit": 1{}}}"#, " ".repeat(SMALL_BODY_LIMIT));
+        let (s, _) = json(&d.state, post_json(uri, &big)).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A queued frame `<stem>` of `d` whose sidecar predicts `labels`, without a label file.
+    fn put_frame_with_record(d: &Ds, stem: &str, labels: &[&str]) -> String {
+        let rel = crate::collect::labels::bulk::test_support::put_frame(&d.dir, stem, None, vec![]);
+        let frame = Frame::resolve(&d.dir, &rel).unwrap();
+        std::fs::remove_file(&frame.labels).unwrap();
+        let mut rec = frame.record().unwrap();
+        rec.predictions = labels
+            .iter()
+            .zip([1.0_f32, 21.0, 41.0])
+            .map(|(l, x)| Det {
+                label: (*l).into(),
+                score: 0.9,
+                bbox: [x, 1.0, x + 14.0, 30.0],
+            })
+            .collect();
+        std::fs::write(&frame.sidecar, serde_json::to_vec(&rec).unwrap()).unwrap();
+        rel
     }
 }

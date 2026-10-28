@@ -271,12 +271,24 @@ impl AutolabelJob {
         let rec = frame.record()?;
         let mut outcome = FrameWrite::default();
         let mut reopened = false;
+        let collect = &self.config.collect;
+        let wanted = labels::bulk::Wanted {
+            classes: &collect.classes,
+            hidden: &collect.hidden_classes,
+        };
         let written = labels::update(&frame.labels, |cur| {
-            // The pre-fill keeps the whole collect class list, not only this run's classes.
-            let mut file =
-                cur.unwrap_or_else(|| labels::prefill(&rec, &self.config.collect.classes));
+            // The pre-fill keeps the whole collect class list (without the hidden classes), not
+            // only this run's classes.
+            let mut file = cur.unwrap_or_else(|| {
+                labels::prefill(&rec, &collect.classes, &collect.hidden_classes)
+            });
             let before = file.status;
             outcome = update(&mut file, rep);
+            if outcome.write {
+                // Pending boxes of unwanted classes (an older pre-fill, a class hidden since):
+                // rejected, as the Review page's class change does.
+                labels::bulk::reject_unwanted_proposals(&mut file, &wanted);
+            }
             reopened = before != file.status && file.status == labels::Status::Unreviewed;
             Ok(outcome.write.then_some(file))
         })?;

@@ -395,6 +395,9 @@ pub struct ExportRequest {
     pub benchmark_split: BenchSplit,
     /// X-AnyLabeling only: also the queue's unreviewed frames, pre-filled and unchecked.
     pub include_unreviewed: bool,
+    /// `collect.hidden_classes`: the pre-fill of those unreviewed frames leaves them out
+    /// ([`super::prefill`]).
+    pub hidden_classes: Vec<String>,
 }
 
 /// What [`run`] wrote.
@@ -618,7 +621,7 @@ pub fn run_filtered(
         reviewed_frames_filtered(dir, classes, &req.split, filter);
     let unreviewed: Vec<(Frame, LabelFile, u32, u32)> =
         if req.include_unreviewed && req.formats.contains(&Format::XAnyLabeling) {
-            unreviewed_queue_frames(dir, classes, &mut warnings)
+            unreviewed_queue_frames(dir, classes, &req.hidden_classes, &mut warnings)
                 .into_iter()
                 .filter(|(_, labels, _, _)| filter.keeps(&preview(labels)))
                 .collect()
@@ -833,10 +836,11 @@ fn preview(labels: &LabelFile) -> LabelFile {
 }
 
 /// The review queue's frames that are not reviewed or skipped, with their labels (saved or
-/// pre-filled with the boxes of `classes`) and size.
+/// pre-filled with the boxes of `classes` not in `hidden`) and size.
 fn unreviewed_queue_frames(
     dir: &Path,
     classes: &[String],
+    hidden: &[String],
     warnings: &mut Vec<String>,
 ) -> Vec<(Frame, LabelFile, u32, u32)> {
     let mut out = Vec::new();
@@ -854,7 +858,7 @@ fn unreviewed_queue_frames(
         let labels = match labels {
             Some(l) if l.status != Status::Unreviewed => continue,
             Some(l) => l,
-            None => super::prefill(&rec, classes),
+            None => super::prefill(&rec, classes, hidden),
         };
         out.push((frame, labels, rec.width, rec.height));
     }
@@ -1186,6 +1190,7 @@ mod tests {
             },
             benchmark_split: BenchSplit::All,
             include_unreviewed: false,
+            hidden_classes: Vec::new(),
         };
         let filter = ClassFilter {
             labels: vec!["raccoon".into()],

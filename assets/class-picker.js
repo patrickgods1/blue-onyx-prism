@@ -5,7 +5,7 @@
 // emit the class). `entries` come from GET /v1/review/class-catalog:
 //   {name, category: person|vehicle|animal|object, in_list, hidden, coco, models, phrases}.
 // mode 'compact' is a drop-down (<details>) with a summary line, for filters.
-// `extra(entry, chip)` may add controls to a chip (the Review Classes card's "hide in Review").
+// `extra(entry, chip)` may add controls to a chip (the Review Classes card's "don't want").
 // Pure helpers (validName, groupEntries, mergeEntries, defaultSelection, quickSetsFor,
 // classChange, visibleClasses, summaryText, ...) live in ClassPicker.util and are tested by
 // the page tests; no libraries, no inline handlers (CSP).

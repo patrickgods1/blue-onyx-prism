@@ -128,11 +128,18 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 - Review (`src/collect/labels/`, `/review`, `assets/review.js`): per-frame `<stem>.labels.json` (v1; states pending/
   accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
   `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk
-  accept of `auto=accept` frames `POST /v1/review/accept-auto`; bulk reject of pending auto boxes below a score `POST /v1/review/reject-low`, `reason: low_score`; both in `collect/labels/bulk.rs`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
+  accept of `auto=accept` frames `POST /v1/review/accept-auto`; bulk reject of pending auto boxes below a score `POST /v1/review/reject-low`, `reason: low_score`; all in `collect/labels/bulk.rs`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
   X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned. The page reviews `collect.review_dir`
   (default `collect.dir`; *Folder under review*, `POST /v1/review/folder`), e.g. an import saved with `train import --out-dir`;
-  auto-label runs follow it. Class selection: a run may pick a subset of `collect.classes` (`AutoRun.classes`; skipped only when the
-  same labelers already covered every picked class), `collect.hidden_classes` only hides Review pickers, `GET /v1/review/class-catalog`
+  auto-label runs follow it. Unwanted classes = labels mapping to no `collect.classes` entry (aliases such as `pottedplant` map) ∪
+  `collect.hidden_classes` (Review "don't want (hide + reject)"; class ids and exports unchanged): left out of `prefill` and of auto-label
+  runs (`autolabel::without_hidden`; the job also rejects pending unwanted boxes in files it writes), not drawn on the page (a page save
+  rejects their pending proposals). A `POST /v1/review/classes` that makes classes newly unwanted rejects their pending model/auto boxes
+  on every unreviewed label file of the review folder (`bulk::bulk_reject_unwanted`, `reason: other_class`) and answers `auto_rejected`
+  + `reviewed_with_unwanted`; reviewed frames change only when the user confirms (`POST /v1/review/reject-unwanted-reviewed`, frames
+  stay reviewed). *Reject boxes of unwanted classes* (`POST /v1/review/reject-other-class`, unreviewed, queue filters) does the same
+  by hand; the auto-label form asks to hide classes left unticked. Class selection: a run may pick a subset of the wanted classes
+  (`AutoRun.classes`; skipped only when the same labelers already covered every picked class), `GET /v1/review/class-catalog`
   (`training/autolabel/catalog.rs`, `coco_class` parity-tested against `scripts/autolabel.py`, default picks = classes the enabled models'
   `object_filter`s keep; `assets/class-picker.js`, also the Config page's per-model Classes column).
 - Training (`src/training/`, `/training`, `blue-onyx-prism train ...`, `scripts/train_model.py`): user-triggered only;

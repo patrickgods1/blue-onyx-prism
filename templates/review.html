@@ -118,8 +118,8 @@
   </div>
   <div id="rv-reject-low-msg" class="review-report" role="status"></div>
   <div class="inline-row">
-    <button type="button" id="rv-reject-other" class="small secondary">Reject model boxes of other classes&hellip;</button>
-    <span class="muted">Pending model boxes whose class is not in the class list, on the unreviewed frames the filters select, are rejected (reason <code>other_class</code>, kept as evidence); a class of the list under another spelling (<code>pottedplant</code>) is renamed instead. Asks first.</span>
+    <button type="button" id="rv-reject-other" class="small secondary">Reject boxes of unwanted classes&hellip;</button>
+    <span class="muted">Pending model and auto boxes of classes you do not want (not in the class list, or marked <em>don't want</em> under Classes), on the unreviewed frames the filters select, are rejected (reason <code>other_class</code>, kept as evidence); a class of the list under another spelling (<code>pottedplant</code>) is renamed instead. Asks first, then asks about reviewed frames that still hold accepted boxes of them.</span>
   </div>
   <div id="rv-reject-other-msg" class="review-report" role="status"></div>
 </div>
@@ -162,7 +162,7 @@
 
 <div class="card">
   <h2>Classes <span class="tag now">applies now</span></h2>
-  <p class="muted">The class list of this page and of the exports (<code>collect.classes</code>); YOLO class ids follow this order, so append rather than reorder once you exported. <em>Hide in Review</em> only removes a class from this page's pickers and shortcuts (labels and ids stay). The auto-label defaults follow the classes the enabled models detect (<a href="/config#at-models">Config page</a>).</p>
+  <p class="muted">The class list of this page and of the exports (<code>collect.classes</code>); YOLO class ids follow this order, so append rather than reorder once you exported. <em>Don't want</em> hides a class from this page (pickers, shortcuts and its boxes) and rejects its pending boxes on the unreviewed frames right away, as removing a class does; reviewed frames with accepted boxes of it change only if you say so when asked. The class keeps its place and YOLO id. The auto-label defaults follow the classes the enabled models detect (<a href="/config#at-models">Config page</a>).</p>
   <form id="rv-classes">
     <div id="rv-classes-picker"></div>
     <input type="text" name="classes" value="{{ classes_text }}" class="cp-fallback" aria-label="Classes (comma separated)">

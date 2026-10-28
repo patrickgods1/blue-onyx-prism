@@ -287,6 +287,68 @@ fn labelers_propose_triaged_pending_boxes_and_queue_the_frames() {
 }
 
 #[test]
+fn hidden_classes_are_neither_labelled_nor_left_pending() {
+    let t = tmp("hidden");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    // Frame 0 was pre-filled before `raccoon` was hidden: a pending model raccoon.
+    let fr = Frame::resolve(&dir, &rels[0]).unwrap();
+    let raccoon = labels::LabelBox {
+        label: "raccoon".into(),
+        bbox: [35.0, 20.0, 60.0, 46.0],
+        source: Source::Model,
+        score: Some(0.6),
+        state: BoxState::Pending,
+        origin: Some(labels::Origin::Prediction),
+        reason: None,
+        model_label: None,
+        orig_bbox: None,
+        auto: Default::default(),
+    };
+    let f = LabelFile {
+        boxes: vec![raccoon],
+        ..LabelFile::default()
+    };
+    labels::write(&fr.labels, &f).unwrap();
+    let mut cfg = config(&t.0);
+    cfg.collect.hidden_classes = vec!["raccoon".into()];
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    assert!(
+        !job.classes.iter().any(|c| c == "raccoon"),
+        "{:?}",
+        job.classes
+    );
+    let fake = LabelFake::default();
+    run_job(&job, &fake).unwrap();
+    let cmd = fake.cmds.lock().unwrap()[0].clone();
+    let classes = arg_after(&cmd, "--classes").unwrap();
+    assert!(
+        !classes.to_string_lossy().contains("raccoon"),
+        "{classes:?}"
+    );
+    for rel in &rels {
+        let l = Frame::resolve(&dir, rel)
+            .unwrap()
+            .labels()
+            .unwrap()
+            .unwrap();
+        assert_eq!(l.status, Status::Unreviewed);
+        let pending: Vec<&str> = l
+            .boxes
+            .iter()
+            .filter(|b| b.state == BoxState::Pending)
+            .map(|b| b.label.as_str())
+            .collect();
+        assert_eq!(pending, ["car"], "{rel}: {:?}", l.boxes);
+    }
+    let f0 = fr.labels().unwrap().unwrap();
+    assert_eq!(
+        (f0.boxes[0].state, f0.boxes[0].reason.as_deref()),
+        (BoxState::Rejected, Some(labels::bulk::OTHER_CLASS_REASON))
+    );
+}
+
+#[test]
 fn empty_frames_get_the_marker_and_other_class_boxes_a_suggestion() {
     let t = tmp("marker");
     let rels = frames(&t.0, 3, false);
@@ -296,6 +358,7 @@ fn empty_frames_get_the_marker_and_other_class_boxes_a_suggestion() {
     let mut f = labels::prefill(
         &fr.record().unwrap(),
         &crate::collect::config::default_classes(),
+        &[],
     );
     f.boxes.push(labels::LabelBox {
         label: "dog".into(),
