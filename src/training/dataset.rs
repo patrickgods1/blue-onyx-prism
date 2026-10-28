@@ -311,8 +311,12 @@ const SPLIT_DIRS: [(&str, SplitHint); 5] = [
 /// Most frames read from one source.
 pub const MAX_FRAMES: usize = 500_000;
 
+/// An image file by extension; hidden files (macOS AppleDouble `._x.jpg`) are not.
 fn is_image(p: &Path) -> bool {
     p.is_file()
+        && !p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'))
         && p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
             ["jpg", "jpeg", "png"]
                 .iter()

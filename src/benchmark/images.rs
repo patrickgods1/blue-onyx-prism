@@ -600,10 +600,14 @@ fn manifest_image(i: &ManifestImage, path: PathBuf) -> SetImage {
     }
 }
 
+/// An image by extension; hidden files (macOS AppleDouble `._x.jpg` beside every file copied
+/// to a non-APFS drive, `.DS_Store`) are not.
 fn is_image(p: &Path) -> bool {
-    p.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+    !p.file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        && p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
 /// Image files directly in `dir`, sorted by name.
@@ -1463,6 +1467,19 @@ mod tests {
         std::fs::write(&ann, coco(&["000000000139.jpg"])).unwrap();
         let e = format!("{:#}", load_dir(&dir, None, None).unwrap_err());
         assert!(e.contains("list none of the 2 images"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// macOS AppleDouble files (`._a.jpg`, not a JPEG) are not images of the set.
+    #[test]
+    fn hidden_files_are_not_images() {
+        let dir = temp_set(&[("a.jpg", None), ("._a.jpg", Some(b"\0\x05\x16\x07"))]);
+        let files: Vec<String> = list_images(&dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, ["a.jpg"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
