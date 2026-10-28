@@ -417,7 +417,7 @@ fn the_review_export_layout_keeps_its_val_split_as_heldout() {
     assert!(p.stats.heldout_groups.is_empty(), "the export chose");
     // Night + IR: the day frame is out.
     let night = Options {
-        scene: SceneFilter::NightIr,
+        scene: SceneFilter::NIGHT_IR,
         ..Options::default()
     };
     let p = plan(&s, &night).unwrap();
@@ -541,20 +541,456 @@ fn errors_say_what_is_missing() {
 
 #[test]
 fn scene_filters_parse() {
-    assert_eq!(SceneFilter::parse("night+ir"), Some(SceneFilter::NightIr));
-    assert_eq!(SceneFilter::parse("IR"), Some(SceneFilter::NightIr));
-    assert_eq!(SceneFilter::parse("day"), Some(SceneFilter::Day));
+    let nf = SceneFilter::new;
+    for (text, want) in [
+        ("all", SceneFilter::ALL_SCENES),
+        ("", SceneFilter::ALL_SCENES),
+        ("day", SceneFilter::DAY),
+        ("night+ir", SceneFilter::NIGHT_IR),
+        ("night-ir", SceneFilter::NIGHT_IR),
+        ("nightir", SceneFilter::NIGHT_IR),
+        ("night ir", SceneFilter::NIGHT_IR),
+        ("Night, IR", SceneFilter::NIGHT_IR),
+        // Behaviour change: one scene alone is that scene only.
+        ("night", nf(false, true, false)),
+        ("IR", nf(false, false, true)),
+        ("day+ir", nf(true, false, true)),
+        ("ir+day", nf(true, false, true)),
+        ("day night", nf(true, true, false)),
+        ("day+night+ir", SceneFilter::ALL_SCENES),
+    ] {
+        assert_eq!(SceneFilter::parse(text), Some(want), "{text}");
+        // Serde accepts every spelling.
+        let j = serde_json::to_string(text).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SceneFilter>(&j).unwrap(),
+            want,
+            "{text}"
+        );
+    }
     assert_eq!(SceneFilter::parse("dusk"), None);
-    assert!(SceneFilter::NightIr.keeps(Some("ir")));
-    assert!(!SceneFilter::NightIr.keeps(None));
-    assert!(SceneFilter::All.keeps(None));
-    assert_eq!(
-        serde_json::to_string(&SceneFilter::NightIr).unwrap(),
-        r#""night+ir""#
-    );
+    assert_eq!(SceneFilter::parse("day+dusk"), None);
+    assert!(serde_json::from_str::<SceneFilter>(r#""dusk""#).is_err());
+    // Canonical strings round-trip; none ticked equals all.
+    let canon = [
+        ("all", "custom"),
+        ("day", "day"),
+        ("night", "night-only"),
+        ("ir", "ir"),
+        ("day+night", "day-night"),
+        ("day+ir", "day-ir"),
+        ("night+ir", "night"),
+    ];
+    for (c, label) in canon {
+        let f = SceneFilter::parse(c).unwrap();
+        assert_eq!(f.as_str(), c);
+        assert_eq!(f.to_string(), c);
+        assert_eq!(f.label(), label);
+        let j = serde_json::to_string(&f).unwrap();
+        assert_eq!(j, format!("\"{c}\""));
+        assert_eq!(serde_json::from_str::<SceneFilter>(&j).unwrap(), f);
+    }
+    assert_eq!(nf(false, false, false), SceneFilter::ALL_SCENES);
+    assert_eq!(nf(false, false, false).as_str(), "all");
+    assert_eq!(SceneFilter::default(), SceneFilter::ALL_SCENES);
+    // keeps
+    assert!(SceneFilter::NIGHT_IR.keeps(Some("ir")));
+    assert!(SceneFilter::NIGHT_IR.keeps(Some("night")));
+    assert!(!SceneFilter::NIGHT_IR.keeps(Some("day")));
+    assert!(!SceneFilter::NIGHT_IR.keeps(None));
+    assert!(nf(false, true, false).keeps(Some("night")));
+    assert!(!nf(false, true, false).keeps(Some("ir")));
+    assert!(SceneFilter::ALL_SCENES.keeps(None));
+    assert!(nf(false, false, false).keeps(None));
+    assert!(!SceneFilter::DAY.keeps(None));
+    // is_night: night and / or IR without day.
+    assert!(SceneFilter::NIGHT_IR.is_night());
+    assert!(nf(false, true, false).is_night() && nf(false, false, true).is_night());
+    assert!(!SceneFilter::DAY.is_night() && !SceneFilter::ALL_SCENES.is_night());
+    assert!(!nf(true, true, false).is_night());
+    assert_eq!(SceneFilter::CHOICES, ["day", "night", "ir"]);
+    // Excluded
+    assert_eq!(Excluded::default(), Excluded::Background);
+    for e in [Excluded::Background, Excluded::DropFrame] {
+        assert_eq!(Excluded::parse(e.as_str()), Some(e));
+        let j = serde_json::to_string(&e).unwrap();
+        assert_eq!(j, format!("\"{}\"", e.as_str()));
+    }
+    assert_eq!(Excluded::parse("drop_frame"), Some(Excluded::DropFrame));
+    assert_eq!(Excluded::parse("x"), None);
+    // Options of older versions (no `excluded`) still read.
+    let o: Options = serde_json::from_str(
+        r#"{"classes": null, "scene": "nightir", "negative_share": 0.2, "heldout_share": 0.15,
+            "val_share": 0.1, "oversample": 3, "seed": 0}"#,
+    )
+    .unwrap();
+    assert_eq!(o.scene, SceneFilter::NIGHT_IR);
+    assert_eq!(o.excluded, Excluded::Background);
     let meta = meta_from_name("20261022T123456789Z_ab12");
     assert_eq!(meta.day.as_deref(), Some("2026-10-22"));
     assert_eq!(meta.camera, None);
+}
+
+/// 5 cameras x 3 days (day 1 day, day 2 night, day 3 IR), 4 frames each (cat, dog + cat, dog,
+/// empty).
+fn scene_export(dir: &Path) {
+    let mut frames: Vec<(String, String, Vec<String>)> = Vec::new();
+    for cam in ["a", "b", "c", "d", "e"] {
+        for (day, scene) in [
+            ("2026-10-01", "day"),
+            ("2026-10-02", "night"),
+            ("2026-10-03", "ir"),
+        ] {
+            for i in 0..4 {
+                let label = match i {
+                    0 => "0 0.5 0.5 0.2 0.4\n",
+                    1 => "1 0.25 0.25 0.1 0.1\n0 0.7 0.7 0.2 0.2\n",
+                    2 => "1 0.5 0.5 0.5 0.5\n",
+                    _ => "",
+                };
+                frames.push((
+                    format!("{cam}-{day}-{i}.jpg"),
+                    label.into(),
+                    vec![scene.into(), format!("camera:{cam}"), format!("date:{day}")],
+                ));
+            }
+        }
+    }
+    let tags: Vec<Vec<&str>> = frames
+        .iter()
+        .map(|(_, _, t)| t.iter().map(String::as_str).collect())
+        .collect();
+    let refs: Vec<(&str, &str, &[&str])> = frames
+        .iter()
+        .zip(&tags)
+        .map(|((n, l, _), t)| (n.as_str(), l.as_str(), t.as_slice()))
+        .collect();
+    flat_export(dir, &["cat", "dog"], &refs);
+}
+
+fn scenes_of(s: &[Source], refs: impl Iterator<Item = FrameRef>) -> BTreeSet<String> {
+    refs.map(|r| s[r.0].frames[r.1].scene.clone().unwrap_or_default())
+        .collect()
+}
+
+/// Runs with other scene filters hold out the same frames (every scene), so their benchmarks
+/// compare; only the train / valid pool follows the filter.
+#[test]
+fn the_heldout_set_is_the_same_for_every_scene_filter() {
+    let t = tmp("scene-held");
+    scene_export(&t.0);
+    let s = vec![read_export(&t.0).unwrap()];
+    let base = Options {
+        heldout_share: 0.2,
+        ..Options::default()
+    };
+    let plans: Vec<(SceneFilter, Plan)> = [
+        SceneFilter::ALL_SCENES,
+        SceneFilter::DAY,
+        SceneFilter::NIGHT_IR,
+        SceneFilter::new(false, true, false),
+    ]
+    .into_iter()
+    .map(|scene| {
+        let o = Options {
+            scene,
+            ..base.clone()
+        };
+        (scene, plan(&s, &o).unwrap())
+    })
+    .collect();
+    let (_, all) = &plans[0];
+    assert_eq!(all.heldout.len(), 12, "3 of 15 camera/day groups");
+    assert_eq!(all.heldout_fingerprint.len(), 64);
+    assert!(
+        all.heldout_fingerprint
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
+    for (scene, p) in &plans {
+        assert_eq!(p.heldout, all.heldout, "{scene}");
+        assert_eq!(p.heldout_fingerprint, all.heldout_fingerprint, "{scene}");
+        assert_eq!(p.stats.heldout_groups, all.stats.heldout_groups, "{scene}");
+        let trained = scenes_of(
+            &s,
+            p.train
+                .iter()
+                .map(|(r, _)| *r)
+                .chain(p.valid.iter().copied()),
+        );
+        let want: BTreeSet<String> = ["day", "night", "ir"]
+            .into_iter()
+            .filter(|x| scene.keeps(Some(x)))
+            .map(String::from)
+            .collect();
+        assert_eq!(trained, want, "{scene}");
+        // Scene-filtered = train / valid frames of the other scenes.
+        let pool = 60 - p.heldout.len();
+        let kept = (0..60)
+            .filter(|&i| !p.heldout.contains(&(0, i)))
+            .filter(|&i| scene.keeps(s[0].frames[i].scene.as_deref()))
+            .count();
+        assert_eq!(p.stats.scene_filtered, pool - kept, "{scene}");
+    }
+    // Day and night + IR train on disjoint frames.
+    let day: BTreeSet<FrameRef> = plans[1].1.train.iter().map(|(r, _)| *r).collect();
+    let night: BTreeSet<FrameRef> = plans[2].1.train.iter().map(|(r, _)| *r).collect();
+    assert!(day.is_disjoint(&night));
+    // Another held-out set, another fingerprint.
+    let other = plan(
+        &s,
+        &Options {
+            seed: 9,
+            ..base.clone()
+        },
+    )
+    .unwrap();
+    if other.heldout != all.heldout {
+        assert_ne!(other.heldout_fingerprint, all.heldout_fingerprint);
+    }
+    // Written into dataset.json and the held-out manifest's tags.
+    let o = Options {
+        scene: SceneFilter::NIGHT_IR,
+        ..base
+    };
+    let p = &plans[2].1;
+    let out = tmp("scene-held-out");
+    let dir = out.0.join("data");
+    let prep = write(&s, p, &o, &dir).unwrap();
+    assert_eq!(prep.heldout_fingerprint, all.heldout_fingerprint);
+    let hd = prep.heldout_dir.clone().unwrap();
+    assert_eq!(
+        read_heldout_fingerprint(&hd).as_deref(),
+        Some(all.heldout_fingerprint.as_str())
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(
+        summary["heldout_fingerprint"],
+        all.heldout_fingerprint.as_str()
+    );
+    assert_eq!(summary["options"]["scene"], "night+ir");
+    assert_eq!(summary["options"]["excluded"], "background");
+    let (set, _) = images::load_dir(&hd, None, Some("heldout")).unwrap();
+    for i in &set.images {
+        let scene = ["day", "night", "ir"]
+            .into_iter()
+            .find(|x| i.tags.iter().any(|t| t == x))
+            .unwrap();
+        assert!(i.tags.contains(&format!("heldout:{scene}")), "{:?}", i.tags);
+        assert!(i.tags.contains(&HELDOUT_ALL.to_string()));
+        assert_eq!(
+            i.tags.contains(&HELDOUT_IN_SCOPE.to_string()),
+            scene != "day",
+            "{:?}",
+            i.tags
+        );
+    }
+}
+
+#[test]
+fn heldout_tags_name_the_scene_and_the_scope() {
+    assert_eq!(
+        heldout_tags(Some("ir"), SceneFilter::NIGHT_IR),
+        ["ir", "heldout:ir", "heldout:all", "heldout:in-scope"]
+    );
+    assert_eq!(
+        heldout_tags(Some("day"), SceneFilter::NIGHT_IR),
+        ["day", "heldout:day", "heldout:all"]
+    );
+    assert_eq!(
+        heldout_tags(None, SceneFilter::ALL_SCENES),
+        ["heldout:all", "heldout:in-scope"]
+    );
+    assert_eq!(heldout_tags(None, SceneFilter::DAY), ["heldout:all"]);
+}
+
+/// A flat export with a `heldout.txt`: cats, cats with a dog, a dog alone, an empty frame; two
+/// held-out frames with dogs. The run trains `cat` only.
+fn dog_export(dir: &Path) -> Vec<Source> {
+    let tags: &[&str] = &["day", "camera:a", "date:2026-01-01"];
+    let cat = "0 0.5 0.5 0.2 0.2\n";
+    let both = "0 0.5 0.5 0.2 0.2\n1 0.2 0.2 0.1 0.1\n";
+    let dog = "1 0.2 0.2 0.1 0.1\n";
+    flat_export(
+        dir,
+        &["cat", "dog"],
+        &[
+            ("c1.jpg", cat, tags),
+            ("c2.jpg", cat, tags),
+            ("c3.jpg", cat, tags),
+            ("c4.jpg", cat, tags),
+            ("d1.jpg", both, tags),
+            ("d2.jpg", both, tags),
+            ("o1.jpg", dog, tags),
+            ("e1.jpg", "", tags),
+            ("h1.jpg", dog, tags),
+            ("h2.jpg", both, tags),
+        ],
+    );
+    std::fs::write(
+        dir.join("heldout.txt"),
+        "h1.jpg
+h2.jpg
+",
+    )
+    .unwrap();
+    vec![read_export(dir).unwrap()]
+}
+
+fn named(s: &[Source], refs: impl Iterator<Item = FrameRef>) -> BTreeSet<String> {
+    refs.map(|r| file_name(&s[r.0].frames[r.1].image)).collect()
+}
+
+#[test]
+fn drop_frame_leaves_out_train_frames_with_untrained_labels_only() {
+    let t = tmp("drop");
+    let s = dog_export(&t.0);
+    let opts = Options {
+        classes: Some(vec!["cat".into()]),
+        excluded: Excluded::DropFrame,
+        negative_share: 0.5,
+        ..Options::default()
+    };
+    let p = plan(&s, &opts).unwrap();
+    assert_eq!(p.stats.excluded_frames, 3, "d1, d2, o1");
+    let used = named(
+        &s,
+        p.train
+            .iter()
+            .map(|(r, _)| *r)
+            .chain(p.valid.iter().copied()),
+    );
+    for n in ["d1.jpg", "d2.jpg", "o1.jpg"] {
+        assert!(!used.contains(n), "{n} in {used:?}");
+    }
+    assert!(used.contains("c1.jpg") && used.contains("e1.jpg"));
+    // The held-out frames keep their dogs.
+    assert_eq!(
+        named(&s, p.heldout.iter().copied()),
+        BTreeSet::from(["h1.jpg".to_string(), "h2.jpg".to_string()])
+    );
+    // 3 of 8 in-scope frames (38%) left out: a warning.
+    assert!(
+        p.warnings.iter().any(|w| w.contains("3 of 8")),
+        "{:?}",
+        p.warnings
+    );
+    // A label dropped by an empty rename is not an untrained label.
+    let renamed = Options {
+        rename: BTreeMap::from([("dog".to_string(), String::new())]),
+        ..opts.clone()
+    };
+    assert_eq!(plan(&s, &renamed).unwrap().stats.excluded_frames, 0);
+    // Background (the default) keeps them.
+    let bg = plan(
+        &s,
+        &Options {
+            excluded: Excluded::Background,
+            ..opts
+        },
+    )
+    .unwrap();
+    assert_eq!(bg.stats.excluded_frames, 0);
+    assert!(!bg.warnings.iter().any(|w| w.contains("do not train")));
+}
+
+/// In the background mode a frame whose only boxes are of untrained labels is a negative and
+/// counts toward `negative_share`.
+#[test]
+fn background_mode_makes_frames_of_untrained_labels_only_negatives() {
+    let t = tmp("bg");
+    let s = dog_export(&t.0);
+    let opts = Options {
+        classes: Some(vec!["cat".into()]),
+        negative_share: 0.5,
+        ..Options::default()
+    };
+    let p = plan(&s, &opts).unwrap();
+    let used: Vec<FrameRef> = p
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(p.valid.iter().copied())
+        .collect();
+    assert!(named(&s, used.iter().copied()).contains("o1.jpg"));
+    let negatives: BTreeSet<String> = named(
+        &s,
+        used.iter().copied().filter(|r| {
+            mapped_boxes(&s[0].frames[r.1], &opts, &p.classes)
+                .next()
+                .is_none()
+        }),
+    );
+    assert_eq!(
+        negatives,
+        BTreeSet::from(["e1.jpg".to_string(), "o1.jpg".to_string()])
+    );
+    assert_eq!(
+        p.stats.boxes_dropped.get("dog"),
+        Some(&5),
+        "d1, d2, o1, h1, h2"
+    );
+    // Toward the share: 6 positives at 0.1 -> 6 x 0.1 / 0.9 = 0.67 -> 1 negative kept; the
+    // reviewer-unconfirmed o1 / e1 rank by seed.
+    let few = plan(
+        &s,
+        &Options {
+            negative_share: 0.1,
+            ..opts
+        },
+    )
+    .unwrap();
+    assert_eq!(few.stats.negatives_dropped, 1);
+}
+
+#[test]
+fn inventory_counts_boxes_per_class_and_scene() {
+    let (a, b) = (tmp("inv-a"), tmp("inv-b"));
+    flat_export(
+        &a.0,
+        &["cat", "dog", "tree"],
+        &[
+            (
+                "1.jpg",
+                "0 0.5 0.5 0.2 0.2\n0 0.2 0.2 0.1 0.1\n1 0.3 0.3 0.1 0.1\n",
+                &["day"],
+            ),
+            ("2.jpg", "0 0.5 0.5 0.2 0.2\n", &["night"]),
+            ("3.jpg", "2 0.5 0.5 0.2 0.2\n", &["ir"]),
+        ],
+    );
+    flat_export(
+        &b.0,
+        &["motorbike", "cat", "person"],
+        &[
+            ("4.jpg", "0 0.5 0.5 0.2 0.2\n1 0.4 0.4 0.1 0.1\n", &[]),
+            ("5.jpg", "1 0.5 0.5 0.2 0.2\n", &["ir"]),
+        ],
+    );
+    let s = vec![read_export(&a.0).unwrap(), read_export(&b.0).unwrap()];
+    let rename = BTreeMap::from([
+        ("motorbike".to_string(), "motorcycle".to_string()),
+        ("tree".to_string(), String::new()),
+    ]);
+    let inv = inventory(&s, &rename);
+    let names: Vec<&str> = inv.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["cat", "dog", "motorcycle", "person"]);
+    let cat = &inv[0];
+    assert_eq!((cat.boxes, cat.frames), (5, 4));
+    assert_eq!(
+        cat.by_scene,
+        SceneCounts {
+            day: 2,
+            night: 1,
+            ir: 1,
+            unknown: 1
+        }
+    );
+    assert_eq!((inv[1].boxes, inv[1].by_scene.day), (1, 1));
+    assert_eq!((inv[2].boxes, inv[2].by_scene.unknown), (1, 1));
+    assert_eq!((inv[3].boxes, inv[3].frames), (0, 0), "listed, no box");
+    assert!(inventory(&[], &BTreeMap::new()).is_empty());
 }
 
 /// The plan of a source does not depend on where its folder is (it once ranked frames by their
@@ -820,4 +1256,191 @@ fn a_class_only_in_the_heldout_split_says_so() {
     // `car` has no box anywhere: a different message.
     let car = p.warnings.iter().find(|w| w.contains("'car'")).unwrap();
     assert!(car.contains("no frame"), "{car}");
+}
+
+/// Skewed footage: 4 cameras, a busy day (8 person frames + 1 empty) and a short IR night
+/// (2 frames, a raccoon on cameras a and b, + 1 empty) each.
+fn skewed_export(dir: &Path) {
+    let mut frames: Vec<(String, String, Vec<String>)> = Vec::new();
+    for cam in ["a", "b", "c", "d"] {
+        for (day, scene, n) in [("2026-10-01", "day", 8), ("2026-10-02", "ir", 2)] {
+            for i in 0..=n {
+                let label = match (scene, i) {
+                    (_, i) if i == n => "",
+                    ("ir", 0) if cam == "a" || cam == "b" => "1 0.5 0.5 0.2 0.2\n",
+                    _ => "0 0.5 0.5 0.2 0.4\n",
+                };
+                frames.push((
+                    format!("{cam}-{day}-{i}.jpg"),
+                    label.into(),
+                    vec![scene.into(), format!("camera:{cam}"), format!("date:{day}")],
+                ));
+            }
+        }
+    }
+    let tags: Vec<Vec<&str>> = frames
+        .iter()
+        .map(|(_, _, t)| t.iter().map(String::as_str).collect())
+        .collect();
+    let refs: Vec<(&str, &str, &[&str])> = frames
+        .iter()
+        .zip(&tags)
+        .map(|((n, l, _), t)| (n.as_str(), l.as_str(), t.as_slice()))
+        .collect();
+    flat_export(dir, &["person", "raccoon"], &refs);
+}
+
+fn balanced(axes: &str, cap: Option<f32>) -> Options {
+    Options {
+        balance: Balance {
+            axes: Balance::parse_axes(axes).unwrap(),
+            cap_dominant: cap,
+            ..Balance::default()
+        },
+        ..Options::default()
+    }
+}
+
+#[test]
+fn balance_off_is_the_old_plan() {
+    let t = tmp("bal-off");
+    skewed_export(&t.0);
+    let s = vec![read_export(&t.0).unwrap()];
+    let old = plan(&s, &Options::default()).unwrap();
+    // Every knob but the axes set: still off.
+    let off = Options {
+        balance: Balance {
+            axes: BTreeSet::new(),
+            strength: 1.0,
+            max_repeat: 9,
+            cap_dominant: Some(1.0),
+        },
+        ..Options::default()
+    };
+    assert_eq!(plan(&s, &off).unwrap(), old);
+    assert_eq!(old.balance, None);
+    assert_eq!(old.stats.balance_dropped, 0);
+    assert!(old.train.iter().all(|(_, r)| *r == 1));
+    // Options of older runs (no balance key) read as off and write no balance key.
+    let mut v = serde_json::to_value(Options::default()).unwrap();
+    assert!(v.get("balance").is_none(), "{v}");
+    v.as_object_mut().unwrap().remove("balance");
+    let back: Options = serde_json::from_value(v).unwrap();
+    assert!(back.balance.is_off());
+    assert_eq!(back, Options::default());
+}
+
+#[test]
+fn balance_repeats_rare_training_frames_and_never_touches_heldout_or_valid() {
+    let t = tmp("bal-on");
+    skewed_export(&t.0);
+    let s = vec![read_export(&t.0).unwrap()];
+    let old = plan(&s, &Options::default()).unwrap();
+    let opts = balanced("class,scene", None);
+    let p = plan(&s, &opts).unwrap();
+    assert_eq!(p.heldout, old.heldout);
+    assert_eq!(p.heldout_fingerprint, old.heldout_fingerprint);
+    assert_eq!(p.valid, old.valid);
+    assert_eq!(
+        p.train.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        old.train.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        "no cap: the same training frames"
+    );
+    let f = |r: FrameRef| &s[r.0].frames[r.1];
+    let mut raccoon_reps = 0;
+    let (mut ir, mut ir_reps) = (0, 0);
+    for (r, rep) in &p.train {
+        let fr = f(*r);
+        let raccoon = fr.boxes.iter().any(|b| b.class == "raccoon");
+        if raccoon {
+            raccoon_reps += rep;
+            assert!(*rep > 1, "raccoon frame {}", fr.image.display());
+        } else if fr.scene.as_deref() == Some("ir") && !fr.boxes.is_empty() {
+            // sqrt(day / ir) between 1 and 2: rounded up or down by rank.
+            assert!((1..=2).contains(rep), "IR frame {}", fr.image.display());
+            (ir, ir_reps) = (ir + 1, ir_reps + rep);
+        } else if fr.scene.as_deref() == Some("day") && !fr.boxes.is_empty() {
+            assert_eq!(*rep, 1, "day person frame {}", fr.image.display());
+        }
+    }
+    assert!(
+        ir > 0 && ir_reps > ir,
+        "{ir_reps} repeats of {ir} IR frames"
+    );
+    let report = p.balance.as_ref().unwrap();
+    assert_eq!(
+        report.after.boxes_per_class["raccoon"],
+        raccoon_reps as usize
+    );
+    assert!(report.after.images > report.before.images);
+    assert_eq!(
+        report.before.images,
+        old.train.iter().map(|(_, r)| *r as usize).sum::<usize>()
+    );
+    assert_eq!(
+        report.after.images,
+        p.train.iter().map(|(_, r)| *r as usize).sum::<usize>()
+    );
+    assert_eq!(
+        p.stats.train_boxes, old.stats.train_boxes,
+        "repeats count once"
+    );
+    // The same plan again (seeded), another seed may round otherwise but keeps the splits.
+    assert_eq!(plan(&s, &opts).unwrap(), p);
+    // Written: repeated lines and the report in dataset.json.
+    let out = tmp("bal-out");
+    let prep = write(&s, &p, &opts, &out.0.join("data")).unwrap();
+    assert_eq!(prep.train_images, report.after.images);
+    let summary = prep.balance_summary.as_deref().unwrap();
+    assert!(
+        summary.starts_with(&format!(
+            "{} → {} images/epoch",
+            report.before.images, report.after.images
+        )),
+        "{summary}"
+    );
+    let lines = std::fs::read_to_string(out.0.join("data").join("train.txt")).unwrap();
+    assert_eq!(lines.lines().count(), report.after.images);
+    let j: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.0.join("data").join("dataset.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        j["options"]["balance"]["axes"],
+        serde_json::json!(["class", "scene"])
+    );
+    assert_eq!(
+        j["balance"]["after"]["images"].as_u64(),
+        Some(report.after.images as u64)
+    );
+    // Unbalanced: no report, no summary.
+    let out2 = tmp("bal-out-off");
+    let prep = write(&s, &old, &Options::default(), &out2.0.join("data")).unwrap();
+    assert_eq!(prep.balance_summary, None);
+    let text = std::fs::read_to_string(out2.0.join("data").join("dataset.json")).unwrap();
+    assert!(!text.contains("\"balance"), "{text}");
+}
+
+#[test]
+fn the_balance_cap_drops_only_training_frames() {
+    let t = tmp("bal-cap");
+    skewed_export(&t.0);
+    let s = vec![read_export(&t.0).unwrap()];
+    let old = plan(&s, &Options::default()).unwrap();
+    let p = plan(&s, &balanced("scene,camera-day", Some(1.0))).unwrap();
+    assert_eq!(p.heldout_fingerprint, old.heldout_fingerprint);
+    assert_eq!(p.valid, old.valid);
+    assert!(p.stats.balance_dropped > 0);
+    assert_eq!(
+        p.train.len() + p.stats.balance_dropped,
+        old.train.len(),
+        "dropped frames leave training only"
+    );
+    assert!(p.stats.train_boxes.contains_key("raccoon"));
+    assert_eq!(p.balance.as_ref().unwrap().dropped, p.stats.balance_dropped);
+    let train: BTreeSet<FrameRef> = p.train.iter().map(|(r, _)| *r).collect();
+    assert!(
+        old.train
+            .iter()
+            .all(|(r, _)| train.contains(r) || s[r.0].frames[r.1].scene.as_deref() == Some("day"))
+    );
 }

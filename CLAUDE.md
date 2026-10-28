@@ -143,6 +143,18 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   (raw keys -> ids by `progress::canonical`, F-beta sweeps, `mem_gb`, `img_s`), kept as `progress.history` + `best`,
   table columns in `training.metric_columns` (`POST /v1/training/metric-columns`); an early GPU OOM retries at half the
   batch (MPS watermark 1.0, RF-DETR memory at its multi-scale side); docs in `docs/TRAINING.md`.
+  Starting points per family in `recipe::recommended` (epochs cap, patience, min epochs, min_delta; `training.epochs`/
+  `.patience` None = recommended, a stored legacy 50 = None); one convergence rule for every trainer (`Convergence` in
+  `train_model.py`, Rust twin `progress::convergence_decision`, parity-tested; native early stopping off; best epoch
+  exported) and Finish now (`POST /training/finish` -> `<run dir>/work/stop-request`, `stop` event). `SceneFilter` is a
+  day/night/ir set (`night` alone = night only); the held-out set is chosen from all review frames before the scene
+  filter (tags `heldout:<scene>|all|in-scope`, `heldout_fingerprint`), so runs queued with several scenes share a
+  `compare_group` and compare per scene (`training/compare.rs`, Comparison card, `GET /v1/training/compare`). Class
+  filter: `dataset::inventory` (`train classes`, `GET /v1/training/dataset-classes`, the page's picker) and
+  `Excluded` (background | drop-frame for objects of unpicked classes). Balancing `dataset::balance` (step 7 of
+  `dataset::plan`, opt-in: class / scene / camera / camera-day repeat factors capped at max repeat, optional cap of
+  dominant groups, negative share kept, held-out/valid untouched; `training::preview_plan`,
+  `POST /v1/training/balance-preview`, `train prepare --dry-run`).
   `train import` (`training/import/`: video / image folder / URL via yt-dlp / pinned `import-data:meva-sample` into the
   dataset folder, scene change + dHash + SigLIP k-center, licence confirmed; the 20k candidate budget split per camera then
   per video before extraction (`select::budget`), videos extracted in parallel (`import/parallel.rs`, `--workers`, results

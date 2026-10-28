@@ -12,17 +12,26 @@
 //!      there is one.
 //!
 //!    A missing label file means "no objects" (the Ultralytics convention).
-//! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops),
-//!    filter by scene, hold out review frames by camera + day (unless the export already did),
-//!    keep about `negative_share` frames without objects in training, take a validation split
-//!    of `val_share` of the review training frames (never a class's last training box), and
-//!    repeat the review frames `oversample` times when public frames are mixed in. Public frames
-//!    are only ever trained on. Seeded choices rank a frame by its path relative to its source
-//!    folder, so the plan is the same wherever the folders are (reproducible runs).
+//! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops);
+//!    hold out review frames by camera + day (unless the export already did) from **every**
+//!    review frame, before any filter, so runs with other scene filters are benchmarked on the
+//!    same frames ([`Plan::heldout_fingerprint`]); then filter the train / valid pool by scene
+//!    ([`SceneFilter`]) and, in [`Excluded::DropFrame`] mode, drop its frames with boxes of
+//!    untrained labels; keep about `negative_share` frames without objects in training, take a
+//!    validation split of `val_share` of the review training frames (never a class's last
+//!    training box), and repeat the review frames `oversample` times when public frames are
+//!    mixed in. Public frames are only ever trained on. Seeded choices rank a frame by its path
+//!    relative to its source folder, so the plan is the same wherever the folders are
+//!    (reproducible runs). Step 7, opt-in ([`Balance`], [`balance`]): repeat the training frames
+//!    of rare classes / scenes / cameras / camera days (and optionally drop frames of dominant
+//!    ones); validation and held-out frames are never balanced.
 //! 3. **Write** ([`write`]): `images/` + `labels/` (hard links, else copies), `classes.txt`,
 //!    `train.txt` / `valid.txt`, `data.yaml` (Ultralytics), `train.coco.json` /
 //!    `valid.coco.json` (category ids 0..C-1, for RF-DETR and transformers), the held-out set as
-//!    a benchmark `dir:` set (`heldout/`), and `dataset.json` (what went in, for provenance).
+//!    a benchmark `dir:` set (`heldout/`, every scene, tagged by [`heldout_tags`]), and
+//!    `dataset.json` (what went in, for provenance).
+//!
+//! [`inventory`] counts the boxes per class and scene of the sources (the class picker).
 
 use crate::benchmark::images::{self, Manifest};
 use anyhow::{Context, Result, bail};
@@ -30,46 +39,205 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Which frames a run trains on, by scene.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum SceneFilter {
-    #[default]
-    All,
-    Day,
-    /// Night and IR frames (a night model).
-    #[serde(rename = "night+ir")]
-    NightIr,
+pub mod balance;
+pub use balance::{Balance, BalanceAxis, BalanceCounts, BalanceReport};
+
+/// Which frames a run trains on, by scene: any combination of day, night and IR. None or all
+/// three = every frame (unknown scenes included). Serialized as its canonical string
+/// ([`SceneFilter::as_str`]); every older spelling still parses. `night` alone is night only and
+/// `ir` alone IR only (before scene sets both meant night + IR).
+#[derive(Debug, Clone, Copy)]
+pub struct SceneFilter {
+    pub day: bool,
+    pub night: bool,
+    pub ir: bool,
+}
+
+impl Default for SceneFilter {
+    fn default() -> Self {
+        Self::ALL_SCENES
+    }
 }
 
 impl SceneFilter {
-    pub const ALL: [SceneFilter; 3] = [SceneFilter::All, SceneFilter::Day, SceneFilter::NightIr];
+    /// Every frame.
+    pub const ALL_SCENES: SceneFilter = SceneFilter::new(true, true, true);
+    pub const DAY: SceneFilter = SceneFilter::new(true, false, false);
+    /// Night and IR frames (a night model).
+    pub const NIGHT_IR: SceneFilter = SceneFilter::new(false, true, true);
+    /// The page's checkboxes, in order.
+    pub const CHOICES: [&'static str; 3] = ["day", "night", "ir"];
+    /// The usual picks: a general, a day and a night model.
+    pub const PRESETS: [SceneFilter; 3] = [Self::ALL_SCENES, Self::DAY, Self::NIGHT_IR];
 
+    pub const fn new(day: bool, night: bool, ir: bool) -> Self {
+        Self { day, night, ir }
+    }
+
+    /// No scene restriction (all three or none ticked).
+    pub const fn is_all(self) -> bool {
+        self.day == self.night && self.night == self.ir
+    }
+
+    /// A night model: night and / or IR, no day.
+    pub const fn is_night(self) -> bool {
+        !self.is_all() && !self.day && (self.night || self.ir)
+    }
+
+    /// The canonical spelling: `all`, `day`, `night`, `ir`, `day+night`, `day+ir`, `night+ir`.
+    pub const fn as_str(self) -> &'static str {
+        if self.is_all() {
+            return "all";
+        }
+        match (self.day, self.night, self.ir) {
+            (true, false, false) => "day",
+            (false, true, false) => "night",
+            (false, false, true) => "ir",
+            (true, true, false) => "day+night",
+            (true, false, true) => "day+ir",
+            _ => "night+ir",
+        }
+    }
+
+    /// The model-name prefix: `custom` (all), `day`, `night` (night + IR), `night-only`, `ir`,
+    /// `day-night`, `day-ir`.
+    pub const fn label(self) -> &'static str {
+        if self.is_all() {
+            return "custom";
+        }
+        match (self.day, self.night, self.ir) {
+            (true, false, false) => "day",
+            (false, true, false) => "night-only",
+            (false, false, true) => "ir",
+            (true, true, false) => "day-night",
+            (true, false, true) => "day-ir",
+            _ => "night",
+        }
+    }
+
+    /// A human description (the page's preset list).
+    pub const fn describe(self) -> &'static str {
+        if self.is_all() {
+            return "all frames (a general custom model)";
+        }
+        match (self.day, self.night, self.ir) {
+            (true, false, false) => "day frames only",
+            (false, true, false) => "night frames only (no IR)",
+            (false, false, true) => "IR frames only",
+            (true, true, false) => "day + night frames (no IR)",
+            (true, false, true) => "day + IR frames",
+            _ => "night + IR frames (a night model)",
+        }
+    }
+
+    /// Parse scene names separated by `+`, `,` or spaces (`day`, `night`, `ir`, `all`), and the
+    /// old spellings `night-ir` / `nightir`. Empty = all.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        if matches!(s.as_str(), "night-ir" | "nightir") {
+            return Some(Self::NIGHT_IR);
+        }
+        let mut f = Self::new(false, false, false);
+        for t in s.split(|c: char| c == '+' || c == ',' || c.is_whitespace()) {
+            match t {
+                "" => {}
+                "all" => f = Self::ALL_SCENES,
+                "day" => f.day = true,
+                "night" => f.night = true,
+                "ir" => f.ir = true,
+                _ => return None,
+            }
+        }
+        Some(f.normalized())
+    }
+
+    /// All three ticked when none is (one spelling of "all").
+    fn normalized(self) -> Self {
+        if self.is_all() {
+            Self::ALL_SCENES
+        } else {
+            self
+        }
+    }
+
+    /// Whether a frame of `scene` (None = unknown) is in: everything for `all`, else only frames
+    /// tagged with a chosen scene.
+    pub fn keeps(self, scene: Option<&str>) -> bool {
+        if self.is_all() {
+            return true;
+        }
+        match scene {
+            Some("day") => self.day,
+            Some("night") => self.night,
+            Some("ir") => self.ir,
+            _ => false,
+        }
+    }
+}
+
+/// Equal by meaning: no scene ticked equals all three.
+impl PartialEq for SceneFilter {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SceneFilter {}
+
+impl std::hash::Hash for SceneFilter {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.as_str().hash(h);
+    }
+}
+
+impl std::fmt::Display for SceneFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for SceneFilter {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SceneFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "scene '{s}' is not all or a combination of day, night and ir"
+            ))
+        })
+    }
+}
+
+/// What happens to a train / valid frame holding a box of a label the run does not train (not in
+/// its classes, not dropped by an empty rename).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Excluded {
+    /// The frame stays; the object is background (a frame left without a box is a negative).
+    #[default]
+    Background,
+    /// The frame is left out, so a look-alike of a trained class is never taught as background.
+    DropFrame,
+}
+
+impl Excluded {
     pub const fn as_str(self) -> &'static str {
         match self {
-            SceneFilter::All => "all",
-            SceneFilter::Day => "day",
-            SceneFilter::NightIr => "night+ir",
+            Excluded::Background => "background",
+            Excluded::DropFrame => "drop-frame",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "all" | "" => Some(SceneFilter::All),
-            "day" => Some(SceneFilter::Day),
-            "night" | "ir" | "night+ir" | "night-ir" | "nightir" | "night ir" => {
-                Some(SceneFilter::NightIr)
-            }
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "background" | "" => Some(Excluded::Background),
+            "drop-frame" | "drop" => Some(Excluded::DropFrame),
             _ => None,
-        }
-    }
-
-    /// Whether a frame of `scene` (None = unknown) is in.
-    pub fn keeps(self, scene: Option<&str>) -> bool {
-        match self {
-            SceneFilter::All => true,
-            SceneFilter::Day => scene == Some("day"),
-            SceneFilter::NightIr => matches!(scene, Some("night" | "ir")),
         }
     }
 }
@@ -551,14 +719,21 @@ pub struct Options {
     /// Label renames (`motorbike` -> `motorcycle`); an empty target drops the label.
     #[serde(default)]
     pub rename: BTreeMap<String, String>,
+    /// Scenes of the train / valid frames (the held-out frames keep every scene).
     #[serde(default)]
     pub scene: SceneFilter,
+    /// What a train / valid frame with a box of an untrained label becomes.
+    #[serde(default)]
+    pub excluded: Excluded,
     pub negative_share: f32,
     pub heldout_share: f32,
     /// Share of the training frames used for validation (checkpoint choice), at least one.
     pub val_share: f32,
     pub oversample: u32,
     pub seed: u64,
+    /// Step 7 (off by default: the plan of older versions).
+    #[serde(default, skip_serializing_if = "Balance::is_off")]
+    pub balance: Balance,
 }
 
 impl Default for Options {
@@ -566,12 +741,14 @@ impl Default for Options {
         Self {
             classes: None,
             rename: BTreeMap::new(),
-            scene: SceneFilter::All,
+            scene: SceneFilter::ALL_SCENES,
+            excluded: Excluded::Background,
             negative_share: super::config::DEFAULT_NEGATIVE_SHARE,
             heldout_share: super::config::DEFAULT_HELDOUT_SHARE,
             val_share: 0.1,
             oversample: super::config::DEFAULT_OVERSAMPLE,
             seed: 0,
+            balance: Balance::default(),
         }
     }
 }
@@ -587,15 +764,24 @@ pub struct Plan {
     pub train: Vec<(FrameRef, u32)>,
     pub valid: Vec<FrameRef>,
     pub heldout: Vec<FrameRef>,
+    /// Hex SHA-256 of the sorted held-out frame keys: runs with the same value were benchmarked
+    /// on the same frames (whatever their scene filter).
+    pub heldout_fingerprint: String,
     pub stats: Stats,
     pub warnings: Vec<String>,
+    /// What balancing did (None when off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceReport>,
 }
 
 /// Counts of a plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
 pub struct Stats {
     pub frames_read: usize,
+    /// Train / valid frames left out by the scene filter.
     pub scene_filtered: usize,
+    /// Train / valid frames left out for a box of an untrained label ([`Excluded::DropFrame`]).
+    pub excluded_frames: usize,
     pub negatives_dropped: usize,
     /// Boxes dropped per label not in the class list.
     pub boxes_dropped: BTreeMap<String, usize>,
@@ -606,6 +792,13 @@ pub struct Stats {
     pub public_frames: usize,
     /// `camera/day` groups held out by the plan (empty when the source chose).
     pub heldout_groups: Vec<String>,
+    /// Training frames the balance cap left out ([`Balance::cap_dominant`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub balance_dropped: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// SHA-256 of `seed` and `key` as a number, for deterministic choices.
@@ -650,6 +843,20 @@ fn frame_key(s: &Source, f: &Frame) -> String {
         .join("/")
 }
 
+/// Hex SHA-256 of `keys` sorted, one per line (the held-out set's identity; empty set = the hash
+/// of nothing).
+fn fingerprint(keys: impl Iterator<Item = String>) -> String {
+    use sha2::Digest;
+    let mut keys: Vec<String> = keys.collect();
+    keys.sort_unstable();
+    let mut h = sha2::Sha256::new();
+    for k in &keys {
+        h.update(k.as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Decide the splits (see the module docs). Pure and deterministic for a given `seed`.
 pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     // 1. Classes.
@@ -682,40 +889,17 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             p.classes
         );
     }
-    // 2. Frames in scope, boxes mapped.
+    // 2. Every frame, review and public apart.
     let mut review: Vec<FrameRef> = Vec::new();
     let mut public: Vec<FrameRef> = Vec::new();
     for (si, s) in sources.iter().enumerate() {
-        for (fi, f) in s.frames.iter().enumerate() {
+        for fi in 0..s.frames.len() {
             p.stats.frames_read += 1;
-            if !opts.scene.keeps(f.scene.as_deref()) {
-                p.stats.scene_filtered += 1;
-                continue;
-            }
-            for b in &f.boxes {
-                let name = opts.rename.get(&b.class).unwrap_or(&b.class);
-                if !p.classes.contains(name) {
-                    *p.stats.boxes_dropped.entry(name.clone()).or_default() += 1;
-                }
-            }
             if s.public.is_some() {
                 public.push((si, fi));
             } else {
                 review.push((si, fi));
             }
-        }
-    }
-    if opts.scene != SceneFilter::All && p.stats.scene_filtered > 0 {
-        let unknown = sources
-            .iter()
-            .flat_map(|s| &s.frames)
-            .filter(|f| f.scene.is_none())
-            .count();
-        if unknown > 0 {
-            p.warnings.push(format!(
-                "{unknown} frame(s) have no scene tag and were left out by the {} filter",
-                opts.scene.as_str()
-            ));
         }
     }
     let frame = |r: FrameRef| -> Option<&Frame> { sources.get(r.0)?.frames.get(r.1) };
@@ -729,11 +913,12 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     let positive = |r: FrameRef| -> bool {
         frame(r).is_some_and(|f| mapped_boxes(f, opts, &p.classes).next().is_some())
     };
-    // 3. Held out (review frames only).
+    // 3. Held out, from every review frame before the scene filter, so that runs with other
+    // scene filters are benchmarked on the same frames (every scene).
     let hinted = review
         .iter()
         .any(|&r| frame(r).is_some_and(|f| f.split != SplitHint::None));
-    let (mut pool, heldout): (Vec<FrameRef>, Vec<FrameRef>) = if hinted {
+    let (pool, heldout): (Vec<FrameRef>, Vec<FrameRef>) = if hinted {
         review
             .iter()
             .partition(|&&r| frame(r).is_none_or(|f| f.split != SplitHint::Heldout))
@@ -789,18 +974,70 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     };
     p.heldout = heldout;
     p.heldout.sort_unstable();
+    p.heldout_fingerprint = fingerprint(p.heldout.iter().map(|&r| key_of(r)));
     if p.heldout.is_empty() {
         p.warnings.push(
             "no frame is held out: the trained model is not benchmarked on your own scenes".into(),
         );
     }
-    // 4. Negatives: about `negative_share` of the training pool.
-    pool.extend(public.iter().copied());
+    // 4. Train / valid pool: the rest of the review frames plus the public ones, by scene, then
+    // without frames of untrained labels when the run drops them.
+    let mut in_scope: Vec<FrameRef> = Vec::new();
+    let mut unknown_left_out = 0usize;
+    for r in pool.into_iter().chain(public.iter().copied()) {
+        let scene = frame(r).and_then(|f| f.scene.as_deref());
+        if opts.scene.keeps(scene) {
+            in_scope.push(r);
+        } else {
+            p.stats.scene_filtered += 1;
+            unknown_left_out += usize::from(scene.is_none());
+        }
+    }
+    if unknown_left_out > 0 {
+        p.warnings.push(format!(
+            "{unknown_left_out} training frame(s) have no scene tag and were left out by the {} \
+             filter",
+            opts.scene
+        ));
+    }
+    let untrained = |b: &YoloBox| -> bool {
+        let name = opts.rename.get(&b.class).unwrap_or(&b.class);
+        !name.is_empty() && !p.classes.contains(name)
+    };
+    let scoped = in_scope.len();
+    let mut pool: Vec<FrameRef> = Vec::with_capacity(scoped);
+    for r in in_scope {
+        let Some(f) = frame(r) else { continue };
+        if opts.excluded == Excluded::DropFrame && f.boxes.iter().any(untrained) {
+            p.stats.excluded_frames += 1;
+            continue;
+        }
+        pool.push(r);
+    }
+    if p.stats.excluded_frames * 10 > scoped * 3 {
+        p.warnings.push(format!(
+            "{} of {scoped} training frame(s) ({:.0}%) were left out for boxes of classes this \
+             run does not train; add those classes, or treat their objects as background",
+            p.stats.excluded_frames,
+            100.0 * p.stats.excluded_frames as f64 / scoped.max(1) as f64
+        ));
+    }
+    // Labels the run does not train, over the frames it uses.
+    for &r in pool.iter().chain(&p.heldout) {
+        for b in frame(r).map(|f| f.boxes.as_slice()).unwrap_or_default() {
+            let name = opts.rename.get(&b.class).unwrap_or(&b.class);
+            if !p.classes.contains(name) {
+                *p.stats.boxes_dropped.entry(name.clone()).or_default() += 1;
+            }
+        }
+    }
+    // 5. Negatives: about `negative_share` of the training pool (a frame whose only boxes are
+    // of untrained labels is one, in the background mode).
     let (pos, mut neg): (Vec<FrameRef>, Vec<FrameRef>) = pool.iter().partition(|&&r| positive(r));
     if pos.is_empty() {
         bail!(
-            "no training frame has a box of the classes {:?} (after the scene filter and the \
-             held-out split); review more frames with objects",
+            "no training frame has a box of the classes {:?} (after the held-out split, the \
+             scene filter and the excluded-class rule); review more frames with objects",
             p.classes
         );
     }
@@ -830,7 +1067,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     }
     let mut pool: Vec<FrameRef> = pos.into_iter().chain(neg).collect();
     pool.sort_unstable();
-    // 5. Validation (the trainer's checkpoint choice): `val_share` of the review frames of the
+    // 6. Validation (the trainer's checkpoint choice): `val_share` of the review frames of the
     // pool when there are any (else of the pool), never a frame holding the last training box of
     // a class (so at least one positive frame stays in training). The size is a share of the
     // frames it is taken from: a share of the whole pool, public frames included, once took
@@ -890,13 +1127,45 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     }
     let val_set: BTreeSet<FrameRef> = valid.iter().copied().collect();
     let mixed = !public.is_empty();
-    for r in pool.into_iter().filter(|r| !val_set.contains(r)) {
+    let base = |r: FrameRef| -> u32 {
         let is_public = sources.get(r.0).is_some_and(|s| s.public.is_some());
-        let repeats = if mixed && !is_public {
+        if mixed && !is_public {
             opts.oversample.max(1)
         } else {
             1
-        };
+        }
+    };
+    let train: Vec<FrameRef> = pool.into_iter().filter(|r| !val_set.contains(r)).collect();
+    // 7. Balance (opt-in): repeats per training frame, after the cap.
+    let mut repeats: Vec<u32> = train.iter().map(|&r| base(r)).collect();
+    let mut keep = vec![true; train.len()];
+    if !opts.balance.is_off() {
+        let items: Vec<balance::Item> = train
+            .iter()
+            .map(|&r| {
+                let f = frame(r);
+                balance::Item {
+                    key: key_of(r),
+                    base: base(r),
+                    scene: f
+                        .and_then(|f| f.scene.clone())
+                        .unwrap_or_else(|| UNKNOWN.into()),
+                    camera: f.map(|f| f.camera.clone()).unwrap_or_default(),
+                    day: f.map(|f| f.day.clone()).unwrap_or_default(),
+                    boxes: boxes_per_class(r),
+                    hard_negative: f.is_some_and(|f| f.hard_negative),
+                }
+            })
+            .collect();
+        let out = balance::apply(&items, &p.classes, &opts.balance, opts.seed);
+        repeats = out.repeats;
+        keep = out.keep;
+        p.stats.balance_dropped = out.report.dropped;
+        p.warnings.extend(out.warnings);
+        p.balance = Some(out.report);
+    }
+    for ((r, repeats), _) in train.into_iter().zip(repeats).zip(keep).filter(|(_, k)| *k) {
+        let is_public = sources.get(r.0).is_some_and(|s| s.public.is_some());
         if let Some(f) = frame(r) {
             let mut any = false;
             for (i, _) in mapped_boxes(f, opts, &p.classes) {
@@ -975,7 +1244,12 @@ pub struct Prepared {
     /// The held-out benchmark set (`dir:<path>`), when frames were held out.
     pub heldout_dir: Option<PathBuf>,
     pub heldout_images: usize,
+    /// [`Plan::heldout_fingerprint`].
+    pub heldout_fingerprint: String,
     pub warnings: Vec<String>,
+    /// [`BalanceReport::summary`] when the run balanced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_summary: Option<String>,
 }
 
 /// `dataset.json`: what went into a prepared dataset.
@@ -990,7 +1264,10 @@ pub struct Summary<'a> {
     pub train_images: usize,
     pub valid_images: usize,
     pub heldout_images: usize,
+    pub heldout_fingerprint: &'a str,
     pub warnings: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<&'a BalanceReport>,
 }
 
 /// One source in `dataset.json`.
@@ -1034,6 +1311,31 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
 
 fn yolo_line(class: usize, b: &YoloBox) -> String {
     format!("{class} {:.6} {:.6} {:.6} {:.6}\n", b.cx, b.cy, b.w, b.h)
+}
+
+/// Tag prefix of the held-out manifest's own scene tags. The bare `day` / `night` / `ir` tags of
+/// the benchmark also match images of built-in sets run beside the held-out set; these do not.
+pub const HELDOUT_TAG: &str = "heldout:";
+/// Held-out tag of every image ([`HELDOUT_TAG`] + `all`).
+pub const HELDOUT_ALL: &str = "heldout:all";
+/// Held-out tag of the images in the run's scene filter.
+pub const HELDOUT_IN_SCOPE: &str = "heldout:in-scope";
+
+/// Benchmark tags of a held-out frame of `scene` for a run filtered by `filter`: the bare scene
+/// (the benchmark's own scene views), `heldout:<scene>`, `heldout:all` and, when the run
+/// trained on its scene, `heldout:in-scope` (so [`super::bench::summarize`] reads exact AP per
+/// scene and over the run's scenes from `accuracy.by_tag`).
+pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    if let Some(s) = scene {
+        tags.push(s.to_string());
+        tags.push(format!("{HELDOUT_TAG}{s}"));
+    }
+    tags.push(HELDOUT_ALL.into());
+    if filter.keeps(scene) {
+        tags.push(HELDOUT_IN_SCOPE.into());
+    }
+    tags
 }
 
 /// Write `plan` into `out` (created; must not exist or be empty).
@@ -1215,7 +1517,7 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
                 .join("labels")
                 .join(format!("{}.txt", stem(Path::new(&n))));
             std::fs::write(&txt, label_text(f))?;
-            let mut tags: Vec<String> = f.scene.iter().cloned().collect();
+            let mut tags = heldout_tags(f.scene.as_deref(), opts.scene);
             tags.push(format!("camera:{}", f.camera));
             tags.push(format!("date:{}", f.day));
             if f.hard_negative {
@@ -1264,7 +1566,9 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         train_images: train_entries.len(),
         valid_images: valid_entries.len(),
         heldout_images: plan.heldout.len(),
+        heldout_fingerprint: &plan.heldout_fingerprint,
         warnings: &warnings,
+        balance: plan.balance.as_ref(),
     };
     write_text("dataset.json", &serde_json::to_string_pretty(&summary)?)?;
     Ok(Prepared {
@@ -1274,7 +1578,9 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         valid_images: valid_entries.len(),
         heldout_dir,
         heldout_images: plan.heldout.len(),
+        heldout_fingerprint: plan.heldout_fingerprint.clone(),
         warnings,
+        balance_summary: plan.balance.as_ref().map(BalanceReport::summary),
     })
 }
 
@@ -1290,6 +1596,89 @@ pub fn read_summary_sources(dir: &Path) -> Vec<SourceSummary> {
         .and_then(|b| serde_json::from_slice::<S>(&b).ok())
         .map(|s| s.sources)
         .unwrap_or_default()
+}
+
+/// The held-out fingerprint in the `dataset.json` beside a held-out set (`<data>/heldout`); None
+/// for datasets of older versions.
+pub fn read_heldout_fingerprint(heldout_dir: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct S {
+        #[serde(default)]
+        heldout_fingerprint: Option<String>,
+    }
+    let b = std::fs::read(heldout_dir.parent()?.join("dataset.json")).ok()?;
+    serde_json::from_slice::<S>(&b)
+        .ok()?
+        .heldout_fingerprint
+        .filter(|f| !f.is_empty())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Class inventory
+// ---------------------------------------------------------------------------------------------
+
+/// Boxes per scene of a class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct SceneCounts {
+    pub day: usize,
+    pub night: usize,
+    pub ir: usize,
+    /// Frames without a scene tag.
+    pub unknown: usize,
+}
+
+/// One class of the chosen datasets (the Training page's class picker, `train classes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClassCount {
+    pub name: String,
+    pub boxes: usize,
+    /// Frames with at least one box of it.
+    pub frames: usize,
+    pub by_scene: SceneCounts,
+}
+
+/// Every class of `sources` after `rename` (an empty target drops the label), listed classes
+/// without a box included, by box count (most first) then name. Pure.
+pub fn inventory(sources: &[Source], rename: &BTreeMap<String, String>) -> Vec<ClassCount> {
+    let renamed = |c: &String| -> Option<String> {
+        let n = rename.get(c).unwrap_or(c);
+        (!n.is_empty()).then(|| n.clone())
+    };
+    fn slot<'a>(by: &'a mut BTreeMap<String, ClassCount>, n: &str) -> &'a mut ClassCount {
+        by.entry(n.to_string()).or_insert_with(|| ClassCount {
+            name: n.to_string(),
+            boxes: 0,
+            frames: 0,
+            by_scene: SceneCounts::default(),
+        })
+    }
+    let mut by: BTreeMap<String, ClassCount> = BTreeMap::new();
+    for s in sources {
+        for c in s.classes.iter().filter_map(renamed) {
+            slot(&mut by, &c);
+        }
+        for f in &s.frames {
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            for b in &f.boxes {
+                let Some(n) = renamed(&b.class) else { continue };
+                let cc = slot(&mut by, &n);
+                cc.boxes += 1;
+                let sc = &mut cc.by_scene;
+                *match f.scene.as_deref() {
+                    Some("day") => &mut sc.day,
+                    Some("night") => &mut sc.night,
+                    Some("ir") => &mut sc.ir,
+                    _ => &mut sc.unknown,
+                } += 1;
+                if seen.insert(n) {
+                    cc.frames += 1;
+                }
+            }
+        }
+    }
+    let mut v: Vec<ClassCount> = by.into_values().collect();
+    v.sort_by(|a, b| b.boxes.cmp(&a.boxes).then_with(|| a.name.cmp(&b.name)));
+    v
 }
 
 #[cfg(test)]

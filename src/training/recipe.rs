@@ -1,5 +1,6 @@
-//! [`TrainRecipe`]: what to train (family, size, base weights, input size, epochs, batch,
-//! learning rate, night augmentation), its validation, and the trained model's default name.
+//! [`TrainRecipe`]: what to train (family, size, base weights, input size, epochs, patience,
+//! batch, learning rate, night augmentation), its validation, the per-family starting points
+//! ([`recommended`]) and the trained model's default name.
 
 use crate::resources::catalog::{self, Resource, TrainFamily};
 use anyhow::{Result, bail};
@@ -77,6 +78,47 @@ impl MultiScale {
     }
 }
 
+/// A family's starting point for fine-tuning: with early stopping on, `epochs` is a cap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Recommended {
+    pub epochs: u32,
+    /// Epochs without an improvement of more than `min_delta` before the run stops.
+    pub patience: u32,
+    /// No convergence stop before this epoch.
+    pub min_epochs: u32,
+    /// Smallest validation mAP gain that counts as an improvement.
+    pub min_delta: f32,
+    /// Learning rate; None = the trainer's default (rfdetr and the transformers recipe: 1e-4).
+    pub lr: Option<f32>,
+}
+
+impl Recommended {
+    /// `min_delta` as the f64 the training script parses from its decimal text (`0.001`), so the
+    /// display twin of its rule ([`super::progress::convergence_decision`]) decides alike.
+    pub fn min_delta_f64(&self) -> f64 {
+        self.min_delta.to_string().parse().unwrap_or(0.0)
+    }
+}
+
+/// The starting point of `family`. Sources: the Ultralytics fine-tuning guide
+/// (<https://docs.ultralytics.com/guides/finetuning-guide>: patience 10-20 when fine-tuning) and
+/// the RF-DETR training docs (<https://rfdetr.roboflow.com/learn/train/>: 100 epochs, lr 1e-4,
+/// patience 10, min_delta 0.001); RT-DETRv2 / D-FINE converge in fewer epochs from COCO weights.
+pub const fn recommended(family: TrainFamily) -> Recommended {
+    let (epochs, patience) = match family {
+        TrainFamily::Yolo26 | TrainFamily::Yolo11 | TrainFamily::Yolov8 => (100, 15),
+        TrainFamily::Rfdetr => (100, 10),
+        TrainFamily::Rtdetrv2 | TrainFamily::Dfine => (80, 10),
+    };
+    Recommended {
+        epochs,
+        patience,
+        min_epochs: 10,
+        min_delta: 0.001,
+        lr: None,
+    }
+}
+
 /// One training run's model choice and hyper-parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainRecipe {
@@ -89,6 +131,10 @@ pub struct TrainRecipe {
     pub base_weights: Option<String>,
     pub imgsz: u32,
     pub epochs: u32,
+    /// Stop after this many epochs without a validation mAP improvement (0 = off; a recipe
+    /// queued before early stopping existed reads as 0, its old behaviour).
+    #[serde(default)]
+    pub patience: u32,
     pub batch: u32,
     /// Learning rate; None = the trainer's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,9 +147,10 @@ pub struct TrainRecipe {
 }
 
 impl TrainRecipe {
-    /// Defaults for `family` / `size`: the size's input size, `epochs`, batch 8 (4 for RF-DETR),
-    /// no augmentation. Errors when the size is not one of the family's.
-    pub fn new(family: TrainFamily, size: &str, epochs: u32) -> Result<Self> {
+    /// Defaults for `family` / `size`: the size's input size, the [`recommended`] epochs and
+    /// patience, batch 8 (4 for RF-DETR), no augmentation. Errors when the size is not one of the
+    /// family's.
+    pub fn new(family: TrainFamily, size: &str) -> Result<Self> {
         let Some(size) = family.size(size) else {
             bail!(
                 "{} has no size '{size}'; choose one of {}",
@@ -111,17 +158,25 @@ impl TrainRecipe {
                 family.sizes().join(", ")
             );
         };
+        let rec = recommended(family);
         Ok(Self {
             family,
             size: size.to_string(),
             base_weights: None,
             imgsz: family.default_imgsz(size),
-            epochs,
+            epochs: rec.epochs,
+            patience: rec.patience,
             batch: if family == TrainFamily::Rfdetr { 4 } else { 8 },
-            lr: None,
+            lr: rec.lr,
             augment: Augment::default(),
             multi_scale: MultiScale::Auto,
         })
+    }
+
+    /// Whether the convergence stop can end the run before its last epoch (patience on and
+    /// below the epochs); else the run gets a warning that early stopping is off.
+    pub fn early_stopping(&self) -> bool {
+        self.patience > 0 && self.patience < self.epochs
     }
 
     /// Whether RF-DETR trains multi-scale on a GPU with `memory_mb` for the estimate (0 =
@@ -217,6 +272,13 @@ impl TrainRecipe {
                 self.epochs
             );
         }
+        if self.patience > self.epochs {
+            bail!(
+                "patience ({}) must not exceed the epochs ({}); 0 turns early stopping off",
+                self.patience,
+                self.epochs
+            );
+        }
         if !(1..=MAX_BATCH).contains(&self.batch) {
             bail!(
                 "batch must be between 1 and {MAX_BATCH}, got {}",
@@ -241,14 +303,11 @@ impl TrainRecipe {
         Ok(())
     }
 
-    /// Default name of the trained model: `night-yolo26n-20261022-1930` for a night / IR run,
-    /// `custom-...` otherwise (`stamp` = `YYYYMMDD-HHMM`).
-    pub fn default_name(&self, night: bool, stamp: &str) -> String {
-        format!(
-            "{}-{}-{stamp}",
-            if night { "night" } else { "custom" },
-            self.label()
-        )
+    /// Default name of the trained model: `<prefix>-yolo26n-20261022-1930`, the prefix being the
+    /// scene filter's label (`custom`, `day`, `night`, `ir`, ... see `SceneFilter::label`;
+    /// `stamp` = `YYYYMMDD-HHMM`).
+    pub fn default_name(&self, prefix: &str, stamp: &str) -> String {
+        format!("{prefix}-{}-{stamp}", self.label())
     }
 }
 
@@ -298,30 +357,30 @@ mod tests {
 
     #[test]
     fn defaults_follow_the_family() {
-        let r = TrainRecipe::new(TrainFamily::Rfdetr, "small", 10).unwrap();
+        let r = TrainRecipe::new(TrainFamily::Rfdetr, "small").unwrap();
         assert_eq!((r.size.as_str(), r.imgsz, r.batch), ("small", 512, 4));
         assert_eq!(r.label(), "rfdetr-small");
         assert_eq!(r.base().unwrap().id, "train-base:rfdetr-small");
         r.validate().unwrap();
-        let y = TrainRecipe::new(TrainFamily::Yolo26, "nano", 1).unwrap();
+        let y = TrainRecipe::new(TrainFamily::Yolo26, "nano").unwrap();
         assert_eq!((y.size.as_str(), y.imgsz, y.batch), ("n", 640, 8));
         assert_eq!(y.base().unwrap().id, "model:yolo26n");
-        assert!(TrainRecipe::new(TrainFamily::Dfine, "n", 1).is_err());
+        assert!(TrainRecipe::new(TrainFamily::Dfine, "n").is_err());
         assert_eq!(
-            y.default_name(true, "20261022-1930"),
+            y.default_name("night", "20261022-1930"),
             "night-yolo26n-20261022-1930"
         );
         assert_eq!(
-            TrainRecipe::new(TrainFamily::Rtdetrv2, "s", 1)
+            TrainRecipe::new(TrainFamily::Rtdetrv2, "s")
                 .unwrap()
-                .default_name(false, "x"),
+                .default_name("custom", "x"),
             "custom-rt-detrv2-s-x"
         );
     }
 
     #[test]
     fn validation_rejects_bad_values() {
-        let base = TrainRecipe::new(TrainFamily::Yolo11, "s", 5).unwrap();
+        let base = TrainRecipe::new(TrainFamily::Yolo11, "s").unwrap();
         let bad = |f: fn(&mut TrainRecipe)| {
             let mut r = base.clone();
             f(&mut r);
@@ -330,6 +389,7 @@ mod tests {
         assert!(bad(|r| r.imgsz = 650).contains("multiple of 32"));
         assert!(bad(|r| r.imgsz = 64).contains("between 160"));
         assert!(bad(|r| r.epochs = 0).contains("epochs"));
+        assert!(bad(|r| r.patience = r.epochs + 1).contains("patience"));
         assert!(bad(|r| r.batch = 0).contains("batch"));
         assert!(bad(|r| r.lr = Some(2.0)).contains("learning rate"));
         assert!(bad(|r| r.lr = Some(f32::NAN)).contains("learning rate"));
@@ -345,7 +405,7 @@ mod tests {
         ok.base_weights = Some("model:yolo11m".into());
         ok.validate().unwrap();
         // RF-DETR base: patch 14 x 4 windows.
-        let mut rf = TrainRecipe::new(TrainFamily::Rfdetr, "base", 5).unwrap();
+        let mut rf = TrainRecipe::new(TrainFamily::Rfdetr, "base").unwrap();
         rf.imgsz = 640;
         assert!(
             rf.validate()
@@ -359,7 +419,7 @@ mod tests {
 
     #[test]
     fn recipe_round_trips_as_json() {
-        let mut r = TrainRecipe::new(TrainFamily::Rtdetrv2, "m", 30).unwrap();
+        let mut r = TrainRecipe::new(TrainFamily::Rtdetrv2, "m").unwrap();
         r.lr = Some(2e-4);
         r.augment = Augment::NIGHT;
         let text = serde_json::to_string(&r).unwrap();
@@ -367,6 +427,62 @@ mod tests {
         let back: TrainRecipe = serde_json::from_str(&text).unwrap();
         assert_eq!(back, r);
         assert!(!r.augment.is_off());
+    }
+
+    #[test]
+    fn recommended_starting_points_per_family() {
+        let row = |f| {
+            let r = recommended(f);
+            (r.epochs, r.patience, r.min_epochs, r.min_delta, r.lr)
+        };
+        for f in [
+            TrainFamily::Yolo26,
+            TrainFamily::Yolo11,
+            TrainFamily::Yolov8,
+        ] {
+            assert_eq!(row(f), (100, 15, 10, 0.001, None), "{f}");
+        }
+        assert_eq!(row(TrainFamily::Rfdetr), (100, 10, 10, 0.001, None));
+        for f in [TrainFamily::Rtdetrv2, TrainFamily::Dfine] {
+            assert_eq!(row(f), (80, 10, 10, 0.001, None), "{f}");
+        }
+        assert_eq!(recommended(TrainFamily::Rfdetr).min_delta_f64(), 0.001);
+        for f in TrainFamily::ALL {
+            let r = TrainRecipe::new(f, f.sizes()[0]).unwrap();
+            let rec = recommended(f);
+            assert_eq!(
+                (r.epochs, r.patience, r.lr),
+                (rec.epochs, rec.patience, rec.lr)
+            );
+            assert!(r.early_stopping(), "{f}");
+            r.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn patience_bounds_and_early_stopping() {
+        let mut r = TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap();
+        r.epochs = 10;
+        r.patience = 10;
+        r.validate().unwrap();
+        assert!(!r.early_stopping(), "patience = epochs never fires");
+        r.patience = 0;
+        r.validate().unwrap();
+        assert!(!r.early_stopping());
+        r.patience = 3;
+        assert!(r.early_stopping());
+        r.patience = 11;
+        assert!(
+            r.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("patience (11)")
+        );
+        // A recipe queued before `patience` existed: off.
+        let mut v = serde_json::to_value(&r).unwrap();
+        v.as_object_mut().unwrap().remove("patience");
+        let old: TrainRecipe = serde_json::from_value(v).unwrap();
+        assert_eq!(old.patience, 0);
     }
 
     #[test]

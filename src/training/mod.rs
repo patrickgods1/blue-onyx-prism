@@ -25,6 +25,7 @@ pub mod autolabel;
 pub mod bench;
 pub mod capability;
 pub mod cli;
+pub mod compare;
 pub mod config;
 pub mod dataset;
 pub mod estimate;
@@ -184,9 +185,57 @@ fn workers() -> u32 {
     u32::try_from(cpus.saturating_sub(1).clamp(1, 8)).unwrap_or(2)
 }
 
+/// The dataset options of `request` on `config`: the `training` section's assembly defaults
+/// with the request's scene, classes, renames, excluded mode and balance. The job
+/// ([`plan_job`]) and [`preview_plan`] both build them here, so a preview is the run's plan.
+pub fn options_for(config: &Config, request: &TrainRequest) -> dataset::Options {
+    let t = &config.training;
+    let base = dataset::Options {
+        negative_share: t.negative_share,
+        heldout_share: t.heldout_share,
+        oversample: t.oversample,
+        ..dataset::Options::default()
+    };
+    job::request_options(&base, request)
+}
+
+/// The plan a run of `request` would train on, without writing anything: the sources read like
+/// the job reads them (relative dataset paths against the data root, `training.datasets` when
+/// the request names none) and [`options_for`]. The public subset is read only when it is
+/// installed; asked for but missing, the plan leaves it out and says so first in its warnings.
+pub fn preview_plan(config: &Config, request: &TrainRequest) -> Result<dataset::Plan> {
+    request.balance.validate()?;
+    let datasets = if request.datasets.is_empty() {
+        &config.training.datasets
+    } else {
+        &request.datasets
+    };
+    if datasets.is_empty() {
+        bail!(
+            "no dataset: choose a review export folder or set training.datasets (export reviewed \
+             frames from the Review page in YOLO format first)"
+        );
+    }
+    let datasets: Vec<PathBuf> = datasets.iter().map(|d| config.data_path(d)).collect();
+    let root = config.data_root();
+    let public_dir = public_subset_dir(&root);
+    let public = request.include_public && public_subset_installed(&root);
+    let sources = job::read_sources(&datasets, public.then_some(public_dir.as_path()))?;
+    let mut plan = dataset::plan(&sources, &options_for(config, request))?;
+    if request.include_public && !public {
+        plan.warnings.insert(
+            0,
+            "the public night subset is not downloaded yet: this preview leaves it out (the run \
+             downloads and mixes it in, repeating your frames training.oversample times)"
+                .into(),
+        );
+    }
+    Ok(plan)
+}
+
 /// Build the job of `request` on `config` and `cap` (see the checks below; `request.gpu` picks
 /// one of `cap`'s GPUs, else the automatic pick). `name`: the model name, default
-/// `night-<model>-<stamp>` / `custom-<model>-<stamp>`.
+/// `<scene label>-<model>-<stamp>` (`custom-`, `day-`, `night-`, ...).
 pub fn plan_job(
     config: &Config,
     mut request: TrainRequest,
@@ -230,11 +279,10 @@ pub fn plan_job(
         .map(|d| config.data_path(d))
         .collect();
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
-    let night = request.scene == dataset::SceneFilter::NightIr;
     let name = name
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| request.recipe.default_name(night, &stamp));
+        .unwrap_or_else(|| request.recipe.default_name(request.scene.label(), &stamp));
     recipe::valid_model_name(&name)?;
     let paths = TrainPaths::for_config(config);
     request.install_dir = request
@@ -268,8 +316,10 @@ pub fn plan_job(
     {
         bail!("the config already has a model named {name}; choose another name");
     }
+    request.balance.validate()?;
     let id = service::new_run_id();
     let t = &config.training;
+    let options = options_for(config, &request);
     Ok(TrainJob {
         run_dir: training_dir(config).join(&id),
         id,
@@ -278,12 +328,7 @@ pub fn plan_job(
         paths,
         platform: Platform::current(),
         accelerator: accel,
-        options: dataset::Options {
-            negative_share: t.negative_share,
-            heldout_share: t.heldout_share,
-            oversample: t.oversample,
-            ..dataset::Options::default()
-        },
+        options,
         root: config.data_root(),
         timeout: Duration::from_secs(u64::from(t.timeout_hours) * 3600),
         workers: workers(),
@@ -341,7 +386,7 @@ mod tests {
         };
         assert_eq!(size(&cap).suggested_batch, Some(4));
         assert!(!size(&cap).measured);
-        let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano", 1).unwrap();
+        let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
         r.batch = 4;
         let mut other = r.clone();
         other.imgsz = 448;
@@ -370,17 +415,114 @@ mod tests {
 
     fn request(family: TrainFamily, size: &str) -> TrainRequest {
         TrainRequest {
-            recipe: TrainRecipe::new(family, size, 1).unwrap(),
+            recipe: TrainRecipe {
+                epochs: 1,
+                patience: 0,
+                ..TrainRecipe::new(family, size).unwrap()
+            },
             datasets: vec!["exports/a".into()],
             include_public: false,
-            scene: dataset::SceneFilter::NightIr,
+            scene: dataset::SceneFilter::NIGHT_IR,
             classes: None,
             rename: Default::default(),
             benchmark_sets: Vec::new(),
             allow_large: false,
             install_dir: None,
             gpu: None,
+            excluded: Default::default(),
+            balance: Default::default(),
+            compare_group: None,
         }
+    }
+
+    /// A review export of `n` frames per camera / day (flat names: scene, camera, date), every
+    /// fourth one empty, one raccoon per IR group.
+    fn tiny_export(dir: &Path) {
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("classes.txt"), "person\nraccoon\n").unwrap();
+        for cam in ["a", "b", "c"] {
+            for (scene, date, n) in [("day", "2026-10-01", 9), ("ir", "2026-10-02", 3)] {
+                for i in 0..n {
+                    let stem = format!("{scene}.{cam}.{date}.f{i}");
+                    std::fs::write(dir.join("images").join(format!("{stem}.jpg")), b"x").unwrap();
+                    let label = match (scene, i % 4) {
+                        (_, 3) => "",
+                        ("ir", 0) => "1 0.5 0.5 0.2 0.2\n",
+                        _ => "0 0.5 0.5 0.2 0.4\n",
+                    };
+                    std::fs::write(dir.join("labels").join(format!("{stem}.txt")), label).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_plan_is_the_jobs_plan() {
+        let root = std::env::temp_dir().join(format!("bop-preview-{}", uuid::Uuid::new_v4()));
+        tiny_export(&root.join("exports").join("a"));
+        let c = Config {
+            download_dir: Some(root.clone()),
+            ..Config::default()
+        };
+        let mut req = request(TrainFamily::Yolo26, "n");
+        req.scene = dataset::SceneFilter::ALL_SCENES;
+        req.balance = dataset::Balance {
+            axes: dataset::Balance::parse_axes("class,scene").unwrap(),
+            cap_dominant: Some(3.0),
+            ..dataset::Balance::default()
+        };
+        let preview = preview_plan(&c, &req).unwrap();
+        assert!(preview.balance.is_some());
+        // What the job's dataset stage plans: its sources and options.
+        let j = plan_job(&c, req.clone(), &mac(), None).unwrap();
+        assert_eq!(j.options.balance, req.balance);
+        assert_eq!(j.options, options_for(&c, &req));
+        let sources = job::read_sources(&j.request.datasets, None).unwrap();
+        let job_plan =
+            dataset::plan(&sources, &job::request_options(&j.options, &j.request)).unwrap();
+        assert_eq!(preview, job_plan);
+        // training.datasets when the request names none.
+        let mut cfg = c.clone();
+        cfg.training.datasets = vec!["exports/a".into()];
+        let mut bare = req.clone();
+        bare.datasets.clear();
+        assert_eq!(preview_plan(&cfg, &bare).unwrap(), preview);
+        // The public subset, not downloaded: left out and said first.
+        let mut public = req.clone();
+        public.include_public = true;
+        let p = preview_plan(&c, &public).unwrap();
+        assert!(p.warnings[0].contains("not downloaded"), "{:?}", p.warnings);
+        assert_eq!(p.train, preview.train);
+        // Nothing was written.
+        assert!(!training_dir(&c).exists());
+        // A bad balance or no dataset: refused.
+        let mut bad = req.clone();
+        bad.balance.max_repeat = 0;
+        assert!(preview_plan(&c, &bad).is_err());
+        assert!(plan_job(&c, bad, &mac(), None).is_err());
+        let e = preview_plan(&c, &bare).unwrap_err().to_string();
+        assert!(e.contains("no dataset"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn requests_without_balance_read_as_off() {
+        let req = request(TrainFamily::Yolo26, "n");
+        let mut v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("balance").is_none(), "off is not written: {v}");
+        v.as_object_mut().unwrap().remove("balance");
+        let old: TrainRequest = serde_json::from_value(v).unwrap();
+        assert!(old.balance.is_off());
+        assert_eq!(old, req);
+        let mut on = req.clone();
+        on.balance.axes = dataset::Balance::parse_axes("camera-day").unwrap();
+        let text = serde_json::to_string(&on).unwrap();
+        assert!(
+            text.contains(r#""balance":{"axes":["camera-day"]"#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<TrainRequest>(&text).unwrap(), on);
     }
 
     #[test]

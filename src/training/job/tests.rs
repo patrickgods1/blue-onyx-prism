@@ -71,10 +71,21 @@ impl CommandRunner for TrainFake {
             r#"@train {"event":"start","device":"mps","train_images":20,"valid_images":2,"epochs":2}"#,
         );
         if self.hang {
-            while !cancel.load(Ordering::Relaxed) {
+            // Like the script: an epoch, then waiting; the stop file (Finish now) ends training.
+            on_line(r#"@train {"event":"epoch","epoch":1,"epochs":2,"loss":2.0,"map":0.3}"#);
+            let stop = arg_after(cmd, "--stop-file").unwrap();
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(anyhow!(Cancelled));
+                }
+                if stop.exists() {
+                    on_line(
+                        r#"@train {"event":"stop","reason":"finish","epoch":1,"best_epoch":1,"best":0.3}"#,
+                    );
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            return Err(anyhow!(Cancelled));
         }
         let batch: u32 = arg_after(cmd, "--batch")
             .and_then(|b| b.to_str().and_then(|b| b.parse().ok()))
@@ -248,7 +259,9 @@ fn job(
     if !exp.join("classes.txt").exists() {
         export(&exp);
     }
-    let mut recipe = TrainRecipe::new(family, size, 2).unwrap();
+    let mut recipe = TrainRecipe::new(family, size).unwrap();
+    recipe.epochs = 2;
+    recipe.patience = 1;
     recipe.augment = crate::training::Augment::NIGHT;
     TrainJob {
         id: format!("run-{}", uuid::Uuid::new_v4().simple()),
@@ -256,13 +269,16 @@ fn job(
             recipe,
             datasets: vec![exp],
             include_public: false,
-            scene: SceneFilter::NightIr,
+            scene: SceneFilter::NIGHT_IR,
             classes: None,
             rename: BTreeMap::new(),
             benchmark_sets: vec!["nir-night".into()],
             allow_large: false,
             install_dir: None,
             gpu: None,
+            excluded: Default::default(),
+            balance: Default::default(),
+            compare_group: None,
         },
         name: format!("night-{}-test", family.base_name(size)),
         paths: TrainPaths::new(root, root.join("models")),
@@ -699,7 +715,7 @@ fn out_of_memory_after_the_first_epochs_or_at_batch_1_is_not_retried() {
 
 #[test]
 fn multi_scale_auto_turns_off_when_batch_4_does_not_fit() {
-    let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano", 1).unwrap();
+    let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
     // 16 GB Mac share: batch 4 fits with multi-scale.
     assert!(r.multi_scale_on(9830));
     // 6 GB: batch 4 at 544 px does not (1500 + 4 x 650 x 2.0 = 6.7 GB > 5.4 GB).
@@ -708,11 +724,11 @@ fn multi_scale_auto_turns_off_when_batch_4_does_not_fit() {
     assert!(r.multi_scale_on(6144));
     r.multi_scale = super::super::recipe::MultiScale::Off;
     assert!(!r.multi_scale_on(100_000));
-    let y = TrainRecipe::new(TrainFamily::Yolo26, "n", 1).unwrap();
+    let y = TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap();
     assert!(!y.multi_scale_on(100_000));
     // Stored only when not auto.
     let text =
-        serde_json::to_string(&TrainRecipe::new(TrainFamily::Rfdetr, "nano", 1).unwrap()).unwrap();
+        serde_json::to_string(&TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap()).unwrap();
     assert!(!text.contains("multi_scale"), "{text}");
     assert!(
         serde_json::to_string(&r)
@@ -933,7 +949,7 @@ fn a_failed_benchmark_keeps_the_model() {
 
 #[test]
 fn classify_names_the_gpu_failures() {
-    let r = TrainRecipe::new(TrainFamily::Yolo26, "m", 1).unwrap();
+    let r = TrainRecipe::new(TrainFamily::Yolo26, "m").unwrap();
     let l = |s: &str| vec![s.to_string()];
     assert!(
         classify_train_failure(&l("RuntimeError: MPS backend out of memory"), &r)
@@ -1014,4 +1030,65 @@ fn the_queue_runs_one_at_a_time_cancels_and_persists() {
     let back = service::load_records(&store);
     assert_eq!(back[0].state, RunState::Failed);
     assert!(back[0].error.as_deref().unwrap().contains("interrupted"));
+}
+
+#[test]
+fn finish_now_writes_the_stop_file_and_the_run_exports_its_best_epoch() {
+    let t = tmp("finish");
+    let fake = Arc::new(TrainFake {
+        hang: true,
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(NoHooks), None);
+    let mut a = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    a.run_dir = t.0.join("training/a");
+    // A stale request of an earlier attempt does not end this one.
+    std::fs::create_dir_all(a.run_dir.join("work")).unwrap();
+    std::fs::write(stop_file(&a.run_dir), "old").unwrap();
+    let mut b = job(&t.0, TrainFamily::Yolo26, "s", mps(), Platform::MACOS_ARM64);
+    b.run_dir = t.0.join("training/b");
+    let ida = svc.enqueue(a).unwrap();
+    let idb = svc.enqueue(b).unwrap();
+    assert!(svc.finish(&idb).unwrap_err().contains("only a running run"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while svc
+        .get(&ida)
+        .unwrap()
+        .progress
+        .is_none_or(|p| p.history.is_empty())
+    {
+        assert!(Instant::now() < deadline, "{:?}", svc.get(&ida));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let args = fake.train_cmds.lock().unwrap().last().unwrap().clone();
+    for (k, v) in [
+        ("--patience", "1"),
+        ("--min-epochs", "10"),
+        ("--min-delta", "0.001"),
+    ] {
+        assert_eq!(arg_after(&args, k).unwrap(), PathBuf::from(v), "{k}");
+    }
+    let stop = arg_after(&args, "--stop-file").unwrap();
+    assert_eq!(PathBuf::from(&stop), stop_file(&t.0.join("training/a")));
+    assert!(!stop.exists(), "the stale request was removed");
+    // Paused: finishing resumes it.
+    assert!(svc.pause(&ida));
+    let msg = svc.finish(&ida).unwrap();
+    assert!(msg.contains("after the current epoch"), "{msg}");
+    assert!(stop.exists());
+    let r = svc.wait(&ida, Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Done, "{}", r.describe());
+    let p = r.progress.unwrap();
+    assert_eq!(
+        p.stopped,
+        Some(crate::training::progress::Stop {
+            reason: "finish".into(),
+            epoch: 1,
+            best_epoch: 1
+        })
+    );
+    let e = svc.finish(&ida).unwrap_err();
+    assert!(e.contains("only a running run"), "{e}");
+    assert!(svc.cancel(&idb));
+    svc.shutdown();
 }

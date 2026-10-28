@@ -4,7 +4,8 @@
 //! import (`import`) and auto-labelling (`autolabel`, also the self-training re-label).
 
 use super::capability::{self, Capability};
-use super::dataset::{self, SceneFilter};
+use super::compare::{self, CompareRun};
+use super::dataset::{self, Excluded, SceneFilter};
 use super::estimate;
 use super::job::{BenchSummary, Hooks, TrainOutput, TrainRequest};
 use super::recipe::{self, Augment, TrainRecipe};
@@ -53,14 +54,28 @@ pub enum TrainCommand {
         #[command(flatten)]
         data: DataArgs,
         /// Output folder (must not exist or be empty).
+        #[arg(long, required_unless_present = "dry_run")]
+        out: Option<PathBuf>,
+        /// Plan only: print the split and the balance report (images per epoch, boxes and frames
+        /// per class, frames per scene, top cameras) and write nothing.
         #[arg(long)]
-        out: PathBuf,
+        dry_run: bool,
         /// With --public: allow downloading the public night subset (about 926 MB, over the
         /// 500 MB limit). Also config `allow_large_downloads`.
         #[arg(long)]
         allow_large: bool,
     },
+    /// The classes of the datasets with their box counts per scene (day / night / ir).
+    Classes(ClassesArgs),
     /// Train one model or several in a row, export, install, add to the config and benchmark.
+    ///
+    /// Several --scene values (or several --model x --scene) queue one run per scene, share a
+    /// comparison group and are benchmarked on the same held-out frames; a table of AP per scene
+    /// is printed at the end. With early stopping on (the default) --epochs is a cap: a run
+    /// stops once the validation mAP has not improved for --patience epochs and exports its best
+    /// checkpoint. A running training can be finished early, keeping the best checkpoint, from
+    /// the Training page (Finish now) or by creating the file `<run dir>/work/stop-request`
+    /// (the run dir is under the training folder, see `train list`). Ctrl-C cancels instead.
     Run {
         /// Model label, repeatable (runs one after the other): yolo26n, yolo11s, yolov8m,
         /// rfdetr-nano, rt-detrv2-s, dfine-s, ...
@@ -68,8 +83,15 @@ pub enum TrainCommand {
         models: Vec<String>,
         #[command(flatten)]
         data: DataArgs,
+        /// Most epochs (default: the family's recommendation: YOLO 100, RF-DETR 100,
+        /// RT-DETRv2 / D-FINE 80; config `training.epochs`).
         #[arg(long)]
         epochs: Option<u32>,
+        /// Epochs without validation-mAP improvement before the run stops and keeps its best
+        /// checkpoint; 0 = off (default: the family's recommendation: YOLO 15, others 10; config
+        /// `training.patience`). At most --epochs.
+        #[arg(long)]
+        patience: Option<u32>,
         /// Images per batch (default: the largest the GPU fits by the estimate, at most 16).
         #[arg(long)]
         batch: Option<u32>,
@@ -92,7 +114,8 @@ pub enum TrainCommand {
         aug_noise: Option<f32>,
         #[arg(long)]
         aug_gray: Option<f32>,
-        /// Model name (only with one --model; default night-<model>-<stamp> or custom-...).
+        /// Model name (only with one --model and one --scene; default <scene>-<model>-<stamp>:
+        /// custom-, day-, night-, ...).
         #[arg(long)]
         name: Option<String>,
         /// Allow downloads over 500 MB: the training environment and, with --public, the public
@@ -553,22 +576,122 @@ pub struct DataArgs {
     /// Review export folder (YOLO layout), repeatable. Default: `training.datasets`.
     #[arg(long = "dataset")]
     pub datasets: Vec<PathBuf>,
-    /// all, day or night+ir.
-    #[arg(long, default_value = "all", value_parser = parse_scene)]
-    pub scene: SceneFilter,
-    /// The model's classes in head order, comma-separated (default: every class of the datasets).
+    /// Scenes of the training frames: all, or scenes joined by `+`: day, night, ir (default all).
+    /// Behaviour change: `night` alone is night frames only and `ir` IR frames only; use
+    /// `night+ir` for both (the old `night`). The held-out frames always keep every scene.
+    /// Repeat the flag (`run --scene day --scene night+ir --scene all`) for one run per scene
+    /// that are compared on the same held-out frames; `prepare` takes one.
+    #[arg(long, value_parser = parse_scene)]
+    pub scene: Vec<SceneFilter>,
+    /// The model's classes in head order, comma-separated and/or repeated (default: every class
+    /// of the datasets; `train classes` lists them).
     #[arg(long, value_delimiter = ',')]
     pub classes: Vec<String>,
+    /// What happens to an object of a label that is not in --classes: `background` (the frame
+    /// stays, the object is background) or `drop-frame` (frames holding one are left out of
+    /// training, so a look-alike is never taught as background; warns above 30 % dropped).
+    #[arg(long, default_value = "background", value_parser = parse_excluded)]
+    pub excluded: Excluded,
     /// Rename a label, `from=to` (empty `to` drops it), repeatable.
     #[arg(long, value_parser = parse_rename)]
     pub rename: Vec<(String, String)>,
     /// Mix in the pinned public night subset (train-data:lila-night).
     #[arg(long)]
     pub public: bool,
+    /// Balance the training frames over these axes, comma-separated and/or repeated: `class`,
+    /// `scene`, `camera`, `camera-day` (the days within each camera), or `off`. Rare groups get
+    /// their existing frames repeated (oversampling, no new information): `class` in the style
+    /// of LVIS repeat-factor sampling (a frame takes the largest factor of its classes), `scene`
+    /// evens out day / night / IR, `camera` and `camera-day` even out cameras and the days of
+    /// each. A group g repeats (largest / g)^strength times. The share of empty frames is kept.
+    /// Held-out and validation frames are never balanced. Default: `training.balance`, else off.
+    #[arg(long, value_delimiter = ',')]
+    pub balance: Vec<String>,
+    /// How hard --balance equalises, 0..1: 0.5 (default) is the square root of the ratio, 1 full
+    /// equalisation.
+    #[arg(long)]
+    pub balance_strength: Option<f32>,
+    /// Most times balancing repeats one frame, 1..10 (default 4).
+    #[arg(long)]
+    pub balance_max_repeat: Option<u32>,
+    /// Also cap dominant groups: a group keeps at most this many times the median group size
+    /// (at least 1; 3 is a good start). The cap DROPS frames of the larger groups, never
+    /// reviewer-confirmed hard negatives and never the last box of a class.
+    #[arg(long)]
+    pub balance_cap: Option<f32>,
+}
+
+impl DataArgs {
+    /// The balancing of the run: the flags over `training.balance` (the default when no
+    /// `--balance` is given), else off. Validated.
+    pub fn balance(&self, config: &Config) -> Result<dataset::Balance> {
+        let mut b = config.training.balance.clone().unwrap_or_default();
+        if !self.balance.is_empty() {
+            b.axes = dataset::Balance::parse_axes(&self.balance.join(","))?;
+        }
+        if let Some(s) = self.balance_strength {
+            b.strength = s;
+        }
+        if let Some(m) = self.balance_max_repeat {
+            b.max_repeat = m;
+        }
+        if let Some(c) = self.balance_cap {
+            b.cap_dominant = Some(c);
+        }
+        b.validate()?;
+        Ok(b)
+    }
+
+    /// The distinct scene filters in the order given; `all` when none was.
+    pub fn scenes(&self) -> Vec<SceneFilter> {
+        let mut v: Vec<SceneFilter> = Vec::new();
+        for s in &self.scene {
+            if !v.contains(s) {
+                v.push(*s);
+            }
+        }
+        if v.is_empty() {
+            v.push(SceneFilter::ALL_SCENES);
+        }
+        v
+    }
+
+    /// The classes, trimmed, without empty entries.
+    pub fn class_list(&self) -> Option<Vec<String>> {
+        let v: Vec<String> = self
+            .classes
+            .iter()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        (!v.is_empty()).then_some(v)
+    }
+}
+
+/// `train classes`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ClassesArgs {
+    /// Review export folder (YOLO layout), repeatable. Default: `training.datasets`.
+    #[arg(long = "dataset")]
+    pub datasets: Vec<PathBuf>,
+    /// Add an "in scope" column: the boxes of these scenes (all, or day, night, ir joined by `+`).
+    #[arg(long, value_parser = parse_scene)]
+    pub scene: Option<SceneFilter>,
+    /// Rename a label, `from=to` (empty `to` drops it), repeatable.
+    #[arg(long, value_parser = parse_rename)]
+    pub rename: Vec<(String, String)>,
+    /// Print JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+fn parse_excluded(s: &str) -> Result<Excluded, String> {
+    Excluded::parse(s).ok_or_else(|| format!("'{s}' is not background or drop-frame"))
 }
 
 fn parse_scene(s: &str) -> Result<SceneFilter, String> {
-    SceneFilter::parse(s).ok_or_else(|| format!("'{s}' is not all, day or night+ir"))
+    SceneFilter::parse(s)
+        .ok_or_else(|| format!("'{s}' is not all or scenes joined by + (day, night, ir)"))
 }
 
 fn parse_rename(s: &str) -> Result<(String, String), String> {
@@ -631,7 +754,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             );
             let imgsz = imgsz.unwrap_or_else(|| family.default_imgsz(size));
             let batch = batch.unwrap_or(8);
-            let epochs = epochs.unwrap_or(config.training.epochs);
+            let epochs = epochs.unwrap_or(config.training.epochs_for(family));
             match estimate::estimate(family, size, imgsz, batch, images, epochs, target) {
                 Some(e) => println!(
                     "{} {size} at {imgsz} px, batch {batch}, {images} images x {epochs} epochs: about {} MB of GPU memory, {} per epoch, {} in total ({}; rough estimate)",
@@ -650,12 +773,25 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
         TrainCommand::Prepare {
             data,
             out,
+            dry_run,
             allow_large,
         } => {
-            if data.public {
+            if data.public && !dry_run {
                 fetch_public(&config, allow_large || config.allow_large_downloads)?;
             }
-            let (sources, opts) = read_sources(&config, &data)?;
+            let [scene] = data.scenes()[..] else {
+                bail!("prepare takes one --scene (train run compares several)");
+            };
+            if dry_run {
+                let request = preview_request(&config, &data, scene)?;
+                let plan = super::preview_plan(&config, &request)?;
+                println!("{}", dry_run_text(&plan, &request.balance));
+                return Ok(true);
+            }
+            let Some(out) = out else {
+                bail!("--out <folder> is required (or --dry-run)");
+            };
+            let (sources, opts) = read_sources(&config, &data, scene)?;
             let plan = dataset::plan(&sources, &opts)?;
             let prepared = dataset::write(&sources, &plan, &opts, &out)?;
             println!(
@@ -666,6 +802,9 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 prepared.heldout_images,
                 prepared.classes.join(", ")
             );
+            if let Some(b) = &prepared.balance_summary {
+                println!("balanced: {b}");
+            }
             if let Some(h) = &prepared.heldout_dir {
                 println!("held-out benchmark set: dir:{}", h.display());
             }
@@ -678,6 +817,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             models,
             data,
             epochs,
+            patience,
             batch,
             imgsz,
             lr,
@@ -696,9 +836,13 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             keep_work,
             verbose,
         } => {
-            if name.is_some() && models.len() > 1 {
-                bail!("--name needs exactly one --model");
+            let scenes = data.scenes();
+            if name.is_some() && (models.len() > 1 || scenes.len() > 1) {
+                bail!("--name needs exactly one --model and one --scene");
             }
+            // Several runs of different scenes are compared on the same held-out frames.
+            let group = (scenes.len() > 1)
+                .then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
             // A chosen GPU: its lane, memory and suggested batches.
             let cap = super::capability_now().for_gpu(gpu.as_deref())?;
             eprintln!("{}", cap.summary());
@@ -732,12 +876,18 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 noise: aug_noise.unwrap_or(base.noise),
                 gray: aug_gray.unwrap_or(base.gray),
             };
+            let balance = data.balance(&config)?;
+            if !balance.is_off() {
+                eprintln!("balance: {}", balance.describe());
+            }
             let mut jobs = Vec::new();
             for m in &models {
                 let (family, size) = recipe::parse_label(m)
                     .with_context(|| format!("unknown model label '{m}' (e.g. yolo26n, rfdetr-nano, rt-detrv2-s, dfine-s)"))?;
-                let mut r =
-                    TrainRecipe::new(family, size, epochs.unwrap_or(config.training.epochs))?;
+                let mut r = TrainRecipe::new(family, size)?;
+                r.epochs = epochs.unwrap_or(config.training.epochs_for(family));
+                r.patience =
+                    patience.unwrap_or_else(|| config.training.patience_for(family).min(r.epochs));
                 if let Some(i) = imgsz {
                     r.imgsz = i;
                 }
@@ -751,21 +901,32 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 r.lr = lr;
                 r.augment = augment;
                 r.multi_scale = recipe::MultiScale::parse(&multi_scale).unwrap_or_default();
-                let req = TrainRequest {
-                    recipe: r,
-                    datasets: data.datasets.clone(),
-                    include_public: data.public,
-                    scene: data.scene,
-                    classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
-                    rename: data.rename.iter().cloned().collect::<BTreeMap<_, _>>(),
-                    benchmark_sets: benchmark_sets.clone(),
-                    allow_large,
-                    install_dir: install_dir.clone(),
-                    gpu: gpu.clone(),
-                };
-                let mut job = super::plan_job(&config, req, &cap, name.clone())?;
-                job.keep_work = keep_work;
-                jobs.push(job);
+                for scene in &scenes {
+                    let req = TrainRequest {
+                        recipe: r.clone(),
+                        datasets: data.datasets.clone(),
+                        include_public: data.public,
+                        scene: *scene,
+                        classes: data.class_list(),
+                        rename: data.rename.iter().cloned().collect::<BTreeMap<_, _>>(),
+                        benchmark_sets: benchmark_sets.clone(),
+                        allow_large,
+                        install_dir: install_dir.clone(),
+                        gpu: gpu.clone(),
+                        excluded: data.excluded,
+                        balance: balance.clone(),
+                        compare_group: group.clone(),
+                    };
+                    let mut job = super::plan_job(&config, req, &cap, name.clone())?;
+                    job.keep_work = keep_work;
+                    jobs.push(job);
+                }
+            }
+            if jobs.len() > 1 {
+                eprintln!("queued {} runs:", jobs.len());
+                for j in &jobs {
+                    eprintln!("  {} ({})", j.name, j.request.scene.as_str());
+                }
             }
             let hooks: Arc<dyn Hooks> = Arc::new(CliHooks {
                 config_path: path.clone(),
@@ -787,6 +948,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 .map(|j| svc.enqueue(j).map_err(anyhow::Error::msg))
                 .collect::<Result<_>>()?;
             let mut ok = true;
+            let mut finished: Vec<service::RunRecord> = Vec::new();
             for id in &ids {
                 let mut last = (None, 0u8, String::new());
                 let mut last_print = std::time::Instant::now();
@@ -797,12 +959,14 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                             svc.cancel(i);
                         }
                     }
-                    if verbose {
-                        for l in r.log.iter().skip(seen_log.min(r.log.len())) {
+                    for l in r.log.iter().skip(seen_log.min(r.log.len())) {
+                        if verbose {
                             eprintln!("    {l}");
+                        } else if l.starts_with("dataset: balanced:") {
+                            eprintln!("[{}] {}", r.name, l.trim_start_matches("dataset: "));
                         }
-                        seen_log = r.log.len();
                     }
+                    seen_log = r.log.len();
                     // One line per stage or percent change, else at most every 10 s.
                     let line = format!("[{}] {:>3}% {}", r.name, r.percent, r.describe());
                     let key = (r.stage, r.percent, line.clone());
@@ -818,12 +982,39 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                     if !r.state.is_busy() {
                         report_run(&r);
                         ok &= r.state == RunState::Done;
+                        finished.push(r);
                         break;
                     }
                 }
             }
             svc.shutdown();
+            if group.is_some() {
+                println!();
+                println!("{}", compare_text(&finished));
+            }
             Ok(ok)
+        }
+        TrainCommand::Classes(a) => {
+            let dirs = if a.datasets.is_empty() {
+                config.training.datasets.clone()
+            } else {
+                a.datasets.clone()
+            };
+            if dirs.is_empty() {
+                bail!("no dataset: pass --dataset <review export folder> or set training.datasets");
+            }
+            let mut sources = Vec::new();
+            for d in dirs {
+                sources.push(dataset::read_export(&config.data_path(&d))?);
+            }
+            let rename: BTreeMap<String, String> = a.rename.iter().cloned().collect();
+            let inv = dataset::inventory(&sources, &rename);
+            if a.json {
+                println!("{}", classes_json(&inv, a.scene)?);
+            } else {
+                print!("{}", classes_text(&inv, a.scene));
+            }
+            Ok(true)
         }
         TrainCommand::Import(a) => {
             let Some(req) = import_request(&a)? else {
@@ -950,6 +1141,100 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
     }
 }
 
+/// The comparison table of the finished runs of a `--scene` group.
+fn compare_text(runs: &[service::RunRecord]) -> String {
+    let runs: Vec<CompareRun> = runs
+        .iter()
+        .map(|r| CompareRun {
+            name: r.name.clone(),
+            model: r.request.recipe.label(),
+            scene: r.request.scene,
+            classes: r.dataset.as_ref().map_or_else(
+                || r.request.classes.clone().unwrap_or_default(),
+                |d| d.classes.clone(),
+            ),
+            excluded: r.request.excluded,
+            balance: r.request.balance.clone(),
+            best_epoch: r
+                .progress
+                .as_ref()
+                .and_then(|p| p.best.as_ref())
+                .map(|b| b.epoch),
+            stopped_epoch: r
+                .progress
+                .as_ref()
+                .and_then(|p| p.stopped.as_ref())
+                .map(|s| s.epoch),
+            bench: r.benchmark.clone(),
+        })
+        .collect();
+    compare::compare(&runs).render_text()
+}
+
+/// Boxes of `c` in the scenes of `f` (unknown-scene boxes only for `all`).
+fn boxes_in_scope(c: &dataset::ClassCount, f: SceneFilter) -> usize {
+    let s = &c.by_scene;
+    if f.is_all() {
+        return c.boxes;
+    }
+    [(f.day, s.day), (f.night, s.night), (f.ir, s.ir)]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, n)| n)
+        .sum()
+}
+
+/// `train classes` as a table; `scene` adds the "in scope" column.
+fn classes_text(inv: &[dataset::ClassCount], scene: Option<SceneFilter>) -> String {
+    if inv.is_empty() {
+        return "no classes in these datasets\n".to_string();
+    }
+    let w = inv.iter().map(|c| c.name.len()).max().unwrap_or(5).max(5);
+    let mut s = format!(
+        "{:<w$}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}",
+        "class", "boxes", "frames", "day", "night", "ir", "unknown"
+    );
+    if let Some(f) = scene {
+        s.push_str(&format!("  {:>8}", format!("in {}", f.as_str())));
+    }
+    s.push('\n');
+    for c in inv {
+        s.push_str(&format!(
+            "{:<w$}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}",
+            c.name,
+            c.boxes,
+            c.frames,
+            c.by_scene.day,
+            c.by_scene.night,
+            c.by_scene.ir,
+            c.by_scene.unknown
+        ));
+        if let Some(f) = scene {
+            s.push_str(&format!("  {:>8}", boxes_in_scope(c, f)));
+        }
+        s.push('\n');
+    }
+    s
+}
+
+fn classes_json(inv: &[dataset::ClassCount], scene: Option<SceneFilter>) -> Result<String> {
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        #[serde(flatten)]
+        class: &'a dataset::ClassCount,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        in_scope: Option<usize>,
+    }
+    let rows: Vec<Row> = inv
+        .iter()
+        .map(|c| Row {
+            class: c,
+            in_scope: scene.map(|f| boxes_in_scope(c, f)),
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&rows)?)
+}
+
 fn report_run(r: &service::RunRecord) {
     println!("{}: {}", r.name, r.describe());
     if let Some(d) = &r.dataset {
@@ -1060,9 +1345,145 @@ fn fetch_public(config: &Config, allowed: bool) -> Result<()> {
     )
 }
 
+/// The request `train prepare --dry-run` plans: the data flags and the config's training
+/// defaults (the recipe does not matter for the plan).
+fn preview_request(config: &Config, data: &DataArgs, scene: SceneFilter) -> Result<TrainRequest> {
+    Ok(TrainRequest {
+        recipe: TrainRecipe::new(catalog::TrainFamily::Yolo26, "n")?,
+        datasets: data.datasets.clone(),
+        include_public: data.public,
+        scene,
+        classes: data.class_list(),
+        rename: data.rename.iter().cloned().collect(),
+        benchmark_sets: Vec::new(),
+        allow_large: false,
+        install_dir: None,
+        gpu: None,
+        excluded: data.excluded,
+        balance: data.balance(config)?,
+        compare_group: None,
+    })
+}
+
+/// Rows of a before / after table: `name  before -> after`, widest name first column.
+fn before_after<'a>(
+    out: &mut String,
+    title: &str,
+    unit: &str,
+    rows: impl IntoIterator<Item = (&'a str, usize, usize)>,
+) {
+    let rows: Vec<_> = rows.into_iter().collect();
+    if rows.is_empty() {
+        return;
+    }
+    let w = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
+    out.push_str(&format!("{title} ({unit}, before -> after):\n"));
+    for (name, b, a) in rows {
+        out.push_str(&format!("  {name:<w$}  {b:>7} -> {a:<7}\n"));
+    }
+}
+
+/// How many cameras / camera-days the dry run lists.
+const DRY_RUN_TOP: usize = 10;
+
+/// `train prepare --dry-run`: the split and, when balancing, what it does. Pure.
+pub fn dry_run_text(plan: &dataset::Plan, balance: &dataset::Balance) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "plan: {} training frames, {} validation, {} held-out; classes: {}\n",
+        plan.train.len(),
+        plan.valid.len(),
+        plan.heldout.len(),
+        plan.classes.join(", ")
+    ));
+    let Some(r) = &plan.balance else {
+        if !plan.stats.train_boxes.is_empty() {
+            out.push_str("training boxes per class:\n");
+            for (c, n) in &plan.stats.train_boxes {
+                out.push_str(&format!("  {c}: {n}\n"));
+            }
+        }
+        out.push_str("balance: off\n");
+        for w in &plan.warnings {
+            out.push_str(&format!("warning: {w}\n"));
+        }
+        return out;
+    };
+    out.push_str(&format!("balance: {}\n", balance.describe()));
+    out.push_str(&format!(
+        "images per epoch: {} -> {} ({} -> {} unique frames, {} capped, most repeats of a frame {})\n",
+        r.before.images, r.after.images, r.frames_before, r.frames_after, r.dropped, r.max_repeat
+    ));
+    out.push_str(&format!(
+        "empty frames: {:.1}% -> {:.1}% of the images\n",
+        r.before.negative_share * 100.0,
+        r.after.negative_share * 100.0
+    ));
+    let get = |m: &BTreeMap<String, usize>, k: &str| m.get(k).copied().unwrap_or(0);
+    let mut classes = String::new();
+    for c in r.before.boxes_per_class.keys() {
+        classes.push_str(&format!(
+            "  {c}: boxes {} -> {}, frames {} -> {}\n",
+            get(&r.before.boxes_per_class, c),
+            get(&r.after.boxes_per_class, c),
+            get(&r.before.frames_per_class, c),
+            get(&r.after.frames_per_class, c)
+        ));
+    }
+    if !classes.is_empty() {
+        out.push_str("per class:\n");
+        out.push_str(&classes);
+    }
+    before_after(
+        &mut out,
+        "frames per scene",
+        "images",
+        r.before
+            .frames_per_scene
+            .iter()
+            .map(|(k, b)| (k.as_str(), *b, get(&r.after.frames_per_scene, k))),
+    );
+    let mut cams: Vec<(&str, usize, usize)> = r
+        .before
+        .frames_per_camera
+        .iter()
+        .map(|(k, b)| (k.as_str(), *b, get(&r.after.frames_per_camera, k)))
+        .collect();
+    cams.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let more = cams.len().saturating_sub(DRY_RUN_TOP);
+    cams.truncate(DRY_RUN_TOP);
+    before_after(&mut out, "top cameras", "images", cams);
+    if more > 0 {
+        out.push_str(&format!("  ... and {more} more camera(s)\n"));
+    }
+    if balance.axes.contains(&dataset::BalanceAxis::CameraDay) {
+        let after: BTreeMap<&str, usize> = r
+            .after
+            .camera_days
+            .iter()
+            .map(|(k, n)| (k.as_str(), *n))
+            .collect();
+        before_after(
+            &mut out,
+            "top camera-days",
+            "images",
+            r.before
+                .camera_days
+                .iter()
+                .take(DRY_RUN_TOP)
+                .map(|(k, b)| (k.as_str(), *b, after.get(k.as_str()).copied().unwrap_or(0))),
+        );
+    }
+    for w in &plan.warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out
+}
+
 fn read_sources(
     config: &Config,
     data: &DataArgs,
+    scene: SceneFilter,
 ) -> Result<(Vec<dataset::Source>, dataset::Options)> {
     let dirs: Vec<PathBuf> = if data.datasets.is_empty() {
         config.training.datasets.clone()
@@ -1089,12 +1510,14 @@ fn read_sources(
     }
     let t = &config.training;
     let opts = dataset::Options {
-        classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
+        classes: data.class_list(),
         rename: data.rename.iter().cloned().collect(),
-        scene: data.scene,
+        scene,
+        excluded: data.excluded,
         negative_share: t.negative_share,
         heldout_share: t.heldout_share,
         oversample: t.oversample,
+        balance: data.balance(config)?,
         ..dataset::Options::default()
     };
     Ok((sources, opts))
@@ -1490,7 +1913,324 @@ mod tests {
             ("tree".into(), String::new())
         );
         assert!(parse_rename("=x").is_err());
-        assert_eq!(parse_scene("night+ir").unwrap(), SceneFilter::NightIr);
+        assert_eq!(parse_scene("night+ir").unwrap(), SceneFilter::NIGHT_IR);
+        assert_eq!(
+            parse_scene("night").unwrap(),
+            SceneFilter::new(false, true, false)
+        );
         assert!(parse_scene("dusk").is_err());
+    }
+
+    #[test]
+    fn scenes_excluded_classes_and_patience_parse() {
+        let TrainCommand::Run {
+            data,
+            patience,
+            epochs,
+            ..
+        } = parse(&[
+            "run",
+            "--model",
+            "yolo26n",
+            "--scene",
+            "day",
+            "--scene",
+            "night+ir",
+            "--scene",
+            "day",
+            "--excluded",
+            "drop-frame",
+            "--classes",
+            "person,car",
+            "--classes",
+            "dog",
+        ])
+        .unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(patience, None);
+        assert_eq!(epochs, None);
+        assert_eq!(
+            data.scenes(),
+            vec![SceneFilter::DAY, SceneFilter::NIGHT_IR],
+            "repeated, deduplicated, in order"
+        );
+        assert_eq!(data.excluded, Excluded::DropFrame);
+        assert_eq!(data.class_list().unwrap(), ["person", "car", "dog"]);
+
+        let TrainCommand::Run { data, patience, .. } =
+            parse(&["run", "--model", "yolo26n", "--patience", "0"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(patience, Some(0), "0 = early stopping off");
+        assert_eq!(data.scenes(), vec![SceneFilter::ALL_SCENES]);
+        assert_eq!(data.excluded, Excluded::Background);
+        assert_eq!(data.class_list(), None);
+        assert!(parse(&["run", "--model", "a", "--scene", "dusk"]).is_err());
+        assert!(parse(&["run", "--model", "a", "--excluded", "x"]).is_err());
+    }
+
+    #[test]
+    fn help_states_the_recommended_starting_points() {
+        // The `--epochs` / `--patience` help text is static; keep it in sync with the table.
+        use crate::resources::catalog::TrainFamily;
+        use recipe::recommended;
+        let y = recommended(TrainFamily::Yolo26);
+        let r = recommended(TrainFamily::Rfdetr);
+        let t = recommended(TrainFamily::Rtdetrv2);
+        assert_eq!(recommended(TrainFamily::Dfine).epochs, t.epochs);
+        assert_eq!((y.epochs, r.epochs, t.epochs), (100, 100, 80));
+        assert_eq!((y.patience, r.patience, t.patience), (15, 10, 10));
+    }
+
+    #[test]
+    fn classes_command_parses_and_tabulates() {
+        let TrainCommand::Classes(a) = parse(&[
+            "classes",
+            "--dataset",
+            "a",
+            "--dataset",
+            "b",
+            "--scene",
+            "night+ir",
+            "--rename",
+            "x=y",
+            "--json",
+        ])
+        .unwrap() else {
+            panic!("not classes")
+        };
+        assert_eq!(a.datasets.len(), 2);
+        assert_eq!(a.scene, Some(SceneFilter::NIGHT_IR));
+        assert!(a.json);
+
+        let dir = std::env::temp_dir().join(format!("bop-cli-classes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("classes.txt"), "person\ncar").unwrap();
+        let mut images = Vec::new();
+        for (name, label, scene) in [
+            ("a.jpg", "0 0.5 0.5 0.2 0.2\n1 0.3 0.3 0.1 0.1\n", "day"),
+            ("b.jpg", "0 0.5 0.5 0.2 0.2\n", "night"),
+            ("c.jpg", "0 0.5 0.5 0.2 0.2\n0 0.2 0.2 0.1 0.1\n", "ir"),
+        ] {
+            image::RgbImage::new(64, 48)
+                .save(dir.join("images").join(name))
+                .unwrap();
+            let stem = name.trim_end_matches(".jpg");
+            std::fs::write(dir.join("labels").join(format!("{stem}.txt")), label).unwrap();
+            images.push(
+                serde_json::json!({"file": name, "width": 64, "height": 48, "tags": [scene]}),
+            );
+        }
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({"images": images})).unwrap(),
+        )
+        .unwrap();
+        let sources = vec![dataset::read_export(&dir).unwrap()];
+        let inv = dataset::inventory(&sources, &BTreeMap::new());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let t = classes_text(&inv, None);
+        let person = t.lines().find(|l| l.starts_with("person")).unwrap();
+        assert_eq!(
+            person.split_whitespace().collect::<Vec<_>>(),
+            ["person", "4", "3", "1", "1", "2", "0"]
+        );
+        assert!(
+            !t.contains("in "),
+            "no in-scope column without --scene: {t}"
+        );
+        let t = classes_text(&inv, Some(SceneFilter::NIGHT_IR));
+        assert!(t.lines().next().unwrap().ends_with("in night+ir"));
+        let person = t.lines().find(|l| l.starts_with("person")).unwrap();
+        assert!(person.ends_with(" 3"), "{person}");
+        let car = t.lines().find(|l| l.starts_with("car")).unwrap();
+        assert!(car.ends_with(" 0"), "{car}");
+        let j: serde_json::Value =
+            serde_json::from_str(&classes_json(&inv, Some(SceneFilter::DAY)).unwrap()).unwrap();
+        assert_eq!(j[0]["name"], "person");
+        assert_eq!(j[0]["in_scope"], 1);
+        assert_eq!(j[0]["by_scene"]["ir"], 2);
+    }
+
+    fn prepare_data(args: &[&str]) -> DataArgs {
+        let mut v = vec!["prepare", "--out", "o"];
+        v.extend_from_slice(args);
+        let TrainCommand::Prepare { data, .. } = parse(&v).unwrap() else {
+            panic!("not prepare")
+        };
+        data
+    }
+
+    #[test]
+    fn balance_flags_parse() {
+        use dataset::BalanceAxis::*;
+        let cfg = Config::default();
+        let d = prepare_data(&["--balance", "class,scene", "--balance", "camera-day"]);
+        let b = d.balance(&cfg).unwrap();
+        assert_eq!(
+            b.axes.iter().copied().collect::<Vec<_>>(),
+            [Class, Scene, CameraDay]
+        );
+        assert_eq!((b.strength, b.max_repeat, b.cap_dominant), (0.5, 4, None));
+        let d = prepare_data(&[
+            "--balance",
+            "camera",
+            "--balance-strength",
+            "1",
+            "--balance-max-repeat",
+            "8",
+            "--balance-cap",
+            "2.5",
+        ]);
+        let b = d.balance(&cfg).unwrap();
+        assert_eq!(
+            (b.strength, b.max_repeat, b.cap_dominant),
+            (1.0, 8, Some(2.5))
+        );
+        assert!(
+            prepare_data(&["--balance", "off"])
+                .balance(&cfg)
+                .unwrap()
+                .is_off()
+        );
+        assert!(prepare_data(&[]).balance(&cfg).unwrap().is_off());
+    }
+
+    #[test]
+    fn balance_flags_reject_bad_values() {
+        let cfg = Config::default();
+        let e = prepare_data(&["--balance", "class,weather"])
+            .balance(&cfg)
+            .unwrap_err();
+        assert!(e.to_string().contains("'weather'"), "{e}");
+        assert!(
+            prepare_data(&["--balance", "class", "--balance-strength", "1.5"])
+                .balance(&cfg)
+                .is_err()
+        );
+        assert!(
+            prepare_data(&["--balance", "class", "--balance-max-repeat", "11"])
+                .balance(&cfg)
+                .is_err()
+        );
+        assert!(
+            prepare_data(&["--balance", "class", "--balance-cap", "0.5"])
+                .balance(&cfg)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn balance_defaults_to_the_config() {
+        let mut cfg = Config::default();
+        cfg.training.balance = Some(dataset::Balance {
+            axes: [dataset::BalanceAxis::Scene].into(),
+            max_repeat: 6,
+            ..Default::default()
+        });
+        let b = prepare_data(&[]).balance(&cfg).unwrap();
+        assert_eq!(b.axes.len(), 1);
+        assert_eq!(b.max_repeat, 6);
+        // A flag wins; `off` switches the config default off.
+        let b = prepare_data(&["--balance", "class", "--balance-strength", "1"])
+            .balance(&cfg)
+            .unwrap();
+        assert!(b.axes.contains(&dataset::BalanceAxis::Class) && b.axes.len() == 1);
+        assert_eq!((b.strength, b.max_repeat), (1.0, 6));
+        assert!(
+            prepare_data(&["--balance", "off"])
+                .balance(&cfg)
+                .unwrap()
+                .is_off()
+        );
+    }
+
+    #[test]
+    fn prepare_dry_run_needs_no_out() {
+        assert!(parse(&["prepare", "--dry-run"]).is_ok());
+        assert!(parse(&["prepare"]).is_err());
+    }
+
+    fn map(v: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        v.iter().map(|(k, n)| (k.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn dry_run_text_shows_before_and_after() {
+        let balance = dataset::Balance {
+            axes: [dataset::BalanceAxis::Class, dataset::BalanceAxis::CameraDay].into(),
+            cap_dominant: Some(3.0),
+            ..Default::default()
+        };
+        let report = dataset::BalanceReport {
+            balance: balance.clone(),
+            before: dataset::BalanceCounts {
+                images: 209,
+                boxes_per_class: map(&[("person", 443), ("raccoon", 32)]),
+                frames_per_class: map(&[("person", 150), ("raccoon", 20)]),
+                frames_per_scene: map(&[("day", 180), ("ir", 29)]),
+                frames_per_camera: map(&[("front", 150), ("yard", 59)]),
+                camera_days: vec![("front/2026-01-02".into(), 100)],
+                negative_share: 0.15,
+            },
+            after: dataset::BalanceCounts {
+                images: 412,
+                boxes_per_class: map(&[("person", 443), ("raccoon", 118)]),
+                frames_per_class: map(&[("person", 150), ("raccoon", 70)]),
+                frames_per_scene: map(&[("day", 250), ("ir", 162)]),
+                frames_per_camera: map(&[("front", 250), ("yard", 162)]),
+                camera_days: vec![("front/2026-01-02".into(), 130)],
+                negative_share: 0.14,
+            },
+            frames_before: 209,
+            frames_after: 200,
+            dropped: 9,
+            max_repeat: 4,
+        };
+        let plan = dataset::Plan {
+            classes: vec!["person".into(), "raccoon".into()],
+            train: vec![((0, 0), 1); 200],
+            valid: vec![(0, 1); 20],
+            heldout: vec![(0, 2); 40],
+            warnings: vec!["few unique frames".into()],
+            balance: Some(report),
+            ..Default::default()
+        };
+        let t = dry_run_text(&plan, &balance);
+        assert!(
+            t.contains("200 training frames, 20 validation, 40 held-out"),
+            "{t}"
+        );
+        assert!(t.contains("images per epoch: 209 -> 412"), "{t}");
+        assert!(t.contains("9 capped"), "{t}");
+        assert!(
+            t.contains("raccoon: boxes 32 -> 118, frames 20 -> 70"),
+            "{t}"
+        );
+        assert!(t.contains("person: boxes 443 -> 443"), "{t}");
+        assert!(t.contains("frames per scene"), "{t}");
+        assert!(t.contains("ir") && t.contains("29 -> 162"), "{t}");
+        assert!(t.contains("top cameras") && t.contains("front"), "{t}");
+        assert!(
+            t.contains("top camera-days") && t.contains("front/2026-01-02"),
+            "{t}"
+        );
+        assert!(t.contains("warning: few unique frames"), "{t}");
+        assert!(t.contains("15.0% -> 14.0%"), "{t}");
+        // Without balancing: the split and the boxes per class.
+        let mut plain = plan.clone();
+        plain.balance = None;
+        plain.stats.train_boxes = map(&[("person", 443)]);
+        let t = dry_run_text(&plain, &dataset::Balance::default());
+        assert!(
+            t.contains("person: 443") && t.contains("balance: off"),
+            "{t}"
+        );
+        assert!(!t.contains("images per epoch"), "{t}");
     }
 }

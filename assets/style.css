@@ -1037,3 +1037,71 @@ table.tr-mtable tr.best-epoch td { background: var(--ok-bg); }
 .tr-cols-list label.check { margin: 0; }
 .tr-cols-list button.small { margin: 0; padding: 0 0.4rem; }
 .tr-cols-msg:empty { display: none; }
+
+/* Train form: runs per scene, the class picker's counts and warnings, the family's
+   recommendation; the Comparison card. */
+.tr-scene-list { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 1.2rem; }
+.tr-scene-other { margin: 0.3rem 0; }
+.tr-scene-other > summary { color: var(--accent); cursor: pointer; }
+.tr-scene-other[open] { flex-basis: 100%; }
+.tr-scene-other label.check { display: inline-flex; margin-right: 1.2rem; }
+.tr-runs-line { margin: 0.3rem 0 0; padding: 0.3rem 0.6rem; border-left: 3px solid var(--accent); background: var(--code-bg); overflow-wrap: anywhere; }
+#train-picker .cp-compact > .cp-body { max-width: 48rem; max-height: none; }
+#train-picker .cp-label { flex-direction: row; align-items: center; text-align: left; margin: 0; color: var(--fg); gap: 0.35rem; }
+#train-picker .cp-chip { border-radius: 8px; }
+#train-epochs, #train-patience { width: 10rem; }
+.tr-cls-count { font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cp-badge.tr-cls-warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
+.cp-chip:not(:has(input[type=checkbox]:checked)) .tr-scene-warn { display: none; }
+#train-classes .tr-radios { align-items: baseline; gap: 0 1rem; }
+.tr-rec { white-space: nowrap; font-weight: normal; }
+details.tr-compare { margin: 0.4rem 0 0.8rem; }
+details.tr-compare > summary { cursor: pointer; font-weight: 600; margin: 0.2rem 0 0.4rem; overflow-wrap: anywhere; }
+table.tr-ctable { font-size: 0.85rem; width: auto; min-width: 100%; }
+table.tr-ctable th, table.tr-ctable td { padding: 0.3rem 0.5rem; vertical-align: top; }
+table.tr-ctable td.num, table.tr-ctable th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.tr-ctable th:last-child, table.tr-ctable td:last-child { padding-left: 1rem; white-space: nowrap; }
+table.tr-ctable td:first-child { min-width: 13rem; }
+table.tr-ctable td.best-val { font-weight: 700; background: var(--ok-bg); color: var(--ok-fg); }
+table.tr-ctable tr.tr-routed td { font-style: italic; background: var(--code-bg); border-top: 2px dashed var(--border); }
+
+/* Train form: the Balance fieldset and its before / after preview (bars sized by script). */
+details.tr-balance > summary { cursor: pointer; font-weight: 600; }
+details.tr-balance > summary .muted { font-weight: normal; margin-left: 0.3rem; }
+fieldset.tr-bal { margin: 0.4rem 0 0.2rem; }
+.tr-bal-axes { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(16rem, 100%), 1fr)); gap: 0 1.2rem; }
+.tr-bal-k { display: block; margin: 0 0 0.2rem; color: var(--muted); font-size: 0.9rem; }
+.tr-form input#train-bal-cap:disabled { opacity: 0.5; }
+.tr-bal-preview { margin: 0.6rem 0 0.2rem; padding: 0.5rem 0.7rem; border: 1px solid var(--border); border-radius: 6px; background: var(--log-bg); min-width: 0; }
+.tr-bal-preview.tr-bal-busy { opacity: 0.6; }
+.tr-bal-preview > p:first-child, .tr-bal-run > p:first-child { margin-top: 0; }
+.tr-bal-tabs { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0 0 0.4rem; }
+.tr-bal-tabs button { margin: 0; }
+.tr-bal-kpi { margin: 0.2rem 0; font-size: 1rem; }
+.tr-bal-kpi .k { color: var(--muted); }
+.tr-bal-kpi strong { font-variant-numeric: tabular-nums; }
+.tr-bal-drop { color: var(--warn-fg); }
+.tr-bal-legend { margin: 0.2rem 0 0.4rem; color: var(--muted); }
+.tr-bal-swatch { display: inline-block; width: 0.9rem; height: 0.55rem; border-radius: 2px; vertical-align: middle; }
+.tr-bal-tables { display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; }
+.tr-bal-table { flex: 1 1 17rem; min-width: 0; max-width: min(100%, 40rem); }
+.tr-bal-h { margin: 0.4rem 0 0.2rem; font-size: 0.88rem; }
+table.tr-btable { font-size: 0.82rem; width: 100%; table-layout: fixed; }
+table.tr-btable th, table.tr-btable td { padding: 0.15rem 0.35rem; }
+table.tr-btable th:nth-child(2), table.tr-btable th:nth-child(3), table.tr-btable td.num { width: 3.2rem; text-align: right; font-variant-numeric: tabular-nums; }
+table.tr-btable th:first-child { width: 34%; }
+table.tr-btable td.tr-bal-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.tr-btable td.tr-bal-up { color: var(--ok-fg); font-weight: 600; }
+table.tr-btable td.tr-bal-down { color: var(--warn-fg); font-weight: 600; }
+td.tr-bal-bars { vertical-align: middle; }
+.tr-bal-bar { display: block; height: 0.4rem; border-radius: 2px; min-width: 0; }
+.tr-bal-bar + .tr-bal-bar { margin-top: 2px; }
+.tr-bal-before { background: var(--muted); opacity: 0.55; }
+.tr-bal-after { background: var(--accent); }
+@media (max-width: 600px) {
+  fieldset.tr-bal { padding: 0.4rem 0.5rem; }
+  .tr-bal-preview { padding: 0.4rem 0.45rem; }
+  table.tr-btable th, table.tr-btable td { padding: 0.15rem 0.25rem; }
+  table.tr-btable th:nth-child(2), table.tr-btable th:nth-child(3), table.tr-btable td.num { width: 3.3rem; }
+  table.tr-btable th:first-child { width: 30%; }
+}

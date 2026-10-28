@@ -314,13 +314,15 @@ it; every key can also be set in the file.
 | `training` | defaults | Model training ([docs/TRAINING.md](docs/TRAINING.md)): where runs go, the review exports offered, dataset defaults. Read when a run is queued. Applies: at once. UI: Training page |
 | `training.dir` | `null` | Folder of the training runs (prepared dataset, `train.log`, held-out benchmark set, `runs.json`); `null` = `training` under the data folder; relative paths resolve there. Applies: at once (refused on the page while a training job is queued or running; old runs stay in the old folder). UI: Training page (This machine) |
 | `training.datasets` | `[]` | Review export folders (YOLO layout) offered on the Training page and used by `train run` without `--dataset`. Applies: at once. UI: Training page |
-| `training.epochs` | `50` | Default epochs of a run (1-1000). Applies: at once. UI: Training page |
+| `training.epochs` | unset | Epochs of every run (1-1000; a cap while early stopping is on); unset = the model family's recommendation (YOLO / RF-DETR 100, RT-DETRv2 / D-FINE 80). A stored `50` (the old default) reads as unset. Applies: at once. UI: Training page |
+| `training.patience` | unset | Epochs without a validation mAP gain (> 0.001) before a run stops and keeps its best epoch (0 = off, at most `training.epochs`); unset = the family's recommendation (YOLO 15, others 10). Applies: at once. UI: Training page |
 | `training.negative_share` | `0.15` | Share of frames without objects (hard negatives) kept in the training split; extra empty frames are dropped, too few give a warning (0-0.9). Applies: at once. UI: config file |
 | `training.heldout_share` | `0.2` | Share of the review frames held out by camera and day for the benchmark when the export has no split of its own (0-0.9). Applies: at once. UI: config file |
 | `training.oversample` | `3` | How often each of your own frames repeats in the training split when the public night subset is mixed in (1-10). Applies: at once. UI: config file |
 | `training.timeout_hours` | `48` | A run is stopped after this many hours (1-336). Applies: at once. UI: config file |
 | `training.synonyms` | `{}` | Auto-label prompt phrases per class, replacing the built-in ones of that class (`{"raccoon": ["raccoon", "trash panda"]}`; MM-Grounding-DINO and SigLIP prompts; at most 16 phrases, no periods). Applies: at once. UI: config file |
 | `training.metric_columns` | `[]` | Columns of the Training page's per-epoch metrics table, in order: metric ids (`map`, `map50`, `map75`, `mar`, `precision`, `recall`, `f1`, `f1_thr`, `f2`, `f2_thr`, `f0_5`, `loss`, `val_loss`, `lr`, `mem_gb`, `img_s`, `ema_map`, ...) or a trainer's raw metric name (at most 20). Empty = `map, map50, f1, f2, precision, recall, loss`. Applies: at once. UI: Training page, Columns |
+| `training.balance` | none (off) | Default balancing of the training frames on the Training page and in `train`: `{"axes": ["class", "scene", "camera", "camera-day"], "strength": 0.5, "max_repeat": 4, "cap_dominant": 3}`. Rare groups are repeated by `(largest / group size)^strength` (at most `max_repeat` times); `cap_dominant` drops frames of groups above that many times the median size. Validation and held-out frames are never balanced. Applies: at once. UI: config file |
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`. Applies: at once. UI: yes (also the Logs page) |
 | `log_timezone` | `"utc"` | Time zone of log timestamps (files, console and the Logs page): `"utc"` (`2026-10-16T00:54:59.580Z`), `"local"` (this computer's zone), an IANA name such as `"America/Los_Angeles"`, or a fixed offset such as `"+08:00"`; others print RFC 3339 with the offset (`2026-10-15T17:54:59.580-07:00`). Applies: at once. UI: yes (a dropdown of UTC, local and common zones; other values set here show as "Custom") |
 | `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout only). Path. Applies: process restart. UI: yes |
@@ -944,10 +946,13 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/review/export` | `{formats, out_dir?, holdout_cameras?, holdout_days?, holdout_fraction?, benchmark_split?, include_unreviewed?, labels?, include_empty?}`: export the reviewed frames (only those with a box of `labels` when given, plus confirmed-empty ones unless `include_empty` is false; a label outside `collect.classes` is a 400) (YOLO, COCO, X-AnyLabeling, benchmark set) to a new folder, default `<data root>/training/exports/<UTC time>` |
 | POST | `/v1/review/import`, `/v1/review/classes` | `{dir, treat_unchecked_as_reviewed?}`: import X-AnyLabeling files; `{classes: [...]}`: save `collect.classes` |
 | GET | `/v1/training` | training capability (accelerator, families and sizes with estimates and fit, reasons), the runs (state, stage, percent, progress, log tail, dataset counts, installed model, benchmark) and the import / auto-label jobs (`tasks`: state, stage, percent, log tail, summary, result) |
-| POST | `/training/queue` | the Training page's form: `model` (repeated: `yolo26n`, `rfdetr-nano`, `rt-detrv2-s`, ...), `dataset` (repeated) / `dataset_path`, `scene`, `classes`, `epochs`, `batch`, `imgsz`, `lr`, `night_aug`, `aug_dark`, `aug_noise`, `aug_gray`, `public`, `benchmark_set`, `name`; `confirm_large=1` for the first environment download unless `allow_large_downloads` |
+| POST | `/training/queue` | the Training page's form: `model` (repeated: `yolo26n`, `rfdetr-nano`, `rt-detrv2-s`, ...), `dataset` (repeated) / `dataset_path`, `scene` (repeated: one run per scene, compared), `classes` (repeated or comma-separated), `excluded` (`background` / `drop-frame`), `balance` (repeated or comma-separated: `class`, `scene`, `camera`, `camera-day`), `balance_strength`, `balance_max_repeat`, `balance_cap_on` + `balance_cap`, `epochs`, `patience`, `batch`, `imgsz`, `lr`, `night_aug`, `aug_dark`, `aug_noise`, `aug_gray`, `public`, `benchmark_set`, `name`; `confirm_large=1` for the first environment download unless `allow_large_downloads` |
+| GET | `/v1/training/dataset-classes` | `dataset` (repeated): boxes and frames per class with per-scene box counts (the class picker), frames per scene, errors per folder |
+| POST | `/v1/training/balance-preview` | the queue form's dataset fields (`dataset`, `dataset_path`, `scene`, `classes`, `excluded`, `public`, `balance*`): per scene filter the planned split and the balance report (before / after per class, scene, camera), nothing written |
+| GET | `/v1/training/compare` | `group`: the runs of a comparison group and their per-scene held-out AP table (`comparison`, `text`) |
 | POST | `/training/import` | the Import footage form: `source` (`path`, `url`, `dataset`) with `path` / `url` / `dataset`, `camera`, `frames`, `select` (`siglip`, `dhash`), `scene`, `max_fps`, `every`, `dedup_window`, `no_balance`, `license`, `confirm_license`, `confirm_large`; queued on the training queue |
 | POST | `/training/autolabel` | the Auto-label form (Training and Review pages): `frames` (filter text), `gdino` (`tiny`, `base`, `large`, `off`), `rfdetr`, `vlm` (`2b`, `4b`, `8b`, `off`), `siglip`, `with_model`, `threshold`, `confirm_large` |
-| POST | `/training/cancel`, `/training/remove`, `/training/use`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; forget a finished one; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model; `add` / `remove`: a `training.datasets` folder; delete the training environment |
+| POST | `/training/cancel`, `/training/finish`, `/training/remove`, `/training/use`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; finish it after the current epoch keeping the best checkpoint; forget a finished one; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model; `add` / `remove`: a `training.datasets` folder; delete the training environment |
 | GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
@@ -992,10 +997,16 @@ the FP32 path is active.
 
 ```sh
 blue-onyx-prism train capability                      # can this machine train, and what fits
-blue-onyx-prism train estimate --model rfdetr-small --images 2000 --epochs 50
+blue-onyx-prism train estimate --model rfdetr-small --images 2000 --epochs 100
+blue-onyx-prism train classes --dataset <review export> --scene night+ir              # classes, boxes per scene
 blue-onyx-prism train prepare --dataset <review export> --scene night+ir --out prep   # dataset only
+blue-onyx-prism train prepare --dataset <review export> --balance class,scene --dry-run   # the plan and the balance report, nothing written
 blue-onyx-prism train run --model yolo26n --model rfdetr-nano --dataset <review export> \
-    --scene night+ir --night-aug --epochs 50 --allow-large
+    --scene night+ir --night-aug --allow-large                  # epochs / --patience: the family's recommendation
+blue-onyx-prism train run --model yolo26s --dataset <review export> \
+    --scene day --scene night+ir --scene all --excluded drop-frame   # one run per scene, compared on the same held-out frames
+blue-onyx-prism train run --model yolo26s --dataset <review export> \
+    --balance class,scene --balance-strength 0.5 --balance-max-repeat 4 --balance-cap 3   # repeat frames of rare groups; the cap drops frames of dominant ones
 blue-onyx-prism train import --path D:\BlueIris\Clips --confirm-license --allow-large   # frames into the dataset
 blue-onyx-prism train import --dataset meva-sample                                    # pinned MEVA clips (CC BY 4.0)
 blue-onyx-prism train autolabel --frames "import=any,limit=200" --allow-large         # pending auto boxes for review
@@ -1009,7 +1020,17 @@ static ONNX (checked against PyTorch with ONNX Runtime), installs `models/<name>
 `<name>.provenance.json`, adds it to the config (disabled until you enable it or use it) and benchmarks
 it on the held-out frames. The pinned training environment (PyTorch CUDA 12.6 / 13.0 or macOS, the
 trainers; about 3 GB with CUDA) is set up under `<data root>/tools/train-env` on the first run. Families,
-licences, the dataset layout and the MPS results: [docs/TRAINING.md](docs/TRAINING.md). `train import`
+licences, the dataset layout and the MPS results: [docs/TRAINING.md](docs/TRAINING.md). A run stops
+once the validation mAP has not improved for `--patience` epochs (`--epochs` is a cap; both default to
+the family's recommendation) and keeps its best checkpoint; Finish now on the page, or the file
+`<run dir>/work/stop-request`, ends it early. `--scene night` is night frames only and `--scene ir` IR
+only (`night+ir` = both); several `--scene` values queue one run each and print an AP-per-scene
+comparison on the same held-out frames. `--balance class,scene,camera,camera-day` (comma-separated and/or
+repeated; `off`) repeats the existing frames of rare groups so they count more (`--balance-strength` 0..1,
+default 0.5 = square root; `--balance-max-repeat` 1..10, default 4); `--balance-cap <ratio>` also drops
+frames of groups above that many times the median size. Held-out and validation frames are never balanced;
+`train prepare --dry-run` prints the before / after report without writing (default: `training.balance`).
+`train import`
 puts frames of your videos and image folders (or a URL whose licence you confirm, or the pinned MEVA
 sample) into the dataset folder and the Review queue; `train autolabel` proposes boxes for them
 (pending, triaged `accept` / `review`; nothing is accepted for you); both run on the training queue.

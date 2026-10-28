@@ -414,3 +414,57 @@ fn cancelling_a_task_cancels_the_queued_tasks_that_follow_it() {
     svc.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn finish_is_refused_for_anything_but_a_training_run() {
+    let runner = Arc::new(HoldRunner::default());
+    let svc = TrainingService::start(
+        runner.clone(),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        None,
+    );
+    assert_eq!(svc.finish("nope").unwrap_err(), "no run nope");
+    let id = svc
+        .enqueue_task(Box::new(HoldTask {
+            id: "task".into(),
+            keep: false,
+        }))
+        .unwrap();
+    until("the helper", || runner.started.load(Ordering::Relaxed) == 1);
+    let e = svc.finish(&id).unwrap_err();
+    assert!(e.contains("only a training run"), "{e}");
+    assert!(svc.cancel(&id));
+    svc.wait_task(&id, Duration::from_secs(10)).unwrap();
+    svc.shutdown();
+}
+
+#[test]
+fn the_run_records_the_balance_summary_of_its_dataset() {
+    let mut p = super::super::dataset::Prepared {
+        dir: PathBuf::from("/runs/r1/data"),
+        classes: vec!["person".into(), "raccoon".into()],
+        train_images: 412,
+        valid_images: 40,
+        heldout_dir: Some(PathBuf::from("/runs/r1/heldout")),
+        heldout_images: 60,
+        heldout_fingerprint: "f1".into(),
+        warnings: vec!["w".into()],
+        balance_summary: Some(
+            "209 → 412 images/epoch; person 443→443, raccoon 32→118 boxes".into(),
+        ),
+    };
+    let d = DatasetCounts::of(&p);
+    assert_eq!(d.train_images, 412);
+    assert_eq!(d.heldout_dir, p.heldout_dir);
+    assert_eq!(d.balance_summary, p.balance_summary);
+    let v = serde_json::to_value(&d).unwrap();
+    assert_eq!(v["balance_summary"], serde_json::json!(p.balance_summary));
+    // Unbalanced: no key written; older records without it read as None.
+    p.balance_summary = None;
+    let d = DatasetCounts::of(&p);
+    let v = serde_json::to_value(&d).unwrap();
+    assert!(v.get("balance_summary").is_none(), "{v}");
+    let back: DatasetCounts = serde_json::from_value(v).unwrap();
+    assert_eq!(back, d);
+}

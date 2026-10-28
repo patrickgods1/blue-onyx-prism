@@ -2,13 +2,15 @@
 //! and the dataset assembly defaults. Read when a run is queued (every field applies at once);
 //! pure data plus validation.
 
+use crate::resources::catalog::TrainFamily;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Folder name of the default training folder under the data root.
 pub const DEFAULT_DIR_NAME: &str = "training";
-/// Default epochs of a run.
-pub const DEFAULT_EPOCHS: u32 = 50;
+/// The old default `training.epochs`, written out by every save before the per-family
+/// recommendations: a stored 50 reads as unset ([`legacy_epochs`]).
+pub const LEGACY_DEFAULT_EPOCHS: u32 = 50;
 /// Most epochs of a run.
 pub const MAX_EPOCHS: u32 = 1000;
 /// Default share of frames without objects in the training split.
@@ -39,8 +41,18 @@ pub struct TrainingConfig {
     /// Review export folders (YOLO layout, see docs/TRAINING.md) offered on the Training page
     /// and used by `train run` without `--dataset`.
     pub datasets: Vec<PathBuf>,
-    /// Default epochs of a run.
-    pub epochs: u32,
+    /// Epochs of every run (a cap while early stopping is on); None = the family's
+    /// recommendation ([`super::recipe::recommended`]). A stored 50 (the old default every save
+    /// wrote) reads as None.
+    #[serde(
+        deserialize_with = "legacy_epochs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub epochs: Option<u32>,
+    /// Epochs without improvement before a run stops (0 = off); None = the family's
+    /// recommendation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patience: Option<u32>,
     /// Share of frames without objects (hard negatives) kept in the training split (0-0.9).
     #[serde(serialize_with = "crate::config::thr::ser_clean")]
     pub negative_share: f32,
@@ -60,6 +72,10 @@ pub struct TrainingConfig {
     /// default ([`DEFAULT_METRIC_COLUMNS`]). Applies at once.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub metric_columns: Vec<String>,
+    /// The Training page's and the CLI's default balancing of the training frames
+    /// ([`super::dataset::Balance`]); None = off. A run uses what its request says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<super::dataset::Balance>,
 }
 
 impl Default for TrainingConfig {
@@ -67,13 +83,15 @@ impl Default for TrainingConfig {
         Self {
             dir: None,
             datasets: Vec::new(),
-            epochs: DEFAULT_EPOCHS,
+            epochs: None,
+            patience: None,
             negative_share: DEFAULT_NEGATIVE_SHARE,
             heldout_share: DEFAULT_HELDOUT_SHARE,
             oversample: DEFAULT_OVERSAMPLE,
             timeout_hours: DEFAULT_TIMEOUT_HOURS,
             synonyms: std::collections::BTreeMap::new(),
             metric_columns: Vec::new(),
+            balance: None,
         }
     }
 }
@@ -92,6 +110,20 @@ impl TrainingConfig {
         }
     }
 
+    /// Epochs of a `family` run: `epochs`, else the family's recommendation.
+    pub fn epochs_for(&self, family: TrainFamily) -> u32 {
+        self.epochs
+            .unwrap_or_else(|| super::recipe::recommended(family).epochs)
+    }
+
+    /// Patience of a `family` run: `patience`, else the family's recommendation (at most the
+    /// run's epochs).
+    pub fn patience_for(&self, family: TrainFamily) -> u32 {
+        self.patience
+            .unwrap_or_else(|| super::recipe::recommended(family).patience)
+            .min(self.epochs_for(family))
+    }
+
     /// The per-epoch table's columns: `metric_columns`, else the default.
     pub fn effective_metric_columns(&self) -> Vec<String> {
         if self.metric_columns.is_empty() {
@@ -106,11 +138,20 @@ impl TrainingConfig {
 
     /// Range-check every field; errors name the key.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !(1..=MAX_EPOCHS).contains(&self.epochs) {
-            anyhow::bail!(
-                "training.epochs must be between 1 and {MAX_EPOCHS}, got {}",
-                self.epochs
-            );
+        if let Some(e) = self.epochs
+            && !(1..=MAX_EPOCHS).contains(&e)
+        {
+            anyhow::bail!("training.epochs must be between 1 and {MAX_EPOCHS}, got {e}");
+        }
+        if let Some(p) = self.patience
+            && p > MAX_EPOCHS
+        {
+            anyhow::bail!("training.patience must be between 0 (off) and {MAX_EPOCHS}, got {p}");
+        }
+        if let (Some(e), Some(p)) = (self.epochs, self.patience)
+            && p > e
+        {
+            anyhow::bail!("training.patience ({p}) must not exceed training.epochs ({e})");
         }
         for (key, v) in [
             ("training.negative_share", self.negative_share),
@@ -144,6 +185,9 @@ impl TrainingConfig {
             );
         }
         validate_metric_columns(&self.metric_columns)?;
+        if let Some(b) = &self.balance {
+            b.validate().map_err(|e| anyhow::anyhow!("training.{e}"))?;
+        }
         for (class, phrases) in &self.synonyms {
             let ok = |s: &str| {
                 !s.trim().is_empty()
@@ -160,6 +204,11 @@ impl TrainingConfig {
         }
         Ok(())
     }
+}
+
+/// `training.epochs`, with the legacy rule: 50 (the old default every save wrote) = None.
+fn legacy_epochs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    Ok(Option::<u32>::deserialize(d)?.filter(|&e| e != LEGACY_DEFAULT_EPOCHS))
 }
 
 /// Check a `metric_columns` list: at most [`MAX_METRIC_COLUMNS`] distinct names of 1 to
@@ -208,7 +257,7 @@ mod tests {
         assert_eq!(back, c);
         // Missing keys take their defaults.
         let partial: TrainingConfig = serde_json::from_str(r#"{"epochs": 3}"#).unwrap();
-        assert_eq!(partial.epochs, 3);
+        assert_eq!(partial.epochs, Some(3));
         assert_eq!(partial.oversample, DEFAULT_OVERSAMPLE);
     }
 
@@ -219,7 +268,15 @@ mod tests {
             f(&mut c);
             c.validate().unwrap_err().to_string()
         };
-        assert!(bad(|c| c.epochs = 0).contains("training.epochs"));
+        assert!(bad(|c| c.epochs = Some(0)).contains("training.epochs"));
+        assert!(bad(|c| c.patience = Some(MAX_EPOCHS + 1)).contains("training.patience"));
+        assert!(
+            bad(|c| {
+                c.epochs = Some(5);
+                c.patience = Some(6);
+            })
+            .contains("must not exceed")
+        );
         assert!(bad(|c| c.negative_share = 0.95).contains("training.negative_share"));
         assert!(bad(|c| c.heldout_share = f32::NAN).contains("training.heldout_share"));
         assert!(bad(|c| c.oversample = 0).contains("training.oversample"));
@@ -233,6 +290,30 @@ mod tests {
         assert!(bad(|c| c.metric_columns = vec!["x".repeat(65)]).contains("metric_columns"));
         assert!(bad(|c| c.metric_columns = vec!["a\nb".into()]).contains("metric_columns"));
         assert!(bad(|c| c.metric_columns = vec!["f2".into(), "f2".into()]).contains("twice"));
+        let balance = |f: fn(&mut crate::training::dataset::Balance)| {
+            let mut c = TrainingConfig::default();
+            let mut b = crate::training::dataset::Balance::default();
+            f(&mut b);
+            c.balance = Some(b);
+            c.validate().map_err(|e| e.to_string())
+        };
+        assert!(balance(|_| {}).is_ok());
+        let e = balance(|b| b.strength = 1.5).unwrap_err();
+        assert!(e.contains("training.balance.strength"), "{e}");
+        assert!(balance(|b| b.strength = f32::NAN).is_err());
+        assert!(
+            balance(|b| b.max_repeat = 0)
+                .unwrap_err()
+                .contains("training.balance.max_repeat")
+        );
+        assert!(balance(|b| b.max_repeat = 11).is_err());
+        assert!(
+            balance(|b| b.cap_dominant = Some(0.5))
+                .unwrap_err()
+                .contains("cap_dominant")
+        );
+        assert!(balance(|b| b.cap_dominant = Some(f32::INFINITY)).is_err());
+        assert!(balance(|b| b.cap_dominant = Some(1.0)).is_ok());
         assert!(
             bad(|c| c.metric_columns = (0..21).map(|i| format!("m{i}")).collect())
                 .contains("at most 20")
@@ -282,6 +363,9 @@ mod tests {
             dir: Some("x".into()),
             synonyms: [("raccoon".to_string(), vec!["raccoon".to_string()])].into(),
             metric_columns: vec!["map".into()],
+            epochs: Some(30),
+            patience: Some(5),
+            balance: Some(Default::default()),
             ..TrainingConfig::default()
         };
         let v = serde_json::to_value(c).unwrap();
@@ -295,6 +379,64 @@ mod tests {
             missing.is_empty(),
             "README.md lacks rows for training.{missing:?}"
         );
+    }
+
+    #[test]
+    fn epochs_and_patience_fall_back_to_the_family_and_legacy_50_is_unset() {
+        let c = TrainingConfig::default();
+        assert!(!serde_json::to_string(&c).unwrap().contains("epochs"));
+        assert_eq!(c.epochs_for(TrainFamily::Yolo26), 100);
+        assert_eq!(c.patience_for(TrainFamily::Yolo26), 15);
+        assert_eq!(c.epochs_for(TrainFamily::Dfine), 80);
+        assert_eq!(c.patience_for(TrainFamily::Rfdetr), 10);
+        // The old default, written by every save: the recommendation again.
+        let old: TrainingConfig = serde_json::from_str(r#"{"epochs": 50}"#).unwrap();
+        assert_eq!(old.epochs, None);
+        assert!(old.is_default());
+        let null: TrainingConfig = serde_json::from_str(r#"{"epochs": null}"#).unwrap();
+        assert_eq!(null.epochs, None);
+        let set: TrainingConfig = serde_json::from_str(r#"{"epochs": 30, "patience": 0}"#).unwrap();
+        set.validate().unwrap();
+        assert_eq!(set.epochs_for(TrainFamily::Rtdetrv2), 30);
+        assert_eq!(set.patience_for(TrainFamily::Yolo11), 0);
+        let text = serde_json::to_string(&set).unwrap();
+        assert!(text.contains(r#""epochs":30,"patience":0"#), "{text}");
+        // A recommended patience above a small epochs override is capped by it.
+        let small: TrainingConfig = serde_json::from_str(r#"{"epochs": 8}"#).unwrap();
+        assert_eq!(small.patience_for(TrainFamily::Yolo26), 8);
+    }
+
+    #[test]
+    fn balance_defaults_off_and_round_trips() {
+        use crate::training::dataset::{Balance, BalanceAxis};
+        // An older config has no balance: off, and not written back.
+        let old: TrainingConfig = serde_json::from_str(r#"{"oversample": 2}"#).unwrap();
+        assert_eq!(old.balance, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("balance"));
+        let c: TrainingConfig = serde_json::from_str(
+            r#"{"balance": {"axes": ["class", "camera-day"], "strength": 1, "cap_dominant": 3}}"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        let b = c.balance.clone().unwrap();
+        assert_eq!(
+            b.axes.iter().copied().collect::<Vec<_>>(),
+            [BalanceAxis::Class, BalanceAxis::CameraDay]
+        );
+        assert_eq!(
+            (b.strength, b.max_repeat, b.cap_dominant),
+            (1.0, 4, Some(3.0))
+        );
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(
+            text.contains(
+                r#""axes":["class","camera-day"],"strength":1.0,"max_repeat":4,"cap_dominant":3.0"#
+            ),
+            "{text}"
+        );
+        let back: TrainingConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, c);
+        assert!(Balance::default().is_off());
     }
 
     #[test]

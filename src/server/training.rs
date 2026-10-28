@@ -13,7 +13,8 @@ use super::{AppState, Shared, blocking, render, save_config};
 use crate::resources::catalog::{self, Platform};
 use crate::resources::export::train::{self as env, TrainPaths};
 use crate::training::capability::Capability;
-use crate::training::dataset::SceneFilter;
+use crate::training::compare::{self, CompareRun, Comparison};
+use crate::training::dataset::{Balance, BalanceAxis, Excluded, SceneFilter};
 use crate::training::job::{BenchSummary, Hooks, TrainOutput, TrainRequest};
 use crate::training::recipe::{self, Augment, TrainRecipe};
 use crate::training::service::{RunRecord, RunState, TrainingService};
@@ -164,6 +165,9 @@ struct FamilyRow {
     sizes: Vec<SizeCell>,
     /// Empty cells after the sizes, so every row of the grid has as many cells.
     pad: usize,
+    /// The family's starting point (`100 ep · patience 15`, [`recipe::recommended`]): what a
+    /// blank Epochs / Patience field means.
+    recommended: String,
 }
 
 /// A licence notice shared by some families (shown once under the size grid).
@@ -184,6 +188,8 @@ struct RunRow {
     model: String,
     state: &'static str,
     busy: bool,
+    /// Finish now applies: running (or paused) in its training stage, not stopped yet.
+    can_finish: bool,
     percent: u8,
     describe: String,
     dataset: String,
@@ -207,6 +213,117 @@ struct GpuChoice {
     value: String,
     /// `NVIDIA GeForce RTX 3090 (cuda:1, 24 GB, PyTorch cu126)`.
     label: String,
+}
+
+/// One checkbox of the Train form's Runs fieldset.
+struct SceneChoice {
+    /// The canonical filter (`all`, `day`, `night+ir`, `night`, `ir`; the form's `scene`).
+    value: &'static str,
+    title: &'static str,
+    describe: &'static str,
+    /// The model-name prefix (`custom`, `day`, `night`, ...), for the runs line.
+    prefix: &'static str,
+    /// Shown at once (else under "Other").
+    preset: bool,
+}
+
+/// The Runs checkboxes: the presets (mixed, day, night + IR), then night only and IR only.
+const SCENE_CHOICES: [(SceneFilter, &str, bool); 5] = [
+    (SceneFilter::ALL_SCENES, "All scenes (mixed)", true),
+    (SceneFilter::DAY, "Day", true),
+    (SceneFilter::NIGHT_IR, "Night + IR", true),
+    (SceneFilter::new(false, true, false), "Night only", false),
+    (SceneFilter::new(false, false, true), "IR only", false),
+];
+
+/// One cell of a comparison table (AP50-95, AP50 beneath).
+struct CompareCell {
+    ap: String,
+    ap50: String,
+    images: usize,
+    best: bool,
+}
+
+struct CompareRowView {
+    name: String,
+    model: String,
+    scene: String,
+    routed: bool,
+    /// The run's state while it has no benchmark (`running`, `failed`); empty when benchmarked.
+    state: String,
+    /// `best 12 / stopped 27`.
+    epochs: String,
+    /// Day, night, IR, all.
+    cells: Vec<CompareCell>,
+    in_scope: String,
+    ms: String,
+    ms_best: bool,
+}
+
+/// The Comparison card of one `compare_group`.
+struct CompareCard {
+    group: String,
+    /// The latest group (and the latest with a result) starts open; older ones collapsed.
+    open: bool,
+    comparable: bool,
+    warnings: Vec<String>,
+    rows: Vec<CompareRowView>,
+}
+
+/// One axis checkbox of the Train form's Balance fieldset.
+struct BalanceChoice {
+    /// `class`, `scene`, `camera`, `camera-day` (the form's `balance`).
+    value: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    checked: bool,
+}
+
+/// The Balance fieldset's defaults: `training.balance` when set, else off.
+struct BalanceView {
+    axes: Vec<BalanceChoice>,
+    on: bool,
+    gentle: bool,
+    full: bool,
+    /// A configured strength other than 0.5 and 1 (a third radio, checked).
+    custom: Option<String>,
+    max_repeat: u32,
+    most: u32,
+    cap_on: bool,
+    cap: String,
+}
+
+impl BalanceView {
+    fn of(b: Option<&Balance>) -> Self {
+        use crate::training::dataset::balance::{DEFAULT_CAP, MAX_REPEAT};
+        let d = Balance::default();
+        let b = b.unwrap_or(&d);
+        let s = b.strength;
+        Self {
+            axes: BalanceAxis::ALL
+                .iter()
+                .map(|&a| BalanceChoice {
+                    value: a.as_str(),
+                    title: match a {
+                        BalanceAxis::Class => "Class",
+                        BalanceAxis::Scene => "Scene",
+                        BalanceAxis::Camera => "Camera",
+                        BalanceAxis::CameraDay => "Camera + day",
+                    },
+                    hint: a.describe(),
+                    checked: b.axes.contains(&a),
+                })
+                .collect(),
+            on: !b.is_off(),
+            gentle: s == 0.5,
+            full: s == 1.0,
+            custom: (s != 0.5 && s != 1.0).then(|| crate::config::clean_f32(s).to_string()),
+            max_repeat: b.max_repeat,
+            most: MAX_REPEAT,
+            cap_on: b.cap_dominant.is_some(),
+            cap: crate::config::clean_f32(b.cap_dominant.unwrap_or(DEFAULT_CAP)).to_string(),
+        }
+    }
 }
 
 struct DatasetRow {
@@ -250,8 +367,14 @@ pub(super) struct TrainingTemplate {
     size_cols: usize,
     notices: Vec<NoticeRow>,
     latencies: Vec<LatencyRow>,
-    epochs: u32,
-    scenes: Vec<(&'static str, &'static str)>,
+    /// `training.epochs`, blank = each family's recommendation.
+    epochs: String,
+    /// `training.patience`, blank = each family's recommendation.
+    patience: String,
+    scenes: Vec<SceneChoice>,
+    balance: BalanceView,
+    /// Day / night / mixed comparisons of runs queued together, the latest first.
+    comparisons: Vec<CompareCard>,
     public_available: bool,
     /// The public night subset is downloaded (else mixing it in needs the large-download
     /// confirmation).
@@ -285,6 +408,16 @@ pub(super) struct TrainingTemplate {
     imports_dir: String,
 }
 
+/// Finish now applies to `r`: running or paused in its training stage, not stopped and not
+/// exporting yet ([`TrainingService::finish`] checks the same).
+fn can_finish(r: &RunRecord) -> bool {
+    r.state.is_active()
+        && r.stage == Some(crate::training::job::TrainStage::Train)
+        && r.progress
+            .as_ref()
+            .is_none_or(|p| p.stopped.is_none() && p.phase.is_none())
+}
+
 fn state_str(s: RunState) -> &'static str {
     match s {
         RunState::Queued => "queued",
@@ -298,18 +431,182 @@ fn state_str(s: RunState) -> &'static str {
 
 fn bench_text(b: Option<&BenchSummary>, err: Option<&str>) -> String {
     match (b, err) {
-        (Some(b), _) => format!(
-            "AP50 {} \u{b7} {} on {} \u{b7} {} images ({})",
-            b.ap50.map_or_else(|| "n/a".into(), |a| format!("{a:.3}")),
-            b.ms_p50
-                .map_or_else(|| "?".into(), |m| format!("{m:.1} ms")),
-            b.device.as_deref().unwrap_or("?"),
-            b.images,
-            b.datasets.join(", ")
-        ),
+        (Some(b), _) => {
+            let mut s = format!(
+                "AP50 {} \u{b7} {} on {} \u{b7} {} images ({})",
+                b.ap50.map_or_else(|| "n/a".into(), |a| format!("{a:.3}")),
+                b.ms_p50
+                    .map_or_else(|| "?".into(), |m| format!("{m:.1} ms")),
+                b.device.as_deref().unwrap_or("?"),
+                b.images,
+                b.datasets.join(", ")
+            );
+            // AP50-95 per scene of the held-out frames, and over the scenes it trained on.
+            let scenes: Vec<String> = ["day", "night", "ir"]
+                .iter()
+                .filter_map(|k| {
+                    let a = b.by_scene.get(*k).filter(|a| a.images > 0)?;
+                    Some(format!("{} {}", scene_name(k), ap_text(a.ap50_95)))
+                })
+                .collect();
+            if !scenes.is_empty() {
+                s.push_str(&format!(" \u{b7} AP50-95 {}", scenes.join(" / ")));
+            }
+            if let Some(a) = b.in_scope.as_ref().and_then(|a| a.ap50_95) {
+                s.push_str(&format!(" \u{b7} in scope {a:.3}"));
+            }
+            s
+        }
         (None, Some(e)) => format!("benchmark failed: {e}"),
         (None, None) => "not benchmarked".into(),
     }
+}
+
+/// `day`, `night`, `IR`.
+fn scene_name(k: &str) -> &str {
+    if k == "ir" { "IR" } else { k }
+}
+
+/// An AP as shown (`0.512`), a dash when unknown.
+fn ap_text(v: Option<f64>) -> String {
+    v.filter(|v| v.is_finite())
+        .map_or_else(|| "\u{2014}".into(), |v| format!("{v:.3}"))
+}
+
+/// The runs of each `compare_group` in `records` (queue order), groups by their latest run,
+/// the newest group first; only groups of two runs or more.
+fn compare_groups(records: &[RunRecord]) -> Vec<(String, Vec<&RunRecord>)> {
+    let mut groups: Vec<(String, Vec<&RunRecord>, usize)> = Vec::new();
+    for (i, r) in records.iter().enumerate() {
+        let Some(g) = r.request.compare_group.as_deref() else {
+            continue;
+        };
+        match groups.iter_mut().find(|(k, _, _)| k == g) {
+            Some((_, v, last)) => {
+                v.push(r);
+                *last = i;
+            }
+            None => groups.push((g.to_string(), vec![r], i)),
+        }
+    }
+    groups.retain(|(_, v, _)| v.len() >= 2);
+    groups.sort_by_key(|g| std::cmp::Reverse(g.2));
+    groups.into_iter().map(|(g, v, _)| (g, v)).collect()
+}
+
+/// A run record as a row of [`compare::compare`].
+fn compare_run(r: &RunRecord) -> CompareRun {
+    let p = r.progress.as_ref();
+    let stop = p.and_then(|p| p.stopped.as_ref());
+    CompareRun {
+        name: r.name.clone(),
+        model: r.request.recipe.label(),
+        scene: r.request.scene,
+        classes: r.request.classes.clone().unwrap_or_default(),
+        excluded: r.request.excluded,
+        balance: r.request.balance.clone(),
+        best_epoch: stop
+            .map(|s| s.best_epoch)
+            .or_else(|| p.and_then(|p| p.best.as_ref()).map(|b| b.epoch)),
+        // A run that trained to its end stopped at its last epoch.
+        stopped_epoch: stop.map(|s| s.epoch).or_else(|| {
+            p.filter(|p| p.epoch > 0 && (r.state == RunState::Done || p.phase.is_some()))
+                .map(|p| p.epoch)
+        }),
+        bench: r.benchmark.clone(),
+    }
+}
+
+/// The comparison of `group` in `records`: its runs and the table; None when no run has it.
+fn group_comparison<'a>(
+    records: &'a [RunRecord],
+    group: &str,
+) -> Option<(Vec<&'a RunRecord>, Comparison)> {
+    let runs: Vec<&RunRecord> = records
+        .iter()
+        .filter(|r| r.request.compare_group.as_deref() == Some(group))
+        .collect();
+    if runs.is_empty() {
+        return None;
+    }
+    let c = compare::compare(&runs.iter().map(|r| compare_run(r)).collect::<Vec<_>>());
+    Some((runs, c))
+}
+
+/// The Comparison cards of `records` (see [`compare_groups`]); older groups start collapsed.
+fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
+    let groups = compare_groups(records);
+    // Open: the newest group, and the newest one with a result when that one has none yet.
+    let with_results = groups
+        .iter()
+        .position(|(_, runs)| runs.iter().any(|r| r.benchmark.is_some()));
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, (group, runs))| {
+            let c = compare::compare(&runs.iter().map(|r| compare_run(r)).collect::<Vec<_>>());
+            let best = |row: usize, col: &str| c.best_per_column.get(col) == Some(&row);
+            let rows = c
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(k, row)| {
+                    let state = runs
+                        .get(k)
+                        .filter(|r| !row.routed && r.benchmark.is_none())
+                        .map(|r| {
+                            if r.state == RunState::Done {
+                                "not benchmarked".to_string()
+                            } else {
+                                state_str(r.state).to_string()
+                            }
+                        })
+                        .unwrap_or_default();
+                    let cells = [
+                        ("day", &row.day),
+                        ("night", &row.night),
+                        ("ir", &row.ir),
+                        ("all", &row.all),
+                    ]
+                    .into_iter()
+                    .map(|(col, cell)| CompareCell {
+                        ap: ap_text(cell.ap50_95),
+                        ap50: cell.ap50.map_or_else(String::new, |a| format!("{a:.3}")),
+                        images: cell.images,
+                        best: !row.routed && best(k, col),
+                    })
+                    .collect();
+                    let epochs = match (row.best_epoch, row.stopped_epoch) {
+                        (Some(b), Some(s)) => format!("best {b} / stopped {s}"),
+                        (Some(b), None) => format!("best {b}"),
+                        (None, Some(s)) => format!("stopped {s}"),
+                        (None, None) => "\u{2014}".into(),
+                    };
+                    CompareRowView {
+                        name: row.name.clone(),
+                        model: row.model.clone(),
+                        scene: row.scene.clone(),
+                        routed: row.routed,
+                        state,
+                        epochs,
+                        cells,
+                        in_scope: ap_text(row.in_scope),
+                        ms: row
+                            .ms_p50
+                            .map_or_else(|| "\u{2014}".into(), |m| format!("{m:.1}")),
+                        ms_best: !row.routed && best(k, "ms_p50"),
+                    }
+                })
+                .collect();
+            CompareCard {
+                group,
+                open: i == 0 || Some(i) == with_results,
+                comparable: c.comparable,
+                warnings: c.warnings,
+                rows,
+            }
+        })
+        .collect()
 }
 
 /// `light: runs on a CPU ...` -> (`light`, `runs on a CPU ...`).
@@ -322,10 +619,23 @@ pub(super) fn view(
     message: Option<String>,
     error: Option<String>,
 ) -> TrainingTemplate {
+    let all = runs(state);
+    let cap = crate::training::capability_with_runs(&all);
+    view_with(state, message, error, all, cap)
+}
+
+/// [`view`] of the run records `all` on `cap` (tests pass their own, so the page does not
+/// depend on the machine they run on).
+fn view_with(
+    state: &AppState,
+    message: Option<String>,
+    error: Option<String>,
+    all: Vec<RunRecord>,
+    cap: Capability,
+) -> TrainingTemplate {
     let config = state.config_read().clone();
     let dataset_dir = crate::collect::CollectSettings::for_config(&config).dir;
     let imports_dir = config.collect.resolved_review_dir(&config.data_root());
-    let cap: Capability = crate::training::capability_with_runs(&runs(state));
     let paths = TrainPaths::for_config(&config);
     let platform = Platform::current();
     let (env_ready, env_note) = match &cap.accelerator {
@@ -409,6 +719,10 @@ pub(super) fn view(
             available: f.available,
             why: f.why.clone().unwrap_or_default(),
             pad: size_cols.saturating_sub(f.sizes.len()),
+            recommended: {
+                let r = recipe::recommended(f.family);
+                format!("{} ep \u{b7} patience {}", r.epochs, r.patience)
+            },
             sizes: f
                 .sizes
                 .iter()
@@ -520,7 +834,6 @@ pub(super) fn view(
         }
         _ => (None, None),
     };
-    let all = runs(state);
     let run_rows = all
         .iter()
         .rev()
@@ -531,13 +844,18 @@ pub(super) fn view(
             model: r.request.recipe.label(),
             state: state_str(r.state),
             busy: r.state.is_busy(),
+            can_finish: can_finish(r),
             percent: r.percent,
             describe: r.describe(),
             dataset: r.dataset.as_ref().map_or_else(String::new, |d| {
-                format!(
+                let mut t = format!(
                     "{} train / {} val / {} held out",
                     d.train_images, d.valid_images, d.heldout_images
-                )
+                );
+                if let Some(b) = &d.balance_summary {
+                    t.push_str(&format!(" \u{b7} balanced: {b}"));
+                }
+                t
             }),
             log_tail: r
                 .log
@@ -624,20 +942,28 @@ pub(super) fn view(
         size_cols,
         notices,
         latencies,
-        epochs: config.training.epochs,
-        scenes: SceneFilter::ALL
+        epochs: config
+            .training
+            .epochs
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
+        patience: config
+            .training
+            .patience
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
+        scenes: SCENE_CHOICES
             .iter()
-            .map(|s| {
-                (
-                    s.as_str(),
-                    match s {
-                        SceneFilter::All => "all frames (a general custom model)",
-                        SceneFilter::Day => "day frames only",
-                        SceneFilter::NightIr => "night + IR frames (a night model)",
-                    },
-                )
+            .map(|(s, title, preset)| SceneChoice {
+                value: s.as_str(),
+                title,
+                describe: s.describe(),
+                prefix: s.label(),
+                preset: *preset,
             })
             .collect(),
+        balance: BalanceView::of(config.training.balance.as_ref()),
+        comparisons: compare_cards(&all),
         public_available: catalog::lila_night().is_some(),
         public_installed: crate::training::public_subset_installed(&config.data_root()),
         public_size: catalog::lila_night()
@@ -711,14 +1037,91 @@ pub(super) fn num<T: std::str::FromStr>(
         .transpose()
 }
 
+/// The dataset side of a queue form, shared with the balance preview ([`data_fields`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DataFields {
+    /// Ticked `dataset`s, then the typed `dataset_path`, as typed (see [`checked_datasets`]).
+    pub datasets: Vec<PathBuf>,
+    pub include_public: bool,
+    pub scenes: Vec<SceneFilter>,
+    /// Empty = every class of the datasets.
+    pub classes: Vec<String>,
+    pub excluded: Excluded,
+    pub balance: Balance,
+}
+
+/// The datasets, scenes ([`scenes_of`]), classes ([`classes_of`]), excluded mode, public mix
+/// and balance ([`balance_of`]) of a queue or preview form. Errors name the field.
+pub(crate) fn data_fields(
+    f: &[(String, String)],
+    training: &crate::training::config::TrainingConfig,
+) -> anyhow::Result<DataFields> {
+    let mut datasets: Vec<PathBuf> = all(f, "dataset").into_iter().map(PathBuf::from).collect();
+    if let Some(extra) = field(f, "dataset_path") {
+        datasets.push(PathBuf::from(extra));
+    }
+    let excluded = match field(f, "excluded") {
+        Some(v) => Excluded::parse(v).ok_or_else(|| {
+            anyhow::anyhow!("objects of unticked classes: '{v}' is not background or drop-frame")
+        })?,
+        None => Excluded::Background,
+    };
+    Ok(DataFields {
+        datasets,
+        include_public: field(f, "public").is_some(),
+        scenes: scenes_of(f)?,
+        classes: classes_of(f),
+        excluded,
+        balance: balance_of(f, training)?,
+    })
+}
+
+/// The Balance fieldset of a form: `balance` (repeated axis checkboxes and / or comma lists of
+/// `class`, `scene`, `camera`, `camera-day`), `balance_strength` (0..=1), `balance_max_repeat`
+/// (1..=10) and `balance_cap` (x the median group size), which applies only with the
+/// `balance_cap_on` checkbox (a blank cap = [`crate::training::dataset::balance::DEFAULT_CAP`]).
+/// A form without any `balance*` field (a script, a bookmark) gets `training.balance`, else
+/// off; no axis = off whatever the other fields say. Errors name the field.
+pub(crate) fn balance_of(
+    f: &[(String, String)],
+    training: &crate::training::config::TrainingConfig,
+) -> anyhow::Result<Balance> {
+    use crate::training::dataset::balance::DEFAULT_CAP;
+    if !f.iter().any(|(k, _)| k.starts_with("balance")) {
+        return Ok(training.balance.clone().unwrap_or_default());
+    }
+    let mut axes = std::collections::BTreeSet::new();
+    for v in all(f, "balance") {
+        axes.extend(Balance::parse_axes(v)?);
+    }
+    let d = Balance::default();
+    let strength: Option<f32> = num(f, "balance_strength", "balance strength")?;
+    let max_repeat: Option<u32> = num(f, "balance_max_repeat", "balance max repeat")?;
+    let cap: Option<f32> = num(f, "balance_cap", "balance cap")?;
+    let b = Balance {
+        axes,
+        strength: strength.unwrap_or(d.strength),
+        max_repeat: max_repeat.unwrap_or(d.max_repeat),
+        cap_dominant: field(f, "balance_cap_on")
+            .is_some()
+            .then(|| cap.unwrap_or(DEFAULT_CAP)),
+    };
+    if b.is_off() {
+        return Ok(Balance::default());
+    }
+    b.validate()?;
+    Ok(b)
+}
+
 /// The runs of a queue form: one [`TrainRequest`] per ticked model (`model=yolo26n`, repeated),
 /// sharing the dataset and options fields (`gpu`: `cuda:N`, empty / `auto` = the automatic pick;
-/// the suggested batches are the chosen GPU's). Errors name the field. The paths are taken as typed:
-/// [`queue`] checks them ([`checked_datasets`], [`checked_folder`]).
+/// the suggested batches are the chosen GPU's; blank `epochs` / `patience` = `training`'s value,
+/// else the family's recommendation, per model). Errors name the field. The paths are taken as
+/// typed: [`queue`] checks them ([`checked_datasets`], [`checked_folder`]).
 pub(crate) fn requests_from_form(
     f: &[(String, String)],
     cap: &Capability,
-    default_epochs: u32,
+    training: &crate::training::config::TrainingConfig,
 ) -> anyhow::Result<(Vec<TrainRequest>, Option<String>)> {
     let models = all(f, "model");
     if models.is_empty() {
@@ -726,23 +1129,8 @@ pub(crate) fn requests_from_form(
     }
     let gpu = crate::training::capability::gpu_arg(field(f, "gpu"))?;
     let cap = &cap.for_gpu(gpu.as_deref())?;
-    let mut datasets: Vec<PathBuf> = all(f, "dataset").into_iter().map(PathBuf::from).collect();
-    if let Some(extra) = field(f, "dataset_path") {
-        datasets.push(PathBuf::from(extra));
-    }
-    let scene = match field(f, "scene") {
-        Some(s) => SceneFilter::parse(s)
-            .ok_or_else(|| anyhow::anyhow!("scene: '{s}' is not all, day or night+ir"))?,
-        None => SceneFilter::All,
-    };
-    let classes: Vec<String> = field(f, "classes")
-        .map(|c| {
-            c.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let data = data_fields(f, training)?;
+    let scenes = &data.scenes;
     let night = field(f, "night_aug").is_some();
     let base = if night {
         Augment::NIGHT
@@ -754,7 +1142,8 @@ pub(crate) fn requests_from_form(
         noise: num(f, "aug_noise", "noise")?.unwrap_or(base.noise),
         gray: num(f, "aug_gray", "grayscale")?.unwrap_or(base.gray),
     };
-    let epochs = num(f, "epochs", "epochs")?.unwrap_or(default_epochs);
+    let epochs: Option<u32> = num(f, "epochs", "epochs")?;
+    let patience: Option<u32> = num(f, "patience", "patience")?;
     let batch: Option<u32> = num(f, "batch", "batch")?;
     let imgsz: Option<u32> = num(f, "imgsz", "input size")?;
     let lr: Option<f32> = num(f, "lr", "learning rate")?;
@@ -764,19 +1153,31 @@ pub(crate) fn requests_from_form(
         None => recipe::MultiScale::Auto,
     };
     let name = field(f, "name").map(str::to_string);
-    if name.is_some() && models.len() > 1 {
-        anyhow::bail!("a model name works with one ticked model only; clear it or tick one");
+    if name.is_some() && models.len() * scenes.len() > 1 {
+        anyhow::bail!(
+            "a model name works with one run only (one ticked model, one scene); clear it or \
+             tick one of each"
+        );
     }
+    // Several scenes: one comparison group for every run (same held-out frames, one table).
+    let compare_group =
+        (scenes.len() > 1).then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
     let sets: Vec<String> = all(f, "benchmark_set")
         .into_iter()
         .filter(|s| EXTRA_SETS.contains(s))
         .map(str::to_string)
         .collect();
     let mut out = Vec::new();
-    for m in models {
+    for (m, scene) in models
+        .iter()
+        .flat_map(|m| scenes.iter().map(move |s| (*m, *s)))
+    {
         let (family, size) =
             recipe::parse_label(m).ok_or_else(|| anyhow::anyhow!("model: unknown '{m}'"))?;
-        let mut r = TrainRecipe::new(family, size, epochs)?;
+        let mut r = TrainRecipe::new(family, size)?;
+        r.epochs = epochs.unwrap_or_else(|| training.epochs_for(family));
+        // A typed patience is checked against the epochs; a default one is capped by them.
+        r.patience = patience.unwrap_or_else(|| training.patience_for(family).min(r.epochs));
         if let Some(i) = imgsz {
             r.imgsz = i;
         }
@@ -792,18 +1193,65 @@ pub(crate) fn requests_from_form(
         r.multi_scale = multi_scale;
         out.push(TrainRequest {
             recipe: r,
-            datasets: datasets.clone(),
-            include_public: field(f, "public").is_some(),
+            datasets: data.datasets.clone(),
+            include_public: data.include_public,
             scene,
-            classes: (!classes.is_empty()).then(|| classes.clone()),
+            classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
             rename: Default::default(),
             benchmark_sets: sets.clone(),
             allow_large: field(f, "confirm_large").is_some(),
             install_dir: field(f, "install_dir").map(PathBuf::from),
             gpu: gpu.clone(),
+            excluded: data.excluded,
+            balance: data.balance.clone(),
+            compare_group: compare_group.clone(),
         });
     }
     Ok((out, name))
+}
+
+/// The scene filters of a queue form: every `scene` field (repeated checkboxes, each `all` or
+/// scenes joined by `+`), deduplicated by meaning in form order; none = all frames.
+pub(crate) fn scenes_of(f: &[(String, String)]) -> anyhow::Result<Vec<SceneFilter>> {
+    let mut out: Vec<SceneFilter> = Vec::new();
+    for s in all(f, "scene") {
+        let v = SceneFilter::parse(s).ok_or_else(|| {
+            anyhow::anyhow!("scene: '{s}' is not all or scenes joined by + (day, night, ir)")
+        })?;
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    if out.is_empty() {
+        out.push(SceneFilter::ALL_SCENES);
+    }
+    Ok(out)
+}
+
+/// The classes of a queue form, in order: repeated `classes` fields (the class picker) and
+/// comma-separated ones (the older text field, bookmarks), without duplicates; empty = every
+/// class of the datasets.
+pub(crate) fn classes_of(f: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in all(f, "classes").into_iter().flat_map(|v| v.split(',')) {
+        let c = c.trim();
+        if !c.is_empty() && !out.iter().any(|o| o == c) {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// `base`, or `base-2`, `base-3`, ... when `taken` (a default model name already used by a busy
+/// run, a configured model or an installed file: two queues within the same minute).
+pub(crate) fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_string();
+    }
+    (2..10_000u32)
+        .map(|i| format!("{base}-{i}"))
+        .find(|n| !taken(n))
+        .unwrap_or_else(|| base.to_string())
 }
 
 /// The dataset folders of a queue form: a ticked `dataset` is taken as is when it is one the
@@ -884,6 +1332,229 @@ pub(super) async fn json(State(state): State<Arc<AppState>>) -> Response {
             "metrics": crate::training::progress::METRICS,
         }))
         .into_response()
+    })
+    .await
+}
+
+/// The class inventory of `datasets` (query values: offered folders as they are, others through
+/// `allow`; see [`checked_datasets`]): every class with its boxes per scene
+/// ([`crate::training::dataset::inventory`]), the classes in list order (`classes.txt` of each
+/// folder, then the rest), frames per scene, and one error per folder that could not be used.
+pub(crate) fn dataset_inventory(
+    datasets: &[&str],
+    offered: &[PathBuf],
+    data_path: &dyn Fn(&std::path::Path) -> PathBuf,
+    allow: &dyn Fn(&str) -> Result<PathBuf, String>,
+) -> serde_json::Value {
+    use crate::training::dataset;
+    let mut sources = Vec::new();
+    let mut errors = Vec::new();
+    for d in datasets {
+        let p = PathBuf::from(d);
+        let dir = if offered.contains(&p) {
+            Ok(data_path(&p))
+        } else {
+            allow(d)
+        };
+        match dir.and_then(|dir| dataset::read_export(&dir).map_err(|e| format!("{e:#}"))) {
+            Ok(s) => sources.push(s),
+            Err(e) => errors.push(serde_json::json!({ "dataset": d, "message": e })),
+        }
+    }
+    let classes = dataset::inventory(&sources, &Default::default());
+    let mut order: Vec<String> = Vec::new();
+    for c in sources
+        .iter()
+        .flat_map(|s| s.classes.iter())
+        .chain(classes.iter().map(|c| &c.name))
+    {
+        if !order.contains(c) {
+            order.push(c.clone());
+        }
+    }
+    let mut frames = dataset::SceneCounts::default();
+    for f in sources.iter().flat_map(|s| s.frames.iter()) {
+        *match f.scene.as_deref() {
+            Some("day") => &mut frames.day,
+            Some("night") => &mut frames.night,
+            Some("ir") => &mut frames.ir,
+            _ => &mut frames.unknown,
+        } += 1;
+    }
+    serde_json::json!({
+        "success": true,
+        "classes": classes,
+        "order": order,
+        "frames": frames,
+        "errors": errors,
+    })
+}
+
+/// `GET /v1/training/dataset-classes?dataset=<path>&dataset=...`: the class picker's classes
+/// with their box counts per scene ([`dataset_inventory`]). A folder that cannot be used is
+/// listed in `errors` (200: the page asks while folders are ticked or typed). A browser request
+/// marked `Sec-Fetch-Site: cross-site` is 403.
+pub(super) async fn dataset_classes(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<Vec<(String, String)>>,
+) -> Response {
+    if super::guard::fetch_site_cross(&headers) {
+        return json_fail(
+            StatusCode::FORBIDDEN,
+            "Cross-site request refused: the class list answers this server's own pages only.",
+        );
+    }
+    blocking(move || {
+        let config = state.config_read().clone();
+        let datasets = all(&q, "dataset");
+        Json(dataset_inventory(
+            &datasets,
+            &offered_datasets(&config),
+            &|p| config.data_path(p),
+            &allow_in(&config),
+        ))
+        .into_response()
+    })
+    .await
+}
+
+/// The balance preview of a queue form ([`data_fields`]; the models are not needed): one run
+/// per scene filter, each [`crate::training::preview_plan`] (the job's sources and options,
+/// nothing written) as `{scene, title, report, warnings, classes, train_frames, train_images,
+/// valid_frames, heldout_frames, dropped, error}` (`report` null when balancing is off; `error`
+/// set when that run cannot be planned). The folders are checked like the queue's
+/// ([`checked_datasets`]); a bad field or folder is an error naming it.
+pub(crate) fn balance_preview_json(
+    f: &[(String, String)],
+    config: &crate::config::Config,
+) -> anyhow::Result<serde_json::Value> {
+    let data = data_fields(f, &config.training)?;
+    let datasets = checked_datasets(f, &offered_datasets(config), &allow_in(config))?;
+    if datasets.is_empty() && config.training.datasets.is_empty() {
+        anyhow::bail!("no dataset: tick a review export folder or type one under Another folder");
+    }
+    // A placeholder model: the plan depends on the data fields only.
+    let recipe = TrainRecipe::new(catalog::TrainFamily::Yolo26, "n")?;
+    let runs: Vec<serde_json::Value> = data
+        .scenes
+        .iter()
+        .map(|&scene| {
+            let title = SCENE_CHOICES
+                .iter()
+                .find(|(s, _, _)| *s == scene)
+                .map_or_else(
+                    || scene.describe().to_string(),
+                    |(_, t, _)| (*t).to_string(),
+                );
+            let request = TrainRequest {
+                recipe: recipe.clone(),
+                datasets: datasets.clone(),
+                include_public: data.include_public,
+                scene,
+                classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
+                rename: Default::default(),
+                benchmark_sets: Vec::new(),
+                allow_large: false,
+                install_dir: None,
+                gpu: None,
+                excluded: data.excluded,
+                balance: data.balance.clone(),
+                compare_group: None,
+            };
+            match crate::training::preview_plan(config, &request) {
+                Ok(p) => serde_json::json!({
+                    "scene": scene.as_str(),
+                    "title": title,
+                    "report": p.balance,
+                    "warnings": p.warnings,
+                    "classes": p.classes,
+                    "train_frames": p.train.len(),
+                    "train_images": p.train.iter().map(|(_, n)| *n as usize).sum::<usize>(),
+                    "valid_frames": p.valid.len(),
+                    "heldout_frames": p.heldout.len(),
+                    "dropped": p.stats.balance_dropped,
+                    "error": null,
+                }),
+                Err(e) => serde_json::json!({
+                    "scene": scene.as_str(),
+                    "title": title,
+                    "report": null,
+                    "warnings": [],
+                    "error": format!("{e:#}"),
+                }),
+            }
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "success": true,
+        "balance": data.balance,
+        "runs": runs,
+    }))
+}
+
+/// `POST /v1/training/balance-preview` with the queue form's fields (urlencoded): what
+/// balancing would do to each run's training frames ([`balance_preview_json`]). 400 with
+/// `{success: false, message}` for a bad field or folder; a browser request marked
+/// `Sec-Fetch-Site: cross-site` is 403.
+pub(super) async fn balance_preview(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if super::guard::fetch_site_cross(&headers) {
+        return json_fail(
+            StatusCode::FORBIDDEN,
+            "Cross-site request refused: the balance preview answers this server's own pages \
+             only.",
+        );
+    }
+    blocking(move || {
+        let f = super::dataset::parse_form(&body);
+        let config = state.config_read().clone();
+        match balance_preview_json(&f, &config) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        }
+    })
+    .await
+}
+
+/// `GET /v1/training/compare?group=<id>`: the day / night / mixed comparison of the runs queued
+/// together as `group` ([`compare::compare`]): `runs` (id, name, state), `comparison` (rows,
+/// best per column, comparable, warnings) and `text` (the CLI's table). 400 without a group,
+/// 404 for an unknown one.
+pub(super) async fn compare_json(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<Vec<(String, String)>>,
+) -> Response {
+    blocking(move || {
+        let Some(group) = field(&q, "group").map(str::to_string) else {
+            return json_fail(
+                StatusCode::BAD_REQUEST,
+                "give a comparison group (group=...)",
+            );
+        };
+        let records = runs(&state);
+        match group_comparison(&records, &group) {
+            Some((rs, c)) => Json(serde_json::json!({
+                "success": true,
+                "group": group,
+                "runs": rs
+                    .iter()
+                    .map(|r| serde_json::json!({
+                        "id": r.id, "name": r.name, "state": state_str(r.state)
+                    }))
+                    .collect::<Vec<_>>(),
+                "text": c.render_text(),
+                "comparison": c,
+            }))
+            .into_response(),
+            None => json_fail(
+                StatusCode::NOT_FOUND,
+                format!("no comparison group {group} in the run list"),
+            ),
+        }
     })
     .await
 }
@@ -969,7 +1640,7 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
         let config = state.config_read().clone();
         let cap = crate::training::capability_with_runs(&runs(&state));
         let result = (|| -> anyhow::Result<String> {
-            let (mut reqs, name) = requests_from_form(&f, &cap, config.training.epochs)?;
+            let (mut reqs, name) = requests_from_form(&f, &cap, &config.training)?;
             // Only folders the page offers, or ones the file browser may show / picked natively.
             let allow = allow_in(&config);
             let datasets = checked_datasets(&f, &offered_datasets(&config), &allow)?;
@@ -1001,9 +1672,36 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                 }
             }
             let svc = service(&shared);
-            let mut queued = Vec::new();
+            // Default names, made unique here: a comparison queued again within the minute
+            // (the stamp's resolution) gets `-2`, ... instead of a refusal.
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+            let busy: Vec<String> = svc
+                .runs()
+                .into_iter()
+                .filter(|r| r.state.is_busy())
+                .map(|r| r.name)
+                .collect();
+            let models_dir = TrainPaths::for_config(&config).export.models;
+            let mut names: Vec<String> = Vec::new();
+            let mut jobs = Vec::new();
             for r in reqs {
-                let job = crate::training::plan_job(&config, r, &cap, name.clone())?;
+                let name = name.clone().unwrap_or_else(|| {
+                    let base = r.recipe.default_name(r.scene.label(), &stamp);
+                    let dir = r.install_dir.as_deref().unwrap_or(&models_dir);
+                    unique_name(&base, |n| {
+                        names.iter().chain(&busy).any(|o| o.eq_ignore_ascii_case(n))
+                            || config
+                                .models
+                                .iter()
+                                .any(|m| m.effective_name().eq_ignore_ascii_case(n))
+                            || dir.join(format!("{n}.onnx")).exists()
+                    })
+                });
+                names.push(name.clone());
+                jobs.push(crate::training::plan_job(&config, r, &cap, Some(name))?);
+            }
+            let mut queued = Vec::new();
+            for job in jobs {
                 let on = job
                     .request
                     .gpu
@@ -1041,6 +1739,27 @@ pub(super) async fn cancel(
                 None,
                 Some(format!("No queued or running run {id}.")),
             ))
+        }
+    })
+    .await
+}
+
+/// `POST /training/finish` (`id`): stop the running run after its current epoch and export its
+/// best epoch ([`TrainingService::finish`]).
+pub(super) async fn finish(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    blocking(move || {
+        let f = super::dataset::parse_form(&body);
+        let id = field(&f, "id").unwrap_or_default().to_string();
+        let r = SERVICE
+            .get()
+            .ok_or_else(|| format!("no run {id}"))
+            .and_then(|s| s.finish(&id));
+        match r {
+            Ok(m) => render(&view(&state, Some(m), None)),
+            Err(e) => render(&view(&state, None, Some(format!("Not finished: {e}.")))),
         }
     })
     .await
@@ -1383,7 +2102,7 @@ mod tests {
             requests_from_form(
                 &form(&[("model", "rfdetr-medium"), ("dataset", "/x"), ("gpu", g)]),
                 &cap,
-                50,
+                &Default::default(),
             )
             .map(|(r, _)| r.into_iter().next().unwrap())
         };
@@ -1405,7 +2124,7 @@ mod tests {
         let e = requests_from_form(
             &form(&[("model", "yolo26n"), ("dataset", "/x"), ("gpu", "cuda:0")]),
             &mac(),
-            50,
+            &Default::default(),
         )
         .unwrap_err()
         .to_string();
@@ -1427,7 +2146,7 @@ mod tests {
             ("benchmark_set", "nir-night"),
             ("benchmark_set", "evil"),
         ]);
-        let (reqs, name) = requests_from_form(&f, &mac(), 50).unwrap();
+        let (reqs, name) = requests_from_form(&f, &mac(), &Default::default()).unwrap();
         assert_eq!(name, None);
         assert_eq!(reqs.len(), 2);
         let r = &reqs[1];
@@ -1445,7 +2164,7 @@ mod tests {
             r.datasets,
             [PathBuf::from("/exports/a"), PathBuf::from("/exports/b")]
         );
-        assert_eq!(r.scene, SceneFilter::NightIr);
+        assert_eq!(r.scene, SceneFilter::NIGHT_IR);
         assert_eq!(
             r.classes.as_deref(),
             Some(&["cat".to_string(), "raccoon".to_string()][..])
@@ -1462,7 +2181,7 @@ mod tests {
                 ("confirm_large", "on"),
             ]),
             &mac(),
-            50,
+            &Default::default(),
         )
         .unwrap();
         assert!(reqs[0].include_public && reqs[0].allow_large);
@@ -1470,26 +2189,57 @@ mod tests {
         let (reqs, _) = requests_from_form(
             &form(&[("model", "yolo26n"), ("install_dir", " /srv/models ")]),
             &mac(),
-            50,
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(reqs[0].install_dir, Some(PathBuf::from("/srv/models")));
-        let e = requests_from_form(&form(&[("dataset", "/x")]), &mac(), 50).unwrap_err();
+        let e = requests_from_form(&form(&[("dataset", "/x")]), &mac(), &Default::default())
+            .unwrap_err();
         assert!(e.to_string().contains("no model ticked"));
         let e = requests_from_form(
             &form(&[("model", "yolo26n"), ("epochs", "lots")]),
             &mac(),
-            50,
+            &Default::default(),
         )
         .unwrap_err();
         assert!(e.to_string().contains("epochs"));
         let e = requests_from_form(
             &form(&[("model", "yolo26n"), ("model", "yolo26s"), ("name", "x")]),
             &mac(),
-            50,
+            &Default::default(),
         )
         .unwrap_err();
         assert!(e.to_string().contains("one ticked model"));
+    }
+
+    #[test]
+    fn form_epochs_and_patience_fall_back_to_the_config_then_the_family() {
+        let post = |extra: &[(&str, &str)], t: &crate::training::config::TrainingConfig| {
+            let mut f = vec![("model", "yolo26n"), ("model", "dfine-s")];
+            f.extend_from_slice(extra);
+            let (reqs, _) = requests_from_form(&form(&f), &mac(), t).unwrap();
+            reqs.iter()
+                .map(|r| (r.recipe.epochs, r.recipe.patience))
+                .collect::<Vec<_>>()
+        };
+        let none = crate::training::config::TrainingConfig::default();
+        assert_eq!(post(&[], &none), [(100, 15), (80, 10)]);
+        assert_eq!(
+            post(&[("epochs", ""), ("patience", "")], &none),
+            [(100, 15), (80, 10)]
+        );
+        let set = crate::training::config::TrainingConfig {
+            epochs: Some(12),
+            patience: Some(4),
+            ..none.clone()
+        };
+        assert_eq!(post(&[], &set), [(12, 4), (12, 4)]);
+        assert_eq!(
+            post(&[("epochs", "6"), ("patience", "0")], &set),
+            [(6, 0), (6, 0)]
+        );
+        // A recommended patience above typed epochs is capped by them.
+        assert_eq!(post(&[("epochs", "5")], &none), [(5, 5), (5, 5)]);
     }
 
     #[test]
@@ -1992,10 +2742,557 @@ mod tests {
         )
         .await;
         assert!(String::from_utf8(b).unwrap().contains("No paused job"));
+        // Finish now: only a training run on the queue's thread.
+        for id in [run, "no-such-run"] {
+            let (s, _, b) = call(
+                &state,
+                post_form("/training/finish", &format!("id={id}"), true),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK);
+            let b = String::from_utf8(b).unwrap();
+            assert!(b.contains("Not finished:"), "{id}");
+        }
         for id in [run, paused] {
             svc.put_task_record(rec(id, RunState::Cancelled));
             svc.remove(id).unwrap();
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scenes_times_models_queue_a_comparison_group() {
+        let f = form(&[
+            ("model", "yolo26n"),
+            ("model", "rfdetr-nano"),
+            ("scene", "day"),
+            ("scene", "night+ir"),
+            ("scene", "all"),
+            ("scene", "ir+night"),
+            ("scene", ""),
+        ]);
+        let (reqs, name) = requests_from_form(&f, &mac(), &Default::default()).unwrap();
+        assert_eq!(name, None);
+        let got: Vec<(String, &str)> = reqs
+            .iter()
+            .map(|r| (r.recipe.label(), r.scene.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("yolo26n".to_string(), "day"),
+                ("yolo26n".to_string(), "night+ir"),
+                ("yolo26n".to_string(), "all"),
+                ("rfdetr-nano".to_string(), "day"),
+                ("rfdetr-nano".to_string(), "night+ir"),
+                ("rfdetr-nano".to_string(), "all"),
+            ]
+        );
+        let group = reqs[0].compare_group.clone().unwrap();
+        assert!(group.starts_with("cmp-") && group.len() == "cmp-20261027-120000".len());
+        assert!(
+            reqs.iter()
+                .all(|r| r.compare_group.as_ref() == Some(&group))
+        );
+        // Every run gets its own default name within the same stamp.
+        let mut names: Vec<String> = reqs
+            .iter()
+            .map(|r| r.recipe.default_name(r.scene.label(), "20261027-1200"))
+            .collect();
+        assert_eq!(
+            names[..3],
+            [
+                "day-yolo26n-20261027-1200",
+                "night-yolo26n-20261027-1200",
+                "custom-yolo26n-20261027-1200"
+            ]
+        );
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 6);
+        // One scene: no group, even with several models; none ticked = all.
+        let (reqs, _) = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("model", "yolo26s"),
+                ("scene", "night"),
+            ]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(reqs.iter().all(|r| r.compare_group.is_none()));
+        assert_eq!(reqs[0].scene, SceneFilter::new(false, true, false));
+        let (reqs, _) =
+            requests_from_form(&form(&[("model", "yolo26n")]), &mac(), &Default::default())
+                .unwrap();
+        assert_eq!(reqs[0].scene, SceneFilter::ALL_SCENES);
+        assert_eq!(reqs[0].compare_group, None);
+        // A typed name: one run only, scenes included.
+        let e = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("scene", "day"),
+                ("scene", "all"),
+                ("name", "x"),
+            ]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("one run only"), "{e}");
+        let (reqs, name) = requests_from_form(
+            &form(&[("model", "yolo26n"), ("scene", "day"), ("name", "x")]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!((reqs.len(), name.as_deref()), (1, Some("x")));
+        let e = requests_from_form(
+            &form(&[("model", "yolo26n"), ("scene", "dusk")]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(e.to_string().starts_with("scene: 'dusk'"), "{e}");
+    }
+
+    #[test]
+    fn classes_repeat_or_comma_and_excluded_parses() {
+        let (reqs, _) = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("classes", "person"),
+                ("classes", "car, dog"),
+                ("classes", " person "),
+                ("classes", ""),
+                ("excluded", "drop-frame"),
+            ]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reqs[0].classes.as_deref(),
+            Some(&["person".to_string(), "car".into(), "dog".into()][..])
+        );
+        assert_eq!(reqs[0].excluded, Excluded::DropFrame);
+        let (reqs, _) =
+            requests_from_form(&form(&[("model", "yolo26n")]), &mac(), &Default::default())
+                .unwrap();
+        assert_eq!(reqs[0].classes, None);
+        assert_eq!(reqs[0].excluded, Excluded::Background);
+        let e = requests_from_form(
+            &form(&[("model", "yolo26n"), ("excluded", "maybe")]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("objects of unticked classes: 'maybe'"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn default_names_get_a_suffix_when_taken() {
+        let taken = ["day-yolo26n-1", "day-yolo26n-1-2"];
+        let t = |n: &str| taken.contains(&n);
+        assert_eq!(unique_name("night-yolo26n-1", t), "night-yolo26n-1");
+        assert_eq!(unique_name("day-yolo26n-1", t), "day-yolo26n-1-3");
+        assert!(recipe::valid_model_name(&unique_name("day-yolo26n-1", t)).is_ok());
+    }
+
+    /// A tiny export: `person` boxes in day and night frames, `car` in one IR frame.
+    fn tiny_export(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("classes.txt"), "person\ncar\nbus\n").unwrap();
+        for (stem, labels) in [
+            (
+                "day.cam1.2026-10-01.a",
+                "0 0.5 0.5 0.2 0.4\n0 0.2 0.2 0.1 0.2\n",
+            ),
+            ("night.cam1.2026-10-02.b", "0 0.5 0.5 0.2 0.4\n"),
+            ("ir.cam2.2026-10-02.c", "1 0.5 0.5 0.3 0.2\n"),
+            ("plain", ""),
+        ] {
+            std::fs::write(dir.join("images").join(format!("{stem}.jpg")), b"x").unwrap();
+            std::fs::write(dir.join("labels").join(format!("{stem}.txt")), labels).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dataset_classes_lists_counts_per_scene_and_refuses_other_folders() {
+        use crate::server::test_util::{REMOTE, call, from_peer, get_text, test_state_with};
+        let root = std::env::temp_dir().join(format!("bop-train-cls-{}", uuid::Uuid::new_v4()));
+        let export = root.join("exports/review-1");
+        tiny_export(&export);
+        let (r2, e2) = (root.clone(), export.clone());
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(r2);
+            c.training.datasets = vec![e2];
+        });
+        let enc = super::super::encode_uri_component(&export.display().to_string());
+        let (s, text) = get_text(
+            &state,
+            &format!("/v1/training/dataset-classes?dataset={enc}&dataset=%2Fno%2Fsuch%2Fexport"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["success"], true);
+        let classes = v["classes"].as_array().unwrap();
+        assert_eq!(classes[0]["name"], "person");
+        assert_eq!(classes[0]["boxes"], 3);
+        assert_eq!(classes[0]["frames"], 2);
+        assert_eq!(
+            classes[0]["by_scene"],
+            serde_json::json!({"day": 2, "night": 1, "ir": 0, "unknown": 0})
+        );
+        assert_eq!(classes[1]["name"], "car");
+        assert_eq!(classes[1]["by_scene"]["ir"], 1);
+        // A listed class without a box is still offered; the order is the class list's.
+        assert_eq!(classes[2]["name"], "bus");
+        assert_eq!(classes[2]["boxes"], 0);
+        assert_eq!(v["order"], serde_json::json!(["person", "car", "bus"]));
+        assert_eq!(
+            v["frames"],
+            serde_json::json!({"day": 1, "night": 1, "ir": 1, "unknown": 1})
+        );
+        // The folder outside the offered and browsable ones is refused and named.
+        let errors = v["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{v}");
+        assert_eq!(errors[0]["dataset"], "/no/such/export");
+        assert!(errors[0]["message"].as_str().is_some_and(|m| !m.is_empty()));
+        // Nothing ticked: nothing listed.
+        let (_, text) = get_text(&state, "/v1/training/dataset-classes").await;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(v["classes"].as_array().unwrap().is_empty());
+        // Admin only.
+        let req = axum::http::Request::get("/v1/training/dataset-classes")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (s, _, _) = call(&state, from_peer(req, REMOTE)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn scene_ap(v: f64) -> crate::training::job::SceneAp {
+        crate::training::job::SceneAp {
+            ap50: Some(v + 0.2),
+            ap50_95: Some(v),
+            images: 10,
+        }
+    }
+
+    /// A run record of comparison `group` (benchmarked with day / night / IR AP when `ap`).
+    fn record(
+        id: &str,
+        scene: SceneFilter,
+        group: Option<&str>,
+        st: RunState,
+        ap: Option<(f64, f64, f64)>,
+    ) -> RunRecord {
+        use crate::resources::catalog::TrainFamily;
+        let request = TrainRequest {
+            recipe: TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap(),
+            datasets: vec!["/exports/a".into()],
+            include_public: false,
+            scene,
+            classes: Some(vec!["person".into()]),
+            rename: Default::default(),
+            benchmark_sets: Vec::new(),
+            allow_large: false,
+            install_dir: None,
+            gpu: None,
+            excluded: Excluded::Background,
+            balance: Default::default(),
+            compare_group: group.map(str::to_string),
+        };
+        let benchmark = ap.map(|(d, n, i)| BenchSummary {
+            datasets: vec![format!("heldout-{id}")],
+            device: Some("ort:coreml".into()),
+            ms_p50: Some(10.0 + d),
+            ap50: Some(d + 0.2),
+            ap50_95: Some(d),
+            images: 30,
+            by_scene: [
+                ("day", d),
+                ("night", n),
+                ("ir", i),
+                ("all", (d + n + i) / 3.0),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), scene_ap(v)))
+            .collect(),
+            in_scope: Some(scene_ap(d.max(n))),
+            heldout_fingerprint: Some("f1".into()),
+        });
+        RunRecord {
+            id: id.into(),
+            name: format!("{}-yolo26n-{id}", scene.label()),
+            created: String::new(),
+            request,
+            device: "mps".into(),
+            state: st,
+            stage: None,
+            step: 0,
+            steps: 8,
+            percent: 0,
+            detail: String::new(),
+            progress: Some(crate::training::progress::TrainProgress {
+                epoch: 27,
+                epochs: 100,
+                patience: 15,
+                stopped: Some(crate::training::progress::Stop {
+                    reason: "converged".into(),
+                    epoch: 27,
+                    best_epoch: 12,
+                }),
+                ..Default::default()
+            }),
+            log: Vec::new(),
+            dataset: None,
+            output: None,
+            registered: None,
+            benchmark,
+            benchmark_error: None,
+            error: None,
+            finished: None,
+            run_dir: PathBuf::from("/runs").join(id),
+        }
+    }
+
+    fn group_records() -> Vec<RunRecord> {
+        let mut running = record("r9", SceneFilter::DAY, None, RunState::Running, None);
+        running.stage = Some(crate::training::job::TrainStage::Train);
+        running.progress = Some(crate::training::progress::TrainProgress {
+            epoch: 4,
+            epochs: 100,
+            patience: 15,
+            since_best: 1,
+            ..Default::default()
+        });
+        let mut queued = record("r8", SceneFilter::DAY, None, RunState::Queued, None);
+        queued.progress = None;
+        vec![
+            record(
+                "old1",
+                SceneFilter::DAY,
+                Some("cmp-old"),
+                RunState::Done,
+                Some((0.5, 0.1, 0.1)),
+            ),
+            record(
+                "old2",
+                SceneFilter::ALL_SCENES,
+                Some("cmp-old"),
+                RunState::Done,
+                Some((0.4, 0.3, 0.2)),
+            ),
+            record(
+                "a",
+                SceneFilter::DAY,
+                Some("cmp-new"),
+                RunState::Done,
+                Some((0.6, 0.2, 0.1)),
+            ),
+            record(
+                "b",
+                SceneFilter::NIGHT_IR,
+                Some("cmp-new"),
+                RunState::Done,
+                Some((0.3, 0.5, 0.45)),
+            ),
+            record(
+                "c",
+                SceneFilter::ALL_SCENES,
+                Some("cmp-new"),
+                RunState::Running,
+                None,
+            ),
+            record(
+                "solo",
+                SceneFilter::DAY,
+                Some("cmp-solo"),
+                RunState::Done,
+                Some((0.1, 0.1, 0.1)),
+            ),
+            queued,
+            running,
+        ]
+    }
+
+    #[test]
+    fn comparison_groups_rows_and_json() {
+        let recs = group_records();
+        let groups = compare_groups(&recs);
+        let names: Vec<&str> = groups.iter().map(|(g, _)| g.as_str()).collect();
+        assert_eq!(
+            names,
+            ["cmp-new", "cmp-old"],
+            "newest first, single runs left out"
+        );
+        let (runs, c) = group_comparison(&recs, "cmp-new").unwrap();
+        assert_eq!(runs.len(), 3);
+        assert!(c.comparable);
+        assert_eq!(c.rows.len(), 4, "3 runs and the routed row");
+        assert!(c.rows[3].routed);
+        assert_eq!(c.best_per_column["day"], 0);
+        assert_eq!(c.best_per_column["night"], 1);
+        assert_eq!(c.rows[0].best_epoch, Some(12));
+        assert_eq!(c.rows[0].stopped_epoch, Some(27));
+        assert_eq!(c.rows[2].day.ap50_95, None, "the running run has no AP yet");
+        assert!(group_comparison(&recs, "cmp-none").is_none());
+        let cards = compare_cards(&recs);
+        assert_eq!(cards.len(), 2);
+        assert!(cards[0].open && !cards[1].open);
+        let r = &cards[0].rows;
+        assert!(r[0].cells[0].best && !r[1].cells[0].best);
+        assert_eq!(r[0].cells[0].ap, "0.600");
+        assert_eq!(r[0].cells[0].ap50, "0.800");
+        assert_eq!(r[0].epochs, "best 12 / stopped 27");
+        assert_eq!(r[2].cells[0].ap, "\u{2014}");
+        assert_eq!(r[2].state, "running");
+        assert!(r[3].routed && !r[3].cells[1].best);
+        // A different held-out set: not comparable, said so.
+        let mut recs = recs;
+        recs[3].benchmark.as_mut().unwrap().heldout_fingerprint = Some("f2".into());
+        let cards = compare_cards(&recs);
+        assert!(!cards[0].comparable);
+        assert!(!cards[0].warnings.is_empty());
+        // The JSON shape.
+        let (_, c) = group_comparison(&recs, "cmp-old").unwrap();
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["comparable"], true);
+        assert_eq!(v["rows"][0]["day"]["ap50_95"], 0.5);
+        assert_eq!(v["best_per_column"]["night"], 1);
+    }
+
+    #[tokio::test]
+    async fn the_page_shows_runs_comparisons_finish_and_the_new_fields() {
+        use crate::server::test_util::{get_text, test_state_with};
+        use askama::Template;
+        let root = std::env::temp_dir().join(format!("bop-train-cmp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let mut recs = group_records();
+        recs[2].output = Some(TrainOutput {
+            name: recs[2].name.clone(),
+            onnx: root.join("a.onnx"),
+            yaml: root.join("a.yaml"),
+            provenance: root.join("a.provenance.json"),
+            family: ModelFamilyKind::Yolo26,
+            classes: vec!["person".into()],
+            license: "AGPL-3.0".into(),
+            heldout: None,
+            device: "mps".into(),
+            train_seconds: 1.0,
+        });
+        let r9 = recs.iter_mut().find(|r| r.id == "r9").unwrap();
+        r9.dataset = Some(crate::training::service::DatasetCounts {
+            train_images: 412,
+            balance_summary: Some("209 → 412 images/epoch; raccoon 32→118 boxes".into()),
+            ..Default::default()
+        });
+        let page = view_with(
+            &state,
+            None,
+            None,
+            recs,
+            crate::training::capability::host_for_tests(),
+        )
+        .render()
+        .unwrap();
+        // The run's dataset line carries its balance summary.
+        let i = page.find("<tr data-run=\"r9\"").unwrap();
+        let j = i + page[i..].find("</tr>").unwrap();
+        assert!(
+            page[i..j]
+                .contains("412 train / 0 val / 0 held out \u{b7} balanced: 209 → 412 images/epoch"),
+            "{}",
+            &page[i..j]
+        );
+        // The Balance fieldset (collapsed, off by default) and the preview's holder.
+        assert!(page.contains("<details class=\"tr-more tr-balance\" id=\"train-balance\">"));
+        for a in ["class", "scene", "camera", "camera-day"] {
+            assert!(
+                page.contains(&format!("name=\"balance\" value=\"{a}\">")),
+                "axis {a} unticked"
+            );
+        }
+        assert!(page.contains("evens out day / night / IR frame counts"));
+        assert!(page.contains("name=\"balance_strength\" value=\"0.5\" checked>"));
+        assert!(page.contains("name=\"balance_strength\" value=\"1\">"));
+        assert!(
+            page.contains(
+                "name=\"balance_max_repeat\" min=\"1\" max=\"10\" step=\"1\" value=\"4\">"
+            )
+        );
+        assert!(page.contains("name=\"balance_cap_on\" id=\"train-bal-cap-on\">"));
+        assert!(page.contains("name=\"balance_cap\" id=\"train-bal-cap\""));
+        assert!(page.contains("id=\"train-balance-preview\""));
+        // Finish now: shown for the running run in its training stage only.
+        let row = |id: &str| {
+            let i = page
+                .find(&format!("<tr data-run=\"{id}\""))
+                .unwrap_or_else(|| panic!("row {id}"));
+            let j = i + page[i..].find("</tr>").unwrap();
+            page[i..j].to_string()
+        };
+        let shown = "action=\"/training/finish\" class=\"inline\" data-field=\"finish\">";
+        let hidden = "action=\"/training/finish\" class=\"inline\" data-field=\"finish\" hidden>";
+        let (running, queued) = (row("r9"), row("r8"));
+        assert!(running.contains(shown), "{running}");
+        assert!(running.contains("Stop after this epoch and keep the best checkpoint"));
+        assert!(
+            queued.contains(hidden) && !queued.contains(shown),
+            "{queued}"
+        );
+        let c = row("c");
+        assert!(c.contains(hidden), "running but not training: {c}");
+        assert_eq!(page.matches(shown).count(), 1);
+        // The Comparison card: the newest group open, the routed row, the best cells.
+        let i = page.find("id=\"compare\"").expect("the Comparison card");
+        let card = &page[i..i + page[i..].find("id=\"use\"").unwrap()];
+        assert!(
+            card.contains("<details class=\"tr-compare\" open>"),
+            "{card}"
+        );
+        assert!(card.find("cmp-new").unwrap() < card.find("cmp-old").unwrap());
+        assert!(card.contains("day-yolo26n-a"));
+        assert!(card.contains("class=\"tr-routed\""));
+        assert!(card.contains("day + night+ir routed"));
+        assert!(card.contains("class=\"num best-val\""));
+        assert!(!card.contains("cmp-solo"));
+        // The Runs checkboxes, Patience, the recommendation and the class picker's fields.
+        assert!(page.contains("name=\"scene\" value=\"all\" data-prefix=\"custom\" checked>"));
+        assert!(page.contains("name=\"scene\" value=\"night+ir\" data-prefix=\"night\">"));
+        assert!(page.contains("name=\"scene\" value=\"ir\" data-prefix=\"ir\">"));
+        assert!(page.contains("name=\"patience\""));
+        assert!(page.contains(
+            "name=\"epochs\" min=\"1\" max=\"1000\" value=\"\" placeholder=\"recommended\""
+        ));
+        assert!(page.contains("100 ep \u{b7} patience 15"));
+        assert!(page.contains("80 ep \u{b7} patience 10"));
+        assert!(page.contains("id=\"train-picker\""));
+        assert!(page.contains("name=\"excluded\" value=\"drop-frame\""));
+        // The per-run summary of a finished run: AP50-95 per scene and in scope.
+        assert!(
+            page.contains("AP50-95 day 0.600 / night 0.200 / IR 0.100 \u{b7} in scope 0.600"),
+            "the result row"
+        );
+        // The live page renders too, and the compare JSON answers 400 / 404.
+        let (s, _) = get_text(&state, "/training").await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, text) = get_text(&state, "/v1/training/compare").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{text}");
+        let (s, text) = get_text(&state, "/v1/training/compare?group=cmp-nope").await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{text}");
+        assert!(text.contains("cmp-nope"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2008,11 +3305,301 @@ mod tests {
             ap50: Some(0.5),
             ap50_95: None,
             images: 20,
+            ..BenchSummary::default()
         };
         assert_eq!(
             bench_text(Some(&b), None),
             "AP50 0.500 \u{b7} 12.3 ms on openvino:cpu \u{b7} 20 images (heldout-x)"
         );
         assert_eq!(bench_text(None, Some("x")), "benchmark failed: x");
+        // Per scene (only scenes with held-out frames) and in scope.
+        let mut b = b;
+        b.by_scene.insert("day".into(), scene_ap(0.61));
+        b.by_scene.insert("ir".into(), scene_ap(0.3));
+        b.by_scene.insert(
+            "night".into(),
+            crate::training::job::SceneAp {
+                images: 0,
+                ..scene_ap(0.1)
+            },
+        );
+        b.in_scope = Some(scene_ap(0.55));
+        assert!(
+            bench_text(Some(&b), None)
+                .ends_with(" \u{b7} AP50-95 day 0.610 / IR 0.300 \u{b7} in scope 0.550"),
+            "{}",
+            bench_text(Some(&b), None)
+        );
+    }
+
+    #[test]
+    fn balance_fields_parse_default_from_the_config_and_name_bad_values() {
+        use crate::training::config::TrainingConfig;
+        use std::collections::BTreeSet;
+        let t = TrainingConfig::default();
+        let axes = |v: &[BalanceAxis]| v.iter().copied().collect::<BTreeSet<_>>();
+        // Repeated checkboxes and a comma list, strength, max repeat and the gated cap.
+        let b = balance_of(
+            &form(&[
+                ("balance", "class"),
+                ("balance", "scene, camera-day"),
+                ("balance_strength", "1"),
+                ("balance_max_repeat", "6"),
+                ("balance_cap_on", "on"),
+                ("balance_cap", "2.5"),
+            ]),
+            &t,
+        )
+        .unwrap();
+        assert_eq!(
+            b.axes,
+            axes(&[
+                BalanceAxis::Class,
+                BalanceAxis::Scene,
+                BalanceAxis::CameraDay
+            ])
+        );
+        assert_eq!((b.strength, b.max_repeat), (1.0, 6));
+        assert_eq!(b.cap_dominant, Some(2.5));
+        // The cap applies only with its box; a blank cap is the default 3.
+        let b = balance_of(&form(&[("balance", "camera"), ("balance_cap", "2")]), &t).unwrap();
+        assert_eq!(b.cap_dominant, None);
+        assert_eq!((b.strength, b.max_repeat), (0.5, 4), "defaults");
+        let b = balance_of(
+            &form(&[
+                ("balance", "camera"),
+                ("balance_cap_on", "on"),
+                ("balance_cap", ""),
+            ]),
+            &t,
+        )
+        .unwrap();
+        assert_eq!(b.cap_dominant, Some(3.0));
+        // No balance field at all: training.balance, else off.
+        let configured = TrainingConfig {
+            balance: Some(Balance {
+                axes: axes(&[BalanceAxis::Class]),
+                strength: 1.0,
+                ..Balance::default()
+            }),
+            ..TrainingConfig::default()
+        };
+        let none = form(&[("dataset", "/x")]);
+        assert_eq!(
+            &balance_of(&none, &configured).unwrap(),
+            configured.balance.as_ref().unwrap()
+        );
+        assert!(balance_of(&none, &t).unwrap().is_off());
+        // A form with the fieldset but no axis ticked: off, whatever the config or the other
+        // fields say.
+        let off = form(&[("balance_strength", "7"), ("balance_max_repeat", "4")]);
+        assert_eq!(balance_of(&off, &configured).unwrap(), Balance::default());
+        // Bad values name the field.
+        let err = |pairs: &[(&str, &str)]| {
+            let mut v = vec![("balance", "class")];
+            v.extend_from_slice(pairs);
+            format!("{:#}", balance_of(&form(&v), &t).unwrap_err())
+        };
+        let e = format!(
+            "{:#}",
+            balance_of(&form(&[("balance", "class,colour")]), &t).unwrap_err()
+        );
+        assert!(e.contains("balance") && e.contains("'colour'"), "{e}");
+        let e = err(&[("balance_strength", "lots")]);
+        assert!(
+            e.contains("balance strength") && e.contains("'lots'"),
+            "{e}"
+        );
+        assert!(err(&[("balance_strength", "1.5")]).contains("balance.strength"));
+        assert!(err(&[("balance_strength", "NaN")]).contains("balance.strength"));
+        assert!(err(&[("balance_max_repeat", "0")]).contains("balance.max_repeat"));
+        assert!(err(&[("balance_max_repeat", "11")]).contains("balance.max_repeat"));
+        assert!(err(&[("balance_max_repeat", "-1")]).contains("balance max repeat"));
+        assert!(err(&[("balance_cap_on", "on"), ("balance_cap", "0.5")]).contains("cap_dominant"));
+        // Every run of a scenes x models batch gets the same balance.
+        let (reqs, _) = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("model", "yolo26s"),
+                ("scene", "day"),
+                ("scene", "night+ir"),
+                ("balance", "class,scene"),
+                ("balance_strength", "0.5"),
+                ("balance_max_repeat", "5"),
+            ]),
+            &mac(),
+            &t,
+        )
+        .unwrap();
+        assert_eq!(reqs.len(), 4);
+        for r in &reqs {
+            assert_eq!(
+                r.balance.axes,
+                axes(&[BalanceAxis::Class, BalanceAxis::Scene])
+            );
+            assert_eq!(r.balance.max_repeat, 5);
+        }
+        // A bad balance refuses the queue form.
+        let e = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("balance", "class"),
+                ("balance_max_repeat", "0"),
+            ]),
+            &mac(),
+            &t,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("balance.max_repeat"), "{e:#}");
+    }
+
+    /// A review export of 3 cameras x (9 day + 3 IR frames), every fourth one empty, a
+    /// raccoon in the first IR frame of each camera, persons elsewhere.
+    fn skewed_export(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("classes.txt"), "person\nraccoon\n").unwrap();
+        for cam in ["a", "b", "c"] {
+            for (scene, date, n) in [("day", "2026-10-01", 9), ("ir", "2026-10-02", 3)] {
+                for i in 0..n {
+                    let stem = format!("{scene}.{cam}.{date}.f{i}");
+                    std::fs::write(dir.join("images").join(format!("{stem}.jpg")), b"x").unwrap();
+                    let label = match (scene, i % 4) {
+                        (_, 3) => "",
+                        ("ir", 0) => "1 0.5 0.5 0.2 0.2\n",
+                        _ => "0 0.5 0.5 0.2 0.4\n",
+                    };
+                    std::fs::write(dir.join("labels").join(format!("{stem}.txt")), label).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_balance_preview_shows_before_and_after_per_run_and_checks_folders() {
+        use crate::server::test_util::{REMOTE, call, from_peer, post_form, test_state_with};
+        let root = std::env::temp_dir().join(format!("bop-train-bal-{}", uuid::Uuid::new_v4()));
+        let export = root.join("exports/review-1");
+        skewed_export(&export);
+        let (r2, e2) = (root.clone(), export.clone());
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(r2);
+            c.training.datasets = vec![e2];
+        });
+        let enc = super::super::encode_uri_component(&export.display().to_string());
+        let post = |body: String| post_form("/v1/training/balance-preview", &body, false);
+        let json = |b: &[u8]| -> serde_json::Value { serde_json::from_slice(b).unwrap() };
+        // Class balance over two runs (all scenes, day): the raccoon frames repeat.
+        let (s, _, b) = call(
+            &state,
+            post(format!(
+                "dataset={enc}&scene=all&scene=day&balance=class&balance_strength=1&\
+                 balance_max_repeat=4"
+            )),
+        )
+        .await;
+        let v = json(&b);
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["success"], true);
+        assert_eq!(v["balance"]["axes"], serde_json::json!(["class"]));
+        let runs = v["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["scene"], "all");
+        assert_eq!(runs[0]["title"], "All scenes (mixed)");
+        assert_eq!(runs[1]["scene"], "day");
+        let r = &runs[0];
+        assert!(r["error"].is_null(), "{r}");
+        let rep = &r["report"];
+        let before = rep["before"]["boxes_per_class"]["raccoon"]
+            .as_u64()
+            .unwrap();
+        let after = rep["after"]["boxes_per_class"]["raccoon"].as_u64().unwrap();
+        assert!(before > 0 && after > before, "{rep}");
+        assert_eq!(
+            rep["before"]["boxes_per_class"]["person"],
+            rep["after"]["boxes_per_class"]["person"]
+        );
+        assert!(rep["after"]["images"].as_u64() > rep["before"]["images"].as_u64());
+        assert_eq!(r["train_images"], rep["after"]["images"]);
+        assert!(r["train_frames"].as_u64().unwrap() > 0);
+        assert!(r["heldout_frames"].as_u64().unwrap() > 0, "{r}");
+        assert!(r["warnings"].is_array());
+        // Balance off: no report, the counts still.
+        let (s, _, b) = call(&state, post(format!("dataset={enc}&balance_strength=0.5"))).await;
+        let v = json(&b);
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let r = &v["runs"][0];
+        assert!(r["report"].is_null(), "{r}");
+        assert_eq!(r["train_images"], r["train_frames"]);
+        // A folder outside the offered and browsable ones, a bad field: 400 naming it.
+        let (s, _, b) = call(
+            &state,
+            post("dataset_path=%2Fno%2Fsuch%2Fexport&balance=class".into()),
+        )
+        .await;
+        let v = json(&b);
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["success"], false);
+        assert!(
+            v["message"].as_str().unwrap().contains("another folder"),
+            "{v}"
+        );
+        let (s, _, b) = call(&state, post(format!("dataset={enc}&balance=colour"))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(json(&b)["message"].as_str().unwrap().contains("'colour'"));
+        // A class the datasets do not have: that run's error.
+        let (_, _, b) = call(
+            &state,
+            post(format!("dataset={enc}&classes=zebra&balance=class")),
+        )
+        .await;
+        let v = json(&b);
+        assert!(
+            v["runs"][0]["error"]
+                .as_str()
+                .is_some_and(|e| !e.is_empty()),
+            "{v}"
+        );
+        // Cross-site browser requests and remote peers are refused.
+        let mut req = post(format!("dataset={enc}&balance=class"));
+        req.headers_mut()
+            .insert("sec-fetch-site", "cross-site".parse().unwrap());
+        let (s, _, _) = call(&state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = call(&state, from_peer(post(format!("dataset={enc}")), REMOTE)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_balance_fieldset_starts_from_training_balance() {
+        use askama::Template;
+        let state = crate::server::test_util::test_state_with(|c| {
+            c.training.balance = Some(Balance {
+                axes: Balance::parse_axes("scene,camera-day").unwrap(),
+                strength: 0.7,
+                max_repeat: 6,
+                cap_dominant: Some(2.5),
+            });
+        });
+        let page = view_with(
+            &state,
+            None,
+            None,
+            Vec::new(),
+            crate::training::capability::host_for_tests(),
+        )
+        .render()
+        .unwrap();
+        assert!(page.contains("<details class=\"tr-more tr-balance\" id=\"train-balance\" open>"));
+        assert!(page.contains("name=\"balance\" value=\"scene\" checked>"));
+        assert!(page.contains("name=\"balance\" value=\"camera-day\" checked>"));
+        assert!(page.contains("name=\"balance\" value=\"class\">"));
+        // A configured strength that is neither preset: its own radio, checked.
+        assert!(page.contains("name=\"balance_strength\" value=\"0.5\">"));
+        assert!(page.contains("name=\"balance_strength\" value=\"0.7\" checked> Configured (0.7)"));
+        assert!(page.contains("value=\"6\">"));
+        assert!(page.contains("name=\"balance_cap_on\" id=\"train-bal-cap-on\" checked>"));
+        assert!(page.contains("value=\"2.5\""));
     }
 }

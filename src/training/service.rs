@@ -13,7 +13,8 @@
 //! suspended where they are, keeping their memory, loaded models and GPU allocations, and no new
 //! helper starts; work the service does itself between helpers (frame analysis, an in-process
 //! benchmark, a download) finishes first. The queue keeps the job's place (nothing else starts)
-//! until [`TrainingService::resume`] or a cancel.
+//! until [`TrainingService::resume`] or a cancel. A running run can also finish early
+//! ([`TrainingService::finish`]): the trainer stops after its current epoch and exports the best.
 
 use super::job::{
     BenchSummary, Hooks, TrainError, TrainJob, TrainOutput, TrainReport, TrainRequest, TrainStage,
@@ -73,6 +74,24 @@ pub struct DatasetCounts {
     pub heldout_images: usize,
     pub heldout_dir: Option<PathBuf>,
     pub warnings: Vec<String>,
+    /// [`super::dataset::BalanceReport::summary`] when the run balanced its training frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_summary: Option<String>,
+}
+
+impl DatasetCounts {
+    /// The counts of a prepared dataset (recorded when the job reports it).
+    pub fn of(p: &super::dataset::Prepared) -> Self {
+        Self {
+            classes: p.classes.clone(),
+            train_images: p.train_images,
+            valid_images: p.valid_images,
+            heldout_images: p.heldout_images,
+            heldout_dir: p.heldout_dir.clone(),
+            warnings: p.warnings.clone(),
+            balance_summary: p.balance_summary.clone(),
+        }
+    }
 }
 
 /// One run as the Training page and `train list` show it.
@@ -636,6 +655,69 @@ impl TrainingService {
         }
     }
 
+    /// Finish the running run `id` after its current epoch, exporting its best one: writes the
+    /// stop file the trainer checks after each epoch ([`super::job::stop_file`]); a paused run is
+    /// resumed first. Refused (with the reason) unless `id` is the run on the queue's thread in
+    /// its training stage.
+    pub fn finish(&self, id: &str) -> Result<String, String> {
+        let Some(r) = self.get(id) else {
+            return Err(if self.get_task(id).is_some() {
+                format!("{id} is an import or auto-label job; only a training run can finish early")
+            } else {
+                format!("no run {id}")
+            });
+        };
+        if !r.state.is_active() {
+            return Err(format!(
+                "run {id} is {}; only a running run can finish early",
+                r.describe()
+            ));
+        }
+        if r.stage != Some(TrainStage::Train) {
+            return Err(format!(
+                "run {id} is not training yet ({}); cancel it instead, or wait for its training \
+                 stage",
+                r.stage.map_or("starting", |s| s.label())
+            ));
+        }
+        let p = r.progress.as_ref();
+        if let Some(t) = p.and_then(TrainProgress::stop_text) {
+            return Err(format!("run {id} already stopped training: {t}"));
+        }
+        if p.is_some_and(|p| p.phase.is_some()) {
+            return Err(format!("run {id} has finished training and is exporting"));
+        }
+        let cancelling = {
+            let cur = self.inner.current.lock_recover();
+            match cur.as_ref().filter(|c| c.id == id) {
+                Some(c) => c.cancel.load(Ordering::Relaxed),
+                None => return Err(format!("run {id} is not the running job")),
+            }
+        };
+        if cancelling {
+            return Err(format!("run {id} is being cancelled"));
+        }
+        let path = super::job::stop_file(&r.run_dir);
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, now()));
+        if let Err(e) = written {
+            return Err(format!(
+                "cannot write the stop request {}: {e}",
+                path.display()
+            ));
+        }
+        if r.state == RunState::Paused {
+            self.resume(id);
+        }
+        tracing::info!(run = %id, "finish requested");
+        Ok(format!(
+            "Finishing {id} after the current epoch; its best epoch is exported, installed and \
+             benchmarked."
+        ))
+    }
+
     /// Pause the running run or task `id` (see the module docs); false when it is not running
     /// (queued, already paused, finished, unknown).
     pub fn pause(&self, id: &str) -> bool {
@@ -874,16 +956,9 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                     r.progress = None;
                 });
             }
-            TrainReport::Prepared(p) => inner.update(&id, |r| {
-                r.dataset = Some(DatasetCounts {
-                    classes: p.classes.clone(),
-                    train_images: p.train_images,
-                    valid_images: p.valid_images,
-                    heldout_images: p.heldout_images,
-                    heldout_dir: p.heldout_dir.clone(),
-                    warnings: p.warnings.clone(),
-                });
-            }),
+            TrainReport::Prepared(p) => {
+                inner.update(&id, |r| r.dataset = Some(DatasetCounts::of(p)));
+            }
         };
         let runner = PausableRunner {
             inner: inner.runner.as_ref(),
