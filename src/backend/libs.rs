@@ -136,7 +136,8 @@ fn install_dir_override_warning(
     ))
 }
 
-/// Set up environment variables so the finder can locate the runtime.
+/// Set up environment variables so the finder can locate the runtime (and, on affected Windows
+/// CPUs, `ONEDNN_MAX_CPU_ISA`; see [`super::cpu_isa`]).
 /// `explicit` (from config `openvino_dir`) wins over `<exe_dir>/openvino`; an already-set
 /// `OPENVINO_INSTALL_DIR` is left untouched.
 pub fn prepare_environment(explicit: Option<&Path>) {
@@ -145,6 +146,10 @@ pub fn prepare_environment(explicit: Option<&Path>) {
         n.clear();
     }
     *OVERRIDE_WARNING.lock_recover() = None;
+    // Before OpenVINO loads: cap oneDNN's ISA on Windows CPUs whose AMX path faults (decided once).
+    if let Some(n) = super::cpu_isa::apply() {
+        note(n);
+    }
     let existing = std::env::var_os(ENV_INSTALL_DIR).filter(|v| !v.is_empty());
     let install_dir: Option<PathBuf> = if let Some(v) = existing {
         let p = PathBuf::from(&v);

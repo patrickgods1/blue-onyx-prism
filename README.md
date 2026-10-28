@@ -1072,6 +1072,10 @@ response has `success: false` or a non-200 status.
   expected, and the benchmark measures latency one request at a time by design.
 - **`Unable to find the openvino_c library`:** run `blue-onyx-prism setup-openvino` or set
   `openvino_dir` / `OPENVINO_INSTALL_DIR`. On Windows install the Visual C++ redistributable.
+- **Windows: crash with an illegal instruction (`0xC000001D`) on the first CPU inference:** on Xeons with AMX
+  but no AMX-FP16 (Sapphire / Emerald Rapids, e.g. cloud VMs with a Xeon Platinum 8573C) OpenVINO's AMX kernels
+  fault, so the service sets `ONEDNN_MAX_CPU_ISA=AVX512_CORE_FP16` (AMX off, AVX-512 kept) before OpenVINO loads.
+  A value you set yourself is left untouched (for example `AVX512_CORE_AMX` to re-enable AMX).
 - **Windows error 1053 / `ServicesPipeTimeout`:** the service did not report in time; reboot once after
   installing (the timeout registry value applies at boot).
 - **Blue Iris shows `Unknown model`:** the name in the custom models field must match a configured model name.
