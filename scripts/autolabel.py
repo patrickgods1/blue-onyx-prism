@@ -880,22 +880,34 @@ class Siglip:
         self.device = device
         self.cache = {}
 
+    def prepare(self, classes: tuple, synonyms: dict) -> None:
+        """Encode the day and night prompts, then move the text tower (~1.1 GB of the 1.4 GB in f32)
+        to the CPU: `rank` only needs the cached features. On an 8 GB card the tower pushed the run
+        into shared system memory, which slowed every model."""
+        for night in (False, True):
+            self.text_features(classes, night, synonyms)
+        if self.device.startswith(("cuda", "mps")):
+            self.model.text_model.to("cpu")
+            if self.device.startswith("cuda"):
+                self.torch.cuda.empty_cache()
+
     def text_features(self, classes: tuple, night: bool, synonyms: dict):
         key = (classes, night)
         if key in self.cache:
             return self.cache[key]
         torch = self.torch
+        dev = next(self.model.text_model.parameters()).device
         feats = []
         for c in classes:
             names = synonyms.get(c) or [c]
             prompts = [t.format(n) for n in names for t in (self.NIGHT if night else self.DAY)]
-            inputs = self.processor(text=prompts, padding="max_length", max_length=64, return_tensors="pt").to(self.device)
+            inputs = self.processor(text=prompts, padding="max_length", max_length=64, return_tensors="pt").to(dev)
             with torch.no_grad():
                 f = self.model.get_text_features(**inputs)
             f = getattr(f, "pooler_output", f)
             f = torch.nn.functional.normalize(f, dim=-1).mean(0)
             feats.append(torch.nn.functional.normalize(f, dim=-1))
-        t = torch.stack(feats)
+        t = torch.stack(feats).to(self.device)
         self.cache[key] = t
         return t
 
@@ -1029,6 +1041,8 @@ def main() -> int:
     for c in classes:
         participants[c] = sorted(m for m in labelers if m == "gdino" or (m == "rfdetr" and coco_class(c) is not None))
     animals = tuple(c for c in classes if category(c) == "animal")
+    if siglip is not None and len(animals) > 1:
+        siglip.prepare(animals, synonyms)
     weights = {m: 1.0 for m in labelers}
     a.out.parent.mkdir(parents=True, exist_ok=True)
     totals = {"boxes": 0, "agreed": 0, "vlm": 0}
