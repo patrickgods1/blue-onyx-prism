@@ -634,6 +634,34 @@ class RfDetr:
         self.threshold = threshold
         if str(device).startswith("mps") and native_grid_sample_on_mps():
             log("RF-DETR: deformable attention samples with grid_sample's MPS kernel")
+        self.optimize(str(device))
+
+    def optimize(self, device: str) -> None:
+        """rfdetr's inference mode, always f32: RF-DETR L overflows f16 (F32_MODELS), and f16 changed
+        boxes on a GTX 1070 Ti. On CUDA a traced copy (one image, the model's resolution, as `detect`
+        calls it) gave the same boxes ~23% faster (204 -> 157 ms); elsewhere the module is only
+        switched to export mode in place. Either way rfdetr's "not optimized" warning is answered.
+        The traced copy has its own weights; the original (kept only for rfdetr's undo) moves to the
+        CPU and the trace's cached blocks are returned, so tracing costs no device memory."""
+        import warnings
+
+        import torch
+
+        compile = device.startswith("cuda")
+        try:
+            if compile:
+                with warnings.catch_warnings():  # shape-only branches, fixed for one size
+                    warnings.simplefilter("ignore", torch.jit.TracerWarning)
+                    warnings.simplefilter("ignore", FutureWarning)  # torch.jit's deprecation notice
+                    self.model.inference(compile=True, batch_size=1, dtype=torch.float32)
+                self.model.model.model.to("cpu")  # predict() runs the traced copy only
+                torch.cuda.empty_cache()
+            else:
+                self.model.inference(compile=False, dtype=torch.float32, inplace=True)
+        except Exception as e:  # noqa: BLE001 - the unoptimized model still works
+            log(f"RF-DETR: inference optimization failed ({type(e).__name__}: {e}); running unoptimized")
+            return
+        log("RF-DETR: traced for inference (f32)" if compile else "RF-DETR: inference mode (f32)")
 
     def detect(self, image, wanted: dict) -> list:
         det = self.model.predict(image, threshold=self.threshold, include_source_image=False)
@@ -658,7 +686,8 @@ class Vlm:
 
         self.torch = torch
         dtype = torch.float16 if device.startswith(("mps", "cuda")) else torch.float32
-        if device.startswith("cuda") and torch.cuda.is_bf16_supported():
+        # native only: the default also counts emulation, true on Pascal, where bf16 runs ~2x slower than f16
+        if device.startswith("cuda") and torch.cuda.is_bf16_supported(including_emulation=False):
             dtype = torch.bfloat16
         self.processor = AutoProcessor.from_pretrained(str(path))
         self.model = AutoModelForImageTextToText.from_pretrained(str(path), dtype=dtype).to(device).eval()
