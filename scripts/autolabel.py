@@ -634,6 +634,34 @@ class RfDetr:
         self.threshold = threshold
         if str(device).startswith("mps") and native_grid_sample_on_mps():
             log("RF-DETR: deformable attention samples with grid_sample's MPS kernel")
+        self.optimize(str(device))
+
+    def optimize(self, device: str) -> None:
+        """rfdetr's inference mode, always f32: RF-DETR L overflows f16 (F32_MODELS), and f16 changed
+        boxes on a GTX 1070 Ti. On CUDA a traced copy (one image, the model's resolution, as `detect`
+        calls it) gave the same boxes ~23% faster (204 -> 157 ms); elsewhere the module is only
+        switched to export mode in place. Either way rfdetr's "not optimized" warning is answered.
+        The traced copy has its own weights; the original (kept only for rfdetr's undo) moves to the
+        CPU and the trace's cached blocks are returned, so tracing costs no device memory."""
+        import warnings
+
+        import torch
+
+        compile = device.startswith("cuda")
+        try:
+            if compile:
+                with warnings.catch_warnings():  # shape-only branches, fixed for one size
+                    warnings.simplefilter("ignore", torch.jit.TracerWarning)
+                    warnings.simplefilter("ignore", FutureWarning)  # torch.jit's deprecation notice
+                    self.model.inference(compile=True, batch_size=1, dtype=torch.float32)
+                self.model.model.model.to("cpu")  # predict() runs the traced copy only
+                torch.cuda.empty_cache()
+            else:
+                self.model.inference(compile=False, dtype=torch.float32, inplace=True)
+        except Exception as e:  # noqa: BLE001 - the unoptimized model still works
+            log(f"RF-DETR: inference optimization failed ({type(e).__name__}: {e}); running unoptimized")
+            return
+        log("RF-DETR: traced for inference (f32)" if compile else "RF-DETR: inference mode (f32)")
 
     def detect(self, image, wanted: dict) -> list:
         det = self.model.predict(image, threshold=self.threshold, include_source_image=False)
@@ -658,7 +686,8 @@ class Vlm:
 
         self.torch = torch
         dtype = torch.float16 if device.startswith(("mps", "cuda")) else torch.float32
-        if device.startswith("cuda") and torch.cuda.is_bf16_supported():
+        # native only: the default also counts emulation, true on Pascal, where bf16 runs ~2x slower than f16
+        if device.startswith("cuda") and torch.cuda.is_bf16_supported(including_emulation=False):
             dtype = torch.bfloat16
         self.processor = AutoProcessor.from_pretrained(str(path))
         self.model = AutoModelForImageTextToText.from_pretrained(str(path), dtype=dtype).to(device).eval()
@@ -851,22 +880,34 @@ class Siglip:
         self.device = device
         self.cache = {}
 
+    def prepare(self, classes: tuple, synonyms: dict) -> None:
+        """Encode the day and night prompts, then move the text tower (~1.1 GB of the 1.4 GB in f32)
+        to the CPU: `rank` only needs the cached features. On an 8 GB card the tower pushed the run
+        into shared system memory, which slowed every model."""
+        for night in (False, True):
+            self.text_features(classes, night, synonyms)
+        if self.device.startswith(("cuda", "mps")):
+            self.model.text_model.to("cpu")
+            if self.device.startswith("cuda"):
+                self.torch.cuda.empty_cache()
+
     def text_features(self, classes: tuple, night: bool, synonyms: dict):
         key = (classes, night)
         if key in self.cache:
             return self.cache[key]
         torch = self.torch
+        dev = next(self.model.text_model.parameters()).device
         feats = []
         for c in classes:
             names = synonyms.get(c) or [c]
             prompts = [t.format(n) for n in names for t in (self.NIGHT if night else self.DAY)]
-            inputs = self.processor(text=prompts, padding="max_length", max_length=64, return_tensors="pt").to(self.device)
+            inputs = self.processor(text=prompts, padding="max_length", max_length=64, return_tensors="pt").to(dev)
             with torch.no_grad():
                 f = self.model.get_text_features(**inputs)
             f = getattr(f, "pooler_output", f)
             f = torch.nn.functional.normalize(f, dim=-1).mean(0)
             feats.append(torch.nn.functional.normalize(f, dim=-1))
-        t = torch.stack(feats)
+        t = torch.stack(feats).to(self.device)
         self.cache[key] = t
         return t
 
@@ -1000,6 +1041,8 @@ def main() -> int:
     for c in classes:
         participants[c] = sorted(m for m in labelers if m == "gdino" or (m == "rfdetr" and coco_class(c) is not None))
     animals = tuple(c for c in classes if category(c) == "animal")
+    if siglip is not None and len(animals) > 1:
+        siglip.prepare(animals, synonyms)
     weights = {m: 1.0 for m in labelers}
     a.out.parent.mkdir(parents=True, exist_ok=True)
     totals = {"boxes": 0, "agreed": 0, "vlm": 0}
