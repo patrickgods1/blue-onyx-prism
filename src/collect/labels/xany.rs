@@ -294,12 +294,14 @@ fn frame_of(x: &XFile, json_name: &str) -> Option<String> {
 
 /// Import every `*.json` directly in `src` into the dataset `dir` (see the module doc). A file
 /// whose image size differs from the frame's (a resized copy) or whose labels are not in
-/// `classes` is an error for that file only. Returns the report; fails only when `src` cannot
-/// be listed.
+/// `classes` is an error for that file only. A frame without a label file starts from its
+/// pre-fill without the `hidden` classes ([`super::prefill`]). Returns the report; fails only
+/// when `src` cannot be listed.
 pub fn import_dir(
     dir: &Path,
     src: &Path,
     classes: &[String],
+    hidden: &[String],
     treat_unchecked_as_reviewed: bool,
     now: &str,
 ) -> Result<ImportReport> {
@@ -356,7 +358,7 @@ pub fn import_dir(
                 .extend(warnings.into_iter().map(|w| format!("{name}: {w}")));
             let base = frame
                 .labels()?
-                .unwrap_or_else(|| super::prefill(&rec, classes));
+                .unwrap_or_else(|| super::prefill(&rec, classes, hidden));
             let classes_version = base.classes_version.clone();
             let mut merged = apply_import(base, &rects);
             merged.classes_version = classes_version;
@@ -488,7 +490,7 @@ mod tests {
             bbox: [10.0, 10.0, 50.0, 90.0],
         }];
         let classes = super::super::super::config::default_classes();
-        let mut reviewed = prefill(&rec, &classes);
+        let mut reviewed = prefill(&rec, &classes, &[]);
         reviewed.status = Status::Reviewed;
         reviewed.boxes.push(LabelBox {
             label: "dog".into(),

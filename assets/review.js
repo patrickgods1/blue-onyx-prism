@@ -5,15 +5,21 @@
 // params. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
 // The Auto-label card queues a job (POST /training/autolabel as JSON) and follows it on
 // GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto and
-// "Reject auto boxes below" POST /v1/review/reject-low and "Reject model boxes of other
-// classes" POST /v1/review/reject-other-class (all three: dry run, confirm, run).
+// "Reject auto boxes below" POST /v1/review/reject-low and "Reject boxes of unwanted classes"
+// POST /v1/review/reject-other-class (all three: dry run, confirm, run).
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
 // a new folder reloads the page.
 // Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
 // filter (label=a,b), "Show boxes of" (display only), the auto-label form (repeated `classes`
 // fields; a class outside the list is appended after a confirm) and the Classes card (list in
-// order, "hide in Review" per class). Pickers, the new-box class select and the 1-0 keys use the
-// class list minus the hidden classes; saved labels and class ids never change with that.
+// order, "don't want (hide + reject)" per class = collect.hidden_classes). Unwanted classes
+// (hidden, or not in the list) are what the reviewer does not review: pickers, the new-box class
+// select and the 1-0 keys leave the hidden ones out, the canvas / box list / stepping skip boxes
+// of hidden classes and rejected boxes of unlisted ones (they stay in the file; a save rejects
+// pending proposals of hidden classes), and the server rejects their pending boxes when a class
+// becomes unwanted. When a class save, the reject button or the auto-label form (unticked listed
+// classes: "Hide and auto-reject ...?") leaves reviewed frames with accepted boxes of unwanted
+// classes, the page asks, then POST /v1/review/reject-unwanted-reviewed. Class ids never change.
 // No inline handlers (CSP): everything is wired here; server values come from data-*.
 (function () {
   'use strict';
@@ -130,15 +136,28 @@
   // A pending model box saving rejects unless accepted (suppressed, below threshold, ...).
   function isHint(b) { return b.state === 'pending' && resolved(b) === 'rejected'; }
 
-  // A pending box the auto-labeler flagged: triage `review`, or it names another class.
+  // A pending box the auto-labeler flagged: triage `review`, or it names another class (never
+  // one of an unwanted class: it is not shown).
   function isReview(b) {
-    return b.state === 'pending' && (b.triage === 'review' || (!!b.auto_label && b.auto_label !== b.label));
+    return b.state === 'pending' && !isUnwanted(b) &&
+      (b.triage === 'review' || (!!b.auto_label && b.auto_label !== b.label));
   }
 
   // What a box shows as: the state, with pending split by review / what saving will make of it.
   function look(b) {
     if (b.state === 'pending') return isReview(b) ? 'review' : (isHint(b) ? 'hint' : 'pending');
     return b.state;
+  }
+
+  // The box `d` (1 or -1) steps from the selected one, wrapping, past the unwanted boxes (not
+  // shown); -1 when none is shown.
+  function stepShown(d) {
+    var bs = boxes();
+    for (var k = 1; k <= bs.length; k++) {
+      var j = ((selected < 0 && d < 0 ? 0 : selected) + d * k + bs.length * 2) % bs.length;
+      if (!isUnwanted(bs[j])) return j;
+    }
+    return -1;
   }
 
   function reviewCount() { return boxes().filter(isReview).length; }
@@ -153,7 +172,7 @@
   // next pending one, else -1.
   function nextUndecided(i) {
     var bs = boxes();
-    var tests = [isReview, function (b) { return b.state === 'pending'; }];
+    var tests = [isReview, function (b) { return b.state === 'pending' && !isUnwanted(b); }];
     for (var t = 0; t < tests.length; t++) {
       for (var k = 1; k <= bs.length; k++) {
         var j = (i + k + bs.length) % bs.length;
@@ -168,8 +187,23 @@
   // The classes Review offers: the list minus the hidden ones.
   function visible() { return classes.filter(function (c) { return hiddenClasses.indexOf(c) < 0; }); }
 
+  // A "don't want" class (collect.hidden_classes; case-insensitive).
+  function isHiddenClass(label) {
+    var l = String(label || '').trim().toLowerCase();
+    return hiddenClasses.some(function (h) { return h.toLowerCase() === l; });
+  }
+
+  // A box of an unwanted class: of a hidden class, or rejected and of no class of the list (the
+  // server's other_class rejects). Not drawn, listed or stepped through (display only; the file
+  // keeps it). Other boxes of no listed class stay visible: a save would refuse them.
+  function isUnwanted(b) {
+    return isHiddenClass(b.label) || (b.state === 'rejected' && classes.indexOf(b.label) < 0);
+  }
+
   // "Show boxes of": a box of another class is dimmed (display only; saving keeps every box).
-  function isShown(b) { return !shownLabels.length || shownLabels.indexOf(b.label) >= 0; }
+  function isShown(b) {
+    return !isUnwanted(b) && (!shownLabels.length || shownLabels.indexOf(b.label) >= 0);
+  }
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
@@ -257,6 +291,7 @@
     ctx.font = font + 'px system-ui, sans-serif';
     ctx.textBaseline = 'bottom';
     boxes().forEach(function (b, i) {
+      if (isUnwanted(b)) return;
       var l = look(b);
       var x = b.bbox[0], y = b.bbox[1], w = b.bbox[2] - b.bbox[0], h = b.bbox[3] - b.bbox[1];
       var color = COLORS[l] || '#ffffff';
@@ -481,15 +516,19 @@
     var order = [];
     bs.forEach(function (b, i) { if (isReview(b)) order.push(i); });
     bs.forEach(function (b, i) { if (!isReview(b)) order.push(i); });
-    var offScreen = 0;
+    var offScreen = 0, unwanted = 0;
     order.forEach(function (i) {
+      if (isUnwanted(bs[i])) { unwanted++; return; }
       if (!isShown(bs[i])) { offScreen++; return; }
       boxList.appendChild(boxItem(bs[i], i));
     });
     if (offScreen) {
       boxList.appendChild(el('li', 'muted', offScreen + ' box(es) of other classes hidden by "Show boxes of" (still saved).'));
     }
-    if (!bs.length && cur) boxList.appendChild(el('li', 'muted', 'No box. Drag on the image to draw one.'));
+    if (unwanted) {
+      boxList.appendChild(el('li', 'muted', unwanted + ' box(es) of classes you do not want (hidden or not in the class list) not shown (kept in the file; pending proposals of them are rejected on save).'));
+    }
+    if (bs.length === unwanted && cur) boxList.appendChild(el('li', 'muted', 'No box. Drag on the image to draw one.'));
     emptyBox.checked = !!(cur && cur.labels.empty_confirmed);
   }
 
@@ -565,9 +604,9 @@
   function acceptProposals() {
     if (!cur) return;
     var todo = boxes().filter(function (b) {
-      return b.state === 'pending' && b.source !== 'human' && resolved(b) === 'accepted';
+      return b.state === 'pending' && b.source !== 'human' && !isUnwanted(b) && resolved(b) === 'accepted';
     });
-    var hints = boxes().filter(isHint).length;
+    var hints = boxes().filter(function (b) { return isHint(b) && !isUnwanted(b); }).length;
     if (!todo.length) {
       say(hints ? hints + ' hint box(es) stay pending (rejected on save unless you accept them); no other proposal.' : 'No pending proposal.');
       return;
@@ -940,6 +979,7 @@
     return api('/v1/review/labels?frame=' + encodeURIComponent(frame)).then(function (j) {
       cur = j;
       if (Array.isArray(j.classes)) classes = j.classes;
+      if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null;
       emptyBackup = null;
       canvas.width = j.width || 640;
@@ -1011,6 +1051,13 @@
     }
     busy = true;
     var body = JSON.parse(JSON.stringify(cur.labels));   // keeps auto_run, bulk_accepted, ...
+    // Proposals of a "don't want" class are not shown: rejected rather than resolved by default.
+    body.boxes.forEach(function (b) {
+      if (b.state === 'pending' && b.source !== 'human' && isHiddenClass(b.label)) {
+        b.state = 'rejected';
+        b.reason = 'other_class';
+      }
+    });
     body.version = body.version || 1;
     body.status = status;
     body.empty_confirmed = !!cur.labels.empty_confirmed;
@@ -1086,8 +1133,8 @@
     else if (k === 'e') confirmEmpty(!(cur && cur.labels.empty_confirmed));
     else if (k === 'z') doUndo();
     else if (k === 's' || k === 'Enter') save('reviewed');
-    else if (k === 'j') select(boxes().length ? (selected + 1) % boxes().length : -1, true);
-    else if (k === 'k') select(boxes().length ? (selected - 1 + boxes().length) % boxes().length : -1, true);
+    else if (k === 'j') select(stepShown(1), true);
+    else if (k === 'k') select(stepShown(-1), true);
     else if (k === 'Delete' || k === 'Backspace') {
       if (selected >= 0) {
         if (boxes()[selected].source === 'human') removeBox(selected);
@@ -1247,8 +1294,24 @@
       });
       picked.forEach(function (c) { body.append('classes', c); });
       alStatus.className = 'review-report';
-      var ready = alPicker && catalog ? CP.ensureInList(picked, catalog) : Promise.resolve(catalog);
-      report(alStatus, ['Queueing...']);
+      // Listed, wanted classes left unticked: offer to stop wanting them altogether.
+      var skipped = alPicker ? visible().filter(function (c) { return picked.indexOf(c) < 0; }) : [];
+      var hideFirst = skipped.length > 0 && window.confirm('Hide and auto-reject ' + skipped.join(', ') +
+        ' in Review? (Cancel = only skip them in this run)');
+      report(alStatus, [hideFirst ? 'Hiding ' + skipped.join(', ') + '...' : 'Queueing...']);
+      var hidden_ = !hideFirst ? Promise.resolve() :
+        postJson('/v1/review/classes', { classes: classes.slice(), hidden: hiddenClasses.concat(skipped) })
+          .then(function (j) {
+            afterClassesSaved(j);
+            var lines = [j.message || 'Saved.'];
+            var auto = unwantedNote(j);
+            if (auto) lines.push(auto);
+            report(alStatus, lines);
+            return askReviewedUnwanted(j.reviewed_with_unwanted, alStatus);
+          });
+      var ready = hidden_.then(function () {
+        return alPicker && catalog ? CP.ensureInList(picked, catalog) : catalog;
+      });
       ready.then(function () {
         if (alPicker) { refreshPickers(); }
         return api('/training/autolabel', {
@@ -1258,7 +1321,10 @@
         });
       }).then(function (j) {
         var m = j.message || 'Queued.';
-        report(alStatus, [/^Queued/.test(m) ? m : 'Queued: ' + m]);
+        var q = /^Queued/.test(m) ? m : 'Queued: ' + m;
+        // After hiding classes: their report stays above.
+        if (hideFirst) alStatus.appendChild(el('div', null, q));
+        else report(alStatus, [q]);
         if (j.id) pollTask(j.id);
       }).catch(function (e) {
         alStatus.className = 'review-report error-text';
@@ -1362,6 +1428,40 @@
     });
   }
 
+  // What a class save rejected on its own (`auto_rejected` of POST /v1/review/classes), or ''.
+  function unwantedNote(j) {
+    var a = j && j.auto_rejected;
+    if (!a || !(a.boxes || 0)) return '';
+    var rejected = a.boxes - (a.relabelled || 0);
+    var text = 'Rejected ' + rejected + ' pending box(es) of unwanted classes (newly: ' +
+      (j.newly_unwanted || []).join(', ') + ') on ' + (a.frames || 0) + ' unreviewed frame(s) (reason other_class).';
+    if (a.relabelled) text += ' Renamed ' + a.relabelled + ' box(es) to the class list\'s spelling.';
+    if (a.failed && a.failed.length) text += ' ' + a.failed.length + ' frame(s) not changed: ' + a.failed.join('; ');
+    return text;
+  }
+
+  // `r` = reviewed_with_unwanted {frames, boxes, classes}: asks whether to reject the accepted
+  // boxes of unwanted classes on reviewed frames too (POST /v1/review/reject-unwanted-reviewed)
+  // and appends the outcome to `box`. Resolves either way.
+  function askReviewedUnwanted(r, box) {
+    if (!r || !(r.frames > 0)) return Promise.resolve();
+    var text = r.frames + ' reviewed frame(s) have ' + r.boxes + ' accepted box(es) of ' +
+      (r.classes || []).join(', ') + '. Reject those too? They are kept as evidence (reason other_class) ' +
+      'and the frames stay reviewed; Cancel keeps them as training labels.';
+    if (!window.confirm(text)) {
+      box.appendChild(el('div', null, 'Reviewed frames left as they are (' + r.frames + ' with boxes of ' +
+        (r.classes || []).join(', ') + ').'));
+      return Promise.resolve();
+    }
+    return postJson('/v1/review/reject-unwanted-reviewed', {}).then(function (j) {
+      box.appendChild(el('div', null, j.message || ('Rejected ' + (j.boxes || 0) + ' box(es).')));
+      if (j.failed && j.failed.length) box.appendChild(el('div', 'error-text', j.failed.join('; ')));
+      return reloadQueue();
+    }).catch(function (e) {
+      box.appendChild(el('div', 'error-text', e.message));
+    });
+  }
+
   var otherBtn = $('rv-reject-other');
   if (otherBtn) {
     otherBtn.addEventListener('click', function () {
@@ -1377,11 +1477,14 @@
       otherBtn.disabled = true;
       postJson('/v1/review/reject-other-class', body).then(function (j) {
         var n = j.boxes || 0;
-        if (!n) { report(box, [j.message || 'No pending model box of a class outside the class list on the unreviewed frames the filters select.']); return null; }
+        if (!n) {
+          report(box, [j.message || 'No pending box of an unwanted class (hidden, or not in the class list) on the unreviewed frames the filters select.']);
+          return askReviewedUnwanted(j.reviewed_with_unwanted, box);
+        }
         var renamed = j.relabelled || 0;
-        var text = 'Reject ' + (n - renamed) + ' pending model box(es) of classes outside the class list on ' +
-          (j.eligible || 0) + ' frame(s)? They are kept as evidence (reason other_class); the frames stay ' +
-          'unreviewed and a reviewer can still change them per frame.';
+        var text = 'Reject ' + (n - renamed) + ' pending model / auto box(es) of unwanted classes (hidden, or not in ' +
+          'the class list) on ' + (j.eligible || 0) + ' frame(s)? They are kept as evidence (reason other_class); ' +
+          'the frames stay unreviewed and a reviewer can still change them per frame.';
         if (renamed) {
           text += ' ' + renamed + ' box(es) whose label is a class of the list under another spelling ' +
             '(e.g. pottedplant) are renamed to the list\'s spelling instead.';
@@ -1396,7 +1499,7 @@
           report(box, [r.message || ('Changed ' + (r.boxes || 0) + ' box(es).')],
             failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
           box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
-          return reloadQueue();
+          return reloadQueue().then(function () { return askReviewedUnwanted(r.reviewed_with_unwanted, box); });
         });
       }).catch(function (e) {
         box.className = 'review-report error-text';
@@ -1510,8 +1613,8 @@
       if (change.idsChange && !window.confirm(
         (change.removed.length ? 'Remove ' + change.removed.join(', ') + ' from the class list. ' : '') +
         (change.reordered ? 'The order of the classes changes. ' : '') +
-        'YOLO class ids of later exports change (frames you exported before keep the old ids), and reviewed frames ' +
-        'labelled with a removed class keep their labels but are marked as reviewed with another class list. Continue?')) {
+        'YOLO class ids of later exports change (frames you exported before keep the old ids). Pending boxes of a ' +
+        'removed class are rejected on the unreviewed frames; for reviewed frames you are asked next. Continue?')) {
         box.textContent = 'Not saved.';
         box.className = 'form-msg';
         return;
@@ -1522,14 +1625,20 @@
     }
     postJson('/v1/review/classes', body).then(function (j) {
       afterClassesSaved(j);
-      box.textContent = j.message || 'Saved.';
+      var lines = [j.message || 'Saved.'];
+      var auto = unwantedNote(j);
+      if (auto) lines.push(auto);
       box.className = 'form-msg ok-text';
+      report(box, lines);
+      return askReviewedUnwanted(j.reviewed_with_unwanted, box).then(function () {
+        if (j.auto_rejected && j.auto_rejected.boxes) return reloadQueue();
+      });
     }).catch(function (e) { box.textContent = e.message; box.className = 'form-msg error-text'; });
   });
 
   // ---- class pickers ------------------------------------------------------------------------
 
-  var hideSet = {};   // Classes card: class -> "hide in Review" ticked
+  var hideSet = {};   // Classes card: class -> "don't want" ticked
 
   function hideChecked(selectedList) {
     return selectedList.filter(function (c) { return hideSet[c]; });
@@ -1583,10 +1692,10 @@
           var cb = document.createElement('input');
           cb.type = 'checkbox';
           cb.checked = !!hideSet[entry.name];
-          cb.setAttribute('aria-label', 'Hide ' + entry.name + ' in Review');
+          cb.setAttribute('aria-label', 'Do not want ' + entry.name + ': hide it in Review and reject its pending boxes');
           cb.addEventListener('change', function () { hideSet[entry.name] = cb.checked; });
           lab.appendChild(cb);
-          lab.appendChild(document.createTextNode('hide in Review'));
+          lab.appendChild(document.createTextNode("don't want (hide + reject)"));
           chip.appendChild(lab);
         }
       });

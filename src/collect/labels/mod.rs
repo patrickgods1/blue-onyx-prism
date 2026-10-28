@@ -1,14 +1,15 @@
 //! Review labels of a collected frame: `<stem>.labels.json` beside its sidecar (schema
 //! [`LABELS_VERSION`], `docs/DATASET.md` "Review labels"). Pure parts: the pre-fill from the
-//! sidecar ([`prefill`]), the save-time normalisation ([`normalize`]: clamping, pending boxes
+//! sidecar ([`prefill`]; boxes of unwanted classes, [`wanted_class`], left out), the save-time
+//! normalisation ([`normalize`]: clamping, pending boxes
 //! resolved, class check) and the merge of later proposals such as auto-labeler boxes
 //! ([`merge_proposals`]), and whether the auto-labeler's triage alone settles a frame
 //! ([`auto_accept_eligible`]). IO: [`Frame::resolve`] (every frame reference goes through
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
-//! review queue is in [`queue`], the bulk accept / low-score and other-class rejects in
-//! [`bulk`], the YOLO /
-//! COCO / benchmark exporters in [`export`] and the X-AnyLabeling interop in [`xany`].
+//! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
+//! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`] and the X-AnyLabeling interop in
+//! [`xany`].
 
 pub mod bulk;
 pub mod export;
@@ -361,9 +362,10 @@ fn push_unique(out: &mut Vec<LabelBox>, b: LabelBox, dup_iou: f32) {
 }
 
 /// `b` with its label given the class list's spelling ([`map_class`]; the model's own label
-/// kept in `model_label` unless only the case differs), or None when it is no class of the list.
-fn on_class_list(mut b: LabelBox, classes: &[String]) -> Option<LabelBox> {
-    let class = map_class(&b.label, classes)?;
+/// kept in `model_label` unless only the case differs), or None when it is no wanted class of
+/// the list ([`wanted_class`]).
+fn on_class_list(mut b: LabelBox, classes: &[String], hidden: &[String]) -> Option<LabelBox> {
+    let class = wanted_class(&b.label, classes, hidden)?;
     rename_to_class(&mut b, class);
     Some(b)
 }
@@ -386,19 +388,33 @@ pub fn map_class<'a>(label: &str, classes: &'a [String]) -> Option<&'a str> {
     crate::training::autolabel::triage::map_label(label, classes)
 }
 
-/// The unreviewed label file a frame starts with: every box of the sidecar of a class of
-/// `classes` (the collector's class list) as a pending model box, in this order: the reply's
-/// predictions (accepted unless rejected), the suppressed boxes with their reason (rejected
-/// unless restored: a wrongly suppressed real object is a miss), the below-threshold boxes and
-/// the frame-mode verifier's own finds (both rejected unless accepted). Labels are mapped onto
-/// the list's spelling ([`map_class`]: a VOC-spelled model's `pottedplant` is `potted plant`,
-/// the model's label kept in `model_label`); a box of no class of the list is left out (the
-/// sidecar keeps it). A box of the same (mapped) label at IoU >= [`DUP_IOU`] of an earlier one
-/// is left out (a verifier find at >= [`MATCH_IOU`]).
-pub fn prefill(rec: &Record, classes: &[String]) -> LabelFile {
+/// Whether `class` is one of `hidden` (`collect.hidden_classes`; case-insensitive).
+pub fn is_hidden(class: &str, hidden: &[String]) -> bool {
+    hidden.iter().any(|h| h.eq_ignore_ascii_case(class.trim()))
+}
+
+/// The class of `classes` a box `label` is ([`map_class`], against the whole list) unless that
+/// class is one of `hidden`. None = an unwanted label: of no class of the list, or of a class the
+/// reviewer does not want (`collect.hidden_classes`: hidden from Review, its pending boxes
+/// rejected).
+pub fn wanted_class<'a>(label: &str, classes: &'a [String], hidden: &[String]) -> Option<&'a str> {
+    map_class(label, classes).filter(|c| !is_hidden(c, hidden))
+}
+
+/// The unreviewed label file a frame starts with: every box of the sidecar of a wanted class of
+/// `classes` (the collector's class list without `hidden`, [`wanted_class`]) as a pending model
+/// box, in this order: the reply's predictions (accepted unless rejected), the suppressed boxes
+/// with their reason (rejected unless restored: a wrongly suppressed real object is a miss), the
+/// below-threshold boxes and the frame-mode verifier's own finds (both rejected unless
+/// accepted). Labels are mapped onto the list's spelling ([`map_class`]: a VOC-spelled model's
+/// `pottedplant` is `potted plant`, the model's label kept in `model_label`); a box of no class
+/// of the list or of a hidden class is left out (the sidecar keeps it). A box of the same
+/// (mapped) label at IoU >= [`DUP_IOU`] of an earlier one is left out (a verifier find at >=
+/// [`MATCH_IOU`]).
+pub fn prefill(rec: &Record, classes: &[String], hidden: &[String]) -> LabelFile {
     let mut boxes = Vec::new();
     let mut push = |b: LabelBox, dup_iou: f32| {
-        if let Some(b) = on_class_list(b, classes) {
+        if let Some(b) = on_class_list(b, classes, hidden) {
             push_unique(&mut boxes, b, dup_iou);
         }
     };
@@ -1024,7 +1040,7 @@ mod tests {
 
     #[test]
     fn prefill_lists_every_sidecar_box_once_and_clamps() {
-        let f = prefill(&record(), &classes());
+        let f = prefill(&record(), &classes(), &[]);
         assert_eq!(f.status, Status::Unreviewed);
         let summary: Vec<(&str, Option<Origin>)> = f
             .boxes
@@ -1064,7 +1080,7 @@ mod tests {
         let classes: Vec<String> = ["person", "potted plant", "motorcycle"]
             .map(String::from)
             .to_vec();
-        let f = prefill(&r, &classes);
+        let f = prefill(&r, &classes, &[]);
         let summary: Vec<(&str, Option<&str>, Option<Origin>)> = f
             .boxes
             .iter()
@@ -1088,13 +1104,36 @@ mod tests {
         );
         assert!(f.boxes.iter().all(|b| b.state == BoxState::Pending));
         // Nothing of the list: no box.
-        assert!(prefill(&r, &["deer".to_string()]).boxes.is_empty());
+        assert!(prefill(&r, &["deer".to_string()], &[]).boxes.is_empty());
+        // A hidden class: left out in every spelling; the other classes kept.
+        let hidden = ["Potted Plant".to_string()];
+        let f = prefill(&r, &classes, &hidden);
+        let labels: Vec<&str> = f.boxes.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["person", "motorcycle"]);
+    }
+
+    #[test]
+    fn wanted_class_maps_against_the_whole_list_then_drops_hidden() {
+        let classes: Vec<String> = ["person", "potted plant", "motorcycle"]
+            .map(String::from)
+            .to_vec();
+        let hidden = ["potted plant".to_string()];
+        assert_eq!(wanted_class("Person", &classes, &hidden), Some("person"));
+        assert_eq!(
+            wanted_class("motorbike", &classes, &hidden),
+            Some("motorcycle")
+        );
+        assert_eq!(wanted_class("pottedplant", &classes, &hidden), None);
+        assert_eq!(wanted_class("potted plant", &classes, &hidden), None);
+        assert_eq!(wanted_class("clock", &classes, &hidden), None);
+        assert!(is_hidden(" Potted Plant", &hidden));
+        assert!(!is_hidden("person", &hidden));
     }
 
     #[test]
     fn reviewed_save_resolves_pending_and_checks_classes() {
         let now = "2026-10-22T12:00:00.000Z";
-        let mut f = prefill(&record(), &classes());
+        let mut f = prefill(&record(), &classes(), &[]);
         f.status = Status::Reviewed;
         // Restore the wrongly suppressed dog (a miss of the rule).
         f.boxes[1].state = BoxState::Accepted;
@@ -1146,7 +1185,7 @@ mod tests {
 
     #[test]
     fn unreviewed_save_keeps_pending_and_drops_rejected_human_boxes() {
-        let mut f = prefill(&record(), &classes());
+        let mut f = prefill(&record(), &classes(), &[]);
         f.boxes[0].label = "unicorn".into();
         f.boxes.push(LabelBox {
             label: "x".into(),
@@ -1173,7 +1212,7 @@ mod tests {
         let p = dir.join("a.labels.json");
         assert_eq!(read(&p).unwrap(), None);
         let mut f = normalize(
-            prefill(&record(), &classes()),
+            prefill(&record(), &classes(), &[]),
             &classes(),
             640,
             480,
@@ -1223,7 +1262,14 @@ mod tests {
 
     #[test]
     fn merge_keeps_decisions_and_reopens_on_new_boxes() {
-        let mut f = normalize(prefill(&record(), &classes()), &classes(), 640, 480, "t").unwrap();
+        let mut f = normalize(
+            prefill(&record(), &classes(), &[]),
+            &classes(),
+            640,
+            480,
+            "t",
+        )
+        .unwrap();
         f.status = Status::Reviewed;
         f.boxes[1].state = BoxState::Rejected; // the suppressed dog: wrong
         let r = merge_proposals(
@@ -1250,7 +1296,7 @@ mod tests {
         assert_eq!(added, ["cat", "deer"]);
         assert!(f.boxes[4..].iter().all(|b| b.state == BoxState::Pending));
 
-        let mut g = prefill(&record(), &classes());
+        let mut g = prefill(&record(), &classes(), &[]);
         let r = merge_proposals(&mut g, vec![auto("cat", [10.0, 10.0, 50.0, 90.0])]);
         assert_eq!(r.added, 0, "another label on a pending box is dropped");
         assert!(!r.reopened);

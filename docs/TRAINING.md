@@ -890,9 +890,12 @@ list, the default phrases, vehicle and animal names, the 80 COCO classes and eve
 classes, each with its category, prompt phrases, `coco` flag and the models that emit it, plus
 `relevant` (the review classes the enabled models report after their `object_filter`).
 
-`collect.hidden_classes` (subset of `collect.classes`; `POST /v1/review/classes` with `hidden`) hides
-rare classes from the Review page's pickers only: they stay in the exports and keep their YOLO class
-ids. Removing a class from the list drops it from the hidden list too.
+`collect.hidden_classes` (subset of `collect.classes`; `POST /v1/review/classes` with `hidden`; the
+Review page's *don't want*) are classes you do not review: hidden from the Review page, left out of the
+pre-fill and of auto-label runs (a run of hidden classes only is refused), and their pending boxes are
+rejected (`reason: other_class`) when a class becomes hidden; they stay in the list and keep their YOLO
+class ids (docs/DATASET.md, "Unwanted classes"). Removing a class from the list drops it from the hidden
+list too.
 
 ### Labelers
 
