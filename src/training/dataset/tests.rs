@@ -111,6 +111,21 @@ fn reads_a_flat_export_with_manifest_tags() {
     assert_eq!(f.size, Some((64, 48)));
 }
 
+/// macOS AppleDouble files (`._x.jpg`, written beside every file copied to a non-APFS drive)
+/// are not frames.
+#[test]
+fn hidden_files_are_not_frames() {
+    let t = tmp("hidden");
+    let n = camera_export(&t.0);
+    std::fs::write(
+        t.0.join("images/._yard-2026-10-02-1.jpg"),
+        b"\0\x05\x16\x07",
+    )
+    .unwrap();
+    let s = read_export(&t.0).unwrap();
+    assert_eq!(s.frames.len(), n);
+}
+
 #[test]
 fn heldout_frames_come_from_other_cameras_and_days() {
     let t = tmp("heldout");
