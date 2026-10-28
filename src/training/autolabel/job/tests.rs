@@ -293,7 +293,10 @@ fn empty_frames_get_the_marker_and_other_class_boxes_a_suggestion() {
     let dir = t.0.join("dataset");
     // Frame 0: the serving model saw a dog where the labelers find a car.
     let fr = Frame::resolve(&dir, &rels[0]).unwrap();
-    let mut f = labels::prefill(&fr.record().unwrap());
+    let mut f = labels::prefill(
+        &fr.record().unwrap(),
+        &crate::collect::config::default_classes(),
+    );
     f.boxes.push(labels::LabelBox {
         label: "dog".into(),
         bbox: [1.0, 1.0, 30.0, 20.0],

@@ -2,7 +2,10 @@
 //! auto-labelers' triage alone settles as reviewed (`POST /v1/review/accept-auto`, the
 //! auto-label chain's accept step), [`bulk_reject_below`] rejects the pending auto boxes scoring
 //! below a minimum on unreviewed frames (`reason: low_score`; the reject-low route and the
-//! chain's reject step). Each frame is re-checked under the label write lock
+//! chain's reject step), [`bulk_reject_other_class`] rejects the pending model boxes of classes
+//! not in the class list on unreviewed frames (`reason: other_class`; an alias such as
+//! `pottedplant` is renamed to the list's spelling instead; `POST
+//! /v1/review/reject-other-class`). Each frame is re-checked under the label write lock
 //! ([`super::update`]); counts are exact, frame lists capped at [`LISTED`].
 
 use super::queue::{self, AutoFilter, Filters, StatusFilter};
@@ -16,13 +19,21 @@ pub const LISTED: usize = 20;
 /// The reason a box rejected by [`reject_low`] carries.
 pub const LOW_SCORE_REASON: &str = "low_score";
 
+/// The reason a box rejected by [`reject_other_class`] carries.
+pub const OTHER_CLASS_REASON: &str = "other_class";
+
 /// What a bulk edit did (or, in a dry run, would do).
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct BulkOutcome {
     /// Frames the edit applies to (all of them, also past the limit).
     pub eligible: usize,
-    /// Boxes changed (a dry run of [`bulk_reject_below`]: the boxes of every eligible frame).
+    /// Boxes changed (a dry run of [`bulk_reject_below`] / [`bulk_reject_other_class`]: the
+    /// boxes of every eligible frame).
     pub boxes: usize,
+    /// Of `boxes`, those [`bulk_reject_other_class`] renamed to the class list's spelling rather
+    /// than rejected (left out of the JSON when 0).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub relabelled: usize,
     /// The first frames changed (a dry run: the first eligible frames), at most [`LISTED`].
     pub done: Vec<String>,
     /// Frames changed (0 in a dry run).
@@ -30,6 +41,10 @@ pub struct BulkOutcome {
     /// The first frames not changed, `<frame>: <why>`, at most [`LISTED`].
     pub failed: Vec<String>,
     pub failed_count: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl BulkOutcome {
@@ -92,43 +107,144 @@ pub fn bulk_reject_below(
     dry_run: bool,
     keep: &dyn Fn(&str) -> bool,
 ) -> BulkOutcome {
+    edit_unreviewed(
+        dir,
+        filters,
+        limit,
+        dry_run,
+        keep,
+        &|l| (count_low(l, min_score), 0),
+        &|l| (reject_low(l, min_score), 0),
+    )
+}
+
+/// What [`reject_other_class`] does to `b`: None = nothing (not a pending model box, or its
+/// label is a class of `classes`); `Some(Some(class))` = renamed to `class` (the list's spelling
+/// of an alias, [`super::map_class`]); `Some(None)` = rejected.
+fn other_class_action<'a>(b: &super::LabelBox, classes: &'a [String]) -> Option<Option<&'a str>> {
+    if b.source != Source::Model || b.state != BoxState::Pending || classes.contains(&b.label) {
+        return None;
+    }
+    Some(super::map_class(&b.label, classes))
+}
+
+/// On an unreviewed frame, the pending model boxes (the serving model's, from the sidecar) whose
+/// label is not a class of `classes`: renamed to the class when it is one under another
+/// spelling ([`super::map_class`]: `pottedplant` -> `potted plant`, the old label kept in
+/// `model_label` unless only the case differs), else rejected with `reason: other_class` (kept
+/// as evidence; a save would otherwise accept a prediction of a class outside the list and
+/// fail). Auto and human boxes, decided boxes and reviewed or skipped frames are untouched; the
+/// frame's status is unchanged. Returns (rejected, renamed).
+pub fn reject_other_class(f: &mut LabelFile, classes: &[String]) -> (usize, usize) {
+    if f.status != Status::Unreviewed {
+        return (0, 0);
+    }
+    let (mut rejected, mut renamed) = (0, 0);
+    for b in &mut f.boxes {
+        match other_class_action(b, classes) {
+            None => {}
+            Some(Some(class)) => {
+                super::rename_to_class(b, class);
+                renamed += 1;
+            }
+            Some(None) => {
+                b.state = BoxState::Rejected;
+                b.reason = Some(OTHER_CLASS_REASON.into());
+                rejected += 1;
+            }
+        }
+    }
+    (rejected, renamed)
+}
+
+/// What [`reject_other_class`] would do: (rejected, renamed).
+fn count_other_class(f: &LabelFile, classes: &[String]) -> (usize, usize) {
+    if f.status != Status::Unreviewed {
+        return (0, 0);
+    }
+    f.boxes
+        .iter()
+        .filter_map(|b| other_class_action(b, classes))
+        .fold((0, 0), |(r, n), a| match a {
+            Some(_) => (r, n + 1),
+            None => (r + 1, n),
+        })
+}
+
+/// [`reject_other_class`] on the unreviewed frames of `dir` that `filters` (status forced to
+/// unreviewed) and `keep` select, at most `limit` frames in queue order; `boxes` counts the
+/// boxes rejected or renamed, `relabelled` the renamed ones. `dry_run` only counts. A frame
+/// that changed meanwhile (reviewed) is passed over.
+pub fn bulk_reject_other_class(
+    dir: &Path,
+    filters: &Filters,
+    classes: &[String],
+    limit: usize,
+    dry_run: bool,
+    keep: &dyn Fn(&str) -> bool,
+) -> BulkOutcome {
+    edit_unreviewed(
+        dir,
+        filters,
+        limit,
+        dry_run,
+        keep,
+        &|l| count_other_class(l, classes),
+        &|l| reject_other_class(l, classes),
+    )
+}
+
+/// The shared run of the box edits of unreviewed frames: `count` and `edit` return (boxes
+/// rejected, boxes renamed); only frames `count` finds something on are eligible, and each
+/// is edited again under the write lock ([`super::update`]).
+fn edit_unreviewed(
+    dir: &Path,
+    filters: &Filters,
+    limit: usize,
+    dry_run: bool,
+    keep: &dyn Fn(&str) -> bool,
+    count: &dyn Fn(&LabelFile) -> (usize, usize),
+    edit: &dyn Fn(&mut LabelFile) -> (usize, usize),
+) -> BulkOutcome {
     let mut f = filters.clone();
     f.status = StatusFilter::Is(Status::Unreviewed);
     let built = queue::build(dir, &f);
     let mut out = BulkOutcome::default();
     let mut eligible = Vec::new();
     for item in built.items.iter().filter(|i| keep(&i.frame)) {
-        let n = Frame::resolve(dir, &item.frame)
+        let (n, renamed) = Frame::resolve(dir, &item.frame)
             .and_then(|fr| fr.labels().ok().flatten())
-            .map_or(0, |l| count_low(&l, min_score));
-        if n > 0 {
-            eligible.push((item.frame.as_str(), n));
+            .map_or((0, 0), |l| count(&l));
+        if n + renamed > 0 {
+            eligible.push((item.frame.as_str(), n, renamed));
         }
     }
     out.eligible = eligible.len();
     if dry_run {
-        out.boxes = eligible.iter().map(|(_, n)| n).sum();
+        out.boxes = eligible.iter().map(|(_, n, r)| n + r).sum();
+        out.relabelled = eligible.iter().map(|(_, _, r)| r).sum();
         out.done = eligible
             .iter()
             .take(LISTED)
-            .map(|(r, _)| (*r).to_string())
+            .map(|(r, _, _)| (*r).to_string())
             .collect();
         return out;
     }
-    for (rel, _) in eligible.into_iter().take(limit) {
+    for (rel, _, _) in eligible.into_iter().take(limit) {
         let Some(frame) = Frame::resolve(dir, rel) else {
             out.failed(rel, "the frame is gone");
             continue;
         };
-        let mut n = 0;
+        let (mut n, mut renamed) = (0, 0);
         let r = super::update(&frame.labels, |cur| {
             let Some(mut l) = cur else { return Ok(None) };
-            n = reject_low(&mut l, min_score);
-            Ok((n > 0).then_some(l))
+            (n, renamed) = edit(&mut l);
+            Ok((n + renamed > 0).then_some(l))
         });
         match r {
             Ok(true) => {
-                out.boxes += n;
+                out.boxes += n + renamed;
+                out.relabelled += renamed;
                 out.done(rel);
             }
             Ok(false) => {}
@@ -372,6 +488,99 @@ mod tests {
         };
         assert_eq!(reject_low(&mut g, 0.3), 0);
         assert!(!auto_accept_eligible(&g));
+    }
+
+    /// A pending model box of `label` from the sidecar part `origin`.
+    fn model_box(label: &str, origin: Origin) -> super::super::LabelBox {
+        let mut b = auto_box(label, 0.7, Triage::Review);
+        b.source = Source::Model;
+        b.origin = Some(origin);
+        b.auto = Default::default();
+        b
+    }
+
+    fn classes() -> Vec<String> {
+        ["person", "car", "potted plant"].map(String::from).to_vec()
+    }
+
+    #[test]
+    fn reject_other_class_touches_only_pending_model_boxes_off_the_list() {
+        let mut decided = model_box("clock", Origin::Prediction);
+        decided.state = BoxState::Accepted;
+        let mut human = model_box("clock", Origin::Prediction);
+        human.source = Source::Human;
+        let mut f = LabelFile {
+            boxes: vec![
+                model_box("person", Origin::Prediction),
+                model_box("parking meter", Origin::Prediction),
+                model_box("pottedplant", Origin::BelowThreshold),
+                model_box("Car", Origin::Suppressed),
+                auto_box("clock", 0.9, Triage::Review),
+                decided,
+                human,
+            ],
+            ..LabelFile::default()
+        };
+        let before = f.clone();
+        assert_eq!(count_other_class(&f, &classes()), (1, 2));
+        assert_eq!(reject_other_class(&mut f, &classes()), (1, 2));
+        assert_eq!(f.boxes[1].state, BoxState::Rejected);
+        assert_eq!(f.boxes[1].reason.as_deref(), Some(OTHER_CLASS_REASON));
+        assert_eq!(f.boxes[1].label, "parking meter");
+        // An alias: renamed, still pending, the model's spelling kept.
+        assert_eq!(
+            (
+                f.boxes[2].label.as_str(),
+                f.boxes[2].model_label.as_deref(),
+                f.boxes[2].state
+            ),
+            ("potted plant", Some("pottedplant"), BoxState::Pending)
+        );
+        // Another case only: renamed without a model label.
+        assert_eq!(
+            (f.boxes[3].label.as_str(), f.boxes[3].model_label.as_deref()),
+            ("car", None)
+        );
+        for i in [0, 4, 5, 6] {
+            assert_eq!(f.boxes[i], before.boxes[i], "box {i}");
+        }
+        assert_eq!(f.status, Status::Unreviewed);
+        assert_eq!(reject_other_class(&mut f, &classes()), (0, 0), "done");
+        // Reviewed and skipped frames are untouched.
+        for s in [Status::Reviewed, Status::Skipped] {
+            let mut r = before.clone();
+            r.status = s;
+            assert_eq!(count_other_class(&r, &classes()), (0, 0));
+            assert_eq!(reject_other_class(&mut r, &classes()), (0, 0));
+            assert_eq!(r.boxes, before.boxes);
+        }
+    }
+
+    #[test]
+    fn rejecting_an_off_list_prediction_leaves_a_frame_the_triage_settles() {
+        let mut f = LabelFile {
+            boxes: vec![
+                auto_box("person", 0.9, Triage::Accept),
+                model_box("clock", Origin::Prediction),
+                model_box("dog", Origin::BelowThreshold),
+            ],
+            ..LabelFile::default()
+        };
+        assert!(!auto_accept_eligible(&f), "the clock would be accepted");
+        assert_eq!(reject_other_class(&mut f, &classes()), (2, 0));
+        assert!(auto_accept_eligible(&f));
+        let n = super::super::normalize(
+            LabelFile {
+                status: Status::Reviewed,
+                ..f
+            },
+            &classes(),
+            64,
+            48,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(n.training().count(), 1, "the save no longer fails");
     }
 
     #[test]

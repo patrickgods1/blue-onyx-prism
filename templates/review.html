@@ -117,6 +117,11 @@
     <span class="muted">Pending auto boxes scoring below it on the unreviewed frames the filters select are rejected (kept as hard-negative evidence; a reviewer can still change them per frame). Asks first.</span>
   </div>
   <div id="rv-reject-low-msg" class="review-report" role="status"></div>
+  <div class="inline-row">
+    <button type="button" id="rv-reject-other" class="small secondary">Reject model boxes of other classes&hellip;</button>
+    <span class="muted">Pending model boxes whose class is not in the class list, on the unreviewed frames the filters select, are rejected (reason <code>other_class</code>, kept as evidence); a class of the list under another spelling (<code>pottedplant</code>) is renamed instead. Asks first.</span>
+  </div>
+  <div id="rv-reject-other-msg" class="review-report" role="status"></div>
 </div>
 
 <div class="card">

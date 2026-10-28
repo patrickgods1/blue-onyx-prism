@@ -272,7 +272,9 @@ impl AutolabelJob {
         let mut outcome = FrameWrite::default();
         let mut reopened = false;
         let written = labels::update(&frame.labels, |cur| {
-            let mut file = cur.unwrap_or_else(|| labels::prefill(&rec));
+            // The pre-fill keeps the whole collect class list, not only this run's classes.
+            let mut file =
+                cur.unwrap_or_else(|| labels::prefill(&rec, &self.config.collect.classes));
             let before = file.status;
             outcome = update(&mut file, rep);
             reopened = before != file.status && file.status == labels::Status::Unreviewed;

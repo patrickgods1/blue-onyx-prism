@@ -618,7 +618,7 @@ pub fn run_filtered(
         reviewed_frames_filtered(dir, classes, &req.split, filter);
     let unreviewed: Vec<(Frame, LabelFile, u32, u32)> =
         if req.include_unreviewed && req.formats.contains(&Format::XAnyLabeling) {
-            unreviewed_queue_frames(dir, &mut warnings)
+            unreviewed_queue_frames(dir, classes, &mut warnings)
                 .into_iter()
                 .filter(|(_, labels, _, _)| filter.keeps(&preview(labels)))
                 .collect()
@@ -833,9 +833,10 @@ fn preview(labels: &LabelFile) -> LabelFile {
 }
 
 /// The review queue's frames that are not reviewed or skipped, with their labels (saved or
-/// pre-filled) and size.
+/// pre-filled with the boxes of `classes`) and size.
 fn unreviewed_queue_frames(
     dir: &Path,
+    classes: &[String],
     warnings: &mut Vec<String>,
 ) -> Vec<(Frame, LabelFile, u32, u32)> {
     let mut out = Vec::new();
@@ -853,7 +854,7 @@ fn unreviewed_queue_frames(
         let labels = match labels {
             Some(l) if l.status != Status::Unreviewed => continue,
             Some(l) => l,
-            None => super::prefill(&rec),
+            None => super::prefill(&rec, classes),
         };
         out.push((frame, labels, rec.width, rec.height));
     }
