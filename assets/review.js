@@ -5,7 +5,8 @@
 // params. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
 // The Auto-label card queues a job (POST /training/autolabel as JSON) and follows it on
 // GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto and
-// "Reject auto boxes below" POST /v1/review/reject-low (both: dry run, confirm, run).
+// "Reject auto boxes below" POST /v1/review/reject-low and "Reject model boxes of other
+// classes" POST /v1/review/reject-other-class (all three: dry run, confirm, run).
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
 // a new folder reloads the page.
 // Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
@@ -1358,6 +1359,49 @@
         box.className = 'review-report error-text';
         report(box, [e.message]);
       }).then(function () { rejectBtn.disabled = false; });
+    });
+  }
+
+  var otherBtn = $('rv-reject-other');
+  if (otherBtn) {
+    otherBtn.addEventListener('click', function () {
+      var box = $('rv-reject-other-msg');
+      var body = {};
+      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
+        var e = filtersForm.elements[k];
+        if (e && e.value) body[k] = e.value;
+      });
+      body.dry_run = true;
+      box.className = 'review-report';
+      report(box, ['Counting the boxes...']);
+      otherBtn.disabled = true;
+      postJson('/v1/review/reject-other-class', body).then(function (j) {
+        var n = j.boxes || 0;
+        if (!n) { report(box, [j.message || 'No pending model box of a class outside the class list on the unreviewed frames the filters select.']); return null; }
+        var renamed = j.relabelled || 0;
+        var text = 'Reject ' + (n - renamed) + ' pending model box(es) of classes outside the class list on ' +
+          (j.eligible || 0) + ' frame(s)? They are kept as evidence (reason other_class); the frames stay ' +
+          'unreviewed and a reviewer can still change them per frame.';
+        if (renamed) {
+          text += ' ' + renamed + ' box(es) whose label is a class of the list under another spelling ' +
+            '(e.g. pottedplant) are renamed to the list\'s spelling instead.';
+        }
+        if (!window.confirm(text)) {
+          report(box, ['Nothing rejected.']);
+          return null;
+        }
+        body.dry_run = false;
+        return postJson('/v1/review/reject-other-class', body).then(function (r) {
+          var failed = r.failed || [];
+          report(box, [r.message || ('Changed ' + (r.boxes || 0) + ' box(es).')],
+            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
+          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+          return reloadQueue();
+        });
+      }).catch(function (e) {
+        box.className = 'review-report error-text';
+        report(box, [e.message]);
+      }).then(function () { otherBtn.disabled = false; });
     });
   }
 

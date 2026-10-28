@@ -354,7 +354,9 @@ pub fn import_dir(
             let (rects, warnings) = rects(&x);
             r.warnings
                 .extend(warnings.into_iter().map(|w| format!("{name}: {w}")));
-            let base = frame.labels()?.unwrap_or_else(|| super::prefill(&rec));
+            let base = frame
+                .labels()?
+                .unwrap_or_else(|| super::prefill(&rec, classes));
             let classes_version = base.classes_version.clone();
             let mut merged = apply_import(base, &rects);
             merged.classes_version = classes_version;
@@ -486,7 +488,7 @@ mod tests {
             bbox: [10.0, 10.0, 50.0, 90.0],
         }];
         let classes = super::super::super::config::default_classes();
-        let mut reviewed = prefill(&rec);
+        let mut reviewed = prefill(&rec, &classes);
         reviewed.status = Status::Reviewed;
         reviewed.boxes.push(LabelBox {
             label: "dog".into(),

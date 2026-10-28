@@ -4,7 +4,9 @@
 //! its pre-fill from the sidecar, with its revision; a save naming a stale revision is refused
 //! with 409), `POST /v1/review/accept-auto` (bulk accept of frames the auto-labeler's triage
 //! settles), `POST /v1/review/reject-low` (bulk reject of the pending auto boxes scoring
-//! below a minimum, `reason: low_score`), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling / benchmark set), `POST
+//! below a minimum, `reason: low_score`), `POST /v1/review/reject-other-class` (bulk reject of
+//! the pending model boxes of classes outside `collect.classes`, `reason: other_class`; aliases
+//! renamed to the list's spelling), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling / benchmark set), `POST
 //! /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes` (`collect.classes`
 //! and `collect.hidden_classes`) and `GET /v1/review/class-catalog` (the class picker's
 //! catalog, [`crate::training::autolabel::catalog`]).
@@ -266,7 +268,7 @@ fn labels_answer(frame: &Frame, classes: &[String], message: Option<String>) -> 
         Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
     let is_saved = saved.is_some();
-    let file = saved.unwrap_or_else(|| labels::prefill(&rec));
+    let file = saved.unwrap_or_else(|| labels::prefill(&rec, classes));
     let version = labels::classes_version(classes);
     let q = encode_uri_component(&frame.rel.jpg());
     Json(serde_json::json!({
@@ -600,6 +602,126 @@ pub(super) async fn reject_low(
             "success": true,
             "eligible": eligible,
             "boxes": o.boxes,
+            "rejected": o.done_count,
+            "failed": o.failed,
+            "frames": o.done,
+            "message": message,
+        }))
+        .into_response()
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectOtherClassBody {
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    scene: Option<String>,
+    #[serde(default)]
+    camera: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `POST /v1/review/reject-other-class` with `{bucket?, scene?, camera?, label?, source?,
+/// dry_run, limit?}`: on the unreviewed frames of those filters, the pending model boxes whose
+/// label is not in `collect.classes` rejected with `reason: other_class` (kept as evidence), or
+/// renamed to the list's spelling when the label is a class under another name
+/// (`pottedplant` -> `potted plant`; [`bulk::bulk_reject_other_class`]), at most `limit` frames
+/// (default 500). `dry_run` only counts. `boxes` counts the boxes changed, `relabelled` the
+/// renamed ones among them, `rejected` the frames changed (as reject-low).
+pub(super) async fn reject_other_class(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: RejectOtherClassBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
+    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        );
+    }
+    let mut q: BTreeMap<String, String> = [
+        ("bucket", b.bucket),
+        ("scene", b.scene),
+        ("camera", b.camera),
+        ("label", b.label),
+        ("source", b.source),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+    .collect();
+    q.insert("status".into(), "unreviewed".into());
+    let filters = match Filters::from_query(&q) {
+        Ok(f) => f,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let dry_run = b.dry_run;
+    blocking(move || {
+        let (dir, classes, _) = context(&state);
+        let o = bulk::bulk_reject_other_class(&dir, &filters, &classes, limit, dry_run, &|_| true);
+        let eligible = o.eligible;
+        if dry_run {
+            return Json(serde_json::json!({
+                "success": true,
+                "eligible": eligible,
+                "boxes": o.boxes,
+                "relabelled": o.relabelled,
+                "rejected": 0,
+                "frames": o.done,
+            }))
+            .into_response();
+        }
+        let mut message = format!(
+            "Rejected {} model box(es) of classes outside the class list on {} frame(s) (kept \
+             as evidence, reason other_class; the frames stay unreviewed).",
+            o.boxes - o.relabelled,
+            o.done_count
+        );
+        if o.relabelled > 0 {
+            message.push_str(&format!(
+                " Renamed {} box(es) to the class list's spelling.",
+                o.relabelled
+            ));
+        }
+        if o.failed_count > 0 {
+            message.push_str(&format!(
+                " {} frame(s) not changed (listed); review them by hand.",
+                o.failed_count
+            ));
+        }
+        if eligible > limit {
+            message.push_str(&format!(
+                " {} more frame(s) beyond the limit of {limit}; run it again.",
+                eligible - limit
+            ));
+        }
+        tracing::info!(
+            boxes = o.boxes,
+            relabelled = o.relabelled,
+            frames = o.done_count,
+            failed = o.failed_count,
+            eligible,
+            "review: model boxes of other classes rejected"
+        );
+        Json(serde_json::json!({
+            "success": true,
+            "eligible": eligible,
+            "boxes": o.boxes,
+            "relabelled": o.relabelled,
             "rejected": o.done_count,
             "failed": o.failed,
             "frames": o.done,
@@ -953,12 +1075,18 @@ mod tests {
     }
 
     fn ds() -> Ds {
+        ds_with(|_| {})
+    }
+
+    /// [`ds`] with `edit` applied to the config.
+    fn ds_with(edit: impl FnOnce(&mut crate::config::Config)) -> Ds {
         let root = std::env::temp_dir().join(format!("bop-review-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let (d, r) = (root.join("dataset"), root.clone());
         let state = test_state_with(move |c| {
             c.download_dir = Some(r);
             c.collect.dir = Some(d);
+            edit(c);
         });
         Ds {
             state,
@@ -1707,7 +1835,10 @@ mod tests {
     /// left without evidence).
     fn put_auto_labels(dir: &std::path::Path, rel: &str, accept: bool) {
         let frame = Frame::resolve(dir, rel).unwrap();
-        let mut f = labels::prefill(&frame.record().unwrap());
+        let mut f = labels::prefill(
+            &frame.record().unwrap(),
+            &crate::collect::config::default_classes(),
+        );
         if accept {
             f.boxes[0].auto.triage = Some(labels::Triage::Accept);
             f.boxes[0].auto.agree = Some(true);
@@ -1981,6 +2112,142 @@ mod tests {
             r#"{{"min_score": 0.3, "camera": "{}"}}"#,
             "x".repeat(SMALL_BODY_LIMIT)
         );
+        let (s, _) = json(&d.state, post_json(uri, &big)).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn reject_other_class_rejects_only_pending_model_boxes_off_the_list() {
+        use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
+        use labels::{BoxState, Origin, Source, Triage};
+        let model = |label: &str| labels::LabelBox {
+            source: Source::Model,
+            origin: Some(Origin::Prediction),
+            auto: Default::default(),
+            ..auto_box(label, 0.7, Triage::Review)
+        };
+        let d = ds_with(|c| {
+            c.collect.classes = ["person", "car", "potted plant"].map(String::from).to_vec();
+        });
+        let a = put_frame(
+            &d.dir,
+            "a",
+            None,
+            vec![
+                model("person"),
+                model("clock"),
+                model("pottedplant"),
+                auto_box("clock", 0.9, Triage::Review),
+            ],
+        );
+        let b = put_frame(&d.dir, "b", None, vec![model("parking meter")]);
+        let on_list = put_frame(&d.dir, "c", None, vec![model("car")]);
+        let reviewed = put_frame(&d.dir, "r", None, vec![model("clock")]);
+        let frame = Frame::resolve(&d.dir, &reviewed).unwrap();
+        let mut f = labels_of(&d.dir, &reviewed);
+        f.status = labels::Status::Reviewed;
+        labels::write(&frame.labels, &f).unwrap();
+
+        let uri = "/v1/review/reject-other-class";
+        let (s, v) = json(&d.state, post_json(uri, r#"{"dry_run": true}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (
+                v["eligible"].as_u64(),
+                v["boxes"].as_u64(),
+                v["relabelled"].as_u64(),
+                v["rejected"].as_u64()
+            ),
+            (Some(2), Some(3), Some(1), Some(0)),
+            "{v}"
+        );
+        assert_eq!(
+            labels_of(&d.dir, &a).boxes[1].state,
+            BoxState::Pending,
+            "a dry run writes nothing"
+        );
+
+        let (s, v) = json(&d.state, post_json(uri, "{}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (
+                v["eligible"].as_u64(),
+                v["boxes"].as_u64(),
+                v["relabelled"].as_u64(),
+                v["rejected"].as_u64()
+            ),
+            (Some(2), Some(3), Some(1), Some(2)),
+            "{v}"
+        );
+        assert_eq!(v["failed"], serde_json::json!([]));
+        assert!(
+            v["message"].as_str().unwrap().contains("Renamed 1 box"),
+            "{v}"
+        );
+        let fa = labels_of(&d.dir, &a);
+        assert_eq!(fa.status, labels::Status::Unreviewed);
+        let got: Vec<(&str, BoxState)> = fa
+            .boxes
+            .iter()
+            .map(|b| (b.label.as_str(), b.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("person", BoxState::Pending),
+                ("clock", BoxState::Rejected),
+                ("potted plant", BoxState::Pending),
+                ("clock", BoxState::Pending),
+            ]
+        );
+        assert_eq!(
+            fa.boxes[1].reason.as_deref(),
+            Some(bulk::OTHER_CLASS_REASON)
+        );
+        assert_eq!(fa.boxes[2].model_label.as_deref(), Some("pottedplant"));
+        assert_eq!(labels_of(&d.dir, &b).boxes[0].state, BoxState::Rejected);
+        assert_eq!(
+            labels_of(&d.dir, &on_list).boxes[0].state,
+            BoxState::Pending
+        );
+        let fr = labels_of(&d.dir, &reviewed);
+        assert_eq!(
+            (fr.status, fr.boxes[0].state),
+            (labels::Status::Reviewed, BoxState::Pending),
+            "a reviewed frame is left alone"
+        );
+        let (_, v) = json(&d.state, post_json(uri, "{}")).await;
+        assert_eq!(
+            (v["eligible"].as_u64(), v["rejected"].as_u64()),
+            (Some(0), Some(0))
+        );
+
+        // Bad requests.
+        for (body, field) in [
+            (r#"{"min_score": 0.3}"#, "unknown field"),
+            (r#"{"limit": 0}"#, "limit"),
+            (r#"{"scene": "dusk"}"#, "scene"),
+            (r#"{"dry_run": "yes"}"#, "invalid JSON body"),
+        ] {
+            let (s, v) = json(&d.state, post_json(uri, body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert!(
+                v["message"].as_str().unwrap().contains(field),
+                "{body}: {v}"
+            );
+        }
+        let mut req = post_json(uri, "{}");
+        req.headers_mut()
+            .insert("origin", "http://evil.example".parse().unwrap());
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let req = super::super::test_util::from_peer(
+            post_json(uri, "{}"),
+            super::super::test_util::REMOTE,
+        );
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let big = format!(r#"{{"camera": "{}"}}"#, "x".repeat(SMALL_BODY_LIMIT));
         let (s, _) = json(&d.state, post_json(uri, &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
     }

@@ -316,11 +316,13 @@ folder; the collector and the Dataset page keep `collect.dir`.
   - `accepted`: a model or auto box that is a real object;
   - `added`: a box the reviewer drew (a miss);
   - `rejected`: a wrong box. It is kept as hard-negative evidence and never becomes a training label;
-    a pending auto box rejected in bulk for its score has `reason: "low_score"`;
+    a pending auto box rejected in bulk for its score has `reason: "low_score"`, a pending model box
+    rejected in bulk for a class outside the list `reason: "other_class"`;
   - `pending`: not decided yet. Only `unreviewed` and `skipped` files have pending boxes.
 - **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
   `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
-- **`model_label`:** the label the model gave, when the reviewer changed it.
+- **`model_label`:** the label the model gave, when the reviewer changed it or it was mapped onto the
+  class list's spelling (pre-fill, auto-label runs, *Reject model boxes of other classes*).
 - **`orig_bbox`:** the proposed box before the reviewer moved or resized it (set by the page; checked
   and clamped like `bbox`, dropped when equal to it).
 - **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
@@ -359,9 +361,13 @@ folder; the collector and the Dataset page keep `collect.dir`.
 
 ### Pre-fill and the save rule
 
-A frame without a label file starts with every sidecar box as `pending`, in this order:
-`predictions`, `suppressed`, `below_threshold`, `verify.found`. A box is left out if an earlier box has
-the same label and IoU >= 0.95 (for `verify.found`, IoU >= 0.5).
+A frame without a label file starts with every sidecar box of a class of `collect.classes` as
+`pending`, in this order: `predictions`, `suppressed`, `below_threshold`, `verify.found`. Labels are
+mapped onto the list's spelling (exact, ignoring case, then the COCO / VOC aliases: a VOC-spelled
+model's `pottedplant` is `potted plant` when that is listed, with `model_label: "pottedplant"`); a box of
+no listed class is left out (the sidecar keeps it). A box is left out if an earlier box has the same
+(mapped) label and IoU >= 0.95 (for `verify.found`, IoU >= 0.5). Label files written before this rule
+can still hold model boxes of other classes: *Reject model boxes of other classes* clears them (below).
 
 When a frame is saved as `reviewed`, each `pending` box becomes:
 
@@ -465,6 +471,19 @@ or skipped frames are left alone. `dry_run` answers `{success, eligible, boxes, 
 `{success, eligible, boxes, rejected, failed, frames, message}` (`boxes` rejected, `rejected` frames
 changed). The auto-label chain's reject step (docs/TRAINING.md, "Auto-label after import") is the
 same code (`collect/labels/bulk.rs`), scoped to the import's frames.
+
+`POST /v1/review/reject-other-class` (JSON `{bucket?, scene?, camera?, label?, source?, dry_run,
+limit?}`; the Review page's *Reject model boxes of other classes*) takes the unreviewed frames of those
+filters and, on each pending `source: model` box whose label is not in `collect.classes`: when the label
+is a listed class under another spelling (ignoring case, or a COCO / VOC alias such as `pottedplant` for
+`potted plant`), renames it to the list's spelling (still `pending`; the old label in `model_label`
+unless only the case differs); otherwise rejects it (`state: rejected`, `reason: "other_class"`). Auto
+and human boxes, decided boxes, the frame's status and reviewed or skipped frames are left alone. It
+clears the predictions of other classes a save would otherwise accept and refuse, which also makes a
+frame accept-ready when they were all that kept it out. `dry_run` answers `{success, eligible, boxes,
+relabelled, rejected: 0, frames}`; otherwise `{success, eligible, boxes, relabelled, rejected, failed,
+frames, message}` (`boxes` rejected or renamed, `relabelled` the renamed ones among them, `rejected`
+frames changed).
 
 ### Keyboard
 
