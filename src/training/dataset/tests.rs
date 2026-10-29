@@ -1071,6 +1071,8 @@ fn reviewed_dataset(dir: &Path, frames: &[ReviewedFrame<'_>]) {
                     reason: None,
                     model_label: None,
                     orig_bbox: None,
+                    difficult: false,
+                    reject_reason: None,
                     auto: Default::default(),
                 })
                 .collect(),

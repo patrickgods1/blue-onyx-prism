@@ -98,6 +98,11 @@ fn name_ok(s: &str, max: usize) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
+/// Whether `s` can be a camera folder ([`camera_dir`]'s alphabet and length).
+pub fn camera_ok(s: &str) -> bool {
+    name_ok(s, MAX_CAMERA_LEN)
+}
+
 fn date_ok(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 10

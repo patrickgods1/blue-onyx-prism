@@ -100,7 +100,7 @@ pub fn to_xany<'a>(
                 points: vec![vec![x0, y0], vec![x1, y0], vec![x1, y1], vec![x0, y1]],
                 group_id: None,
                 description: Some(String::new()),
-                difficult: false,
+                difficult: b.difficult,
                 shape_type: "rectangle".into(),
                 flags: Some(serde_json::Map::new()),
                 attributes: serde_json::Map::new(),
@@ -121,8 +121,8 @@ pub fn to_xany<'a>(
     }
 }
 
-/// An imported rectangle: label, `[x0, y0, x1, y1]`, score.
-pub type Rect = (String, [f32; 4], Option<f32>);
+/// An imported rectangle: label, `[x0, y0, x1, y1]`, score, unsure (`difficult`).
+pub type Rect = (String, [f32; 4], Option<f32>, bool);
 
 /// The rectangles of `x`: `rectangle` (2 or 4 points), `polygon` and `rotation` shapes (their
 /// bounding box). Other shape types (points, lines, circles) are skipped with a warning.
@@ -177,7 +177,7 @@ pub fn rects(x: &XFile) -> (Vec<Rect>, Vec<String>) {
             .score
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
             .map(|v| v as f32);
-        out.push((s.label.trim().to_string(), b, score));
+        out.push((s.label.trim().to_string(), b, score, s.difficult));
     }
     (out, warnings)
 }
@@ -197,7 +197,7 @@ pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
     let mut boxes = base.boxes;
     let mut matched = vec![false; boxes.len()];
     let mut added = Vec::new();
-    for (label, bbox, score) in rects {
+    for (label, bbox, score, difficult) in rects {
         let best = boxes
             .iter()
             .enumerate()
@@ -218,6 +218,7 @@ pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
                     b.label = label.clone();
                 }
                 b.bbox = *bbox;
+                b.difficult = *difficult;
                 b.state = if b.source == Source::Human {
                     BoxState::Added
                 } else {
@@ -234,6 +235,8 @@ pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
                 reason: None,
                 model_label: None,
                 orig_bbox: None,
+                difficult: *difficult,
+                reject_reason: None,
                 auto: Default::default(),
             }),
         }
@@ -391,6 +394,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         }
     }
@@ -422,15 +427,15 @@ mod tests {
                 "imageHeight": 480, "imageWidth": 640, "extra": 1,
                 "shapes": [
                   {"label": "dog", "points": [[50, 60], [10, 20]], "shape_type": "rectangle"},
-                  {"label": "cat", "points": [[1, 1], [9, 2], [5, 8]], "shape_type": "polygon", "score": 0.4},
+                  {"label": "cat", "points": [[1, 1], [9, 2], [5, 8]], "shape_type": "polygon", "score": 0.4, "difficult": true},
                   {"label": "p", "points": [[1, 1]], "shape_type": "point"},
                   {"label": "bad", "points": [[1, 1]], "shape_type": "rectangle"}
                 ]}"#,
         )
         .unwrap();
         let (r, w) = rects(&x);
-        assert_eq!(r[0], ("dog".into(), [10.0, 20.0, 50.0, 60.0], None));
-        assert_eq!(r[1], ("cat".into(), [1.0, 1.0, 9.0, 8.0], Some(0.4)));
+        assert_eq!(r[0], ("dog".into(), [10.0, 20.0, 50.0, 60.0], None, false));
+        assert_eq!(r[1], ("cat".into(), [1.0, 1.0, 9.0, 8.0], Some(0.4), true));
         assert_eq!(r.len(), 2);
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(!x.checked);
@@ -451,9 +456,9 @@ mod tests {
         };
         let rects = vec![
             // The person, moved a little and relabeled.
-            ("raccoon".to_string(), [10.0, 10.0, 50.0, 88.0], None),
+            ("raccoon".to_string(), [10.0, 10.0, 50.0, 88.0], None, false),
             // New.
-            ("deer".to_string(), [400.0, 10.0, 500.0, 100.0], None),
+            ("deer".to_string(), [400.0, 10.0, 500.0, 100.0], None, false),
         ];
         let f = apply_import(base.clone(), &rects);
         assert_eq!(f.status, Status::Reviewed);
@@ -502,6 +507,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         });
         let reviewed = normalize(reviewed, &classes, 640, 480, "t").unwrap();
@@ -513,5 +520,35 @@ mod tests {
         assert!(w.is_empty());
         let again = normalize(apply_import(reviewed.clone(), &r), &classes, 640, 480, "t").unwrap();
         assert_eq!(again, reviewed, "an unchanged round trip changes nothing");
+    }
+
+    #[test]
+    fn unsure_round_trips_through_the_files() {
+        let unsure = LabelBox {
+            difficult: true,
+            ..model_box("person", [10.0, 10.0, 50.0, 90.0], BoxState::Accepted)
+        };
+        let sure = model_box("dog", [100.0, 100.0, 150.0, 140.0], BoxState::Accepted);
+        let x = to_xany("n.jpg", 640, 480, [&unsure, &sure], true);
+        let v = serde_json::to_value(&x).unwrap();
+        assert_eq!(v["shapes"][0]["difficult"], true);
+        assert_eq!(v["shapes"][1]["difficult"], false);
+        let (r, _) = rects(&x);
+        // Marked unsure in X-AnyLabeling: the matched box and a new one take the flag.
+        let mut flipped = r.clone();
+        flipped[0].3 = false;
+        flipped[1].3 = true;
+        flipped.push(("cat".into(), [300.0, 300.0, 340.0, 340.0], None, true));
+        let base = LabelFile {
+            boxes: vec![unsure, sure],
+            ..LabelFile::default()
+        };
+        let f = apply_import(base, &flipped);
+        let got: Vec<(&str, bool)> = f
+            .boxes
+            .iter()
+            .map(|b| (b.label.as_str(), b.difficult))
+            .collect();
+        assert_eq!(got, [("person", false), ("dog", true), ("cat", true)]);
     }
 }

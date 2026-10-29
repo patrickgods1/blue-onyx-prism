@@ -303,6 +303,8 @@ fn hidden_classes_are_neither_labelled_nor_left_pending() {
         reason: None,
         model_label: None,
         orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
         auto: Default::default(),
     };
     let f = LabelFile {
@@ -370,6 +372,8 @@ fn empty_frames_get_the_marker_and_other_class_boxes_a_suggestion() {
         reason: None,
         model_label: None,
         orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
         auto: Default::default(),
     });
     labels::write(&fr.labels, &f).unwrap();
@@ -545,6 +549,8 @@ fn self_training_sends_disagreeing_reviewed_frames_back_first() {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         });
         labels::write(&fr.labels, &f).unwrap();
@@ -858,6 +864,8 @@ fn self_training_for_some_classes_ignores_the_others() {
         reason: None,
         model_label: None,
         orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
         auto: Default::default(),
     });
     labels::write(&fr.labels, &f).unwrap();

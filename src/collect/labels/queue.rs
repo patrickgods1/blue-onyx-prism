@@ -53,6 +53,8 @@ pub enum AutoFilter {
     /// file too).
     #[serde(rename = "none")]
     Never,
+    /// Repeat-only: spot edits settled every box ([`super::repeats::repeats_only`]).
+    Repeats,
 }
 
 impl AutoFilter {
@@ -62,6 +64,7 @@ impl AutoFilter {
             "accept" => Some(AutoFilter::Accept),
             "nothing" => Some(AutoFilter::Nothing),
             "none" => Some(AutoFilter::Never),
+            "repeats" => Some(AutoFilter::Repeats),
             _ => None,
         }
     }
@@ -75,6 +78,7 @@ impl AutoFilter {
             AutoFilter::Accept => labels.is_some_and(super::auto_accept_eligible),
             AutoFilter::Nothing => ran && !evidence,
             AutoFilter::Never => !ran && !evidence,
+            AutoFilter::Repeats => labels.is_some_and(super::repeats::repeats_only),
         }
     }
 }
@@ -152,10 +156,9 @@ impl Filters {
         };
         let auto = match get("auto") {
             None => None,
-            Some(a) => Some(
-                AutoFilter::parse(a)
-                    .ok_or_else(|| format!("auto: '{a}' is not review, accept, nothing or none"))?,
-            ),
+            Some(a) => Some(AutoFilter::parse(a).ok_or_else(|| {
+                format!("auto: '{a}' is not review, accept, nothing, none or repeats")
+            })?),
         };
         Ok(Self {
             bucket,
@@ -212,6 +215,9 @@ pub struct Uncertainty {
     pub relabel: Option<String>,
     /// Pending auto-labeler boxes triaged `review`.
     pub auto_review: usize,
+    /// Spot edits settled every box ([`super::repeats::repeats_only`]): these frames come last.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub repeats_only: bool,
 }
 
 impl Uncertainty {
@@ -237,6 +243,7 @@ impl Uncertainty {
             suppressed: rec.suppressed.len(),
             relabel: None,
             auto_review: 0,
+            repeats_only: false,
         }
     }
 
@@ -253,12 +260,14 @@ impl Uncertainty {
                         && b.auto.triage == Some(super::Triage::Review)
                 })
                 .count();
+            self.repeats_only = super::repeats::repeats_only(l);
         }
         self
     }
 
-    /// Sort key, most uncertain first: a re-label disagreement, then the margin in hundredths
-    /// (no box last), verifier disagreement, more auto boxes to review, more suppressed boxes.
+    /// Sort key, most uncertain first: repeat-only frames last of all, then a re-label
+    /// disagreement, then the margin in hundredths (no box last), verifier disagreement, more auto
+    /// boxes to review, more suppressed boxes.
     #[allow(
         clippy::type_complexity,
         reason = "a lexicographic sort key reads best as one tuple"
@@ -266,6 +275,7 @@ impl Uncertainty {
     fn key(
         &self,
     ) -> (
+        bool,
         bool,
         u32,
         bool,
@@ -281,6 +291,7 @@ impl Uncertainty {
             .margin
             .map_or(u32::MAX, |m| (m.clamp(0.0, 1.0) * 100.0).round() as u32);
         (
+            self.repeats_only,
             self.relabel.is_none(),
             m,
             !self.disagreement,
@@ -333,6 +344,8 @@ pub struct Counts {
     pub auto_review: u64,
     /// Frames the auto-labeler's triage alone settles ([`AutoFilter::Accept`]).
     pub auto_accept: u64,
+    /// Repeat-only frames ([`AutoFilter::Repeats`]).
+    pub repeats_only: u64,
 }
 
 impl Counts {
@@ -345,6 +358,7 @@ impl Counts {
         }
         self.auto_review += u64::from(AutoFilter::Review.matches(labels));
         self.auto_accept += u64::from(AutoFilter::Accept.matches(labels));
+        self.repeats_only += u64::from(AutoFilter::Repeats.matches(labels));
         if let Some(l) = labels.filter(|l| l.status == Status::Reviewed) {
             self.empty_confirmed += u64::from(l.empty_confirmed);
             for b in l.training() {
@@ -503,6 +517,7 @@ mod tests {
             suppressed,
             relabel: None,
             auto_review: 0,
+            repeats_only: false,
         }
     }
 
@@ -525,6 +540,15 @@ mod tests {
         sort_items(&mut items);
         let order: Vec<&str> = items.iter().map(|i| i.frame.as_str()).collect();
         assert_eq!(order, ["relabel", "closest", "auto", "plain"]);
+        // A repeat-only frame goes last, even with a re-label disagreement.
+        let repeats = Uncertainty {
+            repeats_only: true,
+            relabel: Some("x".into()),
+            ..u(Some(0.0), true, 9)
+        };
+        items.push(item("repeats", "9", repeats));
+        sort_items(&mut items);
+        assert_eq!(items.last().unwrap().frame, "repeats");
         // From a label file.
         let mut f = LabelFile {
             disagreement: Some("x".into()),

@@ -4,7 +4,18 @@
 <h1>Review</h1>
 <details class="help">
   <summary>How review works</summary>
-  <p>Frames collected from your cameras (Dataset page), one at a time, most uncertain first. Decide every box: accept the real objects, reject the false ones (kept as hard negatives), restore a wrongly suppressed box, draw what the model missed. They stay on this machine in <code>{{ dir }}</code>. Format: <code>docs/DATASET.md</code>. After an auto-label run, boxes marked <em>auto: accept</em> are accepted on save and <em>auto: review</em> ones (marked ?) ask first; frames with only accept boxes can be accepted in bulk.</p>
+  <p>Frames collected from your cameras (Dataset page), one at a time, most uncertain first. Decide every box: accept the real objects, reject the false ones (kept as hard negatives), restore a wrongly suppressed box, draw what the model missed. They stay on this machine in <code>{{ dir }}</code>. Format: <code>docs/DATASET.md</code>. After an auto-label run, boxes marked <em>auto: accept</em> are accepted on save and <em>auto: review</em> ones (marked ?) ask first; frames with only accept boxes can be accepted in bulk. Press <kbd>?</kbd> for the keys.</p>
+  <p>Labelling rules:</p>
+  <ul class="rv-rules">
+    <li>A tight box around the visible part of the object.</li>
+    <li>Parked cars are cars: an object left unlabelled teaches the model it is background.</li>
+    <li>A cyclist is a person box plus a bicycle box.</li>
+    <li>A person inside a vehicle only if clearly visible.</li>
+    <li>An object cut by the frame edge only if you can still recognise it.</li>
+    <li>Dark frames: look at them brightened (<kbd>b</kbd>) before deciding. A real object you still cannot name for sure is <em>unsure</em> (<kbd>d</kbd>): kept, left out of YOLO training, ignored by the benchmark set. Reject what is not an object at all.</li>
+    <li>Why a box was wrong is optional: after <kbd>r</kbd>, <kbd>Shift</kbd>+<kbd>1</kbd>-<kbd>9</kbd> (insect / web, IR glare, reflection, ...) marks it for hard-negative mining.</li>
+    <li>Before saving, look over the whole frame for objects the model missed: they are the commonest label error.</li>
+  </ul>
 </details>
 
 <div id="review" data-classes="{{ classes_json }}">
@@ -26,7 +37,7 @@
     <label>Scene <select name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></label>
     <label>Camera <select name="camera" id="rv-camera"><option value="">any</option></select></label>
     <div class="rv-label-filter"><span class="field-label" id="rv-label-cap">Class</span> <div id="rv-label-picker" aria-labelledby="rv-label-cap"><select id="rv-label-fallback" aria-label="Class"><option value="">any</option>{% for c in classes %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></div><input type="hidden" name="label" id="rv-label" value=""></div>
-    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option></select></label>
+    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option><option value="repeats">only repeats left</option></select></label>
     <label>Status <select name="status"><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select></label>
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
   </form>
@@ -34,7 +45,7 @@
 
 <div class="review-grid">
   <div class="review-stage">
-    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-zoombox" class="small secondary" hidden>Zoom to box</button><button type="button" id="rv-fit" class="small secondary" hidden>Fit</button></div>
+    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-imgmode" class="small secondary">Image</button><button type="button" id="rv-zoombox" class="small secondary" hidden>Zoom to box</button><button type="button" id="rv-fit" class="small secondary" hidden>Fit</button></div>
     <canvas id="rv-canvas" width="640" height="360" tabindex="0" aria-label="The frame with its boxes. Click a box to select it, drag its handles to resize it, drag inside it to move it, drag elsewhere to draw a new one; the wheel zooms."></canvas>
     <p id="rv-none" class="empty" hidden>No frame matches the filters. Send frames to review from the <a href="/dataset">Dataset</a> page, or show all collected frames.</p>
   </div>
@@ -47,39 +58,22 @@
       <button type="button" id="rv-save">Save &amp; next</button>
       <button type="button" id="rv-accept-all" class="small secondary">Accept proposals</button>
       <button type="button" id="rv-skip" class="small secondary">Skip</button>
+      <button type="button" id="rv-back" class="small secondary">Back</button>
       <button type="button" id="rv-next" class="small secondary">Next</button>
       <button type="button" id="rv-undo" class="small secondary">Undo</button>
+      <button type="button" id="rv-keys-open" class="small secondary">Keys ?</button>
     </div>
     <p id="rv-msg" class="form-msg" role="status"></p>
+    <p id="rv-session" class="rv-session muted" aria-live="polite"></p>
     <details id="rv-panel-opts" class="rv-panel-opts">
       <summary>Panel options</summary>
       <div class="rv-show-of"><span class="field-label" id="rv-show-cap">Show boxes of</span> <div id="rv-show-picker" aria-labelledby="rv-show-cap"></div></div>
       <label>Class for new boxes <select id="rv-class">{% for c in classes %}<option value="{{ c }}">{{ loop.index }}. {{ c }}</option>{% endfor %}</select></label>
+      <label class="check"><input type="checkbox" id="rv-ask-missing"> Ask about missed objects before saving</label>
     <details>
       <summary>Keyboard and colours</summary>
       <table class="review-keys">
-        <tbody>
-          <tr><td>a</td><td>accept the selected box (keep a drawn one) and go to the next</td></tr>
-          <tr><td>r</td><td>reject the selected box (delete a drawn one) and go to the next</td></tr>
-          <tr><td>Shift+A</td><td>accept proposals: the pending boxes saving would accept (hints stay pending)</td></tr>
-          <tr><td></td><td>The next box is the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked <em>to check</em>).</td></tr>
-          <tr><td>1-9, 0</td><td>class 1-10<span id="rv-key-classes"></span>: relabel the selected box (accepting it) and go to the next, else the class of new boxes; the bar's <em>It's a&hellip;</em> lists them all</td></tr>
-          <tr><td>j / k</td><td>select the next / previous box</td></tr>
-          <tr><td>Delete</td><td>delete a drawn box, reject a model box</td></tr>
-          <tr><td>e</td><td>confirmed empty (rejects every box)</td></tr>
-          <tr><td>z</td><td>undo</td></tr>
-          <tr><td>s, Enter</td><td>save &amp; next</td></tr>
-          <tr><td>n</td><td>next without saving</td></tr>
-          <tr><td>drag</td><td>on a handle: resize; inside the selected box: move; elsewhere: draw a box</td></tr>
-          <tr><td>arrows</td><td>move the selected box 1 px (Shift: 10 px)</td></tr>
-          <tr><td>wheel</td><td>zoom about the pointer (up to 8x)</td></tr>
-          <tr><td>right / middle drag, Space + drag</td><td>pan</td></tr>
-          <tr><td>x</td><td>zoom to the selected box and follow the selection (the next box, the next frame) until f, the wheel or a pan</td></tr>
-          <tr><td>f</td><td>fit (zoom out)</td></tr>
-          <tr><td>v</td><td>spotlight on / off: the frame dimmed outside the selected box, the other boxes faint</td></tr>
-          <tr><td>h (hold)</td><td>hide the boxes</td></tr>
-          <tr><td>l</td><td>labels on the boxes on / off</td></tr>
-        </tbody>
+        <tbody><!-- filled by review.js from its key list (also the ? overlay) --></tbody>
       </table>
       <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; decide it, or save twice for the default) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; the pointer over a box shows its full tag.</p>
     </details>
@@ -123,6 +117,11 @@
     <span class="muted">Saves the unreviewed frames the filters select whose boxes are all <em>auto: accept</em> as reviewed (asks first).</span>
   </div>
   <div id="rv-accept-auto-msg" class="review-report" role="status"></div>
+  <div class="inline-row">
+    <button type="button" id="rv-accept-repeats" class="small secondary">Save repeat-only frames&hellip;</button>
+    <span class="muted">Saves as reviewed the unreviewed frames the filters select whose every box <em>Reject / Accept this spot on all frames</em> (the decision bar, for a box you decided) already settled; a frame with a box still to decide is never saved. Asks first.</span>
+  </div>
+  <div id="rv-accept-repeats-msg" class="review-report" role="status"></div>
   <div class="inline-row">
     <button type="button" id="rv-reject-low" class="small secondary">Reject auto boxes below&hellip;</button>
     <label class="inline-label">score <input type="number" id="rv-reject-low-score" min="0.01" max="1" step="0.01" value="0.3" class="num-sm" aria-label="Reject auto boxes scoring below"></label>
@@ -183,6 +182,7 @@
   <div id="rv-classes-msg" class="form-msg" role="status"></div>
 </div>
 </div>
+<dialog id="rv-keys-dialog" class="rv-keys-dialog" aria-label="Keyboard"></dialog>
 <dialog id="browse-dialog">
   <h3 id="browse-title">Choose a folder</h3>
   <div class="browse-bar">

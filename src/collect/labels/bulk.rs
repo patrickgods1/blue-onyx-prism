@@ -8,7 +8,10 @@
 //! list's spelling instead; `POST /v1/review/reject-other-class`), [`bulk_reject_unwanted`]
 //! does the same over every label file of the folder (after a class list change) or, with
 //! [`Scope::Reviewed`], rejects the training boxes of unwanted classes on reviewed frames
-//! (`POST /v1/review/reject-unwanted-reviewed`; [`reviewed_with_unwanted`] counts them). Each
+//! (`POST /v1/review/reject-unwanted-reviewed`; [`reviewed_with_unwanted`] counts them),
+//! [`bulk_spot`] rejects or accepts the boxes at one spot of one camera on its unreviewed frames
+//! ("this spot everywhere", [`super::repeats`]) and [`bulk_accept_repeats`] saves the frames such
+//! edits settled (`POST /v1/review/reject-spot`, `accept-spot`, `accept-repeats`). Each
 //! frame is re-checked under the label write lock ([`super::update`]); counts are exact, frame
 //! lists capped at [`LISTED`].
 
@@ -512,6 +515,103 @@ pub fn bulk_accept(
     out
 }
 
+/// Apply `verdict` at `spot` ([`super::repeats::Spot`]) on the unreviewed frames of
+/// `spot.camera` in `dir` that `filters` (camera and status forced) and `keep` select: every
+/// pending model / auto box of the object there is rejected or accepted, the frame marked
+/// ([`LabelFile::repeat_spot`]). Frames of another size than the spot's are passed over; at most
+/// `limit` frames in queue order. `dry_run` only counts.
+pub fn bulk_spot(
+    dir: &Path,
+    filters: &Filters,
+    spot: &super::repeats::Spot,
+    verdict: &super::repeats::Verdict,
+    limit: usize,
+    dry_run: bool,
+    keep: &dyn Fn(&str) -> bool,
+) -> BulkOutcome {
+    let mut f = filters.clone();
+    f.status = StatusFilter::Is(Status::Unreviewed);
+    f.camera = Some(spot.camera.clone());
+    let built = queue::build(dir, &f);
+    let mut eligible = Vec::new();
+    for item in built.items.into_iter().filter(|i| keep(&i.frame)) {
+        let Some(frame) = Frame::resolve(dir, &item.frame) else {
+            continue;
+        };
+        let (Ok(rec), Ok(Some(l))) = (frame.record(), frame.labels()) else {
+            continue;
+        };
+        if (rec.width, rec.height) != (spot.width, spot.height) {
+            continue;
+        }
+        let n = spot.count(&l, verdict);
+        if n > 0 {
+            eligible.push((item.frame, n, 0));
+        }
+    }
+    edit_listed(dir, eligible, limit, dry_run, &|l| {
+        (spot.apply(l, verdict), 0)
+    })
+}
+
+/// Save the repeat-only frames ([`super::repeats::repeats_only`]: spot edits settled every box,
+/// none pending) that `filters` (status and `auto` forced) and `keep` select as reviewed with
+/// `bulk_accepted`, at most `limit` in queue order, checked against `classes` at time `now`. A
+/// frame is re-checked under the write lock: one with a pending box is never saved.
+pub fn bulk_accept_repeats(
+    dir: &Path,
+    filters: &Filters,
+    classes: &[String],
+    limit: usize,
+    now: &str,
+    dry_run: bool,
+    keep: &dyn Fn(&str) -> bool,
+) -> BulkOutcome {
+    let mut f = filters.clone();
+    f.status = StatusFilter::Is(Status::Unreviewed);
+    f.auto = Some(AutoFilter::Repeats);
+    let built = queue::build(dir, &f);
+    let eligible: Vec<String> = built
+        .items
+        .into_iter()
+        .map(|i| i.frame)
+        .filter(|r| keep(r))
+        .collect();
+    let mut out = BulkOutcome {
+        eligible: eligible.len(),
+        ..BulkOutcome::default()
+    };
+    if dry_run {
+        out.done = eligible.iter().take(LISTED).cloned().collect();
+        return out;
+    }
+    for rel in eligible.iter().take(limit) {
+        let saved = Frame::resolve(dir, rel)
+            .ok_or_else(|| anyhow::anyhow!("the frame is gone"))
+            .and_then(|frame| {
+                let rec = frame.record()?;
+                super::update(&frame.labels, |cur| {
+                    let Some(mut l) = cur.filter(super::repeats::repeats_only) else {
+                        return Ok(None);
+                    };
+                    l.status = Status::Reviewed;
+                    let mut n = super::normalize(l, classes, rec.width, rec.height, now)?;
+                    n.bulk_accepted = true;
+                    Ok(Some(n))
+                })
+            });
+        match saved {
+            Ok(true) => out.done(rel),
+            Ok(false) => out.failed(
+                rel,
+                "it changed since the list was built and needs a look; review it by hand",
+            ),
+            Err(e) => out.failed(rel, &format!("{e:#}")),
+        }
+    }
+    out
+}
+
 /// Frames on disk for the bulk-edit tests (also [`crate::training::finish`]'s).
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -532,6 +632,8 @@ pub(crate) mod test_support {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo {
                 triage: Some(triage),
                 ..AutoInfo::default()
@@ -547,25 +649,37 @@ pub(crate) mod test_support {
         source: Option<&str>,
         boxes: Vec<LabelBox>,
     ) -> String {
-        let day = dir.join("ir").join("cam").join("2026-10-21");
+        put_frame_at(dir, "cam", stem, (64, 48), source, boxes)
+    }
+
+    /// [`put_frame`] of camera `camera` with a `w` x `h` frame.
+    pub(crate) fn put_frame_at(
+        dir: &Path,
+        camera: &str,
+        stem: &str,
+        (w, h): (u32, u32),
+        source: Option<&str>,
+        boxes: Vec<LabelBox>,
+    ) -> String {
+        let day = dir.join("ir").join(camera).join("2026-10-21");
         std::fs::create_dir_all(&day).unwrap();
-        image::RgbImage::from_pixel(64, 48, image::Rgb([90, 90, 90]))
+        image::RgbImage::from_pixel(w, h, image::Rgb([90, 90, 90]))
             .save(day.join(format!("{stem}.jpg")))
             .unwrap();
         let mut r = crate::collect::record::empty_record();
         r.id = stem.into();
         r.scene = "ir".into();
-        r.camera = "cam".into();
+        r.camera = camera.into();
         r.timestamp = "2026-10-21T01:02:03.004Z".into();
-        r.width = 64;
-        r.height = 48;
+        r.width = w;
+        r.height = h;
         r.source = source.map(str::to_string);
         std::fs::write(
             day.join(format!("{stem}.json")),
             serde_json::to_vec(&r).unwrap(),
         )
         .unwrap();
-        let rel = format!("ir/cam/2026-10-21/{stem}.jpg");
+        let rel = format!("ir/{camera}/2026-10-21/{stem}.jpg");
         crate::collect::layout::append_review(dir, std::slice::from_ref(&rel)).unwrap();
         let f = LabelFile {
             boxes,
@@ -590,8 +704,126 @@ pub(crate) mod test_support {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::{Origin, Triage, auto_accept_eligible};
-    use super::test_support::{auto_box, labels_of, put_frame};
+    use super::test_support::{auto_box, labels_of, put_frame, put_frame_at};
     use super::*;
+
+    #[test]
+    fn a_spot_everywhere_takes_only_that_cameras_unreviewed_frames_of_its_size() {
+        use super::super::repeats::{ACCEPT_SPOT_IOU, REJECT_SPOT_IOU, Spot, Verdict};
+        let dir = std::env::temp_dir().join(format!("bop-spot-{}", uuid::Uuid::new_v4()));
+        let car = || auto_box("car", 0.4, Triage::Review); // at [2, 2, 30, 40]
+        let mut shifted = car();
+        shifted.bbox = [3.0, 2.0, 31.0, 40.0];
+        let mut far = car();
+        far.bbox = [34.0, 2.0, 62.0, 40.0];
+        let a = put_frame(
+            &dir,
+            "a",
+            None,
+            vec![car(), auto_box("dog", 0.4, Triage::Review)],
+        );
+        let b = put_frame(&dir, "b", None, vec![shifted.clone()]);
+        let c = put_frame(&dir, "c", None, vec![far]);
+        let d = put_frame_at(&dir, "drive", "d", (64, 48), None, vec![car()]);
+        let e = put_frame_at(&dir, "cam", "e", (32, 24), None, vec![car()]);
+        let f = put_frame(&dir, "f", None, vec![car()]);
+        let mut reviewed = labels_of(&dir, &f);
+        reviewed.status = Status::Reviewed;
+        super::super::write(&Frame::resolve(&dir, &f).unwrap().labels, &reviewed).unwrap();
+        let spot = Spot {
+            camera: "cam".into(),
+            label: "car".into(),
+            bbox: [2.0, 2.0, 30.0, 40.0],
+            width: 64,
+            height: 48,
+            min_iou: REJECT_SPOT_IOU,
+        };
+        let reject = Verdict::Reject(Some(super::super::RejectReason::StaticObject));
+        let all = Filters::default();
+        let before: Vec<LabelFile> = [&a, &b, &c, &d, &e, &f]
+            .iter()
+            .map(|r| labels_of(&dir, r))
+            .collect();
+        let dry = bulk_spot(&dir, &all, &spot, &reject, 100, true, &|_| true);
+        assert_eq!((dry.eligible, dry.boxes, dry.done_count), (2, 2, 0));
+        let after: Vec<LabelFile> = [&a, &b, &c, &d, &e, &f]
+            .iter()
+            .map(|r| labels_of(&dir, r))
+            .collect();
+        assert_eq!(before, after, "a dry run writes nothing");
+        let o = bulk_spot(&dir, &all, &spot, &reject, 100, false, &|_| true);
+        assert_eq!((o.boxes, o.done_count), (2, 2));
+        let la = labels_of(&dir, &a);
+        assert_eq!(la.boxes[0].state, BoxState::Rejected);
+        assert_eq!(
+            la.boxes[0].reason.as_deref(),
+            Some(super::super::repeats::REPEAT_SPOT_REASON)
+        );
+        assert_eq!(
+            la.boxes[1].state,
+            BoxState::Pending,
+            "the dog is another object"
+        );
+        assert!(la.repeat_spot && labels_of(&dir, &b).repeat_spot);
+        for (r, i) in [(&c, 2), (&d, 3), (&e, 4), (&f, 5)] {
+            assert_eq!(
+                labels_of(&dir, r),
+                before[i],
+                "{r}: another place, camera, size or reviewed"
+            );
+        }
+        // Repeat-only: b (nothing pending) is saved; a (the dog) never is.
+        let acc = bulk_accept_repeats(
+            &dir,
+            &all,
+            &["car".to_string(), "dog".to_string()],
+            100,
+            "now",
+            true,
+            &|_| true,
+        );
+        assert_eq!((acc.eligible, acc.done.clone()), (1, vec![b.clone()]));
+        let acc = bulk_accept_repeats(
+            &dir,
+            &all,
+            &["car".to_string(), "dog".to_string()],
+            100,
+            "now",
+            false,
+            &|_| true,
+        );
+        assert_eq!(acc.done_count, 1);
+        let lb = labels_of(&dir, &b);
+        assert_eq!(lb.status, Status::Reviewed);
+        assert!(lb.bulk_accepted && !lb.repeat_spot);
+        assert_eq!(labels_of(&dir, &a).status, Status::Unreviewed);
+        // An accept needs IoU 0.8: a box at 0.75 stays pending.
+        let mut near = car();
+        near.bbox = [2.0, 2.0, 30.0, 33.5]; // 31.5 / 38 high: IoU ~0.83
+        let mut loose = car();
+        loose.bbox = [2.0, 2.0, 30.0, 30.5]; // IoU 0.75
+        let g = put_frame(&dir, "g", None, vec![near, loose]);
+        let accept_spot = Spot {
+            min_iou: ACCEPT_SPOT_IOU,
+            ..spot
+        };
+        let o = bulk_spot(
+            &dir,
+            &all,
+            &accept_spot,
+            &Verdict::Accept,
+            100,
+            false,
+            &|_| true,
+        );
+        assert_eq!(o.boxes, 1);
+        let lg = labels_of(&dir, &g);
+        assert_eq!(
+            (lg.boxes[0].state, lg.boxes[1].state),
+            (BoxState::Accepted, BoxState::Pending)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reject_low_touches_only_pending_auto_boxes_below_the_score() {

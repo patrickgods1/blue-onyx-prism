@@ -236,6 +236,8 @@ fn proposal_box(p: &Proposal, scene: &str, w: u32, h: u32, accept_score: f32) ->
         )),
         model_label: None,
         orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
         auto: AutoInfo {
             agree: Some(p.agree),
             triage: Some(t),
@@ -596,6 +598,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo::default(),
         };
         let mut f = LabelFile {
@@ -638,6 +642,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo::default(),
         }
     }
@@ -780,6 +786,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo::default(),
         };
         LabelFile {

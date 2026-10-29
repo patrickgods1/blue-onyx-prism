@@ -8,12 +8,14 @@
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
 //! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
-//! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`] and the X-AnyLabeling interop in
-//! [`xany`].
+//! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
+//! [`xany`] and the repeat detections of fixed cameras (spot matching, per-camera history) in
+//! [`repeats`].
 
 pub mod bulk;
 pub mod export;
 pub mod queue;
+pub mod repeats;
 pub mod xany;
 
 use super::layout::{self, Rel};
@@ -115,6 +117,76 @@ pub enum Origin {
     VerifyFound,
 }
 
+/// Why the reviewer rejected a box (the Review page's reason chips): hard-negative mining keys,
+/// kept in `hard_negatives.json`. Separate from [`LabelBox::reason`] (provenance). A value this
+/// build does not know (a newer build's reason) loads as [`RejectReason::Other`] and is written
+/// back verbatim: a label file never fails to load over it, and a re-save does not lose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Nothing there, or not an object of the label.
+    FalsePositive,
+    /// A second box on an object another box already covers.
+    Duplicate,
+    /// An insect or a spider web, usually near the IR lights.
+    InsectWeb,
+    RainSnow,
+    /// IR bloom, glare, headlights.
+    IrGlare,
+    /// A reflection, a poster, a picture of the object.
+    Reflection,
+    /// A fixed part of the scene (railing, plant, bin).
+    StaticObject,
+    /// A real object of a class the list does not have.
+    OtherObject,
+    /// Too small or too far to tell.
+    TooSmall,
+    /// A reason this build does not know (kept as written, checked by [`normalize`]).
+    Other(String),
+}
+
+impl RejectReason {
+    const KNOWN: [(&'static str, RejectReason); 9] = [
+        ("false_positive", RejectReason::FalsePositive),
+        ("duplicate", RejectReason::Duplicate),
+        ("insect_web", RejectReason::InsectWeb),
+        ("rain_snow", RejectReason::RainSnow),
+        ("ir_glare", RejectReason::IrGlare),
+        ("reflection", RejectReason::Reflection),
+        ("static_object", RejectReason::StaticObject),
+        ("other_object", RejectReason::OtherObject),
+        ("too_small", RejectReason::TooSmall),
+    ];
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            RejectReason::Other(s) => s,
+            known => Self::KNOWN
+                .iter()
+                .find(|(_, r)| r == known)
+                .map_or("", |(s, _)| s),
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        Self::KNOWN
+            .iter()
+            .find(|(k, _)| *k == s)
+            .map_or_else(|| RejectReason::Other(s.to_string()), |(_, r)| r.clone())
+    }
+}
+
+impl Serialize for RejectReason {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RejectReason {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(d)?))
+    }
+}
+
 /// A box of a label file. `bbox` is `[x0, y0, x1, y1]` in pixels of the original frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabelBox {
@@ -137,6 +209,15 @@ pub struct LabelBox {
     /// The proposed box before the reviewer moved or resized it (set by the Review page).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orig_bbox: Option<[f32; 4]>,
+    /// The reviewer could not tell what the object is (PASCAL VOC `difficult`, Review page `d`):
+    /// left out of the YOLO export, `ignore` in the benchmark set, an attribute in COCO.
+    /// [`normalize`] clears it on a rejected box.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub difficult: bool,
+    /// Why the reviewer rejected the box (optional; absent = a plain false positive).
+    /// [`normalize`] clears it unless the box is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<RejectReason>,
     /// What the auto-labeler found out about the box (`agree`, `triage`, `vlm`, ...); empty for
     /// other boxes. Flattened: the keys sit on the box itself.
     #[serde(flatten)]
@@ -219,6 +300,8 @@ impl LabelBox {
             reason,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo::default(),
         }
     }
@@ -285,6 +368,11 @@ pub struct LabelFile {
     /// reviewer looking at the frame. [`normalize`] clears it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bulk_accepted: bool,
+    /// A spot edit ("reject / accept this spot everywhere", [`repeats`]) changed boxes of this
+    /// unreviewed frame: with no pending box left it is a repeat-only frame
+    /// ([`repeats::repeats_only`]). [`normalize`] clears it once the frame is reviewed or skipped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat_spot: bool,
 }
 
 fn labels_version() -> u32 {
@@ -303,6 +391,7 @@ impl Default for LabelFile {
             disagreement: None,
             auto_run: None,
             bulk_accepted: false,
+            repeat_spot: false,
         }
     }
 }
@@ -512,6 +601,7 @@ fn label_ok(l: &str) -> bool {
 /// - `reviewed`: pending boxes resolved ([`resolve_pending`]), every training label must be in
 ///   `classes`, and a frame confirmed empty must have none; `reviewed_at` = `now`;
 /// - `skipped`: `reviewed_at` = `now`; `unreviewed`: no `reviewed_at`;
+/// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
 ///   (bounded), `bulk_accepted` cleared;
 /// - `version` and `classes_version` set.
@@ -551,6 +641,15 @@ pub fn normalize(
         }
         if b.reason.as_ref().is_some_and(|r| r.chars().count() > 200) {
             bail!("box {n}: the reason is longer than 200 characters");
+        }
+        if let Some(RejectReason::Other(r)) = &b.reject_reason
+            && (r.is_empty()
+                || r.chars().count() > MAX_LABEL_LEN
+                || r.chars().any(char::is_control))
+        {
+            bail!(
+                "box {n}: the reject reason is empty, longer than {MAX_LABEL_LEN} characters or holds control characters"
+            );
         }
         check_auto(&b.auto).with_context(|| format!("box {n}"))?;
         b.bbox = clamp_box(b.bbox, w, h);
@@ -632,8 +731,17 @@ pub fn normalize(
         Status::Skipped => f.reviewed_at = Some(now.to_string()),
         Status::Unreviewed => f.reviewed_at = None,
     }
+    // A reject reason belongs to a rejected box only; a rejected box is not "unsure".
+    for b in &mut f.boxes {
+        if b.state == BoxState::Rejected {
+            b.difficult = false;
+        } else {
+            b.reject_reason = None;
+        }
+    }
     if f.status != Status::Unreviewed {
         f.disagreement = None;
+        f.repeat_spot = false;
     }
     if f.disagreement
         .as_ref()
@@ -894,7 +1002,10 @@ fn write_lock() -> std::sync::MutexGuard<'static, ()> {
 fn write_locked(path: &Path, f: &LabelFile) -> Result<()> {
     let mut text = serde_json::to_vec_pretty(f)?;
     text.push(b'\n');
-    layout::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()))
+    let r =
+        layout::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()));
+    repeats::written(path);
+    r
 }
 
 /// Write `f` to `path` atomically (temporary file + rename).
@@ -981,6 +1092,8 @@ pub(crate) mod tests_support {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo::default(),
         }
     }
@@ -1147,6 +1260,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         });
         let n = normalize(f.clone(), &classes(), 640, 480, now).unwrap();
@@ -1197,12 +1312,84 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         });
         let n = normalize(f, &classes(), 640, 480, "now").unwrap();
         assert_eq!(n.boxes.len(), 4);
         assert!(n.boxes.iter().all(|b| b.state == BoxState::Pending));
         assert_eq!(n.reviewed_at, None);
+    }
+
+    #[test]
+    fn unsure_and_reject_reason_round_trip_and_normalize_keeps_them_where_they_belong() {
+        let mut f = prefill(&record(), &classes(), &[]);
+        f.status = Status::Reviewed;
+        // Accepted + unsure; rejected + reason; accepted with a stray reason; rejected + unsure.
+        f.boxes[0].state = BoxState::Accepted;
+        f.boxes[0].difficult = true;
+        f.boxes[1].state = BoxState::Rejected;
+        f.boxes[1].reject_reason = Some(RejectReason::IrGlare);
+        f.boxes[2].state = BoxState::Accepted;
+        f.boxes[2].reject_reason = Some(RejectReason::Duplicate);
+        f.boxes[3].state = BoxState::Rejected;
+        f.boxes[3].difficult = true;
+        let n = normalize(f, &classes(), 640, 480, "now").unwrap();
+        let got: Vec<(bool, Option<RejectReason>)> = n
+            .boxes
+            .iter()
+            .map(|b| (b.difficult, b.reject_reason.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (true, None),
+                (false, Some(RejectReason::IrGlare)),
+                (false, None),
+                (false, None),
+            ]
+        );
+        let text = serde_json::to_string(&n).unwrap();
+        assert!(
+            text.contains(r#""difficult":true"#) && text.contains(r#""reject_reason":"ir_glare""#)
+        );
+        assert_eq!(text.matches("difficult").count(), 1, "false is not written");
+        let back: LabelFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, n);
+        // A file written before the fields existed loads with them off.
+        let old: LabelBox = serde_json::from_str(
+            r#"{"label": "dog", "bbox": [1, 2, 30, 40], "source": "model", "state": "rejected"}"#,
+        )
+        .unwrap();
+        assert!(!old.difficult && old.reject_reason.is_none());
+        // An unknown reason (a newer build's) loads and is written back as it was.
+        let newer: LabelBox = serde_json::from_str(
+            r#"{"label": "dog", "bbox": [1, 2, 30, 40], "source": "model", "state": "rejected",
+               "reject_reason": "aliens"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            newer.reject_reason,
+            Some(RejectReason::Other("aliens".into()))
+        );
+        assert!(
+            serde_json::to_string(&newer)
+                .unwrap()
+                .contains(r#""reject_reason":"aliens""#)
+        );
+        assert_eq!(RejectReason::parse("ir_glare"), RejectReason::IrGlare);
+        // normalize keeps a short one and refuses a control character.
+        let mut f = prefill(&record(), &classes(), &[]);
+        f.boxes[0].state = BoxState::Rejected;
+        f.boxes[0].reject_reason = Some(RejectReason::Other("aliens".into()));
+        let n = normalize(f.clone(), &classes(), 640, 480, "now").unwrap();
+        assert_eq!(
+            n.boxes[0].reject_reason,
+            Some(RejectReason::Other("aliens".into()))
+        );
+        f.boxes[0].reject_reason = Some(RejectReason::Other("a\u{7}".into()));
+        assert!(normalize(f, &classes(), 640, 480, "now").is_err());
     }
 
     #[test]
@@ -1256,6 +1443,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         }
     }
@@ -1429,6 +1618,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo {
                 triage,
                 auto_label: suggest.map(str::to_string),

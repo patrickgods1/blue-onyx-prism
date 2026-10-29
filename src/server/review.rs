@@ -634,6 +634,306 @@ pub(super) async fn reject_low(
     .await
 }
 
+/// `GET /v1/review/history?camera=<c>`: the reviewer's decisions on that camera's frames in the
+/// folder under review (accepted / rejected model and auto boxes, not by a bulk rule; newest
+/// first, at most [`labels::repeats::HISTORY_CAP`], `truncated` past it), for the Review page's
+/// "rejected here before" hint. Cached until a label file of the folder is written.
+pub(super) async fn history(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
+) -> Response {
+    let q = query_map(query);
+    let Some(camera) = q
+        .get("camera")
+        .map(|c| c.trim().to_string())
+        .filter(|c| layout::camera_ok(c))
+    else {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "give `camera` (a camera name of the dataset, as in the frame paths)",
+        );
+    };
+    blocking(move || {
+        let (dir, _, _) = context(&state);
+        let h = labels::repeats::history(&dir, &camera);
+        Json(serde_json::json!({
+            "success": true,
+            "camera": h.camera,
+            "decisions": h.decisions,
+            "truncated": h.truncated,
+        }))
+        .into_response()
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpotBody {
+    camera: String,
+    label: String,
+    bbox: [f32; 4],
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    min_iou: Option<f32>,
+    /// reject-spot only: the reviewer's reason (`reject_reason`).
+    #[serde(default)]
+    reject_reason: Option<labels::RejectReason>,
+    /// The queue the page shows (`queue|all`; default queue).
+    #[serde(default)]
+    source: Option<String>,
+    /// A frame left alone (the one the page shows: it applies the rule there itself, so its
+    /// open edits do not run into a save conflict).
+    #[serde(default)]
+    skip_frame: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `POST /v1/review/reject-spot` with `{camera, label, bbox, width, height, min_iou?,
+/// reject_reason?, source?, skip_frame?, dry_run, limit?}`: on the unreviewed frames of that camera (of the
+/// same size), every pending model / auto box of the same object class (vehicle classes count as
+/// one) at IoU >= `min_iou` (default 0.6, 0.3..=1) with `bbox` is rejected (`reject_reason` as
+/// given; `reason: repeat_spot` when it had no provenance) and the frame marked repeat-spot
+/// ([`bulk::bulk_spot`]), at most `limit` frames (default 500). `dry_run` only counts.
+pub(super) async fn reject_spot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    spot_route(state, headers, body, false).await
+}
+
+/// `POST /v1/review/accept-spot`: [`reject_spot`]'s mirror for a real object that stays put (a
+/// parked car): the pending boxes of the same label at IoU >= `min_iou` (default and minimum
+/// 0.8) are accepted. `reject_reason` is refused.
+pub(super) async fn accept_spot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    spot_route(state, headers, body, true).await
+}
+
+async fn spot_route(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+    accept: bool,
+) -> Response {
+    use labels::repeats::{ACCEPT_SPOT_IOU, REJECT_SPOT_IOU, Spot, Verdict};
+    let b: SpotBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let camera = b.camera.trim().to_string();
+    if !layout::camera_ok(&camera) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "camera: not a camera name of the dataset",
+        );
+    }
+    if crate::collect::config::validate_classes(std::slice::from_ref(&b.label)).is_err() {
+        return fail(StatusCode::BAD_REQUEST, "label: not a valid class name");
+    }
+    let [x0, y0, x1, y1] = b.bbox;
+    if !b.bbox.iter().all(|v| v.is_finite())
+        || x1 <= x0
+        || y1 <= y0
+        || b.width == 0
+        || b.height == 0
+    {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "bbox: give [x0, y0, x1, y1] in pixels of the width x height frame, x1 > x0, y1 > y0",
+        );
+    }
+    let (lo, default) = if accept {
+        (ACCEPT_SPOT_IOU, ACCEPT_SPOT_IOU)
+    } else {
+        (0.3, REJECT_SPOT_IOU)
+    };
+    let min_iou = b.min_iou.unwrap_or(default);
+    if !(lo..=1.0).contains(&min_iou) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("min_iou: must be between {lo} and 1, got {min_iou}"),
+        );
+    }
+    if accept && b.reject_reason.is_some() {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "reject_reason: only for reject-spot",
+        );
+    }
+    if let Some(labels::RejectReason::Other(r)) = &b.reject_reason {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "reject_reason: '{}' is not a reason this build knows",
+                r.escape_debug()
+            ),
+        );
+    }
+    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
+    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        );
+    }
+    let mut q = BTreeMap::new();
+    if let Some(s) = b.source {
+        q.insert("source".to_string(), s);
+    }
+    let filters = match Filters::from_query(&q) {
+        Ok(f) => f,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let spot = Spot {
+        camera,
+        label: b.label,
+        bbox: b.bbox,
+        width: b.width,
+        height: b.height,
+        min_iou,
+    };
+    let verdict = if accept {
+        Verdict::Accept
+    } else {
+        Verdict::Reject(b.reject_reason)
+    };
+    let (dry_run, skip) = (b.dry_run, b.skip_frame.unwrap_or_default());
+    blocking(move || {
+        let (dir, _, _) = context(&state);
+        let o = bulk::bulk_spot(&dir, &filters, &spot, &verdict, limit, dry_run, &|r| {
+            r != skip
+        });
+        let verb = if accept { "Accepted" } else { "Rejected" };
+        let mut message = format!(
+            "{verb} {} {} box(es) at that spot on {} unreviewed {} frame(s) (the frames stay \
+             unreviewed; frames left with nothing to decide can be saved with \"Save \
+             repeat-only frames\").",
+            o.boxes, spot.label, o.done_count, spot.camera
+        );
+        if o.failed_count > 0 {
+            message.push_str(&format!(
+                " {} frame(s) not changed (listed); review them by hand.",
+                o.failed_count
+            ));
+        }
+        if o.eligible > limit && !dry_run {
+            message.push_str(&format!(
+                " {} more frame(s) beyond the limit of {limit}; run it again.",
+                o.eligible - limit
+            ));
+        }
+        if !dry_run {
+            tracing::info!(
+                boxes = o.boxes,
+                frames = o.done_count,
+                camera = %spot.camera,
+                label = %spot.label,
+                accept,
+                "review: spot edited on every unreviewed frame"
+            );
+        }
+        Json(serde_json::json!({
+            "success": true,
+            "eligible": o.eligible,
+            "boxes": o.boxes,
+            "changed": o.done_count,
+            "failed": o.failed,
+            "frames": o.done,
+            "message": (!dry_run).then_some(message),
+        }))
+        .into_response()
+    })
+    .await
+}
+
+/// `POST /v1/review/accept-repeats` with `{bucket?, scene?, camera?, label?, source?, dry_run,
+/// limit?}`: the repeat-only frames of those filters (spot edits settled every box, none
+/// pending; [`labels::repeats::repeats_only`]) saved as reviewed with `bulk_accepted`
+/// ([`bulk::bulk_accept_repeats`]), at most `limit` (default 500). `dry_run` only counts.
+pub(super) async fn accept_repeats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: AcceptAutoBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
+    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        );
+    }
+    let q: BTreeMap<String, String> = [
+        ("bucket", b.bucket),
+        ("scene", b.scene),
+        ("camera", b.camera),
+        ("label", b.label),
+        ("source", b.source),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+    .collect();
+    let filters = match Filters::from_query(&q) {
+        Ok(f) => f,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let dry_run = b.dry_run;
+    blocking(move || {
+        let (dir, classes, _) = context(&state);
+        let o =
+            bulk::bulk_accept_repeats(&dir, &filters, &classes, limit, &now(), dry_run, &|_| true);
+        if dry_run {
+            return Json(serde_json::json!({
+                "success": true,
+                "eligible": o.eligible,
+                "accepted": 0,
+                "frames": o.done,
+            }))
+            .into_response();
+        }
+        let mut message = format!("Saved {} repeat-only frame(s) as reviewed.", o.done_count);
+        if o.failed_count > 0 {
+            message.push_str(&format!(
+                " {} not saved (listed); review them by hand.",
+                o.failed_count
+            ));
+        }
+        if o.eligible > limit {
+            message.push_str(&format!(
+                " {} more beyond the limit of {limit}; run it again.",
+                o.eligible - limit
+            ));
+        }
+        tracing::info!(
+            saved = o.done_count,
+            failed = o.failed_count,
+            "review: repeat-only frames saved"
+        );
+        Json(serde_json::json!({
+            "success": true,
+            "eligible": o.eligible,
+            "accepted": o.done_count,
+            "failed": o.failed,
+            "frames": o.done,
+            "message": message,
+        }))
+        .into_response()
+    })
+    .await
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RejectOtherClassBody {
@@ -2179,6 +2479,147 @@ mod tests {
         let (s, _) = json(&d.state, post_json("/v1/review/accept-auto", &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
     }
+    #[tokio::test]
+    async fn repeats_history_spot_edits_and_repeat_only_frames() {
+        use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
+        use labels::{BoxState, Triage};
+        let d = ds();
+        let car = || auto_box("car", 0.4, Triage::Review); // [2, 2, 30, 40] of 64 x 48
+        // A frame the reviewer looked at: the car there was rejected as a reflection.
+        let seen = put_frame(&d.dir, "20261021T000000000Z_seen", None, vec![car()]);
+        let frame = Frame::resolve(&d.dir, &seen).unwrap();
+        let mut f = labels_of(&d.dir, &seen);
+        f.status = labels::Status::Reviewed;
+        f.boxes[0].state = BoxState::Rejected;
+        f.boxes[0].reject_reason = Some(labels::RejectReason::Reflection);
+        labels::write(&frame.labels, &f).unwrap();
+        let a = put_frame(&d.dir, "20261021T010000000Z_a", None, vec![car()]);
+        let b = put_frame(
+            &d.dir,
+            "20261021T020000000Z_b",
+            None,
+            vec![car(), auto_box("dog", 0.4, Triage::Review)],
+        );
+
+        // History: the camera's decisions; a bad camera name is refused.
+        let (s, v) = json(&d.state, get("/v1/review/history?camera=cam")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["decisions"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["decisions"][0]["reject_reason"], "reflection");
+        assert_eq!(v["decisions"][0]["frame"], seen.as_str());
+        let (_, v) = json(&d.state, get("/v1/review/history?camera=other")).await;
+        assert_eq!(v["decisions"], serde_json::json!([]));
+        let (s, _) = json(&d.state, get("/v1/review/history?camera=..%2Fx")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // Reject the spot everywhere: dry run first, then for real.
+        let body = |extra: &str| {
+            format!(
+                r#"{{"camera": "cam", "label": "car", "bbox": [2, 2, 30, 40], "width": 64,
+                    "height": 48{extra}}}"#
+            )
+        };
+        let skip = format!(r#", "dry_run": true, "skip_frame": "{b}""#);
+        let (_, v) = json(&d.state, post_json("/v1/review/reject-spot", &body(&skip))).await;
+        assert_eq!(
+            v["eligible"].as_u64(),
+            Some(1),
+            "the frame on screen is left out: {v}"
+        );
+        let (s, v) = json(
+            &d.state,
+            post_json("/v1/review/reject-spot", &body(r#", "dry_run": true"#)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (
+                v["eligible"].as_u64(),
+                v["boxes"].as_u64(),
+                v["changed"].as_u64()
+            ),
+            (Some(2), Some(2), Some(0))
+        );
+        assert_eq!(labels_of(&d.dir, &a).boxes[0].state, BoxState::Pending);
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/reject-spot",
+                &body(r#", "reject_reason": "static_object""#),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["changed"].as_u64(), Some(2), "{v}");
+        let la = labels_of(&d.dir, &a);
+        assert_eq!(la.boxes[0].state, BoxState::Rejected);
+        assert_eq!(
+            la.boxes[0].reject_reason,
+            Some(labels::RejectReason::StaticObject)
+        );
+        // The bulk rule's rejections do not count as a look; the cache was dropped by the writes.
+        let (_, v) = json(&d.state, get("/v1/review/history?camera=cam")).await;
+        assert_eq!(v["decisions"].as_array().unwrap().len(), 1, "{v}");
+
+        // Repeat-only: a (nothing pending) sorts last in the queue and is saved; b (the dog) not.
+        let (_, v) = json(&d.state, get("/v1/review/next?auto=repeats")).await;
+        assert_eq!(v["item"]["frame"], a.as_str(), "{v}");
+        assert_eq!(v["counts"]["repeats_only"].as_u64(), Some(1), "{v}");
+        let (_, v) = json(&d.state, get("/v1/review/next")).await;
+        assert_eq!(
+            v["item"]["frame"],
+            b.as_str(),
+            "repeat-only frames come last: {v}"
+        );
+        let (s, v) = json(
+            &d.state,
+            post_json("/v1/review/accept-repeats", r#"{"dry_run": true}"#),
+        )
+        .await;
+        assert_eq!(
+            (s, v["eligible"].as_u64()),
+            (StatusCode::OK, Some(1)),
+            "{v}"
+        );
+        let (s, v) = json(&d.state, post_json("/v1/review/accept-repeats", "{}")).await;
+        assert_eq!(
+            (s, v["accepted"].as_u64()),
+            (StatusCode::OK, Some(1)),
+            "{v}"
+        );
+        assert_eq!(labels_of(&d.dir, &a).status, labels::Status::Reviewed);
+        assert_eq!(labels_of(&d.dir, &b).status, labels::Status::Unreviewed);
+
+        // Accept-spot needs 0.8 and no reason; bad input is refused.
+        for (uri, extra) in [
+            ("/v1/review/accept-spot", r#", "min_iou": 0.7"#),
+            (
+                "/v1/review/accept-spot",
+                r#", "reject_reason": "rain_snow""#,
+            ),
+            ("/v1/review/reject-spot", r#", "reject_reason": "aliens""#),
+            ("/v1/review/reject-spot", r#", "min_iou": 0.1"#),
+        ] {
+            let (s, v) = json(&d.state, post_json(uri, &body(extra))).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{uri} {extra}: {v}");
+        }
+        let (s, _) = json(
+            &d.state,
+            post_json(
+                "/v1/review/reject-spot",
+                r#"{"camera": "cam", "label": "car", "bbox": [5, 5, 1, 1], "width": 64, "height": 48}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = json(
+            &d.state,
+            post_json("/v1/review/reject-spot", &body(r#", "nope": 1"#)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "unknown fields are refused");
+    }
+
     #[tokio::test]
     async fn reject_low_rejects_only_pending_auto_boxes_below_the_score() {
         use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};

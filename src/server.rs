@@ -232,6 +232,19 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             post(review::classes).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
         ("/v1/review/class-catalog", get(review::class_catalog)),
+        ("/v1/review/history", get(review::history)),
+        (
+            "/v1/review/reject-spot",
+            post(review::reject_spot).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
+            "/v1/review/accept-spot",
+            post(review::accept_spot).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
+            "/v1/review/accept-repeats",
+            post(review::accept_repeats).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
         (
             "/v1/review/folder",
             post(review::folder).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
@@ -1050,6 +1063,10 @@ mod tests {
             "/v1/review/import",
             "/v1/review/classes",
             "/v1/review/class-catalog",
+            "/v1/review/history",
+            "/v1/review/reject-spot",
+            "/v1/review/accept-spot",
+            "/v1/review/accept-repeats",
             "/v1/review/folder",
             "/training",
             "/v1/training",

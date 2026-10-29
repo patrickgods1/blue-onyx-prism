@@ -211,11 +211,12 @@ fn round_to(x: f64, d: i32) -> f64 {
 
 /// A frame's YOLO label file: one `class cx cy w h` line per training box, normalised to the
 /// frame and clamped to 0..1, 6 decimals; an empty file for a frame without objects. Boxes of a
-/// label not in `classes` are an error (the frame must not be exported half-labelled).
+/// label not in `classes` are an error (the frame must not be exported half-labelled). Unsure
+/// (`difficult`) boxes are left out; the frame and its other boxes stay.
 pub fn yolo_txt(f: &ExportFrame, classes: &[String]) -> Result<String> {
     let (w, h) = (f64::from(f.width.max(1)), f64::from(f.height.max(1)));
     let mut out = String::new();
-    for b in f.boxes() {
+    for b in f.boxes().into_iter().filter(|b| !b.difficult) {
         let Some(id) = classes.iter().position(|c| *c == b.label) else {
             bail!(
                 "{}: label '{}' is not in the class list",
@@ -234,7 +235,8 @@ pub fn yolo_txt(f: &ExportFrame, classes: &[String]) -> Result<String> {
 
 /// COCO instances JSON of `frames` (file names as given): category ids 1..=K in `classes`
 /// order, image and annotation ids 1.. in order, `bbox` `[x, y, w, h]` in pixels (2 decimals),
-/// `area` = w * h, `iscrowd` 0. A frame without objects is an image without annotations.
+/// `area` = w * h, `iscrowd` 0, `attributes.difficult` on unsure boxes. A frame without objects
+/// is an image without annotations.
 pub fn coco_json(frames: &[&ExportFrame], classes: &[String]) -> Result<serde_json::Value> {
     use serde_json::json;
     let mut images = Vec::new();
@@ -257,14 +259,20 @@ pub fn coco_json(frames: &[&ExportFrame], classes: &[String]) -> Result<serde_js
             };
             let c = clamp_box(b.bbox, f.width, f.height).map(f64::from);
             let (w, h) = (round_to(c[2] - c[0], 2), round_to(c[3] - c[1], 2));
-            anns.push(json!({
+            let mut ann = json!({
                 "id": anns.len() + 1,
                 "image_id": image_id,
                 "category_id": cat + 1,
                 "bbox": [round_to(c[0], 2), round_to(c[1], 2), w, h],
                 "area": round_to(w * h, 2),
                 "iscrowd": 0,
-            }));
+            });
+            if b.difficult
+                && let Some(o) = ann.as_object_mut()
+            {
+                o.insert("attributes".into(), json!({"difficult": true}));
+            }
+            anns.push(ann);
         }
     }
     let categories: Vec<serde_json::Value> = classes
@@ -297,7 +305,7 @@ fn tags(f: &ExportFrame) -> Vec<String> {
 }
 
 /// The benchmark manifest of `frames`: their training boxes as ground truth, scored on
-/// `classes` only (predictions of other labels count neither way).
+/// `classes` only (predictions of other labels count neither way); unsure boxes are `ignore`.
 pub fn benchmark_manifest(frames: &[&ExportFrame], classes: &[String], id: &str) -> Manifest {
     Manifest {
         id: id.to_string(),
@@ -321,7 +329,7 @@ pub fn benchmark_manifest(frames: &[&ExportFrame], classes: &[String], id: &str)
                         .map(|b| ManifestObject {
                             label: b.label.clone(),
                             bbox: clamp_box(b.bbox, f.width, f.height),
-                            ignore: false,
+                            ignore: b.difficult,
                             crowd: false,
                         })
                         .collect(),
@@ -805,6 +813,7 @@ pub fn run_filtered(
                     "source": b.source,
                     "origin": b.origin,
                     "reason": b.reason,
+                    "reject_reason": b.reject_reason,
                 })
             })
         })
@@ -904,6 +913,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         }
     }
@@ -1266,6 +1277,92 @@ mod tests {
             .is_err()
         );
         assert!(!root.join("four").exists() && !root.join("five").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unsure_boxes_left_out_of_yolo_marked_in_coco_and_ignored_in_the_benchmark() {
+        let unsure = LabelBox {
+            difficult: true,
+            ..lb("raccoon", [100.0, 10.0, 140.0, 40.0], BoxState::Accepted)
+        };
+        let f = frame(
+            vec![
+                lb("dog", [20.0, 10.0, 60.0, 50.0], BoxState::Accepted),
+                unsure,
+            ],
+            false,
+        );
+        assert_eq!(
+            yolo_txt(&f, &classes()).unwrap(),
+            "1 0.200000 0.300000 0.200000 0.400000\n",
+            "the unsure box is left out, the frame's other box stays"
+        );
+        let only = frame(f.labels.boxes[1..].to_vec(), false);
+        assert_eq!(
+            yolo_txt(&only, &classes()).unwrap(),
+            "",
+            "a frame of unsure boxes stays"
+        );
+        let v = coco_json(&[&f], &classes()).unwrap();
+        let anns = v["annotations"].as_array().unwrap();
+        assert_eq!(anns.len(), 2);
+        assert!(anns[0].get("attributes").is_none());
+        assert_eq!(
+            anns[1]["attributes"],
+            serde_json::json!({"difficult": true})
+        );
+        let m = benchmark_manifest(&[&f], &classes(), "t");
+        let objs = m.images[0].objects.as_ref().unwrap();
+        assert_eq!(
+            objs.iter().map(|o| o.ignore).collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn hard_negatives_carry_the_reject_reason() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "a",
+            vec![
+                lb("person", [30.0, 4.0, 60.0, 40.0], BoxState::Accepted),
+                LabelBox {
+                    reject_reason: Some(super::super::RejectReason::InsectWeb),
+                    ..lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Rejected)
+                },
+                lb("dog", [70.0, 1.0, 90.0, 20.0], BoxState::Rejected),
+            ],
+            false,
+        );
+        let req = ExportRequest {
+            formats: vec![Format::Yolo],
+            out_dir: root.join("out"),
+            split: SplitConfig::default(),
+            benchmark_split: BenchSplit::All,
+            include_unreviewed: false,
+            hidden_classes: Vec::new(),
+        };
+        let r = run(&dir, &classes(), &req).unwrap();
+        assert_eq!(r.hard_negative_boxes, 2);
+        let neg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("out/hard_negatives.json")).unwrap(),
+        )
+        .unwrap();
+        let reasons: Vec<&serde_json::Value> = neg
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| &n["reject_reason"])
+            .collect();
+        assert_eq!(
+            reasons,
+            [&serde_json::json!("insect_web"), &serde_json::Value::Null]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
