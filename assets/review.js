@@ -1048,12 +1048,16 @@
     if (ri >= 0) {
       var rb = boxes()[ri];
       var rr = el('div', 'rv-q-reason');
-      rr.appendChild(el('span', 'muted', (ri === selected ? 'Why rejected?' : 'Box ' + (ri + 1) + ' rejected. Why?') + ' (optional)'));
+      // One wrapping row of short chips (the full text is the tooltip): the box list keeps its room.
+      var cap = el('span', 'muted', (ri === selected ? 'Why?' : (ri + 1) + ' why?'));
+      cap.title = 'Optional: why box ' + (ri + 1) + ' is wrong (Shift+1-9)';
+      rr.appendChild(cap);
       REASONS.forEach(function (r, n) {
         var cb = button('', function () { setReason(n); canvas.focus({ preventScroll: true }); },
           'secondary' + (rb.reject_reason === r[0] ? ' active' : ''));
-        cb.appendChild(kbd('⇧' + (n + 1)));
-        cb.appendChild(document.createTextNode(' ' + r[1]));
+        cb.title = r[1] + ' (Shift+' + (n + 1) + ')';
+        cb.appendChild(kbd(String(n + 1)));
+        cb.appendChild(document.createTextNode(r[2]));
         rr.appendChild(cb);
       });
       decide.appendChild(rr);
@@ -1162,17 +1166,18 @@
     if (!why && b && b.state === 'rejected' && b.source !== 'human') offerReason(i);
   }
 
-  // Why a box was wrong (`reject_reason`, Shift+1-9), for hard-negative mining.
+  // Why a box was wrong (`reject_reason`, Shift+1-9), for hard-negative mining: the value, the
+  // text, the chip's short text.
   var REASONS = [
-    ['false_positive', 'nothing there'],
-    ['insect_web', 'insect / web'],
-    ['rain_snow', 'rain / snow'],
-    ['ir_glare', 'IR glare / lights'],
-    ['reflection', 'reflection / picture'],
-    ['static_object', 'part of the scene'],
-    ['other_object', 'other kind of object'],
-    ['too_small', 'too small to tell'],
-    ['duplicate', 'duplicate']
+    ['false_positive', 'nothing there', 'nothing'],
+    ['insect_web', 'insect / web', 'insect'],
+    ['rain_snow', 'rain / snow', 'rain'],
+    ['ir_glare', 'IR glare / lights', 'glare'],
+    ['reflection', 'reflection / picture', 'reflection'],
+    ['static_object', 'part of the scene', 'scene'],
+    ['other_object', 'other kind of object', 'other'],
+    ['too_small', 'too small to tell', 'tiny'],
+    ['duplicate', 'duplicate', 'dup']
   ];
   var REASON_MS = 4000;
   var reasonAsk = null;   // {frame, i, timer}: the chips offered after a rejection

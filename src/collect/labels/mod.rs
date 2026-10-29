@@ -116,9 +116,10 @@ pub enum Origin {
 }
 
 /// Why the reviewer rejected a box (the Review page's reason chips): hard-negative mining keys,
-/// kept in `hard_negatives.json`. Separate from [`LabelBox::reason`] (provenance).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// kept in `hard_negatives.json`. Separate from [`LabelBox::reason`] (provenance). A value this
+/// build does not know (a newer build's reason) loads as [`RejectReason::Other`] and is written
+/// back verbatim: a label file never fails to load over it, and a re-save does not lose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectReason {
     /// Nothing there, or not an object of the label.
     FalsePositive,
@@ -137,6 +138,51 @@ pub enum RejectReason {
     OtherObject,
     /// Too small or too far to tell.
     TooSmall,
+    /// A reason this build does not know (kept as written, checked by [`normalize`]).
+    Other(String),
+}
+
+impl RejectReason {
+    const KNOWN: [(&'static str, RejectReason); 9] = [
+        ("false_positive", RejectReason::FalsePositive),
+        ("duplicate", RejectReason::Duplicate),
+        ("insect_web", RejectReason::InsectWeb),
+        ("rain_snow", RejectReason::RainSnow),
+        ("ir_glare", RejectReason::IrGlare),
+        ("reflection", RejectReason::Reflection),
+        ("static_object", RejectReason::StaticObject),
+        ("other_object", RejectReason::OtherObject),
+        ("too_small", RejectReason::TooSmall),
+    ];
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            RejectReason::Other(s) => s,
+            known => Self::KNOWN
+                .iter()
+                .find(|(_, r)| r == known)
+                .map_or("", |(s, _)| s),
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        Self::KNOWN
+            .iter()
+            .find(|(k, _)| *k == s)
+            .map_or_else(|| RejectReason::Other(s.to_string()), |(_, r)| r.clone())
+    }
+}
+
+impl Serialize for RejectReason {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RejectReason {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(d)?))
+    }
 }
 
 /// A box of a label file. `bbox` is `[x0, y0, x1, y1]` in pixels of the original frame.
@@ -587,6 +633,15 @@ pub fn normalize(
         }
         if b.reason.as_ref().is_some_and(|r| r.chars().count() > 200) {
             bail!("box {n}: the reason is longer than 200 characters");
+        }
+        if let Some(RejectReason::Other(r)) = &b.reject_reason
+            && (r.is_empty()
+                || r.chars().count() > MAX_LABEL_LEN
+                || r.chars().any(char::is_control))
+        {
+            bail!(
+                "box {n}: the reject reason is empty, longer than {MAX_LABEL_LEN} characters or holds control characters"
+            );
         }
         check_auto(&b.auto).with_context(|| format!("box {n}"))?;
         b.bbox = clamp_box(b.bbox, w, h);
@@ -1272,7 +1327,7 @@ mod tests {
         let got: Vec<(bool, Option<RejectReason>)> = n
             .boxes
             .iter()
-            .map(|b| (b.difficult, b.reject_reason))
+            .map(|b| (b.difficult, b.reject_reason.clone()))
             .collect();
         assert_eq!(
             got,
@@ -1296,14 +1351,33 @@ mod tests {
         )
         .unwrap();
         assert!(!old.difficult && old.reject_reason.is_none());
-        // An unknown reason is refused.
-        assert!(
-            serde_json::from_str::<LabelBox>(
-                r#"{"label": "dog", "bbox": [1, 2, 30, 40], "source": "model", "state": "rejected",
-                   "reject_reason": "aliens"}"#,
-            )
-            .is_err()
+        // An unknown reason (a newer build's) loads and is written back as it was.
+        let newer: LabelBox = serde_json::from_str(
+            r#"{"label": "dog", "bbox": [1, 2, 30, 40], "source": "model", "state": "rejected",
+               "reject_reason": "aliens"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            newer.reject_reason,
+            Some(RejectReason::Other("aliens".into()))
         );
+        assert!(
+            serde_json::to_string(&newer)
+                .unwrap()
+                .contains(r#""reject_reason":"aliens""#)
+        );
+        assert_eq!(RejectReason::parse("ir_glare"), RejectReason::IrGlare);
+        // normalize keeps a short one and refuses a control character.
+        let mut f = prefill(&record(), &classes(), &[]);
+        f.boxes[0].state = BoxState::Rejected;
+        f.boxes[0].reject_reason = Some(RejectReason::Other("aliens".into()));
+        let n = normalize(f.clone(), &classes(), 640, 480, "now").unwrap();
+        assert_eq!(
+            n.boxes[0].reject_reason,
+            Some(RejectReason::Other("aliens".into()))
+        );
+        f.boxes[0].reject_reason = Some(RejectReason::Other("a\u{7}".into()));
+        assert!(normalize(f, &classes(), 640, 480, "now").is_err());
     }
 
     #[test]

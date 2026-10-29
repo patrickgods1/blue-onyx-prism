@@ -746,11 +746,11 @@ button.ok:hover, button.bad:hover { filter: brightness(0.95); box-shadow: 0 0 0 
 .rv-q-btns button.small { margin: 0; padding: 0.3rem 0.55rem; font-size: 0.9rem; font-weight: 600; }
 .rv-q-classes, .rv-q-reason { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.4rem; }
 .rv-q-classes button.small, .rv-q-reason button.small { margin: 0; padding: 0.15rem 0.5rem; }
-.rv-q-reason { align-items: center; gap: 0.2rem; font-size: 0.85rem; }
-.rv-q-reason button.small { padding: 0 0.3rem; font-size: 0.75rem; line-height: 1.5; }
-.rv-q-reason > span { flex-basis: 100%; }
+.rv-q-reason { align-items: center; gap: 0.15rem; font-size: 0.8rem; margin-top: 0.3rem; }
+.rv-q-reason button.small { padding: 0 0.25rem; font-size: 0.72rem; line-height: 1.35; }
+.rv-q-reason > span { margin-right: 0.15rem; }
 .rv-decide kbd, .rv-q-classes kbd, .rv-q-reason kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.75rem; font-weight: normal; padding: 0 0.3rem; border: 1px solid currentColor; border-radius: 3px; opacity: 0.75; }
-.rv-decide .rv-q-reason kbd { font-size: 0.65rem; padding: 0 0.2rem; }
+.rv-decide .rv-q-reason kbd { font-size: 0.6rem; padding: 0 0.15rem; margin-right: 0.15rem; border: 0; opacity: 0.6; }
 .rv-progress { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.45rem; font-size: 0.8rem; }
 .rv-progress progress { width: 100%; max-width: none; height: 0.45rem; accent-color: #2e9e4f; }
 .rv-q-dup { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; font-size: 0.85rem; }
