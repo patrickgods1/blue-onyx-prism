@@ -587,7 +587,7 @@
 
   function tagText(b, i) {
     var l = look(b);
-    return (l === 'review' ? '? ' : '') + (i + 1) + ' ' + b.label +
+    return (l === 'review' ? '? ' : '') + (b.difficult ? '?! ' : '') + (i + 1) + ' ' + b.label +
       (b.score != null ? ' ' + fmtScore(b.score) : '') +
       (b.source === 'auto' && b.triage === 'accept' && b.state !== 'rejected' ? ' ✓' : '');
   }
@@ -641,7 +641,8 @@
         ctx.lineWidth = lw * 3.5;
         ctx.strokeRect(x, y, w, h);
       }
-      ctx.setLineDash(dashed ? [lw * 4, lw * 3] : []);
+      // Dashed: rejected or rejected on save; dotted: an unsure box.
+      ctx.setLineDash(dashed ? [lw * 4, lw * 3] : (b.difficult ? [lw, lw * 1.5] : []));
       ctx.lineWidth = (sel ? 2 : 1) * (l === 'review' ? 1.5 : 1) * lw;
       ctx.strokeStyle = color;
       ctx.strokeRect(x, y, w, h);
@@ -756,7 +757,7 @@
     // A thin dashed outline just outside the box: the object's edges stay visible.
     var k = scale * dpr, o = 2 * dpr;
     c.lineWidth = 1.5 * dpr;
-    c.setLineDash([5 * dpr, 3 * dpr]);
+    c.setLineDash(b.difficult ? [2 * dpr, 3 * dpr] : [5 * dpr, 3 * dpr]);
     c.strokeStyle = COLORS[look(b)] || '#ffffff';
     var rx = (b.bbox[0] - x0) * k - o, ry = (b.bbox[1] - y0) * k - o, rw = bw * k + 2 * o, rh = bh * k + 2 * o;
     c.strokeRect(rx, ry, rw, rh);
@@ -767,11 +768,12 @@
   }
 
   // The close-up's tag: the class at a glance (bold), the score, the decision so far (? flagged,
-  // ✓ accepted / drawn, ✗ rejected) and the labelers' class when they name another one. Above the
-  // outline when there is room, else below it, else inside its top; kept within the close-up.
+  // ✓ accepted / drawn, ✗ rejected, ?! unsure) and the labelers' class when they name another
+  // one. Above the outline when there is room, else below it, else inside its top; kept within
+  // the close-up.
   function cropTag(c, b, rx, ry, rh, pw, ph, dpr) {
     var l = look(b);
-    var mark = l === 'review' ? '? ' : (l === 'accepted' || l === 'added' ? '✓ ' : (l === 'rejected' ? '✗ ' : ''));
+    var mark = b.difficult ? '?! ' : (l === 'review' ? '? ' : (l === 'accepted' || l === 'added' ? '✓ ' : (l === 'rejected' ? '✗ ' : '')));
     var main = mark + b.label;
     var extra = (b.score != null ? ' ' + fmtScore(b.score) : '') +
       (b.auto_label && b.auto_label !== b.label ? ' · labelers: ' + b.auto_label : '');
@@ -898,6 +900,7 @@
     li.appendChild(shortState(b));
     if (b.state !== 'pending' && !b._checked) li.appendChild(el('span', 'rv-chip warn', 'to check'));
     if (dups.of[i] && dups.of[i].keeper !== i) li.appendChild(el('span', 'rv-chip warn', 'dup'));
+    if (b.difficult) li.appendChild(el('span', 'rv-chip warn', 'unsure'));
     li.appendChild(el('span', 'bx-score muted', fmtScore(b.score)));
     li.addEventListener('click', function () { select(i); });
     return li;
@@ -919,6 +922,8 @@
     if (t && b.why && b.why.length) t.title = b.why.join('; ');
     if (t) chips.appendChild(t);
     if (dups.of[i] && dups.of[i].keeper !== i) chips.appendChild(el('span', 'rv-chip warn', 'dup'));
+    if (b.difficult) chips.appendChild(el('span', 'rv-chip warn', 'unsure'));
+    if (b.state === 'rejected' && b.reject_reason) chips.appendChild(el('span', 'rv-chip bad', reasonText(b.reject_reason)));
     li.appendChild(chips);
     var ev = evidence(b);
     if (ev) li.appendChild(el('span', 'bx-note', ev));
@@ -1001,6 +1006,8 @@
       else if (b.score != null) why.push('score ' + fmtScore(b.score));
       // Most verification errors are on small objects: say so (the close-up is at least 2x).
       if (Math.min(b.bbox[2] - b.bbox[0], b.bbox[3] - b.bbox[1]) < 24) why.unshift('small: check closely');
+      if (b.difficult) why.unshift('marked unsure: kept, not trained on (YOLO), ignored by the benchmark');
+      if (b.state === 'rejected' && b.reject_reason) why.unshift('why: ' + reasonText(b.reject_reason));
       if (why.length) decide.appendChild(el('div', 'rv-q-why muted', why.join(' · ')));
       var btns = el('div', 'rv-q-btns');
       btns.appendChild(decideButton(yes, 'a', 'ok', acceptSelected));
@@ -1012,6 +1019,9 @@
       var other = decideButton('It\'s a…', '1-9', 'secondary', function () { classGrid = !classGrid; renderDecision(); });
       other.setAttribute('aria-expanded', classGrid ? 'true' : 'false');
       btns.appendChild(other);
+      var unsure = decideButton(b.difficult ? 'Not unsure' : 'Unsure', 'd', 'secondary', toggleUnsure);
+      unsure.title = 'A real object you cannot name for sure: kept, left out of YOLO training, ignored by the benchmark set';
+      btns.appendChild(unsure);
       decide.appendChild(btns);
       var mate = dupPartner(i);
       if (mate >= 0) {
@@ -1032,6 +1042,21 @@
         });
         decide.appendChild(g);
       }
+    }
+    // Why the box just rejected (or the selected rejected box) was wrong: optional chips.
+    var ri = reasonTarget();
+    if (ri >= 0) {
+      var rb = boxes()[ri];
+      var rr = el('div', 'rv-q-reason');
+      rr.appendChild(el('span', 'muted', (ri === selected ? 'Why rejected?' : 'Box ' + (ri + 1) + ' rejected. Why?') + ' (optional)'));
+      REASONS.forEach(function (r, n) {
+        var cb = button('', function () { setReason(n); canvas.focus({ preventScroll: true }); },
+          'secondary' + (rb.reject_reason === r[0] ? ' active' : ''));
+        cb.appendChild(kbd('⇧' + (n + 1)));
+        cb.appendChild(document.createTextNode(' ' + r[1]));
+        rr.appendChild(cb);
+      });
+      decide.appendChild(rr);
     }
     // Stacked boxes on the frame (in the progress line): keep the best of each stack, the rest
     // go as duplicates.
@@ -1110,7 +1135,7 @@
     if (!(b.state === state && b._checked)) {
       snapshot();
       if (state === 'rejected') markRejected(b, why);
-      else { b.state = state; b._checked = true; }
+      else { b.state = state; b._checked = true; delete b.reject_reason; }
       if (state !== 'rejected' && cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
     }
     var next = nextUndecided(i);
@@ -1119,14 +1144,100 @@
   }
 
   // Every rejection by the reviewer goes through here (no undo step, no move: the callers).
-  // `why` ('duplicate', ...) is not recorded yet: the label format has no field for it.
+  // `why`: the box's `reject_reason` ('duplicate', ...); none keeps an earlier one. A rejected
+  // box is not "unsure".
   function markRejected(b, why) {
     b.state = 'rejected';
     b._checked = true;
+    delete b.difficult;
+    if (why) b.reject_reason = why;
   }
 
-  // Reject box `i` (`why`: the reason, see markRejected), then the next box.
-  function rejectWith(i, why) { setState(i, 'rejected', why); }
+  // Reject box `i` (`why`: the reason, see markRejected), then the next box; without a reason,
+  // the decision bar offers the reason chips for a few seconds (never required: rejecting stays
+  // one key).
+  function rejectWith(i, why) {
+    setState(i, 'rejected', why);
+    var b = boxes()[i];
+    if (!why && b && b.state === 'rejected' && b.source !== 'human') offerReason(i);
+  }
+
+  // Why a box was wrong (`reject_reason`, Shift+1-9), for hard-negative mining.
+  var REASONS = [
+    ['false_positive', 'nothing there'],
+    ['insect_web', 'insect / web'],
+    ['rain_snow', 'rain / snow'],
+    ['ir_glare', 'IR glare / lights'],
+    ['reflection', 'reflection / picture'],
+    ['static_object', 'part of the scene'],
+    ['other_object', 'other kind of object'],
+    ['too_small', 'too small to tell'],
+    ['duplicate', 'duplicate']
+  ];
+  var REASON_MS = 4000;
+  var reasonAsk = null;   // {frame, i, timer}: the chips offered after a rejection
+
+  function reasonText(r) {
+    for (var n = 0; n < REASONS.length; n++) if (REASONS[n][0] === r) return REASONS[n][1];
+    return r;
+  }
+
+  function offerReason(i) {
+    clearReason(true);
+    reasonAsk = { frame: cur.frame, i: i, timer: setTimeout(function () { clearReason(); }, REASON_MS) };
+    renderDecision();
+  }
+
+  function clearReason(quiet) {
+    if (!reasonAsk) return;
+    clearTimeout(reasonAsk.timer);
+    reasonAsk = null;
+    if (!quiet) renderDecision();
+  }
+
+  // The box the reason chips apply to: the one just rejected (while offered), else the selected
+  // box when it is a rejected model / auto box; -1 for none.
+  function reasonTarget() {
+    if (!cur) return -1;
+    var a = reasonAsk && reasonAsk.frame === cur.frame ? boxes()[reasonAsk.i] : null;
+    if (a && a.state === 'rejected') return reasonAsk.i;
+    var b = boxes()[selected];
+    return b && b.state === 'rejected' && b.source !== 'human' ? selected : -1;
+  }
+
+  // Reason `n` of REASONS on the target box (again: cleared).
+  function setReason(n) {
+    var i = reasonTarget(), r = REASONS[n], b = boxes()[i];
+    if (!b || !r) return;
+    snapshot();
+    if (b.reject_reason === r[0]) delete b.reject_reason; else b.reject_reason = r[0];
+    say('Box ' + (i + 1) + ' rejected' + (b.reject_reason ? ': ' + r[1] : '') + '.');
+    clearReason(true);
+    refresh();
+  }
+
+  // `d`: the selected box is a real object the reviewer cannot name for sure (VOC "difficult"):
+  // kept, left out of the YOLO export, ignored by the benchmark set; then the next box. Again on
+  // an unsure box: no longer unsure (its decision stays).
+  function toggleUnsure() {
+    var b = boxes()[selected];
+    if (!b) { say('No box selected: j selects one.'); return; }
+    snapshot();
+    if (b.difficult) {
+      delete b.difficult;
+      refresh();
+      say('Box ' + (selected + 1) + ' no longer marked unsure.');
+      return;
+    }
+    b.difficult = true;
+    delete b.reject_reason;
+    b.state = b.source === 'human' ? 'added' : 'accepted';
+    b._checked = true;
+    if (cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
+    var next = nextUndecided(selected);
+    select(next >= 0 ? next : selected, true);
+    sayProgress();
+  }
 
   // The non-drawn boxes of the stacks that are not their keeper.
   function dupDrops(d) {
@@ -1630,6 +1741,7 @@
   // `nav`: 'back' (`p`) or 'forward' (`n` after Back); else a move on, which forgets the frames
   // Back left.
   function loadFrame(frame, nav) {
+    clearReason(true);
     return api('/v1/review/labels?frame=' + encodeURIComponent(frame)).then(function (j) {
       if (cur && cur.frame !== j.frame) {
         if (nav === 'back') fwdStack.push(cur.frame);
@@ -1891,6 +2003,8 @@
     ['Decide', '1-9, 0', null],
     ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps'],
     ['Decide', 'Shift+U', 'stacked boxes: keep the best of each stack, reject the others as duplicates'],
+    ['Decide', 'd', 'unsure: a real object you cannot name for sure (kept, left out of YOLO training, ignored by the benchmark set; ?! on the box); again: not unsure'],
+    ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate)'],
     ['Decide', 'Shift+A', 'accept proposals: the pending boxes saving would accept (hints stay pending)'],
     ['Decide', 'e', 'confirmed empty (rejects every box)'],
     ['Decide', 'Delete', 'delete a drawn box, reject a model box'],
@@ -1992,6 +2106,12 @@
       if (k.length === 1) ev.preventDefault();
       canvas.focus({ preventScroll: true });
     }
+    // Shift+1-9: the reason of the box just rejected (or the selected rejected box).
+    if (ev.shiftKey && /^Digit[1-9]$/.test(ev.code) && reasonTarget() >= 0) {
+      setReason(Number(ev.code.slice(5)) - 1);
+      ev.preventDefault();
+      return;
+    }
     var handled = true;
     if (k === ' ') {
       spaceDown = true;
@@ -2012,6 +2132,7 @@
     else if (k === '[' || k === ']') stepGamma(k === ']' ? 1 : -1);
     else if (ev.code === 'Digit0' && ev.shiftKey) setImgView('auto', 1);
     else if (k === 'p') goBack();
+    else if (k === 'd') toggleUnsure();
     else if (k === 'u') { if (ev.shiftKey) rejectDuplicates(); else rejectDupSelected(); }
     else if (k === '?') openKeys();
     else if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {

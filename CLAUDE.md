@@ -128,7 +128,9 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 - Review (`src/collect/labels/`, `/review`, `assets/review.js`): per-frame `<stem>.labels.json` (v1; states pending/
   accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
   `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk
-  accept of `auto=accept` frames `POST /v1/review/accept-auto`; bulk reject of pending auto boxes below a score `POST /v1/review/reject-low`, `reason: low_score`; all in `collect/labels/bulk.rs`), uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
+  accept of `auto=accept` frames `POST /v1/review/accept-auto`; bulk reject of pending auto boxes below a score `POST /v1/review/reject-low`, `reason: low_score`; all in `collect/labels/bulk.rs`); box `difficult` (page `d`, "unsure": left out of YOLO, COCO attribute,
+  benchmark `ignore`, X-AnyLabeling `difficult`) and `reject_reason` (enum, rejected boxes only, Shift+1-9, into `hard_negatives.json`;
+  `reason` stays provenance); uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
   X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned. The page reviews `collect.review_dir`
   (default `collect.dir`; *Folder under review*, `POST /v1/review/folder`), e.g. an import saved with `train import --out-dir`;
   auto-label runs follow it. Unwanted classes = labels mapping to no `collect.classes` entry (aliases such as `pottedplant` map) ∪

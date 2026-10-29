@@ -12,7 +12,8 @@
     <li>A cyclist is a person box plus a bicycle box.</li>
     <li>A person inside a vehicle only if clearly visible.</li>
     <li>An object cut by the frame edge only if you can still recognise it.</li>
-    <li>Dark frames: look at them brightened (<kbd>b</kbd>) before deciding; reject what you still cannot name.</li>
+    <li>Dark frames: look at them brightened (<kbd>b</kbd>) before deciding. A real object you still cannot name for sure is <em>unsure</em> (<kbd>d</kbd>): kept, left out of YOLO training, ignored by the benchmark set. Reject what is not an object at all.</li>
+    <li>Why a box was wrong is optional: after <kbd>r</kbd>, <kbd>Shift</kbd>+<kbd>1</kbd>-<kbd>9</kbd> (insect / web, IR glare, reflection, ...) marks it for hard-negative mining.</li>
     <li>Before saving, look over the whole frame for objects the model missed: they are the commonest label error.</li>
   </ul>
 </details>

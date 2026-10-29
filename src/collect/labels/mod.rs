@@ -115,6 +115,30 @@ pub enum Origin {
     VerifyFound,
 }
 
+/// Why the reviewer rejected a box (the Review page's reason chips): hard-negative mining keys,
+/// kept in `hard_negatives.json`. Separate from [`LabelBox::reason`] (provenance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectReason {
+    /// Nothing there, or not an object of the label.
+    FalsePositive,
+    /// A second box on an object another box already covers.
+    Duplicate,
+    /// An insect or a spider web, usually near the IR lights.
+    InsectWeb,
+    RainSnow,
+    /// IR bloom, glare, headlights.
+    IrGlare,
+    /// A reflection, a poster, a picture of the object.
+    Reflection,
+    /// A fixed part of the scene (railing, plant, bin).
+    StaticObject,
+    /// A real object of a class the list does not have.
+    OtherObject,
+    /// Too small or too far to tell.
+    TooSmall,
+}
+
 /// A box of a label file. `bbox` is `[x0, y0, x1, y1]` in pixels of the original frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabelBox {
@@ -137,6 +161,15 @@ pub struct LabelBox {
     /// The proposed box before the reviewer moved or resized it (set by the Review page).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orig_bbox: Option<[f32; 4]>,
+    /// The reviewer could not tell what the object is (PASCAL VOC `difficult`, Review page `d`):
+    /// left out of the YOLO export, `ignore` in the benchmark set, an attribute in COCO.
+    /// [`normalize`] clears it on a rejected box.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub difficult: bool,
+    /// Why the reviewer rejected the box (optional; absent = a plain false positive).
+    /// [`normalize`] clears it unless the box is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<RejectReason>,
     /// What the auto-labeler found out about the box (`agree`, `triage`, `vlm`, ...); empty for
     /// other boxes. Flattened: the keys sit on the box itself.
     #[serde(flatten)]
@@ -219,6 +252,8 @@ impl LabelBox {
             reason,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo::default(),
         }
     }
@@ -512,6 +547,7 @@ fn label_ok(l: &str) -> bool {
 /// - `reviewed`: pending boxes resolved ([`resolve_pending`]), every training label must be in
 ///   `classes`, and a frame confirmed empty must have none; `reviewed_at` = `now`;
 /// - `skipped`: `reviewed_at` = `now`; `unreviewed`: no `reviewed_at`;
+/// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
 ///   (bounded), `bulk_accepted` cleared;
 /// - `version` and `classes_version` set.
@@ -631,6 +667,14 @@ pub fn normalize(
         }
         Status::Skipped => f.reviewed_at = Some(now.to_string()),
         Status::Unreviewed => f.reviewed_at = None,
+    }
+    // A reject reason belongs to a rejected box only; a rejected box is not "unsure".
+    for b in &mut f.boxes {
+        if b.state == BoxState::Rejected {
+            b.difficult = false;
+        } else {
+            b.reject_reason = None;
+        }
     }
     if f.status != Status::Unreviewed {
         f.disagreement = None;
@@ -981,6 +1025,8 @@ pub(crate) mod tests_support {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo::default(),
         }
     }
@@ -1147,6 +1193,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         });
         let n = normalize(f.clone(), &classes(), 640, 480, now).unwrap();
@@ -1197,12 +1245,65 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         });
         let n = normalize(f, &classes(), 640, 480, "now").unwrap();
         assert_eq!(n.boxes.len(), 4);
         assert!(n.boxes.iter().all(|b| b.state == BoxState::Pending));
         assert_eq!(n.reviewed_at, None);
+    }
+
+    #[test]
+    fn unsure_and_reject_reason_round_trip_and_normalize_keeps_them_where_they_belong() {
+        let mut f = prefill(&record(), &classes(), &[]);
+        f.status = Status::Reviewed;
+        // Accepted + unsure; rejected + reason; accepted with a stray reason; rejected + unsure.
+        f.boxes[0].state = BoxState::Accepted;
+        f.boxes[0].difficult = true;
+        f.boxes[1].state = BoxState::Rejected;
+        f.boxes[1].reject_reason = Some(RejectReason::IrGlare);
+        f.boxes[2].state = BoxState::Accepted;
+        f.boxes[2].reject_reason = Some(RejectReason::Duplicate);
+        f.boxes[3].state = BoxState::Rejected;
+        f.boxes[3].difficult = true;
+        let n = normalize(f, &classes(), 640, 480, "now").unwrap();
+        let got: Vec<(bool, Option<RejectReason>)> = n
+            .boxes
+            .iter()
+            .map(|b| (b.difficult, b.reject_reason))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (true, None),
+                (false, Some(RejectReason::IrGlare)),
+                (false, None),
+                (false, None),
+            ]
+        );
+        let text = serde_json::to_string(&n).unwrap();
+        assert!(
+            text.contains(r#""difficult":true"#) && text.contains(r#""reject_reason":"ir_glare""#)
+        );
+        assert_eq!(text.matches("difficult").count(), 1, "false is not written");
+        let back: LabelFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, n);
+        // A file written before the fields existed loads with them off.
+        let old: LabelBox = serde_json::from_str(
+            r#"{"label": "dog", "bbox": [1, 2, 30, 40], "source": "model", "state": "rejected"}"#,
+        )
+        .unwrap();
+        assert!(!old.difficult && old.reject_reason.is_none());
+        // An unknown reason is refused.
+        assert!(
+            serde_json::from_str::<LabelBox>(
+                r#"{"label": "dog", "bbox": [1, 2, 30, 40], "source": "model", "state": "rejected",
+                   "reject_reason": "aliens"}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1256,6 +1357,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: Default::default(),
         }
     }
@@ -1429,6 +1532,8 @@ mod tests {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo {
                 triage,
                 auto_label: suggest.map(str::to_string),

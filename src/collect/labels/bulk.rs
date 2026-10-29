@@ -532,6 +532,8 @@ pub(crate) mod test_support {
             reason: None,
             model_label: None,
             orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
             auto: AutoInfo {
                 triage: Some(triage),
                 ..AutoInfo::default()

@@ -325,6 +325,14 @@ folder; the collector and the Dataset page keep `collect.dir`.
   class list's spelling (pre-fill, auto-label runs, *Reject boxes of unwanted classes*).
 - **`orig_bbox`:** the proposed box before the reviewer moved or resized it (set by the page; checked
   and clamped like `bbox`, dropped when equal to it).
+- **`difficult`** (written only when true): the reviewer marked the box *unsure* (Review page `d`), a
+  real object they cannot name for sure (PASCAL VOC `difficult`). It is left out of the YOLO labels (the
+  frame and its other boxes stay), carries `"attributes": {"difficult": true}` in COCO, is `ignore` in the
+  benchmark manifest and `difficult` in X-AnyLabeling (both ways). Cleared on a rejected box.
+- **`reject_reason`** (optional, rejected boxes only): why the reviewer rejected it (Review page,
+  Shift+1-9 after `r`): `false_positive`, `duplicate`, `insect_web`, `rain_snow`, `ir_glare`,
+  `reflection`, `static_object`, `other_object`, `too_small`. Absent = a plain false positive; an
+  unknown value is refused. Separate from `reason`, which is provenance. Copied to `hard_negatives.json`.
 - **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
   cannot have accepted or added boxes.
 - **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
@@ -566,8 +574,9 @@ Click a box to select it. Drag on the image to draw a new one.
   labels/{train,val}/<name>.txt        YOLO: `class cx cy w h`, normalised, clamped to 0..1, 6 decimals; empty file = no object
   classes.txt, data.yaml               class ids follow collect.classes; data.yaml is an Ultralytics dataset
   annotations/instances_{train,val}.json   COCO: categories 1..K in class order, image / annotation ids from 1,
-                                       bbox [x, y, w, h] px (2 decimals), area = w * h, iscrowd 0
-  hard_negatives.json                  every rejected model / auto box (frame, label, bbox, origin, reason)
+                                       bbox [x, y, w, h] px (2 decimals), area = w * h, iscrowd 0,
+                                       attributes.difficult on unsure boxes (left out of YOLO)
+  hard_negatives.json                  every rejected model / auto box (frame, label, bbox, origin, reason, reject_reason)
   xanylabeling/<name>.jpg + .json      X-AnyLabeling files (below)
   benchmark/images/<name>.jpg + manifest.json   a benchmark `dir:` set
   export.json                          the report, written last
