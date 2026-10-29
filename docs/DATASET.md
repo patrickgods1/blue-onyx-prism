@@ -331,8 +331,9 @@ folder; the collector and the Dataset page keep `collect.dir`.
   benchmark manifest and `difficult` in X-AnyLabeling (both ways). Cleared on a rejected box.
 - **`reject_reason`** (optional, rejected boxes only): why the reviewer rejected it (Review page,
   Shift+1-9 after `r`): `false_positive`, `duplicate`, `insect_web`, `rain_snow`, `ir_glare`,
-  `reflection`, `static_object`, `other_object`, `too_small`. Absent = a plain false positive; an
-  unknown value is refused. Separate from `reason`, which is provenance. Copied to `hard_negatives.json`.
+  `reflection`, `static_object`, `other_object`, `too_small`. Absent = a plain false positive; a
+  value this build does not know (a newer build's) loads and is written back unchanged (the API refuses
+  one it is sent). Separate from `reason`, which is provenance. Copied to `hard_negatives.json`.
 - **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
   cannot have accepted or added boxes.
 - **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
@@ -345,8 +346,13 @@ folder; the collector and the Dataset page keep `collect.dir`.
   labelers-mode auto-label run that looked at the frame, boxes found or not (a frame with nothing found
   gets a label file with just this). A later run of the same labelers skips the frame unless its filter
   has `again=1`. The page round-trips it.
-- **`bulk_accepted`:** `true` when the file was saved by the bulk accept (`POST /v1/review/accept-auto`)
-  rather than by a reviewer looking at the frame. Any other save clears it.
+- **`bulk_accepted`:** `true` when the file was saved by a bulk accept (`POST /v1/review/accept-auto`,
+  `accept-repeats`) rather than by a reviewer looking at the frame. Any other save clears it.
+- **`repeat_spot`** (written only when true): a spot edit ("Reject / Accept this spot on all frames",
+  `POST /v1/review/reject-spot` / `accept-spot`) changed boxes of this unreviewed frame. The boxes it
+  rejected or accepted carry `reason: repeat_spot` when they had no provenance. With no pending box left
+  the frame is *repeat-only*: last in the queue, `auto=repeats`, saved in bulk by `POST
+  /v1/review/accept-repeats`. Cleared once the frame is reviewed or skipped.
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
   box itself, all optional:
 

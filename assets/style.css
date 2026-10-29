@@ -755,6 +755,9 @@ button.ok:hover, button.bad:hover { filter: brightness(0.95); box-shadow: 0 0 0 
 .rv-progress progress { width: 100%; max-width: none; height: 0.45rem; accent-color: #2e9e4f; }
 .rv-q-dup { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; font-size: 0.85rem; }
 .rv-q-dup button.small { margin: 0; padding: 0.15rem 0.5rem; }
+.rv-q-spot { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; font-size: 0.85rem; }
+.rv-q-spot button.small { margin: 0; padding: 0.1rem 0.45rem; font-size: 0.78rem; }
+.rv-decide button.suggest { box-shadow: 0 0 0 2px currentColor; }
 .review-side > .rv-session { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; font-size: 0.8rem; margin: 0.2rem 0 0; }
 .review-side > .rv-session:empty { display: none; }
 .rv-session .rv-chip button.small { margin: 0 0 0 0.2rem; padding: 0 0.35rem; font-size: 0.75rem; }

@@ -8,12 +8,14 @@
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
 //! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
-//! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`] and the X-AnyLabeling interop in
-//! [`xany`].
+//! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
+//! [`xany`] and the repeat detections of fixed cameras (spot matching, per-camera history) in
+//! [`repeats`].
 
 pub mod bulk;
 pub mod export;
 pub mod queue;
+pub mod repeats;
 pub mod xany;
 
 use super::layout::{self, Rel};
@@ -366,6 +368,11 @@ pub struct LabelFile {
     /// reviewer looking at the frame. [`normalize`] clears it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bulk_accepted: bool,
+    /// A spot edit ("reject / accept this spot everywhere", [`repeats`]) changed boxes of this
+    /// unreviewed frame: with no pending box left it is a repeat-only frame
+    /// ([`repeats::repeats_only`]). [`normalize`] clears it once the frame is reviewed or skipped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat_spot: bool,
 }
 
 fn labels_version() -> u32 {
@@ -384,6 +391,7 @@ impl Default for LabelFile {
             disagreement: None,
             auto_run: None,
             bulk_accepted: false,
+            repeat_spot: false,
         }
     }
 }
@@ -733,6 +741,7 @@ pub fn normalize(
     }
     if f.status != Status::Unreviewed {
         f.disagreement = None;
+        f.repeat_spot = false;
     }
     if f.disagreement
         .as_ref()
@@ -993,7 +1002,10 @@ fn write_lock() -> std::sync::MutexGuard<'static, ()> {
 fn write_locked(path: &Path, f: &LabelFile) -> Result<()> {
     let mut text = serde_json::to_vec_pretty(f)?;
     text.push(b'\n');
-    layout::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()))
+    let r =
+        layout::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()));
+    repeats::written(path);
+    r
 }
 
 /// Write `f` to `path` atomically (temporary file + rename).

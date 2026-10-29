@@ -37,7 +37,7 @@
     <label>Scene <select name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></label>
     <label>Camera <select name="camera" id="rv-camera"><option value="">any</option></select></label>
     <div class="rv-label-filter"><span class="field-label" id="rv-label-cap">Class</span> <div id="rv-label-picker" aria-labelledby="rv-label-cap"><select id="rv-label-fallback" aria-label="Class"><option value="">any</option>{% for c in classes %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></div><input type="hidden" name="label" id="rv-label" value=""></div>
-    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option></select></label>
+    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option><option value="repeats">only repeats left</option></select></label>
     <label>Status <select name="status"><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select></label>
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
   </form>
@@ -117,6 +117,11 @@
     <span class="muted">Saves the unreviewed frames the filters select whose boxes are all <em>auto: accept</em> as reviewed (asks first).</span>
   </div>
   <div id="rv-accept-auto-msg" class="review-report" role="status"></div>
+  <div class="inline-row">
+    <button type="button" id="rv-accept-repeats" class="small secondary">Save repeat-only frames&hellip;</button>
+    <span class="muted">Saves as reviewed the unreviewed frames the filters select whose every box <em>Reject / Accept this spot on all frames</em> (the decision bar, for a box you decided) already settled; a frame with a box still to decide is never saved. Asks first.</span>
+  </div>
+  <div id="rv-accept-repeats-msg" class="review-report" role="status"></div>
   <div class="inline-row">
     <button type="button" id="rv-reject-low" class="small secondary">Reject auto boxes below&hellip;</button>
     <label class="inline-label">score <input type="number" id="rv-reject-low-score" min="0.01" max="1" step="0.01" value="0.3" class="num-sm" aria-label="Reject auto boxes scoring below"></label>

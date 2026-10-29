@@ -891,6 +891,15 @@
     return el('span', 'rv-chip ' + (b.state === 'accepted' ? 'ok' : 'bad'), b.state);
   }
 
+  // "Seen here": the reviewer's earlier verdict at the box's spot (repeatOf).
+  function repeatChip(r) {
+    var text = r.verdict ? 'seen ' + (r.verdict === 'rejected' ? '✗' : '✓') + r.n : 'seen ✓' + r.acc + ' ✗' + r.rej;
+    var c = el('span', 'rv-chip' + (r.verdict === 'rejected' ? ' bad' : (r.verdict ? ' ok' : '')), text);
+    c.title = 'At this spot on this camera before: accepted ' + r.acc + ', rejected ' + r.rej + ' time(s)' +
+      (r.verdict ? '' : ' (mixed: no suggestion)');
+    return c;
+  }
+
   // A box that is not selected: one row (number, class, state, score); a click selects it.
   function boxRow(b, i) {
     var li = el('li', 'compact st-' + b.state + ' lk-' + look(b));
@@ -901,6 +910,8 @@
     if (b.state !== 'pending' && !b._checked) li.appendChild(el('span', 'rv-chip warn', 'to check'));
     if (dups.of[i] && dups.of[i].keeper !== i) li.appendChild(el('span', 'rv-chip warn', 'dup'));
     if (b.difficult) li.appendChild(el('span', 'rv-chip warn', 'unsure'));
+    var rp = b.state === 'pending' ? repeatOf(b) : null;
+    if (rp) li.appendChild(repeatChip(rp));
     li.appendChild(el('span', 'bx-score muted', fmtScore(b.score)));
     li.addEventListener('click', function () { select(i); });
     return li;
@@ -1009,9 +1020,10 @@
       if (b.difficult) why.unshift('marked unsure: kept, not trained on (YOLO), ignored by the benchmark');
       if (b.state === 'rejected' && b.reject_reason) why.unshift('why: ' + reasonText(b.reject_reason));
       if (why.length) decide.appendChild(el('div', 'rv-q-why muted', why.join(' · ')));
+      var rp = b.state === 'pending' ? repeatOf(b) : null;
       var btns = el('div', 'rv-q-btns');
-      btns.appendChild(decideButton(yes, 'a', 'ok', acceptSelected));
-      btns.appendChild(decideButton(no, 'r', 'bad', rejectSelected));
+      btns.appendChild(decideButton(yes, 'a', 'ok' + (rp && rp.verdict === 'accepted' ? ' suggest' : ''), acceptSelected));
+      btns.appendChild(decideButton(no, 'r', 'bad' + (rp && rp.verdict === 'rejected' ? ' suggest' : ''), rejectSelected));
       if (b.auto_label && b.auto_label !== b.label) {
         var al = b.auto_label;
         btns.appendChild(decideButton('It\'s a ' + al, null, 'ok', function () { relabelNext(i, al); }));
@@ -1031,6 +1043,29 @@
           (dups.of[i].keeper === i ? ', this one kept as the best' : '')));
         dl.appendChild(decideButton('Reject as duplicate', 'u', 'bad', function () { rejectWith(i, 'duplicate'); }));
         decide.appendChild(dl);
+      }
+      // Repeats: what the reviewer decided at this spot before, and the spot on every frame.
+      if (b.source !== 'human') {
+        var sl = el('div', 'rv-q-spot');
+        if (rp && rp.verdict) {
+          sl.appendChild(el('span', null, (rp.verdict === 'rejected' ? 'Rejected' : 'Accepted') + ' here ' + rp.n +
+            ' time(s) before' + (rp.reason ? ' (' + reasonText(rp.reason) + ')' : '') +
+            (rp.total > rp.n ? ', ' + (rp.total - rp.n) + ' the other way' : '')));
+        } else if (rp) {
+          // Mixed: say so, suggest nothing (the same spot holds a real object at times).
+          sl.appendChild(el('span', 'muted', 'Here before: rejected ' + rp.rej + ', accepted ' + rp.acc +
+            (rp.reason ? ' (rejected as ' + reasonText(rp.reason) + ')' : '') + ': look closely'));
+        }
+        var everywhere = b.state === 'rejected' || (b.state === 'pending' && rp && rp.verdict === 'rejected') ? 'reject'
+          : (b.state === 'accepted' || (b.state === 'pending' && rp && rp.verdict === 'accepted') ? 'accept' : null);
+        if (everywhere) {
+          var eb = button((everywhere === 'reject' ? 'Reject' : 'Accept') + ' this spot on all ' + camOf(cur.frame) + ' frames…',
+            function () { spotEverywhere(i, everywhere === 'accept'); }, 'secondary');
+          eb.title = 'Every unreviewed ' + camOf(cur.frame) + ' frame: the pending ' + b.label + ' boxes at this spot are ' +
+            (everywhere === 'reject' ? 'rejected' : 'accepted (a closer match: IoU 0.8, the same class)') + '. Counts first and asks.';
+          sl.appendChild(eb);
+        }
+        if (sl.childNodes.length) decide.appendChild(sl);
       }
       if (classGrid) {
         var g = el('div', 'rv-q-classes');
@@ -1064,13 +1099,19 @@
     }
     // Stacked boxes on the frame (in the progress line): keep the best of each stack, the rest
     // go as duplicates.
+    var repeats = repeatRejects().length;
+    var repeatBtn = null;
+    if (repeats >= REPEAT_MIN) {
+      repeatBtn = decideButton('Reject ' + repeats + ' repeats', null, 'secondary', rejectRepeats);
+      repeatBtn.title = 'Reject the pending boxes of this frame that sit where you rejected boxes of this camera before';
+    }
     var extra = dupDrops(dups).length;
     var stackBtn = null;
     if (extra) {
       stackBtn = decideButton('Reject ' + extra + ' stacked dup' + (extra === 1 ? '' : 's'), 'Shift+U', 'secondary', rejectDuplicates);
       stackBtn.title = 'Keep the best box of each of the ' + dups.groups.length + ' stack(s) of overlapping boxes, reject the others as duplicates';
     }
-    if (p.total || stackBtn) {
+    if (p.total || stackBtn || repeatBtn) {
       var line = el('div', 'rv-progress');
       if (p.total) {
         var bar = el('progress');
@@ -1081,6 +1122,7 @@
       var row = el('div', 'rv-progress-row');
       row.appendChild(el('span', 'muted', p.total ? p.done + '/' + p.total + ' done · ' + p.undecided + ' undecided' + (p.unchecked ? ' · ' + p.unchecked + ' to check' : '') : ''));
       if (stackBtn) row.appendChild(stackBtn);
+      if (repeatBtn) row.appendChild(repeatBtn);
       line.appendChild(row);
       decide.appendChild(line);
     }
@@ -1271,6 +1313,136 @@
     dups = dupGroups();
     if (dupPartner(selected) < 0) { say('Box ' + (selected + 1) + ' overlaps no other box of its object.'); return; }
     rejectWith(selected, 'duplicate');
+  }
+
+  // ---- repeats: the reviewer's earlier decisions at the same spot of this camera -------------
+
+  // A spot counts as decided when at least REPEAT_MIN earlier decisions there (IoU >= REPEAT_IOU,
+  // the same object class) agree REPEAT_SHARE of the time. Only a suggestion: nothing is decided
+  // on load.
+  var REPEAT_IOU = 0.6, REPEAT_MIN = 2, REPEAT_SHARE = 0.8;
+  var ACCEPT_SPOT_IOU = 0.8;           // "accept this spot everywhere" (server: ACCEPT_SPOT_IOU)
+  var histories = {};                  // camera -> {decisions} (GET /v1/review/history)
+
+  function camOf(frame) { return String(frame || '').split('/')[1] || ''; }
+
+  // The camera's history, once per camera and folder (kept up to date by noteHistory).
+  function loadHistory(cam) {
+    if (!cam || histories[cam]) return;
+    histories[cam] = { decisions: [] };
+    api('/v1/review/history?camera=' + encodeURIComponent(cam)).then(function (j) {
+      histories[cam] = { decisions: j.decisions || [] };
+      if (cur && camOf(cur.frame) === cam) refresh();
+    }).catch(function () { /* no hint: the review works without it */ });
+  }
+
+  // A decision of the reviewer's own (the server's rule, repeats.rs `counts`).
+  function lookedAt(b) {
+    return b.source !== 'human' && (b.state === 'accepted' || b.state === 'rejected') &&
+      ['low_score', 'other_class', 'repeat_spot'].indexOf(b.reason) < 0;
+  }
+
+  // After a reviewed save: the frame's decisions replace its earlier ones in the history.
+  function noteHistory(frame, body, w, h) {
+    var hist = histories[camOf(frame)];
+    if (!hist) return;
+    hist.decisions = hist.decisions.filter(function (d) { return d.frame !== frame; });
+    body.boxes.filter(lookedAt).forEach(function (b) {
+      hist.decisions.unshift({ frame: frame, label: b.label, bbox: b.bbox, state: b.state,
+        reject_reason: b.reject_reason, width: w, height: h });
+    });
+  }
+
+  // What the reviewer decided at box b's spot on the camera's other frames: null (fewer than
+  // REPEAT_MIN decisions), else {verdict: 'accepted' | 'rejected' | null (mixed), n (of the
+  // verdict), acc, rej, total, reason (the commonest reject reason)}.
+  function repeatOf(b) {
+    if (!cur || !b || b.source === 'human') return null;
+    var hist = histories[camOf(cur.frame)];
+    if (!hist) return null;
+    var acc = 0, rej = 0, why = {};
+    hist.decisions.forEach(function (d) {
+      if (d.frame === cur.frame || d.width !== cur.width || d.height !== cur.height ||
+        !sameObject(d.label, b.label) || iou(d.bbox, b.bbox) < REPEAT_IOU) return;
+      if (d.state === 'accepted') acc++;
+      else { rej++; if (d.reject_reason) why[d.reject_reason] = (why[d.reject_reason] || 0) + 1; }
+    });
+    var total = acc + rej;
+    var top = Object.keys(why).sort(function (x, y) { return why[y] - why[x]; })[0] || null;
+    if (total < REPEAT_MIN) return null;
+    var r = { verdict: null, n: 0, acc: acc, rej: rej, total: total, reason: top };
+    if (rej >= REPEAT_MIN && rej / total >= REPEAT_SHARE) { r.verdict = 'rejected'; r.n = rej; }
+    else if (acc >= REPEAT_MIN && acc / total >= REPEAT_SHARE) { r.verdict = 'accepted'; r.n = acc; r.reason = null; }
+    return r;
+  }
+
+  // The pending boxes of this frame the history says to reject.
+  function repeatRejects() {
+    var out = [];
+    boxes().forEach(function (b, i) {
+      if (b.state !== 'pending' || isUnwanted(b)) return;
+      var r = repeatOf(b);
+      if (r && r.verdict === 'rejected') out.push({ i: i, reason: r.reason });
+    });
+    return out;
+  }
+
+  // "Reject all repeats on this frame" (one undo step).
+  function rejectRepeats() {
+    var rs = repeatRejects();
+    if (!rs.length) { say('No pending box here sits where you rejected boxes before.'); return; }
+    snapshot();
+    rs.forEach(function (r) { markRejected(boxes()[r.i], r.reason); });
+    select(nextUndecided(-1), true);
+    say('Rejected ' + rs.length + ' box(es) where you rejected boxes of this camera before (z undoes).');
+  }
+
+  // "Reject / accept this spot on every unreviewed frame of the camera": counts first, asks, then
+  // the server edits the other frames and this frame's matching boxes change here (unsaved).
+  function spotEverywhere(i, accept) {
+    var b = boxes()[i];
+    if (!cur || !b || b.source === 'human') return;
+    var cam = camOf(cur.frame);
+    var src = filtersForm.elements.source;
+    var body = { camera: cam, label: b.label, bbox: b.bbox, width: cur.width, height: cur.height,
+      skip_frame: cur.frame, dry_run: true };
+    if (src && src.value) body.source = src.value;
+    if (!accept && b.reject_reason) body.reject_reason = b.reject_reason;
+    var url = accept ? '/v1/review/accept-spot' : '/v1/review/reject-spot';
+    var verb = accept ? 'Accept' : 'Reject';
+    say('Counting the frames...');
+    postJson(url, body).then(function (j) {
+      if (!j.boxes) {
+        say('No other unreviewed ' + cam + ' frame has a pending ' + b.label + ' box at this spot.');
+        return null;
+      }
+      if (!window.confirm(verb + ' ' + j.boxes + ' pending ' + b.label + ' box(es) at this spot on ' + j.eligible +
+        ' unreviewed ' + cam + ' frame(s)?' + (accept ? '' : (b.reject_reason ? ' Reason: ' + reasonText(b.reject_reason) + '.' : '')) +
+        ' The frames stay unreviewed; this frame changes here (save it as usual).')) {
+        say('Nothing changed.');
+        return null;
+      }
+      body.dry_run = false;
+      return postJson(url, body).then(function (r) {
+        // This frame: the same rule, here.
+        var n = 0;
+        snapshot();
+        boxes().forEach(function (x, k) {
+          var take = x.source !== 'human' && x.state === 'pending' &&
+            (accept ? x.label === b.label && iou(x.bbox, b.bbox) >= ACCEPT_SPOT_IOU
+              : sameObject(x.label, b.label) && iou(x.bbox, b.bbox) >= REPEAT_IOU);
+          if (!take && k !== i) return;
+          if (accept) { x.state = 'accepted'; x._checked = true; delete x.reject_reason; }
+          else markRejected(x, b.reject_reason);
+          if (k !== i) n++;
+        });
+        select(nextUndecided(-1), true);
+        // Short: the panel's message line sits above the box list.
+        say(verb + 'ed ' + (r.boxes || 0) + ' ' + b.label + ' box(es) here on ' + (r.changed || 0) + ' ' + cam + ' frame(s)' +
+          (n ? ', ' + n + ' more on this one' : '') + ((r.failed || []).length ? '; ' + r.failed.length + ' not changed' : '') + '.');
+        return loadNext(null, null, true);
+      });
+    }).catch(function (e) { say(e.message, true); });
   }
 
   // `a`: accept the selected box (a drawn one is kept), then the next one.
@@ -1654,6 +1826,7 @@
     add('Rejected boxes', c.rejected_boxes || 0);
     if (c.auto_review != null) add('Auto: to review', c.auto_review);
     if (c.auto_accept != null) add('Auto: accept-ready', c.auto_accept);
+    if (c.repeats_only) add('Repeat-only', c.repeats_only);
     var per = c.per_class || {};
     var keys = Object.keys(per);
     add('Per class', keys.length ? keys.map(function (k) { return k + ' ' + per[k]; }).join(', ') : 'none yet');
@@ -1754,6 +1927,7 @@
         if (backStack.length > 200) backStack.shift();
       }
       cur = j;
+      loadHistory(camOf(j.frame));
       if (Array.isArray(j.classes)) classes = j.classes;
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null;
@@ -1862,12 +2036,12 @@
     body.status = status;
     body.empty_confirmed = !!cur.labels.empty_confirmed;
     body.classes_version = cur.labels.classes_version || '';
-    var frame = cur.frame;
+    var frame = cur.frame, w = cur.width, h = cur.height;
     var url = '/v1/review/labels?frame=' + encodeURIComponent(frame);
     if (cur.revision != null) url += '&revision=' + encodeURIComponent(cur.revision);
     postJson(url, body).then(function (j) {
       dirty = false;
-      if (status === 'reviewed') noteSaved(body);
+      if (status === 'reviewed') { noteSaved(body); noteHistory(frame, body, w, h); }
       // After Back: on to the frame Back left (the counts refresh), else the queue's next.
       if (fwdStack.length) {
         say(j.message || 'Saved.');
@@ -2401,6 +2575,42 @@
         box.className = 'review-report error-text';
         report(box, [e.message]);
       }).then(function () { bulkBtn.disabled = false; });
+    });
+  }
+
+  // Save the frames spot edits settled (nothing pending left): dry run, ask, save.
+  var repeatsBtn = $('rv-accept-repeats');
+  if (repeatsBtn) {
+    repeatsBtn.addEventListener('click', function () {
+      var box = $('rv-accept-repeats-msg') || msg;
+      var body = {};
+      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
+        var e = filtersForm.elements[k];
+        if (e && e.value) body[k] = e.value;
+      });
+      body.dry_run = true;
+      box.className = 'review-report';
+      report(box, ['Counting the frames...']);
+      repeatsBtn.disabled = true;
+      postJson('/v1/review/accept-repeats', body).then(function (j) {
+        var n = j.eligible || 0;
+        if (!n) { report(box, ['No repeat-only frame matches the filters (a frame with a box still to decide never is).']); return null; }
+        if (!window.confirm('Save ' + n + ' repeat-only frame(s) as reviewed? Their boxes were all settled by "this spot on all frames"; ' +
+          'nothing on them is pending.')) {
+          report(box, ['Nothing saved.']);
+          return null;
+        }
+        body.dry_run = false;
+        return postJson('/v1/review/accept-repeats', body).then(function (r) {
+          var failed = r.failed || [];
+          report(box, [r.message || ('Saved ' + (r.accepted || 0) + ' frame(s).')], failed);
+          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+          return reloadQueue();
+        });
+      }).catch(function (e) {
+        box.className = 'review-report error-text';
+        report(box, [e.message]);
+      }).then(function () { repeatsBtn.disabled = false; });
     });
   }
 
