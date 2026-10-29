@@ -92,6 +92,57 @@
   if (cropWrap && cropWrap.parentNode && cropWrap !== cropWrap.parentNode.firstElementChild) {
     cropWrap.parentNode.insertBefore(cropWrap, cropWrap.parentNode.firstElementChild);
   }
+  // The view-only image setting (`b`), next to Zoom / Fit.
+  var imgBtn = $('rv-imgmode');
+  if (!imgBtn && fitBtn) {
+    imgBtn = el('button', 'small secondary', 'Image');
+    imgBtn.type = 'button';
+    imgBtn.id = 'rv-imgmode';
+    fitBtn.parentNode.insertBefore(imgBtn, zoomBoxBtn || fitBtn);
+  }
+  // Back (`p`) and the keys overlay (`?`) in the Save row.
+  var actionsRow = $('rv-save') && $('rv-save').parentNode;
+  var backBtn = $('rv-back');
+  if (!backBtn && actionsRow) {
+    backBtn = el('button', 'small secondary', 'Back');
+    backBtn.type = 'button';
+    backBtn.id = 'rv-back';
+    actionsRow.insertBefore(backBtn, $('rv-next') || null);
+  }
+  var keysBtn = $('rv-keys-open');
+  if (!keysBtn && actionsRow) {
+    keysBtn = el('button', 'small secondary', 'Keys ?');
+    keysBtn.type = 'button';
+    keysBtn.id = 'rv-keys-open';
+    actionsRow.appendChild(keysBtn);
+  }
+  // The session line (pace, acceptance, time; a break note) under the message line.
+  var sessionLine = $('rv-session');
+  if (!sessionLine && msg && msg.parentNode) {
+    sessionLine = el('p', 'rv-session muted');
+    sessionLine.id = 'rv-session';
+    msg.parentNode.insertBefore(sessionLine, msg.nextSibling);
+  }
+  // "Ask about missed objects" in Panel options.
+  var missingBox = $('rv-ask-missing');
+  var panelOpts = $('rv-panel-opts');
+  if (!missingBox && panelOpts) {
+    var ml = el('label', 'check');
+    missingBox = document.createElement('input');
+    missingBox.type = 'checkbox';
+    missingBox.id = 'rv-ask-missing';
+    ml.appendChild(missingBox);
+    ml.appendChild(document.createTextNode(' Ask about missed objects before saving'));
+    panelOpts.insertBefore(ml, panelOpts.querySelector('details'));
+  }
+  // The keys overlay.
+  var keysDialog = $('rv-keys-dialog');
+  if (!keysDialog) {
+    keysDialog = document.createElement('dialog');
+    keysDialog.id = 'rv-keys-dialog';
+    keysDialog.className = 'rv-keys-dialog';
+    document.body.appendChild(keysDialog);
+  }
 
   var cur = null;      // answer of GET /v1/review/labels (with `revision`)
   var img = null;       // the frame image
@@ -117,6 +168,24 @@
   var seenLabels = [];                 // classes the queue saw (Class filter)
   var lastNudge = null;                // {i, t}: arrow nudges in a row share one undo step
   var labelPicker = null, showPicker = null, alPicker = null, classesPicker = null;
+  var backStack = [], fwdStack = [];   // frames left by Back (`p`) / by moving on, for `p` and `n`
+  var missingAsked = null;             // the frame "Anything missing?" was asked on
+  var askMissing = pref('askMissing', true);
+  var frameStart = 0;                  // when the frame was loaded (session pace)
+  var session = {
+    start: Date.now(), frames: [],     // per saved frame {s, acc, rej}
+    breakAt: Date.now() + 45 * 60000   // the next break note
+  };
+  // View-only image setting: `mode` auto (bright + equalised on night / IR frames, else off), off,
+  // bright (levels stretched, lifted), eq (histogram equalised); `gamma` on top ([ / ]).
+  var imgView = { mode: 'auto', gamma: 1 };
+  try {
+    var iv = JSON.parse(window.localStorage.getItem('bop.review.view') || 'null');
+    if (iv && /^(auto|off|bright|eq)$/.test(iv.mode)) imgView.mode = iv.mode;
+    if (iv && typeof iv.gamma === 'number' && iv.gamma >= 0.4 && iv.gamma <= 2.5) imgView.gamma = iv.gamma;
+  } catch (e) { /* the defaults */ }
+  var viewCache = null;                // {img, key, canvas}: the adjusted frame
+  var dups = { groups: [], of: {} };   // stacked boxes (dupGroups), as of the last render
 
   var COLORS = {
     pending: '#e8d000', review: '#ffa000', hint: '#f08c00', accepted: '#2e9e4f',
@@ -281,6 +350,159 @@
 
   function round1(v) { return Math.round(v * 10) / 10; }
 
+  function iou(a, b) {
+    var x0 = Math.max(a[0], b[0]), y0 = Math.max(a[1], b[1]), x1 = Math.min(a[2], b[2]), y1 = Math.min(a[3], b[3]);
+    var inter = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+    var u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter;
+    return u > 0 ? inter / u : 0;
+  }
+
+  var VEHICLES = ['car', 'truck', 'bus', 'van'];
+
+  // Two labels that can name one object: the same class, or two vehicle classes.
+  function sameObject(a, b) {
+    return a === b || (VEHICLES.indexOf(a) >= 0 && VEHICLES.indexOf(b) >= 0);
+  }
+
+  // Stacked boxes: the boxes (not rejected, not unwanted) of one object, IoU >= 0.7 and a label
+  // of the same object, grouped as NMS would. A group of 2 or more keeps one: a drawn box, else
+  // an accepted one, else the highest score. {groups: [{members, keeper}], of: {index: group}}.
+  function dupGroups() {
+    var bs = boxes(), n = bs.length, parent = [], i, j;
+    var live = function (b) { return b.state !== 'rejected' && !isUnwanted(b); };
+    var root = function (x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+    for (i = 0; i < n; i++) parent.push(i);
+    for (i = 0; i < n; i++) {
+      if (!live(bs[i])) continue;
+      for (j = i + 1; j < n; j++) {
+        if (live(bs[j]) && sameObject(bs[i].label, bs[j].label) && iou(bs[i].bbox, bs[j].bbox) >= 0.7) parent[root(j)] = root(i);
+      }
+    }
+    var byRoot = {}, out = { groups: [], of: {} };
+    for (i = 0; i < n; i++) {
+      if (live(bs[i])) (byRoot[root(i)] = byRoot[root(i)] || []).push(i);
+    }
+    var rank = function (k) {
+      var b = bs[k];
+      return (b.state === 'added' ? 20 : (b.state === 'accepted' ? 10 : 0)) + (b.score != null ? b.score : 0);
+    };
+    Object.keys(byRoot).forEach(function (r) {
+      var m = byRoot[r];
+      if (m.length < 2) return;
+      var g = { members: m, keeper: m.reduce(function (a, k) { return rank(k) > rank(a) ? k : a; }, m[0]) };
+      out.groups.push(g);
+      m.forEach(function (k) { out.of[k] = g; });
+    });
+    return out;
+  }
+
+  // The box of `i`'s stack it is compared with: the keeper, or (for the keeper) the most
+  // overlapping other one.
+  function dupPartner(i) {
+    var g = dups.of[i];
+    if (!g) return -1;
+    if (g.keeper !== i) return g.keeper;
+    var bs = boxes(), best = -1, bi = -1;
+    g.members.forEach(function (k) {
+      if (k === i) return;
+      var v = iou(bs[i].bbox, bs[k].bbox);
+      if (v > bi) { bi = v; best = k; }
+    });
+    return best;
+  }
+
+  // A frame with unsaved edits asks before it is left.
+  function leaveOk() {
+    if (!cur || !dirty) return true;
+    return window.confirm('Discard ' + (undo.length || 1) + ' unsaved change(s) on this frame?');
+  }
+
+  // ---- view-only image adjustment -------------------------------------------------------------
+
+  function darkScene() {
+    var s = cur && cur.record && cur.record.scene;
+    return s === 'night' || s === 'ir';
+  }
+
+  // The mode in effect on this frame: `auto` is bright + equalised on night / IR frames.
+  function imgMode() {
+    return imgView.mode === 'auto' ? (darkScene() ? 'eq' : 'off') : imgView.mode;
+  }
+
+  var IMG_NAMES = { off: 'off', bright: 'bright', eq: 'bright+eq' };
+
+  function imgLabel() {
+    return 'Image ' + (imgView.mode === 'auto' ? 'auto: ' + IMG_NAMES[imgMode()] : IMG_NAMES[imgView.mode]) +
+      (imgView.gamma !== 1 ? ' γ' + imgView.gamma.toFixed(2) : '');
+  }
+
+  function setImgView(mode, gamma) {
+    imgView.mode = mode;
+    imgView.gamma = gamma;
+    try { window.localStorage.setItem('bop.review.view', JSON.stringify(imgView)); } catch (e) { /* not kept */ }
+    say(imgLabel() + ' (view only: the frame is not changed).');
+    draw();
+  }
+
+  // `b`: auto -> off -> bright -> bright + equalised -> auto.
+  function cycleImg() {
+    var order = ['auto', 'off', 'bright', 'eq'];
+    setImgView(order[(order.indexOf(imgView.mode) + 1) % order.length], imgView.gamma);
+  }
+
+  // `[` / `]`: darker / brighter (gamma); back at 1 snaps to it.
+  function stepGamma(d) {
+    var g = clamp(imgView.gamma * (d > 0 ? 1 / 0.85 : 0.85), 0.4, 2.5);
+    if (Math.abs(g - 1) < 0.04) g = 1;
+    setImgView(imgView.mode, Math.round(g * 100) / 100);
+  }
+
+  // A 256-entry table from the frame's luma histogram: `bright` stretches the levels (1% .. 99.5%)
+  // and lifts them, `eq` mostly equalises them; the gamma on top.
+  function viewLut(hist, total, mode, gamma) {
+    var lut = new Uint8ClampedArray(256), cdf = new Float64Array(256), acc = 0, i;
+    for (i = 0; i < 256; i++) { acc += hist[i]; cdf[i] = acc / total; }
+    var lo = 0, hi = 255;
+    while (lo < 254 && cdf[lo] < 0.01) lo++;
+    while (hi > lo + 1 && cdf[hi - 1] >= 0.995) hi--;
+    var g = gamma * (mode === 'bright' ? 1.5 : 1);
+    for (i = 0; i < 256; i++) {
+      var v = i / 255;
+      if (mode !== 'off') v = clamp((i - lo) / Math.max(1, hi - lo), 0, 1);
+      if (mode === 'eq') v = 0.75 * cdf[i] + 0.25 * v;
+      lut[i] = Math.round(255 * Math.pow(v, 1 / g));
+    }
+    return lut;
+  }
+
+  // What the frame and the close-up draw: the frame, or a copy of it through the table (made
+  // again only when the frame or the setting changes; the saved frame never changes).
+  function viewSource() {
+    if (!img || !img.complete || !img.naturalWidth) return null;
+    var mode = imgMode();
+    if (mode === 'off' && imgView.gamma === 1) return img;
+    var key = mode + ':' + imgView.gamma;
+    if (viewCache && viewCache.img === img && viewCache.key === key) return viewCache.canvas;
+    try {
+      var w = img.naturalWidth, h = img.naturalHeight;
+      var oc = (viewCache && viewCache.canvas) || document.createElement('canvas');
+      oc.width = w; oc.height = h;
+      var c = oc.getContext('2d');
+      c.drawImage(img, 0, 0);
+      var data = c.getImageData(0, 0, w, h), d = data.data, i;
+      // The histogram from about 250k pixels.
+      var hist = new Float64Array(256), n = 0, step = Math.max(1, Math.floor(d.length / 4 / 250000)) * 4;
+      for (i = 0; i < d.length; i += step) { hist[(d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8]++; n++; }
+      var lut = viewLut(hist, n || 1, mode, imgView.gamma);
+      for (i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+      c.putImageData(data, 0, 0);
+      viewCache = { img: img, key: key, canvas: oc };
+      return oc;
+    } catch (e) {
+      return img;   // a frame the page cannot read back: shown as it is
+    }
+  }
+
   // ---- view (zoom / pan) --------------------------------------------------------------------
 
   // Canvas pixels per CSS pixel.
@@ -347,6 +569,10 @@
     if (fitBtn) fitBtn.hidden = !zoomed;
     if (zoomBoxBtn) zoomBoxBtn.hidden = !boxes()[selected];
     if (zoomText) zoomText.textContent = zoomed ? Math.round(view.z * 100) + '%' : '';
+    if (imgBtn) {
+      imgBtn.textContent = imgLabel();
+      imgBtn.title = 'View only: b cycles auto / off / bright / bright + equalised, [ and ] darker / brighter, Shift+0 resets';
+    }
   }
 
   // ---- drawing ------------------------------------------------------------------------------
@@ -377,7 +603,8 @@
     ctx.clearRect(0, 0, W, H);
     var z = view.z;
     ctx.setTransform(z, 0, 0, z, -view.ox * z, -view.oy * z);
-    if (img && img.complete && img.naturalWidth) ctx.drawImage(img, 0, 0, W, H);
+    var src = viewSource();
+    if (src) ctx.drawImage(src, 0, 0, W, H);
     drawCrop();
     if (!cur || hideBoxes) return;
     var lw = lineWidth() / z;
@@ -525,15 +752,48 @@
     c.clearRect(0, 0, pw, ph);
     c.imageSmoothingEnabled = true;
     c.imageSmoothingQuality = 'high';
-    c.drawImage(img, x0 * kx, y0 * ky, sw * kx, sh * ky, 0, 0, pw, ph);
+    c.drawImage(viewSource() || img, x0 * kx, y0 * ky, sw * kx, sh * ky, 0, 0, pw, ph);
     // A thin dashed outline just outside the box: the object's edges stay visible.
     var k = scale * dpr, o = 2 * dpr;
     c.lineWidth = 1.5 * dpr;
     c.setLineDash([5 * dpr, 3 * dpr]);
     c.strokeStyle = COLORS[look(b)] || '#ffffff';
-    c.strokeRect((b.bbox[0] - x0) * k - o, (b.bbox[1] - y0) * k - o, bw * k + 2 * o, bh * k + 2 * o);
+    var rx = (b.bbox[0] - x0) * k - o, ry = (b.bbox[1] - y0) * k - o, rw = bw * k + 2 * o, rh = bh * k + 2 * o;
+    c.strokeRect(rx, ry, rw, rh);
+    c.setLineDash([]);
+    cropTag(c, b, rx, ry, rh, pw, ph, dpr);
     cropCap.textContent = 'Box ' + (selected + 1) + ' (' + b.label + '), ' + Math.round(bw) + ' x ' + Math.round(bh) + ' px, ' +
       (Math.round(scale * 10) / 10) + 'x';
+  }
+
+  // The close-up's tag: the class at a glance (bold), the score, the decision so far (? flagged,
+  // ✓ accepted / drawn, ✗ rejected) and the labelers' class when they name another one. Above the
+  // outline when there is room, else below it, else inside its top; kept within the close-up.
+  function cropTag(c, b, rx, ry, rh, pw, ph, dpr) {
+    var l = look(b);
+    var mark = l === 'review' ? '? ' : (l === 'accepted' || l === 'added' ? '✓ ' : (l === 'rejected' ? '✗ ' : ''));
+    var main = mark + b.label;
+    var extra = (b.score != null ? ' ' + fmtScore(b.score) : '') +
+      (b.auto_label && b.auto_label !== b.label ? ' · labelers: ' + b.auto_label : '');
+    var fs = 14 * dpr, pad = 5 * dpr, th = fs + 2 * pad;
+    var bold = '600 ' + fs + 'px system-ui, sans-serif', thin = (fs * 0.85) + 'px system-ui, sans-serif';
+    c.font = bold;
+    var mw = c.measureText(main).width;
+    c.font = thin;
+    var tw = Math.min(pw, mw + c.measureText(extra).width + 2 * pad);
+    var top;
+    if (ry - th >= 0) top = ry - th;
+    else if (ry + rh + th <= ph) top = ry + rh;
+    else top = Math.max(0, ry);
+    var tx = clamp(rx, 0, Math.max(0, pw - tw));
+    c.fillStyle = COLORS[l] || '#ffffff';
+    c.fillRect(tx, top, tw, th);
+    c.fillStyle = '#000000';
+    c.textBaseline = 'middle';
+    c.font = bold;
+    c.fillText(main, tx + pad, top + th / 2);
+    c.font = thin;
+    c.fillText(extra, tx + pad + mw, top + th / 2);
   }
 
   // ---- side panel ---------------------------------------------------------------------------
@@ -637,6 +897,7 @@
     li.appendChild(el('span', 'bx-name', b.label + (b.auto_label && b.auto_label !== b.label ? ' (' + b.auto_label + '?)' : '')));
     li.appendChild(shortState(b));
     if (b.state !== 'pending' && !b._checked) li.appendChild(el('span', 'rv-chip warn', 'to check'));
+    if (dups.of[i] && dups.of[i].keeper !== i) li.appendChild(el('span', 'rv-chip warn', 'dup'));
     li.appendChild(el('span', 'bx-score muted', fmtScore(b.score)));
     li.addEventListener('click', function () { select(i); });
     return li;
@@ -657,6 +918,7 @@
     var t = b.triage === 'review' ? el('span', 'rv-chip warn', 'auto: review') : triageChip(b);
     if (t && b.why && b.why.length) t.title = b.why.join('; ');
     if (t) chips.appendChild(t);
+    if (dups.of[i] && dups.of[i].keeper !== i) chips.appendChild(el('span', 'rv-chip warn', 'dup'));
     li.appendChild(chips);
     var ev = evidence(b);
     if (ev) li.appendChild(el('span', 'bx-note', ev));
@@ -668,6 +930,7 @@
   function renderSide() {
     boxList.textContent = '';
     var bs = boxes();
+    dups = dupGroups();
     // Pending review boxes first; each keeps its number (the one on the canvas).
     var order = [];
     bs.forEach(function (b, i) { if (isReview(b)) order.push(i); });
@@ -714,7 +977,8 @@
     var b = boxes()[selected];
     if (!b) {
       decide.appendChild(el('div', 'rv-q', p.total
-        ? (p.undecided || p.unchecked ? 'No box selected: j selects the next one, drag on the frame to draw one.' : 'Every box decided: s saves.')
+        ? (p.undecided || p.unchecked ? 'No box selected: j selects the next one, drag on the frame to draw one.'
+          : (missingAsked === cur.frame ? 'Anything missing? Look over the whole frame and drag to draw a missed object; s saves.' : 'Every box decided: s saves.'))
         : 'No box: drag on the frame to draw one, or e confirms it empty.'));
     } else {
       var i = selected;
@@ -735,6 +999,8 @@
       }
       if (b.triage === 'review' && b.why && b.why.length) why.push(b.why.join('; '));
       else if (b.score != null) why.push('score ' + fmtScore(b.score));
+      // Most verification errors are on small objects: say so (the close-up is at least 2x).
+      if (Math.min(b.bbox[2] - b.bbox[0], b.bbox[3] - b.bbox[1]) < 24) why.unshift('small: check closely');
       if (why.length) decide.appendChild(el('div', 'rv-q-why muted', why.join(' · ')));
       var btns = el('div', 'rv-q-btns');
       btns.appendChild(decideButton(yes, 'a', 'ok', acceptSelected));
@@ -747,6 +1013,15 @@
       other.setAttribute('aria-expanded', classGrid ? 'true' : 'false');
       btns.appendChild(other);
       decide.appendChild(btns);
+      var mate = dupPartner(i);
+      if (mate >= 0) {
+        var mb = boxes()[mate];
+        var dl = el('div', 'rv-q-dup');
+        dl.appendChild(el('span', null, 'Overlaps box ' + (mate + 1) + ' (' + mb.label + (mb.score != null ? ' ' + fmtScore(mb.score) : '') + ')' +
+          (dups.of[i].keeper === i ? ', this one kept as the best' : '')));
+        dl.appendChild(decideButton('Reject as duplicate', 'u', 'bad', function () { rejectWith(i, 'duplicate'); }));
+        decide.appendChild(dl);
+      }
       if (classGrid) {
         var g = el('div', 'rv-q-classes');
         visible().forEach(function (c, n) {
@@ -758,13 +1033,26 @@
         decide.appendChild(g);
       }
     }
-    if (p.total) {
+    // Stacked boxes on the frame (in the progress line): keep the best of each stack, the rest
+    // go as duplicates.
+    var extra = dupDrops(dups).length;
+    var stackBtn = null;
+    if (extra) {
+      stackBtn = decideButton('Reject ' + extra + ' stacked dup' + (extra === 1 ? '' : 's'), 'Shift+U', 'secondary', rejectDuplicates);
+      stackBtn.title = 'Keep the best box of each of the ' + dups.groups.length + ' stack(s) of overlapping boxes, reject the others as duplicates';
+    }
+    if (p.total || stackBtn) {
       var line = el('div', 'rv-progress');
-      var bar = el('progress');
-      bar.max = p.total;
-      bar.value = p.done;
-      line.appendChild(bar);
-      line.appendChild(el('span', 'muted', p.done + '/' + p.total + ' done · ' + p.undecided + ' undecided' + (p.unchecked ? ' · ' + p.unchecked + ' to check' : '')));
+      if (p.total) {
+        var bar = el('progress');
+        bar.max = p.total;
+        bar.value = p.done;
+        line.appendChild(bar);
+      }
+      var row = el('div', 'rv-progress-row');
+      row.appendChild(el('span', 'muted', p.total ? p.done + '/' + p.total + ' done · ' + p.undecided + ' undecided' + (p.unchecked ? ' · ' + p.unchecked + ' to check' : '') : ''));
+      if (stackBtn) row.appendChild(stackBtn);
+      line.appendChild(row);
       decide.appendChild(line);
     }
   }
@@ -814,19 +1102,59 @@
 
   // Deciding a box (also confirming an earlier decision) checks it and moves the selection on to
   // the next box to review, then to the next decided box to double-check (if any).
-  function setState(i, state) {
+  // `why`: the reviewer's reason for a rejection (markRejected).
+  function setState(i, state, why) {
     var b = boxes()[i];
     if (!b) return;
     // Confirming a box already checked in that state only moves on (no undo step).
     if (!(b.state === state && b._checked)) {
       snapshot();
-      b.state = state;
-      b._checked = true;
+      if (state === 'rejected') markRejected(b, why);
+      else { b.state = state; b._checked = true; }
       if (state !== 'rejected' && cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
     }
     var next = nextUndecided(i);
     select(next >= 0 ? next : i, true);
     sayProgress();
+  }
+
+  // Every rejection by the reviewer goes through here (no undo step, no move: the callers).
+  // `why` ('duplicate', ...) is not recorded yet: the label format has no field for it.
+  function markRejected(b, why) {
+    b.state = 'rejected';
+    b._checked = true;
+  }
+
+  // Reject box `i` (`why`: the reason, see markRejected), then the next box.
+  function rejectWith(i, why) { setState(i, 'rejected', why); }
+
+  // The non-drawn boxes of the stacks that are not their keeper.
+  function dupDrops(d) {
+    var out = [];
+    d.groups.forEach(function (g) {
+      g.members.forEach(function (k) { if (k !== g.keeper && boxes()[k].source !== 'human') out.push(k); });
+    });
+    return out;
+  }
+
+  // Shift+U: keep the best box of each stack, reject the others as duplicates (one undo step).
+  function rejectDuplicates() {
+    if (!cur) return;
+    var d = dupGroups(), drop = dupDrops(d);
+    if (!drop.length) { say('No stacked boxes to reject on this frame.'); return; }
+    snapshot();
+    drop.forEach(function (k) { markRejected(boxes()[k], 'duplicate'); });
+    var sb = boxes()[selected];
+    select(sb && sb.state !== 'rejected' ? selected : nextUndecided(selected), true);
+    say('Rejected ' + drop.length + ' duplicate box(es) in ' + d.groups.length + ' stack(s); the best box of each stays for you to decide (z undoes).');
+  }
+
+  // `u`: reject the selected box as a duplicate of the box it overlaps.
+  function rejectDupSelected() {
+    if (!boxes()[selected]) { say('No box selected: j selects one; Shift+U clears every stack.'); return; }
+    dups = dupGroups();
+    if (dupPartner(selected) < 0) { say('Box ' + (selected + 1) + ' overlaps no other box of its object.'); return; }
+    rejectWith(selected, 'duplicate');
   }
 
   // `a`: accept the selected box (a drawn one is kept), then the next one.
@@ -841,7 +1169,7 @@
     var b = boxes()[selected];
     if (!b) return;
     if (b.source === 'human') { removeBox(selected); var n = nextUndecided(-1); if (n >= 0) select(n, true); sayProgress(); return; }
-    setState(selected, 'rejected');
+    rejectWith(selected, null);
   }
 
   function relabel(i, label) {
@@ -1258,10 +1586,10 @@
   }
 
   function fillKeyHint() {
-    var k = $('rv-key-classes');
-    if (!k) return;
     var shown = visible().slice(0, 10).map(function (c, i) { return ((i + 1) % 10) + ' ' + c; });
-    k.textContent = shown.length ? ' (' + shown.join(', ') + ')' : '';
+    Array.prototype.forEach.call(document.querySelectorAll('.rv-key-classes, #rv-key-classes'), function (k) {
+      k.textContent = shown.length ? ' (' + shown.join(', ') + ')' : '';
+    });
   }
 
   function setMeta() {
@@ -1299,13 +1627,20 @@
     prefetchImg.src = '/dataset/image?path=' + encodeURIComponent(next);
   }
 
-  function loadFrame(frame) {
+  // `nav`: 'back' (`p`) or 'forward' (`n` after Back); else a move on, which forgets the frames
+  // Back left.
+  function loadFrame(frame, nav) {
     return api('/v1/review/labels?frame=' + encodeURIComponent(frame)).then(function (j) {
+      if (cur && cur.frame !== j.frame) {
+        if (nav === 'back') fwdStack.push(cur.frame);
+        else { backStack.push(cur.frame); if (nav !== 'forward') fwdStack = []; }
+        if (backStack.length > 200) backStack.shift();
+      }
       cur = j;
       if (Array.isArray(j.classes)) classes = j.classes;
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null;
-      emptyBackup = null;
+      emptyBackup = null; missingAsked = null; frameStart = Date.now();
       canvas.width = j.width || 640;
       canvas.height = j.height || 360;
       view.z = 1; view.ox = 0; view.oy = 0;
@@ -1339,6 +1674,7 @@
       if (j.wrapped) text = (text ? text + ' ' : '') + 'Back to the first frame of the queue.';
       if (text || note === '') say(text);
       if (!j.item) {
+        if (cur) backStack.push(cur.frame);
         cur = null; img = null; undo = []; dirty = false; selected = -1;
         showNone(true); setMeta(); refresh();
         return;
@@ -1384,6 +1720,16 @@
         if (!(selected >= 0 && isUnchecked(bs[selected]))) select(nextUndecided(-1), true);
         return;
       }
+      // Then once per frame: missed objects are the commonest label error. The whole frame,
+      // every box at full strength (no selection, no zoom; `x` keeps following on the next).
+      if (askMissing && missingAsked !== cur.frame && !cur.labels.empty_confirmed) {
+        missingAsked = cur.frame;
+        selected = -1;
+        view.z = 1; view.ox = 0; view.oy = 0;
+        refresh();
+        say('Anything missing? Look over the whole frame and drag to draw a missed object; s saves.');
+        return;
+      }
     }
     busy = true;
     var body = JSON.parse(JSON.stringify(cur.labels));   // keeps auto_run, bulk_accepted, ...
@@ -1404,6 +1750,13 @@
     if (cur.revision != null) url += '&revision=' + encodeURIComponent(cur.revision);
     postJson(url, body).then(function (j) {
       dirty = false;
+      if (status === 'reviewed') noteSaved(body);
+      // After Back: on to the frame Back left (the counts refresh), else the queue's next.
+      if (fwdStack.length) {
+        say(j.message || 'Saved.');
+        loadNext(null, null, true);
+        return loadFrame(fwdStack.pop(), 'forward');
+      }
       return loadNext(frame, j.message || 'Saved.');
     }).catch(function (e) {
       if (e.conflict) showConflict(e.message);
@@ -1411,29 +1764,112 @@
     }).then(function () { busy = false; });
   }
 
+  // `n`: the next frame without saving; after Back, the frame Back left.
   function skipToNext() {
     if (!cur) return loadNext();
-    if (dirty && !window.confirm('Leave this frame without saving your changes?')) return;
+    if (!leaveOk()) return;
+    if (fwdStack.length) {
+      loadFrame(fwdStack.pop(), 'forward').then(function () { say(''); }).catch(function (e) { say(e.message, true); });
+      return;
+    }
     loadNext(cur.frame, '');
   }
+
+  // `p`: the previous frame of this session, as saved (or not yet).
+  function goBack() {
+    if (!backStack.length) { say('No earlier frame in this session.'); return; }
+    if (!leaveOk()) return;
+    loadFrame(backStack.pop(), 'back').then(function () {
+      say('Back to an earlier frame (' + (cur.saved ? 'saved as ' + cur.labels.status : 'not saved yet') + '): n returns, s saves it and returns.');
+    }).catch(function (e) { say(e.message, true); });
+  }
+
+  // ---- session pace -------------------------------------------------------------------------
+
+  function median(a) {
+    var s = a.slice().sort(function (x, y) { return x - y; }), m = s.length >> 1;
+    return s.length ? (s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2) : 0;
+  }
+
+  function acceptRate(fs) {
+    var a = 0, r = 0;
+    fs.forEach(function (f) { a += f.acc; r += f.rej; });
+    return a + r ? a / (a + r) : null;
+  }
+
+  function seconds(fs) { return fs.map(function (f) { return f.s; }); }
+
+  // A saved frame: its time (load to save, at most 10 min) and what saving made of its model boxes.
+  function noteSaved(body) {
+    var acc = 0, rej = 0;
+    body.boxes.forEach(function (b) {
+      if (b.source === 'human') return;
+      var r = resolved(b);
+      if (r === 'accepted') acc++; else if (r === 'rejected') rej++;
+    });
+    session.frames.push({ s: Math.min(600, (Date.now() - frameStart) / 1000), acc: acc, rej: rej });
+    showSession();
+  }
+
+  // "Session 23 frames · 41 s/frame · 82% accepted · 37 min", a note when the last 10 frames went
+  // much faster while accepting more (rubber-stamping), and a break note every 45 min.
+  function showSession() {
+    if (!sessionLine) return;
+    var fs = session.frames, min = Math.floor((Date.now() - session.start) / 60000);
+    sessionLine.textContent = '';
+    if (!fs.length) return;
+    var rate = acceptRate(fs);
+    var parts = ['Session ' + fs.length + ' frame' + (fs.length === 1 ? '' : 's'), Math.round(median(seconds(fs))) + ' s/frame'];
+    if (rate != null) parts.push(Math.round(rate * 100) + '% accepted');
+    parts.push(min + ' min');
+    sessionLine.appendChild(el('span', null, parts.join(' · ')));
+    if (fs.length >= 15) {
+      var last = fs.slice(-10), lr = acceptRate(last);
+      if (median(seconds(last)) < 0.4 * median(seconds(fs)) && lr != null && rate != null && lr > rate) {
+        sessionLine.appendChild(el('span', 'rv-chip warn', 'Going fast: check the small boxes'));
+      }
+    }
+    if (Date.now() >= session.breakAt) {
+      var note = el('span', 'rv-chip warn', 'Take a break? ');
+      note.appendChild(button('Later', function () { session.breakAt = Date.now() + 45 * 60000; showSession(); }, 'secondary'));
+      sessionLine.appendChild(note);
+    }
+  }
+  setInterval(showSession, 30000);
 
   $('rv-save').addEventListener('click', function () { save('reviewed'); });
   $('rv-skip').addEventListener('click', function () { save('skipped'); });
   $('rv-next').addEventListener('click', skipToNext);
+  if (backBtn) backBtn.addEventListener('click', goBack);
   $('rv-undo').addEventListener('click', doUndo);
   $('rv-accept-all').addEventListener('click', acceptProposals);
+  if (imgBtn) imgBtn.addEventListener('click', function () { cycleImg(); canvas.focus({ preventScroll: true }); });
+  if (missingBox) {
+    missingBox.checked = askMissing;
+    missingBox.addEventListener('change', function () { askMissing = missingBox.checked; setPref('askMissing', askMissing); });
+  }
   emptyBox.addEventListener('change', function () { confirmEmpty(emptyBox.checked); });
+  // A filter change with unsaved edits asks first; kept, the frame stays and the counts follow.
+  function filterReload() {
+    if (leaveOk()) { loadNext(); return; }
+    loadNext(null, null, true);
+    say('Kept this frame with its unsaved changes; the new filters apply from the next frame.');
+  }
   var filterTimer = null;
   function filterChanged() {
     if (filterTimer) clearTimeout(filterTimer);
-    filterTimer = setTimeout(function () { filterTimer = null; loadNext(); }, 200);
+    filterTimer = setTimeout(function () { filterTimer = null; filterReload(); }, 200);
   }
   filtersForm.addEventListener('change', function (ev) {
     // The class picker reports through its own onChange (one reload per change).
     if (ev.target && ev.target.closest && ev.target.closest('.cp')) return;
-    loadNext();
+    filterReload();
   });
-  filtersForm.addEventListener('submit', function (ev) { ev.preventDefault(); loadNext(); });
+  filtersForm.addEventListener('submit', function (ev) { ev.preventDefault(); filterReload(); });
+  // Closing or reloading the tab with unsaved edits asks (the browser's own prompt).
+  window.addEventListener('beforeunload', function (ev) {
+    if (cur && dirty) { ev.preventDefault(); ev.returnValue = ''; }
+  });
 
   // A field that takes the key itself. A checkbox / radio does not (the "Confirmed empty" box
   // keeps focus after a click); a box's class select takes only its own navigation keys.
@@ -1445,6 +1881,101 @@
     }
     return tag === 'TEXTAREA' || tag === 'SELECT' || !!(t && t.isContentEditable);
   }
+
+  // ---- keys: one list for the table under Panel options and the `?` overlay ----------------
+
+  // [group, key, text]; a text of null is the class row (filled by fillKeyHint), a key of '' a note.
+  var KEYS = [
+    ['Decide', 'a', 'accept the selected box (keep a drawn one) and go to the next'],
+    ['Decide', 'r', 'reject the selected box (delete a drawn one) and go to the next'],
+    ['Decide', '1-9, 0', null],
+    ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps'],
+    ['Decide', 'Shift+U', 'stacked boxes: keep the best of each stack, reject the others as duplicates'],
+    ['Decide', 'Shift+A', 'accept proposals: the pending boxes saving would accept (hints stay pending)'],
+    ['Decide', 'e', 'confirmed empty (rejects every box)'],
+    ['Decide', 'Delete', 'delete a drawn box, reject a model box'],
+    ['Decide', 'z', 'undo'],
+    ['Decide', 's, Enter', 'save & next; asks first about flagged (?) boxes, boxes not checked yet, then "Anything missing?" (Panel options)'],
+    ['Decide', 'drag', 'on a handle: resize; inside the selected box: move; elsewhere: draw a box'],
+    ['Decide', 'arrows', 'move the selected box 1 px (Shift: 10 px)'],
+    ['Decide', '', 'The next box is the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked to check).'],
+    ['Navigate', 'j / k', 'select the next / previous box'],
+    ['Navigate', 'Esc', 'no box selected'],
+    ['Navigate', 'n', 'next frame without saving (after Back: the frame you came from)'],
+    ['Navigate', 'p', 'back to the previous frame of this session (as saved)'],
+    ['Navigate', 'x', 'zoom to the selected box and follow the selection (the next box, the next frame) until f, the wheel or a pan'],
+    ['Navigate', 'f', 'fit (zoom out)'],
+    ['Navigate', 'wheel', 'zoom about the pointer (up to 8x)'],
+    ['Navigate', 'right / middle drag, Space + drag', 'pan'],
+    ['View', 'b', 'image (view only): auto, off, bright, bright + equalised; auto = bright + equalised on night / IR frames'],
+    ['View', '[ / ]', 'image darker / brighter (gamma)'],
+    ['View', 'Shift+0', 'image back to auto, gamma 1'],
+    ['View', 'v', 'spotlight on / off: the frame dimmed outside the selected box, the other boxes faint'],
+    ['View', 'h (hold)', 'hide the boxes'],
+    ['View', 'l', 'labels on the boxes on / off'],
+    ['View', '?', 'this list (Esc closes it)']
+  ];
+
+  function keyRows(tbody, group, withId) {
+    KEYS.forEach(function (k) {
+      if (group && k[0] !== group) return;
+      var tr = el('tr');
+      tr.appendChild(el('td', null, k[1]));
+      var td = el('td');
+      if (k[2] == null) {
+        td.appendChild(document.createTextNode('class 1-10'));
+        var span = el('span', 'rv-key-classes');
+        if (withId) span.id = 'rv-key-classes';
+        td.appendChild(span);
+        td.appendChild(document.createTextNode(': relabel the selected box (accepting it) and go to the next, else the class of new boxes; the bar\'s It\'s a… lists them all'));
+      } else td.textContent = k[2];
+      if (!k[1]) td.className = 'muted';
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderKeys() {
+    var tbody = document.querySelector('.review-keys tbody');
+    if (tbody) {
+      tbody.textContent = '';
+      ['Decide', 'Navigate', 'View'].forEach(function (g) {
+        var tr = el('tr', 'rv-keys-group');
+        var th = el('th', null, g);
+        th.colSpan = 2;
+        tr.appendChild(th);
+        tbody.appendChild(tr);
+        keyRows(tbody, g, true);
+      });
+    }
+    keysDialog.textContent = '';
+    // Close first: the dialog focuses it on open, and it should not scroll the list to its end.
+    var head = el('div', 'rv-keys-head');
+    head.appendChild(el('h3', null, 'Keyboard'));
+    head.appendChild(button('Close', function () { keysDialog.close(); }, 'secondary'));
+    keysDialog.appendChild(head);
+    var cols = el('div', 'rv-keys-cols');
+    ['Decide', 'Navigate', 'View'].forEach(function (g) {
+      var col = el('section');
+      col.appendChild(el('h4', null, g));
+      var t = el('table', 'review-keys');
+      var tb = el('tbody');
+      keyRows(tb, g, false);
+      t.appendChild(tb);
+      col.appendChild(t);
+      cols.appendChild(col);
+    });
+    keysDialog.appendChild(cols);
+  }
+
+  function openKeys() {
+    if (keysDialog.open) return;
+    if (keysDialog.showModal) keysDialog.showModal(); else keysDialog.setAttribute('open', '');
+  }
+  keysDialog.addEventListener('click', function (ev) { if (ev.target === keysDialog) keysDialog.close(); });
+  keysDialog.addEventListener('close', function () { canvas.focus({ preventScroll: true }); });
+  if (keysBtn) keysBtn.addEventListener('click', openKeys);
+  renderKeys();
 
   document.addEventListener('keydown', function (ev) {
     if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
@@ -1477,6 +2008,12 @@
       draw();
     } else if (k === 'x') zoomToSelected();
     else if (k === 'f') fit();
+    else if (k === 'b') cycleImg();
+    else if (k === '[' || k === ']') stepGamma(k === ']' ? 1 : -1);
+    else if (ev.code === 'Digit0' && ev.shiftKey) setImgView('auto', 1);
+    else if (k === 'p') goBack();
+    else if (k === 'u') { if (ev.shiftKey) rejectDuplicates(); else rejectDupSelected(); }
+    else if (k === '?') openKeys();
     else if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
       var step = ev.shiftKey ? 10 : 1;
       handled = selected >= 0 && nudge(
@@ -1494,7 +2031,7 @@
     else if (k === 'Delete' || k === 'Backspace') {
       if (selected >= 0) {
         if (boxes()[selected].source === 'human') removeBox(selected);
-        else setState(selected, 'rejected');
+        else rejectWith(selected, null);
       }
     } else if (k === 'Escape') select(-1);
     else if (/^[0-9]$/.test(k)) pickClass(k === '0' ? 9 : Number(k) - 1);
@@ -1925,10 +2462,12 @@
   });
 
   function setFolder(dir) {
+    if (!leaveOk()) return;
     var box = $('rv-folder-msg');
     box.textContent = 'Switching...';
     box.className = 'form-msg';
     postJson('/v1/review/folder', { dir: dir }).then(function () {
+      dirty = false;   // asked above: no second prompt on the reload
       location.reload();
     }).catch(function (e) { box.textContent = e.message; box.className = 'form-msg error-text'; });
   }
