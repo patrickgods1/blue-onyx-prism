@@ -2,10 +2,14 @@
 {% block title %}Review{% endblock %}
 {% block content %}
 <h1>Review</h1>
-<p class="warn">Frames collected from your cameras (Dataset page), one at a time, most uncertain first. Decide every box: accept the real objects, reject the false ones (kept as hard negatives), restore a wrongly suppressed box, draw what the model missed. They stay on this machine in <code>{{ dir }}</code>. Format: <code>docs/DATASET.md</code>. After an auto-label run, boxes marked <em>auto: accept</em> are accepted on save and <em>auto: review</em> ones (marked ?) ask first; frames with only accept boxes can be accepted in bulk.</p>
+<details class="help">
+  <summary>How review works</summary>
+  <p>Frames collected from your cameras (Dataset page), one at a time, most uncertain first. Decide every box: accept the real objects, reject the false ones (kept as hard negatives), restore a wrongly suppressed box, draw what the model missed. They stay on this machine in <code>{{ dir }}</code>. Format: <code>docs/DATASET.md</code>. After an auto-label run, boxes marked <em>auto: accept</em> are accepted on save and <em>auto: review</em> ones (marked ?) ask first; frames with only accept boxes can be accepted in bulk.</p>
+</details>
 
 <div id="review" data-classes="{{ classes_json }}">
-<div class="card">
+<details class="card rv-folder-card"{% if custom_dir %} open{% endif %}>
+  <summary>Folder under review: <code>{{ dir }}</code>{% if custom_dir %} <span class="muted">(not the dataset folder)</span>{% endif %}</summary>
   <form id="rv-folder" class="inline-row">
     <label class="grow">Folder under review <span class="with-browse"><input type="text" name="dir" value="{{ dir }}" list="rv-folders" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the folder of imported frames" hidden>Browse&hellip;</button></span></label>
     <button type="submit">Review this folder</button>
@@ -14,7 +18,7 @@
   <datalist id="rv-folders">{% for d in known_dirs %}<option value="{{ d }}">{% endfor %}</datalist>
   <p class="muted small">{% if custom_dir %}Reviewing another folder than the dataset folder (<code>{{ dataset_dir }}</code>). {% endif %}Choose where an import saved its frames (Training page, <em>Save frames to</em>); the queue, exports and auto-label runs of this page use it. Empty = the dataset folder.</p>
   <div id="rv-folder-msg" class="form-msg" role="status"></div>
-</div>
+</details>
 <div class="card">
   <div id="rv-counts" class="review-counts" role="status">Loading...</div>
   <form id="rv-filters" class="inline-row review-filters">
@@ -30,17 +34,16 @@
 
 <div class="review-grid">
   <div class="review-stage">
-    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-fit" class="small secondary" hidden>Fit</button></div>
+    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-zoombox" class="small secondary" hidden>Zoom to box</button><button type="button" id="rv-fit" class="small secondary" hidden>Fit</button></div>
     <canvas id="rv-canvas" width="640" height="360" tabindex="0" aria-label="The frame with its boxes. Click a box to select it, drag its handles to resize it, drag inside it to move it, drag elsewhere to draw a new one; the wheel zooms."></canvas>
     <p id="rv-none" class="empty" hidden>No frame matches the filters. Send frames to review from the <a href="/dataset">Dataset</a> page, or show all collected frames.</p>
   </div>
   <aside class="review-side card">
-    <div class="rv-show-of"><span class="field-label" id="rv-show-cap">Show boxes of</span> <div id="rv-show-picker" aria-labelledby="rv-show-cap"></div></div>
-    <label>Class for new boxes <select id="rv-class">{% for c in classes %}<option value="{{ c }}">{{ loop.index }}. {{ c }}</option>{% endfor %}</select></label>
-    <figure id="rv-crop-wrap" class="review-crop" hidden><canvas id="rv-crop" width="1" height="1" aria-label="The selected box, enlarged"></canvas><figcaption id="rv-crop-cap" class="muted"></figcaption></figure>
+    <figure id="rv-crop-wrap" class="review-crop" hidden><div class="rv-crop-area"><canvas id="rv-crop" width="1" height="1" aria-label="The selected box, enlarged"></canvas></div><figcaption><span id="rv-crop-cap" class="muted"></span> <button type="button" id="rv-crop-wide" class="small secondary rv-crop-wide">Larger close-up</button></figcaption></figure>
+    <div id="rv-decide" class="rv-decide" aria-live="polite"></div>
     <ol id="rv-boxes" class="review-boxes" aria-label="Boxes"></ol>
     <label class="check"><input type="checkbox" id="rv-empty"> Confirmed empty (no object of any class)</label>
-    <div class="inline-row">
+    <div class="inline-row rv-actions">
       <button type="button" id="rv-save">Save &amp; next</button>
       <button type="button" id="rv-accept-all" class="small secondary">Accept proposals</button>
       <button type="button" id="rv-skip" class="small secondary">Skip</button>
@@ -48,13 +51,19 @@
       <button type="button" id="rv-undo" class="small secondary">Undo</button>
     </div>
     <p id="rv-msg" class="form-msg" role="status"></p>
+    <details id="rv-panel-opts" class="rv-panel-opts">
+      <summary>Panel options</summary>
+      <div class="rv-show-of"><span class="field-label" id="rv-show-cap">Show boxes of</span> <div id="rv-show-picker" aria-labelledby="rv-show-cap"></div></div>
+      <label>Class for new boxes <select id="rv-class">{% for c in classes %}<option value="{{ c }}">{{ loop.index }}. {{ c }}</option>{% endfor %}</select></label>
     <details>
       <summary>Keyboard and colours</summary>
       <table class="review-keys">
         <tbody>
-          <tr><td>a</td><td>accept proposals: the pending boxes saving would accept (hints stay pending)</td></tr>
-          <tr><td>r</td><td>reject (or restore) the selected box</td></tr>
-          <tr><td>1-9, 0</td><td>class 1-10<span id="rv-key-classes"></span>: relabel the selected box, else the class of new boxes</td></tr>
+          <tr><td>a</td><td>accept the selected box (keep a drawn one) and go to the next</td></tr>
+          <tr><td>r</td><td>reject the selected box (delete a drawn one) and go to the next</td></tr>
+          <tr><td>Shift+A</td><td>accept proposals: the pending boxes saving would accept (hints stay pending)</td></tr>
+          <tr><td></td><td>The next box is the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked <em>to check</em>).</td></tr>
+          <tr><td>1-9, 0</td><td>class 1-10<span id="rv-key-classes"></span>: relabel the selected box (accepting it) and go to the next, else the class of new boxes; the bar's <em>It's a&hellip;</em> lists them all</td></tr>
           <tr><td>j / k</td><td>select the next / previous box</td></tr>
           <tr><td>Delete</td><td>delete a drawn box, reject a model box</td></tr>
           <tr><td>e</td><td>confirmed empty (rejects every box)</td></tr>
@@ -65,12 +74,15 @@
           <tr><td>arrows</td><td>move the selected box 1 px (Shift: 10 px)</td></tr>
           <tr><td>wheel</td><td>zoom about the pointer (up to 8x)</td></tr>
           <tr><td>right / middle drag, Space + drag</td><td>pan</td></tr>
+          <tr><td>x</td><td>zoom to the selected box and follow the selection (the next box, the next frame) until f, the wheel or a pan</td></tr>
           <tr><td>f</td><td>fit (zoom out)</td></tr>
+          <tr><td>v</td><td>spotlight on / off: the frame dimmed outside the selected box, the other boxes faint</td></tr>
           <tr><td>h (hold)</td><td>hide the boxes</td></tr>
           <tr><td>l</td><td>labels on the boxes on / off</td></tr>
         </tbody>
       </table>
-      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; decide it, or save twice for the default) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first.</p>
+      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; decide it, or save twice for the default) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; the pointer over a box shows its full tag.</p>
+    </details>
     </details>
   </aside>
 </div>

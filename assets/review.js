@@ -46,17 +46,68 @@
   var cropWrap = $('rv-crop-wrap');
   var cropCanvas = $('rv-crop');
   var cropCap = $('rv-crop-cap');
+  var grid = canvas.closest('.review-grid');
 
-  var cur = null;       // answer of GET /v1/review/labels (with `revision`)
+  // Per-viewer preferences (browser storage may be off: then the defaults).
+  function pref(key, dflt) {
+    try { var v = window.localStorage.getItem('bop.review.' + key); return v == null ? dflt : v === '1'; } catch (e) { return dflt; }
+  }
+  function setPref(key, on) {
+    try { window.localStorage.setItem('bop.review.' + key, on ? '1' : '0'); } catch (e) { /* not kept */ }
+  }
+
+  // The decision bar (the selected box's question) sits above the box list; an older page
+  // without it gets one made here.
+  var decide = $('rv-decide');
+  if (!decide) {
+    decide = document.createElement('div');
+    decide.id = 'rv-decide';
+    boxList.parentNode.insertBefore(decide, boxList);
+  }
+  decide.classList.add('rv-decide');
+  var zoomBoxBtn = $('rv-zoombox');
+  if (!zoomBoxBtn && fitBtn) {
+    zoomBoxBtn = document.createElement('button');
+    zoomBoxBtn.type = 'button';
+    zoomBoxBtn.id = 'rv-zoombox';
+    zoomBoxBtn.className = 'small secondary';
+    zoomBoxBtn.textContent = 'Zoom to box';
+    fitBtn.parentNode.insertBefore(zoomBoxBtn, fitBtn);
+  }
+  // "Show boxes of", "Class for new boxes" and the key table sit in the collapsed "Panel options"
+  // at the panel's foot (the box list takes the height); an older page gets it made here.
+  var side = boxList.closest('.review-side');
+  if (side && !$('rv-panel-opts')) {
+    var opts = document.createElement('details');
+    opts.id = 'rv-panel-opts';
+    opts.className = 'rv-panel-opts';
+    var sum = document.createElement('summary');
+    sum.textContent = 'Panel options';
+    opts.appendChild(sum);
+    [side.querySelector('.rv-show-of'), classSel && classSel.closest('label'), side.querySelector(':scope > details')]
+      .forEach(function (e) { if (e) opts.appendChild(e); });
+    side.appendChild(opts);
+  }
+  // The close-up goes first in the side panel.
+  if (cropWrap && cropWrap.parentNode && cropWrap !== cropWrap.parentNode.firstElementChild) {
+    cropWrap.parentNode.insertBefore(cropWrap, cropWrap.parentNode.firstElementChild);
+  }
+
+  var cur = null;      // answer of GET /v1/review/labels (with `revision`)
   var img = null;       // the frame image
   var selected = -1;    // index into cur.labels.boxes
   var undo = [];        // snapshots of cur.labels
   var dirty = false;
   var gesture = null;   // the pointer gesture in progress (see the canvas input section)
   var busy = false;
-  var view = { z: 1, ox: 0, oy: 0 };   // zoom and the frame point at the canvas's top left
+  var view = { z: 1, ox: 0, oy: 0, follow: false };   // zoom, the frame point at the canvas's top
+                                                      // left; `follow`: `x` zooms to each box
   var hideBoxes = false;               // `h` held
   var showTags = true;                 // `l` toggles
+  var spotlight = pref('spotlight', true);   // `v`: veil the frame and dim the other boxes
+  var wideSide = pref('wide', false);        // a larger close-up (wider side panel)
+  var hoverIdx = -1;                   // the box under the pointer (its tag shows in full)
+  var classGrid = false;               // the decision bar's "It's a..." class buttons open
   var spaceDown = false;               // Space held: left-drag pans
   var overCanvas = false;
   var guard = null;                    // {frame, count}: the save that warned about review boxes
@@ -119,7 +170,7 @@
 
   function snapshot() {
     if (!cur) return;
-    undo.push(JSON.stringify(cur.labels));
+    undo.push(JSON.stringify({ labels: cur.labels, selected: selected }));
     if (undo.length > 200) undo.shift();
     dirty = true;
   }
@@ -168,8 +219,20 @@
     return -1;
   }
 
+  // A decided box (accepted, rejected, drawn) not looked at on this visit of the frame: the
+  // check pass steps through them once nothing is pending. `_checked` is page-only (not saved).
+  function isUnchecked(b) {
+    return b.state !== 'pending' && !b._checked && isShown(b);
+  }
+
+  function uncheckedCount() { return boxes().filter(isUnchecked).length; }
+
+  function undecidedCount() {
+    return boxes().filter(function (b) { return b.state === 'pending' && !isUnwanted(b); }).length;
+  }
+
   // The box to look at after `i` (wrapping; -1 for the first): the next review box, else the
-  // next pending one, else -1.
+  // next pending one, else (the check pass) the first unchecked decided one, else -1.
   function nextUndecided(i) {
     var bs = boxes();
     var tests = [isReview, function (b) { return b.state === 'pending' && !isUnwanted(b); }];
@@ -179,7 +242,16 @@
         if (j !== i && tests[t](bs[j])) return j;
       }
     }
+    for (var c = 0; c < bs.length; c++) if (c !== i && isUnchecked(bs[c])) return c;
     return -1;
+  }
+
+  // Where the frame's review stands, after a decision moved the selection on.
+  function sayProgress() {
+    var u = undecidedCount(), c = uncheckedCount();
+    if (u) say(u + ' box(es) still undecided.');
+    else if (c) say('Check pass: ' + c + ' accepted / rejected box(es) left to double-check (a keep / accept, r reject).');
+    else say('Every box decided and checked: s saves.');
   }
 
   function fmtScore(s) { return (typeof s === 'number') ? s.toFixed(2) : ''; }
@@ -225,7 +297,27 @@
   }
 
   function fit() {
-    view.z = 1; view.ox = 0; view.oy = 0;
+    view.z = 1; view.ox = 0; view.oy = 0; view.follow = false;
+    draw();
+  }
+
+  // Zoom so the box `b` with a margin fills about 60% of the view, centred on it.
+  function zoomTo(b) {
+    if (!b) return;
+    var W = canvas.width, H = canvas.height;
+    var bw = Math.max(MIN_BOX, b.bbox[2] - b.bbox[0]), bh = Math.max(MIN_BOX, b.bbox[3] - b.bbox[1]);
+    view.z = clamp(Math.min(W * 0.6 / bw, H * 0.6 / bh), 1, MAX_ZOOM);
+    view.ox = (b.bbox[0] + b.bbox[2]) / 2 - W / view.z / 2;
+    view.oy = (b.bbox[1] + b.bbox[3]) / 2 - H / view.z / 2;
+    clampView();
+  }
+
+  // `x`: zoom to the selected box and keep following the selection (Fit, the wheel or a pan stop it).
+  function zoomToSelected() {
+    var b = boxes()[selected];
+    if (!b) { say('No box selected: j selects one.'); return; }
+    view.follow = true;
+    zoomTo(b);
     draw();
   }
 
@@ -253,6 +345,7 @@
   function updateViewUi() {
     var zoomed = view.z > 1;
     if (fitBtn) fitBtn.hidden = !zoomed;
+    if (zoomBoxBtn) zoomBoxBtn.hidden = !boxes()[selected];
     if (zoomText) zoomText.textContent = zoomed ? Math.round(view.z * 100) + '%' : '';
   }
 
@@ -273,6 +366,9 @@
       (b.source === 'auto' && b.triage === 'accept' && b.state !== 'rejected' ? ' ✓' : '');
   }
 
+  // Spotlight on: a selected box is the only bright one (veil over the frame, the others dim).
+  function spotlit() { return spotlight && !!boxes()[selected]; }
+
   function draw() {
     var W = canvas.width, H = canvas.height;
     clampView();
@@ -290,22 +386,36 @@
     var th = font + pad;
     ctx.font = font + 'px system-ui, sans-serif';
     ctx.textBaseline = 'bottom';
-    boxes().forEach(function (b, i) {
-      if (isUnwanted(b)) return;
+    var spot = spotlit();
+    var sb = boxes()[selected];
+    if (spot) {
+      // The veil, with the selected box cut out.
+      ctx.save();
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+      ctx.beginPath();
+      ctx.rect(0, 0, W, H);
+      ctx.rect(sb.bbox[0], sb.bbox[1], sb.bbox[2] - sb.bbox[0], sb.bbox[3] - sb.bbox[1]);
+      ctx.fill('evenodd');
+      ctx.restore();
+    }
+
+    function drawBox(b, i) {
       var l = look(b);
       var x = b.bbox[0], y = b.bbox[1], w = b.bbox[2] - b.bbox[0], h = b.bbox[3] - b.bbox[1];
       var color = COLORS[l] || '#ffffff';
       var dashed = l === 'rejected' || isHint(b);
+      var sel = i === selected;
+      var dim = spot && !sel;
       ctx.save();
       var shown = isShown(b);
-      ctx.globalAlpha = (l === 'rejected' ? 0.7 : 1) * (shown ? 1 : 0.2);
-      if (i === selected) {
+      ctx.globalAlpha = (l === 'rejected' ? 0.7 : 1) * (shown ? 1 : 0.2) * (dim ? 0.35 : 1);
+      if (sel) {
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = lw * 3.5;
         ctx.strokeRect(x, y, w, h);
       }
       ctx.setLineDash(dashed ? [lw * 4, lw * 3] : []);
-      ctx.lineWidth = (i === selected ? 2 : 1) * (l === 'review' ? 1.5 : 1) * lw;
+      ctx.lineWidth = (sel ? 2 : 1) * (l === 'review' ? 1.5 : 1) * lw;
       ctx.strokeStyle = color;
       ctx.strokeRect(x, y, w, h);
       if (l === 'review') {
@@ -313,7 +423,7 @@
         ctx.setLineDash([]);
         ctx.lineWidth = lw * 0.6;
         ctx.strokeStyle = '#000000';
-        var inset = (i === selected ? 2.25 : 1.1) * lw;
+        var inset = (sel ? 2.25 : 1.1) * lw;
         if (w > 2 * inset && h > 2 * inset) ctx.strokeRect(x + inset, y + inset, w - 2 * inset, h - 2 * inset);
         ctx.strokeStyle = color;
       }
@@ -326,8 +436,13 @@
         ctx.stroke();
       }
       ctx.setLineDash([]);
-      if (showTags && shown) {
-        var text = tagText(b, i);
+      // Tags: in full for the selected and the hovered box; none on dimmed boxes; a decided box
+      // already checked shows its number only.
+      var full = sel || i === hoverIdx;
+      var tag = showTags && shown && (full || !dim);
+      if (tag) {
+        if (full) ctx.globalAlpha = 1;
+        var text = (full || b.state === 'pending' || !b._checked) ? tagText(b, i) : String(i + 1);
         var tw = ctx.measureText(text).width + 2 * pad;
         // Above the box; at the frame top below it when there is room; else inside its top.
         var top;
@@ -341,8 +456,15 @@
         ctx.fillText(text, tx + pad, top + th - pad / 2);
       }
       ctx.restore();
+    }
+
+    // The selected box last (on top), the hovered one just before it.
+    boxes().forEach(function (b, i) {
+      if (!isUnwanted(b) && i !== selected && i !== hoverIdx) drawBox(b, i);
     });
-    var sb = boxes()[selected];
+    var hb = boxes()[hoverIdx];
+    if (hb && hoverIdx !== selected && !isUnwanted(hb)) drawBox(hb, hoverIdx);
+    if (sb && !isUnwanted(sb)) drawBox(sb, selected);
     if (sb && !(gesture && gesture.mode === 'draw' && gesture.moved)) {
       var hs = HANDLE_CSS * cssScale() / z;
       ctx.save();
@@ -370,29 +492,48 @@
     return [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1), Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)];
   }
 
-  // The selected box with a 25% margin, upscaled, in the side panel (to check the evidence).
+  // The close-up: the selected box with a 40% margin, enlarged to the panel's width (a box under
+  // 120 px at least 2x, at most 8x; the view then centres on the box), from the full-size image.
   function drawCrop() {
     if (!cropCanvas) return;
     var b = boxes()[selected];
     if (!b || !img || !img.complete || !img.naturalWidth) { cropWrap.hidden = true; return; }
+    cropWrap.hidden = false;
     var W = canvas.width, H = canvas.height;
-    var bw = b.bbox[2] - b.bbox[0], bh = b.bbox[3] - b.bbox[1];
-    var x0 = clamp(b.bbox[0] - bw * 0.25, 0, W), y0 = clamp(b.bbox[1] - bh * 0.25, 0, H);
-    var x1 = clamp(b.bbox[2] + bw * 0.25, 0, W), y1 = clamp(b.bbox[3] + bh * 0.25, 0, H);
-    var sw = Math.max(1, x1 - x0), sh = Math.max(1, y1 - y0);
-    var scale = Math.min(288 / sw, 200 / sh, 8);
-    var cw = Math.max(1, Math.round(sw * scale)), ch = Math.max(1, Math.round(sh * scale));
-    if (cropCanvas.width !== cw) cropCanvas.width = cw;
-    if (cropCanvas.height !== ch) cropCanvas.height = ch;
+    var bw = Math.max(1, b.bbox[2] - b.bbox[0]), bh = Math.max(1, b.bbox[3] - b.bbox[1]);
+    var aw = Math.max(120, cropWrap.clientWidth || 300);
+    // Its height follows the window: the decision bar and the list stay in view under it.
+    var ah = Math.round(Math.max(140, Math.min(wideSide ? 340 : 240, window.innerHeight * (wideSide ? 0.36 : 0.22))));
+    var mw = bw * 1.8, mh = bh * 1.8;
+    var scale = Math.min(aw / mw, ah / mh);
+    if (Math.max(bw, bh) < 120) scale = Math.max(scale, 2);
+    scale = Math.min(scale, 8);
+    var cw = Math.min(aw, mw * scale), ch = Math.min(ah, mh * scale);
+    var sw = Math.min(W, cw / scale), sh = Math.min(H, ch / scale);
+    cw = sw * scale; ch = sh * scale;
+    var x0 = clamp((b.bbox[0] + b.bbox[2]) / 2 - sw / 2, 0, W - sw);
+    var y0 = clamp((b.bbox[1] + b.bbox[3]) / 2 - sh / 2, 0, H - sh);
+    var dpr = window.devicePixelRatio || 1;
+    var pw = Math.max(1, Math.round(cw * dpr)), ph = Math.max(1, Math.round(ch * dpr));
+    if (cropCanvas.width !== pw) cropCanvas.width = pw;
+    if (cropCanvas.height !== ph) cropCanvas.height = ph;
+    cropCanvas.style.width = Math.round(cw) + 'px';
+    cropCanvas.style.height = Math.round(ch) + 'px';
     var c = cropCanvas.getContext('2d');
     var kx = img.naturalWidth / W, ky = img.naturalHeight / H;
-    c.clearRect(0, 0, cw, ch);
-    c.drawImage(img, x0 * kx, y0 * ky, sw * kx, sh * ky, 0, 0, cw, ch);
-    c.lineWidth = 2;
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.clearRect(0, 0, pw, ph);
+    c.imageSmoothingEnabled = true;
+    c.imageSmoothingQuality = 'high';
+    c.drawImage(img, x0 * kx, y0 * ky, sw * kx, sh * ky, 0, 0, pw, ph);
+    // A thin dashed outline just outside the box: the object's edges stay visible.
+    var k = scale * dpr, o = 2 * dpr;
+    c.lineWidth = 1.5 * dpr;
+    c.setLineDash([5 * dpr, 3 * dpr]);
     c.strokeStyle = COLORS[look(b)] || '#ffffff';
-    c.strokeRect((b.bbox[0] - x0) * scale, (b.bbox[1] - y0) * scale, bw * scale, bh * scale);
-    cropCap.textContent = 'Box ' + (selected + 1) + ' (' + b.label + '), ' + Math.round(bw) + ' x ' + Math.round(bh) + ' px';
-    cropWrap.hidden = false;
+    c.strokeRect((b.bbox[0] - x0) * k - o, (b.bbox[1] - y0) * k - o, bw * k + 2 * o, bh * k + 2 * o);
+    cropCap.textContent = 'Box ' + (selected + 1) + ' (' + b.label + '), ' + Math.round(bw) + ' x ' + Math.round(bh) + ' px, ' +
+      (Math.round(scale * 10) / 10) + 'x';
   }
 
   // ---- side panel ---------------------------------------------------------------------------
@@ -404,8 +545,9 @@
     return e;
   }
 
-  function button(text, onClick) {
-    var b = el('button', 'small', text);
+  // `cls`: extra classes (`ok` / `bad` colour the decisions).
+  function button(text, onClick, cls) {
+    var b = el('button', 'small' + (cls ? ' ' + cls : ''), text);
     b.type = 'button';
     b.addEventListener('click', function (ev) { ev.stopPropagation(); onClick(); });
     return b;
@@ -471,12 +613,38 @@
       sel.appendChild(o);
     });
     sel.addEventListener('click', function (ev) { ev.stopPropagation(); });
-    sel.addEventListener('change', function () { relabel(i, sel.value); });
+    // Focus goes back to the frame: a focused select would take the next shortcut letter as
+    // "jump to the class starting with it" (a relabel) instead of the review key.
+    sel.addEventListener('change', function () { relabel(i, sel.value); canvas.focus({ preventScroll: true }); });
     return sel;
   }
 
+  // A short state for the one-line rows.
+  function shortState(b) {
+    if (b.state === 'pending') {
+      var r = resolved(b);
+      return el('span', 'rv-chip ' + (r === 'rejected' ? 'bad' : 'pend'), '→ ' + (r === 'rejected' ? 'reject' : 'accept'));
+    }
+    if (b.state === 'added') return el('span', 'rv-chip drawn', 'drawn');
+    return el('span', 'rv-chip ' + (b.state === 'accepted' ? 'ok' : 'bad'), b.state);
+  }
+
+  // A box that is not selected: one row (number, class, state, score); a click selects it.
+  function boxRow(b, i) {
+    var li = el('li', 'compact st-' + b.state + ' lk-' + look(b));
+    li.appendChild(el('span', 'swatch sw-' + look(b)));
+    li.appendChild(el('span', 'bx-num', (isReview(b) ? '? ' : '') + String(i + 1)));
+    li.appendChild(el('span', 'bx-name', b.label + (b.auto_label && b.auto_label !== b.label ? ' (' + b.auto_label + '?)' : '')));
+    li.appendChild(shortState(b));
+    if (b.state !== 'pending' && !b._checked) li.appendChild(el('span', 'rv-chip warn', 'to check'));
+    li.appendChild(el('span', 'bx-score muted', fmtScore(b.score)));
+    li.addEventListener('click', function () { select(i); });
+    return li;
+  }
+
   function boxItem(b, i) {
-    var li = el('li', 'st-' + b.state + ' lk-' + look(b) + (i === selected ? ' sel' : ''));
+    if (i !== selected) return boxRow(b, i);
+    var li = el('li', 'st-' + b.state + ' lk-' + look(b) + ' sel');
     var head = el('span', null);
     head.appendChild(el('span', 'swatch sw-' + look(b)));
     head.appendChild(document.createTextNode((isReview(b) ? '? ' : '') + String(i + 1) + ' '));
@@ -484,27 +652,15 @@
     li.appendChild(classSelect(b, i));
     var chips = el('span', 'bx-chips');
     chips.appendChild(stateChip(b));
-    var t = triageChip(b);
+    if (b.state !== 'pending') chips.appendChild(el('span', 'rv-chip' + (b._checked ? ' ok' : ' warn'), b._checked ? 'checked' : 'to check'));
+    // The reason of an `auto: review` is in the decision bar above: the chip alone here.
+    var t = b.triage === 'review' ? el('span', 'rv-chip warn', 'auto: review') : triageChip(b);
+    if (t && b.why && b.why.length) t.title = b.why.join('; ');
     if (t) chips.appendChild(t);
     li.appendChild(chips);
     var ev = evidence(b);
     if (ev) li.appendChild(el('span', 'bx-note', ev));
-    if (b.auto_label && b.auto_label !== b.label) {
-      var sug = el('span', 'bx-suggest');
-      sug.appendChild(document.createTextNode('Auto-labelers say ' + b.auto_label +
-        (b.auto_score != null ? ' (' + fmtScore(b.auto_score) + ')' : '') + ' '));
-      var al = b.auto_label;
-      sug.appendChild(button('Use ' + al, function () { relabel(i, al); }));
-      li.appendChild(sug);
-    }
-    var actions = el('span', 'bx-actions');
-    if (b.source === 'human') {
-      actions.appendChild(button('Delete', function () { removeBox(i); }));
-    } else {
-      if (b.state !== 'accepted') actions.appendChild(button('Accept', function () { setState(i, 'accepted'); }));
-      if (b.state !== 'rejected') actions.appendChild(button('Reject', function () { setState(i, 'rejected'); }));
-    }
-    li.appendChild(actions);
+    // Accept / reject / keep / delete and "It's a <auto label>" are the decision bar's buttons.
     li.addEventListener('click', function () { select(i); });
     return li;
   }
@@ -530,6 +686,87 @@
     }
     if (bs.length === unwanted && cur) boxList.appendChild(el('li', 'muted', 'No box. Drag on the image to draw one.'));
     emptyBox.checked = !!(cur && cur.labels.empty_confirmed);
+    renderDecision();
+  }
+
+  // The frame's progress: the boxes the reviewer sees, undecided / decided but not checked / done.
+  function progress() {
+    var shown = boxes().filter(function (b) { return !isUnwanted(b) && isShown(b); });
+    var u = shown.filter(function (b) { return b.state === 'pending'; }).length;
+    var c = shown.filter(isUnchecked).length;
+    return { total: shown.length, undecided: u, unchecked: c, done: shown.length - u - c };
+  }
+
+  function kbd(text) { return el('kbd', null, text); }
+
+  // A decision button with its key; the frame keeps the focus (the bar is rebuilt).
+  function decideButton(text, key, cls, onClick) {
+    var b = button(text + ' ', function () { onClick(); canvas.focus({ preventScroll: true }); }, cls);
+    if (key) b.appendChild(kbd(key));
+    return b;
+  }
+
+  // The decision bar: the selected box's question, its answers, the frame's progress.
+  function renderDecision() {
+    decide.textContent = '';
+    if (!cur) return;
+    var p = progress();
+    var b = boxes()[selected];
+    if (!b) {
+      decide.appendChild(el('div', 'rv-q', p.total
+        ? (p.undecided || p.unchecked ? 'No box selected: j selects the next one, drag on the frame to draw one.' : 'Every box decided: s saves.')
+        : 'No box: drag on the frame to draw one, or e confirms it empty.'));
+    } else {
+      var i = selected;
+      var q = el('div', 'rv-q');
+      q.appendChild(el('span', 'rv-q-num', 'Box ' + (i + 1) + ' of ' + boxes().length + ' · '));
+      var verb, yes, no;
+      if (b.source === 'human') { verb = 'Drawn: '; yes = 'Keep'; no = 'Delete'; }
+      else if (b.state === 'accepted') { verb = 'Accepted as '; yes = 'Right, keep'; no = 'No, reject'; }
+      else if (b.state === 'rejected') { verb = 'Rejected: is it a '; yes = 'Yes, accept'; no = 'Keep rejected'; }
+      else { verb = 'Is this a '; yes = 'Yes, ' + b.label; no = 'No, reject'; }
+      q.appendChild(document.createTextNode(verb));
+      q.appendChild(el('strong', null, b.label));
+      q.appendChild(document.createTextNode(verb.indexOf('Is') === 0 || verb.indexOf('is it') >= 0 ? '?' : ''));
+      decide.appendChild(q);
+      var why = [];
+      if (b.auto_label && b.auto_label !== b.label) {
+        why.push('auto-labelers say ' + b.auto_label + (b.auto_score != null ? ' (' + fmtScore(b.auto_score) + ')' : ''));
+      }
+      if (b.triage === 'review' && b.why && b.why.length) why.push(b.why.join('; '));
+      else if (b.score != null) why.push('score ' + fmtScore(b.score));
+      if (why.length) decide.appendChild(el('div', 'rv-q-why muted', why.join(' · ')));
+      var btns = el('div', 'rv-q-btns');
+      btns.appendChild(decideButton(yes, 'a', 'ok', acceptSelected));
+      btns.appendChild(decideButton(no, 'r', 'bad', rejectSelected));
+      if (b.auto_label && b.auto_label !== b.label) {
+        var al = b.auto_label;
+        btns.appendChild(decideButton('It\'s a ' + al, null, 'ok', function () { relabelNext(i, al); }));
+      }
+      var other = decideButton('It\'s a…', '1-9', 'secondary', function () { classGrid = !classGrid; renderDecision(); });
+      other.setAttribute('aria-expanded', classGrid ? 'true' : 'false');
+      btns.appendChild(other);
+      decide.appendChild(btns);
+      if (classGrid) {
+        var g = el('div', 'rv-q-classes');
+        visible().forEach(function (c, n) {
+          var cb = button('', function () { classGrid = false; relabelNext(i, c); canvas.focus({ preventScroll: true }); }, 'secondary' + (c === b.label ? ' active' : ''));
+          if (n < 10) cb.appendChild(kbd(String((n + 1) % 10)));
+          cb.appendChild(document.createTextNode(' ' + c));
+          g.appendChild(cb);
+        });
+        decide.appendChild(g);
+      }
+    }
+    if (p.total) {
+      var line = el('div', 'rv-progress');
+      var bar = el('progress');
+      bar.max = p.total;
+      bar.value = p.done;
+      line.appendChild(bar);
+      line.appendChild(el('span', 'muted', p.done + '/' + p.total + ' done · ' + p.undecided + ' undecided' + (p.unchecked ? ' · ' + p.unchecked + ' to check' : '')));
+      decide.appendChild(line);
+    }
   }
 
   function refresh() { renderSide(); draw(); }
@@ -539,46 +776,72 @@
   function revealSelected(page) {
     var li = boxList.querySelector('li.sel');
     if (!li) return;
-    if (page) {
-      // The enlarged crop sits above the list: show it, then the entry.
-      if (cropWrap && !cropWrap.hidden) cropWrap.scrollIntoView({ block: 'nearest' });
-      li.scrollIntoView({ block: 'nearest' });
-      return;
-    }
     var lr = li.getBoundingClientRect(), br = boxList.getBoundingClientRect();
-    if (lr.top < br.top) boxList.scrollTop += lr.top - br.top - 4;
+    // An entry taller than the list shows from its top (its class select).
+    if (lr.top < br.top || lr.height > br.height) boxList.scrollTop += lr.top - br.top - 4;
     else if (lr.bottom > br.bottom) boxList.scrollTop += lr.bottom - br.bottom + 4;
+    // The page too when the decision bar is off screen (one column: the panel does not stick).
+    if (page) {
+      var dr = decide.getBoundingClientRect();
+      if (dr.top < 0 || dr.bottom > window.innerHeight) decide.scrollIntoView({ block: 'nearest' });
+    }
   }
 
-  // A new frame: the page shows the frame from its top, the box list starts at its top.
+  // A new frame: the page scrolls as little as needed to show the whole frame and the side panel
+  // (with its Save row; from the grid's top when they are taller than the window), the box list
+  // starts at its top.
   function revealFrame() {
     boxList.scrollTop = 0;
     revealSelected();
-    var grid = canvas.closest('.review-grid');
-    if (grid && grid.getBoundingClientRect().top < 0) {
-      grid.scrollIntoView({ block: 'start' });
-      revealSelected(true);
-    }
+    if (!grid) return;
+    var top = grid.getBoundingClientRect().top;
+    var bottom = Math.max(canvas.getBoundingClientRect().bottom, side ? side.getBoundingClientRect().bottom : 0);
+    var by = 0;
+    if (top < 0) by = top - 8;
+    else if (bottom > window.innerHeight) by = Math.min(top - 8, bottom - window.innerHeight + 8);
+    if (by) window.scrollBy(0, by);
   }
 
   // ---- edits --------------------------------------------------------------------------------
 
   function select(i, page) {
     selected = (i >= 0 && i < boxes().length) ? i : -1;
-    panTo(boxes()[selected]);
+    if (view.follow && boxes()[selected]) zoomTo(boxes()[selected]);
+    else panTo(boxes()[selected]);
     refresh();
     revealSelected(page);
   }
 
-  // Deciding a box moves the selection on to the next box to review (if any).
+  // Deciding a box (also confirming an earlier decision) checks it and moves the selection on to
+  // the next box to review, then to the next decided box to double-check (if any).
   function setState(i, state) {
     var b = boxes()[i];
     if (!b) return;
-    snapshot();
-    b.state = state;
-    if (state !== 'rejected' && cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
+    // Confirming a box already checked in that state only moves on (no undo step).
+    if (!(b.state === state && b._checked)) {
+      snapshot();
+      b.state = state;
+      b._checked = true;
+      if (state !== 'rejected' && cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
+    }
     var next = nextUndecided(i);
     select(next >= 0 ? next : i, true);
+    sayProgress();
+  }
+
+  // `a`: accept the selected box (a drawn one is kept), then the next one.
+  function acceptSelected() {
+    var b = boxes()[selected];
+    if (!b) { say('No box selected: j selects one, Shift+A accepts every proposal.'); return; }
+    setState(selected, b.source === 'human' ? 'added' : 'accepted');
+  }
+
+  // `r`: reject the selected box (a drawn one is deleted), then the next one.
+  function rejectSelected() {
+    var b = boxes()[selected];
+    if (!b) return;
+    if (b.source === 'human') { removeBox(selected); var n = nextUndecided(-1); if (n >= 0) select(n, true); sayProgress(); return; }
+    setState(selected, 'rejected');
   }
 
   function relabel(i, label) {
@@ -587,9 +850,21 @@
     snapshot();
     if (b.source !== 'human' && !b.model_label) b.model_label = b.label;
     b.label = label;
+    b._checked = true;
     if (b.source !== 'human') b.state = 'accepted';
     if (cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
     refresh();
+    sayProgress();
+  }
+
+  // "It's a ..." (the decision bar, 1-0): relabel the box (accepting it), then the next box.
+  function relabelNext(i, label) {
+    var b = boxes()[i];
+    if (!b) return;
+    relabel(i, label);
+    var next = nextUndecided(i);
+    select(next >= 0 ? next : i, true);
+    sayProgress();
   }
 
   function removeBox(i) {
@@ -625,7 +900,7 @@
       emptyBackup = { frame: cur.frame, boxes: JSON.stringify(boxes()) };
       cur.labels.empty_confirmed = true;
       cur.labels.boxes = boxes().filter(function (b) { return b.source !== 'human'; });
-      boxes().forEach(function (b) { b.state = 'rejected'; });
+      boxes().forEach(function (b) { b.state = 'rejected'; b._checked = true; });
       selected = -1;
     } else {
       cur.labels.empty_confirmed = false;
@@ -640,21 +915,24 @@
 
   function doUndo() {
     if (!cur || !undo.length) return;
-    cur.labels = JSON.parse(undo.pop());
+    // The selection goes back with the boxes: to the box the undone step changed.
+    var u = JSON.parse(undo.pop());
+    cur.labels = u.labels;
     lastNudge = null;
-    if (selected >= boxes().length) selected = -1;
-    refresh();
+    select(u.selected, true);
+    sayProgress();
   }
 
   function pickClass(n) {
     var c = visible()[n];
     if (c == null) return;
-    if (selected >= 0) relabel(selected, c);
+    if (selected >= 0) relabelNext(selected, c);
     else { classSel.value = c; say('New boxes: ' + c); }
   }
 
   // The first geometric edit of a model / auto box keeps its original box and accepts it.
   function markEdited(b) {
+    b._checked = true;
     if (b.source !== 'human') {
       if (!b.orig_bbox) b.orig_bbox = b.bbox.slice();
       b.state = 'accepted';
@@ -737,11 +1015,32 @@
     if (canvas.getAttribute('data-cursor') !== name) canvas.setAttribute('data-cursor', name);
   }
 
+  // The smallest shown box under the frame point `p`, else -1.
+  function boxAt(p) {
+    var best = -1, area = Infinity;
+    if (hideBoxes) return -1;
+    boxes().forEach(function (bx, i) {
+      var a = (bx.bbox[2] - bx.bbox[0]) * (bx.bbox[3] - bx.bbox[1]);
+      if (isShown(bx) && !isUnwanted(bx) && p[0] >= bx.bbox[0] && p[0] <= bx.bbox[2] && p[1] >= bx.bbox[1] && p[1] <= bx.bbox[3] && a < area) {
+        best = i; area = a;
+      }
+    });
+    return best;
+  }
+
+  // The hovered box shows its tag in full (also dimmed or checked ones).
+  function setHover(i) {
+    if (i === hoverIdx) return;
+    hoverIdx = i;
+    draw();
+  }
+
   function hoverCursor(ev) {
     if (gesture) return;
     if (spaceDown) { setCursor('grab'); return; }
     if (!cur || hideBoxes || !ev) { setCursor('crosshair'); return; }
     var p = framePoint(ev);
+    setHover(boxAt(p));
     var h = handleAt(p);
     if (h) setCursor(HANDLE_CURSOR[h]);
     else if (insideSelected(p)) setCursor('move');
@@ -756,6 +1055,7 @@
     if (ev.button === 1 || ev.button === 2 || (ev.button === 0 && spaceDown)) {
       ev.preventDefault();
       gesture = { mode: 'pan', cx: ev.clientX, cy: ev.clientY, ox: view.ox, oy: view.oy, moved: false };
+      view.follow = false;
       canvas.setPointerCapture(ev.pointerId);
       setCursor('grabbing');
       return;
@@ -815,7 +1115,7 @@
           boxes().push({
             label: classSel.value || classes[0] || 'object',
             bbox: r.map(round1),
-            source: 'human', state: 'added'
+            source: 'human', state: 'added', _checked: true
           });
           cur.labels.empty_confirmed = false;
           selected = boxes().length - 1;
@@ -831,16 +1131,7 @@
     }
     if (g.mode === 'resize') { draw(); return; }
     // A click: the smallest box under the point.
-    var best = -1, area = Infinity;
-    if (!hideBoxes) {
-      boxes().forEach(function (bx, i) {
-        var a = (bx.bbox[2] - bx.bbox[0]) * (bx.bbox[3] - bx.bbox[1]);
-        if (isShown(bx) && g.x0 >= bx.bbox[0] && g.x0 <= bx.bbox[2] && g.y0 >= bx.bbox[1] && g.y0 <= bx.bbox[3] && a < area) {
-          best = i; area = a;
-        }
-      });
-    }
-    select(best);
+    select(boxAt([g.x0, g.y0]));
     hoverCursor(ev);
   });
 
@@ -851,7 +1142,7 @@
     if (g && g.moved && g.mode !== 'draw' && g.mode !== 'pan') refresh(); else draw();
   });
   canvas.addEventListener('pointerenter', function () { overCanvas = true; });
-  canvas.addEventListener('pointerleave', function () { overCanvas = false; });
+  canvas.addEventListener('pointerleave', function () { overCanvas = false; if (!gesture) setHover(-1); });
   canvas.addEventListener('contextmenu', function (ev) { ev.preventDefault(); });
   canvas.addEventListener('mousedown', function (ev) { if (ev.button === 1) ev.preventDefault(); });
   canvas.addEventListener('auxclick', function (ev) { ev.preventDefault(); });
@@ -862,10 +1153,43 @@
     // Unzoomed, scrolling down scrolls the page.
     if (view.z <= 1 && factor <= 1) return;
     ev.preventDefault();
+    view.follow = false;
     var c = canvasPoint(ev);
     zoomAt(c[0], c[1], factor);
   }, { passive: false });
   if (fitBtn) fitBtn.addEventListener('click', function () { fit(); canvas.focus(); });
+  if (zoomBoxBtn) zoomBoxBtn.addEventListener('click', function () { zoomToSelected(); canvas.focus(); });
+
+  // "Larger close-up": a wider side panel (per viewer).
+  var wideBtn = $('rv-crop-wide');
+  if (!wideBtn && cropWrap) {
+    wideBtn = button('', function () {}, 'secondary rv-crop-wide');
+    wideBtn.id = 'rv-crop-wide';
+    cropWrap.appendChild(wideBtn);
+  }
+  function applyWide() {
+    if (grid) grid.classList.toggle('rv-wide', wideSide);
+    if (wideBtn) {
+      wideBtn.textContent = wideSide ? 'Smaller close-up' : 'Larger close-up';
+      wideBtn.setAttribute('aria-pressed', wideSide ? 'true' : 'false');
+    }
+  }
+  if (wideBtn) {
+    wideBtn.addEventListener('click', function () {
+      wideSide = !wideSide;
+      setPref('wide', wideSide);
+      applyWide();
+      draw();
+      canvas.focus({ preventScroll: true });
+    });
+  }
+  applyWide();
+  // The close-up follows the side panel's width.
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () { resizeTimer = null; draw(); }, 100);
+  });
 
   // ---- loading and saving -------------------------------------------------------------------
 
@@ -985,7 +1309,10 @@
       canvas.width = j.width || 640;
       canvas.height = j.height || 360;
       view.z = 1; view.ox = 0; view.oy = 0;
+      hoverIdx = -1;
       selected = nextUndecided(-1);
+      // Following (`x`): the new frame opens zoomed on its first box.
+      if (view.follow && boxes()[selected]) zoomTo(boxes()[selected]);
       img = new Image();
       img.onload = draw;
       img.src = j.image_url;
@@ -1048,11 +1375,21 @@
         select(selected >= 0 && isReview(boxes()[selected]) ? selected : firstReview(), true);
         return;
       }
+      // Then the check pass: accepted / rejected boxes not looked at (once per count).
+      var u = uncheckedCount();
+      if (n === 0 && u > 0 && !(guard && guard.frame === cur.frame && guard.unchecked === u)) {
+        guard = { frame: cur.frame, count: 0, unchecked: u };
+        say(u + ' accepted / rejected box(es) not double-checked yet (marked "to check"): a keeps, r rejects, or save again to save as they are.', true);
+        var bs = boxes();
+        if (!(selected >= 0 && isUnchecked(bs[selected]))) select(nextUndecided(-1), true);
+        return;
+      }
     }
     busy = true;
     var body = JSON.parse(JSON.stringify(cur.labels));   // keeps auto_run, bulk_accepted, ...
     // Proposals of a "don't want" class are not shown: rejected rather than resolved by default.
     body.boxes.forEach(function (b) {
+      delete b._checked;
       if (b.state === 'pending' && b.source !== 'human' && isHiddenClass(b.label)) {
         b.state = 'rejected';
         b.reason = 'other_class';
@@ -1098,19 +1435,32 @@
   });
   filtersForm.addEventListener('submit', function (ev) { ev.preventDefault(); loadNext(); });
 
-  function typing(t) {
+  // A field that takes the key itself. A checkbox / radio does not (the "Confirmed empty" box
+  // keeps focus after a click); a box's class select takes only its own navigation keys.
+  function typing(t, k) {
     var tag = t && t.tagName;
-    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!(t && t.isContentEditable);
+    if (tag === 'INPUT') return !/^(checkbox|radio|button|submit|reset)$/.test(t.type);
+    if (tag === 'SELECT' && t.classList.contains('bx-label')) {
+      return /^(Arrow(Up|Down|Left|Right)|Enter| |Home|End|PageUp|PageDown|Tab)$/.test(k);
+    }
+    return tag === 'TEXTAREA' || tag === 'SELECT' || !!(t && t.isContentEditable);
   }
 
   document.addEventListener('keydown', function (ev) {
     if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
     var t = ev.target;
-    if (typing(t)) return;
+    if (typing(t, ev.key)) return;
     // The Browse dialog is modal: its keys are not review shortcuts.
     if (document.querySelector('dialog[open]')) return;
-    var k = ev.key;
-    if (t && (t.tagName === 'BUTTON' || t.tagName === 'SUMMARY') && (k === 'Enter' || k === ' ')) return;
+    // Letters are case-blind (Caps Lock); Shift is read from shiftKey.
+    var k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+    if (t && (t.tagName === 'BUTTON' || t.tagName === 'SUMMARY' || t.tagName === 'INPUT') && (k === 'Enter' || k === ' ')) return;
+    // A letter on a box's class select is a shortcut, never "jump to the class starting with it";
+    // the frame takes the focus back.
+    if (t && t.tagName === 'SELECT') {
+      if (k.length === 1) ev.preventDefault();
+      canvas.focus({ preventScroll: true });
+    }
     var handled = true;
     if (k === ' ') {
       spaceDown = true;
@@ -1120,16 +1470,22 @@
     } else if (k === 'h') {
       if (!ev.repeat && !hideBoxes) { hideBoxes = true; draw(); }
     } else if (k === 'l') { showTags = !showTags; draw(); }
+    else if (k === 'v') {
+      spotlight = !spotlight;
+      setPref('spotlight', spotlight);
+      say(spotlight ? 'Spotlight on: the selected box stands out.' : 'Spotlight off: every box at full strength.');
+      draw();
+    } else if (k === 'x') zoomToSelected();
     else if (k === 'f') fit();
     else if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
       var step = ev.shiftKey ? 10 : 1;
       handled = selected >= 0 && nudge(
         k === 'ArrowLeft' ? -step : (k === 'ArrowRight' ? step : 0),
         k === 'ArrowUp' ? -step : (k === 'ArrowDown' ? step : 0));
-    } else if (k === 'a') acceptProposals();
-    else if (k === 'r') {
-      if (selected >= 0) setState(selected, boxes()[selected].state === 'rejected' ? 'accepted' : 'rejected');
-    } else if (k === 'n') skipToNext();
+    } else if (k === 'a') {
+      if (ev.shiftKey) acceptProposals(); else acceptSelected();
+    } else if (k === 'r') rejectSelected();
+    else if (k === 'n') skipToNext();
     else if (k === 'e') confirmEmpty(!(cur && cur.labels.empty_confirmed));
     else if (k === 'z') doUndo();
     else if (k === 's' || k === 'Enter') save('reviewed');
@@ -1147,7 +1503,7 @@
   });
 
   document.addEventListener('keyup', function (ev) {
-    if (ev.key === 'h' && hideBoxes) { hideBoxes = false; draw(); }
+    if ((ev.key === 'h' || ev.key === 'H') && hideBoxes) { hideBoxes = false; draw(); }
     if (ev.key === ' ' && spaceDown) { spaceDown = false; if (!gesture) hoverCursor(lastPointer); }
   });
   window.addEventListener('blur', function () {
