@@ -1185,7 +1185,8 @@ pub(super) async fn config_models(
 }
 
 /// `POST /config/models/remove` (`name`): the Models card's Remove. Drops the config entry of a
-/// disabled model (its files stay; Resources removes those) and saves like the other writers.
+/// disabled model, saves like the other writers, then deletes its files when they are ours
+/// (inside the models folder, not a catalog model, not used by another entry).
 /// 404 for an unknown name, 409 for an enabled model. JSON unless the client asks for HTML
 /// (then the config page at the Models card).
 pub(super) async fn config_models_remove(
@@ -1206,12 +1207,19 @@ pub(super) async fn config_models_remove(
                 "no model name given (field `name`); reload the page and try again".into(),
             ))
         } else {
-            let mut outcome = String::new();
+            let mut outcome = None;
             save_config(&state, "config page (remove model entry)", |c| {
-                outcome = remove_config_entry(c, &name).map_err(|e| anyhow::anyhow!(e))?;
+                outcome = Some(remove_config_entry(c, &name).map_err(|e| anyhow::anyhow!(e))?);
                 Ok(())
             })
-            .map(|msg| format!("{outcome}. {msg}"))
+            .map(|msg| {
+                // Files go only once the entry is saved out of the config.
+                let done = outcome
+                    .as_ref()
+                    .map(|o| o.delete_files())
+                    .unwrap_or_default();
+                format!("{done}. {msg}")
+            })
             .map_err(|e| match e.downcast::<ActionError>() {
                 Ok(a) => a,
                 Err(e) => ActionError::Failed(format!("{e:#}")),
@@ -1729,7 +1737,7 @@ mod tests {
         assert_eq!(*state.config_read(), saved);
     }
 
-    /// `POST /config/models/remove`: a disabled entry goes (files stay), an enabled one and an
+    /// `POST /config/models/remove`: a disabled entry goes, an enabled one and an
     /// unknown name are refused, and only loopback peers (same-site) may call it.
     #[tokio::test]
     async fn config_models_remove_entry() {
@@ -1750,10 +1758,10 @@ mod tests {
         );
         // Enabled rows: a disabled button with the reason; the disabled row can be removed.
         assert!(html.contains(
-            "form=\"model-remove\" name=\"name\" value=\"ipcam-general\" data-confirm=\"Remove ipcam-general from the config? Its files stay; remove them under Resources.\" disabled title=\"Enabled: disable it first"
+            "form=\"model-remove\" name=\"name\" value=\"ipcam-general\" data-confirm=\"Remove ipcam-general from the config and delete its files in the models folder? Files outside it and catalog models stay.\" disabled title=\"Enabled: disable it first"
         ), "{html}");
         assert!(html.contains(
-            "value=\"dfine-m\" data-confirm=\"Remove dfine-m from the config? Its files stay; remove them under Resources.\" title=\"Remove this entry"
+            "value=\"dfine-m\" data-confirm=\"Remove dfine-m from the config and delete its files in the models folder? Files outside it and catalog models stay.\" title=\"Remove this entry"
         ), "{html}");
 
         // A remote peer and a cross-site page are refused; nothing changes.

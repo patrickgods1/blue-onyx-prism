@@ -808,10 +808,19 @@ async fn spot_route(
     };
     let (dry_run, skip) = (b.dry_run, b.skip_frame.unwrap_or_default());
     blocking(move || {
-        let (dir, _, _) = context(&state);
-        let o = bulk::bulk_spot(&dir, &filters, &spot, &verdict, limit, dry_run, &|r| {
-            r != skip
-        });
+        let (dir, classes, _) = context(&state);
+        let hidden = hidden(&state);
+        let o = bulk::bulk_spot(
+            &dir,
+            &filters,
+            &classes,
+            &hidden,
+            &spot,
+            &verdict,
+            limit,
+            dry_run,
+            &|r| r != skip,
+        );
         let verb = if accept { "Accepted" } else { "Rejected" };
         let mut message = format!(
             "{verb} {} {} box(es) at that spot on {} unreviewed {} frame(s) (the frames stay \

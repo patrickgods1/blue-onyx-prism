@@ -241,9 +241,129 @@ pub fn drop_config_entries(config: &mut Config, names: &[String]) -> Vec<String>
     dropped
 }
 
-/// Remove the config entry `name` (the Models card's Remove): only a disabled entry, never its
-/// files. Returns the answer for the user.
-pub fn remove_config_entry(config: &mut Config, name: &str) -> Result<String, ActionError> {
+/// What [`remove_config_entry`] took out of the config. The files go only after the config is
+/// saved ([`EntryRemoved::delete_files`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryRemoved {
+    pub name: String,
+    /// Files of the entry that are ours to delete: inside the models folder, not a catalog
+    /// download or export, not used by another entry.
+    pub files: Vec<PathBuf>,
+    /// Why the model file stays, when it exists and is not in `files`.
+    pub kept: Option<String>,
+}
+
+impl EntryRemoved {
+    /// Delete [`EntryRemoved::files`] and describe the outcome: "removed 'x' from the config
+    /// and deleted ...". A file that cannot be deleted is reported, not an error (the entry is
+    /// already gone).
+    pub fn delete_files(&self) -> String {
+        let mut deleted = Vec::new();
+        let mut failed = Vec::new();
+        for f in &self.files {
+            match std::fs::remove_file(f) {
+                Ok(()) => deleted.push(f.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!("deleting {}: {e}", f.display());
+                    failed.push(format!("{} ({e})", f.display()));
+                }
+            }
+        }
+        let mut msg = format!("removed '{}' from the config", self.name);
+        if !deleted.is_empty() {
+            msg.push_str(&format!(" and deleted {}", deleted.join(", ")));
+        }
+        if !failed.is_empty() {
+            msg.push_str(&format!(
+                "; could not delete {} (still in use? delete it by hand)",
+                failed.join(", ")
+            ));
+        }
+        if let Some(why) = &self.kept {
+            msg.push_str(&format!("; {why}"));
+        }
+        msg
+    }
+}
+
+/// The files of entry `m` that its Remove may delete (see [`EntryRemoved::files`]), or why the
+/// model file stays. `others` are the entries left in the config.
+fn entry_files(
+    config: &Config,
+    m: &crate::config::ModelConfig,
+    others: &[crate::config::ModelConfig],
+) -> (Vec<PathBuf>, Option<String>) {
+    let model = config.data_path(&m.path);
+    if !model.is_file() {
+        return (Vec::new(), None);
+    }
+    let models_dir = config.data_path(&config.models_dir);
+    if !under_root(&model, &models_dir) {
+        return (
+            Vec::new(),
+            Some(format!(
+                "its file {} is outside the models folder {}, so it stays",
+                model.display(),
+                models_dir.display()
+            )),
+        );
+    }
+    let file_name = model
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if super::status::catalog_model_files(None).contains(&file_name) {
+        return (
+            Vec::new(),
+            Some(format!(
+                "its file {} is a catalog model and stays (remove it under Resources)",
+                model.display()
+            )),
+        );
+    }
+    let in_use: Vec<PathBuf> = others
+        .iter()
+        .flat_map(|o| {
+            let p = config.data_path(&o.path);
+            let mut v = vec![p.with_extension("bin"), p.with_extension("yaml"), p];
+            v.extend(o.classes.as_ref().map(|c| config.data_path(c)));
+            v
+        })
+        .collect();
+    if in_use.iter().any(|u| same_file(u, &model)) {
+        return (
+            Vec::new(),
+            Some(format!(
+                "its file {} stays (another config entry uses it)",
+                model.display()
+            )),
+        );
+    }
+    let stem = model
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut files = vec![model.clone()];
+    if model_ext(&model) == Some("xml") {
+        files.push(model.with_extension("bin"));
+    }
+    files.push(model.with_extension("yaml"));
+    files.push(model.with_file_name(format!("{stem}.provenance.json")));
+    if let Some(c) = &m.classes {
+        let c = config.data_path(c);
+        if under_root(&c, &models_dir) && model_ext(&c).is_none() {
+            files.push(c);
+        }
+    }
+    files.retain(|f| f.is_file() && !in_use.iter().any(|u| same_file(u, f)));
+    files.dedup_by(|a, b| same_file(a, b));
+    (files, None)
+}
+
+/// Remove the config entry `name` (the Models card's Remove): only a disabled entry. Its files
+/// are deleted by [`EntryRemoved::delete_files`] once the config is saved.
+pub fn remove_config_entry(config: &mut Config, name: &str) -> Result<EntryRemoved, ActionError> {
     let norm = crate::registry::normalize_name(name.trim());
     let Some(m) = config
         .models
@@ -261,18 +381,15 @@ pub fn remove_config_entry(config: &mut Config, name: &str) -> Result<String, Ac
             "'{shown}' is enabled; disable it first (untick Load and save), then remove it"
         )));
     }
-    let file = config.data_path(&m.path);
+    let entry = m.clone();
     let dropped = drop_config_entries(config, std::slice::from_ref(&shown));
     debug_assert_eq!(dropped.len(), 1);
-    let files = if file.exists() {
-        format!(
-            "; its file {} stays (remove it under Resources if you no longer need it)",
-            file.display()
-        )
-    } else {
-        String::new()
-    };
-    Ok(format!("removed '{shown}' from the config{files}"))
+    let (files, kept) = entry_files(config, &entry, &config.models);
+    Ok(EntryRemoved {
+        name: shown,
+        files,
+        kept,
+    })
 }
 
 /// Delete our install of `id` (see the module docs for when it is refused). For a model, the
@@ -849,6 +966,74 @@ mod custom_model_tests {
 
     const YAML: &str = "names:\n- a\n- b\n";
 
+    fn entry(name: &str, path: &Path, enabled: bool) -> ModelConfig {
+        ModelConfig {
+            name: Some(name.into()),
+            path: path.to_path_buf(),
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    /// The Models card's Remove deletes a trained model's files in the models folder (after the
+    /// save), keeps files outside it, catalog models and files another entry uses.
+    #[test]
+    fn remove_entry_deletes_owned_files() {
+        let (d, mut c) = setup();
+        let models = c.data_path(&c.models_dir);
+        let mine = models.join("mine.onnx");
+        let sidecars = [
+            models.join("mine.yaml"),
+            models.join("mine.provenance.json"),
+        ];
+        let shared = models.join("classes.yaml");
+        let other = models.join("other.onnx");
+        let outside = d.outside.join("ext.onnx");
+        for f in [&mine, &shared, &other, &outside]
+            .into_iter()
+            .chain(sidecars.iter())
+        {
+            touch(f);
+        }
+        c.models = vec![
+            entry("keep", &other, true),
+            ModelConfig {
+                classes: Some(shared.clone()),
+                ..entry("mine", &mine, false)
+            },
+            ModelConfig {
+                classes: Some(shared.clone()),
+                ..entry("other2", &models.join("x.onnx"), false)
+            },
+            entry("ext", &outside, false),
+        ];
+
+        let r = remove_config_entry(&mut c, "mine").unwrap();
+        assert!(mine.exists(), "nothing is deleted before the save");
+        let mut want = vec![mine.clone()];
+        want.extend(sidecars.iter().cloned());
+        assert_eq!(r.files, want, "the shared classes file stays");
+        let msg = r.delete_files();
+        assert!(
+            msg.starts_with("removed 'mine' from the config and deleted "),
+            "{msg}"
+        );
+        assert!(!mine.exists() && sidecars.iter().all(|f| !f.exists()));
+        assert!(shared.exists() && other.exists());
+
+        let r = remove_config_entry(&mut c, "ext").unwrap();
+        assert!(r.files.is_empty());
+        assert!(r.delete_files().contains("outside the models folder"));
+        assert!(outside.exists());
+
+        let cat = models.join(catalog::MODELS[0].parts[0].file_name);
+        touch(&cat);
+        c.models.push(entry("cat", &cat, false));
+        let r = remove_config_entry(&mut c, "cat").unwrap();
+        assert!(r.files.is_empty() && r.kept.unwrap().contains("catalog model"));
+        assert!(cat.exists());
+    }
+
     #[test]
     fn file_path_and_family() {
         let (d, mut c) = setup();
@@ -1249,13 +1434,18 @@ mod remove_tests {
         assert_eq!(c.models.len(), 3);
 
         // Missing file: no word about files; the default naming it is cleared.
-        let msg = remove_config_entry(&mut c, " gone ").unwrap();
+        let msg = remove_config_entry(&mut c, " gone ")
+            .unwrap()
+            .delete_files();
         assert_eq!(msg, "removed 'Gone' from the config");
         assert_eq!(c.default_model, None);
-        // An existing file stays and the answer says so.
-        let msg = remove_config_entry(&mut c, "kept").unwrap();
-        assert!(msg.contains("stays") && msg.contains("Resources"), "{msg}");
-        assert!(root.0.join("models/kept.onnx").is_file());
+        // An existing file in the models folder is deleted and the answer says so.
+        let msg = remove_config_entry(&mut c, "kept").unwrap().delete_files();
+        assert!(
+            msg.contains("and deleted ") && msg.contains("kept.onnx"),
+            "{msg}"
+        );
+        assert!(!root.0.join("models/kept.onnx").exists());
         assert_eq!(names(&c), ["a"]);
     }
 }

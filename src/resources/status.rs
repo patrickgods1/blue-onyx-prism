@@ -341,19 +341,7 @@ pub fn local_models(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<LocalMod
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let catalog_files: Vec<String> = platform_resources(ctx)
-        .into_iter()
-        .chain(catalog::MODELS.iter())
-        .filter(|r| r.kind == ResourceKind::Model)
-        .flat_map(|r| r.parts.iter().map(|p| p.file_name.to_ascii_lowercase()))
-        // Exported models have their own rows (with Add to config).
-        .chain(
-            catalog::EXPORT_MODELS
-                .iter()
-                .filter_map(catalog::export_files)
-                .map(|(onnx, _)| onnx),
-        )
-        .collect();
+    let catalog_files = catalog_model_files(ctx);
     let configured: Vec<PathBuf> = config
         .models
         .iter()
@@ -425,6 +413,23 @@ pub fn local_models(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<LocalMod
         });
     }
     out
+}
+
+/// Lowercase file names of catalog downloads and exports (their Resources rows manage them).
+pub(super) fn catalog_model_files(ctx: Option<&ResourcesCtx>) -> Vec<String> {
+    platform_resources(ctx)
+        .into_iter()
+        .chain(catalog::MODELS.iter())
+        .filter(|r| r.kind == ResourceKind::Model)
+        .flat_map(|r| r.parts.iter().map(|p| p.file_name.to_ascii_lowercase()))
+        // Exported models have their own rows (with Add to config).
+        .chain(
+            catalog::EXPORT_MODELS
+                .iter()
+                .filter_map(catalog::export_files)
+                .map(|(onnx, _)| onnx),
+        )
+        .collect()
 }
 
 /// Every resource of this platform, plus the provisioner's extra (test) models.
