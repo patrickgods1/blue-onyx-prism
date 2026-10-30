@@ -24,7 +24,7 @@
 //!   pinned commit (SHA-256 checked GitHub archive, only `engine/**/*.py` and `configs/**/*.yml`
 //!   extracted).
 //! - **Pinned script**: `scripts/export_model.py`, embedded in the binary, run as
-//!   `python -X faulthandler -u -I` (a native crash prints its stack) offline: `YOLO_OFFLINE=1`,
+//!   `python -X faulthandler -X utf8 -u -I` (a native crash prints its stack) offline: `YOLO_OFFLINE=1`,
 //!   `YOLO_AUTOINSTALL=false`, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` (nothing reaches the network or pip-installs anything), with its
 //!   settings and caches in our own `tools/export-config`.
 //! - **Contained**: everything lives under `<data root>/tools/` (see [`Paths`]); "Remove export

@@ -263,12 +263,26 @@ pub fn run_script(
             {
                 return e.context(why);
             }
-            env::explain_train_failure(e, paths, platform)
+            env::explain_train_failure(e, paths, platform, task_name(tag))
         })
 }
 
-/// The likely cause of a failed helper script when it ran out of GPU memory.
+/// What the failure messages call the script of event tag `tag`.
+fn task_name(tag: &str) -> &'static str {
+    match tag {
+        "autolabel" => "auto-label",
+        "import" => "import",
+        _ => "training",
+    }
+}
+
+/// The likely cause of a failed helper script when it ran out of GPU memory (not when the host
+/// ran out too: on Windows a CUDA allocation also fails when the system commit is exhausted;
+/// [`super::job::host_out_of_memory_line`], left to the generic memory message).
 fn gpu_failure(lines: &[String]) -> Option<String> {
+    if super::job::host_out_of_memory_line(lines).is_some() {
+        return None;
+    }
     let l = lines.iter().rev().find(|l| {
         [
             "CUDA out of memory",
@@ -305,6 +319,20 @@ mod tests {
             .unwrap()
             .contains("smaller labeler")
         );
+        // The host out of memory too (Windows commit): not the GPU's fault.
+        assert_eq!(
+            gpu_failure(&[
+                "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 \
+                 has a total capacity of 8.00 GiB of which 6.17 GiB is free."
+                    .into(),
+                "RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: not \
+                 enough memory: you tried to allocate 262144 bytes."
+                    .into(),
+            ]),
+            None
+        );
+        assert_eq!(task_name("autolabel"), "auto-label");
+        assert_eq!(task_name("import"), "import");
     }
 
     #[test]

@@ -7,7 +7,8 @@
 // localStorage. A Recent imports row's Auto-label button fills the card's filter (import=<id>).
 // Train: the runs line (one run per ticked scene per model, named before queuing), the class
 // picker of the ticked folders (counts per scene, warnings), the balance preview (what the
-// Balance fieldset does to each run's training frames) and Finish now while training.
+// Balance fieldset does to each run's training frames) and Finish now while training, plus the
+// Stop now / Continue notice of an early-stop point passed while the training loss still falls.
 (function () {
   "use strict";
 
@@ -936,6 +937,21 @@
   }
   loadMetrics();
 
+  // Continue hides the notice of that early-stop point (the run goes on by itself; a later
+  // point shows again).
+  function extendKey(el) { return "bop-extend:" + el.dataset.run + ":" + el.dataset.ext; }
+  function extendDismissed(el) {
+    try { return sessionStorage.getItem(extendKey(el)) === "1"; } catch (e) { return false; }
+  }
+  document.querySelectorAll('[data-field="extend"]').forEach(function (el) {
+    if (extendDismissed(el)) el.hidden = true;
+    var btn = el.querySelector('[data-action="extend-continue"]');
+    if (btn) btn.addEventListener("click", function () {
+      try { sessionStorage.setItem(extendKey(el), "1"); } catch (e) { /* private mode: hide only */ }
+      el.hidden = true;
+    });
+  });
+
   if (Object.keys(busy).length === 0) return;
   function describe(r, list) {
     if (r.state === "queued") {
@@ -978,6 +994,18 @@
       if (finish) {
         var p = r.progress || {};
         finish.hidden = !((r.state === "running" || r.state === "paused") && r.stage === "train" && !p.stopped && !p.phase);
+      }
+      // An early-stop point passed while the training loss still falls: Stop now / Continue.
+      var ext = tr.querySelector('[data-field="extend"]');
+      if (ext) {
+        var n = (r.progress || {}).extension;
+        var show = !!n && finish && !finish.hidden;
+        if (show) {
+          ext.dataset.ext = String(n.extension);
+          set("extend-text", n.text);
+          set("extend-stop", "Stop now and keep epoch " + n.keep_epoch);
+        }
+        ext.hidden = !show || extendDismissed(ext);
       }
       if (busy[r.id] && !isBusy(r.state)) finished = true;
     });

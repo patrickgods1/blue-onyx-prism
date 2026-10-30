@@ -43,8 +43,9 @@ pub use config::TrainingConfig;
 pub use job::{TrainJob, TrainRequest};
 pub use recipe::{Augment, TrainRecipe};
 
+pub use crate::backend::memory::Commit;
 use crate::config::Config;
-use crate::resources::catalog::Platform;
+use crate::resources::catalog::{self, Platform};
 use crate::resources::export::train::TrainPaths;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
@@ -152,7 +153,6 @@ pub fn public_subset_installed(root: &Path) -> bool {
 /// (`--allow-large`, the Training page's download confirmation, or `allow_large_downloads`).
 /// Nothing to refuse when it is downloaded already.
 pub fn check_public_download(root: &Path, allowed: bool) -> Result<()> {
-    use crate::resources::catalog;
     let Some(r) = catalog::lila_night() else {
         bail!(
             "the public night subset is not pinned in this build (its manifest lists no image); \
@@ -174,15 +174,112 @@ pub fn check_public_download(root: &Path, allowed: bool) -> Result<()> {
     )
 }
 
-/// Data loader workers: none on macOS (measured on an M1: 2 or 4 spawned workers did not speed
-/// up RF-DETR nano, which is GPU-bound there, and Ultralytics uses none on MPS; docs/TRAINING.md),
-/// else all cores but one, at most 8 (CUDA GPUs outrun one decoding thread).
-fn workers() -> u32 {
-    if cfg!(target_os = "macos") {
-        return 0;
+/// Data loader workers the core count allows at most (CUDA GPUs outrun one decoding process; more
+/// than 8 did not help).
+pub const MAX_AUTO_WORKERS: u32 = 8;
+/// Commit one data loader worker takes on Windows: each is a spawned Python that imports PyTorch
+/// (measured ~0.9 GB commit for `import torch` alone), plus its prefetched batches (measured
+/// ~1.4 GB per spawned worker during an RF-DETR nano run).
+pub const WORKER_COMMIT_BYTES: u64 = 1400 << 20;
+/// Commit kept free for the training process itself (model, optimizer, CUDA context, pinned
+/// memory) before any worker is counted (measured 5.5 GB for the RF-DETR nano trainer process).
+pub const MAIN_COMMIT_RESERVE_BYTES: u64 = 6 << 30;
+
+/// Worker processes alive at once per `--workers` of `trainer`, read from the pinned packages:
+/// - RF-DETR (rfdetr 1.11.2, `training/module_data.py` `train_dataloader` and `val_dataloader`):
+///   both loaders get `num_workers` and `persistent_workers` (`train_model.py` sets it), so the
+///   validation workers spawned at the end of epoch 1 join the training ones: 2.
+/// - Ultralytics (8.4.163, `models/yolo/detect/train.py` `get_dataloader`): the validation
+///   loader gets `workers * 2`, and both are `InfiniteDataLoader`s (`data/build.py`) that keep
+///   their workers for the whole run: 1 + 2 = 3.
+/// - transformers' `Trainer` (5.17.0, `trainer.py` `get_eval_dataloader`): with
+///   `dataloader_persistent_workers` the evaluation loader is cached with its workers next to
+///   the training one: 2.
+pub const fn worker_loaders(trainer: catalog::Trainer) -> u32 {
+    match trainer {
+        catalog::Trainer::RfDetr | catalog::Trainer::Transformers => 2,
+        catalog::Trainer::Ultralytics => 3,
     }
+}
+
+/// How many data loader workers a run gets, and why (logged at the start of training).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerChoice {
+    /// `--workers` of the trainer (0 = load in the training process).
+    pub workers: u32,
+    /// What the cores alone allow.
+    pub by_cores: u32,
+    /// The commit seen when choosing (Windows only).
+    pub commit: Option<Commit>,
+}
+
+impl WorkerChoice {
+    /// The log line: "memory: commit 21.3 GB limit, 5.1 GB free -> 0 data loader workers (cores
+    /// allow 5)".
+    pub fn describe(&self) -> String {
+        let n = workers_text(self.workers);
+        match self.commit {
+            Some(c) => format!(
+                "memory: commit {:.1} GB limit, {:.1} GB free -> {n} (cores allow {})",
+                gib(c.limit),
+                gib(c.available),
+                self.by_cores
+            ),
+            None => format!(
+                "data loader workers: {} (cores allow {})",
+                self.workers, self.by_cores
+            ),
+        }
+    }
+}
+
+/// "1 data loader worker", "3 data loader workers".
+pub fn workers_text(n: u32) -> String {
+    format!("{n} data loader worker{}", if n == 1 { "" } else { "s" })
+}
+
+/// Bytes in GiB, for messages.
+pub fn gib(bytes: u64) -> f64 {
+    bytes as f64 / f64::from(1u32 << 30)
+}
+
+/// Data loader workers on `os` with `cpus` logical cores, `commit` (Windows) and `loaders`
+/// ([`worker_loaders`]): none on macOS (measured on an M1: 2 or 4 spawned workers did not speed
+/// up RF-DETR nano, which is GPU-bound there, and Ultralytics uses none on MPS;
+/// docs/TRAINING.md), else all cores but one, 1..=[`MAX_AUTO_WORKERS`]. On Windows every worker
+/// is a fresh Python importing PyTorch, so a fixed paging file runs out of commit long before
+/// RAM (WinError 1455): there also at most what the free commit holds after
+/// [`MAIN_COMMIT_RESERVE_BYTES`], [`WORKER_COMMIT_BYTES`] per worker per loader, down to 0.
+pub fn workers_for(os: &str, cpus: usize, commit: Option<Commit>, loaders: u32) -> WorkerChoice {
+    let by_cores = if os == "macos" {
+        0
+    } else {
+        u32::try_from(cpus.saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .clamp(1, MAX_AUTO_WORKERS)
+    };
+    let commit = commit.filter(|_| os == "windows");
+    let by_memory = commit.map_or(u32::MAX, |c| {
+        let per = WORKER_COMMIT_BYTES * u64::from(loaders.max(1));
+        let n = c.available.saturating_sub(MAIN_COMMIT_RESERVE_BYTES) / per;
+        u32::try_from(n).unwrap_or(u32::MAX)
+    });
+    WorkerChoice {
+        workers: by_cores.min(by_memory),
+        by_cores,
+        commit,
+    }
+}
+
+/// [`workers_for`] on this machine now, for `trainer`.
+pub fn workers_now(trainer: catalog::Trainer) -> WorkerChoice {
     let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
-    u32::try_from(cpus.saturating_sub(1).clamp(1, 8)).unwrap_or(2)
+    workers_for(
+        std::env::consts::OS,
+        cpus,
+        crate::system_info::commit(),
+        worker_loaders(trainer),
+    )
 }
 
 /// The dataset options of `request` on `config`: the `training` section's assembly defaults
@@ -331,7 +428,7 @@ pub fn plan_job(
         options,
         root: config.data_root(),
         timeout: Duration::from_secs(u64::from(t.timeout_hours) * 3600),
-        workers: workers(),
+        workers: t.workers.map_or(job::Workers::Auto, job::Workers::Fixed),
         keep_work: false,
     })
 }
@@ -506,6 +603,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    const GB: u64 = 1 << 30;
+
+    fn commit(limit_gb: f64, free_gb: f64) -> Option<Commit> {
+        Some(Commit {
+            limit: (limit_gb * GB as f64) as u64,
+            available: (free_gb * GB as f64) as u64,
+        })
+    }
+
+    #[test]
+    fn workers_follow_the_cores_and_on_windows_the_free_commit() {
+        let rf = worker_loaders(catalog::Trainer::RfDetr);
+        let w = |os, cpus, c, loaders| workers_for(os, cpus, c, loaders).workers;
+        // This box: 6 cores, 2 GB of commit free -> none (load in the training process).
+        assert_eq!(w("windows", 6, commit(21.3, 2.0), rf), 0);
+        // Train + val loaders: (9.1 - 6) / (2 x 1.37 GiB) = 1; (12 - 6) / 2.73 = 2.
+        assert_eq!(w("windows", 6, commit(32.0, 9.1), 2), 1);
+        assert_eq!(w("windows", 6, commit(32.0, 10.0), 2), 1);
+        assert_eq!(w("windows", 6, commit(32.0, 12.0), 2), 2);
+        // Plenty free: the cores rule.
+        assert_eq!(w("windows", 6, commit(64.0, 60.0), rf), 5);
+        // Ultralytics' validation loader doubles the count: 3 processes per worker.
+        assert_eq!(worker_loaders(catalog::Trainer::Ultralytics), 3);
+        assert_eq!(w("windows", 16, commit(32.0, 13.0), 3), 1);
+        assert_eq!(w("windows", 16, commit(32.0, 16.0), 3), 2);
+        assert_eq!(worker_loaders(catalog::Trainer::Transformers), 2);
+        // Exactly at the reserve, or below it: none.
+        assert_eq!(w("windows", 6, commit(8.0, 6.0), rf), 0);
+        assert_eq!(w("windows", 6, commit(8.0, 0.5), rf), 0);
+        // No commit reading: the cores rule (all but one, 1..=8).
+        assert_eq!(w("windows", 6, None, rf), 5);
+        assert_eq!(w("windows", 1, None, rf), 1);
+        assert_eq!(w("windows", 64, None, rf), MAX_AUTO_WORKERS);
+        // Linux overcommits: the commit is not a limit there; macOS never spawns workers.
+        assert_eq!(w("linux", 6, commit(8.0, 0.5), rf), 5);
+        assert_eq!(w("macos", 8, None, rf), 0);
+        assert_eq!(w("macos", 8, commit(8.0, 8.0), rf), 0);
+        // The log line.
+        let c = workers_for("windows", 6, commit(21.3, 5.1), rf);
+        assert_eq!(
+            c.describe(),
+            "memory: commit 21.3 GB limit, 5.1 GB free -> 0 data loader workers (cores allow 5)"
+        );
+        let c = workers_for("windows", 6, commit(21.3, 9.1), rf);
+        assert_eq!(c.workers, 1);
+        assert!(
+            c.describe().contains("-> 1 data loader worker (cores"),
+            "{}",
+            c.describe()
+        );
+        assert_eq!(
+            workers_for("linux", 6, commit(1.0, 1.0), rf).describe(),
+            "data loader workers: 5 (cores allow 5)"
+        );
+    }
+
     #[test]
     fn requests_without_balance_read_as_off() {
         let req = request(TrainFamily::Yolo26, "n");
@@ -543,6 +696,12 @@ mod tests {
         );
         assert_eq!(j.accelerator.device_arg(), "mps");
         assert_eq!(j.options.negative_share, c.training.negative_share);
+        // Workers: sized when training starts, unless training.workers forces a count.
+        assert_eq!(j.workers, job::Workers::Auto);
+        let mut forced = c.clone();
+        forced.training.workers = Some(0);
+        let j0 = plan_job(&forced, request(TrainFamily::Yolo26, "n"), &mac(), None).unwrap();
+        assert_eq!(j0.workers, job::Workers::Fixed(0));
         let named = plan_job(
             &c,
             request(TrainFamily::Rfdetr, "nano"),

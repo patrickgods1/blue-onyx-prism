@@ -94,6 +94,7 @@ impl Task for HoldTask {
             env: vec![],
             cwd: PathBuf::from("."),
             timeout: Duration::from_secs(60),
+            low_priority: false,
         };
         let r = ctx
             .runner

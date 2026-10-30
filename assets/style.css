@@ -1090,6 +1090,9 @@ dialog#class-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
 .tr-metrics svg { max-width: 100%; height: auto; }
 .tr-metrics-row > td { padding-top: 0; }
 .tr-logbox { margin: 0.3rem 0 0; }
+/* Training page: an early-stop point passed while the loss still falls (Stop now / Continue). */
+.tr-extend { margin: 0.4rem 0 0; padding: 0.4rem 0.6rem; border-radius: 6px; background: var(--warn-bg); color: var(--warn-fg); font-size: 0.9rem; }
+.tr-extend form, .tr-extend button { margin-top: 0.3rem; }
 .tr-logbox > summary { margin: 0.2rem 0; font-size: 0.85rem; color: var(--muted); }
 .tr-kpis { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.3rem 0 0.6rem; }
 .tr-kpi { flex: 1 1 8rem; min-width: 7rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.6rem; }

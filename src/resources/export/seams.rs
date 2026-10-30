@@ -15,6 +15,11 @@ pub struct Cmd {
     pub env: Vec<(String, OsString)>,
     pub cwd: PathBuf,
     pub timeout: Duration,
+    /// Start the child below normal priority (Windows `BELOW_NORMAL_PRIORITY_CLASS`, Unix nice
+    /// of at least 10; [`crate::backend::priority`]); the processes it starts inherit it. Set
+    /// for the training environment's helpers (training, import, auto-label), which keep every
+    /// core busy for hours; the model export's commands keep the normal priority.
+    pub low_priority: bool,
 }
 
 impl Cmd {
@@ -207,12 +212,19 @@ impl Tree {
             use std::os::unix::process::CommandExt;
             // Own process group (pgid = pid) so `kill_tree` reaches every descendant.
             c.process_group(0);
+            if cmd.low_priority {
+                crate::backend::priority::lower_child(&mut c);
+            }
         }
         #[cfg(windows)]
         let job = {
             use std::os::windows::process::CommandExt;
-            // CREATE_NO_WINDOW: no console window when the service runs it.
-            c.creation_flags(0x0800_0000);
+            // CREATE_NO_WINDOW: no console window when the service runs it; below normal
+            // priority for a low-priority command (inherited by the processes it starts).
+            c.creation_flags(crate::backend::priority::child_creation_flags(
+                0x0800_0000,
+                cmd.low_priority,
+            ));
             match crate::backend::job::Job::new() {
                 Ok(j) => Some(j),
                 Err(e) => {

@@ -157,11 +157,19 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   export + ORT check, install, benchmark on the held-out split; `epoch`/`eval` events carry every scalar `metrics`
   (raw keys -> ids by `progress::canonical`, F-beta sweeps, `mem_gb`, `img_s`), kept as `progress.history` + `best`,
   table columns in `training.metric_columns` (`POST /v1/training/metric-columns`); an early GPU OOM retries at half the
-  batch (MPS watermark 1.0, RF-DETR memory at its multi-scale side); docs in `docs/TRAINING.md`.
+  batch (MPS watermark 1.0, RF-DETR memory at its multi-scale side); data loader workers are sized at the train stage
+  by free commit on Windows (`training::workers_for`, ~1.4 GB per spawned worker x loaders; `training.workers` overrides)
+  and a host OOM (WinError 1455, `DefaultCPUAllocator`, which also wins over a WDDM "CUDA out of memory") halves the
+  workers, never the batch; training-env helpers (train, import, auto-label: `train_python_cmd`) run below normal
+  priority (`Cmd::low_priority`, Windows creation flag / Unix nice >= 10, `backend::priority`), and between training and
+  export `train_model.py` `prepare_export` frees the training state (DataLoader workers via gc, trainer, one RF-DETR model at
+  a time), caps CPU threads (`BOP_EXPORT_THREADS`) and waits up to 5 min for 3 GB RAM / 4 GB commit; docs in `docs/TRAINING.md`.
   Starting points per family in `recipe::recommended` (epochs cap, patience, min epochs, min_delta; `training.epochs`/
   `.patience` None = recommended, a stored legacy 50 = None); one convergence rule for every trainer (`Convergence` in
-  `train_model.py`, Rust twin `progress::convergence_decision`, parity-tested; native early stopping off; best epoch
-  exported) and Finish now (`POST /training/finish` -> `<run dir>/work/stop-request`, `stop` event). `SceneFilter` is a
+  `train_model.py`, Rust twin `progress::convergence_run`, parity-tested; native early stopping off; best raw epoch
+  exported; gains judged on a `smooth`-epoch mean (3); a recommended patience doubles under 50 validation images
+  (`TrainRecipe::convergence_patience`); a stop point with the training loss still falling (>2%, `loss_falling`) becomes a
+  `converge_point` extension, at most 2, shown on the page with Stop now = Finish now) and Finish now (`POST /training/finish` -> `<run dir>/work/stop-request`, `stop` event). `SceneFilter` is a
   day/night/ir set (`night` alone = night only); the held-out set is chosen from all review frames before the scene
   filter (tags `heldout:<scene>|all|in-scope`, `heldout_fingerprint`), so runs queued with several scenes share a
   `compare_group` and compare per scene (`training/compare.rs`, Comparison card, `GET /v1/training/compare`). Class

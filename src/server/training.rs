@@ -190,6 +190,12 @@ struct RunRow {
     busy: bool,
     /// Finish now applies: running (or paused) in its training stage, not stopped yet.
     can_finish: bool,
+    /// The Stop now / Continue notice while the run trains past an early-stop point (training
+    /// loss still falling); empty otherwise.
+    extend: String,
+    /// The epoch Stop now keeps, and the point's extension number (Continue dismisses it).
+    extend_keep: u32,
+    extend_no: u32,
     percent: u8,
     describe: String,
     dataset: String,
@@ -416,6 +422,15 @@ fn can_finish(r: &RunRecord) -> bool {
         && r.progress
             .as_ref()
             .is_none_or(|p| p.stopped.is_none() && p.phase.is_none())
+}
+
+/// The Stop now / Continue notice of `r`: while it can still finish and trains past an
+/// early-stop point.
+fn extension(r: &RunRecord) -> Option<&crate::training::progress::ExtensionNotice> {
+    if !can_finish(r) {
+        return None;
+    }
+    r.progress.as_ref()?.extension.as_ref()
 }
 
 fn state_str(s: RunState) -> &'static str {
@@ -845,6 +860,9 @@ fn view_with(
             state: state_str(r.state),
             busy: r.state.is_busy(),
             can_finish: can_finish(r),
+            extend: extension(r).map_or_else(String::new, |n| n.text.clone()),
+            extend_keep: extension(r).map_or(0, |n| n.keep_epoch),
+            extend_no: extension(r).map_or(0, |n| n.extension),
             percent: r.percent,
             describe: r.describe(),
             dataset: r.dataset.as_ref().map_or_else(String::new, |d| {
@@ -1178,6 +1196,7 @@ pub(crate) fn requests_from_form(
         r.epochs = epochs.unwrap_or_else(|| training.epochs_for(family));
         // A typed patience is checked against the epochs; a default one is capped by them.
         r.patience = patience.unwrap_or_else(|| training.patience_for(family).min(r.epochs));
+        r.patience_recommended = patience.is_none() && training.patience.is_none();
         if let Some(i) = imgsz {
             r.imgsz = i;
         }
@@ -3073,6 +3092,13 @@ mod tests {
             epochs: 100,
             patience: 15,
             since_best: 1,
+            extension: Some(crate::training::progress::ExtensionNotice {
+                text:
+                    "Early stop reached at epoch 3 (best epoch 2); training loss is still falling."
+                        .into(),
+                keep_epoch: 2,
+                extension: 1,
+            }),
             ..Default::default()
         });
         let mut queued = record("r8", SceneFilter::DAY, None, RunState::Queued, None);
@@ -3255,6 +3281,19 @@ mod tests {
         let c = row("c");
         assert!(c.contains(hidden), "running but not training: {c}");
         assert_eq!(page.matches(shown).count(), 1);
+        // Past an early-stop point: the notice, Stop now (the finish action) and Continue.
+        assert!(
+            running.contains(
+                "data-field=\"extend\" data-run=\"r9\" data-ext=\"1\"><span data-field=\"extend-text\">Early stop reached at epoch 3"
+            ),
+            "{running}"
+        );
+        assert!(
+            running.contains(">Stop now and keep epoch 2</button>"),
+            "{running}"
+        );
+        assert!(running.contains("data-action=\"extend-continue\""));
+        assert!(queued.contains("data-ext=\"0\" hidden>"), "{queued}");
         // The Comparison card: the newest group open, the routed row, the best cells.
         let i = page.find("id=\"compare\"").expect("the Comparison card");
         let card = &page[i..i + page[i..].find("id=\"use\"").unwrap()];

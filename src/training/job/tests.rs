@@ -39,6 +39,8 @@ struct TrainFake {
     /// Run out of GPU memory when `--batch` is above this, after `oom_epochs` finished epochs.
     oom_above: Option<u32>,
     oom_epochs: u32,
+    /// Run out of system memory (the incident's lines) when `--workers` is above this.
+    host_oom_above: Option<u32>,
     train_cmds: Mutex<Vec<Cmd>>,
 }
 
@@ -90,6 +92,20 @@ impl CommandRunner for TrainFake {
         let batch: u32 = arg_after(cmd, "--batch")
             .and_then(|b| b.to_str().and_then(|b| b.parse().ok()))
             .unwrap_or(0);
+        let workers: u32 = arg_after(cmd, "--workers")
+            .and_then(|w| w.to_str().and_then(|w| w.parse().ok()))
+            .unwrap_or(0);
+        if self.host_oom_above.is_some_and(|max| workers > max) {
+            let lines: Vec<String> = HOST_OOM.lines().map(str::to_string).collect();
+            for l in &lines {
+                on_line(l);
+            }
+            return Err(anyhow::Error::new(ChildFailed {
+                program: "python".into(),
+                status: "exit code: 1".into(),
+                lines,
+            }));
+        }
         if self.oom_above.is_some_and(|max| batch > max) {
             for e in 1..=self.oom_epochs {
                 on_line(&format!(
@@ -288,7 +304,7 @@ fn job(
         options: dataset::Options::default(),
         root: root.to_path_buf(),
         timeout: Duration::from_secs(60),
-        workers: 0,
+        workers: Workers::Fixed(0),
         keep_work: false,
     }
 }
@@ -947,24 +963,234 @@ fn a_failed_benchmark_keeps_the_model() {
     );
 }
 
+const LINUX_HOST: HostMemory = HostMemory {
+    windows: false,
+    workers: 2,
+    commit: None,
+};
+
 #[test]
 fn classify_names_the_gpu_failures() {
     let r = TrainRecipe::new(TrainFamily::Yolo26, "m").unwrap();
     let l = |s: &str| vec![s.to_string()];
     assert!(
-        classify_train_failure(&l("RuntimeError: MPS backend out of memory"), &r)
-            .unwrap()
-            .contains("batch (now 8)")
+        classify_train_failure(
+            &l("RuntimeError: MPS backend out of memory"),
+            &r,
+            &LINUX_HOST
+        )
+        .unwrap()
+        .contains("batch (now 8)")
     );
     assert!(
         classify_train_failure(
             &l("CUDA error: no kernel image is available for execution"),
-            &r
+            &r,
+            &LINUX_HOST
         )
         .unwrap()
         .contains("no kernels")
     );
-    assert!(classify_train_failure(&l("all fine"), &r).is_none());
+    assert!(classify_train_failure(&l("all fine"), &r, &LINUX_HOST).is_none());
+}
+
+/// Lines of the incident (RF-DETR nano on a GTX 1070 Ti, Windows, a 5.6 GB fixed paging file):
+/// the WDDM CUDA allocation that fails with GPU memory free, then the CPU allocation.
+const WDDM_OOM: &str = r"[W1029 16:54:57.000000000 CUDACachingAllocator.cpp:3934] memory allocation failed with OOM on device 0 while trying to allocate 20971520 bytes (free: 6624903168, total: 8589803520).
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 6.17 GiB is free. Of the allocated memory 845.46 MiB is allocated by PyTorch, and 4.54 MiB is reserved by PyTorch but unallocated.
+Traceback (most recent call last):
+    return self._apply(lambda t: t.cpu())
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: not enough memory: you tried to allocate 262144 bytes.";
+
+/// The incident's last attempt: the validation workers fail to start at the end of epoch 1.
+const HOST_OOM: &str = r#"Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "C:	\Lib\multiprocessing\spawn.py", line 122, in spawn_main
+OSError: [WinError 1455] The paging file is too small for this operation to complete. Error loading "C:	\Lib\site-packages	orch\lib\cufft64_11.dll" or one of its dependencies.
+OSError: [WinError 1450] Insufficient system resources exist to complete the requested service: 'C:\t\DLLs'
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: not enough memory: you tried to allocate 3993600 bytes.
+RuntimeError: can't start new thread"#;
+
+#[test]
+fn host_out_of_memory_is_not_a_gpu_failure() {
+    let l = |s: &str| -> Vec<String> { s.lines().map(str::to_string).collect() };
+    // WDDM: "CUDA out of memory" with the CPU allocator failing too = the host.
+    let wddm = l(WDDM_OOM);
+    assert!(
+        host_out_of_memory_line(&wddm)
+            .unwrap()
+            .contains("DefaultCPUAllocator")
+    );
+    assert_eq!(out_of_memory_line(&wddm), None);
+    // The paging file line wins over the later, vaguer ones.
+    let spawn = l(HOST_OOM);
+    assert!(
+        host_out_of_memory_line(&spawn)
+            .unwrap()
+            .contains("[WinError 1455]")
+    );
+    // A real GPU OOM stays one; `torch.OutOfMemoryError` is not Python's `MemoryError`.
+    let gpu = l("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB");
+    assert_eq!(host_out_of_memory_line(&gpu), None);
+    assert!(out_of_memory_line(&gpu).is_some());
+    assert!(host_out_of_memory_line(&l("MemoryError: Unable to allocate 3.1 GiB")).is_some());
+    assert!(
+        host_out_of_memory_line(&l(
+            "RuntimeError: DataLoader worker (pid 4242) is killed by signal: Killed."
+        ))
+        .is_some()
+    );
+
+    let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
+    r.batch = 4;
+    let windows = HostMemory {
+        windows: true,
+        workers: 5,
+        commit: Some(crate::training::Commit {
+            limit: 21_300 << 20,
+            available: 2 << 30,
+        }),
+    };
+    let m = classify_train_failure(&wddm, &r, &windows).unwrap();
+    assert!(
+        m.starts_with("training ran out of system memory (RuntimeError: [enforce fail"),
+        "{m}"
+    );
+    assert!(
+        m.contains("each of the 5 data loader workers loads PyTorch (~1 GB each); commit 18.8 of 20.8 GB was in use when training started."),
+        "{m}"
+    );
+    assert!(m.contains("Let Windows manage the paging file size"), "{m}");
+    assert!(m.contains("training.workers to 0"), "{m}");
+    assert!(m.ends_with("then train again"), "{m}");
+    assert!(!m.contains("GPU"), "{m}");
+    // Down to no workers: the advice is the paging file alone.
+    let m = classify_train_failure(
+        &spawn,
+        &r,
+        &HostMemory {
+            workers: 0,
+            commit: None,
+            ..windows
+        },
+    )
+    .unwrap();
+    assert!(m.contains("[WinError 1455]"), "{m}");
+    assert!(m.contains("(no data loader workers)"), "{m}");
+    assert!(
+        !m.contains("training.workers") && !m.contains("commit"),
+        "{m}"
+    );
+    let m = classify_train_failure(&spawn, &r, &LINUX_HOST).unwrap();
+    assert!(m.contains("Close other programs or add swap"), "{m}");
+}
+
+/// The `--workers` of the training commands `fake` ran (not the self-check).
+fn train_workers(fake: &TrainFake) -> Vec<u32> {
+    fake.train_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| !c.display().contains("--self-check"))
+        .map(|c| {
+            arg_after(c, "--workers")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+fn out_of_system_memory_halves_the_workers_and_keeps_the_batch() {
+    let t = tmp("host-oom");
+    let mut j = job(
+        &t.0,
+        TrainFamily::Rfdetr,
+        "nano",
+        cuda(),
+        Platform::LINUX_X64,
+    );
+    j.request.recipe.batch = 4;
+    j.workers = Workers::Fixed(5);
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        host_oom_above: Some(1),
+        ..TrainFake::new()
+    };
+    let mut lines = Vec::new();
+    let mut batches_reported = Vec::new();
+    let r = run_training(
+        &j,
+        &fake,
+        &fake,
+        &NoHooks,
+        &mut |p| match p {
+            TrainReport::Line(l) => lines.push(l.to_string()),
+            TrainReport::Batch(b) => batches_reported.push(b),
+            _ => {}
+        },
+        &AtomicBool::new(false),
+    );
+    let out = r.unwrap();
+    assert_eq!(train_workers(&fake), [5, 2, 1]);
+    assert_eq!(train_batches(&fake), [4, 4, 4]);
+    assert!(batches_reported.is_empty(), "{batches_reported:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "out of system memory with 5 data loader workers, retrying with 2"),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "out of system memory with 2 data loader workers, retrying with 1"),
+        "{lines:?}"
+    );
+    let prov: Provenance =
+        serde_json::from_slice(&std::fs::read(&out.output.provenance).unwrap()).unwrap();
+    assert_eq!(prov.recipe.batch, 4);
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    assert!(
+        log.contains("# data loader workers: 5 (training.workers)"),
+        "{log}"
+    );
+
+    // Never enough: 5 -> 2 -> 1 -> 0, then the host message (not the GPU's).
+    let t2 = tmp("host-oom-all");
+    let mut j = job(
+        &t2.0,
+        TrainFamily::Rfdetr,
+        "nano",
+        cuda(),
+        Platform::LINUX_X64,
+    );
+    j.request.recipe.batch = 4;
+    j.workers = Workers::Fixed(5);
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        fail_lines: WDDM_OOM.lines().collect(),
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert_eq!(train_workers(&fake), [5, 2, 1, 0]);
+    assert_eq!(train_batches(&fake), [4, 4, 4, 4]);
+    assert!(
+        e.message.starts_with("training ran out of system memory"),
+        "{}",
+        e.message
+    );
+    assert!(
+        e.message.contains("(no data loader workers)"),
+        "{}",
+        e.message
+    );
 }
 
 #[test]
@@ -1061,10 +1287,13 @@ fn finish_now_writes_the_stop_file_and_the_run_exports_its_best_epoch() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let args = fake.train_cmds.lock().unwrap().last().unwrap().clone();
+    // The recommended-style patience 1 doubles on the tiny validation split (at most the 2
+    // epochs); the mAP is averaged over 3 epochs.
     for (k, v) in [
-        ("--patience", "1"),
+        ("--patience", "2"),
         ("--min-epochs", "10"),
         ("--min-delta", "0.001"),
+        ("--smooth", "3"),
     ] {
         assert_eq!(arg_after(&args, k).unwrap(), PathBuf::from(v), "{k}");
     }
@@ -1089,6 +1318,13 @@ fn finish_now_writes_the_stop_file_and_the_run_exports_its_best_epoch() {
     );
     let e = svc.finish(&ida).unwrap_err();
     assert!(e.contains("only a running run"), "{e}");
+    let log = std::fs::read_to_string(t.0.join("training/a").join(LOG_FILE)).unwrap();
+    assert!(
+        log.contains(
+            "validation images (< 50): patience 2 instead of 1; mAP averaged over the last 3 epochs"
+        ),
+        "{log}"
+    );
     assert!(svc.cancel(&idb));
     svc.shutdown();
 }

@@ -1,4 +1,5 @@
 //! Classifies a failed child process of the export (the env self-check, the export script, uv)
+//! or of a training-environment script (training, auto-label, import: [`FailureContext::task`])
 //! from its last output lines ([`ChildFailed::lines`]) into a message with the likely cause and
 //! the next action. Pure; an unclassified failure keeps the plain "failed; last output" text.
 
@@ -17,6 +18,23 @@ pub(crate) struct FailureContext<'a> {
     /// The child is our Python script (self-check or export), whose own lines start with
     /// `[export_model]`.
     pub python_script: bool,
+    /// What ran, for the memory and disk messages: "export", "training", "auto-label",
+    /// "import" or "training environment setup" ("the training ran out of memory ... then train
+    /// again"; another task: "then try again").
+    pub task: &'static str,
+}
+
+impl FailureContext<'_> {
+    /// The verb of "then <verb> again".
+    fn verb(&self) -> &'static str {
+        match self.task {
+            "training" => "train",
+            "auto-label" => "auto-label",
+            "import" => "import",
+            "export" => "export",
+            _ => "try",
+        }
+    }
 }
 
 /// Prefix of the export script's own log lines.
@@ -93,9 +111,10 @@ pub(crate) fn classify(lines: &[String], ctx: &FailureContext<'_>) -> Option<Str
     ) {
         return Some(format!(
             "the disk holding {} is full ({}); free a few GB there (or set download_dir to a \
-             larger disk), then export again",
+             larger disk), then {} again",
             ctx.tools.display(),
-            quote(l)
+            quote(l),
+            ctx.verb()
         ));
     }
     if let Some(l) = find(
@@ -117,9 +136,11 @@ pub(crate) fn classify(lines: &[String], ctx: &FailureContext<'_>) -> Option<Str
             ""
         };
         return Some(format!(
-            "the export ran out of memory ({}): PyTorch needs a few GB of free RAM{pagefile}; \
-             close other programs and export again",
-            quote(l)
+            "the {} ran out of memory ({}): PyTorch needs a few GB of free RAM{pagefile}; \
+             close other programs and {} again",
+            ctx.task,
+            quote(l),
+            ctx.verb()
         ));
     }
     if ctx.windows {
@@ -230,6 +251,7 @@ mod tests {
             system_msvcp140: Some(FileVersion([14, 26, 28720, 3])),
             tools: Path::new("D:/bop/tools"),
             python_script: true,
+            task: "export",
         }
     }
 
@@ -352,6 +374,43 @@ OSError: [WinError 1114] A dynamic link library (DLL) initialization routine fai
         )
         .unwrap();
         assert!(m.contains("is full"), "{m}");
+        assert!(m.ends_with("then export again"), "{m}");
+        // Training, auto-label and import name themselves.
+        let train = FailureContext {
+            task: "training",
+            ..ctx(true)
+        };
+        let m = classify(&lines("OSError: [WinError 1455] The paging file is too small for this operation to complete."), &train).unwrap();
+        assert!(m.starts_with("the training ran out of memory"), "{m}");
+        assert!(m.ends_with("close other programs and train again"), "{m}");
+        let m = classify(
+            &lines("OSError: [Errno 28] No space left on device"),
+            &train,
+        )
+        .unwrap();
+        assert!(m.ends_with("then train again"), "{m}");
+        let m = classify(
+            &lines("MemoryError"),
+            &FailureContext {
+                task: "auto-label",
+                ..ctx(false)
+            },
+        )
+        .unwrap();
+        assert!(
+            m.starts_with("the auto-label ran out of memory")
+                && m.ends_with("and auto-label again"),
+            "{m}"
+        );
+        let m = classify(
+            &lines("MemoryError"),
+            &FailureContext {
+                task: "import",
+                ..ctx(false)
+            },
+        )
+        .unwrap();
+        assert!(m.starts_with("the import ran out of memory"), "{m}");
     }
 
     #[test]

@@ -11,6 +11,13 @@
 //!   exits (the guard's drop does nothing).
 //! - Other OSes: no-op.
 //!
+//! Child processes (the training / import / auto-label helpers, `Cmd::low_priority` in
+//! `resources::export`) start below normal instead: [`child_creation_flags`] adds
+//! `BELOW_NORMAL_PRIORITY_CLASS` to the creation flags on Windows (the processes they start,
+//! e.g. PyTorch's DataLoader workers, inherit it); [`lower_child`] raises the child's nice value
+//! to at least [`CHILD_NICE`] between fork and exec on Unix (inherited by its threads and
+//! children).
+//!
 //! Only the CPU scheduling priority changes: `PROCESS_MODE_BACKGROUND_BEGIN` / EcoQoS are
 //! deliberately not used because they also lower I/O and memory priority and change clocks,
 //! which skews timings.
@@ -41,6 +48,43 @@ pub fn lower_for_benchmark(enabled: bool, in_service: bool) -> Guard {
         return Guard::noop();
     }
     imp::lower(in_service)
+}
+
+/// `BELOW_NORMAL_PRIORITY_CLASS`, a process creation flag on Windows.
+pub const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+
+/// Nice value (at least) of a low-priority child process on Unix.
+pub const CHILD_NICE: i32 = 10;
+
+/// Windows creation flags of a child: `base` (e.g. `CREATE_NO_WINDOW`) plus
+/// [`BELOW_NORMAL_PRIORITY_CLASS`] when `low_priority` (pure).
+pub const fn child_creation_flags(base: u32, low_priority: bool) -> u32 {
+    if low_priority {
+        base | BELOW_NORMAL_PRIORITY_CLASS
+    } else {
+        base
+    }
+}
+
+/// Start `cmd`'s process with a nice value of at least [`CHILD_NICE`] (never lowers a higher
+/// one, e.g. a service already running under `Nice=15`). A failure leaves the inherited
+/// priority (an unprivileged process can always raise its nice value, so it does not fail in
+/// practice).
+#[cfg(unix)]
+pub fn lower_child(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook runs in the forked child before exec and only makes the two
+    // async-signal-safe syscalls getpriority / setpriority on the child itself; it allocates
+    // nothing and touches no shared state.
+    unsafe {
+        cmd.pre_exec(|| {
+            let current = libc::getpriority(libc::PRIO_PROCESS, 0);
+            if current < CHILD_NICE {
+                let _ = libc::setpriority(libc::PRIO_PROCESS, 0, CHILD_NICE);
+            }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(windows)]
@@ -148,6 +192,22 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_flags_add_below_normal_only_when_asked() {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        assert_eq!(child_creation_flags(CREATE_NO_WINDOW, true), 0x0800_4000);
+        assert_eq!(
+            child_creation_flags(CREATE_NO_WINDOW, false),
+            CREATE_NO_WINDOW
+        );
+        assert_eq!(child_creation_flags(0, true), BELOW_NORMAL_PRIORITY_CLASS);
+        #[cfg(windows)]
+        assert_eq!(
+            BELOW_NORMAL_PRIORITY_CLASS,
+            windows::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS.0
+        );
+    }
 
     #[test]
     fn disabled_is_noop() {
