@@ -1214,10 +1214,25 @@ pub(super) async fn config_models_remove(
             })
             .map(|msg| {
                 // Files go only once the entry is saved out of the config.
-                let done = outcome
+                let mut done = outcome
                     .as_ref()
                     .map(|o| o.delete_files())
                     .unwrap_or_default();
+                // Its benchmark results go too (the Benchmark page lists what they hold).
+                if let Some(o) = &outcome {
+                    let results = crate::benchmark::results_path(&state.config_path);
+                    match crate::benchmark::forget::forget_model(&results, &o.name) {
+                        Ok(f) if f.any() => done.push_str(" and dropped its benchmark results"),
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!("benchmark results of '{}' not dropped: {e:#}", o.name);
+                            done.push_str(&format!(
+                                "; its benchmark results stay ({e:#}): remove them on the \
+                                 Benchmark page"
+                            ));
+                        }
+                    }
+                }
                 format!("{done}. {msg}")
             })
             .map_err(|e| match e.downcast::<ActionError>() {
