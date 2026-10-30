@@ -53,17 +53,23 @@ fn uv_cmd(job: &ExportJob, stage: Stage, timeout: Duration, args: &[&std::ffi::O
         ],
         cwd: p.tools.clone(),
         timeout,
+        low_priority: false,
     }
 }
 
+/// The interpreter flags in front of every export and training script ([`python_cmd`],
+/// `train::train_python_cmd`).
+pub(crate) const PYTHON_FLAGS: [&str; 6] = ["-X", "faulthandler", "-X", "utf8", "-u", "-I"];
+
 /// The environment's Python running `args` (the export script) as
-/// `python -X faulthandler -u -I <args>`, offline, with its settings and caches under `tools/`.
-/// `-X faulthandler` makes a native crash (an access violation while loading PyTorch's DLLs)
-/// print the Python stack instead of exiting silently.
+/// `python -X faulthandler -X utf8 -u -I <args>`, offline, with its settings and caches under
+/// `tools/`. `-X faulthandler` makes a native crash (an access violation while loading PyTorch's
+/// DLLs) print the Python stack instead of exiting silently; `-X utf8` writes the piped output as
+/// UTF-8 (on Windows it is the ANSI code page otherwise, and `-I` ignores `PYTHONIOENCODING`).
 fn python_cmd(job: &ExportJob, stage: Stage, timeout: Duration, args: Vec<OsString>) -> Cmd {
     let p = &job.paths;
     let cfg = |sub: &str| p.yolo_config.join(sub).into_os_string();
-    let mut all: Vec<OsString> = vec!["-X".into(), "faulthandler".into(), "-u".into(), "-I".into()];
+    let mut all: Vec<OsString> = PYTHON_FLAGS.iter().map(OsString::from).collect();
     all.extend(args);
     Cmd {
         stage,
@@ -85,6 +91,7 @@ fn python_cmd(job: &ExportJob, stage: Stage, timeout: Duration, args: Vec<OsStri
         ],
         cwd: p.work.clone(),
         timeout,
+        low_priority: false,
     }
 }
 
@@ -103,6 +110,7 @@ fn explained(
             system_msvcp140: msvcp140,
             tools: &job.paths.tools,
             python_script,
+            task: "export",
         },
     )
 }

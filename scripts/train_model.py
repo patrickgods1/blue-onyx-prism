@@ -41,9 +41,18 @@ training batches (Ultralytics, transformers) or to one extra copy of each traini
 those probabilities (rfdetr).
 
 Convergence (`Convergence`, the same rule for every trainer; their own early stopping is off):
-after each validation, the run stops once `--min-epochs` passed and `--patience` epochs brought no
-mAP 50-95 (else mAP 50) gain above `--min-delta`, or at once when `--stop-file` exists (the
-service's Finish now); a `stop` event says why, and the best epoch's weights are exported.
+after each validation, the run reaches a stop point once `--min-epochs` passed and `--patience`
+epochs brought no gain above `--min-delta` in the mean of the last `--smooth` mAP 50-95 (else
+mAP 50) values. While the training loss still falls over those epochs (`loss_falling`: the later
+half's mean more than 2% below the earlier half's) it goes on instead, at most twice, each time
+for another `--patience` epochs (a `converge_point` event; the service offers Stop now / Continue);
+else it stops. It stops at once when `--stop-file` exists (the service's Finish now / Stop now); a
+`stop` event says why, and the best (raw mAP) epoch's weights are exported.
+
+Export (`prepare_export`, after training, in this process): the training state is released first
+(DataLoader workers stopped, trainer and optimizer dropped, GPU cache emptied), the CPU threads are
+capped (`BOP_EXPORT_THREADS`, else all physical cores but one) and the export waits up to 5 min for
+3 GB available memory / 4 GB available commit (Windows), then goes ahead anyway.
 
 The service runs this file (embedded in the binary) inside its pinned training environment
 (<data root>/tools/train-env), offline: YOLO_OFFLINE=1, HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1;
@@ -96,51 +105,136 @@ def fail(msg: str) -> None:
     raise SystemExit(f"[train_model] error: {msg}")
 
 
+# Extensions past a stop point while the training loss still falls (`Convergence`), and the
+# relative drop of the loss that counts as falling (`loss_falling`).
+MAX_EXTENSIONS = 2
+LOSS_FALL = 0.02
+
+
+def mean(values) -> float:
+    """Left-to-right sum / count (not `sum()`: Python 3.12+ compensates, the Rust twin does not)."""
+    s = 0.0
+    for v in values:
+        s += v
+    return s / len(values)
+
+
+def loss_halves(losses):
+    """(mean of the earlier n // 2, mean of the later n // 2) of the finite values of `losses` (None
+    and non-finite ones skipped; an odd middle value counts in neither); None below 4 values."""
+    v = [float(x) for x in losses if x is not None and math.isfinite(float(x))]
+    half = len(v) // 2
+    if half < 2:
+        return None
+    return mean(v[:half]), mean(v[len(v) - half:])
+
+
+def loss_falling(losses) -> bool:
+    """Whether the training loss still falls over `losses` (in epoch order): the later half's mean
+    is below the earlier half's by more than LOSS_FALL of it (`loss_halves`; too few values: False).
+    The twin of src/training/progress.rs `loss_falling`."""
+    h = loss_halves(losses)
+    return h is not None and h[1] < h[0] - LOSS_FALL * abs(h[0])
+
+
 class Convergence:
     """When to stop training (one rule for every trainer; src/training/progress.rs
-    `convergence_decision` is its twin, parity-tested). `update(epoch, value)` once per validated
-    epoch with its mAP (None when there is none): "finish" when the stop file exists, "converged"
-    once `epoch >= min_epochs` and `patience` epochs passed since the last gain above `min_delta`
-    (patience 0 = never), else None. A repeated or older epoch is ignored. `best` / `best_epoch`
-    are the last such gain; `top` / `top_epoch` the highest value, `improved` whether this epoch
-    set it (the checkpoint to keep). Pure, no torch."""
+    `convergence_run` is its twin, parity-tested). `update(epoch, value, loss)` once per validated
+    epoch with its mAP (None when there is none) and training loss: "finish" when the stop file
+    exists, "converged" once `epoch >= min_epochs` and `patience` epochs passed since the last gain
+    above `min_delta` (patience 0 = never), else None. The gain is measured on the mean of the last
+    `smooth` mAP values (1 = the raw value), so one noisy peak of a small validation split does not
+    start the countdown. At such a stop point, while the training loss still falls over the last
+    `patience` epochs (`loss_falling`), at most MAX_EXTENSIONS times and before the last of
+    `epochs` (0 = unknown), the run goes on instead: `point` holds the `converge_point` event and
+    the countdown restarts there. A repeated or older epoch is ignored. `best` / `best_epoch` are
+    the last such gain (smoothed); `top` / `top_epoch` the highest raw value, `improved` whether
+    this epoch set it (the checkpoint to keep). Pure, no torch."""
 
-    def __init__(self, patience: int = 0, min_epochs: int = 0, min_delta: float = 0.0, stop_file=None):
+    def __init__(self, patience: int = 0, min_epochs: int = 0, min_delta: float = 0.0, stop_file=None,
+                 smooth: int = 1, epochs: int = 0):
         self.patience, self.min_epochs, self.min_delta = int(patience), int(min_epochs), float(min_delta)
+        self.smooth, self.epochs = max(1, int(smooth)), int(epochs)
         self.stop_file = Path(stop_file) if stop_file else None
         self.last = 0
+        self.window = []
+        self.losses = []
         self.best, self.best_epoch = None, 0
         self.top, self.top_epoch = None, 0
         self.improved = False
+        self.extensions, self.restart = 0, 0
+        self.falling = False
+        self.point = None
         self.decision = None
 
-    def update(self, epoch: int, value) -> str | None:
+    def update(self, epoch: int, value, loss=None) -> str | None:
         epoch = int(epoch)
         if epoch <= self.last or self.decision is not None:
             return None
         self.last = epoch
         self.improved = False
+        self.point = None
+        self.losses.append(float(loss) if loss is not None and math.isfinite(float(loss)) else None)
         if value is not None and math.isfinite(float(value)):
             v = float(value)
-            if self.best is None or v > self.best + self.min_delta:
-                self.best, self.best_epoch = v, epoch
+            self.window = (self.window + [v])[-self.smooth:]
+            m = mean(self.window)
+            if self.best is None or m > self.best + self.min_delta:
+                self.best, self.best_epoch = m, epoch
             if self.top is None or v > self.top:
                 self.top, self.top_epoch, self.improved = v, epoch, True
         if self.stop_file is not None and self.stop_file.exists():
             self.decision = "finish"
-        elif self.patience > 0 and self.best is not None and epoch >= self.min_epochs and epoch - self.best_epoch >= self.patience:
-            self.decision = "converged"
+        elif (self.patience > 0 and self.best is not None and epoch >= self.min_epochs
+              and epoch - max(self.best_epoch, self.restart) >= self.patience):
+            recent = self.losses[-self.patience:]
+            self.falling = loss_falling(recent)
+            if self.falling and self.extensions < MAX_EXTENSIONS and (self.epochs <= 0 or epoch < self.epochs):
+                self.extensions += 1
+                self.restart = epoch
+                nxt = epoch + self.patience
+                early, late = loss_halves(recent)
+                self.point = {"epoch": epoch, "best_epoch": self.top_epoch, "best": self.top, "loss_falling": True,
+                              "loss_from": early, "loss_to": late, "extension": self.extensions,
+                              "next_check": nxt if self.epochs <= 0 else min(nxt, self.epochs)}
+            else:
+                self.decision = "converged"
         return self.decision
+
+    def step(self, epoch: int, value, loss=None) -> bool:
+        """`update`, then its events (`converge_point`, `stop`): True when training stops here."""
+        decision = self.update(epoch, value, loss)
+        if self.point is not None:
+            p = self.point
+            log(f"early stop point at epoch {p['epoch']} (best epoch {p['best_epoch']}, mAP {p['best']}), but the "
+                f"training loss is still falling (mean {p['loss_from']:.3f} -> {p['loss_to']:.3f}): continuing to epoch "
+                f"{p['next_check']} (extension {p['extension']} of {MAX_EXTENSIONS}; Finish now keeps epoch {p['best_epoch']})")
+            event("converge_point", **p)
+        if decision:
+            self.emit()
+        return bool(decision)
 
     def emit(self) -> None:
         """The `stop` event of the decision (the best epoch is the one exported)."""
-        why = "no mAP gain above %g for %d epochs" % (self.min_delta, self.patience) if self.decision == "converged" else "finish requested"
+        if self.decision == "converged":
+            why = "no mAP gain above %g for %d epochs" % (self.min_delta, self.patience)
+            if self.smooth > 1:
+                why += " (mAP averaged over the last %d epochs)" % self.smooth
+            if not self.falling:
+                why += "; training loss no longer falling"
+            elif self.extensions >= MAX_EXTENSIONS:
+                why += "; training loss still falling, but %d extensions used" % MAX_EXTENSIONS
+            else:
+                why += "; training loss still falling, but no epochs left"
+        else:
+            why = "finish requested"
         log(f"stopping after epoch {self.last}: {why}; best epoch {self.top_epoch} (mAP {self.top})")
-        event("stop", reason=self.decision, epoch=self.last, best_epoch=self.top_epoch, best=self.top)
+        event("stop", reason=self.decision, epoch=self.last, best_epoch=self.top_epoch, best=self.top,
+              loss_falling=self.falling, extensions=self.extensions)
 
 
 def convergence(a) -> Convergence:
-    return Convergence(a.patience, a.min_epochs, a.min_delta, a.stop_file)
+    return Convergence(a.patience, a.min_epochs, a.min_delta, a.stop_file, a.smooth, a.epochs)
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,6 +261,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=0, help="stop after this many epochs without improvement (0 = off)")
     p.add_argument("--min-epochs", type=int, default=0, help="no convergence stop before this epoch")
     p.add_argument("--min-delta", type=float, default=0.0, help="smallest validation mAP gain that counts as an improvement")
+    p.add_argument("--smooth", type=int, default=1, help="the convergence rule's mAP is the mean of this many last epochs (1 = the raw value)")
     p.add_argument("--stop-file", type=Path, default=None, help="finish after the current epoch (keeping the best one) once this file exists")
     p.add_argument("--aug-dark", type=float, default=0.0, help="probability of the synthetic darkness augmentation")
     p.add_argument("--aug-noise", type=float, default=0.0, help="probability of the sensor noise augmentation")
@@ -188,6 +283,8 @@ def parse_args() -> argparse.Namespace:
     # The input size step is the family's (32; RF-DETR base 56): checked by the trainers.
     if a.patience < 0 or a.min_epochs < 0 or not (a.min_delta >= 0 and math.isfinite(a.min_delta)):
         p.error("--patience, --min-epochs and --min-delta must not be negative")
+    if a.smooth < 1:
+        p.error("--smooth must be at least 1")
     if a.epochs < 1 or a.batch < 1 or a.imgsz < 32:
         p.error("--epochs and --batch must be at least 1, --imgsz at least 32")
     return a
@@ -717,20 +814,238 @@ def free_ram_bytes() -> int | None:
                         return int(line.split()[1]) * 1024
             return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         if os.name == "nt":
-            import ctypes
-
-            class MS(ctypes.Structure):
-                _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
-                            ("avail", ctypes.c_ulonglong), ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong),
-                            ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ax", ctypes.c_ulonglong)]
-
-            ms = MS()
-            ms.len = ctypes.sizeof(MS)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
-                return int(ms.avail)
+            st = windows_memory_status()
+            return st[0] if st else None
     except Exception:
         return None
     return None
+
+
+def windows_memory_status():
+    """(available physical memory, available commit) in bytes from GlobalMemoryStatusEx, or None.
+    Available commit (`ullAvailPageFile`) is what new allocations may still reserve: RAM plus the
+    paging file minus what is committed."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        class MS(ctypes.Structure):
+            _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                        ("avail", ctypes.c_ulonglong), ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong),
+                        ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ax", ctypes.c_ulonglong)]
+
+        ms = MS()
+        ms.len = ctypes.sizeof(MS)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+            return int(ms.avail), int(ms.ap)
+    except Exception:
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------------------------
+# System load around the export (after training, in the same process)
+# ---------------------------------------------------------------------------------------------
+
+# The export (a PyTorch trace, then an ONNX Runtime session) waits for this much available
+# physical memory and (Windows) available commit, at most MEMORY_WAIT_S, polling every
+# MEMORY_POLL_S; then it goes ahead anyway. On a 16 GB machine that already paged, starting the
+# export at once thrashed the paging file until the machine stopped responding.
+EXPORT_MIN_RAM = 3 << 30
+EXPORT_MIN_COMMIT = 4 << 30
+MEMORY_WAIT_S = 300
+MEMORY_POLL_S = 10
+
+
+def gib(n) -> str:
+    return "?" if n is None else f"{n / (1 << 30):.1f} GB"
+
+
+def memory_status() -> dict:
+    """Available physical memory (`ram`) and, on Windows, available commit (`commit`), in bytes;
+    None where unknown."""
+    win = windows_memory_status()
+    if win:
+        return {"ram": win[0], "commit": win[1]}
+    return {"ram": free_ram_bytes(), "commit": None}
+
+
+def memory_shortfall(ram, commit, min_ram: int = EXPORT_MIN_RAM, min_commit: int = EXPORT_MIN_COMMIT) -> list:
+    """What is short for the export, e.g. ["available memory 1.2 GB < 3.0 GB"]; [] = enough. An
+    unknown value (None) never counts as short."""
+    short = []
+    if ram is not None and ram < min_ram:
+        short.append(f"available memory {gib(ram)} < {gib(min_ram)}")
+    if commit is not None and commit < min_commit:
+        short.append(f"available commit (RAM + paging file) {gib(commit)} < {gib(min_commit)}")
+    return short
+
+
+def wait_for_memory(stop_file=None, wait_s: float = MEMORY_WAIT_S, poll_s: float = MEMORY_POLL_S,
+                    status=memory_status, sleep=time.sleep, clock=time.monotonic) -> bool:
+    """Wait until `memory_shortfall` is empty, at most `wait_s` seconds. True when there is enough
+    memory (or it is unknown); False when the wait ran out or a stop file appeared during it: the
+    export then goes ahead anyway (never fail just for this). A stop file that already existed
+    (Finish now ended training) does not end the wait. Never raises."""
+    try:
+        st = status()
+        short = memory_shortfall(st.get("ram"), st.get("commit"))
+        if not short:
+            log(f"memory before the export: {gib(st.get('ram'))} available, commit {gib(st.get('commit'))} available")
+            return True
+        stop = Path(stop_file) if stop_file else None
+        stop_before = stop is not None and stop.exists()
+        detail = "low memory (" + "; ".join(short) + f"): waiting up to {round(wait_s / 60)} min for memory to free"
+        log("warning: " + detail + "; closing other programs speeds this up")
+        event("phase", phase="export", detail=detail)
+        until = clock() + wait_s
+        while clock() < until:
+            sleep(min(poll_s, max(0.0, until - clock())))
+            st = status()
+            short = memory_shortfall(st.get("ram"), st.get("commit"))
+            if not short:
+                log(f"memory freed: {gib(st.get('ram'))} available, commit {gib(st.get('commit'))} available")
+                event("phase", phase="export", detail="exporting to ONNX")
+                return True
+            if stop is not None and not stop_before and stop.exists():
+                log("stop requested while waiting for memory; exporting now")
+                break
+        log("warning: still " + "; ".join(short) + "; exporting anyway (the machine may page heavily)")
+        event("phase", phase="export", detail="exporting to ONNX (low memory)")
+        return False
+    except Exception as e:
+        log(f"memory check skipped ({type(e).__name__}: {e})")
+        return True
+
+
+def process_memory():
+    """This process's resident memory (`rss`), private commit (`private`, Windows) and its child
+    processes (`children`, `children_rss`: DataLoader workers) in bytes, via psutil; None without
+    psutil. Never raises."""
+    try:
+        import psutil
+
+        me = psutil.Process()
+        mi = me.memory_info()
+        out = {"rss": mi.rss, "private": getattr(mi, "private", None)}
+        kids = me.children(recursive=True)
+        rss = 0
+        for k in kids:
+            try:
+                rss += k.memory_info().rss
+            except Exception:
+                pass
+        out["children"] = len(kids)
+        out["children_rss"] = rss
+        return out
+    except Exception:
+        return None
+
+
+def describe_process_memory(m) -> str:
+    if not m:
+        return "?"
+    text = f"RSS {gib(m['rss'])}"
+    if m.get("private") is not None:
+        text += f", commit {gib(m['private'])}"
+    return text + f", {m['children']} child processes ({gib(m['children_rss'])})"
+
+
+def shutdown_dataloader_workers() -> int:
+    """Stop the worker processes of every live multi-process DataLoader iterator (persistent
+    workers outlive training: Lightning's fit loop and Ultralytics' InfiniteDataLoader keep their
+    iterators) and drop the loaders' cached iterators. Returns the number of iterators stopped."""
+    import gc
+
+    from torch.utils.data import DataLoader
+    from torch.utils.data import dataloader as dl
+
+    cls = getattr(dl, "_MultiProcessingDataLoaderIter", None)
+    if cls is None:
+        return 0
+    stopped = 0
+    loaders = []
+    for obj in gc.get_objects():
+        try:
+            # type(), not isinstance(): the latter reads `__class__`, which deprecated module
+            # proxies (torch.distributed.reduce_op) answer with a FutureWarning.
+            t = type(obj)
+            if issubclass(t, cls):
+                if not getattr(obj, "_shutdown", True):
+                    obj._shutdown_workers()
+                    stopped += 1
+            elif issubclass(t, DataLoader):
+                loaders.append(obj)
+        except Exception:
+            pass
+    for loader in loaders:
+        try:
+            if getattr(loader, "_iterator", None) is not None:
+                loader._iterator = None
+        except Exception:
+            pass
+    return stopped
+
+
+def release_training_memory(device: str) -> None:
+    """After training, before the export: stop the DataLoader workers, collect the training state
+    the caller dropped (trainer, optimizer, datasets), return cached GPU memory. Logs the process's
+    memory before -> after (psutil). Never raises."""
+    try:
+        import gc
+
+        before = process_memory()
+        gc.collect()
+        try:
+            workers = shutdown_dataloader_workers()
+        except Exception as e:
+            workers = 0
+            log(f"DataLoader workers not stopped ({type(e).__name__}: {e})")
+        gc.collect()
+        free_memory(device)
+        after = process_memory()
+        log(f"released the training state: {workers} DataLoader iterator(s) stopped; "
+            f"{describe_process_memory(before)} -> {describe_process_memory(after)}")
+    except Exception as e:
+        log(f"releasing the training memory failed ({type(e).__name__}: {e})")
+
+
+def export_threads() -> int:
+    """CPU threads for the export: `BOP_EXPORT_THREADS` (set by the service), else all physical
+    cores but one, at least one."""
+    try:
+        n = int(os.environ.get("BOP_EXPORT_THREADS", ""))
+        if n > 0:
+            return n
+    except ValueError:
+        pass
+    cores = None
+    try:
+        import psutil
+
+        cores = psutil.cpu_count(logical=False)
+    except Exception:
+        pass
+    return max(1, (cores or os.cpu_count() or 2) - 1)
+
+
+def prepare_export(device: str, stop_file=None) -> None:
+    """Between training and export (the caller dropped its references to the training state
+    first): release that memory, cap the CPU threads of the trace and the ONNX Runtime check
+    (`BOP_EXPORT_THREADS`, also read by the export script), wait for enough free memory. Never
+    raises."""
+    release_training_memory(device)
+    n = export_threads()
+    os.environ["BOP_EXPORT_THREADS"] = str(n)
+    try:
+        import torch
+
+        torch.set_num_threads(n)
+        log(f"export: {n} CPU threads")
+    except Exception as e:
+        log(f"export thread cap skipped ({type(e).__name__}: {e})")
+    wait_for_memory(stop_file)
 
 
 def ultralytics_cache(a):
@@ -906,8 +1221,7 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         # best.pt is validated and exported as always.
         tm = getattr(trainer, "metrics", None) or {}
         value = tm.get("metrics/mAP50-95(B)", tm.get("metrics/mAP50(B)"))
-        if conv.update(trainer.epoch + 1, value):
-            conv.emit()
+        if conv.step(trainer.epoch + 1, value, loss):
             trainer.stop = True
 
     model.add_callback("on_train_epoch_start", on_train_epoch_start)
@@ -965,6 +1279,10 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     if not best.is_file():
         fail("Ultralytics finished without writing best.pt or last.pt")
     event("phase", phase="export", detail=f"exporting {best.name} to ONNX")
+    # The export loads best.pt afresh: drop the trained model, its trainer (optimizer, EMA,
+    # dataloaders) and the base model first.
+    del model, base_yolo, base_model
+    prepare_export(device, a.stop_file)
     service_family = "yolo26" if a.family == "yolo26" else "yolo8"
     ex = argparse.Namespace(
         weights=best, work=a.work / "export", out=a.out_dir, opset=a.opset, no_onnx=False, no_openvino=True,
@@ -1161,8 +1479,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
                          map=mp95, elapsed_s=round(time.time() - started, 1))
             # Lightning runs the epoch's validation before on_train_epoch_end, so the mAP is this
             # epoch's; should_stop ends fit after it (rfdetr's own early stopping is not enabled).
-            if not trainer.sanity_checking and conv.update(trainer.current_epoch + 1, mp95 if mp95 is not None else mp):
-                conv.emit()
+            if not trainer.sanity_checking and conv.step(trainer.current_epoch + 1, mp95 if mp95 is not None else mp, loss):
                 trainer.should_stop = True
 
     # rfdetr builds its Lightning trainer itself; add the progress callback to every trainer it builds.
@@ -1214,13 +1531,19 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     if tc.get("class_names") != names:
         fail(f"rfdetr trained on classes {tc.get('class_names')}, expected {names}")
     event("phase", phase="export", detail="exporting checkpoint_best_total.pth to ONNX")
+    # One model at a time from here: the trained one (with its Lightning trainer, optimizer and
+    # persistent DataLoader workers) goes before the export loads the checkpoint, the export's
+    # PyTorch model before ONNX Runtime checks the file (`release_model`), rfdetr's own model
+    # before the comparison session.
+    del model
+    prepare_export(device, a.stop_file)
     wdir = a.work / "rfdetr-export-weights"
     wdir.mkdir(parents=True, exist_ok=True)
     link_or_copy(ckpt, wdir / ckpt.name)
     (wdir / "config.json").write_text(json.dumps({"model_config": tc["model_config"], "class_names": names}), encoding="utf-8")
     ex = argparse.Namespace(
         weights=wdir, work=a.work / "export", out=a.out_dir, opset=a.opset, no_onnx=False, no_openvino=True,
-        fp32=False, custom_classes=True,
+        fp32=False, custom_classes=True, release_model=True,
     )
     ex.work.mkdir(parents=True, exist_ok=True)
     out = em.export_rfdetr(a.name, "rfdetr", a.imgsz, ex)
@@ -1233,13 +1556,16 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     x = ((x - mean) / std).astype(np.float32)
     with torch.no_grad():
         ref = net(torch.from_numpy(x))
+    ref_logits = ref["pred_logits"].numpy()
+    del native, net, ref
+    free_memory(device)
     slice_logits(a.name, out["onnx"], len(names))
     em.stamp_coreml_cache_key(out["onnx"])
     got = em.compare_with_onnxruntime(a.name, out["onnx"], {"pixel_values": x}, {})
     if got["logits"].shape[-1] != len(names):
         fail(f"{a.name}: logits have {got['logits'].shape[-1]} classes after the cut, expected {len(names)}")
     sig = lambda v: 1 / (1 + np.exp(-v))
-    ref_named = ref["pred_logits"].numpy()[..., : len(names)]
+    ref_named = ref_logits[..., : len(names)]
     diff = float(np.abs(np.sort(sig(ref_named).ravel())[-20:] - np.sort(sig(got["logits"]).ravel())[-20:]).max())
     log(f"{a.name}: top-20 score difference rfdetr PyTorch vs ONNX Runtime: {diff:.2e}")
     if diff > 1e-2:
@@ -1443,12 +1769,12 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
             except Exception as e:  # the loss still counts
                 log(f"detection metrics skipped ({type(e).__name__}: {e})")
             if epoch >= 1:
-                decision = conv.update(epoch, m.get("map", m.get("map50")))
+                losses = [h["loss"] for h in self.state.log_history if "loss" in h]
+                stop = conv.step(epoch, m.get("map", m.get("map50")), losses[-1] if losses else None)
                 if conv.improved:
                     best_state["epoch"], best_state["value"] = conv.top_epoch, conv.top
                     best_state["sd"] = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-                if decision:
-                    conv.emit()
+                if stop:
                     # Read after this evaluation by the epoch loop (transformers Trainer `train`).
                     self.control.should_training_stop = True
             free_memory(device)
@@ -1495,6 +1821,15 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
         log("exporting the last epoch (no validation mAP was measured)")
     event("phase", phase="export", detail="exporting to ONNX")
     model = trainer.model.eval().float().cpu()
+    # Keep only the model: the best epoch's CPU copy, the optimizer, the scheduler and the
+    # dataloaders (accelerate holds references too) go before the export.
+    best_state.clear()
+    try:
+        trainer.accelerator.free_memory()
+    except Exception as e:
+        log(f"accelerate free_memory skipped ({type(e).__name__}: {e})")
+    del trainer
+    prepare_export(device, a.stop_file)
 
     class Wrapped(torch.nn.Module):
         def __init__(self, m):

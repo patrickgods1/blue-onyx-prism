@@ -338,11 +338,17 @@ With nothing typed in, a run starts from the family's recommendation (`recipe::r
 beside each family on the page). With early stopping on, **epochs is a cap**: the run normally ends
 sooner.
 
-| Family | Epochs (cap) | Patience | Min epochs | Min delta | Learning rate |
-|---|---|---|---|---|---|
-| YOLO26 / YOLO11 / YOLOv8 | 100 | 15 | 10 | 0.001 | the trainer's |
-| RF-DETR | 100 | 10 | 10 | 0.001 | 1e-4 (rfdetr's default) |
-| RT-DETRv2 / D-FINE | 80 | 10 | 10 | 0.001 | 1e-4 |
+| Family | Epochs (cap) | Patience | Min epochs | Min delta | Smoothing | Learning rate |
+|---|---|---|---|---|---|---|
+| YOLO26 / YOLO11 / YOLOv8 | 100 | 15 | 10 | 0.001 | 3 epochs | the trainer's |
+| RF-DETR | 100 | 10 | 10 | 0.001 | 3 epochs | 1e-4 (rfdetr's default) |
+| RT-DETRv2 / D-FINE | 80 | 10 | 10 | 0.001 | 3 epochs | 1e-4 |
+
+With fewer than 50 validation images a **recommended** patience doubles (10 -> 20, at most the
+epochs; `recipe::SMALL_VALID_IMAGES`): the mAP of so few images jumps by several points between
+epochs. A typed patience (form, `--patience`, `training.patience`) is never changed. The first lines
+of the train stage in `train.log` say which applied, e.g. `# convergence: 16 validation images
+(< 50): patience 20 instead of 10; mAP averaged over the last 3 epochs`.
 
 Sources: the Ultralytics fine-tuning guide (patience 10-20 when fine-tuning) and the `cfg` reference
 (<https://docs.ultralytics.com/guides/finetuning-guide>, <https://docs.ultralytics.com/usage/cfg>);
@@ -358,15 +364,30 @@ at least 100 verified images per camera (<https://docs.frigate.video/plus>). Few
 expect a noisy held-out AP.
 
 **The convergence rule** is one rule for every trainer (`Convergence` in `scripts/train_model.py`;
-its display twin is `progress::convergence_decision`), and the trainers' own early stopping is
-switched off so only this one decides:
+its display twin is `progress::convergence_run`, parity-tested), and the trainers' own early stopping
+is switched off so only this one decides:
 
-- The value is the validation **mAP50-95**, else mAP50 when the trainer reports no mAP50-95.
-- An improvement is a value above the best so far by more than `min_delta` (0.001).
-- The run stops once `epoch >= min_epochs` (10) and `patience` epochs passed since the last
-  improvement. `patience` 0 turns it off (the run trains all its epochs); it may not exceed the
-  epochs, and a patience that is not below the epochs never fires (a warning says so).
-- The **best checkpoint** is exported, not the last: Ultralytics `best.pt`, RF-DETR
+- The value is the validation **mAP50-95**, else mAP50 when the trainer reports no mAP50-95,
+  **averaged over the last `smooth` epochs** (3; fewer at the start; `--smooth 1` = each epoch's
+  value). A single noisy peak no longer starts the countdown: run `20261030-010233-b69d` (RF-DETR
+  nano, 16 validation images) stopped at epoch 15 on its epoch-5 peak with the raw value, while its
+  3-epoch mean still gained at epochs 7, 9 and 15.
+- An improvement is a mean above the best mean so far by more than `min_delta` (0.001).
+- A **stop point** is reached once `epoch >= min_epochs` (10) and `patience` epochs passed since
+  the last improvement. `patience` 0 turns it off (the run trains all its epochs); it may not exceed
+  the epochs, and a patience that is not below the epochs never fires (a warning says so).
+- At a stop point the run **goes on while the training loss still falls**: over the last `patience`
+  epochs, the mean training loss of the later half (n / 2 epochs; an odd middle one counts in
+  neither) is more than 2% below the earlier half's (`loss_falling`; fewer than 4 losses = not
+  falling). Then the countdown restarts there (the next stop point is `patience` epochs later, or
+  sooner past a gain), at most 2 times (`MAX_EXTENSIONS`) and never at the last epoch; otherwise it
+  stops. The script prints `@train {"event":"converge_point","epoch":E,"best_epoch":B,"best":v,
+  "loss_falling":true,"loss_from":a,"loss_to":b,"extension":n,"next_check":E+patience}` and the
+  Training page shows "Early stop reached at epoch 15 (best epoch 5, mAP 0.835); training loss is
+  still falling (3.569 -> 3.315). Continuing to epoch 25." with **Stop now and keep epoch 5** (the
+  Finish now action) and **Continue** (hides the notice; the run goes on by itself, so an unattended
+  run never waits). The incident run with its losses passes its epoch-15 stop point this way.
+- The **best checkpoint** (highest raw mAP, not the smoothed one) is exported, not the last: Ultralytics `best.pt`, RF-DETR
   `checkpoint_best_total.pth`, and for RT-DETRv2 / D-FINE (transformers) the best model state, which is
   restored in memory before the export (the log names the exported epoch).
 
@@ -378,7 +399,8 @@ checks the file after each epoch; a stale one is removed before training starts.
 cancels.
 
 **The `stop` event.** When the rule (or the stop file) ends training the script prints
-`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v}`. The page shows
+`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v,"loss_falling":f,"extensions":n}`
+(the log line says why: "training loss no longer falling", or that the extensions or epochs ran out). The page shows
 "best epoch B, M epochs without improvement (stops at patience P)" while training and then
 "converged at epoch N (best B)" or "finished on request at epoch N (best B)"; `train run` prints the same
 in its progress lines.
@@ -415,6 +437,27 @@ Stages (page and `train run` show them with percent and ETA):
    oversized batch then swaps for half an hour before it fails (run `20261027-071956-7f1c`: RF-DETR
    nano 384, batch 16, 35 min for 148 images, then out of memory). With the cap, batch 16 fails in
    about a minute and the retry takes over.
+
+   **Data loader workers** (`--workers`): none on macOS; else all cores but one (1 to 8), and on
+   Windows also at most what the free system commit (RAM + paging file) holds when training starts:
+   `(free commit - 6 GB) / (1.4 GB x loaders)`, down to 0 (data loaded in the training process:
+   slower, never short of memory). On Windows every worker is a spawned Python that imports PyTorch
+   (measured ~0.9 GB commit for the import, ~1.4 GB per worker while an RF-DETR nano run trained; its
+   trainer process itself committed 5.5 GB, hence the 6 GB reserve), and the validation loader's workers stay alive beside the training
+   loader's: `loaders` is 2 for RF-DETR and transformers (both loaders persistent) and 3 for
+   Ultralytics (its validation loader gets twice the workers). The decision is the first line of the
+   train stage in `train.log`: `memory: commit 21.3 GB limit, 5.1 GB free -> 0 data loader workers
+   (cores allow 5)`. `training.workers` in the config forces a count (0 = none; absent = automatic).
+   **Out of system memory** (`[WinError 1455]` "the paging file is too small", `DefaultCPUAllocator:
+   not enough memory`, `can't start new thread`, `MemoryError`, a worker killed by the OOM killer)
+   restarts the training with half the workers and the same batch (at most 3 restarts, at any epoch:
+   the worker count does not change the result); the log says "out of system memory with 5 data
+   loader workers, retrying with 2". Such a line also means the GPU was not the problem: on Windows
+   (WDDM) a CUDA allocation fails too when the commit is exhausted ("CUDA out of memory ... 6.17 GiB
+   is free"), so a failure with both is not retried at a smaller batch (run `20261029-235307-ae21`:
+   RF-DETR nano on a GTX 1070 Ti with a fixed 5.6 GB paging file, 5 + 5 workers, halved to batch 1
+   and still failed when the validation workers spawned). On a Windows machine with a fixed paging
+   file, let Windows manage its size (System Properties > Advanced > Performance > Virtual memory).
 6. **install**: `<name>.onnx`, `<name>.yaml` (the class names) and `<name>.provenance.json` into the
    models folder, or the folder given in *Install the model in* / `--install-dir` (relative = under the
    data root; the page accepts a browsable folder or one picked in the native dialog). The config entry,
@@ -463,6 +506,41 @@ offered it (`training.datasets` or an export under `<training dir>/exports`); an
 **Use as** (Trained models card): *Default model* sets `default_model`; *night model of* sets the
 chosen model's `night_model` (IR and dark frames go to the trained model); *verifier of* sets its
 `verify` model. All go through the config page's save path and apply at once.
+
+### System load during training
+
+Training, import and auto-label keep every core (and the GPU) busy for hours, so their helpers run
+**below normal priority**: `Cmd::low_priority` on the training environment's commands
+(`train_python_cmd`), applied by the command runner at spawn. Windows: `BELOW_NORMAL_PRIORITY_CLASS`
+added to the creation flags (beside `CREATE_NO_WINDOW`; the job object is unchanged), inherited by
+what the helper starts (DataLoader workers, ffmpeg). Unix: nice raised to at least 10 between fork
+and exec (`backend::priority::lower_child`; a higher nice, e.g. `Nice=15` in the unit, is kept),
+inherited by its threads and children. The model export's own commands (uv, the export script) keep
+the normal priority.
+
+The export after training runs in the same process as the training, which is where a 16 GB Windows
+machine with a fixed paging file froze (hard reset right after an RF-DETR run finished: the trainer
+committed 5.5 GB, four persistent DataLoader workers 1.4 GB each, 1.2 GB commit free). Between
+training and export `train_model.py` now (`prepare_export`):
+
+- **releases the training state** (`release_training_memory`): the trainer drops its trained model
+  / trainer objects (Ultralytics' YOLO with its trainer and the base model; rfdetr's model with its
+  Lightning trainer; transformers' `Trainer`, accelerate's references and the best epoch's CPU copy),
+  stops every live multi-process DataLoader iterator found by `gc` (`_shutdown_workers()`: persistent
+  workers outlive `fit`), collects and empties the CUDA / MPS cache. With psutil (in the training
+  environment) the log line gives the process's RSS, commit and child processes before -> after.
+  RF-DETR holds one model at a time: the export's transformers model is dropped before the ONNX
+  Runtime check (`release_model`, an option of `export_rfdetr` that the plain model export leaves
+  off), and rfdetr's own comparison model before the comparison session;
+- **caps the CPU threads** of the trace and the ONNX Runtime checks to all physical cores but one
+  (`BOP_EXPORT_THREADS`, set by the service; `torch.set_num_threads`, and the checks' session
+  `intra_op_num_threads`; the plain model export leaves ONNX Runtime's default);
+- **waits for memory**: with less than 3 GB available physical memory or (Windows) 4 GB available
+  commit it logs `warning: low memory (...): waiting up to 5 min for memory to free` and an export
+  `phase` event with that detail (in `train.log`), polls every 10 s, and after 5 minutes (or a
+  Finish now / stop file that appears during the wait) exports anyway: the check never fails a run.
+
+Training itself keeps PyTorch's thread count (the GPU does the work).
 
 ### Metrics per epoch
 
@@ -669,9 +747,8 @@ workers send their output lines and results to the job thread, which alone repor
 ("videos 3/12 done; reading a.mp4, b.mp4"); the results are put back in video order before the dedup
 (which keeps the first of near duplicates), so the outcome does not depend on which video finished
 first. A video that fails is a warning (`<file>: not read (...)`); a cancel stops every worker (the
-running helpers are killed, no further video starts). The helpers run at normal priority:
-`backend/priority.rs` only lowers the service's own process, and the command runner has no
-per-child priority yet.
+running helpers are killed, no further video starts). The helpers run below normal priority, like
+every training-environment helper ([System load](#system-load-during-training)).
 
 `--hwaccel auto` (default) decodes on the platform's hardware decoder when PyAV's FFmpeg has it
 (`av.codec.hwaccel.hwdevices_available()`): D3D11VA on Windows, CUDA then VAAPI on Linux (macOS

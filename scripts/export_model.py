@@ -285,12 +285,30 @@ def synthetic_image(size: int):
     return img[None].astype(np.float32)
 
 
-def compare_with_onnxruntime(name: str, onnx_path: Path, feeds: dict, torch_out: dict) -> dict:
-    """Run the ONNX file in ONNX Runtime and compare with PyTorch's outputs (`name -> array`)."""
+def export_threads_from_env() -> int | None:
+    """`BOP_EXPORT_THREADS` (a positive integer) or None: the training script sets it to cap the
+    CPU threads of the export after training (all cores but one); the model export leaves it unset."""
+    try:
+        n = int(os.environ.get("BOP_EXPORT_THREADS", ""))
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+def compare_with_onnxruntime(name: str, onnx_path: Path, feeds: dict, torch_out: dict, threads: int | None = None) -> dict:
+    """Run the ONNX file in ONNX Runtime and compare with PyTorch's outputs (`name -> array`).
+    `threads` (else `BOP_EXPORT_THREADS`, else ONNX Runtime's default: every core) caps the
+    session's intra-op threads."""
     import numpy as np
     import onnxruntime as ort
 
-    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    threads = threads or export_threads_from_env()
+    kw = {}
+    if threads:
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = threads
+        kw["sess_options"] = so
+    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"], **kw)
     got = dict(zip([o.name for o in sess.get_outputs()], sess.run(None, feeds)))
     for k, ref in torch_out.items():
         out = got[k]
@@ -676,6 +694,14 @@ def export_rfdetr(name: str, family: str, imgsz: int, args: argparse.Namespace) 
     onnx = args.work / f"{name}.onnx"
     log(f"{name}: exporting ONNX (opset {args.opset}, {imgsz}x{imgsz})")
     torch_export(wrapped, (xt,), ["pixel_values"], ["logits", "pred_boxes"], onnx, args.opset)
+    if getattr(args, "release_model", False):
+        # The training script after a long run: drop the PyTorch model (its reference outputs are
+        # kept) before ONNX Runtime loads the file, so both never hold memory at once.
+        import gc
+
+        del wrapped, model, xt
+        mod = None
+        gc.collect()
     got = compare_with_onnxruntime(name, onnx, {"pixel_values": x}, {"logits": logits.numpy(), "pred_boxes": boxes.numpy()})
     pin_output_shapes(name, onnx, got)
     inputs, outputs = onnx_ports(onnx)

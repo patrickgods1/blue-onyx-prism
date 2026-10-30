@@ -888,6 +888,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 r.epochs = epochs.unwrap_or(config.training.epochs_for(family));
                 r.patience =
                     patience.unwrap_or_else(|| config.training.patience_for(family).min(r.epochs));
+                r.patience_recommended = patience.is_none() && config.training.patience.is_none();
                 if let Some(i) = imgsz {
                     r.imgsz = i;
                 }

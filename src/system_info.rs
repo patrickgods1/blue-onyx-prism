@@ -50,6 +50,12 @@ fn cpu_name_impl() -> String {
     std::env::consts::ARCH.to_string()
 }
 
+/// The system commit limit and what is free of it now (Windows only; `None` elsewhere or when the
+/// query fails). Not cached: it changes with every program started.
+pub fn commit() -> Option<crate::backend::memory::Commit> {
+    crate::backend::memory::commit_bytes()
+}
+
 /// Total physical memory in GiB, if it can be determined. Probed once per process and cached
 /// (the hardware profile and the start-up log line both ask).
 pub fn total_memory_gb() -> Option<f64> {

@@ -88,6 +88,9 @@ pub struct Recommended {
     pub min_epochs: u32,
     /// Smallest validation mAP gain that counts as an improvement.
     pub min_delta: f32,
+    /// The gain is measured on the mean of the last `smooth` validation mAP values, so one noisy
+    /// peak of a small validation split does not start the countdown (1 = the raw value).
+    pub smooth: u32,
     /// Learning rate; None = the trainer's default (rfdetr and the transformers recipe: 1e-4).
     pub lr: Option<f32>,
 }
@@ -115,9 +118,14 @@ pub const fn recommended(family: TrainFamily) -> Recommended {
         patience,
         min_epochs: 10,
         min_delta: 0.001,
+        smooth: 3,
         lr: None,
     }
 }
+
+/// Validation splits below this many images make the per-epoch mAP noisy (run
+/// 20261030-010233-b69d: 16 images, +-0.05 between epochs): a recommended patience doubles there.
+pub const SMALL_VALID_IMAGES: usize = 50;
 
 /// One training run's model choice and hyper-parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +143,11 @@ pub struct TrainRecipe {
     /// queued before early stopping existed reads as 0, its old behaviour).
     #[serde(default)]
     pub patience: u32,
+    /// `patience` is the family's recommendation (nothing typed, `training.patience` unset), so a
+    /// small validation split may double it ([`Self::convergence_patience`]); a typed patience is
+    /// never changed (a recipe queued before this field existed reads as typed).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub patience_recommended: bool,
     pub batch: u32,
     /// Learning rate; None = the trainer's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,11 +179,49 @@ impl TrainRecipe {
             imgsz: family.default_imgsz(size),
             epochs: rec.epochs,
             patience: rec.patience,
+            patience_recommended: true,
             batch: if family == TrainFamily::Rfdetr { 4 } else { 8 },
             lr: rec.lr,
             augment: Augment::default(),
             multi_scale: MultiScale::Auto,
         })
+    }
+
+    /// The patience the run trains with on `valid_images` validation images, and the `train.log`
+    /// line that explains the rule: a recommended patience doubles below [`SMALL_VALID_IMAGES`]
+    /// (at most the epochs); a typed one is kept.
+    pub fn convergence_patience(&self, valid_images: usize) -> (u32, String) {
+        let smooth = recommended(self.family).smooth;
+        let window = if smooth > 1 {
+            format!("mAP averaged over the last {smooth} epochs")
+        } else {
+            "mAP of each epoch".into()
+        };
+        if self.patience_recommended && self.patience > 0 && valid_images < SMALL_VALID_IMAGES {
+            let p = self.patience.saturating_mul(2).min(self.epochs);
+            if p != self.patience {
+                return (
+                    p,
+                    format!(
+                        "convergence: {valid_images} validation images (< {SMALL_VALID_IMAGES}): \
+                         patience {p} instead of {}; {window}",
+                        self.patience
+                    ),
+                );
+            }
+        }
+        let typed = if self.patience_recommended {
+            ""
+        } else {
+            " (set)"
+        };
+        (
+            self.patience,
+            format!(
+                "convergence: {valid_images} validation images: patience {}{typed}; {window}",
+                self.patience
+            ),
+        )
     }
 
     /// Whether the convergence stop can end the run before its last epoch (patience on and
@@ -456,7 +507,63 @@ mod tests {
             );
             assert!(r.early_stopping(), "{f}");
             r.validate().unwrap();
+            assert_eq!(rec.smooth, 3, "{f}");
         }
+    }
+
+    #[test]
+    fn a_small_validation_split_doubles_only_a_recommended_patience() {
+        let r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
+        assert!(r.patience_recommended);
+        assert_eq!(
+            r.convergence_patience(16),
+            (
+                20,
+                "convergence: 16 validation images (< 50): patience 20 instead of 10; mAP \
+                 averaged over the last 3 epochs"
+                    .into()
+            )
+        );
+        // 50 images and more: as recommended.
+        assert_eq!(
+            r.convergence_patience(50),
+            (
+                10,
+                "convergence: 50 validation images: patience 10; mAP averaged over the last 3 \
+                 epochs"
+                    .into()
+            )
+        );
+        // Capped by the epochs.
+        let short = TrainRecipe {
+            epochs: 15,
+            ..r.clone()
+        };
+        assert_eq!(short.convergence_patience(16).0, 15);
+        // A typed patience (also one equal to the recommendation) is kept; so is 0 (off).
+        let typed = TrainRecipe {
+            patience_recommended: false,
+            ..r.clone()
+        };
+        let (p, line) = typed.convergence_patience(16);
+        assert_eq!(p, 10);
+        assert!(line.contains("patience 10 (set)"), "{line}");
+        let off = TrainRecipe {
+            patience: 0,
+            ..r.clone()
+        };
+        assert_eq!(off.convergence_patience(16).0, 0);
+        // The flag is written only when set; an old recipe reads as typed.
+        let mut v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["patience_recommended"], true);
+        v.as_object_mut().unwrap().remove("patience_recommended");
+        let old: TrainRecipe = serde_json::from_value(v).unwrap();
+        assert!(!old.patience_recommended);
+        assert!(
+            !serde_json::to_string(&typed)
+                .unwrap()
+                .contains("patience_recommended")
+        );
     }
 
     #[test]

@@ -169,6 +169,15 @@ pub fn request_options(base: &dataset::Options, request: &TrainRequest) -> datas
     }
 }
 
+/// Data loader workers of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Workers {
+    /// [`super::workers_now`] when training starts (the free commit then, not when queued).
+    Auto,
+    /// This many (`training.workers`).
+    Fixed(u32),
+}
+
 /// One queued run.
 #[derive(Debug, Clone)]
 pub struct TrainJob {
@@ -185,7 +194,9 @@ pub struct TrainJob {
     /// Data root (the public subset installs under it).
     pub root: PathBuf,
     pub timeout: Duration,
-    pub workers: u32,
+    /// Data loader workers (`--workers`): sized when training starts, or forced by
+    /// `training.workers`.
+    pub workers: Workers,
     /// Keep the checkpoints (`<run>/work`) after the run.
     pub keep_work: bool,
 }
@@ -331,7 +342,8 @@ pub const LOG_FILE: &str = "train.log";
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 /// Timeout of the self-check.
 const SELF_CHECK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// Restarts of a run that ran out of GPU memory, each at half the batch (down to 1).
+/// Restarts of a run that ran out of GPU memory, each at half the batch (down to 1); as many
+/// again for running out of system memory, each with half the data loader workers (down to 0).
 pub const OOM_RETRIES: u32 = 3;
 /// Only an out-of-memory failure before this many finished epochs is retried (later, the batch
 /// had fitted; restarting would throw away the epochs).
@@ -535,7 +547,7 @@ fn stages(
             },
             cancel,
         )
-        .map_err(|e| env::explain_train_failure(e, paths, job.platform))
+        .map_err(|e| env::explain_train_failure(e, paths, job.platform, TRAINING_TASK))
         .context("the training environment's self-check failed")?;
     match seen {
         Some(TrainEvent::SelfCheck {
@@ -656,6 +668,13 @@ fn stages(
 
     // 5. Train (the script also exports and checks the ONNX).
     enter!(TrainStage::Train, 0, "starting the trainer");
+    // A small validation split: a recommended patience doubles (its mAP is noisy).
+    let (patience, convergence_line) = recipe.convergence_patience(prepared.valid_images);
+    let recipe = &TrainRecipe {
+        patience,
+        ..recipe.clone()
+    };
+    log.line(&format!("# {convergence_line}"));
     if !recipe.early_stopping() {
         let w = format!(
             "early stopping is off (patience {} of {} epochs): every epoch runs; the best one is \
@@ -680,7 +699,7 @@ fn stages(
     };
     // RF-DETR's multi-scale training (`auto`: on when the estimate fits batch 4 with it).
     let multi_scale = recipe.multi_scale_on(job.accelerator.memory_mb());
-    let train_args = |batch: u32| -> Vec<OsString> {
+    let train_args = |batch: u32, workers: u32| -> Vec<OsString> {
         let mut args: Vec<OsString> = vec![
             train_script.clone().into_os_string(),
             "--trainer".into(),
@@ -704,7 +723,7 @@ fn stages(
             "--device".into(),
             job.accelerator.device_arg().into(),
             "--workers".into(),
-            job.workers.to_string().into(),
+            workers.to_string().into(),
             "--seed".into(),
             job.options.seed.to_string().into(),
             "--aug-dark".into(),
@@ -730,6 +749,7 @@ fn stages(
             ("--patience", recipe.patience.to_string()),
             ("--min-epochs", rec.min_epochs.to_string()),
             ("--min-delta", rec.min_delta.to_string()),
+            ("--smooth", rec.smooth.to_string()),
         ] {
             args.push(k.into());
             args.push(v.into());
@@ -742,8 +762,20 @@ fn stages(
         }
         args
     };
+    let (mut workers, start_commit) = match job.workers {
+        Workers::Auto => {
+            let c = super::workers_now(family.trainer());
+            log.line(&format!("# {}", c.describe()));
+            (c.workers, c.commit)
+        }
+        Workers::Fixed(n) => {
+            log.line(&format!("# data loader workers: {n} (training.workers)"));
+            (n, None)
+        }
+    };
     let mut batch = recipe.batch;
     let mut retries = 0;
+    let mut host_retries = 0;
     let mut note: Option<String> = None;
     let (res, done) = loop {
         let mut cmd = env::train_python_cmd(
@@ -752,7 +784,7 @@ fn stages(
             Stage::Export,
             &job.run_dir,
             job.timeout,
-            train_args(batch),
+            train_args(batch, workers),
         );
         if matches!(job.accelerator, Accelerator::Mps { .. }) {
             for (k, v) in MPS_WATERMARKS {
@@ -775,6 +807,7 @@ fn stages(
             patience: recipe.patience,
             min_delta: super::recipe::recommended(family).min_delta_f64(),
             min_epochs: super::recipe::recommended(family).min_epochs,
+            smooth: super::recipe::recommended(family).smooth,
             ..TrainProgress::default()
         };
         let mut done: Option<TrainEvent> = None;
@@ -800,22 +833,45 @@ fn stages(
             },
             cancel,
         );
-        let oom = res.as_ref().err().is_some_and(|e| {
+        let lines = res.as_ref().err().and_then(|e| {
             e.downcast_ref::<crate::resources::export::ChildFailed>()
-                .is_some_and(|c| out_of_memory_line(&c.lines).is_some())
+                .map(|c| c.lines.as_slice())
         });
-        if oom
-            && !cancel.load(Ordering::Relaxed)
+        let host_oom = lines.is_some_and(|l| host_out_of_memory_line(l).is_some());
+        let gpu_oom = lines.is_some_and(|l| out_of_memory_line(l).is_some());
+        let cancelled = cancel.load(Ordering::Relaxed);
+        // Out of system memory (commit): fewer workers, same batch; at any epoch (the worker
+        // count does not change the result).
+        let retry = if host_oom && !cancelled && host_retries < OOM_RETRIES && workers > 0 {
+            let next = workers / 2;
+            host_retries += 1;
+            let msg = format!(
+                "out of system memory with {}, retrying with {next}",
+                super::workers_text(workers)
+            );
+            workers = next;
+            Some((msg, None))
+        } else if gpu_oom
+            && !cancelled
             && retries < OOM_RETRIES
             && batch > 1
             && tp.history.len() < OOM_RETRY_EPOCHS
         {
             let next = (batch / 2).max(1);
+            retries += 1;
             let msg = format!("out of GPU memory at batch {batch}, retrying with batch {next}");
+            batch = next;
+            Some((msg, Some(next)))
+        } else {
+            None
+        };
+        if let Some((msg, new_batch)) = retry {
             tracing::warn!("training {}: {msg}", job.id);
             log.line(&format!("# {msg}"));
             report(TrainReport::Line(&msg));
-            report(TrainReport::Batch(next));
+            if let Some(b) = new_batch {
+                report(TrainReport::Batch(b));
+            }
             report(TrainReport::Stage {
                 stage: TrainStage::Train,
                 percent: 0,
@@ -825,8 +881,6 @@ fn stages(
             manager::remove_any(&staging)?;
             std::fs::create_dir_all(&staging)
                 .with_context(|| format!("creating {}", staging.display()))?;
-            batch = next;
-            retries += 1;
             note = Some(msg);
             continue;
         }
@@ -843,11 +897,23 @@ fn stages(
         let _ = manager::remove_any(&staging);
         if let Some(why) = e
             .downcast_ref::<crate::resources::export::ChildFailed>()
-            .and_then(|c| classify_train_failure(&c.lines, &finished_recipe))
+            .and_then(|c| {
+                let host = HostMemory {
+                    windows: job.platform.os == "windows",
+                    workers,
+                    commit: start_commit,
+                };
+                classify_train_failure(&c.lines, &finished_recipe, &host)
+            })
         {
             return Err(e.context(why));
         }
-        return Err(env::explain_train_failure(e, paths, job.platform));
+        return Err(env::explain_train_failure(
+            e,
+            paths,
+            job.platform,
+            TRAINING_TASK,
+        ));
     }
     check(cancel)?;
     let Some(TrainEvent::Done {
@@ -923,7 +989,45 @@ fn stages(
     })
 }
 
-/// The last line of `lines` that reports the GPU out of memory, if any.
+/// What the failure messages call a training run ([`env::explain_train_failure`]).
+const TRAINING_TASK: &str = "training";
+
+/// A line of `lines` that reports the host out of memory (RAM + paging file, the Windows
+/// commit), if any: of the most telling kind present (a paging file too small, then a failed CPU
+/// allocation, ...), the last such line.
+pub fn host_out_of_memory_line(lines: &[String]) -> Option<&String> {
+    const KINDS: [&[&str]; 4] = [
+        &["[WinError 1455]", "paging file is too small"],
+        &["DefaultCPUAllocator: not enough memory", "[WinError 1450]"],
+        &[
+            "can't start new thread",
+            "Cannot allocate memory",
+            "[Errno 12]",
+        ],
+        &["is killed by signal: Killed"],
+    ];
+    KINDS
+        .iter()
+        .find_map(|pats| {
+            lines
+                .iter()
+                .rev()
+                .find(|l| pats.iter().any(|p| l.contains(p)))
+        })
+        // Python's own `MemoryError` only at the start of a line: `torch.OutOfMemoryError` (GPU)
+        // contains it too.
+        .or_else(|| {
+            lines
+                .iter()
+                .rev()
+                .find(|l| l.trim_start().starts_with("MemoryError"))
+        })
+}
+
+/// The last line of `lines` that reports the GPU out of memory, if any. None when the host ran
+/// out of memory too ([`host_out_of_memory_line`]): on Windows (WDDM) a CUDA allocation also
+/// fails when the system commit is exhausted, with GPU memory free ("CUDA out of memory ...
+/// 6.17 GiB is free"), and a smaller batch does not help there.
 pub fn out_of_memory_line(lines: &[String]) -> Option<&String> {
     const PATTERNS: [&str; 5] = [
         "CUDA out of memory",
@@ -932,21 +1036,77 @@ pub fn out_of_memory_line(lines: &[String]) -> Option<&String> {
         "CUBLAS_STATUS_ALLOC_FAILED",
         "cudaErrorMemoryAllocation",
     ];
+    if host_out_of_memory_line(lines).is_some() {
+        return None;
+    }
     lines
         .iter()
         .rev()
         .find(|l| PATTERNS.iter().any(|p| l.contains(p)))
 }
 
+/// What [`classify_train_failure`] says about the host's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemory {
+    /// The run is on Windows (the paging file advice).
+    pub windows: bool,
+    /// Data loader workers of the last attempt.
+    pub workers: u32,
+    /// The commit when training started (Windows, automatic workers).
+    pub commit: Option<super::Commit>,
+}
+
 /// The likely cause and next action of a failed training from its last output lines, for the
-/// failures the export's classifier does not know (GPU memory, an empty or broken dataset).
-pub fn classify_train_failure(lines: &[String], recipe: &TrainRecipe) -> Option<String> {
+/// failures the export's classifier does not know (system or GPU memory, an empty or broken
+/// dataset).
+pub fn classify_train_failure(
+    lines: &[String],
+    recipe: &TrainRecipe,
+    host: &HostMemory,
+) -> Option<String> {
     let has = |pats: &[&str]| {
         lines
             .iter()
             .rev()
             .find(|l| pats.iter().any(|p| l.contains(p)))
     };
+    if let Some(l) = host_out_of_memory_line(lines) {
+        let who = if host.workers == 0 {
+            "the training process alone needed more than was free (no data loader workers)"
+                .to_string()
+        } else {
+            format!(
+                "each of the {} loads PyTorch (~1 GB each)",
+                super::workers_text(host.workers)
+            )
+        };
+        let commit = host
+            .commit
+            .map(|c| {
+                format!(
+                    "; commit {:.1} of {:.1} GB was in use when training started",
+                    super::gib(c.in_use()),
+                    super::gib(c.limit)
+                )
+            })
+            .unwrap_or_default();
+        let fix = if host.windows {
+            "Let Windows manage the paging file size (System Properties > Advanced > \
+             Performance > Virtual memory) or close other programs"
+        } else {
+            "Close other programs or add swap"
+        };
+        let force = if host.workers > 0 {
+            " (or set training.workers to 0 in the config)"
+        } else {
+            ""
+        };
+        return Some(format!(
+            "training ran out of system memory ({}): {who}{commit}. {fix}{force}, then train \
+             again",
+            l.trim()
+        ));
+    }
     if let Some(l) = out_of_memory_line(lines) {
         return Some(format!(
             "the GPU ran out of memory ({}): train again with a smaller batch (now {}) or input \

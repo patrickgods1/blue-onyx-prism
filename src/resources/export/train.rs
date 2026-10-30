@@ -260,6 +260,7 @@ pub(crate) fn prepare_train_env(
                             system_msvcp140: None,
                             tools: &job.paths.tools,
                             python_script: false,
+                            task: "training environment setup",
                         },
                     )
                 )
@@ -319,9 +320,14 @@ impl TrainLock {
     }
 }
 
-/// The training environment's Python running `args` as `python -X faulthandler -u -I <args>`,
-/// offline (`YOLO_OFFLINE`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`), with its settings and
-/// caches in `tools/train-config` and the MPS CPU fallback on (ops MPS lacks run on the CPU).
+/// The training environment's Python running `args` as
+/// `python -X faulthandler -X utf8 -u -I <args>` (UTF-8 output: rich's box-drawing tables, e.g.
+/// RF-DETR's validation summary, crash the cp1252 pipe of a Windows child otherwise), offline
+/// (`YOLO_OFFLINE`, `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`), with its settings and caches in
+/// `tools/train-config` and the MPS CPU fallback on (ops MPS lacks run on the CPU). It runs below
+/// normal priority ([`Cmd::low_priority`]: training, import and auto-label keep every core busy
+/// for hours) and `BOP_EXPORT_THREADS` ([`export_threads`]) caps the CPU threads of the export
+/// and ONNX Runtime check after training.
 pub fn train_python_cmd(
     paths: &TrainPaths,
     platform: Platform,
@@ -331,7 +337,10 @@ pub fn train_python_cmd(
     args: Vec<OsString>,
 ) -> Cmd {
     let cfg = |sub: &str| paths.config.join(sub).into_os_string();
-    let mut all: Vec<OsString> = vec!["-X".into(), "faulthandler".into(), "-u".into(), "-I".into()];
+    let mut all: Vec<OsString> = super::stages::PYTHON_FLAGS
+        .iter()
+        .map(OsString::from)
+        .collect();
     all.extend(args);
     Cmd {
         stage,
@@ -353,10 +362,23 @@ pub fn train_python_cmd(
             ("RF_HOME".into(), cfg("rfdetr")),
             ("WANDB_MODE".into(), "disabled".into()),
             ("PL_DISABLE_FORK".into(), "1".into()),
+            (
+                "BOP_EXPORT_THREADS".into(),
+                export_threads(crate::backend::cpu_threads::physical_cores())
+                    .to_string()
+                    .into(),
+            ),
         ],
         cwd: cwd.to_path_buf(),
         timeout,
+        low_priority: true,
     }
+}
+
+/// CPU threads of the export after training (PyTorch's trace and the ONNX Runtime check) on a
+/// machine with `physical` cores: all but one, at least one (pure).
+pub fn export_threads(physical: usize) -> usize {
+    physical.saturating_sub(1).max(1)
 }
 
 /// Write the training and export scripts into `tools/train-work`; returns their paths.
@@ -389,11 +411,13 @@ pub fn write_task_scripts(paths: &TrainPaths) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// `e` with the likely cause and next action of a recognized child failure (out of memory, a
-/// missing DLL, disk full, ...), for a Python script of the training environment.
+/// missing DLL, disk full, ...), for a Python script of the training environment. `task` names
+/// what ran in the message: "training", "auto-label" or "import".
 pub fn explain_train_failure(
     e: anyhow::Error,
     paths: &TrainPaths,
     platform: Platform,
+    task: &'static str,
 ) -> anyhow::Error {
     failure::explain(
         e,
@@ -402,6 +426,7 @@ pub fn explain_train_failure(
             system_msvcp140: None,
             tools: &paths.export.tools,
             python_script: true,
+            task,
         },
     )
 }
@@ -527,6 +552,14 @@ mod train_env_tests {
     }
 
     #[test]
+    fn export_threads_keep_a_core_free() {
+        assert_eq!(export_threads(0), 1);
+        assert_eq!(export_threads(1), 1);
+        assert_eq!(export_threads(2), 1);
+        assert_eq!(export_threads(6), 5);
+    }
+
+    #[test]
     fn python_cmd_is_offline_with_the_mps_fallback() {
         let p = TrainPaths::new(Path::new("/d"), PathBuf::from("/d/models"));
         let c = train_python_cmd(
@@ -546,13 +579,17 @@ mod train_env_tests {
                 .join("python")
         );
         assert_eq!(
-            c.args[..4],
-            ["-X", "faulthandler", "-u", "-I"].map(OsString::from)
+            c.args[..6],
+            ["-X", "faulthandler", "-X", "utf8", "-u", "-I"].map(OsString::from)
         );
         let get = |k: &str| c.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         assert_eq!(get("HF_HUB_OFFLINE"), Some("1".into()));
         assert_eq!(get("YOLO_OFFLINE"), Some("1".into()));
         assert_eq!(get("PYTORCH_ENABLE_MPS_FALLBACK"), Some("1".into()));
+        assert!(c.low_priority, "training helpers run below normal priority");
+        let threads = get("BOP_EXPORT_THREADS").unwrap();
+        let n: usize = threads.to_str().unwrap().parse().unwrap();
+        assert!(n >= 1);
         assert_eq!(
             get("HF_HOME"),
             Some(

@@ -30,6 +30,8 @@ pub const DEFAULT_METRIC_COLUMNS: [&str; 7] =
     ["map", "map50", "f1", "f2", "precision", "recall", "loss"];
 /// Most columns of the per-epoch table.
 pub const MAX_METRIC_COLUMNS: usize = 20;
+/// Most data loader workers `training.workers` may force.
+pub const MAX_WORKERS: u32 = 32;
 
 /// `training` in the config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,6 +78,11 @@ pub struct TrainingConfig {
     /// ([`super::dataset::Balance`]); None = off. A run uses what its request says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<super::dataset::Balance>,
+    /// Data loader worker processes of every run; None = automatic (all cores but one, at most 8,
+    /// on Windows fewer when the free commit cannot hold them: [`super::workers_for`]). 0 loads
+    /// the data in the training process (slower, needs the least memory).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers: Option<u32>,
 }
 
 impl Default for TrainingConfig {
@@ -92,6 +99,7 @@ impl Default for TrainingConfig {
             synonyms: std::collections::BTreeMap::new(),
             metric_columns: Vec::new(),
             balance: None,
+            workers: None,
         }
     }
 }
@@ -185,6 +193,11 @@ impl TrainingConfig {
             );
         }
         validate_metric_columns(&self.metric_columns)?;
+        if let Some(w) = self.workers
+            && w > MAX_WORKERS
+        {
+            anyhow::bail!("training.workers must be between 0 and {MAX_WORKERS}, got {w}");
+        }
         if let Some(b) = &self.balance {
             b.validate().map_err(|e| anyhow::anyhow!("training.{e}"))?;
         }
@@ -259,6 +272,16 @@ mod tests {
         let partial: TrainingConfig = serde_json::from_str(r#"{"epochs": 3}"#).unwrap();
         assert_eq!(partial.epochs, Some(3));
         assert_eq!(partial.oversample, DEFAULT_OVERSAMPLE);
+        assert_eq!(partial.workers, None);
+        assert!(!text.contains("workers"), "{text}");
+        let forced: TrainingConfig = serde_json::from_str(r#"{"workers": 0}"#).unwrap();
+        assert_eq!(forced.workers, Some(0));
+        forced.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<TrainingConfig>(&serde_json::to_string(&forced).unwrap())
+                .unwrap(),
+            forced
+        );
     }
 
     #[test]
@@ -281,6 +304,7 @@ mod tests {
         assert!(bad(|c| c.heldout_share = f32::NAN).contains("training.heldout_share"));
         assert!(bad(|c| c.oversample = 0).contains("training.oversample"));
         assert!(bad(|c| c.timeout_hours = 0).contains("training.timeout_hours"));
+        assert!(bad(|c| c.workers = Some(MAX_WORKERS + 1)).contains("training.workers"));
         assert!(bad(|c| c.datasets = vec![PathBuf::new()]).contains("training.datasets"));
         assert!(
             bad(|c| c.synonyms = [("raccoon".to_string(), vec!["a. b".to_string()])].into())

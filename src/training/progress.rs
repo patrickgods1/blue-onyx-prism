@@ -2,7 +2,9 @@
 //! `scripts/train_model.py`) and the run's progress derived from them ([`TrainProgress`]:
 //! percent of the training stage, epoch, ETA, every scalar metric per epoch in
 //! [`TrainProgress::history`], the best epoch and the convergence stop, whose rule
-//! [`convergence_decision`] mirrors the script's `Convergence`). Raw metric keys of the trainers (rfdetr,
+//! [`convergence_run`] mirrors the script's `Convergence`, with its smoothing window and the
+//! extensions while the training loss still falls ([`loss_falling`], [`ConvergePoint`]; the page's
+//! Stop now / Continue notice is [`TrainProgress::extension`]). Raw metric keys of the trainers (rfdetr,
 //! Ultralytics, transformers) map to stable ids ([`canonical`], described by [`METRICS`]);
 //! unknown keys are kept under their raw name. Pure.
 
@@ -91,6 +93,8 @@ pub enum TrainEvent {
         #[serde(default)]
         best: Option<f64>,
     },
+    /// The rule reached a stop point while the training loss still fell: training goes on.
+    ConvergePoint(ConvergePoint),
     Done {
         onnx: String,
         yaml: String,
@@ -393,52 +397,202 @@ pub struct Stop {
     pub best_epoch: u32,
 }
 
-/// The epoch the convergence rule stops at for the per-epoch validation mAP `values` (in epoch
-/// order; a repeated or older epoch is ignored), None when it does not stop. An improvement is a
-/// value above the best so far by more than `min_delta`; the run stops once `epoch >= min_epochs`
-/// and `patience` epochs passed since the last improvement (0 = never). The twin of the script's
-/// `Convergence` (parity-tested).
+/// The script's `converge_point` event: the rule reached a stop point at `epoch` while the
+/// training loss still fell, so the run goes on to `next_check` (the stop point after it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ConvergePoint {
+    pub epoch: u32,
+    /// The epoch whose checkpoint a stop now keeps (highest raw mAP).
+    pub best_epoch: u32,
+    pub best: Option<f64>,
+    pub loss_falling: bool,
+    /// Mean training loss of the earlier / later half of the patience window ([`loss_halves`]).
+    pub loss_from: Option<f64>,
+    pub loss_to: Option<f64>,
+    /// 1 for the first extension, at most [`MAX_EXTENSIONS`].
+    pub extension: u32,
+    pub next_check: u32,
+}
+
+/// Extensions past a stop point while the training loss still falls (the script's
+/// `MAX_EXTENSIONS`).
+pub const MAX_EXTENSIONS: u32 = 2;
+/// Relative drop of the mean training loss that counts as still falling (`LOSS_FALL`).
+pub const LOSS_FALL: f64 = 0.02;
+
+/// Left-to-right sum / count, as the script's `mean` (no compensated summation).
+fn mean(v: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for x in v {
+        s += x;
+    }
+    s / v.len() as f64
+}
+
+/// Mean of the earlier and of the later `n / 2` finite values of `losses` (an odd middle value
+/// counts in neither); None below 4 values. The script's `loss_halves`.
+pub fn loss_halves(losses: &[Option<f64>]) -> Option<(f64, f64)> {
+    let v: Vec<f64> = losses
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
+    let half = v.len() / 2;
+    if half < 2 {
+        return None;
+    }
+    Some((mean(v.get(..half)?), mean(v.get(v.len() - half..)?)))
+}
+
+/// Whether the training loss still falls over `losses` (in epoch order): the later half's mean
+/// is below the earlier half's by more than [`LOSS_FALL`] of it ([`loss_halves`]; too few
+/// values: false). The twin of the script's `loss_falling` (parity-tested).
+pub fn loss_falling(losses: &[Option<f64>]) -> bool {
+    loss_halves(losses).is_some_and(|(early, late)| late < early - LOSS_FALL * early.abs())
+}
+
+/// The convergence rule's settings (the script's `Convergence` arguments).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Rule {
+    /// Epochs without a gain before a stop point (0 = never).
+    pub patience: u32,
+    /// No stop point before this epoch.
+    pub min_epochs: u32,
+    /// Smallest gain of the smoothed mAP that counts.
+    pub min_delta: f64,
+    /// The gain is measured on the mean of the last `smooth` mAP values (0 and 1 = the raw value).
+    pub smooth: u32,
+    /// The run's epochs (0 = unknown): no extension at the last one.
+    pub epochs: u32,
+}
+
+/// Where [`convergence_run`] stopped and the stop points it went past.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConvergenceRun {
+    pub stop: Option<u32>,
+    /// Epochs of the `converge_point`s (loss still falling: extended).
+    pub points: Vec<u32>,
+}
+
+/// The convergence rule over `(epoch, validation mAP, training loss)` in epoch order (a
+/// repeated or older epoch is ignored): a stop point once `epoch >= min_epochs` and `patience`
+/// epochs passed since the last gain of more than `min_delta` in the mean of the last `smooth`
+/// mAP values (or since the last extension). At a stop point the run goes on while the loss
+/// still falls over the last `patience` epochs ([`loss_falling`]), at most [`MAX_EXTENSIONS`]
+/// times and before its last epoch; else it stops. The twin of the script's `Convergence`
+/// (parity-tested).
+pub fn convergence_run(epochs: &[(u32, Option<f64>, Option<f64>)], rule: &Rule) -> ConvergenceRun {
+    let mut t = Tracker::new(rule.min_delta, rule.smooth);
+    let mut losses: Vec<Option<f64>> = Vec::new();
+    let (mut restart, mut out) = (0, ConvergenceRun::default());
+    for &(epoch, v, loss) in epochs {
+        if t.update(epoch, v).is_none() {
+            continue;
+        }
+        losses.push(loss.filter(|l| l.is_finite()));
+        if rule.patience == 0
+            || t.best.is_none()
+            || epoch < rule.min_epochs
+            || epoch - t.best_epoch.max(restart) < rule.patience
+        {
+            continue;
+        }
+        let recent = losses
+            .get(losses.len().saturating_sub(rule.patience as usize)..)
+            .unwrap_or_default();
+        let room = rule.epochs == 0 || epoch < rule.epochs;
+        if loss_falling(recent) && out.points.len() < MAX_EXTENSIONS as usize && room {
+            restart = epoch;
+            out.points.push(epoch);
+        } else {
+            out.stop = Some(epoch);
+            break;
+        }
+    }
+    out
+}
+
+/// The epoch [`convergence_run`] stops at without training losses (so without extensions) for
+/// the per-epoch validation mAP `values`; None when it does not stop.
 pub fn convergence_decision(
     values: &[(u32, f64)],
     patience: u32,
     min_epochs: u32,
     min_delta: f64,
+    smooth: u32,
 ) -> Option<u32> {
-    let mut t = Tracker {
+    let epochs: Vec<_> = values.iter().map(|&(e, v)| (e, Some(v), None)).collect();
+    let rule = Rule {
+        patience,
+        min_epochs,
         min_delta,
-        ..Tracker::default()
+        smooth,
+        epochs: 0,
     };
-    values.iter().find_map(|&(epoch, v)| {
-        t.update(epoch, Some(v))?;
-        let stale = t.best.is_some() && epoch - t.best_epoch >= patience;
-        (patience > 0 && epoch >= min_epochs && stale).then_some(epoch)
-    })
+    convergence_run(&epochs, &rule).stop
 }
 
-/// The rule's state: the last epoch seen and the last improvement.
+/// The rule's state: the last epoch seen, the last gain of the smoothed value and the highest
+/// raw value.
 #[derive(Debug, Default)]
 struct Tracker {
     last: u32,
     best: Option<f64>,
     best_epoch: u32,
+    top: Option<f64>,
+    top_epoch: u32,
     min_delta: f64,
+    smooth: usize,
+    window: Vec<f64>,
 }
 
 impl Tracker {
+    fn new(min_delta: f64, smooth: u32) -> Self {
+        Self {
+            min_delta,
+            smooth: usize::try_from(smooth.max(1)).unwrap_or(1),
+            ..Self::default()
+        }
+    }
+
     /// Fold one epoch in; None for a repeated or older epoch.
     fn update(&mut self, epoch: u32, v: Option<f64>) -> Option<()> {
         if epoch <= self.last {
             return None;
         }
         self.last = epoch;
-        if let Some(v) = v.filter(|v| v.is_finite())
-            && self.best.is_none_or(|b| v > b + self.min_delta)
-        {
-            self.best = Some(v);
-            self.best_epoch = epoch;
+        if let Some(v) = v.filter(|v| v.is_finite()) {
+            self.window.push(v);
+            if self.window.len() > self.smooth {
+                self.window.remove(0);
+            }
+            let m = mean(&self.window);
+            if self.best.is_none_or(|b| m > b + self.min_delta) {
+                self.best = Some(m);
+                self.best_epoch = epoch;
+            }
+            if self.top.is_none_or(|t| v > t) {
+                self.top = Some(v);
+                self.top_epoch = epoch;
+            }
         }
         Some(())
     }
+}
+
+/// The page's notice while a run is in an extension ([`TrainProgress::extension`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ExtensionNotice {
+    /// "Early stop reached at epoch 15 (best epoch 5, mAP 0.835); training loss is still falling
+    /// (3.569 -> 3.315). Continuing to epoch 25."
+    pub text: String,
+    /// The epoch a stop now keeps.
+    pub keep_epoch: u32,
+    /// The point's extension number (the page's Continue dismisses one point).
+    pub extension: u32,
 }
 
 /// What the run reports while the script trains.
@@ -477,9 +631,19 @@ pub struct TrainProgress {
     /// The run's minimum epochs (the rule never stops before), set with `patience`.
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub min_epochs: u32,
-    /// Epochs since the last improvement of the rule's metric (mAP 50-95, else mAP 50): the run
-    /// stops when this reaches `patience` (past the minimum epochs).
+    /// The rule's smoothing window (mean of the last N mAP values; 0 = 1), set with `patience`.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub smooth: u32,
+    /// Epochs since the last improvement of the rule's metric (mAP 50-95, else mAP 50), or since
+    /// the last extension: the run reaches a stop point when this reaches `patience` (past the
+    /// minimum epochs).
     pub since_best: u32,
+    /// The last stop point the run went past because the training loss still fell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub converge_point: Option<ConvergePoint>,
+    /// The page's Stop now / Continue notice while the run trains past `converge_point`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<ExtensionNotice>,
     /// Training ended early (converged or finished on request).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stop>,
@@ -559,8 +723,13 @@ impl TrainProgress {
                     best_epoch: *best_epoch,
                 });
             }
+            TrainEvent::ConvergePoint(p) => {
+                self.converge_point = Some(p.clone());
+                self.since_best = self.since_improvement();
+            }
             TrainEvent::SelfCheck { .. } | TrainEvent::Done { .. } => {}
         }
+        self.extension = self.extension_notice();
         let f = self.fraction();
         self.eta_s = (f > 0.0 && f < 1.0).then(|| elapsed_s * (1.0 - f) / f);
         if self.phase.is_some() {
@@ -641,25 +810,58 @@ impl TrainProgress {
         self.since_best = self.since_improvement();
     }
 
-    /// Epochs since the rule's last improvement over the history (its metric: `map` when any
-    /// epoch has it, else `map50`; 0 without either).
-    fn since_improvement(&self) -> u32 {
+    /// The rule's state over the history (its metric: `map` when any epoch has it, else `map50`).
+    fn rule_state(&self) -> Tracker {
         let id = if self.history.iter().any(|p| p.metrics.contains_key("map")) {
             "map"
         } else {
             "map50"
         };
-        let mut t = Tracker {
-            min_delta: self.min_delta,
-            ..Tracker::default()
-        };
+        let mut t = Tracker::new(self.min_delta, self.smooth);
         for p in &self.history {
             t.update(p.epoch, p.metrics.get(id).copied());
         }
+        t
+    }
+
+    /// Epochs since the rule's last improvement over the history, or since the last extension
+    /// ([`Self::converge_point`]); 0 without a value.
+    fn since_improvement(&self) -> u32 {
+        let t = self.rule_state();
         if t.best.is_none() {
             return 0;
         }
-        t.last.saturating_sub(t.best_epoch)
+        let restart = self.converge_point.as_ref().map_or(0, |p| p.epoch);
+        t.last.saturating_sub(t.best_epoch.max(restart))
+    }
+
+    /// The Stop now / Continue notice: while training past the last `converge_point`, not stopped
+    /// or exporting. The kept epoch is the highest raw value so far (the exported checkpoint).
+    fn extension_notice(&self) -> Option<ExtensionNotice> {
+        let p = self.converge_point.as_ref()?;
+        if self.stopped.is_some() || self.phase.is_some() {
+            return None;
+        }
+        let t = self.rule_state();
+        let (keep, best) = match t.top {
+            Some(v) if t.top_epoch > 0 => (t.top_epoch, Some(v)),
+            _ => (p.best_epoch, p.best),
+        };
+        let best = best.map_or_else(String::new, |b| format!(", mAP {b:.3}"));
+        let loss = match (p.loss_from, p.loss_to) {
+            (Some(a), Some(b)) => format!(" ({a:.3} \u{2192} {b:.3})"),
+            _ => String::new(),
+        };
+        Some(ExtensionNotice {
+            text: format!(
+                "Early stop reached at epoch {} (best epoch {keep}{best}); training loss is still \
+                 falling{loss}. Continuing to epoch {}.",
+                p.epoch,
+                self.stop_epoch()
+            ),
+            keep_epoch: keep,
+            extension: p.extension,
+        })
     }
 
     /// The epoch the rule stops after when nothing improves from now on:
@@ -750,6 +952,12 @@ impl TrainProgress {
                 ", {} without improvement (stops after epoch {} if no gain)",
                 plural(self.since_best, "epoch"),
                 self.stop_epoch()
+            ));
+        }
+        if let Some(p) = &self.converge_point {
+            s.push_str(&format!(
+                ", extended past epoch {} (loss still falling, {} of {MAX_EXTENSIONS})",
+                p.epoch, p.extension
             ));
         }
         if let Some(e) = self.eta_s {
@@ -1197,8 +1405,71 @@ mod tests {
         assert_eq!((old.stopped, old.since_best, old.patience), (None, 0, 0));
     }
 
-    /// `(values, patience, min_epochs, min_delta, stop epoch)`.
-    type Case = (Vec<(u32, f64)>, u32, u32, f64, Option<u32>);
+    /// One fixed sequence: `(epoch, mAP, training loss)`, the rule, and where it stops plus the
+    /// stop points it extends past.
+    struct Case {
+        epochs: Vec<(u32, Option<f64>, Option<f64>)>,
+        rule: Rule,
+        want: ConvergenceRun,
+    }
+
+    fn case(
+        values: &[(u32, f64)],
+        patience: u32,
+        min_epochs: u32,
+        delta: f64,
+        smooth: u32,
+    ) -> Case {
+        Case {
+            epochs: values.iter().map(|&(e, v)| (e, Some(v), None)).collect(),
+            rule: Rule {
+                patience,
+                min_epochs,
+                min_delta: delta,
+                smooth,
+                epochs: 0,
+            },
+            want: ConvergenceRun::default(),
+        }
+    }
+
+    impl Case {
+        fn stops(mut self, stop: Option<u32>, points: &[u32]) -> Self {
+            self.want = ConvergenceRun {
+                stop,
+                points: points.to_vec(),
+            };
+            self
+        }
+
+        /// The training loss per entry (in order), and the run's epochs.
+        fn losses(mut self, losses: &[Option<f64>], epochs: u32) -> Self {
+            for (e, l) in self.epochs.iter_mut().zip(losses) {
+                e.2 = *l;
+            }
+            self.rule.epochs = epochs;
+            self
+        }
+    }
+
+    /// Validation mAP50-95 and training loss of run 20261030-010233-b69d (RF-DETR nano, 16
+    /// validation images): stopped at epoch 15 on the epoch-5 peak while the loss still fell.
+    const INCIDENT_MAP: [f64; 15] = [
+        0.7343, 0.7732, 0.7879, 0.7579, 0.8350, 0.7320, 0.8194, 0.8155, 0.7966, 0.7669, 0.7535,
+        0.7368, 0.8009, 0.8202, 0.8188,
+    ];
+    const INCIDENT_LOSS: [f64; 15] = [
+        4.582, 4.141, 3.842, 3.680, 3.618, 3.630, 3.529, 3.547, 3.655, 3.483, 3.396, 3.167, 3.322,
+        3.156, 3.535,
+    ];
+
+    fn incident() -> Vec<(u32, f64)> {
+        (1..).zip(INCIDENT_MAP).collect()
+    }
+
+    fn incident_losses() -> Vec<Option<f64>> {
+        INCIDENT_LOSS.iter().map(|&l| Some(l)).collect()
+    }
 
     /// Fixed mAP sequences and rules, with the epoch each stops at (None = runs to the end).
     fn sequences() -> Vec<Case> {
@@ -1227,50 +1498,250 @@ mod tests {
             (6, 0.2),
             (7, 0.2),
         ];
+        let flat: Vec<(u32, f64)> = (1..=40).map(|e| (e, 0.5)).collect();
+        // Falls 10% per epoch; then flat after epoch 5.
+        let falling: Vec<Option<f64>> = (0..40).map(|i| Some(4.0 * 0.9f64.powi(i))).collect();
+        let flattening: Vec<Option<f64>> =
+            (0..40).map(|i| Some(4.0 * 0.9f64.powi(i.min(4)))).collect();
+        // Missing losses are skipped: epochs 2..5 hold 3 values, too few to fall.
+        let gappy: Vec<Option<f64>> = (0..40)
+            .map(|i| (i % 4 != 2).then(|| 4.0 * 0.9f64.powi(i)))
+            .collect();
         vec![
-            (ramp.clone(), 3, 10, 0.001, None),
-            (plateau.clone(), 5, 10, 0.001, Some(16)),
-            (plateau, 0, 0, 0.0, None),
-            (early.clone(), 2, 0, 0.0, Some(3)),
-            (early, 2, 5, 0.0, None),
-            (noisy, 3, 0, 0.001, Some(7)),
+            // smooth 1: the rule as it was.
+            case(&ramp, 3, 10, 0.001, 1).stops(None, &[]),
+            case(&plateau, 5, 10, 0.001, 1).stops(Some(16), &[]),
+            case(&plateau, 0, 0, 0.0, 1).stops(None, &[]),
+            case(&early, 2, 0, 0.0, 1).stops(Some(3), &[]),
+            case(&early, 2, 5, 0.0, 1).stops(None, &[]),
+            case(&noisy, 3, 0, 0.001, 1).stops(Some(7), &[]),
+            // smooth 0 reads as 1.
+            case(&plateau, 5, 10, 0.001, 0).stops(Some(16), &[]),
+            // smooth 3: a steady ramp keeps gaining; the plateau's 3-mean gains last at epoch 8.
+            case(&ramp, 3, 10, 0.001, 3).stops(None, &[]),
+            case(&plateau, 5, 10, 0.001, 3).stops(Some(13), &[]),
+            case(&early, 2, 0, 0.0, 3).stops(Some(3), &[]),
+            // The incident: one noisy peak stops it at 15; the 3-mean still gains at 15.
+            case(&incident(), 10, 10, 0.001, 1).stops(Some(15), &[]),
+            case(&incident(), 10, 10, 0.001, 3).stops(None, &[]),
+            // With its losses: still falling at 15, so it goes on.
+            case(&incident(), 10, 10, 0.001, 1)
+                .losses(&incident_losses(), 100)
+                .stops(None, &[15]),
+            // Loss still falling: two extensions, then the stop.
+            case(&flat, 4, 0, 0.0, 1)
+                .losses(&falling, 40)
+                .stops(Some(13), &[5, 9]),
+            // The loss flattens after the first extension: stop at the next point.
+            case(&flat, 4, 0, 0.0, 1)
+                .losses(&flattening, 40)
+                .stops(Some(9), &[5]),
+            // No epochs left at the stop point: stop.
+            case(&flat, 4, 0, 0.0, 1)
+                .losses(&falling, 5)
+                .stops(Some(5), &[]),
+            // Too few losses in the window: stop; later windows have enough.
+            case(&flat, 4, 0, 0.0, 1)
+                .losses(&gappy, 40)
+                .stops(Some(5), &[]),
+            case(&flat, 3, 0, 0.0, 1)
+                .losses(&falling, 40)
+                .stops(Some(4), &[]),
         ]
     }
 
     #[test]
     fn convergence_rule_stops_where_expected() {
-        for (i, (v, patience, min_epochs, delta, want)) in sequences().into_iter().enumerate() {
-            assert_eq!(
-                convergence_decision(&v, patience, min_epochs, delta),
-                want,
-                "sequence {i}"
-            );
+        for (i, c) in sequences().into_iter().enumerate() {
+            assert_eq!(convergence_run(&c.epochs, &c.rule), c.want, "sequence {i}");
         }
-        assert_eq!(convergence_decision(&[], 1, 0, 0.0), None);
+        assert_eq!(convergence_decision(&[], 1, 0, 0.0, 1), None);
+        // The incident: smooth 1 stops at 15, smooth 3 not by 15.
+        assert_eq!(
+            convergence_decision(&incident(), 10, 10, 0.001, 1),
+            Some(15)
+        );
+        assert_eq!(convergence_decision(&incident(), 10, 10, 0.001, 3), None);
     }
 
-    /// The script's `Convergence` decides as [`convergence_decision`] (skipped without python3).
+    #[test]
+    fn smoothing_moves_the_gain_not_the_kept_checkpoint() {
+        let mut t = Tracker::new(0.001, 3);
+        for (e, v) in incident() {
+            t.update(e, Some(v));
+        }
+        // Raw top: the epoch-5 peak (the checkpoint kept); 3-mean gains last at epoch 15.
+        assert_eq!((t.top_epoch, t.top), (5, Some(0.8350)));
+        assert_eq!(t.best_epoch, 15);
+        let gains: Vec<u32> = {
+            let mut t = Tracker::new(0.001, 3);
+            incident()
+                .into_iter()
+                .filter_map(|(e, v)| {
+                    let before = t.best_epoch;
+                    t.update(e, Some(v));
+                    (t.best_epoch != before).then_some(e)
+                })
+                .collect()
+        };
+        assert_eq!(gains, [1, 2, 3, 4, 5, 7, 9, 15]);
+    }
+
+    /// `loss_falling` cases: `(losses, falling)`.
+    fn loss_cases() -> Vec<(Vec<Option<f64>>, bool)> {
+        let s = |v: &[f64]| v.iter().map(|&x| Some(x)).collect::<Vec<_>>();
+        vec![
+            (vec![], false),
+            (s(&[4.0, 3.0, 2.0]), false),
+            (s(&[4.0, 3.0, 2.0, 1.0]), true),
+            (s(&[1.0, 1.0, 1.0, 1.0]), false),
+            (s(&[1.0, 1.0, 0.985, 0.985]), false),
+            (s(&[1.0, 1.0, 0.97, 0.97]), true),
+            (s(&[1.0, 1.0, 1.1, 1.2]), false),
+            // An odd middle value counts in neither half.
+            (s(&[4.0, 4.0, 100.0, 3.0, 3.0]), true),
+            // Missing values are skipped.
+            (
+                vec![Some(4.0), None, Some(4.0), Some(3.0), None, Some(3.0)],
+                true,
+            ),
+            (vec![Some(4.0), None, None, Some(3.0), Some(2.0)], false),
+            (incident_losses().split_off(5), true),
+        ]
+    }
+
+    #[test]
+    fn loss_falling_compares_the_halves() {
+        for (i, (l, want)) in loss_cases().into_iter().enumerate() {
+            assert_eq!(loss_falling(&l), want, "case {i}");
+        }
+        assert!(!loss_falling(&[Some(f64::NAN); 8]));
+        let (a, b) = loss_halves(&incident_losses().split_off(5)).unwrap();
+        assert!(
+            (a - 3.5688).abs() < 1e-9 && (b - 3.3152).abs() < 1e-9,
+            "{a} {b}"
+        );
+    }
+
+    #[test]
+    fn converge_points_parse_and_show_the_stop_now_notice() {
+        let ev = parse_line(
+            r#"@train {"epoch":15,"best_epoch":5,"best":0.835,"loss_falling":true,"loss_from":3.5688,"loss_to":3.3152,"extension":1,"next_check":25,"event":"converge_point"}"#,
+        )
+        .unwrap();
+        let TrainEvent::ConvergePoint(cp) = &ev else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(
+            (cp.epoch, cp.best_epoch, cp.extension, cp.next_check),
+            (15, 5, 1, 25)
+        );
+        let mut p = TrainProgress {
+            patience: 10,
+            min_delta: 0.001,
+            min_epochs: 10,
+            ..TrainProgress::default()
+        };
+        for (e, v) in incident() {
+            let mut ev = epoch(e, &[("map", v)]);
+            if let TrainEvent::Epoch { epochs, .. } = &mut ev {
+                *epochs = 100;
+            }
+            p.apply(&ev, f64::from(e));
+        }
+        assert_eq!((p.since_best, p.stop_epoch()), (10, 15));
+        assert_eq!(p.extension, None);
+        p.apply(&ev, 16.0);
+        // The countdown restarts at the point.
+        assert_eq!((p.since_best, p.stop_epoch()), (0, 25));
+        let n = p.extension.clone().unwrap();
+        assert_eq!(
+            n.text,
+            "Early stop reached at epoch 15 (best epoch 5, mAP 0.835); training loss is still \
+             falling (3.569 \u{2192} 3.315). Continuing to epoch 25."
+        );
+        assert_eq!((n.keep_epoch, n.extension), (5, 1));
+        assert!(
+            p.describe()
+                .contains("extended past epoch 15 (loss still falling, 1 of 2)"),
+            "{}",
+            p.describe()
+        );
+        // Round trip.
+        let back: TrainProgress =
+            serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+        // A stop (Stop now, or the next point) ends the notice.
+        p.apply(
+            &TrainEvent::Stop {
+                reason: "finish".into(),
+                epoch: 17,
+                best_epoch: 5,
+                best: Some(0.835),
+            },
+            17.0,
+        );
+        assert_eq!(p.extension, None);
+        // A stop event with the new fields still parses.
+        assert!(matches!(
+            parse_line(
+                r#"@train {"event":"stop","reason":"converged","epoch":24,"best_epoch":12,"best":0.41,"loss_falling":false,"extensions":0}"#
+            ),
+            Some(TrainEvent::Stop { epoch: 24, .. })
+        ));
+    }
+
+    /// A Python 3 to run the script's code with (`python3`, else `python`); None without one.
+    fn python3() -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|p| {
+            std::process::Command::new(p)
+                .args([
+                    "-I",
+                    "-c",
+                    "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    }
+
+    /// The script's `Convergence` and `loss_falling` decide as [`convergence_run`] and
+    /// [`loss_falling`] (skipped without Python 3).
     #[test]
     fn convergence_matches_the_training_script() {
         let script = include_str!("../../scripts/train_model.py");
         let cases: Vec<serde_json::Value> = sequences()
             .into_iter()
-            .map(|(v, p, m, d, _)| serde_json::json!({"values": v, "patience": p, "min_epochs": m, "min_delta": d}))
+            .map(|c| {
+                serde_json::json!({"epochs": c.epochs, "patience": c.rule.patience,
+                    "min_epochs": c.rule.min_epochs, "min_delta": c.rule.min_delta,
+                    "smooth": c.rule.smooth, "total": c.rule.epochs})
+            })
+            .collect();
+        let losses: Vec<serde_json::Value> = loss_cases()
+            .into_iter()
+            .map(|(l, _)| serde_json::json!(l))
             .collect();
         let code = r#"
 import json, sys
 src, cases = sys.stdin.read().split("\n#CASES#\n")
+cases = json.loads(cases)
 ns = {"__name__": "train_model"}
 exec(compile(src, "train_model.py", "exec"), ns)
 out = []
-for c in json.loads(cases):
-    conv = ns["Convergence"](c["patience"], c["min_epochs"], c["min_delta"], None)
-    stop = None
-    for e, v in c["values"]:
-        if conv.update(e, v):
+for c in cases["runs"]:
+    conv = ns["Convergence"](c["patience"], c["min_epochs"], c["min_delta"], None, c["smooth"], c["total"])
+    stop, points = None, []
+    for e, v, l in c["epochs"]:
+        if conv.update(e, v, l):
             stop = e
             break
-    out.append(stop)
+        if conv.point:
+            points.append(e)
+    out.append({"stop": stop, "points": points})
+falling = [ns["loss_falling"](l) for l in cases["losses"]]
 import pathlib, tempfile
 d = pathlib.Path(tempfile.mkdtemp())
 f = d / "stop-request"
@@ -1280,39 +1751,132 @@ f.write_text("x")
 fin += [c.update(2, 0.2), c.update(2, 0.3), c.update(3, 0.3), c.top_epoch]
 f.unlink()
 d.rmdir()
-print(json.dumps({"stops": out, "finish": fin}))
+print(json.dumps({"runs": out, "falling": falling, "finish": fin}))
 "#;
-        let mut child = match std::process::Command::new("python3")
+        let Some(python) = python3() else {
+            eprintln!("no Python 3 found; parity test skipped");
+            return;
+        };
+        let mut child = std::process::Command::new(python)
             .args(["-I", "-c", code])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("python3 not found ({e}); parity test skipped");
-                return;
-            }
-        };
-        let input = format!("{script}\n#CASES#\n{}", serde_json::Value::from(cases));
+            .unwrap();
+        let input = format!(
+            "{script}\n#CASES#\n{}",
+            serde_json::json!({"runs": cases, "losses": losses})
+        );
         {
             use std::io::Write as _;
             let mut stdin = child.stdin.take().unwrap();
             stdin.write_all(input.as_bytes()).unwrap();
         }
         let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "python3 failed");
+        assert!(out.status.success(), "{python} failed");
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         // The stop file finishes before min_epochs, once.
         assert_eq!(
             v["finish"],
             serde_json::json!([null, "finish", null, null, 2])
         );
-        let got: Vec<Option<u32>> = serde_json::from_value(v["stops"].clone()).unwrap();
-        let want: Vec<Option<u32>> = sequences()
+        let got: Vec<(Option<u32>, Vec<u32>)> = v["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_value(serde_json::json!([r["stop"], r["points"]])).unwrap())
+            .collect();
+        let want: Vec<(Option<u32>, Vec<u32>)> = sequences()
             .into_iter()
-            .map(|(v, p, m, d, _)| convergence_decision(&v, p, m, d))
+            .map(|c| {
+                let r = convergence_run(&c.epochs, &c.rule);
+                (r.stop, r.points)
+            })
             .collect();
         assert_eq!(got, want);
+        let falling: Vec<bool> = serde_json::from_value(v["falling"].clone()).unwrap();
+        let want: Vec<bool> = loss_cases().iter().map(|(l, _)| loss_falling(l)).collect();
+        assert_eq!(falling, want);
+    }
+
+    /// The script's memory gate before the export (`memory_shortfall`, `wait_for_memory` with a
+    /// fake clock): unknown values never block, the 3 GB / 4 GB limits, a wait that ends when
+    /// memory frees, one that runs out, and a stop file that only counts when it appears during
+    /// the wait (skipped without Python 3).
+    #[test]
+    fn export_memory_gate_of_the_training_script() {
+        let script = include_str!("../../scripts/train_model.py");
+        let code = r#"
+import json, sys, pathlib, tempfile
+ns = {"__name__": "train_model"}
+exec(compile(sys.stdin.read(), "train_model.py", "exec"), ns)
+G = 1 << 30
+short = ns["memory_shortfall"]
+out = {"short": [len(short(None, None)), len(short(3 * G - 1, None)), len(short(3 * G, 4 * G)),
+                 len(short(3 * G - 1, 4 * G - 1)), len(short(None, 4 * G - 1))]}
+
+def run(states, stop=None, make_stop_at=None):
+    t = [0.0]
+    it = iter(states)
+    last = [None]
+    def status():
+        last[0] = next(it, last[0])
+        return last[0]
+    def sleep(s):
+        t[0] += s
+        if make_stop_at is not None and t[0] >= make_stop_at:
+            stop.write_text("x")
+    ok = ns["wait_for_memory"](stop, 300, 10, status=status, sleep=sleep, clock=lambda: t[0])
+    return [ok, t[0]]
+
+low, okm = {"ram": G, "commit": 8 * G}, {"ram": 4 * G, "commit": 8 * G}
+out["freed"] = run([low, low, okm])
+out["enough"] = run([okm])
+out["timeout"] = run([low])
+d = pathlib.Path(tempfile.mkdtemp())
+f = d / "stop-request"
+out["stop_during"] = run([low], f, 30)
+out["stop_before"] = run([low], f)
+f.unlink()
+d.rmdir()
+print("RESULT: " + json.dumps(out))
+"#;
+        let Some(python) = python3() else {
+            eprintln!("no Python 3 found; memory gate test skipped");
+            return;
+        };
+        let mut child = std::process::Command::new(python)
+            .args(["-I", "-c", code])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(script.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{python} failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("RESULT: "))
+            .unwrap_or_else(|| panic!("no result in {stdout}"));
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["short"], serde_json::json!([0, 1, 0, 2, 1]));
+        assert_eq!(v["freed"], serde_json::json!([true, 20.0]));
+        assert_eq!(v["enough"], serde_json::json!([true, 0.0]));
+        assert_eq!(v["timeout"], serde_json::json!([false, 300.0]));
+        assert_eq!(v["stop_during"], serde_json::json!([false, 30.0]));
+        assert_eq!(v["stop_before"], serde_json::json!([false, 300.0]));
+        // The waits are reported as export phase events the service parses.
+        assert!(
+            stdout
+                .lines()
+                .filter_map(parse_line)
+                .any(|e| matches!(e, TrainEvent::Phase { ref detail, .. } if detail.contains("waiting up to 5 min"))),
+            "{stdout}"
+        );
     }
 }

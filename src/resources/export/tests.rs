@@ -155,12 +155,12 @@ fn full_export_runs_every_stage_in_order() {
     assert!(cmds[2].contains("--require-hashes --no-deps --only-binary :all: -r "));
     assert!(!cmds[2].contains("--torch-backend"), "macOS uses PyPI");
     assert!(
-        cmds[3].contains(" -X faulthandler -u -I ")
+        cmds[3].contains(" -X faulthandler -X utf8 -u -I ")
             && cmds[3].ends_with("export_model.py --self-check --recipe ultralytics"),
         "{}",
         cmds[3]
     );
-    assert!(cmds[4].contains(" -X faulthandler -u -I "));
+    assert!(cmds[4].contains(" -X faulthandler -X utf8 -u -I "));
     assert!(
         cmds[4].contains("--recipe ultralytics --name yolo26n --family yolo26 --weights "),
         "{}",
@@ -531,6 +531,7 @@ fn system_runner_streams_fails_times_out_and_cancels() {
         env: vec![("BOP_TEST".into(), "hello".into())],
         cwd: dir.clone(),
         timeout,
+        low_priority: false,
     };
     let never = AtomicBool::new(false);
     let mut lines = Vec::new();
@@ -704,6 +705,62 @@ fn system_runner_streams_fails_times_out_and_cancels() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `low_priority` command runs below normal priority (Windows priority class, Unix nice >= 10;
+/// on Unix another one keeps the runner's nice value).
+#[test]
+fn system_runner_starts_low_priority_children() {
+    let dir = tmp("priority");
+    #[cfg(windows)]
+    let (program, args) = (
+        "powershell",
+        vec![
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[System.Diagnostics.Process]::GetCurrentProcess().PriorityClass",
+        ],
+    );
+    #[cfg(unix)]
+    let (program, args) = ("/bin/sh", vec!["-c", "ps -o nice= -p $$"]);
+    let run = |low_priority: bool| {
+        let cmd = Cmd {
+            stage: Stage::Export,
+            program: program.into(),
+            args: args.iter().map(OsString::from).collect(),
+            env: vec![],
+            cwd: dir.clone(),
+            timeout: Duration::from_secs(60),
+            low_priority,
+        };
+        let mut lines = Vec::new();
+        SystemRunner
+            .run(
+                &cmd,
+                &mut |l| {
+                    if !l.trim().is_empty() {
+                        lines.push(l.trim().to_string());
+                    }
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        lines.last().cloned().unwrap_or_default()
+    };
+    let low = run(true);
+    // (Windows: not compared with a normal child: `priority::tests` lowers this test process
+    // for a moment, and a child of a below-normal process inherits that.)
+    #[cfg(windows)]
+    assert_eq!(low, "BelowNormal");
+    #[cfg(unix)]
+    {
+        let nice: i32 = low.parse().unwrap();
+        assert!(nice >= crate::backend::priority::CHILD_NICE, "{low}");
+        let normal: i32 = run(false).parse().unwrap();
+        assert!(normal <= nice, "{normal} vs {nice}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Pause / resume of a real process tree: no output while paused, output continues after it,
 /// paused time does not count toward the timeout, cancel works while paused, and a runner
 /// entered while paused waits before starting the child.
@@ -719,6 +776,7 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
         env: vec![],
         cwd: dir.clone(),
         timeout,
+        low_priority: false,
     };
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let count = || lines.lock().unwrap().len();
