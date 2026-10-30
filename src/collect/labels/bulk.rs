@@ -313,7 +313,7 @@ pub fn bulk_reject_unwanted(
             eligible.push((rel, n, renamed));
         }
     }
-    edit_listed(dir, eligible, limit, dry_run, &edit)
+    edit_listed(dir, eligible, limit, dry_run, &|_| None, &edit)
 }
 
 /// Reviewed frames holding training boxes of unwanted classes ([`reviewed_with_unwanted`]).
@@ -375,17 +375,18 @@ fn edit_unreviewed(
             eligible.push((item.frame, n, renamed));
         }
     }
-    edit_listed(dir, eligible, limit, dry_run, edit)
+    edit_listed(dir, eligible, limit, dry_run, &|_| None, edit)
 }
 
 /// Edit the frames `eligible` lists (rel, boxes rejected, boxes renamed as counted), at most
-/// `limit`, each re-checked under the write lock ([`super::update`]); `dry_run` only sums the
-/// counts.
+/// `limit`, each re-checked under the write lock ([`super::update`]); a frame without a label
+/// file is edited from `fresh` (None: passed over). `dry_run` only sums the counts.
 fn edit_listed(
     dir: &Path,
     eligible: Vec<(String, usize, usize)>,
     limit: usize,
     dry_run: bool,
+    fresh: &dyn Fn(&Frame) -> Option<LabelFile>,
     edit: &dyn Fn(&mut LabelFile) -> (usize, usize),
 ) -> BulkOutcome {
     let mut out = BulkOutcome {
@@ -410,7 +411,9 @@ fn edit_listed(
         };
         let (mut n, mut renamed) = (0, 0);
         let r = super::update(&frame.labels, |cur| {
-            let Some(mut l) = cur else { return Ok(None) };
+            let Some(mut l) = cur.or_else(|| fresh(&frame)) else {
+                return Ok(None);
+            };
             (n, renamed) = edit(&mut l);
             Ok((n + renamed > 0).then_some(l))
         });
@@ -518,11 +521,16 @@ pub fn bulk_accept(
 /// Apply `verdict` at `spot` ([`super::repeats::Spot`]) on the unreviewed frames of
 /// `spot.camera` in `dir` that `filters` (camera and status forced) and `keep` select: every
 /// pending model / auto box of the object there is rejected or accepted, the frame marked
-/// ([`LabelFile::repeat_spot`]). Frames of another size than the spot's are passed over; at most
-/// `limit` frames in queue order. `dry_run` only counts.
+/// ([`LabelFile::repeat_spot`]). A frame without a label file (never opened) is taken as the page
+/// shows it, pre-filled from its sidecar with `classes` / `hidden` ([`super::prefill`]). Frames of
+/// another size than the spot's are passed over; at most `limit` frames in queue order. `dry_run`
+/// only counts.
+#[allow(clippy::too_many_arguments)]
 pub fn bulk_spot(
     dir: &Path,
     filters: &Filters,
+    classes: &[String],
+    hidden: &[String],
     spot: &super::repeats::Spot,
     verdict: &super::repeats::Verdict,
     limit: usize,
@@ -533,23 +541,32 @@ pub fn bulk_spot(
     f.status = StatusFilter::Is(Status::Unreviewed);
     f.camera = Some(spot.camera.clone());
     let built = queue::build(dir, &f);
+    let fresh = |frame: &Frame| {
+        let rec = frame.record().ok()?;
+        Some(super::prefill(&rec, classes, hidden))
+    };
     let mut eligible = Vec::new();
     for item in built.items.into_iter().filter(|i| keep(&i.frame)) {
         let Some(frame) = Frame::resolve(dir, &item.frame) else {
             continue;
         };
-        let (Ok(rec), Ok(Some(l))) = (frame.record(), frame.labels()) else {
+        let Ok(rec) = frame.record() else {
             continue;
         };
         if (rec.width, rec.height) != (spot.width, spot.height) {
             continue;
         }
+        let l = match frame.labels() {
+            Ok(Some(l)) => l,
+            Ok(None) => super::prefill(&rec, classes, hidden),
+            Err(_) => continue,
+        };
         let n = spot.count(&l, verdict);
         if n > 0 {
             eligible.push((item.frame, n, 0));
         }
     }
-    edit_listed(dir, eligible, limit, dry_run, &|l| {
+    edit_listed(dir, eligible, limit, dry_run, &fresh, &|l| {
         (spot.apply(l, verdict), 0)
     })
 }
@@ -740,18 +757,19 @@ mod tests {
         };
         let reject = Verdict::Reject(Some(super::super::RejectReason::StaticObject));
         let all = Filters::default();
+        let cls = ["car".to_string(), "dog".to_string()];
         let before: Vec<LabelFile> = [&a, &b, &c, &d, &e, &f]
             .iter()
             .map(|r| labels_of(&dir, r))
             .collect();
-        let dry = bulk_spot(&dir, &all, &spot, &reject, 100, true, &|_| true);
+        let dry = bulk_spot(&dir, &all, &cls, &[], &spot, &reject, 100, true, &|_| true);
         assert_eq!((dry.eligible, dry.boxes, dry.done_count), (2, 2, 0));
         let after: Vec<LabelFile> = [&a, &b, &c, &d, &e, &f]
             .iter()
             .map(|r| labels_of(&dir, r))
             .collect();
         assert_eq!(before, after, "a dry run writes nothing");
-        let o = bulk_spot(&dir, &all, &spot, &reject, 100, false, &|_| true);
+        let o = bulk_spot(&dir, &all, &cls, &[], &spot, &reject, 100, false, &|_| true);
         assert_eq!((o.boxes, o.done_count), (2, 2));
         let la = labels_of(&dir, &a);
         assert_eq!(la.boxes[0].state, BoxState::Rejected);
@@ -810,6 +828,8 @@ mod tests {
         let o = bulk_spot(
             &dir,
             &all,
+            &cls,
+            &[],
             &accept_spot,
             &Verdict::Accept,
             100,
@@ -822,6 +842,48 @@ mod tests {
             (lg.boxes[0].state, lg.boxes[1].state),
             (BoxState::Accepted, BoxState::Pending)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spot_everywhere_takes_frames_never_opened_as_the_page_shows_them() {
+        use super::super::repeats::{REJECT_SPOT_IOU, Spot, Verdict};
+        let dir = std::env::temp_dir().join(format!("bop-spot-new-{}", uuid::Uuid::new_v4()));
+        // A frame with only its sidecar (no label file): the model's car at the spot.
+        let rel = put_frame(&dir, "fresh", None, vec![]);
+        let frame = Frame::resolve(&dir, &rel).unwrap();
+        std::fs::remove_file(&frame.labels).unwrap();
+        let mut rec = frame.record().unwrap();
+        rec.predictions.push(crate::collect::record::Det {
+            label: "car".into(),
+            score: 0.7,
+            bbox: [2.0, 2.0, 30.0, 40.0],
+        });
+        let json = frame.labels.with_file_name("fresh.json");
+        std::fs::write(&json, serde_json::to_vec(&rec).unwrap()).unwrap();
+        let spot = Spot {
+            camera: "cam".into(),
+            label: "car".into(),
+            bbox: [2.0, 2.0, 30.0, 40.0],
+            width: 64,
+            height: 48,
+            min_iou: REJECT_SPOT_IOU,
+        };
+        let cls = ["car".to_string()];
+        let all = Filters::default();
+        let reject = Verdict::Reject(None);
+        let dry = bulk_spot(&dir, &all, &cls, &[], &spot, &reject, 100, true, &|_| true);
+        assert_eq!((dry.eligible, dry.boxes), (1, 1));
+        assert!(
+            frame.labels().unwrap().is_none(),
+            "a dry run writes nothing"
+        );
+        let o = bulk_spot(&dir, &all, &cls, &[], &spot, &reject, 100, false, &|_| true);
+        assert_eq!((o.boxes, o.done_count), (1, 1));
+        let l = labels_of(&dir, &rel);
+        assert_eq!(l.status, Status::Unreviewed);
+        assert_eq!(l.boxes[0].state, BoxState::Rejected);
+        assert!(l.repeat_spot);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
