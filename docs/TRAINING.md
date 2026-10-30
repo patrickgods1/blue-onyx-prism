@@ -469,7 +469,12 @@ Stages (page and `train run` show them with percent and ETA):
    use one of the actions below, which also enable it).
 8. **benchmark**: the regular benchmark on the held-out `dir:` set (and `nir-night`, `exdark-ir`,
    `exdark-night` when ticked), so the results are in `benchmark.json` and its history like any other
-   run. A failed benchmark is reported but keeps the model.
+   run (they show on the Benchmark page). It runs on the devices ticked under **Benchmark on
+   devices** (`training.benchmark_devices`, saved from the Train form; `--benchmark-device`,
+   repeatable), one after the other, each released before the next loads; none ticked = only the
+   device the model would load on (its own device, else what `auto` picks). It never sweeps every
+   device of the machine (a GTX 1070 Ti + UHD 630 box hard-hung within seconds of that sweep
+   starting, twice). A failed benchmark is reported but keeps the model.
 
 Default name: `<scene>-<model>-<YYYYMMDD-HHMM>`: `custom-` for `all`, `day-`, `night-` for `night+ir`,
 `night-only-`, `ir-`, `day-night-`, `day-ir-`. Several models can be queued at once (one per ticked
@@ -1125,7 +1130,7 @@ blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <e
     [--classes a,b] [--classes c] [--excluded background|drop-frame] \
     [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
     [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
-    [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
+    [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
     [--max-candidates 1500] [--workers 0] [--hwaccel auto|off] \

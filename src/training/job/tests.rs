@@ -202,6 +202,7 @@ impl Hooks for RecHooks {
         &self,
         out: &TrainOutput,
         extra: &[String],
+        _: &[String],
         _: &AtomicBool,
     ) -> Result<Option<BenchSummary>> {
         self.benched
@@ -289,6 +290,7 @@ fn job(
             classes: None,
             rename: BTreeMap::new(),
             benchmark_sets: vec!["nir-night".into()],
+            benchmark_devices: Vec::new(),
             allow_large: false,
             install_dir: None,
             gpu: None,

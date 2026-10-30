@@ -857,7 +857,7 @@ fn cap_images(sets: &mut [ImageSet], cap: usize) -> Option<String> {
 }
 
 /// The registry's shared runtimes, else dedicated ones from the config.
-fn run_runtimes(ctx: &RunContext) -> Result<Arc<Mutex<Runtimes>>> {
+pub(crate) fn run_runtimes(ctx: &RunContext) -> Result<Arc<Mutex<Runtimes>>> {
     Ok(match &ctx.runtimes {
         Some(rt) => rt.clone(),
         None => {

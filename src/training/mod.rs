@@ -523,6 +523,7 @@ mod tests {
             classes: None,
             rename: Default::default(),
             benchmark_sets: Vec::new(),
+            benchmark_devices: Vec::new(),
             allow_large: false,
             install_dir: None,
             gpu: None,

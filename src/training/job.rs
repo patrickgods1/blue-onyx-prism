@@ -116,6 +116,10 @@ pub struct TrainRequest {
     /// Built-in benchmark sets to run besides the held-out frames (`nir-night`, `exdark-ir`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benchmark_sets: Vec<String>,
+    /// Devices the benchmark at the end runs on, one after the other (canonical specs); empty =
+    /// the one device the model would load on (its device, `auto` resolved).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benchmark_devices: Vec<String>,
     /// Downloads over the large-download limit are allowed (`--allow-large`, the page's
     /// confirmation, or `allow_large_downloads`; [`super::plan_job`] folds the config in). Gates
     /// the public night subset ([`super::check_public_download`]).
@@ -279,11 +283,13 @@ pub struct SceneAp {
 pub trait Hooks: Send + Sync {
     /// Add the installed model to the config (the `add-model` code); returns a message.
     fn register(&self, out: &TrainOutput) -> Result<String>;
-    /// Benchmark the model on its held-out set and `extra` built-in sets.
+    /// Benchmark the model on its held-out set and `extra` built-in sets, on `devices` one after
+    /// the other (empty = the device the model would load on).
     fn benchmark(
         &self,
         out: &TrainOutput,
         extra: &[String],
+        devices: &[String],
         cancel: &AtomicBool,
     ) -> Result<Option<BenchSummary>>;
 }
@@ -299,6 +305,7 @@ impl Hooks for NoHooks {
     fn benchmark(
         &self,
         _: &TrainOutput,
+        _: &[String],
         _: &[String],
         _: &AtomicBool,
     ) -> Result<Option<BenchSummary>> {
@@ -967,7 +974,12 @@ fn stages(
     let (benchmark, benchmark_error) =
         if output.heldout.is_some() || !job.request.benchmark_sets.is_empty() {
             enter!(TrainStage::Benchmark, 0, "waiting for the benchmark runner");
-            match hooks.benchmark(&output, &job.request.benchmark_sets, cancel) {
+            match hooks.benchmark(
+                &output,
+                &job.request.benchmark_sets,
+                &job.request.benchmark_devices,
+                cancel,
+            ) {
                 Ok(b) => (b, None),
                 Err(e) if e.downcast_ref::<Cancelled>().is_some() => return Err(e),
                 Err(e) => {
