@@ -28,6 +28,7 @@
 pub mod cli;
 pub mod current;
 pub mod export;
+pub mod forget;
 pub mod grade;
 pub mod history;
 pub mod images;

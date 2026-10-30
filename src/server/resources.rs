@@ -174,7 +174,16 @@ pub(super) async fn resources_remove(
             }) {
                 // Enabled or removed meanwhile.
                 Ok(_) if dropped.is_empty() => removed.message,
-                Ok(msg) => format!("{}. {msg}", removed.describe(&dropped)),
+                Ok(msg) => {
+                    // Their benchmark results go too (the Benchmark page lists what they hold).
+                    let results = crate::benchmark::results_path(&state.config_path);
+                    for n in &dropped {
+                        if let Err(e) = crate::benchmark::forget::forget_model(&results, n) {
+                            warn!("benchmark results of '{n}' not dropped: {e:#}");
+                        }
+                    }
+                    format!("{}. {msg}", removed.describe(&dropped))
+                }
                 Err(e) => {
                     warn!("removed {id} but not its config entries: {e:#}");
                     format!(
