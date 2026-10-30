@@ -1,6 +1,9 @@
 //! The benchmark at the end of a run: the trained model on its held-out frames (a `dir:` set)
 //! and optional built-in sets, through the regular [`BenchmarkService`] (so the results land in
 //! `benchmark.json` and its history like any other run), summarized for the Training page.
+//! It runs on the chosen devices one after the other (`training.benchmark_devices`, the Train
+//! form), else on the one device the model would load on, never on every device of the machine
+//! (a GTX 1070 Ti + UHD 630 box hard-hung within seconds of that sweep starting, twice).
 //!
 //! Per-scene AP comes from the benchmark's per-tag breakdowns of the held-out manifest's own tags
 //! ([`dataset::heldout_tags`]: `heldout:day|night|ir|all|in-scope`), which are exact AP over
@@ -10,11 +13,13 @@
 
 use super::dataset;
 use super::job::{BenchSummary, SceneAp};
+use crate::backend::DeviceSpec;
 use crate::benchmark::Breakdown;
 use crate::benchmark::report::ModelResult;
 use crate::benchmark::service::{BenchmarkService, RunContext, RunRequest, RunState};
 use crate::config::DatasetRef;
 use crate::resources::export::Cancelled;
+use crate::sync::LockExt;
 use anyhow::{Result, anyhow, bail};
 use std::path::Path;
 use std::sync::Arc;
@@ -38,20 +43,46 @@ pub fn datasets(name: &str, heldout: Option<&Path>, extra: &[String]) -> Vec<Dat
     v
 }
 
-/// Benchmark `name` on `sets` (see the module docs). `ctx` builds the run context when the
-/// service is free (the config must already list the model). Waits for a running benchmark up to
-/// [`BUSY_WAIT`]; `cancel` stops the wait and the run.
+/// The devices of the run: `chosen` when given, else the one device the model `name` would load
+/// on (its configured device, `auto` resolved to its first pick on this machine).
+fn devices_for(c: &mut RunContext, name: &str, chosen: &[String]) -> Result<Vec<String>> {
+    if !chosen.is_empty() {
+        return Ok(chosen.to_vec());
+    }
+    let m = crate::benchmark::find_model(&c.config, name)
+        .ok_or_else(|| anyhow!("'{name}' is not in the config"))?;
+    if let DeviceSpec::Device(d) = c.config.device_spec_for(m)? {
+        return Ok(vec![d.to_string()]);
+    }
+    let path = c.config.data_path(&m.path);
+    // The service reuses these runtimes (the CLI has none until now).
+    let rt = crate::benchmark::service::run_runtimes(c)?;
+    c.runtimes = Some(rt.clone());
+    let pick = rt
+        .lock_recover()
+        .selection(Some(&path))
+        .auto_pick()
+        .map(|o| o.spec.to_string());
+    pick.map(|d| vec![d])
+        .ok_or_else(|| anyhow!("no device can run {name} on this machine"))
+}
+
+/// Benchmark `name` on `sets` on `devices` one after the other (see the module docs). `ctx`
+/// builds the run context when the service is free (the config must already list the model).
+/// Waits for a running benchmark up to [`BUSY_WAIT`]; `cancel` stops the wait and the run.
 pub fn run(
     svc: &Arc<BenchmarkService>,
     ctx: &dyn Fn() -> RunContext,
     name: &str,
     sets: Vec<DatasetRef>,
+    devices: &[String],
     cancel: &AtomicBool,
 ) -> Result<Option<BenchSummary>> {
     if sets.is_empty() {
         return Ok(None);
     }
-    let c = ctx();
+    let mut c = ctx();
+    let devices = devices_for(&mut c, name, devices)?;
     let mut req = RunRequest::defaults(&c.config.benchmark);
     req.models = vec![name.to_string()];
     let fingerprint = sets.iter().find_map(|s| match s {
@@ -59,7 +90,7 @@ pub fn run(
         _ => None,
     });
     req.datasets = sets;
-    req.devices = Vec::new();
+    req.devices = devices;
     req.reference_model = None;
     req.validate()?;
     let started = Instant::now();
@@ -181,6 +212,38 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx_with(device: Option<&str>) -> RunContext {
+        let mut config = crate::config::Config::default();
+        config.models = vec![crate::config::ModelConfig {
+            name: Some("custom-1".into()),
+            path: "models/custom-1.onnx".into(),
+            device: device.map(str::to_string),
+            ..Default::default()
+        }];
+        RunContext {
+            config,
+            results_path: "benchmark.json".into(),
+            runtimes: None,
+            loaded: Default::default(),
+            resources: None,
+        }
+    }
+
+    #[test]
+    fn devices_are_the_chosen_ones_else_the_models_own() {
+        // Chosen devices win, in order.
+        let mut c = ctx_with(Some("openvino:cpu"));
+        let chosen = ["ort:cuda:0".to_string(), "openvino:gpu.0".to_string()];
+        assert_eq!(devices_for(&mut c, "custom-1", &chosen).unwrap(), chosen);
+        // None chosen: the model's own device, one only, without starting any runtime.
+        assert_eq!(
+            devices_for(&mut c, "custom-1", &[]).unwrap(),
+            ["openvino:cpu"]
+        );
+        assert!(c.runtimes.is_none());
+        assert!(devices_for(&mut c, "other", &[]).is_err());
+    }
 
     #[test]
     fn datasets_put_the_heldout_set_first() {

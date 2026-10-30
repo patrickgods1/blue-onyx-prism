@@ -510,6 +510,12 @@
       {% for s in extra_sets %}<label class="check"><input type="checkbox" name="benchmark_set" value="{{ s }}"> <code>{{ s }}</code></label>{% endfor %}
       <p class="muted small">The held-out frames of the export are always used.</p>
     </fieldset>
+    <fieldset class="tr-sets">
+      <legend>Benchmark on devices</legend>
+      <input type="hidden" name="benchmark_devices_form" value="1">
+      {% for d in bench_devices %}<label class="check"{% if d.unavailable %} title="{{ d.label }}"{% endif %}><input type="checkbox" name="benchmark_device" value="{{ d.value }}"{% if d.checked %} checked{% endif %}> <code>{{ d.value }}</code> <span class="muted small">{{ d.label }}</span></label>{% endfor %}
+      <p class="muted small">Ticked devices run one after the other, each released before the next loads. None ticked: only the device the model would load on, <code>{{ bench_auto }}</code> here. Results go to the Benchmark page. Your choice is saved for the next runs.</p>
+    </fieldset>
   </fieldset>
   {% if !allow_large && (!env_ready || other_env.is_some() || (public_available && !public_installed)) %}
   <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB:{% if !env_ready %} {{ env_download }}{% endif %}{% if let Some(o) = other_env %}{% if !env_ready %};{% endif %} the training environment of another GPU if you choose it ({{ o }}){% endif %}{% if (!env_ready || other_env.is_some()) && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>

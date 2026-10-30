@@ -115,6 +115,7 @@ impl Hooks for ServerHooks {
         &self,
         out: &TrainOutput,
         extra: &[String],
+        devices: &[String],
         cancel: &AtomicBool,
     ) -> anyhow::Result<Option<BenchSummary>> {
         let state = self.shared.current();
@@ -134,6 +135,7 @@ impl Hooks for ServerHooks {
             &ctx,
             &out.name,
             bench::datasets(&out.name, out.heldout.as_deref(), extra),
+            devices,
             cancel,
         )
     }
@@ -219,6 +221,52 @@ struct GpuChoice {
     value: String,
     /// `NVIDIA GeForce RTX 3090 (cuda:1, 24 GB, PyTorch cu126)`.
     label: String,
+}
+
+/// One checkbox of the Train form's Benchmark devices fieldset.
+struct BenchDeviceChoice {
+    /// Canonical spec (`ort:cuda:0`; the form's `benchmark_device`).
+    value: String,
+    label: String,
+    checked: bool,
+    /// Saved but not runnable on this machine now (kept so a save does not drop it silently).
+    unavailable: bool,
+}
+
+/// The Benchmark devices checkboxes: every runnable device of this machine, ticked when in
+/// `saved` (`training.benchmark_devices`), then saved ones that cannot run here; and what none
+/// ticked means (the `auto` pick for a model without its own device).
+fn bench_device_choices(state: &AppState, saved: &[String]) -> (Vec<BenchDeviceChoice>, String) {
+    let sel = super::devices::devices_snapshot(state).selection;
+    let mut v: Vec<BenchDeviceChoice> = sel
+        .options
+        .iter()
+        .filter(|o| o.runnable)
+        .map(|o| {
+            let value = o.spec.to_string();
+            BenchDeviceChoice {
+                checked: saved.contains(&value),
+                label: o.label.clone(),
+                value,
+                unavailable: false,
+            }
+        })
+        .collect();
+    for d in saved {
+        if !v.iter().any(|c| &c.value == d) {
+            v.push(BenchDeviceChoice {
+                value: d.clone(),
+                label: "not runnable on this machine now".into(),
+                checked: true,
+                unavailable: true,
+            });
+        }
+    }
+    let auto = sel
+        .auto_pick()
+        .map(|o| format!("{} ({})", o.spec, o.label))
+        .unwrap_or_else(|| "none runnable".into());
+    (v, auto)
 }
 
 /// One checkbox of the Train form's Runs fieldset.
@@ -388,6 +436,10 @@ pub(super) struct TrainingTemplate {
     /// Its download size (`926 MB`).
     public_size: String,
     extra_sets: Vec<&'static str>,
+    /// The Benchmark devices checkboxes ([`bench_device_choices`]).
+    bench_devices: Vec<BenchDeviceChoice>,
+    /// What none ticked runs on: the device `auto` picks (a model without its own device).
+    bench_auto: String,
     runs: Vec<RunRow>,
     results: Vec<ResultRow>,
     models: Vec<String>,
@@ -650,6 +702,8 @@ fn view_with(
 ) -> TrainingTemplate {
     let config = state.config_read().clone();
     let dataset_dir = crate::collect::CollectSettings::for_config(&config).dir;
+    let (bench_devices, bench_auto) =
+        bench_device_choices(state, &config.training.benchmark_devices);
     let imports_dir = config.collect.resolved_review_dir(&config.data_root());
     let paths = TrainPaths::for_config(&config);
     let platform = Platform::current();
@@ -988,6 +1042,8 @@ fn view_with(
             .map(|r| catalog::format_size(r.size()))
             .unwrap_or_default(),
         extra_sets: EXTRA_SETS.to_vec(),
+        bench_devices,
+        bench_auto,
         runs: run_rows,
         results,
         models: names,
@@ -1185,6 +1241,21 @@ pub(crate) fn requests_from_form(
         .filter(|s| EXTRA_SETS.contains(s))
         .map(str::to_string)
         .collect();
+    // The Benchmark devices fieldset (marked by `benchmark_devices_form`: none ticked = the device
+    // the model would load on); a form without it (a script, a bookmark) gets the saved setting.
+    let bench_devices =
+        crate::training::config::benchmark_devices(
+            &if field(f, "benchmark_devices_form").is_some() {
+                all(f, "benchmark_device")
+            } else {
+                training
+                    .benchmark_devices
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("benchmark devices: {e}"))?;
     let mut out = Vec::new();
     for (m, scene) in models
         .iter()
@@ -1218,6 +1289,7 @@ pub(crate) fn requests_from_form(
             classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
             rename: Default::default(),
             benchmark_sets: sets.clone(),
+            benchmark_devices: bench_devices.clone(),
             allow_large: field(f, "confirm_large").is_some(),
             install_dir: field(f, "install_dir").map(PathBuf::from),
             gpu: gpu.clone(),
@@ -1474,6 +1546,7 @@ pub(crate) fn balance_preview_json(
                 classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
                 rename: Default::default(),
                 benchmark_sets: Vec::new(),
+                benchmark_devices: Vec::new(),
                 allow_large: false,
                 install_dir: None,
                 gpu: None,
@@ -1660,6 +1733,10 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
         let cap = crate::training::capability_with_runs(&runs(&state));
         let result = (|| -> anyhow::Result<String> {
             let (mut reqs, name) = requests_from_form(&f, &cap, &config.training)?;
+            let bench_devices = reqs
+                .first()
+                .map(|r| r.benchmark_devices.clone())
+                .unwrap_or_default();
             // Only folders the page offers, or ones the file browser may show / picked natively.
             let allow = allow_in(&config);
             let datasets = checked_datasets(&f, &offered_datasets(&config), &allow)?;
@@ -1730,6 +1807,15 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                 let label = format!("{} ({}{on})", job.name, job.request.recipe.label());
                 svc.enqueue(job).map_err(anyhow::Error::msg)?;
                 queued.push(label);
+            }
+            // The ticked benchmark devices become the setting (the next form starts from them).
+            if bench_devices != config.training.benchmark_devices
+                && let Err(e) = save_config(&state, "training page", |c| {
+                    c.training.benchmark_devices.clone_from(&bench_devices);
+                    Ok(())
+                })
+            {
+                tracing::warn!("benchmark devices not saved: {e:#}");
             }
             Ok(format!("Queued: {}.", queued.join(", ")))
         })();
@@ -2148,6 +2234,48 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("no GPU to choose"), "{e}");
+    }
+
+    #[test]
+    fn the_queue_form_takes_benchmark_devices_else_the_setting() {
+        let training = crate::training::config::TrainingConfig {
+            benchmark_devices: vec!["ort:cuda:0".into()],
+            ..Default::default()
+        };
+        // The fieldset sent: its ticks, canonical and deduplicated, in order.
+        let f = form(&[
+            ("model", "yolo26n"),
+            ("dataset", "/x"),
+            ("benchmark_devices_form", "1"),
+            ("benchmark_device", "GPU"),
+            ("benchmark_device", "ort:cpu"),
+            ("benchmark_device", "openvino:gpu"),
+        ]);
+        let (reqs, _) = requests_from_form(&f, &mac(), &training).unwrap();
+        assert_eq!(reqs[0].benchmark_devices, ["openvino:gpu", "ort:cpu"]);
+        // The fieldset with nothing ticked: the device the model would load on.
+        let f = form(&[
+            ("model", "yolo26n"),
+            ("dataset", "/x"),
+            ("benchmark_devices_form", "1"),
+        ]);
+        let (reqs, _) = requests_from_form(&f, &mac(), &training).unwrap();
+        assert!(reqs[0].benchmark_devices.is_empty());
+        // No fieldset (a script): the saved setting.
+        let f = form(&[("model", "yolo26n"), ("dataset", "/x")]);
+        let (reqs, _) = requests_from_form(&f, &mac(), &training).unwrap();
+        assert_eq!(reqs[0].benchmark_devices, ["ort:cuda:0"]);
+        // `auto` is not one device.
+        let f = form(&[
+            ("model", "yolo26n"),
+            ("dataset", "/x"),
+            ("benchmark_devices_form", "1"),
+            ("benchmark_device", "auto"),
+        ]);
+        let e = requests_from_form(&f, &mac(), &training)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("benchmark devices"), "{e}");
     }
 
     #[test]
@@ -3023,6 +3151,7 @@ mod tests {
             classes: Some(vec!["person".into()]),
             rename: Default::default(),
             benchmark_sets: Vec::new(),
+            benchmark_devices: Vec::new(),
             allow_large: false,
             install_dir: None,
             gpu: None,

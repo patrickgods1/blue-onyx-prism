@@ -141,6 +141,11 @@ pub enum TrainCommand {
         /// exdark-ir, ...).
         #[arg(long = "benchmark-set")]
         benchmark_sets: Vec<String>,
+        /// Device to benchmark the trained model on, repeatable, run one after the other
+        /// (ort:cuda:0, openvino:gpu.0, ...); default training.benchmark_devices, else the
+        /// device the model would load on.
+        #[arg(long = "benchmark-device")]
+        benchmark_devices: Vec<String>,
         /// Keep the checkpoints in <run>/work.
         #[arg(long)]
         keep_work: bool,
@@ -833,6 +838,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             no_register,
             no_benchmark,
             benchmark_sets,
+            benchmark_devices,
             keep_work,
             verbose,
         } => {
@@ -876,6 +882,12 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 noise: aug_noise.unwrap_or(base.noise),
                 gray: aug_gray.unwrap_or(base.gray),
             };
+            let benchmark_devices =
+                super::config::benchmark_devices(if benchmark_devices.is_empty() {
+                    &config.training.benchmark_devices
+                } else {
+                    &benchmark_devices
+                })?;
             let balance = data.balance(&config)?;
             if !balance.is_off() {
                 eprintln!("balance: {}", balance.describe());
@@ -911,6 +923,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                         classes: data.class_list(),
                         rename: data.rename.iter().cloned().collect::<BTreeMap<_, _>>(),
                         benchmark_sets: benchmark_sets.clone(),
+                        benchmark_devices: benchmark_devices.clone(),
                         allow_large,
                         install_dir: install_dir.clone(),
                         gpu: gpu.clone(),
@@ -1357,6 +1370,7 @@ fn preview_request(config: &Config, data: &DataArgs, scene: SceneFilter) -> Resu
         classes: data.class_list(),
         rename: data.rename.iter().cloned().collect(),
         benchmark_sets: Vec::new(),
+        benchmark_devices: Vec::new(),
         allow_large: false,
         install_dir: None,
         gpu: None,
@@ -1550,6 +1564,7 @@ impl Hooks for CliHooks {
         &self,
         out: &TrainOutput,
         extra: &[String],
+        devices: &[String],
         cancel: &AtomicBool,
     ) -> Result<Option<BenchSummary>> {
         if !self.benchmark {
@@ -1569,6 +1584,7 @@ impl Hooks for CliHooks {
             &ctx,
             &out.name,
             super::bench::datasets(&out.name, out.heldout.as_deref(), extra),
+            devices,
             cancel,
         )
     }

@@ -83,6 +83,11 @@ pub struct TrainingConfig {
     /// the data in the training process (slower, needs the least memory).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<u32>,
+    /// Devices the benchmark at the end of a run uses, one after the other (canonical specs:
+    /// `ort:cuda:0`, `openvino:gpu.0`, ...). Empty = the one device the model would load on.
+    /// Saved from the Train form; a queued run keeps the list it was queued with.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub benchmark_devices: Vec<String>,
 }
 
 impl Default for TrainingConfig {
@@ -100,8 +105,30 @@ impl Default for TrainingConfig {
             metric_columns: Vec::new(),
             balance: None,
             workers: None,
+            benchmark_devices: Vec::new(),
         }
     }
+}
+
+/// Benchmark device specs in canonical form, deduplicated in order; `auto` and unknown specs are
+/// refused (the benchmark runs exact devices).
+pub fn benchmark_devices(specs: &[impl AsRef<str>]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for s in specs {
+        let s = s.as_ref();
+        match crate::backend::spec::parse(s).map_err(|e| anyhow::anyhow!("device '{s}': {e}"))? {
+            crate::backend::DeviceSpec::Auto => anyhow::bail!(
+                "device 'auto' is not a single device; pick devices, or none for the device the                  model would load on"
+            ),
+            crate::backend::DeviceSpec::Device(d) => {
+                let d = d.to_string();
+                if !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl TrainingConfig {
