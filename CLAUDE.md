@@ -172,7 +172,14 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `converge_point` extension, at most 2, shown on the page with Stop now = Finish now) and Finish now (`POST /training/finish` -> `<run dir>/work/stop-request`, `stop` event). `SceneFilter` is a
   day/night/ir set (`night` alone = night only); the held-out set is chosen from all review frames before the scene
   filter (tags `heldout:<scene>|all|in-scope`, `heldout_fingerprint`), so runs queued with several scenes share a
-  `compare_group` and compare per scene (`training/compare.rs`, Comparison card, `GET /v1/training/compare`). Class
+  `compare_group` and compare per scene (`training/compare.rs`, Comparison card, `GET /v1/training/compare`; columns also
+  person/vehicle recall + false alerts on empty frames at the model's threshold, from `BenchSummary` `person_recall`,
+  `vehicle_recall`, `empty_frames`/`empty_frame_alerts`, `threshold`). RF-DETR: cosine LR schedule (min_factor 0.1) and lr
+  5e-5 / lr_encoder 7.5e-5 under 1000 train images (`TrainRecipe::effective_lr`); anneal-then-stop at a stop point
+  (`--anneal`, max(5, ceil(patience/2)) epochs, Rust twin `progress::convergence_run`). Validation split = 10% but at
+  least 50 frames, capped at 25% of the pool (`Options.min_valid`). "Repeat with N seeds" (form `seeds` 1-3, `train run
+  --seeds`): `TrainRequest.train_seed` is the trainer's `--seed` only (dataset assembly seed unchanged, so same frames),
+  names get `-s<i>`, one compare group, and the Comparison card adds "mean of N seeds" rows (mean + range, never best). Class
   filter: `dataset::inventory` (`train classes`, `GET /v1/training/dataset-classes`, the page's picker) and
   `Excluded` (background | drop-frame for objects of unpicked classes). Balancing `dataset::balance` (step 7 of
   `dataset::plan`, opt-in: class / scene / camera / camera-day repeat factors capped at max repeat, optional cap of

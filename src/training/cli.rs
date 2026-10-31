@@ -114,7 +114,12 @@ pub enum TrainCommand {
         aug_noise: Option<f32>,
         #[arg(long)]
         aug_gray: Option<f32>,
-        /// Model name (only with one --model and one --scene; default <scene>-<model>-<stamp>:
+        /// Repeat every run with N (1-3) different training seeds on the same frames; the
+        /// runs form one comparison group and the Comparison card shows the spread. Differences
+        /// of 2-3 mAP between seeds are noise.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=3))]
+        seeds: u64,
+        /// Model name (only with one --model and one --scene; repeats get -s1, -s2; default <scene>-<model>-<stamp>:
         /// custom-, day-, night-, ...).
         #[arg(long)]
         name: Option<String>,
@@ -831,6 +836,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             aug_dark,
             aug_noise,
             aug_gray,
+            seeds,
             name,
             allow_large,
             install_dir,
@@ -846,8 +852,8 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             if name.is_some() && (models.len() > 1 || scenes.len() > 1) {
                 bail!("--name needs exactly one --model and one --scene");
             }
-            // Several runs of different scenes are compared on the same held-out frames.
-            let group = (scenes.len() > 1)
+            // Several runs of different scenes or seeds are compared on the same held-out frames.
+            let group = (scenes.len() as u64 * seeds > 1)
                 .then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
             // A chosen GPU: its lane, memory and suggested batches.
             let cap = super::capability_now().for_gpu(gpu.as_deref())?;
@@ -914,7 +920,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 r.lr = lr;
                 r.augment = augment;
                 r.multi_scale = recipe::MultiScale::parse(&multi_scale).unwrap_or_default();
-                for scene in &scenes {
+                for (scene, i) in scenes.iter().flat_map(|s| (0..seeds).map(move |i| (s, i))) {
                     let req = TrainRequest {
                         recipe: r.clone(),
                         datasets: data.datasets.clone(),
@@ -930,8 +936,10 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                         excluded: data.excluded,
                         balance: balance.clone(),
                         compare_group: group.clone(),
+                        train_seed: (seeds > 1).then_some(i),
                     };
-                    let mut job = super::plan_job(&config, req, &cap, name.clone())?;
+                    let run_name = seed_run_name(name.as_deref(), &req.recipe, req.scene, i);
+                    let mut job = super::plan_job(&config, req, &cap, run_name)?;
                     job.keep_work = keep_work;
                     jobs.push(job);
                 }
@@ -1179,6 +1187,7 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 .as_ref()
                 .and_then(|p| p.stopped.as_ref())
                 .map(|s| s.epoch),
+            seed: r.request.train_seed,
             bench: r.benchmark.clone(),
         })
         .collect();
@@ -1377,7 +1386,27 @@ fn preview_request(config: &Config, data: &DataArgs, scene: SceneFilter) -> Resu
         excluded: data.excluded,
         balance: data.balance(config)?,
         compare_group: None,
+        train_seed: None,
     })
+}
+
+/// The name of repeat `i` of a run: none (the default name) or the typed one for the first;
+/// `-s<i>` after it for the others (default names of repeats are made here: they share the
+/// stamp's minute).
+fn seed_run_name(
+    name: Option<&str>,
+    recipe: &TrainRecipe,
+    scene: SceneFilter,
+    i: u64,
+) -> Option<String> {
+    if i == 0 {
+        return name.map(str::to_string);
+    }
+    let base = name.map(str::to_string).unwrap_or_else(|| {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+        recipe.default_name(scene.label(), &stamp)
+    });
+    Some(format!("{base}-s{i}"))
 }
 
 /// Rows of a before / after table: `name  before -> after`, widest name first column.
@@ -1936,6 +1965,34 @@ mod tests {
             SceneFilter::new(false, true, false)
         );
         assert!(parse_scene("dusk").is_err());
+    }
+
+    #[test]
+    fn seeds_parse_and_name_the_repeats() {
+        let TrainCommand::Run { seeds, name, .. } =
+            parse(&["run", "--model", "yolo26n", "--seeds", "3", "--name", "cam"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!((seeds, name.as_deref()), (3, Some("cam")));
+        let TrainCommand::Run { seeds, .. } = parse(&["run", "--model", "yolo26n"]).unwrap() else {
+            panic!("not run")
+        };
+        assert_eq!(seeds, 1);
+        assert!(parse(&["run", "--model", "a", "--seeds", "4"]).is_err());
+        assert!(parse(&["run", "--model", "a", "--seeds", "0"]).is_err());
+        let req = TrainRecipe::new(catalog::TrainFamily::Yolo26, "n").unwrap();
+        let all = SceneFilter::ALL_SCENES;
+        assert_eq!(
+            seed_run_name(Some("cam"), &req, all, 0).as_deref(),
+            Some("cam")
+        );
+        assert_eq!(
+            seed_run_name(Some("cam"), &req, all, 2).as_deref(),
+            Some("cam-s2")
+        );
+        assert_eq!(seed_run_name(None, &req, all, 0), None);
+        assert!(seed_run_name(None, &req, all, 1).unwrap().ends_with("-s1"));
     }
 
     #[test]

@@ -599,6 +599,111 @@ pub struct Summary {
     pub ap50_95: Option<f64>,
     pub per_class: Vec<ClassMetrics>,
     pub by_size: Vec<SizeRecall>,
+    /// Alerting view at the threshold, see [`AlertStats`]. Results of older versions have
+    /// none of these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_recall: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vehicle_recall: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_frames: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_frame_alerts: Option<usize>,
+}
+
+/// The labels (scored label space) that count as a vehicle for [`AlertStats::vehicle_recall`]:
+/// the `vehicle` group class and its members ([`CLASS_GROUPS`]: car, truck, bus).
+pub fn is_vehicle_label(label: &str) -> bool {
+    CLASS_GROUPS
+        .iter()
+        .find(|(g, _)| *g == "vehicle")
+        .is_some_and(|(g, members)| label == *g || members.contains(&label))
+}
+
+/// What CCTV alerting needs at the configured threshold (IoU 0.5, the matching of the counts):
+///
+/// - `person_recall`: recall of class `person` (the per-class recall; None without person
+///   ground truth or when the model has no `person` class).
+/// - `vehicle_recall`: recall over vehicle objects, classes merged ([`is_vehicle_label`]): every
+///   non-ignored ground-truth box of `vehicle`/`car`/`truck`/`bus` and every detection of those
+///   classes are relabelled `vehicle` and matched once more ([`match_image`], greedy by
+///   confidence, one detection per object). A car taken by a `truck` detection is a hit here
+///   (a miss plus a false positive in the per-class counts), the same as a model with an
+///   IPcam-style `vehicle` class is scored. None without vehicle ground truth.
+/// - `empty_frames`: images with no non-ignored ground truth of any scored class (ignore
+///   regions alone still make a frame empty).
+/// - `empty_frame_alerts`: empty frames with at least one detection of a scored class at or
+///   above the threshold that is not inside an ignore region (a false positive by the
+///   matching; a detection on a crowd / "other" region is not counted, like everywhere else).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AlertStats {
+    pub person_recall: Option<f64>,
+    pub vehicle_recall: Option<f64>,
+    pub empty_frames: usize,
+    pub empty_frame_alerts: usize,
+}
+
+impl AlertStats {
+    /// Over `images` for the scored `classes` at `threshold`.
+    pub fn of(images: &[EvalImage], classes: &[String], threshold: f32) -> Self {
+        let scored = |l: &str| classes.iter().any(|c| c == l);
+        let mut person = Counts::default();
+        let mut vehicle = Counts::default();
+        let mut empty = 0;
+        let mut alerts = 0;
+        for img in images {
+            let kept: Vec<PredBox> = img
+                .preds
+                .iter()
+                .filter(|p| p.confidence >= threshold && scored(&p.label))
+                .cloned()
+                .collect();
+            let gt: Vec<GtBox> = img
+                .gt
+                .iter()
+                .filter(|g| scored(&g.label))
+                .cloned()
+                .collect();
+            let m = match_image(&kept, &gt, 0.5);
+            for (g, &hit) in gt.iter().zip(&m.gt_matched) {
+                if !g.ignore && g.label == "person" {
+                    person.tp += usize::from(hit);
+                    person.fn_ += usize::from(!hit);
+                }
+            }
+            if gt.iter().all(|g| g.ignore) {
+                empty += 1;
+                alerts += usize::from(m.pred.contains(&Some(false)));
+            }
+            // Vehicles, classes merged.
+            let as_vehicle = |label: &str| is_vehicle_label(label).then(|| "vehicle".to_string());
+            let vg: Vec<GtBox> = gt
+                .iter()
+                .filter_map(|g| as_vehicle(&g.label).map(|label| GtBox { label, ..g.clone() }))
+                .collect();
+            if vg.iter().any(|g| !g.ignore) {
+                let vp: Vec<PredBox> = kept
+                    .iter()
+                    .filter_map(|p| {
+                        as_vehicle(&p.label).map(|label| PredBox { label, ..p.clone() })
+                    })
+                    .collect();
+                let vm = match_image(&vp, &vg, 0.5);
+                for (g, &hit) in vg.iter().zip(&vm.gt_matched) {
+                    if !g.ignore {
+                        vehicle.tp += usize::from(hit);
+                        vehicle.fn_ += usize::from(!hit);
+                    }
+                }
+            }
+        }
+        Self {
+            person_recall: person.recall(),
+            vehicle_recall: vehicle.recall(),
+            empty_frames: empty,
+            empty_frame_alerts: alerts,
+        }
+    }
 }
 
 /// Counts of one image at `threshold` (IoU 0.5), and its match (for drawing).
@@ -729,7 +834,12 @@ pub fn evaluate(images: &[EvalImage], classes: &[String], threshold: f32) -> Sum
         });
     }
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    let alert = AlertStats::of(images, classes, threshold);
     Summary {
+        person_recall: alert.person_recall,
+        vehicle_recall: alert.vehicle_recall,
+        empty_frames: Some(alert.empty_frames),
+        empty_frame_alerts: Some(alert.empty_frame_alerts),
         images: images.len(),
         counts,
         precision: counts.precision(),
@@ -1356,6 +1466,108 @@ mod tests {
         let s = evaluate(&images, &["person".into(), "dog".into()], 0.5);
         assert_eq!(s.per_class[1].ap50, None);
         assert!((s.ap50.unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    /// Person / vehicle recall and false alerts on empty frames at the threshold, hand-counted.
+    #[test]
+    fn alert_stats_hand_computed() {
+        let big = |x: f32| [x, 0.0, x + 100.0, 100.0];
+        let classes: Vec<String> = ["person", "car", "truck", "bus"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let images = vec![
+            // 1: person hit, person missed (detection below the threshold), car taken by a
+            // truck detection (vehicle hit, per-class miss), bus missed.
+            EvalImage {
+                gt: vec![
+                    gt("person", big(0.0)),
+                    gt("person", big(200.0)),
+                    gt("car", big(400.0)),
+                    gt("bus", big(600.0)),
+                ],
+                preds: vec![
+                    p("person", 0.9, big(0.0)),
+                    p("person", 0.3, big(200.0)),
+                    p("truck", 0.8, big(401.0)),
+                ],
+            },
+            // 2: empty with a false alert.
+            EvalImage {
+                gt: vec![],
+                preds: vec![p("car", 0.6, big(0.0))],
+            },
+            // 3: empty, detection below the threshold: no alert.
+            EvalImage {
+                gt: vec![],
+                preds: vec![p("person", 0.4, big(0.0))],
+            },
+            // 4: only an ignore region (empty); a detection inside it is no alert.
+            EvalImage {
+                gt: vec![GtBox {
+                    ignore: true,
+                    ..gt("person", big(0.0))
+                }],
+                preds: vec![p("person", 0.9, big(1.0))],
+            },
+            // 5: empty, an unscored-class detection does not alert.
+            EvalImage {
+                gt: vec![],
+                preds: vec![p("dog", 0.9, big(0.0))],
+            },
+            // 6: two trucks, one truck detection and one car detection: both hits as
+            // vehicles; one bus detection with no object: a false positive, not a hit.
+            EvalImage {
+                gt: vec![gt("truck", big(0.0)), gt("truck", big(200.0))],
+                preds: vec![
+                    p("truck", 0.7, big(0.0)),
+                    p("car", 0.7, big(200.0)),
+                    p("bus", 0.9, big(800.0)),
+                ],
+            },
+        ];
+        let a = AlertStats::of(&images, &classes, 0.5);
+        assert_eq!(a.person_recall, Some(0.5));
+        // Vehicles: car hit, bus missed, two trucks hit -> 3 / 4.
+        assert_eq!(a.vehicle_recall, Some(0.75));
+        assert_eq!((a.empty_frames, a.empty_frame_alerts), (4, 1));
+        let s = evaluate(&images, &classes, 0.5);
+        assert_eq!(s.person_recall, Some(0.5));
+        assert_eq!(s.vehicle_recall, Some(0.75));
+        assert_eq!((s.empty_frames, s.empty_frame_alerts), (Some(4), Some(1)));
+        // Per class, the truck detection on the car is a miss: car recall 0.
+        let car = s.per_class.iter().find(|c| c.class == "car").unwrap();
+        assert_eq!(car.recall, Some(0.0));
+        // Person recall equals the per-class recall.
+        assert_eq!(s.per_class[0].recall, s.person_recall);
+        // At a lower threshold the 0.4 detection alerts on frame 3 and the 0.3 one hits.
+        let low = AlertStats::of(&images, &classes, 0.25);
+        assert_eq!(low.person_recall, Some(1.0));
+        assert_eq!(low.empty_frame_alerts, 2);
+        // IPcam-style group class: the same as its per-class recall.
+        let ip: Vec<String> = vec!["person".into(), "vehicle".into()];
+        let img = EvalImage {
+            gt: vec![gt("vehicle", big(0.0)), gt("vehicle", big(200.0))],
+            preds: vec![p("vehicle", 0.8, big(0.0))],
+        };
+        let a = AlertStats::of(std::slice::from_ref(&img), &ip, 0.5);
+        assert_eq!((a.person_recall, a.vehicle_recall), (None, Some(0.5)));
+        assert_eq!((a.empty_frames, a.empty_frame_alerts), (0, 0));
+        // A model without person / vehicle classes: none.
+        let dogs = AlertStats::of(&images, &["dog".into()], 0.5);
+        assert_eq!((dogs.person_recall, dogs.vehicle_recall), (None, None));
+        assert_eq!(dogs.empty_frames, 6);
+        assert_eq!(dogs.empty_frame_alerts, 1, "frame 5");
+        // Old results without the fields load.
+        let old: Summary = serde_json::from_str(
+            r#"{"images":1,"counts":{"tp":0,"fp":0,"fn":0},"precision":null,"recall":null,
+               "f1":null,"ap50":null,"ap50_95":null,"per_class":[],"by_size":[]}"#,
+        )
+        .unwrap();
+        assert_eq!((old.person_recall, old.empty_frames), (None, None));
+        let back = serde_json::to_value(&s).unwrap();
+        assert_eq!(back["empty_frame_alerts"], 1);
+        assert_eq!(back["vehicle_recall"], 0.75);
     }
 
     #[test]

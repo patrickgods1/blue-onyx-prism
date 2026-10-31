@@ -145,7 +145,10 @@ pub fn run(
 }
 
 /// The Training page's view of a benchmark result: the recommended device (else the first that
-/// ran), its p50 time and AP50 (over every class of the model when the set annotates others).
+/// ran), its p50 time and AP50 (over every class of the model when the set annotates others),
+/// and the alerting figures of its overall score (person / vehicle recall, false alerts on empty
+/// frames) at the benchmark's configured threshold. Like the overall AP, those cover every
+/// dataset of the run (the held-out set and any built-in set run beside it).
 pub fn summarize(m: &ModelResult) -> BenchSummary {
     let dev = m
         .devices
@@ -196,6 +199,8 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
             },
         );
     }
+    // Alerting at the configured threshold, from the overall score (scored CCTV classes).
+    let o = acc.map(|a| &a.overall);
     BenchSummary {
         datasets: m.datasets.clone(),
         device: dev.map(|d| d.device.clone()),
@@ -203,6 +208,11 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
         ap50,
         ap50_95,
         images: m.images,
+        threshold: acc.map(|a| a.threshold),
+        person_recall: o.and_then(|o| o.person_recall),
+        vehicle_recall: o.and_then(|o| o.vehicle_recall),
+        empty_frames: o.and_then(|o| o.empty_frames),
+        empty_frame_alerts: o.and_then(|o| o.empty_frame_alerts),
         by_scene,
         in_scope,
         heldout_fingerprint: None,
@@ -288,6 +298,10 @@ mod tests {
             images: 30,
             ap50: Some(0.7),
             ap50_95: Some(0.4),
+            person_recall: Some(0.39),
+            vehicle_recall: Some(0.67),
+            empty_frames: Some(130),
+            empty_frame_alerts: Some(4),
             ..Default::default()
         };
         d.run.as_mut().unwrap().accuracy = Some(crate::benchmark::AccuracyReport {
@@ -348,6 +362,44 @@ mod tests {
         )
         .unwrap();
         assert!(back.by_scene.is_empty());
+    }
+
+    #[test]
+    fn summarize_carries_the_alerting_figures_and_threshold() {
+        let b = summarize(&result(vec![], false));
+        assert_eq!(b.threshold, Some(0.5));
+        assert_eq!(
+            (b.person_recall, b.vehicle_recall),
+            (Some(0.39), Some(0.67))
+        );
+        assert_eq!((b.empty_frames, b.empty_frame_alerts), (Some(130), Some(4)));
+        let j = serde_json::to_value(&b).unwrap();
+        assert_eq!(j["empty_frame_alerts"], 4);
+        assert_eq!(j["threshold"], 0.5);
+        // Without accuracy (failed or unscored run): none, and not serialized.
+        let mut m = result(vec![], false);
+        m.devices[0].run.as_mut().unwrap().accuracy = None;
+        let b = summarize(&m);
+        assert_eq!(
+            (b.threshold, b.person_recall, b.empty_frames),
+            (None, None, None)
+        );
+        let j = serde_json::to_value(&b).unwrap();
+        for k in [
+            "threshold",
+            "person_recall",
+            "vehicle_recall",
+            "empty_frames",
+            "empty_frame_alerts",
+        ] {
+            assert!(j.get(k).is_none(), "{k}");
+        }
+        // A record of an older version loads without them.
+        let old: BenchSummary = serde_json::from_str(
+            r#"{"datasets":[],"device":null,"ms_p50":null,"ap50":0.5,"ap50_95":null,"images":3}"#,
+        )
+        .unwrap();
+        assert_eq!((old.threshold, old.vehicle_recall), (None, None));
     }
 
     #[test]

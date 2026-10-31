@@ -212,8 +212,9 @@ A missing label file means "no objects" (the Ultralytics convention).
    spellings still load.
 4. **Hard negatives**: about `training.negative_share` (15%) of the training frames have no objects:
    extra empty frames are dropped (reviewer-confirmed ones are kept first); too few give a warning.
-5. **Validation**: 10% of your own training frames (of all training frames when there are none; at
-   least one), for the trainer's checkpoint choice. A frame holding the last training box of a
+5. **Validation**: 10% of your own training frames (of all training frames when there are none),
+   but at least 50 frames when the pool has them (`Options.min_valid`; never more than a quarter of the
+   pool, so 100 frames give 25, 241 give 50, 1000 give 100; always at least one), for the trainer's checkpoint choice. A frame holding the last training box of a
    class stays in training. Seeded choices rank a frame by its path relative to its export folder,
    so the same exports give the same split wherever they are.
    A class with no training box gets a warning that says why: its boxes are only in the held-out
@@ -341,7 +342,7 @@ sooner.
 | Family | Epochs (cap) | Patience | Min epochs | Min delta | Smoothing | Learning rate |
 |---|---|---|---|---|---|---|
 | YOLO26 / YOLO11 / YOLOv8 | 100 | 15 | 10 | 0.001 | 3 epochs | the trainer's |
-| RF-DETR | 100 | 10 | 10 | 0.001 | 3 epochs | 1e-4 (rfdetr's default) |
+| RF-DETR | 100 | 10 | 10 | 0.001 | 3 epochs | 1e-4 (rfdetr's default); 5e-5 below 1000 training images |
 | RT-DETRv2 / D-FINE | 80 | 10 | 10 | 0.001 | 3 epochs | 1e-4 |
 
 With fewer than 50 validation images a **recommended** patience doubles (10 -> 20, at most the
@@ -349,6 +350,19 @@ epochs; `recipe::SMALL_VALID_IMAGES`): the mAP of so few images jumps by several
 epochs. A typed patience (form, `--patience`, `training.patience`) is never changed. The first lines
 of the train stage in `train.log` say which applied, e.g. `# convergence: 16 validation images
 (< 50): patience 20 instead of 10; mAP averaged over the last 3 epochs`.
+
+**RF-DETR learning rate and schedule.** rfdetr 1.11 defaults to a *step* schedule that drops the
+learning rate x0.1 only after epoch 100 (`lr_drop`); the convergence rule usually stops before, so the
+rate never decayed (run `20261031-025744-2a83` stopped at epoch 93). The trainer therefore passes
+`lr_scheduler="cosine"` with `lr_scheduler_kwargs={"min_factor": 0.1}` (`--lr-scheduler cosine|step`,
+`--lr-min-factor`): rfdetr's managed cosine decays from the learning rate to 0.1x of it over the
+planned epochs (its total steps are Lightning's `estimated_stepping_batches`), after its warm-up.
+With no learning rate typed and fewer than 1000 training images (`recipe::SMALL_TRAIN_IMAGES`) an
+RF-DETR run uses lr 5e-5 and encoder (backbone) lr 7.5e-5 instead of rfdetr's 1e-4 / 1.5e-4; a typed
+lr is used as is with an encoder lr of 1.5x it (`TrainRecipe::effective_lr`, `--lr` / `--lr-encoder`).
+`train.log` says which applied, e.g. `# lr: 0.00005, encoder 0.000075 (312 training images < 1000:
+lower than RF-DETR's default 0.0001 for small datasets)`. An rfdetr that does not take these options
+trains without them (logged).
 
 Sources: the Ultralytics fine-tuning guide (patience 10-20 when fine-tuning) and the `cfg` reference
 (<https://docs.ultralytics.com/guides/finetuning-guide>, <https://docs.ultralytics.com/usage/cfg>);
@@ -387,6 +401,21 @@ is switched off so only this one decides:
   still falling (3.569 -> 3.315). Continuing to epoch 25." with **Stop now and keep epoch 5** (the
   Finish now action) and **Continue** (hides the notice; the run goes on by itself, so an unattended
   run never waits). The incident run with its losses passes its epoch-15 stop point this way.
+- **Anneal, then stop** (RF-DETR, `--anneal N`, 0 = off for the other trainers, whose schedules
+  already decay): the first stop point that would stop (no extension left or the loss no longer
+  falling, before the last epoch) instead trains `N` more epochs, at most up to the epochs, with a
+  lowered learning rate, then stops ("converged"); stop points during the anneal are ignored and
+  Finish now still stops at once. `N = max(5, ceil(patience / 2))` with early stopping on
+  (`TrainRecipe::anneal_epochs`; 5 for the recommended patience 10, 10 for a doubled 20), in the
+  `# convergence:` line of `train.log`. The script bends rfdetr's per-step `LambdaLR` from its
+  current factor f0 down to `--lr-min-factor` (0.1) along a half cosine over those epochs' optimizer
+  steps (never above the schedule; `bend_lambda_lr`, tested with a stand-in scheduler); another
+  scheduler is logged and only anneals-then-stops. It prints `@train {"event":"anneal","epoch":E,
+  "until":U,"best_epoch":B,"best":v,"loss_falling":f,"extensions":n}` and the page shows "Early stop
+  reached at epoch E (best epoch B, mAP v). Lowering the learning rate until epoch U, then
+  stopping." (with Stop now / Continue) and "lowering the learning rate until epoch U, then
+  stopping" in the run's progress line. The best checkpoint is still the one exported, usually one
+  of the annealed epochs.
 - The **best checkpoint** (highest raw mAP, not the smoothed one) is exported, not the last: Ultralytics `best.pt`, RF-DETR
   `checkpoint_best_total.pth`, and for RT-DETRv2 / D-FINE (transformers) the best model state, which is
   restored in memory before the export (the log names the exported epoch).
@@ -399,8 +428,9 @@ checks the file after each epoch; a stale one is removed before training starts.
 cancels.
 
 **The `stop` event.** When the rule (or the stop file) ends training the script prints
-`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v,"loss_falling":f,"extensions":n}`
-(the log line says why: "training loss no longer falling", or that the extensions or epochs ran out). The page shows
+`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v,"loss_falling":f,"extensions":n,"anneal_until":U|null}`
+(the log line says why: "training loss no longer falling", that the extensions or epochs ran out, or
+that the learning rate was lowered for N epochs after the stop point). The page shows
 "best epoch B, M epochs without improvement (stops at patience P)" while training and then
 "converged at epoch N (best B)" or "finished on request at epoch N (best B)"; `train run` prints the same
 in its progress lines.
@@ -611,8 +641,20 @@ comparison shows a warning instead of comparing.
 `train run` with several scenes, the CLI table have one row per run: model, scene filter, best epoch
 and the epoch it stopped at, held-out AP50-95 for `day`, `night`, `ir` and `all` frames
 (from the benchmark's per-tag results), the AP over the scenes the run trained on (**in-scope**, the
-run's headline), and the p50 time. The best value of each column is marked (`*` in the CLI). Runs
-that differ in classes or excluded mode get a warning.
+run's headline), the p50 time, and what alerting sees at the model's confidence threshold over every
+held-out frame: **Person R** (person recall), **Vehicle R** (vehicle recall, car / truck / bus merged,
+so a car found as a truck counts) and **False alerts** (`3/130`: frames without any object that got a
+detection at or above the threshold, of all such frames; a detection inside an ignore region does not
+count). The best value of each column is marked (`*` in the CLI): highest AP and recall, lowest time
+and false-alert rate. Runs of older versions show a dash in the new columns. Runs that differ in
+classes, excluded mode or threshold get a warning.
+
+The same figures close each run's benchmark line on the page (`person recall 0.39 · vehicle recall
+0.67 · false alerts 4/130 empty frames @ 0.50`) and are stored in its benchmark summary (`threshold`,
+`person_recall`, `vehicle_recall`, `empty_frames`, `empty_frame_alerts`), from the benchmark's overall
+score (`benchmark.json` `accuracy.overall` has the same four fields; IoU 0.5, same matching as its
+precision / recall). Like the overall AP, they cover every dataset of the run, built-in sets added to
+the held-out set included.
 
 **The routed row.** When the group has a day run and a night or IR run, a **day + night routed** row
 puts the day run's day AP beside the night run's night / IR AP, which is what a service with

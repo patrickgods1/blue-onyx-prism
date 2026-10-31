@@ -181,6 +181,7 @@ fn negatives_are_capped_near_the_target_share() {
         heldout_share: 0.0,
         negative_share: 0.2,
         val_share: 0.0,
+        min_valid: 0,
         ..Options::default()
     };
     let p = plan(&s, &opts).unwrap();
@@ -239,6 +240,7 @@ fn class_lists_are_mapped_by_name_across_sources() {
         ]),
         heldout_share: 0.0,
         val_share: 0.0,
+        min_valid: 0,
         ..Options::default()
     };
     let p = plan(&s, &opts).unwrap();
@@ -1461,4 +1463,34 @@ fn the_balance_cap_drops_only_training_frames() {
             .iter()
             .all(|(r, _)| train.contains(r) || s[r.0].frames[r.1].scene.as_deref() == Some("day"))
     );
+}
+
+/// Validation frames of a plan over `n` frames with one person box each, default split options.
+fn valid_count(n: usize) -> usize {
+    let t = tmp(&format!("minval-{n}"));
+    let tags: &[&str] = &["day", "camera:a", "date:2026-01-01"];
+    let frames: Vec<(String, &str, &[&str])> = (0..n)
+        .map(|i| (format!("p{i}.jpg"), "0 0.5 0.5 0.2 0.2\n", tags))
+        .collect();
+    let refs: Vec<(&str, &str, &[&str])> = frames
+        .iter()
+        .map(|(name, l, tg)| (name.as_str(), *l, *tg))
+        .collect();
+    flat_export(&t.0, &["person"], &refs);
+    let s = vec![read_export(&t.0).unwrap()];
+    let opts = Options {
+        heldout_share: 0.0,
+        negative_share: 0.0,
+        ..Options::default()
+    };
+    plan(&s, &opts).unwrap().valid.len()
+}
+
+#[test]
+fn validation_split_has_a_minimum_capped_at_a_quarter() {
+    assert_eq!(valid_count(241), 50);
+    assert_eq!(valid_count(100), 25);
+    assert_eq!(valid_count(1000), 100);
+    assert_eq!(valid_count(3), 1);
+    assert_eq!(valid_count(2), 1);
 }
