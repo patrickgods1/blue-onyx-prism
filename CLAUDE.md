@@ -165,7 +165,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   export `train_model.py` `prepare_export` frees the training state (DataLoader workers via gc, trainer, one RF-DETR model at
   a time), caps CPU threads (`BOP_EXPORT_THREADS`) and waits up to 5 min for 3 GB RAM / 4 GB commit; docs in `docs/TRAINING.md`.
   Starting points per family in `recipe::recommended` (epochs cap, patience, min epochs, min_delta; `training.epochs`/
-  `.patience` None = recommended, a stored legacy 50 = None); one convergence rule for every trainer (`Convergence` in
+  `.patience` None = recommended, a stored legacy 50 = None); learning rate `training.lr` / `.lr_schedule` (cosine|linear|step, per family `recipe::lr_schedules`) / `.lr_min_factor` (form or CLI value, else config where the family takes it, `TrainingConfig::apply_lr`, else the family default; `--lr-scheduler` / `--lr-min-factor` passed only when set), `batch` events carry the main group's `lr` and `progress` has `lr`, `stop_epoch`, `batch_size`, `imgsz`, `settings` (`RunSettings`); one convergence rule for every trainer (`Convergence` in
   `train_model.py`, Rust twin `progress::convergence_run`, parity-tested; native early stopping off; best raw epoch
   exported; gains judged on a `smooth`-epoch mean (3); a recommended patience doubles under 50 validation images
   (`TrainRecipe::convergence_patience`); a stop point with the training loss still falling (>2%, `loss_falling`) becomes a

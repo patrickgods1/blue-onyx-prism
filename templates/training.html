@@ -406,13 +406,13 @@
       <tbody>
       {% for f in families %}
       <tr>
-        <th scope="row">{{ f.title }}<br><span class="tag">{{ f.license }}</span>{% if f.available %}<br><span class="muted small tr-rec" title="Recommended: what blank Epochs and Patience fields use (epochs is a cap: the run stops once it converges)">{{ f.recommended }}</span>{% endif %}</th>
+        <th scope="row">{{ f.title }}<br><span class="tag">{{ f.license }}</span>{% if f.available %}<br><span class="muted small tr-rec" title="Recommended: what blank Epochs, Patience and Learning rate fields use (epochs is a cap: the run stops once it converges)">{{ f.recommended }}</span>{% endif %}</th>
         {% if !f.available %}
         <td colspan="{{ size_cols }}" class="muted small">{{ f.why }}</td>
         {% else %}
         {% for s in f.sizes %}
         <td class="tr-size{% if !s.fits %} tr-unfit{% endif %}"{% if s.fits %} title="{{ s.estimate }}; {{ s.latency }}"{% else %} title="{{ s.why }}"{% endif %}>
-          <label class="check"><input type="checkbox" name="model" value="{{ s.label }}" aria-label="{{ s.label }}"{% if !s.fits %} disabled{% endif %}> <code>{{ s.size }}</code> <span class="tr-weight tr-{{ s.weight }}">{{ s.weight }}</span></label>
+          <label class="check"><input type="checkbox" name="model" value="{{ s.label }}" aria-label="{{ s.label }}" data-default-lr="{{ f.default_lr }}"{% if !s.fits %} disabled{% endif %}> <code>{{ s.size }}</code> <span class="tr-weight tr-{{ s.weight }}">{{ s.weight }}</span></label>
           {% if s.fits %}<span class="muted small">{{ s.short }}</span>{% else %}<span class="muted small">{{ s.why }}</span>{% endif %}
         </td>
         {% endfor %}
@@ -441,6 +441,11 @@
         <label for="train-patience">Patience</label>
         <input type="number" id="train-patience" name="patience" min="0" max="1000" value="{{ patience }}" placeholder="recommended">
         <p class="muted small">Epochs without a validation mAP gain before the run stops and keeps its best epoch. Empty = recommended, 0 = off (train every epoch).</p>
+      </div>
+      <div class="tr-field">
+        <label for="train-lr">Learning rate</label>
+        <input type="text" id="train-lr" name="lr" inputmode="decimal" autocomplete="off" value="{{ lr }}" placeholder="recommended">
+        <p class="muted small">Empty = each family's default ({{ lr_defaults }}). Lower it (e.g. 5e-5) when the validation mAP jumps between epochs.</p>
       </div>
       <div class="tr-field">
         <label for="train-name">Model name</label>
@@ -508,9 +513,16 @@
           <p class="muted small">Trains at up to about 1.4x the input size for accuracy; auto turns it off when batch 4 would not fit (half the GPU memory).</p>
         </div>
         <div class="tr-field">
-          <label for="train-lr">Learning rate</label>
-          <input type="text" id="train-lr" name="lr">
-          <p class="muted small">Empty = the trainer's default.</p>
+          <label for="train-lr-schedule">LR schedule</label>
+          <select id="train-lr-schedule" name="lr_schedule">
+            {% for c in lr_schedules %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.title }}</option>{% endfor %}
+          </select>
+          <p class="muted small">How the learning rate decays over the epochs; default = the family's. {{ lr_schedule_hint }}.</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-lr-min">Final LR factor</label>
+          <input type="number" id="train-lr-min" name="lr_min_factor" min="0" max="1" step="any" value="{{ lr_min_factor }}" placeholder="default">
+          <p class="muted small">The last epoch's learning rate as a share of the starting one (0&ndash;1). Empty = the family's default. RF-DETR's anneal before a convergence stop also ends there.</p>
         </div>
       </div>
     </details>

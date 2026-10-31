@@ -631,6 +631,7 @@ fn out_of_memory_early_retries_at_half_the_batch_and_keeps_the_batch_that_ran() 
     let mut lines = Vec::new();
     let mut batches_reported = Vec::new();
     let mut details = Vec::new();
+    let mut last = None;
     let r = run_training(
         &j,
         &fake,
@@ -639,7 +640,10 @@ fn out_of_memory_early_retries_at_half_the_batch_and_keeps_the_batch_that_ran() 
         &mut |p| match p {
             TrainReport::Line(l) => lines.push(l.to_string()),
             TrainReport::Batch(b) => batches_reported.push(b),
-            TrainReport::Progress(tp) => details.push(tp.describe()),
+            TrainReport::Progress(tp) => {
+                details.push(tp.describe());
+                last = Some(tp.clone());
+            }
             _ => {}
         },
         &AtomicBool::new(false),
@@ -663,6 +667,24 @@ fn out_of_memory_early_retries_at_half_the_batch_and_keeps_the_batch_that_ran() 
     let prov: Provenance =
         serde_json::from_slice(&std::fs::read(&out.output.provenance).unwrap()).unwrap();
     assert_eq!(prov.recipe.batch, 4);
+    // The progress carries the batch that trains (the fake's start event has none) and the
+    // run's settings: RF-DETR's small-dataset rates, its cosine schedule to 0.1.
+    let last = last.unwrap();
+    assert_eq!(last.batch_size, Some(4));
+    let s = last.settings.unwrap();
+    assert_eq!(
+        (s.lr, s.lr_encoder, s.lr_schedule, s.lr_min_factor),
+        (
+            Some(5e-5),
+            Some(7.5e-5),
+            crate::training::recipe::LrSchedule::Cosine,
+            0.1
+        )
+    );
+    assert_eq!((s.batch, s.epochs, s.seed), (16, 2, j.request.train_seed));
+    assert_eq!(s.scene.as_deref(), Some(j.request.scene.as_str()));
+    assert_eq!(s.gpu.as_deref(), Some(j.accelerator.name()));
+    assert!(s.workers.is_some());
     // macOS: the MPS allocator is capped, RF-DETR gets its multi-scale choice (9000 MB: auto
     // keeps it on at batch 4).
     let cmds = fake.train_cmds.lock().unwrap();
@@ -715,6 +737,8 @@ fn rfdetr_with_early_stopping_anneals_before_it_stops() {
     j.request.recipe.patience = 12;
     j.request.recipe.patience_recommended = false;
     j.request.recipe.lr = Some(2e-4);
+    j.request.recipe.lr_schedule = Some(crate::training::recipe::LrSchedule::Step);
+    j.request.recipe.lr_min_factor = Some(0.2);
     let fake = TrainFake {
         cuda: true,
         mps: false,
@@ -732,6 +756,8 @@ fn rfdetr_with_early_stopping_anneals_before_it_stops() {
         ("--anneal", "6"),
         ("--lr", "0.0002"),
         ("--lr-encoder", "0.0003"),
+        ("--lr-scheduler", "step"),
+        ("--lr-min-factor", "0.2"),
     ] {
         assert_eq!(arg_after(train, k).unwrap().to_str(), Some(v), "{k}");
     }
@@ -743,7 +769,12 @@ fn rfdetr_with_early_stopping_anneals_before_it_stops() {
         ),
         "{log}"
     );
-    assert!(log.contains("# lr: 0.0002, encoder 0.0003 (set)"), "{log}");
+    assert!(
+        log.contains(
+            "# lr: 0.0002, encoder 0.0003 (set); schedule step (set), anneal factor 0.2 (set)"
+        ),
+        "{log}"
+    );
 }
 
 #[test]
@@ -1366,6 +1397,9 @@ fn finish_now_writes_the_stop_file_and_the_run_exports_its_best_epoch() {
     // YOLO: no typed learning rate, none passed (no encoder rate for any YOLO).
     assert!(arg_after(&args, "--lr").is_none());
     assert!(arg_after(&args, "--lr-encoder").is_none());
+    // No schedule set: the script picks the trainer's own.
+    assert!(arg_after(&args, "--lr-scheduler").is_none());
+    assert!(arg_after(&args, "--lr-min-factor").is_none());
     let stop = arg_after(&args, "--stop-file").unwrap();
     assert_eq!(PathBuf::from(&stop), stop_file(&t.0.join("training/a")));
     assert!(!stop.exists(), "the stale request was removed");

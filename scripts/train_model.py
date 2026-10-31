@@ -81,6 +81,15 @@ from pathlib import Path
 
 TRAINERS = ("ultralytics", "rfdetr", "transformers")
 FAMILIES = ("yolo26", "yolo11", "yolov8", "rfdetr", "rtdetrv2", "dfine")
+# Learning-rate schedules (`--lr-scheduler`) and the ones each trainer takes, its default first.
+LR_SCHEDULES = ("cosine", "linear", "step")
+LR_SCHEDULES_OF = {
+    "ultralytics": ("linear", "cosine"),
+    "rfdetr": ("cosine", "step"),
+    "transformers": ("cosine", "linear"),
+}
+# RF-DETR's final learning rate factor (cosine schedule and anneal) when --lr-min-factor is not given.
+RFDETR_MIN_FACTOR = 0.1
 RFDETR_CLASSES = {
     "nano": "RFDETRNano",
     "small": "RFDETRSmall",
@@ -99,6 +108,49 @@ def event(kind: str, **fields) -> None:
     fields["event"] = kind
     # A leading newline: progress bars (Ultralytics, Lightning) leave the cursor mid-line.
     print("\n@train " + json.dumps(fields, separators=(",", ":"), default=str), flush=True)
+
+
+def finite_lr(v):
+    """`v` as a finite float, else None (never raises)."""
+    try:
+        f = float(v)
+    except Exception:
+        return None
+    return f if math.isfinite(f) else None
+
+
+def group_lr(optimizer, index: int = 0):
+    """The learning rate of parameter group `index` of `optimizer`; None when unreadable."""
+    try:
+        return finite_lr(optimizer.param_groups[index]["lr"])
+    except Exception:
+        return None
+
+
+def ultralytics_lr(optimizer):
+    """The main learning rate of an Ultralytics optimizer, None when unreadable. Ultralytics
+    (engine/trainer.py `build_optimizer`) builds weight / bn / bias groups, and with MuSGD a
+    boosted (x3, the class heads) and a plain copy of each; during warmup the bias group falls from
+    `warmup_bias_lr` (0.1) while the others rise from 0. The main rate is the non-bias group with
+    the lowest base rate (`initial_lr`): lr0 after warmup."""
+    try:
+        groups = [g for g in optimizer.param_groups if g.get("param_group") != "bias" and len(g.get("params") or ()) > 0]
+        if not groups:
+            groups = list(optimizer.param_groups)
+        if not groups:
+            return None
+        main = min(groups, key=lambda g: float(g.get("initial_lr", g.get("lr", 0.0))))
+        return finite_lr(main.get("lr"))
+    except Exception:
+        return None
+
+
+def scheduler_lr(scheduler):
+    """The first group's learning rate of a torch scheduler (`get_last_lr`); None when unreadable."""
+    try:
+        return finite_lr(scheduler.get_last_lr()[0])
+    except Exception:
+        return None
 
 
 def fail(msg: str) -> None:
@@ -328,10 +380,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=None, help="learning rate (default: the trainer's)")
     p.add_argument("--lr-encoder", type=float, default=None,
                    help="RF-DETR: the backbone (encoder) learning rate (default: rfdetr's, 1.5e-4)")
-    p.add_argument("--lr-scheduler", choices=("cosine", "step"), default="cosine",
-                   help="RF-DETR: cosine (decays to --lr-min-factor over --epochs) or step (rfdetr's default: x0.1 after epoch 100)")
-    p.add_argument("--lr-min-factor", type=float, default=0.1,
-                   help="RF-DETR: the cosine schedule's and the anneal's final learning rate, as a share of --lr")
+    p.add_argument("--lr-scheduler", choices=LR_SCHEDULES, default=None,
+                   help="learning-rate schedule (default: the trainer's): Ultralytics linear (default) or cosine; "
+                        "RF-DETR cosine (default, decays to --lr-min-factor over --epochs) or step (rfdetr's own: x0.1 "
+                        "after epoch 100); transformers cosine (default) or linear")
+    p.add_argument("--lr-min-factor", type=float, default=None,
+                   help="final learning rate as a share of the starting one (default: the trainer's): Ultralytics lrf "
+                        "(0.01), RF-DETR's cosine schedule and anneal (0.1), transformers' cosine (0: cosine_with_min_lr "
+                        "when set)")
     p.add_argument("--device", default="auto", help="auto, cuda, cuda:N, mps or cpu")
     p.add_argument("--allow-cpu", action="store_true", help="train on the CPU when no GPU is found (slow; smoke tests)")
     p.add_argument("--workers", type=int, default=2, help="data loader workers")
@@ -371,8 +427,13 @@ def parse_args() -> argparse.Namespace:
         p.error("--smooth must be at least 1")
     if a.anneal < 0:
         p.error("--anneal must not be negative")
-    if not 0.0 <= a.lr_min_factor <= 1.0:
+    if a.lr_min_factor is not None and not (math.isfinite(a.lr_min_factor) and 0.0 <= a.lr_min_factor <= 1.0):
         p.error("--lr-min-factor must be between 0 and 1")
+    allowed = LR_SCHEDULES_OF.get(a.trainer, LR_SCHEDULES)
+    if a.lr_scheduler is not None and a.lr_scheduler not in allowed:
+        p.error(f"--lr-scheduler {a.lr_scheduler}: the {a.trainer} trainer takes {' or '.join(allowed)}")
+    if a.trainer == "transformers" and a.lr_scheduler == "linear" and (a.lr_min_factor or 0) > 0:
+        p.error("--lr-min-factor needs the cosine schedule with the transformers trainer (its linear schedule ends at 0)")
     if a.epochs < 1 or a.batch < 1 or a.imgsz < 32:
         p.error("--epochs and --batch must be at least 1, --imgsz at least 32")
     return a
@@ -1252,7 +1313,8 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         meter.batch_end(0)
         nb = len(trainer.train_loader)
         if state["batches"] == nb or state["batches"] % max(1, nb // 10) == 0:
-            event("batch", epoch=trainer.epoch + 1, epochs=trainer.epochs, batch=state["batches"], batches=nb)
+            event("batch", epoch=trainer.epoch + 1, epochs=trainer.epochs, batch=state["batches"], batches=nb,
+                  lr=ultralytics_lr(getattr(trainer, "optimizer", None)))
 
     def on_train_epoch_end(trainer):
         meter.train_done()
@@ -1280,6 +1342,10 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         if val_losses:
             m["val_loss"] = float(sum(val_losses))
         m.update(scalar_metrics(getattr(trainer, "lr", None)))
+        # `lr/pg0` is whichever group comes first; the main group's rate is the run's `lr`.
+        main_lr = ultralytics_lr(getattr(trainer, "optimizer", None))
+        if main_lr is not None:
+            m["lr"] = main_lr
         box = getattr(getattr(getattr(trainer, "validator", None), "metrics", None), "box", None)
         try:
             if box is not None and len(getattr(box, "p_curve", [])):
@@ -1356,6 +1422,11 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     if a.lr is not None:
         kwargs["lr0"] = a.lr
         kwargs["optimizer"] = "AdamW"
+    # Only when set: Ultralytics' own linear schedule to lrf 0.01 otherwise.
+    if a.lr_scheduler is not None:
+        kwargs["cos_lr"] = a.lr_scheduler == "cosine"
+    if a.lr_min_factor is not None:
+        kwargs["lrf"] = a.lr_min_factor
     cache = ultralytics_cache(a)
     if cache:
         kwargs["cache"] = cache
@@ -1528,6 +1599,10 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
         coco_eval.sweep_confidence_thresholds = sweep
 
     conv = convergence(a)
+    # The schedule and the final factor of its cosine and of the anneal (the script's defaults:
+    # cosine to 0.1).
+    schedule = a.lr_scheduler or "cosine"
+    min_factor = a.lr_min_factor if a.lr_min_factor is not None else RFDETR_MIN_FACTOR
     # The scheduler's step at the previous epoch end: its steps per epoch, as they ran.
     sched_steps = {"last": None, "per_epoch": 0}
 
@@ -1559,7 +1634,9 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             if isinstance(nb, int) and nb > 0 and i == nb:
                 meter.train_done()
             if isinstance(nb, int) and nb > 0 and (i == nb or i % max(1, nb // 10) == 0):
-                event("batch", epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, batch=i, batches=nb)
+                opts = getattr(trainer, "optimizers", None) or []
+                event("batch", epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, batch=i, batches=nb,
+                      lr=group_lr(opts[0]) if opts else None)
 
         def on_validation_start(self, trainer, pl_module):
             meter.train_done()
@@ -1591,7 +1668,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
                 trainer.should_stop = True
             elif conv.annealing is not None:
                 p = conv.annealing
-                bend_rfdetr_lr(trainer, p["until"] - p["epoch"], steps_per_epoch(trainer), a.lr_min_factor)
+                bend_rfdetr_lr(trainer, p["until"] - p["epoch"], steps_per_epoch(trainer), min_factor)
 
     # rfdetr builds its Lightning trainer itself; add the progress callback to every trainer it builds.
     import pytorch_lightning as pl
@@ -1619,9 +1696,9 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
         kw["lr_encoder"] = a.lr_encoder
     # rfdetr's default step schedule drops x0.1 only after epoch 100, past where the convergence
     # rule usually stops: cosine decays over the planned epochs (its total steps).
-    kw["lr_scheduler"] = a.lr_scheduler
-    if a.lr_scheduler == "cosine":
-        kw["lr_scheduler_kwargs"] = {"min_factor": a.lr_min_factor}
+    kw["lr_scheduler"] = schedule
+    if schedule == "cosine":
+        kw["lr_scheduler_kwargs"] = {"min_factor": min_factor}
     if a.multi_scale == "off":
         kw["multi_scale"] = False
     if a.workers > 0:
@@ -1856,7 +1933,8 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
             meter.batch_end(0)
             i = ((state.global_step - 1) % steps_per_epoch) + 1
             if i == steps_per_epoch or i % max(1, steps_per_epoch // 10) == 0:
-                event("batch", epoch=math.ceil(state.global_step / steps_per_epoch), epochs=a.epochs, batch=i, batches=steps_per_epoch)
+                event("batch", epoch=math.ceil(state.global_step / steps_per_epoch), epochs=a.epochs, batch=i,
+                      batches=steps_per_epoch, lr=scheduler_lr(kw.get("lr_scheduler")))
 
         def on_epoch_end(self, args, state, control, **kw):
             meter.train_done()
@@ -1905,6 +1983,18 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
     cc = cuda_capability(device)
     bf16 = cc is not None and cc[0] >= 8
     tune_backend(device, fixed_size=False)
+    # Cosine to 0 unless set: linear (to 0), or cosine to a share of the rate (cosine_with_min_lr,
+    # transformers 4.38+).
+    sched_kw = {}
+    if a.lr_scheduler == "linear":
+        sched_kw["lr_scheduler_type"] = "linear"
+    elif a.lr_min_factor:
+        sched_kw["lr_scheduler_type"] = "cosine_with_min_lr"
+        sched_kw["lr_scheduler_kwargs"] = {"min_lr_rate": a.lr_min_factor}
+    else:
+        sched_kw["lr_scheduler_type"] = "cosine"
+    log(f"learning rate schedule: {sched_kw['lr_scheduler_type']}"
+        + (f", final factor {a.lr_min_factor:g}" if "lr_scheduler_kwargs" in sched_kw else ""))
     targs = TrainingArguments(
         output_dir=str(a.work / "hf-out"),
         num_train_epochs=a.epochs,
@@ -1913,7 +2003,7 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
         learning_rate=a.lr if a.lr is not None else 1e-4,
         weight_decay=1e-4,
         max_grad_norm=0.1,
-        lr_scheduler_type="cosine",
+        **sched_kw,
         warmup_steps=min(100, steps_per_epoch * a.epochs // 10),
         eval_strategy="epoch",
         save_strategy="no",

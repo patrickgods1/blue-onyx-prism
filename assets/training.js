@@ -9,6 +9,8 @@
 // picker of the ticked folders (counts per scene, warnings), the balance preview (what the
 // Balance fieldset does to each run's training frames) and Finish now while training, plus the
 // Stop now / Continue notice of an early-stop point passed while the training loss still falls.
+// Each run row gets a settings line (device, batch, input size, learning rate and schedule,
+// patience, seed, ...) and the Learning rate field's placeholder follows the ticked family.
 (function () {
   "use strict";
 
@@ -421,6 +423,26 @@
     var other = train.querySelector(".tr-scene-other");
     if (other && other.querySelector("input:checked")) other.open = true;
     names();
+
+    // Learning rate placeholder: the ticked family's default (`data-default-lr` on the nearest
+    // element around its checkbox: the size cell or the family row); ticked models of families
+    // with different defaults list them all; nothing ticked = the template's text.
+    var lrField = document.getElementById("train-lr");
+    if (lrField) {
+      var lrDefault = lrField.getAttribute("placeholder") || "recommended";
+      var lrHint = function () {
+        var seen = [];
+        models.forEach(function (m) {
+          if (!m.checked) return;
+          var holder = m.closest("[data-default-lr]");
+          var v = holder ? holder.getAttribute("data-default-lr") : "";
+          if (v && seen.indexOf(v) < 0) seen.push(v);
+        });
+        lrField.placeholder = seen.length === 1 ? seen[0] : seen.length > 1 ? "per family: " + seen.join(" / ") : lrDefault;
+      };
+      models.forEach(function (m) { m.addEventListener("change", lrHint); });
+      lrHint();
+    }
 
     // Night augmentation: its probabilities show (and post) only when ticked; prefilled with
     // the server's defaults when empty.
@@ -966,7 +988,13 @@
       var r = byId[host.dataset.run];
       var sig = r ? window.TrainMetrics.signature(r.progress, metricsState.columns) + "|" + r.state + "|" + avail.length : "";
       var row = host.closest("tr");
-      if (!force && host.dataset.sig === sig) return;
+      // Same history and columns: only the tiles move (batch, learning rate, time left).
+      if (!force && host.dataset.sig === sig) {
+        if (r && r.progress && window.TrainMetrics.refresh) {
+          window.TrainMetrics.refresh(host, r.progress, metricsState.metrics, { running: r.state === "running" });
+        }
+        return;
+      }
       host.dataset.sig = sig;
       if (r && r.progress) {
         window.TrainMetrics.render(host, r.progress, metricsState.columns, metricsState.metrics, {
@@ -978,11 +1006,68 @@
       if (row && row.classList.contains("tr-metrics-row")) row.hidden = host.childNodes.length === 0;
     });
   }
+  // The run's settings under its progress text, joined with " · ": device, batch (and the OOM
+  // retry that lowered it), input size, learning rate and schedule, epoch cap, patience, seed,
+  // scene, data loader workers. From progress.settings (what the job resolved) and the trainer's
+  // start event (batch_size, imgsz); a run queued before those existed falls back to its
+  // request's recipe. Missing parts are left out; nothing known = no line.
+  function lrText(v) { return v === 0 ? "0" : (+v.toPrecision(4)).toExponential(); }
+  var isNum = function (v) { return typeof v === "number" && !isNaN(v); };
+  function settingsParts(r) {
+    var p = r.progress || {}, s = p.settings || null, rec = (r.request && r.request.recipe) || {};
+    var out = [];
+    var dev = r.device || p.device || (s && s.gpu) || "";
+    if (dev) out.push(dev);
+    var want = s && isNum(s.batch) ? s.batch : rec.batch;
+    if (isNum(p.batch_size)) out.push("batch " + p.batch_size + (isNum(want) && p.batch_size < want ? " (OOM retry from " + want + ")" : ""));
+    else if (isNum(want)) out.push("batch " + want);
+    var px = isNum(p.imgsz) ? p.imgsz : rec.imgsz;
+    if (isNum(px)) out.push(px + " px");
+    if (s) {
+      var lr = isNum(s.lr) ? "lr " + lrText(s.lr) : "lr auto";
+      if (s.lr_schedule) lr += " " + s.lr_schedule + (isNum(s.lr_min_factor) ? " → " + (+s.lr_min_factor.toPrecision(3)) + "×" : "");
+      if (isNum(s.lr_encoder)) lr += ", enc " + lrText(s.lr_encoder);
+      out.push(lr);
+    } else if (isNum(rec.lr)) {
+      out.push("lr " + lrText(rec.lr));
+    }
+    var cap = s && isNum(s.epochs) ? s.epochs : isNum(rec.epochs) ? rec.epochs : p.epochs;
+    if (isNum(cap) && cap > 0) out.push("cap " + cap + " ep");
+    var pat = s && isNum(s.patience) ? s.patience : p.patience;
+    if (isNum(pat)) out.push(pat > 0 ? "patience " + pat + (s && s.patience_doubled ? " (×2, small val)" : "") : "early stop off");
+    var seed = s && isNum(s.seed) ? s.seed : r.request && isNum(r.request.train_seed) ? r.request.train_seed : null;
+    if (seed !== null) out.push("seed " + seed);
+    if (s && typeof s.scene === "string" && s.scene && s.scene !== "all") out.push(s.scene);
+    if (s && isNum(s.workers)) out.push("workers " + s.workers);
+    return out;
+  }
+  function settingsLine(tr, r) {
+    var desc = tr.querySelector('[data-field="describe"]');
+    if (!desc) return;
+    var line = tr.querySelector(".tr-settings");
+    var text = settingsParts(r).join(" · ");
+    if (!line) {
+      if (!text) return;
+      line = document.createElement("p");
+      line.className = "muted small tr-settings";
+      desc.parentNode.insertBefore(line, desc.nextSibling);
+    }
+    line.textContent = text;
+    line.hidden = !text;
+  }
+  function renderSettings(data) {
+    var t = document.getElementById("training-runs");
+    if (!t || !data) return;
+    (data.runs || []).forEach(function (r) {
+      var tr = t.querySelector('tr[data-run="' + r.id + '"]');
+      if (tr) settingsLine(tr, r);
+    });
+  }
   function loadMetrics() {
-    if (!window.TrainMetrics || !document.querySelector(".tr-metrics[data-run]")) return;
+    if (!document.querySelector(".tr-metrics[data-run]")) return;
     fetch("/v1/training", { headers: { Accept: "application/json" } })
       .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (data) { if (data) renderMetrics(data, false); })
+      .then(function (data) { if (data) { renderSettings(data); renderMetrics(data, false); } })
       .catch(function () {});
   }
   loadMetrics();
@@ -1028,6 +1113,8 @@
       set("state", r.state);
       set("percent", r.percent);
       set("describe", describe(r, list));
+      // The actual batch / input size arrive with the trainer's start event: kept current.
+      if (attr === "run") settingsLine(tr, r);
       if (r.log && r.log.length) {
         var logEl = tr.querySelector('[data-field="log"]');
         var box = logEl && logEl.closest("details.tr-logbox");

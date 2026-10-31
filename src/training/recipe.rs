@@ -78,6 +78,132 @@ impl MultiScale {
     }
 }
 
+/// How the learning rate decays over a run (`--lr-scheduler`). Which ones a family takes, and
+/// its default, are in [`lr_schedules`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LrSchedule {
+    /// Half a cosine from the learning rate down to `lr_min_factor` x it.
+    Cosine,
+    /// A straight line down to `lr_min_factor` x it.
+    Linear,
+    /// RF-DETR's step schedule (x0.1 after its drop epoch, 100 by default).
+    Step,
+}
+
+impl LrSchedule {
+    pub const ALL: [LrSchedule; 3] = [Self::Cosine, Self::Linear, Self::Step];
+
+    /// `cosine`, `linear`, `step` (case-insensitive); None for anything else (`""` / `default`
+    /// are the caller's "unset").
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cosine" | "cos" => Some(Self::Cosine),
+            "linear" => Some(Self::Linear),
+            "step" => Some(Self::Step),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cosine => "cosine",
+            Self::Linear => "linear",
+            Self::Step => "step",
+        }
+    }
+}
+
+impl std::fmt::Display for LrSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The learning-rate schedules a family's trainer supports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LrSchedules {
+    /// The trainer's schedule when none is set.
+    pub default: LrSchedule,
+    /// Every schedule the trainer takes (`default` first).
+    pub allowed: &'static [LrSchedule],
+    /// The final learning rate as a share of the starting one when none is set (Ultralytics'
+    /// `lrf` 0.01; the script's RF-DETR cosine and anneal 0.1; transformers decays to 0).
+    pub min_factor: f32,
+}
+
+/// The schedules of `family`'s trainer: YOLO (Ultralytics) linear | cosine, final factor 0.01;
+/// RF-DETR cosine | step, 0.1 (also its anneal's); RT-DETRv2 / D-FINE (transformers) cosine |
+/// linear, 0 (a factor above 0 needs cosine: transformers' linear schedule always ends at 0).
+pub const fn lr_schedules(family: TrainFamily) -> LrSchedules {
+    match family.trainer() {
+        catalog::Trainer::Ultralytics => LrSchedules {
+            default: LrSchedule::Linear,
+            allowed: &[LrSchedule::Linear, LrSchedule::Cosine],
+            min_factor: 0.01,
+        },
+        catalog::Trainer::RfDetr => LrSchedules {
+            default: LrSchedule::Cosine,
+            allowed: &[LrSchedule::Cosine, LrSchedule::Step],
+            min_factor: 0.1,
+        },
+        catalog::Trainer::Transformers => LrSchedules {
+            default: LrSchedule::Cosine,
+            allowed: &[LrSchedule::Cosine, LrSchedule::Linear],
+            min_factor: 0.0,
+        },
+    }
+}
+
+/// The default learning rate of `family`, for the page's placeholder and hints.
+pub const fn default_lr_label(family: TrainFamily) -> &'static str {
+    match family.trainer() {
+        catalog::Trainer::Ultralytics => "auto (optimizer picks)",
+        catalog::Trainer::RfDetr => "1e-4 (5e-5 under 1000 images)",
+        catalog::Trainer::Transformers => "1e-4",
+    }
+}
+
+/// Why `schedule` / `min_factor` do not suit `family` (None = they do; None values are the
+/// family's defaults and always suit).
+pub fn lr_schedule_error(
+    family: TrainFamily,
+    schedule: Option<LrSchedule>,
+    min_factor: Option<f32>,
+) -> Option<String> {
+    let s = lr_schedules(family);
+    if let Some(f) = min_factor
+        && !(f.is_finite() && (0.0..=1.0).contains(&f))
+    {
+        return Some(format!(
+            "the final learning rate factor must be between 0 and 1, got {f}"
+        ));
+    }
+    if let Some(sch) = schedule
+        && !s.allowed.contains(&sch)
+    {
+        let names: Vec<&str> = s.allowed.iter().map(|x| x.as_str()).collect();
+        return Some(format!(
+            "{} has no '{sch}' learning rate schedule; choose {} (default {}) or leave it on \
+             default",
+            family.title(),
+            names.join(" or "),
+            s.default
+        ));
+    }
+    if family.trainer() == catalog::Trainer::Transformers
+        && schedule == Some(LrSchedule::Linear)
+        && min_factor.is_some_and(|f| f > 0.0)
+    {
+        return Some(format!(
+            "{}'s linear schedule always decays to 0: pick the cosine schedule for a final \
+             learning rate factor above 0, or leave the factor empty",
+            family.title()
+        ));
+    }
+    None
+}
+
 /// A family's starting point for fine-tuning: with early stopping on, `epochs` is a cap.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Recommended {
@@ -182,6 +308,14 @@ pub struct TrainRecipe {
     /// Learning rate; None = the trainer's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lr: Option<f32>,
+    /// Learning-rate schedule (`--lr-scheduler`); None = the family's default
+    /// ([`lr_schedules`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lr_schedule: Option<LrSchedule>,
+    /// Final learning rate as a share of the starting one (`--lr-min-factor`, 0-1); None = the
+    /// family's default ([`lr_schedules`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lr_min_factor: Option<f32>,
     #[serde(default)]
     pub augment: Augment,
     /// RF-DETR only (other families ignore it).
@@ -212,6 +346,8 @@ impl TrainRecipe {
             patience_recommended: true,
             batch: if family == TrainFamily::Rfdetr { 4 } else { 8 },
             lr: rec.lr,
+            lr_schedule: None,
+            lr_min_factor: None,
             augment: Augment::default(),
             multi_scale: MultiScale::Auto,
         })
@@ -278,8 +414,40 @@ impl TrainRecipe {
         })
     }
 
-    /// The `train.log` line of [`Self::effective_lr`] ("lr: ...").
+    /// The schedule the run trains with: `lr_schedule`, else the family's default.
+    pub fn effective_lr_schedule(&self) -> LrSchedule {
+        self.lr_schedule
+            .unwrap_or(lr_schedules(self.family).default)
+    }
+
+    /// The final learning-rate factor the run trains with: `lr_min_factor`, else the family's
+    /// default.
+    pub fn effective_lr_min_factor(&self) -> f32 {
+        self.lr_min_factor
+            .unwrap_or(lr_schedules(self.family).min_factor)
+    }
+
+    /// The `train.log` line of [`Self::effective_lr`] ("lr: ..."), with the schedule and its
+    /// final factor ("; schedule cosine (default), final factor 0.1 (default)").
     pub fn lr_line(&self, train_images: usize) -> String {
+        let tag = |set: bool| if set { " (set)" } else { " (default)" };
+        let factor = if self.effective_lr_schedule() == LrSchedule::Step {
+            // rfdetr's step drop is its own; the factor only ends the anneal.
+            "anneal factor"
+        } else {
+            "final factor"
+        };
+        format!(
+            "{}; schedule {}{}, {factor} {}{}",
+            self.lr_rate_text(train_images),
+            self.effective_lr_schedule(),
+            tag(self.lr_schedule.is_some()),
+            self.effective_lr_min_factor(),
+            tag(self.lr_min_factor.is_some()),
+        )
+    }
+
+    fn lr_rate_text(&self, train_images: usize) -> String {
         match self.effective_lr(train_images) {
             None => format!("lr: {train_images} training images: the trainer's default"),
             Some(r) => {
@@ -420,6 +588,9 @@ impl TrainRecipe {
             && !(lr.is_finite() && lr > 0.0 && lr < 1.0)
         {
             bail!("learning rate must be above 0 and below 1, got {lr}");
+        }
+        if let Some(e) = lr_schedule_error(self.family, self.lr_schedule, self.lr_min_factor) {
+            bail!("{e}");
         }
         for (k, p) in [
             ("darkness", self.augment.dark),
@@ -662,13 +833,13 @@ mod tests {
         assert_eq!(
             r.lr_line(312),
             "lr: 0.00005, encoder 0.000075 (312 training images < 1000: lower than RF-DETR's \
-             default 0.0001 for small datasets)"
+             default 0.0001 for small datasets); schedule cosine (default), final factor 0.1 (default)"
         );
         // 1000 images and more: rfdetr's defaults.
         assert_eq!(r.effective_lr(SMALL_TRAIN_IMAGES), None);
         assert_eq!(
             r.lr_line(1000),
-            "lr: 1000 training images: the trainer's default"
+            "lr: 1000 training images: the trainer's default; schedule cosine (default), final factor 0.1 (default)"
         );
         // A typed rate wins at any size, with the encoder at 1.5x.
         let typed = TrainRecipe {
@@ -683,7 +854,11 @@ mod tests {
             );
             assert_eq!(l.encoder.unwrap().to_string(), "0.00015");
         }
-        assert_eq!(typed.lr_line(10), "lr: 0.0001, encoder 0.00015 (set)");
+        assert!(
+            typed
+                .lr_line(10)
+                .starts_with("lr: 0.0001, encoder 0.00015 (set); schedule cosine")
+        );
         // Other families: the typed rate only, never an encoder rate.
         let y = TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap();
         assert_eq!(y.effective_lr(10), None);
@@ -699,7 +874,108 @@ mod tests {
                 small_dataset: false
             })
         );
-        assert_eq!(y.lr_line(10), "lr: 0.01 (set)");
+        assert_eq!(
+            y.lr_line(10),
+            "lr: 0.01 (set); schedule linear (default), final factor 0.01 (default)"
+        );
+    }
+
+    #[test]
+    fn lr_schedules_are_checked_per_family() {
+        use LrSchedule::*;
+        let with = |f: TrainFamily, s: Option<LrSchedule>, k: Option<f32>| {
+            let mut r = TrainRecipe::new(f, f.sizes()[0]).unwrap();
+            r.lr_schedule = s;
+            r.lr_min_factor = k;
+            r.validate().map_err(|e| e.to_string())
+        };
+        // Defaults: YOLO linear 0.01, RF-DETR cosine 0.1, RT-DETRv2 / D-FINE cosine 0.
+        for (f, d, k) in [
+            (TrainFamily::Yolo26, Linear, 0.01),
+            (TrainFamily::Yolo11, Linear, 0.01),
+            (TrainFamily::Yolov8, Linear, 0.01),
+            (TrainFamily::Rfdetr, Cosine, 0.1),
+            (TrainFamily::Rtdetrv2, Cosine, 0.0),
+            (TrainFamily::Dfine, Cosine, 0.0),
+        ] {
+            let r = TrainRecipe::new(f, f.sizes()[0]).unwrap();
+            assert_eq!(
+                (r.effective_lr_schedule(), r.effective_lr_min_factor()),
+                (d, k),
+                "{f}"
+            );
+            assert_eq!(lr_schedules(f).allowed[0], d, "{f}");
+            with(f, None, None).unwrap();
+            with(f, Some(Cosine), Some(0.0)).unwrap();
+            with(f, Some(d), Some(1.0)).unwrap();
+            for bad in [-0.1, 1.5, f32::NAN] {
+                let e = with(f, None, Some(bad)).unwrap_err();
+                assert!(e.contains("final learning rate factor"), "{f} {e}");
+            }
+        }
+        with(TrainFamily::Yolo26, Some(Linear), Some(0.05)).unwrap();
+        let e = with(TrainFamily::Yolo26, Some(Step), None).unwrap_err();
+        assert!(
+            e.contains("YOLO26 has no 'step'") && e.contains("linear or cosine"),
+            "{e}"
+        );
+        with(TrainFamily::Rfdetr, Some(Step), Some(0.2)).unwrap();
+        let e = with(TrainFamily::Rfdetr, Some(Linear), None).unwrap_err();
+        assert!(e.contains("cosine or step"), "{e}");
+        with(TrainFamily::Dfine, Some(Linear), None).unwrap();
+        with(TrainFamily::Dfine, Some(Linear), Some(0.0)).unwrap();
+        assert!(with(TrainFamily::Dfine, Some(Step), None).is_err());
+        let e = with(TrainFamily::Rtdetrv2, Some(Linear), Some(0.1)).unwrap_err();
+        assert!(e.contains("always decays to 0"), "{e}");
+        // Default factor 0.1 with cosine: transformers' cosine_with_min_lr.
+        with(TrainFamily::Rtdetrv2, None, Some(0.1)).unwrap();
+        // The log line names the set values.
+        let mut r = TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap();
+        r.lr_schedule = Some(Cosine);
+        r.lr_min_factor = Some(0.05);
+        assert_eq!(
+            r.lr_line(10),
+            "lr: 10 training images: the trainer's default; schedule cosine (set), final factor \
+             0.05 (set)"
+        );
+        let mut rf = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
+        rf.lr_schedule = Some(Step);
+        assert!(
+            rf.lr_line(5000)
+                .ends_with("schedule step (set), anneal factor 0.1 (default)"),
+            "{}",
+            rf.lr_line(5000)
+        );
+        // Labels and parsing.
+        assert_eq!(
+            default_lr_label(TrainFamily::Yolo11),
+            "auto (optimizer picks)"
+        );
+        assert_eq!(
+            default_lr_label(TrainFamily::Rfdetr),
+            "1e-4 (5e-5 under 1000 images)"
+        );
+        assert_eq!(default_lr_label(TrainFamily::Dfine), "1e-4");
+        for s in LrSchedule::ALL {
+            assert_eq!(LrSchedule::parse(s.as_str()), Some(s));
+            assert_eq!(
+                serde_json::to_string(&s).unwrap(),
+                format!("\"{}\"", s.as_str())
+            );
+        }
+        assert_eq!(LrSchedule::parse(" Cosine "), Some(Cosine));
+        assert_eq!(LrSchedule::parse("default"), None);
+        // Written only when set; an older recipe reads as unset.
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(
+            text.contains(r#""lr_schedule":"cosine","lr_min_factor":0.05"#),
+            "{text}"
+        );
+        let back: TrainRecipe = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, r);
+        let plain =
+            serde_json::to_string(&TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap()).unwrap();
+        assert!(!plain.contains("lr_schedule") && !plain.contains("lr_min_factor"));
     }
 
     #[test]

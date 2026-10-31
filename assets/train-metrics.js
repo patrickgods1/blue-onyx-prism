@@ -1,8 +1,10 @@
 // Blue Onyx Prism: Training page metrics view (window.TrainMetrics).
 // render(el, progress, columns, metrics, opts) fills one `.tr-metrics` block from a run's
 // progress record (`history` per epoch, `best`): KPI tiles with the change since the previous
-// epoch, loss and quality curves (PrismBench.charts, legend toggles, "Show as table"), a
-// per-epoch table over the chosen columns and the columns picker.
+// epoch (learning rate, convergence countdown, finish time among them), an overfitting hint,
+// loss, quality and learning-rate curves (PrismBench.charts, legend toggles, "Show as table"), a
+// per-epoch table over the chosen columns and the columns picker. refresh(el, progress, metrics,
+// opts) swaps only the tiles and the hint (every poll; render() when signature() changes).
 // opts: runId, available [keys the picker offers], onColumns(list) -> Promise<{ok, message}>.
 // Everything is built with createElement / textContent (metric keys come from a training
 // script); colours come from CSS classes (CSP style-src 'self'). ES5, no build step.
@@ -41,6 +43,18 @@
     var m = Math.round(s / 60);
     if (m < 90) return m + " min";
     return (m / 60).toFixed(1) + " h";
+  }
+  // Shortest scientific text of a learning rate: 1e-4, 1.5e-4 (an f32 widened to f64 such as
+  // 4.999999873689376e-5 reads 5e-5).
+  function shortSci(v) {
+    if (!has(v)) return "-";
+    return v === 0 ? "0" : (+v.toPrecision(4)).toExponential();
+  }
+  // Wall-clock time `eta_s` seconds from now ("14:20"; "Sat 09:05" when over 20 h away).
+  function doneAt(etaS) {
+    var d = new Date(Date.now() + etaS * 1000);
+    var t = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return etaS > 20 * 3600 ? d.toLocaleDateString([], { weekday: "short" }) + " " + t : t;
   }
 
   // id -> {id, label, short, hb, format} from the server's list; raw keys describe themselves.
@@ -93,14 +107,42 @@
     if (delta) t.appendChild(delta);
     return t;
   }
+  // The convergence rule's countdown: epochs since the last gain against the patience, where the
+  // run stops (the server's `stop_epoch`) and the extension / anneal it is in. Null when early
+  // stopping is off or the run predates it (patience 0 or missing).
+  function convergenceTile(progress) {
+    if (!has(progress.patience) || progress.patience <= 0 || !has(progress.since_best)) return null;
+    var subs = [], st = progress.stopped, an = progress.anneal, cp = progress.converge_point;
+    if (st && has(st.epoch)) subs.push("stopped at epoch " + st.epoch + (st.reason ? " (" + st.reason + ")" : ""));
+    else if (an && has(an.until)) subs.push("annealing (lower learning rate), stops at epoch " + an.until);
+    else {
+      if (has(progress.stop_epoch)) subs.push("stops at epoch " + progress.stop_epoch);
+      if (cp && has(cp.extension) && cp.extension > 0) subs.push("extension " + cp.extension + (has(cp.next_check) ? ", next check epoch " + cp.next_check : ""));
+    }
+    return tile("Convergence", "since best " + progress.since_best + " / " + progress.patience, subs.join("; "));
+  }
+  // The current learning rate (the last batch's when the trainer reports it, else the last
+  // epoch's) with the change against the previous epoch's; direction is neither good nor bad.
+  function lrTile(progress, history) {
+    var lt = lastTwo(history, "lr");
+    var cur = has(progress.lr) ? progress.lr : lt.last;
+    if (!has(cur)) return null;
+    // The epoch event sets progress.lr to the epoch's value: compare with the one before it.
+    var prev = has(progress.lr) && cur !== lt.last ? lt.last : lt.prev;
+    return tile("Learning rate", format("sci", cur), "", deltaNode({ hb: null, format: "sci" }, cur, prev));
+  }
   function tiles(progress, history, info, running) {
     var box = el("div", "tr-kpis");
     if (has(progress.epoch)) {
       var sub = has(progress.batch) && has(progress.batches) && progress.batches > 0 ? "batch " + progress.batch + "/" + progress.batches : "";
       box.appendChild(tile("Epoch", progress.epoch + (has(progress.epochs) ? " / " + progress.epochs : ""), sub));
     }
-    if (running && has(progress.eta_s)) box.appendChild(tile("Time left", "~" + duration(progress.eta_s), has(progress.elapsed_s) ? duration(progress.elapsed_s) + " so far" : ""));
-    else if (has(progress.elapsed_s)) box.appendChild(tile("Time", duration(progress.elapsed_s), ""));
+    if (running && has(progress.eta_s)) {
+      var so = has(progress.elapsed_s) ? duration(progress.elapsed_s) + " so far" : "";
+      box.appendChild(tile("Time left", "~" + duration(progress.eta_s), (so ? so + " · " : "") + "done ~" + doneAt(progress.eta_s)));
+    } else if (has(progress.elapsed_s)) box.appendChild(tile("Time", duration(progress.elapsed_s), ""));
+    var conv = convergenceTile(progress);
+    if (conv) box.appendChild(conv);
     var best = progress.best;
     if (best && has(best.value)) {
       var bi = info(best.metric);
@@ -112,6 +154,8 @@
       var i = info(p[0]);
       box.appendChild(tile(p[1], format(i.format || "fixed3", lt.last), "", deltaNode({ hb: i.hb === null ? false : i.hb, format: i.format }, lt.last, lt.prev)));
     });
+    var lr = lrTile(progress, history);
+    if (lr) box.appendChild(lr);
     [["mem_gb", "Peak memory", "gb"], ["img_s", "Peak speed", "rate"]].forEach(function (p) {
       var v = peak(history, p[0]);
       if (!has(v)) return;
@@ -121,12 +165,50 @@
     return box;
   }
 
+  // ---- overfitting hint ------------------------------------------------------------------------
+  // Pure: true when the mean validation loss of the last 3 epochs is above that of the 3 epochs
+  // before them while the mean training loss fell over the same windows, and the convergence
+  // rule has seen no gain for max(3, patience / 2) epochs (a rising validation loss alone is
+  // common early on). Epochs missing either loss are left out; fewer than 6 such epochs, or a
+  // family that reports no validation loss, is never a hint.
+  var OVERFIT_WINDOW = 3;
+  function overfitting(history, progress) {
+    progress = progress || {};
+    var rows = (history || []).filter(function (h) { var m = h.metrics || {}; return has(m.loss) && has(m.val_loss); });
+    var n = OVERFIT_WINDOW;
+    if (rows.length < 2 * n) return false;
+    var mean = function (list, key) { var s = 0; list.forEach(function (h) { s += h.metrics[key]; }); return s / list.length; };
+    var now = rows.slice(-n), before = rows.slice(-2 * n, -n);
+    var valRose = mean(now, "val_loss") > mean(before, "val_loss");
+    var lossFell = mean(now, "loss") < mean(before, "loss");
+    var patience = has(progress.patience) ? progress.patience : 0;
+    var stale = has(progress.since_best) && progress.since_best >= Math.max(3, patience / 2);
+    return valRose && lossFell && stale;
+  }
+  function overfitNote(history, progress) {
+    if (!overfitting(history, progress)) return null;
+    var b = progress.best && has(progress.best.epoch) ? " (" + progress.best.epoch + ")" : "";
+    return el("p", "warn small tr-overfit", "Validation loss rising while training loss falls: likely overfitting; the best epoch" + b + " is kept.");
+  }
+  // The parts that change with every batch (tiles, overfitting hint): refresh() swaps them in
+  // place so the charts and table are rebuilt only when the history or the columns change.
+  function live(progress, history, info, running) {
+    var box = el("div", "tr-live");
+    box.appendChild(tiles(progress, history, info, running));
+    var w = overfitNote(history, progress);
+    if (w) box.appendChild(w);
+    return box;
+  }
+
   // ---- charts ----------------------------------------------------------------------------------
   var QUALITY = /^(ema_)?(map|map50|map75|mar|precision|recall|f1|f2|f0_5)$/;
   function intTick(v) { return String(Math.round(v)); }
-  function chart(runId, kind, title, keys, history, info, progress, yFmt, pct) {
+  // valFmt (optional): the hover and table text of a value (default: percent with pct, else 4
+  // significant digits).
+  function chart(runId, kind, title, keys, history, info, progress, yFmt, pct, valFmt) {
     var C = PB.charts;
     if (!C || !keys.length) return null;
+    var val = valFmt || (pct ? function (v) { return (v * 100).toFixed(2) + "%"; } : function (v) { return String(+v.toPrecision(4)); });
     var series = keys.map(function (k, i) {
       return { id: k, label: info(k).label, cls: "ser ser-" + ((i % 8) + 1), dash: C.dashOf(i), points: seriesOf(history, k) };
     });
@@ -147,13 +229,13 @@
       draw: function (hidden) {
         return C.lineChart(series, {
           title: title, desc: title + " by epoch", hidden: hidden, xMin: x0, xMax: x1, yMin: 0, yMax: ymax, xTicks: ticks, xFmt: intTick,
-          yFmt: yFmt, yHover: pct ? function (v) { return (v * 100).toFixed(2) + "%"; } : function (v) { return String(+v.toPrecision(4)); },
+          yFmt: yFmt, yHover: val,
           xName: "epoch", xLabel: "Epoch", yLabel: pct ? "%" : "", marks: marks, pointDots: history.length < 40, hover: "x", left: pct ? 44 : 56
         });
       },
       table: function () {
         return { head: ["Epoch"].concat(series.map(function (s) { return s.label; })), rows: history.map(function (h, i) {
-          return [String(h.epoch)].concat(series.map(function (s) { var y = s.points[i].y; return has(y) ? (pct ? (y * 100).toFixed(2) + "%" : String(+y.toPrecision(4))) : "-"; }));
+          return [String(h.epoch)].concat(series.map(function (s) { var y = s.points[i].y; return has(y) ? val(y) : "-"; }));
         }) };
       }
     });
@@ -272,21 +354,46 @@
   }
 
   // ---- entry points ----------------------------------------------------------------------------
-  // The reasons to rebuild a block: the history grew, the batch moved or the columns changed.
+  // The reasons to rebuild a block: the history grew, the epoch or best moved or the columns
+  // changed. The batch, the per-batch learning rate and the time left are left out: they change
+  // on every poll and only touch the tiles, which refresh() swaps in place (a rebuild would redraw
+  // the charts every 3 s and drop a hover).
   function signature(progress, columns) {
-    if (!progress || !progress.history || !progress.history.length) return "";
-    return [progress.history.length, progress.epoch, progress.batch, progress.best ? progress.best.epoch + ":" + progress.best.value : "", (columns || []).join(",")].join("|");
+    if (!progress) return "";
+    var n = progress.history ? progress.history.length : 0;
+    return [n, progress.epoch, progress.best ? progress.best.epoch + ":" + progress.best.value : "", (columns || []).join(",")].join("|");
+  }
+  // Something to show before the first epoch ends (the tiles only): an epoch under way or a
+  // learning rate reported.
+  function hasLive(progress) {
+    return !!progress && ((has(progress.epoch) && progress.epoch > 0) || has(progress.lr));
+  }
+
+  // Swap the tiles and the overfitting hint of a block render() built; false when there is no
+  // such block (the caller renders instead).
+  function refresh(host, progress, metrics, opts) {
+    opts = opts || {};
+    var old = host.querySelector(".tr-live");
+    if (!old || !progress) return false;
+    var history = progress.history || [];
+    old.parentNode.replaceChild(live(progress, history, infoMap(metrics), !!opts.running), old);
+    return true;
   }
 
   function render(host, progress, columns, metrics, opts) {
     opts = opts || {};
     var history = progress && progress.history && progress.history.length ? progress.history : null;
     host.replaceChildren();
-    if (!history) return false;
-    var info = infoMap(metrics), runId = opts.runId || host.dataset.run || "", cols = columns || [];
+    var info = infoMap(metrics), running = !!opts.running;
+    if (!history) {
+      // Epoch 1 under way: the tiles (epoch, time left, learning rate in warm-up) without curves.
+      if (!hasLive(progress)) return false;
+      host.appendChild(live(progress, [], info, running));
+      return true;
+    }
+    var runId = opts.runId || host.dataset.run || "", cols = columns || [];
     var keys = keysOf(history);
-    var running = !!opts.running;
-    host.appendChild(tiles(progress, history, info, running));
+    host.appendChild(live(progress, history, info, running));
 
     // The charts follow the chosen columns (training / validation loss always), so a run with
     // dozens of raw keys still draws a few readable series; one epoch is no curve.
@@ -298,8 +405,14 @@
     var charts = el("div", "tr-charts");
     var c1 = chart(runId, "loss", "Loss", lossKeys, history, info, progress, function (v) { return String(+v.toPrecision(3)); }, false);
     var c2 = chart(runId, "quality", "Quality (higher is better)", qualityKeys, history, info, progress, function (v) { return (v * 100).toFixed(0); }, true);
+    // Learning rate on its own axis (1e-4 against a loss of 3 would be a flat line at zero): the
+    // axis still starts at 0 and niceMax rounds tiny maxima fine (1e-4 -> ticks 0, 2e-5 .. 1e-4),
+    // the tick text is scientific so 0.00002 does not crowd the margin.
+    var lrKeys = history.length >= 2 && keys.indexOf("lr") >= 0 ? ["lr"] : [];
+    var c3 = chart(runId, "lr", "Learning rate", lrKeys, history, info, progress, shortSci, false, function (v) { return format("sci", v); });
     if (c1) charts.appendChild(c1);
     if (c2) charts.appendChild(c2);
+    if (c3) charts.appendChild(c3);
     if (charts.childNodes.length) host.appendChild(charts);
 
     var tw = table(runId, history, cols, info, progress);
@@ -309,5 +422,8 @@
     return true;
   }
 
-  window.TrainMetrics = { render: render, signature: signature, format: format, infoMap: infoMap, keysOf: keysOf };
+  window.TrainMetrics = {
+    render: render, refresh: refresh, signature: signature, format: format, infoMap: infoMap, keysOf: keysOf,
+    overfitting: overfitting, shortSci: shortSci
+  };
 })();

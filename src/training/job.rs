@@ -705,6 +705,7 @@ fn stages(
     enter!(TrainStage::Train, 0, "starting the trainer");
     // A small validation split: a recommended patience doubles (its mAP is noisy).
     let (patience, convergence_line) = recipe.convergence_patience(prepared.valid_images);
+    let patience_doubled = patience != recipe.patience;
     let recipe = &TrainRecipe {
         patience,
         ..recipe.clone()
@@ -803,6 +804,15 @@ fn stages(
                 args.push(e.to_string().into());
             }
         }
+        // Only when set: the script resolves each trainer's own default.
+        if let Some(s) = recipe.lr_schedule {
+            args.push("--lr-scheduler".into());
+            args.push(s.as_str().into());
+        }
+        if let Some(f) = recipe.lr_min_factor {
+            args.push("--lr-min-factor".into());
+            args.push(f.to_string().into());
+        }
         // The convergence stop (one rule for every trainer, `Convergence` in the script).
         let rec = super::recipe::recommended(family);
         for (k, v) in [
@@ -869,6 +879,22 @@ fn stages(
             min_delta: super::recipe::recommended(family).min_delta_f64(),
             min_epochs: super::recipe::recommended(family).min_epochs,
             smooth: super::recipe::recommended(family).smooth,
+            batch_size: Some(batch),
+            imgsz: Some(recipe.imgsz),
+            settings: Some(progress::RunSettings {
+                lr: lr.map(|l| l.lr),
+                lr_encoder: lr.and_then(|l| l.encoder),
+                lr_schedule: recipe.effective_lr_schedule(),
+                lr_min_factor: recipe.effective_lr_min_factor(),
+                epochs: recipe.epochs,
+                patience: recipe.patience,
+                patience_doubled,
+                batch: recipe.batch,
+                workers: Some(workers),
+                seed: job.request.train_seed,
+                scene: Some(job.request.scene.as_str().to_string()),
+                gpu: Some(job.accelerator.name().to_string()),
+            }),
             ..TrainProgress::default()
         };
         let mut done: Option<TrainEvent> = None;
