@@ -41,12 +41,26 @@ pub enum TrainEvent {
         valid_images: usize,
         #[serde(default)]
         epochs: u32,
+        /// The input size the trainer was given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        imgsz: Option<u32>,
+        /// The batch size the trainer was given (after an out-of-memory retry, the halved one).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch: Option<u32>,
     },
     Batch {
         epoch: u32,
         epochs: u32,
         batch: u32,
         batches: u32,
+        /// The main parameter group's learning rate after this batch (None: unreadable, or an
+        /// older script).
+        #[serde(
+            default,
+            deserialize_with = "finite_opt",
+            skip_serializing_if = "Option::is_none"
+        )]
+        lr: Option<f64>,
     },
     Epoch {
         epoch: u32,
@@ -335,6 +349,12 @@ pub fn canonical(raw: &str) -> Option<&'static str> {
 /// Counters a trainer logs beside its metrics (transformers' `epoch`, Lightning's `step`); the
 /// history keys points by epoch already.
 const COUNTER_KEYS: &[&str] = &["epoch", "step", "global_step", "eval_epoch"];
+
+/// A finite number, else None (a `null`, a string or a NaN does not lose the event).
+fn finite_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    let v: Option<serde_json::Value> = Option::deserialize(d)?;
+    Ok(v.and_then(|v| v.as_f64()).filter(|f| f.is_finite()))
+}
 
 /// A JSON object of metrics, keeping finite numbers only (a `null`, a string or a NaN the
 /// script let through does not lose the whole event) and no [`COUNTER_KEYS`].
@@ -639,6 +659,36 @@ pub struct ExtensionNotice {
     pub extension: u32,
 }
 
+/// The settings a run trains with, set by the job when the trainer starts (the page's run
+/// settings line; `GET /v1/training` `runs[].progress.settings`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunSettings {
+    /// Learning rate (`--lr`); None = the trainer's own (YOLO: the optimizer picks).
+    pub lr: Option<f32>,
+    /// RF-DETR's backbone learning rate (`--lr-encoder`); None = none or the trainer's own.
+    pub lr_encoder: Option<f32>,
+    /// The schedule in effect (the family's default when none is set).
+    pub lr_schedule: super::recipe::LrSchedule,
+    /// The final learning rate factor in effect (the family's default when none is set).
+    pub lr_min_factor: f32,
+    /// Epochs (a cap while early stopping is on).
+    pub epochs: u32,
+    /// Patience in effect (0 = off), after a small validation split doubled it.
+    pub patience: u32,
+    /// The recommended patience was doubled for a small validation split.
+    pub patience_doubled: bool,
+    /// The batch size asked for (the progress' `batch_size` is the one training).
+    pub batch: u32,
+    /// Data loader workers of this attempt.
+    pub workers: Option<u32>,
+    /// The trainer's seed of a "Repeat with N seeds" run; None = the options' seed.
+    pub seed: Option<u64>,
+    /// The scene filter (`all`, `day`, `night`, `day+night`, ... `SceneFilter::as_str`).
+    pub scene: Option<String>,
+    /// The GPU's name.
+    pub gpu: Option<String>,
+}
+
 /// What the run reports while the script trains.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -695,6 +745,18 @@ pub struct TrainProgress {
     /// Training ended early (converged or finished on request).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stop>,
+    /// The current learning rate: the latest batch event's, else the latest epoch's `lr`.
+    pub lr: Option<f64>,
+    /// The epoch the convergence rule stops after when nothing improves from now on
+    /// ([`Self::stop_epoch`]); None while early stopping is off and once the run stopped.
+    pub stop_epoch: Option<u32>,
+    /// The batch size training (the start event's; the job sets the attempt's beforehand).
+    pub batch_size: Option<u32>,
+    /// The input size training (the start event's).
+    pub imgsz: Option<u32>,
+    /// The run's settings (None for a run recorded before they were kept).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<RunSettings>,
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -710,20 +772,36 @@ impl TrainProgress {
     pub fn apply(&mut self, ev: &TrainEvent, elapsed_s: f64) {
         self.elapsed_s = elapsed_s;
         match ev {
-            TrainEvent::Start { device, epochs, .. } => {
+            TrainEvent::Start {
+                device,
+                epochs,
+                imgsz,
+                batch,
+                ..
+            } => {
                 self.device = Some(device.clone());
                 self.epochs = *epochs;
+                if imgsz.is_some() {
+                    self.imgsz = *imgsz;
+                }
+                if batch.is_some() {
+                    self.batch_size = *batch;
+                }
             }
             TrainEvent::Batch {
                 epoch,
                 epochs,
                 batch,
                 batches,
+                lr,
             } => {
                 self.epoch = *epoch;
                 self.epochs = *epochs;
                 self.batch = *batch;
                 self.batches = *batches;
+                if let Some(lr) = lr.filter(|v| v.is_finite()) {
+                    self.lr = Some(lr);
+                }
             }
             TrainEvent::Epoch {
                 epoch,
@@ -746,6 +824,14 @@ impl TrainProgress {
                 }
                 let named = [("loss", *loss), ("map50", *map50), ("map", *map)];
                 self.merge(*epoch, at.unwrap_or(elapsed_s), metrics, &named);
+                if let Some(&lr) = self
+                    .history
+                    .iter()
+                    .find(|p| p.epoch == *epoch)
+                    .and_then(|p| p.metrics.get("lr"))
+                {
+                    self.lr = Some(lr);
+                }
             }
             TrainEvent::Eval {
                 epoch,
@@ -779,6 +865,8 @@ impl TrainProgress {
             TrainEvent::SelfCheck { .. } | TrainEvent::Done { .. } => {}
         }
         self.extension = self.extension_notice();
+        let early_stop = self.patience > 0 && (self.epochs == 0 || self.patience < self.epochs);
+        self.stop_epoch = (early_stop && self.stopped.is_none()).then(|| self.stop_epoch());
         let f = self.fraction();
         self.eta_s = (f > 0.0 && f < 1.0).then(|| elapsed_s * (1.0 - f) / f);
         if self.phase.is_some() {
@@ -806,6 +894,11 @@ impl TrainProgress {
                 continue;
             }
             match canonical(k) {
+                // A key that is the id itself (the script's explicit `lr` beside Ultralytics'
+                // `lr/pg0`, its bias group on older versions) wins over the trainer's raw keys.
+                Some(id) if id == k => {
+                    known.insert(id.to_string(), v);
+                }
                 Some(id) => {
                     known.entry(id.to_string()).or_insert(v);
                 }
@@ -1041,6 +1134,9 @@ impl TrainProgress {
                 p.epoch, p.extension
             ));
         }
+        if let Some(lr) = self.lr {
+            s.push_str(&format!(", lr {}", sci(lr)));
+        }
         if let Some(e) = self.eta_s {
             s.push_str(&format!(
                 ", about {} left",
@@ -1049,6 +1145,18 @@ impl TrainProgress {
         }
         s.push_str(&note);
         s
+    }
+}
+
+/// `2.3e-4`: two significant digits (`1e-4` when the second is 0).
+pub fn sci(v: f64) -> String {
+    if v == 0.0 || !v.is_finite() {
+        return format!("{v}");
+    }
+    let s = format!("{v:.1e}");
+    match s.split_once('e') {
+        Some((m, e)) => format!("{}e{e}", m.strip_suffix(".0").unwrap_or(m)),
+        None => s,
     }
 }
 
@@ -1069,7 +1177,8 @@ mod tests {
                 epoch: 1,
                 epochs: 3,
                 batch: 2,
-                batches: 5
+                batches: 5,
+                lr: None,
             })
         );
         let e = parse_line(
@@ -1105,17 +1214,21 @@ mod tests {
                 train_images: 100,
                 valid_images: 10,
                 epochs: 4,
+                imgsz: Some(640),
+                batch: Some(8),
             },
             0.0,
         );
         assert_eq!(p.fraction(), 0.0);
         assert_eq!(p.eta_s, None);
+        assert_eq!((p.batch_size, p.imgsz), (Some(8), Some(640)));
         p.apply(
             &TrainEvent::Batch {
                 epoch: 1,
                 epochs: 4,
                 batch: 5,
                 batches: 10,
+                lr: None,
             },
             10.0,
         );
@@ -1149,6 +1262,7 @@ mod tests {
                 epochs: 4,
                 batch: 3,
                 batches: 10,
+                lr: None,
             },
             26.0,
         );
@@ -1162,6 +1276,151 @@ mod tests {
         );
         assert_eq!(p.eta_s, None);
         assert!(p.describe().contains("exporting"));
+    }
+
+    #[test]
+    fn learning_rate_input_size_batch_and_stop_epoch_follow_the_events() {
+        let with = parse_line(
+            r#"@train {"event":"batch","epoch":1,"epochs":20,"batch":4,"batches":10,"lr":0.00023}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(with, TrainEvent::Batch { lr: Some(v), .. } if (v - 0.00023).abs() < 1e-15)
+        );
+        let without =
+            parse_line(r#"@train {"event":"batch","epoch":1,"epochs":20,"batch":5,"batches":10}"#)
+                .unwrap();
+        assert!(matches!(without, TrainEvent::Batch { lr: None, .. }));
+        // A null or a string the script let through does not lose the event.
+        for bad in ["null", "\"x\""] {
+            let l = format!(
+                r#"@train {{"event":"batch","epoch":1,"epochs":20,"batch":6,"batches":10,"lr":{bad}}}"#
+            );
+            assert!(
+                matches!(parse_line(&l), Some(TrainEvent::Batch { lr: None, .. })),
+                "{l}"
+            );
+        }
+        // The script's start event (extra keys of device_info ignored).
+        let start = parse_line(
+            r#"@train {"event":"start","trainer":"ultralytics","family":"yolo26","device":"cuda:0","classes":["person"],"train_images":100,"valid_images":20,"epochs":20,"imgsz":640,"batch":8,"cuda":true}"#,
+        )
+        .unwrap();
+        let mut p = TrainProgress {
+            patience: 5,
+            min_epochs: 3,
+            min_delta: 0.001,
+            smooth: 1,
+            batch_size: Some(16),
+            ..TrainProgress::default()
+        };
+        p.apply(&start, 0.0);
+        assert_eq!((p.batch_size, p.imgsz, p.epochs), (Some(8), Some(640), 20));
+        // An older script's start event keeps the job's batch.
+        let mut q = TrainProgress {
+            batch_size: Some(4),
+            ..TrainProgress::default()
+        };
+        q.apply(
+            &parse_line(r#"@train {"event":"start","device":"mps","epochs":3}"#).unwrap(),
+            0.0,
+        );
+        assert_eq!((q.batch_size, q.imgsz), (Some(4), None));
+        assert_eq!(p.lr, None);
+        p.apply(&with, 1.0);
+        assert_eq!(p.lr, Some(0.00023));
+        assert!(p.describe().contains(", lr 2.3e-4"), "{}", p.describe());
+        p.apply(&without, 2.0);
+        assert_eq!(p.lr, Some(0.00023), "a batch without lr keeps the last one");
+        // The script's explicit `lr` (main group) wins over Ultralytics' `lr/pg0`.
+        let ep = |e: u32, metrics: &[(&str, f64)]| TrainEvent::Epoch {
+            epoch: e,
+            epochs: 20,
+            loss: Some(1.0),
+            map50: None,
+            map: None,
+            elapsed_s: None,
+            metrics: metrics.iter().map(|(k, v)| ((*k).into(), *v)).collect(),
+        };
+        p.apply(
+            &ep(
+                1,
+                &[
+                    ("lr/pg0", 0.07),
+                    ("lr", 0.0002),
+                    ("metrics/mAP50-95(B)", 0.5),
+                ],
+            ),
+            3.0,
+        );
+        assert_eq!(p.history[0].metrics["lr"], 0.0002);
+        assert_eq!(p.lr, Some(0.0002));
+        // Alone, a raw key is the lr.
+        p.apply(
+            &ep(2, &[("lr/pg0", 0.0001), ("metrics/mAP50-95(B)", 0.4)]),
+            4.0,
+        );
+        assert_eq!(p.lr, Some(0.0001));
+        // Best epoch 1 + patience 5 (at least min_epochs 3).
+        assert_eq!(p.stop_epoch, Some(6));
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["stop_epoch"], 6);
+        assert_eq!(v["lr"], 0.0001);
+        assert_eq!(
+            (v["batch_size"].clone(), v["imgsz"].clone()),
+            (8.into(), 640.into())
+        );
+        assert!(v.get("settings").is_none());
+        // Early stopping off, or stopped: none.
+        let mut off = TrainProgress::default();
+        off.apply(&ep(1, &[("map", 0.4)]), 1.0);
+        assert_eq!(off.stop_epoch, None);
+        p.apply(
+            &TrainEvent::Stop {
+                reason: "converged".into(),
+                epoch: 6,
+                best_epoch: 1,
+                best: Some(0.5),
+            },
+            9.0,
+        );
+        assert_eq!(p.stop_epoch, None);
+        // A run recorded before these fields existed.
+        let old: TrainProgress =
+            serde_json::from_str(r#"{"epoch":3,"epochs":10,"patience":4}"#).unwrap();
+        assert_eq!(
+            (old.lr, old.stop_epoch, old.batch_size, old.imgsz),
+            (None, None, None, None)
+        );
+        assert!(old.settings.is_none());
+        // The settings' JSON shape (the page's run settings line).
+        let s = RunSettings {
+            lr: Some(5e-5),
+            lr_encoder: Some(7.5e-5),
+            lr_schedule: crate::training::recipe::LrSchedule::Cosine,
+            lr_min_factor: 0.1,
+            epochs: 100,
+            patience: 20,
+            patience_doubled: true,
+            batch: 4,
+            workers: Some(3),
+            seed: Some(2),
+            scene: Some("night+ir".into()),
+            gpu: Some("NVIDIA GeForce GTX 1070 Ti".into()),
+        };
+        let v = serde_json::to_value(TrainProgress {
+            settings: Some(s.clone()),
+            ..TrainProgress::default()
+        })
+        .unwrap();
+        assert_eq!(v["settings"]["lr_schedule"], "cosine");
+        assert_eq!(v["settings"]["patience_doubled"], true);
+        assert_eq!(v["settings"]["scene"], "night+ir");
+        let back: RunSettings = serde_json::from_value(v["settings"].clone()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(sci(0.00023), "2.3e-4");
+        assert_eq!(sci(0.0001), "1e-4");
+        assert_eq!(sci(0.01), "1e-2");
     }
 
     fn epoch(e: u32, metrics: &[(&str, f64)]) -> TrainEvent {
@@ -2123,6 +2382,121 @@ print("RESULT: " + json.dumps(out))
                 .filter_map(parse_line)
                 .any(|e| matches!(e, TrainEvent::Phase { ref detail, .. } if detail.contains("waiting up to 5 min"))),
             "{stdout}"
+        );
+    }
+
+    /// The script's learning-rate helpers and options (skipped without Python 3): Ultralytics'
+    /// main group (not the bias group warming down from 0.1, not MuSGD's x3 head copy), unreadable
+    /// optimizers give None, and `--lr-scheduler` / `--lr-min-factor` default to unset and are
+    /// checked per trainer like [`crate::training::recipe::lr_schedule_error`]. A batch event with
+    /// its `lr` parses here.
+    #[test]
+    fn learning_rate_helpers_and_options_of_the_training_script() {
+        let script = include_str!("../../scripts/train_model.py");
+        let code = r#"
+import json, sys
+ns = {"__name__": "train_model"}
+exec(compile(sys.stdin.read(), "train_model.py", "exec"), ns)
+class Opt:
+    def __init__(self, groups):
+        self.param_groups = groups
+P = [object()]
+warmup = Opt([
+    {"params": P, "param_group": "weight", "lr": 0.0004, "initial_lr": 0.002},
+    {"params": P, "param_group": "bn", "lr": 0.0004, "initial_lr": 0.002},
+    {"params": P, "param_group": "bias", "lr": 0.08, "initial_lr": 0.002},
+])
+bias_first = Opt([warmup.param_groups[2], warmup.param_groups[0]])
+muon = Opt([
+    {"params": P, "param_group": "weight", "lr": 0.03, "initial_lr": 0.03},
+    {"params": [], "param_group": "weight", "lr": 0.01, "initial_lr": 0.01},
+    {"params": P, "param_group": "muon", "lr": 0.01, "initial_lr": 0.01},
+    {"params": P, "param_group": "bias", "lr": 0.01, "initial_lr": 0.01},
+])
+plain = Opt([{"params": P, "lr": 5e-05}, {"params": P, "lr": 7.5e-05}])
+class Sched:
+    def get_last_lr(self):
+        return [0.0001, 0.0002]
+U = ns["ultralytics_lr"]
+out = {
+    "ultra": [U(warmup), U(bias_first), U(muon), U(None), U(Opt([{"params": P, "lr": float("nan")}]))],
+    "group": [ns["group_lr"](plain), ns["group_lr"](plain, 1), ns["group_lr"](None)],
+    "sched": [ns["scheduler_lr"](Sched()), ns["scheduler_lr"](None)],
+}
+base = ["--family", "yolo26", "--size", "n", "--name", "x", "--weights", "w", "--data", "d", "--out-dir", "o",
+        "--work", "k", "--export-script", "e"]
+def parse(*extra):
+    sys.argv = ["train_model.py", *extra, *base]
+    try:
+        a = ns["parse_args"]()
+        return [a.lr_scheduler, a.lr_min_factor]
+    except SystemExit as e:
+        return "error"
+out["args"] = [
+    parse("--trainer", "ultralytics"),
+    parse("--trainer", "ultralytics", "--lr-scheduler", "cosine", "--lr-min-factor", "0.05"),
+    parse("--trainer", "ultralytics", "--lr-scheduler", "step"),
+    parse("--trainer", "rfdetr", "--lr-scheduler", "step", "--lr-min-factor", "0.2"),
+    parse("--trainer", "rfdetr", "--lr-scheduler", "linear"),
+    parse("--trainer", "transformers", "--lr-scheduler", "linear"),
+    parse("--trainer", "transformers", "--lr-scheduler", "linear", "--lr-min-factor", "0.1"),
+    parse("--trainer", "transformers", "--lr-min-factor", "1.5"),
+]
+sys.stdout.flush()
+ns["event"]("batch", epoch=1, epochs=3, batch=2, batches=5, lr=U(warmup))
+print("RESULT: " + json.dumps(out))
+"#;
+        let Some(python) = python3() else {
+            eprintln!("no Python 3 found; learning rate helper test skipped");
+            return;
+        };
+        let mut child = std::process::Command::new(python)
+            .args(["-I", "-c", code])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(script.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{python} failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("RESULT: "))
+            .unwrap_or_else(|| panic!("no result in {stdout}"));
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        use serde_json::json;
+        assert_eq!(v["ultra"], json!([0.0004, 0.0004, 0.01, null, null]));
+        assert_eq!(v["group"], json!([5e-05, 7.5e-05, null]));
+        assert_eq!(v["sched"], json!([0.0001, null]));
+        assert_eq!(
+            v["args"],
+            json!([
+                [null, null],
+                ["cosine", 0.05],
+                "error",
+                ["step", 0.2],
+                "error",
+                ["linear", null],
+                "error",
+                "error"
+            ])
+        );
+        let batch = stdout.lines().find_map(parse_line);
+        assert_eq!(
+            batch,
+            Some(TrainEvent::Batch {
+                epoch: 1,
+                epochs: 3,
+                batch: 2,
+                batches: 5,
+                lr: Some(0.0004)
+            })
         );
     }
 }

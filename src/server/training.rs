@@ -167,9 +167,19 @@ struct FamilyRow {
     sizes: Vec<SizeCell>,
     /// Empty cells after the sizes, so every row of the grid has as many cells.
     pad: usize,
-    /// The family's starting point (`100 ep · patience 15`, [`recipe::recommended`]): what a
-    /// blank Epochs / Patience field means.
+    /// The family's starting point (`100 ep · patience 15 · lr 1e-4`, [`recipe::recommended`],
+    /// [`recipe::default_lr_label`]): what blank Epochs / Patience / Learning rate fields mean.
     recommended: String,
+    /// The family's default learning rate (`data-default-lr` of its size checkboxes: the page's
+    /// Learning rate placeholder follows the ticked family).
+    default_lr: &'static str,
+}
+
+/// One option of the LR schedule select (`""` = the family's default).
+struct LrScheduleChoice {
+    value: &'static str,
+    title: &'static str,
+    selected: bool,
 }
 
 /// A licence notice shared by some families (shown once under the size grid).
@@ -488,6 +498,16 @@ pub(super) struct TrainingTemplate {
     epochs: String,
     /// `training.patience`, blank = each family's recommendation.
     patience: String,
+    /// `training.lr`, blank = each family's default.
+    lr: String,
+    /// Every family's default learning rate (the field's hint).
+    lr_defaults: String,
+    /// The LR schedule select, `training.lr_schedule` selected.
+    lr_schedules: Vec<LrScheduleChoice>,
+    /// Which schedules each family takes and its final factor (the Advanced hint).
+    lr_schedule_hint: String,
+    /// `training.lr_min_factor`, blank = each family's default.
+    lr_min_factor: String,
     scenes: Vec<SceneChoice>,
     balance: BalanceView,
     /// Day / night / mixed comparisons of runs queued together, the latest first.
@@ -918,8 +938,14 @@ fn view_with(
             pad: size_cols.saturating_sub(f.sizes.len()),
             recommended: {
                 let r = recipe::recommended(f.family);
-                format!("{} ep \u{b7} patience {}", r.epochs, r.patience)
+                format!(
+                    "{} ep \u{b7} patience {} \u{b7} lr {}",
+                    r.epochs,
+                    r.patience,
+                    recipe::default_lr_label(f.family)
+                )
             },
+            default_lr: recipe::default_lr_label(f.family),
             sizes: f
                 .sizes
                 .iter()
@@ -1152,6 +1178,34 @@ fn view_with(
             .patience
             .map(|e| e.to_string())
             .unwrap_or_default(),
+        lr: config
+            .training
+            .lr
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
+        lr_defaults: lr_defaults_text(),
+        lr_schedules: std::iter::once(("", "default"))
+            .chain(
+                recipe::LrSchedule::ALL
+                    .iter()
+                    .map(|s| (s.as_str(), s.as_str())),
+            )
+            .map(|(value, title)| LrScheduleChoice {
+                value,
+                title,
+                selected: config
+                    .training
+                    .lr_schedule
+                    .map_or("", recipe::LrSchedule::as_str)
+                    == value,
+            })
+            .collect(),
+        lr_schedule_hint: lr_schedule_hint_text(),
+        lr_min_factor: config
+            .training
+            .lr_min_factor
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
         scenes: SCENE_CHOICES
             .iter()
             .map(|(s, title, preset)| SceneChoice {
@@ -1315,6 +1369,46 @@ pub(crate) fn balance_of(
     Ok(b)
 }
 
+/// One family of each trainer, with the families it stands for (hint texts).
+const LR_GROUPS: [(catalog::TrainFamily, &str); 3] = [
+    (catalog::TrainFamily::Yolo26, "YOLO"),
+    (catalog::TrainFamily::Rfdetr, "RF-DETR"),
+    (catalog::TrainFamily::Rtdetrv2, "RT-DETRv2 / D-FINE"),
+];
+
+/// "YOLO: auto (optimizer picks); RF-DETR: 1e-4 (5e-5 under 1000 images); RT-DETRv2 / D-FINE:
+/// 1e-4".
+fn lr_defaults_text() -> String {
+    LR_GROUPS
+        .iter()
+        .map(|(f, t)| format!("{t}: {}", recipe::default_lr_label(*f)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// "YOLO: linear (default) or cosine, final factor 0.01; ...".
+fn lr_schedule_hint_text() -> String {
+    LR_GROUPS
+        .iter()
+        .map(|(f, t)| {
+            let s = recipe::lr_schedules(*f);
+            let others: Vec<&str> = s
+                .allowed
+                .iter()
+                .filter(|x| **x != s.default)
+                .map(|x| x.as_str())
+                .collect();
+            format!(
+                "{t}: {} (default) or {}, final factor {}",
+                s.default,
+                others.join(" or "),
+                s.min_factor
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The runs of a queue form: one [`TrainRequest`] per ticked model (`model=yolo26n`, repeated),
 /// sharing the dataset and options fields (`gpu`: `cuda:N`, empty / `auto` = the automatic pick;
 /// the suggested batches are the chosen GPU's; blank `epochs` / `patience` = `training`'s value,
@@ -1349,6 +1443,13 @@ pub(crate) fn requests_from_form(
     let batch: Option<u32> = num(f, "batch", "batch")?;
     let imgsz: Option<u32> = num(f, "imgsz", "input size")?;
     let lr: Option<f32> = num(f, "lr", "learning rate")?;
+    let lr_schedule = match field(f, "lr_schedule").map(str::trim) {
+        None | Some("" | "default") => None,
+        Some(v) => Some(recipe::LrSchedule::parse(v).ok_or_else(|| {
+            anyhow::anyhow!("LR schedule: '{v}' is not default, cosine, linear or step")
+        })?),
+    };
+    let lr_min_factor: Option<f32> = num(f, "lr_min_factor", "final LR factor")?;
     let multi_scale = match field(f, "multi_scale") {
         Some(v) => recipe::MultiScale::parse(v)
             .ok_or_else(|| anyhow::anyhow!("multi-scale: '{v}' is not auto, on or off"))?,
@@ -1413,7 +1514,7 @@ pub(crate) fn requests_from_form(
                 .unwrap_or(r.batch)
                 .min(16)
         });
-        r.lr = lr;
+        training.apply_lr(&mut r, lr, lr_schedule, lr_min_factor);
         r.augment = augment;
         r.multi_scale = multi_scale;
         let request = TrainRequest {
@@ -2590,6 +2691,70 @@ mod tests {
     }
 
     #[test]
+    fn form_learning_rate_settings_fall_back_to_the_config_then_the_family() {
+        use crate::training::recipe::LrSchedule;
+        type Lr = (Option<f32>, Option<LrSchedule>, Option<f32>);
+        let post = |models: &[&str],
+                    extra: &[(&str, &str)],
+                    t: &crate::training::config::TrainingConfig|
+         -> anyhow::Result<Vec<Lr>> {
+            let mut f: Vec<(&str, &str)> = models.iter().map(|m| ("model", *m)).collect();
+            f.extend_from_slice(extra);
+            let (reqs, _) = requests_from_form(&form(&f), &mac(), t)?;
+            Ok(reqs
+                .iter()
+                .map(|r| (r.recipe.lr, r.recipe.lr_schedule, r.recipe.lr_min_factor))
+                .collect())
+        };
+        let none = crate::training::config::TrainingConfig::default();
+        let both = ["yolo26n", "dfine-s"];
+        assert_eq!(
+            post(&both, &[], &none).unwrap(),
+            [(None, None, None), (None, None, None)]
+        );
+        assert_eq!(
+            post(
+                &both,
+                &[
+                    ("lr", ""),
+                    ("lr_schedule", "default"),
+                    ("lr_min_factor", "")
+                ],
+                &none
+            )
+            .unwrap(),
+            [(None, None, None), (None, None, None)]
+        );
+        let typed = [
+            ("lr", "0.002"),
+            ("lr_schedule", "cosine"),
+            ("lr_min_factor", "0.05"),
+        ];
+        let want = (Some(0.002), Some(LrSchedule::Cosine), Some(0.05));
+        assert_eq!(post(&both, &typed, &none).unwrap(), [want, want]);
+        // The config fills blank fields; a stored schedule a family does not take is its default.
+        let set = crate::training::config::TrainingConfig {
+            lr: Some(1e-4),
+            lr_schedule: Some(LrSchedule::Step),
+            lr_min_factor: Some(0.2),
+            ..none.clone()
+        };
+        assert_eq!(
+            post(&["rfdetr-nano", "yolo26n"], &[], &set).unwrap(),
+            [
+                (Some(1e-4), Some(LrSchedule::Step), Some(0.2)),
+                (Some(1e-4), None, Some(0.2))
+            ]
+        );
+        assert_eq!(post(&both, &typed, &set).unwrap(), [want, want]);
+        // Bad values name the field.
+        let e = post(&both, &[("lr_schedule", "exp")], &none).unwrap_err();
+        assert!(e.to_string().contains("LR schedule"), "{e}");
+        let e = post(&both, &[("lr_min_factor", "lots")], &none).unwrap_err();
+        assert!(e.to_string().contains("final LR factor"), "{e}");
+    }
+
+    #[test]
     fn dataset_folders_are_offered_or_allowed() {
         let offered = [PathBuf::from("/exports/a"), PathBuf::from("exports/rel")];
         let allow = |raw: &str| -> Result<PathBuf, String> {
@@ -3672,6 +3837,18 @@ mod tests {
         ));
         assert!(page.contains("100 ep \u{b7} patience 15"));
         assert!(page.contains("80 ep \u{b7} patience 10"));
+        // The learning rate: the family defaults in the recommendation, on every size checkbox
+        // (the placeholder follows the ticked family) and in the hints.
+        assert!(page.contains("100 ep \u{b7} patience 15 \u{b7} lr auto (optimizer picks)"));
+        assert!(page.contains("lr 1e-4 (5e-5 under 1000 images)"));
+        assert!(page.contains(
+            "value=\"yolo26n\" aria-label=\"yolo26n\" data-default-lr=\"auto (optimizer picks)\""
+        ));
+        assert!(page.contains("name=\"lr\" inputmode=\"decimal\""));
+        assert!(page.contains("placeholder=\"recommended\""));
+        assert!(page.contains("RF-DETR: cosine (default) or step, final factor 0.1"));
+        assert!(page.contains("<option value=\"\" selected>default</option>"));
+        assert!(page.contains("name=\"lr_min_factor\""));
         assert!(page.contains("id=\"train-picker\""));
         assert!(page.contains("name=\"excluded\" value=\"drop-frame\""));
         // The per-run summary of a finished run: AP50-95 per scene and in scope.

@@ -98,9 +98,21 @@ pub enum TrainCommand {
         /// Square input size (default: the size's own, 640 for YOLO).
         #[arg(long)]
         imgsz: Option<u32>,
-        /// Learning rate (default: the trainer's).
+        /// Learning rate (default: config `training.lr`, else the family's: YOLO auto (the
+        /// optimizer picks), RF-DETR 1e-4 (5e-5 under 1000 training images), RT-DETRv2 / D-FINE
+        /// 1e-4).
         #[arg(long)]
         lr: Option<f32>,
+        /// Learning-rate schedule: cosine, linear or step (default: config
+        /// `training.lr_schedule`, else the family's: YOLO linear (or cosine), RF-DETR cosine
+        /// (or step), RT-DETRv2 / D-FINE cosine (or linear)).
+        #[arg(long, value_parser = ["cosine", "linear", "step"])]
+        lr_schedule: Option<String>,
+        /// Final learning rate as a share of the starting one, 0-1 (default: config
+        /// `training.lr_min_factor`, else the family's: YOLO 0.01, RF-DETR 0.1 (also its
+        /// anneal's), RT-DETRv2 / D-FINE 0).
+        #[arg(long)]
+        lr_min_factor: Option<f32>,
         /// RF-DETR multi-scale training: auto (on when the estimate fits batch 4 with it), on
         /// (rfdetr's default: batches up to ~1.4x the input size, about twice the memory) or off.
         #[arg(long, default_value = "auto", value_parser = ["auto", "on", "off"])]
@@ -831,6 +843,8 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             batch,
             imgsz,
             lr,
+            lr_schedule,
+            lr_min_factor,
             multi_scale,
             night_aug,
             aug_dark,
@@ -917,7 +931,12 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                         .unwrap_or(r.batch)
                         .min(16)
                 });
-                r.lr = lr;
+                config.training.apply_lr(
+                    &mut r,
+                    lr,
+                    lr_schedule.as_deref().and_then(recipe::LrSchedule::parse),
+                    lr_min_factor,
+                );
                 r.augment = augment;
                 r.multi_scale = recipe::MultiScale::parse(&multi_scale).unwrap_or_default();
                 for (scene, i) in scenes.iter().flat_map(|s| (0..seeds).map(move |i| (s, i))) {

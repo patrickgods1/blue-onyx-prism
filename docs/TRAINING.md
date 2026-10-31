@@ -361,8 +361,55 @@ With no learning rate typed and fewer than 1000 training images (`recipe::SMALL_
 RF-DETR run uses lr 5e-5 and encoder (backbone) lr 7.5e-5 instead of rfdetr's 1e-4 / 1.5e-4; a typed
 lr is used as is with an encoder lr of 1.5x it (`TrainRecipe::effective_lr`, `--lr` / `--lr-encoder`).
 `train.log` says which applied, e.g. `# lr: 0.00005, encoder 0.000075 (312 training images < 1000:
-lower than RF-DETR's default 0.0001 for small datasets)`. An rfdetr that does not take these options
-trains without them (logged).
+lower than RF-DETR's default 0.0001 for small datasets); schedule cosine (default), final factor 0.1
+(default)`. An rfdetr that does not take these options trains without them (logged).
+
+### Learning rate settings
+
+The Options step has a **Learning rate** field (empty = the family's default, the placeholder follows
+the ticked family: `data-default-lr` on each size checkbox); *Advanced* has **LR schedule** (default,
+cosine, linear, step) and **Final LR factor** (the last epoch's rate as a share of the starting one,
+0-1). Blank fields fall back to `training.lr`, `training.lr_schedule` and `training.lr_min_factor`
+(prefilled on the page; a stored schedule or factor a family does not take is skipped for that
+family: `TrainingConfig::apply_lr`), else to the family's default. `train run` takes `--lr`,
+`--lr-schedule` and `--lr-min-factor` the same way. The job passes `--lr-scheduler` /
+`--lr-min-factor` to the script only when one is set, so each trainer otherwise keeps its own.
+
+| Family (trainer) | Learning rate | Schedules (default first) | Final factor (default) |
+|---|---|---|---|
+| YOLO26 / YOLO11 / YOLOv8 (Ultralytics) | auto: the optimizer picks (AdamW `0.002 * 5 / (4 + classes)` up to 10,000 iterations, else MuSGD 0.01); a typed rate uses AdamW | linear, cosine (`cos_lr`) | 0.01 (`lrf`) |
+| RF-DETR (rfdetr) | 1e-4, 5e-5 below 1000 training images; encoder 1.5x | cosine, step (rfdetr's own x0.1 after epoch 100) | 0.1 (the cosine's end and the anneal's) |
+| RT-DETRv2 / D-FINE (transformers) | 1e-4 | cosine, linear | 0 (`cosine`; a factor above 0 is `cosine_with_min_lr` with `min_lr_rate`, transformers 4.38+, pinned 5.17.0) |
+
+A schedule a family does not take is refused when the run is queued, with the allowed ones in the
+message (`recipe::lr_schedule_error`); so is a factor above 0 with transformers' linear schedule (it
+always ends at 0). With RF-DETR's step schedule the factor only ends the anneal before a convergence
+stop. `train.log` names everything: `# lr: ...; schedule linear (default), final factor 0.01
+(default)`.
+
+**Live learning rate.** Every `batch` event carries `lr`, the main parameter group's current rate
+(None when unreadable): Ultralytics' non-bias group with the lowest base rate (in 8.4 `build_optimizer`
+orders weight / bn / bias groups and MuSGD adds a x3 copy for the class heads; the bias group falls
+from `warmup_bias_lr` 0.1 during warm-up, so it is never the one shown), rfdetr's first group (the
+head, at `lr`; the backbone and decoder groups are scaled), transformers' `lr_scheduler.get_last_lr()`.
+Ultralytics' epoch event also has that rate as an explicit `lr`, which wins over `lr/pg0` (a raw key
+that is a canonical id itself wins over the trainer's aliases of it, `progress::TrainProgress::merge`).
+
+**Progress fields** (`runs[].progress` of `GET /v1/training`, all absent / null on older records):
+`lr` (the latest batch event's rate, else the latest epoch's `lr`), `stop_epoch` (the epoch the
+convergence rule stops after when nothing improves from now on; null while early stopping is off and
+after a stop), `batch_size` and `imgsz` (the start event's, the job's halved batch before it after an
+out-of-memory retry), and `settings`: `lr` / `lr_encoder` (null = the trainer's own), `lr_schedule`
+and `lr_min_factor` in effect, `epochs`, `patience` in effect and `patience_doubled` (a small
+validation split), the requested `batch`, `workers`, `seed` (a seed repeat's), `scene` (`all`,
+`night+ir`, ...) and `gpu` (its name). The stage text ends with `lr 2.3e-4`.
+
+**On the page** the metrics view shows a Learning rate tile (the current rate with its change from
+the previous epoch) and an LR curve once the history has `lr`, a Convergence tile ("since best 4 / 10,
+stops at epoch E", the anneal or extension when active; hidden with patience 0), the finish time
+under Time left, a run settings line (GPU, batch and input size, learning rate and schedule, cap and
+patience, seed, scene, workers) and an overfitting hint when the validation loss rises while the
+training loss falls.
 
 Sources: the Ultralytics fine-tuning guide (patience 10-20 when fine-tuning) and the `cfg` reference
 (<https://docs.ultralytics.com/guides/finetuning-guide>, <https://docs.ultralytics.com/usage/cfg>);
@@ -1171,7 +1218,7 @@ blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <e
     [--scene all|day|night|ir|night+ir|day+ir ... (repeat for a comparison)] \
     [--classes a,b] [--classes c] [--excluded background|drop-frame] \
     [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
-    [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
+    [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--lr-schedule cosine|linear|step] [--lr-min-factor 0.05] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
     [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \

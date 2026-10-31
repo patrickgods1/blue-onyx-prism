@@ -55,6 +55,17 @@ pub struct TrainingConfig {
     /// recommendation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patience: Option<u32>,
+    /// Learning rate of every run (above 0, below 1); None = the family's default
+    /// ([`super::recipe::default_lr_label`]). A run's form value wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lr: Option<f32>,
+    /// Learning-rate schedule of every run; None = the family's default. A family that does
+    /// not take it trains with its default ([`Self::lr_schedule_for`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lr_schedule: Option<super::recipe::LrSchedule>,
+    /// Final learning rate as a share of the starting one (0-1); None = the family's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lr_min_factor: Option<f32>,
     /// Share of frames without objects (hard negatives) kept in the training split (0-0.9).
     #[serde(serialize_with = "crate::config::thr::ser_clean")]
     pub negative_share: f32,
@@ -97,6 +108,9 @@ impl Default for TrainingConfig {
             datasets: Vec::new(),
             epochs: None,
             patience: None,
+            lr: None,
+            lr_schedule: None,
+            lr_min_factor: None,
             negative_share: DEFAULT_NEGATIVE_SHARE,
             heldout_share: DEFAULT_HELDOUT_SHARE,
             oversample: DEFAULT_OVERSAMPLE,
@@ -159,6 +173,43 @@ impl TrainingConfig {
             .min(self.epochs_for(family))
     }
 
+    /// `lr_schedule` and `lr_min_factor` for a `family` run: each when the family takes it
+    /// ([`super::recipe::lr_schedule_error`]), else None (the family's default), so a stored
+    /// choice for one family never fails a run of another.
+    pub fn lr_schedule_for(
+        &self,
+        family: TrainFamily,
+    ) -> (Option<super::recipe::LrSchedule>, Option<f32>) {
+        use super::recipe::lr_schedule_error;
+        let schedule = self
+            .lr_schedule
+            .filter(|&s| lr_schedule_error(family, Some(s), None).is_none());
+        let factor = self
+            .lr_min_factor
+            .filter(|&f| lr_schedule_error(family, schedule, Some(f)).is_none());
+        (schedule, factor)
+    }
+
+    /// Fill `r`'s learning-rate settings: each typed value (the form's, the CLI's) wins, else
+    /// this config's when `r`'s family takes it ([`Self::lr_schedule_for`]; a stored factor
+    /// also has to suit the typed schedule), else None (the family's default).
+    pub fn apply_lr(
+        &self,
+        r: &mut super::recipe::TrainRecipe,
+        lr: Option<f32>,
+        schedule: Option<super::recipe::LrSchedule>,
+        min_factor: Option<f32>,
+    ) {
+        let (cfg_schedule, _) = self.lr_schedule_for(r.family);
+        r.lr = lr.or(self.lr);
+        r.lr_schedule = schedule.or(cfg_schedule);
+        r.lr_min_factor = min_factor.or_else(|| {
+            self.lr_min_factor.filter(|&k| {
+                super::recipe::lr_schedule_error(r.family, r.lr_schedule, Some(k)).is_none()
+            })
+        });
+    }
+
     /// The per-epoch table's columns: `metric_columns`, else the default.
     pub fn effective_metric_columns(&self) -> Vec<String> {
         if self.metric_columns.is_empty() {
@@ -187,6 +238,16 @@ impl TrainingConfig {
             && p > e
         {
             anyhow::bail!("training.patience ({p}) must not exceed training.epochs ({e})");
+        }
+        if let Some(lr) = self.lr
+            && !(lr.is_finite() && lr > 0.0 && lr < 1.0)
+        {
+            anyhow::bail!("training.lr must be above 0 and below 1 (e.g. 0.0001), got {lr}");
+        }
+        if let Some(f) = self.lr_min_factor
+            && !(f.is_finite() && (0.0..=1.0).contains(&f))
+        {
+            anyhow::bail!("training.lr_min_factor must be between 0 and 1, got {f}");
         }
         for (key, v) in [
             ("training.negative_share", self.negative_share),
@@ -416,6 +477,9 @@ mod tests {
             metric_columns: vec!["map".into()],
             epochs: Some(30),
             patience: Some(5),
+            lr: Some(1e-4),
+            lr_schedule: Some(crate::training::recipe::LrSchedule::Cosine),
+            lr_min_factor: Some(0.1),
             balance: Some(Default::default()),
             ..TrainingConfig::default()
         };
@@ -455,6 +519,91 @@ mod tests {
         // A recommended patience above a small epochs override is capped by it.
         let small: TrainingConfig = serde_json::from_str(r#"{"epochs": 8}"#).unwrap();
         assert_eq!(small.patience_for(TrainFamily::Yolo26), 8);
+    }
+
+    #[test]
+    fn learning_rate_settings_validate_round_trip_and_fit_the_family() {
+        use crate::training::recipe::LrSchedule;
+        let bad = |f: fn(&mut TrainingConfig)| {
+            let mut c = TrainingConfig::default();
+            f(&mut c);
+            c.validate().unwrap_err().to_string()
+        };
+        for lr in [0.0, 1.0, -1e-4, f32::NAN] {
+            let c = TrainingConfig {
+                lr: Some(lr),
+                ..TrainingConfig::default()
+            };
+            assert!(
+                c.validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("training.lr "),
+                "{lr}"
+            );
+        }
+        assert!(bad(|c| c.lr_min_factor = Some(1.5)).contains("training.lr_min_factor"));
+        assert!(bad(|c| c.lr_min_factor = Some(f32::NAN)).contains("training.lr_min_factor"));
+        let c: TrainingConfig =
+            serde_json::from_str(r#"{"lr": 0.002, "lr_schedule": "step", "lr_min_factor": 0.2}"#)
+                .unwrap();
+        c.validate().unwrap();
+        assert_eq!(
+            (c.lr, c.lr_schedule, c.lr_min_factor),
+            (Some(0.002), Some(LrSchedule::Step), Some(0.2))
+        );
+        let back: TrainingConfig =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+        assert!(serde_json::from_str::<TrainingConfig>(r#"{"lr_schedule": "exp"}"#).is_err());
+        // Unset: not written.
+        let text = serde_json::to_string(&TrainingConfig::default()).unwrap();
+        assert!(!text.contains("\"lr"), "{text}");
+        // A schedule the family does not take falls back to its default.
+        assert_eq!(
+            c.lr_schedule_for(TrainFamily::Rfdetr),
+            (Some(LrSchedule::Step), Some(0.2))
+        );
+        assert_eq!(c.lr_schedule_for(TrainFamily::Yolo26), (None, Some(0.2)));
+        let lin = TrainingConfig {
+            lr_schedule: Some(LrSchedule::Linear),
+            lr_min_factor: Some(0.1),
+            ..TrainingConfig::default()
+        };
+        assert_eq!(
+            lin.lr_schedule_for(TrainFamily::Yolo11),
+            (Some(LrSchedule::Linear), Some(0.1))
+        );
+        // transformers' linear schedule ends at 0: the factor is dropped, not the schedule.
+        assert_eq!(
+            lin.lr_schedule_for(TrainFamily::Dfine),
+            (Some(LrSchedule::Linear), None)
+        );
+        assert_eq!(lin.lr_schedule_for(TrainFamily::Rfdetr), (None, Some(0.1)));
+        // Typed values win; the stored ones fill the gaps where they suit.
+        let stored = TrainingConfig {
+            lr: Some(0.002),
+            lr_schedule: Some(LrSchedule::Cosine),
+            lr_min_factor: Some(0.05),
+            ..TrainingConfig::default()
+        };
+        let mut r = crate::training::recipe::TrainRecipe::new(TrainFamily::Dfine, "s").unwrap();
+        stored.apply_lr(&mut r, None, None, None);
+        assert_eq!(
+            (r.lr, r.lr_schedule, r.lr_min_factor),
+            (Some(0.002), Some(LrSchedule::Cosine), Some(0.05))
+        );
+        r.validate().unwrap();
+        // A typed linear schedule drops the stored factor (D-FINE's linear ends at 0).
+        stored.apply_lr(&mut r, Some(1e-4), Some(LrSchedule::Linear), None);
+        assert_eq!(
+            (r.lr, r.lr_schedule, r.lr_min_factor),
+            (Some(1e-4), Some(LrSchedule::Linear), None)
+        );
+        r.validate().unwrap();
+        // Nothing stored, nothing typed: the family's defaults.
+        TrainingConfig::default().apply_lr(&mut r, None, None, None);
+        assert_eq!((r.lr, r.lr_schedule, r.lr_min_factor), (None, None, None));
     }
 
     #[test]
