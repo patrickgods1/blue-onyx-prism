@@ -42,6 +42,56 @@
     });
     update();
   }
+  // The Import, Auto-label and Train forms keep what was typed across the page the server
+  // answers with (it renders the defaults, also after "Not queued: ..."): a submission that goes
+  // ahead stashes the visible fields in sessionStorage (`formdata`, after the submit handlers
+  // added the picked classes), the next load puts them back once, before the toggles below read
+  // them. Only fields that existed at submit are touched (a folder saved meanwhile keeps its
+  // default); hidden inputs are not restored.
+  var restoredClasses = {};
+  ["import-form", "autolabel-form", "train"].forEach(function (id) {
+    var form = document.getElementById(id);
+    if (!form) return;
+    var KEY = "bop.training.form." + id;
+    var keyOf = function (el, seen) {
+      if (el.type === "checkbox" || el.type === "radio") return el.name + "\u0000" + el.value;
+      var n = seen[el.name] = (seen[el.name] || 0) + 1;
+      return el.name + "\u0000#" + n;
+    };
+    var kept = function (el) {
+      return el.name && el.type !== "hidden" && el.type !== "file" && el.type !== "submit" && el.type !== "button";
+    };
+    form.addEventListener("formdata", function () {
+      var v = {}, seen = {}, classes = [];
+      Array.prototype.forEach.call(form.elements, function (el) {
+        if (el.type === "hidden" && el.name === "classes") classes.push(el.value);
+        if (!kept(el)) return;
+        var k = keyOf(el, seen);
+        if (el.type === "checkbox" || el.type === "radio") v[k] = el.checked;
+        else if (el.multiple) v[k] = Array.prototype.filter.call(el.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
+        else v[k] = el.value;
+      });
+      try { window.sessionStorage.setItem(KEY, JSON.stringify({ fields: v, classes: classes })); } catch (e) { /* storage blocked */ }
+    });
+    var saved = null;
+    try {
+      saved = JSON.parse(window.sessionStorage.getItem(KEY) || "null");
+      window.sessionStorage.removeItem(KEY);
+    } catch (e) { saved = null; }
+    if (!saved || typeof saved.fields !== "object") return;
+    var seen = {};
+    Array.prototype.forEach.call(form.elements, function (el) {
+      if (!kept(el)) return;
+      var k = keyOf(el, seen);
+      if (!Object.prototype.hasOwnProperty.call(saved.fields, k)) return;
+      var x = saved.fields[k];
+      if (el.type === "checkbox" || el.type === "radio") el.checked = !!x;
+      else if (el.multiple && Array.isArray(x)) Array.prototype.forEach.call(el.options, function (o) { o.selected = x.indexOf(o.value) >= 0; });
+      else if (typeof x === "string") el.value = x;
+    });
+    if (Array.isArray(saved.classes) && saved.classes.length) restoredClasses[id] = saved.classes;
+  });
+
   toggle(document.getElementById("import-form"), "source", "data-source");
 
   // An invalid field inside a closed <details> (Sampling options, Advanced) cannot show its
@@ -149,7 +199,7 @@
     CP.fetchCatalog().then(function (cat) {
       catalog = cat;
       picker = CP.create(holder, {
-        entries: entriesOf(cat), selected: CP.util.defaultSelection(cat), mode: "full", allowAdd: true,
+        entries: entriesOf(cat), selected: restoredClasses["autolabel-form"] || CP.util.defaultSelection(cat), mode: "full", allowAdd: true,
         quickSets: CP.util.quickSetsFor(cat)
       });
     }).catch(function (e) {
