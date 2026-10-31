@@ -147,14 +147,18 @@ class Convergence:
     start the countdown. At such a stop point, while the training loss still falls over the last
     `patience` epochs (`loss_falling`), at most MAX_EXTENSIONS times and before the last of
     `epochs` (0 = unknown), the run goes on instead: `point` holds the `converge_point` event and
-    the countdown restarts there. A repeated or older epoch is ignored. `best` / `best_epoch` are
-    the last such gain (smoothed); `top` / `top_epoch` the highest raw value, `improved` whether
-    this epoch set it (the checkpoint to keep). Pure, no torch."""
+    the countdown restarts there. Else, with `anneal` > 0 epochs and before the last of `epochs`,
+    the first stop point that would stop starts an anneal instead: `annealing` holds the `anneal`
+    event, training goes on to `anneal_until` = epoch + anneal (at most `epochs`) and stops there
+    ("converged"; later stop points are ignored, the stop file still finishes at once). The trainer
+    lowers the learning rate over those epochs (`bend_rfdetr_lr`). A repeated or older epoch is
+    ignored. `best` / `best_epoch` are the last such gain (smoothed); `top` / `top_epoch` the highest
+    raw value, `improved` whether this epoch set it (the checkpoint to keep). Pure, no torch."""
 
     def __init__(self, patience: int = 0, min_epochs: int = 0, min_delta: float = 0.0, stop_file=None,
-                 smooth: int = 1, epochs: int = 0):
+                 smooth: int = 1, epochs: int = 0, anneal: int = 0):
         self.patience, self.min_epochs, self.min_delta = int(patience), int(min_epochs), float(min_delta)
-        self.smooth, self.epochs = max(1, int(smooth)), int(epochs)
+        self.smooth, self.epochs, self.anneal = max(1, int(smooth)), int(epochs), max(0, int(anneal))
         self.stop_file = Path(stop_file) if stop_file else None
         self.last = 0
         self.window = []
@@ -165,6 +169,8 @@ class Convergence:
         self.extensions, self.restart = 0, 0
         self.falling = False
         self.point = None
+        self.anneal_from, self.anneal_until = 0, 0
+        self.annealing = None
         self.decision = None
 
     def update(self, epoch: int, value, loss=None) -> str | None:
@@ -174,6 +180,7 @@ class Convergence:
         self.last = epoch
         self.improved = False
         self.point = None
+        self.annealing = None
         self.losses.append(float(loss) if loss is not None and math.isfinite(float(loss)) else None)
         if value is not None and math.isfinite(float(value)):
             v = float(value)
@@ -185,6 +192,9 @@ class Convergence:
                 self.top, self.top_epoch, self.improved = v, epoch, True
         if self.stop_file is not None and self.stop_file.exists():
             self.decision = "finish"
+        elif self.anneal_until:
+            if epoch >= self.anneal_until:
+                self.decision = "converged"
         elif (self.patience > 0 and self.best is not None and epoch >= self.min_epochs
               and epoch - max(self.best_epoch, self.restart) >= self.patience):
             recent = self.losses[-self.patience:]
@@ -197,6 +207,12 @@ class Convergence:
                 self.point = {"epoch": epoch, "best_epoch": self.top_epoch, "best": self.top, "loss_falling": True,
                               "loss_from": early, "loss_to": late, "extension": self.extensions,
                               "next_check": nxt if self.epochs <= 0 else min(nxt, self.epochs)}
+            elif self.anneal > 0 and (self.epochs <= 0 or epoch < self.epochs):
+                until = epoch + self.anneal
+                self.anneal_from = epoch
+                self.anneal_until = until if self.epochs <= 0 else min(until, self.epochs)
+                self.annealing = {"epoch": epoch, "until": self.anneal_until, "best_epoch": self.top_epoch,
+                                  "best": self.top, "loss_falling": self.falling, "extensions": self.extensions}
             else:
                 self.decision = "converged"
         return self.decision
@@ -210,13 +226,21 @@ class Convergence:
                 f"training loss is still falling (mean {p['loss_from']:.3f} -> {p['loss_to']:.3f}): continuing to epoch "
                 f"{p['next_check']} (extension {p['extension']} of {MAX_EXTENSIONS}; Finish now keeps epoch {p['best_epoch']})")
             event("converge_point", **p)
+        if self.annealing is not None:
+            p = self.annealing
+            log(f"early stop point at epoch {p['epoch']} (best epoch {p['best_epoch']}, mAP {p['best']}): lowering the "
+                f"learning rate until epoch {p['until']}, then stopping (Finish now keeps the best epoch)")
+            event("anneal", **p)
         if decision:
             self.emit()
         return bool(decision)
 
     def emit(self) -> None:
         """The `stop` event of the decision (the best epoch is the one exported)."""
-        if self.decision == "converged":
+        if self.decision == "converged" and self.anneal_until:
+            why = "lowered the learning rate for %d epochs after the stop point at epoch %d" % (
+                self.anneal_until - self.anneal_from, self.anneal_from)
+        elif self.decision == "converged":
             why = "no mAP gain above %g for %d epochs" % (self.min_delta, self.patience)
             if self.smooth > 1:
                 why += " (mAP averaged over the last %d epochs)" % self.smooth
@@ -230,11 +254,63 @@ class Convergence:
             why = "finish requested"
         log(f"stopping after epoch {self.last}: {why}; best epoch {self.top_epoch} (mAP {self.top})")
         event("stop", reason=self.decision, epoch=self.last, best_epoch=self.top_epoch, best=self.top,
-              loss_falling=self.falling, extensions=self.extensions)
+              loss_falling=self.falling, extensions=self.extensions, anneal_until=self.anneal_until or None)
+
+
+def bend_lambda_lr(scheduler, steps: int, min_factor: float) -> bool:
+    """Lower the learning rate of a `LambdaLR`-like `scheduler` (its `lr_lambdas` and `last_epoch`)
+    over the next `steps` scheduler steps: each factor f(s) becomes
+    min(f(s), lo + (f0 - lo) * (1 + cos(pi * min(1, (s - s0) / steps))) / 2) from the current step
+    s0 with f0 = f(s0) and lo = min(min_factor, f0), so it follows a half cosine from f0 down to
+    `min_factor` and never rises above the schedule. False (unchanged) without lambdas or steps.
+    No torch: tested with a stand-in."""
+    lambdas = getattr(scheduler, "lr_lambdas", None)
+    if not isinstance(lambdas, list) or not lambdas or int(steps) < 1:
+        return False
+    s0, steps = int(scheduler.last_epoch), int(steps)
+
+    def bend(orig):
+        f0 = float(orig(s0))
+        lo = min(float(min_factor), f0)
+
+        def factor(s):
+            t = min(1.0, max(0.0, (s - s0) / steps))
+            return min(orig(s), lo + (f0 - lo) * 0.5 * (1.0 + math.cos(math.pi * t)))
+
+        return factor
+
+    scheduler.lr_lambdas = [bend(f) for f in lambdas]
+    return True
+
+
+def bend_rfdetr_lr(trainer, epochs: int, steps_per_epoch: int, min_factor: float) -> None:
+    """At the start of an anneal of `epochs` epochs: bend the Lightning trainer's LambdaLR (rfdetr's
+    managed step / cosine schedule, stepped per optimizer step) down to `min_factor` over them
+    (`bend_lambda_lr`). Anything else only logs: the run still anneals, then stops."""
+    try:
+        import torch
+
+        configs = getattr(trainer, "lr_scheduler_configs", None) or []
+        sched = configs[0].scheduler if configs else None
+        if not isinstance(sched, torch.optim.lr_scheduler.LambdaLR):
+            log(f"anneal: the learning rate could not be lowered (scheduler {type(sched).__name__}); "
+                f"training {epochs} more epochs at the schedule's rate, then stopping")
+            return
+        if getattr(configs[0], "interval", "step") == "epoch":
+            steps_per_epoch = 1
+        steps = max(1, int(epochs) * int(steps_per_epoch))
+        before = [float(f(sched.last_epoch)) for f in sched.lr_lambdas]
+        if bend_lambda_lr(sched, steps, min_factor):
+            log(f"anneal: learning rate factor {', '.join(f'{f:.3g}' for f in before)} -> {min_factor:g} over "
+                f"{epochs} epochs ({steps} scheduler steps from step {sched.last_epoch})")
+        else:
+            log("anneal: the learning rate could not be lowered (no lr_lambdas); training on, then stopping")
+    except Exception as e:  # a changed Lightning / rfdetr internal: anneal-then-stop still applies
+        log(f"anneal: the learning rate could not be lowered ({type(e).__name__}: {e}); training on, then stopping")
 
 
 def convergence(a) -> Convergence:
-    return Convergence(a.patience, a.min_epochs, a.min_delta, a.stop_file, a.smooth, a.epochs)
+    return Convergence(a.patience, a.min_epochs, a.min_delta, a.stop_file, a.smooth, a.epochs, a.anneal)
 
 
 def parse_args() -> argparse.Namespace:
@@ -250,6 +326,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--lr", type=float, default=None, help="learning rate (default: the trainer's)")
+    p.add_argument("--lr-encoder", type=float, default=None,
+                   help="RF-DETR: the backbone (encoder) learning rate (default: rfdetr's, 1.5e-4)")
+    p.add_argument("--lr-scheduler", choices=("cosine", "step"), default="cosine",
+                   help="RF-DETR: cosine (decays to --lr-min-factor over --epochs) or step (rfdetr's default: x0.1 after epoch 100)")
+    p.add_argument("--lr-min-factor", type=float, default=0.1,
+                   help="RF-DETR: the cosine schedule's and the anneal's final learning rate, as a share of --lr")
     p.add_argument("--device", default="auto", help="auto, cuda, cuda:N, mps or cpu")
     p.add_argument("--allow-cpu", action="store_true", help="train on the CPU when no GPU is found (slow; smoke tests)")
     p.add_argument("--workers", type=int, default=2, help="data loader workers")
@@ -262,6 +344,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-epochs", type=int, default=0, help="no convergence stop before this epoch")
     p.add_argument("--min-delta", type=float, default=0.0, help="smallest validation mAP gain that counts as an improvement")
     p.add_argument("--smooth", type=int, default=1, help="the convergence rule's mAP is the mean of this many last epochs (1 = the raw value)")
+    p.add_argument("--anneal", type=int, default=0,
+                   help="at the first stop point, train this many more epochs (at most --epochs) with a lowered learning rate (RF-DETR), then stop (0 = stop there)")
     p.add_argument("--stop-file", type=Path, default=None, help="finish after the current epoch (keeping the best one) once this file exists")
     p.add_argument("--aug-dark", type=float, default=0.0, help="probability of the synthetic darkness augmentation")
     p.add_argument("--aug-noise", type=float, default=0.0, help="probability of the sensor noise augmentation")
@@ -285,6 +369,10 @@ def parse_args() -> argparse.Namespace:
         p.error("--patience, --min-epochs and --min-delta must not be negative")
     if a.smooth < 1:
         p.error("--smooth must be at least 1")
+    if a.anneal < 0:
+        p.error("--anneal must not be negative")
+    if not 0.0 <= a.lr_min_factor <= 1.0:
+        p.error("--lr-min-factor must be between 0 and 1")
     if a.epochs < 1 or a.batch < 1 or a.imgsz < 32:
         p.error("--epochs and --batch must be at least 1, --imgsz at least 32")
     return a
@@ -1440,6 +1528,22 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
         coco_eval.sweep_confidence_thresholds = sweep
 
     conv = convergence(a)
+    # The scheduler's step at the previous epoch end: its steps per epoch, as they ran.
+    sched_steps = {"last": None, "per_epoch": 0}
+
+    def scheduler_step(trainer):
+        try:
+            return int(trainer.lr_scheduler_configs[0].scheduler.last_epoch)
+        except Exception:
+            return None
+
+    def steps_per_epoch(trainer) -> int:
+        if sched_steps["per_epoch"] > 0:
+            return sched_steps["per_epoch"]
+        try:
+            return max(1, int(trainer.estimated_stepping_batches) // max(1, int(trainer.max_epochs)))
+        except Exception:
+            return max(1, int(trainer.num_training_batches) // max(1, int(trainer.accumulate_grad_batches)))
 
     class Progress(Callback):
         def on_train_epoch_start(self, trainer, pl_module):
@@ -1479,8 +1583,15 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
                          map=mp95, elapsed_s=round(time.time() - started, 1))
             # Lightning runs the epoch's validation before on_train_epoch_end, so the mAP is this
             # epoch's; should_stop ends fit after it (rfdetr's own early stopping is not enabled).
+            s = scheduler_step(trainer)
+            if s is not None and sched_steps["last"] is not None and s > sched_steps["last"]:
+                sched_steps["per_epoch"] = s - sched_steps["last"]
+            sched_steps["last"] = s
             if not trainer.sanity_checking and conv.step(trainer.current_epoch + 1, mp95 if mp95 is not None else mp, loss):
                 trainer.should_stop = True
+            elif conv.annealing is not None:
+                p = conv.annealing
+                bend_rfdetr_lr(trainer, p["until"] - p["epoch"], steps_per_epoch(trainer), a.lr_min_factor)
 
     # rfdetr builds its Lightning trainer itself; add the progress callback to every trainer it builds.
     import pytorch_lightning as pl
@@ -1504,6 +1615,13 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     )
     if a.lr is not None:
         kw["lr"] = a.lr
+    if a.lr_encoder is not None:
+        kw["lr_encoder"] = a.lr_encoder
+    # rfdetr's default step schedule drops x0.1 only after epoch 100, past where the convergence
+    # rule usually stops: cosine decays over the planned epochs (its total steps).
+    kw["lr_scheduler"] = a.lr_scheduler
+    if a.lr_scheduler == "cosine":
+        kw["lr_scheduler_kwargs"] = {"min_factor": a.lr_min_factor}
     if a.multi_scale == "off":
         kw["multi_scale"] = False
     if a.workers > 0:
@@ -1514,10 +1632,14 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     log(f"rfdetr {cls_name}.train({', '.join(f'{k}={v}' for k, v in kw.items())})")
     try:
         model.train(**kw)
-    except TypeError as e:
-        # A keyword this rfdetr version does not take: retry without the optional ones.
+    except (TypeError, ValueError) as e:
+        # A keyword this rfdetr version does not take (TypeError, or its config's "Unknown
+        # parameter(s)" ValueError): retry without the optional ones.
+        if isinstance(e, ValueError) and "Unknown parameter" not in str(e):
+            raise
         log(f"rfdetr rejected an option ({e}); retrying with the basic options")
-        for k in ("seed", "multi_scale", "persistent_workers", "pin_memory"):
+        for k in ("seed", "multi_scale", "persistent_workers", "pin_memory", "lr_encoder", "lr_scheduler",
+                  "lr_scheduler_kwargs"):
             kw.pop(k, None)
         model.train(**kw)
     pl.Trainer.__init__ = orig_init

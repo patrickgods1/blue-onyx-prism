@@ -530,6 +530,7 @@ mod tests {
             excluded: Default::default(),
             balance: Default::default(),
             compare_group: None,
+            train_seed: None,
         }
     }
 

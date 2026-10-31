@@ -143,6 +143,17 @@ pub struct TrainRequest {
     /// stamp ([`super::compare`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compare_group: Option<String>,
+    /// The trainer's seed of a repeat ("Repeat with N seeds"); None = the options' seed. The
+    /// dataset assembly keeps `options.seed`, so every repeat trains on the same frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub train_seed: Option<u64>,
+}
+
+impl TrainRequest {
+    /// The seed handed to the trainer: the repeat's own, else `assembly_seed`.
+    pub fn trainer_seed(&self, assembly_seed: u64) -> u64 {
+        self.train_seed.unwrap_or(assembly_seed)
+    }
 }
 
 /// The sources of a run: the review exports `datasets` (absolute), then the public subset
@@ -254,10 +265,27 @@ pub struct BenchSummary {
     pub device: Option<String>,
     /// Total time per image (p50), ms.
     pub ms_p50: Option<f64>,
-    /// AP50 over the scored classes.
+    /// AP50 over every class of the model when the sets annotate others (the benchmark's
+    /// `all_classes`), else over the scored CCTV classes ([`super::bench::summarize`]).
     pub ap50: Option<f64>,
     pub ap50_95: Option<f64>,
     pub images: usize,
+    /// The confidence threshold the alerting figures below were measured at (the benchmark's
+    /// configured threshold for the model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+    /// Recall of `person` at `threshold`, IoU 0.5 (`benchmark::metrics::AlertStats`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_recall: Option<f64>,
+    /// Recall of vehicles at `threshold`, car/truck/bus/vehicle merged into one class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vehicle_recall: Option<f64>,
+    /// Benchmarked frames without any scored object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_frames: Option<usize>,
+    /// Of `empty_frames`, those with a detection at or above `threshold` (false alerts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_frame_alerts: Option<usize>,
     /// AP on the held-out frames per scene: `day`, `night`, `ir`, and `all` (every held-out
     /// frame) ([`super::bench::summarize`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -681,7 +709,25 @@ fn stages(
         patience,
         ..recipe.clone()
     };
-    log.line(&format!("# {convergence_line}"));
+    // RF-DETR: at a stop point the learning rate is lowered over a few more epochs first.
+    let anneal = recipe.anneal_epochs();
+    let anneal_text = if anneal > 0 {
+        format!(
+            "; at a stop point the learning rate is lowered over {anneal} more epochs, then \
+             training stops"
+        )
+    } else {
+        String::new()
+    };
+    log.line(&format!("# {convergence_line}{anneal_text}"));
+    if let Some(seed) = job.request.train_seed {
+        log.line(&format!(
+            "# training seed {seed} (the frames are the same for every seed)"
+        ));
+    }
+    // RF-DETR on a small training split: a lower learning rate than rfdetr's default.
+    let lr = recipe.effective_lr(prepared.train_images);
+    log.line(&format!("# {}", recipe.lr_line(prepared.train_images)));
     if !recipe.early_stopping() {
         let w = format!(
             "early stopping is off (patience {} of {} epochs): every epoch runs; the best one is \
@@ -732,7 +778,10 @@ fn stages(
             "--workers".into(),
             workers.to_string().into(),
             "--seed".into(),
-            job.options.seed.to_string().into(),
+            job.request
+                .trainer_seed(job.options.seed)
+                .to_string()
+                .into(),
             "--aug-dark".into(),
             recipe.augment.dark.to_string().into(),
             "--aug-noise".into(),
@@ -746,9 +795,13 @@ fn stages(
             "--export-script".into(),
             export_script.clone().into_os_string(),
         ];
-        if let Some(lr) = recipe.lr {
+        if let Some(lr) = lr {
             args.push("--lr".into());
-            args.push(lr.to_string().into());
+            args.push(lr.lr.to_string().into());
+            if let Some(e) = lr.encoder {
+                args.push("--lr-encoder".into());
+                args.push(e.to_string().into());
+            }
         }
         // The convergence stop (one rule for every trainer, `Convergence` in the script).
         let rec = super::recipe::recommended(family);
@@ -757,6 +810,7 @@ fn stages(
             ("--min-epochs", rec.min_epochs.to_string()),
             ("--min-delta", rec.min_delta.to_string()),
             ("--smooth", rec.smooth.to_string()),
+            ("--anneal", anneal.to_string()),
         ] {
             args.push(k.into());
             args.push(v.into());

@@ -733,11 +733,22 @@ pub struct Options {
     pub heldout_share: f32,
     /// Share of the training frames used for validation (checkpoint choice), at least one.
     pub val_share: f32,
+    /// Smallest validation split wanted (capped at a quarter of the candidates): a 10% share of a
+    /// small pool is too few frames to choose a checkpoint on.
+    #[serde(default = "default_min_valid")]
+    pub min_valid: usize,
     pub oversample: u32,
     pub seed: u64,
     /// Step 7 (off by default: the plan of older versions).
     #[serde(default, skip_serializing_if = "Balance::is_off")]
     pub balance: Balance,
+}
+
+/// Default `Options.min_valid`.
+pub const MIN_VALID: usize = 50;
+
+fn default_min_valid() -> usize {
+    MIN_VALID
 }
 
 impl Default for Options {
@@ -750,6 +761,7 @@ impl Default for Options {
             negative_share: super::config::DEFAULT_NEGATIVE_SHARE,
             heldout_share: super::config::DEFAULT_HELDOUT_SHARE,
             val_share: 0.1,
+            min_valid: MIN_VALID,
             oversample: super::config::DEFAULT_OVERSAMPLE,
             seed: 0,
             balance: Balance::default(),
@@ -1087,7 +1099,8 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     }
     cands.sort_by_key(key);
     let n_val = if cands.len() >= 2 {
-        share_of(cands.len(), opts.val_share).clamp(1, cands.len() - 1)
+        let wanted = share_of(cands.len(), opts.val_share).max(opts.min_valid.min(cands.len() / 4));
+        wanted.clamp(1, cands.len() - 1)
     } else {
         0
     };

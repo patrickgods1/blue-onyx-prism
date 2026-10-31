@@ -127,6 +127,36 @@ pub const fn recommended(family: TrainFamily) -> Recommended {
 /// 20261030-010233-b69d: 16 images, +-0.05 between epochs): a recommended patience doubles there.
 pub const SMALL_VALID_IMAGES: usize = 50;
 
+/// Training splits below this many images get RF-DETR's [`SMALL_DATASET_LR`] when no learning
+/// rate is typed: its default 1e-4 (encoder 1.5e-4) is sized for larger sets and overshoots a
+/// few hundred images (run 20261031-025744-2a83).
+pub const SMALL_TRAIN_IMAGES: usize = 1000;
+/// RF-DETR's learning rate on a small training split ([`SMALL_TRAIN_IMAGES`]).
+pub const SMALL_DATASET_LR: f32 = 5e-5;
+/// RF-DETR's backbone (encoder) learning rate is this multiple of its learning rate (its
+/// defaults: 1e-4 / 1.5e-4).
+pub const RFDETR_ENCODER_LR_RATIO: f64 = 1.5;
+/// Shortest anneal ([`TrainRecipe::anneal_epochs`]).
+pub const MIN_ANNEAL_EPOCHS: u32 = 5;
+
+/// The learning rates a run trains with ([`TrainRecipe::effective_lr`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LearningRate {
+    /// `--lr`.
+    pub lr: f32,
+    /// `--lr-encoder` (RF-DETR's backbone); None for families without one.
+    pub encoder: Option<f32>,
+    /// The small-dataset default ([`SMALL_DATASET_LR`]), not a typed rate.
+    pub small_dataset: bool,
+}
+
+/// `x * factor` rounded to the nearest f32 of the decimal value (the script parses the decimal
+/// text: `1e-4 * 1.5` is passed as `0.00015`, not `0.00015000001`).
+fn scaled(x: f32, factor: f64) -> f32 {
+    let exact: f64 = x.to_string().parse().unwrap_or(f64::from(x));
+    (exact * factor).to_string().parse().unwrap_or(x)
+}
+
 /// One training run's model choice and hyper-parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainRecipe {
@@ -228,6 +258,56 @@ impl TrainRecipe {
     /// below the epochs); else the run gets a warning that early stopping is off.
     pub fn early_stopping(&self) -> bool {
         self.patience > 0 && self.patience < self.epochs
+    }
+
+    /// The learning rates of a run on `train_images` training images; None = the trainer's
+    /// defaults. RF-DETR: a typed `lr` with an encoder rate of [`RFDETR_ENCODER_LR_RATIO`] x it,
+    /// else below [`SMALL_TRAIN_IMAGES`] the [`SMALL_DATASET_LR`] (encoder 7.5e-5), else None.
+    /// Other families: the typed `lr` only (no separate encoder rate).
+    pub fn effective_lr(&self, train_images: usize) -> Option<LearningRate> {
+        let rfdetr = self.family == TrainFamily::Rfdetr;
+        let (lr, small_dataset) = match self.lr {
+            Some(lr) => (lr, false),
+            None if rfdetr && train_images < SMALL_TRAIN_IMAGES => (SMALL_DATASET_LR, true),
+            None => return None,
+        };
+        Some(LearningRate {
+            lr,
+            encoder: rfdetr.then(|| scaled(lr, RFDETR_ENCODER_LR_RATIO)),
+            small_dataset,
+        })
+    }
+
+    /// The `train.log` line of [`Self::effective_lr`] ("lr: ...").
+    pub fn lr_line(&self, train_images: usize) -> String {
+        match self.effective_lr(train_images) {
+            None => format!("lr: {train_images} training images: the trainer's default"),
+            Some(r) => {
+                let enc = r
+                    .encoder
+                    .map_or_else(String::new, |e| format!(", encoder {e}"));
+                let why = if r.small_dataset {
+                    format!(
+                        " ({train_images} training images < {SMALL_TRAIN_IMAGES}: lower than \
+                         RF-DETR's default 0.0001 for small datasets)"
+                    )
+                } else {
+                    " (set)".into()
+                };
+                format!("lr: {}{enc}{why}", r.lr)
+            }
+        }
+    }
+
+    /// Epochs the script's convergence rule trains on with a lowered learning rate once it
+    /// reaches a stop point (`--anneal`, 0 = stop there): RF-DETR, with early stopping on,
+    /// `max(5, ceil(patience / 2))`; its step schedule would otherwise never decay before a stop.
+    /// 0 for the other trainers (their schedules already decay over the run).
+    pub fn anneal_epochs(&self) -> u32 {
+        if self.family != TrainFamily::Rfdetr || !self.early_stopping() {
+            return 0;
+        }
+        MIN_ANNEAL_EPOCHS.max(self.patience.div_ceil(2))
     }
 
     /// Whether RF-DETR trains multi-scale on a GPU with `memory_mb` for the estimate (0 =
@@ -564,6 +644,91 @@ mod tests {
                 .unwrap()
                 .contains("patience_recommended")
         );
+    }
+
+    #[test]
+    fn rfdetr_gets_a_lower_learning_rate_on_a_small_training_split() {
+        let r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
+        let small = r.effective_lr(312).unwrap();
+        assert_eq!(
+            (small.lr, small.encoder, small.small_dataset),
+            (5e-5, Some(7.5e-5), true)
+        );
+        // The script gets the decimal text.
+        assert_eq!(
+            (small.lr.to_string(), small.encoder.unwrap().to_string()),
+            ("0.00005".into(), "0.000075".into())
+        );
+        assert_eq!(
+            r.lr_line(312),
+            "lr: 0.00005, encoder 0.000075 (312 training images < 1000: lower than RF-DETR's \
+             default 0.0001 for small datasets)"
+        );
+        // 1000 images and more: rfdetr's defaults.
+        assert_eq!(r.effective_lr(SMALL_TRAIN_IMAGES), None);
+        assert_eq!(
+            r.lr_line(1000),
+            "lr: 1000 training images: the trainer's default"
+        );
+        // A typed rate wins at any size, with the encoder at 1.5x.
+        let typed = TrainRecipe {
+            lr: Some(1e-4),
+            ..r.clone()
+        };
+        for n in [10, 5000] {
+            let l = typed.effective_lr(n).unwrap();
+            assert_eq!(
+                (l.lr, l.encoder, l.small_dataset),
+                (1e-4, Some(1.5e-4), false)
+            );
+            assert_eq!(l.encoder.unwrap().to_string(), "0.00015");
+        }
+        assert_eq!(typed.lr_line(10), "lr: 0.0001, encoder 0.00015 (set)");
+        // Other families: the typed rate only, never an encoder rate.
+        let y = TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap();
+        assert_eq!(y.effective_lr(10), None);
+        let y = TrainRecipe {
+            lr: Some(0.01),
+            ..y
+        };
+        assert_eq!(
+            y.effective_lr(10),
+            Some(LearningRate {
+                lr: 0.01,
+                encoder: None,
+                small_dataset: false
+            })
+        );
+        assert_eq!(y.lr_line(10), "lr: 0.01 (set)");
+    }
+
+    #[test]
+    fn rfdetr_anneals_half_its_patience_at_least_five_epochs() {
+        let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
+        assert_eq!((r.epochs, r.patience), (100, 10));
+        assert_eq!(r.anneal_epochs(), 5);
+        r.patience = 20;
+        assert_eq!(r.anneal_epochs(), 10);
+        r.patience = 15;
+        assert_eq!(r.anneal_epochs(), 8);
+        r.patience = 4;
+        assert_eq!(r.anneal_epochs(), 5);
+        // Early stopping off: nothing to anneal before.
+        r.patience = 0;
+        assert_eq!(r.anneal_epochs(), 0);
+        r.patience = 100;
+        assert_eq!(r.anneal_epochs(), 0);
+        // Other trainers' schedules already decay.
+        for f in [
+            TrainFamily::Yolo26,
+            TrainFamily::Yolo11,
+            TrainFamily::Yolov8,
+            TrainFamily::Rtdetrv2,
+            TrainFamily::Dfine,
+        ] {
+            let size = f.sizes()[0];
+            assert_eq!(TrainRecipe::new(f, size).unwrap().anneal_epochs(), 0, "{f}");
+        }
     }
 
     #[test]

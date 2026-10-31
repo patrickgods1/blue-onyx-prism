@@ -300,6 +300,8 @@ struct CompareCell {
 
 struct CompareRowView {
     name: String,
+    /// The training seed of a repeat (shown as `seed 1` beside the model).
+    seed: Option<u64>,
     model: String,
     scene: String,
     routed: bool,
@@ -312,7 +314,66 @@ struct CompareRowView {
     in_scope: String,
     ms: String,
     ms_best: bool,
+    /// Person recall, vehicle recall, false alerts ([`ALERT_COLUMNS`]).
+    alerts: Vec<AlertCell>,
 }
+
+/// The "mean of N seeds" row of a Comparison card.
+struct SeedSummaryView {
+    label: String,
+    model: String,
+    scene: String,
+    /// Day, night, IR, all, in scope, p50 ms, person R, vehicle R, false alerts: `mean (min-max)`.
+    cells: Vec<String>,
+}
+
+/// `0.412 (0.398-0.431)` of a [`compare::Spread`] with `decimals` places (`scale` 100 = percent).
+fn spread_text(s: Option<&compare::Spread>, decimals: usize, scale: f64, unit: &str) -> String {
+    s.map_or_else(
+        || "\u{2014}".into(),
+        |s| {
+            format!(
+                "{:.d$}{unit} ({:.d$}EN\u{2014}{:.d$}{unit})",
+                s.mean * scale,
+                s.min * scale,
+                s.max * scale,
+                d = decimals
+            )
+        },
+    )
+}
+
+fn seed_summary_view(sm: &compare::SeedSummary) -> SeedSummaryView {
+    let col =
+        |c: &str, d: usize, scale: f64, unit: &str| spread_text(sm.columns.get(c), d, scale, unit);
+    SeedSummaryView {
+        label: sm.label.clone(),
+        model: sm.model.clone(),
+        scene: sm.scene.clone(),
+        cells: vec![
+            col("day", 3, 1.0, ""),
+            col("night", 3, 1.0, ""),
+            col("ir", 3, 1.0, ""),
+            col("all", 3, 1.0, ""),
+            "\u{2014}".into(),
+            col("ms_p50", 1, 1.0, ""),
+            col("person_recall", 2, 1.0, ""),
+            col("vehicle_recall", 2, 1.0, ""),
+            col("false_alerts", 1, 100.0, "%"),
+        ],
+    }
+}
+
+/// One alerting cell of a comparison row: `0.39`, `3/130`, a dash when unknown.
+struct AlertCell {
+    text: String,
+    /// Hover text (the threshold, the false-alert rate).
+    title: String,
+    best: bool,
+}
+
+/// The alerting columns of the Comparison card, in table order ([`compare::COLUMNS`] ids).
+const ALERT_COLUMNS: [&str; 3] = ["person_recall", "vehicle_recall", "false_alerts"];
 
 /// The Comparison card of one `compare_group`.
 struct CompareCard {
@@ -322,6 +383,8 @@ struct CompareCard {
     comparable: bool,
     warnings: Vec<String>,
     rows: Vec<CompareRowView>,
+    /// "Mean of N seeds" rows (runs that differ only by training seed).
+    seed_summaries: Vec<SeedSummaryView>,
 }
 
 /// One axis checkbox of the Train form's Balance fieldset.
@@ -522,6 +585,23 @@ fn bench_text(b: Option<&BenchSummary>, err: Option<&str>) -> String {
             if let Some(a) = b.in_scope.as_ref().and_then(|a| a.ap50_95) {
                 s.push_str(&format!(" \u{b7} in scope {a:.3}"));
             }
+            // Alerting at the configured threshold (only the figures present).
+            let mut alerting = Vec::new();
+            if let Some(r) = b.person_recall.filter(|r| r.is_finite()) {
+                alerting.push(format!("person recall {r:.2}"));
+            }
+            if let Some(r) = b.vehicle_recall.filter(|r| r.is_finite()) {
+                alerting.push(format!("vehicle recall {r:.2}"));
+            }
+            if let (Some(a), Some(e)) = (b.empty_frame_alerts, b.empty_frames.filter(|e| *e > 0)) {
+                alerting.push(format!("false alerts {a}/{e} empty frames"));
+            }
+            if !alerting.is_empty() {
+                s.push_str(&format!(" \u{b7} {}", alerting.join(" \u{b7} ")));
+                if let Some(t) = b.threshold {
+                    s.push_str(&format!(" @ {t:.2}"));
+                }
+            }
             s
         }
         (None, Some(e)) => format!("benchmark failed: {e}"),
@@ -580,6 +660,7 @@ fn compare_run(r: &RunRecord) -> CompareRun {
             p.filter(|p| p.epoch > 0 && (r.state == RunState::Done || p.phase.is_some()))
                 .map(|p| p.epoch)
         }),
+        seed: r.request.train_seed,
         bench: r.benchmark.clone(),
     }
 }
@@ -651,6 +732,7 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
                     };
                     CompareRowView {
                         name: row.name.clone(),
+                        seed: row.seed,
                         model: row.model.clone(),
                         scene: row.scene.clone(),
                         routed: row.routed,
@@ -662,6 +744,17 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
                             .ms_p50
                             .map_or_else(|| "\u{2014}".into(), |m| format!("{m:.1}")),
                         ms_best: !row.routed && best(k, "ms_p50"),
+                        alerts: ALERT_COLUMNS
+                            .iter()
+                            .map(|col| {
+                                let (text, title) = alert_cell(row, col);
+                                AlertCell {
+                                    text,
+                                    title,
+                                    best: !row.routed && best(k, col),
+                                }
+                            })
+                            .collect(),
                     }
                 })
                 .collect();
@@ -671,9 +764,44 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
                 comparable: c.comparable,
                 warnings: c.warnings,
                 rows,
+                seed_summaries: c.seed_summaries.iter().map(seed_summary_view).collect(),
             }
         })
         .collect()
+}
+
+/// Text and hover text of alerting column `col` of a comparison row (a dash when the run has
+/// no such figure: not benchmarked, an older version, a routed row).
+fn alert_cell(row: &compare::Row, col: &str) -> (String, String) {
+    let at = row
+        .threshold
+        .map_or_else(String::new, |t| format!(" at threshold {t:.2}"));
+    let dash = || ("\u{2014}".to_string(), String::new());
+    match col {
+        "person_recall" | "vehicle_recall" => {
+            let v = if col == "person_recall" {
+                row.person_recall
+            } else {
+                row.vehicle_recall
+            };
+            v.filter(|v| v.is_finite()).map_or_else(dash, |v| {
+                (format!("{v:.2}"), format!("recall{at}, IoU 0.5"))
+            })
+        }
+        "false_alerts" => row.false_alerts.map_or_else(dash, |f| {
+            let rate = f
+                .rate()
+                .map_or_else(String::new, |r| format!(" ({:.1}%)", r * 100.0));
+            (
+                f.text(),
+                format!(
+                    "{} of {} frames without any object alerted{rate}{at}",
+                    f.alerts, f.empty_frames
+                ),
+            )
+        }),
+        _ => dash(),
+    }
 }
 
 /// `light: runs on a CPU ...` -> (`light`, `runs on a CPU ...`).
@@ -1226,16 +1354,23 @@ pub(crate) fn requests_from_form(
             .ok_or_else(|| anyhow::anyhow!("multi-scale: '{v}' is not auto, on or off"))?,
         None => recipe::MultiScale::Auto,
     };
+    let seeds: u64 = match num::<u64>(f, "seeds", "seeds")? {
+        None => 1,
+        Some(n @ 1..=3) => n,
+        Some(n) => anyhow::bail!("seeds: {n} is not 1 to 3"),
+    };
     let name = field(f, "name").map(str::to_string);
+    // A typed name works with one model x scene; its repeats get `-s<i>` (see `queue`).
     if name.is_some() && models.len() * scenes.len() > 1 {
         anyhow::bail!(
             "a model name works with one run only (one ticked model, one scene); clear it or \
              tick one of each"
         );
     }
-    // Several scenes: one comparison group for every run (same held-out frames, one table).
-    let compare_group =
-        (scenes.len() > 1).then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    // Several scenes or seeds: one comparison group for every run (same held-out frames, one
+    // table).
+    let compare_group = (scenes.len() as u64 * seeds > 1)
+        .then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
     let sets: Vec<String> = all(f, "benchmark_set")
         .into_iter()
         .filter(|s| EXTRA_SETS.contains(s))
@@ -1281,7 +1416,7 @@ pub(crate) fn requests_from_form(
         r.lr = lr;
         r.augment = augment;
         r.multi_scale = multi_scale;
-        out.push(TrainRequest {
+        let request = TrainRequest {
             recipe: r,
             datasets: data.datasets.clone(),
             include_public: data.include_public,
@@ -1296,7 +1431,15 @@ pub(crate) fn requests_from_form(
             excluded: data.excluded,
             balance: data.balance.clone(),
             compare_group: compare_group.clone(),
-        });
+            train_seed: None,
+        };
+        // Repeats train on the same frames (the assembly seed is the config's) with their own
+        // trainer seed.
+        for i in 0..seeds {
+            let mut req = request.clone();
+            req.train_seed = (seeds > 1).then_some(i);
+            out.push(req);
+        }
     }
     Ok((out, name))
 }
@@ -1553,6 +1696,7 @@ pub(crate) fn balance_preview_json(
                 excluded: data.excluded,
                 balance: data.balance.clone(),
                 compare_group: None,
+                train_seed: None,
             };
             match crate::training::preview_plan(config, &request) {
                 Ok(p) => serde_json::json!({
@@ -1781,8 +1925,17 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
             let mut names: Vec<String> = Vec::new();
             let mut jobs = Vec::new();
             for r in reqs {
-                let name = name.clone().unwrap_or_else(|| {
-                    let base = r.recipe.default_name(r.scene.label(), &stamp);
+                // Repeats of a seed beyond the first: `-s<i>` after the typed / default name.
+                let seed_suffix = match r.train_seed {
+                    Some(i) if i > 0 => format!("-s{i}"),
+                    _ => String::new(),
+                };
+                let typed = name.as_ref().map(|n| format!("{n}{seed_suffix}"));
+                let name = typed.unwrap_or_else(|| {
+                    let base = format!(
+                        "{}{seed_suffix}",
+                        r.recipe.default_name(r.scene.label(), &stamp)
+                    );
                     let dir = r.install_dir.as_deref().unwrap_or(&models_dir);
                     unique_name(&base, |n| {
                         names.iter().chain(&busy).any(|o| o.eq_ignore_ascii_case(n))
@@ -2276,6 +2429,53 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("benchmark devices"), "{e}");
+    }
+
+    #[test]
+    fn seeds_repeat_every_run_in_one_group() {
+        let f = form(&[
+            ("model", "yolo26n"),
+            ("dataset", "/x"),
+            ("scene", "day"),
+            ("scene", "night+ir"),
+            ("seeds", "3"),
+        ]);
+        let (reqs, name) = requests_from_form(&f, &mac(), &Default::default()).unwrap();
+        assert_eq!(name, None);
+        assert_eq!(reqs.len(), 6);
+        let seeds: Vec<Option<u64>> = reqs.iter().map(|r| r.train_seed).collect();
+        assert_eq!(
+            seeds,
+            [Some(0), Some(1), Some(2), Some(0), Some(1), Some(2)]
+        );
+        let group = reqs[0].compare_group.clone();
+        assert!(group.is_some() && reqs.iter().all(|r| r.compare_group == group));
+        // One scene, one model, three seeds: still a group; a typed name is allowed.
+        let f = form(&[
+            ("model", "yolo26n"),
+            ("dataset", "/x"),
+            ("seeds", "3"),
+            ("name", "cam"),
+        ]);
+        let (reqs, name) = requests_from_form(&f, &mac(), &Default::default()).unwrap();
+        assert_eq!((reqs.len(), name.as_deref()), (3, Some("cam")));
+        assert!(reqs[0].compare_group.is_some());
+        // One seed (the default): no train seed, no group.
+        for extra in [&[][..], &[("seeds", "1")][..]] {
+            let mut v = vec![("model", "yolo26n"), ("dataset", "/x")];
+            v.extend_from_slice(extra);
+            let (reqs, _) = requests_from_form(&form(&v), &mac(), &Default::default()).unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].train_seed, None);
+            assert_eq!(reqs[0].compare_group, None);
+        }
+        for bad in ["0", "4", "x"] {
+            let f = form(&[("model", "yolo26n"), ("dataset", "/x"), ("seeds", bad)]);
+            let e = requests_from_form(&f, &mac(), &Default::default())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("seeds"), "{e}");
+        }
     }
 
     #[test]
@@ -3158,6 +3358,7 @@ mod tests {
             excluded: Excluded::Background,
             balance: Default::default(),
             compare_group: group.map(str::to_string),
+            train_seed: None,
         };
         let benchmark = ap.map(|(d, n, i)| BenchSummary {
             datasets: vec![format!("heldout-{id}")],
@@ -3177,6 +3378,11 @@ mod tests {
             .collect(),
             in_scope: Some(scene_ap(d.max(n))),
             heldout_fingerprint: Some("f1".into()),
+            threshold: Some(0.5),
+            person_recall: Some(d),
+            vehicle_recall: None,
+            empty_frames: Some(40),
+            empty_frame_alerts: Some((10.0 * n).round() as usize),
         });
         RunRecord {
             id: id.into(),
@@ -3312,6 +3518,21 @@ mod tests {
         assert_eq!(r[2].cells[0].ap, "\u{2014}");
         assert_eq!(r[2].state, "running");
         assert!(r[3].routed && !r[3].cells[1].best);
+        // Alerting columns: person recall, vehicle recall (none recorded), false alerts.
+        let texts =
+            |k: usize| -> Vec<&str> { r[k].alerts.iter().map(|a| a.text.as_str()).collect() };
+        assert_eq!(texts(0), ["0.60", "\u{2014}", "2/40"]);
+        assert_eq!(texts(1), ["0.30", "\u{2014}", "5/40"]);
+        assert!(r[0].alerts[0].best && r[0].alerts[2].best && !r[0].alerts[1].best);
+        assert!(!r[1].alerts[0].best && !r[1].alerts[2].best);
+        assert_eq!(r[0].alerts[0].title, "recall at threshold 0.50, IoU 0.5");
+        assert_eq!(
+            r[0].alerts[2].title,
+            "2 of 40 frames without any object alerted (5.0%) at threshold 0.50"
+        );
+        assert_eq!(texts(2), ["\u{2014}"; 3], "the running run");
+        assert_eq!(texts(3), ["\u{2014}"; 3], "the routed row");
+        assert!(r[3].alerts.iter().all(|a| !a.best && a.title.is_empty()));
         // A different held-out set: not comparable, said so.
         let mut recs = recs;
         recs[3].benchmark.as_mut().unwrap().heldout_fingerprint = Some("f2".into());
@@ -3436,6 +3657,11 @@ mod tests {
         assert!(card.contains("day + night+ir routed"));
         assert!(card.contains("class=\"num best-val\""));
         assert!(!card.contains("cmp-solo"));
+        assert!(card.contains(">Person R</th>") && card.contains(">False alerts</th>"));
+        assert!(
+            card.contains("<td class=\"num best-val\" title=\"2 of 40 frames without any object alerted (5.0%) at threshold 0.50\">2/40</td>"),
+            "{card}"
+        );
         // The Runs checkboxes, Patience, the recommendation and the class picker's fields.
         assert!(page.contains("name=\"scene\" value=\"all\" data-prefix=\"custom\" checked>"));
         assert!(page.contains("name=\"scene\" value=\"night+ir\" data-prefix=\"night\">"));
@@ -3498,6 +3724,29 @@ mod tests {
             "{}",
             bench_text(Some(&b), None)
         );
+        // Alerting at the threshold: only the parts present.
+        b.threshold = Some(0.5);
+        b.person_recall = Some(0.391);
+        assert!(
+            bench_text(Some(&b), None)
+                .ends_with(" \u{b7} in scope 0.550 \u{b7} person recall 0.39 @ 0.50"),
+            "{}",
+            bench_text(Some(&b), None)
+        );
+        b.vehicle_recall = Some(0.666);
+        b.empty_frames = Some(130);
+        b.empty_frame_alerts = Some(0);
+        assert!(
+            bench_text(Some(&b), None).ends_with(
+                " \u{b7} person recall 0.39 \u{b7} vehicle recall 0.67 \u{b7} false alerts 0/130 empty \
+                 frames @ 0.50"
+            ),
+            "{}",
+            bench_text(Some(&b), None)
+        );
+        // No empty frames: no false-alert part.
+        b.empty_frames = Some(0);
+        assert!(bench_text(Some(&b), None).ends_with("vehicle recall 0.67 @ 0.50"));
     }
 
     #[test]

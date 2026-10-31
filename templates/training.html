@@ -487,7 +487,16 @@
         <div class="tr-field">
           <label for="train-imgsz">Input size</label>
           <input type="number" id="train-imgsz" name="imgsz" min="160" max="1536" step="32">
-          <p class="muted small">Empty = the size's own.</p>
+          <p class="muted small">Empty = the size's own. 384 is the RF-DETR Nano default. 512 or 640 finds distant people on 4 MP cameras better but costs about 1.8x / 2.8x inference time; check the held-out benchmark's ms on your slowest device.</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-seeds">Repeat with N seeds</label>
+          <select id="train-seeds" name="seeds">
+            <option value="1" selected>1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+          </select>
+          <p class="muted small">Repeats the run with different training seeds on the same frames; the Comparison card shows the spread. Differences of 2-3 mAP between seeds are noise.</p>
         </div>
         <div class="tr-field">
           <label for="train-multi-scale">Multi-scale (RF-DETR)</label>
@@ -527,7 +536,7 @@
 {% if !comparisons.is_empty() %}
 <div class="card" id="compare">
   <h2>Comparison</h2>
-  <p class="muted small">Runs queued together with several scenes, benchmarked on the same held-out frames. AP50-95 per scene of the held-out frames (AP50 beneath); <strong>bold</strong> = the best of the column. The routed row pairs the day run's day AP with the night run's night / IR AP, as a model with a night model would score (no combined AP is made up). JSON: <code>/v1/training/compare?group=&lt;group&gt;</code>.</p>
+  <p class="muted small">Runs queued together with several scenes or seeds, benchmarked on the same held-out frames. AP50-95 per scene of the held-out frames (AP50 beneath); <strong>bold</strong> = the best of the column. Person R / Vehicle R / False alerts: what alerting sees at the model's confidence threshold, over every held-out frame (highest recall, lowest false-alert rate are best). The routed row pairs the day run's day AP with the night run's night / IR AP, as a model with a night model would score (no combined AP is made up). JSON: <code>/v1/training/compare?group=&lt;group&gt;</code>.</p>
   {% for g in comparisons %}
   <details class="tr-compare"{% if g.open %} open{% endif %}>
     <summary>{{ g.group }} <span class="muted small">({{ g.rows.len() }} rows)</span>{% if !g.comparable %} <span class="chip chip-nc">not comparable</span>{% endif %}</summary>
@@ -535,16 +544,25 @@
     {% if !g.warnings.is_empty() %}<ul class="warn-list small">{% for w in g.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
     <div class="scroll">
     <table class="tr-ctable">
-      <thead><tr><th>Run</th><th>Scene</th><th class="num" title="AP50-95 on the day frames of the held-out set (AP50 beneath)">Day</th><th class="num" title="AP50-95 on the night frames">Night</th><th class="num" title="AP50-95 on the IR frames">IR</th><th class="num" title="AP50-95 on every held-out frame">All</th><th class="num" title="AP50-95 on the held-out frames of the scenes the run trained on">In scope</th><th class="num" title="Time per image, median">p50 ms</th><th>Epochs</th></tr></thead>
+      <thead><tr><th>Run</th><th>Scene</th><th class="num" title="AP50-95 on the day frames of the held-out set (AP50 beneath)">Day</th><th class="num" title="AP50-95 on the night frames">Night</th><th class="num" title="AP50-95 on the IR frames">IR</th><th class="num" title="AP50-95 on every held-out frame">All</th><th class="num" title="AP50-95 on the held-out frames of the scenes the run trained on">In scope</th><th class="num" title="Time per image, median">p50 ms</th><th class="num" title="Recall of person on every held-out frame at the confidence threshold the model runs with (IoU 0.5)">Person R</th><th class="num" title="Recall of vehicles (car, truck, bus merged: a car found as a truck counts) on every held-out frame at the threshold">Vehicle R</th><th class="num" title="Held-out frames without any object that alerted at the threshold / all such frames; best = the lowest rate">False alerts</th><th>Epochs</th></tr></thead>
       <tbody>
       {% for r in g.rows %}
       <tr{% if r.routed %} class="tr-routed"{% endif %}>
-        <td><code>{{ r.name }}</code><br><span class="muted small">{{ r.model }}{% if !r.state.is_empty() %} &middot; {{ r.state }}{% endif %}</span></td>
+        <td><code>{{ r.name }}</code><br><span class="muted small">{{ r.model }}{% if let Some(sd) = r.seed %} &middot; seed {{ sd }}{% endif %}{% if !r.state.is_empty() %} &middot; {{ r.state }}{% endif %}</span></td>
         <td>{{ r.scene }}</td>
         {% for c in r.cells %}<td class="num{% if c.best %} best-val{% endif %}"{% if c.images > 0 %} title="{{ c.images }} images"{% endif %}>{{ c.ap }}{% if !c.ap50.is_empty() %}<br><span class="muted small">AP50 {{ c.ap50 }}</span>{% endif %}</td>{% endfor %}
         <td class="num">{{ r.in_scope }}</td>
         <td class="num{% if r.ms_best %} best-val{% endif %}">{{ r.ms }}</td>
+        {% for c in r.alerts %}<td class="num{% if c.best %} best-val{% endif %}"{% if !c.title.is_empty() %} title="{{ c.title }}"{% endif %}>{{ c.text }}</td>{% endfor %}
         <td class="small">{{ r.epochs }}</td>
+      </tr>
+      {% endfor %}
+      {% for sm in g.seed_summaries %}
+      <tr class="tr-routed">
+        <td><strong>{{ sm.label }}</strong><br><span class="muted small">{{ sm.model }}</span></td>
+        <td>{{ sm.scene }}</td>
+        {% for c in sm.cells %}<td class="num small">{{ c }}</td>{% endfor %}
+        <td class="small">mean (min&ndash;max)</td>
       </tr>
       {% endfor %}
       </tbody>

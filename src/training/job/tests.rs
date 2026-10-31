@@ -297,6 +297,8 @@ fn job(
             excluded: Default::default(),
             balance: Default::default(),
             compare_group: None,
+            // A repeat: the trainer's seed differs from the assembly seed (options.seed 0).
+            train_seed: Some(2),
         },
         name: format!("night-{}-test", family.base_name(size)),
         paths: TrainPaths::new(root, root.join("models")),
@@ -439,6 +441,7 @@ fn a_run_trains_installs_registers_and_benchmarks() {
         "--family yolo26",
         "--size n",
         "--device mps",
+        "--seed 2",
         "--aug-dark 0.5",
         "--aug-gray 0.5",
         "--epochs 2",
@@ -681,6 +684,66 @@ fn out_of_memory_early_retries_at_half_the_batch_and_keeps_the_batch_that_ran() 
         arg_after(train, "--multi-scale").unwrap().to_str(),
         Some("on")
     );
+    // A tiny training split: RF-DETR's small-dataset learning rates. Patience 2 of 2 epochs is
+    // no early stop, so no anneal either.
+    for (k, v) in [
+        ("--lr", "0.00005"),
+        ("--lr-encoder", "0.000075"),
+        ("--anneal", "0"),
+    ] {
+        assert_eq!(arg_after(train, k).unwrap().to_str(), Some(v), "{k}");
+    }
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    assert!(
+        log.contains("# lr: 0.00005, encoder 0.000075 (")
+            && log.contains("training images < 1000: lower than RF-DETR's default"),
+        "{log}"
+    );
+}
+
+#[test]
+fn rfdetr_with_early_stopping_anneals_before_it_stops() {
+    let t = tmp("anneal");
+    let mut j = job(
+        &t.0,
+        TrainFamily::Rfdetr,
+        "nano",
+        cuda(),
+        Platform::LINUX_X64,
+    );
+    j.request.recipe.epochs = 30;
+    j.request.recipe.patience = 12;
+    j.request.recipe.patience_recommended = false;
+    j.request.recipe.lr = Some(2e-4);
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    r.unwrap();
+    let cmds = fake.train_cmds.lock().unwrap();
+    let train = cmds
+        .iter()
+        .rfind(|c| !c.display().contains("--self-check"))
+        .unwrap();
+    for (k, v) in [
+        ("--patience", "12"),
+        ("--anneal", "6"),
+        ("--lr", "0.0002"),
+        ("--lr-encoder", "0.0003"),
+    ] {
+        assert_eq!(arg_after(train, k).unwrap().to_str(), Some(v), "{k}");
+    }
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    assert!(
+        log.contains(
+            "patience 12 (set); mAP averaged over the last 3 epochs; at a stop point the \
+             learning rate is lowered over 6 more epochs, then training stops"
+        ),
+        "{log}"
+    );
+    assert!(log.contains("# lr: 0.0002, encoder 0.0003 (set)"), "{log}");
 }
 
 #[test]
@@ -1296,9 +1359,13 @@ fn finish_now_writes_the_stop_file_and_the_run_exports_its_best_epoch() {
         ("--min-epochs", "10"),
         ("--min-delta", "0.001"),
         ("--smooth", "3"),
+        ("--anneal", "0"),
     ] {
         assert_eq!(arg_after(&args, k).unwrap(), PathBuf::from(v), "{k}");
     }
+    // YOLO: no typed learning rate, none passed (no encoder rate for any YOLO).
+    assert!(arg_after(&args, "--lr").is_none());
+    assert!(arg_after(&args, "--lr-encoder").is_none());
     let stop = arg_after(&args, "--stop-file").unwrap();
     assert_eq!(PathBuf::from(&stop), stop_file(&t.0.join("training/a")));
     assert!(!stop.exists(), "the stale request was removed");
