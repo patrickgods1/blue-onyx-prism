@@ -207,15 +207,18 @@ fn model_options(c: &Config) -> Vec<ModelOption> {
 }
 
 /// Every device option, runnable first (downloadable ones count as not runnable here: the
-/// benchmark only measures what is installed).
+/// benchmark only measures what is installed). The saved devices are ticked; saved ones that
+/// cannot run here are left out, and with none left every runnable one is ticked (a saved
+/// `openvino:gpu.0` whose iGPU was switched off must not leave the page with nothing ticked).
 fn device_rows(snap: &DevicesSnapshot, c: &Config) -> Vec<DeviceOptionRow> {
+    let (ok, bad): (Vec<_>, Vec<_>) = snap.selection.options.iter().partition(|o| o.runnable);
     let chosen: Vec<String> = c
         .benchmark
         .devices
         .iter()
         .filter_map(|d| crate::backend::spec::parse(d).ok().map(|s| s.to_string()))
+        .filter(|d| ok.iter().any(|o| o.spec.to_string() == *d))
         .collect();
-    let (ok, bad): (Vec<_>, Vec<_>) = snap.selection.options.iter().partition(|o| o.runnable);
     ok.into_iter()
         .chain(bad)
         .map(|o| {
@@ -948,6 +951,35 @@ mod tests {
                 .expect("bench-charts.js")
                 .contains("function rocSvg")
         );
+    }
+
+    #[tokio::test]
+    async fn saved_devices_that_cannot_run_here_are_not_ticked() {
+        let st = state();
+        let ticked = |html: &str, spec: &str| html.contains(&format!("value=\"{spec}\" checked"));
+        // Only a vanished iGPU saved: every runnable device is ticked instead of none.
+        st.config
+            .update("test", |c| {
+                c.benchmark.devices = vec!["openvino:gpu.0".into()];
+                Ok(())
+            })
+            .unwrap();
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        assert!(ticked(&html, "openvino:cpu"), "{html}");
+        assert!(!html.contains("value=\"openvino:gpu.0\""), "{html}");
+        // Every saved one unavailable (ORT is not in this probe): the same, and a disabled box
+        // is never ticked.
+        st.config
+            .update("test", |c| {
+                c.benchmark.devices = vec!["openvino:gpu.0".into(), "ort:cpu".into()];
+                Ok(())
+            })
+            .unwrap();
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        assert!(ticked(&html, "openvino:cpu"), "{html}");
+        assert!(!ticked(&html, "ort:cpu"), "{html}");
+        let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
+        assert!(js.contains("Tick at least one device"));
     }
 
     #[tokio::test]
