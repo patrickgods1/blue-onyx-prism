@@ -49,6 +49,8 @@
   }
   var runMsg = $("run-msg");
   $("start").addEventListener("click", function () {
+    // No device field would make the server fall back to the saved devices, unseen here.
+    if (!form.querySelector("input[name=device]:checked")) { runMsg.textContent = "Tick at least one device to benchmark on."; return; }
     msg.textContent = "starting…"; runMsg.textContent = "";
     post("/v1/benchmark", formBody()).then(function (j) { msg.textContent = j.message; if (j.success) poll(); else runMsg.textContent = j.message; });
   });
