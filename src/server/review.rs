@@ -19,7 +19,7 @@
 //! [`Frame::resolve`] (404 otherwise); POST bodies are JSON (415 otherwise) with per-route size
 //! caps (413); the admin guard and the cross-site check of the router apply.
 
-use super::{AppState, blocking, encode_uri_component, render, save_config};
+use super::{AppState, Shared, blocking, encode_uri_component, render, save_config};
 use crate::collect::CollectSettings;
 #[cfg(test)]
 use crate::collect::labels::bulk::accept_one;
@@ -287,6 +287,11 @@ fn labels_answer(
     let is_saved = saved.is_some();
     let file = saved.unwrap_or_else(|| labels::prefill(&rec, classes, hidden));
     let version = labels::classes_version(classes);
+    let wanted = bulk::Wanted { classes, hidden };
+    let overlap_live: Vec<usize> = labels::overlaps::live(&file, Some(&wanted))
+        .iter()
+        .map(|l| l.index)
+        .collect();
     let q = encode_uri_component(&frame.rel.jpg());
     Json(serde_json::json!({
         "success": true,
@@ -299,6 +304,7 @@ fn labels_answer(
         "saved": is_saved,
         "revision": revision,
         "stale_classes": is_saved && !file.classes_version.is_empty() && file.classes_version != version,
+        "overlap_live": overlap_live,
         "labels": file,
         "classes": classes,
         "hidden": hidden,
@@ -1057,6 +1063,117 @@ pub(super) async fn reject_stacked(
             "overlaps_left_reviewed": left_reviewed,
         }))
         .into_response()
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuggestOverlapsBody {
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    scene: Option<String>,
+    #[serde(default)]
+    camera: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    gpu: Option<String>,
+    #[serde(default)]
+    allow_large: bool,
+    /// Also pairs with an answer.
+    #[serde(default)]
+    again: bool,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /v1/review/suggest-overlaps` with `{bucket?, scene?, camera?, label?, gpu?, allow_large?,
+/// again?, dry_run?}`: queue the overlap check ([`crate::training::overlaps`]) on the label files
+/// of the folder under review those filters select, reviewed frames too (no `source` or `status`
+/// narrows it, a reviewed frame need not be in the review queue). It writes suggestions and nothing
+/// else. `dry_run` only counts (`frames`, `pairs`, `crops`, `no_zoom`, `answered`, `passed_over`), and
+/// needs no GPU. Otherwise `{success, message, id}`, the task id in `GET /v1/training` `tasks[]`.
+pub(super) async fn suggest_overlaps(
+    State(shared): State<Shared>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    use crate::training::overlaps::{OverlapsRequest, plan_overlaps, select};
+    let b: SuggestOverlapsBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    blocking(move || {
+        let state = shared.current();
+        let mut req = match OverlapsRequest::parse(if b.again { "again=1" } else { "" }) {
+            Ok(r) => r,
+            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        };
+        for (k, v) in [
+            ("bucket", b.bucket),
+            ("scene", b.scene),
+            ("camera", b.camera),
+            ("label", b.label),
+        ] {
+            if let Some(v) = v.filter(|v| !v.trim().is_empty()) {
+                req.frames.query.insert(k.to_string(), v);
+            }
+        }
+        req.gpu = b.gpu;
+        req.allow_large = b.allow_large;
+        if let Err(e) = req.frames.filters() {
+            return fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
+        }
+        if b.dry_run {
+            let (dir, classes, _) = context(&state);
+            let hidden = hidden(&state);
+            let wanted = bulk::Wanted {
+                classes: &classes,
+                hidden: &hidden,
+            };
+            let s = match select::select(&dir, &req.frames, &wanted) {
+                Ok(s) => s,
+                Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            };
+            let message = (s.pairs == 0).then(|| {
+                format!(
+                    "No open overlap without an answer on these frames ({} pairs answered before,                      {} frames skipped or checked by a reviewer).",
+                    s.answered, s.passed_over
+                )
+            });
+            return Json(serde_json::json!({
+                "success": true,
+                "frames": s.frame_count,
+                "pairs": s.pairs,
+                "no_zoom": s.no_zoom,
+                "crops": s.crops,
+                "answered": s.answered,
+                "passed_over": s.passed_over,
+                "message": message,
+            }))
+            .into_response();
+        }
+        let config = state.config_read().clone();
+        let cap = crate::training::capability_now();
+        let job = match plan_overlaps(&config, req, &cap) {
+            Ok(j) => j,
+            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("Not queued: {e:#}")),
+        };
+        let title = crate::training::task::Task::title(&job);
+        match super::training::service(&shared).enqueue_task(Box::new(job)) {
+            Ok(id) => Json(serde_json::json!({
+                "success": true,
+                "id": id,
+                "message": format!(
+                    "Queued: {title}. It writes suggestions only: no box changes until you \
+                     confirm one here."
+                ),
+            }))
+            .into_response(),
+            Err(e) => fail(StatusCode::BAD_REQUEST, format!("Not queued: {e}")),
+        }
     })
     .await
 }
@@ -2355,6 +2472,96 @@ mod tests {
 
     fn get(uri: &str) -> Request<Body> {
         Request::get(uri).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn overlap_suggestions_round_trip_the_page_and_the_route_counts_every_status() {
+        use crate::collect::labels::overlaps::{Suggestion, Verdict};
+        let d = ds();
+        let rel = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+        let q = encode_uri_component(&rel);
+        let path = d
+            .dir
+            .join("ir/drive/2026-10-21/20261021T010203004Z_a.labels.json");
+        let car = |bbox: [f32; 4]| labels::LabelBox {
+            label: "car".into(),
+            bbox,
+            source: labels::Source::Auto,
+            score: Some(0.5),
+            state: labels::BoxState::Accepted,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: labels::AutoInfo::default(),
+        };
+        let (big, small) = ([0.0, 0.0, 40.0, 40.0], [5.0, 5.0, 25.0, 25.0]);
+        let s = Suggestion {
+            a: big,
+            b: small,
+            verdict: Verdict::DropB,
+            why: "A closer look found only the kept box".into(),
+            kept_score: Some(0.9),
+            other_score: Some(0.0),
+            low_confidence: false,
+            weak: false,
+        };
+        let f = LabelFile {
+            status: labels::Status::Reviewed,
+            reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+            boxes: vec![car(big), car(small)],
+            overlap_suggestions: vec![s.clone()],
+            ..LabelFile::default()
+        };
+        labels::write(&path, &f).unwrap();
+        let (_, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(l["overlap_live"], serde_json::json!([0]));
+        assert_eq!(l["labels"]["overlap_suggestions"][0]["verdict"], "drop_b");
+        // The page's save posts the file back as it read it.
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            l["revision"].as_str().unwrap()
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &l["labels"].to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["overlap_live"], serde_json::json!([0]));
+        let back = labels::read(&path).unwrap().unwrap();
+        assert_eq!(back.overlap_suggestions, [s]);
+
+        // Dry run: reviewed frames count; a pair with an answer does not, unless asked.
+        let body = r#"{"dry_run":true}"#;
+        let (st, v) = json(&d.state, post_json("/v1/review/suggest-overlaps", body)).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["pairs"].as_u64(), v["answered"].as_u64()),
+            (Some(0), Some(1))
+        );
+        assert!(v["message"].as_str().unwrap().contains("answered"));
+        let body = r#"{"dry_run":true,"again":true}"#;
+        let (_, v) = json(&d.state, post_json("/v1/review/suggest-overlaps", body)).await;
+        assert_eq!(
+            (v["frames"].as_u64(), v["pairs"].as_u64()),
+            (Some(1), Some(1))
+        );
+        assert_eq!(v["crops"], 1);
+        // A skipped frame is passed over.
+        let mut skipped = labels::read(&path).unwrap().unwrap();
+        skipped.status = labels::Status::Skipped;
+        labels::write(&path, &skipped).unwrap();
+        let (_, v) = json(&d.state, post_json("/v1/review/suggest-overlaps", body)).await;
+        assert_eq!(
+            (v["pairs"].as_u64(), v["passed_over"].as_u64()),
+            (Some(0), Some(1))
+        );
+        // A bad filter and an unknown field are refused.
+        let bad = r#"{"dry_run":true,"scene":"dusk"}"#;
+        let (st, _) = json(&d.state, post_json("/v1/review/suggest-overlaps", bad)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let bad = r#"{"status":"reviewed"}"#;
+        let (st, _) = json(&d.state, post_json("/v1/review/suggest-overlaps", bad)).await;
+        assert_ne!(st, StatusCode::OK);
     }
 
     #[tokio::test]

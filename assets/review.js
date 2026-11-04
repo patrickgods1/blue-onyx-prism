@@ -7,7 +7,9 @@
 // GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto and
 // "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
 // POST /v1/review/reject-other-class and "Reject stacked duplicates" POST /v1/review/reject-stacked
-// (all four: dry run, confirm, run).
+// (all four: dry run, confirm, run). *Suggest overlaps...* queues the overlap check
+// (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
+// the frame, and `y` accepts the one on screen.
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
 // a new folder reloads the page.
 // Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
@@ -187,10 +189,11 @@
   } catch (e) { /* the defaults */ }
   var viewCache = null;                // {img, key, canvas}: the adjusted frame
   var dups = { groups: [], of: {}, overlaps: [], near: {} };   // dupGroups, as of the last render
+  var suggestions = [];                // liveSuggestions, as of the last render
 
   var COLORS = {
     pending: '#e8d000', review: '#ffa000', hint: '#f08c00', accepted: '#2e9e4f',
-    added: '#1f6fe0', rejected: '#e53935'
+    added: '#1f6fe0', rejected: '#e53935', sugDrop: '#ff3df0', sugKeep: '#00e5ff'
   };
   var MAX_ZOOM = 8;
   var HANDLE_CSS = 5;   // half size of a resize handle, CSS pixels
@@ -447,6 +450,114 @@
     return best;
   }
 
+  // ---- overlap suggestions ------------------------------------------------------------------
+
+  function sameBbox(a, b) {
+    return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+  }
+
+  // The suggestions a reviewer can act on now, strongest first (as stored): of those the server
+  // calls live (`overlap_live`: labels/overlaps.rs `live`, which also knows a mapped spelling from a
+  // relabel), the ones still true after what happened on this page. The pair must still be open
+  // under its two bboxes (`dupGroups`: a moved, relabelled or rejected box ends it), a box to drop must
+  // not have become a drawn, moved or relabelled one, and a two-object suggestion not be accepted yet.
+  // [{index, s, a, b, drop, keep}]: box indices; drop and keep -1 for two objects. Reads `dups`.
+  // Twin of labels/overlaps.rs `live`: keep the two in step.
+  function liveSuggestions() {
+    var out = [];
+    var list = cur && cur.labels.overlap_suggestions, ok = cur && cur.overlap_live;
+    if (!list || !ok || cur.labels.overlaps_checked) return out;
+    var bs = boxes();
+    ok.forEach(function (n) {
+      var s = list[n];
+      if (!s || s._done) return;
+      (dups.overlaps || []).some(function (o) {
+        var i = o[0], j = o[1], a, b;
+        if (sameBbox(bs[i].bbox, s.a) && sameBbox(bs[j].bbox, s.b)) { a = i; b = j; }
+        else if (sameBbox(bs[j].bbox, s.a) && sameBbox(bs[i].bbox, s.b)) { a = j; b = i; }
+        else return false;
+        var drop = s.verdict === 'drop_a' ? a : (s.verdict === 'drop_b' ? b : -1);
+        var d = bs[drop];
+        if (d && (d.source === 'human' || d.orig_bbox || d._relabelled)) return false;
+        out.push({ index: n, s: s, a: a, b: b, drop: drop, keep: drop < 0 ? -1 : (drop === a ? b : a) });
+        return true;
+      });
+    });
+    return out;
+  }
+
+  // The suggestion on screen: the one about the selected box, else the strongest.
+  function shownSuggestion() {
+    return suggestions.filter(function (g) { return g.a === selected || g.b === selected; })[0] || suggestions[0] || null;
+  }
+
+  // The box to open a suggestion on: the one it would drop, else its first.
+  function suggestionBox(g) { return g.drop >= 0 ? g.drop : g.a; }
+
+  // 'drop', 'keep' or '' for box `i` under the suggestion on screen.
+  function suggestionRole(i) {
+    var g = shownSuggestion();
+    if (!g) return '';
+    if (i === g.drop) return 'drop';
+    return i === g.a || i === g.b ? 'keep' : '';
+  }
+
+  // A hint saving would reject stays through the save: accepted, so the object keeps a box.
+  function keepThrough(b) {
+    if (b.state === 'pending' && resolved(b) === 'rejected') b.state = 'accepted';
+    b._checked = true;
+  }
+
+  // `y`: the suggestion on screen. A drop rejects the box as a duplicate and keeps the other through
+  // the save; two objects keeps both (the save then records `overlaps_checked`). One undo step.
+  // Twin of labels/overlaps.rs `accept`: keep the two in step.
+  function acceptOverlap() {
+    if (!cur) return;
+    dups = dupGroups();
+    suggestions = liveSuggestions();
+    var g = shownSuggestion(), bs = boxes();
+    if (!g) { say('No overlap suggestion on this frame.'); return; }
+    snapshot();
+    var text;
+    if (g.drop >= 0) {
+      keepThrough(bs[g.keep]);
+      markDuplicate(bs[g.drop]);
+      text = 'Box ' + (g.drop + 1) + ' rejected as a duplicate of box ' + (g.keep + 1) + ' (z undoes).';
+    } else {
+      keepThrough(bs[g.a]);
+      keepThrough(bs[g.b]);
+      g.s._done = true;
+      text = 'Boxes ' + (g.a + 1) + ' and ' + (g.b + 1) + ' kept as two objects (z undoes).';
+    }
+    if (cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
+    dups = dupGroups();
+    suggestions = liveSuggestions();
+    var next = suggestions.length ? suggestionBox(suggestions[0]) : nextUndecided(-1);
+    select(next >= 0 ? next : (g.drop >= 0 ? g.keep : g.a), true);
+    say(text + (suggestions.length ? ' ' + suggestions.length + ' more suggestion(s) on this frame.' : ''));
+  }
+
+  // The decision bar's block: what is suggested, why, a warning in the weak band, the key.
+  function suggestionBlock() {
+    var g = shownSuggestion();
+    if (!g) return null;
+    var s = g.s, box = el('div', 'rv-q-sug');
+    box.appendChild(el('div', 'rv-q-sug-head', g.drop >= 0
+      ? 'Suggested: drop box ' + (g.drop + 1) + ', keep box ' + (g.keep + 1) + '.'
+      : 'Suggested: two objects, keep boxes ' + (g.a + 1) + ' and ' + (g.b + 1) + '.'));
+    if (s.why) box.appendChild(el('div', 'muted', s.why + '.'));
+    if (s.low_confidence) box.appendChild(el('div', 'rv-chip warn', 'Lower confidence: the closer look gave no answer, only the detectors count.'));
+    if (s.weak) {
+      box.appendChild(el('div', 'rv-chip bad', 'Look closely: something (' + fmtScore(s.other_score) +
+        ') was seen on the box to drop. 6 of 17 such drops removed a real object.'));
+    }
+    var row = el('div', 'rv-q-btns');
+    row.appendChild(decideButton(g.drop >= 0 ? 'Accept: drop box ' + (g.drop + 1) : 'Accept: keep both', 'y', 'ok', acceptOverlap));
+    if (suggestions.length > 1) row.appendChild(el('span', 'muted', (suggestions.length - 1) + ' more on this frame'));
+    box.appendChild(row);
+    return box;
+  }
+
   // A frame with unsaved edits asks before it is left.
   function leaveOk() {
     if (!cur || !dirty) return true;
@@ -668,7 +779,8 @@
       var color = COLORS[l] || '#ffffff';
       var dashed = l === 'rejected' || isHint(b);
       var sel = i === selected;
-      var dim = spot && !sel;
+      var role = suggestionRole(i);
+      var dim = spot && !sel && !role;
       ctx.save();
       var shown = isShown(b);
       ctx.globalAlpha = (l === 'rejected' ? 0.7 : 1) * (shown ? 1 : 0.2) * (dim ? 0.35 : 1);
@@ -691,6 +803,15 @@
         if (w > 2 * inset && h > 2 * inset) ctx.strokeRect(x + inset, y + inset, w - 2 * inset, h - 2 * inset);
         ctx.strokeStyle = color;
       }
+      if (role) {
+        // The pair of the suggestion on screen, outside the box: dashed around the box it drops.
+        var o = 2.5 * lw;
+        ctx.setLineDash(role === 'drop' ? [lw * 3, lw * 2] : []);
+        ctx.lineWidth = lw * 1.5;
+        ctx.strokeStyle = role === 'drop' ? COLORS.sugDrop : COLORS.sugKeep;
+        ctx.strokeRect(x - o, y - o, w + 2 * o, h + 2 * o);
+        ctx.strokeStyle = color;
+      }
       if (l === 'rejected') {
         ctx.setLineDash(dashed ? [lw * 4, lw * 3] : []);
         ctx.lineWidth = lw;
@@ -706,7 +827,8 @@
       var tag = showTags && shown && (full || !dim);
       if (tag) {
         if (full) ctx.globalAlpha = 1;
-        var text = (full || b.state === 'pending' || !b._checked) ? tagText(b, i) : String(i + 1);
+        var text = (role === 'drop' ? 'drop? ' : (role === 'keep' ? 'keep ' : '')) +
+          ((full || b.state === 'pending' || !b._checked) ? tagText(b, i) : String(i + 1));
         var tw = ctx.measureText(text).width + 2 * pad;
         // Above the box; at the frame top below it when there is room; else inside its top.
         var top;
@@ -946,6 +1068,8 @@
     if (b.state !== 'pending' && !b._checked) li.appendChild(el('span', 'rv-chip warn', 'to check'));
     if (dups.of[i] && dups.of[i].keeper !== i) li.appendChild(el('span', 'rv-chip warn', 'dup'));
     else if (dups.near[i] != null) li.appendChild(el('span', 'rv-chip warn', 'overlap'));
+    var role = suggestionRole(i);
+    if (role) li.appendChild(el('span', 'rv-chip ' + (role === 'drop' ? 'bad' : 'ok'), role === 'drop' ? 'drop?' : 'keep'));
     if (b.difficult) li.appendChild(el('span', 'rv-chip warn', 'unsure'));
     var rp = b.state === 'pending' ? repeatOf(b) : null;
     if (rp) li.appendChild(repeatChip(rp));
@@ -971,6 +1095,8 @@
     if (t) chips.appendChild(t);
     if (dups.of[i] && dups.of[i].keeper !== i) chips.appendChild(el('span', 'rv-chip warn', 'dup'));
     else if (dups.near[i] != null) chips.appendChild(el('span', 'rv-chip warn', 'overlap'));
+    var role = suggestionRole(i);
+    if (role) chips.appendChild(el('span', 'rv-chip ' + (role === 'drop' ? 'bad' : 'ok'), role === 'drop' ? 'drop?' : 'keep'));
     if (b.difficult) chips.appendChild(el('span', 'rv-chip warn', 'unsure'));
     if (b.state === 'rejected' && b.reject_reason) chips.appendChild(el('span', 'rv-chip bad', reasonText(b.reject_reason)));
     li.appendChild(chips);
@@ -985,6 +1111,7 @@
     boxList.textContent = '';
     var bs = boxes();
     dups = dupGroups();
+    suggestions = liveSuggestions();
     // Pending review boxes first; each keeps its number (the one on the canvas).
     var order = [];
     bs.forEach(function (b, i) { if (isReview(b)) order.push(i); });
@@ -1027,6 +1154,8 @@
   function renderDecision() {
     decide.textContent = '';
     if (!cur) return;
+    var sugBlock = suggestionBlock();
+    if (sugBlock) decide.appendChild(sugBlock);
     var p = progress();
     var b = boxes()[selected];
     if (!b) {
@@ -1530,6 +1659,7 @@
     snapshot();
     if (b.source !== 'human' && !b.model_label) b.model_label = b.label;
     b.label = label;
+    b._relabelled = true;
     b._checked = true;
     if (b.source !== 'human') b.state = 'accepted';
     if (cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
@@ -2006,6 +2136,10 @@
       view.z = 1; view.ox = 0; view.oy = 0;
       hoverIdx = -1;
       selected = nextUndecided(-1);
+      // A suggestion opens on the box it would drop.
+      dups = dupGroups();
+      suggestions = liveSuggestions();
+      if (suggestions.length) selected = suggestionBox(suggestions[0]);
       // Following (`x`): the new frame opens zoomed on its first box.
       if (view.follow && boxes()[selected]) zoomTo(boxes()[selected]);
       img = new Image();
@@ -2098,8 +2232,10 @@
     var dropped = status === 'reviewed' ? pendingDupDrops(dupGroups()) : [];
     dropped.forEach(function (k) { markDuplicate(body.boxes[k]); });
     // Proposals of a "don't want" class are not shown: rejected rather than resolved by default.
+    (body.overlap_suggestions || []).forEach(function (s) { delete s._done; });
     body.boxes.forEach(function (b) {
       delete b._checked;
+      delete b._relabelled;
       if (b.state === 'pending' && b.source !== 'human' && isHiddenClass(b.label)) {
         b.state = 'rejected';
         b.reason = 'other_class';
@@ -2233,9 +2369,22 @@
     if (filterTimer) clearTimeout(filterTimer);
     filterTimer = setTimeout(function () { filterTimer = null; filterReload(); }, 200);
   }
+  // Overlaps sit on reviewed frames too, and a reviewed frame need not be in the review queue: the
+  // Auto filter's "overlapping boxes" opens every status and every collected frame (both stay
+  // choosable afterwards).
+  function showOverlaps() {
+    var f = filtersForm.elements;
+    f.auto.value = 'overlaps';
+    f.status.value = 'any';
+    f.source.value = 'all';
+  }
   filtersForm.addEventListener('change', function (ev) {
     // The class picker reports through its own onChange (one reload per change).
     if (ev.target && ev.target.closest && ev.target.closest('.cp')) return;
+    if (ev.target && ev.target.name === 'auto' && ev.target.value === 'overlaps') {
+      showOverlaps();
+      say('Overlapping boxes: Status set to any and Frames to all collected, so reviewed frames show too.');
+    }
     filterReload();
   });
   filtersForm.addEventListener('submit', function (ev) { ev.preventDefault(); filterReload(); });
@@ -2264,6 +2413,7 @@
     ['Decide', '1-9, 0', null],
     ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps (stacked, nested or partly overlapping)'],
     ['Decide', 'Shift+U', 'stacked boxes: keep the best of each stack, reject the others as duplicates'],
+    ['Decide', 'y', 'overlap suggestion: accept the one on screen (drops the box marked drop?, as a duplicate; or keeps both as two objects). Doing anything else ignores it'],
     ['Decide', 'd', 'unsure: a real object you cannot name for sure (kept, left out of YOLO training, ignored by the benchmark set; ?! on the box); again: not unsure'],
     ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate)'],
     ['Decide', 'Shift+A', 'accept proposals: the pending boxes saving would accept (hints stay pending)'],
@@ -2395,6 +2545,7 @@
     else if (k === 'p') goBack();
     else if (k === 'd') toggleUnsure();
     else if (k === 'u') { if (ev.shiftKey) rejectDuplicates(); else rejectDupSelected(); }
+    else if (k === 'y') acceptOverlap();
     else if (k === '?') openKeys();
     else if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
       var step = ev.shiftKey ? 10 : 1;
@@ -2515,9 +2666,11 @@
     polling = null;
   }
 
-  function pollTask(id) {
+  // Follow task `id`; `box` and `bar` show it (default: the auto-label card's), `after(t)` runs when
+  // it ends.
+  function pollTask(id, box, bar, after) {
     stopPolling();
-    polling = { id: id, timer: setInterval(function () { tick(id); }, 3000) };
+    polling = { id: id, box: box || alStatus, bar: bar || alProgress, after: after, timer: setInterval(function () { tick(id); }, 3000) };
     tick(id);
   }
 
@@ -2528,18 +2681,20 @@
         if (!data || !polling || polling.id !== id) return;
         var t = (data.tasks || []).filter(function (x) { return x.id === id; })[0];
         if (!t) return;
-        if (t.state === 'queued' || t.state === 'running') {
-          report(alStatus, [describeTask(t)]);
-          alProgress.hidden = false;
-          alProgress.value = t.percent || 0;
+        var box = polling.box, bar = polling.bar, after = polling.after;
+        if (t.state === 'queued' || t.state === 'running' || t.state === 'paused') {
+          report(box, [describeTask(t)]);
+          bar.hidden = false;
+          bar.value = t.percent || 0;
           return;
         }
         stopPolling();
-        alProgress.hidden = true;
-        if (t.state === 'done') report(alStatus, ['Done: ' + (t.summary || t.title || 'auto-label finished')]);
-        else if (t.state === 'failed') report(alStatus, ['Failed: ' + (t.error || 'see the Training page.')]);
-        else report(alStatus, ['Cancelled.']);
-        alStatus.className = 'review-report ' + (t.state === 'done' ? 'ok-text' : 'error-text');
+        bar.hidden = true;
+        if (t.state === 'done') report(box, ['Done: ' + (t.summary || t.title || 'auto-label finished')]);
+        else if (t.state === 'failed') report(box, ['Failed: ' + (t.error || 'see the Training page.')]);
+        else report(box, [t.summary ? 'Cancelled: ' + t.summary : 'Cancelled.']);
+        box.className = 'review-report ' + (t.state === 'done' ? 'ok-text' : 'error-text');
+        if (after) after(t);
         reloadQueue();
       })
       .catch(function () {});
@@ -2621,10 +2776,11 @@
       .then(function (data) {
         if (!data || polling) return;
         var busyTasks = (data.tasks || []).filter(function (t) {
-          return t.kind === 'autolabel' && (t.state === 'queued' || t.state === 'running');
+          return (t.kind === 'autolabel' || t.kind === 'overlaps') && (t.state === 'queued' || t.state === 'running' || t.state === 'paused');
         });
         var t = busyTasks.filter(function (x) { return x.state === 'running'; })[0] || busyTasks[0];
-        if (t) pollTask(t.id);
+        if (t && t.kind === 'overlaps') followOverlaps(t.id);
+        else if (t) pollTask(t.id);
       })
       .catch(function () {});
   }
@@ -2822,6 +2978,57 @@
         box.className = 'review-report error-text';
         report(box, [e.message]);
       }).then(function () { otherBtn.disabled = false; });
+    });
+  }
+
+  // The overlap check: count, confirm, queue, follow. It writes suggestions only; the result line
+  // offers the queue of overlapping boxes.
+  function followOverlaps(id) {
+    var box = $('rv-suggest-msg');
+    pollTask(id, box, $('rv-suggest-progress'), function (t) {
+      if (t.state !== 'done') return;
+      box.appendChild(button('Show the overlapping frames', function () {
+        showOverlaps();
+        filterReload();
+      }));
+    });
+  }
+
+  var suggestBtn = $('rv-suggest-overlaps');
+  if (suggestBtn) {
+    suggestBtn.addEventListener('click', function () {
+      var box = $('rv-suggest-msg');
+      var body = {};
+      ['bucket', 'scene', 'camera', 'label'].forEach(function (k) {
+        var e = filtersForm.elements[k];
+        if (e && e.value) body[k] = e.value;
+      });
+      var large = $('rv-suggest-large');
+      if (large && large.checked) body.allow_large = true;
+      body.dry_run = true;
+      box.className = 'review-report';
+      report(box, ['Counting the pairs...']);
+      suggestBtn.disabled = true;
+      postJson('/v1/review/suggest-overlaps', body).then(function (j) {
+        if (!j.pairs) {
+          report(box, [j.message || 'No open overlap without a suggestion on these frames.']);
+          return null;
+        }
+        if (!window.confirm('Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included, ' +
+          'with RF-DETR L (' + j.crops + ' crops, on the training queue, about ' + Math.max(1, Math.ceil(j.crops * 0.08 / 60)) + ' min)? ' +
+          'It writes suggestions only: no box changes until you confirm one here.')) {
+          report(box, ['Nothing queued.']);
+          return null;
+        }
+        body.dry_run = false;
+        return postJson('/v1/review/suggest-overlaps', body).then(function (r) {
+          report(box, [r.message || 'Queued.']);
+          if (r.id) followOverlaps(r.id);
+        });
+      }).catch(function (e) {
+        box.className = 'review-report error-text';
+        report(box, [e.message]);
+      }).then(function () { suggestBtn.disabled = false; });
     });
   }
 
