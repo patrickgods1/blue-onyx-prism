@@ -260,6 +260,7 @@ pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
         status: Status::Reviewed,
         empty_confirmed: rects.is_empty(),
         boxes: out,
+        overlaps_checked: base.overlaps_checked,
         ..LabelFile::default()
     }
 }
@@ -478,6 +479,12 @@ mod tests {
         );
         assert_eq!(f.boxes[0].model_label.as_deref(), Some("person"));
         assert_eq!(f.boxes[0].bbox, [10.0, 10.0, 50.0, 88.0]);
+        let mut checked = base.clone();
+        checked.overlaps_checked = true;
+        assert!(
+            apply_import(checked, &rects).overlaps_checked,
+            "the reviewer's look survives the rebuild"
+        );
         let empty = apply_import(base, &[]);
         assert!(empty.empty_confirmed);
         assert_eq!(empty.training().count(), 0);

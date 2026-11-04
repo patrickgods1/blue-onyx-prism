@@ -8,7 +8,9 @@
 //! the pending model and auto boxes of unwanted classes, outside `collect.classes` or in
 //! `collect.hidden_classes`, `reason: other_class`; aliases renamed to the list's spelling),
 //! `POST /v1/review/reject-unwanted-reviewed` (the accepted boxes of unwanted classes on
-//! reviewed frames, on request), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
+//! reviewed frames, on request), `POST /v1/review/reject-stacked` (the duplicates of stacked
+//! boxes on reviewed and unreviewed frames, `reason: duplicate`; overlapping boxes are left to a
+//! reviewer, `auto=overlaps`), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
 //! benchmark set), `POST /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes`
 //! (`collect.classes` and `collect.hidden_classes`; classes that become unwanted have their
 //! pending boxes rejected right away) and `GET /v1/review/class-catalog` (the class picker's
@@ -227,12 +229,13 @@ pub(super) async fn next(
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
 ) -> Response {
     let q = query_map(query);
-    let filters = match Filters::from_query(&q) {
+    let mut filters = match Filters::from_query(&q) {
         Ok(f) => f,
         Err(e) => return fail(StatusCode::BAD_REQUEST, e),
     };
     blocking(move || {
-        let (dir, _, _) = context(&state);
+        let (dir, classes, _) = context(&state);
+        filters.wanted = Some((classes, hidden(&state)));
         let built = queue::build(&dir, &filters);
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
         let found = queue::next_after(&built.items, after);
@@ -937,6 +940,121 @@ pub(super) async fn accept_repeats(
             "failed": o.failed,
             "frames": o.done,
             "message": message,
+        }))
+        .into_response()
+    })
+    .await
+}
+
+/// `POST /v1/review/reject-stacked` with `{bucket?, scene?, camera?, label?, source?, dry_run,
+/// limit?}`: on the reviewed and unreviewed frames with a label file that the bucket, scene, camera
+/// and class filters select, the boxes stacked on a better box of the object (IoU >= 0.7) are
+/// rejected (`reject_reason: duplicate`, kept as evidence; [`bulk::bulk_reject_stacked`]), at most
+/// `limit` frames (default 500). The frames keep their status; drawn boxes and frames a reviewer
+/// checked (`overlaps_checked`) are left alone. `source` is checked but does not narrow the walk: a
+/// reviewed frame need not be in the review queue. `dry_run` only counts. `boxes` counts the boxes
+/// rejected, `rejected` the frames changed (as reject-low), `overlaps_left` the frames that still
+/// need a reviewer once the duplicates are gone (nested or overlapping boxes no rule can settle:
+/// `auto=overlaps`), in a dry run too.
+pub(super) async fn reject_stacked(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: RejectOtherClassBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
+    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        );
+    }
+    let q: BTreeMap<String, String> = [
+        ("bucket", b.bucket),
+        ("scene", b.scene),
+        ("camera", b.camera),
+        ("label", b.label),
+        ("source", b.source),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+    .collect();
+    let filters = match Filters::from_query(&q) {
+        Ok(f) => f,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let dry_run = b.dry_run;
+    blocking(move || {
+        let (dir, classes, _) = context(&state);
+        let hidden = hidden(&state);
+        let wanted = bulk::Wanted {
+            classes: &classes,
+            hidden: &hidden,
+        };
+        let done = bulk::bulk_reject_stacked(&dir, &filters, &wanted, limit, dry_run, &|_| true);
+        let (o, left, left_reviewed) = (
+            done.outcome,
+            done.overlaps_left,
+            done.overlaps_left_reviewed,
+        );
+        let mut message = if o.boxes == 0 {
+            "No stacked duplicates on the frames these filters select.".to_string()
+        } else if dry_run {
+            format!(
+                "Would reject {} stacked duplicate box(es) on {} frame(s); the frames keep their \
+                 status.",
+                o.boxes, o.eligible
+            )
+        } else {
+            format!(
+                "Rejected {} stacked duplicate box(es) on {} frame(s) (kept as evidence, reason \
+                 duplicate; reviewed frames stay reviewed).",
+                o.boxes, o.done_count
+            )
+        };
+        if o.failed_count > 0 {
+            message.push_str(&format!(
+                " {} frame(s) not changed (listed); review them by hand.",
+                o.failed_count
+            ));
+        }
+        if !dry_run && o.eligible > limit {
+            message.push_str(&format!(
+                " {} more frame(s) beyond the limit of {limit}; run it again.",
+                o.eligible - limit
+            ));
+        }
+        if left > 0 {
+            message.push_str(&format!(
+                " {left} frame(s) still have overlapping boxes no rule can settle, \
+                 {left_reviewed} of them reviewed (those are the ones training uses): set Auto \
+                 to overlapping boxes, Status to reviewed and Frames to all collected, then keep \
+                 or reject them by hand."
+            ));
+        }
+        if !dry_run {
+            tracing::info!(
+                boxes = o.boxes,
+                frames = o.done_count,
+                failed = o.failed_count,
+                eligible = o.eligible,
+                overlaps_left = left,
+                "review: stacked duplicates rejected"
+            );
+        }
+        Json(serde_json::json!({
+            "success": true,
+            "eligible": o.eligible,
+            "boxes": o.boxes,
+            "rejected": o.done_count,
+            "failed": o.failed,
+            "frames": o.done,
+            "message": message,
+            "overlaps_left": left,
+            "overlaps_left_reviewed": left_reviewed,
         }))
         .into_response()
     })
@@ -2756,6 +2874,161 @@ mod tests {
             r#"{{"min_score": 0.3, "camera": "{}"}}"#,
             "x".repeat(SMALL_BODY_LIMIT)
         );
+        let (s, _) = json(&d.state, post_json(uri, &big)).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn reject_stacked_spans_reviewed_frames_and_counts_what_is_left() {
+        use crate::collect::labels::bulk::test_support::{
+            auto_box, labels_of, put_frame, put_frame_at,
+        };
+        use labels::{BoxState, RejectReason, Status, Triage};
+        let car = |bbox: [f32; 4], score: f32| labels::LabelBox {
+            bbox,
+            state: BoxState::Accepted,
+            ..auto_box("car", score, Triage::Accept)
+        };
+        let (a, near, small) = (
+            [0.0, 0.0, 40.0, 40.0],
+            [0.0, 0.0, 40.0, 38.0],
+            [5.0, 5.0, 25.0, 25.0],
+        );
+        let d = ds_with(|c| {
+            c.collect.classes = ["person", "car"].map(String::from).to_vec();
+        });
+        let reviewed = put_frame(
+            &d.dir,
+            "r",
+            None,
+            vec![car(a, 0.9), car(near, 0.4), car(small, 0.3)],
+        );
+        let other = put_frame_at(
+            &d.dir,
+            "drive",
+            "o",
+            (64, 48),
+            None,
+            vec![car(a, 0.9), car(near, 0.4)],
+        );
+        for rel in [&reviewed, &other] {
+            let frame = Frame::resolve(&d.dir, rel).unwrap();
+            let mut f = labels_of(&d.dir, rel);
+            f.status = Status::Reviewed;
+            f.reviewed_at = Some("2026-10-01T00:00:00Z".into());
+            labels::write(&frame.labels, &f).unwrap();
+        }
+
+        let uri = "/v1/review/reject-stacked";
+        let (s, v) = json(&d.state, post_json(uri, r#"{"dry_run": true}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (
+                v["eligible"].as_u64(),
+                v["boxes"].as_u64(),
+                v["rejected"].as_u64(),
+                v["overlaps_left"].as_u64()
+            ),
+            (Some(2), Some(2), Some(0), Some(1)),
+            "{v}"
+        );
+        assert!(
+            v["message"].as_str().unwrap().contains("Would reject 2"),
+            "{v}"
+        );
+        assert_eq!(
+            labels_of(&d.dir, &reviewed).boxes[1].state,
+            BoxState::Accepted,
+            "a dry run writes nothing"
+        );
+
+        // One camera first; the page's Frames filter does not narrow it.
+        let one = r#"{"camera": "drive", "source": "queue"}"#;
+        let (s, v) = json(&d.state, post_json(uri, one)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["rejected"], 1, "{v}");
+        assert_eq!(v["overlaps_left"], 0, "{v}");
+        assert_eq!(
+            labels_of(&d.dir, &reviewed).boxes[1].state,
+            BoxState::Accepted,
+            "another camera"
+        );
+
+        let (s, v) = json(&d.state, post_json(uri, "{}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (
+                v["eligible"].as_u64(),
+                v["boxes"].as_u64(),
+                v["rejected"].as_u64(),
+                v["overlaps_left"].as_u64()
+            ),
+            (Some(1), Some(1), Some(1), Some(1)),
+            "{v}"
+        );
+        assert_eq!(v["failed"], serde_json::json!([]));
+        assert_eq!(v["frames"], serde_json::json!([reviewed.clone()]));
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.contains("Rejected 1 stacked") && m.contains("overlapping boxes"),
+            "{m}"
+        );
+        let f = labels_of(&d.dir, &reviewed);
+        assert_eq!(f.status, Status::Reviewed);
+        assert_eq!(f.reviewed_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+        assert_eq!(f.boxes[1].state, BoxState::Rejected);
+        assert_eq!(f.boxes[1].reject_reason, Some(RejectReason::Duplicate));
+        assert_eq!(f.boxes[2].state, BoxState::Accepted, "nested: a reviewer's");
+
+        // Run again: nothing to do, the overlap still waits. The queue's filter finds it.
+        let (_, v) = json(&d.state, post_json(uri, "{}")).await;
+        assert_eq!(
+            (
+                v["eligible"].as_u64(),
+                v["rejected"].as_u64(),
+                v["overlaps_left"].as_u64()
+            ),
+            (Some(0), Some(0), Some(1)),
+            "{v}"
+        );
+        let next = "/v1/review/next?auto=overlaps&status=reviewed";
+        let (s, v) = json(
+            &d.state,
+            Request::builder().uri(next).body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["item"]["frame"], serde_json::json!(reviewed), "{v}");
+        assert_eq!(v["total"], 1, "{v}");
+
+        // Bad requests.
+        for (body, field) in [
+            (r#"{"min_score": 0.3}"#, "unknown field"),
+            (r#"{"limit": 0}"#, "limit"),
+            (r#"{"limit": 20001}"#, "limit"),
+            (r#"{"scene": "dusk"}"#, "scene"),
+            (r#"{"source": "nope"}"#, "source"),
+            (r#"{"dry_run": "yes"}"#, "invalid JSON body"),
+        ] {
+            let (s, v) = json(&d.state, post_json(uri, body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert!(
+                v["message"].as_str().unwrap().contains(field),
+                "{body}: {v}"
+            );
+        }
+        let mut req = post_json(uri, "{}");
+        req.headers_mut()
+            .insert("origin", "http://evil.example".parse().unwrap());
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let req = super::super::test_util::from_peer(
+            post_json(uri, "{}"),
+            super::super::test_util::REMOTE,
+        );
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let big = format!(r#"{{"camera": "{}"}}"#, "x".repeat(SMALL_BODY_LIMIT));
         let (s, _) = json(&d.state, post_json(uri, &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
     }

@@ -333,7 +333,8 @@ folder; the collector and the Dataset page keep `collect.dir`.
   Shift+1-9 after `r`): `false_positive`, `duplicate`, `insect_web`, `rain_snow`, `ir_glare`,
   `reflection`, `static_object`, `other_object`, `too_small`. Absent = a plain false positive; a
   value this build does not know (a newer build's) loads and is written back unchanged (the API refuses
-  one it is sent). Separate from `reason`, which is provenance. Copied to `hard_negatives.json`.
+  one it is sent). Separate from `reason`, which is provenance. Copied to `hard_negatives.json`, which
+  leaves out `duplicate` boxes (they sit on real objects).
 - **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
   cannot have accepted or added boxes.
 - **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
@@ -353,6 +354,10 @@ folder; the collector and the Dataset page keep `collect.dir`.
   rejected or accepted carry `reason: repeat_spot` when they had no provenance. With no pending box left
   the frame is *repeat-only*: last in the queue, `auto=repeats`, saved in bulk by `POST
   /v1/review/accept-repeats`. Cleared once the frame is reviewed or skipped.
+- **`overlaps_checked`** (written only when true): the reviewer saved the frame as reviewed with stacked
+  or overlapping boxes still on it, so they looked and kept them (two real nested cars). `auto=overlaps`
+  passes the frame over and `POST /v1/review/reject-stacked` leaves it alone. Kept by saves; cleared when
+  a merge adds a box.
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
   box itself, all optional:
 
@@ -522,6 +527,23 @@ frame accept-ready when they were all that kept it out. `dry_run` answers `{succ
 relabelled, rejected: 0, frames, reviewed_with_unwanted}`; otherwise `{success, eligible, boxes,
 relabelled, rejected, failed, frames, message, reviewed_with_unwanted}` (`boxes` rejected or renamed,
 `relabelled` the renamed ones among them, `rejected` frames changed).
+
+`POST /v1/review/reject-stacked` (JSON `{bucket?, scene?, camera?, label?, source?, dry_run, limit?}`;
+the Review page's *Reject stacked duplicates*) walks every label file those filters select, reviewed
+frames too (`source` is checked but does not narrow it). A stack is boxes of one object (the same label,
+or two of car / truck / bus / van), neither rejected nor unwanted, at IoU >= 0.7; a chain is one stack.
+The keeper is the drawn box, else a reviewer-edited one, else an accepted one, else a pending one (a hint
+saving would reject last), then the highest score. The others get `state: rejected`, `reject_reason:
+"duplicate"`, `difficult` off and `reason: "duplicate"` when they had none. `human` boxes are never
+rejected; skipped frames and frames with `overlaps_checked` are left alone; the frame's status and
+`reviewed_at` do not change. Nested or partly overlapping boxes (IoU >= 0.5, or the smaller >= 80% inside
+the larger) are never taken: `auto=overlaps` lists them, and any stack still left, for a reviewer. Both
+`dry_run` and a run answer `{success, eligible, boxes, rejected, failed, frames, message, overlaps_left,
+overlaps_left_reviewed}` (`boxes` rejected, `rejected` frames changed, `overlaps_left` the frames
+`auto=overlaps` would still list once the duplicates are gone, `overlaps_left_reviewed` the reviewed ones
+among them). A save as reviewed, Shift+A and the bulk accept reject pending boxes stacked
+on a better one the same way. A duplicate sits on a real object: it is left out of `hard_negatives.json`,
+the rejected-box count and the per-camera repeat history.
 
 `POST /v1/review/reject-unwanted-reviewed` (JSON `{dry_run, limit?}`, `limit` 1..20000, default 20000)
 rejects the accepted and added boxes of unwanted classes on every reviewed label file of the folder under

@@ -37,7 +37,7 @@
     <label>Scene <select name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></label>
     <label>Camera <select name="camera" id="rv-camera"><option value="">any</option></select></label>
     <div class="rv-label-filter"><span class="field-label" id="rv-label-cap">Class</span> <div id="rv-label-picker" aria-labelledby="rv-label-cap"><select id="rv-label-fallback" aria-label="Class"><option value="">any</option>{% for c in classes %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></div><input type="hidden" name="label" id="rv-label" value=""></div>
-    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option><option value="repeats">only repeats left</option></select></label>
+    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option><option value="repeats">only repeats left</option><option value="overlaps">overlapping boxes</option></select></label>
     <label>Status <select name="status"><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select></label>
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
   </form>
@@ -133,6 +133,11 @@
     <span class="muted">Pending model and auto boxes of classes you do not want (not in the class list, or marked <em>don't want</em> under Classes), on the unreviewed frames the filters select, are rejected (reason <code>other_class</code>, kept as evidence); a class of the list under another spelling (<code>pottedplant</code>) is renamed instead. Asks first, then asks about reviewed frames that still hold accepted boxes of them.</span>
   </div>
   <div id="rv-reject-other-msg" class="review-report" role="status"></div>
+  <div class="inline-row">
+    <button type="button" id="rv-reject-stacked" class="small secondary">Reject stacked duplicates&hellip;</button>
+    <span class="muted">Near-identical boxes of one object on the frames the Bucket, Scene, Camera and Class filters select, <strong>reviewed frames too</strong> (the Frames filter does not narrow it): the best box of each stack stays and the others are rejected as duplicates (kept as evidence, frames stay reviewed, drawn boxes never rejected), while nested or partly overlapping boxes wait for you under Auto <em>overlapping boxes</em>. Asks first.</span>
+  </div>
+  <div id="rv-reject-stacked-msg" class="review-report" role="status"></div>
 </div>
 
 <div class="card">

@@ -418,7 +418,8 @@ pub struct ExportReport {
     pub val: usize,
     pub empty_confirmed: usize,
     pub per_class: BTreeMap<String, u64>,
-    /// Rejected model / auto boxes listed in `hard_negatives.json`.
+    /// Rejected model / auto boxes listed in `hard_negatives.json` (duplicates sit on real objects
+    /// and are left out, [`LabelFile::hard_negatives`]).
     pub hard_negative_boxes: usize,
     /// Groups and their split.
     pub splits: Vec<GroupSplit>,
@@ -802,7 +803,7 @@ pub fn run_filtered(
     let negatives: Vec<serde_json::Value> = frames
         .iter()
         .flat_map(|f| {
-            f.labels.rejected().map(move |b| {
+            f.labels.hard_negatives().map(move |b| {
                 serde_json::json!({
                     "frame": f.rel.jpg(),
                     "file": f.name,
@@ -1336,6 +1337,11 @@ mod tests {
                     ..lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Rejected)
                 },
                 lb("dog", [70.0, 1.0, 90.0, 20.0], BoxState::Rejected),
+                // A second box on the accepted person: no false positive.
+                LabelBox {
+                    reject_reason: Some(super::super::RejectReason::Duplicate),
+                    ..lb("person", [30.0, 4.0, 60.0, 39.0], BoxState::Rejected)
+                },
             ],
             false,
         );
@@ -1348,7 +1354,7 @@ mod tests {
             hidden_classes: Vec::new(),
         };
         let r = run(&dir, &classes(), &req).unwrap();
-        assert_eq!(r.hard_negative_boxes, 2);
+        assert_eq!(r.hard_negative_boxes, 2, "the duplicate is left out");
         let neg: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(root.join("out/hard_negatives.json")).unwrap(),
         )
