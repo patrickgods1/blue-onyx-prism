@@ -12,6 +12,7 @@
 //!   tags, classes); `POST /v1/benchmark/threshold-search`: the exact confidence-threshold
 //!   search over the stored predictions (no inference; [`crate::benchmark::search`]);
 //! - `POST /v1/benchmark/settings`: save the form as the `benchmark` config defaults;
+//! - `POST /v1/benchmark/datasets/remove`: drop one saved folder dataset from those defaults;
 //! - `POST /v1/benchmark/report`: save the HTML report of the saved results into a chosen
 //!   folder (`report`);
 //! - `GET /v1/benchmark/images?model=&device=`: per-image drill-down (ground truth and
@@ -37,7 +38,7 @@ use apply::BLUE_IRIS_THRESHOLD_NOTE;
 pub(super) use apply::{apply, apply_profiles, apply_threshold, search_options, threshold_search};
 pub(super) use history::{history_compare, history_delete, history_get, history_pin};
 pub(super) use report::save_report;
-pub(super) use run::{cancel, image_file, images_detail, settings, start};
+pub(super) use run::{cancel, image_file, images_detail, remove_dataset, settings, start};
 
 use super::{AppState, DevicesSnapshot, devices_snapshot, global_device_label, render};
 use crate::benchmark::images::{self, ImageSet};

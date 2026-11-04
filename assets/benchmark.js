@@ -80,9 +80,8 @@
   });
   form.querySelectorAll("[data-remove-folder]").forEach(function (b) {
     b.addEventListener("click", function () {
-      var v = b.dataset.removeFolder, body = formBody(); body.delete("dataset");
-      form.querySelectorAll("input[name=dataset]:checked").forEach(function (c) { if (c.value !== v) body.append("dataset", c.value); });
-      post("/v1/benchmark/settings", body).then(function (j) { runMsg.textContent = j.message; if (j.success) L.reloadKeep(); });
+      // Not the settings form: it keeps the saved list when no dataset is left, and checks the rest.
+      post("/v1/benchmark/datasets/remove", new URLSearchParams({dataset: b.dataset.removeFolder})).then(function (j) { runMsg.textContent = j.message; if (j.success) L.reloadKeep(); });
     });
   });
 
