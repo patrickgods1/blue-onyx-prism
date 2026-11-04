@@ -684,6 +684,9 @@ fn stages(
     for w in &prepared.warnings {
         log.line(&format!("dataset: {w}"));
     }
+    if let Some(t) = dataset::valid_groups_text(&prepared.valid_groups) {
+        log.line(&format!("dataset: {t}"));
+    }
     if let Some(b) = &prepared.balance_summary {
         log.line(&format!("dataset: balanced: {b}"));
     }
@@ -726,9 +729,10 @@ fn stages(
             "# training seed {seed} (the frames are the same for every seed)"
         ));
     }
-    // RF-DETR on a small training split: a lower learning rate than rfdetr's default.
-    let lr = recipe.effective_lr(prepared.train_images);
-    log.line(&format!("# {}", recipe.lr_line(prepared.train_images)));
+    // RF-DETR on a small training split: a lower learning rate than rfdetr's default. Unique
+    // frames: balancing repeats do not make a dataset larger.
+    let lr = recipe.effective_lr(prepared.train_frames);
+    log.line(&format!("# {}", recipe.lr_line(prepared.train_frames)));
     if !recipe.early_stopping() {
         let w = format!(
             "early stopping is off (patience {} of {} epochs): every epoch runs; the best one is \

@@ -718,9 +718,52 @@ fn out_of_memory_early_retries_at_half_the_batch_and_keeps_the_batch_that_ran() 
     let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
     assert!(
         log.contains("# lr: 0.00005, encoder 0.000075 (")
-            && log.contains("training images < 1000: lower than RF-DETR's default"),
+            && log.contains("unique training frames < 1000: lower than RF-DETR's default"),
         "{log}"
     );
+}
+
+/// Balancing repeats frames; the learning rate and its log line count each frame once.
+#[test]
+fn the_learning_rate_log_counts_unique_frames_under_balancing() {
+    let t = tmp("lr-unique");
+    let mut j = job(
+        &t.0,
+        TrainFamily::Rfdetr,
+        "nano",
+        mps(),
+        Platform::MACOS_ARM64,
+    );
+    // More cats than raccoons, on another day.
+    let exp = t.0.join("export");
+    for i in 0..9 {
+        let stem = format!("ir.yard.2026-10-03.2026100{i}T000000000Z_c{i}");
+        jpg(&exp.join("images").join(format!("{stem}.jpg")));
+        std::fs::write(
+            exp.join("labels").join(format!("{stem}.txt")),
+            "0 0.5 0.5 0.2 0.2\n",
+        )
+        .unwrap();
+    }
+    j.request.balance = dataset::Balance {
+        axes: dataset::Balance::parse_axes("class").unwrap(),
+        strength: 1.0,
+        ..dataset::Balance::default()
+    };
+    let fake = TrainFake::new();
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let p = r.unwrap().prepared;
+    assert!(p.train_images > p.train_frames, "{p:?}");
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    assert!(
+        log.contains(&format!(
+            "({} unique training frames < 1000: lower than RF-DETR's default",
+            p.train_frames
+        )),
+        "{log}"
+    );
+    let groups = dataset::valid_groups_text(&p.valid_groups).unwrap();
+    assert!(log.contains(&format!("dataset: {groups}")), "{log}");
 }
 
 #[test]

@@ -446,7 +446,9 @@ fn the_run_records_the_balance_summary_of_its_dataset() {
         dir: PathBuf::from("/runs/r1/data"),
         classes: vec!["person".into(), "raccoon".into()],
         train_images: 412,
+        train_frames: 209,
         valid_images: 40,
+        valid_groups: vec!["yard/2026-10-01".into()],
         heldout_dir: Some(PathBuf::from("/runs/r1/heldout")),
         heldout_images: 60,
         heldout_fingerprint: "f1".into(),
@@ -457,6 +459,8 @@ fn the_run_records_the_balance_summary_of_its_dataset() {
     };
     let d = DatasetCounts::of(&p);
     assert_eq!(d.train_images, 412);
+    assert_eq!(d.train_frames, 209);
+    assert_eq!(d.valid_groups, p.valid_groups);
     assert_eq!(d.heldout_dir, p.heldout_dir);
     assert_eq!(d.balance_summary, p.balance_summary);
     let v = serde_json::to_value(&d).unwrap();
@@ -468,4 +472,15 @@ fn the_run_records_the_balance_summary_of_its_dataset() {
     assert!(v.get("balance_summary").is_none(), "{v}");
     let back: DatasetCounts = serde_json::from_value(v).unwrap();
     assert_eq!(back, d);
+    // A record of an older version has neither field.
+    let old: DatasetCounts = serde_json::from_value(serde_json::json!({
+        "classes": ["person"],
+        "train_images": 1019,
+        "valid_images": 50,
+        "heldout_images": 136,
+        "heldout_dir": null,
+        "warnings": [],
+    }))
+    .unwrap();
+    assert_eq!((old.train_frames, old.valid_groups.len()), (0, 0));
 }

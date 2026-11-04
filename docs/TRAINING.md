@@ -214,9 +214,26 @@ A missing label file means "no objects" (the Ultralytics convention).
    extra empty frames are dropped (reviewer-confirmed ones are kept first); too few give a warning.
 5. **Validation**: 10% of your own training frames (of all training frames when there are none),
    but at least 50 frames when the pool has them (`Options.min_valid`; never more than a quarter of the
-   pool, so 100 frames give 25, 241 give 50, 1000 give 100; always at least one), for the trainer's checkpoint choice. A frame holding the last training box of a
-   class stays in training. Seeded choices rank a frame by its path relative to its export folder,
-   so the same exports give the same split wherever they are.
+   pool, so 100 frames give 25, 241 give 50, 1000 give 100; always at least one), for the trainer's checkpoint choice.
+   **Whole camera days** (`dataset/valid.rs`, always on): frames of one camera on one day are
+   near-duplicates, so validation takes whole `camera/day` groups, never one that also trains.
+   Groups go by seeded rank, those adding a class validation lacks first, until the size is reached:
+   the first pass accepts a group while the total stays within 1.5x that size, the second, when
+   short, within `max(size, a quarter of the frames)`, so a day of 74 frames can stand in for 50 and a
+   small pool can give up to 37.5% of its frames. A group is skipped when validation would then hold
+   more than half of a class's boxes in the pool, which also keeps a class's last training box in
+   training (`Stats.valid_groups` in `dataset.json` and the `dataset:` line of `train.log` list the
+   groups). Frames with neither a camera nor a day tag are no group and stay in training.
+   **Fallback**: under 3 camera days left after the held-out split, groups reaching under half of the
+   size, no group with a box, or no camera or day tag at all give a warning that says so and the
+   frame-by-frame split (seeded rank, a frame holding a class's last training box stays in training);
+   validation then shares camera days with training and reads optimistic. Pools of public frames
+   only use the frame split without a warning. Seeded choices rank by the path relative to the export
+   folder or by the `camera/day` name, so the same exports give the same split wherever they are, the
+   training seed (`--seeds`) never changes it, and the held-out set and `heldout_fingerprint` do not
+   depend on it.
+   **Validation mAP now measures unseen camera days**: it reads lower than in runs of older versions
+   and does not compare with them. Compare runs on the held-out benchmark.
    A class with no training box gets a warning that says why: its boxes are only in the held-out
    split (the export's `val`: hold out other cameras or days when exporting, or review frames with
    it from the training cameras and days), or no frame has one.
@@ -342,14 +359,15 @@ sooner.
 | Family | Epochs (cap) | Patience | Min epochs | Min delta | Smoothing | Learning rate |
 |---|---|---|---|---|---|---|
 | YOLO26 / YOLO11 / YOLOv8 | 100 | 15 | 10 | 0.001 | 3 epochs | the trainer's |
-| RF-DETR | 100 | 10 | 10 | 0.001 | 3 epochs | 1e-4 (rfdetr's default); 5e-5 below 1000 training images |
+| RF-DETR | 100 | 10 | 10 | 0.001 | 3 epochs | 1e-4 (rfdetr's default); 5e-5 below 1000 unique training frames |
 | RT-DETRv2 / D-FINE | 80 | 10 | 10 | 0.001 | 3 epochs | 1e-4 |
 
 With fewer than 50 validation images a **recommended** patience doubles (10 -> 20, at most the
 epochs; `recipe::SMALL_VALID_IMAGES`): the metrics of so few images jump by several points between
 epochs. A typed patience (form, `--patience`, `training.patience`) is never changed. The first lines
 of the train stage in `train.log` say which applied, e.g. `# convergence: 16 validation images
-(< 50): patience 20 instead of 10; mAP averaged over the last 3 epochs`.
+(< 50): patience 20 instead of 10; mAP averaged over the last 3 epochs`. Whole camera days can
+land under 50 in a pool that has more frames; the rule counts the frames validation really got.
 
 **RF-DETR learning rate and schedule.** rfdetr 1.11 defaults to a *step* schedule that drops the
 learning rate x0.1 only after epoch 100 (`lr_drop`); the convergence rule usually stops before, so the
@@ -357,10 +375,11 @@ rate never decayed (run `20261031-025744-2a83` stopped at epoch 93). The trainer
 `lr_scheduler="cosine"` with `lr_scheduler_kwargs={"min_factor": 0.1}` (`--lr-scheduler cosine|step`,
 `--lr-min-factor`): rfdetr's managed cosine decays from the learning rate to 0.1x of it over the
 planned epochs (its total steps are Lightning's `estimated_stepping_batches`), after its warm-up.
-With no learning rate typed and fewer than 1000 training images (`recipe::SMALL_TRAIN_IMAGES`) an
+With no learning rate typed and fewer than 1000 unique training frames (`recipe::SMALL_TRAIN_IMAGES`;
+balancing and public-mix repeats count once, so 423 frames repeated to 1,019 lines are 423) an
 RF-DETR run uses lr 5e-5 and encoder (backbone) lr 7.5e-5 instead of rfdetr's 1e-4 / 1.5e-4; a typed
 lr is used as is with an encoder lr of 1.5x it (`TrainRecipe::effective_lr`, `--lr` / `--lr-encoder`).
-`train.log` says which applied, e.g. `# lr: 0.00005, encoder 0.000075 (312 training images < 1000:
+`train.log` says which applied, e.g. `# lr: 0.00005, encoder 0.000075 (312 unique training frames < 1000:
 lower than RF-DETR's default 0.0001 for small datasets); schedule cosine (default), final factor 0.1
 (default)`. An rfdetr that does not take these options trains without them (logged).
 
@@ -378,7 +397,7 @@ family: `TrainingConfig::apply_lr`), else to the family's default. `train run` t
 | Family (trainer) | Learning rate | Schedules (default first) | Final factor (default) |
 |---|---|---|---|
 | YOLO26 / YOLO11 / YOLOv8 (Ultralytics) | auto: the optimizer picks (AdamW `0.002 * 5 / (4 + classes)` up to 10,000 iterations, else MuSGD 0.01); a typed rate uses AdamW | linear, cosine (`cos_lr`) | 0.01 (`lrf`) |
-| RF-DETR (rfdetr) | 1e-4, 5e-5 below 1000 training images; encoder 1.5x | cosine, step (rfdetr's own x0.1 after epoch 100) | 0.1 (the cosine's end and the anneal's) |
+| RF-DETR (rfdetr) | 1e-4, 5e-5 below 1000 unique training frames; encoder 1.5x | cosine, step (rfdetr's own x0.1 after epoch 100) | 0.1 (the cosine's end and the anneal's) |
 | RT-DETRv2 / D-FINE (transformers) | 1e-4 | cosine, linear | 0 (`cosine`; a factor above 0 is `cosine_with_min_lr` with `min_lr_rate`, transformers 4.38+, pinned 5.17.0) |
 
 A schedule a family does not take is refused when the run is queued, with the allowed ones in the

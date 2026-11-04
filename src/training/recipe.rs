@@ -266,7 +266,7 @@ pub const fn lr_schedules(family: TrainFamily) -> LrSchedules {
 pub const fn default_lr_label(family: TrainFamily) -> &'static str {
     match family.trainer() {
         catalog::Trainer::Ultralytics => "auto (optimizer picks)",
-        catalog::Trainer::RfDetr => "1e-4 (5e-5 under 1000 images)",
+        catalog::Trainer::RfDetr => "1e-4 (5e-5 under 1000 unique frames)",
         catalog::Trainer::Transformers => "1e-4",
     }
 }
@@ -361,9 +361,10 @@ pub const fn recommended(family: TrainFamily) -> Recommended {
 /// 20261030-010233-b69d: 16 images, +-0.05 between epochs): a recommended patience doubles there.
 pub const SMALL_VALID_IMAGES: usize = 50;
 
-/// Training splits below this many images get RF-DETR's [`SMALL_DATASET_LR`] when no learning
-/// rate is typed: its default 1e-4 (encoder 1.5e-4) is sized for larger sets and overshoots a
-/// few hundred images (run 20261031-025744-2a83).
+/// Training splits below this many unique frames get RF-DETR's [`SMALL_DATASET_LR`] when no
+/// learning rate is typed: its default 1e-4 (encoder 1.5e-4) is sized for larger sets and
+/// overshoots a few hundred images (run 20261031-025744-2a83). Unique: repeats add no new images,
+/// 423 frames balanced to 1,019 lines overshot like 423.
 pub const SMALL_TRAIN_IMAGES: usize = 1000;
 /// RF-DETR's learning rate on a small training split ([`SMALL_TRAIN_IMAGES`]).
 pub const SMALL_DATASET_LR: f32 = 5e-5;
@@ -510,15 +511,15 @@ impl TrainRecipe {
         self.patience > 0 && self.patience < self.epochs
     }
 
-    /// The learning rates of a run on `train_images` training images; None = the trainer's
-    /// defaults. RF-DETR: a typed `lr` with an encoder rate of [`RFDETR_ENCODER_LR_RATIO`] x it,
+    /// The learning rates of a run on `train_frames` unique training frames (balancing and
+    /// oversampling repeats counted once); None = the trainer's defaults. RF-DETR: a typed `lr` with an encoder rate of [`RFDETR_ENCODER_LR_RATIO`] x it,
     /// else below [`SMALL_TRAIN_IMAGES`] the [`SMALL_DATASET_LR`] (encoder 7.5e-5), else None.
     /// Other families: the typed `lr` only (no separate encoder rate).
-    pub fn effective_lr(&self, train_images: usize) -> Option<LearningRate> {
+    pub fn effective_lr(&self, train_frames: usize) -> Option<LearningRate> {
         let rfdetr = self.family == TrainFamily::Rfdetr;
         let (lr, small_dataset) = match self.lr {
             Some(lr) => (lr, false),
-            None if rfdetr && train_images < SMALL_TRAIN_IMAGES => (SMALL_DATASET_LR, true),
+            None if rfdetr && train_frames < SMALL_TRAIN_IMAGES => (SMALL_DATASET_LR, true),
             None => return None,
         };
         Some(LearningRate {
@@ -543,7 +544,7 @@ impl TrainRecipe {
 
     /// The `train.log` line of [`Self::effective_lr`] ("lr: ..."), with the schedule and its
     /// final factor ("; schedule cosine (default), final factor 0.1 (default)").
-    pub fn lr_line(&self, train_images: usize) -> String {
+    pub fn lr_line(&self, train_frames: usize) -> String {
         let tag = |set: bool| if set { " (set)" } else { " (default)" };
         let factor = if self.effective_lr_schedule() == LrSchedule::Step {
             // rfdetr's step drop is its own; the factor only ends the anneal.
@@ -553,7 +554,7 @@ impl TrainRecipe {
         };
         format!(
             "{}; schedule {}{}, {factor} {}{}",
-            self.lr_rate_text(train_images),
+            self.lr_rate_text(train_frames),
             self.effective_lr_schedule(),
             tag(self.lr_schedule.is_some()),
             self.effective_lr_min_factor(),
@@ -561,16 +562,16 @@ impl TrainRecipe {
         )
     }
 
-    fn lr_rate_text(&self, train_images: usize) -> String {
-        match self.effective_lr(train_images) {
-            None => format!("lr: {train_images} training images: the trainer's default"),
+    fn lr_rate_text(&self, train_frames: usize) -> String {
+        match self.effective_lr(train_frames) {
+            None => format!("lr: {train_frames} unique training frames: the trainer's default"),
             Some(r) => {
                 let enc = r
                     .encoder
                     .map_or_else(String::new, |e| format!(", encoder {e}"));
                 let why = if r.small_dataset {
                     format!(
-                        " ({train_images} training images < {SMALL_TRAIN_IMAGES}: lower than \
+                        " ({train_frames} unique training frames < {SMALL_TRAIN_IMAGES}: lower than \
                          RF-DETR's default 0.0001 for small datasets)"
                     )
                 } else {
@@ -946,14 +947,14 @@ mod tests {
         );
         assert_eq!(
             r.lr_line(312),
-            "lr: 0.00005, encoder 0.000075 (312 training images < 1000: lower than RF-DETR's \
+            "lr: 0.00005, encoder 0.000075 (312 unique training frames < 1000: lower than RF-DETR's \
              default 0.0001 for small datasets); schedule cosine (default), final factor 0.1 (default)"
         );
-        // 1000 images and more: rfdetr's defaults.
+        // 1000 unique frames and more: rfdetr's defaults.
         assert_eq!(r.effective_lr(SMALL_TRAIN_IMAGES), None);
         assert_eq!(
             r.lr_line(1000),
-            "lr: 1000 training images: the trainer's default; schedule cosine (default), final factor 0.1 (default)"
+            "lr: 1000 unique training frames: the trainer's default; schedule cosine (default), final factor 0.1 (default)"
         );
         // A typed rate wins at any size, with the encoder at 1.5x.
         let typed = TrainRecipe {
@@ -1049,7 +1050,7 @@ mod tests {
         r.lr_min_factor = Some(0.05);
         assert_eq!(
             r.lr_line(10),
-            "lr: 10 training images: the trainer's default; schedule cosine (set), final factor \
+            "lr: 10 unique training frames: the trainer's default; schedule cosine (set), final factor \
              0.05 (set)"
         );
         let mut rf = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
@@ -1067,7 +1068,7 @@ mod tests {
         );
         assert_eq!(
             default_lr_label(TrainFamily::Rfdetr),
-            "1e-4 (5e-5 under 1000 images)"
+            "1e-4 (5e-5 under 1000 unique frames)"
         );
         assert_eq!(default_lr_label(TrainFamily::Dfine), "1e-4");
         for s in LrSchedule::ALL {

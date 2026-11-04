@@ -101,8 +101,8 @@ pub enum TrainCommand {
         #[arg(long)]
         imgsz: Option<u32>,
         /// Learning rate (default: config `training.lr`, else the family's: YOLO auto (the
-        /// optimizer picks), RF-DETR 1e-4 (5e-5 under 1000 training images), RT-DETRv2 / D-FINE
-        /// 1e-4).
+        /// optimizer picks), RF-DETR 1e-4 (5e-5 under 1000 unique training frames), RT-DETRv2 /
+        /// D-FINE 1e-4).
         #[arg(long)]
         lr: Option<f32>,
         /// Learning-rate schedule: cosine, linear or step (default: config
@@ -839,6 +839,9 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 prepared.heldout_images,
                 prepared.classes.join(", ")
             );
+            if let Some(t) = dataset::valid_groups_text(&prepared.valid_groups) {
+                println!("{t}");
+            }
             if let Some(b) = &prepared.balance_summary {
                 println!("balanced: {b}");
             }
@@ -1488,6 +1491,9 @@ pub fn dry_run_text(plan: &dataset::Plan, balance: &dataset::Balance) -> String 
         plan.heldout.len(),
         plan.classes.join(", ")
     ));
+    if let Some(t) = dataset::valid_groups_text(&plan.stats.valid_groups) {
+        out.push_str(&format!("{t}\n"));
+    }
     let Some(r) = &plan.balance else {
         if !plan.stats.train_boxes.is_empty() {
             out.push_str("training boxes per class:\n");
@@ -2353,9 +2359,14 @@ mod tests {
             heldout: vec![(0, 2); 40],
             warnings: vec!["few unique frames".into()],
             balance: Some(report),
+            stats: dataset::Stats {
+                valid_groups: vec!["yard/2026-10-01".into()],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let t = dry_run_text(&plan, &balance);
+        assert!(t.contains("validation on 1 camera day(s) kept out of training: yard/2026-10-01"));
         assert!(
             t.contains("200 training frames, 20 validation, 40 held-out"),
             "{t}"
