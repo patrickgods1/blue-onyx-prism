@@ -222,8 +222,8 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 /// older forms post), `gdino`, `vlm` (`off` = none), `rfdetr` / `siglip` (ticked = on; the
 /// Review page's form sends them), `with_model` (any id of `GET /v1/autolabel/models`),
 /// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick), and for
-/// a run with a model `device` (empty = the model's), `model_accept_score` (empty = off);
-/// `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
+/// a run with a model `device` (empty = the model's), `model_accept_score` (empty = off),
+/// `missing_only` (ticked = on); `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
 /// `vlm_batch`, `prefetch` and `vlm_min_on` (ticked = on; then `vlm_min_score` applies) count
 /// only when the form posts `run_options` (the Training page's card); without it (the Review
 /// page, older forms) they keep the request's defaults.
@@ -270,6 +270,7 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
         // A model run's fields; the labelers' are ignored.
         r.device = field(f, "device").map(str::to_string);
         r.model_accept_score = num(f, "model_accept_score", "model accept score")?;
+        r.missing_only = field(f, "missing_only").is_some();
     } else {
         r.gpu = field(f, "gpu").map(str::to_string);
     }
@@ -292,12 +293,14 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
 
 /// The auto-label form's fields an import posts with `al.` (prefix stripped), without its frame
 /// fields ([`FILTER_FIELDS`], `frames`, `again`): the run labels the import's frames
-/// ([`crate::training::autolabel::follow_import`]).
+/// ([`crate::training::autolabel::follow_import`]). `missing_only` is left out too: new frames
+/// are not reviewed, so it would select none.
 fn chained_autolabel_fields(f: &[(String, String)]) -> Vec<(String, String)> {
     f.iter()
         .filter_map(|(k, v)| Some((k.strip_prefix("al.")?.to_string(), v.clone())))
         .filter(|(k, _)| {
-            !FILTER_FIELDS.contains(&k.as_str()) && k.as_str() != "frames" && k.as_str() != "again"
+            !FILTER_FIELDS.contains(&k.as_str())
+                && !matches!(k.as_str(), "frames" | "again" | "missing_only")
         })
         .collect()
 }
@@ -549,16 +552,21 @@ pub(super) async fn autolabel(
             let mut job = crate::training::autolabel::plan_autolabel(&config, req, &cap)?;
             attach_seams(&state, &shared, &config, &mut job);
             let title = crate::training::task::Task::title(&job);
+            let missing = job.request.missing_only;
             let id = service(&shared)
                 .enqueue_task(Box::new(job))
                 .map_err(anyhow::Error::msg)?;
-            Ok((
-                format!(
-                    "Queued: {title}. The boxes appear on the Review page as pending auto boxes \
-                     when it is done."
-                ),
-                id,
-            ))
+            let mut msg = format!(
+                "Queued: {title}. The boxes appear on the Review page as pending auto boxes when \
+                 it is done."
+            );
+            if missing {
+                msg.push_str(
+                    " A frame that gains a box leaves exports until you save it again on the \
+                     Review page.",
+                );
+            }
+            Ok((msg, id))
         })();
         match (result, json) {
             (Ok((m, id)), true) => {
@@ -763,6 +771,31 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!((l.device, l.model_accept_score), (None, None));
+        // Find missing labels: a model run's field, ignored by the labelers.
+        let f = form(&[("with_model", "x"), ("missing_only", "on")]);
+        assert!(autolabel_from_form(&f).unwrap().missing_only);
+        let f = form(&[("with_model", "x")]);
+        assert!(!autolabel_from_form(&f).unwrap().missing_only);
+        let f = form(&[
+            ("mode", "labelers"),
+            ("rfdetr", "on"),
+            ("missing_only", "on"),
+        ]);
+        assert!(!autolabel_from_form(&f).unwrap().missing_only);
+        let f = form(&[
+            ("with_model", "x"),
+            ("missing_only", "on"),
+            ("model_accept_score", "0.8"),
+        ]);
+        let e = autolabel_from_form(&f).unwrap_err().to_string();
+        assert!(e.contains("pre-accepts nothing"), "{e}");
+        for page in [
+            include_str!("../../templates/training.html"),
+            include_str!("../../templates/review.html"),
+        ] {
+            assert!(page.contains("name=\"missing_only\""));
+            assert!(page.contains("eaves exports until you save it again"));
+        }
         for (k, v) in [
             ("model_accept_score", "0.1"),
             ("model_accept_score", "1.5"),
@@ -1282,6 +1315,7 @@ mod tests {
             ("al.limit", "5"),
             ("al.frames", "import=other"),
             ("al.again", "1"),
+            ("al.missing_only", "on"),
             ("al.classes", "person"),
             ("frames", "40"),
         ]);

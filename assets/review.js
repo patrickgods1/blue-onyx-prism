@@ -2481,6 +2481,12 @@
       r.addEventListener('change', applyAlMode);
     });
     applyAlMode();
+    if (MP) {
+      var syncMissing = MP.util.missingToggle(alForm);
+      Array.prototype.forEach.call(alForm.querySelectorAll('input[name="mode"]'), function (r) {
+        r.addEventListener('change', syncMissing);
+      });
+    }
   }
 
   // The filters of the queue become the job's frame filter.

@@ -1261,6 +1261,51 @@ detection matches *missed*. Any of them puts the frame back to `unreviewed` with
 first. The detections are merged as pending auto boxes (`review`, or `accept` at a pre-accept score).
 Train, re-label, review the disagreements, train again: 2-3 rounds, IR frames and rare species first.
 
+### Find missing labels
+
+`train autolabel --with-model <id> --missing-only` (the *Find missing labels* box on the Training and
+Review pages; `POST /training/autolabel` `missing_only`) looks for real objects with no box on frames
+you already reviewed, and nothing else. An unlabelled object teaches a model that the object is
+background and counts as a false alarm in validation. Run it once per model, one task each, then review
+the proposals. The self-training loop above does not fit this job: it also reopens frames for missed
+boxes and class changes (with `truck=car`, every truck), asks a model about frames it trained on, and
+its merge drops any proposal on a rejected box, so a real car under an automatic reject stays hidden.
+
+**Frames:** every frame of the folder under review (`status` and `source` of the filter are set to `any`
+and `all`, other filters apply) that is `reviewed`, or `unreviewed` with a `disagreement` note, so a
+second model can add to the first one's proposals. Frames confirmed empty are left out. So are the
+frames the model trained on: `<model>.provenance.json` beside the model file gives the run,
+`<training dir>/<run_id>/data/train.txt` the frames; validation and held-out frames stay in. A model
+without that record (a catalog or plain local model) gets a warning and no frames are left out. When
+the record is there but `train.txt` is gone the run refuses to start, since it can no longer tell.
+
+**Defaults:** the threshold 0.3 becomes 0.5 and the limit 200 becomes 20000; any other value is used as
+given, so `--threshold 0.3` cannot be asked for (0.31 can). `--accept-score-model` is refused: you check
+every box.
+
+**Rules** (`triage::apply_missing`), per detection, highest score first, against the boxes of the same
+object (the same class, or two of car, truck, bus, van, so a car on a labelled truck is no new object):
+
+| Existing box | Result |
+|---|---|
+| Accepted, added or pending, at IoU >= 0.3, or with at least 50% of the detection inside it (this run's boxes count) | Dropped. |
+| Rejected at IoU >= 0.5 by a reviewer: by hand, as a repeat spot, as a duplicate, or with a reject reason | Dropped, whatever else matches. |
+| Rejected at IoU >= 0.5 with no judgement: `reason: low_score`, or a model hint (suppressed, below threshold, verifier find) the save default rejected | The detection takes that box's place (other such boxes there are removed), so `hard_negatives.json` does not call the object a false positive. |
+| None of these | Added. |
+
+Boxes are pending `source: auto`, triaged `review`; existing boxes get no evidence and no class
+suggestion. A frame that gains a box goes back to `unreviewed` with a `disagreement` note
+(`re-label by <models>: N new boxes`, first in the queue), loses `overlaps_checked` and is queued for
+review. **It leaves exports until you save it again**, because exports take reviewed frames only; the
+summary says so. Every other frame is not written at all.
+
+No `auto_run` marker is written: it is one slot, and several models run in turn. A rerun detects again,
+and the pending boxes keep it from adding anything twice. The report adds `missing_only`, `candidates`
+(`added` + `overwritten`), `overwritten`, `dropped_judged`, `skipped_trained` to `reopened`.
+
+*Accept this spot on all frames* takes the proposals like any pending box (parked cars), `d` marks an
+unclear one.
+
 ### M1 run (MPS)
 
 | Run | Time | Result |
@@ -1303,7 +1348,8 @@ blue-onyx-prism train autolabel [--frames "scene=ir,status=unreviewed,import=any
     [--gdino tiny|base|large|off] [--no-rfdetr] [--vlm 2b|4b|8b|off] [--no-siglip] [--classes a,b] \
     [--no-vlm-batch] [--vlm-min-score 0.2] [--no-prefetch] [--discard-on-cancel] [--gpu cuda:N] [--allow-large] [--verbose]
 blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
-    [--device <spec>] [--accept-score-model 0.8] [--confirm-license] [--allow-large] [--frames "status=any,..."]
+    [--device <spec>] [--accept-score-model 0.8] [--missing-only] [--confirm-license] [--allow-large] \
+    [--frames "status=any,..."]
 blue-onyx-prism train list
 blue-onyx-prism train remove-env
 ```

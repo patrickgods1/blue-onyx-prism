@@ -955,7 +955,7 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/training/balance-preview` | the queue form's dataset fields (`dataset`, `dataset_path`, `scene`, `classes`, `excluded`, `public`, `balance*`): per scene filter the planned split and the balance report (before / after per class, scene, camera), nothing written |
 | GET | `/v1/training/compare` | `group`: the runs of a comparison group and their per-scene held-out AP table (`comparison`, `text`) |
 | POST | `/training/import` | the Import footage form: `source` (`path`, `url`, `dataset`) with `path` / `url` / `dataset`, `camera`, `frames`, `select` (`siglip`, `dhash`), `scene`, `max_fps`, `every`, `dedup_window`, `no_balance`, `license`, `confirm_license`, `confirm_large`; queued on the training queue |
-| POST | `/training/autolabel` | the Auto-label form (Training and Review pages): `frames` (filter text), `gdino` (`tiny`, `base`, `large`, `off`), `rfdetr`, `vlm` (`2b`, `4b`, `8b`, `off`), `siglip`, `with_model`, `threshold`, `confirm_large` |
+| POST | `/training/autolabel` | the Auto-label form (Training and Review pages): `frames` (filter text), `gdino` (`tiny`, `base`, `large`, `off`), `rfdetr`, `vlm` (`2b`, `4b`, `8b`, `off`), `siglip`, `with_model`, `missing_only`, `threshold`, `confirm_large` |
 | POST | `/training/cancel`, `/training/finish`, `/training/remove`, `/training/use`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; finish it after the current epoch keeping the best checkpoint; forget a finished one; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model; `add` / `remove`: a `training.datasets` folder; delete the training environment |
 | GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
@@ -1015,6 +1015,7 @@ blue-onyx-prism train import --path D:\BlueIris\Clips --confirm-license --allow-
 blue-onyx-prism train import --dataset meva-sample                                    # pinned MEVA clips (CC BY 4.0)
 blue-onyx-prism train autolabel --frames "import=any,limit=200" --allow-large         # pending auto boxes for review
 blue-onyx-prism train autolabel --with-model night-yolo26n-20261023-1200              # self-training re-label
+blue-onyx-prism train autolabel --with-model night-yolo26n-20261023-1200 --missing-only   # real objects with no box on reviewed frames
 blue-onyx-prism train list
 blue-onyx-prism train remove-env
 ```

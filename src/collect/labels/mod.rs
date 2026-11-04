@@ -44,6 +44,8 @@ pub const MIN_BOX_PX: f32 = 1.0;
 pub const MATCH_IOU: f32 = 0.5;
 /// IoU at or above which two pre-filled boxes of one label are the same box ([`prefill`]).
 pub const DUP_IOU: f32 = 0.95;
+/// Longest [`LabelFile::disagreement`] note, in characters ([`normalize`] refuses a longer one).
+pub const MAX_DISAGREEMENT_LEN: usize = 500;
 
 /// Where a frame is in the review.
 #[derive(
@@ -774,9 +776,9 @@ pub fn normalize(
     }
     if f.disagreement
         .as_ref()
-        .is_some_and(|d| d.chars().count() > 500)
+        .is_some_and(|d| d.chars().count() > MAX_DISAGREEMENT_LEN)
     {
-        bail!("the disagreement note is longer than 500 characters");
+        bail!("the disagreement note is longer than {MAX_DISAGREEMENT_LEN} characters");
     }
     Ok(f)
 }

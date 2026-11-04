@@ -442,7 +442,7 @@ fn find_entry<'a>(config: &'a Config, name: &str) -> Option<&'a ModelConfig> {
 }
 
 /// A plain file name (no folder part).
-fn plain_file(file: &str) -> bool {
+pub(super) fn plain_file(file: &str) -> bool {
     !file.is_empty()
         && file != "."
         && file != ".."

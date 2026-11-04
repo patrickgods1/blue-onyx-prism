@@ -340,9 +340,10 @@ folder; the collector and the Dataset page keep `collect.dir`.
 - **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
   names joined by `\n`). The page flags a frame that was reviewed with another list.
 - **`disagreement`:** set by a re-label with a trained model (`train autolabel --with-model`) when its
-  detections disagree with the reviewed labels (`"re-label by night-yolo26n: 1 new box, 1 missed"`); the
+  detections disagree with the reviewed labels (`"re-label by night-yolo26n: 1 new box, 1 missed"`), or
+  by a `--missing-only` run that found an object with no box (`"re-label by a, b: 2 new boxes"`); the
   file goes back to `unreviewed` and the Review queue lists it first. Cleared when the frame is saved
-  as reviewed or skipped.
+  as reviewed or skipped. At most 500 characters.
 - **`auto_run`:** `{"at": "<RFC 3339>", "labeler": "mm-gdino-tiny + rfdetr-large + ..."}`, the last
   labelers-mode auto-label run that looked at the frame, boxes found or not (a frame with nothing found
   gets a label file with just this). A later run of the same labelers skips the frame unless its filter
@@ -427,6 +428,10 @@ a class suggestion (`auto_label`, `auto_score`, triage `review`) and the proposa
 
 A `reviewed` or `skipped` file that gains a box goes back to `unreviewed` and keeps its other decisions.
 This is how the self-training loop sends disagreements back to review.
+
+A `--missing-only` run (`triage::apply_missing`) uses its own rule instead: a looser match against
+training and pending boxes, and proposals may replace rejected boxes no reviewer judged. See
+[Find missing labels](TRAINING.md#find-missing-labels).
 
 ### Queue
 

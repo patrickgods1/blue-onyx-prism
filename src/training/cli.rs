@@ -390,6 +390,13 @@ pub struct AutolabelArgs {
     /// night / IR person and animal boxes stay in review. Default off (every box reviewed).
     #[arg(long)]
     pub accept_score_model: Option<f32>,
+    /// With --with-model: only propose real objects that have no label on reviewed frames, for you
+    /// to check. Frames the model trained on are left out; a frame goes back to review only when
+    /// it gains a box, and leaves exports until you save it again. Looks at every frame (--frames
+    /// status and source are ignored); a --threshold of 0.3 means 0.5 and a limit of 200 means
+    /// 20000. Run it once per model.
+    #[arg(long)]
+    pub missing_only: bool,
     /// Confirm the licence of a non-commercial / personal-use catalog model --with-model
     /// installs or adds.
     #[arg(long)]
@@ -480,6 +487,7 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
     r.device = a.device.clone();
     r.gpu = a.gpu.clone();
     r.model_accept_score = a.accept_score_model;
+    r.missing_only = a.missing_only;
     r.confirm_license = a.confirm_license;
     r.classes = (!a.classes.is_empty()).then(|| a.classes.clone());
     r.allow_large = a.allow_large;
@@ -1835,6 +1843,13 @@ mod tests {
         assert_eq!(r.model_accept_score, Some(0.8));
         assert!(r.confirm_license);
         assert_eq!(r.frames.query["status"], "any");
+        assert!(!r.missing_only);
+        let TrainCommand::Autolabel(m) =
+            parse(&["autolabel", "--with-model", "m", "--missing-only"]).unwrap()
+        else {
+            panic!()
+        };
+        assert!(autolabel_request(&m).unwrap().missing_only);
         for bad in [
             &[
                 "autolabel",
@@ -1846,6 +1861,15 @@ mod tests {
             &["autolabel", "--with-model", "m", "--device", "tpu"],
             &["autolabel", "--accept-score-model", "0.8"],
             &["autolabel", "--device", "openvino:cpu"],
+            &["autolabel", "--missing-only"],
+            &[
+                "autolabel",
+                "--with-model",
+                "m",
+                "--missing-only",
+                "--accept-score-model",
+                "0.8",
+            ],
         ] {
             let TrainCommand::Autolabel(b) = parse(bad).unwrap() else {
                 panic!()

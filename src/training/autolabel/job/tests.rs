@@ -1693,3 +1693,440 @@ fn a_chained_run_rejects_low_boxes_then_accepts_then_switches_the_folder() {
     }
     assert_eq!(writer.0.lock().unwrap().collect.review_dir, Some(other));
 }
+
+/// `missing_only` runs.
+mod missing {
+    use super::*;
+    use crate::collect::labels::export::flat_name;
+    use crate::collect::labels::{LabelBox, LabelFile};
+    use crate::collect::layout;
+
+    /// A reviewed file with an accepted model box per `(label, bbox)`.
+    fn reviewed(boxes: &[(&str, [f32; 4])]) -> LabelFile {
+        LabelFile {
+            status: Status::Reviewed,
+            boxes: boxes
+                .iter()
+                .map(|(label, bbox)| LabelBox {
+                    label: (*label).into(),
+                    bbox: *bbox,
+                    source: Source::Model,
+                    score: Some(0.9),
+                    state: BoxState::Accepted,
+                    origin: Some(labels::Origin::Prediction),
+                    reason: None,
+                    model_label: None,
+                    orig_bbox: None,
+                    difficult: false,
+                    reject_reason: None,
+                    auto: Default::default(),
+                })
+                .collect(),
+            ..LabelFile::default()
+        }
+    }
+
+    fn put(dir: &Path, rel: &str, f: &LabelFile) {
+        labels::write(&Frame::resolve(dir, rel).unwrap().labels, f).unwrap();
+    }
+
+    fn bytes(dir: &Path, rel: &str) -> Vec<u8> {
+        std::fs::read(Frame::resolve(dir, rel).unwrap().labels).unwrap()
+    }
+
+    /// A planned run of the model `name`, on `cfg`, with `detector`.
+    fn plan(
+        cfg: &Config,
+        name: &str,
+        filter: &str,
+        detector: Arc<dyn Detector>,
+    ) -> Result<AutolabelJob> {
+        let mut req = AutolabelRequest::new(FrameFilter::parse(filter, "unreviewed")?);
+        req.with_model = Some(name.into());
+        req.missing_only = true;
+        let mut job = plan_autolabel(cfg, req, &no_gpu())?;
+        job.detector = Some(detector);
+        Ok(job)
+    }
+
+    fn fake(dets: &[(&str, Vec<Det>)]) -> Arc<dyn Detector> {
+        Arc::new(FakeDetector::new(
+            dets.iter()
+                .map(|(rel, d)| ((*rel).to_string(), d.clone()))
+                .collect(),
+        ))
+    }
+
+    /// The default model trained in run `id` on `rels`: its provenance and `train.txt`, each frame
+    /// repeated as balancing does, under source prefixes as the dataset writes them.
+    fn trained_on(cfg: &Config, id: &str, rels: &[&str]) {
+        let entry = cfg.models.first().unwrap();
+        let path = cfg.data_path(&entry.path);
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path.with_file_name(format!("{stem}.provenance.json")),
+            serde_json::json!({"run_id": id}).to_string(),
+        )
+        .unwrap();
+        let data = crate::training::training_dir(cfg).join(id).join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let mut text = String::new();
+        for (i, rel) in rels.iter().enumerate() {
+            let flat = flat_name(&layout::parse_rel(rel).unwrap());
+            for _ in 0..3 {
+                text.push_str(&format!("./images/s{i}-{flat}\n"));
+            }
+        }
+        std::fs::write(data.join("train.txt"), text).unwrap();
+    }
+
+    const CAR: [f32; 4] = [1.0, 1.0, 30.0, 20.0];
+    const SPOT: [f32; 4] = [35.0, 20.0, 60.0, 46.0];
+
+    #[test]
+    fn plan_forces_every_frame_and_raises_the_defaults() {
+        let t = tmp("missing-plan");
+        let cfg = config(&t.0);
+        let job = plan(&cfg, "IPcam-general", "", fake(&[])).unwrap();
+        let f = &job.request.frames;
+        assert_eq!(f.query["status"], "any");
+        assert_eq!(f.query["source"], "all");
+        assert_eq!(f.limit, crate::training::autolabel::MAX_LIMIT);
+        assert_eq!(job.request.threshold, 0.5);
+        assert!(
+            job.title()
+                .starts_with("find missing labels with IPcam-general")
+        );
+        // What a page posts: the queue's filters and its own status.
+        let job = plan(
+            &cfg,
+            "IPcam-general",
+            "status=reviewed,source=queue,scene=ir,limit=50",
+            fake(&[]),
+        )
+        .unwrap();
+        let f = &job.request.frames;
+        assert_eq!(f.query["status"], "any");
+        assert_eq!(f.query["source"], "all");
+        assert_eq!(f.query["scene"], "ir", "other filters stay");
+        assert_eq!(f.limit, 50, "a limit somebody chose stays");
+        // A threshold somebody chose stays.
+        let mut req = AutolabelRequest::new(FrameFilter::default());
+        req.with_model = Some("IPcam-general".into());
+        req.missing_only = true;
+        req.threshold = 0.7;
+        let job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+        assert_eq!(job.request.threshold, 0.7);
+        // A normal run is not changed.
+        let mut req = AutolabelRequest::new(FrameFilter::default());
+        req.with_model = Some("IPcam-general".into());
+        let job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+        assert_eq!(job.request.frames.query["status"], "unreviewed");
+        assert_eq!(job.request.frames.limit, 200);
+        assert!((job.request.threshold - 0.3).abs() < 1e-6);
+        // Bad requests are refused before anything else.
+        let mut req = AutolabelRequest::new(FrameFilter::default());
+        req.missing_only = true;
+        let e = plan_autolabel(&cfg, req, &no_gpu())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--with-model"), "{e}");
+    }
+
+    #[test]
+    fn only_frames_gaining_a_box_are_written() {
+        let t = tmp("missing-write");
+        let rels = frames(&t.0, 6, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        // Gains a box.
+        let mut gains = reviewed(&[("person", SPOT)]);
+        gains.overlaps_checked = true;
+        put(&dir, &rels[0], &gains);
+        // The detection is the labelled object, under the other vehicle name.
+        put(&dir, &rels[1], &reviewed(&[("truck", CAR)]));
+        // The model trained on this one.
+        put(&dir, &rels[2], &reviewed(&[("person", SPOT)]));
+        // Confirmed empty.
+        let mut empty = reviewed(&[]);
+        empty.empty_confirmed = true;
+        put(&dir, &rels[3], &empty);
+        // Skipped.
+        let mut skipped = reviewed(&[]);
+        skipped.status = Status::Skipped;
+        put(&dir, &rels[4], &skipped);
+        // rels[5]: no label file.
+        trained_on(&cfg, "20261031-1", &[&rels[2]]);
+        let before: Vec<Vec<u8>> = (1..5).map(|i| bytes(&dir, &rels[i])).collect();
+        // Frames reviewed under "all collected": not in the queue file, and still reached.
+        let queue_file = dir.join(layout::REVIEW_QUEUE_FILE);
+        std::fs::remove_file(&queue_file).unwrap();
+        let car = || vec![det("car", 0.9, CAR)];
+        let detector = fake(&[
+            (&rels[0], car()),
+            (&rels[1], car()),
+            (&rels[2], car()),
+            (&rels[3], car()),
+            (&rels[4], car()),
+            (&rels[5], car()),
+        ]);
+        let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        let rep = &out.result;
+        assert_eq!(rep["missing_only"], true, "{rep}");
+        assert_eq!(rep["frames"], 2, "reviewed, not trained on: {rep}");
+        assert_eq!(rep["skipped_trained"], 1, "{rep}");
+        assert_eq!(rep["proposals"], 2, "{rep}");
+        assert_eq!(rep["candidates"], 1, "{rep}");
+        assert_eq!(rep["added"], 1, "{rep}");
+        assert_eq!(rep["dropped"], 1, "{rep}");
+        assert_eq!(rep["reopened"], 1, "{rep}");
+        assert_eq!(rep["disagreements"], 0, "{rep}");
+        let summary = &out.summary;
+        assert!(summary.contains("1 candidate boxes"), "{summary}");
+        assert!(summary.contains("1 frames reopened"), "{summary}");
+        assert!(
+            summary.contains("leave exports until you save"),
+            "{summary}"
+        );
+        // Untouched frames are byte-identical, and no file appears for a frame without one.
+        let after: Vec<Vec<u8>> = (1..5).map(|i| bytes(&dir, &rels[i])).collect();
+        assert_eq!(before, after);
+        assert!(!Frame::resolve(&dir, &rels[5]).unwrap().labels.exists());
+        // The changed frame.
+        let f = labels_of(&dir, &rels[0]);
+        assert_eq!(f.status, Status::Unreviewed);
+        assert_eq!(
+            f.disagreement.as_deref(),
+            Some("re-label by IPcam-general: 1 new box")
+        );
+        assert!(!f.overlaps_checked);
+        assert_eq!(f.auto_run, None, "no marker");
+        assert_eq!(f.boxes.len(), 2);
+        assert_eq!(f.boxes[1].state, BoxState::Pending);
+        assert_eq!(f.boxes[1].auto.triage, Some(Triage::Review));
+        // Only that frame was queued.
+        let queued: Vec<String> = layout::read_review(&queue_file)
+            .into_iter()
+            .map(|l| l.frame)
+            .collect();
+        assert_eq!(queued, [rels[0].clone()]);
+        // A save through the page's normalisation takes it back to reviewed, boxes accepted.
+        let classes = cfg.collect.classes.clone();
+        let mut f = f;
+        f.status = Status::Reviewed;
+        let saved = labels::normalize(f, &classes, 64, 48, "2026-11-04T00:00:00.000Z").unwrap();
+        assert_eq!(saved.training().count(), 2);
+        assert_eq!(saved.disagreement, None);
+    }
+
+    #[test]
+    fn two_models_run_in_turn_and_a_rerun_adds_nothing() {
+        let t = tmp("missing-turn");
+        let rels = frames(&t.0, 1, false);
+        let dir = t.0.join("dataset");
+        let mut cfg = config(&t.0);
+        cfg.models.push(ModelConfig {
+            name: Some("second".into()),
+            path: "models/second.onnx".into(),
+            enabled: false,
+            ..ModelConfig::default()
+        });
+        put(&dir, &rels[0], &reviewed(&[]));
+        let first = fake(&[(&rels[0], vec![det("car", 0.9, CAR)])]);
+        let job = plan(&cfg, "IPcam-general", "", first.clone()).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["candidates"], 1);
+        // No marker, so the second model is not turned away; the frame is unreviewed now, with
+        // the note, so it is still in scope. It sees the same car and a dog.
+        let both = fake(&[(&rels[0], vec![det("car", 0.8, CAR), det("dog", 0.7, SPOT)])]);
+        let job = plan(&cfg, "second", "", both).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["frames"], 1, "{}", out.result);
+        assert_eq!(out.result["candidates"], 1, "the dog only: {}", out.result);
+        assert_eq!(out.result["reopened"], 0, "it was open already");
+        let f = labels_of(&dir, &rels[0]);
+        assert_eq!(f.boxes.len(), 2);
+        assert_eq!(
+            f.disagreement.as_deref(),
+            Some("re-label by IPcam-general, second: 2 new boxes")
+        );
+        // A rerun of the first adds nothing and writes nothing.
+        let before = bytes(&dir, &rels[0]);
+        let job = plan(&cfg, "IPcam-general", "", first).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["candidates"], 0);
+        assert!(!out.summary.contains("leave exports"), "{}", out.summary);
+        assert_eq!(bytes(&dir, &rels[0]), before);
+    }
+
+    #[test]
+    fn the_limit_counts_frames_in_scope() {
+        let t = tmp("missing-limit");
+        let rels = frames(&t.0, 3, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        // One of three frames in scope; the others sort anywhere.
+        put(&dir, &rels[2], &reviewed(&[]));
+        let job = plan(
+            &cfg,
+            "IPcam-general",
+            "limit=1",
+            fake(&[(&rels[2], vec![det("car", 0.9, CAR)])]),
+        )
+        .unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["frames"], 1);
+        assert_eq!(out.result["candidates"], 1);
+    }
+
+    /// Takes a frame out of scope while the model runs, as a reviewer on the page can.
+    struct SkipDuring {
+        inner: Arc<dyn Detector>,
+        dir: PathBuf,
+        rel: String,
+    }
+
+    impl Detector for SkipDuring {
+        fn detect(
+            &self,
+            config: &Config,
+            model: &ModelConfig,
+            device: Option<&str>,
+            images: &[Image],
+            threshold: f32,
+            cancel: &AtomicBool,
+        ) -> Result<super::super::super::relabel::Detections> {
+            let mut f = labels_of(&self.dir, &self.rel);
+            f.status = Status::Skipped;
+            put(&self.dir, &self.rel, &f);
+            self.inner
+                .detect(config, model, device, images, threshold, cancel)
+        }
+    }
+
+    #[test]
+    fn the_scope_is_checked_again_under_the_write_lock() {
+        let t = tmp("missing-recheck");
+        let rels = frames(&t.0, 1, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        put(&dir, &rels[0], &reviewed(&[]));
+        let detector = Arc::new(SkipDuring {
+            inner: fake(&[(&rels[0], vec![det("car", 0.9, CAR)])]),
+            dir: dir.clone(),
+            rel: rels[0].clone(),
+        });
+        let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["candidates"], 0);
+        let f = labels_of(&dir, &rels[0]);
+        assert_eq!(f.status, Status::Skipped);
+        assert!(f.boxes.is_empty());
+    }
+
+    #[test]
+    fn a_model_without_a_record_warns_and_runs_a_lost_list_refuses() {
+        let t = tmp("missing-record");
+        let rels = frames(&t.0, 1, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        put(&dir, &rels[0], &reviewed(&[]));
+        let detector = fake(&[(&rels[0], vec![det("car", 0.9, CAR)])]);
+        let job = plan(&cfg, "IPcam-general", "", detector.clone()).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["candidates"], 1);
+        let warn = out.result["warnings"][0].as_str().unwrap();
+        assert!(warn.contains("no training record"), "{warn}");
+        assert!(
+            out.summary.contains("no training record"),
+            "{}",
+            out.summary
+        );
+        // The record is there, its run folder is not: nothing runs, nothing is written.
+        trained_on(&cfg, "20261031-1", &[]);
+        std::fs::remove_dir_all(crate::training::training_dir(&cfg).join("20261031-1")).unwrap();
+        let before = bytes(&dir, &rels[0]);
+        let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        let e = run_job(&job, &LabelFake::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("20261031-1") && e.contains("train.txt"), "{e}");
+        assert_eq!(bytes(&dir, &rels[0]), before);
+    }
+
+    #[test]
+    fn a_local_model_finds_its_record_before_it_is_in_the_config() {
+        let t = tmp("missing-local");
+        let rels = frames(&t.0, 2, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        put(&dir, &rels[0], &reviewed(&[]));
+        put(&dir, &rels[1], &reviewed(&[]));
+        // The default entry's record, then the same record for a file no entry uses.
+        trained_on(&cfg, "20261031-1", &[&rels[0]]);
+        let models = cfg.data_path(&cfg.models_dir);
+        std::fs::create_dir_all(&models).unwrap();
+        let path = cfg.data_path(&cfg.models.first().unwrap().path);
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        std::fs::write(models.join("mine.onnx"), b"x").unwrap();
+        std::fs::rename(
+            path.with_file_name(format!("{stem}.provenance.json")),
+            models.join("mine.provenance.json"),
+        )
+        .unwrap();
+        let detector = fake(&[(&rels[1], vec![det("car", 0.9, CAR)])]);
+        let mut job = plan(&cfg, "local:mine.onnx", "", detector).unwrap();
+        job.config_writer = Some(Arc::new(MemWriter(Mutex::new(cfg.clone()))));
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["skipped_trained"], 1, "{}", out.result);
+        assert_eq!(out.result["frames"], 1, "{}", out.result);
+    }
+
+    #[test]
+    fn nothing_in_scope_says_why() {
+        let t = tmp("missing-none");
+        let rels = frames(&t.0, 1, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        put(&dir, &rels[0], &reviewed(&[]));
+        trained_on(&cfg, "20261031-1", &[&rels[0]]);
+        let job = plan(&cfg, "IPcam-general", "", fake(&[])).unwrap();
+        let e = run_job(&job, &LabelFake::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("1 reviewed frame(s)") && e.contains("trained on"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_cancel_keeps_the_finished_frames_and_says_a_rerun_looks_again() {
+        let t = tmp("missing-cancel");
+        let rels = frames(&t.0, 2, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        put(&dir, &rels[0], &reviewed(&[]));
+        put(&dir, &rels[1], &reviewed(&[]));
+        let dets = rels
+            .iter()
+            .map(|r| (r.clone(), vec![det("car", 0.9, CAR)]))
+            .collect();
+        let detector = FakeDetector {
+            stop_after: Some(1),
+            ..FakeDetector::new(dets)
+        };
+        let job = plan(&cfg, "IPcam-general", "", Arc::new(detector)).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["cancelled"], true);
+        assert_eq!(out.result["candidates"], 1);
+        assert!(
+            out.summary.starts_with("stopped by Cancel after 1 of 2"),
+            "{}",
+            out.summary
+        );
+        assert!(out.summary.contains("run it again"), "{}", out.summary);
+    }
+}
