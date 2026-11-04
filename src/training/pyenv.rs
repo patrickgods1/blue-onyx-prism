@@ -1,7 +1,9 @@
-//! What the import and auto-label jobs share: the training environment (`tools/train-env`, set up
-//! by the export's code under its lock, [`setup`]), the verified downloads of their checkpoints
-//! and footage ([`fetch_missing`], where each one goes: [`weights_dir`], [`dataset_dir`]) and
-//! running a helper script in it with its `@<tag> {json}` events ([`run_script`]).
+//! What the import, auto-label and overlap jobs share: the training environment
+//! (`tools/train-env`, set up by the export's code under its lock, [`setup`]), the verified downloads
+//! of their checkpoints and footage ([`fetch_missing`], where each one goes: [`weights_dir`],
+//! [`dataset_dir`]), running a helper script in it with its `@<tag> {json}` events ([`run_script`]),
+//! `scripts/autolabel.py`'s own check ([`self_check`]) and telling a cancel from a failure
+//! ([`is_cancel`]).
 
 use super::capability::Accelerator;
 use super::task::TaskReport;
@@ -22,6 +24,11 @@ pub fn check(cancel: &AtomicBool) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Whether `e` is a cancel ([`Cancelled`] or the benchmark's).
+pub fn is_cancel(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Cancelled>()) || crate::benchmark::is_cancelled(e)
 }
 
 /// Where a labeler checkpoint is installed: `tools/train-weights/<key>` (RF-DETR's training base
@@ -259,7 +266,7 @@ pub fn run_script(
             }
             if let Some(why) = e
                 .downcast_ref::<crate::resources::export::ChildFailed>()
-                .and_then(|c| gpu_failure(&c.lines))
+                .and_then(|c| gpu_failure(&c.lines, tag))
             {
                 return e.context(why);
             }
@@ -267,10 +274,45 @@ pub fn run_script(
         })
 }
 
+/// Run `scripts/autolabel.py --self-check` (the imports and its own tests), reporting nothing but
+/// the log; an error when it fails or did not run its tests.
+pub fn self_check(
+    runner: &dyn CommandRunner,
+    paths: &TrainPaths,
+    platform: Platform,
+    script: &Path,
+    report: &mut dyn FnMut(TaskReport<'_>),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut passed = None;
+    run_script(
+        runner,
+        paths,
+        platform,
+        &paths.scripts,
+        Duration::from_secs(15 * 60),
+        vec![script.as_os_str().to_owned(), "--self-check".into()],
+        "autolabel",
+        &mut |ev, _| {
+            if ev.get("event").and_then(serde_json::Value::as_str) == Some("self_test") {
+                passed = ev.get("passed").and_then(serde_json::Value::as_u64);
+            }
+        },
+        report,
+        cancel,
+    )
+    .context("the auto-labeler's self-check failed")?;
+    if passed.is_none() {
+        bail!("the auto-labeler's self-test did not run; the script is damaged");
+    }
+    Ok(())
+}
+
 /// What the failure messages call the script of event tag `tag`.
 fn task_name(tag: &str) -> &'static str {
     match tag {
         "autolabel" => "auto-label",
+        "overlaps" => "overlap check",
         "import" => "import",
         _ => "training",
     }
@@ -279,7 +321,7 @@ fn task_name(tag: &str) -> &'static str {
 /// The likely cause of a failed helper script when it ran out of GPU memory (not when the host
 /// ran out too: on Windows a CUDA allocation also fails when the system commit is exhausted;
 /// [`super::job::host_out_of_memory_line`], left to the generic memory message).
-fn gpu_failure(lines: &[String]) -> Option<String> {
+fn gpu_failure(lines: &[String], tag: &str) -> Option<String> {
     if super::job::host_out_of_memory_line(lines).is_some() {
         return None;
     }
@@ -292,11 +334,14 @@ fn gpu_failure(lines: &[String]) -> Option<String> {
         .iter()
         .any(|p| l.contains(p))
     })?;
-    Some(format!(
-        "the GPU ran out of memory ({}): use a smaller labeler (--gdino tiny, --vlm qwen3-vl-2b \
-         or none) or close other programs that use the GPU",
-        l.trim()
-    ))
+    let fix = if tag == "overlaps" {
+        "close other programs that use the GPU (the check needs about 500 MB of it) and run it \
+         again; it keeps the finished pairs"
+    } else {
+        "use a smaller labeler (--gdino tiny, --vlm qwen3-vl-2b or none) or close other programs \
+         that use the GPU"
+    };
+    Some(format!("the GPU ran out of memory ({}): {fix}", l.trim()))
 }
 
 #[cfg(test)]
@@ -312,26 +357,38 @@ mod tests {
         assert!(parse_event("[import] hello", "import").is_none());
         assert!(parse_event("@importx {}", "import").is_none());
         assert!(
-            gpu_failure(&[
-                "x".into(),
-                "RuntimeError: MPS backend out of memory (MPS)".into()
-            ])
+            gpu_failure(
+                &[
+                    "x".into(),
+                    "RuntimeError: MPS backend out of memory (MPS)".into()
+                ],
+                "autolabel"
+            )
             .unwrap()
             .contains("smaller labeler")
         );
+        assert!(
+            gpu_failure(&["CUDA out of memory".into()], "overlaps")
+                .unwrap()
+                .contains("keeps the finished pairs")
+        );
         // The host out of memory too (Windows commit): not the GPU's fault.
         assert_eq!(
-            gpu_failure(&[
-                "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 \
-                 has a total capacity of 8.00 GiB of which 6.17 GiB is free."
-                    .into(),
-                "RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: not \
-                 enough memory: you tried to allocate 262144 bytes."
-                    .into(),
-            ]),
+            gpu_failure(
+                &[
+                    "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU \
+                     0 has a total capacity of 8.00 GiB of which 6.17 GiB is free."
+                        .into(),
+                    "RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: \
+                     not enough memory: you tried to allocate 262144 bytes."
+                        .into(),
+                ],
+                "autolabel"
+            ),
             None
         );
         assert_eq!(task_name("autolabel"), "auto-label");
+        assert_eq!(task_name("overlaps"), "overlap check");
         assert_eq!(task_name("import"), "import");
     }
 

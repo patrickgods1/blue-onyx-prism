@@ -12,6 +12,7 @@
 //! - [`job`]: one run's stage machine over the model export's seams (`CommandRunner`, `Fetcher`;
 //!   the environment is `tools/train-env`, [`crate::resources::export::train`]).
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
+//! - [`overlaps`]: the overlap check, suggestions for nested and partly overlapping boxes.
 //! - [`finish`]: the steps after an import chain (reject low-scoring auto boxes, accept the
 //!   settled frames, switch the Review folder).
 //! - [`bench`]: the benchmark at the end of a run.
@@ -32,6 +33,7 @@ pub mod estimate;
 pub mod finish;
 pub mod import;
 pub mod job;
+pub mod overlaps;
 pub mod progress;
 pub mod pyenv;
 pub mod recipe;

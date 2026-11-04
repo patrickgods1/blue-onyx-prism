@@ -1,6 +1,6 @@
 //! Jobs of the training queue other than a training run: footage imports
-//! ([`super::import`]) and auto-label runs ([`super::autolabel`]). They share the queue's one
-//! worker thread with the training runs ([`super::service::TrainingService`]), so a GPU or the
+//! ([`super::import`]), auto-label runs ([`super::autolabel`]) and overlap checks
+//! ([`super::overlaps`]). They share the queue's one worker thread with the training runs ([`super::service::TrainingService`]), so a GPU or the
 //! training environment is used by one job at a time, and each holds the cross-process
 //! training lock (`tools/.train.lock`) while it runs. A [`Task`] reports numbered stages and
 //! log lines; its [`TaskRecord`] (state, progress, log tail, result) is kept like a run's, in
@@ -23,6 +23,7 @@ pub const TASKS_FILE: &str = "tasks.json";
 pub enum TaskKind {
     Import,
     Autolabel,
+    Overlaps,
 }
 
 impl TaskKind {
@@ -30,6 +31,7 @@ impl TaskKind {
         match self {
             TaskKind::Import => "import",
             TaskKind::Autolabel => "autolabel",
+            TaskKind::Overlaps => "overlaps",
         }
     }
 }
