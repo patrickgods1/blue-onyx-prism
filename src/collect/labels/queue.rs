@@ -184,18 +184,33 @@ impl Filters {
         })
     }
 
+    /// [`Self::wanted`] as [`Wanted`].
+    fn wanted(&self) -> Option<Wanted<'_>> {
+        self.wanted
+            .as_ref()
+            .map(|(classes, hidden)| Wanted { classes, hidden })
+    }
+
     /// Whether a frame with `labels` passes the auto filter.
     fn auto_keeps(&self, labels: Option<&LabelFile>) -> bool {
         match self.auto {
             None => true,
             Some(AutoFilter::Overlaps) => {
-                let wanted = self
-                    .wanted
-                    .as_ref()
-                    .map(|(classes, hidden)| Wanted { classes, hidden });
+                let wanted = self.wanted();
                 labels.is_some_and(|l| super::stacks::needs_look(l, wanted.as_ref()))
             }
             Some(a) => a.matches(labels),
+        }
+    }
+
+    /// The sort strength of a frame with `labels`: its strongest overlap suggestion under
+    /// `auto=overlaps`, else 0 (no effect on the order).
+    fn overlap_strength(&self, labels: Option<&LabelFile>) -> u32 {
+        match (self.auto, labels) {
+            (Some(AutoFilter::Overlaps), Some(l)) => {
+                super::overlaps::frame_strength(l, self.wanted().as_ref())
+            }
+            _ => 0,
         }
     }
 }
@@ -250,6 +265,14 @@ pub struct Uncertainty {
     /// Spot edits settled every box ([`super::repeats::repeats_only`]): these frames come last.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub repeats_only: bool,
+    /// `auto=overlaps` only: the strongest suggestion on the frame
+    /// ([`super::overlaps::frame_strength`], 0 = none). These frames come first, strongest first.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub overlap_strength: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Uncertainty {
@@ -276,6 +299,7 @@ impl Uncertainty {
             relabel: None,
             auto_review: 0,
             repeats_only: false,
+            overlap_strength: 0,
         }
     }
 
@@ -297,9 +321,9 @@ impl Uncertainty {
         self
     }
 
-    /// Sort key, most uncertain first: repeat-only frames last of all, then a re-label
-    /// disagreement, then the margin in hundredths (no box last), verifier disagreement, more auto
-    /// boxes to review, more suppressed boxes.
+    /// Sort key, most uncertain first: the strongest overlap suggestion (`auto=overlaps` only),
+    /// repeat-only frames last of all, then a re-label disagreement, then the margin in hundredths
+    /// (no box last), verifier disagreement, more auto boxes to review, more suppressed boxes.
     #[allow(
         clippy::type_complexity,
         reason = "a lexicographic sort key reads best as one tuple"
@@ -307,6 +331,7 @@ impl Uncertainty {
     fn key(
         &self,
     ) -> (
+        std::cmp::Reverse<u32>,
         bool,
         bool,
         u32,
@@ -323,6 +348,7 @@ impl Uncertainty {
             .margin
             .map_or(u32::MAX, |m| (m.clamp(0.0, 1.0) * 100.0).round() as u32);
         (
+            std::cmp::Reverse(self.overlap_strength),
             self.repeats_only,
             self.relabel.is_none(),
             m,
@@ -492,6 +518,10 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
         if !f.auto_keeps(labels.as_ref()) {
             continue;
         }
+        let uncertainty = Uncertainty {
+            overlap_strength: f.overlap_strength(labels.as_ref()),
+            ..Uncertainty::of(&rec).with_labels(labels.as_ref())
+        };
         q.items.push(Item {
             frame: c.rel,
             timestamp: rec.timestamp.clone(),
@@ -501,7 +531,7 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
             buckets: c.buckets,
             status,
             queued: c.queued,
-            uncertainty: Uncertainty::of(&rec).with_labels(labels.as_ref()),
+            uncertainty,
         });
     }
     sort_items(&mut q.items);
@@ -589,6 +619,7 @@ mod tests {
             relabel: None,
             auto_review: 0,
             repeats_only: false,
+            overlap_strength: 0,
         }
     }
 
@@ -878,6 +909,95 @@ mod tests {
             "any of the classes"
         );
         assert_eq!(build(&dir, &filters(Some("cat,dog"))).counts.total, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_overlaps_queue_lists_reviewed_frames_strongest_suggestion_first() {
+        use super::super::bulk::test_support::{auto_box, put_frame};
+        use super::super::overlaps::{Suggestion, Verdict};
+        use super::super::write;
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let (big, small) = ([0.0, 0.0, 40.0, 40.0], [5.0, 5.0, 25.0, 25.0]);
+        let car = |bbox: [f32; 4]| super::super::LabelBox {
+            bbox,
+            ..auto_box("car", 0.5, super::super::Triage::Review)
+        };
+        let drop_b = |kept: f32, other: f32, weak: bool, low: bool| Suggestion {
+            a: big,
+            b: small,
+            verdict: Verdict::DropB,
+            why: "x".into(),
+            kept_score: (!low).then_some(kept),
+            other_score: (!low).then_some(other),
+            low_confidence: low,
+            weak,
+        };
+        let put = |stem: &str, status: Status, s: Vec<Suggestion>| {
+            let rel = put_frame(&dir, stem, None, vec![car(big), car(small)]);
+            let frame = Frame::resolve(&dir, &rel).unwrap();
+            let mut l = frame.labels().unwrap().unwrap();
+            l.status = status;
+            l.overlap_suggestions = s;
+            write(&frame.labels, &l).unwrap();
+            rel
+        };
+        let none = put("none", Status::Unreviewed, vec![]);
+        let witness = put(
+            "witness",
+            Status::Reviewed,
+            vec![drop_b(0.0, 0.0, false, true)],
+        );
+        let strong = put(
+            "strong",
+            Status::Reviewed,
+            vec![drop_b(0.9, 0.0, false, false)],
+        );
+        let two = put(
+            "two",
+            Status::Unreviewed,
+            vec![Suggestion {
+                verdict: Verdict::TwoObjects,
+                ..drop_b(0.9, 0.8, false, false)
+            }],
+        );
+        let weak = put(
+            "weak",
+            Status::Unreviewed,
+            vec![drop_b(0.9, 0.4, true, false)],
+        );
+        // A frame whose suggestion went stale is one without.
+        let stale = put(
+            "stale",
+            Status::Unreviewed,
+            vec![Suggestion {
+                b: [1.0, 1.0, 2.0, 2.0],
+                ..drop_b(0.9, 0.0, false, false)
+            }],
+        );
+        let classes: Vec<String> = ["car".to_string()].to_vec();
+        let f = Filters {
+            status: StatusFilter::Any,
+            auto: Some(AutoFilter::Overlaps),
+            wanted: Some((classes, Vec::new())),
+            ..Filters::default()
+        };
+        let got: Vec<String> = build(&dir, &f).items.into_iter().map(|i| i.frame).collect();
+        assert_eq!(got.len(), 6, "{got:?}");
+        assert_eq!(got[..4], [strong, two, weak, witness]);
+        let rest: BTreeSet<String> = got[4..].iter().cloned().collect();
+        assert_eq!(rest, [none, stale].into_iter().collect());
+        // The filter asks for it: another queue is not reordered, and shows no strength.
+        let plain = Filters {
+            status: StatusFilter::Any,
+            ..Filters::default()
+        };
+        assert!(
+            build(&dir, &plain)
+                .items
+                .iter()
+                .all(|i| i.uncertainty.overlap_strength == 0)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
