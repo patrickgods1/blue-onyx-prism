@@ -9,6 +9,7 @@
 //! Ultralytics, transformers) map to stable ids ([`canonical`], described by [`METRICS`]);
 //! unknown keys are kept under their raw name. Pure.
 
+use super::recipe::SelectMetric;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -113,6 +114,8 @@ pub enum TrainEvent {
     /// The rule reached a stop point and anneals: a lowered learning rate until `until`, then
     /// the stop.
     Anneal(Anneal),
+    /// The selected metric's source failed: the run goes on by mAP.
+    SelectFallback(SelectFallback),
     Done {
         onnx: String,
         yaml: String,
@@ -200,6 +203,7 @@ pub const METRICS: &[MetricInfo] = {
         m("map50", "mAP 50", "mAP50", UP, Fixed3),
         m("map75", "mAP 75", "mAP75", UP, Fixed3),
         m("mar", "mAR (max detections)", "mAR", UP, Fixed3),
+        m("iou", "Mean IoU of matched boxes", "IoU", UP, Fixed3),
         m(
             "precision",
             "Precision (at the best F1 threshold)",
@@ -378,7 +382,8 @@ pub struct EpochPoint {
     pub metrics: BTreeMap<String, f64>,
 }
 
-/// The best epoch on the primary metric (`map`, else `map50`, else the lowest `val_loss`).
+/// The best epoch on the selected metric ([`SelectMetric`]), by default the primary one (`map`,
+/// else `map50`, else the lowest `val_loss`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Best {
     pub metric: String,
@@ -389,8 +394,24 @@ pub struct Best {
 /// The primary metrics, in order of preference, with "larger is better".
 const PRIMARY: [(&str, bool); 3] = [("map", true), ("map50", true), ("val_loss", false)];
 
-/// The best epoch of `history` (see [`Best`]); the earliest epoch wins a tie.
-pub fn best_of(history: &[EpochPoint]) -> Option<Best> {
+/// The best epoch of `history` on `select` (see [`Best`]); the earliest epoch wins a tie.
+pub fn best_of(history: &[EpochPoint], select: SelectMetric) -> Option<Best> {
+    if !select.is_default() {
+        let mut best: Option<Best> = None;
+        for (epoch, v) in rule_values(history, select) {
+            let Some(v) = v else { continue };
+            if best.as_ref().is_none_or(|b| v > b.value) {
+                best = Some(Best {
+                    metric: select.id().to_string(),
+                    epoch,
+                    value: v,
+                });
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
     PRIMARY.iter().find_map(|&(id, up)| {
         let mut best: Option<Best> = None;
         for p in history {
@@ -412,6 +433,27 @@ pub fn best_of(history: &[EpochPoint]) -> Option<Best> {
     })
 }
 
+/// The value of the convergence rule and the best epoch for each row of `history`, as the
+/// script's `pick_metric`: `map` (`map50` when no epoch has it), `map50`, or the macro F / mean
+/// IoU, which a validated epoch without one (nothing matched) counts as 0.
+pub fn rule_values(history: &[EpochPoint], select: SelectMetric) -> Vec<(u32, Option<f64>)> {
+    let map = select == SelectMetric::Map;
+    let id = if map && !history.iter().any(|p| p.metrics.contains_key("map")) {
+        "map50"
+    } else {
+        select.id()
+    };
+    let zero = !matches!(select, SelectMetric::Map | SelectMetric::Map50);
+    history
+        .iter()
+        .map(|p| {
+            let validated = p.metrics.contains_key("map") || p.metrics.contains_key("map50");
+            let v = p.metrics.get(id).copied();
+            (p.epoch, v.or((zero && validated).then_some(0.0)))
+        })
+        .collect()
+}
+
 /// Why training ended before its last epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stop {
@@ -427,7 +469,7 @@ pub struct Stop {
 #[serde(default)]
 pub struct ConvergePoint {
     pub epoch: u32,
-    /// The epoch whose checkpoint a stop now keeps (highest raw mAP).
+    /// The epoch whose checkpoint a stop now keeps (highest raw value of the selected metric).
     pub best_epoch: u32,
     pub best: Option<f64>,
     pub loss_falling: bool,
@@ -447,11 +489,21 @@ pub struct ConvergePoint {
 pub struct Anneal {
     pub epoch: u32,
     pub until: u32,
-    /// The epoch whose checkpoint a stop now keeps (highest raw mAP so far).
+    /// The epoch whose checkpoint a stop now keeps (highest raw value so far).
     pub best_epoch: u32,
     pub best: Option<f64>,
     pub loss_falling: bool,
     pub extensions: u32,
+}
+
+/// The script's `select_fallback` event: `metric`'s source failed at `epoch`, so from there the
+/// run selects by mAP; the checkpoint and the rule start again at that epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SelectFallback {
+    pub metric: String,
+    pub epoch: u32,
+    pub reason: String,
 }
 
 /// Extensions past a stop point while the training loss still falls (the script's
@@ -499,9 +551,9 @@ pub struct Rule {
     pub patience: u32,
     /// No stop point before this epoch.
     pub min_epochs: u32,
-    /// Smallest gain of the smoothed mAP that counts.
+    /// Smallest gain of the smoothed value that counts.
     pub min_delta: f64,
-    /// The gain is measured on the mean of the last `smooth` mAP values (0 and 1 = the raw value).
+    /// The gain is measured on the mean of the last `smooth` values (0 and 1 = the raw value).
     pub smooth: u32,
     /// The run's epochs (0 = unknown): no extension at the last one.
     pub epochs: u32,
@@ -520,14 +572,15 @@ pub struct ConvergenceRun {
     pub anneal: Option<u32>,
 }
 
-/// The convergence rule over `(epoch, validation mAP, training loss)` in epoch order (a
-/// repeated or older epoch is ignored): a stop point once `epoch >= min_epochs` and `patience`
-/// epochs passed since the last gain of more than `min_delta` in the mean of the last `smooth`
-/// mAP values (or since the last extension). At a stop point the run goes on while the loss
-/// still falls over the last `patience` epochs ([`loss_falling`]), at most [`MAX_EXTENSIONS`]
-/// times and before its last epoch; else, with `anneal` > 0 and before its last epoch, it
-/// anneals until `epoch + anneal` (at most `epochs`; later stop points are ignored) and stops
-/// there; else it stops. The twin of the script's `Convergence` (parity-tested).
+/// The convergence rule over `(epoch, value of the selected metric ([`rule_values`]), training
+/// loss)` in epoch order (a repeated or older epoch is ignored): a stop point once `epoch >=
+/// min_epochs` and `patience` epochs passed since the last gain of more than `min_delta` in the
+/// mean of the last `smooth` values (or since the last extension). At a stop point the run goes
+/// on while the loss still falls over the last `patience` epochs ([`loss_falling`]), at most
+/// [`MAX_EXTENSIONS`] times and before its last epoch; else, with `anneal` > 0 and before its
+/// last epoch, it anneals until `epoch + anneal` (at most `epochs`; later stop points are
+/// ignored) and stops there; else it stops. The twin of the script's `Convergence`
+/// (parity-tested).
 pub fn convergence_run(epochs: &[(u32, Option<f64>, Option<f64>)], rule: &Rule) -> ConvergenceRun {
     let mut t = Tracker::new(rule.min_delta, rule.smooth);
     let mut losses: Vec<Option<f64>> = Vec::new();
@@ -576,8 +629,7 @@ pub fn convergence_run(epochs: &[(u32, Option<f64>, Option<f64>)], rule: &Rule) 
 }
 
 /// The epoch [`convergence_run`] stops at without training losses (so without extensions) for
-/// the per-epoch validation mAP `values`, after an anneal of `anneal` epochs; None when it does
-/// not stop.
+/// the per-epoch `values`, after an anneal of `anneal` epochs; None when it does not stop.
 pub fn convergence_decision(
     values: &[(u32, f64)],
     patience: u32,
@@ -671,6 +723,10 @@ pub struct RunSettings {
     pub lr_schedule: super::recipe::LrSchedule,
     /// The final learning rate factor in effect (the family's default when none is set).
     pub lr_min_factor: f32,
+    /// What picks the exported epoch and drives the convergence rule (a record from before the
+    /// setting: `map`).
+    #[serde(default)]
+    pub select_metric: SelectMetric,
     /// Epochs (a cap while early stopping is on).
     pub epochs: u32,
     /// Patience in effect (0 = off), after a small validation split doubled it.
@@ -725,12 +781,12 @@ pub struct TrainProgress {
     /// The run's minimum epochs (the rule never stops before), set with `patience`.
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub min_epochs: u32,
-    /// The rule's smoothing window (mean of the last N mAP values; 0 = 1), set with `patience`.
+    /// The rule's smoothing window (mean of the last N values; 0 = 1), set with `patience`.
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub smooth: u32,
-    /// Epochs since the last improvement of the rule's metric (mAP 50-95, else mAP 50), or since
-    /// the last extension: the run reaches a stop point when this reaches `patience` (past the
-    /// minimum epochs).
+    /// Epochs since the last improvement of the rule's metric ([`Self::select_metric`]; mAP 50-95,
+    /// else mAP 50, by default), or since the last extension: the run reaches a stop point when
+    /// this reaches `patience` (past the minimum epochs).
     pub since_best: u32,
     /// The last stop point the run went past because the training loss still fell.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -757,6 +813,9 @@ pub struct TrainProgress {
     /// The run's settings (None for a run recorded before they were kept).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<RunSettings>,
+    /// The selected metric's source failed: the run went on by mAP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub select_fallback: Option<SelectFallback>,
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -862,6 +921,11 @@ impl TrainProgress {
                 self.since_best = self.since_improvement();
             }
             TrainEvent::Anneal(a) => self.anneal = Some(a.clone()),
+            TrainEvent::SelectFallback(f) => {
+                self.select_fallback = Some(f.clone());
+                self.best = best_of(self.rule_history(), self.select_metric());
+                self.since_best = self.since_improvement();
+            }
             TrainEvent::SelfCheck { .. } | TrainEvent::Done { .. } => {}
         }
         self.extension = self.extension_notice();
@@ -948,20 +1012,32 @@ impl TrainProgress {
         while self.history.len() > MAX_HISTORY {
             self.history.remove(0);
         }
-        self.best = best_of(&self.history);
+        self.best = best_of(self.rule_history(), self.select_metric());
         self.since_best = self.since_improvement();
     }
 
-    /// The rule's state over the history (its metric: `map` when any epoch has it, else `map50`).
+    /// The metric the run selects by: its setting, `map` from a [`SelectFallback`] on (and for a
+    /// record from before the setting).
+    pub fn select_metric(&self) -> SelectMetric {
+        match &self.settings {
+            Some(s) if self.select_fallback.is_none() => s.select_metric,
+            _ => SelectMetric::Map,
+        }
+    }
+
+    /// The history the best epoch and the rule see: all of it, or from a [`SelectFallback`] on
+    /// (the script forgets the earlier values there).
+    fn rule_history(&self) -> &[EpochPoint] {
+        let from = self.select_fallback.as_ref().map_or(0, |f| f.epoch);
+        let at = self.history.partition_point(|p| p.epoch < from);
+        self.history.get(at..).unwrap_or_default()
+    }
+
+    /// The rule's state over the history ([`rule_values`] of the selected metric).
     fn rule_state(&self) -> Tracker {
-        let id = if self.history.iter().any(|p| p.metrics.contains_key("map")) {
-            "map"
-        } else {
-            "map50"
-        };
         let mut t = Tracker::new(self.min_delta, self.smooth);
-        for p in &self.history {
-            t.update(p.epoch, p.metrics.get(id).copied());
+        for (epoch, v) in rule_values(self.rule_history(), self.select_metric()) {
+            t.update(epoch, v);
         }
         t
     }
@@ -985,6 +1061,7 @@ impl TrainProgress {
             return None;
         }
         let t = self.rule_state();
+        let label = self.select_metric().short();
         let kept = |epoch: u32, value: Option<f64>| {
             let (keep, best) = match t.top {
                 Some(v) if t.top_epoch > 0 => (t.top_epoch, Some(v)),
@@ -992,7 +1069,7 @@ impl TrainProgress {
             };
             (
                 keep,
-                best.map_or_else(String::new, |b| format!(", mAP {b:.3}")),
+                best.map_or_else(String::new, |b| format!(", {label} {b:.3}")),
             )
         };
         if let Some(a) = &self.anneal {
@@ -1105,7 +1182,7 @@ impl TrainProgress {
                 "map" => "mAP50-95",
                 "map50" => "mAP50",
                 "val_loss" => "val loss",
-                other => other,
+                other => metric(other).map_or(other, |m| m.short),
             };
             s.push_str(&format!(
                 ", best {label} {:.3} @ epoch {}",
@@ -1399,6 +1476,7 @@ mod tests {
             lr_encoder: Some(7.5e-5),
             lr_schedule: crate::training::recipe::LrSchedule::Cosine,
             lr_min_factor: 0.1,
+            select_metric: SelectMetric::F2,
             epochs: 100,
             patience: 20,
             patience_doubled: true,
@@ -1414,6 +1492,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v["settings"]["lr_schedule"], "cosine");
+        assert_eq!(v["settings"]["select_metric"], "f2");
         assert_eq!(v["settings"]["patience_doubled"], true);
         assert_eq!(v["settings"]["scene"], "night+ir");
         let back: RunSettings = serde_json::from_value(v["settings"].clone()).unwrap();
@@ -1507,6 +1586,7 @@ mod tests {
             ("eval_map_50", "map50"),
             // the script's own
             ("f2", "f2"),
+            ("iou", "iou"),
             ("f2_thr", "f2_thr"),
             ("mem_gb", "mem_gb"),
             ("img_s", "img_s"),
@@ -1534,6 +1614,28 @@ mod tests {
         let lr = METRICS.iter().position(|m| m.id == "lr").unwrap();
         assert_eq!(j[lr]["format"], "sci");
         assert!(j[lr]["higher_better"].is_null());
+    }
+
+    /// `iou` lands in the history and never decides the best epoch or the convergence rule.
+    #[test]
+    fn mean_iou_is_shown_but_decides_nothing() {
+        let mut p = TrainProgress::default();
+        p.apply(&epoch(1, &[("val/mAP_50_95", 0.5), ("iou", 0.9)]), 10.0);
+        p.apply(&epoch(2, &[("val/mAP_50_95", 0.6), ("iou", 0.7)]), 20.0);
+        assert_eq!(p.history[0].metrics["iou"], 0.9);
+        assert_eq!(p.history[1].metrics["iou"], 0.7);
+        assert_eq!(
+            p.best,
+            Some(Best {
+                metric: "map".into(),
+                epoch: 2,
+                value: 0.6
+            })
+        );
+        // Only an `iou`: no best epoch.
+        let mut p = TrainProgress::default();
+        p.apply(&epoch(1, &[("iou", 0.9)]), 10.0);
+        assert_eq!(p.best, None);
     }
 
     #[test]
@@ -1585,7 +1687,10 @@ mod tests {
         assert_eq!(p.val_loss, Some(1.8));
         // mAP outranks the val loss once any epoch has it.
         p.history[0].metrics.insert("map".into(), 0.2);
-        assert_eq!(best_of(&p.history).unwrap().metric, "map");
+        assert_eq!(
+            best_of(&p.history, SelectMetric::Map).unwrap().metric,
+            "map"
+        );
         // map50 when there is no mAP50-95; a tie keeps the earlier epoch.
         let h = [
             EpochPoint {
@@ -1599,8 +1704,8 @@ mod tests {
                 metrics: [("map50".to_string(), 0.4)].into(),
             },
         ];
-        assert_eq!(best_of(&h).unwrap().epoch, 1);
-        assert_eq!(best_of(&[]), None);
+        assert_eq!(best_of(&h, SelectMetric::Map).unwrap().epoch, 1);
+        assert_eq!(best_of(&[], SelectMetric::Map), None);
     }
 
     #[test]
@@ -2304,6 +2409,148 @@ print(json.dumps({"runs": out, "falling": falling, "finish": fin, "anneal_finish
         assert_eq!(falling, want);
     }
 
+    /// The script's `match_detections(..., ious=)` on hand-computed boxes (a partial overlap, a
+    /// box of exactly 0.5, one below it, a wrong class, two predictions on one ground truth), its
+    /// return value unchanged, `mean_iou`, `IouMeter` and the trainer hooks' box readers (skipped
+    /// without Python 3 or numpy).
+    #[test]
+    fn mean_iou_matches_hand_computed_boxes() {
+        let script = include_str!("../../scripts/train_model.py");
+        let code = r#"
+import json, sys
+src = sys.stdin.read()  # first: the test is still writing it when numpy is missing
+try:
+    import numpy as np
+except ImportError:
+    print("null")
+    sys.exit(0)
+ns = {"__name__": "train_model"}
+exec(compile(src, "train_model.py", "exec"), ns)
+logs = []
+ns["log"] = logs.append
+
+def boxes(rows):
+    return np.array(rows, dtype=np.float64).reshape(-1, 4)
+
+def labels(rows):
+    return np.array(rows, dtype=np.int64)
+
+def scores(rows):
+    return np.array(rows, dtype=np.float64)
+
+preds = [
+    # The 0.9 box takes the ground truth (IoU 0.8); the better 0.5 box finds it used. The 0.8 box
+    # sits exactly on the class 1 ground truth under the wrong class. The class 1 box is at 0.4.
+    (boxes([[0, 0, 10, 8], [0, 0, 10, 10], [20, 0, 30, 10], [20, 0, 30, 4]]), labels([0, 0, 0, 1]),
+     scores([0.9, 0.5, 0.8, 0.7])),
+    # IoU 0.6.
+    (boxes([[0, 0, 10, 6]]), labels([1]), scores([0.6])),
+    # Exactly the threshold, IoU 0.5.
+    (boxes([[0, 0, 10, 5]]), labels([0]), scores([0.4])),
+    # No ground truth in this image.
+    (boxes([[0, 0, 10, 10]]), labels([0]), scores([0.9])),
+    # No prediction in this image.
+    (boxes([]), labels([]), scores([])),
+]
+gts = [
+    (boxes([[0, 0, 10, 10], [20, 0, 30, 10]]), labels([0, 1])),
+    (boxes([[0, 0, 10, 10]]), labels([1])),
+    (boxes([[0, 0, 10, 10]]), labels([0])),
+    (boxes([]), labels([])),
+    (boxes([[0, 0, 10, 10]]), labels([0])),
+]
+ious = []
+with_ious = ns["match_detections"](preds, gts, ious=ious)
+plain = ns["match_detections"](preds, gts)
+same = sorted(with_ious) == sorted(plain) and all(
+    np.array_equal(with_ious[c][0], plain[c][0]) and np.array_equal(with_ious[c][1], plain[c][1])
+    and with_ious[c][2] == plain[c][2] for c in plain)
+mean = ns["mean_iou"](ious)
+
+meter = ns["IouMeter"]()
+meter.add(lambda: (preds, gts))
+ok = meter.take()
+after_take = meter.take()
+def broken():
+    raise KeyError("conf")
+meter.add(lambda: (preds, gts))
+meter.add(broken)
+meter.add(broken)
+meter.add(lambda: (preds, gts))
+failed = meter.take()
+
+# Stand-in tensor.
+class T:
+    def __init__(self, a):
+        self.a = np.array(a)
+    def detach(self):
+        return self
+    def float(self):
+        return T(self.a.astype(np.float32))
+    def cpu(self):
+        return self
+    def numpy(self):
+        return self.a
+
+pred = {"bboxes": T([[0, 0, 10, 8]]), "cls": T([2]), "conf": T([0.9])}
+yolo = []
+ns["match_detections"](*ns["ultralytics_boxes"](pred, {"bboxes": T([[0, 0, 10, 10]]), "cls": T([2])}), ious=yolo)
+pred = {"boxes": T([[0, 0, 10, 8], [0, 0, 10, 6]]), "labels": T([2, 2]), "scores": T([0.9, 0.8])}
+rfdetr = []
+ns["match_detections"](*ns["rfdetr_boxes"]([pred], [{"boxes": T([[0, 0, 10, 10]]), "labels": T([2])}]), ious=rfdetr)
+print(json.dumps({"ious": ious, "same": same, "mean": mean["iou"], "empty": ns["mean_iou"]([]), "ok": ok["iou"],
+                  "after_take": after_take, "failed": failed, "logs": logs, "yolo": yolo, "rfdetr": rfdetr}))
+"#;
+        let Some(python) = python3() else {
+            eprintln!("no Python 3 found; mean IoU test skipped");
+            return;
+        };
+        let mut child = std::process::Command::new(python)
+            .args(["-I", "-c", code])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(script.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{python} failed");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if v.is_null() {
+            eprintln!("{python} has no numpy; mean IoU test skipped");
+            return;
+        }
+        let close = |got: &serde_json::Value, want: f64, what: &str| {
+            let got = got.as_f64().unwrap();
+            assert!((got - want).abs() < 1e-6, "{what}: {got} != {want}");
+        };
+        let ious = v["ious"].as_array().unwrap();
+        assert_eq!(ious.len(), 3, "{ious:?}");
+        for (got, want) in ious.iter().zip([0.8, 0.6, 0.5]) {
+            close(got, want, "matched IoU");
+        }
+        assert_eq!(v["same"], true);
+        close(&v["mean"], (0.8 + 0.6 + 0.5) / 3.0, "mean");
+        assert_eq!(v["empty"], serde_json::json!({}));
+        close(&v["ok"], (0.8 + 0.6 + 0.5) / 3.0, "meter");
+        // Reading empties the meter; a failed read logs once and leaves the metric out.
+        assert_eq!(v["after_take"], serde_json::json!({}));
+        assert_eq!(v["failed"], serde_json::json!({}));
+        assert_eq!(v["logs"].as_array().unwrap().len(), 1, "{}", v["logs"]);
+        assert!(
+            v["logs"][0].as_str().unwrap().contains("mean IoU skipped"),
+            "{}",
+            v["logs"]
+        );
+        // The hooks' readers: both hand over boxes, classes and scores.
+        close(&v["yolo"][0], 0.8, "ultralytics_boxes");
+        assert_eq!(v["rfdetr"].as_array().unwrap().len(), 1);
+        close(&v["rfdetr"][0], 0.8, "rfdetr_boxes");
+    }
+
     /// The script's memory gate before the export (`memory_shortfall`, `wait_for_memory` with a
     /// fake clock): unknown values never block, the 3 GB / 4 GB limits, a wait that ends when
     /// memory frees, one that runs out, and a stop file that only counts when it appears during
@@ -2498,5 +2745,454 @@ print("RESULT: " + json.dumps(out))
                 lr: Some(0.0004)
             })
         );
+    }
+
+    fn select_settings(select: SelectMetric) -> RunSettings {
+        RunSettings {
+            lr: None,
+            lr_encoder: None,
+            lr_schedule: crate::training::recipe::LrSchedule::Linear,
+            lr_min_factor: 0.01,
+            select_metric: select,
+            epochs: 30,
+            patience: 3,
+            patience_doubled: false,
+            batch: 8,
+            workers: None,
+            seed: None,
+            scene: None,
+            gpu: None,
+        }
+    }
+
+    /// `(epoch, loss, raw metrics)`.
+    type SelectRow = (u32, f64, Vec<(&'static str, f64)>);
+
+    /// A progress selecting by `select` that saw `rows`.
+    fn selecting(select: SelectMetric, rows: &[SelectRow]) -> TrainProgress {
+        let mut p = TrainProgress {
+            patience: 3,
+            min_epochs: 2,
+            min_delta: 0.001,
+            smooth: 1,
+            settings: Some(select_settings(select)),
+            ..TrainProgress::default()
+        };
+        for (e, loss, m) in rows {
+            p.apply(
+                &TrainEvent::Epoch {
+                    epoch: *e,
+                    epochs: 30,
+                    loss: Some(*loss),
+                    map50: None,
+                    map: None,
+                    elapsed_s: None,
+                    metrics: m.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+                },
+                f64::from(*e),
+            );
+        }
+        p
+    }
+
+    /// mAP peaks at epoch 2, F2 at 4, F0.5 at 1, IoU at 3; F2 is missing at epoch 5 (nothing
+    /// matched), the last row has no validation.
+    fn select_rows() -> Vec<SelectRow> {
+        let row = |map, map50, f1, f2, f05, iou| {
+            vec![
+                ("metrics/mAP50-95(B)", map),
+                ("metrics/mAP50(B)", map50),
+                ("f1", f1),
+                ("f2", f2),
+                ("f0_5", f05),
+                ("iou", iou),
+            ]
+        };
+        vec![
+            (1, 3.0, row(0.30, 0.61, 0.50, 0.40, 0.70, 0.60)),
+            (2, 2.9, row(0.50, 0.62, 0.52, 0.45, 0.60, 0.62)),
+            (3, 2.8, row(0.40, 0.70, 0.60, 0.50, 0.50, 0.80)),
+            (4, 2.7, row(0.45, 0.65, 0.65, 0.90, 0.40, 0.70)),
+            (
+                5,
+                2.6,
+                vec![("metrics/mAP50-95(B)", 0.44), ("metrics/mAP50(B)", 0.64)],
+            ),
+            (6, 2.5, vec![("val_loss", 1.0)]),
+        ]
+    }
+
+    #[test]
+    fn best_and_the_rule_follow_the_selected_metric() {
+        let want = [
+            (SelectMetric::Map, "map", 2, 0.50),
+            (SelectMetric::Map50, "map50", 3, 0.70),
+            (SelectMetric::F1, "f1", 4, 0.65),
+            (SelectMetric::F2, "f2", 4, 0.90),
+            (SelectMetric::F05, "f0_5", 1, 0.70),
+            (SelectMetric::Iou, "iou", 3, 0.80),
+        ];
+        for (select, id, epoch, value) in want {
+            let p = selecting(select, &select_rows());
+            assert_eq!(p.select_metric(), select);
+            assert_eq!(
+                p.best,
+                Some(Best {
+                    metric: id.into(),
+                    epoch,
+                    value
+                }),
+                "{id}"
+            );
+            // The last row has no value, so it counts as an epoch without a gain.
+            assert_eq!(p.since_best, 6 - epoch, "{id}");
+        }
+        let p = selecting(SelectMetric::F2, &select_rows());
+        // A validated epoch without the key is 0 (the script's pick_metric); no validation, none.
+        let v = rule_values(&p.history, SelectMetric::F2);
+        assert_eq!(v[4], (5, Some(0.0)));
+        assert_eq!(v[5], (6, None));
+        assert_eq!(rule_values(&p.history, SelectMetric::Map)[5], (6, None));
+        assert!(
+            p.describe().contains("best F2 0.900 @ epoch 4"),
+            "{}",
+            p.describe()
+        );
+        // The notices name the metric and keep its best epoch; a default run's are as before.
+        for (select, kept) in [
+            (SelectMetric::F2, "best epoch 4, F2 0.900"),
+            (SelectMetric::Iou, "best epoch 3, IoU 0.800"),
+            (SelectMetric::Map, "best epoch 2, mAP 0.500"),
+        ] {
+            let mut p = selecting(select, &select_rows());
+            p.apply(
+                &TrainEvent::ConvergePoint(ConvergePoint {
+                    epoch: 6,
+                    best_epoch: 1,
+                    best: Some(0.1),
+                    loss_falling: true,
+                    loss_from: Some(3.0),
+                    loss_to: Some(2.5),
+                    extension: 1,
+                    next_check: 9,
+                }),
+                6.0,
+            );
+            let text = &p.extension.as_ref().unwrap().text;
+            assert!(text.contains(kept), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_record_without_the_setting_selects_by_map_as_before() {
+        // A run recorded before the setting: settings without `select_metric`, or none at all.
+        let mut s = serde_json::to_value(select_settings(SelectMetric::Map)).unwrap();
+        s.as_object_mut().unwrap().remove("select_metric");
+        let old: RunSettings = serde_json::from_value(s).unwrap();
+        assert_eq!(old.select_metric, SelectMetric::Map);
+        let p: TrainProgress = serde_json::from_value(serde_json::json!({
+            "epoch": 2, "epochs": 5,
+            "history": [{"epoch": 1, "metrics": {"map": 0.4, "f2": 0.9}},
+                        {"epoch": 2, "metrics": {"map": 0.5, "f2": 0.1}}],
+            "best": {"metric": "map", "epoch": 2, "value": 0.5},
+            "settings": serde_json::to_value(&old).unwrap(),
+        }))
+        .unwrap();
+        assert_eq!(p.select_metric(), SelectMetric::Map);
+        assert_eq!(p.select_fallback, None);
+        let mut none = p.clone();
+        none.settings = None;
+        for mut q in [p, none] {
+            q.apply(
+                &TrainEvent::Eval {
+                    epoch: 2,
+                    val_loss: Some(1.0),
+                    metrics: BTreeMap::new(),
+                },
+                2.0,
+            );
+            assert_eq!(q.best.as_ref().unwrap().metric, "map");
+            assert_eq!(q.best.as_ref().unwrap().epoch, 2);
+            assert!(
+                serde_json::to_value(&q)
+                    .unwrap()
+                    .get("select_fallback")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn a_fallback_selects_by_map_from_its_epoch() {
+        let mut p = selecting(SelectMetric::F2, &select_rows());
+        assert_eq!(p.best.as_ref().unwrap().metric, "f2");
+        let ev = parse_line(
+            r#"@train {"metric":"f2","epoch":3,"reason":"the F-beta sweep failed","event":"select_fallback"}"#,
+        )
+        .unwrap();
+        p.apply(&ev, 6.0);
+        assert_eq!(p.select_metric(), SelectMetric::Map);
+        // Epochs before it no longer count: mAP's own best of the rest, not epoch 2's 0.50.
+        assert_eq!(
+            p.best,
+            Some(Best {
+                metric: "map".into(),
+                epoch: 4,
+                value: 0.45
+            })
+        );
+        assert_eq!(p.since_best, 2);
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["select_fallback"]["metric"], "f2");
+        let back: TrainProgress = serde_json::from_value(v).unwrap();
+        assert_eq!(back.select_metric(), SelectMetric::Map);
+    }
+
+    /// `Convergence` fed by the script's `pick_metric` decides as [`convergence_run`] over
+    /// [`rule_values`], with the same best epoch as [`best_of`], for every metric of
+    /// `SELECT_METRICS`; both lists and the names agree; `Selection` falls back once (skipped
+    /// without Python 3).
+    #[test]
+    fn selected_metric_matches_the_training_script() {
+        use crate::training::recipe::SELECT_METRICS;
+        // A long run: the metrics peak at different epochs, F2 and IoU go missing at some.
+        let rows: Vec<SelectRow> = (1..=40u32)
+            .map(|e| {
+                let t = f64::from(e);
+                let wave = |p: f64, q: f64| 0.5 + 0.3 * (t / p).sin() - t * q;
+                let mut m = vec![
+                    ("metrics/mAP50-95(B)", wave(5.0, 0.002)),
+                    ("metrics/mAP50(B)", wave(4.0, 0.001)),
+                    ("f1", wave(6.0, 0.0)),
+                    ("f0_5", wave(3.0, 0.004)),
+                ];
+                if e % 7 != 0 {
+                    m.push(("f2", wave(7.0, 0.003)));
+                    m.push(("iou", wave(2.5, 0.0)));
+                }
+                (e, 4.0 - t * if e < 20 { 0.08 } else { 0.0 }, m)
+            })
+            .collect();
+        let rule = Rule {
+            patience: 6,
+            min_epochs: 10,
+            min_delta: 0.001,
+            smooth: 3,
+            epochs: 40,
+            anneal: 3,
+        };
+        let raw: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(e, l, m)| {
+                let metrics: BTreeMap<&str, f64> = m.iter().copied().collect();
+                serde_json::json!({"epoch": e, "loss": l, "metrics": metrics})
+            })
+            .collect();
+        let shorts: BTreeMap<&str, &str> = SELECT_METRICS
+            .iter()
+            .map(|o| (o.metric.id(), o.metric.short()))
+            .collect();
+        let ids: Vec<&str> = SELECT_METRICS.iter().map(|o| o.metric.id()).collect();
+        let data = serde_json::json!({"rows": raw, "ids": ids, "patience": rule.patience,
+            "min_epochs": rule.min_epochs, "min_delta": rule.min_delta, "smooth": rule.smooth,
+            "total": rule.epochs, "anneal": rule.anneal});
+        let code = r#"
+import io, json, sys
+from contextlib import redirect_stdout
+src, data = sys.stdin.read().split("\n#CASES#\n")
+d = json.loads(data)
+ns = {"__name__": "train_model"}
+exec(compile(src, "train_model.py", "exec"), ns)
+Pick, Sel, Conv = ns["pick_metric"], ns["Selection"], ns["Convergence"]
+out = {"ids": list(ns["SELECT_METRICS"]), "labels": ns["SELECT_LABELS"], "runs": {}}
+for id in d["ids"]:
+    c = Conv(d["patience"], d["min_epochs"], d["min_delta"], None, d["smooth"], d["total"], d["anneal"])
+    stop, points, anneal = None, [], None
+    for r in d["rows"]:
+        decision = c.update(r["epoch"], Pick(r["metrics"], id), r["loss"])
+        if c.point is not None:
+            points.append(c.point["epoch"])
+        if c.annealing is not None:
+            anneal = c.annealing["epoch"]
+        if decision:
+            stop = r["epoch"]
+            break
+    out["runs"][id] = {"stop": stop, "points": points, "anneal": anneal, "top_epoch": c.top_epoch}
+nan = float("nan")
+out["pick"] = [
+    Pick({"metrics/mAP50-95(B)": 0.5, "metrics/mAP50(B)": 0.7}, "map"),
+    Pick({"metrics/mAP50(B)": 0.7}, "map"),
+    Pick({"val/ema_mAP_50_95": 0.4}, "map"),
+    Pick({"map": 0.3, "map50": 0.6}, "map"),
+    Pick({}, "map"),
+    Pick({"val/mAP_50": 0.6}, "map50"),
+    Pick({"metrics/mAP50-95(B)": 0.5}, "map50"),
+    Pick({"val/F1": 0.55}, "f1"),
+    Pick({"f1": 0.25}, "f1"),
+    Pick({"f2": 0.8, "map": 0.1}, "f2"),
+    Pick({"f0_5": 0.2}, "f0_5"),
+    Pick({"iou": 0.9}, "iou"),
+    Pick({"map": 0.5}, "f2"),
+    Pick({"map": 0.5}, "iou"),
+    Pick({"f1": nan}, "f1"),
+]
+buf = io.StringIO()
+with redirect_stdout(buf):
+    c = Conv(2, 0, 0.0, None, 1, 0, 0, ns["SELECT_LABELS"]["f2"])
+    s = Sel("f2", c)
+    values = [s.value({"f2": 0.9, "map": 0.2}, 1, sweep_failed=False)]
+    c.update(1, values[-1])
+    before = [c.top, c.top_epoch, c.label]
+    values.append(s.value({"map": 0.3}, 2, sweep_failed=True, iou_failed=True))
+    after = [c.top, c.top_epoch, c.label, s.metric, s.requested, s.label]
+    c.update(2, values[-1])
+    values.append(s.value({"map": 0.25}, 3, sweep_failed=True))
+    c.update(3, values[-1])
+    final = [c.top, c.top_epoch]
+text = buf.getvalue()
+out["fallback"] = {"values": values, "before": before, "after": after, "final": final, "text": text}
+buf = io.StringIO()
+with redirect_stdout(buf):
+    kept = [Sel("f1").value({"f1": 0.5}, 1, iou_failed=True), Sel("iou").value({"iou": 0.6}, 1, sweep_failed=True),
+            Sel("map").value({"map": 0.7}, 1, sweep_failed=True, iou_failed=True),
+            Sel("map50").value({"map50": 0.8}, 1, sweep_failed=True, iou_failed=True)]
+    iou = Sel("iou")
+    kept.append(iou.value({"map": 0.4, "iou": 0.9}, 4, iou_failed=True))
+    kept.append(iou.metric)
+out["kept"] = kept
+out["kept_text"] = buf.getvalue()
+def stop_text(label):
+    buf = io.StringIO()
+    c = Conv(2, 0, 0.0, None, 3, 0, 0, label)
+    with redirect_stdout(buf):
+        for e in range(1, 5):
+            if c.step(e, 0.5, None):
+                break
+    return buf.getvalue()
+out["stop"] = {"default": stop_text("mAP"), "f2": stop_text("F2")}
+base = ["--family", "yolo26", "--size", "n", "--name", "x", "--weights", "w", "--data", "d", "--out-dir", "o",
+        "--work", "k", "--export-script", "e", "--trainer", "ultralytics"]
+def parse(*extra):
+    sys.argv = ["train_model.py", *extra, *base]
+    try:
+        return ns["parse_args"]().select_metric
+    except SystemExit:
+        return "error"
+with redirect_stdout(io.StringIO()):
+    sys.stderr = io.StringIO()
+    out["args"] = [parse(), parse("--select-metric", "f0_5"), parse("--select-metric", "f3")]
+    sys.stderr = sys.__stderr__
+print("RESULT: " + json.dumps(out))
+"#;
+        let Some(python) = python3() else {
+            eprintln!("no Python 3 found; selected metric test skipped");
+            return;
+        };
+        let mut child = std::process::Command::new(python)
+            .args(["-I", "-c", code])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().unwrap();
+            let script = include_str!("../../scripts/train_model.py");
+            stdin
+                .write_all(format!("{script}\n#CASES#\n{data}").as_bytes())
+                .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{python} failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("RESULT: "))
+            .unwrap_or_else(|| panic!("no result in {stdout}"));
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        use serde_json::json;
+        assert_eq!(v["ids"], json!(ids));
+        assert_eq!(v["labels"], json!(shorts));
+        let mut stops = 0;
+        for o in SELECT_METRICS {
+            let id = o.metric.id();
+            let mut p = selecting(o.metric, &rows);
+            p.min_delta = rule.min_delta;
+            let values = rule_values(&p.history, o.metric);
+            let run_rows: Vec<_> = values
+                .iter()
+                .zip(&rows)
+                .map(|(&(e, x), (_, l, _))| (e, x, Some(*l)))
+                .collect();
+            let r = convergence_run(&run_rows, &rule);
+            let got = &v["runs"][id];
+            assert_eq!(got["stop"], json!(r.stop), "{id}");
+            assert_eq!(got["points"], json!(r.points), "{id}");
+            assert_eq!(got["anneal"], json!(r.anneal), "{id}");
+            stops += usize::from(r.stop.is_some());
+            // The best epoch over what the script saw up to its stop.
+            let seen = r.stop.unwrap_or(rule.epochs);
+            let cut: Vec<EpochPoint> = p
+                .history
+                .iter()
+                .filter(|h| h.epoch <= seen)
+                .cloned()
+                .collect();
+            let best = best_of(&cut, o.metric).unwrap();
+            assert_eq!(got["top_epoch"], json!(best.epoch), "{id}");
+        }
+        assert!(stops >= 3, "the rule should stop for most metrics: {v}");
+        assert_eq!(
+            v["pick"],
+            json!([
+                0.5, 0.7, 0.4, 0.3, null, 0.6, null, 0.55, 0.25, 0.8, 0.2, 0.9, 0.0, 0.0, 0.0
+            ])
+        );
+        // The fall-back: the epoch's mAP, the rule starts again on it, once.
+        let f = &v["fallback"];
+        assert_eq!(f["values"], json!([0.9, 0.3, 0.25]));
+        assert_eq!(f["before"], json!([0.9, 1, "F2"]));
+        assert_eq!(f["after"], json!([null, 0, "mAP", "map", "f2", "mAP"]));
+        assert_eq!(f["final"], json!([0.3, 2]));
+        let text = f["text"].as_str().unwrap();
+        assert_eq!(
+            text.matches("--select-metric f2: the F-beta sweep failed")
+                .count(),
+            1
+        );
+        assert_eq!(text.matches("select_fallback").count(), 1);
+        let ev = text.lines().find_map(parse_line).unwrap();
+        assert_eq!(
+            ev,
+            TrainEvent::SelectFallback(SelectFallback {
+                metric: "f2".into(),
+                epoch: 2,
+                reason: "the F-beta sweep failed".into()
+            })
+        );
+        // A failed source that the metric does not read changes nothing.
+        assert_eq!(v["kept"], json!([0.5, 0.6, 0.7, 0.8, 0.4, "map"]));
+        let kept = v["kept_text"].as_str().unwrap();
+        assert_eq!(kept.matches("select_fallback").count(), 1, "{kept}");
+        assert!(
+            kept.contains("--select-metric iou: the mean IoU failed"),
+            "{kept}"
+        );
+        // The log names the metric; the default's text is as it always was.
+        let d = v["stop"]["default"].as_str().unwrap();
+        assert!(
+            d.contains(
+                "stopping after epoch 3: no mAP gain above 0 for 2 epochs (mAP averaged over the \
+                 last 3 epochs); training loss no longer falling; best epoch 1 (mAP 0.5)"
+            ),
+            "{d}"
+        );
+        let f2 = v["stop"]["f2"].as_str().unwrap();
+        assert!(
+            f2.contains("no F2 gain above 0 for 2 epochs (F2 averaged over the last 3 epochs)"),
+            "{f2}"
+        );
+        assert!(f2.contains("best epoch 1 (F2 0.5)"), "{f2}");
+        assert_eq!(v["args"], json!(["map", "f0_5", "error"]));
     }
 }

@@ -34,20 +34,22 @@ Progress: every event is one line `@train {json}` on stdout (`start`, `epoch`, `
 `stop`, `phase`, `done`); the service parses them, everything else is log output. `epoch` and `eval` carry
 `metrics`: every scalar metric of the epoch under the trainer's own key (`val/mAP_50_95`,
 `metrics/mAP50(B)`, `eval_loss`, ...) plus this script's `f1`/`f2`/`f0_5` sweeps (`fbeta_sweep`),
-`mem_gb` (peak GPU memory) and `img_s` (training images per second); the service maps the keys to
-stable ids (src/training/progress.rs). Night augmentation
+`iou` (`mean_iou`), `mem_gb` (peak GPU memory) and `img_s` (training images per second); the service
+maps the keys to stable ids (src/training/progress.rs). Night augmentation
 (`--aug-dark`, `--aug-noise`, `--aug-gray`: per-image probabilities) is applied on the fly to the
 training batches (Ultralytics, transformers) or to one extra copy of each training image chosen by
 those probabilities (rfdetr).
 
 Convergence (`Convergence`, the same rule for every trainer; their own early stopping is off):
 after each validation, the run reaches a stop point once `--min-epochs` passed and `--patience`
-epochs brought no gain above `--min-delta` in the mean of the last `--smooth` mAP 50-95 (else
-mAP 50) values. While the training loss still falls over those epochs (`loss_falling`: the later
-half's mean more than 2% below the earlier half's) it goes on instead, at most twice, each time
-for another `--patience` epochs (a `converge_point` event; the service offers Stop now / Continue);
-else it stops. It stops at once when `--stop-file` exists (the service's Finish now / Stop now); a
-`stop` event says why, and the best (raw mAP) epoch's weights are exported.
+epochs brought no gain above `--min-delta` in the mean of the last `--smooth` values of the
+selected metric (`--select-metric`, default `map`: mAP 50-95, else mAP 50). While the training loss
+still falls over those epochs (`loss_falling`: the later half's mean more than 2% below the earlier
+half's) it goes on instead, at most twice, each time for another `--patience` epochs (a
+`converge_point` event; the service offers Stop now / Continue); else it stops. It stops at once
+when `--stop-file` exists (the service's Finish now / Stop now); a `stop` event says why, and the
+weights of the epoch with the highest raw value of that metric are exported (`Selection`: one
+value for the rule and the checkpoint, so a run never stops on one metric and keeps another's best).
 
 Export (`prepare_export`, after training, in this process): the training state is released first
 (DataLoader workers stopped, trainer and optimizer dropped, GPU cache emptied), the CPU threads are
@@ -90,6 +92,19 @@ LR_SCHEDULES_OF = {
 }
 # RF-DETR's final learning rate factor (cosine schedule and anneal) when --lr-min-factor is not given.
 RFDETR_MIN_FACTOR = 0.1
+# What a run selects its best epoch and converges on (`--select-metric`, ids of progress::METRICS,
+# the list is recipe::SELECT_METRICS), the name in logs (its `short`) and the raw keys of each
+# trainer's epoch metrics, in order of preference.
+SELECT_METRICS = ("map", "map50", "f1", "f2", "f0_5", "iou")
+SELECT_LABELS = {"map": "mAP", "map50": "mAP50", "f1": "F1", "f2": "F2", "f0_5": "F0.5", "iou": "IoU"}
+SELECT_KEYS = {
+    "map": ("map", "metrics/mAP50-95(B)", "val/mAP_50_95", "val/ema_mAP_50_95"),
+    "map50": ("map50", "metrics/mAP50(B)", "val/mAP_50", "val/ema_mAP_50", "val/map50"),
+    "f1": ("f1", "val/F1"),
+    "f2": ("f2",),
+    "f0_5": ("f0_5",),
+    "iou": ("iou",),
+}
 RFDETR_CLASSES = {
     "nano": "RFDETRNano",
     "small": "RFDETRSmall",
@@ -192,11 +207,12 @@ def loss_falling(losses) -> bool:
 class Convergence:
     """When to stop training (one rule for every trainer; src/training/progress.rs
     `convergence_run` is its twin, parity-tested). `update(epoch, value, loss)` once per validated
-    epoch with its mAP (None when there is none) and training loss: "finish" when the stop file
-    exists, "converged" once `epoch >= min_epochs` and `patience` epochs passed since the last gain
-    above `min_delta` (patience 0 = never), else None. The gain is measured on the mean of the last
-    `smooth` mAP values (1 = the raw value), so one noisy peak of a small validation split does not
-    start the countdown. At such a stop point, while the training loss still falls over the last
+    epoch with the value of the selected metric (`Selection`, None when there is none; `label`
+    names it in the logs) and the training loss: "finish" when the stop file exists, "converged"
+    once `epoch >= min_epochs` and `patience` epochs passed since the last gain above `min_delta`
+    (patience 0 = never), else None. The gain is measured on the mean of the last `smooth` values
+    (1 = the raw value), so one noisy peak of a small validation split does not start the
+    countdown. At such a stop point, while the training loss still falls over the last
     `patience` epochs (`loss_falling`), at most MAX_EXTENSIONS times and before the last of
     `epochs` (0 = unknown), the run goes on instead: `point` holds the `converge_point` event and
     the countdown restarts there. Else, with `anneal` > 0 epochs and before the last of `epochs`,
@@ -208,10 +224,11 @@ class Convergence:
     raw value, `improved` whether this epoch set it (the checkpoint to keep). Pure, no torch."""
 
     def __init__(self, patience: int = 0, min_epochs: int = 0, min_delta: float = 0.0, stop_file=None,
-                 smooth: int = 1, epochs: int = 0, anneal: int = 0):
+                 smooth: int = 1, epochs: int = 0, anneal: int = 0, label: str = "mAP"):
         self.patience, self.min_epochs, self.min_delta = int(patience), int(min_epochs), float(min_delta)
         self.smooth, self.epochs, self.anneal = max(1, int(smooth)), int(epochs), max(0, int(anneal))
         self.stop_file = Path(stop_file) if stop_file else None
+        self.label = label
         self.last = 0
         self.window = []
         self.losses = []
@@ -224,6 +241,14 @@ class Convergence:
         self.anneal_from, self.anneal_until = 0, 0
         self.annealing = None
         self.decision = None
+
+    def forget_values(self) -> None:
+        """The run changed metric (`Selection.fall_back`): the values so far are on another scale,
+        so the best and the smoothing window start again at the next value. The losses and the
+        extensions stay."""
+        self.window = []
+        self.best, self.best_epoch = None, 0
+        self.top, self.top_epoch = None, 0
 
     def update(self, epoch: int, value, loss=None) -> str | None:
         epoch = int(epoch)
@@ -274,13 +299,13 @@ class Convergence:
         decision = self.update(epoch, value, loss)
         if self.point is not None:
             p = self.point
-            log(f"early stop point at epoch {p['epoch']} (best epoch {p['best_epoch']}, mAP {p['best']}), but the "
+            log(f"early stop point at epoch {p['epoch']} (best epoch {p['best_epoch']}, {self.label} {p['best']}), but the "
                 f"training loss is still falling (mean {p['loss_from']:.3f} -> {p['loss_to']:.3f}): continuing to epoch "
                 f"{p['next_check']} (extension {p['extension']} of {MAX_EXTENSIONS}; Finish now keeps epoch {p['best_epoch']})")
             event("converge_point", **p)
         if self.annealing is not None:
             p = self.annealing
-            log(f"early stop point at epoch {p['epoch']} (best epoch {p['best_epoch']}, mAP {p['best']}): lowering the "
+            log(f"early stop point at epoch {p['epoch']} (best epoch {p['best_epoch']}, {self.label} {p['best']}): lowering the "
                 f"learning rate until epoch {p['until']}, then stopping (Finish now keeps the best epoch)")
             event("anneal", **p)
         if decision:
@@ -293,9 +318,9 @@ class Convergence:
             why = "lowered the learning rate for %d epochs after the stop point at epoch %d" % (
                 self.anneal_until - self.anneal_from, self.anneal_from)
         elif self.decision == "converged":
-            why = "no mAP gain above %g for %d epochs" % (self.min_delta, self.patience)
+            why = "no %s gain above %g for %d epochs" % (self.label, self.min_delta, self.patience)
             if self.smooth > 1:
-                why += " (mAP averaged over the last %d epochs)" % self.smooth
+                why += " (%s averaged over the last %d epochs)" % (self.label, self.smooth)
             if not self.falling:
                 why += "; training loss no longer falling"
             elif self.extensions >= MAX_EXTENSIONS:
@@ -304,9 +329,60 @@ class Convergence:
                 why += "; training loss still falling, but no epochs left"
         else:
             why = "finish requested"
-        log(f"stopping after epoch {self.last}: {why}; best epoch {self.top_epoch} (mAP {self.top})")
+        log(f"stopping after epoch {self.last}: {why}; best epoch {self.top_epoch} ({self.label} {self.top})")
         event("stop", reason=self.decision, epoch=self.last, best_epoch=self.top_epoch, best=self.top,
               loss_falling=self.falling, extensions=self.extensions, anneal_until=self.anneal_until or None)
+
+
+def pick_metric(metrics: dict, metric: str):
+    """The value of `metric` (a `SELECT_METRICS` id) in an epoch's `metrics`, under any trainer's
+    key. `map` is mAP 50-95, else mAP 50; both may be None. A macro F or the mean IoU without a key
+    (or not finite) is 0.0: nothing matched at that validation."""
+    def first(keys):
+        return next((metrics[k] for k in keys if k in metrics), None)
+
+    if metric == "map":
+        v = first(SELECT_KEYS["map"])
+        return first(SELECT_KEYS["map50"]) if v is None else v
+    v = first(SELECT_KEYS[metric])
+    if metric == "map50":
+        return v
+    f = finite_lr(v)
+    return 0.0 if f is None else f
+
+
+class Selection:
+    """The metric a run selects by (`--select-metric`): `value` gives the one number for an epoch
+    that both the convergence rule and the trainer's best checkpoint use. When the source of the
+    metric failed (`sweep_failed`: the F-beta sweep, `iou_failed`: the mean IoU) the run says so
+    once and goes on by mAP (`fall_back`); it never fails for this. Pure apart from the log."""
+
+    def __init__(self, metric: str = "map", conv=None):
+        self.requested, self.metric, self.conv = metric, metric, conv
+
+    @property
+    def label(self) -> str:
+        return SELECT_LABELS[self.metric]
+
+    def fall_back(self, why: str, epoch: int = 0) -> None:
+        """From `epoch` on the run selects by mAP: a `select_fallback` event, and the rule forgets
+        the old metric's values (another scale); the trainer forgets its best the same way."""
+        if self.metric == "map":
+            return
+        log(f"--select-metric {self.metric}: {why}; selecting by mAP for the whole run: the best epoch and "
+            f"the convergence rule start again at epoch {epoch}")
+        event("select_fallback", metric=self.metric, epoch=epoch, reason=why)
+        self.metric = "map"
+        if self.conv is not None:
+            self.conv.label = self.label
+            self.conv.forget_values()
+
+    def value(self, metrics: dict, epoch: int = 0, sweep_failed: bool = False, iou_failed: bool = False):
+        if self.metric in ("f1", "f2", "f0_5") and sweep_failed:
+            self.fall_back("the F-beta sweep failed", epoch)
+        elif self.metric == "iou" and iou_failed:
+            self.fall_back("the mean IoU failed", epoch)
+        return pick_metric(metrics, self.metric)
 
 
 def bend_lambda_lr(scheduler, steps: int, min_factor: float) -> bool:
@@ -361,8 +437,15 @@ def bend_rfdetr_lr(trainer, epochs: int, steps_per_epoch: int, min_factor: float
         log(f"anneal: the learning rate could not be lowered ({type(e).__name__}: {e}); training on, then stopping")
 
 
+def log_selected(selection: Selection, conv: Convergence) -> None:
+    """After training, with `--select-metric` set: the epoch the trainer's best checkpoint holds."""
+    if selection.requested != "map":
+        log(f"exporting epoch {conv.top_epoch} (best {selection.label} {conv.top}); the last epoch was {conv.last}")
+
+
 def convergence(a) -> Convergence:
-    return Convergence(a.patience, a.min_epochs, a.min_delta, a.stop_file, a.smooth, a.epochs, a.anneal)
+    return Convergence(a.patience, a.min_epochs, a.min_delta, a.stop_file, a.smooth, a.epochs, a.anneal,
+                       SELECT_LABELS[a.select_metric])
 
 
 def parse_args() -> argparse.Namespace:
@@ -398,8 +481,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--patience", type=int, default=0, help="stop after this many epochs without improvement (0 = off)")
     p.add_argument("--min-epochs", type=int, default=0, help="no convergence stop before this epoch")
-    p.add_argument("--min-delta", type=float, default=0.0, help="smallest validation mAP gain that counts as an improvement")
-    p.add_argument("--smooth", type=int, default=1, help="the convergence rule's mAP is the mean of this many last epochs (1 = the raw value)")
+    p.add_argument("--min-delta", type=float, default=0.0, help="smallest gain of the selected metric that counts as an improvement")
+    p.add_argument("--smooth", type=int, default=1, help="the convergence rule's value is the mean of this many last epochs (1 = the raw value)")
+    p.add_argument("--select-metric", choices=SELECT_METRICS, default="map",
+                   help="the metric that picks the exported epoch and drives the convergence rule (default: map, mAP 50-95): "
+                        "map50; f1, f2 (favours catching objects), f0_5 (favours fewer false alarms): macro averages over the "
+                        "classes at their best threshold; iou: box tightness of matched boxes, ignores missed objects")
     p.add_argument("--anneal", type=int, default=0,
                    help="at the first stop point, train this many more epochs (at most --epochs) with a lowered learning rate (RF-DETR), then stop (0 = stop there)")
     p.add_argument("--stop-file", type=Path, default=None, help="finish after the current epoch (keeping the best one) once this file exists")
@@ -696,11 +783,12 @@ def fbeta_sweep(prec, rec, thresholds, betas=(0.5, 1.0, 2.0)) -> dict:
     return out
 
 
-def match_detections(preds, gts, iou_thr: float = 0.5):
+def match_detections(preds, gts, iou_thr: float = 0.5, ious: list | None = None):
     """Per-class matching data for a P/R sweep (COCO-style greedy matching at `iou_thr`, by
     score, each ground truth matched once): `preds` / `gts` are per image lists of
     `(boxes [N,4] xyxy, labels [N], scores [N])` / `(boxes, labels)` numpy arrays. Returns
-    `{class: (scores, matched 0/1, ground truth count)}`."""
+    `{class: (scores, matched 0/1, ground truth count)}`; `ious` also receives the IoU of each
+    matched pair."""
     import numpy as np
 
     data: dict[int, list] = {}
@@ -727,9 +815,46 @@ def match_detections(preds, gts, iou_thr: float = 0.5):
                     if iou[k] >= iou_thr:
                         used[k] = True
                         m = 1
+                        if ious is not None:
+                            ious.append(float(iou[k]))
                 d[0].append(float(ps[j]))
                 d[1].append(m)
     return {c: (np.asarray(v[0]), np.asarray(v[1]), v[2]) for c, v in data.items()}
+
+
+def mean_iou(ious) -> dict:
+    """`{"iou": mean}` of the matched pairs' IoUs from [`match_detections`], `{}` without a match.
+    Box tightness only: a missed object does not lower it, so it reads alongside recall, and a run
+    selected by it (`--select-metric iou`) can prefer a model that misses more."""
+    return {"iou": math.fsum(ious) / len(ious)} if ious else {}
+
+
+class IouMeter:
+    """[`mean_iou`] of one validation, fed by a hook inside a trainer: `read()` returns the `preds`
+    and `gts` of [`match_detections`]. A changed library internal is logged once and leaves the
+    metric out; the run goes on."""
+
+    def __init__(self):
+        self.ious, self.failed = [], False
+
+    def add(self, read) -> None:
+        if self.failed:
+            return
+        try:
+            match_detections(*read(), ious=self.ious)
+        except Exception as e:
+            self.failed = True
+            self.ious.clear()
+            log(f"mean IoU skipped ({type(e).__name__}: {e})")
+
+    def peek(self) -> dict:
+        """[`mean_iou`] so far, keeping the data for `take`."""
+        return mean_iou(self.ious)
+
+    def take(self) -> dict:
+        m = self.peek()
+        self.ious.clear()
+        return m
 
 
 def pr_sweep(matches: dict, thresholds):
@@ -1215,6 +1340,17 @@ def ultralytics_cache(a):
     return "ram"
 
 
+def numpy_of(t):
+    """A tensor as a float32 numpy array."""
+    return t.detach().float().cpu().numpy()
+
+
+def ultralytics_boxes(preds: dict, batch: dict) -> tuple:
+    """The arguments of [`match_detections`] from the validator's `_process_batch(preds, batch)`."""
+    return ([(numpy_of(preds["bboxes"]), numpy_of(preds["cls"]), numpy_of(preds["conf"]))],
+            [(numpy_of(batch["bboxes"]), numpy_of(batch["cls"]))])
+
+
 def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     import torch
     from ultralytics import YOLO
@@ -1268,6 +1404,10 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         return model
     probs = (a.aug_dark, a.aug_noise, a.aug_gray)
     gen = torch.Generator().manual_seed(a.seed)
+    iou_meter = IouMeter()
+    conv = convergence(a)
+    selection = Selection(a.select_metric, conv)
+    state = {"batches": 0}
 
     base_yolo = YOLO(str(a.weights))
     base_names = em.ultralytics_names(base_yolo)
@@ -1295,12 +1435,64 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
                 batch["img"] = night_augment(batch["img"], *probs, gen=gen)
             return batch
 
+        def get_validator(self):
+            validator = super().get_validator()
+            orig = getattr(validator, "_process_batch", None)
+            if orig is None:
+                log("mean IoU skipped (no _process_batch in the Ultralytics validator)")
+                iou_meter.failed = True
+                return validator
+
+            # Called once per image with both box sets in the model's input pixels.
+            def process_batch(*args, **kw):
+                iou_meter.add(lambda: ultralytics_boxes(*args[:2]))
+                return orig(*args, **kw)
+
+            validator._process_batch = process_batch
+            return validator
+
+        def validate(self):
+            # best.pt follows `best_fitness` (`save_model`, also on a tie): with another metric
+            # than mAP it and the returned fitness carry that metric's value. mAP keeps
+            # Ultralytics' own path untouched. Its patience is above the epochs, so its stopper
+            # never fires, and a real NaN fitness stays its NaN recovery's.
+            if selection.metric == "map":
+                return super().validate()
+            prev = self.best_fitness
+            metrics, fitness = super().validate()
+            if metrics is None:
+                return metrics, fitness
+            m, swept = dict(metrics), True
+            box = getattr(getattr(getattr(self, "validator", None), "metrics", None), "box", None)
+            try:
+                if box is not None and len(getattr(box, "p_curve", [])):
+                    m.update(fbeta_sweep(box.p_curve, box.r_curve, box.px))
+            except Exception as e:  # a changed Ultralytics internal
+                log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
+                swept = False
+            m.update(iou_meter.peek())
+            epoch = self.epoch + 1
+            value = selection.value(m, epoch, sweep_failed=not swept, iou_failed=iou_meter.failed)
+            if selection.metric == "map":  # fell back just now: mAP's best starts here
+                self.best_fitness = fitness
+                return metrics, fitness
+            if not math.isfinite(float(fitness)):
+                self.best_fitness = prev
+                return metrics, fitness
+            state["selected"] = (epoch, value)
+            if prev is None or prev < value:
+                self.best_fitness = value
+            else:
+                self.best_fitness = prev
+                # `save_model` also writes best.pt on a tie; the rule keeps the earlier epoch.
+                value = math.nextafter(prev, -math.inf) if value == prev else value
+            return metrics, value
+
     os.chdir(a.work)
     weights = a.work / f"base-{a.weights.name}"
     shutil.copyfile(a.weights, weights)
     model = YOLO(str(weights))
     started = time.time()
-    state = {"batches": 0}
     meter = EpochMeter(device)
 
     def on_train_epoch_start(trainer):
@@ -1318,8 +1510,6 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
 
     def on_train_epoch_end(trainer):
         meter.train_done()
-
-    conv = convergence(a)
 
     def on_fit_epoch_end(trainer):
         # Also called once more by the final validation of best.pt (epoch + 1, after the loop):
@@ -1355,6 +1545,7 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
                 m.pop("recall", None)
         except Exception as e:  # a changed Ultralytics internal: the other metrics still count
             log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
+        m.update(iou_meter.take())
         try:
             images = len(trainer.train_loader.dataset)
         except Exception:
@@ -1374,7 +1565,9 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         # break` (ultralytics 8.4 engine/trainer.py `_do_train`): stop ends training here, then
         # best.pt is validated and exported as always.
         tm = getattr(trainer, "metrics", None) or {}
-        value = tm.get("metrics/mAP50-95(B)", tm.get("metrics/mAP50(B)"))
+        at, value = state.get("selected", (0, None))
+        if selection.metric == "map" or at != trainer.epoch + 1:
+            value = selection.value(tm)
         if conv.step(trainer.epoch + 1, value, loss):
             trainer.stop = True
 
@@ -1432,6 +1625,7 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         kwargs["cache"] = cache
     tune_backend(device, fixed_size=True)
     model.train(**kwargs)
+    log_selected(selection, conv)
     best = a.work / "run" / "weights" / "best.pt"
     if not best.is_file():
         best = a.work / "run" / "weights" / "last.pt"
@@ -1557,6 +1751,12 @@ def rfdetr_mapped_checkpoint(a, names: list[str], em) -> Path:
     return out
 
 
+def rfdetr_boxes(preds: list, targets: list) -> tuple:
+    """The arguments of [`match_detections`] from `build_matching_data(preds, targets)`."""
+    return ([(numpy_of(p["boxes"]), numpy_of(p["labels"]), numpy_of(p["scores"])) for p in preds],
+            [(numpy_of(t["boxes"]), numpy_of(t["labels"])) for t in targets])
+
+
 def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     import numpy as np
     import torch
@@ -1574,7 +1774,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     # recall at np.linspace(0, 1, 101)); keep each sweep for the F2 / F0.5 of the same rows.
     import rfdetr.training.callbacks.coco_eval as coco_eval
 
-    sweeps = {"n": 0, "used": 0, "last": {}}
+    sweeps = {"n": 0, "used": 0, "last": {}, "failed": False}
     orig_sweep = getattr(coco_eval, "sweep_confidence_thresholds", None)
 
     def sweep(per_class_data, conf_thresholds, classes_with_gt, *args, **kw):
@@ -1593,12 +1793,92 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
                 sweeps["n"] += 1
         except Exception as e:  # a changed rfdetr internal: its own metrics still count
             log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
+            sweeps["failed"] = True
         return res
 
     if orig_sweep is not None:
         coco_eval.sweep_confidence_thresholds = sweep
+    else:
+        sweeps["failed"] = True
+
+    # Its validation matches each batch's boxes for that F1, in original image pixels, once per
+    # batch (`on_validation_batch_end`; the extra EMA pass of `eval_base_model` does not match).
+    iou_meter = IouMeter()
+    orig_matching = getattr(coco_eval, "build_matching_data", None)
+
+    def matching(*args, **kw):
+        iou_meter.add(lambda: rfdetr_boxes(*args[:2]))
+        return orig_matching(*args, **kw)
+
+    if orig_matching is not None:
+        coco_eval.build_matching_data = matching
+    else:
+        log("mean IoU skipped (no build_matching_data in rfdetr)")
+        iou_meter.failed = True
 
     conv = convergence(a)
+    selection = Selection(a.select_metric, conv)
+    # This epoch's selected value, as rfdetr's best-checkpoint callback compared it.
+    selected = {}
+
+    def rfdetr_value(trainer, metrics: dict):
+        """`Selection.value` over the epoch's callback metrics and this validation's sweep and IoU;
+        rfdetr's own `val/F1` does not go through the script's sweep wrapper."""
+        m = dict(metrics)
+        if sweeps["n"] > sweeps["used"]:
+            m.update(sweeps["last"])
+        m.update(iou_meter.peek())
+        return selection.value(m, trainer.current_epoch + 1, sweep_failed=sweeps["failed"] and selection.metric != "f1",
+                               iou_failed=iou_meter.failed)
+
+    # rfdetr's BestModelCallback writes checkpoint_best_total.pth and only knows mAP / mAR. For its
+    # `on_validation_end` it gets the trainer with the selected value under its monitor keys. Not
+    # by writing into `trainer.callback_metrics` (as its own smoothing does): Lightning's property
+    # refreshes that dict from the logged results on every read until the validation loop resets
+    # them, so `val/ema_mAP_50_95`, which is logged, would read as mAP again. Nothing here changes
+    # the real metrics, so `metrics.csv` and the epoch event cannot see the value. Lightning runs
+    # this after COCOEvalCallback's `on_validation_epoch_end` (sweep and IoU are done) and before
+    # `on_train_epoch_end` (Progress). With EMA (rfdetr's default) the EMA track is the only one
+    # and the sweep follows the same EMA model.
+    class SelectedMetrics:
+        def __init__(self, trainer, metrics: dict):
+            self.trainer, self.callback_metrics = trainer, metrics
+
+        def __getattr__(self, name):
+            return getattr(self.trainer, name)
+
+    best_model = None
+    orig_best_end = None
+    try:
+        from rfdetr.training.callbacks import best_model
+        orig_best_end = best_model.BestModelCallback.on_validation_end
+    except Exception as e:  # a changed rfdetr internal
+        selection.fall_back(f"rfdetr's best checkpoint cannot follow it ({type(e).__name__}: {e})")
+
+    def best_on_validation_end(cb, trainer, pl_module):
+        if selection.metric == "map" or trainer.sanity_checking:
+            return orig_best_end(cb, trainer, pl_module)
+        # Its high-water mark starts at 0.0 with a strict `>`: below any value, so an all-zero
+        # metric still keeps the first epoch (the rule's) and not the final weights it backfills.
+        if selected.get("cb") is not cb:
+            selected["cb"] = cb
+            cb._best_ema = -1.0
+        metrics = dict(trainer.callback_metrics)
+        value = rfdetr_value(trainer, scalar_metrics(metrics))
+        if selection.metric == "map":  # fell back just now: mAP's best starts here
+            cb._best_ema = -1.0
+            return orig_best_end(cb, trainer, pl_module)
+        for key in (cb.monitor, cb._monitor_ema):
+            if key in metrics and value is not None:
+                t = metrics[key]
+                metrics[key] = torch.tensor(value, dtype=t.dtype, device=t.device)
+                value = metrics[key].item()  # as the callback compares it
+        selected.update(epoch=trainer.current_epoch + 1, value=value)
+        return orig_best_end(cb, SelectedMetrics(trainer, metrics), pl_module)
+
+    if orig_best_end is not None:
+        best_model.BestModelCallback.on_validation_end = best_on_validation_end
+
     # The schedule and the final factor of its cosine and of the anneal (the script's defaults:
     # cosine to 0.1).
     schedule = a.lr_scheduler or "cosine"
@@ -1640,6 +1920,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
 
         def on_validation_start(self, trainer, pl_module):
             meter.train_done()
+            iou_meter.take()  # this validation's boxes only (not a sanity check's, the training split's)
 
         def on_validation_end(self, trainer, pl_module):
             # The first training step after the EMA validation is where MPS ran out of memory.
@@ -1655,6 +1936,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             if sweeps["n"] > sweeps["used"]:
                 m.update(sweeps["last"])
                 sweeps["used"] = sweeps["n"]
+            m.update(iou_meter.take())
             m.update(meter.metrics())
             emit_metrics("epoch", m, epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, loss=loss, map50=mp,
                          map=mp95, elapsed_s=round(time.time() - started, 1))
@@ -1664,7 +1946,8 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             if s is not None and sched_steps["last"] is not None and s > sched_steps["last"]:
                 sched_steps["per_epoch"] = s - sched_steps["last"]
             sched_steps["last"] = s
-            if not trainer.sanity_checking and conv.step(trainer.current_epoch + 1, mp95 if mp95 is not None else mp, loss):
+            value = selected["value"] if selected.get("epoch") == trainer.current_epoch + 1 else selection.value(m)
+            if not trainer.sanity_checking and conv.step(trainer.current_epoch + 1, value, loss):
                 trainer.should_stop = True
             elif conv.annealing is not None:
                 p = conv.annealing
@@ -1720,8 +2003,13 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             kw.pop(k, None)
         model.train(**kw)
     pl.Trainer.__init__ = orig_init
+    if orig_best_end is not None:
+        best_model.BestModelCallback.on_validation_end = orig_best_end
+    log_selected(selection, conv)
     if orig_sweep is not None:
         coco_eval.sweep_confidence_thresholds = orig_sweep
+    if orig_matching is not None:
+        coco_eval.build_matching_data = orig_matching
     ckpt = out_dir / "checkpoint_best_total.pth"
     cfg = out_dir / "training_config.json"
     if not ckpt.is_file() or not cfg.is_file():
@@ -1850,8 +2138,9 @@ def collate(batch):
 
 def detection_metrics(model, ds, proc, batch: int, imgsz: int) -> dict:
     """mAP 50-95 / 50 / 75 and mAR@100 (torchmetrics, COCO rules) plus the macro P / R / F-beta
-    sweep at IoU 0.5 ([`fbeta_sweep`]) of `model` on the prepared validation set `ds`, in the
-    model's input pixels (images are stretched to imgsz x imgsz, the labels are normalized)."""
+    sweep at IoU 0.5 ([`fbeta_sweep`]) and the mean IoU of the matched boxes ([`mean_iou`]) of
+    `model` on the prepared validation set `ds`, in the model's input pixels (images are stretched
+    to imgsz x imgsz, the labels are normalized). `sweep_failed` is set when the sweep raised."""
     import numpy as np
     import torch
     from torchmetrics.detection import MeanAveragePrecision
@@ -1883,8 +2172,14 @@ def detection_metrics(model, ds, proc, batch: int, imgsz: int) -> dict:
     m = {"map": r["map"], "map50": r["map_50"], "map75": r["map_75"], "mar": r["mar_100"]}
     m = {k: float(v) for k, v in m.items() if float(v) >= 0}  # torchmetrics: -1 = no ground truth
     thresholds = np.linspace(0, 1, 101)
-    prec, rec = pr_sweep(match_detections(preds, gts), thresholds)
-    m.update(fbeta_sweep(prec, rec, thresholds))
+    ious: list = []
+    try:
+        prec, rec = pr_sweep(match_detections(preds, gts, ious=ious), thresholds)
+        m.update(fbeta_sweep(prec, rec, thresholds))
+        m.update(mean_iou(ious))
+    except Exception as e:  # the mAP still counts
+        log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
+        m["sweep_failed"] = True
     return m
 
 
@@ -1953,6 +2248,7 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
                              epoch=round(state.epoch or 0), epochs=a.epochs, val_loss=float(metrics["eval_loss"]))
 
     conv = convergence(a)
+    selection = Selection(a.select_metric, conv)
     best_state = {}
 
     class DetectionTrainer(Trainer):
@@ -1962,15 +2258,19 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
         def evaluate(self, *args, **kw):
             out = super().evaluate(*args, **kw)
             m = {}
+            failed = False
             epoch = round(self.state.epoch or 0)
             try:
                 m = detection_metrics(self.model, val_ds, proc, a.batch, a.imgsz)
+                failed = m.pop("sweep_failed", False)
                 emit_metrics("eval", m, epoch=epoch, epochs=a.epochs)
             except Exception as e:  # the loss still counts
                 log(f"detection metrics skipped ({type(e).__name__}: {e})")
+                failed = True
             if epoch >= 1:
                 losses = [h["loss"] for h in self.state.log_history if "loss" in h]
-                stop = conv.step(epoch, m.get("map", m.get("map50")), losses[-1] if losses else None)
+                value = selection.value(m, epoch, sweep_failed=failed, iou_failed=failed)
+                stop = conv.step(epoch, value, losses[-1] if losses else None)
                 if conv.improved:
                     best_state["epoch"], best_state["value"] = conv.top_epoch, conv.top
                     best_state["sd"] = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
@@ -2028,9 +2328,9 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
     if best_state.get("sd") is not None:
         # The best epoch, not the last one (save_strategy="no": nothing else keeps it).
         trainer.model.load_state_dict(best_state["sd"])
-        log(f"exporting epoch {best_state['epoch']} (best mAP {best_state['value']:.4f}); the last epoch was {conv.last}")
+        log(f"exporting epoch {best_state['epoch']} (best {selection.label} {best_state['value']:.4f}); the last epoch was {conv.last}")
     else:
-        log("exporting the last epoch (no validation mAP was measured)")
+        log(f"exporting the last epoch (no validation {selection.label} was measured)")
     event("phase", phase="export", detail="exporting to ONNX")
     model = trainer.model.eval().float().cpu()
     # Keep only the model: the best epoch's CPU copy, the optimizer, the scheduler and the
@@ -2113,6 +2413,8 @@ def main() -> int:
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     event("start", trainer=a.trainer, family=a.family, size=a.size, device=device, classes=names,
           train_images=len(train), valid_images=len(valid), epochs=a.epochs, imgsz=a.imgsz, batch=a.batch, **device_info())
+    if a.select_metric != "map":
+        log(f"best epoch and convergence by {SELECT_LABELS[a.select_metric]} (--select-metric {a.select_metric})")
     t0 = time.time()
     if a.trainer == "ultralytics":
         out = train_ultralytics(a, device, names, em)

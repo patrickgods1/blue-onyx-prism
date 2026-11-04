@@ -166,8 +166,8 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   a time), caps CPU threads (`BOP_EXPORT_THREADS`) and waits up to 5 min for 3 GB RAM / 4 GB commit; docs in `docs/TRAINING.md`.
   Starting points per family in `recipe::recommended` (epochs cap, patience, min epochs, min_delta; `training.epochs`/
   `.patience` None = recommended, a stored legacy 50 = None); learning rate `training.lr` / `.lr_schedule` (cosine|linear|step, per family `recipe::lr_schedules`) / `.lr_min_factor` (form or CLI value, else config where the family takes it, `TrainingConfig::apply_lr`, else the family default; `--lr-scheduler` / `--lr-min-factor` passed only when set), `batch` events carry the main group's `lr` and `progress` has `lr`, `stop_epoch`, `batch_size`, `imgsz`, `settings` (`RunSettings`); one convergence rule for every trainer (`Convergence` in
-  `train_model.py`, Rust twin `progress::convergence_run`, parity-tested; native early stopping off; best raw epoch
-  exported; gains judged on a `smooth`-epoch mean (3); a recommended patience doubles under 50 validation images
+  `train_model.py`, Rust twin `progress::convergence_run`, parity-tested; native early stopping off; best raw epoch of the selected metric
+  exported (`training.select_metric`, `recipe::SELECT_METRICS`, `--select-metric`, default `map`: drives both the rule and the checkpoint; a failed source falls back to mAP for the run, `select_fallback`); gains judged on a `smooth`-epoch mean (3); a recommended patience doubles under 50 validation images
   (`TrainRecipe::convergence_patience`); a stop point with the training loss still falling (>2%, `loss_falling`) becomes a
   `converge_point` extension, at most 2, shown on the page with Stop now = Finish now) and Finish now (`POST /training/finish` -> `<run dir>/work/stop-request`, `stop` event). `SceneFilter` is a
   day/night/ir set (`night` alone = night only); the held-out set is chosen from all review frames before the scene

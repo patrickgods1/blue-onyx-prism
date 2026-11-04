@@ -131,6 +131,18 @@ pub struct RunRecord {
 }
 
 impl RunRecord {
+    /// The metric that picks the run's best epoch: the progress' once it trains (a fall-back to
+    /// mAP included), else the request's.
+    pub fn select_metric(&self) -> super::recipe::SelectMetric {
+        self.progress
+            .as_ref()
+            .filter(|p| p.settings.is_some())
+            .map_or(
+                self.request.recipe.select_metric,
+                super::progress::TrainProgress::select_metric,
+            )
+    }
+
     fn new(job: &TrainJob) -> Self {
         Self {
             id: job.id.clone(),

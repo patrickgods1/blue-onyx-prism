@@ -120,6 +120,113 @@ impl std::fmt::Display for LrSchedule {
     }
 }
 
+/// The metric a run optimizes (`--select-metric`, one of [`SELECT_METRICS`]): it picks the epoch
+/// whose weights are exported and is the value of the convergence rule, so a run never stops on
+/// one metric and keeps another's best. Ids are [`super::progress::METRICS`]'; all are on a 0..1
+/// scale, so the family's `min_delta` suits every one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SelectMetric {
+    #[default]
+    Map,
+    Map50,
+    F1,
+    F2,
+    #[serde(rename = "f0_5")]
+    F05,
+    Iou,
+}
+
+/// One choice of "Select best by".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectOption {
+    pub metric: SelectMetric,
+    /// The dropdown's text.
+    pub label: &'static str,
+    /// What choosing it does, one line.
+    pub hint: &'static str,
+}
+
+/// Every choice of "Select best by", the default first: the one list behind validation, the
+/// page and the CLI.
+pub const SELECT_METRICS: [SelectOption; 6] = [
+    SelectOption {
+        metric: SelectMetric::Map,
+        label: "mAP 50-95 (default)",
+        hint: "Average precision over IoU 0.5-0.95, per class: rewards finding objects and \
+               tight boxes.",
+    },
+    SelectOption {
+        metric: SelectMetric::Map50,
+        label: "mAP 50",
+        hint: "Average precision at IoU 0.5, per class: finding objects counts, exact box fit \
+               does not.",
+    },
+    SelectOption {
+        metric: SelectMetric::F1,
+        label: "F1",
+        hint: "Weighs catching objects and false alarms equally. Macro average over the classes \
+               at its best confidence threshold, not person or vehicle specific.",
+    },
+    SelectOption {
+        metric: SelectMetric::F2,
+        label: "F2 (catch more)",
+        hint: "Favours catching objects over false alarms. Macro average over the classes at its \
+               best confidence threshold, not person or vehicle specific.",
+    },
+    SelectOption {
+        metric: SelectMetric::F05,
+        label: "F0.5 (fewer false alarms)",
+        hint: "Favours fewer false alarms over catching objects. Macro average over the classes \
+               at its best confidence threshold, not person or vehicle specific.",
+    },
+    SelectOption {
+        metric: SelectMetric::Iou,
+        label: "Mean IoU (box tightness)",
+        hint: "Box tightness of the matched boxes only: it ignores missed objects, so it can \
+               prefer a model that misses more.",
+    },
+];
+
+impl SelectMetric {
+    /// The metric id (`map`, `f0_5`, ...), as in [`super::progress::METRICS`] and the script.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Map => "map",
+            Self::Map50 => "map50",
+            Self::F1 => "f1",
+            Self::F2 => "f2",
+            Self::F05 => "f0_5",
+            Self::Iou => "iou",
+        }
+    }
+
+    /// The name in notices and logs (the metric's `short`: `mAP`, `F0.5`); the script's
+    /// `SELECT_LABELS` (parity-tested).
+    pub fn short(self) -> &'static str {
+        super::progress::metric(self.id()).map_or(self.id(), |m| m.short)
+    }
+
+    /// An id of [`SELECT_METRICS`] (case-insensitive); see [`select_metric_error`].
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        SELECT_METRICS
+            .iter()
+            .map(|o| o.metric)
+            .find(|m| m.id().eq_ignore_ascii_case(s))
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// "'x' is not one of map, map50, f1, f2, f0_5, iou".
+pub fn select_metric_error(value: &str) -> String {
+    let ids: Vec<&str> = SELECT_METRICS.iter().map(|o| o.metric.id()).collect();
+    format!("'{value}' is not one of {}", ids.join(", "))
+}
+
 /// The learning-rate schedules a family's trainer supports.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LrSchedules {
@@ -212,10 +319,11 @@ pub struct Recommended {
     pub patience: u32,
     /// No convergence stop before this epoch.
     pub min_epochs: u32,
-    /// Smallest validation mAP gain that counts as an improvement.
+    /// Smallest gain of the selected metric ([`SelectMetric`], all 0..1) that counts as an
+    /// improvement.
     pub min_delta: f32,
-    /// The gain is measured on the mean of the last `smooth` validation mAP values, so one noisy
-    /// peak of a small validation split does not start the countdown (1 = the raw value).
+    /// The gain is measured on the mean of its last `smooth` values, so one noisy peak of a small
+    /// validation split does not start the countdown (1 = the raw value).
     pub smooth: u32,
     /// Learning rate; None = the trainer's default (rfdetr and the transformers recipe: 1e-4).
     pub lr: Option<f32>,
@@ -295,8 +403,8 @@ pub struct TrainRecipe {
     pub base_weights: Option<String>,
     pub imgsz: u32,
     pub epochs: u32,
-    /// Stop after this many epochs without a validation mAP improvement (0 = off; a recipe
-    /// queued before early stopping existed reads as 0, its old behaviour).
+    /// Stop after this many epochs without an improvement of the selected metric (0 = off; a
+    /// recipe queued before early stopping existed reads as 0, its old behaviour).
     #[serde(default)]
     pub patience: u32,
     /// `patience` is the family's recommendation (nothing typed, `training.patience` unset), so a
@@ -316,6 +424,10 @@ pub struct TrainRecipe {
     /// family's default ([`lr_schedules`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lr_min_factor: Option<f32>,
+    /// What picks the exported epoch and drives the convergence rule (`--select-metric`, passed
+    /// only when not the default).
+    #[serde(default, skip_serializing_if = "SelectMetric::is_default")]
+    pub select_metric: SelectMetric,
     #[serde(default)]
     pub augment: Augment,
     /// RF-DETR only (other families ignore it).
@@ -348,6 +460,7 @@ impl TrainRecipe {
             lr: rec.lr,
             lr_schedule: None,
             lr_min_factor: None,
+            select_metric: SelectMetric::Map,
             augment: Augment::default(),
             multi_scale: MultiScale::Auto,
         })
@@ -358,10 +471,11 @@ impl TrainRecipe {
     /// (at most the epochs); a typed one is kept.
     pub fn convergence_patience(&self, valid_images: usize) -> (u32, String) {
         let smooth = recommended(self.family).smooth;
+        let metric = self.select_metric.short();
         let window = if smooth > 1 {
-            format!("mAP averaged over the last {smooth} epochs")
+            format!("{metric} averaged over the last {smooth} epochs")
         } else {
-            "mAP of each epoch".into()
+            format!("{metric} of each epoch")
         };
         if self.patience_recommended && self.patience > 0 && valid_images < SMALL_VALID_IMAGES {
             let p = self.patience.saturating_mul(2).min(self.epochs);
@@ -1067,5 +1181,68 @@ mod tests {
         for bad in ["", ".hidden", "a/b", "a b", "x?y", &"a".repeat(65)] {
             assert!(valid_model_name(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn select_metrics_are_one_list() {
+        let ids: Vec<&str> = SELECT_METRICS.iter().map(|o| o.metric.id()).collect();
+        assert_eq!(ids, ["map", "map50", "f1", "f2", "f0_5", "iou"]);
+        assert_eq!(SELECT_METRICS[0].metric, SelectMetric::default());
+        for o in SELECT_METRICS {
+            let info = crate::training::progress::metric(o.metric.id())
+                .unwrap_or_else(|| panic!("{} is not a metric id", o.metric.id()));
+            assert_eq!(o.metric.short(), info.short);
+            assert_eq!(info.higher_better, Some(true), "{}", o.metric.id());
+            assert!(!o.label.is_empty() && !o.hint.is_empty());
+            assert_eq!(SelectMetric::parse(o.metric.id()), Some(o.metric));
+            // The serialized form is the id.
+            assert_eq!(
+                serde_json::to_value(o.metric).unwrap(),
+                serde_json::json!(o.metric.id())
+            );
+        }
+        assert_eq!(SelectMetric::parse(" F2 "), Some(SelectMetric::F2));
+        assert_eq!(SelectMetric::parse("f3"), None);
+        assert_eq!(SelectMetric::parse(""), None);
+        let e = select_metric_error("f3");
+        assert_eq!(e, "'f3' is not one of map, map50, f1, f2, f0_5, iou");
+        // The hints say what each one trades.
+        let hint = |m: SelectMetric| {
+            SELECT_METRICS
+                .iter()
+                .find(|o| o.metric == m)
+                .unwrap()
+                .hint
+                .to_ascii_lowercase()
+        };
+        assert!(hint(SelectMetric::F2).contains("catching objects over false alarms"));
+        assert!(hint(SelectMetric::F05).contains("fewer false alarms over catching objects"));
+        assert!(hint(SelectMetric::Iou).contains("ignores missed objects"));
+        assert!(hint(SelectMetric::Iou).contains("misses more"));
+    }
+
+    #[test]
+    fn the_select_metric_is_kept_only_when_set() {
+        let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
+        assert_eq!(r.select_metric, SelectMetric::Map);
+        let plain = serde_json::to_string(&r).unwrap();
+        assert!(!plain.contains("select_metric"), "{plain}");
+        // A recipe queued before the setting existed.
+        let old: TrainRecipe = serde_json::from_str(&plain).unwrap();
+        assert_eq!(old.select_metric, SelectMetric::Map);
+        assert!(
+            r.convergence_patience(100)
+                .1
+                .contains("mAP averaged over the last 3 epochs")
+        );
+        r.select_metric = SelectMetric::F05;
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(text.contains(r#""select_metric":"f0_5""#), "{text}");
+        assert_eq!(serde_json::from_str::<TrainRecipe>(&text).unwrap(), r);
+        assert!(
+            r.convergence_patience(10)
+                .1
+                .contains("F0.5 averaged over the last 3 epochs")
+        );
     }
 }

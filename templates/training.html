@@ -440,7 +440,14 @@
       <div class="tr-field">
         <label for="train-patience">Patience</label>
         <input type="number" id="train-patience" name="patience" min="0" max="1000" value="{{ patience }}" placeholder="recommended">
-        <p class="muted small">Epochs without a validation mAP gain before the run stops and keeps its best epoch. Empty = recommended, 0 = off (train every epoch).</p>
+        <p class="muted small">Epochs without a gain of the metric below before the run stops and keeps its best epoch. Empty = recommended, 0 = off (train every epoch).</p>
+      </div>
+      <div class="tr-field">
+        <label for="train-select-metric">Select best by</label>
+        <select id="train-select-metric" name="select_metric">
+          {% for c in select_metrics %}<option value="{{ c.value }}" data-hint="{{ c.hint }}"{% if c.selected %} selected{% endif %}>{{ c.title }}</option>{% endfor %}
+        </select>
+        <p class="muted small"><span id="train-select-hint">{{ select_hint }}</span> Decides which epoch is exported and when the run converges. With few validation images anything but mAP is noisy; the held-out benchmark is the number to trust.</p>
       </div>
       <div class="tr-field">
         <label for="train-lr">Learning rate</label>

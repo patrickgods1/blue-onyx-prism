@@ -26,8 +26,16 @@ pub const DEFAULT_TIMEOUT_HOURS: u32 = 48;
 /// Most hours of a run.
 pub const MAX_TIMEOUT_HOURS: u32 = 24 * 14;
 /// The Training page's per-epoch table columns when `metric_columns` is empty.
-pub const DEFAULT_METRIC_COLUMNS: [&str; 7] =
-    ["map", "map50", "f1", "f2", "precision", "recall", "loss"];
+pub const DEFAULT_METRIC_COLUMNS: [&str; 8] = [
+    "map",
+    "map50",
+    "iou",
+    "f1",
+    "f2",
+    "precision",
+    "recall",
+    "loss",
+];
 /// Most columns of the per-epoch table.
 pub const MAX_METRIC_COLUMNS: usize = 20;
 /// Most data loader workers `training.workers` may force.
@@ -66,6 +74,10 @@ pub struct TrainingConfig {
     /// Final learning rate as a share of the starting one (0-1); None = the family's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lr_min_factor: Option<f32>,
+    /// What every run selects its best epoch and converges on; None = `map`. A run's form value
+    /// or `--select-metric` wins ([`Self::select_metric_for`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub select_metric: Option<super::recipe::SelectMetric>,
     /// Share of frames without objects (hard negatives) kept in the training split (0-0.9).
     #[serde(serialize_with = "crate::config::thr::ser_clean")]
     pub negative_share: f32,
@@ -111,6 +123,7 @@ impl Default for TrainingConfig {
             lr: None,
             lr_schedule: None,
             lr_min_factor: None,
+            select_metric: None,
             negative_share: DEFAULT_NEGATIVE_SHARE,
             heldout_share: DEFAULT_HELDOUT_SHARE,
             oversample: DEFAULT_OVERSAMPLE,
@@ -208,6 +221,14 @@ impl TrainingConfig {
                 super::recipe::lr_schedule_error(r.family, r.lr_schedule, Some(k)).is_none()
             })
         });
+    }
+
+    /// The metric of a run: the typed one (form, CLI), else this config's, else `map`.
+    pub fn select_metric_for(
+        &self,
+        typed: Option<super::recipe::SelectMetric>,
+    ) -> super::recipe::SelectMetric {
+        typed.or(self.select_metric).unwrap_or_default()
     }
 
     /// The per-epoch table's columns: `metric_columns`, else the default.
@@ -437,7 +458,16 @@ mod tests {
         let mut c = TrainingConfig::default();
         assert_eq!(
             c.effective_metric_columns(),
-            ["map", "map50", "f1", "f2", "precision", "recall", "loss"]
+            [
+                "map",
+                "map50",
+                "iou",
+                "f1",
+                "f2",
+                "precision",
+                "recall",
+                "loss"
+            ]
         );
         // Not written while empty.
         assert!(
@@ -556,6 +586,36 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
         assert!(serde_json::from_str::<TrainingConfig>(r#"{"lr_schedule": "exp"}"#).is_err());
+        // The selected metric: absent = None and not written; a set one round-trips; an unknown
+        // one is refused, naming the choices.
+        use crate::training::recipe::SelectMetric;
+        assert_eq!(TrainingConfig::default().select_metric, None);
+        assert!(
+            !serde_json::to_string(&TrainingConfig::default())
+                .unwrap()
+                .contains("select_metric")
+        );
+        let m: TrainingConfig = serde_json::from_str(r#"{"select_metric": "f0_5"}"#).unwrap();
+        assert_eq!(m.select_metric, Some(SelectMetric::F05));
+        let text = serde_json::to_string(&m).unwrap();
+        assert!(text.contains(r#""select_metric":"f0_5""#), "{text}");
+        assert_eq!(serde_json::from_str::<TrainingConfig>(&text).unwrap(), m);
+        let e = serde_json::from_str::<TrainingConfig>(r#"{"select_metric": "f3"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("f3") && e.contains("map50") && e.contains("f0_5"),
+            "{e}"
+        );
+        assert_eq!(m.select_metric_for(None), SelectMetric::F05);
+        assert_eq!(
+            m.select_metric_for(Some(SelectMetric::Map)),
+            SelectMetric::Map
+        );
+        assert_eq!(
+            TrainingConfig::default().select_metric_for(None),
+            SelectMetric::Map
+        );
         // Unset: not written.
         let text = serde_json::to_string(&TrainingConfig::default()).unwrap();
         assert!(!text.contains("\"lr"), "{text}");

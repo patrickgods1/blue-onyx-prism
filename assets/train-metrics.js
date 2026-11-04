@@ -109,10 +109,13 @@
   }
   // The convergence rule's countdown: epochs since the last gain against the patience, where the
   // run stops (the server's `stop_epoch`) and the extension / anneal it is in. Null when early
-  // stopping is off or the run predates it (patience 0 or missing).
-  function convergenceTile(progress) {
+  // stopping is off or the run predates it (patience 0 or missing). `by F2`: the metric it follows
+  // when not mAP.
+  function convergenceTile(progress, info) {
     if (!has(progress.patience) || progress.patience <= 0 || !has(progress.since_best)) return null;
     var subs = [], st = progress.stopped, an = progress.anneal, cp = progress.converge_point;
+    var by = progress.select_fallback ? "map" : (progress.settings || {}).select_metric;
+    if (by && by !== "map") subs.push("by " + info(by).short);
     if (st && has(st.epoch)) subs.push("stopped at epoch " + st.epoch + (st.reason ? " (" + st.reason + ")" : ""));
     else if (an && has(an.until)) subs.push("annealing (lower learning rate), stops at epoch " + an.until);
     else {
@@ -141,14 +144,14 @@
       var so = has(progress.elapsed_s) ? duration(progress.elapsed_s) + " so far" : "";
       box.appendChild(tile("Time left", "~" + duration(progress.eta_s), (so ? so + " · " : "") + "done ~" + doneAt(progress.eta_s)));
     } else if (has(progress.elapsed_s)) box.appendChild(tile("Time", duration(progress.elapsed_s), ""));
-    var conv = convergenceTile(progress);
+    var conv = convergenceTile(progress, info);
     if (conv) box.appendChild(conv);
     var best = progress.best;
     if (best && has(best.value)) {
       var bi = info(best.metric);
       box.appendChild(tile("Best " + bi.short, format(bi.format, best.value), "epoch " + best.epoch));
     }
-    [["loss", "Loss"], ["val_loss", "Val loss"]].forEach(function (p) {
+    [["loss", "Loss"], ["val_loss", "Val loss"], ["iou", "Mean IoU"]].forEach(function (p) {
       var lt = lastTwo(history, p[0]);
       if (!has(lt.last)) return;
       var i = info(p[0]);
@@ -201,7 +204,7 @@
   }
 
   // ---- charts ----------------------------------------------------------------------------------
-  var QUALITY = /^(ema_)?(map|map50|map75|mar|precision|recall|f1|f2|f0_5)$/;
+  var QUALITY = /^(ema_)?(map|map50|map75|mar|iou|precision|recall|f1|f2|f0_5)$/;
   function intTick(v) { return String(Math.round(v)); }
   // valFmt (optional): the hover and table text of a value (default: percent with pct, else 4
   // significant digits).

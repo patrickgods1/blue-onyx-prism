@@ -94,6 +94,19 @@
     if (Array.isArray(saved.classes) && saved.classes.length) restoredClasses[id] = saved.classes;
   });
 
+  // "Select best by": the hint of the chosen metric (the server's list, on each option).
+  (function () {
+    var sel = document.getElementById("train-select-metric");
+    var hint = document.getElementById("train-select-hint");
+    if (!sel || !hint) return;
+    var show = function () {
+      var o = sel.options[sel.selectedIndex];
+      if (o) hint.textContent = o.getAttribute("data-hint") || "";
+    };
+    sel.addEventListener("change", show);
+    show();
+  })();
+
   toggle(document.getElementById("import-form"), "source", "data-source");
 
   // An invalid field inside a closed <details> (Sampling options, Advanced) cannot show its
@@ -1007,12 +1020,17 @@
     });
   }
   // The run's settings under its progress text, joined with " · ": device, batch (and the OOM
-  // retry that lowered it), input size, learning rate and schedule, epoch cap, patience, seed,
-  // scene, data loader workers. From progress.settings (what the job resolved) and the trainer's
+  // retry that lowered it), input size, learning rate and schedule, epoch cap, patience, the
+  // metric selected by (when not mAP), seed, scene, data loader workers. From progress.settings
+  // (what the job resolved) and the trainer's
   // start event (batch_size, imgsz); a run queued before those existed falls back to its
   // request's recipe. Missing parts are left out; nothing known = no line.
   function lrText(v) { return v === 0 ? "0" : (+v.toPrecision(4)).toExponential(); }
   var isNum = function (v) { return typeof v === "number" && !isNaN(v); };
+  function metricShort(id) {
+    var m = (metricsState.metrics || []).filter(function (x) { return x.id === id; })[0];
+    return (m && m.short) || id;
+  }
   function settingsParts(r) {
     var p = r.progress || {}, s = p.settings || null, rec = (r.request && r.request.recipe) || {};
     var out = [];
@@ -1035,6 +1053,9 @@
     if (isNum(cap) && cap > 0) out.push("cap " + cap + " ep");
     var pat = s && isNum(s.patience) ? s.patience : p.patience;
     if (isNum(pat)) out.push(pat > 0 ? "patience " + pat + (s && s.patience_doubled ? " (×2, small val)" : "") : "early stop off");
+    var select = s ? s.select_metric : rec.select_metric;
+    if (p.select_fallback) out.push("selected by mAP (" + metricShort(p.select_fallback.metric) + " failed at epoch " + p.select_fallback.epoch + ")");
+    else if (select && select !== "map") out.push("selected by " + metricShort(select));
     var seed = s && isNum(s.seed) ? s.seed : r.request && isNum(r.request.train_seed) ? r.request.train_seed : null;
     if (seed !== null) out.push("seed " + seed);
     if (s && typeof s.scene === "string" && s.scene && s.scene !== "all") out.push(s.scene);
