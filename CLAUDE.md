@@ -146,7 +146,14 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   on every unreviewed label file of the review folder (`bulk::bulk_reject_unwanted`, `reason: other_class`) and answers `auto_rejected`
   + `reviewed_with_unwanted`; reviewed frames change only when the user confirms (`POST /v1/review/reject-unwanted-reviewed`, frames
   stay reviewed). *Reject boxes of unwanted classes* (`POST /v1/review/reject-other-class`, unreviewed, queue filters) does the same
-  by hand; the auto-label form asks to hide classes left unticked. Class selection: a run may pick a subset of the wanted classes
+  by hand; the auto-label form asks to hide classes left unticked. Duplicate boxes (`collect/labels/stacks.rs`, twin of the page's
+  `dupGroups`): stacks = live boxes of one object at IoU >= 0.7 (keeper: drawn > edited > accepted > pending > hint, then score; human
+  boxes never dropped), rejected on reviewed and unreviewed frames by `POST /v1/review/reject-stacked` (`bulk_reject_stacked`, walks the
+  label files via `queue::labelled`, `source` does not narrow; `reject_reason: duplicate`, frames keep their status, `overlaps_left`,
+  `overlaps_left_reviewed`), and at save / Shift+A / `accept_frame` for pending boxes; nested or partial overlaps (IoU >= 0.5, or >= 80%
+  inside, `inside_share`) go to a human, never a bulk action: `auto=overlaps`, `u`, and `overlaps_checked` on the file once a reviewer
+  saved with them kept (the bulk skips such a frame; a merged-in box clears it). A duplicate is no negative: out of `hard_negatives.json`
+  (`LabelFile::hard_negatives`), `rejected_boxes` and the repeats history. Class selection: a run may pick a subset of the wanted classes
   (`AutoRun.classes`; skipped only when the same labelers already covered every picked class), `GET /v1/review/class-catalog`
   (`training/autolabel/catalog.rs`, `coco_class` parity-tested against `scripts/autolabel.py`, default picks = classes the enabled models'
   `object_filter`s keep; `assets/class-picker.js`, also the Config page's per-model Classes column).
@@ -175,9 +182,12 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `compare_group` and compare per scene (`training/compare.rs`, Comparison card, `GET /v1/training/compare`; columns also
   person/vehicle recall + false alerts on empty frames at the model's threshold, from `BenchSummary` `person_recall`,
   `vehicle_recall`, `empty_frames`/`empty_frame_alerts`, `threshold`). RF-DETR: cosine LR schedule (min_factor 0.1) and lr
-  5e-5 / lr_encoder 7.5e-5 under 1000 train images (`TrainRecipe::effective_lr`); anneal-then-stop at a stop point
-  (`--anneal`, max(5, ceil(patience/2)) epochs, Rust twin `progress::convergence_run`). Validation split = 10% but at
-  least 50 frames, capped at 25% of the pool (`Options.min_valid`). "Repeat with N seeds" (form `seeds` 1-3, `train run
+  5e-5 / lr_encoder 7.5e-5 under 1000 unique train frames, not repeats (`TrainRecipe::effective_lr`, `Prepared.train_frames`); anneal-then-stop at a stop point
+  (`--anneal`, max(5, ceil(patience/2)) epochs, Rust twin `progress::convergence_run`). Validation split (`dataset/valid.rs`) = 10% but at
+  least 50 frames, at most 25% of the pool as a target (`Options.min_valid`), taken as whole camera days never shared with training:
+  seeded rank, class-adding days first, at most half of a class's boxes, up to 1.5x the target, then up to the 25% cap. It falls back to
+  the frame split with a warning under 3 days, under half the target, no group with a box, or no camera/day tags (`Stats.valid_groups`).
+  "Repeat with N seeds" (form `seeds` 1-3, `train run
   --seeds`): `TrainRequest.train_seed` is the trainer's `--seed` only (dataset assembly seed unchanged, so same frames),
   names get `-s<i>`, one compare group, and the Comparison card adds "mean of N seeds" rows (mean + range, never best). Class
   filter: `dataset::inventory` (`train classes`, `GET /v1/training/dataset-classes`, the page's picker) and
@@ -192,6 +202,11 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   VideoToolbox measured slower); two-pass extraction (640 px candidates, then only the kept frames at full resolution) with a free-space
   preflight and running guard (`import/disk.rs`, ENOSPC -> one actionable error, work folder removed); `GET /v1/training/import/preview` backs the page's preview line) and `train autolabel` (`training/autolabel/`:
   MM-Grounding-DINO + RF-DETR L, Qwen3-VL / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label;
+  `--with-model <id> --missing-only` (`triage::apply_missing`, `autolabel::trained_frames`) proposes unlabelled real objects on reviewed
+  frames, bypassing `triage::apply` and `merge_proposals`: frames the model trained on are skipped (`<model>.provenance.json` ->
+  `<training dir>/<run_id>/data/train.txt`), a same-object training or pending box at IoU >= 0.3 or holding 50% of the detection covers
+  it, judged rejects block at IoU >= 0.5, unjudged ones (`low_score`, hints rejected by the save default) are overwritten in place; only
+  frames that gain a box are written (`unreviewed` + `disagreement`, so out of exports until saved); no `auto_run` marker, so models run in turn;
   run options: batched VLM check, `--vlm-min-score`, prefetch; a Cancel keeps the finished frames, a rerun resumes)
   are `task::Task`s on the same one-at-a-time queue (an import can queue an auto-label of its frames: `Task::after`, skipped unless the import is Done with new frames; post-steps reject-low / accept / review folder in `training/finish.rs`), recorded in `<training dir>/tasks.json` beside `runs.json`; pins in
   `catalog/autolabel.rs`. A running job pauses / resumes (`PausableRunner`: SIGSTOP/SIGCONT of the helper's process group,
