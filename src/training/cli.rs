@@ -72,8 +72,9 @@ pub enum TrainCommand {
     /// Several --scene values (or several --model x --scene) queue one run per scene, share a
     /// comparison group and are benchmarked on the same held-out frames; a table of AP per scene
     /// is printed at the end. With early stopping on (the default) --epochs is a cap: a run
-    /// stops once the validation mAP has not improved for --patience epochs and exports its best
-    /// checkpoint. A running training can be finished early, keeping the best checkpoint, from
+    /// stops once the validation mAP (or --select-metric) has not improved for --patience epochs
+    /// and exports its best checkpoint. A running training can be finished early, keeping the
+    /// best checkpoint, from
     /// the Training page (Finish now) or by creating the file `<run dir>/work/stop-request`
     /// (the run dir is under the training folder, see `train list`). Ctrl-C cancels instead.
     Run {
@@ -87,9 +88,10 @@ pub enum TrainCommand {
         /// RT-DETRv2 / D-FINE 80; config `training.epochs`).
         #[arg(long)]
         epochs: Option<u32>,
-        /// Epochs without validation-mAP improvement before the run stops and keeps its best
-        /// checkpoint; 0 = off (default: the family's recommendation: YOLO 15, others 10; config
-        /// `training.patience`). At most --epochs.
+        /// Epochs without an improvement of the selected metric (--select-metric, mAP by
+        /// default) before the run stops and keeps its best checkpoint; 0 = off (default: the
+        /// family's recommendation: YOLO 15, others 10; config `training.patience`). At most
+        /// --epochs.
         #[arg(long)]
         patience: Option<u32>,
         /// Images per batch (default: the largest the GPU fits by the estimate, at most 16).
@@ -113,6 +115,11 @@ pub enum TrainCommand {
         /// anneal's), RT-DETRv2 / D-FINE 0).
         #[arg(long)]
         lr_min_factor: Option<f32>,
+        /// The metric the run optimizes: it picks the exported epoch and drives the convergence
+        /// rule (default: config `training.select_metric`, else map). With a small validation
+        /// split any choice but mAP is noisy; the held-out benchmark stays the number to trust.
+        #[arg(long, value_parser = select_metric_arg())]
+        select_metric: Option<recipe::SelectMetric>,
         /// RF-DETR multi-scale training: auto (on when the estimate fits batch 4 with it), on
         /// (rfdetr's default: batches up to ~1.4x the input size, about twice the memory) or off.
         #[arg(long, default_value = "auto", value_parser = ["auto", "on", "off"])]
@@ -845,6 +852,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             lr,
             lr_schedule,
             lr_min_factor,
+            select_metric,
             multi_scale,
             night_aug,
             aug_dark,
@@ -937,6 +945,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                     lr_schedule.as_deref().and_then(recipe::LrSchedule::parse),
                     lr_min_factor,
                 );
+                r.select_metric = config.training.select_metric_for(select_metric);
                 r.augment = augment;
                 r.multi_scale = recipe::MultiScale::parse(&multi_scale).unwrap_or_default();
                 for (scene, i) in scenes.iter().flat_map(|s| (0..seeds).map(move |i| (s, i))) {
@@ -1182,6 +1191,17 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
     }
 }
 
+/// `--select-metric`: an id of [`recipe::SELECT_METRICS`], each shown in `--help` with its hint.
+fn select_metric_arg() -> impl clap::builder::TypedValueParser<Value = recipe::SelectMetric> {
+    use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+    PossibleValuesParser::new(
+        recipe::SELECT_METRICS
+            .iter()
+            .map(|o| PossibleValue::new(o.metric.id()).help(o.hint)),
+    )
+    .map(|s| recipe::SelectMetric::parse(&s).unwrap_or_default())
+}
+
 /// The comparison table of the finished runs of a `--scene` group.
 fn compare_text(runs: &[service::RunRecord]) -> String {
     let runs: Vec<CompareRun> = runs
@@ -1207,6 +1227,7 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 .and_then(|p| p.stopped.as_ref())
                 .map(|s| s.epoch),
             seed: r.request.train_seed,
+            select_metric: r.select_metric(),
             bench: r.benchmark.clone(),
         })
         .collect();
@@ -1999,6 +2020,22 @@ mod tests {
         };
         assert_eq!(seeds, 1);
         assert!(parse(&["run", "--model", "a", "--seeds", "4"]).is_err());
+        // --select-metric: the ids of the one list; unset = None (config, else map).
+        let metric = |args: &[&str]| match parse(args) {
+            Ok(TrainCommand::Run { select_metric, .. }) => Ok(select_metric),
+            Ok(_) => panic!("not run"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(metric(&["run", "--model", "a"]), Ok(None));
+        assert_eq!(
+            metric(&["run", "--model", "a", "--select-metric", "f0_5"]),
+            Ok(Some(recipe::SelectMetric::F05))
+        );
+        let e = metric(&["run", "--model", "a", "--select-metric", "f3"]).unwrap_err();
+        assert!(
+            e.contains("f3") && e.contains("map50") && e.contains("iou"),
+            "{e}"
+        );
         assert!(parse(&["run", "--model", "a", "--seeds", "0"]).is_err());
         let req = TrainRecipe::new(catalog::TrainFamily::Yolo26, "n").unwrap();
         let all = SceneFilter::ALL_SCENES;

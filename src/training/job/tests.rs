@@ -739,6 +739,7 @@ fn rfdetr_with_early_stopping_anneals_before_it_stops() {
     j.request.recipe.lr = Some(2e-4);
     j.request.recipe.lr_schedule = Some(crate::training::recipe::LrSchedule::Step);
     j.request.recipe.lr_min_factor = Some(0.2);
+    j.request.recipe.select_metric = crate::training::recipe::SelectMetric::F2;
     let fake = TrainFake {
         cuda: true,
         mps: false,
@@ -758,13 +759,14 @@ fn rfdetr_with_early_stopping_anneals_before_it_stops() {
         ("--lr-encoder", "0.0003"),
         ("--lr-scheduler", "step"),
         ("--lr-min-factor", "0.2"),
+        ("--select-metric", "f2"),
     ] {
         assert_eq!(arg_after(train, k).unwrap().to_str(), Some(v), "{k}");
     }
     let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
     assert!(
         log.contains(
-            "patience 12 (set); mAP averaged over the last 3 epochs; at a stop point the \
+            "patience 12 (set); F2 averaged over the last 3 epochs; at a stop point the \
              learning rate is lowered over 6 more epochs, then training stops"
         ),
         "{log}"
@@ -1400,6 +1402,7 @@ fn finish_now_writes_the_stop_file_and_the_run_exports_its_best_epoch() {
     // No schedule set: the script picks the trainer's own.
     assert!(arg_after(&args, "--lr-scheduler").is_none());
     assert!(arg_after(&args, "--lr-min-factor").is_none());
+    assert!(arg_after(&args, "--select-metric").is_none());
     let stop = arg_after(&args, "--stop-file").unwrap();
     assert_eq!(PathBuf::from(&stop), stop_file(&t.0.join("training/a")));
     assert!(!stop.exists(), "the stale request was removed");

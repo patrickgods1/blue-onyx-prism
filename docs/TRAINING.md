@@ -346,7 +346,7 @@ sooner.
 | RT-DETRv2 / D-FINE | 80 | 10 | 10 | 0.001 | 3 epochs | 1e-4 |
 
 With fewer than 50 validation images a **recommended** patience doubles (10 -> 20, at most the
-epochs; `recipe::SMALL_VALID_IMAGES`): the mAP of so few images jumps by several points between
+epochs; `recipe::SMALL_VALID_IMAGES`): the metrics of so few images jump by several points between
 epochs. A typed patience (form, `--patience`, `training.patience`) is never changed. The first lines
 of the train stage in `train.log` say which applied, e.g. `# convergence: 16 validation images
 (< 50): patience 20 instead of 10; mAP averaged over the last 3 epochs`.
@@ -400,16 +400,18 @@ that is a canonical id itself wins over the trainer's aliases of it, `progress::
 convergence rule stops after when nothing improves from now on; null while early stopping is off and
 after a stop), `batch_size` and `imgsz` (the start event's, the job's halved batch before it after an
 out-of-memory retry), and `settings`: `lr` / `lr_encoder` (null = the trainer's own), `lr_schedule`
-and `lr_min_factor` in effect, `epochs`, `patience` in effect and `patience_doubled` (a small
-validation split), the requested `batch`, `workers`, `seed` (a seed repeat's), `scene` (`all`,
-`night+ir`, ...) and `gpu` (its name). The stage text ends with `lr 2.3e-4`.
+and `lr_min_factor` in effect, `select_metric` (absent on older records: `map`), `epochs`, `patience`
+in effect and `patience_doubled` (a small validation split), the requested `batch`, `workers`, `seed`
+(a seed repeat's), `scene` (`all`, `night+ir`, ...) and `gpu` (its name). `select_fallback`
+(`{metric, epoch, reason}`, absent normally) says the selected metric's source failed and the run went
+on by mAP. The stage text ends with `lr 2.3e-4`.
 
 **On the page** the metrics view shows a Learning rate tile (the current rate with its change from
 the previous epoch) and an LR curve once the history has `lr`, a Convergence tile ("since best 4 / 10,
 stops at epoch E", the anneal or extension when active; hidden with patience 0), the finish time
 under Time left, a run settings line (GPU, batch and input size, learning rate and schedule, cap and
-patience, seed, scene, workers) and an overfitting hint when the validation loss rises while the
-training loss falls.
+patience, "selected by F2" when the metric is not mAP, seed, scene, workers) and an overfitting hint
+when the validation loss rises while the training loss falls.
 
 Sources: the Ultralytics fine-tuning guide (patience 10-20 when fine-tuning) and the `cfg` reference
 (<https://docs.ultralytics.com/guides/finetuning-guide>, <https://docs.ultralytics.com/usage/cfg>);
@@ -428,9 +430,9 @@ expect a noisy held-out AP.
 its display twin is `progress::convergence_run`, parity-tested), and the trainers' own early stopping
 is switched off so only this one decides:
 
-- The value is the validation **mAP50-95**, else mAP50 when the trainer reports no mAP50-95,
-  **averaged over the last `smooth` epochs** (3; fewer at the start; `--smooth 1` = each epoch's
-  value). A single noisy peak no longer starts the countdown: run `20261030-010233-b69d` (RF-DETR
+- The value is the **selected metric** (see *Select best by* below; by default the validation
+  **mAP50-95**, else mAP50 when the trainer reports no mAP50-95), **averaged over the last `smooth`
+  epochs** (3; fewer at the start; `--smooth 1` = each epoch's value). A single noisy peak no longer starts the countdown: run `20261030-010233-b69d` (RF-DETR
   nano, 16 validation images) stopped at epoch 15 on its epoch-5 peak with the raw value, while its
   3-epoch mean still gained at epochs 7, 9 and 15.
 - An improvement is a mean above the best mean so far by more than `min_delta` (0.001).
@@ -444,8 +446,8 @@ is switched off so only this one decides:
   sooner past a gain), at most 2 times (`MAX_EXTENSIONS`) and never at the last epoch; otherwise it
   stops. The script prints `@train {"event":"converge_point","epoch":E,"best_epoch":B,"best":v,
   "loss_falling":true,"loss_from":a,"loss_to":b,"extension":n,"next_check":E+patience}` and the
-  Training page shows "Early stop reached at epoch 15 (best epoch 5, mAP 0.835); training loss is
-  still falling (3.569 -> 3.315). Continuing to epoch 25." with **Stop now and keep epoch 5** (the
+  Training page shows "Early stop reached at epoch 15 (best epoch 5, mAP 0.835; the selected metric's
+  name when it is not mAP); training loss is still falling (3.569 -> 3.315). Continuing to epoch 25." with **Stop now and keep epoch 5** (the
   Finish now action) and **Continue** (hides the notice; the run goes on by itself, so an unattended
   run never waits). The incident run with its losses passes its epoch-15 stop point this way.
 - **Anneal, then stop** (RF-DETR, `--anneal N`, 0 = off for the other trainers, whose schedules
@@ -463,9 +465,68 @@ is switched off so only this one decides:
   stopping." (with Stop now / Continue) and "lowering the learning rate until epoch U, then
   stopping" in the run's progress line. The best checkpoint is still the one exported, usually one
   of the annealed epochs.
-- The **best checkpoint** (highest raw mAP, not the smoothed one) is exported, not the last: Ultralytics `best.pt`, RF-DETR
+- The **best checkpoint** (highest raw value of the selected metric, not the smoothed one; the
+  earliest epoch on a tie) is exported, not the last: Ultralytics `best.pt`, RF-DETR
   `checkpoint_best_total.pth`, and for RT-DETRv2 / D-FINE (transformers) the best model state, which is
   restored in memory before the export (the log names the exported epoch).
+
+### Select best by
+
+The Options step's **Select best by** dropdown (`training.select_metric`, `train run --select-metric`,
+the script's `--select-metric`; none of them set = `map`) picks the metric a run optimizes. It decides
+both which epoch's weights are exported and the convergence rule's value, so a run never stops on mAP
+while selecting on something else. The one list with labels and hints is `recipe::SELECT_METRICS`.
+
+| Id | Metric | What it does |
+|---|---|---|
+| `map` (default) | mAP 50-95 | Average precision over IoU 0.5-0.95, per class: rewards finding objects and tight boxes |
+| `map50` | mAP 50 | Average precision at IoU 0.5: finding objects counts, exact box fit does not |
+| `f1` | F1 | Weighs catching objects and false alarms equally |
+| `f2` | F2 | Favours catching objects over false alarms |
+| `f0_5` | F0.5 | Favours fewer false alarms over catching objects |
+| `iou` | Mean IoU | Box tightness of the matched boxes only: **it ignores missed objects, so it can prefer a model that misses more** |
+
+`f1`, `f2` and `f0_5` are macro averages over the classes at the one confidence threshold that
+maximizes that average, so they are not person or vehicle specific: a rare class counts as much as
+`person`. `iou` is pooled over the matched boxes of all classes, at no threshold. All are on a 0..1
+scale, so `min_delta` stays 0.001.
+
+**A small validation split makes any choice but mAP noisier**: F-beta and IoU take the best threshold
+of few objects, and a single box moves them. Whatever a run selects by, **the held-out benchmark stays
+the number to trust**; two runs that differ only in this setting are compared there (the Comparison
+card shows "best 12 by F2" and warns when runs of a group were selected by different metrics).
+
+How each trainer follows it (`Selection` and `pick_metric` in `train_model.py`; with `map` every trainer
+keeps its own path, byte for byte):
+
+- **Ultralytics**: `NightTrainer.validate` restores `best_fitness` after Ultralytics' `validate` and
+  applies the same comparison to the selected value, computed there from `validator.metrics.box` and
+  a peek at the IoU data (`on_fit_epoch_end`, which reports them, runs later). `best.pt` follows it,
+  and `conv.step` gets the same number. `save_model` also writes on a tie, so a tie returns a fitness
+  a hair below the best: the earlier epoch stays, as in the rule. Ultralytics' own stopper never fires
+  (its patience is above the epochs), and a NaN mAP fitness stays Ultralytics' NaN recovery's.
+- **RF-DETR**: `BestModelCallback` writes `checkpoint_best_total.pth` and knows only mAP / mAR. For its
+  `on_validation_end` the script hands it a view of the trainer whose `callback_metrics` has the
+  selected value (same dtype and device) under `monitor` and `_monitor_ema`. Writing into
+  `trainer.callback_metrics` itself, as rfdetr's `smooth_alpha` does, has no effect: Lightning's
+  property refreshes that dict from the logged results on every read until the validation loop resets
+  them, and `val/ema_mAP_50_95` is logged. The real metrics are never changed, so nothing reaches
+  `metrics.csv`, the epoch event or the `map` columns. With EMA (rfdetr's default) validation scores
+  only the EMA model, the sweep and the IoU included, and the EMA track is the only one. rfdetr's
+  high-water mark starts at 0.0 with a strict `>`, and it would backfill the final weights if nothing
+  beat it; a non-default run starts it at -1, so a metric of exactly 0.0 at every epoch keeps epoch 1,
+  as the rule and the page say. (A default run keeps rfdetr's behaviour: all-zero mAP exports the
+  final EMA weights.)
+- **RT-DETRv2 / D-FINE**: the rule's `improved` already keeps the weights, so only the value changes.
+
+An F or the IoU missing at an epoch means nothing matched and counts as 0.0 (`pick_metric`, Rust twin
+`progress::rule_values`). If the source itself failed (the F-beta sweep raised, a changed library
+internal took the IoU hook, or rfdetr's callback cannot be wrapped) the script logs it once, prints
+`@train {"event":"select_fallback","metric":"f2","epoch":E,"reason":"..."}` and selects by mAP for the
+whole run; it never fails a run for this. Values on another scale cannot be compared, so the rule and
+the trainer's best start again at epoch E, and the page's best epoch and settings line follow.
+`progress.best`, the Best tile, the "best epoch" text and the Stop now / Continue notices follow the
+selected metric. Records from before the setting read as `map`.
 
 **Finish now.** A run in its train stage can be stopped after the current epoch, keeping the best
 checkpoint (it then exports, installs and benchmarks as usual): the **Finish now** button beside Cancel
@@ -645,7 +706,8 @@ predictions (all scores, so no confidence threshold): COCO-style greedy matching
 per class, each ground truth matched once, IoU >= 0.5, then the mean IoU of the matched pairs (pooled
 over classes). It measures how tight the boxes are, so it starts at 0.5 and missed objects do not lower
 it: read it alongside recall. YOLO `box_loss` and RF-DETR `loss_giou` are loss terms on other scales and
-not comparable with it. It is display only: the convergence rule, the best epoch and `best` stay on mAP.
+not comparable with it. By default it is display only; `--select-metric iou` makes it the selected metric
+(*Select best by*).
 
 The service maps the keys to stable ids (`src/training/progress.rs` `canonical`): `map`, `map50`,
 `map75`, `mar`, `iou`, `precision`, `recall`, `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`,
@@ -653,8 +715,8 @@ The service maps the keys to stable ids (`src/training/progress.rs` `canonical`)
 `val/ema_*`; unknown keys keep their raw name (`val/AP/raccoon`, `train/loss_ce`), so nothing is lost
 when a library renames one. Each run's `progress` in `runs.json` and `GET /v1/training` has
 `history` (one point per epoch: `epoch`, `elapsed_s`, `metrics`; an `eval` event fills its epoch's
-point; at most 1000 points) and `best` (`{metric, epoch, value}` on `map`, else `map50`, else the
-lowest `val_loss`), which the stage text shows as "best mAP50-95 0.711 @ epoch 3". `GET /v1/training`
+point; at most 1000 points) and `best` (`{metric, epoch, value}` on the selected metric, by default
+`map`, else `map50`, else the lowest `val_loss`), which the stage text shows as "best mAP50-95 0.711 @ epoch 3". `GET /v1/training`
 also has `metrics` (label, short label, `higher_better`, `format` of every id) and `metric_columns`.
 Records written before this keep loading (no `history`: the page shows no metrics block).
 
@@ -693,7 +755,8 @@ comparison shows a warning instead of comparing.
 
 **The table.** The Comparison card of the Training page (one per group) and, at the end of a
 `train run` with several scenes, the CLI table have one row per run: model, scene filter, best epoch
-and the epoch it stopped at, held-out AP50-95 for `day`, `night`, `ir` and `all` frames
+(with "by F2" when not selected by mAP; a warning when runs of a group differ) and the epoch it
+stopped at, held-out AP50-95 for `day`, `night`, `ir` and `all` frames
 (from the benchmark's per-tag results), the AP over the scenes the run trained on (**in-scope**, the
 run's headline), the p50 time, and what alerting sees at the model's confidence threshold over every
 held-out frame: **Person R** (person recall), **Vehicle R** (vehicle recall, car / truck / bus merged,
@@ -1225,7 +1288,7 @@ blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <e
     [--scene all|day|night|ir|night+ir|day+ir ... (repeat for a comparison)] \
     [--classes a,b] [--classes c] [--excluded background|drop-frame] \
     [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
-    [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--lr-schedule cosine|linear|step] [--lr-min-factor 0.05] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
+    [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--lr-schedule cosine|linear|step] [--lr-min-factor 0.05] [--select-metric map|map50|f1|f2|f0_5|iou] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
     [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \

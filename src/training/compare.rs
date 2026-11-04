@@ -12,6 +12,7 @@
 
 use super::dataset::{Balance, Excluded, SceneFilter};
 use super::job::{BenchSummary, SceneAp};
+use super::recipe::SelectMetric;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -33,6 +34,8 @@ pub struct CompareRun {
     pub stopped_epoch: Option<u32>,
     /// The run's training seed (`TrainRequest.train_seed`; None = not a repeat).
     pub seed: Option<u64>,
+    /// The metric that picked its best epoch (`RunRecord::select_metric`).
+    pub select_metric: SelectMetric,
     /// None while the run has no benchmark (running, failed, or nothing held out).
     pub bench: Option<BenchSummary>,
 }
@@ -69,6 +72,8 @@ pub struct Row {
     pub seed: Option<u64>,
     pub best_epoch: Option<u32>,
     pub stopped_epoch: Option<u32>,
+    /// The metric that picked `best_epoch` (None for a routed row).
+    pub select_metric: Option<SelectMetric>,
     pub day: Cell,
     pub night: Cell,
     pub ir: Cell,
@@ -236,6 +241,7 @@ fn row_of(r: &CompareRun) -> Row {
         seed: r.seed,
         best_epoch: r.best_epoch,
         stopped_epoch: r.stopped_epoch,
+        select_metric: Some(r.select_metric),
         day: cell("day"),
         night: cell("night"),
         ir: cell("ir"),
@@ -250,6 +256,15 @@ fn row_of(r: &CompareRun) -> Row {
         person_recall: r.bench.as_ref().and_then(|b| b.person_recall),
         vehicle_recall: r.bench.as_ref().and_then(|b| b.vehicle_recall),
         false_alerts: r.bench.as_ref().and_then(FalseAlerts::of),
+    }
+}
+
+impl Row {
+    /// " by F2" beside the best epoch of a run not selected by mAP (empty otherwise).
+    pub fn selected_by(&self) -> String {
+        self.select_metric
+            .filter(|m| !m.is_default())
+            .map_or_else(String::new, |m| format!(" by {}", m.short()))
     }
 }
 
@@ -351,6 +366,19 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
                 uniq.join(" / ")
             ));
         }
+        if runs.iter().any(|r| r.select_metric != first.select_metric) {
+            let mut names: Vec<&str> = Vec::new();
+            for m in runs.iter().map(|r| r.select_metric.short()) {
+                if !names.contains(&m) {
+                    names.push(m);
+                }
+            }
+            c.warnings.push(format!(
+                "the runs picked their best epoch by different metrics ({}): AP differences may \
+                 come from that choice",
+                names.join(" / ")
+            ));
+        }
     }
     c.rows = runs.iter().map(row_of).collect();
     for (col, better) in COLUMNS {
@@ -400,6 +428,7 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             seed: None,
             best_epoch: None,
             stopped_epoch: None,
+            select_metric: None,
             day: dr.day,
             night: nr.night,
             ir: nr.ir,
@@ -450,9 +479,10 @@ impl Comparison {
             let recall = |col: &str, v: Option<f64>| {
                 v.map_or_else(|| "-".into(), |v| format!("{v:.2}{}", mark(col)))
             };
+            let by = r.selected_by();
             let epochs = match (r.best_epoch, r.stopped_epoch) {
-                (Some(b), Some(s)) => format!("best {b}/{s}"),
-                (Some(b), None) => format!("best {b}"),
+                (Some(b), Some(s)) => format!("best {b}{by}/{s}"),
+                (Some(b), None) => format!("best {b}{by}"),
                 (None, Some(s)) => format!("{s}"),
                 (None, None) => "-".into(),
             };
@@ -599,6 +629,7 @@ mod tests {
             balance: Balance::default(),
             best_epoch: Some(12),
             stopped_epoch: Some(27),
+            select_metric: SelectMetric::Map,
             bench: Some(BenchSummary {
                 ms_p50: Some(ms),
                 by_scene,
@@ -818,5 +849,31 @@ mod tests {
         assert!(c.comparable);
         assert_eq!(c.best_per_column["day"], 1);
         assert_eq!(c.rows[0].day.ap50_95, None);
+    }
+
+    #[test]
+    fn runs_selected_by_different_metrics_are_marked() {
+        let same = compare(&[
+            run("a", SceneFilter::DAY, 0.5, 0.5, 0.5, 10.0),
+            run("b", SceneFilter::DAY, 0.4, 0.4, 0.4, 10.0),
+        ]);
+        assert!(same.warnings.is_empty(), "{:?}", same.warnings);
+        assert_eq!(same.rows[0].selected_by(), "");
+        assert!(same.render_text().contains("best 12/27"));
+        let mut b = run("b", SceneFilter::DAY, 0.4, 0.4, 0.4, 10.0);
+        b.select_metric = SelectMetric::F2;
+        let c = compare(&[run("a", SceneFilter::DAY, 0.5, 0.5, 0.5, 10.0), b]);
+        assert_eq!(c.warnings.len(), 1);
+        assert!(
+            c.warnings[0].contains("different metrics (mAP / F2)"),
+            "{:?}",
+            c.warnings
+        );
+        assert_eq!(c.rows[1].select_metric, Some(SelectMetric::F2));
+        assert_eq!(c.rows[1].selected_by(), " by F2");
+        let text = c.render_text();
+        assert!(text.contains("best 12 by F2/27"), "{text}");
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["rows"][1]["select_metric"], "f2");
     }
 }

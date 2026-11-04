@@ -182,6 +182,14 @@ struct LrScheduleChoice {
     selected: bool,
 }
 
+/// One option of the "Select best by" select.
+struct SelectChoice {
+    value: &'static str,
+    title: &'static str,
+    hint: &'static str,
+    selected: bool,
+}
+
 /// A licence notice shared by some families (shown once under the size grid).
 struct NoticeRow {
     families: String,
@@ -508,6 +516,10 @@ pub(super) struct TrainingTemplate {
     lr_schedule_hint: String,
     /// `training.lr_min_factor`, blank = each family's default.
     lr_min_factor: String,
+    /// "Select best by": [`recipe::SELECT_METRICS`], `training.select_metric` selected.
+    select_metrics: Vec<SelectChoice>,
+    /// The selected choice's hint.
+    select_hint: &'static str,
     scenes: Vec<SceneChoice>,
     balance: BalanceView,
     /// Day / night / mixed comparisons of runs queued together, the latest first.
@@ -681,6 +693,7 @@ fn compare_run(r: &RunRecord) -> CompareRun {
                 .map(|p| p.epoch)
         }),
         seed: r.request.train_seed,
+        select_metric: r.select_metric(),
         bench: r.benchmark.clone(),
     }
 }
@@ -744,9 +757,10 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
                         best: !row.routed && best(k, col),
                     })
                     .collect();
+                    let by = row.selected_by();
                     let epochs = match (row.best_epoch, row.stopped_epoch) {
-                        (Some(b), Some(s)) => format!("best {b} / stopped {s}"),
-                        (Some(b), None) => format!("best {b}"),
+                        (Some(b), Some(s)) => format!("best {b}{by} / stopped {s}"),
+                        (Some(b), None) => format!("best {b}{by}"),
                         (None, Some(s)) => format!("stopped {s}"),
                         (None, None) => "\u{2014}".into(),
                     };
@@ -1206,6 +1220,19 @@ fn view_with(
             .lr_min_factor
             .map(|e| e.to_string())
             .unwrap_or_default(),
+        select_metrics: recipe::SELECT_METRICS
+            .iter()
+            .map(|o| SelectChoice {
+                value: o.metric.id(),
+                title: o.label,
+                hint: o.hint,
+                selected: config.training.select_metric_for(None) == o.metric,
+            })
+            .collect(),
+        select_hint: recipe::SELECT_METRICS
+            .iter()
+            .find(|o| config.training.select_metric_for(None) == o.metric)
+            .map_or("", |o| o.hint),
         scenes: SCENE_CHOICES
             .iter()
             .map(|(s, title, preset)| SceneChoice {
@@ -1450,6 +1477,12 @@ pub(crate) fn requests_from_form(
         })?),
     };
     let lr_min_factor: Option<f32> = num(f, "lr_min_factor", "final LR factor")?;
+    let select_metric = match field(f, "select_metric").map(str::trim) {
+        None | Some("") => None,
+        Some(v) => Some(recipe::SelectMetric::parse(v).ok_or_else(|| {
+            anyhow::anyhow!("select best by: {}", recipe::select_metric_error(v))
+        })?),
+    };
     let multi_scale = match field(f, "multi_scale") {
         Some(v) => recipe::MultiScale::parse(v)
             .ok_or_else(|| anyhow::anyhow!("multi-scale: '{v}' is not auto, on or off"))?,
@@ -1515,6 +1548,7 @@ pub(crate) fn requests_from_form(
                 .min(16)
         });
         training.apply_lr(&mut r, lr, lr_schedule, lr_min_factor);
+        r.select_metric = training.select_metric_for(select_metric);
         r.augment = augment;
         r.multi_scale = multi_scale;
         let request = TrainRequest {
@@ -2755,6 +2789,61 @@ mod tests {
     }
 
     #[test]
+    fn the_selected_metric_comes_from_the_form_else_the_config() {
+        use crate::training::config::TrainingConfig;
+        use crate::training::recipe::SelectMetric;
+        type Queued = (SelectMetric, Option<u64>, Option<String>);
+        let post = |extra: &[(&str, &str)], t: &TrainingConfig| -> anyhow::Result<Vec<Queued>> {
+            let mut f: Vec<(&str, &str)> = vec![("model", "yolo26n"), ("dataset", "/x")];
+            f.extend_from_slice(extra);
+            let (reqs, _) = requests_from_form(&form(&f), &mac(), t)?;
+            Ok(reqs
+                .into_iter()
+                .map(|r| (r.recipe.select_metric, r.train_seed, r.compare_group))
+                .collect())
+        };
+        let none = TrainingConfig::default();
+        let metric = |v: &[Queued]| v[0].0;
+        assert_eq!(metric(&post(&[], &none).unwrap()), SelectMetric::Map);
+        assert_eq!(
+            metric(&post(&[("select_metric", "")], &none).unwrap()),
+            SelectMetric::Map
+        );
+        assert_eq!(
+            metric(&post(&[("select_metric", "f0_5")], &none).unwrap()),
+            SelectMetric::F05
+        );
+        // The form wins over the config, also with the default.
+        let set = TrainingConfig {
+            select_metric: Some(SelectMetric::Iou),
+            ..none.clone()
+        };
+        assert_eq!(metric(&post(&[], &set).unwrap()), SelectMetric::Iou);
+        assert_eq!(
+            metric(&post(&[("select_metric", "map")], &set).unwrap()),
+            SelectMetric::Map
+        );
+        // Every seed and scene of a compare group carries it.
+        let group = post(
+            &[
+                ("select_metric", "f2"),
+                ("seeds", "2"),
+                ("scene", "day"),
+                ("scene", "night"),
+            ],
+            &none,
+        )
+        .unwrap();
+        assert_eq!(group.len(), 4);
+        assert!(group.iter().all(|r| r.0 == SelectMetric::F2));
+        assert!(group.iter().all(|r| r.2.is_some() && r.2 == group[0].2));
+        let e = post(&[("select_metric", "f3")], &none)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("select best by") && e.contains("f0_5"), "{e}");
+    }
+
+    #[test]
     fn dataset_folders_are_offered_or_allowed() {
         let offered = [PathBuf::from("/exports/a"), PathBuf::from("exports/rel")];
         let allow = |raw: &str| -> Result<PathBuf, String> {
@@ -3858,6 +3947,15 @@ mod tests {
         assert!(page.contains("RF-DETR: cosine (default) or step, final factor 0.1"));
         assert!(page.contains("<option value=\"\" selected>default</option>"));
         assert!(page.contains("name=\"lr_min_factor\""));
+        // Select best by: the one list, with hints; mAP preselected.
+        assert!(page.contains("name=\"select_metric\""));
+        for o in recipe::SELECT_METRICS {
+            assert!(page.contains(&format!("<option value=\"{}\"", o.metric.id())));
+            assert!(page.contains(o.label), "{}", o.label);
+        }
+        assert!(page.contains("ignores missed objects"));
+        assert!(page.contains("<option value=\"map\" data-hint"));
+        assert!(page.contains("held-out benchmark is the number to trust"));
         assert!(page.contains("id=\"train-picker\""));
         assert!(page.contains("name=\"excluded\" value=\"drop-frame\""));
         // The per-run summary of a finished run: AP50-95 per scene and in scope.

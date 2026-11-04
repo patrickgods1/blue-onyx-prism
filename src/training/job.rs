@@ -703,7 +703,7 @@ fn stages(
 
     // 5. Train (the script also exports and checks the ONNX).
     enter!(TrainStage::Train, 0, "starting the trainer");
-    // A small validation split: a recommended patience doubles (its mAP is noisy).
+    // A small validation split: a recommended patience doubles (its metrics are noisy).
     let (patience, convergence_line) = recipe.convergence_patience(prepared.valid_images);
     let patience_doubled = patience != recipe.patience;
     let recipe = &TrainRecipe {
@@ -813,6 +813,10 @@ fn stages(
             args.push("--lr-min-factor".into());
             args.push(f.to_string().into());
         }
+        if !recipe.select_metric.is_default() {
+            args.push("--select-metric".into());
+            args.push(recipe.select_metric.id().into());
+        }
         // The convergence stop (one rule for every trainer, `Convergence` in the script).
         let rec = super::recipe::recommended(family);
         for (k, v) in [
@@ -886,6 +890,7 @@ fn stages(
                 lr_encoder: lr.and_then(|l| l.encoder),
                 lr_schedule: recipe.effective_lr_schedule(),
                 lr_min_factor: recipe.effective_lr_min_factor(),
+                select_metric: recipe.select_metric,
                 epochs: recipe.epochs,
                 patience: recipe.patience,
                 patience_doubled,
