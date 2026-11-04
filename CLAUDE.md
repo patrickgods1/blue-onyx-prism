@@ -24,6 +24,7 @@ cargo run -- --model models/IPcam-general.onnx --family yolo5 --force-cpu
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --device ort:cpu
 cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco-cctv|bmd45-cctv|exdark-night|dir:<p>] [--max-images 20]   # grade models x devices; benchmark.json next to the config
 cargo run -- benchmark --list-datasets       # built-in image sets (assets/bench/*.json, resource bench:<id>)
+cargo run -- train overlaps [--frames "scene=ir,limit=200,again=1"] [--dry-run] [--allow-large]   # suggestions for overlapping boxes; changes no box
 cargo run -- service status|start|stop|restart   # control the installed service (start/stop/restart need admin)
 cargo run --bin blue-onyx-prism-tray -- [--port n] [--cli <path>]   # tray / menu bar app (Windows, macOS)
 cargo run -- --version                      # <version> (<git sha>, <build date>): BLUE_ONYX_PRISM_GIT_SHA / _BUILD_DATE at build time (release.yml), `unknown` locally
@@ -153,7 +154,18 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `overlaps_left_reviewed`), and at save / Shift+A / `accept_frame` for pending boxes; nested or partial overlaps (IoU >= 0.5, or >= 80%
   inside, `inside_share`) go to a human, never a bulk action: `auto=overlaps`, `u`, and `overlaps_checked` on the file once a reviewer
   saved with them kept (the bulk skips such a frame; a merged-in box clears it). A duplicate is no negative: out of `hard_negatives.json`
-  (`LabelFile::hard_negatives`), `rejected_boxes` and the repeats history. Class selection: a run may pick a subset of the wanted classes
+  (`LabelFile::hard_negatives`), `rejected_boxes` and the repeats history. Overlap suggestions (`collect/labels/overlaps.rs`, pure, ported
+  from `scripts/research/eval_overlaps.py`; `tests/data/overlaps_parity.json` holds its answers; job `training/overlaps/`, `train overlaps`, Review
+  *Suggest overlaps...*, `POST /v1/review/suggest-overlaps`): assist mode, because a blind test failed the automatic rule (13 of 99 drops removed a real
+  object). `TaskKind::Overlaps`: select pairs -> env -> zoom (`scripts/autolabel.py --zoom-pairs`: RF-DETR L on the pair's padded union, one flushed JSONL
+  line per crop, detections only; ~2.6 GB free commit) -> write. **Only ever writes `LabelFile.overlap_suggestions`** (`overlaps::apply` under `labels::update`,
+  re-judged there; no box state, status, `reviewed_at` or `overlaps_checked`; reviewed and unreviewed frames, not skipped or checked). `suggest`: zoom match
+  IoU 0.6 + score 0.5 (constants in one place) and `witnesses` (independent detectors at IoU >= 0.7); no zoom answer = witnesses, `low_confidence`; `other_score`
+  >= 0.3 = `weak`, the page warns; `unclear` records a looked-at pair so a rerun resumes. Keyed by both bboxes, stale ones ignored (`overlaps::live`, also
+  `overlap_live` of `GET /v1/review/labels`), at most 64 per frame. Guards on the dropped box: human, `orig_bbox`, a `model_label` of another class (a
+  mapped spelling such as `motorbike` on `motorcycle` does not guard). `auto=overlaps` sorts by `overlaps::strength`; choosing it on the page sets
+  status any + frames all. Key `y` (`acceptOverlap`, twin `overlaps::accept`; `liveSuggestions` twin of `live`): rejects as `Duplicate`, promotes a hint keeper so the
+  save cannot leave the object with no box; a two-object accept keeps both. Class selection: a run may pick a subset of the wanted classes
   (`AutoRun.classes`; skipped only when the same labelers already covered every picked class), `GET /v1/review/class-catalog`
   (`training/autolabel/catalog.rs`, `coco_class` parity-tested against `scripts/autolabel.py`, default picks = classes the enabled models'
   `object_filter`s keep; `assets/class-picker.js`, also the Config page's per-model Classes column).

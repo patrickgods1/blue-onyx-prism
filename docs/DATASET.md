@@ -359,6 +359,24 @@ folder; the collector and the Dataset page keep `collect.dir`.
   or overlapping boxes still on it, so they looked and kept them (two real nested cars). `auto=overlaps`
   passes the frame over and `POST /v1/review/reject-stacked` leaves it alone. Kept by saves; cleared when
   a merge adds a box.
+- **`overlap_suggestions`** (written only when not empty, at most 64): what the overlap check
+  (`train overlaps`, [Overlap suggestions](TRAINING.md#overlap-suggestions)) suggests for overlapping
+  pairs. Suggestions only: they change no box, status or `reviewed_at`.
+
+  ```json
+  {"a": [812.0, 314.6, 2589.1, 1507.5], "b": [857.0, 314.0, 1828.0, 996.0], "verdict": "drop_b",
+   "why": "A closer look found only the kept box (0.61): 2 detectors (gdino, rfdetr) found it, 1 detector (serving) found the dropped one",
+   "kept_score": 0.61, "other_score": 0.19}
+  ```
+
+  `a`, `b`: the two boxes by `bbox`, the lower first. That is the key: a suggestion whose boxes moved or
+  went, or whose pair is no longer open, is stale and ignored, and so is any suggestion on a skipped or
+  `overlaps_checked` frame. `verdict`: `drop_a`, `drop_b`, `two_objects`, or `unclear` (looked at, no
+  suggestion: the page shows nothing, a rerun passes it over; an unknown value loads and is ignored).
+  `kept_score`: the zoom's score on the kept box; `other_score`: the best other detection on the box to
+  drop, 0 if none (`two_objects`: the zoom's scores on `a` and `b`). `low_confidence`: the zoom gave no
+  answer, so only the witnesses speak. `weak`: `other_score` >= 0.3, where 6 of 17 judged drops removed a
+  real object; the page warns. Kept by saves, merges, X-AnyLabeling imports and every bulk edit.
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
   box itself, all optional:
 
@@ -445,6 +463,12 @@ frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` 
 | `accept` | the auto-labelers' triage alone settles the frame (below) |
 | `nothing` | `auto_run` set and no box carries auto evidence (the labelers found nothing) |
 | `none` | never auto-labelled: no `auto_run` and no auto evidence (frames without a label file too) |
+| `repeats` | spot edits settled every box (`repeat_spot`, nothing pending) |
+| `overlaps` | stacked or overlapping boxes no reviewer has looked at (no `overlaps_checked`), any review status |
+
+`auto=overlaps` obeys `status` and `source` like the other filters, and most frames with overlaps need
+`status=any&source=all`: a reviewed frame is often not in `review-queue.jsonl`, and reviewed frames need
+this cleaning too. Choosing *overlapping boxes* on the page sets both.
 
 A frame is **accept-ready** (`labels::auto_accept_eligible`) when it is `unreviewed`, not confirmed
 empty, has no `disagreement`, has at least one pending box triaged `accept` without a class suggestion,
@@ -465,6 +489,11 @@ holds `collect.classes`). The auto-label form passes it on like the other filter
 4. more pending auto boxes triaged `review` (item field `auto_review`);
 5. more suppressed boxes;
 6. newest.
+
+Under `auto=overlaps` the frames with a live suggestion come first, strongest first (item field
+`overlap_strength`; `collect/labels/overlaps.rs` `strength`): drops with no other detection on the box,
+then with one under 0.2, then under 0.3, then two objects, then the weak band, then the witnesses alone,
+each by the zoom's score. Frames with no live suggestion follow in the order above.
 
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
 After the last frame it returns the first one again with `"wrapped": true`. The answer also carries the
@@ -550,6 +579,13 @@ among them). A save as reviewed, Shift+A and the bulk accept reject pending boxe
 on a better one the same way. A duplicate sits on a real object: it is left out of `hard_negatives.json`,
 the rejected-box count and the per-camera repeat history.
 
+`POST /v1/review/suggest-overlaps` (JSON `{bucket?, scene?, camera?, label?, gpu?, allow_large?, again?,
+dry_run?}`; the Review page's *Suggest overlaps...*) queues the overlap check on the label files of the
+folder under review those filters select, reviewed frames too. `dry_run` needs no GPU and answers
+`{success, frames, pairs, no_zoom, crops, answered, passed_over, message}`; otherwise `{success, message,
+id}`, the task's id in `GET /v1/training`. `GET /v1/review/labels` carries `overlap_live`, the indices of
+the frame's `overlap_suggestions` a reviewer can act on.
+
 `POST /v1/review/reject-unwanted-reviewed` (JSON `{dry_run, limit?}`, `limit` 1..20000, default 20000)
 rejects the accepted and added boxes of unwanted classes on every reviewed label file of the folder under
 review (`reason: "other_class"`; a rejected `human` box is dropped at the frame's next save). The frames
@@ -564,6 +600,8 @@ eligible, boxes, rejected, failed, frames, message}`. Both routes are admin rout
 | `a` | Accept every pending box. |
 | `r` | Reject or restore the selected box. |
 | `1`-`9`, `0` | Pick class 1-10: relabel the selected box, else set the class of new boxes. |
+| `u` | Reject the selected box as a duplicate of the box it overlaps (Shift: every stack on the frame). |
+| `y` | Accept the overlap suggestion on screen: reject the box marked `drop?` as a duplicate and keep the other (a hint saving would reject is accepted, so the object keeps a box), or for two objects keep both. Doing anything else ignores it. |
 | `j` / `k` | Select the next / previous box. |
 | `Delete` | Delete a drawn box, reject a model box. |
 | `e` | Confirmed empty (rejects every box). |
