@@ -2418,13 +2418,14 @@ print(json.dumps({"runs": out, "falling": falling, "finish": fin, "anneal_finish
         let script = include_str!("../../scripts/train_model.py");
         let code = r#"
 import json, sys
+src = sys.stdin.read()  # first: the test is still writing it when numpy is missing
 try:
     import numpy as np
 except ImportError:
     print("null")
     sys.exit(0)
 ns = {"__name__": "train_model"}
-exec(compile(sys.stdin.read(), "train_model.py", "exec"), ns)
+exec(compile(src, "train_model.py", "exec"), ns)
 logs = []
 ns["log"] = logs.append
 
