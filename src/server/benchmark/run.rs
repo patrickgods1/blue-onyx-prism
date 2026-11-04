@@ -1,7 +1,8 @@
 //! Benchmark run endpoints: start (`POST /v1/benchmark`), cancel, save the form as the
-//! `benchmark` config defaults, and the per-image drill-down (`/v1/benchmark/images`) with the
-//! image file itself (`/v1/benchmark/image`, only files listed in the saved results, through a
-//! cached index keyed by the results file stamp). File I/O runs in `server::blocking`.
+//! `benchmark` config defaults, drop a saved folder dataset (`POST /v1/benchmark/datasets/remove`),
+//! and the per-image drill-down (`/v1/benchmark/images`) with the image file itself
+//! (`/v1/benchmark/image`, only files listed in the saved results, through a cached index keyed
+//! by the results file stamp). File I/O runs in `server::blocking`.
 
 use super::{file_stamp, json_error, loaded_devices};
 use crate::benchmark::images;
@@ -206,6 +207,66 @@ fn settings_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Respon
                 "regraded": regraded,
             }))
             .into_response()
+        }
+        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+    }
+}
+
+/// `POST /v1/benchmark/datasets/remove` (form field `dataset` = the row's value, a saved
+/// folder dataset's label such as `dir:/srv/alerts`): drop that folder from the saved
+/// `benchmark.datasets` and nothing else. It does not go through [`settings`]: that handler
+/// keeps the saved list when the form has no `dataset` field (so removing the last one was a
+/// no-op) and checks every remaining dataset, so a folder that is gone from the disk could never
+/// be removed. The list may end up empty; a run then asks for a dataset. Built-in set ids are
+/// not removed here (untick them); a value that is not a saved folder answers 404 and writes
+/// nothing.
+pub(in crate::server) async fn remove_dataset(
+    State(state): State<Arc<AppState>>,
+    form: Result<Form<Vec<(String, String)>>, FormRejection>,
+) -> Response {
+    let form = match form {
+        Ok(Form(f)) => f,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+    };
+    crate::server::blocking(move || remove_dataset_blocking(&state, &form)).await
+}
+
+/// [`remove_dataset`] off the runtime threads: the config write (SV-06).
+fn remove_dataset_blocking(state: &AppState, form: &[(String, String)]) -> Response {
+    let Some(value) = form
+        .iter()
+        .find(|(k, _)| k == "dataset")
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "give `dataset`, the folder dataset to remove".into(),
+        );
+    };
+    let is_it = |d: &DatasetRef| d.dir().is_some() && d.label() == value;
+    if !state.config_read().benchmark.datasets.iter().any(is_it) {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "'{value}' is not a saved folder dataset; it may have been removed already \
+                 (reload the page). Built-in datasets are unticked, not removed."
+            ),
+        );
+    }
+    let mut left = 0;
+    match save_config(state, "benchmark dataset removed", |c| {
+        c.benchmark.datasets.retain(|d| !is_it(d));
+        left = c.benchmark.datasets.len();
+        Ok(())
+    }) {
+        Ok(_) => {
+            info!(dataset = %value, left, "benchmark folder dataset removed from the web UI");
+            let mut message = format!("Removed {value} from the benchmark datasets.");
+            if left == 0 {
+                message.push_str(" No dataset is selected; tick one before starting a run.");
+            }
+            Json(serde_json::json!({ "success": true, "message": message })).into_response()
         }
         Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
@@ -616,6 +677,177 @@ mod tests {
             let _ = std::fs::remove_dir_all(&outside);
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Save `datasets` as the config's benchmark datasets (a test seed, not under test).
+    fn seed_datasets(st: &Arc<AppState>, datasets: Vec<DatasetRef>) {
+        crate::server::save_config(st, "test", move |c| {
+            c.benchmark.datasets = datasets;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The saved dataset labels, read back from the config file.
+    fn saved_labels(st: &AppState) -> Vec<String> {
+        crate::config::Config::load(&st.config_path)
+            .unwrap()
+            .benchmark
+            .datasets
+            .iter()
+            .map(DatasetRef::label)
+            .collect()
+    }
+
+    /// `POST /v1/benchmark/datasets/remove` with `dataset` = `value`.
+    fn remove_req(value: &str) -> axum::http::Request<axum::body::Body> {
+        post(
+            "/v1/benchmark/datasets/remove",
+            &format!("dataset={}", crate::server::encode_uri_component(value)),
+        )
+    }
+
+    /// The `/benchmark` page body (status checked).
+    async fn page_html(st: &Arc<AppState>) -> String {
+        let resp = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// A folder dataset ref for `dir`, as the page saves it.
+    fn folder_ref(dir: &std::path::Path) -> DatasetRef {
+        DatasetRef::Id(format!("{}{}", images::DIR_PREFIX, dir.display()))
+    }
+
+    #[tokio::test]
+    async fn remove_dataset_drops_the_only_saved_folder() {
+        let st = state();
+        let dir = st
+            .config_path
+            .parent()
+            .unwrap()
+            .join("bo_only_folder_marker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder = folder_ref(&dir);
+        seed_datasets(&st, vec![folder.clone()]);
+        let html = page_html(&st).await;
+        assert!(html.contains("bo_only_folder_marker"), "{html}");
+        assert!(html.contains("data-remove-folder"), "{html}");
+
+        let (s, v) = call(&st, remove_req(&folder.label())).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["success"], true, "{v}");
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.contains("bo_only_folder_marker") && m.contains("tick one before starting a run"),
+            "{m}"
+        );
+        let last = st.config.changes(1).pop().expect("logged");
+        assert_eq!(last.source, "benchmark dataset removed");
+        // Explicit empty list on disk: it must not fall back to the built-in sets.
+        assert_eq!(saved_labels(&st), Vec::<String>::new());
+        assert_eq!(saved_labels(&st), Vec::<String>::new(), "after a reload");
+        assert!(st.config_read().benchmark.datasets.is_empty());
+        // The page still renders and has no row for the folder.
+        let html = page_html(&st).await;
+        assert!(!html.contains("bo_only_folder_marker"), "{html}");
+        assert!(!html.contains("data-remove-folder"), "{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_dataset_drops_a_folder_that_is_gone_from_the_disk() {
+        let st = state();
+        let gone = st.config_path.parent().unwrap().join("bo_gone_folder");
+        assert!(!gone.exists());
+        let folder = folder_ref(&gone);
+        seed_datasets(&st, vec![folder.clone()]);
+        let html = page_html(&st).await;
+        assert!(html.contains("directory not found"), "{html}");
+        // The settings form cannot do this (it validates the folder); the dedicated route can.
+        let (s, v) = call(&st, remove_req(&folder.label())).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(saved_labels(&st).is_empty());
+        assert!(!page_html(&st).await.contains("bo_gone_folder"));
+    }
+
+    #[tokio::test]
+    async fn remove_dataset_keeps_the_other_datasets() {
+        let st = state();
+        let base = st.config_path.parent().unwrap();
+        let (a, b) = (base.join("bo_keep_a"), base.join("bo_keep_b"));
+        seed_datasets(
+            &st,
+            vec![
+                DatasetRef::Id("coco-cctv".into()),
+                folder_ref(&a),
+                DatasetRef::Dir {
+                    dir: b.clone(),
+                    gt: None,
+                    name: Some("porch".into()),
+                },
+            ],
+        );
+        let (s, v) = call(&st, remove_req(&folder_ref(&a).label())).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(!v["message"].as_str().unwrap().contains("tick one"), "{v}");
+        assert_eq!(saved_labels(&st), ["coco-cctv", "porch"]);
+        // A named folder is removed by its label.
+        let (s, v) = call(&st, remove_req("porch")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(saved_labels(&st), ["coco-cctv"]);
+    }
+
+    #[tokio::test]
+    async fn remove_dataset_refuses_built_in_and_unknown_values_without_writing() {
+        let st = state();
+        let dir = st.config_path.parent().unwrap().join("bo_refuse_folder");
+        seed_datasets(
+            &st,
+            vec![DatasetRef::Id("coco-cctv".into()), folder_ref(&dir)],
+        );
+        let revision = || st.config.changes(1).pop().map(|c| c.revision);
+        let (before, rev) = (saved_labels(&st), revision());
+        for value in [
+            "coco-cctv",
+            "sample",
+            "nope",
+            "dir:/not/a/saved/folder",
+            "bo_refuse_folder",
+        ] {
+            let (s, v) = call(&st, remove_req(value)).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{value}: {v}");
+            assert_eq!(v["success"], false, "{value}: {v}");
+            assert_eq!(saved_labels(&st), before, "{value}");
+            assert_eq!(revision(), rev, "{value} must not write the config");
+        }
+        // No `dataset` field at all.
+        let (s, v) = call(&st, post("/v1/benchmark/datasets/remove", "")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(saved_labels(&st), before);
+        assert_eq!(revision(), rev);
+    }
+
+    #[tokio::test]
+    async fn start_with_no_saved_dataset_and_no_field_is_refused() {
+        let st = state();
+        seed_datasets(&st, Vec::new());
+        let (s, v) = call(&st, post("/v1/benchmark", "model=ipcam-general")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("choose at least one dataset"),
+            "{v}"
+        );
+        assert!(!st.benchmark.is_running());
     }
 
     #[tokio::test]

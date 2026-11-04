@@ -3307,6 +3307,7 @@ whether heavy work runs inside `server::blocking` (B), on the async thread (A), 
 | POST | `/v1/benchmark/apply-threshold` | `apply_threshold` | admin | yes (config write + live apply) | **A** |
 | GET, POST | `/v1/benchmark/threshold-search` | `search_options` / `threshold_search` | admin | no | **A** (multi-MB JSON parse + search) |
 | POST | `/v1/benchmark/settings` | `settings` | admin | yes (config write) | **A** |
+| POST | `/v1/benchmark/datasets/remove` | `remove_dataset` | admin | yes (config write) | **A** |
 | GET | `/v1/benchmark/images` | `images_detail` | admin | no | **A** (results JSON parse) |
 | GET | `/v1/benchmark/image` | `image_file` | admin | no | **A** (results JSON parse per image) |
 | any | anything else | `pages::fallback` | open | no | - |

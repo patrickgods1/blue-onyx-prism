@@ -960,6 +960,7 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
+| POST | `/v1/benchmark/datasets/remove` | `dataset`: the saved folder dataset to drop from `benchmark.datasets` (e.g. `dir:/srv/alerts`; the list may end up empty); 404 for a built-in id or a folder that is not saved |
 | POST | `/v1/benchmark/report` | `dir`: write the HTML report of the saved results there as `benchmark-report-<UTC time>.html` (folder inside the browsable folders or natively picked); `{success, path}`, 404 without results |
 | POST | `/v1/benchmark/apply` | `model` + `device` (`""`/`global` clears it), or `all=1` for every saved recommendation; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable; a following `device` writes that device's profile instead, `threshold=none` removes it), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
