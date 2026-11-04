@@ -10,7 +10,11 @@
 //! to the config disabled (a local or catalog model, through the [`ConfigWriter`]) -> label with
 //! the service's own pipeline ([`super::relabel`]) -> map, triage and merge
 //! ([`triage::model_boxes`], [`triage::apply_relabel`]); every frame it looked at gets the
-//! `model:<name>@<device>` marker.
+//! `model:<name>@<device>` marker. A `missing_only` run differs in two places: stage 1 keeps the
+//! frames of [`triage::missing_scope`] the model did not train on ([`super::trained_frames`]) and
+//! stage 5 writes [`triage::apply_missing`] to the frames that gain a box, and nothing else: no
+//! marker (it is one slot, and every reviewed frame holds the labelers'; several models run in
+//! turn, and a rerun re-detects and relies on the pending boxes to add nothing twice).
 //!
 //! A cancel while labelling with [`AutolabelRequest::keep_on_cancel`] (the default) is not a
 //! failure: the frames finished so far (the script's flushed `proposals.jsonl`, the model's
@@ -112,6 +116,11 @@ impl std::fmt::Debug for AutolabelJob {
     }
 }
 
+/// The warning of a `missing_only` run's summary: the review queue gets the frames back, the
+/// export takes reviewed frames only.
+const REOPENED_WARNING: &str = "reopened frames leave exports until you save them again on the \
+                                Review page";
+
 /// A selected frame.
 #[derive(Debug, Clone)]
 struct Selected {
@@ -152,6 +161,16 @@ pub struct AutolabelReport {
     pub skipped_done: usize,
     /// Reviewed or skipped frames that went back to review.
     pub reopened: usize,
+    /// A `missing_only` run ([`AutolabelRequest::missing_only`]).
+    pub missing_only: bool,
+    /// `missing_only`: boxes proposed as objects without a label (`added` + `overwritten`).
+    pub candidates: usize,
+    /// `missing_only`: of those, boxes that took the place of an automatic reject.
+    pub overwritten: usize,
+    /// `missing_only`: detections on a box a reviewer rejected (also in `dropped`).
+    pub dropped_judged: usize,
+    /// `missing_only`: frames left out because the model trained on them.
+    pub skipped_trained: usize,
     /// Self-training: frames whose reviewed labels the model disagrees with.
     pub disagreements: usize,
     /// Boxes per class (the class list's spelling).
@@ -217,12 +236,19 @@ impl AutolabelJob {
     /// The frames to label, in queue order, and how many matching frames were left out because
     /// `skip_labeler` (Some in labelers mode without `again=1`) already looked at them for every
     /// class of this run ([`labels::AutoRun::covers`]; a run for a class it did not look for
-    /// labels the frame again).
-    fn select(&self, skip_labeler: Option<&str>) -> Result<(Vec<Selected>, usize)> {
+    /// labels the frame again). With `trained` (a `missing_only` run) only frames of
+    /// [`triage::missing_scope`] count, those of `trained` are left out too, and the last value
+    /// says how many: `limit` is then the number of frames looked at.
+    fn select(
+        &self,
+        skip_labeler: Option<&str>,
+        trained: Option<&BTreeSet<String>>,
+    ) -> Result<(Vec<Selected>, usize, usize)> {
         let f = &self.request.frames;
         let built = queue::build(&self.dataset_dir, &f.filters()?);
         let mut out = Vec::new();
         let mut skipped = 0;
+        let mut skipped_trained = 0;
         for item in built.items {
             if out.len() >= f.limit {
                 break;
@@ -245,6 +271,16 @@ impl AutolabelJob {
                 skipped += 1;
                 continue;
             }
+            if let Some(trained) = trained {
+                let scope = frame.labels().ok().flatten();
+                if !scope.as_ref().is_some_and(triage::missing_scope) {
+                    continue;
+                }
+                if trained.contains(&item.frame) {
+                    skipped_trained += 1;
+                    continue;
+                }
+            }
             out.push(Selected {
                 rel: item.frame,
                 jpg: frame.jpg,
@@ -253,7 +289,28 @@ impl AutolabelJob {
                 height: rec.height,
             });
         }
-        Ok((out, skipped))
+        Ok((out, skipped, skipped_trained))
+    }
+
+    /// The frames a `missing_only` run leaves out ([`super::trained_frames`]; stage 1 comes before
+    /// the stage that adds a local model to the config, so its entry is made up here).
+    fn trained(&self, plan: &ModelPlan, warnings: &mut Vec<String>) -> Result<BTreeSet<String>> {
+        let entry = match &plan.target {
+            Target::Config { .. } => models::entry_of(&self.config, plan).cloned(),
+            Target::Local { path, .. } => Some(ModelConfig {
+                name: Some(plan.name.clone()),
+                path: path.clone(),
+                ..ModelConfig::default()
+            }),
+            Target::Catalog { .. } => None,
+        };
+        match entry {
+            Some(m) => super::trained_frames(&self.config, &m, warnings),
+            None => {
+                warnings.push(super::no_training_record(&plan.name));
+                Ok(BTreeSet::new())
+            }
+        }
     }
 
     /// Update one frame's label file (the pre-fill when it has none) under the label write lock
@@ -321,9 +378,29 @@ impl AutolabelJob {
             Some(m) => m.labeler(),
             None => self.labeler(),
         };
-        let skip = (!r.frames.again()).then_some(labeler.as_str());
-        let (frames, skipped) = self.select(skip)?;
+        rep.missing_only = r.missing_only;
+        let trained = match &self.model {
+            Some(plan) if r.missing_only => Some(self.trained(plan, &mut rep.warnings)?),
+            _ => None,
+        };
+        for w in &rep.warnings {
+            tracing::warn!("{w}");
+        }
+        let training_notes = rep.warnings.clone();
+        let skip = (!r.frames.again() && !r.missing_only).then_some(labeler.as_str());
+        let (frames, skipped, skipped_trained) = self.select(skip, trained.as_ref())?;
         rep.skipped_done = skipped;
+        rep.skipped_trained = skipped_trained;
+        if frames.is_empty() && r.missing_only {
+            bail!(
+                "no frame to check for missing labels in {}: {skipped_trained} reviewed frame(s) \
+                 matching {} were left out because {labeler} trained on them, and frames not \
+                 reviewed or confirmed empty never count; review more frames, or use a model that \
+                 did not train on these",
+                self.dataset_dir.display(),
+                r.frames.describe()
+            );
+        }
         if frames.is_empty() && skipped > 0 {
             bail!(
                 "all {skipped} frame(s) matching {} were auto-labelled by {labeler} for these \
@@ -660,7 +737,45 @@ impl AutolabelJob {
         rep.seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
         let _ = crate::resources::manager::remove_any(&self.work);
         self.step(report, 5, 100, &format!("{} frames changed", changed.len()));
-        let summary = if stopped {
+        let summary = if r.missing_only {
+            let mut s = if stopped {
+                format!(
+                    "stopped by Cancel after {} of {} frames; ",
+                    frames_done,
+                    frames.len()
+                )
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "{} frames checked for missing labels by {} on {}: {} detections, {} candidate \
+                 boxes ({} replace automatic rejects), {} frames reopened; {} detections matched \
+                 existing boxes, {} of them boxes you rejected; {} frames left out because the \
+                 model trained on them",
+                rep.frames,
+                self.model.as_ref().map_or("?", |m| m.name.as_str()),
+                rep.device.as_deref().unwrap_or("?"),
+                rep.proposals,
+                rep.candidates,
+                rep.overwritten,
+                rep.reopened,
+                rep.dropped,
+                rep.dropped_judged,
+                rep.skipped_trained
+            ));
+            if rep.reopened > 0 {
+                s.push_str("; ");
+                s.push_str(REOPENED_WARNING);
+            }
+            if stopped {
+                s.push_str("; run it again to check the rest (it looks at every frame again)");
+            }
+            for w in &training_notes {
+                s.push_str("; ");
+                s.push_str(w);
+            }
+            s
+        } else if stopped {
             let n = crate::training::import::preview::thousands;
             format!(
                 "stopped by Cancel after {} of {} frames; those {} were saved for review ({} \
@@ -876,6 +991,27 @@ impl AutolabelJob {
                     _ => rep.review += 1,
                 }
             }
+            if r.missing_only {
+                // [`triage::apply_missing`] rechecks the scope under the write lock: the
+                // reviewer may have changed the frame while the model ran.
+                let res = self.write_frame(f, rep, changed, |file, rep| {
+                    let m = triage::apply_missing(file, out.boxes, &plan.name);
+                    rep.added += m.added;
+                    rep.overwritten += m.overwritten;
+                    rep.candidates += m.candidates();
+                    rep.dropped += m.covered + m.judged + m.full;
+                    rep.dropped_judged += m.judged;
+                    let gained = m.candidates() > 0;
+                    FrameWrite {
+                        write: gained,
+                        queue: gained,
+                    }
+                });
+                if let Err(e) = res {
+                    rep.warnings.push(format!("{}: {e:#}", f.rel));
+                }
+                continue;
+            }
             let marker = labels::AutoRun {
                 at: crate::collect::utc_rfc3339(std::time::SystemTime::now()),
                 labeler: labeler.to_string(),
@@ -1089,6 +1225,12 @@ impl Task for AutolabelJob {
             None => self.request.frames.describe(),
         };
         match (&self.model, &self.after) {
+            (Some(m), _) if self.request.missing_only => {
+                format!(
+                    "find missing labels with {} on {} ({frames})",
+                    m.name, m.device
+                )
+            }
             (Some(m), _) => format!("label with {} on {} ({frames})", m.name, m.device),
             (None, Some(_)) => match (&self.request.gpu, &self.accelerator) {
                 (Some(_), Some(a)) => {

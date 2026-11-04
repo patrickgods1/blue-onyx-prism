@@ -581,6 +581,11 @@ mod tests {
         let job_plan =
             dataset::plan(&sources, &job::request_options(&j.options, &j.request)).unwrap();
         assert_eq!(preview, job_plan);
+        // A repeat with another training seed: the same frames.
+        let mut seeded = req.clone();
+        seeded.train_seed = Some(2);
+        assert_eq!(options_for(&c, &seeded), options_for(&c, &req));
+        assert_eq!(preview_plan(&c, &seeded).unwrap(), preview);
         // training.datasets when the request names none.
         let mut cfg = c.clone();
         cfg.training.datasets = vec!["exports/a".into()];

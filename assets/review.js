@@ -5,8 +5,9 @@
 // params. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
 // The Auto-label card queues a job (POST /training/autolabel as JSON) and follows it on
 // GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto and
-// "Reject auto boxes below" POST /v1/review/reject-low and "Reject boxes of unwanted classes"
-// POST /v1/review/reject-other-class (all three: dry run, confirm, run).
+// "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
+// POST /v1/review/reject-other-class and "Reject stacked duplicates" POST /v1/review/reject-stacked
+// (all four: dry run, confirm, run).
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
 // a new folder reloads the page.
 // Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
@@ -185,7 +186,7 @@
     if (iv && typeof iv.gamma === 'number' && iv.gamma >= 0.4 && iv.gamma <= 2.5) imgView.gamma = iv.gamma;
   } catch (e) { /* the defaults */ }
   var viewCache = null;                // {img, key, canvas}: the adjusted frame
-  var dups = { groups: [], of: {} };   // stacked boxes (dupGroups), as of the last render
+  var dups = { groups: [], of: {}, overlaps: [], near: {} };   // dupGroups, as of the last render
 
   var COLORS = {
     pending: '#e8d000', review: '#ffa000', hint: '#f08c00', accepted: '#2e9e4f',
@@ -364,27 +365,46 @@
     return a === b || (VEHICLES.indexOf(a) >= 0 && VEHICLES.indexOf(b) >= 0);
   }
 
-  // Stacked boxes: the boxes (not rejected, not unwanted) of one object, IoU >= 0.7 and a label
-  // of the same object, grouped as NMS would. A group of 2 or more keeps one: a drawn box, else
-  // an accepted one, else the highest score. {groups: [{members, keeper}], of: {index: group}}.
-  function dupGroups() {
-    var bs = boxes(), n = bs.length, parent = [], i, j;
+  // How much of the smaller box lies inside the other (labels::inside_share).
+  function insideShare(a, b) {
+    var inter = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0])) * Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+    var small = Math.min(Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1]), Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]));
+    return small > 0 ? inter / small : 0;
+  }
+
+  var STACK_IOU = 0.7, OVERLAP_IOU = 0.5, NESTED_SHARE = 0.8;   // labels/stacks.rs
+
+  // Stacked boxes: the boxes (not rejected, not unwanted) of one object, IoU >= STACK_IOU and a
+  // label of the same object, grouped as NMS would. A group of 2 or more keeps one: a drawn box,
+  // else a reviewer-edited one, else an accepted one, else a pending one (a hint saving rejects
+  // last: as keeper it would leave the object with no box), then the highest score. `overlaps`:
+  // pairs of live boxes of one object outside a stack, IoU >= OVERLAP_IOU or the smaller
+  // >= NESTED_SHARE inside the larger; those are the reviewer's, no rule picks.
+  // {groups: [{members, keeper}], of: {index: group}, overlaps: [[i, j]], near: {index: partner}}.
+  // Twin of labels/stacks.rs (`stacks`, `rank`, `overlaps`): keep the two in step. One difference,
+  // on purpose: a live box of no listed class counts here (the page shows it, a save refuses it
+  // until it is relabelled), the server skips it. `list`: other boxes than the frame's own.
+  function dupGroups(list) {
+    var bs = list || boxes(), n = bs.length, parent = [], i, j;
     var live = function (b) { return b.state !== 'rejected' && !isUnwanted(b); };
     var root = function (x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
     for (i = 0; i < n; i++) parent.push(i);
     for (i = 0; i < n; i++) {
       if (!live(bs[i])) continue;
       for (j = i + 1; j < n; j++) {
-        if (live(bs[j]) && sameObject(bs[i].label, bs[j].label) && iou(bs[i].bbox, bs[j].bbox) >= 0.7) parent[root(j)] = root(i);
+        if (live(bs[j]) && sameObject(bs[i].label, bs[j].label) && iou(bs[i].bbox, bs[j].bbox) >= STACK_IOU) parent[root(j)] = root(i);
       }
     }
-    var byRoot = {}, out = { groups: [], of: {} };
+    var byRoot = {}, out = { groups: [], of: {}, overlaps: [], near: {} };
     for (i = 0; i < n; i++) {
       if (live(bs[i])) (byRoot[root(i)] = byRoot[root(i)] || []).push(i);
     }
     var rank = function (k) {
-      var b = bs[k];
-      return (b.state === 'added' ? 20 : (b.state === 'accepted' ? 10 : 0)) + (b.score != null ? b.score : 0);
+      var b = bs[k], tier;
+      if (b.state === 'added') tier = 40;
+      else if (b.state === 'accepted') tier = (b.orig_bbox || b.model_label) ? 30 : 20;
+      else tier = resolved(b) === 'rejected' ? 0 : 10;
+      return tier + (b.score != null ? b.score : 0);
     };
     Object.keys(byRoot).forEach(function (r) {
       var m = byRoot[r];
@@ -393,14 +413,30 @@
       out.groups.push(g);
       m.forEach(function (k) { out.of[k] = g; });
     });
+    var closest = {};
+    var note = function (a, b, v) {
+      if (closest[a] == null || v > closest[a]) { closest[a] = v; out.near[a] = b; }
+    };
+    for (i = 0; i < n; i++) {
+      if (!live(bs[i])) continue;
+      for (j = i + 1; j < n; j++) {
+        if (!live(bs[j]) || !sameObject(bs[i].label, bs[j].label) || (out.of[i] && out.of[i] === out.of[j])) continue;
+        var v = iou(bs[i].bbox, bs[j].bbox);
+        if (v >= OVERLAP_IOU || insideShare(bs[i].bbox, bs[j].bbox) >= NESTED_SHARE) {
+          out.overlaps.push([i, j]);
+          note(i, j, v);
+          note(j, i, v);
+        }
+      }
+    }
     return out;
   }
 
   // The box of `i`'s stack it is compared with: the keeper, or (for the keeper) the most
-  // overlapping other one.
+  // overlapping other one. Outside a stack, the box it overlaps most.
   function dupPartner(i) {
     var g = dups.of[i];
-    if (!g) return -1;
+    if (!g) return dups.near[i] != null ? dups.near[i] : -1;
     if (g.keeper !== i) return g.keeper;
     var bs = boxes(), best = -1, bi = -1;
     g.members.forEach(function (k) {
@@ -909,6 +945,7 @@
     li.appendChild(shortState(b));
     if (b.state !== 'pending' && !b._checked) li.appendChild(el('span', 'rv-chip warn', 'to check'));
     if (dups.of[i] && dups.of[i].keeper !== i) li.appendChild(el('span', 'rv-chip warn', 'dup'));
+    else if (dups.near[i] != null) li.appendChild(el('span', 'rv-chip warn', 'overlap'));
     if (b.difficult) li.appendChild(el('span', 'rv-chip warn', 'unsure'));
     var rp = b.state === 'pending' ? repeatOf(b) : null;
     if (rp) li.appendChild(repeatChip(rp));
@@ -933,6 +970,7 @@
     if (t && b.why && b.why.length) t.title = b.why.join('; ');
     if (t) chips.appendChild(t);
     if (dups.of[i] && dups.of[i].keeper !== i) chips.appendChild(el('span', 'rv-chip warn', 'dup'));
+    else if (dups.near[i] != null) chips.appendChild(el('span', 'rv-chip warn', 'overlap'));
     if (b.difficult) chips.appendChild(el('span', 'rv-chip warn', 'unsure'));
     if (b.state === 'rejected' && b.reject_reason) chips.appendChild(el('span', 'rv-chip bad', reasonText(b.reject_reason)));
     li.appendChild(chips);
@@ -1040,7 +1078,7 @@
         var mb = boxes()[mate];
         var dl = el('div', 'rv-q-dup');
         dl.appendChild(el('span', null, 'Overlaps box ' + (mate + 1) + ' (' + mb.label + (mb.score != null ? ' ' + fmtScore(mb.score) : '') + ')' +
-          (dups.of[i].keeper === i ? ', this one kept as the best' : '')));
+          (dups.of[i] ? (dups.of[i].keeper === i ? ', this one kept as the best' : '') : ', not near-identical: keep both if they are two objects')));
         dl.appendChild(decideButton('Reject as duplicate', 'u', 'bad', function () { rejectWith(i, 'duplicate'); }));
         decide.appendChild(dl);
       }
@@ -1058,6 +1096,8 @@
         }
         var everywhere = b.state === 'rejected' || (b.state === 'pending' && rp && rp.verdict === 'rejected') ? 'reject'
           : (b.state === 'accepted' || (b.state === 'pending' && rp && rp.verdict === 'accepted') ? 'accept' : null);
+        // A duplicate says nothing about the spot: another box stays on the object there.
+        if (b.state === 'rejected' && b.reject_reason === 'duplicate') everywhere = null;
         if (everywhere) {
           var eb = button((everywhere === 'reject' ? 'Reject' : 'Accept') + ' this spot on all ' + camOf(cur.frame) + ' frames…',
             function () { spotEverywhere(i, everywhere === 'accept'); }, 'secondary');
@@ -1111,7 +1151,16 @@
       stackBtn = decideButton('Reject ' + extra + ' stacked dup' + (extra === 1 ? '' : 's'), 'Shift+U', 'secondary', rejectDuplicates);
       stackBtn.title = 'Keep the best box of each of the ' + dups.groups.length + ' stack(s) of overlapping boxes, reject the others as duplicates';
     }
-    if (p.total || stackBtn || repeatBtn) {
+    // Overlapping boxes that are no stack: the reviewer's call, named so they can be found (the
+    // boxes carry the `overlap` chip, the decision bar names the partner, `u` works on them).
+    var lapping = (dups.overlaps || []).filter(function (o) { return boxes()[o[0]] && boxes()[o[1]]; });
+    var lapNote = null;
+    if (lapping.length) {
+      lapNote = el('span', 'muted', 'Overlap: ' + lapping.slice(0, 3).map(function (o) { return (o[0] + 1) + '+' + (o[1] + 1); }).join(', ') +
+        (lapping.length > 3 ? ' +' + (lapping.length - 3) + ' more' : ''));
+      lapNote.title = 'These boxes of one object overlap or sit inside each other. Select one: u rejects it as a duplicate, r rejects it as wrong. Saving with both kept stops flagging the frame.';
+    }
+    if (p.total || stackBtn || repeatBtn || lapNote) {
       var line = el('div', 'rv-progress');
       if (p.total) {
         var bar = el('progress');
@@ -1121,6 +1170,7 @@
       }
       var row = el('div', 'rv-progress-row');
       row.appendChild(el('span', 'muted', p.total ? p.done + '/' + p.total + ' done · ' + p.undecided + ' undecided' + (p.unchecked ? ' · ' + p.unchecked + ' to check' : '') : ''));
+      if (lapNote) row.appendChild(lapNote);
       if (stackBtn) row.appendChild(stackBtn);
       if (repeatBtn) row.appendChild(repeatBtn);
       line.appendChild(row);
@@ -1295,6 +1345,18 @@
     return out;
   }
 
+  // Of those, the pending ones: what saving or Shift+A would otherwise accept as new duplicates
+  // (a box the reviewer accepted stays; labels/stacks.rs `reject_pending_stacked`).
+  function pendingDupDrops(d) {
+    return dupDrops(d).filter(function (k) { return boxes()[k].state === 'pending'; });
+  }
+
+  // A duplicate rejected by rule rather than by hand: the provenance says so, an older one stays.
+  function markDuplicate(b) {
+    markRejected(b, 'duplicate');
+    if (!b.reason) b.reason = 'duplicate';
+  }
+
   // Shift+U: keep the best box of each stack, reject the others as duplicates (one undo step).
   function rejectDuplicates() {
     if (!cur) return;
@@ -1336,9 +1398,11 @@
     }).catch(function () { /* no hint: the review works without it */ });
   }
 
-  // A decision of the reviewer's own (the server's rule, repeats.rs `counts`).
+  // A decision of the reviewer's own (the server's rule, repeats.rs `counts`). A duplicate is no
+  // verdict on the spot: another box stays on the object there.
   function lookedAt(b) {
     return b.source !== 'human' && (b.state === 'accepted' || b.state === 'rejected') &&
+      b.reject_reason !== 'duplicate' &&
       ['low_score', 'other_class', 'repeat_spot'].indexOf(b.reason) < 0;
   }
 
@@ -1491,21 +1555,26 @@
     refresh();
   }
 
-  // `a`: accept the pending non-human boxes saving would accept anyway; hints stay pending.
+  // `a`: accept the pending non-human boxes saving would accept anyway; hints stay pending, and a
+  // box stacked on a better one is rejected as a duplicate instead (z undoes both).
   function acceptProposals() {
     if (!cur) return;
-    var todo = boxes().filter(function (b) {
-      return b.state === 'pending' && b.source !== 'human' && !isUnwanted(b) && resolved(b) === 'accepted';
+    var drop = pendingDupDrops(dupGroups());
+    var todo = boxes().filter(function (b, i) {
+      return drop.indexOf(i) < 0 && b.state === 'pending' && b.source !== 'human' && !isUnwanted(b) && resolved(b) === 'accepted';
     });
-    var hints = boxes().filter(function (b) { return isHint(b) && !isUnwanted(b); }).length;
-    if (!todo.length) {
+    var hints = boxes().filter(function (b, i) { return drop.indexOf(i) < 0 && isHint(b) && !isUnwanted(b); }).length;
+    if (!todo.length && !drop.length) {
       say(hints ? hints + ' hint box(es) stay pending (rejected on save unless you accept them); no other proposal.' : 'No pending proposal.');
       return;
     }
     snapshot();
     todo.forEach(function (b) { b.state = 'accepted'; });
+    drop.forEach(function (k) { markDuplicate(boxes()[k]); });
     cur.labels.empty_confirmed = false;
-    say('Accepted ' + todo.length + ' box(es)' + (hints ? '; ' + hints + ' hint box(es) stay pending (rejected on save unless you accept them).' : '.'));
+    say('Accepted ' + todo.length + ' box(es)' +
+      (drop.length ? '; rejected ' + drop.length + ' stacked duplicate(s) (z undoes)' : '') +
+      (hints ? '; ' + hints + ' hint box(es) stay pending (rejected on save unless you accept them).' : '.'));
     refresh();
   }
 
@@ -2024,6 +2093,10 @@
     }
     busy = true;
     var body = JSON.parse(JSON.stringify(cur.labels));   // keeps auto_run, bulk_accepted, ...
+    // A pending box stacked on a better one must not be accepted by the save (on the copy: a
+    // refused save loses nothing).
+    var dropped = status === 'reviewed' ? pendingDupDrops(dupGroups()) : [];
+    dropped.forEach(function (k) { markDuplicate(body.boxes[k]); });
     // Proposals of a "don't want" class are not shown: rejected rather than resolved by default.
     body.boxes.forEach(function (b) {
       delete b._checked;
@@ -2036,6 +2109,14 @@
     body.status = status;
     body.empty_confirmed = !!cur.labels.empty_confirmed;
     body.classes_version = cur.labels.classes_version || '';
+    // Stacks or overlaps still there after the save: the reviewer looked and kept them, so
+    // auto=overlaps and the bulk reject leave the frame alone (as saved: hints go to rejected).
+    if (status === 'reviewed') {
+      var left = dupGroups(body.boxes.map(function (b) { return Object.assign({}, b, { state: resolved(b) }); }));
+      if (left.groups.length || left.overlaps.length) body.overlaps_checked = true;
+      else delete body.overlaps_checked;
+    }
+    var note = dropped.length ? ' Rejected ' + dropped.length + ' pending stacked duplicate(s).' : '';
     var frame = cur.frame, w = cur.width, h = cur.height;
     var url = '/v1/review/labels?frame=' + encodeURIComponent(frame);
     if (cur.revision != null) url += '&revision=' + encodeURIComponent(cur.revision);
@@ -2044,11 +2125,11 @@
       if (status === 'reviewed') { noteSaved(body); noteHistory(frame, body, w, h); }
       // After Back: on to the frame Back left (the counts refresh), else the queue's next.
       if (fwdStack.length) {
-        say(j.message || 'Saved.');
+        say((j.message || 'Saved.') + note);
         loadNext(null, null, true);
         return loadFrame(fwdStack.pop(), 'forward');
       }
-      return loadNext(frame, j.message || 'Saved.');
+      return loadNext(frame, (j.message || 'Saved.') + note);
     }).catch(function (e) {
       if (e.conflict) showConflict(e.message);
       else say(e.message, true);
@@ -2094,7 +2175,8 @@
   function noteSaved(body) {
     var acc = 0, rej = 0;
     body.boxes.forEach(function (b) {
-      if (b.source === 'human') return;
+      // A duplicate is no verdict on an object: it would read as a false positive here.
+      if (b.source === 'human' || b.reject_reason === 'duplicate') return;
       var r = resolved(b);
       if (r === 'accepted') acc++; else if (r === 'rejected') rej++;
     });
@@ -2180,7 +2262,7 @@
     ['Decide', 'a', 'accept the selected box (keep a drawn one) and go to the next'],
     ['Decide', 'r', 'reject the selected box (delete a drawn one) and go to the next'],
     ['Decide', '1-9, 0', null],
-    ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps'],
+    ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps (stacked, nested or partly overlapping)'],
     ['Decide', 'Shift+U', 'stacked boxes: keep the best of each stack, reject the others as duplicates'],
     ['Decide', 'd', 'unsure: a real object you cannot name for sure (kept, left out of YOLO training, ignored by the benchmark set; ?! on the box); again: not unsure'],
     ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate)'],
@@ -2399,6 +2481,12 @@
       r.addEventListener('change', applyAlMode);
     });
     applyAlMode();
+    if (MP) {
+      var syncMissing = MP.util.missingToggle(alForm);
+      Array.prototype.forEach.call(alForm.querySelectorAll('input[name="mode"]'), function (r) {
+        r.addEventListener('change', syncMissing);
+      });
+    }
   }
 
   // The filters of the queue become the job's frame filter.
@@ -2734,6 +2822,50 @@
         box.className = 'review-report error-text';
         report(box, [e.message]);
       }).then(function () { otherBtn.disabled = false; });
+    });
+  }
+
+  // Stacked boxes span reviewed frames too; the Frames filter does not narrow it (a reviewed frame
+  // need not be in the review queue). Overlaps that are no stack stay a reviewer's: the server's
+  // message says how many and how to list them.
+  var stackedBtn = $('rv-reject-stacked');
+  if (stackedBtn) {
+    stackedBtn.addEventListener('click', function () {
+      var box = $('rv-reject-stacked-msg');
+      var body = {};
+      ['bucket', 'scene', 'camera', 'label'].forEach(function (k) {
+        var e = filtersForm.elements[k];
+        if (e && e.value) body[k] = e.value;
+      });
+      body.dry_run = true;
+      box.className = 'review-report';
+      report(box, ['Counting the boxes...']);
+      stackedBtn.disabled = true;
+      postJson('/v1/review/reject-stacked', body).then(function (j) {
+        var n = j.boxes || 0;
+        if (!n) {
+          report(box, [j.message || 'No stacked duplicates on the frames these filters select.']);
+          return null;
+        }
+        if (!window.confirm('Reject ' + n + ' stacked duplicate box(es) on ' + (j.eligible || 0) + ' frame(s), reviewed frames ' +
+          'included? The best box of each stack stays. Frames stay reviewed and the boxes are kept as rejected evidence ' +
+          '(reason duplicate, left out of the hard negatives); drawn boxes are never rejected.')) {
+          report(box, ['Nothing rejected.']);
+          return null;
+        }
+        body.dry_run = false;
+        return postJson('/v1/review/reject-stacked', body).then(function (r) {
+          var failed = r.failed || [];
+          report(box, [r.message || ('Rejected ' + (r.boxes || 0) + ' box(es).')],
+            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
+          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+          histories = {};   // the boxes rejected were decisions of these cameras
+          return reloadQueue();
+        });
+      }).catch(function (e) {
+        box.className = 'review-report error-text';
+        report(box, [e.message]);
+      }).then(function () { stackedBtn.disabled = false; });
     });
   }
 

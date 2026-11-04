@@ -265,6 +265,10 @@
         <select id="al-preset"><option value="first-pass">First pass</option><option value="self-training">Self-training check</option></select>
         <p class="muted small">First pass: unreviewed frames. Self-training check: all frames, flagging where the model disagrees with your reviewed labels. Sets the status below.</p>
       </div>
+      <div class="tr-field tr-wide">
+        <label class="check"><input type="checkbox" name="missing_only"> Find missing labels only</label>
+        <p class="muted small">Proposes real objects with no box on reviewed frames, for you to check, and nothing else: no class changes, no missed boxes. Frames the model trained on are left out; validation and held-out frames stay in. Status and the frame source are ignored, threshold 0.3 means 0.5, limit 200 means every frame. Run it once per model. A frame that gains a box goes back to review and <strong>leaves exports until you save it again</strong>.</p>
+      </div>
     </div>
     <fieldset>
       <legend>Which frames</legend>

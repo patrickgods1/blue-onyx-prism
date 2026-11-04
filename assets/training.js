@@ -233,6 +233,10 @@
         if (t && j.default_threshold && t.value === t.defaultValue) t.value = j.default_threshold;
       }
     }) : null;
+    if (MP) {
+      var syncMissing = MP.util.missingToggle(form);
+      form.querySelectorAll('input[name="mode"]').forEach(function (r) { r.addEventListener("change", syncMissing); });
+    }
     var preset = document.getElementById("al-preset");
     if (preset && form.elements.status) {
       preset.addEventListener("change", function () {

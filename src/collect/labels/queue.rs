@@ -2,10 +2,12 @@
 //! indexed frame), filtered by bucket, scene, camera, object class ([`frame_labels`]), review
 //! status and auto-label state ([`AutoFilter`]), and sorted by
 //! uncertainty ([`Uncertainty`]): the near-threshold margin first, then verifier disagreement,
-//! then the number of suppressed boxes, then newest. Also the counts the Review page shows.
+//! then the number of suppressed boxes, then newest. Also the counts the Review page shows, and
+//! [`labelled`], every label file those filters select whichever queue it is in.
 
 use super::super::layout::{self, REVIEW_QUEUE_FILE};
 use super::super::record::{Bucket, Record};
+use super::bulk::Wanted;
 use super::{BoxState, Frame, LabelFile, Status, Triage};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,6 +57,11 @@ pub enum AutoFilter {
     Never,
     /// Repeat-only: spot edits settled every box ([`super::repeats::repeats_only`]).
     Repeats,
+    /// Stacked or overlapping boxes no reviewer has looked at ([`super::stacks::needs_look`]), any
+    /// review status. With a class list ([`Filters::wanted`]) rejected and unwanted boxes do not
+    /// count; [`AutoFilter::matches`] has none, so there every label counts. A frame without a
+    /// label file is not listed: it is pre-filled, and a save rejects its pending duplicates.
+    Overlaps,
 }
 
 impl AutoFilter {
@@ -65,6 +72,7 @@ impl AutoFilter {
             "nothing" => Some(AutoFilter::Nothing),
             "none" => Some(AutoFilter::Never),
             "repeats" => Some(AutoFilter::Repeats),
+            "overlaps" => Some(AutoFilter::Overlaps),
             _ => None,
         }
     }
@@ -79,6 +87,7 @@ impl AutoFilter {
             AutoFilter::Nothing => ran && !evidence,
             AutoFilter::Never => !ran && !evidence,
             AutoFilter::Repeats => labels.is_some_and(super::repeats::repeats_only),
+            AutoFilter::Overlaps => labels.is_some_and(|l| super::stacks::needs_look(l, None)),
         }
     }
 }
@@ -102,13 +111,16 @@ pub struct Filters {
     pub source: QueueSource,
     /// Only frames in this auto-label state.
     pub auto: Option<AutoFilter>,
+    /// `collect.classes` and `collect.hidden_classes`, for [`AutoFilter::Overlaps`] (not from the
+    /// query: the caller's config). None = every label is wanted.
+    pub wanted: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl Filters {
     /// From query parameters (`bucket`, `scene`, `camera`, `label` = a comma list, any of
     /// them, empty items ignored, `status` = `unreviewed|reviewed|
-    /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none`); empty values
-    /// mean "any". Errors name the field.
+    /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none|repeats|
+    /// overlaps`); empty values mean "any". Errors name the field.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let bucket = match get("bucket") {
@@ -157,7 +169,7 @@ impl Filters {
         let auto = match get("auto") {
             None => None,
             Some(a) => Some(AutoFilter::parse(a).ok_or_else(|| {
-                format!("auto: '{a}' is not review, accept, nothing, none or repeats")
+                format!("auto: '{a}' is not review, accept, nothing, none, repeats or overlaps")
             })?),
         };
         Ok(Self {
@@ -168,8 +180,33 @@ impl Filters {
             status,
             source,
             auto,
+            wanted: None,
         })
     }
+
+    /// Whether a frame with `labels` passes the auto filter.
+    fn auto_keeps(&self, labels: Option<&LabelFile>) -> bool {
+        match self.auto {
+            None => true,
+            Some(AutoFilter::Overlaps) => {
+                let wanted = self
+                    .wanted
+                    .as_ref()
+                    .map(|(classes, hidden)| Wanted { classes, hidden });
+                labels.is_some_and(|l| super::stacks::needs_look(l, wanted.as_ref()))
+            }
+            Some(a) => a.matches(labels),
+        }
+    }
+}
+
+/// The labels of the boxes of `l` that are not rejected.
+fn file_labels(l: &LabelFile) -> BTreeSet<String> {
+    l.boxes
+        .iter()
+        .filter(|b| b.state != super::BoxState::Rejected)
+        .map(|b| b.label.clone())
+        .collect()
 }
 
 /// The object classes of a frame: with a label file, the labels of its boxes that are not
@@ -177,12 +214,7 @@ impl Filters {
 /// `predictions`.
 pub fn frame_labels(rec: &Record, labels: Option<&LabelFile>) -> BTreeSet<String> {
     match labels {
-        Some(l) => l
-            .boxes
-            .iter()
-            .filter(|b| b.state != super::BoxState::Rejected)
-            .map(|b| b.label.clone())
-            .collect(),
+        Some(l) => file_labels(l),
         None => rec.predictions.iter().map(|d| d.label.clone()).collect(),
     }
 }
@@ -338,7 +370,7 @@ pub struct Counts {
     pub empty_confirmed: u64,
     /// Accepted and added boxes of reviewed frames, per label.
     pub per_class: BTreeMap<String, u64>,
-    /// Rejected model boxes of reviewed frames (hard-negative evidence).
+    /// Rejected model boxes of reviewed frames (hard-negative evidence; duplicates are not).
     pub rejected_boxes: u64,
     /// Frames with a pending box triaged `review` ([`AutoFilter::Review`]).
     pub auto_review: u64,
@@ -364,7 +396,7 @@ impl Counts {
             for b in l.training() {
                 *self.per_class.entry(b.label.clone()).or_default() += 1;
             }
-            self.rejected_boxes += l.rejected().count() as u64;
+            self.rejected_boxes += l.hard_negatives().count() as u64;
         }
     }
 }
@@ -457,7 +489,7 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
         {
             continue;
         }
-        if f.auto.is_some_and(|a| !a.matches(labels.as_ref())) {
+        if !f.auto_keeps(labels.as_ref()) {
             continue;
         }
         q.items.push(Item {
@@ -476,6 +508,45 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
     q.cameras = cameras.into_iter().collect();
     q.labels = seen_labels.into_iter().collect();
     q
+}
+
+/// The label files of `dir` ([`super::label_files`], in its order) that the bucket, scene, camera
+/// and class filters of `f` and `keep` select, read one at a time. For edits of already labelled
+/// frames, reviewed ones too: [`build`] only reaches what `f.source` draws from (by default
+/// `review-queue.jsonl`, which a frame reviewed under "all collected" is not in), so `source` is
+/// not used here, nor are `status` and `auto`. A frame whose image, sidecar or label file does not
+/// read is left out.
+pub fn labelled<'a>(
+    dir: &'a Path,
+    f: &'a Filters,
+    keep: &'a dyn Fn(&str) -> bool,
+) -> impl Iterator<Item = (String, LabelFile)> + 'a {
+    super::label_files(dir)
+        .into_iter()
+        .filter_map(move |(rel, path)| {
+            let r = layout::parse_rel(&rel)?;
+            if !keep(&rel)
+                || f.scene.as_ref().is_some_and(|s| *s != r.scene)
+                || f.camera.as_ref().is_some_and(|c| *c != r.camera)
+            {
+                return None;
+            }
+            let frame = Frame::resolve(dir, &rel)?;
+            // The buckets a review line or an index line carries: the sidecar's.
+            if let Some(b) = f.bucket
+                && !frame.record().ok()?.buckets.contains(&b)
+            {
+                return None;
+            }
+            let l = super::read(&path).ok().flatten()?;
+            if !f.label.is_empty() {
+                let classes = file_labels(&l);
+                if !f.label.iter().any(|c| classes.contains(c)) {
+                    return None;
+                }
+            }
+            Some((rel, l))
+        })
 }
 
 /// The item after `after` in `items` with its index: the first one when `after` is None or
@@ -670,6 +741,10 @@ mod tests {
             Some(AutoFilter::Accept)
         );
         assert_eq!(q(&[("auto", "")]).unwrap().auto, None);
+        assert_eq!(
+            q(&[("auto", "overlaps")]).unwrap().auto,
+            Some(AutoFilter::Overlaps)
+        );
         assert!(q(&[("auto", "maybe")]).unwrap_err().contains("auto"));
         assert_eq!(q(&[("bucket", "")]).unwrap().bucket, None);
         let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
@@ -804,6 +879,134 @@ mod tests {
         );
         assert_eq!(build(&dir, &filters(Some("cat,dog"))).counts.total, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_overlaps_filter_lists_reviewed_frames_until_a_reviewer_checked_them() {
+        use super::super::bulk::test_support::put_frame;
+        use super::super::{LabelBox, tests_support::auto_box, write};
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let at = |label: &str, bbox: [f32; 4]| LabelBox {
+            bbox,
+            state: BoxState::Accepted,
+            ..auto_box(label)
+        };
+        let reviewed = |rel: &str, checked: bool| {
+            let frame = Frame::resolve(&dir, rel).unwrap();
+            let mut l = frame.labels().unwrap().unwrap();
+            l.status = Status::Reviewed;
+            l.overlaps_checked = checked;
+            write(&frame.labels, &l).unwrap();
+        };
+        let (a, near, small) = (
+            [0.0, 0.0, 40.0, 40.0],
+            [0.0, 0.0, 40.0, 38.0],
+            [5.0, 5.0, 25.0, 25.0],
+        );
+        let stacked = put_frame(&dir, "s", None, vec![at("car", a), at("car", near)]);
+        let nested = put_frame(&dir, "n", None, vec![at("car", a), at("truck", small)]);
+        let kept = put_frame(&dir, "k", None, vec![at("car", a), at("car", small)]);
+        let plain = put_frame(&dir, "p", None, vec![at("car", a)]);
+        let hidden = put_frame(&dir, "h", None, vec![at("dog", a), at("dog", near)]);
+        let open = put_frame(&dir, "o", None, vec![at("car", a), at("car", near)]);
+        for rel in [&stacked, &nested, &plain, &hidden] {
+            reviewed(rel, false);
+        }
+        reviewed(&kept, true);
+        let frames = |f: &Filters| {
+            let mut v: Vec<String> = build(&dir, f).items.into_iter().map(|i| i.frame).collect();
+            v.sort();
+            v
+        };
+        let mut f = Filters {
+            status: StatusFilter::Is(Status::Reviewed),
+            auto: Some(AutoFilter::Overlaps),
+            ..Filters::default()
+        };
+        let mut want = vec![hidden.clone(), nested.clone(), stacked.clone()];
+        want.sort();
+        assert_eq!(frames(&f), want, "no class list: every label counts");
+        // With the class list, a frame only an unwanted class overlaps on is not listed.
+        f.wanted = Some((
+            ["car", "truck", "dog"].map(String::from).to_vec(),
+            vec!["dog".to_string()],
+        ));
+        want.retain(|r| *r != hidden);
+        assert_eq!(frames(&f), want);
+        f.status = StatusFilter::Is(Status::Unreviewed);
+        assert_eq!(frames(&f), [open.as_str()], "any review status");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn labelled_reaches_frames_outside_the_queue_and_honours_the_filters() {
+        use super::super::bulk::test_support::{put_frame, put_frame_at};
+        use super::super::tests_support::auto_box;
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let a = put_frame(&dir, "a", None, vec![auto_box("car")]);
+        let b = put_frame_at(&dir, "drive", "b", (64, 48), None, vec![auto_box("dog")]);
+        // Out of the review queue, reviewed: only the walk over the label files finds it.
+        std::fs::remove_file(dir.join(REVIEW_QUEUE_FILE)).unwrap();
+        let frame = Frame::resolve(&dir, &a).unwrap();
+        let mut l = frame.labels().unwrap().unwrap();
+        l.status = Status::Reviewed;
+        super::super::write(&frame.labels, &l).unwrap();
+        let rec = frame.sidecar.clone();
+        let mut r = frame.record().unwrap();
+        r.buckets = vec![Bucket::Positive];
+        std::fs::write(&rec, serde_json::to_vec(&r).unwrap()).unwrap();
+        assert!(build(&dir, &Filters::default()).items.is_empty());
+        let all = |_: &str| true;
+        let names = |f: &Filters, keep: &dyn Fn(&str) -> bool| {
+            labelled(&dir, f, keep)
+                .map(|(rel, _)| rel)
+                .collect::<Vec<_>>()
+        };
+        let mut both = vec![a.clone(), b.clone()];
+        both.sort();
+        let mut got = names(&Filters::default(), &all);
+        got.sort();
+        assert_eq!(got, both, "a default filter reaches every label file");
+        let camera = Filters {
+            camera: Some("drive".into()),
+            ..Filters::default()
+        };
+        assert_eq!(names(&camera, &all), [b.as_str()]);
+        let scene = Filters {
+            scene: Some("day".into()),
+            ..Filters::default()
+        };
+        assert!(names(&scene, &all).is_empty());
+        let bucket = Filters {
+            bucket: Some(Bucket::Positive),
+            ..Filters::default()
+        };
+        assert_eq!(names(&bucket, &all), [a.as_str()]);
+        let label = Filters {
+            label: ["dog".to_string()].into(),
+            ..Filters::default()
+        };
+        assert_eq!(names(&label, &all), [b.as_str()]);
+        let only_a = |r: &str| r == a;
+        assert_eq!(names(&Filters::default(), &only_a), [a.as_str()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejected_duplicates_are_not_counted_as_hard_negatives() {
+        use super::super::{RejectReason, tests_support::auto_box};
+        let mut dup = auto_box("car");
+        dup.state = BoxState::Rejected;
+        dup.reject_reason = Some(RejectReason::Duplicate);
+        let mut wrong = dup.clone();
+        wrong.reject_reason = None;
+        let mut c = Counts::default();
+        c.add(Some(&LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![dup, wrong],
+            ..LabelFile::default()
+        }));
+        assert_eq!(c.rejected_boxes, 1);
     }
 
     #[test]

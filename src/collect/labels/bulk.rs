@@ -10,13 +10,15 @@
 //! [`Scope::Reviewed`], rejects the training boxes of unwanted classes on reviewed frames
 //! (`POST /v1/review/reject-unwanted-reviewed`; [`reviewed_with_unwanted`] counts them),
 //! [`bulk_spot`] rejects or accepts the boxes at one spot of one camera on its unreviewed frames
-//! ("this spot everywhere", [`super::repeats`]) and [`bulk_accept_repeats`] saves the frames such
-//! edits settled (`POST /v1/review/reject-spot`, `accept-spot`, `accept-repeats`). Each
+//! ("this spot everywhere", [`super::repeats`]), [`bulk_accept_repeats`] saves the frames such
+//! edits settled (`POST /v1/review/reject-spot`, `accept-spot`, `accept-repeats`) and
+//! [`bulk_reject_stacked`] rejects the duplicates of stacked boxes on reviewed and unreviewed
+//! frames (`reason: duplicate`, [`super::stacks`]; `POST /v1/review/reject-stacked`). Each
 //! frame is re-checked under the label write lock ([`super::update`]); counts are exact, frame
 //! lists capped at [`LISTED`].
 
 use super::queue::{self, AutoFilter, Filters, StatusFilter};
-use super::{BoxState, Frame, LabelFile, Source, Status};
+use super::{BoxState, Frame, LabelFile, Source, Status, stacks};
 use serde::Serialize;
 use std::path::Path;
 
@@ -351,6 +353,57 @@ pub fn reviewed_with_unwanted(dir: &Path, wanted: &Wanted<'_>) -> ReviewedUnwant
     out
 }
 
+/// What [`bulk_reject_stacked`] did.
+#[derive(Debug, Default, Clone)]
+pub struct StackedOutcome {
+    pub outcome: BulkOutcome,
+    /// Frames (reviewed or unreviewed, of the same filters) that still need a reviewer once the
+    /// duplicates are gone ([`stacks::needs_look_after`], the test of `auto=overlaps`); frames past
+    /// the limit are counted as if done, so a dry run and the run answer the same.
+    pub overlaps_left: usize,
+    /// Of [`Self::overlaps_left`], the reviewed frames: the ones an export would train on.
+    pub overlaps_left_reviewed: usize,
+}
+
+/// Reject the duplicates of stacked boxes ([`stacks::reject_stacked`]) on the reviewed and
+/// unreviewed frames of `dir`, at most `limit` frames. Walks the label files ([`queue::labelled`]):
+/// `filters` narrows by bucket, scene, camera and class, its `source`, `status` and `auto` are not
+/// used (a reviewed frame need not be in the review queue). A frame without a label file is
+/// passed over. The frame's status, `reviewed_at` and other boxes are unchanged. `dry_run` only
+/// counts.
+pub fn bulk_reject_stacked(
+    dir: &Path,
+    filters: &Filters,
+    wanted: &Wanted<'_>,
+    limit: usize,
+    dry_run: bool,
+    keep: &dyn Fn(&str) -> bool,
+) -> StackedOutcome {
+    let mut eligible = Vec::new();
+    let (mut overlaps_left, mut overlaps_left_reviewed) = (0, 0);
+    for (rel, l) in queue::labelled(dir, filters, keep) {
+        if l.status == Status::Skipped {
+            continue;
+        }
+        if stacks::needs_look_after(&l, wanted) {
+            overlaps_left += 1;
+            overlaps_left_reviewed += usize::from(l.status == Status::Reviewed);
+        }
+        let n = stacks::count_stacked(&l, wanted);
+        if n > 0 {
+            eligible.push((rel, n, 0));
+        }
+    }
+    let outcome = edit_listed(dir, eligible, limit, dry_run, &|_| None, &|l| {
+        (stacks::reject_stacked(l, wanted), 0)
+    });
+    StackedOutcome {
+        outcome,
+        overlaps_left,
+        overlaps_left_reviewed,
+    }
+}
+
 /// The shared run of the box edits of unreviewed frames: `count` and `edit` return (boxes
 /// rejected, boxes renamed); only frames `count` finds something on are eligible, and each
 /// is edited again under the write lock ([`super::update`]).
@@ -431,8 +484,10 @@ fn edit_listed(
 }
 
 /// Accept one frame the queue listed as eligible: re-checked under the write lock (it may have
-/// changed since), saved as reviewed ([`super::normalize`]) with `bulk_accepted`. `Ok(None)`
-/// when it is not eligible any more, else the boxes it accepted.
+/// changed since), saved as reviewed ([`super::normalize`]) with `bulk_accepted`; a pending box
+/// stacked on a better one is rejected as a duplicate rather than accepted
+/// ([`stacks::reject_pending_stacked`]). `Ok(None)` when it is not eligible any more, else the
+/// boxes it accepted.
 fn accept_frame(
     dir: &Path,
     rel: &str,
@@ -446,6 +501,11 @@ fn accept_frame(
         let Some(mut f) = cur.filter(super::auto_accept_eligible) else {
             return Ok(None);
         };
+        let wanted = Wanted {
+            classes,
+            hidden: &[],
+        };
+        stacks::reject_pending_stacked(&mut f, &wanted);
         boxes = f
             .boxes
             .iter()
@@ -1171,6 +1231,284 @@ mod tests {
         )
         .unwrap();
         assert_eq!(n.training().count(), 1, "the save no longer fails");
+    }
+
+    /// A box of the "reviewed frame" shape at `bbox`.
+    fn car_at(bbox: [f32; 4], score: f32) -> super::super::LabelBox {
+        let mut b = auto_box("car", score, Triage::Accept);
+        b.bbox = bbox;
+        b.state = BoxState::Accepted;
+        b
+    }
+
+    /// Make `rel` a reviewed frame as of `at`.
+    fn mark_reviewed(dir: &Path, rel: &str, at: &str) {
+        let frame = Frame::resolve(dir, rel).unwrap();
+        let mut l = labels_of(dir, rel);
+        l.status = Status::Reviewed;
+        l.reviewed_at = Some(at.into());
+        super::super::write(&frame.labels, &l).unwrap();
+    }
+
+    #[test]
+    fn overlaps_left_reviewed_leaves_out_unreviewed_frames() {
+        let dir = std::env::temp_dir().join(format!("bop-stacked-{}", uuid::Uuid::new_v4()));
+        let (a, small) = ([0.0, 0.0, 40.0, 40.0], [5.0, 5.0, 25.0, 25.0]);
+        let reviewed = put_frame(&dir, "r", None, vec![car_at(a, 0.9), car_at(small, 0.3)]);
+        put_frame(&dir, "u", None, vec![car_at(a, 0.9), car_at(small, 0.3)]);
+        mark_reviewed(&dir, &reviewed, "2026-10-01T00:00:00Z");
+        let cl = classes();
+        let w = wanted(&cl, &[]);
+        let o = bulk_reject_stacked(&dir, &Filters::default(), &w, 100, true, &|_| true);
+        assert_eq!((o.overlaps_left, o.overlaps_left_reviewed), (2, 1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stacked_duplicates_go_on_reviewed_frames_which_stay_reviewed() {
+        use super::super::RejectReason;
+        use super::super::stacks::DUPLICATE_REASON;
+        let dir = std::env::temp_dir().join(format!("bop-stacked-{}", uuid::Uuid::new_v4()));
+        let (a, near, small) = (
+            [0.0, 0.0, 40.0, 40.0],
+            [0.0, 0.0, 40.0, 38.0],
+            [5.0, 5.0, 25.0, 25.0],
+        );
+        // Reviewed, stacked; reviewed on another camera; unreviewed, pending; nested only.
+        let r = put_frame(&dir, "r", None, vec![car_at(a, 0.9), car_at(near, 0.4)]);
+        let other = put_frame_at(
+            &dir,
+            "drive",
+            "o",
+            (64, 48),
+            None,
+            vec![car_at(a, 0.9), car_at(near, 0.4), car_at(small, 0.3)],
+        );
+        let mut p = car_at(near, 0.4);
+        p.state = BoxState::Pending;
+        let u = put_frame(&dir, "u", None, vec![car_at(a, 0.9), p]);
+        let n = put_frame(&dir, "n", None, vec![car_at(a, 0.9), car_at(small, 0.3)]);
+        for rel in [&r, &other, &n] {
+            mark_reviewed(&dir, rel, "2026-10-01T00:00:00Z");
+        }
+        // Past the default filters: out of the review queue altogether.
+        std::fs::remove_file(dir.join(crate::collect::layout::REVIEW_QUEUE_FILE)).unwrap();
+        let cl = classes();
+        let w = wanted(&cl, &[]);
+        let all = Filters::default();
+        let everything = |_: &str| true;
+        let before: Vec<LabelFile> = [&r, &other, &u, &n]
+            .iter()
+            .map(|f| labels_of(&dir, f))
+            .collect();
+        let dry = bulk_reject_stacked(&dir, &all, &w, 100, true, &everything);
+        assert_eq!(
+            (
+                dry.outcome.eligible,
+                dry.outcome.boxes,
+                dry.outcome.done_count
+            ),
+            (3, 3, 0)
+        );
+        assert_eq!(
+            dry.overlaps_left, 2,
+            "the frame with a nested box left and the nested frame, after the removal"
+        );
+        assert_eq!(dry.overlaps_left_reviewed, 2, "both of those are reviewed");
+        let after: Vec<LabelFile> = [&r, &other, &u, &n]
+            .iter()
+            .map(|f| labels_of(&dir, f))
+            .collect();
+        assert_eq!(before, after, "a dry run writes nothing");
+        // One camera first.
+        let drive = Filters {
+            camera: Some("drive".into()),
+            ..Filters::default()
+        };
+        let o = bulk_reject_stacked(&dir, &drive, &w, 100, false, &everything);
+        assert_eq!((o.outcome.boxes, o.outcome.done_count), (1, 1));
+        assert_eq!(o.overlaps_left, 1);
+        assert_eq!(
+            labels_of(&dir, &r),
+            before[0],
+            "another camera is untouched"
+        );
+        assert_eq!(
+            labels_of(&dir, &u),
+            before[2],
+            "another camera is untouched"
+        );
+        // The rest.
+        let o = bulk_reject_stacked(&dir, &all, &w, 100, false, &everything);
+        assert_eq!(
+            (o.outcome.eligible, o.outcome.boxes, o.outcome.done_count),
+            (2, 2, 2)
+        );
+        assert_eq!(o.overlaps_left, 2, "the same answer as the dry run");
+        assert_eq!(o.overlaps_left_reviewed, dry.overlaps_left_reviewed);
+        let lr = labels_of(&dir, &r);
+        assert_eq!(lr.status, Status::Reviewed);
+        assert_eq!(
+            lr.reviewed_at.as_deref(),
+            Some("2026-10-01T00:00:00Z"),
+            "no re-save"
+        );
+        assert_eq!(lr.boxes[0], before[0].boxes[0], "the keeper is untouched");
+        let dropped = &lr.boxes[1];
+        assert_eq!(
+            (
+                dropped.state,
+                dropped.reject_reason.clone(),
+                dropped.reason.as_deref()
+            ),
+            (
+                BoxState::Rejected,
+                Some(RejectReason::Duplicate),
+                Some(DUPLICATE_REASON)
+            )
+        );
+        let lu = labels_of(&dir, &u);
+        assert_eq!(lu.status, Status::Unreviewed);
+        assert_eq!(lu.boxes[1].state, BoxState::Rejected);
+        assert_eq!(
+            labels_of(&dir, &n),
+            before[3],
+            "nested boxes are a reviewer's"
+        );
+        // A second run finds nothing and writes nothing.
+        let settled: Vec<LabelFile> = [&r, &other, &u, &n]
+            .iter()
+            .map(|f| labels_of(&dir, f))
+            .collect();
+        let again = bulk_reject_stacked(&dir, &all, &w, 100, false, &everything);
+        assert_eq!(
+            (
+                again.outcome.eligible,
+                again.outcome.boxes,
+                again.outcome.done_count
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(again.overlaps_left, 2);
+        let now: Vec<LabelFile> = [&r, &other, &u, &n]
+            .iter()
+            .map(|f| labels_of(&dir, f))
+            .collect();
+        assert_eq!(now, settled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_limit_and_a_reviewers_check_hold_the_stacked_reject_back() {
+        let dir = std::env::temp_dir().join(format!("bop-stacked-{}", uuid::Uuid::new_v4()));
+        let (a, near) = ([0.0, 0.0, 40.0, 40.0], [0.0, 0.0, 40.0, 38.0]);
+        let first = put_frame(&dir, "a", None, vec![car_at(a, 0.9), car_at(near, 0.4)]);
+        let second = put_frame(&dir, "b", None, vec![car_at(a, 0.9), car_at(near, 0.4)]);
+        let kept = put_frame(&dir, "c", None, vec![car_at(a, 0.9), car_at(near, 0.4)]);
+        let skipped = put_frame(&dir, "d", None, vec![car_at(a, 0.9), car_at(near, 0.4)]);
+        let frame = Frame::resolve(&dir, &kept).unwrap();
+        let mut l = labels_of(&dir, &kept);
+        l.status = Status::Reviewed;
+        l.overlaps_checked = true;
+        super::super::write(&frame.labels, &l).unwrap();
+        let frame = Frame::resolve(&dir, &skipped).unwrap();
+        let mut l = labels_of(&dir, &skipped);
+        l.status = Status::Skipped;
+        super::super::write(&frame.labels, &l).unwrap();
+        let cl = classes();
+        let w = wanted(&cl, &[]);
+        let all = Filters::default();
+        let o = bulk_reject_stacked(&dir, &all, &w, 1, false, &|_| true);
+        assert_eq!(
+            (o.outcome.eligible, o.outcome.done_count, o.overlaps_left),
+            (2, 1, 0),
+            "a checked frame and a skipped one are neither eligible nor left to look at"
+        );
+        assert_eq!(labels_of(&dir, &first).boxes[1].state, BoxState::Rejected);
+        assert_eq!(labels_of(&dir, &second).boxes[1].state, BoxState::Accepted);
+        assert_eq!(labels_of(&dir, &kept).boxes[1].state, BoxState::Accepted);
+        assert_eq!(labels_of(&dir, &skipped).boxes[1].state, BoxState::Accepted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stacked_reject_invalidates_the_cameras_history() {
+        use super::super::repeats::history;
+        let dir = std::env::temp_dir().join(format!("bop-stacked-{}", uuid::Uuid::new_v4()));
+        let (a, near) = ([0.0, 0.0, 40.0, 40.0], [0.0, 0.0, 40.0, 38.0]);
+        put_frame(&dir, "a", None, vec![car_at(a, 0.9), car_at(near, 0.4)]);
+        assert_eq!(history(&dir, "cam").decisions.len(), 2);
+        let cl = classes();
+        let o = bulk_reject_stacked(
+            &dir,
+            &Filters::default(),
+            &wanted(&cl, &[]),
+            10,
+            false,
+            &|_| true,
+        );
+        assert_eq!(o.outcome.done_count, 1);
+        // Seen at once, and the duplicate is no decision on the spot.
+        assert_eq!(history(&dir, "cam").decisions.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bulk_accept_rejects_pending_duplicates_and_keeps_explicit_accepts() {
+        use super::super::RejectReason;
+        let dir = std::env::temp_dir().join(format!("bop-stacked-{}", uuid::Uuid::new_v4()));
+        let (a, near) = ([0.0, 0.0, 40.0, 40.0], [0.0, 0.0, 40.0, 38.0]);
+        let pending = |bbox: [f32; 4], score: f32| {
+            let mut b = auto_box("car", score, Triage::Accept);
+            b.bbox = bbox;
+            b
+        };
+        // Two proposals on one car, a far person; then an accepted box with a proposal on it.
+        let mut person = auto_box("person", 0.9, Triage::Accept);
+        person.bbox = [45.0, 2.0, 60.0, 40.0];
+        let two = put_frame(
+            &dir,
+            "two",
+            None,
+            vec![pending(a, 0.6), pending(near, 0.8), person],
+        );
+        let mut explicit = pending(a, 0.5);
+        explicit.state = BoxState::Accepted;
+        let mut extra = pending(near, 0.9);
+        extra.state = BoxState::Accepted;
+        let decided = put_frame(
+            &dir,
+            "dec",
+            None,
+            vec![explicit.clone(), extra, pending(near, 0.95)],
+        );
+        let cl = vec!["person".to_string(), "car".to_string()];
+        let filters = Filters {
+            source: queue::QueueSource::All,
+            ..Filters::default()
+        };
+        let o = bulk_accept(&dir, &filters, &cl, 10, "t", false, &|_| true);
+        assert_eq!((o.done_count, o.failed_count), (2, 0), "{:?}", o.failed);
+        assert_eq!(
+            o.boxes, 2,
+            "the car's best box and the person; no duplicate"
+        );
+        let f = labels_of(&dir, &two);
+        assert_eq!(f.status, Status::Reviewed);
+        assert!(f.bulk_accepted);
+        let got: Vec<BoxState> = f.boxes.iter().map(|b| b.state).collect();
+        assert_eq!(
+            got,
+            [BoxState::Rejected, BoxState::Accepted, BoxState::Accepted]
+        );
+        assert_eq!(f.boxes[0].reject_reason, Some(RejectReason::Duplicate));
+        // Two explicit accepts stay: only a pending box is the rule's to reject.
+        let f = labels_of(&dir, &decided);
+        assert_eq!(
+            f.boxes.iter().map(|b| b.state).collect::<Vec<_>>(),
+            [BoxState::Accepted, BoxState::Accepted, BoxState::Rejected]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -70,7 +70,13 @@ impl RunState {
 pub struct DatasetCounts {
     pub classes: Vec<String>,
     pub train_images: usize,
+    /// Unique training frames (0 in records of older versions).
+    #[serde(default)]
+    pub train_frames: usize,
     pub valid_images: usize,
+    /// [`super::dataset::Stats::valid_groups`] (empty in records of older versions).
+    #[serde(default)]
+    pub valid_groups: Vec<String>,
     pub heldout_images: usize,
     pub heldout_dir: Option<PathBuf>,
     pub warnings: Vec<String>,
@@ -85,7 +91,9 @@ impl DatasetCounts {
         Self {
             classes: p.classes.clone(),
             train_images: p.train_images,
+            train_frames: p.train_frames,
             valid_images: p.valid_images,
+            valid_groups: p.valid_groups.clone(),
             heldout_images: p.heldout_images,
             heldout_dir: p.heldout_dir.clone(),
             warnings: p.warnings.clone(),

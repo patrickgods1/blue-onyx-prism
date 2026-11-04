@@ -4,19 +4,30 @@
 //! merge into a label file ([`apply`]: evidence on boxes it confirms, class suggestions on
 //! pending boxes it labels otherwise, then [`merge_proposals`]); and for runs with a model
 //! ([`model_boxes`], [`model_triage`]: `review`, or `accept` at a pre-accept score), the
-//! disagreement of its detections with the reviewed labels ([`disagreement`]).
+//! disagreement of its detections with the reviewed labels ([`disagreement`]); and for a
+//! `missing_only` run, the objects a reviewed frame has no box for ([`apply_missing`], which
+//! bypasses [`apply`] and [`merge_proposals`] on purpose).
 
 use super::Category;
 use super::catalog::same_class;
+use crate::collect::labels::repeats::{REPEAT_SPOT_REASON, same_object};
+use crate::collect::labels::stacks::DUPLICATE_REASON;
 use crate::collect::labels::{
-    self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, Source, Status, Triage,
-    VlmCheck, iou, merge_proposals,
+    self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, Origin, Source, Status,
+    Triage, VlmCheck, inside_share, iou, merge_proposals,
 };
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Fused score at or above which a box both labelers found is accepted.
 pub const ACCEPT_SCORE: f32 = 0.6;
+/// `missing_only`: IoU at or above which a training or pending box of the same object covers a
+/// detection ([`apply_missing`]). Lower than [`MATCH_IOU`]: a loosely drawn box still labels the
+/// object.
+pub const MISSING_IOU: f32 = 0.3;
+/// `missing_only`: share of a detection inside a training or pending box of the same object at
+/// which that box covers it ([`apply_missing`]).
+pub const MISSING_INSIDE: f32 = 0.5;
 
 /// The VLM check of a box, as the script reports it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -489,6 +500,183 @@ pub fn apply_relabel(
         f.disagreement = Some(w.clone());
     }
     (rep, why)
+}
+
+/// Whether a `missing_only` run may look at `f`: a reviewed frame, or an unreviewed one that a
+/// re-label sent back (`disagreement`, so a second model can add to the first one's proposals). A
+/// frame confirmed empty is left out: accepting a box there would fail [`labels::normalize`].
+pub fn missing_scope(f: &LabelFile) -> bool {
+    !f.empty_confirmed
+        && (f.status == Status::Reviewed
+            || (f.status == Status::Unreviewed && f.disagreement.is_some()))
+}
+
+/// What [`apply_missing`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MissingReport {
+    /// New pending boxes.
+    pub added: usize,
+    /// Pending boxes that took the place of an automatic reject.
+    pub overwritten: usize,
+    /// Detections a training box, a pending box or a box of this run already covers.
+    pub covered: usize,
+    /// Detections on a box a reviewer rejected.
+    pub judged: usize,
+    /// Detections with no room left in the file ([`labels::MAX_BOXES`]).
+    pub full: usize,
+}
+
+impl MissingReport {
+    /// The boxes the reviewer has to look at because of this run.
+    pub fn candidates(&self) -> usize {
+        self.added + self.overwritten
+    }
+}
+
+fn area(b: &[f32; 4]) -> f32 {
+    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
+}
+
+/// Whether `b` covers the detection `p`: IoU >= [`MISSING_IOU`], or at least [`MISSING_INSIDE`] of
+/// `p` inside `b`. Only that direction: a small box inside a large detection does not cover it.
+/// [`inside_share`] measures the smaller box, which is `p` under the area check; a `p` larger than
+/// `b` with that share of it inside `b` has an IoU of at least 1/3 anyway, so the check loses
+/// nothing.
+fn covers(b: &LabelBox, p: &LabelBox) -> bool {
+    iou(&b.bbox, &p.bbox) >= MISSING_IOU
+        || (area(&p.bbox) <= area(&b.bbox) && inside_share(&p.bbox, &b.bbox) >= MISSING_INSIDE)
+}
+
+/// A rejected box no reviewer judged: a [`labels::bulk::LOW_SCORE_REASON`] bulk reject, or a model
+/// hint (suppressed, below threshold, verifier find) the page's save default rejected. A reject
+/// reason, a spot edit or a duplicate reject means somebody looked, whatever the box's origin. A
+/// spot edit leaves its mark only on a box without a `reason` of its own, so a suppressed hint
+/// rejected by one cannot be told from the save default.
+fn unjudged_reject(b: &LabelBox) -> bool {
+    let reason = b.reason.as_deref();
+    b.state == BoxState::Rejected
+        && b.reject_reason.is_none()
+        && !matches!(reason, Some(REPEAT_SPOT_REASON | DUPLICATE_REASON))
+        && (reason == Some(labels::bulk::LOW_SCORE_REASON)
+            || (b.source == Source::Model && b.origin != Some(Origin::Prediction)))
+}
+
+/// The note of a frame with `f`'s pending proposals: who proposed them and how many, within
+/// [`labels::MAX_DISAGREEMENT_LEN`] characters (names past that are counted, not listed).
+fn missing_note(f: &LabelFile, model: &str) -> String {
+    let pending: Vec<&LabelBox> = f
+        .boxes
+        .iter()
+        .filter(|b| b.state == BoxState::Pending && !b.auto.labelers.is_empty())
+        .collect();
+    let mut names: BTreeSet<&str> = pending
+        .iter()
+        .flat_map(|b| b.auto.labelers.keys().map(String::as_str))
+        .collect();
+    names.insert(model);
+    let n = pending.len();
+    let tail = format!(": {n} new box{}", if n == 1 { "" } else { "es" });
+    // Room for the prefix, the tail and " and 999 more".
+    let room = labels::MAX_DISAGREEMENT_LEN
+        .saturating_sub("re-label by ".len() + tail.len() + " and 999 more".len());
+    let mut listed = String::new();
+    let mut left = names.len();
+    for name in names {
+        let extra = name.chars().count() + if listed.is_empty() { 0 } else { 2 };
+        if listed.chars().count() + extra > room {
+            break;
+        }
+        if !listed.is_empty() {
+            listed.push_str(", ");
+        }
+        listed.push_str(name);
+        left -= 1;
+    }
+    match (listed.is_empty(), left) {
+        (true, _) => format!("re-label by {left} model(s){tail}"),
+        (false, 0) => format!("re-label by {listed}{tail}"),
+        (false, _) => format!("re-label by {listed} and {left} more{tail}"),
+    }
+}
+
+/// Propose the objects `f` has no box for: `boxes` are `model`'s [`model_boxes`], taken highest
+/// score first. Does nothing outside [`missing_scope`]. Per box, against the boxes of the same
+/// object ([`same_object`], so a car on a labelled truck is no new object):
+///
+/// - a training box, a pending box or a box added by this call that [`covers`] it: dropped;
+/// - a rejected box at IoU >= [`MATCH_IOU`] that a reviewer judged (anything but
+///   [`unjudged_reject`]): dropped, whatever else matches;
+/// - an [`unjudged_reject`] at that IoU: the box takes its place (the closest one; any others
+///   there are removed), so `hard_negatives.json` does not call a real object a false positive;
+/// - else it is added.
+///
+/// Boxes are `pending`, triaged `review`; existing boxes get no evidence and no class suggestion.
+/// A frame that gains a box goes back to `unreviewed` with a `disagreement` note naming the
+/// labelers of its pending boxes, and loses [`LabelFile::overlaps_checked`] (the reviewer's look
+/// did not cover this box). A frame that gains none is left exactly as it was.
+pub fn apply_missing(f: &mut LabelFile, mut boxes: Vec<LabelBox>, model: &str) -> MissingReport {
+    let mut r = MissingReport::default();
+    if !missing_scope(f) {
+        return r;
+    }
+    boxes.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+    for mut p in boxes {
+        let same = |b: &&LabelBox| same_object(&b.label, &p.label);
+        if f.boxes
+            .iter()
+            .filter(same)
+            .filter(|b| b.is_training() || b.state == BoxState::Pending)
+            .any(|b| covers(b, &p))
+        {
+            r.covered += 1;
+            continue;
+        }
+        // The same-object rejects at this place, closest first.
+        let mut rejects: Vec<(usize, f32, bool)> = f
+            .boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| same(b) && b.state == BoxState::Rejected)
+            .map(|(i, b)| (i, iou(&b.bbox, &p.bbox), unjudged_reject(b)))
+            .filter(|x| x.1 >= MATCH_IOU)
+            .collect();
+        if rejects.iter().any(|x| !x.2) {
+            r.judged += 1;
+            continue;
+        }
+        rejects.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let closest = rejects.first().map(|x| x.0);
+        if closest.is_none() && f.boxes.len() >= labels::MAX_BOXES {
+            r.full += 1;
+            continue;
+        }
+        p.state = BoxState::Pending;
+        p.auto.triage = Some(Triage::Review);
+        match closest.and_then(|i| f.boxes.get_mut(i)) {
+            Some(slot) => {
+                *slot = p;
+                r.overwritten += 1;
+            }
+            None => {
+                f.boxes.push(p);
+                r.added += 1;
+            }
+        }
+        let gone: BTreeSet<usize> = rejects.iter().skip(1).map(|x| x.0).collect();
+        if !gone.is_empty() {
+            let mut i = 0;
+            f.boxes.retain(|_| {
+                i += 1;
+                !gone.contains(&(i - 1))
+            });
+        }
+    }
+    if r.candidates() > 0 {
+        f.status = Status::Unreviewed;
+        f.disagreement = Some(missing_note(f, model));
+        f.overlaps_checked = false;
+    }
+    r
 }
 
 #[cfg(test)]
@@ -1070,6 +1258,391 @@ mod tests {
         let (rep, why) = relabel(&mut h, &same, "m", &classes());
         assert_eq!((rep.added, why), (0, None));
         assert_eq!(h.status, Status::Reviewed);
+    }
+
+    /// `boxes` as a reviewed file.
+    fn frame(boxes: Vec<LabelBox>) -> LabelFile {
+        LabelFile {
+            status: Status::Reviewed,
+            boxes,
+            ..LabelFile::default()
+        }
+    }
+
+    /// A box of `source`, `state` at `bbox`.
+    fn lb(label: &str, bbox: [f32; 4], source: Source, state: BoxState) -> LabelBox {
+        LabelBox {
+            bbox,
+            source,
+            state,
+            origin: (source == Source::Model).then_some(labels::Origin::Prediction),
+            ..labels::tests_support::auto_box(label)
+        }
+    }
+
+    fn accepted(label: &str, bbox: [f32; 4]) -> LabelBox {
+        lb(label, bbox, Source::Model, BoxState::Accepted)
+    }
+
+    /// [`apply_missing`] of `dets` by `model` on a 640x480 day frame.
+    fn missing(f: &mut LabelFile, dets: &[Det], model: &str) -> MissingReport {
+        let cls = classes();
+        let run = ModelRun {
+            model,
+            classes: &cls,
+            scene: "day",
+            accept_score: None,
+        };
+        apply_missing(f, model_boxes(dets, &run, 640, 480).boxes, model)
+    }
+
+    const CAR: [f32; 4] = [100.0, 100.0, 200.0, 200.0];
+
+    #[test]
+    fn a_new_object_reopens_the_frame_with_a_pending_review_box() {
+        let mut f = frame(vec![accepted("person", [400.0, 10.0, 450.0, 90.0])]);
+        f.overlaps_checked = true;
+        f.reviewed_at = Some("2026-10-22T12:00:00.000Z".into());
+        let r = missing(&mut f, &[d("car", CAR)], "nano-2");
+        assert_eq!(r.added, 1);
+        assert_eq!(r.candidates(), 1);
+        assert_eq!(f.status, Status::Unreviewed);
+        assert_eq!(
+            f.disagreement.as_deref(),
+            Some("re-label by nano-2: 1 new box")
+        );
+        assert!(!f.overlaps_checked, "the look did not cover this box");
+        let b = &f.boxes[1];
+        assert_eq!((b.source, b.state), (Source::Auto, BoxState::Pending));
+        assert_eq!(b.auto.triage, Some(Triage::Review));
+        assert!(b.auto.labelers.contains_key("nano-2"));
+        assert_eq!(f.boxes[0].state, BoxState::Accepted, "decisions are kept");
+        assert!(f.boxes[0].auto.is_empty(), "no evidence on existing boxes");
+    }
+
+    #[test]
+    fn a_frame_that_gains_nothing_is_unchanged() {
+        let mut f = frame(vec![accepted("car", CAR)]);
+        f.overlaps_checked = true;
+        let before = f.clone();
+        let r = missing(&mut f, &[d("car", [101.0, 100.0, 200.0, 200.0])], "m");
+        assert_eq!((r.candidates(), r.covered), (0, 1));
+        assert_eq!(f, before);
+        assert_eq!(missing(&mut f, &[], "m"), MissingReport::default());
+        assert_eq!(f, before);
+    }
+
+    #[test]
+    fn a_training_box_covers_a_detection_from_iou_0_3_or_half_inside_it() {
+        let wide = [0.0, 0.0, 100.0, 100.0];
+        // Exactly IoU 0.3 (6000 / 20000), a third of the detection inside: covered.
+        let mut f = frame(vec![accepted("car", wide)]);
+        assert_eq!(
+            missing(&mut f, &[d("car", [40.0, 0.0, 200.0, 100.0])], "m").covered,
+            1
+        );
+        // IoU 0.25: a new object.
+        assert_eq!(
+            missing(&mut f, &[d("car", [50.0, 0.0, 200.0, 100.0])], "m").added,
+            1
+        );
+        let big = [0.0, 0.0, 300.0, 300.0];
+        // Half of a small detection inside: covered, at an IoU of 0.02.
+        let mut f = frame(vec![accepted("car", big)]);
+        let half = [270.0, 0.0, 330.0, 60.0];
+        assert_eq!(missing(&mut f, &[d("car", half)], "m").covered, 1);
+        // A third of it inside: kept.
+        let third = [280.0, 0.0, 340.0, 60.0];
+        assert_eq!(missing(&mut f, &[d("car", third)], "m").added, 1);
+        // The other way round: a small box inside a large detection does not cover it, though
+        // `inside_share` of the two is 1.
+        let mut f = frame(vec![accepted("car", [100.0, 100.0, 130.0, 130.0])]);
+        let large = [50.0, 50.0, 300.0, 300.0];
+        assert_eq!(inside_share(&large, &f.boxes[0].bbox), 1.0);
+        assert_eq!(missing(&mut f, &[d("car", large)], "m").added, 1);
+        // A rejected box does not cover at IoU 0.3.
+        let mut f = frame(vec![lb("car", wide, Source::Model, BoxState::Rejected)]);
+        assert_eq!(
+            missing(&mut f, &[d("car", [40.0, 0.0, 200.0, 100.0])], "m").added,
+            1
+        );
+    }
+
+    #[test]
+    fn a_car_on_a_labelled_truck_neither_adds_nor_reopens() {
+        let mut f = frame(vec![accepted("truck", CAR)]);
+        let before = f.clone();
+        let r = missing(&mut f, &[d("car", CAR)], "m");
+        assert_eq!((r.candidates(), r.covered), (0, 1));
+        assert_eq!(f, before);
+        // Another object class on the same place is a new object.
+        let r = missing(&mut f, &[d("person", CAR)], "m");
+        assert_eq!(r.added, 1);
+        assert_eq!(f.status, Status::Unreviewed);
+    }
+
+    #[test]
+    fn pending_boxes_and_this_runs_boxes_cover_highest_score_first() {
+        let mut f = frame(vec![]);
+        let low = Det {
+            score: 0.6,
+            ..d("car", [102.0, 100.0, 200.0, 200.0])
+        };
+        let high = Det {
+            score: 0.9,
+            ..d("truck", CAR)
+        };
+        let r = missing(&mut f, &[low, high], "m");
+        assert_eq!((r.added, r.covered), (1, 1));
+        assert_eq!(f.boxes.len(), 1);
+        assert_eq!(f.boxes[0].label, "truck", "the sure box stays");
+        // Pending hint of the sidecar on an unreviewed frame sent back by a re-label.
+        let mut g = LabelFile {
+            disagreement: Some("x".into()),
+            boxes: vec![lb("car", CAR, Source::Model, BoxState::Pending)],
+            ..LabelFile::default()
+        };
+        assert_eq!(missing(&mut g, &[d("car", CAR)], "m").covered, 1);
+        assert_eq!(g.disagreement.as_deref(), Some("x"), "not rebuilt");
+    }
+
+    #[test]
+    fn a_judged_reject_blocks_the_detection() {
+        let hint = |origin| LabelBox {
+            origin: Some(origin),
+            ..lb("car", CAR, Source::Model, BoxState::Rejected)
+        };
+        let cases = [
+            // By hand: the reviewer rejected a prediction or a proposal.
+            lb("car", CAR, Source::Model, BoxState::Rejected),
+            LabelBox {
+                reason: Some("model m".into()),
+                ..lb("car", CAR, Source::Auto, BoxState::Rejected)
+            },
+            // With a reject reason, on a hint too: somebody chose it.
+            LabelBox {
+                reject_reason: Some(labels::RejectReason::IrGlare),
+                ..hint(labels::Origin::BelowThreshold)
+            },
+            // A spot edit.
+            LabelBox {
+                reason: Some(labels::repeats::REPEAT_SPOT_REASON.into()),
+                ..hint(labels::Origin::BelowThreshold)
+            },
+            // A duplicate reject, on a hint and on a box rejected low before.
+            LabelBox {
+                reject_reason: Some(labels::RejectReason::Duplicate),
+                reason: Some(DUPLICATE_REASON.into()),
+                ..hint(labels::Origin::Suppressed)
+            },
+            LabelBox {
+                reason: Some(labels::bulk::LOW_SCORE_REASON.into()),
+                reject_reason: Some(labels::RejectReason::FalsePositive),
+                ..lb("car", CAR, Source::Auto, BoxState::Rejected)
+            },
+        ];
+        for c in cases {
+            let mut f = frame(vec![c.clone()]);
+            let before = f.clone();
+            let r = missing(&mut f, &[d("truck", CAR)], "m");
+            assert_eq!((r.candidates(), r.judged), (0, 1), "{c:?}");
+            assert_eq!(f, before, "{c:?}");
+            // Below IoU 0.5 it says nothing about the detection.
+            let r = missing(&mut f, &[d("car", [150.0, 100.0, 250.0, 200.0])], "m");
+            assert_eq!(r.added, 1, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn an_unjudged_reject_is_overwritten_in_place() {
+        let low = LabelBox {
+            reason: Some(labels::bulk::LOW_SCORE_REASON.into()),
+            ..lb("truck", CAR, Source::Auto, BoxState::Rejected)
+        };
+        let hint = LabelBox {
+            origin: Some(labels::Origin::BelowThreshold),
+            ..lb(
+                "car",
+                [101.0, 100.0, 200.0, 200.0],
+                Source::Model,
+                BoxState::Rejected,
+            )
+        };
+        let suppressed = LabelBox {
+            origin: Some(labels::Origin::Suppressed),
+            reason: Some("night_threshold".into()),
+            ..hint.clone()
+        };
+        let other = accepted("person", [400.0, 10.0, 450.0, 90.0]);
+        for reject in [low, hint.clone(), suppressed] {
+            let mut f = frame(vec![reject, other.clone()]);
+            let r = missing(&mut f, &[d("car", CAR)], "m");
+            assert_eq!((r.added, r.overwritten, r.candidates()), (0, 1, 1));
+            assert_eq!(f.boxes.len(), 2, "no second box");
+            let b = &f.boxes[0];
+            assert_eq!(
+                (b.label.as_str(), b.source, b.state, b.bbox),
+                ("car", Source::Auto, BoxState::Pending, CAR)
+            );
+            assert_eq!(b.origin, None);
+            assert_eq!(b.reason.as_deref(), Some("model m"));
+            assert_eq!(f.hard_negatives().count(), 0, "no contradiction");
+            assert_eq!(f.status, Status::Unreviewed);
+            assert_eq!(f.disagreement.as_deref(), Some("re-label by m: 1 new box"));
+        }
+        // Two automatic rejects on the object: the closest is taken, the other goes.
+        let far = LabelBox {
+            bbox: [105.0, 100.0, 200.0, 200.0],
+            ..hint.clone()
+        };
+        let mut f = frame(vec![far, other.clone(), hint.clone()]);
+        let r = missing(&mut f, &[d("car", CAR)], "m");
+        assert_eq!(r.overwritten, 1);
+        assert_eq!(f.boxes.len(), 2);
+        assert_eq!(f.boxes[0].label, "person");
+        assert_eq!(f.boxes[1].state, BoxState::Pending);
+        assert_eq!(f.hard_negatives().count(), 0);
+        // A judged reject beside an automatic one blocks: nothing changes.
+        let judged = lb("car", CAR, Source::Model, BoxState::Rejected);
+        let mut f = frame(vec![hint.clone(), judged]);
+        let before = f.clone();
+        assert_eq!(missing(&mut f, &[d("car", CAR)], "m").judged, 1);
+        assert_eq!(f, before);
+        // Of another object: not touched.
+        let mut f = frame(vec![LabelBox {
+            label: "person".into(),
+            ..hint
+        }]);
+        assert_eq!(missing(&mut f, &[d("car", CAR)], "m").added, 1);
+        assert_eq!(f.boxes.len(), 2);
+        assert_eq!(f.boxes[0].state, BoxState::Rejected);
+    }
+
+    #[test]
+    fn only_reviewed_frames_and_re_label_returns_are_in_scope() {
+        assert!(missing_scope(&frame(vec![])));
+        let back = LabelFile {
+            disagreement: Some("x".into()),
+            ..LabelFile::default()
+        };
+        assert!(missing_scope(&back));
+        for out in [
+            LabelFile::default(),
+            LabelFile {
+                status: Status::Skipped,
+                disagreement: Some("x".into()),
+                ..LabelFile::default()
+            },
+            LabelFile {
+                empty_confirmed: true,
+                ..frame(vec![])
+            },
+            LabelFile {
+                empty_confirmed: true,
+                ..back
+            },
+        ] {
+            assert!(!missing_scope(&out), "{out:?}");
+            let mut f = out.clone();
+            assert_eq!(
+                missing(&mut f, &[d("car", CAR)], "m"),
+                MissingReport::default()
+            );
+            assert_eq!(f, out);
+        }
+    }
+
+    #[test]
+    fn two_models_in_turn_add_nothing_twice_and_share_the_note() {
+        let mut f = frame(vec![]);
+        assert_eq!(missing(&mut f, &[d("car", CAR)], "b-model").added, 1);
+        let snapshot = f.clone();
+        // The same object from the second model: nothing, the note stays.
+        let r = missing(&mut f, &[d("car", [102.0, 100.0, 200.0, 200.0])], "a-model");
+        assert_eq!((r.candidates(), r.covered), (0, 1));
+        assert_eq!(f, snapshot);
+        // A rerun of the first: nothing.
+        assert_eq!(missing(&mut f, &[d("car", CAR)], "b-model").candidates(), 0);
+        // A second object: the note names both, the count is the pending boxes'.
+        let r = missing(&mut f, &[d("dog", [300.0, 300.0, 360.0, 360.0])], "a-model");
+        assert_eq!(r.added, 1);
+        assert_eq!(f.boxes.len(), 2);
+        assert_eq!(
+            f.disagreement.as_deref(),
+            Some("re-label by a-model, b-model: 2 new boxes")
+        );
+    }
+
+    #[test]
+    fn a_reopened_frame_saves_and_its_note_stays_under_the_limit() {
+        let now = "2026-10-22T12:00:00.000Z";
+        let cls = classes();
+        // 30 models of the longest name a save accepts, each with its own box.
+        let mut f = frame(vec![]);
+        for i in 0..30u16 {
+            let model = format!("{i:02}{}", "m".repeat(labels::MAX_LABEL_LEN - 2));
+            let x = f32::from(i) * 20.0;
+            let r = missing(&mut f, &[d("car", [x, 0.0, x + 10.0, 10.0])], &model);
+            assert_eq!(r.added, 1);
+        }
+        let note = f.disagreement.clone().unwrap();
+        assert!(
+            note.chars().count() < labels::MAX_DISAGREEMENT_LEN,
+            "{note}"
+        );
+        assert!(note.ends_with(" more: 30 new boxes"), "{note}");
+        assert!(note.contains("00mmm"), "{note}");
+        // Unreviewed save: the note is kept, and accepted.
+        let saved = labels::normalize(f.clone(), &cls, 640, 480, now).unwrap();
+        assert_eq!(saved.disagreement.as_deref(), Some(note.as_str()));
+        // Saved as reviewed: the proposals are accepted, the note goes.
+        let mut done = saved;
+        done.status = Status::Reviewed;
+        let done = labels::normalize(done, &cls, 640, 480, now).unwrap();
+        assert_eq!(done.training().count(), 30);
+        assert_eq!(done.disagreement, None);
+        // One name longer than the note: the count stands in for it.
+        let mut g = frame(vec![]);
+        missing(&mut g, &[d("car", CAR)], &"x".repeat(900));
+        let note = g.disagreement.unwrap();
+        assert_eq!(note, "re-label by 1 model(s): 1 new box");
+    }
+
+    #[test]
+    fn accept_this_spot_takes_a_reopened_frames_proposal() {
+        use labels::repeats::{ACCEPT_SPOT_IOU, Spot, Verdict};
+        let mut f = frame(vec![accepted("person", [400.0, 10.0, 450.0, 90.0])]);
+        missing(&mut f, &[d("car", CAR)], "m");
+        let spot = Spot {
+            camera: "cam".into(),
+            label: "car".into(),
+            bbox: CAR,
+            width: 640,
+            height: 480,
+            min_iou: ACCEPT_SPOT_IOU,
+        };
+        assert!(spot.matches(&f.boxes[1], &Verdict::Accept));
+        assert_eq!(spot.apply(&mut f, &Verdict::Accept), 1);
+        assert_eq!(f.boxes[1].state, BoxState::Accepted);
+        // So is an overwritten reject's.
+        let mut g = frame(vec![LabelBox {
+            reason: Some(labels::bulk::LOW_SCORE_REASON.into()),
+            ..lb("car", CAR, Source::Auto, BoxState::Rejected)
+        }]);
+        missing(&mut g, &[d("car", CAR)], "m");
+        assert!(spot.matches(&g.boxes[0], &Verdict::Accept));
+    }
+
+    #[test]
+    fn a_full_file_gains_no_box() {
+        let mut f = frame(vec![
+            accepted("car", [0.0, 0.0, 10.0, 10.0]);
+            labels::MAX_BOXES
+        ]);
+        let before = f.clone();
+        let r = missing(&mut f, &[d("dog", CAR)], "m");
+        assert_eq!((r.candidates(), r.full), (0, 1));
+        assert_eq!(f, before);
     }
 
     /// The script's own tests of its fusion code (WBF, NMS, prompt batching, phrase mapping,

@@ -1494,3 +1494,122 @@ fn validation_split_has_a_minimum_capped_at_a_quarter() {
     assert_eq!(valid_count(3), 1);
     assert_eq!(valid_count(2), 1);
 }
+
+/// A plan of `unique` frames (all one small image) with `lines` train.txt lines in all.
+fn repeated_plan(s: &Source, unique: usize, lines: usize) -> Plan {
+    let extra = lines - unique;
+    Plan {
+        classes: vec!["person".into()],
+        train: (0..unique)
+            .map(|i| {
+                // The extra lines spread over the first frames, 2 each (one more when odd).
+                let more = (extra.saturating_sub(2 * i)).min(2) as u32;
+                ((0, i), 1 + more)
+            })
+            .collect(),
+        valid: vec![(0, s.frames.len() - 1)],
+        ..Plan::default()
+    }
+}
+
+fn one_image_source(dir: &Path, n: usize) -> Source {
+    jpg(&dir.join("x.jpg"), 8, 8);
+    Source {
+        dir: dir.to_path_buf(),
+        public: None,
+        classes: vec!["person".into()],
+        frames: vec![
+            Frame {
+                image: dir.join("x.jpg"),
+                boxes: vec![YoloBox {
+                    class: "person".into(),
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 0.2,
+                    h: 0.2,
+                }],
+                scene: Some("day".into()),
+                camera: "a".into(),
+                day: "2026-10-01".into(),
+                split: SplitHint::None,
+                hard_negative: false,
+                size: Some((8, 8)),
+            };
+            n
+        ],
+        warnings: Vec::new(),
+    }
+}
+
+/// The run of 20261103-204935-f7d1: balancing took 423 frames to 1,019 lines, so RF-DETR left the
+/// small-dataset rate it needed.
+#[test]
+fn the_learning_rate_counts_unique_frames_not_repeats() {
+    use crate::resources::catalog::TrainFamily;
+    let t = tmp("lr-unique");
+    let s = vec![one_image_source(&t.0, 424)];
+    let p = repeated_plan(&s[0], 423, 1019);
+    let prep = write(&s, &p, &Options::default(), &t.0.join("data")).unwrap();
+    assert_eq!((prep.train_images, prep.train_frames), (1019, 423));
+    let text = std::fs::read(t.0.join("data").join("dataset.json")).unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&text).unwrap();
+    assert_eq!(
+        (j["train_images"].as_u64(), j["train_frames"].as_u64()),
+        (Some(1019), Some(423))
+    );
+    let r = crate::training::recipe::TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
+    assert_eq!(r.effective_lr(prep.train_images), None, "the old count");
+    let lr = r.effective_lr(prep.train_frames).unwrap();
+    assert_eq!((lr.lr, lr.small_dataset), (5e-5, true));
+    assert!(
+        r.lr_line(prep.train_frames)
+            .contains("(423 unique training frames < 1000: lower than"),
+        "{}",
+        r.lr_line(prep.train_frames)
+    );
+    // A large unique set keeps the default, repeats or not.
+    let t = tmp("lr-large");
+    let s = vec![one_image_source(&t.0, 1001)];
+    let p = repeated_plan(&s[0], 1000, 1000);
+    let prep = write(&s, &p, &Options::default(), &t.0.join("data")).unwrap();
+    assert_eq!((prep.train_images, prep.train_frames), (1000, 1000));
+    assert_eq!(r.effective_lr(prep.train_frames), None);
+}
+
+#[test]
+fn public_frames_count_once_and_review_repeats_do_not() {
+    let t = tmp("lr-public");
+    // Eight cameras of 5 own frames, 30 public frames.
+    let source = |dir: PathBuf, n: usize, camera: &dyn Fn(usize) -> String| {
+        let mut s = one_image_source(&dir, n);
+        for (i, f) in s.frames.iter_mut().enumerate() {
+            f.image = dir.join(format!("{i}.jpg"));
+            f.camera = camera(i);
+            jpg(&f.image, 8, 8);
+        }
+        s
+    };
+    let own = source(t.0.join("own"), 40, &|i| format!("cam{}", i % 8));
+    let mut public = source(t.0.join("pub"), 30, &|_| "pub".to_string());
+    public.public = Some(Public {
+        id: "pub".into(),
+        license: "cc".into(),
+    });
+    let s = vec![own, public];
+    let opts = Options {
+        heldout_share: 0.0,
+        negative_share: 0.0,
+        oversample: 3,
+        ..Options::default()
+    };
+    let p = plan(&s, &opts).unwrap();
+    let review = p.train.iter().filter(|(r, _)| r.0 == 0).count();
+    assert!(
+        p.train
+            .iter()
+            .all(|((si, _), n)| *n == if *si == 0 { 3 } else { 1 })
+    );
+    let prep = write(&s, &p, &opts, &t.0.join("data")).unwrap();
+    assert_eq!(prep.train_frames, review + 30);
+    assert_eq!(prep.train_images, review * 3 + 30);
+}

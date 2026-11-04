@@ -106,11 +106,48 @@
   // Label of the device select's first option.
   function ownDeviceLabel(m) { return "model's own (" + ((m && m.device) || 'auto') + ')'; }
 
+  // Threshold and limit of the form once "Find missing labels" is ticked (on) or unticked: a
+  // value the user changed stays. The server applies the same defaults (plan_autolabel), for its
+  // own 0.3 and 200 only, so the Review page's lower limit has to change here.
+  function missingDefaults(on, threshold, limit, savedLimit) {
+    return {
+      threshold: on ? (threshold === '0.3' ? '0.5' : threshold) : (threshold === '0.5' ? '0.3' : threshold),
+      limit: on ? '20000' : (limit === '20000' && savedLimit ? savedLimit : limit),
+      savedLimit: on ? limit : ''
+    };
+  }
+
+  // Wires the "Find missing labels" box of an auto-label form; returns the function that disables
+  // the pre-accept score while it is ticked (a run with it is refused). Call that again after
+  // anything that re-enables the form's fields.
+  function missingToggle(form) {
+    var box = form.elements.missing_only, saved = '';
+    var sync = function () {
+      var accept = form.elements.model_accept_score;
+      if (!box || !accept || box.disabled) return;
+      accept.disabled = box.checked;
+      if (box.checked) accept.value = '';
+    };
+    if (box) {
+      box.addEventListener('change', function () {
+        var t = form.elements.threshold, l = form.elements.limit;
+        var d = missingDefaults(box.checked, t ? t.value : '', l ? l.value : '', saved);
+        if (t) t.value = d.threshold;
+        if (l) l.value = d.limit;
+        saved = d.savedLimit;
+        sync();
+      });
+    }
+    sync();
+    return sync;
+  }
+
   var util = {
     groupModels: groupModels, sizeText: sizeText, needsLicenseConfirm: needsLicenseConfirm,
     needsLargeConfirm: needsLargeConfirm, notesFor: notesFor, optionText: optionText,
     detailText: detailText, acceptProblem: acceptProblem, selectionProblem: selectionProblem,
-    ownDeviceLabel: ownDeviceLabel, isCatalogOnly: isCatalogOnly, GROUPS: GROUPS
+    ownDeviceLabel: ownDeviceLabel, isCatalogOnly: isCatalogOnly, missingDefaults: missingDefaults,
+    missingToggle: missingToggle, GROUPS: GROUPS
   };
 
   // ---- fetch ---------------------------------------------------------------------------------

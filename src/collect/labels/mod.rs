@@ -9,13 +9,14 @@
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
 //! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
 //! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
-//! [`xany`] and the repeat detections of fixed cameras (spot matching, per-camera history) in
-//! [`repeats`].
+//! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
+//! [`repeats`] and the duplicate boxes on one object (stacks, overlaps) in [`stacks`].
 
 pub mod bulk;
 pub mod export;
 pub mod queue;
 pub mod repeats;
+pub mod stacks;
 pub mod xany;
 
 use super::layout::{self, Rel};
@@ -43,6 +44,8 @@ pub const MIN_BOX_PX: f32 = 1.0;
 pub const MATCH_IOU: f32 = 0.5;
 /// IoU at or above which two pre-filled boxes of one label are the same box ([`prefill`]).
 pub const DUP_IOU: f32 = 0.95;
+/// Longest [`LabelFile::disagreement`] note, in characters ([`normalize`] refuses a longer one).
+pub const MAX_DISAGREEMENT_LEN: usize = 500;
 
 /// Where a frame is in the review.
 #[derive(
@@ -373,6 +376,12 @@ pub struct LabelFile {
     /// ([`repeats::repeats_only`]). [`normalize`] clears it once the frame is reviewed or skipped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub repeat_spot: bool,
+    /// The reviewer saved the frame with stacked or overlapping boxes still on it: they looked and
+    /// kept them (two real nested cars). `auto=overlaps` passes the frame over and the bulk reject
+    /// leaves it alone ([`stacks`]). The Review page sets it on a reviewed save; [`merge_proposals`]
+    /// clears it when a box is added (the look did not cover that box).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overlaps_checked: bool,
 }
 
 fn labels_version() -> u32 {
@@ -392,6 +401,7 @@ impl Default for LabelFile {
             auto_run: None,
             bulk_accepted: false,
             repeat_spot: false,
+            overlaps_checked: false,
         }
     }
 }
@@ -407,6 +417,13 @@ impl LabelFile {
         self.boxes
             .iter()
             .filter(|b| b.state == BoxState::Rejected && b.source != Source::Human)
+    }
+
+    /// [`Self::rejected`] without the duplicates: a box rejected as a second box on an object sits
+    /// on a real object, so it is no false positive to learn from.
+    pub fn hard_negatives(&self) -> impl Iterator<Item = &LabelBox> {
+        self.rejected()
+            .filter(|b| b.reject_reason != Some(RejectReason::Duplicate))
     }
 }
 
@@ -426,6 +443,20 @@ pub fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     let area = |r: &[f32; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
     let union = area(a) + area(b) - inter;
     if union > 0.0 { inter / union } else { 0.0 }
+}
+
+/// How much of the smaller of two `[x0, y0, x1, y1]` boxes lies inside the other: their
+/// intersection over the smaller area (0 for an empty box). 1 = one is wholly inside the other.
+pub fn inside_share(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+    let iw = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
+    let ih = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    let area = |r: &[f32; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
+    let smaller = area(a).min(area(b));
+    if smaller > 0.0 {
+        iw * ih / smaller
+    } else {
+        0.0
+    }
 }
 
 /// `b` ordered (`x0 <= x1`, `y0 <= y1`) and clamped to the `w` x `h` frame.
@@ -603,7 +634,7 @@ fn label_ok(l: &str) -> bool {
 /// - `skipped`: `reviewed_at` = `now`; `unreviewed`: no `reviewed_at`;
 /// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
-///   (bounded), `bulk_accepted` cleared;
+///   (bounded), `overlaps_checked` kept, `bulk_accepted` cleared;
 /// - `version` and `classes_version` set.
 pub fn normalize(
     mut f: LabelFile,
@@ -745,9 +776,9 @@ pub fn normalize(
     }
     if f.disagreement
         .as_ref()
-        .is_some_and(|d| d.chars().count() > 500)
+        .is_some_and(|d| d.chars().count() > MAX_DISAGREEMENT_LEN)
     {
-        bail!("the disagreement note is longer than 500 characters");
+        bail!("the disagreement note is longer than {MAX_DISAGREEMENT_LEN} characters");
     }
     Ok(f)
 }
@@ -813,7 +844,8 @@ pub struct MergeReport {
 ///   disagreement for the reviewer; on a pending box: dropped.
 ///
 /// A reviewed (or skipped) file that gains a box goes back to `unreviewed`, keeping its other
-/// decisions. Proposals are stored with state `pending` whatever they carry.
+/// decisions, and a gained box ends [`LabelFile::overlaps_checked`]. Proposals are stored with
+/// state `pending` whatever they carry.
 pub fn merge_proposals(f: &mut LabelFile, proposals: Vec<LabelBox>) -> MergeReport {
     let mut r = MergeReport::default();
     let existing = f.boxes.len();
@@ -843,6 +875,9 @@ pub fn merge_proposals(f: &mut LabelFile, proposals: Vec<LabelBox>) -> MergeRepo
         } else {
             r.dropped += 1;
         }
+    }
+    if r.added > 0 {
+        f.overlaps_checked = false;
     }
     if r.added > 0 && f.status != Status::Unreviewed {
         f.status = Status::Unreviewed;
@@ -1548,6 +1583,62 @@ mod tests {
         let mut bad = f;
         bad.boxes[0].auto.labelers.insert("x".into(), 2.0);
         assert!(normalize(bad, &classes(), 640, 480, "t").is_err());
+    }
+
+    #[test]
+    fn inside_share_is_the_part_of_the_smaller_box_inside_the_other() {
+        let big = [0.0, 0.0, 100.0, 100.0];
+        assert_eq!(inside_share(&big, &[10.0, 10.0, 20.0, 20.0]), 1.0);
+        assert_eq!(
+            inside_share(&[10.0, 10.0, 20.0, 20.0], &big),
+            1.0,
+            "either order"
+        );
+        // Half of the small box sticks out on the right.
+        assert_eq!(inside_share(&big, &[95.0, 0.0, 105.0, 10.0]), 0.5);
+        assert_eq!(inside_share(&big, &[200.0, 0.0, 210.0, 10.0]), 0.0);
+        assert_eq!(inside_share(&big, &[5.0, 5.0, 5.0, 50.0]), 0.0, "empty box");
+    }
+
+    #[test]
+    fn overlaps_checked_round_trips_old_files_load_and_a_new_box_ends_it() {
+        let mut f = prefill(&record(), &classes(), &[]);
+        f.status = Status::Reviewed;
+        f.overlaps_checked = true;
+        let n = normalize(f, &classes(), 640, 480, "t").unwrap();
+        assert!(n.overlaps_checked, "normalize keeps it");
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["overlaps_checked"], true);
+        let back: LabelFile = serde_json::from_value(v).unwrap();
+        assert_eq!(back, n);
+        // Off: not written, and a file from before the field loads with it off.
+        let off = serde_json::to_string(&LabelFile::default()).unwrap();
+        assert!(!off.contains("overlaps_checked"), "{off}");
+        let old: LabelFile = serde_json::from_str(r#"{"status": "reviewed"}"#).unwrap();
+        assert!(!old.overlaps_checked);
+        // A proposal dropped changes nothing the reviewer saw; a box added does.
+        let mut m = n.clone();
+        let r = merge_proposals(&mut m, vec![auto("person", [10.0, 10.0, 50.0, 88.0])]);
+        assert_eq!((r.added, m.overlaps_checked), (0, true));
+        let r = merge_proposals(&mut m, vec![auto("deer", [200.0, 200.0, 260.0, 260.0])]);
+        assert_eq!((r.added, m.overlaps_checked), (1, false));
+    }
+
+    #[test]
+    fn hard_negatives_leave_out_duplicates() {
+        let mut dup = tests_support::auto_box("car");
+        dup.state = BoxState::Rejected;
+        dup.reject_reason = Some(RejectReason::Duplicate);
+        let mut wrong = dup.clone();
+        wrong.reject_reason = Some(RejectReason::IrGlare);
+        let mut plain = dup.clone();
+        plain.reject_reason = None;
+        let f = LabelFile {
+            boxes: vec![dup, wrong, plain],
+            ..LabelFile::default()
+        };
+        assert_eq!(f.rejected().count(), 3);
+        assert_eq!(f.hard_negatives().count(), 2);
     }
 
     #[test]

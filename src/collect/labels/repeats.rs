@@ -144,10 +144,13 @@ pub struct History {
 /// Whether a decided box counts as the reviewer's own look at that spot: a model or auto box
 /// accepted or rejected, not by a rule over many frames (the low-score and unwanted-class
 /// rejects, an earlier spot edit; counting those would make a spot look more certain than any
-/// look at it was).
+/// look at it was). A duplicate reject is no verdict on the spot either: another box stays on the
+/// object there (a real parked car must not read "rejected here N times"). Twin of the page's
+/// `lookedAt`.
 fn counts(b: &LabelBox) -> bool {
     b.source != Source::Human
         && matches!(b.state, BoxState::Accepted | BoxState::Rejected)
+        && b.reject_reason != Some(RejectReason::Duplicate)
         && !matches!(
             b.reason.as_deref(),
             Some(
@@ -444,6 +447,11 @@ mod tests {
             counts(&b),
             "a suppression reason is provenance, the decision was the reviewer's"
         );
+        b.reject_reason = Some(RejectReason::Reflection);
+        assert!(counts(&b), "a reason of the reviewer's");
+        b.reject_reason = Some(RejectReason::Duplicate);
+        assert!(!counts(&b), "a duplicate says nothing about the spot");
+        b.reject_reason = None;
         b.source = Source::Human;
         b.state = BoxState::Added;
         assert!(!counts(&b));

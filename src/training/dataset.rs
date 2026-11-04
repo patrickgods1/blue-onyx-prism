@@ -18,11 +18,12 @@
 //!    same frames ([`Plan::heldout_fingerprint`]); then filter the train / valid pool by scene
 //!    ([`SceneFilter`]) and, in [`Excluded::DropFrame`] mode, drop its frames with boxes of
 //!    untrained labels; keep about `negative_share` frames without objects in training, take a
-//!    validation split of `val_share` of the review training frames (never a class's last
-//!    training box), and repeat the review frames `oversample` times when public frames are
-//!    mixed in. Public frames are only ever trained on. Seeded choices rank a frame by its path
-//!    relative to its source folder, so the plan is the same wherever the folders are
-//!    (reproducible runs). Step 7, opt-in ([`Balance`], [`balance`]): repeat the training frames
+//!    validation split of `val_share` of the review training frames as whole camera days
+//!    ([`valid`], never a class's last training box), and repeat the review frames
+//!    `oversample` times when public frames are mixed in. Public frames are only ever trained on.
+//!    Seeded choices rank a frame by its path relative to its source folder, so the plan is the
+//!    same wherever the folders are (reproducible runs). Step 7, opt-in ([`Balance`],
+//!    [`balance`]): repeat the training frames
 //!    of rare classes / scenes / cameras / camera days (and optionally drop frames of dominant
 //!    ones); validation and held-out frames are never balanced.
 //! 3. **Write** ([`write`]): `images/` + `labels/` (hard links, else copies), `classes.txt`,
@@ -40,7 +41,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub mod balance;
+mod valid;
 pub use balance::{Balance, BalanceAxis, BalanceCounts, BalanceReport};
+pub use valid::valid_groups_text;
 
 /// Which frames a run trains on, by scene: any combination of day, night and IR. None or all
 /// three = every frame (unknown scenes included). Serialized as its canonical string
@@ -808,6 +811,9 @@ pub struct Stats {
     pub public_frames: usize,
     /// `camera/day` groups held out by the plan (empty when the source chose).
     pub heldout_groups: Vec<String>,
+    /// `camera/day` groups validated on, each whole and sorted (empty when validation fell back
+    /// to the frame split, see [`valid`]).
+    pub valid_groups: Vec<String>,
     /// Training frames the balance cap left out ([`Balance::cap_dominant`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub balance_dropped: usize,
@@ -857,6 +863,22 @@ fn frame_key(s: &Source, f: &Frame) -> String {
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// The `camera/day` group of a frame (held-out and validation splits).
+fn group_key(f: &Frame) -> String {
+    format!("{}/{}", f.camera, f.day)
+}
+
+/// Boxes per run class of `f`.
+fn class_boxes(f: &Frame, opts: &Options, classes: &[String]) -> Vec<usize> {
+    let mut n = vec![0usize; classes.len()];
+    for (i, _) in mapped_boxes(f, opts, classes) {
+        if let Some(c) = n.get_mut(i) {
+            *c += 1;
+        }
+    }
+    n
 }
 
 /// Hex SHA-256 of `keys` sorted, one per line (the held-out set's identity; empty set = the hash
@@ -944,10 +966,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         let mut groups: BTreeMap<String, Vec<FrameRef>> = BTreeMap::new();
         for &r in &review {
             if let Some(f) = frame(r) {
-                groups
-                    .entry(format!("{}/{}", f.camera, f.day))
-                    .or_default()
-                    .push(r);
+                groups.entry(group_key(f)).or_default().push(r);
             }
         }
         if groups.len() >= 2 {
@@ -1083,59 +1102,11 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     }
     let mut pool: Vec<FrameRef> = pos.into_iter().chain(neg).collect();
     pool.sort_unstable();
-    // 6. Validation (the trainer's checkpoint choice): `val_share` of the review frames of the
-    // pool when there are any (else of the pool), never a frame holding the last training box of
-    // a class (so at least one positive frame stays in training). The size is a share of the
-    // frames it is taken from: a share of the whole pool, public frames included, once took
-    // every review frame, so a class only the review frames have was never trained.
-    let key = |r: &FrameRef| rank(opts.seed ^ 0x5eed, &key_of(*r));
-    let mut cands: Vec<FrameRef> = pool
-        .iter()
-        .copied()
-        .filter(|r| sources.get(r.0).is_some_and(|s| s.public.is_none()))
-        .collect();
-    if cands.is_empty() {
-        cands = pool.clone();
-    }
-    cands.sort_by_key(key);
-    let n_val = if cands.len() >= 2 {
-        let wanted = share_of(cands.len(), opts.val_share).max(opts.min_valid.min(cands.len() / 4));
-        wanted.clamp(1, cands.len() - 1)
-    } else {
-        0
-    };
-    let boxes_per_class = |r: FrameRef| -> Vec<usize> {
-        let mut n = vec![0usize; p.classes.len()];
-        if let Some(f) = frame(r) {
-            for (i, _) in mapped_boxes(f, opts, &p.classes) {
-                if let Some(c) = n.get_mut(i) {
-                    *c += 1;
-                }
-            }
-        }
-        n
-    };
-    let mut left = vec![0usize; p.classes.len()];
-    for &r in &pool {
-        for (l, n) in left.iter_mut().zip(boxes_per_class(r)) {
-            *l += n;
-        }
-    }
-    let mut valid: Vec<FrameRef> = Vec::new();
-    for r in cands {
-        if valid.len() >= n_val {
-            break;
-        }
-        let need = boxes_per_class(r);
-        if need.iter().zip(&left).any(|(n, l)| *n > 0 && l <= n) {
-            continue;
-        }
-        for (l, n) in left.iter_mut().zip(&need) {
-            *l -= n;
-        }
-        valid.push(r);
-    }
-    valid.sort_unstable();
+    // 6. Validation (the trainer's checkpoint choice).
+    let split = valid::pick_valid_groups(sources, &pool, opts, &p.classes);
+    let valid = split.frames;
+    p.stats.valid_groups = split.groups;
+    p.warnings.extend(split.warning);
     if valid.is_empty() {
         p.warnings.push(
             "too few frames for a validation split: the trainer validates on its training frames"
@@ -1169,7 +1140,10 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                         .unwrap_or_else(|| UNKNOWN.into()),
                     camera: f.map(|f| f.camera.clone()).unwrap_or_default(),
                     day: f.map(|f| f.day.clone()).unwrap_or_default(),
-                    boxes: boxes_per_class(r),
+                    boxes: f.map_or_else(
+                        || vec![0; p.classes.len()],
+                        |f| class_boxes(f, opts, &p.classes),
+                    ),
                     hard_negative: f.is_some_and(|f| f.hard_negative),
                 }
             })
@@ -1257,7 +1231,11 @@ pub struct Prepared {
     pub classes: Vec<String>,
     /// Training image entries (repeats counted).
     pub train_images: usize,
+    /// Unique training frames (repeats counted once).
+    pub train_frames: usize,
     pub valid_images: usize,
+    /// [`Stats::valid_groups`].
+    pub valid_groups: Vec<String>,
     /// The held-out benchmark set (`dir:<path>`), when frames were held out.
     pub heldout_dir: Option<PathBuf>,
     pub heldout_images: usize,
@@ -1279,6 +1257,8 @@ pub struct Summary<'a> {
     pub sources: Vec<SourceSummary>,
     pub stats: &'a Stats,
     pub train_images: usize,
+    /// Unique training frames (repeats counted once).
+    pub train_frames: usize,
     pub valid_images: usize,
     pub heldout_images: usize,
     pub heldout_fingerprint: &'a str,
@@ -1581,6 +1561,7 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         sources: sources_summary,
         stats: &plan.stats,
         train_images: train_entries.len(),
+        train_frames: plan.train.len(),
         valid_images: valid_entries.len(),
         heldout_images: plan.heldout.len(),
         heldout_fingerprint: &plan.heldout_fingerprint,
@@ -1592,7 +1573,9 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         dir: out.to_path_buf(),
         classes: classes.clone(),
         train_images: train_entries.len(),
+        train_frames: plan.train.len(),
         valid_images: valid_entries.len(),
+        valid_groups: plan.stats.valid_groups.clone(),
         heldout_dir,
         heldout_images: plan.heldout.len(),
         heldout_fingerprint: plan.heldout_fingerprint.clone(),

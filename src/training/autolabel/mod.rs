@@ -18,11 +18,15 @@
 //!   default it labels unreviewed frames (first-pass labelling); with `status=any` it is the
 //!   self-training loop: frames whose reviewed labels it disagrees with (a new box, a missed
 //!   box, a class change at IoU 0.5) go back to review with a `disagreement` note, which the
-//!   Review queue sorts first.
+//!   Review queue sorts first. With `missing_only` it looks for real objects without a label on
+//!   reviewed frames and nothing else: frames the model trained on are left out
+//!   ([`trained_frames`]), only a new object reopens a frame ([`triage::apply_missing`]), no
+//!   `auto_run` marker is written (several models can run in turn, and a rerun re-detects).
 //!
-//! The service owns every label-file write ([`crate::collect::labels::merge_proposals`]); the
-//! Python side only returns proposals as JSONL. Nothing is deleted or accepted automatically:
-//! hard negatives come from the reviewer only.
+//! The service owns every label-file write ([`crate::collect::labels::merge_proposals`],
+//! [`triage::apply_missing`]); the Python side only returns proposals as JSONL. Nothing is accepted
+//! automatically, and hard negatives come from the reviewer: `apply_missing` removes rejected boxes
+//! only when no reviewer judged them.
 //!
 //! - [`catalog`]: the class catalog of the Review page's picker, [`catalog::coco_class`] and
 //!   the classes the enabled models report.
@@ -45,15 +49,18 @@ use crate::collect::labels::queue::Filters;
 use crate::config::Config;
 use crate::resources::catalog::{self as res_catalog, Platform, Resource};
 use crate::resources::export::train::{self as env, TrainPaths};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 /// Default most frames of one run.
 pub const DEFAULT_LIMIT: usize = 200;
 /// Most frames of one run.
 pub const MAX_LIMIT: usize = 20_000;
+/// Threshold of a `missing_only` run that leaves it at [`models::DEFAULT_THRESHOLD`]: every box it
+/// proposes reopens a reviewed frame, so it should be a sure one.
+pub const MISSING_THRESHOLD: f32 = 0.5;
 
 /// Prompt phrases of the default classes (`training.synonyms` adds or replaces entries).
 pub const DEFAULT_SYNONYMS: [(&str, &[&str]); 14] = [
@@ -343,6 +350,10 @@ pub struct AutolabelRequest {
     /// Pre-accept `with_model`'s boxes at this score or more (None = every box `review`).
     #[serde(default)]
     pub model_accept_score: Option<f32>,
+    /// Only look for real objects with no label on reviewed frames, with `with_model`
+    /// ([`triage::apply_missing`], [`plan_autolabel`] sets the frames it needs).
+    #[serde(default)]
+    pub missing_only: bool,
     /// The user confirmed a restrictive (non-commercial / personal use) licence of a catalog
     /// model the run installs or adds.
     #[serde(default)]
@@ -399,6 +410,7 @@ impl AutolabelRequest {
             device: None,
             gpu: None,
             model_accept_score: None,
+            missing_only: false,
             confirm_license: false,
             gdino_threshold: 0.2,
             rfdetr_threshold: 0.3,
@@ -425,6 +437,18 @@ impl AutolabelRequest {
         }
         if self.with_model.is_none() && self.gdino.is_none() && !self.rfdetr {
             bail!("no labeler: enable MM-Grounding-DINO or RF-DETR, or pass --with-model");
+        }
+        if self.missing_only && self.with_model.is_none() {
+            bail!(
+                "finding missing labels needs a trained model to look with: add --with-model \
+                 <name> (Training page: Label with a model)"
+            );
+        }
+        if self.missing_only && self.model_accept_score.is_some() {
+            bail!(
+                "finding missing labels pre-accepts nothing, you check every box it proposes: \
+                 remove --accept-score-model (on the pages: leave Pre-accept empty)"
+            );
         }
         if let Some(v) = self.model_accept_score {
             if self.with_model.is_none() {
@@ -497,13 +521,28 @@ impl AutolabelRequest {
 }
 
 /// Plan an auto-label run of `request` on `config` (fails fast on a bad filter, an unknown
-/// model, a missing GPU or a large download that was not allowed).
+/// model, a missing GPU or a large download that was not allowed). A `missing_only` run looks at
+/// every status and every frame of the folder (`status=any`, `source=all`: the job keeps
+/// [`triage::missing_scope`]; the default `unreviewed`, or the Review page's `source=queue`,
+/// would miss the reviewed frames), and the default limit and threshold become [`MAX_LIMIT`] and
+/// [`MISSING_THRESHOLD`] (any other value is used as given).
 pub fn plan_autolabel(
     config: &Config,
     mut request: AutolabelRequest,
     cap: &Capability,
 ) -> Result<AutolabelJob> {
     request.validate()?;
+    if request.missing_only {
+        let query = &mut request.frames.query;
+        query.insert("status".into(), "any".into());
+        query.insert("source".into(), "all".into());
+        if request.frames.limit == DEFAULT_LIMIT {
+            request.frames.limit = MAX_LIMIT;
+        }
+        if (request.threshold - models::DEFAULT_THRESHOLD).abs() < f32::EPSILON {
+            request.threshold = MISSING_THRESHOLD;
+        }
+    }
     let classes = without_hidden(
         run_classes(&config.collect.classes, request.classes.as_deref())?,
         &config.collect.hidden_classes,
@@ -566,6 +605,90 @@ pub fn plan_autolabel(
         after: None,
         finish: None,
     })
+}
+
+/// The frame of a `train.txt` line (`./images/s0-day.back.2026-10-25.<stem>.jpg`): the file name
+/// [`crate::training::dataset`] gives it without its `s<N>-` source prefix, as an export's flat
+/// name. None: not a frame of a dataset folder (a public image).
+fn trained_frame(line: &str) -> Option<String> {
+    let name = line.trim().rsplit('/').next()?;
+    let (source, flat) = name.strip_prefix('s')?.split_once('-')?;
+    if source.is_empty() || !source.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(crate::collect::labels::export::parse_flat_name(flat)?.jpg())
+}
+
+/// The frames `model` trained on (`<scene>/<camera>/<date>/<stem>.jpg`, each once, however often
+/// balancing repeated it): its `<stem>.provenance.json` beside the model file names the run, whose
+/// `<training dir>/<run_id>/data/train.txt` lists them. Validation and held-out frames are not in
+/// that list. A model without the record (a catalog or plain local model) trained on nothing of
+/// here as far as anyone can tell: a warning, no frames. A record that does not read, or a run
+/// whose list is gone, is an error: the frames cannot be left out, and the model would be asked
+/// about what it memorised.
+pub fn trained_frames(
+    config: &Config,
+    model: &crate::config::ModelConfig,
+    warnings: &mut Vec<String>,
+) -> Result<BTreeSet<String>> {
+    #[derive(Deserialize)]
+    struct Record {
+        run_id: String,
+    }
+    let name = model.effective_name();
+    let path = config.data_path(&model.path);
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let record = path.with_file_name(format!("{}.provenance.json", stem.unwrap_or_default()));
+    let text = match std::fs::read_to_string(&record) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push(no_training_record(&name));
+            return Ok(BTreeSet::new());
+        }
+        t => t.with_context(|| format!("reading {}", record.display()))?,
+    };
+    let run = serde_json::from_str::<Record>(&text)
+        .ok()
+        .map(|r| r.run_id)
+        .filter(|id| models::plain_file(id))
+        .ok_or_else(|| {
+            anyhow!(
+                "{} names no training run, so the frames {name} trained on cannot be left out; \
+                 restore the file, or choose another model",
+                record.display()
+            )
+        })?;
+    let list = super::training_dir(config)
+        .join(&run)
+        .join("data")
+        .join("train.txt");
+    let text = std::fs::read_to_string(&list).map_err(|e| {
+        anyhow!(
+            "{name} was trained in run {run}, but its frame list {} does not read ({e}), so the \
+             frames it trained on cannot be left out; restore that run folder, or choose a model \
+             whose run folder still exists",
+            list.display()
+        )
+    })?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let frames: BTreeSet<String> = lines.iter().filter_map(|l| trained_frame(l)).collect();
+    let other = lines.iter().filter(|l| trained_frame(l).is_none()).count();
+    if other > 0 {
+        warnings.push(format!(
+            "{other} of the {} lines of {} name no frame of a dataset folder (public images, or a \
+             name cut short); a frame among them is not left out",
+            lines.len(),
+            list.display()
+        ));
+    }
+    Ok(frames)
+}
+
+/// The warning of a model without a training record ([`trained_frames`]).
+pub(crate) fn no_training_record(name: &str) -> String {
+    format!(
+        "{name} has no training record (<model>.provenance.json), so no frame is left out as \
+         trained on; if it did train on these frames, expect few real finds"
+    )
 }
 
 /// [`super::task::Task::skip_reason`] of a run after an import that wrote no frame.
@@ -707,6 +830,22 @@ pub fn default_status(_with_model: bool) -> &'static str {
 mod tests {
     use super::*;
 
+    use std::path::Path;
+
+    struct Tmp(std::path::PathBuf);
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let d = std::env::temp_dir().join(format!("bop-autolabel-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        Tmp(d)
+    }
+
     #[test]
     fn frame_filters_parse_with_defaults() {
         let f = FrameFilter::parse("", "unreviewed").unwrap();
@@ -776,6 +915,145 @@ mod tests {
             let e = m.validate().unwrap_err().to_string();
             assert!(e.contains("VLM minimum score"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn missing_only_needs_a_model_and_refuses_a_pre_accept() {
+        let mut r = AutolabelRequest::new(FrameFilter::default());
+        assert!(!r.missing_only);
+        // Saved before the option existed (tasks.json).
+        let mut old = serde_json::to_value(&r).unwrap();
+        assert!(
+            old.as_object_mut()
+                .unwrap()
+                .remove("missing_only")
+                .is_some()
+        );
+        assert_eq!(serde_json::from_value::<AutolabelRequest>(old).unwrap(), r);
+        r.missing_only = true;
+        let e = r.validate().unwrap_err().to_string();
+        assert!(e.contains("--with-model"), "{e}");
+        r.with_model = Some("m".into());
+        assert!(r.validate().is_ok());
+        r.model_accept_score = Some(0.8);
+        let e = r.validate().unwrap_err().to_string();
+        assert!(e.contains("--accept-score-model"), "{e}");
+    }
+
+    #[test]
+    fn train_lines_map_to_frames() {
+        assert_eq!(
+            trained_frame("./images/s0-day.back.2026-10-25.20261026T003155612Z_2e444695.jpg\n")
+                .as_deref(),
+            Some("day/back/2026-10-25/20261026T003155612Z_2e444695.jpg")
+        );
+        assert_eq!(
+            trained_frame("./images/s12-ir.a-b_c.2026-01-02.x-1.jpg").as_deref(),
+            Some("ir/a-b_c/2026-01-02/x-1.jpg")
+        );
+        for other in [
+            "./images/s0-img_001.jpg",
+            "./images/sx-day.back.2026-10-25.a.jpg",
+            "./images/s-day.back.2026-10-25.a.jpg",
+            "./images/day.back.2026-10-25.a.jpg",
+            "./images/s0-day.back.2026-10-25.a",
+            "",
+        ] {
+            assert_eq!(trained_frame(other), None, "{other}");
+        }
+    }
+
+    /// `Config` with a model `night` under `root` and its provenance, whose run is `run_id`.
+    fn trained_setup(root: &Path, run_id: &str) -> (Config, crate::config::ModelConfig) {
+        let config = Config {
+            download_dir: Some(root.to_path_buf()),
+            ..Config::default()
+        };
+        let entry = crate::config::ModelConfig {
+            name: Some("night".into()),
+            path: "models/night.onnx".into(),
+            ..crate::config::ModelConfig::default()
+        };
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // Only `run_id` is read: a record of another version still works.
+        std::fs::write(
+            models.join("night.provenance.json"),
+            serde_json::json!({"version": 9, "run_id": run_id}).to_string(),
+        )
+        .unwrap();
+        (config, entry)
+    }
+
+    #[test]
+    fn trained_frames_come_from_the_runs_list_each_once() {
+        let t = tmp("trained");
+        let (config, entry) = trained_setup(&t.0, "20261031-1");
+        let data = crate::training::training_dir(&config)
+            .join("20261031-1")
+            .join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // Repeats from balancing, two sources, a public image.
+        std::fs::write(
+            data.join("train.txt"),
+            "./images/s0-day.back.2026-10-25.a.jpg\n\
+             ./images/s0-day.back.2026-10-25.a.jpg\n\
+             ./images/s1-ir.gate.2026-10-26.b.jpg\n\
+             ./images/s1-ir.gate.2026-10-26.b.jpg\n\
+             ./images/s2-coco_0001.jpg\n",
+        )
+        .unwrap();
+        // valid.txt is not read: those frames stay eligible.
+        std::fs::write(
+            data.join("valid.txt"),
+            "./images/s0-day.back.2026-10-25.v.jpg\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let got = trained_frames(&config, &entry, &mut warnings).unwrap();
+        let want: BTreeSet<String> = [
+            "day/back/2026-10-25/a.jpg".to_string(),
+            "ir/gate/2026-10-26/b.jpg".to_string(),
+        ]
+        .into();
+        assert_eq!(got, want);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("1 of the 5 lines"), "{warnings:?}");
+    }
+
+    #[test]
+    fn no_record_warns_and_a_lost_list_or_a_bad_record_refuses() {
+        let t = tmp("trained-gone");
+        let (config, entry) = trained_setup(&t.0, "20261031-1");
+        // Provenance, no train.txt.
+        let mut warnings = Vec::new();
+        let e = trained_frames(&config, &entry, &mut warnings)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("20261031-1") && e.contains("train.txt") && e.contains("restore"),
+            "{e}"
+        );
+        assert!(warnings.is_empty());
+        // A run id that leaves the training folder, or no run id.
+        for bad in [
+            serde_json::json!({"run_id": "../../secrets"}).to_string(),
+            serde_json::json!({"run_id": ""}).to_string(),
+            serde_json::json!({"name": "x"}).to_string(),
+            "not json".to_string(),
+        ] {
+            std::fs::write(t.0.join("models/night.provenance.json"), &bad).unwrap();
+            let e = trained_frames(&config, &entry, &mut warnings)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("names no training run"), "{bad}: {e}");
+        }
+        // No record at all.
+        std::fs::remove_file(t.0.join("models/night.provenance.json")).unwrap();
+        let got = trained_frames(&config, &entry, &mut warnings).unwrap();
+        assert!(got.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("no training record"), "{warnings:?}");
     }
 
     #[test]

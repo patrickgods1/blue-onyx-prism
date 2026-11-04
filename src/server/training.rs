@@ -1403,8 +1403,8 @@ const LR_GROUPS: [(catalog::TrainFamily, &str); 3] = [
     (catalog::TrainFamily::Rtdetrv2, "RT-DETRv2 / D-FINE"),
 ];
 
-/// "YOLO: auto (optimizer picks); RF-DETR: 1e-4 (5e-5 under 1000 images); RT-DETRv2 / D-FINE:
-/// 1e-4".
+/// "YOLO: auto (optimizer picks); RF-DETR: 1e-4 (5e-5 under 1000 unique frames); RT-DETRv2 /
+/// D-FINE: 1e-4".
 fn lr_defaults_text() -> String {
     LR_GROUPS
         .iter()
@@ -3938,7 +3938,7 @@ mod tests {
         // The learning rate: the family defaults in the recommendation, on every size checkbox
         // (the placeholder follows the ticked family) and in the hints.
         assert!(page.contains("100 ep \u{b7} patience 15 \u{b7} lr auto (optimizer picks)"));
-        assert!(page.contains("lr 1e-4 (5e-5 under 1000 images)"));
+        assert!(page.contains("lr 1e-4 (5e-5 under 1000 unique frames)"));
         assert!(page.contains(
             "value=\"yolo26n\" aria-label=\"yolo26n\" data-default-lr=\"auto (optimizer picks)\""
         ));

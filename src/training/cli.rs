@@ -101,8 +101,8 @@ pub enum TrainCommand {
         #[arg(long)]
         imgsz: Option<u32>,
         /// Learning rate (default: config `training.lr`, else the family's: YOLO auto (the
-        /// optimizer picks), RF-DETR 1e-4 (5e-5 under 1000 training images), RT-DETRv2 / D-FINE
-        /// 1e-4).
+        /// optimizer picks), RF-DETR 1e-4 (5e-5 under 1000 unique training frames), RT-DETRv2 /
+        /// D-FINE 1e-4).
         #[arg(long)]
         lr: Option<f32>,
         /// Learning-rate schedule: cosine, linear or step (default: config
@@ -390,6 +390,13 @@ pub struct AutolabelArgs {
     /// night / IR person and animal boxes stay in review. Default off (every box reviewed).
     #[arg(long)]
     pub accept_score_model: Option<f32>,
+    /// With --with-model: only propose real objects that have no label on reviewed frames, for you
+    /// to check. Frames the model trained on are left out; a frame goes back to review only when
+    /// it gains a box, and leaves exports until you save it again. Looks at every frame (--frames
+    /// status and source are ignored); a --threshold of 0.3 means 0.5 and a limit of 200 means
+    /// 20000. Run it once per model.
+    #[arg(long)]
+    pub missing_only: bool,
     /// Confirm the licence of a non-commercial / personal-use catalog model --with-model
     /// installs or adds.
     #[arg(long)]
@@ -480,6 +487,7 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
     r.device = a.device.clone();
     r.gpu = a.gpu.clone();
     r.model_accept_score = a.accept_score_model;
+    r.missing_only = a.missing_only;
     r.confirm_license = a.confirm_license;
     r.classes = (!a.classes.is_empty()).then(|| a.classes.clone());
     r.allow_large = a.allow_large;
@@ -831,6 +839,9 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
                 prepared.heldout_images,
                 prepared.classes.join(", ")
             );
+            if let Some(t) = dataset::valid_groups_text(&prepared.valid_groups) {
+                println!("{t}");
+            }
             if let Some(b) = &prepared.balance_summary {
                 println!("balanced: {b}");
             }
@@ -1480,6 +1491,9 @@ pub fn dry_run_text(plan: &dataset::Plan, balance: &dataset::Balance) -> String 
         plan.heldout.len(),
         plan.classes.join(", ")
     ));
+    if let Some(t) = dataset::valid_groups_text(&plan.stats.valid_groups) {
+        out.push_str(&format!("{t}\n"));
+    }
     let Some(r) = &plan.balance else {
         if !plan.stats.train_boxes.is_empty() {
             out.push_str("training boxes per class:\n");
@@ -1835,6 +1849,13 @@ mod tests {
         assert_eq!(r.model_accept_score, Some(0.8));
         assert!(r.confirm_license);
         assert_eq!(r.frames.query["status"], "any");
+        assert!(!r.missing_only);
+        let TrainCommand::Autolabel(m) =
+            parse(&["autolabel", "--with-model", "m", "--missing-only"]).unwrap()
+        else {
+            panic!()
+        };
+        assert!(autolabel_request(&m).unwrap().missing_only);
         for bad in [
             &[
                 "autolabel",
@@ -1846,6 +1867,15 @@ mod tests {
             &["autolabel", "--with-model", "m", "--device", "tpu"],
             &["autolabel", "--accept-score-model", "0.8"],
             &["autolabel", "--device", "openvino:cpu"],
+            &["autolabel", "--missing-only"],
+            &[
+                "autolabel",
+                "--with-model",
+                "m",
+                "--missing-only",
+                "--accept-score-model",
+                "0.8",
+            ],
         ] {
             let TrainCommand::Autolabel(b) = parse(bad).unwrap() else {
                 panic!()
@@ -2329,9 +2359,14 @@ mod tests {
             heldout: vec![(0, 2); 40],
             warnings: vec!["few unique frames".into()],
             balance: Some(report),
+            stats: dataset::Stats {
+                valid_groups: vec!["yard/2026-10-01".into()],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let t = dry_run_text(&plan, &balance);
+        assert!(t.contains("validation on 1 camera day(s) kept out of training: yard/2026-10-01"));
         assert!(
             t.contains("200 training frames, 20 validation, 40 held-out"),
             "{t}"
