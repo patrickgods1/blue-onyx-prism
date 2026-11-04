@@ -200,6 +200,7 @@ pub const METRICS: &[MetricInfo] = {
         m("map50", "mAP 50", "mAP50", UP, Fixed3),
         m("map75", "mAP 75", "mAP75", UP, Fixed3),
         m("mar", "mAR (max detections)", "mAR", UP, Fixed3),
+        m("iou", "Mean IoU of matched boxes", "IoU", UP, Fixed3),
         m(
             "precision",
             "Precision (at the best F1 threshold)",
@@ -1507,6 +1508,7 @@ mod tests {
             ("eval_map_50", "map50"),
             // the script's own
             ("f2", "f2"),
+            ("iou", "iou"),
             ("f2_thr", "f2_thr"),
             ("mem_gb", "mem_gb"),
             ("img_s", "img_s"),
@@ -1534,6 +1536,28 @@ mod tests {
         let lr = METRICS.iter().position(|m| m.id == "lr").unwrap();
         assert_eq!(j[lr]["format"], "sci");
         assert!(j[lr]["higher_better"].is_null());
+    }
+
+    /// `iou` lands in the history and never decides the best epoch or the convergence rule.
+    #[test]
+    fn mean_iou_is_shown_but_decides_nothing() {
+        let mut p = TrainProgress::default();
+        p.apply(&epoch(1, &[("val/mAP_50_95", 0.5), ("iou", 0.9)]), 10.0);
+        p.apply(&epoch(2, &[("val/mAP_50_95", 0.6), ("iou", 0.7)]), 20.0);
+        assert_eq!(p.history[0].metrics["iou"], 0.9);
+        assert_eq!(p.history[1].metrics["iou"], 0.7);
+        assert_eq!(
+            p.best,
+            Some(Best {
+                metric: "map".into(),
+                epoch: 2,
+                value: 0.6
+            })
+        );
+        // Only an `iou`: no best epoch.
+        let mut p = TrainProgress::default();
+        p.apply(&epoch(1, &[("iou", 0.9)]), 10.0);
+        assert_eq!(p.best, None);
     }
 
     #[test]
@@ -2302,6 +2326,147 @@ print(json.dumps({"runs": out, "falling": falling, "finish": fin, "anneal_finish
         let falling: Vec<bool> = serde_json::from_value(v["falling"].clone()).unwrap();
         let want: Vec<bool> = loss_cases().iter().map(|(l, _)| loss_falling(l)).collect();
         assert_eq!(falling, want);
+    }
+
+    /// The script's `match_detections(..., ious=)` on hand-computed boxes (a partial overlap, a
+    /// box of exactly 0.5, one below it, a wrong class, two predictions on one ground truth), its
+    /// return value unchanged, `mean_iou`, `IouMeter` and the trainer hooks' box readers (skipped
+    /// without Python 3 or numpy).
+    #[test]
+    fn mean_iou_matches_hand_computed_boxes() {
+        let script = include_str!("../../scripts/train_model.py");
+        let code = r#"
+import json, sys
+try:
+    import numpy as np
+except ImportError:
+    print("null")
+    sys.exit(0)
+ns = {"__name__": "train_model"}
+exec(compile(sys.stdin.read(), "train_model.py", "exec"), ns)
+logs = []
+ns["log"] = logs.append
+
+def boxes(rows):
+    return np.array(rows, dtype=np.float64).reshape(-1, 4)
+
+def labels(rows):
+    return np.array(rows, dtype=np.int64)
+
+def scores(rows):
+    return np.array(rows, dtype=np.float64)
+
+preds = [
+    # The 0.9 box takes the ground truth (IoU 0.8); the better 0.5 box finds it used. The 0.8 box
+    # sits exactly on the class 1 ground truth under the wrong class. The class 1 box is at 0.4.
+    (boxes([[0, 0, 10, 8], [0, 0, 10, 10], [20, 0, 30, 10], [20, 0, 30, 4]]), labels([0, 0, 0, 1]),
+     scores([0.9, 0.5, 0.8, 0.7])),
+    # IoU 0.6.
+    (boxes([[0, 0, 10, 6]]), labels([1]), scores([0.6])),
+    # Exactly the threshold, IoU 0.5.
+    (boxes([[0, 0, 10, 5]]), labels([0]), scores([0.4])),
+    # No ground truth in this image.
+    (boxes([[0, 0, 10, 10]]), labels([0]), scores([0.9])),
+    # No prediction in this image.
+    (boxes([]), labels([]), scores([])),
+]
+gts = [
+    (boxes([[0, 0, 10, 10], [20, 0, 30, 10]]), labels([0, 1])),
+    (boxes([[0, 0, 10, 10]]), labels([1])),
+    (boxes([[0, 0, 10, 10]]), labels([0])),
+    (boxes([]), labels([])),
+    (boxes([[0, 0, 10, 10]]), labels([0])),
+]
+ious = []
+with_ious = ns["match_detections"](preds, gts, ious=ious)
+plain = ns["match_detections"](preds, gts)
+same = sorted(with_ious) == sorted(plain) and all(
+    np.array_equal(with_ious[c][0], plain[c][0]) and np.array_equal(with_ious[c][1], plain[c][1])
+    and with_ious[c][2] == plain[c][2] for c in plain)
+mean = ns["mean_iou"](ious)
+
+meter = ns["IouMeter"]()
+meter.add(lambda: (preds, gts))
+ok = meter.take()
+after_take = meter.take()
+def broken():
+    raise KeyError("conf")
+meter.add(lambda: (preds, gts))
+meter.add(broken)
+meter.add(broken)
+meter.add(lambda: (preds, gts))
+failed = meter.take()
+
+# Stand-in tensor.
+class T:
+    def __init__(self, a):
+        self.a = np.array(a)
+    def detach(self):
+        return self
+    def float(self):
+        return T(self.a.astype(np.float32))
+    def cpu(self):
+        return self
+    def numpy(self):
+        return self.a
+
+pred = {"bboxes": T([[0, 0, 10, 8]]), "cls": T([2]), "conf": T([0.9])}
+yolo = []
+ns["match_detections"](*ns["ultralytics_boxes"](pred, {"bboxes": T([[0, 0, 10, 10]]), "cls": T([2])}), ious=yolo)
+pred = {"boxes": T([[0, 0, 10, 8], [0, 0, 10, 6]]), "labels": T([2, 2]), "scores": T([0.9, 0.8])}
+rfdetr = []
+ns["match_detections"](*ns["rfdetr_boxes"]([pred], [{"boxes": T([[0, 0, 10, 10]]), "labels": T([2])}]), ious=rfdetr)
+print(json.dumps({"ious": ious, "same": same, "mean": mean["iou"], "empty": ns["mean_iou"]([]), "ok": ok["iou"],
+                  "after_take": after_take, "failed": failed, "logs": logs, "yolo": yolo, "rfdetr": rfdetr}))
+"#;
+        let Some(python) = python3() else {
+            eprintln!("no Python 3 found; mean IoU test skipped");
+            return;
+        };
+        let mut child = std::process::Command::new(python)
+            .args(["-I", "-c", code])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(script.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{python} failed");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if v.is_null() {
+            eprintln!("{python} has no numpy; mean IoU test skipped");
+            return;
+        }
+        let close = |got: &serde_json::Value, want: f64, what: &str| {
+            let got = got.as_f64().unwrap();
+            assert!((got - want).abs() < 1e-6, "{what}: {got} != {want}");
+        };
+        let ious = v["ious"].as_array().unwrap();
+        assert_eq!(ious.len(), 3, "{ious:?}");
+        for (got, want) in ious.iter().zip([0.8, 0.6, 0.5]) {
+            close(got, want, "matched IoU");
+        }
+        assert_eq!(v["same"], true);
+        close(&v["mean"], (0.8 + 0.6 + 0.5) / 3.0, "mean");
+        assert_eq!(v["empty"], serde_json::json!({}));
+        close(&v["ok"], (0.8 + 0.6 + 0.5) / 3.0, "meter");
+        // Reading empties the meter; a failed read logs once and leaves the metric out.
+        assert_eq!(v["after_take"], serde_json::json!({}));
+        assert_eq!(v["failed"], serde_json::json!({}));
+        assert_eq!(v["logs"].as_array().unwrap().len(), 1, "{}", v["logs"]);
+        assert!(
+            v["logs"][0].as_str().unwrap().contains("mean IoU skipped"),
+            "{}",
+            v["logs"]
+        );
+        // The hooks' readers: both hand over boxes, classes and scores.
+        close(&v["yolo"][0], 0.8, "ultralytics_boxes");
+        assert_eq!(v["rfdetr"].as_array().unwrap().len(), 1);
+        close(&v["rfdetr"][0], 0.8, "rfdetr_boxes");
     }
 
     /// The script's memory gate before the export (`memory_shortfall`, `wait_for_memory` with a

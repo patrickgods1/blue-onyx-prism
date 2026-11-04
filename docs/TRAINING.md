@@ -634,14 +634,21 @@ own key, plus the script's own:
 | RF-DETR (rfdetr 1.11 Lightning `callback_metrics`) | `val/mAP_50_95`, `val/mAP_50`, `val/mAP_75`, `val/mAR` (the EMA model by default), `val/ema_*`, `val/F1`, `val/precision`, `val/recall` (at the best macro-F1 confidence), `train/loss`, `train/lr`, `train/loss_ce`, ... |
 | Ultralytics (`trainer.metrics`, `tloss`, `lr`) | `metrics/mAP50-95(B)`, `metrics/mAP50(B)`, `metrics/precision(B)`, `metrics/recall(B)`, `val/box_loss`, `train/cls_loss`, `lr/pg0`, ...; `val_loss` = the sum of the `val/*_loss` |
 | transformers (RT-DETRv2, D-FINE) | `eval_loss`, `learning_rate`, and a detection evaluation after each `evaluate` (an extra pass over the validation split): mAP 50-95 / 50 / 75 and mAR@100 with torchmetrics (COCO rules), P / R / F-beta from a greedy IoU-0.5 matching swept over 101 confidences |
-| all (the script) | `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`, `f0_5`, `f0_5_thr`, ...: macro F-beta (`(1+b^2)PR/(b^2P+R)` per class, averaged over the classes with ground truth) at the best confidence of the sweep (rfdetr's own 101-threshold rows, Ultralytics' `p_curve` / `r_curve`); `mem_gb` (peak GPU memory: CUDA `max_memory_reserved`, MPS the driver's allocation sampled after every batch); `img_s` (training images per second, validation excluded) |
+| all (the script) | `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`, `f0_5`, `f0_5_thr`, ...: macro F-beta (`(1+b^2)PR/(b^2P+R)` per class, averaged over the classes with ground truth) at the best confidence of the sweep (rfdetr's own 101-threshold rows, Ultralytics' `p_curve` / `r_curve`); `iou` (mean IoU of the matched boxes, below); `mem_gb` (peak GPU memory: CUDA `max_memory_reserved`, MPS the driver's allocation sampled after every batch); `img_s` (training images per second, validation excluded) |
 
 F2 weighs recall four times precision ("don't miss a person"), F0.5 the other way; the `*_thr` columns
 are a starting confidence threshold for the trained model. NaN, infinite and non-numeric values are
 dropped; at most 64 metrics per epoch (the shortest keys first).
 
+`iou` is the same measurement for every family, taken at each validation on the validator's own
+predictions (all scores, so no confidence threshold): COCO-style greedy matching, highest score first,
+per class, each ground truth matched once, IoU >= 0.5, then the mean IoU of the matched pairs (pooled
+over classes). It measures how tight the boxes are, so it starts at 0.5 and missed objects do not lower
+it: read it alongside recall. YOLO `box_loss` and RF-DETR `loss_giou` are loss terms on other scales and
+not comparable with it. It is display only: the convergence rule, the best epoch and `best` stay on mAP.
+
 The service maps the keys to stable ids (`src/training/progress.rs` `canonical`): `map`, `map50`,
-`map75`, `mar`, `precision`, `recall`, `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`,
+`map75`, `mar`, `iou`, `precision`, `recall`, `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`,
 `f0_5`, `f0_5_thr`, `loss`, `val_loss`, `lr`, `mem_gb`, `img_s`, and `ema_map` ... for rfdetr's
 `val/ema_*`; unknown keys keep their raw name (`val/AP/raccoon`, `train/loss_ce`), so nothing is lost
 when a library renames one. Each run's `progress` in `runs.json` and `GET /v1/training` has
@@ -652,13 +659,13 @@ also has `metrics` (label, short label, `higher_better`, `format` of every id) a
 Records written before this keep loading (no `history`: the page shows no metrics block).
 
 **The metrics view** (Training page, every run with a history, running or finished): KPI tiles
-(epoch, ETA, best primary metric with its epoch, latest loss and validation loss with the change
-from the previous epoch), curves of the losses and of the quality metrics with the best epoch marked,
+(epoch, ETA, best primary metric with its epoch, latest loss, validation loss and mean IoU with the
+change from the previous epoch), curves of the losses and of the quality metrics with the best epoch marked,
 and a per-epoch table, newest first. **Columns** picks the table's columns from every metric in the
 run's history (known ids by label, raw keys by name) and their order; the choice is saved as
 `training.metric_columns` (`POST /v1/training/metric-columns` with `{"columns": [...]}`: at most 20
 distinct names of 1-64 characters, known ids or raw names; answers the saved list, 400 otherwise) and
-applies at once. Empty (the default) = `map, map50, f1, f2, precision, recall, loss`. The raw trainer
+applies at once. Empty (the default) = `map, map50, iou, f1, f2, precision, recall, loss`. The raw trainer
 log is under a closed *Log* disclosure.
 
 ## Comparing day, night/IR and mixed models

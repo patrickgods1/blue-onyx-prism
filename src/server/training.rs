@@ -3093,7 +3093,16 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             v["metric_columns"],
-            serde_json::json!(["map", "map50", "f1", "f2", "precision", "recall", "loss"])
+            serde_json::json!([
+                "map",
+                "map50",
+                "iou",
+                "f1",
+                "f2",
+                "precision",
+                "recall",
+                "loss"
+            ])
         );
         let metrics = v["metrics"].as_array().unwrap();
         assert_eq!(metrics.len(), crate::training::progress::METRICS.len());
@@ -3160,7 +3169,7 @@ mod tests {
         // The default list is stored as empty (not written to the config file).
         let (s, _, _) = call(
             &state,
-            post(r#"{"columns": ["map", "map50", "f1", "f2", "precision", "recall", "loss"]}"#),
+            post(r#"{"columns": ["map", "map50", "iou", "f1", "f2", "precision", "recall", "loss"]}"#),
         )
         .await;
         assert_eq!(s, StatusCode::OK);

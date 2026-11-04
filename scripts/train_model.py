@@ -34,8 +34,8 @@ Progress: every event is one line `@train {json}` on stdout (`start`, `epoch`, `
 `stop`, `phase`, `done`); the service parses them, everything else is log output. `epoch` and `eval` carry
 `metrics`: every scalar metric of the epoch under the trainer's own key (`val/mAP_50_95`,
 `metrics/mAP50(B)`, `eval_loss`, ...) plus this script's `f1`/`f2`/`f0_5` sweeps (`fbeta_sweep`),
-`mem_gb` (peak GPU memory) and `img_s` (training images per second); the service maps the keys to
-stable ids (src/training/progress.rs). Night augmentation
+`iou` (`mean_iou`), `mem_gb` (peak GPU memory) and `img_s` (training images per second); the service
+maps the keys to stable ids (src/training/progress.rs). Night augmentation
 (`--aug-dark`, `--aug-noise`, `--aug-gray`: per-image probabilities) is applied on the fly to the
 training batches (Ultralytics, transformers) or to one extra copy of each training image chosen by
 those probabilities (rfdetr).
@@ -696,11 +696,12 @@ def fbeta_sweep(prec, rec, thresholds, betas=(0.5, 1.0, 2.0)) -> dict:
     return out
 
 
-def match_detections(preds, gts, iou_thr: float = 0.5):
+def match_detections(preds, gts, iou_thr: float = 0.5, ious: list | None = None):
     """Per-class matching data for a P/R sweep (COCO-style greedy matching at `iou_thr`, by
     score, each ground truth matched once): `preds` / `gts` are per image lists of
     `(boxes [N,4] xyxy, labels [N], scores [N])` / `(boxes, labels)` numpy arrays. Returns
-    `{class: (scores, matched 0/1, ground truth count)}`."""
+    `{class: (scores, matched 0/1, ground truth count)}`; `ious` also receives the IoU of each
+    matched pair."""
     import numpy as np
 
     data: dict[int, list] = {}
@@ -727,9 +728,42 @@ def match_detections(preds, gts, iou_thr: float = 0.5):
                     if iou[k] >= iou_thr:
                         used[k] = True
                         m = 1
+                        if ious is not None:
+                            ious.append(float(iou[k]))
                 d[0].append(float(ps[j]))
                 d[1].append(m)
     return {c: (np.asarray(v[0]), np.asarray(v[1]), v[2]) for c, v in data.items()}
+
+
+def mean_iou(ious) -> dict:
+    """`{"iou": mean}` of the matched pairs' IoUs from [`match_detections`], `{}` without a match.
+    Box tightness only: a missed object does not lower it, so it reads alongside recall. Display
+    only: the convergence rule and the best epoch stay on mAP."""
+    return {"iou": math.fsum(ious) / len(ious)} if ious else {}
+
+
+class IouMeter:
+    """[`mean_iou`] of one validation, fed by a hook inside a trainer: `read()` returns the `preds`
+    and `gts` of [`match_detections`]. A changed library internal is logged once and leaves the
+    metric out; the run goes on."""
+
+    def __init__(self):
+        self.ious, self.failed = [], False
+
+    def add(self, read) -> None:
+        if self.failed:
+            return
+        try:
+            match_detections(*read(), ious=self.ious)
+        except Exception as e:
+            self.failed = True
+            self.ious.clear()
+            log(f"mean IoU skipped ({type(e).__name__}: {e})")
+
+    def take(self) -> dict:
+        m = mean_iou(self.ious)
+        self.ious.clear()
+        return m
 
 
 def pr_sweep(matches: dict, thresholds):
@@ -1215,6 +1249,17 @@ def ultralytics_cache(a):
     return "ram"
 
 
+def numpy_of(t):
+    """A tensor as a float32 numpy array."""
+    return t.detach().float().cpu().numpy()
+
+
+def ultralytics_boxes(preds: dict, batch: dict) -> tuple:
+    """The arguments of [`match_detections`] from the validator's `_process_batch(preds, batch)`."""
+    return ([(numpy_of(preds["bboxes"]), numpy_of(preds["cls"]), numpy_of(preds["conf"]))],
+            [(numpy_of(batch["bboxes"]), numpy_of(batch["cls"]))])
+
+
 def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     import torch
     from ultralytics import YOLO
@@ -1268,6 +1313,7 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         return model
     probs = (a.aug_dark, a.aug_noise, a.aug_gray)
     gen = torch.Generator().manual_seed(a.seed)
+    iou_meter = IouMeter()
 
     base_yolo = YOLO(str(a.weights))
     base_names = em.ultralytics_names(base_yolo)
@@ -1294,6 +1340,21 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
             if any(p > 0 for p in probs):
                 batch["img"] = night_augment(batch["img"], *probs, gen=gen)
             return batch
+
+        def get_validator(self):
+            validator = super().get_validator()
+            orig = getattr(validator, "_process_batch", None)
+            if orig is None:
+                log("mean IoU skipped (no _process_batch in the Ultralytics validator)")
+                return validator
+
+            # Called once per image with both box sets in the model's input pixels.
+            def process_batch(*args, **kw):
+                iou_meter.add(lambda: ultralytics_boxes(*args[:2]))
+                return orig(*args, **kw)
+
+            validator._process_batch = process_batch
+            return validator
 
     os.chdir(a.work)
     weights = a.work / f"base-{a.weights.name}"
@@ -1355,6 +1416,7 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
                 m.pop("recall", None)
         except Exception as e:  # a changed Ultralytics internal: the other metrics still count
             log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
+        m.update(iou_meter.take())
         try:
             images = len(trainer.train_loader.dataset)
         except Exception:
@@ -1557,6 +1619,12 @@ def rfdetr_mapped_checkpoint(a, names: list[str], em) -> Path:
     return out
 
 
+def rfdetr_boxes(preds: list, targets: list) -> tuple:
+    """The arguments of [`match_detections`] from `build_matching_data(preds, targets)`."""
+    return ([(numpy_of(p["boxes"]), numpy_of(p["labels"]), numpy_of(p["scores"])) for p in preds],
+            [(numpy_of(t["boxes"]), numpy_of(t["labels"])) for t in targets])
+
+
 def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     import numpy as np
     import torch
@@ -1597,6 +1665,20 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
 
     if orig_sweep is not None:
         coco_eval.sweep_confidence_thresholds = sweep
+
+    # Its validation matches each batch's boxes for that F1, in original image pixels, once per
+    # batch (`on_validation_batch_end`; the extra EMA pass of `eval_base_model` does not match).
+    iou_meter = IouMeter()
+    orig_matching = getattr(coco_eval, "build_matching_data", None)
+
+    def matching(*args, **kw):
+        iou_meter.add(lambda: rfdetr_boxes(*args[:2]))
+        return orig_matching(*args, **kw)
+
+    if orig_matching is not None:
+        coco_eval.build_matching_data = matching
+    else:
+        log("mean IoU skipped (no build_matching_data in rfdetr)")
 
     conv = convergence(a)
     # The schedule and the final factor of its cosine and of the anneal (the script's defaults:
@@ -1640,6 +1722,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
 
         def on_validation_start(self, trainer, pl_module):
             meter.train_done()
+            iou_meter.take()  # this validation's boxes only (not a sanity check's, the training split's)
 
         def on_validation_end(self, trainer, pl_module):
             # The first training step after the EMA validation is where MPS ran out of memory.
@@ -1655,6 +1738,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             if sweeps["n"] > sweeps["used"]:
                 m.update(sweeps["last"])
                 sweeps["used"] = sweeps["n"]
+            m.update(iou_meter.take())
             m.update(meter.metrics())
             emit_metrics("epoch", m, epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, loss=loss, map50=mp,
                          map=mp95, elapsed_s=round(time.time() - started, 1))
@@ -1722,6 +1806,8 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     pl.Trainer.__init__ = orig_init
     if orig_sweep is not None:
         coco_eval.sweep_confidence_thresholds = orig_sweep
+    if orig_matching is not None:
+        coco_eval.build_matching_data = orig_matching
     ckpt = out_dir / "checkpoint_best_total.pth"
     cfg = out_dir / "training_config.json"
     if not ckpt.is_file() or not cfg.is_file():
@@ -1850,8 +1936,9 @@ def collate(batch):
 
 def detection_metrics(model, ds, proc, batch: int, imgsz: int) -> dict:
     """mAP 50-95 / 50 / 75 and mAR@100 (torchmetrics, COCO rules) plus the macro P / R / F-beta
-    sweep at IoU 0.5 ([`fbeta_sweep`]) of `model` on the prepared validation set `ds`, in the
-    model's input pixels (images are stretched to imgsz x imgsz, the labels are normalized)."""
+    sweep at IoU 0.5 ([`fbeta_sweep`]) and the mean IoU of the matched boxes ([`mean_iou`]) of
+    `model` on the prepared validation set `ds`, in the model's input pixels (images are stretched
+    to imgsz x imgsz, the labels are normalized)."""
     import numpy as np
     import torch
     from torchmetrics.detection import MeanAveragePrecision
@@ -1883,8 +1970,10 @@ def detection_metrics(model, ds, proc, batch: int, imgsz: int) -> dict:
     m = {"map": r["map"], "map50": r["map_50"], "map75": r["map_75"], "mar": r["mar_100"]}
     m = {k: float(v) for k, v in m.items() if float(v) >= 0}  # torchmetrics: -1 = no ground truth
     thresholds = np.linspace(0, 1, 101)
-    prec, rec = pr_sweep(match_detections(preds, gts), thresholds)
+    ious: list = []
+    prec, rec = pr_sweep(match_detections(preds, gts, ious=ious), thresholds)
     m.update(fbeta_sweep(prec, rec, thresholds))
+    m.update(mean_iou(ious))
     return m
 
 

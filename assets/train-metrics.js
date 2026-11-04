@@ -148,7 +148,7 @@
       var bi = info(best.metric);
       box.appendChild(tile("Best " + bi.short, format(bi.format, best.value), "epoch " + best.epoch));
     }
-    [["loss", "Loss"], ["val_loss", "Val loss"]].forEach(function (p) {
+    [["loss", "Loss"], ["val_loss", "Val loss"], ["iou", "Mean IoU"]].forEach(function (p) {
       var lt = lastTwo(history, p[0]);
       if (!has(lt.last)) return;
       var i = info(p[0]);
@@ -201,7 +201,7 @@
   }
 
   // ---- charts ----------------------------------------------------------------------------------
-  var QUALITY = /^(ema_)?(map|map50|map75|mar|precision|recall|f1|f2|f0_5)$/;
+  var QUALITY = /^(ema_)?(map|map50|map75|mar|iou|precision|recall|f1|f2|f0_5)$/;
   function intTick(v) { return String(Math.round(v)); }
   // valFmt (optional): the hover and table text of a value (default: percent with pct, else 4
   // significant digits).

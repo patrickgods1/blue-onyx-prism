@@ -26,8 +26,16 @@ pub const DEFAULT_TIMEOUT_HOURS: u32 = 48;
 /// Most hours of a run.
 pub const MAX_TIMEOUT_HOURS: u32 = 24 * 14;
 /// The Training page's per-epoch table columns when `metric_columns` is empty.
-pub const DEFAULT_METRIC_COLUMNS: [&str; 7] =
-    ["map", "map50", "f1", "f2", "precision", "recall", "loss"];
+pub const DEFAULT_METRIC_COLUMNS: [&str; 8] = [
+    "map",
+    "map50",
+    "iou",
+    "f1",
+    "f2",
+    "precision",
+    "recall",
+    "loss",
+];
 /// Most columns of the per-epoch table.
 pub const MAX_METRIC_COLUMNS: usize = 20;
 /// Most data loader workers `training.workers` may force.
@@ -437,7 +445,16 @@ mod tests {
         let mut c = TrainingConfig::default();
         assert_eq!(
             c.effective_metric_columns(),
-            ["map", "map50", "f1", "f2", "precision", "recall", "loss"]
+            [
+                "map",
+                "map50",
+                "iou",
+                "f1",
+                "f2",
+                "precision",
+                "recall",
+                "loss"
+            ]
         );
         // Not written while empty.
         assert!(
