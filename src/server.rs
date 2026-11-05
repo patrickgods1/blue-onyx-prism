@@ -225,6 +225,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             post(review::reject_stacked).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
         (
+            "/v1/review/restore-reopened",
+            post(review::restore_reopened).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
             "/v1/review/suggest-overlaps",
             post(review::suggest_overlaps).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
@@ -1076,6 +1080,7 @@ mod tests {
             "/v1/review/reject-other-class",
             "/v1/review/reject-unwanted-reviewed",
             "/v1/review/reject-stacked",
+            "/v1/review/restore-reopened",
             "/v1/review/suggest-overlaps",
             "/v1/review/export",
             "/v1/review/import",

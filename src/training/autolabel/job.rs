@@ -19,7 +19,11 @@
 //! A cancel while labelling with [`AutolabelRequest::keep_on_cancel`] (the default) is not a
 //! failure: the frames finished so far (the script's flushed `proposals.jsonl`, the model's
 //! finished frames) go through the same triage and write stage, markers included, and the run
-//! returns `Ok` with a "stopped by Cancel" summary; a rerun skips them by their marker.
+//! returns `Ok` with a "stopped by Cancel" summary; a rerun skips them by their marker. A labelers
+//! run that fails writes its finished frames the same way, then still fails, saying how many it
+//! saved ([`AutolabelJob::failed_run`]). A labelers run writes through
+//! [`triage::apply_labelers`], decided per frame under the label write lock, so reviewed frames
+//! only reopen for confident new objects and their decided boxes change by nothing but votes.
 
 use super::models::{self, ConfigWriter, Install, ModelPlan, Target};
 use super::relabel::{Detector, Image};
@@ -109,7 +113,7 @@ impl std::fmt::Debug for AutolabelJob {
     }
 }
 
-/// The warning of a `missing_only` run's summary: the review queue gets the frames back, the
+/// The warning of a run's summary when it reopened frames: the review queue gets them back, the
 /// export takes reviewed frames only.
 const REOPENED_WARNING: &str = "reopened frames leave exports until you save them again on the \
                                 Review page";
@@ -160,7 +164,7 @@ pub struct AutolabelReport {
     pub candidates: usize,
     /// `missing_only`: of those, boxes that took the place of an automatic reject.
     pub overwritten: usize,
-    /// `missing_only`: detections on a box a reviewer rejected (also in `dropped`).
+    /// Reviewed frames: detections on a box a reviewer rejected (also in `dropped`).
     pub dropped_judged: usize,
     /// `missing_only`: frames left out because the model trained on them.
     pub skipped_trained: usize,
@@ -193,6 +197,75 @@ pub struct AutolabelReport {
     pub cancelled: bool,
     pub frames_done: usize,
     pub frames_total: usize,
+    /// Existing boxes that gained a labeler ([`triage::apply_labelers`]), for the overlap check's
+    /// witnesses.
+    pub votes: usize,
+    /// Reviewed frames: proposals left out, the labelers not agreeing and none confident.
+    pub filtered_low_score: usize,
+    /// Reviewed frames: proposals left out on a VLM or SigLIP objection.
+    pub filtered_objected: usize,
+    /// Reviewed frames: proposals left out on a decided box of another object.
+    pub filtered_other_object: usize,
+    /// Reviewed frames: proposals left out on a rejected box no reviewer judged (which stays).
+    pub filtered_on_reject: usize,
+    /// Proposals left out on skipped and confirmed-empty frames, which take no box.
+    pub filtered_closed: usize,
+}
+
+impl AutolabelReport {
+    /// Add what one frame of a labelers run did.
+    fn count_labelers(&mut self, a: &triage::LabelersReport) {
+        self.added += a.apply.merge.added + a.missing.candidates();
+        self.dropped +=
+            a.apply.merge.dropped + a.missing.covered + a.missing.judged + a.missing.full;
+        self.dropped_judged += a.missing.judged;
+        self.annotated += a.apply.annotated;
+        self.class_suggestions += a.apply.class_suggestions;
+        self.votes += a.votes;
+        self.filtered_low_score += a.gate.low_score;
+        self.filtered_objected += a.gate.objected;
+        self.filtered_other_object += a.gate.other_object;
+        self.filtered_on_reject += a.gate.on_reject;
+        self.filtered_closed += a.closed;
+    }
+
+    /// What a labelers run did to frames with a reviewer's decisions, for its summary (empty when
+    /// it touched none).
+    fn labelers_notes(&self) -> String {
+        let mut s = String::new();
+        let filtered = self.filtered_low_score
+            + self.filtered_objected
+            + self.filtered_other_object
+            + self.filtered_on_reject
+            + self.filtered_closed;
+        if filtered > 0 {
+            s.push_str(&format!(
+                "; {filtered} proposals left out to protect reviewed frames ({} not confident, {} \
+                 objected to by the VLM or SigLIP, {} on a decided box of another class, {} on a \
+                 rejected box, {} on skipped or confirmed-empty frames)",
+                self.filtered_low_score,
+                self.filtered_objected,
+                self.filtered_other_object,
+                self.filtered_on_reject,
+                self.filtered_closed
+            ));
+        }
+        if self.reopened > 0 {
+            s.push_str(&format!(
+                "; {} frames reopened; {REOPENED_WARNING}, and Restore reopened frames on that \
+                 page puts back the ones with nothing left pending",
+                self.reopened
+            ));
+        }
+        if self.votes > 0 {
+            s.push_str(&format!(
+                "; {} existing boxes gained a labeler's vote: the overlap check counts it for new \
+                 pairs, and pairs it already answered need Ask again in Suggest overlaps",
+                self.votes
+            ));
+        }
+        s
+    }
 }
 
 impl AutolabelJob {
@@ -226,6 +299,60 @@ impl AutolabelJob {
         .flatten()
         .collect::<Vec<_>>()
         .join(" + ")
+    }
+
+    /// One short name of the run's boxes (`sam3`), for the note of a frame it reopens: the keys
+    /// its boxes carry in `labelers`, not [`Self::labeler`]'s list of checkpoints.
+    fn short_labeler(&self) -> &'static str {
+        let r = &self.request;
+        if r.sam3 {
+            catalog::SAM3_KEY
+        } else if r.gdino.is_some() {
+            "gdino"
+        } else {
+            "rfdetr"
+        }
+    }
+
+    /// The error of a run that failed after `saved` frames went through the write stage: those
+    /// are queued for review like a finished run's, and the message says what is on disk.
+    fn failed_run(
+        &self,
+        e: anyhow::Error,
+        saved: usize,
+        total: usize,
+        rep: &AutolabelReport,
+        changed: &[String],
+    ) -> anyhow::Error {
+        for w in &rep.warnings {
+            tracing::warn!("{w}");
+        }
+        if saved == 0 {
+            return e.context("the auto-labeler failed");
+        }
+        let mut msg = format!(
+            "the auto-labeler failed after {saved} of {total} frames; those {saved} were saved \
+             ({} queued for review) and ",
+            changed.len()
+        );
+        msg.push_str(if self.request.frames.again() {
+            "a run without again=1 skips them"
+        } else {
+            "running the same auto-label again labels only the rest"
+        });
+        if let Err(q) = crate::collect::layout::append_review(&self.dataset_dir, changed) {
+            msg.push_str(&format!(
+                "; queueing them for review failed too ({q:#}), so find them with the frame \
+                 filters on the Review page"
+            ));
+        }
+        if rep.reopened > 0 {
+            msg.push_str(&format!(
+                "; {} frames reopened: {REOPENED_WARNING}",
+                rep.reopened
+            ));
+        }
+        e.context(msg)
     }
 
     /// The frames to label, in queue order, and how many matching frames were left out because
@@ -614,26 +741,42 @@ impl AutolabelJob {
                 cancel,
             );
             // A cancel kills the script; with `keep_on_cancel` the frames it finished (it
-            // flushes `proposals.jsonl` after each) are written below like a finished run's.
-            let stopped = match labelled {
-                Err(e) if r.keep_on_cancel && is_cancel(&e) => true,
-                Err(e) => return Err(e.context("the auto-labeler failed")),
-                Ok(()) => r.keep_on_cancel && cancelled(cancel),
-            };
-            if !stopped {
-                if done_ev.is_none() {
-                    bail!("the auto-labeler finished without its summary; the script is damaged");
+            // flushes `proposals.jsonl` after each) are written below like a finished run's. So
+            // are they when it failed, whatever `keep_on_cancel` says: that option is the user's
+            // choice about their own Cancel, and nobody chose to lose hours of labelling to a
+            // crash. The run is still a failure ([`failed_run`]).
+            let (stopped, failure) = match labelled {
+                Err(e) if r.keep_on_cancel && is_cancel(&e) => (true, None),
+                Err(e) if is_cancel(&e) || (!r.keep_on_cancel && cancelled(cancel)) => {
+                    return Err(e.context("the auto-labeler failed"));
                 }
+                Err(e) => (false, Some(e)),
+                Ok(()) if r.keep_on_cancel && cancelled(cancel) => (true, None),
+                Ok(()) if done_ev.is_none() && !cancelled(cancel) => (
+                    false,
+                    Some(anyhow!(
+                        "it finished without its summary; the script is damaged"
+                    )),
+                ),
+                Ok(()) => (false, None),
+            };
+            if !stopped && failure.is_none() {
                 check(cancel)?;
             }
             // 5. Triage and write (no cancel checks: a stopped run writes what it has).
+            let partial = stopped || failure.is_some();
             let text = match std::fs::read_to_string(&out) {
-                Err(e) if stopped && e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                t => t.with_context(|| format!("reading {}", out.display()))?,
+                Ok(t) => t,
+                Err(e) => match failure {
+                    Some(f) => return Err(f.context("the auto-labeler failed")),
+                    None if stopped && e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    None => return Err(e).with_context(|| format!("reading {}", out.display())),
+                },
             };
             let by_rel: BTreeMap<&str, &Selected> =
                 frames.iter().map(|f| (f.rel.as_str(), f)).collect();
             let mut done: BTreeSet<&str> = BTreeSet::new();
+            let mut saved = 0;
             let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
             for (i, line) in lines.iter().enumerate() {
                 if i % 10 == 0 {
@@ -643,7 +786,7 @@ impl AutolabelJob {
                 let fp: FrameProposals = match serde_json::from_str(line) {
                     Ok(x) => x,
                     // The line the killed script was writing.
-                    Err(_) if stopped && i + 1 == lines.len() => continue,
+                    Err(_) if partial && i + 1 == lines.len() => continue,
                     Err(e) => {
                         rep.warnings
                             .push(format!("a proposals line does not parse: {e}"));
@@ -687,27 +830,24 @@ impl AutolabelJob {
                     labeler: labeler.clone(),
                     classes: self.classes.clone(),
                 };
+                // Decided from the file as it is now: a reviewer may have got to the frame since
+                // it was selected.
                 let res = self.write_frame(sel, &mut rep, &mut changed, |file, rep| {
                     file.auto_run = Some(marker);
-                    if boxes.is_empty() {
-                        return FrameWrite {
-                            write: true,
-                            queue: false,
-                        };
-                    }
-                    let a = triage::apply(file, boxes);
-                    rep.added += a.merge.added;
-                    rep.dropped += a.merge.dropped;
-                    rep.annotated += a.annotated;
-                    rep.class_suggestions += a.class_suggestions;
+                    let a = triage::apply_labelers(file, boxes, self.short_labeler());
+                    rep.count_labelers(&a);
                     FrameWrite {
                         write: true,
-                        queue: a.merge.added > 0 || a.annotated > 0 || a.class_suggestions > 0,
+                        queue: a.for_review(),
                     }
                 });
-                if let Err(e) = res {
-                    rep.warnings.push(format!("{}: {e:#}", sel.rel));
+                match res {
+                    Ok(()) => saved += 1,
+                    Err(e) => rep.warnings.push(format!("{}: {e:#}", sel.rel)),
                 }
+            }
+            if let Some(e) = failure {
+                return Err(self.failed_run(e, saved, frames.len(), &rep, &changed));
             }
             (stopped, done.len())
         };
@@ -831,6 +971,11 @@ impl AutolabelJob {
                 ));
             }
             s
+        };
+        let summary = if self.model.is_none() {
+            summary + &rep.labelers_notes()
+        } else {
+            summary
         };
         Ok(TaskOutcome {
             summary,

@@ -6,8 +6,9 @@
 // The Auto-label card queues a job (POST /training/autolabel as JSON) and follows it on
 // GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto and
 // "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
-// POST /v1/review/reject-other-class and "Reject stacked duplicates" POST /v1/review/reject-stacked
-// (all four: dry run, confirm, run). *Suggest overlaps...* queues the overlap check
+// POST /v1/review/reject-other-class, "Restore reopened frames" POST /v1/review/restore-reopened
+// and "Reject stacked duplicates" POST /v1/review/reject-stacked
+// (all five: dry run, confirm, run). *Suggest overlaps...* queues the overlap check
 // (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
 // the frame, and `y` accepts the one on screen.
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
@@ -997,7 +998,7 @@
     var names = Object.keys(b.labelers || {});
     if (names.length) {
       parts.push(names.map(function (k) { return k + ' ' + fmtScore(b.labelers[k]); }).join(', ') +
-        (b.agree === false ? ' (one labeler)' : ''));
+        (b.agree === false && names.length < 2 ? ' (one labeler)' : ''));
     } else if (b.agree === false) parts.push('one labeler');
     if (b.vlm) {
       parts.push((b.vlm.model || 'VLM') + ': ' + (b.vlm.answer || 'nothing') +
@@ -3089,6 +3090,46 @@
         box.className = 'review-report error-text';
         report(box, [e.message]);
       }).then(function () { stackedBtn.disabled = false; });
+    });
+  }
+
+  // The undo of a re-label that reopened reviewed frames: back to reviewed when nothing is pending.
+  var restoreBtn = $('rv-restore-reopened');
+  if (restoreBtn) {
+    restoreBtn.addEventListener('click', function () {
+      var box = $('rv-restore-reopened-msg');
+      var body = {};
+      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
+        var e = filtersForm.elements[k];
+        if (e && e.value) body[k] = e.value;
+      });
+      body.dry_run = true;
+      box.className = 'review-report';
+      report(box, ['Counting the frames...']);
+      restoreBtn.disabled = true;
+      postJson('/v1/review/restore-reopened', body).then(function (j) {
+        var n = j.eligible || 0;
+        if (!n) {
+          report(box, ['No reopened frame with nothing left pending among the frames the filters select.']);
+          return null;
+        }
+        if (!window.confirm('Put ' + n + ' reopened frame(s) back to reviewed? Their boxes stay as they are, and they ' +
+          'return to exports. Frames with a pending box are not touched.')) {
+          report(box, ['Nothing restored.']);
+          return null;
+        }
+        body.dry_run = false;
+        return postJson('/v1/review/restore-reopened', body).then(function (r) {
+          var failed = r.failed || [];
+          report(box, [r.message || ('Restored ' + (r.restored || 0) + ' frame(s).')],
+            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
+          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+          return reloadQueue();
+        });
+      }).catch(function (e) {
+        box.className = 'review-report error-text';
+        report(box, [e.message]);
+      }).then(function () { restoreBtn.disabled = false; });
     });
   }
 

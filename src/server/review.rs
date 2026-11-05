@@ -10,7 +10,8 @@
 //! `POST /v1/review/reject-unwanted-reviewed` (the accepted boxes of unwanted classes on
 //! reviewed frames, on request), `POST /v1/review/reject-stacked` (the duplicates of stacked
 //! boxes on reviewed and unreviewed frames, `reason: duplicate`; overlapping boxes are left to a
-//! reviewer, `auto=overlaps`), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
+//! reviewer, `auto=overlaps`), `POST /v1/review/restore-reopened` (frames a re-label reopened, back
+//! to reviewed once nothing is pending), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
 //! benchmark set), `POST /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes`
 //! (`collect.classes` and `collect.hidden_classes`; classes that become unwanted have their
 //! pending boxes rejected right away) and `GET /v1/review/class-catalog` (the class picker's
@@ -1061,6 +1062,93 @@ pub(super) async fn reject_stacked(
             "message": message,
             "overlaps_left": left,
             "overlaps_left_reviewed": left_reviewed,
+        }))
+        .into_response()
+    })
+    .await
+}
+
+/// `POST /v1/review/restore-reopened` with `{bucket?, scene?, camera?, label?, source?, dry_run,
+/// limit?}`: the undo of a re-label that reopened reviewed frames. On the unreviewed frames of those
+/// filters, a frame with a `disagreement` note, a `reviewed_at` and nothing pending goes back to
+/// reviewed and loses the note ([`bulk::bulk_restore_reopened`], re-checked under the write lock),
+/// at most `limit` frames (default 500). Frames with a pending box and frames never reviewed are
+/// not touched. `dry_run` only counts. `eligible` counts the frames, `restored` those changed.
+pub(super) async fn restore_reopened(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: RejectOtherClassBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
+    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        );
+    }
+    let mut q: BTreeMap<String, String> = [
+        ("bucket", b.bucket),
+        ("scene", b.scene),
+        ("camera", b.camera),
+        ("label", b.label),
+        ("source", b.source),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+    .collect();
+    q.insert("status".into(), "unreviewed".into());
+    let filters = match Filters::from_query(&q) {
+        Ok(f) => f,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let dry_run = b.dry_run;
+    blocking(move || {
+        let (dir, _, _) = context(&state);
+        let o = bulk::bulk_restore_reopened(&dir, &filters, limit, dry_run, &|_| true);
+        let eligible = o.eligible;
+        if dry_run {
+            return Json(serde_json::json!({
+                "success": true,
+                "eligible": eligible,
+                "restored": 0,
+                "frames": o.done,
+            }))
+            .into_response();
+        }
+        let mut message = format!(
+            "Restored {} reopened frame(s) to reviewed (their boxes are unchanged; they are back \
+             in exports).",
+            o.done_count
+        );
+        if o.failed_count > 0 {
+            message.push_str(&format!(
+                " {} frame(s) not changed (listed); review them by hand.",
+                o.failed_count
+            ));
+        }
+        if eligible > limit {
+            message.push_str(&format!(
+                " {} more frame(s) beyond the limit of {limit}; run it again.",
+                eligible - limit
+            ));
+        }
+        tracing::info!(
+            restored = o.done_count,
+            failed = o.failed_count,
+            eligible,
+            "review: reopened frames restored"
+        );
+        Json(serde_json::json!({
+            "success": true,
+            "eligible": eligible,
+            "restored": o.done_count,
+            "failed": o.failed,
+            "frames": o.done,
+            "message": message,
         }))
         .into_response()
     })
@@ -2951,6 +3039,67 @@ mod tests {
             post_json("/v1/review/reject-spot", &body(r#", "nope": 1"#)),
         )
         .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "unknown fields are refused");
+    }
+
+    #[tokio::test]
+    async fn restore_reopened_asks_first_and_leaves_frames_with_pending_boxes_alone() {
+        use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
+        use labels::{BoxState, Triage};
+        let d = ds();
+        let reopen = |stem: &str, boxes: Vec<labels::LabelBox>| {
+            let rel = put_frame(&d.dir, stem, None, boxes);
+            let frame = Frame::resolve(&d.dir, &rel).unwrap();
+            let mut f = labels_of(&d.dir, &rel);
+            f.reviewed_at = Some("2026-10-01T00:00:00Z".into());
+            f.disagreement = Some("re-label by sam3: 1 new box".into());
+            labels::write(&frame.labels, &f).unwrap();
+            rel
+        };
+        let mut no = auto_box("car", 0.7, Triage::Review);
+        no.state = BoxState::Rejected;
+        let done = reopen("a", vec![no]);
+        let waiting = reopen("b", vec![auto_box("car", 0.7, Triage::Review)]);
+        let never = put_frame(&d.dir, "c", None, Vec::new());
+
+        let uri = "/v1/review/restore-reopened";
+        let (s, v) = json(&d.state, post_json(uri, r#"{"dry_run": true}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["eligible"].as_u64(), v["restored"].as_u64()),
+            (Some(1), Some(0))
+        );
+        assert_eq!(v["frames"], serde_json::json!([done]));
+        assert_eq!(labels_of(&d.dir, &done).status, labels::Status::Unreviewed);
+
+        let (s, v) = json(&d.state, post_json(uri, "{}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["eligible"].as_u64(), v["restored"].as_u64()),
+            (Some(1), Some(1))
+        );
+        assert!(v["message"].as_str().unwrap().contains("Restored 1"), "{v}");
+        let f = labels_of(&d.dir, &done);
+        assert_eq!(f.status, labels::Status::Reviewed);
+        assert_eq!(f.disagreement, None);
+        assert_eq!(f.boxes[0].state, BoxState::Rejected);
+        assert_eq!(
+            labels_of(&d.dir, &waiting).status,
+            labels::Status::Unreviewed
+        );
+        assert!(labels_of(&d.dir, &waiting).disagreement.is_some());
+        assert_eq!(labels_of(&d.dir, &never).status, labels::Status::Unreviewed);
+
+        // The filters narrow it, bad input is refused.
+        let (s, v) = json(&d.state, post_json(uri, r#"{"camera": "other"}"#)).await;
+        assert_eq!(
+            (s, v["eligible"].as_u64()),
+            (StatusCode::OK, Some(0)),
+            "{v}"
+        );
+        let (s, _) = json(&d.state, post_json(uri, r#"{"limit": 0}"#)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = json(&d.state, post_json(uri, r#"{"nope": 1}"#)).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "unknown fields are refused");
     }
 

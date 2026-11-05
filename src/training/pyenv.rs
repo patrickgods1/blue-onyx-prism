@@ -253,6 +253,7 @@ pub fn run_script(
     cancel: &AtomicBool,
 ) -> Result<()> {
     std::fs::create_dir_all(cwd).with_context(|| format!("creating {}", cwd.display()))?;
+    let sam3 = args.iter().any(|a| a == "--sam3");
     let cmd = env::train_python_cmd(paths, platform, Stage::Export, cwd, timeout, args);
     runner
         .run(
@@ -269,7 +270,7 @@ pub fn run_script(
             }
             if let Some(why) = e
                 .downcast_ref::<crate::resources::export::ChildFailed>()
-                .and_then(|c| gpu_failure(&c.lines, tag))
+                .and_then(|c| gpu_failure(&c.lines, tag, sam3))
             {
                 return e.context(why);
             }
@@ -323,8 +324,9 @@ fn task_name(tag: &str) -> &'static str {
 
 /// The likely cause of a failed helper script when it ran out of GPU memory (not when the host
 /// ran out too: on Windows a CUDA allocation also fails when the system commit is exhausted;
-/// [`super::job::host_out_of_memory_line`], left to the generic memory message).
-fn gpu_failure(lines: &[String], tag: &str) -> Option<String> {
+/// [`super::job::host_out_of_memory_line`], left to the generic memory message). `sam3`: a run with
+/// SAM 3, which `--gdino` is refused on.
+fn gpu_failure(lines: &[String], tag: &str, sam3: bool) -> Option<String> {
     if super::job::host_out_of_memory_line(lines).is_some() {
         return None;
     }
@@ -340,6 +342,9 @@ fn gpu_failure(lines: &[String], tag: &str) -> Option<String> {
     let fix = if tag == "overlaps" {
         "close other programs that use the GPU (the check needs about 500 MB of it) and run it \
          again; it keeps the finished pairs"
+    } else if sam3 {
+        "SAM 3 comes in one size, so use a smaller VLM (--vlm qwen3-vl-2b or none) or --no-siglip, \
+         close other programs that use the GPU, or leave SAM 3 out (no --sam3)"
     } else {
         "use a smaller labeler (--gdino tiny, --vlm qwen3-vl-2b or none) or close other programs \
          that use the GPU"
@@ -365,13 +370,18 @@ mod tests {
                     "x".into(),
                     "RuntimeError: MPS backend out of memory (MPS)".into()
                 ],
-                "autolabel"
+                "autolabel",
+                false
             )
             .unwrap()
-            .contains("smaller labeler")
+            .contains("--gdino tiny")
         );
+        // A SAM 3 run refuses --gdino, so the hint must not offer it.
+        let sam3 = gpu_failure(&["CUDA out of memory".into()], "autolabel", true).unwrap();
+        assert!(!sam3.contains("--gdino"), "{sam3}");
+        assert!(sam3.contains("--no-siglip"), "{sam3}");
         assert!(
-            gpu_failure(&["CUDA out of memory".into()], "overlaps")
+            gpu_failure(&["CUDA out of memory".into()], "overlaps", false)
                 .unwrap()
                 .contains("keeps the finished pairs")
         );
@@ -386,7 +396,8 @@ mod tests {
                      not enough memory: you tried to allocate 262144 bytes."
                         .into(),
                 ],
-                "autolabel"
+                "autolabel",
+                false
             ),
             None
         );

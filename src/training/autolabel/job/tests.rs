@@ -98,6 +98,14 @@ struct LabelFake {
     /// Cancel after writing this many proposal lines, the last one cut off mid-line (as the
     /// real runner does: the flag set, the script killed, `Cancelled`).
     stop_after: Option<usize>,
+    /// Die after this many proposal lines and half of the next one, with a plain error.
+    fail_after: Option<usize>,
+    /// Write only this many lines, then exit cleanly without the `done` event.
+    no_summary_after: Option<usize>,
+    /// The boxes of every frame, in place of the default car, raccoon and unicorn.
+    boxes: Option<serde_json::Value>,
+    /// Label files a reviewer saves while the script runs (path, new content).
+    saved_during_run: Vec<(PathBuf, LabelFile)>,
 }
 
 impl CommandRunner for LabelFake {
@@ -111,10 +119,22 @@ impl CommandRunner for LabelFake {
             return Ok(());
         }
         self.cmds.lock().unwrap().push(cmd.clone());
+        for (path, f) in &self.saved_during_run {
+            labels::write(path, f).unwrap();
+        }
         let list = arg_after(cmd, "--frames").unwrap();
         let out = arg_after(cmd, "--out").unwrap();
         let mut text = String::new();
         for (i, l) in std::fs::read_to_string(list).unwrap().lines().enumerate() {
+            if self.fail_after == Some(i) {
+                text.push_str("{\"frame\": \"torn");
+                std::fs::write(&out, &text).unwrap();
+                return Err(anyhow!("the GPU fell off the bus"));
+            }
+            if self.no_summary_after == Some(i) {
+                std::fs::write(&out, &text).unwrap();
+                return Ok(());
+            }
             if let Some(k) = self.stop_after
                 && i + 1 == k
             {
@@ -137,7 +157,7 @@ impl CommandRunner for LabelFake {
             } else {
                 "gdino"
             };
-            let line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48, "boxes": [
+            let boxes = self.boxes.clone().unwrap_or_else(|| serde_json::json!([
                 {"label": "car", "bbox": [1, 1, 30, 20], "score": 0.82, "agree": true,
                  "sources": {(seat): 0.7, "rfdetr": 0.94}},
                 {"label": "raccoon", "bbox": [35, 20, 60, 46], "score": 0.31, "agree": false,
@@ -145,7 +165,9 @@ impl CommandRunner for LabelFake {
                  "vlm": {"model": "qwen3-vl-2b", "answer": "rock", "expected": "animal", "ok": false},
                  "species_scores": {"raccoon": 0.6, "cat": 0.4}},
                 {"label": "unicorn", "bbox": [1, 1, 5, 5], "score": 0.9, "agree": true, "sources": {}}
-            ], "ms": {"gdino": 10}});
+            ]));
+            let line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48,
+                                          "boxes": boxes, "ms": {"gdino": 10}});
             text.push_str(&line.to_string());
             text.push('\n');
             on_line(&format!(
@@ -2224,5 +2246,438 @@ mod missing {
             out.summary
         );
         assert!(out.summary.contains("run it again"), "{}", out.summary);
+    }
+}
+
+/// A reviewed file with one drawn car where the fake labelers find theirs, plus `extra` boxes.
+fn reviewed_car(extra: Vec<labels::LabelBox>) -> LabelFile {
+    let mut boxes = vec![labels::LabelBox {
+        label: "car".into(),
+        bbox: [1.0, 1.0, 30.0, 20.0],
+        source: Source::Human,
+        score: None,
+        state: BoxState::Added,
+        origin: None,
+        reason: None,
+        model_label: None,
+        orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
+        auto: Default::default(),
+    }];
+    boxes.extend(extra);
+    LabelFile {
+        status: Status::Reviewed,
+        reviewed_at: Some("2026-10-22T12:00:00.000Z".into()),
+        boxes,
+        ..LabelFile::default()
+    }
+}
+
+/// A decided model box.
+fn decided(label: &str, bbox: [f32; 4], state: BoxState) -> labels::LabelBox {
+    labels::LabelBox {
+        label: label.into(),
+        bbox,
+        source: Source::Model,
+        score: Some(0.4),
+        state,
+        origin: Some(labels::Origin::Prediction),
+        reason: None,
+        model_label: None,
+        orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
+        auto: Default::default(),
+    }
+}
+
+fn review_queue(dir: &Path) -> Vec<String> {
+    crate::collect::layout::read_review(&dir.join(crate::collect::layout::REVIEW_QUEUE_FILE))
+        .into_iter()
+        .map(|l| l.frame)
+        .collect()
+}
+
+/// A SAM 3 run over `filter`, no VLM or SigLIP.
+fn sam3_over(cfg: &Config, filter: &str) -> AutolabelJob {
+    let mut job = sam3_job(cfg);
+    job.request.frames = FrameFilter::parse(filter, "unreviewed").unwrap();
+    job.request.vlm = None;
+    job.request.siglip = false;
+    job
+}
+
+/// The boxes every frame gets in the reviewed-frame runs: a confident second sight of the drawn
+/// car, a confident person, a weak dog.
+fn sam3_boxes() -> serde_json::Value {
+    serde_json::json!([
+        {"label": "car", "bbox": [1, 1, 30, 20], "score": 0.35, "agree": false,
+         "sources": {"sam3": 0.7}},
+        {"label": "person", "bbox": [40, 5, 60, 40], "score": 0.45, "agree": false,
+         "sources": {"sam3": 0.9}},
+        {"label": "dog", "bbox": [2, 25, 30, 46], "score": 0.1, "agree": false,
+         "sources": {"sam3": 0.2}}
+    ])
+}
+
+#[test]
+fn a_rerun_over_reviewed_frames_only_reopens_for_confident_new_objects() {
+    let t = tmp("reviewed");
+    let rels = frames(&t.0, 5, false);
+    let dir = t.0.join("dataset");
+    let write = |rel: &str, f: &LabelFile| {
+        labels::write(&Frame::resolve(&dir, rel).unwrap().labels, f).unwrap();
+    };
+    // 0: the person is new. 1: a person is labelled, nothing is new. 2: the person sits on an
+    // accepted cat. 3: skipped. 4: confirmed empty.
+    let person = [40.0, 5.0, 60.0, 40.0];
+    write(
+        &rels[0],
+        &reviewed_car(vec![decided(
+            "dog",
+            [2.0, 25.0, 30.0, 46.0],
+            BoxState::Rejected,
+        )]),
+    );
+    write(
+        &rels[1],
+        &reviewed_car(vec![decided("person", person, BoxState::Accepted)]),
+    );
+    write(
+        &rels[2],
+        &reviewed_car(vec![decided("cat", person, BoxState::Accepted)]),
+    );
+    let mut skipped = reviewed_car(vec![]);
+    skipped.status = Status::Skipped;
+    write(&rels[3], &skipped);
+    write(
+        &rels[4],
+        &LabelFile {
+            empty_confirmed: true,
+            boxes: Vec::new(),
+            ..reviewed_car(vec![])
+        },
+    );
+    let before: Vec<LabelFile> = rels.iter().map(|r| labels_of(&dir, r)).collect();
+    // Only the frames of this run in the queue file: nothing was reviewed through it.
+    let queued_before = review_queue(&dir);
+
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "status=any,limit=20");
+    let fake = LabelFake {
+        boxes: Some(sam3_boxes()),
+        ..LabelFake::default()
+    };
+    let out = run_job(&job, &fake).unwrap();
+    let rep = &out.result;
+    assert_eq!(rep["frames"], 5, "{rep}");
+    assert_eq!(rep["added"], 1, "the person of frame 0: {rep}");
+    assert_eq!(rep["reopened"], 1, "{rep}");
+    assert_eq!(
+        rep["filtered_low_score"], 3,
+        "the dog, frames 0 to 2: {rep}"
+    );
+    assert_eq!(
+        rep["filtered_other_object"], 1,
+        "the person on the cat: {rep}"
+    );
+    assert_eq!(
+        rep["filtered_closed"], 6,
+        "three boxes on frames 3 and 4: {rep}"
+    );
+    assert_eq!(
+        rep["votes"], 6,
+        "cars 0 to 3, the dog on frame 0's rejected dog, the person of frame 1: {rep}"
+    );
+    assert_eq!(rep["annotated"], 0, "a vote is no annotation: {rep}");
+    assert!(
+        out.summary.contains("leave exports until you save"),
+        "{}",
+        out.summary
+    );
+    assert!(out.summary.contains("Ask again"), "{}", out.summary);
+    assert!(out.summary.contains("Restore reopened"), "{}", out.summary);
+    assert!(out.summary.contains("3 not confident"), "{}", out.summary);
+
+    let after: Vec<LabelFile> = rels.iter().map(|r| labels_of(&dir, r)).collect();
+    // Decided boxes: every field but the `labelers` a vote adds, byte for byte.
+    let bare = |b: &labels::LabelBox| {
+        let mut b = b.clone();
+        b.auto.labelers.clear();
+        serde_json::to_string(&b).unwrap()
+    };
+    for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+        for (x, y) in a.boxes.iter().zip(&b.boxes) {
+            assert_eq!(bare(x), bare(y), "frame {i}");
+        }
+        assert_eq!(
+            a.auto_run.as_ref().unwrap().labeler,
+            rep["labeler"].as_str().unwrap(),
+            "frame {i}"
+        );
+    }
+    // Frame 0: reopened, with a note and one new pending box; the vote on its drawn car.
+    let f0 = &after[0];
+    assert_eq!(f0.status, Status::Unreviewed);
+    assert_eq!(f0.boxes.len(), 3);
+    assert_eq!(f0.boxes[0].auto.labelers["sam3"], 0.7);
+    assert_eq!(f0.boxes[2].state, BoxState::Pending);
+    assert_eq!(
+        f0.disagreement.as_deref(),
+        Some("re-label by sam3: 1 new box"),
+        "the short name"
+    );
+    // The others keep their status and their boxes.
+    for i in 1..5 {
+        assert_eq!(after[i].status, before[i].status, "frame {i}");
+        assert_eq!(after[i].boxes.len(), before[i].boxes.len(), "frame {i}");
+        assert_eq!(after[i].disagreement, None, "frame {i}");
+    }
+    assert!(!labels::auto_accept_eligible(&after[3]));
+    // Only the reopened frame is queued, once more; a vote queues nothing.
+    let queued = review_queue(&dir);
+    assert_eq!(
+        queued.len(),
+        queued_before.len(),
+        "every frame was queued by the import: {queued:?}"
+    );
+    assert_eq!(rep["sample"], serde_json::json!([rels[0]]));
+    // A rerun of the same labelers finds its markers.
+    let job2 = sam3_over(&cfg, "status=any,limit=20");
+    let e = run_job(&job2, &fake).unwrap_err().to_string();
+    assert!(e.contains("all 5 frame(s)"), "{e}");
+}
+
+#[test]
+fn a_vote_only_write_adds_nothing_to_the_review_queue() {
+    let t = tmp("vote-queue");
+    let rels = frames(&t.0, 1, false);
+    let dir = t.0.join("dataset");
+    let fr = Frame::resolve(&dir, &rels[0]).unwrap();
+    labels::write(&fr.labels, &reviewed_car(vec![])).unwrap();
+    // The frame left the queue file: a reviewed frame from an older queue, or `source=all`.
+    std::fs::write(dir.join(crate::collect::layout::REVIEW_QUEUE_FILE), "").unwrap();
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "status=reviewed,source=all");
+    let fake = LabelFake {
+        boxes: Some(serde_json::json!([sam3_boxes()[0]])),
+        ..LabelFake::default()
+    };
+    let rep = run_job(&job, &fake).unwrap().result;
+    assert_eq!(
+        (rep["votes"].as_u64(), rep["reopened"].as_u64()),
+        (Some(1), Some(0))
+    );
+    assert!(review_queue(&dir).is_empty(), "{:?}", review_queue(&dir));
+    assert_eq!(rep["sample"], serde_json::json!([]));
+    let f = labels_of(&dir, &rels[0]);
+    assert_eq!(f.status, Status::Reviewed);
+    assert_eq!(f.boxes[0].auto.labelers["sam3"], 0.7);
+    assert_eq!(f.boxes[0].state, BoxState::Added);
+}
+
+#[test]
+fn the_frames_status_is_read_when_the_file_is_written() {
+    let t = tmp("write-time");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "limit=20");
+    // Both unreviewed when selected. A reviewer saves frame 0 and skips frame 1 while the labelers
+    // run, with the car drawn and nothing else on it.
+    let mut skipped = reviewed_car(vec![]);
+    skipped.status = Status::Skipped;
+    let fake = LabelFake {
+        saved_during_run: vec![
+            (
+                Frame::resolve(&dir, &rels[0]).unwrap().labels,
+                reviewed_car(vec![]),
+            ),
+            (Frame::resolve(&dir, &rels[1]).unwrap().labels, skipped),
+        ],
+        boxes: Some(serde_json::json!([
+            sam3_boxes()[2],
+            {"label": "dog", "bbox": [35, 25, 60, 46], "score": 0.15, "agree": false,
+             "sources": {"sam3": 0.3}}
+        ])),
+        ..LabelFake::default()
+    };
+    let rep = run_job(&job, &fake).unwrap().result;
+    assert_eq!(rep["added"], 0, "{rep}");
+    assert_eq!(rep["reopened"], 0, "{rep}");
+    assert_eq!(rep["filtered_low_score"], 2, "{rep}");
+    assert_eq!(rep["filtered_closed"], 2, "{rep}");
+    let f0 = labels_of(&dir, &rels[0]);
+    assert_eq!((f0.status, f0.boxes.len()), (Status::Reviewed, 1));
+    assert!(f0.auto_run.is_some());
+    let f1 = labels_of(&dir, &rels[1]);
+    assert_eq!((f1.status, f1.boxes.len()), (Status::Skipped, 1));
+    assert!(f1.auto_run.is_some());
+}
+
+#[test]
+fn a_failed_run_keeps_its_finished_frames_and_still_fails() {
+    let t = tmp("salvage");
+    let rels = frames(&t.0, 5, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    for keep in [true, false] {
+        let mut request = AutolabelRequest::new(FrameFilter::default());
+        request.keep_on_cancel = keep;
+        let job = plan_autolabel(&cfg, request, &host()).unwrap();
+        let fake = LabelFake {
+            fail_after: Some(if keep { 2 } else { 1 }),
+            ..LabelFake::default()
+        };
+        let e = run_job(&job, &fake).unwrap_err();
+        let text = format!("{e:#}");
+        let n = if keep { 2 } else { 1 };
+        assert!(
+            text.contains(&format!("failed after {n} of ")),
+            "keep {keep}: {text}"
+        );
+        assert!(text.contains("labels only the rest"), "{text}");
+        assert!(text.contains("the GPU fell off the bus"), "{text}");
+        assert!(!crate::training::pyenv::is_cancel(&e), "a failure: {text}");
+        assert!(!job.work.exists(), "the work folder is removed");
+    }
+    // The finished frames are written with their markers, the others left alone.
+    let labelled: Vec<&String> = rels
+        .iter()
+        .filter(|r| labels_of_opt(&dir, r).is_some_and(|f| f.auto_run.is_some()))
+        .collect();
+    assert_eq!(labelled.len(), 3, "2 frames, then 1 more: {labelled:?}");
+    for r in &labelled {
+        assert_eq!(labels_of(&dir, r).boxes.len(), 2, "{r}");
+    }
+    // A rerun resumes after them.
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let rep = run_job(&job, &LabelFake::default()).unwrap().result;
+    assert_eq!(
+        (rep["frames"].as_u64(), rep["skipped_done"].as_u64()),
+        (Some(2), Some(3)),
+        "{rep}"
+    );
+}
+
+/// [`labels_of`] of a frame that may have no label file yet.
+fn labels_of_opt(dir: &Path, rel: &str) -> Option<LabelFile> {
+    Frame::resolve(dir, rel).unwrap().labels().unwrap()
+}
+
+#[test]
+fn a_failed_run_says_so_when_it_reopened_frames() {
+    let t = tmp("salvage-reopen");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    for r in &rels {
+        labels::write(
+            &Frame::resolve(&dir, r).unwrap().labels,
+            &reviewed_car(vec![]),
+        )
+        .unwrap();
+    }
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "status=reviewed");
+    let fake = LabelFake {
+        fail_after: Some(1),
+        boxes: Some(sam3_boxes()),
+        ..LabelFake::default()
+    };
+    let text = format!("{:#}", run_job(&job, &fake).unwrap_err());
+    assert!(text.contains("failed after 1 of 3"), "{text}");
+    assert!(text.contains("1 frames reopened"), "{text}");
+    assert!(text.contains("leave exports"), "{text}");
+    let reopened: Vec<LabelFile> = rels
+        .iter()
+        .map(|r| labels_of(&dir, r))
+        .filter(|f| f.status == Status::Unreviewed)
+        .collect();
+    assert_eq!(reopened.len(), 1);
+    assert!(reopened[0].disagreement.is_some());
+    assert_eq!(review_queue(&dir).len(), 3, "still queued once");
+}
+
+#[test]
+fn a_run_that_fails_with_nothing_finished_stays_a_plain_failure() {
+    let t = tmp("salvage-none");
+    frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let fake = LabelFake {
+        fail_after: Some(0),
+        ..LabelFake::default()
+    };
+    let text = format!("{:#}", run_job(&job, &fake).unwrap_err());
+    assert!(text.starts_with("the auto-labeler failed: "), "{text}");
+    assert!(text.contains("the GPU fell off the bus"), "{text}");
+    assert!(!text.contains("saved"), "{text}");
+}
+
+#[test]
+fn a_script_that_exits_without_its_summary_is_a_failure_that_keeps_its_frames() {
+    let t = tmp("salvage-summary");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let fake = LabelFake {
+        no_summary_after: Some(2),
+        ..LabelFake::default()
+    };
+    let text = format!("{:#}", run_job(&job, &fake).unwrap_err());
+    assert!(text.contains("failed after 2 of 3"), "{text}");
+    assert!(text.contains("without its summary"), "{text}");
+    let n = rels
+        .iter()
+        .filter(|r| labels_of_opt(&dir, r).is_some_and(|f| f.auto_run.is_some()))
+        .count();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn a_cancel_without_keep_on_cancel_still_discards_a_failing_run() {
+    /// Sets the cancel flag, then dies with a plain error.
+    struct DiesCancelled(LabelFake);
+    impl CommandRunner for DiesCancelled {
+        fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+            let r = self.0.run(cmd, on_line, cancel);
+            if r.is_err() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            r
+        }
+    }
+    impl Fetcher for DiesCancelled {
+        fn fetch(
+            &self,
+            res: &'static Resource,
+            dir: &Path,
+            progress: &mut dyn FnMut(u64, u64),
+            cancel: &AtomicBool,
+        ) -> Result<()> {
+            self.0.fetch(res, dir, progress, cancel)
+        }
+    }
+    let t = tmp("salvage-cancel");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let mut request = AutolabelRequest::new(FrameFilter::default());
+    request.keep_on_cancel = false;
+    let job = plan_autolabel(&cfg, request, &host()).unwrap();
+    let fake = DiesCancelled(LabelFake {
+        fail_after: Some(2),
+        ..LabelFake::default()
+    });
+    let cancel = AtomicBool::new(false);
+    let ctx = TaskContext {
+        runner: &fake,
+        fetcher: &fake,
+    };
+    assert!(job.run(ctx, &mut |_| {}, &cancel).is_err());
+    for r in &rels {
+        assert!(labels_of_opt(&dir, r).is_none(), "{r}: asked to discard");
     }
 }

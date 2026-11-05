@@ -141,6 +141,11 @@
   </div>
   <div id="rv-reject-stacked-msg" class="review-report" role="status"></div>
   <div class="inline-row">
+    <button type="button" id="rv-restore-reopened" class="small secondary">Restore reopened frames&hellip;</button>
+    <span class="muted">Frames a re-label sent back from review leave exports until saved again. This puts the ones the filters select back to reviewed when nothing on them is pending, with their boxes as they are: frames with a box still to decide and frames never reviewed are left alone. Asks first.</span>
+  </div>
+  <div id="rv-restore-reopened-msg" class="review-report" role="status"></div>
+  <div class="inline-row">
     <button type="button" id="rv-suggest-overlaps" class="small secondary">Suggest overlaps&hellip;</button>
     <label class="check"><input type="checkbox" id="rv-suggest-large"> Download RF-DETR L if missing</label>
     <span class="muted">Takes a closer look at the nested and partly overlapping boxes on the frames the Bucket, Scene, Camera and Class filters select, <strong>reviewed frames too</strong>, and writes a suggestion for each pair: which box to drop, or that they are two objects. <strong>No box changes</strong>: under Auto <em>overlapping boxes</em> the frames open on the suggestion, strongest first, and <kbd>y</kbd> accepts it. Run <em>Reject stacked duplicates</em> first. Runs on the <a href="/training#autolabel">Training</a> queue (NVIDIA GPU or Apple silicon). Asks first.</span>

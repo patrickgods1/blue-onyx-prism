@@ -48,6 +48,8 @@ pub const MATCH_IOU: f32 = 0.5;
 pub const DUP_IOU: f32 = 0.95;
 /// Longest [`LabelFile::disagreement`] note, in characters ([`normalize`] refuses a longer one).
 pub const MAX_DISAGREEMENT_LEN: usize = 500;
+/// Most entries of [`AutoInfo::labelers`] ([`normalize`] refuses more).
+pub const MAX_LABELERS: usize = 16;
 
 /// Where a frame is in the review.
 #[derive(
@@ -254,7 +256,8 @@ pub struct VlmCheck {
     pub ok: bool,
 }
 
-/// The auto-labeler's evidence on a box (all optional; empty for model and human boxes).
+/// The auto-labeler's evidence on a box (all optional; empty for model and human boxes, unless a
+/// labelers run found one again: then `labelers` alone, a vote for the overlap check's witnesses).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AutoInfo {
     /// Both labelers (MM-Grounding-DINO and RF-DETR) found the box.
@@ -361,9 +364,9 @@ pub struct LabelFile {
     /// [`classes_version`] of the class list the review used.
     #[serde(default)]
     pub classes_version: String,
-    /// Why the frame went back to review after a re-label with a trained model (its boxes
-    /// disagree with the reviewed labels); the Review queue lists these frames first. Cleared
-    /// when the frame is reviewed or skipped again.
+    /// Why the frame went back to review after a re-label (a trained model's boxes disagree with
+    /// the reviewed labels, or a labeler found an object they lack); the Review queue lists these
+    /// frames first. Cleared when the frame is reviewed or skipped again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disagreement: Option<String>,
     /// The last auto-label run over the frame (round-tripped by the Review page).
@@ -800,7 +803,7 @@ fn check_auto(a: &AutoInfo) -> Result<()> {
     if a.why.len() > 16 || a.why.iter().any(|w| w.chars().count() > 200) {
         bail!("too many or too long triage reasons");
     }
-    if a.labelers.len() > 16 || a.species_scores.len() > super::config::MAX_CLASSES {
+    if a.labelers.len() > MAX_LABELERS || a.species_scores.len() > super::config::MAX_CLASSES {
         bail!("too many labeler or species scores");
     }
     for (k, v) in a.labelers.iter().chain(&a.species_scores) {
