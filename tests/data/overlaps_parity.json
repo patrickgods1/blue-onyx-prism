@@ -1,0 +1,1731 @@
+{
+ "about": "Answers of scripts/research/eval_overlaps.py (zoom_rule, match_zoom, crop_detect) on synthetic input; src/collect/labels/overlaps.rs and scripts/autolabel.py --self-test --parity are checked against them. `cases`: at match IoU 0.6 and score 0.5, with guards; `reviewer` is the reference's no-answer. `crops`: padded crop and detections in frame coordinates.",
+ "point": {
+  "match_iou": 0.6,
+  "score": 0.5,
+  "floor": 0.1,
+  "pad": 0.2
+ },
+ "cases": [
+  {
+   "name": "both boxes seen",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr",
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.8
+    },
+    {
+     "label": "car",
+     "bbox": [
+      20.0,
+      20.0,
+      70.0,
+      70.0
+     ],
+     "score": 0.6
+    }
+   ],
+   "matched": [
+    0,
+    1
+   ],
+   "verdict": "two_objects",
+   "drop": null,
+   "reason": "both",
+   "kept_score": null,
+   "other_score": null,
+   "scores": [
+    0.8,
+    0.6
+   ]
+  },
+  {
+   "name": "only a, more witnesses",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr",
+     "serving"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.9,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "only a, a tie",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.9,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "only b, a tie",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      20.0,
+      20.0,
+      70.0,
+      70.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    null,
+    0
+   ],
+   "verdict": "drop_other",
+   "drop": "a",
+   "reason": "only",
+   "kept_score": 0.9,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "only a, the other has more",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "fewer_witnesses",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  },
+  {
+   "name": "only b, the other has more",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr",
+     "serving"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      20.0,
+      20.0,
+      70.0,
+      70.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    null,
+    0
+   ],
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "fewer_witnesses",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  },
+  {
+   "name": "neither",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr",
+     "serving"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      300.0,
+      300.0,
+      400.0,
+      400.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    null,
+    null
+   ],
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "neither",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  },
+  {
+   "name": "below the score",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.49999
+    }
+   ],
+   "matched": [
+    null,
+    null
+   ],
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "neither",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  },
+  {
+   "name": "at the score",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.5
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.5,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "guarded box to drop",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": true
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "guard",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  },
+  {
+   "name": "guard on the keeper",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": true
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.9,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "a weak detection on the dropped box",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.85
+    },
+    {
+     "label": "car",
+     "bbox": [
+      20.0,
+      20.0,
+      70.0,
+      70.0
+     ],
+     "score": 0.31
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.85,
+   "other_score": 0.31,
+   "scores": null
+  },
+  {
+   "name": "just under the weak band",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.85
+    },
+    {
+     "label": "truck",
+     "bbox": [
+      20.0,
+      20.0,
+      70.0,
+      70.0
+     ],
+     "score": 0.29999
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.85,
+   "other_score": 0.29999,
+   "scores": null
+  },
+  {
+   "name": "the other detection of another object",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.85
+    },
+    {
+     "label": "person",
+     "bbox": [
+      20.0,
+      20.0,
+      70.0,
+      70.0
+     ],
+     "score": 0.45
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.85,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "car and truck are one object",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "truck",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "truck",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.7
+    },
+    {
+     "label": "car",
+     "bbox": [
+      20.0,
+      20.0,
+      70.0,
+      70.0
+     ],
+     "score": 0.2
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.7,
+   "other_score": 0.2,
+   "scores": null
+  },
+  {
+   "name": "two detections on one box: the best IoU",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      100.0
+     ],
+     "score": 0.9
+    },
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      109.0
+     ],
+     "score": 0.6
+    }
+   ],
+   "matched": [
+    1,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.6,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "a tie of IoU: the higher score",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.6
+    },
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    1,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.9,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "a tie of IoU and score: the earlier",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.9
+    },
+    {
+     "label": "car",
+     "bbox": [
+      10.0,
+      10.0,
+      110.0,
+      110.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.9,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "one detection cannot see both",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     0.0,
+     0.0,
+     100.0,
+     100.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     0.0,
+     0.0,
+     100.0,
+     96.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      0.0,
+      0.0,
+      100.0,
+      98.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.9,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "the match IoU, just under",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     0.0,
+     0.0,
+     100.0,
+     100.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     0.0,
+     0.0,
+     300.0,
+     300.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      0.0,
+      0.0,
+      100.0,
+      166.7
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    null,
+    null
+   ],
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "neither",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  },
+  {
+   "name": "the match IoU, just over",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     0.0,
+     0.0,
+     100.0,
+     100.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     0.0,
+     0.0,
+     300.0,
+     300.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      0.0,
+      0.0,
+      100.0,
+      166.6
+     ],
+     "score": 0.9
+    }
+   ],
+   "matched": [
+    0,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.9,
+   "other_score": 0.0,
+   "scores": null
+  },
+  {
+   "name": "the real patio pair",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     1.0,
+     292.0,
+     112.0,
+     414.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     1.0,
+     296.0,
+     257.6,
+     517.0
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr",
+     "serving"
+    ],
+    "guarded": true
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      0.0,
+      303.3,
+      256.9,
+      527.8
+     ],
+     "score": 0.85084
+    },
+    {
+     "label": "car",
+     "bbox": [
+      0.0,
+      291.7,
+      112.0,
+      432.5
+     ],
+     "score": 0.67445
+    },
+    {
+     "label": "car",
+     "bbox": [
+      219.0,
+      418.7,
+      309.0,
+      561.6
+     ],
+     "score": 0.66406
+    },
+    {
+     "label": "car",
+     "bbox": [
+      0.2,
+      292.0,
+      111.7,
+      473.8
+     ],
+     "score": 0.30875
+    }
+   ],
+   "matched": [
+    1,
+    0
+   ],
+   "verdict": "two_objects",
+   "drop": null,
+   "reason": "both",
+   "kept_score": null,
+   "other_score": null,
+   "scores": [
+    0.67445,
+    0.85084
+   ]
+  },
+  {
+   "name": "the real garage pair",
+   "a": {
+    "cls": "car",
+    "bbox": [
+     816.2,
+     315.2,
+     2592.6,
+     1518.9
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "car",
+    "bbox": [
+     857.0,
+     314.0,
+     1828.0,
+     996.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      891.5,
+      116.1,
+      1335.1,
+      423.7
+     ],
+     "score": 0.79268
+    },
+    {
+     "label": "truck",
+     "bbox": [
+      796.5,
+      313.6,
+      2591.5,
+      1506.4
+     ],
+     "score": 0.58083
+    },
+    {
+     "label": "person",
+     "bbox": [
+      1458.2,
+      214.4,
+      1533.6,
+      324.6
+     ],
+     "score": 0.24787
+    },
+    {
+     "label": "car",
+     "bbox": [
+      852.2,
+      314.4,
+      1809.5,
+      771.2
+     ],
+     "score": 0.218
+    },
+    {
+     "label": "car",
+     "bbox": [
+      814.7,
+      315.1,
+      1827.4,
+      1508.2
+     ],
+     "score": 0.16888
+    },
+    {
+     "label": "car",
+     "bbox": [
+      796.5,
+      313.6,
+      2591.5,
+      1506.4
+     ],
+     "score": 0.14932
+    }
+   ],
+   "matched": [
+    1,
+    null
+   ],
+   "verdict": "drop_other",
+   "drop": "b",
+   "reason": "only",
+   "kept_score": 0.58083,
+   "other_score": 0.218,
+   "scores": null
+  },
+  {
+   "name": "a class RF-DETR cannot see",
+   "a": {
+    "cls": "raccoon",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "raccoon",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": null,
+   "matched": null,
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "no_zoom",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  },
+  {
+   "name": "no zoom, witnesses differ",
+   "a": {
+    "cls": "raccoon",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "raccoon",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": false
+   },
+   "dets": null,
+   "matched": null,
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "no_zoom",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  },
+  {
+   "name": "no zoom, the guard holds",
+   "a": {
+    "cls": "raccoon",
+    "bbox": [
+     10.0,
+     10.0,
+     110.0,
+     110.0
+    ],
+    "witnesses": [
+     "gdino",
+     "rfdetr"
+    ],
+    "guarded": false
+   },
+   "b": {
+    "cls": "raccoon",
+    "bbox": [
+     20.0,
+     20.0,
+     70.0,
+     70.0
+    ],
+    "witnesses": [
+     "serving"
+    ],
+    "guarded": true
+   },
+   "dets": null,
+   "matched": null,
+   "verdict": "reviewer",
+   "drop": null,
+   "reason": "no_zoom",
+   "kept_score": null,
+   "other_score": null,
+   "scores": null
+  }
+ ],
+ "crops": [
+  {
+   "name": "in the middle",
+   "union": [
+    100.0,
+    100.0,
+    200.0,
+    150.0
+   ],
+   "size": [
+    640,
+    480
+   ],
+   "found": [
+    {
+     "label": "car",
+     "bbox": [
+      1.04,
+      2.0,
+      50.0,
+      40.0
+     ],
+     "score": 0.4000049
+    }
+   ],
+   "crop": [
+    80,
+    90,
+    220,
+    160
+   ],
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      81.0,
+      92.0,
+      130.0,
+      130.0
+     ],
+     "score": 0.4
+    }
+   ]
+  },
+  {
+   "name": "at the frame corner",
+   "union": [
+    0.0,
+    0.0,
+    300.0,
+    200.0
+   ],
+   "size": [
+    640,
+    480
+   ],
+   "found": [
+    {
+     "label": "truck",
+     "bbox": [
+      -3.0,
+      -2.0,
+      700.0,
+      500.0
+     ],
+     "score": 0.9
+    },
+    {
+     "label": "car",
+     "bbox": [
+      5.0,
+      5.0,
+      40.5,
+      20.25
+     ],
+     "score": 0.12345678
+    }
+   ],
+   "crop": [
+    0,
+    0,
+    360,
+    240
+   ],
+   "dets": [
+    {
+     "label": "truck",
+     "bbox": [
+      0.0,
+      0.0,
+      640,
+      480
+     ],
+     "score": 0.9
+    },
+    {
+     "label": "car",
+     "bbox": [
+      5.0,
+      5.0,
+      40.5,
+      20.2
+     ],
+     "score": 0.12346
+    }
+   ]
+  },
+  {
+   "name": "past the far edge",
+   "union": [
+    600.0,
+    400.0,
+    640.0,
+    480.0
+   ],
+   "size": [
+    640,
+    480
+   ],
+   "found": [
+    {
+     "label": "car",
+     "bbox": [
+      0.0,
+      0.0,
+      200.0,
+      200.0
+     ],
+     "score": 0.5
+    },
+    {
+     "label": "car",
+     "bbox": [
+      120.0,
+      5.0,
+      200.0,
+      60.0
+     ],
+     "score": 0.7
+    }
+   ],
+   "crop": [
+    592,
+    384,
+    640,
+    480
+   ],
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      592.0,
+      384.0,
+      640,
+      480
+     ],
+     "score": 0.5
+    }
+   ]
+  },
+  {
+   "name": "the real garage union",
+   "union": [
+    816.2,
+    314.0,
+    2592.6,
+    1518.9
+   ],
+   "size": [
+    2688,
+    1520
+   ],
+   "found": [
+    {
+     "label": "car",
+     "bbox": [
+      431.5,
+      43.1,
+      875.1,
+      350.7
+     ],
+     "score": 0.79268
+    },
+    {
+     "label": "truck",
+     "bbox": [
+      336.5,
+      240.6,
+      2131.5,
+      1433.4
+     ],
+     "score": 0.58083
+    }
+   ],
+   "crop": [
+    460,
+    73,
+    2688,
+    1520
+   ],
+   "dets": [
+    {
+     "label": "car",
+     "bbox": [
+      891.5,
+      116.1,
+      1335.1,
+      423.7
+     ],
+     "score": 0.79268
+    },
+    {
+     "label": "truck",
+     "bbox": [
+      796.5,
+      313.6,
+      2591.5,
+      1506.4
+     ],
+     "score": 0.58083
+    }
+   ]
+  },
+  {
+   "name": "a box under a pixel",
+   "union": [
+    10.0,
+    10.0,
+    20.0,
+    20.0
+   ],
+   "size": [
+    30,
+    30
+   ],
+   "found": [
+    {
+     "label": "car",
+     "bbox": [
+      500.0,
+      500.0,
+      510.0,
+      510.0
+     ],
+     "score": 0.9
+    }
+   ],
+   "crop": [
+    8,
+    8,
+    22,
+    22
+   ],
+   "dets": []
+  }
+ ]
+}

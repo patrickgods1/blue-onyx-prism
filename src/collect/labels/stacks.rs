@@ -113,7 +113,10 @@ pub fn stacks(boxes: &[LabelBox], wanted: &Wanted<'_>) -> Vec<Stack> {
 }
 
 /// [`overlaps`], with a class list or without one (every label wanted).
-fn overlap_pairs(boxes: &[LabelBox], wanted: Option<&Wanted<'_>>) -> Vec<(usize, usize)> {
+pub(super) fn overlap_pairs(
+    boxes: &[LabelBox],
+    wanted: Option<&Wanted<'_>>,
+) -> Vec<(usize, usize)> {
     let stacked = groups(boxes, wanted);
     let stack_of = |i: usize| stacked.iter().position(|s| s.members.contains(&i));
     let items: Vec<(usize, &LabelBox)> = boxes
@@ -167,7 +170,7 @@ pub fn needs_look(f: &LabelFile, wanted: Option<&Wanted<'_>>) -> bool {
 }
 
 /// Reject `b` as a duplicate, keeping its provenance (`reason`, [`DUPLICATE_REASON`] if none).
-fn mark(b: &mut LabelBox) {
+pub(super) fn mark(b: &mut LabelBox) {
     b.state = BoxState::Rejected;
     b.reject_reason = Some(RejectReason::Duplicate);
     b.difficult = false;

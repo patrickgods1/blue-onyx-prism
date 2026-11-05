@@ -30,7 +30,7 @@ use crate::config::{Config, ModelConfig};
 use crate::resources::catalog::{Platform, Resource, ResourceKind};
 use crate::resources::export::train::TrainPaths;
 use crate::training::capability::Accelerator;
-use crate::training::pyenv::{self, check, stage};
+use crate::training::pyenv::{self, check, is_cancel, stage};
 use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskRecord, TaskReport};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -62,13 +62,6 @@ pub const MODEL_STAGES: [&str; 5] = [
     "labelling",
     "writing labels",
 ];
-
-/// Whether `e` is a cancel ([`crate::resources::export::Cancelled`] or the benchmark's).
-fn is_cancel(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.is::<crate::resources::export::Cancelled>())
-        || crate::benchmark::is_cancelled(e)
-}
 
 fn cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(std::sync::atomic::Ordering::Relaxed)
@@ -456,27 +449,14 @@ impl AutolabelJob {
             let (_, script) = crate::resources::export::train::write_task_scripts(&self.paths)?;
             // The script's own tests of its fusion code, and the imports.
             self.step(report, 2, 95, "checking the auto-labeler");
-            let mut passed = None;
-            pyenv::run_script(
+            pyenv::self_check(
                 ctx.runner,
                 &self.paths,
                 self.platform,
-                &self.paths.scripts,
-                Duration::from_secs(15 * 60),
-                vec![script.clone().into_os_string(), "--self-check".into()],
-                "autolabel",
-                &mut |ev, _| {
-                    if ev.get("event").and_then(serde_json::Value::as_str) == Some("self_test") {
-                        passed = ev.get("passed").and_then(serde_json::Value::as_u64);
-                    }
-                },
+                &script,
                 report,
                 cancel,
-            )
-            .context("the auto-labeler's self-check failed")?;
-            if passed.is_none() {
-                bail!("the auto-labeler's self-test did not run; the script is damaged");
-            }
+            )?;
             check(cancel)?;
             // 3. Weights.
             let res: Vec<&'static Resource> = r.resources();

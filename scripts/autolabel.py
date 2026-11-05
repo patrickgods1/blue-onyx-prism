@@ -34,10 +34,22 @@ Progress: one stdout line `@autolabel {json}` per event (`start`, `model`, `fram
 service runs this file (embedded in the binary) in its training environment
 (<data root>/tools/train-env), offline, with weights it downloaded and SHA-256 checked.
 
+--zoom-pairs is the overlap check's detector (`blue-onyx-prism train overlaps`, docs/TRAINING.md,
+"Overlap suggestions"): RF-DETR L on a padded crop of each union, detections in frame coordinates.
+Input: JSONL, one object per frame: `{"frame": "<rel>", "path": "<image>", "crops": [{"id": 0,
+"union": [x0, y0, x1, y1]}]}`. Output (`--out`): JSONL, one flushed line per finished crop:
+`{"id": 0, "frame": "<rel>", "crop": [x0, y0, x1, y1], "size": [w, h], "boxes": [{"label", "bbox",
+"score"}]}`, highest score first, or `{"id", "frame", "error"}` for an unreadable frame. Progress:
+`@overlaps {json}` events (`start`, `model`, `crop`, `done`). Nothing is decided here either: the
+service matches the detections to the boxes under its label write lock.
+
     python scripts/autolabel.py --self-test           # pure tests of the fusion code, no torch needed
+    python scripts/autolabel.py --self-test --parity tests/data/overlaps_parity.json   # also the crops
     python scripts/autolabel.py --self-check          # imports and the device
     python scripts/autolabel.py --frames f.jsonl --out p.jsonl --classes '["person","car"]' \\
         --gdino <dir> --rfdetr <rf-detr-large.pth> [--vlm <Qwen3-VL dir>] [--siglip <SigLIP 2 dir>]
+    python scripts/autolabel.py --zoom-pairs c.jsonl --out z.jsonl --classes '["person","car"]' \\
+        --rfdetr <rf-detr-large.pth> --rfdetr-threshold 0.1
 """
 
 from __future__ import annotations
@@ -62,9 +74,12 @@ def log(msg: str) -> None:
     print(f"[autolabel] {msg}", flush=True)
 
 
+EVENT_TAG = ["autolabel"]  # the tag of the `@<tag> {json}` lines; --zoom-pairs sets "overlaps"
+
+
 def event(kind: str, **fields) -> None:
     fields["event"] = kind
-    print("\n@autolabel " + json.dumps(fields, separators=(",", ":"), default=str), flush=True)
+    print(f"\n@{EVENT_TAG[0]} " + json.dumps(fields, separators=(",", ":"), default=str), flush=True)
 
 
 def fail(msg: str) -> None:
@@ -274,6 +289,25 @@ def crop_box(b, w: int, h: int, pad: float = 0.2):
     return x0, y0, max(x1, x0 + 1), max(y1, y0 + 1)
 
 
+def clamp_frame(box, w: int, h: int):
+    """`box` clamped to the frame, None when under a pixel (as `GroundingDino.detect`)."""
+    x0, y0, x1, y1 = (max(0.0, min(float(box[0]), w)), max(0.0, min(float(box[1]), h)),
+                      max(0.0, min(float(box[2]), w)), max(0.0, min(float(box[3]), h)))
+    return [x0, y0, x1, y1] if x1 - x0 >= 1 and y1 - y0 >= 1 else None
+
+
+def crop_detections(found: list, box, w: int, h: int) -> list:
+    """Detections of the crop `box` of a `w` x `h` frame in frame coordinates: clamped, 0.1 px and 5
+    decimals (what the overlap check stores and compares), highest score first."""
+    out = []
+    for d in found:
+        b = clamp_frame([d["bbox"][0] + box[0], d["bbox"][1] + box[1], d["bbox"][2] + box[0], d["bbox"][3] + box[1]], w, h)
+        if b is not None:
+            out.append({"label": d["label"], "bbox": [round(v, 1) for v in b], "score": round(float(d["score"]), 5)})
+    out.sort(key=lambda d: -d["score"])
+    return out
+
+
 def needs_vlm(b: dict) -> bool:
     """The VLM checks person boxes and boxes only one labeler found (of the person, vehicle and
     animal classes: its answers cover only those)."""
@@ -315,7 +349,7 @@ def chunks(items: list, n: int) -> list:
     return [items[i:i + n] for i in range(0, len(items), n)]
 
 
-def self_test() -> int:
+def self_test(parity: Path = None) -> int:
     n = 0
 
     def check(cond, what):
@@ -449,6 +483,65 @@ def self_test() -> int:
         for item in r:
             break
     check(r.thread is not None and not r.thread.is_alive(), "prefetch thread stops on early exit")
+    # The overlap check: crops to frame coordinates, one line per crop, an unreadable frame.
+    check(clamp_frame([-3.0, 2.0, 120.0, 50.0], 100, 40) == [0.0, 2.0, 100.0, 40.0], "clamp_frame")
+    check(clamp_frame([99.5, 0, 120, 10], 100, 40) is None, "clamp_frame under a pixel")
+    dets = crop_detections([{"label": "car", "bbox": [1.04, 2.0, 11.0, 12.0], "score": 0.4000049},
+                            {"label": "dog", "bbox": [90.0, 90.0, 400.0, 400.0], "score": 0.91},
+                            {"label": "car", "bbox": [500.0, 2.0, 600.0, 12.0], "score": 0.99}], (10, 20, 110, 120), 200, 150)
+    check(dets == [{"label": "dog", "bbox": [100.0, 110.0, 200.0, 150.0], "score": 0.91},
+                   {"label": "car", "bbox": [11.0, 22.0, 21.0, 32.0], "score": 0.4}], f"crop_detections {dets}")
+
+    class FakeModel:
+        def __init__(self):
+            self.seen = []
+
+        def detect(self, crop, wanted):
+            self.seen.append(crop)
+            return [{"label": "car", "bbox": [0.0, 0.0, 5.0, 5.0], "score": 0.7}]
+
+    class Sink:
+        def __init__(self):
+            self.lines, self.flushes = [], 0
+
+        def write(self, text):
+            self.lines.append(text)
+
+        def flush(self):
+            self.flushes += 1
+
+    fake, sink, seen = FakeModel(), Sink(), []
+    frames = [{"frame": "a", "path": "a", "crops": [{"id": 0, "union": [10, 10, 20, 20]}, {"id": 1, "union": [0, 0, 100, 100]}]},
+              {"frame": "b", "path": "b", "crops": [{"id": 2, "union": [10, 10, 20, 20]}]}]
+
+    def opener(path):
+        if path == "b":
+            raise OSError("broken")
+        return FakeImage()
+
+    quiet, real_log = (lambda msg: None), globals()["log"]
+    globals()["log"] = quiet
+    try:
+        with FrameReader(frames, False, opener=opener) as reader:
+            total = zoom_crops(fake, reader, 3, {}, 0.2, sink, lambda **e: seen.append(e))
+    finally:
+        globals()["log"] = real_log
+    lines = [json.loads(line) for line in sink.lines]
+    check(total == 3 and len(lines) == 3 and sink.flushes == 3, f"zoom_crops lines {lines}")
+    check(all(line.endswith("\n") for line in sink.lines), "zoom_crops one line each")
+    check(lines[0]["crop"] == [8, 8, 22, 22] and lines[0]["id"] == 0 and lines[0]["size"] == [100, 100], f"zoom crop {lines[0]}")
+    check(lines[0]["boxes"] == [{"label": "car", "bbox": [8.0, 8.0, 13.0, 13.0], "score": 0.7}], f"zoom boxes {lines[0]}")
+    check(fake.seen[1] == (0, 0, 100, 100), f"zoom crop clamp {fake.seen}")
+    check(lines[2] == {"id": 2, "frame": "b", "error": "broken"}, f"zoom error line {lines[2]}")
+    check([e["index"] for e in seen] == [1, 2, 3], f"zoom events {seen}")
+    if parity:
+        doc = json.loads(Path(parity).read_text(encoding="utf-8"))
+        check(len(doc["crops"]) >= 4, "parity crops")
+        for c in doc["crops"]:
+            w, h = c["size"]
+            box = crop_box(c["union"], w, h, doc["point"]["pad"])
+            check(list(box) == c["crop"], f"parity crop {c['name']}: {box}")
+            check(crop_detections(c["found"], box, w, h) == c["dets"], f"parity detections {c['name']}")
     event("self_test", passed=n)
     log(f"self-test: {n} checks passed")
     return 0
@@ -864,6 +957,60 @@ class FrameReader:
             self.close()
 
 
+def zoom_crops(model, reader, crops: int, wanted: dict, pad: float, out, emit) -> int:
+    """Runs `model` on every crop of `reader`'s frames; one flushed line per finished crop in `out`,
+    `emit(...)` after each. Returns the crops done."""
+    n = 0
+    for _, fr, image, e in reader:
+        if image is None:
+            log(f"{fr.get('frame')}: cannot read the image ({e}); no zoom answer for it")
+        for c in fr["crops"]:
+            line = {"id": c["id"], "frame": fr["frame"]}
+            if image is None:
+                line["error"] = str(e)
+            else:
+                w, h = image.size
+                box = crop_box(c["union"], w, h, pad)
+                line.update({"crop": list(box), "size": [w, h],
+                             "boxes": crop_detections(model.detect(image.crop(box), wanted), box, w, h)})
+            out.write(json.dumps(line, separators=(",", ":")) + "\n")
+            out.flush()
+            n += 1
+            emit(index=n, crops=crops)
+    return n
+
+
+def zoom_pairs(a: argparse.Namespace) -> int:
+    """The overlap check's detector (module docs). Two CPU threads: the GPU does the work, and the
+    machines this runs on crash under sustained load."""
+    EVENT_TAG[0] = "overlaps"
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    os.environ.setdefault("MKL_NUM_THREADS", "2")
+    classes = [c.strip() for c in json.loads(a.classes) if c.strip()]
+    frames = [json.loads(line) for line in a.zoom_pairs.read_text(encoding="utf-8").splitlines() if line.strip()]
+    crops = sum(len(f["crops"]) for f in frames)
+    if sys.platform == "darwin":
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    device = pick_device(a.device)
+    import torch
+
+    torch.set_num_threads(2)
+    event("start", frames=len(frames), crops=crops, device=device)
+    wanted = {}
+    for c in classes:
+        n = coco_class(c)
+        if n is not None:
+            wanted.setdefault(n, c)
+    t0 = time.time()
+    model = RfDetr(a.rfdetr, device, a.rfdetr_threshold)
+    event("model", name="rfdetr", seconds=round(time.time() - t0, 1))
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    with open(a.out, "w", encoding="utf-8", newline="\n") as out, FrameReader(frames, True) as reader:
+        n = zoom_crops(model, reader, crops, wanted, a.zoom_pad, out, lambda **e: event("crop", **e))
+    event("done", crops=n, seconds=round(time.time() - t0, 1), device=device)
+    return 0
+
+
 class Siglip:
     """SigLIP 2 zero-shot ranking of the animal classes on a crop."""
 
@@ -948,6 +1095,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--self-check", action="store_true")
+    p.add_argument("--parity", type=Path, help="with --self-test: the parity fixture (tests/data/overlaps_parity.json)")
+    p.add_argument("--zoom-pairs", type=Path, help="the overlap check: JSONL of frames with their crops (module docs)")
+    p.add_argument("--zoom-pad", type=float, default=0.2, help="crop padding of --zoom-pairs, a share of the union's size")
     p.add_argument("--frames", type=Path)
     p.add_argument("--out", type=Path)
     p.add_argument("--classes", help="JSON list of the class names")
@@ -971,6 +1121,11 @@ def parse_args() -> argparse.Namespace:
     a = p.parse_args()
     if a.self_test or a.self_check:
         return a
+    if a.zoom_pairs is not None:
+        missing = [k for k in ("out", "classes", "rfdetr") if getattr(a, k) is None]
+        if missing:
+            p.error("--zoom-pairs needs " + ", ".join("--" + m for m in missing))
+        return a
     if a.vlm_batch < 1:
         p.error("--vlm-batch must be at least 1")
     if not 0.0 <= a.vlm_min_score <= 1.0:
@@ -989,10 +1144,12 @@ def main() -> int:
     # on the Training page instead of the progress lines.
     warnings.filterwarnings("ignore", category=FutureWarning)
     if a.self_test:
-        return self_test()
+        return self_test(a.parity)
     if a.self_check:
         return self_check()
     watch_parent()
+    if a.zoom_pairs is not None:
+        return zoom_pairs(a)
 
     classes = [c.strip() for c in json.loads(a.classes) if c.strip()]
     synonyms = dict(DEFAULT_SYNONYMS)

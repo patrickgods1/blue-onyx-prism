@@ -10,10 +10,12 @@
 //! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
 //! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
 //! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
-//! [`repeats`] and the duplicate boxes on one object (stacks, overlaps) in [`stacks`].
+//! [`repeats`], the duplicate boxes on one object (stacks, overlaps) in [`stacks`] and the stored
+//! suggestions for overlapping boxes in [`overlaps`].
 
 pub mod bulk;
 pub mod export;
+pub mod overlaps;
 pub mod queue;
 pub mod repeats;
 pub mod stacks;
@@ -382,6 +384,11 @@ pub struct LabelFile {
     /// clears it when a box is added (the look did not cover that box).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overlaps_checked: bool,
+    /// Suggestions for overlapping pairs from the overlap check ([`overlaps`], `train overlaps`), for
+    /// a reviewer to confirm: they change no box. Round-tripped by the Review page and kept by every
+    /// edit; one whose boxes moved or went is stale and ignored ([`overlaps::live`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlap_suggestions: Vec<overlaps::Suggestion>,
 }
 
 fn labels_version() -> u32 {
@@ -402,6 +409,7 @@ impl Default for LabelFile {
             bulk_accepted: false,
             repeat_spot: false,
             overlaps_checked: false,
+            overlap_suggestions: Vec::new(),
         }
     }
 }
@@ -634,7 +642,8 @@ fn label_ok(l: &str) -> bool {
 /// - `skipped`: `reviewed_at` = `now`; `unreviewed`: no `reviewed_at`;
 /// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
-///   (bounded), `overlaps_checked` kept, `bulk_accepted` cleared;
+///   (bounded), `overlaps_checked` and `overlap_suggestions` (bounded, [`overlaps::check`]) kept,
+///   `bulk_accepted` cleared;
 /// - `version` and `classes_version` set.
 pub fn normalize(
     mut f: LabelFile,
@@ -714,6 +723,7 @@ pub fn normalize(
     f.version = LABELS_VERSION;
     f.classes_version = classes_version(classes);
     f.bulk_accepted = false;
+    overlaps::check(&f.overlap_suggestions)?;
     if let Some(r) = &f.auto_run {
         if [&r.at, &r.labeler]
             .into_iter()
@@ -844,8 +854,8 @@ pub struct MergeReport {
 ///   disagreement for the reviewer; on a pending box: dropped.
 ///
 /// A reviewed (or skipped) file that gains a box goes back to `unreviewed`, keeping its other
-/// decisions, and a gained box ends [`LabelFile::overlaps_checked`]. Proposals are stored with
-/// state `pending` whatever they carry.
+/// decisions, and a gained box ends [`LabelFile::overlaps_checked`] (a stored suggestion stays: its
+/// boxes are still there). Proposals are stored with state `pending` whatever they carry.
 pub fn merge_proposals(f: &mut LabelFile, proposals: Vec<LabelBox>) -> MergeReport {
     let mut r = MergeReport::default();
     let existing = f.boxes.len();

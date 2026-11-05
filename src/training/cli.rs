@@ -183,6 +183,10 @@ pub enum TrainCommand {
     /// Propose boxes for dataset frames (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and
     /// SigLIP 2), or re-label them with a trained model (--with-model).
     Autolabel(AutolabelArgs),
+    /// Check the overlapping boxes of the folder under review with RF-DETR L on a crop of each pair
+    /// and write suggestions for you to confirm on the Review page. It changes no box, status or
+    /// reviewed time.
+    Overlaps(OverlapsArgs),
     /// List the runs recorded in the training folder.
     List,
     /// Delete the training environment (tools/train-env, its base weights and settings).
@@ -412,6 +416,29 @@ pub struct AutolabelArgs {
     #[arg(long)]
     pub allow_large: bool,
     /// Print the labeler's output.
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+/// `train overlaps`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct OverlapsArgs {
+    /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, label, import, limit,
+    /// again=1 (also pairs with an answer). Every label file of the folder under review but
+    /// skipped frames and frames a reviewer checked; status and source do not narrow it.
+    #[arg(long, default_value = "")]
+    pub frames: String,
+    /// GPU, cuda:N (`train capability` lists the usable ones; default the one with the most
+    /// memory).
+    #[arg(long)]
+    pub gpu: Option<String>,
+    /// Allow downloads over 500 MB (the environment, RF-DETR L's weights).
+    #[arg(long)]
+    pub allow_large: bool,
+    /// Only count the frames, pairs and crops of the run.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Print the script's output.
     #[arg(long)]
     pub verbose: bool,
 }
@@ -1171,6 +1198,28 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             );
             run_task_cli(&config, Box::new(job), a.verbose)
         }
+        TrainCommand::Overlaps(a) => {
+            let mut req = super::overlaps::OverlapsRequest::parse(&a.frames)?;
+            req.gpu.clone_from(&a.gpu);
+            req.allow_large = a.allow_large;
+            let cap = super::capability_now();
+            let job = super::overlaps::plan_overlaps(&config, req, &cap)?;
+            eprintln!(
+                "{} in {}",
+                super::task::Task::title(&job),
+                job.dataset_dir.display()
+            );
+            if a.dry_run {
+                let s = job.select()?;
+                println!(
+                    "{} frames, {} pairs to check ({} of classes RF-DETR cannot see), {} crops; {} \
+                     pairs answered before, {} frames skipped or checked by a reviewer",
+                    s.frame_count, s.pairs, s.no_zoom, s.crops, s.answered, s.passed_over
+                );
+                return Ok(true);
+            }
+            run_task_cli(&config, Box::new(job), a.verbose)
+        }
         TrainCommand::List => {
             let runs = service::load_records(&super::runs_file(&config));
             if runs.is_empty() {
@@ -1714,6 +1763,31 @@ mod tests {
     fn parse(args: &[&str]) -> Result<TrainCommand, clap::Error> {
         use clap::Parser;
         T::try_parse_from(std::iter::once("train").chain(args.iter().copied())).map(|t| t.c)
+    }
+
+    #[test]
+    fn overlaps_flags_parse() {
+        let TrainCommand::Overlaps(a) = parse(&[
+            "overlaps",
+            "--frames",
+            "scene=ir,limit=20,again=1",
+            "--gpu",
+            "cuda:1",
+            "--allow-large",
+            "--dry-run",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(a.gpu.as_deref(), Some("cuda:1"));
+        assert!(a.allow_large && a.dry_run && !a.verbose);
+        let r = super::super::overlaps::OverlapsRequest::parse(&a.frames).unwrap();
+        assert_eq!(r.frames.limit, 20);
+        assert!(r.frames.again());
+        let TrainCommand::Overlaps(d) = parse(&["overlaps"]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(d.frames, "");
     }
 
     #[test]

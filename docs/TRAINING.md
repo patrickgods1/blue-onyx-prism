@@ -1325,6 +1325,71 @@ and the pending boxes keep it from adding anything twice. The report adds `missi
 *Accept this spot on all frames* takes the proposals like any pending box (parked cars), `d` marks an
 unclear one.
 
+### Overlap suggestions
+
+`train overlaps` (the Review page's *Suggest overlaps...*; `POST /v1/review/suggest-overlaps`) takes a
+closer look at the nested and partly overlapping boxes that `Reject stacked duplicates` leaves to a
+reviewer, and writes a suggestion for each pair. **It changes no box, frame status, `reviewed_at` or
+`overlaps_checked`**: a box changes when you accept a suggestion on the Review page. An automatic rule
+failed a blind test (13 of 99 drops removed a real object), while it named the right box on 86 of 99, so
+it saves looking, not deciding. Run *Reject stacked duplicates* first: a stack is no open pair.
+
+**Frames:** every label file of the folder under review with an open pair, reviewed frames too (382 of
+the 1,169 frames measured were reviewed); `bucket`, `scene`, `camera`, `label`, `import` and `limit`
+narrow it, `status` and `source` do not. Skipped frames and frames a reviewer checked
+(`overlaps_checked`) are passed over.
+
+**The check.** RF-DETR L runs on a crop of the pair's union (20% padding, so a small pair fills the
+model's input) at score 0.1, and its detections are matched one-to-one to the two boxes of the same
+object (car, truck, bus and van are one object) at IoU >= 0.6 and score >= 0.5, the point the research
+picked (`labels/overlaps.rs` holds these once). The other signal is the *witnesses* of a box: the
+independent detectors that found it (the serving model and each auto-labeler, counted once, in any state,
+at IoU >= 0.7).
+
+| The zoom sees | Witnesses | Suggestion |
+|---|---|---|
+| Both boxes | Any | Two objects |
+| Only X | X has more, or a tie | Drop the other |
+| Only X | The other has more | None |
+| Neither, or it cannot look | One box has more | Drop the other, marked lower confidence |
+| Neither, or it cannot look | A tie | None |
+
+It cannot look at a class outside RF-DETR's COCO label space (raccoon, opossum, ...) or an unreadable frame.
+
+**Guards.** A drop never takes a drawn box, a box you moved (`orig_bbox`) or one you relabelled; that pair
+gets no suggestion. `model_label` alone is not the mark of a relabel: an auto-label run and the pre-fill
+set it too when they map a spelling (`motorbike` on a `motorcycle` box), so a label that names the box's
+own class does not guard; another class (`truck` on a `car` box) or none of the list does.
+
+**What was measured** (the 99 + 45 judged pairs at this point): the right box on 86 of 99 drops; 13 removed
+a real object. By the best other detection on the dropped box: none 2 of 31 failed, under 0.2 3 of 35,
+under 0.3 2 of 17, 0.3 or more 6 of 17, which the page warns about. Two-object suggestions were right on
+36 of 45. Drops from the witnesses alone were not judged; on 197 settled pairs they went 187 right, 10
+wrong, a set that cannot show a real second object removed.
+
+**A run** is a task of the training queue, like an auto-label run: one job at a time, the training lock,
+low priority, pause, and Cancel keeps the finished crops (a rerun skips every pair with an answer, `unclear`
+ones too, so it resumes; `again=1` in the filter looks afresh). The stages are *selecting pairs*, *setting
+up the environment* (the training environment, RF-DETR L's weights through the pinned download if they are
+missing), *zoom check* (`scripts/autolabel.py --zoom-pairs`) and *writing suggestions*. A failed script
+keeps what finished too. It needs an NVIDIA GPU or Apple silicon, about 500 MB of VRAM and on Windows about
+2.6 GB of free commit, checked before the model loads. Measured on a GTX 1070 Ti: 79 ms per crop, about 5
+minutes for 3,578 crops.
+
+**Live reviews.** Each frame is judged again under the label write lock with the file as it stands: a pair
+whose box moved or went is passed over, a frame you skipped or checked meanwhile is left alone, and only a
+frame that gained a suggestion is written. A frame open on the page when the job writes it answers its
+save with the usual "changed since you opened it" conflict.
+
+**On the Review page**, *Auto: overlapping boxes* (which sets Status to any and Frames to all collected)
+lists the frames strongest suggestion first. A frame opens on the box it would drop, marked `drop?` on the
+frame and in the list, with its partner marked `keep`, and the decision bar says why. `y` accepts: the box
+is rejected as a duplicate (out of `hard_negatives.json` and the repeats history), and a keeper that is a
+hint a save would reject is accepted, so the object keeps a box. On a two-object suggestion `y` keeps both,
+and the save records `overlaps_checked`. To turn a suggestion down, do anything else: decide the boxes
+yourself, or save with both kept. The twin rules are `liveSuggestions` / `acceptOverlap` in
+`assets/review.js` and `live` / `accept` in `collect/labels/overlaps.rs`.
+
 ### M1 run (MPS)
 
 | Run | Time | Result |
@@ -1366,6 +1431,8 @@ blue-onyx-prism train import --list-datasets
 blue-onyx-prism train autolabel [--frames "scene=ir,status=unreviewed,import=any,limit=200"] \
     [--gdino tiny|base|large|off] [--no-rfdetr] [--vlm 2b|4b|8b|off] [--no-siglip] [--classes a,b] \
     [--no-vlm-batch] [--vlm-min-score 0.2] [--no-prefetch] [--discard-on-cancel] [--gpu cuda:N] [--allow-large] [--verbose]
+blue-onyx-prism train overlaps [--frames "scene=ir,camera=patio,limit=200,again=1"] [--gpu cuda:0] \
+    [--allow-large] [--dry-run] [--verbose]    # suggestions for overlapping boxes; changes no box
 blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
     [--device <spec>] [--accept-score-model 0.8] [--missing-only] [--confirm-license] [--allow-large] \
     [--frames "status=any,..."]

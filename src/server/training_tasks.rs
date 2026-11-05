@@ -97,6 +97,7 @@ pub(super) fn task_rows(tasks: &[TaskRecord]) -> Vec<TaskRow> {
             kind: match r.kind {
                 TaskKind::Import => "import",
                 TaskKind::Autolabel => "auto-label",
+                TaskKind::Overlaps => "overlap check",
             },
             title: r.title.clone(),
             state: state_str(r.state),
