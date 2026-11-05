@@ -636,15 +636,24 @@ impl CommandRunner for RealScript {
 #[test]
 #[ignore = "needs a GPU, an installed training environment and a copy of a dataset"]
 fn real_script_on_a_copy() {
-    let var = |k: &str| PathBuf::from(std::env::var_os(k).unwrap());
+    // CI runs every ignored test: without these three there is nothing to run.
+    let var = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    let (Some(copy), Some(python), Some(weights)) = (
+        var("BOP_OVERLAPS_COPY"),
+        var("BOP_TRAIN_PYTHON"),
+        var("BOP_RFDETR_WEIGHTS"),
+    ) else {
+        println!("skipped: BOP_OVERLAPS_COPY, BOP_TRAIN_PYTHON or BOP_RFDETR_WEIGHTS is not set");
+        return;
+    };
     let t = tmp("real");
     let mut job = plan(&t.0, "");
-    job.dataset_dir = var("BOP_OVERLAPS_COPY");
+    job.dataset_dir = copy;
     job.free_commit = crate::system_info::commit;
     let fake = RealScript {
         fake: ZoomFake::default(),
-        python: var("BOP_TRAIN_PYTHON"),
-        weights: var("BOP_RFDETR_WEIGHTS"),
+        python,
+        weights,
     };
     let started = std::time::Instant::now();
     let mut last = 0;

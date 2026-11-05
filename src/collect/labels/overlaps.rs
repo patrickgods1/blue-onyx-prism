@@ -1465,7 +1465,11 @@ mod tests {
     #[test]
     #[ignore = "needs a research snapshot"]
     fn real_pairs_agree_with_the_research_reference() {
-        let path = std::env::var("BOP_OVERLAPS_PARITY").unwrap();
+        // CI runs every ignored test: without a snapshot there is nothing to check.
+        let Ok(path) = std::env::var("BOP_OVERLAPS_PARITY") else {
+            println!("skipped: BOP_OVERLAPS_PARITY is not set");
+            return;
+        };
         let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         let cases: Vec<Case> = serde_json::from_value(doc["cases"].clone()).unwrap();
         println!("{} pairs", cases.len());
