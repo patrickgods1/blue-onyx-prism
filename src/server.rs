@@ -294,6 +294,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ),
         ("/training/autolabel", post(training_tasks::autolabel)),
         (
+            "/training/autolabel/preview",
+            post(training_tasks::autolabel_preview),
+        ),
+        (
             "/v1/autolabel/models",
             get(training_tasks::autolabel_models),
         ),
@@ -1110,6 +1114,7 @@ mod tests {
             "/training/import",
             "/v1/training/import/preview",
             "/training/autolabel",
+            "/training/autolabel/preview",
             "/v1/autolabel/models",
             "/v1/autolabel/sam3",
             "/v1/autolabel/sam3/download",

@@ -13,6 +13,10 @@
 // patience, seed, ...) and the Learning rate field's placeholder follows the ticked family.
 // SAM 3: the three-step access panel of the Auto-label card (GET /v1/autolabel/sam3); its option
 // in the labeler select stays disabled until the checkpoint is installed.
+// Auto-label frames: the "Which frames" select writes Status and Auto (the fields the form posts;
+// the select itself has no name, so the import chain's `al.*` copy and the form's restore are the
+// fields as before); Custom shows them. Preview frames posts the form to
+// POST /training/autolabel/preview on a click (it reads every sidecar) and draws the answer.
 (function () {
   "use strict";
 
@@ -334,12 +338,6 @@
       var syncMissing = MP.util.missingToggle(form);
       form.querySelectorAll('input[name="mode"]').forEach(function (r) { r.addEventListener("change", syncMissing); });
     }
-    var preset = document.getElementById("al-preset");
-    if (preset && form.elements.status) {
-      preset.addEventListener("change", function () {
-        form.elements.status.value = preset.value === "self-training" ? "any" : "unreviewed";
-      });
-    }
     var modelProblemOk = function (ev) {
       if (!mp) return true;
       var p = mp.problem() || MP.util.acceptProblem(form.elements.threshold.value, form.elements.model_accept_score.value);
@@ -363,6 +361,7 @@
       return {
         names: names,
         missing: CP.util.missingFrom(names, catalog.classes || []).length > 0,
+        listed: function () { return names.filter(function (n) { return (catalog.classes || []).indexOf(n) >= 0; }); },
         ensure: function () { return CP.ensureInList(names, catalog); }
       };
     };
@@ -380,6 +379,128 @@
         confirmed = true;
         if (form.requestSubmit) form.requestSubmit(by || undefined); else form.submit();
       }).catch(function (e) { say(e.cancelled ? "Not queued: the class list was left as it is." : e.message, true); });
+    });
+  })();
+
+  // "Which frames" is the one writer of Status and Auto while it names a preset, and the model
+  // mode's First pass / Self-training check only moves it. On load it is worked out from the
+  // fields, so a restored form shows what it holds. The fields only Custom uses are disabled under
+  // a preset: a stale scene must not narrow a hidden filter. Status and Auto stay enabled, hidden.
+  (function () {
+    var form = document.getElementById("autolabel-form");
+    var which = document.getElementById("al-which");
+    var field = document.getElementById("al-which-field");
+    if (!form || !which || !field || !form.elements.status || !form.elements.auto) return;
+    var status = form.elements.status, auto = form.elements.auto;
+    var modelPreset = document.getElementById("al-preset");
+    var PRESETS = {
+      unreviewed: ["unreviewed", ""], reviewed: ["reviewed", ""],
+      "reviewed-overlaps": ["reviewed", "overlaps"], "unreviewed-overlaps": ["unreviewed", "overlaps"],
+      all: ["any", ""]
+    };
+    var CUSTOM_ONLY = ["scene", "camera", "label", "frames"];
+    var named = function () {
+      var other = CUSTOM_ONLY.some(function (n) { var e = form.elements[n]; return e && e.value.trim(); });
+      if (other) return "custom";
+      var s = status.value || "unreviewed";
+      var found = Object.keys(PRESETS).filter(function (k) { return PRESETS[k][0] === s && PRESETS[k][1] === auto.value; });
+      return found.length ? found[0] : "custom";
+    };
+    var syncModel = function () {
+      if (!modelPreset) return;
+      var s = status.value || "unreviewed";
+      modelPreset.value = s === "any" ? "self-training" : s === "unreviewed" ? "first-pass" : "";
+    };
+    var apply = function () {
+      var p = PRESETS[which.value];
+      if (p) { status.value = p[0]; auto.value = p[1]; }
+      form.querySelectorAll("[data-al-custom]").forEach(function (el) { el.hidden = !!p; });
+      CUSTOM_ONLY.forEach(function (n) { var e = form.elements[n]; if (e) e.disabled = !!p; });
+      syncModel();
+    };
+    which.addEventListener("change", apply);
+    status.addEventListener("change", syncModel);
+    if (modelPreset) {
+      modelPreset.addEventListener("change", function () {
+        var all = modelPreset.value === "self-training";
+        if (which.value === "custom") { status.value = all ? "any" : "unreviewed"; return; }
+        which.value = all ? "all" : "unreviewed";
+        apply();
+      });
+    }
+    field.hidden = false;
+    which.value = named();
+    apply();
+  })();
+
+  // Preview frames: what the form would do, on a click. A change to the form clears the answer,
+  // which no longer describes it. The classes are the picker's; one not in the class list yet is
+  // appended only by a real run, so it is left out here and said so.
+  (function () {
+    var form = document.getElementById("autolabel-form");
+    var run = document.getElementById("al-preview-run");
+    var box = document.getElementById("al-preview");
+    if (!form || !run || !box) return;
+    var seq = 0;
+    var line = function (cls, text) {
+      var p = document.createElement("p");
+      p.className = cls;
+      p.textContent = text;
+      box.appendChild(p);
+    };
+    var clear = function () { seq++; box.textContent = ""; box.hidden = true; };
+    var draw = function (j, note) {
+      box.textContent = "";
+      box.hidden = false;
+      line("small tr-runs-line", j.summary);
+      var warnings = (j.warnings || []).concat(note ? [note] : []);
+      if (!warnings.length) return;
+      var ul = document.createElement("ul");
+      ul.className = "warn-list small";
+      warnings.forEach(function (w) {
+        var li = document.createElement("li");
+        li.textContent = w;
+        ul.appendChild(li);
+      });
+      box.appendChild(ul);
+    };
+    var fail = function (text) {
+      box.textContent = "";
+      box.hidden = false;
+      line("small error-text", text);
+    };
+    run.hidden = false;
+    form.addEventListener("change", clear);
+    run.addEventListener("click", function () {
+      var mine = ++seq;
+      var body = new URLSearchParams(), note = "";
+      Array.prototype.forEach.call(form.elements, function (e) {
+        if (!e.name || e.disabled || e.name === "classes") return;
+        if ((e.type === "checkbox" || e.type === "radio") && !e.checked) return;
+        body.append(e.name, e.value);
+      });
+      var cls = alClasses ? alClasses() : null;
+      if (cls && !cls.names.length) { fail("Choose at least one class to look for."); return; }
+      if (cls) {
+        var listed = cls.listed();
+        if (!listed.length) { fail("Add a picked class to the class list first: the preview counts listed classes only."); return; }
+        if (listed.length < cls.names.length) note = "Classes not in the class list yet are left out of this count; a real run adds them first.";
+        listed.forEach(function (n) { body.append("classes", n); });
+      }
+      box.textContent = "";
+      box.hidden = false;
+      line("small muted", "Counting the frames\u2026");
+      run.disabled = true;
+      fetch("/training/autolabel/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        body: body.toString()
+      }).then(function (res) { return res.json(); }).then(function (j) {
+        if (mine !== seq) return;
+        if (j.success) draw(j, note); else fail(j.message || "The server gave no answer.");
+      }).catch(function (e) {
+        if (mine === seq) fail(e.message);
+      }).then(function () { run.disabled = false; });
     });
   })();
 
@@ -474,12 +595,15 @@
         var limit = document.getElementById("al-limit");
         var n = parseInt(b.getAttribute("data-al-frames"), 10);
         if (!(n >= 1)) n = 1;
+        // The import's filter is Custom's: the fields must be enabled before they are filled.
+        var which = document.getElementById("al-which");
+        if (which) { which.value = "custom"; which.dispatchEvent(new Event("change", { bubbles: true })); }
         if (frames) {
           frames.value = "import=" + b.getAttribute("data-al-import");
           var d = frames.closest("details");
           if (d) d.open = true;
         }
-        if (status) status.value = "any";
+        if (status) { status.value = "any"; status.dispatchEvent(new Event("change", { bubbles: true })); }
         if (limit) limit.value = String(Math.min(n, 20000));
         var card = document.getElementById("autolabel");
         if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });

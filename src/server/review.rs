@@ -1226,8 +1226,14 @@ pub(super) async fn suggest_overlaps(
                 Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
             };
             let message = (s.pairs == 0).then(|| {
+                let again = if s.answered > 0 {
+                    "; tick Ask again to check the answered ones again"
+                } else {
+                    ""
+                };
                 format!(
-                    "No open overlap without an answer on these frames ({} pairs answered before,                      {} frames skipped or checked by a reviewer).",
+                    "No open overlap without an answer on these frames ({} pairs answered before, \
+                     {} frames skipped or checked by a reviewer){again}.",
                     s.answered, s.passed_over
                 )
             });
@@ -2626,7 +2632,7 @@ mod tests {
             (v["pairs"].as_u64(), v["answered"].as_u64()),
             (Some(0), Some(1))
         );
-        assert!(v["message"].as_str().unwrap().contains("answered"));
+        assert!(v["message"].as_str().unwrap().contains("tick Ask again"));
         let body = r#"{"dry_run":true,"again":true}"#;
         let (_, v) = json(&d.state, post_json("/v1/review/suggest-overlaps", body)).await;
         assert_eq!(
@@ -2650,6 +2656,118 @@ mod tests {
         let bad = r#"{"status":"reviewed"}"#;
         let (st, _) = json(&d.state, post_json("/v1/review/suggest-overlaps", bad)).await;
         assert_ne!(st, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_autolabel_preview_counts_what_the_page_lists_and_queues_nothing() {
+        let d = ds_with(|c| {
+            c.collect.classes = vec!["car".into(), "dog".into()];
+            c.collect.hidden_classes = vec!["dog".into()];
+        });
+        let frame = |stem: &str, label: &str| {
+            put_frame(&d.dir, "drive", "2026-10-21", stem, 0.9);
+            let path = d
+                .dir
+                .join(format!("ir/drive/2026-10-21/{stem}.labels.json"));
+            let at = |bbox: [f32; 4]| labels::LabelBox {
+                label: label.into(),
+                bbox,
+                source: labels::Source::Auto,
+                score: Some(0.5),
+                state: labels::BoxState::Accepted,
+                origin: None,
+                reason: None,
+                model_label: None,
+                orig_bbox: None,
+                difficult: false,
+                reject_reason: None,
+                auto: Default::default(),
+            };
+            let file = LabelFile {
+                status: labels::Status::Reviewed,
+                reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+                boxes: vec![at([1.0, 1.0, 30.0, 20.0]), at([2.0, 1.0, 30.0, 20.0])],
+                ..LabelFile::default()
+            };
+            labels::write(&path, &file).unwrap();
+        };
+        frame("20261021T010203004Z_a", "car");
+        frame("20261021T010204004Z_b", "dog");
+        let post = |body: &str| {
+            Request::post("/training/autolabel/preview")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (_, next) = json(
+            &d.state,
+            get("/v1/review/next?status=reviewed&auto=overlaps&source=all"),
+        )
+        .await;
+        assert_eq!(next["total"], 1, "{next}");
+
+        // The real form's fields; no GPU, download or login is asked for.
+        let (st, v) = json(
+            &d.state,
+            post("mode=labelers&gdino=sam3&rfdetr=on&vlm=2b&status=reviewed&auto=overlaps&limit=1"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["success"], true, "{v}");
+        assert_eq!(v["matched"], next["total"], "{v}");
+        assert_eq!(v["taken"], 1, "{v}");
+        assert_eq!(v["taken_by_status"]["reviewed"], 1, "{v}");
+        assert_eq!(v["over_limit"], 0, "{v}");
+        assert_eq!(v["limit"], 1, "{v}");
+        assert!(v.get("frames").is_none(), "{v}");
+        assert!(
+            v["estimate"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("GTX 1070 Ti"),
+            "{v}"
+        );
+        assert!(
+            v["summary"].as_str().unwrap().contains("This run takes 1"),
+            "{v}"
+        );
+        assert!(
+            v["warnings"][0].as_str().unwrap().contains("may reopen"),
+            "{v}"
+        );
+
+        // The raw filter text of the Review page's form.
+        let (st, v) = json(
+            &d.state,
+            post("frames=status%3Dreviewed%2Csource%3Dall%2Climit%3D5&limit=9&rfdetr=on"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["matched"].as_u64(), v["limit"].as_u64()),
+            (Some(2), Some(5))
+        );
+
+        // The parser's errors are the real form's.
+        let (st, v) = json(&d.state, post("frames=colour%3Dred")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(v["success"], false, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown frame filter"),
+            "{v}"
+        );
+
+        // Nothing was queued (the queue is shared with other tests).
+        let (_, t) = json(&d.state, get("/v1/training")).await;
+        let queued = t["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["title"].as_str().unwrap().contains("status=reviewed"));
+        assert!(!queued, "{}", t["tasks"]);
     }
 
     #[tokio::test]

@@ -24,8 +24,12 @@
 //! saved ([`AutolabelJob::failed_run`]). A labelers run writes through
 //! [`triage::apply_labelers`], decided per frame under the label write lock, so reviewed frames
 //! only reopen for confident new objects and their decided boxes change by nothing but votes.
+//!
+//! [`AutolabelJob::preview`] is stage 1 alone: the same walk ([`AutolabelJob::select`]), written
+//! nowhere, for the pages' Preview and `train autolabel --dry-run`.
 
 use super::models::{self, ConfigWriter, Install, ModelPlan, Target};
+use super::preview::{AutolabelPreview, Counts, StatusSplit};
 use super::relabel::{Detector, Image};
 use super::triage::{self, FrameProposals};
 use super::{AutolabelRequest, Category};
@@ -115,8 +119,8 @@ impl std::fmt::Debug for AutolabelJob {
 
 /// The warning of a run's summary when it reopened frames: the review queue gets them back, the
 /// export takes reviewed frames only.
-const REOPENED_WARNING: &str = "reopened frames leave exports until you save them again on the \
-                                Review page";
+pub(super) const REOPENED_WARNING: &str = "reopened frames leave exports until you save them \
+                                           again on the Review page";
 
 /// A selected frame.
 #[derive(Debug, Clone)]
@@ -126,6 +130,23 @@ struct Selected {
     scene: String,
     width: u32,
     height: u32,
+}
+
+/// What [`AutolabelJob::select`] found.
+#[derive(Debug, Default)]
+struct Selection {
+    /// The frames to label: the first `limit` of those not left out, in queue order.
+    frames: Vec<Selected>,
+    /// Frames matching the filter, left out or not.
+    matched: StatusSplit,
+    /// [`Self::frames`] by status.
+    taken: StatusSplit,
+    /// Left out by the marker.
+    skipped_done: usize,
+    /// Left out because the model trained on them.
+    skipped_trained: usize,
+    /// Frames the queue could not read.
+    unreadable: u64,
 }
 
 /// What [`AutolabelJob::write_frame`] does with a frame's updated label file.
@@ -355,26 +376,49 @@ impl AutolabelJob {
         e.context(msg)
     }
 
-    /// The frames to label, in queue order, and how many matching frames were left out because
+    /// The labeler of this run, as the frames' marker holds it.
+    fn run_labeler(&self) -> String {
+        match &self.model {
+            Some(m) => m.labeler(),
+            None => self.labeler(),
+        }
+    }
+
+    /// Stage 1: the frames of this run for `labeler` ([`Self::run_labeler`]); notes about a
+    /// model's training record go to `warnings`. The run and [`Self::preview`] both come here.
+    fn select_for_run(&self, labeler: &str, warnings: &mut Vec<String>) -> Result<Selection> {
+        let r = &self.request;
+        let trained = match &self.model {
+            Some(plan) if r.missing_only => Some(self.trained(plan, warnings)?),
+            _ => None,
+        };
+        let skip = (!r.frames.again() && !r.missing_only).then_some(labeler);
+        self.select(skip, trained.as_ref())
+    }
+
+    /// Every frame of the filter, in queue order, with the filter's `wanted` set as the Review page
+    /// sets it, so `auto=overlaps` selects the same frames here and there. Frames are left out when
     /// `skip_labeler` (Some in labelers mode without `again=1`) already looked at them for every
     /// class of this run ([`labels::AutoRun::covers`]; a run for a class it did not look for
     /// labels the frame again). With `trained` (a `missing_only` run) only frames of
-    /// [`triage::missing_scope`] count, those of `trained` are left out too, and the last value
-    /// says how many: `limit` is then the number of frames looked at.
+    /// [`triage::missing_scope`] count and those of `trained` are left out too: `limit` is then
+    /// the number of frames looked at. The whole list is walked past `limit`, so the counts are
+    /// of the whole filter, not of the frames before the limit was reached.
     fn select(
         &self,
         skip_labeler: Option<&str>,
         trained: Option<&BTreeSet<String>>,
-    ) -> Result<(Vec<Selected>, usize, usize)> {
+    ) -> Result<Selection> {
         let f = &self.request.frames;
-        let built = queue::build(&self.dataset_dir, &f.filters()?);
-        let mut out = Vec::new();
-        let mut skipped = 0;
-        let mut skipped_trained = 0;
+        let collect = &self.config.collect;
+        let mut filters = f.filters()?;
+        filters.wanted = Some((collect.classes.clone(), collect.hidden_classes.clone()));
+        let built = queue::build(&self.dataset_dir, &filters);
+        let mut out = Selection {
+            unreadable: built.unreadable,
+            ..Selection::default()
+        };
         for item in built.items {
-            if out.len() >= f.limit {
-                break;
-            }
             let Some(frame) = Frame::resolve(&self.dataset_dir, &item.frame) else {
                 continue;
             };
@@ -382,28 +426,28 @@ impl AutolabelJob {
             if !f.accepts_source(rec.source.as_deref()) {
                 continue;
             }
+            let file = frame.labels().ok().flatten();
+            if trained.is_some() && !file.as_ref().is_some_and(triage::missing_scope) {
+                continue;
+            }
+            out.matched.add(item.status);
             if let Some(l) = skip_labeler
-                && frame
-                    .labels()
-                    .ok()
-                    .flatten()
+                && file
                     .and_then(|x| x.auto_run)
                     .is_some_and(|r| r.labeler == l && r.covers(&self.classes))
             {
-                skipped += 1;
+                out.skipped_done += 1;
                 continue;
             }
-            if let Some(trained) = trained {
-                let scope = frame.labels().ok().flatten();
-                if !scope.as_ref().is_some_and(triage::missing_scope) {
-                    continue;
-                }
-                if trained.contains(&item.frame) {
-                    skipped_trained += 1;
-                    continue;
-                }
+            if trained.is_some_and(|t| t.contains(&item.frame)) {
+                out.skipped_trained += 1;
+                continue;
             }
-            out.push(Selected {
+            if out.frames.len() >= f.limit {
+                continue;
+            }
+            out.taken.add(item.status);
+            out.frames.push(Selected {
                 rel: item.frame,
                 jpg: frame.jpg,
                 scene: rec.scene,
@@ -411,7 +455,48 @@ impl AutolabelJob {
                 height: rec.height,
             });
         }
-        Ok((out, skipped, skipped_trained))
+        Ok(out)
+    }
+
+    /// The distinct prompt phrases of the run: the keys of `scripts/autolabel.py`'s
+    /// `phrase_to_class`, which folds case and spaces and runs one prompt per key.
+    fn phrases(&self) -> usize {
+        self.classes
+            .iter()
+            .filter_map(|c| self.synonyms.get(c))
+            .flatten()
+            .map(|p| {
+                p.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+            })
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    /// What this run would do, without doing any of it: stage 1, written nowhere. The frames can
+    /// change before a real run; on the same folder its stage 1 finds exactly these.
+    pub fn preview(&self) -> Result<AutolabelPreview> {
+        let labeler = self.run_labeler();
+        let mut notes = Vec::new();
+        let sel = self.select_for_run(&labeler, &mut notes)?;
+        let counts = Counts {
+            matched: sel.matched,
+            taken: sel.taken,
+            skipped_done: sel.skipped_done,
+            skipped_trained: sel.skipped_trained,
+            unreadable: sel.unreadable,
+        };
+        Ok(AutolabelPreview::new(
+            &self.request,
+            self.dataset_dir.display().to_string(),
+            labeler,
+            self.phrases(),
+            &counts,
+            sel.frames.into_iter().map(|s| s.rel).collect(),
+            notes,
+        ))
     }
 
     /// The frames a `missing_only` run leaves out ([`super::trained_frames`]; stage 1 comes before
@@ -496,21 +581,19 @@ impl AutolabelJob {
 
         // 1. Frames.
         self.step(report, 1, 0, &r.frames.describe());
-        let labeler = match &self.model {
-            Some(m) => m.labeler(),
-            None => self.labeler(),
-        };
+        let labeler = self.run_labeler();
         rep.missing_only = r.missing_only;
-        let trained = match &self.model {
-            Some(plan) if r.missing_only => Some(self.trained(plan, &mut rep.warnings)?),
-            _ => None,
-        };
+        let selection = self.select_for_run(&labeler, &mut rep.warnings)?;
         for w in &rep.warnings {
             tracing::warn!("{w}");
         }
         let training_notes = rep.warnings.clone();
-        let skip = (!r.frames.again() && !r.missing_only).then_some(labeler.as_str());
-        let (frames, skipped, skipped_trained) = self.select(skip, trained.as_ref())?;
+        let Selection {
+            frames,
+            skipped_done: skipped,
+            skipped_trained,
+            ..
+        } = selection;
         rep.skipped_done = skipped;
         rep.skipped_trained = skipped_trained;
         if frames.is_empty() && r.missing_only {

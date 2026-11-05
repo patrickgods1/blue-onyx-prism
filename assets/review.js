@@ -8,7 +8,8 @@
 // "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
 // POST /v1/review/reject-other-class, "Restore reopened frames" POST /v1/review/restore-reopened
 // and "Reject stacked duplicates" POST /v1/review/reject-stacked
-// (all five: dry run, confirm, run). *Suggest overlaps...* queues the overlap check
+// (all five: dry run, confirm, run). Preview frames posts the form to
+// POST /training/autolabel/preview on a click. *Suggest overlaps...* queues the overlap check
 // (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
 // the frame, and `y` accepts the one on screen.
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
@@ -2717,10 +2718,65 @@
       .catch(function () {});
   }
 
+  // The queue's filters into the form's hidden fields.
+  function fillAlFilter() {
+    alForm.elements.frames.value = autolabelFrames();
+    if (alForm.elements.label) alForm.elements.label.value = filtersForm.elements.label ? filtersForm.elements.label.value : '';
+  }
+
+  // The form as a POST body, with the classes `picked`.
+  function alBody(picked) {
+    var body = new URLSearchParams();
+    Array.prototype.forEach.call(alForm.elements, function (e) {
+      if (!e.name || e.disabled) return;
+      if ((e.type === 'checkbox' || e.type === 'radio') && !e.checked) return;
+      body.append(e.name, e.value);
+    });
+    picked.forEach(function (c) { body.append('classes', c); });
+    return body;
+  }
+
+  // Preview frames: what the form would do on these filters, on a click (it reads every sidecar).
+  // A changed form or filter clears the answer. A class not in the class list yet is appended only
+  // by a real run, so it is left out here and said so.
+  function wireAlPreview() {
+    var run = $('rv-al-preview-run'), box = $('rv-al-preview');
+    if (!run || !box || !window.fetch || !window.URLSearchParams) return;
+    var seq = 0;
+    var clear = function () { seq++; box.className = 'review-report'; box.textContent = ''; };
+    run.hidden = false;
+    alForm.addEventListener('change', clear);
+    filtersForm.addEventListener('change', clear);
+    run.addEventListener('click', function () {
+      var mine = ++seq;
+      var picked = alPicker ? alPicker.getSelected() : [];
+      var fail = function (m) { box.className = 'review-report error-text'; report(box, [m]); };
+      if (alPicker && !picked.length) { fail('Choose at least one class to look for.'); return; }
+      var listed = catalog ? picked.filter(function (c) { return (catalog.classes || []).indexOf(c) >= 0; }) : picked;
+      if (alPicker && !listed.length) { fail('Add a picked class to the class list first: the preview counts listed classes only.'); return; }
+      fillAlFilter();
+      box.className = 'review-report';
+      report(box, ['Counting the frames...']);
+      run.disabled = true;
+      api('/training/autolabel/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        body: alBody(listed).toString()
+      }).then(function (j) {
+        if (mine !== seq) return;
+        var warnings = (j.warnings || []).slice();
+        if (listed.length < picked.length) warnings.push('Classes not in the class list yet are left out of this count; a real run adds them first.');
+        report(box, [j.summary], warnings);
+      }).catch(function (e) {
+        if (mine === seq) fail(e.message);
+      }).then(function () { run.disabled = false; });
+    });
+  }
+
   if (alForm) {
+    wireAlPreview();
     alForm.addEventListener('submit', function (ev) {
-      alForm.elements.frames.value = autolabelFrames();
-      if (alForm.elements.label) alForm.elements.label.value = filtersForm.elements.label ? filtersForm.elements.label.value : '';
+      fillAlFilter();
       if (!window.fetch || !window.URLSearchParams) return;   // the plain form post
       ev.preventDefault();
       var picked = alPicker ? alPicker.getSelected() : [];
@@ -2739,13 +2795,7 @@
           return;
         }
       }
-      var body = new URLSearchParams();
-      Array.prototype.forEach.call(alForm.elements, function (e) {
-        if (!e.name || e.disabled) return;
-        if ((e.type === 'checkbox' || e.type === 'radio') && !e.checked) return;
-        body.append(e.name, e.value);
-      });
-      picked.forEach(function (c) { body.append('classes', c); });
+      var body = alBody(picked);
       alStatus.className = 'review-report';
       // Listed, wanted classes left unticked: offer to stop wanting them altogether.
       var skipped = alPicker ? visible().filter(function (c) { return picked.indexOf(c) < 0; }) : [];
@@ -3022,6 +3072,8 @@
       });
       var large = $('rv-suggest-large');
       if (large && large.checked) body.allow_large = true;
+      var askAgain = $('rv-suggest-again');
+      if (askAgain && askAgain.checked) body.again = true;
       body.dry_run = true;
       box.className = 'review-report';
       report(box, ['Counting the pairs...']);
@@ -3031,7 +3083,8 @@
           report(box, [j.message || 'No open overlap without a suggestion on these frames.']);
           return null;
         }
-        if (!window.confirm('Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included, ' +
+        if (!window.confirm('Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
+          (body.again ? ', answered pairs asked again' : '') + ', ' +
           'with RF-DETR L (' + j.crops + ' crops, on the training queue, about ' + Math.max(1, Math.ceil(j.crops * 0.08 / 60)) + ' min)? ' +
           'It writes suggestions only: no box changes until you confirm one here.')) {
           report(box, ['Nothing queued.']);

@@ -275,8 +275,8 @@
       </div>
       <div class="tr-field">
         <label for="al-preset">Preset</label>
-        <select id="al-preset"><option value="first-pass">First pass</option><option value="self-training">Self-training check</option></select>
-        <p class="muted small">First pass: unreviewed frames. Self-training check: all frames, flagging where the model disagrees with your reviewed labels. Sets the status below.</p>
+        <select id="al-preset"><option value="first-pass">First pass</option><option value="self-training">Self-training check</option><option value="" hidden>As under Which frames</option></select>
+        <p class="muted small">First pass: unreviewed frames. Self-training check: all frames, flagging where the model disagrees with your reviewed labels. Sets Which frames below.</p>
       </div>
       <div class="tr-field tr-wide">
         <label class="check"><input type="checkbox" name="missing_only"> Find missing labels only</label>
@@ -285,41 +285,46 @@
     </div>
     <fieldset>
       <legend>Which frames</legend>
+      <div class="tr-field" id="al-which-field" hidden>
+        <label for="al-which">Frames</label>
+        <select id="al-which"><option value="unreviewed">Unreviewed</option><option value="reviewed">Reviewed</option><option value="reviewed-overlaps">Reviewed with overlaps or duplicates</option><option value="unreviewed-overlaps">Unreviewed with overlaps or duplicates</option><option value="all">All</option><option value="custom">Custom</option></select>
+        <p class="muted small">Overlaps or duplicates: the Review page's <em>overlapping boxes</em>; frames whose overlaps a reviewer already checked stay out. Custom: status, scene, camera, class and other filters.</p>
+      </div>
       <div class="tr-grid">
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-status">Status</label>
           <select id="al-status" name="status"><option value="">default</option><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select>
-          <p class="muted small">Default: unreviewed. The model presets set it.</p>
+          <p class="muted small">Default: unreviewed.</p>
         </div>
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-scene">Scene</label>
           <select id="al-scene" name="scene"><option value="">any</option><option value="day">day</option><option value="night">night</option><option value="ir">IR</option></select>
         </div>
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-camera">Camera</label>
           <input type="text" id="al-camera" name="camera" placeholder="any">
         </div>
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-label">Class</label>
           <input type="text" id="al-label" name="label" placeholder="any">
         </div>
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-auto">Auto-labelled</label>
-          <select id="al-auto" name="auto"><option value="">any</option><option value="none">never</option><option value="review">marked review</option><option value="accept">marked accept</option><option value="nothing">found nothing</option></select>
+          <select id="al-auto" name="auto"><option value="">any</option><option value="none">never</option><option value="review">marked review</option><option value="accept">marked accept</option><option value="nothing">found nothing</option><option value="overlaps">overlapping boxes</option></select>
         </div>
         <div class="tr-field">
           <label for="al-limit">Limit</label>
           <input type="number" id="al-limit" name="limit" min="1" max="20000" value="200">
-          <p class="muted small">Most frames, in queue order.</p>
+          <p class="muted small">Most frames, in queue order. Preview says when it cuts a run short.</p>
         </div>
       </div>
       <label class="check"><input type="checkbox" name="again" value="1"> Also frames these labelers already looked at</label>
-      <details class="tr-more">
+      <details class="tr-more" data-al-custom>
         <summary>Other filters</summary>
         <div class="tr-field">
           <label for="al-frames">Filter text</label>
           <input type="text" id="al-frames" name="frames" placeholder="bucket=empty,import=any">
-          <p class="muted small"><code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>import</code> (an import id, or any), <code>source</code> (queue, all; default all here), and any key above (<code>scene</code> day, night, ir; <code>camera</code>; <code>label</code>; <code>status</code> unreviewed, reviewed, skipped, any; <code>auto</code> review, accept, nothing, none; <code>again=1</code>; <code>limit</code>). A key given here wins over its field.</p>
+          <p class="muted small"><code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>import</code> (an import id, or any), <code>source</code> (queue, all; default all here), and any key above (<code>scene</code> day, night, ir; <code>camera</code>; <code>label</code>; <code>status</code> unreviewed, reviewed, skipped, any; <code>auto</code> review, accept, nothing, none, overlaps; <code>again=1</code>; <code>limit</code>). A key given here wins over its field.</p>
         </div>
       </details>
     </fieldset>
@@ -329,7 +334,8 @@
     {% if let Some(what) = autolabel_large %}
     <label class="check tr-confirm" data-mode="labelers"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB: {{ what }}</label>
     {% endif %}
-    <div class="actions"><button type="submit">Auto-label</button></div>
+    <div class="actions"><button type="submit">Auto-label</button> <button type="button" class="secondary" id="al-preview-run" hidden>Preview frames</button></div>
+    <div id="al-preview" role="status" hidden></div>
   </form>
 </div>
 

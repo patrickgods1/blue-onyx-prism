@@ -36,10 +36,12 @@
 //!   becomes a (disabled) config entry.
 //! - [`relabel`]: detection with a model of the config in this process.
 //! - [`job`]: the stage machine ([`AutolabelJob`], a [`super::task::Task`]).
+//! - [`preview`]: what a run would do, from its own first stage ([`preview_autolabel`]).
 
 pub mod catalog;
 pub mod job;
 pub mod models;
+pub mod preview;
 pub mod relabel;
 pub mod triage;
 
@@ -214,7 +216,8 @@ impl VlmSize {
 
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
 /// `label` (any of several classes, separated by `|`: `label=person|car`), `status`, `source`,
-/// `auto`), `import=<id>|any` (imported frames), `again=1` (also
+/// `auto`; `auto=overlaps` needs [`Filters::wanted`], which [`AutolabelJob`] sets from the config
+/// as the Review page does), `import=<id>|any` (imported frames), `again=1` (also
 /// frames these labelers already looked at, see [`crate::collect::labels::AutoRun`]) and `limit`
 /// (most frames, in queue order). Written `key=value` pairs separated by commas
 /// (`scene=ir,status=unreviewed,limit=20`).
@@ -571,19 +574,13 @@ fn sam3_problem(parts_on_disk: bool, lookup: &Lookup, login: &LoginCommand) -> O
     ))
 }
 
-/// Plan an auto-label run of `request` on `config`, the config file at `config_path` (fails fast
-/// on a bad filter, an unknown model, a missing GPU, SAM 3 with no way to get it, or a large
-/// download that was not allowed). A `missing_only` run looks at
-/// every status and every frame of the folder (`status=any`, `source=all`: the job keeps
-/// [`triage::missing_scope`]; the default `unreviewed`, or the Review page's `source=queue`,
-/// would miss the reviewed frames), and the default limit and threshold become [`MAX_LIMIT`] and
-/// [`MISSING_THRESHOLD`] (any other value is used as given).
-pub fn plan_autolabel(
-    config: &Config,
-    config_path: &Path,
-    mut request: AutolabelRequest,
-    cap: &Capability,
-) -> Result<AutolabelJob> {
+/// The part of a plan that decides a run's frames, and what the preview shares with the run: no
+/// GPU, login or download gate applies. A `missing_only` run looks at every status and every frame
+/// of the folder (`status=any`, `source=all`: the job keeps [`triage::missing_scope`]; the default
+/// `unreviewed`, or the Review page's `source=queue`, would miss the reviewed frames), and the
+/// default limit and threshold become [`MAX_LIMIT`] and [`MISSING_THRESHOLD`] (any other value is
+/// used as given). Fails on a bad filter or an unknown class or model.
+fn scoped_job(config: &Config, mut request: AutolabelRequest) -> Result<AutolabelJob> {
     request.validate()?;
     if request.missing_only {
         let query = &mut request.frames.query;
@@ -600,19 +597,61 @@ pub fn plan_autolabel(
         run_classes(&config.collect.classes, request.classes.as_deref())?,
         &config.collect.hidden_classes,
     )?;
-    let paths = TrainPaths::for_config(config);
-    let platform = Platform::current();
-    let allow_large = request.allow_large || config.allow_large_downloads;
     let mut model = None;
-    let mut accelerator = cap.accelerator.clone();
     if let Some(m) = &request.with_model {
         if let Some(d) = &request.device {
             request.device = Some(models::canonical_device(d)?);
         }
-        let plan = models::resolve(config, m, request.device.as_deref())?;
-        check_model_install(config, &plan, allow_large, request.confirm_license)?;
-        model = Some(plan);
+        model = Some(models::resolve(config, m, request.device.as_deref())?);
+    }
+    let id = super::service::new_run_id();
+    Ok(AutolabelJob {
+        work: super::training_dir(config).join("autolabel").join(&id),
+        id,
+        dataset_dir: config.collect.resolved_review_dir(&config.data_root()),
+        synonyms: synonyms(&classes, &config.training.synonyms),
+        classes,
+        request,
+        paths: TrainPaths::for_config(config),
+        platform: Platform::current(),
+        accelerator: None,
+        timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
+        config: Box::new(config.clone()),
+        model,
+        detector: None,
+        config_writer: None,
+        after: None,
+        finish: None,
+    })
+}
+
+/// What a run of `request` on `config` would do: the frames it takes and leaves out, a rough time
+/// ([`preview::AutolabelPreview`]). Reads every sidecar of the folder and writes nothing. Unlike
+/// [`plan_autolabel`] it does not care whether this machine can run it.
+pub fn preview_autolabel(
+    config: &Config,
+    request: AutolabelRequest,
+) -> Result<preview::AutolabelPreview> {
+    scoped_job(config, request)?.preview()
+}
+
+/// Plan an auto-label run of `request` on `config`, the config file at `config_path` (fails fast
+/// on a bad filter, an unknown model, a missing GPU, SAM 3 with no way to get it, or a large
+/// download that was not allowed; [`scoped_job`] says what a `missing_only` run changes).
+pub fn plan_autolabel(
+    config: &Config,
+    config_path: &Path,
+    request: AutolabelRequest,
+    cap: &Capability,
+) -> Result<AutolabelJob> {
+    let mut job = scoped_job(config, request)?;
+    let allow_large = job.request.allow_large || config.allow_large_downloads;
+    job.accelerator.clone_from(&cap.accelerator);
+    if let Some(plan) = &job.model {
+        check_model_install(config, plan, allow_large, job.request.confirm_license)?;
     } else {
+        let paths = &job.paths;
+        let request = &mut job.request;
         // A chosen GPU: its device and its lane's environment.
         let Some(a) = &cap.resolve_gpu(request.gpu.as_deref())? else {
             bail!(
@@ -623,14 +662,14 @@ pub fn plan_autolabel(
         };
         if request.sam3
             && let Some(problem) = sam3_problem(
-                hf_token::sam3_ready(&paths) || hf_token::sam3_parts_present(&paths),
+                hf_token::sam3_ready(paths) || hf_token::sam3_parts_present(paths),
                 &hf_token::lookup(&config.data_root()),
                 &hf_token::login_command_for(config_path),
             )
         {
             bail!(problem);
         }
-        if !env::train_env_ready(&paths, platform, a.lane()) && !allow_large {
+        if !env::train_env_ready(paths, job.platform, a.lane()) && !allow_large {
             let (dl, _) = a.lane().estimate();
             bail!(
                 "the auto-labelers run in the training environment (about {} download); rerun \
@@ -641,32 +680,14 @@ pub fn plan_autolabel(
         let list: Vec<(&'static Resource, std::path::PathBuf)> = request
             .resources()
             .into_iter()
-            .map(|r| (r, super::pyenv::weights_dir(&paths, r)))
+            .map(|r| (r, super::pyenv::weights_dir(paths, r)))
             .collect();
         super::pyenv::check_large(&list, allow_large)?;
         request.gpu = super::capability::gpu_arg(request.gpu.as_deref())?.map(|_| a.device_arg());
-        accelerator = Some(a.clone());
+        job.accelerator = Some(a.clone());
     }
-    request.allow_large = allow_large;
-    let id = super::service::new_run_id();
-    Ok(AutolabelJob {
-        work: super::training_dir(config).join("autolabel").join(&id),
-        id,
-        dataset_dir: config.collect.resolved_review_dir(&config.data_root()),
-        synonyms: synonyms(&classes, &config.training.synonyms),
-        classes,
-        request,
-        paths,
-        platform,
-        accelerator,
-        timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
-        config: Box::new(config.clone()),
-        model,
-        detector: None,
-        config_writer: None,
-        after: None,
-        finish: None,
-    })
+    job.request.allow_large = allow_large;
+    Ok(job)
 }
 
 /// The frame of a `train.txt` line (`./images/s0-day.back.2026-10-25.<stem>.jpg`): the file name

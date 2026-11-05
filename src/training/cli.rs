@@ -346,9 +346,17 @@ pub fn import_chain(a: &ImportArgs) -> Result<ImportChain> {
 #[derive(Debug, Clone, clap::Args)]
 pub struct AutolabelArgs {
     /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, label, status
-    /// (unreviewed | reviewed | skipped | any), source (queue | all), import (<id> | any), limit.
+    /// (unreviewed | reviewed | skipped | any), source (queue | all), auto (review | accept |
+    /// nothing | none | repeats | overlaps: frames in that auto-label state; overlaps = overlapping
+    /// boxes a reviewer has not checked), import (<id> | any), again=1 (also frames these labelers
+    /// already looked at), limit (most frames, in queue order; default 200, at most 20000).
+    /// --dry-run shows what a filter selects.
     #[arg(long, default_value = "")]
     pub frames: String,
+    /// Only count the frames: how many match, how many this run takes after the limit, how many it
+    /// leaves out, and a rough time. Needs no GPU, login or download, and writes nothing.
+    #[arg(long)]
+    pub dry_run: bool,
     /// MM-Grounding-DINO size: tiny, base, large, or off.
     #[arg(long, default_value = "tiny")]
     pub gdino: String,
@@ -799,7 +807,7 @@ fn load_config(path: &Path) -> Result<Config> {
     }
 }
 
-fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
+pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
     let path = config_path.unwrap_or_else(Config::default_config_path);
     let config = load_config(&path)?;
     match args.command {
@@ -1195,6 +1203,13 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
         }
         TrainCommand::Autolabel(a) => {
             let req = autolabel_request(&a)?;
+            if a.dry_run {
+                println!(
+                    "{}",
+                    autolabel_dry_run_text(&super::autolabel::preview_autolabel(&config, req)?)
+                );
+                return Ok(true);
+            }
             let cap = super::capability_now();
             let mut job = super::autolabel::plan_autolabel(&config, &path, req, &cap)?;
             // A local or catalog model is added to the config file (disabled).
@@ -1540,6 +1555,15 @@ fn before_after<'a>(
 /// How many cameras / camera-days the dry run lists.
 const DRY_RUN_TOP: usize = 10;
 
+/// `train autolabel --dry-run`: the preview's folder, sentences and warnings. Pure.
+fn autolabel_dry_run_text(p: &super::autolabel::preview::AutolabelPreview) -> String {
+    let mut t = format!("{}: {}\n{}", p.dir, p.filter, p.summary);
+    for w in &p.warnings {
+        t.push_str(&format!("\nwarning: {w}"));
+    }
+    t
+}
+
 /// `train prepare --dry-run`: the split and, when balancing, what it does. Pure.
 pub fn dry_run_text(plan: &dataset::Plan, balance: &dataset::Balance) -> String {
     let mut out = String::new();
@@ -1773,6 +1797,37 @@ mod tests {
     fn parse(args: &[&str]) -> Result<TrainCommand, clap::Error> {
         use clap::Parser;
         T::try_parse_from(std::iter::once("train").chain(args.iter().copied())).map(|t| t.c)
+    }
+
+    #[test]
+    fn autolabel_dry_run_parses_and_prints_the_warnings() {
+        let TrainCommand::Autolabel(a) = parse(&[
+            "autolabel",
+            "--dry-run",
+            "--frames",
+            "status=reviewed,auto=overlaps,again=1,limit=500",
+        ])
+        .unwrap() else {
+            panic!("autolabel");
+        };
+        assert!(a.dry_run);
+        let r = autolabel_request(&a).unwrap();
+        assert_eq!(r.frames.query["auto"], "overlaps");
+        assert!(r.frames.again());
+        assert_eq!(r.frames.limit, 500);
+        let p = super::super::autolabel::preview::AutolabelPreview::new(
+            &r,
+            "D:/dataset".into(),
+            "labelers".into(),
+            3,
+            &super::super::autolabel::preview::Counts::default(),
+            vec![],
+            vec!["a note".into()],
+        );
+        let t = autolabel_dry_run_text(&p);
+        assert!(t.starts_with("D:/dataset: "), "{t}");
+        assert!(t.contains("No frame matches"), "{t}");
+        assert!(t.ends_with("warning: a note"), "{t}");
     }
 
     #[test]

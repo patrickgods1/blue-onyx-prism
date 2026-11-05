@@ -110,7 +110,9 @@
     <label class="inline-label">At most <input type="number" name="limit" min="1" max="20000" value="50" class="num-sm"> frames</label>
     <label class="check"><input type="checkbox" id="rv-al-again"> Label again (frames already auto-labelled)</label>
     <button type="submit">Auto-label</button>
+    <button type="button" id="rv-al-preview-run" class="secondary" hidden>Preview frames</button>
   </form>
+  <div id="rv-al-preview" class="review-report" role="status"></div>
   <p class="muted cp-note">The classes default to the ones your enabled models detect, within the class list and not hidden in Review; change which models detect what on the <a href="/config#at-models">Config page</a> (Models, <em>Classes</em>).</p>
   <progress id="rv-al-progress" max="100" value="0" hidden></progress>
   <div id="rv-al-status" class="review-report" role="status"></div>
@@ -148,6 +150,7 @@
   <div class="inline-row">
     <button type="button" id="rv-suggest-overlaps" class="small secondary">Suggest overlaps&hellip;</button>
     <label class="check"><input type="checkbox" id="rv-suggest-large"> Download RF-DETR L if missing</label>
+    <label class="check"><input type="checkbox" id="rv-suggest-again"> Ask again <span class="muted small">(pairs with an answer too, say after a rerun added a labeler's vote)</span></label>
     <span class="muted">Takes a closer look at the nested and partly overlapping boxes on the frames the Bucket, Scene, Camera and Class filters select, <strong>reviewed frames too</strong>, and writes a suggestion for each pair: which box to drop, or that they are two objects. <strong>No box changes</strong>: under Auto <em>overlapping boxes</em> the frames open on the suggestion, strongest first, and <kbd>y</kbd> accepts it. Run <em>Reject stacked duplicates</em> first. Runs on the <a href="/training#autolabel">Training</a> queue (NVIDIA GPU or Apple silicon). Asks first.</span>
   </div>
   <progress id="rv-suggest-progress" max="100" value="0" hidden></progress>

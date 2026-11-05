@@ -1,6 +1,7 @@
 //! The Training page's footage import and auto-label forms (`POST /training/import`,
 //! `POST /training/autolabel`, also posted by the Review page), the import preview
-//! (`GET /v1/training/import/preview`, the line under the path field), the models an auto-label
+//! (`GET /v1/training/import/preview`, the line under the path field), the auto-label preview
+//! (`POST /training/autolabel/preview`, both pages' Preview button), the models an auto-label
 //! run can use (`GET /v1/autolabel/models`) and the rows of their jobs.
 //! Both are planned like the CLI does ([`crate::training::import::plan_import`],
 //! [`crate::training::autolabel::plan_autolabel`]) and queued on the page's training queue
@@ -594,6 +595,40 @@ pub(super) async fn autolabel(
                 .into_response(),
             (Ok((m, _)), false) => render(&view(&state, Some(m), None)),
             (Err(e), false) => render(&view(&state, None, Some(format!("Not queued: {e:#}")))),
+        }
+    })
+    .await
+}
+
+/// `POST /training/autolabel/preview` with the fields of the auto-label form
+/// ([`autolabel_from_form`]): 200 `{success: true, ...}`
+/// ([`crate::training::autolabel::preview::AutolabelPreview`]) or 400 `{success: false, message}`.
+/// It reads every sidecar of the folder, so the pages call it on a click, never while typing.
+/// Nothing is queued or written, and no gate of a real run applies: an answer here does not mean
+/// this machine can run it.
+pub(super) async fn autolabel_preview(
+    State(shared): State<Shared>,
+    body: axum::body::Bytes,
+) -> Response {
+    blocking(move || {
+        let state = shared.current();
+        let f = super::dataset::parse_form(&body);
+        let config = state.config_read().clone();
+        let preview = autolabel_from_form(&f)
+            .and_then(|r| crate::training::autolabel::preview_autolabel(&config, r))
+            .and_then(|p| serde_json::to_value(&p).map_err(anyhow::Error::from));
+        match preview {
+            Ok(mut v) => {
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("success".into(), true.into());
+                }
+                Json(v).into_response()
+            }
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"success": false, "message": format!("{e:#}")})),
+            )
+                .into_response(),
         }
     })
     .await
