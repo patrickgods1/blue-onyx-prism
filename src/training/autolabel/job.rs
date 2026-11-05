@@ -27,7 +27,7 @@ use super::triage::{self, FrameProposals};
 use super::{AutolabelRequest, Category};
 use crate::collect::labels::{self, Frame, LabelFile, Triage, queue};
 use crate::config::{Config, ModelConfig};
-use crate::resources::catalog::{Platform, Resource, ResourceKind};
+use crate::resources::catalog::{self, Platform, Resource, ResourceKind};
 use crate::resources::export::train::TrainPaths;
 use crate::training::capability::Accelerator;
 use crate::training::pyenv::{self, check, is_cancel, stage};
@@ -211,11 +211,13 @@ impl AutolabelJob {
     }
 
     /// The labelers of a labelers-mode run (`mm-gdino-tiny + rfdetr-large + ...`), as recorded
-    /// in the report and the frames' `auto_run`.
+    /// in the report and the frames' `auto_run`. SAM 3 has its own key, so frames only
+    /// MM-Grounding-DINO looked at are labelled again by it.
     fn labeler(&self) -> String {
         let r = &self.request;
         [
             r.gdino.map(|g| g.key().to_string()),
+            r.sam3.then(|| catalog::SAM3_KEY.to_string()),
             r.rfdetr.then(|| "rfdetr-large".to_string()),
             r.vlm.map(|v| v.key().to_string()),
             r.siglip.then(|| "siglip2-base".to_string()),
@@ -525,6 +527,12 @@ impl AutolabelJob {
             if let Some(g) = r.gdino {
                 args.push("--gdino".into());
                 args.push(dir_of(g.key())?);
+            }
+            if r.sam3 {
+                args.push("--sam3".into());
+                args.push(dir_of(catalog::SAM3_KEY)?);
+                args.push("--sam3-threshold".into());
+                args.push(r.sam3_threshold.to_string().into());
             }
             if r.rfdetr {
                 let rf = list
@@ -1197,6 +1205,13 @@ impl Task for AutolabelJob {
     }
     fn kind(&self) -> TaskKind {
         TaskKind::Autolabel
+    }
+    fn uses(&self) -> Vec<String> {
+        if self.request.sam3 {
+            vec![catalog::SAM3_ID.to_string()]
+        } else {
+            Vec::new()
+        }
     }
     fn title(&self) -> String {
         // A run after an import names it instead of its frame filter.

@@ -247,7 +247,7 @@
       $("apple").hidden = !s.apple;
       remove.hidden = !(installed || s.parts_on_disk);
       remove.disabled = busy || s.in_use;
-      remove.title = s.in_use ? "An auto-label run may be using it" : "";
+      remove.title = s.in_use ? "An auto-label run is using it" : "";
       if (timer) { clearTimeout(timer); timer = null; }
       if (busy) timer = setTimeout(load, 2000);
     };

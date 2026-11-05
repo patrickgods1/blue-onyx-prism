@@ -9,13 +9,22 @@ use crate::config::ModelConfig;
 use crate::resources::catalog::Platform;
 use crate::resources::export::fake::{Fake, arg_after};
 use crate::resources::export::{Cmd, CommandRunner, Fetcher};
+use crate::training::autolabel::FrameFilter;
 use crate::training::autolabel::models::{ConfigWriter, Install, Target};
 use crate::training::autolabel::triage::Det;
-use crate::training::autolabel::{FrameFilter, plan_autolabel};
 use crate::training::capability::{self, Capability};
 use crate::training::service::RunState;
 use std::path::Path;
 use std::sync::Mutex;
+
+/// [`crate::training::autolabel::plan_autolabel`]; nothing here reads the config file's path.
+fn plan_autolabel(
+    config: &Config,
+    request: AutolabelRequest,
+    cap: &Capability,
+) -> Result<AutolabelJob> {
+    crate::training::autolabel::plan_autolabel(config, Path::new("config.json"), request, cap)
+}
 
 struct Tmp(PathBuf);
 
@@ -123,11 +132,16 @@ impl CommandRunner for LabelFake {
                 text.push('\n');
                 continue;
             }
+            let seat = if cmd.args.iter().any(|a| a == "--sam3") {
+                "sam3"
+            } else {
+                "gdino"
+            };
             let line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48, "boxes": [
                 {"label": "car", "bbox": [1, 1, 30, 20], "score": 0.82, "agree": true,
-                 "sources": {"gdino": 0.7, "rfdetr": 0.94}},
+                 "sources": {(seat): 0.7, "rfdetr": 0.94}},
                 {"label": "raccoon", "bbox": [35, 20, 60, 46], "score": 0.31, "agree": false,
-                 "sources": {"gdino": 0.31},
+                 "sources": {(seat): 0.31},
                  "vlm": {"model": "qwen3-vl-2b", "answer": "rock", "expected": "animal", "ok": false},
                  "species_scores": {"raccoon": 0.6, "cat": 0.4}},
                 {"label": "unicorn", "bbox": [1, 1, 5, 5], "score": 0.9, "agree": true, "sources": {}}
@@ -1387,6 +1401,88 @@ fn script_flags_follow_the_run_options() {
         "{a:?}"
     );
     assert!(has(&a, "--prefetch"), "{a:?}");
+}
+
+/// A SAM 3 run, past the plan's login gate (it looks at this machine's token).
+fn sam3_job(cfg: &Config) -> AutolabelJob {
+    let mut job =
+        plan_autolabel(cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    job.request.gdino = None;
+    job.request.sam3 = true;
+    job
+}
+
+#[test]
+fn sam3_runs_in_the_gdino_seat_with_its_own_marker_and_never_accepts() {
+    let t = tmp("sam3");
+    let rels = frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let fake = LabelFake::default();
+
+    let job = sam3_job(&cfg);
+    assert_eq!(
+        job.labeler(),
+        "sam3 + rfdetr-large + qwen3-vl-2b + siglip2-base"
+    );
+    assert_eq!(Task::uses(&job), [catalog::SAM3_ID]);
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(out.result["frames"], 2);
+    // The car both found at 0.82 would be `accept` with MM-Grounding-DINO.
+    assert_eq!(out.result["accept"], 0, "{}", out.result);
+    assert_eq!(out.result["review"], 4, "{}", out.result);
+    let dir = t.0.join("dataset");
+    let f = labels_of(&dir, &rels[0]);
+    let car = f.boxes.iter().find(|b| b.label == "car").unwrap();
+    assert_eq!(car.auto.triage, Some(labels::Triage::Review));
+    assert!(car.auto.why.iter().any(|w| w.contains("SAM 3")), "{car:?}");
+    assert_eq!(car.auto.labelers.keys().next().unwrap(), "rfdetr");
+    assert!(car.auto.labelers.contains_key("sam3"), "{car:?}");
+    assert_eq!(f.auto_run.unwrap().labeler, job.labeler());
+
+    // The script's arguments: --sam3 with its folder, no --gdino.
+    let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
+    let weights = job.paths.weights.join("sam3");
+    assert_eq!(arg_after(&cmd, "--sam3").unwrap(), weights);
+    assert_eq!(
+        arg_after(&cmd, "--sam3-threshold").unwrap(),
+        Path::new("0.3")
+    );
+    assert!(arg_after(&cmd, "--gdino").is_none(), "{}", cmd.display());
+    assert!(
+        fake.inner
+            .fetched
+            .lock()
+            .unwrap()
+            .contains(&catalog::SAM3_ID.to_string())
+    );
+
+    // The same run again is covered; MM-Grounding-DINO's is another run.
+    let e = run_job(&sam3_job(&cfg), &fake).unwrap_err().to_string();
+    assert!(e.contains("all 2 frame(s)"), "{e}");
+    let gdino =
+        plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    assert!(Task::uses(&gdino).is_empty());
+    assert_eq!(run_job(&gdino, &fake).unwrap().result["frames"], 2);
+    // So is SAM 3 after it: a gdino marker does not skip these frames.
+    assert_eq!(run_job(&sam3_job(&cfg), &fake).unwrap().result["frames"], 2);
+}
+
+#[test]
+fn sam3_can_run_without_rfdetr() {
+    let t = tmp("sam3-alone");
+    frames(&t.0, 1, false);
+    let cfg = config(&t.0);
+    let fake = LabelFake::default();
+    let mut job = sam3_job(&cfg);
+    job.request.rfdetr = false;
+    job.request.sam3_threshold = 0.45;
+    run_job(&job, &fake).unwrap();
+    let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        arg_after(&cmd, "--sam3-threshold").unwrap(),
+        Path::new("0.45")
+    );
+    assert!(arg_after(&cmd, "--rfdetr").is_none(), "{}", cmd.display());
 }
 
 #[test]

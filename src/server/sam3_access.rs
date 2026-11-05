@@ -62,7 +62,7 @@ pub(super) struct Sam3Status {
     progress: Option<u8>,
     /// Every file is here at its pinned size: no login needed.
     parts_on_disk: bool,
-    /// An auto-label run may be using the folder: Remove is refused.
+    /// An auto-label run uses the folder: Remove is refused.
     in_use: bool,
     repo_url: &'static str,
     license: &'static str,
@@ -184,12 +184,11 @@ fn checking() -> (Sam3State, String) {
     )
 }
 
-/// A queued or running auto-label run may read the checkpoint. The records do not say which
-/// labelers a run uses, so any of them counts.
-fn run_uses_folder(tasks: &[TaskRecord]) -> bool {
-    tasks
-        .iter()
-        .any(|t| t.kind == TaskKind::Autolabel && t.state.is_busy())
+/// A queued or running auto-label run with SAM 3 reads the checkpoint.
+fn run_uses_folder(tasks: &[TaskRecord], res: &Resource) -> bool {
+    tasks.iter().any(|t| {
+        t.kind == TaskKind::Autolabel && t.state.is_busy() && t.uses.iter().any(|u| u == res.id)
+    })
 }
 
 fn folder_of(cfg: &Config, res: &Resource) -> PathBuf {
@@ -236,7 +235,7 @@ fn view(state: &AppState, t: &Target, tasks: &[TaskRecord]) -> Sam3Status {
         size_text: catalog::format_size(t.res.size()),
         progress,
         parts_on_disk,
-        in_use: run_uses_folder(tasks),
+        in_use: run_uses_folder(tasks, t.res),
         repo_url: t.gated.repo_url,
         license: t.gated.license,
         apple: std::env::consts::OS == "macos",
@@ -433,11 +432,11 @@ fn remove_with(state: &AppState, t: &Target, tasks: &[TaskRecord]) -> Response {
         body.message = message;
         reply(code, body)
     };
-    if run_uses_folder(tasks) {
+    if run_uses_folder(tasks, t.res) {
         return refuse(
             StatusCode::CONFLICT,
-            "an auto-label run is queued or running and may be using SAM 3; wait for it or \
-             cancel it, then remove"
+            "an auto-label run with SAM 3 is queued or running; wait for it or cancel it, then \
+             remove"
                 .to_string(),
         );
     }
@@ -738,25 +737,40 @@ mod tests {
     }
 
     #[test]
-    fn only_a_busy_autolabel_run_blocks_remove() {
-        let record = |kind: &str, state: &str| -> TaskRecord {
+    fn only_a_busy_autolabel_run_with_sam3_blocks_remove() {
+        let res = fixture("http://127.0.0.1:9");
+        let record = |kind: &str, state: &str, uses: &[&str]| -> TaskRecord {
             serde_json::from_value(serde_json::json!({
                 "id": "t", "kind": kind, "title": "t", "created": "now", "state": state,
-                "step": 0, "steps": 1, "percent": 0,
+                "step": 0, "steps": 1, "percent": 0, "uses": uses,
             }))
             .unwrap()
         };
-        assert!(!run_uses_folder(&[]));
+        let sam3 = [res.id];
+        assert!(!run_uses_folder(&[], res));
         for state in ["queued", "running", "paused"] {
-            assert!(run_uses_folder(&[record("autolabel", state)]), "{state}");
+            assert!(
+                run_uses_folder(&[record("autolabel", state, &sam3)], res),
+                "{state}"
+            );
+            assert!(
+                !run_uses_folder(&[record("autolabel", state, &[])], res),
+                "a run with MM-Grounding-DINO: {state}"
+            );
         }
         for state in ["done", "failed", "cancelled"] {
-            assert!(!run_uses_folder(&[record("autolabel", state)]), "{state}");
+            assert!(
+                !run_uses_folder(&[record("autolabel", state, &sam3)], res),
+                "{state}"
+            );
         }
-        assert!(!run_uses_folder(&[
-            record("import", "running"),
-            record("overlaps", "running")
-        ]));
+        assert!(!run_uses_folder(
+            &[
+                record("import", "running", &[]),
+                record("overlaps", "running", &[])
+            ],
+            res
+        ));
     }
 
     #[test]
@@ -933,7 +947,7 @@ mod tests {
 
         let busy: TaskRecord = serde_json::from_value(serde_json::json!({
             "id": "t", "kind": "autolabel", "title": "t", "created": "now", "state": "running",
-            "step": 0, "steps": 1, "percent": 0,
+            "step": 0, "steps": 1, "percent": 0, "uses": [res.id],
         }))
         .unwrap();
         let (code, _, v) = body_of(remove_with(&state, &t, &[busy])).await;

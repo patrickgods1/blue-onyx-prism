@@ -220,8 +220,9 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 
 /// The auto-label run of a form: the frame filter ([`frame_filter_text`]), `mode` (`labelers`
 /// ignores `with_model`, `model` needs it; absent = `with_model` decides, as the Review page and
-/// older forms post), `gdino`, `vlm` (`off` = none), `rfdetr` / `siglip` (ticked = on; the
-/// Review page's form sends them), `with_model` (any id of `GET /v1/autolabel/models`),
+/// older forms post), `gdino` (a size, or `sam3` for SAM 3 in its seat), `vlm` (`off` = none),
+/// `rfdetr` / `siglip` (ticked = on; the Review page's form sends them), `with_model` (any id of
+/// `GET /v1/autolabel/models`),
 /// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick), and for
 /// a run with a model `device` (empty = the model's), `model_accept_score` (empty = off),
 /// `missing_only` (ticked = on); `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
@@ -243,6 +244,11 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
     let mut r = AutolabelRequest::new(frames);
     r.gdino = match field(f, "gdino").unwrap_or("tiny") {
         "off" => None,
+        // A model run ignores the labelers' fields, and a page's select may still say SAM 3.
+        "sam3" => {
+            r.sam3 = with_model.is_none();
+            None
+        }
         g => Some(
             GdinoSize::parse(g)
                 .ok_or_else(|| anyhow::anyhow!("MM-Grounding-DINO: '{g}' is not a size"))?,
@@ -403,7 +409,12 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
             let autolabel = if chained {
                 let mut plan = || -> anyhow::Result<AutolabelJob> {
                     let req = autolabel_from_form(&chained_autolabel_fields(&f))?;
-                    let mut al = crate::training::autolabel::plan_autolabel(&config, req, &cap)?;
+                    let mut al = crate::training::autolabel::plan_autolabel(
+                        &config,
+                        &state.config_path,
+                        req,
+                        &cap,
+                    )?;
                     attach_seams(&state, &shared, &config, &mut al);
                     crate::training::autolabel::follow_import(&mut al, &job);
                     al.finish = finish.take();
@@ -550,7 +561,8 @@ pub(super) async fn autolabel(
         let result = (|| -> anyhow::Result<(String, String)> {
             let req = autolabel_from_form(&f)?;
             let cap = crate::training::capability_now();
-            let mut job = crate::training::autolabel::plan_autolabel(&config, req, &cap)?;
+            let mut job =
+                crate::training::autolabel::plan_autolabel(&config, &state.config_path, req, &cap)?;
             attach_seams(&state, &shared, &config, &mut job);
             let title = crate::training::task::Task::title(&job);
             let missing = job.request.missing_only;
@@ -1308,6 +1320,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
+    fn the_form_takes_sam3_in_the_gdino_seat() {
+        let r = autolabel_from_form(&form(&[("gdino", "sam3"), ("rfdetr", "on")])).unwrap();
+        assert!(r.sam3);
+        assert_eq!(r.gdino, None);
+        // Enough on its own.
+        let r = autolabel_from_form(&form(&[("gdino", "sam3"), ("vlm", "off")])).unwrap();
+        assert!(r.sam3 && !r.rfdetr);
+        let r = autolabel_from_form(&form(&[("gdino", "tiny"), ("rfdetr", "on")])).unwrap();
+        assert!(!r.sam3);
+        assert_eq!(r.gdino, Some(GdinoSize::Tiny));
+        // A model run ignores the labelers' select, as it does their other fields.
+        let r = autolabel_from_form(&form(&[
+            ("mode", "model"),
+            ("with_model", "x"),
+            ("gdino", "sam3"),
+        ]))
+        .unwrap();
+        assert!(!r.sam3);
+        assert_eq!(r.with_model.as_deref(), Some("x"));
+        // Through an import's `al.` fields.
+        let f = form(&[
+            ("autolabel", "on"),
+            ("al.mode", "labelers"),
+            ("al.gdino", "sam3"),
+            ("al.rfdetr", "on"),
+        ]);
+        let r = autolabel_from_form(&chained_autolabel_fields(&f)).unwrap();
+        assert!(r.sam3 && r.rfdetr);
+        assert_eq!(r.gdino, None);
+    }
+
+    #[test]
     fn chained_fields_and_follow_ups_parse() {
         let f = form(&[
             ("al.mode", "model"),
@@ -1435,6 +1479,7 @@ mod tests {
             error: None,
             finished: None,
             after: after.map(str::to_string),
+            uses: Vec::new(),
         };
         let tasks = vec![
             rec("imp", TaskKind::Import, RunState::Running, None),

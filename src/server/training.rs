@@ -1059,13 +1059,21 @@ fn view_with(
                 "qwen3-vl-4b",
                 "qwen3-vl-8b",
             ]);
+            // Never a reason for the box on its own: the page offers SAM 3 once it is installed.
+            let sam3 = if missing(&[catalog::SAM3_KEY]) > 0 {
+                "; SAM 3 has its own download above"
+            } else {
+                ""
+            };
             if defaults > 0 {
                 label.push(format!(
-                    "the labeler weights ({} for the default set, more for larger sizes)",
+                    "the labeler weights ({} for the default set, more for larger sizes{sam3})",
                     catalog::format_size(defaults)
                 ));
             } else if others > 0 {
-                label.push("the weights of a larger labeler size if you pick one".into());
+                label.push(format!(
+                    "the weights of a larger labeler size if you pick one{sam3}"
+                ));
             }
             (large(import), large(label))
         }
@@ -3298,6 +3306,7 @@ mod tests {
             error: None,
             finished: None,
             after: None,
+            uses: Vec::new(),
         };
         let (run, paused) = ("pause-test-running", "pause-test-paused");
         svc.put_task_record(rec(run, RunState::Running));

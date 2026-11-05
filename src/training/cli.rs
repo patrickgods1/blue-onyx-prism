@@ -352,6 +352,11 @@ pub struct AutolabelArgs {
     /// MM-Grounding-DINO size: tiny, base, large, or off.
     #[arg(long, default_value = "tiny")]
     pub gdino: String,
+    /// SAM 3 in MM-Grounding-DINO's place (gated: request access and sign in first, see the
+    /// Training page's SAM 3 panel). Its boxes always go to review. Not with --gdino or
+    /// --with-model.
+    #[arg(long, conflicts_with = "gdino")]
+    pub sam3: bool,
     /// Do not run RF-DETR L.
     #[arg(long)]
     pub no_rfdetr: bool,
@@ -497,6 +502,11 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
                 .with_context(|| format!("--gdino: '{g}' is not tiny, base, large or off"))?,
         ),
     };
+    if a.sam3 {
+        // `--gdino` itself is refused when parsing; this is its default.
+        r.gdino = None;
+        r.sam3 = true;
+    }
     r.vlm = match a.vlm.trim() {
         "off" | "none" | "" => None,
         v => Some(
@@ -1144,7 +1154,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             // Planned before anything runs: a bad auto-label setting imports nothing.
             let autolabel = match chain.autolabel {
                 Some(r) => {
-                    let mut al = super::autolabel::plan_autolabel(&config, r, &cap)
+                    let mut al = super::autolabel::plan_autolabel(&config, &path, r, &cap)
                         .context("auto-label of the import (nothing was imported)")?;
                     super::autolabel::follow_import(&mut al, &job);
                     al.config_writer = Some(writer);
@@ -1186,7 +1196,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
         TrainCommand::Autolabel(a) => {
             let req = autolabel_request(&a)?;
             let cap = super::capability_now();
-            let mut job = super::autolabel::plan_autolabel(&config, req, &cap)?;
+            let mut job = super::autolabel::plan_autolabel(&config, &path, req, &cap)?;
             // A local or catalog model is added to the config file (disabled).
             job.config_writer = Some(Arc::new(super::autolabel::models::FileConfigWriter {
                 path: path.clone(),
@@ -1963,6 +1973,34 @@ mod tests {
     }
 
     #[test]
+    fn sam3_clears_the_gdino_default_and_refuses_an_explicit_one() {
+        let TrainCommand::Autolabel(a) = parse(&["autolabel", "--sam3"]).unwrap() else {
+            panic!()
+        };
+        let r = autolabel_request(&a).unwrap();
+        assert!(r.sam3);
+        assert_eq!(r.gdino, None);
+        assert!(r.rfdetr, "only the seat changes");
+        let TrainCommand::Autolabel(a) = parse(&["autolabel"]).unwrap() else {
+            panic!()
+        };
+        let r = autolabel_request(&a).unwrap();
+        assert!(!r.sam3);
+        assert_eq!(r.gdino, Some(super::super::autolabel::GdinoSize::Tiny));
+        let e = parse(&["autolabel", "--sam3", "--gdino", "base"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--sam3") && e.contains("--gdino"), "{e}");
+        let TrainCommand::Autolabel(a) =
+            parse(&["autolabel", "--sam3", "--with-model", "x"]).unwrap()
+        else {
+            panic!()
+        };
+        let e = autolabel_request(&a).unwrap_err().to_string();
+        assert!(e.contains("--with-model"), "{e}");
+    }
+
+    #[test]
     fn import_follow_up_flags_parse_and_are_checked() {
         let chain = |args: &[&str]| {
             let mut v = vec!["import", "--path", "clips"];
@@ -2030,6 +2068,7 @@ mod tests {
                 error: None,
                 finished: None,
                 after: None,
+                uses: Vec::new(),
             };
             r.summary = summary.map(str::to_string);
             chain_ok(i, Some(&r))

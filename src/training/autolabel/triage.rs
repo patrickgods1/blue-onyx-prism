@@ -16,6 +16,7 @@ use crate::collect::labels::{
     self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, Origin, Source, Status,
     Triage, VlmCheck, inside_share, iou, merge_proposals,
 };
+use crate::resources::catalog::SAM3_KEY;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,7 +46,7 @@ pub struct Proposal {
     pub label: String,
     pub bbox: [f32; 4],
     pub score: f32,
-    /// Best score per labeler (`gdino`, `rfdetr`).
+    /// Best score per labeler (`gdino` or `sam3`, `rfdetr`).
     #[serde(default)]
     pub sources: BTreeMap<String, f32>,
     #[serde(default)]
@@ -66,8 +67,9 @@ pub struct FrameProposals {
 
 /// The triage of a proposal on a `scene` frame: `accept` only when both labelers agree, the
 /// fused score is at least `accept_score`, it is not a person or an animal at night (`night` /
-/// `ir`), the VLM did not object and SigLIP ranks the box's own species first; else `review`
-/// with the reasons.
+/// `ir`), the VLM did not object, SigLIP ranks the box's own species first and SAM 3 did not find
+/// it ([`ACCEPT_SCORE`] was tuned on MM-Grounding-DINO + RF-DETR, and a bulk accept reaches the
+/// exports); else `review` with the reasons.
 pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<String>) {
     let mut why = Vec::new();
     if !p.agree {
@@ -83,6 +85,9 @@ pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<Stri
     }
     if p.score < accept_score {
         why.push(format!("score {:.2} below {accept_score:.2}", p.score));
+    }
+    if p.sources.contains_key(SAM3_KEY) {
+        why.push("found by SAM 3: always reviewed".to_string());
     }
     if let Some(n) = night_review(&p.label, scene) {
         why.push(n.to_string());
@@ -747,6 +752,29 @@ mod tests {
         );
         s.species_scores = [("cat".to_string(), 0.8), ("raccoon".to_string(), 0.2)].into();
         assert_eq!(triage(&s, "day", ACCEPT_SCORE).0, Triage::Accept);
+    }
+
+    #[test]
+    fn a_box_sam3_found_is_never_accepted() {
+        // Everything else would accept it.
+        let mut b = p("car", 0.95, true);
+        b.sources = [("sam3".to_string(), 0.95), ("rfdetr".to_string(), 0.95)].into();
+        let (t, why) = triage(&b, "day", ACCEPT_SCORE);
+        assert_eq!(t, Triage::Review);
+        assert_eq!(why, ["found by SAM 3: always reviewed"]);
+        // RF-DETR alone on a SAM 3 run is an ordinary one-labeler box.
+        b.sources = [("rfdetr".to_string(), 0.95)].into();
+        b.agree = false;
+        assert_eq!(triage(&b, "day", ACCEPT_SCORE).1, ["found by rfdetr only"]);
+        // Through to the box the page shows.
+        b.sources = [("sam3".to_string(), 0.95)].into();
+        let boxes = to_boxes(&[b], &classes(), "day", 640, 480, ACCEPT_SCORE);
+        assert_eq!(boxes[0].auto.triage, Some(Triage::Review));
+        assert!(
+            boxes[0].auto.why.iter().any(|w| w.contains("SAM 3")),
+            "{:?}",
+            boxes[0].auto.why
+        );
     }
 
     #[test]

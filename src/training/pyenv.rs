@@ -10,7 +10,7 @@ use super::task::TaskReport;
 use crate::resources::catalog::{self, Platform, Resource};
 use crate::resources::export::train::{self as env, TrainPaths};
 use crate::resources::export::{Cancelled, CommandRunner, Fetcher, Progress, Stage};
-use crate::resources::manager;
+use crate::resources::{hf_token, manager};
 use anyhow::{Context, Result, anyhow, bail};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -65,12 +65,19 @@ pub fn stage(
     });
 }
 
-/// Total size of the resources of `list` that are not installed yet.
-pub fn missing_bytes(list: &[(&'static Resource, PathBuf)]) -> u64 {
+/// The resources of `list` a fetch would download: not installed, and not every file on disk at
+/// its pinned size either, which the download manager adopts by hash with no network.
+fn to_download<'a>(
+    list: &'a [(&'static Resource, PathBuf)],
+) -> impl Iterator<Item = &'static Resource> + 'a {
     list.iter()
-        .filter(|(r, d)| !manager::is_installed(r, d))
-        .map(|(r, _)| r.size())
-        .sum()
+        .filter(|(r, d)| !manager::is_installed(r, d) && !hf_token::parts_present(r, d))
+        .map(|(r, _)| *r)
+}
+
+/// Total size of the resources of `list` that have to be downloaded ([`to_download`]).
+pub fn missing_bytes(list: &[(&'static Resource, PathBuf)]) -> u64 {
+    to_download(list).map(Resource::size).sum()
 }
 
 /// Refuse a download over the large-download gate unless allowed (`--allow-large`, the page's
@@ -78,11 +85,7 @@ pub fn missing_bytes(list: &[(&'static Resource, PathBuf)]) -> u64 {
 pub fn check_large(list: &[(&'static Resource, PathBuf)], allowed: bool) -> Result<()> {
     let bytes = missing_bytes(list);
     if bytes > 0 && catalog::is_large(bytes) && !allowed {
-        let names: Vec<&str> = list
-            .iter()
-            .filter(|(r, d)| !manager::is_installed(r, d))
-            .map(|(r, _)| r.title)
-            .collect();
+        let names: Vec<&str> = to_download(list).map(|r| r.title).collect();
         bail!(
             "this needs a large download ({}: {}); rerun with --allow-large (Training page: tick \
              the download confirmation) or enable allow_large_downloads",
@@ -408,5 +411,41 @@ mod tests {
         );
         let m = catalog::import_dataset("meva-sample").unwrap();
         assert_eq!(dataset_dir(root, m), root.join("train-data/meva-sample"));
+    }
+
+    #[test]
+    fn files_on_disk_at_their_pinned_size_are_not_a_download() {
+        let part = |name: &'static str| catalog::Part {
+            url: "https://example.invalid/x",
+            sha256: "00",
+            size: 4,
+            file_name: name,
+            archive: None,
+            layout: catalog::Layout::File,
+        };
+        let parts: &'static [catalog::Part] =
+            Box::leak(vec![part("a"), part("b")].into_boxed_slice());
+        let res: &'static Resource = Box::leak(Box::new(Resource {
+            id: "autolabel:adopt-test",
+            kind: catalog::ResourceKind::ExportModel,
+            version: "1",
+            platform: None,
+            parts,
+            dest: catalog::TRAIN_WEIGHTS_DEST,
+            provides: catalog::Provides::Tool { name: "adopt-test" },
+            title: "fixture",
+            description: "fixture",
+            license: "MIT",
+        }));
+        let dir = std::env::temp_dir().join(format!("bop-pyenv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let list = vec![(res, dir.clone())];
+        assert_eq!(missing_bytes(&list), 8, "nothing on disk");
+        std::fs::write(dir.join("a"), b"1234").unwrap();
+        std::fs::write(dir.join("b"), b"123").unwrap();
+        assert_eq!(missing_bytes(&list), 8, "a short file is not there");
+        std::fs::write(dir.join("b"), b"1234").unwrap();
+        assert_eq!(missing_bytes(&list), 0, "adopted by hash, no network");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

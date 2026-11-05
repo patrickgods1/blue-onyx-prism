@@ -83,7 +83,7 @@
 
 <div class="card">
   <h2>Auto-label these frames</h2>
-  <p class="muted">Proposes boxes for the frames the filters above select: they appear here as pending <em>auto</em> boxes. The <em>labelers</em> (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2; NVIDIA GPU or Apple silicon) mark each box <em>accept</em> or <em>review</em>. <em>A model</em> (any detector from your config, a model file or a downloadable one) runs on any device, CPU included (RF-DETR L on CPU takes about 1 s per frame); its boxes are <em>review</em> unless you pre-accept them above a score. Frames the filters leave open default to the unreviewed ones in model mode. Runs on the <a href="/training#autolabel">Training</a> page's queue, where the progress and a self-training check are.</p>
+  <p class="muted">Proposes boxes for the frames the filters above select: they appear here as pending <em>auto</em> boxes. The <em>labelers</em> (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2; NVIDIA GPU or Apple silicon) mark each box <em>accept</em> or <em>review</em> (SAM 3, once installed on the <a href="/training#autolabel">Training</a> page, can replace MM-Grounding-DINO; its boxes are always <em>review</em>). <em>A model</em> (any detector from your config, a model file or a downloadable one) runs on any device, CPU included (RF-DETR L on CPU takes about 1 s per frame); its boxes are <em>review</em> unless you pre-accept them above a score. Frames the filters leave open default to the unreviewed ones in model mode. Runs on the <a href="/training#autolabel">Training</a> page's queue, where the progress and a self-training check are.</p>
   <form id="rv-autolabel" method="post" action="/training/autolabel" class="inline-row">
     <input type="hidden" name="frames" value="">
     <input type="hidden" name="label" value="">
@@ -93,7 +93,8 @@
       <label class="check"><input type="radio" name="mode" value="model"> A model <span class="muted small">(runs anywhere)</span></label>
     </fieldset>
     <div class="rv-al-labelers" data-al-mode="labelers">
-      <input type="hidden" name="gdino" value="tiny">
+      <label class="inline-label" id="rv-al-gdino-field" hidden>Open-vocabulary labeler <select name="gdino" id="rv-al-gdino"><option value="tiny">MM-Grounding-DINO tiny</option></select></label>
+      <span class="muted small" id="rv-al-sam3-apple" hidden>SAM 3 is not measured on Apple GPUs.</span>
       <input type="hidden" name="rfdetr" value="on">
       <input type="hidden" name="vlm" value="2b">
       <input type="hidden" name="siglip" value="on">

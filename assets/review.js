@@ -2632,6 +2632,22 @@
       r.addEventListener('change', applyAlMode);
     });
     applyAlMode();
+    // SAM 3 is offered once installed (its panel is on the Training page); the select stays out of
+    // sight until then and posts MM-Grounding-DINO.
+    var alSeat = $('rv-al-gdino');
+    if (alSeat && window.fetch) {
+      fetch('/v1/autolabel/sam3', { headers: { Accept: 'application/json' } })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (s) {
+          if (!s || s.state !== 'installed') return;
+          var sam3 = el('option', null, 'SAM 3');
+          sam3.value = 'sam3';
+          alSeat.appendChild(sam3);
+          $('rv-al-gdino-field').hidden = false;
+          $('rv-al-sam3-apple').hidden = !s.apple;
+        })
+        .catch(function () {});
+    }
     if (MP) {
       var syncMissing = MP.util.missingToggle(alForm);
       Array.prototype.forEach.call(alForm.querySelectorAll('input[name="mode"]'), function (r) {
