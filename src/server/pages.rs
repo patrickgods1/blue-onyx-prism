@@ -1214,9 +1214,13 @@ mod tests {
         assert!(review.contains("id=\"rv-label-picker\""));
         assert!(review.contains("id=\"rv-show-picker\""));
         assert!(review.contains("id=\"rv-classes-picker\""));
+        assert!(review.contains("name=\"sam3_threshold\""));
+        assert!(review.contains("<option value=\"both\">found by 2+ labelers</option>"));
         let (_, training) = get_text(&state, "/training").await;
         assert!(training.contains("id=\"al-picker\""));
         assert!(training.contains("id=\"al-preset\""));
         assert!(training.contains("id=\"al-model-picker\""));
+        assert!(training.contains("name=\"sam3_threshold\""));
+        assert!(training.contains("<option value=\"both\">found by 2+ labelers</option>"));
     }
 }

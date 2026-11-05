@@ -6,8 +6,10 @@
 // The Auto-label card queues a job (POST /training/autolabel as JSON) and follows it on
 // GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto and
 // "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
-// POST /v1/review/reject-other-class and "Reject stacked duplicates" POST /v1/review/reject-stacked
-// (all four: dry run, confirm, run). *Suggest overlaps...* queues the overlap check
+// POST /v1/review/reject-other-class, "Restore reopened frames" POST /v1/review/restore-reopened
+// and "Reject stacked duplicates" POST /v1/review/reject-stacked
+// (all five: dry run, confirm, run). Preview frames posts the form to
+// POST /training/autolabel/preview on a click. *Suggest overlaps...* queues the overlap check
 // (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
 // the frame, and `y` accepts the one on screen.
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
@@ -997,7 +999,7 @@
     var names = Object.keys(b.labelers || {});
     if (names.length) {
       parts.push(names.map(function (k) { return k + ' ' + fmtScore(b.labelers[k]); }).join(', ') +
-        (b.agree === false ? ' (one labeler)' : ''));
+        (b.agree === false && names.length < 2 ? ' (one labeler)' : ''));
     } else if (b.agree === false) parts.push('one labeler');
     if (b.vlm) {
       parts.push((b.vlm.model || 'VLM') + ': ' + (b.vlm.answer || 'nothing') +
@@ -2617,6 +2619,17 @@
       blk.hidden = off;
       Array.prototype.forEach.call(blk.querySelectorAll('input, select, textarea'), function (f) { f.disabled = off; });
     });
+    syncSam3Threshold();
+  }
+  // The SAM 3 threshold only while SAM 3 is the chosen labeler; hidden, it is disabled (not posted,
+  // not validated). The mode switch above enables every field of the shown block, so it runs after.
+  function syncSam3Threshold() {
+    var seat = $('rv-al-gdino'), input = alForm.elements.sam3_threshold;
+    if (!seat || !input) return;
+    var on = alMode() === 'labelers' && seat.value === 'sam3';
+    $('rv-al-sam3-threshold-field').hidden = !on;
+    $('rv-al-sam3-threshold-hint').hidden = !on;
+    input.disabled = !on;
   }
   if (alForm) {
     var mpHolder = $('rv-al-model-picker');
@@ -2632,6 +2645,23 @@
       r.addEventListener('change', applyAlMode);
     });
     applyAlMode();
+    // SAM 3 is offered once installed (its panel is on the Training page); the select stays out of
+    // sight until then and posts MM-Grounding-DINO.
+    var alSeat = $('rv-al-gdino');
+    if (alSeat) alSeat.addEventListener('change', syncSam3Threshold);
+    if (alSeat && window.fetch) {
+      fetch('/v1/autolabel/sam3', { headers: { Accept: 'application/json' } })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (s) {
+          if (!s || s.state !== 'installed') return;
+          var sam3 = el('option', null, 'SAM 3');
+          sam3.value = 'sam3';
+          alSeat.appendChild(sam3);
+          $('rv-al-gdino-field').hidden = false;
+          $('rv-al-sam3-apple').hidden = !s.apple;
+        })
+        .catch(function () {});
+    }
     if (MP) {
       var syncMissing = MP.util.missingToggle(alForm);
       Array.prototype.forEach.call(alForm.querySelectorAll('input[name="mode"]'), function (r) {
@@ -2700,10 +2730,65 @@
       .catch(function () {});
   }
 
+  // The queue's filters into the form's hidden fields.
+  function fillAlFilter() {
+    alForm.elements.frames.value = autolabelFrames();
+    if (alForm.elements.label) alForm.elements.label.value = filtersForm.elements.label ? filtersForm.elements.label.value : '';
+  }
+
+  // The form as a POST body, with the classes `picked`.
+  function alBody(picked) {
+    var body = new URLSearchParams();
+    Array.prototype.forEach.call(alForm.elements, function (e) {
+      if (!e.name || e.disabled) return;
+      if ((e.type === 'checkbox' || e.type === 'radio') && !e.checked) return;
+      body.append(e.name, e.value);
+    });
+    picked.forEach(function (c) { body.append('classes', c); });
+    return body;
+  }
+
+  // Preview frames: what the form would do on these filters, on a click (it reads every sidecar).
+  // A changed form or filter clears the answer. A class not in the class list yet is appended only
+  // by a real run, so it is left out here and said so.
+  function wireAlPreview() {
+    var run = $('rv-al-preview-run'), box = $('rv-al-preview');
+    if (!run || !box || !window.fetch || !window.URLSearchParams) return;
+    var seq = 0;
+    var clear = function () { seq++; box.className = 'review-report'; box.textContent = ''; };
+    run.hidden = false;
+    alForm.addEventListener('change', clear);
+    filtersForm.addEventListener('change', clear);
+    run.addEventListener('click', function () {
+      var mine = ++seq;
+      var picked = alPicker ? alPicker.getSelected() : [];
+      var fail = function (m) { box.className = 'review-report error-text'; report(box, [m]); };
+      if (alPicker && !picked.length) { fail('Choose at least one class to look for.'); return; }
+      var listed = catalog ? picked.filter(function (c) { return (catalog.classes || []).indexOf(c) >= 0; }) : picked;
+      if (alPicker && !listed.length) { fail('Add a picked class to the class list first: the preview counts listed classes only.'); return; }
+      fillAlFilter();
+      box.className = 'review-report';
+      report(box, ['Counting the frames...']);
+      run.disabled = true;
+      api('/training/autolabel/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        body: alBody(listed).toString()
+      }).then(function (j) {
+        if (mine !== seq) return;
+        var warnings = (j.warnings || []).slice();
+        if (listed.length < picked.length) warnings.push('Classes not in the class list yet are left out of this count; a real run adds them first.');
+        report(box, [j.summary], warnings);
+      }).catch(function (e) {
+        if (mine === seq) fail(e.message);
+      }).then(function () { run.disabled = false; });
+    });
+  }
+
   if (alForm) {
+    wireAlPreview();
     alForm.addEventListener('submit', function (ev) {
-      alForm.elements.frames.value = autolabelFrames();
-      if (alForm.elements.label) alForm.elements.label.value = filtersForm.elements.label ? filtersForm.elements.label.value : '';
+      fillAlFilter();
       if (!window.fetch || !window.URLSearchParams) return;   // the plain form post
       ev.preventDefault();
       var picked = alPicker ? alPicker.getSelected() : [];
@@ -2722,13 +2807,7 @@
           return;
         }
       }
-      var body = new URLSearchParams();
-      Array.prototype.forEach.call(alForm.elements, function (e) {
-        if (!e.name || e.disabled) return;
-        if ((e.type === 'checkbox' || e.type === 'radio') && !e.checked) return;
-        body.append(e.name, e.value);
-      });
-      picked.forEach(function (c) { body.append('classes', c); });
+      var body = alBody(picked);
       alStatus.className = 'review-report';
       // Listed, wanted classes left unticked: offer to stop wanting them altogether.
       var skipped = alPicker ? visible().filter(function (c) { return picked.indexOf(c) < 0; }) : [];
@@ -3005,6 +3084,8 @@
       });
       var large = $('rv-suggest-large');
       if (large && large.checked) body.allow_large = true;
+      var askAgain = $('rv-suggest-again');
+      if (askAgain && askAgain.checked) body.again = true;
       body.dry_run = true;
       box.className = 'review-report';
       report(box, ['Counting the pairs...']);
@@ -3014,7 +3095,8 @@
           report(box, [j.message || 'No open overlap without a suggestion on these frames.']);
           return null;
         }
-        if (!window.confirm('Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included, ' +
+        if (!window.confirm('Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
+          (body.again ? ', answered pairs asked again' : '') + ', ' +
           'with RF-DETR L (' + j.crops + ' crops, on the training queue, about ' + Math.max(1, Math.ceil(j.crops * 0.08 / 60)) + ' min)? ' +
           'It writes suggestions only: no box changes until you confirm one here.')) {
           report(box, ['Nothing queued.']);
@@ -3073,6 +3155,46 @@
         box.className = 'review-report error-text';
         report(box, [e.message]);
       }).then(function () { stackedBtn.disabled = false; });
+    });
+  }
+
+  // The undo of a re-label that reopened reviewed frames: back to reviewed when nothing is pending.
+  var restoreBtn = $('rv-restore-reopened');
+  if (restoreBtn) {
+    restoreBtn.addEventListener('click', function () {
+      var box = $('rv-restore-reopened-msg');
+      var body = {};
+      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
+        var e = filtersForm.elements[k];
+        if (e && e.value) body[k] = e.value;
+      });
+      body.dry_run = true;
+      box.className = 'review-report';
+      report(box, ['Counting the frames...']);
+      restoreBtn.disabled = true;
+      postJson('/v1/review/restore-reopened', body).then(function (j) {
+        var n = j.eligible || 0;
+        if (!n) {
+          report(box, ['No reopened frame with nothing left pending among the frames the filters select.']);
+          return null;
+        }
+        if (!window.confirm('Put ' + n + ' reopened frame(s) back to reviewed? Their boxes stay as they are, and they ' +
+          'return to exports. Frames with a pending box are not touched.')) {
+          report(box, ['Nothing restored.']);
+          return null;
+        }
+        body.dry_run = false;
+        return postJson('/v1/review/restore-reopened', body).then(function (r) {
+          var failed = r.failed || [];
+          report(box, [r.message || ('Restored ' + (r.restored || 0) + ' frame(s).')],
+            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
+          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+          return reloadQueue();
+        });
+      }).catch(function (e) {
+        box.className = 'review-report error-text';
+        report(box, [e.message]);
+      }).then(function () { restoreBtn.disabled = false; });
     });
   }
 

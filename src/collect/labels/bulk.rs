@@ -11,11 +11,12 @@
 //! (`POST /v1/review/reject-unwanted-reviewed`; [`reviewed_with_unwanted`] counts them),
 //! [`bulk_spot`] rejects or accepts the boxes at one spot of one camera on its unreviewed frames
 //! ("this spot everywhere", [`super::repeats`]), [`bulk_accept_repeats`] saves the frames such
-//! edits settled (`POST /v1/review/reject-spot`, `accept-spot`, `accept-repeats`) and
+//! edits settled (`POST /v1/review/reject-spot`, `accept-spot`, `accept-repeats`),
 //! [`bulk_reject_stacked`] rejects the duplicates of stacked boxes on reviewed and unreviewed
-//! frames (`reason: duplicate`, [`super::stacks`]; `POST /v1/review/reject-stacked`). Each
-//! frame is re-checked under the label write lock ([`super::update`]); counts are exact, frame
-//! lists capped at [`LISTED`].
+//! frames (`reason: duplicate`, [`super::stacks`]; `POST /v1/review/reject-stacked`) and
+//! [`bulk_restore_reopened`] puts frames a re-label reopened back to reviewed once nothing on them
+//! is pending (`POST /v1/review/restore-reopened`). Each frame is re-checked under the label write
+//! lock ([`super::update`]); counts are exact, frame lists capped at [`LISTED`].
 
 use super::queue::{self, AutoFilter, Filters, StatusFilter};
 use super::{BoxState, Frame, LabelFile, Source, Status, stacks};
@@ -404,6 +405,57 @@ pub fn bulk_reject_stacked(
     }
 }
 
+/// Whether a re-label's reopening of `f` can be undone: it went back to review
+/// ([`LabelFile::disagreement`]) from a review ([`LabelFile::reviewed_at`], which a save as
+/// unreviewed clears) and nothing on it waits for a decision. A frame confirmed empty that has
+/// gained a training box is left out: a save refuses that frame.
+pub fn restorable(f: &LabelFile) -> bool {
+    f.status == Status::Unreviewed
+        && f.disagreement.is_some()
+        && f.reviewed_at.is_some()
+        && !f.boxes.iter().any(|b| b.state == BoxState::Pending)
+        && !(f.empty_confirmed && f.training().next().is_some())
+}
+
+/// Put a [`restorable`] frame back to reviewed, its boxes and `reviewed_at` as they are, and clear
+/// the note (and a spot edit's mark, as a save does). [`LabelFile::overlaps_checked`] comes back
+/// from [`LabelFile::checked_before_reopen`]: nothing is pending and no new box was accepted (a spot
+/// accept ends the mark, a save ends the reopening), so the frame's live boxes are the ones the
+/// reviewer checked. Returns 1 when it did, else 0.
+pub fn restore_reopened(f: &mut LabelFile) -> usize {
+    if !restorable(f) {
+        return 0;
+    }
+    f.status = Status::Reviewed;
+    f.disagreement = None;
+    f.repeat_spot = false;
+    f.overlaps_checked |= std::mem::take(&mut f.checked_before_reopen);
+    1
+}
+
+/// [`restore_reopened`] on the unreviewed frames of `dir` that `filters` (status forced to
+/// unreviewed) and `keep` select, at most `limit` in queue order; `boxes` counts frames here.
+/// `dry_run` only counts. Without it, a frame whose proposals were all rejected (by Reject auto
+/// boxes below, say) would stay out of the exports. A frame that gained a pending box meanwhile
+/// is passed over.
+pub fn bulk_restore_reopened(
+    dir: &Path,
+    filters: &Filters,
+    limit: usize,
+    dry_run: bool,
+    keep: &dyn Fn(&str) -> bool,
+) -> BulkOutcome {
+    edit_unreviewed(
+        dir,
+        filters,
+        limit,
+        dry_run,
+        keep,
+        &|l| (usize::from(restorable(l)), 0),
+        &|l| (restore_reopened(l), 0),
+    )
+}
+
 /// The shared run of the box edits of unreviewed frames: `count` and `edit` return (boxes
 /// rejected, boxes renamed); only frames `count` finds something on are eligible, and each
 /// is edited again under the write lock ([`super::update`]).
@@ -672,8 +724,12 @@ pub fn bulk_accept_repeats(
                         return Ok(None);
                     };
                     l.status = Status::Reviewed;
+                    // A repeat-only frame holds no box a reviewer did not settle, so a check
+                    // from before a rerun reopened it still stands; `normalize` ends the memory.
+                    let checked = l.checked_before_reopen;
                     let mut n = super::normalize(l, classes, rec.width, rec.height, now)?;
                     n.bulk_accepted = true;
+                    n.overlaps_checked |= checked;
                     Ok(Some(n))
                 })
             });
@@ -1250,6 +1306,118 @@ mod tests {
         super::super::write(&frame.labels, &l).unwrap();
     }
 
+    /// A frame reopened by a re-label: reviewed once, sent back with a note and `boxes`.
+    fn reopened(dir: &Path, stem: &str, boxes: Vec<super::super::LabelBox>) -> String {
+        let rel = put_frame(dir, stem, None, boxes);
+        let frame = Frame::resolve(dir, &rel).unwrap();
+        let mut l = labels_of(dir, &rel);
+        l.reviewed_at = Some("2026-10-01T00:00:00Z".into());
+        l.disagreement = Some("re-label by sam3: 1 new box".into());
+        super::super::write(&frame.labels, &l).unwrap();
+        rel
+    }
+
+    #[test]
+    fn restore_takes_only_reopened_frames_with_nothing_pending() {
+        let root = std::env::temp_dir().join(format!("bop-restore-{}", uuid::Uuid::new_v4()));
+        let dir = root.as_path();
+        let any = Filters {
+            status: StatusFilter::Any,
+            ..Filters::default()
+        };
+        let mut rejected = auto_box("car", 0.8, Triage::Review);
+        rejected.state = BoxState::Rejected;
+        let settled = car_at([1.0, 1.0, 20.0, 20.0], 0.8);
+        let done = reopened(dir, "a", vec![settled.clone(), rejected.clone()]);
+        let pending = reopened(
+            dir,
+            "b",
+            vec![settled.clone(), auto_box("dog", 0.9, Triage::Review)],
+        );
+        // Never reviewed, whatever else it has.
+        let never = put_frame(dir, "c", None, vec![settled.clone()]);
+        let sent = put_frame(dir, "d", None, vec![settled.clone()]);
+        let frame = Frame::resolve(dir, &sent).unwrap();
+        let mut l = labels_of(dir, &sent);
+        l.disagreement = Some("re-label by m: 1 new box".into());
+        super::super::write(&frame.labels, &l).unwrap();
+        // Reviewed once, reopened with no note (a proposal merge of an older build).
+        let quiet = put_frame(dir, "e", None, vec![settled.clone()]);
+        let frame = Frame::resolve(dir, &quiet).unwrap();
+        let mut l = labels_of(dir, &quiet);
+        l.reviewed_at = Some("2026-10-01T00:00:00Z".into());
+        super::super::write(&frame.labels, &l).unwrap();
+        let reviewed = put_frame(dir, "f", None, vec![settled.clone()]);
+        mark_reviewed(dir, &reviewed, "2026-10-01T00:00:00Z");
+        let empty = reopened(dir, "g", vec![settled.clone()]);
+        let frame = Frame::resolve(dir, &empty).unwrap();
+        let mut l = labels_of(dir, &empty);
+        l.empty_confirmed = true;
+        super::super::write(&frame.labels, &l).unwrap();
+
+        let untouched = [&pending, &never, &sent, &quiet, &reviewed, &empty];
+        let before: Vec<LabelFile> = untouched.iter().map(|r| labels_of(dir, r)).collect();
+        let dry = bulk_restore_reopened(dir, &any, 500, true, &|_| true);
+        assert_eq!((dry.eligible, dry.done_count), (1, 0));
+        assert_eq!(dry.done, std::slice::from_ref(&done));
+        assert_eq!(labels_of(dir, &done).status, Status::Unreviewed);
+
+        let was = labels_of(dir, &done);
+        let o = bulk_restore_reopened(dir, &any, 500, false, &|_| true);
+        assert_eq!((o.eligible, o.done_count, o.failed_count), (1, 1, 0));
+        let l = labels_of(dir, &done);
+        assert_eq!(l.status, Status::Reviewed);
+        assert_eq!(l.disagreement, None);
+        assert_eq!(l.boxes, was.boxes, "boxes as they were");
+        assert_eq!(l.reviewed_at, was.reviewed_at, "the review it goes back to");
+        let after: Vec<LabelFile> = untouched.iter().map(|r| labels_of(dir, r)).collect();
+        assert_eq!(after, before);
+        // It exports again, and a rerun finds nothing.
+        assert_eq!(
+            bulk_restore_reopened(dir, &any, 500, false, &|_| true).eligible,
+            0
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restore_checks_again_under_the_lock_and_honours_the_scope() {
+        let mut f = LabelFile {
+            disagreement: Some("x".into()),
+            reviewed_at: Some("t".into()),
+            repeat_spot: true,
+            ..LabelFile::default()
+        };
+        // A box that went pending between the list and the write.
+        let mut pending = f.clone();
+        pending.boxes.push(auto_box("dog", 0.9, Triage::Review));
+        let frozen = pending.clone();
+        assert_eq!(restore_reopened(&mut pending), 0);
+        assert_eq!(pending, frozen);
+        assert_eq!(restore_reopened(&mut f), 1);
+        assert_eq!(f.status, Status::Reviewed);
+        assert!(!f.repeat_spot, "as a save clears it");
+        assert_eq!(restore_reopened(&mut f), 0, "reviewed already");
+
+        let root = std::env::temp_dir().join(format!("bop-restore-{}", uuid::Uuid::new_v4()));
+        let dir = root.as_path();
+        let any = Filters::default();
+        let a = reopened(dir, "a", vec![]);
+        let b = reopened(dir, "b", vec![]);
+        let o = bulk_restore_reopened(dir, &any, 1, false, &|_| true);
+        assert_eq!((o.eligible, o.done_count), (2, 1));
+        let o = bulk_restore_reopened(dir, &any, 500, false, &|r| r != b);
+        assert_eq!(o.eligible, 0, "{a} went first, {b} is out of scope");
+        assert_eq!(
+            [labels_of(dir, &a).status, labels_of(dir, &b).status]
+                .iter()
+                .filter(|s| **s == Status::Reviewed)
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn overlaps_left_reviewed_leaves_out_unreviewed_frames() {
         let dir = std::env::temp_dir().join(format!("bop-stacked-{}", uuid::Uuid::new_v4()));
@@ -1396,6 +1564,68 @@ mod tests {
             .collect();
         assert_eq!(now, settled);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_frame_is_checked_again_only_if_it_was_before() {
+        let root = std::env::temp_dir().join(format!("bop-restore-{}", uuid::Uuid::new_v4()));
+        let dir = root.as_path();
+        let (a, near) = ([0.0, 0.0, 40.0, 40.0], [0.0, 0.0, 40.0, 38.0]);
+        let cars = || vec![car_at(a, 0.9), car_at(near, 0.4)];
+        let kept = reopened(dir, "a", cars());
+        let open = reopened(dir, "b", cars());
+        let frame = Frame::resolve(dir, &kept).unwrap();
+        let mut l = labels_of(dir, &kept);
+        l.checked_before_reopen = true;
+        super::super::write(&frame.labels, &l).unwrap();
+
+        let all = Filters::default();
+        let cl = classes();
+        let w = wanted(&cl, &[]);
+        // While the rerun has it open, the reviewer's check still holds the bulk back.
+        let o = bulk_reject_stacked(dir, &all, &w, 100, true, &|_| true);
+        assert_eq!(o.outcome.eligible, 1, "only the frame nobody checked");
+        assert_eq!(o.outcome.done, vec![open.clone()]);
+
+        let o = bulk_restore_reopened(dir, &all, 500, false, &|_| true);
+        assert_eq!(o.done_count, 2);
+        let l = labels_of(dir, &kept);
+        assert!(l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
+        let l = labels_of(dir, &open);
+        assert!(!l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
+
+        let o = bulk_reject_stacked(dir, &all, &w, 100, false, &|_| true);
+        assert_eq!(o.outcome.done_count, 1, "only the frame nobody checked");
+        assert_eq!(labels_of(dir, &kept).boxes[1].state, BoxState::Accepted);
+        assert_eq!(labels_of(dir, &open).boxes[1].state, BoxState::Rejected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepting_a_repeat_only_frame_keeps_a_check_from_before_the_reopen() {
+        let root = std::env::temp_dir().join(format!("bop-repeat-check-{}", uuid::Uuid::new_v4()));
+        let dir = root.as_path();
+        let (a, near) = ([0.0, 0.0, 40.0, 40.0], [0.0, 0.0, 40.0, 38.0]);
+        let cars = || vec![car_at(a, 0.9), car_at(near, 0.4)];
+        let kept = reopened(dir, "a", cars());
+        let open = reopened(dir, "b", cars());
+        for (rel, checked) in [(&kept, true), (&open, false)] {
+            let frame = Frame::resolve(dir, rel).unwrap();
+            let mut l = labels_of(dir, rel);
+            l.repeat_spot = true;
+            l.checked_before_reopen = checked;
+            super::super::write(&frame.labels, &l).unwrap();
+        }
+        let all = Filters::default();
+        let o = bulk_accept_repeats(dir, &all, &classes(), 100, "now", false, &|_| true);
+        assert_eq!(o.done_count, 2);
+        let l = labels_of(dir, &kept);
+        assert_eq!(l.status, Status::Reviewed);
+        assert!(l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
+        let l = labels_of(dir, &open);
+        assert_eq!(l.status, Status::Reviewed);
+        assert!(!l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

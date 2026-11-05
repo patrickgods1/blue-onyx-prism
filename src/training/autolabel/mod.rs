@@ -4,11 +4,12 @@
 //! rejects. Two modes:
 //!
 //! - **Labelers** (default): `scripts/autolabel.py` in the training environment runs
-//!   MM-Grounding-DINO (open vocabulary, prompts from `collect.classes` plus
-//!   `training.synonyms`), RF-DETR L (COCO classes) and fuses them (WBF), then checks person and
-//!   single-labeler boxes with Qwen3-VL and ranks animal species with SigLIP 2. The service
-//!   triages every box ([`triage`]): `accept` only when both labelers agree at a score of at least
-//!   0.6 and no check objects; night person / animal boxes always `review`.
+//!   MM-Grounding-DINO or, in its seat, SAM 3 ([`AutolabelRequest::sam3`], gated) (open vocabulary,
+//!   prompts from `collect.classes` plus `training.synonyms`), RF-DETR L (COCO classes) and fuses
+//!   them (WBF), then checks person and single-labeler boxes with Qwen3-VL and ranks animal species
+//!   with SigLIP 2. The service triages every box ([`triage`]): `accept` only when both labelers
+//!   agree at a score of at least 0.6 and no check objects; night person / animal boxes and SAM 3
+//!   boxes always `review`.
 //! - **A model** (`--with-model <id>`, any model of [`models`]: configured, a local file, or a
 //!   catalog model the run downloads or exports first and adds to the config disabled): the
 //!   service's own inference path (the benchmark pipeline: decode, preprocess, infer,
@@ -35,10 +36,12 @@
 //!   becomes a (disabled) config entry.
 //! - [`relabel`]: detection with a model of the config in this process.
 //! - [`job`]: the stage machine ([`AutolabelJob`], a [`super::task::Task`]).
+//! - [`preview`]: what a run would do, from its own first stage ([`preview_autolabel`]).
 
 pub mod catalog;
 pub mod job;
 pub mod models;
+pub mod preview;
 pub mod relabel;
 pub mod triage;
 
@@ -49,9 +52,11 @@ use crate::collect::labels::queue::Filters;
 use crate::config::Config;
 use crate::resources::catalog::{self as res_catalog, Platform, Resource};
 use crate::resources::export::train::{self as env, TrainPaths};
+use crate::resources::hf_token::{self, LoginCommand, Lookup};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::time::Duration;
 
 /// Default most frames of one run.
@@ -211,7 +216,8 @@ impl VlmSize {
 
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
 /// `label` (any of several classes, separated by `|`: `label=person|car`), `status`, `source`,
-/// `auto`), `import=<id>|any` (imported frames), `again=1` (also
+/// `auto`; `auto=overlaps` and `auto=both` need [`Filters::wanted`], which [`AutolabelJob`] sets
+/// from the config as the Review page does), `import=<id>|any` (imported frames), `again=1` (also
 /// frames these labelers already looked at, see [`crate::collect::labels::AutoRun`]) and `limit`
 /// (most frames, in queue order). Written `key=value` pairs separated by commas
 /// (`scene=ir,status=unreviewed,limit=20`).
@@ -328,6 +334,9 @@ pub struct AutolabelRequest {
     pub frames: FrameFilter,
     /// MM-Grounding-DINO (None = off).
     pub gdino: Option<GdinoSize>,
+    /// SAM 3 in MM-Grounding-DINO's seat (`gdino` is None then). Its boxes never triage `accept`.
+    #[serde(default)]
+    pub sam3: bool,
     /// RF-DETR L for the COCO classes.
     pub rfdetr: bool,
     /// Qwen3-VL crop check (None = off).
@@ -359,6 +368,10 @@ pub struct AutolabelRequest {
     #[serde(default)]
     pub confirm_license: bool,
     pub gdino_threshold: f32,
+    /// SAM 3's own score threshold, before fusion: higher means fewer boxes and missed faint
+    /// objects. Not part of the frames' marker, so a rerun at another value needs `again=1`.
+    #[serde(default = "default_sam3_threshold")]
+    pub sam3_threshold: f32,
     pub rfdetr_threshold: f32,
     /// Triage: both labelers agree at this fused score or more to `accept`.
     pub accept_score: f32,
@@ -392,8 +405,15 @@ pub const VLM_BATCH: usize = 8;
 /// Default of [`AutolabelRequest::vlm_min_score`] the Training page suggests.
 pub const SUGGESTED_VLM_MIN_SCORE: f32 = 0.2;
 
+/// Default of [`AutolabelRequest::sam3_threshold`].
+pub const SAM3_THRESHOLD: f32 = 0.3;
+
 const fn yes() -> bool {
     true
+}
+
+const fn default_sam3_threshold() -> f32 {
+    SAM3_THRESHOLD
 }
 
 impl AutolabelRequest {
@@ -402,6 +422,7 @@ impl AutolabelRequest {
         Self {
             frames,
             gdino: Some(GdinoSize::Tiny),
+            sam3: false,
             rfdetr: true,
             vlm: Some(VlmSize::Qwen2b),
             siglip: true,
@@ -413,6 +434,7 @@ impl AutolabelRequest {
             missing_only: false,
             confirm_license: false,
             gdino_threshold: 0.2,
+            sam3_threshold: SAM3_THRESHOLD,
             rfdetr_threshold: 0.3,
             accept_score: triage::ACCEPT_SCORE,
             classes: None,
@@ -428,6 +450,7 @@ impl AutolabelRequest {
         for (k, v) in [
             ("threshold", self.threshold),
             ("gdino threshold", self.gdino_threshold),
+            ("sam3 threshold", self.sam3_threshold),
             ("rfdetr threshold", self.rfdetr_threshold),
             ("accept score", self.accept_score),
         ] {
@@ -435,8 +458,17 @@ impl AutolabelRequest {
                 bail!("{k} must be between 0.01 and 1, got {v}");
             }
         }
-        if self.with_model.is_none() && self.gdino.is_none() && !self.rfdetr {
-            bail!("no labeler: enable MM-Grounding-DINO or RF-DETR, or pass --with-model");
+        if self.with_model.is_none() && self.gdino.is_none() && !self.sam3 && !self.rfdetr {
+            bail!("no labeler: enable MM-Grounding-DINO, SAM 3 or RF-DETR, or pass --with-model");
+        }
+        if self.sam3 && self.with_model.is_some() {
+            bail!(
+                "SAM 3 is one of the labelers, and a run with a model (--with-model) uses that \
+                 model alone: remove --sam3 or --with-model"
+            );
+        }
+        if self.sam3 && self.gdino.is_some() {
+            bail!("SAM 3 takes MM-Grounding-DINO's place: choose one of them");
         }
         if self.missing_only && self.with_model.is_none() {
             bail!(
@@ -500,6 +532,11 @@ impl AutolabelRequest {
         {
             v.push(g);
         }
+        if self.sam3
+            && let Some(s) = hf_token::sam3_resource()
+        {
+            v.push(s);
+        }
         if self.rfdetr
             && let Some(r) = res_catalog::base_weights(res_catalog::TrainFamily::Rfdetr, "large")
         {
@@ -520,17 +557,32 @@ impl AutolabelRequest {
     }
 }
 
-/// Plan an auto-label run of `request` on `config` (fails fast on a bad filter, an unknown
-/// model, a missing GPU or a large download that was not allowed). A `missing_only` run looks at
-/// every status and every frame of the folder (`status=any`, `source=all`: the job keeps
-/// [`triage::missing_scope`]; the default `unreviewed`, or the Review page's `source=queue`,
-/// would miss the reviewed frames), and the default limit and threshold become [`MAX_LIMIT`] and
-/// [`MISSING_THRESHOLD`] (any other value is used as given).
-pub fn plan_autolabel(
-    config: &Config,
-    mut request: AutolabelRequest,
-    cap: &Capability,
-) -> Result<AutolabelJob> {
+/// Why a SAM 3 run could not get its weights, with what to do; None when it can: every file is on
+/// disk (`parts_on_disk`: adopted by hash, nothing is downloaded), or there is a token to try.
+/// Whether that token has access only the download can tell.
+fn sam3_problem(parts_on_disk: bool, lookup: &Lookup, login: &LoginCommand) -> Option<String> {
+    if parts_on_disk || lookup.token().is_some() {
+        return None;
+    }
+    let why = lookup
+        .problem()
+        .unwrap_or_else(|| "No Hugging Face token is set up".to_string());
+    let gated = res_catalog::gated(res_catalog::SAM3_ID)?;
+    Some(format!(
+        "SAM 3 is not installed, and its download needs a Hugging Face login. {why}. Request access \
+         on {} ({}), then sign in: {} ({}). Then rerun with --allow-large, or download it from the \
+         Training page's SAM 3 panel",
+        gated.repo_url, gated.license, login.command, login.note,
+    ))
+}
+
+/// The part of a plan that decides a run's frames, and what the preview shares with the run: no
+/// GPU, login or download gate applies. A `missing_only` run looks at every status and every frame
+/// of the folder (`status=any`, `source=all`: the job keeps [`triage::missing_scope`]; the default
+/// `unreviewed`, or the Review page's `source=queue`, would miss the reviewed frames), and the
+/// default limit and threshold become [`MAX_LIMIT`] and [`MISSING_THRESHOLD`] (any other value is
+/// used as given). Fails on a bad filter or an unknown class or model.
+fn scoped_job(config: &Config, mut request: AutolabelRequest) -> Result<AutolabelJob> {
     request.validate()?;
     if request.missing_only {
         let query = &mut request.frames.query;
@@ -547,19 +599,61 @@ pub fn plan_autolabel(
         run_classes(&config.collect.classes, request.classes.as_deref())?,
         &config.collect.hidden_classes,
     )?;
-    let paths = TrainPaths::for_config(config);
-    let platform = Platform::current();
-    let allow_large = request.allow_large || config.allow_large_downloads;
     let mut model = None;
-    let mut accelerator = cap.accelerator.clone();
     if let Some(m) = &request.with_model {
         if let Some(d) = &request.device {
             request.device = Some(models::canonical_device(d)?);
         }
-        let plan = models::resolve(config, m, request.device.as_deref())?;
-        check_model_install(config, &plan, allow_large, request.confirm_license)?;
-        model = Some(plan);
+        model = Some(models::resolve(config, m, request.device.as_deref())?);
+    }
+    let id = super::service::new_run_id();
+    Ok(AutolabelJob {
+        work: super::training_dir(config).join("autolabel").join(&id),
+        id,
+        dataset_dir: config.collect.resolved_review_dir(&config.data_root()),
+        synonyms: synonyms(&classes, &config.training.synonyms),
+        classes,
+        request,
+        paths: TrainPaths::for_config(config),
+        platform: Platform::current(),
+        accelerator: None,
+        timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
+        config: Box::new(config.clone()),
+        model,
+        detector: None,
+        config_writer: None,
+        after: None,
+        finish: None,
+    })
+}
+
+/// What a run of `request` on `config` would do: the frames it takes and leaves out, a rough time
+/// ([`preview::AutolabelPreview`]). Reads every sidecar of the folder and writes nothing. Unlike
+/// [`plan_autolabel`] it does not care whether this machine can run it.
+pub fn preview_autolabel(
+    config: &Config,
+    request: AutolabelRequest,
+) -> Result<preview::AutolabelPreview> {
+    scoped_job(config, request)?.preview()
+}
+
+/// Plan an auto-label run of `request` on `config`, the config file at `config_path` (fails fast
+/// on a bad filter, an unknown model, a missing GPU, SAM 3 with no way to get it, or a large
+/// download that was not allowed; [`scoped_job`] says what a `missing_only` run changes).
+pub fn plan_autolabel(
+    config: &Config,
+    config_path: &Path,
+    request: AutolabelRequest,
+    cap: &Capability,
+) -> Result<AutolabelJob> {
+    let mut job = scoped_job(config, request)?;
+    let allow_large = job.request.allow_large || config.allow_large_downloads;
+    job.accelerator.clone_from(&cap.accelerator);
+    if let Some(plan) = &job.model {
+        check_model_install(config, plan, allow_large, job.request.confirm_license)?;
     } else {
+        let paths = &job.paths;
+        let request = &mut job.request;
         // A chosen GPU: its device and its lane's environment.
         let Some(a) = &cap.resolve_gpu(request.gpu.as_deref())? else {
             bail!(
@@ -568,7 +662,16 @@ pub fn plan_autolabel(
                 cap.summary()
             );
         };
-        if !env::train_env_ready(&paths, platform, a.lane()) && !allow_large {
+        if request.sam3
+            && let Some(problem) = sam3_problem(
+                hf_token::sam3_ready(paths) || hf_token::sam3_parts_present(paths),
+                &hf_token::lookup(&config.data_root()),
+                &hf_token::login_command_for(config_path),
+            )
+        {
+            bail!(problem);
+        }
+        if !env::train_env_ready(paths, job.platform, a.lane()) && !allow_large {
             let (dl, _) = a.lane().estimate();
             bail!(
                 "the auto-labelers run in the training environment (about {} download); rerun \
@@ -579,32 +682,14 @@ pub fn plan_autolabel(
         let list: Vec<(&'static Resource, std::path::PathBuf)> = request
             .resources()
             .into_iter()
-            .map(|r| (r, super::pyenv::weights_dir(&paths, r)))
+            .map(|r| (r, super::pyenv::weights_dir(paths, r)))
             .collect();
         super::pyenv::check_large(&list, allow_large)?;
         request.gpu = super::capability::gpu_arg(request.gpu.as_deref())?.map(|_| a.device_arg());
-        accelerator = Some(a.clone());
+        job.accelerator = Some(a.clone());
     }
-    request.allow_large = allow_large;
-    let id = super::service::new_run_id();
-    Ok(AutolabelJob {
-        work: super::training_dir(config).join("autolabel").join(&id),
-        id,
-        dataset_dir: config.collect.resolved_review_dir(&config.data_root()),
-        synonyms: synonyms(&classes, &config.training.synonyms),
-        classes,
-        request,
-        paths,
-        platform,
-        accelerator,
-        timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
-        config: Box::new(config.clone()),
-        model,
-        detector: None,
-        config_writer: None,
-        after: None,
-        finish: None,
-    })
+    job.request.allow_large = allow_large;
+    Ok(job)
 }
 
 /// The frame of a `train.txt` line (`./images/s0-day.back.2026-10-25.<stem>.jpg`): the file name
@@ -1122,5 +1207,109 @@ mod tests {
         assert!(none.validate().is_err());
         assert_eq!(GdinoSize::parse("Swin-B"), Some(GdinoSize::Base));
         assert_eq!(VlmSize::parse("8b"), Some(VlmSize::Qwen8b));
+    }
+
+    #[test]
+    fn requests_saved_before_sam3_still_parse() {
+        // The fields a request had before SAM 3.
+        let old = serde_json::json!({
+            "frames": FrameFilter::default(), "gdino": "tiny", "rfdetr": true, "vlm": "qwen3-vl-2b",
+            "siglip": true, "threshold": 0.3, "gdino_threshold": 0.2, "rfdetr_threshold": 0.3,
+            "accept_score": 0.6,
+        });
+        let r: AutolabelRequest = serde_json::from_value(old).unwrap();
+        assert!(!r.sam3);
+        assert_eq!(r.gdino, Some(GdinoSize::Tiny));
+        assert!(
+            (r.sam3_threshold - 0.3).abs() < f32::EPSILON,
+            "not serde's 0.0"
+        );
+        r.validate().unwrap();
+    }
+
+    #[test]
+    fn sam3_takes_the_gdino_seat_and_only_that() {
+        let sam3 = || {
+            let mut r = AutolabelRequest::new(FrameFilter::default());
+            r.gdino = None;
+            r.sam3 = true;
+            r
+        };
+        sam3().validate().unwrap();
+        // Enough on its own.
+        let mut alone = sam3();
+        alone.rfdetr = false;
+        alone.validate().unwrap();
+        let ids: Vec<&str> = sam3().resources().iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            [
+                res_catalog::SAM3_ID,
+                "train-base:rfdetr-large",
+                "autolabel:qwen3-vl-2b",
+                "autolabel:siglip2-base"
+            ]
+        );
+        let ids: Vec<&'static str> = AutolabelRequest::new(FrameFilter::default())
+            .resources()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(!ids.contains(&res_catalog::SAM3_ID), "{ids:?}");
+
+        let mut both = sam3();
+        both.gdino = Some(GdinoSize::Tiny);
+        let e = both.validate().unwrap_err().to_string();
+        assert!(e.contains("choose one"), "{e}");
+
+        let mut model = sam3();
+        model.with_model = Some("x".into());
+        let e = model.validate().unwrap_err().to_string();
+        assert!(e.contains("--sam3") && e.contains("--with-model"), "{e}");
+        assert!(model.resources().is_empty());
+
+        for bad in [0.0, 1.5, f32::NAN] {
+            let mut t = sam3();
+            t.sam3_threshold = bad;
+            let e = t.validate().unwrap_err().to_string();
+            assert!(e.contains("sam3 threshold"), "{e}");
+        }
+    }
+
+    #[test]
+    fn sam3_with_no_way_to_get_it_names_the_login() {
+        let login = LoginCommand {
+            command: "bop --config c.json hf-login".into(),
+            note: "Run it in PowerShell.".into(),
+        };
+        let found =
+            Lookup::Found(hf_token::HfToken::new("hf_x", hf_token::TokenSource::Saved).unwrap());
+        // Files on disk are adopted, a token is worth a try.
+        assert_eq!(sam3_problem(true, &Lookup::Missing, &login), None);
+        assert_eq!(sam3_problem(false, &found, &login), None);
+
+        let e = sam3_problem(false, &Lookup::Missing, &login).unwrap();
+        for want in [
+            "No Hugging Face token",
+            "https://huggingface.co/facebook/sam3",
+            "SAM License",
+            "bop --config c.json hf-login",
+            "Run it in PowerShell.",
+            "--allow-large",
+        ] {
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        // A login that exists but cannot be read says that instead.
+        let unreadable = Lookup::Unreadable {
+            source: hf_token::TokenSource::Saved,
+            path: Some(Path::new("t").to_path_buf()),
+            reason: "access denied".into(),
+        };
+        let e = sam3_problem(false, &unreadable, &login).unwrap();
+        assert!(
+            e.contains("access denied") && !e.contains("No Hugging Face"),
+            "{e}"
+        );
+        assert!(e.contains("hf-login"), "{e}");
     }
 }

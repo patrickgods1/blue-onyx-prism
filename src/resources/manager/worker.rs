@@ -98,9 +98,8 @@ pub(super) fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
                 if shared.opts.retry && retryable && exhausted {
                     error = format!(
                         "{error} (gave up after {attempts} attempts; check the network \
-                         connection, proxy and firewall, then press Download on the Config page \
-                         or run `{}`)",
-                        fetch_command(job.resource)
+                         connection, proxy and firewall, then {})",
+                        retry_advice(job.resource)
                     );
                 }
                 let delay = (shared.opts.backoff)(attempts);
@@ -139,6 +138,20 @@ pub(super) fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
     }
 }
 
+/// How to start a download again by hand. Only what [`crate::resources::catalog::find`] resolves
+/// has a Download button and a `fetch` command; the training pins (`autolabel:*`, `train-base:*`)
+/// come back with the job that needs them.
+fn retry_advice(res: &Resource) -> String {
+    let here = crate::resources::catalog::Platform::current();
+    match crate::resources::catalog::find(res.id, here.os, here.arch) {
+        Some(_) => format!(
+            "press Download on the Config page or run `{}`",
+            fetch_command(res)
+        ),
+        None => "start again what asked for this download".to_string(),
+    }
+}
+
 /// Resource id whose job panics the worker (tests of RS-04 only).
 #[cfg(test)]
 const TEST_PANIC_ID: &str = "model:test-worker-panic";
@@ -162,7 +175,7 @@ pub fn allow_loopback_http_for_tests() {
 
 /// The download client: HTTPS only (plus loopback `http://` under `cfg(test)`), the same
 /// rule applied to every redirect target, at most [`MAX_REDIRECTS`] hops.
-fn http_client() -> Result<reqwest::Client> {
+pub(crate) fn http_client() -> Result<reqwest::Client> {
     let policy = reqwest::redirect::Policy::custom(|attempt| {
         // `previous` holds the initial URL and every hop so far.
         if attempt.previous().len() > MAX_REDIRECTS {
@@ -172,7 +185,7 @@ fn http_client() -> Result<reqwest::Client> {
         if url_allowed(&next) {
             attempt.follow()
         } else {
-            attempt.error(RedirectRefused::Scheme(next))
+            attempt.error(RedirectRefused::Scheme(without_query(&next).to_string()))
         }
     });
     reqwest::Client::builder()
@@ -197,6 +210,11 @@ enum RedirectRefused {
     TooMany,
 }
 
+/// `url` for an error message: a signed URL's query is a credential.
+fn without_query(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
 /// `https://`, or `http://` to the loopback address when [`loopback_http_allowed`].
 fn url_allowed(url: &str) -> bool {
     url.starts_with("https://")
@@ -210,6 +228,22 @@ fn check_url(url: &str) -> Result<()> {
     } else {
         Err(anyhow!(UrlRefused(url.to_string())))
     }
+}
+
+/// What a gated resource adds to a download: its entry and the token of this attempt.
+struct Gate<'a> {
+    gated: &'static Gated,
+    host: &'a str,
+    token: Option<HfToken>,
+}
+
+/// The [`Gate`] of `res`; None for an ordinary resource, which never sees a token.
+fn gate_of<'a>(shared: &'a Shared, res: &Resource) -> Option<Gate<'a>> {
+    crate::resources::catalog::gated(res.id).map(|gated| Gate {
+        gated,
+        host: &shared.opts.hf.host,
+        token: (shared.opts.hf.token)(),
+    })
 }
 
 /// Install one job (steps 1-6 of the module docs).
@@ -245,13 +279,23 @@ fn run_job(
         let mut files = Vec::new();
         for part in res.parts {
             let dest = job.target.join(part.file_name);
+            // A file of the right size is about to be hashed: gigabytes, so it shows.
+            if std::fs::metadata(&dest).is_ok_and(|m| m.len() == part.size) {
+                shared.set(job, State::Verifying);
+            }
             if file_matches(&dest, part.size, part.sha256, &shared.stop)? {
                 done += part.size;
             } else {
                 let partial = job.target.join(format!("{}.partial", part.file_name));
-                rt.block_on(download_part(client, part, &partial, &shared.stop, |b| {
-                    progress(done + b, false)
-                }))?;
+                let gate = gate_of(shared, res);
+                rt.block_on(download_part(
+                    client,
+                    part,
+                    &partial,
+                    &shared.stop,
+                    gate.as_ref(),
+                    |b| progress(done + b, false),
+                ))?;
                 shared.set(job, State::Verifying);
                 verify(&partial, part, &shared.stop)?;
                 std::fs::rename(&partial, &dest)
@@ -295,9 +339,15 @@ fn run_job(
                 let file = downloads.join(part.file_name);
                 if !file_matches(&file, part.size, part.sha256, &shared.stop)? {
                     let partial = downloads.join(format!("{}.partial", part.file_name));
-                    rt.block_on(download_part(client, part, &partial, &shared.stop, |b| {
-                        progress(done + b, false)
-                    }))?;
+                    let gate = gate_of(shared, res);
+                    rt.block_on(download_part(
+                        client,
+                        part,
+                        &partial,
+                        &shared.stop,
+                        gate.as_ref(),
+                        |b| progress(done + b, false),
+                    ))?;
                     shared.set(job, State::Verifying);
                     verify(&partial, part, &shared.stop)?;
                     std::fs::rename(&partial, &file)
@@ -644,11 +694,16 @@ fn size_mismatch(
 /// coming past it, is a permanent [`SizeMismatch`] (the `.partial` is deleted). A body that
 /// stops short is an interrupted transfer, resumed on the next attempt; the whole file is
 /// hashed by [`verify`] afterwards, resumed or not.
+///
+/// With a `gate` the first request carries the token (when it goes to the gate's host), and a
+/// refusal is a permanent [`GatedRefused`]. reqwest's errors name the URL they failed on, here
+/// possibly a signed one, so each is stripped of it and names the pinned URL.
 async fn download_part(
     client: &reqwest::Client,
     part: &crate::resources::catalog::Part,
     partial: &Path,
     stop: &AtomicBool,
+    gate: Option<&Gate<'_>>,
     mut progress: impl FnMut(u64),
 ) -> Result<()> {
     use futures_util::StreamExt;
@@ -665,14 +720,32 @@ async fn download_part(
     if have > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
     }
+    if let Some(g) = gate {
+        req = hf_token::signed(req, part.url, g.token.as_ref(), g.host);
+    }
     let resp = req
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("GET {}", part.url))?;
     if !url_allowed(resp.url().as_str()) {
-        bail!(UrlRefused(resp.url().to_string()));
+        bail!(UrlRefused(without_query(resp.url().as_str()).to_string()));
     }
     let status = resp.status();
+    if let Some(g) = gate
+        && let Some(refusal) = hf_token::refusal(
+            status.as_u16(),
+            hf_token::has_gated_header(resp.headers()),
+            hf_token::url_on_host(resp.url().as_str(), g.host),
+        )
+    {
+        return Err(anyhow!(GatedRefused {
+            file: part.file_name.to_string(),
+            refusal,
+            gated: g.gated,
+            token: g.token.as_ref().map(HfToken::source),
+        }));
+    }
     let append = if status == reqwest::StatusCode::PARTIAL_CONTENT {
         // Only append when the server resumed exactly where we are, in a file of the
         // pinned size.
@@ -694,6 +767,7 @@ async fn download_part(
         bail!("GET {}: range not satisfiable; restarting", part.url);
     } else {
         resp.error_for_status_ref()
+            .map_err(|e| e.without_url())
             .with_context(|| format!("GET {}", part.url))?;
         false
     };
@@ -725,7 +799,9 @@ async fn download_part(
         if stop.load(Ordering::Relaxed) {
             bail!("cancelled");
         }
-        let chunk = chunk.with_context(|| format!("downloading {}", part.url))?;
+        let chunk = chunk
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("downloading {}", part.url))?;
         have = have.saturating_add(chunk.len() as u64);
         if have > part.size {
             drop(f);
@@ -841,6 +917,10 @@ mod tests {
         /// No `Content-Length` at all (body until the connection closes), so only the running
         /// byte count can catch an oversize body.
         no_length: bool,
+        /// Answer every request with this status line and headers, no body.
+        refuse: Option<&'static str>,
+        /// Answer every request with a 302 to this location.
+        redirect_always: Option<String>,
     }
 
     /// Minimal HTTP/1.1 file server: honors `Range: bytes=N-`, misbehaves per [`Mode`].
@@ -849,6 +929,8 @@ mod tests {
         url: String,
         requests: Arc<AtomicUsize>,
         ranged: Arc<AtomicUsize>,
+        /// The head of every request, as sent.
+        heads: Arc<Mutex<Vec<String>>>,
     }
 
     fn serve(body: Vec<u8>, cut_first: bool) -> Server {
@@ -866,7 +948,12 @@ mod tests {
         let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
         let ranged = Arc::new(AtomicUsize::new(0));
-        let (rq, rg) = (Arc::clone(&requests), Arc::clone(&ranged));
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let (rq, rg, hd) = (
+            Arc::clone(&requests),
+            Arc::clone(&ranged),
+            Arc::clone(&heads),
+        );
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { continue };
@@ -878,8 +965,26 @@ mod tests {
                     }
                     buf.push(byte[0]);
                 }
+                hd.lock_recover()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
                 let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
                 let n = rq.fetch_add(1, Ordering::SeqCst);
+                if let Some(line) = mode.refuse {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.flush();
+                    continue;
+                }
+                if let Some(loc) = &mode.redirect_always {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.flush();
+                    continue;
+                }
                 if n == 0
                     && let Some(loc) = &mode.redirect_first
                 {
@@ -934,6 +1039,7 @@ mod tests {
             url,
             requests,
             ranged,
+            heads,
         }
     }
 
@@ -1298,7 +1404,11 @@ mod tests {
             .unwrap()
             .port();
         let data = body();
-        let res = model_resource(&format!("http://127.0.0.1:{port}/gone"), &data, None);
+        // A catalog id: the manual command only exists for what `fetch` can resolve.
+        let res: &'static Resource = Box::leak(Box::new(Resource {
+            id: "model:IPcam-general",
+            ..*model_resource(&format!("http://127.0.0.1:{port}/gone"), &data, None)
+        }));
         let root = tmp("bounded");
         let m = Manager::start(ManagerOptions {
             retry: true,
@@ -1319,7 +1429,7 @@ mod tests {
                 assert_eq!(*attempts, 3);
                 assert!(error.contains("gave up after 3 attempts"), "{error}");
                 assert!(
-                    error.contains("blue-onyx-prism fetch --resource model:test-model"),
+                    error.contains("blue-onyx-prism fetch --resource model:IPcam-general"),
                     "{error}"
                 );
             }
@@ -1343,6 +1453,371 @@ mod tests {
         assert!(!m.status(&key).unwrap().state.is_final());
         m.shutdown();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const TOKEN: &str = "hf_NotARealTokenOnlyForManagerTests";
+    /// A credential in the signed URL of the CDN.
+    const SIGNATURE: &str = "X-Amz-Signature=abc123";
+    const GATED_401: &str = "401 Unauthorized\r\nX-Error-Code: GatedRepo";
+    const GATED_403: &str = "403 Forbidden\r\nX-Error-Code: GatedRepo";
+
+    fn token() -> Option<HfToken> {
+        HfToken::new(TOKEN, hf_token::TokenSource::Saved).ok()
+    }
+
+    /// `model_resource` under the id that marks a job gated.
+    fn gated_resource(url: &str, data: &[u8]) -> &'static Resource {
+        Box::leak(Box::new(Resource {
+            id: crate::resources::catalog::SAM3_ID,
+            ..*model_resource(url, data, None)
+        }))
+    }
+
+    /// Options of a retrying service, with `host` as the Hugging Face host.
+    fn gated_opts(root: &Path, host: &str) -> ManagerOptions {
+        ManagerOptions {
+            retry: true,
+            backoff: |_| Duration::from_millis(10),
+            max_attempts: Some(3),
+            hf: HfAuth {
+                host: host.to_string(),
+                token: Arc::new(token),
+            },
+            ..ManagerOptions::new(root)
+        }
+    }
+
+    fn run_with(opts: ManagerOptions, res: &'static Resource, root: &Path) -> State {
+        let m = Manager::start(opts);
+        let key = m.enqueue(Job::into_dir(res, root.join("models")));
+        let st = m.wait(std::slice::from_ref(&key), Some(Duration::from_secs(20)));
+        m.shutdown();
+        st[0].state.clone()
+    }
+
+    /// The measured refusals (401 no or bad token, 403 not approved) stop after one attempt, say
+    /// what to do, and hold no token.
+    #[test]
+    fn gated_refusals_stop_after_one_attempt() {
+        // Each answer points at the next step: a new token, or the repo page.
+        for (line, words, next) in [
+            (GATED_401, "hf-login", "huggingface.co/settings/tokens"),
+            (GATED_403, "no access", "huggingface.co/facebook/sam3"),
+        ] {
+            let data = body();
+            let server = serve_with(
+                data.clone(),
+                Mode {
+                    refuse: Some(line),
+                    ..Mode::default()
+                },
+            );
+            let res = gated_resource(&server.url, &data);
+            let root = tmp("gated");
+            let state = run_with(gated_opts(&root, "127.0.0.1"), res, &root);
+            failed_permanently(&state, words);
+            assert_eq!(server.requests.load(Ordering::SeqCst), 1, "one attempt");
+            let State::Failed {
+                error, attempts, ..
+            } = &state
+            else {
+                panic!("{state:?}")
+            };
+            assert_eq!(*attempts, 1);
+            assert!(error.contains(next), "{error}");
+            assert!(!error.contains(TOKEN), "{error}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// No token at all: the 401 sends the user to the repo page first, then to `hf-login`.
+    #[test]
+    fn a_refusal_without_a_token_names_the_repo_and_the_login() {
+        let data = body();
+        let server = serve_with(
+            data.clone(),
+            Mode {
+                refuse: Some(GATED_401),
+                ..Mode::default()
+            },
+        );
+        let res = gated_resource(&server.url, &data);
+        let root = tmp("gated-anon");
+        let mut opts = gated_opts(&root, "127.0.0.1");
+        opts.hf.token = Arc::new(|| None);
+        let state = run_with(opts, res, &root);
+        failed_permanently(&state, "huggingface.co/facebook/sam3");
+        failed_permanently(&state, "hf-login");
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        let heads = server.heads.lock_recover();
+        assert!(!heads[0].to_ascii_lowercase().contains("authorization"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same statuses from a host that is not Hugging Face count only with the header.
+    #[test]
+    fn a_gated_header_is_a_refusal_from_any_host() {
+        let data = body();
+        let server = serve_with(
+            data.clone(),
+            Mode {
+                refuse: Some(GATED_403),
+                ..Mode::default()
+            },
+        );
+        let res = gated_resource(&server.url, &data);
+        let root = tmp("gated-any-host");
+        let state = run_with(gated_opts(&root, "huggingface.co"), res, &root);
+        failed_permanently(&state, "no access");
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An expired signed URL: the CDN's plain 403 is an ordinary failure, retried up to the limit,
+    /// and the signature reaches neither the state nor the error.
+    #[test]
+    fn a_cdn_403_stays_retryable_and_hides_the_signed_url() {
+        let data = body();
+        let cdn = serve_with(
+            data.clone(),
+            Mode {
+                refuse: Some("403 Forbidden"),
+                ..Mode::default()
+            },
+        );
+        let signed = format!("{}?{SIGNATURE}", cdn.url);
+        let front = serve_with(
+            Vec::new(),
+            Mode {
+                redirect_always: Some(signed),
+                ..Mode::default()
+            },
+        );
+        // `localhost` plays huggingface.co, `127.0.0.1` the CDN.
+        let front_url = front.url.replace("127.0.0.1", "localhost");
+        let res = gated_resource(&front_url, &data);
+        let root = tmp("cdn-403");
+        let state = run_with(gated_opts(&root, "localhost"), res, &root);
+        match &state {
+            State::Failed {
+                error,
+                retry_at,
+                attempts,
+            } => {
+                assert_eq!(*retry_at, None, "gave up");
+                assert_eq!(*attempts, 3, "ordinary failure: retried");
+                assert!(error.contains("gave up after 3 attempts"), "{error}");
+                assert!(error.contains("403"), "{error}");
+                assert!(!error.contains("X-Amz"), "{error}");
+                assert!(!error.contains(TOKEN), "{error}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(cdn.requests.load(Ordering::SeqCst), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The token goes to the Hugging Face host and stops at the redirect to the CDN.
+    #[test]
+    fn the_token_does_not_cross_hosts() {
+        let data = body();
+        let cdn = serve(data.clone(), false);
+        let front = serve_with(
+            Vec::new(),
+            Mode {
+                redirect_always: Some(format!("{}?{SIGNATURE}", cdn.url)),
+                ..Mode::default()
+            },
+        );
+        let front_url = front.url.replace("127.0.0.1", "localhost");
+        let res = gated_resource(&front_url, &data);
+        let root = tmp("cross-host");
+        assert_eq!(
+            run_with(gated_opts(&root, "localhost"), res, &root),
+            State::Installed
+        );
+        let sent = front.heads.lock_recover();
+        assert!(sent[0].contains(&format!("Bearer {TOKEN}")), "{}", sent[0]);
+        let got = cdn.heads.lock_recover();
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].contains(TOKEN), "{}", got[0]);
+        assert!(
+            !got[0].to_ascii_lowercase().contains("authorization"),
+            "{}",
+            got[0]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same host name, other port: reqwest counts that as another host too.
+    #[test]
+    fn the_token_does_not_cross_ports() {
+        let data = body();
+        let cdn = serve(data.clone(), false);
+        let front = serve_with(
+            Vec::new(),
+            Mode {
+                redirect_always: Some(cdn.url.clone()),
+                ..Mode::default()
+            },
+        );
+        let res = gated_resource(&front.url, &data);
+        let root = tmp("cross-port");
+        assert_eq!(
+            run_with(gated_opts(&root, "127.0.0.1"), res, &root),
+            State::Installed
+        );
+        assert!(front.heads.lock_recover()[0].contains(TOKEN));
+        assert!(!cdn.heads.lock_recover()[0].contains(TOKEN));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_gated_resources_on_the_hugging_face_host_send_a_token() {
+        // An ordinary resource, on that very host.
+        let data = body();
+        let server = serve(data.clone(), false);
+        let res = model_resource(&server.url, &data, None);
+        let root = tmp("plain");
+        assert_eq!(
+            run_with(gated_opts(&root, "127.0.0.1"), res, &root),
+            State::Installed
+        );
+        assert!(!server.heads.lock_recover()[0].contains(TOKEN));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A gated resource on another host.
+        let server = serve(data.clone(), false);
+        let res = gated_resource(&server.url, &data);
+        let root = tmp("other-host");
+        assert_eq!(
+            run_with(gated_opts(&root, "huggingface.co"), res, &root),
+            State::Installed
+        );
+        assert!(!server.heads.lock_recover()[0].contains(TOKEN));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A login made between two attempts counts on the second.
+    #[test]
+    fn the_token_is_read_again_for_every_attempt() {
+        let data = body();
+        let server = serve(data.clone(), true);
+        let res = gated_resource(&server.url, &data);
+        let root = tmp("reread");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut opts = gated_opts(&root, "127.0.0.1");
+        opts.hf.token = Arc::new(move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            HfToken::new(&format!("token-{n}"), hf_token::TokenSource::Saved).ok()
+        });
+        assert_eq!(run_with(opts, res, &root), State::Installed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let heads = server.heads.lock_recover();
+        assert!(heads[0].contains("Bearer token-0"), "{}", heads[0]);
+        assert!(heads[1].contains("Bearer token-1"), "{}", heads[1]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A folder already holding the files is adopted by hash: no request and no token read, and
+    /// the wait shows as verifying.
+    #[test]
+    fn a_folder_on_disk_is_adopted_by_hash_with_no_request() {
+        let data = body();
+        let server = serve(data.clone(), false);
+        let res = gated_resource(&server.url, &data);
+        let root = tmp("adopt");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("test-model.onnx"), &data).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let verifying = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&verifying);
+        let mut opts = gated_opts(&root, "127.0.0.1");
+        opts.hf.token = Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        opts.on_progress = Some(Arc::new(move |s: &Status| {
+            if s.state == State::Verifying {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        assert_eq!(run_with(opts, res, &root), State::Installed);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 0, "no request");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no token needed");
+        assert_eq!(verifying.load(Ordering::SeqCst), 1);
+        assert!(is_installed(res, &models));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A wrong file at the pinned size is not adopted: it goes to the download, here refused.
+    #[test]
+    fn a_wrong_file_is_not_adopted() {
+        let data = body();
+        let server = serve_with(
+            data.clone(),
+            Mode {
+                refuse: Some(GATED_401),
+                ..Mode::default()
+            },
+        );
+        let res = gated_resource(&server.url, &data);
+        let root = tmp("adopt-wrong");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("test-model.onnx"), vec![0u8; data.len()]).unwrap();
+        let state = run_with(gated_opts(&root, "127.0.0.1"), res, &root);
+        failed_permanently(&state, "hf-login");
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert!(!is_installed(res, &models));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn signed_urls_lose_their_query_in_messages() {
+        assert_eq!(without_query("http://x/y?sig=1&b=2"), "http://x/y");
+        assert_eq!(without_query("http://x/y#f"), "http://x/y");
+        assert_eq!(without_query("http://x/y"), "http://x/y");
+    }
+
+    /// A redirect off https to a signed URL is refused without repeating the signature.
+    #[test]
+    fn a_refused_redirect_hides_the_signature() {
+        let data = body();
+        let server = serve_with(
+            data.clone(),
+            Mode {
+                redirect_first: Some(format!("http://example.com/f?{SIGNATURE}")),
+                ..Mode::default()
+            },
+        );
+        let res = gated_resource(&server.url, &data);
+        let root = tmp("redirect-signed");
+        let state = run_with(gated_opts(&root, "127.0.0.1"), res, &root);
+        failed_permanently(&state, "redirect");
+        let State::Failed { error, .. } = &state else {
+            panic!("{state:?}")
+        };
+        assert!(!error.contains("X-Amz"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The give-up text never offers a command that would answer "unknown resource".
+    #[test]
+    fn the_give_up_text_only_names_what_fetch_can_resolve() {
+        let sam3 = crate::resources::catalog::autolabel_weights("sam3").unwrap();
+        let here = Platform::current();
+        assert!(crate::resources::catalog::find(sam3.id, here.os, here.arch).is_none());
+        let advice = retry_advice(sam3);
+        assert!(!advice.contains("fetch"), "{advice}");
+        assert!(!advice.contains("Config page"), "{advice}");
+        assert!(!advice.contains("autolabel:sam3"), "{advice}");
+
+        let model = crate::resources::catalog::model("IPcam-general").unwrap();
+        assert!(retry_advice(model).contains("fetch --resource model:IPcam-general"));
     }
 
     /// RS-10: hashing stops as soon as the stop flag is set.

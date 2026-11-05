@@ -37,7 +37,7 @@
     <label>Scene <select name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></label>
     <label>Camera <select name="camera" id="rv-camera"><option value="">any</option></select></label>
     <div class="rv-label-filter"><span class="field-label" id="rv-label-cap">Class</span> <div id="rv-label-picker" aria-labelledby="rv-label-cap"><select id="rv-label-fallback" aria-label="Class"><option value="">any</option>{% for c in classes %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></div><input type="hidden" name="label" id="rv-label" value=""></div>
-    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option><option value="repeats">only repeats left</option><option value="overlaps">overlapping boxes</option></select></label>
+    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option><option value="repeats">only repeats left</option><option value="overlaps">overlapping boxes</option><option value="both">found by 2+ labelers</option></select></label>
     <label>Status <select name="status"><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select></label>
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
   </form>
@@ -83,7 +83,7 @@
 
 <div class="card">
   <h2>Auto-label these frames</h2>
-  <p class="muted">Proposes boxes for the frames the filters above select: they appear here as pending <em>auto</em> boxes. The <em>labelers</em> (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2; NVIDIA GPU or Apple silicon) mark each box <em>accept</em> or <em>review</em>. <em>A model</em> (any detector from your config, a model file or a downloadable one) runs on any device, CPU included (RF-DETR L on CPU takes about 1 s per frame); its boxes are <em>review</em> unless you pre-accept them above a score. Frames the filters leave open default to the unreviewed ones in model mode. Runs on the <a href="/training#autolabel">Training</a> page's queue, where the progress and a self-training check are.</p>
+  <p class="muted">Proposes boxes for the frames the filters above select: they appear here as pending <em>auto</em> boxes. The <em>labelers</em> (MM-Grounding-DINO + RF-DETR L, checked by Qwen3-VL and SigLIP 2; NVIDIA GPU or Apple silicon) mark each box <em>accept</em> or <em>review</em> (SAM 3, once installed on the <a href="/training#autolabel">Training</a> page, can replace MM-Grounding-DINO; its boxes are always <em>review</em>). <em>A model</em> (any detector from your config, a model file or a downloadable one) runs on any device, CPU included (RF-DETR L on CPU takes about 1 s per frame); its boxes are <em>review</em> unless you pre-accept them above a score. Frames the filters leave open default to the unreviewed ones in model mode. Runs on the <a href="/training#autolabel">Training</a> page's queue, where the progress and a self-training check are.</p>
   <form id="rv-autolabel" method="post" action="/training/autolabel" class="inline-row">
     <input type="hidden" name="frames" value="">
     <input type="hidden" name="label" value="">
@@ -93,7 +93,10 @@
       <label class="check"><input type="radio" name="mode" value="model"> A model <span class="muted small">(runs anywhere)</span></label>
     </fieldset>
     <div class="rv-al-labelers" data-al-mode="labelers">
-      <input type="hidden" name="gdino" value="tiny">
+      <label class="inline-label" id="rv-al-gdino-field" hidden>Open-vocabulary labeler <select name="gdino" id="rv-al-gdino"><option value="tiny">MM-Grounding-DINO tiny</option></select></label>
+      <span class="muted small" id="rv-al-sam3-apple" hidden>SAM 3 is not measured on Apple GPUs.</span>
+      <label class="inline-label" id="rv-al-sam3-threshold-field" hidden>SAM 3 threshold <input type="number" name="sam3_threshold" min="0.01" max="1" step="0.01" value="0.3" class="num-sm" disabled></label>
+      <span class="muted small" id="rv-al-sam3-threshold-hint" hidden>SAM 3's own score, before fusion. Higher means fewer boxes and missed faint objects. A rerun at another threshold counts as the same labeler: frames it already looked at stay skipped unless you tick <em>Label again</em>.</span>
       <input type="hidden" name="rfdetr" value="on">
       <input type="hidden" name="vlm" value="2b">
       <input type="hidden" name="siglip" value="on">
@@ -109,7 +112,9 @@
     <label class="inline-label">At most <input type="number" name="limit" min="1" max="20000" value="50" class="num-sm"> frames</label>
     <label class="check"><input type="checkbox" id="rv-al-again"> Label again (frames already auto-labelled)</label>
     <button type="submit">Auto-label</button>
+    <button type="button" id="rv-al-preview-run" class="secondary" hidden>Preview frames</button>
   </form>
+  <div id="rv-al-preview" class="review-report" role="status"></div>
   <p class="muted cp-note">The classes default to the ones your enabled models detect, within the class list and not hidden in Review; change which models detect what on the <a href="/config#at-models">Config page</a> (Models, <em>Classes</em>).</p>
   <progress id="rv-al-progress" max="100" value="0" hidden></progress>
   <div id="rv-al-status" class="review-report" role="status"></div>
@@ -140,8 +145,14 @@
   </div>
   <div id="rv-reject-stacked-msg" class="review-report" role="status"></div>
   <div class="inline-row">
+    <button type="button" id="rv-restore-reopened" class="small secondary">Restore reopened frames&hellip;</button>
+    <span class="muted">Frames a re-label sent back from review leave exports until saved again. This puts the ones the filters select back to reviewed when nothing on them is pending, with their boxes as they are: frames with a box still to decide and frames never reviewed are left alone. Asks first.</span>
+  </div>
+  <div id="rv-restore-reopened-msg" class="review-report" role="status"></div>
+  <div class="inline-row">
     <button type="button" id="rv-suggest-overlaps" class="small secondary">Suggest overlaps&hellip;</button>
     <label class="check"><input type="checkbox" id="rv-suggest-large"> Download RF-DETR L if missing</label>
+    <label class="check"><input type="checkbox" id="rv-suggest-again"> Ask again <span class="muted small">(pairs with an answer too, say after a rerun added a labeler's vote)</span></label>
     <span class="muted">Takes a closer look at the nested and partly overlapping boxes on the frames the Bucket, Scene, Camera and Class filters select, <strong>reviewed frames too</strong>, and writes a suggestion for each pair: which box to drop, or that they are two objects. <strong>No box changes</strong>: under Auto <em>overlapping boxes</em> the frames open on the suggestion, strongest first, and <kbd>y</kbd> accepts it. Run <em>Reject stacked duplicates</em> first. Runs on the <a href="/training#autolabel">Training</a> queue (NVIDIA GPU or Apple silicon). Asks first.</span>
   </div>
   <progress id="rv-suggest-progress" max="100" value="0" hidden></progress>

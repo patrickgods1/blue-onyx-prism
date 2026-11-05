@@ -346,12 +346,31 @@ pub fn import_chain(a: &ImportArgs) -> Result<ImportChain> {
 #[derive(Debug, Clone, clap::Args)]
 pub struct AutolabelArgs {
     /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, label, status
-    /// (unreviewed | reviewed | skipped | any), source (queue | all), import (<id> | any), limit.
+    /// (unreviewed | reviewed | skipped | any), source (queue | all), auto (review | accept |
+    /// nothing | none | repeats | overlaps | both: frames in that auto-label state; overlaps =
+    /// overlapping boxes a reviewer has not checked; both = a pending box two or more labelers
+    /// found, most such boxes first), import (<id> | any), again=1 (also frames these labelers
+    /// already looked at), limit (most frames, in queue order; default 200, at most 20000).
+    /// --dry-run shows what a filter selects.
     #[arg(long, default_value = "")]
     pub frames: String,
+    /// Only count the frames: how many match, how many this run takes after the limit, how many it
+    /// leaves out, and a rough time. Needs no GPU, login or download, and writes nothing.
+    #[arg(long)]
+    pub dry_run: bool,
     /// MM-Grounding-DINO size: tiny, base, large, or off.
     #[arg(long, default_value = "tiny")]
     pub gdino: String,
+    /// SAM 3 in MM-Grounding-DINO's place (gated: request access and sign in first, see the
+    /// Training page's SAM 3 panel). Its boxes always go to review. Not with --gdino or
+    /// --with-model.
+    #[arg(long, conflicts_with = "gdino")]
+    pub sam3: bool,
+    /// SAM 3's own score threshold before fusion, 0.01 to 1 (default 0.3). Higher means fewer
+    /// boxes and missed faint objects. The frames' marker names the labelers, not this value, so
+    /// a rerun at another threshold needs again=1 in --frames. Needs --sam3.
+    #[arg(long, requires = "sam3")]
+    pub sam3_threshold: Option<f32>,
     /// Do not run RF-DETR L.
     #[arg(long)]
     pub no_rfdetr: bool,
@@ -497,6 +516,14 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
                 .with_context(|| format!("--gdino: '{g}' is not tiny, base, large or off"))?,
         ),
     };
+    if a.sam3 {
+        // `--gdino` itself is refused when parsing; this is its default.
+        r.gdino = None;
+        r.sam3 = true;
+    }
+    if let Some(t) = a.sam3_threshold {
+        r.sam3_threshold = t;
+    }
     r.vlm = match a.vlm.trim() {
         "off" | "none" | "" => None,
         v => Some(
@@ -789,7 +816,7 @@ fn load_config(path: &Path) -> Result<Config> {
     }
 }
 
-fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
+pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
     let path = config_path.unwrap_or_else(Config::default_config_path);
     let config = load_config(&path)?;
     match args.command {
@@ -1144,7 +1171,7 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
             // Planned before anything runs: a bad auto-label setting imports nothing.
             let autolabel = match chain.autolabel {
                 Some(r) => {
-                    let mut al = super::autolabel::plan_autolabel(&config, r, &cap)
+                    let mut al = super::autolabel::plan_autolabel(&config, &path, r, &cap)
                         .context("auto-label of the import (nothing was imported)")?;
                     super::autolabel::follow_import(&mut al, &job);
                     al.config_writer = Some(writer);
@@ -1185,8 +1212,15 @@ fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
         }
         TrainCommand::Autolabel(a) => {
             let req = autolabel_request(&a)?;
+            if a.dry_run {
+                println!(
+                    "{}",
+                    autolabel_dry_run_text(&super::autolabel::preview_autolabel(&config, req)?)
+                );
+                return Ok(true);
+            }
             let cap = super::capability_now();
-            let mut job = super::autolabel::plan_autolabel(&config, req, &cap)?;
+            let mut job = super::autolabel::plan_autolabel(&config, &path, req, &cap)?;
             // A local or catalog model is added to the config file (disabled).
             job.config_writer = Some(Arc::new(super::autolabel::models::FileConfigWriter {
                 path: path.clone(),
@@ -1530,6 +1564,15 @@ fn before_after<'a>(
 /// How many cameras / camera-days the dry run lists.
 const DRY_RUN_TOP: usize = 10;
 
+/// `train autolabel --dry-run`: the preview's folder, sentences and warnings. Pure.
+fn autolabel_dry_run_text(p: &super::autolabel::preview::AutolabelPreview) -> String {
+    let mut t = format!("{}: {}\n{}", p.dir, p.filter, p.summary);
+    for w in &p.warnings {
+        t.push_str(&format!("\nwarning: {w}"));
+    }
+    t
+}
+
 /// `train prepare --dry-run`: the split and, when balancing, what it does. Pure.
 pub fn dry_run_text(plan: &dataset::Plan, balance: &dataset::Balance) -> String {
     let mut out = String::new();
@@ -1766,6 +1809,37 @@ mod tests {
     }
 
     #[test]
+    fn autolabel_dry_run_parses_and_prints_the_warnings() {
+        let TrainCommand::Autolabel(a) = parse(&[
+            "autolabel",
+            "--dry-run",
+            "--frames",
+            "status=reviewed,auto=overlaps,again=1,limit=500",
+        ])
+        .unwrap() else {
+            panic!("autolabel");
+        };
+        assert!(a.dry_run);
+        let r = autolabel_request(&a).unwrap();
+        assert_eq!(r.frames.query["auto"], "overlaps");
+        assert!(r.frames.again());
+        assert_eq!(r.frames.limit, 500);
+        let p = super::super::autolabel::preview::AutolabelPreview::new(
+            &r,
+            "D:/dataset".into(),
+            "labelers".into(),
+            3,
+            &super::super::autolabel::preview::Counts::default(),
+            vec![],
+            vec!["a note".into()],
+        );
+        let t = autolabel_dry_run_text(&p);
+        assert!(t.starts_with("D:/dataset: "), "{t}");
+        assert!(t.contains("No frame matches"), "{t}");
+        assert!(t.ends_with("warning: a note"), "{t}");
+    }
+
+    #[test]
     fn overlaps_flags_parse() {
         let TrainCommand::Overlaps(a) = parse(&[
             "overlaps",
@@ -1963,6 +2037,66 @@ mod tests {
     }
 
     #[test]
+    fn the_sam3_threshold_needs_sam3_and_a_value_in_range() {
+        let args = |rest: &[&str]| -> AutolabelArgs {
+            let mut v = vec!["autolabel"];
+            v.extend_from_slice(rest);
+            let TrainCommand::Autolabel(a) = parse(&v).unwrap() else {
+                panic!("not autolabel")
+            };
+            a
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < f32::EPSILON;
+        let r = autolabel_request(&args(&["--sam3"])).unwrap();
+        assert!(near(r.sam3_threshold, 0.3), "the default");
+        let r = autolabel_request(&args(&["--sam3", "--sam3-threshold", "0.45"])).unwrap();
+        assert!(near(r.sam3_threshold, 0.45));
+        for edge in ["0.01", "1"] {
+            let a = args(&["--sam3", "--sam3-threshold", edge]);
+            assert!(autolabel_request(&a).is_ok(), "{edge}");
+        }
+        for bad in ["0", "1.5", "NaN", "inf"] {
+            let a = args(&["--sam3", "--sam3-threshold", bad]);
+            let e = autolabel_request(&a).unwrap_err().to_string();
+            assert!(e.contains("sam3 threshold"), "{bad}: {e}");
+        }
+        assert!(parse(&["autolabel", "--sam3", "--sam3-threshold", "high"]).is_err());
+        let e = parse(&["autolabel", "--sam3-threshold", "0.45"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("--sam3"), "{e}");
+    }
+
+    #[test]
+    fn sam3_clears_the_gdino_default_and_refuses_an_explicit_one() {
+        let TrainCommand::Autolabel(a) = parse(&["autolabel", "--sam3"]).unwrap() else {
+            panic!()
+        };
+        let r = autolabel_request(&a).unwrap();
+        assert!(r.sam3);
+        assert_eq!(r.gdino, None);
+        assert!(r.rfdetr, "only the seat changes");
+        let TrainCommand::Autolabel(a) = parse(&["autolabel"]).unwrap() else {
+            panic!()
+        };
+        let r = autolabel_request(&a).unwrap();
+        assert!(!r.sam3);
+        assert_eq!(r.gdino, Some(super::super::autolabel::GdinoSize::Tiny));
+        let e = parse(&["autolabel", "--sam3", "--gdino", "base"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--sam3") && e.contains("--gdino"), "{e}");
+        let TrainCommand::Autolabel(a) =
+            parse(&["autolabel", "--sam3", "--with-model", "x"]).unwrap()
+        else {
+            panic!()
+        };
+        let e = autolabel_request(&a).unwrap_err().to_string();
+        assert!(e.contains("--with-model"), "{e}");
+    }
+
+    #[test]
     fn import_follow_up_flags_parse_and_are_checked() {
         let chain = |args: &[&str]| {
             let mut v = vec!["import", "--path", "clips"];
@@ -2030,6 +2164,7 @@ mod tests {
                 error: None,
                 finished: None,
                 after: None,
+                uses: Vec::new(),
             };
             r.summary = summary.map(str::to_string);
             chain_ok(i, Some(&r))

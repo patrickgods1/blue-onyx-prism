@@ -204,7 +204,7 @@
 
 <div class="card" id="autolabel">
   <h2>Auto-label</h2>
-  <p class="muted">Proposes boxes for dataset frames as pending <em>auto</em> boxes on the <a href="/review">Review</a> page. Nothing is accepted or deleted for you: a box is marked <em>accept</em> only when both labelers agree at 0.6 or more and no check objects; night persons and animals are always <em>review</em>.</p>
+  <p class="muted">Proposes boxes for dataset frames as pending <em>auto</em> boxes on the <a href="/review">Review</a> page. Nothing is accepted or deleted for you: a box is marked <em>accept</em> only when both labelers agree at 0.6 or more and no check objects; night persons, animals and every SAM 3 box are always <em>review</em>.</p>
   <form method="post" action="/training/autolabel" class="tr-form" id="autolabel-form">
     <fieldset class="tr-radios">
       <legend>Labelers</legend>
@@ -213,9 +213,27 @@
     </fieldset>
     <div class="tr-grid" data-mode="labelers">
       <div class="tr-field">
-        <label for="al-gdino">MM-Grounding-DINO</label>
-        <select id="al-gdino" name="gdino"><option value="tiny">tiny (Swin-T, 0.7 GB)</option><option value="base">base (Swin-B, 0.9 GB)</option><option value="large">large (Swin-L, 1.4 GB)</option><option value="off">off</option></select>
+        <label for="al-gdino">Open-vocabulary labeler</label>
+        <select id="al-gdino" name="gdino"><option value="tiny">MM-Grounding-DINO tiny (Swin-T, 0.7 GB)</option><option value="base">MM-Grounding-DINO base (Swin-B, 0.9 GB)</option><option value="large">MM-Grounding-DINO large (Swin-L, 1.4 GB)</option><option value="sam3" id="al-gdino-sam3" disabled>SAM 3 (gated, needs the download below)</option><option value="off">off</option></select>
         <p class="muted small">Open vocabulary: the class list plus <code>training.synonyms</code>.</p>
+        <div class="tr-sub" id="al-sam3-threshold-field" hidden>
+          <label for="al-sam3-threshold">SAM 3 threshold</label>
+          <input type="number" id="al-sam3-threshold" name="sam3_threshold" class="al-num" min="0.01" max="1" step="0.01" value="0.3" disabled>
+          <p class="muted small">SAM 3's own score, before fusion. Higher means fewer boxes and missed faint objects. A rerun at another threshold counts as the same labeler: frames it already looked at stay skipped unless you tick <em>Also frames these labelers already looked at</em>.</p>
+        </div>
+        <details class="tr-more" id="al-sam3" hidden>
+          <summary>SAM 3 <span class="muted small" id="al-sam3-summary"></span></summary>
+          <ol class="small">
+            <li>Request access on <a id="al-sam3-link" href="https://huggingface.co/facebook/sam3" target="_blank" rel="noopener">the SAM 3 page</a> (<span id="al-sam3-license">SAM License</span>). Meta approves each account.</li>
+            <li><button type="button" class="small" id="al-sam3-download">I have access, download</button> <progress id="al-sam3-progress" max="100" hidden></progress></li>
+            <li id="al-sam3-login" hidden>Sign in once, in a terminal: <code id="al-sam3-command"></code> <button type="button" class="small" id="al-sam3-copy">Copy</button> <span class="muted" id="al-sam3-copied" role="status"></span><br><span class="muted" id="al-sam3-note"></span><br><button type="button" class="small" id="al-sam3-retry">Try again</button></li>
+          </ol>
+          <p class="form-msg" id="al-sam3-msg" role="status"></p>
+          <p class="muted small" id="al-sam3-source" hidden></p>
+          <ul class="warn-list small" id="al-sam3-override" hidden><li>HF_TOKEN is set for this service and wins over the login on disk, so signing in again changes nothing until it is unset.</li></ul>
+          <p class="muted small" id="al-sam3-apple" hidden>Not measured on Apple GPUs.</p>
+          <p><button type="button" class="small" id="al-sam3-remove" hidden>Remove SAM 3</button></p>
+        </details>
       </div>
       <div class="tr-field">
         <label for="al-vlm">VLM check</label>
@@ -262,8 +280,8 @@
       </div>
       <div class="tr-field">
         <label for="al-preset">Preset</label>
-        <select id="al-preset"><option value="first-pass">First pass</option><option value="self-training">Self-training check</option></select>
-        <p class="muted small">First pass: unreviewed frames. Self-training check: all frames, flagging where the model disagrees with your reviewed labels. Sets the status below.</p>
+        <select id="al-preset"><option value="first-pass">First pass</option><option value="self-training">Self-training check</option><option value="" hidden>As under Which frames</option></select>
+        <p class="muted small">First pass: unreviewed frames. Self-training check: all frames, flagging where the model disagrees with your reviewed labels. Sets Which frames below.</p>
       </div>
       <div class="tr-field tr-wide">
         <label class="check"><input type="checkbox" name="missing_only"> Find missing labels only</label>
@@ -272,41 +290,46 @@
     </div>
     <fieldset>
       <legend>Which frames</legend>
+      <div class="tr-field" id="al-which-field" hidden>
+        <label for="al-which">Frames</label>
+        <select id="al-which"><option value="unreviewed">Unreviewed</option><option value="reviewed">Reviewed</option><option value="reviewed-overlaps">Reviewed with overlaps or duplicates</option><option value="unreviewed-overlaps">Unreviewed with overlaps or duplicates</option><option value="all">All</option><option value="custom">Custom</option></select>
+        <p class="muted small">Overlaps or duplicates: the Review page's <em>overlapping boxes</em>; frames whose overlaps a reviewer already checked stay out. Custom: status, scene, camera, class and other filters.</p>
+      </div>
       <div class="tr-grid">
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-status">Status</label>
           <select id="al-status" name="status"><option value="">default</option><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select>
-          <p class="muted small">Default: unreviewed. The model presets set it.</p>
+          <p class="muted small">Default: unreviewed.</p>
         </div>
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-scene">Scene</label>
           <select id="al-scene" name="scene"><option value="">any</option><option value="day">day</option><option value="night">night</option><option value="ir">IR</option></select>
         </div>
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-camera">Camera</label>
           <input type="text" id="al-camera" name="camera" placeholder="any">
         </div>
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-label">Class</label>
           <input type="text" id="al-label" name="label" placeholder="any">
         </div>
-        <div class="tr-field">
+        <div class="tr-field" data-al-custom>
           <label for="al-auto">Auto-labelled</label>
-          <select id="al-auto" name="auto"><option value="">any</option><option value="none">never</option><option value="review">marked review</option><option value="accept">marked accept</option><option value="nothing">found nothing</option></select>
+          <select id="al-auto" name="auto"><option value="">any</option><option value="none">never</option><option value="review">marked review</option><option value="accept">marked accept</option><option value="nothing">found nothing</option><option value="overlaps">overlapping boxes</option><option value="both">found by 2+ labelers</option></select>
         </div>
         <div class="tr-field">
           <label for="al-limit">Limit</label>
           <input type="number" id="al-limit" name="limit" min="1" max="20000" value="200">
-          <p class="muted small">Most frames, in queue order.</p>
+          <p class="muted small">Most frames, in queue order. Preview says when it cuts a run short.</p>
         </div>
       </div>
       <label class="check"><input type="checkbox" name="again" value="1"> Also frames these labelers already looked at</label>
-      <details class="tr-more">
+      <details class="tr-more" data-al-custom>
         <summary>Other filters</summary>
         <div class="tr-field">
           <label for="al-frames">Filter text</label>
           <input type="text" id="al-frames" name="frames" placeholder="bucket=empty,import=any">
-          <p class="muted small"><code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>import</code> (an import id, or any), <code>source</code> (queue, all; default all here), and any key above (<code>scene</code> day, night, ir; <code>camera</code>; <code>label</code>; <code>status</code> unreviewed, reviewed, skipped, any; <code>auto</code> review, accept, nothing, none; <code>again=1</code>; <code>limit</code>). A key given here wins over its field.</p>
+          <p class="muted small"><code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>import</code> (an import id, or any), <code>source</code> (queue, all; default all here), and any key above (<code>scene</code> day, night, ir; <code>camera</code>; <code>label</code>; <code>status</code> unreviewed, reviewed, skipped, any; <code>auto</code> review, accept, nothing, none, overlaps, both (a pending box found by 2+ labelers); <code>again=1</code>; <code>limit</code>). A key given here wins over its field.</p>
         </div>
       </details>
     </fieldset>
@@ -316,7 +339,8 @@
     {% if let Some(what) = autolabel_large %}
     <label class="check tr-confirm" data-mode="labelers"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB: {{ what }}</label>
     {% endif %}
-    <div class="actions"><button type="submit">Auto-label</button></div>
+    <div class="actions"><button type="submit">Auto-label</button> <button type="button" class="secondary" id="al-preview-run" hidden>Preview frames</button></div>
+    <div id="al-preview" role="status" hidden></div>
   </form>
 </div>
 

@@ -94,7 +94,11 @@ impl Spot {
                     b.difficult = false;
                     b.reject_reason = why.clone();
                 }
-                Verdict::Accept => b.state = BoxState::Accepted,
+                Verdict::Accept => {
+                    b.state = BoxState::Accepted;
+                    // The look that flag remembers did not cover this box.
+                    f.checked_before_reopen = false;
+                }
             }
             if b.reason.is_none() {
                 b.reason = Some(REPEAT_SPOT_REASON.into());

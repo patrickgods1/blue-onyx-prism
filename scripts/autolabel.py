@@ -6,7 +6,8 @@ Labelers, per frame (docs/TRAINING.md, "Auto-label"):
   1. MM-Grounding-DINO (open vocabulary, Hugging Face transformers, Apache-2.0): one text prompt per
      class plus its synonyms ("raccoon", "Virginia opossum", ...), batched so each prompt stays under
      the text encoder's token limit; boxes at or above --gdino-threshold (0.2), class-aware NMS at
-     --nms-iou (0.6).
+     --nms-iou (0.6). Or, in the same seat, SAM 3 (--sam3, gated, SAM License): one prompt per phrase,
+     boxes above --sam3-threshold (0.3), the same NMS.
   2. RF-DETR L (closed set, the `rfdetr` package, Apache-2.0) for the classes that are COCO classes,
      at or above --rfdetr-threshold (0.3).
   3. Weighted boxes fusion of both (IoU --wbf-iou 0.55, weights 1:1; a class only one labeler can
@@ -48,6 +49,8 @@ service matches the detections to the boxes under its label write lock.
     python scripts/autolabel.py --self-check          # imports and the device
     python scripts/autolabel.py --frames f.jsonl --out p.jsonl --classes '["person","car"]' \\
         --gdino <dir> --rfdetr <rf-detr-large.pth> [--vlm <Qwen3-VL dir>] [--siglip <SigLIP 2 dir>]
+    python scripts/autolabel.py --frames f.jsonl --out p.jsonl --classes '["person","car"]' \\
+        --sam3 <dir> --rfdetr <rf-detr-large.pth>
     python scripts/autolabel.py --zoom-pairs c.jsonl --out z.jsonl --classes '["person","car"]' \\
         --rfdetr <rf-detr-large.pth> --rfdetr-threshold 0.1
 """
@@ -62,6 +65,7 @@ import queue
 import sys
 import threading
 import time
+import types
 import warnings
 from pathlib import Path
 
@@ -124,6 +128,9 @@ DEFAULT_SYNONYMS = {
     "bird": ["bird"],
 }
 
+# The labelers that take any class by name (`participants_of`).
+OPEN_VOCABULARY = ("gdino", "sam3")
+
 PERSON = {"person"}
 VEHICLES = {"car", "truck", "bus", "bicycle", "motorcycle", "train", "boat", "airplane", "van"}
 ANIMALS = {"dog", "cat", "raccoon", "opossum", "skunk", "fox", "deer", "squirrel", "bird", "horse", "sheep",
@@ -163,6 +170,13 @@ def iou(a, b) -> float:
     return inter / ua if ua > 0 else 0.0
 
 
+def clamp_box(box, w: int, h: int):
+    """`box` clamped to a `w` x `h` frame as a list of floats; None when under a pixel on a side."""
+    x0, y0, x1, y1 = (max(0.0, min(float(box[0]), w)), max(0.0, min(float(box[1]), h)),
+                      max(0.0, min(float(box[2]), w)), max(0.0, min(float(box[3]), h)))
+    return [x0, y0, x1, y1] if x1 - x0 >= 1 and y1 - y0 >= 1 else None
+
+
 def nms(boxes: list, thr: float) -> list:
     """Class-aware greedy NMS over dicts with `label`, `bbox`, `score`: highest score first, a box
     of the same label at IoU > thr of a kept one is dropped."""
@@ -171,6 +185,23 @@ def nms(boxes: list, thr: float) -> list:
         if all(k["label"] != b["label"] or iou(k["bbox"], b["bbox"]) <= thr for k in out):
             out.append(b)
     return out
+
+
+def participants_of(labelers, classes: list) -> dict:
+    """Class -> the `labelers` that can report it, sorted (the `participants` of `wbf`): an
+    open-vocabulary labeler (`gdino`, `sam3`) reports any class, RF-DETR only the COCO ones."""
+    return {c: sorted(m for m in labelers if m in OPEN_VOCABULARY or (m == "rfdetr" and coco_class(c) is not None))
+            for c in classes}
+
+
+def labeler_problem(gdino, sam3, rfdetr):
+    """What is wrong with the chosen labelers (each a path or None), None when nothing is: SAM 3
+    takes MM-Grounding-DINO's seat, so they are never both on, and one labeler has to be."""
+    if gdino is not None and sam3 is not None:
+        return "--gdino and --sam3 are the same seat: choose one"
+    if gdino is None and sam3 is None and rfdetr is None:
+        return "give --gdino or --sam3, and/or --rfdetr"
+    return None
 
 
 def wbf(per_model: dict, weights: dict, iou_thr: float, participants: dict) -> list:
@@ -370,6 +401,28 @@ def self_test(parity: Path = None) -> int:
         {"label": "dog", "bbox": [50, 50, 60, 60], "score": 0.3},
     ], 0.6)
     check([(k["label"], k["score"]) for k in kept] == [("dog", 0.9), ("cat", 0.7), ("dog", 0.3)], "nms")
+    check(clamp_box([-5, 2, 30, 40], 20, 30) == [0.0, 2.0, 20.0, 30.0], "clamp_box inside the frame")
+    check(clamp_box([19.5, 0, 30, 10], 20, 30) is None, "clamp_box under a pixel wide")
+    check(clamp_box([0, 5, 10, 5.5], 20, 30) is None, "clamp_box under a pixel high")
+    # SAM 3 sits in gdino's seat: any class, fused over RF-DETR too where RF-DETR knows the class.
+    check(participants_of(["rfdetr", "gdino"], ["person", "raccoon"]) == {"person": ["gdino", "rfdetr"],
+                                                                          "raccoon": ["gdino"]},
+          "participants of gdino")
+    both = ["sam3", "rfdetr"]
+    check(participants_of(both, ["person", "raccoon"]) == {"person": ["rfdetr", "sam3"], "raccoon": ["sam3"]},
+          "participants of sam3")
+    check(participants_of(["sam3"], ["person"]) == {"person": ["sam3"]}, "participants of sam3 alone")
+    check(participants_of(["rfdetr"], ["raccoon"]) == {"raccoon": []}, "participants without an open-vocabulary labeler")
+    seat = wbf({"sam3": [{"label": "person", "bbox": [0, 0, 10, 10], "score": 0.8},
+                         {"label": "raccoon", "bbox": [50, 50, 60, 60], "score": 0.8}], "rfdetr": []},
+               {"sam3": 1.0, "rfdetr": 1.0}, 0.55, participants_of(both, ["person", "raccoon"]))
+    by = {b["label"]: b for b in seat}
+    check(abs(by["person"]["score"] - 0.4) < 1e-9 and not by["person"]["agree"], f"sam3 alone on a COCO class {by}")
+    check(abs(by["raccoon"]["score"] - 0.8) < 1e-9, f"sam3 on a class only it knows {by}")
+    check(by["person"]["sources"] == {"sam3": 0.8}, f"sam3 in sources {by}")
+    check(labeler_problem("g", None, None) is None and labeler_problem(None, "s", "r") is None, "labeler choice")
+    check("same seat" in labeler_problem("g", "s", None), "gdino and sam3 refused")
+    check("--sam3" in labeler_problem(None, None, None), "no labeler refused")
     # WBF: two models agree on a person (fused box = score-weighted mean), one model alone on a car.
     fused = wbf({
         "gdino": [{"label": "person", "bbox": [10, 10, 50, 90], "score": 0.6},
@@ -666,11 +719,101 @@ class GroundingDino:
                 cls = phrase_class(str(lab), phrase_to_class)
                 if cls is None:
                     continue
-                x0, y0, x1, y1 = (max(0.0, min(float(box[0]), w)), max(0.0, min(float(box[1]), h)),
-                                  max(0.0, min(float(box[2]), w)), max(0.0, min(float(box[3]), h)))
-                if x1 - x0 >= 1 and y1 - y0 >= 1:
-                    found.append({"label": cls, "bbox": [x0, y0, x1, y1], "score": float(score)})
+                b = clamp_box(box, w, h)
+                if b is not None:
+                    found.append({"label": cls, "bbox": b, "score": float(score)})
         return nms(found, self.nms_iou)
+
+
+class Sam3:
+    """SAM 3 (`facebook/sam3`, gated) as an open-vocabulary detector: one `get_vision_features` per
+    frame, one `forward` per phrase, boxes above `threshold` from `post_process_object_detection`,
+    class-aware NMS. The weights are only read.
+
+    - `post_process_object_detection` gives the same boxes as the instance-segmentation one: both
+      return the detector head's `pred_boxes`, not boxes derived from masks. So the mask decoder
+      comes out (`no_mask_decoder`): boxes and scores are computed before it.
+    - Both post-processors already multiply the class score by the presence score.
+    - The phrases are encoded once, then the text tower moves to the CPU, so load this model first:
+      the room it leaves on the GPU is there for the other labelers.
+    - `attention_mask` stays with `text_embeds`: the processor pads to 32 tokens, and without the
+      mask `forward` would read the padding as prompt.
+    - `text_embeds` takes the object `get_text_features` returns, not `.pooler_output` as the
+      docstring shows: `forward` reads `.pooler_output` itself.
+    - `target_sizes=[(h, w)]` goes to the post-processor directly; it never reads `original_sizes`.
+    - float32: the model loads in it, and the box arithmetic stays in it, since an f16 box times
+      2688 would round to 2 px.
+    """
+
+    def __init__(self, path: Path, device: str, threshold: float, nms_iou: float, phrases: list):
+        import torch
+        from transformers import Sam3Model, Sam3Processor
+        from transformers.modeling_outputs import BaseModelOutputWithPooling
+
+        if not (path / "config.json").exists():
+            fail(f"no SAM 3 weights in {path}: it is a gated download, see the Training page's SAM 3 panel")
+        self.torch = torch
+        self.device = device
+        self.threshold = threshold
+        self.nms_iou = nms_iou
+        self.processor = Sam3Processor.from_pretrained(str(path))
+        model = Sam3Model.from_pretrained(str(path), dtype=torch.float32)
+        model.mask_decoder = no_mask_decoder()
+        self.model = model.to(device).eval()
+        self.masks, self.embeds = {}, {}
+        with torch.no_grad():
+            for p in phrases:
+                t = self.processor(text=p, return_tensors="pt").to(device)
+                self.masks[p] = t["attention_mask"]
+                self.embeds[p] = BaseModelOutputWithPooling(pooler_output=self.model.get_text_features(
+                    input_ids=t["input_ids"], attention_mask=t["attention_mask"]).pooler_output)
+        if device.startswith(("cuda", "mps")):
+            self.model.text_encoder.to("cpu")
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+    def check(self, outputs, phrase: str) -> None:
+        """A NaN compares false with every threshold, so without this a broken run would label frames
+        as empty and mark them done."""
+        for name in ("pred_logits", "pred_boxes", "presence_logits"):
+            v = getattr(outputs, name)
+            if v is not None and not self.torch.isfinite(v).all():
+                fail(f"SAM 3's {name} for {phrase!r} is NaN or infinite in float32 on {self.device}, which "
+                     "points at the GPU (a reset, overheating, a driver problem) rather than this frame. "
+                     "Check the GPU and run it again.")
+
+    def detect(self, image, phrase_to_class: dict) -> list:
+        torch = self.torch
+        w, h = image.size
+        pixel = self.processor(images=image, return_tensors="pt")["pixel_values"].to(self.device, dtype=torch.float32)
+        found = []
+        with torch.no_grad():
+            vision = self.model.get_vision_features(pixel_values=pixel)
+            for phrase, cls in phrase_to_class.items():
+                outputs = self.model(vision_embeds=vision, text_embeds=self.embeds[phrase],
+                                     attention_mask=self.masks[phrase])
+                self.check(outputs, phrase)
+                res = self.processor.post_process_object_detection(types.SimpleNamespace(
+                    pred_logits=outputs.pred_logits.float(), pred_boxes=outputs.pred_boxes.float(),
+                    presence_logits=None if outputs.presence_logits is None else outputs.presence_logits.float(),
+                ), threshold=self.threshold, target_sizes=[(h, w)])[0]
+                for box, score in zip(res["boxes"].tolist(), res["scores"].tolist()):
+                    b = clamp_box(box, w, h)
+                    if b is not None:
+                        found.append({"label": cls, "bbox": b, "score": float(score)})
+                del outputs
+        return nms(found, self.nms_iou)
+
+
+def no_mask_decoder():
+    """Stands in for `Sam3MaskDecoder` in `Sam3Model.forward`: boxes and scores come before it."""
+    import torch
+
+    class NoMaskDecoder(torch.nn.Module):
+        def forward(self, **kwargs):
+            return types.SimpleNamespace(pred_masks=None, semantic_seg=None, attentions=None)
+
+    return NoMaskDecoder()
 
 
 def native_grid_sample_on_mps() -> bool:
@@ -1082,6 +1225,8 @@ def self_check() -> int:
     for mod in ("numpy", "PIL", "torch", "transformers", "rfdetr"):
         m = importlib.import_module(mod)
         log(f"self-check: {mod} {getattr(m, '__version__', '?')}")
+    # Here, so an environment that cannot run SAM 3 fails before its 3.4 GB download.
+    from transformers import Sam3Model, Sam3Processor  # noqa: F401
     import torch
 
     info = {"torch": torch.__version__, "cuda": torch.cuda.is_available(),
@@ -1104,12 +1249,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--synonyms", type=Path, help="JSON file: {class: [prompt phrases]}")
     p.add_argument("--categories", type=Path, help="JSON file: {class: person|vehicle|animal|object}")
     p.add_argument("--gdino", type=Path, help="MM-Grounding-DINO checkpoint directory")
+    p.add_argument("--sam3", type=Path, help="SAM 3 checkpoint directory (in place of --gdino)")
     p.add_argument("--rfdetr", type=Path, help="RF-DETR L checkpoint (.pth)")
     p.add_argument("--vlm", type=Path, help="Qwen3-VL checkpoint directory (optional)")
     p.add_argument("--vlm-name", default="qwen3-vl")
     p.add_argument("--siglip", type=Path, help="SigLIP 2 checkpoint directory (optional)")
     p.add_argument("--device", default="auto")
     p.add_argument("--gdino-threshold", type=float, default=0.2)
+    p.add_argument("--sam3-threshold", type=float, default=0.3)
     p.add_argument("--rfdetr-threshold", type=float, default=0.3)
     p.add_argument("--nms-iou", type=float, default=0.6)
     p.add_argument("--wbf-iou", type=float, default=0.55)
@@ -1133,8 +1280,9 @@ def parse_args() -> argparse.Namespace:
     missing = [k for k in ("frames", "out", "classes") if getattr(a, k) is None]
     if missing:
         p.error("missing: " + ", ".join("--" + m for m in missing))
-    if a.gdino is None and a.rfdetr is None:
-        p.error("give --gdino and/or --rfdetr")
+    problem = labeler_problem(a.gdino, a.sam3, a.rfdetr)
+    if problem:
+        p.error(problem)
     return a
 
 
@@ -1176,6 +1324,10 @@ def main() -> int:
             coco_wanted.setdefault(n, c)
     labelers = {}
     t0 = time.time()
+    if a.sam3:
+        # First: its text tower leaves the GPU before the other models load.
+        labelers["sam3"] = Sam3(a.sam3, device, a.sam3_threshold, a.nms_iou, list(phrase_to_class))
+        event("model", name="sam3", seconds=round(time.time() - t0, 1), phrases=len(phrase_to_class))
     if a.gdino:
         labelers["gdino"] = GroundingDino(a.gdino, device, a.gdino_threshold, a.nms_iou, a.token_limit)
         batches = labelers["gdino"].batches(list(phrase_to_class))
@@ -1194,9 +1346,7 @@ def main() -> int:
         t = time.time()
         siglip = Siglip(a.siglip, device)
         event("model", name="siglip", seconds=round(time.time() - t, 1))
-    participants = {}
-    for c in classes:
-        participants[c] = sorted(m for m in labelers if m == "gdino" or (m == "rfdetr" and coco_class(c) is not None))
+    participants = participants_of(labelers, classes)
     animals = tuple(c for c in classes if category(c) == "animal")
     if siglip is not None and len(animals) > 1:
         siglip.prepare(animals, synonyms)
@@ -1216,6 +1366,10 @@ def main() -> int:
                 continue
             w, h = image.size
             per = {}
+            if "sam3" in labelers:
+                t = time.time()
+                per["sam3"] = labelers["sam3"].detect(image, phrase_to_class)
+                ms["sam3"] = round((time.time() - t) * 1000)
             if "gdino" in labelers:
                 t = time.time()
                 per["gdino"] = labelers["gdino"].detect(image, batches, phrase_to_class)

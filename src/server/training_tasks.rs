@@ -1,6 +1,7 @@
 //! The Training page's footage import and auto-label forms (`POST /training/import`,
 //! `POST /training/autolabel`, also posted by the Review page), the import preview
-//! (`GET /v1/training/import/preview`, the line under the path field), the models an auto-label
+//! (`GET /v1/training/import/preview`, the line under the path field), the auto-label preview
+//! (`POST /training/autolabel/preview`, both pages' Preview button), the models an auto-label
 //! run can use (`GET /v1/autolabel/models`) and the rows of their jobs.
 //! Both are planned like the CLI does ([`crate::training::import::plan_import`],
 //! [`crate::training::autolabel::plan_autolabel`]) and queued on the page's training queue
@@ -220,10 +221,12 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 
 /// The auto-label run of a form: the frame filter ([`frame_filter_text`]), `mode` (`labelers`
 /// ignores `with_model`, `model` needs it; absent = `with_model` decides, as the Review page and
-/// older forms post), `gdino`, `vlm` (`off` = none), `rfdetr` / `siglip` (ticked = on; the
-/// Review page's form sends them), `with_model` (any id of `GET /v1/autolabel/models`),
-/// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick), and for
-/// a run with a model `device` (empty = the model's), `model_accept_score` (empty = off),
+/// older forms post), `gdino` (a size, or `sam3` for SAM 3 in its seat), `vlm` (`off` = none),
+/// `rfdetr` / `siglip` (ticked = on; the Review page's form sends them), `with_model` (any id of
+/// `GET /v1/autolabel/models`),
+/// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick) and, when
+/// `gdino` is `sam3`, `sam3_threshold` (empty = the default; ignored otherwise, so a stale value of
+/// a hidden field refuses nothing), and for a run with a model `device` (empty = the model's), `model_accept_score` (empty = off),
 /// `missing_only` (ticked = on); `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
 /// `vlm_batch`, `prefetch` and `vlm_min_on` (ticked = on; then `vlm_min_score` applies) count
 /// only when the form posts `run_options` (the Training page's card); without it (the Review
@@ -243,6 +246,11 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
     let mut r = AutolabelRequest::new(frames);
     r.gdino = match field(f, "gdino").unwrap_or("tiny") {
         "off" => None,
+        // A model run ignores the labelers' fields, and a page's select may still say SAM 3.
+        "sam3" => {
+            r.sam3 = with_model.is_none();
+            None
+        }
         g => Some(
             GdinoSize::parse(g)
                 .ok_or_else(|| anyhow::anyhow!("MM-Grounding-DINO: '{g}' is not a size"))?,
@@ -274,6 +282,11 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
         r.missing_only = field(f, "missing_only").is_some();
     } else {
         r.gpu = field(f, "gpu").map(str::to_string);
+        if r.sam3
+            && let Some(t) = num(f, "sam3_threshold", "SAM 3 threshold")?
+        {
+            r.sam3_threshold = t;
+        }
     }
     r.with_model = with_model;
     if let Some(t) = num(f, "threshold", "threshold")? {
@@ -403,7 +416,12 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
             let autolabel = if chained {
                 let mut plan = || -> anyhow::Result<AutolabelJob> {
                     let req = autolabel_from_form(&chained_autolabel_fields(&f))?;
-                    let mut al = crate::training::autolabel::plan_autolabel(&config, req, &cap)?;
+                    let mut al = crate::training::autolabel::plan_autolabel(
+                        &config,
+                        &state.config_path,
+                        req,
+                        &cap,
+                    )?;
                     attach_seams(&state, &shared, &config, &mut al);
                     crate::training::autolabel::follow_import(&mut al, &job);
                     al.finish = finish.take();
@@ -550,7 +568,8 @@ pub(super) async fn autolabel(
         let result = (|| -> anyhow::Result<(String, String)> {
             let req = autolabel_from_form(&f)?;
             let cap = crate::training::capability_now();
-            let mut job = crate::training::autolabel::plan_autolabel(&config, req, &cap)?;
+            let mut job =
+                crate::training::autolabel::plan_autolabel(&config, &state.config_path, req, &cap)?;
             attach_seams(&state, &shared, &config, &mut job);
             let title = crate::training::task::Task::title(&job);
             let missing = job.request.missing_only;
@@ -582,6 +601,40 @@ pub(super) async fn autolabel(
                 .into_response(),
             (Ok((m, _)), false) => render(&view(&state, Some(m), None)),
             (Err(e), false) => render(&view(&state, None, Some(format!("Not queued: {e:#}")))),
+        }
+    })
+    .await
+}
+
+/// `POST /training/autolabel/preview` with the fields of the auto-label form
+/// ([`autolabel_from_form`]): 200 `{success: true, ...}`
+/// ([`crate::training::autolabel::preview::AutolabelPreview`]) or 400 `{success: false, message}`.
+/// It reads every sidecar of the folder, so the pages call it on a click, never while typing.
+/// Nothing is queued or written, and no gate of a real run applies: an answer here does not mean
+/// this machine can run it.
+pub(super) async fn autolabel_preview(
+    State(shared): State<Shared>,
+    body: axum::body::Bytes,
+) -> Response {
+    blocking(move || {
+        let state = shared.current();
+        let f = super::dataset::parse_form(&body);
+        let config = state.config_read().clone();
+        let preview = autolabel_from_form(&f)
+            .and_then(|r| crate::training::autolabel::preview_autolabel(&config, r))
+            .and_then(|p| serde_json::to_value(&p).map_err(anyhow::Error::from));
+        match preview {
+            Ok(mut v) => {
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("success".into(), true.into());
+                }
+                Json(v).into_response()
+            }
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"success": false, "message": format!("{e:#}")})),
+            )
+                .into_response(),
         }
     })
     .await
@@ -1308,6 +1361,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
+    fn the_form_takes_sam3_in_the_gdino_seat() {
+        let r = autolabel_from_form(&form(&[("gdino", "sam3"), ("rfdetr", "on")])).unwrap();
+        assert!(r.sam3);
+        assert_eq!(r.gdino, None);
+        // Enough on its own.
+        let r = autolabel_from_form(&form(&[("gdino", "sam3"), ("vlm", "off")])).unwrap();
+        assert!(r.sam3 && !r.rfdetr);
+        let r = autolabel_from_form(&form(&[("gdino", "tiny"), ("rfdetr", "on")])).unwrap();
+        assert!(!r.sam3);
+        assert_eq!(r.gdino, Some(GdinoSize::Tiny));
+        // A model run ignores the labelers' select, as it does their other fields.
+        let r = autolabel_from_form(&form(&[
+            ("mode", "model"),
+            ("with_model", "x"),
+            ("gdino", "sam3"),
+        ]))
+        .unwrap();
+        assert!(!r.sam3);
+        assert_eq!(r.with_model.as_deref(), Some("x"));
+        // Through an import's `al.` fields.
+        let f = form(&[
+            ("autolabel", "on"),
+            ("al.mode", "labelers"),
+            ("al.gdino", "sam3"),
+            ("al.rfdetr", "on"),
+        ]);
+        let r = autolabel_from_form(&chained_autolabel_fields(&f)).unwrap();
+        assert!(r.sam3 && r.rfdetr);
+        assert_eq!(r.gdino, None);
+    }
+
+    #[test]
+    fn the_form_takes_the_sam3_threshold_only_for_sam3() {
+        use crate::training::autolabel::SAM3_THRESHOLD;
+        let near = |a: f32, b: f32| (a - b).abs() < f32::EPSILON;
+        let sam3 = |t: &str| {
+            autolabel_from_form(&form(&[
+                ("gdino", "sam3"),
+                ("rfdetr", "on"),
+                ("sam3_threshold", t),
+            ]))
+        };
+        assert!(near(sam3("0.45").unwrap().sam3_threshold, 0.45));
+        assert!(
+            near(sam3("").unwrap().sam3_threshold, SAM3_THRESHOLD),
+            "empty"
+        );
+        let r = autolabel_from_form(&form(&[("gdino", "sam3"), ("rfdetr", "on")])).unwrap();
+        assert!(near(r.sam3_threshold, SAM3_THRESHOLD), "not posted");
+        // Out of range: `validate` refuses it; not a number: the field is named.
+        for bad in ["0", "1.5", "-1", "NaN"] {
+            let e = sam3(bad).unwrap_err().to_string();
+            assert!(e.contains("sam3 threshold"), "{bad}: {e}");
+        }
+        let e = sam3("high").unwrap_err().to_string();
+        assert!(e.contains("SAM 3 threshold"), "{e}");
+        // Any other labeler, and a model run, ignore it, so a stale field refuses nothing.
+        let other = [
+            vec![("gdino", "tiny"), ("rfdetr", "on")],
+            vec![("mode", "model"), ("with_model", "x"), ("gdino", "sam3")],
+        ];
+        for mut fields in other {
+            fields.push(("sam3_threshold", "9"));
+            let r = autolabel_from_form(&form(&fields)).unwrap();
+            assert!(near(r.sam3_threshold, SAM3_THRESHOLD), "{fields:?}");
+        }
+        // Through an import's `al.` fields, a bad value too: the import is planned on it.
+        let chained = |t: &str| {
+            let f = form(&[
+                ("autolabel", "on"),
+                ("al.mode", "labelers"),
+                ("al.gdino", "sam3"),
+                ("al.rfdetr", "on"),
+                ("al.sam3_threshold", t),
+            ]);
+            autolabel_from_form(&chained_autolabel_fields(&f))
+        };
+        assert!(near(chained("0.45").unwrap().sam3_threshold, 0.45));
+        assert!(chained("1.5").is_err());
+    }
+
+    #[test]
     fn chained_fields_and_follow_ups_parse() {
         let f = form(&[
             ("al.mode", "model"),
@@ -1435,6 +1570,7 @@ mod tests {
             error: None,
             finished: None,
             after: after.map(str::to_string),
+            uses: Vec::new(),
         };
         let tasks = vec![
             rec("imp", TaskKind::Import, RunState::Running, None),

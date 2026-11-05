@@ -382,16 +382,33 @@ pub fn model_files(res: &Resource, dir: &Path) -> Vec<PathBuf> {
 /// Largest response [`remote_size`] counts byte by byte when the server sends no size.
 const COUNT_BODY_MAX: u64 = 64 * 1024 * 1024;
 
+/// What a pinned URL said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remote {
+    /// The size it reports.
+    Size(u64),
+    /// A gated part refused the anonymous request, as it should: the repo and revision exist.
+    /// CI holds no token, so the size is not checked.
+    Gated,
+}
+
 /// Total size a server reports for `url`: `Content-Range: bytes 0-0/<total>` of a one-byte
 /// range request, else `Content-Length` when the range is ignored, else (streamed responses such
-/// as GitHub source archives) the length of the body, up to [`COUNT_BODY_MAX`].
-async fn remote_size(client: &reqwest::Client, url: &str) -> Result<u64> {
-    let mut resp = client
+/// as GitHub source archives) the length of the body, up to [`COUNT_BODY_MAX`]. For a `gated`
+/// part, and only there, 401 with `X-Error-Code: GatedRepo` is [`Remote::Gated`].
+async fn remote_size(client: &reqwest::Client, url: &str, gated: bool) -> Result<Remote> {
+    let resp = client
         .get(url)
         .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    if gated
+        && resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        && super::hf_token::has_gated_header(resp.headers())
+    {
+        return Ok(Remote::Gated);
+    }
+    let mut resp = resp.error_for_status()?;
     let total = resp
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
@@ -399,7 +416,7 @@ async fn remote_size(client: &reqwest::Client, url: &str) -> Result<u64> {
         .and_then(|v| v.rsplit('/').next())
         .and_then(|v| v.trim().parse::<u64>().ok());
     if let Some(n) = total.or(resp.content_length()) {
-        return Ok(n);
+        return Ok(Remote::Size(n));
     }
     let mut n = 0u64;
     while let Some(chunk) = resp.chunk().await? {
@@ -408,7 +425,7 @@ async fn remote_size(client: &reqwest::Client, url: &str) -> Result<u64> {
             bail!("no size in the response (and the body is over {COUNT_BODY_MAX} bytes)");
         }
     }
-    Ok(n)
+    Ok(Remote::Size(n))
 }
 
 /// Every pinned resource `--check-urls` checks: [`catalog::all`] plus the training pins that are
@@ -430,8 +447,11 @@ const CHECK_CONCURRENCY: usize = 16;
 /// [`CHECK_CONCURRENCY`] requests in flight); an error lists the failures.
 pub fn check_urls() -> Result<()> {
     use futures_util::StreamExt;
-    let mut parts: Vec<(&'static str, u64)> = url_check_resources()
-        .flat_map(|r| r.parts.iter().map(|p| (p.url, p.size)))
+    let mut parts: Vec<(&'static str, u64, bool)> = url_check_resources()
+        .flat_map(|r| {
+            let gated = catalog::gated(r.id).is_some();
+            r.parts.iter().map(move |p| (p.url, p.size, gated))
+        })
         .collect();
     parts.sort();
     parts.dedup();
@@ -446,16 +466,16 @@ pub fn check_urls() -> Result<()> {
     let mut failures = Vec::new();
     rt.block_on(async {
         let client = &client;
-        let mut results = futures_util::stream::iter(
-            parts
-                .iter()
-                .map(|&(url, size)| async move { (url, size, remote_size(client, url).await) }),
-        )
-        .buffered(CHECK_CONCURRENCY);
+        let mut results =
+            futures_util::stream::iter(parts.iter().map(|&(url, size, gated)| async move {
+                (url, size, remote_size(client, url, gated).await)
+            }))
+            .buffered(CHECK_CONCURRENCY);
         while let Some((url, size, got)) = results.next().await {
             match got {
-                Ok(n) if n == size => println!("ok    {size:>11}  {url}"),
-                Ok(n) => {
+                Ok(Remote::Size(n)) if n == size => println!("ok    {size:>11}  {url}"),
+                Ok(Remote::Gated) => println!("ok    {size:>11}  {url} (gated: size not checked)"),
+                Ok(Remote::Size(n)) => {
                     println!("FAIL  {size:>11}  {url} (server says {n} bytes)");
                     failures.push(format!("{url}: size {n}, pinned {size}"));
                 }
@@ -471,4 +491,69 @@ pub fn check_urls() -> Result<()> {
         bail!("catalog URLs failed: {}", failures.join("; "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One canned answer per connection.
+    fn answering(head: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut b = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    if s.read(&mut b).map_or(true, |n| n == 0) {
+                        break;
+                    }
+                    buf.push(b[0]);
+                }
+                let _ = write!(s, "HTTP/1.1 {head}\r\nConnection: close\r\n\r\n");
+            }
+        });
+        url
+    }
+
+    fn ask(url: &str, gated: bool) -> Result<Remote> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(remote_size(&reqwest::Client::new(), url, gated))
+    }
+
+    /// The weekly check holds no token: for a gated part the expected refusal is fine, and only
+    /// that one; every other part stays strict.
+    #[test]
+    fn a_gated_refusal_counts_for_gated_parts_only() {
+        let refused = answering("401 Unauthorized\r\nX-Error-Code: GatedRepo\r\nContent-Length: 0");
+        assert_eq!(ask(&refused, true).unwrap(), Remote::Gated);
+        assert!(ask(&refused, false).is_err());
+
+        // A plain 401 (no such repo, say) and a 403 are failures for a gated part too.
+        let plain = answering("401 Unauthorized\r\nContent-Length: 0");
+        assert!(ask(&plain, true).is_err());
+        let forbidden = answering("403 Forbidden\r\nX-Error-Code: GatedRepo\r\nContent-Length: 0");
+        assert!(ask(&forbidden, true).is_err());
+        let other =
+            answering("401 Unauthorized\r\nX-Error-Code: RepoNotFound\r\nContent-Length: 0");
+        assert!(ask(&other, true).is_err());
+
+        // A gated part that opens up is sized like any other.
+        let open =
+            answering("206 Partial Content\r\nContent-Range: bytes 0-0/1234\r\nContent-Length: 0");
+        assert_eq!(ask(&open, true).unwrap(), Remote::Size(1234));
+    }
+
+    #[test]
+    fn the_check_covers_the_gated_pins() {
+        for g in catalog::GATED {
+            assert!(url_check_resources().any(|r| r.id == g.id), "{}", g.id);
+        }
+    }
 }

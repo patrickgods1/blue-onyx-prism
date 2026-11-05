@@ -62,7 +62,15 @@ pub enum AutoFilter {
     /// count; [`AutoFilter::matches`] has none, so there every label counts. A frame without a
     /// label file is not listed: it is pre-filled, and a save rejects its pending duplicates.
     Overlaps,
+    /// A pending box with [`AGREED_LABELERS`] or more `labelers` ([`agreed_boxes`]): likely real and
+    /// still unsettled, so a decided box never counts. With a class list ([`Filters::wanted`]) boxes
+    /// of unwanted classes do not count either; [`AutoFilter::matches`] has none, so there every
+    /// label counts.
+    Both,
 }
+
+/// How many labelers make a box agreed ([`AutoFilter::Both`]).
+const AGREED_LABELERS: usize = 2;
 
 impl AutoFilter {
     pub fn parse(s: &str) -> Option<Self> {
@@ -73,6 +81,7 @@ impl AutoFilter {
             "none" => Some(AutoFilter::Never),
             "repeats" => Some(AutoFilter::Repeats),
             "overlaps" => Some(AutoFilter::Overlaps),
+            "both" => Some(AutoFilter::Both),
             _ => None,
         }
     }
@@ -88,6 +97,7 @@ impl AutoFilter {
             AutoFilter::Never => !ran && !evidence,
             AutoFilter::Repeats => labels.is_some_and(super::repeats::repeats_only),
             AutoFilter::Overlaps => labels.is_some_and(|l| super::stacks::needs_look(l, None)),
+            AutoFilter::Both => labels.is_some_and(|l| agreed_boxes(l, None) > 0),
         }
     }
 }
@@ -97,6 +107,16 @@ fn has_auto_review(l: &LabelFile) -> bool {
     l.boxes
         .iter()
         .any(|b| b.state == BoxState::Pending && b.auto.triage == Some(Triage::Review))
+}
+
+/// The pending boxes of `l` with [`AGREED_LABELERS`] or more `labelers`, those of unwanted classes
+/// left out when `wanted` is given.
+fn agreed_boxes(l: &LabelFile, wanted: Option<&Wanted<'_>>) -> usize {
+    l.boxes
+        .iter()
+        .filter(|b| b.state == BoxState::Pending && b.auto.labelers.len() >= AGREED_LABELERS)
+        .filter(|b| wanted.is_none_or(|w| w.class_of(&b.label).is_some()))
+        .count()
 }
 
 /// Queue filters (`GET /v1/review/next?...`).
@@ -111,8 +131,8 @@ pub struct Filters {
     pub source: QueueSource,
     /// Only frames in this auto-label state.
     pub auto: Option<AutoFilter>,
-    /// `collect.classes` and `collect.hidden_classes`, for [`AutoFilter::Overlaps`] (not from the
-    /// query: the caller's config). None = every label is wanted.
+    /// `collect.classes` and `collect.hidden_classes`, for [`AutoFilter::Overlaps`] and
+    /// [`AutoFilter::Both`] (not from the query: the caller's config). None = every label is wanted.
     pub wanted: Option<(Vec<String>, Vec<String>)>,
 }
 
@@ -120,7 +140,7 @@ impl Filters {
     /// From query parameters (`bucket`, `scene`, `camera`, `label` = a comma list, any of
     /// them, empty items ignored, `status` = `unreviewed|reviewed|
     /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none|repeats|
-    /// overlaps`); empty values mean "any". Errors name the field.
+    /// overlaps|both`); empty values mean "any". Errors name the field.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let bucket = match get("bucket") {
@@ -169,7 +189,9 @@ impl Filters {
         let auto = match get("auto") {
             None => None,
             Some(a) => Some(AutoFilter::parse(a).ok_or_else(|| {
-                format!("auto: '{a}' is not review, accept, nothing, none, repeats or overlaps")
+                format!(
+                    "auto: '{a}' is not review, accept, nothing, none, repeats, overlaps or both"
+                )
             })?),
         };
         Ok(Self {
@@ -199,6 +221,9 @@ impl Filters {
                 let wanted = self.wanted();
                 labels.is_some_and(|l| super::stacks::needs_look(l, wanted.as_ref()))
             }
+            Some(AutoFilter::Both) => {
+                labels.is_some_and(|l| agreed_boxes(l, self.wanted().as_ref()) > 0)
+            }
             Some(a) => a.matches(labels),
         }
     }
@@ -209,6 +234,17 @@ impl Filters {
         match (self.auto, labels) {
             (Some(AutoFilter::Overlaps), Some(l)) => {
                 super::overlaps::frame_strength(l, self.wanted().as_ref())
+            }
+            _ => 0,
+        }
+    }
+
+    /// The sort count of a frame with `labels`: its agreed boxes under `auto=both`, else 0 (no
+    /// effect on the order).
+    fn agreed_boxes(&self, labels: Option<&LabelFile>) -> u32 {
+        match (self.auto, labels) {
+            (Some(AutoFilter::Both), Some(l)) => {
+                u32::try_from(agreed_boxes(l, self.wanted().as_ref())).unwrap_or(u32::MAX)
             }
             _ => 0,
         }
@@ -269,6 +305,10 @@ pub struct Uncertainty {
     /// ([`super::overlaps::frame_strength`], 0 = none). These frames come first, strongest first.
     #[serde(skip_serializing_if = "is_zero")]
     pub overlap_strength: u32,
+    /// `auto=both` only: the frame's pending boxes [`AGREED_LABELERS`] or more labelers found. These
+    /// frames come first, most agreed boxes first.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub agreed_boxes: u32,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -300,6 +340,7 @@ impl Uncertainty {
             auto_review: 0,
             repeats_only: false,
             overlap_strength: 0,
+            agreed_boxes: 0,
         }
     }
 
@@ -321,9 +362,10 @@ impl Uncertainty {
         self
     }
 
-    /// Sort key, most uncertain first: the strongest overlap suggestion (`auto=overlaps` only),
-    /// repeat-only frames last of all, then a re-label disagreement, then the margin in hundredths
-    /// (no box last), verifier disagreement, more auto boxes to review, more suppressed boxes.
+    /// Sort key, most uncertain first: the strongest overlap suggestion (`auto=overlaps` only), the
+    /// most agreed boxes (`auto=both` only), repeat-only frames last of all, then a re-label
+    /// disagreement, then the margin in hundredths (no box last), verifier disagreement, more auto
+    /// boxes to review, more suppressed boxes.
     #[allow(
         clippy::type_complexity,
         reason = "a lexicographic sort key reads best as one tuple"
@@ -331,6 +373,7 @@ impl Uncertainty {
     fn key(
         &self,
     ) -> (
+        std::cmp::Reverse<u32>,
         std::cmp::Reverse<u32>,
         bool,
         bool,
@@ -349,6 +392,7 @@ impl Uncertainty {
             .map_or(u32::MAX, |m| (m.clamp(0.0, 1.0) * 100.0).round() as u32);
         (
             std::cmp::Reverse(self.overlap_strength),
+            std::cmp::Reverse(self.agreed_boxes),
             self.repeats_only,
             self.relabel.is_none(),
             m,
@@ -520,6 +564,7 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
         }
         let uncertainty = Uncertainty {
             overlap_strength: f.overlap_strength(labels.as_ref()),
+            agreed_boxes: f.agreed_boxes(labels.as_ref()),
             ..Uncertainty::of(&rec).with_labels(labels.as_ref())
         };
         q.items.push(Item {
@@ -620,6 +665,7 @@ mod tests {
             auto_review: 0,
             repeats_only: false,
             overlap_strength: 0,
+            agreed_boxes: 0,
         }
     }
 
@@ -776,6 +822,7 @@ mod tests {
             q(&[("auto", "overlaps")]).unwrap().auto,
             Some(AutoFilter::Overlaps)
         );
+        assert_eq!(q(&[("auto", "both")]).unwrap().auto, Some(AutoFilter::Both));
         assert!(q(&[("auto", "maybe")]).unwrap_err().contains("auto"));
         assert_eq!(q(&[("bucket", "")]).unwrap().bucket, None);
         let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
@@ -1109,6 +1156,97 @@ mod tests {
         assert_eq!(names(&label, &all), [b.as_str()]);
         let only_a = |r: &str| r == a;
         assert_eq!(names(&Filters::default(), &only_a), [a.as_str()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pending auto box found by `labelers`.
+    fn found_by(label: &str, labelers: &[&str]) -> super::super::LabelBox {
+        let mut b = super::super::tests_support::auto_box(label);
+        b.auto.labelers = labelers.iter().map(|k| ((*k).to_string(), 0.5)).collect();
+        b
+    }
+
+    #[test]
+    fn auto_both_needs_two_labelers_on_a_pending_box() {
+        let file = |boxes| LabelFile {
+            boxes,
+            ..LabelFile::default()
+        };
+        let matches = |l: &LabelFile| AutoFilter::Both.matches(Some(l));
+        assert!(!AutoFilter::Both.matches(None), "no label file");
+        assert!(matches(&file(vec![found_by("car", &["sam3", "rfdetr"])])));
+        assert!(matches(&file(vec![
+            found_by("car", &["sam3"]),
+            found_by("dog", &["sam3", "gdino", "custom"]),
+        ])));
+        assert!(!matches(&file(vec![found_by("car", &["sam3"])])), "one");
+        assert!(!matches(&file(vec![found_by("car", &[])])), "none");
+        // A decided box is settled, however many found it.
+        for state in [BoxState::Accepted, BoxState::Added, BoxState::Rejected] {
+            let mut b = found_by("car", &["sam3", "rfdetr"]);
+            b.state = state;
+            assert!(!matches(&file(vec![b])), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn auto_both_leaves_out_unwanted_classes_and_sorts_most_agreed_first() {
+        use super::super::bulk::test_support::put_frame;
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let car = || found_by("car", &["sam3", "rfdetr"]);
+        let dog = || found_by("dog", &["sam3", "rfdetr"]);
+        // Ties fall to the path, so these names alone would sort the fewest first.
+        let one = put_frame(&dir, "aone", None, vec![car(), found_by("car", &["sam3"])]);
+        let pair = put_frame(&dir, "bpair", None, vec![car(), car()]);
+        let three = put_frame(&dir, "cthree", None, vec![car(), car(), car()]);
+        let hidden = put_frame(&dir, "dhidden", None, vec![dog()]);
+        let other = put_frame(
+            &dir,
+            "eother",
+            None,
+            vec![found_by("pottery", &["sam3", "rfdetr"])],
+        );
+        let lone = put_frame(&dir, "flone", None, vec![found_by("car", &["sam3"])]);
+        // Unwanted boxes beside a wanted one: the frame stays, and only the wanted box counts.
+        let mixed = put_frame(&dir, "gmixed", None, vec![car(), dog(), dog(), dog()]);
+        let mut f = Filters {
+            auto: Some(AutoFilter::Both),
+            ..Filters::default()
+        };
+        let frames = |f: &Filters| -> Vec<String> {
+            build(&dir, f).items.into_iter().map(|i| i.frame).collect()
+        };
+        // No class list: every label counts, as `matches` does.
+        assert_eq!(
+            frames(&f),
+            [
+                mixed.clone(),
+                three.clone(),
+                pair.clone(),
+                one.clone(),
+                hidden.clone(),
+                other.clone()
+            ]
+        );
+        f.wanted = Some((
+            ["car", "dog"].map(String::from).to_vec(),
+            vec!["dog".to_string()],
+        ));
+        assert_eq!(frames(&f), [three, pair, one, mixed], "{lone}");
+        let items = build(&dir, &f).items;
+        let counts: Vec<u32> = items.iter().map(|i| i.uncertainty.agreed_boxes).collect();
+        assert_eq!(counts, [3, 2, 1, 1]);
+        // The filter asks for it: another queue is not reordered, and shows no count.
+        let plain = Filters {
+            status: StatusFilter::Any,
+            ..Filters::default()
+        };
+        assert!(
+            build(&dir, &plain)
+                .items
+                .iter()
+                .all(|i| i.uncertainty.agreed_boxes == 0)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

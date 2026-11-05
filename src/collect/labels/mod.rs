@@ -48,6 +48,8 @@ pub const MATCH_IOU: f32 = 0.5;
 pub const DUP_IOU: f32 = 0.95;
 /// Longest [`LabelFile::disagreement`] note, in characters ([`normalize`] refuses a longer one).
 pub const MAX_DISAGREEMENT_LEN: usize = 500;
+/// Most entries of [`AutoInfo::labelers`] ([`normalize`] refuses more).
+pub const MAX_LABELERS: usize = 16;
 
 /// Where a frame is in the review.
 #[derive(
@@ -254,7 +256,8 @@ pub struct VlmCheck {
     pub ok: bool,
 }
 
-/// The auto-labeler's evidence on a box (all optional; empty for model and human boxes).
+/// The auto-labeler's evidence on a box (all optional; empty for model and human boxes, unless a
+/// labelers run found one again: then `labelers` alone, a vote for the overlap check's witnesses).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AutoInfo {
     /// Both labelers (MM-Grounding-DINO and RF-DETR) found the box.
@@ -361,9 +364,9 @@ pub struct LabelFile {
     /// [`classes_version`] of the class list the review used.
     #[serde(default)]
     pub classes_version: String,
-    /// Why the frame went back to review after a re-label with a trained model (its boxes
-    /// disagree with the reviewed labels); the Review queue lists these frames first. Cleared
-    /// when the frame is reviewed or skipped again.
+    /// Why the frame went back to review after a re-label (a trained model's boxes disagree with
+    /// the reviewed labels, or a labeler found an object they lack); the Review queue lists these
+    /// frames first. Cleared when the frame is reviewed or skipped again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disagreement: Option<String>,
     /// The last auto-label run over the frame (round-tripped by the Review page).
@@ -384,6 +387,12 @@ pub struct LabelFile {
     /// clears it when a box is added (the look did not cover that box).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overlaps_checked: bool,
+    /// A rerun's new boxes took [`Self::overlaps_checked`] off this frame
+    /// (`autolabel::triage::apply_missing`). [`bulk::restore_reopened`] gives it back once those
+    /// boxes are all rejected: what is left is what the reviewer checked. A spot accept of a new box
+    /// ends it, and so do a restore and a save ([`normalize`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checked_before_reopen: bool,
     /// Suggestions for overlapping pairs from the overlap check ([`overlaps`], `train overlaps`), for
     /// a reviewer to confirm: they change no box. Round-tripped by the Review page and kept by every
     /// edit; one whose boxes moved or went is stale and ignored ([`overlaps::live`]).
@@ -409,6 +418,7 @@ impl Default for LabelFile {
             bulk_accepted: false,
             repeat_spot: false,
             overlaps_checked: false,
+            checked_before_reopen: false,
             overlap_suggestions: Vec::new(),
         }
     }
@@ -643,7 +653,7 @@ fn label_ok(l: &str) -> bool {
 /// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
 ///   (bounded), `overlaps_checked` and `overlap_suggestions` (bounded, [`overlaps::check`]) kept,
-///   `bulk_accepted` cleared;
+///   `bulk_accepted` and `checked_before_reopen` cleared;
 /// - `version` and `classes_version` set.
 pub fn normalize(
     mut f: LabelFile,
@@ -723,6 +733,7 @@ pub fn normalize(
     f.version = LABELS_VERSION;
     f.classes_version = classes_version(classes);
     f.bulk_accepted = false;
+    f.checked_before_reopen = false;
     overlaps::check(&f.overlap_suggestions)?;
     if let Some(r) = &f.auto_run {
         if [&r.at, &r.labeler]
@@ -800,7 +811,7 @@ fn check_auto(a: &AutoInfo) -> Result<()> {
     if a.why.len() > 16 || a.why.iter().any(|w| w.chars().count() > 200) {
         bail!("too many or too long triage reasons");
     }
-    if a.labelers.len() > 16 || a.species_scores.len() > super::config::MAX_CLASSES {
+    if a.labelers.len() > MAX_LABELERS || a.species_scores.len() > super::config::MAX_CLASSES {
         bail!("too many labeler or species scores");
     }
     for (k, v) in a.labelers.iter().chain(&a.species_scores) {
@@ -1632,6 +1643,31 @@ mod tests {
         assert_eq!((r.added, m.overlaps_checked), (0, true));
         let r = merge_proposals(&mut m, vec![auto("deer", [200.0, 200.0, 260.0, 260.0])]);
         assert_eq!((r.added, m.overlaps_checked), (1, false));
+    }
+
+    #[test]
+    fn checked_before_reopen_round_trips_old_files_load_and_a_save_ends_it() {
+        let old: LabelFile = serde_json::from_str(r#"{"status":"reviewed","boxes":[]}"#).unwrap();
+        assert!(!old.checked_before_reopen);
+        let off = serde_json::to_string(&old).unwrap();
+        assert!(!off.contains("checked_before_reopen"), "{off}");
+
+        // The Review page sends back what it loaded, on any status.
+        let f = LabelFile {
+            disagreement: Some("re-label by sam3: 1 new box".into()),
+            reviewed_at: Some("t".into()),
+            checked_before_reopen: true,
+            ..LabelFile::default()
+        };
+        let body = serde_json::to_string(&f).unwrap();
+        assert!(body.contains(r#""checked_before_reopen":true"#), "{body}");
+        for status in [Status::Reviewed, Status::Unreviewed, Status::Skipped] {
+            let mut sent: LabelFile = serde_json::from_str(&body).unwrap();
+            assert!(sent.checked_before_reopen, "the file keeps it on disk");
+            sent.status = status;
+            let n = normalize(sent, &["car".to_string()], 640, 480, "now").unwrap();
+            assert!(!n.checked_before_reopen, "{status:?}");
+        }
     }
 
     #[test]

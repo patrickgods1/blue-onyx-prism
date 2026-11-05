@@ -10,7 +10,8 @@
 //! `POST /v1/review/reject-unwanted-reviewed` (the accepted boxes of unwanted classes on
 //! reviewed frames, on request), `POST /v1/review/reject-stacked` (the duplicates of stacked
 //! boxes on reviewed and unreviewed frames, `reason: duplicate`; overlapping boxes are left to a
-//! reviewer, `auto=overlaps`), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
+//! reviewer, `auto=overlaps`), `POST /v1/review/restore-reopened` (frames a re-label reopened, back
+//! to reviewed once nothing is pending), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
 //! benchmark set), `POST /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes`
 //! (`collect.classes` and `collect.hidden_classes`; classes that become unwanted have their
 //! pending boxes rejected right away) and `GET /v1/review/class-catalog` (the class picker's
@@ -1067,6 +1068,93 @@ pub(super) async fn reject_stacked(
     .await
 }
 
+/// `POST /v1/review/restore-reopened` with `{bucket?, scene?, camera?, label?, source?, dry_run,
+/// limit?}`: the undo of a re-label that reopened reviewed frames. On the unreviewed frames of those
+/// filters, a frame with a `disagreement` note, a `reviewed_at` and nothing pending goes back to
+/// reviewed and loses the note ([`bulk::bulk_restore_reopened`], re-checked under the write lock),
+/// at most `limit` frames (default 500). Frames with a pending box and frames never reviewed are
+/// not touched. `dry_run` only counts. `eligible` counts the frames, `restored` those changed.
+pub(super) async fn restore_reopened(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: RejectOtherClassBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
+    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        );
+    }
+    let mut q: BTreeMap<String, String> = [
+        ("bucket", b.bucket),
+        ("scene", b.scene),
+        ("camera", b.camera),
+        ("label", b.label),
+        ("source", b.source),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+    .collect();
+    q.insert("status".into(), "unreviewed".into());
+    let filters = match Filters::from_query(&q) {
+        Ok(f) => f,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let dry_run = b.dry_run;
+    blocking(move || {
+        let (dir, _, _) = context(&state);
+        let o = bulk::bulk_restore_reopened(&dir, &filters, limit, dry_run, &|_| true);
+        let eligible = o.eligible;
+        if dry_run {
+            return Json(serde_json::json!({
+                "success": true,
+                "eligible": eligible,
+                "restored": 0,
+                "frames": o.done,
+            }))
+            .into_response();
+        }
+        let mut message = format!(
+            "Restored {} reopened frame(s) to reviewed (their boxes are unchanged; they are back \
+             in exports).",
+            o.done_count
+        );
+        if o.failed_count > 0 {
+            message.push_str(&format!(
+                " {} frame(s) not changed (listed); review them by hand.",
+                o.failed_count
+            ));
+        }
+        if eligible > limit {
+            message.push_str(&format!(
+                " {} more frame(s) beyond the limit of {limit}; run it again.",
+                eligible - limit
+            ));
+        }
+        tracing::info!(
+            restored = o.done_count,
+            failed = o.failed_count,
+            eligible,
+            "review: reopened frames restored"
+        );
+        Json(serde_json::json!({
+            "success": true,
+            "eligible": eligible,
+            "restored": o.done_count,
+            "failed": o.failed,
+            "frames": o.done,
+            "message": message,
+        }))
+        .into_response()
+    })
+    .await
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SuggestOverlapsBody {
@@ -1138,8 +1226,14 @@ pub(super) async fn suggest_overlaps(
                 Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
             };
             let message = (s.pairs == 0).then(|| {
+                let again = if s.answered > 0 {
+                    "; tick Ask again to check the answered ones again"
+                } else {
+                    ""
+                };
                 format!(
-                    "No open overlap without an answer on these frames ({} pairs answered before,                      {} frames skipped or checked by a reviewer).",
+                    "No open overlap without an answer on these frames ({} pairs answered before, \
+                     {} frames skipped or checked by a reviewer){again}.",
                     s.answered, s.passed_over
                 )
             });
@@ -2538,7 +2632,7 @@ mod tests {
             (v["pairs"].as_u64(), v["answered"].as_u64()),
             (Some(0), Some(1))
         );
-        assert!(v["message"].as_str().unwrap().contains("answered"));
+        assert!(v["message"].as_str().unwrap().contains("tick Ask again"));
         let body = r#"{"dry_run":true,"again":true}"#;
         let (_, v) = json(&d.state, post_json("/v1/review/suggest-overlaps", body)).await;
         assert_eq!(
@@ -2562,6 +2656,130 @@ mod tests {
         let bad = r#"{"status":"reviewed"}"#;
         let (st, _) = json(&d.state, post_json("/v1/review/suggest-overlaps", bad)).await;
         assert_ne!(st, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_autolabel_preview_counts_what_the_page_lists_and_queues_nothing() {
+        let d = ds_with(|c| {
+            c.collect.classes = vec!["car".into(), "dog".into()];
+            c.collect.hidden_classes = vec!["dog".into()];
+        });
+        let frame = |stem: &str, label: &str| {
+            put_frame(&d.dir, "drive", "2026-10-21", stem, 0.9);
+            let path = d
+                .dir
+                .join(format!("ir/drive/2026-10-21/{stem}.labels.json"));
+            let at = |bbox: [f32; 4]| labels::LabelBox {
+                label: label.into(),
+                bbox,
+                source: labels::Source::Auto,
+                score: Some(0.5),
+                state: labels::BoxState::Accepted,
+                origin: None,
+                reason: None,
+                model_label: None,
+                orig_bbox: None,
+                difficult: false,
+                reject_reason: None,
+                auto: Default::default(),
+            };
+            let file = LabelFile {
+                status: labels::Status::Reviewed,
+                reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+                boxes: vec![at([1.0, 1.0, 30.0, 20.0]), at([2.0, 1.0, 30.0, 20.0])],
+                ..LabelFile::default()
+            };
+            labels::write(&path, &file).unwrap();
+        };
+        frame("20261021T010203004Z_a", "car");
+        frame("20261021T010204004Z_b", "dog");
+        let post = |body: &str| {
+            Request::post("/training/autolabel/preview")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (_, next) = json(
+            &d.state,
+            get("/v1/review/next?status=reviewed&auto=overlaps&source=all"),
+        )
+        .await;
+        assert_eq!(next["total"], 1, "{next}");
+
+        // The real form's fields; no GPU, download or login is asked for.
+        let (st, v) = json(
+            &d.state,
+            post("mode=labelers&gdino=sam3&rfdetr=on&vlm=2b&status=reviewed&auto=overlaps&limit=1"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["success"], true, "{v}");
+        assert_eq!(v["matched"], next["total"], "{v}");
+        assert_eq!(v["taken"], 1, "{v}");
+        assert_eq!(v["taken_by_status"]["reviewed"], 1, "{v}");
+        assert_eq!(v["over_limit"], 0, "{v}");
+        assert_eq!(v["limit"], 1, "{v}");
+        assert!(v.get("frames").is_none(), "{v}");
+        assert!(
+            v["estimate"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("GTX 1070 Ti"),
+            "{v}"
+        );
+        assert!(
+            v["summary"].as_str().unwrap().contains("This run takes 1"),
+            "{v}"
+        );
+        assert!(
+            v["warnings"][0].as_str().unwrap().contains("may reopen"),
+            "{v}"
+        );
+
+        // The raw filter text of the Review page's form.
+        let (st, v) = json(
+            &d.state,
+            post("frames=status%3Dreviewed%2Csource%3Dall%2Climit%3D5&limit=9&rfdetr=on"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["matched"].as_u64(), v["limit"].as_u64()),
+            (Some(2), Some(5))
+        );
+
+        // A threshold out of range is refused before anything is counted.
+        let (st, v) = json(
+            &d.state,
+            post("mode=labelers&gdino=sam3&rfdetr=on&sam3_threshold=1.5"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("sam3 threshold"),
+            "{v}"
+        );
+
+        // The parser's errors are the real form's.
+        let (st, v) = json(&d.state, post("frames=colour%3Dred")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(v["success"], false, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown frame filter"),
+            "{v}"
+        );
+
+        // Nothing was queued (the queue is shared with other tests).
+        let (_, t) = json(&d.state, get("/v1/training")).await;
+        let queued = t["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["title"].as_str().unwrap().contains("status=reviewed"));
+        assert!(!queued, "{}", t["tasks"]);
     }
 
     #[tokio::test]
@@ -2951,6 +3169,67 @@ mod tests {
             post_json("/v1/review/reject-spot", &body(r#", "nope": 1"#)),
         )
         .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "unknown fields are refused");
+    }
+
+    #[tokio::test]
+    async fn restore_reopened_asks_first_and_leaves_frames_with_pending_boxes_alone() {
+        use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
+        use labels::{BoxState, Triage};
+        let d = ds();
+        let reopen = |stem: &str, boxes: Vec<labels::LabelBox>| {
+            let rel = put_frame(&d.dir, stem, None, boxes);
+            let frame = Frame::resolve(&d.dir, &rel).unwrap();
+            let mut f = labels_of(&d.dir, &rel);
+            f.reviewed_at = Some("2026-10-01T00:00:00Z".into());
+            f.disagreement = Some("re-label by sam3: 1 new box".into());
+            labels::write(&frame.labels, &f).unwrap();
+            rel
+        };
+        let mut no = auto_box("car", 0.7, Triage::Review);
+        no.state = BoxState::Rejected;
+        let done = reopen("a", vec![no]);
+        let waiting = reopen("b", vec![auto_box("car", 0.7, Triage::Review)]);
+        let never = put_frame(&d.dir, "c", None, Vec::new());
+
+        let uri = "/v1/review/restore-reopened";
+        let (s, v) = json(&d.state, post_json(uri, r#"{"dry_run": true}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["eligible"].as_u64(), v["restored"].as_u64()),
+            (Some(1), Some(0))
+        );
+        assert_eq!(v["frames"], serde_json::json!([done]));
+        assert_eq!(labels_of(&d.dir, &done).status, labels::Status::Unreviewed);
+
+        let (s, v) = json(&d.state, post_json(uri, "{}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["eligible"].as_u64(), v["restored"].as_u64()),
+            (Some(1), Some(1))
+        );
+        assert!(v["message"].as_str().unwrap().contains("Restored 1"), "{v}");
+        let f = labels_of(&d.dir, &done);
+        assert_eq!(f.status, labels::Status::Reviewed);
+        assert_eq!(f.disagreement, None);
+        assert_eq!(f.boxes[0].state, BoxState::Rejected);
+        assert_eq!(
+            labels_of(&d.dir, &waiting).status,
+            labels::Status::Unreviewed
+        );
+        assert!(labels_of(&d.dir, &waiting).disagreement.is_some());
+        assert_eq!(labels_of(&d.dir, &never).status, labels::Status::Unreviewed);
+
+        // The filters narrow it, bad input is refused.
+        let (s, v) = json(&d.state, post_json(uri, r#"{"camera": "other"}"#)).await;
+        assert_eq!(
+            (s, v["eligible"].as_u64()),
+            (StatusCode::OK, Some(0)),
+            "{v}"
+        );
+        let (s, _) = json(&d.state, post_json(uri, r#"{"limit": 0}"#)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = json(&d.state, post_json(uri, r#"{"nope": 1}"#)).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "unknown fields are refused");
     }
 

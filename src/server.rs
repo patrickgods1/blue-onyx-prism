@@ -34,6 +34,7 @@ mod pages;
 mod pick;
 mod resources;
 mod review;
+mod sam3_access;
 mod status;
 #[cfg(test)]
 mod test_util;
@@ -224,6 +225,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             post(review::reject_stacked).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
         (
+            "/v1/review/restore-reopened",
+            post(review::restore_reopened).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
+        (
             "/v1/review/suggest-overlaps",
             post(review::suggest_overlaps).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
@@ -289,9 +294,16 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ),
         ("/training/autolabel", post(training_tasks::autolabel)),
         (
+            "/training/autolabel/preview",
+            post(training_tasks::autolabel_preview),
+        ),
+        (
             "/v1/autolabel/models",
             get(training_tasks::autolabel_models),
         ),
+        ("/v1/autolabel/sam3", get(sam3_access::status)),
+        ("/v1/autolabel/sam3/download", post(sam3_access::download)),
+        ("/v1/autolabel/sam3/remove", post(sam3_access::remove)),
         ("/logs", get(logs_page)),
         ("/logs.json", get(logs_json)),
         ("/benchmark", get(benchmark::page)),
@@ -1072,6 +1084,7 @@ mod tests {
             "/v1/review/reject-other-class",
             "/v1/review/reject-unwanted-reviewed",
             "/v1/review/reject-stacked",
+            "/v1/review/restore-reopened",
             "/v1/review/suggest-overlaps",
             "/v1/review/export",
             "/v1/review/import",
@@ -1101,7 +1114,11 @@ mod tests {
             "/training/import",
             "/v1/training/import/preview",
             "/training/autolabel",
+            "/training/autolabel/preview",
             "/v1/autolabel/models",
+            "/v1/autolabel/sam3",
+            "/v1/autolabel/sam3/download",
+            "/v1/autolabel/sam3/remove",
             "/logs",
             "/logs.json",
             "/benchmark",

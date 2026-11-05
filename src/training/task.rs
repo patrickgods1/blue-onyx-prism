@@ -89,6 +89,11 @@ pub trait Task: Send {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> anyhow::Result<TaskOutcome>;
+    /// Ids of the resources it reads while queued or running, for the ones removable by hand
+    /// (kept in its record: [`TaskRecord::uses`]).
+    fn uses(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// The task this one follows (queued before it): it runs only when that one allows it
     /// ([`Self::skip_reason`]).
     fn after(&self) -> Option<&str> {
@@ -144,6 +149,9 @@ pub struct TaskRecord {
     /// The task it follows ([`Task::after`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
+    /// [`Task::uses`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
 }
 
 impl TaskRecord {
@@ -165,6 +173,7 @@ impl TaskRecord {
             error: None,
             finished: None,
             after: task.after().map(str::to_string),
+            uses: task.uses(),
         }
     }
 
@@ -282,6 +291,7 @@ mod tests {
             error: None,
             finished: None,
             after: None,
+            uses: Vec::new(),
         };
         assert_eq!(r.describe(), "extracting frames (2/5): 12 frames");
         r.state = RunState::Paused;
@@ -294,6 +304,16 @@ mod tests {
         r.state = RunState::Failed;
         r.error = Some("boom".into());
         assert_eq!(r.describe(), "failed while extracting frames: boom");
+    }
+
+    #[test]
+    fn a_tasks_json_from_before_uses_still_parses() {
+        let old = r#"[{"id":"a","kind":"autolabel","title":"t","created":"c","state":"done",
+            "step":1,"steps":1,"percent":100}]"#;
+        let r: Vec<TaskRecord> = serde_json::from_str(old).unwrap();
+        assert!(r[0].uses.is_empty());
+        let json = serde_json::to_string(&r[0]).unwrap();
+        assert!(!json.contains("uses"), "{json}");
     }
 
     #[test]
@@ -318,6 +338,7 @@ mod tests {
             error: None,
             finished: None,
             after: None,
+            uses: Vec::new(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains(r#""state":"paused""#), "{json}");

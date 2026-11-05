@@ -9,13 +9,22 @@ use crate::config::ModelConfig;
 use crate::resources::catalog::Platform;
 use crate::resources::export::fake::{Fake, arg_after};
 use crate::resources::export::{Cmd, CommandRunner, Fetcher};
+use crate::training::autolabel::FrameFilter;
 use crate::training::autolabel::models::{ConfigWriter, Install, Target};
 use crate::training::autolabel::triage::Det;
-use crate::training::autolabel::{FrameFilter, plan_autolabel};
 use crate::training::capability::{self, Capability};
 use crate::training::service::RunState;
 use std::path::Path;
 use std::sync::Mutex;
+
+/// [`crate::training::autolabel::plan_autolabel`]; nothing here reads the config file's path.
+fn plan_autolabel(
+    config: &Config,
+    request: AutolabelRequest,
+    cap: &Capability,
+) -> Result<AutolabelJob> {
+    crate::training::autolabel::plan_autolabel(config, Path::new("config.json"), request, cap)
+}
 
 struct Tmp(PathBuf);
 
@@ -89,6 +98,14 @@ struct LabelFake {
     /// Cancel after writing this many proposal lines, the last one cut off mid-line (as the
     /// real runner does: the flag set, the script killed, `Cancelled`).
     stop_after: Option<usize>,
+    /// Die after this many proposal lines and half of the next one, with a plain error.
+    fail_after: Option<usize>,
+    /// Write only this many lines, then exit cleanly without the `done` event.
+    no_summary_after: Option<usize>,
+    /// The boxes of every frame, in place of the default car, raccoon and unicorn.
+    boxes: Option<serde_json::Value>,
+    /// Label files a reviewer saves while the script runs (path, new content).
+    saved_during_run: Vec<(PathBuf, LabelFile)>,
 }
 
 impl CommandRunner for LabelFake {
@@ -102,10 +119,22 @@ impl CommandRunner for LabelFake {
             return Ok(());
         }
         self.cmds.lock().unwrap().push(cmd.clone());
+        for (path, f) in &self.saved_during_run {
+            labels::write(path, f).unwrap();
+        }
         let list = arg_after(cmd, "--frames").unwrap();
         let out = arg_after(cmd, "--out").unwrap();
         let mut text = String::new();
         for (i, l) in std::fs::read_to_string(list).unwrap().lines().enumerate() {
+            if self.fail_after == Some(i) {
+                text.push_str("{\"frame\": \"torn");
+                std::fs::write(&out, &text).unwrap();
+                return Err(anyhow!("the GPU fell off the bus"));
+            }
+            if self.no_summary_after == Some(i) {
+                std::fs::write(&out, &text).unwrap();
+                return Ok(());
+            }
             if let Some(k) = self.stop_after
                 && i + 1 == k
             {
@@ -123,15 +152,22 @@ impl CommandRunner for LabelFake {
                 text.push('\n');
                 continue;
             }
-            let line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48, "boxes": [
+            let seat = if cmd.args.iter().any(|a| a == "--sam3") {
+                "sam3"
+            } else {
+                "gdino"
+            };
+            let boxes = self.boxes.clone().unwrap_or_else(|| serde_json::json!([
                 {"label": "car", "bbox": [1, 1, 30, 20], "score": 0.82, "agree": true,
-                 "sources": {"gdino": 0.7, "rfdetr": 0.94}},
+                 "sources": {(seat): 0.7, "rfdetr": 0.94}},
                 {"label": "raccoon", "bbox": [35, 20, 60, 46], "score": 0.31, "agree": false,
-                 "sources": {"gdino": 0.31},
+                 "sources": {(seat): 0.31},
                  "vlm": {"model": "qwen3-vl-2b", "answer": "rock", "expected": "animal", "ok": false},
                  "species_scores": {"raccoon": 0.6, "cat": 0.4}},
                 {"label": "unicorn", "bbox": [1, 1, 5, 5], "score": 0.9, "agree": true, "sources": {}}
-            ], "ms": {"gdino": 10}});
+            ]));
+            let line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48,
+                                          "boxes": boxes, "ms": {"gdino": 10}});
             text.push_str(&line.to_string());
             text.push('\n');
             on_line(&format!(
@@ -1389,6 +1425,123 @@ fn script_flags_follow_the_run_options() {
     assert!(has(&a, "--prefetch"), "{a:?}");
 }
 
+/// A SAM 3 run, past the plan's login gate (it looks at this machine's token).
+fn sam3_job(cfg: &Config) -> AutolabelJob {
+    let mut job =
+        plan_autolabel(cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    job.request.gdino = None;
+    job.request.sam3 = true;
+    job
+}
+
+#[test]
+fn sam3_runs_in_the_gdino_seat_with_its_own_marker_and_never_accepts() {
+    let t = tmp("sam3");
+    let rels = frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let fake = LabelFake::default();
+
+    let job = sam3_job(&cfg);
+    assert_eq!(
+        job.labeler(),
+        "sam3 + rfdetr-large + qwen3-vl-2b + siglip2-base"
+    );
+    assert_eq!(Task::uses(&job), [catalog::SAM3_ID]);
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(out.result["frames"], 2);
+    // The car both found at 0.82 would be `accept` with MM-Grounding-DINO.
+    assert_eq!(out.result["accept"], 0, "{}", out.result);
+    assert_eq!(out.result["review"], 4, "{}", out.result);
+    let dir = t.0.join("dataset");
+    let f = labels_of(&dir, &rels[0]);
+    let car = f.boxes.iter().find(|b| b.label == "car").unwrap();
+    assert_eq!(car.auto.triage, Some(labels::Triage::Review));
+    assert!(car.auto.why.iter().any(|w| w.contains("SAM 3")), "{car:?}");
+    assert_eq!(car.auto.labelers.keys().next().unwrap(), "rfdetr");
+    assert!(car.auto.labelers.contains_key("sam3"), "{car:?}");
+    assert_eq!(f.auto_run.unwrap().labeler, job.labeler());
+
+    // The script's arguments: --sam3 with its folder, no --gdino.
+    let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
+    let weights = job.paths.weights.join("sam3");
+    assert_eq!(arg_after(&cmd, "--sam3").unwrap(), weights);
+    assert_eq!(
+        arg_after(&cmd, "--sam3-threshold").unwrap(),
+        Path::new("0.3")
+    );
+    assert!(arg_after(&cmd, "--gdino").is_none(), "{}", cmd.display());
+    assert!(
+        fake.inner
+            .fetched
+            .lock()
+            .unwrap()
+            .contains(&catalog::SAM3_ID.to_string())
+    );
+
+    // The same run again is covered; MM-Grounding-DINO's is another run.
+    let e = run_job(&sam3_job(&cfg), &fake).unwrap_err().to_string();
+    assert!(e.contains("all 2 frame(s)"), "{e}");
+    let gdino =
+        plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    assert!(Task::uses(&gdino).is_empty());
+    let out = run_job(&gdino, &fake).unwrap();
+    assert_eq!(out.result["frames"], 2);
+    assert!(!out.summary.contains("SAM 3 threshold"), "{}", out.summary);
+    // So is SAM 3 after it: a gdino marker does not skip these frames.
+    assert_eq!(run_job(&sam3_job(&cfg), &fake).unwrap().result["frames"], 2);
+}
+
+#[test]
+fn sam3_can_run_without_rfdetr() {
+    let t = tmp("sam3-alone");
+    frames(&t.0, 1, false);
+    let cfg = config(&t.0);
+    let fake = LabelFake::default();
+    let mut job = sam3_job(&cfg);
+    job.request.rfdetr = false;
+    job.request.sam3_threshold = 0.45;
+    let out = run_job(&job, &fake).unwrap();
+    let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        arg_after(&cmd, "--sam3-threshold").unwrap(),
+        Path::new("0.45")
+    );
+    assert!(arg_after(&cmd, "--rfdetr").is_none(), "{}", cmd.display());
+    assert!(
+        out.summary.contains("SAM 3 threshold 0.45"),
+        "{}",
+        out.summary
+    );
+}
+
+#[test]
+fn a_rerun_at_a_new_sam3_threshold_is_skipped_by_the_marker_without_again() {
+    let t = tmp("sam3-again");
+    frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let fake = LabelFake::default();
+    run_job(&sam3_job(&cfg), &fake).unwrap();
+    let mut rerun = sam3_job(&cfg);
+    rerun.request.sam3_threshold = 0.45;
+    let p = rerun.preview().unwrap();
+    assert_eq!((p.taken, p.skipped_done), (0, 2), "{p:?}");
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("not the SAM 3 threshold")),
+        "{p:?}"
+    );
+    assert!(run_job(&rerun, &fake).is_err(), "nothing left to label");
+    rerun.request.frames = FrameFilter::parse("again=1", "unreviewed").unwrap();
+    assert_eq!(rerun.preview().unwrap().taken, 2);
+    assert_eq!(run_job(&rerun, &fake).unwrap().result["frames"], 2);
+    let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        arg_after(&cmd, "--sam3-threshold").unwrap(),
+        Path::new("0.45")
+    );
+}
+
 #[test]
 fn a_cancelled_labelers_run_keeps_the_finished_frames_and_a_rerun_resumes() {
     let t = tmp("keep");
@@ -1872,9 +2025,22 @@ mod missing {
             (&rels[5], car()),
         ]);
         let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        // The preview walks the frames as the run does, the training record included.
+        let p = job.preview().unwrap();
+        assert_eq!(p.matched, 3, "{p:?}");
+        assert_eq!((p.taken, p.skipped_trained, p.skipped_done), (2, 1, 0));
+        assert!(p.frames.contains(&rels[0]) && p.frames.contains(&rels[1]));
+        assert!(!p.frames.contains(&rels[2]), "trained on");
+        let mut short = job.clone();
+        short.request.frames.limit = 1;
+        let cut = short.preview().unwrap();
+        assert_eq!((cut.taken, cut.over_limit), (1, 1), "{cut:?}");
+        assert_eq!(cut.skipped_trained, 1, "past the limit too: {cut:?}");
         let out = run_job(&job, &LabelFake::default()).unwrap();
         let rep = &out.result;
         assert_eq!(rep["missing_only"], true, "{rep}");
+        assert_eq!(rep["skipped_trained"], p.skipped_trained, "{rep}");
+        assert_eq!(rep["frames"], p.taken, "{rep}");
         assert_eq!(rep["frames"], 2, "reviewed, not trained on: {rep}");
         assert_eq!(rep["skipped_trained"], 1, "{rep}");
         assert_eq!(rep["proposals"], 2, "{rep}");
@@ -1919,6 +2085,101 @@ mod missing {
         let saved = labels::normalize(f, &classes, 64, 48, "2026-11-04T00:00:00.000Z").unwrap();
         assert_eq!(saved.training().count(), 2);
         assert_eq!(saved.disagreement, None);
+    }
+
+    #[test]
+    fn a_missing_only_run_writes_no_vote_on_a_box_it_finds_again() {
+        let t = tmp("missing-vote");
+        let rels = frames(&t.0, 1, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        let mut f = reviewed(&[("car", CAR)]);
+        f.boxes[0].auto.labelers.insert("gdino".into(), 0.41);
+        put(&dir, &rels[0], &f);
+        let before = bytes(&dir, &rels[0]);
+        let detector = fake(&[(&rels[0], vec![det("car", 0.9, CAR)])]);
+        let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["votes"], 0, "{}", out.result);
+        assert_eq!(out.result["dropped"], 1, "{}", out.result);
+        assert!(!out.summary.contains("vote"), "{}", out.summary);
+        assert_eq!(bytes(&dir, &rels[0]), before, "the file is not written");
+    }
+
+    #[test]
+    fn a_model_run_votes_on_boxes_it_finds_again_and_queues_no_frame_for_it() {
+        let t = tmp("model-vote");
+        let rels = frames(&t.0, 3, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        // A pending box of a labelers run, a reviewed box with evidence, an evidence-free car.
+        let mut open = reviewed(&[("car", CAR)]);
+        open.status = Status::Unreviewed;
+        open.boxes[0].state = BoxState::Pending;
+        open.boxes[0].source = Source::Auto;
+        open.boxes[0].origin = None;
+        open.boxes[0].auto.labelers.insert("gdino".into(), 0.41);
+        open.boxes[0].auto.triage = Some(Triage::Review);
+        put(&dir, &rels[0], &open);
+        let mut done = reviewed(&[("car", CAR)]);
+        done.boxes[0].auto.labelers.insert("gdino".into(), 0.41);
+        put(&dir, &rels[1], &done);
+        let plain = LabelFile {
+            status: Status::Unreviewed,
+            ..reviewed(&[("car", CAR)])
+        };
+        put(&dir, &rels[2], &plain);
+        let queue_file = dir.join(layout::REVIEW_QUEUE_FILE);
+        std::fs::remove_file(&queue_file).unwrap();
+
+        let car = || vec![det("car", 0.9, CAR)];
+        let mut req =
+            AutolabelRequest::new(FrameFilter::parse("status=any", "unreviewed").unwrap());
+        req.with_model = Some("IPcam-general".into());
+        let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+        job.detector = Some(fake(&[
+            (&rels[0], car()),
+            (&rels[1], car()),
+            (&rels[2], car()),
+        ]));
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        let rep = &out.result;
+        assert_eq!(rep["votes"], 2, "{rep}");
+        // The third frame's box takes the evidence, as before: annotated, and queued for that.
+        assert_eq!(rep["annotated"], 1, "{rep}");
+        assert_eq!(
+            (&rep["added"], &rep["dropped"]),
+            (&0.into(), &3.into()),
+            "{rep}"
+        );
+        assert_eq!(
+            (&rep["disagreements"], &rep["reopened"]),
+            (&0.into(), &0.into())
+        );
+        assert!(
+            out.summary
+                .contains("2 existing boxes gained a labeler's vote"),
+            "{}",
+            out.summary
+        );
+
+        // Only `labelers` and the marker changed on the voted frames.
+        for (rel, before) in [(&rels[0], open), (&rels[1], done)] {
+            let mut f = labels_of(&dir, rel);
+            let voted = &f.boxes[0].auto.labelers;
+            assert_eq!(voted["gdino"], 0.41, "{voted:?}");
+            assert_eq!(voted["IPcam-general"], 0.9, "{voted:?}");
+            assert!(f.auto_run.is_some(), "every frame gets the marker");
+            f.boxes[0].auto.labelers = before.boxes[0].auto.labelers.clone();
+            f.auto_run = None;
+            assert_eq!(f, before);
+        }
+        // A vote queues nothing; the annotated frame is queued as before.
+        let queued: Vec<String> = layout::read_review(&queue_file)
+            .into_iter()
+            .map(|l| l.frame)
+            .collect();
+        assert_eq!(queued, [rels[2].clone()]);
     }
 
     #[test]
@@ -2129,4 +2390,854 @@ mod missing {
         );
         assert!(out.summary.contains("run it again"), "{}", out.summary);
     }
+}
+
+/// A reviewed file with one drawn car where the fake labelers find theirs, plus `extra` boxes.
+fn reviewed_car(extra: Vec<labels::LabelBox>) -> LabelFile {
+    let mut boxes = vec![labels::LabelBox {
+        label: "car".into(),
+        bbox: [1.0, 1.0, 30.0, 20.0],
+        source: Source::Human,
+        score: None,
+        state: BoxState::Added,
+        origin: None,
+        reason: None,
+        model_label: None,
+        orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
+        auto: Default::default(),
+    }];
+    boxes.extend(extra);
+    LabelFile {
+        status: Status::Reviewed,
+        reviewed_at: Some("2026-10-22T12:00:00.000Z".into()),
+        boxes,
+        ..LabelFile::default()
+    }
+}
+
+/// A decided model box.
+fn decided(label: &str, bbox: [f32; 4], state: BoxState) -> labels::LabelBox {
+    labels::LabelBox {
+        label: label.into(),
+        bbox,
+        source: Source::Model,
+        score: Some(0.4),
+        state,
+        origin: Some(labels::Origin::Prediction),
+        reason: None,
+        model_label: None,
+        orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
+        auto: Default::default(),
+    }
+}
+
+fn review_queue(dir: &Path) -> Vec<String> {
+    crate::collect::layout::read_review(&dir.join(crate::collect::layout::REVIEW_QUEUE_FILE))
+        .into_iter()
+        .map(|l| l.frame)
+        .collect()
+}
+
+/// A SAM 3 run over `filter`, no VLM or SigLIP.
+fn sam3_over(cfg: &Config, filter: &str) -> AutolabelJob {
+    let mut job = sam3_job(cfg);
+    job.request.frames = FrameFilter::parse(filter, "unreviewed").unwrap();
+    job.request.vlm = None;
+    job.request.siglip = false;
+    job
+}
+
+/// The boxes every frame gets in the reviewed-frame runs: a confident second sight of the drawn
+/// car, a confident person (both with a VLM yes, which the fake's script can give whatever the
+/// request says), a weak dog.
+fn sam3_boxes() -> serde_json::Value {
+    let yes = serde_json::json!({"answer": "person", "expected": "person", "ok": true});
+    serde_json::json!([
+        {"label": "car", "bbox": [1, 1, 30, 20], "score": 0.35, "agree": false,
+         "sources": {"sam3": 0.7}, "vlm": yes},
+        {"label": "person", "bbox": [40, 5, 60, 40], "score": 0.45, "agree": false,
+         "sources": {"sam3": 0.9}, "vlm": yes},
+        {"label": "dog", "bbox": [2, 25, 30, 46], "score": 0.1, "agree": false,
+         "sources": {"sam3": 0.2}}
+    ])
+}
+
+#[test]
+fn a_lone_box_with_no_vlm_answer_is_counted_and_reopens_nothing() {
+    let t = tmp("unchecked");
+    let rels = frames(&t.0, 1, false);
+    let dir = t.0.join("dataset");
+    labels::write(
+        &Frame::resolve(&dir, &rels[0]).unwrap().labels,
+        &reviewed_car(vec![]),
+    )
+    .unwrap();
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "status=any,limit=20");
+    let fake = LabelFake {
+        boxes: Some(serde_json::json!([
+            {"label": "person", "bbox": [40, 5, 60, 40], "score": 0.45, "agree": false,
+             "sources": {"sam3": 0.9}},
+            {"label": "dog", "bbox": [2, 25, 30, 46], "score": 0.45, "agree": false,
+             "sources": {"sam3": 0.9}, "vlm_skipped": "score"}
+        ])),
+        ..LabelFake::default()
+    };
+    let out = run_job(&job, &fake).unwrap();
+    let rep = &out.result;
+    assert_eq!(rep["filtered_unchecked"], 2, "{rep}");
+    assert_eq!((&rep["added"], &rep["reopened"]), (&0.into(), &0.into()));
+    assert!(
+        out.summary
+            .contains("2 found by one labeler with no VLM yes"),
+        "{}",
+        out.summary
+    );
+    let f = labels_of(&dir, &rels[0]);
+    assert_eq!((f.status, f.boxes.len()), (Status::Reviewed, 1));
+    assert!(f.auto_run.is_some());
+}
+
+#[test]
+fn a_confirmed_empty_frame_nobody_reviewed_takes_only_the_marker() {
+    let t = tmp("empty-unreviewed");
+    let rels = frames(&t.0, 1, false);
+    let dir = t.0.join("dataset");
+    let path = Frame::resolve(&dir, &rels[0]).unwrap().labels;
+    let empty = LabelFile {
+        empty_confirmed: true,
+        ..LabelFile::default()
+    };
+    labels::write(&path, &empty).unwrap();
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "limit=20");
+    let fake = LabelFake {
+        boxes: Some(sam3_boxes()),
+        ..LabelFake::default()
+    };
+    let rep = run_job(&job, &fake).unwrap().result;
+    assert_eq!(rep["added"], 0, "{rep}");
+    assert_eq!(rep["filtered_closed"], 3, "{rep}");
+    let f = labels_of(&dir, &rels[0]);
+    assert!(f.boxes.is_empty(), "{f:?}");
+    assert!(f.auto_run.is_some(), "{f:?}");
+}
+
+#[test]
+fn a_rerun_over_reviewed_frames_only_reopens_for_confident_new_objects() {
+    let t = tmp("reviewed");
+    let rels = frames(&t.0, 5, false);
+    let dir = t.0.join("dataset");
+    let write = |rel: &str, f: &LabelFile| {
+        labels::write(&Frame::resolve(&dir, rel).unwrap().labels, f).unwrap();
+    };
+    // 0: the person is new. 1: a person is labelled, nothing is new. 2: the person sits on an
+    // accepted cat. 3: skipped. 4: confirmed empty.
+    let person = [40.0, 5.0, 60.0, 40.0];
+    write(
+        &rels[0],
+        &reviewed_car(vec![decided(
+            "dog",
+            [2.0, 25.0, 30.0, 46.0],
+            BoxState::Rejected,
+        )]),
+    );
+    write(
+        &rels[1],
+        &reviewed_car(vec![decided("person", person, BoxState::Accepted)]),
+    );
+    write(
+        &rels[2],
+        &reviewed_car(vec![decided("cat", person, BoxState::Accepted)]),
+    );
+    let mut skipped = reviewed_car(vec![]);
+    skipped.status = Status::Skipped;
+    write(&rels[3], &skipped);
+    write(
+        &rels[4],
+        &LabelFile {
+            empty_confirmed: true,
+            boxes: Vec::new(),
+            ..reviewed_car(vec![])
+        },
+    );
+    let before: Vec<LabelFile> = rels.iter().map(|r| labels_of(&dir, r)).collect();
+    // Only the frames of this run in the queue file: nothing was reviewed through it.
+    let queued_before = review_queue(&dir);
+
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "status=any,limit=20");
+    let fake = LabelFake {
+        boxes: Some(sam3_boxes()),
+        ..LabelFake::default()
+    };
+    let out = run_job(&job, &fake).unwrap();
+    let rep = &out.result;
+    assert_eq!(rep["frames"], 5, "{rep}");
+    assert_eq!(rep["added"], 1, "the person of frame 0: {rep}");
+    assert_eq!(rep["reopened"], 1, "{rep}");
+    assert_eq!(
+        rep["filtered_low_score"], 3,
+        "the dog, frames 0 to 2: {rep}"
+    );
+    assert_eq!(
+        rep["filtered_other_object"], 1,
+        "the person on the cat: {rep}"
+    );
+    assert_eq!(
+        rep["filtered_closed"], 6,
+        "three boxes on frames 3 and 4: {rep}"
+    );
+    assert_eq!(
+        rep["votes"], 6,
+        "cars 0 to 3, the dog on frame 0's rejected dog, the person of frame 1: {rep}"
+    );
+    assert_eq!(rep["annotated"], 0, "a vote is no annotation: {rep}");
+    assert!(
+        out.summary.contains("leave exports until you save"),
+        "{}",
+        out.summary
+    );
+    assert!(out.summary.contains("Ask again"), "{}", out.summary);
+    assert!(out.summary.contains("Restore reopened"), "{}", out.summary);
+    assert!(out.summary.contains("3 not confident"), "{}", out.summary);
+
+    let after: Vec<LabelFile> = rels.iter().map(|r| labels_of(&dir, r)).collect();
+    // Decided boxes: every field but the `labelers` a vote adds, byte for byte.
+    let bare = |b: &labels::LabelBox| {
+        let mut b = b.clone();
+        b.auto.labelers.clear();
+        serde_json::to_string(&b).unwrap()
+    };
+    for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+        for (x, y) in a.boxes.iter().zip(&b.boxes) {
+            assert_eq!(bare(x), bare(y), "frame {i}");
+        }
+        assert_eq!(
+            a.auto_run.as_ref().unwrap().labeler,
+            rep["labeler"].as_str().unwrap(),
+            "frame {i}"
+        );
+    }
+    // Frame 0: reopened, with a note and one new pending box; the vote on its drawn car.
+    let f0 = &after[0];
+    assert_eq!(f0.status, Status::Unreviewed);
+    assert_eq!(f0.boxes.len(), 3);
+    assert_eq!(f0.boxes[0].auto.labelers["sam3"], 0.7);
+    assert_eq!(f0.boxes[2].state, BoxState::Pending);
+    assert_eq!(
+        f0.disagreement.as_deref(),
+        Some("re-label by sam3: 1 new box"),
+        "the short name"
+    );
+    // The others keep their status and their boxes.
+    for i in 1..5 {
+        assert_eq!(after[i].status, before[i].status, "frame {i}");
+        assert_eq!(after[i].boxes.len(), before[i].boxes.len(), "frame {i}");
+        assert_eq!(after[i].disagreement, None, "frame {i}");
+    }
+    assert!(!labels::auto_accept_eligible(&after[3]));
+    // Only the reopened frame is queued, once more; a vote queues nothing.
+    let queued = review_queue(&dir);
+    assert_eq!(
+        queued.len(),
+        queued_before.len(),
+        "every frame was queued by the import: {queued:?}"
+    );
+    assert_eq!(rep["sample"], serde_json::json!([rels[0]]));
+    // A rerun of the same labelers finds its markers.
+    let job2 = sam3_over(&cfg, "status=any,limit=20");
+    let e = run_job(&job2, &fake).unwrap_err().to_string();
+    assert!(e.contains("all 5 frame(s)"), "{e}");
+}
+
+#[test]
+fn a_vote_only_write_adds_nothing_to_the_review_queue() {
+    let t = tmp("vote-queue");
+    let rels = frames(&t.0, 1, false);
+    let dir = t.0.join("dataset");
+    let fr = Frame::resolve(&dir, &rels[0]).unwrap();
+    labels::write(&fr.labels, &reviewed_car(vec![])).unwrap();
+    // The frame left the queue file: a reviewed frame from an older queue, or `source=all`.
+    std::fs::write(dir.join(crate::collect::layout::REVIEW_QUEUE_FILE), "").unwrap();
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "status=reviewed,source=all");
+    let fake = LabelFake {
+        boxes: Some(serde_json::json!([sam3_boxes()[0]])),
+        ..LabelFake::default()
+    };
+    let rep = run_job(&job, &fake).unwrap().result;
+    assert_eq!(
+        (rep["votes"].as_u64(), rep["reopened"].as_u64()),
+        (Some(1), Some(0))
+    );
+    assert!(review_queue(&dir).is_empty(), "{:?}", review_queue(&dir));
+    assert_eq!(rep["sample"], serde_json::json!([]));
+    let f = labels_of(&dir, &rels[0]);
+    assert_eq!(f.status, Status::Reviewed);
+    assert_eq!(f.boxes[0].auto.labelers["sam3"], 0.7);
+    assert_eq!(f.boxes[0].state, BoxState::Added);
+}
+
+#[test]
+fn the_frames_status_is_read_when_the_file_is_written() {
+    let t = tmp("write-time");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "limit=20");
+    // Both unreviewed when selected. A reviewer saves frame 0 and skips frame 1 while the labelers
+    // run, with the car drawn and nothing else on it.
+    let mut skipped = reviewed_car(vec![]);
+    skipped.status = Status::Skipped;
+    let fake = LabelFake {
+        saved_during_run: vec![
+            (
+                Frame::resolve(&dir, &rels[0]).unwrap().labels,
+                reviewed_car(vec![]),
+            ),
+            (Frame::resolve(&dir, &rels[1]).unwrap().labels, skipped),
+        ],
+        boxes: Some(serde_json::json!([
+            sam3_boxes()[2],
+            {"label": "dog", "bbox": [35, 25, 60, 46], "score": 0.15, "agree": false,
+             "sources": {"sam3": 0.3}}
+        ])),
+        ..LabelFake::default()
+    };
+    let rep = run_job(&job, &fake).unwrap().result;
+    assert_eq!(rep["added"], 0, "{rep}");
+    assert_eq!(rep["reopened"], 0, "{rep}");
+    assert_eq!(rep["filtered_low_score"], 2, "{rep}");
+    assert_eq!(rep["filtered_closed"], 2, "{rep}");
+    let f0 = labels_of(&dir, &rels[0]);
+    assert_eq!((f0.status, f0.boxes.len()), (Status::Reviewed, 1));
+    assert!(f0.auto_run.is_some());
+    let f1 = labels_of(&dir, &rels[1]);
+    assert_eq!((f1.status, f1.boxes.len()), (Status::Skipped, 1));
+    assert!(f1.auto_run.is_some());
+}
+
+#[test]
+fn a_failed_run_keeps_its_finished_frames_and_still_fails() {
+    let t = tmp("salvage");
+    let rels = frames(&t.0, 5, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    for keep in [true, false] {
+        let mut request = AutolabelRequest::new(FrameFilter::default());
+        request.keep_on_cancel = keep;
+        let job = plan_autolabel(&cfg, request, &host()).unwrap();
+        let fake = LabelFake {
+            fail_after: Some(if keep { 2 } else { 1 }),
+            ..LabelFake::default()
+        };
+        let e = run_job(&job, &fake).unwrap_err();
+        let text = format!("{e:#}");
+        let n = if keep { 2 } else { 1 };
+        assert!(
+            text.contains(&format!("failed after {n} of ")),
+            "keep {keep}: {text}"
+        );
+        assert!(text.contains("labels only the rest"), "{text}");
+        assert!(text.contains("the GPU fell off the bus"), "{text}");
+        assert!(!crate::training::pyenv::is_cancel(&e), "a failure: {text}");
+        assert!(!job.work.exists(), "the work folder is removed");
+    }
+    // The finished frames are written with their markers, the others left alone.
+    let labelled: Vec<&String> = rels
+        .iter()
+        .filter(|r| labels_of_opt(&dir, r).is_some_and(|f| f.auto_run.is_some()))
+        .collect();
+    assert_eq!(labelled.len(), 3, "2 frames, then 1 more: {labelled:?}");
+    for r in &labelled {
+        assert_eq!(labels_of(&dir, r).boxes.len(), 2, "{r}");
+    }
+    // A rerun resumes after them.
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let rep = run_job(&job, &LabelFake::default()).unwrap().result;
+    assert_eq!(
+        (rep["frames"].as_u64(), rep["skipped_done"].as_u64()),
+        (Some(2), Some(3)),
+        "{rep}"
+    );
+}
+
+/// [`labels_of`] of a frame that may have no label file yet.
+fn labels_of_opt(dir: &Path, rel: &str) -> Option<LabelFile> {
+    Frame::resolve(dir, rel).unwrap().labels().unwrap()
+}
+
+#[test]
+fn a_failed_run_says_so_when_it_reopened_frames() {
+    let t = tmp("salvage-reopen");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    for r in &rels {
+        labels::write(
+            &Frame::resolve(&dir, r).unwrap().labels,
+            &reviewed_car(vec![]),
+        )
+        .unwrap();
+    }
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "status=reviewed");
+    let fake = LabelFake {
+        fail_after: Some(1),
+        boxes: Some(sam3_boxes()),
+        ..LabelFake::default()
+    };
+    let text = format!("{:#}", run_job(&job, &fake).unwrap_err());
+    assert!(text.contains("failed after 1 of 3"), "{text}");
+    assert!(text.contains("1 frames reopened"), "{text}");
+    assert!(text.contains("leave exports"), "{text}");
+    let reopened: Vec<LabelFile> = rels
+        .iter()
+        .map(|r| labels_of(&dir, r))
+        .filter(|f| f.status == Status::Unreviewed)
+        .collect();
+    assert_eq!(reopened.len(), 1);
+    assert!(reopened[0].disagreement.is_some());
+    assert_eq!(review_queue(&dir).len(), 3, "still queued once");
+}
+
+#[test]
+fn a_run_that_fails_with_nothing_finished_stays_a_plain_failure() {
+    let t = tmp("salvage-none");
+    frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let fake = LabelFake {
+        fail_after: Some(0),
+        ..LabelFake::default()
+    };
+    let text = format!("{:#}", run_job(&job, &fake).unwrap_err());
+    assert!(text.starts_with("the auto-labeler failed: "), "{text}");
+    assert!(text.contains("the GPU fell off the bus"), "{text}");
+    assert!(!text.contains("saved"), "{text}");
+}
+
+#[test]
+fn a_script_that_exits_without_its_summary_is_a_failure_that_keeps_its_frames() {
+    let t = tmp("salvage-summary");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let fake = LabelFake {
+        no_summary_after: Some(2),
+        ..LabelFake::default()
+    };
+    let text = format!("{:#}", run_job(&job, &fake).unwrap_err());
+    assert!(text.contains("failed after 2 of 3"), "{text}");
+    assert!(text.contains("without its summary"), "{text}");
+    let n = rels
+        .iter()
+        .filter(|r| labels_of_opt(&dir, r).is_some_and(|f| f.auto_run.is_some()))
+        .count();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn a_cancel_without_keep_on_cancel_still_discards_a_failing_run() {
+    /// Sets the cancel flag, then dies with a plain error.
+    struct DiesCancelled(LabelFake);
+    impl CommandRunner for DiesCancelled {
+        fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+            let r = self.0.run(cmd, on_line, cancel);
+            if r.is_err() {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            r
+        }
+    }
+    impl Fetcher for DiesCancelled {
+        fn fetch(
+            &self,
+            res: &'static Resource,
+            dir: &Path,
+            progress: &mut dyn FnMut(u64, u64),
+            cancel: &AtomicBool,
+        ) -> Result<()> {
+            self.0.fetch(res, dir, progress, cancel)
+        }
+    }
+    let t = tmp("salvage-cancel");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let mut request = AutolabelRequest::new(FrameFilter::default());
+    request.keep_on_cancel = false;
+    let job = plan_autolabel(&cfg, request, &host()).unwrap();
+    let fake = DiesCancelled(LabelFake {
+        fail_after: Some(2),
+        ..LabelFake::default()
+    });
+    let cancel = AtomicBool::new(false);
+    let ctx = TaskContext {
+        runner: &fake,
+        fetcher: &fake,
+    };
+    assert!(job.run(ctx, &mut |_| {}, &cancel).is_err());
+    for r in &rels {
+        assert!(labels_of_opt(&dir, r).is_none(), "{r}: asked to discard");
+    }
+}
+
+/// The frames holding an `auto_run` marker, sorted.
+fn marked(dir: &Path, rels: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = rels
+        .iter()
+        .filter(|r| labels_of_opt(dir, r).is_some_and(|f| f.auto_run.is_some()))
+        .cloned()
+        .collect();
+    v.sort();
+    v
+}
+
+fn request(filter: &str) -> AutolabelRequest {
+    AutolabelRequest::new(FrameFilter::parse(filter, "unreviewed").unwrap())
+}
+
+#[test]
+fn the_preview_takes_what_the_run_then_takes() {
+    let t = tmp("preview-run");
+    let rels = frames(&t.0, 6, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    // Two frames carry the labelers' marker.
+    let first = plan_autolabel(&cfg, request("limit=2"), &host()).unwrap();
+    let p = first.preview().unwrap();
+    assert_eq!((p.matched, p.taken, p.over_limit), (6, 2, 4), "{p:?}");
+    assert_eq!(p.skipped_done, 0, "{p:?}");
+    run_job(&first, &LabelFake::default()).unwrap();
+    let before = marked(&dir, &rels);
+    assert_eq!(before.len(), 2);
+    assert!(p.frames.iter().all(|f| before.contains(f)), "{p:?}");
+
+    // Limit below what is left: same frames, same skipped count as the run's own stage 1.
+    let job = plan_autolabel(&cfg, request("limit=3"), &host()).unwrap();
+    let p = job.preview().unwrap();
+    assert_eq!((p.matched, p.taken, p.over_limit), (6, 3, 1), "{p:?}");
+    assert_eq!(p.skipped_done, 2, "{p:?}");
+    assert_eq!(p.matched_by_status.unreviewed, 6, "{p:?}");
+    assert_eq!(p.taken_by_status.unreviewed, 3, "{p:?}");
+    let labeler = job.run_labeler();
+    let sel = job.select(Some(&labeler), None).unwrap();
+    let selected: Vec<String> = sel.frames.iter().map(|f| f.rel.clone()).collect();
+    assert_eq!(selected, p.frames);
+    assert_eq!(sel.skipped_done, p.skipped_done);
+    let rep = run_job(&job, &LabelFake::default()).unwrap().result;
+    assert_eq!(rep["frames"], p.taken, "{rep}");
+    assert_eq!(rep["skipped_done"], p.skipped_done, "{rep}");
+    let after = marked(&dir, &rels);
+    let new: BTreeSet<&String> = after.iter().filter(|f| !before.contains(f)).collect();
+    assert_eq!(new, p.frames.iter().collect(), "the frames it previewed");
+
+    // The count of the left-out frames does not stop at the limit.
+    let job = plan_autolabel(&cfg, request("limit=1"), &host()).unwrap();
+    let p = job.preview().unwrap();
+    assert_eq!((p.skipped_done, p.taken, p.over_limit), (5, 1, 0), "{p:?}");
+
+    // again=1 takes them back, and a rerun would start from the same frames.
+    let job = plan_autolabel(&cfg, request("again=1,limit=4"), &host()).unwrap();
+    let p = job.preview().unwrap();
+    assert_eq!((p.skipped_done, p.taken, p.over_limit), (0, 4, 2), "{p:?}");
+    assert!(p.warnings[0].contains("same frames first"), "{p:?}");
+    let rep = run_job(&job, &LabelFake::default()).unwrap().result;
+    assert_eq!(rep["frames"], 4, "{rep}");
+    assert_eq!(rep["skipped_done"], 0, "{rep}");
+
+    // A class the labelers did not look for: the marker does not cover it.
+    let mut wider = cfg.clone();
+    wider.collect.classes.push("wombat".into());
+    let job = plan_autolabel(&wider, request("limit=20"), &host()).unwrap();
+    let p = job.preview().unwrap();
+    assert_eq!((p.skipped_done, p.taken), (0, 6), "{p:?}");
+}
+
+#[test]
+fn the_preview_needs_no_gpu_and_splits_by_status() {
+    let t = tmp("preview-gates");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    let mut cfg = config(&t.0);
+    cfg.allow_large_downloads = false;
+    labels::write(
+        &Frame::resolve(&dir, &rels[0]).unwrap().labels,
+        &reviewed_car(vec![]),
+    )
+    .unwrap();
+    let skipped = LabelFile {
+        status: Status::Skipped,
+        ..LabelFile::default()
+    };
+    labels::write(&Frame::resolve(&dir, &rels[1]).unwrap().labels, &skipped).unwrap();
+    assert!(
+        plan_autolabel(&cfg, request("status=any"), &no_gpu()).is_err(),
+        "a run needs a GPU"
+    );
+    let p = crate::training::autolabel::preview_autolabel(&cfg, request("status=any")).unwrap();
+    assert_eq!(
+        (p.matched_by_status.reviewed, p.matched_by_status.skipped),
+        (1, 1),
+        "{p:?}"
+    );
+    assert_eq!(p.matched_by_status.unreviewed, 1, "{p:?}");
+    assert_eq!(p.taken_by_status, p.matched_by_status, "{p:?}");
+    assert!(
+        p.warnings.iter().any(|w| w.contains("leave exports")),
+        "a reviewed frame may reopen: {p:?}"
+    );
+    // A run of SAM 3 needs a login; a count does not.
+    let mut sam3 = request("status=unreviewed");
+    sam3.sam3 = true;
+    sam3.gdino = None;
+    let p = crate::training::autolabel::preview_autolabel(&cfg, sam3).unwrap();
+    let e = p.estimate.unwrap();
+    let phrases = p.phrases as f64;
+    assert!(
+        phrases >= cfg.collect.classes.len() as f64,
+        "synonyms count"
+    );
+    assert!(
+        (e.total_seconds - (2.0 + 0.2 * phrases)).abs() < 1e-9,
+        "{e:?}"
+    );
+    assert!(p.warnings.is_empty(), "no reviewed frame: {:?}", p.warnings);
+    // A bad filter and an unknown class stay errors.
+    let mut bad = request("");
+    bad.classes = Some(vec!["unicorn".into()]);
+    assert!(crate::training::autolabel::preview_autolabel(&cfg, bad).is_err());
+}
+
+#[test]
+fn phrases_are_counted_as_the_script_folds_them() {
+    let t = tmp("preview-phrases");
+    let mut cfg = config(&t.0);
+    cfg.collect.classes = vec!["car".into(), "truck".into()];
+    cfg.training.synonyms = [
+        (
+            "car".to_string(),
+            vec!["Pickup  Truck".to_string(), "car".to_string()],
+        ),
+        ("truck".to_string(), vec!["pickup truck".to_string()]),
+    ]
+    .into();
+    let p = crate::training::autolabel::preview_autolabel(&cfg, request("")).unwrap();
+    assert_eq!(p.phrases, 2, "{p:?}");
+}
+
+/// Two boxes of `label` on one object, accepted: an overlap for a reviewer to look at, unless the
+/// class is unwanted.
+fn overlapping(label: &str) -> LabelFile {
+    let at = |bbox: [f32; 4]| labels::LabelBox {
+        label: label.into(),
+        bbox,
+        source: Source::Model,
+        score: Some(0.9),
+        state: BoxState::Accepted,
+        origin: Some(labels::Origin::Prediction),
+        reason: None,
+        model_label: None,
+        orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
+        auto: Default::default(),
+    };
+    LabelFile {
+        status: Status::Reviewed,
+        reviewed_at: Some("2026-10-22T12:00:00.000Z".into()),
+        boxes: vec![at([1.0, 1.0, 30.0, 20.0]), at([2.0, 1.0, 30.0, 20.0])],
+        ..LabelFile::default()
+    }
+}
+
+#[test]
+fn a_job_and_the_page_agree_on_an_overlap_of_an_unwanted_class() {
+    let t = tmp("preview-wanted");
+    let rels = frames(&t.0, 4, false);
+    let dir = t.0.join("dataset");
+    let mut cfg = config(&t.0);
+    cfg.collect.classes = vec!["car".into(), "person".into(), "dog".into()];
+    cfg.collect.hidden_classes = vec!["dog".into()];
+    let put = |i: usize, f: &LabelFile| {
+        labels::write(&Frame::resolve(&dir, &rels[i]).unwrap().labels, f).unwrap();
+    };
+    put(0, &overlapping("car"));
+    put(1, &overlapping("dog"));
+    put(2, &overlapping("pottery"));
+    put(3, &reviewed_car(vec![]));
+
+    let query: BTreeMap<String, String> = [
+        ("status", "reviewed"),
+        ("auto", "overlaps"),
+        ("source", "all"),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .into();
+    let mut page = queue::Filters::from_query(&query).unwrap();
+    // Without the class rules the two unwanted frames count: the gap this closes.
+    assert_eq!(queue::build(&dir, &page).items.len(), 3);
+    page.wanted = Some((
+        cfg.collect.classes.clone(),
+        cfg.collect.hidden_classes.clone(),
+    ));
+    let on_page: Vec<String> = queue::build(&dir, &page)
+        .items
+        .into_iter()
+        .map(|i| i.frame)
+        .collect();
+    assert_eq!(on_page, [rels[0].clone()]);
+
+    let job = plan_autolabel(&cfg, request("status=reviewed,auto=overlaps"), &host()).unwrap();
+    let selected: Vec<String> = job
+        .select(None, None)
+        .unwrap()
+        .frames
+        .into_iter()
+        .map(|f| f.rel)
+        .collect();
+    assert_eq!(selected, on_page);
+    assert_eq!(job.preview().unwrap().frames, on_page);
+}
+
+#[test]
+fn the_page_the_preview_and_the_run_agree_on_auto_both() {
+    let t = tmp("preview-both");
+    let rels = frames(&t.0, 6, false);
+    let dir = t.0.join("dataset");
+    let mut cfg = config(&t.0);
+    cfg.collect.classes = vec!["car".into(), "person".into(), "dog".into()];
+    cfg.collect.hidden_classes = vec!["dog".into()];
+    let found = |label: &str, labelers: &[&str], state: BoxState| labels::LabelBox {
+        bbox: [1.0, 1.0, 30.0, 20.0],
+        state,
+        auto: labels::AutoInfo {
+            labelers: labelers.iter().map(|k| ((*k).to_string(), 0.5)).collect(),
+            ..Default::default()
+        },
+        ..labels::tests_support::auto_box(label)
+    };
+    let pair = ["sam3", "rfdetr"];
+    let put = |i: usize, status: Status, boxes: Vec<labels::LabelBox>| {
+        let f = LabelFile {
+            status,
+            boxes,
+            ..LabelFile::default()
+        };
+        labels::write(&Frame::resolve(&dir, &rels[i]).unwrap().labels, &f).unwrap();
+    };
+    let open = Status::Unreviewed;
+    put(0, open, vec![found("car", &["sam3"], BoxState::Pending)]);
+    put(1, open, vec![found("car", &pair, BoxState::Pending)]);
+    let two = found("car", &pair, BoxState::Pending);
+    put(2, open, vec![two.clone(), two]);
+    put(3, open, vec![found("dog", &pair, BoxState::Pending)]);
+    put(
+        4,
+        Status::Reviewed,
+        vec![found("car", &pair, BoxState::Accepted)],
+    );
+    // rels[5]: no label file.
+    let want = [rels[2].clone(), rels[1].clone()];
+
+    let query: BTreeMap<String, String> = [("status", "any"), ("auto", "both"), ("source", "all")]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .into();
+    let mut page = queue::Filters::from_query(&query).unwrap();
+    page.wanted = Some((
+        cfg.collect.classes.clone(),
+        cfg.collect.hidden_classes.clone(),
+    ));
+    let on_page: Vec<String> = queue::build(&dir, &page)
+        .items
+        .into_iter()
+        .map(|i| i.frame)
+        .collect();
+    assert_eq!(on_page, want);
+
+    let job = plan_autolabel(&cfg, request("status=any,auto=both"), &host()).unwrap();
+    let p = job.preview().unwrap();
+    assert_eq!(p.frames, want);
+    assert_eq!((p.matched, p.taken), (2, 2), "{p:?}");
+    // `limit` keeps the most agreed frame.
+    let first = plan_autolabel(&cfg, request("status=any,auto=both,limit=1"), &host()).unwrap();
+    assert_eq!(first.preview().unwrap().frames, want[..1]);
+
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    assert_eq!(out.result["frames"], p.taken, "{}", out.result);
+    let mut sorted = want.to_vec();
+    sorted.sort();
+    assert_eq!(
+        marked(&dir, &rels),
+        sorted,
+        "the run took what it previewed"
+    );
+}
+
+/// Every file under `root` with its time and bytes.
+fn tree(root: &Path) -> BTreeMap<PathBuf, (std::time::SystemTime, Vec<u8>)> {
+    let mut out = BTreeMap::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let path = e.path();
+            if path.is_dir() {
+                todo.push(path);
+            } else {
+                let at = e.metadata().unwrap().modified().unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                out.insert(path, (at, bytes));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn dry_run_writes_nothing() {
+    use clap::Parser;
+    #[derive(clap::Parser)]
+    struct T {
+        #[command(subcommand)]
+        c: crate::training::cli::TrainCommand,
+    }
+    let t = tmp("preview-dry");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    labels::write(
+        &Frame::resolve(&dir, &rels[0]).unwrap().labels,
+        &overlapping("car"),
+    )
+    .unwrap();
+    let mut cfg = config(&t.0);
+    cfg.collect.dir = Some(dir);
+    let path = t.0.join("config.json");
+    cfg.save(&path).unwrap();
+    let before = tree(&t.0);
+    for filter in ["status=reviewed,auto=overlaps", "status=any,limit=1"] {
+        let args = T::parse_from([
+            "train",
+            "autolabel",
+            "--dry-run",
+            "--sam3",
+            "--frames",
+            filter,
+        ]);
+        let args = crate::training::cli::TrainArgs { command: args.c };
+        assert!(crate::training::cli::run(args, Some(path.clone())).unwrap());
+    }
+    let after = tree(&t.0);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "no file came or went"
+    );
+    assert!(before == after, "no file changed");
 }
