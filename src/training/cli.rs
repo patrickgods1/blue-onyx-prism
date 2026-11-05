@@ -347,8 +347,9 @@ pub fn import_chain(a: &ImportArgs) -> Result<ImportChain> {
 pub struct AutolabelArgs {
     /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, label, status
     /// (unreviewed | reviewed | skipped | any), source (queue | all), auto (review | accept |
-    /// nothing | none | repeats | overlaps: frames in that auto-label state; overlaps = overlapping
-    /// boxes a reviewer has not checked), import (<id> | any), again=1 (also frames these labelers
+    /// nothing | none | repeats | overlaps | both: frames in that auto-label state; overlaps =
+    /// overlapping boxes a reviewer has not checked; both = a pending box two or more labelers
+    /// found, most such boxes first), import (<id> | any), again=1 (also frames these labelers
     /// already looked at), limit (most frames, in queue order; default 200, at most 20000).
     /// --dry-run shows what a filter selects.
     #[arg(long, default_value = "")]
@@ -365,6 +366,11 @@ pub struct AutolabelArgs {
     /// --with-model.
     #[arg(long, conflicts_with = "gdino")]
     pub sam3: bool,
+    /// SAM 3's own score threshold before fusion, 0.01 to 1 (default 0.3). Higher means fewer
+    /// boxes and missed faint objects. The frames' marker names the labelers, not this value, so
+    /// a rerun at another threshold needs again=1 in --frames. Needs --sam3.
+    #[arg(long, requires = "sam3")]
+    pub sam3_threshold: Option<f32>,
     /// Do not run RF-DETR L.
     #[arg(long)]
     pub no_rfdetr: bool,
@@ -514,6 +520,9 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
         // `--gdino` itself is refused when parsing; this is its default.
         r.gdino = None;
         r.sam3 = true;
+    }
+    if let Some(t) = a.sam3_threshold {
+        r.sam3_threshold = t;
     }
     r.vlm = match a.vlm.trim() {
         "off" | "none" | "" => None,
@@ -2025,6 +2034,38 @@ mod tests {
             panic!()
         };
         assert!(autolabel_request(&bad).is_err());
+    }
+
+    #[test]
+    fn the_sam3_threshold_needs_sam3_and_a_value_in_range() {
+        let args = |rest: &[&str]| -> AutolabelArgs {
+            let mut v = vec!["autolabel"];
+            v.extend_from_slice(rest);
+            let TrainCommand::Autolabel(a) = parse(&v).unwrap() else {
+                panic!("not autolabel")
+            };
+            a
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < f32::EPSILON;
+        let r = autolabel_request(&args(&["--sam3"])).unwrap();
+        assert!(near(r.sam3_threshold, 0.3), "the default");
+        let r = autolabel_request(&args(&["--sam3", "--sam3-threshold", "0.45"])).unwrap();
+        assert!(near(r.sam3_threshold, 0.45));
+        for edge in ["0.01", "1"] {
+            let a = args(&["--sam3", "--sam3-threshold", edge]);
+            assert!(autolabel_request(&a).is_ok(), "{edge}");
+        }
+        for bad in ["0", "1.5", "NaN", "inf"] {
+            let a = args(&["--sam3", "--sam3-threshold", bad]);
+            let e = autolabel_request(&a).unwrap_err().to_string();
+            assert!(e.contains("sam3 threshold"), "{bad}: {e}");
+        }
+        assert!(parse(&["autolabel", "--sam3", "--sam3-threshold", "high"]).is_err());
+        let e = parse(&["autolabel", "--sam3-threshold", "0.45"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("--sam3"), "{e}");
     }
 
     #[test]

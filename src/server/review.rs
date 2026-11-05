@@ -2748,6 +2748,18 @@ mod tests {
             (Some(2), Some(5))
         );
 
+        // A threshold out of range is refused before anything is counted.
+        let (st, v) = json(
+            &d.state,
+            post("mode=labelers&gdino=sam3&rfdetr=on&sam3_threshold=1.5"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("sam3 threshold"),
+            "{v}"
+        );
+
         // The parser's errors are the real form's.
         let (st, v) = json(&d.state, post("frames=colour%3Dred")).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);

@@ -9,7 +9,8 @@
 //! bypasses [`apply`] and [`merge_proposals`] on purpose). A labelers run writes through
 //! [`apply_labelers`]: what a frame takes depends on its status when the file is written, a
 //! reviewed frame only takes the confident new objects past its gate ([`gate_drop`]), and every
-//! frame takes the labelers' votes on boxes they found again ([`vote`]).
+//! frame takes the labelers' votes on boxes they found again ([`vote`]). A run with a model votes
+//! the same way ([`apply_relabel`]); a `missing_only` run does not.
 
 use super::catalog::same_class;
 use super::{Category, MISSING_THRESHOLD};
@@ -497,23 +498,42 @@ pub fn model_boxes(dets: &[Det], run: &ModelRun<'_>, w: u32, h: u32) -> Boxes {
     out
 }
 
+/// What [`apply_relabel`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelabelReport {
+    pub apply: ApplyReport,
+    /// Existing boxes that gained the model as a labeler ([`vote`]). A vote changes nothing a
+    /// reviewer has to look at, so it queues no frame.
+    pub votes: usize,
+    /// The note of a frame that went back to `unreviewed` ([`disagreement`]).
+    pub disagreement: Option<String>,
+}
+
 /// Apply a model's detections to a frame's label file: the disagreement note (reviewed files
-/// only; the file goes back to `unreviewed`) and `boxes` (its [`model_boxes`]) merged by
-/// [`apply`]. Returns what the merge did and the disagreement.
+/// only; the file goes back to `unreviewed`), `boxes` (its [`model_boxes`]) merged by [`apply`],
+/// and the model's votes on the boxes it found again ([`vote`]), so its name survives a proposal
+/// the merge drops. The votes come after [`apply`], as on [`apply_labelers`]' unreviewed path: a
+/// vote on a box without evidence would stop it taking the proposal's.
 pub fn apply_relabel(
     f: &mut LabelFile,
     dets: &[Det],
     boxes: Vec<LabelBox>,
     model: &str,
     classes: &[String],
-) -> (ApplyReport, Option<String>) {
+) -> RelabelReport {
     let why = disagreement(f, dets, model, classes);
-    let rep = apply(f, boxes);
+    let existing = f.boxes.len();
+    let merged = apply(f, boxes.clone());
+    let votes = vote(f, &boxes, existing);
     if let Some(w) = &why {
         f.status = Status::Unreviewed;
         f.disagreement = Some(w.clone());
     }
-    (rep, why)
+    RelabelReport {
+        apply: merged,
+        votes,
+        disagreement: why,
+    }
 }
 
 /// Whether a `missing_only` run may look at `f`: a reviewed frame, or an unreviewed one that a
@@ -839,7 +859,8 @@ fn gate_reason(p: &LabelBox) -> String {
 /// state. Only keys are added to `labelers`, a stored score stays, and nothing else of the box
 /// changes. A pending box without evidence gets no vote: having none is what lets [`apply`] annotate
 /// it and [`labels::auto_accept_eligible`] pass it, so a vote would change how it is triaged. Stops
-/// at [`labels::MAX_LABELERS`], past which a save fails. Returns the boxes that gained a labeler.
+/// at [`labels::MAX_LABELERS`] and skips a name over [`labels::MAX_LABEL_LEN`] (a model's file name
+/// can be), past either of which a save fails. Returns the boxes that gained a labeler.
 fn vote(f: &mut LabelFile, proposals: &[LabelBox], existing: usize) -> usize {
     let mut gained = 0;
     for p in proposals {
@@ -860,7 +881,8 @@ fn vote(f: &mut LabelFile, proposals: &[LabelBox], existing: usize) -> usize {
         }
         let before = b.auto.labelers.len();
         for (k, s) in &p.auto.labelers {
-            if b.auto.labelers.len() < labels::MAX_LABELERS {
+            let short = k.chars().count() <= labels::MAX_LABEL_LEN;
+            if short && b.auto.labelers.len() < labels::MAX_LABELERS {
                 b.auto.labelers.entry(k.clone()).or_insert(*s);
             }
         }
@@ -1268,8 +1290,8 @@ mod tests {
             accept_score: None,
         };
         let boxes = model_boxes(dets, &run, 640, 480).boxes;
-        let (a, why) = apply_relabel(f, dets, boxes, model, classes);
-        (a.merge, why)
+        let r = apply_relabel(f, dets, boxes, model, classes);
+        (r.apply.merge, r.disagreement)
     }
 
     #[test]
@@ -2429,6 +2451,166 @@ mod tests {
         );
         assert_eq!(g.boxes[0].auto.labelers["gdino"], 0.8);
         assert_eq!(g.boxes[0].auto.labelers["sam3"], 0.6);
+    }
+
+    /// [`apply_relabel`] of one `custom` detection at 0.9 on a 640x480 day frame.
+    fn found_by_custom(f: &mut LabelFile, label: &str, bbox: [f32; 4]) -> RelabelReport {
+        let cls = classes();
+        let dets = [Det {
+            label: label.into(),
+            score: 0.9,
+            bbox,
+        }];
+        let run = ModelRun {
+            model: "custom",
+            classes: &cls,
+            scene: "day",
+            accept_score: None,
+        };
+        let out = model_boxes(&dets, &run, 640, 480);
+        for b in &out.boxes {
+            let keys: Vec<&String> = b.auto.labelers.keys().collect();
+            assert_eq!(keys, ["custom"], "keyed by the model's name");
+        }
+        apply_relabel(f, &dets, out.boxes, "custom", &cls)
+    }
+
+    #[test]
+    fn a_model_run_votes_on_a_box_it_finds_again_and_changes_nothing_else() {
+        // A pending box of a labelers run, which `apply` leaves alone: it has evidence.
+        let mut b = lb("car", CAR, Source::Auto, BoxState::Pending);
+        b.auto.labelers.insert("gdino".into(), 0.41);
+        b.auto.triage = Some(Triage::Review);
+        b.auto.why = vec!["found by gdino only".into()];
+        let mut f = frame(vec![b]);
+        f.status = Status::Unreviewed;
+        let before = f.clone();
+        let r = found_by_custom(&mut f, "car", CAR);
+        assert_eq!(r.votes, 1, "{r:?}");
+        assert_eq!(r.disagreement, None);
+        assert_eq!(
+            r.apply.merge.dropped, 1,
+            "the proposal is dropped as before"
+        );
+        assert_eq!(
+            (
+                r.apply.merge.added,
+                r.apply.annotated,
+                r.apply.class_suggestions
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(f.boxes[0].auto.labelers["gdino"], 0.41);
+        assert_eq!(f.boxes[0].auto.labelers["custom"], 0.9);
+        let mut g = f.clone();
+        g.boxes[0].auto.labelers = before.boxes[0].auto.labelers.clone();
+        assert_eq!(g, before, "only `labelers` moved");
+
+        // A reviewed frame: its box matches, so it stays reviewed with no note.
+        let mut b = accepted("car", CAR);
+        b.auto.labelers.insert("gdino".into(), 0.41);
+        let mut f = frame(vec![b]);
+        f.status = Status::Reviewed;
+        f.overlaps_checked = true;
+        let before = f.clone();
+        let r = found_by_custom(&mut f, "car", CAR);
+        assert_eq!((r.votes, r.apply.annotated), (1, 0), "{r:?}");
+        assert_eq!(r.disagreement, None);
+        let mut g = f.clone();
+        g.boxes[0].auto.labelers = before.boxes[0].auto.labelers.clone();
+        assert_eq!(g, before, "status, note and the box stand");
+    }
+
+    #[test]
+    fn a_model_vote_does_not_undo_a_disagreement_or_add_to_the_annotated_count() {
+        // Vehicles are one object, so the truck takes the vote while the class differs.
+        let mut b = accepted("truck", CAR);
+        b.auto.labelers.insert("gdino".into(), 0.41);
+        let mut f = frame(vec![b]);
+        f.status = Status::Reviewed;
+        let r = found_by_custom(&mut f, "car", CAR);
+        assert_eq!(r.votes, 1, "{r:?}");
+        assert_eq!(f.status, Status::Unreviewed, "a class change still reopens");
+        assert_eq!(f.disagreement, r.disagreement);
+        assert!(r.disagreement.is_some());
+        assert_eq!(r.apply.merge.added, 1, "the other label is added as before");
+        assert_eq!(r.apply.annotated, 0);
+    }
+
+    #[test]
+    fn a_model_gives_no_vote_to_a_pending_box_without_evidence() {
+        // Of the same label `apply` annotates it, as ever: evidence, no vote on top.
+        let mut f = frame(vec![lb("car", CAR, Source::Model, BoxState::Pending)]);
+        f.status = Status::Unreviewed;
+        let r = found_by_custom(&mut f, "car", CAR);
+        assert_eq!((r.apply.annotated, r.votes), (1, 0), "{r:?}");
+        // Another vehicle, closest to the detection, while a car with evidence blocks both the
+        // annotation and the class suggestion: nothing takes the vote.
+        let near = [100.0, 100.0, 200.0, 190.0];
+        assert!(iou(&near, &CAR) >= STACK_IOU);
+        let hint = LabelBox {
+            origin: Some(labels::Origin::BelowThreshold),
+            ..lb("truck", CAR, Source::Model, BoxState::Pending)
+        };
+        let mut car = lb("car", near, Source::Auto, BoxState::Pending);
+        car.auto.labelers.insert("gdino".into(), 0.41);
+        let mut f = frame(vec![hint, car]);
+        f.status = Status::Unreviewed;
+        let before = f.clone();
+        let r = found_by_custom(&mut f, "car", CAR);
+        assert_eq!(r.votes, 0, "{r:?}");
+        assert_eq!(
+            f, before,
+            "the best match may not take it, nor the next one"
+        );
+    }
+
+    #[test]
+    fn a_long_model_name_cannot_break_a_save_through_its_vote() {
+        let cls = classes();
+        let name = "m".repeat(labels::MAX_LABEL_LEN + 30);
+        let dets = [Det {
+            label: "car".into(),
+            score: 0.9,
+            bbox: CAR,
+        }];
+        let run = ModelRun {
+            model: &name,
+            classes: &cls,
+            scene: "day",
+            accept_score: None,
+        };
+        let boxes = model_boxes(&dets, &run, 640, 480).boxes;
+        let mut b = accepted("car", CAR);
+        b.auto.labelers.insert("gdino".into(), 0.41);
+        let mut f = frame(vec![b]);
+        f.status = Status::Reviewed;
+        assert_eq!(apply_relabel(&mut f, &dets, boxes, &name, &cls).votes, 0);
+        assert!(labels::normalize(f, &cls, 640, 480, "t").is_ok());
+    }
+
+    #[test]
+    fn a_missing_only_run_never_votes() {
+        let mut b = accepted("car", CAR);
+        b.auto.labelers.insert("gdino".into(), 0.41);
+        let mut f = frame(vec![b]);
+        let before = f.clone();
+        let cls = classes();
+        let run = ModelRun {
+            model: "custom",
+            classes: &cls,
+            scene: "day",
+            accept_score: None,
+        };
+        let dets = [Det {
+            label: "car".into(),
+            score: 0.9,
+            bbox: CAR,
+        }];
+        let boxes = model_boxes(&dets, &run, 640, 480).boxes;
+        let m = apply_missing(&mut f, boxes, "custom");
+        assert_eq!(m.covered, 1);
+        assert_eq!(f, before, "existing boxes get no evidence");
     }
 
     #[test]

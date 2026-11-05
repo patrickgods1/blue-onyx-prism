@@ -26,7 +26,7 @@ cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco
 cargo run -- benchmark --list-datasets       # built-in image sets (assets/bench/*.json, resource bench:<id>)
 cargo run -- train overlaps [--frames "scene=ir,limit=200,again=1"] [--dry-run] [--allow-large]   # suggestions for overlapping boxes; changes no box
 cargo run -- hf-login                        # saves a Hugging Face token for gated downloads (no-echo prompt or stdin, never argv); `hf-logout` deletes it
-cargo run -- train autolabel --sam3 [--frames "status=reviewed,auto=overlaps"] [--dry-run]   # SAM 3 in gdino's seat; --dry-run previews frames and a rough time, runs nothing
+cargo run -- train autolabel --sam3 [--sam3-threshold 0.3] [--frames "status=reviewed,auto=overlaps"] [--dry-run]   # SAM 3 in gdino's seat; --dry-run previews frames and a rough time, runs nothing
 cargo run -- service status|start|stop|restart   # control the installed service (start/stop/restart need admin)
 cargo run --bin blue-onyx-prism-tray -- [--port n] [--cli <path>]   # tray / menu bar app (Windows, macOS)
 cargo run -- --version                      # <version> (<git sha>, <build date>): BLUE_ONYX_PRISM_GIT_SHA / _BUILD_DATE at build time (release.yml), `unknown` locally
@@ -229,8 +229,11 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   page's GPU select (`Capability::cuda_options`). The public night subset (`train-data:lila-night`, 926 MB) and other > 500 MB downloads need
   `--allow-large` / the page's box / `allow_large_downloads`.
 - SAM 3 (`facebook/sam3`, SAM License, gated, 3.4 GB, pin `autolabel:sam3` in `catalog/autolabel.rs`) is an opt-in labeler: it takes
-  gdino's seat in fusion (`--sam3`, form `gdino=sam3`, `sam3_threshold` 0.3; refused with `with_model`); the default stays gdino and
-  nothing here claims it is better, its full evaluation has not run. `scripts/autolabel.py` `Sam3` (masks off, phrases cached, f32,
+  gdino's seat in fusion (`--sam3`, form `gdino=sam3`; refused with `with_model`); the default stays gdino and
+  nothing here claims it is better, its full evaluation has not run. `--sam3-threshold` (needs `--sam3`) / form `sam3_threshold` (Training
+  and Review cards, shown and posted only while SAM 3 is chosen, `al.sam3_threshold` through an import, ignored for other labelers) is SAM 3's
+  own score before fusion, 0.01..=1 by `validate`, default 0.3, in the run summary; the marker does not hold it, so a rerun at a new value
+  needs `again=1` (the preview warns). `scripts/autolabel.py` `Sam3` (masks off, phrases cached, f32,
   loaded first), `participants_of` generalises the fusion seats, `labeler()` names it so gdino markers do not skip its frames, and
   `--self-check` imports `Sam3Model` before the download. **SAM 3 boxes never triage `accept`** (`ACCEPT_SCORE` 0.6 was tuned for
   gdino + RF-DETR and a bulk accept reaches exports). Cost: ~2 s + 0.2 s x phrases per frame on a GTX 1070 Ti (about 5 s with 22
@@ -260,7 +263,10 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   unreviewed with a `disagreement` note naming `sam3` and loses `bulk_accepted`; `reopened` and the filtered counts are in the summary
   with `REOPENED_WARNING`. Votes: the new labeler's score joins a same-object box's `auto.labelers` at IoU >= `STACK_IOU` 0.7 (best
   match, `or_insert`, `labels::MAX_LABELERS`) so it can witness overlap suggestions; nothing else on the box changes, a vote-only
-  write is `queue: false`. `POST /v1/review/restore-reopened` (`bulk::bulk_restore_reopened`; filters, `dry_run`, `limit` 500) puts
+  write is `queue: false`. A `--with-model` run votes too (`apply_relabel`: `apply`, then `vote`, the model's name as the key, `votes` in
+  its summary), with no change to status, `disagreement` or `annotated`; `--missing-only` never votes. `auto=both` (`AutoFilter::Both`, page *found
+  by 2+ labelers*): a pending box with 2+ `labelers` of a wanted class (`Filters::wanted`, as `auto=overlaps`), most such boxes first (item field
+  `agreed_boxes`); a decided box never counts. `POST /v1/review/restore-reopened` (`bulk::bulk_restore_reopened`; filters, `dry_run`, `limit` 500) puts
   unreviewed frames with `disagreement`, a `reviewed_at` and nothing pending back to reviewed (the undo; reopened frames stay out of
   exports until saved or restored, exports already made are unaffected). `overlaps_checked` comes back with it: `apply_missing` moves
   a true one to `checked_before_reopen`, which a restore or `accept-repeats` gives back, holds `reject-stacked` back while set, and a spot accept of a new box or a save ends. A failed labelers run with a readable `proposals.jsonl`

@@ -294,6 +294,15 @@ impl AutolabelPreview {
                 plural(self.skipped_done)
             ));
         }
+        if r.sam3 && self.skipped_done > 0 {
+            w.push(format!(
+                "The frames' marker names the labelers, not the SAM 3 threshold, so a new threshold \
+                 does not bring those {} frame{} back: add again=1 to the filter, or tick the box \
+                 for frames already labelled.",
+                self.skipped_done,
+                plural(self.skipped_done)
+            ));
+        }
         if self.taken == 0 && self.skipped_trained > 0 {
             w.push(format!(
                 "Nothing to check: the model trained on {} frame{}.",
@@ -374,6 +383,36 @@ mod tests {
         r.gdino = Some(GdinoSize::Large);
         let e = estimate(&r, 20, 1).unwrap();
         assert!(e.text.contains("measured with tiny"), "{}", e.text);
+    }
+
+    #[test]
+    fn frames_skipped_by_the_marker_stay_skipped_at_a_new_sam3_threshold() {
+        let c = Counts {
+            matched: unreviewed(7),
+            taken: unreviewed(4),
+            skipped_done: 3,
+            ..Counts::default()
+        };
+        let says = |p: &AutolabelPreview| {
+            p.warnings
+                .iter()
+                .any(|w| w.contains("not the SAM 3 threshold") && w.contains("again=1"))
+        };
+        let mut r = sam3();
+        r.sam3_threshold = 0.45;
+        let p = preview(&r, &c);
+        assert!(says(&p), "{p:?}");
+        assert!(
+            p.warnings.iter().any(|w| w.contains("those 3 frames")),
+            "{p:?}"
+        );
+        assert!(!says(&preview(&request(), &c)), "not a SAM 3 run");
+        let none = Counts {
+            matched: unreviewed(7),
+            taken: unreviewed(7),
+            ..Counts::default()
+        };
+        assert!(!says(&preview(&r, &none)), "nothing was skipped");
     }
 
     #[test]

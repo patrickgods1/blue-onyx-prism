@@ -1216,8 +1216,17 @@ SAM 3 (`facebook/sam3`) can take MM-Grounding-DINO's seat (step 1): `train autol
 in the Auto-label card's open-vocabulary select. It is **opt-in**: the default stays MM-Grounding-DINO,
 and the full comparison of the two has not been run, so nothing here says SAM 3 is better. Steps 2 to 5
 are unchanged, with one exception: **a SAM 3 box is never triaged `accept`** (the 0.6 rule was tuned for
-MM-Grounding-DINO + RF-DETR), so *Accept auto-labeled frames* never takes a frame on SAM 3's word. Its
-score threshold is 0.3 (`sam3_threshold`). It cannot be combined with *Label with a model*.
+MM-Grounding-DINO + RF-DETR), so *Accept auto-labeled frames* never takes a frame on SAM 3's word. It
+cannot be combined with *Label with a model*.
+
+**Threshold.** `--sam3-threshold` (needs `--sam3`), or the *SAM 3 threshold* field on the Training and
+Review cards, shown while SAM 3 is the chosen labeler (form field `sam3_threshold`; an import's chained
+auto-label takes it too). It is SAM 3's own score before fusion, from 0.01 to 1, default 0.3: a higher
+value means fewer boxes and missed faint objects. A box only one labeler found scores half that after
+fusion. The value appears in the run's summary. The frames' marker names the labelers, not the threshold,
+so a rerun at a new value skips the frames already looked at unless the filter has `again=1` (*Label
+again*); Preview says so. A rerun adds boxes and removes none, so a higher value does not clear the boxes
+of an earlier, lower one.
 
 **Cost.** About 5 s per frame on a GTX 1070 Ti with 22 prompt phrases (about 2 s plus 0.2 s per phrase),
 against 0.55 s for MM-Grounding-DINO tiny. It was not measured on Apple GPUs. *Preview* (below) gives a
@@ -1277,6 +1286,11 @@ selects frames with overlapping boxes you have not yet checked; frames whose ove
 checked stay out). A frame the same labelers already looked at is skipped unless the filter has `again=1`
 (Review page: *Label again*).
 
+**Found by two.** `auto=both` (Review page's Auto filter and the card's Custom *Auto-labelled* select:
+*found by 2+ labelers*) selects frames with a pending box that two or more labelers found, most such boxes
+first, so the likely real and still unsettled boxes come up early. Only pending boxes count, so a reviewed
+frame has none, and boxes of unwanted classes do not count on the page or in a run.
+
 **Preview** (the button on the card; `train autolabel ... --dry-run` on the command line; nothing is
 run or written, and no GPU, download or login is needed) shows how many frames match, how many a run
 takes after `limit`, how many are skipped because the labelers already ran, the split by status, and a
@@ -1321,7 +1335,11 @@ those frames like a Cancel does, then still reports the failure; run it again an
 `with_model`) labels the frames with a detection model through the service's own pipeline (the
 benchmark's decode, preprocess, infer, postprocess; no Python, no training GPU needed), default
 threshold 0.3, by default over the **unreviewed** frames (first-pass labelling). Its boxes are pending
-`source: auto` boxes like the labelers'.
+`source: auto` boxes like the labelers'. When it finds an existing box again, the merge drops its proposal
+as for the labelers, and the model's name and score join that box's labelers: a vote for overlap
+suggestions and `auto=both`, counted in the run's summary. The vote takes the best box of the same object
+at IoU 0.7 or more and changes nothing else on it: no state, frame status, disagreement note or review
+queue. A pending box with no evidence gets the model's evidence as before, not a vote.
 
 **Sources** (`GET /v1/autolabel/models`, admin, `training::autolabel::models`):
 
@@ -1390,8 +1408,8 @@ Train, re-label, review the disagreements, train again: 2-3 rounds, IR frames an
 `train autolabel --with-model <id> --missing-only` (the *Find missing labels* box on the Training and
 Review pages; `POST /training/autolabel` `missing_only`) looks for real objects with no box on frames
 you already reviewed, and nothing else. An unlabelled object teaches a model that the object is
-background and counts as a false alarm in validation. Run it once per model, one task each, then review
-the proposals. The self-training loop above does not fit this job: it also reopens frames for missed
+background and counts as a false alarm in validation. Existing boxes get no evidence and no vote. Run it
+once per model, one task each, then review the proposals. The self-training loop above does not fit this job: it also reopens frames for missed
 boxes and class changes (with `truck=car`, every truck), asks a model about frames it trained on, and
 its merge drops any proposal on a rejected box, so a real car under an automatic reject stays hidden.
 

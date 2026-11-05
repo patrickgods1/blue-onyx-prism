@@ -216,8 +216,8 @@ impl VlmSize {
 
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
 /// `label` (any of several classes, separated by `|`: `label=person|car`), `status`, `source`,
-/// `auto`; `auto=overlaps` needs [`Filters::wanted`], which [`AutolabelJob`] sets from the config
-/// as the Review page does), `import=<id>|any` (imported frames), `again=1` (also
+/// `auto`; `auto=overlaps` and `auto=both` need [`Filters::wanted`], which [`AutolabelJob`] sets
+/// from the config as the Review page does), `import=<id>|any` (imported frames), `again=1` (also
 /// frames these labelers already looked at, see [`crate::collect::labels::AutoRun`]) and `limit`
 /// (most frames, in queue order). Written `key=value` pairs separated by commas
 /// (`scene=ir,status=unreviewed,limit=20`).
@@ -368,6 +368,8 @@ pub struct AutolabelRequest {
     #[serde(default)]
     pub confirm_license: bool,
     pub gdino_threshold: f32,
+    /// SAM 3's own score threshold, before fusion: higher means fewer boxes and missed faint
+    /// objects. Not part of the frames' marker, so a rerun at another value needs `again=1`.
     #[serde(default = "default_sam3_threshold")]
     pub sam3_threshold: f32,
     pub rfdetr_threshold: f32,

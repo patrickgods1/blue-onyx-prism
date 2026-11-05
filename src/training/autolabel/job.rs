@@ -9,7 +9,8 @@
 //! catalog model not on disk yet: downloaded, or exported with the export toolchain) -> add it
 //! to the config disabled (a local or catalog model, through the [`ConfigWriter`]) -> label with
 //! the service's own pipeline ([`super::relabel`]) -> map, triage and merge
-//! ([`triage::model_boxes`], [`triage::apply_relabel`]); every frame it looked at gets the
+//! ([`triage::model_boxes`], [`triage::apply_relabel`], which also records the model as a labeler
+//! on the boxes it found again); every frame it looked at gets the
 //! `model:<name>@<device>` marker. A `missing_only` run differs in two places: stage 1 keeps the
 //! frames of [`triage::missing_scope`] the model did not train on ([`super::trained_frames`]) and
 //! stage 5 writes [`triage::apply_missing`] to the frames that gain a box, and nothing else: no
@@ -218,9 +219,11 @@ pub struct AutolabelReport {
     pub cancelled: bool,
     pub frames_done: usize,
     pub frames_total: usize,
-    /// Existing boxes that gained a labeler ([`triage::apply_labelers`]), for the overlap check's
-    /// witnesses.
+    /// Existing boxes that gained a labeler ([`triage::apply_labelers`],
+    /// [`triage::apply_relabel`]), for the overlap check's witnesses and `auto=both`.
     pub votes: usize,
+    /// A SAM 3 run: its threshold ([`AutolabelRequest::sam3_threshold`]).
+    pub sam3_threshold: Option<f32>,
     /// Reviewed frames: proposals left out, the labelers not agreeing and none confident.
     pub filtered_low_score: usize,
     /// Reviewed frames: proposals left out on a VLM or SigLIP objection.
@@ -253,10 +256,25 @@ impl AutolabelReport {
         self.filtered_closed += a.closed;
     }
 
-    /// What a labelers run did to frames with a reviewer's decisions, for its summary (empty when
-    /// it touched none).
+    /// The votes of a labelers or model run, for its summary (empty when it cast none).
+    fn votes_note(&self) -> String {
+        if self.votes == 0 {
+            return String::new();
+        }
+        format!(
+            "; {} existing boxes gained a labeler's vote: the overlap check counts it for new \
+             pairs, and pairs it already answered need Ask again in Suggest overlaps",
+            self.votes
+        )
+    }
+
+    /// A labelers run's SAM 3 threshold and what it did to frames with a reviewer's decisions, for
+    /// its summary (empty when neither applies).
     fn labelers_notes(&self) -> String {
         let mut s = String::new();
+        if let Some(t) = self.sam3_threshold {
+            s.push_str(&format!("; SAM 3 threshold {t}"));
+        }
         let filtered = self.filtered_low_score
             + self.filtered_objected
             + self.filtered_other_object
@@ -284,13 +302,7 @@ impl AutolabelReport {
                 self.reopened
             ));
         }
-        if self.votes > 0 {
-            s.push_str(&format!(
-                "; {} existing boxes gained a labeler's vote: the overlap check counts it for new \
-                 pairs, and pairs it already answered need Ask again in Suggest overlaps",
-                self.votes
-            ));
-        }
+        s.push_str(&self.votes_note());
         s
     }
 }
@@ -648,6 +660,7 @@ impl AutolabelJob {
             )?
         } else {
             rep.labeler = labeler.clone();
+            rep.sam3_threshold = r.sam3.then_some(r.sam3_threshold);
             // 2. Environment.
             let accel = self
                 .accelerator
@@ -1064,7 +1077,7 @@ impl AutolabelJob {
         let summary = if self.model.is_none() {
             summary + &rep.labelers_notes()
         } else {
-            summary
+            summary + &rep.votes_note()
         };
         Ok(TaskOutcome {
             summary,
@@ -1241,21 +1254,23 @@ impl AutolabelJob {
             };
             let res = self.write_frame(f, rep, changed, |file, rep| {
                 file.auto_run = Some(marker);
-                let (a, why) =
-                    triage::apply_relabel(file, &d, out.boxes, &plan.name, &self.classes);
+                let t = triage::apply_relabel(file, &d, out.boxes, &plan.name, &self.classes);
+                let (a, disagrees) = (t.apply, t.disagreement.is_some());
                 rep.added += a.merge.added;
                 rep.dropped += a.merge.dropped;
                 rep.annotated += a.annotated;
                 rep.class_suggestions += a.class_suggestions;
-                if why.is_some() {
+                rep.votes += t.votes;
+                if disagrees {
                     rep.disagreements += 1;
                 }
                 FrameWrite {
                     write: true,
+                    // A vote is no change for a reviewer: it does not queue the frame.
                     queue: a.merge.added > 0
                         || a.annotated > 0
                         || a.class_suggestions > 0
-                        || why.is_some(),
+                        || disagrees,
                 }
             });
             if let Err(e) = res {

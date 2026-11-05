@@ -12,7 +12,8 @@
 // Each run row gets a settings line (device, batch, input size, learning rate and schedule,
 // patience, seed, ...) and the Learning rate field's placeholder follows the ticked family.
 // SAM 3: the three-step access panel of the Auto-label card (GET /v1/autolabel/sam3); its option
-// in the labeler select stays disabled until the checkpoint is installed.
+// in the labeler select stays disabled until the checkpoint is installed. Its threshold field
+// shows only while SAM 3 is the chosen labeler.
 // Auto-label frames: the "Which frames" select writes Status and Auto (the fields the form posts;
 // the select itself has no name, so the import chain's `al.*` copy and the form's restore are the
 // fields as before); Custom shows them. Preview frames posts the form to
@@ -202,6 +203,23 @@
     form.querySelectorAll('input[name="mode"]').forEach(function (r) { r.addEventListener("change", update); });
     update();
   })();
+  // Auto-label: the SAM 3 threshold only while SAM 3 is the chosen labeler. Hidden, it is disabled:
+  // not posted, not validated, not copied into an import's `al.*` fields. Like the block above this
+  // runs after the mode toggle, which re-enables every field of the shown mode.
+  (function () {
+    var form = document.getElementById("autolabel-form");
+    var field = document.getElementById("al-sam3-threshold-field");
+    if (!form || !field || !form.elements.gdino || !form.elements.sam3_threshold) return;
+    var seat = form.elements.gdino, input = form.elements.sam3_threshold;
+    var update = function () {
+      var on = checked(form, "mode") === "labelers" && seat.value === "sam3";
+      field.hidden = !on;
+      input.disabled = !on;
+    };
+    seat.addEventListener("change", update);
+    form.querySelectorAll('input[name="mode"]').forEach(function (r) { r.addEventListener("change", update); });
+    update();
+  })();
 
   // SAM 3 is gated: request access, say so (POST .../download, which also adopts a folder already
   // on disk by hash), then sign in with the command shown. The server decides the state; this
@@ -233,7 +251,10 @@
       if (option) {
         option.disabled = !installed;
         option.textContent = installed ? "SAM 3" : "SAM 3 (gated, needs the download below)";
-        if (!installed && select && select.value === "sam3") select.value = select.options[0].value;
+        if (!installed && select && select.value === "sam3") {
+          select.value = select.options[0].value;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        }
       }
       download.textContent = s.parts_on_disk ? "Check the files on disk" : "I have access, download (" + s.size_text + ")";
       download.hidden = installed;

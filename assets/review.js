@@ -2619,6 +2619,17 @@
       blk.hidden = off;
       Array.prototype.forEach.call(blk.querySelectorAll('input, select, textarea'), function (f) { f.disabled = off; });
     });
+    syncSam3Threshold();
+  }
+  // The SAM 3 threshold only while SAM 3 is the chosen labeler; hidden, it is disabled (not posted,
+  // not validated). The mode switch above enables every field of the shown block, so it runs after.
+  function syncSam3Threshold() {
+    var seat = $('rv-al-gdino'), input = alForm.elements.sam3_threshold;
+    if (!seat || !input) return;
+    var on = alMode() === 'labelers' && seat.value === 'sam3';
+    $('rv-al-sam3-threshold-field').hidden = !on;
+    $('rv-al-sam3-threshold-hint').hidden = !on;
+    input.disabled = !on;
   }
   if (alForm) {
     var mpHolder = $('rv-al-model-picker');
@@ -2637,6 +2648,7 @@
     // SAM 3 is offered once installed (its panel is on the Training page); the select stays out of
     // sight until then and posts MM-Grounding-DINO.
     var alSeat = $('rv-al-gdino');
+    if (alSeat) alSeat.addEventListener('change', syncSam3Threshold);
     if (alSeat && window.fetch) {
       fetch('/v1/autolabel/sam3', { headers: { Accept: 'application/json' } })
         .then(function (r) { return r.ok ? r.json() : null; })

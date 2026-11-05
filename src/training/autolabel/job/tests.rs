@@ -1484,7 +1484,9 @@ fn sam3_runs_in_the_gdino_seat_with_its_own_marker_and_never_accepts() {
     let gdino =
         plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
     assert!(Task::uses(&gdino).is_empty());
-    assert_eq!(run_job(&gdino, &fake).unwrap().result["frames"], 2);
+    let out = run_job(&gdino, &fake).unwrap();
+    assert_eq!(out.result["frames"], 2);
+    assert!(!out.summary.contains("SAM 3 threshold"), "{}", out.summary);
     // So is SAM 3 after it: a gdino marker does not skip these frames.
     assert_eq!(run_job(&sam3_job(&cfg), &fake).unwrap().result["frames"], 2);
 }
@@ -1498,13 +1500,46 @@ fn sam3_can_run_without_rfdetr() {
     let mut job = sam3_job(&cfg);
     job.request.rfdetr = false;
     job.request.sam3_threshold = 0.45;
-    run_job(&job, &fake).unwrap();
+    let out = run_job(&job, &fake).unwrap();
     let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
     assert_eq!(
         arg_after(&cmd, "--sam3-threshold").unwrap(),
         Path::new("0.45")
     );
     assert!(arg_after(&cmd, "--rfdetr").is_none(), "{}", cmd.display());
+    assert!(
+        out.summary.contains("SAM 3 threshold 0.45"),
+        "{}",
+        out.summary
+    );
+}
+
+#[test]
+fn a_rerun_at_a_new_sam3_threshold_is_skipped_by_the_marker_without_again() {
+    let t = tmp("sam3-again");
+    frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let fake = LabelFake::default();
+    run_job(&sam3_job(&cfg), &fake).unwrap();
+    let mut rerun = sam3_job(&cfg);
+    rerun.request.sam3_threshold = 0.45;
+    let p = rerun.preview().unwrap();
+    assert_eq!((p.taken, p.skipped_done), (0, 2), "{p:?}");
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("not the SAM 3 threshold")),
+        "{p:?}"
+    );
+    assert!(run_job(&rerun, &fake).is_err(), "nothing left to label");
+    rerun.request.frames = FrameFilter::parse("again=1", "unreviewed").unwrap();
+    assert_eq!(rerun.preview().unwrap().taken, 2);
+    assert_eq!(run_job(&rerun, &fake).unwrap().result["frames"], 2);
+    let cmd = fake.cmds.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        arg_after(&cmd, "--sam3-threshold").unwrap(),
+        Path::new("0.45")
+    );
 }
 
 #[test]
@@ -2050,6 +2085,101 @@ mod missing {
         let saved = labels::normalize(f, &classes, 64, 48, "2026-11-04T00:00:00.000Z").unwrap();
         assert_eq!(saved.training().count(), 2);
         assert_eq!(saved.disagreement, None);
+    }
+
+    #[test]
+    fn a_missing_only_run_writes_no_vote_on_a_box_it_finds_again() {
+        let t = tmp("missing-vote");
+        let rels = frames(&t.0, 1, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        let mut f = reviewed(&[("car", CAR)]);
+        f.boxes[0].auto.labelers.insert("gdino".into(), 0.41);
+        put(&dir, &rels[0], &f);
+        let before = bytes(&dir, &rels[0]);
+        let detector = fake(&[(&rels[0], vec![det("car", 0.9, CAR)])]);
+        let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["votes"], 0, "{}", out.result);
+        assert_eq!(out.result["dropped"], 1, "{}", out.result);
+        assert!(!out.summary.contains("vote"), "{}", out.summary);
+        assert_eq!(bytes(&dir, &rels[0]), before, "the file is not written");
+    }
+
+    #[test]
+    fn a_model_run_votes_on_boxes_it_finds_again_and_queues_no_frame_for_it() {
+        let t = tmp("model-vote");
+        let rels = frames(&t.0, 3, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        // A pending box of a labelers run, a reviewed box with evidence, an evidence-free car.
+        let mut open = reviewed(&[("car", CAR)]);
+        open.status = Status::Unreviewed;
+        open.boxes[0].state = BoxState::Pending;
+        open.boxes[0].source = Source::Auto;
+        open.boxes[0].origin = None;
+        open.boxes[0].auto.labelers.insert("gdino".into(), 0.41);
+        open.boxes[0].auto.triage = Some(Triage::Review);
+        put(&dir, &rels[0], &open);
+        let mut done = reviewed(&[("car", CAR)]);
+        done.boxes[0].auto.labelers.insert("gdino".into(), 0.41);
+        put(&dir, &rels[1], &done);
+        let plain = LabelFile {
+            status: Status::Unreviewed,
+            ..reviewed(&[("car", CAR)])
+        };
+        put(&dir, &rels[2], &plain);
+        let queue_file = dir.join(layout::REVIEW_QUEUE_FILE);
+        std::fs::remove_file(&queue_file).unwrap();
+
+        let car = || vec![det("car", 0.9, CAR)];
+        let mut req =
+            AutolabelRequest::new(FrameFilter::parse("status=any", "unreviewed").unwrap());
+        req.with_model = Some("IPcam-general".into());
+        let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+        job.detector = Some(fake(&[
+            (&rels[0], car()),
+            (&rels[1], car()),
+            (&rels[2], car()),
+        ]));
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        let rep = &out.result;
+        assert_eq!(rep["votes"], 2, "{rep}");
+        // The third frame's box takes the evidence, as before: annotated, and queued for that.
+        assert_eq!(rep["annotated"], 1, "{rep}");
+        assert_eq!(
+            (&rep["added"], &rep["dropped"]),
+            (&0.into(), &3.into()),
+            "{rep}"
+        );
+        assert_eq!(
+            (&rep["disagreements"], &rep["reopened"]),
+            (&0.into(), &0.into())
+        );
+        assert!(
+            out.summary
+                .contains("2 existing boxes gained a labeler's vote"),
+            "{}",
+            out.summary
+        );
+
+        // Only `labelers` and the marker changed on the voted frames.
+        for (rel, before) in [(&rels[0], open), (&rels[1], done)] {
+            let mut f = labels_of(&dir, rel);
+            let voted = &f.boxes[0].auto.labelers;
+            assert_eq!(voted["gdino"], 0.41, "{voted:?}");
+            assert_eq!(voted["IPcam-general"], 0.9, "{voted:?}");
+            assert!(f.auto_run.is_some(), "every frame gets the marker");
+            f.boxes[0].auto.labelers = before.boxes[0].auto.labelers.clone();
+            f.auto_run = None;
+            assert_eq!(f, before);
+        }
+        // A vote queues nothing; the annotated frame is queued as before.
+        let queued: Vec<String> = layout::read_review(&queue_file)
+            .into_iter()
+            .map(|l| l.frame)
+            .collect();
+        assert_eq!(queued, [rels[2].clone()]);
     }
 
     #[test]
@@ -2974,6 +3104,80 @@ fn a_job_and_the_page_agree_on_an_overlap_of_an_unwanted_class() {
         .collect();
     assert_eq!(selected, on_page);
     assert_eq!(job.preview().unwrap().frames, on_page);
+}
+
+#[test]
+fn the_page_the_preview_and_the_run_agree_on_auto_both() {
+    let t = tmp("preview-both");
+    let rels = frames(&t.0, 6, false);
+    let dir = t.0.join("dataset");
+    let mut cfg = config(&t.0);
+    cfg.collect.classes = vec!["car".into(), "person".into(), "dog".into()];
+    cfg.collect.hidden_classes = vec!["dog".into()];
+    let found = |label: &str, labelers: &[&str], state: BoxState| labels::LabelBox {
+        bbox: [1.0, 1.0, 30.0, 20.0],
+        state,
+        auto: labels::AutoInfo {
+            labelers: labelers.iter().map(|k| ((*k).to_string(), 0.5)).collect(),
+            ..Default::default()
+        },
+        ..labels::tests_support::auto_box(label)
+    };
+    let pair = ["sam3", "rfdetr"];
+    let put = |i: usize, status: Status, boxes: Vec<labels::LabelBox>| {
+        let f = LabelFile {
+            status,
+            boxes,
+            ..LabelFile::default()
+        };
+        labels::write(&Frame::resolve(&dir, &rels[i]).unwrap().labels, &f).unwrap();
+    };
+    let open = Status::Unreviewed;
+    put(0, open, vec![found("car", &["sam3"], BoxState::Pending)]);
+    put(1, open, vec![found("car", &pair, BoxState::Pending)]);
+    let two = found("car", &pair, BoxState::Pending);
+    put(2, open, vec![two.clone(), two]);
+    put(3, open, vec![found("dog", &pair, BoxState::Pending)]);
+    put(
+        4,
+        Status::Reviewed,
+        vec![found("car", &pair, BoxState::Accepted)],
+    );
+    // rels[5]: no label file.
+    let want = [rels[2].clone(), rels[1].clone()];
+
+    let query: BTreeMap<String, String> = [("status", "any"), ("auto", "both"), ("source", "all")]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .into();
+    let mut page = queue::Filters::from_query(&query).unwrap();
+    page.wanted = Some((
+        cfg.collect.classes.clone(),
+        cfg.collect.hidden_classes.clone(),
+    ));
+    let on_page: Vec<String> = queue::build(&dir, &page)
+        .items
+        .into_iter()
+        .map(|i| i.frame)
+        .collect();
+    assert_eq!(on_page, want);
+
+    let job = plan_autolabel(&cfg, request("status=any,auto=both"), &host()).unwrap();
+    let p = job.preview().unwrap();
+    assert_eq!(p.frames, want);
+    assert_eq!((p.matched, p.taken), (2, 2), "{p:?}");
+    // `limit` keeps the most agreed frame.
+    let first = plan_autolabel(&cfg, request("status=any,auto=both,limit=1"), &host()).unwrap();
+    assert_eq!(first.preview().unwrap().frames, want[..1]);
+
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    assert_eq!(out.result["frames"], p.taken, "{}", out.result);
+    let mut sorted = want.to_vec();
+    sorted.sort();
+    assert_eq!(
+        marked(&dir, &rels),
+        sorted,
+        "the run took what it previewed"
+    );
 }
 
 /// Every file under `root` with its time and bytes.

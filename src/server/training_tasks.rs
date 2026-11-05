@@ -224,8 +224,9 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 /// older forms post), `gdino` (a size, or `sam3` for SAM 3 in its seat), `vlm` (`off` = none),
 /// `rfdetr` / `siglip` (ticked = on; the Review page's form sends them), `with_model` (any id of
 /// `GET /v1/autolabel/models`),
-/// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick), and for
-/// a run with a model `device` (empty = the model's), `model_accept_score` (empty = off),
+/// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick) and, when
+/// `gdino` is `sam3`, `sam3_threshold` (empty = the default; ignored otherwise, so a stale value of
+/// a hidden field refuses nothing), and for a run with a model `device` (empty = the model's), `model_accept_score` (empty = off),
 /// `missing_only` (ticked = on); `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
 /// `vlm_batch`, `prefetch` and `vlm_min_on` (ticked = on; then `vlm_min_score` applies) count
 /// only when the form posts `run_options` (the Training page's card); without it (the Review
@@ -281,6 +282,11 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
         r.missing_only = field(f, "missing_only").is_some();
     } else {
         r.gpu = field(f, "gpu").map(str::to_string);
+        if r.sam3
+            && let Some(t) = num(f, "sam3_threshold", "SAM 3 threshold")?
+        {
+            r.sam3_threshold = t;
+        }
     }
     r.with_model = with_model;
     if let Some(t) = num(f, "threshold", "threshold")? {
@@ -1384,6 +1390,56 @@ mod tests {
         let r = autolabel_from_form(&chained_autolabel_fields(&f)).unwrap();
         assert!(r.sam3 && r.rfdetr);
         assert_eq!(r.gdino, None);
+    }
+
+    #[test]
+    fn the_form_takes_the_sam3_threshold_only_for_sam3() {
+        use crate::training::autolabel::SAM3_THRESHOLD;
+        let near = |a: f32, b: f32| (a - b).abs() < f32::EPSILON;
+        let sam3 = |t: &str| {
+            autolabel_from_form(&form(&[
+                ("gdino", "sam3"),
+                ("rfdetr", "on"),
+                ("sam3_threshold", t),
+            ]))
+        };
+        assert!(near(sam3("0.45").unwrap().sam3_threshold, 0.45));
+        assert!(
+            near(sam3("").unwrap().sam3_threshold, SAM3_THRESHOLD),
+            "empty"
+        );
+        let r = autolabel_from_form(&form(&[("gdino", "sam3"), ("rfdetr", "on")])).unwrap();
+        assert!(near(r.sam3_threshold, SAM3_THRESHOLD), "not posted");
+        // Out of range: `validate` refuses it; not a number: the field is named.
+        for bad in ["0", "1.5", "-1", "NaN"] {
+            let e = sam3(bad).unwrap_err().to_string();
+            assert!(e.contains("sam3 threshold"), "{bad}: {e}");
+        }
+        let e = sam3("high").unwrap_err().to_string();
+        assert!(e.contains("SAM 3 threshold"), "{e}");
+        // Any other labeler, and a model run, ignore it, so a stale field refuses nothing.
+        let other = [
+            vec![("gdino", "tiny"), ("rfdetr", "on")],
+            vec![("mode", "model"), ("with_model", "x"), ("gdino", "sam3")],
+        ];
+        for mut fields in other {
+            fields.push(("sam3_threshold", "9"));
+            let r = autolabel_from_form(&form(&fields)).unwrap();
+            assert!(near(r.sam3_threshold, SAM3_THRESHOLD), "{fields:?}");
+        }
+        // Through an import's `al.` fields, a bad value too: the import is planned on it.
+        let chained = |t: &str| {
+            let f = form(&[
+                ("autolabel", "on"),
+                ("al.mode", "labelers"),
+                ("al.gdino", "sam3"),
+                ("al.rfdetr", "on"),
+                ("al.sam3_threshold", t),
+            ]);
+            autolabel_from_form(&chained_autolabel_fields(&f))
+        };
+        assert!(near(chained("0.45").unwrap().sam3_threshold, 0.45));
+        assert!(chained("1.5").is_err());
     }
 
     #[test]

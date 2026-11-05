@@ -216,6 +216,11 @@
         <label for="al-gdino">Open-vocabulary labeler</label>
         <select id="al-gdino" name="gdino"><option value="tiny">MM-Grounding-DINO tiny (Swin-T, 0.7 GB)</option><option value="base">MM-Grounding-DINO base (Swin-B, 0.9 GB)</option><option value="large">MM-Grounding-DINO large (Swin-L, 1.4 GB)</option><option value="sam3" id="al-gdino-sam3" disabled>SAM 3 (gated, needs the download below)</option><option value="off">off</option></select>
         <p class="muted small">Open vocabulary: the class list plus <code>training.synonyms</code>.</p>
+        <div class="tr-sub" id="al-sam3-threshold-field" hidden>
+          <label for="al-sam3-threshold">SAM 3 threshold</label>
+          <input type="number" id="al-sam3-threshold" name="sam3_threshold" class="al-num" min="0.01" max="1" step="0.01" value="0.3" disabled>
+          <p class="muted small">SAM 3's own score, before fusion. Higher means fewer boxes and missed faint objects. A rerun at another threshold counts as the same labeler: frames it already looked at stay skipped unless you tick <em>Also frames these labelers already looked at</em>.</p>
+        </div>
         <details class="tr-more" id="al-sam3" hidden>
           <summary>SAM 3 <span class="muted small" id="al-sam3-summary"></span></summary>
           <ol class="small">
@@ -310,7 +315,7 @@
         </div>
         <div class="tr-field" data-al-custom>
           <label for="al-auto">Auto-labelled</label>
-          <select id="al-auto" name="auto"><option value="">any</option><option value="none">never</option><option value="review">marked review</option><option value="accept">marked accept</option><option value="nothing">found nothing</option><option value="overlaps">overlapping boxes</option></select>
+          <select id="al-auto" name="auto"><option value="">any</option><option value="none">never</option><option value="review">marked review</option><option value="accept">marked accept</option><option value="nothing">found nothing</option><option value="overlaps">overlapping boxes</option><option value="both">found by 2+ labelers</option></select>
         </div>
         <div class="tr-field">
           <label for="al-limit">Limit</label>
@@ -324,7 +329,7 @@
         <div class="tr-field">
           <label for="al-frames">Filter text</label>
           <input type="text" id="al-frames" name="frames" placeholder="bucket=empty,import=any">
-          <p class="muted small"><code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>import</code> (an import id, or any), <code>source</code> (queue, all; default all here), and any key above (<code>scene</code> day, night, ir; <code>camera</code>; <code>label</code>; <code>status</code> unreviewed, reviewed, skipped, any; <code>auto</code> review, accept, nothing, none, overlaps; <code>again=1</code>; <code>limit</code>). A key given here wins over its field.</p>
+          <p class="muted small"><code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>import</code> (an import id, or any), <code>source</code> (queue, all; default all here), and any key above (<code>scene</code> day, night, ir; <code>camera</code>; <code>label</code>; <code>status</code> unreviewed, reviewed, skipped, any; <code>auto</code> review, accept, nothing, none, overlaps, both (a pending box found by 2+ labelers); <code>again=1</code>; <code>limit</code>). A key given here wins over its field.</p>
         </div>
       </details>
     </fieldset>
