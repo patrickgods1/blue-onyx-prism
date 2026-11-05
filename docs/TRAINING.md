@@ -1281,21 +1281,29 @@ checked stay out). A frame the same labelers already looked at is skipped unless
 run or written, and no GPU, download or login is needed) shows how many frames match, how many a run
 takes after `limit`, how many are skipped because the labelers already ran, the split by status, and a
 rough time (SAM 3: 2 s + 0.2 s per phrase per frame; MM-Grounding-DINO 0.55 s; both before the VLM
-check, on a GTX 1070 Ti). It warns when reviewed frames are in scope and when `limit` is below the
-match count (the preset never changes `limit` for you).
+check, on a GTX 1070 Ti). It warns when reviewed frames are in scope, adds with the VLM off that a box
+only one labeler found cannot reopen them, and warns when `limit` is below the match count (the preset
+never changes `limit` for you).
 
 **What happens to reviewed frames.** A rerun never changes a box you decided: accepted and rejected
 boxes stay as they are. On a reviewed frame the run adds a proposal only when it is a confident new
-object: the labelers agree, or one of them scored it 0.5 or more, no check (Qwen3-VL, SigLIP 2)
-objected, and it does not sit on a box you decided as another class or on one you rejected. A frame that
-gains such a box goes back to **unreviewed** with a note ("re-label by sam3: ...") and **leaves the
-exports until you save it again**; exports you already made are unaffected. Frames you skipped and
-frames you confirmed empty never gain a box; the run only records its scores. These rules also apply to a
-frame an earlier re-label sent back.
+object: the labelers agree, or one of them scored it 0.5 or more and Qwen3-VL said yes to it; no check
+(Qwen3-VL, SigLIP 2) objected; and it does not sit on a box you decided as another class or on one you
+rejected. A check that did not run counts for nothing: a box only one labeler found cannot reopen a frame
+at any score when the VLM is off, when *Skip boxes scoring below* skipped it, or when its class is one the
+VLM is never asked about (anything but a person, vehicle or animal class). The report counts these as
+`filtered_unchecked`, which also takes in such boxes that only repeat one already on the frame. In a real
+run with both checks off, 22 of 41 reviewed frames reopened, mostly on false boxes; with them on, 0 of 16.
+A frame that gains a box goes back to **unreviewed** with a note ("re-label by sam3: ...") and **leaves
+the exports until you save it again**; exports you already made are unaffected. Frames you skipped and
+frames you confirmed empty, reviewed or not, never gain a box; the run only records its scores and its
+marker. These rules also apply to a frame an earlier re-label sent back.
 
 **Undo.** *Restore reopened frames...* on the Review page (`POST /v1/review/restore-reopened`, with a
 dry-run count first) puts back to reviewed every frame the run reopened that has no pending box left,
 for example after you rejected the proposals (*Reject auto boxes below...*). Frames with a pending box are left alone.
+A frame you had checked for overlaps gets that check back, so *Reject stacked duplicates* still leaves your
+kept boxes alone, unless *Accept this spot* took a new box on it: that box was not part of your check.
 
 **Votes and overlap suggestions.** When a rerun's labeler finds a box that is already there, its score is
 added to that box's list of labelers (an extra witness for [Overlap suggestions](#overlap-suggestions));
@@ -1411,8 +1419,8 @@ object (the same class, or two of car, truck, bus, van, so a car on a labelled t
 
 Boxes are pending `source: auto`, triaged `review`; existing boxes get no evidence and no class
 suggestion. A frame that gains a box goes back to `unreviewed` with a `disagreement` note
-(`re-label by <models>: N new boxes`, first in the queue), loses `overlaps_checked` and is queued for
-review. **It leaves exports until you save it again**, because exports take reviewed frames only; the
+(`re-label by <models>: N new boxes`, first in the queue), loses `overlaps_checked` until a restore
+gives it back (`checked_before_reopen`) and is queued for review. **It leaves exports until you save it again**, because exports take reviewed frames only; the
 summary says so. Every other frame is not written at all.
 
 No `auto_run` marker is written: it is one slot, and several models run in turn. A rerun detects again,

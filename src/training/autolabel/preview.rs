@@ -277,6 +277,13 @@ impl AutolabelPreview {
                 "{reviewed} reviewed frame{} in this run may reopen: {REOPENED_WARNING}.",
                 plural(reviewed)
             ));
+            if r.vlm.is_none() && r.with_model.is_none() {
+                w.push(
+                    "The VLM check is off, so a box only one labeler found cannot reopen a \
+                     reviewed frame, whatever its score: only boxes the labelers agree on can."
+                        .to_string(),
+                );
+            }
         }
         if self.taken == 0 && self.skipped_done > 0 {
             w.push(format!(
@@ -434,6 +441,26 @@ mod tests {
         let p = preview(&request(), &c);
         assert!(p.warnings[0].contains("Raise Limit to 20000"), "{p:?}");
         assert!(p.warnings[0].contains("the most one run can"), "{p:?}");
+    }
+
+    #[test]
+    fn reviewed_frames_with_the_vlm_off_warn_that_lone_finds_cannot_reopen() {
+        let c = Counts {
+            matched: reviewed(5),
+            taken: reviewed(5),
+            ..Counts::default()
+        };
+        let says = |p: &AutolabelPreview| p.warnings.iter().any(|w| w.contains("only one labeler"));
+        let mut r = request();
+        assert!(!says(&preview(&r, &c)), "the VLM is on");
+        r.vlm = None;
+        assert!(says(&preview(&r, &c)));
+        let u = Counts {
+            matched: unreviewed(5),
+            taken: unreviewed(5),
+            ..Counts::default()
+        };
+        assert!(!says(&preview(&r, &u)), "no reviewed frame in scope");
     }
 
     #[test]

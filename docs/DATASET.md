@@ -359,6 +359,9 @@ folder; the collector and the Dataset page keep `collect.dir`.
   or overlapping boxes still on it, so they looked and kept them (two real nested cars). `auto=overlaps`
   passes the frame over and `POST /v1/review/reject-stacked` leaves it alone. Kept by saves; cleared when
   a merge adds a box.
+- **`checked_before_reopen`** (written only when true): a rerun's new box took `overlaps_checked` off this
+  frame. `POST /v1/review/restore-reopened` gives it back; a restore, a save or an accept-spot of a new box
+  clears this field.
 - **`overlap_suggestions`** (written only when not empty, at most 64): what the overlap check
   (`train overlaps`, [Overlap suggestions](TRAINING.md#overlap-suggestions)) suggests for overlapping
   pairs. Suggestions only: they change no box, status or `reviewed_at`.

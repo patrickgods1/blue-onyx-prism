@@ -2322,16 +2322,79 @@ fn sam3_over(cfg: &Config, filter: &str) -> AutolabelJob {
 }
 
 /// The boxes every frame gets in the reviewed-frame runs: a confident second sight of the drawn
-/// car, a confident person, a weak dog.
+/// car, a confident person (both with a VLM yes, which the fake's script can give whatever the
+/// request says), a weak dog.
 fn sam3_boxes() -> serde_json::Value {
+    let yes = serde_json::json!({"answer": "person", "expected": "person", "ok": true});
     serde_json::json!([
         {"label": "car", "bbox": [1, 1, 30, 20], "score": 0.35, "agree": false,
-         "sources": {"sam3": 0.7}},
+         "sources": {"sam3": 0.7}, "vlm": yes},
         {"label": "person", "bbox": [40, 5, 60, 40], "score": 0.45, "agree": false,
-         "sources": {"sam3": 0.9}},
+         "sources": {"sam3": 0.9}, "vlm": yes},
         {"label": "dog", "bbox": [2, 25, 30, 46], "score": 0.1, "agree": false,
          "sources": {"sam3": 0.2}}
     ])
+}
+
+#[test]
+fn a_lone_box_with_no_vlm_answer_is_counted_and_reopens_nothing() {
+    let t = tmp("unchecked");
+    let rels = frames(&t.0, 1, false);
+    let dir = t.0.join("dataset");
+    labels::write(
+        &Frame::resolve(&dir, &rels[0]).unwrap().labels,
+        &reviewed_car(vec![]),
+    )
+    .unwrap();
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "status=any,limit=20");
+    let fake = LabelFake {
+        boxes: Some(serde_json::json!([
+            {"label": "person", "bbox": [40, 5, 60, 40], "score": 0.45, "agree": false,
+             "sources": {"sam3": 0.9}},
+            {"label": "dog", "bbox": [2, 25, 30, 46], "score": 0.45, "agree": false,
+             "sources": {"sam3": 0.9}, "vlm_skipped": "score"}
+        ])),
+        ..LabelFake::default()
+    };
+    let out = run_job(&job, &fake).unwrap();
+    let rep = &out.result;
+    assert_eq!(rep["filtered_unchecked"], 2, "{rep}");
+    assert_eq!((&rep["added"], &rep["reopened"]), (&0.into(), &0.into()));
+    assert!(
+        out.summary
+            .contains("2 found by one labeler with no VLM yes"),
+        "{}",
+        out.summary
+    );
+    let f = labels_of(&dir, &rels[0]);
+    assert_eq!((f.status, f.boxes.len()), (Status::Reviewed, 1));
+    assert!(f.auto_run.is_some());
+}
+
+#[test]
+fn a_confirmed_empty_frame_nobody_reviewed_takes_only_the_marker() {
+    let t = tmp("empty-unreviewed");
+    let rels = frames(&t.0, 1, false);
+    let dir = t.0.join("dataset");
+    let path = Frame::resolve(&dir, &rels[0]).unwrap().labels;
+    let empty = LabelFile {
+        empty_confirmed: true,
+        ..LabelFile::default()
+    };
+    labels::write(&path, &empty).unwrap();
+    let cfg = config(&t.0);
+    let job = sam3_over(&cfg, "limit=20");
+    let fake = LabelFake {
+        boxes: Some(sam3_boxes()),
+        ..LabelFake::default()
+    };
+    let rep = run_job(&job, &fake).unwrap().result;
+    assert_eq!(rep["added"], 0, "{rep}");
+    assert_eq!(rep["filtered_closed"], 3, "{rep}");
+    let f = labels_of(&dir, &rels[0]);
+    assert!(f.boxes.is_empty(), "{f:?}");
+    assert!(f.auto_run.is_some(), "{f:?}");
 }
 
 #[test]

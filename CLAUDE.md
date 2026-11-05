@@ -250,22 +250,26 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   on Unix. `plan_autolabel` fails fast with it when SAM 3 is missing, there is no token and the parts are not on disk.
 - Labelers reruns (`training/autolabel/triage.rs`): `triage::apply_labelers(f, boxes, name)` decides under the write lock by the
   frame's status at write time: unreviewed = `apply` + votes; reviewed, or sent back by a re-label (unreviewed with `disagreement` and
-  `reviewed_at`) = votes, the confidence gate (`gate_drop`), then `apply_missing`; reviewed + `empty_confirmed`, and skipped = votes
-  only (a skipped frame must not come back and reach exports by a bulk accept). The gate keeps a proposal only if the labelers agree
-  or a source score is >= `MISSING_THRESHOLD` 0.5 (the fused score halves single-labeler boxes), no VLM / SigLIP objection, and it is
-  on no decided box of another label nor a reject; survivors get a `why` and triage `review`, and a frame that gains one goes back to
+  `reviewed_at`) = votes, the confidence gate (`gate_drop`), then `apply_missing`; `empty_confirmed` on any status, and skipped = votes
+  and the marker only (a save refuses a box on a confirmed-empty frame; a skipped frame must not come back and reach exports by a bulk
+  accept). The gate keeps a proposal only if the labelers agree or a source score is >= `MISSING_THRESHOLD` 0.5 (the fused score halves
+  single-labeler boxes), no VLM / SigLIP objection, it is on no decided box of another label nor a reject, and a box one labeler found
+  has a VLM yes (`vlm.ok`; a check that never ran is no evidence, so `--vlm off`, `vlm_skipped` and a class the VLM is never asked
+  about, `Category::Object`, count as `filtered_unchecked`: with the checks off a real run reopened 22 of 41 reviewed frames, mostly on
+  false boxes, with them on 0 of 16); survivors get a `why` and triage `review`, and a frame that gains one goes back to
   unreviewed with a `disagreement` note naming `sam3` and loses `bulk_accepted`; `reopened` and the filtered counts are in the summary
   with `REOPENED_WARNING`. Votes: the new labeler's score joins a same-object box's `auto.labelers` at IoU >= `STACK_IOU` 0.7 (best
   match, `or_insert`, `labels::MAX_LABELERS`) so it can witness overlap suggestions; nothing else on the box changes, a vote-only
   write is `queue: false`. `POST /v1/review/restore-reopened` (`bulk::bulk_restore_reopened`; filters, `dry_run`, `limit` 500) puts
   unreviewed frames with `disagreement`, a `reviewed_at` and nothing pending back to reviewed (the undo; reopened frames stay out of
-  exports until saved or restored, exports already made are unaffected). A failed labelers run with a readable `proposals.jsonl`
+  exports until saved or restored, exports already made are unaffected). `overlaps_checked` comes back with it: `apply_missing` moves
+  a true one to `checked_before_reopen`, which a restore gives back and a spot accept of a new box or a save ends. A failed labelers run with a readable `proposals.jsonl`
   writes its finished frames like a Cancel, then still fails; a rerun resumes through the marker. Choosing frames: the Training
   card's *Which frames* presets (unreviewed, reviewed, each with `auto=overlaps`, all, custom; they cooperate with `#al-preset`),
   `autolabel/preview.rs` (`POST /training/autolabel/preview`, `train autolabel --dry-run`; through `server::blocking`, no GPU /
   download / login gate; shares `AutolabelJob::preview`'s walk, which does not stop at `limit`: matched, taken, skipped by marker, split
   by status, a rough time from 2 s + 0.2 s x phrases for SAM 3 or 0.55 s for gdino before the VLM, warnings that reviewed frames may
-  reopen or that `limit` makes the run partial); `select` sets `wanted` like the Review page. *Suggest overlaps...* has *Ask again*
+  reopen, that with the VLM off lone finds cannot, or that `limit` makes the run partial); `select` sets `wanted` like the Review page. *Suggest overlaps...* has *Ask again*
   (`again`): answered pairs are otherwise kept, so a rerun's new votes reach only unchecked frames and unanswered pairs.
 - Disk trap: `cargo clean` wipes data roots under `target/` (here `target/release` holds the OpenVINO / ORT libs, the training env,
   weights such as SAM 3's 3.4 GB, the config; a dataset or training folder placed there too). Do not run it without moving them first.

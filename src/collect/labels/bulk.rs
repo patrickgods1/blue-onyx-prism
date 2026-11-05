@@ -418,8 +418,10 @@ pub fn restorable(f: &LabelFile) -> bool {
 }
 
 /// Put a [`restorable`] frame back to reviewed, its boxes and `reviewed_at` as they are, and clear
-/// the note (and a spot edit's mark, as a save does). `overlaps_checked` stays off: the frame's
-/// boxes are not the ones the reviewer checked. Returns 1 when it did, else 0.
+/// the note (and a spot edit's mark, as a save does). [`LabelFile::overlaps_checked`] comes back
+/// from [`LabelFile::checked_before_reopen`]: nothing is pending and no new box was accepted (a spot
+/// accept ends the mark, a save ends the reopening), so the frame's live boxes are the ones the
+/// reviewer checked. Returns 1 when it did, else 0.
 pub fn restore_reopened(f: &mut LabelFile) -> usize {
     if !restorable(f) {
         return 0;
@@ -427,6 +429,7 @@ pub fn restore_reopened(f: &mut LabelFile) -> usize {
     f.status = Status::Reviewed;
     f.disagreement = None;
     f.repeat_spot = false;
+    f.overlaps_checked |= std::mem::take(&mut f.checked_before_reopen);
     1
 }
 
@@ -1557,6 +1560,36 @@ mod tests {
             .collect();
         assert_eq!(now, settled);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_frame_is_checked_again_only_if_it_was_before() {
+        let root = std::env::temp_dir().join(format!("bop-restore-{}", uuid::Uuid::new_v4()));
+        let dir = root.as_path();
+        let (a, near) = ([0.0, 0.0, 40.0, 40.0], [0.0, 0.0, 40.0, 38.0]);
+        let cars = || vec![car_at(a, 0.9), car_at(near, 0.4)];
+        let kept = reopened(dir, "a", cars());
+        let open = reopened(dir, "b", cars());
+        let frame = Frame::resolve(dir, &kept).unwrap();
+        let mut l = labels_of(dir, &kept);
+        l.checked_before_reopen = true;
+        super::super::write(&frame.labels, &l).unwrap();
+
+        let all = Filters::default();
+        let o = bulk_restore_reopened(dir, &all, 500, false, &|_| true);
+        assert_eq!(o.done_count, 2);
+        let l = labels_of(dir, &kept);
+        assert!(l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
+        let l = labels_of(dir, &open);
+        assert!(!l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
+
+        let cl = classes();
+        let w = wanted(&cl, &[]);
+        let o = bulk_reject_stacked(dir, &all, &w, 100, false, &|_| true);
+        assert_eq!(o.outcome.done_count, 1, "only the frame nobody checked");
+        assert_eq!(labels_of(dir, &kept).boxes[1].state, BoxState::Accepted);
+        assert_eq!(labels_of(dir, &open).boxes[1].state, BoxState::Rejected);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

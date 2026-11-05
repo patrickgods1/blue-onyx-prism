@@ -412,13 +412,14 @@ pub fn refusal_message(refusal: Refusal, gated: &Gated, token: Option<TokenSourc
     match (refusal, token) {
         (Refusal::NeedsLogin, None) => format!(
             "Hugging Face asks for a login for this repo and no token is set up. Accept the {} \
-             at {}, then sign in with `{CLI_NAME} hf-login` (a read-only token is enough) and try \
-             again",
+             at {}, then sign in with the hf-login command the Training page's SAM 3 panel shows \
+             with its full path (a read-only token is enough) and try again",
             gated.license, gated.repo_url
         ),
         (Refusal::NeedsLogin, Some(s)) => format!(
             "Hugging Face refused the token from {} (expired, revoked or mistyped). Make a new \
-             read-only token at {TOKENS_URL}, sign in with `{CLI_NAME} hf-login` and try again",
+             read-only token at {TOKENS_URL}, sign in with the hf-login command the Training \
+             page's SAM 3 panel shows with its full path and try again",
             s.label()
         ),
         (Refusal::NeedsAccess, source) => format!(
@@ -990,6 +991,9 @@ mod tests {
         assert!(none.contains("SAM License"), "{none}");
         let bad = refusal_message(Refusal::NeedsLogin, g, Some(TokenSource::Env));
         assert!(bad.contains("HF_TOKEN") && bad.contains("refused"), "{bad}");
+        for text in [&none, &bad] {
+            assert!(!text.contains(&format!("{CLI_NAME} hf-login")), "{text}");
+        }
         let wait = refusal_message(Refusal::NeedsAccess, g, Some(TokenSource::Saved));
         assert!(
             wait.contains(g.repo_url) && wait.contains("no access"),

@@ -229,6 +229,8 @@ pub struct AutolabelReport {
     pub filtered_other_object: usize,
     /// Reviewed frames: proposals left out on a rejected box no reviewer judged (which stays).
     pub filtered_on_reject: usize,
+    /// Reviewed frames: proposals only one labeler found and the VLM did not say yes to.
+    pub filtered_unchecked: usize,
     /// Proposals left out on skipped and confirmed-empty frames, which take no box.
     pub filtered_closed: usize,
 }
@@ -247,6 +249,7 @@ impl AutolabelReport {
         self.filtered_objected += a.gate.objected;
         self.filtered_other_object += a.gate.other_object;
         self.filtered_on_reject += a.gate.on_reject;
+        self.filtered_unchecked += a.gate.unchecked;
         self.filtered_closed += a.closed;
     }
 
@@ -258,16 +261,19 @@ impl AutolabelReport {
             + self.filtered_objected
             + self.filtered_other_object
             + self.filtered_on_reject
+            + self.filtered_unchecked
             + self.filtered_closed;
         if filtered > 0 {
             s.push_str(&format!(
                 "; {filtered} proposals left out to protect reviewed frames ({} not confident, {} \
                  objected to by the VLM or SigLIP, {} on a decided box of another class, {} on a \
-                 rejected box, {} on skipped or confirmed-empty frames)",
+                 rejected box, {} found by one labeler with no VLM yes, {} on skipped or \
+                 confirmed-empty frames)",
                 self.filtered_low_score,
                 self.filtered_objected,
                 self.filtered_other_object,
                 self.filtered_on_reject,
+                self.filtered_unchecked,
                 self.filtered_closed
             ));
         }
