@@ -11,6 +11,7 @@
 //! - [`actions`]: the Download / Remove / Add-to-config / Export actions and "Add a model by
 //!   path" (mutate the disk, the download queue or the config).
 //! - [`commands`]: the `fetch` and `list-resources` subcommands.
+//! - [`hf_token`]: the Hugging Face token of gated downloads, `hf-login` / `hf-logout`.
 //! - [`extract`]: whitelist-only archive extraction shared by the manager and `setup-*`.
 //! - [`export`]: the user-triggered YOLO26 export (pinned uv + Python env + Ultralytics'
 //!   exporter); the only module that executes downloaded code.
@@ -21,6 +22,7 @@ pub mod catalog;
 pub mod commands;
 pub mod export;
 pub mod extract;
+pub mod hf_token;
 pub mod manager;
 pub mod provision;
 pub mod resolve;

@@ -3,16 +3,20 @@
 //! Qwen3-VL, SigLIP 2, each a Hugging Face repo at a commit) and the pinned open footage
 //! ([`IMPORT_DATASETS`]: a small MEVA sample). Pure data; downloaded only when the user starts an
 //! import or an auto-label run (never by `auto_download`). RF-DETR L, the closed-set labeler, is the
-//! training base pin `train-base:rfdetr-large` ([`TRAIN_BASE_WEIGHTS`]).
+//! training base pin `train-base:rfdetr-large` ([`TRAIN_BASE_WEIGHTS`]). [`GATED`] lists the pins
+//! whose repo needs a Hugging Face login (SAM 3).
 //!
 //! Where the hashes come from: the Hugging Face tree API's LFS `oid`s (SHA-256) of the
 //! `*.safetensors` files and the downloaded, hashed small files (configs, tokenizers) at the pinned
-//! commits; the MEVA clips were downloaded from the public AWS bucket and hashed.
+//! commits; the MEVA clips were downloaded from the public AWS bucket and hashed. SAM 3's files were
+//! hashed from a copy downloaded with an approved token; its sizes and git blob ids match the tree
+//! API at the commit.
 //!
 //! Licences (model cards and dataset page, checked at the pinned commits):
 //! - `openmmlab-community/mm_grounding_dino_*`: Apache-2.0 (MM-Grounding-DINO, OpenMMLab).
 //! - `Qwen/Qwen3-VL-*-Instruct`: Apache-2.0.
 //! - `google/siglip2-base-patch16-224`: Apache-2.0.
+//! - `facebook/sam3`: SAM License (Meta), accepted per account on the repo page, so it is gated.
 //! - MEVA (Kitware / IARPA DIVA, mevadata.org): CC BY 4.0 ("All MEVA data is available for use
 //!   under a CC BY-4.0 license").
 
@@ -24,6 +28,37 @@ pub const AUTOLABEL_PREFIX: &str = "autolabel:";
 pub const IMPORT_DATA_PREFIX: &str = "import-data:";
 /// Install directory of the pinned footage under the download root (`<dest>/<key>`).
 pub const IMPORT_DATA_DEST: &str = "train-data";
+/// Key of the SAM 3 checkpoint ([`autolabel_weights`], its folder under `tools/train-weights`).
+pub const SAM3_KEY: &str = "sam3";
+/// Resource id of the SAM 3 checkpoint.
+pub const SAM3_ID: &str = "autolabel:sam3";
+/// Licence of the SAM 3 checkpoint.
+pub const SAM_LICENSE: &str = "SAM License";
+
+/// A pin whose repo refuses anonymous downloads: the account has to accept the licence on the repo
+/// page, then the download sends a token ([`crate::resources::hf_token`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gated {
+    /// Resource id.
+    pub id: &'static str,
+    /// Page where the account asks for access.
+    pub repo_url: &'static str,
+    /// Licence accepted there.
+    pub license: &'static str,
+}
+
+/// The gated pins. Kept beside [`AUTOLABEL_WEIGHTS`] rather than on [`Resource`], so only the few
+/// places that care look here.
+pub static GATED: &[Gated] = &[Gated {
+    id: SAM3_ID,
+    repo_url: "https://huggingface.co/facebook/sam3",
+    license: SAM_LICENSE,
+}];
+
+/// The [`GATED`] entry of resource `id`.
+pub fn gated(id: &str) -> Option<&'static Gated> {
+    GATED.iter().find(|g| g.id == id)
+}
 
 /// A file of a Hugging Face repo at a commit.
 macro_rules! hf_part {
@@ -46,7 +81,8 @@ macro_rules! hf_part {
     };
 }
 
-/// A labeler checkpoint: every file of the repo at the commit except `README.md`.
+/// A labeler checkpoint: every file of the repo at the commit except `README.md` (and files the
+/// labeler has no use for, such as `sam3.pt`, the same weights in another format).
 macro_rules! labeler {
     ($key:literal, $repo:literal, $rev:literal, $title:literal, $license:expr, $parts:expr) => {
         Resource {
@@ -558,6 +594,85 @@ pub static AUTOLABEL_WEIGHTS: &[Resource] = &[
             ),
         ]
     ),
+    labeler!(
+        "sam3",
+        "facebook/sam3",
+        "3c879f39826c281e95690f02c7821c4de09afae7",
+        "SAM 3",
+        SAM_LICENSE,
+        &[
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                ".gitattributes",
+                "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361",
+                1519
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "LICENSE",
+                "bec48f70bd37bf8280a9d1ebf01642d26086f6122ba735baa08fe03c5a6e7448",
+                7352
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "config.json",
+                "4616385e4b21f2e5e22c875b65679185cbccfa95de42542b9166f7dc3d57160f",
+                25843
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "merges.txt",
+                "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a",
+                524619
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "model.safetensors",
+                "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a",
+                3439938512
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "processor_config.json",
+                "6420cf2671fa9309ea95bc0144a8b9861666d1c5f43c8db09e410dacda974fce",
+                1712
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "special_tokens_map.json",
+                "2cdb3b8331a60c92fc1e55a13e9fd61fd2293c5a51275fdcccd62b780052530e",
+                588
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "tokenizer.json",
+                "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35",
+                3642073
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "tokenizer_config.json",
+                "39670ad98457fe8f14ca59f6bb74591e9fc850974380a63993e5b8ffc865baa2",
+                799
+            ),
+            hf_part!(
+                "facebook/sam3",
+                "3c879f39826c281e95690f02c7821c4de09afae7",
+                "vocab.json",
+                "5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363",
+                862328
+            ),
+        ]
+    ),
 ];
 
 /// A labeler checkpoint by key (`mm-gdino-tiny`, `qwen3-vl-2b`, `siglip2-base`) or id.
@@ -681,7 +796,10 @@ mod autolabel_tests {
             assert!(!install_key(r).contains(':'), "{}", r.id);
         }
         for r in AUTOLABEL_WEIGHTS {
-            assert_eq!(r.license, APACHE, "{}", r.id);
+            match gated(r.id) {
+                Some(g) => assert_eq!(r.license, g.license, "{}", r.id),
+                None => assert_eq!(r.license, APACHE, "{}", r.id),
+            }
             assert!(
                 r.parts.iter().any(|p| p.file_name == "config.json"),
                 "{}",
@@ -712,5 +830,48 @@ mod autolabel_tests {
         assert!(meva.size() < 1_000_000_000);
         // The four the README lists as large downloads are over the gate.
         assert!(autolabel_weights("qwen3-vl-2b").unwrap().is_large());
+    }
+
+    #[test]
+    fn sam3_is_pinned_and_gated() {
+        let r = autolabel_weights(SAM3_KEY).unwrap();
+        assert_eq!(r.id, SAM3_ID);
+        assert_eq!(install_key(r), SAM3_KEY);
+        assert_eq!(r.license, "SAM License");
+        assert_eq!(
+            r.version, "hf-3c879f39826c281e95690f02c7821c4de09afae7",
+            "pinned commit"
+        );
+        // Every file of the repo but these two.
+        assert!(
+            r.parts
+                .iter()
+                .all(|p| p.file_name != "README.md" && p.file_name != "sam3.pt")
+        );
+        assert_eq!(r.parts.len(), 10);
+        let model = r
+            .parts
+            .iter()
+            .find(|p| p.file_name == "model.safetensors")
+            .unwrap();
+        assert_eq!(model.size, 3_439_938_512);
+        assert_eq!(
+            model.sha256,
+            "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a"
+        );
+        assert!(r.is_large());
+        let g = gated(SAM3_ID).unwrap();
+        assert!(g.repo_url.starts_with("https://huggingface.co/"));
+        assert!(r.parts.iter().all(|p| p.url.starts_with(g.repo_url)));
+        assert_eq!(g.license, r.license);
+    }
+
+    #[test]
+    fn gated_entries_name_real_pins_and_only_they_are_gated() {
+        for g in GATED {
+            assert!(autolabel_weights(g.id).is_some(), "{}", g.id);
+        }
+        assert_eq!(gated("autolabel:mm-gdino-tiny"), None);
+        assert_eq!(gated("model:IPcam-general"), None);
     }
 }

@@ -11,6 +11,8 @@
 // Stop now / Continue notice of an early-stop point passed while the training loss still falls.
 // Each run row gets a settings line (device, batch, input size, learning rate and schedule,
 // patience, seed, ...) and the Learning rate field's placeholder follows the ticked family.
+// SAM 3: the three-step access panel of the Auto-label card (GET /v1/autolabel/sam3); its option
+// in the labeler select stays disabled until the checkpoint is installed.
 (function () {
   "use strict";
 
@@ -195,6 +197,101 @@
     [vlm, minOn].forEach(function (e) { if (e) e.addEventListener("change", update); });
     form.querySelectorAll('input[name="mode"]').forEach(function (r) { r.addEventListener("change", update); });
     update();
+  })();
+
+  // SAM 3 is gated: request access, say so (POST .../download, which also adopts a folder already
+  // on disk by hash), then sign in with the command shown. The server decides the state; this
+  // only draws it, and polls while something runs.
+  (function () {
+    var panel = document.getElementById("al-sam3");
+    if (!panel) return;
+    var API = "/v1/autolabel/sam3";
+    var $ = function (id) { return document.getElementById("al-sam3-" + id); };
+    var option = document.getElementById("al-gdino-sam3");
+    var select = document.getElementById("al-gdino");
+    var download = $("download"), retry = $("retry"), remove = $("remove"), progress = $("progress");
+    var msg = $("msg"), command = $("command"), copied = $("copied");
+    var SUMMARY = {
+      not_requested: "needs access", needs_login: "needs a login", token_unreadable: "login unreadable",
+      needs_access: "waiting for access", checking: "checking the files", downloading: "downloading",
+      installed: "installed", failed: "failed"
+    };
+    var LOGIN = ["needs_login", "needs_access", "token_unreadable", "failed"];
+    var timer = null, sizeText = "";
+    var draw = function (s) {
+      panel.hidden = false;
+      var busy = s.state === "checking" || s.state === "downloading";
+      var installed = s.state === "installed";
+      sizeText = s.size_text || sizeText;
+      $("summary").textContent = "(" + (SUMMARY[s.state] || s.state) + ")";
+      $("link").href = s.repo_url;
+      $("license").textContent = s.license;
+      if (option) {
+        option.disabled = !installed;
+        option.textContent = installed ? "SAM 3" : "SAM 3 (gated, needs the download below)";
+        if (!installed && select && select.value === "sam3") select.value = select.options[0].value;
+      }
+      download.textContent = s.parts_on_disk ? "Check the files on disk" : "I have access, download (" + s.size_text + ")";
+      download.hidden = installed;
+      download.disabled = busy;
+      progress.hidden = !busy;
+      if (typeof s.progress === "number") progress.value = s.progress; else progress.removeAttribute("value");
+      $("login").hidden = LOGIN.indexOf(s.state) < 0;
+      command.textContent = s.command;
+      $("note").textContent = s.command_note;
+      msg.textContent = s.message || "";
+      msg.className = "form-msg" + (LOGIN.indexOf(s.state) >= 0 ? " error-text" : "");
+      $("source").hidden = installed;
+      $("source").textContent = s.token_source ? "Token from " + s.token_source + "." : "No token set up.";
+      $("override").hidden = !s.token_env_overrides;
+      $("apple").hidden = !s.apple;
+      remove.hidden = !(installed || s.parts_on_disk);
+      remove.disabled = busy || s.in_use;
+      remove.title = s.in_use ? "An auto-label run may be using it" : "";
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (busy) timer = setTimeout(load, 2000);
+    };
+    var fail = function (text) {
+      msg.textContent = text;
+      msg.className = "form-msg error-text";
+    };
+    function load() {
+      fetch(API, { headers: { Accept: "application/json" } })
+        .then(function (res) { return res.json(); })
+        .then(function (s) { if (s.state) draw(s); })
+        .catch(function () {});
+    }
+    // The answer of a refused action is a state too (409 needs_login, ...), so it is drawn the same.
+    var act = function (path, button) {
+      button.disabled = true;
+      fetch(API + path, { method: "POST", headers: { Accept: "application/json" } })
+        .then(function (res) { return res.json(); })
+        .then(function (s) {
+          button.disabled = false;
+          if (s.state) draw(s); else fail(s.message || "The server gave no answer.");
+        })
+        .catch(function (e) { button.disabled = false; fail(e.message); });
+    };
+    download.addEventListener("click", function () { act("/download", download); });
+    retry.addEventListener("click", function () { act("/download", retry); });
+    remove.addEventListener("click", function () {
+      if (window.confirm("Remove SAM 3 (" + sizeText + ") from this machine?")) act("/remove", remove);
+    });
+    $("copy").addEventListener("click", function () {
+      var said = function (t) { copied.textContent = t; };
+      var byHand = function () {
+        // No clipboard API on plain http from another machine.
+        var range = document.createRange();
+        range.selectNodeContents(command);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        try { said(document.execCommand("copy") ? "copied" : "selected: press Ctrl+C"); } catch (e) { said("selected: press Ctrl+C"); }
+      };
+      if (navigator.clipboard) navigator.clipboard.writeText(command.textContent).then(function () { said("copied"); }, byHand);
+      else byHand();
+    });
+    load();
   })();
 
   // Auto-label classes: the class picker (class-picker.js). The chosen classes post as repeated

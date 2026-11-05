@@ -47,9 +47,20 @@
 //! executed by this module: archives go through the whitelist in [`super::extract`] into a
 //! staging directory that is swapped into place only after every entry passed; model files are
 //! read by the inference runtimes.
+//!
+//! # Gated resources
+//!
+//! A resource in [`super::catalog::GATED`] sends the current token ([`HfAuth`], read again for every
+//! attempt, so a login counts without a restart) to the Hugging Face host and to nothing else:
+//! reqwest strips the header from a redirect to another host, such as the CDN. A 401 or 403 from
+//! that host, or with `X-Error-Code: GatedRepo`, is [`GatedRefused`]: not retried, since only the
+//! user can change it. A 403 from the CDN stays an ordinary failure. Signed CDN URLs carry a
+//! credential, so errors are stripped of their URL (`reqwest::Error::without_url`) and name the
+//! pinned URL instead.
 
-use super::catalog::{ArchiveKind, Layout, Resource, ResourceKind};
+use super::catalog::{ArchiveKind, Gated, Layout, Resource, ResourceKind};
 use super::extract::{self, Target};
+use super::hf_token::{self, HfToken, Refusal, TokenSource};
 use crate::sync::LockExt;
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
@@ -245,11 +256,25 @@ pub(crate) struct SizeMismatch {
     pub offered: String,
 }
 
-/// Retry this error later? Hash and size mismatches and refused URLs are permanent.
+/// A gated repo refused the download (not retried automatically): only a login or the repo's
+/// owner can change that. The text never holds the token.
+#[derive(Debug, thiserror::Error)]
+#[error("{file}: {}", hf_token::refusal_message(*refusal, gated, *token))]
+pub(crate) struct GatedRefused {
+    pub file: String,
+    pub refusal: Refusal,
+    pub gated: &'static Gated,
+    /// Where the token that was sent came from.
+    pub token: Option<TokenSource>,
+}
+
+/// Retry this error later? Hash and size mismatches, refused URLs and a gated repo's refusal are
+/// permanent.
 fn retryable(e: &anyhow::Error) -> bool {
     !(e.downcast_ref::<HashMismatch>().is_some()
         || e.downcast_ref::<SizeMismatch>().is_some()
         || e.downcast_ref::<UrlRefused>().is_some()
+        || e.downcast_ref::<GatedRefused>().is_some()
         || e.chain().any(|c| {
             c.downcast_ref::<reqwest::Error>()
                 .is_some_and(|r| r.is_redirect())
@@ -436,6 +461,33 @@ pub enum Event {
 /// Progress hook: called on every state change (downloads at most every 100 ms).
 pub(crate) type ProgressFn = Arc<dyn Fn(&Status) + Send + Sync>;
 
+/// How gated downloads sign in.
+#[derive(Clone)]
+pub struct HfAuth {
+    /// The only host that gets the token (tests: the loopback fixture).
+    pub host: String,
+    /// The token now; called for every attempt.
+    pub token: Arc<dyn Fn() -> Option<HfToken> + Send + Sync>,
+}
+
+impl std::fmt::Debug for HfAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HfAuth")
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HfAuth {
+    /// [`hf_token::lookup`] under the download root.
+    fn for_root(root: PathBuf) -> Self {
+        Self {
+            host: hf_token::HF_HOST.to_string(),
+            token: Arc::new(move || hf_token::lookup(&root).token().cloned()),
+        }
+    }
+}
+
 /// Manager settings.
 #[derive(Clone)]
 pub struct ManagerOptions {
@@ -451,12 +503,16 @@ pub struct ManagerOptions {
     /// With `retry`: give up after this many attempts of one job (None = retry forever). The
     /// service uses [`SERVICE_MAX_ATTEMPTS`].
     pub max_attempts: Option<u32>,
+    /// Sign-in of gated resources.
+    pub hf: HfAuth,
 }
 
 impl ManagerOptions {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
         Self {
-            root: root.into(),
+            hf: HfAuth::for_root(root.clone()),
+            root,
             retry: false,
             lock_wait: None,
             on_progress: None,

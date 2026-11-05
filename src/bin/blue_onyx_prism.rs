@@ -404,6 +404,8 @@ fn run(cli: Cli) -> Result<()> {
             list_devices(&cli, &model)?;
             return Ok(());
         }
+        Some(Command::HfLogin) => return resources::hf_token::login(&read_config(&cli)?),
+        Some(Command::HfLogout) => return resources::hf_token::logout(&read_config(&cli)?),
         Some(Command::Service { action }) => {
             let code = service_command(action)?;
             if code != 0 {

@@ -214,8 +214,21 @@
     <div class="tr-grid" data-mode="labelers">
       <div class="tr-field">
         <label for="al-gdino">MM-Grounding-DINO</label>
-        <select id="al-gdino" name="gdino"><option value="tiny">tiny (Swin-T, 0.7 GB)</option><option value="base">base (Swin-B, 0.9 GB)</option><option value="large">large (Swin-L, 1.4 GB)</option><option value="off">off</option></select>
+        <select id="al-gdino" name="gdino"><option value="tiny">tiny (Swin-T, 0.7 GB)</option><option value="base">base (Swin-B, 0.9 GB)</option><option value="large">large (Swin-L, 1.4 GB)</option><option value="sam3" id="al-gdino-sam3" disabled>SAM 3 (gated, needs the download below)</option><option value="off">off</option></select>
         <p class="muted small">Open vocabulary: the class list plus <code>training.synonyms</code>.</p>
+        <details class="tr-more" id="al-sam3" hidden>
+          <summary>SAM 3 <span class="muted small" id="al-sam3-summary"></span></summary>
+          <ol class="small">
+            <li>Request access on <a id="al-sam3-link" href="https://huggingface.co/facebook/sam3" target="_blank" rel="noopener">the SAM 3 page</a> (<span id="al-sam3-license">SAM License</span>). Meta approves each account.</li>
+            <li><button type="button" class="small" id="al-sam3-download">I have access, download</button> <progress id="al-sam3-progress" max="100" hidden></progress></li>
+            <li id="al-sam3-login" hidden>Sign in once, in a terminal: <code id="al-sam3-command"></code> <button type="button" class="small" id="al-sam3-copy">Copy</button> <span class="muted" id="al-sam3-copied" role="status"></span><br><span class="muted" id="al-sam3-note"></span><br><button type="button" class="small" id="al-sam3-retry">Try again</button></li>
+          </ol>
+          <p class="form-msg" id="al-sam3-msg" role="status"></p>
+          <p class="muted small" id="al-sam3-source" hidden></p>
+          <ul class="warn-list small" id="al-sam3-override" hidden><li>HF_TOKEN is set for this service and wins over the login on disk, so signing in again changes nothing until it is unset.</li></ul>
+          <p class="muted small" id="al-sam3-apple" hidden>Not measured on Apple GPUs.</p>
+          <p><button type="button" class="small" id="al-sam3-remove" hidden>Remove SAM 3</button></p>
+        </details>
       </div>
       <div class="tr-field">
         <label for="al-vlm">VLM check</label>

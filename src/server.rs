@@ -34,6 +34,7 @@ mod pages;
 mod pick;
 mod resources;
 mod review;
+mod sam3_access;
 mod status;
 #[cfg(test)]
 mod test_util;
@@ -292,6 +293,9 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             "/v1/autolabel/models",
             get(training_tasks::autolabel_models),
         ),
+        ("/v1/autolabel/sam3", get(sam3_access::status)),
+        ("/v1/autolabel/sam3/download", post(sam3_access::download)),
+        ("/v1/autolabel/sam3/remove", post(sam3_access::remove)),
         ("/logs", get(logs_page)),
         ("/logs.json", get(logs_json)),
         ("/benchmark", get(benchmark::page)),
@@ -1102,6 +1106,9 @@ mod tests {
             "/v1/training/import/preview",
             "/training/autolabel",
             "/v1/autolabel/models",
+            "/v1/autolabel/sam3",
+            "/v1/autolabel/sam3/download",
+            "/v1/autolabel/sam3/remove",
             "/logs",
             "/logs.json",
             "/benchmark",

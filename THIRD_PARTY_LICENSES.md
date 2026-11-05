@@ -285,6 +285,8 @@ check it with `cargo deny check licenses`.
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | reqwest | 0.13.1 | MIT OR Apache-2.0 | https://github.com/seanmonstar/reqwest |
 | ring | 0.17.14 | Apache-2.0 AND ISC | https://github.com/briansmith/ring |
+| rpassword | 7.5.4 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
+| rtoolbox | 0.0.6 | Apache-2.0 | https://github.com/conradkleinespel/rtoolbox |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | https://github.com/rust-lang/rustc-hash |
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix |
 | rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT | https://github.com/rustls/rustls |

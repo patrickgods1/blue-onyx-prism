@@ -132,6 +132,13 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceCommand,
     },
+    /// Sign in to Hugging Face for gated downloads (SAM 3): asks for a token without echoing it
+    /// (or reads it from stdin when piped), checks it, saves it under `<data root>/tools/hf` and
+    /// says whether the account has SAM 3 access. A read-only token is enough. `--config` goes
+    /// before the subcommand; run it as the service's account.
+    HfLogin,
+    /// Delete the token saved by `hf-login`. `HF_TOKEN` and the `hf` CLI's own login stay.
+    HfLogout,
 }
 
 /// `blue-onyx-prism service ...`.
@@ -486,7 +493,9 @@ impl Cli {
             | Command::ListResources { .. }
             | Command::Benchmark(_)
             | Command::Train(_)
-            | Command::Service { .. } => cmd,
+            | Command::Service { .. }
+            | Command::HfLogin
+            | Command::HfLogout => cmd,
             Command::ListDevices { model } => Command::ListDevices {
                 model: model.iter().map(|p| absolutize(p, base)).collect(),
             },
@@ -980,6 +989,20 @@ pub fn init_logging_opts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--config` goes before the subcommand, and a token has no way in through argv (`Cmd`
+    /// logs argv, shells keep history).
+    #[test]
+    fn hf_login_takes_no_token_and_config_goes_first() {
+        let cli = Cli::try_parse_from(["bop", "--config", "c.json", "hf-login"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::HfLogin)));
+        assert_eq!(cli.config.as_deref(), Some(Path::new("c.json")));
+        let cli = Cli::try_parse_from(["bop", "--config", "c.json", "hf-logout"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::HfLogout)));
+        assert!(Cli::try_parse_from(["bop", "hf-login", "--config", "c.json"]).is_err());
+        assert!(Cli::try_parse_from(["bop", "hf-login", "--token", "x"]).is_err());
+        assert!(Cli::try_parse_from(["bop", "hf-login", "x"]).is_err());
+    }
 
     #[test]
     fn family_values() {
