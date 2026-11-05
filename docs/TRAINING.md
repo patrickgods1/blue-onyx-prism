@@ -1210,6 +1210,103 @@ safetensors, the small files downloaded and hashed) and downloaded by the downlo
 On Apple silicon everything runs on MPS (float16 for Qwen3-VL); `PYTORCH_ENABLE_MPS_FALLBACK=1` covers
 missing ops.
 
+### SAM 3 as the open-vocabulary labeler
+
+SAM 3 (`facebook/sam3`) can take MM-Grounding-DINO's seat (step 1): `train autolabel --sam3`, or *SAM 3*
+in the Auto-label card's open-vocabulary select. It is **opt-in**: the default stays MM-Grounding-DINO,
+and the full comparison of the two has not been run, so nothing here says SAM 3 is better. Steps 2 to 5
+are unchanged, with one exception: **a SAM 3 box is never triaged `accept`** (the 0.6 rule was tuned for
+MM-Grounding-DINO + RF-DETR), so *Accept auto-labeled frames* never takes a frame on SAM 3's word. Its
+score threshold is 0.3 (`sam3_threshold`). It cannot be combined with *Label with a model*.
+
+**Cost.** About 5 s per frame on a GTX 1070 Ti with 22 prompt phrases (about 2 s plus 0.2 s per phrase),
+against 0.55 s for MM-Grounding-DINO tiny. It was not measured on Apple GPUs. *Preview* (below) gives a
+rough time before you start.
+
+**Licence.** The SAM License allows commercial use and modification; redistribution must carry the licence,
+and it bars military and ITAR uses. The app does not ship the weights: it downloads them (3.4 GB, pinned
+by commit and SHA-256) after you accept the licence on Hugging Face.
+
+**Getting the weights.** The repository is gated, so the download needs a Hugging Face account that has
+been approved:
+
+1. Open <https://huggingface.co/facebook/sam3> (the Training page links it) and request access. Approval
+   can take a while.
+2. On the Training page click **I have access, download**. This is also your consent to the 3.4 GB. If
+   the files are already in the weights folder (a copy you made by hand), they are checked by hash and
+   used with no login and no network.
+3. If the page asks for a login, run the command it shows, from the account the service runs as (below).
+   It asks for a Hugging Face token without echoing it and checks it; a **read-only** token is enough
+   (make one at <https://huggingface.co/settings/tokens>). A fine-grained token also needs read access to
+   public gated repos. Click **Try again**.
+
+What a refusal means:
+
+| The page says | Cause | What to do |
+|---|---|---|
+| needs login | No token found, or Hugging Face refused it (expired, revoked, mistyped) | Run the shown command with a new token |
+| token unreadable | A token file exists but this process cannot read it (often the service account) | Run the command as the service's account |
+| needs access | The token is valid but the account is not approved for `facebook/sam3` yet, or a fine-grained token lacks the gated-repos permission | Request access, wait for approval, then Try again |
+
+A refusal is final for that attempt: the app does not retry a 401 or 403 from Hugging Face. The token is
+never shown, logged or passed to Python. It is looked up as `HF_TOKEN`, then the token saved by
+`hf-login` (`<data root>/tools/hf/token`), then the `hf` CLI's own file; the page says which one is in
+use and warns when `HF_TOKEN` hides a saved login. `blue-onyx-prism hf-logout` deletes the saved token.
+
+**Service accounts.** `hf auth login` alone does not reach a service: the `hf` tool exists only after the
+training environment is built, and a service account cannot read your profile's login file. Run the
+app's own `hf-login` as the account that runs the service, with the service's config:
+
+- Windows, MSI install (service runs as LocalService): an elevated PowerShell (Run as administrator) and
+  the command the page shows, which names the installed `blue-onyx-prism.exe` by full path and passes
+  `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json` (the page prints the exact
+  path) before `hf-login`.
+- Linux and macOS: `sudo -u <service account> /path/to/blue-onyx-prism --config <config> hf-login`.
+- Docker: `docker exec -it <container> blue-onyx-prism hf-login`, or start the container with
+  `HF_TOKEN` set.
+
+**Remove** (the panel's button) deletes the whole SAM 3 weights folder and is refused while a queued or
+running auto-label uses it.
+
+### Rerunning labeling on part of the dataset
+
+The Training card's **Which frames** select picks the frames: *Unreviewed*, *Reviewed*, *Reviewed with
+overlaps or duplicates*, *Unreviewed with overlaps or duplicates*, *All*, or *Custom* (the existing
+fields). On the command line the same is `--frames "status=reviewed,auto=overlaps"` (`auto=overlaps`
+selects frames with overlapping boxes you have not yet checked; frames whose overlaps a reviewer already
+checked stay out). A frame the same labelers already looked at is skipped unless the filter has `again=1`
+(Review page: *Label again*).
+
+**Preview** (the button on the card; `train autolabel ... --dry-run` on the command line; nothing is
+run or written, and no GPU, download or login is needed) shows how many frames match, how many a run
+takes after `limit`, how many are skipped because the labelers already ran, the split by status, and a
+rough time (SAM 3: 2 s + 0.2 s per phrase per frame; MM-Grounding-DINO 0.55 s; both before the VLM
+check, on a GTX 1070 Ti). It warns when reviewed frames are in scope and when `limit` is below the
+match count (the preset never changes `limit` for you).
+
+**What happens to reviewed frames.** A rerun never changes a box you decided: accepted and rejected
+boxes stay as they are. On a reviewed frame the run adds a proposal only when it is a confident new
+object: the labelers agree, or one of them scored it 0.5 or more, no check (Qwen3-VL, SigLIP 2)
+objected, and it does not sit on a box you decided as another class or on one you rejected. A frame that
+gains such a box goes back to **unreviewed** with a note ("re-label by sam3: ...") and **leaves the
+exports until you save it again**; exports you already made are unaffected. Frames you skipped and
+frames you confirmed empty never gain a box; the run only records its scores. These rules also apply to a
+frame an earlier re-label sent back.
+
+**Undo.** *Restore reopened frames...* on the Review page (`POST /v1/review/restore-reopened`, with a
+dry-run count first) puts back to reviewed every frame the run reopened that has no pending box left,
+for example after you rejected the proposals (*Reject auto boxes below...*). Frames with a pending box are left alone.
+
+**Votes and overlap suggestions.** When a rerun's labeler finds a box that is already there, its score is
+added to that box's list of labelers (an extra witness for [Overlap suggestions](#overlap-suggestions));
+nothing else on the box changes. New votes only count in the suggestions of frames that are not yet
+checked, and pairs already answered stay answered, so tick **Ask again** on *Suggest overlaps...*
+(`again=1` on the command line) after a rerun. Suggestions stay for you to confirm; how useful SAM 3 is
+as a witness has not been measured.
+
+**If a run fails.** A labelers run that fails after some frames finished (a crash, a reset GPU) writes
+those frames like a Cancel does, then still reports the failure; run it again and it resumes.
+
 ### Label with any model
 
 `train autolabel --with-model <id>` (the Training page's *Label with a model*; `POST /training/autolabel`
@@ -1431,6 +1528,8 @@ blue-onyx-prism train import --list-datasets
 blue-onyx-prism train autolabel [--frames "scene=ir,status=unreviewed,import=any,limit=200"] \
     [--gdino tiny|base|large|off] [--no-rfdetr] [--vlm 2b|4b|8b|off] [--no-siglip] [--classes a,b] \
     [--no-vlm-batch] [--vlm-min-score 0.2] [--no-prefetch] [--discard-on-cancel] [--gpu cuda:N] [--allow-large] [--verbose]
+blue-onyx-prism train autolabel --sam3 [--dry-run] [...]   # SAM 3 in MM-Grounding-DINO's seat; --dry-run only previews
+blue-onyx-prism hf-login | hf-logout      # Hugging Face token for the SAM 3 download
 blue-onyx-prism train overlaps [--frames "scene=ir,camera=patio,limit=200,again=1"] [--gpu cuda:0] \
     [--allow-large] [--dry-run] [--verbose]    # suggestions for overlapping boxes; changes no box
 blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
