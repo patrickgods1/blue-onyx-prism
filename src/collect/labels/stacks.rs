@@ -189,9 +189,10 @@ fn mark_all(f: &mut LabelFile, which: &[usize]) -> usize {
 }
 
 /// The boxes [`reject_stacked`] takes: the [`drops`] of a reviewed or unreviewed frame no reviewer
-/// kept them on ([`LabelFile::overlaps_checked`]). A skipped frame is never exported.
+/// kept them on ([`LabelFile::overlaps_checked`], or [`LabelFile::checked_before_reopen`] while a
+/// rerun has the frame open). A skipped frame is never exported.
 fn stacked(f: &LabelFile, wanted: &Wanted<'_>) -> Vec<usize> {
-    if f.status == Status::Skipped || f.overlaps_checked {
+    if f.status == Status::Skipped || f.overlaps_checked || f.checked_before_reopen {
         return Vec::new();
     }
     drops(&stacks(&f.boxes, wanted), &f.boxes)

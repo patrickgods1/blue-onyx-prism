@@ -263,7 +263,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   write is `queue: false`. `POST /v1/review/restore-reopened` (`bulk::bulk_restore_reopened`; filters, `dry_run`, `limit` 500) puts
   unreviewed frames with `disagreement`, a `reviewed_at` and nothing pending back to reviewed (the undo; reopened frames stay out of
   exports until saved or restored, exports already made are unaffected). `overlaps_checked` comes back with it: `apply_missing` moves
-  a true one to `checked_before_reopen`, which a restore gives back and a spot accept of a new box or a save ends. A failed labelers run with a readable `proposals.jsonl`
+  a true one to `checked_before_reopen`, which a restore or `accept-repeats` gives back, holds `reject-stacked` back while set, and a spot accept of a new box or a save ends. A failed labelers run with a readable `proposals.jsonl`
   writes its finished frames like a Cancel, then still fails; a rerun resumes through the marker. Choosing frames: the Training
   card's *Which frames* presets (unreviewed, reviewed, each with `auto=overlaps`, all, custom; they cooperate with `#al-preset`),
   `autolabel/preview.rs` (`POST /training/autolabel/preview`, `train autolabel --dry-run`; through `server::blocking`, no GPU /

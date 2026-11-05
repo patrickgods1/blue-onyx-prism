@@ -724,8 +724,12 @@ pub fn bulk_accept_repeats(
                         return Ok(None);
                     };
                     l.status = Status::Reviewed;
+                    // A repeat-only frame holds no box a reviewer did not settle, so a check
+                    // from before a rerun reopened it still stands; `normalize` ends the memory.
+                    let checked = l.checked_before_reopen;
                     let mut n = super::normalize(l, classes, rec.width, rec.height, now)?;
                     n.bulk_accepted = true;
+                    n.overlaps_checked |= checked;
                     Ok(Some(n))
                 })
             });
@@ -1576,6 +1580,13 @@ mod tests {
         super::super::write(&frame.labels, &l).unwrap();
 
         let all = Filters::default();
+        let cl = classes();
+        let w = wanted(&cl, &[]);
+        // While the rerun has it open, the reviewer's check still holds the bulk back.
+        let o = bulk_reject_stacked(dir, &all, &w, 100, true, &|_| true);
+        assert_eq!(o.outcome.eligible, 1, "only the frame nobody checked");
+        assert_eq!(o.outcome.done, vec![open.clone()]);
+
         let o = bulk_restore_reopened(dir, &all, 500, false, &|_| true);
         assert_eq!(o.done_count, 2);
         let l = labels_of(dir, &kept);
@@ -1583,12 +1594,37 @@ mod tests {
         let l = labels_of(dir, &open);
         assert!(!l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
 
-        let cl = classes();
-        let w = wanted(&cl, &[]);
         let o = bulk_reject_stacked(dir, &all, &w, 100, false, &|_| true);
         assert_eq!(o.outcome.done_count, 1, "only the frame nobody checked");
         assert_eq!(labels_of(dir, &kept).boxes[1].state, BoxState::Accepted);
         assert_eq!(labels_of(dir, &open).boxes[1].state, BoxState::Rejected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepting_a_repeat_only_frame_keeps_a_check_from_before_the_reopen() {
+        let root = std::env::temp_dir().join(format!("bop-repeat-check-{}", uuid::Uuid::new_v4()));
+        let dir = root.as_path();
+        let (a, near) = ([0.0, 0.0, 40.0, 40.0], [0.0, 0.0, 40.0, 38.0]);
+        let cars = || vec![car_at(a, 0.9), car_at(near, 0.4)];
+        let kept = reopened(dir, "a", cars());
+        let open = reopened(dir, "b", cars());
+        for (rel, checked) in [(&kept, true), (&open, false)] {
+            let frame = Frame::resolve(dir, rel).unwrap();
+            let mut l = labels_of(dir, rel);
+            l.repeat_spot = true;
+            l.checked_before_reopen = checked;
+            super::super::write(&frame.labels, &l).unwrap();
+        }
+        let all = Filters::default();
+        let o = bulk_accept_repeats(dir, &all, &classes(), 100, "now", false, &|_| true);
+        assert_eq!(o.done_count, 2);
+        let l = labels_of(dir, &kept);
+        assert_eq!(l.status, Status::Reviewed);
+        assert!(l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
+        let l = labels_of(dir, &open);
+        assert_eq!(l.status, Status::Reviewed);
+        assert!(!l.overlaps_checked && !l.checked_before_reopen, "{l:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
