@@ -88,8 +88,18 @@ sudo test -f "$CONFIG" || fail "config deleted without --purge"
 sudo test -f "$SEED" || fail "$SEED deleted without --purge"
 dscl . -read /Users/_blueonyx >/dev/null 2>&1 || fail "account _blueonyx deleted without --purge"
 
-# A reinstall picks the data up, even when the account's id changed meanwhile (deleted by hand and
-# made again): the daemon must own and read what the old id wrote.
+# A reinstall picks the data up, at once.
+sudo installer -pkg "$PKG" -target / -verbose
+check_daemon
+sudo test -f "$SEED" || fail "$SEED lost over the reinstall"
+sudo "$PROG/scripts/uninstall_launchd.sh"
+sudo test -f "$SEED" || fail "$SEED deleted by the second uninstall"
+
+# Then with the account's id changed meanwhile (deleted by hand and made again): the daemon must
+# own and read what the old id wrote. The kernel refuses a bind while a socket of the port belongs
+# to another uid, and the old daemon's closed connections stay in TIME_WAIT for 30 s, so wait them
+# out: launchd would otherwise restart the daemon until they are gone.
+sleep 35
 new_uid=""
 for i in $(seq 499 -1 300); do
   if ! dscl . -list /Users UniqueID | awk -v id="$i" '$2 == id { f = 1 } END { exit !f }'; then new_uid="$i"; break; fi
