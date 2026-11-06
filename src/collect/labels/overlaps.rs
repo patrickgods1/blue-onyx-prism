@@ -3,7 +3,7 @@
 //! real object) while it named the right box on 86 of 99, so a suggestion is only that: nothing here
 //! changes a box's state, a frame's status, `reviewed_at` or `overlaps_checked`. [`apply`] only
 //! writes [`LabelFile::overlap_suggestions`]; a box changes when a reviewer accepts a suggestion on
-//! the Review page.
+//! the Review tab.
 //!
 //! The signals, ported from `scripts/research/eval_overlaps.py` (the reference that reproduced the
 //! measured numbers; `tests/data/overlaps_parity.json` holds its answers on synthetic pairs):
@@ -37,7 +37,7 @@
 //! whose pair stopped being open, is stale and ignored ([`live`]), never an error. A frame holds at
 //! most [`MAX_SUGGESTIONS`], strongest first ([`strength`]).
 //!
-//! Twin of the Review page's `liveSuggestions` and `acceptOverlap` (`assets/review.js`), which
+//! Twin of the Review tab's `liveSuggestions` and `acceptOverlap` (`assets/review.js`), which
 //! [`live`] and [`accept`] state as Rust: keep them in step. The page cannot call [`super::map_class`],
 //! so `GET /v1/review/labels` names the live suggestions (`overlap_live`) and the page only adds what
 //! changes while the frame is open (a move, a relabel, a rejected box).

@@ -1,6 +1,6 @@
 //! The benchmark at the end of a run: the trained model on its held-out frames (a `dir:` set)
 //! and optional built-in sets, through the regular [`BenchmarkService`] (so the results land in
-//! `benchmark.json` and its history like any other run), summarized for the Training page.
+//! `benchmark.json` and its history like any other run), summarized for the Train tab.
 //! It runs on the chosen devices one after the other (`training.benchmark_devices`, the Train
 //! form), else on the one device the model would load on, never on every device of the machine
 //! (a GTX 1070 Ti + UHD 630 box hard-hung within seconds of that sweep starting, twice).
@@ -252,7 +252,7 @@ pub fn compare_text(new: Option<&BenchSummary>, baseline: Option<&Baseline>) -> 
     s
 }
 
-/// The Training page's view of a benchmark result: the recommended device (else the first that
+/// The Train tab's view of a benchmark result: the recommended device (else the first that
 /// ran), its p50 time and AP50 (over every class of the model when the set annotates others),
 /// and the alerting figures of its overall score (person / vehicle recall, false alerts on empty
 /// frames) at the benchmark's configured threshold. Like the overall AP, those cover every

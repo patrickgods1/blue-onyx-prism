@@ -2,7 +2,7 @@
 //! indexed frame), filtered by bucket, scene, camera, object class ([`frame_labels`]), review
 //! status and auto-label state ([`AutoFilter`]), and sorted by
 //! uncertainty ([`Uncertainty`]): frames with likely boxes first, then fewer flagged boxes, then the
-//! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest. Also the counts the Review page shows, and
+//! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest. Also the counts the Review tab shows, and
 //! [`labelled`], every label file those filters select whichever queue it is in.
 
 use super::super::layout::{self, REVIEW_QUEUE_FILE};
@@ -17,7 +17,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QueueSource {
-    /// `review-queue.jsonl` only (frames sent from the Dataset page).
+    /// `review-queue.jsonl` only (frames sent from the Collect tab).
     #[default]
     Queue,
     /// The queue plus every frame of the index files.
@@ -286,7 +286,7 @@ pub struct Candidate {
     pub scene: String,
     pub camera: String,
     pub buckets: Vec<Bucket>,
-    /// Sent to review from the Dataset page.
+    /// Sent to review from the Collect tab.
     pub queued: bool,
 }
 
@@ -617,6 +617,86 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
     q.cameras = cameras.into_iter().collect();
     q.labels = seen_labels.into_iter().collect();
     q
+}
+
+/// Reviewed boxes of one class ([`Tally::coverage`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ClassCoverage {
+    pub boxes: u64,
+    /// scene -> boxes.
+    pub by_scene: BTreeMap<String, u64>,
+    /// camera -> boxes.
+    pub by_camera: BTreeMap<String, u64>,
+}
+
+/// Where a folder's review stands, in one walk over its frames ([`tally`]): what the Train area's
+/// status strip and the Dataset tab's coverage table show.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Tally {
+    /// Every frame of the review queue and the index files that still exists.
+    pub frames: u64,
+    pub reviewed: u64,
+    pub skipped: u64,
+    /// Frames not reviewed or skipped yet.
+    pub to_review: u64,
+    /// Those of them in `review-queue.jsonl`, what the Review tab shows by default.
+    pub queued_to_review: u64,
+    /// Pending boxes on the frames to review. Boxes only a sidecar proposes (a frame with no
+    /// label file) are not counted: reading every sidecar is what this walk avoids.
+    pub pending_boxes: u64,
+    /// Frames to review that no auto-label run has looked at ([`AutoFilter::Never`]).
+    pub never_auto_labelled: u64,
+    /// Training boxes of reviewed frames, per class.
+    pub coverage: BTreeMap<String, ClassCoverage>,
+    /// Frames left out: unreadable label file.
+    pub unreadable: u64,
+}
+
+impl Tally {
+    fn add(&mut self, c: &Candidate, labels: Option<&LabelFile>) {
+        self.frames += 1;
+        match labels.map(|l| l.status) {
+            Some(Status::Reviewed) => self.reviewed += 1,
+            Some(Status::Skipped) => self.skipped += 1,
+            _ => {
+                self.to_review += 1;
+                self.queued_to_review += u64::from(c.queued);
+                self.never_auto_labelled += u64::from(AutoFilter::Never.matches(labels));
+                if let Some(l) = labels {
+                    self.pending_boxes += l
+                        .boxes
+                        .iter()
+                        .filter(|b| b.state == BoxState::Pending)
+                        .count() as u64;
+                }
+            }
+        }
+        if let Some(l) = labels.filter(|l| l.status == Status::Reviewed) {
+            for b in l.training() {
+                let row = self.coverage.entry(b.label.clone()).or_default();
+                row.boxes += 1;
+                *row.by_scene.entry(c.scene.clone()).or_default() += 1;
+                *row.by_camera.entry(c.camera.clone()).or_default() += 1;
+            }
+        }
+    }
+}
+
+/// The [`Tally`] of `dir`. Reads the label files, never the sidecars, so it costs about one small
+/// file per frame; a caller on a request path keeps the answer ([`crate::server`]'s Train area
+/// does).
+pub fn tally(dir: &Path) -> Tally {
+    let mut t = Tally::default();
+    for c in candidates(dir, QueueSource::All) {
+        let Some(frame) = Frame::resolve(dir, &c.rel) else {
+            continue;
+        };
+        match frame.labels() {
+            Ok(labels) => t.add(&c, labels.as_ref()),
+            Err(_) => t.unreadable += 1,
+        }
+    }
+    t
 }
 
 /// The label files of `dir` ([`super::label_files`], in its order) that the bucket, scene, camera
@@ -1479,5 +1559,54 @@ mod tests {
         c.add(Some(&reviewed));
         c.add(Some(&open));
         assert_eq!((c.audit_accepted, c.audit_rejected), (1, 2));
+    }
+
+    #[test]
+    fn the_tally_counts_what_is_left_and_where_the_reviewed_boxes_are() {
+        use super::super::{AutoRun, tests_support::auto_box};
+        let cand = |scene: &str, camera: &str, queued: bool| Candidate {
+            rel: String::new(),
+            scene: scene.into(),
+            camera: camera.into(),
+            buckets: vec![],
+            queued,
+        };
+        let mut good = auto_box("person");
+        good.state = BoxState::Accepted;
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![good.clone(), good, auto_box("car")],
+            ..LabelFile::default()
+        };
+        let labelled = LabelFile {
+            boxes: vec![auto_box("car"), auto_box("dog")],
+            auto_run: Some(AutoRun {
+                at: "t".into(),
+                labeler: "l".into(),
+                classes: vec![],
+            }),
+            ..LabelFile::default()
+        };
+        let skipped = LabelFile {
+            status: Status::Skipped,
+            ..LabelFile::default()
+        };
+        let mut t = Tally::default();
+        t.add(&cand("day", "gate", true), Some(&reviewed));
+        t.add(&cand("ir", "back", true), Some(&labelled));
+        t.add(&cand("day", "back", false), None);
+        t.add(&cand("day", "back", false), Some(&skipped));
+        assert_eq!((t.frames, t.reviewed, t.skipped, t.to_review), (4, 1, 1, 2));
+        assert_eq!(
+            t.queued_to_review, 1,
+            "the frame with no label file is not queued"
+        );
+        assert_eq!(t.pending_boxes, 2, "pending boxes of frames to review only");
+        assert_eq!(t.never_auto_labelled, 1);
+        let person = &t.coverage["person"];
+        assert_eq!(person.boxes, 2);
+        assert_eq!(person.by_scene["day"], 2);
+        assert_eq!(person.by_camera["gate"], 2);
+        assert!(!t.coverage.contains_key("car"), "a pending box is no label");
     }
 }

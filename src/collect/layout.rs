@@ -155,7 +155,7 @@ pub fn resolve(dir: &Path, rel: &str, ext: &str) -> Option<PathBuf> {
     real.starts_with(&root).then_some(real)
 }
 
-/// A frame the Dataset page shows.
+/// A frame the Collect tab shows.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FrameRef {
     /// `<scene>/<camera>/<date>/<stem>.jpg`.

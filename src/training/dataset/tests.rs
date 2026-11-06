@@ -2133,7 +2133,7 @@ fn the_export_names_frames_with_only_parked_boxes() {
     );
 }
 
-/// A Review page export of `frames` (flat names; `val` = held out), with its label files.
+/// A Dataset tab export of `frames` (flat names; `val` = held out), with its label files.
 fn split_export(dir: &Path, train: &[&str], val: &[&str]) {
     std::fs::write(dir.join("classes.txt"), "cat\n").unwrap();
     for (split, list) in [("train", train), ("val", val)] {

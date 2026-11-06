@@ -208,7 +208,7 @@ pub struct CollectConfig {
     /// root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
-    /// Folder the Review page, its exports and the auto-labeler work on (an import saved
+    /// Folder the Review tab, its exports and the auto-labeler work on (an import saved
     /// elsewhere); None = the dataset folder. Relative paths resolve against the data root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_dir: Option<PathBuf>,
@@ -221,10 +221,10 @@ pub struct CollectConfig {
     /// dHash Hamming distance (of 64 bits) at or below which a frame of the same camera within
     /// the dedup window counts as a near duplicate and is dropped.
     pub dedup_hamming: u32,
-    /// Classes of the Review page and the label exports (YOLO class ids follow this order).
+    /// Classes of the Review tab and the label exports (YOLO class ids follow this order).
     pub classes: Vec<String>,
-    /// Classes of `classes` the reviewer does not want (the Review page's "don't want"): left out
-    /// of the Review page (pickers, shortcuts, their boxes), of the pre-fill and of auto-label
+    /// Classes of `classes` the reviewer does not want (the Review tab's "don't want"): left out
+    /// of the Review tab (pickers, shortcuts, their boxes), of the pre-fill and of auto-label
     /// runs, and their pending boxes rejected when a class becomes hidden
     /// ([`super::labels::bulk::Wanted`]); they stay in the list and keep their YOLO ids.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -262,7 +262,7 @@ impl CollectConfig {
         }
     }
 
-    /// The Review page's folder: `review_dir` resolved against `data_root`, or the dataset
+    /// The Review tab's folder: `review_dir` resolved against `data_root`, or the dataset
     /// folder ([`Self::resolved_dir`]).
     pub fn resolved_review_dir(&self, data_root: &Path) -> PathBuf {
         match self
@@ -380,7 +380,7 @@ pub fn validate_classes(classes: &[String]) -> anyhow::Result<()> {
     use anyhow::bail;
     if classes.is_empty() || classes.len() > MAX_CLASSES {
         bail!(
-            "collect.classes: give 1 to {MAX_CLASSES} class names (the Review page's class list), \
+            "collect.classes: give 1 to {MAX_CLASSES} class names (the Dataset tab's class list), \
              got {}",
             classes.len()
         );
@@ -466,7 +466,7 @@ impl CollectSettings {
     }
 }
 
-/// Point the Review page at `dir` (`collect.review_dir` of `config`; None or the dataset folder
+/// Point the Review tab at `dir` (`collect.review_dir` of `config`; None or the dataset folder
 /// itself = the dataset folder) and check the section (`POST /v1/review/folder`, the
 /// auto-label chain's folder switch).
 pub fn set_review_dir(

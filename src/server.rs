@@ -38,6 +38,7 @@ mod sam3_access;
 mod status;
 #[cfg(test)]
 mod test_util;
+mod train_area;
 mod training;
 mod training_switch;
 mod training_tasks;
@@ -189,14 +190,23 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/config/models/remove", post(config_models_remove)),
         ("/config/restart", post(config_restart)),
         ("/config/loglevel", post(config_loglevel)),
-        ("/dataset", get(dataset::page)),
+        ("/train", get(train_area::entry)),
+        ("/train/collect", get(dataset::page)),
+        ("/train/import", get(training::import_tab)),
+        ("/train/autolabel", get(training::autolabel_tab)),
+        ("/train/review", get(review::page)),
+        ("/train/dataset", get(train_area::dataset_page)),
+        ("/train/train", get(training::train_tab)),
+        ("/train/models", get(training::models_tab)),
+        ("/v1/train/summary", get(train_area::summary)),
+        ("/dataset", get(train_area::old_dataset)),
         ("/dataset/settings", post(dataset::settings)),
         ("/dataset/review", post(dataset::review)),
         ("/dataset/resume", post(dataset::resume)),
         ("/dataset/image", get(dataset::image)),
         ("/dataset/sidecar", get(dataset::sidecar)),
         ("/v1/dataset", get(dataset::json)),
-        ("/review", get(review::page)),
+        ("/review", get(train_area::old_review)),
         ("/v1/review/next", get(review::next)),
         (
             "/v1/review/labels",
@@ -276,7 +286,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             "/v1/review/folder",
             post(review::folder).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
-        ("/training", get(training::page)),
+        ("/training", get(train_area::old_training)),
         ("/v1/training", get(training::json)),
         (
             "/v1/training/metric-columns",
@@ -1086,6 +1096,15 @@ mod tests {
             "/config/models/remove",
             "/config/restart",
             "/config/loglevel",
+            "/train",
+            "/train/collect",
+            "/train/import",
+            "/train/autolabel",
+            "/train/review",
+            "/train/dataset",
+            "/train/train",
+            "/train/models",
+            "/v1/train/summary",
             "/dataset",
             "/dataset/settings",
             "/dataset/review",

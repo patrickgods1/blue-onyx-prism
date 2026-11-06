@@ -3,7 +3,7 @@
 //!
 //! 1. **Read** ([`read_export`], [`read_public_set`]): class list, frames with their boxes
 //!    (normalized YOLO boxes), scene, camera and day. Two export layouts are read:
-//!    - the Review page's export (`src/collect/labels/export.rs`): `images/{train,val}/`,
+//!    - the Review tab's export (`src/collect/labels/export.rs`): `images/{train,val}/`,
 //!      `labels/{train,val}/`, `classes.txt`, flat names `<scene>.<camera>.<date>.<stem>.jpg`;
 //!      its `val` split is already held out by whole camera days, so it becomes the held-out set
 //!      (an export with no `val` frame, such as one camera on one day, is held out here instead);
@@ -408,7 +408,7 @@ pub fn read_classes(dir: &Path) -> Result<Vec<String>> {
         }
     }
     bail!(
-        "{} has no classes.txt or data.yaml: it is not a YOLO export (export from the Review page \
+        "{} has no classes.txt or data.yaml: it is not a YOLO export (export from the Dataset tab \
          with the YOLO format)",
         dir.display()
     )
@@ -585,7 +585,7 @@ fn read_ignore(dir: &Path) -> Result<IgnoreRead> {
     let file: IgnoreFile = serde_json::from_slice(&bytes).with_context(|| {
         format!(
             "{} is damaged, so this run cannot tell which objects not to train on; export the \
-             frames again from the Review page",
+             frames again from the Dataset tab",
             p.display()
         )
     })?;
@@ -636,7 +636,7 @@ fn read_frame_notes(dir: &Path, warnings: &mut Vec<String>) -> Option<FrameNotes
         Err(e) => {
             warnings.push(format!(
                 "{} is damaged ({e}): frames confirmed empty are not preferred; export the frames \
-                 again from the Review page",
+                 again from the Dataset tab",
                 p.display()
             ));
             None
@@ -671,7 +671,7 @@ fn read_rejected(dir: &Path, warnings: &mut Vec<String>) -> BTreeSet<String> {
         Err(e) => {
             warnings.push(format!(
                 "{} is damaged ({e}): frames with rejected boxes are not preferred as negatives; \
-                 export the frames again from the Review page",
+                 export the frames again from the Dataset tab",
                 p.display()
             ));
             BTreeSet::new()
@@ -1348,7 +1348,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             "{} of {scoped} training frame(s) were left out for unsure or too-small boxes: no \
              trainer can skip such a box, so the object would train as background. Held-out \
              frames keep them, and detections on those boxes do not count; to train on a frame \
-             again, give its box a class or reject it with another reason on the Review page",
+             again, give its box a class or reject it with another reason on the Review tab",
             p.stats.ignore_frames
         ));
     }
@@ -1525,7 +1525,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             Some(n) if hinted => format!(
                 "class '{c}' has no training box: its {n} box(es) are only in the held-out split \
                  (the export's val split: camera days held out for the benchmark), so the model \
-                 cannot learn it; export again and hold out other cameras or days (Review page \
+                 cannot learn it; export again and hold out other cameras or days (Dataset tab \
                  export: holdout cameras / days), or review frames with it from the camera days \
                  that train"
             ),
@@ -2036,7 +2036,7 @@ pub struct SceneCounts {
     pub unknown: usize,
 }
 
-/// One class of the chosen datasets (the Training page's class picker, `train classes`).
+/// One class of the chosen datasets (the Train tab's class picker, `train classes`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClassCount {
     pub name: String,

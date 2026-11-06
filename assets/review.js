@@ -1,15 +1,16 @@
-// Review page (/review): one frame at a time from GET /v1/review/next, its boxes from
+// Review tab (/train/review): one frame at a time from GET /v1/review/next, its boxes from
 // GET /v1/review/labels, drawn on a canvas; decisions saved with POST /v1/review/labels
 // (with the loaded `revision`; a 409 means someone else saved the frame meanwhile).
 // Filters (bucket, scene, camera, class, auto, status, source) go to /v1/review/next as query
-// params. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
-// The Auto-label card queues a job (POST /training/autolabel as JSON) and follows it on
-// GET /v1/training; "Accept auto: accept frames" calls POST /v1/review/accept-auto and
+// params; they start from the page's own URL (a deep link such as ?auto=overlaps), stay in it, and
+// fold to the one-line summary above the frame, whose "Auto-label these frames" link passes them
+// on. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
+// A job queued on the Auto-label tab is followed on GET /v1/training, and the frames reload when it
+// ends. Under Bulk tools, "Accept auto: accept frames" calls POST /v1/review/accept-auto and
 // "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
 // POST /v1/review/reject-other-class, "Restore reopened frames" POST /v1/review/restore-reopened
 // and "Reject stacked duplicates" POST /v1/review/reject-stacked
-// (all five: dry run, confirm, run). Preview frames posts the form to
-// POST /training/autolabel/preview on a click. *Suggest overlaps...* queues the overlap check
+// (all five: dry run, confirm, run). *Suggest overlaps...* queues the overlap check
 // (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
 // the frame, and `y` accepts the one on screen. A labelers run sorts its new boxes into tiers
 // (training/autolabel/triage.rs): dismissed ones (state rejected, reason auto_dismissed or, at a
@@ -18,18 +19,15 @@
 // `t` accepts a real object that stays put and remembers its spot (POST /v1/review/spots/parked);
 // later runs accept it there. GET /v1/review/spots feeds the card's line, and Panel options has
 // "Camera moved: forget spots" (POST /v1/review/spots/moved).
-// Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
-// a new folder reloads the page.
+// The folder form posts JSON to /v1/review/folder; a new folder reloads the page. Export, X-AnyLabeling
+// import and the class list are on the Dataset tab (train-dataset.js).
 // Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
-// filter (label=a,b), "Show boxes of" (display only), the auto-label form (repeated `classes`
-// fields; a class outside the list is appended after a confirm) and the Classes card (list in
-// order, "don't want (hide + reject)" per class = collect.hidden_classes). Unwanted classes
+// filter (label=a,b) and "Show boxes of" (display only). Unwanted classes
 // (hidden, or not in the list) are what the reviewer does not review: pickers, the new-box class
 // select and the 1-0 keys leave the hidden ones out, the canvas / box list / stepping skip boxes
 // of hidden classes and rejected boxes of unlisted ones (they stay in the file; a save rejects
 // pending proposals of hidden classes), and the server rejects their pending boxes when a class
-// becomes unwanted. When a class save, the reject button or the auto-label form (unticked listed
-// classes: "Hide and auto-reject ...?") leaves reviewed frames with accepted boxes of unwanted
+// becomes unwanted. When the reject button leaves reviewed frames with accepted boxes of unwanted
 // classes, the page asks, then POST /v1/review/reject-unwanted-reviewed. Class ids never change.
 // No inline handlers (CSP): everything is wired here; server values come from data-*.
 (function () {
@@ -198,7 +196,7 @@
   var prefetchImg = null;
   var seenLabels = [];                 // classes the queue saw (Class filter)
   var lastNudge = null;                // {i, t}: arrow nudges in a row share one undo step
-  var labelPicker = null, showPicker = null, alPicker = null, classesPicker = null;
+  var labelPicker = null, showPicker = null;
   var backStack = [], fwdStack = [];   // frames left by Back (`p`) / by moving on, for `p` and `n`
   var missingAsked = null;             // the frame "Anything missing?" was asked on
   var askMissing = pref('askMissing', true);
@@ -2681,8 +2679,49 @@
     missingBox.addEventListener('change', function () { askMissing = missingBox.checked; setPref('askMissing', askMissing); });
   }
   emptyBox.addEventListener('change', function () { confirmEmpty(emptyBox.checked); });
+  // The filters in the page's URL (defaults left out), in the summary line and in the link to the
+  // Auto-label tab.
+  var DEFAULT_FILTERS = { status: 'unreviewed', source: 'queue' };
+  function filtersShown() {
+    var p = filterParams(), q = new URLSearchParams();
+    p.forEach(function (v, k) { if (DEFAULT_FILTERS[k] !== v) q.set(k, v); });
+    var text = q.toString();
+    try { history.replaceState(null, '', location.pathname + (text ? '?' + text : '') + location.hash); } catch (e) { /* not kept */ }
+    var link = $('rv-autolabel-link');
+    if (link) link.href = '/train/autolabel?' + p.toString();
+    var summary = $('rv-filter-summary');
+    if (!summary) return;
+    var f = filtersForm.elements;
+    var name = function (k) { var e = f[k]; return e && e.options ? e.options[e.selectedIndex].text : ''; };
+    var parts = [name('status'), name('source')];
+    if (f.scene.value) parts.push(f.scene.value);
+    if (f.camera.value) parts.push('camera ' + f.camera.value);
+    if (f.label.value) parts.push(f.label.value.split(',').join(', '));
+    if (f.bucket.value) parts.push('bucket ' + f.bucket.value);
+    if (f.auto.value) parts.push(name('auto'));
+    summary.textContent = parts.join(', ');
+  }
+  // A link's filters: unknown values are left at the default. `auto=overlaps` alone opens what the
+  // Auto filter's choice opens.
+  function filtersFromUrl() {
+    var q = new URLSearchParams(location.search), f = filtersForm.elements;
+    ['bucket', 'scene', 'camera', 'label', 'auto', 'status', 'source'].forEach(function (k) {
+      var v = q.get(k), e = f[k];
+      if (!v || !e) return;
+      if (k === 'camera' && !Array.prototype.some.call(e.options, function (o) { return o.value === v; })) {
+        var o = el('option', null, v);
+        o.value = v;
+        e.appendChild(o);
+      }
+      var was = e.value;
+      e.value = v;
+      if (e.options && e.value !== v) e.value = was;
+    });
+    if (q.get('auto') === 'overlaps' && !q.has('status') && !q.has('source')) showOverlaps();
+  }
   // A filter change with unsaved edits asks first; kept, the frame stays and the counts follow.
   function filterReload() {
+    filtersShown();
     if (leaveOk()) { loadNext(); return; }
     loadNext(null, null, true);
     say('Kept this frame with its unsaved changes; the new filters apply from the next frame.');
@@ -2914,7 +2953,7 @@
     if (redraw) draw();
   });
 
-  // ---- auto-label: queue a job, follow it, bulk accept -------------------------------------
+  // ---- follow a job, bulk tools -------------------------------------
 
   function report(box, lines, warnings) {
     box.textContent = '';
@@ -2927,92 +2966,9 @@
     }
   }
 
-  var alForm = $('rv-autolabel');
   var alStatus = $('rv-al-status');
   var alProgress = $('rv-al-progress');
   var polling = null;   // {id, timer}
-
-  // Label with: labelers (hidden fields, as before) or a model (model-picker.js: model, device,
-  // threshold, pre-accept score, the licence / large-download confirms). The blocks of the other
-  // mode are hidden and disabled, so they are not posted.
-  var MP = window.ModelPicker;
-  var alModelPicker = null;
-  function alMode() {
-    var r = alForm && alForm.querySelector('input[name="mode"]:checked');
-    return r ? r.value : 'labelers';
-  }
-  function applyAlMode() {
-    if (!alForm) return;
-    var m = alMode();
-    Array.prototype.forEach.call(alForm.querySelectorAll('[data-al-mode]'), function (blk) {
-      var off = blk.getAttribute('data-al-mode') !== m;
-      blk.hidden = off;
-      Array.prototype.forEach.call(blk.querySelectorAll('input, select, textarea'), function (f) { f.disabled = off; });
-    });
-    syncSam3Threshold();
-  }
-  // The SAM 3 threshold only while SAM 3 is the chosen labeler; hidden, it is disabled (not posted,
-  // not validated). The mode switch above enables every field of the shown block, so it runs after.
-  function syncSam3Threshold() {
-    var seat = $('rv-al-gdino'), input = alForm.elements.sam3_threshold;
-    if (!seat || !input) return;
-    var on = alMode() === 'labelers' && seat.value === 'sam3';
-    $('rv-al-sam3-threshold-field').hidden = !on;
-    $('rv-al-sam3-threshold-hint').hidden = !on;
-    input.disabled = !on;
-  }
-  if (alForm) {
-    var mpHolder = $('rv-al-model-picker');
-    if (mpHolder && MP) {
-      alModelPicker = MP.create(mpHolder, {
-        onLoad: function (j) {
-          var t = alForm.elements.threshold;
-          if (t && j.default_threshold && t.value === t.defaultValue) t.value = j.default_threshold;
-        }
-      });
-    }
-    Array.prototype.forEach.call(alForm.querySelectorAll('input[name="mode"]'), function (r) {
-      r.addEventListener('change', applyAlMode);
-    });
-    applyAlMode();
-    // SAM 3 is offered once installed (its panel is on the Training page); the select stays out of
-    // sight until then and posts MM-Grounding-DINO.
-    var alSeat = $('rv-al-gdino');
-    if (alSeat) alSeat.addEventListener('change', syncSam3Threshold);
-    if (alSeat && window.fetch) {
-      fetch('/v1/autolabel/sam3', { headers: { Accept: 'application/json' } })
-        .then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (s) {
-          if (!s || s.state !== 'installed') return;
-          var sam3 = el('option', null, 'SAM 3');
-          sam3.value = 'sam3';
-          alSeat.appendChild(sam3);
-          $('rv-al-gdino-field').hidden = false;
-          $('rv-al-sam3-apple').hidden = !s.apple;
-        })
-        .catch(function () {});
-    }
-    if (MP) {
-      var syncMissing = MP.util.missingToggle(alForm);
-      Array.prototype.forEach.call(alForm.querySelectorAll('input[name="mode"]'), function (r) {
-        r.addEventListener('change', syncMissing);
-      });
-    }
-  }
-
-  // The filters of the queue become the job's frame filter.
-  function autolabelFrames() {
-    var parts = [];
-    // `label` (a comma list) goes in the form's own `label` field, not in this comma list.
-    Array.prototype.forEach.call(filtersForm.elements, function (e) {
-      if (e.name && e.name !== 'label' && e.value) parts.push(e.name + '=' + e.value);
-    });
-    var lim = alForm.elements.limit && alForm.elements.limit.value;
-    if (lim) parts.push('limit=' + lim);
-    var again = $('rv-al-again');
-    if (again && again.checked) parts.push('again=1');
-    return parts.join(',');
-  }
 
   function describeTask(t) {
     if (t.state === 'queued') return 'Queued: ' + (t.title || 'auto-label') + ' (waiting for the queue).';
@@ -3026,7 +2982,7 @@
     polling = null;
   }
 
-  // Follow task `id`; `box` and `bar` show it (default: the auto-label card's), `after(t)` runs when
+  // Follow task `id`; `box` and `bar` show it (default: the line above the frame), `after(t)` runs when
   // it ends.
   function pollTask(id, box, bar, after) {
     stopPolling();
@@ -3051,7 +3007,7 @@
         stopPolling();
         bar.hidden = true;
         if (t.state === 'done') report(box, ['Done: ' + (t.summary || t.title || 'auto-label finished')]);
-        else if (t.state === 'failed') report(box, ['Failed: ' + (t.error || 'see the Training page.')]);
+        else if (t.state === 'failed') report(box, ['Failed: ' + (t.error || 'see Jobs on the Auto-label tab.')]);
         else report(box, [t.summary ? 'Cancelled: ' + t.summary : 'Cancelled.']);
         box.className = 'review-report ' + (t.state === 'done' ? 'ok-text' : 'error-text');
         if (after) after(t);
@@ -3060,125 +3016,7 @@
       .catch(function () {});
   }
 
-  // The queue's filters into the form's hidden fields.
-  function fillAlFilter() {
-    alForm.elements.frames.value = autolabelFrames();
-    if (alForm.elements.label) alForm.elements.label.value = filtersForm.elements.label ? filtersForm.elements.label.value : '';
-  }
-
-  // The form as a POST body, with the classes `picked`.
-  function alBody(picked) {
-    var body = new URLSearchParams();
-    Array.prototype.forEach.call(alForm.elements, function (e) {
-      if (!e.name || e.disabled) return;
-      if ((e.type === 'checkbox' || e.type === 'radio') && !e.checked) return;
-      body.append(e.name, e.value);
-    });
-    picked.forEach(function (c) { body.append('classes', c); });
-    return body;
-  }
-
-  // Preview frames: what the form would do on these filters, on a click (it reads every sidecar).
-  // A changed form or filter clears the answer. A class not in the class list yet is appended only
-  // by a real run, so it is left out here and said so.
-  function wireAlPreview() {
-    var run = $('rv-al-preview-run'), box = $('rv-al-preview');
-    if (!run || !box || !window.fetch || !window.URLSearchParams) return;
-    var seq = 0;
-    var clear = function () { seq++; box.className = 'review-report'; box.textContent = ''; };
-    run.hidden = false;
-    alForm.addEventListener('change', clear);
-    filtersForm.addEventListener('change', clear);
-    run.addEventListener('click', function () {
-      var mine = ++seq;
-      var picked = alPicker ? alPicker.getSelected() : [];
-      var fail = function (m) { box.className = 'review-report error-text'; report(box, [m]); };
-      if (alPicker && !picked.length) { fail('Choose at least one class to look for.'); return; }
-      var listed = catalog ? picked.filter(function (c) { return (catalog.classes || []).indexOf(c) >= 0; }) : picked;
-      if (alPicker && !listed.length) { fail('Add a picked class to the class list first: the preview counts listed classes only.'); return; }
-      fillAlFilter();
-      box.className = 'review-report';
-      report(box, ['Counting the frames...']);
-      run.disabled = true;
-      api('/training/autolabel/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-        body: alBody(listed).toString()
-      }).then(function (j) {
-        if (mine !== seq) return;
-        var warnings = (j.warnings || []).slice();
-        if (listed.length < picked.length) warnings.push('Classes not in the class list yet are left out of this count; a real run adds them first.');
-        report(box, [j.summary], warnings);
-      }).catch(function (e) {
-        if (mine === seq) fail(e.message);
-      }).then(function () { run.disabled = false; });
-    });
-  }
-
-  if (alForm) {
-    wireAlPreview();
-    alForm.addEventListener('submit', function (ev) {
-      fillAlFilter();
-      if (!window.fetch || !window.URLSearchParams) return;   // the plain form post
-      ev.preventDefault();
-      var picked = alPicker ? alPicker.getSelected() : [];
-      if (alPicker && !picked.length) {
-        alStatus.className = 'review-report error-text';
-        report(alStatus, ['Choose at least one class to look for.']);
-        return;
-      }
-      if (alMode() === 'model') {
-        var problem = !alModelPicker ? 'The model list is not available (reload the page).' :
-          (alModelPicker.problem() ||
-            MP.util.acceptProblem(alForm.elements.threshold.value, alForm.elements.model_accept_score.value));
-        if (problem) {
-          alStatus.className = 'review-report error-text';
-          report(alStatus, [problem]);
-          return;
-        }
-      }
-      var body = alBody(picked);
-      alStatus.className = 'review-report';
-      // Listed, wanted classes left unticked: offer to stop wanting them altogether.
-      var skipped = alPicker ? visible().filter(function (c) { return picked.indexOf(c) < 0; }) : [];
-      var hideFirst = skipped.length > 0 && window.confirm('Hide and auto-reject ' + skipped.join(', ') +
-        ' in Review? (Cancel = only skip them in this run)');
-      report(alStatus, [hideFirst ? 'Hiding ' + skipped.join(', ') + '...' : 'Queueing...']);
-      var hidden_ = !hideFirst ? Promise.resolve() :
-        postJson('/v1/review/classes', { classes: classes.slice(), hidden: hiddenClasses.concat(skipped) })
-          .then(function (j) {
-            afterClassesSaved(j);
-            var lines = [j.message || 'Saved.'];
-            var auto = unwantedNote(j);
-            if (auto) lines.push(auto);
-            report(alStatus, lines);
-            return askReviewedUnwanted(j.reviewed_with_unwanted, alStatus);
-          });
-      var ready = hidden_.then(function () {
-        return alPicker && catalog ? CP.ensureInList(picked, catalog) : catalog;
-      });
-      ready.then(function () {
-        if (alPicker) { refreshPickers(); }
-        return api('/training/autolabel', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-          body: body.toString()
-        });
-      }).then(function (j) {
-        var m = j.message || 'Queued.';
-        var q = /^Queued/.test(m) ? m : 'Queued: ' + m;
-        // After hiding classes: their report stays above.
-        if (hideFirst) alStatus.appendChild(el('div', null, q));
-        else report(alStatus, [q]);
-        if (j.id) pollTask(j.id);
-      }).catch(function (e) {
-        alStatus.className = 'review-report error-text';
-        report(alStatus, [e.cancelled ? 'Not queued: the class list was left as it is.' : e.message]);
-      });
-    });
-  }
-
-  // A job queued earlier (this page or the Training page): follow it.
+  // A job queued earlier (here or on the Auto-label tab): follow it.
   if (alStatus) {
     fetch('/v1/training', { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.ok ? r.json() : null; })
@@ -3308,18 +3146,6 @@
         report(box, [e.message]);
       }).then(function () { rejectBtn.disabled = false; });
     });
-  }
-
-  // What a class save rejected on its own (`auto_rejected` of POST /v1/review/classes), or ''.
-  function unwantedNote(j) {
-    var a = j && j.auto_rejected;
-    if (!a || !(a.boxes || 0)) return '';
-    var rejected = a.boxes - (a.relabelled || 0);
-    var text = 'Rejected ' + rejected + ' pending box(es) of unwanted classes (newly: ' +
-      (j.newly_unwanted || []).join(', ') + ') on ' + (a.frames || 0) + ' unreviewed frame(s) (reason other_class).';
-    if (a.relabelled) text += ' Renamed ' + a.relabelled + ' box(es) to the class list\'s spelling.';
-    if (a.failed && a.failed.length) text += ' ' + a.failed.length + ' frame(s) not changed: ' + a.failed.join('; ');
-    return text;
   }
 
   // `r` = reviewed_with_unwanted {frames, boxes, classes}: asks whether to reject the accepted
@@ -3528,66 +3354,7 @@
     });
   }
 
-  // ---- export / import / classes ------------------------------------------------------------
-
-  function list(text) {
-    return String(text || '').split(/[,\n]/).map(function (s) { return s.trim(); }).filter(Boolean);
-  }
-
-  $('rv-export').addEventListener('submit', function (ev) {
-    ev.preventDefault();
-    var f = ev.target;
-    var box = $('rv-export-msg');
-    var formats = Array.prototype.filter.call(f.querySelectorAll('input[name=fmt]'), function (c) { return c.checked; })
-      .map(function (c) { return c.value; });
-    var body = {
-      formats: formats,
-      holdout_cameras: list(f.elements.holdout_cameras.value),
-      holdout_days: list(f.elements.holdout_days.value),
-      holdout_fraction: Number(f.elements.holdout_fraction.value || 0.2),
-      benchmark_split: f.elements.benchmark_split.value,
-      include_unreviewed: f.elements.include_unreviewed.checked,
-      labels: list(f.elements.labels.value),
-      include_empty: f.elements.include_empty.checked
-    };
-    if (f.elements.out_dir.value.trim()) body.out_dir = f.elements.out_dir.value.trim();
-    report(box, ['Exporting...']);
-    postJson('/v1/review/export', body).then(function (j) {
-      var r = j.report;
-      var per = Object.keys(r.per_class || {}).map(function (k) { return k + ' ' + r.per_class[k]; }).join(', ');
-      var lines = [
-        'Exported ' + r.frames + ' frame(s) (' + r.train + ' train, ' + r.val + ' held out, ' +
-          r.empty_confirmed + ' confirmed empty) to ' + r.out_dir,
-        'Boxes per class: ' + (per || 'none') + '; ' + r.hard_negative_boxes + ' rejected box(es) in hard_negatives.json; ' +
-          (r.ignore_boxes || 0) + ' unsure / too-small box(es) in ignore.json'
-      ];
-      var cf = r.class_filter || {};
-      if ((cf.labels && cf.labels.length) || cf.include_empty === false) {
-        lines.push('Class filter: ' + ((cf.labels && cf.labels.length) ? cf.labels.join(', ') : 'every class') +
-          (cf.include_empty === false ? ', without confirmed-empty frames' : ', with confirmed-empty frames') +
-          '; ' + (r.filtered_out || 0) + ' reviewed frame(s) left out');
-      }
-      if (r.unreviewed_frames) lines.push(r.unreviewed_frames + ' unreviewed frame(s) added to the X-AnyLabeling folder');
-      if (r.benchmark_dataset) lines.push('Benchmark: blue-onyx-prism benchmark --dataset "' + r.benchmark_dataset + '"');
-      report(box, lines, r.warnings);
-    }).catch(function (e) { report(box, [e.message]); });
-  });
-
-  $('rv-import').addEventListener('submit', function (ev) {
-    ev.preventDefault();
-    var f = ev.target;
-    var box = $('rv-import-msg');
-    report(box, ['Importing...']);
-    postJson('/v1/review/import', {
-      dir: f.elements.dir.value.trim(),
-      treat_unchecked_as_reviewed: f.elements.treat_unchecked_as_reviewed.checked
-    }).then(function (j) {
-      var r = j.report;
-      report(box, ['Imported ' + r.imported + ' frame(s); ' + r.unchecked + ' unchecked file(s) left alone; ' +
-        r.unmatched + ' file(s) name no frame of the dataset.'], (r.errors || []).concat(r.warnings || []));
-      loadNext();
-    }).catch(function (e) { report(box, [e.message]); });
-  });
+  // ---- folder under review -------------------------------------------------------------------
 
   function setFolder(dir) {
     if (!leaveOk()) return;
@@ -3608,75 +3375,7 @@
     $('rv-folder-reset').addEventListener('click', function () { setFolder(''); });
   }
 
-  // The Classes card. Without the picker the comma text field saves as before.
-  function afterClassesSaved(j) {
-    classes = j.classes;
-    if (j.hidden) hiddenClasses = j.hidden;
-    if (catalog) { catalog.classes = classes.slice(); catalog.hidden = hiddenClasses.slice(); }
-    hideSet = {};
-    classes.forEach(function (c) { hideSet[c] = hiddenClasses.indexOf(c) >= 0; });
-    fillClassSelect();
-    fillKeyHint();
-    refreshPickers();
-    refresh();
-  }
-
-  $('rv-classes').addEventListener('submit', function (ev) {
-    ev.preventDefault();
-    var box = $('rv-classes-msg');
-    var body;
-    if (classesPicker) {
-      var list_ = classesPicker.getSelected();
-      if (!list_.length) {
-        box.textContent = 'Keep at least one class in the list.';
-        box.className = 'form-msg error-text';
-        return;
-      }
-      var change = CU.classChange(classes, list_);
-      if (change.idsChange && !window.confirm(
-        (change.removed.length ? 'Remove ' + change.removed.join(', ') + ' from the class list. ' : '') +
-        (change.reordered ? 'The order of the classes changes. ' : '') +
-        'YOLO class ids of later exports change (frames you exported before keep the old ids). Pending boxes of a ' +
-        'removed class are rejected on the unreviewed frames; for reviewed frames you are asked next. Continue?')) {
-        box.textContent = 'Not saved.';
-        box.className = 'form-msg';
-        return;
-      }
-      body = { classes: list_, hidden: hideChecked(list_) };
-    } else {
-      body = { classes: list(ev.target.elements.classes.value) };
-    }
-    postJson('/v1/review/classes', body).then(function (j) {
-      afterClassesSaved(j);
-      var lines = [j.message || 'Saved.'];
-      var auto = unwantedNote(j);
-      if (auto) lines.push(auto);
-      box.className = 'form-msg ok-text';
-      report(box, lines);
-      return askReviewedUnwanted(j.reviewed_with_unwanted, box).then(function () {
-        if (j.auto_rejected && j.auto_rejected.boxes) return reloadQueue();
-      });
-    }).catch(function (e) { box.textContent = e.message; box.className = 'form-msg error-text'; });
-  });
-
   // ---- class pickers ------------------------------------------------------------------------
-
-  var hideSet = {};   // Classes card: class -> "don't want" ticked
-
-  function hideChecked(selectedList) {
-    return selectedList.filter(function (c) { return hideSet[c]; });
-  }
-
-  function refreshPickers() {
-    var entries = buildEntries();
-    if (labelPicker) labelPicker.setEntries(entries);
-    if (showPicker) showPicker.setEntries(entries);
-    if (alPicker) {
-      alPicker.setEntries(entries);
-      if (catalog) alPicker.setQuickSets(CU.quickSetsFor(catalog));
-    }
-    if (classesPicker) classesPicker.setEntries(entries);
-  }
 
   function initPickers() {
     if (!CP) return;
@@ -3687,7 +3386,7 @@
     if (holder && labelHidden) {
       var reload = filterChanged;
       labelPicker = CP.create(holder, {
-        entries: entries, selected: [], mode: 'compact', label: 'Class', emptyText: 'any',
+        entries: entries, selected: labelHidden.value ? labelHidden.value.split(',') : [], mode: 'compact', label: 'Class', emptyText: 'any',
         onChange: function (sel) { labelHidden.value = sel.join(','); reload(); }
       });
     }
@@ -3697,33 +3396,6 @@
         entries: entries, selected: [], mode: 'compact', emptyText: 'all classes',
         onChange: function (sel) { shownLabels = sel; refresh(); }
       });
-    }
-    var alHolder = $('rv-al-picker');
-    if (alHolder) {
-      alPicker = CP.create(alHolder, {
-        entries: entries, selected: catalog ? CU.defaultSelection(catalog) : visible(), mode: 'full', allowAdd: true,
-        quickSets: catalog ? CU.quickSetsFor(catalog) : []
-      });
-    }
-    var clsHolder = $('rv-classes-picker');
-    if (clsHolder) {
-      classes.forEach(function (c) { hideSet[c] = hiddenClasses.indexOf(c) >= 0; });
-      classesPicker = CP.create(clsHolder, {
-        entries: entries, selected: classes.slice(), mode: 'full', allowAdd: true,
-        extra: function (entry, chip) {
-          var lab = el('label', 'cp-extra');
-          var cb = document.createElement('input');
-          cb.type = 'checkbox';
-          cb.checked = !!hideSet[entry.name];
-          cb.setAttribute('aria-label', 'Do not want ' + entry.name + ': hide it in Review and reject its pending boxes');
-          cb.addEventListener('change', function () { hideSet[entry.name] = cb.checked; });
-          lab.appendChild(cb);
-          lab.appendChild(document.createTextNode("don't want (hide + reject)"));
-          chip.appendChild(lab);
-        }
-      });
-      var plain = $('rv-classes').elements.classes;
-      if (plain) plain.hidden = true;
     }
   }
 
@@ -3740,5 +3412,7 @@
       refresh();
     });
   }
+  filtersFromUrl();
+  filtersShown();
   loadNext();
 })();

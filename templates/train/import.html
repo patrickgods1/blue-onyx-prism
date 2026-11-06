@@ -1,0 +1,119 @@
+<div class="card" id="import">
+  <h2>Import footage</h2>
+  <p class="muted">Frames from your own videos and image folders, a video URL or pinned open footage go into the dataset folder (<code>{{ dataset_dir }}</code>) and the Review queue, like collected frames. Scene changes are kept at a bounded rate, near duplicates dropped, and the frames picked by SigLIP 2, balanced by day / night / IR. Every frame records its source and licence.</p>
+  <form method="post" action="/training/import" class="tr-form" id="import-form">
+    <fieldset class="tr-radios">
+      <legend>Source</legend>
+      <label class="check"><input type="radio" name="source" value="path" checked> Files on this machine</label>
+      <label class="check"><input type="radio" name="source" value="url"> Video URL</label>
+      <label class="check"><input type="radio" name="source" value="dataset"> Pinned open footage</label>
+    </fieldset>
+    <div class="tr-field" data-source="path">
+      <label for="import-path">Video, image or folder</label>
+      <div class="with-browse tr-browse"><input type="text" id="import-path" name="path" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Video file&hellip;</button><button type="button" class="browse secondary" data-browse="folder" data-target="path" data-title="Choose a clip or image folder" hidden>Folder&hellip;</button></div>
+      <p class="muted small" id="import-preview" aria-live="polite" hidden></p>
+      <p class="muted small">Blue Iris clip and alert folders work. <code>.bvr</code> clips cannot be read: export them to MP4 in Blue Iris first.</p>
+    </div>
+    <div class="tr-field" data-source="url">
+      <label for="import-url">Video URL</label>
+      <input type="url" id="import-url" name="url" placeholder="https://...">
+      <p class="muted small">Downloaded with yt-dlp. Sites that list unsecured or private cameras (Insecam and the like) are refused, and live streams are never read.</p>
+    </div>
+    <div class="tr-field" data-source="dataset">
+      <label for="import-dataset">Pinned footage</label>
+      <select id="import-dataset" name="dataset">{% for d in footage %}<option value="{{ d.key }}">{{ d.key }}: {{ d.title }} ({{ d.license }}, {{ d.size }})</option>{% endfor %}</select>
+      <p class="muted small">Its licence is recorded with every frame; no confirmation needed.</p>
+    </div>
+    <div class="tr-field" data-source="path url">
+      <label for="import-license">Licence</label>
+      <input type="text" id="import-license" name="license" placeholder="own footage / CC BY 4.0">
+      <label class="check"><input type="checkbox" name="confirm_license"> I may use this footage for training under that licence</label>
+      <p class="muted small">Stored with every frame.</p>
+    </div>
+    <div class="tr-field tr-narrow">
+      <label for="import-frames">Frames to keep</label>
+      <input type="number" id="import-frames" name="frames" min="1" max="5000" value="200">
+    </div>
+    <div class="tr-field">
+      <label for="import-out">Save frames to</label>
+      <div class="with-browse tr-browse"><input type="text" id="import-out" name="out_dir" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="out_dir" data-title="Choose where to save the imported frames" hidden>Folder&hellip;</button></div>
+      <p class="muted small">Empty = the dataset folder, shown on the Collect and Review tabs. Another folder gets the same layout (<code>&lt;scene&gt;/&lt;camera&gt;/&lt;date&gt;/</code>, sidecars, review queue); review them by choosing this folder on the Review tab.</p>
+    </div>
+    <details class="tr-more">
+      <summary>Sampling options</summary>
+      <div class="tr-grid">
+        <div class="tr-field">
+          <label for="import-select">Selection</label>
+          <select id="import-select" name="select"><option value="siglip">SigLIP 2 embeddings, k-center</option><option value="dhash">dHash k-center</option></select>
+          <p class="muted small">dHash: image folders import without a GPU or a download.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-scene">Scene-change threshold</label>
+          <input type="number" id="import-scene" name="scene" min="0" max="1" step="0.005" value="0.01">
+          <p class="muted small">0.01 = motion in a fixed camera, 0.3 = cuts (FFmpeg <code>select</code>).</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-fps">Max frames per second</label>
+          <input type="number" id="import-fps" name="max_fps" min="0" max="60" step="0.5" value="1">
+          <p class="muted small">Scene changes kept at most at this rate.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-dedup">Dedup window (s)</label>
+          <input type="number" id="import-dedup" name="dedup_window" min="0" max="86400" step="1" value="10">
+          <p class="muted small">Near duplicates (dHash) within this time are dropped.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-every">One frame every (s)</label>
+          <input type="number" id="import-every" name="every" min="0" max="3600" step="1" value="10">
+          <p class="muted small">Also a periodic frame when nothing moves; 0 = off.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-max-candidates">Candidates per video</label>
+          <input type="number" id="import-max-candidates" name="max_candidates" min="1" max="20000" step="1" placeholder="1500">
+          <p class="muted small">At most this many frames read from one video; the 20,000 of an import are shared fairly by cameras, videos and images.</p>
+        </div>
+        <div class="tr-field">
+          <label for="import-camera">Camera folder</label>
+          <input type="text" id="import-camera" name="camera">
+          <p class="muted small">Empty = from the file names.</p>
+        </div>
+      </div>
+      <label class="check"><input type="checkbox" name="no_balance"> Do not balance by scene</label>
+      <p class="muted small">Without it, the picked frames are balanced by day / night / IR.</p>
+    </details>
+    {% if let Some(what) = import_large %}
+    <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB: {{ what }}</label>
+    {% endif %}
+    <label class="check"><input type="checkbox" name="autolabel" id="import-autolabel"> Auto-label the imported frames when the import finishes</label>
+    <p class="muted small">Uses the settings of your last run on the <a href="/train/autolabel">Auto-label tab</a> (the defaults until then) and the classes below; the run labels this import's frames. It does not run when the import fails, is cancelled or writes no new frame.</p>
+    <div class="tr-sub" id="import-after">
+      <div class="tr-classes" id="import-al-classes">
+        <span class="field-label" id="import-al-cap">Classes to look for</span>
+        <div id="import-al-picker" aria-labelledby="import-al-cap"><p class="muted small">Without scripts the labelers use the class list and <code>training.synonyms</code>.</p></div>
+      </div>
+      {% if let Some(what) = autolabel_large %}
+      <label class="check tr-confirm"><input type="checkbox" name="al.confirm_large"> Allow auto-label downloads over 500 MB: {{ what }}</label>
+      {% endif %}
+      <label class="check"><input type="checkbox" name="after_reject" id="import-after-reject"> <span>Then reject auto boxes scoring <span class="tr-keep">below <input type="number" name="after_reject_score" id="import-after-reject-score" class="al-num" min="0.01" max="1" step="0.01" value="0.3" aria-label="Reject auto boxes scoring below"></span></span></label>
+      <p class="muted small">Kept as hard negatives (<code>low_score</code>); a reviewer can still change them per frame.</p>
+      <label class="check"><input type="checkbox" name="after_accept" id="import-after-accept"> <span>Then accept frames whose boxes are all <em>auto: accept</em> (saved as reviewed)</span></label>
+      <p class="muted small">Those frames skip your look; leave it off until you trust the labelers on this footage.</p>
+    </div>
+    <div id="import-after-folder">
+      <label class="check"><input type="checkbox" name="after_review_folder" id="import-after-review-folder"> <span>Show this folder on the Review tab when done</span></label>
+      <p class="muted small">Needs <em>Save frames to</em>; with or without auto-label.</p>
+    </div>
+    <p id="import-autolabel-msg" class="form-msg" role="status"></p>
+    <div class="actions"><button type="submit">Import</button></div>
+  </form>
+  {% if !imports.is_empty() %}
+  <details class="tr-more">
+  <summary>Recent imports ({{ imports.len() }})</summary>
+  <p class="muted small">In <code>{{ imports_dir }}</code>, the folder auto-label works on (the Review tab's).</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Cameras</th><th></th></tr></thead>
+    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}{% if let Some(a) = i.attribution %}<br><span class="muted small">{{ a }}</span>{% endif %}</td><td class="num">{{ i.frames }}</td><td>{{ i.cameras.join(", ") }}</td><td>{% if i.frames > 0 %}<a class="small" href="/train/autolabel?import={{ i.id }}&amp;status=any&amp;limit={{ i.frames }}">Auto-label</a>{% endif %}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  </details>
+  {% endif %}
+</div>

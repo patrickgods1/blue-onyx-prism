@@ -6,7 +6,7 @@
 //! up. Beside AP, the alerting figures of the post-training benchmark at its configured threshold
 //! (every held-out frame): person recall, vehicle recall (car/truck/bus merged) and false alerts
 //! on frames without any object (best = highest recall, lowest false-alert rate). Pure; the
-//! Training page and `train run --scene ... --scene ...` render it. Runs that differ only by
+//! Train tab and `train run --scene ... --scene ...` render it. Runs that differ only by
 //! training seed (`--seeds`, "Repeat with N seeds") also get a "mean of N seeds" summary
 //! ([`SeedSummary`]: mean and range per column; never the best of a column).
 

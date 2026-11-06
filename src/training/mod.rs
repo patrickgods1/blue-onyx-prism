@@ -1,5 +1,5 @@
 //! In-app model training (docs/TRAINING.md): fine-tune YOLO26 / YOLO11 / YOLOv8 (Ultralytics,
-//! AGPL-3.0), RF-DETR, RT-DETRv2 or D-FINE (Apache-2.0) on the frames reviewed on the Review page,
+//! AGPL-3.0), RF-DETR, RT-DETRv2 or D-FINE (Apache-2.0) on the frames reviewed on the Review tab,
 //! export a static ONNX, install it next to the other models, add it to the config and benchmark
 //! it on held-out frames it did not train on (whole camera days when there are several, a share of
 //! the frames when there is one; other days of a held-out camera may train).
@@ -21,7 +21,7 @@
 //! - [`bench`]: the benchmark at the end of a run, and the current default on the same frames.
 //! - [`switch`]: making a trained model the default safely: the diff, copied settings, the
 //!   suggested threshold, Revert.
-//! - [`cli`]: `blue-onyx-prism train ...`. The Training page is `crate::server` (`/training`).
+//! - [`cli`]: `blue-onyx-prism train ...`. The Train tab is `crate::server` (`/training`).
 //!
 //! Like the export, training is user-triggered only (never by `auto_download`), runs downloaded
 //! code only from pinned, hashed sources, and keeps everything under `<data root>/tools` (the
@@ -127,7 +127,7 @@ pub fn runs_file(config: &Config) -> PathBuf {
     training_dir(config).join(service::RUNS_FILE)
 }
 
-/// Review exports found under `<training dir>/exports/` (the Review page's default export
+/// Review exports found under `<training dir>/exports/` (the Review tab's default export
 /// folder), newest first, at most 20: folders with a `classes.txt` or `data.yaml`.
 pub fn discover_exports(config: &Config) -> Vec<PathBuf> {
     let root = training_dir(config).join("exports");
@@ -160,7 +160,7 @@ pub fn public_subset_installed(root: &Path) -> bool {
 
 /// The large-download gate of the public night subset (about 926 MB, over the 500 MB limit like
 /// the training environment): refuse a run that would download it unless `allowed`
-/// (`--allow-large`, the Training page's download confirmation, or `allow_large_downloads`).
+/// (`--allow-large`, the Train tab's download confirmation, or `allow_large_downloads`).
 /// Nothing to refuse when it is downloaded already.
 pub fn check_public_download(root: &Path, allowed: bool) -> Result<()> {
     let Some(r) = catalog::lila_night() else {
@@ -174,7 +174,7 @@ pub fn check_public_download(root: &Path, allowed: bool) -> Result<()> {
     }
     bail!(
         "the public night subset ({}, {} images) is a large download ({}, over the 500 MB \
-         limit) and is not downloaded yet under {}: rerun with --allow-large (Training page: tick \
+         limit) and is not downloaded yet under {}: rerun with --allow-large (Train area: tick \
          \"Download what is missing\"), enable allow_large_downloads, or train without the \
          public subset",
         r.id,
@@ -333,7 +333,7 @@ pub fn preview_parts(config: &Config, request: &TrainRequest) -> Result<Preview>
     if datasets.is_empty() {
         bail!(
             "no dataset: choose a review export folder or set training.datasets (export reviewed \
-             frames from the Review page in YOLO format first)"
+             frames from the Dataset tab in YOLO format first)"
         );
     }
     let datasets: Vec<PathBuf> = datasets.iter().map(|d| config.data_path(d)).collect();
@@ -474,7 +474,7 @@ pub fn plan_job(
     if request.datasets.is_empty() {
         bail!(
             "no dataset: pass --dataset <review export folder> or set training.datasets (export \
-             reviewed frames from the Review page in YOLO format first)"
+             reviewed frames from the Dataset tab in YOLO format first)"
         );
     }
     request.datasets = request

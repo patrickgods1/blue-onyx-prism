@@ -63,7 +63,7 @@ impl Bucket {
         Self::ALL.into_iter().find(|b| b.as_str() == s)
     }
 
-    /// Short human text for the Dataset page.
+    /// Short human text for the Collect tab.
     pub fn describe(self) -> &'static str {
         match self {
             Bucket::Positive => "Detections in the reply",
@@ -287,7 +287,7 @@ pub(crate) fn empty_record() -> Record {
     }
 }
 
-/// One line of a day folder's `index.jsonl`: what the Dataset page and the later stages list
+/// One line of a day folder's `index.jsonl`: what the Collect tab and the later stages list
 /// without opening every sidecar.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexLine {

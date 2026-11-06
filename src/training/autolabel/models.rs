@@ -552,7 +552,7 @@ pub fn resolve(config: &Config, id: &str, device: Option<&str>) -> Result<ModelP
     }
     bail!(
         "no model '{id}': not a configured model, local:<file> or resource:<catalog id> \
-         (GET /v1/autolabel/models, the Training page's model list, shows every choice)"
+         (GET /v1/autolabel/models, the Auto-label tab's model list, shows every choice)"
     )
 }
 

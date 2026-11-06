@@ -1,10 +1,14 @@
-// Training page: the forms' show / hide (import source, auto-label mode, night augmentation,
-// the model name with several models ticked; without JS every field shows and works), live
-// progress of the queued and running training runs and import / auto-label jobs (polls
-// GET /v1/training) and a reload when one finishes, so the results show.
-// Auto-label after import: a ticked import posts the Auto-label card's fields as `al.<name>`
-// hidden inputs (its classes included); the box and its follow-up options are remembered in
-// localStorage. A Recent imports row's Auto-label button fills the card's filter (import=<id>).
+// The Import, Auto-label, Train and Models tabs of the Train area. One file for the four: each block
+// looks up its form or card and returns when this tab does not have it. The forms' show / hide
+// (import source, auto-label mode, night augmentation, the model name with several models ticked;
+// without JS every field shows and works), live progress of the queued and running training runs
+// and import / auto-label jobs (polls GET /v1/training) and a reload when one finishes, so the
+// results show.
+// Auto-label after import: a ticked import posts the settings of the last Auto-label run (kept in
+// localStorage, else the form's defaults) as `al.<name>` hidden inputs, with the classes picked on
+// the Import tab; the box and its follow-up options are remembered in localStorage. A link to
+// /train/autolabel?<filters> (Review's "Auto-label these frames", a Recent imports row) fills the
+// form's Which frames; /train/train?dataset=<folder> ticks that export.
 // Train: the runs line (one run per ticked scene per model, named before queuing), the class
 // picker of the ticked folders (counts per scene, warnings), the balance preview (what the
 // Balance fieldset does to each run's training frames) and Finish now while training, plus the
@@ -14,7 +18,8 @@
 // SAM 3: the three-step access panel of the Auto-label card (GET /v1/autolabel/sam3); its option
 // in the labeler select stays disabled until the checkpoint is installed. Its threshold field
 // shows only while SAM 3 is the chosen labeler.
-// Auto-label frames: the "Which frames" select writes Status and Auto (the fields the form posts;
+// Auto-label frames: the line above the button says what a run looks at, and the "Which frames"
+// select under Advanced writes Status and Auto (the fields the form posts;
 // the select itself has no name, so the import chain's `al.*` copy and the form's restore are the
 // fields as before); Custom shows them. Preview frames posts the form to
 // POST /training/autolabel/preview on a click (it reads every sidecar) and draws the answer.
@@ -102,6 +107,50 @@
     });
     if (Array.isArray(saved.classes) && saved.classes.length) restoredClasses[id] = saved.classes;
   });
+
+  // A link's filters into the Auto-label form, before the blocks below read its fields. Keys with a
+  // field of their own fill it; the others, and a value its select does not offer, go to the filter
+  // text. The note above the form says what was filled and Clear goes back to the defaults.
+  (function () {
+    var form = document.getElementById("autolabel-form");
+    if (!form) return;
+    var q = new URLSearchParams(window.location.search);
+    var parts = [], said = [];
+    ["status", "scene", "camera", "label", "auto", "limit"].forEach(function (k) {
+      var v = q.get(k), e = form.elements[k];
+      if (!v) return;
+      if (e) {
+        var was = e.value;
+        e.value = v;
+        if (e.options && e.value !== v) { e.value = was; parts.push(k + "=" + v); }
+      } else parts.push(k + "=" + v);
+      if (k !== "limit") said.push(k + " " + v);
+    });
+    ["bucket", "source", "import"].forEach(function (k) {
+      var v = q.get(k);
+      if (!v) return;
+      parts.push(k + "=" + v);
+      if (k !== "source") said.push(k + " " + v);
+    });
+    if (form.elements.frames && parts.length) form.elements.frames.value = parts.join(",");
+    if (q.get("again") === "1" && form.elements.again) form.elements.again.checked = true;
+    var note = document.getElementById("al-prefill"), text = document.getElementById("al-prefill-text");
+    if (note && text && said.length) {
+      text.textContent = "Filled in from your link: " + said.join(", ") + ".";
+      note.hidden = false;
+    }
+  })();
+
+  // A link's export: its box ticked, or the Another folder field when the list does not offer it.
+  (function () {
+    var form = document.getElementById("train");
+    var want = new URLSearchParams(window.location.search).get("dataset");
+    if (!form || !want) return;
+    var boxes = form.querySelectorAll('input[name="dataset"]');
+    var hit = Array.prototype.filter.call(boxes, function (b) { return b.value === want && !b.disabled; })[0];
+    if (hit) hit.checked = true;
+    else if (form.elements.dataset_path) form.elements.dataset_path.value = want;
+  })();
 
   // "Select best by": the hint of the chosen metric (the server's list, on each option).
   (function () {
@@ -321,6 +370,44 @@
     load();
   })();
 
+  // The class picker's entries of catalog `cat`.
+  function alEntries(cat) {
+    var out = window.ClassPicker.util.mergeEntries(cat.entries || [], (cat.classes || []));
+    out.forEach(function (e) { if ((cat.classes || []).indexOf(e.name) >= 0) e.in_list = true; e.hidden = (cat.hidden || []).indexOf(e.name) >= 0; });
+    return out;
+  }
+  // What the picker `picker` holds, for the Preview and the auto-label an import chains.
+  function alSelection(picker, catalog, CP) {
+    var names = picker.getSelected();
+    return {
+      names: names,
+      missing: CP.util.missingFrom(names, catalog.classes || []).length > 0,
+      listed: function () { return names.filter(function (n) { return (catalog.classes || []).indexOf(n) >= 0; }); },
+      ensure: function () { return CP.ensureInList(names, catalog); }
+    };
+  }
+
+  // Auto-label classes on the Import tab: the same picker, for a run the import chains.
+  (function () {
+    var holder = document.getElementById("import-al-picker"), CP = window.ClassPicker;
+    if (!holder || !CP) return;
+    var picker = null, catalog = null;
+    CP.fetchCatalog().then(function (cat) {
+      catalog = cat;
+      picker = CP.create(holder, {
+        entries: alEntries(cat), selected: CP.util.defaultSelection(cat), mode: "compact", label: "Classes", allowAdd: true,
+        quickSets: CP.util.quickSetsFor(cat)
+      });
+    }).catch(function (e) {
+      holder.textContent = "";
+      var p = document.createElement("p");
+      p.className = "muted small";
+      p.textContent = "The class list could not be read (" + e.message + "); the labelers use the class list and training.synonyms.";
+      holder.appendChild(p);
+    });
+    alClasses = function () { return picker ? alSelection(picker, catalog, CP) : null; };
+  })();
+
   // Auto-label classes: the class picker (class-picker.js). The chosen classes post as repeated
   // hidden `classes` fields; one outside the class list is appended to it first (after a confirm,
   // POST /v1/review/classes, append only).
@@ -330,15 +417,10 @@
     if (!form || !holder || !CP) return;
     var picker = null, catalog = null, confirmed = false;
     var say = function (t, bad) { if (msg) { msg.textContent = t || ""; msg.className = "form-msg" + (bad ? " error-text" : ""); } };
-    var entriesOf = function (cat) {
-      var out = CP.util.mergeEntries(cat.entries || [], (cat.classes || []));
-      out.forEach(function (e) { if ((cat.classes || []).indexOf(e.name) >= 0) e.in_list = true; e.hidden = (cat.hidden || []).indexOf(e.name) >= 0; });
-      return out;
-    };
     CP.fetchCatalog().then(function (cat) {
       catalog = cat;
       picker = CP.create(holder, {
-        entries: entriesOf(cat), selected: restoredClasses["autolabel-form"] || CP.util.defaultSelection(cat), mode: "full", allowAdd: true,
+        entries: alEntries(cat), selected: restoredClasses["autolabel-form"] || CP.util.defaultSelection(cat), mode: "full", allowAdd: true,
         quickSets: CP.util.quickSetsFor(cat)
       });
     }).catch(function (e) {
@@ -378,15 +460,36 @@
         form.appendChild(i);
       });
     };
-    alClasses = function () {
-      if (!picker) return null;
-      var names = picker.getSelected();
-      return {
-        names: names,
-        missing: CP.util.missingFrom(names, catalog.classes || []).length > 0,
-        listed: function () { return names.filter(function (n) { return (catalog.classes || []).indexOf(n) >= 0; }); },
-        ensure: function () { return CP.ensureInList(names, catalog); }
-      };
+    alClasses = function () { return picker ? alSelection(picker, catalog, CP) : null; };
+    var postJson = function (url, body) {
+      return fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(body)
+      }).then(function (res) {
+        return res.json().catch(function () { return null; }).then(function (j) {
+          if (!res.ok || !j || j.success === false) throw new Error((j && j.message) || "HTTP " + res.status);
+          return j;
+        });
+      });
+    };
+    // "Hide the classes left unticked": listed, wanted classes the run skips stop being wanted
+    // (their pending boxes are rejected by the class save), then the reviewed frames that still
+    // hold accepted boxes of them ask. Cancel only skips them in this run.
+    var hideUnticked = function (names) {
+      var box = document.getElementById("al-hide-unticked");
+      var list = catalog.classes || [], hidden = catalog.hidden || [];
+      var skipped = !box || !box.checked ? [] : list.filter(function (c) { return names.indexOf(c) < 0 && hidden.indexOf(c) < 0; });
+      if (!skipped.length || !window.confirm("Hide and auto-reject " + skipped.join(", ") + " in Review? (Cancel = only skip them in this run)")) return Promise.resolve();
+      return postJson("/v1/review/classes", { classes: list.slice(), hidden: hidden.concat(skipped) }).then(function (j) {
+        catalog.classes = j.classes || list;
+        if (j.hidden) catalog.hidden = j.hidden;
+        var r = j.reviewed_with_unwanted;
+        if (!r || !(r.frames > 0)) return null;
+        if (!window.confirm(r.frames + " reviewed frame(s) have " + r.boxes + " accepted box(es) of " + (r.classes || []).join(", ") +
+          ". Reject those too? They are kept as evidence (reason other_class) and the frames stay reviewed; Cancel keeps them as training labels.")) return null;
+        return postJson("/v1/review/reject-unwanted-reviewed", {});
+      });
     };
     form.addEventListener("submit", function (ev) {
       if (mode() === "model" && !modelProblemOk(ev)) return;
@@ -395,15 +498,43 @@
       if (!names.length) { ev.preventDefault(); say("Choose at least one class to look for.", true); return; }
       say("", false);
       fields(names);
-      if (confirmed || !CP.util.missingFrom(names, catalog.classes || []).length) { confirmed = false; return; }
+      if (confirmed) { confirmed = false; return; }
+      var hide = document.getElementById("al-hide-unticked");
+      if (!CP.util.missingFrom(names, catalog.classes || []).length && !(hide && hide.checked)) return;
       ev.preventDefault();
       var by = ev.submitter;
-      CP.ensureInList(names, catalog).then(function () {
+      hideUnticked(names).then(function () { return CP.ensureInList(names, catalog); }).then(function () {
         confirmed = true;
         if (form.requestSubmit) form.requestSubmit(by || undefined); else form.submit();
       }).catch(function (e) { say(e.cancelled ? "Not queued: the class list was left as it is." : e.message, true); });
     });
   })();
+
+  // The settings of an auto-label run, kept for the run an import chains on the Import tab: the
+  // form's fields without the frames, classes and confirmations, which are that form's own.
+  var AL_OPTIONS = "bop.training.alOptions";
+  var AL_DEFAULTS = [
+    ["mode", "labelers"], ["gdino", "tiny"], ["vlm", "2b"], ["vlm_batch", "on"], ["vlm_min_on", "on"],
+    ["vlm_min_score", "0.15"], ["rfdetr", "on"], ["siglip", "on"], ["prefetch", "on"],
+    ["run_options", "1"], ["keep_on_cancel", "on"]
+  ];
+  var AL_NOT_OPTIONS = ["classes", "confirm_large", "status", "scene", "camera", "label", "auto", "limit", "frames", "again", "missing_only"];
+  (function () {
+    var form = document.getElementById("autolabel-form");
+    if (!form) return;
+    form.addEventListener("formdata", function (ev) {
+      var kept = [];
+      ev.formData.forEach(function (value, name) {
+        if (typeof value === "string" && AL_NOT_OPTIONS.indexOf(name) < 0) kept.push([name, value]);
+      });
+      try { window.localStorage.setItem(AL_OPTIONS, JSON.stringify(kept)); } catch (e) { /* defaults next time */ }
+    });
+  })();
+  function alOptions() {
+    var kept = null;
+    try { kept = JSON.parse(window.localStorage.getItem(AL_OPTIONS) || "null"); } catch (e) { kept = null; }
+    return Array.isArray(kept) && kept.length ? kept : AL_DEFAULTS;
+  }
 
   // "Which frames" is the one writer of Status and Auto while it names a preset, and the model
   // mode's First pass / Self-training check only moves it. On load it is worked out from the
@@ -434,14 +565,26 @@
       var s = status.value || "unreviewed";
       modelPreset.value = s === "any" ? "self-training" : s === "unreviewed" ? "first-pass" : "";
     };
+    // The line above the button: what a run looks at, while its fields sit under Advanced.
+    var scope = function () {
+      var line = document.getElementById("al-scope");
+      if (!line) return;
+      var limit = form.elements.limit ? form.elements.limit.value : "";
+      var what = which.value === "custom" ? "frames matching your filters" :
+        which.options[which.selectedIndex].text.toLowerCase() + (which.value === "all" ? " frames" : which.value.indexOf("overlaps") > 0 ? "" : " frames");
+      var again = form.elements.again && form.elements.again.checked;
+      line.textContent = "Looks at up to " + limit + " " + what + (again ? ", also ones these labelers already looked at" : "") + ". Change that under Advanced.";
+    };
     var apply = function () {
       var p = PRESETS[which.value];
       if (p) { status.value = p[0]; auto.value = p[1]; }
       form.querySelectorAll("[data-al-custom]").forEach(function (el) { el.hidden = !!p; });
       CUSTOM_ONLY.forEach(function (n) { var e = form.elements[n]; if (e) e.disabled = !!p; });
       syncModel();
+      scope();
     };
     which.addEventListener("change", apply);
+    form.addEventListener("change", scope);
     status.addEventListener("change", syncModel);
     if (modelPreset) {
       modelPreset.addEventListener("change", function () {
@@ -531,7 +674,6 @@
   // are disabled, so not posted), the Review folder switch while "Save frames to" has a value.
   (function () {
     var form = document.getElementById("import-form");
-    var alForm = document.getElementById("autolabel-form");
     var box = document.getElementById("import-autolabel");
     if (!form || !box) return;
     var after = document.getElementById("import-after");
@@ -577,11 +719,11 @@
       form.querySelectorAll("input.al-injected").forEach(function (i) { i.remove(); });
       say("");
       remember();
-      if (!box.checked || !alForm) return;
+      if (!box.checked) return;
       var cls = alClasses ? alClasses() : null;
       if (cls && !cls.names.length) {
         ev.preventDefault();
-        say("Auto-label: choose at least one class to look for on the Auto-label card.");
+        say("Auto-label: choose at least one class to look for.");
         return;
       }
       if (cls && cls.missing && !confirmed) {
@@ -599,40 +741,8 @@
         i.type = "hidden"; i.name = "al." + name; i.value = value; i.className = "al-injected";
         form.appendChild(i);
       };
-      new FormData(alForm).forEach(function (value, name) {
-        if (typeof value !== "string") return;
-        if (cls && name === "classes") return;
-        add(name, value);
-      });
+      alOptions().forEach(function (p) { add(p[0], p[1]); });
       if (cls) cls.names.forEach(function (n) { add("classes", n); });
-    });
-
-    // Recent imports: Auto-label fills the card's filter with the import and scrolls to it.
-    document.querySelectorAll("[data-al-fallback]").forEach(function (a) { a.hidden = true; });
-    document.querySelectorAll("button[data-al-import]").forEach(function (b) {
-      b.hidden = false;
-      b.addEventListener("click", function () {
-        if (!alForm) return;
-        var frames = document.getElementById("al-frames");
-        var status = document.getElementById("al-status");
-        var limit = document.getElementById("al-limit");
-        var n = parseInt(b.getAttribute("data-al-frames"), 10);
-        if (!(n >= 1)) n = 1;
-        // The import's filter is Custom's: the fields must be enabled before they are filled.
-        var which = document.getElementById("al-which");
-        if (which) { which.value = "custom"; which.dispatchEvent(new Event("change", { bubbles: true })); }
-        if (frames) {
-          frames.value = "import=" + b.getAttribute("data-al-import");
-          var d = frames.closest("details");
-          if (d) d.open = true;
-        }
-        if (status) { status.value = "any"; status.dispatchEvent(new Event("change", { bubbles: true })); }
-        if (limit) limit.value = String(Math.min(n, 20000));
-        var card = document.getElementById("autolabel");
-        if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
-        var submit = alForm.querySelector('.actions button[type="submit"]');
-        if (submit) submit.focus({ preventScroll: true });
-      });
     });
   })();
 
@@ -1138,7 +1248,7 @@
         [p.scene_filtered, "outside this run's scenes"]
       ].filter(function (x) { return x[0] > 0; }).map(function (x) { return x[0] + " " + x[1]; });
       if (left.length) d.appendChild(mk("p", "muted small", "Left out of training: " + left.join("; ") + "."));
-      if (p.hard_negatives > 0) d.appendChild(mk("p", "muted small", p.hard_negatives + " of the frames without objects were confirmed empty or had a box rejected on the Review page."));
+      if (p.hard_negatives > 0) d.appendChild(mk("p", "muted small", p.hard_negatives + " of the frames without objects were confirmed empty or had a box rejected on the Review tab."));
       if ((p.notes || []).length) d.appendChild(list(p.notes, "muted small"));
       if ((p.warnings || []).length) d.appendChild(list(p.warnings, "warn-list small"));
       return d;
@@ -1273,7 +1383,7 @@
     return shown.join(", ") + (more > 0 ? " and " + more + " more" : "");
   };
 
-  // Use card, "Use as default": GET /v1/training/switch-preview draws what would change in the
+  // Models tab, Use card, "Use as default": GET /v1/training/switch-preview draws what would change in the
   // row under the model, nothing is saved until Switch is pressed. Copy settings changes the
   // "After" column; the threshold box too. Without JS the form posts a switch with the settings
   // copied, which Revert undoes.
@@ -1679,7 +1789,7 @@
         renderMetrics(data, false);
         // Not reload(): the page may be the answer to a POST, and reloading it would ask to
         // resubmit (and queue the job again).
-        if (a || b) window.location.assign("/training" + window.location.hash);
+        if (a || b) window.location.assign(window.location.pathname + window.location.hash);
       })
       .catch(function () {});
   }

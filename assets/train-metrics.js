@@ -1,4 +1,4 @@
-// Blue Onyx Prism: Training page metrics view (window.TrainMetrics).
+// Blue Onyx Prism: run metrics view of the Train area (window.TrainMetrics).
 // render(el, progress, columns, metrics, opts) fills one `.tr-metrics` block from a run's
 // progress record (`history` per epoch, `best`): KPI tiles with the change since the previous
 // epoch (learning rate, convergence countdown, finish time among them), an overfitting hint,

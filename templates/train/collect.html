@@ -1,7 +1,7 @@
 {% extends "base.html" %}
-{% block title %}Dataset{% endblock %}
+{% block title %}{{ tab_title }}{% endblock %}
 {% block content %}
-<h1>Dataset</h1>
+{% include "train/tabs.html" %}
 <p class="warn">The collector saves frames Blue Iris sends to this machine, with what the model saw, for review and training. They contain whatever your cameras see. They stay on this machine in the folder below and are never uploaded anywhere. Format: <code>docs/DATASET.md</code>.</p>
 {% if let Some(m) = message %}<p class="notice">{{ m }}</p>{% endif %}
 {% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
@@ -39,50 +39,53 @@
   <h2>Settings <span class="tag now">applies now</span></h2>
   <form method="post" action="/dataset/settings">
     <label class="check"><input type="checkbox" name="enabled"{% if enabled %} checked{% endif %}> Collect frames</label>
-    <div class="scroll">
-    <table class="buckets">
-      <thead><tr><th>Bucket</th><th>Saved when</th><th>On</th><th>Rate (0..1)</th><th>Min interval per camera (s)</th><th>Saved</th></tr></thead>
-      <tbody>
-      {% for b in buckets %}
-      <tr>
-        <td><code>{{ b.key }}</code></td>
-        <td>{{ b.describe }}</td>
-        <td><input type="checkbox" name="{{ b.key }}.enabled" aria-label="{{ b.key }} on"{% if b.enabled %} checked{% endif %}></td>
-        <td><input type="number" name="{{ b.key }}.rate" aria-label="{{ b.key }} rate" min="0" max="1" step="0.01" value="{{ b.rate }}"></td>
-        <td><input type="number" name="{{ b.key }}.interval" aria-label="{{ b.key }} interval" min="0" step="1" value="{{ b.interval }}"></td>
-        <td class="num">{{ b.saved }}</td>
-      </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-    </div>
     <div class="fields">
-      <label>Near-threshold margin <input type="number" name="near_threshold.margin" min="0.01" max="0.5" step="0.01" value="{{ near_margin }}"></label>
       <label>Max size (GB) <input type="number" name="max_gb" min="0.1" step="0.1" value="{{ max_gb }}"></label>
       <label>Max age (days, 0 = keep) <input type="number" name="max_age_days" min="0" step="1" value="{{ max_age_days }}"></label>
-      <label>Dedup distance (dHash bits) <input type="number" name="dedup_hamming" min="0" max="32" step="1" value="{{ dedup_hamming }}"></label>
-      <label class="wide">Folder <span class="with-browse"><input type="text" name="dir" value="{{ dir_setting }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the dataset folder" hidden>Browse&hellip;</button></span><span class="muted small">Empty = <span class="nowrap"><code>dataset</code></span> under the data folder.</span></label>
     </div>
     <div class="actions"><button type="submit">Save</button></div>
+    <details class="tr-more" id="collect-advanced">
+      <summary>Advanced</summary>
+      <p class="muted">Which kinds of frame are kept, how often, and how alike two frames may be. Saved with the button above.</p>
+      <div class="scroll">
+      <table class="buckets">
+        <thead><tr><th>Bucket</th><th>Saved when</th><th>On</th><th>Rate (0..1)</th><th>Min interval per camera (s)</th><th>Saved</th></tr></thead>
+        <tbody>
+        {% for b in buckets %}
+        <tr>
+          <td><code>{{ b.key }}</code></td>
+          <td>{{ b.describe }}</td>
+          <td><input type="checkbox" name="{{ b.key }}.enabled" aria-label="{{ b.key }} on"{% if b.enabled %} checked{% endif %}></td>
+          <td><input type="number" name="{{ b.key }}.rate" aria-label="{{ b.key }} rate" min="0" max="1" step="0.01" value="{{ b.rate }}"></td>
+          <td><input type="number" name="{{ b.key }}.interval" aria-label="{{ b.key }} interval" min="0" step="1" value="{{ b.interval }}"></td>
+          <td class="num">{{ b.saved }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      <div class="fields">
+        <label>Near-threshold margin <input type="number" name="near_threshold.margin" min="0.01" max="0.5" step="0.01" value="{{ near_margin }}"></label>
+        <label>Dedup distance (dHash bits) <input type="number" name="dedup_hamming" min="0" max="32" step="1" value="{{ dedup_hamming }}"></label>
+        <label class="wide">Folder <span class="with-browse"><input type="text" name="dir" value="{{ dir_setting }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the dataset folder" hidden>Browse&hellip;</button></span><span class="muted small">Empty = <span class="nowrap"><code>dataset</code></span> under the data folder.</span></label>
+      </div>
+      <h3>Frames by scene and bucket</h3>
+      <p class="muted">A frame counts once in each bucket it was kept for.</p>
+      <div class="scroll">
+      <table>
+        <thead><tr><th>Scene</th>{% for n in bucket_names %}<th>{{ n }}</th>{% endfor %}</tr></thead>
+        <tbody>
+        {% for s in scenes %}<tr><td>{{ s.scene }}</td>{% for c in s.counts %}<td class="num">{{ c }}</td>{% endfor %}</tr>{% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </details>
   </form>
 </div>
 
 <div class="card">
-  <h2>Frames by scene and bucket</h2>
-  <p class="muted">A frame counts once in each bucket it was kept for.</p>
-  <div class="scroll">
-  <table>
-    <thead><tr><th>Scene</th>{% for n in bucket_names %}<th>{{ n }}</th>{% endfor %}</tr></thead>
-    <tbody>
-    {% for s in scenes %}<tr><td>{{ s.scene }}</td>{% for c in s.counts %}<td class="num">{{ c }}</td>{% endfor %}</tr>{% endfor %}
-    </tbody>
-  </table>
-  </div>
-</div>
-
-<div class="card">
   <h2>Frames by detected class</h2>
-  <p class="muted">The labels the model reported when the frame was collected (a frame counts once per class). Reviewed labels are counted on the <a href="/review">Review</a> page and in the export report.</p>
+  <p class="muted">The labels the model reported when the frame was collected (a frame counts once per class). Reviewed labels are counted on the <a href="/train/dataset#coverage">Dataset</a> tab and in the export report.</p>
   {% if labels.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
   <div class="scroll">
   <table>
@@ -109,7 +112,7 @@
 
 <div class="card">
   <h2>Imported footage</h2>
-  <p class="muted">Frames imported on the <a href="/training#import">Training</a> page or with <code>train import</code> (videos, image folders, Blue Iris clips, URLs, pinned open footage) are stored here like collected frames, with no bucket, and queued for review. Their sidecars carry the source and licence.</p>
+  <p class="muted">Frames imported on the <a href="/train/import">Import</a> tab or with <code>train import</code> (videos, image folders, Blue Iris clips, URLs, pinned open footage) are stored here like collected frames, with no bucket, and queued for review. Their sidecars carry the source and licence.</p>
   {% if imports.is_empty() %}<p class="muted">No imports yet.</p>{% else %}
   <div class="scroll"><table>
     <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Scenes</th><th>Cameras</th></tr></thead>
@@ -137,16 +140,5 @@
   </form>
   {% endif %}
 </div>
-<dialog id="browse-dialog">
-  <h3 id="browse-title">Choose a folder</h3>
-  <div class="browse-bar">
-    <select id="browse-roots" aria-label="Places"></select>
-    <button type="button" id="browse-up" class="small">Up</button>
-  </div>
-  <div id="browse-path" class="browse-path"></div>
-  <div id="browse-list" class="browse-list"></div>
-  <p id="browse-msg" class="muted" role="status"></p>
-  <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
-</dialog>
-<script src="/static/browse.js?v={{ version }}"></script>
+{% include "train/browse_dialog.html" %}
 {% endblock %}

@@ -134,7 +134,7 @@ fn last_frame_at(s: &Status) -> Option<String> {
     })
 }
 
-/// The `collection` object of `GET /v1/dataset` and the Dataset page's Status card.
+/// The `collection` object of `GET /v1/dataset` and the Collect tab's Status card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Health {
     #[serde(flatten)]

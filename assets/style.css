@@ -413,6 +413,21 @@ details.help > summary:hover { color: var(--accent); }
 details.help > :not(summary) { color: var(--muted); margin: 0.4rem 0 0; }
 details.help[open] > summary { color: var(--fg); }
 
+/* Train area: sub-tabs at their own URLs, the status strip under them. */
+nav.train-tabs { display: flex; gap: 0; margin: 0 0 0.5rem; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
+nav.train-tabs a { flex: none; padding: 0.55rem 0.85rem; border-bottom: 2px solid transparent; margin-bottom: -1px; color: var(--muted); text-decoration: none; white-space: nowrap; }
+nav.train-tabs a:hover { color: var(--fg); }
+nav.train-tabs a.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent); }
+.train-strip { margin: 0 0 0.8rem; font-size: 0.88rem; }
+.train-strip[hidden] { display: none; }
+ul.train-counts { display: flex; flex-wrap: wrap; gap: 0.1rem 1rem; list-style: none; margin: 0 0 0.2rem; padding: 0; }
+ul.train-counts a { color: var(--fg); text-decoration: none; }
+ul.train-counts a:hover { color: var(--accent); }
+ul.train-counts strong { font-variant-numeric: tabular-nums; }
+.train-next { margin: 0; }
+.train-next-k { color: var(--muted); }
+.train-next a { white-space: nowrap; margin-left: 0.3rem; }
+
 /* Tab strip: the sticky nav.toc look; one panel at a time with JavaScript, all stacked without. */
 nav.tabs { gap: 0; padding: 0 0.4rem; }
 nav.tabs a[role="tab"] { padding: 0.6rem 0.9rem; border-bottom: 2px solid transparent; color: var(--muted); border-radius: 0; }
@@ -709,8 +724,15 @@ table.dt td button.small { padding: 0.12rem 0.5rem; margin: 0; }
   .review-side { position: static; height: auto; overflow: visible; }
   .review-side > .review-boxes { flex: none; max-height: 40vh; }
 }
-details.rv-folder-card > summary { margin: 0; color: var(--fg); overflow-wrap: anywhere; }
-details.rv-folder-card[open] > summary { margin-bottom: 0.6rem; }
+.rv-bar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 1rem; }
+.rv-bar .review-counts { flex: 1 1 20rem; min-width: 0; }
+.rv-al-link { white-space: nowrap; }
+details.rv-filters-card { margin: 0.2rem 0 0.5rem; font-size: 0.9rem; }
+details.rv-filters-card > summary { overflow-wrap: anywhere; margin: 0; }
+details.rv-filters-card[open] { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.8rem; }
+details.rv-filters-card[open] > summary { margin-bottom: 0.5rem; }
+details.rv-bulk > summary { margin: 0; font-weight: 600; }
+details.rv-bulk[open] > summary { margin-bottom: 0.6rem; }
 details.rv-panel-opts { font-size: 0.9rem; margin-top: 0.3rem; }
 details.rv-panel-opts > summary { margin: 0.2rem 0; font-size: 0.85rem; }
 details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25rem; color: var(--muted); margin: 0.4rem 0; }
@@ -833,11 +855,6 @@ label.grow { flex: 1 1 20rem; min-width: 0; }
 
 /* Training page (templates/training.html), scoped under .tr */
 .tr [hidden] { display: none !important; }
-ol.tr-steps { display: flex; flex-wrap: wrap; gap: 0.4rem; list-style: none; padding: 0; margin: 0.5rem 0 1rem; counter-reset: trstep; }
-ol.tr-steps li { counter-increment: trstep; }
-ol.tr-steps li a { display: inline-block; padding: 0.25rem 0.75rem; border: 1px solid var(--border); border-radius: 999px; background: var(--card); text-decoration: none; font-size: 0.9rem; }
-ol.tr-steps li a::before { content: counter(trstep) ". "; color: var(--muted); }
-ol.tr-steps li a:hover { border-color: var(--accent); }
 .tr .card, .tr form.card { scroll-margin-top: 4rem; }
 .tr-wrap, .tr-wrap p, .tr .tr-fact { overflow-wrap: anywhere; }
 /* Job and run logs wrap inside their cell: long lines (paths, warnings) would widen the table past the card. */

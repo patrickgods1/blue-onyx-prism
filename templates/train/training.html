@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}{{ tab_title }}{% endblock %}
+{% block content %}
+{% include "train/tabs.html" %}
+<div class="tr">
+{% if let Some(m) = message %}<p class="notice">{{ m }}</p>{% endif %}
+{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
+{% if jobs_busy %}{% include "train/jobs.html" %}{% endif %}
+{% if tab == "import" %}{% include "train/import.html" %}{% endif %}
+{% if tab == "autolabel" %}{% include "train/autolabel.html" %}{% endif %}
+{% if tab == "train" %}{% include "train/train.html" %}{% endif %}
+{% if tab == "models" %}{% include "train/models.html" %}{% endif %}
+{% if !jobs_busy %}{% include "train/jobs.html" %}{% endif %}
+</div>
+{% if tab != "models" %}<script src="/static/class-picker.js?v={{ version }}"></script>
+{% endif %}{% if tab == "autolabel" %}<script src="/static/model-picker.js?v={{ version }}"></script>
+{% endif %}{% if !runs.is_empty() || !results.is_empty() %}<script src="/static/bench-glossary.js?v={{ version }}"></script>
+<script src="/static/bench-charts.js?v={{ version }}"></script>
+<script src="/static/train-metrics.js?v={{ version }}"></script>
+{% endif %}<script src="/static/training.js?v={{ version }}"></script>
+{% if tab == "import" || tab == "train" %}{% include "train/browse_dialog.html" %}{% endif %}
+{% endblock %}

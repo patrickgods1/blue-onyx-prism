@@ -1,6 +1,6 @@
 //! The pre-flight report: what a run would train on and whether it is worth starting, from the same
 //! plan the run itself makes ([`planned`], used by the job, [`super::preview_plan`] and through it
-//! the Training page and `train prepare --dry-run`).
+//! the Train tab and `train prepare --dry-run`).
 //!
 //! - [`advice`]: warnings a plan alone cannot give (a class with few boxes, few held-out frames, a
 //!   scene with few frames), in [`dataset::Plan::warnings`] so they reach the run row and `train.log`;
@@ -128,7 +128,7 @@ pub fn refusals(plan: &Plan, sources: &[Source], opts: &Options) -> Vec<String> 
             .sum();
         out.push(if own == 0 {
             "No frame of your own to hold out, so this run could not be measured on your cameras: \
-             add a Review page export."
+             add a Dataset tab export."
                 .to_string()
         } else {
             format!(
@@ -250,7 +250,7 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
     match bulk_accepted {
         Some(n) if n > 0 => notes.push(format!(
             "{n} of {own} frame(s) ({:.0}%) were accepted in bulk: nobody looked at them one by \
-             one. Spot-check them on the Review page if the result disappoints.",
+             one. Spot-check them on the Review tab if the result disappoints.",
             100.0 * n as f64 / own.max(1) as f64
         )),
         Some(_) => {}
@@ -349,10 +349,10 @@ pub struct VolumeNeed {
 
 /// [`VolumeNeed::advice`] of the training folder.
 pub const TRAINING_ADVICE: &str = "free some space, or choose a Training folder on a bigger disk \
-     (This machine on the Training page, training.dir in the config)";
+     (This machine on the Train tab, training.dir in the config)";
 /// [`VolumeNeed::advice`] of the folder a model is installed in.
-pub const MODELS_ADVICE: &str = "free some space, or install the model in a folder on a bigger disk (Options on the Training \
-     page, --install-dir)";
+pub const MODELS_ADVICE: &str = "free some space, or install the model in a folder on a bigger disk (Advanced on the Train \
+     tab, --install-dir)";
 /// [`VolumeNeed::advice`] of the tools folder (environment, base weights).
 pub const TOOLS_ADVICE: &str = "free some space, or set download_dir to a bigger disk";
 

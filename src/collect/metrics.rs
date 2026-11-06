@@ -2,7 +2,7 @@
 //! `dataset_saved_total`, `dataset_no_bucket_total`, `dataset_frames_total{bucket}`,
 //! `dataset_dropped_total{reason}`, `dataset_bytes`, `dataset_collect_disabled`) and their
 //! Prometheus rendering, called from [`crate::metrics::render_prometheus`]. They count since this
-//! process started; the Dataset page reads them through [`super::health`].
+//! process started; the Collect tab reads them through [`super::health`].
 
 use super::Bucket;
 use std::fmt::Write;
@@ -42,7 +42,7 @@ impl Dropped {
         }
     }
 
-    /// The reason in plain words, for the Dataset page and `GET /v1/dataset`.
+    /// The reason in plain words, for the Collect tab and `GET /v1/dataset`.
     pub fn plain(self) -> &'static str {
         match self {
             Dropped::QueueFull => "Images came in faster than the disk could save them",

@@ -419,7 +419,7 @@ fn frames_without_tags_fall_back_and_never_validate_as_a_group() {
     let p = plan(&s, &o).unwrap();
     let w = split_warning(&p).unwrap();
     assert!(w.contains("no frame has a camera or day tag"), "{w}");
-    assert!(w.contains("Review page export"), "{w}");
+    assert!(w.contains("Dataset tab export"), "{w}");
     assert_eq!(p.valid, frame_split(&src, &o, 25));
 
     // Beside real days the untagged frames stay in training: they may be from any camera day.

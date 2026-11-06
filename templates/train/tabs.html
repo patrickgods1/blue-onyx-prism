@@ -1,0 +1,15 @@
+<h1 class="sr-only">Train: {{ tab_title }}</h1>
+<nav class="train-tabs" aria-label="Train">
+  <a href="/train/collect"{% if tab == "collect" %} class="active" aria-current="page"{% endif %}>Collect</a>
+  <a href="/train/import"{% if tab == "import" %} class="active" aria-current="page"{% endif %}>Import</a>
+  <a href="/train/autolabel"{% if tab == "autolabel" %} class="active" aria-current="page"{% endif %}>Auto-label</a>
+  <a href="/train/review"{% if tab == "review" %} class="active" aria-current="page"{% endif %}>Review</a>
+  <a href="/train/dataset"{% if tab == "dataset" %} class="active" aria-current="page"{% endif %}>Dataset</a>
+  <a href="/train/train"{% if tab == "train" %} class="active" aria-current="page"{% endif %}>Train</a>
+  <a href="/train/models"{% if tab == "models" %} class="active" aria-current="page"{% endif %}>Models</a>
+</nav>
+<div id="train-strip" data-tab="{{ tab }}" class="train-strip" aria-label="Where things stand" hidden>
+  <ul class="train-counts" id="train-counts"></ul>
+  <p class="train-next" role="status"><span class="train-next-k">Next:</span> <span id="train-next-text"></span> <a id="train-next-link" href="/train" hidden></a></p>
+</div>
+<script src="/static/train-area.js?v={{ version }}"></script>

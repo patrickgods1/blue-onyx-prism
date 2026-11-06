@@ -7,12 +7,12 @@ it did not train on: whole camera days when there are several (other days of the
 train), a share of the frames when there is only one. Use it as the default model, as the `night_model` of
 another model (IR and dark frames) or as a `verify` model.
 
-Training runs only when you start it (Training page or `blue-onyx-prism train run`), never from
+Training runs only when you start it (the Train area's Train tab or `blue-onyx-prism train run`), never from
 `auto_download`.
 
 ## Can this machine train?
 
-`blue-onyx-prism train capability` and the top of the Training page answer this. Training needs one
+`blue-onyx-prism train capability` and the top of the Train tab answer this. Training needs one
 of:
 
 | Hardware | PyTorch build | Notes |
@@ -47,8 +47,8 @@ Sizes whose estimated memory does not fit the GPU even at batch 1 are shown but 
 
 **Several NVIDIA GPUs.** Every qualifying GPU is an option (`cuda_options` in `GET /v1/training`
 and `train capability --json`, the one with the most VRAM first); that first one is the automatic
-pick. With more than one, the Training page shows a **GPU** select in the Auto-label card (labelers
-mode) and in the Train form (*Options*), and the CLI takes `--gpu cuda:N` (`train run`,
+pick. With more than one, the Auto-label tab shows a **GPU** select under Advanced (labelers
+mode) and the Train tab shows one under Advanced, and the CLI takes `--gpu cuda:N` (`train run`,
 `train autolabel`; `train capability` lists them). The choice is checked when the run is queued: an
 unknown ordinal, a GPU PyTorch cannot run on (with its reason) or a CUDA ordinal on a Mac is an
 error naming the usable GPUs; on Apple silicon and with one GPU there is nothing to choose (`mps` /
@@ -122,7 +122,7 @@ head init still had AP50 0.000 on the held-out frames: its fresh head scored eve
 
 So on Apple silicon YOLO, RF-DETR and RT-DETRv2 are offered and D-FINE is CUDA-only.
 
-Through the service (Training page form, `POST /training/queue`): a 1-epoch yolo26n run took 14 s
+Through the service (Train tab form, `POST /training/queue`): a 1-epoch yolo26n run took 14 s
 end to end with the environment and weights in place, was added to the config (applied live) and
 benchmarked by the service's benchmark runner (held-out AP50 0.572, 92 ms p50 on OpenVINO CPU);
 **night model of** IPcam-general then set `night_model`, loaded the model, and
@@ -173,10 +173,10 @@ benchmarked by the service's benchmark runner (held-out AP50 0.572, 92 ms p50 on
 
 ### Input: review exports
 
-The Training page lists the folders in `training.datasets` and the Review page's exports under
+The Train tab lists the folders in `training.datasets` and the Dataset tab's exports under
 `<training dir>/exports/`. Two layouts are read:
 
-1. **The Review page's YOLO export** (`src/collect/labels/export.rs`):
+1. **The Dataset tab's YOLO export** (`src/collect/labels/export.rs`):
 
    ```
    <export>/
@@ -315,7 +315,7 @@ lists [ignore regions](#ignore-regions); no file means none.
    **Never touched**: the held-out frames, the validation frames, the scene filter, the class list.
    The `balance` report in `dataset.json` has the counts before and after (boxes and frames per class,
    frames per scene, camera and camera/day, images per epoch, the largest repeat, dropped frames), and
-   the same report is shown **before** a run: the Training page's preview panel, or
+   the same report is shown **before** a run: the Train tab's preview panel, or
    `train prepare --dry-run` (also without balancing: the split and the boxes per class). Warnings: a
    group with a single frame repeated `max_repeat` times (only repeats, no new information), and
    images per epoch more than doubled.
@@ -364,7 +364,7 @@ training.
 
 ### Ignore regions
 
-An unsure box (Review page `d`) or a box rejected as too small (the *Too small* button) means "a real
+An unsure box (Review tab `d`) or a box rejected as too small (the *Too small* button) means "a real
 object, do not train on it" (`docs/DATASET.md`, Ignore regions). None of the trainers here can leave a box
 out of its loss: Ultralytics and transformers show no ignore support and RF-DETR's crowd handling makes
 such a box background. So the frame goes, as for a public set's `ignore` objects:
@@ -387,7 +387,7 @@ export again.
 `blue-onyx-prism train classes --dataset <export>... [--scene <s>] [--rename from=to] [--json]` lists
 the classes of the datasets after the renames: boxes, frames holding one, and boxes per scene (day,
 night, ir, unknown scene). With `--scene` an **in scope** column adds the boxes of those scenes
-(unknown-scene boxes count only for `all`). The Training page's class picker shows the same counts
+(unknown-scene boxes count only for `all`). The Train tab's class picker shows the same counts
 (`GET /v1/training/dataset-classes`) and warns about a class with fewer than 50 boxes (a fine-tuning
 floor, far below Ultralytics' best-case 10,000 instances) and about a class with no box in the
 scenes the run trains on (`person` with no night boxes in a night run).
@@ -473,7 +473,7 @@ lower than RF-DETR's default 0.0001 for small datasets); schedule cosine (defaul
 
 ### Learning rate settings
 
-The Options step has a **Learning rate** field (empty = the family's default, the placeholder follows
+The Train tab's Advanced section has a **Learning rate** field (empty = the family's default, the placeholder follows
 the ticked family: `data-default-lr` on each size checkbox); *Advanced* has **LR schedule** (default,
 cosine, linear, step) and **Final LR factor** (the last epoch's rate as a share of the starting one,
 0-1). Blank fields fall back to `training.lr`, `training.lr_schedule` and `training.lr_min_factor`
@@ -553,7 +553,7 @@ is switched off so only this one decides:
   sooner past a gain), at most 2 times (`MAX_EXTENSIONS`) and never at the last epoch; otherwise it
   stops. The script prints `@train {"event":"converge_point","epoch":E,"best_epoch":B,"best":v,
   "loss_falling":true,"loss_from":a,"loss_to":b,"extension":n,"next_check":E+patience}` and the
-  Training page shows "Early stop reached at epoch 15 (best epoch 5, mAP 0.835; the selected metric's
+  Train tab shows "Early stop reached at epoch 15 (best epoch 5, mAP 0.835; the selected metric's
   name when it is not mAP); training loss is still falling (3.569 -> 3.315). Continuing to epoch 25." with **Stop now and keep epoch 5** (the
   Finish now action) and **Continue** (hides the notice; the run goes on by itself, so an unattended
   run never waits). The incident run with its losses passes its epoch-15 stop point this way.
@@ -579,7 +579,7 @@ is switched off so only this one decides:
 
 ### Select best by
 
-The Options step's **Select best by** dropdown (`training.select_metric`, `train run --select-metric`,
+The Train tab's Advanced **Select best by** dropdown (`training.select_metric`, `train run --select-metric`,
 the script's `--select-metric`; none of them set = `map`) picks the metric a run optimizes. It decides
 both which epoch's weights are exported and the convergence rule's value, so a run never stops on mAP
 while selecting on something else. The one list with labels and hints is `recipe::SELECT_METRICS`.
@@ -637,7 +637,7 @@ selected metric. Records from before the setting read as `map`.
 
 **Finish now.** A run in its train stage can be stopped after the current epoch, keeping the best
 checkpoint (it then exports, installs and benchmarks as usual): the **Finish now** button beside Cancel
-on the Training page (loopback / admin, like Cancel; a paused run is resumed first), or create the file
+on the Train tab (loopback / admin, like Cancel; a paused run is resumed first), or create the file
 `<run dir>/work/stop-request` (the run dir is `<training dir>/<run id>`, see `train list`). The trainer
 checks the file after each epoch; a stale one is removed before training starts. Ctrl-C in the CLI still
 cancels.
@@ -767,9 +767,9 @@ benchmark of a trained model, a download) finishes first; the pause takes hold a
 Cancel works while paused. A service restart while paused shows the job as interrupted, like a running
 one.
 
-**Training folder** (`training.dir`, default `<data root>/training`; This machine card, with a
+**Training folder** (`training.dir`, default `<data root>/training`; This machine card of the Train tab, under *Folders and training environment*, with a
 Folder... button): run records (`runs.json`, `tasks.json`), prepared datasets, held-out sets, logs,
-import work and the Review page's exports. A new folder must exist and pass the same checks as other
+import work and the Dataset tab's exports. A new folder must exist and pass the same checks as other
 folder settings (no system folder, browsable or natively picked). It applies at once, without a
 restart: the queue switches to the new folder's records when no run, import or auto-label job is
 queued or running, and the page refuses the change (409) while one is. Runs, imports and exports in the
@@ -795,7 +795,7 @@ different verifier unless the confirm names it (`replace_verifier`). All go thro
 save path and apply at once. A camera that names a custom model in Blue Iris keeps using that model.
 
 After a run's benchmark the current default runs on the same sets and devices (`Hooks::baseline`,
-Training page only), so the Use card can say "On N held-out frames: new finds ...; current finds ...".
+Train tab only), so the Models tab's Use card can say "On N held-out frames: new finds ...; current finds ...".
 Its results stay in `<run>/baseline/`, removed afterwards: they never touch `benchmark.json`, the
 history or the `auto` order. It is skipped, with the reason in the row, when the default is the new
 model, is not loaded, or reports none of its classes.
@@ -874,7 +874,7 @@ point; at most 1000 points) and `best` (`{metric, epoch, value}` on the selected
 also has `metrics` (label, short label, `higher_better`, `format` of every id) and `metric_columns`.
 Records written before this keep loading (no `history`: the page shows no metrics block).
 
-**The metrics view** (Training page, every run with a history, running or finished): KPI tiles
+**The metrics view** (Jobs card and Models tab, every run with a history, running or finished): KPI tiles
 (epoch, ETA, best primary metric with its epoch, latest loss, validation loss and mean IoU with the
 change from the previous epoch), curves of the losses and of the quality metrics with the best epoch marked,
 and a per-epoch table, newest first. **Columns** picks the table's columns from every metric in the
@@ -907,7 +907,7 @@ group is benchmarked on the same frames, all scenes included. The fingerprint in
 summary proves it. If the fingerprints differ (an export was edited between queuing and running) the
 comparison shows a warning instead of comparing.
 
-**The table.** The Comparison card of the Training page (one per group) and, at the end of a
+**The table.** The Comparison card of the Models tab (one per group) and, at the end of a
 `train run` with several scenes, the CLI table have one row per run: model, scene filter, best epoch
 (with "by F2" when not selected by mAP; a warning when runs of a group differ) and the epoch it
 stopped at, held-out AP50-95 for `day`, `night`, `ir` and `all` frames
@@ -1010,14 +1010,14 @@ one (at most 8).
 
 ## Footage import
 
-`blue-onyx-prism train import` and the Training page's **Import footage** card put frames from other
+`blue-onyx-prism train import` and the **Import** tab put frames from other
 sources into the dataset folder (`collect.dir`), in the collector's layout, so they show on the
-Dataset page (*Imported footage*) and on the Review page (they are queued for review) like collected
+Collect tab (*Imported footage*) and on the Review tab (they are queued for review) like collected
 frames.
 
 `--out-dir <dir>` (the page's *Save frames to*, with a native folder picker) writes them to another
-folder instead, in the same layout with its own `imports.jsonl` and review queue. The Dataset page
-shows only `collect.dir`; to review the frames, choose the folder on the Review page (*Folder under
+folder instead, in the same layout with its own `imports.jsonl` and review queue. The Collect tab
+shows only `collect.dir`; to review the frames, choose the folder on the Review tab (*Folder under
 review*, `collect.review_dir`). The page accepts a browsable folder or one picked in the native
 dialog, like the source path.
 
@@ -1052,7 +1052,7 @@ where before the first clips by name took everything and the snapshots none. The
 check as the import, so natively picked folders work) answers what an import would read: the video
 and image counts, videos per camera, the total size, the `.bvr` and other files skipped, whether
 the listing was cut at 20 000 files, the largest and smallest per-video share, skipped videos, images
-used, the warnings and one `summary` line. The Training page shows that line under the path field
+used, the warnings and one `summary` line. The Import tab shows that line under the path field
 (debounced, also after *Browse...* fills it), e.g. "12 videos from 4 cameras, 240 images (3.1 GB);
 2 .bvr skipped; up to 1,500 frames per video". *Candidates per video* in the page's Sampling options
 is `--max-candidates`.
@@ -1162,8 +1162,8 @@ already in the lock (a dependency of the trainers) and decodes every format the 
 
 ### Auto-label after import
 
-The Import footage card's **Auto-label the imported frames when the import finishes** box queues an
-[auto-label](#auto-label) run right behind the import, with the Auto-label card's labelers (or model),
+The Import tab's **Auto-label the imported frames when the import finishes** box queues an
+[auto-label](#auto-label) run right behind the import, with the settings of your last Auto-label tab run, or the defaults, and the classes picked on the Import tab (labelers or model),
 classes and run options (the page posts them as `al.<field>`); the card's *Which frames* fields are
 ignored: the run takes this import's frames (`import=<id>, status=any, source=all`, limit = Frames to
 keep) in the folder the import writes. Both are planned before anything is queued, so a bad auto-label
@@ -1174,9 +1174,9 @@ import's frames:
 - *Then reject auto boxes scoring below* (0.3): the pending auto boxes under that score on the unreviewed
   frames become `rejected` with `reason: low_score` (hard negatives; a reviewer can still change them);
 - *Then accept frames whose boxes are all auto: accept* (off by default): those frames are saved as
-  reviewed, like the Review page's bulk accept; after the reject, a frame left with only `accept` boxes
+  reviewed, like the Review tab's bulk accept; after the reject, a frame left with only `accept` boxes
   qualifies;
-- *Show this folder on the Review page when done* (needs *Save frames to*; also without auto-label): sets
+- *Show this folder on the Review tab when done* (needs *Save frames to*; also without auto-label): sets
   `collect.review_dir` to the import's folder.
 
 A failing step is a `warning:` line in the job's summary, not a failed job. The auto-label waits for the
@@ -1209,7 +1209,7 @@ Decoding ran at about 1400 frames/s (PyAV with threads, the 5-minute 1072x1920 H
 
 ## Auto-label
 
-`blue-onyx-prism train autolabel` and the **Auto-label** cards (Training page; Review page: the frames
+`blue-onyx-prism train autolabel` and the **Auto-label** tab (from the Review tab, *Auto-label these frames* passes the frames
 its filters select) propose boxes for dataset frames. They land in the frames' label files as
 **pending `source: auto` boxes** through `labels::merge_proposals` (the service writes every label file;
 the script only returns proposals as JSONL), so the reviewer decides. Nothing is accepted, rejected or
@@ -1219,19 +1219,19 @@ deleted automatically; confirmed empty frames (hard negatives) come only from th
 `status` (default `unreviewed`), `source` (default `all`), `auto` (`review`, `accept`, `nothing`, `none`;
 `label=person|car` = frames with any of these classes; the queue's `label=` takes a comma list;
 docs/DATASET.md "Queue"), `import=<id>|any`, `again=1`, `limit` (default 200). They are taken in the
-queue's order (most uncertain first). The Review page's button sends its own filters.
+queue's order (most uncertain first). The Review tab's button sends its own filters.
 
 **Marker**: every frame the labelers return (boxes or not) gets `auto_run: {at, labeler, classes}` in its label
 file (a frame without one gets its pre-fill plus the marker). Only frames whose boxes changed are queued
 for review. A later run with the same labelers (`labeler`, e.g. `mm-gdino-tiny + rfdetr-large +
 qwen3-vl-2b + siglip2-base`) skips those frames (`skipped_done` in the report) unless the filter has
-`again=1` (Review page: **Label again**); when every matching frame was skipped the run fails saying so.
+`again=1` (Review tab: **Label again**); when every matching frame was skipped the run fails saying so.
 A run with a model writes the marker too, with `labeler: "model:<name>@<device>"` (the device it asked
 for), so the same model on the same device skips the frames it looked at unless `again=1`, and `auto=`
 filters see them. Writes take the label write lock,
 so a Review save with a stale `revision` gets a 409 instead of overwriting merged boxes.
 
-**Run options** (Training page's Auto-label card; the Review page's button uses the defaults):
+**Run options** (Auto-label tab, Advanced):
 
 | Option | Default | CLI | Script flag |
 |---|---|---|---|
@@ -1297,7 +1297,7 @@ in `training/autolabel/triage.rs`; change them only after measuring again.
   how many are hidden. No bulk save takes a frame with hidden boxes: a saved frame claims it is complete,
   so a real object nobody looked at would train as background.
 - **The filter is checked.** About 2% of the boxes that would be hidden stay visible, marked *audit sample:
-  normally hidden*. The same box gets the same answer on a rerun. Your verdicts show on the Review page
+  normally hidden*. The same box gets the same answer on a rerun. Your verdicts show on the Review tab
   as *Hidden-box check: 1 of 40 was real*, with a percentage from 20 boxes on.
 - **A rerun can bring a box back.** A later proposal of the same label on a hidden box takes its place and is
   sorted again: the same score hides it again, a higher one or SAM 3's shows it. A run with a model shows it too.
@@ -1372,12 +1372,12 @@ mapped onto the list's spelling (`triage::map_label`: the same name, else the sa
 else the same COCO class through the aliases): a VOC-spelled model's `motorbike`, `tvmonitor`,
 `pottedplant`, `aeroplane`, `sofa`, `diningtable` count as the list's `motorcycle`, `tv`, `potted plant`,
 `airplane`, `couch`, `dining table`. The box gets the list's class and keeps the model's spelling in
-`model_label` (the Review page shows "was motorbike"); the report lists the renames (`renamed`) and
+`model_label` (the Review tab shows "was motorbike"); the report lists the renames (`renamed`) and
 counts boxes per mapped class (`by_label`). The marker records the run's classes (`auto_run.classes`; files written before
 runs could pick classes have none, which counts as the whole list), and the skip rule above becomes:
 a frame is skipped only when the same labelers looked at it for **every** class of this run. A run
 for `raccoon` after one for `person, car` labels the frames again; a run for `car` after the full list
-skips them. `auto=nothing` still means "auto-labelled, no auto evidence"; the Review page reads
+skips them. `auto=nothing` still means "auto-labelled, no auto evidence"; the Review tab reads
 `auto_run.classes` to say which classes were found absent, which says nothing about the others.
 Self-training with `--classes` compares only detections and reviewed boxes of those classes (a
 detection of one may still match a reviewed box of another class: a class change).
@@ -1392,7 +1392,7 @@ classes, each with its category, prompt phrases, `coco` flag and the models that
 `relevant` (the review classes the enabled models report after their `object_filter`).
 
 `collect.hidden_classes` (subset of `collect.classes`; `POST /v1/review/classes` with `hidden`; the
-Review page's *don't want*) are classes you do not review: hidden from the Review page, left out of the
+Review tab's *don't want*) are classes you do not review: hidden from the Review tab, left out of the
 pre-fill and of auto-label runs (a run of hidden classes only is refused), and their pending boxes are
 rejected (`reason: other_class`) when a class becomes hidden; they stay in the list and keep their YOLO
 class ids (docs/DATASET.md, "Unwanted classes"). Removing a class from the list drops it from the hidden
@@ -1440,13 +1440,13 @@ safetensors, the small files downloaded and hashed) and downloaded by the downlo
    a person or an animal on a night or IR frame is always `review`. Every box gets `triage` and the
    reasons (`why`). A proposal that matches an existing box of the same label (IoU >= 0.5) is dropped
    by the merge rule, but its evidence (VLM answer, species) is put on that box: a model box the VLM
-   calls a rock shows it on the Review page, and a suppressed / below-threshold / verifier-found box
+   calls a rock shows it on the Review tab, and a suppressed / below-threshold / verifier-found box
    triaged `accept` is accepted on save instead of rejected. A proposal on a *pending* box of another
    label (and no box of its own label) becomes a **class suggestion** on that box (`auto_label`,
    `auto_score`, triage `review`; `class_suggestions` in the report) instead of being lost. New boxes on
    unreviewed frames are then sorted into [likely, unlikely and hidden](#likely-unlikely-and-hidden-boxes).
 6. **Bulk accept**: frames whose triage alone settles them (`auto=accept`: boxes `accept`, nothing else
-   pending but unconfirmed model hints, no hidden box) can be saved as reviewed in one go from the Review page
+   pending but unconfirmed model hints, no hidden box) can be saved as reviewed in one go from the Review tab
    (`POST /v1/review/accept-auto`, `bulk_accepted: true` in the file); everything else waits for a
    reviewer.
 
@@ -1456,7 +1456,7 @@ missing ops.
 ### SAM 3 as the open-vocabulary labeler
 
 SAM 3 (`facebook/sam3`) can take MM-Grounding-DINO's seat (step 1): `train autolabel --sam3`, or *SAM 3*
-in the Auto-label card's open-vocabulary select. It is **opt-in**: the default stays MM-Grounding-DINO,
+in the open-vocabulary select under Advanced on the Auto-label tab. It is **opt-in**: the default stays MM-Grounding-DINO,
 and the full comparison of the two has not been run, so nothing here says SAM 3 is better. Steps 2 to 5
 are unchanged, with one exception: **a SAM 3 box is never triaged `accept`** (the 0.6 rule was tuned for
 MM-Grounding-DINO + RF-DETR), so *Accept auto-labeled frames* never takes a frame on SAM 3's word. It
@@ -1482,9 +1482,9 @@ by commit and SHA-256) after you accept the licence on Hugging Face.
 **Getting the weights.** The repository is gated, so the download needs a Hugging Face account that has
 been approved:
 
-1. Open <https://huggingface.co/facebook/sam3> (the Training page links it) and request access. Approval
+1. Open <https://huggingface.co/facebook/sam3> (the Auto-label tab links it, under Advanced) and request access. Approval
    can take a while.
-2. On the Training page click **I have access, download**. This is also your consent to the 3.4 GB. If
+2. On the Auto-label tab, under Advanced, click **I have access, download**. This is also your consent to the 3.4 GB. If
    the files are already in the weights folder (a copy you made by hand), they are checked by hash and
    used with no login and no network.
 3. If the page asks for a login, run the command it shows, from the account the service runs as (below).
@@ -1522,14 +1522,14 @@ running auto-label uses it.
 
 ### Rerunning labeling on part of the dataset
 
-The Training card's **Which frames** select picks the frames: *Unreviewed*, *Reviewed*, *Reviewed with
+The Auto-label tab's **Which frames** select (under Advanced) picks the frames: *Unreviewed*, *Reviewed*, *Reviewed with
 overlaps or duplicates*, *Unreviewed with overlaps or duplicates*, *All*, or *Custom* (the existing
 fields). On the command line the same is `--frames "status=reviewed,auto=overlaps"` (`auto=overlaps`
 selects frames with overlapping boxes you have not yet checked; frames whose overlaps a reviewer already
 checked stay out). A frame the same labelers already looked at is skipped unless the filter has `again=1`
-(Review page: *Label again*).
+(Review tab: *Label again*).
 
-**Found by two.** `auto=both` (Review page's Auto filter and the card's Custom *Auto-labelled* select:
+**Found by two.** `auto=both` (Review tab's Auto filter and the card's Custom *Auto-labelled* select:
 *found by 2+ labelers*) selects frames with a pending box that two or more labelers found, most such boxes
 first, so the likely real and still unsettled boxes come up early. Only pending boxes count, so a reviewed
 frame has none, and boxes of unwanted classes do not count on the page or in a run.
@@ -1556,7 +1556,7 @@ the exports until you save it again**; exports you already made are unaffected. 
 frames you confirmed empty, reviewed or not, never gain a box; the run only records its scores and its
 marker. These rules also apply to a frame an earlier re-label sent back.
 
-**Undo.** *Restore reopened frames...* on the Review page (`POST /v1/review/restore-reopened`, with a
+**Undo.** *Restore reopened frames...* on the Review tab (`POST /v1/review/restore-reopened`, with a
 dry-run count first) puts back to reviewed every frame the run reopened that has no pending box left,
 for example after you rejected the proposals (*Reject auto boxes below...*). Frames with a pending box are left alone.
 A frame you had checked for overlaps gets that check back, so *Reject stacked duplicates* still leaves your
@@ -1574,7 +1574,7 @@ those frames like a Cancel does, then still reports the failure; run it again an
 
 ### Label with any model
 
-`train autolabel --with-model <id>` (the Training page's *Label with a model*; `POST /training/autolabel`
+`train autolabel --with-model <id>` (the Auto-label tab's *Label with a model*, under Advanced; `POST /training/autolabel`
 `with_model`) labels the frames with a detection model through the service's own pipeline (the
 benchmark's decode, preprocess, infer, postprocess; no Python, no training GPU needed), default
 threshold 0.3, by default over the **unreviewed** frames (first-pass labelling). Its boxes are pending
@@ -1638,7 +1638,7 @@ labelers' rule). Without it every box is `review`. Pre-accepted frames are what 
 ### Self-training
 
 Self-training is a run with a trained model over the reviewed frames too: an explicit `status=any`
-(the Training page's preset). For a frame that was reviewed, its detections (labels mapped onto the
+(the Auto-label tab's preset). For a frame that was reviewed, its detections (labels mapped onto the
 list) are compared with the training labels (accepted and added boxes): a detection matching
 none at IoU 0.5 is *new*, one whose best match has another label a *class change*, a training box no
 detection matches *missed*. Any of them puts the frame back to `unreviewed` with
@@ -1649,7 +1649,7 @@ Train, re-label, review the disagreements, train again: 2-3 rounds, IR frames an
 ### Find missing labels
 
 `train autolabel --with-model <id> --missing-only` (the *Find missing labels* box on the Training and
-Review pages; `POST /training/autolabel` `missing_only`) looks for real objects with no box on frames
+Review tabs; `POST /training/autolabel` `missing_only`) looks for real objects with no box on frames
 you already reviewed, and nothing else. An unlabelled object teaches a model that the object is
 background and counts as a false alarm in validation. Existing boxes get no evidence and no vote. Run it
 once per model, one task each, then review the proposals. The self-training loop above does not fit this job: it also reopens frames for missed
@@ -1693,10 +1693,10 @@ unclear one. For a labelers run, see [Spot memory](#spot-memory-of-fixed-cameras
 
 ### Overlap suggestions
 
-`train overlaps` (the Review page's *Suggest overlaps...*; `POST /v1/review/suggest-overlaps`) takes a
+`train overlaps` (the Review tab's *Suggest overlaps...*; `POST /v1/review/suggest-overlaps`) takes a
 closer look at the nested and partly overlapping boxes that `Reject stacked duplicates` leaves to a
 reviewer, and writes a suggestion for each pair. **It changes no box, frame status, `reviewed_at` or
-`overlaps_checked`**: a box changes when you accept a suggestion on the Review page. An automatic rule
+`overlaps_checked`**: a box changes when you accept a suggestion on the Review tab. An automatic rule
 failed a blind test (13 of 99 drops removed a real object), while it named the right box on 86 of 99, so
 it saves looking, not deciding. Run *Reject stacked duplicates* first: a stack is no open pair.
 
@@ -1747,7 +1747,7 @@ whose box moved or went is passed over, a frame you skipped or checked meanwhile
 frame that gained a suggestion is written. A frame open on the page when the job writes it answers its
 save with the usual "changed since you opened it" conflict.
 
-**On the Review page**, *Auto: overlapping boxes* (which sets Status to any and Frames to all collected)
+**On the Review tab**, *Auto: overlapping boxes* (which sets Status to any and Frames to all collected)
 lists the frames strongest suggestion first. A frame opens on the box it would drop, marked `drop?` on the
 frame and in the list, with its partner marked `keep`, and the decision bar says why. `y` accepts: the box
 is rejected as a duplicate (out of `hard_negatives.json` and the repeats history), and a keeper that is a

@@ -335,7 +335,7 @@ impl OverlapsJob {
         summary.push_str(&format!(
             "{} pairs checked on {} frames: {} drops suggested ({} with a warning, {} from the \
              witnesses alone), {} pairs that look like two objects, {} left for you without a \
-             suggestion, on {} frames. No box was changed: confirm them on the Review page (Auto: \
+             suggestion, on {} frames. No box was changed: confirm them on the Review tab (Auto: \
              overlapping boxes, Status: any, Frames: all collected)",
             n(rep.selection.pairs),
             n(rep.selection.frame_count),

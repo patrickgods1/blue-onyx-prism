@@ -1,0 +1,254 @@
+<div class="card tr-wrap" id="machine">
+  <h2>This machine</h2>
+  <p{% if !available %} class="error"{% endif %}>{{ summary }}</p>
+  {% if !reasons.is_empty() %}
+  <ul>{% for r in reasons %}<li class="muted">{{ r }}</li>{% endfor %}</ul>
+  {% endif %}
+  <details class="tr-more" id="machine-advanced">
+    <summary>Folders and training environment</summary>
+  <p class="tr-fact"><span class="k">Training environment</span> {{ env_note }}</p>
+  <form method="post" action="/training/dir" class="tr-form" id="training-dir-form">
+    <div class="tr-field">
+      <label for="training-dir">Training folder</label>
+      <div class="with-browse tr-browse"><input type="text" id="training-dir" name="training_dir" value="{{ training_dir_setting }}" autocomplete="off" placeholder="{{ training_dir_default }}"{% if jobs_busy %} disabled{% endif %}><button type="button" class="browse secondary" data-browse="folder" data-target="training_dir" data-title="Choose the training folder" hidden{% if jobs_busy %} disabled{% endif %}>Folder&hellip;</button><button type="submit" class="secondary"{% if jobs_busy %} disabled{% endif %}>Save</button></div>
+      <p class="muted small">Now <code>{{ training_dir }}</code>: the run records (<code>runs.json</code>, <code>tasks.json</code>), prepared datasets, held-out sets, logs, import work and the Dataset tab's exports. Empty = <code>{{ training_dir_default }}</code>. A new folder is used at once; runs, imports and exports in the old folder stay there and are not moved.{% if jobs_busy %} It cannot change while a job is queued or running.{% endif %}</p>
+    </div>
+  </form>
+  {% if env_ready %}
+  <form method="post" action="/training/remove-env" class="inline"><button type="submit" class="small danger">Remove training environment</button> <span class="muted small">uv and Python stay for the model export</span></form>
+  {% endif %}
+  </details>
+</div>
+<form method="post" action="/training/queue" class="card tr-form" id="train">
+  <button type="submit" class="tr-default-submit" tabindex="-1" aria-hidden="true"{% if !available %} disabled{% endif %}>Queue training</button>
+  <h2>Train</h2>
+  {% if !available %}<p class="muted">Training is not available on this machine (see above); the saved dataset folders can still be managed.</p>{% endif %}
+  <fieldset class="tr-step" id="datasets">
+    <legend>Datasets</legend>
+    {% if datasets.is_empty() %}<p class="muted">Nothing to train on yet: <a href="/train/dataset#export">export your reviewed frames</a> on the Dataset tab.</p>{% endif %}
+    {% for d in datasets %}
+    <div class="tr-folder">
+      <label class="check" title="{{ d.path }}"><input type="checkbox" name="dataset" value="{{ d.path }}"{% if !d.exists %} disabled{% else if d.saved %} checked{% endif %}> <span>{{ d.when }}{% if let Some(n) = d.frames %} <span class="muted small">{{ n }} frames{% if !d.split.is_empty() %}, {{ d.split }}{% endif %}</span>{% endif %}{% if !d.classes.is_empty() %}<span class="muted small tr-hint">{{ d.classes }}</span>{% endif %}</span>{% if !d.exists %} <span class="error-text small">missing</span>{% endif %}{% if !d.saved %} <span class="muted small">Dataset tab export</span>{% endif %}</label>
+      {% if d.saved %}<button type="submit" class="small secondary" formaction="/training/datasets" formnovalidate name="remove" value="{{ d.path }}">Remove</button>{% endif %}
+    </div>
+    {% endfor %}
+    <fieldset class="tr-scenes" id="train-scenes">
+      <legend>Runs</legend>
+      <div class="tr-scene-list">
+      {% for c in scenes %}{% if c.preset %}<label class="check" title="{{ c.describe }}"><input type="checkbox" name="scene" value="{{ c.value }}" data-prefix="{{ c.prefix }}"{% if c.value == "all" %} checked{% endif %}> {{ c.title }}</label>{% endif %}{% endfor %}
+      <details class="tr-scene-other">
+        <summary>Other</summary>
+        {% for c in scenes %}{% if !c.preset %}<label class="check" title="{{ c.describe }}"><input type="checkbox" name="scene" value="{{ c.value }}" data-prefix="{{ c.prefix }}"> {{ c.title }}</label>{% endif %}{% endfor %}
+      </details>
+      </div>
+      <p class="muted small">One run per ticked scene and model. Ticking several compares them: every run is benchmarked on the same held-out frames (all scenes), and a Comparison table shows their AP per scene. None ticked = all scenes.</p>
+      <p class="small tr-runs-line" id="train-runs-line" role="status" hidden></p>
+    </fieldset>
+    <fieldset class="tr-classes" id="train-classes">
+      <legend>Classes</legend>
+      <div id="train-picker">
+        <input type="text" name="classes" aria-label="Classes" placeholder="person, car, dog, cat, raccoon">
+        <p class="muted small">Comma-separated, in head order; empty = all of the export. (With scripts: a list of the ticked folders' classes and their boxes.)</p>
+      </div>
+      <p class="small" id="train-classes-msg" role="status"></p>
+      <div class="tr-radios" role="radiogroup" aria-label="Objects of unticked classes">
+        <span class="muted small">Objects of unticked classes:</span>
+        <label class="check" title="The frame stays; the object is background (a frame left without a box is a negative). Right for unrelated objects (a bench)."><input type="radio" name="excluded" value="background" checked> treat as background</label>
+        <label class="check" title="Training and validation frames with such an object are left out, so a look-alike of a trained class (a dog when training cat) is never taught as background. The held-out frames stay."><input type="radio" name="excluded" value="drop-frame"> leave those frames out</label>
+      </div>
+    </fieldset>
+    <label class="check"><input type="checkbox" name="public"{% if !public_available %} disabled{% endif %}> Mix in the public night subset (LILA camera traps, CDLA)</label>
+    {% if !public_available %}<p class="muted small">Not pinned in this build.</p>{% else if !public_installed %}<p class="muted small">A {{ public_size }} download on the first run.</p>{% endif %}
+    <details class="tr-more tr-balance" id="train-balance"{% if balance.on %} open{% endif %}>
+      <summary>Balance <span class="muted small" id="train-balance-state">{% if balance.on %}on{% else %}off{% endif %}</span></summary>
+      <fieldset class="tr-bal">
+        <legend>Balance the training frames</legend>
+        <p class="muted small">Repeats the training frames of rare groups (and, with the cap, leaves out some frames of dominant ones) so each epoch sees them more evenly. Repeats add no new information: collect more frames of a rare group when you can. Validation and held-out frames are never balanced, so benchmarks stay comparable.</p>
+        <div class="tr-bal-axes">
+        {% for a in balance.axes %}<label class="check"><input type="checkbox" name="balance" value="{{ a.value }}"{% if a.checked %} checked{% endif %}> <span>{{ a.title }}<span class="muted small tr-hint">{{ a.hint }}</span></span></label>{% endfor %}
+        </div>
+        <div class="tr-grid">
+          <div class="tr-field">
+            <span class="tr-bal-k">Strength</span>
+            <div class="tr-radios" role="radiogroup" aria-label="Strength">
+              <label class="check" title="Weights are the square root of the size ratio (LVIS repeat-factor sampling): rare groups move closer without being repeated as often as the large ones."><input type="radio" name="balance_strength" value="0.5"{% if balance.gentle %} checked{% endif %}> Gentle (0.5)</label>
+              <label class="check" title="Weights are the full size ratio: every group as large as the largest (up to the max repeat)."><input type="radio" name="balance_strength" value="1"{% if balance.full %} checked{% endif %}> Full (1.0)</label>
+              {% if let Some(c) = balance.custom %}<label class="check"><input type="radio" name="balance_strength" value="{{ c }}" checked> Configured ({{ c }})</label>{% endif %}
+            </div>
+          </div>
+          <div class="tr-field">
+            <label for="train-bal-max">Max repeat</label>
+            <input type="number" id="train-bal-max" name="balance_max_repeat" min="1" max="{{ balance.most }}" step="1" value="{{ balance.max_repeat }}">
+            <p class="muted small">Most balancing repeats of one frame (1&ndash;{{ balance.most }}).</p>
+          </div>
+        </div>
+        <label class="check"><input type="checkbox" name="balance_cap_on" id="train-bal-cap-on"{% if balance.cap_on %} checked{% endif %}> <span>Cap dominant groups at <span class="tr-keep"><input type="number" name="balance_cap" id="train-bal-cap" class="al-num" min="1" max="100" step="0.5" value="{{ balance.cap }}" aria-label="Cap at this many times the median">&times; the median</span></span></label>
+        <p class="muted small">A group above that size leaves out frames down to it. Hard negatives and the last frames of a class always stay.</p>
+        <div class="tr-bal-preview" id="train-balance-preview" aria-live="polite" hidden></div>
+      </fieldset>
+    </details>
+  </fieldset>
+
+  {% if available %}
+  <fieldset class="tr-step" id="models">
+    <legend>Models</legend>
+    <p class="muted small">Tick one or more; they train one after the other. Each size shows a rough estimate: GPU memory at the suggested batch and time per epoch per 100 images.</p>
+    <div class="scroll">
+    <table class="tr-models">
+      <tbody>
+      {% for f in families %}
+      <tr>
+        <th scope="row">{{ f.title }}<br><span class="tag">{{ f.license }}</span>{% if f.available %}<br><span class="muted small tr-rec" title="Recommended: what blank Epochs, Patience and Learning rate fields use (epochs is a cap: the run stops once it converges)">{{ f.recommended }}</span>{% endif %}</th>
+        {% if !f.available %}
+        <td colspan="{{ size_cols }}" class="muted small">{{ f.why }}</td>
+        {% else %}
+        {% for s in f.sizes %}
+        <td class="tr-size{% if !s.fits %} tr-unfit{% endif %}"{% if s.fits %} title="{{ s.estimate }}; {{ s.latency }}"{% else %} title="{{ s.why }}"{% endif %}>
+          <label class="check"><input type="checkbox" name="model" value="{{ s.label }}" aria-label="{{ s.label }}" data-default-lr="{{ f.default_lr }}"{% if !s.fits %} disabled{% endif %}> <code>{{ s.size }}</code> <span class="tr-weight tr-{{ s.weight }}">{{ s.weight }}</span></label>
+          {% if s.fits %}<span class="muted small">{{ s.short }}</span>{% else %}<span class="muted small">{{ s.why }}</span>{% endif %}
+        </td>
+        {% endfor %}
+        {% for _ in 0..f.pad %}<td></td>{% endfor %}
+        {% endif %}
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <ul class="tr-legend small">
+      {% for l in latencies %}<li><span class="tr-weight tr-{{ l.weight }}">{{ l.weight }}</span> {{ l.text }}</li>{% endfor %}
+    </ul>
+    {% for n in notices %}<p class="muted small"><strong>{{ n.families }}:</strong> {{ n.notice }}</p>{% endfor %}
+  </fieldset>
+
+  {% if !allow_large && (!env_ready || other_env.is_some() || (public_available && !public_installed)) %}
+  <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB:{% if !env_ready %} {{ env_download }}{% endif %}{% if let Some(o) = other_env %}{% if !env_ready %};{% endif %} the training environment of another GPU if you choose it ({{ o }}){% endif %}{% if (!env_ready || other_env.is_some()) && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>
+  {% endif %}
+  <div class="tr-preflight" id="train-preflight" aria-live="polite" hidden></div>
+  <div class="actions"><button type="submit">Queue training</button></div>
+  {% endif %}
+  <details class="tr-more" id="train-advanced">
+    <summary>Advanced</summary>
+    <p class="muted small">Datasets are review export folders (YOLO layout: <code>classes.txt</code>, <code>images/</code>, <code>labels/</code>): the saved ones and the Dataset tab's exports under <code>{{ training_dir }}/exports</code>. The export's validation split (whole camera days) becomes the benchmark set; an export of one camera day has none, so a share of its frames is held out instead. Frames that several ticked exports share are used once.</p>
+    <div class="tr-field">
+      <label for="train-folder">Another folder</label>
+      <div class="with-browse tr-browse"><input type="text" id="train-folder" name="dataset_path" autocomplete="off" placeholder="C:\BlueOnyx\exports\review-2026-10"><button type="button" class="browse secondary" data-browse="folder" data-target="dataset_path" data-title="Choose a review export folder" hidden>Folder&hellip;</button><button type="submit" class="secondary" formaction="/training/datasets" formnovalidate name="save" value="1">Save folder</button></div>
+      <p class="muted small">Used by this run when filled; Save folder keeps it in the list above.</p>
+    </div>
+  {% if available %}
+  <fieldset class="tr-step" id="options">
+    <legend>Options</legend>
+    <div class="tr-grid">
+      <div class="tr-field">
+        <label for="train-epochs">Epochs</label>
+        <input type="number" id="train-epochs" name="epochs" min="1" max="1000" value="{{ epochs }}" placeholder="recommended">
+        <p class="muted small">Empty = each family's recommendation (shown under its name). A cap: the run stops once it converges.</p>
+      </div>
+      <div class="tr-field">
+        <label for="train-patience">Patience</label>
+        <input type="number" id="train-patience" name="patience" min="0" max="1000" value="{{ patience }}" placeholder="recommended">
+        <p class="muted small">Epochs without a gain of the metric below before the run stops and keeps its best epoch. Empty = recommended, 0 = off (train every epoch).</p>
+      </div>
+      <div class="tr-field">
+        <label for="train-select-metric">Select best by</label>
+        <select id="train-select-metric" name="select_metric">
+          {% for c in select_metrics %}<option value="{{ c.value }}" data-hint="{{ c.hint }}"{% if c.selected %} selected{% endif %}>{{ c.title }}</option>{% endfor %}
+        </select>
+        <p class="muted small"><span id="train-select-hint">{{ select_hint }}</span> Decides which epoch is exported and when the run converges. With few validation images anything but mAP is noisy; the held-out benchmark is the number to trust.</p>
+      </div>
+      <div class="tr-field">
+        <label for="train-lr">Learning rate</label>
+        <input type="text" id="train-lr" name="lr" inputmode="decimal" autocomplete="off" value="{{ lr }}" placeholder="recommended">
+        <p class="muted small">Empty = each family's default ({{ lr_defaults }}). Lower it (e.g. 5e-5) when the validation mAP jumps between epochs.</p>
+      </div>
+      <div class="tr-field">
+        <label for="train-name">Model name</label>
+        <input type="text" id="train-name" name="name">
+        <p class="muted small" id="train-name-hint">One run only (one model, one scene); empty = <code>custom-</code>/<code>day-</code>/<code>night-&lt;model&gt;-&lt;date&gt;</code>.</p>
+      </div>
+      {% if let Some(auto) = gpu_choices.first() %}
+      <div class="tr-field">
+        <label for="train-gpu">GPU</label>
+        <select id="train-gpu" name="gpu"><option value="">Automatic: {{ auto.label }}</option>{% for g in gpu_choices %}<option value="{{ g.value }}">{{ g.label }}</option>{% endfor %}</select>
+        <p class="muted small">The estimates above are for the automatic GPU; the batch is suggested for the chosen one. A GPU on another PyTorch build (cu126 / cu130) sets up that build's environment in place of the current one.</p>
+      </div>
+      {% endif %}
+    </div>
+    <div class="tr-field">
+      <label for="train-install">Install the model in</label>
+      <div class="with-browse tr-browse"><input type="text" id="train-install" name="install_dir" autocomplete="off" placeholder="{{ models_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="install_dir" data-title="Choose where to install the trained model" hidden>Folder&hellip;</button></div>
+      <p class="muted small">Empty = the models folder (<code>{{ models_dir }}</code>). The <code>.onnx</code>, its <code>.yaml</code> classes and <code>.provenance.json</code> go there, and the config entry points at that file.</p>
+    </div>
+    <label class="check"><input type="checkbox" name="night_aug" id="train-night"> Night augmentation</label>
+    <div class="tr-grid" id="train-night-fields">
+      <div class="tr-field">
+        <label for="train-dark">Darkness p</label>
+        <input type="number" id="train-dark" name="aug_dark" min="0" max="1" step="0.05">
+      </div>
+      <div class="tr-field">
+        <label for="train-noise">Noise p</label>
+        <input type="number" id="train-noise" name="aug_noise" min="0" max="1" step="0.05">
+      </div>
+      <div class="tr-field">
+        <label for="train-gray">Grayscale p</label>
+        <input type="number" id="train-gray" name="aug_gray" min="0" max="1" step="0.05">
+      </div>
+      <p class="muted small tr-span">Probability per training image. Empty = 0.5 / 0.3 / 0.5 with night augmentation, 0 without.</p>
+    </div>
+    <div class="tr-grid">
+        <div class="tr-field">
+          <label for="train-batch">Batch</label>
+          <input type="number" id="train-batch" name="batch" min="1" max="256">
+          <p class="muted small">Empty = the suggested batch (at most 16).</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-imgsz">Input size</label>
+          <input type="number" id="train-imgsz" name="imgsz" min="160" max="1536" step="32">
+          <p class="muted small">Empty = the size's own. 384 is the RF-DETR Nano default. 512 or 640 finds distant people on 4 MP cameras better but costs about 1.8x / 2.8x inference time; check the held-out benchmark's ms on your slowest device.</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-seeds">Repeat with N seeds</label>
+          <select id="train-seeds" name="seeds">
+            <option value="1" selected>1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+          </select>
+          <p class="muted small">Repeats the run with different training seeds on the same frames; the Comparison card shows the spread. Differences of 2-3 mAP between seeds are noise.</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-multi-scale">Multi-scale (RF-DETR)</label>
+          <select id="train-multi-scale" name="multi_scale">
+            <option value="auto" selected>auto</option>
+            <option value="on">on</option>
+            <option value="off">off</option>
+          </select>
+          <p class="muted small">Trains at up to about 1.4x the input size for accuracy; auto turns it off when batch 4 would not fit (half the GPU memory).</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-lr-schedule">LR schedule</label>
+          <select id="train-lr-schedule" name="lr_schedule">
+            {% for c in lr_schedules %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.title }}</option>{% endfor %}
+          </select>
+          <p class="muted small">How the learning rate decays over the epochs; default = the family's. {{ lr_schedule_hint }}.</p>
+        </div>
+        <div class="tr-field">
+          <label for="train-lr-min">Final LR factor</label>
+          <input type="number" id="train-lr-min" name="lr_min_factor" min="0" max="1" step="any" value="{{ lr_min_factor }}" placeholder="default">
+          <p class="muted small">The last epoch's learning rate as a share of the starting one (0&ndash;1). Empty = the family's default. RF-DETR's anneal before a convergence stop also ends there.</p>
+        </div>
+    </div>
+    <fieldset class="tr-sets">
+      <legend>Also benchmark on</legend>
+      {% for s in extra_sets %}<label class="check"><input type="checkbox" name="benchmark_set" value="{{ s }}"> <code>{{ s }}</code></label>{% endfor %}
+      <p class="muted small">The held-out frames of the export are always used.</p>
+    </fieldset>
+    <fieldset class="tr-sets">
+      <legend>Benchmark on devices</legend>
+      <input type="hidden" name="benchmark_devices_form" value="1">
+      {% for d in bench_devices %}<label class="check"{% if d.unavailable %} title="{{ d.label }}"{% endif %}><input type="checkbox" name="benchmark_device" value="{{ d.value }}"{% if d.checked %} checked{% endif %}> <code>{{ d.value }}</code> <span class="muted small">{{ d.label }}</span></label>{% endfor %}
+      <p class="muted small">Ticked devices run one after the other, each released before the next loads. None ticked: only the device the model would load on, <code>{{ bench_auto }}</code> here. Results go to the Benchmark page. Your choice is saved for the next runs.</p>
+    </fieldset>
+  </fieldset>
+  {% endif %}
+  </details>
+</form>

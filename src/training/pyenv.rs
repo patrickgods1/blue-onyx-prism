@@ -87,7 +87,7 @@ pub fn check_large(list: &[(&'static Resource, PathBuf)], allowed: bool) -> Resu
     if bytes > 0 && catalog::is_large(bytes) && !allowed {
         let names: Vec<&str> = to_download(list).map(|r| r.title).collect();
         bail!(
-            "this needs a large download ({}: {}); rerun with --allow-large (Training page: tick \
+            "this needs a large download ({}: {}); rerun with --allow-large (Train area: tick \
              the download confirmation) or enable allow_large_downloads",
             catalog::format_size(bytes),
             names.join(", ")

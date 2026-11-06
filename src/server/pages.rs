@@ -66,6 +66,16 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     ("test.js", JS, include_str!("../../assets/test.js")),
     ("training.js", JS, include_str!("../../assets/training.js")),
     (
+        "train-area.js",
+        JS,
+        include_str!("../../assets/train-area.js"),
+    ),
+    (
+        "train-dataset.js",
+        JS,
+        include_str!("../../assets/train-dataset.js"),
+    ),
+    (
         "train-metrics.js",
         JS,
         include_str!("../../assets/train-metrics.js"),
@@ -184,6 +194,8 @@ struct WelcomeTemplate {
     dataset_line: String,
     /// Why collection stopped on its own, while it is stopped.
     dataset_stopped: Option<String>,
+    /// `collect.enabled`: off, Home suggests it in one line.
+    collecting: bool,
 }
 
 pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
@@ -258,6 +270,7 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
                 dataset.summary.frames,
             ),
             dataset_stopped: dataset.disabled,
+            collecting,
         })
     })
     .await
@@ -1048,7 +1061,21 @@ mod tests {
     #[tokio::test]
     async fn pages_need_no_inline_script_or_style() {
         let state = test_state();
-        for page in ["/", "/stats", "/test", "/config", "/logs", "/benchmark"] {
+        for page in [
+            "/",
+            "/stats",
+            "/test",
+            "/config",
+            "/logs",
+            "/benchmark",
+            "/train/collect",
+            "/train/import",
+            "/train/autolabel",
+            "/train/review",
+            "/train/dataset",
+            "/train/train",
+            "/train/models",
+        ] {
             let (s, html) = get_text(&state, page).await;
             assert_eq!(s, StatusCode::OK, "{page}");
             assert!(html.contains("<script src=\"/static/live.js?v="), "{page}");
@@ -1210,16 +1237,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_and_training_pages_load_the_class_picker() {
+    async fn train_tabs_load_the_class_picker() {
         let state = test_state();
         for (uri, own_js) in [
-            ("/review", "/static/review.js?v="),
-            ("/training", "/static/training.js?v="),
+            ("/train/review", "/static/review.js?v="),
+            ("/train/dataset", "/static/train-dataset.js?v="),
+            ("/train/import", "/static/training.js?v="),
+            ("/train/autolabel", "/static/training.js?v="),
+            ("/train/train", "/static/training.js?v="),
             ("/config", "/static/config.js?v="),
         ] {
             let (s, html) = get_text(&state, uri).await;
             assert_eq!(s, StatusCode::OK, "{uri}");
-            if uri != "/config" {
+            if uri == "/train/autolabel" {
                 let mp = html.find("/static/model-picker.js?v=");
                 assert!(mp.is_some() && mp < html.find(own_js), "{uri}");
             }
@@ -1229,18 +1259,19 @@ mod tests {
             // The picker defines ClassPicker before the page script uses it.
             assert!(picker < own, "{uri}");
         }
-        let (_, review) = get_text(&state, "/review").await;
-        assert!(review.contains("id=\"rv-al-picker\""));
-        assert!(review.contains("name=\"mode\" value=\"labelers\""));
-        assert!(review.contains("name=\"mode\" value=\"model\""));
-        assert!(review.contains("id=\"rv-al-model-picker\""));
+        let (_, review) = get_text(&state, "/train/review").await;
         assert!(review.contains("id=\"rv-label-picker\""));
         assert!(review.contains("id=\"rv-show-picker\""));
-        assert!(review.contains("id=\"rv-classes-picker\""));
-        assert!(review.contains("name=\"sam3_threshold\""));
         assert!(review.contains("<option value=\"both\">found by 2+ labelers</option>"));
-        let (_, training) = get_text(&state, "/training").await;
+        let (_, dataset) = get_text(&state, "/train/dataset").await;
+        assert!(dataset.contains("id=\"rv-classes-picker\""));
+        let (_, import) = get_text(&state, "/train/import").await;
+        assert!(import.contains("id=\"import-al-picker\""));
+        let (_, training) = get_text(&state, "/train/autolabel").await;
         assert!(training.contains("id=\"al-picker\""));
+        assert!(training.contains("name=\"mode\" value=\"labelers\""));
+        assert!(training.contains("name=\"mode\" value=\"model\""));
+        assert!(training.contains("id=\"al-hide-unticked\""));
         assert!(training.contains("id=\"al-preset\""));
         assert!(training.contains("id=\"al-model-picker\""));
         assert!(training.contains("name=\"sam3_threshold\""));

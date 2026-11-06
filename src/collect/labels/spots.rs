@@ -186,7 +186,7 @@ pub fn add_parked(dir: &Path, at: &Place<'_>, from: &str) -> Result<(Parked, boo
         if list.len() >= MAX_PARKED {
             bail!(
                 "{} already has {MAX_PARKED} parked spots at this frame size; use Camera moved: \
-                 forget spots on the Review page, or delete old entries from its file",
+                 forget spots on the Review tab, or delete old entries from its file",
                 at.camera
             );
         }
@@ -267,7 +267,7 @@ fn after_move(rel: &layout::Rel, moved_at: &str) -> bool {
     }
 }
 
-/// A rejected spot as the Review page lists it ([`CameraMemory::rejected_spots`]).
+/// A rejected spot as the Review tab lists it ([`CameraMemory::rejected_spots`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RejectedSpot {
     pub label: String,

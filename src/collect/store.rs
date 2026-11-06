@@ -202,7 +202,7 @@ impl Store {
         s.last_error = self.last_error.clone();
     }
 
-    /// Remember `message` as the last error, for the Dataset page, and warn (throttled).
+    /// Remember `message` as the last error, for the Collect tab, and warn (throttled).
     pub fn note_error(&mut self, message: &str) {
         self.warn_throttled(message);
         self.last_error = Some(LastError {
@@ -230,7 +230,7 @@ impl Store {
         self.publish();
     }
 
-    /// Re-arm after a disk stop (the Dataset page's Resume).
+    /// Re-arm after a disk stop (the Collect tab's Resume).
     pub fn resume(&mut self) {
         if self.disabled.take().is_some() {
             info!("dataset collection resumed");

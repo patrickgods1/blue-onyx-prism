@@ -1,4 +1,4 @@
-//! The overlap check (`blue-onyx-prism train overlaps`, the Review page's *Suggest overlaps...*;
+//! The overlap check (`blue-onyx-prism train overlaps`, the Review tab's *Suggest overlaps...*;
 //! docs/TRAINING.md "Overlap suggestions"): a second look at the nested and partly overlapping boxes
 //! of the folder under review. RF-DETR L runs on a crop of each open pair and
 //! [`crate::collect::labels::overlaps`] turns what it saw, with the witnesses already in the label
@@ -80,7 +80,7 @@ fn rfdetr_weights(paths: &TrainPaths) -> Result<(&'static Resource, PathBuf)> {
 }
 
 /// Plan a check of `request` on `config` (fails fast on a bad filter, a missing GPU or a large
-/// download that was not allowed). It reads the folder under review, like the Review page.
+/// download that was not allowed). It reads the folder under review, like the Review tab.
 pub fn plan_overlaps(
     config: &Config,
     mut request: OverlapsRequest,
@@ -101,7 +101,7 @@ pub fn plan_overlaps(
         let (dl, _) = accelerator.lane().estimate();
         bail!(
             "the overlap check runs in the training environment (about {} download); rerun with \
-             --allow-large (Review page: tick the download confirmation)",
+             --allow-large (Review tab: tick the download confirmation)",
             res_catalog::format_size(dl)
         );
     }

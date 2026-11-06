@@ -1,5 +1,5 @@
 //! What an import of a path would read, before it is queued (`GET /v1/training/import/preview`,
-//! the line under the Training page's path field): the videos and images [`super::source::discover`]
+//! the line under the Train tab's path field): the videos and images [`super::source::discover`]
 //! finds, the cameras of the videos, their size, the skipped files, and the candidate budget
 //! ([`super::select::budget`]) each video would get.
 //!

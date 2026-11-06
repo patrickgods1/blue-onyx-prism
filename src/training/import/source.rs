@@ -395,7 +395,7 @@ pub fn check_license(
             if !confirmed {
                 bail!(
                     "confirm that the licence \"{l}\" allows you to use this video for training \
-                     (--confirm-license, or tick the box on the Training page)"
+                     (--confirm-license, or tick the box on the Import tab)"
                 );
             }
             if l.chars().count() > 200 || l.chars().any(char::is_control) {
@@ -408,7 +408,7 @@ pub fn check_license(
             if !confirmed {
                 bail!(
                     "confirm that you may use this footage for training (licence \"{l}\"; \
-                     --confirm-license, or tick the box on the Training page)"
+                     --confirm-license, or tick the box on the Import tab)"
                 );
             }
             if l.chars().count() > 200 || l.chars().any(char::is_control) {

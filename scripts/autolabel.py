@@ -765,7 +765,7 @@ class Sam3:
         from transformers.modeling_outputs import BaseModelOutputWithPooling
 
         if not (path / "config.json").exists():
-            fail(f"no SAM 3 weights in {path}: it is a gated download, see the Training page's SAM 3 panel")
+            fail(f"no SAM 3 weights in {path}: it is a gated download, see the Auto-label tab's SAM 3 panel")
         self.torch = torch
         self.device = device
         self.threshold = threshold
@@ -1307,7 +1307,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     a = parse_args()
     # The libraries' deprecation notices (transformers, torch.jit) would fill the job's log tail
-    # on the Training page instead of the progress lines.
+    # on the Train tab instead of the progress lines.
     warnings.filterwarnings("ignore", category=FutureWarning)
     if a.self_test:
         return self_test(a.parity)

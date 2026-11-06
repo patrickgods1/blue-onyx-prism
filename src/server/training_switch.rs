@@ -1,8 +1,9 @@
-//! The safe default switch of the Training page's Use card: `GET /v1/training/switch-preview`
+//! The safe default switch of the Models tab's Use card: `GET /v1/training/switch-preview`
 //! (what changes, the settings copied, the suggested threshold, the comparison with the current
 //! default) and `POST /training/revert` (also on Home). The pure part is
 //! [`crate::training::switch`]; `POST /training/use` ([`super::training`]) does the switch.
 
+use super::train_area::MODELS;
 use super::training::{field, runs, view};
 use super::{AppState, blocking, devices_snapshot, render};
 use crate::benchmark::{BenchmarkResults, configured_device, find_model, results_path};
@@ -173,7 +174,7 @@ pub(super) async fn preview(
 }
 
 /// `POST /training/revert`: undo the last default switch (`forget=1`: drop a record that cannot
-/// be used). Answers with the Training page, from Home too: that is where the message shows.
+/// be used). Answers with the Models tab, from Home too: that is where the message shows.
 pub(super) async fn revert(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
@@ -193,8 +194,13 @@ pub(super) async fn revert(
             Ok(())
         });
         match saved {
-            Ok(m) => render(&view(&state, Some(format!("{message} {m}")), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not reverted: {e:#}.")))),
+            Ok(m) => render(&view(&state, MODELS, Some(format!("{message} {m}")), None)),
+            Err(e) => render(&view(
+                &state,
+                MODELS,
+                None,
+                Some(format!("Not reverted: {e:#}.")),
+            )),
         }
     })
     .await
