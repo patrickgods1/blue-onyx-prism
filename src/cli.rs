@@ -139,6 +139,19 @@ pub enum Command {
     HfLogin,
     /// Delete the token saved by `hf-login`. `HF_TOKEN` and the `hf` CLI's own login stay.
     HfLogout,
+    /// Print the admin token other machines sign in with while `allow_remote_admin` is on (made
+    /// if there is none). Run it as the service's account, with the service's config. Stdout
+    /// holds the token and nothing else.
+    AdminToken {
+        /// Replace the token. A running service uses the new one at once; signed-in browsers
+        /// have to sign in again.
+        #[arg(long)]
+        rotate: bool,
+        /// The service's config file, which says where the token lives (default:
+        /// <exe_dir>/blue_onyx_prism_config.json; `--config` before the subcommand works too).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 /// `blue-onyx-prism service ...`.
@@ -179,9 +192,9 @@ pub struct Cli {
     /// only).
     #[arg(long)]
     pub bind_address: Option<std::net::IpAddr>,
-    /// Serve the admin pages (Config, Test, Logs, Benchmark, resources) to other machines too,
-    /// for this run only (not written to the config; set `allow_remote_admin` there to keep it;
-    /// default: loopback clients only).
+    /// Serve the admin pages (Config, Test, Logs, Benchmark, resources) to other machines that
+    /// show the admin token (see `admin-token`), for this run only (not written to the config;
+    /// set `allow_remote_admin` there to keep it; default: loopback clients only).
     #[arg(long)]
     pub allow_remote_admin: bool,
     /// Model file (.xml OpenVINO IR or .onnx). Replaces the configured model list unless
@@ -284,7 +297,7 @@ pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
 /// ([`Config::seed_default_model`]), written to `path`, so a first start binds the HTTP port,
 /// serves the web UI and downloads the model (`auto_download`). Messages go through
 /// [`crate::logbuf::early`] (this runs before logging is set up). Returns whether a model was
-/// added.
+/// added. `config` may hold the one-off flags of this run: the file keeps its own values.
 pub fn seed_default_model(config: &mut Config, path: &Path) -> bool {
     let Some(name) = config.seed_default_model() else {
         return false;
@@ -303,7 +316,8 @@ pub fn seed_default_model(config: &mut Config, path: &Path) -> bool {
             path.display()
         ),
     );
-    if let Err(e) = config.save(path) {
+    let file = Config::parse_file(path).unwrap_or_default();
+    if let Err(e) = without_one_off_flags(config, &file).save(path) {
         crate::logbuf::early(
             tracing::Level::WARN,
             format!(
@@ -316,21 +330,20 @@ pub fn seed_default_model(config: &mut Config, path: &Path) -> bool {
     true
 }
 
-/// `config` with the one-off boolean flags (`allow_remote_admin`, `force_cpu`,
-/// `save_ref_image`) put back to their values in `file`: what the CLI merge writes to disk. A
-/// test run with `--allow-remote-admin` must not leave the admin surface open on later starts.
+/// `config` with the one-off boolean flags ([`Config::one_off_flags`]) put back to their values
+/// in `file`: what a startup write puts on disk. A test run with `--allow-remote-admin` must not
+/// leave the admin surface open on later starts. The running service's writes do the same in
+/// [`crate::config_store::ConfigStore::update`].
 fn without_one_off_flags(config: &Config, file: &Config) -> Config {
-    Config {
-        allow_remote_admin: file.allow_remote_admin,
-        force_cpu: file.force_cpu,
-        save_ref_image: file.save_ref_image,
-        ..config.clone()
-    }
+    let mut out = config.clone();
+    out.set_one_off_flags(file.one_off_flags());
+    out
 }
 
 /// Log the settings of the starting config that widen what the service exposes or does (call
-/// once logging is up, at every start). `allow_remote_admin` is logged at warn.
-pub fn log_startup_warnings(config: &Config) {
+/// once logging is up, at every start). `allow_remote_admin` is logged at warn, with where its
+/// token is and how to read it. `config_path`: the file this process serves.
+pub fn log_startup_warnings(config: &Config, config_path: &Path) {
     for (what, t) in blocking_thresholds(config) {
         tracing::warn!(
             "{what} is {t}: no detection can reach it, so every request answers 0 objects; set a              threshold below 1 (0.4 to 0.6 is usual)"
@@ -338,10 +351,13 @@ pub fn log_startup_warnings(config: &Config) {
     }
     if config.allow_remote_admin {
         tracing::warn!(
-            "allow_remote_admin is on: the admin pages and actions (config editor, file browser, \
-             downloads, model export, restarts) answer every client that can reach port {} \
-             without authentication",
-            config.port
+            "allow_remote_admin is on: other machines reach the admin pages and actions (config \
+             editor, file browser, downloads, model export, restarts) on port {} with the admin \
+             token, over plain HTTP, so use it only on a trusted network or behind TLS. The token \
+             is in {}; read it on this machine with: {}",
+            config.port,
+            crate::admin_token::path(config).display(),
+            crate::admin_token::read_command(config_path)
         );
     }
 }
@@ -489,6 +505,10 @@ impl Cli {
                 classes: abs(&classes),
             },
             Command::ListModels { dir } => Command::ListModels { dir: abs(&dir) },
+            Command::AdminToken { rotate, config } => Command::AdminToken {
+                rotate,
+                config: abs(&config),
+            },
             Command::Fetch { .. }
             | Command::ListResources { .. }
             | Command::Benchmark(_)
@@ -996,6 +1016,24 @@ mod tests {
     fn hf_login_takes_no_token_and_config_goes_first() {
         let cli = Cli::try_parse_from(["bop", "--config", "c.json", "hf-login"]).unwrap();
         assert!(matches!(cli.command, Some(Command::HfLogin)));
+        // `--config` works on either side of `admin-token`, and relative paths follow the cwd.
+        let cli = Cli::try_parse_from(["x", "admin-token", "--rotate", "--config", "c.json"])
+            .unwrap()
+            .absolutized(Path::new("/work"));
+        assert!(matches!(
+            cli.command,
+            Some(Command::AdminToken { rotate: true, config: Some(ref p) })
+                if p.as_path() == Path::new("/work/c.json")
+        ));
+        let cli = Cli::try_parse_from(["x", "--config", "c.json", "admin-token"]).unwrap();
+        assert!(cli.config.is_some());
+        assert!(matches!(
+            cli.command,
+            Some(Command::AdminToken {
+                rotate: false,
+                config: None
+            })
+        ));
         assert_eq!(cli.config.as_deref(), Some(Path::new("c.json")));
         let cli = Cli::try_parse_from(["bop", "--config", "c.json", "hf-logout"]).unwrap();
         assert!(matches!(cli.command, Some(Command::HfLogout)));
@@ -1500,6 +1538,53 @@ mod tests {
         let err = Cli::try_parse_from(["x", "--version"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(v), "{err}");
+    }
+
+    /// A first start with the one-off flags and no models: `resolve_config`, then the seed,
+    /// as the service's start does. Memory keeps them for this run, the file never gets them.
+    #[test]
+    fn a_first_start_with_one_off_flags_does_not_save_them() {
+        let flags = |c: &Config| (c.allow_remote_admin, c.force_cpu, c.save_ref_image);
+        for existing in [false, true] {
+            let path = temp_cfg();
+            if existing {
+                Config::default().save(&path).unwrap();
+            }
+            let cli = Cli {
+                config: Some(path.clone()),
+                allow_remote_admin: true,
+                force_cpu: true,
+                save_ref_image: true,
+                ..Default::default()
+            };
+            let (mut c, _) = resolve_config(&cli).unwrap();
+            assert!(seed_default_model(&mut c, &path));
+            assert_eq!(flags(&c), (true, true, true), "this run");
+            let disk = Config::load(&path).unwrap();
+            assert_eq!(disk.models.len(), 1, "the seed is saved");
+            assert_eq!(flags(&disk), (false, false, false), "existing: {existing}");
+        }
+    }
+
+    /// The seed keeps what the file itself says: these are no one-offs.
+    #[test]
+    fn the_seed_keeps_flags_the_file_holds() {
+        let path = temp_cfg();
+        Config {
+            allow_remote_admin: true,
+            save_ref_image: true,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let cli = Cli {
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        let (mut c, _) = resolve_config(&cli).unwrap();
+        assert!(seed_default_model(&mut c, &path));
+        let disk = Config::load(&path).unwrap();
+        assert!(disk.allow_remote_admin && disk.save_ref_image && !disk.force_cpu);
     }
 
     #[test]

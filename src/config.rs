@@ -2,7 +2,7 @@
 //! Merge rule: a flag given on the command line overrides the file value (`cli::merge_cli`; an
 //! absent flag leaves the file value alone), the result is validated and written back to the
 //! file, except the one-off flags (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`),
-//! which apply to that run only and are never written back (`cli::without_one_off_flags`).
+//! which apply to that run only and are never written back ([`Config::one_off_flags`]).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -601,13 +601,15 @@ pub struct Config {
     /// `localhost`). `127.0.0.1` keeps the service local to this machine. Process restart.
     pub bind_address: std::net::IpAddr,
     /// Serve the admin pages and actions (Config, Test, Logs, Benchmark, resources, restart)
-    /// to other machines too. Off: only loopback clients get them (403 otherwise); detection,
-    /// `/stats.json`, `/prometheus`, `/v1/devices` and `/v1/config` stay open. Applies at once.
+    /// to other machines that show the admin token ([`crate::admin_token`]). Off: only loopback
+    /// clients get them (403 otherwise); detection, `/stats.json`, `/prometheus`, `/v1/devices`
+    /// and `/v1/config` stay open. Applies at once.
     pub allow_remote_admin: bool,
     /// Host names (no scheme, port or path; at most [`MAX_ALLOWED_HOSTS`]) the admin routes
     /// answer under, besides IP addresses and `localhost`: the defence against DNS rebinding
     /// (`server::guard`). The name a reverse proxy or `http://nas.local:32168` arrives with
-    /// goes here. Stored lower-case. Applies at once.
+    /// goes here, also to sign in from a browser under that name. Stored lower-case. Applies
+    /// at once.
     pub allowed_hosts: Vec<String>,
     /// How long a request may wait in the queue + processing before it is dropped (the only
     /// request timeout; the HTTP handler waits this plus a 500 ms grace for the worker).
@@ -965,6 +967,26 @@ impl Config {
             )
         })?;
         Ok(config)
+    }
+
+    /// The switches a command-line flag turns on for one run only (`allow_remote_admin`,
+    /// `force_cpu`, `save_ref_image`): every write of a config that may hold such a flag has to
+    /// put the file's values back ([`Self::set_one_off_flags`]).
+    pub fn one_off_flags(&self) -> [bool; 3] {
+        [self.allow_remote_admin, self.force_cpu, self.save_ref_image]
+    }
+
+    /// Set the switches of [`Self::one_off_flags`], in that order.
+    pub fn set_one_off_flags(&mut self, [remote, cpu, image]: [bool; 3]) {
+        self.allow_remote_admin = remote;
+        self.force_cpu = cpu;
+        self.save_ref_image = image;
+    }
+
+    /// The config in the file at `path`, parsed only (nothing is logged or checked), for what a
+    /// writer has to keep from it. `None`: no such file, or not a config.
+    pub fn parse_file(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
     }
 
     /// Give a config without any model the default catalog model ([`DEFAULT_MODEL_NAME`],

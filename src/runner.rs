@@ -227,6 +227,8 @@ struct Process {
     bound_port: u16,
     /// One benchmark runner for the process, so its last results survive a restart.
     benchmark: Arc<crate::benchmark::service::BenchmarkService>,
+    /// Wrong admin tokens per peer: a restart must not forgive them.
+    admin_failures: Arc<std::sync::Mutex<server::FailureLimit>>,
     /// The live config (revision, change log) is shared by every generation; a restart that
     /// reloads the file (or restores the previous config) adopts it as a logged change.
     store: Arc<crate::config_store::ConfigStore>,
@@ -288,6 +290,7 @@ impl Process {
                 ort_loaded: loaded_ort,
             }),
             benchmark: self.benchmark.clone(),
+            admin_failures: self.admin_failures.clone(),
         })
     }
 
@@ -501,6 +504,7 @@ pub fn run_server_with(
         log,
         provisioner,
         benchmark: crate::benchmark::service::BenchmarkService::new(),
+        admin_failures: Arc::default(),
         metrics: Arc::new(Metrics::new(crate::VERSION)),
     };
     // Disk retention (saved images, free-space warning): one sweeper per process, reading the
@@ -557,6 +561,7 @@ pub fn run_server_with(
             loaded_ort = registry_ort_flavor(&registry);
         }
         let state = process.state_for(&config, &registry, &provision, &generation, loaded_ort);
+        crate::admin_token::ensure_for(&config);
         let resources_restart = Arc::new(AtomicBool::new(false));
         let watcher = spawn_watcher(
             provision.clone(),

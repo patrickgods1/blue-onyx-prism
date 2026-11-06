@@ -43,6 +43,8 @@ pub(super) fn test_state_with(edit: impl FnOnce(&mut Config)) -> Arc<AppState> {
                 ..Default::default()
             })
             .collect(),
+        // Never the exe dir: these tests make files in the data root (`admin-token`).
+        download_dir: Some(dir.clone()),
         ..Default::default()
     };
     edit(&mut config);

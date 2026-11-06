@@ -3,8 +3,9 @@
 //!
 //! # Cross-site requests (CSRF)
 //!
-//! The admin routes have no login: a loopback peer (or anyone, with `allow_remote_admin`) may
-//! change the config, start downloads or restart the server. A web page on any site can make
+//! A loopback peer needs no login (with `allow_remote_admin`, a remote peer needs the admin
+//! token, which a browser then sends by itself: [`super::auth`]), and may change the config, start
+//! downloads or restart the server. A web page on any site can make
 //! the admin's browser send such a request (an auto-submitted form needs no CORS preflight),
 //! so [`csrf`] refuses a state-changing request (POST/PUT/PATCH/DELETE) that a browser marks as
 //! coming from another site:
@@ -36,7 +37,8 @@
 //! lie. The TCP peer is the victim's own machine, so the loopback rule passes too.
 //!
 //! Only the name itself gives the attack away: it needs a DNS name the attacker controls. So
-//! [`foreign_host`], applied by `admin_only` to every admin route and every method, passes an
+//! [`foreign_host`], applied by `admin_only` to every admin route and every method (and to
+//! `/login` and `/logout`), passes an
 //! IP literal (nothing to rebind, so LAN administration by address keeps working), `localhost`,
 //! and the names listed in `allowed_hosts`, and refuses any other name. It reads the `Host`
 //! header, else the URI authority (HTTP/2). A request with neither passes: a browser always
@@ -156,6 +158,16 @@ pub(crate) fn cross_site(headers: &HeaderMap) -> Result<(), CrossSite> {
     }
 }
 
+/// Headers a reverse proxy adds: a request carrying one did not come straight from a browser on
+/// this machine, whatever the TCP peer is. Read in that direction only: the header takes the
+/// trust of a loopback peer away and its value is never believed, since any client can send it.
+const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
+
+/// The first [`PROXY_HEADERS`] entry the request carries.
+pub(super) fn proxy_header(headers: &HeaderMap) -> Option<&'static str> {
+    PROXY_HEADERS.into_iter().find(|h| headers.contains_key(*h))
+}
+
 /// Most characters of a client's `Host` repeated in a refusal or in the log.
 const MAX_HOST_SHOWN: usize = 100;
 
@@ -225,14 +237,21 @@ pub(super) fn foreign_host(headers: &HeaderMap, uri: &Uri, allowed: &[String]) -
 
 /// What decides whether a repeated warning is logged now.
 #[derive(Debug)]
-struct WarnThrottle {
+pub(super) struct WarnThrottle {
     last: Option<Instant>,
     dropped: u64,
 }
 
 impl WarnThrottle {
+    pub(super) const fn new() -> Self {
+        Self {
+            last: None,
+            dropped: 0,
+        }
+    }
+
     /// `Some(lines dropped since the last one)` when a line may be logged at `now`.
-    fn allow_at(&mut self, now: Instant, every: Duration) -> Option<u64> {
+    pub(super) fn allow_at(&mut self, now: Instant, every: Duration) -> Option<u64> {
         if self.last.is_some_and(|t| now.duration_since(t) < every) {
             self.dropped = self.dropped.saturating_add(1);
             return None;
@@ -243,10 +262,7 @@ impl WarnThrottle {
 }
 
 /// The refused-`Host` warnings of this process.
-static HOST_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle {
-    last: None,
-    dropped: 0,
-});
+static HOST_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
 
 /// 403 for a `host` the admin routes do not answer under: an HTML page for browsers, else
 /// JSON. `host` comes from [`foreign_host`].
@@ -272,21 +288,31 @@ pub(super) fn host_refused(headers: &HeaderMap, path: &str, host: &str) -> Respo
 
 /// A 403 with `msg`: an HTML page for browsers, else JSON.
 pub(super) fn forbidden(headers: &HeaderMap, msg: String) -> Response {
+    refused(StatusCode::FORBIDDEN, headers, "Forbidden", msg)
+}
+
+/// `status` with `msg`: an HTML page under `heading` for browsers, else JSON.
+pub(super) fn refused(
+    status: StatusCode,
+    headers: &HeaderMap,
+    heading: &str,
+    msg: String,
+) -> Response {
     if wants_html(headers) {
         let page = MessageTemplate {
             nav: "",
             version: crate::VERSION,
-            heading: "Forbidden".into(),
+            heading: heading.into(),
             message: msg,
             refresh_secs: 0,
             refresh_url: String::new(),
             restarting: false,
             generation: 0,
         };
-        (StatusCode::FORBIDDEN, render(&page)).into_response()
+        (status, render(&page)).into_response()
     } else {
         (
-            StatusCode::FORBIDDEN,
+            status,
             Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
         )
             .into_response()

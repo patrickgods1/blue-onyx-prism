@@ -269,7 +269,7 @@ pub fn env_overrides_login(data_root: &Path) -> bool {
 /// Write `value` to a new file only this account can read: mode 0600 on Unix, on Windows the
 /// protected ACL of its folder (`folder_acl`). `path` must not exist yet: nothing is ever
 /// written through a file or link already there.
-fn write_private(path: &Path, value: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, value: &str) -> Result<()> {
     use std::io::Write;
     let mut open = std::fs::OpenOptions::new();
     open.write(true).create_new(true);
@@ -289,7 +289,7 @@ fn write_private(path: &Path, value: &str) -> Result<()> {
 /// Run as root, the data root's owner has to own what was made, or the service cannot read the
 /// token (nor add its own folders to a `tools` that root created).
 #[cfg(any(unix, test))]
-fn chown_to(me: u32, data_root_owner: (u32, u32)) -> Option<(u32, u32)> {
+pub(crate) fn chown_to(me: u32, data_root_owner: (u32, u32)) -> Option<(u32, u32)> {
     (me == 0 && data_root_owner.0 != 0).then_some(data_root_owner)
 }
 
@@ -798,30 +798,20 @@ fn windows_system_install(place: &CommandPlace<'_>) -> bool {
     inside(place.exe_dir, "\\program files") || inside(place.config, "\\programdata\\")
 }
 
-/// The command that signs in for the service at `place`. `--config` goes before the subcommand:
-/// it is not a global option. Docker has no shape here: `docker exec -it <name> ...` or `HF_TOKEN`,
-/// in the docs.
-pub fn login_command(place: &CommandPlace<'_>) -> LoginCommand {
-    const HIDDEN: &str = "It asks for the token and does not show what you paste; a read-only \
-                          token is enough.";
+/// The command line that runs `subcommand` for the service at `place`, as the service's account.
+/// `--config` goes before the subcommand: it is not a global option. Docker has no shape here:
+/// `docker exec -it <name> ...`, in the docs.
+pub fn cli_command(place: &CommandPlace<'_>, subcommand: &str) -> String {
     if place.os == "windows" {
         let exe = format!(
             "{}\\{CLI_NAME}.exe",
             place.exe_dir.trim_end_matches(['\\', '/'])
         );
-        let how = if windows_system_install(place) {
-            "Run it in PowerShell from an elevated terminal (Run as administrator)."
-        } else {
-            "Run it in PowerShell."
-        };
-        return LoginCommand {
-            command: format!(
-                "& {} --config {} hf-login",
-                powershell_quote(&exe),
-                powershell_quote(place.config)
-            ),
-            note: format!("{how} {HIDDEN}"),
-        };
+        return format!(
+            "& {} --config {} {subcommand}",
+            powershell_quote(&exe),
+            powershell_quote(place.config)
+        );
     }
     let exe = format!("{}/{CLI_NAME}", place.exe_dir.trim_end_matches('/'));
     let fallback = if place.os == "macos" {
@@ -839,12 +829,31 @@ pub fn login_command(place: &CommandPlace<'_>) -> LoginCommand {
     } else {
         format!("sudo -u {}", sh_quote(account))
     };
+    format!(
+        "{sudo} {} --config {} {subcommand}",
+        sh_quote(&exe),
+        sh_quote(place.config)
+    )
+}
+
+/// The command that signs in for the service at `place` ([`cli_command`]) and how to run it.
+pub fn login_command(place: &CommandPlace<'_>) -> LoginCommand {
+    const HIDDEN: &str = "It asks for the token and does not show what you paste; a read-only \
+                          token is enough.";
+    let command = cli_command(place, "hf-login");
+    if place.os == "windows" {
+        let how = if windows_system_install(place) {
+            "Run it in PowerShell from an elevated terminal (Run as administrator)."
+        } else {
+            "Run it in PowerShell."
+        };
+        return LoginCommand {
+            command,
+            note: format!("{how} {HIDDEN}"),
+        };
+    }
     LoginCommand {
-        command: format!(
-            "{sudo} {} --config {} hf-login",
-            sh_quote(&exe),
-            sh_quote(place.config)
-        ),
+        command,
         note: format!(
             "Run it as the service's account, so the service can read the token. {HIDDEN}"
         ),
@@ -853,13 +862,23 @@ pub fn login_command(place: &CommandPlace<'_>) -> LoginCommand {
 
 /// [`login_command`] for this process, serving the config at `config`.
 pub fn login_command_for(config: &Path) -> LoginCommand {
+    with_place_for(config, login_command)
+}
+
+/// [`cli_command`] for this process, serving the config at `config`.
+pub fn cli_command_for(config: &Path, subcommand: &str) -> String {
+    with_place_for(config, |place| cli_command(place, subcommand))
+}
+
+/// `f` on where this process's CLI runs for the config at `config`.
+fn with_place_for<T>(config: &Path, f: impl FnOnce(&CommandPlace<'_>) -> T) -> T {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(crate::exe_dir);
     let config = std::path::absolute(config).unwrap_or_else(|_| config.to_path_buf());
     let account = process_env("USER").or_else(|| process_env("LOGNAME"));
-    login_command(&CommandPlace {
+    f(&CommandPlace {
         os: std::env::consts::OS,
         exe_dir: &exe_dir.to_string_lossy(),
         config: &config.to_string_lossy(),
