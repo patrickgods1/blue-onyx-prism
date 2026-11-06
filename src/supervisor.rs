@@ -306,7 +306,7 @@ pub fn spawn(state: Weak<AppState>, generation: CancellationToken) -> Option<Joi
                 let tries = upgrades.due(
                     now,
                     better.iter().map(|(n, b, t)| (n.as_str(), b, *t)),
-                    state.benchmark.is_running(),
+                    state.benchmark.is_running() || crate::server::training_queue_busy(),
                 );
                 for u in tries {
                     try_better(&state, &u);
