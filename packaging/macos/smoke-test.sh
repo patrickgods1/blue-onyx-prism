@@ -13,7 +13,16 @@ CONFIG="$DATA/blue_onyx_prism_config.json"
 SEED="$DATA/dataset/smoke-test/frame.labels.json"
 PROG=/usr/local/blue-onyx-prism
 APP="/Applications/Uninstall Blue Onyx Prism.app"
-fail() { echo "SMOKE TEST FAILED: $*" >&2; exit 1; }
+fail() {
+  echo "SMOKE TEST FAILED: $*" >&2
+  # Why the daemon stopped: a restart count alone says nothing.
+  sudo launchctl print system/com.blueonyx.prism 2>&1 \
+    | grep -E '^\s*(state|runs|pid|last exit|immediate reason|job state)' >&2 || true
+  id _blueonyx >&2 || true
+  sudo ls -ldn "$DATA" "$CONFIG" >&2 || true
+  sudo sh -c 'cd /var/log/blue-onyx-prism && ls -la && for f in $(ls -t | head -3); do echo "== $f"; tail -n 40 "$f"; done' >&2 || true
+  exit 1
+}
 
 # The daemon is loaded, owns its config and comes up ready, started once.
 check_daemon() {
