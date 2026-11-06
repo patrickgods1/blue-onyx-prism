@@ -10,7 +10,8 @@
 //! [`apply_labelers`]: what a frame takes depends on its status when the file is written, a
 //! reviewed frame only takes the confident new objects past its gate ([`gate_drop`]), and every
 //! frame takes the labelers' votes on boxes they found again ([`vote`]). A run with a model votes
-//! the same way ([`apply_relabel`]); a `missing_only` run does not.
+//! the same way ([`apply_relabel`]); a `missing_only` run does not. On a frame no reviewer has
+//! decided, [`tier`] sorts a labelers run's new boxes into dismissed, likely and the rest.
 
 use super::catalog::same_class;
 use super::{Category, MISSING_THRESHOLD};
@@ -33,6 +34,21 @@ pub const MISSING_IOU: f32 = 0.3;
 /// `missing_only`: share of a detection inside a training or pending box of the same object at
 /// which that box covers it ([`apply_missing`]).
 pub const MISSING_INSIDE: f32 = 0.5;
+
+// The tiers of a labelers run's boxes ([`tier`]), measured in `docs/TRAINING.md` "Measuring
+// auto-label". Change them only after running `scripts/research/eval_autolabel.py`.
+
+/// Fused score below which a box is dismissed: 5% real on public sets, 0% on a fixed camera.
+pub const DISMISS_SCORE: f32 = 0.15;
+/// Fused score from which a box with a VLM yes is likely real: 77% / 96% real.
+pub const LIKELY_SCORE: f32 = 0.25;
+/// Classes never dismissed: 10.7% of real trucks scored below [`DISMISS_SCORE`].
+pub const NEVER_DISMISSED: [&str; 1] = ["truck"];
+/// One box in this many that would be dismissed stays visible, so that the filter can be checked
+/// (about 2%).
+pub const AUDIT_ONE_IN: u32 = 50;
+/// The reason an audit sample shows on the Review page.
+pub const AUDIT_WHY: &str = "audit sample: normally hidden";
 
 /// The VLM check of a box, as the script reports it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -289,6 +305,8 @@ fn proposal_box(p: &Proposal, scene: &str, w: u32, h: u32, accept_score: f32) ->
                 .collect(),
             auto_label: None,
             auto_score: None,
+            likely: false,
+            audit: false,
         },
     })
 }
@@ -528,6 +546,7 @@ pub fn apply_relabel(
     classes: &[String],
 ) -> RelabelReport {
     let why = disagreement(f, dets, model, classes);
+    undismiss_found(f, &boxes);
     let existing = f.boxes.len();
     let merged = apply(f, boxes.clone());
     let votes = vote(f, &boxes, existing);
@@ -587,8 +606,9 @@ fn covers(b: &LabelBox, p: &LabelBox) -> bool {
         || (area(&p.bbox) <= area(&b.bbox) && inside_share(&p.bbox, &b.bbox) >= MISSING_INSIDE)
 }
 
-/// A rejected box no reviewer judged: a [`labels::bulk::LOW_SCORE_REASON`] bulk reject, or a model
-/// hint (suppressed, below threshold, verifier find) the page's save default rejected. A reject
+/// A rejected box no reviewer judged: a [`labels::bulk::LOW_SCORE_REASON`] bulk reject, a dismissal
+/// ([`labels::bulk::DISMISSED_REASON`]), or a model hint (suppressed, below threshold, verifier find)
+/// the page's save default rejected. A reject
 /// reason, a spot edit or a duplicate reject means somebody looked, whatever the box's origin. A
 /// spot edit leaves its mark only on a box without a `reason` of its own, so a suppressed hint
 /// rejected by one cannot be told from the save default.
@@ -597,8 +617,10 @@ fn unjudged_reject(b: &LabelBox) -> bool {
     b.state == BoxState::Rejected
         && b.reject_reason.is_none()
         && !matches!(reason, Some(REPEAT_SPOT_REASON | DUPLICATE_REASON))
-        && (reason == Some(labels::bulk::LOW_SCORE_REASON)
-            || (b.source == Source::Model && b.origin != Some(Origin::Prediction)))
+        && (matches!(
+            reason,
+            Some(labels::bulk::LOW_SCORE_REASON | labels::bulk::DISMISSED_REASON)
+        ) || (b.source == Source::Model && b.origin != Some(Origin::Prediction)))
 }
 
 /// The note of a frame with `f`'s pending proposals: who proposed them and how many, within
@@ -770,6 +792,12 @@ pub struct LabelersReport {
     pub votes: usize,
     /// Proposals a skipped or confirmed-empty frame took no box for.
     pub closed: usize,
+    /// New boxes dismissed ([`Tier::Dismissed`]).
+    pub dismissed: usize,
+    /// New boxes kept visible to check the dismissals ([`Tier::Audit`]).
+    pub audit: usize,
+    /// New boxes likely real ([`Tier::Likely`]).
+    pub likely: usize,
 }
 
 impl LabelersReport {
@@ -831,9 +859,10 @@ fn gate_drop(f: &LabelFile, p: &LabelBox) -> Option<GateDrop> {
     }
     let here = |b: &LabelBox| iou(&b.bbox, &p.bbox) >= MATCH_IOU;
     let other_object = |b: &LabelBox| !same_object(&b.label, &p.label);
+    // A dismissed box is no decision: nobody said what is there.
     if f.boxes
         .iter()
-        .any(|b| b.state != BoxState::Pending && other_object(b) && here(b))
+        .any(|b| b.state != BoxState::Pending && !b.is_dismissed() && other_object(b) && here(b))
     {
         return Some(GateDrop::OtherObject);
     }
@@ -897,12 +926,119 @@ fn vote(f: &mut LabelFile, proposals: &[LabelBox], existing: usize) -> usize {
     gained
 }
 
+/// How much a reviewer should trust a new box of a labelers run ([`tier`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// Too unlikely to show: rejected with [`labels::bulk::DISMISSED_REASON`], recoverable on the
+    /// Review page.
+    Dismissed,
+    /// Would be dismissed, but [`audit_sample`] keeps it visible to check the filter.
+    Audit,
+    /// Shown first ([`AutoInfo::likely`]).
+    Likely,
+    /// Everything else: visible, shown after the likely boxes.
+    Unlikely,
+}
+
+/// Whether a box is among the [`AUDIT_ONE_IN`] kept back from dismissal: a hash of its frame, label
+/// and whole-pixel box, so a rerun gives the same box the same answer.
+pub fn audit_sample(frame: &str, label: &str, bbox: &[f32; 4]) -> bool {
+    use sha2::Digest;
+    let [x0, y0, x1, y1] = bbox;
+    let key = format!("{frame}\n{label}\n{x0:.0},{y0:.0},{x1:.0},{y1:.0}");
+    let digest = sha2::Sha256::digest(key.as_bytes());
+    let n = digest
+        .iter()
+        .take(4)
+        .fold(0u32, |n, b| (n << 8) | u32::from(*b));
+    n % AUDIT_ONE_IN == 0
+}
+
+/// The [`Tier`] of `b`, a box of a labelers run on `frame` (thresholds and their measured reasons
+/// above [`DISMISS_SCORE`]). Only a pending auto box with no sign of a reviewer gets a tier other
+/// than [`Tier::Unlikely`].
+///
+/// - Likely: fused score >= [`LIKELY_SCORE`] and a yes to the yes/no question. An older run's
+///   seven-way VLM answer is never one.
+/// - Dismissed: fused score < [`DISMISS_SCORE`], not triaged `accept`, not of a class in
+///   [`NEVER_DISMISSED`], not found by SAM 3, and `sam3_run` false (the thresholds were measured on
+///   MM-Grounding-DINO + RF-DETR). Only the score decides: a VLM no never hides a box, 40% of
+///   those were real on public sets. A class only one labeler can report is not halved by the
+///   fusion, so it stays at or above that labeler's threshold (0.2 for MM-Grounding-DINO).
+pub fn tier(b: &LabelBox, frame: &str, sam3_run: bool) -> Tier {
+    let untouched = b.state == BoxState::Pending
+        && b.source == Source::Auto
+        && b.orig_bbox.is_none()
+        && !b.difficult
+        && b.reject_reason.is_none();
+    let Some(score) = b.score.filter(|_| untouched) else {
+        return Tier::Unlikely;
+    };
+    let yes = b
+        .auto
+        .vlm
+        .as_ref()
+        .is_some_and(|v| v.expected == "yes" && v.ok);
+    if score >= LIKELY_SCORE && yes {
+        return Tier::Likely;
+    }
+    let protected = sam3_run
+        || b.auto.labelers.contains_key(SAM3_KEY)
+        || b.auto.triage == Some(Triage::Accept)
+        || NEVER_DISMISSED
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(b.label.trim()));
+    if score >= DISMISS_SCORE || protected {
+        Tier::Unlikely
+    } else if audit_sample(frame, &b.label, &b.bbox) {
+        Tier::Audit
+    } else {
+        Tier::Dismissed
+    }
+}
+
+/// Give the boxes of `f` from index `from` on their [`tier`], counted in `r`.
+fn apply_tiers(f: &mut LabelFile, from: usize, frame: &str, name: &str, r: &mut LabelersReport) {
+    for b in f.boxes.iter_mut().skip(from) {
+        match tier(b, frame, name == SAM3_KEY) {
+            Tier::Dismissed => {
+                b.state = BoxState::Rejected;
+                b.reason = Some(labels::bulk::DISMISSED_REASON.into());
+                r.dismissed += 1;
+            }
+            Tier::Audit => {
+                b.auto.audit = true;
+                b.auto.why.push(AUDIT_WHY.to_string());
+                r.audit += 1;
+            }
+            Tier::Likely => {
+                b.auto.likely = true;
+                r.likely += 1;
+            }
+            Tier::Unlikely => {}
+        }
+    }
+}
+
+/// Take away the dismissed boxes of `f` that one of `proposals` found again, same label at IoU >=
+/// [`MATCH_IOU`]: nobody decided on them, so [`merge_proposals`] must not drop the proposal as
+/// covered. It comes back as new, and a labelers run tiers it afresh: the same box scores the same
+/// and is dismissed again, a stronger find or SAM 3's stays visible.
+fn undismiss_found(f: &mut LabelFile, proposals: &[LabelBox]) {
+    f.boxes.retain(|b| {
+        !b.is_dismissed()
+            || !proposals
+                .iter()
+                .any(|p| p.label == b.label && iou(&b.bbox, &p.bbox) >= MATCH_IOU)
+    });
+}
+
 /// Merge the proposals of a labelers run into `f`, by the frame's status now (the caller holds the
 /// write lock, so a frame reviewed while the run looked at it counts as reviewed):
 ///
 /// | Frame | Result |
 /// |---|---|
-/// | Unreviewed, not sent back | [`apply`], then votes |
+/// | Unreviewed, not sent back | [`apply`], then votes, then the new boxes' [`tier`] |
 /// | Reviewed, or sent back by a re-label | votes, the gate ([`gate_drop`]), then [`apply_missing`] |
 /// | Confirmed empty, any status | votes: a save refuses a training box on such a frame |
 /// | Skipped | votes: a skipped frame must not come back and reach an export by a bulk accept |
@@ -911,14 +1047,26 @@ fn vote(f: &mut LabelFile, proposals: &[LabelBox], existing: usize) -> usize {
 /// `labelers`. A box past the gate gets a reason and triage `review`; a frame that gains one goes
 /// back to `unreviewed` with a `disagreement` note naming `name` (one short name, `sam3`, not the
 /// run's joined list) and loses [`LabelFile::bulk_accepted`]: a reviewer has to look at it now.
-pub fn apply_labelers(f: &mut LabelFile, boxes: Vec<LabelBox>, name: &str) -> LabelersReport {
+/// `frame` (`<scene>/<camera>/<date>/<stem>.jpg`) seeds the [`audit_sample`].
+pub fn apply_labelers(
+    f: &mut LabelFile,
+    boxes: Vec<LabelBox>,
+    name: &str,
+    frame: &str,
+) -> LabelersReport {
     let mut r = LabelersReport::default();
+    let path = labelers_path(f);
+    if path == LabelersPath::Merge {
+        undismiss_found(f, &boxes);
+    }
     let existing = f.boxes.len();
-    match labelers_path(f) {
+    match path {
         LabelersPath::Merge => {
             // After `apply`: a vote on a box without evidence would stop it taking the proposal's.
             r.apply = apply(f, boxes.clone());
             r.votes = vote(f, &boxes, existing);
+            // Only the boxes this run added: a stored box is never tiered again.
+            apply_tiers(f, existing, frame, name, &mut r);
         }
         LabelersPath::Closed => {
             r.votes = vote(f, &boxes, existing);
@@ -953,6 +1101,8 @@ pub fn apply_labelers(f: &mut LabelFile, boxes: Vec<LabelBox>, name: &str) -> La
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    const REL: &str = "day/yard/2026-10-22/20261022T010203004Z_abcd.jpg";
 
     fn p(label: &str, score: f32, agree: bool) -> Proposal {
         Proposal {
@@ -1967,7 +2117,7 @@ mod tests {
         };
         // Through the labelers' gate and through `--missing-only`.
         let mut gated = stacked_cars(true);
-        apply_labelers(&mut gated, boxes(&[sam("dog", OFF, 0.9)]), "sam3");
+        apply_labelers(&mut gated, boxes(&[sam("dog", OFF, 0.9)]), "sam3", REL);
         let mut direct = stacked_cars(true);
         missing(&mut direct, &[d("dog", OFF)], "m");
         for mut f in [gated, direct] {
@@ -1975,7 +2125,7 @@ mod tests {
             assert!(!f.overlaps_checked && f.checked_before_reopen);
             // A second rerun on the sent-back frame must not forget it.
             let free = [10.0, 300.0, 60.0, 360.0];
-            apply_labelers(&mut f, boxes(&[sam("cat", free, 0.9)]), "sam3");
+            apply_labelers(&mut f, boxes(&[sam("cat", free, 0.9)]), "sam3", REL);
             assert!(f.checked_before_reopen);
             assert_eq!(labels::bulk::restore_reopened(&mut f), 0, "still pending");
             reject_new(&mut f);
@@ -1988,7 +2138,7 @@ mod tests {
 
         // Nobody checked this one: it stays in reach.
         let mut f = stacked_cars(false);
-        apply_labelers(&mut f, boxes(&[sam("dog", OFF, 0.9)]), "sam3");
+        apply_labelers(&mut f, boxes(&[sam("dog", OFF, 0.9)]), "sam3", REL);
         assert!(!f.checked_before_reopen);
         reject_new(&mut f);
         assert_eq!(labels::bulk::restore_reopened(&mut f), 1);
@@ -1998,7 +2148,7 @@ mod tests {
         // A frame that gains nothing keeps its check where it was.
         let mut f = stacked_cars(true);
         let before = f.clone();
-        apply_labelers(&mut f, boxes(&[unasked("dog", OFF, 0.9)]), "sam3");
+        apply_labelers(&mut f, boxes(&[unasked("dog", OFF, 0.9)]), "sam3", REL);
         assert_eq!(f, before);
     }
 
@@ -2085,7 +2235,7 @@ mod tests {
             sam("truck", [500.0, 300.0, 600.0, 400.0], 0.9),
             sam("dog", OFF, 0.2),
         ];
-        let r = apply_labelers(&mut f, boxes(&props), "sam3");
+        let r = apply_labelers(&mut f, boxes(&props), "sam3", REL);
         assert_eq!(r.missing.candidates(), 0, "{r:?}");
         assert_eq!(f.status, Status::Reviewed);
         assert_eq!(f.boxes.len(), before.boxes.len());
@@ -2096,7 +2246,7 @@ mod tests {
         assert_eq!(f.boxes[3].auto.labelers["rfdetr"], 0.33);
         assert_eq!(f.boxes[3].auto.labelers["sam3"], 0.9);
         let mut g = before.clone();
-        apply_labelers(&mut g, boxes(&[sam("dog", OFF, 0.2)]), "sam3");
+        apply_labelers(&mut g, boxes(&[sam("dog", OFF, 0.2)]), "sam3", REL);
         assert_eq!(g, before, "no vote, no box: the frame is as it was");
     }
 
@@ -2106,23 +2256,23 @@ mod tests {
         for state in [BoxState::Accepted, BoxState::Rejected] {
             let mut f = frame(vec![lb("cat", cat, Source::Model, state)]);
             let before = f.clone();
-            let r = apply_labelers(&mut f, boxes(&[sam("dog", CAR, 0.9)]), "sam3");
+            let r = apply_labelers(&mut f, boxes(&[sam("dog", CAR, 0.9)]), "sam3", REL);
             assert_eq!(r.gate.other_object, 1, "{state:?}");
             assert_eq!(r.missing.candidates(), 0);
             assert_eq!(f, before, "no vote: another object");
         }
         let mut f = frame(vec![lb("cat", cat, Source::Human, BoxState::Added)]);
-        let r = apply_labelers(&mut f, boxes(&[sam("dog", cat, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("dog", cat, 0.9)]), "sam3", REL);
         assert_eq!(r.gate.other_object, 1);
         // Below IoU 0.5 it is a new object, an accepted cat or not.
         let mut f = frame(vec![accepted("cat", cat)]);
         let beside = [160.0, 100.0, 260.0, 200.0];
         assert!(iou(&cat, &beside) < MATCH_IOU);
-        let r = apply_labelers(&mut f, boxes(&[sam("dog", beside, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("dog", beside, 0.9)]), "sam3", REL);
         assert_eq!((r.gate.other_object, r.missing.added), (0, 1));
         // A pending box is no decision.
         let mut f = frame(vec![lb("cat", cat, Source::Auto, BoxState::Pending)]);
-        let r = apply_labelers(&mut f, boxes(&[sam("dog", cat, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("dog", cat, 0.9)]), "sam3", REL);
         assert_eq!((r.gate.other_object, r.missing.added), (0, 1));
     }
 
@@ -2137,14 +2287,14 @@ mod tests {
         let before = f.clone();
         let mut sure = p("car", 0.9, true);
         sure.bbox = CAR;
-        let r = apply_labelers(&mut f, boxes(&[sure]), "gdino");
+        let r = apply_labelers(&mut f, boxes(&[sure]), "gdino", REL);
         assert_eq!(r.closed, 1);
         assert!(!r.for_review());
         assert_eq!(f, before);
         assert!(!labels::auto_accept_eligible(&f));
         // Votes still land: the frame's boxes were found again.
         let again = sam("person", [401.0, 10.0, 450.0, 90.0], 0.8);
-        let r = apply_labelers(&mut f, boxes(&[again]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[again]), "sam3", REL);
         assert_eq!((r.votes, f.status), (1, Status::Skipped));
         assert_eq!(f.boxes.len(), 1);
     }
@@ -2153,13 +2303,13 @@ mod tests {
     fn a_low_score_does_not_reopen() {
         let mut f = frame(vec![]);
         let before = f.clone();
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.49)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.49)]), "sam3", REL);
         assert_eq!((r.gate.low_score, r.missing.candidates()), (1, 0));
         assert_eq!(f, before);
         // The source's score decides: fused 0.25 reopens at a source of exactly 0.5.
         let at = boxes(&[sam("car", CAR, MISSING_THRESHOLD)]);
         assert_eq!(at[0].score, Some(0.25));
-        assert_eq!(apply_labelers(&mut f, at, "sam3").missing.added, 1);
+        assert_eq!(apply_labelers(&mut f, at, "sam3", REL).missing.added, 1);
         assert_eq!(f.status, Status::Unreviewed);
     }
 
@@ -2208,7 +2358,7 @@ mod tests {
         for (o, name) in [(vlm.clone(), "vlm"), (agreed.clone(), "siglip")] {
             let mut f = frame(vec![]);
             let before = f.clone();
-            let r = apply_labelers(&mut f, boxes(&[o]), "sam3");
+            let r = apply_labelers(&mut f, boxes(&[o]), "sam3", REL);
             assert_eq!((r.gate.objected, r.missing.candidates()), (1, 0), "{name}");
             assert_eq!(f, before, "{name}");
         }
@@ -2217,7 +2367,12 @@ mod tests {
         agreed.species_scores = [("cat".to_string(), 0.7), ("raccoon".to_string(), 0.2)].into();
         for o in [vlm, agreed] {
             let mut f = frame(vec![]);
-            assert_eq!(apply_labelers(&mut f, boxes(&[o]), "sam3").missing.added, 1);
+            assert_eq!(
+                apply_labelers(&mut f, boxes(&[o]), "sam3", REL)
+                    .missing
+                    .added,
+                1
+            );
         }
     }
 
@@ -2229,7 +2384,7 @@ mod tests {
         for lone in [unasked("car", CAR, 0.9), gdino.clone()] {
             let mut f = frame(vec![]);
             let before = f.clone();
-            let r = apply_labelers(&mut f, boxes(&[lone]), "sam3");
+            let r = apply_labelers(&mut f, boxes(&[lone]), "sam3", REL);
             assert_eq!((r.gate.unchecked, r.missing.candidates()), (1, 0));
             assert_eq!(r.gate.total(), 1);
             assert!(!r.for_review());
@@ -2242,14 +2397,14 @@ mod tests {
         let skipped: FrameProposals = serde_json::from_str(line).unwrap();
         let mut f = frame(vec![]);
         let before = f.clone();
-        let r = apply_labelers(&mut f, boxes(&skipped.boxes), "sam3");
+        let r = apply_labelers(&mut f, boxes(&skipped.boxes), "sam3", REL);
         assert_eq!((r.gate.unchecked, r.missing.candidates()), (1, 0));
         assert_eq!(f, before);
 
         // The VLM's yes opens it, for either labeler.
         let mut f = frame(vec![]);
         assert_eq!(
-            apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3")
+            apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL)
                 .missing
                 .added,
             1
@@ -2257,19 +2412,19 @@ mod tests {
         assert_eq!(f.status, Status::Unreviewed);
         gdino.vlm = sam("car", CAR, 0.9).vlm;
         let mut f = frame(vec![]);
-        let r = apply_labelers(&mut f, boxes(&[gdino]), "gdino");
+        let r = apply_labelers(&mut f, boxes(&[gdino]), "gdino", REL);
         assert_eq!(r.missing.added, 1);
 
         // A VLM yes does not lift the score rule.
         let mut f = frame(vec![]);
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.4)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.4)]), "sam3", REL);
         assert_eq!((r.gate.low_score, r.gate.unchecked), (1, 0));
 
         // Labelers that agree need no VLM, unless a check objected.
         let mut agreed = p("car", 0.7, true);
         agreed.bbox = CAR;
         let mut f = frame(vec![]);
-        let r = apply_labelers(&mut f, boxes(std::slice::from_ref(&agreed)), "sam3");
+        let r = apply_labelers(&mut f, boxes(std::slice::from_ref(&agreed)), "sam3", REL);
         assert_eq!((r.gate.unchecked, r.missing.added), (0, 1));
         agreed.vlm = Some(VlmOut {
             model: "qwen3-vl-2b".into(),
@@ -2278,13 +2433,13 @@ mod tests {
             ok: false,
         });
         let mut f = frame(vec![]);
-        let r = apply_labelers(&mut f, boxes(&[agreed]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[agreed]), "sam3", REL);
         assert_eq!((r.gate.objected, r.missing.added), (1, 0));
 
         // Votes do not ask: the unchecked box still counts for the box it found again.
         let seen = [400.0, 10.0, 450.0, 90.0];
         let mut f = frame(vec![accepted("person", seen)]);
-        let r = apply_labelers(&mut f, boxes(&[unasked("person", seen, 0.8)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[unasked("person", seen, 0.8)]), "sam3", REL);
         assert_eq!((r.votes, r.gate.unchecked), (1, 1));
         assert_eq!(f.status, Status::Reviewed);
         assert_eq!(f.boxes[0].auto.labelers["sam3"], 0.8);
@@ -2305,11 +2460,11 @@ mod tests {
         let before = f.clone();
         let mut sure = p("dog", 0.9, true);
         sure.bbox = OFF;
-        let r = apply_labelers(&mut f, boxes(&[sure, sam("person", OFF, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sure, sam("person", OFF, 0.9)]), "sam3", REL);
         assert_eq!((r.closed, r.votes), (2, 0));
         assert!(!r.for_review());
         assert_eq!(f, before);
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         assert_eq!((r.closed, r.votes), (1, 1));
         assert_eq!(f.boxes.len(), 1);
         // So the later save still goes through.
@@ -2325,11 +2480,11 @@ mod tests {
             ..frame(vec![rejected])
         };
         let before = f.clone();
-        let r = apply_labelers(&mut f, boxes(&[sam("dog", OFF, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("dog", OFF, 0.9)]), "sam3", REL);
         assert_eq!((r.closed, r.votes), (1, 0));
         assert_eq!(f, before);
         // Its rejected box takes a vote, and that is all.
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         assert_eq!((r.closed, r.votes), (1, 1));
         assert_eq!(f.status, Status::Reviewed);
         assert_eq!(f.boxes.len(), 1);
@@ -2349,7 +2504,7 @@ mod tests {
         let b = boxes(&[low]);
         assert_eq!(b[0].auto.triage, Some(Triage::Accept));
         assert!(b[0].auto.why.is_empty());
-        let r = apply_labelers(&mut f, b, "gdino");
+        let r = apply_labelers(&mut f, b, "gdino", REL);
         assert_eq!(r.missing.added, 1);
         assert!(r.for_review());
         assert_eq!(f.status, Status::Unreviewed);
@@ -2365,7 +2520,7 @@ mod tests {
         assert_eq!(n.auto.why, ["new on a reviewed frame: the labelers agree"]);
         // One labeler: its name and score, after the triage's own reasons.
         let mut g = frame(vec![]);
-        apply_labelers(&mut g, boxes(&[sam("car", CAR, 0.8)]), "sam3");
+        apply_labelers(&mut g, boxes(&[sam("car", CAR, 0.8)]), "sam3", REL);
         assert_eq!(
             g.boxes[0].auto.why.last().map(String::as_str),
             Some("new on a reviewed frame: sam3 at 0.80")
@@ -2398,7 +2553,7 @@ mod tests {
             },
         ] {
             let mut f = frame(vec![reject.clone()]);
-            let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+            let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
             assert_eq!((r.gate.on_reject, r.missing.overwritten), (1, 0));
             assert_eq!(f.status, Status::Reviewed);
             assert_eq!(f.boxes.len(), 1);
@@ -2411,14 +2566,14 @@ mod tests {
         };
         let mut f = frame(vec![low]);
         let beside = [160.0, 100.0, 260.0, 200.0];
-        let r = apply_labelers(&mut f, boxes(&[sam("car", beside, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", beside, 0.9)]), "sam3", REL);
         assert_eq!((r.gate.on_reject, r.missing.added), (0, 1));
     }
 
     #[test]
     fn a_frame_a_re_label_sent_back_is_still_gated() {
         let mut f = frame(vec![accepted("cat", CAR)]);
-        apply_labelers(&mut f, boxes(&[sam("car", OFF, 0.9)]), "sam3");
+        apply_labelers(&mut f, boxes(&[sam("car", OFF, 0.9)]), "sam3", REL);
         assert_eq!(f.status, Status::Unreviewed);
         let before = f.clone();
         // What `apply` would have added, and what it would have written on the accepted cat.
@@ -2426,7 +2581,7 @@ mod tests {
             sam("dog", CAR, 0.9),
             sam("person", [0.0, 0.0, 40.0, 40.0], 0.3),
         ];
-        let r = apply_labelers(&mut f, boxes(&props), "gdino");
+        let r = apply_labelers(&mut f, boxes(&props), "gdino", REL);
         assert_eq!((r.gate.other_object, r.gate.low_score), (1, 1));
         assert_eq!(f, before);
         // A confident new object joins, and the note counts both.
@@ -2434,6 +2589,7 @@ mod tests {
             &mut f,
             boxes(&[sam("dog", [0.0, 0.0, 40.0, 40.0], 0.9)]),
             "sam3",
+            REL,
         );
         assert_eq!(r.missing.added, 1);
         assert_eq!(
@@ -2448,6 +2604,7 @@ mod tests {
             &mut g,
             boxes(&[sam("dog", [0.0, 0.0, 40.0, 40.0], 0.9)]),
             "sam3",
+            REL,
         );
         assert_eq!(r.closed, 1);
         assert_eq!(g, frozen);
@@ -2459,7 +2616,7 @@ mod tests {
         let props = boxes(&[sam("dog", OFF, 0.2), sam("car", CAR, 0.3)]);
         let (mut a, mut b) = (LabelFile::default(), LabelFile::default());
         apply(&mut a, props.clone());
-        let r = apply_labelers(&mut b, props, "sam3");
+        let r = apply_labelers(&mut b, props, "sam3", REL);
         assert_eq!(a, b);
         assert_eq!((r.apply.merge.added, r.votes), (2, 0));
         // A pending model box without evidence gets the proposal's evidence, as ever.
@@ -2467,7 +2624,7 @@ mod tests {
             boxes: vec![lb("car", CAR, Source::Model, BoxState::Pending)],
             ..LabelFile::default()
         };
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         assert_eq!((r.apply.annotated, r.votes), (1, 0));
         assert_eq!(f.boxes[0].auto.agree, Some(false));
         // A pending box with evidence: dropped by `apply`, and its new labeler is recorded.
@@ -2480,9 +2637,10 @@ mod tests {
                 gd
             }]),
             "gdino",
+            REL,
         );
         let triaged = (g.boxes[0].auto.triage, g.boxes[0].auto.why.clone());
-        let r = apply_labelers(&mut g, boxes(&[sam("car", CAR, 0.6)]), "sam3");
+        let r = apply_labelers(&mut g, boxes(&[sam("car", CAR, 0.6)]), "sam3", REL);
         assert_eq!((r.apply.merge.dropped, r.votes), (1, 1));
         assert!(!r.for_review(), "a vote queues nothing");
         assert_eq!(g.boxes.len(), 1);
@@ -2663,7 +2821,7 @@ mod tests {
         let before = f.clone();
         let mut props = boxes(&[sam("car", CAR, 0.9)]);
         props[0].auto.labelers.insert("rfdetr".into(), 0.7);
-        let r = apply_labelers(&mut f, props, "sam3");
+        let r = apply_labelers(&mut f, props, "sam3", REL);
         assert_eq!((r.votes, r.missing.covered), (1, 1));
         assert!(!r.for_review());
         assert_eq!(f.boxes[0].auto.labelers["sam3"], 0.33, "never overwritten");
@@ -2675,7 +2833,7 @@ mod tests {
         // A serving-model box without evidence takes `labelers` and nothing else.
         let mut h = frame(vec![accepted("car", CAR)]);
         assert!(h.boxes[0].auto.is_empty());
-        apply_labelers(&mut h, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        apply_labelers(&mut h, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         let auto = &h.boxes[0].auto;
         assert_eq!(auto.labelers.len(), 1);
         assert_eq!((auto.agree, auto.triage), (None, None));
@@ -2697,33 +2855,33 @@ mod tests {
         let (near, far) = ([100.0, 100.0, 200.0, 200.0], [110.0, 100.0, 200.0, 200.0]);
         let mut f = frame(vec![accepted("car", far), accepted("car", near)]);
         assert!(iou(&far, &CAR) >= STACK_IOU);
-        apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         assert!(f.boxes[0].auto.is_empty(), "second best");
         assert!(f.boxes[1].auto.labelers.contains_key("sam3"));
         // Vehicles are one object.
         let mut f = frame(vec![accepted("truck", CAR)]);
         assert_eq!(
-            apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3").votes,
+            apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL).votes,
             1
         );
         // Another object: none, at any IoU.
         let mut f = frame(vec![accepted("dog", CAR)]);
         assert_eq!(
-            apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3").votes,
+            apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL).votes,
             0
         );
         // Under IoU 0.7: none (and the box covers the proposal).
         let under = [100.0, 100.0, 200.0, 160.0];
         assert!(iou(&under, &CAR) < STACK_IOU);
         let mut f = frame(vec![accepted("car", under)]);
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         assert_eq!((r.votes, r.missing.covered), (0, 1));
         // A best match that may not take the vote does not pass it to the next one.
         let mut f = frame(vec![
             accepted("car", far),
             lb("car", near, Source::Model, BoxState::Pending),
         ]);
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         assert_eq!(r.votes, 0);
         assert!(f.boxes[0].auto.is_empty());
         assert!(f.boxes[1].auto.is_empty());
@@ -2762,7 +2920,7 @@ mod tests {
             b.auto.labelers.insert(format!("m{i:02}"), 0.5);
         }
         let mut f = frame(vec![b]);
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         assert_eq!(r.votes, 0);
         assert_eq!(f.boxes[0].auto.labelers.len(), labels::MAX_LABELERS);
         assert!(labels::normalize(f, &classes(), 640, 480, "t").is_ok());
@@ -2790,7 +2948,7 @@ mod tests {
         }];
         assert_eq!(overlaps::live(&f, Some(&wanted)).len(), 1);
         let stored = f.overlap_suggestions.clone();
-        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3");
+        let r = apply_labelers(&mut f, boxes(&[sam("car", CAR, 0.9)]), "sam3", REL);
         assert_eq!(r.votes, 1);
         assert_eq!(f.overlap_suggestions, stored);
         assert_eq!(overlaps::live(&f, Some(&wanted)).len(), 1);
@@ -2833,5 +2991,400 @@ mod tests {
         let f: FrameProposals = serde_json::from_str(line).unwrap();
         assert_eq!(f.boxes[0].vlm.as_ref().unwrap().answer, "rock");
         assert!(!f.boxes[0].agree);
+    }
+
+    /// A proposal both gdino and RF-DETR found, fused to `score`, with this VLM reply.
+    fn fused(label: &str, bbox: [f32; 4], score: f32, vlm: Option<(&str, bool)>) -> Proposal {
+        Proposal {
+            bbox,
+            vlm: vlm.map(|(expected, ok)| VlmOut {
+                model: "qwen3-vl-2b".into(),
+                answer: if ok { expected } else { "no" }.into(),
+                expected: expected.into(),
+                ok,
+            }),
+            ..p(label, score, false)
+        }
+    }
+
+    const YES: Option<(&str, bool)> = Some(("yes", true));
+    const NO: Option<(&str, bool)> = Some(("yes", false));
+
+    /// A place for a `label` box whose hash is (or is not) an audit sample on [`REL`].
+    fn place(label: &str, audit: bool) -> [f32; 4] {
+        (0..2000)
+            .map(|i| {
+                let x = i as f32;
+                [x, 10.0, x + 60.0, 90.0]
+            })
+            .find(|b| audit_sample(REL, label, b) == audit)
+            .unwrap()
+    }
+
+    /// What a labelers run makes of one proposal on an empty unreviewed frame.
+    fn one(run: &str, prop: Proposal) -> (LabelBox, LabelersReport) {
+        let mut f = LabelFile::default();
+        let r = apply_labelers(&mut f, boxes(&[prop]), run, REL);
+        assert_eq!(f.boxes.len(), 1);
+        (f.boxes.remove(0), r)
+    }
+
+    #[test]
+    fn the_tiers_turn_at_their_exact_scores() {
+        let at = place("car", false);
+        let (b, r) = one("gdino", fused("car", at, 0.1499, None));
+        assert!(b.is_dismissed());
+        assert_eq!(b.reason.as_deref(), Some(labels::bulk::DISMISSED_REASON));
+        assert_eq!((r.dismissed, r.likely, r.audit), (1, 0, 0));
+        assert!(r.for_review(), "the frame stays reachable from the queue");
+        let (b, r) = one("gdino", fused("car", at, 0.15, None));
+        assert_eq!(
+            (b.state, b.auto.likely, r.dismissed),
+            (BoxState::Pending, false, 0)
+        );
+        assert_ne!(b.reason.as_deref(), Some(labels::bulk::DISMISSED_REASON));
+        let (b, _) = one("gdino", fused("car", at, 0.2499, YES));
+        assert!(!b.auto.likely);
+        let (b, r) = one("gdino", fused("car", at, 0.25, YES));
+        assert_eq!(
+            (b.state, b.auto.likely, r.likely),
+            (BoxState::Pending, true, 1)
+        );
+        assert_eq!(b.auto.triage, Some(Triage::Review), "triage stays review");
+    }
+
+    #[test]
+    fn a_vlm_no_never_hides_a_box() {
+        let at = place("car", false);
+        for score in [0.15, 0.3, 0.55] {
+            let (b, _) = one("gdino", fused("car", at, score, NO));
+            assert_eq!(
+                (b.state, b.auto.likely),
+                (BoxState::Pending, false),
+                "{score}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_low_score_goes_whatever_the_vlm_said() {
+        let at = place("car", false);
+        assert!(one("gdino", fused("car", at, 0.1, YES)).0.is_dismissed());
+        assert!(one("gdino", fused("car", at, 0.1, NO)).0.is_dismissed());
+    }
+
+    #[test]
+    fn with_the_vlm_off_nothing_is_likely_and_the_score_still_dismisses() {
+        let at = place("car", false);
+        let (b, r) = one("gdino", fused("car", at, 0.9, None));
+        assert_eq!((b.auto.likely, r.likely), (false, 0));
+        assert!(one("gdino", fused("car", at, 0.1, None)).0.is_dismissed());
+    }
+
+    #[test]
+    fn an_old_seven_way_vlm_answer_is_never_likely() {
+        let at = place("person", false);
+        let (b, _) = one("gdino", fused("person", at, 0.9, Some(("person", true))));
+        assert!(!b.auto.likely);
+        assert_eq!(b.state, BoxState::Pending);
+    }
+
+    #[test]
+    fn trucks_are_never_dismissed_in_any_spelling() {
+        let at = place("truck", false);
+        let (b, r) = one("gdino", fused("truck", at, 0.05, None));
+        assert_eq!((b.state, r.dismissed), (BoxState::Pending, 0));
+        let mut upper = scored_box(0.05);
+        upper.label = "Truck".into();
+        assert_eq!(tier(&upper, REL, false), Tier::Unlikely);
+    }
+
+    /// A pending auto box scoring `score` at a place that is no audit sample.
+    fn scored_box(score: f32) -> LabelBox {
+        LabelBox {
+            bbox: place("car", false),
+            score: Some(score),
+            ..labels::tests_support::auto_box("car")
+        }
+    }
+
+    #[test]
+    fn a_class_only_one_labeler_reports_stays_at_its_labelers_threshold() {
+        // RF-DETR cannot report a raccoon, so the fusion does not halve it: its fused score is
+        // gdino's own, at least the 0.2 threshold.
+        let at = place("raccoon", false);
+        let (b, r) = one("gdino", fused("raccoon", at, 0.2, None));
+        assert_eq!((b.state, r.dismissed), (BoxState::Pending, 0));
+    }
+
+    #[test]
+    fn sam3_and_its_runs_never_dismiss() {
+        let at = place("car", false);
+        // Found by SAM 3, whatever the run's name.
+        let mut prop = unasked("car", at, 0.2);
+        prop.score = 0.1;
+        let (b, r) = one("gdino", prop);
+        assert_eq!((b.state, r.dismissed), (BoxState::Pending, 0));
+        // RF-DETR alone on a SAM 3 run: the thresholds were not measured with SAM 3 in the fusion.
+        let mut alone = fused("car", at, 0.1, None);
+        alone.sources = [("rfdetr".to_string(), 0.2)].into();
+        let (b, r) = one(SAM3_KEY, alone.clone());
+        assert_eq!((b.state, r.dismissed), (BoxState::Pending, 0));
+        assert!(one("rfdetr", alone).0.is_dismissed());
+    }
+
+    #[test]
+    fn a_box_triage_accepted_is_never_dismissed() {
+        let mut b = scored_box(0.1);
+        b.auto.triage = Some(Triage::Accept);
+        assert_eq!(tier(&b, REL, false), Tier::Unlikely);
+    }
+
+    #[test]
+    fn only_untouched_pending_auto_boxes_get_a_tier() {
+        let touched: [fn(&mut LabelBox); 5] = [
+            |b| b.source = Source::Model,
+            |b| b.state = BoxState::Accepted,
+            |b| b.orig_bbox = Some([0.0, 0.0, 5.0, 5.0]),
+            |b| b.difficult = true,
+            |b| b.score = None,
+        ];
+        assert_eq!(tier(&scored_box(0.1), REL, false), Tier::Dismissed);
+        for t in touched {
+            let mut b = scored_box(0.1);
+            t(&mut b);
+            assert_eq!(tier(&b, REL, false), Tier::Unlikely, "{b:?}");
+        }
+    }
+
+    #[test]
+    fn a_model_run_never_dismisses_or_marks_likely() {
+        let dets = [Det {
+            label: "car".into(),
+            score: 0.05,
+            bbox: place("car", false),
+        }];
+        let run = ModelRun {
+            model: "nano",
+            classes: &classes(),
+            scene: "day",
+            accept_score: None,
+        };
+        let b = model_boxes(&dets, &run, 640, 480).boxes;
+        let mut f = LabelFile::default();
+        apply_relabel(&mut f, &dets, b, "nano", &classes());
+        assert_eq!(
+            (f.boxes[0].state, f.boxes[0].auto.likely),
+            (BoxState::Pending, false)
+        );
+        // Nor does a `missing_only` run, on the same low score.
+        let mut g = LabelFile {
+            status: Status::Reviewed,
+            ..LabelFile::default()
+        };
+        let b = model_boxes(&dets, &run, 640, 480).boxes;
+        assert_eq!(apply_missing(&mut g, b, "nano").added, 1);
+        assert_eq!(g.boxes[0].state, BoxState::Pending);
+    }
+
+    #[test]
+    fn about_one_in_fifty_stays_visible_and_the_same_one_on_a_rerun() {
+        let at = place("car", true);
+        let (b, r) = one("gdino", fused("car", at, 0.1, None));
+        assert_eq!(
+            (b.state, b.auto.audit, r.audit, r.dismissed),
+            (BoxState::Pending, true, 1, 0)
+        );
+        assert_eq!(b.auto.why.last().map(String::as_str), Some(AUDIT_WHY));
+        assert_eq!(
+            b.auto.triage,
+            Some(Triage::Review),
+            "a save needs a decision"
+        );
+        assert!(labels::needs_decision(&b));
+        // Sub-pixel noise does not change the answer.
+        assert_eq!(
+            audit_sample(REL, "car", &[10.2, 10.0, 70.1, 90.0]),
+            audit_sample(REL, "car", &[10.3, 10.1, 70.0, 89.9])
+        );
+        // Frame, label and place all count.
+        assert_ne!(
+            (0..200)
+                .map(|i| audit_sample(&format!("{REL}{i}"), "car", &at))
+                .collect::<Vec<_>>(),
+            (0..200)
+                .map(|i| audit_sample(&format!("{REL}{i}"), "dog", &at))
+                .collect::<Vec<_>>()
+        );
+        let n = 20_000;
+        let hits = (0..n)
+            .filter(|i| audit_sample(&format!("day/c/2026-01-01/{i}.jpg"), "car", &at))
+            .count();
+        assert!((300..500).contains(&hits), "{hits} of {n}");
+        // A rerun of the same proposals: the audit box stays one, the dismissed box comes back
+        // dismissed, nothing doubles.
+        let props = boxes(&[
+            fused("car", at, 0.1, None),
+            fused("dog", place("dog", false), 0.1, None),
+        ]);
+        let mut f = LabelFile::default();
+        apply_labelers(&mut f, props.clone(), "gdino", REL);
+        let once = f.clone();
+        apply_labelers(&mut f, props, "gdino", REL);
+        assert_eq!(f.boxes.len(), 2);
+        assert!(once.boxes[1].is_dismissed() && f.boxes[1].is_dismissed());
+        assert_eq!(once.boxes, f.boxes);
+    }
+
+    #[test]
+    fn stored_boxes_and_decided_frames_are_never_tiered() {
+        // An older run's box: scoring low, a yes on file, no tier.
+        let at = place("car", false);
+        let mut old = scored_box(0.1);
+        old.auto.triage = Some(Triage::Review);
+        let mut high = scored_box(0.9);
+        high.bbox = OFF;
+        high.auto.labelers = [("gdino".to_string(), 0.9)].into();
+        high.auto.vlm = Some(VlmCheck {
+            model: "m".into(),
+            answer: "yes".into(),
+            expected: "yes".into(),
+            ok: true,
+        });
+        let mut f = LabelFile {
+            boxes: vec![old, high],
+            ..LabelFile::default()
+        };
+        let before = f.clone();
+        let r = apply_labelers(&mut f, Vec::new(), "gdino", REL);
+        assert_eq!((r.dismissed, r.likely), (0, 0));
+        assert_eq!(f, before);
+        // A reviewed frame: the gate, no tier, also for a box the gate lets through at a low fused
+        // score (the labelers agree).
+        let mut agreed = fused("car", at, 0.1, YES);
+        agreed.agree = true;
+        for (status, empty) in [
+            (Status::Reviewed, false),
+            (Status::Skipped, false),
+            (Status::Reviewed, true),
+        ] {
+            let mut g = LabelFile {
+                status,
+                empty_confirmed: empty,
+                ..LabelFile::default()
+            };
+            let r = apply_labelers(&mut g, boxes(&[agreed.clone()]), "gdino", REL);
+            assert_eq!((r.dismissed, r.likely, r.audit), (0, 0, 0));
+            assert!(!g.boxes.iter().any(|b| b.is_dismissed() || b.auto.likely));
+        }
+    }
+
+    /// A dismissed `label` box at `bbox`.
+    fn dismissed(label: &str, bbox: [f32; 4]) -> LabelBox {
+        LabelBox {
+            bbox,
+            state: BoxState::Rejected,
+            reason: Some(labels::bulk::DISMISSED_REASON.into()),
+            ..labels::tests_support::auto_box(label)
+        }
+    }
+
+    #[test]
+    fn a_dismissal_is_no_judged_reject() {
+        assert!(unjudged_reject(&dismissed("car", CAR)));
+        let mut judged = dismissed("car", CAR);
+        judged.reject_reason = Some(labels::RejectReason::FalsePositive);
+        assert!(!unjudged_reject(&judged));
+    }
+
+    #[test]
+    fn a_model_finding_a_dismissed_box_overwrites_it() {
+        let mut f = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![dismissed("car", CAR)],
+            ..LabelFile::default()
+        };
+        let mut b = labels::tests_support::auto_box("car");
+        b.bbox = CAR;
+        let r = apply_missing(&mut f, vec![b], "nano");
+        assert_eq!((r.overwritten, r.added), (1, 0));
+        assert_eq!(f.boxes.len(), 1);
+        assert_eq!(f.boxes[0].state, BoxState::Pending);
+    }
+
+    #[test]
+    fn a_dismissed_box_blocks_no_other_object_at_the_gate() {
+        let mut dog = sam("dog", CAR, 0.9);
+        dog.agree = true;
+        let dog = boxes(&[dog]);
+        let f = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![dismissed("car", CAR)],
+            ..LabelFile::default()
+        };
+        assert_eq!(gate_drop(&f, &dog[0]), None);
+        // A reviewer's reject there still does.
+        let mut judged = f.clone();
+        judged.boxes[0].reason = None;
+        assert_eq!(gate_drop(&judged, &dog[0]), Some(GateDrop::OtherObject));
+        // The same object: a labelers run leaves a rejected box alone, dismissed or not.
+        let car = boxes(&[sam("car", CAR, 0.9)]);
+        assert_eq!(gate_drop(&f, &car[0]), Some(GateDrop::OnReject));
+    }
+
+    #[test]
+    fn a_later_run_can_bring_a_dismissed_box_back() {
+        let at = place("car", false);
+        let mut f = LabelFile {
+            boxes: vec![dismissed("car", at)],
+            ..LabelFile::default()
+        };
+        // SAM 3 on an unreviewed frame: the proposal is no covered box.
+        let r = apply_labelers(&mut f, boxes(&[sam("car", at, 0.2)]), SAM3_KEY, REL);
+        assert_eq!((r.apply.merge.added, r.apply.merge.dropped), (1, 0));
+        assert_eq!(f.boxes.len(), 1);
+        assert_eq!(f.boxes[0].state, BoxState::Pending);
+        // A proposal of a later run scoring higher.
+        let mut g = LabelFile {
+            boxes: vec![dismissed("car", at)],
+            ..LabelFile::default()
+        };
+        apply_labelers(&mut g, boxes(&[fused("car", at, 0.4, YES)]), "gdino", REL);
+        assert!(!g.boxes[0].is_dismissed() && g.boxes[0].auto.likely);
+        // A dismissed box elsewhere stays as it is.
+        let mut h = LabelFile {
+            boxes: vec![dismissed("car", OFF)],
+            ..LabelFile::default()
+        };
+        apply_labelers(&mut h, boxes(&[fused("car", CAR, 0.4, YES)]), "gdino", REL);
+        assert!(h.boxes[0].is_dismissed());
+        // A trained model's detection on one.
+        let dets = [Det {
+            label: "car".into(),
+            score: 0.9,
+            bbox: OFF,
+        }];
+        let run = ModelRun {
+            model: "nano",
+            classes: &classes(),
+            scene: "day",
+            accept_score: None,
+        };
+        let b = model_boxes(&dets, &run, 640, 480).boxes;
+        apply_relabel(&mut h, &dets, b, "nano", &classes());
+        assert_eq!(h.boxes.len(), 2);
+        assert!(h.boxes.iter().all(|b| !b.is_dismissed()));
+    }
+
+    #[test]
+    fn a_dismissed_box_stays_rejected_through_a_save() {
+        let mut f = LabelFile {
+            boxes: vec![dismissed("car", CAR)],
+            ..LabelFile::default()
+        };
+        f.status = Status::Reviewed;
+        let n = labels::normalize(f, &classes(), 640, 480, "2026-10-22T12:00:00.000Z").unwrap();
+        assert!(n.boxes[0].is_dismissed());
+        assert_eq!(n.training().count(), 0);
     }
 }

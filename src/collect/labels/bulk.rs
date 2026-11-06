@@ -29,6 +29,12 @@ pub const LISTED: usize = 20;
 /// The reason a box rejected by [`reject_low`] carries.
 pub const LOW_SCORE_REASON: &str = "low_score";
 
+/// The reason of a box a labelers run dismissed for its score
+/// ([`crate::training::autolabel::triage::tier`], [`super::LabelBox::is_dismissed`]). Rejected like
+/// [`LOW_SCORE_REASON`], which keeps it out of every reader of live boxes, but no reviewer's
+/// decision: no hard negative, not in the repeats history, and a rerun may replace it.
+pub const DISMISSED_REASON: &str = "auto_dismissed";
+
 /// The reason a box rejected by [`reject_other_class`] carries.
 pub const OTHER_CLASS_REASON: &str = "other_class";
 
@@ -78,11 +84,13 @@ impl BulkOutcome {
 fn is_low(b: &super::LabelBox, min_score: f32) -> bool {
     b.source == Source::Auto
         && b.state == BoxState::Pending
+        && !b.auto.audit
         && b.score.is_some_and(|s| s < min_score)
 }
 
 /// Reject the pending auto-labeler boxes of `f` scoring below `min_score` (`reason:
-/// low_score`, kept as hard-negative evidence); only on an unreviewed frame. The frame's status
+/// low_score`, kept as hard-negative evidence), never an audit sample (it exists to be looked at);
+/// only on an unreviewed frame. The frame's status
 /// is unchanged. Returns the boxes rejected.
 pub fn reject_low(f: &mut LabelFile, min_score: f32) -> usize {
     if f.status != Status::Unreviewed {
@@ -1004,6 +1012,18 @@ mod tests {
     }
 
     #[test]
+    fn reject_low_leaves_an_audit_sample_to_be_looked_at() {
+        let mut b = auto_box("car", 0.1, Triage::Review);
+        b.auto.audit = true;
+        let mut f = LabelFile {
+            boxes: vec![b],
+            ..LabelFile::default()
+        };
+        assert_eq!(reject_low(&mut f, 0.3), 0);
+        assert_eq!(f.boxes[0].state, BoxState::Pending);
+    }
+
+    #[test]
     fn reject_low_touches_only_pending_auto_boxes_below_the_score() {
         let mut model = auto_box("car", 0.1, Triage::Review);
         model.source = Source::Model;
@@ -1782,7 +1802,11 @@ mod tests {
         let all = |_: &str| true;
         let dry = bulk_reject_below(&dir, &filters, 0.3, 10, true, &all);
         assert_eq!((dry.eligible, dry.boxes, dry.done_count), (2, 3, 0));
-        assert_eq!(dry.done, [a.clone(), b.clone()]);
+        assert_eq!(
+            dry.done,
+            [b.clone(), a.clone()],
+            "fewer flagged boxes first"
+        );
         assert_eq!(labels_of(&dir, &a).boxes[1].state, BoxState::Pending, "dry");
         // Only the frames of `keep`.
         let only_a = |r: &str| r == a;
@@ -1901,6 +1925,65 @@ mod tests {
             reviewed_with_unwanted(&dir, &w),
             ReviewedUnwanted::default()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dismissed(label: &str) -> super::super::LabelBox {
+        super::super::LabelBox {
+            state: BoxState::Rejected,
+            reason: Some(DISMISSED_REASON.into()),
+            ..auto_box(label, 0.1, Triage::Review)
+        }
+    }
+
+    #[test]
+    fn the_bulk_edits_leave_dismissed_boxes_as_they_are() {
+        let wanted_list = ["car".to_string()];
+        let wanted = Wanted {
+            classes: &wanted_list,
+            hidden: &[],
+        };
+        let mut f = LabelFile {
+            boxes: vec![dismissed("car"), dismissed("dog"), dismissed("car")],
+            ..LabelFile::default()
+        };
+        let before = f.clone();
+        assert_eq!(reject_low(&mut f, 0.5), 0);
+        assert_eq!(reject_other_class(&mut f, &wanted), (0, 0));
+        assert_eq!(stacks::reject_stacked(&mut f, &wanted), 0, "not live");
+        assert_eq!(f, before);
+        assert_eq!(f.hard_negatives().count(), 0);
+    }
+
+    #[test]
+    fn no_bulk_save_passes_over_a_dismissed_box() {
+        let dir = std::env::temp_dir().join(format!("bop-dismissed-{}", uuid::Uuid::new_v4()));
+        let sure = auto_box("car", 0.9, Triage::Accept);
+        let clean = put_frame(&dir, "a", None, vec![sure.clone()]);
+        let held = put_frame(&dir, "b", None, vec![sure, dismissed("dog")]);
+        let classes = ["car".to_string(), "dog".to_string()];
+        let f = Filters {
+            source: queue::QueueSource::All,
+            ..Filters::default()
+        };
+        let o = bulk_accept(&dir, &f, &classes, 500, "t", false, &|_| true);
+        assert_eq!((o.eligible, o.done_count), (1, 1));
+        assert_eq!(labels_of(&dir, &clean).status, Status::Reviewed);
+        assert_eq!(labels_of(&dir, &held).status, Status::Unreviewed);
+        assert!(!accept_one(&dir, &held, &classes, "t").unwrap());
+        // A repeat-only frame with one: not saved either.
+        let mut l = labels_of(&dir, &held);
+        l.repeat_spot = true;
+        l.boxes[0].state = BoxState::Rejected;
+        let frame = Frame::resolve(&dir, &held).unwrap();
+        super::super::write(&frame.labels, &l).unwrap();
+        let o = bulk_accept_repeats(&dir, &f, &classes, 500, "t", false, &|_| true);
+        assert_eq!(o.eligible, 0);
+        // Once a reviewer's decision clears the reason it is one.
+        l.boxes[1].reason = None;
+        super::super::write(&frame.labels, &l).unwrap();
+        let o = bulk_accept_repeats(&dir, &f, &classes, 500, "t", false, &|_| true);
+        assert_eq!(o.done_count, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

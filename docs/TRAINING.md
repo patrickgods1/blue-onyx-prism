@@ -1162,6 +1162,40 @@ people, so a figure there says nothing about vehicles or animals.
   nothing?" called 75 of 171 real people `plant` (the same at batch size 1). "Is there a real person in this
   image? Answer yes or no." said yes to 169 of 173 real objects and 50 of 1,352 false boxes on the same crops.
 
+### Likely, unlikely and hidden boxes
+
+A labelers run uses those figures to sort the new boxes of frames nobody has reviewed. The constants are
+in `training/autolabel/triage.rs`; change them only after measuring again.
+
+| Tier | Rule | What the page does |
+|---|---|---|
+| Hidden | Pending auto box, score < 0.15, not a `truck`, not found by SAM 3 | Rejected with `reason: "auto_dismissed"`: not drawn or listed until you ask |
+| Likely | Pending auto box, score >= 0.25, the VLM said yes to the yes/no question | Marked with a star, first in the list, and its frame first in the queue. `c` or *Accept likely (N)* accepts them all |
+| Unlikely | Everything else | Drawn quieter, listed after the likely boxes. `Shift+R` clears them |
+
+- **Only the score hides a box.** A VLM no never does, because 40% of those boxes were real on public sets.
+  With the VLM off nothing is likely, and the score still hides boxes.
+- **`truck` is never hidden.** 10.7% of the real trucks scored below 0.15.
+- **SAM 3 never hides a box.** A box it found stays, and so does anything else on a SAM 3 run, because
+  these thresholds were measured with MM-Grounding-DINO. A run with a model and `--missing-only` hide nothing.
+- **Classes only one labeler can report are safe.** The fusion does not halve them, so their score is at
+  least that labeler's own threshold: 0.2 for MM-Grounding-DINO. A test holds a raccoon at 0.2 to this.
+- **Hidden boxes are recoverable.** They stay in the label file. *Show N hidden* or `i` shows a frame's
+  boxes dimmed, `auto=dismissed` finds the frames, and accepting one makes it a label. They are no hard
+  negatives and teach no spot memory, since nobody judged them. Before you save, *Anything missing?* says
+  how many are hidden. No bulk save takes a frame with hidden boxes: a saved frame claims it is complete,
+  so a real object nobody looked at would train as background.
+- **The filter is checked.** About 2% of the boxes that would be hidden stay visible, marked *audit sample:
+  normally hidden*. The same box gets the same answer on a rerun. Your verdicts show on the Review page
+  as *Hidden-box check: 1 of 40 was real*, with a percentage from 20 boxes on.
+- **A rerun can bring a box back.** A later proposal of the same label on a hidden box takes its place and is
+  sorted again: the same score hides it again, a higher one or SAM 3's shows it. A run with a model shows it too.
+- **Only new boxes are sorted.** Boxes of older runs stay as they are, an old seven-way VLM answer is
+  never likely, and reviewed, sent-back, skipped and confirmed-empty frames follow the rules under
+  [Rerunning labeling](#rerunning-labeling-on-part-of-the-dataset) with no tiers.
+
+The run's summary and report give the counts: `likely`, `dismissed` (left out of `added`) and `audit`.
+
 **Cancel** while the frames are labelled, with *Keep finished frames* on: the frames finished so far
 are not thrown away. The labelers' script writes `proposals.jsonl` line by line (flushed per frame);
 the run triages and writes those frames exactly like a finished run's (pending boxes, the `auto_run`
@@ -1254,9 +1288,10 @@ safetensors, the small files downloaded and hashed) and downloaded by the downlo
    calls a rock shows it on the Review page, and a suppressed / below-threshold / verifier-found box
    triaged `accept` is accepted on save instead of rejected. A proposal on a *pending* box of another
    label (and no box of its own label) becomes a **class suggestion** on that box (`auto_label`,
-   `auto_score`, triage `review`; `class_suggestions` in the report) instead of being lost.
+   `auto_score`, triage `review`; `class_suggestions` in the report) instead of being lost. New boxes on
+   unreviewed frames are then sorted into [likely, unlikely and hidden](#likely-unlikely-and-hidden-boxes).
 6. **Bulk accept**: frames whose triage alone settles them (`auto=accept`: boxes `accept`, nothing else
-   pending but unconfirmed model hints) can be saved as reviewed in one go from the Review page
+   pending but unconfirmed model hints, no hidden box) can be saved as reviewed in one go from the Review page
    (`POST /v1/review/accept-auto`, `bulk_accepted: true` in the file); everything else waits for a
    reviewer.
 

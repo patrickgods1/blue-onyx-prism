@@ -1,8 +1,8 @@
 //! The review queue: the frames of `review-queue.jsonl` (and, with [`QueueSource::All`], every
 //! indexed frame), filtered by bucket, scene, camera, object class ([`frame_labels`]), review
 //! status and auto-label state ([`AutoFilter`]), and sorted by
-//! uncertainty ([`Uncertainty`]): the near-threshold margin first, then verifier disagreement,
-//! then the number of suppressed boxes, then newest. Also the counts the Review page shows, and
+//! uncertainty ([`Uncertainty`]): frames with likely boxes first, then fewer flagged boxes, then the
+//! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest. Also the counts the Review page shows, and
 //! [`labelled`], every label file those filters select whichever queue it is in.
 
 use super::super::layout::{self, REVIEW_QUEUE_FILE};
@@ -67,6 +67,9 @@ pub enum AutoFilter {
     /// of unwanted classes do not count either; [`AutoFilter::matches`] has none, so there every
     /// label counts.
     Both,
+    /// At least one box a labelers run dismissed ([`LabelBox::is_dismissed`]), pending boxes or
+    /// not: a frame left with only such boxes has nothing else to find it by.
+    Dismissed,
 }
 
 /// How many labelers make a box agreed ([`AutoFilter::Both`]).
@@ -82,6 +85,7 @@ impl AutoFilter {
             "repeats" => Some(AutoFilter::Repeats),
             "overlaps" => Some(AutoFilter::Overlaps),
             "both" => Some(AutoFilter::Both),
+            "dismissed" => Some(AutoFilter::Dismissed),
             _ => None,
         }
     }
@@ -98,6 +102,9 @@ impl AutoFilter {
             AutoFilter::Repeats => labels.is_some_and(super::repeats::repeats_only),
             AutoFilter::Overlaps => labels.is_some_and(|l| super::stacks::needs_look(l, None)),
             AutoFilter::Both => labels.is_some_and(|l| agreed_boxes(l, None) > 0),
+            AutoFilter::Dismissed => {
+                labels.is_some_and(|l| l.boxes.iter().any(super::LabelBox::is_dismissed))
+            }
         }
     }
 }
@@ -140,7 +147,7 @@ impl Filters {
     /// From query parameters (`bucket`, `scene`, `camera`, `label` = a comma list, any of
     /// them, empty items ignored, `status` = `unreviewed|reviewed|
     /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none|repeats|
-    /// overlaps|both`); empty values mean "any". Errors name the field.
+    /// overlaps|both|dismissed`); empty values mean "any". Errors name the field.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let bucket = match get("bucket") {
@@ -190,7 +197,8 @@ impl Filters {
             None => None,
             Some(a) => Some(AutoFilter::parse(a).ok_or_else(|| {
                 format!(
-                    "auto: '{a}' is not review, accept, nothing, none, repeats, overlaps or both"
+                    "auto: '{a}' is not review, accept, nothing, none, repeats, overlaps, both \
+                     or dismissed"
                 )
             })?),
         };
@@ -298,6 +306,10 @@ pub struct Uncertainty {
     pub relabel: Option<String>,
     /// Pending auto-labeler boxes triaged `review`.
     pub auto_review: usize,
+    /// Pending boxes likely real ([`super::AutoInfo::likely`]). These frames come first, most such
+    /// boxes first, so the queue opens on frames worth a look rather than on the most false boxes.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub likely_boxes: u32,
     /// Spot edits settled every box ([`super::repeats::repeats_only`]): these frames come last.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub repeats_only: bool,
@@ -338,14 +350,15 @@ impl Uncertainty {
             suppressed: rec.suppressed.len(),
             relabel: None,
             auto_review: 0,
+            likely_boxes: 0,
             repeats_only: false,
             overlap_strength: 0,
             agreed_boxes: 0,
         }
     }
 
-    /// Add what the frame's label file says: its re-label disagreement and the pending
-    /// auto-labeler boxes triaged `review`.
+    /// Add what the frame's label file says: its re-label disagreement, the pending auto-labeler
+    /// boxes triaged `review` and the likely ones among them.
     pub fn with_labels(mut self, labels: Option<&LabelFile>) -> Self {
         if let Some(l) = labels {
             self.relabel = l.disagreement.clone();
@@ -357,6 +370,12 @@ impl Uncertainty {
                         && b.auto.triage == Some(super::Triage::Review)
                 })
                 .count();
+            let likely = l
+                .boxes
+                .iter()
+                .filter(|b| b.state == super::BoxState::Pending && b.auto.likely)
+                .count();
+            self.likely_boxes = u32::try_from(likely).unwrap_or(u32::MAX);
             self.repeats_only = super::repeats::repeats_only(l);
         }
         self
@@ -364,8 +383,9 @@ impl Uncertainty {
 
     /// Sort key, most uncertain first: the strongest overlap suggestion (`auto=overlaps` only), the
     /// most agreed boxes (`auto=both` only), repeat-only frames last of all, then a re-label
-    /// disagreement, then the margin in hundredths (no box last), verifier disagreement, more auto
-    /// boxes to review, more suppressed boxes.
+    /// disagreement, then the most likely boxes, fewer flagged boxes (17 flagged boxes on a frame
+    /// with no likely one are mostly false: an empty yard must not open the queue), then the margin
+    /// in hundredths (no box last), verifier disagreement, more suppressed boxes.
     #[allow(
         clippy::type_complexity,
         reason = "a lexicographic sort key reads best as one tuple"
@@ -377,9 +397,10 @@ impl Uncertainty {
         std::cmp::Reverse<u32>,
         bool,
         bool,
+        std::cmp::Reverse<u32>,
+        usize,
         u32,
         bool,
-        std::cmp::Reverse<usize>,
         std::cmp::Reverse<usize>,
     ) {
         #[allow(
@@ -395,9 +416,10 @@ impl Uncertainty {
             std::cmp::Reverse(self.agreed_boxes),
             self.repeats_only,
             self.relabel.is_none(),
+            std::cmp::Reverse(self.likely_boxes),
+            self.auto_review,
             m,
             !self.disagreement,
-            std::cmp::Reverse(self.auto_review),
             std::cmp::Reverse(self.suppressed),
         )
     }
@@ -448,6 +470,11 @@ pub struct Counts {
     pub auto_accept: u64,
     /// Repeat-only frames ([`AutoFilter::Repeats`]).
     pub repeats_only: u64,
+    /// Audit samples of the dismissal filter on reviewed frames a reviewer found real
+    /// ([`super::LabelBox::audit_verdict`]).
+    pub audit_accepted: u64,
+    /// Audit samples on reviewed frames a reviewer found not real.
+    pub audit_rejected: u64,
 }
 
 impl Counts {
@@ -467,6 +494,13 @@ impl Counts {
                 *self.per_class.entry(b.label.clone()).or_default() += 1;
             }
             self.rejected_boxes += l.hard_negatives().count() as u64;
+            for v in l.boxes.iter().filter_map(super::LabelBox::audit_verdict) {
+                if v {
+                    self.audit_accepted += 1;
+                } else {
+                    self.audit_rejected += 1;
+                }
+            }
         }
     }
 }
@@ -663,6 +697,7 @@ mod tests {
             suppressed,
             relabel: None,
             auto_review: 0,
+            likely_boxes: 0,
             repeats_only: false,
             overlap_strength: 0,
             agreed_boxes: 0,
@@ -670,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn relabel_disagreements_come_first_then_auto_boxes_to_review() {
+    fn relabel_disagreements_come_first_then_fewer_flagged_boxes() {
         let relabel = Uncertainty {
             relabel: Some("model m: 1 new box".into()),
             ..u(None, false, 0)
@@ -687,7 +722,7 @@ mod tests {
         ];
         sort_items(&mut items);
         let order: Vec<&str> = items.iter().map(|i| i.frame.as_str()).collect();
-        assert_eq!(order, ["relabel", "closest", "auto", "plain"]);
+        assert_eq!(order, ["relabel", "closest", "plain", "auto"]);
         // A repeat-only frame goes last, even with a re-label disagreement.
         let repeats = Uncertainty {
             repeats_only: true,
@@ -1320,5 +1355,129 @@ mod tests {
         c.add(Some(&file(vec![accept], true)));
         c.add(None);
         assert_eq!((c.total, c.auto_accept, c.auto_review), (2, 1, 0));
+    }
+
+    #[test]
+    fn frames_with_likely_boxes_open_the_queue_and_the_yard_of_false_boxes_comes_last() {
+        let flagged = |n: usize, likely: u32, margin: Option<f32>| Uncertainty {
+            auto_review: n,
+            likely_boxes: likely,
+            ..u(margin, false, 0)
+        };
+        let relabel = Uncertainty {
+            relabel: Some("x".into()),
+            ..u(None, false, 0)
+        };
+        let repeats = Uncertainty {
+            repeats_only: true,
+            likely_boxes: 9,
+            ..u(None, false, 0)
+        };
+        let mut items = vec![
+            item("yard", "9", flagged(17, 0, Some(0.0))),
+            item("three", "1", flagged(3, 0, None)),
+            item("one", "1", flagged(1, 0, Some(0.4))),
+            item("likely-1", "1", flagged(9, 1, None)),
+            item("likely-2", "1", flagged(2, 2, None)),
+            item("likely-2-flagged", "1", flagged(5, 2, None)),
+            item("relabel", "0", relabel),
+            item("repeats", "9", repeats),
+        ];
+        sort_items(&mut items);
+        let order: Vec<&str> = items.iter().map(|i| i.frame.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "relabel",
+                "likely-2",
+                "likely-2-flagged",
+                "likely-1",
+                "one",
+                "three",
+                "yard",
+                "repeats"
+            ]
+        );
+    }
+
+    #[test]
+    fn likely_boxes_count_only_while_pending() {
+        let mut b = super::super::tests_support::auto_box("dog");
+        b.auto.likely = true;
+        let mut f = LabelFile {
+            boxes: vec![b.clone(), b.clone()],
+            ..LabelFile::default()
+        };
+        f.boxes[1].state = BoxState::Accepted;
+        assert_eq!(u(None, false, 0).with_labels(Some(&f)).likely_boxes, 1);
+        // In the JSON only when set: older pages and tests see the items of today.
+        let v = serde_json::to_value(u(None, false, 0)).unwrap();
+        assert!(v.get("likely_boxes").is_none());
+    }
+
+    #[test]
+    fn auto_dismissed_finds_a_frame_with_nothing_else_on_it() {
+        assert_eq!(AutoFilter::parse("dismissed"), Some(AutoFilter::Dismissed));
+        let q: BTreeMap<String, String> = [("auto".to_string(), "dismissed".to_string())].into();
+        assert_eq!(
+            Filters::from_query(&q).unwrap().auto,
+            Some(AutoFilter::Dismissed)
+        );
+        let bad: BTreeMap<String, String> = [("auto".to_string(), "x".to_string())].into();
+        assert!(Filters::from_query(&bad).unwrap_err().contains("dismissed"));
+        let f = LabelFile {
+            boxes: vec![super::super::LabelBox {
+                state: BoxState::Rejected,
+                reason: Some(super::super::bulk::DISMISSED_REASON.into()),
+                ..super::super::tests_support::auto_box("car")
+            }],
+            ..LabelFile::default()
+        };
+        assert!(AutoFilter::Dismissed.matches(Some(&f)));
+        assert!(!AutoFilter::Review.matches(Some(&f)), "nothing pending");
+        assert!(
+            !AutoFilter::Nothing.matches(Some(&f)),
+            "the run found something"
+        );
+        assert!(!AutoFilter::Dismissed.matches(Some(&LabelFile::default())));
+        assert!(!AutoFilter::Dismissed.matches(None));
+        // A low-score reject is another thing.
+        let mut low = f;
+        low.boxes[0].reason = Some(super::super::bulk::LOW_SCORE_REASON.into());
+        assert!(!AutoFilter::Dismissed.matches(Some(&low)));
+    }
+
+    #[test]
+    fn the_counts_report_audit_verdicts_of_reviewed_frames_only() {
+        let audit = |state: BoxState, reason: Option<&str>| super::super::LabelBox {
+            state,
+            reason: reason.map(str::to_string),
+            auto: super::super::AutoInfo {
+                audit: true,
+                ..Default::default()
+            },
+            ..super::super::tests_support::auto_box("car")
+        };
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![
+                audit(BoxState::Accepted, None),
+                audit(BoxState::Rejected, None),
+                audit(BoxState::Rejected, Some(super::super::REST_REASON)),
+                audit(
+                    BoxState::Rejected,
+                    Some(super::super::bulk::LOW_SCORE_REASON),
+                ),
+            ],
+            ..LabelFile::default()
+        };
+        let open = LabelFile {
+            boxes: vec![audit(BoxState::Accepted, None)],
+            ..LabelFile::default()
+        };
+        let mut c = Counts::default();
+        c.add(Some(&reviewed));
+        c.add(Some(&open));
+        assert_eq!((c.audit_accepted, c.audit_rejected), (1, 2));
     }
 }

@@ -559,4 +559,34 @@ mod tests {
             .collect();
         assert_eq!(got, [("person", false), ("dog", true), ("cat", true)]);
     }
+
+    #[test]
+    fn import_keeps_a_dismissed_box_out_of_the_negatives_until_a_rectangle_claims_it() {
+        let d = LabelBox {
+            reason: Some(super::super::bulk::DISMISSED_REASON.into()),
+            ..model_box("dog", [100.0, 100.0, 150.0, 140.0], BoxState::Rejected)
+        };
+        let base = LabelFile {
+            boxes: vec![d],
+            ..LabelFile::default()
+        };
+        // No rectangle on it: still dismissed, no negative.
+        let f = apply_import(base.clone(), &[]);
+        assert!(f.boxes[0].is_dismissed());
+        assert_eq!(f.hard_negatives().count(), 0);
+        // A rectangle on it: a label, the reason gone once normalized.
+        let rects = vec![("dog".to_string(), [100.0, 100.0, 150.0, 140.0], None, false)];
+        let f = normalize(
+            apply_import(base, &rects),
+            &crate::collect::config::default_classes(),
+            640,
+            480,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            (f.boxes[0].state, f.boxes[0].reason.as_deref()),
+            (BoxState::Accepted, None)
+        );
+    }
 }

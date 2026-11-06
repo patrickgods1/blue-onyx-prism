@@ -140,7 +140,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   repeats"; `POST /v1/review/reject-spot|accept-spot` (`bulk::bulk_spot`: pending model/auto boxes at IoU >= 0.6 / 0.8,
   same object class (vehicles one class) / same label, unreviewed frames of that camera and size, `skip_frame`, file
   marker `repeat_spot`) and `POST /v1/review/accept-repeats` (repeat-only frames, nothing pending, sorted last,
-  `auto=repeats`); uncertainty-sorted queue (`auto=` filter, wraps), exports YOLO / COCO /
+  `auto=repeats`); queue sorted by likely boxes, then fewer flagged, then uncertainty (`auto=` filter, wraps), exports YOLO / COCO /
   X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned. The page reviews `collect.review_dir`
   (default `collect.dir`; *Folder under review*, `POST /v1/review/folder`), e.g. an import saved with `train import --out-dir`;
   auto-label runs follow it. Unwanted classes = labels mapping to no `collect.classes` entry (aliases such as `pottedplant` map) ∪
@@ -252,7 +252,11 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `POST .../remove` (deletes the whole weights folder; refused while a run uses it: `Task::uses` / `TaskRecord::uses` narrow it to
   runs using SAM 3). The login command names the sibling CLI exe by full path with `--config` before `hf-login`, `sudo -u <account>`
   on Unix. `plan_autolabel` fails fast with it when SAM 3 is missing, there is no token and the parts are not on disk.
-- Labelers reruns (`training/autolabel/triage.rs`): `triage::apply_labelers(f, boxes, name)` decides under the write lock by the
+- Tiers (`triage::tier`, only on the Merge path of a labelers run, constants in `triage.rs`, docs "Likely, unlikely and hidden boxes"): dismissed = pending auto box
+  at fused < 0.15, not `truck`, never on a SAM 3 run: `state: rejected`, `reason: auto_dismissed` (`bulk::DISMISSED_REASON`; "hidden" in code means unwanted classes), out of
+  `hard_negatives` and the repeats history, `undismiss_found` lets a stronger find through, frames with one are refused by bulk accept and `repeats_only`; 1 in 50 stays visible as
+  `auto.audit`; likely = fused >= 0.25 with a yes-contract VLM yes (`auto.likely`, triage stays `review`). A VLM no ranks, never hides. Page keys `c` (Accept likely), `i` (show hidden), `Shift+R` (`REST_REASON`), `auto=dismissed`; `labels::needs_decision` refuses a save holding a flagged box that would become a label.
+- Labelers reruns (`training/autolabel/triage.rs`): `triage::apply_labelers(f, boxes, name, frame)` decides under the write lock by the
   frame's status at write time: unreviewed = `apply` + votes; reviewed, or sent back by a re-label (unreviewed with `disagreement` and
   `reviewed_at`) = votes, the confidence gate (`gate_drop`), then `apply_missing`; `empty_confirmed` on any status, and skipped = votes
   and the marker only (a save refuses a box on a confirmed-empty frame; a skipped frame must not come back and reach exports by a bulk

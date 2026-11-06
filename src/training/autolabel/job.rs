@@ -236,12 +236,18 @@ pub struct AutolabelReport {
     pub filtered_unchecked: usize,
     /// Proposals left out on skipped and confirmed-empty frames, which take no box.
     pub filtered_closed: usize,
+    /// New boxes dismissed for their score ([`triage::Tier::Dismissed`]); left out of `added`.
+    pub dismissed: usize,
+    /// Boxes that would have been dismissed, left visible to check the filter.
+    pub audit: usize,
+    /// New boxes likely real ([`triage::Tier::Likely`]).
+    pub likely: usize,
 }
 
 impl AutolabelReport {
     /// Add what one frame of a labelers run did.
     fn count_labelers(&mut self, a: &triage::LabelersReport) {
-        self.added += a.apply.merge.added + a.missing.candidates();
+        self.added += a.apply.merge.added.saturating_sub(a.dismissed) + a.missing.candidates();
         self.dropped +=
             a.apply.merge.dropped + a.missing.covered + a.missing.judged + a.missing.full;
         self.dropped_judged += a.missing.judged;
@@ -254,6 +260,9 @@ impl AutolabelReport {
         self.filtered_on_reject += a.gate.on_reject;
         self.filtered_unchecked += a.gate.unchecked;
         self.filtered_closed += a.closed;
+        self.dismissed += a.dismissed;
+        self.audit += a.audit;
+        self.likely += a.likely;
     }
 
     /// The votes of a labelers or model run, for its summary (empty when it cast none).
@@ -293,6 +302,22 @@ impl AutolabelReport {
                 self.filtered_on_reject,
                 self.filtered_unchecked,
                 self.filtered_closed
+            ));
+        }
+        if self.likely > 0 {
+            s.push_str(&format!(
+                "; {} boxes likely real (the Review queue and box list show them first)",
+                self.likely
+            ));
+        }
+        if self.dismissed + self.audit > 0 {
+            s.push_str(&format!(
+                "; {} boxes below score {} hidden, {} more kept visible as a check of that filter \
+                 (hidden boxes stay in the label files: Show hidden on the Review page brings \
+                 them back)",
+                self.dismissed,
+                triage::DISMISS_SCORE,
+                self.audit
             ));
         }
         if self.reopened > 0 {
@@ -938,7 +963,7 @@ impl AutolabelJob {
                 // it was selected.
                 let res = self.write_frame(sel, &mut rep, &mut changed, |file, rep| {
                     file.auto_run = Some(marker);
-                    let a = triage::apply_labelers(file, boxes, self.short_labeler());
+                    let a = triage::apply_labelers(file, boxes, self.short_labeler(), &sel.rel);
                     rep.count_labelers(&a);
                     FrameWrite {
                         write: true,

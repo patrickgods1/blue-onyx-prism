@@ -11,7 +11,10 @@
 // (all five: dry run, confirm, run). Preview frames posts the form to
 // POST /training/autolabel/preview on a click. *Suggest overlaps...* queues the overlap check
 // (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
-// the frame, and `y` accepts the one on screen.
+// the frame, and `y` accepts the one on screen. A labelers run sorts its new boxes into tiers
+// (training/autolabel/triage.rs): dismissed ones (state rejected, reason auto_dismissed) are left
+// off the frame and the list until `i` shows them, likely ones come first and `c` accepts them, the
+// other flagged ones are drawn quieter.
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
 // a new folder reloads the page.
 // Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
@@ -70,6 +73,14 @@
     boxList.parentNode.insertBefore(decide, boxList);
   }
   decide.classList.add('rv-decide');
+  // "Accept likely" and "Show N hidden", beside the box list.
+  var boxTools = $('rv-box-tools');
+  if (!boxTools) {
+    boxTools = document.createElement('div');
+    boxTools.id = 'rv-box-tools';
+    boxTools.className = 'rv-box-tools';
+    boxList.parentNode.insertBefore(boxTools, boxList);
+  }
   var zoomBoxBtn = $('rv-zoombox');
   if (!zoomBoxBtn && fitBtn) {
     zoomBoxBtn = document.createElement('button');
@@ -164,6 +175,7 @@
   var wideSide = pref('wide', false);        // a larger close-up (wider side panel)
   var hoverIdx = -1;                   // the box under the pointer (its tag shows in full)
   var classGrid = false;               // the decision bar's "It's a..." class buttons open
+  var dismissedOn = false;             // `i`: this frame's dismissed boxes are shown
   var spaceDown = false;               // Space held: left-drag pans
   var overCanvas = false;
   var guard = null;                    // {frame, count}: the save that warned about review boxes
@@ -194,13 +206,14 @@
   var suggestions = [];                // liveSuggestions, as of the last render
 
   var COLORS = {
-    pending: '#e8d000', review: '#ffa000', hint: '#f08c00', accepted: '#2e9e4f',
+    pending: '#e8d000', review: '#ffa000', unlikely: '#ffa000', likely: '#14d6b0', hint: '#f08c00', accepted: '#2e9e4f',
     added: '#1f6fe0', rejected: '#e53935', sugDrop: '#ff3df0', sugKeep: '#00e5ff'
   };
   var MAX_ZOOM = 8;
   var HANDLE_CSS = 5;   // half size of a resize handle, CSS pixels
   var CLICK_CSS = 4;    // a pointer that moves less than this is a click
   var MIN_BOX = 3;      // frame pixels
+  var DISMISS_SCORE = 0.15;   // training/autolabel/triage.rs
 
   function say(text, isError) {
     msg.textContent = text || '';
@@ -273,11 +286,45 @@
   // `labels::needs_decision`, which refuses the save.
   function mustDecide(b) { return isReview(b) && resolved(b) === 'accepted'; }
 
-  // What a box shows as: the state, with pending split by review / what saving will make of it.
+  // Set aside by a labelers run for its score, nobody judged it (labels::LabelBox::is_dismissed).
+  function isDismissed(b) { return b.state === 'rejected' && b.reason === 'auto_dismissed'; }
+
+  // Dismissed and not shown just now.
+  function isPutAway(b) { return isDismissed(b) && !dismissedOn; }
+
+  // Not drawn, listed or stepped through.
+  function isOff(b) { return isUnwanted(b) || isPutAway(b); }
+
+  function dismissedCount() {
+    return boxes().filter(function (b) { return isDismissed(b) && !isUnwanted(b); }).length;
+  }
+
+  // A reviewer's decision ends a dismissal: then the box is a label or a negative like any other
+  // (labels::normalize does the same).
+  function endDismissal(b) { if (b.reason === 'auto_dismissed') delete b.reason; }
+
+  // A pending box the labelers think is real (`likely`: a score and a VLM yes).
+  function isLikely(b) { return b.state === 'pending' && !!b.likely && !isUnwanted(b); }
+
+  // A flagged auto box on a frame a run sorted into tiers. Files of older runs have no tiers, so
+  // their flagged boxes keep their full look.
+  function isUnlikely(b) {
+    return isReview(b) && !b.likely && b.source === 'auto' &&
+      boxes().some(function (x) { return x.likely || x.audit || isDismissed(x); });
+  }
+
+  // What a box shows as: the state, with pending split by tier, review, what saving makes of it.
   function look(b) {
-    if (b.state === 'pending') return isReview(b) ? 'review' : (isHint(b) ? 'hint' : 'pending');
+    if (b.state === 'pending') {
+      if (isLikely(b)) return 'likely';
+      if (isReview(b)) return isUnlikely(b) ? 'unlikely' : 'review';
+      return isHint(b) ? 'hint' : 'pending';
+    }
     return b.state;
   }
+
+  // The mark before a box's number: likely, or flagged.
+  function markOf(b) { return isLikely(b) ? '★ ' : (isReview(b) ? '? ' : ''); }
 
   // The box `d` (1 or -1) steps from the selected one, wrapping, past the unwanted boxes (not
   // shown); -1 when none is shown.
@@ -285,21 +332,24 @@
     var bs = boxes();
     for (var k = 1; k <= bs.length; k++) {
       var j = ((selected < 0 && d < 0 ? 0 : selected) + d * k + bs.length * 2) % bs.length;
-      if (!isUnwanted(bs[j])) return j;
+      if (!isOff(bs[j])) return j;
     }
     return -1;
   }
 
   function reviewCount() { return boxes().filter(isReview).length; }
 
+  // The first flagged box, a likely one before the others.
   function firstReview() {
-    var bs = boxes();
-    for (var i = 0; i < bs.length; i++) if (isReview(bs[i])) return i;
+    var bs = boxes(), i;
+    for (i = 0; i < bs.length; i++) if (isLikely(bs[i]) && isReview(bs[i])) return i;
+    for (i = 0; i < bs.length; i++) if (isReview(bs[i])) return i;
     return -1;
   }
 
   // A decided box (accepted, rejected, drawn) not looked at on this visit of the frame: the
   // check pass steps through them once nothing is pending. `_checked` is page-only (not saved).
+  // A dismissed box only while shown (isShown): nobody asked to judge it.
   function isUnchecked(b) {
     return b.state !== 'pending' && !b._checked && isShown(b);
   }
@@ -310,11 +360,12 @@
     return boxes().filter(function (b) { return b.state === 'pending' && !isUnwanted(b); }).length;
   }
 
-  // The box to look at after `i` (wrapping; -1 for the first): the next review box, else the
-  // next pending one, else (the check pass) the first unchecked decided one, else -1.
+  // The box to look at after `i` (wrapping; -1 for the first): the next likely box, else the next
+  // review box, else the next pending one, else (the check pass) the first unchecked decided one,
+  // else -1.
   function nextUndecided(i) {
     var bs = boxes();
-    var tests = [isReview, function (b) { return b.state === 'pending' && !isUnwanted(b); }];
+    var tests = [isLikely, isReview, function (b) { return b.state === 'pending' && !isUnwanted(b); }];
     for (var t = 0; t < tests.length; t++) {
       for (var k = 1; k <= bs.length; k++) {
         var j = (i + k + bs.length) % bs.length;
@@ -353,7 +404,7 @@
 
   // "Show boxes of": a box of another class is dimmed (display only; saving keeps every box).
   function isShown(b) {
-    return !isUnwanted(b) && (!shownLabels.length || shownLabels.indexOf(b.label) >= 0);
+    return !isOff(b) && (!shownLabels.length || shownLabels.indexOf(b.label) >= 0);
   }
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
@@ -740,7 +791,7 @@
 
   function tagText(b, i) {
     var l = look(b);
-    return (l === 'review' ? '? ' : '') + (b.difficult ? '?! ' : '') + (i + 1) + ' ' + b.label +
+    return markOf(b) + (b.difficult ? '?! ' : '') + (i + 1) + ' ' + b.label +
       (b.score != null ? ' ' + fmtScore(b.score) : '') +
       (b.source === 'auto' && b.triage === 'accept' && b.state !== 'rejected' ? ' ✓' : '');
   }
@@ -789,7 +840,10 @@
       var dim = spot && !sel && !role;
       ctx.save();
       var shown = isShown(b);
-      ctx.globalAlpha = (l === 'rejected' ? 0.7 : 1) * (shown ? 1 : 0.2) * (dim ? 0.35 : 1);
+      var strong = l === 'review' || l === 'likely';
+      // Shown dismissed boxes and the unlikely ones sit back: the eye goes to the likely ones.
+      var quiet = isDismissed(b) ? 0.85 : (l === 'unlikely' ? 0.6 : 1);
+      ctx.globalAlpha = (l === 'rejected' ? 0.7 : 1) * quiet * (shown ? 1 : 0.2) * (dim ? 0.35 : 1);
       if (sel) {
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth = lw * 3.5;
@@ -797,10 +851,10 @@
       }
       // Dashed: rejected or rejected on save; dotted: an unsure box.
       ctx.setLineDash(dashed ? [lw * 4, lw * 3] : (b.difficult ? [lw, lw * 1.5] : []));
-      ctx.lineWidth = (sel ? 2 : 1) * (l === 'review' ? 1.5 : 1) * lw;
+      ctx.lineWidth = (sel ? 2 : 1) * (strong ? 1.5 : 1) * lw;
       ctx.strokeStyle = color;
       ctx.strokeRect(x, y, w, h);
-      if (l === 'review') {
+      if (strong) {
         // A dark inner line: the flagged boxes read as outlined.
         ctx.setLineDash([]);
         ctx.lineWidth = lw * 0.6;
@@ -852,11 +906,11 @@
 
     // The selected box last (on top), the hovered one just before it.
     boxes().forEach(function (b, i) {
-      if (!isUnwanted(b) && i !== selected && i !== hoverIdx) drawBox(b, i);
+      if (!isOff(b) && i !== selected && i !== hoverIdx) drawBox(b, i);
     });
     var hb = boxes()[hoverIdx];
-    if (hb && hoverIdx !== selected && !isUnwanted(hb)) drawBox(hb, hoverIdx);
-    if (sb && !isUnwanted(sb)) drawBox(sb, selected);
+    if (hb && hoverIdx !== selected && !isOff(hb)) drawBox(hb, hoverIdx);
+    if (sb && !isOff(sb)) drawBox(sb, selected);
     if (sb && !(gesture && gesture.mode === 'draw' && gesture.moved)) {
       var hs = HANDLE_CSS * cssScale() / z;
       ctx.save();
@@ -937,7 +991,7 @@
   // the close-up.
   function cropTag(c, b, rx, ry, rh, pw, ph, dpr) {
     var l = look(b);
-    var mark = b.difficult ? '?! ' : (l === 'review' ? '? ' : (l === 'accepted' || l === 'added' ? '✓ ' : (l === 'rejected' ? '✗ ' : '')));
+    var mark = b.difficult ? '?! ' : (markOf(b) || (l === 'accepted' || l === 'added' ? '✓ ' : (l === 'rejected' ? '✗ ' : '')));
     var main = mark + b.label;
     var extra = (b.score != null ? ' ' + fmtScore(b.score) : '') +
       (b.auto_label && b.auto_label !== b.label ? ' · labelers: ' + b.auto_label : '');
@@ -1023,7 +1077,8 @@
       if (b.origin) m.push(b.origin.replace(/_/g, ' '));
       if (b.reason) m.push(b.reason);
       parts.push(m.join(' '));
-    } else if (b.reason) parts.push(b.reason);
+    } else if (isDismissed(b)) parts.push('hidden: score below ' + DISMISS_SCORE);
+    else if (b.reason) parts.push(b.reason);
     if (b.model_label && b.model_label !== b.label) parts.push('was ' + b.model_label);
     if (b.orig_bbox) parts.push('moved');
     return parts.join(' · ');
@@ -1072,9 +1127,11 @@
   function boxRow(b, i) {
     var li = el('li', 'compact st-' + b.state + ' lk-' + look(b));
     li.appendChild(el('span', 'swatch sw-' + look(b)));
-    li.appendChild(el('span', 'bx-num', (isReview(b) ? '? ' : '') + String(i + 1)));
+    li.appendChild(el('span', 'bx-num', markOf(b) + String(i + 1)));
     li.appendChild(el('span', 'bx-name', b.label + (b.auto_label && b.auto_label !== b.label ? ' (' + b.auto_label + '?)' : '')));
     li.appendChild(shortState(b));
+    if (isLikely(b)) li.appendChild(el('span', 'rv-chip likely', 'likely'));
+    if (isDismissed(b)) li.appendChild(el('span', 'rv-chip', 'hidden'));
     if (b.state !== 'pending' && !b._checked) li.appendChild(el('span', 'rv-chip warn', 'to check'));
     if (dups.of[i] && dups.of[i].keeper !== i) li.appendChild(el('span', 'rv-chip warn', 'dup'));
     else if (dups.near[i] != null) li.appendChild(el('span', 'rv-chip warn', 'overlap'));
@@ -1093,11 +1150,13 @@
     var li = el('li', 'st-' + b.state + ' lk-' + look(b) + ' sel');
     var head = el('span', null);
     head.appendChild(el('span', 'swatch sw-' + look(b)));
-    head.appendChild(document.createTextNode((isReview(b) ? '? ' : '') + String(i + 1) + ' '));
+    head.appendChild(document.createTextNode(markOf(b) + String(i + 1) + ' '));
     li.appendChild(head);
     li.appendChild(classSelect(b, i));
     var chips = el('span', 'bx-chips');
     chips.appendChild(stateChip(b));
+    if (isLikely(b)) chips.appendChild(el('span', 'rv-chip likely', 'likely'));
+    if (isDismissed(b)) chips.appendChild(el('span', 'rv-chip', 'hidden'));
     if (b.state !== 'pending') chips.appendChild(el('span', 'rv-chip' + (b._checked ? ' ok' : ' warn'), b._checked ? 'checked' : 'to check'));
     // The reason of an `auto: review` is in the decision bar above: the chip alone here.
     var t = b.triage === 'review' ? el('span', 'rv-chip warn', 'auto: review') : triageChip(b);
@@ -1122,13 +1181,17 @@
     var bs = boxes();
     dups = dupGroups();
     suggestions = liveSuggestions();
-    // Pending review boxes first; each keeps its number (the one on the canvas).
+    // Likely boxes first, then the other flagged ones, the dismissed ones last; each keeps its
+    // number (the one on the canvas).
     var order = [];
-    bs.forEach(function (b, i) { if (isReview(b)) order.push(i); });
-    bs.forEach(function (b, i) { if (!isReview(b)) order.push(i); });
-    var offScreen = 0, unwanted = 0;
+    var rank = function (b) { return isLikely(b) ? 0 : (isReview(b) ? 1 : (isDismissed(b) ? 3 : 2)); };
+    [0, 1, 2, 3].forEach(function (r) {
+      bs.forEach(function (b, i) { if (rank(b) === r) order.push(i); });
+    });
+    var offScreen = 0, unwanted = 0, putAway = 0;
     order.forEach(function (i) {
       if (isUnwanted(bs[i])) { unwanted++; return; }
+      if (isPutAway(bs[i])) { putAway++; return; }
       if (!isShown(bs[i])) { offScreen++; return; }
       boxList.appendChild(boxItem(bs[i], i));
     });
@@ -1138,9 +1201,35 @@
     if (unwanted) {
       boxList.appendChild(el('li', 'muted', unwanted + ' box(es) of classes you do not want (hidden or not in the class list) not shown (kept in the file; pending proposals of them are rejected on save).'));
     }
-    if (bs.length === unwanted && cur) boxList.appendChild(el('li', 'muted', 'No box. Drag on the image to draw one.'));
+    if (bs.length === unwanted + putAway && cur) boxList.appendChild(el('li', 'muted', 'No box. Drag on the image to draw one.'));
     emptyBox.checked = !!(cur && cur.labels.empty_confirmed);
+    renderTools();
     renderDecision();
+  }
+
+  // "Accept likely (N)" and "Show N hidden" beside the box list.
+  function renderTools() {
+    boxTools.textContent = '';
+    var likely = boxes().filter(isLikely).length, n = dismissedCount();
+    if (likely) {
+      var acc = decideButton('Accept likely (' + likely + ')', 'c', 'ok', acceptLikely);
+      acc.title = 'Accept every likely box (★) on this frame; the other boxes stay pending';
+      boxTools.appendChild(acc);
+    }
+    if (n) {
+      var show = decideButton((dismissedOn ? 'Hide ' : 'Show ') + n + ' hidden', 'i', 'secondary', toggleDismissed);
+      show.setAttribute('aria-pressed', dismissedOn ? 'true' : 'false');
+      show.title = 'Boxes the auto-labelers set aside for a score below ' + DISMISS_SCORE + ': about 5% were real on public sets. Accept one if it is real.';
+      boxTools.appendChild(show);
+    }
+    boxTools.hidden = !likely && !n;
+  }
+
+  // The "Anything missing?" question, with the frame's dismissed boxes when they are off.
+  function missingText() {
+    var n = dismissedOn ? 0 : dismissedCount();
+    return 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
+      (n ? n + ' hidden: i shows them; ' : '') + 's saves.';
   }
 
   // The frame's progress: the boxes the reviewer sees, undecided / decided but not checked / done.
@@ -1169,17 +1258,21 @@
     var p = progress();
     var b = boxes()[selected];
     if (!b) {
-      decide.appendChild(el('div', 'rv-q', p.total
-        ? (p.undecided || p.unchecked ? 'No box selected: j selects the next one, drag on the frame to draw one.'
-          : (missingAsked === cur.frame ? 'Anything missing? Look over the whole frame and drag to draw a missed object; s saves.' : 'Every box decided: s saves.'))
-        : 'No box: drag on the frame to draw one, or e confirms it empty.'));
+      var off = dismissedOn ? 0 : dismissedCount();
+      decide.appendChild(el('div', 'rv-q', p.undecided || p.unchecked ? 'No box selected: j selects the next one, drag on the frame to draw one.'
+        : (missingAsked === cur.frame ? missingText()
+          : (p.total ? 'Every box decided: s saves.'
+            : 'No box: drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : '')))));
     } else {
       var i = selected;
       var q = el('div', 'rv-q');
-      q.appendChild(el('span', 'rv-q-num', 'Box ' + (i + 1) + ' of ' + boxes().length + ' · '));
+      // Put-away boxes are not counted: box numbers keep their place, so the total would mislead.
+      var putAway = boxes().some(isPutAway);
+      q.appendChild(el('span', 'rv-q-num', 'Box ' + (i + 1) + (putAway ? '' : ' of ' + boxes().length) + ' · '));
       var verb, yes, no;
       if (b.source === 'human') { verb = 'Drawn: '; yes = 'Keep'; no = 'Delete'; }
       else if (b.state === 'accepted') { verb = 'Accepted as '; yes = 'Right, keep'; no = 'No, reject'; }
+      else if (isDismissed(b)) { verb = 'Hidden for its score: is it a '; yes = 'Yes, accept'; no = 'No, reject'; }
       else if (b.state === 'rejected') { verb = 'Rejected: is it a '; yes = 'Yes, accept'; no = 'Keep rejected'; }
       else { verb = 'Is this a '; yes = 'Yes, ' + b.label; no = 'No, reject'; }
       q.appendChild(document.createTextNode(verb));
@@ -1246,6 +1339,8 @@
         // A duplicate says nothing about the spot: another box stays on the object there. Too
         // small neither: a real object, and a bulk reject would take frames out of training.
         if (b.state === 'rejected' && (b.reject_reason === 'duplicate' || b.reject_reason === 'too_small')) everywhere = null;
+        // A dismissed box: nobody decided, so there is no decision to spread.
+        if (isDismissed(b)) everywhere = null;
         if (everywhere) {
           var eb = button((everywhere === 'reject' ? 'Reject' : 'Accept') + ' this spot on all ' + camOf(cur.frame) + ' frames…',
             function () { spotEverywhere(i, everywhere === 'accept'); }, 'secondary');
@@ -1379,7 +1474,7 @@
     if (!(b.state === state && b._checked)) {
       snapshot();
       if (state === 'rejected') markRejected(b, why);
-      else { b.state = state; b._checked = true; delete b.reject_reason; }
+      else { b.state = state; b._checked = true; delete b.reject_reason; endDismissal(b); }
       if (state !== 'rejected' && cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
     }
     var next = nextUndecided(i);
@@ -1394,6 +1489,7 @@
     b.state = 'rejected';
     b._checked = true;
     delete b.difficult;
+    endDismissal(b);
     if (why) b.reject_reason = why;
   }
 
@@ -1460,6 +1556,7 @@
     var i = reasonTarget(), r = REASONS[n], b = boxes()[i];
     if (!b || !r) return;
     snapshot();
+    endDismissal(b);
     if (b.reject_reason === r[0]) delete b.reject_reason; else b.reject_reason = r[0];
     say('Box ' + (i + 1) + ' rejected' + (b.reject_reason ? ': ' + r[1] : '') + '.');
     clearReason(true);
@@ -1475,6 +1572,7 @@
     if (!b) { say('No box selected: j selects one.'); return; }
     if (b.state !== 'rejected') { rejectWith(i, 'too_small'); return; }
     snapshot();
+    endDismissal(b);
     if (b.reject_reason === 'too_small') delete b.reject_reason; else b.reject_reason = 'too_small';
     say('Box ' + (i + 1) + ' rejected' + (b.reject_reason ? ': ' + reasonText('too_small') : '') + '.');
     clearReason(true);
@@ -1497,6 +1595,7 @@
     }
     b.difficult = true;
     delete b.reject_reason;
+    endDismissal(b);
     b.state = b.source === 'human' ? 'added' : 'accepted';
     b._checked = true;
     if (cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
@@ -1573,7 +1672,7 @@
   function lookedAt(b) {
     return b.source !== 'human' && (b.state === 'accepted' || b.state === 'rejected') &&
       b.reject_reason !== 'duplicate' && b.reject_reason !== 'too_small' &&
-      ['low_score', 'other_class', 'repeat_spot', 'rest_rejected'].indexOf(b.reason) < 0;
+      ['low_score', 'auto_dismissed', 'other_class', 'repeat_spot', 'rest_rejected'].indexOf(b.reason) < 0;
   }
 
   // After a reviewed save: the frame's decisions replace its earlier ones in the history.
@@ -1702,6 +1801,7 @@
     b.label = label;
     b._relabelled = true;
     b._checked = true;
+    endDismissal(b);
     if (b.source !== 'human') b.state = 'accepted';
     if (cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
     refresh();
@@ -1749,6 +1849,36 @@
       (drop.length ? '; rejected ' + drop.length + ' stacked duplicate(s) (z undoes)' : '') +
       (hints ? '; ' + hints + ' hint box(es) stay pending (rejected on save unless you accept them).' : '.') + left);
     refresh();
+  }
+
+  // `c`: accept every likely box of the frame; the others stay pending, and a likely box stacked on
+  // a better one is left for the save to reject as a duplicate. They stay to check: a likely box is
+  // not a sure one, 23% were false on public sets (z undoes).
+  function acceptLikely() {
+    if (!cur) return;
+    var drop = pendingDupDrops(dupGroups());
+    var todo = boxes().filter(function (b, i) { return drop.indexOf(i) < 0 && isLikely(b); });
+    if (!todo.length) { say('No likely box on this frame.'); return; }
+    snapshot();
+    todo.forEach(function (b) { b.state = 'accepted'; });
+    cur.labels.empty_confirmed = false;
+    select(nextUndecided(-1), true);
+    var u = undecidedCount();
+    say('Accepted ' + todo.length + ' likely box(es)' + (u ? '; ' + u + ' still undecided' : '') + ' (z undoes).');
+  }
+
+  // `i`: show or put away this frame's dismissed boxes (view only: nothing changes until one is
+  // decided).
+  function toggleDismissed() {
+    if (!cur) return;
+    var n = dismissedCount();
+    if (!n) { say('No hidden box on this frame.'); return; }
+    dismissedOn = !dismissedOn;
+    // Showing them clears the selection: the spotlight's veil would all but hide them.
+    if (dismissedOn || (boxes()[selected] && isOff(boxes()[selected]))) selected = -1;
+    if (boxes()[hoverIdx] && isOff(boxes()[hoverIdx])) hoverIdx = -1;
+    refresh();
+    say(dismissedOn ? n + ' hidden box(es) shown, dashed: click one, then a accepts it, r rejects it; i puts them away.' : 'Hidden boxes put away.');
   }
 
   // Shift+R: reject every box still undecided, for "the real ones are done, the rest are wrong".
@@ -1803,6 +1933,7 @@
   // The first geometric edit of a model / auto box keeps its original box and accepts it.
   function markEdited(b) {
     b._checked = true;
+    endDismissal(b);
     if (b.source !== 'human') {
       if (!b.orig_bbox) b.orig_bbox = b.bbox.slice();
       b.state = 'accepted';
@@ -2081,6 +2212,13 @@
     if (c.auto_review != null) add('Auto: to review', c.auto_review);
     if (c.auto_accept != null) add('Auto: accept-ready', c.auto_accept);
     if (c.repeats_only) add('Repeat-only', c.repeats_only);
+    // The boxes kept back from dismissal: how often the filter would have hidden a real object.
+    // A percentage of a few boxes says nothing, so none under 20.
+    var real = c.audit_accepted || 0, audited = real + (c.audit_rejected || 0);
+    if (audited) {
+      add('Hidden-box check:', real + ' of ' + audited + (real === 1 ? ' was' : ' were') + ' real' +
+        (audited >= 20 ? ' (' + Math.round(real / audited * 100) + '%)' : ''));
+    }
     var per = c.per_class || {};
     var keys = Object.keys(per);
     add('Per class', keys.length ? keys.map(function (k) { return k + ' ' + per[k]; }).join(', ') : 'none yet');
@@ -2186,6 +2324,8 @@
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null;
       emptyBackup = null; missingAsked = null; frameStart = Date.now();
+      // Asking for these frames means asking to see those boxes.
+      dismissedOn = !!filtersForm.elements.auto && filtersForm.elements.auto.value === 'dismissed';
       canvas.width = j.width || 640;
       canvas.height = j.height || 360;
       view.z = 1; view.ox = 0; view.oy = 0;
@@ -2284,7 +2424,7 @@
         selected = -1;
         view.z = 1; view.ox = 0; view.oy = 0;
         refresh();
-        say('Anything missing? Look over the whole frame and drag to draw a missed object; s saves.');
+        say(missingText());
         return;
       }
     }
@@ -2374,9 +2514,9 @@
   function noteSaved(body) {
     var acc = 0, rej = 0;
     body.boxes.forEach(function (b) {
-      // A duplicate or a too-small box is no verdict on an object: it would read as a false
-      // positive here.
-      if (b.source === 'human' || b.reject_reason === 'duplicate' || b.reject_reason === 'too_small') return;
+      // A duplicate or a too-small box is no verdict on an object, and nobody judged a dismissed
+      // one: it would read as a false positive here.
+      if (b.source === 'human' || b.reject_reason === 'duplicate' || b.reject_reason === 'too_small' || b.reason === 'auto_dismissed') return;
       var r = resolved(b);
       if (r === 'accepted') acc++; else if (r === 'rejected') rej++;
     });
@@ -2481,15 +2621,16 @@
     ['Decide', 'y', 'overlap suggestion: accept the one on screen (drops the box marked drop?, as a duplicate; or keeps both as two objects). Doing anything else ignores it'],
     ['Decide', 'd', 'unsure: a real object you cannot name for sure: kept out of training, its frame goes to held-out only, ignored by the benchmark (?! on the box); again: not unsure'],
     ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate). Too small is also a button in the decision card: a real object too small to label, no negative, treated like unsure'],
+    ['Decide', 'c', 'accept likely: every likely (★) box on the frame; the others stay pending'],
     ['Decide', 'Shift+A', 'accept proposals: the pending boxes saving would accept (flagged ? boxes and hints stay pending)'],
-    ['Decide', 'Shift+R', 'reject the rest: every box still undecided'],
+    ['Decide', 'Shift+R', 'reject the rest: every box still undecided, the way to clear the unlikely boxes'],
     ['Decide', 'e', 'confirmed empty (rejects every box)'],
     ['Decide', 'Delete', 'delete a drawn box, reject a model box'],
     ['Decide', 'z', 'undo'],
     ['Decide', 's, Enter', 'save & next; flagged (?) boxes need a decision first, then it asks about boxes not checked yet and "Anything missing?" (Panel options)'],
     ['Decide', 'drag', 'on a handle: resize; inside the selected box: move; elsewhere: draw a box'],
     ['Decide', 'arrows', 'move the selected box 1 px (Shift: 10 px)'],
-    ['Decide', '', 'The next box is the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked to check).'],
+    ['Decide', '', 'The next box is the next likely (★) one, then the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked to check).'],
     ['Navigate', 'j / k', 'select the next / previous box'],
     ['Navigate', 'Esc', 'no box selected'],
     ['Navigate', 'n', 'next frame without saving (after Back: the frame you came from)'],
@@ -2504,6 +2645,7 @@
     ['View', 'v', 'spotlight on / off: the frame dimmed outside the selected box, the other boxes faint'],
     ['View', 'h (hold)', 'hide the boxes'],
     ['View', 'l', 'labels on the boxes on / off'],
+    ['View', 'i', 'show / put away the hidden boxes of this frame (low-score auto boxes, dimmed; accepting one makes it a label)'],
     ['View', '?', 'this list (Esc closes it)']
   ];
 
@@ -2612,6 +2754,8 @@
     else if (k === 'd') toggleUnsure();
     else if (k === 'u') { if (ev.shiftKey) rejectDuplicates(); else rejectDupSelected(); }
     else if (k === 'y') acceptOverlap();
+    else if (k === 'c') { if (!ev.shiftKey) acceptLikely(); }
+    else if (k === 'i') toggleDismissed();
     else if (k === '?') openKeys();
     else if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
       var step = ev.shiftKey ? 10 : 1;
