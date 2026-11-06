@@ -148,7 +148,8 @@ pub enum RejectReason {
     StaticObject,
     /// A real object of a class the list does not have.
     OtherObject,
-    /// Too small or too far to tell.
+    /// Too small or too far to tell: a real object not worth a label, so an ignore region
+    /// ([`LabelBox::is_ignore`]), not a hard negative.
     TooSmall,
     /// A reason this build does not know (kept as written, checked by [`normalize`]).
     Other(String),
@@ -220,8 +221,8 @@ pub struct LabelBox {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orig_bbox: Option<[f32; 4]>,
     /// The reviewer could not tell what the object is (PASCAL VOC `difficult`, Review page `d`):
-    /// left out of the YOLO export, `ignore` in the benchmark set, an attribute in COCO.
-    /// [`normalize`] clears it on a rejected box.
+    /// an ignore region ([`LabelBox::is_ignore`]), an attribute in COCO. [`normalize`] clears it on
+    /// a rejected box.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub difficult: bool,
     /// Why the reviewer rejected the box (optional; absent = a plain false positive).
@@ -298,6 +299,15 @@ impl LabelBox {
     /// A training label: accepted or added.
     pub fn is_training(&self) -> bool {
         matches!(self.state, BoxState::Accepted | BoxState::Added)
+    }
+
+    /// A real object not to train on, and no negative either: an unsure box, or one rejected as
+    /// too small. Its frame leaves training and it is `ignore` in a benchmark set. Read from the
+    /// existing fields, so frames reviewed before this rule count without a rewrite.
+    pub fn is_ignore(&self) -> bool {
+        self.difficult
+            || (self.state == BoxState::Rejected
+                && self.reject_reason == Some(RejectReason::TooSmall))
     }
 
     fn proposal(d: &super::record::Det, origin: Origin, reason: Option<String>) -> Self {
@@ -440,11 +450,11 @@ impl LabelFile {
             .filter(|b| b.state == BoxState::Rejected && b.source != Source::Human)
     }
 
-    /// [`Self::rejected`] without the duplicates: a box rejected as a second box on an object sits
-    /// on a real object, so it is no false positive to learn from.
+    /// [`Self::rejected`] without the boxes that sit on a real object, so are no false positive to
+    /// learn from: duplicates (a second box on an object) and ignore regions (too small).
     pub fn hard_negatives(&self) -> impl Iterator<Item = &LabelBox> {
         self.rejected()
-            .filter(|b| b.reject_reason != Some(RejectReason::Duplicate))
+            .filter(|b| b.reject_reason != Some(RejectReason::Duplicate) && !b.is_ignore())
     }
 }
 
@@ -1752,6 +1762,35 @@ mod tests {
             let n = normalize(sent, &["car".to_string()], 640, 480, "now").unwrap();
             assert!(!n.checked_before_reopen, "{status:?}");
         }
+    }
+
+    #[test]
+    fn too_small_rejects_are_ignore_regions_not_hard_negatives() {
+        let mut tiny = tests_support::auto_box("person");
+        tiny.state = BoxState::Rejected;
+        tiny.reject_reason = Some(RejectReason::TooSmall);
+        let mut wrong = tiny.clone();
+        wrong.reject_reason = Some(RejectReason::FalsePositive);
+        let mut unsure = tests_support::auto_box("dog");
+        unsure.state = BoxState::Accepted;
+        unsure.difficult = true;
+        let mut pending = tiny.clone();
+        pending.state = BoxState::Pending;
+        assert!(tiny.is_ignore() && unsure.is_ignore());
+        assert!(!wrong.is_ignore());
+        assert!(!pending.is_ignore(), "too small counts once rejected");
+        // A file reviewed before this rule: nothing to rewrite, the same JSON now reads this way.
+        let old = r#"{"label":"person","bbox":[1,1,9,9],"source":"model","state":"rejected",
+            "reject_reason":"too_small"}"#;
+        assert!(serde_json::from_str::<LabelBox>(old).unwrap().is_ignore());
+        let f = LabelFile {
+            boxes: vec![tiny, wrong, unsure],
+            ..LabelFile::default()
+        };
+        assert_eq!(f.rejected().count(), 2);
+        let neg: Vec<_> = f.hard_negatives().collect();
+        assert_eq!(neg.len(), 1);
+        assert_eq!(neg[0].reject_reason, Some(RejectReason::FalsePositive));
     }
 
     #[test]

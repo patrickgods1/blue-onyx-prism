@@ -16,6 +16,7 @@ fn frame(camera: &str, day: &str, name: &str, classes: &[&str]) -> Frame {
                 h: 0.2,
             })
             .collect(),
+        ignore: Vec::new(),
         scene: Some("day".into()),
         camera: camera.into(),
         day: day.into(),

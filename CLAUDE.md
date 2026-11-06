@@ -132,8 +132,8 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 - Review (`src/collect/labels/`, `/review`, `assets/review.js`): per-frame `<stem>.labels.json` (v1; states pending/
   accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
   `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk
-  accept of `auto=accept` frames `POST /v1/review/accept-auto`; bulk reject of pending auto boxes below a score `POST /v1/review/reject-low`, `reason: low_score`; all in `collect/labels/bulk.rs`); box `difficult` (page `d`, "unsure": left out of YOLO, COCO attribute,
-  benchmark `ignore`, X-AnyLabeling `difficult`) and `reject_reason` (enum, rejected boxes only, Shift+1-9, into `hard_negatives.json`;
+  accept of `auto=accept` frames `POST /v1/review/accept-auto`; bulk reject of pending auto boxes below a score `POST /v1/review/reject-low`, `reason: low_score`; all in `collect/labels/bulk.rs`); box `difficult` (page `d`, "unsure") and `too_small` rejects are ignore regions (`LabelBox::is_ignore`: out of YOLO, in `ignore.json`, the frame leaves train and valid and stays held-out with the region `ignore: true`; COCO attribute,
+  X-AnyLabeling `difficult`) and `reject_reason` (enum, rejected boxes only, Shift+1-9, into `hard_negatives.json`, except `too_small` and duplicates;
   `reason` stays provenance; an unknown one loads as `RejectReason::Other` and round-trips); repeats of fixed cameras
   (`collect/labels/repeats.rs`): `GET /v1/review/history?camera=` (the reviewer's own decisions per camera, cached per
   folder+camera, dropped by every label write, 60 s TTL) drives the page's "rejected here N times" hint and "Reject N

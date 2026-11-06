@@ -11,13 +11,16 @@
 //!      held-out images; scene / camera / date tags from a `manifest.json` (benchmark format) when
 //!      there is one.
 //!
-//!    A missing label file means "no objects" (the Ultralytics convention).
+//!    A missing label file means "no objects" (the Ultralytics convention). `ignore.json`
+//!    ([`IgnoreFile`]) lists real objects not to train on (unsure, too small); no file = none.
 //! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops);
 //!    hold out review frames by camera + day (unless the export already did) from **every**
 //!    review frame, before any filter, so runs with other scene filters are benchmarked on the
 //!    same frames ([`Plan::heldout_fingerprint`]); then filter the train / valid pool by scene
-//!    ([`SceneFilter`]) and, in [`Excluded::DropFrame`] mode, drop its frames with boxes of
-//!    untrained labels; keep about `negative_share` frames without objects in training, take a
+//!    ([`SceneFilter`]), drop its frames with ignore regions (no trainer here can leave a region
+//!    out of its loss, so the object would train as background; the held-out set keeps them, with
+//!    the regions `ignore` in its manifest) and, in [`Excluded::DropFrame`] mode, its frames with
+//!    boxes of untrained labels; keep about `negative_share` frames without objects in training, take a
 //!    validation split of `val_share` of the review training frames as whole camera days
 //!    ([`valid`], never a class's last training box), and repeat the review frames
 //!    `oversample` times when public frames are mixed in. Public frames are only ever trained on.
@@ -34,7 +37,8 @@
 //!
 //! [`inventory`] counts the boxes per class and scene of the sources (the class picker).
 
-use crate::benchmark::images::{self, Manifest};
+use crate::benchmark::images::{self, Manifest, ManifestObject};
+use crate::collect::labels::export::{IGNORE_FILE, IGNORE_VERSION, IgnoreBox, IgnoreFile};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -271,6 +275,9 @@ pub enum SplitHint {
 pub struct Frame {
     pub image: PathBuf,
     pub boxes: Vec<YoloBox>,
+    /// Real objects not to train on (`ignore.json`): not in `boxes`, so the frame cannot be
+    /// trained on, and `ignore` when the frame is benchmarked.
+    pub ignore: Vec<YoloBox>,
     /// `day`, `night` or `ir`; None = unknown.
     pub scene: Option<String>,
     pub camera: String,
@@ -531,6 +538,48 @@ fn list_file(dir: &Path, names: &[&str]) -> Option<BTreeSet<String>> {
     })
 }
 
+/// The ignore regions of a folder by image file name ([`IGNORE_FILE`]); no file = none (exports
+/// of older versions). A file that cannot be read is an error: going on without it would teach
+/// the objects it lists as background.
+fn read_ignore(dir: &Path) -> Result<BTreeMap<String, Vec<YoloBox>>> {
+    let p = dir.join(IGNORE_FILE);
+    let bytes = match std::fs::read(&p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
+    };
+    let file: IgnoreFile = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "{} is damaged, so this run cannot tell which objects not to train on; export the \
+             frames again from the Review page",
+            p.display()
+        )
+    })?;
+    if file.version > IGNORE_VERSION {
+        bail!(
+            "{} has version {}, newer than this build understands ({IGNORE_VERSION}); update Blue \
+             Onyx Prism or export the frames again",
+            p.display(),
+            file.version
+        );
+    }
+    // Normalized coordinates, 6 decimals: an f32 holds them.
+    #[allow(clippy::cast_possible_truncation)]
+    let unit = |v: f64| (v as f32).clamp(0.0, 1.0);
+    let to_box = |b: &IgnoreBox| YoloBox {
+        class: b.label.clone(),
+        cx: unit(b.cx),
+        cy: unit(b.cy),
+        w: unit(b.w),
+        h: unit(b.h),
+    };
+    Ok(file
+        .images
+        .iter()
+        .map(|(name, list)| (name.clone(), list.iter().map(to_box).collect()))
+        .collect())
+}
+
 /// Read a review export / YOLO folder (see the module docs).
 pub fn read_export(dir: &Path) -> Result<Source> {
     if !dir.is_dir() {
@@ -538,6 +587,7 @@ pub fn read_export(dir: &Path) -> Result<Source> {
     }
     let classes = read_classes(dir)?;
     let meta = manifest_meta(dir);
+    let mut ignore = read_ignore(dir)?;
     let mut warnings = Vec::new();
     // (image, label file, hint)
     let mut entries: Vec<(PathBuf, PathBuf, SplitHint)> = Vec::new();
@@ -612,6 +662,7 @@ pub fn read_export(dir: &Path) -> Result<Source> {
         let n = meta_from_name(&stem(&img));
         frames.push(Frame {
             boxes,
+            ignore: ignore.remove(&name).unwrap_or_default(),
             scene: m.scene.or(n.scene),
             camera: m.camera.or(n.camera).unwrap_or_else(|| UNKNOWN.into()),
             day: m.day.or(n.day).unwrap_or_else(|| UNKNOWN.into()),
@@ -686,6 +737,7 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
         frames.push(Frame {
             image: img,
             boxes,
+            ignore: Vec::new(),
             scene: m.scene,
             camera: m.camera.unwrap_or_else(|| manifest.id.clone()),
             day: m.day.unwrap_or_else(|| UNKNOWN.into()),
@@ -783,8 +835,10 @@ pub struct Plan {
     pub train: Vec<(FrameRef, u32)>,
     pub valid: Vec<FrameRef>,
     pub heldout: Vec<FrameRef>,
-    /// Hex SHA-256 of the sorted held-out frame keys: runs with the same value were benchmarked
-    /// on the same frames (whatever their scene filter).
+    /// Hex SHA-256 of the sorted held-out frame keys, a frame's ignore regions part of its key:
+    /// runs with the same value were benchmarked on the same frames, scored the same way
+    /// (whatever their scene filter). The class list plays no part. A frame without regions keeps
+    /// the key it always had, so such a set compares with runs of older versions.
     pub heldout_fingerprint: String,
     pub stats: Stats,
     pub warnings: Vec<String>,
@@ -801,6 +855,9 @@ pub struct Stats {
     pub scene_filtered: usize,
     /// Train / valid frames left out for a box of an untrained label ([`Excluded::DropFrame`]).
     pub excluded_frames: usize,
+    /// Train / valid frames left out for an ignore region ([`Frame::ignore`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ignore_frames: usize,
     pub negatives_dropped: usize,
     /// Boxes dropped per label not in the class list.
     pub boxes_dropped: BTreeMap<String, usize>,
@@ -847,7 +904,16 @@ pub fn mapped_boxes<'a>(
     opts: &'a Options,
     classes: &'a [String],
 ) -> impl Iterator<Item = (usize, &'a YoloBox)> + 'a {
-    f.boxes.iter().filter_map(move |b| {
+    mapped(&f.boxes, opts, classes)
+}
+
+/// `boxes` in the run's classes (renamed; others dropped), with their class index.
+fn mapped<'a>(
+    boxes: &'a [YoloBox],
+    opts: &'a Options,
+    classes: &'a [String],
+) -> impl Iterator<Item = (usize, &'a YoloBox)> + 'a {
+    boxes.iter().filter_map(move |b| {
         let name = opts.rename.get(&b.class).unwrap_or(&b.class);
         classes.iter().position(|c| c == name).map(|i| (i, b))
     })
@@ -879,6 +945,18 @@ fn class_boxes(f: &Frame, opts: &Options, classes: &[String]) -> Vec<usize> {
         }
     }
     n
+}
+
+/// A held-out frame's part of [`Plan::heldout_fingerprint`]: `key`, then its ignore regions as
+/// written (sorted, not mapped to the run's classes), so no regions = `key` alone.
+fn heldout_key(key: String, f: &Frame) -> String {
+    let mut regions: Vec<String> = f
+        .ignore
+        .iter()
+        .map(|b| format!("{} {:.6} {:.6} {:.6} {:.6}", b.class, b.cx, b.cy, b.w, b.h))
+        .collect();
+    regions.sort_unstable();
+    regions.iter().fold(key, |k, r| format!("{k}\t{r}"))
 }
 
 /// Hex SHA-256 of `keys` sorted, one per line (the held-out set's identity; empty set = the hash
@@ -1009,14 +1087,18 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     };
     p.heldout = heldout;
     p.heldout.sort_unstable();
-    p.heldout_fingerprint = fingerprint(p.heldout.iter().map(|&r| key_of(r)));
+    p.heldout_fingerprint = fingerprint(p.heldout.iter().map(|&r| match frame(r) {
+        Some(f) => heldout_key(key_of(r), f),
+        None => key_of(r),
+    }));
     if p.heldout.is_empty() {
         p.warnings.push(
             "no frame is held out: the trained model is not benchmarked on your own scenes".into(),
         );
     }
     // 4. Train / valid pool: the rest of the review frames plus the public ones, by scene, then
-    // without frames of untrained labels when the run drops them.
+    // without frames with ignore regions, and without frames of untrained labels when the run
+    // drops them.
     let mut in_scope: Vec<FrameRef> = Vec::new();
     let mut unknown_left_out = 0usize;
     for r in pool.into_iter().chain(public.iter().copied()) {
@@ -1043,11 +1125,24 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     let mut pool: Vec<FrameRef> = Vec::with_capacity(scoped);
     for r in in_scope {
         let Some(f) = frame(r) else { continue };
+        if !f.ignore.is_empty() {
+            p.stats.ignore_frames += 1;
+            continue;
+        }
         if opts.excluded == Excluded::DropFrame && f.boxes.iter().any(untrained) {
             p.stats.excluded_frames += 1;
             continue;
         }
         pool.push(r);
+    }
+    if p.stats.ignore_frames > 0 {
+        p.warnings.push(format!(
+            "{} of {scoped} training frame(s) were left out for unsure or too-small boxes: no \
+             trainer can skip such a box, so the object would train as background. Held-out \
+             frames keep them, and detections on those boxes do not count; to train on a frame \
+             again, give its box a class or reject it with another reason on the Review page",
+            p.stats.ignore_frames
+        ));
     }
     if p.stats.excluded_frames * 10 > scoped * 3 {
         p.warnings.push(format!(
@@ -1072,7 +1167,8 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     if pos.is_empty() {
         bail!(
             "no training frame has a box of the classes {:?} (after the held-out split, the \
-             scene filter and the excluded-class rule); review more frames with objects",
+             scene filter, the frames with unsure or too-small boxes and the excluded-class \
+             rule); review more frames with objects",
             p.classes
         );
     }
@@ -1213,7 +1309,8 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             ),
             None => format!(
                 "class '{c}' has no training box: no frame has a box of it (after the scene \
-                 filter), so the model cannot learn it; review frames with it or drop the class"
+                 filter and the frames left out for unsure or too-small boxes), so the model \
+                 cannot learn it; review frames with it or drop the class"
             ),
         });
     }
@@ -1398,6 +1495,26 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
             .map(|(i, b)| yolo_line(i, b))
             .collect()
     };
+    // A held-out frame's ground truth: read back from the very lines `label_text` writes, as the
+    // benchmark reads YOLO labels, so an ordinary box scores as it would from `labels/`. Ignore
+    // regions follow, through the same class map.
+    let ground_truth = |f: &Frame, (w, h): (u32, u32)| -> Result<Vec<ManifestObject>> {
+        let regions: String = mapped(&f.ignore, opts, classes)
+            .map(|(i, b)| yolo_line(i, b))
+            .collect();
+        let mut objects = Vec::new();
+        for (text, ignore) in [(label_text(f), false), (regions, true)] {
+            for g in images::parse_yolo(&text, classes, w, h)? {
+                objects.push(ManifestObject {
+                    label: g.label,
+                    bbox: g.bbox,
+                    ignore,
+                    crowd: false,
+                });
+            }
+        }
+        Ok(objects)
+    };
     let mut written: BTreeSet<FrameRef> = BTreeSet::new();
     let put = |r: FrameRef, f: &Frame, n: &str, written: &mut BTreeSet<FrameRef>| -> Result<()> {
         if written.insert(r) {
@@ -1494,6 +1611,7 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         &serde_json::to_string(&coco(&valid_entries)?)?,
     )?;
     // Held-out benchmark set.
+    let mut unreadable = 0usize;
     let heldout_dir = (!plan.heldout.is_empty()).then(|| out.join("heldout"));
     if let Some(hd) = &heldout_dir {
         std::fs::create_dir_all(hd.join("images"))?;
@@ -1508,6 +1626,11 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         };
         for &r in &plan.heldout {
             let f = frame(r)?;
+            // Boxes cannot be placed without the size: left out, as the benchmark always did.
+            let Some(size) = size_of(r, f).ok().filter(|s| s.0 > 0 && s.1 > 0) else {
+                unreadable += 1;
+                continue;
+            };
             let n = name_of(r, f);
             link_or_copy(&f.image, &hd.join("images").join(&n))?;
             let txt = hd
@@ -1525,10 +1648,10 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
                 url: None,
                 sha256: None,
                 size: None,
-                width: f.size.map(|s| s.0),
-                height: f.size.map(|s| s.1),
+                width: Some(size.0),
+                height: Some(size.1),
                 tags,
-                objects: None,
+                objects: Some(ground_truth(f, size)?),
             });
         }
         std::fs::write(hd.join("classes.txt"), &class_text)?;
@@ -1553,6 +1676,13 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
     }
     let mut warnings: Vec<String> = sources.iter().flat_map(|s| s.warnings.clone()).collect();
     warnings.extend(plan.warnings.iter().cloned());
+    if unreadable > 0 {
+        warnings.push(format!(
+            "{unreadable} held-out image(s) could not be read and were left out of the benchmark \
+             set: their boxes cannot be placed without the image size. The files are probably \
+             damaged; replace them."
+        ));
+    }
     let summary = Summary {
         version: 1,
         created: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

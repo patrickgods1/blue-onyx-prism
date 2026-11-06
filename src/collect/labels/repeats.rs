@@ -149,12 +149,15 @@ pub struct History {
 /// accepted or rejected, not by a rule over many frames (the low-score and unwanted-class
 /// rejects, an earlier spot edit; counting those would make a spot look more certain than any
 /// look at it was). A duplicate reject is no verdict on the spot either: another box stays on the
-/// object there (a real parked car must not read "rejected here N times"). Twin of the page's
-/// `lookedAt`.
+/// object there (a real parked car must not read "rejected here N times"), and neither is a
+/// too-small reject: a real object, only too small to label. Twin of the page's `lookedAt`.
 fn counts(b: &LabelBox) -> bool {
     b.source != Source::Human
         && matches!(b.state, BoxState::Accepted | BoxState::Rejected)
-        && b.reject_reason != Some(RejectReason::Duplicate)
+        && !matches!(
+            b.reject_reason,
+            Some(RejectReason::Duplicate | RejectReason::TooSmall)
+        )
         && !matches!(
             b.reason.as_deref(),
             Some(
@@ -461,7 +464,13 @@ mod tests {
         assert!(counts(&b), "a reason of the reviewer's");
         b.reject_reason = Some(RejectReason::Duplicate);
         assert!(!counts(&b), "a duplicate says nothing about the spot");
+        b.reject_reason = Some(RejectReason::TooSmall);
+        assert!(!counts(&b), "too small is no verdict on the spot either");
         b.reject_reason = None;
+        b.state = BoxState::Accepted;
+        b.difficult = true;
+        assert!(counts(&b), "an unsure accept is still the reviewer's look");
+        b.difficult = false;
         b.source = Source::Human;
         b.state = BoxState::Added;
         assert!(!counts(&b));
