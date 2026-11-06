@@ -117,6 +117,11 @@ libc = "0.2"
 # Router tests (`ServiceExt::oneshot`); already a transitive dependency of axum.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
+# Debug builds keep line tables only: backtraces still name files and lines, and the 14 test
+# binaries no longer each carry full debug info (target/debug had reached 54 GB on a 228 GB disk).
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
