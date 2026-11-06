@@ -1535,11 +1535,14 @@ fn one_image_source(dir: &Path, n: usize) -> Source {
                 day: "2026-10-01".into(),
                 split: SplitHint::None,
                 hard_negative: false,
+                human_rejected: false,
+                bulk_accepted: false,
                 size: Some((8, 8)),
             };
             n
         ],
         warnings: Vec::new(),
+        notes_known: false,
     }
 }
 
@@ -2011,9 +2014,11 @@ fn parked_source(dir: &Path, n: usize, free: usize, spots: &[&str]) -> Source {
     s
 }
 
+/// Every frame in the pool: a split-hinted export with no held-out frame now gets a held-out share.
 fn no_negatives() -> Options {
     Options {
         negative_share: 0.0,
+        heldout_share: 0.0,
         ..Options::default()
     }
 }
@@ -2126,4 +2131,237 @@ fn the_export_names_frames_with_only_parked_boxes() {
             .iter()
             .all(|f| f.parked.is_empty())
     );
+}
+
+/// A Review page export of `frames` (flat names; `val` = held out), with its label files.
+fn split_export(dir: &Path, train: &[&str], val: &[&str]) {
+    std::fs::write(dir.join("classes.txt"), "cat\n").unwrap();
+    for (split, list) in [("train", train), ("val", val)] {
+        for stem in list {
+            jpg(
+                &dir.join("images").join(split).join(format!("{stem}.jpg")),
+                16,
+                12,
+            );
+            let l = dir.join("labels").join(split);
+            std::fs::create_dir_all(&l).unwrap();
+            let boxes = if stem.contains("-empty") {
+                ""
+            } else {
+                "0 0.5 0.5 0.2 0.2\n"
+            };
+            std::fs::write(l.join(format!("{stem}.txt")), boxes).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_single_camera_day_export_still_holds_frames_out() {
+    let t = tmp("one-day");
+    let names: Vec<String> = (0..20)
+        .map(|i| format!("day.yard.2026-10-01.f{i:02}"))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    // What export.rs writes for one camera day: everything under train.
+    split_export(&t.0, &refs, &[]);
+    let s = [read_export(&t.0).unwrap()];
+    let o = Options::default();
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.heldout.len(), 4, "training.heldout_share of the frames");
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("frames of one day are similar")),
+        "{:?}",
+        p.warnings
+    );
+    let held: BTreeSet<FrameRef> = p.heldout.iter().copied().collect();
+    assert!(p.train.iter().all(|(r, _)| !held.contains(r)));
+    assert!(p.valid.iter().all(|r| !held.contains(r)));
+    // The same day whose hash sent it all to val: nothing would train.
+    let t3 = tmp("one-day-val");
+    split_export(&t3.0, &[], &refs);
+    let s3 = [read_export(&t3.0).unwrap()];
+    let p = plan(&s3, &o).unwrap();
+    assert_eq!(p.heldout.len(), 4);
+    assert!(!p.train.is_empty());
+    // heldout_share 0 stays the explicit way out.
+    let none = Options {
+        heldout_share: 0.0,
+        ..Options::default()
+    };
+    assert!(plan(&s, &none).unwrap().heldout.is_empty());
+    // An explicit split wins: the export's val, nothing added.
+    let t2 = tmp("explicit");
+    split_export(&t2.0, &refs, &["day.gate.2026-10-02.h1"]);
+    let s = [read_export(&t2.0).unwrap()];
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.heldout.len(), 1);
+}
+
+#[test]
+fn an_export_without_val_over_several_days_holds_whole_days_out() {
+    let t = tmp("several-days");
+    let names: Vec<String> = (0..24)
+        .map(|i| format!("day.yard.2026-10-0{}.f{i:02}", i % 4 + 1))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    split_export(&t.0, &refs, &[]);
+    let s = [read_export(&t.0).unwrap()];
+    let p = plan(&s, &Options::default()).unwrap();
+    assert_eq!(p.heldout.len(), 6, "one whole day");
+    assert_eq!(p.stats.heldout_groups.len(), 1);
+}
+
+#[test]
+fn a_frame_in_two_exports_counts_once_and_held_out_wins() {
+    let (a, b) = (tmp("dup-a"), tmp("dup-b"));
+    let train: Vec<String> = (0..12)
+        .map(|i| format!("day.yard.2026-10-01.f{i:02}"))
+        .collect();
+    let refs: Vec<&str> = train.iter().map(String::as_str).collect();
+    // `f00` trains in the first export and is held out in the second.
+    split_export(&a.0, &refs, &["day.gate.2026-10-02.h1"]);
+    split_export(&b.0, &refs[1..4], &[refs[0], "day.gate.2026-10-03.h2"]);
+    let s = [read_export(&a.0).unwrap(), read_export(&b.0).unwrap()];
+    let o = Options {
+        min_valid: 0,
+        val_share: 0.0,
+        ..Options::default()
+    };
+    let p = plan(&s, &o).unwrap();
+    // f00 (train copy) + f01..f03 (second copies) go.
+    assert_eq!(p.stats.duplicates_dropped, 4);
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.contains("4 frame(s) are in more than one")),
+        "{:?}",
+        p.warnings
+    );
+    let name = |r: FrameRef| file_name(&s[r.0].frames[r.1].image);
+    let held: Vec<String> = p.heldout.iter().map(|&r| name(r)).collect();
+    assert!(held.contains(&format!("{}.jpg", refs[0])), "{held:?}");
+    let trained: BTreeSet<String> = p.train.iter().map(|(r, _)| name(*r)).collect();
+    assert_eq!(trained.len(), p.train.len(), "each frame once");
+    assert!(
+        !trained.contains(&format!("{}.jpg", refs[0])),
+        "{trained:?}"
+    );
+    for h in &held {
+        assert!(!trained.contains(h), "{h} trains and is held out");
+    }
+    // Other names say nothing: both 0001.jpg stay.
+    let (c, d) = (tmp("dup-c"), tmp("dup-d"));
+    flat_export(&c.0, &["cat"], &[("0001.jpg", "0 0.5 0.5 0.2 0.2\n", &[])]);
+    flat_export(&d.0, &["cat"], &[("0001.jpg", "0 0.5 0.5 0.2 0.2\n", &[])]);
+    let s = [read_export(&c.0).unwrap(), read_export(&d.0).unwrap()];
+    let p = plan(&s, &Options::default()).unwrap();
+    assert_eq!(p.stats.duplicates_dropped, 0);
+}
+
+#[test]
+fn negatives_rank_reviewer_evidence_first_whatever_the_formats() {
+    let t = tmp("negatives");
+    let mut train: Vec<String> = (0..4)
+        .map(|i| format!("day.yard.2026-10-01.p{i}"))
+        .collect();
+    let empties: Vec<String> = (0..30)
+        .map(|i| format!("day.yard.2026-10-01.e{i:02}-empty"))
+        .collect();
+    train.extend(empties.iter().cloned());
+    let refs: Vec<&str> = train.iter().map(String::as_str).collect();
+    split_export(&t.0, &refs, &["day.gate.2026-10-02.h1"]);
+    let jpg_of = |s: &str| format!("{s}.jpg");
+    // No benchmark manifest: frames.json and hard_negatives.json say it all.
+    std::fs::write(
+        t.0.join(FRAMES_FILE),
+        serde_json::to_vec(&FrameNotes {
+            version: FRAMES_VERSION,
+            empty_confirmed: vec![jpg_of(&empties[29])],
+            bulk_accepted: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        t.0.join(HARD_NEGATIVES_FILE),
+        serde_json::to_vec(&serde_json::json!([
+            {"file": jpg_of(&empties[28]), "reason": null},
+            {"file": jpg_of(&empties[27]), "reason": bulk::DISMISSED_REASON},
+            {"file": jpg_of(&empties[26]), "reason": bulk::SPOT_DISMISSED_REASON},
+            {"file": jpg_of(&empties[25]), "reason": bulk::OTHER_CLASS_REASON},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let s = [read_export(&t.0).unwrap()];
+    assert!(s[0].notes_known);
+    let by_name = |n: &str| {
+        s[0].frames
+            .iter()
+            .find(|f| file_name(&f.image) == jpg_of(n))
+            .unwrap()
+    };
+    assert!(by_name(&empties[29]).hard_negative);
+    assert!(by_name(&empties[28]).human_rejected);
+    assert!(
+        !by_name(&empties[27]).human_rejected,
+        "a dismissal is no human reject"
+    );
+    assert!(!by_name(&empties[26]).human_rejected);
+    assert!(
+        !by_name(&empties[25]).human_rejected,
+        "a class-list reject says nothing"
+    );
+    // Room for only two negatives: the two with evidence, whatever their seeded rank.
+    let o = Options {
+        negative_share: 2.0 / 6.0,
+        min_valid: 0,
+        val_share: 0.0,
+        ..Options::default()
+    };
+    for seed in 0..5 {
+        let p = plan(&s, &Options { seed, ..o.clone() }).unwrap();
+        let negs: BTreeSet<String> = p
+            .train
+            .iter()
+            .map(|(r, _)| r)
+            .chain(p.valid.iter())
+            .map(|(_, i)| &s[0].frames[*i])
+            .filter(|f| f.boxes.is_empty())
+            .map(|f| file_name(&f.image))
+            .collect();
+        assert_eq!(negs.len(), 2, "{negs:?}");
+        assert!(negs.contains(&jpg_of(&empties[29])), "{negs:?}");
+        assert!(negs.contains(&jpg_of(&empties[28])), "{negs:?}");
+    }
+    // A damaged file: a warning, the frames still read.
+    std::fs::write(t.0.join(HARD_NEGATIVES_FILE), b"not json").unwrap();
+    std::fs::write(t.0.join(FRAMES_FILE), b"not json").unwrap();
+    let s = read_export(&t.0).unwrap();
+    assert!(!s.notes_known);
+    assert_eq!(s.warnings.len(), 2, "{:?}", s.warnings);
+}
+
+#[test]
+fn a_prepared_dataset_reads_back() {
+    let (t, out) = (tmp("prepared"), tmp("prepared-out"));
+    camera_export(&t.0);
+    let s = [read_export(&t.0).unwrap()];
+    let o = Options::default();
+    let p = plan(&s, &o).unwrap();
+    let dir = out.0.join("data");
+    let w = write(&s, &p, &o, &dir).unwrap();
+    let r = read_prepared(&dir).unwrap();
+    assert_eq!(r.classes, w.classes);
+    assert_eq!(r.train_images, w.train_images);
+    assert_eq!(r.train_frames, w.train_frames);
+    assert_eq!(r.valid_images, w.valid_images);
+    assert_eq!(r.valid_groups, w.valid_groups);
+    assert_eq!(r.heldout_dir, w.heldout_dir);
+    assert_eq!(r.heldout_images, w.heldout_images);
+    assert_eq!(r.heldout_fingerprint, w.heldout_fingerprint);
+    assert_eq!(r.warnings, w.warnings);
+    assert!(read_prepared(&out.0).is_err(), "no dataset.json");
 }

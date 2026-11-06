@@ -5,7 +5,8 @@
 //!    (normalized YOLO boxes), scene, camera and day. Two export layouts are read:
 //!    - the Review page's export (`src/collect/labels/export.rs`): `images/{train,val}/`,
 //!      `labels/{train,val}/`, `classes.txt`, flat names `<scene>.<camera>.<date>.<stem>.jpg`;
-//!      its `val` split is already held out by camera + day, so it becomes the held-out set;
+//!      its `val` split is already held out by whole camera days, so it becomes the held-out set
+//!      (an export with no `val` frame, such as one camera on one day, is held out here instead);
 //!    - a flat YOLO folder: `images/` (or the folder itself), `labels/` (or `<stem>.txt` beside
 //!      the image), `classes.txt` or `data.yaml`, optional `test.txt` / `heldout.txt` listing
 //!      held-out images; scene / camera / date tags from a `manifest.json` (benchmark format) when
@@ -13,17 +14,22 @@
 //!
 //!    A missing label file means "no objects" (the Ultralytics convention). `ignore.json`
 //!    ([`IgnoreFile`]) lists real objects not to train on (unsure, too small) and the frames with
-//!    nothing but parked-spot boxes; no file = none.
+//!    nothing but parked-spot boxes; no file = none. `frames.json` ([`FrameNotes`]) names the
+//!    frames confirmed empty or accepted in bulk and `hard_negatives.json` the rejected boxes,
+//!    whichever formats the export wrote.
 //! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops);
-//!    hold out review frames by camera + day (unless the export already did) from **every**
-//!    review frame, before any filter, so runs with other scene filters are benchmarked on the
-//!    same frames ([`Plan::heldout_fingerprint`]); then filter the train / valid pool by scene
+//!    drop the copies of a frame that several exports hold (a held-out copy wins); hold out review
+//!    frames by whole camera days (unless the exports already did; one camera day: frame by frame,
+//!    with a warning) from **every** review frame, before any filter, so runs with other scene
+//!    filters are benchmarked on the same frames ([`Plan::heldout_fingerprint`]); then filter the
+//!    train / valid pool by scene
 //!    ([`SceneFilter`]), drop its frames with ignore regions (no trainer here can leave a region
 //!    out of its loss, so the object would train as background; the held-out set keeps them, with
 //!    the regions `ignore` in its manifest) and, in [`Excluded::DropFrame`] mode, its frames with
 //!    boxes of untrained labels; cap the frames with nothing but parked-spot boxes at
 //!    [`PARKED_CAP`] per spot (the same crop again and again would dominate training); keep about
-//!    `negative_share` frames without objects in training, take a
+//!    `negative_share` frames without objects in training (frames a reviewer confirmed empty or
+//!    rejected a box on first), take a
 //!    validation split of `val_share` of the review training frames as whole camera days
 //!    ([`valid`], never a class's last training box), and repeat the review frames
 //!    `oversample` times when public frames are mixed in. Public frames are only ever trained on.
@@ -41,7 +47,11 @@
 //! [`inventory`] counts the boxes per class and scene of the sources (the class picker).
 
 use crate::benchmark::images::{self, Manifest, ManifestObject};
-use crate::collect::labels::export::{IGNORE_FILE, IGNORE_VERSION, IgnoreBox, IgnoreFile};
+use crate::collect::labels::bulk;
+use crate::collect::labels::export::{
+    FRAMES_FILE, FRAMES_VERSION, FrameNotes, HARD_NEGATIVES_FILE, IGNORE_FILE, IGNORE_VERSION,
+    IgnoreBox, IgnoreFile,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -289,6 +299,13 @@ pub struct Frame {
     pub split: SplitHint,
     /// Confirmed empty by the reviewer (a hard negative).
     pub hard_negative: bool,
+    /// A reviewer rejected a box of a model or labeler here ([`read_rejected`]): a frame the model
+    /// is known to get wrong, the most useful kind of negative.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub human_rejected: bool,
+    /// Accepted in bulk ([`FrameNotes::bulk_accepted`]): nobody looked at this frame on its own.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bulk_accepted: bool,
     /// `(width, height)` when the source knows it.
     pub size: Option<(u32, u32)>,
     /// The parked spots of a frame with nothing but parked-spot boxes ([`IgnoreFile::parked`]).
@@ -312,6 +329,9 @@ pub struct Source {
     pub frames: Vec<Frame>,
     /// Problems that did not stop the read.
     pub warnings: Vec<String>,
+    /// The folder says which frames were accepted in bulk ([`FRAMES_FILE`]); exports of older
+    /// versions do not.
+    pub notes_known: bool,
 }
 
 /// Unknown camera / day.
@@ -597,6 +617,68 @@ fn read_ignore(dir: &Path) -> Result<IgnoreRead> {
     })
 }
 
+/// The [`FrameNotes`] of a folder; None = no file, or one this build cannot read (a warning: the
+/// notes rank frames and inform the report, a frame is the same without them).
+fn read_frame_notes(dir: &Path, warnings: &mut Vec<String>) -> Option<FrameNotes> {
+    let p = dir.join(FRAMES_FILE);
+    let bytes = std::fs::read(&p).ok()?;
+    match serde_json::from_slice::<FrameNotes>(&bytes) {
+        Ok(n) if n.version <= FRAMES_VERSION => Some(n),
+        Ok(n) => {
+            warnings.push(format!(
+                "{} has version {}, newer than this build understands: frames confirmed empty are \
+                 not preferred; update Blue Onyx Prism or export the frames again",
+                p.display(),
+                n.version
+            ));
+            None
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "{} is damaged ({e}): frames confirmed empty are not preferred; export the frames \
+                 again from the Review page",
+                p.display()
+            ));
+            None
+        }
+    }
+}
+
+/// The image file names of a folder's `hard_negatives.json` with a box a reviewer rejected. No
+/// file = none. A dismissal ([`bulk::is_dismissal`]) is a labelers run's own filter, and a reject
+/// for the class list ([`bulk::OTHER_CLASS_REASON`]) says the class is unwanted, not that the box
+/// was wrong; exports of older versions may list both.
+fn read_rejected(dir: &Path, warnings: &mut Vec<String>) -> BTreeSet<String> {
+    #[derive(Deserialize)]
+    struct Rejected {
+        file: String,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+    let p = dir.join(HARD_NEGATIVES_FILE);
+    let Ok(bytes) = std::fs::read(&p) else {
+        return BTreeSet::new();
+    };
+    match serde_json::from_slice::<Vec<Rejected>>(&bytes) {
+        Ok(v) => v
+            .into_iter()
+            .filter(|b| {
+                let reason = b.reason.as_deref();
+                !bulk::is_dismissal(reason) && reason != Some(bulk::OTHER_CLASS_REASON)
+            })
+            .map(|b| b.file)
+            .collect(),
+        Err(e) => {
+            warnings.push(format!(
+                "{} is damaged ({e}): frames with rejected boxes are not preferred as negatives; \
+                 export the frames again from the Review page",
+                p.display()
+            ));
+            BTreeSet::new()
+        }
+    }
+}
+
 /// Read a review export / YOLO folder (see the module docs).
 pub fn read_export(dir: &Path) -> Result<Source> {
     if !dir.is_dir() {
@@ -606,6 +688,17 @@ pub fn read_export(dir: &Path) -> Result<Source> {
     let meta = manifest_meta(dir);
     let mut ignore = read_ignore(dir)?;
     let mut warnings = Vec::new();
+    let notes = read_frame_notes(dir, &mut warnings);
+    let notes_known = notes.is_some();
+    let names_of = |pick: fn(&FrameNotes) -> &Vec<String>| -> BTreeSet<&str> {
+        notes
+            .iter()
+            .flat_map(|n| pick(n).iter().map(String::as_str))
+            .collect()
+    };
+    let empty_confirmed = names_of(|n| &n.empty_confirmed);
+    let bulk_accepted = names_of(|n| &n.bulk_accepted);
+    let rejected = read_rejected(dir, &mut warnings);
     // (image, label file, hint)
     let mut entries: Vec<(PathBuf, PathBuf, SplitHint)> = Vec::new();
     let split_layout = SPLIT_DIRS
@@ -685,7 +778,9 @@ pub fn read_export(dir: &Path) -> Result<Source> {
             camera: m.camera.or(n.camera).unwrap_or_else(|| UNKNOWN.into()),
             day: m.day.or(n.day).unwrap_or_else(|| UNKNOWN.into()),
             split,
-            hard_negative: m.hard_negative,
+            hard_negative: m.hard_negative || empty_confirmed.contains(name.as_str()),
+            human_rejected: rejected.contains(&name),
+            bulk_accepted: bulk_accepted.contains(name.as_str()),
             size: m.size,
             image: img,
         });
@@ -702,6 +797,7 @@ pub fn read_export(dir: &Path) -> Result<Source> {
         classes,
         frames,
         warnings,
+        notes_known,
     })
 }
 
@@ -762,6 +858,8 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
             day: m.day.unwrap_or_else(|| UNKNOWN.into()),
             split: SplitHint::Train,
             hard_negative: m.hard_negative || i.tags.iter().any(|t| t == "empty"),
+            human_rejected: false,
+            bulk_accepted: false,
             size: Some(size),
         });
     }
@@ -781,6 +879,7 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
         classes,
         frames,
         warnings,
+        notes_known: true,
     })
 }
 
@@ -896,6 +995,12 @@ pub struct Stats {
     /// Train / valid frames left out over the cap per parked spot ([`PARKED_CAP`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub parked_capped: usize,
+    /// Copies of a frame several exports hold, left out ([`frame_identity`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub duplicates_dropped: usize,
+    /// Of `train_negatives`, frames a reviewer confirmed empty or rejected a box on.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hard_negatives: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -973,6 +1078,52 @@ fn frame_key(s: &Source, f: &Frame) -> String {
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// What identifies a frame across review exports: its flat name (`<scene>.<camera>.<date>.<stem>`,
+/// [`crate::collect::labels::export::flat_name`]), the one thing of the frame's path that survives
+/// into every export; the stem holds the capture time and an id. Any other name says nothing (two
+/// folders may well both hold `0001.jpg`): None, never a duplicate.
+fn frame_identity(f: &Frame) -> Option<String> {
+    let stem = stem(&f.image);
+    let parts: Vec<&str> = stem.split('.').collect();
+    match parts.as_slice() {
+        [scene, _, _, _] if SCENES.contains(scene) => Some(file_name(&f.image)),
+        _ => None,
+    }
+}
+
+/// `review` without the copies of a frame several sources hold, and how many went. A held-out copy
+/// wins (else the frame would train and be measured on); among equals the first source does.
+fn without_duplicates(sources: &[Source], review: Vec<FrameRef>) -> (Vec<FrameRef>, usize) {
+    let frame = |r: FrameRef| sources.get(r.0).and_then(|s| s.frames.get(r.1));
+    let mut keep: BTreeMap<String, FrameRef> = BTreeMap::new();
+    for &r in &review {
+        let Some(id) = frame(r).and_then(frame_identity) else {
+            continue;
+        };
+        let held = |r: FrameRef| frame(r).is_some_and(|f| f.split == SplitHint::Heldout);
+        match keep.get_mut(&id) {
+            Some(kept) => {
+                if held(r) && !held(*kept) {
+                    *kept = r;
+                }
+            }
+            None => {
+                keep.insert(id, r);
+            }
+        }
+    }
+    let before = review.len();
+    let out: Vec<FrameRef> = review
+        .into_iter()
+        .filter(|&r| match frame(r).and_then(frame_identity) {
+            Some(id) => keep.get(&id) == Some(&r),
+            None => true,
+        })
+        .collect();
+    let dropped = before - out.len();
+    (out, dropped)
 }
 
 /// The `camera/day` group of a frame (held-out and validation splits).
@@ -1062,6 +1213,15 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             }
         }
     }
+    let (review, duplicates) = without_duplicates(sources, review);
+    p.stats.duplicates_dropped = duplicates;
+    if duplicates > 0 {
+        p.warnings.push(format!(
+            "{duplicates} frame(s) are in more than one of the ticked exports: one copy of each \
+             stays (the held-out copy when there is one, so no frame both trains and is measured \
+             on). Tick one export per set of frames to avoid this"
+        ));
+    }
     let frame = |r: FrameRef| -> Option<&Frame> { sources.get(r.0)?.frames.get(r.1) };
     let key_of = |r: FrameRef| -> String {
         sources
@@ -1074,10 +1234,13 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         frame(r).is_some_and(|f| mapped_boxes(f, opts, &p.classes).next().is_some())
     };
     // 3. Held out, from every review frame before the scene filter, so that runs with other
-    // scene filters are benchmarked on the same frames (every scene).
-    let hinted = review
-        .iter()
-        .any(|&r| frame(r).is_some_and(|f| f.split != SplitHint::None));
+    // scene filters are benchmarked on the same frames (every scene). The sources' split when it
+    // leaves both sides; else the same held-out share as a folder without a split: an export of
+    // one camera day has nothing to split, and its one group goes all to train or (by its hash)
+    // all to val. All held out stays as it is when public frames train.
+    let is_held = |r: FrameRef| frame(r).is_some_and(|f| f.split == SplitHint::Heldout);
+    let hinted = review.iter().any(|&r| is_held(r))
+        && (review.iter().any(|&r| !is_held(r)) || !public.is_empty());
     let (pool, heldout): (Vec<FrameRef>, Vec<FrameRef>) = if hinted {
         review
             .iter()
@@ -1115,9 +1278,10 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             (rest, held)
         } else {
             p.warnings.push(
-                "every frame is from one camera on one day: the held-out frames share it with \
-                 the training frames, so the benchmark of this run is optimistic; export frames \
-                 from more cameras or days"
+                "every frame is from one camera on one day: the held-out frames are a share of \
+                 that day, and frames of one day are similar, so the benchmark of this run reads \
+                 better than the model is; review and export frames from more cameras or days \
+                 for a fair measurement"
                     .into(),
             );
             let mut v = review.clone();
@@ -1137,7 +1301,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     }));
     if p.heldout.is_empty() {
         p.warnings.push(
-            "no frame is held out: the trained model is not benchmarked on your own scenes".into(),
+            "no frame is held out: the trained model is not benchmarked on your own frames".into(),
         );
     }
     // 4. Train / valid pool: the rest of the review frames plus the public ones, by scene, then
@@ -1239,11 +1403,11 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     let want_neg = super::estimate::to_u64(pos.len() as f64 * share / (1.0 - share));
     let want_neg = usize::try_from(want_neg).unwrap_or(usize::MAX);
     if neg.len() > want_neg {
-        // Keep the reviewer's confirmed negatives first, then by rank.
+        // Frames a reviewer confirmed empty or rejected a box on first, then by rank.
         neg.sort_by_key(|r| {
             let f = frame(*r);
             (
-                !f.is_some_and(|f| f.hard_negative),
+                !f.is_some_and(|f| f.hard_negative || f.human_rejected),
                 rank(opts.seed, &key_of(*r)),
             )
         });
@@ -1303,7 +1467,11 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                         || vec![0; p.classes.len()],
                         |f| class_boxes(f, opts, &p.classes),
                     ),
-                    hard_negative: f.is_some_and(|f| f.hard_negative),
+                    hard_negative: f.is_some_and(|f| {
+                        f.hard_negative
+                            || (f.human_rejected
+                                && mapped_boxes(f, opts, &p.classes).next().is_none())
+                    }),
                 }
             })
             .collect();
@@ -1328,6 +1496,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                 p.stats.train_positives += 1;
             } else {
                 p.stats.train_negatives += 1;
+                p.stats.hard_negatives += usize::from(f.hard_negative || f.human_rejected);
             }
         }
         p.stats.public_frames += usize::from(is_public);
@@ -1355,10 +1524,10 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         p.warnings.push(match heldout_boxes.get(c.as_str()) {
             Some(n) if hinted => format!(
                 "class '{c}' has no training box: its {n} box(es) are only in the held-out split \
-                 (the export's val split: cameras and days held out for the benchmark), so the \
-                 model cannot learn it; export again and hold out other cameras or days (Review \
-                 page export: holdout cameras / days), or review frames with it from the \
-                 training cameras and days"
+                 (the export's val split: camera days held out for the benchmark), so the model \
+                 cannot learn it; export again and hold out other cameras or days (Review page \
+                 export: holdout cameras / days), or review frames with it from the camera days \
+                 that train"
             ),
             Some(n) => format!(
                 "class '{c}' has no training box: its {n} box(es) are only in the held-out \
@@ -1405,6 +1574,50 @@ pub struct Prepared {
     /// [`BalanceReport::summary`] when the run balanced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_summary: Option<String>,
+}
+
+/// The [`Prepared`] of the dataset already in `dir` (its `dataset.json`, `<dir>/heldout`), for a
+/// run that exports again without assembling anything. A file that does not read is an error: the
+/// export checks the class list against it.
+pub fn read_prepared(dir: &Path) -> Result<Prepared> {
+    #[derive(Deserialize, Default)]
+    struct SavedStats {
+        #[serde(default)]
+        valid_groups: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct Saved {
+        classes: Vec<String>,
+        train_images: usize,
+        #[serde(default)]
+        train_frames: usize,
+        valid_images: usize,
+        heldout_images: usize,
+        #[serde(default)]
+        heldout_fingerprint: String,
+        #[serde(default)]
+        warnings: Vec<String>,
+        #[serde(default)]
+        stats: SavedStats,
+    }
+    let p = dir.join("dataset.json");
+    let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+    let s: Saved =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", p.display()))?;
+    let heldout = dir.join("heldout");
+    Ok(Prepared {
+        dir: dir.to_path_buf(),
+        classes: s.classes,
+        train_images: s.train_images,
+        train_frames: s.train_frames,
+        valid_images: s.valid_images,
+        valid_groups: s.stats.valid_groups,
+        heldout_dir: heldout.is_dir().then_some(heldout),
+        heldout_images: s.heldout_images,
+        heldout_fingerprint: s.heldout_fingerprint,
+        warnings: s.warnings,
+        balance_summary: None,
+    })
 }
 
 /// `dataset.json`: what went into a prepared dataset.
@@ -1682,7 +1895,10 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         let mut m = Manifest {
             id: "heldout".into(),
             title: "Held-out frames of this training run".into(),
-            description: "Your own frames from cameras and days the model did not train on.".into(),
+            description: "Your own frames, held out of training. Whole camera days when there \
+                          are several (other days of the same camera may train), else a share of \
+                          the one camera day."
+                .into(),
             license: "private: your own camera footage, do not share".into(),
             scored_labels: Some(classes.clone()),
             ..Manifest::default()

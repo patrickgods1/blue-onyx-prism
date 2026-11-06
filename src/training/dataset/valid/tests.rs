@@ -23,6 +23,8 @@ fn frame(camera: &str, day: &str, name: &str, classes: &[&str]) -> Frame {
         day: day.into(),
         split: SplitHint::None,
         hard_negative: false,
+        human_rejected: false,
+        bulk_accepted: false,
         size: Some((64, 48)),
     }
 }
@@ -51,6 +53,7 @@ fn source(frames: Vec<Frame>) -> Source {
             .to_vec(),
         frames,
         warnings: Vec::new(),
+        notes_known: false,
     }
 }
 

@@ -936,11 +936,14 @@
   // scene, class, excluded, public and balance fields; debounced, a stale answer is aborted or
   // dropped), shown only while an axis is ticked: images per epoch before -> after, then boxes
   // per class, frames per scene, the top cameras (and camera-days with that axis) with bars,
-  // and the warnings. Several scenes ticked: one tab per run.
+  // Several scenes ticked: one tab per run. The same answer draws the pre-flight report above Queue
+  // training, always: boxes per class and scene, the splits, what was left out, the disk, the
+  // warnings and what would refuse the run.
   (function () {
     var form = document.getElementById("train");
     var box = document.getElementById("train-balance");
     var panel = document.getElementById("train-balance-preview");
+    var pre = document.getElementById("train-preflight");
     var stateEl = document.getElementById("train-balance-state");
     if (!form || !box || !panel) return;
     var TOP = 8;
@@ -986,6 +989,11 @@
         p.append("balance_cap_on", "on");
         if (cap && cap.value !== "") p.append("balance_cap", cap.value);
       }
+      // The disk estimate of the ticked models.
+      form.querySelectorAll('input[name="model"]:checked').forEach(function (b) { p.append("model", b.value); });
+      var seeds = form.elements.seeds, dir = form.elements.install_dir;
+      if (seeds && seeds.value) p.append("seeds", seeds.value);
+      if (dir && dir.value.trim()) p.append("install_dir", dir.value.trim());
       return p.toString();
     };
     var say = function (text, cls) {
@@ -1075,13 +1083,73 @@
         }
         d.appendChild(grid);
       }
-      var w = r.warnings || [];
-      if (w.length) {
-        var ul = mk("ul", "warn-list small");
-        w.forEach(function (x) { ul.appendChild(mk("li", null, x)); });
-        d.appendChild(ul);
-      }
       return d;
+    };
+    var list = function (items, cls) {
+      var ul = mk("ul", cls);
+      items.forEach(function (x) { ul.appendChild(mk("li", null, x)); });
+      return ul;
+    };
+    // One run of the pre-flight report: the counts, then in plain sentences what to do about them.
+    var preRun = function (r, several) {
+      var d = mk("div", "tr-pre-run");
+      if (several) d.appendChild(mk("h4", "tr-bal-h", r.title || r.scene));
+      if (r.error) { d.appendChild(mk("p", "error-text small", "This run would not start: " + r.error)); return d; }
+      var p = r.preflight || {};
+      (p.refusals || []).forEach(function (x) { d.appendChild(mk("p", "error-text small", "This run would not start: " + x)); });
+      d.appendChild(mk("p", "small", p.train_frames + " training frames (" + p.train_images + " images per epoch, " + p.negatives +
+        " without objects), " + p.valid_frames + " validation, " + p.heldout_frames + " held out for the benchmark."));
+      var sc = p.scenes || {};
+      var parts = [["day", sc.day], ["night", sc.night], ["IR", sc.ir], ["no scene tag", sc.unknown]]
+        .filter(function (x) { return x[1] > 0; })
+        .map(function (x) { return x[1] + " " + x[0]; });
+      if (parts.length) d.appendChild(mk("p", "muted small", "Training frames by scene: " + parts.join(", ") + "."));
+      var rows = p.classes || [];
+      if (rows.length) {
+        var t = mk("table", "tr-btable tr-pre-table");
+        var head = mk("tr");
+        ["Boxes per class", "Train", "Val", "Held out", "Day", "Night", "IR"].forEach(function (h, i) {
+          var th = mk("th", i ? "num" : null, h);
+          th.scope = "col";
+          head.appendChild(th);
+        });
+        var thead = mk("thead");
+        thead.appendChild(head);
+        t.appendChild(thead);
+        var tb = mk("tbody");
+        rows.forEach(function (c) {
+          var tr = mk("tr");
+          var s = c.by_scene || {};
+          tr.appendChild(mk("td", "tr-bal-name", c.name));
+          [c.train, c.valid, c.heldout, s.day, s.night, s.ir].forEach(function (n) { tr.appendChild(mk("td", "num", String(n || 0))); });
+          tb.appendChild(tr);
+        });
+        t.appendChild(tb);
+        var wrap = mk("div", "scroll");
+        wrap.appendChild(t);
+        d.appendChild(wrap);
+      }
+      var left = [
+        [p.ignore_frames, "with unsure or too-small boxes"],
+        [p.parked_capped, "over the parked-spot cap"],
+        [p.duplicates_dropped, "that repeat a frame of another export"],
+        [p.scene_filtered, "outside this run's scenes"]
+      ].filter(function (x) { return x[0] > 0; }).map(function (x) { return x[0] + " " + x[1]; });
+      if (left.length) d.appendChild(mk("p", "muted small", "Left out of training: " + left.join("; ") + "."));
+      if (p.hard_negatives > 0) d.appendChild(mk("p", "muted small", p.hard_negatives + " of the frames without objects were confirmed empty or had a box rejected on the Review page."));
+      if ((p.notes || []).length) d.appendChild(list(p.notes, "muted small"));
+      if ((p.warnings || []).length) d.appendChild(list(p.warnings, "warn-list small"));
+      return d;
+    };
+    var renderPre = function (j) {
+      if (!pre) return;
+      var runs = j.runs || [];
+      pre.replaceChildren(mk("h3", "tr-bal-h", "Before you train"));
+      runs.forEach(function (r) { pre.appendChild(preRun(r, runs.length > 1)); });
+      var disk = j.disk || {};
+      (disk.lines || []).forEach(function (l) { pre.appendChild(mk("p", "muted small", "Disk: " + l.text + ".")); });
+      if (disk.refusal) pre.appendChild(mk("p", "error-text small", disk.refusal));
+      pre.hidden = false;
     };
     var render = function (j) {
       var runs = j.runs || [];
@@ -1118,22 +1186,32 @@
       panel.appendChild(legend);
       panes.forEach(function (p, i) { p.hidden = i !== tab; p.setAttribute("role", runs.length > 1 ? "tabpanel" : "region"); panel.appendChild(p); });
     };
+    var anyData = function () {
+      var extra = form.elements.dataset_path;
+      return !!form.querySelector('input[name="dataset"]:checked:not(:disabled)') || !!(extra && extra.value.trim());
+    };
     var run = function () {
       timer = null;
       var ax = axes();
       if (stateEl) stateEl.textContent = ax.length ? "on: " + ax.map(function (a) { return LABEL[a] || a; }).join(" + ") : "off";
       if (!ax.length) {
-        if (ctrl) ctrl.abort();
-        ctrl = null; seq++; lastBody = null;
         panel.hidden = true;
         panel.replaceChildren();
+      }
+      var stop = function () {
+        if (ctrl) ctrl.abort();
+        ctrl = null; seq++; lastBody = null;
+      };
+      if (!anyData()) {
+        stop();
+        if (pre) { pre.hidden = true; pre.replaceChildren(); }
         return;
       }
       var cls = trainClasses ? trainClasses() : null;
       if (cls && !cls.length) {
-        lastBody = null;
-        panel.hidden = false;
-        say("Tick at least one class to preview the balance.", "small error-text");
+        stop();
+        if (pre) { pre.hidden = false; pre.replaceChildren(mk("p", "small error-text", "Tick at least one class.")); }
+        if (ax.length) { panel.hidden = false; say("Tick at least one class to preview the balance.", "small error-text"); }
         return;
       }
       var b = body();
@@ -1142,9 +1220,11 @@
       if (ctrl) ctrl.abort();
       ctrl = typeof AbortController === "function" ? new AbortController() : null;
       var mine = ++seq;
-      panel.hidden = false;
-      panel.classList.add("tr-bal-busy");
-      if (!panel.firstChild) say("Previewing the balance…");
+      if (ax.length) {
+        panel.hidden = false;
+        panel.classList.add("tr-bal-busy");
+        if (!panel.firstChild) say("Previewing the balance…");
+      }
       fetch("/v1/training/balance-preview", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
@@ -1158,28 +1238,36 @@
       }).then(function (j) {
         if (mine !== seq) return;
         panel.classList.remove("tr-bal-busy");
-        render(j);
+        renderPre(j);
+        if (axes().length) render(j);
       }).catch(function (e) {
         if (mine !== seq || (e && e.name === "AbortError")) return;
         panel.classList.remove("tr-bal-busy");
         lastBody = null;
-        say("No preview: " + e.message, "small error-text");
+        if (axes().length) say("No preview: " + e.message, "small error-text");
+        if (pre) { pre.hidden = false; pre.replaceChildren(mk("p", "small error-text", "No report: " + e.message)); }
       });
     };
     var later = function () {
       if (timer) clearTimeout(timer);
       timer = setTimeout(run, 400);
     };
-    // Every field of the Datasets step (folders, scenes, classes, excluded, public, balance);
-    // the class picker's changes come as tr-classes. An unchanged form asks nothing.
-    var step = document.getElementById("datasets") || form;
-    step.addEventListener("change", later);
-    step.addEventListener("input", later);
+    // Every field of the form (the Datasets step, and models, seeds and the install folder for the
+    // disk estimate); the class picker's changes come as tr-classes. An unchanged form asks nothing.
+    form.addEventListener("change", later);
+    form.addEventListener("input", later);
     form.addEventListener("tr-classes", later);
     if (capOn) capOn.addEventListener("change", syncCap);
     syncCap();
     later();
   })();
+
+  // Deleting a run's files asks first, naming the size (the form's data-confirm).
+  document.querySelectorAll("form[data-confirm]").forEach(function (f) {
+    f.addEventListener("submit", function (e) {
+      if (!window.confirm(f.dataset.confirm)) e.preventDefault();
+    });
+  });
 
   // Live progress.
   var runs = document.getElementById("training-runs");
@@ -1382,6 +1470,20 @@
       set("describe", describe(r, list));
       // The actual batch / input size arrive with the trainer's start event: kept current.
       if (attr === "run") settingsLine(tr, r);
+      // The dataset's warnings arrive once the dataset is assembled.
+      var warnList = attr === "run" ? tr.querySelector('[data-field="warnings"]') : null;
+      if (warnList) {
+        var ws = (r.dataset && r.dataset.warnings) || [];
+        if (warnList.childElementCount !== ws.length) {
+          warnList.replaceChildren();
+          ws.forEach(function (w) {
+            var li = document.createElement("li");
+            li.textContent = w;
+            warnList.appendChild(li);
+          });
+        }
+        warnList.hidden = !ws.length;
+      }
       if (r.log && r.log.length) {
         var logEl = tr.querySelector('[data-field="log"]');
         var box = logEl && logEl.closest("details.tr-logbox");
@@ -1397,7 +1499,7 @@
       var finish = tr.querySelector('[data-field="finish"]');
       if (finish) {
         var p = r.progress || {};
-        finish.hidden = !((r.state === "running" || r.state === "paused") && r.stage === "train" && !p.stopped && !p.phase);
+        finish.hidden = !((r.state === "running" || r.state === "paused") && r.stage === "train" && !p.stopped && !p.phase && !r.retrying);
       }
       // An early-stop point passed while the training loss still falls: Stop now / Continue.
       var ext = tr.querySelector('[data-field="extend"]');

@@ -8,6 +8,7 @@ use super::compare::{self, CompareRun};
 use super::dataset::{self, Excluded, SceneFilter};
 use super::estimate;
 use super::job::{BenchSummary, Hooks, TrainOutput, TrainRequest};
+use super::preflight;
 use super::recipe::{self, Augment, TrainRecipe};
 use super::service::{self, RunState, TrainingService};
 use crate::config::Config;
@@ -189,6 +190,18 @@ pub enum TrainCommand {
     Overlaps(OverlapsArgs),
     /// List the runs recorded in the training folder.
     List,
+    /// Export a failed run's best checkpoint without training again, then install, add to the
+    /// config and benchmark it. `train list` shows the run ids.
+    RetryExport {
+        /// The run's id.
+        run: String,
+        /// Install the model but do not add it to the config (and do not benchmark it).
+        #[arg(long)]
+        no_register: bool,
+        /// Add the model to the config but do not benchmark it.
+        #[arg(long)]
+        no_benchmark: bool,
+    },
     /// Delete the training environment (tools/train-env, its base weights and settings).
     RemoveEnv,
 }
@@ -882,15 +895,29 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             };
             if dry_run {
                 let request = preview_request(&config, &data, scene)?;
-                let plan = super::preview_plan(&config, &request)?;
-                println!("{}", dry_run_text(&plan, &request.balance));
+                let p = super::preview_parts(&config, &request)?;
+                println!("{}", dry_run_text(&p.plan, &request.balance));
+                let unreviewed = super::unreviewed_frames(&config);
+                let report = preflight::report(&p.plan, &p.sources, &p.options, unreviewed);
+                print!("{}", preflight::text(&report));
+                let needs = preflight::run_needs(
+                    &p.plan,
+                    &p.sources,
+                    &request.recipe,
+                    &super::training_dir(&config).join("preview"),
+                    &TrainPaths::for_config(&config).export.models,
+                )?;
+                for n in preflight::combine(needs) {
+                    let s = super::import::disk::space(&n.dir);
+                    println!("disk: {}", preflight::disk_line(&n, s).text);
+                }
                 return Ok(true);
             }
             let Some(out) = out else {
                 bail!("--out <folder> is required (or --dry-run)");
             };
             let (sources, opts) = read_sources(&config, &data, scene)?;
-            let plan = dataset::plan(&sources, &opts)?;
+            let plan = preflight::planned(&sources, &opts)?;
             let prepared = dataset::write(&sources, &plan, &opts, &out)?;
             println!(
                 "{}: {} training, {} validation, {} held-out images; classes: {}",
@@ -1044,6 +1071,7 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                     jobs.push(job);
                 }
             }
+            super::check_jobs(&config, &jobs)?;
             if jobs.len() > 1 {
                 eprintln!("queued {} runs:", jobs.len());
                 for j in &jobs {
@@ -1279,6 +1307,51 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 );
             }
             Ok(true)
+        }
+        TrainCommand::RetryExport {
+            run,
+            no_register,
+            no_benchmark,
+        } => {
+            let hooks: Arc<dyn Hooks> = Arc::new(CliHooks {
+                config_path: path.clone(),
+                register: !no_register,
+                benchmark: !no_register && !no_benchmark,
+            });
+            let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
+            let svc = TrainingService::start(
+                Arc::new(crate::resources::export::SystemRunner),
+                fetcher,
+                hooks,
+                Some(super::runs_file(&config)),
+            );
+            let rec = svc
+                .get(&run)
+                .with_context(|| format!("no run {run} (train list shows the runs)"))?;
+            let job = super::retry::plan_retry(&config, &rec, &super::capability_now())?;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let _ctrl_c =
+                crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the export");
+            let id = svc.enqueue_retry(job).map_err(anyhow::Error::msg)?;
+            let mut last = String::new();
+            let mut ok = false;
+            while let Some(r) = svc.wait(&id, Duration::from_secs(1)) {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    svc.cancel(&id);
+                }
+                let line = format!("[{}] {:>3}% {}", r.name, r.percent, r.describe());
+                if r.state == RunState::Running && line != last {
+                    eprintln!("{line}");
+                    last = line;
+                }
+                if !r.state.is_busy() {
+                    report_run(&r);
+                    ok = r.state == RunState::Done;
+                    break;
+                }
+            }
+            svc.shutdown();
+            Ok(ok)
         }
         TrainCommand::RemoveEnv => {
             let paths = TrainPaths::for_config(&config);

@@ -5,8 +5,9 @@
 //! `bucket:<b>` and `hard-negative` for a frame confirmed empty). Only reviewed frames are
 //! exported (X-AnyLabeling may add the queue's unreviewed frames, pre-filled, unchecked).
 //!
-//! Split ([`assign_splits`]): by camera and day, so held-out frames come from cameras and days
-//! the model did not train on. Explicit `holdout_cameras` / `holdout_days` decide when given;
+//! Split ([`assign_splits`]): whole (camera, day) groups, so frames of one camera on one day never
+//! sit on both sides. Other days of a held-out group's camera still train, unless a camera is
+//! named. Explicit `holdout_cameras` / `holdout_days` decide when given;
 //! else a (camera, date) group is held out when the first 8 bytes of SHA-256(`camera/date`), as a
 //! fraction of 2^64, are below `holdout_fraction` (stable when days are added), with at least
 //! one group on each side once there are two groups.
@@ -25,7 +26,12 @@
 //! are listed in `ignore.json` too (`parked`): identical crops can dominate training, so a training
 //! run caps them per spot. They train normally otherwise.
 //!
-//! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`], [`ignore_file`]) plus
+//! `frames.json` ([`FrameNotes`], at the export's root, every format): the frames a reviewer
+//! confirmed empty and the frames accepted in bulk, so a training run knows them whichever formats
+//! were ticked. `hard_negatives.json` lists the rejected boxes.
+//!
+//! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`], [`ignore_file`],
+//! [`frame_notes`]) plus
 //! [`run`], which writes into an empty or new folder, or a new `export-<UTC time>` folder inside a
 //! non-empty one, never into the dataset (images hard-linked, else copied), and writes
 //! `export.json` last.
@@ -274,6 +280,44 @@ pub struct IgnoreFile {
     /// per spot. Absent in exports of older versions, and older builds skip it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parked: BTreeMap<String, Vec<String>>,
+}
+
+/// File at the root of an export: what a training run needs to know about its frames beyond their
+/// boxes. A missing file means not known (exports of older versions).
+pub const FRAMES_FILE: &str = "frames.json";
+/// File at the root of an export: its rejected boxes ([`LabelFile::hard_negatives`]).
+pub const HARD_NEGATIVES_FILE: &str = "hard_negatives.json";
+/// Version [`frame_notes`] writes.
+pub const FRAMES_VERSION: u32 = 1;
+
+/// [`FRAMES_FILE`]: image file names ([`flat_name`]), sorted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameNotes {
+    pub version: u32,
+    /// Confirmed empty by a reviewer.
+    #[serde(default)]
+    pub empty_confirmed: Vec<String>,
+    /// Accepted in bulk: nobody looked at the frame on its own.
+    #[serde(default)]
+    pub bulk_accepted: Vec<String>,
+}
+
+/// The [`FrameNotes`] of `frames`.
+pub fn frame_notes(frames: &[ExportFrame]) -> FrameNotes {
+    let names = |keep: &dyn Fn(&LabelFile) -> bool| {
+        let mut v: Vec<String> = frames
+            .iter()
+            .filter(|f| keep(&f.labels))
+            .map(|f| f.name.clone())
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    FrameNotes {
+        version: FRAMES_VERSION,
+        empty_confirmed: names(&|l| l.empty_confirmed),
+        bulk_accepted: names(&|l| l.bulk_accepted),
+    }
 }
 
 /// `x` rounded to `d` decimals, as f64 (clean JSON numbers).
@@ -943,7 +987,8 @@ pub fn run_filtered(
         .collect();
     r.hard_negative_boxes = negatives.len();
     if !frames.is_empty() {
-        write_file(&out.join("hard_negatives.json"), &json_bytes(&negatives)?)?;
+        write_file(&out.join(HARD_NEGATIVES_FILE), &json_bytes(&negatives)?)?;
+        write_file(&out.join(FRAMES_FILE), &json_bytes(&frame_notes(&frames))?)?;
         let ignore = ignore_file(&frames);
         r.ignore_boxes = ignore.images.values().map(Vec::len).sum();
         write_file(&out.join(IGNORE_FILE), &json_bytes(&ignore)?)?;

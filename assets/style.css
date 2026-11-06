@@ -1178,6 +1178,10 @@ fieldset.tr-bal { margin: 0.4rem 0 0.2rem; }
 .tr-bal-drop { color: var(--warn-fg); }
 .tr-bal-legend { margin: 0.2rem 0 0.4rem; color: var(--muted); }
 .tr-bal-swatch { display: inline-block; width: 0.9rem; height: 0.55rem; border-radius: 2px; vertical-align: middle; }
+.tr-preflight { margin: 0.6rem 0; padding: 0.5rem 0.7rem; border-radius: 6px; border: 1px solid var(--border); overflow-wrap: anywhere; }
+.tr-pre-table { max-width: 36rem; }
+table.tr-pre-table th:nth-child(n+2), table.tr-pre-table td.num { width: 3.6rem; text-align: right; font-variant-numeric: tabular-nums; }
+.tr-files { margin: 0.2rem 0; }
 .tr-bal-tables { display: flex; flex-wrap: wrap; gap: 0.4rem 1.2rem; }
 .tr-bal-table { flex: 1 1 17rem; min-width: 0; max-width: min(100%, 40rem); }
 .tr-bal-h { margin: 0.4rem 0 0.2rem; font-size: 0.88rem; }
