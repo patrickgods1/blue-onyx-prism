@@ -1797,7 +1797,9 @@
     var cam = camOf(cur.frame), label = b.label;
     postJson('/v1/review/spots/parked', { frame: cur.frame, label: label, bbox: b.bbox }).then(function (j) {
       reloadSpots(cam);
-      say(j.new ? 'Parked spot saved: auto-label runs accept ' + label + ' here from now on. z undoes the box only; Forget this spot on the card removes the spot.' : 'This spot was already marked parked, since ' + j.spot.from + '.');
+      say(j.new ? 'Parked spot saved: auto-label runs accept ' + label + ' here from now on. ' : 'This spot was already marked parked, since ' + j.spot.from + '.');
+      // Right here: `t` moved on to the next box, and z undoes the accept but not the spot.
+      if (j.new) msg.appendChild(button('Forget this spot', function () { forgetSpot(j.spot); }, 'small secondary'));
     }).catch(function (e) { say('Accepted, but the spot was not saved: ' + e.message, true); });
     setState(i, 'accepted');
   }
