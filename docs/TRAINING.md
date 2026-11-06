@@ -1100,7 +1100,7 @@ so a Review save with a stale `revision` gets a 409 instead of overwriting merge
 | Option | Default | CLI | Script flag |
 |---|---|---|---|
 | Batch the VLM check: up to 8 of a frame's boxes per Qwen3-VL call | on | `--no-vlm-batch` | `--vlm-batch 8` (off: `1`) |
-| Skip the VLM check below a fused score (0 < x <= 1) | off (every eligible box) | `--vlm-min-score 0.2` | `--vlm-min-score X` |
+| Skip the VLM check below a fused score (0 < x <= 1); 2% of those boxes are asked anyway, to audit the cutoff | on, 0.15 | `--vlm-min-score X`, `--vlm-all-boxes` | `--vlm-min-score X --vlm-sample 0.02` |
 | Load the next frame on a background thread while the GPU works | on | `--no-prefetch` | `--prefetch` |
 | Keep finished frames if cancelled (both modes) | on | `--discard-on-cancel` | - |
 | GPU of the labelers (shown with more than one usable NVIDIA GPU) | automatic (most VRAM) | `--gpu cuda:N` | `--device cuda:N` |
@@ -1109,6 +1109,33 @@ The VLM flags are left out when the VLM is off. Measured per frame on an M1 (MPS
 call): Qwen3-VL check 7.6 s (about 1 s per box, ~8 boxes), MM-Grounding-DINO 1.9 s, RF-DETR 0.2 s,
 SigLIP 0.07 s; 89% of the checked boxes had a fused score below 0.2, which is what the minimum score
 skips (such a box is triaged without a VLM answer).
+
+### Measuring auto-label
+
+`scripts/research/eval_autolabel.py` scores the labelers' proposals against known boxes. Use it before
+changing a threshold, a prompt or the question the VLM is asked; it changes no label file.
+
+Measured on MM-Grounding-DINO tiny + RF-DETR L + Qwen3-VL 2B, the default 14 classes. A proposal is real
+when it has the label of a known box at IoU >= 0.5. *Public* is 588 frames of `coco-cctv`, `bmd45-cctv`,
+`exdark-night` and `nir-night`. *One camera* is 188 reviewed frames of a fixed overhead camera, nearly all
+people, so a figure there says nothing about vehicles or animals.
+
+| Proposals | Public: per frame, real | One camera: per frame, real |
+|---|---|---|
+| All | 7.24, 39% | 7.20, 13% |
+| Score >= 0.25, VLM yes | 2.74, 77% | 0.92, 96% |
+| The rest at score >= 0.15 | 2.59, 24% | 2.35, 1.8% |
+| Score < 0.15 | 1.91, 5.3% | 3.93, 0% |
+
+- **A VLM no ranks a box; it does not disprove one.** On public sets 40% of the boxes at score >= 0.25 it
+  said no to were real. Small, distant and dark objects are where it fails.
+- **One camera does not generalize.** Score >= 0.25 with a VLM yes hid 3% of the real objects on the fixed
+  camera, 25% on the public sets and 45% of the people on `exdark-night`.
+- **Score < 0.15** holds 3.6% of the real objects the labelers found on public sets, per class: `truck` 10.7%,
+  `cat` 5.1%, `bicycle` 5.0%, `motorcycle` 4.9%, `person` 3.1%, `car` 2.9%, `bird` 2.4%, `dog` 0%.
+- **The question matters.** The earlier "What is in this image: a person, a vehicle, ..., a plant, or
+  nothing?" called 75 of 171 real people `plant` (the same at batch size 1). "Is there a real person in this
+  image? Answer yes or no." said yes to 169 of 173 real objects and 50 of 1,352 false boxes on the same crops.
 
 **Cancel** while the frames are labelled, with *Keep finished frames* on: the frames finished so far
 are not thrown away. The labelers' script writes `proposals.jsonl` line by line (flushed per frame);
@@ -1187,10 +1214,11 @@ safetensors, the small files downloaded and hashed) and downloaded by the downlo
    Python 3 is on PATH, and by every auto-label run). A class only MM-Grounding-DINO knows
    (`raccoon`) is fused over it alone; a box only one of two labelers found keeps half its score.
    Each box records each labeler's score (`labelers`) and whether both found it (`agree`).
-4. **Checks**: Qwen3-VL answers "What is in this image: a person, a vehicle, an animal, a statue, a
-   rock, a plant, or nothing? Answer with one word." for the crop (20% padding, at most 448 px) of
-   every person box and every single-labeler box of the person / vehicle / animal classes; the
-   answer is compared with the class's category (`vlm`). SigLIP 2 ranks the animal classes on the crop
+4. **Checks**: Qwen3-VL answers "Is there a real <label> in this image? Answer yes or no." for the
+   crop (20% padding, at most 448 px) of every box at or above `--vlm-min-score` (default 0.15), plus
+   2% of the boxes below it for the audit (`vlm`, with `expected: "yes"`). A reply that is neither yes
+   nor no leaves the box unchecked, never a no. Older label files hold the earlier seven-way answer
+   (`plant`, expected `person`), which still loads and shows. SigLIP 2 ranks the animal classes on the crop
    (prompt ensembles; at night "an infrared night-vision photo of a ...") and stores the probabilities
    (`species_scores`).
 5. **Triage** (the service, `training::autolabel::triage`): `accept` only when both labelers agree, the
@@ -1304,8 +1332,8 @@ boxes stay as they are. On a reviewed frame the run adds a proposal only when it
 object: the labelers agree, or one of them scored it 0.5 or more and Qwen3-VL said yes to it; no check
 (Qwen3-VL, SigLIP 2) objected; and it does not sit on a box you decided as another class or on one you
 rejected. A check that did not run counts for nothing: a box only one labeler found cannot reopen a frame
-at any score when the VLM is off, when *Skip boxes scoring below* skipped it, or when its class is one the
-VLM is never asked about (anything but a person, vehicle or animal class). The report counts these as
+at any score when the VLM is off, when *Skip boxes scoring below* skipped it, or when its reply was unclear.
+The report counts these as
 `filtered_unchecked`, which also takes in such boxes that only repeat one already on the frame. In a real
 run with both checks off, 22 of 41 reviewed frames reopened, mostly on false boxes; with them on, 0 of 16.
 A frame that gains a box goes back to **unreviewed** with a note ("re-label by sam3: ...") and **leaves

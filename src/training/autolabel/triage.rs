@@ -99,20 +99,7 @@ pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<Stri
     if let Some(v) = &p.vlm
         && !v.ok
     {
-        why.push(format!(
-            "{} says {} (expected {})",
-            if v.model.is_empty() {
-                "the VLM"
-            } else {
-                &v.model
-            },
-            if v.answer.is_empty() {
-                "nothing"
-            } else {
-                &v.answer
-            },
-            v.expected
-        ));
+        why.push(vlm_objection(p, v));
     }
     if let Some((top, s)) = siglip_objection(&p.label, &p.species_scores) {
         why.push(format!("SigLIP ranks {top} first ({s:.2})"));
@@ -122,6 +109,25 @@ pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<Stri
     } else {
         (Triage::Review, why)
     }
+}
+
+/// A VLM "no" as a reason. `expected: "yes"` marks the yes/no question; label files of older runs
+/// hold the seven-way answer (`plant`, expected `person`), which the Review page still shows.
+fn vlm_objection(p: &Proposal, v: &VlmOut) -> String {
+    let who = if v.model.is_empty() {
+        "the VLM"
+    } else {
+        &v.model
+    };
+    if v.expected == "yes" {
+        return format!("{who} sees no {}", p.label);
+    }
+    let answer = if v.answer.is_empty() {
+        "nothing"
+    } else {
+        &v.answer
+    };
+    format!("{who} says {answer} (expected {})", v.expected)
 }
 
 /// The species SigLIP ranks first when that is not `label`: an objection to the box's class.
@@ -809,9 +815,9 @@ fn labelers_path(f: &LabelFile) -> LabelersPath {
 /// another object ([`apply_missing`] compares boxes of one object only, so a `dog` on an accepted
 /// `cat` would pass it) and on no [`unjudged_reject`] (which [`apply_missing`] would overwrite: on a
 /// labelers run a rejected box never changes, `--missing-only` is the run that may replace one), and
-/// a box only one labeler found has a VLM yes. A check that did not run is no evidence: `--vlm off`,
-/// a box under `--vlm-min-score` (`vlm_skipped`, which no field here reads) and a class outside the
-/// VLM's answers all leave `vlm` empty, and such a lone box cannot reopen a frame at any score.
+/// a box only one labeler found has a VLM yes. A check that did not run or gave no clear answer is
+/// no evidence: `--vlm off`, a box under `--vlm-min-score` and an unclear reply (`vlm_skipped`, which
+/// no field here reads) all leave `vlm` empty, and such a lone box cannot reopen a frame at any score.
 fn gate_drop(f: &LabelFile, p: &LabelBox) -> Option<GateDrop> {
     let lone = p.auto.agree != Some(true);
     let best = p.auto.labelers.values().copied().fold(0.0, f32::max);
@@ -2152,6 +2158,36 @@ mod tests {
         assert_eq!(at[0].score, Some(0.25));
         assert_eq!(apply_labelers(&mut f, at, "sam3").missing.added, 1);
         assert_eq!(f.status, Status::Unreviewed);
+    }
+
+    #[test]
+    fn a_vlm_no_reads_by_the_question_that_was_asked() {
+        let mut p = sam("person", CAR, 0.9);
+        p.vlm = Some(VlmOut {
+            model: "qwen3-vl-2b".into(),
+            answer: "no".into(),
+            expected: "yes".into(),
+            ok: false,
+        });
+        let (t, why) = triage(&p, "day", ACCEPT_SCORE);
+        assert_eq!(t, Triage::Review);
+        assert!(
+            why.iter().any(|w| w == "qwen3-vl-2b sees no person"),
+            "{why:?}"
+        );
+        // A label file of an older run keeps its seven-way wording.
+        p.vlm = Some(VlmOut {
+            model: "qwen3-vl-2b".into(),
+            answer: "plant".into(),
+            expected: "person".into(),
+            ok: false,
+        });
+        let (_, why) = triage(&p, "day", ACCEPT_SCORE);
+        assert!(
+            why.iter()
+                .any(|w| w == "qwen3-vl-2b says plant (expected person)"),
+            "{why:?}"
+        );
     }
 
     #[test]

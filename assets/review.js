@@ -1002,7 +1002,9 @@
         (b.agree === false && names.length < 2 ? ' (one labeler)' : ''));
     } else if (b.agree === false) parts.push('one labeler');
     if (b.vlm) {
-      parts.push((b.vlm.model || 'VLM') + ': ' + (b.vlm.answer || 'nothing') +
+      // `expected: yes`: the yes/no question. Older label files hold a one-word answer.
+      if (b.vlm.expected === 'yes') parts.push((b.vlm.model || 'VLM') + (b.vlm.ok ? ': yes' : ' sees no ' + b.label));
+      else parts.push((b.vlm.model || 'VLM') + ': ' + (b.vlm.answer || 'nothing') +
         (b.vlm.ok ? '' : (b.vlm.expected ? ' (expected ' + b.vlm.expected + ')' : ' (!)')));
     }
     if (b.species_scores) {
