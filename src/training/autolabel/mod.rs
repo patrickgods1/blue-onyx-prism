@@ -1,4 +1,4 @@
-//! Auto-labelling (`blue-onyx-prism train autolabel`, the Review and Training pages' Auto-label
+//! Auto-labelling (`blue-onyx-prism train autolabel`, the Auto-label tab's
 //! buttons; docs/TRAINING.md "Auto-label"): proposals for the frames of the dataset folder,
 //! written into their label files as pending `source: auto` boxes the reviewer accepts or
 //! rejects. Two modes:
@@ -29,7 +29,7 @@
 //! automatically, and hard negatives come from the reviewer: `apply_missing` removes rejected boxes
 //! only when no reviewer judged them.
 //!
-//! - [`catalog`]: the class catalog of the Review page's picker, [`catalog::coco_class`] and
+//! - [`catalog`]: the class catalog of the Review tab's picker, [`catalog::coco_class`] and
 //!   the classes the enabled models report.
 //! - [`triage`]: pure: the triage rule, proposals to label boxes, the re-label disagreement.
 //! - [`models`]: the models a run can use (`GET /v1/autolabel/models`) and how a chosen one
@@ -217,7 +217,7 @@ impl VlmSize {
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
 /// `label` (any of several classes, separated by `|`: `label=person|car`), `status`, `source`,
 /// `auto`; `auto=overlaps` and `auto=both` need [`Filters::wanted`], which [`AutolabelJob`] sets
-/// from the config as the Review page does), `import=<id>|any` (imported frames), `again=1` (also
+/// from the config as the Review tab does), `import=<id>|any` (imported frames), `again=1` (also
 /// frames these labelers already looked at, see [`crate::collect::labels::AutoRun`]) and `limit`
 /// (most frames, in queue order). Written `key=value` pairs separated by commas
 /// (`scene=ir,status=unreviewed,limit=20`).
@@ -478,7 +478,7 @@ impl AutolabelRequest {
         if self.missing_only && self.with_model.is_none() {
             bail!(
                 "finding missing labels needs a trained model to look with: add --with-model \
-                 <name> (Training page: Label with a model)"
+                 <name> (Auto-label tab, Advanced: Label with a model)"
             );
         }
         if self.missing_only && self.model_accept_score.is_some() {
@@ -576,7 +576,7 @@ fn sam3_problem(parts_on_disk: bool, lookup: &Lookup, login: &LoginCommand) -> O
     Some(format!(
         "SAM 3 is not installed, and its download needs a Hugging Face login. {why}. Request access \
          on {} ({}), then sign in: {} ({}). Then rerun with --allow-large, or download it from the \
-         Training page's SAM 3 panel",
+         Auto-label tab's SAM 3 panel",
         gated.repo_url, gated.license, login.command, login.note,
     ))
 }
@@ -584,7 +584,7 @@ fn sam3_problem(parts_on_disk: bool, lookup: &Lookup, login: &LoginCommand) -> O
 /// The part of a plan that decides a run's frames, and what the preview shares with the run: no
 /// GPU, login or download gate applies. A `missing_only` run looks at every status and every frame
 /// of the folder (`status=any`, `source=all`: the job keeps [`triage::missing_scope`]; the default
-/// `unreviewed`, or the Review page's `source=queue`, would miss the reviewed frames), and the
+/// `unreviewed`, or the Review tab's `source=queue`, would miss the reviewed frames), and the
 /// default limit and threshold become [`MAX_LIMIT`] and [`MISSING_THRESHOLD`] (any other value is
 /// used as given). Fails on a bad filter or an unknown class or model.
 fn scoped_job(config: &Config, mut request: AutolabelRequest) -> Result<AutolabelJob> {
@@ -680,7 +680,7 @@ pub fn plan_autolabel(
             let (dl, _) = a.lane().estimate();
             bail!(
                 "the auto-labelers run in the training environment (about {} download); rerun \
-                 with --allow-large (Training page: tick the download confirmation)",
+                 with --allow-large (Train area: tick the download confirmation)",
                 res_catalog::format_size(dl)
             );
         }
@@ -837,7 +837,7 @@ fn check_model_install(
         && !confirm_license
     {
         bail!(
-            "{} is licensed {lic}; confirm that your use is covered (Training page: tick the \
+            "{} is licensed {lic}; confirm that your use is covered (Train area: tick the \
              licence confirmation; CLI: --confirm-license)",
             res.title
         );
@@ -858,7 +858,7 @@ fn check_model_install(
             .flatten();
         if res.is_large() || (plan.install == Some(models::Install::Export) && !ready) {
             bail!(
-                "installing {} downloads {}{}; allow the large download (Training page: tick \
+                "installing {} downloads {}{}; allow the large download (Train area: tick \
                  the download confirmation; CLI: --allow-large)",
                 res.title,
                 res_catalog::format_size(res.size()),
@@ -878,7 +878,7 @@ fn check_model_install(
 /// reviewer could not accept its boxes.
 pub fn run_classes(review_classes: &[String], requested: Option<&[String]>) -> Result<Vec<String>> {
     if review_classes.is_empty() {
-        bail!("no classes: set collect.classes (Review page, Classes)");
+        bail!("no classes: set collect.classes (Dataset tab, Classes)");
     }
     let Some(req) = requested.filter(|r| r.iter().any(|c| !c.trim().is_empty())) else {
         return Ok(review_classes.to_vec());
@@ -891,7 +891,7 @@ pub fn run_classes(review_classes: &[String], requested: Option<&[String]>) -> R
     if !unknown.is_empty() {
         bail!(
             "class(es) {} are not in collect.classes ({}); add them to the class list first \
-             (Review page, Classes)",
+             (Dataset tab, Classes)",
             unknown.join(", "),
             review_classes.join(", ")
         );
@@ -913,7 +913,7 @@ pub fn without_hidden(classes: Vec<String>, hidden: &[String]) -> Result<Vec<Str
     if kept.is_empty() {
         bail!(
             "class(es) {} are marked \"don't want\" in Review (collect.hidden_classes); untick it \
-             for a class to label (Review page, Classes) or pick another class",
+             for a class to label (Dataset tab, Classes) or pick another class",
             gone.join(", ")
         );
     }
@@ -928,7 +928,7 @@ pub fn without_hidden(classes: Vec<String>, hidden: &[String]) -> Result<Vec<Str
 
 /// The status filter of a run that does not name one: `unreviewed` for the labelers and for a
 /// model (first-pass labelling); self-training over reviewed frames is an explicit `status=any`
-/// (the Training page's preset).
+/// (the Train tab's preset).
 pub fn default_status(_with_model: bool) -> &'static str {
     "unreviewed"
 }

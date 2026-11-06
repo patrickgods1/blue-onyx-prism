@@ -1,4 +1,4 @@
-//! The Review page (`/review`, admin only) and its JSON API over the dataset collector's
+//! The Review tab (`/train/review`, admin only) and its JSON API over the dataset collector's
 //! frames ([`crate::collect::labels`]): `GET /v1/review/next` (the uncertainty-sorted queue
 //! with filters and counts), `GET`/`POST /v1/review/labels?frame=` (a frame's label file, or
 //! its pre-fill from the sidecar, with its revision; a save naming a stale revision is refused
@@ -48,7 +48,7 @@ use std::sync::Arc;
 pub(super) const LABELS_BODY_LIMIT: usize = 256 * 1024;
 /// Largest body of the other review POST routes.
 pub(super) const SMALL_BODY_LIMIT: usize = 16 * 1024;
-/// The folder of the page's default exports, `<UTC time>` under it unless `out_dir` is given: where the Training page looks for them
+/// The folder of the page's default exports, `<UTC time>` under it unless `out_dir` is given: where the Train tab looks for them
 /// ([`crate::training::discover_exports`]), so a custom `training.dir` moves it too.
 fn exports_dir(state: &AppState) -> std::path::PathBuf {
     crate::training::training_dir(&state.config_read()).join("exports")
@@ -126,17 +126,17 @@ fn now() -> String {
 }
 
 #[derive(Template)]
-#[template(path = "review.html")]
+#[template(path = "train/review.html")]
 struct ReviewTemplate {
     nav: &'static str,
+    tab: &'static str,
+    tab_title: &'static str,
     version: &'static str,
     dir: String,
     classes: Vec<String>,
     classes_json: String,
-    classes_text: String,
     buckets: Vec<&'static str>,
     scenes: Vec<&'static str>,
-    exports_dir: String,
     /// The dataset folder (the collector's; the default of the folder under review).
     dataset_dir: String,
     /// `dir` is another folder than the dataset folder.
@@ -199,24 +199,24 @@ pub(super) fn allowed_folder(
     if known { Ok(canon) } else { Err(err) }
 }
 
-/// `GET /review`.
+/// `GET /train/review`.
 pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
         let (dir, classes, _) = context(&state);
         let dataset = CollectSettings::for_config(&state.config_read()).dir;
         render(&ReviewTemplate {
-            nav: "review",
+            nav: "train",
+            tab: super::train_area::REVIEW,
+            tab_title: super::train_area::tab_title(super::train_area::REVIEW),
             version: crate::VERSION,
             dir: dir.display().to_string(),
             custom_dir: dir != dataset,
             known_dirs: known_dirs(&state, &dataset),
             dataset_dir: dataset.display().to_string(),
             classes_json: serde_json::to_string(&classes).unwrap_or_else(|_| "[]".into()),
-            classes_text: classes.join(", "),
             classes,
             buckets: Bucket::ALL.iter().map(|b| b.as_str()).collect(),
             scenes: layout::SCENES.to_vec(),
-            exports_dir: exports_dir(&state).display().to_string(),
         })
     })
     .await
@@ -647,7 +647,7 @@ pub(super) async fn reject_low(
 
 /// `GET /v1/review/history?camera=<c>`: the reviewer's decisions on that camera's frames in the
 /// folder under review (accepted / rejected model and auto boxes, not by a bulk rule; newest
-/// first, at most [`labels::repeats::HISTORY_CAP`], `truncated` past it), for the Review page's
+/// first, at most [`labels::repeats::HISTORY_CAP`], `truncated` past it), for the Review tab's
 /// "rejected here before" hint. Cached until a label file of the folder is written.
 pub(super) async fn history(
     State(state): State<Arc<AppState>>,
@@ -1629,7 +1629,7 @@ struct RejectUnwantedReviewedBody {
 /// `collect.classes`, or in `collect.hidden_classes`) rejected with `reason: other_class`; the
 /// frames stay reviewed ([`bulk::bulk_reject_unwanted`] with [`bulk::Scope::Reviewed`]), at most
 /// `limit` frames (default and most [`ACCEPT_AUTO_MAX_LIMIT`]). `dry_run` only counts: `eligible`
-/// frames, `boxes`, `classes` (their labels). The Review page asks before it calls this.
+/// frames, `boxes`, `classes` (their labels). The Review tab asks before it calls this.
 pub(super) async fn reject_unwanted_reviewed(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2225,7 +2225,7 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         // The page offers the dataset folder to go back to.
-        let (_, page) = get_text(&d.state, "/review").await;
+        let (_, page) = get_text(&d.state, "/train/review").await;
         assert!(page.contains("Back to the dataset folder"), "{page}");
         // A file, a missing folder, a folder outside the browsable ones: refused, unchanged.
         let outside = std::env::temp_dir().join(format!("bop-review-out-{}", uuid::Uuid::new_v4()));
@@ -2293,17 +2293,19 @@ mod tests {
             "20261022T010203004Z_near",
             0.52,
         );
-        let (s, page) = get_text(&d.state, "/review").await;
+        let (s, page) = get_text(&d.state, "/train/review").await;
         assert_eq!(s, StatusCode::OK);
         assert!(
             page.contains("class=\"active\" aria-current=\"page\">Review</a>"),
             "nav"
         );
         assert!(page.contains("/static/review.js"));
-        // Browse... on the export folder and the X-AnyLabeling folder (native picker, else the
-        // in-page browser of this dialog).
-        assert!(page.contains("data-browse=\"folder\" data-target=\"out_dir\""));
+        // Browse... on the folder under review (native picker, else the in-page browser of this
+        // dialog); the export and X-AnyLabeling folders are on the Dataset tab.
         assert!(page.contains("data-browse=\"folder\" data-target=\"dir\""));
+        let (_, data) = get_text(&d.state, "/train/dataset").await;
+        assert!(data.contains("data-browse=\"folder\" data-target=\"out_dir\""));
+        assert!(data.contains("data-browse=\"folder\" data-target=\"dir\""));
         assert!(page.contains("<dialog id=\"browse-dialog\">"));
         assert!(page.contains("/static/browse.js?v="));
         assert!(page.contains("raccoon"));
@@ -2312,11 +2314,11 @@ mod tests {
             "class filter"
         );
         assert!(
-            page.contains("Only frames with these classes"),
+            data.contains("Only frames with these classes"),
             "export class filter"
         );
         assert!(
-            page.contains("name=\"include_empty\" checked"),
+            data.contains("name=\"include_empty\" checked"),
             "include empty by default"
         );
 
@@ -2947,7 +2949,7 @@ mod tests {
             "{v}"
         );
 
-        // The raw filter text of the Review page's form.
+        // The raw filter text of the Review tab's form.
         let (st, v) = json(
             &d.state,
             post("frames=status%3Dreviewed%2Csource%3Dall%2Climit%3D5&limit=9&rfdetr=on"),

@@ -1,7 +1,7 @@
-//! Footage import (`blue-onyx-prism train import`, the Training page's Import card,
+//! Footage import (`blue-onyx-prism train import`, the Import tab,
 //! docs/TRAINING.md "Footage import"): frames from local videos, image folders (Blue Iris clip and
 //! alert folders), a video URL (yt-dlp) or pinned open footage (MEVA, CC BY 4.0) into the dataset
-//! folder, so they show on the Dataset and Review pages like collected frames.
+//! folder, so they show on the Collect and Review tabs like collected frames.
 //!
 //! Frame selection, in order:
 //! 1. FFmpeg's `select` scene-change filter at a bounded rate, plus one frame every few seconds
@@ -175,7 +175,7 @@ pub struct ImportRequest {
     #[serde(default)]
     pub hwaccel: HwAccel,
     /// Dataset folder the frames are written to (relative = under the data root; default
-    /// `collect.dir`, the folder the Dataset and Review pages show).
+    /// `collect.dir`, the folder the Collect and Review tabs show).
     #[serde(default)]
     pub out_dir: Option<PathBuf>,
 }
@@ -328,7 +328,7 @@ pub fn plan_import(
         let (dl, disk) = a.lane().estimate();
         bail!(
             "the import needs the training environment (PyTorch {}, PyAV, yt-dlp; about {} \
-             download, {} on disk under {}); rerun with --allow-large (Training page: tick the \
+             download, {} on disk under {}); rerun with --allow-large (Train area: tick the \
              download confirmation)",
             a.lane().as_str(),
             catalog::format_size(dl),

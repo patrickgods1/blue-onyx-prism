@@ -1,5 +1,5 @@
 //! `GET /v1/fs/browse`: a read-only, server-side file browser for the Config page's
-//! "Add a model by path" form, the Training page's footage import and the Dataset page's
+//! "Add a model by path" form, the Import tab and the Collect tab's
 //! folder picker (`kind=folder`: folders only). Lists folders plus model
 //! (`.onnx`/`.xml`), classes (`.yaml`/`.yml`) or, for the import picker only (`kind=video`),
 //! video (`.mp4`/`.mkv`/`.avi`/`.mov`) files, and only inside the roots the page offers ([`roots`]: the
@@ -41,7 +41,7 @@ pub(super) enum Kind {
     Classes,
     /// The footage import's picker: videos (folders of images are picked as folders).
     Video,
-    /// The Dataset page's folder picker: folders only, no files.
+    /// The Collect tab's folder picker: folders only, no files.
     Folder,
 }
 

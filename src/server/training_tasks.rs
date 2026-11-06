@@ -1,5 +1,5 @@
-//! The Training page's footage import and auto-label forms (`POST /training/import`,
-//! `POST /training/autolabel`, also posted by the Review page), the import preview
+//! The Import and Auto-label tabs' forms (`POST /training/import`,
+//! `POST /training/autolabel`, also posted by the Review tab), the import preview
 //! (`GET /v1/training/import/preview`, the line under the path field), the auto-label preview
 //! (`POST /training/autolabel/preview`, both pages' Preview button), the models an auto-label
 //! run can use (`GET /v1/autolabel/models`) and the rows of their jobs.
@@ -7,8 +7,9 @@
 //! [`crate::training::autolabel::plan_autolabel`]) and queued on the page's training queue
 //! (one GPU job at a time with the training runs). Admin only, like every training route. The
 //! auto-label form answers JSON (`{success, message, id}`) to a client that accepts
-//! `application/json` (the Review page's fetch), else the Training page.
+//! `application/json`, else the Auto-label tab.
 
+use super::train_area::{AUTOLABEL, IMPORT};
 use super::training::{all, field, num, service, view};
 use super::{AppState, Shared, blocking, render};
 use crate::config::Config;
@@ -175,8 +176,8 @@ pub(crate) fn import_from_form(f: &[(String, String)]) -> anyhow::Result<ImportR
 /// The frame-filter fields of the auto-label form, each a key of [`FrameFilter`].
 const FILTER_FIELDS: [&str; 6] = ["status", "scene", "camera", "label", "auto", "limit"];
 
-/// The frame filter text of an auto-label form: the raw `frames` text (the Training page's
-/// "Other filters", the Review page's and older forms' whole filter) followed by the structured
+/// The frame filter text of an auto-label form: the raw `frames` text (the Train tab's
+/// "Other filters", the Review tab's and older forms' whole filter) followed by the structured
 /// fields `status`, `scene`, `camera`, `label`, `auto`, `limit` and `again` (ticked = `again=1`)
 /// whose key the raw text does not already name. `label` is a comma list of classes (any of
 /// them), written `label=a|b`; a comma in another field's value is refused (it would split the
@@ -220,16 +221,16 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 }
 
 /// The auto-label run of a form: the frame filter ([`frame_filter_text`]), `mode` (`labelers`
-/// ignores `with_model`, `model` needs it; absent = `with_model` decides, as the Review page and
+/// ignores `with_model`, `model` needs it; absent = `with_model` decides, as the Review tab and
 /// older forms post), `gdino` (a size, or `sam3` for SAM 3 in its seat), `vlm` (`off` = none),
-/// `rfdetr` / `siglip` (ticked = on; the Review page's form sends them), `with_model` (any id of
+/// `rfdetr` / `siglip` (ticked = on; the Review tab's form sends them), `with_model` (any id of
 /// `GET /v1/autolabel/models`),
 /// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick) and, when
 /// `gdino` is `sam3`, `sam3_threshold` (empty = the default; ignored otherwise, so a stale value of
 /// a hidden field refuses nothing), and for a run with a model `device` (empty = the model's), `model_accept_score` (empty = off),
 /// `missing_only` (ticked = on); `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
 /// `vlm_batch`, `prefetch` and `vlm_min_on` (ticked = on; then `vlm_min_score` applies) count
-/// only when the form posts `run_options` (the Training page's card); without it (the Review
+/// only when the form posts `run_options` (the Train tab's card); without it (the Review
 /// page, older forms) they keep the request's defaults.
 pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<AutolabelRequest> {
     let with_model = match field(f, "mode") {
@@ -359,8 +360,8 @@ fn finish_from_form(
     };
     if folder && out_dir.is_none() {
         anyhow::bail!(
-            "show this folder on the Review page: give a folder in Save frames to (the default \
-             folder is the dataset folder the Review page shows already)"
+            "show this folder on the Review tab: give a folder in Save frames to (the default \
+             folder is the dataset folder the Review tab shows already)"
         );
     }
     let fin = Finish {
@@ -448,7 +449,7 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
                     }
                     format!(
                         "Queued: {title}, then {al_title}. The auto-label runs only when the \
-                         import finishes with new frames; its boxes appear on the Review page as \
+                         import finishes with new frames; its boxes appear on the Review tab as \
                          pending auto boxes."
                     )
                 }
@@ -456,21 +457,26 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
             };
             if switches {
                 msg.push_str(&format!(
-                    " The Review page switches to {out} when it is done."
+                    " The Review tab switches to {out} when it is done."
                 ));
             } else if shown {
-                msg.push_str(" The frames appear on the Dataset and Review pages when it is done.");
+                msg.push_str(" The frames appear on the Collect and Review tabs when it is done.");
             } else {
                 msg.push_str(&format!(
                     " The frames are written to {out}; to review them, choose that folder on the \
-                     Review page."
+                     Review tab."
                 ));
             }
             Ok(msg)
         })();
         match result {
-            Ok(m) => render(&view(&state, Some(m), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not imported: {e:#}")))),
+            Ok(m) => render(&view(&state, IMPORT, Some(m), None)),
+            Err(e) => render(&view(
+                &state,
+                IMPORT,
+                None,
+                Some(format!("Not imported: {e:#}")),
+            )),
         }
     })
     .await
@@ -552,7 +558,7 @@ fn wants_json(headers: &HeaderMap) -> bool {
         .any(|v| v.to_ascii_lowercase().contains("application/json"))
 }
 
-/// `POST /training/autolabel`: the Training page, or with `Accept: application/json` 200
+/// `POST /training/autolabel`: the Auto-label tab, or with `Accept: application/json` 200
 /// `{success: true, message, id}` (the task id, polled in `GET /v1/training` `tasks[]`) / 400
 /// `{success: false, message}`.
 pub(super) async fn autolabel(
@@ -577,13 +583,13 @@ pub(super) async fn autolabel(
                 .enqueue_task(Box::new(job))
                 .map_err(anyhow::Error::msg)?;
             let mut msg = format!(
-                "Queued: {title}. The boxes appear on the Review page as pending auto boxes when \
+                "Queued: {title}. The boxes appear on the Review tab as pending auto boxes when \
                  it is done."
             );
             if missing {
                 msg.push_str(
                     " A frame that gains a box leaves exports until you save it again on the \
-                     Review page.",
+                     Review tab.",
                 );
             }
             Ok((msg, id))
@@ -599,8 +605,13 @@ pub(super) async fn autolabel(
                 ),
             )
                 .into_response(),
-            (Ok((m, _)), false) => render(&view(&state, Some(m), None)),
-            (Err(e), false) => render(&view(&state, None, Some(format!("Not queued: {e:#}")))),
+            (Ok((m, _)), false) => render(&view(&state, AUTOLABEL, Some(m), None)),
+            (Err(e), false) => render(&view(
+                &state,
+                AUTOLABEL,
+                None,
+                Some(format!("Not queued: {e:#}")),
+            )),
         }
     })
     .await
@@ -843,13 +854,9 @@ mod tests {
         ]);
         let e = autolabel_from_form(&f).unwrap_err().to_string();
         assert!(e.contains("pre-accepts nothing"), "{e}");
-        for page in [
-            include_str!("../../templates/training.html"),
-            include_str!("../../templates/review.html"),
-        ] {
-            assert!(page.contains("name=\"missing_only\""));
-            assert!(page.contains("eaves exports until you save it again"));
-        }
+        let page = include_str!("../../templates/train/autolabel.html");
+        assert!(page.contains("name=\"missing_only\""));
+        assert!(page.contains("eaves exports until you save it again"));
         for (k, v) in [
             ("model_accept_score", "0.1"),
             ("model_accept_score", "1.5"),
@@ -887,14 +894,14 @@ mod tests {
 
     #[test]
     fn autolabel_run_options_parse_ticked_and_unticked() {
-        // The Review page and older forms post no run options: the defaults.
+        // The Review tab and older forms post no run options: the defaults.
         let r = autolabel_from_form(&form(&[("rfdetr", "on")])).unwrap();
         assert!(r.keep_on_cancel && r.vlm_batch && r.prefetch);
         assert_eq!(
             r.vlm_min_score,
             Some(crate::training::autolabel::SUGGESTED_VLM_MIN_SCORE)
         );
-        // The Training page with every box unticked (absent); the score alone is ignored.
+        // The Train tab with every box unticked (absent); the score alone is ignored.
         let r = autolabel_from_form(&form(&[
             ("rfdetr", "on"),
             ("run_options", "1"),
@@ -978,7 +985,7 @@ mod tests {
         assert_eq!(r.frames.import(), Some("any"));
         assert_eq!(r.frames.query["status"], "unreviewed");
         assert!(!r.frames.again());
-        // A key of the raw text wins over its field (the Review page sends both `limit`s).
+        // A key of the raw text wins over its field (the Review tab sends both `limit`s).
         let t = frame_filter_text(&form(&[
             ("frames", "scene=day,limit=50,again=1"),
             ("limit", "200"),
@@ -1062,10 +1069,15 @@ mod tests {
         .unwrap();
         let r2 = root.clone();
         let state = test_state_with(move |c| c.download_dir = Some(r2));
-        let (s, page) = get_text(&state, "/training").await;
+        let (s, page) = get_text(&state, "/train/import").await;
         assert_eq!(s, StatusCode::OK);
         assert!(page.contains("Import footage"), "the import card");
-        assert!(page.contains("Auto-label"), "the auto-label card");
+        let (s, label) = get_text(&state, "/train/autolabel").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(
+            label.contains("id=\"autolabel-form\""),
+            "the auto-label card"
+        );
         assert!(page.contains("meva-sample"));
         assert!(page.contains("/static/browse.js"));
         assert!(page.contains("import-preview"), "the preview line");
@@ -1616,7 +1628,7 @@ mod tests {
         .unwrap();
         let r2 = root.clone();
         let state = test_state_with(move |c| c.download_dir = Some(r2));
-        let (_, page) = get_text(&state, "/training").await;
+        let (_, page) = get_text(&state, "/train/import").await;
         assert!(page.contains("import-autolabel"), "the import card's box");
         assert!(page.contains("import-after"), "its follow-up options");
         let tasks = |state: Arc<AppState>| async move {

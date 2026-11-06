@@ -76,7 +76,7 @@ pub enum TrainCommand {
     /// stops once the validation mAP (or --select-metric) has not improved for --patience epochs
     /// and exports its best checkpoint. A running training can be finished early, keeping the
     /// best checkpoint, from
-    /// the Training page (Finish now) or by creating the file `<run dir>/work/stop-request`
+    /// the Train tab (Finish now) or by creating the file `<run dir>/work/stop-request`
     /// (the run dir is under the training folder, see `train list`). Ctrl-C cancels instead.
     Run {
         /// Model label, repeatable (runs one after the other): yolo26n, yolo11s, yolov8m,
@@ -185,7 +185,7 @@ pub enum TrainCommand {
     /// SigLIP 2), or re-label them with a trained model (--with-model).
     Autolabel(AutolabelArgs),
     /// Check the overlapping boxes of the folder under review with RF-DETR L on a crop of each pair
-    /// and write suggestions for you to confirm on the Review page. It changes no box, status or
+    /// and write suggestions for you to confirm on the Review tab. It changes no box, status or
     /// reviewed time.
     Overlaps(OverlapsArgs),
     /// List the runs recorded in the training folder.
@@ -277,7 +277,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub keep_work: bool,
     /// Dataset folder the frames are written to (default collect.dir, the folder the Dataset and
-    /// Review pages show; relative = under the data root).
+    /// Review tabs show; relative = under the data root).
     #[arg(long)]
     pub out_dir: Option<PathBuf>,
     /// Auto-label the imported frames when the import finished (the labelers with their
@@ -298,7 +298,7 @@ pub struct ImportArgs {
     /// `auto: accept` as reviewed.
     #[arg(long)]
     pub accept_auto: bool,
-    /// When done: point the Review page at --out-dir (collect.review_dir).
+    /// When done: point the Review tab at --out-dir (collect.review_dir).
     #[arg(long)]
     pub review_folder: bool,
     /// Print the helper's output.
@@ -335,7 +335,7 @@ pub fn import_chain(a: &ImportArgs) -> Result<ImportChain> {
     }
     if a.review_folder && a.out_dir.is_none() {
         bail!(
-            "--review-folder points the Review page at the import's folder; give it with \
+            "--review-folder points the Review tab at the import's folder; give it with \
              --out-dir (the default folder is the dataset folder the page shows already)"
         );
     }
@@ -375,7 +375,7 @@ pub struct AutolabelArgs {
     #[arg(long, default_value = "tiny")]
     pub gdino: String,
     /// SAM 3 in MM-Grounding-DINO's place (gated: request access and sign in first, see the
-    /// Training page's SAM 3 panel). Its boxes always go to review. Not with --gdino or
+    /// Auto-label tab's SAM 3 panel). Its boxes always go to review. Not with --gdino or
     /// --with-model.
     #[arg(long, conflicts_with = "gdino")]
     pub sam3: bool,
@@ -425,7 +425,7 @@ pub struct AutolabelArgs {
     #[arg(long)]
     pub device: Option<String>,
     /// Pre-accept --with-model's boxes at this score or more (at least --threshold): triaged
-    /// accept, so `POST /v1/review/accept-auto` and the Review page's bulk accept take them;
+    /// accept, so `POST /v1/review/accept-auto` and the Review tab's bulk accept take them;
     /// night / IR person and animal boxes stay in review. Default off (every box reviewed).
     #[arg(long)]
     pub accept_score_model: Option<f32>,

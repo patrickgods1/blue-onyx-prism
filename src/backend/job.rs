@@ -10,7 +10,7 @@
 //!
 //! [`Job::suspend`] pauses the whole tree (every thread of every process in the job, kept as
 //! open handles in [`Suspended`]) and [`Suspended::resume`] (or dropping it) continues it: the
-//! Training page's Pause / Resume. Windows has no documented "suspend a job" call, so the threads
+//! Train tab's Pause / Resume. Windows has no documented "suspend a job" call, so the threads
 //! are found with a ToolHelp snapshot.
 
 use anyhow::{Context, Result};

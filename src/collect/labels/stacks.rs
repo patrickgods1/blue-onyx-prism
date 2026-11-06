@@ -9,7 +9,7 @@
 //! a real object, so it is neither a hard negative ([`LabelFile::hard_negatives`]) nor a decision
 //! about the spot ([`super::repeats`]).
 //!
-//! Twin of the Review page's `dupGroups`, `rank` and `dupDrops` (`assets/review.js`): keep the
+//! Twin of the Review tab's `dupGroups`, `rank` and `dupDrops` (`assets/review.js`): keep the
 //! thresholds, the keeper rank and the tie break in step. One difference, on purpose: a box of no
 //! listed class that is not rejected counts as unwanted here, while the page keeps it (it shows
 //! such a box: a save refuses it until it is relabelled).

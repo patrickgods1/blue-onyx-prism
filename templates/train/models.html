@@ -1,0 +1,75 @@
+<div class="card" id="use" data-verifiers="{{ verifiers }}">
+  <h2>Use a trained model</h2>
+  {% include "revert.html" %}
+  {% if results.is_empty() %}<p class="muted">No trained model yet: finished runs from the <a href="/train/train">Train</a> tab show here, with their held-out benchmark.</p>{% else %}
+  <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark">Benchmark</a> page.</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Model</th><th>Family</th><th>Licence</th><th>Classes</th><th>Held-out benchmark</th><th>Use as</th></tr></thead>
+    <tbody>
+    {% for r in results %}
+    <tr>
+      <td><code>{{ r.name }}</code>{% if !r.in_config %} <span class="muted">(not in config)</span>{% endif %}<br><span class="muted small">{{ r.finished }}</span></td>
+      <td>{{ r.family }}</td>
+      <td>{{ r.license }}</td>
+      <td>{{ r.classes }}</td>
+      <td>{{ r.benchmark }}{% if !r.trained_on.is_empty() %} <span class="tag restart" title="A score on frames a model trained on says little about the frames it will see next.">{{ r.trained_on }}</span>{% endif %}{% if !r.compare.is_empty() %}<p class="tr-compare">{{ r.compare }}</p>{% endif %}{% if !r.warnings.is_empty() %}<ul class="warn-list small">{% for w in r.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}{% if !r.files.text.is_empty() %}<p class="muted small tr-files">{{ r.files.text }}.</p>{% endif %}</td>
+      <td>
+        {% if r.is_default %}<span class="tag now">Default now</span>{% endif %}
+        <form method="post" action="/training/use" class="inline" data-switch="{{ r.id }}"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="role" value="default"><input type="hidden" name="copy" value="1"><button type="submit" class="small">{% if r.is_default %}Threshold&hellip;{% else %}Use as default&hellip;{% endif %}</button></form>
+        <form method="post" action="/training/use" class="inline" data-use-as="{{ r.name }}"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="replace_verifier" value="">
+          <select name="role" aria-label="role"><option value="night">night model of</option><option value="verify">verifier of</option></select>
+          <select name="target" aria-label="target">{% for m in models %}{% if m != &r.name %}<option value="{{ m }}"{% if m == &default_model %} selected{% endif %}>{{ m }}</option>{% endif %}{% endfor %}</select>
+          <button type="submit" class="small">Apply</button>
+        </form>
+        <form method="post" action="/training/remove" class="inline"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="tab" value="{{ tab }}"><button type="submit" class="small">Remove from list</button></form>
+        {% if !r.files.size.is_empty() %}<form method="post" action="/training/remove" class="inline" data-confirm="{{ r.confirm }}"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="tab" value="{{ tab }}"><input type="hidden" name="delete_files" value="1"><button type="submit" class="small danger">Remove and delete files ({{ r.files.size }})</button></form>{% endif %}
+      </td>
+    </tr>
+    <tr class="tr-switch-row" hidden><td colspan="6"><div class="tr-switch" data-run="{{ r.id }}"></div></td></tr>
+    <tr class="tr-metrics-row" hidden><td colspan="6"><div class="tr-metrics" data-run="{{ r.id }}"></div></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</div>
+{% if !comparisons.is_empty() %}
+<div class="card" id="compare">
+  <h2>Comparison</h2>
+  <p class="muted small">Runs queued together with several scenes or seeds, benchmarked on the same held-out frames. AP50-95 per scene of the held-out frames (AP50 beneath); <strong>bold</strong> = the best of the column. Person R / Vehicle R / False alerts: what alerting sees at the model's confidence threshold, over every held-out frame (highest recall, lowest false-alert rate are best). The routed row pairs the day run's day AP with the night run's night / IR AP, as a model with a night model would score (no combined AP is made up). JSON: <code>/v1/training/compare?group=&lt;group&gt;</code>.</p>
+  {% for g in comparisons %}
+  <details class="tr-compare"{% if g.open %} open{% endif %}>
+    <summary>{{ g.group }} <span class="muted small">({{ g.rows.len() }} rows)</span>{% if !g.comparable %} <span class="chip chip-nc">not comparable</span>{% endif %}</summary>
+    {% if !g.comparable %}<p class="warn small">Not comparable: the held-out frames differ.</p>{% endif %}
+    {% if !g.warnings.is_empty() %}<ul class="warn-list small">{% for w in g.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
+    <div class="scroll">
+    <table class="tr-ctable">
+      <thead><tr><th>Run</th><th>Scene</th><th class="num" title="AP50-95 on the day frames of the held-out set (AP50 beneath)">Day</th><th class="num" title="AP50-95 on the night frames">Night</th><th class="num" title="AP50-95 on the IR frames">IR</th><th class="num" title="AP50-95 on every held-out frame">All</th><th class="num" title="AP50-95 on the held-out frames of the scenes the run trained on">In scope</th><th class="num" title="Time per image, median">p50 ms</th><th class="num" title="Recall of person on every held-out frame at the confidence threshold the model runs with (IoU 0.5)">Person R</th><th class="num" title="Recall of vehicles (car, truck, bus merged: a car found as a truck counts) on every held-out frame at the threshold">Vehicle R</th><th class="num" title="Held-out frames without any object that alerted at the threshold / all such frames; best = the lowest rate">False alerts</th><th>Epochs</th></tr></thead>
+      <tbody>
+      {% for r in g.rows %}
+      <tr{% if r.routed %} class="tr-routed"{% endif %}>
+        <td><code>{{ r.name }}</code><br><span class="muted small">{{ r.model }}{% if let Some(sd) = r.seed %} &middot; seed {{ sd }}{% endif %}{% if !r.state.is_empty() %} &middot; {{ r.state }}{% endif %}</span></td>
+        <td>{{ r.scene }}</td>
+        {% for c in r.cells %}<td class="num{% if c.best %} best-val{% endif %}"{% if c.images > 0 %} title="{{ c.images }} images"{% endif %}>{{ c.ap }}{% if !c.ap50.is_empty() %}<br><span class="muted small">AP50 {{ c.ap50 }}</span>{% endif %}</td>{% endfor %}
+        <td class="num">{{ r.in_scope }}</td>
+        <td class="num{% if r.ms_best %} best-val{% endif %}">{{ r.ms }}</td>
+        {% for c in r.alerts %}<td class="num{% if c.best %} best-val{% endif %}"{% if !c.title.is_empty() %} title="{{ c.title }}"{% endif %}>{{ c.text }}</td>{% endfor %}
+        <td class="small">{{ r.epochs }}</td>
+      </tr>
+      {% endfor %}
+      {% for sm in g.seed_summaries %}
+      <tr class="tr-routed">
+        <td><strong>{{ sm.label }}</strong><br><span class="muted small">{{ sm.model }}</span></td>
+        <td>{{ sm.scene }}</td>
+        {% for c in sm.cells %}<td class="num small">{{ c }}</td>{% endfor %}
+        <td class="small">mean (min&ndash;max)</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </details>
+  {% endfor %}
+</div>
+{% endif %}

@@ -131,7 +131,7 @@ pub enum Origin {
     VerifyFound,
 }
 
-/// Why the reviewer rejected a box (the Review page's reason chips): hard-negative mining keys,
+/// Why the reviewer rejected a box (the Review tab's reason chips): hard-negative mining keys,
 /// kept in `hard_negatives.json`. Separate from [`LabelBox::reason`] (provenance). A value this
 /// build does not know (a newer build's reason) loads as [`RejectReason::Other`] and is written
 /// back verbatim: a label file never fails to load over it, and a re-save does not lose it.
@@ -218,13 +218,13 @@ pub struct LabelBox {
     pub reason: Option<String>,
     /// The label the model or auto-labeler gave, when the reviewer relabeled the box, or the
     /// model's own spelling when an auto-label run mapped it onto the class list (`motorbike` for
-    /// a `motorcycle` box; the Review page shows "was motorbike").
+    /// a `motorcycle` box; the Review tab shows "was motorbike").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_label: Option<String>,
-    /// The proposed box before the reviewer moved or resized it (set by the Review page).
+    /// The proposed box before the reviewer moved or resized it (set by the Review tab).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orig_bbox: Option<[f32; 4]>,
-    /// The reviewer could not tell what the object is (PASCAL VOC `difficult`, Review page `d`):
+    /// The reviewer could not tell what the object is (PASCAL VOC `difficult`, Review tab `d`):
     /// an ignore region ([`LabelBox::is_ignore`]), an attribute in COCO. [`normalize`] clears it on
     /// a rejected box.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -292,7 +292,7 @@ pub struct AutoInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_score: Option<f32>,
     /// Likely real ([`crate::training::autolabel::triage::tier`]): a labelers run's box with a high
-    /// enough score and a VLM yes. Shown first on the Review page; `triage` stays `review` (that
+    /// enough score and a VLM yes. Shown first on the Review tab; `triage` stays `review` (that
     /// enum is strict, a new value would break older builds).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub likely: bool,
@@ -301,7 +301,7 @@ pub struct AutoInfo {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub audit: bool,
     /// A box dismissed at a rejected spot ([`bulk::SPOT_DISMISSED_REASON`]): the frames the reviewer
-    /// rejected that spot on. The Review page's "you rejected this spot N times".
+    /// rejected that spot on. The Review tab's "you rejected this spot N times".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spot_rejections: Option<u32>,
     /// A box a labelers run accepted at a parked spot ([`spots::PARKED_REASON`]): which spot.
@@ -484,7 +484,7 @@ pub struct LabelFile {
     /// frames first. Cleared when the frame is reviewed or skipped again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disagreement: Option<String>,
-    /// The last auto-label run over the frame (round-tripped by the Review page).
+    /// The last auto-label run over the frame (round-tripped by the Review tab).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_run: Option<AutoRun>,
     /// Saved by the bulk accept of auto-labels (`POST /v1/review/accept-auto`), not by a
@@ -498,7 +498,7 @@ pub struct LabelFile {
     pub repeat_spot: bool,
     /// The reviewer saved the frame with stacked or overlapping boxes still on it: they looked and
     /// kept them (two real nested cars). `auto=overlaps` passes the frame over and the bulk reject
-    /// leaves it alone ([`stacks`]). The Review page sets it on a reviewed save; [`merge_proposals`]
+    /// leaves it alone ([`stacks`]). The Review tab sets it on a reviewed save; [`merge_proposals`]
     /// clears it when a box is added (the look did not cover that box).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overlaps_checked: bool,
@@ -509,7 +509,7 @@ pub struct LabelFile {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub checked_before_reopen: bool,
     /// Suggestions for overlapping pairs from the overlap check ([`overlaps`], `train overlaps`), for
-    /// a reviewer to confirm: they change no box. Round-tripped by the Review page and kept by every
+    /// a reviewer to confirm: they change no box. Round-tripped by the Review tab and kept by every
     /// edit; one whose boxes moved or went is stale and ignored ([`overlaps::live`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlap_suggestions: Vec<overlaps::Suggestion>,
@@ -734,7 +734,7 @@ pub fn prefill(rec: &Record, classes: &[String], hidden: &[String]) -> LabelFile
 /// prediction or an auto-labeler box is accepted (the reviewer rejects false boxes rather than
 /// confirming each true one); a suppressed, below-threshold or verifier-found box is accepted
 /// when the auto-labelers confirmed it (`triage: accept`, no class suggestion), else rejected
-/// (it was not reported, so restoring it is an explicit decision). The Review page mirrors
+/// (it was not reported, so restoring it is an explicit decision). The Review tab mirrors
 /// this rule.
 pub fn resolve_pending(b: &LabelBox) -> BoxState {
     match (b.state, b.source, b.origin) {
@@ -1962,7 +1962,7 @@ mod tests {
         let off = serde_json::to_string(&old).unwrap();
         assert!(!off.contains("checked_before_reopen"), "{off}");
 
-        // The Review page sends back what it loaded, on any status.
+        // The Review tab sends back what it loaded, on any status.
         let f = LabelFile {
             disagreement: Some("re-label by sam3: 1 new box".into()),
             reviewed_at: Some("t".into()),

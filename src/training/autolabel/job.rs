@@ -121,7 +121,7 @@ impl std::fmt::Debug for AutolabelJob {
 /// The warning of a run's summary when it reopened frames: the review queue gets them back, the
 /// export takes reviewed frames only.
 pub(super) const REOPENED_WARNING: &str = "reopened frames leave exports until you save them \
-                                           again on the Review page";
+                                           again on the Review tab";
 
 /// A selected frame.
 #[derive(Debug, Clone)]
@@ -324,7 +324,7 @@ impl AutolabelReport {
         if self.dismissed + self.audit > 0 {
             s.push_str(&format!(
                 "; {} boxes below score {} hidden, {} more kept visible as a check of that filter \
-                 (hidden boxes stay in the label files: Show hidden on the Review page brings \
+                 (hidden boxes stay in the label files: Show hidden on the Review tab brings \
                  them back)",
                 self.dismissed,
                 triage::DISMISS_SCORE,
@@ -333,7 +333,7 @@ impl AutolabelReport {
         }
         if self.spot_dismissed > 0 {
             s.push_str(&format!(
-                "; {} boxes hidden at spots you rejected (Show hidden on the Review page brings \
+                "; {} boxes hidden at spots you rejected (Show hidden on the Review tab brings \
                  them back)",
                 self.spot_dismissed
             ));
@@ -431,7 +431,7 @@ impl AutolabelJob {
         if let Err(q) = crate::collect::layout::append_review(&self.dataset_dir, changed) {
             msg.push_str(&format!(
                 "; queueing them for review failed too ({q:#}), so find them with the frame \
-                 filters on the Review page"
+                 filters on the Review tab"
             ));
         }
         if rep.reopened > 0 {
@@ -463,7 +463,7 @@ impl AutolabelJob {
         self.select(skip, trained.as_ref())
     }
 
-    /// Every frame of the filter, in queue order, with the filter's `wanted` set as the Review page
+    /// Every frame of the filter, in queue order, with the filter's `wanted` set as the Review tab
     /// sets it, so `auto=overlaps` selects the same frames here and there. Frames are left out when
     /// `skip_labeler` (Some in labelers mode without `again=1`) already looked at them for every
     /// class of this run ([`labels::AutoRun::covers`]; a run for a class it did not look for
@@ -617,7 +617,7 @@ impl AutolabelJob {
             outcome = update(&mut file, rep);
             if outcome.write {
                 // Pending boxes of unwanted classes (an older pre-fill, a class hidden since):
-                // rejected, as the Review page's class change does.
+                // rejected, as the Review tab's class change does.
                 labels::bulk::reject_unwanted_proposals(&mut file, &wanted);
             }
             reopened = before != file.status && file.status == labels::Status::Unreviewed;
@@ -676,7 +676,7 @@ impl AutolabelJob {
         if frames.is_empty() && skipped > 0 {
             bail!(
                 "all {skipped} frame(s) matching {} were auto-labelled by {labeler} for these \
-                 classes already; add again=1 to the frame filter (Review page: tick \"Label \
+                 classes already; add again=1 to the frame filter (Review tab: tick \"Label \
                  again\") to label them again",
                 r.frames.describe()
             );
@@ -1507,8 +1507,8 @@ impl AutolabelJob {
         };
         let entry = models::entry_of(&config, plan).cloned().ok_or_else(|| {
             anyhow!(
-                "{} is not in the config (any more); choose the model again on the Training \
-                 page",
+                "{} is not in the config (any more); choose the model again on the Auto-label \
+                 tab",
                 plan.name
             )
         })?;

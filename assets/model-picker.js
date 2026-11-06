@@ -1,4 +1,4 @@
-// Blue Onyx Prism: model picker widget for the auto-label forms (Review and Training pages;
+// Blue Onyx Prism: model picker widget for the auto-label form (Auto-label tab;
 // served from /static/). ModelPicker.create(container, {onChange, selectName, deviceName})
 // fetches GET /v1/autolabel/models and renders a drop-down grouped "In config" / "Model files" /
 // "Downloadable / exportable" (name, family, class count, COCO, size, notes), a detail line, a
@@ -108,7 +108,7 @@
 
   // Threshold and limit of the form once "Find missing labels" is ticked (on) or unticked: a
   // value the user changed stays. The server applies the same defaults (plan_autolabel), for its
-  // own 0.3 and 200 only, so the Review page's lower limit has to change here.
+  // own 0.3 and 200 only, so a lower limit in the form has to change here.
   function missingDefaults(on, threshold, limit, savedLimit) {
     return {
       threshold: on ? (threshold === '0.3' ? '0.5' : threshold) : (threshold === '0.5' ? '0.3' : threshold),

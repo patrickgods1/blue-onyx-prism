@@ -1,4 +1,4 @@
-//! The class catalog behind the Review page's class picker (`GET /v1/review/class-catalog`):
+//! The class catalog behind the Review tab's class picker (`GET /v1/review/class-catalog`):
 //! every class name worth offering (the review list `collect.classes`, the auto-labeler's
 //! default phrases, its vehicle and animal names, the 80 COCO classes RF-DETR knows, and the
 //! classes of every configured model), each with its category, its prompt phrases, whether

@@ -412,14 +412,14 @@ pub fn refusal_message(refusal: Refusal, gated: &Gated, token: Option<TokenSourc
     match (refusal, token) {
         (Refusal::NeedsLogin, None) => format!(
             "Hugging Face asks for a login for this repo and no token is set up. Accept the {} \
-             at {}, then sign in with the hf-login command the Training page's SAM 3 panel shows \
+             at {}, then sign in with the hf-login command the Auto-label tab's SAM 3 panel shows \
              with its full path (a read-only token is enough) and try again",
             gated.license, gated.repo_url
         ),
         (Refusal::NeedsLogin, Some(s)) => format!(
             "Hugging Face refused the token from {} (expired, revoked or mistyped). Make a new \
-             read-only token at {TOKENS_URL}, sign in with the hf-login command the Training \
-             page's SAM 3 panel shows with its full path and try again",
+             read-only token at {TOKENS_URL}, sign in with the hf-login command the Auto-label \
+             tab's SAM 3 panel shows with its full path and try again",
             s.label()
         ),
         (Refusal::NeedsAccess, source) => format!(

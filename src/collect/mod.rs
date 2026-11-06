@@ -11,7 +11,7 @@
 //! waits and the reply is never delayed. One collector thread ([`store`]) decides the buckets
 //! ([`record::decide`]), applies sampling, per-camera rate limits and dHash dedup, writes the
 //! files atomically, maintains the per-day `index.jsonl` and the in-memory [`layout::Summary`]
-//! the Dataset page shows, applies the caps through [`crate::retention::prune_dataset`] and
+//! the Collect tab shows, applies the caps through [`crate::retention::prune_dataset`] and
 //! stops on low free space or a full disk until space is back. [`health`] turns its counts into
 //! what the pages say.
 //!
@@ -207,7 +207,7 @@ pub struct Frame {
     pub record: Draft,
 }
 
-/// What the Dataset page reads of the collector.
+/// What the Collect tab reads of the collector.
 #[derive(Debug, Clone, Default)]
 pub struct Status {
     /// Folder the summary describes (None: nothing collected or scanned yet).

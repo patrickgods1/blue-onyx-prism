@@ -50,7 +50,7 @@ pub const NEVER_DISMISSED: [&str; 1] = ["truck"];
 /// One box in this many that would be dismissed stays visible, so that the filter can be checked
 /// (about 2%).
 pub const AUDIT_ONE_IN: u32 = 50;
-/// The reason an audit sample shows on the Review page.
+/// The reason an audit sample shows on the Review tab.
 pub const AUDIT_WHY: &str = "audit sample: normally hidden";
 /// Fused score from which a box stays visible at a rejected spot, whatever the spot's record:
 /// a real object at a bad spot on an unlucky frame.
@@ -137,7 +137,7 @@ pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<Stri
 }
 
 /// A VLM "no" as a reason. `expected: "yes"` marks the yes/no question; label files of older runs
-/// hold the seven-way answer (`plant`, expected `person`), which the Review page still shows.
+/// hold the seven-way answer (`plant`, expected `person`), which the Review tab still shows.
 fn vlm_objection(p: &Proposal, v: &VlmOut) -> String {
     let who = if v.model.is_empty() {
         "the VLM"
@@ -894,7 +894,7 @@ fn gate_drop(f: &LabelFile, p: &LabelBox) -> Option<GateDrop> {
     None
 }
 
-/// The reason a box past the gate carries on the Review page.
+/// The reason a box past the gate carries on the Review tab.
 fn gate_reason(p: &LabelBox) -> String {
     let best = p.auto.labelers.iter().max_by(|a, b| a.1.total_cmp(b.1));
     match best {
@@ -946,7 +946,7 @@ fn vote(f: &mut LabelFile, proposals: &[LabelBox], existing: usize) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     /// Too unlikely to show: rejected with [`labels::bulk::DISMISSED_REASON`], recoverable on the
-    /// Review page.
+    /// Review tab.
     Dismissed,
     /// Would be dismissed, but [`audit_sample`] keeps it visible to check the filter.
     Audit,

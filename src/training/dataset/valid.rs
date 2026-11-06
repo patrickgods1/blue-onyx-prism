@@ -153,7 +153,7 @@ fn whole_groups(
     by_key.remove(&format!("{UNKNOWN}/{UNKNOWN}"));
     if by_key.is_empty() {
         return Err(format!(
-            "no frame has a camera or day tag: {FRAME_SPLIT}; train from a Review page export, \
+            "no frame has a camera or day tag: {FRAME_SPLIT}; train from a Dataset tab export, \
              or tag the frames (camera: and date: tags in manifest.json)"
         ));
     }

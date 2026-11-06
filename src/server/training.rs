@@ -1,4 +1,4 @@
-//! The Training page (`/training`, admin only, docs/TRAINING.md): what this machine can train
+//! The Import, Auto-label, Train and Models tabs (`/train/...`, admin only, docs/TRAINING.md): what this machine can train
 //! (capability, environment state), the dataset picker (review export folders), the family /
 //! size picker with estimates and hardware fit, the run queue with live progress
 //! (`assets/training.js` polls `GET /v1/training`), finished runs with their benchmark and the
@@ -9,6 +9,7 @@
 //! [`save_config`] (the `add-model` code) and benchmark it on its held-out frames with the
 //! generation's benchmark runner, both on the generation current at that moment.
 
+use super::train_area::{AUTOLABEL, IMPORT, MODELS, TRAIN, jobs_tab, tab_title};
 use super::{AppState, Shared, blocking, render, save_config};
 use crate::resources::catalog::{self, Platform};
 use crate::resources::export::train::{self as env, TrainPaths};
@@ -617,15 +618,41 @@ impl BalanceView {
 
 struct DatasetRow {
     path: String,
+    /// When it was exported, or the folder's name ([`super::train_area::ExportRow`]).
+    when: String,
+    /// Its frames, when it has an export report.
+    frames: Option<u64>,
+    /// "17 train, 9 held out".
+    split: String,
+    /// "person 27, bicycle 1".
+    classes: String,
     exists: bool,
     /// In `training.datasets` (else found under `<training dir>/exports`).
     saved: bool,
 }
 
+impl DatasetRow {
+    fn of(path: String, dir: &std::path::Path, exists: bool, saved: bool) -> Self {
+        let r = super::train_area::export_row(dir);
+        Self {
+            path,
+            when: r.when,
+            frames: r.frames,
+            split: r.split,
+            classes: r.classes,
+            exists,
+            saved,
+        }
+    }
+}
+
 #[derive(Template)]
-#[template(path = "training.html")]
+#[template(path = "train/training.html")]
 pub(super) struct TrainingTemplate {
     nav: &'static str,
+    /// The tab of the Train area this renders ([`super::train_area::TABS`]).
+    tab: &'static str,
+    tab_title: &'static str,
     version: &'static str,
     message: Option<String>,
     error: Option<String>,
@@ -713,7 +740,7 @@ pub(super) struct TrainingTemplate {
     footage: Vec<super::training_tasks::FootageRow>,
     dataset_dir: String,
     /// Imports listed in the folder auto-label runs on (`collect.resolved_review_dir`, the
-    /// Review page's folder), so their Auto-label buttons find the frames.
+    /// Review tab's folder), so their Auto-label buttons find the frames.
     imports: Vec<crate::training::import::write::ImportLine>,
     /// That folder.
     imports_dir: String,
@@ -1004,18 +1031,20 @@ fn latency_parts(hint: &'static str) -> (&'static str, &'static str) {
 
 pub(super) fn view(
     state: &AppState,
+    tab: &'static str,
     message: Option<String>,
     error: Option<String>,
 ) -> TrainingTemplate {
     let all = runs(state);
     let cap = crate::training::capability_with_runs(&all);
-    view_with(state, message, error, all, cap)
+    view_with(state, tab, message, error, all, cap)
 }
 
 /// [`view`] of the run records `all` on `cap` (tests pass their own, so the page does not
 /// depend on the machine they run on).
 fn view_with(
     state: &AppState,
+    tab: &'static str,
     message: Option<String>,
     error: Option<String>,
     all: Vec<RunRecord>,
@@ -1220,7 +1249,7 @@ fn view_with(
             ]);
             // Never a reason for the box on its own: the page offers SAM 3 once it is installed.
             let sam3 = if missing(&[catalog::SAM3_KEY]) > 0 {
-                "; SAM 3 has its own download above"
+                "; SAM 3 has its own download under Advanced"
             } else {
                 ""
             };
@@ -1329,7 +1358,9 @@ fn view_with(
     let tasks_busy = task_rows.iter().any(|t| t.busy);
     let jobs_busy = tasks_busy || all.iter().any(|r| r.state.is_busy());
     TrainingTemplate {
-        nav: "training",
+        nav: "train",
+        tab,
+        tab_title: tab_title(tab),
         version: crate::VERSION,
         message,
         error,
@@ -1353,20 +1384,15 @@ fn view_with(
                 .training
                 .datasets
                 .iter()
-                .map(|d| DatasetRow {
-                    path: d.display().to_string(),
-                    exists: config.data_path(d).is_dir(),
-                    saved: true,
+                .map(|d| {
+                    let dir = config.data_path(d);
+                    DatasetRow::of(d.display().to_string(), &dir, dir.is_dir(), true)
                 })
                 .collect();
             for d in crate::training::discover_exports(&config) {
                 let path = d.display().to_string();
                 if !v.iter().any(|r| r.path == path) {
-                    v.push(DatasetRow {
-                        path,
-                        exists: true,
-                        saved: false,
-                    });
+                    v.push(DatasetRow::of(path, &d, true, false));
                 }
             }
             v
@@ -1820,7 +1846,7 @@ pub(crate) fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
 }
 
 /// The dataset folders of a queue form: a ticked `dataset` is taken as is when it is one the
-/// page offers (`offered`: `training.datasets` and the Review page's exports), anything else and
+/// page offers (`offered`: `training.datasets` and the Review tab's exports), anything else and
 /// the typed `dataset_path` only when `allow` accepts it ([`super::browse::allowed_path`]: inside
 /// the browsable folders or picked in the native dialog), as the path it returns. Errors name the
 /// field.
@@ -1844,7 +1870,7 @@ pub(crate) fn checked_datasets(
     Ok(out)
 }
 
-/// The folders the Datasets list offers: `training.datasets`, then the Review page's exports.
+/// The folders the Datasets list offers: `training.datasets`, then the Review tab's exports.
 fn offered_datasets(config: &crate::config::Config) -> Vec<PathBuf> {
     let mut v = config.training.datasets.clone();
     v.extend(crate::training::discover_exports(config));
@@ -1878,9 +1904,24 @@ pub(crate) fn checked_folder(
     Ok(Some(p))
 }
 
-/// `GET /training`.
-pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
-    blocking(move || render(&view(&state, None, None))).await
+/// `GET /train/import`.
+pub(super) async fn import_tab(State(state): State<Arc<AppState>>) -> Response {
+    blocking(move || render(&view(&state, IMPORT, None, None))).await
+}
+
+/// `GET /train/autolabel`.
+pub(super) async fn autolabel_tab(State(state): State<Arc<AppState>>) -> Response {
+    blocking(move || render(&view(&state, AUTOLABEL, None, None))).await
+}
+
+/// `GET /train/train`.
+pub(super) async fn train_tab(State(state): State<Arc<AppState>>) -> Response {
+    blocking(move || render(&view(&state, TRAIN, None, None))).await
+}
+
+/// `GET /train/models`.
+pub(super) async fn models_tab(State(state): State<Arc<AppState>>) -> Response {
+    blocking(move || render(&view(&state, MODELS, None, None))).await
 }
 
 /// `GET /v1/training`: capability and runs as JSON (the page's poller).
@@ -1985,7 +2026,7 @@ pub(super) async fn dataset_classes(
 }
 
 /// The answers of [`crate::training::unreviewed_frames`] (it reads every label file): the form
-/// asks on every change, the count moves on the Review page's pace.
+/// asks on every change, the count moves on the Review tab's pace.
 static UNREVIEWED: std::sync::Mutex<Option<(PathBuf, std::time::Instant, Option<u64>)>> =
     std::sync::Mutex::new(None);
 const UNREVIEWED_TTL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2389,8 +2430,13 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
             Ok(format!("Queued: {}.", queued.join(", ")))
         })();
         match result {
-            Ok(m) => render(&view(&state, Some(m), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not queued: {e:#}")))),
+            Ok(m) => render(&view(&state, TRAIN, Some(m), None)),
+            Err(e) => render(&view(
+                &state,
+                TRAIN,
+                None,
+                Some(format!("Not queued: {e:#}")),
+            )),
         }
     })
     .await
@@ -2403,13 +2449,20 @@ pub(super) async fn cancel(
 ) -> Response {
     blocking(move || {
         let f = super::dataset::parse_form(&body);
+        let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
         let ok = SERVICE.get().is_some_and(|s| s.cancel(&id));
         if ok {
-            render(&view(&state, Some(format!("Cancelling run {id}.")), None))
+            render(&view(
+                &state,
+                tab,
+                Some(format!("Cancelling run {id}.")),
+                None,
+            ))
         } else {
             render(&view(
                 &state,
+                tab,
                 None,
                 Some(format!("No queued or running run {id}.")),
             ))
@@ -2426,14 +2479,20 @@ pub(super) async fn finish(
 ) -> Response {
     blocking(move || {
         let f = super::dataset::parse_form(&body);
+        let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
         let r = SERVICE
             .get()
             .ok_or_else(|| format!("no run {id}"))
             .and_then(|s| s.finish(&id));
         match r {
-            Ok(m) => render(&view(&state, Some(m), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not finished: {e}.")))),
+            Ok(m) => render(&view(&state, tab, Some(m), None)),
+            Err(e) => render(&view(
+                &state,
+                tab,
+                None,
+                Some(format!("Not finished: {e}.")),
+            )),
         }
     })
     .await
@@ -2456,6 +2515,7 @@ pub(super) async fn resume(
 async fn pause_or_resume(state: Arc<AppState>, body: axum::body::Bytes, pause: bool) -> Response {
     blocking(move || {
         let f = super::dataset::parse_form(&body);
+        let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
         let ok = SERVICE
             .get()
@@ -2463,15 +2523,26 @@ async fn pause_or_resume(state: Arc<AppState>, body: axum::body::Bytes, pause: b
         match (ok, pause) {
             (true, true) => render(&view(
                 &state,
+                tab,
                 Some(format!(
                     "Paused {id}: its processes are suspended (models stay loaded and GPU memory \
                      stays in use); nothing else starts until you resume or cancel it."
                 )),
                 None,
             )),
-            (true, false) => render(&view(&state, Some(format!("Resumed {id}.")), None)),
-            (false, true) => render(&view(&state, None, Some(format!("No running job {id}.")))),
-            (false, false) => render(&view(&state, None, Some(format!("No paused job {id}.")))),
+            (true, false) => render(&view(&state, tab, Some(format!("Resumed {id}.")), None)),
+            (false, true) => render(&view(
+                &state,
+                tab,
+                None,
+                Some(format!("No running job {id}.")),
+            )),
+            (false, false) => render(&view(
+                &state,
+                tab,
+                None,
+                Some(format!("No paused job {id}.")),
+            )),
         }
     })
     .await
@@ -2486,6 +2557,7 @@ pub(super) async fn retry_export(
     blocking(move || {
         let state = shared.current();
         let f = super::dataset::parse_form(&body);
+        let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
         let result = (|| -> anyhow::Result<String> {
             let svc = service(&shared);
@@ -2501,8 +2573,13 @@ pub(super) async fn retry_export(
             ))
         })();
         match result {
-            Ok(m) => render(&view(&state, Some(m), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not queued: {e:#}.")))),
+            Ok(m) => render(&view(&state, tab, Some(m), None)),
+            Err(e) => render(&view(
+                &state,
+                tab,
+                None,
+                Some(format!("Not queued: {e:#}.")),
+            )),
         }
     })
     .await
@@ -2514,6 +2591,7 @@ pub(super) async fn remove(State(shared): State<Shared>, body: axum::body::Bytes
     blocking(move || {
         let state = shared.current();
         let f = super::dataset::parse_form(&body);
+        let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
         if field(&f, "delete_files").is_some() {
             let config = state.config_read().clone();
@@ -2525,6 +2603,7 @@ pub(super) async fn remove(State(shared): State<Shared>, body: axum::body::Bytes
             return match done {
                 Ok(r) => render(&view(
                     &state,
+                    tab,
                     Some(format!(
                         "Removed run {} and deleted its files ({}).",
                         r.name,
@@ -2532,16 +2611,17 @@ pub(super) async fn remove(State(shared): State<Shared>, body: axum::body::Bytes
                     )),
                     None,
                 )),
-                Err(e) => render(&view(&state, None, Some(e))),
+                Err(e) => render(&view(&state, tab, None, Some(e))),
             };
         }
         match service(&shared).remove(&id) {
             Ok(()) => render(&view(
                 &state,
+                tab,
                 Some(format!("Removed run {id} from the list.")),
                 None,
             )),
-            Err(e) => render(&view(&state, None, Some(e))),
+            Err(e) => render(&view(&state, tab, None, Some(e))),
         }
     })
     .await
@@ -2594,8 +2674,13 @@ pub(super) async fn use_model(
             })
         })();
         match result {
-            Ok(m) => render(&view(&state, Some(format!("{message} {m}")), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not saved: {e:#}")))),
+            Ok(m) => render(&view(&state, MODELS, Some(format!("{message} {m}")), None)),
+            Err(e) => render(&view(
+                &state,
+                MODELS,
+                None,
+                Some(format!("Not saved: {e:#}")),
+            )),
         }
     })
     .await
@@ -2762,8 +2847,13 @@ pub(super) async fn datasets(
                 })
             });
         match result {
-            Ok(m) => render(&view(&state, Some(m), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not saved: {e:#}")))),
+            Ok(m) => render(&view(&state, TRAIN, Some(m), None)),
+            Err(e) => render(&view(
+                &state,
+                TRAIN,
+                None,
+                Some(format!("Not saved: {e:#}")),
+            )),
         }
     })
     .await
@@ -2784,6 +2874,7 @@ pub(super) async fn set_dir(
                 StatusCode::CONFLICT,
                 render(&view(
                     &state,
+                    TRAIN,
                     None,
                     Some(
                         "Not saved: a training run, import or auto-label job is queued or \
@@ -2828,8 +2919,13 @@ pub(super) async fn set_dir(
             })
         })();
         match result {
-            Ok(m) => render(&view(&state, Some(m), None)),
-            Err(e) => render(&view(&state, None, Some(format!("Not saved: {e:#}")))),
+            Ok(m) => render(&view(&state, TRAIN, Some(m), None)),
+            Err(e) => render(&view(
+                &state,
+                TRAIN,
+                None,
+                Some(format!("Not saved: {e:#}")),
+            )),
         }
     })
     .await
@@ -2843,6 +2939,7 @@ pub(super) async fn remove_env(State(state): State<Arc<AppState>>) -> Response {
                 StatusCode::CONFLICT,
                 render(&view(
                     &state,
+                    TRAIN,
                     None,
                     Some("A run is queued or running; cancel it first.".into()),
                 )),
@@ -2853,10 +2950,16 @@ pub(super) async fn remove_env(State(state): State<Arc<AppState>>) -> Response {
         match env::remove_train_env(&paths) {
             Ok(()) => render(&view(
                 &state,
+                TRAIN,
                 Some("Removed the training environment.".into()),
                 None,
             )),
-            Err(e) => render(&view(&state, None, Some(format!("Not removed: {e:#}")))),
+            Err(e) => render(&view(
+                &state,
+                TRAIN,
+                None,
+                Some(format!("Not removed: {e:#}")),
+            )),
         }
     })
     .await
@@ -3487,7 +3590,7 @@ mod tests {
                 ..Default::default()
             });
         });
-        for page in ["/", "/training"] {
+        for page in ["/", "/train/models"] {
             let (_, html) = get_text(&state, page).await;
             assert!(html.contains("Revert to ipcam-general"), "{page}");
             assert!(html.contains("action=\"/training/revert\""), "{page}");
@@ -3532,10 +3635,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let r2 = root.clone();
         let state = test_state_with(move |c| c.download_dir = Some(r2));
-        let (s, page) = get_text(&state, "/training").await;
+        let (s, page) = get_text(&state, "/train/train").await;
         assert_eq!(s, StatusCode::OK);
         assert!(
-            page.contains("class=\"active\" aria-current=\"page\">Training</a>"),
+            page.contains("href=\"/train\" class=\"active\" aria-current=\"page\">Train</a>"),
             "nav"
         );
         assert!(page.contains("This machine"));
@@ -3828,7 +3931,7 @@ mod tests {
         let (run, paused) = ("pause-test-running", "pause-test-paused");
         svc.put_task_record(rec(run, RunState::Running));
         svc.put_task_record(rec(paused, RunState::Paused));
-        let (s, page) = get_text(&state, "/training").await;
+        let (s, page) = get_text(&state, "/train/train").await;
         assert_eq!(s, StatusCode::OK);
         let row = |id: &str| {
             let i = page
@@ -4442,7 +4545,7 @@ mod tests {
         std::fs::write(dir.join("data/dataset.json"), "{}").unwrap();
         std::fs::write(dir.join("work/run/weights/best.pt"), vec![0u8; 3000]).unwrap();
         let cap = crate::training::capability::host_for_tests();
-        let page = view_with(&state, None, None, recs.clone(), cap.clone())
+        let page = view_with(&state, TRAIN, None, None, recs.clone(), cap.clone())
             .render()
             .unwrap();
         let row = page.split("<tr data-run=\"r9\"").nth(1).unwrap();
@@ -4468,7 +4571,9 @@ mod tests {
         assert!(row.contains("name=\"delete_files\""), "{row}");
         // The checkpoint gone: no button, the files line stays.
         std::fs::remove_dir_all(dir.join("work")).unwrap();
-        let page = view_with(&state, None, None, recs, cap).render().unwrap();
+        let page = view_with(&state, TRAIN, None, None, recs, cap)
+            .render()
+            .unwrap();
         let row = page.split("<tr data-run=\"r9\"").nth(1).unwrap();
         let row = row.split("tr-metrics-row").next().unwrap();
         assert!(!row.contains("/training/retry-export"), "{row}");
@@ -4507,9 +4612,10 @@ mod tests {
         });
         let page = view_with(
             &state,
+            TRAIN,
             None,
             None,
-            recs,
+            recs.clone(),
             crate::training::capability::host_for_tests(),
         )
         .render()
@@ -4575,9 +4681,20 @@ mod tests {
         );
         assert!(running.contains("data-action=\"extend-continue\""));
         assert!(queued.contains("data-ext=\"0\" hidden>"), "{queued}");
-        // The Comparison card: the newest group open, the routed row, the best cells.
-        let i = page.find("id=\"compare\"").expect("the Comparison card");
-        let card = &page[i..i + page[i..].find("id=\"use\"").unwrap()];
+        // The Comparison card, on the Models tab: the newest group open, the routed row, the best
+        // cells.
+        let models = view_with(
+            &state,
+            MODELS,
+            None,
+            None,
+            recs,
+            crate::training::capability::host_for_tests(),
+        )
+        .render()
+        .unwrap();
+        let i = models.find("id=\"compare\"").expect("the Comparison card");
+        let card = &models[i..];
         assert!(
             card.contains("<details class=\"tr-compare\" open>"),
             "{card}"
@@ -4628,11 +4745,11 @@ mod tests {
         assert!(page.contains("name=\"excluded\" value=\"drop-frame\""));
         // The per-run summary of a finished run: AP50-95 per scene and in scope.
         assert!(
-            page.contains("AP50-95 day 0.600 / night 0.200 / IR 0.100 \u{b7} in scope 0.600"),
+            models.contains("AP50-95 day 0.600 / night 0.200 / IR 0.100 \u{b7} in scope 0.600"),
             "the result row"
         );
         // The live page renders too, and the compare JSON answers 400 / 404.
-        let (s, _) = get_text(&state, "/training").await;
+        let (s, _) = get_text(&state, "/train/models").await;
         assert_eq!(s, StatusCode::OK);
         let (s, text) = get_text(&state, "/v1/training/compare").await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{text}");
@@ -4975,6 +5092,7 @@ mod tests {
         });
         let page = view_with(
             &state,
+            TRAIN,
             None,
             None,
             Vec::new(),

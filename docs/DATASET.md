@@ -2,7 +2,7 @@
 
 The collector saves frames that Blue Iris sends, together with what the model saw and did. Later stages
 use them: the review page, footage import, auto-labelling and training (plan, Phase 5). It is off by
-default. Turn it on with `collect.enabled` or on the **Dataset** page (`/dataset`). Every setting
+default. Turn it on with `collect.enabled` or on the **Collect** tab (`/train/collect`). Every setting
 applies at once; the README config table lists them.
 
 **Privacy:** the frames contain whatever your cameras see. They stay on this machine, in the dataset
@@ -203,7 +203,7 @@ file names `<UTC ms>_imp-<import id>-<n>.jpg`, and a version-1 sidecar with no d
 - The camera folder is `--camera`, else the Blue Iris camera of the file name, `meva-<site>-<camera>`
   for MEVA, a URL's host, or `import`.
 - The import appends its frames to `review-queue.jsonl` and one line to `<dir>/imports.jsonl` (id,
-  time, source, kind, licence, attribution, frames, cameras, frames per scene), which the Dataset page
+  time, source, kind, licence, attribution, frames, cameras, frames per scene), which the Collect tab
   lists. Imported frames have no bucket, so the scene x bucket table does not count them; the frame
   total and the camera table do.
 
@@ -217,23 +217,23 @@ One JSON object per line, appended when a frame is saved:
 
 - `bytes` is the image plus the sidecar.
 - When frames are deleted, retention rewrites the day's index atomically.
-- At startup, the service rebuilds the Dataset page's summary (counts by scene x bucket, by detected
+- At startup, the service rebuilds the Collect tab's summary (counts by scene x bucket, by detected
   class and per camera, bytes, the newest 8 frames per bucket) from the index files.
 
 ### Frames by detected class
 
-The Dataset page's **Frames by detected class** table counts frames per class and scene (`by_label`
+The Collect tab's **Frames by detected class** table counts frames per class and scene (`by_label`
 in `GET /v1/dataset`).
 
 - The classes are the `labels` of the index line: the reply's predictions at collection time, not
-  reviewed labels. Reviewed labels are counted on the Review page and in the export report.
+  reviewed labels. Reviewed labels are counted on the Dataset tab and in the export report.
 - A frame counts once per class, however many boxes of that class it has.
 - A frame without a prediction counts under `(none)`.
 - Rows are sorted by total frames, most first. `(none)` is last.
 
 ### `review-queue.jsonl`
 
-The Dataset page's **Send to review** appends one line per ticked frame that is not queued yet:
+The Collect tab's **Send to review** appends one line per ticked frame that is not queued yet:
 
 ```json
 {"version": 1, "frame": "ir/driveway/2026-10-22/<stem>.jpg", "sidecar": "ir/driveway/2026-10-22/<stem>.json", "id": "<stem>", "buckets": ["suppressed"], "scene": "ir", "camera": "driveway", "queued_at": "2026-10-22T13:00:00.000Z"}
@@ -259,12 +259,12 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
   a confirmed empty frame.
   - A frame with boxes waiting for review is kept too, because an auto-label run takes hours. Such
     frames can take the folder past `max_gb`; the disk guard still protects the volume, and the
-    Dataset page's disk line shows them.
+    Collect tab's disk line shows them.
   - A label file with nothing left to look at does not protect its frame. That covers an auto-label
     run that found nothing, boxes a labeler dismissed or accepted at a parked spot, and bulk rejects
     by score, by class or as a stacked duplicate.
   - A label file that cannot be read protects its frame, in case it holds a person's work.
-  - The size cap applies to the frames that can be deleted. The Dataset page's *Disk used* line shows
+  - The size cap applies to the frames that can be deleted. The Collect tab's *Disk used* line shows
     the total, the part that counts toward the cap and the protected reviewed data. The protected
     figure can lag a review by up to 10 minutes.
 - **Low disk:** if free space under the folder drops below 1 GB (`retention::MIN_FREE_MB`, the same
@@ -276,11 +276,11 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
     256 MB), checked every 30 seconds whether or not frames arrive. **Resume** on the page or a change
     to the `collect` settings restart it sooner. If free space cannot be read, only those two do.
 - **Other write errors** (permissions, a read-only folder) drop the frame (`reason="error"`) with a
-  throttled warning, and show as the last error on the Dataset page.
+  throttled warning, and show as the last error on the Collect tab.
 
 ## Is it working?
 
-The Dataset page's Status card and `GET /v1/dataset` (`collection`) answer this, so an unwritable folder
+The Collect tab's Status card and `GET /v1/dataset` (`collection`) answer this, so an unwritable folder
 does not look like a quiet camera. Counts start from zero when the service starts.
 
 - **Requests seen:** detection requests received, collection on or off. Test page uploads do not count.
@@ -315,7 +315,7 @@ marks the request itself.
 
 ## How the later stages use it
 
-- **Review page** (`/review`, see [Review labels](#review-labels)):
+- **Review tab** (`/train/review`, see [Review labels](#review-labels)):
   - reads `review-queue.jsonl` (or every indexed frame) and sorts it by uncertainty;
   - shows the `predictions`, `suppressed`, `below_threshold` and `verify.found` boxes from the sidecar;
   - writes `<stem>.labels.json` beside the frame; exports YOLO / COCO / X-AnyLabeling / a benchmark set.
@@ -342,14 +342,14 @@ marks the request itself.
 
 ## Review labels
 
-The **Review** page (`/review`, admin only like `/dataset`) shows one frame at a time with its boxes.
+The **Review** tab (`/train/review`, admin only like the rest of the Train area) shows one frame at a time with its boxes.
 Each decision is saved in `<stem>.labels.json` beside the sidecar. The sidecar is never changed.
 
 The page works on the dataset folder, or on another folder in the same layout (an import saved with
 *Save frames to* / `train import --out-dir`): *Folder under review* (a native folder picker, `POST
 /v1/review/folder` with `{dir}`, empty = back to the dataset folder) saves it as `collect.review_dir`.
 The queue, the label saves, the exports, the X-AnyLabeling import and auto-label runs then use that
-folder; the collector and the Dataset page keep `collect.dir`.
+folder; the collector and the Collect tab keep `collect.dir`.
 
 ### Label file (version 1)
 
@@ -391,12 +391,12 @@ folder; the collector and the Dataset page keep `collect.dir`.
   class list's spelling (pre-fill, auto-label runs, *Reject boxes of unwanted classes*).
 - **`orig_bbox`:** the proposed box before the reviewer moved or resized it (set by the page; checked
   and clamped like `bbox`, dropped when equal to it).
-- **`difficult`** (written only when true): the reviewer marked the box *unsure* (Review page `d`), a
+- **`difficult`** (written only when true): the reviewer marked the box *unsure* (Review tab `d`), a
   real object they cannot name for sure (PASCAL VOC `difficult`). It is an [ignore region](#ignore-regions):
   left out of the YOLO labels and listed in `ignore.json`, `ignore` in the benchmark manifest. It carries
   `"attributes": {"difficult": true}` in COCO and `difficult` in X-AnyLabeling (both ways). Cleared on a
   rejected box.
-- **`reject_reason`** (optional, rejected boxes only): why the reviewer rejected it (Review page,
+- **`reject_reason`** (optional, rejected boxes only): why the reviewer rejected it (Review tab,
   Shift+1-9 after `r`): `false_positive`, `duplicate`, `insect_web`, `rain_snow`, `ir_glare`,
   `reflection`, `static_object`, `other_object`, `too_small`. Absent = a plain false positive; a
   value this build does not know (a newer build's) loads and is written back unchanged (the API refuses
@@ -405,7 +405,7 @@ folder; the collector and the Dataset page keep `collect.dir`.
   button of the decision card, or its reason chip) also makes the box an
   [ignore region](#ignore-regions), and like `duplicate` it says nothing about the spot, so the repeats
   history and "rejected here N times" skip it. Frames reviewed earlier follow this without a rewrite.
-- **`reason: "auto_dismissed"`** (a *hidden* box on the Review page): a labelers run found the box at a
+- **`reason: "auto_dismissed"`** (a *hidden* box on the Review tab): a labelers run found the box at a
   fused score below 0.15 on a frame nobody had reviewed. Those boxes were 5% real on public sets and 0% on
   a fixed camera, so they do not take a reviewer's time ([docs/TRAINING.md](TRAINING.md#likely-unlikely-and-hidden-boxes)).
   The box is `rejected` so that it is no label and no live box, but nobody judged it: it is left out of
@@ -624,7 +624,7 @@ true`: `{success, eligible, accepted, failed: ["<frame>: <why>", ...], frames, m
 listed each).
 
 `POST /v1/review/reject-low` (JSON `{bucket?, scene?, camera?, label?, source?, min_score, dry_run,
-limit?}`, `min_score` required, 0.01..1; the Review page's *Reject auto boxes below*) takes the
+limit?}`, `min_score` required, 0.01..1; the Review tab's Bulk tools, *Reject auto boxes below*) takes the
 unreviewed frames of those filters and rejects their pending `source: auto` boxes scoring below
 `min_score` (`state: rejected`, `reason: "low_score"`); the frame's status, its other boxes and reviewed
 or skipped frames are left alone. `dry_run` answers `{success, eligible, boxes, rejected: 0, frames}`
@@ -638,7 +638,7 @@ same code (`collect/labels/bulk.rs`), scoped to the import's frames.
 A label is **unwanted** when it maps to no class of `collect.classes` (never listed, or removed) or to a
 class of `collect.hidden_classes` (the Classes card's *don't want (hide + reject)*; each a listed class,
 case-insensitive). Hiding keeps the class in the list, so exports and YOLO class ids do not change; it
-means "I do not review this class": the Review page leaves it out of its pickers and shortcuts and does
+means "I do not review this class": the Review tab leaves it out of its pickers and shortcuts and does
 not draw or list its boxes (nor rejected boxes of unlisted classes; they stay in the file, and a save
 from the page rejects pending model / auto boxes of a hidden class instead of resolving them), the
 pre-fill leaves its boxes out, auto-label runs leave it out of their classes (a run of hidden classes
@@ -657,7 +657,7 @@ reject button below, and when the auto-label form leaves listed classes unticked
 them: *Hide and auto-reject X, Y in Review? (Cancel = only skip them in this run)*).
 
 `POST /v1/review/reject-other-class` (JSON `{bucket?, scene?, camera?, label?, source?, dry_run,
-limit?}`; the Review page's *Reject boxes of unwanted classes*) takes the unreviewed frames of those
+limit?}`; the Review tab's Bulk tools, *Reject boxes of unwanted classes*) takes the unreviewed frames of those
 filters and, on each pending `source: model` or `source: auto` box whose label is not a wanted class in
 the list's spelling: when the label is a wanted class under another spelling (ignoring case, or a COCO /
 VOC alias such as `pottedplant` for `potted plant`), renames it to the list's spelling (still `pending`;
@@ -670,7 +670,7 @@ relabelled, rejected, failed, frames, message, reviewed_with_unwanted}` (`boxes`
 `relabelled` the renamed ones among them, `rejected` frames changed).
 
 `POST /v1/review/reject-stacked` (JSON `{bucket?, scene?, camera?, label?, source?, dry_run, limit?}`;
-the Review page's *Reject stacked duplicates*) walks every label file those filters select, reviewed
+the Review tab's Bulk tools, *Reject stacked duplicates*) walks every label file those filters select, reviewed
 frames too (`source` is checked but does not narrow it). A stack is boxes of one object (the same label,
 or two of car / truck / bus / van), neither rejected nor unwanted, at IoU >= 0.7; a chain is one stack.
 The keeper is the drawn box, else a reviewer-edited one, else an accepted one, else a pending one (a hint
@@ -687,7 +687,7 @@ on a better one the same way. A duplicate sits on a real object: it is left out 
 the rejected-box count and the per-camera repeat history.
 
 `POST /v1/review/suggest-overlaps` (JSON `{bucket?, scene?, camera?, label?, gpu?, allow_large?, again?,
-dry_run?}`; the Review page's *Suggest overlaps...*) queues the overlap check on the label files of the
+dry_run?}`; the Review tab's *Suggest overlaps...*) queues the overlap check on the label files of the
 folder under review those filters select, reviewed frames too. `dry_run` needs no GPU and answers
 `{success, frames, pairs, no_zoom, crops, answered, passed_over, message}`; otherwise `{success, message,
 id}`, the task's id in `GET /v1/training`. `GET /v1/review/labels` carries `overlap_live`, the indices of

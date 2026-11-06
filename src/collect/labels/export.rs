@@ -474,7 +474,7 @@ pub fn benchmark_manifest(frames: &[&ExportFrame], classes: &[String], id: &str)
     Manifest {
         id: id.to_string(),
         title: format!("Reviewed frames ({id})"),
-        description: "Frames collected from your cameras and reviewed on the Review page.".into(),
+        description: "Frames collected from your cameras and reviewed on the Review tab.".into(),
         license: "private: your own camera footage, do not share".into(),
         scored_labels: Some(classes.to_vec()),
         images: frames
@@ -539,7 +539,7 @@ impl ClassFilter {
         if let Some(l) = self.labels.iter().find(|l| !classes.contains(l)) {
             bail!(
                 "labels: '{}' is not in the class list ({}); pick classes from the list, or add \
-                 '{}' to the class list on the Review page first",
+                 '{}' to the class list on the Dataset tab first",
                 l.escape_debug(),
                 classes.join(", "),
                 l.escape_debug()
@@ -814,7 +814,7 @@ pub fn run_filtered(
             );
         }
         bail!(
-            "no reviewed frame to export in {}; review frames on the Review page first (save \
+            "no reviewed frame to export in {}; review frames on the Review tab first (save \
              them as reviewed)",
             dir.display()
         );
@@ -1357,7 +1357,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            e.contains("'unicorn' is not in the class list") && e.contains("Review page"),
+            e.contains("'unicorn' is not in the class list") && e.contains("Dataset tab"),
             "{e}"
         );
     }
@@ -1748,7 +1748,7 @@ mod tests {
     fn the_benchmark_set_defaults_to_held_out_frames() {
         assert_eq!(BenchSplit::default(), BenchSplit::Val);
         // The page starts there too, and offers the others with what they mean.
-        let page = include_str!("../../../templates/review.html");
+        let page = include_str!("../../../templates/train/dataset.html");
         assert!(page.contains(r#"<option value="val" selected>held-out frames"#));
         assert!(page.contains("all frames (includes training frames"));
     }

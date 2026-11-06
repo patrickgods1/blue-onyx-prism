@@ -121,7 +121,7 @@ pub fn default_skip_reason(dep: &TaskRecord) -> Option<String> {
     ))
 }
 
-/// One task as the Training page and the CLI show it.
+/// One task as the Train tab and the CLI show it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub id: String,

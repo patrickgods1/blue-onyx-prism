@@ -37,7 +37,7 @@ pub const DISMISSED_REASON: &str = "auto_dismissed";
 
 /// The reason of a box a labelers run dismissed because a reviewer rejected that spot of the
 /// camera again and again ([`super::spots`]). Every reader treats it as [`DISMISSED_REASON`]
-/// through [`is_dismissal`]; only the Review page's wording differs.
+/// through [`is_dismissal`]; only the Review tab's wording differs.
 pub const SPOT_DISMISSED_REASON: &str = "spot_dismissed";
 
 /// Whether `reason` marks a dismissal ([`DISMISSED_REASON`], [`SPOT_DISMISSED_REASON`]): the one
@@ -227,7 +227,7 @@ fn count_unwanted(f: &LabelFile, wanted: &Wanted<'_>, pick: Pick) -> (usize, usi
 
 /// The pending model and auto-labeler boxes of `f` of an unwanted class rejected (`reason:
 /// other_class`), those of a wanted class under another spelling renamed, whatever the frame's
-/// status (a save of the Review page, which does not show them, and the auto-label run's writes).
+/// status (a save of the Review tab, which does not show them, and the auto-label run's writes).
 /// Returns (rejected, renamed).
 pub fn reject_unwanted_proposals(f: &mut LabelFile, wanted: &Wanted<'_>) -> (usize, usize) {
     apply_unwanted(f, wanted, Pick::Proposals)
@@ -1221,7 +1221,7 @@ mod tests {
         );
         assert_eq!(f.boxes[4], before.boxes[4], "a human box is the reviewer's");
         assert_eq!(f.boxes[5], before.boxes[5], "a decided box stays");
-        // Whatever the status: the save of the Review page.
+        // Whatever the status: the save of the Review tab.
         let mut r = before.clone();
         r.status = Status::Reviewed;
         assert_eq!(reject_unwanted_proposals(&mut r, &w), (2, 1));

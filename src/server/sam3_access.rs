@@ -1,4 +1,4 @@
-//! SAM 3's gated download, for the Training page's panel. Admin only.
+//! SAM 3's gated download, for the Auto-label tab's panel. Admin only.
 //!
 //! - `GET /v1/autolabel/sam3`: the state ([`Sam3State`]), where the token comes from (its source,
 //!   never its value), the login command, the size and the progress. No network.

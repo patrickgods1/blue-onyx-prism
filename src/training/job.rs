@@ -323,7 +323,7 @@ pub struct BenchSummary {
 }
 
 /// The current default model on the frames of a run's benchmark ([`Hooks::baseline`]): what the
-/// new model's result is compared with on the Training page.
+/// new model's result is compared with on the Train tab.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Baseline {
     /// The default model; empty when the comparison failed before it was known.
@@ -1507,7 +1507,7 @@ pub fn classify_train_failure(
         "CUDA error: invalid device function",
     ]) {
         return Some(format!(
-            "the PyTorch build has no kernels for this GPU ({}); see the Training page's \
+            "the PyTorch build has no kernels for this GPU ({}); see the Train tab's \
              capability notes",
             l.trim()
         ));

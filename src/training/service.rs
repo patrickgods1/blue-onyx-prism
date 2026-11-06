@@ -2,7 +2,7 @@
 //! ([`super::job::run_training`]), the rest wait; any run can be cancelled (a queued one is
 //! dropped, a running one has its process tree killed). Every run's record ([`RunRecord`]: state,
 //! stage, progress, log tail, dataset counts, the installed model, the benchmark) is kept in
-//! memory and saved to `<training dir>/runs.json`, so the Training page shows past runs after a
+//! memory and saved to `<training dir>/runs.json`, so the Train tab shows past runs after a
 //! restart; a run that was queued or running when the process stopped is marked interrupted.
 //! While idle the queue can move to another training folder ([`TrainingService::set_store`]).
 //! Footage imports and auto-label runs ([`super::task::Task`]) go through the same queue and
@@ -102,7 +102,7 @@ impl DatasetCounts {
     }
 }
 
-/// One run as the Training page and `train list` show it.
+/// One run as the Train tab and `train list` show it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunRecord {
     pub id: String,

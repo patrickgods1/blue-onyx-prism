@@ -2,7 +2,7 @@
 //! that follows an import, or by the import itself when nothing follows it, only when it ended
 //! Done. In order: reject the pending auto boxes scoring below a minimum
 //! ([`bulk::bulk_reject_below`]), accept the frames the triage then settles
-//! ([`bulk::bulk_accept`]), point the Review page at the import's folder
+//! ([`bulk::bulk_accept`]), point the Review tab at the import's folder
 //! ([`crate::collect::config::set_review_dir`]). Reject and accept are scoped to the import's
 //! frames (sidecar `source: import:<id>`). Each step reports one line; a failing step is a
 //! `warning: ...` line, never a failed task.
@@ -26,7 +26,7 @@ pub struct Finish {
     pub reject_below: Option<f32>,
     /// Save the frames whose boxes are all `auto: accept` as reviewed.
     pub accept_auto: bool,
-    /// Point the Review page (`collect.review_dir`) at this folder.
+    /// Point the Review tab (`collect.review_dir`) at this folder.
     pub review_folder: Option<PathBuf>,
     /// Saves the folder switch (None: the switch is a warning).
     pub config_writer: Option<Arc<dyn ConfigWriter>>,
@@ -112,18 +112,18 @@ impl Finish {
     fn switch_folder(&self, dir: &Path) -> String {
         let Some(w) = &self.config_writer else {
             return format!(
-                "warning: the Review page was not switched to {} (no config to save); choose the \
-                 folder on the Review page (Folder under review)",
+                "warning: the Review tab was not switched to {} (no config to save); choose the \
+                 folder on the Review tab (Folder under review)",
                 dir.display()
             );
         };
         let r =
             w.update(&mut |c| crate::collect::config::set_review_dir(c, Some(dir.to_path_buf())));
         match r {
-            Ok(_) => format!("the Review page now shows {}", dir.display()),
+            Ok(_) => format!("the Review tab now shows {}", dir.display()),
             Err(e) => format!(
-                "warning: the Review page was not switched to {}: {e:#}; choose the folder on \
-                 the Review page (Folder under review)",
+                "warning: the Review tab was not switched to {}: {e:#}; choose the folder on \
+                 the Review tab (Folder under review)",
                 dir.display()
             ),
         }
@@ -240,7 +240,7 @@ mod tests {
                 "accepted 1 frame(s) of import x whose boxes were all auto: accept (1 boxes; \
                  saved as reviewed)"
                     .into(),
-                format!("the Review page now shows {}", dir.display()),
+                format!("the Review tab now shows {}", dir.display()),
             ]
         );
         assert_eq!(
@@ -272,7 +272,7 @@ mod tests {
         let l = g.apply(&dir, None, &classes);
         assert_eq!(l.len(), 1);
         assert!(
-            l[0].starts_with("warning: the Review page was not switched"),
+            l[0].starts_with("warning: the Review tab was not switched"),
             "{l:?}"
         );
         assert!(l[0].contains("read-only"), "{l:?}");

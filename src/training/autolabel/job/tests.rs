@@ -1834,7 +1834,7 @@ fn a_chained_run_rejects_low_boxes_then_accepts_then_switches_the_folder() {
         out.summary
     );
     assert!(
-        out.summary.contains("the Review page now shows"),
+        out.summary.contains("the Review tab now shows"),
         "{}",
         out.summary
     );
@@ -3281,7 +3281,7 @@ fn the_summary_says_what_the_tiers_did() {
         s.contains("3 boxes below score 0.15 hidden, 1 more kept visible"),
         "{s}"
     );
-    assert!(s.contains("Show hidden on the Review page"), "{s}");
+    assert!(s.contains("Show hidden on the Review tab"), "{s}");
     let mut spots = AutolabelReport::default();
     spots.count_labelers(&triage::LabelersReport {
         apply: triage::ApplyReport {

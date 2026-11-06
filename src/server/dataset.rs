@@ -1,4 +1,4 @@
-//! The Dataset page (`/dataset`, admin only) of the dataset collector ([`crate::collect`]):
+//! The Train area's Collect tab (`/train/collect`, admin only) of the dataset collector ([`crate::collect`]):
 //! the collection and per-bucket toggles and limits (saved with [`save_config`], applied
 //! live), counts by scene x bucket, by detected class and per camera, disk use, the newest frames per bucket and
 //! "Send to review" (appends to `<dir>/review-queue.jsonl`). Frames and sidecars are served
@@ -183,9 +183,11 @@ struct ThumbGroup {
 }
 
 #[derive(Template)]
-#[template(path = "dataset.html")]
+#[template(path = "train/collect.html")]
 struct DatasetTemplate {
     nav: &'static str,
+    tab: &'static str,
+    tab_title: &'static str,
     version: &'static str,
     message: Option<String>,
     error: Option<String>,
@@ -311,7 +313,9 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
         })
         .collect();
     DatasetTemplate {
-        nav: "dataset",
+        nav: "train",
+        tab: super::train_area::COLLECT,
+        tab_title: super::train_area::tab_title(super::train_area::COLLECT),
         version: crate::VERSION,
         message,
         error,
@@ -353,7 +357,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
     }
 }
 
-/// `GET /dataset`.
+/// `GET /train/collect`.
 pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || render(&view(&state, None, None))).await
 }
@@ -466,7 +470,7 @@ async fn serve(
             return not_found();
         };
         let wanted = if ext == "jpg" { r.jpg() } else { r.json() };
-        // The Review page's folder first (an import saved elsewhere), then the dataset folder.
+        // The Review tab's folder first (an import saved elsewhere), then the dataset folder.
         let Some(path) = dirs.iter().find_map(|d| layout::resolve(d, &wanted, ext)) else {
             return not_found();
         };
@@ -576,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn the_page_and_the_json_report_how_collection_is_doing() {
         let (state, dir) = collecting_state(None);
-        let (_, body) = get_text(&state, "/dataset").await;
+        let (_, body) = get_text(&state, "/train/collect").await;
         for want in ["Requests seen", "Frames saved", "Last frame", "Last error"] {
             assert!(body.contains(want), "{want}");
         }
@@ -601,10 +605,15 @@ mod tests {
         put_frame(&dir, "ir/cam/2026-10-22", "20261022T010203004Z_a");
         let (_, body) = get_text(&state, "/").await;
         assert!(body.contains("not collecting, 1 frame so far"), "{body}");
-        assert!(body.contains("href=\"/dataset\""));
+        assert!(body.contains("href=\"/train/collect\""));
+        assert!(
+            body.contains("Turn on collecting"),
+            "the one-line suggestion"
+        );
         let (state, _) = collecting_state(Some(dir.clone()));
         let (_, body) = get_text(&state, "/").await;
         assert!(body.contains(">collecting, 1 frame so far"), "{body}");
+        assert!(!body.contains("Turn on collecting"), "{body}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -700,10 +709,10 @@ mod tests {
         let (state, dir) = dataset_state();
         let rel = put_frame(&dir, "ir/cam/2026-10-22", "20261022T010203004Z_abcd");
         std::fs::write(dir.join("secret.jpg"), b"outside the layout").unwrap();
-        let (s, page) = get_text(&state, "/dataset").await;
+        let (s, page) = get_text(&state, "/train/collect").await;
         assert_eq!(s, StatusCode::OK);
         assert!(
-            page.contains("class=\"active\" aria-current=\"page\">Dataset</a>"),
+            page.contains("class=\"active\" aria-current=\"page\">Collect</a>"),
             "nav"
         );
         assert!(
@@ -813,7 +822,7 @@ mod tests {
             &["person", "car"],
         );
         put_frame(&dir, "day/cam/2026-10-22", "20261022T010203006Z_c");
-        let (s, page) = get_text(&state, "/dataset").await;
+        let (s, page) = get_text(&state, "/train/collect").await;
         assert_eq!(s, StatusCode::OK);
         assert!(page.contains("Frames by detected class"), "card");
         assert!(page.contains("Reviewed labels are counted on the"), "note");

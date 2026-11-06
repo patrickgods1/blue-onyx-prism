@@ -1,4 +1,4 @@
-//! The `training` config section: where runs go, which review exports the Training page offers,
+//! The `training` config section: where runs go, which review exports the Train tab offers,
 //! and the dataset assembly defaults. Read when a run is queued (every field applies at once);
 //! pure data plus validation.
 
@@ -25,7 +25,7 @@ pub const MAX_OVERSAMPLE: u32 = 10;
 pub const DEFAULT_TIMEOUT_HOURS: u32 = 48;
 /// Most hours of a run.
 pub const MAX_TIMEOUT_HOURS: u32 = 24 * 14;
-/// The Training page's per-epoch table columns when `metric_columns` is empty.
+/// The Train tab's per-epoch table columns when `metric_columns` is empty.
 pub const DEFAULT_METRIC_COLUMNS: [&str; 8] = [
     "map",
     "map50",
@@ -48,7 +48,7 @@ pub struct TrainingConfig {
     /// Folder of the training runs (prepared datasets, logs, held-out sets). None =
     /// `<data root>/training`; relative paths resolve against the data root.
     pub dir: Option<PathBuf>,
-    /// Review export folders (YOLO layout, see docs/TRAINING.md) offered on the Training page
+    /// Review export folders (YOLO layout, see docs/TRAINING.md) offered on the Train tab
     /// and used by `train run` without `--dataset`.
     pub datasets: Vec<PathBuf>,
     /// Epochs of every run (a cap while early stopping is on); None = the family's
@@ -92,12 +92,12 @@ pub struct TrainingConfig {
     /// the built-in ones of that class (MM-Grounding-DINO prompts, SigLIP species prompts).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub synonyms: std::collections::BTreeMap<String, Vec<String>>,
-    /// Columns of the Training page's per-epoch metrics table, in order: metric ids
+    /// Columns of the Train tab's per-epoch metrics table, in order: metric ids
     /// (`map`, `f2`, ... see `progress::METRICS`) or a trainer's raw metric names. Empty = the
     /// default ([`DEFAULT_METRIC_COLUMNS`]). Applies at once.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub metric_columns: Vec<String>,
-    /// The Training page's and the CLI's default balancing of the training frames
+    /// The Train tab's and the CLI's default balancing of the training frames
     /// ([`super::dataset::Balance`]); None = off. A run uses what its request says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<super::dataset::Balance>,

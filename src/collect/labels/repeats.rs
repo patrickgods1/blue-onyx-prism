@@ -3,7 +3,7 @@
 //! ([`Spot::matches`]: a pending model / auto box of the same object class, [`same_object`], at
 //! IoU >= [`Spot::min_iou`]) and whether a frame holds only such decided repeats
 //! ([`repeats_only`]). IO: the per-camera history of the reviewer's decisions ([`history`], the
-//! Review page's "rejected here before" hint; cached per folder and camera, [`invalidate`] after
+//! Review tab's "rejected here before" hint; cached per folder and camera, [`invalidate`] after
 //! every write of the folder's label files). The bulk edits are [`super::bulk::bulk_spot`] and
 //! [`super::bulk::bulk_accept_repeats`]; what a labelers run does with spots is in [`super::spots`].
 
@@ -23,13 +23,13 @@ pub const ACCEPT_SPOT_IOU: f32 = 0.8;
 pub const REPEAT_SPOT_REASON: &str = "repeat_spot";
 /// Most boxes [`history`] returns per camera (newest frames first).
 pub const HISTORY_CAP: usize = 2000;
-/// Earlier decisions at a place that make it a spot (the Review page's `REPEAT_MIN`).
+/// Earlier decisions at a place that make it a spot (the Review tab's `REPEAT_MIN`).
 pub const REPEAT_MIN: usize = 2;
 /// How long a cached history is used without a write of the folder (label files written by
 /// other processes, such as an auto-label run, show up after this).
 pub const HISTORY_TTL: Duration = Duration::from_secs(60);
 
-/// Vehicle classes: a box of one may stand for an object another names (the Review page's
+/// Vehicle classes: a box of one may stand for an object another names (the Review tab's
 /// `VEHICLES`, `assets/review.js`).
 pub const VEHICLES: [&str; 4] = ["car", "truck", "bus", "van"];
 
