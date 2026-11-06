@@ -8,7 +8,7 @@
     <thead><tr><th>Run</th><th>Model</th><th>State</th><th>Progress</th><th></th></tr></thead>
     <tbody>
     {% for r in runs %}
-    <tr data-run="{{ r.id }}">
+    <tr data-run="{{ r.id }}" id="job-{{ r.id }}">
       <td class="rc-title-plain"><code>{{ r.name }}</code><br><span class="muted small">{{ r.id }}</span></td>
       <td data-label="Model">{{ r.model }}<br><span class="muted small">{{ r.dataset }}</span></td>
       <td data-field="state" data-label="State">{{ r.state }}</td>
@@ -37,7 +37,7 @@
     <thead><tr><th>Job</th><th>State</th><th>Progress</th><th></th></tr></thead>
     <tbody>
     {% for r in tasks %}
-    <tr data-task="{{ r.id }}">
+    <tr data-task="{{ r.id }}" id="job-{{ r.id }}">
       <td class="rc-title-plain">{{ r.title }}<br><span class="muted small">{{ r.kind }} {{ r.id }} &middot; {{ r.created }}</span></td>
       <td data-field="state" data-label="State">{{ r.state }}</td>
       <td class="rc-block"><progress max="100" value="{{ r.percent }}" data-field="percent"></progress> <span data-field="describe">{{ r.describe }}</span>{% if !r.log_tail.is_empty() %}<pre class="small tr-log" data-field="log">{{ r.log_tail }}</pre>{% endif %}</td>

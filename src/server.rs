@@ -39,6 +39,7 @@ mod status;
 #[cfg(test)]
 mod test_util;
 mod train_area;
+mod train_jobs;
 mod training;
 mod training_switch;
 mod training_tasks;
@@ -198,7 +199,9 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/train/dataset", get(train_area::dataset_page)),
         ("/train/train", get(training::train_tab)),
         ("/train/models", get(training::models_tab)),
+        ("/train/jobs", get(train_jobs::page)),
         ("/v1/train/summary", get(train_area::summary)),
+        ("/v1/train/jobs", get(train_jobs::jobs)),
         ("/dataset", get(train_area::old_dataset)),
         ("/dataset/settings", post(dataset::settings)),
         ("/dataset/review", post(dataset::review)),
@@ -1104,7 +1107,9 @@ mod tests {
             "/train/dataset",
             "/train/train",
             "/train/models",
+            "/train/jobs",
             "/v1/train/summary",
+            "/v1/train/jobs",
             "/dataset",
             "/dataset/settings",
             "/dataset/review",

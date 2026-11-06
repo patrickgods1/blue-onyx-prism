@@ -7,6 +7,7 @@
   <a href="/train/dataset"{% if tab == "dataset" %} class="active" aria-current="page"{% endif %}>Dataset</a>
   <a href="/train/train"{% if tab == "train" %} class="active" aria-current="page"{% endif %}>Train</a>
   <a href="/train/models"{% if tab == "models" %} class="active" aria-current="page"{% endif %}>Models</a>
+  <a href="/train/jobs"{% if tab == "jobs" %} class="active" aria-current="page"{% endif %}>Jobs <span class="tab-count" id="train-jobs-count" hidden></span></a>
 </nav>
 <div id="train-strip" data-tab="{{ tab }}" class="train-strip" aria-label="Where things stand" hidden>
   <ul class="train-counts" id="train-counts"></ul>

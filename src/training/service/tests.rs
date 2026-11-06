@@ -85,6 +85,7 @@ impl Task for HoldTask {
             step: 2,
             steps: 2,
             percent: 50,
+            step_percent: 50,
             detail: "3 of 6 frames",
         });
         let cmd = Cmd {
@@ -161,6 +162,13 @@ fn a_running_task_pauses_resumes_keeps_its_place_and_cancels_while_paused() {
     assert_eq!(r.state, RunState::Paused);
     assert!(r.state.is_busy() && r.state.is_active());
     assert_eq!(r.describe(), "paused (labelling 2/2): 3 of 6 frames");
+    // The Jobs tab's clock stands still while paused, and is only the running job's.
+    let t = svc.timing(&first).expect("the running job has a clock");
+    assert!(svc.timing(&second).is_none());
+    std::thread::sleep(Duration::from_millis(30));
+    let later = svc.timing(&first).unwrap();
+    assert_eq!(later.elapsed_s, t.elapsed_s);
+    assert!(later.paused_s > t.paused_s);
     until("the helper to see the pause", || {
         runner.paused.load(Ordering::Relaxed)
     });

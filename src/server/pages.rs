@@ -1080,6 +1080,7 @@ mod tests {
             "/train/dataset",
             "/train/train",
             "/train/models",
+            "/train/jobs",
         ] {
             let (s, html) = get_text(&state, page).await;
             assert_eq!(s, StatusCode::OK, "{page}");

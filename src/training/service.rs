@@ -16,6 +16,7 @@
 //! until [`TrainingService::resume`] or a cancel. A running run can also finish early
 //! ([`TrainingService::finish`]): the trainer stops after its current epoch and exports the best.
 
+use super::eta::{JobClock, JobTiming};
 use super::job::{
     BenchSummary, Hooks, TrainError, TrainJob, TrainOutput, TrainReport, TrainRequest, TrainStage,
 };
@@ -300,6 +301,9 @@ struct Inner {
     persist_lock: Mutex<()>,
     stop: AtomicBool,
     tasks: Mutex<Vec<TaskRecord>>,
+    /// The clock of the job that last held the queue's thread. A leaf lock: nothing is taken
+    /// under it.
+    clock: Mutex<Option<(String, JobClock)>>,
 }
 
 /// The job on the queue's thread and its flags.
@@ -364,6 +368,17 @@ impl Inner {
         let _order = self.persist_lock.lock_recover();
         self.update(id, f);
         self.write_runs();
+    }
+
+    /// Start the clock of job `id`.
+    fn start_clock(&self, id: &str) {
+        *self.clock.lock_recover() = Some((id.to_string(), JobClock::new(Instant::now())));
+    }
+
+    fn on_clock(&self, f: impl FnOnce(&mut JobClock)) {
+        if let Some((_, c)) = self.clock.lock_recover().as_mut() {
+            f(c);
+        }
     }
 
     fn update_task(&self, id: &str, f: impl FnOnce(&mut TaskRecord)) {
@@ -444,6 +459,7 @@ impl TrainingService {
             runs: Mutex::new(runs),
             changed: Condvar::new(),
             current: Mutex::new(None),
+            clock: Mutex::new(None),
             cancelled: Mutex::new(HashSet::new()),
             stores: Mutex::new(stores),
             persist_lock: Mutex::new(()),
@@ -829,6 +845,13 @@ impl TrainingService {
         }
         if flipped {
             c.pause.store(paused, Ordering::Relaxed);
+            self.inner.on_clock(|c| {
+                if paused {
+                    c.pause(Instant::now());
+                } else {
+                    c.resume(Instant::now());
+                }
+            });
         }
         drop(cur);
         if flipped {
@@ -844,6 +867,14 @@ impl TrainingService {
 
     pub fn runs(&self) -> Vec<RunRecord> {
         self.inner.runs.lock_recover().clone()
+    }
+
+    /// How long job `id` has run and how long its step should still take; None unless it is the
+    /// job on the queue's thread.
+    pub fn timing(&self, id: &str) -> Option<JobTiming> {
+        let clock = self.inner.clock.lock_recover();
+        let (_, c) = clock.as_ref().filter(|(job, _)| job == id)?;
+        Some(c.timing(Instant::now()))
     }
 
     pub fn get(&self, id: &str) -> Option<RunRecord> {
@@ -1005,6 +1036,7 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             continue;
         }
         inner.persist();
+        inner.start_clock(&id);
         tracing::info!(run = %id, model = %job.name, "training started: {} on {}", job.request.recipe.label(), job.accelerator.describe());
         let started = Instant::now();
         let mut last_stage = None;
@@ -1020,6 +1052,7 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                     tracing::info!(run = %id, "training stage {}/{}: {}", stage.number(), TrainStage::ALL.len(), stage.label());
                     last_stage = Some(stage);
                 }
+                inner.on_clock(|c| c.report(Instant::now(), stage.number(), percent));
                 inner.update(&id, |r| {
                     r.stage = Some(stage);
                     r.step = stage.number();
@@ -1154,6 +1187,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
         return;
     }
     inner.persist_tasks();
+    inner.start_clock(&id);
     tracing::info!(job = %id, "{} started: {}", t.kind().as_str(), t.title());
     let started = Instant::now();
     let mut last_step = 0usize;
@@ -1164,6 +1198,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
             step,
             steps,
             percent,
+            step_percent,
             detail,
         } => {
             let new_step = step != last_step;
@@ -1171,6 +1206,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
                 tracing::info!(job = %id, "stage {step}/{steps}: {stage}");
                 last_step = step;
             }
+            inner.on_clock(|c| c.report(Instant::now(), step, step_percent));
             inner.update_task(&id, |r| {
                 r.stage = Some(stage.to_string());
                 r.step = step;

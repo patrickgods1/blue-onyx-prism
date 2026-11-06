@@ -35,6 +35,7 @@ pub mod compare;
 pub mod config;
 pub mod dataset;
 pub mod estimate;
+pub mod eta;
 pub mod finish;
 pub mod import;
 pub mod job;

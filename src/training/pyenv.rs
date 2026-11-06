@@ -61,6 +61,7 @@ pub fn stage(
         step,
         steps,
         percent: super::task::overall(step, steps, pct),
+        step_percent: pct,
         detail,
     });
 }
