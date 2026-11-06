@@ -355,7 +355,7 @@ fn writes_yolo_coco_and_a_loadable_heldout_set() {
     let (set, warnings) = images::load_dir(&hd, None, Some("heldout")).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(set.images.len(), p.heldout.len());
-    assert_eq!(set.ground_truth, images::GroundTruth::Yolo);
+    assert_eq!(set.ground_truth, images::GroundTruth::Manifest);
     assert_eq!(
         set.scored_labels.as_deref(),
         Some(&["cat".to_string(), "dog".to_string()][..])
@@ -1528,6 +1528,7 @@ fn one_image_source(dir: &Path, n: usize) -> Source {
                     w: 0.2,
                     h: 0.2,
                 }],
+                ignore: Vec::new(),
                 scene: Some("day".into()),
                 camera: "a".into(),
                 day: "2026-10-01".into(),
@@ -1612,4 +1613,384 @@ fn public_frames_count_once_and_review_repeats_do_not() {
     let prep = write(&s, &p, &opts, &t.0.join("data")).unwrap();
     assert_eq!(prep.train_frames, review + 30);
     assert_eq!(prep.train_images, review * 3 + 30);
+}
+
+/// `ignore.json` beside an export: (image, label, cx, cy, w, h).
+fn ignore_json(dir: &Path, regions: &[(&str, &str, f64, f64, f64, f64)]) {
+    let mut images: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    for (name, label, cx, cy, w, h) in regions {
+        images
+            .entry((*name).to_string())
+            .or_default()
+            .push(serde_json::json!({"label": label, "cx": cx, "cy": cy, "w": w, "h": h}));
+    }
+    std::fs::write(
+        dir.join("ignore.json"),
+        serde_json::to_vec(&serde_json::json!({"version": 1, "images": images})).unwrap(),
+    )
+    .unwrap();
+}
+
+fn name_of(s: &Source, r: FrameRef) -> String {
+    file_name(&s.frames[r.1].image)
+}
+
+fn used(p: &Plan, r: FrameRef) -> bool {
+    p.train.iter().any(|(t, _)| *t == r) || p.valid.contains(&r)
+}
+
+#[test]
+fn an_old_export_without_ignore_json_reads_as_none() {
+    let t = tmp("no-ignore");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    assert!(s.frames.iter().all(|f| f.ignore.is_empty()));
+    let p = plan(std::slice::from_ref(&s), &Options::default()).unwrap();
+    assert_eq!(p.stats.ignore_frames, 0);
+    assert!(p.warnings.iter().all(|w| !w.contains("too-small")));
+    // Not written for a run that leaves nothing out: dataset.json stays as it was.
+    assert!(
+        serde_json::to_value(&p.stats)
+            .unwrap()
+            .get("ignore_frames")
+            .is_none()
+    );
+}
+
+#[test]
+fn ignore_json_is_read_by_image_name_and_a_damaged_one_stops_the_read() {
+    let t = tmp("ignore-read");
+    camera_export(&t.0);
+    ignore_json(
+        &t.0,
+        &[
+            ("yard-2026-10-01-0.jpg", "cat", 0.5, 0.25, 0.1, 0.2),
+            ("nothing-by-this-name.jpg", "cat", 0.5, 0.5, 0.1, 0.1),
+        ],
+    );
+    let s = read_export(&t.0).unwrap();
+    let with: Vec<&Frame> = s.frames.iter().filter(|f| !f.ignore.is_empty()).collect();
+    assert_eq!(with.len(), 1);
+    assert!(with[0].image.ends_with("yard-2026-10-01-0.jpg"));
+    assert_eq!(
+        with[0].ignore,
+        [YoloBox {
+            class: "cat".into(),
+            cx: 0.5,
+            cy: 0.25,
+            w: 0.1,
+            h: 0.2,
+        }]
+    );
+    assert_eq!(with[0].boxes.len(), 1, "the frame's boxes are its own");
+    std::fs::write(t.0.join("ignore.json"), "{").unwrap();
+    let e = format!("{:#}", read_export(&t.0).unwrap_err());
+    assert!(
+        e.contains("damaged") && e.contains("export the frames again"),
+        "{e}"
+    );
+    std::fs::write(t.0.join("ignore.json"), r#"{"version": 99, "images": {}}"#).unwrap();
+    let e = format!("{:#}", read_export(&t.0).unwrap_err());
+    assert!(e.contains("newer than this build"), "{e}");
+}
+
+/// The export of [`camera_export`] with ignore regions on one frame of the train / valid pool and
+/// one held-out frame; returns them with the plan before the regions.
+fn with_regions(dir: &Path, opts: &Options) -> (Plan, FrameRef, FrameRef) {
+    camera_export(dir);
+    let s = read_export(dir).unwrap();
+    let before = plan(std::slice::from_ref(&s), opts).unwrap();
+    let pooled = *before
+        .train
+        .iter()
+        .map(|(r, _)| r)
+        .chain(&before.valid)
+        .next()
+        .unwrap();
+    let held = before.heldout[0];
+    ignore_json(
+        dir,
+        &[
+            (&name_of(&s, pooled), "dog", 0.2, 0.2, 0.1, 0.1),
+            (&name_of(&s, held), "dog", 0.25, 0.25, 0.5, 0.5),
+        ],
+    );
+    (before, pooled, held)
+}
+
+#[test]
+fn a_frame_with_an_ignore_region_leaves_train_and_valid_and_is_counted() {
+    let t = tmp("ignore-plan");
+    let opts = Options::default();
+    let (before, pooled, held) = with_regions(&t.0, &opts);
+    let s = read_export(&t.0).unwrap();
+    let p = plan(std::slice::from_ref(&s), &opts).unwrap();
+    assert!(used(&before, pooled) && !used(&p, pooled));
+    assert_eq!(
+        p.stats.ignore_frames, 1,
+        "the held-out frame is not counted"
+    );
+    assert!(
+        p.warnings
+            .iter()
+            .any(|w| w.starts_with("1 of ") && w.contains("too-small")),
+        "{:?}",
+        p.warnings
+    );
+    assert_eq!(p.heldout, before.heldout, "the held-out set does not move");
+    assert!(p.heldout.contains(&held));
+    assert!(!used(&p, held));
+    assert_eq!(
+        serde_json::to_value(&p.stats).unwrap()["ignore_frames"],
+        serde_json::json!(1)
+    );
+}
+
+#[test]
+fn a_frame_left_out_by_the_scene_filter_is_not_counted_as_ignored() {
+    let t = tmp("ignore-scene");
+    let opts = Options::default();
+    let (_, pooled, _) = with_regions(&t.0, &opts);
+    let s = read_export(&t.0).unwrap();
+    let scene = s.frames[pooled.1].scene.clone().unwrap();
+    let other = if scene == "day" { "ir" } else { "day" };
+    let filtered = Options {
+        scene: SceneFilter::parse(other).unwrap(),
+        ..Options::default()
+    };
+    let p = plan(std::slice::from_ref(&s), &filtered).unwrap();
+    assert_eq!(p.stats.ignore_frames, 0);
+}
+
+#[test]
+fn every_frame_of_a_class_with_a_region_explains_the_refusal() {
+    let t = tmp("ignore-all");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let names: Vec<String> = s.frames.iter().map(|f| file_name(&f.image)).collect();
+    let regions: Vec<(&str, &str, f64, f64, f64, f64)> = names
+        .iter()
+        .map(|n| (n.as_str(), "cat", 0.5, 0.5, 0.1, 0.1))
+        .collect();
+    ignore_json(&t.0, &regions);
+    let s = read_export(&t.0).unwrap();
+    let e = plan(&[s], &Options::default()).unwrap_err().to_string();
+    assert!(e.contains("unsure or too-small"), "{e}");
+}
+
+#[test]
+fn held_out_frames_keep_their_regions_and_ordinary_frames_score_as_before() {
+    let t = tmp("ignore-held");
+    let opts = Options {
+        rename: BTreeMap::from([("dog".to_string(), "hound".to_string())]),
+        ..Options::default()
+    };
+    let (_, _, held) = with_regions(&t.0, &opts);
+    let s = vec![read_export(&t.0).unwrap()];
+    let p = plan(&s, &opts).unwrap();
+    assert!(p.heldout.contains(&held));
+    let dir = t.0.join("prepared");
+    let prep = write(&s, &p, &opts, &dir).unwrap();
+    let hd = prep.heldout_dir.unwrap();
+    let (set, warnings) = images::load_dir(&hd, None, Some("heldout")).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(set.ground_truth, images::GroundTruth::Manifest);
+    assert_eq!(set.images.len(), p.heldout.len());
+
+    // The set as a dataset of older versions: `objects: None`, ground truth from the YOLO labels.
+    let text = std::fs::read_to_string(hd.join("manifest.json")).unwrap();
+    let mut old: Manifest = serde_json::from_str(&text).unwrap();
+    for i in &mut old.images {
+        i.objects = None;
+    }
+    let old_dir = t.0.join("old-heldout");
+    std::fs::create_dir_all(old_dir.join("images")).unwrap();
+    std::fs::create_dir_all(old_dir.join("labels")).unwrap();
+    for e in std::fs::read_dir(hd.join("images")).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), old_dir.join("images").join(e.file_name())).unwrap();
+    }
+    for e in std::fs::read_dir(hd.join("labels")).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), old_dir.join("labels").join(e.file_name())).unwrap();
+    }
+    std::fs::copy(hd.join("classes.txt"), old_dir.join("classes.txt")).unwrap();
+    std::fs::write(
+        old_dir.join("manifest.json"),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    let (old_set, _) = images::load_dir(&old_dir, None, Some("old")).unwrap();
+    assert_eq!(old_set.ground_truth, images::GroundTruth::Yolo);
+
+    let held_name = format!("s0-{}", name_of(&s[0], held));
+    let mut empties = 0;
+    for (new, old) in set.images.iter().zip(&old_set.images) {
+        assert_eq!(new.file, old.file);
+        assert_eq!((new.width, new.height), (old.width, old.height));
+        assert_eq!(new.tags, old.tags, "{}", new.file);
+        let (gt, was) = (new.gt.as_ref().unwrap(), old.gt.as_ref().unwrap());
+        let ordinary: Vec<_> = gt.iter().filter(|g| !g.ignore).cloned().collect();
+        assert_eq!(&ordinary, was, "{}: bit for bit", new.file);
+        empties += usize::from(gt.is_empty());
+        if new.file == held_name {
+            let region: Vec<_> = gt.iter().filter(|g| g.ignore).collect();
+            assert_eq!(region.len(), 1, "{gt:?}");
+            assert_eq!(region[0].label, "hound", "renamed like the boxes");
+            assert_eq!(region[0].bbox, [0.0, 0.0, 32.0, 24.0]);
+            assert!(!region[0].crowd);
+        } else {
+            assert_eq!(gt.len(), was.len(), "{}: no region here", new.file);
+        }
+    }
+    assert!(
+        empties > 0,
+        "an empty frame stays scored as empty: an empty list, not None"
+    );
+    assert_eq!(set.ground_truth.is_real(), old_set.ground_truth.is_real());
+    let labels = std::fs::read_to_string(
+        hd.join("labels")
+            .join(format!("{}.txt", stem(Path::new(&held_name)))),
+    )
+    .unwrap();
+    assert!(!labels.contains("0.250000 0.250000 0.500000"), "{labels}");
+}
+
+#[test]
+fn a_region_of_a_label_the_run_does_not_score_is_left_out_of_the_held_out_set() {
+    let t = tmp("ignore-unscored");
+    let opts = Options::default();
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let held = plan(std::slice::from_ref(&s), &opts).unwrap().heldout[0];
+    ignore_json(&t.0, &[(&name_of(&s, held), "raccoon", 0.5, 0.5, 0.1, 0.1)]);
+    let s = vec![read_export(&t.0).unwrap()];
+    let p = plan(&s, &opts).unwrap();
+    let dir = t.0.join("prepared");
+    let hd = write(&s, &p, &opts, &dir).unwrap().heldout_dir.unwrap();
+    let (set, _) = images::load_dir(&hd, None, None).unwrap();
+    let want = format!("s0-{}", name_of(&s[0], held));
+    let img = set.images.iter().find(|i| i.file == want).unwrap();
+    assert!(img.gt.as_ref().unwrap().iter().all(|g| !g.ignore));
+}
+
+#[test]
+fn a_held_out_image_of_no_readable_size_is_left_out_with_a_warning() {
+    let t = tmp("ignore-size");
+    let opts = Options::default();
+    camera_export(&t.0);
+    let mut s = read_export(&t.0).unwrap();
+    let p = plan(std::slice::from_ref(&s), &opts).unwrap();
+    let held = p.heldout[0];
+    s.frames[held.1].size = None;
+    std::fs::write(&s.frames[held.1].image, b"not a jpeg").unwrap();
+    let dir = t.0.join("prepared");
+    let prep = write(std::slice::from_ref(&s), &p, &opts, &dir).unwrap();
+    assert!(
+        prep.warnings
+            .iter()
+            .any(|w| w.contains("could not be read")),
+        "{:?}",
+        prep.warnings
+    );
+    let hd = prep.heldout_dir.unwrap();
+    let (set, warnings) = images::load_dir(&hd, None, None).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(set.images.len(), p.heldout.len() - 1);
+    assert_eq!(set.ground_truth, images::GroundTruth::Manifest);
+}
+
+#[test]
+fn the_fingerprint_follows_the_ignore_regions() {
+    let t = tmp("ignore-print");
+    let opts = Options::default();
+    let (before, _, held) = with_regions(&t.0, &opts);
+    let s = read_export(&t.0).unwrap();
+    let with = plan(std::slice::from_ref(&s), &opts).unwrap();
+    assert_ne!(with.heldout_fingerprint, before.heldout_fingerprint);
+    // Without regions: the plain hash of the frame keys, as older versions recorded it.
+    let keys = before.heldout.iter().map(|r| frame_key(&s, &s.frames[r.1]));
+    assert_eq!(before.heldout_fingerprint, fingerprint(keys));
+    // Another region on the frame, or the same one elsewhere on it, is another scoring.
+    let name = name_of(&s, held);
+    ignore_json(&t.0, &[(&name, "dog", 0.3, 0.25, 0.5, 0.5)]);
+    let s2 = read_export(&t.0).unwrap();
+    let moved = plan(std::slice::from_ref(&s2), &opts).unwrap();
+    assert_ne!(moved.heldout_fingerprint, with.heldout_fingerprint);
+    // Regions on train frames do not change how the held-out set is scored.
+    ignore_json(&t.0, &[]);
+    let pooled = before.train[0].0;
+    ignore_json(&t.0, &[(&name_of(&s, pooled), "dog", 0.3, 0.25, 0.5, 0.5)]);
+    let s3 = read_export(&t.0).unwrap();
+    let elsewhere = plan(std::slice::from_ref(&s3), &opts).unwrap();
+    assert_eq!(elsewhere.heldout_fingerprint, before.heldout_fingerprint);
+    // Nor does the order of a frame's regions, the class list or the scene filter.
+    ignore_json(
+        &t.0,
+        &[
+            (&name, "dog", 0.1, 0.1, 0.1, 0.1),
+            (&name, "cat", 0.2, 0.2, 0.1, 0.1),
+        ],
+    );
+    let a = plan(&[read_export(&t.0).unwrap()], &opts).unwrap();
+    ignore_json(
+        &t.0,
+        &[
+            (&name, "cat", 0.2, 0.2, 0.1, 0.1),
+            (&name, "dog", 0.1, 0.1, 0.1, 0.1),
+        ],
+    );
+    let other = Options {
+        scene: SceneFilter::parse("day").unwrap(),
+        classes: Some(vec!["cat".into()]),
+        ..Options::default()
+    };
+    let b = plan(&[read_export(&t.0).unwrap()], &other).unwrap();
+    assert_eq!(a.heldout_fingerprint, b.heldout_fingerprint);
+}
+
+#[test]
+fn a_confirmed_empty_frame_stays_a_hard_negative() {
+    let t = tmp("ignore-empty");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let mut m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(t.0.join("manifest.json")).unwrap()).unwrap();
+    let opts = Options {
+        negative_share: 0.5,
+        ..Options::default()
+    };
+    let p = plan(std::slice::from_ref(&s), &opts).unwrap();
+    let empty = *p
+        .train
+        .iter()
+        .map(|(r, _)| r)
+        .find(|r| s.frames[r.1].boxes.is_empty())
+        .expect("a negative in training");
+    let name = name_of(&s, empty);
+    for i in m["images"].as_array_mut().unwrap() {
+        if i["file"] == name.as_str() {
+            i["tags"]
+                .as_array_mut()
+                .unwrap()
+                .push("hard-negative".into());
+        }
+    }
+    std::fs::write(t.0.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+    // A region on some other frame changes nothing for it.
+    let other = p
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .find(|r| *r != empty)
+        .unwrap();
+    ignore_json(&t.0, &[(&name_of(&s, other), "cat", 0.5, 0.5, 0.1, 0.1)]);
+    let s = read_export(&t.0).unwrap();
+    assert!(s.frames[empty.1].hard_negative && s.frames[empty.1].ignore.is_empty());
+    let p = plan(std::slice::from_ref(&s), &opts).unwrap();
+    assert!(
+        used(&p, empty),
+        "still trained on as a frame without objects"
+    );
+    assert_eq!(p.stats.ignore_frames, 1);
 }

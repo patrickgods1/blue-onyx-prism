@@ -16,9 +16,15 @@
 //! the class list); frames confirmed empty are exported while `include_empty` is set (default).
 //! Applied before the split, recorded in `export.json`.
 //!
-//! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`]) plus [`run`], which
-//! writes into an empty or new folder, or a new `export-<UTC time>` folder inside a non-empty
-//! one, never into the dataset (images hard-linked, else copied), and writes `export.json` last.
+//! Ignore regions ([`LabelBox::is_ignore`]: unsure boxes, boxes rejected as too small) are real
+//! objects not to train on. They stay out of the YOLO labels, so `ignore.json` ([`IgnoreFile`],
+//! at the export's root) names them per image: a training run leaves those frames out of train
+//! and valid instead of teaching the object as background. They are `ignore` in the benchmark set.
+//!
+//! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`], [`ignore_file`]) plus
+//! [`run`], which writes into an empty or new folder, or a new `export-<UTC time>` folder inside a
+//! non-empty one, never into the dataset (images hard-linked, else copied), and writes
+//! `export.json` last.
 
 use super::super::layout::{self, Rel};
 use super::super::record::Bucket;
@@ -191,16 +197,52 @@ pub struct ExportFrame {
 }
 
 impl ExportFrame {
-    /// Training boxes, clamped to the frame, empty ones left out.
-    pub fn boxes(&self) -> Vec<&LabelBox> {
+    /// The boxes `keep` takes that are not empty once clamped to the frame.
+    fn placed(&self, keep: impl Fn(&LabelBox) -> bool) -> Vec<&LabelBox> {
         self.labels
-            .training()
+            .boxes
+            .iter()
             .filter(|b| {
                 let c = clamp_box(b.bbox, self.width, self.height);
-                c[2] > c[0] && c[3] > c[1]
+                keep(b) && c[2] > c[0] && c[3] > c[1]
             })
             .collect()
     }
+
+    /// Training boxes, clamped to the frame, empty ones left out.
+    pub fn boxes(&self) -> Vec<&LabelBox> {
+        self.placed(LabelBox::is_training)
+    }
+
+    /// Ignore regions ([`LabelBox::is_ignore`]), clamped to the frame, empty ones left out.
+    pub fn ignore_boxes(&self) -> Vec<&LabelBox> {
+        self.placed(LabelBox::is_ignore)
+    }
+}
+
+/// File at the root of an export: the ignore regions of its images. A missing file means none
+/// (exports of older versions).
+pub const IGNORE_FILE: &str = "ignore.json";
+/// Version [`ignore_file`] writes.
+pub const IGNORE_VERSION: u32 = 1;
+
+/// One ignore region, in the numbers of a YOLO label line (normalised to the image, center and
+/// size, 6 decimals), so a reader treats it like the frame's boxes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IgnoreBox {
+    pub label: String,
+    pub cx: f64,
+    pub cy: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// [`IGNORE_FILE`]: image file name (the [`flat_name`] of `images/<split>/`) -> its ignore regions.
+/// Images without any are not listed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IgnoreFile {
+    pub version: u32,
+    pub images: BTreeMap<String, Vec<IgnoreBox>>,
 }
 
 /// `x` rounded to `d` decimals, as f64 (clean JSON numbers).
@@ -212,9 +254,8 @@ fn round_to(x: f64, d: i32) -> f64 {
 /// A frame's YOLO label file: one `class cx cy w h` line per training box, normalised to the
 /// frame and clamped to 0..1, 6 decimals; an empty file for a frame without objects. Boxes of a
 /// label not in `classes` are an error (the frame must not be exported half-labelled). Unsure
-/// (`difficult`) boxes are left out; the frame and its other boxes stay.
+/// (`difficult`) boxes are left out, for [`ignore_file`]; the frame and its other boxes stay.
 pub fn yolo_txt(f: &ExportFrame, classes: &[String]) -> Result<String> {
-    let (w, h) = (f64::from(f.width.max(1)), f64::from(f.height.max(1)));
     let mut out = String::new();
     for b in f.boxes().into_iter().filter(|b| !b.difficult) {
         let Some(id) = classes.iter().position(|c| *c == b.label) else {
@@ -224,13 +265,52 @@ pub fn yolo_txt(f: &ExportFrame, classes: &[String]) -> Result<String> {
                 b.label
             );
         };
-        let c = clamp_box(b.bbox, f.width, f.height).map(f64::from);
-        let n = |v: f64| round_to(v.clamp(0.0, 1.0), 6);
-        let (cx, cy) = (n((c[0] + c[2]) / 2.0 / w), n((c[1] + c[3]) / 2.0 / h));
-        let (bw, bh) = (n((c[2] - c[0]) / w), n((c[3] - c[1]) / h));
+        let [cx, cy, bw, bh] = yolo_numbers(b, f);
         out.push_str(&format!("{id} {cx:.6} {cy:.6} {bw:.6} {bh:.6}\n"));
     }
     Ok(out)
+}
+
+/// `[cx, cy, w, h]` of `b`, normalised to the frame and clamped to 0..1, 6 decimals.
+fn yolo_numbers(b: &LabelBox, f: &ExportFrame) -> [f64; 4] {
+    let (w, h) = (f64::from(f.width.max(1)), f64::from(f.height.max(1)));
+    let c = clamp_box(b.bbox, f.width, f.height).map(f64::from);
+    let n = |v: f64| round_to(v.clamp(0.0, 1.0), 6);
+    [
+        n((c[0] + c[2]) / 2.0 / w),
+        n((c[1] + c[3]) / 2.0 / h),
+        n((c[2] - c[0]) / w),
+        n((c[3] - c[1]) / h),
+    ]
+}
+
+/// The ignore regions of `frames` ([`IgnoreFile`]). Labels are kept as reviewed, in the class list
+/// or not: such a box needs no class id, and the object is just as real.
+pub fn ignore_file(frames: &[ExportFrame]) -> IgnoreFile {
+    let images = frames
+        .iter()
+        .filter_map(|f| {
+            let list: Vec<IgnoreBox> = f
+                .ignore_boxes()
+                .into_iter()
+                .map(|b| {
+                    let [cx, cy, w, h] = yolo_numbers(b, f);
+                    IgnoreBox {
+                        label: b.label.clone(),
+                        cx,
+                        cy,
+                        w,
+                        h,
+                    }
+                })
+                .collect();
+            (!list.is_empty()).then(|| (f.name.clone(), list))
+        })
+        .collect();
+    IgnoreFile {
+        version: IGNORE_VERSION,
+        images,
+    }
 }
 
 /// COCO instances JSON of `frames` (file names as given): category ids 1..=K in `classes`
@@ -305,7 +385,8 @@ fn tags(f: &ExportFrame) -> Vec<String> {
 }
 
 /// The benchmark manifest of `frames`: their training boxes as ground truth, scored on
-/// `classes` only (predictions of other labels count neither way); unsure boxes are `ignore`.
+/// `classes` only (predictions of other labels count neither way); ignore regions
+/// ([`LabelBox::is_ignore`], also the too-small rejects that are no training box) are `ignore`.
 pub fn benchmark_manifest(frames: &[&ExportFrame], classes: &[String], id: &str) -> Manifest {
     Manifest {
         id: id.to_string(),
@@ -324,12 +405,12 @@ pub fn benchmark_manifest(frames: &[&ExportFrame], classes: &[String], id: &str)
                 height: Some(f.height),
                 tags: tags(f),
                 objects: Some(
-                    f.boxes()
+                    f.placed(|b| b.is_training() || b.is_ignore())
                         .into_iter()
                         .map(|b| ManifestObject {
                             label: b.label.clone(),
                             bbox: clamp_box(b.bbox, f.width, f.height),
-                            ignore: b.difficult,
+                            ignore: b.is_ignore(),
                             crowd: false,
                         })
                         .collect(),
@@ -418,9 +499,11 @@ pub struct ExportReport {
     pub val: usize,
     pub empty_confirmed: usize,
     pub per_class: BTreeMap<String, u64>,
-    /// Rejected model / auto boxes listed in `hard_negatives.json` (duplicates sit on real objects
-    /// and are left out, [`LabelFile::hard_negatives`]).
+    /// Rejected model / auto boxes listed in `hard_negatives.json` (duplicates and too-small boxes
+    /// sit on real objects and are left out, [`LabelFile::hard_negatives`]).
     pub hard_negative_boxes: usize,
+    /// Ignore regions listed in [`IGNORE_FILE`].
+    pub ignore_boxes: usize,
     /// Groups and their split.
     pub splits: Vec<GroupSplit>,
     /// Format -> path written.
@@ -822,6 +905,9 @@ pub fn run_filtered(
     r.hard_negative_boxes = negatives.len();
     if !frames.is_empty() {
         write_file(&out.join("hard_negatives.json"), &json_bytes(&negatives)?)?;
+        let ignore = ignore_file(&frames);
+        r.ignore_boxes = ignore.images.values().map(Vec::len).sum();
+        write_file(&out.join(IGNORE_FILE), &json_bytes(&ignore)?)?;
     }
     r.warnings = warnings;
     write_file(&out.join("export.json"), &json_bytes(&r)?)?;
@@ -1337,6 +1423,77 @@ mod tests {
     }
 
     #[test]
+    fn too_small_rejects_are_ignored_in_the_benchmark_and_listed_for_training() {
+        let tiny = LabelBox {
+            reject_reason: Some(super::super::RejectReason::TooSmall),
+            ..lb("person", [20.0, 10.0, 24.0, 18.0], BoxState::Rejected)
+        };
+        let unsure = LabelBox {
+            difficult: true,
+            ..lb("raccoon", [100.0, 10.0, 140.0, 40.0], BoxState::Accepted)
+        };
+        let wrong = lb("dog", [50.0, 50.0, 60.0, 60.0], BoxState::Rejected);
+        // Off the frame once clamped: nothing to ignore.
+        let gone = LabelBox {
+            reject_reason: Some(super::super::RejectReason::TooSmall),
+            ..lb("person", [300.0, 10.0, 320.0, 30.0], BoxState::Rejected)
+        };
+        let keep = lb("dog", [20.0, 10.0, 60.0, 50.0], BoxState::Accepted);
+        let f = frame(vec![keep, tiny, unsure, wrong, gone], false);
+        // Neither reaches YOLO or COCO as a label: the rejected box was never one.
+        assert_eq!(
+            yolo_txt(&f, &classes()).unwrap(),
+            "1 0.200000 0.300000 0.200000 0.400000\n"
+        );
+        assert_eq!(
+            coco_json(&[&f], &classes()).unwrap()["annotations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "the accepted box and the unsure one"
+        );
+        let m = benchmark_manifest(&[&f], &classes(), "t");
+        let objs: Vec<(&str, bool)> = m.images[0]
+            .objects
+            .iter()
+            .flatten()
+            .map(|o| (o.label.as_str(), o.ignore))
+            .collect();
+        assert_eq!(
+            objs,
+            [("dog", false), ("person", true), ("raccoon", true)],
+            "the plain reject is no ground truth"
+        );
+        let plain = frame(
+            vec![lb("dog", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted)],
+            true,
+        );
+        let file = ignore_file(&[f.clone(), plain]);
+        assert_eq!(file.version, IGNORE_VERSION);
+        assert_eq!(file.images.len(), 1, "a frame without any is not listed");
+        assert_eq!(
+            file.images[&f.name],
+            [
+                IgnoreBox {
+                    label: "person".into(),
+                    cx: 0.11,
+                    cy: 0.14,
+                    w: 0.02,
+                    h: 0.08,
+                },
+                IgnoreBox {
+                    label: "raccoon".into(),
+                    cx: 0.6,
+                    cy: 0.25,
+                    w: 0.2,
+                    h: 0.3,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn hard_negatives_carry_the_reject_reason() {
         let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
         let dir = root.join("dataset");
@@ -1357,6 +1514,11 @@ mod tests {
                     reject_reason: Some(super::super::RejectReason::Duplicate),
                     ..lb("person", [30.0, 4.0, 60.0, 39.0], BoxState::Rejected)
                 },
+                // Real, only too small to label: no false positive either.
+                LabelBox {
+                    reject_reason: Some(super::super::RejectReason::TooSmall),
+                    ..lb("person", [50.0, 30.0, 60.0, 45.0], BoxState::Rejected)
+                },
             ],
             false,
         );
@@ -1369,7 +1531,22 @@ mod tests {
             hidden_classes: Vec::new(),
         };
         let r = run(&dir, &classes(), &req).unwrap();
-        assert_eq!(r.hard_negative_boxes, 2, "the duplicate is left out");
+        assert_eq!(r.hard_negative_boxes, 2, "duplicate and too small left out");
+        assert_eq!(r.ignore_boxes, 1);
+        let ignore: IgnoreFile =
+            serde_json::from_slice(&std::fs::read(root.join("out").join(IGNORE_FILE)).unwrap())
+                .unwrap();
+        let (name, list) = ignore.images.iter().next().unwrap();
+        assert!(root.join("out/images/train").join(name).is_file(), "{name}");
+        assert_eq!(list[0].label, "person");
+        // What a training run reads back from a real export.
+        let source = crate::training::dataset::read_export(&root.join("out")).unwrap();
+        let frame = &source.frames[0];
+        assert_eq!(frame.boxes.len(), 1);
+        assert_eq!(frame.ignore.len(), 1);
+        assert_eq!(frame.ignore[0].class, "person");
+        assert!((frame.ignore[0].cx - 0.859_375).abs() < 1e-6);
+        assert!((frame.ignore[0].h - 0.3125).abs() < 1e-6);
         let neg: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(root.join("out/hard_negatives.json")).unwrap(),
         )

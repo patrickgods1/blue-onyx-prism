@@ -1194,7 +1194,8 @@
       else if (b.score != null) why.push('score ' + fmtScore(b.score));
       // Most verification errors are on small objects: say so (the close-up is at least 2x).
       if (Math.min(b.bbox[2] - b.bbox[0], b.bbox[3] - b.bbox[1]) < 24) why.unshift('small: check closely');
-      if (b.difficult) why.unshift('marked unsure: kept, not trained on (YOLO), ignored by the benchmark');
+      if (b.difficult) why.unshift('marked unsure: kept out of training, its frame goes to held-out only, ignored by the benchmark');
+      if (b.state === 'rejected' && b.reject_reason === 'too_small') why.unshift('too small: a real object, no negative; its frame goes to held-out only, ignored by the benchmark');
       if (b.state === 'rejected' && b.reject_reason) why.unshift('why: ' + reasonText(b.reject_reason));
       if (why.length) decide.appendChild(el('div', 'rv-q-why muted', why.join(' · ')));
       var rp = b.state === 'pending' ? repeatOf(b) : null;
@@ -1209,8 +1210,15 @@
       other.setAttribute('aria-expanded', classGrid ? 'true' : 'false');
       btns.appendChild(other);
       var unsure = decideButton(b.difficult ? 'Not unsure' : 'Unsure', 'd', 'secondary', toggleUnsure);
-      unsure.title = 'A real object you cannot name for sure: kept, left out of YOLO training, ignored by the benchmark set';
+      unsure.title = 'A real object you cannot name for sure: kept out of training, its frame goes to held-out only, ignored by the benchmark';
       btns.appendChild(unsure);
+      // A drawn box has nothing to reject: deleting it is the way out (Unsure still applies).
+      if (b.source !== 'human') {
+        var small = decideButton('Too small', null, 'secondary' + (b.reject_reason === 'too_small' ? ' active' : ''), tooSmall);
+        small.title = 'A real object too small to label (same as reason ' + (reasonIndex('too_small') + 1) + ', Shift+' + (reasonIndex('too_small') + 1) +
+          '): rejected but never a negative, its frame goes to held-out only, ignored by the benchmark';
+        btns.appendChild(small);
+      }
       decide.appendChild(btns);
       var mate = dupPartner(i);
       if (mate >= 0) {
@@ -1235,8 +1243,9 @@
         }
         var everywhere = b.state === 'rejected' || (b.state === 'pending' && rp && rp.verdict === 'rejected') ? 'reject'
           : (b.state === 'accepted' || (b.state === 'pending' && rp && rp.verdict === 'accepted') ? 'accept' : null);
-        // A duplicate says nothing about the spot: another box stays on the object there.
-        if (b.state === 'rejected' && b.reject_reason === 'duplicate') everywhere = null;
+        // A duplicate says nothing about the spot: another box stays on the object there. Too
+        // small neither: a real object, and a bulk reject would take frames out of training.
+        if (b.state === 'rejected' && (b.reject_reason === 'duplicate' || b.reject_reason === 'too_small')) everywhere = null;
         if (everywhere) {
           var eb = button((everywhere === 'reject' ? 'Reject' : 'Accept') + ' this spot on all ' + camOf(cur.frame) + ' frames…',
             function () { spotEverywhere(i, everywhere === 'accept'); }, 'secondary');
@@ -1413,6 +1422,11 @@
   var REASON_MS = 4000;
   var reasonAsk = null;   // {frame, i, timer}: the chips offered after a rejection
 
+  function reasonIndex(r) {
+    for (var n = 0; n < REASONS.length; n++) if (REASONS[n][0] === r) return n;
+    return -1;
+  }
+
   function reasonText(r) {
     for (var n = 0; n < REASONS.length; n++) if (REASONS[n][0] === r) return REASONS[n][1];
     return r;
@@ -1452,9 +1466,25 @@
     refresh();
   }
 
+  // The Too small button: the selected box is a real object too small to label. Rejected with
+  // reason too_small, which makes it an ignore region (LabelBox::is_ignore), no hard negative. On
+  // a box already rejected only the reason changes (again: cleared, like its reason chip), since
+  // setState leaves a confirmed rejection as it is.
+  function tooSmall() {
+    var i = selected, b = boxes()[i];
+    if (!b) { say('No box selected: j selects one.'); return; }
+    if (b.state !== 'rejected') { rejectWith(i, 'too_small'); return; }
+    snapshot();
+    if (b.reject_reason === 'too_small') delete b.reject_reason; else b.reject_reason = 'too_small';
+    say('Box ' + (i + 1) + ' rejected' + (b.reject_reason ? ': ' + reasonText('too_small') : '') + '.');
+    clearReason(true);
+    refresh();
+  }
+
   // `d`: the selected box is a real object the reviewer cannot name for sure (VOC "difficult"):
-  // kept, left out of the YOLO export, ignored by the benchmark set; then the next box. Again on
-  // an unsure box: no longer unsure (its decision stays).
+  // an ignore region (LabelBox::is_ignore), so kept out of training, its frame held-out only,
+  // ignored by the benchmark; then the next box. Again on an unsure box: no longer unsure (its
+  // decision stays).
   function toggleUnsure() {
     var b = boxes()[selected];
     if (!b) { say('No box selected: j selects one.'); return; }
@@ -1538,10 +1568,11 @@
   }
 
   // A decision of the reviewer's own (the server's rule, repeats.rs `counts`). A duplicate is no
-  // verdict on the spot: another box stays on the object there.
+  // verdict on the spot: another box stays on the object there. Too small neither: a real object,
+  // only too small to label.
   function lookedAt(b) {
     return b.source !== 'human' && (b.state === 'accepted' || b.state === 'rejected') &&
-      b.reject_reason !== 'duplicate' &&
+      b.reject_reason !== 'duplicate' && b.reject_reason !== 'too_small' &&
       ['low_score', 'other_class', 'repeat_spot', 'rest_rejected'].indexOf(b.reason) < 0;
   }
 
@@ -2343,8 +2374,9 @@
   function noteSaved(body) {
     var acc = 0, rej = 0;
     body.boxes.forEach(function (b) {
-      // A duplicate is no verdict on an object: it would read as a false positive here.
-      if (b.source === 'human' || b.reject_reason === 'duplicate') return;
+      // A duplicate or a too-small box is no verdict on an object: it would read as a false
+      // positive here.
+      if (b.source === 'human' || b.reject_reason === 'duplicate' || b.reject_reason === 'too_small') return;
       var r = resolved(b);
       if (r === 'accepted') acc++; else if (r === 'rejected') rej++;
     });
@@ -2447,8 +2479,8 @@
     ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps (stacked, nested or partly overlapping)'],
     ['Decide', 'Shift+U', 'stacked boxes: keep the best of each stack, reject the others as duplicates'],
     ['Decide', 'y', 'overlap suggestion: accept the one on screen (drops the box marked drop?, as a duplicate; or keeps both as two objects). Doing anything else ignores it'],
-    ['Decide', 'd', 'unsure: a real object you cannot name for sure (kept, left out of YOLO training, ignored by the benchmark set; ?! on the box); again: not unsure'],
-    ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate)'],
+    ['Decide', 'd', 'unsure: a real object you cannot name for sure: kept out of training, its frame goes to held-out only, ignored by the benchmark (?! on the box); again: not unsure'],
+    ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate). Too small is also a button in the decision card: a real object too small to label, no negative, treated like unsure'],
     ['Decide', 'Shift+A', 'accept proposals: the pending boxes saving would accept (flagged ? boxes and hints stay pending)'],
     ['Decide', 'Shift+R', 'reject the rest: every box still undecided'],
     ['Decide', 'e', 'confirmed empty (rejects every box)'],
@@ -3262,7 +3294,8 @@
       var lines = [
         'Exported ' + r.frames + ' frame(s) (' + r.train + ' train, ' + r.val + ' held out, ' +
           r.empty_confirmed + ' confirmed empty) to ' + r.out_dir,
-        'Boxes per class: ' + (per || 'none') + '; ' + r.hard_negative_boxes + ' rejected box(es) in hard_negatives.json'
+        'Boxes per class: ' + (per || 'none') + '; ' + r.hard_negative_boxes + ' rejected box(es) in hard_negatives.json; ' +
+          (r.ignore_boxes || 0) + ' unsure / too-small box(es) in ignore.json'
       ];
       var cf = r.class_filter || {};
       if ((cf.labels && cf.labels.length) || cf.include_empty === false) {

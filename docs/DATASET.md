@@ -326,15 +326,19 @@ folder; the collector and the Dataset page keep `collect.dir`.
 - **`orig_bbox`:** the proposed box before the reviewer moved or resized it (set by the page; checked
   and clamped like `bbox`, dropped when equal to it).
 - **`difficult`** (written only when true): the reviewer marked the box *unsure* (Review page `d`), a
-  real object they cannot name for sure (PASCAL VOC `difficult`). It is left out of the YOLO labels (the
-  frame and its other boxes stay), carries `"attributes": {"difficult": true}` in COCO, is `ignore` in the
-  benchmark manifest and `difficult` in X-AnyLabeling (both ways). Cleared on a rejected box.
+  real object they cannot name for sure (PASCAL VOC `difficult`). It is an [ignore region](#ignore-regions):
+  left out of the YOLO labels and listed in `ignore.json`, `ignore` in the benchmark manifest. It carries
+  `"attributes": {"difficult": true}` in COCO and `difficult` in X-AnyLabeling (both ways). Cleared on a
+  rejected box.
 - **`reject_reason`** (optional, rejected boxes only): why the reviewer rejected it (Review page,
   Shift+1-9 after `r`): `false_positive`, `duplicate`, `insect_web`, `rain_snow`, `ir_glare`,
   `reflection`, `static_object`, `other_object`, `too_small`. Absent = a plain false positive; a
   value this build does not know (a newer build's) loads and is written back unchanged (the API refuses
   one it is sent). Separate from `reason`, which is provenance. Copied to `hard_negatives.json`, which
-  leaves out `duplicate` boxes (they sit on real objects).
+  leaves out `duplicate` and `too_small` boxes (they sit on real objects). `too_small` (the *Too small*
+  button of the decision card, or its reason chip) also makes the box an
+  [ignore region](#ignore-regions), and like `duplicate` it says nothing about the spot, so the repeats
+  history and "rejected here N times" skip it. Frames reviewed earlier follow this without a rewrite.
 - **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
   cannot have accepted or added boxes.
 - **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
@@ -652,11 +656,31 @@ Click a box to select it. Drag on the image to draw a new one.
   annotations/instances_{train,val}.json   COCO: categories 1..K in class order, image / annotation ids from 1,
                                        bbox [x, y, w, h] px (2 decimals), area = w * h, iscrowd 0,
                                        attributes.difficult on unsure boxes (left out of YOLO)
-  hard_negatives.json                  every rejected model / auto box (frame, label, bbox, origin, reason, reject_reason)
+  hard_negatives.json                  rejected model / auto boxes (frame, label, bbox, origin, reason, reject_reason), without
+                                       duplicate and too_small ones
+  ignore.json                          ignore regions per image, below
   xanylabeling/<name>.jpg + .json      X-AnyLabeling files (below)
   benchmark/images/<name>.jpg + manifest.json   a benchmark `dir:` set
   export.json                          the report, written last
 ```
+
+<a id="ignore-regions"></a>**Ignore regions.** A real object not to train on, and no negative either: an
+unsure box (`difficult`), or a box rejected with `reject_reason: too_small`. YOLO has no way to say "skip
+this object", and a frame trained with it unlabelled teaches the object as background, so a training run
+takes such a frame out of train and valid (counted, `ignore_frames` in `dataset.json`, with a warning). It
+stays in the held-out set, where the box is `ignore`: a detection on it counts neither way. `ignore.json`
+at the export's root carries them, in the numbers of a YOLO label line, so no pixel size is needed to read it:
+
+```json
+{ "version": 1,
+  "images": { "ir.drive.2026-10-22.20261022T010203004Z_abcd.jpg":
+                [ { "label": "person", "cx": 0.11, "cy": 0.14, "w": 0.02, "h": 0.08 } ] } }
+```
+
+Keys are the image file names of `images/<split>/`, a frame without regions is not listed, and labels stay
+as reviewed even outside the class list. Written with every export format. A folder without the file has no
+regions, so an export from an older version still reads, with those objects unlabelled as before: export
+again to use them. A damaged file stops the run rather than teach them as background.
 
 **Split.** Frames are split by camera and day (the date folder), so held-out frames come from cameras
 and days the model did not train on.
@@ -667,7 +691,8 @@ and days the model did not train on.
   of 2^64, fall below `holdout_fraction`. This is deterministic, and stable when days are added.
 - Once there are two or more camera-days, at least one goes to each side.
 
-**Benchmark set.** `manifest.json` gives each frame its training boxes as ground truth. `scored_labels`
+**Benchmark set.** `manifest.json` gives each frame its training boxes as ground truth, and its ignore
+regions (too-small rejects included) as `ignore` objects. `scored_labels`
 is the class list, so predictions of other labels count neither way. The tags are:
 
 - `<scene>`, `camera:<c>`, `date:<d>`, `split:<s>`, and `bucket:<b>` for each bucket;

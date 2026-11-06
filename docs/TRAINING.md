@@ -170,6 +170,7 @@ The Training page lists the folders in `training.datasets` and the Review page's
      labels/train/<same stem>.txt               YOLO `class cx cy w h`, normalized; empty = no objects
      labels/val/...
      benchmark/manifest.json                    tags: scene, camera:<c>, date:<d>, hard-negative
+     ignore.json                                ignore regions per image
    ```
 
    Scene, camera and date come from the flat file name (or the manifest tags). The export's `val`
@@ -180,7 +181,8 @@ The Training page lists the folders in `training.datasets` and the Review page's
    the held-out images, and a `manifest.json` in the benchmark format whose tags (`day` | `night` |
    `ir` | `grayscale`, `camera:<c>`, `date:<YYYY-MM-DD>`, `hard-negative`) give scene, camera and day.
 
-A missing label file means "no objects" (the Ultralytics convention).
+A missing label file means "no objects" (the Ultralytics convention). `ignore.json` beside the labels
+lists [ignore regions](#ignore-regions); no file means none.
 
 ### Assembly (`src/training/dataset.rs`)
 
@@ -201,7 +203,9 @@ A missing label file means "no objects" (the Ultralytics convention).
    frames are split one by one, with a warning that the benchmark is optimistic. The held-out set
    keeps every scene, so a day model is also measured on night frames, and the same exports give the
    same held-out frames whatever the scene filter. `dataset.json` holds `heldout_fingerprint` (SHA-256
-   of the sorted held-out frame keys), copied into the run's benchmark summary; the held-out
+   of the sorted held-out frame keys, a frame's ignore regions part of its key, so runs scored with other
+   regions do not compare; a set without regions keeps the value older versions wrote), copied into the
+   run's benchmark summary; the held-out
    `manifest.json` tags each frame with its scene plus `heldout:<scene>`, `heldout:all` and, for a
    frame of the run's scenes, `heldout:in-scope`, which the benchmark summary reads for per-scene AP.
 3. **Scene filter** (training and validation frames only): `all`, or any combination of `day`,
@@ -209,7 +213,7 @@ A missing label file means "no objects" (the Ultralytics convention).
    page's checkboxes). Frames without a scene tag are left out by every filter but `all`, with a
    warning. **Behaviour change**: `night` alone now means night frames only and `ir` IR frames only;
    use `night+ir` for both (what `night` used to mean). Saved requests and configs with the old
-   spellings still load.
+   spellings still load. In-scope frames with [ignore regions](#ignore-regions) leave the pool next.
 4. **Hard negatives**: about `training.negative_share` (15%) of the training frames have no objects:
    extra empty frames are dropped (reviewer-confirmed ones are kept first); too few give a warning.
 5. **Validation**: 10% of your own training frames (of all training frames when there are none),
@@ -291,8 +295,29 @@ Output in `<training dir>/<run id>/data/`: `images/`, `labels/` (hard links, els
 `classes.txt`, `train.txt` / `valid.txt` (repeats as repeated lines), `data.yaml` (Ultralytics),
 `train.coco.json` / `valid.coco.json` (category ids 0..C-1, `file_name` relative to the folder; a
 repeated frame is a separate image entry), `heldout/` (a benchmark `dir:` set: `images/`, YOLO
-`labels/`, `classes.txt`, `manifest.json` with tags and `scored_labels`) and `dataset.json` (sources,
-licences, counts, warnings). `train prepare --out <dir>` writes the same without training.
+`labels/`, `classes.txt`, `manifest.json` with tags, `scored_labels` and every frame's `objects`) and
+`dataset.json` (sources, licences, counts, warnings). `train prepare --out <dir>` writes the same without
+training.
+
+### Ignore regions
+
+An unsure box (Review page `d`) or a box rejected as too small (the *Too small* button) means "a real
+object, do not train on it" (`docs/DATASET.md`, Ignore regions). None of the trainers here can leave a box
+out of its loss: Ultralytics and transformers show no ignore support and RF-DETR's crowd handling makes
+such a box background. So the frame goes, as for a public set's `ignore` objects:
+
+- **Train and valid:** frames with a region are left out, counted as `ignore_frames` in `dataset.json`, with
+  a warning. The scene filter comes first, so only in-scope frames count.
+- **Held out:** the frames stay. Their `manifest.json` entry has `objects` for every frame: the boxes read
+  back from the frame's YOLO lines, so they score exactly as `labels/` did, and the regions with
+  `ignore: true`, renamed like the boxes. A region of a label the run has no class for is left out, as
+  predictions of that label are not scored. A detection of the region's label that overlaps it at the IoU
+  being scored counts neither way (a detection of another label is still a false positive), the region is
+  never a miss, and a frame of regions only is scored as empty. A frame with no objects stays an empty list,
+  so it stays scored as empty.
+
+An export from an older version has no `ignore.json`, so its unsure objects stay unlabelled in training:
+export again.
 
 ### Class inventory
 
