@@ -199,6 +199,9 @@ pub struct HistoryEntry {
     pub devices: Vec<DeviceSnap>,
     #[serde(default)]
     pub threshold: Option<ThresholdSnap>,
+    /// [`ModelResult::trained_on_share`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trained_on_share: Option<f64>,
 }
 
 /// `openvino` / `onnxruntime` of a device spec (`openvino:gpu`, `ort:cuda:0`, legacy `GPU`).
@@ -377,6 +380,7 @@ impl From<&ModelResult> for HistoryEntry {
                 exact_score: a.best.as_ref().and_then(|b| b.exact_score),
                 device: a.device.clone(),
             }),
+            trained_on_share: m.trained_on_share,
         }
     }
 }

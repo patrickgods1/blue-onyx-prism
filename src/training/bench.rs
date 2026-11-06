@@ -10,9 +10,14 @@
 //! those images and never mix in the built-in sets run beside it (their bare `day` / `night` tags
 //! would). Held-out sets of older versions only carry the bare scene tags: they are read when the
 //! held-out set was the only dataset of the run, and give no `in_scope`.
+//!
+//! The current default model then runs on the same sets and devices ([`baseline_skip`] says when
+//! it cannot), so the Use card compares like with like ([`compare_text`]). Its results stay in
+//! the run's folder: a set of a few hundred frames must not replace the default model's saved
+//! benchmark, its threshold advice or its `auto` device order.
 
 use super::dataset;
-use super::job::{BenchSummary, SceneAp};
+use super::job::{Baseline, BenchSummary, SceneAp};
 use crate::backend::DeviceSpec;
 use crate::benchmark::Breakdown;
 use crate::benchmark::report::ModelResult;
@@ -144,6 +149,109 @@ pub fn run(
     }))
 }
 
+/// Why the current default cannot be compared on a run's frames; None = it can. `default` is the
+/// current default's name, `loaded` whether it is loaded, `default_classes` the classes it
+/// reports (None = could not be read: the run itself will tell).
+pub fn baseline_skip(
+    default: Option<&str>,
+    new: &str,
+    new_classes: &[String],
+    default_classes: Option<&[String]>,
+    loaded: bool,
+) -> Option<String> {
+    use super::autolabel::catalog::same_class;
+    let Some(default) = default else {
+        return Some("no model is enabled as the default".to_string());
+    };
+    if crate::registry::normalize_name(default) == crate::registry::normalize_name(new) {
+        return Some(format!(
+            "{new} is the default model itself, so there is nothing to compare it with"
+        ));
+    }
+    if !loaded {
+        return Some(format!(
+            "{default} is not loaded, so it could not run; once it is, benchmark it on the \
+             Benchmark page"
+        ));
+    }
+    if let Some(classes) = default_classes.filter(|c| !c.is_empty())
+        && !new_classes.is_empty()
+        && !classes
+            .iter()
+            .any(|c| new_classes.iter().any(|n| same_class(c, n)))
+    {
+        return Some(format!(
+            "{default} reports none of the classes of {new} ({}), so the same frames say nothing \
+             about it",
+            new_classes.join(", ")
+        ));
+    }
+    None
+}
+
+/// The chip of a benchmark that includes the model's own training frames; None without any.
+pub fn trained_chip(share: f64) -> Option<String> {
+    (share.is_finite() && share > 0.0).then(|| {
+        let p = (share * 100.0).round().max(1.0);
+        format!("{p:.0}% of these frames are its own training frames")
+    })
+}
+
+/// `91% of people, 84% of vehicles, 3 false alerts on 120 empty frames (threshold 0.50)`.
+fn finds_text(b: &BenchSummary) -> String {
+    let pct = |v: Option<f64>| {
+        v.filter(|v| v.is_finite())
+            .map(|v| format!("{:.0}%", v * 100.0))
+    };
+    let mut finds = Vec::new();
+    if let Some(p) = pct(b.person_recall) {
+        finds.push(format!("{p} of people"));
+    }
+    if let Some(p) = pct(b.vehicle_recall) {
+        finds.push(format!("{p} of vehicles"));
+    }
+    let mut s = if finds.is_empty() {
+        "finds n/a".to_string()
+    } else {
+        format!("finds {}", finds.join(", "))
+    };
+    match (b.empty_frame_alerts, b.empty_frames.filter(|e| *e > 0)) {
+        (Some(a), Some(e)) => s.push_str(&format!(", false alerts {a} on {e} empty frames")),
+        _ => s.push_str(", false alerts n/a (no empty frames)"),
+    }
+    if let Some(t) = b.threshold {
+        s.push_str(&format!(" (threshold {t:.2})"));
+    }
+    s
+}
+
+/// The line of the run row and the Use card: the new model and the current default on the same
+/// frames, or why they were not compared. Empty when no comparison was tried.
+pub fn compare_text(new: Option<&BenchSummary>, baseline: Option<&Baseline>) -> String {
+    let (Some(new), Some(b)) = (new, baseline) else {
+        return String::new();
+    };
+    let Some(cur) = &b.summary else {
+        let why = b.note.as_deref().unwrap_or("no result");
+        return format!("Not compared with the current default model: {why}.");
+    };
+    let frames = if new.datasets.len() > 1 {
+        format!("{} frames ({})", new.images, new.datasets.join(" + "))
+    } else {
+        format!("{} held-out frames", new.images)
+    };
+    let mut s = format!(
+        "On {frames}: new {}; current ({}) {}.",
+        finds_text(new),
+        b.model,
+        finds_text(cur)
+    );
+    if let Some(c) = cur.trained_on_share.and_then(trained_chip) {
+        s.push_str(&format!(" For {}, {c}, so it has an unfair lead.", b.model));
+    }
+    s
+}
+
 /// The Training page's view of a benchmark result: the recommended device (else the first that
 /// ran), its p50 time and AP50 (over every class of the model when the set annotates others),
 /// and the alerting figures of its overall score (person / vehicle recall, false alerts on empty
@@ -216,6 +324,7 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
         by_scene,
         in_scope,
         heldout_fingerprint: None,
+        trained_on_share: m.trained_on_share,
     }
 }
 
@@ -253,6 +362,105 @@ mod tests {
         );
         assert!(c.runtimes.is_none());
         assert!(devices_for(&mut c, "other", &[]).is_err());
+    }
+
+    #[test]
+    fn baseline_skip_reasons() {
+        let new = vec!["person".to_string(), "car".to_string()];
+        let skip = |d, c, l| baseline_skip(d, "new-model", &new, c, l);
+        let coco = ["person".to_string(), "dog".to_string()];
+        assert_eq!(skip(Some("IPcam"), Some(&coco[..]), true), None);
+        // An unreadable class list does not stop it: the run will tell.
+        assert_eq!(skip(Some("IPcam"), None, true), None);
+        assert_eq!(skip(Some("IPcam"), Some(&[]), true), None);
+        assert!(skip(None, None, true).unwrap().contains("no model"));
+        let e = skip(Some("New-Model.onnx"), None, true).unwrap();
+        assert!(e.contains("default model itself"), "{e}");
+        let e = skip(Some("IPcam"), Some(&coco[..]), false).unwrap();
+        assert!(
+            e.contains("IPcam is not loaded") && e.contains("Benchmark page"),
+            "{e}"
+        );
+        let dogs = ["dog".to_string()];
+        let e = skip(Some("IPcam"), Some(&dogs[..]), true).unwrap();
+        assert!(
+            e.contains("none of the classes") && e.contains("person, car"),
+            "{e}"
+        );
+        // Same class under two spellings: shared.
+        let cycles = ["motorbike".to_string()];
+        let m = ["motorcycle".to_string()];
+        assert_eq!(
+            baseline_skip(Some("a"), "b", &m, Some(&cycles[..]), true),
+            None
+        );
+    }
+
+    fn summary(person: f64, alerts: usize) -> BenchSummary {
+        BenchSummary {
+            datasets: vec!["heldout-x".into()],
+            images: 251,
+            threshold: Some(0.5),
+            person_recall: Some(person),
+            vehicle_recall: Some(0.8),
+            empty_frames: Some(120),
+            empty_frame_alerts: Some(alerts),
+            ..BenchSummary::default()
+        }
+    }
+
+    #[test]
+    fn compare_text_sets_both_models_side_by_side() {
+        let new = summary(0.91, 3);
+        let base = Baseline {
+            model: "IPcam".into(),
+            summary: Some(summary(0.72, 9)),
+            note: None,
+        };
+        let t = compare_text(Some(&new), Some(&base));
+        assert_eq!(
+            t,
+            "On 251 held-out frames: new finds 91% of people, 80% of vehicles, false alerts 3 on \
+             120 empty frames (threshold 0.50); current (IPcam) finds 72% of people, 80% of \
+             vehicles, false alerts 9 on 120 empty frames (threshold 0.50)."
+        );
+        // A default that trained on these frames has a lead the reader must see.
+        let mut unfair = base.clone();
+        unfair.summary.as_mut().unwrap().trained_on_share = Some(0.25);
+        assert!(compare_text(Some(&new), Some(&unfair)).contains("25% of these frames"));
+        // Skipped, or never tried.
+        let skipped = Baseline {
+            model: "IPcam".into(),
+            summary: None,
+            note: Some("IPcam is not loaded".into()),
+        };
+        assert_eq!(
+            compare_text(Some(&new), Some(&skipped)),
+            "Not compared with the current default model: IPcam is not loaded."
+        );
+        assert_eq!(compare_text(Some(&new), None), "");
+        assert_eq!(compare_text(None, Some(&base)), "");
+        // With a built-in set beside the held-out frames the words say so.
+        let mut more = new.clone();
+        more.datasets.push("nir-night".into());
+        assert!(compare_text(Some(&more), Some(&base)).contains("frames (heldout-x + nir-night)"));
+    }
+
+    #[test]
+    fn the_chip_only_shows_a_share_above_zero() {
+        assert_eq!(trained_chip(0.0), None);
+        assert_eq!(trained_chip(f64::NAN), None);
+        assert_eq!(
+            trained_chip(0.625).as_deref(),
+            Some("63% of these frames are its own training frames")
+        );
+        assert!(
+            trained_chip(0.001).unwrap().starts_with("1%"),
+            "never rounds away"
+        );
+        let mut m = result(vec![], false);
+        m.trained_on_share = Some(0.5);
+        assert_eq!(summarize(&m).trained_on_share, Some(0.5));
     }
 
     #[test]

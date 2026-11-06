@@ -15,6 +15,7 @@
 </section>
 {% if let Some(n) = force_cpu_note %}<p class="warn">{{ n }} <a href="/config#inference">Change</a></p>{% endif %}
 {% if let Some(n) = openvino_note %}<p class="warn">{{ n }}</p>{% endif %}
+{% include "revert.html" %}
 <h2>Models</h2>
 <div class="scroll">
 <table class="models">

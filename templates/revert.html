@@ -1,0 +1,7 @@
+{% if let Some(v) = revert %}<div class="warn tr-revert" id="revert-default">
+  {% if let Some(why) = v.blocked %}<p>Default model switched from <code>{{ v.to }}</code> to <code>{{ v.from }}</code>{% if !v.at.is_empty() %} on {{ v.at }}{% endif %}. Revert is not possible: {{ why }}</p>
+  <form method="post" action="/training/revert" class="inline"><input type="hidden" name="forget" value="1"><button type="submit" class="small secondary">Forget this record</button></form>
+  {% else %}<p>Default model switched from <code>{{ v.to }}</code> to <code>{{ v.from }}</code>{% if !v.at.is_empty() %} on {{ v.at }}{% endif %}.{% if !v.restores.is_empty() %} Revert also restores: {{ v.restores }}.{% endif %}</p>
+  <form method="post" action="/training/revert" class="inline"><button type="submit" class="small">Revert to {{ v.to }}</button></form>
+  {% endif %}
+</div>{% endif %}

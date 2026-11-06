@@ -253,6 +253,12 @@ pub fn refusal(
 /// Refuse `need` when the volumes of `work` and `dataset` lack the space ([`refusal`]); fine
 /// when the space cannot be determined.
 pub fn check(need: Need, work: &Path, dataset: &Path) -> Result<()> {
+    // A job test's outcome must not depend on how full the machine's disk is; [`refusal`] is tested
+    // on its own.
+    #[cfg(test)]
+    if !crate::training::preflight::REAL_DISK.with(std::cell::Cell::get) {
+        return Ok(());
+    }
     match refusal(
         need,
         (work, space(work)),

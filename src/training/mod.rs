@@ -18,7 +18,9 @@
 //! - [`overlaps`]: the overlap check, suggestions for nested and partly overlapping boxes.
 //! - [`finish`]: the steps after an import chain (reject low-scoring auto boxes, accept the
 //!   settled frames, switch the Review folder).
-//! - [`bench`]: the benchmark at the end of a run.
+//! - [`bench`]: the benchmark at the end of a run, and the current default on the same frames.
+//! - [`switch`]: making a trained model the default safely: the diff, copied settings, the
+//!   suggested threshold, Revert.
 //! - [`cli`]: `blue-onyx-prism train ...`. The Training page is `crate::server` (`/training`).
 //!
 //! Like the export, training is user-triggered only (never by `auto_download`), runs downloaded
@@ -43,6 +45,7 @@ pub mod pyenv;
 pub mod recipe;
 pub mod retry;
 pub mod service;
+pub mod switch;
 pub mod task;
 
 pub use capability::{Accelerator, Capability};

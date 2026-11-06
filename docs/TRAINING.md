@@ -763,9 +763,30 @@ The dataset folders a run uses are checked too: a ticked folder is used as is on
 offered it (`training.datasets` or an export under `<training dir>/exports`); any other value, the typed
 *Another folder* and its *Save folder* must be a browsable folder or one picked in the native dialog.
 
-**Use as** (Trained models card): *Default model* sets `default_model`; *night model of* sets the
-chosen model's `night_model` (IR and dark frames go to the trained model); *verifier of* sets its
-`verify` model. All go through the config page's save path and apply at once.
+**Use as** (Trained models card): *Use as default* first shows what changes (`GET
+/v1/training/switch-preview`, `training/switch.rs`): thresholds, classes (a class reported today and
+not after the switch is called out, since Blue Iris may filter on labels), night model, filters,
+verifier, static suppression, device. *Copy settings from <current>* (default on) copies the per-model
+behaviour settings onto the new model, narrowed to its classes; classes, device and device profiles
+stay. The held-out benchmark's threshold is offered in words (`suggest`, `ThresholdAdvice`, saved as the
+device's confidence profile) and is part of the switch. The switch records `previous_default`, and
+**Revert** (this card and Home, `POST /training/revert`) restores `default_model` and the fields the
+switch changed; it writes the opposite record, so a second Revert redoes the switch. Revert is refused
+with the config unchanged when the old model is gone (the page offers to forget the record), disabled, or
+the default was changed by hand since. *night model of* sets the chosen model's `night_model` (IR and
+dark frames go to the trained model); *verifier of* sets its `verify` model and refuses to replace a
+different verifier unless the confirm names it (`replace_verifier`). All go through the config page's
+save path and apply at once. A camera that names a custom model in Blue Iris keeps using that model.
+
+After a run's benchmark the current default runs on the same sets and devices (`Hooks::baseline`,
+Training page only), so the Use card can say "On N held-out frames: new finds ...; current finds ...".
+Its results stay in `<run>/baseline/`, removed afterwards: they never touch `benchmark.json`, the
+history or the `auto` order. It is skipped, with the reason in the row, when the default is the new
+model, is not loaded, or reports none of its classes.
+
+`trained_on_share` on a benchmark result (`benchmark/trained_on.rs`) is the share of its frames the
+model trained on (frame identity against the run's `train.txt`; None without a training record). Older
+results get it when served. Profiles, Compare and the run row show a chip when it is above 0.
 
 ### System load during training
 

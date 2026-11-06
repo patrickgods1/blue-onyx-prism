@@ -85,7 +85,9 @@
   }
   function card(p, running) {
     var box = el("section", "card profile-card"); box.id = "m-" + encodeURIComponent(p.model);
-    var h = el("h3", "profile-head"); h.appendChild(el("span", "mname", p.model)); h.appendChild(statusChip(p.status)); box.appendChild(h);
+    var h = el("h3", "profile-head"); h.appendChild(el("span", "mname", p.model)); h.appendChild(statusChip(p.status));
+    var trained = PB.trainedChip(p.trainedOnShare); if (trained) h.appendChild(trained);
+    box.appendChild(h);
     var line = el("p", "muted profile-now");
     line.appendChild(document.createTextNode("Runs on now: "));
     line.appendChild(el("code", null, p.running || "not loaded"));

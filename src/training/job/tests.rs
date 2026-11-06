@@ -235,6 +235,7 @@ struct RecHooks {
     registered: Mutex<Vec<TrainOutput>>,
     benched: Mutex<Vec<(Option<PathBuf>, Vec<String>)>>,
     bench_fails: bool,
+    baseline_fails: bool,
 }
 
 impl Hooks for RecHooks {
@@ -260,6 +261,23 @@ impl Hooks for RecHooks {
             ap50: Some(0.61),
             ms_p50: Some(12.0),
             ..BenchSummary::default()
+        }))
+    }
+    fn baseline(
+        &self,
+        _: &TrainOutput,
+        extra: &[String],
+        _: &[String],
+        run_dir: &Path,
+        _: &AtomicBool,
+    ) -> Result<Option<Baseline>> {
+        if self.baseline_fails {
+            bail!("no runtime for the default");
+        }
+        assert!(run_dir.is_dir());
+        Ok(Some(Baseline {
+            model: format!("default+{}", extra.len()),
+            ..Baseline::default()
         }))
     }
 }
@@ -470,6 +488,11 @@ fn a_run_trains_installs_registers_and_benchmarks() {
     assert_eq!(b[0].0.as_deref(), out.prepared.heldout_dir.as_deref());
     assert_eq!(b[0].1, ["nir-night"]);
     assert_eq!(out.benchmark.as_ref().unwrap().ap50, Some(0.61));
+    assert_eq!(
+        out.baseline.as_ref().unwrap().model,
+        "default+1",
+        "the default ran on the same sets"
+    );
     // The commands.
     let cmds = fake.inner.cmds();
     let pip = cmds.iter().find(|c| c.contains(" pip install ")).unwrap();
@@ -558,6 +581,31 @@ fn rfdetr_and_transformers_runs_pass_their_weights() {
         assert!(train.display().contains(&format!("--trainer {trainer}")));
         assert_eq!(out.benchmark, None);
     }
+}
+
+#[test]
+fn a_failed_comparison_is_a_note_and_a_failed_benchmark_skips_it() {
+    let t = tmp("baseline-note");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let hooks = RecHooks {
+        baseline_fails: true,
+        ..RecHooks::default()
+    };
+    let (r, _) = run(&j, &TrainFake::new(), &hooks, &AtomicBool::new(false));
+    let out = r.unwrap();
+    assert!(out.benchmark.is_some(), "the run still succeeds");
+    assert_eq!(
+        out.baseline.unwrap().note.as_deref(),
+        Some("no runtime for the default")
+    );
+    let t = tmp("baseline-none");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let hooks = RecHooks {
+        bench_fails: true,
+        ..RecHooks::default()
+    };
+    let (r, _) = run(&j, &TrainFake::new(), &hooks, &AtomicBool::new(false));
+    assert_eq!(r.unwrap().baseline, None);
 }
 
 #[test]

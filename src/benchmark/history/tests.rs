@@ -53,6 +53,7 @@ fn entry(run_id: &str, devices: Vec<DeviceSnap>) -> HistoryEntry {
         },
         devices,
         threshold: None,
+        trained_on_share: None,
     }
 }
 

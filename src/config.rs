@@ -742,9 +742,36 @@ pub struct Config {
     pub max_image_pixels: u64,
     /// Name of the model that serves `/v1/vision/detection`. None = first enabled entry.
     pub default_model: Option<String>,
+    /// What the last "Use as default" replaced, for its one-click Revert
+    /// ([`crate::training::switch`]). Never validated against `models`: the model it names may
+    /// have been removed since, which Revert reports instead of a config that no longer loads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_default: Option<PreviousDefault>,
     pub models: Vec<ModelConfig>,
     /// Defaults of the benchmark (web UI Benchmark page and `benchmark` CLI).
     pub benchmark: BenchmarkConfig,
+}
+
+/// The record behind Revert ([`Config::previous_default`]). A Revert writes the opposite record
+/// (the two sides swapped), so a second Revert redoes the switch and nothing is lost.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct PreviousDefault {
+    /// The model a Revert goes back to (effective name).
+    pub model: String,
+    /// `default_model` as it was (None = the first enabled model).
+    pub default_model: Option<String>,
+    /// The default model the record was written for; a default changed by hand since then makes
+    /// the record stale, and Revert is no longer offered.
+    pub switched_to: String,
+    /// The fields of `settings` the switch changed; only these go back.
+    pub changed: Vec<String>,
+    /// The entry of the model whose settings the switch changed, before the change; None when
+    /// it changed none. Its name says which entry that is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<ModelConfig>,
+    /// RFC 3339 time of the switch.
+    pub at: String,
 }
 
 /// A benchmark dataset: a built-in set id (`coco-cctv`), `sample` (the embedded image),
@@ -895,6 +922,7 @@ impl Default for Config {
             download_dir: None,
             max_image_pixels: crate::image::MAX_IMAGE_PIXELS_DEFAULT,
             default_model: None,
+            previous_default: None,
             models: Vec::new(),
             benchmark: BenchmarkConfig::default(),
         }

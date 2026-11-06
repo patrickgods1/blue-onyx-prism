@@ -39,7 +39,7 @@
           fps: r.throughput_fps, ap50: ov ? ov.ap50 : null, ap50_95: ov ? ov.ap50_95 : null, roc_auc: acc && acc.frame_roc ? acc.frame_roc.auc : null,
           precision: ov ? ov.precision : null, recall: ov ? ov.recall : null, f1: ov ? ov.f1 : null,
           score: r.grades ? r.grades.accuracy_score : null, grade: r.grades ? r.grades.overall : null, relative: !!(acc && acc.relative),
-          trust: d.trust, recommended: m.recommended === d.device, fellBack: !!r.fell_back, datasets: m.datasets || [], timestamp: m.timestamp, thisRun: m.this_run,
+          trust: d.trust, recommended: m.recommended === d.device, fellBack: !!r.fell_back, datasets: m.datasets || [], timestamp: m.timestamp, thisRun: m.this_run, trainedOn: m.trained_on_share,
           curve: sweep && sweep.overall ? sweep.overall.points : adv ? adv.curve : null,
           roc: sweep && sweep.roc && sweep.roc.curve && sweep.roc.curve.length ? sweep.roc.curve : adv && adv.roc ? adv.roc.curve : null,
           threshold: acc ? acc.threshold : null
@@ -60,7 +60,7 @@
             key: name.toLowerCase() + "|" + dv.device + "|" + e.run_id, model: e.model || name, device: dv.device, devLabel: dv.label, runtime: PB.runtimeOf(dv.device, dv.runtime),
             label: (e.model || name) + " · " + dv.device + " · " + fmt.day(e.timestamp), p50: dv.total_p50_ms, p95: dv.total_p95_ms, infer: dv.infer_p50_ms, fps: dv.fps,
             ap50: dv.ap50, ap50_95: dv.ap50_95, roc_auc: dv.roc_auc, precision: dv.precision, recall: dv.recall, f1: dv.f1, score: null, grade: dv.grade,
-            trust: null, recommended: !!dv.recommended, fellBack: !!dv.fell_back, datasets: (e.settings && e.settings.datasets) || [], timestamp: e.timestamp, curve: null, roc: null
+            trust: null, recommended: !!dv.recommended, fellBack: !!dv.fell_back, datasets: (e.settings && e.settings.datasets) || [], timestamp: e.timestamp, curve: null, roc: null, trainedOn: e.trained_on_share
           });
         });
       });
@@ -211,7 +211,7 @@
     var columns = [
       {id: "model", head: "@model", value: function (r) { return r.model.toLowerCase(); }, render: function (r) {
         var s = el("span"), sw = el("span", "swatch ser-" + PB.colorOf(r.model)); sw.setAttribute("aria-hidden", "true"); s.appendChild(sw); s.appendChild(document.createTextNode(" " + r.model + (r.relative ? " *" : "")));
-        if (r.recommended) { var t0 = el("span", "tag rec", "Recommended"); t0.title = "The best device for this model and your goal"; s.appendChild(t0); } s.className = "nowrap"; return s; }},
+        if (r.recommended) { var t0 = el("span", "tag rec", "Recommended"); t0.title = "The best device for this model and your goal"; s.appendChild(t0); } var t1 = PB.trainedChip(r.trainedOn); if (t1) s.appendChild(t1); s.className = "nowrap"; return s; }},
       {id: "device", head: "@device", value: function (r) { return r.device; }, render: function (r, td) { td.title = r.devLabel || ""; var s = el("span", "nowrap", r.device); if (r.fellBack) s.appendChild(el("span", "tag restart", "fell back")); return s; }},
       {id: "runtime", head: "@runtime", value: function (r) { return r.runtime; }, render: function (r) { return PB.RUNTIME_NAMES[r.runtime] || r.runtime; }}
     ].concat(cols.map(function (c) {

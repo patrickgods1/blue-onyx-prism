@@ -2560,7 +2560,7 @@ mod tests {
         }
         let (s, v) = json(
             &d.state,
-            post_json("/v1/review/export", r#"{"formats": ["yolo", "coco", "benchmark", "xanylabeling"], "holdout_cameras": ["yard"]}"#),
+            post_json("/v1/review/export", r#"{"formats": ["yolo", "coco", "benchmark", "xanylabeling"], "holdout_cameras": ["yard"], "benchmark_split": "all"}"#),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
