@@ -3805,3 +3805,12 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RR-S7 | security | fixed: uploads have a 10 s read deadline and a per-address limit on bodies still arriving; total requests from one Blue Iris are never capped |
 | RR-S8 | security | fixed: protected DACL on `tools\hf`; a failed token rename leaves no temp copy |
 | RR-S9 | security | partly fixed: URL import refuses internal addresses and hosts, by name and after resolving; a redirect to one is not covered, yt-dlp follows redirects itself. Review `out_dir` and `dir` use `allowed_folder`. Docker bases pinned by digest. Dependabot alerts are a repository setting and still off; the hashed pip locks are not suited to Dependabot |
+| RR-R1 | reliability | fixed: submit errors reach the health path, and a dead session marks the model at once |
+| RR-R2 | reliability | fixed: the supervisor keeps retrying a reload that failed (`Status::ReloadFailed`) |
+| RR-R3 | reliability | fixed: a model on a fallback after a memory or device-lost failure retries the better candidate with a long backoff, the current worker serving; other failures are not retried. Classifier in `plan.rs` |
+| RR-R4 | reliability | fixed: a healthy reload or restart keeps the old worker serving until the replacement is Ready; a memory failure retires it and tries again (RR-G5) |
+| RR-R5 | reliability | fixed: a bounded drain answers an overload 503 without breaking the connection |
+| RR-R6 | reliability | fixed: a runtime that lost a listed file is no longer Installed, and downloads again |
+| RR-R7 | reliability | fixed in code, not verified on a GPU: a Failed or stuck model is retired before its reload |
+| RR-R8 | reliability | fixed: bounded reapers free an abandoned backend instead of `mem::forget` |
+| RR-G1 | reliability | reduced, not solved: the root cause of the recorded hangs is unknown. The default is each model's device, several GPUs need a confirmation, the page refuses to start during a job, and a breadcrumb names the last device. A `train` CLI in another process is not seen, and CLI sweeps leave no breadcrumb |

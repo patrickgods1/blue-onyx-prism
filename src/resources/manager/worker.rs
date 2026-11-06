@@ -262,6 +262,15 @@ fn run_job(
     if !local && is_installed(res, &job.target) {
         return Ok(());
     }
+    if !local && let Some(damage) = install_damage(&manifest_path(res, &job.target), &job.target) {
+        tracing::warn!(
+            "{}: {damage} in {}, although its manifest lists it; antivirus or a manual delete \
+             is the usual cause. Installing it again; if it comes back, exclude that folder from \
+             the scanner",
+            res.id,
+            job.target.display()
+        );
+    }
     let total = res.size();
     let mut done = 0u64;
     let mut last_report = Instant::now() - Duration::from_secs(1);
@@ -313,6 +322,7 @@ fn run_job(
                 sha256: res.parts.iter().map(|p| p.sha256.to_string()).collect(),
                 files,
             },
+            &job.target,
         )?;
         return Ok(());
     }
@@ -402,7 +412,7 @@ fn run_job(
             },
             files: got.iter().cloned().collect(),
         };
-        write_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
+        write_manifest(&staging.join(MANIFEST_FILE), &manifest, &staging)?;
         Ok(got)
     })();
     if let Err(e) = result {
@@ -1867,6 +1877,158 @@ mod tests {
         assert_eq!(r("bytes 0-0/*"), None);
         assert_eq!(r("items 1-2/3"), None);
         assert_eq!(r("bytes x-2/3"), None);
+    }
+
+    /// A served ONNX Runtime archive (a catalog entry with its one part pointed at `url`).
+    fn runtime_resource(url: &str, archive: &[u8]) -> &'static Resource {
+        let base = crate::resources::catalog::onnxruntime(
+            "linux",
+            "x86_64",
+            crate::resources::Flavor::Cpu,
+        )
+        .unwrap();
+        let part = Part {
+            url: leak(url.to_string()),
+            sha256: leak(sha_hex(archive)),
+            size: archive.len() as u64,
+            ..base.parts[0]
+        };
+        Box::leak(Box::new(Resource {
+            parts: Box::leak(vec![part].into_boxed_slice()),
+            ..*base
+        }))
+    }
+
+    /// A `.tgz` holding one ONNX Runtime library of `content`.
+    fn runtime_archive(content: &[u8]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(content.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(
+            &mut h,
+            "onnxruntime-linux-x64-1.24.4/lib/libonnxruntime.so",
+            content,
+        )
+        .unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// R6: a runtime library gone or cut short while `.installed.json` stays is no install: the
+    /// same Download fetches it again, also on a manager that remembers it as Installed.
+    #[test]
+    fn a_runtime_that_lost_a_file_is_downloaded_again() {
+        const LIBRARY: &[u8] = b"the runtime library";
+        let archive = runtime_archive(LIBRARY);
+        let server = serve(archive.clone(), false);
+        let res = runtime_resource(&server.url, &archive);
+        let root = tmp("repair");
+        let dir = root.join("onnxruntime/cpu");
+        let library = dir.join("libonnxruntime.so");
+        let m = Manager::start(ManagerOptions::new(&root));
+        let install = || {
+            let key = m.enqueue(Job::new(res, &root));
+            let done = m.wait(std::slice::from_ref(&key), Some(Duration::from_secs(20)));
+            assert_eq!(done[0].state, State::Installed, "{done:?}");
+        };
+        install();
+        assert!(is_installed(res, &dir));
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        install();
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1, "nothing to do");
+
+        std::fs::remove_file(&library).unwrap();
+        assert!(!is_installed(res, &dir), "a listed file is gone");
+        assert_eq!(
+            install_damage(&dir.join(MANIFEST_FILE), &dir).as_deref(),
+            Some("libonnxruntime.so is missing")
+        );
+        install();
+        assert_eq!(std::fs::read(&library).unwrap(), LIBRARY);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+
+        std::fs::write(&library, b"cut").unwrap();
+        assert!(!is_installed(res, &dir), "a listed file has another size");
+        let damage = install_damage(&dir.join(MANIFEST_FILE), &dir).unwrap();
+        assert!(
+            damage.contains("3 bytes") && damage.contains(&format!("{} bytes", LIBRARY.len())),
+            "{damage}"
+        );
+        install();
+        assert_eq!(std::fs::read(&library).unwrap(), LIBRARY);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 3);
+
+        // What an install does not list does not matter.
+        std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        assert!(is_installed(res, &dir));
+        m.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Manifests from before the sizes: every listed file must exist, any size goes; one that
+    /// lists no files stays as trusted as it always was.
+    #[test]
+    fn older_manifests_check_what_they_can() {
+        let res = crate::resources::catalog::onnxruntime(
+            "linux",
+            "x86_64",
+            crate::resources::Flavor::Cpu,
+        )
+        .unwrap();
+        let dir = tmp("old-manifest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MANIFEST_FILE);
+        let manifest = |files: Vec<&str>| {
+            serde_json::to_vec(&Manifest {
+                id: res.id.to_string(),
+                version: res.version.to_string(),
+                sha256: Vec::new(),
+                files: files.into_iter().map(str::to_string).collect(),
+            })
+            .unwrap()
+        };
+        std::fs::write(&path, manifest(vec![])).unwrap();
+        assert!(is_installed(res, &dir), "no files listed");
+        std::fs::write(&path, manifest(vec!["lib.so", "sub/x.txt"])).unwrap();
+        assert!(!is_installed(res, &dir));
+        std::fs::write(dir.join("lib.so"), b"any").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/x.txt"), b"size").unwrap();
+        assert!(is_installed(res, &dir));
+        assert_eq!(install_damage(&path, &dir), None);
+        assert_eq!(install_damage(&dir.join("absent.json"), &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sizes are extra data in the file: [`read_manifest`] and the older struct read it, an
+    /// entry for a file a model install does not hold is skipped when written, and a model file
+    /// is checked like a runtime's.
+    #[test]
+    fn manifests_record_the_sizes_of_their_files() {
+        let data = body();
+        let server = serve(data.clone(), false);
+        let res = model_resource(&server.url, &data, None);
+        let root = tmp("sizes");
+        let models = root.join("models");
+        install_all(
+            ManagerOptions::new(&root),
+            vec![Job::into_dir(res, models.clone())],
+        )
+        .unwrap();
+        let path = manifest_path(res, &models);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["sizes"]["test-model.onnx"], data.len());
+        assert_eq!(
+            stored["id"], res.id,
+            "the manifest's fields stay at the top"
+        );
+        assert_eq!(read_manifest(&path).unwrap().files, ["test-model.onnx"]);
+        std::fs::write(models.join("test-model.onnx"), b"short").unwrap();
+        assert!(!is_installed(res, &models));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An ONNX Runtime archive from local files: extracted into staging, swapped into place,

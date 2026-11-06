@@ -14,8 +14,11 @@
 //! failed without it.
 //!
 //! The HTTP listener is bound once per run and serves [`server::Shared`]: a restart builds the
-//! next generation while the old one keeps answering, swaps it in, and stops the old workers
-//! once its in-flight requests have finished (at most `DRAIN`).
+//! next generation while the old one keeps answering, swaps it in once its models are ready (at
+//! most after `TAKEOVER_WAIT`), and stops the old workers once its in-flight requests have
+//! finished (at most `DRAIN`). So requests do not see "initializing" for a restart, except a
+//! model whose new copy had no memory beside the old one: the old copy goes first
+//! (`ModelRegistry::yield_model`).
 
 use crate::cli::LogReloadHandle;
 use crate::config::Config;
@@ -23,7 +26,6 @@ use crate::metrics::Metrics;
 use crate::registry::ModelRegistry;
 use crate::resources::provision::{Provision, Provisioner};
 use crate::server::{self, AppState};
-use crate::sync::LockExt;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,6 +102,22 @@ pub fn run_server_on(
 /// How long a retired generation's in-flight requests may take before its workers are stopped.
 const DRAIN: Duration = Duration::from_secs(5);
 
+/// How long a new generation may load while the old one serves before it takes over anyway (the
+/// time after which a compile counts as slow: a model that never finishes must not hold config
+/// changes off the running service for ever).
+const TAKEOVER_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// How often the takeover looks at the new generation's models.
+const TAKEOVER_POLL: Duration = Duration::from_millis(100);
+
+/// True when the next generation can take over from one serving the `serving` models (by
+/// normalized name): none of those is still loading (`loading`, same names). A model that
+/// failed there takes over as failed, as it would have without the wait, and a model the old
+/// generation does not serve has nothing to protect.
+fn takeover_ready(serving: &[String], loading: &[String]) -> bool {
+    !loading.iter().any(|m| serving.contains(m))
+}
+
 /// How long shutdown waits for the HTTP side to let go of the last generation's state after
 /// the server task has returned. The server task can return a moment before every connection
 /// task has dropped its copy of the router (axum 0.8 releases a connection's "still open" guard
@@ -108,6 +126,45 @@ const DRAIN: Duration = Duration::from_secs(5);
 /// `ModelRegistry::shutdown` (no worker join) whenever it lost that race. Normally the wait
 /// ends at once.
 const SHUTDOWN_LINGER: Duration = Duration::from_secs(1);
+
+/// A restart: let `old` serve until `next` has loaded the models `old` serves, at most `limit`.
+/// Returns early when `generation` is cancelled (a shutdown, or a runtime installed meanwhile:
+/// the restart that follows waits again).
+fn wait_for_takeover(
+    old: &ModelRegistry,
+    next: &ModelRegistry,
+    generation: &CancellationToken,
+    limit: Duration,
+) {
+    let names = |r: &ModelRegistry, keep: &dyn Fn(&crate::worker::WorkerHandle) -> bool| {
+        r.workers()
+            .iter()
+            .filter(|w| keep(w))
+            .map(|w| crate::registry::normalize_name(&w.name))
+            .collect::<Vec<_>>()
+    };
+    let started = Instant::now();
+    while !generation.is_cancelled() {
+        let serving = names(old, &|w| w.state.is_ready());
+        let loading = names(next, &|w| {
+            w.state.get() == crate::startup::ModelState::Initializing
+                && !w.accepts_while_initializing()
+        });
+        if takeover_ready(&serving, &loading) {
+            return;
+        }
+        if started.elapsed() >= limit {
+            warn!(
+                models = ?loading,
+                "still loading after {} s; the new generation takes over anyway, so these are \
+                 answered \"initializing\" until they are ready",
+                limit.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(TAKEOVER_POLL);
+    }
+}
 
 /// A generation that is (or was) current: what has to be stopped once it is replaced.
 struct Generation {
@@ -243,14 +300,24 @@ impl Process {
         config: &Config,
         workers: &CancellationToken,
         provision: &Arc<Provision>,
+        previous: Option<std::sync::Weak<ModelRegistry>>,
     ) -> Result<ModelRegistry> {
-        ModelRegistry::start_with_benchmark(
+        ModelRegistry::start_replacing(
             config,
             &self.metrics,
             workers.clone(),
             Some(provision),
             Some(&crate::benchmark::results_path(&self.config_path)),
+            previous,
         )
+    }
+
+    /// A benchmark still running uses the runtimes of the generation that is ending: stop it.
+    fn stop_benchmark(&self) {
+        if self.benchmark.cancel() {
+            info!("benchmark cancelled by the restart");
+            self.benchmark.wait_idle(Duration::from_secs(30));
+        }
     }
 
     /// The `AppState` of a generation running `config` on `registry`.
@@ -284,9 +351,7 @@ impl Process {
             resources: Some(crate::resources::status::ResourcesCtx {
                 provisioner: self.provisioner.clone(),
                 provision: provision.clone(),
-                openvino_loaded: registry
-                    .runtimes()
-                    .is_some_and(|rt| rt.lock_recover().openvino().is_some()),
+                openvino_loaded: registry.loaded_runtimes().openvino,
                 ort_loaded: loaded_ort,
             }),
             benchmark: self.benchmark.clone(),
@@ -507,6 +572,8 @@ pub fn run_server_with(
         admin_failures: Arc::default(),
         metrics: Arc::new(Metrics::new(crate::VERSION)),
     };
+    // A benchmark the machine died in names its last device at start, not at the next page view.
+    process.benchmark.claim_breadcrumb(&config.data_root());
     // Disk retention (saved images, free-space warning): one sweeper per process, reading the
     // current settings on every tick; stopped and joined when this function returns.
     let _sweeper = Sweeper::spawn(process.store.clone(), &shutdown);
@@ -541,7 +608,8 @@ pub fn run_server_with(
         let generation = shutdown.child_token();
         let workers = shutdown.child_token();
         let provision = Arc::new(process.provisioner.prepare(&config, loaded_ort));
-        let registry = match process.start_registry(&config, &workers, &provision) {
+        let serving = run.old.as_ref().map(|g| Arc::downgrade(&g.registry));
+        let registry = match process.start_registry(&config, &workers, &provision, serving) {
             Ok(r) => Arc::new(r),
             Err(e) => match previous.take() {
                 Some(prev) => {
@@ -558,7 +626,7 @@ pub fn run_server_with(
         };
         info!(models = ?registry.names(), "models registered (compiling in the background)");
         if loaded_ort.is_none() {
-            loaded_ort = registry_ort_flavor(&registry);
+            loaded_ort = registry.loaded_runtimes().ort;
         }
         let state = process.state_for(&config, &registry, &provision, &generation, loaded_ort);
         crate::admin_token::ensure_for(&config);
@@ -570,7 +638,20 @@ pub fn run_server_with(
             resources_restart.clone(),
         );
         let supervisor = crate::supervisor::spawn(Arc::downgrade(&state), generation.clone());
-        // Applies the config file when it is edited on disk, with no page open.
+        // The store's generation (and adopted config) changes together with the swap, so pages
+        // waiting for the restart see the new generation's models.
+        let restarted = !first;
+        if restarted {
+            // The old generation serves meanwhile and takes every save: what lands during the
+            // wait reaches this one through the apply below, a disabled model included.
+            if let Some(old) = &run.old {
+                wait_for_takeover(&old.registry, &registry, &generation, TAKEOVER_WAIT);
+            }
+            // One started during the wait runs on the generation that is leaving.
+            process.stop_benchmark();
+        }
+        // Applies the config file when it is edited on disk, with no page open. Not before the
+        // store has adopted this generation's config: a sync would apply the old one to it.
         let disk_watch = {
             let weak = Arc::downgrade(&state);
             crate::config_store::spawn_disk_watch(
@@ -583,9 +664,6 @@ pub fn run_server_with(
                 },
             )
         };
-        // The store's generation (and adopted config) changes together with the swap, so pages
-        // waiting for the restart see the new generation's models.
-        let restarted = !first;
         if restarted {
             process.store.adopt(
                 adopt.map(|_| config.clone()),
@@ -640,11 +718,7 @@ pub fn run_server_with(
             let r = r.and(Err(anyhow::anyhow!("HTTP server stopped unexpectedly")));
             return run.finish(r);
         }
-        // A benchmark still running uses this generation's runtimes: stop it.
-        if process.benchmark.cancel() {
-            info!("benchmark cancelled by the restart");
-            process.benchmark.wait_idle(Duration::from_secs(30));
-        }
+        process.stop_benchmark();
 
         if shutdown.is_cancelled() {
             let r = run.finish(Ok(()));
@@ -673,22 +747,6 @@ pub fn run_server_with(
 /// pages trigger.
 fn config_for_resources_restart(store: &crate::config_store::ConfigStore) -> (u64, Config) {
     store.snapshot()
-}
-
-/// The ONNX Runtime flavor `registry` loaded, if any.
-fn registry_ort_flavor(registry: &ModelRegistry) -> Option<crate::resources::catalog::Flavor> {
-    let rt = registry.runtimes()?;
-    let rt = rt.lock_recover();
-    let ort = &rt.probe().ort;
-    if !ort.is_available() {
-        return None;
-    }
-    Some(
-        ort.flavor
-            .as_deref()
-            .and_then(crate::resources::catalog::Flavor::parse)
-            .unwrap_or(crate::resources::catalog::Flavor::Cpu),
-    )
 }
 
 /// Watch the download manager during one generation and log every outcome. When a model file
@@ -787,6 +845,62 @@ fn spawn_watcher(
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
+
+    #[test]
+    fn takeover_waits_only_for_models_the_old_generation_serves() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(takeover_ready(&names(&["a", "b"]), &[]));
+        assert!(!takeover_ready(&names(&["a", "b"]), &names(&["b"])));
+        // New in this generation, or failed in the old one: nothing is served to protect.
+        assert!(takeover_ready(&names(&["a"]), &names(&["b"])));
+        assert!(takeover_ready(&[], &names(&["a"])));
+    }
+
+    fn registry_of(models: &[(&str, crate::startup::ModelState)]) -> ModelRegistry {
+        let metrics = Metrics::new("0");
+        let workers = models
+            .iter()
+            .map(|(n, state)| {
+                let h = crate::worker::WorkerHandle::failed(*n, "test", metrics.model(n));
+                h.state.set(state.clone());
+                h
+            })
+            .collect();
+        ModelRegistry::from_handles(workers, Some(0), Default::default())
+    }
+
+    #[test]
+    fn takeover_waits_for_the_models_then_gives_up_at_its_limit() {
+        use crate::startup::ModelState::{Initializing, Ready};
+        let long = Duration::from_secs(600);
+        let old = registry_of(&[("a", Ready)]);
+        let new = registry_of(&[("a", Initializing)]);
+        let token = CancellationToken::new();
+
+        // Bounded: a model that never loads does not hold the swap.
+        wait_for_takeover(&old, &new, &token, Duration::from_millis(50));
+
+        // Ends once the model loaded.
+        let (new_a, token2) = (new.by_name("a").unwrap(), token.clone());
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| wait_for_takeover(&old, &new, &token2, long));
+            std::thread::sleep(TAKEOVER_POLL);
+            assert!(!waiting.is_finished());
+            new_a.state.set(Ready);
+            waiting.join().unwrap();
+        });
+
+        // Ends on a cancel (a shutdown).
+        new_a.state.set(Initializing);
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| wait_for_takeover(&old, &new, &token, long));
+            token.cancel();
+            waiting.join().unwrap();
+        });
+        // Nothing serves in the old generation: no wait at all.
+        let dead = registry_of(&[("a", crate::startup::ModelState::Failed("x".into()))]);
+        wait_for_takeover(&dead, &new, &CancellationToken::new(), long);
+    }
 
     #[test]
     fn resources_restart_starts_from_the_live_config() {

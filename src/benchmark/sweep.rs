@@ -73,7 +73,9 @@ pub(super) fn partial_summary(
 /// CPU, else ONNX Runtime CPU, whichever ran) and recommend a device. The reference CPU devices
 /// run first so each later result can be judged as it arrives; the result lists devices in the
 /// selection's order. `on_device` sees the partial result after each device (live progress), in
-/// its [`ModelResult::summary`] form (no per-image details: BM-11).
+/// its [`ModelResult::summary`] form (no per-image details: BM-11). A sweep that will touch more
+/// than one GPU says so in a warning first ([`service::SEVERAL_GPUS_WARNING`]): on stderr for the
+/// CLI, in the log for the service.
 ///
 /// Errors only with [`Cancelled`]; device failures are recorded in the result.
 pub fn sweep(
@@ -81,6 +83,19 @@ pub fn sweep(
     runtimes: &Mutex<Runtimes>,
     job: &Job,
     opts: &SweepOptions,
+    on_device: &mut dyn FnMut(&ModelResult),
+) -> Result<ModelResult> {
+    sweep_with(bench, runtimes, job, opts, &mut |_| {}, on_device)
+}
+
+/// [`sweep`], calling `before_device` right before each device starts (the service's
+/// breadcrumb).
+pub(super) fn sweep_with(
+    bench: &Bench,
+    runtimes: &Mutex<Runtimes>,
+    job: &Job,
+    opts: &SweepOptions,
+    before_device: &mut dyn FnMut(&Device),
     on_device: &mut dyn FnMut(&ModelResult),
 ) -> Result<ModelResult> {
     let selection = lock(runtimes).selection(Some(&job.path));
@@ -127,6 +142,19 @@ pub fn sweep(
         }
     }
     planned.sort_by_key(|p| p.0);
+    let gpus: Vec<String> = planned
+        .iter()
+        .filter(|p| p.3.is_none() && p.1.is_gpu_like())
+        .map(|p| p.1.to_string())
+        .collect();
+    if gpus.len() > 1 {
+        tracing::warn!(
+            "{}: benchmark on {}. {}",
+            job.name,
+            gpus.join(", "),
+            service::SEVERAL_GPUS_WARNING
+        );
+    }
     // Run order: the reference candidates first.
     let mut order: Vec<usize> = (0..planned.len()).collect();
     order.sort_by_key(|&k| {
@@ -144,14 +172,17 @@ pub fn sweep(
         };
         let entry = match why {
             Some(reason) => DeviceResult::failed(device, label, reason.clone()),
-            None => match bench.run_exact(runtimes, job, *device) {
-                Ok(run) => DeviceResult::ran(device, label, run),
-                Err(e) if is_cancelled(&e) => return Err(e),
-                Err(e) => {
-                    tracing::warn!(model = %job.name, device = %device, "benchmark run failed: {e:#}");
-                    DeviceResult::failed(device, label, format!("{e:#}"))
+            None => {
+                before_device(device);
+                match bench.run_exact(runtimes, job, *device) {
+                    Ok(run) => DeviceResult::ran(device, label, run),
+                    Err(e) if is_cancelled(&e) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(model = %job.name, device = %device, "benchmark run failed: {e:#}");
+                        DeviceResult::failed(device, label, format!("{e:#}"))
+                    }
                 }
-            },
+            }
         };
         if let Some(slot) = slots.get_mut(k) {
             *slot = Some(entry);
@@ -224,6 +255,58 @@ mod tests {
                 .all(|d| d.error.is_some() && d.run.is_none())
         );
         assert_eq!(r.recommended, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The breadcrumb hook sees a device only when it is about to start: one that cannot run
+    /// starts nothing.
+    #[test]
+    fn nothing_is_noted_for_a_device_that_cannot_run() {
+        let dir = std::env::temp_dir().join(format!("bop-note-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = Mutex::new(Runtimes::new_with(
+            &crate::backend::CoreOptions {
+                openvino_dir: Some(dir.join("no-openvino")),
+                ..Default::default()
+            },
+            &crate::backend::OrtOptions {
+                onnxruntime_dir: Some(dir.join("no-ort")),
+                default_dir: Some(dir.join("no-ort")),
+                cuda_libs_dir: None,
+            },
+        ));
+        let job = Job {
+            name: "m".into(),
+            path: dir.join("m.onnx"),
+            family: ModelFamilyKind::Yolo5,
+            classes: vec!["a".into()],
+            device: "auto".into(),
+            gpu_precision: None,
+            confidence_threshold: None,
+            object_filter: None,
+            variant: None,
+        };
+        let params = PostParams {
+            confidence_threshold: 0.5,
+            nms_iou: 0.5,
+        };
+        let sets = [ImageSet::sample()];
+        let bench = Bench::new(&sets, 0, 1, params);
+        let opts = SweepOptions {
+            // Never an option of this machine, so never attempted.
+            devices: Some(vec![
+                spec::parse("ort:tensorrt:7")
+                    .unwrap()
+                    .device()
+                    .copied()
+                    .unwrap(),
+            ]),
+            ..Default::default()
+        };
+        let mut noted = 0;
+        let r = sweep_with(&bench, &rt, &job, &opts, &mut |_| noted += 1, &mut |_| {}).unwrap();
+        assert_eq!(noted, 0);
+        assert_eq!(r.devices.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

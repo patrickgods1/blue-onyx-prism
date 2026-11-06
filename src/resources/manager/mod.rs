@@ -2,7 +2,9 @@
 //! at a time, with shared progress.
 //!
 //! For each [`Job`]:
-//! 1. Skip when the target already holds a matching [`Manifest`] (`.installed.json`).
+//! 1. Skip when the target already holds a matching [`Manifest`] (`.installed.json`) and every
+//!    file it lists is there at the size it was installed with ([`install_damage`]): a check by
+//!    size, not a hash of gigabytes, so a removed or cut library is downloaded again.
 //! 2. Take the cross-process lock `<root>/.downloads.lock` (`File::try_lock`, an OS-level lock
 //!    that is released when the process dies), so the CLI and the service never download at the
 //!    same time. Re-check step 1 once it is held.
@@ -138,17 +140,67 @@ pub fn read_manifest(path: &Path) -> Option<Manifest> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-fn write_manifest(path: &Path, m: &Manifest) -> Result<()> {
+/// The manifest file as [`write_manifest`] writes it: a [`Manifest`] plus the size of every
+/// installed file. Apart so the sizes stay this module's detail; absent in older files.
+#[derive(Serialize)]
+struct WrittenManifest<'a> {
+    #[serde(flatten)]
+    manifest: &'a Manifest,
+    sizes: BTreeMap<&'a str, u64>,
+}
+
+/// The file sizes of a manifest ([`WrittenManifest`]).
+#[derive(Deserialize)]
+struct RecordedSizes {
+    #[serde(default)]
+    sizes: BTreeMap<String, u64>,
+}
+
+/// Write `m` for the files as they are in `dir`, with their sizes.
+fn write_manifest(path: &Path, m: &Manifest, dir: &Path) -> Result<()> {
+    let sizes = m
+        .files
+        .iter()
+        .filter_map(|f| {
+            let meta = std::fs::metadata(dir.join(f)).ok()?;
+            meta.is_file().then_some((f.as_str(), meta.len()))
+        })
+        .collect();
+    let written = WrittenManifest { manifest: m, sizes };
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&written)?)
         .with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
-/// `resource` (this version) is installed in `dir` according to its manifest; for models every
-/// file must also still exist.
+/// What is wrong with the install of the manifest at `manifest` in `dir`: the first listed file
+/// that is gone, or that has another size than the one recorded, in words; None when nothing is
+/// (also without a readable manifest, and for a manifest that lists no files). Only sizes: one
+/// `stat` per file, cheap enough for every status page. An older manifest has no sizes, so its
+/// files only have to exist.
+pub fn install_damage(manifest: &Path, dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(manifest).ok()?;
+    let m: Manifest = serde_json::from_slice(&bytes).ok()?;
+    let sizes = serde_json::from_slice::<RecordedSizes>(&bytes)
+        .map(|r| r.sizes)
+        .unwrap_or_default();
+    m.files.iter().find_map(|f| {
+        // Follows a link: one whose target went is as useless as a file that went.
+        let Ok(meta) = std::fs::metadata(dir.join(f)) else {
+            return Some(format!("{f} is missing"));
+        };
+        let want = sizes.get(f).copied()?;
+        (meta.is_file() && meta.len() != want)
+            .then(|| format!("{f} has {} bytes, {want} bytes were installed", meta.len()))
+    })
+}
+
+/// `resource` (this version) is installed in `dir` according to its manifest and every file the
+/// manifest lists is intact ([`install_damage`]); for models every file of the catalog must also
+/// still exist.
 pub fn is_installed(resource: &Resource, dir: &Path) -> bool {
-    let Some(m) = read_manifest(&manifest_path(resource, dir)) else {
+    let path = manifest_path(resource, dir);
+    let Some(m) = read_manifest(&path) else {
         return false;
     };
     m.id == resource.id
@@ -158,6 +210,7 @@ pub fn is_installed(resource: &Resource, dir: &Path) -> bool {
                 .parts
                 .iter()
                 .all(|p| dir.join(p.file_name).is_file()))
+        && install_damage(&path, dir).is_none()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -739,14 +792,19 @@ impl Manager {
         }
     }
 
-    /// Queue `job` unless the same key is already queued, running or installed. Returns the key.
+    /// Queue `job` unless the same key is already queued, running or installed (and still is:
+    /// an install that lost a file is queued again). Returns the key.
     pub fn enqueue(&self, job: Job) -> String {
         let key = job.key();
-        let busy = matches!(
-            self.shared.state(&key),
-            Some(State::Queued | State::Downloading { .. } | State::Verifying | State::Extracting)
-                | Some(State::Installed)
-        );
+        let busy = match self.shared.state(&key) {
+            Some(
+                State::Queued | State::Downloading { .. } | State::Verifying | State::Extracting,
+            ) => true,
+            Some(State::Installed) => {
+                job.local_archives.is_some() || is_installed(job.resource, &job.target)
+            }
+            _ => false,
+        };
         if !busy {
             self.shared.set(&job, State::Queued);
             let sent = self.tx.send(Msg::Job(Box::new(job.clone()))).is_ok();

@@ -10,26 +10,42 @@
 //! starts or stops one model's worker without touching the others (no `LoadGate`: a reload
 //! compiles as soon as the runtimes lock is free). The decode + preprocess pool and the runtimes
 //! belong to the generation: a reload uses them as they are.
+//!
+//! Replacing a model that serves: the replacement loads in the background and takes over when
+//! it is Ready, so requests never see "initializing" for a config change. It is held in
+//! [`Slots::pending`] and swapped in under the slots lock by a `swap-{name}` thread. When its
+//! first candidate has no memory beside the old worker, the worker asks for room
+//! ([`crate::worker::MakeRoom`]): the old one retires and the replacement takes its place at
+//! once, a gap of "initializing" answers that is logged. No VRAM is estimated up front. A model
+//! that does not serve (failed, stuck, still loading) has nothing worth keeping: its worker
+//! retires first and the replacement loads once that freed the device, at most [`FREE_WAIT`]
+//! later, so a dead device is not held while the reload runs.
 
+use crate::backend::Candidate;
+use crate::backend::plan::Better;
 use crate::backend::{CoreOptions, DeviceSpec, LoadRequest, OrtOptions, Runtimes};
 use crate::config::{Config, ModelConfig};
 use crate::metrics::{Metrics, ModelGauges};
 use crate::profile::Profile;
 use crate::resources::provision::Provision;
+use crate::startup::ModelState;
 use crate::sync::{LockExt, RwLockExt};
 use crate::worker::{
-    LiveSettings, LoadGate, Peers, WorkerConfig, WorkerHandle, spawn_worker_after,
+    LiveSettings, LoadGate, MakeRoom, Peers, WorkerConfig, WorkerHandle, spawn_worker_after,
 };
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 mod plan;
+#[cfg(test)]
+mod reload_tests;
 
 pub use crate::backend::RuntimeInfo;
 pub use plan::{ModelPlan, PlanOutcome, PlanRuntimes, plan_model, plan_models};
@@ -134,6 +150,18 @@ struct WorkerSlot {
     join: Option<JoinHandle<()>>,
 }
 
+/// A worker loading in the background while the model's current worker serves.
+struct Replacement {
+    slot: WorkerSlot,
+    /// Tells this replacement from a later one of the same model.
+    id: u64,
+    /// `LoadRequest::requested`, for the metrics when a failed replacement takes over.
+    requested: String,
+    /// Another try of a better device ([`ModelRegistry::retry_better`]): it takes over only if
+    /// it loads. A config reload takes over either way: its failure is the model's new state.
+    upgrade: bool,
+}
+
 /// The served models. `by_name` and the default index always match `workers` (they change
 /// together under one lock).
 #[derive(Default)]
@@ -146,6 +174,8 @@ struct Slots {
     reloads: HashMap<String, u64>,
     /// What the workers see of each other (night model switch); republished with `by_name`.
     peers: Peers,
+    /// Normalized name -> the replacement loading in the background, not served yet.
+    pending: HashMap<String, Replacement>,
 }
 
 impl Slots {
@@ -185,6 +215,51 @@ impl Slots {
         self.rebuild_names();
         self.default_idx = default_by_name(config, &self.by_name, self.workers.len());
     }
+
+    /// The worker serving `key` now.
+    fn current(&self, key: &str) -> Option<&WorkerSlot> {
+        self.by_name.get(key).and_then(|&i| self.workers.get(i))
+    }
+
+    /// Put `slot` in the place of the worker serving `key` (the order and the default stay) and
+    /// return that worker. The weak handles are republished under the caller's lock.
+    fn install(&mut self, key: &str, slot: WorkerSlot) -> Option<WorkerSlot> {
+        let at = self.by_name.get(key).copied();
+        let old = match at.and_then(|i| self.workers.get_mut(i)) {
+            Some(w) => Some(std::mem::replace(w, slot)),
+            None => {
+                self.workers.push(slot);
+                None
+            }
+        };
+        *self.reloads.entry(key.to_string()).or_default() += u64::from(old.is_some());
+        self.rebuild_names();
+        old
+    }
+}
+
+/// Which runtime libraries a registry loaded. Known before any worker takes the runtimes lock,
+/// so asking never waits for a compile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadedRuntimes {
+    pub openvino: bool,
+    /// The ONNX Runtime flavor (fixed for the process once loaded).
+    pub ort: Option<crate::resources::catalog::Flavor>,
+}
+
+impl LoadedRuntimes {
+    fn of(rt: &Runtimes) -> Self {
+        let ort = &rt.probe().ort;
+        Self {
+            openvino: rt.openvino().is_some(),
+            ort: ort.is_available().then(|| {
+                ort.flavor
+                    .as_deref()
+                    .and_then(crate::resources::catalog::Flavor::parse)
+                    .unwrap_or(crate::resources::catalog::Flavor::Cpu)
+            }),
+        }
+    }
 }
 
 /// What a registry started from a config needs to spawn (and respawn) workers.
@@ -205,21 +280,66 @@ struct Spawner {
     provision: RwLock<Option<Arc<Provision>>>,
     /// One reload at a time.
     reload: Mutex<()>,
+    /// The generation this one replaces, which still serves while this one loads: a first
+    /// candidate with no memory beside it asks it for room ([`ModelRegistry::yield_model`]).
+    previous: Option<Weak<ModelRegistry>>,
+    loaded: LoadedRuntimes,
+    /// What tests make go wrong in this registry's workers.
+    #[cfg(test)]
+    faults: crate::worker::TestFaults,
+}
+
+/// The model a reload is about.
+#[derive(Clone, Copy)]
+struct ModelAt<'a> {
+    sp: &'a Spawner,
+    config: &'a Config,
+    /// Its normalized name.
+    key: &'a str,
+}
+
+/// How to start a worker, beyond its plan.
+#[derive(Default)]
+struct SpawnOptions {
+    /// The [`LoadGate`] to wait for before loading (startup order; a reload that waits for the
+    /// old worker to free its device).
+    after: Option<LoadGate>,
+    /// See [`WorkerConfig::only`].
+    only: Option<Candidate>,
+    /// See [`WorkerConfig::make_room`].
+    make_room: Option<MakeRoom>,
+    /// See [`WorkerConfig::recovering_from`].
+    recovering_from: Option<String>,
+    /// An automatic reload ([`WorkerHandle::is_recovery`]).
+    recovery: bool,
+    /// A worker that loads beside the one serving: the model's metrics keep showing that one.
+    beside: bool,
+}
+
+/// The served models and what goes with them, shared with the threads that finish a background
+/// reload.
+#[derive(Default)]
+struct Served {
+    slots: RwLock<Slots>,
+    /// The `stop-{name}` helper threads of workers removed by a disable or reload
+    /// ([`retire_worker`]) and the `swap-{name}` threads of replacements; pruned of finished
+    /// ones on each retire, joined by [`ModelRegistry::shutdown`].
+    retiring: Mutex<Vec<JoinHandle<()>>>,
+    /// Source of [`Replacement::id`].
+    next_id: AtomicU64,
 }
 
 pub struct ModelRegistry {
-    slots: RwLock<Slots>,
+    served: Arc<Served>,
     pub runtime_info: RuntimeInfo,
     /// None for registries built from handles (they cannot spawn workers).
     spawner: Option<Spawner>,
-    /// The `stop-{name}` helper threads of workers removed by a disable or reload
-    /// ([`retire_worker`]); pruned of finished ones on each retire, joined by [`Self::shutdown`].
-    retiring: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for ModelRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let models: Vec<String> = self
+            .served
             .slots
             .read()
             .map(|s| s.workers.iter().map(|w| w.handle.name.clone()).collect())
@@ -301,16 +421,24 @@ fn try_lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<std::sync::MutexGu
 
 impl Spawner {
     /// Spawn the worker of a planned model (or a `Failed` handle when the plan failed: missing
-    /// file, pending export, bad classes, downloads that must be fetched by hand). `after` is
-    /// the startup [`LoadGate`] to wait for (reloads pass None); `stop` its own token. The
-    /// returned handle owns the thread's join handle (`join`), None for a failed handle.
+    /// file, pending export, bad classes, downloads that must be fetched by hand); `stop` is its
+    /// own token. The returned handle owns the thread's join handle (`join`), None for a failed
+    /// handle.
     fn spawn_model(
         &self,
         config: &Config,
         plan: ModelPlan,
-        after: Option<LoadGate>,
+        options: SpawnOptions,
         stop: CancellationToken,
     ) -> WorkerHandle {
+        let SpawnOptions {
+            after,
+            only,
+            make_room,
+            recovering_from,
+            recovery,
+            beside,
+        } = options;
         let ModelPlan {
             name,
             device,
@@ -326,10 +454,14 @@ impl Spawner {
         } = plan;
         // Counters live for the whole process; the device/provider restart on each load.
         let mm = self.metrics.model(&name);
-        mm.begin_load(load.requested.clone());
+        if !beside {
+            mm.begin_load(load.requested.clone());
+        }
         if let PlanOutcome::Failed(msg) = outcome {
             warn!(model = %name, "{msg}");
-            return WorkerHandle::failed(name, msg, mm);
+            let mut handle = WorkerHandle::failed(name, msg, mm);
+            handle.set_history(recovery, recovering_from);
+            return handle;
         }
 
         let cfg = WorkerConfig {
@@ -349,9 +481,15 @@ impl Spawner {
             wait,
             prep: Some(self.prep.clone()),
             peers: self.peers.clone(),
+            only,
+            make_room,
+            recovering_from: recovering_from.clone(),
+            #[cfg(test)]
+            faults: self.faults.clone(),
         };
         let mut handle = spawn_worker_after(self.runtimes.clone(), cfg, mm, stop, after);
         handle.set_planned(device, planned.map(|(_, label)| label));
+        handle.set_history(recovery, recovering_from);
         handle
     }
 
@@ -379,18 +517,99 @@ impl Spawner {
     }
 }
 
-/// Stop a worker that left the registry without blocking the caller: on a helper thread, let
-/// its in-flight requests finish (the handle's sender goes away with the last HTTP handler that
-/// uses it, and the worker exits once its channel is empty), at most the request timeout plus
-/// a second, then cancel its token and join it. Returns the helper thread (None: the worker had
-/// no thread, or the helper could not be spawned).
-fn retire_worker(slot: WorkerSlot) -> Option<JoinHandle<()>> {
+/// Longest a reload holds up for a retired worker to free its device before it loads anyway.
+pub const FREE_WAIT: Duration = Duration::from_secs(2);
+
+/// Of [`FREE_WAIT`], how long the requests of a worker retired for its memory may finish.
+const FREE_DRAIN: Duration = Duration::from_millis(1500);
+
+/// How often a `swap-{name}` thread looks at its replacement.
+const SWAP_POLL: Duration = Duration::from_millis(50);
+
+/// How [`retire_worker`] stops a worker.
+struct Stop {
+    /// How long its requests may finish before its token is cancelled.
+    drain: Duration,
+    /// How long after the cancel to wait for the worker to free its device.
+    settle: Duration,
+    /// Opened once it is free, or those waits ran out.
+    freed: Option<LoadGate>,
+}
+
+impl Stop {
+    /// A worker that served: its requests finish (the handle's sender goes away with the last
+    /// HTTP handler that uses it, and the worker exits once its channel is empty), at most the
+    /// request timeout plus a second.
+    fn draining(handle: &WorkerHandle) -> Self {
+        Self {
+            drain: handle
+                .request_timeout()
+                .saturating_add(Duration::from_secs(1)),
+            settle: Duration::ZERO,
+            freed: None,
+        }
+    }
+
+    /// A worker nothing waits for: never served, or failed.
+    fn at_once() -> Self {
+        Self {
+            drain: Duration::ZERO,
+            settle: Duration::ZERO,
+            freed: None,
+        }
+    }
+
+    /// A failed or stuck worker whose replacement waits on `freed`.
+    fn first(freed: LoadGate) -> Self {
+        Self {
+            drain: Duration::ZERO,
+            settle: FREE_WAIT,
+            freed: Some(freed),
+        }
+    }
+
+    /// A serving worker whose memory is needed now.
+    fn for_room(freed: LoadGate) -> Self {
+        Self {
+            drain: FREE_DRAIN,
+            settle: FREE_WAIT.saturating_sub(FREE_DRAIN),
+            freed: Some(freed),
+        }
+    }
+}
+
+/// Opens its gate when dropped, so a reload cannot wait on it for ever whatever happens to the
+/// thread that holds it.
+struct OpensGate(Option<LoadGate>);
+
+impl Drop for OpensGate {
+    fn drop(&mut self) {
+        if let Some(g) = &self.0 {
+            g.open();
+        }
+    }
+}
+
+/// Wait until `join`'s thread ended, at most until `deadline`.
+fn wait_finished(join: &JoinHandle<()>, deadline: Instant) {
+    while !join.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Stop a worker that left the registry without blocking the caller, on a helper thread: as
+/// `how` says, then cancel its token and join it. Returns the helper thread (None: the worker
+/// had no thread, or the helper could not be spawned).
+fn retire_worker(slot: WorkerSlot, how: Stop) -> Option<JoinHandle<()>> {
     let WorkerSlot { handle, stop, join } = slot;
+    let Stop {
+        drain,
+        settle,
+        freed,
+    } = how;
+    let freed = OpensGate(freed);
     let name = handle.name.clone();
     let stuck = handle.stuck_flag();
-    let drain = handle
-        .request_timeout()
-        .saturating_add(Duration::from_secs(1));
     drop(handle);
     let Some(join) = join else {
         stop.cancel();
@@ -399,11 +618,15 @@ fn retire_worker(slot: WorkerSlot) -> Option<JoinHandle<()>> {
     let spawned = std::thread::Builder::new()
         .name(format!("stop-{name}"))
         .spawn(move || {
-            let deadline = Instant::now() + drain;
-            while !join.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            wait_finished(&join, Instant::now() + drain);
             stop.cancel();
+            let settled = Instant::now() + settle;
+            wait_finished(&join, settled);
+            if freed.0.is_some() {
+                // A stuck worker handed its engine to a reaper instead of freeing it.
+                crate::worker::wait_for_reapers(settled.saturating_duration_since(Instant::now()));
+            }
+            drop(freed);
             if stuck.load(std::sync::atomic::Ordering::Acquire) && !join.is_finished() {
                 // Blocked in the runtime for good: joining would hang this thread and, through
                 // `ModelRegistry::shutdown`, the next generation swap or the exit.
@@ -425,6 +648,161 @@ fn retire_worker(slot: WorkerSlot) -> Option<JoinHandle<()>> {
             // The thread still stops (its token is cancelled); it is just not joined.
             warn!("could not spawn a thread to stop a worker: {e}");
             None
+        }
+    }
+}
+
+impl Served {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Slots> {
+        self.slots.read_recover()
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Slots> {
+        self.slots.write_recover()
+    }
+
+    /// Keep a helper thread for [`ModelRegistry::shutdown`], dropping the finished ones.
+    fn keep_thread(&self, helper: Option<JoinHandle<()>>) {
+        let mut retiring = self.retiring.lock_recover();
+        retiring.retain(|h| !h.is_finished());
+        retiring.extend(helper);
+    }
+
+    /// Stop a worker that left the registry without waiting for it ([`retire_worker`]).
+    fn retire(&self, slot: WorkerSlot, how: Stop) {
+        self.keep_thread(retire_worker(slot, how));
+    }
+
+    /// Stop a serving worker because its memory is needed now, and wait until it is free or
+    /// [`FREE_WAIT`] ran out.
+    fn retire_for_room(&self, slot: WorkerSlot) {
+        let freed = LoadGate::new();
+        self.retire(slot, Stop::for_room(freed.clone()));
+        // Opens within `FREE_WAIT` (see `OpensGate`).
+        freed.wait(&CancellationToken::new());
+    }
+
+    fn is_pending(&self, key: &str, id: u64) -> bool {
+        self.read().pending.get(key).is_some_and(|r| r.id == id)
+    }
+
+    /// A replacement's first candidate has no memory beside the worker it replaces: put it in
+    /// that worker's place and retire that worker. True when there was one to retire.
+    fn make_room(&self, key: &str, id: u64) -> bool {
+        let old = {
+            let mut s = self.write();
+            if s.pending.get(key).is_none_or(|r| r.id != id) {
+                return false;
+            }
+            s.pending.remove(key).and_then(|r| s.install(key, r.slot))
+        };
+        let Some(old) = old else {
+            return false;
+        };
+        self.retire_for_room(old);
+        true
+    }
+
+    /// A background replacement finished loading (`failed`: on no device). It takes over,
+    /// unless it was a retry of a better device that failed: the current worker is then
+    /// untouched, and tries stop when the failure will not pass.
+    fn finish_replacement(&self, key: &str, id: u64, failed: bool) {
+        let mut s = self.write();
+        if s.pending.get(key).is_none_or(|r| r.id != id) {
+            return;
+        }
+        let Some(r) = s.pending.remove(key) else {
+            return;
+        };
+        let name = r.slot.handle.name.clone();
+        if failed && r.upgrade {
+            let current = s.current(key).map(|w| w.handle.clone());
+            drop(s);
+            match (r.slot.handle.better(), current) {
+                (Some(b), _) => {
+                    info!(
+                        model = %name,
+                        device = %b.candidate.device,
+                        "the better device still fails ({}); staying where it serves",
+                        b.reason
+                    );
+                }
+                (None, Some(current)) => {
+                    let text = r.slot.handle.state.describe();
+                    info!(
+                        model = %name,
+                        "the better device failed for a reason that will not pass ({text}); not \
+                         trying it again"
+                    );
+                    current.clear_better();
+                }
+                (None, None) => {}
+            }
+            self.retire(r.slot, Stop::at_once());
+            return;
+        }
+        // A replacement loaded beside the old worker left the stats alone; they are its now.
+        if failed {
+            r.slot.handle.metrics.begin_load(r.requested);
+        } else {
+            r.slot.handle.metrics.set_requested_device(r.requested);
+        }
+        let device = r.slot.handle.loaded_device();
+        let upgrade = r.upgrade;
+        let old = s.install(key, r.slot);
+        drop(s);
+        match (upgrade, device) {
+            (true, Some(device)) => {
+                warn!(model = %name, device = %device, "model moved back to its better device");
+            }
+            (false, Some(device)) => {
+                info!(model = %name, device = %device, "replacement ready; it serves from now on");
+            }
+            (_, None) => warn!(
+                model = %name,
+                "the replacement failed to load; it takes over so its error shows"
+            ),
+        }
+        if let Some(old) = old {
+            let how = Stop::draining(&old.handle);
+            self.retire(old, how);
+        }
+    }
+
+    /// Start the `swap-{name}` thread of the replacement `handle` of `key`.
+    fn watch_replacement(
+        self: &Arc<Self>,
+        key: String,
+        id: u64,
+        handle: Arc<WorkerHandle>,
+        stop: CancellationToken,
+    ) {
+        let served = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("swap-{}", handle.name))
+            .spawn({
+                let key = key.clone();
+                move || {
+                    loop {
+                        if stop.is_cancelled() || !served.is_pending(&key, id) {
+                            return;
+                        }
+                        match handle.state.get() {
+                            ModelState::Ready => return served.finish_replacement(&key, id, false),
+                            ModelState::Failed(_) => {
+                                return served.finish_replacement(&key, id, true);
+                            }
+                            ModelState::Initializing => std::thread::sleep(SWAP_POLL),
+                        }
+                    }
+                }
+            });
+        match spawned {
+            Ok(thread) => self.keep_thread(Some(thread)),
+            Err(e) => {
+                warn!(model = %key, "could not spawn a thread to swap a reloaded model: {e}");
+                self.finish_replacement(&key, id, false);
+            }
         }
     }
 }
@@ -468,6 +846,20 @@ impl ModelRegistry {
         shutdown: CancellationToken,
         provision: Option<&Provision>,
         benchmark: Option<&Path>,
+    ) -> Result<Self> {
+        Self::start_replacing(config, metrics, shutdown, provision, benchmark, None)
+    }
+
+    /// [`Self::start_with_benchmark`] for a generation that replaces `previous`, which keeps
+    /// serving while this one loads: a model's first candidate that has no memory beside the
+    /// old copy asks `previous` to give it up ([`Self::yield_model`]).
+    pub fn start_replacing(
+        config: &Config,
+        metrics: &Arc<Metrics>,
+        shutdown: CancellationToken,
+        provision: Option<&Provision>,
+        benchmark: Option<&Path>,
+        previous: Option<Weak<ModelRegistry>>,
     ) -> Result<Self> {
         if config.models.is_empty() {
             bail!(
@@ -568,6 +960,7 @@ impl ModelRegistry {
             profile = %profile.summary(prep_threads),
             "hardware profile"
         );
+        let loaded = LoadedRuntimes::of(&runtimes);
         let spawner = Spawner {
             runtimes: Arc::new(Mutex::new(runtimes)),
             metrics: metrics.clone(),
@@ -580,14 +973,36 @@ impl ModelRegistry {
             can_use_gpu: runtime_info.has_gpu,
             provision: RwLock::new(None),
             reload: Mutex::new(()),
+            previous,
+            loaded,
+            #[cfg(test)]
+            faults: crate::worker::TestFaults::default(),
         };
+        Ok(Self::with_spawner(config, spawner, plans, runtime_info))
+    }
 
+    /// Spawn the workers of `plans` in config order and build the registry over them.
+    fn with_spawner(
+        config: &Config,
+        spawner: Spawner,
+        plans: Vec<ModelPlan>,
+        runtime_info: RuntimeInfo,
+    ) -> Self {
         let mut workers = Vec::with_capacity(plans.len());
         // Startup order: each spawned worker waits for the previous one's gate.
         let mut prev: Option<LoadGate> = None;
         for plan in plans {
             let stop = spawner.shutdown.child_token();
-            let mut handle = spawner.spawn_model(config, plan, prev.clone(), stop.clone());
+            let make_room = spawner.previous.clone().map(|previous| {
+                let name = plan.name.clone();
+                MakeRoom::new(move || previous.upgrade().is_some_and(|r| r.yield_model(&name)))
+            });
+            let options = SpawnOptions {
+                after: prev.clone(),
+                make_room,
+                ..SpawnOptions::default()
+            };
+            let mut handle = spawner.spawn_model(config, plan, options, stop.clone());
             let join = handle.join.take();
             if join.is_some() {
                 prev = Some(handle.load_gate());
@@ -605,12 +1020,14 @@ impl ModelRegistry {
         }
 
         let peers = spawner.peers.clone();
-        Ok(Self {
-            slots: RwLock::new(Slots::from_slots(workers, default_idx, peers)),
+        Self {
+            served: Arc::new(Served {
+                slots: RwLock::new(Slots::from_slots(workers, default_idx, peers)),
+                ..Served::default()
+            }),
             runtime_info,
             spawner: Some(spawner),
-            retiring: Mutex::new(Vec::new()),
-        })
+        }
     }
 
     /// Registry over already constructed handles (no OpenVINO involved). Used by tests that
@@ -632,34 +1049,32 @@ impl ModelRegistry {
             })
             .collect();
         Self {
-            slots: RwLock::new(Slots::from_slots(workers, default_idx, Peers::new())),
+            served: Arc::new(Served {
+                slots: RwLock::new(Slots::from_slots(workers, default_idx, Peers::new())),
+                ..Served::default()
+            }),
             runtime_info,
             spawner: None,
-            retiring: Mutex::new(Vec::new()),
         }
     }
 
-    /// Stop a worker that left the registry without waiting for it ([`retire_worker`]); its
-    /// helper thread is kept for [`Self::shutdown`], and finished helpers are dropped.
-    fn retire(&self, slot: WorkerSlot) {
-        let helper = retire_worker(slot);
-        let mut retiring = self.retiring.lock_recover();
-        retiring.retain(|h| !h.is_finished());
-        retiring.extend(helper);
-    }
-
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Slots> {
-        self.slots.read_recover()
+        self.served.read()
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Slots> {
-        self.slots.write_recover()
+        self.served.write()
     }
 
     /// The shared runtimes (None for registries built with [`Self::from_handles`]). Lock briefly:
     /// workers hold the lock while compiling.
     pub fn runtimes(&self) -> Option<&Arc<Mutex<Runtimes>>> {
         self.spawner.as_ref().map(|s| &s.runtimes)
+    }
+
+    /// See [`LoadedRuntimes`] (nothing for registries built with [`Self::from_handles`]).
+    pub fn loaded_runtimes(&self) -> LoadedRuntimes {
+        self.spawner.as_ref().map(|s| s.loaded).unwrap_or_default()
     }
 
     /// The hardware profile of this generation and its decode + preprocess thread count (None
@@ -745,6 +1160,11 @@ impl ModelRegistry {
             .unwrap_or(0)
     }
 
+    /// True while a replacement of `name` loads in the background.
+    pub fn is_replacing(&self, name: &str) -> bool {
+        self.read().pending.contains_key(&normalize_name(name))
+    }
+
     /// Apply the live part of `config` without reloading anything: every served model's
     /// [`LiveSettings`] (threshold, NMS IoU, object filter, request timeout, image saving) and
     /// the default model. Models of `config` that are not served (disabled, or not loaded yet)
@@ -765,6 +1185,16 @@ impl ModelRegistry {
                 out.models.push(w.handle.name.clone());
             }
         }
+        // A replacement takes over later, with what applies then.
+        for (key, r) in &s.pending {
+            if let Some(m) = config
+                .models
+                .iter()
+                .find(|m| normalize_name(&m.effective_name()) == *key)
+            {
+                r.slot.handle.set_live(LiveSettings::for_model(config, m));
+            }
+        }
         let new = default_by_name(config, &s.by_name, s.workers.len());
         if s.default_idx != new {
             s.default_idx = new;
@@ -783,19 +1213,37 @@ impl ModelRegistry {
         out
     }
 
-    /// Reload model `name` from `config` without touching the others: a served model gets a
-    /// new worker (the old one is taken out of routing at once and stops on a helper thread
-    /// once its requests are answered); a model that is enabled but not served is spawned; a
-    /// served model that is disabled or gone from `config` is stopped. The new worker loads
-    /// right away (no startup [`LoadGate`]), through this generation's runtimes and prep pool;
-    /// `provision` is the plan for downloads it may wait for. Runtime-level settings come from
-    /// `config` as given (the caller keeps the running ones; see
-    /// `config_merge::runtime_overlay`). Errors for registries built from handles.
+    /// Reload model `name` from `config` without touching the others: a model that serves gets
+    /// a new worker in the background and the old one keeps answering until that is Ready (see
+    /// the module docs); a model that does not serve is replaced at once, with its old worker
+    /// retired first; a model that is enabled but not served is spawned; a served model that is
+    /// disabled or gone from `config` is stopped. The new worker loads right away (no startup
+    /// [`LoadGate`]), through this generation's runtimes and prep pool; `provision` is the plan
+    /// for downloads it may wait for. Runtime-level settings come from `config` as given (the
+    /// caller keeps the running ones; see `config_merge::runtime_overlay`). Errors for
+    /// registries built from handles.
     pub fn reload_model(
         &self,
         name: &str,
         config: &Config,
         provision: Option<&Provision>,
+    ) -> Result<Reload> {
+        self.reload(name, config, provision, false)
+    }
+
+    /// [`Self::reload_model`] for the [`crate::supervisor`]: the worker counts as an automatic
+    /// reload, so that it failing to load is retried. A reload by anyone else (a saved config)
+    /// ends that: its failure is a config's, not a fault's.
+    pub fn recover_model(&self, name: &str, config: &Config) -> Result<Reload> {
+        self.reload(name, config, None, true)
+    }
+
+    fn reload(
+        &self,
+        name: &str,
+        config: &Config,
+        provision: Option<&Provision>,
+        recovery: bool,
     ) -> Result<Reload> {
         let Some(sp) = &self.spawner else {
             bail!("this registry cannot reload models");
@@ -807,26 +1255,23 @@ impl ModelRegistry {
             .models
             .iter()
             .find(|m| normalize_name(&m.effective_name()) == key);
-        let served = self.read().by_name.contains_key(&key);
         let Some(m) = entry.filter(|m| m.enabled) else {
-            if !served {
-                return Ok(Reload::Unchanged {
-                    name: name.to_string(),
-                });
-            }
-            let old = {
+            let (old, stale) = {
                 let mut s = self.write();
+                let stale = s.pending.remove(&key);
                 let idx = s
                     .by_name
                     .get(&key)
                     .copied()
                     .filter(|&i| i < s.workers.len());
-                idx.map(|i| {
+                let old = idx.map(|i| {
                     let old = s.workers.remove(i);
                     s.reindex(config);
                     old
-                })
+                });
+                (old, stale)
             };
+            self.discard(stale);
             let Some(old) = old else {
                 return Ok(Reload::Unchanged {
                     name: name.to_string(),
@@ -834,7 +1279,8 @@ impl ModelRegistry {
             };
             let name = old.handle.name.clone();
             info!(model = %name, "model disabled; stopping its worker");
-            self.retire(old);
+            let how = Stop::draining(&old.handle);
+            self.served.retire(old, how);
             return Ok(Reload::Stopped { name });
         };
 
@@ -845,31 +1291,53 @@ impl ModelRegistry {
             provision,
             sp.best_cpu,
         );
-        let stop = sp.shutdown.child_token();
-        let mut handle = sp.spawn_model(config, plan, None, stop.clone());
-        let join = handle.join.take();
-        let device_text = handle.planned_device_text();
-        let new_name = handle.name.clone();
-        let slot = WorkerSlot {
-            handle: Arc::new(handle),
-            stop,
-            join,
+        let current = self.read().current(&key).map(|w| w.handle.clone());
+        let replaced = current.is_some();
+        let serving = current
+            .as_ref()
+            .is_some_and(|h| h.state.is_ready() && !h.is_stuck());
+        let recovering_from = current
+            .as_ref()
+            .filter(|_| !serving)
+            .and_then(|h| h.device_before_fault());
+        drop(current);
+        let background = serving && !plan.lazy && plan.outcome == PlanOutcome::Spawn;
+        let at = ModelAt {
+            sp,
+            config,
+            key: &key,
         };
-        let old = {
-            let mut s = self.write();
-            let old = s.by_name.get(&key).copied().map(|i| s.workers.remove(i));
-            s.workers.push(slot);
-            *s.reloads.entry(key.clone()).or_default() += u64::from(old.is_some());
-            s.reindex(config);
-            old
+        let (new_name, device_text) = if background {
+            let id = self.served.next_id.fetch_add(1, Ordering::Relaxed);
+            let room = {
+                let (served, key) = (self.served.clone(), key.clone());
+                MakeRoom::new(move || served.make_room(&key, id))
+            };
+            let options = SpawnOptions {
+                make_room: Some(room),
+                recovery,
+                beside: true,
+                ..SpawnOptions::default()
+            };
+            self.spawn_replacement(at, plan, options, id, false)
+        } else {
+            let options = SpawnOptions {
+                recovery,
+                recovering_from,
+                ..SpawnOptions::default()
+            };
+            self.replace_at_once(at, plan, options, serving)
         };
-        let replaced = old.is_some();
-        match old {
-            Some(old) => {
-                info!(model = %new_name, device = %device_text, "reloading model");
-                self.retire(old);
+        match (replaced, background) {
+            (true, true) => {
+                info!(
+                    model = %new_name,
+                    device = %device_text,
+                    "reloading model; the current worker serves until the new one is ready"
+                );
             }
-            None => info!(model = %new_name, device = %device_text, "model enabled; loading"),
+            (true, false) => info!(model = %new_name, device = %device_text, "reloading model"),
+            (false, _) => info!(model = %new_name, device = %device_text, "model enabled; loading"),
         }
         // The decode + preprocess pool is sized once per generation.
         if config.preprocess_threads == 0
@@ -892,6 +1360,196 @@ impl ModelRegistry {
         })
     }
 
+    /// Stop a replacement that will not take over (`Reload` of the same model, disabled).
+    fn discard(&self, stale: Option<Replacement>) {
+        if let Some(r) = stale {
+            info!(model = %r.slot.handle.name, "dropping the reload that was loading");
+            self.served.retire(r.slot, Stop::at_once());
+        }
+    }
+
+    /// Spawn a replacement beside the worker serving the model. Returns its name and where it
+    /// is headed.
+    fn spawn_replacement(
+        &self,
+        at: ModelAt<'_>,
+        plan: ModelPlan,
+        options: SpawnOptions,
+        id: u64,
+        upgrade: bool,
+    ) -> (String, String) {
+        let ModelAt { sp, config, key } = at;
+        let requested = plan.load.requested.clone();
+        let stop = sp.shutdown.child_token();
+        let (handle, stale) = {
+            // Spawned under the lock: its first candidate may ask for room at once, and that
+            // needs it recorded.
+            let mut s = self.write();
+            let stale = s.pending.remove(key);
+            let mut handle = sp.spawn_model(config, plan, options, stop.clone());
+            let join = handle.join.take();
+            let handle = Arc::new(handle);
+            let slot = WorkerSlot {
+                handle: handle.clone(),
+                stop: stop.clone(),
+                join,
+            };
+            s.pending.insert(
+                key.to_string(),
+                Replacement {
+                    slot,
+                    id,
+                    requested,
+                    upgrade,
+                },
+            );
+            s.reindex(config);
+            (handle, stale)
+        };
+        self.discard(stale);
+        let text = (handle.name.clone(), handle.planned_device_text());
+        self.served
+            .watch_replacement(key.to_string(), id, handle, stop);
+        text
+    }
+
+    /// Put a new worker in the model's place now. The old one, when it `served`, finishes its
+    /// requests; else it has nothing worth keeping and the new one waits until it is gone (at
+    /// most [`FREE_WAIT`]), so a dead device is not held while the new one loads.
+    fn replace_at_once(
+        &self,
+        at: ModelAt<'_>,
+        plan: ModelPlan,
+        options: SpawnOptions,
+        served: bool,
+    ) -> (String, String) {
+        let ModelAt { sp, config, key } = at;
+        let exists = self.read().by_name.contains_key(key);
+        let freed = (exists && !served).then(LoadGate::new);
+        let stop = sp.shutdown.child_token();
+        let options = SpawnOptions {
+            after: freed.clone(),
+            ..options
+        };
+        let mut handle = sp.spawn_model(config, plan, options, stop.clone());
+        let join = handle.join.take();
+        let text = (handle.name.clone(), handle.planned_device_text());
+        let slot = WorkerSlot {
+            handle: Arc::new(handle),
+            stop,
+            join,
+        };
+        let (old, stale) = {
+            let mut s = self.write();
+            let stale = s.pending.remove(key);
+            let old = s.by_name.get(key).copied().map(|i| s.workers.remove(i));
+            s.workers.push(slot);
+            *s.reloads.entry(key.to_string()).or_default() += u64::from(old.is_some());
+            s.reindex(config);
+            (old, stale)
+        };
+        self.discard(stale);
+        // The new worker waits on this gate, so it opens whatever happens here.
+        let mut opens = OpensGate(freed);
+        if let Some(old) = old {
+            let how = match opens.0.take() {
+                Some(gate) => Stop::first(gate),
+                None => Stop::draining(&old.handle),
+            };
+            self.served.retire(old, how);
+        }
+        text
+    }
+
+    /// Try `better` again for `name`, beside the worker serving it: a replacement on that device
+    /// only, which takes over if it loads; else nothing changes. True when one started (not
+    /// while another reload of the model is under way, or the model does not serve).
+    pub fn retry_better(&self, name: &str, config: &Config, better: &Better) -> Result<bool> {
+        let Some(sp) = &self.spawner else {
+            bail!("this registry cannot reload models");
+        };
+        let _one = sp.reload.lock_recover();
+        let key = normalize_name(name);
+        let Some(m) = config
+            .models
+            .iter()
+            .find(|m| m.enabled && normalize_name(&m.effective_name()) == key)
+        else {
+            return Ok(false);
+        };
+        {
+            let s = self.read();
+            let serving = s
+                .current(&key)
+                .is_some_and(|w| w.handle.state.is_ready() && !w.handle.is_stuck());
+            if !serving || s.pending.contains_key(&key) {
+                return Ok(false);
+            }
+        }
+        let mut plan = plan_model(
+            config,
+            m,
+            &plan::LockedRuntimes(&sp.runtimes),
+            None,
+            sp.best_cpu,
+        );
+        if plan.outcome != PlanOutcome::Spawn || plan.wait.is_some() {
+            return Ok(false);
+        }
+        plan.lazy = false;
+        let id = self.served.next_id.fetch_add(1, Ordering::Relaxed);
+        let options = SpawnOptions {
+            only: Some(better.candidate.clone()),
+            beside: true,
+            ..SpawnOptions::default()
+        };
+        let at = ModelAt {
+            sp,
+            config,
+            key: &key,
+        };
+        self.spawn_replacement(at, plan, options, id, true);
+        Ok(true)
+    }
+
+    /// A worker of the next generation has no memory beside this generation's copy of `name`,
+    /// which still serves: give it up. Requests are answered "initializing" until the next
+    /// generation takes over. Waits at most [`FREE_WAIT`]; true when it had a copy to give up.
+    pub fn yield_model(&self, name: &str) -> bool {
+        let key = normalize_name(name);
+        let (old, stale) = {
+            let mut s = self.write();
+            let Some(i) = s.by_name.get(&key).copied() else {
+                return false;
+            };
+            let Some(slot) = s.workers.get_mut(i) else {
+                return false;
+            };
+            if !slot.handle.state.is_ready() {
+                return false;
+            }
+            let handle = WorkerHandle::placeholder(
+                slot.handle.name.clone(),
+                "the new generation is taking over",
+                slot.handle.metrics.clone(),
+            );
+            let old = std::mem::replace(
+                slot,
+                WorkerSlot {
+                    handle: Arc::new(handle),
+                    stop: CancellationToken::new(),
+                    join: None,
+                },
+            );
+            let stale = s.pending.remove(&key);
+            s.rebuild_names();
+            (old, stale)
+        };
+        self.discard(stale);
+        self.served.retire_for_room(old);
+        true
+    }
+
     /// Stop every worker and join the threads (the registry is left empty, so a straggling
     /// request of a retired generation gets "no model"). Workers no other thread holds a handle of exit
     /// once their channel is empty; the others are cancelled. Cancel the shutdown token first
@@ -900,11 +1558,17 @@ impl ModelRegistry {
     pub fn shutdown(&self) {
         // Taken out of the registry (not consumed): a handler of a retired generation may still
         // hold an `Arc` of it while its connection winds down; it then sees no models.
-        let slots = {
-            let mut s = self.slots.write_recover();
+        let mut slots = {
+            let mut s = self.write();
             s.peers.clear();
             std::mem::take(&mut *s)
         };
+        // Replacements served nothing yet.
+        let replacements = std::mem::take(&mut slots.pending);
+        for r in replacements.into_values() {
+            r.slot.stop.cancel();
+            slots.workers.push(r.slot);
+        }
         for WorkerSlot { handle, stop, join } in slots.workers {
             let name = handle.name.clone();
             if handle.is_stuck() {
@@ -924,10 +1588,16 @@ impl ModelRegistry {
             }
             info!(model = %name, "worker stopped");
         }
-        let retiring = std::mem::take(&mut *self.retiring.lock_recover());
-        for helper in retiring {
-            if helper.join().is_err() {
-                error!("thread stopping a retired worker panicked");
+        // A `swap-{name}` thread that was finishing a swap may add a helper of its own.
+        loop {
+            let retiring = std::mem::take(&mut *self.served.retiring.lock_recover());
+            if retiring.is_empty() {
+                break;
+            }
+            for helper in retiring {
+                if helper.join().is_err() {
+                    error!("thread stopping a retired worker panicked");
+                }
             }
         }
     }
@@ -1265,20 +1935,24 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             flag.store(true, Ordering::SeqCst);
         });
-        reg.retire(WorkerSlot {
+        let slot = WorkerSlot {
             handle: Arc::new(WorkerHandle::failed("a", "test", metrics.model("a"))),
             stop,
             join: Some(join),
-        });
+        };
+        let how = Stop::draining(&slot.handle);
+        reg.served.retire(slot, how);
         // A handle without a thread is cancelled in place; no helper is kept.
         let b_stop = generation.child_token();
-        reg.retire(WorkerSlot {
+        let slot = WorkerSlot {
             handle: Arc::new(WorkerHandle::failed("b", "test", metrics.model("b"))),
             stop: b_stop.clone(),
             join: None,
-        });
+        };
+        let how = Stop::draining(&slot.handle);
+        reg.served.retire(slot, how);
         assert!(b_stop.is_cancelled());
-        assert_eq!(reg.retiring.lock_recover().len(), 1);
+        assert_eq!(reg.served.retiring.lock_recover().len(), 1);
         assert!(!stopped.load(Ordering::SeqCst));
         // Cancelling the generation token first (as the runner does) cuts the drain short; the
         // helper then joins the worker, and shutdown joins the helper.

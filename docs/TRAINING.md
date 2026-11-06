@@ -745,7 +745,11 @@ Stages (page and `train run` show them with percent and ETA):
    repeatable), one after the other, each released before the next loads; none ticked = only the
    device the model would load on (its own device, else what `auto` picks). It never sweeps every
    device of the machine (a GTX 1070 Ti + UHD 630 box hard-hung within seconds of that sweep
-   starting, twice). A failed benchmark is reported but keeps the model.
+   starting, twice; the cause was never found). The Benchmark page keeps away from it too: it
+   starts with the devices the models run on, asks before a run of several GPUs, refuses while a
+   queue job runs, and leaves `<data root>/benchmark-breadcrumb.json` naming the device it was
+   about to start, so a hang leaves the last device on record. A failed benchmark is reported but
+   keeps the model.
 
 Default name: `<scene>-<model>-<YYYYMMDD-HHMM>`: `custom-` for `all`, `day-`, `night-` for `night+ir`,
 `night-only-`, `ir-`, `day-night-`, `day-ir-`. Several models can be queued at once (one per ticked

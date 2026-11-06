@@ -1,16 +1,19 @@
-//! Benchmark run endpoints: start (`POST /v1/benchmark`), cancel, save the form as the
+//! Benchmark run endpoints: start (`POST /v1/benchmark`, refused while a job of the training
+//! queue runs, and for several GPUs until confirmed), cancel, save the form as the
 //! `benchmark` config defaults, drop a saved folder dataset (`POST /v1/benchmark/datasets/remove`),
 //! and the per-image drill-down (`/v1/benchmark/images`) with the image file itself
 //! (`/v1/benchmark/image`, only files listed in the saved results, through a cached index keyed
 //! by the results file stamp). File I/O runs in `server::blocking`.
 
-use super::{file_stamp, json_error, loaded_devices};
+use super::{file_stamp, json_error, loaded_devices, truthy};
 use crate::benchmark::images;
-use crate::benchmark::service::{RunContext, RunRequest};
+use crate::benchmark::service::{RunContext, RunRequest, SEVERAL_GPUS_WARNING, parse_devices};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::DatasetRef;
 use crate::server::{AppState, save_config};
 use crate::sync::LockExt;
+use crate::training::service::RunRecord;
+use crate::training::task::{TaskKind, TaskRecord};
 use axum::Json;
 use axum::extract::rejection::{FormRejection, QueryRejection};
 use axum::extract::{Form, Query, State};
@@ -85,10 +88,48 @@ fn parse_request(state: &AppState, form: &[(String, String)]) -> anyhow::Result<
     Ok(req)
 }
 
+/// Form field that accepts a run of several GPUs ([`gpu_devices`]).
+pub(super) const CONFIRM_GPUS: &str = "confirm_gpus";
+
+/// The GPUs among `devices`: more than one needs [`CONFIRM_GPUS`]. A device of each runtime counts
+/// on its own: the spec does not tell which of them share a card.
+pub(super) fn gpu_devices(devices: &[String]) -> Vec<String> {
+    parse_devices(devices)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .iter()
+        .filter(|d| d.is_gpu_like())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// The job of the training queue that holds the queue's thread now, in words: a GPU and the
+/// machine's memory are its own while it runs. Only this process's queue: a `train` command in
+/// another process is not seen here.
+fn running_job(runs: &[RunRecord], tasks: &[TaskRecord]) -> Option<String> {
+    let run = runs
+        .iter()
+        .find(|r| r.state.is_active())
+        .map(|r| format!("Training run '{}'", r.name));
+    run.or_else(|| {
+        tasks.iter().find(|t| t.state.is_active()).map(|t| {
+            let kind = match t.kind {
+                TaskKind::Import => "Import",
+                TaskKind::Autolabel => "Auto-label run",
+                TaskKind::Overlaps => "Overlap check",
+            };
+            format!("{kind} '{}'", t.title)
+        })
+    })
+}
+
 /// `POST /v1/benchmark` (urlencoded; every field optional, defaults from the `benchmark`
 /// config): `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`,
-/// `reference_model`, `accuracy_weight`. Starts a run in the background: 202, 400 (bad input)
-/// or 409 (a run is in progress).
+/// `reference_model`, `accuracy_weight`, and [`CONFIRM_GPUS`] for more than one GPU. No devices
+/// anywhere = each model on the device it runs on. Starts a run in the background: 202, 400 (bad
+/// input) or 409 (a run or a job of the training queue is in progress, or several GPUs without
+/// the confirmation).
 pub(in crate::server) async fn start(
     State(state): State<Arc<AppState>>,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
@@ -112,6 +153,37 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
             StatusCode::CONFLICT,
             "a benchmark is already running; cancel it or wait for it to finish".into(),
         );
+    }
+    let job = running_job(
+        &crate::server::training::runs(state),
+        &crate::server::training::tasks(state),
+    );
+    if let Some(job) = job {
+        return json_error(
+            StatusCode::CONFLICT,
+            format!(
+                "{job} is running, and a benchmark would compete with it for the same CPU and \
+                 GPU. Wait for it to finish or cancel it on the Jobs tab of Train, then start \
+                 the benchmark."
+            ),
+        );
+    }
+    let gpus = gpu_devices(&req.devices);
+    if gpus.len() > 1 && !form.iter().any(|(k, v)| k == CONFIRM_GPUS && truthy(v)) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "message": format!(
+                    "{} GPU devices were chosen ({}). {SEVERAL_GPUS_WARNING} To run them anyway, \
+                     send {CONFIRM_GPUS}=1.",
+                    gpus.len(),
+                    gpus.join(", ")
+                ),
+                "confirm": CONFIRM_GPUS,
+            })),
+        )
+            .into_response();
     }
     let ctx = RunContext {
         config: state.config_read().clone(),
@@ -935,6 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_status_busy_and_cancel() {
+        let _queue = crate::server::training::QUEUE_TEST_LOCK.lock().await;
         let st = state();
         let (s, v) = call(&st, get("/v1/benchmark")).await;
         assert_eq!(s, StatusCode::OK);
@@ -1008,6 +1081,191 @@ mod tests {
             "failed" => assert!(v["run"]["error"].is_string(), "{v}"),
             other => panic!("unexpected state {other}: {v}"),
         }
+    }
+
+    /// G1: more than one GPU needs the confirmation, and the answer says what it risks; a device
+    /// of each runtime on the same card counts too. The refused run never starts.
+    #[tokio::test]
+    async fn several_gpus_need_a_confirmation() {
+        let _queue = crate::server::training::QUEUE_TEST_LOCK.lock().await;
+        assert_eq!(
+            gpu_devices(&[
+                "openvino:cpu".into(),
+                "ort:cuda:0".into(),
+                "openvino:gpu.0".into()
+            ]),
+            ["ort:cuda:0", "openvino:gpu.0"]
+        );
+        assert!(gpu_devices(&["ort:cpu".into(), "openvino:cpu".into()]).is_empty());
+        assert_eq!(gpu_devices(&["ort:coreml".into()]), ["ort:coreml"]);
+
+        let st = state();
+        let two = "model=ipcam-general&device=ort:directml:0&device=ort:directml:1\
+                   &repeat=1&warmup=0&low_priority=0";
+        let (s, v) = call(&st, post("/v1/benchmark", two)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["success"], false);
+        assert_eq!(v["confirm"], CONFIRM_GPUS);
+        let m = v["message"].as_str().unwrap();
+        assert!(m.contains("ort:directml:0, ort:directml:1"), "{m}");
+        assert!(
+            m.contains("has hung a machine") && m.contains("never found"),
+            "{m}"
+        );
+        assert!(!st.benchmark.is_running());
+        let (s, v) = call(
+            &st,
+            post("/v1/benchmark", &format!("{two}&{CONFIRM_GPUS}=0")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+
+        // Neither device exists on the test machines' selection or loads: failed rows, no GPU
+        // is touched.
+        let (s, v) = call(
+            &st,
+            post("/v1/benchmark", &format!("{two}&{CONFIRM_GPUS}=1")),
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        assert!(st.benchmark.wait_idle(Duration::from_secs(60)));
+    }
+
+    /// The running job of the queue is named; a queued one holds nothing yet.
+    #[test]
+    fn a_running_job_is_named() {
+        use crate::training::dataset::SceneFilter;
+        use crate::training::service::RunState;
+        let run = |state| {
+            let mut r = crate::server::training::tests::record(
+                "r",
+                SceneFilter::default(),
+                None,
+                state,
+                None,
+            );
+            r.name = "day-yolo26s".into();
+            r
+        };
+        let task = |kind, state| TaskRecord {
+            id: "t".into(),
+            kind,
+            title: "900 frames".into(),
+            created: String::new(),
+            state,
+            stage: None,
+            step: 0,
+            steps: 1,
+            percent: 0,
+            detail: String::new(),
+            log: vec![],
+            summary: None,
+            result: None,
+            error: None,
+            finished: None,
+            after: None,
+            uses: Vec::new(),
+        };
+        assert_eq!(running_job(&[], &[]), None);
+        for state in [RunState::Queued, RunState::Done, RunState::Failed] {
+            assert_eq!(
+                running_job(&[run(state)], &[task(TaskKind::Import, state)]),
+                None,
+                "{state:?}"
+            );
+        }
+        for state in [RunState::Running, RunState::Paused] {
+            assert_eq!(
+                running_job(&[run(state)], &[]).as_deref(),
+                Some("Training run 'day-yolo26s'")
+            );
+        }
+        for (kind, text) in [
+            (TaskKind::Import, "Import '900 frames'"),
+            (TaskKind::Autolabel, "Auto-label run '900 frames'"),
+            (TaskKind::Overlaps, "Overlap check '900 frames'"),
+        ] {
+            assert_eq!(
+                running_job(&[], &[task(kind, RunState::Running)]).as_deref(),
+                Some(text)
+            );
+        }
+    }
+
+    /// A job on the real queue, through the real route: 409 with its name while it runs, and the
+    /// benchmark is free again when it ended.
+    #[tokio::test]
+    async fn a_running_queue_job_refuses_a_benchmark() {
+        use crate::training::task::{Task, TaskContext, TaskOutcome, TaskReport};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// Runs until its cancel flag is set; tells when it started.
+        struct Waits(Arc<AtomicBool>, String);
+        impl Task for Waits {
+            fn id(&self) -> &str {
+                &self.1
+            }
+            fn kind(&self) -> TaskKind {
+                TaskKind::Overlaps
+            }
+            fn title(&self) -> String {
+                "overlaps of the test".into()
+            }
+            fn steps(&self) -> usize {
+                1
+            }
+            fn run(
+                &self,
+                _: TaskContext<'_>,
+                _: &mut dyn FnMut(TaskReport<'_>),
+                cancel: &AtomicBool,
+            ) -> anyhow::Result<TaskOutcome> {
+                self.0.store(true, Ordering::SeqCst);
+                while !cancel.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(crate::resources::export::Cancelled.into())
+            }
+        }
+        let _queue = crate::server::training::QUEUE_TEST_LOCK.lock().await;
+        // Its own data root: the queue keeps its records in the config's training folder.
+        let st = crate::server::test_util::test_state();
+        let shared: crate::server::Shared = st.clone().into();
+        let svc = crate::server::training::service(&shared);
+        let started = Arc::new(AtomicBool::new(false));
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        svc.enqueue_task(Box::new(Waits(started.clone(), id.clone())))
+            .unwrap();
+        for _ in 0..2000 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.load(Ordering::SeqCst), "the job did not start");
+
+        let (s, v) = call(&st, post("/v1/benchmark", "model=ipcam-general")).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.contains("Overlap check 'overlaps of the test' is running"),
+            "{m}"
+        );
+        assert!(m.contains("Jobs tab"), "{m}");
+        assert!(!st.benchmark.is_running());
+
+        svc.cancel(&id);
+        let done = svc.wait_task(&id, Duration::from_secs(30)).unwrap();
+        assert!(!done.state.is_busy(), "{done:?}");
+        let (s, v) = call(
+            &st,
+            post(
+                "/v1/benchmark",
+                "model=ipcam-general&device=openvino:cpu&repeat=1&warmup=0&low_priority=0",
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        assert!(st.benchmark.wait_idle(Duration::from_secs(60)));
     }
 
     #[tokio::test]

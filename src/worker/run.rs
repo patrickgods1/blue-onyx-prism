@@ -5,6 +5,7 @@
 //! queued request); postprocessing runs on this thread.
 
 use super::pipeline::{Done, InFlight, Job, Meta, Pipeline, Stage};
+use super::reap::reap;
 use super::verify::{Lane, LaneCtx, Pending};
 use super::watch::{SlowCompile, StuckWatch, collect_watched, watch_slow_compile};
 use super::{
@@ -13,6 +14,7 @@ use super::{
     millis_u64, ms, new_request_id,
 };
 use crate::api::VisionDetectionResponse;
+use crate::backend::plan::{Better, LoadFailure, lesser_device};
 use crate::backend::{Backend, Candidate, Completion, DeviceInfo, Runtimes};
 use crate::image_stats::Scene;
 use crate::metrics::{DropReason, ModelMetrics, RouteFallback};
@@ -44,6 +46,16 @@ struct Engine {
     device: String,
 }
 
+/// A backend given up on: stops what still runs on it, then frees it. Both wait for the device,
+/// so this goes to a reaper thread ([`reap`]), never dropped on a worker thread.
+struct Abandoned(Backend);
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// What woke the worker.
 enum Event {
     Work(Result<WorkItem, crossbeam_channel::RecvError>),
@@ -63,6 +75,8 @@ pub(super) struct WorkerCtx {
     pub(super) load_started: Arc<AtomicBool>,
     /// Shared with [`WorkerHandle::is_stuck`].
     pub(super) stuck: Arc<AtomicBool>,
+    /// Shared with [`WorkerHandle::better`].
+    pub(super) better: Arc<Mutex<Option<Better>>>,
     pub(super) shutdown: CancellationToken,
     /// Inferences in a row that returned an error (see [`MAX_CONSECUTIVE_ERRORS`]).
     pub(super) consecutive_errors: Cell<u32>,
@@ -123,9 +137,6 @@ impl WorkerCtx {
         }
 
         let mut engine: Option<Engine> = None;
-        // The engine of a model whose inference got stuck and then failed (kept, not dropped,
-        // until the thread exits: dropping waits for whatever else is in flight).
-        let mut parked: Option<Engine> = None;
         if self.cfg.lazy {
             info!(model = %name, "lazy model: compiling on first request");
             self.gate.open();
@@ -158,7 +169,10 @@ impl WorkerCtx {
                 if engine.is_some() && self.stuck.load(Ordering::Acquire) {
                     // The stuck inference came back with an error (or the session died): stop
                     // using the engine; requests are answered with the Failed state from now on.
-                    parked = engine.take();
+                    // It goes now, not when this thread exits: a dead device must not be held
+                    // while the replacement loads (D3D12 shares one device per adapter, CUDA
+                    // keeps its context), and freeing it waits for what is still in flight.
+                    self.abandon(engine.take());
                     self.fail_pipeline(&mut p);
                     progressed = true;
                 }
@@ -231,7 +245,10 @@ impl WorkerCtx {
                 Event::Tick => self.unstick(&mut p),
             }
         }
-        if let Some(eng) = engine.as_mut()
+        if self.stuck.load(Ordering::Acquire) {
+            // Stopping these inferences waits for the device that hung.
+            self.abandon(engine.take());
+        } else if let Some(eng) = engine.as_mut()
             && p.busy()
         {
             // Never leave an inference running past the worker (shutdown).
@@ -240,8 +257,14 @@ impl WorkerCtx {
         self.answer_remaining(p, &rx);
         // Answers the verifications still waiting (unverified) and joins the lane thread.
         drop(self.verify_lane.borrow_mut().take());
-        drop(parked);
         info!(model = %name, "worker exiting");
+    }
+
+    /// Hand `engine` to a reaper thread (see [`Abandoned`]).
+    fn abandon(&self, engine: Option<Engine>) {
+        if let Some(e) = engine {
+            reap(&self.cfg.name, Abandoned(e.backend));
+        }
     }
 
     /// Shutdown: answer every request still in the pipeline or queued in the channel at once
@@ -773,7 +796,7 @@ impl WorkerCtx {
             }
             let extra = eng.family.extra_inputs(&prepared.ctx);
             let submitted = Instant::now();
-            match eng.backend.submit(slot, &prepared.chw, &extra) {
+            match self.submit(eng, slot, &prepared.chw, &extra) {
                 Ok(seq) => {
                     let Prepared {
                         ctx,
@@ -805,12 +828,35 @@ impl WorkerCtx {
                     p.order.push_back(Done::Slot(slot));
                 }
                 Err(e) => {
+                    // A reset GPU fails here, before any inference runs, so nothing would
+                    // reach `finish` and the model would answer errors while it stays Ready.
+                    self.mark_if_dead(eng, submitted, &e);
+                    self.note_health(eng, Some(&e), false);
                     let resp = self.failure(&meta, &eng.provider, &e);
                     p.order.push_back(Done::Answer(Box::new((meta, resp))));
+                    if self.stuck.load(Ordering::Acquire) {
+                        // The run loop parks the engine next and answers what is left.
+                        break;
+                    }
                 }
             }
         }
         moved
+    }
+
+    /// Start one inference ([`Backend::submit`]).
+    fn submit(
+        &self,
+        eng: &mut Engine,
+        slot: usize,
+        chw: &[f32],
+        extra: &[crate::model::ExtraInput],
+    ) -> Result<u64> {
+        #[cfg(test)]
+        if let Some(fault) = &self.cfg.faults.submit {
+            fault()?;
+        }
+        eng.backend.submit(slot, chw, extra)
     }
 
     /// Reply to the requests at the front of `order` that are answered or whose inference
@@ -945,10 +991,7 @@ impl WorkerCtx {
 
     fn load(&self) -> Result<Engine> {
         let name = &self.cfg.name;
-        let candidates = {
-            let rt = self.runtimes.lock_recover();
-            rt.plan(&self.cfg.device, &self.cfg.load.path)
-        };
+        let candidates = self.candidates();
         info!(
             model = %name,
             path = %self.cfg.load.path.display(),
@@ -957,9 +1000,26 @@ impl WorkerCtx {
             "loading model"
         );
         let label = format!("model {name}");
+        let first = candidates.first().map(|c| c.device);
+        let mut better: Option<Better> = None;
+        let loaded = crate::backend::try_candidates(&label, &candidates, |cand| {
+            let mut attempt = self.load_on(cand);
+            if Some(cand.device) == first
+                && let Err(e) = &attempt
+                && self.room_made(cand, e)
+            {
+                attempt = self.load_on(cand);
+            }
+            if better.is_none()
+                && let Err(e) = &attempt
+            {
+                better = Better::of(cand, e);
+            }
+            attempt
+        });
+        *self.better.lock_recover() = better;
         let (engine, compile_ms, warmup_ms) =
-            crate::backend::try_candidates(&label, &candidates, |cand| self.load_on(cand))
-                .with_context(|| format!("loading {}", self.cfg.load.path.display()))?;
+            loaded.with_context(|| format!("loading {}", self.cfg.load.path.display()))?;
 
         let dev = engine.backend.info().device.clone();
         let (in_w, in_h) = engine.backend.info().input_size;
@@ -972,6 +1032,19 @@ impl WorkerCtx {
         *self.device.write_recover() = Some(dev.clone());
         self.metrics
             .set_loaded(dev.actual.clone(), engine.provider.clone());
+        if let Some(before) = &self.cfg.recovering_from
+            && lesser_device(&candidates, before, &dev.spec)
+        {
+            warn!(
+                model = %name,
+                before = %before,
+                now = %dev.spec,
+                "reloaded on a lesser device than before the fault: {before} did not come back; \
+                 it is tried again later, and if the model stays on {} a service restart may be \
+                 needed to recover the device",
+                dev.spec
+            );
+        }
         let (hint, streams) = engine.backend.hint_and_streams();
         super::warn_unknown_filter(name, &self.cfg.live.load().object_filter, &self.cfg.classes);
         info!(
@@ -994,6 +1067,38 @@ impl WorkerCtx {
         Ok(engine)
     }
 
+    /// The candidates to walk: the one [`WorkerConfig::only`] names, else the plan.
+    fn candidates(&self) -> Vec<Candidate> {
+        if let Some(c) = &self.cfg.only {
+            return vec![c.clone()];
+        }
+        #[cfg(test)]
+        if let Some(c) = &self.cfg.faults.candidates {
+            return c.clone();
+        }
+        let rt = self.runtimes.lock_recover();
+        rt.plan(&self.cfg.device, &self.cfg.load.path)
+    }
+
+    /// The first candidate failed with `e`. When that is lack of memory and a copy of this
+    /// model that serves can be freed, free it (bounded) and say so: true means try again.
+    fn room_made(&self, cand: &Candidate, e: &anyhow::Error) -> bool {
+        let Some(room) = &self.cfg.make_room else {
+            return false;
+        };
+        if LoadFailure::of(e) != LoadFailure::Memory {
+            return false;
+        }
+        warn!(
+            model = %self.cfg.name,
+            device = %cand.device,
+            "no memory for the new copy of this model beside the one serving ({e:#}); retiring \
+             the old copy and trying again, so requests are answered \"initializing\" until it \
+             has loaded"
+        );
+        (room.0)()
+    }
+
     /// The compile hint and in-flight count for `cand` (serial without a profile).
     fn tuning_for(&self, rt: &Runtimes, cand: &Candidate) -> DeviceTuning {
         match &self.cfg.concurrency {
@@ -1010,6 +1115,10 @@ impl WorkerCtx {
     fn load_on(&self, cand: &Candidate) -> Result<(Engine, u64, u64)> {
         self.state
             .set_initializing(format!("{COMPILING_ON} {}", cand.device));
+        #[cfg(test)]
+        if let Some(fault) = &self.cfg.faults.load {
+            fault(cand)?;
+        }
         let compiled = {
             let mut rt = self.runtimes.lock_recover();
             let tuning = self.tuning_for(&rt, cand);
@@ -1043,16 +1152,20 @@ impl WorkerCtx {
         let mut pre = spec.preprocessor();
         let (chw, ctx) = pre.run(&gray, in_w, in_h)?;
         let extra = family.extra_inputs(&ctx);
-        let outs = match warm_up(&mut backend, chw, &extra, WARMUP_TIMEOUT) {
+        #[cfg(not(test))]
+        let warmup_timeout = WARMUP_TIMEOUT;
+        #[cfg(test)]
+        let warmup_timeout = self.cfg.faults.warmup_timeout.unwrap_or(WARMUP_TIMEOUT);
+        let outs = match warm_up(&mut backend, chw, &extra, warmup_timeout) {
             Ok(outs) => outs,
             Err(e) => {
                 if e.is::<WarmupTimeout>() {
                     // The inference is still running on a device that does not answer.
-                    // Dropping the backend would wait for it (OpenVINO cancels and waits,
-                    // ONNX Runtime waits `ABORT_TIMEOUT`): leak it instead, so this thread
-                    // goes on to the next candidate (CPU last) and the model still serves.
+                    // Dropping the backend here would wait for it (OpenVINO cancels and waits,
+                    // ONNX Runtime waits `ABORT_TIMEOUT`): a reaper does, so this thread goes
+                    // on to the next candidate (CPU last) and the model still serves.
                     error!(model = %self.cfg.name, "{e:#}; abandoning the device");
-                    std::mem::forget(backend);
+                    reap(&self.cfg.name, Abandoned(backend));
                 }
                 return Err(e);
             }
@@ -1100,6 +1213,14 @@ impl WorkerCtx {
             inferenceMs: inference_ms,
             processMs: process_ms,
             ..VisionDetectionResponse::error(msg)
+        }
+    }
+
+    /// A dead session marks the model at once, whether `submit` or `collect` reported it: no
+    /// later inference can work.
+    fn mark_if_dead(&self, eng: &Engine, started: Instant, e: &anyhow::Error) {
+        if session_dead(e) {
+            self.stuck_watch(eng).mark(started.elapsed(), Some(e));
         }
     }
 
@@ -1238,10 +1359,8 @@ impl WorkerCtx {
         } else {
             eng.backend.collect(slot)
         };
-        if let Err(e) = &collected
-            && session_dead(e)
-        {
-            self.stuck_watch(eng).mark(f.submitted.elapsed(), Some(e));
+        if let Err(e) = &collected {
+            self.mark_if_dead(eng, f.submitted, e);
         }
         let mut degenerate = false;
         let scene = f.stats.scene();
@@ -1574,7 +1693,7 @@ fn fallback_text(reason: RouteFallback) -> &'static str {
 pub(crate) const WARMUP_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// A warm-up inference that did not finish within [`WARMUP_TIMEOUT`]; the backend it ran on
-/// must not be dropped (see `load_on`).
+/// must not be dropped on the worker thread (see `load_on`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WarmupTimeout {
     pub device: String,

@@ -702,7 +702,7 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 |---|---|---|
 | `benchmark.datasets` | `["coco-cctv", "bmd45-cctv", "exdark-night"]` | Datasets to run: built-in ids, `sample`, `dir:<path>` or `{"dir", "gt", "name"}` objects. UI: yes |
 | `benchmark.max_images_per_dataset` | `0` | Images per dataset, evenly spread; 0 = all. Integer >= 0. UI: yes |
-| `benchmark.devices` | `[]` | Device specs to run; empty = every runnable option. UI: yes |
+| `benchmark.devices` | `[]` | Device specs to run; empty = the device each model runs on. Several GPUs need a confirmation, because a sweep of every device has hung a machine. UI: yes |
 | `benchmark.models` | `[]` | Model names; empty = the enabled models whose files are present. UI: yes |
 | `benchmark.warmup` | `3` | Untimed warm-up runs per model and device. Integer 0-1000. UI: yes |
 | `benchmark.repeat_per_image` | `1` | Timed runs per image. Integer 0-1000. UI: yes |

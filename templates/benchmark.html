@@ -4,6 +4,7 @@
 <h1>Benchmark</h1>
 <p class="muted">Compare models on the same images, then set the best device and confidence for each. Results: <code>{{ results_file }}</code> &middot; JSON: <a href="/v1/benchmark"><code>/v1/benchmark</code></a>.</p>
 <p class="warn">{{ warning }}</p>
+{% if let Some(n) = interrupted %}<p class="warn" id="bench-interrupted">{{ n }}</p>{% endif %}
 {% if force_cpu %}<p class="warn">Force CPU is on: it overrides every per-model device until it is unchecked on the <a href="/config#inference">Config page</a>.</p>{% endif %}
 
 <nav class="toc tabs wizard" role="tablist" aria-label="Benchmark">
@@ -55,8 +56,9 @@
     <fieldset>
       <legend>Devices</legend>
       {% for d in devices %}
-      <label class="check{% if !d.runnable %} unavailable{% endif %}"><input type="checkbox" name="device" value="{{ d.spec }}"{% if d.checked %} checked{% endif %}{% if !d.runnable %} disabled{% endif %}> <code class="nowrap">{{ d.spec }}</code> <span class="muted">{{ d.label }}{% if let Some(r) = d.reason %} &middot; {{ r }}{% endif %}</span></label>
+      <label class="check{% if !d.runnable %} unavailable{% endif %}"><input type="checkbox" name="device" value="{{ d.spec }}"{% if d.checked %} checked{% endif %}{% if !d.runnable %} disabled{% endif %}{% if d.gpu %} data-gpu="1"{% endif %}> <code class="nowrap">{{ d.spec }}</code> <span class="muted">{{ d.label }}{% if let Some(r) = d.reason %} &middot; {{ r }}{% endif %}</span></label>
       {% endfor %}
+      <p class="warn" id="gpu-warning" hidden>{{ gpu_warning }}</p>
     </fieldset>
   </div>
   <details class="help run-settings" data-keep="d:run-settings"><summary>Settings: images per dataset, timed runs, warm-up, reference model</summary>

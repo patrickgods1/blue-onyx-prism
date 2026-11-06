@@ -47,6 +47,112 @@ impl Candidate {
     }
 }
 
+/// Why a device candidate failed to load, as far as trying it again is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadFailure {
+    /// The device has no memory for it now; something else may free some.
+    Memory,
+    /// The device stopped answering or was reset; it may come back.
+    DeviceLost,
+    /// Anything else: a model that does not compile there or a missing runtime fails the same
+    /// way every time.
+    Other,
+}
+
+impl LoadFailure {
+    /// Classify the error of a compile or a warm-up by its text: the runtimes report these
+    /// conditions only in their messages (OpenCL, CUDA and DXGI names), and neither the
+    /// backend's own context nor a model path holds any of the phrases below.
+    pub fn of(e: &anyhow::Error) -> Self {
+        Self::of_text(&format!("{e:#}"))
+    }
+
+    /// [`Self::of`] on the text of an error.
+    pub fn of_text(text: &str) -> Self {
+        const MEMORY: &[&str] = &[
+            "out of memory",
+            "out_of_memory",
+            "outofmemory",
+            "cl_out_of_resources",
+            "cl_out_of_host_memory",
+            "cl_mem_object_allocation_failure",
+            "out of gpu resources",
+            "exceeded max size of memory object allocation",
+            "failed to allocate",
+            "allocation failed",
+            "bad_alloc",
+            "bad allocation",
+            "not enough memory",
+            "insufficient memory",
+            "8007000e",
+        ];
+        const DEVICE_LOST: &[&str] = &[
+            "device lost",
+            "device_lost",
+            "device removed",
+            "device_removed",
+            "device hung",
+            "device_hung",
+            "device_reset",
+            "device instance has been suspended",
+            "may have been reset or lost",
+            "the device driver may have hung",
+            "cl_device_not_available",
+            "cuda_error_unknown",
+            "cuda failure 999",
+            "launch_timeout",
+            "fallen off the bus",
+            "887a0005",
+            "887a0006",
+            "887a0007",
+            "887a0020",
+        ];
+        let text = text.to_ascii_lowercase();
+        let has = |list: &[&str]| list.iter().any(|p| text.contains(p));
+        if has(MEMORY) {
+            Self::Memory
+        } else if has(DEVICE_LOST) {
+            Self::DeviceLost
+        } else {
+            Self::Other
+        }
+    }
+
+    /// True when the same candidate may work later.
+    pub fn retryable(self) -> bool {
+        self != Self::Other
+    }
+}
+
+/// A candidate better than the device a model loaded on, which failed for a reason that may
+/// pass ([`LoadFailure::retryable`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Better {
+    pub candidate: Candidate,
+    pub failure: LoadFailure,
+    /// The error, for the log.
+    pub reason: String,
+}
+
+impl Better {
+    /// `candidate`'s failure `e`, when it is worth another try.
+    pub fn of(candidate: &Candidate, e: &anyhow::Error) -> Option<Self> {
+        let failure = LoadFailure::of(e);
+        failure.retryable().then(|| Self {
+            candidate: candidate.clone(),
+            failure,
+            reason: format!("{e:#}"),
+        })
+    }
+}
+
+/// True when `now` comes after `before` in `candidates`: the model runs on a lesser device than
+/// it did. Specs are canonical (`DeviceInfo::spec`); one that is not listed compares as false.
+pub fn lesser_device(candidates: &[Candidate], before: &str, now: &str) -> bool {
+    let at = |spec: &str| candidates.iter().position(|c| c.device.to_string() == spec);
+    matches!((at(before), at(now)), (Some(b), Some(n)) if n > b)
+}
+
 /// Ordered candidates for `spec` on a machine described by `sel` (from [`select`]).
 pub fn plan_for(
     spec: &DeviceSpec,
@@ -316,6 +422,116 @@ mod tests {
 
     fn s(v: &[(&str, bool)]) -> Vec<(String, bool)> {
         v.iter().map(|(d, f)| (d.to_string(), *f)).collect()
+    }
+
+    /// Texts the runtimes report (or close to them), and what each means for a retry.
+    #[test]
+    fn load_failures_classified() {
+        use LoadFailure::{DeviceLost, Memory, Other};
+        for (text, want) in [
+            // OpenVINO GPU plugin.
+            ("[GPU] out of GPU resources", Memory),
+            (
+                "[GPU] clEnqueueMapBuffer, error code: -5 CL_OUT_OF_RESOURCES",
+                Memory,
+            ),
+            ("error code: -4 CL_MEM_OBJECT_ALLOCATION_FAILURE", Memory),
+            ("error code: -6 CL_OUT_OF_HOST_MEMORY", Memory),
+            (
+                "[GPU] Exceeded max size of memory object allocation: requested 3 GB",
+                Memory,
+            ),
+            ("std::bad_alloc", Memory),
+            ("bad allocation", Memory),
+            // ONNX Runtime CUDA / DirectML.
+            ("CUDA failure 2: out of memory ; GPU=0", Memory),
+            ("CUDA_ERROR_OUT_OF_MEMORY", Memory),
+            (
+                "Failed to allocate memory for requested buffer of size 123",
+                Memory,
+            ),
+            (
+                "DmlExecutionProvider: The parameter is incorrect, 0x8007000E",
+                Memory,
+            ),
+            ("Not enough memory resources are available", Memory),
+            ("kIOGPUCommandBufferCallbackErrorOutOfMemory", Memory),
+            // A device that went away.
+            ("DXGI_ERROR_DEVICE_REMOVED", DeviceLost),
+            ("DXGI_ERROR_DEVICE_HUNG", DeviceLost),
+            ("DXGI_ERROR_DEVICE_RESET", DeviceLost),
+            ("HRESULT 0x887A0005", DeviceLost),
+            ("0x887A0006", DeviceLost),
+            ("0x887A0007", DeviceLost),
+            ("0x887A0020", DeviceLost),
+            (
+                "The GPU device instance has been suspended. Use GetDeviceRemovedReason",
+                DeviceLost,
+            ),
+            ("CUDA_ERROR_UNKNOWN", DeviceLost),
+            ("CUDA failure 999: unknown error", DeviceLost),
+            ("CUDA_ERROR_LAUNCH_TIMEOUT", DeviceLost),
+            ("GPU has fallen off the bus", DeviceLost),
+            ("CL_DEVICE_NOT_AVAILABLE", DeviceLost),
+            (
+                "model m.xml on openvino:gpu: starting inference failed; the GPU/device may have been reset or lost; retry",
+                DeviceLost,
+            ),
+            (
+                "warm-up inference on ort:cuda did not finish within 180 s; the device driver may have hung or the GPU is not available yet",
+                DeviceLost,
+            ),
+            // Fails the same way every time.
+            ("[GPU] Unsupported operation: Foo", Other),
+            ("Exception from src/core/shape_inference: wrong rank", Other),
+            (
+                "OpenVINO is not available (library not found); its runtime libraries are probably missing or of another version; run `setup-openvino`",
+                Other,
+            ),
+            (
+                "ONNX Runtime is not available (x); its library is probably not installed",
+                Other,
+            ),
+            ("no CUDA-capable device is detected", Other),
+            ("the model's outputs do not fit family `yolo8`", Other),
+            ("model file not found: /models/out of order.onnx", Other),
+            ("memory pattern disabled for this session", Other),
+            ("device openvino:npu is not available", Other),
+            ("", Other),
+        ] {
+            assert_eq!(LoadFailure::of_text(text), want, "{text}");
+        }
+        assert!(Memory.retryable());
+        assert!(DeviceLost.retryable());
+        assert!(!Other.retryable());
+        // Memory wins when an error names both.
+        assert_eq!(
+            LoadFailure::of_text("CUDA_ERROR_OUT_OF_MEMORY after device lost"),
+            Memory
+        );
+    }
+
+    #[test]
+    fn better_candidates_are_the_ones_worth_another_try() {
+        let cand = Candidate::new(Device::OPENVINO_CPU, false);
+        let oom = anyhow::anyhow!("CL_OUT_OF_RESOURCES").context("compiling");
+        let b = Better::of(&cand, &oom).unwrap();
+        assert_eq!(b.failure, LoadFailure::Memory);
+        assert_eq!(b.candidate, cand);
+        assert_eq!(b.reason, "compiling: CL_OUT_OF_RESOURCES");
+        assert_eq!(Better::of(&cand, &anyhow::anyhow!("no such op")), None);
+    }
+
+    #[test]
+    fn lesser_device_follows_the_candidate_order() {
+        let cands = plan_candidates(&parse("GPU").unwrap(), &devs(&["CPU", "GPU"]));
+        assert!(lesser_device(&cands, "openvino:gpu", "openvino:cpu"));
+        assert!(!lesser_device(&cands, "openvino:cpu", "openvino:gpu"));
+        assert!(!lesser_device(&cands, "openvino:gpu", "openvino:gpu"));
+        assert!(
+            !lesser_device(&cands, "ort:cuda", "openvino:cpu"),
+            "unlisted"
+        );
     }
 
     #[test]

@@ -1060,10 +1060,18 @@ pub fn download_root(config: &Config) -> PathBuf {
 /// `dir` holds a completed install of resource `id`: the manager's `.installed.json` names it,
 /// or (installs from before the manager) a `VERSION` file is present.
 fn installed_in(dir: &Path, id: &str) -> bool {
-    match super::manager::read_manifest(&dir.join(super::manager::MANIFEST_FILE)) {
-        Some(m) => m.id == id,
+    let path = dir.join(super::manager::MANIFEST_FILE);
+    match super::manager::read_manifest(&path) {
+        Some(m) => m.id == id && super::manager::install_damage(&path, dir).is_none(),
         None => dir.join("VERSION").is_file(),
     }
+}
+
+/// The manifest of `id` in `dir`, when there is one and the files it lists are intact.
+fn intact_manifest(dir: &Path, id: &str) -> Option<super::manager::Manifest> {
+    let path = dir.join(super::manager::MANIFEST_FILE);
+    super::manager::read_manifest(&path)
+        .filter(|m| m.id == id && super::manager::install_damage(&path, dir).is_none())
 }
 
 /// The `VERSION` marker of an install directory, when present and non-empty.
@@ -1124,9 +1132,15 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
     }
     for f in Flavor::ALL {
         let dir = root.join(f.dest());
-        let manifest = super::manager::read_manifest(&dir.join(super::manager::MANIFEST_FILE))
-            .filter(|m| m.id == f.resource_id());
-        let by_marker = crate::backend::libs::read_ort_flavor(&dir).as_deref() == Some(f.as_str());
+        let manifest = intact_manifest(&dir, f.resource_id());
+        // A marker speaks for an install without a manifest; one with a damaged manifest is
+        // damaged, even when the loader above still found a library in it.
+        let has_manifest = dir.join(super::manager::MANIFEST_FILE).is_file();
+        let by_marker = !has_manifest
+            && crate::backend::libs::read_ort_flavor(&dir).as_deref() == Some(f.as_str());
+        if has_manifest && manifest.is_none() && !out.ort_pinned {
+            out.resources.remove(f.resource_id());
+        }
         if manifest.is_some() || by_marker {
             out.resources.insert(f.resource_id().to_string());
             let version = manifest.map(|m| m.version).or_else(|| version_file(&dir));
@@ -1136,10 +1150,10 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
         }
     }
     let cuda_dir = root.join(catalog::CUDA_LIBS_DEST);
-    let cuda_manifest =
-        super::manager::read_manifest(&cuda_dir.join(super::manager::MANIFEST_FILE))
-            .filter(|m| m.id == catalog::CUDA_LIBS_ID);
-    if cuda_manifest.is_some() || dir_non_empty(&cuda_dir) {
+    let cuda_manifest = intact_manifest(&cuda_dir, catalog::CUDA_LIBS_ID);
+    let cuda_unlisted =
+        !cuda_dir.join(super::manager::MANIFEST_FILE).is_file() && dir_non_empty(&cuda_dir);
+    if cuda_manifest.is_some() || cuda_unlisted {
         out.resources.insert(catalog::CUDA_LIBS_ID.to_string());
         let version = cuda_manifest
             .map(|m| m.version)
@@ -1160,4 +1174,56 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
         }
     }
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod install_damage_tests {
+    use super::*;
+
+    /// An install with one listed file; returns that file.
+    fn install(dir: &Path, id: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let file = dir.join("runtime.bin");
+        std::fs::write(&file, b"library").unwrap();
+        let manifest = serde_json::json!({
+            "id": id, "version": "1", "sha256": [], "files": ["runtime.bin"],
+        });
+        std::fs::write(
+            dir.join(super::super::manager::MANIFEST_FILE),
+            manifest.to_string(),
+        )
+        .unwrap();
+        file
+    }
+
+    /// Antivirus or a user removed a runtime library and left the manifest: it is not installed,
+    /// so the next provision downloads it again instead of reporting Installed.
+    #[test]
+    fn a_runtime_that_lost_a_file_is_not_installed() {
+        let root = std::env::temp_dir().join(format!("bop-resolve-{}", uuid::Uuid::new_v4()));
+        let config = Config::default();
+        let flavor = Flavor::Cpu;
+        let installs = [
+            (
+                root.join(crate::backend::libs::BUNDLED_DIR_NAME),
+                catalog::OPENVINO_RUNTIME_ID,
+            ),
+            (root.join(flavor.dest()), flavor.resource_id()),
+            (root.join(catalog::CUDA_LIBS_DEST), catalog::CUDA_LIBS_ID),
+        ];
+        let files: Vec<PathBuf> = installs.iter().map(|(d, id)| install(d, id)).collect();
+        let found = detect_installed(&config, &root, None);
+        for (_, id) in &installs {
+            assert!(found.resources.contains(*id), "{id} intact");
+        }
+        for f in &files {
+            std::fs::remove_file(f).unwrap();
+        }
+        let found = detect_installed(&config, &root, None);
+        for (_, id) in &installs {
+            assert!(!found.resources.contains(*id), "{id} lost its file");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

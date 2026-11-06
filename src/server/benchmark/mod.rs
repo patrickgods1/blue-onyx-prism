@@ -73,6 +73,8 @@ struct DeviceOptionRow {
     label: String,
     runnable: bool,
     checked: bool,
+    /// Counts toward the "several GPUs" confirmation.
+    gpu: bool,
     reason: Option<String>,
 }
 
@@ -114,6 +116,10 @@ struct BenchmarkTemplate {
     max_images: usize,
     accuracy_weight: String,
     warning: &'static str,
+    /// The text of the "several GPUs" confirmation.
+    gpu_warning: &'static str,
+    /// A run that never ended, shown once ([`crate::benchmark::service::breadcrumb`]).
+    interrupted: Option<String>,
     force_cpu: bool,
     results_file: String,
     speed_thresholds: String,
@@ -211,25 +217,47 @@ fn model_options(c: &Config) -> Vec<ModelOption> {
         .collect()
 }
 
+/// The devices the enabled models run on now (loaded), else would run on, in config order.
+fn devices_in_use(state: &AppState, snap: &DevicesSnapshot, c: &Config) -> Vec<String> {
+    let loaded = loaded_devices(state);
+    c.enabled_models()
+        .filter_map(|m| {
+            let name = crate::registry::normalize_name(&m.effective_name());
+            loaded
+                .get(&name)
+                .cloned()
+                .or_else(|| configured_device(c, m, &snap.model_selection(state, c, m)))
+        })
+        .collect()
+}
+
 /// Every device option, runnable first (downloadable ones count as not runnable here: the
-/// benchmark only measures what is installed). The saved devices are ticked; saved ones that
-/// cannot run here are left out, and with none left every runnable one is ticked (a saved
-/// `openvino:gpu.0` whose iGPU was switched off must not leave the page with nothing ticked).
-fn device_rows(snap: &DevicesSnapshot, c: &Config) -> Vec<DeviceOptionRow> {
+/// benchmark only measures what is installed). The saved devices are ticked, else `in_use`, the
+/// devices the models run on, else the first runnable option: a sweep of every device has hung
+/// a machine, so that takes ticking them by hand. Any of those that cannot run here is left out
+/// (a saved `openvino:gpu.0` whose iGPU was switched off must not leave the page with nothing
+/// ticked).
+fn device_rows(snap: &DevicesSnapshot, c: &Config, in_use: &[String]) -> Vec<DeviceOptionRow> {
     let (ok, bad): (Vec<_>, Vec<_>) = snap.selection.options.iter().partition(|o| o.runnable);
-    let chosen: Vec<String> = c
-        .benchmark
-        .devices
-        .iter()
-        .filter_map(|d| crate::backend::spec::parse(d).ok().map(|s| s.to_string()))
-        .filter(|d| ok.iter().any(|o| o.spec.to_string() == *d))
-        .collect();
-    ok.into_iter()
+    let runnable = |list: &[String]| -> Vec<String> {
+        list.iter()
+            .filter_map(|d| crate::backend::spec::parse(d).ok().map(|s| s.to_string()))
+            .filter(|d| ok.iter().any(|o| o.spec.to_string() == *d))
+            .collect()
+    };
+    let chosen = [runnable(&c.benchmark.devices), runnable(in_use)]
+        .into_iter()
+        .find(|l| !l.is_empty())
+        .or_else(|| ok.first().map(|o| vec![o.spec.to_string()]))
+        .unwrap_or_default();
+    ok.iter()
+        .copied()
         .chain(bad)
         .map(|o| {
             let spec = o.spec.to_string();
             DeviceOptionRow {
-                checked: o.runnable && (chosen.is_empty() || chosen.contains(&spec)),
+                checked: o.runnable && chosen.contains(&spec),
+                gpu: o.spec.is_gpu_like(),
                 spec,
                 label: o.label.clone(),
                 runnable: o.runnable,
@@ -376,7 +404,7 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
             nav: "benchmark",
             version: crate::VERSION,
             models: model_options(&cfg),
-            devices: device_rows(&snap, &cfg),
+            devices: device_rows(&snap, &cfg, &devices_in_use(&state, &snap, &cfg)),
             datasets: dataset_rows(&state, &cfg),
             reference_models: cfg
                 .models
@@ -394,6 +422,8 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
             max_images: b.max_images_per_dataset,
             accuracy_weight: format!("{:.2}", b.weights.accuracy_share()),
             warning: LIVE_WARNING,
+            gpu_warning: crate::benchmark::service::SEVERAL_GPUS_WARNING,
+            interrupted: state.benchmark.take_interrupted(&cfg.data_root()),
             force_cpu: cfg.force_cpu,
             results_file: results_path(&state.config_path).display().to_string(),
             speed_thresholds: format!("A < {} ms, B < {}, C < {}, D < {}", S[0], S[1], S[2], S[3]),
@@ -1047,7 +1077,7 @@ mod tests {
     async fn saved_devices_that_cannot_run_here_are_not_ticked() {
         let st = state();
         let ticked = |html: &str, spec: &str| html.contains(&format!("value=\"{spec}\" checked"));
-        // Only a vanished iGPU saved: every runnable device is ticked instead of none.
+        // Only a vanished iGPU saved: the device the model runs on is ticked instead of none.
         st.config
             .update("test", |c| {
                 c.benchmark.devices = vec!["openvino:gpu.0".into()];
@@ -1070,6 +1100,115 @@ mod tests {
         assert!(!ticked(&html, "ort:cpu"), "{html}");
         let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
         assert!(js.contains("Tick at least one device"));
+    }
+
+    fn gpu_box() -> DevicesSnapshot {
+        use crate::backend::detect::{GpuAdapter, GpuVendor};
+        use crate::backend::select::{RuntimeProbe, select};
+        let adapter = |index, vendor, name: &str, discrete| GpuAdapter {
+            vendor,
+            name: name.into(),
+            vram_mb: if discrete { 8192 } else { 0 },
+            index,
+            discrete,
+            cuda: None,
+        };
+        let hardware = crate::backend::HardwareInfo::new(
+            "linux",
+            "x86_64",
+            vec![
+                adapter(0, GpuVendor::Intel, "UHD 630", false),
+                adapter(1, GpuVendor::Intel, "Arc A770", true),
+            ],
+        );
+        let names: Vec<String> = ["CPU", "GPU.0", "GPU.1"].map(String::from).to_vec();
+        let probe = RuntimeProbe::openvino_only(&names);
+        let selection = select(&hardware, &probe, true);
+        DevicesSnapshot {
+            hardware,
+            selection,
+            probe,
+            openvino_version: "test".into(),
+            openvino_devices: names,
+            onnxruntime: None,
+        }
+    }
+
+    /// G1: with nothing saved the form ticks the devices the models run on, not the machine's
+    /// every device; a saved choice wins; with neither, one device.
+    #[test]
+    fn the_form_starts_on_the_devices_in_use() {
+        let snap = gpu_box();
+        let ticked = |c: &Config, in_use: &[&str]| -> Vec<String> {
+            let in_use: Vec<String> = in_use.iter().map(|s| s.to_string()).collect();
+            device_rows(&snap, c, &in_use)
+                .into_iter()
+                .filter(|r| r.checked)
+                .map(|r| r.spec)
+                .collect()
+        };
+        let mut c = Config::default();
+        let runnable = device_rows(&snap, &c, &[])
+            .iter()
+            .filter(|r| r.runnable)
+            .count();
+        assert!(runnable >= 3, "the fixture has several devices");
+
+        assert_eq!(ticked(&c, &["openvino:gpu.1"]), ["openvino:gpu.1"]);
+        // Spelled as the config may spell it.
+        assert_eq!(ticked(&c, &["GPU.1", "openvino:gpu.1"]).len(), 1);
+        assert_eq!(
+            ticked(&c, &["openvino:gpu.0", "openvino:cpu"]).len(),
+            2,
+            "two models on two devices"
+        );
+        assert_eq!(ticked(&c, &["ort:coreml"]).len(), 1, "gone: one, not all");
+        assert_eq!(ticked(&c, &[]).len(), 1);
+
+        c.benchmark.devices = vec!["openvino:cpu".into()];
+        assert_eq!(ticked(&c, &["openvino:gpu.1"]), ["openvino:cpu"]);
+
+        let rows = device_rows(&snap, &Config::default(), &[]);
+        let gpu = |spec: &str| rows.iter().find(|r| r.spec == spec).unwrap().gpu;
+        assert!(gpu("openvino:gpu.0") && gpu("openvino:gpu.1"));
+        assert!(!gpu("openvino:cpu"));
+    }
+
+    /// The form's side of the confirmation: the boxes are marked, the warning sits under them.
+    #[tokio::test]
+    async fn the_form_warns_about_several_gpus() {
+        use crate::benchmark::service::SEVERAL_GPUS_WARNING;
+        let (_, html) = crate::server::test_util::get_text(&state(), "/benchmark").await;
+        assert!(html.contains("id=\"gpu-warning\" hidden"), "{html}");
+        assert!(html.contains("never found"), "{html}");
+        assert!(SEVERAL_GPUS_WARNING.contains("has hung a machine"));
+        let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
+        assert!(js.contains("[data-gpu]") && js.contains("\"confirm_gpus\""));
+        let template = include_str!("../../../templates/benchmark.html");
+        assert!(template.contains("data-gpu=\"1\""));
+    }
+
+    /// G1: a breadcrumb in the data root is shown on the page once, and the file goes with it.
+    #[tokio::test]
+    async fn a_run_that_never_ended_is_shown_once() {
+        use crate::benchmark::service::breadcrumb::{BREADCRUMB_FILE, Breadcrumb};
+        let st = crate::server::test_util::test_state();
+        let file = st.config_read().data_root().join(BREADCRUMB_FILE);
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        assert!(!html.contains("id=\"bench-interrupted\""), "nothing left");
+        let crumb = Breadcrumb {
+            device: "ort:directml:1".into(),
+            model: "<b>m</b>".into(),
+            time: "2026-11-06T10:00:00Z".into(),
+        };
+        std::fs::write(&file, serde_json::to_vec(&crumb).unwrap()).unwrap();
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        assert!(html.contains("id=\"bench-interrupted\""), "{html}");
+        assert!(html.contains("ort:directml:1"), "{html}");
+        assert!(!html.contains("<b>m</b>"), "escaped");
+        assert!(!file.exists(), "shown, so gone");
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        assert!(!html.contains("id=\"bench-interrupted\""), "once");
     }
 
     #[tokio::test]
