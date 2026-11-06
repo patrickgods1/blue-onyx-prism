@@ -1558,6 +1558,12 @@ fn a_cancelled_labelers_run_keeps_the_finished_frames_and_a_rerun_resumes() {
         ..LabelFake::default()
     };
     let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    // The order the run takes them in: its boxes change the queue's order afterwards.
+    let list: Vec<String> = queue::build(&dir, &job.request.frames.filters().unwrap())
+        .items
+        .into_iter()
+        .map(|i| i.frame)
+        .collect();
     let cancel = AtomicBool::new(false);
     let out = run_cancellable(&job, &fake, &cancel).unwrap();
     assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
@@ -1586,11 +1592,6 @@ fn a_cancelled_labelers_run_keeps_the_finished_frames_and_a_rerun_resumes() {
     assert!(!job.work.exists(), "the work folder is removed");
     let labeler = rep["labeler"].as_str().unwrap();
     // The proposals follow the frame list's order: the first three are done.
-    let list: Vec<String> = queue::build(&dir, &job.request.frames.filters().unwrap())
-        .items
-        .into_iter()
-        .map(|i| i.frame)
-        .collect();
     assert_eq!(list.len(), 5);
     for rel in &list[..3] {
         let f = labels_of(&dir, rel);
@@ -3247,4 +3248,38 @@ fn dry_run_writes_nothing() {
         "no file came or went"
     );
     assert!(before == after, "no file changed");
+}
+
+#[test]
+fn the_summary_says_what_the_tiers_did() {
+    let mut rep = AutolabelReport::default();
+    assert_eq!(
+        rep.labelers_notes(),
+        "",
+        "a run of an older kind reads as before"
+    );
+    rep.count_labelers(&triage::LabelersReport {
+        apply: triage::ApplyReport {
+            merge: labels::MergeReport {
+                added: 6,
+                ..labels::MergeReport::default()
+            },
+            ..triage::ApplyReport::default()
+        },
+        dismissed: 3,
+        audit: 1,
+        likely: 2,
+        ..triage::LabelersReport::default()
+    });
+    assert_eq!(
+        (rep.added, rep.dismissed, rep.audit, rep.likely),
+        (3, 3, 1, 2)
+    );
+    let s = rep.labelers_notes();
+    assert!(s.contains("2 boxes likely real"), "{s}");
+    assert!(
+        s.contains("3 boxes below score 0.15 hidden, 1 more kept visible"),
+        "{s}"
+    );
+    assert!(s.contains("Show hidden on the Review page"), "{s}");
 }

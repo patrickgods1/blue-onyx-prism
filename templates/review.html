@@ -5,6 +5,7 @@
 <details class="help">
   <summary>How review works</summary>
   <p>Frames collected from your cameras (Dataset page), one at a time, most uncertain first. Decide every box: accept the real objects, reject the false ones (kept as hard negatives), restore a wrongly suppressed box, draw what the model missed. They stay on this machine in <code>{{ dir }}</code>. Format: <code>docs/DATASET.md</code>. After an auto-label run, boxes marked <em>auto: accept</em> are accepted on save and <em>auto: review</em> ones (marked ?) ask first; frames with only accept boxes can be accepted in bulk. Press <kbd>?</kbd> for the keys.</p>
+  <p>An auto-label run also sorts its new boxes, by what its test runs measured. <em>Likely</em> boxes (&#9733;, a score of 0.25 or more and a VLM yes; 77% real on public sets, 96% on a fixed camera) come first, in the queue and in the box list, and <kbd>c</kbd> accepts them all. The other flagged boxes are drawn quieter; <kbd>Shift</kbd>+<kbd>R</kbd> clears them. Boxes under 0.15 (5% real on public sets) are <em>hidden</em>: no negatives, nothing lost. <em>Show N hidden</em> or <kbd>i</kbd> brings them back dimmed, and accepting one makes it a label. A VLM no never hides a box, trucks and SAM 3 boxes are never hidden, and a frame with hidden boxes needs a reviewer: no bulk save takes it. About 2% of the boxes that would be hidden stay visible (<em>audit sample: normally hidden</em>); your verdicts on them are the <em>Hidden-box check</em> in the counts.</p>
   <p>Labelling rules:</p>
   <ul class="rv-rules">
     <li>A tight box around the visible part of the object.</li>
@@ -37,7 +38,7 @@
     <label>Scene <select name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></label>
     <label>Camera <select name="camera" id="rv-camera"><option value="">any</option></select></label>
     <div class="rv-label-filter"><span class="field-label" id="rv-label-cap">Class</span> <div id="rv-label-picker" aria-labelledby="rv-label-cap"><select id="rv-label-fallback" aria-label="Class"><option value="">any</option>{% for c in classes %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></div><input type="hidden" name="label" id="rv-label" value=""></div>
-    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option><option value="repeats">only repeats left</option><option value="overlaps">overlapping boxes</option><option value="both">found by 2+ labelers</option></select></label>
+    <label>Auto <select name="auto"><option value="">any</option><option value="review">flagged for review</option><option value="accept">all auto: accept</option><option value="nothing">auto found nothing</option><option value="none">not auto-labelled</option><option value="repeats">only repeats left</option><option value="overlaps">overlapping boxes</option><option value="both">found by 2+ labelers</option><option value="dismissed">hidden boxes</option></select></label>
     <label>Status <select name="status"><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select></label>
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
   </form>
@@ -52,6 +53,7 @@
   <aside class="review-side card">
     <figure id="rv-crop-wrap" class="review-crop" hidden><div class="rv-crop-area"><canvas id="rv-crop" width="1" height="1" aria-label="The selected box, enlarged"></canvas></div><figcaption><span id="rv-crop-cap" class="muted"></span> <button type="button" id="rv-crop-wide" class="small secondary rv-crop-wide">Larger close-up</button></figcaption></figure>
     <div id="rv-decide" class="rv-decide" aria-live="polite"></div>
+    <div id="rv-box-tools" class="rv-box-tools" hidden></div>
     <ol id="rv-boxes" class="review-boxes" aria-label="Boxes"></ol>
     <label class="check"><input type="checkbox" id="rv-empty"> Confirmed empty (no object of any class)</label>
     <div class="inline-row rv-actions">
@@ -76,7 +78,7 @@
       <table class="review-keys">
         <tbody><!-- filled by review.js from its key list (also the ? overlay) --></tbody>
       </table>
-      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; needs a decision before saving) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; the pointer over a box shows its full tag.</p>
+      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-likely"></span>&#9733; likely real (outlined; first in the list; needs a decision before saving) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; needs a decision before saving) <span class="swatch sw-unlikely"></span>? flagged, unlikely (quieter, after a run that sorted its boxes) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; the pointer over a box shows its full tag.</p>
     </details>
     </details>
   </aside>
@@ -121,12 +123,12 @@
   <div id="rv-al-status" class="review-report" role="status"></div>
   <div class="inline-row">
     <button type="button" id="rv-accept-auto" class="small secondary">Accept auto: accept frames&hellip;</button>
-    <span class="muted">Saves the unreviewed frames the filters select whose boxes are all <em>auto: accept</em> as reviewed (asks first).</span>
+    <span class="muted">Saves the unreviewed frames the filters select whose boxes are all <em>auto: accept</em> as reviewed (asks first). A frame with hidden boxes is left for you: a saved frame claims it is complete.</span>
   </div>
   <div id="rv-accept-auto-msg" class="review-report" role="status"></div>
   <div class="inline-row">
     <button type="button" id="rv-accept-repeats" class="small secondary">Save repeat-only frames&hellip;</button>
-    <span class="muted">Saves as reviewed the unreviewed frames the filters select whose every box <em>Reject / Accept this spot on all frames</em> (the decision bar, for a box you decided) already settled; a frame with a box still to decide is never saved. Asks first.</span>
+    <span class="muted">Saves as reviewed the unreviewed frames the filters select whose every box <em>Reject / Accept this spot on all frames</em> (the decision bar, for a box you decided) already settled; a frame with a box still to decide or with hidden boxes is never saved. Asks first.</span>
   </div>
   <div id="rv-accept-repeats-msg" class="review-report" role="status"></div>
   <div class="inline-row">

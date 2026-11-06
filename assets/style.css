@@ -38,6 +38,8 @@
   --series-8: #4f5868;
   --chip-same-bg: #eceff4;
   --chip-same-fg: #4a5262;
+  --likely-bg: #d9f7ef;
+  --likely-fg: #0b5e50;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -78,6 +80,8 @@
     --series-8: #b4bccb;
     --chip-same-bg: #262d39;
     --chip-same-fg: #c3cad6;
+    --likely-bg: #113a32;
+    --likely-fg: #7fe9d2;
   }
 }
 * { box-sizing: border-box; }
@@ -786,6 +790,7 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .review-boxes .bx-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 0.2rem; }
 .sw-pending { background: #e8d000; } .sw-review { background: #ffa000; box-shadow: inset 0 0 0 2px #000; } .sw-hint { background: #f08c00; } .sw-accepted { background: #2e9e4f; }
 .sw-added { background: #1f6fe0; } .sw-rejected { background: #e53935; }
+.sw-likely { background: #14d6b0; box-shadow: inset 0 0 0 2px #000; } .sw-unlikely { background: #ffa000; opacity: .55; }
 .review-keys td { padding: 0.1rem 0.6rem 0.1rem 0; font-size: 0.85rem; }
 .review-keys td:first-child { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: nowrap; }
 .review-report { font-size: 0.9rem; overflow-wrap: anywhere; }
@@ -808,12 +813,17 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .review-crop button.rv-crop-wide { margin: 0; padding: 0 0.45rem; font-size: 0.75rem; }
 .review-boxes li.lk-review { border-color: #ffa000; }
 .review-boxes li.lk-review.sel { box-shadow: 0 0 0 1px #ffa000; }
+.review-boxes li.lk-likely { border-color: var(--likely-fg); }
+.review-boxes li.lk-likely.sel { box-shadow: 0 0 0 1px var(--likely-fg); }
+.review-boxes li.lk-unlikely:not(.sel) { opacity: .7; }
+.rv-box-tools { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; margin: .35rem 0; }
 .review-boxes .bx-chips { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 0.25rem; }
 .rv-chip { font-size: 0.75rem; padding: 0 0.4rem; border-radius: 4px; border: 1px solid var(--border); overflow-wrap: anywhere; }
 .rv-chip.ok { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--ok-fg); }
 .rv-chip.warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
 .rv-chip.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(--err-fg); }
 .rv-chip.drawn { color: #1f6fe0; border-color: #1f6fe0; }
+.rv-chip.likely { background: var(--likely-bg); color: var(--likely-fg); border-color: var(--likely-fg); }
 .review-boxes .bx-suggest { grid-column: 1 / -1; font-size: 0.85rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; }
 .review-boxes .bx-suggest button.small { margin: 0; }
 #rv-msg button.small { margin-left: 0.4rem; }

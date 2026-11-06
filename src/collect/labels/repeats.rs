@@ -113,12 +113,16 @@ impl Spot {
 }
 
 /// A frame whose boxes a spot edit settled: unreviewed, touched by a spot edit
-/// ([`LabelFile::repeat_spot`]), no pending box left. Sorted last in the queue; the "accept
-/// repeat-only frames" bulk save takes these only.
+/// ([`LabelFile::repeat_spot`]), no pending box left, no dismissed box
+/// ([`LabelBox::is_dismissed`]: a save claims the frame is complete, and nobody saw those). Sorted
+/// last in the queue; the "accept repeat-only frames" bulk save takes these only.
 pub fn repeats_only(f: &LabelFile) -> bool {
     f.status == Status::Unreviewed
         && f.repeat_spot
-        && !f.boxes.iter().any(|b| b.state == BoxState::Pending)
+        && !f
+            .boxes
+            .iter()
+            .any(|b| b.state == BoxState::Pending || b.is_dismissed())
 }
 
 /// One earlier decision at a camera ([`history`]).
@@ -147,8 +151,8 @@ pub struct History {
 
 /// Whether a decided box counts as the reviewer's own look at that spot: a model or auto box
 /// accepted or rejected, not by a rule over many frames (the low-score and unwanted-class
-/// rejects, an earlier spot edit; counting those would make a spot look more certain than any
-/// look at it was). A duplicate reject is no verdict on the spot either: another box stays on the
+/// rejects, a labelers run's dismissals, an earlier spot edit; counting those would make a spot look
+/// more certain than any look at it was). A duplicate reject is no verdict on the spot either: another box stays on the
 /// object there (a real parked car must not read "rejected here N times"), and neither is a
 /// too-small reject: a real object, only too small to label. Twin of the page's `lookedAt`.
 fn counts(b: &LabelBox) -> bool {
@@ -162,6 +166,7 @@ fn counts(b: &LabelBox) -> bool {
             b.reason.as_deref(),
             Some(
                 super::bulk::LOW_SCORE_REASON
+                    | super::bulk::DISMISSED_REASON
                     | super::bulk::OTHER_CLASS_REASON
                     | REPEAT_SPOT_REASON
                     | super::REST_REASON
@@ -474,5 +479,52 @@ mod tests {
         b.source = Source::Human;
         b.state = BoxState::Added;
         assert!(!counts(&b));
+    }
+
+    fn dismissed() -> LabelBox {
+        LabelBox {
+            state: BoxState::Rejected,
+            reason: Some(super::super::bulk::DISMISSED_REASON.into()),
+            ..super::super::tests_support::auto_box("car")
+        }
+    }
+
+    #[test]
+    fn a_dismissed_box_teaches_the_spot_nothing() {
+        assert!(!counts(&dismissed()));
+        // Once a reviewer rejects it the reason is gone, and it counts.
+        let mut judged = dismissed();
+        judged.reason = None;
+        assert!(counts(&judged));
+    }
+
+    #[test]
+    fn a_frame_with_a_dismissed_box_is_not_repeat_only() {
+        let mut f = LabelFile {
+            repeat_spot: true,
+            boxes: vec![LabelBox {
+                state: BoxState::Rejected,
+                ..super::super::tests_support::auto_box("dog")
+            }],
+            ..LabelFile::default()
+        };
+        assert!(repeats_only(&f));
+        f.boxes.push(dismissed());
+        assert!(!repeats_only(&f), "a bulk save would pass over it unseen");
+    }
+
+    #[test]
+    fn a_spot_edit_leaves_a_dismissed_box_alone() {
+        let d = dismissed();
+        let spot = Spot {
+            camera: "c".into(),
+            label: "car".into(),
+            bbox: d.bbox,
+            width: 640,
+            height: 480,
+            min_iou: REJECT_SPOT_IOU,
+        };
+        assert!(!spot.matches(&d, &Verdict::Reject(None)));
+        assert!(!spot.matches(&d, &Verdict::Accept));
     }
 }

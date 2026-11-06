@@ -3,8 +3,9 @@
 //! sidecar ([`prefill`]; boxes of unwanted classes, [`wanted_class`], left out), the save-time
 //! normalisation ([`normalize`]: clamping, pending boxes
 //! resolved, class check) and the merge of later proposals such as auto-labeler boxes
-//! ([`merge_proposals`]), and whether the auto-labeler's triage alone settles a frame
-//! ([`auto_accept_eligible`]). IO: [`Frame::resolve`] (every frame reference goes through
+//! ([`merge_proposals`]), whether the auto-labeler's triage alone settles a frame
+//! ([`auto_accept_eligible`]), and which boxes a labelers run set aside
+//! ([`LabelBox::is_dismissed`]). IO: [`Frame::resolve`] (every frame reference goes through
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
 //! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
@@ -287,6 +288,15 @@ pub struct AutoInfo {
     /// The auto-labelers' fused score of `auto_label`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_score: Option<f32>,
+    /// Likely real ([`crate::training::autolabel::triage::tier`]): a labelers run's box with a high
+    /// enough score and a VLM yes. Shown first on the Review page; `triage` stays `review` (that
+    /// enum is strict, a new value would break older builds).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub likely: bool,
+    /// A sample of the boxes a run would have dismissed, left pending so that a reviewer's verdict
+    /// checks the filter ([`Counts`](queue::Counts) `audit_accepted` / `audit_rejected`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub audit: bool,
 }
 
 impl AutoInfo {
@@ -308,6 +318,39 @@ impl LabelBox {
         self.difficult
             || (self.state == BoxState::Rejected
                 && self.reject_reason == Some(RejectReason::TooSmall))
+    }
+
+    /// Set aside by a labelers run for its score ([`bulk::DISMISSED_REASON`]): rejected, so no
+    /// label and no live box, but nobody judged it, so no negative and no decision either. A
+    /// reviewer's own verdict clears the reason ([`normalize`]).
+    pub fn is_dismissed(&self) -> bool {
+        self.state == BoxState::Rejected && self.reason.as_deref() == Some(bulk::DISMISSED_REASON)
+    }
+
+    /// A reviewer's verdict on an [`AutoInfo::audit`] box: `Some(true)` real, `Some(false)` not,
+    /// None while undecided or when the decision is no verdict on the box: a bulk reject by score
+    /// or class, a duplicate (another box stays on the object), too small (real, but no label).
+    /// Reject the rest counts as a no: the box was on screen and `Shift+R` is the way to clear
+    /// unlikely boxes, so leaving it out would leave the check nearly all accepts.
+    pub fn audit_verdict(&self) -> Option<bool> {
+        if !self.auto.audit {
+            return None;
+        }
+        match self.state {
+            BoxState::Accepted => Some(true),
+            BoxState::Rejected
+                if !matches!(
+                    self.reason.as_deref(),
+                    Some(bulk::LOW_SCORE_REASON | bulk::OTHER_CLASS_REASON)
+                ) && !matches!(
+                    self.reject_reason,
+                    Some(RejectReason::Duplicate | RejectReason::TooSmall)
+                ) =>
+            {
+                Some(false)
+            }
+            _ => None,
+        }
     }
 
     fn proposal(d: &super::record::Det, origin: Origin, reason: Option<String>) -> Self {
@@ -450,11 +493,13 @@ impl LabelFile {
             .filter(|b| b.state == BoxState::Rejected && b.source != Source::Human)
     }
 
-    /// [`Self::rejected`] without the boxes that sit on a real object, so are no false positive to
-    /// learn from: duplicates (a second box on an object) and ignore regions (too small).
+    /// [`Self::rejected`] without the boxes that are no false positive to learn from: duplicates (a
+    /// second box on an object), ignore regions (too small) and dismissed boxes
+    /// ([`LabelBox::is_dismissed`]: nobody judged them).
     pub fn hard_negatives(&self) -> impl Iterator<Item = &LabelBox> {
-        self.rejected()
-            .filter(|b| b.reject_reason != Some(RejectReason::Duplicate) && !b.is_ignore())
+        self.rejected().filter(|b| {
+            b.reject_reason != Some(RejectReason::Duplicate) && !b.is_ignore() && !b.is_dismissed()
+        })
     }
 }
 
@@ -641,10 +686,16 @@ fn auto_accepted(b: &LabelBox) -> bool {
 /// already settled: an unreviewed frame, not confirmed empty, without a re-label
 /// disagreement, with at least one pending box triaged `accept` (no class suggestion) and every
 /// other pending box a model hint the labelers did not confirm (suppressed, below threshold or
-/// verifier-found, no auto evidence: rejected on save). Decided boxes do not matter. Used by the
-/// queue's `auto=accept` filter and the bulk accept.
+/// verifier-found, no auto evidence: rejected on save). Decided boxes do not matter, but a
+/// dismissed box ([`LabelBox::is_dismissed`]) keeps the frame out: a saved frame claims it is
+/// complete, and 5% of those boxes were real on public sets, so a real object nobody looked at
+/// would train as background. Used by the queue's `auto=accept` filter and the bulk accept.
 pub fn auto_accept_eligible(f: &LabelFile) -> bool {
-    if f.status != Status::Unreviewed || f.empty_confirmed || f.disagreement.is_some() {
+    if f.status != Status::Unreviewed
+        || f.empty_confirmed
+        || f.disagreement.is_some()
+        || f.boxes.iter().any(LabelBox::is_dismissed)
+    {
         return false;
     }
     let mut any = false;
@@ -675,6 +726,7 @@ fn label_ok(l: &str) -> bool {
 ///   `classes`, and a frame confirmed empty must have none; `reviewed_at` = `now`;
 /// - `skipped`: `reviewed_at` = `now`; `unreviewed`: no `reviewed_at`;
 /// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
+/// - [`bulk::DISMISSED_REASON`] cleared unless the box is rejected with no reason of a reviewer's;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
 ///   (bounded), `overlaps_checked` and `overlap_suggestions` (bounded, [`overlaps::check`]) kept,
 ///   `bulk_accepted` and `checked_before_reopen` cleared;
@@ -814,13 +866,18 @@ pub fn normalize(
         Status::Skipped => f.reviewed_at = Some(now.to_string()),
         Status::Unreviewed => f.reviewed_at = None,
     }
-    // A reject reason belongs to a rejected box only; a rejected box is not "unsure".
+    // A reject reason belongs to a rejected box only; a rejected box is not "unsure". A reviewer's
+    // decision ends a dismissal: then the box is a label, or a negative like any other.
     for b in &mut f.boxes {
+        let dismissed = b.reason.as_deref() == Some(bulk::DISMISSED_REASON);
         if b.state == BoxState::Rejected {
             b.difficult = false;
+            if dismissed && b.reject_reason.is_some() {
+                b.reason = None;
+            }
         } else {
             b.reject_reason = None;
-            if b.reason.as_deref() == Some(REST_REASON) {
+            if dismissed || b.reason.as_deref() == Some(REST_REASON) {
                 b.reason = None;
             }
         }
@@ -873,6 +930,12 @@ fn check_auto(a: &AutoInfo) -> Result<()> {
         && !score_ok(s)
     {
         bail!("auto_score {s} is not between 0 and 1");
+    }
+    if a.likely && a.audit {
+        bail!(
+            "marked both likely and audit: an audit sample is a box scoring too low to be likely; \
+             reload the frame and save again"
+        );
     }
     Ok(())
 }
@@ -1656,6 +1719,8 @@ mod tests {
             species_scores: Default::default(),
             auto_label: None,
             auto_score: None,
+            likely: false,
+            audit: false,
         };
         let v = serde_json::to_value(&b).unwrap();
         assert_eq!(v["agree"], true);
@@ -2116,5 +2181,149 @@ mod tests {
             .unwrap()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A box a labelers run dismissed.
+    fn dismissed(label: &str) -> LabelBox {
+        LabelBox {
+            state: BoxState::Rejected,
+            reason: Some(bulk::DISMISSED_REASON.into()),
+            ..tests_support::auto_box(label)
+        }
+    }
+
+    #[test]
+    fn a_dismissed_box_is_rejected_evidence_of_nothing() {
+        let plain = LabelBox {
+            state: BoxState::Rejected,
+            ..tests_support::auto_box("dog")
+        };
+        let f = LabelFile {
+            boxes: vec![dismissed("car"), plain],
+            ..LabelFile::default()
+        };
+        assert_eq!(f.rejected().count(), 2);
+        let neg: Vec<&str> = f.hard_negatives().map(|b| b.label.as_str()).collect();
+        assert_eq!(neg, ["dog"]);
+        // The reason alone is not a dismissal.
+        let mut restored = dismissed("car");
+        restored.state = BoxState::Accepted;
+        assert!(!restored.is_dismissed());
+    }
+
+    #[test]
+    fn a_decision_on_a_dismissed_box_clears_the_reason() {
+        let save = |b: LabelBox, status: Status| {
+            let f = LabelFile {
+                status,
+                boxes: vec![b],
+                ..LabelFile::default()
+            };
+            normalize(f, &classes(), 640, 480, "t")
+                .unwrap()
+                .boxes
+                .remove(0)
+        };
+        // Left alone: it stays dismissed.
+        assert!(save(dismissed("car"), Status::Reviewed).is_dismissed());
+        // Accepted.
+        let mut b = dismissed("car");
+        b.state = BoxState::Accepted;
+        assert_eq!(save(b, Status::Reviewed).reason, None);
+        // Pending again.
+        let mut b = dismissed("car");
+        b.state = BoxState::Pending;
+        assert_eq!(save(b, Status::Unreviewed).reason, None);
+        // Rejected by a reviewer with a reason: a negative like any other.
+        let mut b = dismissed("car");
+        b.reject_reason = Some(RejectReason::IrGlare);
+        let b = save(b, Status::Reviewed);
+        assert_eq!(b.reason, None);
+        assert_eq!(
+            LabelFile {
+                boxes: vec![b],
+                ..LabelFile::default()
+            }
+            .hard_negatives()
+            .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_frame_with_a_dismissed_box_is_not_settled_by_its_triage() {
+        let mut sure = tests_support::auto_box("dog");
+        sure.auto.triage = Some(Triage::Accept);
+        let mut f = LabelFile {
+            boxes: vec![sure],
+            ..LabelFile::default()
+        };
+        assert!(auto_accept_eligible(&f));
+        f.boxes.push(dismissed("car"));
+        assert!(!auto_accept_eligible(&f));
+        // Another kind of reject does not keep it out.
+        f.boxes[1].reason = Some(bulk::LOW_SCORE_REASON.into());
+        assert!(auto_accept_eligible(&f));
+    }
+
+    #[test]
+    fn likely_and_audit_stay_off_the_json_when_false_and_old_files_load() {
+        let b = tests_support::auto_box("car");
+        let v = serde_json::to_value(&b).unwrap();
+        assert!(v.get("likely").is_none() && v.get("audit").is_none());
+        let back: LabelBox = serde_json::from_value(v).unwrap();
+        assert!(!back.auto.likely && !back.auto.audit);
+        let mut set = tests_support::auto_box("car");
+        set.auto.likely = true;
+        let v = serde_json::to_value(&set).unwrap();
+        assert_eq!(v["likely"], true);
+        assert!(
+            !serde_json::from_value::<LabelBox>(v)
+                .unwrap()
+                .auto
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_box_cannot_be_both_likely_and_an_audit_sample() {
+        let mut b = tests_support::auto_box("car");
+        b.auto.likely = true;
+        b.auto.audit = true;
+        let f = LabelFile {
+            boxes: vec![b],
+            ..LabelFile::default()
+        };
+        let e = normalize(f, &classes(), 640, 480, "t").unwrap_err();
+        assert!(format!("{e:#}").contains("likely and audit"), "{e:#}");
+    }
+
+    #[test]
+    fn audit_verdicts_count_only_a_look_at_the_box() {
+        let audit = |state: BoxState| {
+            let mut b = tests_support::auto_box("car");
+            b.state = state;
+            b.auto.audit = true;
+            b
+        };
+        assert_eq!(audit(BoxState::Pending).audit_verdict(), None);
+        assert_eq!(audit(BoxState::Accepted).audit_verdict(), Some(true));
+        assert_eq!(audit(BoxState::Rejected).audit_verdict(), Some(false));
+        let mut rest = audit(BoxState::Rejected);
+        rest.reason = Some(REST_REASON.into());
+        assert_eq!(rest.audit_verdict(), Some(false), "the box was on screen");
+        for reason in [bulk::LOW_SCORE_REASON, bulk::OTHER_CLASS_REASON] {
+            let mut b = audit(BoxState::Rejected);
+            b.reason = Some(reason.into());
+            assert_eq!(b.audit_verdict(), None, "{reason}");
+        }
+        for why in [RejectReason::Duplicate, RejectReason::TooSmall] {
+            let mut b = audit(BoxState::Rejected);
+            b.reject_reason = Some(why);
+            assert_eq!(b.audit_verdict(), None);
+        }
+        let mut other = audit(BoxState::Accepted);
+        other.auto.audit = false;
+        assert_eq!(other.audit_verdict(), None);
     }
 }

@@ -317,7 +317,8 @@ folder; the collector and the Dataset page keep `collect.dir`.
   - `added`: a box the reviewer drew (a miss);
   - `rejected`: a wrong box. It is kept as hard-negative evidence and never becomes a training label;
     a pending auto box rejected in bulk for its score has `reason: "low_score"`, a box rejected for an
-    unwanted class (outside the list, or in `collect.hidden_classes`) `reason: "other_class"`;
+    unwanted class (outside the list, or in `collect.hidden_classes`) `reason: "other_class"`, a box a
+    labelers run set aside for its score `reason: "auto_dismissed"` (below);
   - `pending`: not decided yet. Only `unreviewed` and `skipped` files have pending boxes.
 - **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
   `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
@@ -339,6 +340,23 @@ folder; the collector and the Dataset page keep `collect.dir`.
   button of the decision card, or its reason chip) also makes the box an
   [ignore region](#ignore-regions), and like `duplicate` it says nothing about the spot, so the repeats
   history and "rejected here N times" skip it. Frames reviewed earlier follow this without a rewrite.
+- **`reason: "auto_dismissed"`** (a *hidden* box on the Review page): a labelers run found the box at a
+  fused score below 0.15 on a frame nobody had reviewed. Those boxes were 5% real on public sets and 0% on
+  a fixed camera, so they do not take a reviewer's time ([docs/TRAINING.md](TRAINING.md#likely-unlikely-and-hidden-boxes)).
+  The box is `rejected` so that it is no label and no live box, but nobody judged it: it is left out of
+  `hard_negatives.json` and the repeats history, and a later run may replace it. Nothing is lost. Press
+  `i` or *Show N hidden* on the page, or filter by `auto=dismissed`; accepting the box clears the reason, and
+  so does rejecting it by hand, which makes it an ordinary negative. A frame with such a box is never
+  saved in bulk (`auto=accept`, `auto=repeats`): a saved frame claims it is complete. A reviewer who saves it
+  has been told how many are hidden, and a real object among them then counts as background, like any
+  object left unlabelled.
+- **`likely`** (written only when true): a labelers run's box with a fused score of 0.25 or more and a
+  yes to the VLM's yes/no question, 77% real on public sets and 96% on a fixed camera. It is listed first,
+  and the frame comes first in the queue. `triage` stays `review`. Boxes of older runs have no `likely`,
+  and a seven-way VLM answer never gives one.
+- **`audit`** (written only when true): one of the boxes that would have been dismissed, about 2%, left
+  pending with the reason *audit sample: normally hidden*, so that the filter can be checked. A hash of
+  the frame, the label and the whole-pixel box picks them, so a rerun picks the same boxes.
 - **`empty_confirmed`:** the frame holds no object of any class. It is a hard-negative image, and it
   cannot have accepted or added boxes.
 - **`classes_version`:** the first 16 hex digits of the SHA-256 of the class list (`collect.classes`,
@@ -473,6 +491,7 @@ frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` 
 | `repeats` | spot edits settled every box (`repeat_spot`, nothing pending) |
 | `overlaps` | stacked or overlapping boxes no reviewer has looked at (no `overlaps_checked`), any review status |
 | `both` | a pending box two or more labelers found (`labelers`), of a wanted class; most such boxes first (item field `agreed_boxes`) |
+| `dismissed` | a box a labelers run dismissed (`reason: "auto_dismissed"`), pending boxes or not. The page shows those boxes on these frames |
 
 `auto=overlaps` obeys `status` and `source` like the other filters, and most frames with overlaps need
 `status=any&source=all`: a reviewed frame is often not in `review-queue.jsonl`, and reviewed frames need
@@ -481,7 +500,8 @@ this cleaning too. Choosing *overlapping boxes* on the page sets both.
 A frame is **accept-ready** (`labels::auto_accept_eligible`) when it is `unreviewed`, not confirmed
 empty, has no `disagreement`, has at least one pending box triaged `accept` without a class suggestion,
 and every other pending box is a suppressed, below-threshold or verifier-found model box without auto
-evidence (rejected on save). A pending prediction the labelers did not confirm keeps the frame out.
+evidence (rejected on save). A pending prediction the labelers did not confirm keeps the frame out, and
+so does a dismissed box: nobody has seen it, and saving would call the frame complete.
 
 **`label`** keeps the frames that have a box of that class. With a label file, these are its boxes
 that are not rejected (accepted, added and pending ones). Without one, they are the sidecar's
@@ -491,12 +511,14 @@ lists the classes of the frames the other filters keep, for the page's **Class**
 holds `collect.classes`). The auto-label form passes it on like the other filters. Frames are sorted most uncertain first:
 
 1. a re-label disagreement (the label file's `disagreement`, item field `relabel`);
-2. the near-threshold margin: the smallest `|top score - threshold|` over the labels of `raw` and
+2. more pending likely boxes (item field `likely_boxes`), so a frame with one comes before a frame with none;
+3. fewer pending boxes triaged `review` (item field `auto_review`): many flagged boxes with no likely one
+   are mostly false, and such a frame used to open the queue;
+4. the near-threshold margin: the smallest `|top score - threshold|` over the labels of `raw` and
    `below_threshold`, in hundredths;
-3. verifier disagreement (the `disagreement` bucket, or a rejected verifier candidate);
-4. more pending auto boxes triaged `review` (item field `auto_review`);
-5. more suppressed boxes;
-6. newest.
+5. verifier disagreement (the `disagreement` bucket, or a rejected verifier candidate);
+6. more suppressed boxes;
+7. newest.
 
 Under `auto=overlaps` the frames with a live suggestion come first, strongest first (item field
 `overlap_strength`; `collect/labels/overlaps.rs` `strength`): drops with no other detection on the box,
@@ -506,8 +528,11 @@ each by the zoom's score. Frames with no live suggestion follow in the order abo
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
 After the last frame it returns the first one again with `"wrapped": true`. The answer also carries the
 counts: reviewed, remaining, skipped, confirmed empty, rejected boxes, accepted boxes per class, and the
-frames to review (`auto_review`) and accept-ready (`auto_accept`) by the `auto` rules. The counts follow
-every filter except `status` and `auto`.
+frames to review (`auto_review`) and accept-ready (`auto_accept`) by the `auto` rules. `audit_accepted`
+and `audit_rejected` count the audit boxes of reviewed frames a reviewer found real or not; a bulk reject
+by score or class, a duplicate and a too-small reject are no verdict and count as neither, while *Reject the
+rest* counts as not real. The page shows them as *Hidden-box check: 1 of 40 was real*, with a percentage
+from 20 boxes on. The counts follow every filter except `status` and `auto`.
 
 ### Saving, revisions and bulk accept
 
@@ -657,7 +682,7 @@ Click a box to select it. Drag on the image to draw a new one.
                                        bbox [x, y, w, h] px (2 decimals), area = w * h, iscrowd 0,
                                        attributes.difficult on unsure boxes (left out of YOLO)
   hard_negatives.json                  rejected model / auto boxes (frame, label, bbox, origin, reason, reject_reason), without
-                                       duplicate and too_small ones
+                                       duplicate, too_small and auto_dismissed ones
   ignore.json                          ignore regions per image, below
   xanylabeling/<name>.jpg + .json      X-AnyLabeling files (below)
   benchmark/images/<name>.jpg + manifest.json   a benchmark `dir:` set

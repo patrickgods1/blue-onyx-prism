@@ -1519,6 +1519,10 @@ mod tests {
                     reject_reason: Some(super::super::RejectReason::TooSmall),
                     ..lb("person", [50.0, 30.0, 60.0, 45.0], BoxState::Rejected)
                 },
+                LabelBox {
+                    reason: Some(super::super::bulk::DISMISSED_REASON.into()),
+                    ..lb("person", [100.0, 1.0, 120.0, 20.0], BoxState::Rejected)
+                },
             ],
             false,
         );
@@ -1531,7 +1535,10 @@ mod tests {
             hidden_classes: Vec::new(),
         };
         let r = run(&dir, &classes(), &req).unwrap();
-        assert_eq!(r.hard_negative_boxes, 2, "duplicate and too small left out");
+        assert_eq!(
+            r.hard_negative_boxes, 2,
+            "duplicate, too small and dismissed left out"
+        );
         assert_eq!(r.ignore_boxes, 1);
         let ignore: IgnoreFile =
             serde_json::from_slice(&std::fs::read(root.join("out").join(IGNORE_FILE)).unwrap())
