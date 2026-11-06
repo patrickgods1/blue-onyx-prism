@@ -20,18 +20,51 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
+/// The folder set `id` names in `results`: a folder dataset with a name instead of a `dir:` id.
+/// The results record the images folder; `load_dir` wants the folder holding it.
+fn named_folder(results: &BenchmarkResults, id: &str) -> Option<DatasetRef> {
+    if id.starts_with(images::DIR_PREFIX) {
+        return None;
+    }
+    let set = results
+        .image_sets
+        .iter()
+        .find(|s| s.id == id && s.kind == images::SetKind::Dir)?;
+    let dir = set.dir.as_ref()?;
+    let root = match (dir.file_name(), dir.parent()) {
+        (Some(n), Some(p)) if n == "images" => p.to_path_buf(),
+        _ => dir.clone(),
+    };
+    Some(DatasetRef::Dir {
+        dir: root,
+        gt: None,
+        name: Some(id.to_string()),
+    })
+}
+
 /// Parse a start/settings form over the configured defaults and check the datasets: a folder
 /// set (`dir:<path>`) the config does not already list must be a browsable folder or one
 /// picked with Browse... ([`crate::server::browse::allowed_path`]), like `add_folder`.
 fn parse_request(state: &AppState, form: &[(String, String)]) -> anyhow::Result<RunRequest> {
     let cfg = state.config_read().clone();
-    let req = RunRequest::from_form(form, &cfg.benchmark)?;
-    let configured: Vec<std::path::PathBuf> = cfg
+    let mut req = RunRequest::from_form(form, &cfg.benchmark)?;
+    let mut configured: Vec<std::path::PathBuf> = cfg
         .benchmark
         .datasets
         .iter()
         .filter_map(|d| d.dir().map(|(dir, _, _)| cfg.data_path(&dir)))
         .collect();
+    // A named folder set of the saved results (a training run's held-out frames, offered by
+    // Compare's "Run on these images"): the form can only name it, the results know where it is.
+    let saved = BenchmarkResults::load_or_warn(&results_path(&state.config_path));
+    for d in &mut req.datasets {
+        if let Some(named) = saved.as_ref().and_then(|r| named_folder(r, &d.label())) {
+            if let Some((dir, _, _)) = named.dir() {
+                configured.push(cfg.data_path(&dir));
+            }
+            *d = named;
+        }
+    }
     for d in &req.datasets {
         let Some((dir, _, _)) = d.dir() else {
             continue;
@@ -502,6 +535,56 @@ fn image_paths_in(
 
 #[cfg(test)]
 mod tests {
+    use super::named_folder;
+    use crate::benchmark::BenchmarkResults;
+    use crate::benchmark::images::{GroundTruth, SetKind};
+    use crate::benchmark::report::ImageSetInfo;
+    use crate::config::DatasetRef;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_held_out_set_is_found_by_its_name_only() {
+        let mut r: BenchmarkResults = serde_json::from_str("{}").unwrap();
+        let set = |id: &str, kind, dir: &str| ImageSetInfo {
+            id: id.into(),
+            title: String::new(),
+            kind,
+            dir: Some(PathBuf::from(dir)),
+            license: String::new(),
+            attribution: String::new(),
+            source: String::new(),
+            ground_truth: GroundTruth::Yolo,
+            scored_labels: None,
+            images: Vec::new(),
+        };
+        r.image_sets = vec![
+            set("heldout-a", SetKind::Dir, "/t/run/heldout/images"),
+            set("plain", SetKind::Dir, "/t/flat"),
+            set("coco-cctv", SetKind::Builtin, "/t/bench/coco"),
+            set("dir:/x", SetKind::Dir, "/x"),
+        ];
+        assert_eq!(
+            named_folder(&r, "heldout-a"),
+            Some(DatasetRef::Dir {
+                dir: PathBuf::from("/t/run/heldout"),
+                gt: None,
+                name: Some("heldout-a".into()),
+            }),
+            "the folder that holds images/"
+        );
+        assert!(matches!(
+            named_folder(&r, "plain"),
+            Some(DatasetRef::Dir { dir, .. }) if dir.as_path() == std::path::Path::new("/t/flat")
+        ));
+        assert_eq!(
+            named_folder(&r, "coco-cctv"),
+            None,
+            "built-in: an id stays an id"
+        );
+        assert_eq!(named_folder(&r, "dir:/x"), None, "already a path");
+        assert_eq!(named_folder(&r, "unknown"), None);
+    }
+
     use super::super::tests::{call, get, post, state};
     use super::*;
     use crate::server::router;

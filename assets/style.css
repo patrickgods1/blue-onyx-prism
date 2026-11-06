@@ -995,12 +995,11 @@ details.res-group table.resources tr[hidden] { display: none; }
 }
 .tag.ds-state { white-space: nowrap; }
 
-/* ---- Benchmark wizard: 1 Run, 2 Profiles, 3 Apply, then Advanced set apart ----------------- */
+/* ---- Benchmark tabs: Compare, Run, Tune, History, Details ----------------------------------- */
 nav.wizard { align-items: stretch; flex-wrap: wrap; }
 nav.wizard a[role="tab"] { display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap; }
 nav.wizard .step-n { display: inline-flex; align-items: center; justify-content: center; width: 1.45rem; height: 1.45rem; border-radius: 50%; border: 1.5px solid currentColor; font-weight: 700; font-size: 0.8rem; }
 nav.wizard a[role="tab"][aria-selected="true"] .step-n { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-nav.wizard a.tab-advanced { margin-left: auto; border-left: 1px solid var(--border); }
 nav.wizard .tab-count { display: inline-block; min-width: 1.2rem; padding: 0 0.35rem; border-radius: 999px; background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-fg); font-size: 0.72rem; font-weight: 700; line-height: 1.3; text-align: center; }
 nav.wizard .tab-count[hidden] { display: none; }
 .goal-line { margin: 0.2rem 0 0.8rem; }
@@ -1027,17 +1026,80 @@ table.profile-table td.error-text { white-space: normal; }
 .status-differs { background: var(--err-bg); color: var(--err-fg); border-color: var(--err-fg); }
 .status-none { background: var(--chip-same-bg); color: var(--chip-same-fg); border-color: var(--border); font-weight: normal; }
 
-/* Step 3: the plain list of what saving changes. */
+/* Tune: the plain list of what saving changes. */
 ul.apply-diff { margin: 0.4rem 0 0.8rem; padding-left: 1.2rem; }
 ul.apply-diff li { margin: 0.2rem 0; overflow-wrap: anywhere; }
 #ap-result { margin: 0.6rem 0; }
 #ap-result[hidden] { display: none; }
 
-/* Advanced: one collapsible section each. */
+/* Details: one collapsible section each. */
 details.adv { padding: 0.6rem 1.2rem; }
 details.adv > summary { font-weight: 600; font-size: 1.1rem; cursor: pointer; }
 details.adv[open] > summary { margin-bottom: 0.5rem; }
 details.adv > .card { margin-left: 0; margin-right: 0; }
+
+/* Compare: one table, models as rows, on the same images. Phones get one card per model. */
+.lineup h2 { margin-top: 0; }
+.lineup-tools { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: flex-end; margin: 0.4rem 0 0.7rem; }
+.lineup-tools label { display: flex; flex-direction: column; align-items: stretch; text-align: left; gap: 0.15rem; min-width: 0; max-width: 100%; margin: 0; }
+.lineup-tools select { width: 100%; max-width: 100%; margin: 0; }
+.lineup-tools label:first-child { flex: 1 1 22rem; }
+.lineup-label { font-size: 0.8rem; color: var(--muted); }
+.lineup-set-line { margin: 0.3rem 0; overflow-wrap: anywhere; }
+.lineup-headline { font-size: 1.1rem; font-weight: 600; margin: 0.6rem 0 0.8rem; padding: 0.5rem 0.75rem; border-left: 4px solid var(--accent); background: var(--bg); overflow-wrap: anywhere; }
+.lineup-headline.lineup-too_few, .lineup-headline.lineup-alone, .lineup-headline.lineup-level { border-left-color: var(--muted); font-weight: 500; }
+table.lineup-table { width: 100%; }
+table.lineup-table thead th { vertical-align: bottom; }
+table.lineup-table th.lineup-group { text-align: center; border-left: 1px solid var(--border); }
+table.lineup-table th.lineup-group.num { text-align: right; }
+table.lineup-table th.lineup-model { text-align: left; }
+table.lineup-table td.lineup-model { min-width: 12rem; white-space: normal; }
+table.lineup-table .lineup-name { font-weight: 600; }
+table.lineup-table .tag { margin-left: 0.35rem; }
+.lineup-sub { display: block; font-size: 0.78rem; font-weight: normal; color: var(--muted); }
+.lineup-count { display: block; font-size: 0.75rem; color: var(--muted); }
+td.lineup-best { font-weight: 700; background: var(--ok-bg); color: var(--ok-fg); }
+td.lineup-best .lineup-count { color: inherit; }
+.lineup-star { font-size: 0.72rem; font-weight: 600; }
+td.lineup-none { color: var(--muted); }
+tr.lineup-out td { background: var(--bg); }
+th.lineup-flag, td.lineup-flag { border-left: 2px dashed var(--warn-fg); }
+.lineup-missing h3 { margin: 1rem 0 0.3rem; font-size: 1rem; }
+ul.lineup-missing-list { margin: 0; padding-left: 1.1rem; }
+ul.lineup-missing-list li { margin: 0.3rem 0; overflow-wrap: anywhere; }
+ul.lineup-missing-list button { margin-left: 0.3rem; }
+@media (min-width: 701px) {
+  /* The model stays in view while the columns scroll sideways. */
+  table.lineup-table th.lineup-model, table.lineup-table td.lineup-model { position: sticky; left: 0; background: var(--card, var(--bg)); z-index: 1; border-right: 1px solid var(--border); }
+}
+@media (min-width: 701px) and (max-width: 1000px) {
+  /* A tablet fits the whole table: narrow model column, the best mark under its value. */
+  table.lineup-table td.lineup-model { min-width: 8rem; }
+  table.lineup-table th, table.lineup-table td { padding-left: 0.35rem; padding-right: 0.35rem; }
+  .lineup-star { display: block; }
+  table.lineup-table .tag { margin-left: 0; }
+  table.lineup-table th .lineup-sub { white-space: normal; }
+}
+@media (max-width: 700px) {
+  table.bench.lineup-table td.lineup-model { padding-top: 0.5rem; padding-bottom: 0.4rem; }
+  table.bench.lineup-table td.num { display: flex; justify-content: space-between; gap: 0.75rem; align-items: baseline; }
+  table.bench.lineup-table td.num[data-label]::before { flex: 1; }
+  .lineup-count { display: inline; }
+  .lineup-tools label { width: 100%; }
+}
+
+/* Run: the datasets as a short list; the licences sit behind "About datasets". */
+.ds-list { display: flex; flex-direction: column; }
+.ds-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.1rem 0.75rem; padding: 0.3rem 0; border-bottom: 1px solid var(--border); }
+.ds-row label.check { flex: 1 1 16rem; min-width: 0; margin: 0; }
+.ds-row .ds-main { display: block; min-width: 0; overflow-wrap: anywhere; }
+.ds-row .ds-tests { display: block; font-size: 0.82rem; }
+.ds-row .ds-side { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.5rem; }
+.ds-size { font-size: 0.82rem; white-space: nowrap; }
+dl.ds-licences { margin: 0.4rem 0 0; font-size: 0.85rem; }
+dl.ds-licences dt { font-weight: 600; margin-top: 0.3rem; }
+dl.ds-licences dd { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+.bench-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 0.5rem 1rem; margin-top: 0.4rem; }
 
 /* Config page: the per-device confidences of a model, a compact list inside its table cell
    (config.html: details.thr-profiles > ul.thr-profile-list; .profiles is the generic form). */
@@ -1062,7 +1124,6 @@ ul.thr-profile-list code, .profiles code { font-size: 0.8rem; }
   main { padding: 1rem; }
   nav.wizard { padding: 0; }
   nav.wizard a[role="tab"] { padding: 0.5rem 0.55rem; }
-  nav.wizard a.tab-advanced { margin-left: 0; }
   details.adv { padding: 0.5rem 0.7rem; }
   .profile-card { padding: 0.8rem; }
 }

@@ -81,8 +81,12 @@ struct DatasetRow {
     /// Value posted as `dataset` (`coco-cctv`, `sample`, `dir:/path`).
     value: String,
     title: String,
-    /// "120 images · 45 MB · CC BY 4.0".
-    detail: String,
+    /// What it tests, in a few words (a folder: its path).
+    tests: String,
+    /// "120 images · 45 MB".
+    size: String,
+    /// Licence text, shown behind a disclosure; empty for none.
+    license: String,
     /// `installed`, `partial`, `available`, `embedded`, `folder`, `missing`, `unavailable`.
     state: &'static str,
     state_text: String,
@@ -239,6 +243,28 @@ fn device_rows(snap: &DevicesSnapshot, c: &Config) -> Vec<DeviceOptionRow> {
 }
 
 /// Download state of a built-in set from the manager (busy) or the disk.
+/// What a built-in set tests, in a few words.
+fn tests_of(m: &images::Manifest) -> String {
+    let known = match m.id.as_str() {
+        "coco-cctv" => "Street scenes by day: people, vehicles, animals",
+        "bmd45-cctv" => "Real daytime CCTV traffic: vehicles only",
+        "exdark-night" => "Low light and twilight: people, vehicles, animals",
+        "exdark-ir" => "A grayscale stand-in for night IR",
+        "nir-night" => "Real night IR camera traps: mostly false alerts",
+        _ => "",
+    };
+    if !known.is_empty() {
+        return known.to_string();
+    }
+    // A set added later: the first sentence of its description.
+    let first = m.description.split(". ").next().unwrap_or_default();
+    if m.has_ground_truth() {
+        first.to_string()
+    } else {
+        format!("{first}; no labels")
+    }
+}
+
 fn dataset_rows(state: &AppState, c: &Config) -> Vec<DatasetRow> {
     let selected: Vec<String> = c.benchmark.datasets.iter().map(|d| d.label()).collect();
     let is_sel = |id: &str| selected.iter().any(|s| s.eq_ignore_ascii_case(id));
@@ -266,17 +292,13 @@ fn dataset_rows(state: &AppState, c: &Config) -> Vec<DatasetRow> {
         out.push(DatasetRow {
             value: m.id.clone(),
             title: m.title.clone(),
-            detail: format!(
-                "{} images \u{b7} {} \u{b7} {} \u{b7} {}",
+            tests: tests_of(m),
+            size: format!(
+                "{} images \u{b7} {}",
                 m.images.len(),
-                crate::resources::catalog::format_size(m.size()),
-                if m.has_ground_truth() {
-                    "ground truth"
-                } else {
-                    "no ground truth"
-                },
-                m.license
+                crate::resources::catalog::format_size(m.size())
             ),
+            license: m.license.clone(),
             state: st,
             state_text: text,
             checked: is_sel(&m.id),
@@ -290,7 +312,9 @@ fn dataset_rows(state: &AppState, c: &Config) -> Vec<DatasetRow> {
             out.push(DatasetRow {
                 value: id.to_string(),
                 title: id.to_string(),
-                detail: "curated set; not included in this build yet".into(),
+                tests: "curated set; not included in this build yet".into(),
+                size: String::new(),
+                license: String::new(),
                 state: "unavailable",
                 state_text: "not in this build".into(),
                 checked: is_sel(id),
@@ -303,7 +327,9 @@ fn dataset_rows(state: &AppState, c: &Config) -> Vec<DatasetRow> {
     out.push(DatasetRow {
         value: images::SAMPLE_ID.into(),
         title: "Embedded sample".into(),
-        detail: "1 image (dog, bicycle, car) \u{b7} works offline \u{b7} no ground truth".into(),
+        tests: "Checks that a model runs, offline; no labels".into(),
+        size: "1 image".into(),
+        license: String::new(),
         state: "embedded",
         state_text: "always available".into(),
         checked: is_sel(images::SAMPLE_ID),
@@ -318,7 +344,9 @@ fn dataset_rows(state: &AppState, c: &Config) -> Vec<DatasetRow> {
             out.push(DatasetRow {
                 value: d.label(),
                 title: d.label(),
-                detail: abs.display().to_string(),
+                tests: abs.display().to_string(),
+                size: String::new(),
+                license: String::new(),
                 state: if ok { "folder" } else { "missing" },
                 state_text: if ok {
                     "folder on the server".into()
@@ -508,6 +536,8 @@ struct SavedView {
     ranking: serde_json::Value,
     points: serde_json::Value,
     latest_run_id: Option<String>,
+    /// `lineup`: the models side by side per image set ([`crate::benchmark::lineup`]).
+    lineup: serde_json::Value,
     /// The measured part of `profiles` ([`profiles::facts`]).
     facts: Vec<profiles::ModelFacts>,
     /// The hardware the results were measured on (`otherHardware`).
@@ -562,6 +592,7 @@ fn saved_view(
             let facts = profiles::facts(&r);
             // No history file yet: seeded in memory (written by the next run, pin or delete).
             let history = History::load_or_seed(&hist, Some(&r));
+            let lineup = lineup_of(&r, stored.as_deref(), &history, now, &state.config_read());
             let mut results = serde_json::to_value(r.summary()).unwrap_or_default();
             view::annotate(&mut results, &r, &history);
             SavedView {
@@ -569,15 +600,64 @@ fn saved_view(
                 ranking,
                 points,
                 latest_run_id: view::latest_run_id(&r),
+                lineup,
                 facts,
                 hardware: Some(r.hardware.clone()),
             }
         }
-        None => SavedView::default(),
+        None => SavedView {
+            lineup: serde_json::to_value(crate::benchmark::lineup::Lineup::default())
+                .unwrap_or_default(),
+            ..SavedView::default()
+        },
     };
     let view = Arc::new(view);
     *cache = Some((key, view.clone()));
     view
+}
+
+/// The `lineup` of the saved results: the frames each trained model trained on, what can run and
+/// which dataset folders can be read now are read here, the rest is pure.
+fn lineup_of(
+    results: &BenchmarkResults,
+    preds: Option<&crate::benchmark::search::StoredPreds>,
+    history: &crate::benchmark::history::History,
+    now: &HashMap<String, crate::benchmark::current::ModelNow>,
+    cfg: &Config,
+) -> serde_json::Value {
+    use crate::benchmark::lineup::{Configured, Inputs, build};
+    let key = crate::registry::normalize_name;
+    let trained = cfg
+        .models
+        .iter()
+        .filter_map(|m| {
+            let name = m.effective_name();
+            results.find(&name)?;
+            let frames =
+                crate::training::autolabel::trained_frames(cfg, m, &mut Vec::new()).ok()?;
+            (!frames.is_empty()).then(|| (key(&name), frames))
+        })
+        .collect();
+    let configured: Vec<Configured> = cfg
+        .models
+        .iter()
+        .map(|m| Configured {
+            name: m.effective_name(),
+            blocked: (!cfg.data_path(&m.path).is_file())
+                .then(|| "its model file is missing".to_string()),
+        })
+        .collect();
+    let lineup = build(&Inputs {
+        results,
+        preds,
+        history,
+        now,
+        default_model: crate::training::switch::current_default(cfg).as_deref(),
+        configured: &configured,
+        trained: &trained,
+        reachable: &|s| s.dir.as_deref().is_some_and(std::path::Path::is_dir),
+    });
+    serde_json::to_value(lineup).unwrap_or_default()
 }
 
 /// `GET /v1/benchmark`: the current/last run (state, progress, partial results), the saved
@@ -586,7 +666,8 @@ fn saved_view(
 /// threshold in the config, the counts there, exact from the stored predictions) and each
 /// model's `configured` is the device the config resolves to now. `profiles` lists per model and
 /// device the measured best threshold and the saved confidence profile ([`profiles::profiles`]),
-/// `otherHardware` whether the results were measured on other GPUs, `goal` the benchmark goal.
+/// `otherHardware` whether the results were measured on other GPUs, `goal` the benchmark goal,
+/// `lineup` the models side by side per image set ([`crate::benchmark::lineup`]).
 pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     super::blocking(move || {
         let snap = devices_snapshot(&state);
@@ -621,6 +702,7 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_jso
             "ranking": saved.ranking,
             "points": saved.points,
             "latest_run_id": saved.latest_run_id,
+            "lineup": saved.lineup,
             "noise": crate::benchmark::history::view::noise_json(),
             "resultsFile": path.display().to_string(),
             "config": config,
@@ -909,8 +991,14 @@ mod tests {
         );
         let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
         assert!(js.contains("fetch(\"/v1/benchmark\""));
-        // The steps: Run, Profiles, Apply, Advanced.
-        for id in ["tab-run", "tab-profiles", "tab-apply", "tab-advanced"] {
+        // The tabs.
+        for id in [
+            "tab-compare",
+            "tab-run",
+            "tab-tune",
+            "tab-history",
+            "tab-details",
+        ] {
             assert!(html.contains(&format!("id=\"{id}\"")), "{id}: {html}");
             assert!(html.contains(&format!("href=\"#{id}\"")), "{id}: {html}");
         }
@@ -1159,6 +1247,8 @@ mod tests {
         // No results: no profiles; the goal is the config's.
         let (_, v) = call(&st, get("/v1/benchmark")).await;
         assert_eq!(v["profiles"], serde_json::json!([]));
+        assert_eq!(v["lineup"]["sets"], serde_json::json!([]));
+        assert_eq!(v["lineup"]["defaultSet"], serde_json::Value::Null);
         assert_eq!(v["otherHardware"], false);
         assert_eq!(v["goal"]["label"], "Balanced");
         assert_eq!(v["goal"]["objective"], "f1");

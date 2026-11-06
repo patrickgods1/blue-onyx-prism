@@ -88,7 +88,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
 ## Architecture (see the plan in the repo history / README for detail)
 
 - Large modules are directories split by concern (`src/benchmark/{run,scoring,sweep}.rs`, `benchmark/cli/`,
-  `benchmark/report/`, `server/benchmark/`, `resources/{export,manager,catalog,extract}/`, `registry/`,
+  `benchmark/report/`, `benchmark/lineup/`, `server/benchmark/`, `resources/{export,manager,catalog,extract}/`, `registry/`,
   `backend/onnx_rewrite/`, `backend/memory.rs`); each file starts with a `//!` doc stating its responsibility.
 - `src/server.rs` axum HTTP (2-thread tokio runtime; fs-heavy handlers run in `server::blocking`). The
   listener is bound once per process (`bind` + `serve_on`) and serves `Shared`, the swappable current
@@ -299,8 +299,9 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   Confidence profiles: `ModelConfig.device_thresholds` (canonical spec -> threshold) win over `confidence_threshold`
   for the device the model actually loaded on (`LiveSettings::threshold_for(eng.device)`, so `auto`/fallback follow);
   `POST /v1/benchmark/apply-profiles` / `--apply-threshold` save `ThresholdAdvice.by_device`; `GET /v1/benchmark`
-  `profiles` (`server/benchmark/profiles.rs`). The page is Run -> Profiles -> Apply + Advanced (`assets/bench-profiles.js`);
+  `profiles` (`server/benchmark/profiles.rs`). The page's tabs are Compare (`assets/bench-lineup.js`), Run, Tune (`assets/bench-profiles.js`), History, Details;
   the Config page's device dropdown swaps the threshold field to that device's profile / benchmark best.
+- `src/benchmark/lineup/` (`sets`, `score`, `comparable`, `verdict`): `lineup` in `GET /v1/benchmark` puts models side by side on exactly the same images, rescored from `benchmark-preds.json` on the classes they share; `comparable_models` is the model-vs-model rule (hardware and runtime flag only speed), a set with training frames leaves that row out of "best", a sentence needs `MIN_OBJECTS_TO_CALL`; `?set=<id>` opens a set.
 - `src/resources/` on-demand resources: `catalog` (pins), `resolve` (pure needs from config + hardware +
   installed), `manager` (one download thread, Range resume, SHA-256, staging + atomic rename, `.installed.json`,
   `.downloads.lock`, backoff), `extract` (whitelist-only, nothing executed), `provision` (startup: models wait

@@ -1,19 +1,18 @@
 // Blue Onyx Prism: Benchmark page (served from /static/; no inline scripts under the CSP).
-// The wizard (1 Run, 2 Profiles, 3 Apply, Advanced): the run loop and polling, the goal chooser
-// (the only place that sets the goal), the Advanced sections (Confidence, Details; Compare and
-// History are in bench-compare.js) and the page wiring. The profile cards and the Apply step are
-// in bench-profiles.js, the vocabulary in bench-glossary.js, the charts in bench-charts.js, all
-// shared through window.PrismBench (loaded before this file).
+// The tabs (Compare, Run, Tune, History, Details): the run loop and polling, the goal chooser
+// (the only place that sets the goal), the Details sections (Confidence, Per model; All results
+// and History are in bench-compare.js) and the page wiring. Compare's table is in bench-lineup.js,
+// Tune's profile cards and its Save in bench-profiles.js, the vocabulary in bench-glossary.js, the
+// charts in bench-charts.js, all shared through window.PrismBench (loaded before this file).
 (function () {
   var PB = window.PrismBench, C = PB.charts, F = PB.fmt, has = PB.has;
   var $ = function (id) { return document.getElementById(id); };
   var form = $("bench-form"), msg = $("msg"), bar = $("bar"), ptext = $("ptext");
   var polling = null, lastState = null, lastConfig = null, lastModels = [], lastStatus = null;
-  // Old links: the Overview (and the older Results) is step 2 Profiles now; Compare, Confidence
-  // and Details (and the older Models) are sections of Advanced. Rewritten before the tabs read
-  // the URL (and on later hash changes, before their listener runs); a link into a section of
-  // Advanced opens that section.
-  var ALIAS = {"#tab-overview": "#tab-profiles", "#tab-results": "#tab-profiles", "#tab-compare": "#adv-compare", "#tab-confidence": "#adv-confidence", "#tab-details": "#adv-details", "#tab-models": "#adv-details", "#tab-history": "#adv-history"};
+  // Old links: Overview, Results, Profiles and Apply are Tune now, Advanced is Details, and its
+  // sections moved with it (History has its own tab). Rewritten before the tabs read the URL (and
+  // on later hash changes, before their listener runs); a link into a section opens that section.
+  var ALIAS = {"#tab-overview": "#tab-tune", "#tab-results": "#tab-tune", "#tab-profiles": "#tab-tune", "#tab-apply": "#tune-apply", "#tab-advanced": "#tab-details", "#tab-confidence": "#adv-confidence", "#tab-models": "#adv-details"};
   function openTo(id) { for (var t = id ? document.getElementById(id) : null; t; t = t.parentElement) if (t.tagName === "DETAILS") t.open = true; }
   function alias() {
     var h = ALIAS[location.hash];
@@ -129,7 +128,7 @@
     return {reference: "reference", agrees: "agrees", minor: "minor (" + a.matched + "/" + total + ")", disagrees: "DISAGREES (" + a.matched + "/" + total + ")"}[a.verdict] || a.verdict;
   }
 
-  // ---- apply from Advanced, with before -> after and Undo --------------------------------------
+  // ---- apply from Details, with before -> after and Undo --------------------------------------
   // Details "Use <device>" sets a model's device (its confidence then follows the device through
   // the saved profiles); the confidence actions write the profile of one model on one device.
   // Each answer is shown in the status box with one Undo.
@@ -542,7 +541,7 @@
   // The accuracy weight (0..1) of the config's benchmark settings.
   function weightOf(b) { var w = (b && b.weights) || {}; return (w.accuracy || 0) + (w.speed || 0) > 0 ? w.accuracy / (w.accuracy + w.speed) : 0.6; }
 
-  // ---- Overview: run summary banner --------------------------------------------------------------
+  // ---- History: run summary banner ---------------------------------------------------------------
   function renderBanner(j, models) {
     var box = $("run-banner"); box.replaceChildren();
     var p = j.run && j.run.progress;
@@ -577,7 +576,7 @@
     box.appendChild(b);
   }
 
-  // ---- step 2: the goal (the only place that sets it) --------------------------------------
+  // ---- Tune: the goal (the only place that sets it) ----------------------------------------
   var PRESETS = [
     {id: "balanced", name: "Balanced", text: "Finding objects and avoiding false alerts count the same; speed counts 40% (the default).", obj: "f1", w: 0.6},
     {id: "miss", name: "Miss fewer objects", text: "Catching every person or car matters most; some extra false alerts are fine.", obj: "f2", w: 0.7},
@@ -636,14 +635,14 @@
     saveSettings({}, function () { presetUi.custom = presetOf(lastStatus && lastStatus.config && lastStatus.config.benchmark) === "custom"; });
   });
 
-  // ---- Advanced: the shared device selection (Confidence) ------------------------------------
-  // "chosen" = the device picked for each model under Run on (step 2, PrismBench.choice), "rec"
+  // ---- Details: the shared device selection (Confidence) -------------------------------------
+  // "chosen" = the device picked for each model under Run on (Tune, PrismBench.choice), "rec"
   // = the recommended device of each model, "all" = every device, else a device spec.
   // Remembered per browser.
   var selDevice = PB.store.get("view", "chosen") || "chosen";
   function selName() { return selDevice === "chosen" ? "the chosen device of each model" : selDevice === "rec" ? "the recommended device of each model" : selDevice === "all" ? "every device" : selDevice; }
   function ranOn(m, device) { return (m.devices || []).some(function (d) { return d.device === device && d.run && !d.run.fell_back; }); }
-  // The device chosen in step 2; without a choice (or when the model did not run there): the
+  // The device chosen in Tune; without a choice (or when the model did not run there): the
   // device it uses now when it ran there, else its recommended device, else the first one.
   function chosenDevice(j, m) {
     var p = ((j && j.profiles) || []).find(function (x) { return x.model.toLowerCase() === m.model.toLowerCase(); });
@@ -663,7 +662,7 @@
   function deviceSelector(models, scope, text) {
     var l = el("label", "inline-label device-select"), s = el("select");
     l.appendChild(document.createTextNode((text || "Show") + " "));
-    var opts = [["chosen", "Chosen device of each model (step 2)"], ["rec", "Recommended device of each model"], ["all", "All devices"]].concat(devicesOf(models).map(function (d) { return [d, d + " (" + (PB.RUNTIME_NAMES[PB.runtimeOf(d)] || "") + ")"]; }));
+    var opts = [["chosen", "Chosen device of each model (Tune)"], ["rec", "Recommended device of each model"], ["all", "All devices"]].concat(devicesOf(models).map(function (d) { return [d, d + " (" + (PB.RUNTIME_NAMES[PB.runtimeOf(d)] || "") + ")"]; }));
     if (!opts.some(function (o) { return o[0] === selDevice; })) opts.push([selDevice, selDevice + " (no results)"]);
     opts.forEach(function (o) { var x = el("option", null, o[1]); x.value = o[0]; if (o[0] === selDevice) x.selected = true; s.appendChild(x); });
     s.name = "device-select-" + scope;
@@ -725,7 +724,7 @@
     return out;
   }
   function selectedRow(r) { return selDevice === "all" ? true : selDevice === "chosen" ? r.chosen : selDevice === "rec" ? r.rec : r.device === selDevice; }
-  // The tags of a device cell: recommended, now, fell back (the same words as step 2).
+  // The tags of a device cell: recommended, now, fell back (the same words as Tune).
   function deviceCell(r) {
     var s = el("span", "nowrap"); s.appendChild(document.createTextNode(r.device));
     if (r.rec) { var t0 = el("span", "tag rec", "Recommended"); t0.title = "The best device for this model and your goal"; s.appendChild(t0); }
@@ -739,7 +738,7 @@
   function thrShort(v) { return has(v) ? PB.conf(v) : "-"; }
   function savedTag() { return el("span", "tag now", "saved"); }
 
-  // ---- Advanced: Confidence ------------------------------------------------------------------
+  // ---- Details: Confidence -------------------------------------------------------------------
   var conf = {obj: null, cache: {}, pending: {}};
   function savedObjective(j) { return String((j && j.config && j.config.benchmark && j.config.benchmark.threshold_objective) || "f1"); }
   // The threshold search for `obj` on `device` ("" = each model's recommended device).
@@ -792,7 +791,7 @@
     var box = $("conf-best"); box.replaceChildren();
     var saved = savedObjective(j), obj = conf.obj || saved;
     var all = devRows(j, models).filter(function (r) { return r.m.threshold && !r.fellBack; }), rows = all.filter(selectedRow);
-    if (!all.length) { box.appendChild(el("p", "empty", models.length ? "No confidence results: the benchmark needs datasets with labels (or a reference model) to find the best confidence." : "No results yet: run a benchmark in 1 Run; this section then shows the best confidence for each model and device.")); return; }
+    if (!all.length) { box.appendChild(el("p", "empty", models.length ? "No confidence results: the benchmark needs datasets with labels (or a reference model) to find the best confidence." : "No results yet: start a benchmark under Run; this section then shows the best confidence for each model and device.")); return; }
     // Searches for an objective the stored advice was not found for (per device when chosen).
     if (rows.some(function (r) { return String(r.m.threshold.objective) !== obj; })) {
       rows.forEach(function (r) { confSearch(obj, r.device); });
@@ -846,7 +845,7 @@
     }));
   }
 
-  // ---- Details tab (one collapsible card per model) ---------------------------------------------
+  // ---- Details, Per model (one collapsible card per model) --------------------------------------
   function breakdown(key, title, rows) {
     var d = el("div"); if (!rows || !rows.length) return d;
     d.appendChild(el("h4", null, title));
@@ -882,7 +881,7 @@
     }
     return box;
   }
-  // One collapsible card per model (id "d-<model>"; "m-<model>" is its step-2 profile card),
+  // One collapsible card per model (id "d-<model>"; "m-<model>" is its profile card in Tune),
   // patched in place: only cards whose data changed are rebuilt (keeping their scroll offsets,
   // open <details> and sort order). The first card (or the one the URL names) starts open; a
   // rebuilt card keeps its open state.
@@ -955,7 +954,7 @@
         if (r.agreement && r.agreement.verdict === "disagrees") { tr.classList.add("bad"); ag.title = "detections differ from " + r.agreement.reference + "; never recommended"; }
         var tc = cell(tr, "", undefined, "Trust"); tc.appendChild(PB.trustBadge(d.trust, "dev"));
         var act = el("td", "actions-cell");
-        if (!(c.device && c.device === d.device)) { var u = el("button", "small", "Use " + d.device); u.type = "button"; u.title = "Run " + m.model + " on " + d.device + "; its confidence follows the device through the saved profiles (save them in 3 Apply)"; u.addEventListener("click", function () { u.disabled = true; useDevice(m.model, d.device); }); act.appendChild(u); }
+        if (!(c.device && c.device === d.device)) { var u = el("button", "small", "Use " + d.device); u.type = "button"; u.title = "Run " + m.model + " on " + d.device + "; its confidence follows the device through the saved profiles (save them in Tune)"; u.addEventListener("click", function () { u.disabled = true; useDevice(m.model, d.device); }); act.appendChild(u); }
         if (r.images) { var i = el("button", "small", "Images"); i.type = "button"; i.addEventListener("click", function () { drill(m.model, d.device); }); act.appendChild(i); }
         tr.appendChild(act);
       }
@@ -1031,7 +1030,7 @@
   }
   if (form) { form.addEventListener("input", estimate); form.addEventListener("change", estimate); }
 
-  // ---- Save report (Advanced) -------------------------------------------------------------------
+  // ---- Save report (Details) --------------------------------------------------------------------
   // Writes the HTML report of the saved results into the chosen folder; the last folder used is
   // remembered in this browser (PB.store wraps localStorage in try/catch).
   (function () {
@@ -1050,6 +1049,22 @@
     });
   })();
 
+  // ---- Compare: one model on one set of images ------------------------------------------------
+  // "Run on these images": the run form's settings, narrowed to this model, its device and the
+  // set's datasets. A model keeps one result, so a run replaces what it scored before: say so.
+  PB.runOn = function (m, s, button) {
+    var old = modelOf(lastModels, m.model), was = old && (old.datasets || []).length ? old.datasets.join(", ") : "";
+    if (was && !confirm("Benchmark " + m.model + " on these " + s.images + " " + s.unit + "? A model keeps one result, so this replaces its scores on " + was + ".")) return;
+    var b = formBody();
+    ["model", "device", "dataset", "max_images"].forEach(function (k) { b.delete(k); });
+    b.append("model", m.model);
+    if (m.device) b.append("device", m.device);
+    s.run.datasets.forEach(function (d) { b.append("dataset", d); });
+    b.append("max_images", String(s.run.maxImages));
+    button.disabled = true; msg.textContent = "starting…";
+    post("/v1/benchmark", b).then(function (j) { msg.textContent = j.message; if (j.success) poll(); else button.disabled = false; });
+  };
+
   // ---- render loop ------------------------------------------------------------------------------
   // Each section re-renders only when its data changed, keeping the user's scroll offsets,
   // open <details>, sort order and focus (PrismLive.keep / patch); progress updates in place.
@@ -1059,19 +1074,19 @@
     msg.replaceChildren(document.createTextNode((j.run.message || j.run.error || "Benchmark finished.") + " "));
     if (j.run.error) return;
     var b = el("button", "small", "See results"); b.type = "button";
-    b.addEventListener("click", function () { if (T) T.show("tab-profiles"); if (history.replaceState) history.replaceState(null, "", "#tab-profiles"); var o = $("tab-profiles"); if (o) o.scrollIntoView(); });
+    b.addEventListener("click", function () { if (T) T.show("tab-compare"); if (history.replaceState) history.replaceState(null, "", "#tab-compare"); var o = $("tab-compare"); if (o) o.scrollIntoView(); });
     msg.appendChild(b);
   }
-  // Compare and History (bench-compare.js) load the run history once either is visible.
+  // History and All results (bench-compare.js) load the run history once either is visible.
   function compareShown() {
-    if (!T || !PB.compare || T.current() !== T.indexOf("tab-advanced")) return;
-    var c = $("adv-compare"), h = $("adv-history");
-    if ((c && c.open) || (h && h.open)) PB.compare.shown();
+    if (!T || !PB.compare) return;
+    var c = $("adv-compare");
+    if (T.current() === T.indexOf("tab-history") || (T.current() === T.indexOf("tab-details") && c && c.open)) PB.compare.shown();
   }
   var nav = document.querySelector("nav.tabs");
   if (nav) nav.addEventListener("click", function () { setTimeout(compareShown, 0); });
   window.addEventListener("hashchange", function () { setTimeout(compareShown, 0); });
-  ["adv-compare", "adv-history"].forEach(function (id) { var d = $(id); if (d) d.addEventListener("toggle", compareShown); });
+  var ac = $("adv-compare"); if (ac) ac.addEventListener("toggle", compareShown);
   function render(j) {
     PB.setNoise(j.noise);
     var models = merged(j), sm = JSON.stringify(models), sc = JSON.stringify(j.config), sr = JSON.stringify(j.ranking || []);
@@ -1080,14 +1095,15 @@
     $("no-results").hidden = hasResults || j.running;
     var gl = $("goal-label"); if (gl && j.goal && j.goal.label) gl.textContent = j.goal.label;
     if (PB.profiles) PB.profiles.render(j);
+    if (PB.lineup) PB.lineup.render(j);
     if (firstRender) {
       firstRender = false;
       // A link to a tab or into one (#m-<model> = a profile card, #d-<model> = a Details card)
-      // opens it; without one the page opens on Profiles when there are results, else on Run.
+      // opens it; without one the page opens on Compare when there are results, else on Run.
       var target = location.hash.slice(1);
       if (target) renderModels(models, j.config, j.ranking);
       if (T && target && T.show(target)) { openTo(target); var te = $(target); if (te && te.getAttribute("role") !== "tabpanel") te.scrollIntoView(); }
-      else if (T && hasResults) T.show("tab-profiles");
+      else if (T) T.show(hasResults ? "tab-compare" : "tab-run");
     }
     var running = j.running;
     L.keep($("run-banner"), JSON.stringify([models.map(function (m) { return [m.model, m.this_run, m.changes, m.timestamp, m.error, m.recommendation]; }), running, j.run && j.run.progress && [j.run.progress.modelIndex, j.run.progress.modelCount], (j.run && j.run.models || []).length, j.latest_run_id, sr]), function () { renderBanner(j, models); });
