@@ -2086,6 +2086,9 @@ mod missing {
         let classes = cfg.collect.classes.clone();
         let mut f = f;
         f.status = Status::Reviewed;
+        f.boxes
+            .iter_mut()
+            .for_each(|b| b.state = BoxState::Accepted);
         let saved = labels::normalize(f, &classes, 64, 48, "2026-11-04T00:00:00.000Z").unwrap();
         assert_eq!(saved.training().count(), 2);
         assert_eq!(saved.disagreement, None);

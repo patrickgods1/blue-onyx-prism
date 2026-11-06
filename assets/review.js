@@ -269,6 +269,10 @@
       (b.triage === 'review' || (!!b.auto_label && b.auto_label !== b.label));
   }
 
+  // A flagged box a save would make a label: it needs a decision first. Twin of
+  // `labels::needs_decision`, which refuses the save.
+  function mustDecide(b) { return isReview(b) && resolved(b) === 'accepted'; }
+
   // What a box shows as: the state, with pending split by review / what saving will make of it.
   function look(b) {
     if (b.state === 'pending') return isReview(b) ? 'review' : (isHint(b) ? 'hint' : 'pending');
@@ -978,6 +982,7 @@
   function stateChip(b) {
     if (b.state === 'pending') {
       var r = resolved(b);
+      if (mustDecide(b)) return el('span', 'rv-chip warn', 'needs a decision');
       return el('span', 'rv-chip ' + (r === 'rejected' ? 'bad' : 'pend'), 'pending → ' + r + ' on save');
     }
     if (b.state === 'added') return el('span', 'rv-chip drawn', 'drawn');
@@ -1047,6 +1052,7 @@
   function shortState(b) {
     if (b.state === 'pending') {
       var r = resolved(b);
+      if (mustDecide(b)) return el('span', 'rv-chip warn', 'decide');
       return el('span', 'rv-chip ' + (r === 'rejected' ? 'bad' : 'pend'), '→ ' + (r === 'rejected' ? 'reject' : 'accept'));
     }
     if (b.state === 'added') return el('span', 'rv-chip drawn', 'drawn');
@@ -1536,7 +1542,7 @@
   function lookedAt(b) {
     return b.source !== 'human' && (b.state === 'accepted' || b.state === 'rejected') &&
       b.reject_reason !== 'duplicate' &&
-      ['low_score', 'other_class', 'repeat_spot'].indexOf(b.reason) < 0;
+      ['low_score', 'other_class', 'repeat_spot', 'rest_rejected'].indexOf(b.reason) < 0;
   }
 
   // After a reviewed save: the frame's decisions replace its earlier ones in the history.
@@ -1695,11 +1701,13 @@
     if (!cur) return;
     var drop = pendingDupDrops(dupGroups());
     var todo = boxes().filter(function (b, i) {
-      return drop.indexOf(i) < 0 && b.state === 'pending' && b.source !== 'human' && !isUnwanted(b) && resolved(b) === 'accepted';
+      return drop.indexOf(i) < 0 && b.state === 'pending' && b.source !== 'human' && !isUnwanted(b) && !isReview(b) && resolved(b) === 'accepted';
     });
+    var flagged = boxes().filter(function (b, i) { return drop.indexOf(i) < 0 && mustDecide(b); }).length;
+    var left = flagged ? ' ' + flagged + ' flagged box(es) (marked ?) still need a decision.' : '';
     var hints = boxes().filter(function (b, i) { return drop.indexOf(i) < 0 && isHint(b) && !isUnwanted(b); }).length;
     if (!todo.length && !drop.length) {
-      say(hints ? hints + ' hint box(es) stay pending (rejected on save unless you accept them); no other proposal.' : 'No pending proposal.');
+      say((hints ? hints + ' hint box(es) stay pending (rejected on save unless you accept them); no other proposal.' : (flagged ? 'No proposal to accept.' : 'No pending proposal.')) + left);
       return;
     }
     snapshot();
@@ -1708,7 +1716,19 @@
     cur.labels.empty_confirmed = false;
     say('Accepted ' + todo.length + ' box(es)' +
       (drop.length ? '; rejected ' + drop.length + ' stacked duplicate(s) (z undoes)' : '') +
-      (hints ? '; ' + hints + ' hint box(es) stay pending (rejected on save unless you accept them).' : '.'));
+      (hints ? '; ' + hints + ' hint box(es) stay pending (rejected on save unless you accept them).' : '.') + left);
+    refresh();
+  }
+
+  // Shift+R: reject every box still undecided, for "the real ones are done, the rest are wrong".
+  // A decision on the frame, not on each box, so the repeats history leaves these out (z undoes).
+  function rejectRest() {
+    if (!cur) return;
+    var todo = boxes().filter(function (b) { return b.state === 'pending' && b.source !== 'human' && !isUnwanted(b); });
+    if (!todo.length) { say('No undecided box.'); return; }
+    snapshot();
+    todo.forEach(function (b) { markRejected(b); b.reason = 'rest_rejected'; });
+    say('Rejected ' + todo.length + ' undecided box(es) (z undoes).');
     refresh();
   }
 
@@ -2202,10 +2222,18 @@
   function save(status) {
     if (!cur || busy) return;
     if (status === 'reviewed') {
+      // No second press gets past this: pressing s must never turn a flagged box into a label.
+      var stacked = pendingDupDrops(dupGroups());
+      var must = boxes().filter(function (b, i) { return stacked.indexOf(i) < 0 && mustDecide(b); }).length;
+      if (must > 0) {
+        say(must + ' box(es) the auto-labeler flagged (marked ?) need a decision: a accepts, r rejects, Shift+R rejects the rest.', true);
+        select(selected >= 0 && mustDecide(boxes()[selected]) ? selected : firstReview(), true);
+        return;
+      }
       var n = reviewCount();
       if (n > 0 && !(guard && guard.frame === cur.frame && guard.count === n)) {
         guard = { frame: cur.frame, count: n };
-        say(n + ' box(es) the auto-labeler flagged still need a decision (marked ?): accept or reject them, or save again to use the defaults.', true);
+        say(n + ' flagged hint box(es) (marked ?) are rejected on save unless you accept them; save again to reject them.', true);
         select(selected >= 0 && isReview(boxes()[selected]) ? selected : firstReview(), true);
         return;
       }
@@ -2356,6 +2384,7 @@
   if (backBtn) backBtn.addEventListener('click', goBack);
   $('rv-undo').addEventListener('click', doUndo);
   $('rv-accept-all').addEventListener('click', acceptProposals);
+  $('rv-reject-rest').addEventListener('click', rejectRest);
   if (imgBtn) imgBtn.addEventListener('click', function () { cycleImg(); canvas.focus({ preventScroll: true }); });
   if (missingBox) {
     missingBox.checked = askMissing;
@@ -2420,11 +2449,12 @@
     ['Decide', 'y', 'overlap suggestion: accept the one on screen (drops the box marked drop?, as a duplicate; or keeps both as two objects). Doing anything else ignores it'],
     ['Decide', 'd', 'unsure: a real object you cannot name for sure (kept, left out of YOLO training, ignored by the benchmark set; ?! on the box); again: not unsure'],
     ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate)'],
-    ['Decide', 'Shift+A', 'accept proposals: the pending boxes saving would accept (hints stay pending)'],
+    ['Decide', 'Shift+A', 'accept proposals: the pending boxes saving would accept (flagged ? boxes and hints stay pending)'],
+    ['Decide', 'Shift+R', 'reject the rest: every box still undecided'],
     ['Decide', 'e', 'confirmed empty (rejects every box)'],
     ['Decide', 'Delete', 'delete a drawn box, reject a model box'],
     ['Decide', 'z', 'undo'],
-    ['Decide', 's, Enter', 'save & next; asks first about flagged (?) boxes, boxes not checked yet, then "Anything missing?" (Panel options)'],
+    ['Decide', 's, Enter', 'save & next; flagged (?) boxes need a decision first, then it asks about boxes not checked yet and "Anything missing?" (Panel options)'],
     ['Decide', 'drag', 'on a handle: resize; inside the selected box: move; elsewhere: draw a box'],
     ['Decide', 'arrows', 'move the selected box 1 px (Shift: 10 px)'],
     ['Decide', '', 'The next box is the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked to check).'],
@@ -2558,7 +2588,9 @@
         k === 'ArrowUp' ? -step : (k === 'ArrowDown' ? step : 0));
     } else if (k === 'a') {
       if (ev.shiftKey) acceptProposals(); else acceptSelected();
-    } else if (k === 'r') rejectSelected();
+    } else if (k === 'r') {
+      if (ev.shiftKey) rejectRest(); else rejectSelected();
+    }
     else if (k === 'n') skipToNext();
     else if (k === 'e') confirmEmpty(!(cur && cur.labels.empty_confirmed));
     else if (k === 'z') doUndo();

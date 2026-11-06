@@ -610,7 +610,8 @@ eligible, boxes, rejected, failed, frames, message}`. Both routes are admin rout
 | `Delete` | Delete a drawn box, reject a model box. |
 | `e` | Confirmed empty (rejects every box). |
 | `z` | Undo. |
-| `s`, `Enter` | Save & next. |
+| `s`, `Enter` | Save & next. A box the auto-labelers flagged (`?`) needs a decision first: the save refuses it, on the page and on the server, however often it is pressed. |
+| `Shift+R` | Reject the rest: every box still undecided (`reason: rest_rejected`; a decision on the frame, so the repeats history leaves these out). |
 | `n` | Next without saving. |
 
 Click a box to select it. Drag on the image to draw a new one.

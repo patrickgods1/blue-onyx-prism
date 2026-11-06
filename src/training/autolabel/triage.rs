@@ -1888,9 +1888,12 @@ mod tests {
         // Unreviewed save: the note is kept, and accepted.
         let saved = labels::normalize(f.clone(), &cls, 640, 480, now).unwrap();
         assert_eq!(saved.disagreement.as_deref(), Some(note.as_str()));
-        // Saved as reviewed: the proposals are accepted, the note goes.
+        // Saved as reviewed once the reviewer accepted the proposals: the note goes.
         let mut done = saved;
         done.status = Status::Reviewed;
+        done.boxes
+            .iter_mut()
+            .for_each(|b| b.state = BoxState::Accepted);
         let done = labels::normalize(done, &cls, 640, 480, now).unwrap();
         assert_eq!(done.training().count(), 30);
         assert_eq!(done.disagreement, None);
@@ -2371,10 +2374,12 @@ mod tests {
             g.disagreement.as_deref(),
             Some("re-label by sam3: 1 new box")
         );
-        // The file still saves, and the reviewer's save accepts the box.
+        // The file still saves; a reviewed save waits for the reviewer's decision.
         let saved = labels::normalize(g, &classes(), 640, 480, "t").unwrap();
         let mut done = saved;
         done.status = Status::Reviewed;
+        assert!(labels::normalize(done.clone(), &classes(), 640, 480, "t").is_err());
+        done.boxes[0].state = BoxState::Accepted;
         let done = labels::normalize(done, &classes(), 640, 480, "t").unwrap();
         assert_eq!(done.training().count(), 1);
         assert_eq!(done.disagreement, None);

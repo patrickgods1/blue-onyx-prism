@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 pub const LABELS_VERSION: u32 = 1;
 /// Suffix of a label file after the frame's stem (`<stem>.labels.json`).
 pub const LABELS_SUFFIX: &str = ".labels.json";
+/// [`LabelBox::reason`] of a box rejected by the page's "Reject the rest": a decision on the frame,
+/// not a look at that box, so the repeats history leaves it out.
+pub const REST_REASON: &str = "rest_rejected";
 /// Most boxes in one label file.
 pub const MAX_BOXES: usize = 500;
 /// Largest label file read (bytes).
@@ -608,6 +611,17 @@ pub fn resolve_pending(b: &LabelBox) -> BoxState {
     }
 }
 
+/// A pending box a save must not settle: the auto-labelers flagged it (`triage: review`, or they
+/// name another class) and [`resolve_pending`] would make it a label. A hint it would reject is no
+/// label, so it needs no decision. Twin of the page's `mustDecide`.
+pub fn needs_decision(b: &LabelBox) -> bool {
+    b.state == BoxState::Pending
+        && resolve_pending(b) == BoxState::Accepted
+        && b.source != Source::Human
+        && (b.auto.triage == Some(Triage::Review)
+            || b.auto.auto_label.as_ref().is_some_and(|l| *l != b.label))
+}
+
 /// The auto-labelers accept the box as labelled (`triage: accept`, no class suggestion).
 fn auto_accepted(b: &LabelBox) -> bool {
     b.auto.triage == Some(Triage::Accept) && b.auto.auto_label.is_none()
@@ -755,6 +769,13 @@ pub fn normalize(
     }
     match f.status {
         Status::Reviewed => {
+            let undecided = f.boxes.iter().filter(|b| needs_decision(b)).count();
+            if undecided > 0 {
+                bail!(
+                    "{undecided} box(es) the auto-labelers flagged still need a decision: accept \
+                     or reject them, then save"
+                );
+            }
             for b in &mut f.boxes {
                 b.state = resolve_pending(b);
             }
@@ -789,6 +810,9 @@ pub fn normalize(
             b.difficult = false;
         } else {
             b.reject_reason = None;
+            if b.reason.as_deref() == Some(REST_REASON) {
+                b.reason = None;
+            }
         }
     }
     if f.status != Status::Unreviewed {
@@ -1548,6 +1572,64 @@ mod tests {
     }
 
     #[test]
+    fn a_save_never_turns_a_flagged_box_into_a_label() {
+        let reviewed = |boxes: Vec<LabelBox>| LabelFile {
+            status: Status::Reviewed,
+            boxes,
+            ..LabelFile::default()
+        };
+        let save = |f| normalize(f, &classes(), 640, 480, "now");
+        let mut flagged = tests_support::auto_box("person");
+        flagged.auto.triage = Some(Triage::Review);
+        assert!(needs_decision(&flagged));
+        let e = save(reviewed(vec![flagged.clone()])).unwrap_err();
+        assert!(e.to_string().contains("1 box(es)"), "{e:#}");
+        // Decided either way, it saves.
+        for state in [BoxState::Accepted, BoxState::Rejected] {
+            let mut b = flagged.clone();
+            b.state = state;
+            assert_eq!(save(reviewed(vec![b])).unwrap().boxes[0].state, state);
+        }
+        // Another status does not settle it, so it stays allowed.
+        let skipped = LabelFile {
+            status: Status::Skipped,
+            ..reviewed(vec![flagged.clone()])
+        };
+        assert_eq!(save(skipped).unwrap().boxes[0].state, BoxState::Pending);
+        // A class suggestion on a model box is flagged too; the same label is not.
+        let mut suggestion = hint(Origin::Prediction, None, Some("cat"));
+        assert!(needs_decision(&suggestion));
+        suggestion.auto.auto_label = Some(suggestion.label.clone());
+        assert!(!needs_decision(&suggestion));
+        // An unflagged proposal is accepted as before, and a flagged hint is rejected by default:
+        // neither is a label nobody chose.
+        let plain = tests_support::auto_box("person");
+        assert!(!needs_decision(&plain));
+        let flagged_hint = hint(Origin::Suppressed, Some(Triage::Review), None);
+        assert!(!needs_decision(&flagged_hint));
+        let f = save(reviewed(vec![plain, flagged_hint])).unwrap();
+        assert_eq!(f.boxes[0].state, BoxState::Accepted);
+        assert_eq!(f.boxes[1].state, BoxState::Rejected);
+    }
+
+    #[test]
+    fn the_reject_the_rest_mark_stays_only_on_a_rejected_box() {
+        let mut b = tests_support::auto_box("person");
+        b.reason = Some(REST_REASON.into());
+        b.state = BoxState::Rejected;
+        let mut f = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![b],
+            ..LabelFile::default()
+        };
+        let n = normalize(f.clone(), &classes(), 640, 480, "now").unwrap();
+        assert_eq!(n.boxes[0].reason.as_deref(), Some(REST_REASON));
+        f.boxes[0].state = BoxState::Accepted;
+        let n = normalize(f, &classes(), 640, 480, "now").unwrap();
+        assert_eq!(n.boxes[0].reason, None);
+    }
+
+    #[test]
     fn auto_info_round_trips_flat_and_disagreement_clears_on_review() {
         let mut b = tests_support::auto_box("person");
         b.auto = AutoInfo {
@@ -1588,6 +1670,8 @@ mod tests {
         };
         let un = normalize(f.clone(), &classes(), 640, 480, "t").unwrap();
         assert!(un.disagreement.is_some(), "kept while unreviewed");
+        let mut f = f;
+        f.boxes[0].state = BoxState::Accepted;
         let rev = normalize(
             LabelFile {
                 status: Status::Reviewed,
