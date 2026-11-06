@@ -21,6 +21,10 @@
 //! at the export's root) names them per image: a training run leaves those frames out of train
 //! and valid instead of teaching the object as background. They are `ignore` in the benchmark set.
 //!
+//! Frames whose only boxes a labelers run accepted at parked spots ([`ExportFrame::parked_spots`])
+//! are listed in `ignore.json` too (`parked`): identical crops can dominate training, so a training
+//! run caps them per spot. They train normally otherwise.
+//!
 //! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`], [`ignore_file`]) plus
 //! [`run`], which writes into an empty or new folder, or a new `export-<UTC time>` folder inside a
 //! non-empty one, never into the dataset (images hard-linked, else copied), and writes
@@ -29,7 +33,7 @@
 use super::super::layout::{self, Rel};
 use super::super::record::Bucket;
 use super::xany;
-use super::{BoxState, Frame, LabelBox, LabelFile, Status, clamp_box, label_files};
+use super::{BoxState, Frame, LabelBox, LabelFile, Status, clamp_box, label_files, spots};
 use crate::benchmark::images::{Manifest, ManifestImage, ManifestObject};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -218,6 +222,28 @@ impl ExportFrame {
     pub fn ignore_boxes(&self) -> Vec<&LabelBox> {
         self.placed(LabelBox::is_ignore)
     }
+
+    /// The parked spots of a frame whose training boxes all come from one, sorted; empty for any
+    /// other frame. A box a reviewer moved or renamed since is the reviewer's box.
+    pub fn parked_spots(&self) -> Vec<String> {
+        let keys: Option<BTreeSet<String>> = self
+            .boxes()
+            .into_iter()
+            .map(|b| {
+                let mark = b.auto.parked.as_ref().filter(|_| {
+                    b.reason.as_deref() == Some(spots::PARKED_REASON)
+                        && b.orig_bbox.is_none()
+                        && b.model_label.is_none()
+                })?;
+                let [x0, y0, x1, y1] = mark.bbox;
+                Some(format!(
+                    "{}/{}x{}/{}/{x0:.0},{y0:.0},{x1:.0},{y1:.0}",
+                    self.rel.camera, self.width, self.height, b.label
+                ))
+            })
+            .collect();
+        keys.map(|k| k.into_iter().collect()).unwrap_or_default()
+    }
 }
 
 /// File at the root of an export: the ignore regions of its images. A missing file means none
@@ -243,6 +269,11 @@ pub struct IgnoreBox {
 pub struct IgnoreFile {
     pub version: u32,
     pub images: BTreeMap<String, Vec<IgnoreBox>>,
+    /// Image file name -> the spots of a frame with nothing but parked-spot boxes
+    /// ([`ExportFrame::parked_spots`]). These are no ignore regions: the frames train, up to a cap
+    /// per spot. Absent in exports of older versions, and older builds skip it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parked: BTreeMap<String, Vec<String>>,
 }
 
 /// `x` rounded to `d` decimals, as f64 (clean JSON numbers).
@@ -307,9 +338,17 @@ pub fn ignore_file(frames: &[ExportFrame]) -> IgnoreFile {
             (!list.is_empty()).then(|| (f.name.clone(), list))
         })
         .collect();
+    let parked = frames
+        .iter()
+        .filter_map(|f| {
+            let spots = f.parked_spots();
+            (!spots.is_empty()).then(|| (f.name.clone(), spots))
+        })
+        .collect();
     IgnoreFile {
         version: IGNORE_VERSION,
         images,
+        parked,
     }
 }
 
@@ -980,6 +1019,53 @@ mod tests {
         assert_eq!(p.boxes.len(), 1);
         assert_eq!(p.boxes[0].label, "car");
         assert_eq!(p.boxes[0].state, BoxState::Accepted);
+    }
+
+    #[test]
+    fn only_frames_with_nothing_but_parked_boxes_are_listed() {
+        let parked = |bbox: [f32; 4]| {
+            let mut b = lb("car", bbox, BoxState::Accepted);
+            b.reason = Some(spots::PARKED_REASON.into());
+            b.auto.parked = Some(super::super::ParkedMark {
+                since: "2026-10-01".into(),
+                bbox: [10.0, 10.0, 50.0, 50.0],
+            });
+            b
+        };
+        let f = frame(vec![parked([11.0, 11.0, 50.0, 50.0])], false);
+        let key = "cam/200x100/car/10,10,50,50".to_string();
+        assert_eq!(f.parked_spots(), std::slice::from_ref(&key));
+        // Two boxes at one spot are one spot.
+        let two = frame(
+            vec![
+                parked([11.0, 11.0, 50.0, 50.0]),
+                parked([10.0, 10.0, 50.0, 50.0]),
+            ],
+            false,
+        );
+        assert_eq!(two.parked_spots(), std::slice::from_ref(&key));
+        // Another label on the frame, and a box a reviewer moved or renamed.
+        let mixed = vec![
+            parked([1.0, 1.0, 9.0, 9.0]),
+            lb("car", [20.0, 20.0, 60.0, 60.0], BoxState::Accepted),
+        ];
+        assert!(frame(mixed, false).parked_spots().is_empty());
+        let mut moved = parked([1.0, 1.0, 9.0, 9.0]);
+        moved.orig_bbox = Some([2.0, 2.0, 9.0, 9.0]);
+        assert!(frame(vec![moved], false).parked_spots().is_empty());
+        let mut renamed = parked([1.0, 1.0, 9.0, 9.0]);
+        renamed.model_label = Some("truck".into());
+        assert!(frame(vec![renamed], false).parked_spots().is_empty());
+        // A rejected box is no training box, and an empty frame has no spot.
+        let side = lb("car", [20.0, 20.0, 60.0, 60.0], BoxState::Rejected);
+        assert_eq!(
+            frame(vec![parked([11.0, 11.0, 50.0, 50.0]), side], false).parked_spots(),
+            std::slice::from_ref(&key)
+        );
+        assert!(frame(Vec::new(), true).parked_spots().is_empty());
+        let file = ignore_file(&[f]);
+        assert_eq!(file.parked.values().next(), Some(&vec![key]));
+        assert!(file.images.is_empty());
     }
 
     fn g(c: &str, d: &str) -> Group {

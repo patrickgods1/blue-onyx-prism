@@ -35,6 +35,17 @@ pub const LOW_SCORE_REASON: &str = "low_score";
 /// decision: no hard negative, not in the repeats history, and a rerun may replace it.
 pub const DISMISSED_REASON: &str = "auto_dismissed";
 
+/// The reason of a box a labelers run dismissed because a reviewer rejected that spot of the
+/// camera again and again ([`super::spots`]). Every reader treats it as [`DISMISSED_REASON`]
+/// through [`is_dismissal`]; only the Review page's wording differs.
+pub const SPOT_DISMISSED_REASON: &str = "spot_dismissed";
+
+/// Whether `reason` marks a dismissal ([`DISMISSED_REASON`], [`SPOT_DISMISSED_REASON`]): the one
+/// place that lists them, so the two cannot drift apart. Twin of the page's `isDismissal`.
+pub fn is_dismissal(reason: Option<&str>) -> bool {
+    matches!(reason, Some(DISMISSED_REASON | SPOT_DISMISSED_REASON))
+}
+
 /// The reason a box rejected by [`reject_other_class`] carries.
 pub const OTHER_CLASS_REASON: &str = "other_class";
 

@@ -11,15 +11,18 @@
 //! reviewed frame only takes the confident new objects past its gate ([`gate_drop`]), and every
 //! frame takes the labelers' votes on boxes they found again ([`vote`]). A run with a model votes
 //! the same way ([`apply_relabel`]); a `missing_only` run does not. On a frame no reviewer has
-//! decided, [`tier`] sorts a labelers run's new boxes into dismissed, likely and the rest.
+//! decided, [`tier`] sorts a labelers run's new boxes into dismissed, likely and the rest, then
+//! [`apply_spots`] applies what the reviewer taught about fixed places of the camera
+//! ([`labels::spots`]): rejected spots hide boxes, parked spots accept them.
 
 use super::catalog::same_class;
 use super::{Category, MISSING_THRESHOLD};
 use crate::collect::labels::repeats::{REPEAT_SPOT_REASON, same_object};
+use crate::collect::labels::spots::{CameraMemory, PARKED_REASON};
 use crate::collect::labels::stacks::{DUPLICATE_REASON, STACK_IOU};
 use crate::collect::labels::{
-    self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, Origin, Source, Status,
-    Triage, VlmCheck, inside_share, iou, merge_proposals,
+    self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, Origin, ParkedMark,
+    Source, Status, Triage, VlmCheck, inside_share, iou, merge_proposals,
 };
 use crate::resources::catalog::SAM3_KEY;
 use serde::Deserialize;
@@ -49,6 +52,12 @@ pub const NEVER_DISMISSED: [&str; 1] = ["truck"];
 pub const AUDIT_ONE_IN: u32 = 50;
 /// The reason an audit sample shows on the Review page.
 pub const AUDIT_WHY: &str = "audit sample: normally hidden";
+/// Fused score from which a box stays visible at a rejected spot, whatever the spot's record:
+/// a real object at a bad spot on an unlucky frame.
+pub const SPOT_KEEP_SCORE: f32 = 0.5;
+/// The reason a box at a parked spot stays flagged: the VLM said no, so the object may have left.
+pub const PARKED_GONE_WHY: &str =
+    "at a parked spot, but the VLM sees nothing there: it may have left";
 
 /// The VLM check of a box, as the script reports it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -307,6 +316,8 @@ fn proposal_box(p: &Proposal, scene: &str, w: u32, h: u32, accept_score: f32) ->
             auto_score: None,
             likely: false,
             audit: false,
+            spot_rejections: None,
+            parked: None,
         },
     })
 }
@@ -607,7 +618,7 @@ fn covers(b: &LabelBox, p: &LabelBox) -> bool {
 }
 
 /// A rejected box no reviewer judged: a [`labels::bulk::LOW_SCORE_REASON`] bulk reject, a dismissal
-/// ([`labels::bulk::DISMISSED_REASON`]), or a model hint (suppressed, below threshold, verifier find)
+/// ([`labels::bulk::is_dismissal`]), or a model hint (suppressed, below threshold, verifier find)
 /// the page's save default rejected. A reject
 /// reason, a spot edit or a duplicate reject means somebody looked, whatever the box's origin. A
 /// spot edit leaves its mark only on a box without a `reason` of its own, so a suppressed hint
@@ -617,10 +628,9 @@ fn unjudged_reject(b: &LabelBox) -> bool {
     b.state == BoxState::Rejected
         && b.reject_reason.is_none()
         && !matches!(reason, Some(REPEAT_SPOT_REASON | DUPLICATE_REASON))
-        && (matches!(
-            reason,
-            Some(labels::bulk::LOW_SCORE_REASON | labels::bulk::DISMISSED_REASON)
-        ) || (b.source == Source::Model && b.origin != Some(Origin::Prediction)))
+        && (reason == Some(labels::bulk::LOW_SCORE_REASON)
+            || labels::bulk::is_dismissal(reason)
+            || (b.source == Source::Model && b.origin != Some(Origin::Prediction)))
 }
 
 /// The note of a frame with `f`'s pending proposals: who proposed them and how many, within
@@ -798,6 +808,12 @@ pub struct LabelersReport {
     pub audit: usize,
     /// New boxes likely real ([`Tier::Likely`]).
     pub likely: usize,
+    /// New boxes dismissed at a rejected spot ([`apply_spots`]).
+    pub spot_dismissed: usize,
+    /// Pending boxes accepted at a parked spot ([`apply_spots`]).
+    pub parked_accepted: usize,
+    /// Of `parked_accepted`, boxes this run added.
+    pub parked_new: usize,
 }
 
 impl LabelersReport {
@@ -954,6 +970,24 @@ pub fn audit_sample(frame: &str, label: &str, bbox: &[f32; 4]) -> bool {
     n % AUDIT_ONE_IN == 0
 }
 
+/// A pending auto box with no sign of a reviewer.
+fn untouched(b: &LabelBox) -> bool {
+    b.state == BoxState::Pending
+        && b.source == Source::Auto
+        && b.orig_bbox.is_none()
+        && !b.difficult
+        && b.reject_reason.is_none()
+}
+
+fn found_by_sam3(b: &LabelBox) -> bool {
+    b.auto.labelers.contains_key(SAM3_KEY)
+}
+
+/// [`LIKELY_SCORE`] and a yes to the yes/no question.
+fn is_likely(b: &LabelBox, score: f32) -> bool {
+    score >= LIKELY_SCORE && b.auto.vlm.as_ref().is_some_and(VlmCheck::says_yes)
+}
+
 /// The [`Tier`] of `b`, a box of a labelers run on `frame` (thresholds and their measured reasons
 /// above [`DISMISS_SCORE`]). Only a pending auto box with no sign of a reviewer gets a tier other
 /// than [`Tier::Unlikely`].
@@ -966,24 +1000,14 @@ pub fn audit_sample(frame: &str, label: &str, bbox: &[f32; 4]) -> bool {
 ///   those were real on public sets. A class only one labeler can report is not halved by the
 ///   fusion, so it stays at or above that labeler's threshold (0.2 for MM-Grounding-DINO).
 pub fn tier(b: &LabelBox, frame: &str, sam3_run: bool) -> Tier {
-    let untouched = b.state == BoxState::Pending
-        && b.source == Source::Auto
-        && b.orig_bbox.is_none()
-        && !b.difficult
-        && b.reject_reason.is_none();
-    let Some(score) = b.score.filter(|_| untouched) else {
+    let Some(score) = b.score.filter(|_| untouched(b)) else {
         return Tier::Unlikely;
     };
-    let yes = b
-        .auto
-        .vlm
-        .as_ref()
-        .is_some_and(|v| v.expected == "yes" && v.ok);
-    if score >= LIKELY_SCORE && yes {
+    if is_likely(b, score) {
         return Tier::Likely;
     }
     let protected = sam3_run
-        || b.auto.labelers.contains_key(SAM3_KEY)
+        || found_by_sam3(b)
         || b.auto.triage == Some(Triage::Accept)
         || NEVER_DISMISSED
             .iter()
@@ -1020,6 +1044,97 @@ fn apply_tiers(f: &mut LabelFile, from: usize, frame: &str, name: &str, r: &mut 
     }
 }
 
+/// The spots of a frame's camera for a run ([`labels::spots::Snapshot`]).
+#[derive(Debug, Clone, Copy)]
+pub struct FrameSpots<'a> {
+    pub memory: &'a CameraMemory,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Whether `b`, a new box at a rejected spot, stays visible at fused score `score`. The truck
+/// exception of [`tier`] is not here: that one is about the score, a spot rests on a reviewer's
+/// own look.
+fn spot_keeps(b: &LabelBox, score: f32) -> bool {
+    score >= SPOT_KEEP_SCORE || is_likely(b, score) || b.auto.triage == Some(Triage::Accept)
+}
+
+/// What the reviewer taught about the camera's places, on the boxes of `f` after [`apply_tiers`].
+/// Not on a SAM 3 run or a box SAM 3 found: its boxes never get past a reviewer unseen.
+///
+/// - Parked spot ([`CameraMemory::parked_at`]: the exact label, IoU >= 0.8), any pending auto box
+///   with no sign of a reviewer and no class suggestion, an [`AUDIT_ONE_IN`] sample excepted:
+///   accepted, [`PARKED_REASON`], so it leaves the frame's undecided count. The frame stays
+///   unreviewed and is marked [`LabelFile::repeat_spot`]. A VLM no in the yes/no contract leaves it
+///   pending and flagged instead: the car may have left.
+/// - Rejected spot ([`CameraMemory::rejections_at`]), only the boxes this run added (from index
+///   `from` on) and not near a parked spot: dismissed with
+///   [`labels::bulk::SPOT_DISMISSED_REASON`], unless [`spot_keeps`]; an [`audit_sample`] stays
+///   visible as [`Tier::Audit`] does.
+fn apply_spots(
+    f: &mut LabelFile,
+    from: usize,
+    frame: &str,
+    name: &str,
+    spots: FrameSpots<'_>,
+    r: &mut LabelersReport,
+) {
+    if name == SAM3_KEY {
+        return;
+    }
+    let FrameSpots {
+        memory,
+        width,
+        height,
+    } = spots;
+    let before = r.parked_accepted;
+    for (i, b) in f.boxes.iter_mut().enumerate() {
+        if !untouched(b) || found_by_sam3(b) || b.auto.audit {
+            continue;
+        }
+        if let Some(p) = memory.parked_at(b, width, height) {
+            if b.auto.vlm.as_ref().is_some_and(VlmCheck::says_no) {
+                b.auto.triage = Some(Triage::Review);
+                if !b.auto.why.iter().any(|w| w == PARKED_GONE_WHY) {
+                    b.auto.why.push(PARKED_GONE_WHY.to_string());
+                }
+            } else if b.auto.auto_label.as_ref().is_none_or(|l| *l == b.label) {
+                b.state = BoxState::Accepted;
+                b.reason = Some(PARKED_REASON.to_string());
+                b.auto.parked = Some(ParkedMark {
+                    since: p.from.clone(),
+                    bbox: p.bbox,
+                });
+                r.parked_accepted += 1;
+                r.parked_new += usize::from(i >= from);
+            }
+            continue;
+        }
+        let Some(score) = b.score.filter(|_| i >= from) else {
+            continue;
+        };
+        let n = memory.rejections_at(b, frame, width, height);
+        if n == 0 || spot_keeps(b, score) || memory.parked_near(b, width, height) {
+            continue;
+        }
+        if audit_sample(frame, &b.label, &b.bbox) {
+            b.auto.audit = true;
+            b.auto.why.push(AUDIT_WHY.to_string());
+            r.audit += 1;
+        } else {
+            b.state = BoxState::Rejected;
+            b.reason = Some(labels::bulk::SPOT_DISMISSED_REASON.into());
+            b.auto.spot_rejections = u32::try_from(n).ok();
+            r.spot_dismissed += 1;
+        }
+    }
+    if r.parked_accepted > before {
+        f.repeat_spot = true;
+        // The look that flag remembers did not cover this box.
+        f.checked_before_reopen = false;
+    }
+}
+
 /// Take away the dismissed boxes of `f` that one of `proposals` found again, same label at IoU >=
 /// [`MATCH_IOU`]: nobody decided on them, so [`merge_proposals`] must not drop the proposal as
 /// covered. It comes back as new, and a labelers run tiers it afresh: the same box scores the same
@@ -1038,7 +1153,7 @@ fn undismiss_found(f: &mut LabelFile, proposals: &[LabelBox]) {
 ///
 /// | Frame | Result |
 /// |---|---|
-/// | Unreviewed, not sent back | [`apply`], then votes, then the new boxes' [`tier`] |
+/// | Unreviewed, not sent back | [`apply`], then votes, then the new boxes' [`tier`], then `spots` ([`apply_spots`]) |
 /// | Reviewed, or sent back by a re-label | votes, the gate ([`gate_drop`]), then [`apply_missing`] |
 /// | Confirmed empty, any status | votes: a save refuses a training box on such a frame |
 /// | Skipped | votes: a skipped frame must not come back and reach an export by a bulk accept |
@@ -1047,12 +1162,14 @@ fn undismiss_found(f: &mut LabelFile, proposals: &[LabelBox]) {
 /// `labelers`. A box past the gate gets a reason and triage `review`; a frame that gains one goes
 /// back to `unreviewed` with a `disagreement` note naming `name` (one short name, `sam3`, not the
 /// run's joined list) and loses [`LabelFile::bulk_accepted`]: a reviewer has to look at it now.
-/// `frame` (`<scene>/<camera>/<date>/<stem>.jpg`) seeds the [`audit_sample`].
+/// `frame` (`<scene>/<camera>/<date>/<stem>.jpg`) seeds the [`audit_sample`]. `spots` is None for a
+/// camera without a snapshot.
 pub fn apply_labelers(
     f: &mut LabelFile,
     boxes: Vec<LabelBox>,
     name: &str,
     frame: &str,
+    spots: Option<FrameSpots<'_>>,
 ) -> LabelersReport {
     let mut r = LabelersReport::default();
     let path = labelers_path(f);
@@ -1067,6 +1184,9 @@ pub fn apply_labelers(
             r.votes = vote(f, &boxes, existing);
             // Only the boxes this run added: a stored box is never tiered again.
             apply_tiers(f, existing, frame, name, &mut r);
+            if let Some(spots) = spots {
+                apply_spots(f, existing, frame, name, spots, &mut r);
+            }
         }
         LabelersPath::Closed => {
             r.votes = vote(f, &boxes, existing);
@@ -1101,8 +1221,20 @@ pub fn apply_labelers(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::collect::labels::repeats::{Decision, History};
+    use crate::collect::labels::spots::{CameraSpots, Parked};
 
     const REL: &str = "day/yard/2026-10-22/20261022T010203004Z_abcd.jpg";
+
+    /// [`super::apply_labelers`] for a camera without a snapshot.
+    fn apply_labelers(
+        f: &mut LabelFile,
+        boxes: Vec<LabelBox>,
+        name: &str,
+        frame: &str,
+    ) -> LabelersReport {
+        super::apply_labelers(f, boxes, name, frame, None)
+    }
 
     fn p(label: &str, score: f32, agree: bool) -> Proposal {
         Proposal {
@@ -3386,5 +3518,370 @@ mod tests {
         let n = labels::normalize(f, &classes(), 640, 480, "2026-10-22T12:00:00.000Z").unwrap();
         assert!(n.boxes[0].is_dismissed());
         assert_eq!(n.training().count(), 0);
+    }
+
+    // ---- spots ------------------------------------------------------------------------------
+
+    const FRAME_SIZE: (u32, u32) = (640, 480);
+
+    /// A rejected box of camera `yard` at `at` on the frame of `day` number `n`.
+    fn decision(day: &str, n: usize, label: &str, at: [f32; 4], state: BoxState) -> Decision {
+        Decision {
+            frame: format!("day/yard/{day}/20260101T000000000Z_{n}.jpg"),
+            label: label.into(),
+            bbox: at,
+            state,
+            reject_reason: None,
+            width: FRAME_SIZE.0,
+            height: FRAME_SIZE.1,
+        }
+    }
+
+    fn memory(decisions: Vec<Decision>, store: CameraSpots) -> CameraMemory {
+        let h = History {
+            camera: "yard".into(),
+            decisions,
+            truncated: false,
+        };
+        CameraMemory::new(&h, store)
+    }
+
+    /// Rejected on two frames, a week before [`REL`].
+    fn bad_spot(at: [f32; 4]) -> CameraMemory {
+        let d = (0..2)
+            .map(|n| decision("2026-10-15", n, "car", at, BoxState::Rejected))
+            .collect();
+        memory(d, CameraSpots::default())
+    }
+
+    fn parked_spot(at: [f32; 4]) -> CameraMemory {
+        let mut store = CameraSpots::default();
+        store.parked.insert(
+            "640x480".into(),
+            vec![Parked {
+                label: "car".into(),
+                bbox: at,
+                from: "2026-10-01".into(),
+                retired: None,
+            }],
+        );
+        memory(Vec::new(), store)
+    }
+
+    /// One proposal on an empty unreviewed frame of [`REL`] with `m`.
+    fn at_spot(run: &str, m: &CameraMemory, prop: Proposal) -> (LabelFile, LabelersReport) {
+        let mut f = LabelFile::default();
+        let spots = FrameSpots {
+            memory: m,
+            width: FRAME_SIZE.0,
+            height: FRAME_SIZE.1,
+        };
+        let r = super::apply_labelers(&mut f, boxes(&[prop]), run, REL, Some(spots));
+        (f, r)
+    }
+
+    #[test]
+    fn a_rejected_spot_hides_a_new_box_with_its_own_reason() {
+        let at = place("truck", false);
+        let m = bad_spot(at);
+        let (f, r) = at_spot("gdino", &m, fused("truck", at, 0.3, None));
+        let b = &f.boxes[0];
+        assert!(
+            b.is_dismissed(),
+            "a truck: the exception is the score rule's"
+        );
+        assert_eq!(
+            b.reason.as_deref(),
+            Some(labels::bulk::SPOT_DISMISSED_REASON)
+        );
+        assert_eq!(b.auto.spot_rejections, Some(2));
+        assert_eq!((r.spot_dismissed, r.dismissed, r.audit), (1, 0, 0));
+        // Elsewhere nothing happens, and a frame without a memory neither.
+        let (f, _) = at_spot("gdino", &m, fused("truck", OFF, 0.3, None));
+        assert_eq!(f.boxes[0].state, BoxState::Pending);
+        // A score below the tiers' line is the tier's dismissal, not the spot's.
+        let at = place("car", false);
+        let (f, r) = at_spot("gdino", &bad_spot(at), fused("car", at, 0.1, None));
+        assert_eq!(
+            f.boxes[0].reason.as_deref(),
+            Some(labels::bulk::DISMISSED_REASON)
+        );
+        assert_eq!((r.spot_dismissed, r.dismissed), (0, 1));
+    }
+
+    #[test]
+    fn a_strong_box_stays_visible_at_a_rejected_spot() {
+        let at = place("car", false);
+        let m = bad_spot(at);
+        let state = |prop| at_spot("gdino", &m, prop).0.boxes[0].state;
+        assert_eq!(state(fused("car", at, 0.4999, None)), BoxState::Rejected);
+        assert_eq!(state(fused("car", at, 0.5, None)), BoxState::Pending);
+        // Likely: 0.25 with a yes, and just under it the spot wins.
+        assert_eq!(state(fused("car", at, 0.25, YES)), BoxState::Pending);
+        assert_eq!(state(fused("car", at, 0.2499, YES)), BoxState::Rejected);
+        // A VLM no is no reason either way; an old seven-way yes is no likely box.
+        assert_eq!(state(fused("car", at, 0.3, NO)), BoxState::Rejected);
+        let old = Some(("vehicle", true));
+        assert_eq!(state(fused("car", at, 0.3, old)), BoxState::Rejected);
+        // A box the triage accepts at a lowered accept score.
+        let mut sure = boxes(&[fused("car", at, 0.3, None)]).remove(0);
+        sure.auto.triage = Some(Triage::Accept);
+        assert!(spot_keeps(&sure, 0.3));
+    }
+
+    #[test]
+    fn the_audit_sample_stays_visible_at_a_rejected_spot() {
+        let at = place("car", true);
+        let (f, r) = at_spot("gdino", &bad_spot(at), fused("car", at, 0.3, None));
+        let b = &f.boxes[0];
+        assert_eq!(b.state, BoxState::Pending);
+        assert!(b.auto.audit && b.auto.why.iter().any(|w| w == AUDIT_WHY));
+        assert_eq!((r.audit, r.spot_dismissed), (1, 0));
+        // And it is no parked accept: a verdict on it checks the filter.
+        let (f, r) = at_spot("gdino", &parked_spot(at), fused("car", at, 0.1, None));
+        assert_eq!(
+            (f.boxes[0].state, r.parked_accepted),
+            (BoxState::Pending, 0)
+        );
+    }
+
+    #[test]
+    fn sam3_runs_use_no_spot() {
+        let at = place("car", false);
+        for m in [bad_spot(at), parked_spot(at)] {
+            let (f, r) = at_spot(SAM3_KEY, &m, fused("car", at, 0.3, None));
+            assert_eq!(f.boxes[0].state, BoxState::Pending);
+            assert_eq!((r.spot_dismissed, r.parked_accepted), (0, 0));
+            // A box SAM 3 found in another run's name.
+            let sam_box = Proposal {
+                sources: [(SAM3_KEY.to_string(), 0.3)].into(),
+                ..fused("car", at, 0.3, None)
+            };
+            let (f, r) = at_spot("gdino", &m, sam_box);
+            assert_eq!(f.boxes[0].state, BoxState::Pending);
+            assert_eq!((r.spot_dismissed, r.parked_accepted), (0, 0));
+        }
+    }
+
+    #[test]
+    fn a_stored_box_is_never_dismissed_for_its_spot_and_a_reviewed_frame_takes_nothing() {
+        let at = place("car", false);
+        let m = bad_spot(at);
+        let spots = FrameSpots {
+            memory: &m,
+            width: FRAME_SIZE.0,
+            height: FRAME_SIZE.1,
+        };
+        // An older run's box, found again: only this run's boxes are sorted.
+        let mut f = LabelFile {
+            boxes: boxes(&[fused("car", at, 0.3, None)]),
+            ..LabelFile::default()
+        };
+        let r = super::apply_labelers(
+            &mut f,
+            boxes(&[fused("car", at, 0.3, None)]),
+            "gdino",
+            REL,
+            Some(spots),
+        );
+        assert_eq!((f.boxes[0].state, r.spot_dismissed), (BoxState::Pending, 0));
+        // Reviewed, sent-back and skipped frames follow their own paths.
+        for status in [Status::Reviewed, Status::Skipped] {
+            let mut f = LabelFile {
+                status,
+                ..LabelFile::default()
+            };
+            let r = super::apply_labelers(
+                &mut f,
+                boxes(&[fused("car", at, 0.3, None)]),
+                "gdino",
+                REL,
+                Some(spots),
+            );
+            assert_eq!(r.spot_dismissed, 0, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_rerun_finds_a_spot_dismissed_box_again_and_decides_afresh() {
+        let at = place("car", false);
+        let m = bad_spot(at);
+        let spots = FrameSpots {
+            memory: &m,
+            width: FRAME_SIZE.0,
+            height: FRAME_SIZE.1,
+        };
+        let (mut f, _) = at_spot("gdino", &m, fused("car", at, 0.3, None));
+        let run =
+            |f: &mut LabelFile, p| super::apply_labelers(f, boxes(&[p]), "gdino", REL, Some(spots));
+        // Same box, same answer; nothing doubles.
+        run(&mut f, fused("car", at, 0.3, None));
+        assert_eq!(f.boxes.len(), 1);
+        assert!(f.boxes[0].is_dismissed());
+        // Stronger now: it shows.
+        run(&mut f, fused("car", at, 0.6, None));
+        assert_eq!((f.boxes.len(), f.boxes[0].state), (1, BoxState::Pending));
+    }
+
+    #[test]
+    fn a_spot_dismissal_is_no_judged_reject_and_no_decision_at_the_gate() {
+        let dismissed = LabelBox {
+            state: BoxState::Rejected,
+            reason: Some(labels::bulk::SPOT_DISMISSED_REASON.into()),
+            bbox: CAR,
+            ..labels::tests_support::auto_box("car")
+        };
+        assert!(unjudged_reject(&dismissed));
+        let mut judged = dismissed.clone();
+        judged.reject_reason = Some(labels::RejectReason::Reflection);
+        assert!(!unjudged_reject(&judged));
+        // On a reviewed frame: a dog on it is no box on a decided car...
+        let f = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![dismissed],
+            ..LabelFile::default()
+        };
+        let dog = boxes(&[sam("dog", CAR, 0.9)]).remove(0);
+        assert_eq!(gate_drop(&f, &dog), None);
+        // ...and a car on it stays out, as on a score dismissal.
+        let car = boxes(&[sam("car", CAR, 0.9)]).remove(0);
+        assert_eq!(gate_drop(&f, &car), Some(GateDrop::OnReject));
+    }
+
+    #[test]
+    fn a_parked_spot_accepts_the_exact_label_and_keeps_the_evidence() {
+        let at = place("car", false);
+        let m = parked_spot(at);
+        let (f, r) = at_spot("gdino", &m, fused("car", at, 0.3, None));
+        let b = &f.boxes[0];
+        assert_eq!(b.state, BoxState::Accepted);
+        assert_eq!(b.reason.as_deref(), Some(PARKED_REASON));
+        let mark = b.auto.parked.as_ref().unwrap();
+        assert_eq!((mark.since.as_str(), mark.bbox), ("2026-10-01", at));
+        assert!(b.auto.labelers.contains_key("gdino"), "the evidence stays");
+        assert_eq!((r.parked_accepted, r.parked_new), (1, 1));
+        assert_eq!(f.status, Status::Unreviewed, "the frame stays unreviewed");
+        assert!(f.repeat_spot);
+        assert!(!labels::needs_decision(b));
+        assert!(labels::repeats::repeats_only(&f));
+        // Another vehicle class at the place: not this label, and not hidden either.
+        let (f, r) = at_spot("gdino", &m, fused("truck", at, 0.3, None));
+        assert_eq!(f.boxes[0].state, BoxState::Pending);
+        assert_eq!((r.parked_accepted, f.repeat_spot), (0, false));
+        // Below IoU 0.8.
+        let [x0, y0, x1, y1] = at;
+        let loose = [x0, y0, x1, y0 + (y1 - y0) * 0.75];
+        let (f, r) = at_spot("gdino", &m, fused("car", loose, 0.3, None));
+        assert_eq!(
+            (f.boxes[0].state, r.parked_accepted),
+            (BoxState::Pending, 0)
+        );
+    }
+
+    #[test]
+    fn a_vlm_no_blocks_a_parked_accept_and_a_bulk_save() {
+        let at = place("car", false);
+        let m = parked_spot(at);
+        let (f, r) = at_spot("gdino", &m, fused("car", at, 0.6, NO));
+        let b = &f.boxes[0];
+        assert_eq!(b.state, BoxState::Pending);
+        assert_eq!(b.auto.triage, Some(Triage::Review));
+        assert!(b.auto.why.iter().any(|w| w == PARKED_GONE_WHY));
+        assert!(labels::needs_decision(b), "flagged: a save asks");
+        assert_eq!(r.parked_accepted, 0);
+        // Only the yes/no contract counts: a seven-way answer or no check accepts.
+        let old = Some(("vehicle", false));
+        for vlm in [old, None, YES] {
+            let (f, _) = at_spot("gdino", &m, fused("car", at, 0.6, vlm));
+            assert_eq!(f.boxes[0].state, BoxState::Accepted, "{vlm:?}");
+        }
+        // The frame-level save has the same rule, for a box a spot edit accepted.
+        let mut g = LabelFile {
+            repeat_spot: true,
+            boxes: boxes(&[fused("car", at, 0.6, NO)]),
+            ..LabelFile::default()
+        };
+        g.boxes[0].state = BoxState::Accepted;
+        assert!(!labels::repeats::repeats_only(&g));
+        g.boxes[0].auto.vlm = None;
+        assert!(labels::repeats::repeats_only(&g));
+    }
+
+    #[test]
+    fn a_parked_spot_takes_a_stored_pending_box_and_shields_its_place() {
+        let at = place("car", false);
+        let m = parked_spot(at);
+        let spots = FrameSpots {
+            memory: &m,
+            width: FRAME_SIZE.0,
+            height: FRAME_SIZE.1,
+        };
+        let mut f = LabelFile {
+            boxes: boxes(&[fused("car", at, 0.3, None)]),
+            ..LabelFile::default()
+        };
+        let r = super::apply_labelers(&mut f, Vec::new(), "gdino", REL, Some(spots));
+        assert_eq!((f.boxes[0].state, r.parked_new), (BoxState::Accepted, 0));
+        // Rejected on two frames as well, say before the car was parked: the reviewer's later
+        // word wins, also for another vehicle at the place, which stays visible.
+        let d = (0..2)
+            .map(|n| decision("2026-10-15", n, "car", at, BoxState::Rejected))
+            .collect();
+        let both = memory(d, m.store().clone());
+        let (f, r) = at_spot("gdino", &both, fused("truck", at, 0.3, None));
+        assert_eq!((f.boxes[0].state, r.spot_dismissed), (BoxState::Pending, 0));
+    }
+
+    /// The test behind the feature, in small: decisions on the early dates, boxes on the later ones.
+    #[test]
+    fn spots_learned_early_hide_later_false_boxes_and_a_real_box_survives() {
+        let rail = place("car", false);
+        let plant = [300.0, 40.0, 380.0, 120.0];
+        let early: Vec<Decision> = (0..6)
+            .map(|n| {
+                let day = format!("2026-10-0{}", n / 2 + 1);
+                let at = if n % 2 == 0 { rail } else { plant };
+                decision(&day, n, "car", at, BoxState::Rejected)
+            })
+            .collect();
+        let m = memory(early, CameraSpots::default());
+        let later = |date: &str, p: Proposal| {
+            let rel = format!("day/yard/{date}/20261020T000000000Z_x.jpg");
+            let mut f = LabelFile::default();
+            let spots = FrameSpots {
+                memory: &m,
+                width: FRAME_SIZE.0,
+                height: FRAME_SIZE.1,
+            };
+            super::apply_labelers(&mut f, boxes(&[p]), "gdino", &rel, Some(spots));
+            f.boxes.remove(0)
+        };
+        let mut shown = 0;
+        for day in 10..=30 {
+            let day = format!("2026-10-{day}");
+            let day = day.as_str();
+            for (at, score) in [(rail, 0.2), (plant, 0.31)] {
+                let b = later(day, fused("car", at, score, None));
+                if b.state == BoxState::Pending {
+                    assert!(b.auto.audit, "only an audit sample stays");
+                    shown += 1;
+                } else {
+                    assert_eq!(
+                        b.reason.as_deref(),
+                        Some(labels::bulk::SPOT_DISMISSED_REASON)
+                    );
+                }
+            }
+            // A real car at the bad spot on an unlucky frame.
+            let real = later(day, fused("car", rail, 0.6, None));
+            assert_eq!(real.state, BoxState::Pending);
+            // And a real box somewhere the reviewer never rejected.
+            let elsewhere = later(day, fused("person", OFF, 0.2, None));
+            assert_eq!(elsewhere.state, BoxState::Pending);
+        }
+        assert!(shown < 5, "{shown} of 42 false boxes shown");
+        // More than 30 days on, the spot has gone stale.
+        let stale = later("2026-11-15", fused("car", rail, 0.2, None));
+        assert_eq!(stale.state, BoxState::Pending);
     }
 }

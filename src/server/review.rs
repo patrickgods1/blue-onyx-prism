@@ -14,8 +14,10 @@
 //! to reviewed once nothing is pending), `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
 //! benchmark set), `POST /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes`
 //! (`collect.classes` and `collect.hidden_classes`; classes that become unwanted have their
-//! pending boxes rejected right away) and `GET /v1/review/class-catalog` (the class picker's
-//! catalog, [`crate::training::autolabel::catalog`]).
+//! pending boxes rejected right away), `GET /v1/review/class-catalog` (the class picker's
+//! catalog, [`crate::training::autolabel::catalog`]) and the spot memory
+//! ([`labels::spots`]): `GET /v1/review/spots`, `POST /v1/review/spots/parked`, `.../retire` and
+//! `.../moved`.
 //! Every frame reference goes through
 //! [`Frame::resolve`] (404 otherwise); POST bodies are JSON (415 otherwise) with per-route size
 //! caps (413); the admin guard and the cross-site check of the router apply.
@@ -949,6 +951,217 @@ pub(super) async fn accept_repeats(
             "message": message,
         }))
         .into_response()
+    })
+    .await
+}
+
+/// The camera of a spots route, or 400.
+fn spot_camera(camera: Option<&String>) -> Result<String, Problem> {
+    camera
+        .map(|c| c.trim().to_string())
+        .filter(|c| layout::camera_ok(c))
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "give `camera` (a camera name of the dataset, as in the frame paths)".to_string(),
+            )
+        })
+}
+
+/// A box of a spots route, or 400: a valid class name, `[x0, y0, x1, y1]` in pixels, inside a
+/// `width` x `height` frame once clamped, both sides at least [`labels::MIN_BOX_PX`].
+fn spot_box(label: &str, bbox: [f32; 4], width: u32, height: u32) -> Result<[f32; 4], Problem> {
+    if crate::collect::config::validate_classes(&[label.to_string()]).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "label: not a valid class name".to_string(),
+        ));
+    }
+    let c = labels::clamp_box(bbox, width, height);
+    let finite = bbox.iter().all(|v| v.is_finite());
+    if !finite || c[2] - c[0] < labels::MIN_BOX_PX || c[3] - c[1] < labels::MIN_BOX_PX {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "bbox: give [x0, y0, x1, y1] in pixels inside the frame".to_string(),
+        ));
+    }
+    Ok(c)
+}
+
+/// `GET /v1/review/spots?camera=<c>`: the camera's parked spots (every frame size, retired ones
+/// too), its rejected spots as of today, derived from the history
+/// ([`labels::spots::CameraMemory::rejected_spots`]), `moved_at`, and how many spots
+/// "Camera moved" would forget (`live`).
+pub(super) async fn spots(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
+) -> Response {
+    let camera = match spot_camera(query_map(query).get("camera")) {
+        Ok(c) => c,
+        Err((s, m)) => return fail(s, m),
+    };
+    blocking(move || {
+        let (dir, _, _) = context(&state);
+        let store = match labels::spots::read(&dir, &camera) {
+            Ok(s) => s,
+            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        };
+        let today = chrono::Utc::now().date_naive();
+        let memory =
+            labels::spots::CameraMemory::new(&labels::repeats::history(&dir, &camera), store);
+        let rejected = memory.rejected_spots(today);
+        let store = memory.store();
+        Json(serde_json::json!({
+            "success": true,
+            "camera": camera,
+            "moved_at": store.moved_at,
+            "parked": store.parked,
+            "rejected": rejected,
+            "live": store.live_count() + rejected.len(),
+        }))
+        .into_response()
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpotParkedBody {
+    frame: String,
+    label: String,
+    bbox: [f32; 4],
+}
+
+/// `POST /v1/review/spots/parked` with `{frame, label, bbox}` (the page's "Real, parked"): a parked
+/// spot on the frame's camera and size, from the frame's date ([`labels::spots::add_parked`]). The
+/// page accepts the box itself, in its unsaved edits. Answers the spot and whether it is `new`.
+pub(super) async fn spots_parked(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: SpotParkedBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    blocking(move || {
+        let (dir, _, _) = context(&state);
+        let Some(frame) = Frame::resolve(&dir, &b.frame) else {
+            return not_found();
+        };
+        let rec = match frame.record() {
+            Ok(r) => r,
+            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        };
+        let bbox = match spot_box(&b.label, b.bbox, rec.width, rec.height) {
+            Ok(c) => c,
+            Err((s, m)) => return fail(s, m),
+        };
+        let at = labels::spots::Place {
+            camera: &frame.rel.camera,
+            width: rec.width,
+            height: rec.height,
+            label: &b.label,
+            bbox,
+        };
+        match labels::spots::add_parked(&dir, &at, &frame.rel.date) {
+            Ok((spot, new)) => {
+                tracing::info!(
+                    camera = at.camera,
+                    label = at.label,
+                    new,
+                    "review: parked spot"
+                );
+                Json(serde_json::json!({ "success": true, "spot": spot, "new": new }))
+                    .into_response()
+            }
+            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        }
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpotRetireBody {
+    camera: String,
+    width: u32,
+    height: u32,
+    label: String,
+    bbox: [f32; 4],
+}
+
+/// `POST /v1/review/spots/retire` with `{camera, width, height, label, bbox}`: that parked spot
+/// stops counting ([`labels::spots::retire`]); 404 when there is none.
+pub(super) async fn spots_retire(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: SpotRetireBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let camera = match spot_camera(Some(&b.camera)) {
+        Ok(c) => c,
+        Err((s, m)) => return fail(s, m),
+    };
+    let bbox = match spot_box(&b.label, b.bbox, b.width, b.height) {
+        Ok(c) => c,
+        Err((s, m)) => return fail(s, m),
+    };
+    blocking(move || {
+        let (dir, _, _) = context(&state);
+        let at = labels::spots::Place {
+            camera: &camera,
+            width: b.width,
+            height: b.height,
+            label: &b.label,
+            bbox,
+        };
+        let today = crate::collect::utc_date(std::time::SystemTime::now());
+        match labels::spots::retire(&dir, &at, &today) {
+            Ok(true) => Json(serde_json::json!({ "success": true })).into_response(),
+            Ok(false) => fail(StatusCode::NOT_FOUND, "no parked spot there"),
+            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        }
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpotMovedBody {
+    camera: String,
+}
+
+/// `POST /v1/review/spots/moved` with `{camera}` ("Camera moved: forget spots"): every parked spot
+/// retires and `moved_at` is set, so rejected spots from before it stop counting too
+/// ([`labels::spots::camera_moved`]). A run already going keeps the spots it read at its start.
+pub(super) async fn spots_moved(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let b: SpotMovedBody = match json_body(&headers, body) {
+        Ok(b) => b,
+        Err((s, m)) => return fail(s, m),
+    };
+    let camera = match spot_camera(Some(&b.camera)) {
+        Ok(c) => c,
+        Err((s, m)) => return fail(s, m),
+    };
+    blocking(move || {
+        let (dir, _, _) = context(&state);
+        let at = now();
+        match labels::spots::camera_moved(&dir, &camera, &at) {
+            Ok(retired) => {
+                tracing::info!(camera, retired, "review: camera moved, spots forgotten");
+                Json(serde_json::json!({ "success": true, "retired": retired, "moved_at": at }))
+                    .into_response()
+            }
+            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        }
     })
     .await
 }
@@ -3031,6 +3244,117 @@ mod tests {
         let (s, _) = json(&d.state, post_json("/v1/review/accept-auto", &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
     }
+    #[tokio::test]
+    async fn parked_and_rejected_spots_round_trip_and_a_camera_move_forgets_them() {
+        use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
+        use labels::{BoxState, Triage};
+        let d = ds();
+        let today = crate::collect::utc_date(std::time::SystemTime::now());
+        // Decisions dated today: put_frame's fixed date would fall out of the window.
+        let dated = |stem: &str| {
+            let rel = put_frame(
+                &d.dir,
+                stem,
+                None,
+                vec![auto_box("car", 0.4, Triage::Review)],
+            );
+            let old = d.dir.join("ir/cam/2026-10-21");
+            let new = d.dir.join(format!("ir/cam/{today}"));
+            std::fs::create_dir_all(&new).unwrap();
+            for ext in ["jpg", "json", "labels.json"] {
+                std::fs::rename(
+                    old.join(format!("{stem}.{ext}")),
+                    new.join(format!("{stem}.{ext}")),
+                )
+                .unwrap();
+            }
+            rel.replace("2026-10-21", &today)
+        };
+        for stem in ["00000000T000000000Z_a", "00000000T000000000Z_b"] {
+            let rel = dated(stem);
+            let mut f = labels_of(&d.dir, &rel);
+            f.status = labels::Status::Reviewed;
+            f.boxes[0].state = BoxState::Rejected;
+            labels::write(&Frame::resolve(&d.dir, &rel).unwrap().labels, &f).unwrap();
+        }
+        let (s, v) = json(&d.state, get("/v1/review/spots?camera=cam")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["rejected"][0]["rejections"], 2, "{v}");
+        assert_eq!(v["live"], 1);
+        let (s, _) = json(&d.state, get("/v1/review/spots?camera=..%2Fx")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // The page's "Real, parked": clamped to the frame, dated by the frame.
+        let frame = put_frame(&d.dir, "20261021T010000000Z_c", None, vec![]);
+        let body = serde_json::json!({
+            "frame": frame, "label": "car", "bbox": [40.0, 4.0, 900.0, 40.0]
+        })
+        .to_string();
+        let (s, v) = json(&d.state, post_json("/v1/review/spots/parked", &body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["new"].as_bool(), v["spot"]["from"].as_str()),
+            (Some(true), Some("2026-10-21"))
+        );
+        assert_eq!(v["spot"]["bbox"][2], 64.0);
+        let (_, v) = json(&d.state, post_json("/v1/review/spots/parked", &body)).await;
+        assert_eq!(v["new"], false, "the same spot again");
+        assert!(d.dir.join("spots/cam.json").is_file());
+        let (_, v) = json(&d.state, get("/v1/review/spots?camera=cam")).await;
+        assert_eq!(v["parked"]["64x48"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["live"], 2);
+
+        // Refused: a frame that is not one, a bad box, a bad class, an unknown field.
+        for (body, status) in [
+            (
+                r#"{"frame":"../x.jpg","label":"car","bbox":[1,1,9,9]}"#,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                &serde_json::json!({"frame": frame, "label": "car", "bbox": [70, 1, 90, 9]})
+                    .to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                &serde_json::json!({"frame": frame, "label": "", "bbox": [1, 1, 9, 9]}).to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                &serde_json::json!({"frame": frame, "label": "car", "bbox": [1, 1, 9, 9], "x": 1})
+                    .to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (s, v) = json(&d.state, post_json("/v1/review/spots/parked", body)).await;
+            assert_eq!(s, status, "{body}: {v}");
+        }
+
+        // Retire one; again it is gone.
+        let body = r#"{"camera":"cam","width":64,"height":48,"label":"car","bbox":[40,4,64,40]}"#;
+        let (s, v) = json(&d.state, post_json("/v1/review/spots/retire", body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (s, _) = json(&d.state, post_json("/v1/review/spots/retire", body)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        // The camera moved: the rejected spot stops counting, a parked one retires.
+        let body = serde_json::json!({
+            "frame": frame, "label": "bus", "bbox": [1.0, 1.0, 20.0, 20.0]
+        })
+        .to_string();
+        json(&d.state, post_json("/v1/review/spots/parked", &body)).await;
+        let (s, v) = json(
+            &d.state,
+            post_json("/v1/review/spots/moved", r#"{"camera":"cam"}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["retired"], 1);
+        let (_, v) = json(&d.state, get("/v1/review/spots?camera=cam")).await;
+        assert_eq!(v["live"], 0, "{v}");
+        assert!(v["moved_at"].is_string());
+        assert!(v["rejected"].as_array().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn repeats_history_spot_edits_and_repeat_only_frames() {
         use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};

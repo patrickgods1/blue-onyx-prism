@@ -12,7 +12,8 @@
 //!      there is one.
 //!
 //!    A missing label file means "no objects" (the Ultralytics convention). `ignore.json`
-//!    ([`IgnoreFile`]) lists real objects not to train on (unsure, too small); no file = none.
+//!    ([`IgnoreFile`]) lists real objects not to train on (unsure, too small) and the frames with
+//!    nothing but parked-spot boxes; no file = none.
 //! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops);
 //!    hold out review frames by camera + day (unless the export already did) from **every**
 //!    review frame, before any filter, so runs with other scene filters are benchmarked on the
@@ -20,7 +21,9 @@
 //!    ([`SceneFilter`]), drop its frames with ignore regions (no trainer here can leave a region
 //!    out of its loss, so the object would train as background; the held-out set keeps them, with
 //!    the regions `ignore` in its manifest) and, in [`Excluded::DropFrame`] mode, its frames with
-//!    boxes of untrained labels; keep about `negative_share` frames without objects in training, take a
+//!    boxes of untrained labels; cap the frames with nothing but parked-spot boxes at
+//!    [`PARKED_CAP`] per spot (the same crop again and again would dominate training); keep about
+//!    `negative_share` frames without objects in training, take a
 //!    validation split of `val_share` of the review training frames as whole camera days
 //!    ([`valid`], never a class's last training box), and repeat the review frames
 //!    `oversample` times when public frames are mixed in. Public frames are only ever trained on.
@@ -288,6 +291,9 @@ pub struct Frame {
     pub hard_negative: bool,
     /// `(width, height)` when the source knows it.
     pub size: Option<(u32, u32)>,
+    /// The parked spots of a frame with nothing but parked-spot boxes ([`IgnoreFile::parked`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parked: Vec<String>,
 }
 
 /// A public dataset mixed in (never held out, never oversampled).
@@ -320,6 +326,8 @@ const SPLIT_DIRS: [(&str, SplitHint); 5] = [
 ];
 /// Most frames read from one source.
 pub const MAX_FRAMES: usize = 500_000;
+/// Most frames with nothing but parked-spot boxes kept per spot, for training and validation.
+pub const PARKED_CAP: usize = 20;
 
 /// An image file by extension; hidden files (macOS AppleDouble `._x.jpg`) are not.
 fn is_image(p: &Path) -> bool {
@@ -538,14 +546,20 @@ fn list_file(dir: &Path, names: &[&str]) -> Option<BTreeSet<String>> {
     })
 }
 
-/// The ignore regions of a folder by image file name ([`IGNORE_FILE`]); no file = none (exports
-/// of older versions). A file that cannot be read is an error: going on without it would teach
-/// the objects it lists as background.
-fn read_ignore(dir: &Path) -> Result<BTreeMap<String, Vec<YoloBox>>> {
+/// What a folder's [`IGNORE_FILE`] says, by image file name.
+#[derive(Debug, Default)]
+struct IgnoreRead {
+    regions: BTreeMap<String, Vec<YoloBox>>,
+    parked: BTreeMap<String, Vec<String>>,
+}
+
+/// The [`IgnoreRead`] of a folder; no file = nothing (exports of older versions). A file that
+/// cannot be read is an error: going on without it would teach the objects it lists as background.
+fn read_ignore(dir: &Path) -> Result<IgnoreRead> {
     let p = dir.join(IGNORE_FILE);
     let bytes = match std::fs::read(&p) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(IgnoreRead::default()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
     };
     let file: IgnoreFile = serde_json::from_slice(&bytes).with_context(|| {
@@ -573,11 +587,14 @@ fn read_ignore(dir: &Path) -> Result<BTreeMap<String, Vec<YoloBox>>> {
         w: unit(b.w),
         h: unit(b.h),
     };
-    Ok(file
-        .images
-        .iter()
-        .map(|(name, list)| (name.clone(), list.iter().map(to_box).collect()))
-        .collect())
+    Ok(IgnoreRead {
+        regions: file
+            .images
+            .iter()
+            .map(|(name, list)| (name.clone(), list.iter().map(to_box).collect()))
+            .collect(),
+        parked: file.parked,
+    })
 }
 
 /// Read a review export / YOLO folder (see the module docs).
@@ -662,7 +679,8 @@ pub fn read_export(dir: &Path) -> Result<Source> {
         let n = meta_from_name(&stem(&img));
         frames.push(Frame {
             boxes,
-            ignore: ignore.remove(&name).unwrap_or_default(),
+            ignore: ignore.regions.remove(&name).unwrap_or_default(),
+            parked: ignore.parked.remove(&name).unwrap_or_default(),
             scene: m.scene.or(n.scene),
             camera: m.camera.or(n.camera).unwrap_or_else(|| UNKNOWN.into()),
             day: m.day.or(n.day).unwrap_or_else(|| UNKNOWN.into()),
@@ -738,6 +756,7 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
             image: img,
             boxes,
             ignore: Vec::new(),
+            parked: Vec::new(),
             scene: m.scene,
             camera: m.camera.unwrap_or_else(|| manifest.id.clone()),
             day: m.day.unwrap_or_else(|| UNKNOWN.into()),
@@ -874,6 +893,9 @@ pub struct Stats {
     /// Training frames the balance cap left out ([`Balance::cap_dominant`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub balance_dropped: usize,
+    /// Train / valid frames left out over the cap per parked spot ([`PARKED_CAP`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub parked_capped: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -917,6 +939,28 @@ fn mapped<'a>(
         let name = opts.rename.get(&b.class).unwrap_or(&b.class);
         classes.iter().position(|c| c == name).map(|i| (i, b))
     })
+}
+
+/// The frames of `frames` to leave out so that at most [`PARKED_CAP`] of them stand for each parked
+/// spot, seeded. A frame with several spots stays while one of them has room, and counts for each.
+fn over_parked_cap(frames: Vec<(u64, FrameRef, &[String])>) -> BTreeSet<FrameRef> {
+    let mut frames = frames;
+    frames.sort_by_key(|(rank, r, _)| (*rank, *r));
+    let mut kept: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut over = BTreeSet::new();
+    for (_, r, spots) in frames {
+        let room = spots
+            .iter()
+            .any(|s| kept.get(s.as_str()).copied().unwrap_or(0) < PARKED_CAP);
+        if room {
+            for s in spots {
+                *kept.entry(s).or_default() += 1;
+            }
+        } else {
+            over.insert(r);
+        }
+    }
+    over
 }
 
 /// The stable identity of a frame for the plan's seeded choices: its image path relative to its
@@ -1163,7 +1207,26 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     }
     // 5. Negatives: about `negative_share` of the training pool (a frame whose only boxes are
     // of untrained labels is one, in the background mode).
-    let (pos, mut neg): (Vec<FrameRef>, Vec<FrameRef>) = pool.iter().partition(|&&r| positive(r));
+    let (mut pos, mut neg): (Vec<FrameRef>, Vec<FrameRef>) =
+        pool.iter().partition(|&&r| positive(r));
+    // Before the negatives' target, which follows the positive frames. Held-out frames stay.
+    let over = over_parked_cap(
+        pos.iter()
+            .filter_map(|&r| {
+                let f = frame(r).filter(|f| !f.parked.is_empty())?;
+                Some((rank(opts.seed, &key_of(r)), r, f.parked.as_slice()))
+            })
+            .collect(),
+    );
+    pos.retain(|r| !over.contains(r));
+    p.stats.parked_capped = over.len();
+    if !over.is_empty() {
+        p.warnings.push(format!(
+            "{} training frame(s) with nothing but parked-spot boxes were left out, over the cap \
+             of {PARKED_CAP} per spot: the same crop again and again would dominate training",
+            over.len()
+        ));
+    }
     if pos.is_empty() {
         bail!(
             "no training frame has a box of the classes {:?} (after the held-out split, the \

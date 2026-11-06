@@ -1529,6 +1529,7 @@ fn one_image_source(dir: &Path, n: usize) -> Source {
                     h: 0.2,
                 }],
                 ignore: Vec::new(),
+                parked: Vec::new(),
                 scene: Some("day".into()),
                 camera: "a".into(),
                 day: "2026-10-01".into(),
@@ -1993,4 +1994,136 @@ fn a_confirmed_empty_frame_stays_a_hard_negative() {
         "still trained on as a frame without objects"
     );
     assert_eq!(p.stats.ignore_frames, 1);
+}
+
+/// `n` training frames of camera `a` with only the parked spot `spot`, and `free` frames with a
+/// normal box, over two days so that a day can be held out.
+fn parked_source(dir: &Path, n: usize, free: usize, spots: &[&str]) -> Source {
+    let mut s = one_image_source(dir, n + free);
+    for (i, f) in s.frames.iter_mut().enumerate() {
+        f.image = dir.join(format!("{i}.jpg"));
+        f.day = format!("2026-10-{:02}", i % 2 + 1);
+        f.split = SplitHint::Train;
+        if i < n {
+            f.parked = spots.iter().map(|s| (*s).to_string()).collect();
+        }
+    }
+    s
+}
+
+fn no_negatives() -> Options {
+    Options {
+        negative_share: 0.0,
+        ..Options::default()
+    }
+}
+
+fn parked_kept(s: &Source, p: &Plan) -> usize {
+    p.train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(p.valid.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .iter()
+        .filter(|r| !s.frames[r.1].parked.is_empty())
+        .count()
+}
+
+#[test]
+fn parked_frames_are_capped_per_spot_and_reported() {
+    let t = tmp("parked-cap");
+    let s = parked_source(&t.0, 50, 30, &["a/8x8/car/1,1,5,5"]);
+    let sources = [s];
+    let p = plan(&sources, &no_negatives()).unwrap();
+    assert_eq!(parked_kept(&sources[0], &p), PARKED_CAP);
+    assert_eq!(p.stats.parked_capped, 50 - PARKED_CAP);
+    let warning = p.warnings.iter().find(|w| w.contains("parked-spot boxes"));
+    assert!(
+        warning.is_some_and(|w| w.contains("30 training frame(s)")),
+        "{:?}",
+        p.warnings
+    );
+    // The same choice on every run, another with another seed.
+    let again = plan(&sources, &no_negatives()).unwrap();
+    assert_eq!(p.train, again.train);
+    let seeded = Options {
+        seed: 7,
+        ..no_negatives()
+    };
+    assert_ne!(p.train, plan(&sources, &seeded).unwrap().train);
+}
+
+#[test]
+fn the_cap_counts_each_spot_and_leaves_other_frames_alone() {
+    let t = tmp("parked-spots");
+    // Under the cap nothing goes, and no word is said.
+    let few = [parked_source(&t.0, 20, 10, &["a/8x8/car/1,1,5,5"])];
+    let p = plan(&few, &no_negatives()).unwrap();
+    assert_eq!(p.stats.parked_capped, 0);
+    assert!(!p.warnings.iter().any(|w| w.contains("parked-spot")));
+    // Two spots, half the frames each: each keeps its own 20.
+    let mut two = parked_source(&t.0, 60, 10, &["a/8x8/car/1,1,5,5"]);
+    for f in two.frames.iter_mut().take(30) {
+        f.parked = vec!["a/8x8/car/9,9,15,15".into()];
+    }
+    let two = [two];
+    let p = plan(&two, &no_negatives()).unwrap();
+    assert_eq!(parked_kept(&two[0], &p), 2 * PARKED_CAP);
+    // A frame with both spots stays while one of them has room.
+    let both = [parked_source(
+        &t.0,
+        40,
+        10,
+        &["a/8x8/car/1,1,5,5", "a/8x8/car/9,9,15,15"],
+    )];
+    let p = plan(&both, &no_negatives()).unwrap();
+    assert_eq!(parked_kept(&both[0], &p), PARKED_CAP);
+}
+
+#[test]
+fn a_held_out_parked_frame_is_never_capped() {
+    let t = tmp("parked-held");
+    let mut s = parked_source(&t.0, 40, 30, &["a/8x8/car/1,1,5,5"]);
+    for f in s.frames.iter_mut().take(10) {
+        f.split = SplitHint::Heldout;
+    }
+    let p = plan(&[s], &no_negatives()).unwrap();
+    assert_eq!(p.heldout.len(), 10);
+    assert_eq!(p.stats.parked_capped, 10, "30 parked frames in the pool");
+}
+
+/// From a label file to the plan: the export names the frames, the reader passes them on.
+#[test]
+fn the_export_names_frames_with_only_parked_boxes() {
+    use crate::collect::labels::export::{IGNORE_FILE, IGNORE_VERSION, IgnoreFile};
+    let t = tmp("parked-read");
+    let dir = &t.0;
+    let tags: &[&str] = &["day"];
+    flat_export(
+        dir,
+        &["person"],
+        &[("a.jpg", "0 0.5 0.5 0.2 0.2\n", tags), ("b.jpg", "", tags)],
+    );
+    let file = IgnoreFile {
+        version: IGNORE_VERSION,
+        images: BTreeMap::new(),
+        parked: [(
+            "a.jpg".to_string(),
+            vec!["cam/8x8/person/1,1,5,5".to_string()],
+        )]
+        .into(),
+    };
+    std::fs::write(dir.join(IGNORE_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
+    let s = read_export(dir).unwrap();
+    let parked: Vec<usize> = s.frames.iter().map(|f| f.parked.len()).collect();
+    assert_eq!(parked.iter().sum::<usize>(), 1, "{parked:?}");
+    // A file of an older version has no such list.
+    std::fs::write(dir.join(IGNORE_FILE), r#"{"version": 1, "images": {}}"#).unwrap();
+    assert!(
+        read_export(dir)
+            .unwrap()
+            .frames
+            .iter()
+            .all(|f| f.parked.is_empty())
+    );
 }
