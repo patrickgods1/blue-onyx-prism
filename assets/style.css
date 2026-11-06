@@ -427,6 +427,33 @@ ul.train-counts strong { font-variant-numeric: tabular-nums; }
 .train-next { margin: 0; }
 .train-next-k { color: var(--muted); }
 .train-next a { white-space: nowrap; margin-left: 0.3rem; }
+nav.train-tabs .tab-count { display: inline-block; margin-left: 0.2em; min-width: 1.3em; padding: 0 0.3em; border-radius: 1em; background: var(--accent); color: var(--accent-fg); font-size: 0.75rem; font-weight: 600; line-height: 1.4; text-align: center; }
+nav.train-tabs .tab-count[hidden] { display: none; }
+/* Jobs tab: one row each, the whole row links to the job on its tab. */
+.train-next[hidden] { display: none; }
+.train-jobs { margin: 0.5rem 0 0; }
+.train-jobs[hidden] { display: none; }
+a.tj { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.25rem 0.7rem; align-items: center; padding: 0.6rem 0.8rem; margin-bottom: 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); text-decoration: none; }
+a.tj:hover { border-color: var(--accent); text-decoration: none; }
+.tj-head { display: flex; align-items: baseline; gap: 0.5rem; min-width: 0; }
+.tj-kind { font-weight: 600; white-space: nowrap; }
+.tj-title { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tj-state { padding: 0 0.5rem; border-radius: 1em; background: var(--ok-bg); color: var(--ok-fg); font-size: 0.8rem; font-weight: 600; }
+a.tj[data-state="paused"] .tj-state { background: var(--warn-bg); color: var(--warn-fg); }
+a.tj[data-state="queued"] .tj-state { background: var(--code-bg); color: var(--muted); }
+.tj-open { color: var(--accent); white-space: nowrap; }
+.tj-meter { grid-column: 1 / -1; display: flex; align-items: center; gap: 0.6rem; }
+.tj-meter progress { flex: 1; width: auto; max-width: none; }
+.tj-pct { min-width: 2.6em; text-align: right; font-variant-numeric: tabular-nums; }
+a.tj[data-state="queued"] .tj-meter { display: none; }
+.tj-time { grid-column: 1 / -1; font-weight: 600; }
+.tj-time::first-letter { text-transform: uppercase; }
+.tj-step { grid-column: 1 / -1; color: var(--muted); font-size: 0.88rem; overflow-wrap: anywhere; }
+.tj-step[hidden] { display: none; }
+@media (max-width: 700px) {
+  .tj-head { flex-wrap: wrap; gap: 0 0.5rem; }
+  .tj-title { flex-basis: 100%; }
+}
 
 /* Tab strip: the sticky nav.toc look; one panel at a time with JavaScript, all stacked without. */
 nav.tabs { gap: 0; padding: 0 0.4rem; }

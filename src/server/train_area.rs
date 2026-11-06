@@ -1,5 +1,5 @@
-//! The Train area: one top-nav entry with seven tabs at their own URLs (Collect, Import,
-//! Auto-label, Review, Dataset, Train, Models). This file holds what the tabs share: the tab list,
+//! The Train area: one top-nav entry with eight tabs at their own URLs (Collect, Import,
+//! Auto-label, Review, Dataset, Train, Models, Jobs). This file holds what the tabs share: the tab list,
 //! `GET /train` (the most useful tab), the redirects of the old `/dataset`, `/review` and
 //! `/training` pages, `GET /v1/train/summary` (the counts of the status strip and the one suggested
 //! next action) with the pure rule [`next_step`], and the Dataset tab. The other tabs render in
@@ -33,9 +33,10 @@ pub(super) const REVIEW: &str = "review";
 pub(super) const DATASET: &str = "dataset";
 pub(super) const TRAIN: &str = "train";
 pub(super) const MODELS: &str = "models";
+pub(super) const JOBS: &str = "jobs";
 
 /// The tabs in nav order: id, title.
-pub(super) const TABS: [(&str, &str); 7] = [
+pub(super) const TABS: [(&str, &str); 8] = [
     (COLLECT, "Collect"),
     (IMPORT, "Import"),
     (AUTOLABEL, "Auto-label"),
@@ -43,6 +44,7 @@ pub(super) const TABS: [(&str, &str); 7] = [
     (DATASET, "Dataset"),
     (TRAIN, "Train"),
     (MODELS, "Models"),
+    (JOBS, "Jobs"),
 ];
 
 /// The tab the Jobs card's forms came from (their hidden `tab` field), so their answer lands
@@ -466,6 +468,14 @@ pub(super) fn export_row(dir: &Path) -> ExportRow {
     }
 }
 
+/// The tab with the jobs of `kind`.
+pub(super) const fn task_tab(kind: TaskKind) -> &'static str {
+    match kind {
+        TaskKind::Import => IMPORT,
+        TaskKind::Autolabel | TaskKind::Overlaps => AUTOLABEL,
+    }
+}
+
 /// The job the strip names: a running one, else the first queued; training runs before the rest.
 fn current_job(runs: &[RunRecord], tasks: &[crate::training::task::TaskRecord]) -> Option<Job> {
     let run = |s: RunState| {
@@ -482,10 +492,7 @@ fn current_job(runs: &[RunRecord], tasks: &[crate::training::task::TaskRecord]) 
                 TaskKind::Autolabel => "An auto-label run",
                 TaskKind::Overlaps => "An overlap check",
             },
-            tab: match t.kind {
-                TaskKind::Import => IMPORT,
-                TaskKind::Autolabel | TaskKind::Overlaps => AUTOLABEL,
-            },
+            tab: task_tab(t.kind),
             paused: s == RunState::Paused,
         })
     };
@@ -1035,7 +1042,7 @@ mod tests {
     }
 
     /// The tabs' URLs as a server sees them.
-    const PAGES: [(&str, &str); 7] = [
+    const PAGES: [(&str, &str); 8] = [
         ("/train/collect", "collect"),
         ("/train/import", "import"),
         ("/train/autolabel", "autolabel"),
@@ -1043,6 +1050,7 @@ mod tests {
         ("/train/dataset", "dataset"),
         ("/train/train", "train"),
         ("/train/models", "models"),
+        ("/train/jobs", "jobs"),
     ];
 
     /// A folder of its own for a test (under the system's temp folder).
@@ -1115,6 +1123,33 @@ mod tests {
         assert_eq!(v["summary"]["frames_to_review"], 0);
         assert_eq!(v["next"]["key"], "start_collecting");
         assert_eq!(v["next"]["link"], "/train/collect");
+    }
+
+    #[tokio::test]
+    async fn the_jobs_route_answers_with_no_queue_yet() {
+        let dir = scratch();
+        let state = state_in(&dir);
+        let (s, body) = get_text(&state, "/v1/train/jobs").await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["success"], true);
+        assert!(v["jobs"]["active"].is_array(), "{v}");
+        assert!(v["jobs"]["queued"].is_array(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn the_jobs_tab_says_when_nothing_runs_and_every_tab_links_to_it() {
+        let dir = scratch();
+        let state = state_in(&dir);
+        let (s, html) = get_text(&state, "/train/jobs").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(html.contains(r#"id="train-jobs-empty""#), "{html}");
+        assert!(html.contains(r#"id="train-jobs""#), "{html}");
+        for (url, _) in PAGES {
+            let (_, page) = get_text(&state, url).await;
+            assert!(page.contains(r#"<a href="/train/jobs""#), "{url}");
+            assert!(page.contains(r#"id="train-jobs-count""#), "{url}");
+        }
     }
 
     #[tokio::test]

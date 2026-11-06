@@ -391,6 +391,16 @@ pub struct Best {
     pub value: f64,
 }
 
+/// A best epoch's metric as the status lines name it.
+fn best_label(id: &str) -> &str {
+    match id {
+        "map" => "mAP50-95",
+        "map50" => "mAP50",
+        "val_loss" => "val loss",
+        other => metric(other).map_or(other, |m| m.short),
+    }
+}
+
 /// The primary metrics, in order of preference, with "larger is better".
 const PRIMARY: [(&str, bool); 3] = [("map", true), ("map50", true), ("val_loss", false)];
 
@@ -1119,6 +1129,47 @@ impl TrainProgress {
         }
     }
 
+    /// One short line for the Jobs tab: `epoch 12 of 50, best mAP50-95 0.402 at epoch 9`. None
+    /// before the epochs are known.
+    pub fn brief(&self) -> Option<String> {
+        if self.phase.is_some() {
+            return Some("exporting the trained model".to_string());
+        }
+        if let Some(t) = self.stop_text() {
+            return Some(t);
+        }
+        if self.epochs == 0 {
+            return None;
+        }
+        let mut s = format!("epoch {} of {}", self.epoch.max(1), self.epochs);
+        if let Some(b) = &self.best {
+            let label = best_label(&b.metric);
+            s.push_str(&format!(
+                ", best {label} {:.3} at epoch {}",
+                b.value, b.epoch
+            ));
+        }
+        Some(s)
+    }
+
+    /// Seconds of training left, least to most: the run stopping at [`Self::stop_epoch`] (nothing
+    /// improves from now on) and the run reaching the epoch cap. `paused_s` of the elapsed time
+    /// did no work, so it is the training stage's pauses only. None before the first batch and once the epochs are over.
+    pub fn time_left(&self, paused_s: f64) -> Option<(f64, f64)> {
+        let f = self.fraction();
+        if self.phase.is_some() || f <= 0.0 || f >= 1.0 {
+            return None;
+        }
+        let epochs = f64::from(self.epochs);
+        let done = f * epochs;
+        let per_epoch = (self.elapsed_s - paused_s).max(0.0) / done;
+        let cap = (epochs - done) * per_epoch;
+        let stop = self
+            .stop_epoch
+            .map_or(cap, |e| (f64::from(e) - done).max(0.0) * per_epoch);
+        Some((stop.min(cap), cap))
+    }
+
     /// Share of the training done, 0..1: finished epochs plus the share of the current one.
     pub fn fraction(&self) -> f64 {
         if self.stopped.is_some() {
@@ -1178,12 +1229,7 @@ impl TrainProgress {
             s.push_str(&format!(", val mAP50 {m:.3}"));
         }
         if let Some(b) = &self.best {
-            let label = match b.metric.as_str() {
-                "map" => "mAP50-95",
-                "map50" => "mAP50",
-                "val_loss" => "val loss",
-                other => metric(other).map_or(other, |m| m.short),
-            };
+            let label = best_label(&b.metric);
             s.push_str(&format!(
                 ", best {label} {:.3} @ epoch {}",
                 b.value, b.epoch
@@ -1280,6 +1326,63 @@ mod tests {
         assert_eq!(parse_line("Epoch 1/3 loss 2"), None);
         assert_eq!(parse_line(r#"@train {"event":"telemetry"}"#), None);
         assert_eq!(parse_line("@train {broken"), None);
+    }
+
+    #[test]
+    fn the_brief_line_keeps_only_the_epoch_and_the_best() {
+        let mut p = TrainProgress::default();
+        assert_eq!(p.brief(), None);
+        p.epoch = 12;
+        p.epochs = 50;
+        p.batch = 310;
+        p.batches = 1204;
+        p.loss = Some(0.42);
+        assert_eq!(p.brief().unwrap(), "epoch 12 of 50");
+        p.best = Some(Best {
+            metric: "map".into(),
+            epoch: 9,
+            value: 0.4021,
+        });
+        assert_eq!(
+            p.brief().unwrap(),
+            "epoch 12 of 50, best mAP50-95 0.402 at epoch 9"
+        );
+        p.phase = Some("export".into());
+        assert_eq!(p.brief().unwrap(), "exporting the trained model");
+    }
+
+    #[test]
+    fn time_left_runs_from_the_early_stop_to_the_epoch_cap_without_the_paused_time() {
+        let p = TrainProgress {
+            epoch: 11,
+            epochs: 50,
+            elapsed_s: 1100.0,
+            stop_epoch: Some(20),
+            ..TrainProgress::default()
+        };
+        // 10 finished epochs, 110 s each.
+        assert_eq!(p.time_left(0.0), Some((1100.0, 4400.0)));
+        // 500 s of it were paused: 60 s per epoch.
+        assert_eq!(p.time_left(500.0), Some((600.0, 2400.0)));
+        // No early stop: one answer.
+        let off = TrainProgress {
+            stop_epoch: None,
+            ..p.clone()
+        };
+        assert_eq!(off.time_left(0.0), Some((4400.0, 4400.0)));
+        // Past the rule's epoch: the run can stop now.
+        let past = TrainProgress {
+            stop_epoch: Some(5),
+            ..p.clone()
+        };
+        assert_eq!(past.time_left(0.0), Some((0.0, 4400.0)));
+        // Nothing to measure yet, and nothing left once exporting.
+        assert_eq!(TrainProgress::default().time_left(0.0), None);
+        let export = TrainProgress {
+            phase: Some("export".into()),
+            ..p
+        };
+        assert_eq!(export.time_left(0.0), None);
     }
 
     #[test]

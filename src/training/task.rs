@@ -52,12 +52,13 @@ impl std::fmt::Debug for TaskContext<'_> {
 /// What a task reports while it runs.
 #[derive(Debug)]
 pub enum TaskReport<'a> {
-    /// Stage `step` of `steps` (1-based), `percent` of the whole task.
+    /// Stage `step` of `steps` (1-based), `percent` of the whole task, `step_percent` of the stage.
     Stage {
         stage: &'a str,
         step: usize,
         steps: usize,
         percent: u8,
+        step_percent: u8,
         detail: &'a str,
     },
     Line(&'a str),

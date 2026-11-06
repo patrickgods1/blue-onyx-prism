@@ -87,6 +87,11 @@ pub(super) fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> 
     }
 }
 
+/// The clock of job `id` ([`TrainingService::timing`]).
+pub(super) fn job_timing(id: &str) -> Option<crate::training::eta::JobTiming> {
+    SERVICE.get()?.timing(id)
+}
+
 /// The queue if it was started (the page shows `runs.json` otherwise).
 pub(super) fn runs(state: &AppState) -> Vec<RunRecord> {
     match SERVICE.get() {
@@ -2981,7 +2986,7 @@ pub(super) async fn remove_env(State(state): State<Arc<AppState>>) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::backend::detect::{HardwareInfo, apple_gpu};
     use crate::config::Config;
@@ -4242,7 +4247,7 @@ mod tests {
     }
 
     /// A run record of comparison `group` (benchmarked with day / night / IR AP when `ap`).
-    fn record(
+    pub(in crate::server) fn record(
         id: &str,
         scene: SceneFilter,
         group: Option<&str>,
