@@ -33,6 +33,9 @@ install -m 0755 "$BIN_DIR/blue-onyx-prism" "$BIN_DIR/blue-onyx-prism-benchmark" 
 install -m 0644 "$REPO/LICENSE" "$REPO/THIRD_PARTY_LICENSES.md" "$REPO/README.md" "$PROG/"
 install -m 0755 "$REPO/scripts/uninstall_launchd.sh" "$PROG/scripts/"
 install -m 0644 "$REPO/scripts/launchd_common.sh" "$PROG/scripts/"
+# By-hand training where the service cannot train (capability::BY_HAND in src/training).
+install -m 0644 "$REPO/scripts/train_model.py" "$REPO/scripts/export_model.py" "$REPO/scripts/autolabel.py" \
+  "$REPO/scripts/requirements-model-train.txt" "$PROG/scripts/"
 # The plist already names the default paths (/usr/local/blue-onyx-prism, the data root, the log
 # dir): install_launchd.sh only substitutes a custom install dir, which the pkg never has.
 install -m 0644 "$REPO/deploy/com.blueonyx.prism.plist" "$ROOT/Library/LaunchDaemons/"

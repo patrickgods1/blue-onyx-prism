@@ -8,19 +8,31 @@
 {% if let Some(d) = disabled %}
 <div class="card">
   <p class="error">Collection stopped: {{ d }}</p>
-  <form method="post" action="/dataset/resume" class="inline"><button type="submit">Resume</button> <span class="muted">after freeing space or lowering the size cap</span></form>
+  <form method="post" action="/dataset/resume" class="inline"><button type="submit">Resume</button> <span class="muted">Collection also starts again by itself within a minute once enough space is free.</span></form>
 </div>
 {% endif %}
 
 <div class="card">
   <h2>Status</h2>
+  {% if let Some(n) = health.note %}<p class="warn">{{ n }}</p>{% endif %}
   <div class="facts">
     <div><span class="k">Collection</span> {% if enabled %}on{% else %}off{% endif %}</div>
     <div><span class="k">Folder</span> <code>{{ dir }}</code></div>
     <div><span class="k">Frames</span> {{ frames }}</div>
-    <div><span class="k">Disk used</span> {{ used_mb }} MB of {{ max_gb }} GB</div>
+    <div><span class="k">Disk used</span> {{ disk_line }}</div>
     <div><span class="k">Review queue</span> {{ queued }} frame(s)</div>
+    <div><span class="k">Requests seen</span> {{ health.counts.requests_seen }} since this service started</div>
+    <div><span class="k">Frames saved</span> {{ health.counts.frames_saved }} since this service started</div>
+    <div><span class="k">Last frame</span> {% if let Some(t) = health.last_frame_at %}{{ t }}{% else %}none yet{% endif %}</div>
+    <div><span class="k">Last error</span> {% if let Some(e) = health.last_error %}<span class="error">{{ e }}</span>{% if let Some(t) = health.last_error_at %} <span class="muted">({{ t }})</span>{% endif %}{% else %}none{% endif %}</div>
   </div>
+  {% if drops.is_empty() %}<p class="muted">No frames dropped since this service started.</p>{% else %}
+  <h3>Frames not saved since this service started</h3>
+  <ul>
+    {% for d in drops %}<li>{{ d.plain }}: {{ d.count }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if health.counts.no_bucket > 0 %}<p class="muted">{{ health.counts.no_bucket }} image(s) matched no bucket that is turned on.</p>{% endif %}
 </div>
 
 <div class="card">

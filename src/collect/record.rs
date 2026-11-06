@@ -39,6 +39,14 @@ impl Bucket {
         Bucket::Disagreement,
     ];
 
+    /// A frame kept for this bucket is saved even when it looks like a recent frame of its camera:
+    /// these frames matter for a box or a score, and a distant person changes only a few of the 64
+    /// dHash bits. `positive` and `empty` keep the dedup window. Limit:
+    /// [`super::store::DEDUP_SKIPS_PER_CAMERA`].
+    pub fn skips_dedup(self) -> bool {
+        !matches!(self, Bucket::Positive | Bucket::Empty)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Bucket::Positive => "positive",

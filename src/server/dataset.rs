@@ -8,6 +8,7 @@
 //! folder field's Browse... button).
 
 use super::{AppState, blocking, encode_uri_component, render, save_config};
+use crate::collect::health::{Counts, DropCount, Health};
 use crate::collect::layout::{self, REVIEW_QUEUE_FILE, SCENES};
 use crate::collect::{Bucket, CollectConfig, CollectSettings, Status};
 use askama::Template;
@@ -192,12 +193,16 @@ struct DatasetTemplate {
     dir: String,
     dir_setting: String,
     frames: u64,
-    used_mb: String,
     max_gb: String,
     max_age_days: u32,
     dedup_hamming: u32,
     near_margin: String,
     disabled: Option<String>,
+    /// The folder's size and what the cap covers, in one sentence.
+    disk_line: String,
+    health: Health,
+    /// Reasons frames were not saved, those that happened.
+    drops: Vec<DropCount>,
     queued: usize,
     bucket_names: Vec<&'static str>,
     buckets: Vec<BucketRow>,
@@ -213,15 +218,36 @@ fn clean(x: f32) -> String {
     crate::config::clean_f32(x).to_string()
 }
 
+/// The Status card's disk line: the total, what counts toward the cap, and the protected data.
+fn disk_line(s: &Status, max_gb: f32) -> String {
+    let mb = |b: u64| format!("{:.1} MB", b as f64 / MB);
+    let cap = clean(max_gb);
+    let used = mb(s.summary.bytes);
+    if s.usage.protected_frames == 0 {
+        return format!("{used} of {cap} GB");
+    }
+    let protected = s.usage.protected_frames;
+    let unit = if protected == 1 { "frame" } else { "frames" };
+    format!(
+        "{used} in all: {} toward the {cap} GB limit, and {} of protected data, reviewed or waiting for review ({protected} \
+         {unit}), which is never deleted automatically and does not count toward the limit",
+        mb(s.usage.prunable_bytes),
+        mb(s.usage.protected_bytes),
+    )
+}
+
 /// The page for the config as it is now (call off the async runtime: it may scan the folder).
 fn view(state: &AppState, message: Option<String>, error: Option<String>) -> DatasetTemplate {
     let (c, settings) = {
         let cfg = state.config_read();
         (cfg.collect.clone(), CollectSettings::for_config(&cfg))
     };
+    let status = crate::collect::global().status_of(&settings.dir);
+    let health = Health::of(c.enabled, &status, Counts::now());
+    let disk_line = disk_line(&status, c.max_gb);
     let Status {
         summary, disabled, ..
-    } = crate::collect::global().status_of(&settings.dir);
+    } = status;
     let buckets = Bucket::ALL
         .into_iter()
         .map(|b| {
@@ -297,12 +323,20 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
             .map(|d| d.display().to_string())
             .unwrap_or_default(),
         frames: summary.frames,
-        used_mb: format!("{:.1}", summary.bytes as f64 / MB),
         max_gb: clean(c.max_gb),
         max_age_days: c.max_age_days,
         dedup_hamming: c.dedup_hamming,
         near_margin: clean(c.buckets.near_margin()),
         disabled,
+        disk_line,
+        drops: health
+            .counts
+            .dropped
+            .iter()
+            .filter(|d| d.count > 0)
+            .cloned()
+            .collect(),
+        health,
         queued: layout::read_review(&settings.dir.join(REVIEW_QUEUE_FILE)).len(),
         imports: {
             let mut v = crate::training::import::write::read_imports(&settings.dir);
@@ -381,12 +415,19 @@ pub(super) async fn review(
 /// `POST /dataset/resume`: re-arm the collector after a disk stop.
 pub(super) async fn resume(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
-        crate::collect::global().resume();
-        render(&view(
-            &state,
-            Some("Collection resumed; it stops again if free space is still low.".into()),
-            None,
-        ))
+        if crate::collect::global().resume() {
+            render(&view(
+                &state,
+                Some("Collection resumed; it stops again if free space is still low.".into()),
+                None,
+            ))
+        } else {
+            render(&view(
+                &state,
+                None,
+                Some("Not resumed: the collector is busy. Press Resume again in a moment.".into()),
+            ))
+        }
     })
     .await
 }
@@ -467,7 +508,8 @@ pub(super) async fn sidecar(
     serve(state, query.ok().map(|Query(q)| q), "json").await
 }
 
-/// `GET /v1/dataset`: the settings, the summary and the disk stop reason.
+/// `GET /v1/dataset`: the settings, the summary, the disk stop reason, how much is protected
+/// (`usage`) and whether collection works (`collection`, [`Health`]).
 pub(super) async fn json(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
         let (c, settings) = {
@@ -476,6 +518,7 @@ pub(super) async fn json(State(state): State<Arc<AppState>>) -> Response {
         };
         let s = crate::collect::global().status_of(&settings.dir);
         let queued = layout::read_review(&settings.dir.join(REVIEW_QUEUE_FILE)).len();
+        let health = Health::of(c.enabled, &s, Counts::now());
         Json(serde_json::json!({
             "success": true,
             "enabled": c.enabled,
@@ -484,6 +527,8 @@ pub(super) async fn json(State(state): State<Arc<AppState>>) -> Response {
             "disabled": s.disabled,
             "review_queue": queued,
             "summary": s.summary,
+            "usage": s.usage,
+            "collection": health,
         }))
         .into_response()
     })
@@ -505,6 +550,62 @@ mod tests {
         assert_eq!(f[1].1, "b c");
         assert_eq!(f[3].1, "%zz");
         assert_eq!(f[4], ("k".into(), String::new()));
+    }
+
+    #[test]
+    fn the_disk_line_says_how_much_is_protected() {
+        let mut s = Status::default();
+        s.summary.bytes = 3 * 1024 * 1024;
+        assert_eq!(disk_line(&s, 5.0), "3.0 MB of 5 GB");
+        s.usage = crate::retention::DatasetUsage {
+            prunable_bytes: 1024 * 1024,
+            protected_bytes: 2 * 1024 * 1024,
+            protected_frames: 7,
+        };
+        let l = disk_line(&s, 5.0);
+        assert!(
+            l.starts_with("3.0 MB in all: 1.0 MB toward the 5 GB limit"),
+            "{l}"
+        );
+        assert!(
+            l.contains("2.0 MB of protected data, reviewed or waiting for review (7 frames)"),
+            "{l}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_and_the_json_report_how_collection_is_doing() {
+        let (state, dir) = collecting_state(None);
+        let (_, body) = get_text(&state, "/dataset").await;
+        for want in ["Requests seen", "Frames saved", "Last frame", "Last error"] {
+            assert!(body.contains(want), "{want}");
+        }
+        let (_, _, bytes) = call(
+            &state,
+            Request::get("/v1/dataset").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let h = &v["collection"];
+        assert!(h["requests_seen"].is_u64() && h["frames_saved"].is_u64());
+        assert_eq!(h["dropped"].as_array().unwrap().len(), 5);
+        assert!(h["dropped"][0]["plain"].is_string());
+        assert!(h.get("last_frame_at").is_some() && h.get("last_error_at").is_some());
+        assert_eq!(v["usage"]["protected_frames"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn home_says_whether_it_collects_and_links_the_dataset() {
+        let (state, dir) = dataset_state();
+        put_frame(&dir, "ir/cam/2026-10-22", "20261022T010203004Z_a");
+        let (_, body) = get_text(&state, "/").await;
+        assert!(body.contains("not collecting, 1 frame so far"), "{body}");
+        assert!(body.contains("href=\"/dataset\""));
+        let (state, _) = collecting_state(Some(dir.clone()));
+        let (_, body) = get_text(&state, "/").await;
+        assert!(body.contains(">collecting, 1 frame so far"), "{body}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -531,6 +632,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bop-ds-{}", uuid::Uuid::new_v4()));
         let d = dir.clone();
         let state = test_state_with(move |c| {
+            c.collect.dir = Some(d);
+        });
+        (state, dir)
+    }
+
+    /// [`dataset_state`] with collection on, on `dir` or a new folder.
+    fn collecting_state(dir: Option<std::path::PathBuf>) -> (Arc<AppState>, std::path::PathBuf) {
+        let dir = dir.unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("bop-ds-{}", uuid::Uuid::new_v4()))
+        });
+        let d = dir.clone();
+        let state = test_state_with(move |c| {
+            c.collect.enabled = true;
             c.collect.dir = Some(d);
         });
         (state, dir)

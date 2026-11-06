@@ -1,6 +1,8 @@
-//! Process-wide dataset collector counters (`dataset_frames_total{bucket}`,
+//! Process-wide dataset collector counters (`dataset_requests_total`, `dataset_offered_total`,
+//! `dataset_saved_total`, `dataset_no_bucket_total`, `dataset_frames_total{bucket}`,
 //! `dataset_dropped_total{reason}`, `dataset_bytes`, `dataset_collect_disabled`) and their
-//! Prometheus rendering, called from [`crate::metrics::render_prometheus`].
+//! Prometheus rendering, called from [`crate::metrics::render_prometheus`]. They count since this
+//! process started; the Dataset page reads them through [`super::health`].
 
 use super::Bucket;
 use std::fmt::Write;
@@ -39,11 +41,30 @@ impl Dropped {
             Dropped::Error => "error",
         }
     }
+
+    /// The reason in plain words, for the Dataset page and `GET /v1/dataset`.
+    pub fn plain(self) -> &'static str {
+        match self {
+            Dropped::QueueFull => "Images came in faster than the disk could save them",
+            Dropped::Rate => "Held back by a bucket's rate or minimum interval",
+            Dropped::Dup => "Looked like a frame of the same camera saved shortly before",
+            Dropped::Disk => "Collection was stopped for low disk space",
+            Dropped::Error => "Could not be read or written",
+        }
+    }
 }
 
 /// The counters.
 #[derive(Debug)]
 pub struct DatasetMetrics {
+    /// Detection requests the HTTP layer took in, collection on or off (no Test page uploads).
+    requests: AtomicU64,
+    /// Finished frames handed to the collector.
+    offered: AtomicU64,
+    /// Frames saved (once each, unlike `frames`, which counts per bucket).
+    saved: AtomicU64,
+    /// Frames that matched no enabled bucket (no drop: nothing wanted them).
+    no_bucket: AtomicU64,
     frames: [AtomicU64; Bucket::ALL.len()],
     dropped: [AtomicU64; Dropped::ALL.len()],
     bytes: AtomicU64,
@@ -53,6 +74,10 @@ pub struct DatasetMetrics {
 impl DatasetMetrics {
     const fn new() -> Self {
         Self {
+            requests: AtomicU64::new(0),
+            offered: AtomicU64::new(0),
+            saved: AtomicU64::new(0),
+            no_bucket: AtomicU64::new(0),
             frames: [const { AtomicU64::new(0) }; Bucket::ALL.len()],
             dropped: [const { AtomicU64::new(0) }; Dropped::ALL.len()],
             bytes: AtomicU64::new(0),
@@ -60,7 +85,37 @@ impl DatasetMetrics {
         }
     }
 
+    pub fn record_request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    pub fn record_offered(&self) {
+        self.offered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn offered(&self) -> u64 {
+        self.offered.load(Ordering::Relaxed)
+    }
+
+    pub fn record_no_bucket(&self) {
+        self.no_bucket.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn no_bucket(&self) -> u64 {
+        self.no_bucket.load(Ordering::Relaxed)
+    }
+
+    pub fn saved(&self) -> u64 {
+        self.saved.load(Ordering::Relaxed)
+    }
+
+    /// One saved frame, kept for `buckets`.
     pub fn record_frame(&self, buckets: &[Bucket]) {
+        self.saved.fetch_add(1, Ordering::Relaxed);
         for b in buckets {
             if let Some(c) = self.frames.get(*b as usize) {
                 c.fetch_add(1, Ordering::Relaxed);
@@ -109,6 +164,29 @@ pub static METRICS: DatasetMetrics = DatasetMetrics::new();
 /// Append the dataset series to a Prometheus text exposition (`prefix` = the metric prefix).
 pub fn render_prometheus(out: &mut String, prefix: &str) {
     let m = &METRICS;
+    let counters = [
+        (
+            "requests",
+            "Detection requests received since the service started (test page uploads excluded).",
+            m.requests(),
+        ),
+        (
+            "offered",
+            "Answered requests handed to the dataset collector.",
+            m.offered(),
+        ),
+        ("saved", "Frames the dataset collector saved.", m.saved()),
+        (
+            "no_bucket",
+            "Frames the dataset collector skipped because they matched no enabled bucket.",
+            m.no_bucket(),
+        ),
+    ];
+    for (name, help, value) in counters {
+        let _ = writeln!(out, "# HELP {prefix}dataset_{name}_total {help}");
+        let _ = writeln!(out, "# TYPE {prefix}dataset_{name}_total counter");
+        let _ = writeln!(out, "{prefix}dataset_{name}_total {value}");
+    }
     let _ = writeln!(
         out,
         "# HELP {prefix}dataset_frames_total Frames saved by the dataset collector, by bucket (a frame counts once in each bucket it was kept for)."

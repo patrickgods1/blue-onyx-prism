@@ -359,6 +359,33 @@ impl LabelBox {
         self.state == BoxState::Rejected && bulk::is_dismissal(self.reason.as_deref())
     }
 
+    /// The box shows a person's hand on an unreviewed frame: drawn, moved, relabelled, marked
+    /// unsure, or accepted or rejected by anything but a machine rule (a labelers run's dismissal
+    /// or parked-spot accept, a bulk reject by score, class or as a stacked duplicate). A spot edit
+    /// counts: the reviewer chose that spot.
+    fn has_human_decision(&self) -> bool {
+        if self.source == Source::Human
+            || self.orig_bbox.is_some()
+            || self.difficult
+            || (self.source == Source::Model && self.model_label.is_some())
+        {
+            return true;
+        }
+        match self.state {
+            BoxState::Pending => false,
+            BoxState::Added => true,
+            BoxState::Accepted => self.reason.as_deref() != Some(spots::PARKED_REASON),
+            BoxState::Rejected => {
+                !self.is_dismissed()
+                    && self.reject_reason != Some(RejectReason::Duplicate)
+                    && !matches!(
+                        self.reason.as_deref(),
+                        Some(bulk::LOW_SCORE_REASON | bulk::OTHER_CLASS_REASON)
+                    )
+            }
+        }
+    }
+
     /// A reviewer's verdict on an [`AutoInfo::audit`] box: `Some(true)` real, `Some(false)` not,
     /// None while undecided or when the decision is no verdict on the box: a bulk reject by score
     /// or class, a duplicate (another box stays on the object), too small (real, but no label).
@@ -490,6 +517,28 @@ pub struct LabelFile {
 
 fn labels_version() -> u32 {
     LABELS_VERSION
+}
+
+impl LabelFile {
+    /// Boxes wait for a reviewer, so retention keeps the frame: an auto-label run takes hours, and
+    /// pruning its results before anyone saw them costs more than a folder over its cap (the disk
+    /// guard still protects the volume). A file with nothing left to look at ages out.
+    pub fn awaits_review(&self) -> bool {
+        self.status == Status::Unreviewed && self.boxes.iter().any(|b| b.state == BoxState::Pending)
+    }
+
+    /// A person's work is on this file, so retention keeps the frame: it is reviewed or skipped, it
+    /// was reviewed before a re-label sent it back, the reviewer confirmed it empty or checked its
+    /// overlaps, or a box carries a reviewer's decision ([`LabelBox::has_human_decision`]). What an
+    /// auto-label run alone writes (its `auto_run` marker, pending boxes, its dismissals) is not.
+    pub fn has_human_decision(&self) -> bool {
+        self.status != Status::Unreviewed
+            || self.reviewed_at.is_some()
+            || self.empty_confirmed
+            || self.overlaps_checked
+            || self.checked_before_reopen
+            || self.boxes.iter().any(LabelBox::has_human_decision)
+    }
 }
 
 impl Default for LabelFile {
@@ -1236,6 +1285,37 @@ pub fn write_checked(path: &Path, f: &LabelFile, expected: &str) -> Result<Resul
     write_locked(path, f).map(Ok)
 }
 
+/// The label file of the frame image `jpg` (`<stem>.jpg` -> `<stem>.labels.json`).
+pub fn path_of_frame(jpg: &Path) -> PathBuf {
+    jpg.with_extension(LABELS_SUFFIX.trim_start_matches('.'))
+}
+
+/// True when retention must keep the frame of the label file at `path`: it holds a human decision
+/// ([`LabelFile::has_human_decision`]), boxes await a reviewer ([`LabelFile::awaits_review`]), or it
+/// cannot be read (it may hold either).
+pub fn is_protected(path: &Path) -> bool {
+    match read(path) {
+        Ok(None) => false,
+        Ok(Some(f)) => f.has_human_decision() || f.awaits_review(),
+        Err(e) => {
+            tracing::debug!("retention: keeping the frame of an unreadable label file: {e:#}");
+            true
+        }
+    }
+}
+
+/// Run `delete` under the write lock unless the label file at `path` is protected
+/// ([`is_protected`]; None then), so a save cannot land between the check and the delete.
+pub fn unless_protected<T>(path: &Path, delete: impl FnOnce() -> T) -> Option<T> {
+    let _held = write_lock();
+    if is_protected(path) {
+        return None;
+    }
+    let out = delete();
+    repeats::written(path);
+    Some(out)
+}
+
 /// Every label file under `dir` with its frame (`<scene>/<camera>/<date>/<stem>.jpg`), in day
 /// folder order then by name. Files whose frame image is gone are left out.
 pub fn label_files(dir: &Path) -> Vec<(String, PathBuf)> {
@@ -1743,6 +1823,32 @@ mod tests {
         f.boxes[0].state = BoxState::Accepted;
         let n = normalize(f, &classes(), 640, 480, "now").unwrap();
         assert_eq!(n.boxes[0].reason, None);
+    }
+
+    #[test]
+    fn frames_waiting_for_review_are_not_pruned() {
+        let dir = std::env::temp_dir().join(format!("bop-awaits-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.labels.json");
+        let pending = tests_support::auto_box("person");
+        let mut dismissed = pending.clone();
+        dismissed.state = BoxState::Rejected;
+        dismissed.reason = Some(bulk::DISMISSED_REASON.into());
+        let waiting = LabelFile {
+            boxes: vec![pending, dismissed.clone()],
+            ..LabelFile::default()
+        };
+        write(&path, &waiting).unwrap();
+        assert!(waiting.awaits_review() && !waiting.has_human_decision());
+        assert!(is_protected(&path));
+        // Nothing left to look at: it ages out with its frame.
+        let done = LabelFile {
+            boxes: vec![dismissed],
+            ..LabelFile::default()
+        };
+        write(&path, &done).unwrap();
+        assert!(!is_protected(&path));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2370,5 +2476,130 @@ mod tests {
         let mut other = audit(BoxState::Accepted);
         other.auto.audit = false;
         assert_eq!(other.audit_verdict(), None);
+    }
+
+    #[test]
+    fn retention_keeps_a_persons_work_and_nothing_else() {
+        let pending = LabelBox {
+            label: "car".into(),
+            bbox: [1.0, 1.0, 50.0, 50.0],
+            source: Source::Auto,
+            score: Some(0.4),
+            state: BoxState::Pending,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: AutoInfo::default(),
+        };
+        let file = |b: Vec<LabelBox>| LabelFile {
+            boxes: b,
+            ..LabelFile::default()
+        };
+        let edit = |e: &dyn Fn(&mut LabelBox)| {
+            let mut b = pending.clone();
+            e(&mut b);
+            file(vec![b])
+        };
+        let rejected = |why: &str| {
+            edit(&|b| {
+                b.state = BoxState::Rejected;
+                b.reason = Some(why.to_string());
+            })
+        };
+        // What a machine wrote: an empty run, pending boxes, its dismissals and bulk rejects.
+        assert!(!LabelFile::default().has_human_decision());
+        assert!(
+            !LabelFile {
+                auto_run: Some(AutoRun {
+                    at: "t".into(),
+                    labeler: "gdino".into(),
+                    classes: Vec::new(),
+                }),
+                ..LabelFile::default()
+            }
+            .has_human_decision()
+        );
+        assert!(!file(vec![pending.clone()]).has_human_decision());
+        for why in [
+            bulk::LOW_SCORE_REASON,
+            bulk::OTHER_CLASS_REASON,
+            bulk::DISMISSED_REASON,
+            bulk::SPOT_DISMISSED_REASON,
+            stacks::DUPLICATE_REASON,
+        ] {
+            let mut f = rejected(why);
+            if why == stacks::DUPLICATE_REASON {
+                f.boxes[0].reject_reason = Some(RejectReason::Duplicate);
+            }
+            assert!(!f.has_human_decision(), "{why}");
+        }
+        assert!(
+            !edit(&|b| {
+                b.state = BoxState::Accepted;
+                b.reason = Some(spots::PARKED_REASON.to_string());
+            })
+            .has_human_decision()
+        );
+        // What a person did.
+        for f in [
+            LabelFile {
+                status: Status::Reviewed,
+                ..LabelFile::default()
+            },
+            LabelFile {
+                status: Status::Skipped,
+                ..LabelFile::default()
+            },
+            LabelFile {
+                reviewed_at: Some("t".into()),
+                ..LabelFile::default()
+            },
+            LabelFile {
+                empty_confirmed: true,
+                ..LabelFile::default()
+            },
+            LabelFile {
+                overlaps_checked: true,
+                ..LabelFile::default()
+            },
+            edit(&|b| b.state = BoxState::Accepted),
+            edit(&|b| b.state = BoxState::Rejected),
+            edit(&|b| b.source = Source::Human),
+            edit(&|b| b.orig_bbox = Some([0.0, 0.0, 9.0, 9.0])),
+            edit(&|b| b.difficult = true),
+            rejected(REST_REASON),
+        ] {
+            assert!(f.has_human_decision(), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn a_frame_is_never_deleted_past_a_save_and_unreadable_labels_protect_it() {
+        let dir = std::env::temp_dir().join(format!("bop-prot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.labels.json");
+        assert!(!is_protected(&p), "no label file");
+        assert_eq!(unless_protected(&p, || 7), Some(7));
+        write(&p, &LabelFile::default()).unwrap();
+        assert!(!is_protected(&p));
+        write(
+            &p,
+            &LabelFile {
+                status: Status::Reviewed,
+                ..LabelFile::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(unless_protected(&p, || 7), None);
+        std::fs::write(&p, b"garbled").unwrap();
+        assert!(is_protected(&p));
+        assert_eq!(
+            path_of_frame(Path::new("d/x_1.jpg")),
+            Path::new("d/x_1.labels.json")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

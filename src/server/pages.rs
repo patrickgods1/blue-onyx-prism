@@ -180,6 +180,10 @@ struct WelcomeTemplate {
     models: Vec<ModelRow>,
     /// The last default switch, while it can be reverted.
     revert: Option<crate::training::switch::RevertView>,
+    /// The dataset collector: collecting or not, and the frames so far.
+    dataset_line: String,
+    /// Why collection stopped on its own, while it is stopped.
+    dataset_stopped: Option<String>,
 }
 
 pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
@@ -208,6 +212,14 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
             .collect();
         let in_use = providers_in_use(reg);
         let force_cpu_note = force_cpu_note(&state.config_read(), &snap);
+        let (collecting, dataset_dir) = {
+            let cfg = state.config_read();
+            (
+                cfg.collect.enabled,
+                crate::collect::CollectSettings::for_config(&cfg).dir,
+            )
+        };
+        let dataset = crate::collect::global().brief_of(&dataset_dir);
         render(&WelcomeTemplate {
             nav: "home",
             version: crate::VERSION,
@@ -240,6 +252,12 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
             default_model: default,
             models,
             revert: crate::training::switch::revert_view(&state.config_read()),
+            dataset_line: crate::collect::health::home_line(
+                collecting,
+                dataset.disabled.is_some(),
+                dataset.summary.frames,
+            ),
+            dataset_stopped: dataset.disabled,
         })
     })
     .await
@@ -510,12 +528,13 @@ pub(super) async fn test_page(State(state): State<Arc<AppState>>) -> Response {
     render(&test_template(&state, "", String::new(), None, None))
 }
 
-/// Same dispatch path as the API (metrics and queues behave identically), then draws the
-/// predictions on the uploaded image off the async thread.
+/// Same dispatch path as the API (metrics and queues behave identically), except that the upload
+/// is no camera's frame and stays out of the dataset; then draws the predictions on the uploaded
+/// image off the async thread.
 pub(super) async fn test_submit(State(state): State<Arc<AppState>>, upload: Upload) -> Response {
     let start = Instant::now();
     let id = new_request_id();
-    let (req, fields) = match parse_detection_body(upload).await {
+    let (mut req, fields) = match parse_detection_body(upload).await {
         Ok(v) => v,
         Err(e) => {
             e.record(&state);
@@ -545,6 +564,7 @@ pub(super) async fn test_submit(State(state): State<Arc<AppState>>, upload: Uplo
         return render(&test_template(&state, model, min_conf, Some(e), None));
     };
 
+    req.no_collect = true;
     let image = req.image_data.clone();
     let resp = run_detection(&state, &handle, Ok(req), start, command, &id).await;
     let json = serde_json::to_string_pretty(&resp).unwrap_or_default();

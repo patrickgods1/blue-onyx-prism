@@ -96,6 +96,16 @@ for. Every bucket has `enabled`, a sampling `rate` (0 to 1, deterministic per re
    remembered).
    - dHash is 64 bits: the luma is box-averaged to 9 x 8 cells, and a bit is set when a cell is brighter
      than its right neighbour.
+   - This check is only for frames kept for `positive` or `empty`. A frame kept for `near_threshold`,
+     `suppressed`, `verify_rejected`, `verify_kept` or `disagreement` skips it, because a distant person
+     changes only a few of the 64 bits and those are the frames review needs most. If such a frame also
+     passed `positive` or `empty`, it keeps those buckets too.
+   - **The limit on skipping:** at most 10 near duplicates per camera per minute are saved this way
+     (`store::DEDUP_SKIPS_PER_CAMERA`, `DEDUP_SKIP_WINDOW`). Past that they are dropped as duplicates.
+     These five buckets have an interval of 0 by default, so in a storm of look-alike frames this limit
+     is what holds: about 14,400 frames a day per camera at most, and `collect.max_gb` still applies.
+     Frames that do not look like a recent one are not limited by it, as before. To limit those too,
+     set the bucket's interval.
 4. The frame is saved, and the passing buckets' interval clocks restart.
 
 **`below_threshold`:** with `near_threshold` on, postprocessing runs `margin` below the request's
@@ -188,6 +198,8 @@ file names `<UTC ms>_imp-<import id>-<n>.jpg`, and a version-1 sidecar with no d
   `attribution`; nothing to confirm).
 - `time_offset_s`: seconds from the start of the video (absent for an image). `timestamp` is the
   recording time when the file name has one (Blue Iris, MEVA), else the file's modification time.
+  A Blue Iris name holds local time and is stored as if it were UTC, while collected frames use real
+  UTC, so frames of the same hour from the two sources can land in different day folders.
 - The camera folder is `--camera`, else the Blue Iris camera of the file name, `meva-<site>-<camera>`
   for MEVA, a URL's host, or `import`.
 - The import appends its frames to `review-queue.jsonl` and one line to `<dir>/imports.jsonl` (id,
@@ -238,21 +250,64 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
   - It runs on the collector thread, the only writer: every 10 minutes (asked by the retention sweeper,
     also while collection is off, as long as the folder exists) and right after a write that crossed
     the size cap.
-  - It deletes only frame pairs in the layout above. It never deletes `review-queue.jsonl`, `spots/` or
-    anything else. A frame in the review queue is pruned like any other until it is labelled.
+  - It deletes only frames in the layout above: the image, the sidecar and the frame's `.labels.json`.
+    It never deletes `review-queue.jsonl`, `spots/` or anything else. A frame in the review queue is
+    pruned like any other.
+- **What is protected:** a reviewed or skipped frame, a frame that was reviewed before a re-label sent it
+  back, and a frame with a human decision on it are never deleted and do not count toward `max_gb`. A
+  human decision is an accepted or rejected box, a drawn, moved or relabelled box, an unsure mark, or
+  a confirmed empty frame.
+  - A frame with boxes waiting for review is kept too, because an auto-label run takes hours. Such
+    frames can take the folder past `max_gb`; the disk guard still protects the volume, and the
+    Dataset page's disk line shows them.
+  - A label file with nothing left to look at does not protect its frame. That covers an auto-label
+    run that found nothing, boxes a labeler dismissed or accepted at a parked spot, and bulk rejects
+    by score, by class or as a stacked duplicate.
+  - A label file that cannot be read protects its frame, in case it holds a person's work.
+  - The size cap applies to the frames that can be deleted. The Dataset page's *Disk used* line shows
+    the total, the part that counts toward the cap and the protected reviewed data. The protected
+    figure can lag a review by up to 10 minutes.
 - **Low disk:** if free space under the folder drops below 1 GB (`retention::MIN_FREE_MB`, the same
   threshold as the low-space warning), or a write fails with a full disk or exhausted quota:
   - collection stops with a warning;
   - `dataset_collect_disabled` becomes 1 and frames count as `dataset_dropped_total{reason="disk"}`;
-  - the Dataset page shows the reason.
-  - It stays off until **Resume** is pressed on the page or the `collect` settings change.
+  - the Dataset and Home pages show the reason.
+  - It starts again by itself once 1.25 GB is free (the stop point plus `store::REARM_MARGIN_MB`,
+    256 MB), checked every 30 seconds whether or not frames arrive. **Resume** on the page or a change
+    to the `collect` settings restart it sooner. If free space cannot be read, only those two do.
 - **Other write errors** (permissions, a read-only folder) drop the frame (`reason="error"`) with a
-  throttled warning.
+  throttled warning, and show as the last error on the Dataset page.
+
+## Is it working?
+
+The Dataset page's Status card and `GET /v1/dataset` (`collection`) answer this, so an unwritable folder
+does not look like a quiet camera. Counts start from zero when the service starts.
+
+- **Requests seen:** detection requests received, collection on or off. Test page uploads do not count.
+- **Frames saved:** frames written.
+- **Frames not saved:** drops by reason in plain words (`dropped`: `reason`, `plain`, `count`), plus
+  images that matched no bucket that is on (`no_bucket`).
+- **Last frame:** the time of the last saved frame, or the newest in the folder after a restart.
+- **Last error:** the last failure with its time. It stays after later frames save, so check the time.
+- **A sentence** (`note`) when collection is on and nothing was saved: "Blue Iris has not sent any images
+  since this service started" with no requests at all; otherwise how many images arrived and the likely
+  reason.
+
+Home shows one line: collecting or not, the frames so far, a link to this page, and the stop reason
+while collection is stopped.
+
+**Test page uploads** are never collected, so a test image `dog.jpg` does not become a camera `dog`. The
+page's script sends the header `x-prism-no-collect` to the API routes, and the form path `POST /test`
+marks the request itself.
 
 ## Metrics
 
 | Metric | Meaning |
 |---|---|
+| `blue_onyx_prism_dataset_requests_total` | Detection requests received, Test page uploads excluded. |
+| `blue_onyx_prism_dataset_offered_total` | Answered requests handed to the collector while it was on. |
+| `blue_onyx_prism_dataset_saved_total` | Frames saved (once each). |
+| `blue_onyx_prism_dataset_no_bucket_total` | Frames that matched no enabled bucket. |
 | `blue_onyx_prism_dataset_frames_total{bucket}` | Frames saved per bucket (a frame counts in each bucket it was kept for). |
 | `blue_onyx_prism_dataset_dropped_total{reason}` | `queue_full`, `rate`, `dup`, `disk`, `error`. |
 | `blue_onyx_prism_dataset_bytes` | Image and sidecar bytes in the folder (from the index). |
@@ -828,6 +883,7 @@ become the frame's complete set of training boxes:
 - **Folders:** `out_dir` and the import `dir` are checked like the other folder settings (no system
   folders).
 
-**Retention:** a frame that has a `.labels.json` (anything saved on the Review page) is never pruned and
-does not count toward `collect.max_gb`; only unlabelled frames age out or make room. Delete labelled
-frames yourself if they are no longer wanted.
+**Retention:** a reviewed frame, one with a human decision, or one with boxes waiting for review is never
+pruned and does not count toward `collect.max_gb` (see [Disk](#disk)). A label file with nothing left to
+look at is pruned with its frame.
+Delete reviewed frames yourself if they are no longer wanted.

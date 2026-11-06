@@ -1,7 +1,8 @@
 # Linux packages (.deb / .rpm)
 
 Installs the service like `scripts/install_systemd.sh`: binaries `blue-onyx-prism` and
-`blue-onyx-prism-benchmark` (plus LICENSE, THIRD_PARTY_LICENSES.md, README.md and `scripts/`) in
+`blue-onyx-prism-benchmark` (plus LICENSE, THIRD_PARTY_LICENSES.md, README.md and `scripts/`, which
+also holds the by-hand training scripts) in
 `/opt/blue-onyx-prism/` (root-owned), data and config in `/var/lib/blue-onyx-prism/`, system user
 `blueonyx` (groups `render`, `video`), unit `/usr/lib/systemd/system/blue-onyx-prism.service`
 enabled and started. OpenVINO / ONNX Runtime are not bundled: the service downloads them on first

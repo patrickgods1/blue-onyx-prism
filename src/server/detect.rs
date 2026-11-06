@@ -321,8 +321,18 @@ async fn parse_body_within(
     }
 }
 
+/// Header of a Test page upload through the API routes (`assets/test.js`): the image is no
+/// camera's frame, so the request stays out of the dataset and its counts. Only an opt-out: a
+/// client that sends it just leaves its own frames uncollected.
+pub(super) const NO_COLLECT_HEADER: &str = "x-prism-no-collect";
+
+fn no_collect(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(NO_COLLECT_HEADER)
+}
+
 pub(super) async fn detection_default(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     upload: Upload,
 ) -> Response {
     let start = Instant::now();
@@ -340,13 +350,15 @@ pub(super) async fn detection_default(
         ));
         return with_request_id(resp.into_response(), &id);
     };
-    let resp = detect_on(&state, &handle, upload, start, "detect", &id).await;
+    let skip = no_collect(&headers);
+    let resp = detect_on(&state, &handle, upload, start, "detect", &id, skip).await;
     with_request_id(Json(resp).into_response(), &id)
 }
 
 pub(super) async fn detection_custom(
     State(state): State<Arc<AppState>>,
     Path(model): Path<String>,
+    headers: axum::http::HeaderMap,
     upload: Upload,
 ) -> Response {
     let start = Instant::now();
@@ -366,14 +378,19 @@ pub(super) async fn detection_custom(
         r.command = "custom".into();
         return with_request_id(Json(r).into_response(), &id);
     };
-    let resp = detect_on(&state, &handle, upload, start, "custom", &id).await;
+    let skip = no_collect(&headers);
+    let resp = detect_on(&state, &handle, upload, start, "custom", &id, skip).await;
     with_request_id(Json(resp).into_response(), &id)
 }
 
 /// Parse the upload, counting a rejection.
-async fn parse_counted(state: &AppState, upload: Upload) -> Result<VisionDetectionRequest, String> {
+async fn parse_counted(
+    state: &AppState,
+    upload: Upload,
+    no_collect: bool,
+) -> Result<VisionDetectionRequest, String> {
     match parse_detection_body(upload).await {
-        Ok((r, _)) => Ok(r),
+        Ok((r, _)) => Ok(VisionDetectionRequest { no_collect, ..r }),
         Err(e) => {
             e.record(state);
             Err(e.message)
@@ -391,7 +408,12 @@ async fn detect_on(
     start: Instant,
     command: &str,
     request_id: &str,
+    no_collect: bool,
 ) -> VisionDetectionResponse {
+    // Counted here, not per inference: a failed model must not look like a silent Blue Iris.
+    if !no_collect {
+        crate::collect::metrics::METRICS.record_request();
+    }
     if !matches!(handle.state.get(), ModelState::Ready) || handle.is_full() {
         handle.metrics.requests.fetch_add(1, Ordering::Relaxed);
         if let Some(early) = answer_without_inference(handle) {
@@ -400,13 +422,13 @@ async fn detect_on(
         }
         // It became ready (or got room) meanwhile: serve it normally (the request is
         // already counted).
-        let resp = match parse_counted(state, upload).await {
+        let resp = match parse_counted(state, upload, no_collect).await {
             Ok(r) => send_to_worker(handle, r, start, request_id).await,
             Err(e) => VisionDetectionResponse::error(e),
         };
         return finish(state, handle, resp, start, command, request_id);
     }
-    let req = parse_counted(state, upload).await;
+    let req = parse_counted(state, upload, no_collect).await;
     run_detection(state, handle, req, start, command, request_id).await
 }
 
@@ -870,6 +892,19 @@ mod tests {
             .unwrap();
         discard_body(multipart_of(req).await).await;
         assert!(consumed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_test_page_script_sends_the_no_collect_header() {
+        let script = include_str!("../../assets/test.js");
+        assert!(
+            script.contains(&format!("\"{NO_COLLECT_HEADER}\": \"1\"")),
+            "assets/test.js must send {NO_COLLECT_HEADER}"
+        );
+        let mut h = axum::http::HeaderMap::new();
+        assert!(!no_collect(&h));
+        h.insert(NO_COLLECT_HEADER, "1".parse().unwrap());
+        assert!(no_collect(&h));
     }
 
     /// What the detection parser made of one body: the image size or the rejection.

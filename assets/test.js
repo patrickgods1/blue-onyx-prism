@@ -99,7 +99,8 @@
     busy.hidden = false; btn.disabled = true;
     var old = document.getElementById("server-result");
     if (old) old.remove();
-    fetch(target, {method: "POST", body: fd}).then(function (r) { return r.json(); })
+    // The header keeps a test upload out of the dataset: it is no camera's frame.
+    fetch(target, {method: "POST", body: fd, headers: {"x-prism-no-collect": "1"}}).then(function (r) { return r.json(); })
       .then(function (j) { show(j, model); })
       .catch(function (ex) {
         var err = document.getElementById("client-error");

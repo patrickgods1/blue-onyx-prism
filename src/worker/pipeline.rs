@@ -46,7 +46,8 @@ pub(super) struct Meta {
     /// detections only, never verified, filtered or saved.
     pub(super) verify_crop: bool,
     /// The upload's encoded bytes, kept (a reference count, no copy) while the dataset
-    /// collector is on ([`crate::collect`]); None otherwise.
+    /// collector is on ([`crate::collect`]), which also marks the request as one to collect;
+    /// None otherwise, and for a `no_collect` upload.
     pub(super) original: Option<bytes::Bytes>,
 }
 

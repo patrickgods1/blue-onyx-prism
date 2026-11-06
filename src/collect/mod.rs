@@ -12,7 +12,8 @@
 //! ([`record::decide`]), applies sampling, per-camera rate limits and dHash dedup, writes the
 //! files atomically, maintains the per-day `index.jsonl` and the in-memory [`layout::Summary`]
 //! the Dataset page shows, applies the caps through [`crate::retention::prune_dataset`] and
-//! disables itself on low free space or a full disk.
+//! stops on low free space or a full disk until space is back. [`health`] turns its counts into
+//! what the pages say.
 //!
 //! The thread runs at the normal priority: the per-thread below-normal priority helper would
 //! live in `backend/priority.rs` (the only place `unsafe` is allowed) and does not exist yet.
@@ -21,6 +22,7 @@
 
 pub mod config;
 pub mod dhash;
+pub mod health;
 pub mod labels;
 pub mod layout;
 pub mod metrics;
@@ -213,6 +215,12 @@ pub struct Status {
     pub summary: Summary,
     /// Why collection stopped on its own (low disk, full disk).
     pub disabled: Option<String>,
+    /// How the folder divides up; the collector's when it describes the folder, up to 10 minutes
+    /// behind a review. Zero from [`Collector::brief_of`].
+    pub usage: crate::retention::DatasetUsage,
+    /// When this process last saved a frame (UTC, RFC 3339).
+    pub last_saved_at: Option<String>,
+    pub last_error: Option<health::LastError>,
 }
 
 enum Msg {
@@ -253,6 +261,7 @@ pub fn global() -> &'static Collector {
 
 /// Hand `frame` to the collector (never blocks; a full queue drops it with a count).
 pub fn submit(frame: Frame) {
+    METRICS.record_offered();
     global().submit(frame);
 }
 
@@ -279,6 +288,13 @@ impl Collector {
     pub fn submit(&self, frame: Frame) {
         let Some(tx) = self.sender() else {
             METRICS.record_drop(Dropped::Error);
+            let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            s.last_error = Some(health::LastError {
+                message: "the collector thread could not start, so no frame is saved; restart \
+                          the service"
+                    .to_string(),
+                at: utc_rfc3339(SystemTime::now()),
+            });
             return;
         };
         match tx.try_send(Msg::Frame(Box::new(frame))) {
@@ -315,18 +331,33 @@ impl Collector {
             .map_or(0, Sender::len)
     }
 
-    /// Re-arm after a disk stop.
-    pub fn resume(&self) {
-        if let Some(tx) = self.sender() {
-            let _ = tx.try_send(Msg::Resume);
+    /// Re-arm after a disk stop. False when the request could not be queued (the collector is
+    /// busy, or its thread is gone): the stop stands and still shows.
+    pub fn resume(&self) -> bool {
+        let sent = self
+            .sender()
+            .is_some_and(|tx| tx.try_send(Msg::Resume).is_ok());
+        if sent {
+            let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            s.disabled = None;
         }
-        let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
-        s.disabled = None;
+        sent
     }
 
-    /// The summary of `dir` (the collector's when it describes `dir`, else scanned now; call
-    /// off the async runtime) and the disk stop reason.
+    /// Everything the collector knows of `dir`: its summary and usage (the collector's when it
+    /// describes `dir`, else read from disk now, every label file included; call off the async
+    /// runtime), the disk stop reason, the last frame and the last error.
     pub fn status_of(&self, dir: &std::path::Path) -> Status {
+        let mut s = self.brief_of(dir);
+        if self.describes(dir) {
+            return s;
+        }
+        s.usage = crate::retention::dataset_usage(dir);
+        s
+    }
+
+    /// [`Self::status_of`] without the walk over the label files, for Home.
+    pub fn brief_of(&self, dir: &std::path::Path) -> Status {
         let s = self
             .status
             .lock()
@@ -338,8 +369,15 @@ impl Collector {
         Status {
             dir: Some(dir.to_path_buf()),
             summary: Summary::scan(dir),
-            disabled: s.disabled,
+            usage: crate::retention::DatasetUsage::default(),
+            last_saved_at: None,
+            ..s
         }
+    }
+
+    fn describes(&self, dir: &std::path::Path) -> bool {
+        let s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        s.dir.as_deref() == Some(dir)
     }
 }
 
@@ -352,11 +390,12 @@ fn run(rx: &Receiver<Msg>, status: Arc<Mutex<Status>>) {
     let mut last: Option<Arc<CollectSettings>> = None;
     let mut last_prune = std::time::Instant::now();
     loop {
+        st.poll_rearm();
         #[cfg(test)]
         while PAUSE.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(2));
         }
-        let msg = match rx.recv_timeout(Duration::from_secs(60)) {
+        let msg = match rx.recv_timeout(store::FREE_CHECK_INTERVAL) {
             Ok(m) => Some(m),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
@@ -367,7 +406,10 @@ fn run(rx: &Receiver<Msg>, status: Arc<Mutex<Status>>) {
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| st.handle(*f)));
                 if out.is_err() {
                     METRICS.record_drop(Dropped::Error);
-                    warn!("dataset collector: saving a frame panicked; the frame was dropped");
+                    st.note_error(
+                        "saving a frame panicked, so it was dropped; please report this with the \
+                         log",
+                    );
                 }
                 last = Some(settings);
             }
@@ -392,6 +434,40 @@ fn run(rx: &Receiver<Msg>, status: Arc<Mutex<Status>>) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn collector(tx: Sender<Msg>, disabled: &str) -> Collector {
+        let c = Collector {
+            tx: OnceLock::new(),
+            status: Arc::new(Mutex::new(Status {
+                disabled: Some(disabled.to_string()),
+                ..Status::default()
+            })),
+        };
+        c.tx.set(Some(tx)).unwrap();
+        c
+    }
+
+    #[test]
+    fn resume_clears_the_stop_only_when_the_request_was_queued() {
+        let (tx, rx) = crossbeam_channel::bounded::<Msg>(1);
+        tx.try_send(Msg::Resume).unwrap();
+        let c = collector(tx, "low disk");
+        // The queue is full: the collector would never hear of it, so the page must not lie.
+        assert!(!c.resume());
+        assert_eq!(
+            c.status.lock().unwrap().disabled.as_deref(),
+            Some("low disk")
+        );
+        rx.try_recv().unwrap();
+        assert!(c.resume());
+        assert_eq!(c.status.lock().unwrap().disabled, None);
+        assert!(matches!(rx.try_recv(), Ok(Msg::Resume)));
+        // The thread is gone.
+        drop(rx);
+        c.status.lock().unwrap().disabled = Some("low disk".into());
+        assert!(!c.resume());
+        assert!(c.status.lock().unwrap().disabled.is_some());
+    }
 
     #[test]
     fn timestamps() {

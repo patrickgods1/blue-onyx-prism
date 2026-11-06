@@ -107,6 +107,9 @@ jobs:
             fi
           fi
           cp scripts/export_model.py scripts/convert_onnx_to_ir.py scripts/requirements-export.txt "$STAGE/scripts/"
+          # By-hand training where the service cannot train (capability::BY_HAND); the service
+          # itself runs the copies embedded in the binary.
+          cp scripts/train_model.py scripts/autolabel.py scripts/requirements-model-train.txt "$STAGE/scripts/"
           # LICENSE (this project) and the notices of everything the archive bundles: OpenVINO,
           # ONNX Runtime, DirectML, the embedded font and the Rust crates in the binaries.
           cp README.md LICENSE THIRD_PARTY_LICENSES.md "$STAGE/"

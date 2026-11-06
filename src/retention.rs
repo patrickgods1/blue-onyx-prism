@@ -72,6 +72,21 @@ pub struct PruneReport {
     pub failed: usize,
     /// Prunable files left in the folder.
     pub remaining: usize,
+    /// The dataset's size after this pass ([`prune_dataset`] only).
+    pub usage: DatasetUsage,
+}
+
+/// How the dataset folder's frames (image + sidecar, label files not counted) divide up. The size
+/// cap applies to `prunable_bytes`, the one figure the collector compares with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DatasetUsage {
+    /// Frames retention may delete.
+    pub prunable_bytes: u64,
+    /// Reviewed frames and frames with a human decision
+    /// ([`LabelFile::has_human_decision`](crate::collect::labels::LabelFile::has_human_decision)):
+    /// never deleted, outside the cap.
+    pub protected_bytes: u64,
+    pub protected_frames: u64,
 }
 
 fn is_prunable(path: &Path) -> bool {
@@ -137,23 +152,19 @@ pub fn prune_saved_images(dir: &Path, max_age_days: u32, max_mb: u64) -> Result<
     Ok(report)
 }
 
-/// Delete the oldest frames of the dataset folder `dir` (`<scene>/<camera>/<date>/<stem>.jpg`
-/// with its `.json` sidecar, see `docs/DATASET.md`) until none is older than `max_age_days`
-/// and the frames total at most `max_bytes` (0 disables a limit), then drop the deleted frames
-/// from their day's `index.jsonl` and remove emptied folders. Only those names are touched
-/// (no symlinks, nothing outside the layout, never `review-queue.jsonl`); temporary files of
-/// an interrupted write older than an hour go too. A missing folder is not an error. Run it
-/// only where nothing else writes the folder (the collector thread).
-pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<PruneReport> {
-    use crate::collect::layout;
-    if !dir.is_dir() {
-        return Ok(PruneReport::default());
-    }
-    let now = SystemTime::now();
+/// The frames of the dataset folder `dir` retention may delete, as (path, modified, bytes), and
+/// how the folder divides up. With `clean`, temporary files of an interrupted write older than an
+/// hour are removed on the way.
+fn walk_dataset(
+    dir: &Path,
+    now: SystemTime,
+    clean: bool,
+) -> (Vec<(PathBuf, SystemTime, u64)>, DatasetUsage) {
+    use crate::collect::{labels, layout};
     let mut entries = Vec::new();
-    let days = layout::day_dirs(dir);
-    for day in &days {
-        let Ok(rd) = std::fs::read_dir(day) else {
+    let mut usage = DatasetUsage::default();
+    for day in layout::day_dirs(dir) {
+        let Ok(rd) = std::fs::read_dir(&day) else {
             continue;
         };
         for ent in rd.flatten() {
@@ -169,27 +180,62 @@ pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<Pr
                 let stale = now
                     .duration_since(modified)
                     .is_ok_and(|d| d > Duration::from_secs(3600));
-                if stale {
+                if stale && clean {
                     let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
+            // A run that was labelling a frame as it went leaves a label file behind.
+            if let Some(stem) = name.strip_suffix(labels::LABELS_SUFFIX) {
+                if clean && !day.join(format!("{stem}.jpg")).exists() {
+                    labels::unless_protected(&path, || std::fs::remove_file(&path));
                 }
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
                 continue;
             }
-            // A frame someone labelled (`<stem>.labels.json`, written by the Review page) is
-            // training data: never pruned, and not counted against the cap.
-            if path.with_extension("labels.json").exists() {
-                continue;
-            }
-            let side = path.with_extension("json");
-            let side_len = std::fs::symlink_metadata(&side)
+            let side_len = std::fs::symlink_metadata(path.with_extension("json"))
                 .ok()
                 .filter(|m| m.file_type().is_file())
                 .map_or(0, |m| m.len());
-            entries.push((path, modified, meta.len().saturating_add(side_len)));
+            let size = meta.len().saturating_add(side_len);
+            if labels::is_protected(&labels::path_of_frame(&path)) {
+                usage.protected_bytes = usage.protected_bytes.saturating_add(size);
+                usage.protected_frames += 1;
+            } else {
+                usage.prunable_bytes = usage.prunable_bytes.saturating_add(size);
+                entries.push((path, modified, size));
+            }
         }
     }
+    (entries, usage)
+}
+
+/// How the frames of the dataset folder `dir` divide up (reads every label file; call it off the
+/// async runtime). A missing folder is empty.
+pub fn dataset_usage(dir: &Path) -> DatasetUsage {
+    walk_dataset(dir, SystemTime::now(), false).1
+}
+
+/// Delete the oldest frames of the dataset folder `dir` (`<scene>/<camera>/<date>/<stem>.jpg`
+/// with its `.json` sidecar and `.labels.json`, see `docs/DATASET.md`) until none is older than
+/// `max_age_days` and the deletable frames total at most `max_bytes` (0 disables a limit), then
+/// drop the deleted frames from their day's `index.jsonl` and remove emptied folders. Reviewed
+/// frames and frames with a human decision are never deleted and do not count toward the cap; a
+/// label file with nothing human on it (an auto-label run writes one even when it finds nothing)
+/// goes with its frame. Only those names are touched (no symlinks, nothing outside the layout,
+/// never `review-queue.jsonl`); temporary files of an interrupted write older than an hour go
+/// too. A missing folder is not an error. Frames are written only by the collector thread, where
+/// this runs; label files can change at any time, so each frame's is read again, under the label
+/// write lock, right before the frame goes.
+pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<PruneReport> {
+    use crate::collect::{labels, layout};
+    if !dir.is_dir() {
+        return Ok(PruneReport::default());
+    }
+    let now = SystemTime::now();
+    let (entries, mut usage) = walk_dataset(dir, now, true);
     let age =
         (max_age_days > 0).then(|| Duration::from_secs(u64::from(max_age_days) * SECS_PER_DAY));
     let cap = (max_bytes > 0).then_some(max_bytes);
@@ -201,14 +247,28 @@ pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<Pr
     let mut touched: Vec<PathBuf> = Vec::new();
     for path in doomed {
         let size = entries.iter().find(|e| e.0 == path).map_or(0, |e| e.2);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                let side = path.with_extension("json");
-                if let Err(e) = std::fs::remove_file(&side)
+        let label_file = labels::path_of_frame(&path);
+        let removed = labels::unless_protected(&label_file, || {
+            std::fs::remove_file(&path)?;
+            for extra in [path.with_extension("json"), label_file.clone()] {
+                if let Err(e) = std::fs::remove_file(&extra)
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
-                    tracing::debug!("retention: removing {}: {e}", side.display());
+                    tracing::debug!("retention: removing {}: {e}", extra.display());
                 }
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        match removed {
+            // A reviewer got to it during this pass.
+            None => {
+                usage.prunable_bytes = usage.prunable_bytes.saturating_sub(size);
+                usage.protected_bytes = usage.protected_bytes.saturating_add(size);
+                usage.protected_frames += 1;
+                report.remaining = report.remaining.saturating_sub(1);
+            }
+            Some(Ok(())) => {
+                usage.prunable_bytes = usage.prunable_bytes.saturating_sub(size);
                 report.deleted += 1;
                 report.freed_bytes = report.freed_bytes.saturating_add(size);
                 report.remaining = report.remaining.saturating_sub(1);
@@ -218,12 +278,13 @@ pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<Pr
                     touched.push(day.to_path_buf());
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 report.failed += 1;
                 tracing::debug!("retention: removing {}: {e}", path.display());
             }
         }
     }
+    report.usage = usage;
     for day in &touched {
         if let Err(e) = layout::rewrite_index(day) {
             tracing::warn!("dataset retention: {e:#}");
@@ -254,13 +315,18 @@ pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<Pr
 /// A warning text when the file system holding `data_root` has less than `min_free_mb` MB
 /// available. None when there is enough, or when the space cannot be determined.
 pub fn free_space_warning(data_root: &Path, min_free_mb: u64) -> Option<String> {
-    // The root may not exist yet; ask about the nearest existing ancestor.
-    let probe = data_root.ancestors().find(|p| p.exists())?;
-    let free = fs4::available_space(probe).ok()?;
-    low_space_message(data_root, free, min_free_mb)
+    low_space_message(data_root, free_bytes(data_root)?, min_free_mb)
 }
 
-fn low_space_message(data_root: &Path, free_bytes: u64, min_free_mb: u64) -> Option<String> {
+/// Bytes available to this process on the file system holding `path`, None when unknown. The path
+/// may not exist yet: the nearest existing ancestor is asked.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    let probe = path.ancestors().find(|p| p.exists())?;
+    fs4::available_space(probe).ok()
+}
+
+/// The low-space warning for `free_bytes` under `data_root`, None at or above `min_free_mb`.
+pub fn low_space_message(data_root: &Path, free_bytes: u64, min_free_mb: u64) -> Option<String> {
     (free_bytes < min_free_mb.saturating_mul(BYTES_PER_MB)).then(|| {
         format!(
             "low disk space under {}: {} MB free (threshold {} MB); saved images, logs, caches and downloads may fail",
@@ -505,19 +571,109 @@ mod tests {
     }
 
     #[test]
-    fn dataset_prune_keeps_labelled_frames() {
+    fn dataset_prune_keeps_human_work_and_deletes_machine_labels_with_their_frame() {
+        use crate::collect::labels::{self, LabelFile, Status};
         let d = Tmp::new();
         let p = d.path();
-        dataset_frame(p, "ir/cam/2026-01-01", "labelled", 100, 200);
-        dataset_frame(p, "ir/cam/2026-01-01", "plain", 100, 200);
         let day = p.join("ir/cam/2026-01-01");
-        std::fs::write(day.join("labelled.labels.json"), b"{}").unwrap();
+        let put = |stem: &str, f: Option<LabelFile>| {
+            dataset_frame(p, "ir/cam/2026-01-01", stem, 100, 200);
+            if let Some(f) = f {
+                labels::write(&day.join(format!("{stem}.labels.json")), &f).unwrap();
+            }
+        };
+        put(
+            "reviewed",
+            Some(LabelFile {
+                status: Status::Reviewed,
+                ..LabelFile::default()
+            }),
+        );
+        put(
+            "sent_back",
+            Some(LabelFile {
+                reviewed_at: Some("2026-01-02T00:00:00.000Z".into()),
+                ..LabelFile::default()
+            }),
+        );
+        // An auto-label run that found nothing.
+        put("auto_empty", Some(LabelFile::default()));
+        put("plain", None);
+        dataset_frame(p, "ir/cam/2026-01-01", "garbled", 100, 200);
+        std::fs::write(day.join("garbled.labels.json"), b"not json").unwrap();
+
+        let u = dataset_usage(p);
+        assert_eq!(
+            (u.prunable_bytes, u.protected_bytes, u.protected_frames),
+            (400, 600, 3)
+        );
         let r = prune_dataset(p, 90, 1).unwrap();
-        assert_eq!((r.deleted, r.remaining), (1, 0));
-        for f in ["labelled.jpg", "labelled.json", "labelled.labels.json"] {
+        assert_eq!((r.deleted, r.remaining, r.failed), (2, 0, 0));
+        assert_eq!(
+            r.usage,
+            DatasetUsage {
+                prunable_bytes: 0,
+                protected_bytes: 600,
+                protected_frames: 3
+            }
+        );
+        for f in [
+            "reviewed.jpg",
+            "reviewed.json",
+            "reviewed.labels.json",
+            "sent_back.jpg",
+            "garbled.jpg",
+        ] {
             assert!(day.join(f).exists(), "{f}");
         }
-        assert!(!day.join("plain.jpg").exists());
+        for f in [
+            "auto_empty.jpg",
+            "auto_empty.json",
+            "auto_empty.labels.json",
+            "plain.jpg",
+        ] {
+            assert!(!day.join(f).exists(), "{f}");
+        }
+    }
+
+    #[test]
+    fn dataset_cap_counts_only_what_it_can_delete() {
+        use crate::collect::labels::{self, LabelFile, Status};
+        let d = Tmp::new();
+        let p = d.path();
+        let day = p.join("ir/cam/2026-01-01");
+        for (stem, age) in [("a", 3), ("b", 2), ("c", 1)] {
+            dataset_frame(p, "ir/cam/2026-01-01", stem, 100, age);
+        }
+        // Protected "a" is the oldest and bigger than the cap: it takes no room from b and c.
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            ..LabelFile::default()
+        };
+        labels::write(&day.join("a.labels.json"), &reviewed).unwrap();
+        let r = prune_dataset(p, 0, 400).unwrap();
+        assert_eq!(r.deleted, 0);
+        assert_eq!(r.usage.prunable_bytes, 400);
+        // A second pass at the same cap has nothing to do: the figure is at the cap, not over it.
+        assert_eq!(prune_dataset(p, 0, 400).unwrap().deleted, 0);
+    }
+
+    #[test]
+    fn dataset_prune_sweeps_up_machine_label_files_left_without_a_frame() {
+        use crate::collect::labels::{self, LabelFile, Status};
+        let d = Tmp::new();
+        let p = d.path();
+        dataset_frame(p, "ir/cam/2026-01-01", "kept", 100, 1);
+        let day = p.join("ir/cam/2026-01-01");
+        labels::write(&day.join("orphan.labels.json"), &LabelFile::default()).unwrap();
+        let human = LabelFile {
+            status: Status::Reviewed,
+            ..LabelFile::default()
+        };
+        labels::write(&day.join("reviewed.labels.json"), &human).unwrap();
+        prune_dataset(p, 0, 0).unwrap();
+        assert!(!day.join("orphan.labels.json").exists());
+        assert!(day.join("reviewed.labels.json").exists());
     }
 
     #[test]
