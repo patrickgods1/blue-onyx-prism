@@ -1286,3 +1286,227 @@ td.tr-bal-bars { vertical-align: middle; }
   table.tr-btable th:nth-child(2), table.tr-btable th:nth-child(3), table.tr-btable td.num { width: 3.3rem; }
   table.tr-btable th:first-child { width: 30%; }
 }
+
+/* ---- Phones and tablets ------------------------------------------------------------------- */
+/* Everything below is for one-column widths or a finger; desktop widths stay as above.
+   `table.rcards`: a table that turns into one card per row under 700 px, each cell under the name
+   of its column (`data-label`); `rc-title` / `rc-title-plain` head the card, `rc-block` puts the
+   label over a control, `rc-action` holds buttons. `rgrid` lays the cells out in three columns. */
+@media (min-width: 901px) { #rv-accept-likely { display: none; } }
+.rv-phone-head { display: none; }
+.rv-actions-main, .rv-actions-more { display: contents; }
+
+/* Header: one row, the links scroll (live.js keeps the current page in view). */
+@media (max-width: 700px) {
+  header { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0 0.5rem; padding: 0 0.75rem; }
+  /* The short name; the full one stays in the link for screen readers. */
+  header .brand { font-size: 0; }
+  header .brand::after { content: "Prism"; font-size: 1.1rem; }
+  header nav { flex-wrap: nowrap; gap: 0; overflow-x: auto; scrollbar-width: none; }
+  header nav::-webkit-scrollbar, nav.train-tabs::-webkit-scrollbar { display: none; }
+  header nav a { flex: none; display: flex; align-items: center; min-height: 44px; padding: 0 0.6rem; border-radius: 0; }
+  header nav a.active { box-shadow: inset 0 -2px 0 var(--head-fg); background: none; }
+  .live-status, .pending-restart { grid-column: 1 / -1; margin: 0 0 0.3rem; justify-self: start; }
+  .pending-restart { flex-wrap: wrap; }
+  main { padding: 0.75rem 1rem 1rem; }
+  h1 { font-size: 1.45rem; margin-bottom: 0.6rem; }
+  .card { padding: 0.75rem 0.85rem; }
+  footer { padding: 1.2rem 1rem; }
+}
+
+/* Finger-sized controls. */
+@media (max-width: 900px), (pointer: coarse) {
+  button:not(.term):not(.browse-item), select, input:not([type=checkbox], [type=radio], [type=range]) { min-height: 44px; }
+  table.model-card td.mc-load input, table.model-card td.mc-default input { width: 1.6rem; height: 1.6rem; }
+  button.small { padding-left: 0.75rem; padding-right: 0.75rem; }
+  button.browse-item { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+  label.check { min-height: 44px; }
+  input[type=checkbox], input[type=radio] { width: 1.3rem; height: 1.3rem; flex: none; }
+  fieldset label.check input { margin-top: 0; }
+  fieldset label.check { align-items: center; }
+  details > summary { min-height: 44px; padding: 0.6rem 0; margin: 0; box-sizing: border-box; }
+  details.model > summary { padding: 0.7rem 1.2rem; }
+  details.adv > summary { padding: 0.5rem 0; }
+  details.thr-profiles > summary, details.rv-panel-opts > summary, details.tr-more > summary, details.tr-scene-other > summary { display: list-item; }
+  nav.train-tabs a, nav.tabs a[role="tab"] { display: flex; align-items: center; min-height: 44px; }
+  .next-step a.button-link { display: inline-flex; align-items: center; min-height: 44px; }
+  td a.small, a.small { display: inline-block; padding: 0.55rem 0; }
+  .cp-chip { min-height: 44px; padding: 0.15rem 0.7rem 0.15rem 0.5rem; border-radius: 12px; }
+  .cp-chip .cp-label { min-height: 40px; align-content: center; }
+  .cp-compact > .cp-summary { max-width: 100%; display: list-item; padding: 0.6rem 0.5rem; }
+  .cp-compact > .cp-body { max-width: 100%; }
+  .cp-search, .cp-add-input { max-width: 100%; width: 100%; }
+}
+/* 16 px keeps iOS from zooming the page when a field takes the focus. */
+@media (pointer: coarse) {
+  input, select, textarea { font-size: 16px; }
+}
+
+/* Config: 11 columns fit no tablet: a card per model from 900 px down (one column under 700). */
+@media (max-width: 900px) {
+  .scroll:has(> table.model-card) { overflow-x: visible; }
+  table.model-card { display: block; background: none; border: 0; }
+  table.model-card > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  table.model-card > tbody { display: block; }
+  table.model-card > tbody > tr { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.2rem 0.8rem; align-items: start; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.75rem; margin: 0 0 0.6rem; }
+  table.model-card > tbody > tr > td { display: block; border: 0; padding: 0.12rem 0; text-align: left; white-space: normal; overflow-wrap: anywhere; }
+  table.model-card > tbody > tr > td[data-label]::before { content: attr(data-label); display: block; color: var(--muted); font-size: 0.8rem; font-weight: normal; }
+  table.model-card > tbody > tr > td.mc-name { grid-column: 1 / 3; grid-row: 1; font-weight: 600; font-size: 1rem; }
+  table.model-card > tbody > tr > td.mc-load { grid-column: 3; grid-row: 1; }
+  table.model-card > tbody > tr > td.mc-default { grid-column: 4; grid-row: 1; }
+  table.model-card > tbody > tr > td.model-device, table.model-card > tbody > tr > td.file { grid-column: span 3; }
+  table.model-card > tbody > tr > td.model-thr, table.model-card > tbody > tr > td.model-night,
+  table.model-card > tbody > tr > td.model-classes, table.model-card > tbody > tr > td.running { grid-column: span 2; }
+  table.model-card select, table.model-card td.model-device select { width: 100%; max-width: 100%; }
+  table.model-card td.running { max-width: none; }
+  table.model-card .sub { white-space: normal; }
+  td.model-thr input.thr-input, td.model-night input.night-thr { width: 100%; }
+}
+@media (min-width: 701px) and (max-width: 900px) {
+  table.rcards th, table.rcards td { padding-left: 0.45rem; padding-right: 0.45rem; }
+  header nav a { display: flex; align-items: center; min-height: 44px; }
+  header { padding-top: 0; padding-bottom: 0; }
+}
+
+/* Cards under 700 px. */
+@media (max-width: 700px) {
+  .scroll:has(> table.rcards) { overflow-x: visible; }
+  table.rcards { display: block; width: 100%; background: none; border: 0; border-radius: 0; }
+  table.rcards > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  table.rcards > tbody { display: block; width: 100%; }
+  table.rcards > tbody > tr { display: block; width: 100%; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.75rem; margin: 0 0 0.6rem; }
+  .card table.rcards > tbody > tr { background: var(--bg); }
+  table.rcards > tbody > tr > td, table.rcards > tbody > tr > th { display: block; width: auto; max-width: none; border: 0; padding: 0.12rem 0; text-align: left; white-space: normal; overflow-wrap: anywhere; overflow: visible; }
+  table.rcards > tbody > tr > td:empty { display: none; }
+  table.rcards > tbody > tr > td[data-label]::before { content: attr(data-label); display: inline-block; min-width: 6.2rem; margin-right: 0.4rem; color: var(--muted); font-size: 0.8rem; font-weight: normal; }
+  table.rcards > tbody > tr > td.rc-block[data-label]::before { display: block; margin: 0.25rem 0 0.1rem; }
+  table.rcards > tbody > tr > td.rc-title, table.models.rcards > tbody > tr > td:first-child { font-weight: 600; font-size: 1rem; }
+  table.rcards > tbody > tr > td.rc-title-plain { padding-bottom: 0.25rem; }
+  table.rcards > tbody > tr > td.rc-action { padding-top: 0.35rem; }
+  table.rcards > tbody > tr > td.rc-badge:not(:has(> :not([hidden]))) { display: none; }
+  table.rcards td .inline-row, table.rcards td form.inline { gap: 0.4rem; }
+  table.rcards td form.inline { margin: 0.2rem 0; }
+  table.rcards td form.inline select { max-width: 100%; }
+  table.rcards td .detail { display: block; overflow-wrap: anywhere; }
+  table.rcards > tbody > tr[hidden] { display: none; }
+  table.rcards > tbody > tr.tr-metrics-row, table.rcards > tbody > tr.tr-switch-row { padding: 0.4rem 0.5rem; }
+  .tr-metrics { max-width: 100%; }
+
+  /* rgrid: label over value, three to a row (rc-title and rc-wide take the whole row). */
+  table.rgrid > tbody > tr { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.2rem 0.6rem; }
+  table.rgrid > tbody > tr > td.rc-title, table.rgrid > tbody > tr > td.rc-wide, table.stats > tbody > tr > td.state { grid-column: 1 / -1; }
+  table.rgrid > tbody > tr > td[data-label]::before { display: block; min-width: 0; margin: 0; }
+  table.rgrid > tbody > tr > td input { width: 100%; }
+
+  /* Stats: the sticky column has no column left to stick to. */
+  table.stats.rcards td:first-child { position: static; box-shadow: none; background: none; }
+  table.sticky-first.rcards { border-collapse: collapse; }
+  table.stats td { white-space: normal; }
+
+  /* Config: Load and Default beside the name, then one field per line. */
+  table.model-card > tbody > tr { grid-template-columns: minmax(0, 1fr) auto auto; gap: 0 0.8rem; align-items: center; }
+  table.model-card > tbody > tr > td, table.model-card > tbody > tr > td.model-device, table.model-card > tbody > tr > td.file,
+  table.model-card > tbody > tr > td.model-thr, table.model-card > tbody > tr > td.model-night,
+  table.model-card > tbody > tr > td.model-classes, table.model-card > tbody > tr > td.running { grid-column: 1 / -1; }
+  table.model-card > tbody > tr > td[data-label]::before { min-width: 6.2rem; }
+  table.model-card > tbody > tr > td:not(.rc-block)[data-label]::before { display: inline-block; }
+  table.model-card > tbody > tr > td.mc-name { grid-column: 1; grid-row: 1; }
+  table.model-card > tbody > tr > td.mc-load { grid-column: 2; grid-row: 1; }
+  table.model-card > tbody > tr > td.mc-default { grid-column: 3; grid-row: 1; }
+  table.model-card > tbody > tr > td.mc-load, table.model-card > tbody > tr > td.mc-default { text-align: center; }
+  table.model-card > tbody > tr > td.mc-load::before, table.model-card > tbody > tr > td.mc-default::before { display: block; min-width: 0; margin: 0; }
+  table.model-card td.file code { max-width: 100%; }
+  ul.thr-profile-list li { white-space: normal; }
+
+  /* Collect: the bucket's name and switch on one line. */
+  table.buckets > tbody > tr > td.bk-key { grid-column: 1 / 3; grid-row: 1; }
+  table.buckets > tbody > tr > td.bk-on { grid-column: 3; grid-row: 1; display: flex; align-items: center; justify-content: flex-end; gap: 0.4rem; }
+  table.buckets > tbody > tr > td.bk-on::before { flex: none; }
+  table.buckets > tbody > tr > td.bk-when { font-size: 0.85rem; color: var(--muted); }
+
+  /* Facts: a path or a long value takes the whole row. */
+  .facts div { min-width: 0; }
+  .facts div:has(code), .facts div:has(.error) { grid-column: 1 / -1; }
+  pre.example { white-space: pre-wrap; overflow-wrap: anywhere; }
+}
+
+/* Train: the tabs scroll, the sizes of a family wrap instead of scrolling. */
+@media (max-width: 900px) {
+  nav.train-tabs { flex-wrap: nowrap; }
+  .tr-rec { white-space: normal; }
+  .scroll:has(> table.tr-models) { overflow-x: visible; }
+  table.tr-models, table.tr-models tbody { display: block; width: 100%; }
+  table.tr-models tr { display: grid; grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr)); border-bottom: 1px solid var(--border); padding: 0.3rem 0; }
+  table.tr-models tr > th { grid-column: 1 / -1; }
+  table.tr-models tr > th, table.tr-models tr > td { border: 0; padding: 0.2rem 0.4rem; }
+  table.tr-models tr > td:empty { display: none; }
+  table.tr-models tr > td[colspan] { grid-column: 1 / -1; }
+}
+
+/* Benchmark, Tune: a tablet fits the whole table. */
+@media (min-width: 701px) and (max-width: 1000px) {
+  table.profile-table th, table.profile-table td { padding-left: 0.35rem; padding-right: 0.35rem; }
+  table.profile-table td .chip, table.profile-table td .tag { white-space: normal; }
+}
+
+/* ---- Review: frame, question, answers, Save on one screen ---- */
+@media (hover: none) {
+  .rv-decide kbd, .rv-q-classes kbd, .rv-q-reason kbd { display: none; }
+  .review-stage canvas:focus-visible { outline: none; }
+  #rv-keys-open { display: none; }
+}
+@media (max-width: 900px) {
+  .review-side.card { padding: 0.4rem 0.6rem 0; }
+  .review-side > #rv-crop-wrap { order: 1; }
+  .review-side > #rv-decide { order: 2; scroll-margin-bottom: 5.5rem; }
+  .review-side > #rv-msg { order: 3; }
+  .rv-actions { display: contents; }
+  .rv-actions-more { order: 4; display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.2rem 0; }
+  .rv-actions-more button { flex: 1 1 0; margin: 0; }
+  .review-side > #rv-box-tools { order: 5; }
+  .review-side > .review-boxes { order: 6; max-height: none; overflow: visible; }
+  .review-side > label.check { order: 7; }
+  .review-side > #rv-session { order: 8; }
+  .review-side > #rv-panel-opts { order: 9; }
+  /* The bottom bar: sticks to the bottom of the screen while the panel is in view. */
+  .rv-actions-main { order: 20; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.35rem; position: sticky; bottom: 0; z-index: 10; margin: 0.3rem -0.6rem 0; padding: 0.4rem 0.6rem calc(0.4rem + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--border); }
+  .rv-actions-main button { margin: 0; padding-left: 0.3rem; padding-right: 0.3rem; font-size: 0.88rem; line-height: 1.2; }
+  #rv-accept-likely:not([hidden]) + #rv-accept-all { display: none; }
+  .rv-box-tools .rv-tool-likely { display: none; }
+  .rv-box-tools.rv-only-likely { display: none; }
+  .rv-q-btns button.small { min-height: 44px; flex: 1 1 auto; margin: 0; }
+  .rv-q-btns button.small { padding-left: 0.4rem; padding-right: 0.4rem; font-size: 0.85rem; }
+  .rv-q-btns button.ok:first-child, .rv-q-btns button.bad:nth-child(2) { flex: 1 1 40%; font-size: 1rem; min-height: 48px; }
+  /* The optional reasons: one row that scrolls sideways, not a block of buttons. */
+  .rv-q-reason { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .rv-q-reason button.small { flex: none; padding: 0 0.6rem; font-size: 0.85rem; }
+  .rv-q-spot button.small, .rv-q-dup button.small { font-size: 0.85rem; padding: 0 0.6rem; }
+  .rv-q-classes { gap: 0.35rem; }
+  .review-crop figcaption .rv-crop-wide { display: none; }
+  .review-boxes li.compact { min-height: 44px; }
+  .rv-chip { white-space: normal; }
+}
+@media (max-width: 700px) {
+  /* One line over the frame; Details opens the rest. */
+  .rv-phone-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin: 0 0 0.25rem; font-size: 0.9rem; }
+  .rv-phone-line { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .rv-phone-head button.small { flex: none; margin: 0; min-height: 36px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
+  main:has(#review:not(.rv-info-open)) .train-strip { display: none; }
+  #review:not(.rv-info-open):not(:has(#rv-none:not([hidden]))) > .rv-bar,
+  #review:not(.rv-info-open):not(:has(#rv-none:not([hidden]))) > #rv-filters-card,
+  #review:not(.rv-info-open) .review-meta { display: none; }
+  .rv-bar { margin-bottom: 0.3rem; }
+  /* The frame edge to edge, its view buttons under it. */
+  .review-stage { display: flex; flex-direction: column; margin: 0 -1rem; }
+  .review-stage canvas { border-radius: 0; }
+  .review-stage #rv-none { padding: 1rem; }
+  .review-meta-row { order: 2; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 0.3rem; padding: 0.15rem 1rem 0; }
+  .review-meta-row .review-meta { flex: 1 1 100%; margin: 0; }
+  .review-meta-row button.small { min-height: 36px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
+  .review-grid { gap: 0.25rem; }
+  .review-side.card { border: 0; background: none; padding: 0; border-radius: 0; }
+  .rv-actions-main { margin-left: -1rem; margin-right: -1rem; padding-left: 0.6rem; padding-right: 0.6rem; }
+  .review-crop figcaption { display: none; }
+  .rv-decide { margin: 0.3rem 0; padding: 0.4rem 0.5rem; background: var(--card); }
+  .rv-q-why { -webkit-line-clamp: 1; }
+}

@@ -7,6 +7,9 @@
 (function () {
   "use strict";
   var PERIOD = 2000, MAX_PERIOD = 30000, RESTART_GIVE_UP_MS = 120000;
+  // On a phone the header's links are one row that scrolls: the current page in view.
+  var navRow = document.querySelector("header nav"), navHere = navRow && navRow.querySelector("a.active");
+  if (navHere) navRow.scrollLeft = navHere.offsetLeft - navRow.offsetLeft - (navRow.clientWidth - navHere.offsetWidth) / 2;
   var listeners = [], etag = null, last = null, busy = null, failures = 0, timer = null;
 
   function emit(data, prev) {

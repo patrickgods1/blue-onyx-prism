@@ -48,17 +48,17 @@
       <summary>Advanced</summary>
       <p class="muted">Which kinds of frame are kept, how often, and how alike two frames may be. Saved with the button above.</p>
       <div class="scroll">
-      <table class="buckets">
+      <table class="buckets rcards rgrid">
         <thead><tr><th>Bucket</th><th>Saved when</th><th>On</th><th>Rate (0..1)</th><th>Min interval per camera (s)</th><th>Saved</th></tr></thead>
         <tbody>
         {% for b in buckets %}
         <tr>
-          <td><code>{{ b.key }}</code></td>
-          <td>{{ b.describe }}</td>
-          <td><input type="checkbox" name="{{ b.key }}.enabled" aria-label="{{ b.key }} on"{% if b.enabled %} checked{% endif %}></td>
-          <td><input type="number" name="{{ b.key }}.rate" aria-label="{{ b.key }} rate" min="0" max="1" step="0.01" value="{{ b.rate }}"></td>
-          <td><input type="number" name="{{ b.key }}.interval" aria-label="{{ b.key }} interval" min="0" step="1" value="{{ b.interval }}"></td>
-          <td class="num">{{ b.saved }}</td>
+          <td class="rc-title bk-key"><code>{{ b.key }}</code></td>
+          <td class="rc-wide bk-when">{{ b.describe }}</td>
+          <td class="bk-on" data-label="On"><input type="checkbox" name="{{ b.key }}.enabled" aria-label="{{ b.key }} on"{% if b.enabled %} checked{% endif %}></td>
+          <td data-label="Rate (0..1)"><input type="number" name="{{ b.key }}.rate" aria-label="{{ b.key }} rate" min="0" max="1" step="0.01" value="{{ b.rate }}"></td>
+          <td data-label="Min interval (s)"><input type="number" name="{{ b.key }}.interval" aria-label="{{ b.key }} interval" min="0" step="1" value="{{ b.interval }}"></td>
+          <td class="num" data-label="Saved">{{ b.saved }}</td>
         </tr>
         {% endfor %}
         </tbody>
@@ -72,10 +72,10 @@
       <h3>Frames by scene and bucket</h3>
       <p class="muted">A frame counts once in each bucket it was kept for.</p>
       <div class="scroll">
-      <table>
+      <table class="rcards rgrid">
         <thead><tr><th>Scene</th>{% for n in bucket_names %}<th>{{ n }}</th>{% endfor %}</tr></thead>
         <tbody>
-        {% for s in scenes %}<tr><td>{{ s.scene }}</td>{% for c in s.counts %}<td class="num">{{ c }}</td>{% endfor %}</tr>{% endfor %}
+        {% for s in scenes %}<tr><td class="rc-title">{{ s.scene }}</td>{% for c in s.counts %}<td class="num" data-label="{{ bucket_names[loop.index0] }}">{{ c }}</td>{% endfor %}</tr>{% endfor %}
         </tbody>
       </table>
       </div>
@@ -101,10 +101,10 @@
 <div class="card">
   <h2>Cameras</h2>
   {% if cameras.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
-  <table>
+  <table class="rcards">
     <thead><tr><th>Camera</th><th>Frames</th><th>MB</th><th>Newest (UTC)</th></tr></thead>
     <tbody>
-    {% for c in cameras %}<tr><td>{{ c.name }}</td><td class="num">{{ c.frames }}</td><td class="num">{{ c.mb }}</td><td>{{ c.newest }}</td></tr>{% endfor %}
+    {% for c in cameras %}<tr><td class="rc-title">{{ c.name }}</td><td class="num" data-label="Frames">{{ c.frames }}</td><td class="num" data-label="MB">{{ c.mb }}</td><td data-label="Newest (UTC)">{{ c.newest }}</td></tr>{% endfor %}
     </tbody>
   </table>
   {% endif %}
@@ -114,9 +114,9 @@
   <h2>Imported footage</h2>
   <p class="muted">Frames imported on the <a href="/train/import">Import</a> tab or with <code>train import</code> (videos, image folders, Blue Iris clips, URLs, pinned open footage) are stored here like collected frames, with no bucket, and queued for review. Their sidecars carry the source and licence.</p>
   {% if imports.is_empty() %}<p class="muted">No imports yet.</p>{% else %}
-  <div class="scroll"><table>
+  <div class="scroll"><table class="rcards">
     <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Scenes</th><th>Cameras</th></tr></thead>
-    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}</td><td class="num">{{ i.frames }}</td><td>{% for (k, v) in i.scenes %}{{ k }} {{ v }} {% endfor %}</td><td>{{ i.cameras.join(", ") }}</td></tr>{% endfor %}</tbody>
+    <tbody>{% for i in imports %}<tr><td class="rc-title-plain"><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td data-label="Source">{{ i.source }}</td><td data-label="Licence">{{ i.license }}</td><td class="num" data-label="Frames">{{ i.frames }}</td><td data-label="Scenes">{% for (k, v) in i.scenes %}{{ k }} {{ v }} {% endfor %}</td><td data-label="Cameras">{{ i.cameras.join(", ") }}</td></tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}
 </div>

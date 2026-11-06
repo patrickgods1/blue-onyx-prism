@@ -27,20 +27,20 @@
   </details>
   {% if c.force_cpu %}<p class="warn">Force CPU is on and overrides every per-model device. <a href="#inference">Change</a></p>{% endif %}
   <div class="scroll">
-  <table class="model-card">
+  <table class="model-card rcards">
   <thead><tr><th>Load</th><th>Default</th><th>Name</th><th>Family</th><th>Device</th><th>Threshold</th><th title="Model that answers this model's night / IR frames">Night model</th><th title="Which classes this model reports (its object filter)">Classes</th><th>Running</th><th>File</th><th>Entry</th></tr></thead>
   <tbody>
   {% for m in models %}
   <tr data-model="{{ m.key }}"{% if !m.pending.is_empty() %} class="pending"{% endif %}>
-    <td><input type="checkbox" data-key="model:enabled:{{ m.key }}" name="enabled" value="{{ m.name }}" aria-label="Load {{ m.name }}"{% if m.enabled %} checked{% endif %}></td>
-    <td><input type="radio" data-key="default" name="default_model" value="{{ m.name }}" aria-label="Default {{ m.name }}"{% if m.is_default %} checked{% endif %}></td>
-    <td>{{ m.name }} <span class="tag restart pending-badge" title="{{ m.pending.join("; ") }}"{% if m.pending.is_empty() %} hidden{% endif %}>restart needed</span></td>
-    <td>{{ m.family }}</td>
-    <td class="model-device"><select data-key="model:device:{{ m.key }}" name="device.{{ m.name }}" aria-label="Device of {{ m.name }}">
+    <td class="mc-load" data-label="Load"><input type="checkbox" data-key="model:enabled:{{ m.key }}" name="enabled" value="{{ m.name }}" aria-label="Load {{ m.name }}"{% if m.enabled %} checked{% endif %}></td>
+    <td class="mc-default" data-label="Default"><input type="radio" data-key="default" name="default_model" value="{{ m.name }}" aria-label="Default {{ m.name }}"{% if m.is_default %} checked{% endif %}></td>
+    <td class="rc-title mc-name">{{ m.name }} <span class="tag restart pending-badge" title="{{ m.pending.join("; ") }}"{% if m.pending.is_empty() %} hidden{% endif %}>restart needed</span></td>
+    <td data-label="Family">{{ m.family }}</td>
+    <td class="model-device rc-block" data-label="Device"><select data-key="model:device:{{ m.key }}" name="device.{{ m.name }}" aria-label="Device of {{ m.name }}">
       {% for d in m.devices %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}{% if d.disabled %} disabled class="unavailable"{% endif %} data-key="{{ d.key }}" data-thr="{{ d.thr }}" data-src="{{ d.src }}" data-bench="{{ d.bench }}">{{ d.label }}</option>{% endfor %}
       </select>
       <span class="bench-hint sub">{% if let Some(b) = m.bench %}<a href="{{ b.href }}" title="{{ b.title }}">{{ b.text }}</a>{% endif %}</span></td>
-    <td class="model-thr" data-fallback="{{ m.threshold_fallback }}" data-fallback-src="{{ m.threshold_fallback_source }}" data-running-thr="{{ m.running_threshold }}"><input type="number" class="thr-input" data-key="model:threshold:{{ m.key }}" name="threshold.{{ m.name }}" min="0" max="1" step="0.01" value="{{ m.threshold }}" placeholder="{{ m.threshold_placeholder }}" aria-label="Confidence threshold of {{ m.name }} on the selected device (empty = {{ m.threshold_placeholder }})"><input type="hidden" class="thr-key" name="threshold_key.{{ m.name }}" value="{{ m.threshold_key }}">
+    <td class="model-thr rc-block" data-label="Threshold" data-fallback="{{ m.threshold_fallback }}" data-fallback-src="{{ m.threshold_fallback_source }}" data-running-thr="{{ m.running_threshold }}"><input type="number" class="thr-input" data-key="model:threshold:{{ m.key }}" name="threshold.{{ m.name }}" min="0" max="1" step="0.01" value="{{ m.threshold }}" placeholder="{{ m.threshold_placeholder }}" aria-label="Confidence threshold of {{ m.name }} on the selected device (empty = {{ m.threshold_placeholder }})"><input type="hidden" class="thr-key" name="threshold_key.{{ m.name }}" value="{{ m.threshold_key }}">
       <span class="thr-hint sub">{% if !m.threshold_key.is_empty() %}<span class="muted">for <code>{{ m.threshold_key }}</code></span>{% endif %}{% if let Some(t) = m.best_threshold %}{% if !m.threshold_key.is_empty() %} &middot; {% endif %}<span class="muted" title="Best confidence for {{ t.1 }} in the last benchmark">benchmark best {{ t.0 }}</span>{% if let Some(st) = t.2 %} <span class="muted">{{ st }}</span>{% else %} <button type="button" class="small secondary" data-use-threshold="{{ t.0 }}" title="Put {{ t.0 }} in the threshold field (then save)">use</button>{% endif %}{% endif %}</span>
       <details class="thr-profiles"><summary class="small">Confidence per device{% if !m.profiles.is_empty() %} ({{ m.profiles.len() }}){% endif %}</summary>
       <p class="muted small">Each device can have its own threshold; devices without one use the default.</p>
@@ -48,14 +48,14 @@
       <p class="muted small thr-profile-none"{% if !m.profiles.is_empty() %} hidden{% endif %}>No device has its own threshold yet.</p>
       <label class="small">Default for other devices <input type="number" class="thr-default" data-key="model:confidence_threshold:{{ m.key }}" name="threshold_default.{{ m.name }}" min="0" max="1" step="0.01" value="{{ m.default_threshold }}" placeholder="{{ global_threshold }}" aria-label="Default confidence threshold of {{ m.name }} (empty = global {{ global_threshold }})"{% if m.threshold_key.is_empty() %} disabled{% endif %}></label>
       </details></td>
-    <td class="model-night"><select data-key="model:night_model:{{ m.key }}" name="night.{{ m.name }}" aria-label="Night model of {{ m.name }}" title="Night / IR frames of {{ m.name }} are answered by this model (falls back to {{ m.name }} while it is not loaded)">
+    <td class="model-night rc-block" data-label="Night model"><select data-key="model:night_model:{{ m.key }}" name="night.{{ m.name }}" aria-label="Night model of {{ m.name }}" title="Night / IR frames of {{ m.name }} are answered by this model (falls back to {{ m.name }} while it is not loaded)">
       {% for d in m.night_models %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}>{{ d.label }}</option>{% endfor %}
       </select>
       <input type="number" class="night-thr" data-key="model:night_threshold:{{ m.key }}" name="night_threshold.{{ m.name }}" min="0" max="1" step="0.01" value="{{ m.night_threshold }}" placeholder="0.30" aria-label="Confidence threshold of {{ m.name }} on night / IR frames" title="Replaces the threshold of {{ m.name }} on night / IR frames (lower or higher)"{% if !m.night_self %} hidden{% endif %}></td>
-    <td class="model-classes"><input type="hidden" class="of-value" name="object_filter.{{ m.name }}" value="{{ m.object_filter }}"><span class="of-summary" data-model="{{ m.name }}">{{ m.object_filter_text }}</span> <button type="button" class="small secondary of-edit" data-model="{{ m.name }}" aria-label="Choose the classes of {{ m.name }}" hidden>Choose&hellip;</button></td>
-    <td class="running st-{{ m.running_class }}"><span class="run-text">{{ m.running }}</span>{% if let Some(d) = m.running_detail %}<details class="run-detail"><summary title="{{ d }}">{{ d }}</summary></details>{% endif %}</td>
-    <td class="file"><code title="{{ m.path }}">{{ m.file_name }}</code>{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-export" title="{{ x }}: exported on this machine on request">export it</a>{% else if !m.exists %} <span class="muted">(missing)</span>{% endif %}</td>
-    <td class="model-remove-cell"><button type="submit" class="small danger model-remove" form="model-remove" name="name" value="{{ m.name }}" data-confirm="Remove {{ m.name }} from the config and delete its files in the models folder? Files outside it and catalog models stay."{% if m.enabled %} disabled title="Enabled: disable it first (untick Load and save), then remove it"{% else %} title="Remove this entry from the config and delete its model files in the models folder"{% endif %}>Remove</button></td>
+    <td class="model-classes rc-block" data-label="Classes"><input type="hidden" class="of-value" name="object_filter.{{ m.name }}" value="{{ m.object_filter }}"><span class="of-summary" data-model="{{ m.name }}">{{ m.object_filter_text }}</span> <button type="button" class="small secondary of-edit" data-model="{{ m.name }}" aria-label="Choose the classes of {{ m.name }}" hidden>Choose&hellip;</button></td>
+    <td class="running rc-block st-{{ m.running_class }}" data-label="Running"><span class="run-text">{{ m.running }}</span>{% if let Some(d) = m.running_detail %}<details class="run-detail"><summary title="{{ d }}">{{ d }}</summary></details>{% endif %}</td>
+    <td class="file" data-label="File"><code title="{{ m.path }}">{{ m.file_name }}</code>{% if let Some(x) = m.needs_export %} <span class="tag restart">needs export</span> <a href="#res-models-export" title="{{ x }}: exported on this machine on request">export it</a>{% else if !m.exists %} <span class="muted">(missing)</span>{% endif %}</td>
+    <td class="model-remove-cell rc-action"><button type="submit" class="small danger model-remove" form="model-remove" name="name" value="{{ m.name }}" data-confirm="Remove {{ m.name }} from the config and delete its files in the models folder? Files outside it and catalog models stay."{% if m.enabled %} disabled title="Enabled: disable it first (untick Load and save), then remove it"{% else %} title="Remove this entry from the config and delete its model files in the models folder"{% endif %}>Remove</button></td>
   </tr>
   {% endfor %}
   </tbody>
@@ -95,15 +95,15 @@
   <p class="muted">No other <code>.onnx</code> / <code>.xml</code> files in <code>{{ models_dir }}</code>.</p>
   {% else %}
   <div class="scroll">
-  <table class="resources">
+  <table class="resources rcards">
   <thead><tr><th>File</th><th>Size</th><th>Family</th><th>Action</th></tr></thead>
   <tbody>
   {% for l in local_models %}
   <tr id="resource-{{ l.id }}" data-id="{{ l.id }}">
-    <td><code>{{ l.file }}</code>{% if let Some(a) = l.also %} <span class="muted">(also <code>{{ a }}</code>)</span>{% endif %}<br><span class="muted">{{ l.note }}</span></td>
-    <td class="num">{{ l.size_text }}</td>
-    <td>{{ l.family }}</td>
-    <td><form method="post" action="/v1/resources/add-to-config#resource-{{ l.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ l.id }}"><button type="submit">Add to config</button></form>{% if at_row == l.id %}{% call notices("resources-row") %}{% endcall %}{% endif %}</td>
+    <td class="rc-title-plain"><code>{{ l.file }}</code>{% if let Some(a) = l.also %} <span class="muted">(also <code>{{ a }}</code>)</span>{% endif %}<br><span class="muted">{{ l.note }}</span></td>
+    <td class="num" data-label="Size">{{ l.size_text }}</td>
+    <td data-label="Family">{{ l.family }}</td>
+    <td class="rc-action"><form method="post" action="/v1/resources/add-to-config#resource-{{ l.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ l.id }}"><button type="submit">Add to config</button></form>{% if at_row == l.id %}{% call notices("resources-row") %}{% endcall %}{% endif %}</td>
   </tr>
   {% endfor %}
   </tbody>
@@ -140,17 +140,17 @@
   {% if g.key == "models-export" %}{% if let Some(n) = g.note %}<p class="muted small res-note">{{ n }}</p>{% endif %}<details class="help"><summary>About exports</summary><p>{{ export_notice }} Export makes <code>&lt;name&gt;.onnx</code> + <code>.yaml</code> in <code>{{ models_dir }}</code> (runs on OpenVINO and ONNX Runtime incl. CoreML); the toolchain lives in <code>{{ tools_dir }}</code> (remove it with <em>Remove export toolchain</em>). Nothing is exported automatically. CLI: <code>blue-onyx-prism fetch --resource model:yolo11s --allow-large</code>; by hand: <code>scripts/export_model.py</code>.</p></details>
   <p class="export-add-row" hidden><label class="check"><input type="checkbox" id="export-add-to-config" checked> Add exported models to the config</label></p>{% endif %}
   <div class="scroll">
-  <table class="resources">
+  <table class="resources rcards">
   <colgroup><col><col class="c-size"><col class="c-state"><col class="c-action"></colgroup>
   <thead><tr><th>Resource</th><th>Size</th><th>State</th><th>Action</th></tr></thead>
   <tbody>
   {% for r in g.rows %}
   <tr id="resource-{{ r.id }}" data-id="{{ r.id }}" data-busy="{{ r.busy }}" data-state="{{ r.state }}">
-    <td>{{ r.title }} <code>{{ r.id }}</code>{% if let Some(v) = r.update_available %} <span class="tag update" title="Installed in an older version; Update replaces it in place (a loaded runtime is used after a restart)">update to {{ v }}</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% endif %}</span></td>
-    <td class="num">{{ r.size_text }}{% if let Some(n) = r.size_note %}<br><span class="muted">{{ n }}</span>{% else if r.large && r.action != "export" %}<br><span class="muted">large</span>{% endif %}</td>
-    <td class="res-state"><span class="res-text">{{ r.state_text }}</span>{% if r.busy %}<br><progress max="100"{% if let Some(p) = r.progress %} value="{{ p }}"{% endif %}></progress>{% endif %}{% if r.active %} <span class="tag">active</span>{% endif %}{% if r.loaded %} <span class="tag">loaded</span>{% endif %}{% if !r.blocking.is_empty() %}<br><span class="muted">needed by {{ r.blocking.join(", ") }}</span>{% endif %}{% if !r.log.is_empty() %}<details class="res-log"><summary>output</summary><pre>{% for l in r.log %}{{ l }}
+    <td class="rc-title-plain">{{ r.title }} <code>{{ r.id }}</code>{% if let Some(v) = r.update_available %} <span class="tag update" title="Installed in an older version; Update replaces it in place (a loaded runtime is used after a restart)">update to {{ v }}</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% endif %}</span></td>
+    <td class="num" data-label="Size">{{ r.size_text }}{% if let Some(n) = r.size_note %}<br><span class="muted">{{ n }}</span>{% else if r.large && r.action != "export" %}<br><span class="muted">large</span>{% endif %}</td>
+    <td class="res-state" data-label="State"><span class="res-text">{{ r.state_text }}</span>{% if r.busy %}<br><progress max="100"{% if let Some(p) = r.progress %} value="{{ p }}"{% endif %}></progress>{% endif %}{% if r.active %} <span class="tag">active</span>{% endif %}{% if r.loaded %} <span class="tag">loaded</span>{% endif %}{% if !r.blocking.is_empty() %}<br><span class="muted">needed by {{ r.blocking.join(", ") }}</span>{% endif %}{% if !r.log.is_empty() %}<details class="res-log"><summary>output</summary><pre>{% for l in r.log %}{{ l }}
 {% endfor %}</pre></details>{% endif %}</td>
-    <td class="res-action">
+    <td class="res-action rc-action">
     {% if r.action == "export" %}
       {% if r.busy %}<form method="post" action="/v1/resources/export/cancel#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger small" data-confirm="Cancel the export of {{ r.title }}?">Cancel</button></form>
       {% else if r.state == "installed" %}

@@ -110,9 +110,9 @@
   <details class="tr-more">
   <summary>Recent imports ({{ imports.len() }})</summary>
   <p class="muted small">In <code>{{ imports_dir }}</code>, the folder auto-label works on (the Review tab's).</p>
-  <div class="scroll"><table>
+  <div class="scroll"><table class="rcards">
     <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Cameras</th><th></th></tr></thead>
-    <tbody>{% for i in imports %}<tr><td><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td>{{ i.source }}</td><td>{{ i.license }}{% if let Some(a) = i.attribution %}<br><span class="muted small">{{ a }}</span>{% endif %}</td><td class="num">{{ i.frames }}</td><td>{{ i.cameras.join(", ") }}</td><td>{% if i.frames > 0 %}<a class="small" href="/train/autolabel?import={{ i.id }}&amp;status=any&amp;limit={{ i.frames }}">Auto-label</a>{% endif %}</td></tr>{% endfor %}</tbody>
+    <tbody>{% for i in imports %}<tr><td class="rc-title-plain"><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td data-label="Source">{{ i.source }}</td><td data-label="Licence">{{ i.license }}{% if let Some(a) = i.attribution %}<br><span class="muted small">{{ a }}</span>{% endif %}</td><td class="num" data-label="Frames">{{ i.frames }}</td><td data-label="Cameras">{{ i.cameras.join(", ") }}</td><td class="rc-action">{% if i.frames > 0 %}<a class="small" href="/train/autolabel?import={{ i.id }}&amp;status=any&amp;limit={{ i.frames }}">Auto-label</a>{% endif %}</td></tr>{% endfor %}</tbody>
   </table></div>
   </details>
   {% endif %}

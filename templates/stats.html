@@ -5,7 +5,7 @@
 <p class="muted">Uptime <span id="uptime">{{ uptime }}</span> &middot; <span id="live">updates every 5 s</span> &middot; <a href="/stats.json">JSON</a></p>
 <noscript><p class="muted">Reload the page to update (live updates need JavaScript).</p></noscript>
 <div class="scroll">
-<table class="stats sticky-first">
+<table class="stats sticky-first rcards rgrid">
 <thead>
 <tr class="group-head"><th rowspan="2">Model</th><th rowspan="2">State</th><th rowspan="2">Runtime</th><th rowspan="2">Device</th><th rowspan="2">Fell back</th>
 <th rowspan="2">Requests</th><th rowspan="2">Dropped</th><th rowspan="2">Queue</th>
@@ -15,15 +15,15 @@
 <tbody id="stats-body">
 {% for m in models %}
 <tr class="st-{{ m.state_class }}">
-<td>{{ m.name }}{% if m.is_default %} <span class="tag">default</span>{% endif %}</td>
+<td class="rc-title">{{ m.name }}{% if m.is_default %} <span class="tag">default</span>{% endif %}</td>
 <td class="state">{{ m.state }}{% if let Some(d) = m.state_detail %}<br><span class="detail">{{ d }}</span>{% endif %}</td>
-<td>{{ m.runtime }}</td>
-<td class="trunc" title="{{ m.device }}">{{ m.provider }}</td>
-<td>{{ m.fell_back }}</td>
-<td class="num">{{ m.requests }}</td>
-<td class="num">{{ m.dropped }}</td>
-<td class="num">{{ m.queue }}</td>
-{% for s in m.timings %}<td class="num">{{ s.avg }}</td><td class="num">{{ s.min }}</td><td class="num">{{ s.max }}</td>{% endfor %}
+<td data-label="Runtime">{{ m.runtime }}</td>
+<td class="trunc" data-label="Device" title="{{ m.device }}">{{ m.provider }}</td>
+<td data-label="Fell back">{{ m.fell_back }}</td>
+<td class="num" data-label="Requests">{{ m.requests }}</td>
+<td class="num" data-label="Dropped">{{ m.dropped }}</td>
+<td class="num" data-label="Queue">{{ m.queue }}</td>
+{% for s in m.timings %}{% let n = ["Inference", "Process", "Round trip"][loop.index0] %}<td class="num" data-label="{{ n }} avg">{{ s.avg }}</td><td class="num" data-label="{{ n }} min">{{ s.min }}</td><td class="num" data-label="{{ n }} max">{{ s.max }}</td>{% endfor %}
 </tr>
 {% endfor %}
 </tbody>

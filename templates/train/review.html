@@ -3,6 +3,7 @@
 {% block content %}
 {% include "train/tabs.html" %}
 <div id="review" data-classes="{{ classes_json }}">
+<div id="rv-phone-head" class="rv-phone-head"><span id="rv-phone-line" class="rv-phone-line">Review</span> <button type="button" id="rv-info-toggle" class="small secondary" aria-expanded="false">Details</button></div>
 <div class="rv-bar">
   <div id="rv-counts" class="review-counts" role="status">Loading...</div>
   <a id="rv-autolabel-link" class="rv-al-link" href="/train/autolabel">Auto-label these frames</a>
@@ -43,14 +44,19 @@
     <ol id="rv-boxes" class="review-boxes" aria-label="Boxes"></ol>
     <label class="check"><input type="checkbox" id="rv-empty"> Confirmed empty (no object of any class)</label>
     <div class="inline-row rv-actions">
+      <div class="rv-actions-main">
       <button type="button" id="rv-save">Save &amp; next</button>
+      <button type="button" id="rv-accept-likely" class="small secondary" title="Accept every likely box (&#9733;) on this frame; the other boxes stay pending" hidden>Accept likely</button>
       <button type="button" id="rv-accept-all" class="small secondary">Accept proposals</button>
       <button type="button" id="rv-reject-rest" class="small secondary">Reject the rest</button>
+      </div>
+      <div class="rv-actions-more">
       <button type="button" id="rv-skip" class="small secondary">Skip</button>
       <button type="button" id="rv-back" class="small secondary">Back</button>
       <button type="button" id="rv-next" class="small secondary">Next</button>
       <button type="button" id="rv-undo" class="small secondary">Undo</button>
       <button type="button" id="rv-keys-open" class="small secondary">Keys ?</button>
+      </div>
     </div>
     <p id="rv-msg" class="form-msg" role="status"></p>
     <p id="rv-session" class="rv-session muted" aria-live="polite"></p>

@@ -34,9 +34,9 @@
 <div class="card" id="exports">
   <h2>Exports</h2>
   {% if exports.is_empty() %}<p class="muted">No export yet. Exports appear here and on the <a href="/train/train">Train</a> tab.</p>{% else %}
-  <div class="scroll"><table>
+  <div class="scroll"><table class="rcards">
     <thead><tr><th>Export</th><th class="num">Frames</th><th>Split</th><th>Boxes</th><th>Formats</th><th></th></tr></thead>
-    <tbody>{% for e in exports %}<tr><td title="{{ e.path }}">{{ e.when }}</td><td class="num">{% if let Some(n) = e.frames %}{{ n }}{% else %}?{% endif %}</td><td>{{ e.split }}</td><td>{{ e.classes }}</td><td>{{ e.formats }}</td><td><a class="small" href="{{ e.train_link }}">Train on it</a></td></tr>{% endfor %}</tbody>
+    <tbody>{% for e in exports %}<tr><td class="rc-title" title="{{ e.path }}">{{ e.when }}</td><td class="num" data-label="Frames">{% if let Some(n) = e.frames %}{{ n }}{% else %}?{% endif %}</td><td data-label="Split">{{ e.split }}</td><td data-label="Boxes">{{ e.classes }}</td><td data-label="Formats">{{ e.formats }}</td><td class="rc-action"><a class="small" href="{{ e.train_link }}">Train on it</a></td></tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}
 </div>
@@ -47,9 +47,9 @@
   {% else if coverage.is_empty() %}<p class="muted">No reviewed boxes yet in <code>{{ dir }}</code>.</p>
   {% else %}
   <p class="muted">Boxes on the {{ reviewed }} reviewed frames, by class, scene and camera. A class with few boxes in a scene will be weak there.</p>
-  <div class="scroll"><table>
+  <div class="scroll"><table class="rcards rgrid">
     <thead><tr><th>Class</th><th class="num">Total</th>{% for s in coverage_scenes %}<th class="num">{{ s }}</th>{% endfor %}{% for c in coverage_cameras %}<th class="num">{{ c }}</th>{% endfor %}{% if coverage_other %}<th class="num">Other cameras</th>{% endif %}</tr></thead>
-    <tbody>{% for r in coverage %}<tr><td>{{ r.class }}</td><td class="num">{{ r.total }}</td>{% for n in r.scenes %}<td class="num">{{ n }}</td>{% endfor %}{% for n in r.cameras %}<td class="num">{{ n }}</td>{% endfor %}{% if coverage_other %}<td class="num">{{ r.other }}</td>{% endif %}</tr>{% endfor %}</tbody>
+    <tbody>{% for r in coverage %}<tr><td class="rc-title">{{ r.class }}</td><td class="num" data-label="Total">{{ r.total }}</td>{% for n in r.scenes %}<td class="num" data-label="{{ coverage_scenes[loop.index0] }}">{{ n }}</td>{% endfor %}{% for n in r.cameras %}<td class="num" data-label="{{ coverage_cameras[loop.index0] }}">{{ n }}</td>{% endfor %}{% if coverage_other %}<td class="num" data-label="Other cameras">{{ r.other }}</td>{% endif %}</tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}
 </div>

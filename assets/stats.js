@@ -2,6 +2,9 @@
 // Update the table in place from /stats.json (keeps scroll position, no flicker).
 (function () {
   var body = document.getElementById("stats-body"), live = document.getElementById("live");
+  // Column names for the cards of a phone, the same as the template's data-label.
+  var LABELS = ["", "", "Runtime", "Device", "Fell back", "Requests", "Dropped", "Queue"];
+  ["Inference", "Process", "Round trip"].forEach(function (n) { LABELS.push(n + " avg", n + " min", n + " max"); });
   function td(text, cls, title) {
     var c = document.createElement("td");
     c.textContent = text;
@@ -24,7 +27,7 @@
       j.models.forEach(function (m) {
         var tr = document.createElement("tr");
         tr.className = "st-" + m.stateClass;
-        var name = td(m.name);
+        var name = td(m.name, "rc-title");
         if (m.default) {
           var t = document.createElement("span");
           t.className = "tag"; t.textContent = "default";
@@ -48,6 +51,7 @@
         [m.inferenceMs, m.processMs, m.roundTripMs].forEach(function (s) {
           stat(s).forEach(function (v) { tr.appendChild(td(v, "num")); });
         });
+        Array.prototype.forEach.call(tr.cells, function (c, i) { if (LABELS[i]) c.setAttribute("data-label", LABELS[i]); });
         frag.appendChild(tr);
       });
       // Same models in the same order: update the cells that changed in place (keeps a text
