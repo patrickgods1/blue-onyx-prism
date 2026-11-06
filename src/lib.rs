@@ -2,6 +2,7 @@
 //! object detection service on native OpenVINO, with ONNX Runtime as a second runtime.
 //!
 //! Module map (see CLAUDE.md):
+//! - [`admin_token`] the token remote administration needs: its file, creation and rotation
 //! - [`api`]       wire structs for the CodeProject.AI compatible JSON API
 //! - [`config`]    JSON config next to the executable, merged with CLI flags
 //! - [`config_form`] applying the web UI's forms (config page, models, devices, thresholds) to a `Config`
@@ -53,6 +54,7 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
 
+pub mod admin_token;
 pub mod api;
 #[allow(
     unsafe_code,

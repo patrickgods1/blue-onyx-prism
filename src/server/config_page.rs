@@ -11,11 +11,12 @@ use crate::config_form::FORM_FIELDS;
 use crate::sync::LockExt;
 use askama::Template;
 use axum::Json;
-use axum::extract::rejection::{FormRejection, QueryRejection};
-use axum::extract::{Form, Query, State};
+use axum::extract::rejection::{ExtensionRejection, FormRejection, QueryRejection};
+use axum::extract::{ConnectInfo, Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -618,6 +619,53 @@ fn timezone_choices(current: &str) -> Vec<TimezoneChoice> {
     out
 }
 
+/// The admin token card while `allow_remote_admin` is on. Never the token.
+pub(super) struct TokenPanel {
+    /// This machine: where the file is and how to read it, and the Rotate button.
+    local: Option<TokenFile>,
+}
+
+pub(super) struct TokenFile {
+    path: String,
+    command: String,
+}
+
+impl TokenFile {
+    fn of(state: &AppState) -> Self {
+        Self {
+            path: crate::admin_token::path(&state.config_read())
+                .display()
+                .to_string(),
+            command: crate::admin_token::read_command(&state.config_path),
+        }
+    }
+}
+
+/// The card for this request: a remote peer only gets a sign-out button.
+fn token_panel(
+    state: &AppState,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> Option<TokenPanel> {
+    let on = state.config_read().allow_remote_admin;
+    on.then(|| TokenPanel {
+        local: super::direct_local(peer, headers).then(|| TokenFile::of(state)),
+    })
+}
+
+/// The Config page after a rotation, at the admin token card. Only this machine gets here.
+pub(super) fn token_result(
+    state: &AppState,
+    message: Option<String>,
+    error: Option<String>,
+) -> Response {
+    let mut t = config_template_at(state, message, error, None, "admin-token");
+    t.token_panel = Some(TokenPanel {
+        local: Some(TokenFile::of(state)),
+    });
+    render(&t)
+}
+
 #[derive(Template)]
 #[template(path = "config.html")]
 pub(super) struct ConfigTemplate {
@@ -631,6 +679,8 @@ pub(super) struct ConfigTemplate {
     device_choices: Vec<DeviceChoice>,
     message: Option<String>,
     error: Option<String>,
+    /// The admin token card (Server tab): set where the peer is known ([`token_panel`]).
+    token_panel: Option<TokenPanel>,
     /// Resources card, grouped (Runtimes, GPU libraries, Models by family).
     pub(super) resource_groups: Vec<crate::resources::status::ResourceGroup>,
     /// Model files in `models_dir` that no config entry uses.
@@ -946,6 +996,7 @@ pub(super) fn config_template(
         device_choices,
         message,
         error,
+        token_panel: None,
         revision,
         global_threshold: format!(
             "{:.2}",
@@ -970,8 +1021,18 @@ fn config_template_at(
     t
 }
 
-pub(super) async fn config_page(State(state): State<Arc<AppState>>) -> Response {
-    blocking(move || render(&config_template(&state, None, None, None))).await
+pub(super) async fn config_page(
+    State(state): State<Arc<AppState>>,
+    peer: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let peer = peer.ok().map(|c| c.0);
+    blocking(move || {
+        let mut t = config_template(&state, None, None, None);
+        t.token_panel = token_panel(&state, peer, &headers);
+        render(&t)
+    })
+    .await
 }
 
 /// Apply `edit` to the current config through the config store (one writer for everything:
@@ -1051,9 +1112,11 @@ pub(super) fn save_config(
 /// `Accept: application/json` get JSON.
 pub(super) async fn config_submit(
     State(state): State<Arc<AppState>>,
+    peer: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
 ) -> Response {
+    let peer = peer.ok().map(|c| c.0);
     blocking(move || {
         let json = live::wants_json(&headers);
         let pairs = match form {
@@ -1083,7 +1146,9 @@ pub(super) async fn config_submit(
                 if json {
                     return live::saved_json(&state, msg, false);
                 }
-                render(&config_template_at(&state, Some(msg), None, None, "server"))
+                let mut t = config_template_at(&state, Some(msg), None, None, "server");
+                t.token_panel = token_panel(&state, peer, &headers);
+                render(&t)
             }
             Err(e) => {
                 warn!("rejected config form: {e:#}");
@@ -1091,13 +1156,9 @@ pub(super) async fn config_submit(
                 if json {
                     return live::error_json(StatusCode::BAD_REQUEST, msg);
                 }
-                render(&config_template_at(
-                    &state,
-                    None,
-                    Some(msg),
-                    Some(&form),
-                    "server",
-                ))
+                let mut t = config_template_at(&state, None, Some(msg), Some(&form), "server");
+                t.token_panel = token_panel(&state, peer, &headers);
+                render(&t)
             }
         }
     })

@@ -39,11 +39,14 @@ services:
       # Default: this host only. Inside Docker every client (the host's browser too) arrives from
       # the bridge network, never loopback, so the admin pages answer 403 until
       # `"allow_remote_admin": true` is set in config/blue_onyx_prism_config.json; with this line
-      # that still reaches only this host (or an SSH tunnel to it).
+      # that still reaches only this host (or an SSH tunnel to it). Every browser then signs in
+      # with the admin token, which is in the `data` volume; read it with
+      # docker exec blue-onyx-prism /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json admin-token
       - "127.0.0.1:32168:32168"
-      # Blue Iris on another machine: use this line instead. allow_remote_admin then opens the
-      # admin pages to the whole LAN: keep it false and edit the config file in ./config (then
-      # `docker compose restart`), or turn it on only while you use the web UI. See README, Docker.
+      # Blue Iris on another machine: use this line instead. allow_remote_admin then offers the
+      # login page to the whole LAN, and the token goes over plain HTTP: keep it false and edit
+      # the config file in ./config (then `docker compose restart`), or turn it on only on a
+      # trusted network. See README, Docker.
       # - "32168:32168"
     devices:
       - /dev/dri:/dev/dri

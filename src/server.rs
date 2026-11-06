@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 mod apply;
+mod auth;
 mod benchmark;
 mod browse;
 mod config_page;
@@ -45,6 +46,7 @@ mod training_switch;
 mod training_tasks;
 
 pub(crate) use apply::{apply_config, reload_models, sync_config};
+pub(crate) use auth::FailureLimit;
 use config_page::{
     ConfigView, MessageTemplate, config_loglevel, config_models, config_models_remove, config_page,
     config_restart, config_submit, encode_uri_component, global_device_label, save_config,
@@ -92,6 +94,8 @@ pub struct AppState {
     pub(crate) resources: Option<crate::resources::status::ResourcesCtx>,
     /// Benchmark runner (one per process, shared by every generation).
     pub(crate) benchmark: Arc<crate::benchmark::service::BenchmarkService>,
+    /// Wrong admin tokens per peer (one list for the process, like the config).
+    pub(crate) admin_failures: Arc<std::sync::Mutex<FailureLimit>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -131,6 +135,7 @@ impl AppState {
             restart: CancellationToken::new(),
             resources: None,
             benchmark: crate::benchmark::service::BenchmarkService::new(),
+            admin_failures: Arc::default(),
         }
     }
 
@@ -171,9 +176,24 @@ fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     ]
 }
 
-/// The administration routes: loopback clients only unless `allow_remote_admin`, under an IP
-/// address, `localhost` or an `allowed_hosts` name ([`admin_only`]), and no cross-site state
-/// changes ([`guard::csrf`]).
+/// Signing in with the admin token: a remote peer must reach these with no token, so they are
+/// neither open nor admin. They pass the admin routes' peer and `Host` checks ([`login_only`]) and
+/// the CSRF guard.
+fn login_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
+    vec![
+        (
+            "/login",
+            get(auth::login_page)
+                .post(auth::login_submit)
+                .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+        ),
+        ("/logout", post(auth::logout)),
+    ]
+}
+
+/// The administration routes: loopback clients, and with `allow_remote_admin` remote clients
+/// that show the admin token ([`admin_only`]), under an IP address, `localhost` or an
+/// `allowed_hosts` name, and no cross-site state changes ([`guard::csrf`]).
 fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     vec![
         ("/v1/resources", get(resources_json)),
@@ -192,6 +212,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/config/models/remove", post(config_models_remove)),
         ("/config/restart", post(config_restart)),
         ("/config/loglevel", post(config_loglevel)),
+        ("/config/admin-token/rotate", post(auth::rotate)),
         ("/train", get(train_area::entry)),
         ("/train/collect", get(dataset::page)),
         ("/train/import", get(training::import_tab)),
@@ -395,11 +416,22 @@ pub(crate) fn router(state: impl Into<Shared>) -> Router {
             shared.clone(),
             admin_only,
         ));
+    let mut login = Router::new();
+    for (path, method) in login_routes() {
+        login = login.route(path, method);
+    }
+    let login = login
+        .route_layer(axum::middleware::from_fn(guard::csrf))
+        .route_layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            login_only,
+        ));
     #[cfg(test)]
     let open = open
         .route("/__test/panic", get(test_panic))
         .route("/__test/blocking-panic", get(test_blocking_panic));
     open.merge(admin)
+        .merge(login)
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(axum::middleware::from_fn(catch_panic))
@@ -491,77 +523,126 @@ async fn catch_panic(req: axum::extract::Request, next: axum::middleware::Next) 
     }
 }
 
-/// Whether a client may use the admin routes: a loopback peer, or anyone with
-/// `allow_remote_admin`. A request without a peer address (not from [`serve_on`]) is refused.
-pub(super) fn admin_allowed(peer: Option<std::net::SocketAddr>, allow_remote_admin: bool) -> bool {
-    allow_remote_admin
-        || peer.is_some_and(|a| match a.ip() {
-            std::net::IpAddr::V4(ip) => ip.is_loopback(),
-            // `::1`, or an IPv4 loopback client on a dual-stack socket (`::ffff:127.0.0.1`).
-            std::net::IpAddr::V6(ip) => {
-                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-            }
-        })
+/// Whether the peer is this machine. A request without a peer address (not from [`serve_on`])
+/// is not.
+pub(super) fn loopback_peer(peer: Option<std::net::SocketAddr>) -> bool {
+    peer.is_some_and(|a| match a.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        // `::1`, or an IPv4 loopback client on a dual-stack socket (`::ffff:127.0.0.1`).
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    })
 }
 
-/// Set once the "local reverse proxy" warning was logged (SV-12).
+/// Whether the client is a person on this machine: a loopback peer with no forwarding header.
+/// What the admin routes, `GET /v1/config`, `/login` and the rotation all ask, so a reverse proxy's
+/// client is remote for all of them. A proxy that adds no such header cannot be told apart.
+pub(super) fn direct_local(peer: Option<std::net::SocketAddr>, headers: &HeaderMap) -> bool {
+    loopback_peer(peer) && guard::proxy_header(headers).is_none()
+}
+
+/// Whether a client gets past the peer check of the admin routes: this machine, or anyone with
+/// `allow_remote_admin` (then a remote client still has to show the token: [`admin_only`]).
+pub(super) fn admin_allowed(
+    peer: Option<std::net::SocketAddr>,
+    headers: &HeaderMap,
+    allow_remote_admin: bool,
+) -> bool {
+    allow_remote_admin || direct_local(peer, headers)
+}
+
+/// Set once the "local reverse proxy" notice was logged (SV-12).
 static LOCAL_PROXY_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Whether a request carries a proxy's forwarding header (`X-Forwarded-For` or `Forwarded`).
-fn is_forwarded(headers: &HeaderMap) -> bool {
-    headers.contains_key("x-forwarded-for") || headers.contains_key(header::FORWARDED)
-}
-
-/// Log, once per `flag` (once per process for [`LOCAL_PROXY_WARNED`]), that admin requests
-/// arrive through a reverse proxy on this machine: the admin guard trusts the peer address
-/// only, so every proxied client counts as local. True when this call logged it.
+/// Log, once per `flag` (once per process for [`LOCAL_PROXY_WARNED`]), that admin requests arrive
+/// through a reverse proxy on this machine, and what that takes. True when this call logged it.
 fn warn_local_proxy_once(flag: &std::sync::atomic::AtomicBool) -> bool {
     if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
     warn!(
-        "requests arrive through a local reverse proxy: every proxied client is treated as \
-         local admin; set allow_remote_admin or restrict the proxy"
+        "requests arrive through a local reverse proxy: they count as remote clients, so the \
+         admin routes need allow_remote_admin and the admin token. A proxy that adds no \
+         forwarding header (X-Forwarded-For, Forwarded or X-Real-IP) cannot be told from this \
+         machine and gets the admin routes with no token, so make sure yours adds one"
     );
     true
 }
 
-/// Middleware of the admin routes, every method: 403 (an HTML page for browsers, else JSON) for
-/// a client that is not on this machine, unless `allow_remote_admin` is set, and for a request
-/// under a host name that could be a DNS rebinding ([`guard::foreign_host`]). Both settings are
-/// read per request, so they apply at once.
-pub(super) async fn admin_only(
-    State(state): State<Arc<AppState>>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let peer = req
-        .extensions()
+/// The peer of a request (what [`serve_on`] adds).
+fn peer_of(req: &axum::extract::Request) -> Option<std::net::SocketAddr> {
+    req.extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0);
+        .map(|c| c.0)
+}
+
+/// The peer and `Host` checks of the admin and login routes: 403 (an HTML page for browsers, else
+/// JSON) for a client that is not on this machine unless `allow_remote_admin` is set, and for a
+/// request under a host name that could be a DNS rebinding ([`guard::foreign_host`]). `None`
+/// passes. Both settings are read per request, so they apply at once.
+fn peer_refusal(state: &AppState, req: &axum::extract::Request) -> Option<Response> {
+    let peer = peer_of(req);
     let (allow_remote, foreign) = {
         let c = state.config_read();
         let foreign = guard::foreign_host(req.headers(), req.uri(), &c.allowed_hosts);
         (c.allow_remote_admin, foreign)
     };
-    if admin_allowed(peer, allow_remote) {
-        if let Some(host) = foreign {
-            return guard::host_refused(req.headers(), req.uri().path(), &host);
-        }
-        if !allow_remote && is_forwarded(req.headers()) {
-            warn_local_proxy_once(&LOCAL_PROXY_WARNED);
-        }
-        return next.run(req).await;
+    let proxied = guard::proxy_header(req.headers()).filter(|_| loopback_peer(peer));
+    if proxied.is_some() {
+        warn_local_proxy_once(&LOCAL_PROXY_WARNED);
+    }
+    if admin_allowed(peer, req.headers(), allow_remote) {
+        let host = foreign?;
+        return Some(guard::host_refused(req.headers(), req.uri().path(), &host));
     }
     let who = peer.map_or_else(|| "unknown".to_string(), |a| a.ip().to_string());
     warn!(peer = %who, path = %req.uri().path(), "admin route refused for a remote client");
+    let through = proxied.map_or_else(String::new, |h| {
+        format!(" This request came through a proxy ({h} header), so it is not from this machine.")
+    });
     let msg = format!(
-        "Administration is only available from this machine (your address: {who}). Set \
+        "Administration is only available from this machine (your address: {who}).{through} Set \
          \"allow_remote_admin\": true in the config (or start with --allow-remote-admin, or \
-         check \"Allow remote administration\" on the Config page from this machine) to allow it."
+         check \"Allow remote administration\" on the Config page from this machine) to allow it \
+         with the admin token."
     );
-    guard::forbidden(req.headers(), msg)
+    Some(guard::forbidden(req.headers(), msg))
+}
+
+/// Middleware of the admin routes, every method: [`peer_refusal`], then a remote peer has to show
+/// the admin token (`auth::verify`; a browser without it goes to `/login`, other clients get a
+/// JSON 401, too many wrong tokens 429). A person on this machine never does ([`direct_local`]).
+pub(super) async fn admin_only(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(refusal) = peer_refusal(&state, &req) {
+        return refusal;
+    }
+    let peer = peer_of(&req);
+    if direct_local(peer, req.headers()) {
+        return next.run(req).await;
+    }
+    let checked = auth::verify(&state, peer, req.headers()).await;
+    if checked.verdict == auth::Verdict::Valid {
+        return next.run(req).await;
+    }
+    auth::refused(checked, req.method(), req.uri(), req.headers(), peer)
+}
+
+/// Middleware of `/login` and `/logout`: [`peer_refusal`], with no token.
+pub(super) async fn login_only(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match peer_refusal(&state, &req) {
+        Some(refusal) => refusal,
+        None => next.run(req).await,
+    }
 }
 
 /// The process-wide router state: the generation (`AppState`) that is current. A generation
@@ -1013,9 +1094,32 @@ mod tests {
         from_peer(b.body(Body::empty()).unwrap(), peer)
     }
 
+    /// A token in the right shape, for the tests that are about something else.
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// `req` with the admin token.
+    fn signed_in(mut req: Request<Body>) -> Request<Body> {
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {TOKEN}").parse().unwrap(),
+        );
+        req
+    }
+
+    /// [`test_state_with`] with `allow_remote_admin` on and [`TOKEN`] in its file.
+    fn remote_state_with_token(edit: impl FnOnce(&mut Config)) -> Arc<AppState> {
+        let state = test_state_with(|c| {
+            c.allow_remote_admin = true;
+            edit(c);
+        });
+        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        state
+    }
+
     #[test]
     fn loopback_peers_are_local() {
-        let ok = |a: &str| admin_allowed(Some(a.parse().unwrap()), false);
+        let none = HeaderMap::new();
+        let ok = |a: &str| admin_allowed(Some(a.parse().unwrap()), &none, false);
         assert!(ok("127.0.0.1:1"));
         assert!(ok("127.8.9.10:1"));
         assert!(ok("[::1]:1"));
@@ -1024,40 +1128,53 @@ mod tests {
         assert!(!ok("192.168.1.20:1"));
         assert!(!ok("[fe80::1]:1"));
         assert!(!ok("[::ffff:10.0.0.5]:1"));
-        assert!(!admin_allowed(None, false));
-        assert!(admin_allowed(Some("10.0.0.5:1".parse().unwrap()), true));
+        assert!(!admin_allowed(None, &none, false));
+        assert!(admin_allowed(
+            Some("10.0.0.5:1".parse().unwrap()),
+            &none,
+            true
+        ));
     }
 
-    /// SV-12: a loopback admin request carrying a proxy's forwarding header logs the
-    /// "local reverse proxy" warning, once per process.
+    /// SV-12: a loopback admin request carrying a proxy's forwarding header is no local request,
+    /// and says so in the log, once per process.
     #[tokio::test]
-    async fn local_proxy_is_warned_once() {
+    async fn a_local_proxy_is_noted_once() {
+        let local: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut h = HeaderMap::new();
-        assert!(!is_forwarded(&h));
-        h.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
-        assert!(is_forwarded(&h));
-        let mut h = HeaderMap::new();
-        h.insert(header::FORWARDED, "for=203.0.113.9".parse().unwrap());
-        assert!(is_forwarded(&h));
+        assert!(direct_local(Some(local), &h));
+        for (name, value) in [
+            ("x-forwarded-for", "203.0.113.9"),
+            ("forwarded", "for=203.0.113.9"),
+            ("x-real-ip", "203.0.113.9"),
+        ] {
+            h = HeaderMap::new();
+            h.insert(name, value.parse().unwrap());
+            assert!(!direct_local(Some(local), &h), "{name}");
+            assert!(admin_allowed(Some(local), &h, true), "{name}");
+            assert!(!admin_allowed(Some(local), &h, false), "{name}");
+        }
 
         let flag = std::sync::atomic::AtomicBool::new(false);
         assert!(warn_local_proxy_once(&flag));
         assert!(!warn_local_proxy_once(&flag));
 
-        // Through the admin guard: the proxied loopback request is served and sets the
+        // Through the admin guard: the proxied loopback request is refused and sets the
         // process-wide flag.
         let state = test_state();
         let mut req = from("127.0.0.1:40000", "GET", "/config", true);
         req.headers_mut()
             .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
         let (s, _, _) = call(&state, req).await;
-        assert_eq!(s, StatusCode::OK);
+        assert_eq!(s, StatusCode::FORBIDDEN);
         assert!(LOCAL_PROXY_WARNED.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// Every route of the router, classified. A new route must be added here: the test fails
     /// when the router has a path this list does not (and the other way round), and probes
-    /// each path from a remote peer (admin routes answer 403, open ones never do).
+    /// each path from a remote peer: with `allow_remote_admin` off admin and login routes answer
+    /// 403, with it on admin routes want the token, login routes do not, and open routes never
+    /// answer 401 or 403.
     #[tokio::test]
     async fn router_classification() {
         const OPEN: &[&str] = &[
@@ -1073,6 +1190,7 @@ mod tests {
             "/prometheus",
             "/favicon.ico",
         ];
+        const LOGIN: &[&str] = &["/login", "/logout"];
         const ADMIN: &[&str] = &[
             "/v1/resources",
             "/v1/resources/download",
@@ -1090,6 +1208,7 @@ mod tests {
             "/config/models/remove",
             "/config/restart",
             "/config/loglevel",
+            "/config/admin-token/rotate",
             "/train",
             "/train/collect",
             "/train/import",
@@ -1188,6 +1307,8 @@ mod tests {
         for p in OPEN {
             assert!(open.contains(p), "expected open route {p} is not routed");
         }
+        let login: Vec<&str> = login_routes().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(login, LOGIN, "login routes");
         for p in &admin {
             assert!(
                 ADMIN.contains(p),
@@ -1197,7 +1318,12 @@ mod tests {
         for p in ADMIN {
             assert!(admin.contains(p), "expected admin route {p} is not routed");
         }
-        let mut all: Vec<&str> = open.iter().chain(admin.iter()).copied().collect();
+        let mut all: Vec<&str> = open
+            .iter()
+            .chain(admin.iter())
+            .chain(login.iter())
+            .copied()
+            .collect();
         let n = all.len();
         all.sort_unstable();
         all.dedup();
@@ -1215,6 +1341,40 @@ mod tests {
             for method in ["GET", "POST"] {
                 let (s, _, _) = call(&state, from(REMOTE, method, &probe(p), false)).await;
                 assert_ne!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
+            }
+        }
+        for p in &login {
+            for method in ["GET", "POST"] {
+                let (s, _, _) = call(&state, from(REMOTE, method, p, false)).await;
+                assert_eq!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
+            }
+        }
+
+        let lan = test_state_with(|c| c.allow_remote_admin = true);
+        for p in &admin {
+            for method in ["GET", "POST"] {
+                let (s, _, _) = call(&lan, from(REMOTE, method, &probe(p), false)).await;
+                assert_eq!(s, StatusCode::UNAUTHORIZED, "{method} {p} with no token");
+            }
+        }
+        for (method, p) in [("GET", "/login"), ("POST", "/login"), ("POST", "/logout")] {
+            let (s, _, b) = call(&lan, from(REMOTE, method, p, false)).await;
+            let answer = String::from_utf8_lossy(&b);
+            assert_ne!(s, StatusCode::FORBIDDEN, "{method} {p}: {answer}");
+            // POST /login with no form says so; the route itself let the peer in.
+            if p != "/login" || method == "GET" {
+                assert_ne!(s, StatusCode::UNAUTHORIZED, "{method} {p}: {answer}");
+            }
+        }
+        for p in &open {
+            for method in ["GET", "POST"] {
+                let (s, _, _) = call(&lan, from(REMOTE, method, &probe(p), false)).await;
+                assert_ne!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
+                assert_ne!(
+                    s,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {p} from a remote peer"
+                );
             }
         }
     }
@@ -1275,9 +1435,10 @@ mod tests {
             assert!(String::from_utf8_lossy(&b).contains("allowed_hosts"));
         }
         assert_eq!(state.config_read().port, Config::default().port);
-        // `allow_remote_admin` does not lift it: the rebound browser may be on the LAN.
-        let open = test_state_with(|c| c.allow_remote_admin = true);
-        let req = with_host(from(REMOTE, "GET", "/config", false), rebound);
+        // `allow_remote_admin` does not lift it, nor does the token: the rebound browser may be
+        // on the LAN.
+        let open = remote_state_with_token(|_| {});
+        let req = with_host(signed_in(from(REMOTE, "GET", "/config", false)), rebound);
         assert_eq!(call(&open, req).await.0, StatusCode::FORBIDDEN);
         // A remote peer keeps its own message: the host name is not what it needs to fix.
         let (s, _, b) = call(
@@ -1306,27 +1467,24 @@ mod tests {
             assert_eq!(call(&state, req).await.0, StatusCode::OK, "{host}");
         }
         // LAN administration by address, with a browser's matching Origin on a POST.
-        let lan = test_state_with(|c| c.allow_remote_admin = true);
+        let lan = remote_state_with_token(|_| {});
         for host in ["192.168.1.10:32168", "[fe80::1]:32168"] {
-            let req = with_host(from(REMOTE, "GET", "/config", false), host);
+            let req = with_host(signed_in(from(REMOTE, "GET", "/config", false)), host);
             assert_eq!(call(&lan, req).await.0, StatusCode::OK, "{host}");
         }
         // A listed name, in any case, with or without a port or a trailing dot; its
         // subdomains and other names stay out.
-        let named = test_state_with(|c| {
-            c.allow_remote_admin = true;
-            c.allowed_hosts = vec!["nas.home.arpa".into()];
-        });
+        let named = remote_state_with_token(|c| c.allowed_hosts = vec!["nas.home.arpa".into()]);
         for host in [
             "nas.home.arpa",
             "NAS.Home.Arpa:32168",
             "nas.home.arpa.:32168",
         ] {
-            let req = with_host(from(REMOTE, "GET", "/config", false), host);
+            let req = with_host(signed_in(from(REMOTE, "GET", "/config", false)), host);
             assert_eq!(call(&named, req).await.0, StatusCode::OK, "{host}");
         }
         for host in ["x.nas.home.arpa", "nas.home.arpa.evil.test", "home.arpa"] {
-            let req = with_host(from(REMOTE, "GET", "/config", false), host);
+            let req = with_host(signed_in(from(REMOTE, "GET", "/config", false)), host);
             assert_eq!(call(&named, req).await.0, StatusCode::FORBIDDEN, "{host}");
         }
     }
@@ -1516,7 +1674,8 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_MODIFIED);
         // Nothing of the config was read or written from disk for it.
         assert!(!state.config_path.exists());
-        // This machine (and remote peers with `allow_remote_admin`) get the full payload.
+        // This machine gets the full payload, remote peers with `allow_remote_admin` and the
+        // token too (more cases in `auth::tests`).
         let (_, _, b) = call(&state, from(LOCAL, "GET", "/v1/config", false)).await;
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(j["config"].is_object() && j["models"].is_array() && j["path"].is_string());
@@ -1527,7 +1686,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let (_, _, b) = call(&state, from(REMOTE, "GET", "/v1/config", false)).await;
+        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        let req = signed_in(from(REMOTE, "GET", "/v1/config", false));
+        let (_, _, b) = call(&state, req).await;
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(j["config"].is_object());
     }
@@ -1722,7 +1883,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let (s, _, _) = call(&state, from(REMOTE, "GET", "/config", true)).await;
+        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        let req = signed_in(from(REMOTE, "GET", "/config", true));
+        let (s, _, _) = call(&state, req).await;
         assert_eq!(s, StatusCode::OK);
     }
 }

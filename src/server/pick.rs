@@ -43,7 +43,7 @@
 //! the roots rule (SV-10 unchanged), so a pick never widens what the page can list.
 
 use super::guard::{host_part, request_host};
-use super::{AppState, admin_allowed, blocking};
+use super::{AppState, blocking, loopback_peer};
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
@@ -906,16 +906,12 @@ fn remote_message() -> String {
     )
 }
 
-/// Headers a reverse proxy adds: a request carrying one did not come straight from a browser
-/// on this machine, whatever the TCP peer is.
-const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
-
 /// Why a loopback request still must not open a dialog: it came through a proxy, or under a
 /// host name other than a loopback one (a DNS-rebound name, a reverse proxy that keeps the
 /// peer local). `None` = a direct local request. The `Host` is the header, else the request
 /// URI's authority (HTTP/2); a request with neither is refused too.
 fn indirect_reason(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> Option<String> {
-    if let Some(h) = PROXY_HEADERS.iter().find(|h| headers.contains_key(**h)) {
+    if let Some(h) = super::guard::proxy_header(headers) {
         return Some(format!("the request came through a proxy ({h} header)"));
     }
     let Some(host) = request_host(headers, uri) else {
@@ -951,7 +947,7 @@ fn peer_of(ci: Option<&ConnectInfo<SocketAddr>>) -> Option<SocketAddr> {
 
 /// Whether the peer is this machine (a dialog on the server's screen is useless otherwise).
 fn local_peer(peer: Option<SocketAddr>) -> bool {
-    admin_allowed(peer, false)
+    loopback_peer(peer)
 }
 
 fn unavailable(message: String) -> Response {
@@ -1596,6 +1592,7 @@ mod tests {
         use super::super::test_util::*;
         use axum::body::Body;
         use axum::http::{Request, header};
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let state = test_state_with(|c| c.allow_remote_admin = true);
         let post = |peer: &str, body: &str| {
             from_peer(
@@ -1606,7 +1603,15 @@ mod tests {
                 peer,
             )
         };
-        let (s, _, b) = call(&state, post(REMOTE, r#"{"kind":"folder"}"#)).await;
+        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        let signed_in = |mut r: axum::http::Request<Body>| {
+            r.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {TOKEN}").parse().unwrap(),
+            );
+            r
+        };
+        let (s, _, b) = call(&state, signed_in(post(REMOTE, r#"{"kind":"folder"}"#))).await;
         assert_eq!(s, StatusCode::CONFLICT);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);
@@ -1616,7 +1621,7 @@ mod tests {
             Request::get("/v1/fs/pick").body(Body::empty()).unwrap(),
             REMOTE,
         );
-        let (s, _, b) = call(&state, get).await;
+        let (s, _, b) = call(&state, signed_in(get)).await;
         assert_eq!(s, StatusCode::OK);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);
@@ -1649,11 +1654,12 @@ mod tests {
         drop(g);
         assert!(BusyGuard::acquire().is_some(), "released by the guard");
 
-        // Local peers behind a proxy or under a foreign Host: unavailable, nothing opened.
+        // Local peers behind a proxy or under a foreign Host: unavailable, nothing opened. A
+        // proxied client is remote, so it gets here only with the token.
         let mut req = post(LOCAL, r#"{"kind":"folder"}"#);
         req.headers_mut()
             .insert("x-forwarded-for", "10.0.0.5".parse().unwrap());
-        let (s, _, b) = call(&state, req).await;
+        let (s, _, b) = call(&state, signed_in(req)).await;
         assert_eq!(s, StatusCode::CONFLICT);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);
@@ -1688,7 +1694,7 @@ mod tests {
                 .unwrap(),
             LOCAL,
         );
-        let (s, _, b) = call(&state, get).await;
+        let (s, _, b) = call(&state, signed_in(get)).await;
         assert_eq!(s, StatusCode::OK);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);

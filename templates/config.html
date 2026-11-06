@@ -210,8 +210,8 @@
     <label>Bind address {{ self.badge("bind_address")|safe }} <input type="text" name="bind_address" value="{{ c.bind_address }}" placeholder="0.0.0.0" required></label>
     <label>Request timeout (s) {{ self.badge("request_timeout_secs")|safe }} <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
     <label>Worker queue size (0 = auto) {{ self.badge("worker_queue_size")|safe }} <input type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
-    <label class="check"><input type="checkbox" name="allow_remote_admin"{% if c.allow_remote_admin %} checked{% endif %}> Allow remote administration {{ self.badge("allow_remote_admin")|safe }} <span class="muted">(Config, Test, Logs, Benchmark and resource actions from other machines; off = this machine only)</span></label>
-    <label>Allowed host names {{ self.badge("allowed_hosts")|safe }} <input type="text" name="allowed_hosts" value="{{ c.allowed_hosts }}" placeholder="nas.local, prism.example.com" autocomplete="off" spellcheck="false"> <span class="muted">(comma separated, names only, no port; the names this page may be opened under, besides IP addresses and localhost. Any other name is refused, which stops a web page from reaching it through DNS rebinding)</span></label>
+    <label class="check"><input type="checkbox" name="allow_remote_admin"{% if c.allow_remote_admin %} checked{% endif %}> Allow remote administration {{ self.badge("allow_remote_admin")|safe }} <span class="muted">(Config, Test, Logs, Benchmark and resource actions from other machines; off = this machine only. Other machines must sign in with the admin token, which goes over plain HTTP, so use this only on a trusted network or behind TLS)</span></label>
+    <label>Allowed host names {{ self.badge("allowed_hosts")|safe }} <input type="text" name="allowed_hosts" value="{{ c.allowed_hosts }}" placeholder="nas.local, prism.example.com" autocomplete="off" spellcheck="false"> <span class="muted">(comma separated, names only, no port; the names this page may be opened under, besides IP addresses and localhost. Any other name is refused, which stops a web page from reaching it through DNS rebinding. A browser on another machine that opens the server by name needs that name here to sign in)</span></label>
   </fieldset>
 
   <fieldset class="group" id="inference">
@@ -287,6 +287,20 @@
 
   <div class="actions"><button type="submit">Save</button> <span class="form-msg" aria-live="polite"></span></div>
 </form>
+{% if let Some(t) = token_panel %}
+<div class="card" id="admin-token">
+  <h2>Admin token</h2>
+  {% call notices("admin-token") %}{% endcall %}
+  {% if let Some(f) = t.local %}
+  <p>Other machines sign in with this token, at <code>/login</code> or with <code>Authorization: Bearer</code>. It is stored in <code>{{ f.path }}</code>; this page does not show it. Read it on this machine with:</p>
+  <p><code>{{ f.command }}</code></p>
+  <form method="post" action="/config/admin-token/rotate#admin-token" class="inline"><button type="submit" class="danger small" data-confirm="Replace the admin token? The old one stops working and every signed-in browser has to sign in again.">Rotate token</button></form>
+  {% else %}
+  <p>You are signed in with the admin token.</p>
+  <form method="post" action="/logout" class="inline"><button type="submit" class="small secondary">Sign out</button></form>
+  {% endif %}
+</div>
+{% endif %}
 </section>
 <dialog id="browse-dialog">
   <h3 id="browse-title">Choose a model file or folder</h3>

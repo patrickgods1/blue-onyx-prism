@@ -1,5 +1,6 @@
 //! Live config for the pages:
-//! - `GET /v1/config`: for an admin peer ([`super::admin_allowed`], under an allowed `Host`) the effective config, its
+//! - `GET /v1/config`: for an admin peer (this machine, or a remote peer with the admin token while
+//!   `allow_remote_admin` is on; under an allowed `Host`) the effective config, its
 //!   revision and change log, per model what is configured vs what the running worker uses,
 //!   what a restart would apply, and the main form's field values the Config page refreshes
 //!   untouched fields from (ETag / If-None-Match); for anyone else only the revision,
@@ -575,7 +576,10 @@ pub(super) fn minimal_payload(state: &AppState) -> Value {
 }
 
 /// `GET /v1/config` with a weak ETag over the payload (If-None-Match answers 304). The full
-/// [`payload`] for admin peers, [`minimal_payload`] for everyone else (SV-05).
+/// [`payload`] for admin peers, [`minimal_payload`] for everyone else (SV-05). Nobody is refused:
+/// the pages' poller reads this route, so a missing or wrong token gets the minimal answer. A
+/// wrong one counts against the peer's limit, or this would be a free way to test tokens, and
+/// over the limit even the right one gets the minimal answer.
 pub(super) async fn config_json(
     State(state): State<Arc<AppState>>,
     peer: Result<
@@ -586,7 +590,7 @@ pub(super) async fn config_json(
     uri: axum::http::Uri,
 ) -> Response {
     let peer = peer.ok().map(|c| c.0);
-    // This route is open, so `admin_only` never runs: the same two checks here, or a DNS-rebound
+    // This route is open, so `admin_only` never runs: the same checks here, or a DNS-rebound
     // page on this machine could read the admin payload (see `guard`).
     let (allow_remote, foreign) = {
         let c = state.config_read();
@@ -595,7 +599,18 @@ pub(super) async fn config_json(
             super::guard::foreign_host(&headers, &uri, &c.allowed_hosts),
         )
     };
-    let admin = foreign.is_none() && super::admin_allowed(peer, allow_remote);
+    let mut stale_cookie = false;
+    let admin = if foreign.is_some() {
+        false
+    } else if super::direct_local(peer, &headers) {
+        true
+    } else if allow_remote {
+        let checked = super::auth::verify(&state, peer, &headers).await;
+        stale_cookie = checked.stale_cookie();
+        checked.verdict == super::auth::Verdict::Valid
+    } else {
+        false
+    };
     let body = if admin {
         // Reads the config file when it changed on disk, `benchmark.json`, and probes devices.
         super::blocking(move || payload(&state)).await
@@ -614,29 +629,35 @@ pub(super) async fn config_json(
         .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
     let etag_value = HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("W/\"0\""));
     let rev = HeaderValue::from_str(&revision.to_string()).unwrap_or(HeaderValue::from_static("0"));
-    if matches {
-        return (
+    let mut resp = if matches {
+        (
             StatusCode::NOT_MODIFIED,
             [
                 (header::ETAG, etag_value),
                 (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
             ],
         )
+            .into_response()
+    } else {
+        let mut resp = (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                ),
+                (header::ETAG, etag_value),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            ],
+            text,
+        )
             .into_response();
+        resp.headers_mut().insert("x-config-revision", rev);
+        resp
+    };
+    if stale_cookie {
+        resp.headers_mut()
+            .append(header::SET_COOKIE, super::auth::cleared_cookie());
     }
-    let mut resp = (
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            ),
-            (header::ETAG, etag_value),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
-        ],
-        text,
-    )
-        .into_response();
-    resp.headers_mut().insert("x-config-revision", rev);
     resp
 }
 

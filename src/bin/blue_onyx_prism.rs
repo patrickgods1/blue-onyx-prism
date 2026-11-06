@@ -86,6 +86,37 @@ fn service_command(cmd: cli::ServiceCommand) -> Result<i32> {
     Ok(0)
 }
 
+/// `admin-token`: the token on stdout, nothing else there. No config file means this is not the
+/// service's data root, and a token made here would be one nobody checks, so that is an error.
+fn admin_token_command(cli: &Cli, rotate: bool, config: Option<PathBuf>) -> Result<()> {
+    let cli = Cli {
+        config: config.or_else(|| cli.config.clone()),
+        ..cli.clone()
+    };
+    let file = config_path(&cli);
+    if !file.is_file() {
+        anyhow::bail!(
+            "there is no config file at {}, so the service's token cannot be found; pass the \
+             service's config with --config <file> (it is named in the service's start command)",
+            file.display()
+        );
+    }
+    let path = blue_onyx_prism::admin_token::path(&read_config(&cli)?);
+    let token = if rotate {
+        let token = blue_onyx_prism::admin_token::rotate(&path)?;
+        eprintln!(
+            "Replaced {}. A running service uses the new token at once; signed-in browsers have \
+             to sign in again.",
+            path.display()
+        );
+        token
+    } else {
+        blue_onyx_prism::admin_token::ensure(&path)?.0
+    };
+    println!("{}", token.reveal());
+    Ok(())
+}
+
 /// `--config` or the default config path.
 fn config_path(cli: &Cli) -> PathBuf {
     cli.config
@@ -406,6 +437,9 @@ fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::HfLogin) => return resources::hf_token::login(&read_config(&cli)?),
         Some(Command::HfLogout) => return resources::hf_token::logout(&read_config(&cli)?),
+        Some(Command::AdminToken { rotate, config }) => {
+            return admin_token_command(&cli, rotate, config);
+        }
         Some(Command::Service { action }) => {
             let code = service_command(action)?;
             if code != 0 {
@@ -434,7 +468,7 @@ fn run(cli: Cli) -> Result<()> {
         config.log_timezone,
         None,
     )?;
-    cli::log_startup_warnings(&config);
+    cli::log_startup_warnings(&config, &config_path);
     info!(
         version = blue_onyx_prism::VERSION,
         git_sha = blue_onyx_prism::GIT_SHA,
