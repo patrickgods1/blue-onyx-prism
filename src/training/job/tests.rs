@@ -41,6 +41,12 @@ struct TrainFake {
     oom_epochs: u32,
     /// Run out of system memory (the incident's lines) when `--workers` is above this.
     host_oom_above: Option<u32>,
+    /// Write `<work>/run/weights/best.pt`, as Ultralytics does after an epoch.
+    checkpoint: bool,
+    /// Fail with these lines once training ended, in the export, unless `--export-only`.
+    export_fails: Vec<&'static str>,
+    /// Fail like that with `--export-only` too.
+    retry_fails: bool,
     train_cmds: Mutex<Vec<Cmd>>,
 }
 
@@ -69,9 +75,35 @@ impl CommandRunner for TrainFake {
             ));
             return Ok(());
         }
-        on_line(
-            r#"@train {"event":"start","device":"mps","train_images":20,"valid_images":2,"epochs":2}"#,
-        );
+        if self.checkpoint {
+            let w = arg_after(cmd, "--work")
+                .unwrap()
+                .join("run")
+                .join("weights");
+            std::fs::create_dir_all(&w).unwrap();
+            std::fs::write(w.join("best.pt"), vec![7u8; 2048]).unwrap();
+        }
+        let export_only = arg_after(cmd, "--export-only").is_some();
+        if export_only {
+            if self.hang {
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return Err(anyhow!(Cancelled));
+            }
+            on_line(r#"@train {"event":"phase","phase":"export","detail":"exporting best.pt"}"#);
+            if self.retry_fails {
+                return Err(anyhow::Error::new(ChildFailed {
+                    program: "python".into(),
+                    status: "exit status: 1".into(),
+                    lines: vec!["RuntimeError: the export failed again".to_string()],
+                }));
+            }
+        } else {
+            on_line(
+                r#"@train {"event":"start","device":"mps","train_images":20,"valid_images":2,"epochs":2}"#,
+            );
+        }
         if self.hang {
             // Like the script: an epoch, then waiting; the stop file (Finish now) ends training.
             on_line(r#"@train {"event":"epoch","epoch":1,"epochs":2,"loss":2.0,"map":0.3}"#);
@@ -135,16 +167,28 @@ impl CommandRunner for TrainFake {
                 lines: self.fail_lines.iter().map(|l| l.to_string()).collect(),
             }));
         }
-        for e in 1..=2 {
-            on_line(&format!(
-                "noise @train {{\"event\":\"batch\",\"epoch\":{e},\"epochs\":2,\"batch\":1,\"batches\":2}}"
-            ));
-            on_line(&format!(
-                "@train {{\"event\":\"epoch\",\"epoch\":{e},\"epochs\":2,\"loss\":{}}}",
-                3.0 - f64::from(e)
-            ));
+        if !export_only {
+            for e in 1..=2 {
+                on_line(&format!(
+                    "noise @train {{\"event\":\"batch\",\"epoch\":{e},\"epochs\":2,\"batch\":1,\"batches\":2}}"
+                ));
+                on_line(&format!(
+                    "@train {{\"event\":\"epoch\",\"epoch\":{e},\"epochs\":2,\"loss\":{}}}",
+                    3.0 - f64::from(e)
+                ));
+            }
+            on_line(r#"@train {"event":"phase","phase":"export","detail":"x"}"#);
+            if !self.export_fails.is_empty() {
+                for l in &self.export_fails {
+                    on_line(l);
+                }
+                return Err(anyhow::Error::new(ChildFailed {
+                    program: "python".into(),
+                    status: "exit status: 1".into(),
+                    lines: self.export_fails.iter().map(|l| l.to_string()).collect(),
+                }));
+            }
         }
-        on_line(r#"@train {"event":"phase","phase":"export","detail":"x"}"#);
         let name = arg_after(cmd, "--name").unwrap().display().to_string();
         let out = arg_after(cmd, "--out-dir").unwrap();
         let data = arg_after(cmd, "--data").unwrap();
@@ -310,6 +354,7 @@ fn job(
         timeout: Duration::from_secs(60),
         workers: Workers::Fixed(0),
         keep_work: false,
+        export_only: None,
     }
 }
 
@@ -1476,4 +1521,320 @@ fn finish_now_writes_the_stop_file_and_the_run_exports_its_best_epoch() {
     );
     assert!(svc.cancel(&idb));
     svc.shutdown();
+}
+
+/// `j` as the failed run it would become: the checkpoint it would export.
+fn retry_of(j: &TrainJob) -> TrainJob {
+    let mut j = j.clone();
+    j.export_only = Some(ExportRetry {
+        checkpoint: super::super::retry::work_dir(&j.run_dir).join("run/weights/best.pt"),
+        train_seconds: Some(3600.0),
+        device: "NVIDIA RTX".into(),
+    });
+    j
+}
+
+fn training_cmd(fake: &TrainFake) -> Cmd {
+    fake.train_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|c| !c.display().contains("--self-check"))
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn a_failed_export_keeps_the_checkpoint_and_a_retry_makes_the_model() {
+    let t = tmp("retry");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let work = j.run_dir.join("work");
+    let fake = TrainFake {
+        checkpoint: true,
+        export_fails: vec!["RuntimeError: ONNX Runtime and PyTorch disagree"],
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert_eq!(e.stage, Some(TrainStage::Train));
+    assert!(e.message.contains("Retry export"), "{}", e.message);
+    assert!(work.join("run/weights/best.pt").is_file(), "work is kept");
+    assert!(!j.install_dir().join(format!("{}.onnx", j.name)).exists());
+    assert!(j.run_dir.join("data/dataset.json").is_file());
+
+    // A retry that fails again keeps it too.
+    let again = retry_of(&j);
+    let fake = TrainFake {
+        checkpoint: true,
+        retry_fails: true,
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&again, &fake, &NoHooks, &AtomicBool::new(false));
+    assert!(r.unwrap_err().message.contains("Retry export"));
+    assert!(work.join("run/weights/best.pt").is_file());
+
+    // The retry that works: only the export ran, on the run's own dataset.
+    let fake = TrainFake::new();
+    let hooks = RecHooks::default();
+    let (r, stages) = run(&again, &fake, &hooks, &AtomicBool::new(false));
+    let out = r.unwrap();
+    let cmd = training_cmd(&fake);
+    assert_eq!(
+        arg_after(&cmd, "--export-only").unwrap(),
+        work.join("run/weights/best.pt")
+    );
+    assert!(arg_after(&cmd, "--weights").is_none());
+    assert!(arg_after(&cmd, "--epochs").is_none());
+    assert!(!stages.iter().any(|(s, _)| *s == TrainStage::Weights));
+    assert!(!stages.iter().any(|(s, _)| *s == TrainStage::Dataset));
+    assert!(out.output.onnx.is_file());
+    assert_eq!(out.output.classes, ["cat", "raccoon"]);
+    assert_eq!(out.output.device, "NVIDIA RTX");
+    assert_eq!(out.output.train_seconds, 3600.0);
+    assert!(
+        out.output.heldout.is_some(),
+        "the held-out set is still there"
+    );
+    assert_eq!(hooks.registered.lock().unwrap().len(), 1);
+    assert_eq!(hooks.benched.lock().unwrap().len(), 1);
+    assert!(!work.exists(), "a successful retry frees the work folder");
+    let prov: Provenance =
+        serde_json::from_slice(&std::fs::read(&out.output.provenance).unwrap()).unwrap();
+    assert_eq!(prov.device, "NVIDIA RTX");
+}
+
+#[test]
+fn a_finished_run_frees_its_work_and_a_cancelled_one_too() {
+    let t = tmp("work-freed");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = TrainFake {
+        checkpoint: true,
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    r.unwrap();
+    assert!(!j.run_dir.join("work").exists());
+    // --keep-work keeps it.
+    let t = tmp("work-kept");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    j.keep_work = true;
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    r.unwrap();
+    assert!(j.run_dir.join("work/run/weights/best.pt").is_file());
+    // Cancelled: the user gave it up. A cancelled retry keeps what the failed run left.
+    let t = tmp("work-cancel");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        hang: true,
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(NoHooks), None);
+    let run_dir = j.run_dir.clone();
+    let id = svc.enqueue(j).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !run_dir.join("work/run/weights/best.pt").is_file() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(svc.cancel(&id));
+    let r = svc.wait(&id, Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Cancelled);
+    assert!(!run_dir.join("work").exists());
+}
+
+#[test]
+fn a_retry_cancelled_goes_back_to_the_failure_with_its_checkpoint() {
+    let t = tmp("retry-svc");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        export_fails: vec!["RuntimeError: disagree"],
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(NoHooks), None);
+    let again = retry_of(&j);
+    let id = svc.enqueue(j).unwrap();
+    let first = svc.wait(&id, Duration::from_secs(20)).unwrap();
+    assert_eq!(first.state, RunState::Failed);
+    assert!(first.dataset.as_ref().is_some_and(|d| d.train_images > 0));
+    let ckpt = super::super::retry::retry_checkpoint(&first).unwrap();
+    assert!(ckpt.ends_with("run/weights/best.pt"));
+    // Only a failed run; not one that is waiting.
+    svc.enqueue_retry(again.clone()).unwrap();
+    assert!(svc.enqueue_retry(again.clone()).is_err());
+    assert!(svc.finish(&id).is_err());
+    let done = svc.wait(&id, Duration::from_secs(20)).unwrap();
+    assert_eq!(done.state, RunState::Done, "{:?}", done.error);
+    assert!(!done.retrying);
+    assert_eq!(done.error, None);
+    assert!(!done.run_dir.join("work").exists());
+    assert_eq!(
+        super::super::retry::retry_checkpoint(&done).unwrap_err(),
+        format!(
+            "run {id} is {}; only a failed run can export again",
+            done.describe()
+        )
+    );
+
+    // A cancelled retry: back to failed, checkpoint there, ready for another.
+    let t = tmp("retry-cancel");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        export_fails: vec!["RuntimeError: disagree"],
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(NoHooks), None);
+    let again = retry_of(&j);
+    let id = svc.enqueue(j).unwrap();
+    assert_eq!(
+        svc.wait(&id, Duration::from_secs(20)).unwrap().state,
+        RunState::Failed
+    );
+    let hang = Arc::new(TrainFake {
+        hang: true,
+        ..TrainFake::new()
+    });
+    let svc2 = TrainingService::start(hang.clone(), hang.clone(), Arc::new(NoHooks), None);
+    // The record moves with the store in real use; here a second queue gets the same run.
+    let mut rec = svc.get(&id).unwrap();
+    rec.state = RunState::Failed;
+    let store = t.0.join("runs.json");
+    std::fs::write(&store, serde_json::to_vec(&vec![rec]).unwrap()).unwrap();
+    svc2.set_store(&store).unwrap();
+    svc2.enqueue_retry(again).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while hang
+        .train_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|c| arg_after(c, "--export-only").is_none())
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(svc2.cancel(&id));
+    let r = svc2.wait(&id, Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Failed);
+    assert!(!r.retrying);
+    assert!(super::super::retry::retry_checkpoint(&r).is_ok());
+}
+
+#[test]
+fn out_of_memory_never_restarts_over_a_finished_training_or_many_epochs() {
+    // The export ran out of system memory after training: no restart, the checkpoint stays.
+    let t = tmp("oom-export");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", cuda(), Platform::LINUX_X64);
+    j.workers = Workers::Fixed(5);
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        checkpoint: true,
+        export_fails: vec!["RuntimeError: DefaultCPUAllocator: not enough memory"],
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert_eq!(train_workers(&fake), [5], "not restarted");
+    assert!(e.message.contains("Retry export"), "{}", e.message);
+    assert!(j.run_dir.join("work/run/weights/best.pt").is_file());
+
+    // The GPU, late in training, with a checkpoint: no restart, as before, and it stays.
+    let t = tmp("oom-gpu-late");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", cuda(), Platform::LINUX_X64);
+    j.request.recipe.batch = 16;
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        checkpoint: true,
+        oom_above: Some(4),
+        oom_epochs: OOM_RETRY_EPOCHS as u32,
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    assert!(r.unwrap_err().message.contains("Retry export"));
+    assert_eq!(train_batches(&fake), [16]);
+    assert!(j.run_dir.join("work/run/weights/best.pt").is_file());
+
+    // Early, nothing worth keeping: the restart at half the batch still happens.
+    let t = tmp("oom-early");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", cuda(), Platform::LINUX_X64);
+    j.request.recipe.batch = 16;
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        checkpoint: true,
+        oom_above: Some(8),
+        oom_epochs: OOM_RETRY_EPOCHS as u32 - 1,
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    r.unwrap();
+    assert_eq!(train_batches(&fake), [16, 8]);
+}
+
+#[test]
+fn a_run_refuses_a_dataset_without_held_out_frames() {
+    let t = tmp("no-heldout");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    j.request.scene = SceneFilter::ALL_SCENES;
+    // One frame of your own holds nothing out (a single frame cannot be split) but trains.
+    let exp = t.0.join("one");
+    std::fs::create_dir_all(&exp).unwrap();
+    std::fs::write(exp.join("classes.txt"), "cat\n").unwrap();
+    jpg(&exp.join("images/ir.yard.2026-10-01.a.jpg"));
+    std::fs::create_dir_all(exp.join("labels")).unwrap();
+    std::fs::write(
+        exp.join("labels/ir.yard.2026-10-01.a.txt"),
+        "0 0.5 0.5 0.2 0.2\n",
+    )
+    .unwrap();
+    j.request.datasets = vec![exp];
+    let fake = TrainFake::new();
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert_eq!(e.stage, Some(TrainStage::Dataset));
+    assert!(
+        e.message.contains("No frame can be held out"),
+        "{}",
+        e.message
+    );
+    assert!(e.message.contains("review more frames"), "{}", e.message);
+    assert!(!j.run_dir.join("data").exists(), "nothing was written");
+}
+
+#[test]
+fn remove_with_files_deletes_only_after_its_checks() {
+    let t = tmp("remove-files");
+    let root = t.0.join("training");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        export_fails: vec!["RuntimeError: disagree"],
+        ..TrainFake::new()
+    });
+    j.run_dir = root.join(&j.id);
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(NoHooks), None);
+    let id = svc.enqueue(j).unwrap();
+    let r = svc.wait(&id, Duration::from_secs(20)).unwrap();
+    assert_eq!(r.state, RunState::Failed);
+    assert!(super::super::retry::disk_use(&r.run_dir) >= 2048);
+    // The check refuses: nothing gone, the run stays listed.
+    let e = svc
+        .remove_with_files(&id, |r| {
+            super::super::retry::delete_run_files(&r.run_dir, "other", &root)
+        })
+        .unwrap_err();
+    assert!(e.contains("stays in the list"), "{e}");
+    assert!(r.run_dir.is_dir());
+    assert!(svc.get(&id).is_some());
+    assert!(svc.remove_with_files("nope", |_| Ok(())).is_err());
+    svc.remove_with_files(&id, |r| {
+        super::super::retry::delete_run_files(&r.run_dir, &r.id, &root)
+    })
+    .unwrap();
+    assert!(!r.run_dir.exists());
+    assert!(svc.get(&id).is_none());
 }

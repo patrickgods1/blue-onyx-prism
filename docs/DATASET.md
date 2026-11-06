@@ -270,10 +270,18 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
   - uses `below_threshold` and `verify.found` as cheap hints;
   - adds its boxes (`source: auto`) to the label files through the merge rule below.
 - **Dataset assembly** (the export does the first part):
-  - splits by `camera` and date folder, so held-out frames come from cameras and days the model did not
-    train on;
-  - balances by `scene`;
-  - uses `dhash` to drop near duplicates across days.
+  - splits by whole camera days (camera and date folder), so frames of one camera on one day never sit
+    on both sides; other days of a held-out camera can train unless the export names that camera. An
+    export of a single camera day has no `val` split, so a run holds out a share of its frames, with a
+    warning that frames of one day are similar;
+  - uses a frame once when several ticked exports hold it (by the flat image name; the held-out copy
+    wins);
+  - balances by scene, class, camera or camera day only when asked (off by default,
+    [Assembly](TRAINING.md#assembly-srctrainingdatasetrs) step 7).
+
+  `dhash` is not used here: the collector and the import drop near duplicates when frames are saved,
+  each within its own window ([Imported frames](#imported-frames)), and nothing compares frames across
+  days when a dataset is assembled.
 - **Import:** imported footage uses the same layout and sidecar, with `source` and `provenance`
   added ([Imported frames](#imported-frames)).
 
@@ -734,6 +742,8 @@ Click a box to select it. Drag on the image to draw a new one.
                                        duplicate, too_small, auto_dismissed and spot_dismissed ones
   ignore.json                          ignore regions per image, below, and in `parked` the frames whose
                                        training boxes all came from parked spots (for the training cap)
+  frames.json                          `empty_confirmed` and `bulk_accepted`: image names, for a training run whichever
+                                       formats were ticked (absent in older exports)
   xanylabeling/<name>.jpg + .json      X-AnyLabeling files (below)
   benchmark/images/<name>.jpg + manifest.json   a benchmark `dir:` set
   export.json                          the report, written last
@@ -757,8 +767,9 @@ as reviewed even outside the class list. Written with every export format. A fol
 regions, so an export from an older version still reads, with those objects unlabelled as before: export
 again to use them. A damaged file stops the run rather than teach them as background.
 
-**Split.** Frames are split by camera and day (the date folder), so held-out frames come from cameras
-and days the model did not train on.
+**Split.** Frames are split by whole camera days (camera and date folder), so frames of one camera on
+one day never sit on both sides. That does not mean an unseen camera: other days of a held-out camera
+train unless the camera is named in `holdout_cameras`.
 
 - If `holdout_cameras` or `holdout_days` is given, a frame of a named camera or day goes to `val`, and
   every other frame to `train`.

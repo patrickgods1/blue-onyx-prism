@@ -26,6 +26,7 @@ cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco
 cargo run -- benchmark --list-datasets       # built-in image sets (assets/bench/*.json, resource bench:<id>)
 cargo run -- train overlaps [--frames "scene=ir,limit=200,again=1"] [--dry-run] [--allow-large]   # suggestions for overlapping boxes; changes no box
 python scripts/research/eval_autolabel.py --self-test   # scores auto-label proposals against known boxes: truth / yesno / score (docs/TRAINING.md, "Measuring auto-label")
+cargo run -- train retry-export <run> [--no-register] [--no-benchmark]   # a failed run's kept checkpoint: export, install, benchmark again
 cargo run -- hf-login                        # saves a Hugging Face token for gated downloads (no-echo prompt or stdin, never argv); `hf-logout` deletes it
 cargo run -- train autolabel --sam3 [--sam3-threshold 0.3] [--frames "status=reviewed,auto=overlaps"] [--dry-run]   # SAM 3 in gdino's seat; --dry-run previews frames and a rough time, runs nothing
 cargo run -- service status|start|stop|restart   # control the installed service (start/stop/restart need admin)
@@ -129,6 +130,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   writes under `<data root>/dataset/<scene>/<camera>/<date>/`, `retention::prune_dataset`, disk guard); admin `/dataset`
   page (frames by detected class; Review queue and export filter by class) and `review-queue.jsonl`; format in `docs/DATASET.md`. OpenVINO CACHE_DIR is `<cache>/openvino-<device>-<prec>`
   (the CPU cache hash ignores precision); `config_store::spawn_disk_watch` applies on-disk config edits within 2 s.
+- Training protection: a failed run keeps `work` (`training/retry.rs`, `train_model.py --export-only`, YOLO, RF-DETR, RT-DETRv2 / D-FINE via `hf-best/`; training itself does not resume), an OOM restarts only before 3 finished epochs. `training/preflight.rs` is the one report behind the page's panel, `balance-preview` and `train prepare --dry-run`: an empty held-out set is refused, `MIN_CLASS_BOXES` etc. warn; `check_disk` refuses up front. Exports write `frames.json` (`empty_confirmed`, `bulk_accepted`); negatives rank by it and `hard_negatives.json`; frames are deduplicated across exports by flat name, held-out wins.
 - Review (`src/collect/labels/`, `/review`, `assets/review.js`): per-frame `<stem>.labels.json` (v1; states pending/
   accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
   `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk

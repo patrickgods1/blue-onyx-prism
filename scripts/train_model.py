@@ -56,6 +56,16 @@ Export (`prepare_export`, after training, in this process): the training state i
 capped (`BOP_EXPORT_THREADS`, else all physical cores but one) and the export waits up to 5 min for
 3 GB available memory / 4 GB available commit (Windows), then goes ahead anyway.
 
+Export only (`--export-only <checkpoint>`, the service's Retry export of a failed run): no training,
+the same export, its checks and the same `phase` / `done` events from the best checkpoint a run left
+in its work folder, on the CPU (a fresh process, so the GPU and the training memory are free):
+  ultralytics   `<work>/run/weights/best.pt` (else `last.pt`), saved after every epoch.
+  rfdetr        `<work>/rfdetr-out/checkpoint_best_total.pth` once training ended, else the running
+                best `checkpoint_best_ema.pth` / `checkpoint_best_regular.pth`, beside the
+                `training_config.json` rfdetr writes before and after training.
+  transformers  `<work>/hf-best/` (`config.json` + `model.safetensors`): `save_strategy="no"` keeps
+                nothing on disk, so this script saves the best epoch there (`save_hf_best`).
+
 The service runs this file (embedded in the binary) inside its pinned training environment
 (<data root>/tools/train-env), offline: YOLO_OFFLINE=1, HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1;
 the base weights were downloaded and SHA-256 checked by the service. `--export-script` is the
@@ -497,10 +507,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--work", type=Path, help="scratch directory (checkpoints, logs)")
     p.add_argument("--export-script", type=Path, help="scripts/export_model.py (its functions do the export)")
     p.add_argument("--opset", type=int, default=17)
+    p.add_argument("--export-only", type=Path, default=None,
+                   help="no training: export this checkpoint of an earlier run (a best.pt, a rfdetr .pth, or the hf-best folder) and check it, on the CPU")
     a = p.parse_args()
     if a.self_check:
         return a
-    missing = [k for k in ("family", "size", "name", "weights", "data", "out_dir", "work", "export_script") if getattr(a, k) is None]
+    required = ("family", "size", "name", "weights", "data", "out_dir", "work", "export_script")
+    if a.export_only is not None:
+        required = tuple(k for k in required if k != "weights")
+    missing = [k for k in required if getattr(a, k) is None]
     if missing:
         p.error("missing: " + ", ".join("--" + m.replace("_", "-") for m in missing))
     for k in ("aug_dark", "aug_noise", "aug_gray"):
@@ -1635,6 +1650,12 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     # The export loads best.pt afresh: drop the trained model, its trainer (optimizer, EMA,
     # dataloaders) and the base model first.
     del model, base_yolo, base_model
+    return export_ultralytics_best(a, best, device, names, em)
+
+
+def export_ultralytics_best(a, best: Path, device: str, names: list[str], em) -> dict:
+    """`best.pt` (or `last.pt`) to ONNX, checked: the end of a training and the whole of
+    `--export-only`."""
     prepare_export(device, a.stop_file)
     service_family = "yolo26" if a.family == "yolo26" else "yolo8"
     ex = argparse.Namespace(
@@ -2014,19 +2035,52 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     cfg = out_dir / "training_config.json"
     if not ckpt.is_file() or not cfg.is_file():
         fail(f"rfdetr finished without {ckpt.name} / {cfg.name} in {out_dir}")
-    tc = json.loads(cfg.read_text(encoding="utf-8"))
-    if tc.get("class_names") != names:
-        fail(f"rfdetr trained on classes {tc.get('class_names')}, expected {names}")
     event("phase", phase="export", detail="exporting checkpoint_best_total.pth to ONNX")
     # One model at a time from here: the trained one (with its Lightning trainer, optimizer and
     # persistent DataLoader workers) goes before the export loads the checkpoint, the export's
     # PyTorch model before ONNX Runtime checks the file (`release_model`), rfdetr's own model
     # before the comparison session.
     del model
+    return export_rfdetr_best(a, ckpt, device, names, em)
+
+
+def rfdetr_stripped(ckpt: Path, dst: Path) -> None:
+    """`ckpt` as `dst`, loadable with `weights_only=True`. `checkpoint_best_total.pth` already is;
+    a running best (`--export-only` of a run that never finished) still holds the Lightning state
+    (optimizer, callbacks), which rfdetr's `strip_checkpoint` removes the way it does at the end
+    of training."""
+    if ckpt.name == "checkpoint_best_total.pth":
+        link_or_copy(ckpt, dst)
+        return
+    from rfdetr.utilities.state_dict import strip_checkpoint
+
+    shutil.copyfile(ckpt, dst)
+    strip_checkpoint(dst)
+
+
+def export_rfdetr_best(a, ckpt: Path, device: str, names: list[str], em) -> dict:
+    """An rfdetr checkpoint and the `training_config.json` beside it to ONNX, checked against
+    rfdetr's own model: the end of a training and the whole of `--export-only`."""
+    import numpy as np
+    import torch
+    import rfdetr
+
+    cls_name = RFDETR_CLASSES.get(a.size)
+    if cls_name is None:
+        fail(f"unknown RF-DETR size {a.size!r} (nano, small, medium, base, large)")
+    cfg = ckpt.parent / "training_config.json"
+    if not cfg.is_file():
+        fail(f"{cfg} is missing: rfdetr writes it before training starts")
+    tc = json.loads(cfg.read_text(encoding="utf-8"))
+    # The copy written before training may not know the class names yet (None).
+    if tc.get("class_names") not in (names, None) or (a.export_only is None and tc.get("class_names") != names):
+        fail(f"rfdetr trained on classes {tc.get('class_names')}, expected {names}")
     prepare_export(device, a.stop_file)
     wdir = a.work / "rfdetr-export-weights"
+    shutil.rmtree(wdir, ignore_errors=True)
     wdir.mkdir(parents=True, exist_ok=True)
-    link_or_copy(ckpt, wdir / ckpt.name)
+    rfdetr_stripped(ckpt, wdir / "checkpoint_best_total.pth")
+    ckpt = wdir / "checkpoint_best_total.pth"
     (wdir / "config.json").write_text(json.dumps({"model_config": tc["model_config"], "class_names": names}), encoding="utf-8")
     ex = argparse.Namespace(
         weights=wdir, work=a.work / "export", out=a.out_dir, opset=a.opset, no_onnx=False, no_openvino=True,
@@ -2274,6 +2328,7 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
                 if conv.improved:
                     best_state["epoch"], best_state["value"] = conv.top_epoch, conv.top
                     best_state["sd"] = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                    save_hf_best(self.model, a.work)
                 if stop:
                     # Read after this evaluation by the epoch loop (transformers Trainer `train`).
                     self.control.should_training_stop = True
@@ -2331,6 +2386,7 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
         log(f"exporting epoch {best_state['epoch']} (best {selection.label} {best_state['value']:.4f}); the last epoch was {conv.last}")
     else:
         log(f"exporting the last epoch (no validation {selection.label} was measured)")
+        save_hf_best(trainer.model, a.work)
     event("phase", phase="export", detail="exporting to ONNX")
     model = trainer.model.eval().float().cpu()
     # Keep only the model: the best epoch's CPU copy, the optimizer, the scheduler and the
@@ -2341,6 +2397,30 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
     except Exception as e:
         log(f"accelerate free_memory skipped ({type(e).__name__}: {e})")
     del trainer
+    return export_transformers_model(a, model, device, names, em)
+
+
+def save_hf_best(model, work: Path) -> None:
+    """The best epoch's weights as `<work>/hf-best` (`save_pretrained`, written beside it and
+    renamed): with `save_strategy="no"` nothing else on disk survives a failed export or a crash.
+    A failure here (a full disk) costs the Retry export, never the run."""
+    tmp, dst = work / "hf-best.tmp", work / "hf-best"
+    try:
+        shutil.rmtree(tmp, ignore_errors=True)
+        model.save_pretrained(str(tmp))
+        shutil.rmtree(dst, ignore_errors=True)
+        tmp.replace(dst)
+    except Exception as e:
+        log(f"the best epoch was not saved to {dst} ({type(e).__name__}: {e}); training goes on, but a failed export cannot be retried")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def export_transformers_model(a, model, device: str, names: list[str], em) -> dict:
+    """A trained RT-DETRv2 / D-FINE (on the CPU, in eval mode) to ONNX, checked: the end of a
+    training and the whole of `--export-only`."""
+    import numpy as np
+    import torch
+
     prepare_export(device, a.stop_file)
 
     class Wrapped(torch.nn.Module):
@@ -2385,6 +2465,32 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
+# Export only
+# ---------------------------------------------------------------------------------------------
+
+
+def export_only(a, names: list[str], em) -> dict:
+    """`--export-only`: the checkpoint of an earlier run to ONNX, without training (see the module
+    docs). Runs on the CPU: the export never needed the GPU, and a retry should not need one."""
+    ckpt = a.export_only.resolve()
+    if not ckpt.exists():
+        fail(f"the checkpoint {ckpt} is gone; train the model again")
+    event("phase", phase="export", detail=f"exporting {ckpt.name} to ONNX")
+    if a.trainer == "ultralytics":
+        return export_ultralytics_best(a, ckpt, "cpu", names, em)
+    if a.trainer == "rfdetr":
+        return export_rfdetr_best(a, ckpt, "cpu", names, em)
+    from transformers import AutoModelForObjectDetection
+
+    model = AutoModelForObjectDetection.from_pretrained(str(ckpt), local_files_only=True)
+    kind = type(model).__name__
+    want = {"rtdetrv2": "RTDetrV2ForObjectDetection", "dfine": "DFineForObjectDetection"}[a.family]
+    if kind != want:
+        fail(f"{ckpt} holds a {kind}, expected {want}")
+    return export_transformers_model(a, model.eval().float().cpu(), "cpu", names, em)
+
+
+# ---------------------------------------------------------------------------------------------
 
 
 def main() -> int:
@@ -2400,7 +2506,9 @@ def main() -> int:
         return self_check(a.trainer, a.device)
     for d in (a.out_dir, a.work):
         d.mkdir(parents=True, exist_ok=True)
-    a.data, a.work, a.out_dir, a.weights = a.data.resolve(), a.work.resolve(), a.out_dir.resolve(), a.weights.resolve()
+    a.data, a.work, a.out_dir = a.data.resolve(), a.work.resolve(), a.out_dir.resolve()
+    if a.weights is not None:
+        a.weights = a.weights.resolve()
     random.seed(a.seed)
     names = read_classes(a.data)
     train, valid = read_split(a.data, "train"), read_split(a.data, "valid")
@@ -2408,6 +2516,12 @@ def main() -> int:
         fail("the training split is empty")
     watch_parent()
     em = load_export_module(a.export_script)
+    t0 = time.time()
+    if a.export_only is not None:
+        out = export_only(a, names, em)
+        event("done", onnx=str(out["onnx"]), yaml=str(out["yaml"]), family=out["family"], classes=out["names"],
+              imgsz=a.imgsz, seconds=round(time.time() - t0, 1), device="cpu")
+        return 0
     device = pick_device(a.device, a.allow_cpu)
     if device == "mps":
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")

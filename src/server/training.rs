@@ -18,7 +18,7 @@ use crate::training::dataset::{Balance, BalanceAxis, Excluded, SceneFilter};
 use crate::training::job::{BenchSummary, Hooks, TrainOutput, TrainRequest};
 use crate::training::recipe::{self, Augment, TrainRecipe};
 use crate::training::service::{RunRecord, RunState, TrainingService};
-use crate::training::{bench, estimate};
+use crate::training::{bench, estimate, preflight, retry};
 use askama::Template;
 use axum::Json;
 use axum::extract::State;
@@ -219,7 +219,64 @@ struct RunRow {
     percent: u8,
     describe: String,
     dataset: String,
+    /// The dataset's warnings, shown on the row.
+    warnings: Vec<String>,
+    /// A failed run with a checkpoint: the Retry export button.
+    can_retry: bool,
+    /// What the retry exports when training did not end, else empty.
+    retry_note: String,
+    files: RunFiles,
     log_tail: String,
+}
+
+/// What a finished run leaves on disk.
+struct RunFiles {
+    /// "1.2 GB" (bytes deleting the folder frees), empty when there is nothing.
+    size: String,
+    /// "1.2 GB on disk, 900 MB of it checkpoints", empty when there is nothing.
+    text: String,
+}
+
+impl RunFiles {
+    /// The files of `r`; nothing is measured while it is busy.
+    fn of(r: &RunRecord) -> Self {
+        let total = if r.state.is_busy() {
+            0
+        } else {
+            retry::disk_use(&r.run_dir)
+        };
+        if total == 0 {
+            return Self {
+                size: String::new(),
+                text: String::new(),
+            };
+        }
+        let size = catalog::format_size(total);
+        let work = retry::disk_use(&retry::work_dir(&r.run_dir));
+        let text = if work > 0 {
+            format!(
+                "Run files: {size} on disk, {} of it checkpoints",
+                catalog::format_size(work)
+            )
+        } else {
+            format!("Run files: {size} on disk")
+        };
+        Self { size, text }
+    }
+
+    /// The Remove button's confirmation. The installed model is not in the run's folder.
+    fn confirm(&self, r: &RunRecord) -> String {
+        let model = if r.output.is_some() {
+            " The installed model stays, but its held-out frames go, so it can no longer be \
+             benchmarked on them."
+        } else {
+            ""
+        };
+        format!(
+            "Delete the files of run {} ({}) from this machine?{model}",
+            r.name, self.size
+        )
+    }
 }
 
 struct ResultRow {
@@ -231,6 +288,10 @@ struct ResultRow {
     benchmark: String,
     finished: String,
     in_config: bool,
+    warnings: Vec<String>,
+    files: RunFiles,
+    /// The Remove button's confirmation.
+    confirm: String,
 }
 
 /// One GPU of the page's GPU selects (a PC with more than one usable NVIDIA GPU).
@@ -565,6 +626,7 @@ pub(super) struct TrainingTemplate {
 /// exporting yet ([`TrainingService::finish`] checks the same).
 fn can_finish(r: &RunRecord) -> bool {
     r.state.is_active()
+        && !r.retrying
         && r.stage == Some(crate::training::job::TrainStage::Train)
         && r.progress
             .as_ref()
@@ -1079,11 +1141,24 @@ fn view_with(
         }
         _ => (None, None),
     };
+    let warnings_of = |r: &RunRecord| {
+        r.dataset
+            .as_ref()
+            .map_or_else(Vec::new, |d| d.warnings.clone())
+    };
     let run_rows = all
         .iter()
         .rev()
         .filter(|r| r.state != RunState::Done)
         .map(|r| RunRow {
+            warnings: warnings_of(r),
+            can_retry: retry::retry_checkpoint(r).is_ok(),
+            retry_note: if retry::retry_checkpoint(r).is_ok() {
+                retry::partial_note(r)
+            } else {
+                String::new()
+            },
+            files: RunFiles::of(r),
             id: r.id.clone(),
             name: r.name.clone(),
             model: r.request.recipe.label(),
@@ -1132,6 +1207,9 @@ fn view_with(
                 benchmark: bench_text(r.benchmark.as_ref(), r.benchmark_error.as_deref()),
                 finished: r.finished.clone().unwrap_or_default(),
                 in_config: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name)),
+                warnings: warnings_of(r),
+                confirm: RunFiles::of(r).confirm(r),
+                files: RunFiles::of(r),
             })
         })
         .collect();
@@ -1796,12 +1874,48 @@ pub(super) async fn dataset_classes(
     .await
 }
 
-/// The balance preview of a queue form ([`data_fields`]; the models are not needed): one run
-/// per scene filter, each [`crate::training::preview_plan`] (the job's sources and options,
-/// nothing written) as `{scene, title, report, warnings, classes, train_frames, train_images,
-/// valid_frames, heldout_frames, dropped, error}` (`report` null when balancing is off; `error`
-/// set when that run cannot be planned). The folders are checked like the queue's
-/// ([`checked_datasets`]); a bad field or folder is an error naming it.
+/// The answers of [`crate::training::unreviewed_frames`] (it reads every label file): the form
+/// asks on every change, the count moves on the Review page's pace.
+static UNREVIEWED: std::sync::Mutex<Option<(PathBuf, std::time::Instant, Option<u64>)>> =
+    std::sync::Mutex::new(None);
+const UNREVIEWED_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn unreviewed_cached(config: &crate::config::Config) -> Option<u64> {
+    use crate::sync::LockExt;
+    let dir = config.collect.resolved_review_dir(&config.data_root());
+    let mut c = UNREVIEWED.lock_recover();
+    if let Some((d, at, n)) = c.as_ref()
+        && *d == dir
+        && at.elapsed() < UNREVIEWED_TTL
+    {
+        return *n;
+    }
+    let n = crate::training::unreviewed_frames(config);
+    *c = Some((dir, std::time::Instant::now(), n));
+    n
+}
+
+/// The models the form ticks, a small one when none is yet: the disk estimate needs one.
+fn preview_recipes(f: &[(String, String)]) -> anyhow::Result<Vec<TrainRecipe>> {
+    let mut out = Vec::new();
+    for m in all(f, "model") {
+        if let Some((family, size)) = recipe::parse_label(m) {
+            out.push(TrainRecipe::new(family, size)?);
+        }
+    }
+    if out.is_empty() {
+        out.push(TrainRecipe::new(catalog::TrainFamily::Yolo26, "n")?);
+    }
+    Ok(out)
+}
+
+/// The preview of a queue form ([`data_fields`]; models, `seeds` and `install_dir` only size the
+/// disk estimate): one run per scene filter, each [`crate::training::preview_parts`] (the job's
+/// sources and options, nothing written) as `{scene, title, report, warnings, classes,
+/// train_frames, train_images, valid_frames, heldout_frames, dropped, preflight, error}` (`report`
+/// null when balancing is off; `preflight`: [`preflight::Report`]; `error` set when that run cannot
+/// be planned), and `disk` `{lines, refusal}`, what every ticked run needs together. The folders
+/// are checked like the queue's ([`checked_datasets`]); a bad field or folder is an error naming it.
 pub(crate) fn balance_preview_json(
     f: &[(String, String)],
     config: &crate::config::Config,
@@ -1811,8 +1925,20 @@ pub(crate) fn balance_preview_json(
     if datasets.is_empty() && config.training.datasets.is_empty() {
         anyhow::bail!("no dataset: tick a review export folder or type one under Another folder");
     }
-    // A placeholder model: the plan depends on the data fields only.
-    let recipe = TrainRecipe::new(catalog::TrainFamily::Yolo26, "n")?;
+    // The plan depends on the data fields only, the disk estimate on the models too.
+    let recipes = preview_recipes(f)?;
+    let recipe = recipes
+        .first()
+        .cloned()
+        .unwrap_or(TrainRecipe::new(catalog::TrainFamily::Yolo26, "n")?);
+    let seeds = num::<usize>(f, "seeds", "seeds")?.unwrap_or(1).clamp(1, 3);
+    let run_dir = crate::training::training_dir(config).join("preview");
+    let models_dir = match field(f, "install_dir") {
+        Some(d) => config.data_path(std::path::Path::new(d)),
+        None => TrainPaths::for_config(config).export.models,
+    };
+    let unreviewed = unreviewed_cached(config);
+    let mut needs: Vec<preflight::VolumeNeed> = Vec::new();
     let runs: Vec<serde_json::Value> = data
         .scenes
         .iter()
@@ -1841,20 +1967,37 @@ pub(crate) fn balance_preview_json(
                 compare_group: None,
                 train_seed: None,
             };
-            match crate::training::preview_plan(config, &request) {
-                Ok(p) => serde_json::json!({
-                    "scene": scene.as_str(),
-                    "title": title,
-                    "report": p.balance,
-                    "warnings": p.warnings,
-                    "classes": p.classes,
-                    "train_frames": p.train.len(),
-                    "train_images": p.train.iter().map(|(_, n)| *n as usize).sum::<usize>(),
-                    "valid_frames": p.valid.len(),
-                    "heldout_frames": p.heldout.len(),
-                    "dropped": p.stats.balance_dropped,
-                    "error": null,
-                }),
+            match crate::training::preview_parts(config, &request) {
+                Ok(parts) => {
+                    let p = &parts.plan;
+                    for r in &recipes {
+                        for _ in 0..seeds {
+                            if let Ok(n) = preflight::run_needs(
+                                p,
+                                &parts.sources,
+                                r,
+                                &run_dir,
+                                &models_dir,
+                            ) {
+                                needs.extend(n);
+                            }
+                        }
+                    }
+                    serde_json::json!({
+                        "scene": scene.as_str(),
+                        "title": title,
+                        "report": p.balance,
+                        "warnings": p.warnings,
+                        "classes": p.classes,
+                        "train_frames": p.train.len(),
+                        "train_images": p.train.iter().map(|(_, n)| *n as usize).sum::<usize>(),
+                        "valid_frames": p.valid.len(),
+                        "heldout_frames": p.heldout.len(),
+                        "dropped": p.stats.balance_dropped,
+                        "preflight": preflight::report(p, &parts.sources, &parts.options, unreviewed),
+                        "error": null,
+                    })
+                }
                 Err(e) => serde_json::json!({
                     "scene": scene.as_str(),
                     "title": title,
@@ -1865,10 +2008,29 @@ pub(crate) fn balance_preview_json(
             }
         })
         .collect();
+    let lane = crate::training::capability_now()
+        .accelerator
+        .as_ref()
+        .map(crate::training::Accelerator::lane);
+    needs.extend(crate::training::tools_needs(config, &recipes, lane));
+    let volumes: Vec<(
+        preflight::VolumeNeed,
+        Option<crate::training::import::disk::Space>,
+    )> = preflight::combine(needs)
+        .into_iter()
+        .map(|n| {
+            let s = crate::training::import::disk::space(&n.dir);
+            (n, s)
+        })
+        .collect();
     Ok(serde_json::json!({
         "success": true,
         "balance": data.balance,
         "runs": runs,
+        "disk": {
+            "lines": volumes.iter().map(|(n, s)| preflight::disk_line(n, *s)).collect::<Vec<_>>(),
+            "refusal": preflight::refusal(&volumes),
+        },
     }))
 }
 
@@ -2092,6 +2254,7 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                 names.push(name.clone());
                 jobs.push(crate::training::plan_job(&config, r, &cap, Some(name))?);
             }
+            crate::training::check_jobs(&config, &jobs)?;
             let mut queued = Vec::new();
             for job in jobs {
                 let on = job
@@ -2204,12 +2367,64 @@ async fn pause_or_resume(state: Arc<AppState>, body: axum::body::Bytes, pause: b
     .await
 }
 
-/// `POST /training/remove` (`id`): forget a finished run (its files stay).
+/// `POST /training/retry-export` (`id`): queue the export of a failed run's kept checkpoint
+/// ([`retry::plan_retry`]).
+pub(super) async fn retry_export(
+    State(shared): State<Shared>,
+    body: axum::body::Bytes,
+) -> Response {
+    blocking(move || {
+        let state = shared.current();
+        let f = super::dataset::parse_form(&body);
+        let id = field(&f, "id").unwrap_or_default().to_string();
+        let result = (|| -> anyhow::Result<String> {
+            let svc = service(&shared);
+            let rec = svc.get(&id).ok_or_else(|| anyhow::anyhow!("no run {id}"))?;
+            let config = state.config_read().clone();
+            let cap = crate::training::capability_with_runs(&runs(&state));
+            let job = retry::plan_retry(&config, &rec, &cap)?;
+            svc.enqueue_retry(job).map_err(anyhow::Error::msg)?;
+            Ok(format!(
+                "Exporting {} from its best checkpoint. It is added to the config and benchmarked \
+                 when that works.",
+                rec.name
+            ))
+        })();
+        match result {
+            Ok(m) => render(&view(&state, Some(m), None)),
+            Err(e) => render(&view(&state, None, Some(format!("Not queued: {e:#}.")))),
+        }
+    })
+    .await
+}
+
+/// `POST /training/remove` (`id`, optional `delete_files`): forget a finished run; with
+/// `delete_files` its folder goes too ([`retry::delete_run_files`]), else its files stay.
 pub(super) async fn remove(State(shared): State<Shared>, body: axum::body::Bytes) -> Response {
     blocking(move || {
         let state = shared.current();
         let f = super::dataset::parse_form(&body);
         let id = field(&f, "id").unwrap_or_default().to_string();
+        if field(&f, "delete_files").is_some() {
+            let config = state.config_read().clone();
+            let size = service(&shared)
+                .get(&id)
+                .map_or(0, |r| retry::disk_use(&r.run_dir));
+            let done =
+                service(&shared).remove_with_files(&id, |r| retry::delete_files_of(&config, r));
+            return match done {
+                Ok(r) => render(&view(
+                    &state,
+                    Some(format!(
+                        "Removed run {} and deleted its files ({}).",
+                        r.name,
+                        catalog::format_size(size)
+                    )),
+                    None,
+                )),
+                Err(e) => render(&view(&state, None, Some(e))),
+            };
+        }
         match service(&shared).remove(&id) {
             Ok(()) => render(&view(
                 &state,
@@ -3688,6 +3903,7 @@ mod tests {
             error: None,
             finished: None,
             run_dir: PathBuf::from("/runs").join(id),
+            retrying: false,
         }
     }
 
@@ -3817,6 +4033,64 @@ mod tests {
         assert_eq!(v["comparable"], true);
         assert_eq!(v["rows"][0]["day"]["ap50_95"], 0.5);
         assert_eq!(v["best_per_column"]["night"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_shows_its_warnings_files_and_retry_export() {
+        use crate::server::test_util::{call, post_form, test_state_with};
+        use askama::Template;
+        let root = std::env::temp_dir().join(format!("bop-train-retry-{}", uuid::Uuid::new_v4()));
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let mut recs = group_records();
+        let dir = root.join("training").join("r9");
+        let r9 = recs.iter_mut().find(|r| r.id == "r9").unwrap();
+        r9.state = RunState::Failed;
+        r9.run_dir.clone_from(&dir);
+        r9.progress = None;
+        r9.dataset = Some(crate::training::service::DatasetCounts {
+            warnings: vec!["no frame is held out: <check>".into()],
+            ..Default::default()
+        });
+        std::fs::create_dir_all(dir.join("work/run/weights")).unwrap();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data/dataset.json"), "{}").unwrap();
+        std::fs::write(dir.join("work/run/weights/best.pt"), vec![0u8; 3000]).unwrap();
+        let cap = crate::training::capability::host_for_tests();
+        let page = view_with(&state, None, None, recs.clone(), cap.clone())
+            .render()
+            .unwrap();
+        let row = page.split("<tr data-run=\"r9\"").nth(1).unwrap();
+        let row = row.split("tr-metrics-row").next().unwrap();
+        assert!(
+            row.contains("no frame is held out: &#60;check&#62;")
+                || row.contains("no frame is held out: &lt;check&gt;"),
+            "{row}"
+        );
+        assert!(!row.contains("data-field=\"warnings\" hidden"), "{row}");
+        assert!(row.contains("action=\"/training/retry-export\""), "{row}");
+        assert!(
+            row.contains("Run files: 3.0 kB on disk, 3.0 kB of it checkpoints")
+                || row.contains("Run files: 3 kB on disk"),
+            "{row}"
+        );
+        assert!(
+            row.contains("A successful retry or Remove frees them"),
+            "{row}"
+        );
+        assert!(row.contains("Remove and delete files"), "{row}");
+        assert!(row.contains("data-confirm="), "{row}");
+        assert!(row.contains("name=\"delete_files\""), "{row}");
+        // The checkpoint gone: no button, the files line stays.
+        std::fs::remove_dir_all(dir.join("work")).unwrap();
+        let page = view_with(&state, None, None, recs, cap).render().unwrap();
+        let row = page.split("<tr data-run=\"r9\"").nth(1).unwrap();
+        let row = row.split("tr-metrics-row").next().unwrap();
+        assert!(!row.contains("/training/retry-export"), "{row}");
+        // The route names what is wrong.
+        let (_, _, b) = call(&state, post_form("/training/retry-export", "id=nope", true)).await;
+        assert!(String::from_utf8(b).unwrap().contains("no run nope"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -4234,6 +4508,28 @@ mod tests {
         assert!(r["train_frames"].as_u64().unwrap() > 0);
         assert!(r["heldout_frames"].as_u64().unwrap() > 0, "{r}");
         assert!(r["warnings"].is_array());
+        // The pre-flight report and the disk come with every answer.
+        let pre = &r["preflight"];
+        assert_eq!(pre["train_frames"], r["train_frames"]);
+        assert_eq!(pre["heldout_frames"], r["heldout_frames"]);
+        assert!(
+            pre["classes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == "raccoon")
+        );
+        assert!(pre["refusals"].as_array().unwrap().is_empty(), "{pre}");
+        assert!(
+            v["disk"]["lines"].as_array().is_some_and(|l| !l.is_empty()),
+            "{v}"
+        );
+        assert!(
+            v["disk"]["lines"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("needed under")
+        );
         // Balance off: no report, the counts still.
         let (s, _, b) = call(&state, post(format!("dataset={enc}&balance_strength=0.5"))).await;
         let v = json(&b);

@@ -321,7 +321,7 @@ it; every key can also be set in the file.
 | `training.lr_min_factor` | unset | Final learning rate as a share of the starting one (0-1); unset = the family's default (YOLO 0.01, RF-DETR 0.1, also its anneal's; RT-DETRv2 / D-FINE 0). Applies: at once. UI: Training page (Advanced) |
 | `training.select_metric` | unset | What a run optimizes: it picks the exported epoch and drives the convergence rule. `map` (unset), `map50`, `f1`, `f2` (catch more), `f0_5` (fewer false alarms) or `iou` (box tightness only, ignores missed objects). F values are macro averages over the classes at their best threshold, not person or vehicle specific. With a small validation split anything but mAP is noisy; the held-out benchmark stays the number to trust. The Train form's value wins. Applies: at once. UI: Training page (Options) |
 | `training.negative_share` | `0.15` | Share of frames without objects (hard negatives) kept in the training split; extra empty frames are dropped, too few give a warning (0-0.9). Applies: at once. UI: config file |
-| `training.heldout_share` | `0.2` | Share of the review frames held out by camera and day for the benchmark when the export has no split of its own (0-0.9). Applies: at once. UI: config file |
+| `training.heldout_share` | `0.2` | Share of the review frames held out by whole camera days for the benchmark when the export holds nothing out; a single camera day is held out frame by frame (0-0.9; 0 = none). Applies: at once. UI: config file |
 | `training.oversample` | `3` | How often each of your own frames repeats in the training split when the public night subset is mixed in (1-10). Applies: at once. UI: config file |
 | `training.timeout_hours` | `48` | A run is stopped after this many hours (1-336). Applies: at once. UI: config file |
 | `training.synonyms` | `{}` | Auto-label prompt phrases per class, replacing the built-in ones of that class (`{"raccoon": ["raccoon", "trash panda"]}`; MM-Grounding-DINO and SigLIP prompts; at most 16 phrases, no periods). Applies: at once. UI: config file |
@@ -961,7 +961,7 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/autolabel/sam3/download` | "I have access": adopts a folder already on disk, else checks access and downloads; 409 with the state when refused |
 | POST | `/v1/autolabel/sam3/remove` | deletes the whole SAM 3 weights folder; refused while a run uses it |
 | POST | `/v1/review/restore-reopened` | puts frames a rerun reopened back to reviewed when nothing is pending; `dry_run` counts them |
-| POST | `/training/cancel`, `/training/finish`, `/training/remove`, `/training/use`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; finish it after the current epoch keeping the best checkpoint; forget a finished one; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model; `add` / `remove`: a `training.datasets` folder; delete the training environment |
+| POST | `/training/cancel`, `/training/finish`, `/training/remove`, `/training/retry-export`, `/training/use`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; finish it after the current epoch keeping the best checkpoint; forget a finished one (`delete_files` also deletes its folder); export a failed run's best checkpoint; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model; `add` / `remove`: a `training.datasets` folder; delete the training environment |
 | GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
@@ -1023,6 +1023,7 @@ blue-onyx-prism train autolabel --frames "import=any,limit=200" --allow-large   
 blue-onyx-prism train autolabel --with-model night-yolo26n-20261023-1200              # self-training re-label
 blue-onyx-prism train autolabel --with-model night-yolo26n-20261023-1200 --missing-only   # real objects with no box on reviewed frames
 blue-onyx-prism train list
+blue-onyx-prism train retry-export <run>   # a failed run: make the model from its best checkpoint, without training again
 blue-onyx-prism train remove-env
 ```
 

@@ -1,7 +1,8 @@
 //! In-app model training (docs/TRAINING.md): fine-tune YOLO26 / YOLO11 / YOLOv8 (Ultralytics,
 //! AGPL-3.0), RF-DETR, RT-DETRv2 or D-FINE (Apache-2.0) on the frames reviewed on the Review page,
 //! export a static ONNX, install it next to the other models, add it to the config and benchmark
-//! it on held-out frames from cameras and days it did not train on.
+//! it on held-out frames it did not train on (whole camera days when there are several, a share of
+//! the frames when there is one; other days of a held-out camera may train).
 //!
 //! - [`capability`]: can this machine train, on which GPU, which families and sizes fit (pure).
 //! - [`recipe`]: [`TrainRecipe`] (family, size, base weights, input size, epochs, batch, learning
@@ -11,6 +12,8 @@
 //!   (YOLO + COCO) and a held-out benchmark `dir:` set.
 //! - [`job`]: one run's stage machine over the model export's seams (`CommandRunner`, `Fetcher`;
 //!   the environment is `tools/train-env`, [`crate::resources::export::train`]).
+//! - [`preflight`]: the report shown before a run, the refusals and the disk check.
+//! - [`retry`]: a failed run's kept checkpoints: Retry export, disk use, deleting run files.
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
 //! - [`overlaps`]: the overlap check, suggestions for nested and partly overlapping boxes.
 //! - [`finish`]: the steps after an import chain (reject low-scoring auto boxes, accept the
@@ -34,9 +37,11 @@ pub mod finish;
 pub mod import;
 pub mod job;
 pub mod overlaps;
+pub mod preflight;
 pub mod progress;
 pub mod pyenv;
 pub mod recipe;
+pub mod retry;
 pub mod service;
 pub mod task;
 
@@ -303,6 +308,19 @@ pub fn options_for(config: &Config, request: &TrainRequest) -> dataset::Options 
 /// the request names none) and [`options_for`]. The public subset is read only when it is
 /// installed; asked for but missing, the plan leaves it out and says so first in its warnings.
 pub fn preview_plan(config: &Config, request: &TrainRequest) -> Result<dataset::Plan> {
+    Ok(preview_parts(config, request)?.plan)
+}
+
+/// A preview: the sources read, the options and the plan.
+#[derive(Debug)]
+pub struct Preview {
+    pub sources: Vec<dataset::Source>,
+    pub options: dataset::Options,
+    pub plan: dataset::Plan,
+}
+
+/// [`preview_plan`] with what it read, for [`preflight::report`] and [`preflight::run_needs`].
+pub fn preview_parts(config: &Config, request: &TrainRequest) -> Result<Preview> {
     request.balance.validate()?;
     let datasets = if request.datasets.is_empty() {
         &config.training.datasets
@@ -320,7 +338,8 @@ pub fn preview_plan(config: &Config, request: &TrainRequest) -> Result<dataset::
     let public_dir = public_subset_dir(&root);
     let public = request.include_public && public_subset_installed(&root);
     let sources = job::read_sources(&datasets, public.then_some(public_dir.as_path()))?;
-    let mut plan = dataset::plan(&sources, &options_for(config, request))?;
+    let options = options_for(config, request);
+    let mut plan = preflight::planned(&sources, &options)?;
     if request.include_public && !public {
         plan.warnings.insert(
             0,
@@ -329,7 +348,90 @@ pub fn preview_plan(config: &Config, request: &TrainRequest) -> Result<dataset::
                 .into(),
         );
     }
-    Ok(plan)
+    Ok(Preview {
+        sources,
+        options,
+        plan,
+    })
+}
+
+/// Frames of the folder under review that are not reviewed yet (`collect.review_dir`, or the
+/// dataset folder), for the pre-flight report. Reads every label file; None when the folder is not
+/// there.
+pub fn unreviewed_frames(config: &Config) -> Option<u64> {
+    use crate::collect::labels::queue;
+    let dir = config.collect.resolved_review_dir(&config.data_root());
+    dir.is_dir().then(|| {
+        let f = queue::Filters {
+            source: queue::QueueSource::All,
+            ..queue::Filters::default()
+        };
+        queue::build(&dir, &f).counts.remaining
+    })
+}
+
+/// Disk the training environment and base weights still need under the tools folder, for
+/// `recipes` (one download per weights) on `lane` (None = no GPU, nothing can run).
+pub fn tools_needs(
+    config: &Config,
+    recipes: &[TrainRecipe],
+    lane: Option<crate::resources::export::train::TrainLane>,
+) -> Vec<preflight::VolumeNeed> {
+    let paths = TrainPaths::for_config(config);
+    let mut bytes = lane
+        .filter(|l| {
+            !crate::resources::export::train::train_env_ready(&paths, Platform::current(), *l)
+        })
+        .map_or(0, |l| l.estimate().1);
+    let mut seen: Vec<&str> = Vec::new();
+    for base in recipes.iter().filter_map(|r| r.base().ok()) {
+        if !seen.contains(&base.id)
+            && !crate::resources::manager::is_installed(base, &paths.weights_dir(base))
+        {
+            seen.push(base.id);
+            bytes = bytes.saturating_add(base.size());
+        }
+    }
+    vec![preflight::VolumeNeed {
+        dir: paths.export.tools,
+        bytes,
+        advice: preflight::TOOLS_ADVICE,
+    }]
+}
+
+/// Refuse `jobs` before they queue: data no run can use ([`preflight::check_plan`], naming the run
+/// when there are several) and the disk they need together. The run checks again when it starts,
+/// the disk may have filled up by then.
+pub fn check_jobs(config: &Config, jobs: &[TrainJob]) -> Result<()> {
+    let mut needs = Vec::new();
+    for j in jobs {
+        // Not downloaded yet: the plan without it may look unusable, and the run downloads it.
+        if j.request.include_public && !public_subset_installed(&config.data_root()) {
+            continue;
+        }
+        let p = preview_parts(config, &j.request)?;
+        preflight::check_plan(&p.plan, &p.sources, &p.options).map_err(|e| {
+            if jobs.len() > 1 {
+                e.context(format!("run {}", j.name))
+            } else {
+                e
+            }
+        })?;
+        needs.extend(preflight::run_needs(
+            &p.plan,
+            &p.sources,
+            &j.request.recipe,
+            &j.run_dir,
+            j.install_dir(),
+        )?);
+    }
+    let recipes: Vec<TrainRecipe> = jobs.iter().map(|j| j.request.recipe.clone()).collect();
+    needs.extend(tools_needs(
+        config,
+        &recipes,
+        jobs.first().map(|j| j.accelerator.lane()),
+    ));
+    preflight::check_disk(needs)
 }
 
 /// Build the job of `request` on `config` and `cap` (see the checks below; `request.gpu` picks
@@ -432,6 +534,7 @@ pub fn plan_job(
         timeout: Duration::from_secs(u64::from(t.timeout_hours) * 3600),
         workers: t.workers.map_or(job::Workers::Auto, job::Workers::Fixed),
         keep_work: false,
+        export_only: None,
     })
 }
 
@@ -581,7 +684,7 @@ mod tests {
         assert_eq!(j.options, options_for(&c, &req));
         let sources = job::read_sources(&j.request.datasets, None).unwrap();
         let job_plan =
-            dataset::plan(&sources, &job::request_options(&j.options, &j.request)).unwrap();
+            preflight::planned(&sources, &job::request_options(&j.options, &j.request)).unwrap();
         assert_eq!(preview, job_plan);
         // A repeat with another training seed: the same frames.
         let mut seeded = req.clone();

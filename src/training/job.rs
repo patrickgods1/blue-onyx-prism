@@ -12,9 +12,16 @@
 //! ([`Hooks::register`], the `add-model` code, with the installed path) -> benchmark
 //! ([`Hooks::benchmark`] on the held-out `dir:` set; a failure there is reported but does not
 //! undo the model). Cancellation kills the child's process tree (the runner's job).
+//!
+//! The checkpoints (`<run>/work`) go once the model is installed, or when the run is cancelled. A
+//! failed run keeps them: training and export share one process, so a late failure would otherwise
+//! cost the whole training. [`TrainJob::export_only`] exports such a run again ([`super::retry`]):
+//! setup, self-check, then only the export and the stages after it. A run out of memory restarts
+//! only while that costs little ([`keeps_checkpoints`]).
 
 use super::capability::Accelerator;
 use super::dataset::{self, Prepared, SceneFilter};
+use super::preflight;
 use super::progress::{self, TrainEvent, TrainProgress};
 use super::recipe::TrainRecipe;
 use crate::model::ModelFamilyKind;
@@ -214,6 +221,19 @@ pub struct TrainJob {
     pub workers: Workers,
     /// Keep the checkpoints (`<run>/work`) after the run.
     pub keep_work: bool,
+    /// Export this failed run's checkpoint instead of training ([`super::retry::plan_retry`]).
+    pub export_only: Option<ExportRetry>,
+}
+
+/// A failed run to export again: what the run itself no longer tells.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportRetry {
+    /// `train_model.py --export-only` ([`super::retry::best_checkpoint`]).
+    pub checkpoint: PathBuf,
+    /// Time the training took, for the provenance (the script reports the export's).
+    pub train_seconds: Option<f64>,
+    /// What it trained on, for the provenance (the export runs on the CPU).
+    pub device: String,
 }
 
 impl TrainJob {
@@ -390,7 +410,12 @@ pub const MPS_WATERMARKS: [(&str, &str); 2] = [
     ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.8"),
 ];
 
-/// Run every stage of `job` (see the module docs).
+/// Longest export of an export-only run: minutes on a CPU, so this only catches a hang.
+const EXPORT_ONLY_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
+
+/// Run every stage of `job` (see the module docs). A failure names the checkpoint left behind, if
+/// any; a cancelled training takes its checkpoints along, a cancelled retry keeps them (the failed
+/// run it came from is still there to retry).
 pub fn run_training(
     job: &TrainJob,
     runner: &dyn CommandRunner,
@@ -403,16 +428,57 @@ pub fn run_training(
     let r = stages(job, runner, fetcher, hooks, report, cancel, &mut stage);
     r.map_err(|e| {
         let cancelled = e.downcast_ref::<Cancelled>().is_some() || cancel.load(Ordering::Relaxed);
+        let work = super::retry::work_dir(&job.run_dir);
+        if cancelled && !job.keep_work && job.export_only.is_none() {
+            let _ = manager::remove_any(&work);
+        }
         TrainError {
             stage,
             message: if cancelled {
                 "cancelled".into()
             } else {
-                format!("{e:#}")
+                format!("{e:#}{}", kept_note(job, &work))
             },
             cancelled,
         }
     })
+}
+
+/// The failure message's last sentence: the checkpoint that survived and what to do with it.
+fn kept_note(job: &TrainJob, work: &Path) -> String {
+    if super::retry::best_checkpoint(job.request.recipe.family.trainer(), work).is_none() {
+        return String::new();
+    }
+    format!(
+        ". Its best checkpoint is kept ({} in {}): Retry export on the run's row (train \
+         retry-export {}) makes the model without training again",
+        catalog::format_size(super::retry::disk_use(work)),
+        work.display(),
+        job.id
+    )
+}
+
+/// Whether a run out of memory stops rather than restarts from epoch 1: its work folder holds a
+/// checkpoint, and either training had ended (a restart would repeat all of it for an export that
+/// can be retried alone) or at least [`OOM_RETRY_EPOCHS`] epochs finished. It then fails, keeps the
+/// checkpoint, and the row offers its best epoch.
+fn keeps_checkpoints(tp: &TrainProgress, trainer: catalog::Trainer, work: &Path) -> bool {
+    (tp.phase.is_some() || tp.history.len() >= OOM_RETRY_EPOCHS)
+        && super::retry::best_checkpoint(trainer, work).is_some()
+}
+
+/// A failure while writing files, as an actionable message: a full disk gets the numbers.
+fn explain_full_disk(e: anyhow::Error, dir: &Path) -> anyhow::Error {
+    if !super::import::disk::is_disk_full(&e) {
+        return e;
+    }
+    let free = super::import::disk::space(dir)
+        .map_or_else(|| "unknown".into(), |s| catalog::format_size(s.available));
+    e.context(format!(
+        "the disk filled up ({free} free under {}): {}, then train again",
+        dir.display(),
+        preflight::TRAINING_ADVICE
+    ))
 }
 
 fn check(cancel: &AtomicBool) -> Result<()> {
@@ -487,6 +553,19 @@ fn stages(
             "{} already exists; choose another model name",
             models.join(format!("{}.onnx", job.name)).display()
         );
+    }
+    if let Some(r) = &job.export_only {
+        if !r.checkpoint.exists() {
+            bail!(
+                "the checkpoint {} is gone; train the model again",
+                r.checkpoint.display()
+            );
+        }
+        preflight::check_disk(vec![preflight::VolumeNeed {
+            dir: models.to_path_buf(),
+            bytes: super::retry::EXPORT_BYTES,
+            advice: preflight::MODELS_ADVICE,
+        }])?;
     }
     std::fs::create_dir_all(&job.run_dir)
         .with_context(|| format!("creating {}", job.run_dir.display()))?;
@@ -611,6 +690,83 @@ fn stages(
     }
     enter!(TrainStage::SelfCheck, 100, "PyTorch sees the GPU");
     check(cancel)?;
+    let finish = Finish {
+        job,
+        base,
+        hooks,
+        cancel,
+    };
+    if let Some(retry) = &job.export_only {
+        let data_dir = job.run_dir.join("data");
+        let prepared = dataset::read_prepared(&data_dir)?;
+        let staging = models.join(format!(".{}.train-staging", job.name));
+        manager::remove_any(&staging)?;
+        std::fs::create_dir_all(&staging)
+            .with_context(|| format!("creating {}", staging.display()))?;
+        enter!(TrainStage::Train, 0, "exporting the best checkpoint");
+        let work = super::retry::work_dir(&job.run_dir);
+        let args: Vec<OsString> = vec![
+            train_script.clone().into_os_string(),
+            "--trainer".into(),
+            trainer.into(),
+            "--family".into(),
+            family.as_str().into(),
+            "--size".into(),
+            recipe.size.clone().into(),
+            "--name".into(),
+            job.name.clone().into(),
+            "--data".into(),
+            data_dir.into_os_string(),
+            "--imgsz".into(),
+            recipe.imgsz.to_string().into(),
+            "--out-dir".into(),
+            staging.clone().into_os_string(),
+            "--work".into(),
+            work.clone().into_os_string(),
+            "--export-script".into(),
+            export_script.into_os_string(),
+            "--export-only".into(),
+            retry.checkpoint.clone().into_os_string(),
+        ];
+        let cmd = env::train_python_cmd(
+            paths,
+            job.platform,
+            Stage::Export,
+            &job.run_dir,
+            EXPORT_ONLY_TIMEOUT,
+            args,
+        );
+        let mut done: Option<TrainEvent> = None;
+        let res = runner.run(
+            &cmd,
+            &mut |l| {
+                log.line(l);
+                match progress::parse_line(l) {
+                    Some(ev @ TrainEvent::Done { .. }) => done = Some(ev),
+                    Some(TrainEvent::Phase { detail, .. }) => report(TrainReport::Stage {
+                        stage: TrainStage::Train,
+                        percent: 50,
+                        detail: &detail,
+                    }),
+                    Some(_) => {}
+                    None => report(TrainReport::Line(l)),
+                }
+            },
+            cancel,
+        );
+        if let Err(e) = res {
+            let _ = manager::remove_any(&staging);
+            let e = explain_full_disk(e, models);
+            return Err(env::explain_train_failure(
+                e,
+                paths,
+                job.platform,
+                "the export retry",
+            ));
+        }
+        check(cancel)?;
+        return finish.run(recipe, prepared, done, &staging, &mut log, report, current);
+    }
 
     // 3. Weights (and the public subset).
     let wdir = paths.weights_dir(base);
@@ -677,10 +833,19 @@ fn stages(
         job.request.include_public.then_some(public_dir.as_path()),
     )?;
     let opts = request_options(&job.options, &job.request);
-    let plan = dataset::plan(&sources, &opts)?;
+    let plan = preflight::planned(&sources, &opts)?;
+    preflight::check_plan(&plan, &sources, &opts)?;
     let data_dir = job.run_dir.join("data");
     manager::remove_any(&data_dir)?;
-    let prepared = dataset::write(&sources, &plan, &opts, &data_dir)?;
+    preflight::check_disk(preflight::run_needs(
+        &plan,
+        &sources,
+        recipe,
+        &job.run_dir,
+        models,
+    )?)?;
+    let prepared = dataset::write(&sources, &plan, &opts, &data_dir)
+        .map_err(|e| explain_full_disk(e, &job.run_dir))?;
     for w in &prepared.warnings {
         log.line(&format!("dataset: {w}"));
     }
@@ -936,9 +1101,11 @@ fn stages(
         let host_oom = lines.is_some_and(|l| host_out_of_memory_line(l).is_some());
         let gpu_oom = lines.is_some_and(|l| out_of_memory_line(l).is_some());
         let cancelled = cancel.load(Ordering::Relaxed);
-        // Out of system memory (commit): fewer workers, same batch; at any epoch (the worker
-        // count does not change the result).
-        let retry = if host_oom && !cancelled && host_retries < OOM_RETRIES && workers > 0 {
+        let keep = keeps_checkpoints(&tp, family.trainer(), &work);
+        // Out of system memory (commit): fewer workers, same batch (the worker count does not
+        // change the result).
+        let retry = if host_oom && !cancelled && !keep && host_retries < OOM_RETRIES && workers > 0
+        {
             let next = workers / 2;
             host_retries += 1;
             let msg = format!(
@@ -950,6 +1117,7 @@ fn stages(
         } else if gpu_oom
             && !cancelled
             && retries < OOM_RETRIES
+            && !keep
             && batch > 1
             && tp.history.len() < OOM_RETRY_EPOCHS
         {
@@ -982,15 +1150,15 @@ fn stages(
         }
         break (res, done);
     };
-    if !job.keep_work {
-        let _ = manager::remove_any(&work);
-    }
     let finished_recipe = TrainRecipe {
         batch,
         ..recipe.clone()
     };
     if let Err(e) = res {
         let _ = manager::remove_any(&staging);
+        if super::import::disk::is_disk_full(&e) {
+            return Err(explain_full_disk(e, &job.run_dir));
+        }
         if let Some(why) = e
             .downcast_ref::<crate::resources::export::ChildFailed>()
             .and_then(|c| {
@@ -1012,82 +1180,139 @@ fn stages(
         ));
     }
     check(cancel)?;
-    let Some(TrainEvent::Done {
-        family: fam,
-        classes,
-        device,
-        seconds,
-        ..
-    }) = done
-    else {
-        let _ = manager::remove_any(&staging);
-        bail!("the trainer finished without reporting its exported model");
-    };
-    let service_family: ModelFamilyKind = fam.parse()?;
-    if service_family != family.service_family() {
-        bail!(
-            "the trainer exported a {service_family} model, expected {}",
-            family.service_family()
-        );
-    }
-    if classes != prepared.classes {
-        bail!(
-            "the trained model has classes {classes:?}, the dataset {:?}",
-            prepared.classes
-        );
-    }
-
-    // 6. Install.
-    enter!(TrainStage::Install, 0, "checking the output");
-    let installed = install(
-        job,
+    finish.run(
         &finished_recipe,
-        &staging,
-        &prepared,
-        base,
-        service_family,
-        device.as_deref(),
-        seconds,
-    );
-    let _ = manager::remove_any(&staging);
-    let output = installed?;
-    enter!(TrainStage::Install, 100, &output.onnx.display().to_string());
-    check(cancel)?;
-
-    // 7. Register.
-    enter!(TrainStage::Register, 0, &output.name);
-    let registered = hooks.register(&output)?;
-    enter!(TrainStage::Register, 100, &registered);
-
-    // 8. Benchmark (best effort).
-    let (benchmark, benchmark_error) =
-        if output.heldout.is_some() || !job.request.benchmark_sets.is_empty() {
-            enter!(TrainStage::Benchmark, 0, "waiting for the benchmark runner");
-            match hooks.benchmark(
-                &output,
-                &job.request.benchmark_sets,
-                &job.request.benchmark_devices,
-                cancel,
-            ) {
-                Ok(b) => (b, None),
-                Err(e) if e.downcast_ref::<Cancelled>().is_some() => return Err(e),
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    log.line(&format!("benchmark failed: {msg}"));
-                    (None, Some(msg))
-                }
-            }
-        } else {
-            (None, None)
-        };
-    enter!(TrainStage::Benchmark, 100, "done");
-    Ok(RunOutcome {
-        output,
         prepared,
-        registered,
-        benchmark,
-        benchmark_error,
-    })
+        done,
+        &staging,
+        &mut log,
+        report,
+        current,
+    )
+}
+
+/// What a run does once the script exported a model, trained or from a checkpoint.
+struct Finish<'a> {
+    job: &'a TrainJob,
+    base: &'static Resource,
+    hooks: &'a dyn Hooks,
+    cancel: &'a AtomicBool,
+}
+
+impl Finish<'_> {
+    /// Check the script's report, install (the checkpoints go then: the model is safe), register
+    /// and benchmark.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        recipe: &TrainRecipe,
+        prepared: Prepared,
+        done: Option<TrainEvent>,
+        staging: &Path,
+        log: &mut Log,
+        report: &mut dyn FnMut(TrainReport<'_>),
+        current: &mut Option<TrainStage>,
+    ) -> Result<RunOutcome> {
+        let Self {
+            job,
+            base,
+            hooks,
+            cancel,
+        } = *self;
+        let family = recipe.family;
+        let mut enter = |stage: TrainStage, percent: u8, detail: &str| {
+            *current = Some(stage);
+            report(TrainReport::Stage {
+                stage,
+                percent,
+                detail,
+            });
+        };
+        let Some(TrainEvent::Done {
+            family: fam,
+            classes,
+            device,
+            seconds,
+            ..
+        }) = done
+        else {
+            let _ = manager::remove_any(staging);
+            bail!("the trainer finished without reporting its exported model");
+        };
+        let service_family: ModelFamilyKind = fam.parse()?;
+        if service_family != family.service_family() {
+            bail!(
+                "the trainer exported a {service_family} model, expected {}",
+                family.service_family()
+            );
+        }
+        if classes != prepared.classes {
+            bail!(
+                "the trained model has classes {classes:?}, the dataset {:?}",
+                prepared.classes
+            );
+        }
+        // Trained earlier: the script reports the export's own device and seconds.
+        let (device, seconds) = match &job.export_only {
+            Some(r) => (Some(r.device.clone()), r.train_seconds),
+            None => (device, seconds),
+        };
+
+        // 6. Install.
+        enter(TrainStage::Install, 0, "checking the output");
+        let installed = install(
+            job,
+            recipe,
+            staging,
+            &prepared,
+            base,
+            service_family,
+            device.as_deref(),
+            seconds,
+        );
+        let _ = manager::remove_any(staging);
+        let output = installed.map_err(|e| explain_full_disk(e, job.install_dir()))?;
+        if !job.keep_work {
+            let _ = manager::remove_any(&super::retry::work_dir(&job.run_dir));
+        }
+        enter(TrainStage::Install, 100, &output.onnx.display().to_string());
+        check(cancel)?;
+
+        // 7. Register.
+        enter(TrainStage::Register, 0, &output.name);
+        let registered = hooks.register(&output)?;
+        enter(TrainStage::Register, 100, &registered);
+
+        // 8. Benchmark (best effort).
+        let (benchmark, benchmark_error) =
+            if output.heldout.is_some() || !job.request.benchmark_sets.is_empty() {
+                enter(TrainStage::Benchmark, 0, "waiting for the benchmark runner");
+                match hooks.benchmark(
+                    &output,
+                    &job.request.benchmark_sets,
+                    &job.request.benchmark_devices,
+                    cancel,
+                ) {
+                    Ok(b) => (b, None),
+                    Err(e) if e.downcast_ref::<Cancelled>().is_some() => return Err(e),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        log.line(&format!("benchmark failed: {msg}"));
+                        (None, Some(msg))
+                    }
+                }
+            } else {
+                (None, None)
+            };
+        enter(TrainStage::Benchmark, 100, "done");
+        Ok(RunOutcome {
+            output,
+            prepared,
+            registered,
+            benchmark,
+            benchmark_error,
+        })
+    }
 }
 
 /// What the failure messages call a training run ([`env::explain_train_failure`]).

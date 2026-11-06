@@ -3,7 +3,8 @@
 Blue Onyx Prism can fine-tune a detection model on frames from your own cameras: frames the
 [dataset collector](DATASET.md) saved, reviewed on the **Review** page and exported in YOLO format.
 The result is a static ONNX model next to the others, added to the config and benchmarked on frames
-from cameras and days it did not train on. Use it as the default model, as the `night_model` of
+it did not train on: whole camera days when there are several (other days of the same camera may
+train), a share of the frames when there is only one. Use it as the default model, as the `night_model` of
 another model (IR and dark frames) or as a `verify` model.
 
 Training runs only when you start it (Training page or `blue-onyx-prism train run`), never from
@@ -166,16 +167,20 @@ The Training page lists the folders in `training.datasets` and the Review page's
      classes.txt                                class id = line number
      data.yaml
      images/train/<scene>.<camera>.<date>.<stem>.jpg
-     images/val/...                             held out by camera + day by the export
+     images/val/...                             held out by the export, whole camera days
      labels/train/<same stem>.txt               YOLO `class cx cy w h`, normalized; empty = no objects
      labels/val/...
      benchmark/manifest.json                    tags: scene, camera:<c>, date:<d>, hard-negative
      ignore.json                                ignore regions per image, frames with only parked-spot boxes
+     frames.json                                frames confirmed empty, frames accepted in bulk
+     hard_negatives.json                        rejected boxes
    ```
 
    Scene, camera and date come from the flat file name (or the manifest tags). The export's `val`
    split (whole camera + day groups) becomes the run's **held-out** set: never trained on, used for
-   the benchmark. `test/`, `valid/` and `heldout/` folders count as held out too.
+   the benchmark. `test/`, `valid/` and `heldout/` folders count as held out too. An export that
+   holds nothing out (a single camera day goes wholly to one side) is held out by the run instead,
+   step 2.
 2. **A flat YOLO folder**: `images/` (or the folder itself), `labels/<stem>.txt` or `<stem>.txt` beside
    the image, `classes.txt` or `data.yaml` (`names`), optionally `heldout.txt` / `test.txt` listing
    the held-out images, and a `manifest.json` in the benchmark format whose tags (`day` | `night` |
@@ -197,10 +202,20 @@ lists [ignore regions](#ignore-regions); no file means none.
    frames are counted (`excluded_frames` in `dataset.json`) and a run that drops more than 30% of
    its in-scope frames gets a warning. Held-out frames are never dropped, so a comparison stays fair.
    See [Class inventory](#class-inventory).
-2. **Held out**: chosen from **all** review frames, *before* the scene filter: the export's split when
-   it has one; else whole `camera/day` groups, in a seeded hash order, until
+2. **Same frame in several exports**: a frame ticked twice would both train and be measured on. By
+   the flat image name (`<scene>.<camera>.<date>.<stem>.jpg`, what survives into every export; other
+   names never match), one copy stays: the held-out one, else the first export's. Counted
+   (`duplicates_dropped`) and warned.
+
+   **Held out**: chosen from **all** review frames, *before* the scene filter: the export's split when
+   it leaves frames on both sides; else whole `camera/day` groups, in a seeded hash order, until
    `training.heldout_share` (0.2) of the frames, never all groups. With a single camera and day the
-   frames are split one by one, with a warning that the benchmark is optimistic. The held-out set
+   frames are split one by one, with a warning that frames of one day are similar and the benchmark
+   reads better than the model is. The explicit options stay: `holdout_cameras` / `holdout_days` on
+   the export, `training.heldout_share` 0 for no held-out set (a warning; every other empty held-out
+   set is refused, [Pre-flight](#pre-flight-report)). A whole camera day held out means that day's
+   frames are unseen, not that the camera is: other days of it train unless the export names it in
+   `holdout_cameras`. The held-out set
    keeps every scene, so a day model is also measured on night frames, and the same exports give the
    same held-out frames whatever the scene filter. `dataset.json` holds `heldout_fingerprint` (SHA-256
    of the sorted held-out frame keys, a frame's ignore regions part of its key, so runs scored with other
@@ -221,7 +236,9 @@ lists [ignore regions](#ignore-regions); no file means none.
    count as `parked_capped` in `dataset.json`, with a warning. Held-out frames are not capped. The
    frame where you pressed *Real, parked* holds a reviewer's box, so it is not capped.
 4. **Hard negatives**: about `training.negative_share` (15%) of the training frames have no objects:
-   extra empty frames are dropped (reviewer-confirmed ones are kept first); too few give a warning.
+   extra empty frames are dropped, those a reviewer confirmed empty or rejected a box on kept first
+   (`frames.json`, `hard_negatives.json`, so the Benchmark format need not be ticked; a labelers
+   run's dismissals and rejects for the class list do not count); too few give a warning.
 5. **Validation**: 10% of your own training frames (of all training frames when there are none),
    but at least 50 frames when the pool has them (`Options.min_valid`; never more than a quarter of the
    pool, so 100 frames give 25, 241 give 50, 1000 give 100; always at least one), for the trainer's checkpoint choice.
@@ -246,7 +263,7 @@ lists [ignore regions](#ignore-regions); no file means none.
    and does not compare with them. Compare runs on the held-out benchmark.
    A class with no training box gets a warning that says why: its boxes are only in the held-out
    split (the export's `val`: hold out other cameras or days when exporting, or review frames with
-   it from the training cameras and days), or no frame has one.
+   it from the camera days that train), or no frame has one.
 6. **Public subset**: optional, train only, never held out; your own frames then repeat
    `training.oversample` (3) times.
 7. **Balance** (optional, off by default; `--balance`, the page's Balance fieldset, `training.balance`
@@ -296,6 +313,30 @@ day dominates the set. Repeats add no new information: they only make the traine
 more often, so collect more frames of rare groups when you can, and keep `max_repeat` low for groups of
 a few frames (they overfit first). Images per epoch grow, so epochs take longer; patience counts epochs.
 Try it with `--dry-run` first, and compare against an unbalanced run on the same held-out frames.
+
+### Pre-flight report
+
+Above **Queue training** the page shows what the ticked data would give, for each run (the answer of
+`POST /v1/training/balance-preview`; `train prepare --dry-run` prints the same, `src/training/preflight.rs`):
+boxes per class (train, validation, held out, and by scene), training frames per scene, the splits,
+frames confirmed empty or with a rejected box, frames left out (ignore regions, parked-spot cap, frames
+repeated across exports, the scene filter), the share accepted in bulk, frames of the folder under review
+not reviewed yet, and disk needed against free per volume.
+
+| Check | Limit (`preflight.rs`) | Result |
+|---|---|---|
+| No training box of any picked class | none | refused |
+| No held-out frame, `training.heldout_share` above 0 | none | refused: the run could not be measured |
+| Disk | need + the free space a volume keeps (5%, 1 to 5 GiB, as an import) | refused, with the numbers |
+| Few training boxes of a class | under 50 (`MIN_CLASS_BOXES`) | warning |
+| Few held-out frames | under 10 (`MIN_HELDOUT_FRAMES`) | warning |
+| Few training frames of a scene | under 50 (`MIN_SCENE_FRAMES`) | warning, e.g. "Only 12 night frames: review more, or train day only." |
+
+The checks run when a run is queued (page, `train run`) and again when it starts. Warnings stay with the
+run: on its row, in `dataset.json` and in `train.log`. The disk need is the frames that cannot be hard-linked
+(another volume, or exFAT, probed with one link), labels, four times the base weights for the work folder
+(measured: YOLO26n 16 MB, RT-DETRv2 S 77 MB, RF-DETR nano 1.2 GB), RF-DETR's augmented copies, the model, and
+what the environment and weights still have to download.
 
 Output in `<training dir>/<run id>/data/`: `images/`, `labels/` (hard links, else copies),
 `classes.txt`, `train.txt` / `valid.txt` (repeats as repeated lines), `data.yaml` (Ultralytics),
@@ -601,6 +642,30 @@ the recommendation.
 
 ## A run
 
+### Retry export
+
+One process trains and exports, so a failure late in a run used to take the checkpoints with it. Now
+`<run>/work` goes only once the model is installed, or when you cancel. A failed run keeps it, and when it
+holds a best checkpoint the run's row (or `train retry-export <run>`) offers **Retry export**: a new process
+with `train_model.py --export-only <checkpoint>`, on the CPU, then install, config and benchmark as usual,
+under the run's own name. The checkpoints go when that succeeds, or with **Remove and delete files**; the
+row states their size. Cancelling a retry returns the run to its failure.
+
+| Family | Checkpoint | From a run that died while training |
+|---|---|---|
+| YOLO26, YOLO11, YOLOv8 | `run/weights/best.pt`, else `last.pt` | yes, the best epoch so far |
+| RF-DETR | `rfdetr-out/checkpoint_best_total.pth`, else the running `checkpoint_best_ema.pth` / `_regular.pth` | yes, the best epoch so far |
+| RT-DETRv2, D-FINE | `hf-best/` (saved at every new best epoch; `save_strategy="no"` keeps nothing else) | yes, the best epoch so far; not for runs of older versions |
+
+Measured on an M1 with a 16-frame set, 2 epochs: YOLO26n, RF-DETR nano and RT-DETRv2 S each exported after
+a failed export and after `kill -9` during training (RF-DETR from `checkpoint_best_ema.pth`), in 3 to 7 s. D-FINE
+has not been run: it trains on CUDA only. Training itself does not resume: the convergence rule, the
+selection and the learning-rate bends live in the trainer's process.
+
+A run out of memory restarts only while that costs little: not once training ended, and not after 3
+finished epochs when a checkpoint exists. It then fails with the checkpoint kept, and the row offers the
+best epoch so far.
+
 Stages (page and `train run` show them with percent and ETA):
 
 1. **setup**: uv, Python, the lock's packages, on Windows the Visual C++ runtime check (the export's
@@ -609,7 +674,8 @@ Stages (page and `train run` show them with percent and ETA):
    CUDA run also launches a test kernel, so a driver or kernel problem fails here in seconds.
 3. **weights**: the base weights (and the public subset), SHA-256 checked.
 4. **dataset**: assembled as above.
-5. **train**: `train_model.py` trains, then exports and checks the ONNX. Progress: every event is one
+5. **train**: `train_model.py` trains, then exports and checks the ONNX; a failure at any later point
+   keeps `<run>/work`, see [Retry export](#retry-export). Progress: every event is one
    stdout line `@train {json}` (`start`, `batch`, `epoch` with loss and validation mAP50 where the
    trainer reports it, `eval`, `phase`, `done`; `epoch` / `eval` also carry every scalar metric, see
    [Metrics per epoch](#metrics-per-epoch)); everything else goes to `<run>/train.log` (capped
@@ -638,8 +704,9 @@ Stages (page and `train run` show them with percent and ETA):
    (cores allow 5)`. `training.workers` in the config forces a count (0 = none; absent = automatic).
    **Out of system memory** (`[WinError 1455]` "the paging file is too small", `DefaultCPUAllocator:
    not enough memory`, `can't start new thread`, `MemoryError`, a worker killed by the OOM killer)
-   restarts the training with half the workers and the same batch (at most 3 restarts, at any epoch:
-   the worker count does not change the result); the log says "out of system memory with 5 data
+   restarts the training with half the workers and the same batch (at most 3 restarts; after 3
+   finished epochs with a checkpoint on disk, or in the export, it fails instead and keeps the
+   checkpoint, [Retry export](#retry-export)); the log says "out of system memory with 5 data
    loader workers, retrying with 2". Such a line also means the GPU was not the problem: on Windows
    (WDDM) a CUDA allocation fails too when the commit is exhausted ("CUDA out of memory ... 6.17 GiB
    is free"), so a failure with both is not retried at a smaller batch (run `20261029-235307-ae21`:
@@ -1700,6 +1767,7 @@ blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [
     [--device <spec>] [--accept-score-model 0.8] [--missing-only] [--confirm-license] [--allow-large] \
     [--frames "status=any,..."]
 blue-onyx-prism train list
+blue-onyx-prism train retry-export <run> [--no-register] [--no-benchmark]    # a failed run's best checkpoint -> the model
 blue-onyx-prism train remove-env
 ```
 

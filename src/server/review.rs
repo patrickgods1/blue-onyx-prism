@@ -48,8 +48,11 @@ use std::sync::Arc;
 pub(super) const LABELS_BODY_LIMIT: usize = 256 * 1024;
 /// Largest body of the other review POST routes.
 pub(super) const SMALL_BODY_LIMIT: usize = 16 * 1024;
-/// Exports go under `<data root>/training/exports/<UTC time>` unless `out_dir` is given.
-pub(crate) const EXPORTS_DIR: [&str; 2] = ["training", "exports"];
+/// The folder of the page's default exports, `<UTC time>` under it unless `out_dir` is given: where the Training page looks for them
+/// ([`crate::training::discover_exports`]), so a custom `training.dir` moves it too.
+fn exports_dir(state: &AppState) -> std::path::PathBuf {
+    crate::training::training_dir(&state.config_read()).join("exports")
+}
 
 fn fail(status: StatusCode, message: impl Into<String>) -> Response {
     (
@@ -199,7 +202,7 @@ pub(super) fn allowed_folder(
 /// `GET /review`.
 pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
-        let (dir, classes, root) = context(&state);
+        let (dir, classes, _) = context(&state);
         let dataset = CollectSettings::for_config(&state.config_read()).dir;
         render(&ReviewTemplate {
             nav: "review",
@@ -213,11 +216,7 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
             classes,
             buckets: Bucket::ALL.iter().map(|b| b.as_str()).collect(),
             scenes: layout::SCENES.to_vec(),
-            exports_dir: EXPORTS_DIR
-                .iter()
-                .fold(root, |p, c| p.join(c))
-                .display()
-                .to_string(),
+            exports_dir: exports_dir(&state).display().to_string(),
         })
     })
     .await
@@ -1818,10 +1817,9 @@ pub(super) async fn export(
             Err(e) => return fail(StatusCode::BAD_REQUEST, e),
         };
         let out_dir = match b.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            None => EXPORTS_DIR
-                .iter()
-                .fold(root.clone(), |p, c| p.join(c))
-                .join(crate::collect::utc_file_ts(std::time::SystemTime::now())),
+            None => {
+                exports_dir(&state).join(crate::collect::utc_file_ts(std::time::SystemTime::now()))
+            }
             Some(raw) => match crate::config::validate_dir_setting("out_dir", raw, &root) {
                 Ok(Some(p)) => p,
                 Ok(None) => return fail(StatusCode::BAD_REQUEST, "out_dir: empty"),

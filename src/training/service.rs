@@ -136,6 +136,9 @@ pub struct RunRecord {
     #[serde(default)]
     pub finished: Option<String>,
     pub run_dir: PathBuf,
+    /// Queued or running again to export its checkpoint ([`TrainingService::enqueue_retry`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retrying: bool,
 }
 
 impl RunRecord {
@@ -174,6 +177,7 @@ impl RunRecord {
             error: None,
             finished: None,
             run_dir: job.run_dir.clone(),
+            retrying: false,
         }
     }
 
@@ -249,10 +253,11 @@ pub fn load_records(path: &Path) -> Vec<RunRecord> {
         if r.state.is_busy() {
             r.state = RunState::Failed;
             r.error = Some(
-                "interrupted: the service stopped while this run was queued or running; queue \
-                 it again"
+                "interrupted: the service stopped while this run was queued or running; use Retry \
+                 export if the row offers it, else queue it again"
                     .into(),
             );
+            r.retrying = false;
         }
     }
     v
@@ -523,6 +528,38 @@ impl TrainingService {
         Ok(id)
     }
 
+    /// Queue the export of a failed run's checkpoint ([`super::retry::plan_retry`]) on its own
+    /// record: same id, folder and history. A cancelled retry goes back to the failure it came from.
+    pub fn enqueue_retry(&self, job: TrainJob) -> Result<String, String> {
+        let id = job.id.clone();
+        {
+            let mut runs = self.inner.runs.lock_recover();
+            if runs.iter().any(|r| r.state.is_busy() && r.name == job.name) {
+                return Err(format!(
+                    "a run training {} is already queued or running",
+                    job.name
+                ));
+            }
+            let Some(r) = runs.iter_mut().find(|r| r.id == id) else {
+                return Err(format!("no run {id}"));
+            };
+            if r.state != RunState::Failed {
+                return Err(format!("run {id} is {}, not failed", r.describe()));
+            }
+            r.state = RunState::Queued;
+            r.retrying = true;
+            r.percent = 0;
+            r.detail = String::new();
+            r.finished = None;
+        }
+        self.inner.persist();
+        self.inner.changed.notify_all();
+        self.tx
+            .send(Msg::Job(Box::new(job)))
+            .map_err(|_| "the training thread has stopped".to_string())?;
+        Ok(id)
+    }
+
     /// Queue an import or auto-label task (after the runs and tasks queued before it).
     pub fn enqueue_task(&self, task: Box<dyn Task>) -> Result<String, String> {
         let id = task.id().to_string();
@@ -619,7 +656,12 @@ impl TrainingService {
             RunState::Queued => {
                 self.inner.cancelled.lock_recover().insert(id.to_string());
                 self.inner.update_persist(id, |r| {
-                    r.state = RunState::Cancelled;
+                    r.state = if r.retrying {
+                        RunState::Failed
+                    } else {
+                        RunState::Cancelled
+                    };
+                    r.retrying = false;
                     r.finished = Some(now());
                 });
                 true
@@ -692,6 +734,9 @@ impl TrainingService {
                 "run {id} is {}; only a running run can finish early",
                 r.describe()
             ));
+        }
+        if r.retrying {
+            return Err(format!("run {id} is exporting its best checkpoint"));
         }
         if r.stage != Some(TrainStage::Train) {
             return Err(format!(
@@ -819,6 +864,29 @@ impl TrainingService {
                 .lock_recover()
                 .iter()
                 .any(|r| r.state.is_busy())
+    }
+
+    /// Forget the finished run `id` and delete its folder ([`super::retry::delete_run_files`]),
+    /// in that order of checks: nothing is forgotten when the files cannot go. Returns the record.
+    pub fn remove_with_files(
+        &self,
+        id: &str,
+        delete: impl FnOnce(&RunRecord) -> anyhow::Result<()>,
+    ) -> Result<RunRecord, String> {
+        let Some(r) = self.get(id) else {
+            return Err(format!("no run {id}"));
+        };
+        if r.state.is_busy() {
+            return Err("the run is queued or running; cancel it first".into());
+        }
+        delete(&r).map_err(|e| {
+            format!(
+                "the files of run {id} could not be deleted: {e:#}. The run stays in the list; \
+                 close what uses them and try again"
+            )
+        })?;
+        self.remove(id)?;
+        Ok(r)
     }
 
     /// Forget a finished run or task (its files stay).
@@ -977,7 +1045,7 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                 });
             }
             TrainReport::Prepared(p) => {
-                inner.update(&id, |r| r.dataset = Some(DatasetCounts::of(p)));
+                inner.update_persist(&id, |r| r.dataset = Some(DatasetCounts::of(p)));
             }
         };
         let runner = PausableRunner {
@@ -1003,6 +1071,8 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                     r.registered = Some(out.registered);
                     r.benchmark = out.benchmark;
                     r.benchmark_error = out.benchmark_error;
+                    r.error = None;
+                    r.retrying = false;
                     r.finished = Some(now());
                 });
             }
@@ -1011,7 +1081,12 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             }) => {
                 tracing::warn!(run = %id, "training cancelled");
                 inner.update_persist(&id, |r| {
-                    r.state = RunState::Cancelled;
+                    r.state = if r.retrying {
+                        RunState::Failed
+                    } else {
+                        RunState::Cancelled
+                    };
+                    r.retrying = false;
                     r.finished = Some(now());
                 });
             }
@@ -1021,6 +1096,7 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                     r.state = RunState::Failed;
                     r.stage = e.stage;
                     r.error = Some(e.message);
+                    r.retrying = false;
                     r.finished = Some(now());
                 });
             }

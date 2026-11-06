@@ -165,7 +165,7 @@
 
 <div class="card">
   <h2>Export reviewed frames</h2>
-  <p class="muted">Writes YOLO (<code>images/</code>, <code>labels/</code>, <code>data.yaml</code>), COCO (<code>annotations/</code>), X-AnyLabeling (<code>xanylabeling/</code>) and a benchmark set (<code>benchmark/</code>, run it with <code>benchmark --dataset dir:&lt;folder&gt;/benchmark</code>). The split holds out whole cameras or days. A class filter keeps the frames with a reviewed box of those classes; their other boxes stay labelled.</p>
+  <p class="muted">Writes YOLO (<code>images/</code>, <code>labels/</code>, <code>data.yaml</code>), COCO (<code>annotations/</code>), X-AnyLabeling (<code>xanylabeling/</code>) and a benchmark set (<code>benchmark/</code>, run it with <code>benchmark --dataset dir:&lt;folder&gt;/benchmark</code>). The split holds out whole camera days, or the cameras and days you name; other days of a held-out camera still train unless you name the camera. A class filter keeps the frames with a reviewed box of those classes; their other boxes stay labelled.</p>
   <form id="rv-export">
     <div class="inline-row">
       <label class="check"><input type="checkbox" name="fmt" value="yolo" checked> YOLO</label>
