@@ -1,10 +1,12 @@
 //! Request/latency counters and Prometheus text rendering.
 
 use crate::model::filters::{SuppressCounts, SuppressReason};
-use crate::sync::RwLockExt;
+use crate::sync::{LockExt, RwLockExt};
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// Upper bounds (ms, inclusive) of the histogram buckets; the last bucket is `+Inf`.
@@ -122,16 +124,24 @@ pub enum RejectReason {
     /// The image could not be decoded or was rejected by its size (counted per model by the
     /// worker, see [`ModelMetrics::record_decode_error`]).
     DecodeError,
-    /// Not a multipart body, no `image` field, a malformed or stalled upload.
+    /// Not a multipart body, no `image` field, a malformed upload.
     BadRequest,
+    /// One peer already had its limit of uploads still being read (503). Counted apart from
+    /// [`RejectReason::Overloaded`]: this one points at a stalled or very slow sender, that one
+    /// at more frames than the models can serve.
+    PeerBodyReads,
+    /// The upload was not received within the read deadline.
+    BodyTimeout,
 }
 
 impl RejectReason {
-    pub const ALL: [RejectReason; 4] = [
+    pub const ALL: [RejectReason; 6] = [
         RejectReason::Overloaded,
         RejectReason::BodyTooLarge,
         RejectReason::DecodeError,
         RejectReason::BadRequest,
+        RejectReason::PeerBodyReads,
+        RejectReason::BodyTimeout,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -140,6 +150,8 @@ impl RejectReason {
             RejectReason::BodyTooLarge => "body_too_large",
             RejectReason::DecodeError => "decode_error",
             RejectReason::BadRequest => "bad_request",
+            RejectReason::PeerBodyReads => "peer_body_reads",
+            RejectReason::BodyTimeout => "body_timeout",
         }
     }
 }
@@ -457,14 +469,47 @@ pub struct Metrics {
     pub rejected_body_too_large: AtomicU64,
     /// Detection requests without a usable multipart body (see [`RejectReason::BadRequest`]).
     pub rejected_bad_request: AtomicU64,
+    /// Detection requests answered 503 because their peer had its limit of uploads still being
+    /// read (see [`Metrics::try_begin_body_read`]).
+    pub rejected_peer_body_reads: AtomicU64,
+    /// Detection uploads not received within the read deadline.
+    pub rejected_body_timeout: AtomicU64,
     /// Fixed server-wide in-flight cap for detection requests; 0 (the default) derives it from
     /// the models' queue capacities on every request (see `server::detect::max_inflight`).
     pub inflight_limit: AtomicUsize,
     /// Rate limit of the "server is overloaded" warning.
     pub overload_log: LogThrottle,
+    /// Rate limit of the "one client holds too many uploads" warning.
+    pub peer_reads_log: LogThrottle,
     /// Detection requests being handled now, process-wide (every generation counts: an
     /// in-flight request of an old generation still holds its upload in memory).
     inflight: AtomicUsize,
+    /// Uploads still being read, per peer. An entry exists only while its count is above zero
+    /// and a [`BodyReadPermit`] exists only under an [`InflightPermit`], so the map never holds
+    /// more peers than the in-flight cap allows requests.
+    body_reads: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// One upload being read from a peer; gives the peer's slot back when dropped, which removes the
+/// peer's entry when it was the last one. Held only for the body read, unlike
+/// [`InflightPermit`], so a client's total requests are never capped by it: frames waiting for a
+/// model hold none.
+#[derive(Debug)]
+pub struct BodyReadPermit {
+    metrics: Arc<Metrics>,
+    peer: IpAddr,
+}
+
+impl Drop for BodyReadPermit {
+    fn drop(&mut self) {
+        let mut reads = self.metrics.body_reads.lock_recover();
+        if let Some(n) = reads.get_mut(&self.peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                reads.remove(&self.peer);
+            }
+        }
+    }
 }
 
 /// A detection request admitted under the server-wide in-flight cap; releases its slot when
@@ -531,9 +576,13 @@ impl Metrics {
             rejected_overloaded: AtomicU64::new(0),
             rejected_body_too_large: AtomicU64::new(0),
             rejected_bad_request: AtomicU64::new(0),
+            rejected_peer_body_reads: AtomicU64::new(0),
+            rejected_body_timeout: AtomicU64::new(0),
             inflight_limit: AtomicUsize::new(0),
             overload_log: LogThrottle::default(),
+            peer_reads_log: LogThrottle::default(),
             inflight: AtomicUsize::new(0),
+            body_reads: Mutex::new(HashMap::new()),
         }
     }
 
@@ -548,6 +597,40 @@ impl Metrics {
             .map(|_| InflightPermit(self.clone()))
     }
 
+    /// Start reading one more upload from `peer` when it has fewer than `limit` being read;
+    /// `None` when it has them all (the caller answers 503 and counts it in
+    /// `rejected_peer_body_reads`). An IPv4 client on a dual-stack socket is one peer with its
+    /// plain IPv4 address. The address is the whole key on purpose: a shared IPv6 /64 would tie
+    /// a Blue Iris machine to whatever else sits on its LAN.
+    pub fn try_begin_body_read(
+        self: &Arc<Self>,
+        peer: IpAddr,
+        limit: usize,
+    ) -> Option<BodyReadPermit> {
+        let peer = peer.to_canonical();
+        let mut reads = self.body_reads.lock_recover();
+        let held = reads.get(&peer).copied().unwrap_or(0);
+        if held >= limit {
+            return None;
+        }
+        reads.insert(peer, held.saturating_add(1));
+        drop(reads);
+        Some(BodyReadPermit {
+            metrics: self.clone(),
+            peer,
+        })
+    }
+
+    /// Uploads being read now, over every peer.
+    pub fn body_reads(&self) -> usize {
+        self.body_reads.lock_recover().values().sum()
+    }
+
+    /// Peers with an upload being read now (the size of the per-peer map).
+    pub fn body_read_peers(&self) -> usize {
+        self.body_reads.lock_recover().len()
+    }
+
     /// Count one rejected detection request ([`RejectReason::DecodeError`] is counted per
     /// model instead, see [`ModelMetrics::record_decode_error`]; recording it here is a no-op).
     pub fn record_rejected(&self, reason: RejectReason) {
@@ -555,6 +638,8 @@ impl Metrics {
             RejectReason::Overloaded => &self.rejected_overloaded,
             RejectReason::BodyTooLarge => &self.rejected_body_too_large,
             RejectReason::BadRequest => &self.rejected_bad_request,
+            RejectReason::PeerBodyReads => &self.rejected_peer_body_reads,
+            RejectReason::BodyTimeout => &self.rejected_body_timeout,
             RejectReason::DecodeError => return,
         };
         c.fetch_add(1, Ordering::Relaxed);
@@ -566,6 +651,8 @@ impl Metrics {
             RejectReason::Overloaded => self.rejected_overloaded.load(Ordering::Relaxed),
             RejectReason::BodyTooLarge => self.rejected_body_too_large.load(Ordering::Relaxed),
             RejectReason::BadRequest => self.rejected_bad_request.load(Ordering::Relaxed),
+            RejectReason::PeerBodyReads => self.rejected_peer_body_reads.load(Ordering::Relaxed),
+            RejectReason::BodyTimeout => self.rejected_body_timeout.load(Ordering::Relaxed),
             RejectReason::DecodeError => self
                 .models
                 .read_recover()
@@ -706,7 +793,7 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
 
     let _ = writeln!(
         out,
-        "# HELP {PREFIX}requests_rejected_total Detection requests rejected before inference, by reason (overloaded: the server-wide in-flight cap was reached; body_too_large: the upload exceeded the body limit; decode_error: the image could not be decoded; bad_request: no usable multipart image upload)."
+        "# HELP {PREFIX}requests_rejected_total Detection requests rejected before inference, by reason (overloaded: the server-wide in-flight cap was reached; body_too_large: the upload exceeded the body limit; decode_error: the image could not be decoded; bad_request: no usable multipart image upload; peer_body_reads: one client had too many uploads still being read, a stalled or very slow sender; body_timeout: the upload was not received in time)."
     );
     let _ = writeln!(out, "# TYPE {PREFIX}requests_rejected_total counter");
     for reason in RejectReason::ALL {
@@ -969,6 +1056,63 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
 mod tests {
     use super::*;
 
+    /// One peer's uploads being read: capped per address, not across peers, and the map holds
+    /// nothing once the last permit is gone.
+    #[test]
+    fn body_read_permits_are_per_peer_and_leave_no_entry() {
+        let m = Arc::new(Metrics::new("x"));
+        let a: IpAddr = "10.0.0.7".parse().unwrap();
+        let b: IpAddr = "10.0.0.8".parse().unwrap();
+        let held: Vec<_> = (0..2)
+            .map(|_| m.try_begin_body_read(a, 2).unwrap())
+            .collect();
+        assert!(m.try_begin_body_read(a, 2).is_none(), "a is at its limit");
+        let other = m.try_begin_body_read(b, 2).unwrap();
+        assert_eq!((m.body_reads(), m.body_read_peers()), (3, 2));
+        drop(other);
+        assert_eq!((m.body_reads(), m.body_read_peers()), (2, 1));
+        drop(held);
+        assert_eq!((m.body_reads(), m.body_read_peers()), (0, 0));
+        // A refused peer gets no entry.
+        assert!(m.try_begin_body_read(a, 0).is_none());
+        assert_eq!(m.body_read_peers(), 0);
+    }
+
+    /// An IPv4 client seen through a dual-stack socket is the same peer.
+    #[test]
+    fn body_reads_key_an_ipv4_mapped_peer_as_ipv4() {
+        let m = Arc::new(Metrics::new("x"));
+        let plain: IpAddr = "192.168.1.5".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.168.1.5".parse().unwrap();
+        let held = m.try_begin_body_read(plain, 1).unwrap();
+        assert!(m.try_begin_body_read(mapped, 1).is_none());
+        drop(held);
+        let held = m.try_begin_body_read(mapped, 1).unwrap();
+        assert!(m.try_begin_body_read(plain, 1).is_none());
+        assert_eq!(m.body_read_peers(), 1);
+        drop(held);
+        assert_eq!(m.body_read_peers(), 0);
+    }
+
+    /// The per-peer map is one mutex on the detection path: many threads hammering it end
+    /// with nothing left behind.
+    #[test]
+    fn body_read_permits_survive_concurrent_use() {
+        let m = Arc::new(Metrics::new("x"));
+        std::thread::scope(|s| {
+            for t in 0..8u8 {
+                let m = m.clone();
+                s.spawn(move || {
+                    let peer = IpAddr::from([10, 0, 0, t % 3]);
+                    for _ in 0..2000 {
+                        drop(m.try_begin_body_read(peer, 4));
+                    }
+                });
+            }
+        });
+        assert_eq!((m.body_reads(), m.body_read_peers()), (0, 0));
+    }
+
     #[test]
     fn inflight_permits_respect_the_limit() {
         let m = Arc::new(Metrics::new("0"));
@@ -1084,6 +1228,9 @@ mod tests {
         m.record_rejected(RejectReason::BadRequest);
         m.record_rejected(RejectReason::BadRequest);
         m.record_rejected(RejectReason::DecodeError); // per model: no-op here
+        m.record_rejected(RejectReason::PeerBodyReads);
+        m.record_rejected(RejectReason::BodyTimeout);
+        m.record_rejected(RejectReason::BodyTimeout);
         m.model("a").record_decode_error();
         m.model("b").record_decode_error();
         m.model("b").record_decode_error();
@@ -1098,6 +1245,8 @@ mod tests {
         has("blue_onyx_prism_requests_rejected_total{reason=\"overloaded\"} 0");
         has("blue_onyx_prism_requests_rejected_total{reason=\"body_too_large\"} 1");
         has("blue_onyx_prism_requests_rejected_total{reason=\"decode_error\"} 3");
+        has("blue_onyx_prism_requests_rejected_total{reason=\"peer_body_reads\"} 1");
+        has("blue_onyx_prism_requests_rejected_total{reason=\"body_timeout\"} 2");
         has("blue_onyx_prism_requests_rejected_total{reason=\"bad_request\"} 2");
         has("blue_onyx_prism_info{version=\"9.8.7\"} 1");
         has("# TYPE blue_onyx_prism_build_info gauge");

@@ -131,7 +131,7 @@ serves HTTP right away (models answer `Model initializing` with the download pro
 |---|---|---|
 | `auto_download` | `true` | Download what the config needs at startup. `false` (air-gapped, Docker): only report it; affected models are `Failed` with the command to run |
 | `allow_large_downloads` | `false` | Allow downloads over 500 MB, in practice the NVIDIA CUDA libraries |
-| `download_dir` | `null` | Root for runtimes and relative model paths (default: the executable's directory) |
+| `download_dir` | `null` | Root for runtimes and relative model paths (default: the executable's directory). Config file only: see [Library folders](#library-folders-config-file-or-command-line-only) |
 
 Commands (the same code the service uses):
 
@@ -190,7 +190,9 @@ After installing, open `http://127.0.0.1:32168/`. The installers are not code-si
 
 - **Windows:** SmartScreen may show "Windows protected your PC". Click *More info*, then *Run anyway*.
   The MSI installs the `BlueOnyxPrismService` service (runs as Local Service, starts automatically),
-  a firewall rule for TCP 32168 (`msiexec /i <file>.msi PORT=<n>` for another port's rule), and a
+  a firewall rule for TCP 32168 (`msiexec /i <file>.msi PORT=<n>` for another port's rule; local subnet
+  on Domain and Private networks only, so Blue Iris on another subnet or a PC on a Public network needs
+  the manual rule in [packaging/windows/README.md](packaging/windows/README.md)), and a
   Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn`. Uninstall from
   *Settings > Apps*: it removes everything, including `C:\ProgramData\BlueOnyxPrism` (config,
   downloads, logs); to keep that folder for a reinstall, uninstall with
@@ -278,17 +280,18 @@ it; every key can also be set in the file.
 | `port` | `32168` | HTTP listen port. Integer 1-65535. Applies: process restart. UI: yes |
 | `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
 | `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines too. Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
+| `allowed_hosts` | `[]` | Host names the admin pages answer under, besides IP addresses and `localhost` (the defence against DNS rebinding). List of up to 32 bare names, lower-cased: no scheme, port, path or wildcard. Applies: at once. UI: yes. See [Remote access](#remote-access) |
 | `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout). Integer 1-3600. Applies: at once. UI: yes |
 | `worker_queue_size` | `0` | Per-model queue length; 0 = auto from timeout and measured inference time. Integer 0-1024. Applies: restart. UI: yes |
 | `device` | `"auto"` | Device spec (`auto`, `openvino:gpu`, `ort:cuda`, ..., or legacy `GPU`/`CPU`); see [Hardware and device selection](#hardware-and-device-selection). Falls back to CPU when the device cannot run. Applies: restart. UI: yes |
 | `gpu_index` | `0` | GPU to use when several are present. Integer 0-64. Applies: restart. UI: yes |
 | `force_cpu` | `false` | Always use the CPU (overrides every per-model device). Boolean. Applies: restart. UI: yes |
 | `cache_dir` | `"cache"` | Compiled-model cache; `""` disables it. Path. Applies: restart. UI: yes |
-| `openvino_dir` | `null` | OpenVINO runtime dir; default `<exe_dir>/openvino`, else the system install. Path (relative = under the exe dir). Applies: restart. UI: yes (Server, Folders) |
-| `onnxruntime_dir` | `null` | ONNX Runtime dir (user-managed, never replaced); lookup order: this field, `ORT_DYLIB_PATH`, `onnxruntime/<flavor>/` named by `onnxruntime/active.txt`, `onnxruntime/` itself (older installs), any `onnxruntime/<flavor>/`. Path (relative = under the exe dir). Applies: process restart (a process loads one ONNX Runtime). UI: yes (Server, Folders) |
+| `openvino_dir` | `null` | OpenVINO runtime dir; default `<exe_dir>/openvino`, else the system install. Path (relative = under the exe dir). Applies: restart. UI: read-only; set it in the file or with `--openvino-dir`, see [Library folders](#library-folders-config-file-or-command-line-only) |
+| `onnxruntime_dir` | `null` | ONNX Runtime dir (user-managed, never replaced); lookup order: this field, `ORT_DYLIB_PATH`, `onnxruntime/<flavor>/` named by `onnxruntime/active.txt`, `onnxruntime/` itself (older installs), any `onnxruntime/<flavor>/`. Must be a folder; a file is refused (only `ORT_DYLIB_PATH` may name a file). Path (relative = under the exe dir). Applies: process restart (a process loads one ONNX Runtime). UI: read-only; set it in the file or with `--onnxruntime-dir`, see [Library folders](#library-folders-config-file-or-command-line-only) |
 | `auto_download` | `true` | Download missing runtimes and models at startup; see [First run](#first-run). Boolean. Applies: restart. UI: yes |
 | `allow_large_downloads` | `false` | Allow downloads over 500 MB (NVIDIA CUDA libraries). Boolean. Applies: restart. UI: yes |
-| `download_dir` | `null` | Root for downloaded runtimes and relative model paths (default: the executable's directory). Path. Applies: restart. Files already downloaded are not moved. UI: yes (Server, Folders) |
+| `download_dir` | `null` | Root for downloaded runtimes and relative model paths (default: the executable's directory). Path. Applies: restart. Files already downloaded are not moved. UI: read-only; set it in the file, see [Library folders](#library-folders-config-file-or-command-line-only) |
 | `confidence_threshold` | `0.5` | Default minimum confidence (a request's `min_confidence` > 0 overrides it). Number 0-1. Applies: at once. UI: yes |
 | `nms_iou` | `0.5` | IoU threshold for NMS-based families. Number 0-1. Applies: at once. UI: yes |
 | `object_filter` | `[]` | Only report these labels (case-insensitive); empty = all. List of strings. Applies: at once. UI: yes |
@@ -758,7 +761,8 @@ dashboards; the `_avg`/`_min`/`_max` gauges are still exported. Process level:
 (detections answered 503 at once because more requests were in flight than every model's queue
 can hold plus 16; `stats.json` shows the same as `rejectedOverloaded` and `inflightRequests`).
 Other `requests_rejected_total` reasons count detection requests refused before they reach a
-model (`body_too_large`, `decode_error`, `bad_request`). Gauges: `model_info`, `model_ready`,
+model (`body_too_large`, `decode_error`, `bad_request`, `peer_body_reads`: one address already has
+the most uploads allowed in progress, `body_timeout`: an upload took over 10 s to arrive). Gauges: `model_info`, `model_ready`,
 `queue_length`, `queue_capacity`, `inflight_requests`. (`rejected_initializing_total` is now
 `dropped_total{reason="initializing"}`.) Process and build:
 
@@ -797,6 +801,14 @@ detection API (`/v1/vision/*`), `/v1/status`, `/v1/status/updateavailable`, the 
   foreign). Requests with none of these headers are allowed, so `curl` and scripts on this machine
   keep working; browsers always send `Origin` on cross-origin POSTs. The detection API is never
   checked.
+- DNS rebinding: a web page can point a DNS name of its own at this machine, and then `Origin`
+  matches `Host` and the peer looks local, so the check above does not help. Every admin route
+  therefore answers only under an IP address (so LAN administration by address keeps working),
+  `localhost`, or a name you list in `allowed_hosts`; any other `Host` gets **403**, on every
+  method, naming the host. If you open the service by name (`http://nas.local:32168/`, or a name
+  a reverse proxy passes on), add that name to `allowed_hosts`, on the Config page opened by IP
+  address or in the config file. Names match exactly: a subdomain needs its own entry. The
+  detection API and the other open routes accept any `Host`.
 - A reverse proxy on this machine (nginx, Caddy, Traefik, e.g. for TLS) makes every proxied request
   arrive from `127.0.0.1`, so everyone who can reach the proxy gets the admin pages: it is
   equivalent to `"allow_remote_admin": true`. `X-Forwarded-For` and similar headers are ignored on
@@ -804,6 +816,16 @@ detection API (`/v1/vision/*`), `/v1/status`, `/v1/status/updateavailable`, the 
   `/v1/vision/*`) when it is reachable from other machines.
 - To keep everything on this machine (Blue Iris on the same PC), set `"bind_address": "127.0.0.1"`
   (or `--bind-address 127.0.0.1`); it applies when the process restarts.
+
+#### Library folders: config file or command line only
+
+`download_dir`, `onnxruntime_dir` and `openvino_dir` decide which shared libraries the service
+loads, and a loaded library runs with the service's rights. The admin pages have no login, so
+anyone who reached them could otherwise run their own code as the service. The Config page shows
+the three read-only, and `POST /config` refuses a changed value. To change one, edit the config
+file (`--onnxruntime-dir` and `--openvino-dir` work too; `download_dir` has no flag), then restart.
+`onnxruntime_dir` must be a folder: a file there is refused and the search goes on, while
+`ORT_DYLIB_PATH`, which only whoever controls the service can set, may name a file.
 
 ## Running as a service
 

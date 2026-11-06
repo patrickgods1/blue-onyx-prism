@@ -8,7 +8,8 @@
 //!   when the child is killed), else 409 `{"available": false, "message"}` (no desktop, a peer
 //!   that is not this machine, the dialog failed to start) or 409 `{"busy": true, "message"}`
 //!   (one dialog at a time, process-wide). An admin route: loopback only unless
-//!   `allow_remote_admin`, and the POST passes the CSRF guard; even with `allow_remote_admin` a
+//!   `allow_remote_admin`, the `Host` check of [`super::guard`] applies, and the POST passes
+//!   the CSRF guard; even with `allow_remote_admin` a
 //!   remote peer gets "unavailable", since the dialog would open on a screen it cannot see. So
 //!   does a loopback peer reached indirectly: a request carrying `X-Forwarded-For`, `Forwarded`
 //!   or `X-Real-IP` (a reverse proxy on this machine), or whose `Host` is not `localhost`,
@@ -41,6 +42,7 @@
 //! the paths that person chose, for an hour. The in-page listing (`GET /v1/fs/browse`) keeps
 //! the roots rule (SV-10 unchanged), so a pick never widens what the page can list.
 
+use super::guard::{host_part, request_host};
 use super::{AppState, admin_allowed, blocking};
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
@@ -908,25 +910,6 @@ fn remote_message() -> String {
 /// on this machine, whatever the TCP peer is.
 const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
 
-/// The host part of a `Host` value (`localhost:32168` -> `localhost`, `[::1]:80` -> `::1`,
-/// lowercased); None when it is not well formed.
-fn host_part(host: &str) -> Option<String> {
-    let h = host.trim();
-    let name = if let Some(rest) = h.strip_prefix('[') {
-        let (v6, after) = rest.split_once(']')?;
-        if !(after.is_empty() || after.starts_with(':')) {
-            return None;
-        }
-        v6
-    } else if h.matches(':').count() > 1 {
-        // A bare IPv6 literal (`::1`), no port.
-        h
-    } else {
-        h.split(':').next()?
-    };
-    (!name.is_empty()).then(|| name.to_ascii_lowercase())
-}
-
 /// Why a loopback request still must not open a dialog: it came through a proxy, or under a
 /// host name other than a loopback one (a DNS-rebound name, a reverse proxy that keeps the
 /// peer local). `None` = a direct local request. The `Host` is the header, else the request
@@ -935,12 +918,7 @@ fn indirect_reason(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> Op
     if let Some(h) = PROXY_HEADERS.iter().find(|h| headers.contains_key(**h)) {
         return Some(format!("the request came through a proxy ({h} header)"));
     }
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| uri.authority().map(|a| a.as_str().to_string()));
-    let Some(host) = host else {
+    let Some(host) = request_host(headers, uri) else {
         return Some("the request has no Host header".into());
     };
     match host_part(&host).as_deref() {
@@ -1486,25 +1464,6 @@ mod tests {
         assert_eq!(out.ended, Ended::Abandoned);
     }
 
-    #[test]
-    fn host_parts() {
-        for (h, want) in [
-            ("localhost:32168", Some("localhost")),
-            ("LocalHost", Some("localhost")),
-            ("127.0.0.1:80", Some("127.0.0.1")),
-            ("[::1]:32168", Some("::1")),
-            ("[::1]", Some("::1")),
-            ("::1", Some("::1")),
-            ("evil.example:32168", Some("evil.example")),
-            ("localhost.evil.example", Some("localhost.evil.example")),
-            ("[::1]x", None),
-            ("", None),
-            (":80", None),
-        ] {
-            assert_eq!(host_part(h).as_deref(), want, "{h}");
-        }
-    }
-
     /// Loopback peers reached through a proxy or under a foreign host name are refused.
     #[test]
     fn indirect_local_requests_are_refused() {
@@ -1699,13 +1658,29 @@ mod tests {
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);
         assert!(j["message"].as_str().unwrap().contains("proxy"), "{j}");
+        // The admin guard passes an IP address; the dialog still needs a loopback name.
         let mut req = post(LOCAL, r#"{"kind":"folder"}"#);
         req.headers_mut()
-            .insert(header::HOST, "rebind.attacker.test:32168".parse().unwrap());
+            .insert(header::HOST, "192.168.1.10:32168".parse().unwrap());
         let (s, _, b) = call(&state, req).await;
         assert_eq!(s, StatusCode::CONFLICT);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(j["message"].as_str().unwrap().contains("opened as"), "{j}");
+        // So does a name the config allows.
+        let named = test_state_with(|c| c.allowed_hosts = vec!["nas.home.arpa".into()]);
+        let mut req = post(LOCAL, r#"{"kind":"folder"}"#);
+        req.headers_mut()
+            .insert(header::HOST, "nas.home.arpa:32168".parse().unwrap());
+        let (s, _, b) = call(&named, req).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(j["message"].as_str().unwrap().contains("opened as"), "{j}");
+        // A rebound name does not get that far.
+        let mut req = post(LOCAL, r#"{"kind":"folder"}"#);
+        req.headers_mut()
+            .insert(header::HOST, "rebind.attacker.test:32168".parse().unwrap());
+        let (s, _, _) = call(&state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
         let get = from_peer(
             Request::get("/v1/fs/pick")
                 .header("forwarded", "for=10.0.0.5")

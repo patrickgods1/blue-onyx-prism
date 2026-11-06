@@ -34,6 +34,7 @@ pub(super) struct ConfigView {
     port: String,
     bind_address: String,
     allow_remote_admin: bool,
+    allowed_hosts: String,
     request_timeout_secs: String,
     worker_queue_size: String,
     device: String,
@@ -81,6 +82,7 @@ impl ConfigView {
             port: c.port.to_string(),
             bind_address: c.bind_address.to_string(),
             allow_remote_admin: c.allow_remote_admin,
+            allowed_hosts: c.allowed_hosts.join(", "),
             request_timeout_secs: c.request_timeout_secs.to_string(),
             worker_queue_size: c.worker_queue_size.to_string(),
             device: c.device.clone(),
@@ -139,15 +141,13 @@ impl ConfigView {
                     let slot = match key {
                         "port" => &mut self.port,
                         "bind_address" => &mut self.bind_address,
+                        "allowed_hosts" => &mut self.allowed_hosts,
                         "request_timeout_secs" => &mut self.request_timeout_secs,
                         "worker_queue_size" => &mut self.worker_queue_size,
                         "device" => &mut self.device,
                         "gpu_index" => &mut self.gpu_index,
                         "cache_dir" => &mut self.cache_dir,
-                        "download_dir" => &mut self.download_dir,
                         "models_dir" => &mut self.models_dir,
-                        "onnxruntime_dir" => &mut self.onnxruntime_dir,
-                        "openvino_dir" => &mut self.openvino_dir,
                         "confidence_threshold" => &mut self.confidence_threshold,
                         "nms_iou" => &mut self.nms_iou,
                         "object_filter" => &mut self.object_filter,
@@ -1109,7 +1109,7 @@ pub(super) async fn config_submit(
 /// (the server's [`super::browse::allowed_or_missing_inside_roots`]: inside the browsable
 /// folders, even when not downloaded yet, or covered by a recent native pick), like the
 /// "Add a model by path" form. It is checked against the roots of the saved config and of the
-/// edited one (a `download_dir` changed in the same post), and resolved under the edited
+/// edited one (a `models_dir` changed in the same post), and resolved under the edited
 /// config's data root. Unchanged entries are never re-checked.
 fn check_new_model_paths<E>(
     before: &Config,
@@ -2161,18 +2161,19 @@ mod tests {
         assert!(html.contains("id=\"browse-dialog\""));
         // The folder settings of the Server tab browse folders; the shared picker script
         // (native dialog, else the in-page browser) is loaded after config.js.
-        for target in [
-            "cache_dir",
-            "log_path",
-            "save_image_path",
-            "download_dir",
-            "models_dir",
-            "onnxruntime_dir",
-            "openvino_dir",
-        ] {
+        for target in ["cache_dir", "log_path", "save_image_path", "models_dir"] {
             assert!(
                 html.contains(&format!("data-browse=\"folder\" data-target=\"{target}\"")),
                 "{target}"
+            );
+        }
+        // The settings that decide which libraries load are shown, never posted or browsed.
+        for key in crate::config_form::LIBRARY_PATH_SETTINGS {
+            assert!(!html.contains(&format!("data-target=\"{key}\"")), "{key}");
+            assert!(!html.contains(&format!("name=\"{key}\"")), "{key}");
+            assert!(
+                html.contains(&format!("data-view=\"{key}\" readonly")),
+                "{key}"
             );
         }
         let (cfg_js, browse_js) = (
@@ -2200,6 +2201,44 @@ mod tests {
         let (s, body) = get_text(&state, "/v1/fs/browse?kind=nope").await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(body.contains("\"success\":false"));
+    }
+
+    /// S2 through the route: a changed library folder is refused with the way to change it,
+    /// nothing is saved, and the page keeps showing the real value, not the refused one.
+    #[tokio::test]
+    async fn config_post_refuses_library_folders() {
+        for key in crate::config_form::LIBRARY_PATH_SETTINGS {
+            let state = test_state();
+            let before = state.config_read().clone();
+            let body = format!("port=4000&{key}={}", urlencode("/tmp/evil-libs"));
+            let (s, _, b) = call(&state, post_form("/config", &body, true)).await;
+            let page = String::from_utf8(b).unwrap();
+            assert_eq!(s, StatusCode::OK);
+            assert!(page.contains("class=\"error\">Not saved: "), "{page}");
+            assert!(page.contains("config file"), "{page}");
+            assert!(!page.contains("value=\"/tmp/evil-libs\""), "{key}");
+            assert_eq!(*state.config_read(), before);
+            assert!(!state.config_path.exists(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_page_shows_and_saves_allowed_hosts() {
+        let state = test_state_with(|c| c.allowed_hosts = vec!["nas.local".into(), "b.lan".into()]);
+        let (_, html) = get_text(&state, "/config").await;
+        assert!(
+            html.contains("name=\"allowed_hosts\" value=\"nas.local, b.lan\""),
+            "{html}"
+        );
+        let (_, _, b) = call(&state, post_form("/config", "allowed_hosts=nope%3A1", true)).await;
+        let page = String::from_utf8(b).unwrap();
+        assert!(
+            page.contains("class=\"error\">Not saved: allowed_hosts"),
+            "{page}"
+        );
+        // Shown as typed, like every other rejected field.
+        assert!(page.contains("value=\"nope:1\""), "{page}");
+        assert_eq!(state.config_read().allowed_hosts.len(), 2);
     }
 
     #[tokio::test]

@@ -1786,6 +1786,49 @@ fn parse_formats(f: Option<Formats>) -> Result<Vec<Format>, String> {
     Ok(out)
 }
 
+/// A folder a client named for this server to read or write: well formed and no system folder
+/// ([`crate::config::validate_dir_setting`], 400), then [`allowed_folder`]. `Ok(None)` when
+/// `allowed_folder` found nothing there.
+fn named_folder(
+    state: &AppState,
+    key: &str,
+    raw: &str,
+    root: &std::path::Path,
+) -> Result<Option<PathBuf>, (StatusCode, String)> {
+    match crate::config::validate_dir_setting(key, raw, root) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err((StatusCode::BAD_REQUEST, format!("{key}: empty"))),
+        Err(e) => return Err((StatusCode::BAD_REQUEST, format!("{e:#}"))),
+    }
+    let config = state.config_read().clone();
+    match allowed_folder(state, &config, raw) {
+        Ok(p) => Ok(Some(p)),
+        Err((StatusCode::NOT_FOUND, _)) => Ok(None),
+        Err(e) => Err(folder_refusal(key, e)),
+    }
+}
+
+/// `refusal` of a folder under the setting's name, with what to do about it.
+fn folder_refusal(key: &str, (status, message): (StatusCode, String)) -> (StatusCode, String) {
+    let message = format!("{key}: {message}; choose the folder with the Browse button instead");
+    (status, message)
+}
+
+/// Where a client-named export goes ([`named_folder`]). The export creates it, so a folder that
+/// does not exist yet is fine inside the browsable folders or a native pick.
+fn export_folder(
+    state: &AppState,
+    raw: &str,
+    root: &std::path::Path,
+) -> Result<PathBuf, (StatusCode, String)> {
+    if let Some(p) = named_folder(state, "out_dir", raw, root)? {
+        return Ok(p);
+    }
+    let config = state.config_read().clone();
+    super::browse::allowed_or_missing_inside_roots(&config, raw)
+        .map_err(|e| folder_refusal("out_dir", e.into_parts()))
+}
+
 /// `POST /v1/review/export` with `{format(s), out_dir?, holdout_cameras?, holdout_days?,
 /// holdout_fraction?, benchmark_split?, include_unreviewed?, labels?, include_empty?}`.
 pub(super) async fn export(
@@ -1820,10 +1863,9 @@ pub(super) async fn export(
             None => {
                 exports_dir(&state).join(crate::collect::utc_file_ts(std::time::SystemTime::now()))
             }
-            Some(raw) => match crate::config::validate_dir_setting("out_dir", raw, &root) {
-                Ok(Some(p)) => p,
-                Ok(None) => return fail(StatusCode::BAD_REQUEST, "out_dir: empty"),
-                Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            Some(raw) => match export_folder(&state, raw, &root) {
+                Ok(p) => p,
+                Err((s, m)) => return fail(s, m),
             },
         };
         let req = ExportRequest {
@@ -1870,15 +1912,21 @@ pub(super) async fn import(
     };
     blocking(move || {
         let (dir, classes, root) = context(&state);
-        let src = match crate::config::validate_dir_setting("dir", &b.dir, &root) {
+        let src = match named_folder(&state, "dir", &b.dir, &root) {
             Ok(Some(p)) if p.is_dir() => p,
-            Ok(_) => {
+            Ok(Some(_)) => {
                 return fail(
                     StatusCode::BAD_REQUEST,
                     format!("dir: '{}' is not a folder", b.dir),
                 );
             }
-            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            Ok(None) => {
+                return fail(
+                    StatusCode::NOT_FOUND,
+                    format!("dir: '{}' does not exist; choose the folder again", b.dir),
+                );
+            }
+            Err((s, m)) => return fail(s, m),
         };
         let hidden = hidden(&state);
         match xany::import_dir(
@@ -2259,6 +2307,118 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(d.state.config_read().collect.review_dir, None);
         assert_eq!(total(d.state.clone()).await, 0);
+    }
+
+    /// One frame saved as reviewed, so an export has something to write.
+    async fn reviewed_frame(d: &Ds) {
+        let rel = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+        let q = encode_uri_component(&rel);
+        let (_, l) = json(
+            &d.state,
+            Request::get(format!("/v1/review/labels?frame={q}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let mut f = l["labels"].clone();
+        f["status"] = "reviewed".into();
+        let uri = format!("/v1/review/labels?frame={q}");
+        let (s, v) = json(&d.state, post_json(&uri, &f.to_string())).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+
+    /// `out_dir` of an export and `dir` of an import reach the disk, so they obey the same rule
+    /// as the other folder routes: refused outside the browsable folders until the folder is
+    /// picked in the native dialog. (On Windows every drive is a root, so Unix only.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_and_import_folders_must_be_browsable_or_picked() {
+        let d = ds();
+        reviewed_frame(&d).await;
+        let outside =
+            std::env::temp_dir().join(format!("bop-review-fold-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let text = outside.display().to_string();
+        let export = serde_json::json!({"format": "coco", "out_dir": text}).to_string();
+        let import = serde_json::json!({ "dir": text }).to_string();
+
+        for (uri, body) in [
+            ("/v1/review/export", &export),
+            ("/v1/review/import", &import),
+        ] {
+            let (s, v) = json(&d.state, post_json(uri, body)).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{uri}: {v}");
+            let m = v["message"].as_str().unwrap();
+            assert!(m.contains("outside the browsable folders"), "{m}");
+        }
+        // Nothing was written, and a child that does not exist yet is no way around it.
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        let body =
+            serde_json::json!({"format": "coco", "out_dir": outside.join("new")}).to_string();
+        let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+        assert!(!outside.join("new").exists());
+
+        // A symlink inside a root that leads out of the roots is refused too.
+        let link = d.root.join("link-out");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        for target in [link.clone(), link.join("new")] {
+            let body = serde_json::json!({"format": "coco", "out_dir": target}).to_string();
+            let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+        }
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+
+        // A native pick lets both through, for the folder and for a new folder inside it.
+        super::super::pick::record_pick(&text);
+        let (s, v) = json(&d.state, post_json("/v1/review/export", &export)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (s, v) = json(&d.state, post_json("/v1/review/import", &import)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let body =
+            serde_json::json!({"format": "coco", "out_dir": outside.join("new")}).to_string();
+        let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(outside.join("new/export.json").is_file(), "{v}");
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Exports still work where they worked: the default location, a folder in a root, a new
+    /// folder in a root (the form's text field), and the data root's relative paths.
+    #[tokio::test]
+    async fn export_locations_inside_the_roots_keep_working() {
+        let d = ds();
+        reviewed_frame(&d).await;
+        let (s, v) = json(
+            &d.state,
+            post_json("/v1/review/export", r#"{"format": "coco"}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let default = PathBuf::from(v["report"]["out_dir"].as_str().unwrap());
+        assert!(default.starts_with(exports_dir(&d.state)), "{v}");
+
+        let new = d.root.join("exports-here/deep");
+        let body = serde_json::json!({"format": "coco", "out_dir": new}).to_string();
+        let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(new.join("export.json").is_file(), "{v}");
+
+        let body = r#"{"format": "coco", "out_dir": "relative-exports"}"#;
+        let (s, v) = json(&d.state, post_json("/v1/review/export", body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(d.root.join("relative-exports/export.json").is_file(), "{v}");
+
+        // Bad syntax and system folders stay a 400.
+        for bad in ["/etc/x", "a\0b"] {
+            let body = serde_json::json!({"format": "coco", "out_dir": bad}).to_string();
+            let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+        }
+        // An import needs a folder that exists.
+        let body = serde_json::json!({ "dir": d.root.join("nope") }).to_string();
+        let (s, v) = json(&d.state, post_json("/v1/review/import", &body)).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
     }
 
     fn post_json(uri: &str, body: &str) -> Request<Body> {
@@ -2643,7 +2803,9 @@ mod tests {
         let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
         assert_eq!(s, StatusCode::OK, "{v}");
         let inner = PathBuf::from(v["report"]["out_dir"].as_str().unwrap());
-        assert_eq!(inner.parent(), Some(out.as_path()));
+        // (An existing folder comes back canonical, as from the other folder routes.)
+        let canon = super::super::browse::plain(&out.canonicalize().unwrap());
+        assert_eq!(inner.parent(), Some(canon.as_path()));
         assert!(inner.join("export.json").is_file());
         // The dataset folder itself is refused.
         let body = serde_json::json!({"format": "coco", "out_dir": d.dir}).to_string();

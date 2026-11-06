@@ -60,7 +60,8 @@ fn with_runtimes<T>(f: impl FnOnce(&mut Runtimes) -> T) -> T {
                 openvino_dir: Some(openvino_dir),
             },
             &OrtOptions {
-                onnxruntime_dir: Some(lib),
+                // The config setting names a folder; only `ORT_DYLIB_PATH` may name a file.
+                onnxruntime_dir: lib.parent().map(std::path::Path::to_path_buf),
                 ..OrtOptions::default()
             },
         )

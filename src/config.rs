@@ -604,6 +604,11 @@ pub struct Config {
     /// to other machines too. Off: only loopback clients get them (403 otherwise); detection,
     /// `/stats.json`, `/prometheus`, `/v1/devices` and `/v1/config` stay open. Applies at once.
     pub allow_remote_admin: bool,
+    /// Host names (no scheme, port or path; at most [`MAX_ALLOWED_HOSTS`]) the admin routes
+    /// answer under, besides IP addresses and `localhost`: the defence against DNS rebinding
+    /// (`server::guard`). The name a reverse proxy or `http://nas.local:32168` arrives with
+    /// goes here. Stored lower-case. Applies at once.
+    pub allowed_hosts: Vec<String>,
     /// How long a request may wait in the queue + processing before it is dropped (the only
     /// request timeout; the HTTP handler waits this plus a 500 ms grace for the worker).
     pub request_timeout_secs: u64,
@@ -618,10 +623,13 @@ pub struct Config {
     pub force_cpu: bool,
     /// Compiled-model cache directory (relative to exe dir). Empty disables caching.
     pub cache_dir: String,
-    /// Directory holding the OpenVINO runtime (archive layout). None = `<exe_dir>/openvino` or system.
+    /// Directory holding the OpenVINO runtime (archive layout). None = `<exe_dir>/openvino` or
+    /// system. File and command line only, see `onnxruntime_dir`.
     pub openvino_dir: Option<PathBuf>,
-    /// Directory holding the ONNX Runtime library (or the library file itself). None =
-    /// `ORT_DYLIB_PATH`, then `<exe_dir>/onnxruntime`.
+    /// Directory holding the ONNX Runtime library; a file is refused (`ORT_DYLIB_PATH` may name
+    /// one). None = `ORT_DYLIB_PATH`, then `<exe_dir>/onnxruntime`. It decides what the process
+    /// loads, so like `openvino_dir` and `download_dir` it is set in this file or on the
+    /// command line only, never through a web form.
     pub onnxruntime_dir: Option<PathBuf>,
     /// Kept rounded to 2 decimals ([`round_threshold`]).
     #[serde(serialize_with = "thr::ser")]
@@ -734,7 +742,8 @@ pub struct Config {
     /// CUDA/cuDNN libraries. Off by default.
     pub allow_large_downloads: bool,
     /// Root for downloaded runtimes (`openvino/`, `onnxruntime/<flavor>/`, ...), relative to the
-    /// exe dir. None = the exe dir. Model files go where each model's `path` points.
+    /// exe dir. None = the exe dir. Model files go where each model's `path` points. File only,
+    /// see `onnxruntime_dir`: libraries load from under this folder.
     pub download_dir: Option<PathBuf>,
     /// Largest image accepted for decoding, in pixels (width x height), checked from the image
     /// header before any pixel buffer is allocated; applies to detection requests, the test
@@ -880,6 +889,7 @@ impl Default for Config {
             port: crate::DEFAULT_PORT,
             bind_address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             allow_remote_admin: false,
+            allowed_hosts: Vec::new(),
             request_timeout_secs: 15,
             worker_queue_size: 0,
             device: "auto".to_string(),
@@ -1030,6 +1040,13 @@ impl Config {
     /// compares equal to what was saved.
     pub fn normalize(&mut self) {
         self.fill_model_names();
+        let mut hosts: Vec<String> = Vec::with_capacity(self.allowed_hosts.len());
+        for h in self.allowed_hosts.iter().map(|h| normalized_host(h)) {
+            if !hosts.contains(&h) {
+                hosts.push(h);
+            }
+        }
+        self.allowed_hosts = hosts;
         self.confidence_threshold = round_threshold(self.confidence_threshold);
         for m in &mut self.models {
             m.confidence_threshold = m.confidence_threshold.map(round_threshold);
@@ -1544,6 +1561,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         use anyhow::bail;
         check_range("port", self.port, 1, u16::MAX)?;
+        validate_allowed_hosts(&self.allowed_hosts)?;
         check_range(
             "request_timeout_secs",
             self.request_timeout_secs,
@@ -1639,6 +1657,9 @@ pub const MAX_PATH_LEN: usize = 4096;
 /// Longest accepted path component, in bytes.
 pub const MAX_PATH_COMPONENT_LEN: usize = 255;
 
+/// Most entries of `allowed_hosts`.
+pub const MAX_ALLOWED_HOSTS: usize = 32;
+
 /// The settings that name a directory and go through [`validate_dir_setting`].
 pub const DIR_SETTINGS: &[&str] = &[
     "save_image_path",
@@ -1681,9 +1702,23 @@ pub fn is_absolute_path_text(s: &str) -> bool {
             .is_some_and(|c| *c == b'\\' || *c == b'/')
 }
 
+/// Whether `raw` starts with two separators of either kind: a UNC path to Windows, which
+/// treats `/` and `\` alike (`\\host`, `//host`, `\/host`, `/\host`).
+fn has_unc_prefix(raw: &str) -> bool {
+    let sep = |b: Option<&u8>| matches!(b, Some(b'/' | b'\\'));
+    let b = raw.as_bytes();
+    sep(b.first()) && sep(b.get(1))
+}
+
+/// Whether `raw` starts with a Windows verbatim prefix.
+fn has_verbatim_prefix(raw: &str) -> bool {
+    raw.starts_with(r"\\?\") || raw.starts_with(r"\??\") || raw.starts_with("//?/")
+}
+
 /// Syntax checks shared by the path settings and the file browser: no NUL bytes, at most
 /// [`MAX_PATH_LEN`] bytes and [`MAX_PATH_COMPONENT_LEN`] per component, no `..` component, no
-/// Windows verbatim (`\\?\`) or UNC (`\\server\share`) prefix and no drive-relative path
+/// Windows verbatim (`\\?\`) or UNC (`\\server\share`, either separator) prefix and no
+/// drive-relative path
 /// (`C:foo`). `key` names the setting in the error.
 pub fn check_path_syntax(key: &str, raw: &str) -> Result<()> {
     use anyhow::bail;
@@ -1693,10 +1728,10 @@ pub fn check_path_syntax(key: &str, raw: &str) -> Result<()> {
     if raw.len() > MAX_PATH_LEN {
         bail!("{key}: the path is longer than {MAX_PATH_LEN} bytes");
     }
-    if raw.starts_with(r"\\?\") || raw.starts_with(r"\??\") || raw.starts_with("//?/") {
+    if has_verbatim_prefix(raw) {
         bail!("{key}: verbatim paths (\\\\?\\) are not accepted");
     }
-    if raw.starts_with(r"\\") || raw.starts_with("//") {
+    if has_unc_prefix(raw) {
         bail!("{key}: UNC paths (\\\\server\\share) are not accepted");
     }
     if drive_prefix(raw) && !is_absolute_path_text(raw) {
@@ -1740,9 +1775,9 @@ pub fn is_system_dir(p: &Path) -> bool {
 
 /// Validate a directory setting typed into the Config page (`key` is one of
 /// [`DIR_SETTINGS`]): `Ok(None)` for an empty value (an error for a required one),
-/// [`check_path_syntax`], relative paths resolved under `data_root`, and a path that is not
-/// under the data root must not be a system directory or inside one ([`is_system_dir`]).
-/// Returns the path to store (absolute).
+/// [`check_path_syntax`], relative paths resolved under `data_root`, a path that is not under
+/// the data root must not be a system directory or inside one ([`is_system_dir`]), and a path
+/// that exists must be a directory. Returns the path to store (absolute).
 pub fn validate_dir_setting(key: &str, raw: &str, data_root: &Path) -> Result<Option<PathBuf>> {
     use anyhow::bail;
     let raw = raw.trim();
@@ -1756,8 +1791,7 @@ pub fn validate_dir_setting(key: &str, raw: &str, data_root: &Path) -> Result<Op
         }
         return Ok(None);
     }
-    let verbatim = raw.starts_with(r"\\?\") || raw.starts_with(r"\??\") || raw.starts_with("//?/");
-    if !verbatim && (raw.starts_with(r"\\") || raw.starts_with("//")) {
+    if !has_verbatim_prefix(raw) && has_unc_prefix(raw) {
         // A network share picked in the native dialog arrives as `\\server\share\...`: the
         // service (often LocalService) may not reach it, and its paths are not checked here.
         bail!(
@@ -1783,7 +1817,59 @@ pub fn validate_dir_setting(key: &str, raw: &str, data_root: &Path) -> Result<Op
             data_root.display()
         );
     }
+    if resolved.exists() && !resolved.is_dir() {
+        bail!(
+            "{key}: {} is not a folder; choose the folder itself, not a file in it",
+            resolved.display()
+        );
+    }
     Ok(Some(resolved))
+}
+
+/// An `allowed_hosts` entry as it is stored and compared: trimmed, lower-case, no trailing dot.
+fn normalized_host(entry: &str) -> String {
+    let h = entry.trim().to_ascii_lowercase();
+    h.strip_suffix('.').map(str::to_string).unwrap_or(h)
+}
+
+/// Whether `name` is a host name: dot-separated labels of letters, digits, `-` and `_`
+/// (Docker service names use it) within the DNS length limits.
+fn is_host_name(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+/// `allowed_hosts`: at most [`MAX_ALLOWED_HOSTS`] plain host names. An entry is compared with
+/// the name in a request's `Host`, so a scheme, a port, a path or a wildcard could never match.
+pub fn validate_allowed_hosts(hosts: &[String]) -> Result<()> {
+    use anyhow::bail;
+    if hosts.len() > MAX_ALLOWED_HOSTS {
+        bail!(
+            "allowed_hosts: {} names, at most {MAX_ALLOWED_HOSTS} are accepted; list only the \
+             names you open this server under",
+            hosts.len()
+        );
+    }
+    for entry in hosts {
+        let name = normalized_host(entry);
+        if name.is_empty() {
+            bail!("allowed_hosts: an entry is empty; remove it or give a name such as nas.local");
+        }
+        if !is_host_name(&name) {
+            bail!(
+                "allowed_hosts: '{}' is not a host name; give the bare name, such as nas.local, \
+                 without a scheme, port, path or wildcard",
+                name.chars().take(100).collect::<String>()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Error of an empty models list.
@@ -1974,6 +2060,58 @@ mod tests {
         assert!(e.to_string().contains("verbatim"), "{e}");
         let e = super::check_path_syntax("path", r"\\server\share").unwrap_err();
         assert!(!e.to_string().contains("drive letter"), "{e}");
+    }
+
+    /// S5: any two leading separators are a UNC path to Windows, whichever way they lean.
+    #[test]
+    fn every_spelling_of_a_unc_prefix_is_refused() {
+        let r = std::path::Path::new("/r");
+        for p in [
+            r"\\host\share",
+            "//host/share",
+            r"\/host/share",
+            r"/\host\share",
+        ] {
+            let e = super::check_path_syntax("path", p).unwrap_err().to_string();
+            assert!(e.contains("UNC"), "{p}: {e}");
+            let e = super::validate_dir_setting("log_path", p, r)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("UNC"), "{p}: {e}");
+            assert!(e.contains("map the share to a drive letter"), "{p}: {e}");
+        }
+        // One separator, or one in the second place only, is an ordinary path.
+        assert!(super::check_path_syntax("path", "/usr/x").is_ok());
+        assert!(super::check_path_syntax("path", r"\usr\x").is_ok());
+        assert!(super::check_path_syntax("path", "a//b").is_ok());
+        assert!(super::validate_dir_setting("log_path", "/data/x", r).is_ok());
+        // Verbatim prefixes keep their own message.
+        for p in [r"\\?\C:\x", r"\??\C:\x", "//?/C:/x"] {
+            let e = super::check_path_syntax("path", p).unwrap_err().to_string();
+            assert!(e.contains("verbatim"), "{p}: {e}");
+        }
+    }
+
+    #[test]
+    fn dir_setting_refuses_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("bop-dirset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        // Absolute, and relative to the root.
+        for raw in [file.display().to_string(), "f.txt".to_string()] {
+            let e = super::validate_dir_setting("log_path", &raw, &dir)
+                .unwrap_err()
+                .to_string();
+            assert!(e.starts_with("log_path: "), "{e}");
+            assert!(e.contains("is not a folder"), "{e}");
+        }
+        // A folder, and a folder that does not exist yet, stay fine.
+        let got = super::validate_dir_setting("log_path", &dir.display().to_string(), &dir);
+        assert_eq!(got.unwrap(), Some(dir.clone()));
+        let got = super::validate_dir_setting("log_path", "not-yet", &dir).unwrap();
+        assert_eq!(got, Some(dir.join("not-yet")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2603,6 +2741,69 @@ mod tests {
         let mut c = three_models();
         c.models[1].name = Some("A".into());
         assert!(format!("{:#}", c.validate().unwrap_err()).contains("duplicate"));
+    }
+
+    #[test]
+    fn validate_allowed_hosts_entries() {
+        let hosts = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for good in [
+            hosts(&[]),
+            hosts(&[
+                "nas.local",
+                "prism",
+                "my-nas.home.arpa",
+                "blue_onyx",
+                "10.0.0.5",
+            ]),
+            hosts(&[" NAS.Local. "]),
+        ] {
+            assert!(super::validate_allowed_hosts(&good).is_ok(), "{good:?}");
+        }
+        for (bad, want) in [
+            ("", "empty"),
+            ("   ", "empty"),
+            ("http://nas.local", "not a host name"),
+            ("nas.local:32168", "not a host name"),
+            ("nas.local/config", "not a host name"),
+            ("*.local", "not a host name"),
+            ("a..b", "not a host name"),
+            (".local", "not a host name"),
+            ("nas local", "not a host name"),
+            ("[::1]", "not a host name"),
+            ("caf\u{e9}.local", "not a host name"),
+        ] {
+            let e = super::validate_allowed_hosts(&hosts(&[bad])).unwrap_err();
+            let e = e.to_string();
+            assert!(e.starts_with("allowed_hosts: "), "{bad}: {e}");
+            assert!(e.contains(want), "{bad}: {e}");
+        }
+        let label = "a".repeat(64);
+        assert!(super::validate_allowed_hosts(&hosts(&[&label])).is_err());
+        let long = ["a"; 128].join(".");
+        assert!(super::validate_allowed_hosts(&hosts(&[&long])).is_err());
+        // The limit, and one past it.
+        let many: Vec<String> = (0..=super::MAX_ALLOWED_HOSTS)
+            .map(|i| format!("h{i}.local"))
+            .collect();
+        let (fit, _) = many.split_at(super::MAX_ALLOWED_HOSTS);
+        assert!(super::validate_allowed_hosts(fit).is_ok());
+        let e = super::validate_allowed_hosts(&many).unwrap_err();
+        assert!(e.to_string().contains("at most 32"), "{e}");
+        // Through `validate`, so a config file is held to it too; old files have no key.
+        rejects(
+            |c| c.allowed_hosts = vec!["nas.local:1".into()],
+            "allowed_hosts",
+            "host name",
+        );
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(c.allowed_hosts.is_empty());
+        // Stored lower-case, once, with no trailing dot.
+        let mut c = Config {
+            allowed_hosts: hosts(&[" NAS.Local. ", "nas.local", "Other"]),
+            ..Config::default()
+        };
+        c.normalize();
+        assert_eq!(c.allowed_hosts, hosts(&["nas.local", "other"]));
     }
 
     #[test]

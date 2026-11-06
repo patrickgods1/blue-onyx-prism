@@ -107,6 +107,8 @@ document.addEventListener("click", function (e) {
       var describe = name === "models_json" ? function () { return "a newer models list (see the change banner)"; } : show;
       U.refresh(ctl, view[name], describe);
     });
+    // Read-only settings (edited in the config file): no field to protect, just show the value.
+    serverForm.querySelectorAll("input[data-view]").forEach(function (i) { var v = view[i.dataset.view]; if (v !== undefined) i.value = v; });
     var adv = $("models-json"), ta = jsonForm.elements.models_json;
     if (ta && ta.classList.contains("edited-conflict")) adv.open = true;
     var dev = $("device"), fc = $("force-cpu"); if (dev && fc) { dev.disabled = fc.checked; $("device-hint").hidden = !fc.checked; }

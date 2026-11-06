@@ -358,6 +358,7 @@ form.export label.check { font-size: 0.85rem; }
 @keyframes live-flash { from { background-color: var(--warn-bg); box-shadow: 0 0 0 3px var(--warn-fg); } to { background-color: transparent; box-shadow: none; } }
 .flash { animation: live-flash 2.5s ease-out; }
 tr.flash > td { animation: live-flash 2.5s ease-out; }
+input[readonly] { background: transparent; color: var(--muted); border-style: dashed; cursor: default; }
 input.edited, select.edited, textarea.edited { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .edited-conflict { border-color: var(--warn-fg) !important; box-shadow: 0 0 0 2px var(--warn-fg) !important; }
 .live-note { display: block; font-size: 0.8rem; color: var(--warn-fg); }

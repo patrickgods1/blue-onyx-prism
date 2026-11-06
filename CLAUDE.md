@@ -92,7 +92,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `backend/onnx_rewrite/`, `backend/memory.rs`); each file starts with a `//!` doc stating its responsibility.
 - `src/server.rs` axum HTTP (2-thread tokio runtime; fs-heavy handlers run in `server::blocking`). The
   listener is bound once per process (`bind` + `serve_on`) and serves `Shared`, the swappable current
-  `AppState`; admin routes answer loopback peers only unless `allow_remote_admin`. Blue Iris calls
+  `AppState`; admin routes answer loopback peers only unless `allow_remote_admin`, and only under an IP address, `localhost` or an `allowed_hosts` name (`guard::foreign_host`, DNS rebinding; `GET /v1/config` is open and applies it itself). `download_dir`, `onnxruntime_dir` and `openvino_dir` choose libraries the service loads, so they are config-file or CLI only, never web-editable. Blue Iris calls
   `POST /v1/vision/detection` (default model) and `POST /v1/vision/custom/{model}` (named model),
   `POST /v1/vision/custom/list`. Responses use `api.rs` structs (camelCase; `Prediction` snake_case).
 - `src/registry.rs` loads N models from config sequentially on one `Core`; each model gets its own
@@ -104,7 +104,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `DeviceOption` list and the `auto` pick; `plan.rs` turns it into per-model load candidates (compile +
   warm-up, falling down the list, CPU last); `ort.rs` is the ONNX Runtime backend (all `ort` code lives here).
   `onnx_rewrite.rs`: `ort:coreml` loads a cached copy without HardSigmoid/HardSwish/opset<13 Split (protobuf wire-level, `cache/coreml/<stem>-<sha16>-v<N>.onnx`, `BOP_COREML_REWRITE=0` off).
-  `GET /v1/status` (readiness, 200/503; Docker HEALTHCHECK, systemd `Type=notify` + watchdog via `sdnotify.rs`); a process-wide in-flight cap on detections answers 503 (`metrics.rs`, `requests_rejected_total`); `retention.rs` prunes saved images and warns on low disk.
+  `GET /v1/status` (readiness, 200/503; Docker HEALTHCHECK, systemd `Type=notify` + watchdog via `sdnotify.rs`); a process-wide in-flight cap on detections answers 503 (`metrics.rs`, `requests_rejected_total`), and uploads still arriving have a 10 s deadline and a per-address limit (`BODY_READS_PER_PEER`, never a cap on one Blue Iris's total requests); `retention.rs` prunes saved images and warns on low disk.
   Also `GET /v1/devices` and the config-page device dropdown; Browse... buttons (`assets/browse.js`, every page) first try `GET|POST /v1/fs/pick` (`server/pick.rs`: native dialog on the server's screen via osascript / PowerShell WinForms / zenity|kdialog; loopback only, one at a time, killed after 10 min; no desktop, e.g. the Windows service in session 0 -> 409) and fall back to `GET /v1/fs/browse` (`server/browse.rs`, in-page, roots only). A natively picked path (and what is under it) passes `browse::allowed_path` for 1 h even outside the roots.
 - `src/model/` model families: `yolo26` (YOLO26/YOLOv10 end-to-end `[1,300,6]`), `yolo5` (`[1,N,5+C]` + NMS),
   `yolo8` (YOLOv8/9/11/12 `[1,4+C,8400]` + NMS), `detr` (D-FINE: `pixel_values` -> `logits/pred_boxes`), `rfdetr` (same, ImageNet-normalized, COCO-91 head), `rtdetr` (RT-DETRv2, DEIMv2: `images` + i64 `orig_target_sizes`; `labels/boxes/scores`; input size from the model's static dims).
@@ -243,7 +243,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   `--self-check` imports `Sam3Model` before the download. **SAM 3 boxes never triage `accept`** (`ACCEPT_SCORE` 0.6 was tuned for
   gdino + RF-DETR and a bulk accept reaches exports). Cost: ~2 s + 0.2 s x phrases per frame on a GTX 1070 Ti (about 5 s with 22
   phrases; gdino 0.55 s), unmeasured on Apple GPUs. Gated download: `resources/hf_token.rs` looks the token up as `HF_TOKEN`, then
-  `<data root>/tools/hf/token` (`hf-login`; 0600 on Unix, chowned to the data root's owner), then the `hf` CLI's file
+  `<data root>/tools/hf/token` (`hf-login`; 0600 on Unix, chowned to the data root's owner; on Windows a protected DACL on `tools\hf`), then the `hf` CLI's file
   (`HF_TOKEN_PATH`, `HF_HOME/token`, `~/.cache/huggingface/token`), with a source label; the value is never logged, returned by a
   route or passed to Python (`inherited()` drops `HF_*`). `catalog::GATED` (by resource id: repo page, license) marks gated
   resources (exempt from the Apache test; the weekly URL check counts 401 + `GatedRepo` as OK). The manager sends the bearer only to
@@ -318,6 +318,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   (`config_merge::pending`).
 - Native installers in `packaging/` (WiX v7 MSI, cargo-deb/cargo-generate-rpm with metadata in Cargo.toml, pkgbuild pkg),
   built and smoke-tested (install, `/v1/status`, uninstall) by `packaging/build-installers.sh` / `smoke-test-installers.sh`
+  The MSI sets a protected DACL on the data folder (`icacls`, not `util:PermissionEx`, which merges), keeps only `SeChangeNotifyPrivilege`, and scopes the firewall rule to the local subnet on Domain and Private profiles.
   in `release.yml` and `packaging.yml`; unsigned; runtimes are downloaded on first start. The MSI runs the service as
   LocalService with `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json` (a service config created
   outside the exe dir seeds `download_dir`/`cache_dir`/`log_path` beside it). The deb/rpm and pkg share

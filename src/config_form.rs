@@ -19,21 +19,20 @@ use tracing::warn;
 /// `allow_large_downloads`) are true when present with any value but `false`/`off`/`0`, and
 /// false when absent (browsers omit unchecked boxes); each is read only when its form's marker
 /// field (`inference_settings`, `image_settings`, `access_settings`, `download_settings`) is
-/// posted too, so a form that does not show the box never clears it.
+/// posted too, so a form that does not show the box never clears it. [`LIBRARY_PATH_SETTINGS`]
+/// are not here: the page shows them read-only.
 pub const FORM_FIELDS: &[&str] = &[
     "port",
     "bind_address",
     "allow_remote_admin",
+    "allowed_hosts",
     "request_timeout_secs",
     "worker_queue_size",
     "device",
     "gpu_index",
     "force_cpu",
     "cache_dir",
-    "download_dir",
     "models_dir",
-    "onnxruntime_dir",
-    "openvino_dir",
     "confidence_threshold",
     "nms_iou",
     "object_filter",
@@ -54,6 +53,12 @@ pub const FORM_FIELDS: &[&str] = &[
     "drop_person_on_plant",
     "static_suppression",
 ];
+
+/// The settings that decide which shared libraries the service loads. Whoever could change
+/// them could run code as the service, and the admin routes have no login, so only the config
+/// file and the command line (people who already control the service) may set them; a form
+/// gets [`check_library_paths`].
+pub const LIBRARY_PATH_SETTINGS: [&str; 3] = ["download_dir", "onnxruntime_dir", "openvino_dir"];
 
 /// The overlap rule behind the Config page's "drop person on potted plant" checkbox.
 pub const PLANT_RULE: (&str, &str) = ("person", "potted plant");
@@ -79,10 +84,10 @@ pub fn night_person_threshold(c: &Config) -> Option<f32> {
 /// Apply a submitted `/config` form to `config`. All fields are validated first; on any error
 /// `config` is left untouched. Text fields that are absent keep their current value; empty
 /// optional paths / `default_model` become `None`. The directory settings
-/// (`save_image_path`, `log_path`, `cache_dir`, `download_dir`, `models_dir`,
-/// `onnxruntime_dir`, `openvino_dir`) go through
+/// (`save_image_path`, `log_path`, `cache_dir`, `models_dir`) go through
 /// [`crate::config::validate_dir_setting`] (stored absolute; relative ones under the data
 /// root), and a change of one is logged at warn level: it moves where the service writes.
+/// A change of a [`LIBRARY_PATH_SETTINGS`] entry is refused.
 pub fn apply_config_form(
     config: &mut Config,
     form: &std::collections::HashMap<String, String>,
@@ -104,24 +109,9 @@ pub fn apply_config_form(
         ("log_path", show(&config.log_path), show(&c.log_path)),
         ("cache_dir", config.cache_dir.clone(), c.cache_dir.clone()),
         (
-            "download_dir",
-            show(&config.download_dir),
-            show(&c.download_dir),
-        ),
-        (
             "models_dir",
             config.models_dir.display().to_string(),
             c.models_dir.display().to_string(),
-        ),
-        (
-            "onnxruntime_dir",
-            show(&config.onnxruntime_dir),
-            show(&c.onnxruntime_dir),
-        ),
-        (
-            "openvino_dir",
-            show(&config.openvino_dir),
-            show(&c.openvino_dir),
         ),
     ] {
         if from != to {
@@ -149,9 +139,9 @@ pub fn parse_config_form(
         get(k).is_some_and(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "0"))
     };
     // Directory settings: syntax-checked, relative ones resolved under the data root, system
-    // directories refused (SV-03). `download_dir` (the data root itself) comes first, so the
-    // other relative settings of the same post resolve under the new root.
-    parse_runtime_dirs(c, form)?;
+    // directories refused (SV-03).
+    check_library_paths(c, form)?;
+    parse_models_dir(c, form)?;
     let data_root = c.data_root();
     let dir = |key: &str, v: &str| validate_dir_setting(key, v, &data_root);
 
@@ -170,6 +160,14 @@ pub fn parse_config_form(
     // form posts never turn remote administration off or on by omission.
     if form.contains_key("access_settings") {
         c.allow_remote_admin = checkbox("allow_remote_admin");
+    }
+    // Commas or spaces between names; `normalize` below and `validate_config` do the rest.
+    if let Some(v) = get("allowed_hosts") {
+        c.allowed_hosts = v
+            .split([',', ' ', '\t', '\r', '\n'])
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
     }
     if let Some(v) = get("request_timeout_secs") {
         c.request_timeout_secs = num("request_timeout_secs", v)?;
@@ -260,34 +258,40 @@ pub fn parse_config_form(
     Ok(())
 }
 
-/// The "Folders" fieldset: `download_dir` (the data root), `models_dir`, `onnxruntime_dir` and
-/// `openvino_dir`, each through [`validate_dir_setting`]. `download_dir`, `onnxruntime_dir`
-/// and `openvino_dir` resolve against the exe dir (like [`crate::resolve_path`]), `models_dir`
-/// under the (possibly new) data root. Empty = the default (`None`; `models_dir`: `models`).
-/// A value equal to the current one, as the page shows it, is kept as stored, so saving the
-/// form unchanged never turns a relative setting into an absolute one (a spurious restart).
-fn parse_runtime_dirs(
+/// Refuse a form that changes a [`LIBRARY_PATH_SETTINGS`] entry. The value the page shows, or
+/// for an unset one an empty field, is no change, and no field at all keeps the setting too.
+fn check_library_paths(c: &Config, form: &std::collections::HashMap<String, String>) -> Result<()> {
+    let [download, ort, openvino] = LIBRARY_PATH_SETTINGS;
+    for (key, current, how) in [
+        (download, &c.download_dir, ""),
+        (ort, &c.onnxruntime_dir, " or start with --onnxruntime-dir"),
+        (openvino, &c.openvino_dir, " or start with --openvino-dir"),
+    ] {
+        let shown = current.as_ref().map(|p| p.display().to_string());
+        if form
+            .get(key)
+            .is_some_and(|v| v.trim() != shown.as_deref().unwrap_or(""))
+        {
+            anyhow::bail!(
+                "{key}: not changed. This folder decides which libraries the service loads, so \
+                 a web form cannot set it: anyone who can reach this page could run their own \
+                 code as the service. Edit \"{key}\" in the config file{how}, then restart the \
+                 service"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `models_dir` of the "Folders" fieldset, through [`validate_dir_setting`], under the data
+/// root; empty = the default (`models`). A value equal to the current one, as the page shows
+/// it, is kept as stored, so saving the form unchanged never turns a relative setting into an
+/// absolute one.
+fn parse_models_dir(
     c: &mut Config,
     form: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
-    let get = |k: &str| form.get(k).map(|v| v.trim());
-    let exe_dir = crate::exe_dir();
-    let unchanged = |v: &str, cur: &Option<PathBuf>| match cur {
-        Some(p) => p.display().to_string() == v,
-        None => v.is_empty(),
-    };
-    for (key, slot) in [
-        ("download_dir", &mut c.download_dir),
-        ("onnxruntime_dir", &mut c.onnxruntime_dir),
-        ("openvino_dir", &mut c.openvino_dir),
-    ] {
-        if let Some(v) = get(key)
-            && !unchanged(v, slot)
-        {
-            *slot = validate_dir_setting(key, v, &exe_dir)?;
-        }
-    }
-    if let Some(v) = get("models_dir")
+    if let Some(v) = form.get("models_dir").map(|v| v.trim())
         && v != c.models_dir.display().to_string()
     {
         c.models_dir = if v.is_empty() {
@@ -1282,96 +1286,127 @@ mod tests {
         }
     }
 
-    /// The Folders fieldset: relative runtime dirs resolve under the exe dir, `models_dir`
-    /// under the (new) data root; empty = the default; an unchanged value keeps its stored
-    /// (possibly relative) form; bad values are refused without touching the config.
+    /// The Folders fieldset: `models_dir` resolves under the data root and empty = the default;
+    /// an unchanged value keeps its stored (possibly relative) form; bad values are refused
+    /// without touching the config.
     #[test]
     fn folder_fields_parse_default_and_validate() {
-        let exe = crate::exe_dir();
-        let base = std::env::temp_dir().join("bop-folders");
-        let dl = base.join("data");
+        let dl = std::env::temp_dir().join("bop-folders").join("data");
         let mut c = with_model();
-        apply_config_form(
-            &mut c,
-            &form(&[
-                ("download_dir", &dl.display().to_string()),
-                ("models_dir", "my-models"),
-                ("onnxruntime_dir", "rt/ort"),
-                ("openvino_dir", " \"ov\" "),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(c.download_dir, Some(dl.clone()));
-        assert_eq!(c.data_root(), dl);
+        c.download_dir = Some(dl.clone());
+        apply_config_form(&mut c, &form(&[("models_dir", "my-models")])).unwrap();
         assert_eq!(c.models_dir, dl.join("my-models"));
-        assert_eq!(c.onnxruntime_dir, Some(exe.join("rt/ort")));
-        assert_eq!(c.openvino_dir, Some(exe.join("ov")));
 
         // Empty = the default.
-        let f = form(&[
-            ("download_dir", ""),
-            ("models_dir", " "),
-            ("onnxruntime_dir", ""),
-            ("openvino_dir", ""),
-        ]);
-        apply_config_form(&mut c, &f).unwrap();
-        let d = Config::default();
-        assert_eq!(
-            (
-                &c.download_dir,
-                &c.models_dir,
-                &c.onnxruntime_dir,
-                &c.openvino_dir
-            ),
-            (
-                &d.download_dir,
-                &d.models_dir,
-                &d.onnxruntime_dir,
-                &d.openvino_dir
-            )
-        );
+        apply_config_form(&mut c, &form(&[("models_dir", " ")])).unwrap();
+        assert_eq!(c.models_dir, Config::default().models_dir);
 
-        // The page posts the shown values back: a relative stored value stays as it is.
+        // The page posts the shown value back: a relative stored value stays as it is.
         let mut c = with_model();
         c.models_dir = "models".into();
-        c.openvino_dir = Some("ov".into());
         c.normalize();
         let before = c.clone();
-        apply_config_form(
-            &mut c,
-            &form(&[
-                ("download_dir", ""),
-                ("models_dir", "models"),
-                ("onnxruntime_dir", ""),
-                ("openvino_dir", "ov"),
-            ]),
-        )
-        .unwrap();
+        apply_config_form(&mut c, &form(&[("models_dir", "models")])).unwrap();
         assert_eq!(c, before);
 
-        for (field, value, needle) in [
-            ("download_dir", "/etc/prism", "system directory"),
-            ("models_dir", "/usr/share/models", "system directory"),
-            (
-                "onnxruntime_dir",
-                "C:\\Windows\\System32",
-                "system directory",
-            ),
-            ("openvino_dir", "../ov", "'..'"),
-            ("download_dir", "\\\\nas\\share", "UNC"),
-            ("models_dir", "C:models", "drive-relative"),
+        for (value, needle) in [
+            ("/usr/share/models", "system directory"),
+            ("../models", "'..'"),
+            ("\\\\nas\\share", "UNC"),
+            ("C:models", "drive-relative"),
         ] {
             let mut c = with_model();
             let e = format!(
                 "{:#}",
-                apply_config_form(&mut c, &form(&[(field, value)])).unwrap_err()
+                apply_config_form(&mut c, &form(&[("models_dir", value)])).unwrap_err()
             );
             assert!(
-                e.contains(field) && e.contains(needle),
-                "{field}={value}: {e}"
+                e.contains("models_dir") && e.contains(needle),
+                "{value}: {e}"
             );
             assert_eq!(c, with_model());
         }
+    }
+
+    /// S2: these three decide which shared libraries the service loads, so no form may change
+    /// them, in any spelling; the value the page shows still passes.
+    #[test]
+    fn library_path_settings_cannot_change_through_a_form() {
+        for key in LIBRARY_PATH_SETTINGS {
+            for value in ["/srv/evil", "evil", "\\\\nas\\share"] {
+                let mut c = with_model();
+                let before = c.clone();
+                let e = format!(
+                    "{:#}",
+                    apply_config_form(&mut c, &form(&[(key, value)])).unwrap_err()
+                );
+                assert!(e.starts_with(&format!("{key}: ")), "{e}");
+                assert!(e.contains("config file") && e.contains("restart"), "{e}");
+                assert_eq!(c, before);
+            }
+            // Clearing a set value is a change too.
+            let mut c = with_model();
+            c.download_dir = Some("/srv/a".into());
+            c.onnxruntime_dir = Some("rt/ort".into());
+            c.openvino_dir = Some("ov".into());
+            let before = c.clone();
+            assert!(apply_config_form(&mut c, &form(&[(key, "")])).is_err());
+            assert_eq!(c, before);
+        }
+        // Unchanged values pass and keep their stored form, set or not.
+        let mut c = with_model();
+        c.normalize();
+        let before = c.clone();
+        let empty = form(&[
+            ("download_dir", ""),
+            ("onnxruntime_dir", " "),
+            ("openvino_dir", ""),
+        ]);
+        apply_config_form(&mut c, &empty).unwrap();
+        assert_eq!(c, before);
+        c.download_dir = Some("/srv/a".into());
+        c.onnxruntime_dir = Some("rt/ort".into());
+        c.openvino_dir = Some("ov".into());
+        let before = c.clone();
+        let same = form(&[
+            ("download_dir", "/srv/a"),
+            ("onnxruntime_dir", "rt/ort"),
+            ("openvino_dir", "ov"),
+        ]);
+        apply_config_form(&mut c, &same).unwrap();
+        assert_eq!(c, before);
+        // The page no longer offers them, so a redisplayed form cannot show a refused value.
+        for key in LIBRARY_PATH_SETTINGS {
+            assert!(!FORM_FIELDS.contains(&key), "{key}");
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_field() {
+        let mut c = with_model();
+        let f = form(&[(
+            "allowed_hosts",
+            " NAS.local, prism.example.com.\nnas.local ",
+        )]);
+        apply_config_form(&mut c, &f).unwrap();
+        assert_eq!(c.allowed_hosts, vec!["nas.local", "prism.example.com"]);
+        // A post of other fields keeps it; an empty field clears it.
+        apply_config_form(&mut c, &form(&[("port", "4000")])).unwrap();
+        assert_eq!(c.allowed_hosts.len(), 2);
+        // A refused value leaves the config as it was.
+        for bad in [
+            "http://nas.local",
+            "nas.local:32168",
+            "nas.local/x",
+            "*.local",
+        ] {
+            let before = c.clone();
+            let e = apply_config_form(&mut c, &form(&[("allowed_hosts", bad)])).unwrap_err();
+            assert!(format!("{e:#}").contains("allowed_hosts"), "{bad}: {e:#}");
+            assert_eq!(c, before);
+        }
+        apply_config_form(&mut c, &form(&[("allowed_hosts", "  ")])).unwrap();
+        assert!(c.allowed_hosts.is_empty());
     }
 
     #[test]

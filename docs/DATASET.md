@@ -881,7 +881,8 @@ become the frame's complete set of training boxes:
 - **Admin guard:** the routes sit behind the admin guard (loopback only unless `allow_remote_admin`) and
   the cross-site check (403).
 - **Folders:** `out_dir` and the import `dir` are checked like the other folder settings (no system
-  folders).
+  folders), and must be under a browse root or picked in the native dialog. An `out_dir` that does not
+  exist yet must be inside the browse roots or a picked folder.
 
 **Retention:** a reviewed frame, one with a human decision, or one with boxes waiting for review is never
 pruned and does not count toward `collect.max_gb` (see [Disk](#disk)). A label file with nothing left to

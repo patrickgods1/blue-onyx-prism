@@ -1,5 +1,5 @@
-//! Request guards of the router: the admin routes' cross-site check (SV-01) and the security
-//! response headers (SV-09).
+//! Request guards of the router: the admin routes' cross-site check (SV-01), their `Host` check
+//! against DNS rebinding and the security response headers (SV-09).
 //!
 //! # Cross-site requests (CSRF)
 //!
@@ -25,6 +25,23 @@
 //! not come from a browser page. GET requests are not checked here: they change nothing, and a
 //! cross-site page cannot read their answer (no CORS headers are sent).
 //!
+//! # DNS rebinding
+//!
+//! The cross-site check compares `Origin` with `Host`, and that says nothing about a rebound
+//! page. A hostile site serves a page from `http://rebind.attacker.test:32168`, then changes
+//! that name's DNS answer to `127.0.0.1` (or a LAN address). The browser still thinks it talks
+//! to the same site, so it lets the page's scripts read the answers, and every request carries
+//! `Host: rebind.attacker.test:32168` with `Origin: http://rebind.attacker.test:32168`, or
+//! `Sec-Fetch-Site: same-origin`: `Origin` equals `Host` because the two come from the same
+//! lie. The TCP peer is the victim's own machine, so the loopback rule passes too.
+//!
+//! Only the name itself gives the attack away: it needs a DNS name the attacker controls. So
+//! [`foreign_host`], applied by `admin_only` to every admin route and every method, passes an
+//! IP literal (nothing to rebind, so LAN administration by address keeps working), `localhost`,
+//! and the names listed in `allowed_hosts`, and refuses any other name. It reads the `Host`
+//! header, else the URI authority (HTTP/2). A request with neither passes: a browser always
+//! sends one, so this is not a page, and [`cross_site`] refuses a state change with no `Host`.
+//!
 //! # Response headers
 //!
 //! [`security_headers`] adds `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`
@@ -33,9 +50,13 @@
 //! no-store` to JSON that sets no cache policy of its own.
 
 use super::{MessageTemplate, render, wants_html};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use crate::sync::LockExt;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, middleware::Next};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Content-Security-Policy of the HTML pages: everything from this origin, inline scripts
@@ -135,6 +156,143 @@ pub(crate) fn cross_site(headers: &HeaderMap) -> Result<(), CrossSite> {
     }
 }
 
+/// Most characters of a client's `Host` repeated in a refusal or in the log.
+const MAX_HOST_SHOWN: usize = 100;
+
+/// At most one log line per this long for refused `Host` names: every request of a hostile
+/// page would otherwise write one.
+const HOST_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// The request's host: the `Host` header, else the URI's authority (HTTP/2). A header that is
+/// not text counts as present, so it cannot pass for a missing one.
+pub(super) fn request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    headers
+        .get(header::HOST)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .or_else(|| uri.authority().map(|a| a.as_str().to_string()))
+}
+
+/// The host part of a `Host` value (`localhost:32168` -> `localhost`, `[::1]:80` -> `::1`,
+/// lowercased); None when it is not well formed: no name, or a port that is not a number.
+pub(super) fn host_part(host: &str) -> Option<String> {
+    let h = host.trim();
+    let (name, port) = if let Some(rest) = h.strip_prefix('[') {
+        let (v6, after) = rest.split_once(']')?;
+        match after.strip_prefix(':') {
+            Some(port) => (v6, port),
+            None if after.is_empty() => (v6, ""),
+            None => return None,
+        }
+    } else if h.matches(':').count() > 1 {
+        // A bare IPv6 literal (`::1`), no port.
+        (h, "")
+    } else {
+        h.split_once(':').unwrap_or((h, ""))
+    };
+    let good = !name.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+    good.then(|| name.to_ascii_lowercase())
+}
+
+/// Whether the admin routes answer under this `Host` value (see the module doc): an IPv4
+/// literal, a bracketed IPv6 literal, `localhost` or a name of `allowed`, the last two in any
+/// case and with one trailing dot. Exact names only: `localhost.evil.test` is a foreign name,
+/// and so is a subdomain of a listed name.
+pub(super) fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let Some(name) = host_part(host) else {
+        return false;
+    };
+    if host.trim_start().starts_with('[') {
+        return name.parse::<Ipv6Addr>().is_ok();
+    }
+    if name.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let name = name.strip_suffix('.').unwrap_or(&name);
+    name == "localhost" || allowed.iter().any(|a| a.eq_ignore_ascii_case(name))
+}
+
+/// The request's host as it may be shown, when the admin routes must not answer under it
+/// ([`host_allowed`]); None lets the request through. No host at all passes (module doc).
+pub(super) fn foreign_host(headers: &HeaderMap, uri: &Uri, allowed: &[String]) -> Option<String> {
+    let host = request_host(headers, uri)?;
+    (!host_allowed(&host, allowed)).then(|| {
+        host.chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_HOST_SHOWN)
+            .collect()
+    })
+}
+
+/// What decides whether a repeated warning is logged now.
+#[derive(Debug)]
+struct WarnThrottle {
+    last: Option<Instant>,
+    dropped: u64,
+}
+
+impl WarnThrottle {
+    /// `Some(lines dropped since the last one)` when a line may be logged at `now`.
+    fn allow_at(&mut self, now: Instant, every: Duration) -> Option<u64> {
+        if self.last.is_some_and(|t| now.duration_since(t) < every) {
+            self.dropped = self.dropped.saturating_add(1);
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.dropped))
+    }
+}
+
+/// The refused-`Host` warnings of this process.
+static HOST_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle {
+    last: None,
+    dropped: 0,
+});
+
+/// 403 for a `host` the admin routes do not answer under: an HTML page for browsers, else
+/// JSON. `host` comes from [`foreign_host`].
+pub(super) fn host_refused(headers: &HeaderMap, path: &str, host: &str) -> Response {
+    let dropped = HOST_WARNS
+        .lock_recover()
+        .allow_at(Instant::now(), HOST_WARN_EVERY);
+    if let Some(dropped) = dropped {
+        warn!(%host, path, dropped, "admin route refused for an unknown host name (DNS rebinding?)");
+    }
+    forbidden(
+        headers,
+        format!(
+            "This server does not answer administration requests under the name {host}: a web \
+             page can point a name of its own at this machine (DNS rebinding), so only IP \
+             addresses, localhost and the names in allowed_hosts are served. If this is your \
+             name for the server, add it to \"allowed_hosts\" in the config (on the Config page, \
+             opened by IP address or as localhost, or in the config file); otherwise open the \
+             page by IP address."
+        ),
+    )
+}
+
+/// A 403 with `msg`: an HTML page for browsers, else JSON.
+pub(super) fn forbidden(headers: &HeaderMap, msg: String) -> Response {
+    if wants_html(headers) {
+        let page = MessageTemplate {
+            nav: "",
+            version: crate::VERSION,
+            heading: "Forbidden".into(),
+            message: msg,
+            refresh_secs: 0,
+            refresh_url: String::new(),
+            restarting: false,
+            generation: 0,
+        };
+        (StatusCode::FORBIDDEN, render(&page)).into_response()
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
+        )
+            .into_response()
+    }
+}
+
 /// Middleware of the admin routes: 403 (an HTML page for browsers, else JSON) for a
 /// state-changing request that comes from another site (see the module doc).
 pub(super) async fn csrf(req: axum::extract::Request, next: Next) -> Response {
@@ -154,25 +312,7 @@ pub(super) async fn csrf(req: axum::extract::Request, next: Next) -> Response {
          server's own pages (same scheme, host and port as the address in the browser) or from \
          a non-browser client."
     );
-    if wants_html(req.headers()) {
-        let page = MessageTemplate {
-            nav: "",
-            version: crate::VERSION,
-            heading: "Forbidden".into(),
-            message: msg,
-            refresh_secs: 0,
-            refresh_url: String::new(),
-            restarting: false,
-            generation: 0,
-        };
-        (StatusCode::FORBIDDEN, render(&page)).into_response()
-    } else {
-        (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
-        )
-            .into_response()
-    }
+    forbidden(req.headers(), msg)
 }
 
 /// `map_response` middleware of the whole router (see the module doc).
@@ -306,8 +446,9 @@ mod tests {
                 "localhost:32168".into()
             ))
         );
-        // Another port of the same host is another origin; so is `null`; so is a DNS-rebound
-        // name that does not match the Host the page was served under.
+        // Another port of the same host is another origin; so is `null`; so is another name
+        // than the Host. (A DNS-rebound page is not caught here: its Origin equals its Host,
+        // see the module doc. `foreign_host` stops it.)
         assert!(cross_site(&headers(&[host, ("origin", "http://localhost:8080")])).is_err());
         assert!(cross_site(&headers(&[host, ("origin", "null")])).is_err());
         assert!(
@@ -325,6 +466,130 @@ mod tests {
             Err(CrossSite::NoHost)
         );
         assert_eq!(cross_site(&headers(&[])), Err(CrossSite::NoHost));
+    }
+
+    #[test]
+    fn host_parts() {
+        for (h, want) in [
+            ("localhost:32168", Some("localhost")),
+            ("LocalHost", Some("localhost")),
+            ("LOCALHOST.:32168", Some("localhost.")),
+            ("127.0.0.1:80", Some("127.0.0.1")),
+            ("[::1]:32168", Some("::1")),
+            ("[::1]", Some("::1")),
+            ("::1", Some("::1")),
+            ("evil.example:32168", Some("evil.example")),
+            ("localhost.evil.example", Some("localhost.evil.example")),
+            ("[::1]x", None),
+            ("[::1]:x", None),
+            ("localhost:x", None),
+            ("localhost:80@evil.test", None),
+            ("", None),
+            (":80", None),
+        ] {
+            assert_eq!(host_part(h).as_deref(), want, "{h}");
+        }
+    }
+
+    #[test]
+    fn hosts_the_admin_routes_answer_under() {
+        let allowed = ["nas.home.arpa".to_string(), "Prism_1".to_string()];
+        for h in [
+            "localhost",
+            "localhost:32168",
+            "LOCALHOST.:32168",
+            "127.0.0.1",
+            "127.0.0.1:32168",
+            "192.168.1.10:32168",
+            "[::1]",
+            "[::1]:32168",
+            "[fe80::1]:32168",
+            "[::ffff:127.0.0.1]:32168",
+            "nas.home.arpa",
+            "NAS.HOME.ARPA.:80",
+            "prism_1:32168",
+        ] {
+            assert!(host_allowed(h, &allowed), "{h}");
+        }
+        for h in [
+            "",
+            ":32168",
+            "rebind.attacker.test:32168",
+            "localhost.evil.test",
+            "localhost.evil.test:32168",
+            "evil-localhost",
+            "x.nas.home.arpa",
+            "nas.home.arpa.evil.test",
+            // Not IP literals: a name made of digits resolves through DNS like any other. A
+            // browser normalizes the numeric forms before it sends them.
+            "127.0.0.1.evil.test",
+            "127.0.0.1.",
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            // Brackets hold an IPv6 address and nothing else; an address needs its brackets.
+            "[localhost]:32168",
+            "[nas.home.arpa]",
+            "[evil.test]",
+            "::1",
+            "localhost:80@evil.test",
+            "localhost:evil.test",
+            "localhost..",
+        ] {
+            assert!(!host_allowed(h, &allowed), "{h}");
+        }
+        assert!(!host_allowed("nas.home.arpa", &[]));
+    }
+
+    #[test]
+    fn foreign_host_reads_the_header_then_the_authority() {
+        let uri = |s: &str| s.parse::<Uri>().unwrap();
+        let allowed: &[String] = &[];
+        let host = |v: &str| headers(&[("host", v)]);
+        assert_eq!(foreign_host(&host("localhost"), &uri("/x"), allowed), None);
+        assert_eq!(
+            foreign_host(&host("evil.test:1"), &uri("/x"), allowed).as_deref(),
+            Some("evil.test:1")
+        );
+        // The header wins over an absolute request target.
+        assert!(foreign_host(&host("evil.test"), &uri("http://localhost/x"), allowed).is_some());
+        // No header: the authority, else nothing to judge.
+        let none = HeaderMap::new();
+        assert_eq!(
+            foreign_host(&none, &uri("http://localhost/x"), allowed),
+            None
+        );
+        assert!(foreign_host(&none, &uri("http://evil.test/x"), allowed).is_some());
+        assert_eq!(foreign_host(&none, &uri("/x"), allowed), None);
+        // A header that is present but not text is refused, not taken for a missing one.
+        let mut bytes = HeaderMap::new();
+        bytes.insert(
+            header::HOST,
+            HeaderValue::from_bytes(b"evil\xff.test").unwrap(),
+        );
+        assert!(foreign_host(&bytes, &uri("/x"), allowed).is_some());
+        // Empty is present, and no name.
+        assert!(foreign_host(&host(""), &uri("/x"), allowed).is_some());
+        // Short and without control characters, whatever the client sent.
+        let shown = foreign_host(&host(&"a".repeat(300)), &uri("/x"), allowed).unwrap();
+        assert_eq!(shown.chars().count(), MAX_HOST_SHOWN);
+    }
+
+    #[test]
+    fn repeated_warnings_are_throttled() {
+        let t0 = Instant::now();
+        let every = Duration::from_secs(60);
+        let mut w = WarnThrottle {
+            last: None,
+            dropped: 0,
+        };
+        assert_eq!(w.allow_at(t0, every), Some(0));
+        for s in 0..59 {
+            assert_eq!(w.allow_at(t0 + Duration::from_secs(s), every), None);
+        }
+        assert_eq!(w.allow_at(t0 + every, every), Some(59));
+        assert_eq!(w.allow_at(t0 + every, every), None);
+        assert_eq!(w.allow_at(t0 + every * 2, every), Some(1));
     }
 
     #[test]

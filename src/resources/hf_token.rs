@@ -266,11 +266,11 @@ pub fn env_overrides_login(data_root: &Path) -> bool {
     env_overrides_login_with(&process_env, data_root)
 }
 
-/// Write `value` to a new file only this account can read (Unix; on Windows it inherits the
-/// folder's ACL, the same protection as `hf`'s own plaintext file).
+/// Write `value` to a new file only this account can read: mode 0600 on Unix, on Windows the
+/// protected ACL of its folder (`folder_acl`). `path` must not exist yet: nothing is ever
+/// written through a file or link already there.
 fn write_private(path: &Path, value: &str) -> Result<()> {
     use std::io::Write;
-    let _ = std::fs::remove_file(path);
     let mut open = std::fs::OpenOptions::new();
     open.write(true).create_new(true);
     #[cfg(unix)]
@@ -319,19 +319,246 @@ fn hand_over(data_root: &Path, made: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Save `token` as the login under `data_root`, atomically. Returns the file.
-pub fn save(data_root: &Path, token: &HfToken) -> Result<PathBuf> {
+/// The Windows half of [`save`]: who may reach the token's folder.
+///
+/// The data root's own ACL lets every local user read (the tray reads the config there), so the
+/// token cannot rely on it. `tools\hf` gets a protected DACL, inheriting nothing: Administrators
+/// and SYSTEM (full control, the uninstaller and `hf-logout` of another admin), the account running
+/// this login (full control), the service's account (read: it never writes the token). `icacls`
+/// does it, since `unsafe` stays in `src/backend/`: every argument is one array element with no
+/// shell, and the token is in none of them.
+///
+/// Everything here but `service_account` builds and runs on every OS, so the tests reach it
+/// through a fake [`Run`].
+#[cfg(any(windows, test))]
+mod folder_acl {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    // icacls' `*SID` form: account names are translated on a non-English Windows.
+    const ADMINISTRATORS: &str = "*S-1-5-32-544";
+    const SYSTEM: &str = "*S-1-5-18";
+    const LOCAL_SERVICE: &str = "*S-1-5-19";
+    const NETWORK_SERVICE: &str = "*S-1-5-20";
+    const FULL: &str = "(OI)(CI)F";
+    const READ: &str = "(OI)(CI)RX";
+    /// The most of a tool's answer kept in a message.
+    const MAX_ANSWER_CHARS: usize = 300;
+
+    /// Runs one system tool: its standard output, or why it failed.
+    pub(super) type Run<'a> = &'a dyn Fn(&str, &[OsString]) -> Result<String, String>;
+
+    /// The name `icacls` should get for the Service Control Manager's account `account`. `None`
+    /// for LocalSystem (an empty name means it too), which [`grants`] always lists. The built-in
+    /// accounts become SIDs: their names are translated, and only the SCM takes the English ones
+    /// everywhere. `.\user` is the SCM's own spelling of a local account; `icacls` cannot look up
+    /// the dot.
+    pub(super) fn service_principal(account: &str) -> Option<String> {
+        let account = account.trim();
+        match account.to_ascii_lowercase().as_str() {
+            "" | "localsystem" | ".\\localsystem" | "nt authority\\system" => None,
+            "nt authority\\localservice" | "nt authority\\local service" => {
+                Some(LOCAL_SERVICE.to_string())
+            }
+            "nt authority\\networkservice" | "nt authority\\network service" => {
+                Some(NETWORK_SERVICE.to_string())
+            }
+            _ => Some(account.strip_prefix(".\\").unwrap_or(account).to_string()),
+        }
+    }
+
+    /// The grants of the folder: `me` is the account running this, `service` the service's.
+    pub(super) fn grants(service: Option<&str>, me: &str) -> Vec<String> {
+        let mut out = vec![
+            format!("{ADMINISTRATORS}:{FULL}"),
+            format!("{SYSTEM}:{FULL}"),
+        ];
+        if me != ADMINISTRATORS && me != SYSTEM {
+            out.push(format!("{me}:{FULL}"));
+        }
+        if let Some(service) = service.filter(|s| *s != me && *s != SYSTEM) {
+            out.push(format!("{service}:{READ}"));
+        }
+        out
+    }
+
+    /// The two `icacls` runs. `/reset` first: `/grant:r` replaces only the accounts it names, so
+    /// a grant of an earlier login would stay. Inherited access is back only until the second
+    /// run, and the new token is written after both.
+    pub(super) fn icacls_commands(dir: &Path, grants: &[String]) -> [Vec<OsString>; 2] {
+        let reset = vec![dir.as_os_str().to_owned(), "/reset".into(), "/Q".into()];
+        let mut protect = vec![
+            dir.as_os_str().to_owned(),
+            "/inheritance:r".into(),
+            "/grant:r".into(),
+        ];
+        protect.extend(grants.iter().map(OsString::from));
+        protect.push("/Q".into());
+        [reset, protect]
+    }
+
+    /// The SID in the output of `whoami /user /fo csv /nh`, as `*S-1-...`. The account name before
+    /// it can hold a comma, and is translated.
+    pub(super) fn parse_whoami(output: &str) -> Option<String> {
+        let sid = output.trim().rsplit(',').next()?.trim_matches('"');
+        let rest = sid.strip_prefix("S-1-")?;
+        let shaped = !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+            && !rest.ends_with('-');
+        shaped.then(|| format!("*{sid}"))
+    }
+
+    /// Protect `dir`. `service`: the service's account, `None` with no service installed. When
+    /// either account is unknown the ACL stays as it is: guessing could lock the service, or the
+    /// user, out of the token.
+    pub(super) fn protect(
+        dir: &Path,
+        service: Result<Option<String>, String>,
+        run: Run<'_>,
+    ) -> Result<(), String> {
+        let service = service.map_err(|e| format!("the service's account is unknown: {e}"))?;
+        let whoami = ["/user", "/fo", "csv", "/nh"].map(OsString::from);
+        let answer = run("whoami.exe", &whoami)?;
+        let me = parse_whoami(&answer)
+            .ok_or_else(|| "whoami did not name the current account".to_string())?;
+        let principal = service.as_deref().and_then(service_principal);
+        for args in icacls_commands(dir, &grants(principal.as_deref(), &me)) {
+            run("icacls.exe", &args)?;
+        }
+        Ok(())
+    }
+
+    /// [`protect`], with its failure as what the user reads.
+    pub(super) fn protect_or_warn(
+        dir: &Path,
+        service: Result<Option<String>, String>,
+        run: Run<'_>,
+    ) -> Option<String> {
+        let why = protect(dir, service, run).err()?;
+        Some(format!(
+            "could not restrict {} to the service's account, Administrators and you ({why}). The \
+             token is saved, but the folder keeps the permissions of its parent, so other \
+             accounts on this computer may be able to read it. Run this command again from an \
+             elevated terminal (Run as administrator); if that fails too, the drive may not \
+             support NTFS permissions: keep the data folder on an NTFS drive.",
+            dir.display()
+        ))
+    }
+
+    /// `name` in System32 of the Windows folder `root`: by absolute path, because an elevated
+    /// login must not run an `icacls.exe` that happens to lie on the search path.
+    pub(super) fn tool_path(root: Option<OsString>, name: &str) -> PathBuf {
+        Path::new(&root.unwrap_or_else(|| "C:\\Windows".into()))
+            .join("System32")
+            .join(name)
+    }
+
+    /// Run `exe`: its standard output when it exits with 0, otherwise what it said.
+    pub(super) fn run_at(exe: &Path, args: &[OsString]) -> Result<String, String> {
+        let out = std::process::Command::new(exe)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("{} did not run: {e}", exe.display()))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if out.status.success() {
+            return Ok(stdout);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let said: String = format!("{} {}", stdout.trim(), stderr.trim())
+            .trim()
+            .chars()
+            .take(MAX_ANSWER_CHARS)
+            .collect();
+        Err(format!("{} failed, {}: {said}", exe.display(), out.status))
+    }
+
+    /// The account the installed service runs as: `None` with no service installed. Asking needs
+    /// no administrator rights.
+    #[cfg(windows)]
+    pub(super) fn service_account() -> Result<Option<String>, String> {
+        use crate::service_ctl::WINDOWS_SERVICE_NAME;
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+        const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(|e| e.to_string())?;
+        let service = match manager.open_service(WINDOWS_SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
+        {
+            Ok(service) => service,
+            Err(windows_service::Error::Winapi(e))
+                if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let config = service.query_config().map_err(|e| e.to_string())?;
+        let account = config.account_name.unwrap_or_default();
+        Ok(Some(account.to_string_lossy().into_owned()))
+    }
+}
+
+/// Protect the token's folder: the warning for the user when that failed.
+#[cfg(windows)]
+fn protect_token_folder(dir: &Path) -> Option<String> {
+    let run = |name: &str, args: &[std::ffi::OsString]| {
+        folder_acl::run_at(
+            &folder_acl::tool_path(std::env::var_os("SystemRoot"), name),
+            args,
+        )
+    };
+    folder_acl::protect_or_warn(dir, folder_acl::service_account(), &run)
+}
+
+/// Unix needs nothing first: the file is 0600 from its first byte, and `hand_over` closes the
+/// folder.
+#[cfg(not(windows))]
+fn protect_token_folder(_dir: &Path) -> Option<String> {
+    None
+}
+
+/// A saved login.
+#[derive(Debug)]
+pub struct Saved {
+    pub path: PathBuf,
+    /// The login stands, but its folder could not be protected: tell the user.
+    pub warning: Option<String>,
+}
+
+/// Save `token` as the login under `data_root`.
+pub fn save(data_root: &Path, token: &HfToken) -> Result<Saved> {
+    save_with(data_root, token, &protect_token_folder)
+}
+
+/// [`save`] with `protect` as the folder's protection, run before the token is on disk. The old
+/// login stays until the rename replaces it, so a failure at any point leaves it working, and no
+/// copy of the new token behind.
+fn save_with(
+    data_root: &Path,
+    token: &HfToken,
+    protect: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Saved> {
     let path = saved_token_path(data_root);
     let dir = path
         .parent()
         .context("the token file has no parent directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let tmp = dir.join(format!(".token.{}.tmp", std::process::id()));
-    write_private(&tmp, token.secret())?;
-    #[cfg(unix)]
-    hand_over(data_root, &tmp)?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    let warning = protect(dir);
+    if let Some(w) = &warning {
+        tracing::warn!("{w}");
+    }
+    let tmp = dir.join(format!(".token.{}.tmp", uuid::Uuid::new_v4()));
+    let replaced = write_private(&tmp, token.secret()).and_then(|()| {
+        #[cfg(unix)]
+        hand_over(data_root, &tmp)?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+    });
+    if let Err(e) = replaced {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(Saved { path, warning })
 }
 
 /// Delete the saved login. Returns whether there was one.
@@ -659,6 +886,8 @@ struct LoginReport {
     path: PathBuf,
     /// Err: the access check itself failed; the login still stands.
     access: Result<Access, String>,
+    /// The token's folder could not be protected ([`Saved::warning`]).
+    warning: Option<String>,
 }
 
 impl LoginReport {
@@ -672,11 +901,15 @@ impl LoginReport {
             },
             Err(e) => format!("unknown ({e})"),
         };
-        format!(
+        let saved = format!(
             "Logged in as {}, SAM 3 access: {access}\nSaved to {}. A read-only token is enough.",
             self.name,
             self.path.display()
-        )
+        );
+        match &self.warning {
+            Some(w) => format!("{saved}\nwarning: {w}"),
+            None => saved,
+        }
     }
 }
 
@@ -688,11 +921,16 @@ async fn sign_in(
     token: &HfToken,
 ) -> Result<LoginReport> {
     let name = whoami(client, at.whoami, token).await?;
-    let path = save(data_root, token)?;
+    let Saved { path, warning } = save(data_root, token)?;
     let access = probe(client, at.probe, Some(token), at.host)
         .await
         .map_err(|e| format!("{e:#}"));
-    Ok(LoginReport { name, path, access })
+    Ok(LoginReport {
+        name,
+        path,
+        access,
+        warning,
+    })
 }
 
 /// The token from the terminal with no echo, or from stdin when piped. Never from argv.
@@ -908,7 +1146,7 @@ mod tests {
     fn save_and_remove_round_trip() {
         let root = tmp();
         let t = HfToken::new(TOKEN, TokenSource::Saved).unwrap();
-        let path = save(&root, &t).unwrap();
+        let path = save(&root, &t).unwrap().path;
         assert_eq!(path, root.join("tools/hf/token"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), TOKEN);
         save(&root, &HfToken::new("second", TokenSource::Saved).unwrap()).unwrap();
@@ -936,6 +1174,261 @@ mod tests {
         assert_eq!(chown_to(0, (0, 0)), None);
         assert_eq!(chown_to(1001, (1001, 1001)), None);
         assert_eq!(chown_to(1000, (1001, 1001)), None);
+    }
+
+    /// A save that cannot finish keeps the old login and leaves no copy of the new token behind.
+    #[test]
+    fn a_failed_save_keeps_the_old_login_and_leaves_no_temp_file() {
+        let root = tmp();
+        let target = saved_token_path(&root);
+        // A folder with something in it where the file goes: the rename cannot replace it.
+        write(&target.join("in-the-way"), "old");
+        let t = HfToken::new(TOKEN, TokenSource::Saved).unwrap();
+        assert!(save(&root, &t).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("in-the-way")).unwrap(),
+            "old"
+        );
+        let names: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, ["token"], "no temp file left");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The folder is protected before the token exists in it.
+    #[test]
+    fn the_folder_is_protected_before_the_token_is_written() {
+        let root = tmp();
+        let t = HfToken::new(TOKEN, TokenSource::Saved).unwrap();
+        let seen = std::cell::Cell::new(false);
+        let saved = save_with(&root, &t, &|dir| {
+            assert_eq!(dir, root.join("tools/hf"));
+            assert!(dir.is_dir());
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+            seen.set(true);
+            None
+        })
+        .unwrap();
+        assert!(seen.get());
+        assert_eq!(saved.warning, None);
+        assert_eq!(std::fs::read_to_string(saved.path).unwrap(), TOKEN);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An ACL that cannot be set does not lose the login, and the user is told.
+    #[test]
+    fn a_failed_acl_is_a_visible_warning_and_the_token_is_still_saved() {
+        let root = tmp();
+        let t = HfToken::new(TOKEN, TokenSource::Saved).unwrap();
+        let saved = save_with(&root, &t, &|dir| {
+            let refused: folder_acl::Run<'_> = &|_, _| Err("Access is denied".to_string());
+            folder_acl::protect_or_warn(dir, Ok(None), refused)
+        })
+        .unwrap();
+        let warning = saved.warning.clone().unwrap();
+        assert!(warning.contains("Access is denied"), "{warning}");
+        assert!(warning.contains("Run as administrator"), "{warning}");
+        assert!(!warning.contains(TOKEN), "{warning}");
+        assert_eq!(std::fs::read_to_string(&saved.path).unwrap(), TOKEN);
+        let report = LoginReport {
+            name: "someone".to_string(),
+            path: saved.path,
+            access: Ok(Access::Granted),
+            warning: saved.warning,
+        };
+        assert!(
+            report.text(None).contains(&warning),
+            "{}",
+            report.text(None)
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn strings(args: &[std::ffi::OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Every SID form, so a non-English Windows resolves them; one element per argument, so a
+    /// path or an account with a space stays one.
+    #[test]
+    fn icacls_arguments_are_a_protected_dacl_for_three_accounts() {
+        let dir = Path::new("D:/Data Root/tools/hf");
+        let grants = folder_acl::grants(
+            Some("NT SERVICE\\BlueOnyxPrismService"),
+            "*S-1-5-21-1-2-3-1001",
+        );
+        let [reset, protect] = folder_acl::icacls_commands(dir, &grants);
+        assert_eq!(strings(&reset), [dir.to_str().unwrap(), "/reset", "/Q"]);
+        assert_eq!(
+            strings(&protect),
+            [
+                dir.to_str().unwrap(),
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-21-1-2-3-1001:(OI)(CI)F",
+                "NT SERVICE\\BlueOnyxPrismService:(OI)(CI)RX",
+                "/Q",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_account_that_already_has_full_control_is_not_granted_twice() {
+        // The login ran as the service's account, or as SYSTEM.
+        assert_eq!(
+            folder_acl::grants(Some("*S-1-5-19"), "*S-1-5-19"),
+            [
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-19:(OI)(CI)F",
+            ]
+        );
+        assert_eq!(
+            folder_acl::grants(None, "*S-1-5-18"),
+            ["*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"]
+        );
+    }
+
+    #[test]
+    fn the_scm_account_maps_to_what_icacls_resolves_in_any_language() {
+        let cases = [
+            ("NT AUTHORITY\\LocalService", Some("*S-1-5-19")),
+            ("nt authority\\local service", Some("*S-1-5-19")),
+            ("NT AUTHORITY\\NetworkService", Some("*S-1-5-20")),
+            (
+                "NT SERVICE\\BlueOnyxPrismService",
+                Some("NT SERVICE\\BlueOnyxPrismService"),
+            ),
+            ("DOMAIN\\John Smith", Some("DOMAIN\\John Smith")),
+            // SCM's spelling of a local account: icacls cannot look up the dot.
+            (".\\camera", Some("camera")),
+            // Always in the list.
+            ("LocalSystem", None),
+            ("NT AUTHORITY\\SYSTEM", None),
+            ("", None),
+        ];
+        for (account, want) in cases {
+            assert_eq!(
+                folder_acl::service_principal(account).as_deref(),
+                want,
+                "{account}"
+            );
+        }
+    }
+
+    #[test]
+    fn whoami_output_gives_the_sid() {
+        let out = "\"desktop-1\\pat, jr\",\"S-1-5-21-111-222-333-1001\"\r\n";
+        assert_eq!(
+            folder_acl::parse_whoami(out).as_deref(),
+            Some("*S-1-5-21-111-222-333-1001")
+        );
+        for bad in [
+            "",
+            "\"a\",\"b\"",
+            "\"a\",\"S-1-\"",
+            "\"a\",\"S-1-5-x\"",
+            "denied",
+        ] {
+            assert_eq!(folder_acl::parse_whoami(bad), None, "{bad}");
+        }
+    }
+
+    type Calls = std::cell::RefCell<Vec<(String, Vec<String>)>>;
+
+    /// A fake of the tools: `whoami` answers, the rest succeed; the calls are kept.
+    fn recording(calls: &Calls) -> impl Fn(&str, &[std::ffi::OsString]) -> Result<String, String> {
+        move |tool, args| {
+            calls.borrow_mut().push((tool.to_string(), strings(args)));
+            Ok(if tool == "whoami.exe" {
+                "\"pc\\me\",\"S-1-5-21-9-1001\"\r\n".to_string()
+            } else {
+                String::new()
+            })
+        }
+    }
+
+    #[test]
+    fn protect_runs_whoami_then_both_icacls_steps_and_no_argument_is_the_token() {
+        let root = tmp();
+        let calls = Calls::default();
+        let run = recording(&calls);
+        let t = HfToken::new(TOKEN, TokenSource::Saved).unwrap();
+        let saved = save_with(&root, &t, &|dir| {
+            let service = Ok(Some("NT AUTHORITY\\LocalService".to_string()));
+            folder_acl::protect_or_warn(dir, service, &run)
+        })
+        .unwrap();
+        assert_eq!(saved.warning, None);
+        let calls = calls.borrow();
+        let tools: Vec<_> = calls.iter().map(|(tool, _)| tool.as_str()).collect();
+        assert_eq!(tools, ["whoami.exe", "icacls.exe", "icacls.exe"]);
+        assert_eq!(calls[0].1, ["/user", "/fo", "csv", "/nh"]);
+        assert!(calls[2].1.contains(&"*S-1-5-19:(OI)(CI)RX".to_string()));
+        assert!(
+            calls[2]
+                .1
+                .contains(&"*S-1-5-21-9-1001:(OI)(CI)F".to_string())
+        );
+        for (_, args) in calls.iter() {
+            assert!(!args.iter().any(|a| a.contains(TOKEN)), "{args:?}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Protecting a folder without knowing who needs it could lock the service or the user out
+    /// of their own token: nothing changes, and the warning says why.
+    #[test]
+    fn an_unknown_account_leaves_the_acl_alone() {
+        let calls = Calls::default();
+        let run = recording(&calls);
+        let dir = Path::new("hf");
+        let why = folder_acl::protect(dir, Err("the SCM said no".to_string()), &run).unwrap_err();
+        assert!(why.contains("the SCM said no"), "{why}");
+        assert!(calls.borrow().is_empty());
+
+        let no_sid: folder_acl::Run<'_> = &|tool, args| {
+            calls.borrow_mut().push((tool.to_string(), strings(args)));
+            Ok("not csv".to_string())
+        };
+        let why = folder_acl::protect(dir, Ok(None), no_sid).unwrap_err();
+        assert!(why.contains("whoami"), "{why}");
+        assert!(calls.borrow().iter().all(|(tool, _)| tool == "whoami.exe"));
+    }
+
+    /// Tools are found by absolute path, never through the search path.
+    #[test]
+    fn tools_come_from_system32() {
+        assert_eq!(
+            folder_acl::tool_path(Some("D:\\Win".into()), "icacls.exe"),
+            Path::new("D:\\Win").join("System32").join("icacls.exe")
+        );
+        assert_eq!(
+            folder_acl::tool_path(None, "icacls.exe"),
+            Path::new("C:\\Windows").join("System32").join("icacls.exe")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_fails_reports_what_it_said() {
+        let sh = Path::new("/bin/sh");
+        let args = |script: &str| ["-c".into(), script.into()];
+        assert_eq!(
+            folder_acl::run_at(sh, &args("printf ok")).as_deref(),
+            Ok("ok")
+        );
+        let why = folder_acl::run_at(sh, &args("echo denied; echo more >&2; exit 3")).unwrap_err();
+        assert!(why.contains("denied") && why.contains("more"), "{why}");
+        let why = folder_acl::run_at(Path::new("/no/such/tool"), &[]).unwrap_err();
+        assert!(why.contains("/no/such/tool"), "{why}");
     }
 
     #[test]
@@ -1150,6 +1643,7 @@ mod tests {
             name: "someone".into(),
             path: PathBuf::from("t"),
             access,
+            warning: None,
         };
         let yes = report(Ok(Access::Granted)).text(g);
         assert!(

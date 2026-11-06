@@ -17,13 +17,35 @@ cargo build --release --locked --bins
 
 - `C:\Program Files\Blue Onyx Prism`: service exe, CLI, tray exe (`blue-onyx-prism-tray.exe`), benchmark exe, LICENSE, THIRD_PARTY_LICENSES.md, README.md.
 - Service `BlueOnyxPrismService` (auto start, `NT AUTHORITY\LocalService`), started `--config "C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json"`;
-  restarts after 5 s / 30 s / 120 s (count reset after 1 h).
-- `C:\ProgramData\BlueOnyxPrism`: config, models, cache, logs; Administrators/SYSTEM full control, LocalService modify.
-- Application event log source `BlueOnyxPrism`, firewall rule `Blue Onyx Prism (<PORT>)` (TCP, any scope, all profiles),
+  restarts after 5 s / 30 s / 120 s (count reset after 1 h). Its only required privilege is `SeChangeNotifyPrivilege`:
+  the SCM removes every other one from the process, as `scripts\install_service.ps1` does.
+- `C:\ProgramData\BlueOnyxPrism`: config, models, cache, logs. Its DACL is protected, so nothing is inherited from
+  `ProgramData` (whose ACL lets `Users` create files): Administrators/SYSTEM full control, LocalService modify, Users
+  read (the tray reads the port from the config). Commands that write here, such as `hf-login` or a `fetch` by hand,
+  need an elevated terminal. Every install, repair and upgrade sets this again, so an upgrade corrects an older install.
+  `tools\hf` has its own protected DACL, because it holds the Hugging Face token of `hf-login`, and Users cannot read it.
+- Application event log source `BlueOnyxPrism`, firewall rule `Blue Onyx Prism (<PORT>)` (see below),
   Start Menu shortcuts "Blue Onyx Prism" (the tray icon app) and "Blue Onyx Prism Web UI" (`http://127.0.0.1:32168/`).
 - Tray app: `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\BlueOnyxPrismTray` starts it at login for every user.
   A running tray is terminated (WiX `CloseApplication`) before an upgrade or uninstall replaces/removes its exe. The
   installer does not launch it at the end (it starts at the next login or from the Start Menu).
+
+## Firewall
+
+The rule `Blue Onyx Prism (<PORT>)` allows TCP `<PORT>` from the local subnet only, on the Domain and Private network
+profiles. A Blue Iris on the same subnet, or on the same PC, needs nothing more. Two cases do:
+
+- **Blue Iris on another subnet or VLAN.** Add your own rule, for that machine's address, in an elevated PowerShell:
+
+  ```powershell
+  New-NetFirewallRule -DisplayName "Blue Onyx Prism (Blue Iris)" -Direction Inbound -Action Allow `
+      -Protocol TCP -LocalPort 32168 -RemoteAddress 192.168.20.5 -Profile Domain,Private
+  ```
+
+  An uninstall does not remove this rule: `Remove-NetFirewallRule -DisplayName "Blue Onyx Prism (Blue Iris)"`.
+- **This PC's network is set to Public.** Windows often picks Public for a new network, and the rule does not apply
+  there. Check with `Get-NetConnectionProfile`, and make a trusted network Private:
+  `Set-NetConnectionProfile -InterfaceAlias Ethernet -NetworkCategory Private`.
 
 ## Properties
 
@@ -49,4 +71,7 @@ The MSI does not change `ServicesPipeTimeout`.
 
 ## CI smoke test
 
-`smoke-test.ps1 -Msi <path> [-Port 32168]` (elevated): installs, checks service/account/HTTP/config and the tray exe, Run value and shortcuts (the tray is not run), uninstalls, checks cleanup.
+`smoke-test.ps1 -Msi <path> [-Port 32168]` (elevated): installs, checks service/account/HTTP/config, the data folder's
+DACL, the required privileges, the firewall rule's scope and profiles and the tray exe, Run value and shortcuts (the tray
+is not run), uninstalls, checks cleanup. A third round installs over data with an older version's ACL and a token, and
+checks that both folders' DACLs are corrected and that the full uninstall still removes them.

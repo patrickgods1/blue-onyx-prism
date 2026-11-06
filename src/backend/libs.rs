@@ -40,6 +40,7 @@
 
 use crate::sync::LockExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) const BUNDLED_DIR_NAME: &str = "openvino";
@@ -745,6 +746,19 @@ pub(crate) fn write_active_flavor(ort_root: &Path, flavor: &str) -> std::io::Res
     std::fs::rename(&tmp, ort_root.join(ORT_ACTIVE_FILE))
 }
 
+/// Why a file named anywhere but in `ORT_DYLIB_PATH` is not loaded.
+const ORT_FILE_REFUSED: &str = "is a file, not a folder; set onnxruntime_dir to the folder that \
+     holds the library, or set ORT_DYLIB_PATH to name a single file";
+
+/// Log once per process that a file was refused: the lookup runs for every status page, and
+/// with a library found elsewhere the line in [`OrtLookup::checked`] would never be shown.
+fn warn_ort_file_once(label: &str, p: &Path) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("{label} {} {ORT_FILE_REFUSED}", p.display());
+    }
+}
+
 /// [`find_onnxruntime`] with another install root than `<exe_dir>/onnxruntime` (config
 /// `download_dir`).
 pub(crate) fn find_onnxruntime_with(explicit: Option<&Path>, default_dir: &Path) -> OrtLookup {
@@ -755,7 +769,7 @@ pub(crate) fn find_onnxruntime_with(explicit: Option<&Path>, default_dir: &Path)
 }
 
 /// Locate the ONNX Runtime library. Order (first hit wins):
-/// 1. config `onnxruntime_dir` (`explicit`, a directory or the library file itself);
+/// 1. config `onnxruntime_dir` (`explicit`, a directory; a file is refused and noted);
 /// 2. `ORT_DYLIB_PATH` (file or directory);
 /// 3. `<exe_dir>/onnxruntime/<flavor>/` for the flavor in `onnxruntime/active.txt`;
 /// 4. `<exe_dir>/onnxruntime/` itself (the legacy flat layout);
@@ -778,8 +792,11 @@ pub fn find_onnxruntime_from(
         ..OrtLookup::default()
     };
     let mut try_path = |label: &str, p: &Path| -> Option<PathBuf> {
-        let hit = if p.is_file() {
-            Some(p.to_path_buf())
+        // Only the environment may name a file: it is set by whoever controls the service.
+        let file_ok = label == ENV_ORT_DYLIB_PATH;
+        let is_file = p.is_file();
+        let hit = if is_file {
+            file_ok.then(|| p.to_path_buf())
         } else if p.is_dir() {
             find_ort_library_in(p)
         } else {
@@ -787,6 +804,10 @@ pub fn find_onnxruntime_from(
         };
         let state = match (&hit, p.exists()) {
             (Some(_), _) => "found",
+            (None, true) if is_file => {
+                warn_ort_file_once(label, p);
+                ORT_FILE_REFUSED
+            }
             (None, true) => "no ONNX Runtime library inside",
             (None, false) => "does not exist",
         };
@@ -1429,6 +1450,40 @@ mod tests {
         assert_eq!(read_ort_flavor(&c).as_deref(), Some("coreml"));
         assert_eq!(read_ort_flavor(&a), None);
         assert!(default_onnxruntime_dir().ends_with(ORT_DIR_NAME));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// S2: the config's `onnxruntime_dir` must be a folder; only `ORT_DYLIB_PATH`, which the
+    /// web UI cannot touch, may name a file.
+    #[test]
+    fn onnxruntime_dir_in_the_config_refuses_a_file() {
+        let root = std::env::temp_dir().join(format!("bop_ortfile_{}", uuid::Uuid::new_v4()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let lib = ort_library_file_name();
+        std::fs::write(a.join(lib), b"").unwrap();
+        std::fs::write(b.join(lib), b"").unwrap();
+        let file = a.join(lib);
+
+        // Refused, with the reason in the list of what was checked; the search goes on.
+        let r = find_onnxruntime_from(Some(&file), None, &root.join("empty"));
+        assert_eq!(r.library, None);
+        assert!(
+            r.checked[0].contains("is a file, not a folder"),
+            "{:?}",
+            r.checked
+        );
+        assert!(r.checked[0].contains("ORT_DYLIB_PATH"), "{:?}", r.checked);
+        let r = find_onnxruntime_from(Some(&file), None, &b);
+        assert_eq!(r.library, Some(b.join(lib)));
+        // The same library through its folder, and a file through the environment, are fine.
+        assert_eq!(
+            find_onnxruntime_from(Some(&a), None, &b).library,
+            Some(a.join(lib))
+        );
+        let r = find_onnxruntime_from(None, Some(&file), &root.join("empty"));
+        assert_eq!(r.library, Some(file.clone()));
         std::fs::remove_dir_all(&root).ok();
     }
 

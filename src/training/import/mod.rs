@@ -263,12 +263,25 @@ impl ImportRequest {
 }
 
 /// Plan an import of `request` on `config` (checks that fail fast: the source, the URL
-/// denylist, the licence confirmation, whether the training environment is needed and allowed
-/// to download). The job then runs on the training queue.
-pub fn plan_import(
+/// denylist and internal hosts, the licence confirmation, whether the training environment is
+/// needed and allowed to download). The job then runs on the training queue.
+pub fn plan_import(config: &Config, request: ImportRequest, cap: &Capability) -> Result<ImportJob> {
+    // Unit tests plan URL imports too: they stay off the network, as a failed lookup would.
+    #[cfg(test)]
+    let resolve = |_: &str| -> std::io::Result<Vec<std::net::IpAddr>> {
+        Err(std::io::Error::other("no DNS in unit tests"))
+    };
+    #[cfg(not(test))]
+    let resolve = source::system_resolve;
+    plan_import_with(config, request, cap, &resolve)
+}
+
+/// [`plan_import`] with the resolver a URL's host is checked through (a fake in tests).
+pub(crate) fn plan_import_with(
     config: &Config,
     mut request: ImportRequest,
     cap: &Capability,
+    resolve: &dyn Fn(&str) -> std::io::Result<Vec<std::net::IpAddr>>,
 ) -> Result<ImportJob> {
     request.validate()?;
     let license = source::check_license(
@@ -281,6 +294,7 @@ pub fn plan_import(
     match &mut request.source {
         ImportSource::Url(u) => {
             *u = source::check_url(u)?;
+            source::check_resolved(u, resolve)?;
             needs_python = true;
         }
         ImportSource::Path(p) => {
@@ -535,6 +549,28 @@ mod tests {
                 .to_string()
                 .contains("refused")
         );
+        // An internal host, as text or by its DNS answer, fails before anything is queued too.
+        let url = |u: &str| {
+            let mut r = ImportRequest::new(ImportSource::Url(u.into()));
+            r.license = Some("CC0".into());
+            r.license_confirmed = true;
+            r.allow_large = true;
+            r
+        };
+        let e = plan_import(&c, url("http://169.254.169.254/latest/"), &cap)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("private or local"), "{e}");
+        let private = |_: &str| Ok(vec![std::net::IpAddr::from([192, 168, 1, 1])]);
+        let e = plan_import_with(&c, url("https://nas.example.com/v.mp4"), &cap, &private)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("nas.example.com resolves to"), "{e}");
+        let public = |_: &str| Ok(vec![std::net::IpAddr::from([8, 8, 8, 8])]);
+        plan_import_with(&c, url("https://example.com/v.mp4"), &cap, &public).unwrap();
+        // A resolver that fails leaves the answer to yt-dlp.
+        let down = |_: &str| Err(std::io::Error::other("no DNS"));
+        plan_import_with(&c, url("https://example.com/v.mp4"), &cap, &down).unwrap();
         // Without a GPU: videos are refused, an image folder with dHash selection is fine.
         let none = super::super::capability::capability(
             &HardwareInfo::new("linux", "x86_64", vec![]),
