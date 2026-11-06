@@ -57,6 +57,7 @@
     <div class="inline-row rv-actions">
       <button type="button" id="rv-save">Save &amp; next</button>
       <button type="button" id="rv-accept-all" class="small secondary">Accept proposals</button>
+      <button type="button" id="rv-reject-rest" class="small secondary">Reject the rest</button>
       <button type="button" id="rv-skip" class="small secondary">Skip</button>
       <button type="button" id="rv-back" class="small secondary">Back</button>
       <button type="button" id="rv-next" class="small secondary">Next</button>
@@ -75,7 +76,7 @@
       <table class="review-keys">
         <tbody><!-- filled by review.js from its key list (also the ? overlay) --></tbody>
       </table>
-      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; decide it, or save twice for the default) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; the pointer over a box shows its full tag.</p>
+      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; needs a decision before saving) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; the pointer over a box shows its full tag.</p>
     </details>
     </details>
   </aside>

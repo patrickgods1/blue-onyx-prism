@@ -828,13 +828,14 @@ pub fn run_filtered(
     Ok(r)
 }
 
-/// An unreviewed frame's labels as a save would leave them: pending boxes resolved, training
-/// boxes only.
+/// An unreviewed frame's labels as a save could leave them: pending boxes resolved, training
+/// boxes only, without the flagged boxes a reviewer has yet to decide.
 fn preview(labels: &LabelFile) -> LabelFile {
     LabelFile {
         boxes: labels
             .boxes
             .iter()
+            .filter(|b| !super::needs_decision(b))
             .map(|b| LabelBox {
                 state: super::resolve_pending(b),
                 ..b.clone()
@@ -880,6 +881,20 @@ fn unreviewed_queue_frames(
 mod tests {
     use super::super::Source;
     use super::*;
+
+    #[test]
+    fn a_preview_leaves_out_boxes_a_reviewer_has_yet_to_decide() {
+        let mut flagged = super::super::tests_support::auto_box("person");
+        flagged.auto.triage = Some(super::super::Triage::Review);
+        let plain = super::super::tests_support::auto_box("car");
+        let p = preview(&LabelFile {
+            boxes: vec![flagged, plain],
+            ..LabelFile::default()
+        });
+        assert_eq!(p.boxes.len(), 1);
+        assert_eq!(p.boxes[0].label, "car");
+        assert_eq!(p.boxes[0].state, BoxState::Accepted);
+    }
 
     fn g(c: &str, d: &str) -> Group {
         (c.to_string(), d.to_string())

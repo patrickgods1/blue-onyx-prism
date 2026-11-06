@@ -161,6 +161,7 @@ fn counts(b: &LabelBox) -> bool {
                 super::bulk::LOW_SCORE_REASON
                     | super::bulk::OTHER_CLASS_REASON
                     | REPEAT_SPOT_REASON
+                    | super::REST_REASON
             )
         )
 }
@@ -442,7 +443,12 @@ mod tests {
         assert!(!counts(&b), "pending");
         b.state = BoxState::Rejected;
         assert!(counts(&b));
-        for r in ["low_score", "other_class", REPEAT_SPOT_REASON] {
+        for r in [
+            "low_score",
+            "other_class",
+            REPEAT_SPOT_REASON,
+            super::super::REST_REASON,
+        ] {
             b.reason = Some(r.into());
             assert!(!counts(&b), "{r}");
         }
