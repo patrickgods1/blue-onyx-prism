@@ -2,8 +2,10 @@
 <#
 .SYNOPSIS
     Install / run / uninstall smoke test for the Blue Onyx Prism MSI (CI; modifies the machine).
-    Installs twice: a plain uninstall must leave nothing behind; one with KEEPDATA=1 keeps only
-    the data folder.
+    Installs three times: a plain uninstall must leave nothing behind; one with KEEPDATA=1 keeps
+    only the data folder; an install over data with an older version's ACL corrects it. Each
+    install also checks the data folder's DACL, the service's required privileges and the firewall
+    rule's scope and profiles.
 .PARAMETER Msi
     Path of the MSI to test.
 .PARAMETER Port
@@ -28,6 +30,7 @@ $Msi = (Resolve-Path $Msi).Path
 $Service = "BlueOnyxPrismService"
 $DataDir = Join-Path $env:ProgramData "BlueOnyxPrism"
 $Config = Join-Path $DataDir "blue_onyx_prism_config_service.json"
+$TokenDir = Join-Path $DataDir "tools\hf"
 $InstallLog = Join-Path (Get-Location) "msi-install.log"
 $UninstallLog = Join-Path (Get-Location) "msi-uninstall.log"
 
@@ -58,6 +61,109 @@ $RunKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 $StartMenu = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Blue Onyx Prism"
 $ProductKey = "HKLM:\SOFTWARE\BlueOnyxPrism"
 $EventSourceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\BlueOnyxPrism"
+
+# Account names as icacls prints them (translated on a non-English Windows).
+function Get-AccountName([string]$Sid) {
+    return (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+}
+$Administrators = Get-AccountName "S-1-5-32-544"
+$LocalSystem = Get-AccountName "S-1-5-18"
+$LocalService = Get-AccountName "S-1-5-19"
+$BuiltinUsers = Get-AccountName "S-1-5-32-545"
+
+# The ACEs of $Path as icacls prints them: `<account>:(OI)(CI)(RX)`, the first one after the path.
+function Get-Aces([string]$Path, [string[]]$Logs) {
+    $out = @(& icacls.exe $Path)
+    if ($LASTEXITCODE -ne 0) { Fail "icacls '$Path' exited with $LASTEXITCODE`: $out" $Logs }
+    Write-Host ($out -join "`n")
+    $aces = @()
+    foreach ($line in $out) {
+        $text = "$line"
+        if ($text.StartsWith($Path)) { $text = $text.Substring($Path.Length) }
+        if ($text.Trim() -match '^(.+?):((?:\([A-Za-z,]+\))+)$') {
+            $aces += [pscustomobject]@{ Account = $Matches[1]; Rights = $Matches[2] }
+        }
+    }
+    if ($aces.Count -eq 0) { Fail "no ACE could be read from icacls '$Path': $out" $Logs }
+    return $aces
+}
+
+# Every right in a `(OI)(CI)(RX)` string that lets an account change something. An allow-list of
+# what does not: inheritance flags, read, execute, list, read attributes, synchronize.
+function Get-WriteRights([string]$Rights) {
+    $harmless = "OI", "CI", "IO", "NP", "I", "RX", "R", "GR", "GE", "RD", "REA", "RA", "RC", "X", "S"
+    return @($Rights -split '[(),]' | Where-Object { $_ -and $harmless -notcontains $_ })
+}
+
+function Assert-NoUserWrite([string]$Path, [string[]]$Logs) {
+    foreach ($ace in @(Get-Aces $Path $Logs | Where-Object { $_.Account -eq $BuiltinUsers })) {
+        $write = @(Get-WriteRights $ace.Rights)
+        if ($write.Count -gt 0) { Fail "$BuiltinUsers can write to $Path`: $($ace.Rights)" $Logs }
+    }
+}
+
+# $Expected: account -> rights. Exactly these ACEs, none inherited: the DACL is protected.
+function Assert-ExactDacl([string]$Path, [hashtable]$Expected, [string[]]$Logs) {
+    $aces = @(Get-Aces $Path $Logs)
+    foreach ($ace in $aces) {
+        if ($ace.Rights -match '\(I\)') { Fail "$Path has an inherited ACE: $($ace.Account):$($ace.Rights)" $Logs }
+        if ($Expected[$ace.Account] -cne $ace.Rights) {
+            Fail "$Path has $($ace.Account):$($ace.Rights), expected '$($Expected[$ace.Account])'" $Logs
+        }
+    }
+    if ($aces.Count -ne $Expected.Count) { Fail "$Path has $($aces.Count) ACEs, expected $($Expected.Count)" $Logs }
+}
+
+function Assert-Hardening([string]$Log) {
+    Assert-ExactDacl $DataDir @{
+        $Administrators = "(OI)(CI)(F)"
+        $LocalSystem    = "(OI)(CI)(F)"
+        $LocalService   = "(OI)(CI)(M)"
+        $BuiltinUsers   = "(OI)(CI)(RX)"
+    } @($Log)
+    # What the service created inherits that, on an upgrade too.
+    Assert-NoUserWrite $Config @($Log)
+    Write-Host "Data folder DACL is protected; Users can only read."
+
+    $svcKey = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Service"
+    if (-not $svcKey.PSObject.Properties["RequiredPrivileges"]) { Fail "the service has no RequiredPrivileges value" @($Log) }
+    $privileges = @($svcKey.RequiredPrivileges)
+    if ($privileges.Count -ne 1 -or $privileges[0] -ne "SeChangeNotifyPrivilege") {
+        Fail "required privileges are '$($privileges -join ', ')', expected only SeChangeNotifyPrivilege" @($Log)
+    }
+    Write-Host "Required privileges: $($privileges -join ', ')."
+
+    $rules = @(Get-NetFirewallRule -DisplayName "Blue Onyx Prism ($Port)")
+    if ($rules.Count -ne 1) { Fail "$($rules.Count) firewall rules named 'Blue Onyx Prism ($Port)', expected 1" @($Log) }
+    $scope = @(($rules[0] | Get-NetFirewallAddressFilter).RemoteAddress)
+    $outside = @($scope | Where-Object { $_ -notlike "LocalSubnet*" })
+    if ($scope.Count -eq 0 -or $outside.Count -gt 0) { Fail "firewall rule remote addresses are '$($scope -join ', ')', expected LocalSubnet" @($Log) }
+    $fwProfiles = "$($rules[0].Profile)"
+    if ($fwProfiles -ne "Domain, Private") { Fail "firewall rule profiles are '$fwProfiles', expected 'Domain, Private'" @($Log) }
+    Write-Host "Firewall rule: $($scope -join ', '), $fwProfiles."
+}
+
+# What an older version left: the data folder inherits from ProgramData, Users can write, and a
+# saved token sits in a folder with no ACL of its own.
+function Set-OlderVersionData {
+    $out = @(& icacls.exe $DataDir /inheritance:e /grant "*S-1-5-32-545:(OI)(CI)M" /Q)
+    if ($LASTEXITCODE -ne 0) { Fail "icacls '$DataDir' exited with $LASTEXITCODE`: $out" }
+    New-Item -ItemType Directory -Force -Path $TokenDir | Out-Null
+    Set-Content -Path (Join-Path $TokenDir "token") -Value "not-a-real-token"
+}
+
+function Assert-TokenFolderProtected([string]$Log) {
+    Assert-ExactDacl $TokenDir @{
+        $Administrators = "(OI)(CI)(F)"
+        $LocalSystem    = "(OI)(CI)(F)"
+        $LocalService   = "(OI)(CI)(RX)"
+    } @($Log)
+    $token = Join-Path $TokenDir "token"
+    if (@(Get-Aces $token @($Log) | Where-Object { $_.Account -eq $BuiltinUsers }).Count -gt 0) {
+        Fail "$BuiltinUsers can read $token" @($Log)
+    }
+    Write-Host "Token folder DACL is protected; Users have no access."
+}
 
 function Install-AndCheck([string]$Log) {
     Write-Host "Installing $Msi ..."
@@ -113,6 +219,7 @@ function Install-AndCheck([string]$Log) {
     if (-not (Get-NetFirewallRule -DisplayName "Blue Onyx Prism ($Port)" -ErrorAction SilentlyContinue)) {
         Fail "firewall rule 'Blue Onyx Prism ($Port)' missing after install" @($Log)
     }
+    Assert-Hardening $Log
 
     # Tray: exe, start-at-login Run value, Start Menu shortcut (the tray itself is not run: no desktop session in CI).
     if (-not (Test-Path $TrayExe)) { Fail "$TrayExe missing after install" @($Log) }
@@ -170,6 +277,12 @@ Uninstall-AndCheck $UninstallLog $false
 # 2. KEEPDATA=1: only the data folder stays.
 Install-AndCheck (Join-Path (Get-Location) "msi-install-2.log")
 Uninstall-AndCheck (Join-Path (Get-Location) "msi-uninstall-keepdata.log") $true
-Remove-Item -Recurse -Force $DataDir
+# 3. Over that data, with an older version's ACL: the install corrects it, and the full uninstall
+# still removes the protected token folder.
+Set-OlderVersionData
+$Log3 = Join-Path (Get-Location) "msi-install-3.log"
+Install-AndCheck $Log3
+Assert-TokenFolderProtected $Log3
+Uninstall-AndCheck (Join-Path (Get-Location) "msi-uninstall-3.log") $false
 
-Write-Host "SMOKE TEST PASSED (a full uninstall leaves nothing behind; KEEPDATA=1 keeps only the data folder)."
+Write-Host "SMOKE TEST PASSED (a full uninstall leaves nothing behind; KEEPDATA=1 keeps only the data folder; an older ACL is corrected)."

@@ -1,5 +1,5 @@
 //! Live config for the pages:
-//! - `GET /v1/config`: for an admin peer ([`super::admin_allowed`]) the effective config, its
+//! - `GET /v1/config`: for an admin peer ([`super::admin_allowed`], under an allowed `Host`) the effective config, its
 //!   revision and change log, per model what is configured vs what the running worker uses,
 //!   what a restart would apply, and the main form's field values the Config page refreshes
 //!   untouched fields from (ETag / If-None-Match); for anyone else only the revision,
@@ -583,9 +583,19 @@ pub(super) async fn config_json(
         axum::extract::rejection::ExtensionRejection,
     >,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     let peer = peer.ok().map(|c| c.0);
-    let admin = super::admin_allowed(peer, state.config_read().allow_remote_admin);
+    // This route is open, so `admin_only` never runs: the same two checks here, or a DNS-rebound
+    // page on this machine could read the admin payload (see `guard`).
+    let (allow_remote, foreign) = {
+        let c = state.config_read();
+        (
+            c.allow_remote_admin,
+            super::guard::foreign_host(&headers, &uri, &c.allowed_hosts),
+        )
+    };
+    let admin = foreign.is_none() && super::admin_allowed(peer, allow_remote);
     let body = if admin {
         // Reads the config file when it changed on disk, `benchmark.json`, and probes devices.
         super::blocking(move || payload(&state)).await

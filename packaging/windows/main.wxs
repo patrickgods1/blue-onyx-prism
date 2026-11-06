@@ -25,6 +25,10 @@
          (msiexec /x blue-onyx-prism.msi KEEPDATA=1) keeps C:\ProgramData\BlueOnyxPrism. -->
     <Property Id="PORT" Value="32168" Secure="yes" />
     <Property Id="KEEPDATA" Secure="yes" />
+    <!-- Firewall profiles, NET_FW_PROFILE2 bits: domain (1) + private (2). The Profile attribute
+         names one profile or "all", so the mask comes through a property: the extension's custom
+         action reads it as a formatted integer and hands it to INetFwRule::put_Profiles. -->
+    <Property Id="BOP_FIREWALL_PROFILES" Value="3" />
 
     <!-- Block when the service was installed by scripts\install_service.ps1 (no MSI marker value),
          but never block an upgrade/repair/uninstall of this MSI. -->
@@ -63,6 +67,43 @@
                   Directory="INSTALLFOLDER"
                   ExeCommand="&quot;[System64Folder]sc.exe&quot; failure BlueOnyxPrismService reset= 3600 actions= restart/5000/restart/30000/restart/120000"
                   Execute="deferred" Impersonate="no" Return="check" />
+    <!-- Required privileges: the SCM removes every privilege not listed from the service process
+         (no SeImpersonate, SeAssignPrimaryToken, ...). Same as install_service.ps1, which explains
+         the choice of this one. It takes effect at the next start, and StartServices comes after. -->
+    <CustomAction Id="SetServicePrivileges"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; privs BlueOnyxPrismService SeChangeNotifyPrivilege"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <!-- The data folder's DACL: protected (nothing inherited from ProgramData, whose ACL lets Users
+         create files in every folder below it), same result as install_service.ps1 for its install
+         folder. Administrators and SYSTEM full control, LocalService modify, Users read (the tray,
+         which runs as the logged-in user, reads the port from the config).
+
+         icacls and not util:PermissionEx: that one merges into the ACL it finds, so the inherited
+         Users write stays. SIDs, because account names are translated on a non-English Windows.
+         No /T: children follow through inheritance, and a child with its own protected DACL
+         (tools\hf, below) must keep it. [CommonAppDataFolder]BlueOnyxPrism and not [DATADIR]: a
+         folder property ends in a backslash, which would escape the closing quote. Runs on every
+         install, repair and upgrade, so an upgrade corrects the ACL of an older install.
+         EnsureDataFolder: the folder is a Permanent component, and a failing icacls stops the
+         install, so its existence is not left to how CreateFolders treats a folder that a full
+         uninstall deleted. An existing folder makes mkdir fail, which is ignored. -->
+    <CustomAction Id="EnsureDataFolder"
+                  Directory="CommonAppDataFolder"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c mkdir &quot;[CommonAppDataFolder]BlueOnyxPrism&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="ProtectDataFolder"
+                  Directory="CommonAppDataFolder"
+                  ExeCommand="&quot;[System64Folder]icacls.exe&quot; &quot;[CommonAppDataFolder]BlueOnyxPrism&quot; /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-19:(OI)(CI)M *S-1-5-32-545:(OI)(CI)RX /Q"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <!-- A token saved by an older version sits in tools\hf with only the data folder's ACL, which
+         Users can read. hf-login protects this folder on its next save (src/resources/hf_token.rs);
+         this does it for a token that is already there. LocalService reads, as hf-login grants it.
+         Return="ignore": the folder exists only after a login. -->
+    <CustomAction Id="ProtectTokenFolder"
+                  Directory="CommonAppDataFolder"
+                  ExeCommand="&quot;[System64Folder]icacls.exe&quot; &quot;[CommonAppDataFolder]BlueOnyxPrism\tools\hf&quot; /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-19:(OI)(CI)RX /Q"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <!-- A full uninstall (not the removal of the old version during an upgrade) leaves nothing
          behind: it deletes the data folder (config, downloaded runtimes and models, cache, logs,
          tools) unless KEEPDATA is set, and the program folder with whatever the program created
@@ -79,7 +120,11 @@
                   ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c rmdir /s /q &quot;[CommonAppDataFolder]BlueOnyxPrism&quot;"
                   Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
+      <Custom Action="EnsureDataFolder" After="CreateFolders" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="ProtectDataFolder" After="EnsureDataFolder" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="ProtectTokenFolder" After="ProtectDataFolder" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="SetServiceFailureActions" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="SetServicePrivileges" After="SetServiceFailureActions" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RemoveProgramFolder" After="RemoveFiles"
               Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND INSTALLFOLDER ~= BOP_DEFAULT_INSTALLFOLDER" />
       <Custom Action="RemoveDataFolder" After="RemoveProgramFolder"
@@ -114,8 +159,8 @@
                                 Name="Blue Onyx Prism ([PORT])"
                                 Protocol="tcp"
                                 Port="[PORT]"
-                                Scope="any"
-                                Profile="all" />
+                                Scope="localSubnet"
+                                Profile="[BOP_FIREWALL_PROFILES]" />
       </Component>
 
       <Component Id="CliComponent" Bitness="always64">
@@ -160,15 +205,11 @@
     </ComponentGroup>
 
     <!-- Data folder (config, models, cache, logs): Permanent, so an upgrade keeps it; a full
-         uninstall deletes it (RemoveDataFolder above) unless KEEPDATA. LocalService gets Modify,
-         Administrators and SYSTEM full control; everything below inherits it. -->
+         uninstall deletes it (RemoveDataFolder above) unless KEEPDATA. ProtectDataFolder above sets
+         its DACL; everything below inherits it. -->
     <ComponentGroup Id="DataFolder" Directory="DATADIR">
       <Component Id="DataDirComponent" Guid="2D8F6A14-5B7C-4E39-A0D1-93C4E7B15F68" Bitness="always64" Permanent="yes">
-        <CreateFolder>
-          <util:PermissionEx User="Administrators" GenericAll="yes" />
-          <util:PermissionEx User="LocalSystem" GenericAll="yes" />
-          <util:PermissionEx User="LocalService" GenericRead="yes" GenericWrite="yes" GenericExecute="yes" Delete="yes" />
-        </CreateFolder>
+        <CreateFolder />
       </Component>
     </ComponentGroup>
 

@@ -171,8 +171,9 @@ fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     ]
 }
 
-/// The administration routes: loopback clients only unless `allow_remote_admin`
-/// ([`admin_only`]), and no cross-site state changes ([`guard::csrf`]).
+/// The administration routes: loopback clients only unless `allow_remote_admin`, under an IP
+/// address, `localhost` or an `allowed_hosts` name ([`admin_only`]), and no cross-site state
+/// changes ([`guard::csrf`]).
 fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     vec![
         ("/v1/resources", get(resources_json)),
@@ -526,9 +527,10 @@ fn warn_local_proxy_once(flag: &std::sync::atomic::AtomicBool) -> bool {
     true
 }
 
-/// Middleware of the admin routes: 403 (an HTML page for browsers, else JSON) for a client
-/// that is not on this machine, unless `allow_remote_admin` is set (read per request, so it
-/// applies at once).
+/// Middleware of the admin routes, every method: 403 (an HTML page for browsers, else JSON) for
+/// a client that is not on this machine, unless `allow_remote_admin` is set, and for a request
+/// under a host name that could be a DNS rebinding ([`guard::foreign_host`]). Both settings are
+/// read per request, so they apply at once.
 pub(super) async fn admin_only(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -538,8 +540,15 @@ pub(super) async fn admin_only(
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0);
-    let allow_remote = state.config_read().allow_remote_admin;
+    let (allow_remote, foreign) = {
+        let c = state.config_read();
+        let foreign = guard::foreign_host(req.headers(), req.uri(), &c.allowed_hosts);
+        (c.allow_remote_admin, foreign)
+    };
     if admin_allowed(peer, allow_remote) {
+        if let Some(host) = foreign {
+            return guard::host_refused(req.headers(), req.uri().path(), &host);
+        }
         if !allow_remote && is_forwarded(req.headers()) {
             warn_local_proxy_once(&LOCAL_PROXY_WARNED);
         }
@@ -552,25 +561,7 @@ pub(super) async fn admin_only(
          \"allow_remote_admin\": true in the config (or start with --allow-remote-admin, or \
          check \"Allow remote administration\" on the Config page from this machine) to allow it."
     );
-    if wants_html(req.headers()) {
-        let page = MessageTemplate {
-            nav: "",
-            version: crate::VERSION,
-            heading: "Forbidden".into(),
-            message: msg,
-            refresh_secs: 0,
-            refresh_url: String::new(),
-            restarting: false,
-            generation: 0,
-        };
-        (StatusCode::FORBIDDEN, render(&page)).into_response()
-    } else {
-        (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
-        )
-            .into_response()
-    }
+    guard::forbidden(req.headers(), msg)
 }
 
 /// The process-wide router state: the generation (`AppState`) that is current. A generation
@@ -1228,6 +1219,162 @@ mod tests {
         }
     }
 
+    /// S1: a request as a DNS-rebound page makes it. The peer is this machine and `Origin`
+    /// matches `Host`, so only the `Host` itself gives it away.
+    fn with_host(mut req: Request<Body>, host: &str) -> Request<Body> {
+        req.headers_mut()
+            .insert(header::HOST, host.parse().unwrap());
+        let origin = format!("http://{host}");
+        req.headers_mut()
+            .insert(header::ORIGIN, origin.parse().unwrap());
+        req
+    }
+
+    /// S1: the admin routes refuse a DNS name they do not know, on every method, whatever the
+    /// peer, and the `Origin == Host` check alone would have let these through.
+    #[tokio::test]
+    async fn dns_rebound_admin_requests_are_refused() {
+        let state = test_state();
+        let rebound = "rebind.attacker.test:32168";
+        for (method, uri) in [
+            ("GET", "/config"),
+            ("POST", "/config"),
+            ("GET", "/logs"),
+            ("GET", "/dataset/image?path=x.jpg"),
+            ("POST", "/config/restart"),
+            ("GET", "/v1/fs/browse"),
+        ] {
+            for host in [rebound, "localhost.evil.test", "localhost.evil.test:32168"] {
+                let (s, h, b) =
+                    call(&state, with_host(from(LOCAL, method, uri, false), host)).await;
+                let body = String::from_utf8_lossy(&b).to_string();
+                assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri} {host}: {body}");
+                assert!(
+                    h[header::CONTENT_TYPE]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("application/json"),
+                    "{method} {uri}"
+                );
+                let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                assert_eq!(j["success"], false);
+                let msg = j["message"].as_str().unwrap();
+                assert_eq!(j["error"], msg);
+                assert!(msg.contains(host), "{msg}");
+                assert!(msg.contains("allowed_hosts"), "{msg}");
+            }
+            // Browsers get a page.
+            let (s, h, b) = call(&state, with_host(from(LOCAL, method, uri, true), rebound)).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert!(
+                h[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html")
+            );
+            assert!(String::from_utf8_lossy(&b).contains("allowed_hosts"));
+        }
+        assert_eq!(state.config_read().port, Config::default().port);
+        // `allow_remote_admin` does not lift it: the rebound browser may be on the LAN.
+        let open = test_state_with(|c| c.allow_remote_admin = true);
+        let req = with_host(from(REMOTE, "GET", "/config", false), rebound);
+        assert_eq!(call(&open, req).await.0, StatusCode::FORBIDDEN);
+        // A remote peer keeps its own message: the host name is not what it needs to fix.
+        let (s, _, b) = call(
+            &state,
+            with_host(from(REMOTE, "GET", "/config", false), rebound),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(&b).contains("your address"));
+    }
+
+    /// S1: IP literals, `localhost` and `allowed_hosts` names reach the handler.
+    #[tokio::test]
+    async fn admin_hosts_that_cannot_be_rebound_pass() {
+        let state = test_state();
+        for host in [
+            "localhost",
+            "localhost:32168",
+            "LOCALHOST.:32168",
+            "LocalHost.",
+            "127.0.0.1:32168",
+            "[::1]:32168",
+            "[::1]",
+        ] {
+            let req = with_host(from(LOCAL, "GET", "/config", false), host);
+            assert_eq!(call(&state, req).await.0, StatusCode::OK, "{host}");
+        }
+        // LAN administration by address, with a browser's matching Origin on a POST.
+        let lan = test_state_with(|c| c.allow_remote_admin = true);
+        for host in ["192.168.1.10:32168", "[fe80::1]:32168"] {
+            let req = with_host(from(REMOTE, "GET", "/config", false), host);
+            assert_eq!(call(&lan, req).await.0, StatusCode::OK, "{host}");
+        }
+        // A listed name, in any case, with or without a port or a trailing dot; its
+        // subdomains and other names stay out.
+        let named = test_state_with(|c| {
+            c.allow_remote_admin = true;
+            c.allowed_hosts = vec!["nas.home.arpa".into()];
+        });
+        for host in [
+            "nas.home.arpa",
+            "NAS.Home.Arpa:32168",
+            "nas.home.arpa.:32168",
+        ] {
+            let req = with_host(from(REMOTE, "GET", "/config", false), host);
+            assert_eq!(call(&named, req).await.0, StatusCode::OK, "{host}");
+        }
+        for host in ["x.nas.home.arpa", "nas.home.arpa.evil.test", "home.arpa"] {
+            let req = with_host(from(REMOTE, "GET", "/config", false), host);
+            assert_eq!(call(&named, req).await.0, StatusCode::FORBIDDEN, "{host}");
+        }
+    }
+
+    /// S1: a saved `allowed_hosts` is read per request, and the refusal never echoes more than
+    /// 100 characters of what the client sent.
+    #[tokio::test]
+    async fn allowed_hosts_apply_at_once_and_the_refusal_stays_short() {
+        let state = test_state();
+        let req = with_host(from(LOCAL, "GET", "/config", false), "nas.home.arpa");
+        assert_eq!(call(&state, req).await.0, StatusCode::FORBIDDEN);
+        let body = "allowed_hosts=nas.home.arpa";
+        let (s, _, b) = call(&state, post_form("/config", body, false)).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let req = with_host(from(LOCAL, "GET", "/config", false), "nas.home.arpa");
+        assert_eq!(call(&state, req).await.0, StatusCode::OK);
+
+        let long = format!("{}.test", "a".repeat(300));
+        let req = with_host(from(LOCAL, "GET", "/config", false), &long);
+        let (s, _, b) = call(&state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let text = String::from_utf8_lossy(&b);
+        assert!(text.contains(&"a".repeat(100)), "{text}");
+        assert!(!text.contains(&"a".repeat(101)), "{text}");
+    }
+
+    /// S1: the open routes do not look at `Host`; Blue Iris may use any name it likes.
+    #[tokio::test]
+    async fn open_routes_ignore_the_host() {
+        let state = test_state();
+        for host in [
+            "rebind.attacker.test:32168",
+            "blue-iris-target",
+            "localhost",
+        ] {
+            for (method, uri) in [
+                ("POST", "/v1/vision/detection"),
+                ("POST", "/v1/vision/custom/list"),
+                ("GET", "/v1/status"),
+                ("GET", "/stats.json"),
+            ] {
+                let (s, _, _) =
+                    call(&state, with_host(from(REMOTE, method, uri, false), host)).await;
+                assert_ne!(s, StatusCode::FORBIDDEN, "{method} {uri} {host}");
+            }
+        }
+    }
+
     /// SV-01: a state-changing admin request from another site is refused, same-origin and
     /// header-less ones reach the handler.
     #[tokio::test]
@@ -1383,6 +1530,26 @@ mod tests {
         let (_, _, b) = call(&state, from(REMOTE, "GET", "/v1/config", false)).await;
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(j["config"].is_object());
+    }
+
+    /// `GET /v1/config` is an open route with its own gate, so [`admin_only`] never sees it: a
+    /// rebound name gets the minimal answer of a stranger, even from this machine.
+    #[tokio::test]
+    async fn the_config_payload_is_not_served_to_a_rebound_name() {
+        let state = test_state();
+        let rebound = "rebind.attacker.test:32168";
+        let req = with_host(from(LOCAL, "GET", "/v1/config", false), rebound);
+        let (s, _, b) = call(&state, req).await;
+        assert_eq!(s, StatusCode::OK);
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(j.get("config").is_none() && j.get("path").is_none(), "{j}");
+        // The names an admin page is opened under keep the full payload.
+        for host in ["127.0.0.1:32168", "localhost:32168", "[::1]:32168"] {
+            let req = with_host(from(LOCAL, "GET", "/v1/config", false), host);
+            let (_, _, b) = call(&state, req).await;
+            let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            assert!(j["config"].is_object(), "{host}");
+        }
     }
 
     /// SV-09: security headers on every answer, CSP on pages, no-store on JSON, a fallback

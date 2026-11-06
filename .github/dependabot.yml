@@ -1,4 +1,9 @@
 version: 2
+# No `pip` entry: scripts/model-export/locks/*.txt come from `uv pip compile` for several platforms
+# (gen_locks.sh, gen_train_locks.sh: --python-platform, --exclude-newer, the PyTorch index with
+# `+cu126` builds) and are installed with --no-deps. Dependabot would change one line of one file,
+# without the transitive set, without the other platforms' locks, and without the PyTorch index.
+# Update them by regenerating, in a reviewed commit.
 updates:
   - package-ecosystem: cargo
     directory: /
@@ -14,3 +19,11 @@ updates:
     groups:
       actions-minor-patch:
         update-types: [minor, patch]
+  # Keeps the digests in the Dockerfile moving. The OpenVINO image's tag must equal
+  # OPENVINO_VERSION in src/resources/catalog/mod.rs, so it changes only with that pin, by hand.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: openvino/ubuntu24_runtime

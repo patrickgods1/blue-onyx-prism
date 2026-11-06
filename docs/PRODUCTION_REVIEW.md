@@ -3789,3 +3789,19 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | PL-12 | maintainability | 5 | fixed in phase 5: `cfg(test)` `Backend::Fake` (`backend/fake.rs`, scripted Ok/Fail/Hang/Panic steps, call log) + `Runtimes::fake`; `worker::run_tests` drives `spawn_worker` in-process: FIFO across slots, prep failure mid-queue, timeout before submit, shutdown with a busy slot, stuck inference -> Failed and recovery, dead session, per-request failure |
 | RS-13 | maintainability | 5 | fixed in phase 5: the temp name is `<full file name>.partial`; the tar entry-name error names the archive (`reading an entry name in ...`); tests for both (the tar error branch runs only on Windows) |
 | SV-16 | maintainability | 5 | fixed in phase 2: message.html passes values via data attributes |
+
+## November 2026 release review
+
+*Second review, 2026-11-06: design, speed, hardening, security, memory and release readiness of the code added since phase 5. IDs below continue this document's status table; the plan and full ranking were kept outside the repository.*
+
+| ID | area | status |
+|---|---|---|
+| RR-S1 | security | fixed: admin routes and `GET /v1/config` refuse a `Host` that is not an IP address, `localhost` or an `allowed_hosts` name (`guard::foreign_host`). DNS rebinding passed the peer check and `Origin == Host`; SV-01 fixed cross-site requests only |
+| RR-S2 | security | fixed: `download_dir`, `onnxruntime_dir` and `openvino_dir` choose libraries the service loads, so they are config-file or CLI only; only `ORT_DYLIB_PATH` may name a file |
+| RR-S3 | security | mitigated: RR-S2 removes the path from a local user to code running as the service. Admin routes stay open to loopback, so another local account can still read frames and change ordinary settings. No browser check can tell a browser from a local program |
+| RR-S4 | security | open: `allow_remote_admin` needs a token |
+| RR-S5 | security | fixed: paths starting with two separators of either kind are refused (`\/host`, `/\host`) |
+| RR-S6 | security | fixed in code, proved only by the Windows `packaging` job: MSI protected DACL, `SeChangeNotifyPrivilege` only, firewall rule on the local subnet, Domain and Private profiles |
+| RR-S7 | security | fixed: uploads have a 10 s read deadline and a per-address limit on bodies still arriving; total requests from one Blue Iris are never capped |
+| RR-S8 | security | fixed: protected DACL on `tools\hf`; a failed token rename leaves no temp copy |
+| RR-S9 | security | partly fixed: URL import refuses internal addresses and hosts, by name and after resolving; a redirect to one is not covered, yt-dlp follows redirects itself. Review `out_dir` and `dir` use `allowed_folder`. Docker bases pinned by digest. Dependabot alerts are a repository setting and still off; the hashed pip locks are not suited to Dependabot |

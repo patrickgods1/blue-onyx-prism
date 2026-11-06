@@ -1027,7 +1027,7 @@ dialog, like the source path.
 |---|---|---|
 | A video (`.mp4`, `.mkv`, `.avi`, `.mov`), an image, or a folder of them | `--path`; the page's *Browse...* lists folders and videos (`GET /v1/fs/browse?kind=video`). Folders are walked 6 levels deep, up to 20 000 files. | You confirm it (`--confirm-license`; default text "own footage") |
 | Blue Iris clip and alert folders | the same `--path`: `Cam.20240315_083012.mp4` clips and `Cam.20240315_083012.123456.jpg` alert snapshots. The camera folder and the recording time come from the file name. `.bvr` clips cannot be read (Blue Iris's own format): they are counted and the report says to export them to MP4 in Blue Iris. | You confirm it |
-| A video URL | `--url`, downloaded with yt-dlp (pinned in the environment): no playlists, no live streams, a video-only format up to 1080 p (so no ffmpeg binary is needed to merge streams), at most 2 GB. What the site reports (title, uploader, page URL, licence) goes into the provenance next to your confirmation; a different site licence is a warning. | `--license` (required) and `--confirm-license` |
+| A video URL | `--url`, downloaded with yt-dlp (pinned in the environment): loopback, private and other internal addresses are refused, by name and after resolving it (a redirect to one is not checked, because yt-dlp follows redirects itself); no playlists, no live streams, a video-only format up to 1080 p (so no ffmpeg binary is needed to merge streams), at most 2 GB. What the site reports (title, uploader, page URL, licence) goes into the provenance next to your confirmation; a different site licence is a warning. | `--license` (required) and `--confirm-license` |
 | Pinned open footage | `--dataset meva-sample`: six five-minute MEVA clips (Kitware / IARPA, mevadata.org, **CC BY 4.0**; fixed outdoor cameras: a night IR camera, two thermal cameras, a lit night camera, two day cameras; 307 MB), SHA-256 pinned, downloaded by the download manager into `<data root>/train-data/meva-sample`. Frames carry the attribution. The full MEVA corpus (328 h, 516 GB, `s3://mevadata-public-01/drops-123-r13/`) is not pinned; more clips can be added to the catalog the same way. | Pinned (CC BY 4.0) |
 
 **Refused**: URLs of sites that list unsecured or private cameras without their owners' consent
@@ -1507,7 +1507,8 @@ use and warns when `HF_TOKEN` hides a saved login. `blue-onyx-prism hf-logout` d
 
 **Service accounts.** `hf auth login` alone does not reach a service: the `hf` tool exists only after the
 training environment is built, and a service account cannot read your profile's login file. Run the
-app's own `hf-login` as the account that runs the service, with the service's config:
+app's own `hf-login` as the account that runs the service, with the service's config: (on Windows it gives
+`tools\hf` a protected ACL: Administrators, SYSTEM, you, and the service account read-only; a failure is a warning):
 
 - Windows, MSI install (service runs as LocalService): an elevated PowerShell (Run as administrator) and
   the command the page shows, which names the installed `blue-onyx-prism.exe` by full path and passes

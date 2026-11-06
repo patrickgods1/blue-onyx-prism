@@ -12,16 +12,19 @@
 # (e.g. -v $PWD/models:/app/models) replaces them with your own. `-p 127.0.0.1:...` keeps the port
 # on this host; for a Blue Iris on another machine use `-p 32168:32168` (see README, Docker).
 
-FROM rust:1-bookworm AS builder
+# Base images are pinned by digest, the tag next to it says what it was; dependabot moves the
+# digests (.github/dependabot.yml). Multi-arch index of rust:1-bookworm, read 2026-11-06.
+FROM rust:1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked
 
 # Builder glibc 2.36 (bookworm) <= runtime glibc 2.39 (ubuntu24), so the binary runs unchanged.
-# Keep the tag equal to OPENVINO_VERSION in src/resources/catalog.rs.
+# Keep the tag equal to OPENVINO_VERSION in src/resources/catalog.rs, and update the digest with it.
 # openvino/ubuntu24_runtime ships the OpenVINO runtime, Intel compute runtime (OpenCL) and sets
 # INTEL_OPENVINO_DIR, which openvino-finder honours.
-FROM openvino/ubuntu24_runtime:2026.4.0
+# Manifest of openvino/ubuntu24_runtime:2026.4.0 (amd64 only), read 2026-11-06.
+FROM openvino/ubuntu24_runtime:2026.4.0@sha256:b326dcae9b91fa25f794a391d9953e65a65096597237e6de431116b184a01718
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

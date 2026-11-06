@@ -73,7 +73,7 @@ pub struct CoreOptions {
 /// Options for the ONNX Runtime library lookup (see `libs::find_onnxruntime`).
 #[derive(Debug, Clone, Default)]
 pub struct OrtOptions {
-    /// Config `onnxruntime_dir`: a directory holding the library, or the library file. None =
+    /// Config `onnxruntime_dir`: a directory holding the library. None =
     /// `ORT_DYLIB_PATH`, then `<exe_dir>/onnxruntime`.
     pub onnxruntime_dir: Option<PathBuf>,
     /// Install root searched after the explicit dir and `ORT_DYLIB_PATH` (active flavor, legacy

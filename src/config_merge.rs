@@ -180,6 +180,7 @@ fn global_label(k: &str) -> String {
         "port" => "Port".into(),
         "bind_address" => "Bind address".into(),
         "allow_remote_admin" => "Allow remote administration".into(),
+        "allowed_hosts" => "Allowed host names".into(),
         "request_timeout_secs" => "Request timeout".into(),
         "worker_queue_size" => "Worker queue size".into(),
         "device" => "Device".into(),
@@ -421,6 +422,7 @@ pub fn live_global(k: &str) -> bool {
             | "default_model"
             | "previous_default"
             | "allow_remote_admin"
+            | "allowed_hosts"
             | "request_timeout_secs"
             | "confidence_threshold"
             | "nms_iou"
