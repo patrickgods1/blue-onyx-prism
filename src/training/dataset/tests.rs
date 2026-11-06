@@ -2365,3 +2365,34 @@ fn a_prepared_dataset_reads_back() {
     assert_eq!(r.warnings, w.warnings);
     assert!(read_prepared(&out.0).is_err(), "no dataset.json");
 }
+
+#[test]
+fn a_label_file_that_cannot_be_read_never_means_no_objects() {
+    let t = tmp("unreadable-label");
+    flat_export(&t.0, &["person"], &[("a.jpg", "0 0.5 0.5 0.2 0.4\n", &[])]);
+    // Invalid UTF-8: the file is there, and holds boxes nobody can read now.
+    let label = t.0.join("labels/a.txt");
+    std::fs::write(&label, b"0 0.5 0.5 0.2 0.4\n\xff\n").unwrap();
+    let e = read_export(&t.0).unwrap_err();
+    assert!(format!("{e:#}").contains("a.txt"), "{e:#}");
+    // Not a file at all (the read fails with something else than NotFound).
+    std::fs::remove_file(&label).unwrap();
+    std::fs::create_dir(&label).unwrap();
+    let e = read_export(&t.0).unwrap_err();
+    assert!(format!("{e:#}").contains("a.txt"), "{e:#}");
+}
+
+#[test]
+fn a_missing_label_file_is_no_objects_only_outside_our_own_exports() {
+    let t = tmp("missing-label");
+    flat_export(&t.0, &["person"], &[("a.jpg", "0 0.5 0.5 0.2 0.4\n", &[])]);
+    std::fs::remove_file(t.0.join("labels/a.txt")).unwrap();
+    // Somebody's YOLO folder: a background image, with a warning, as before.
+    let s = read_export(&t.0).unwrap();
+    assert!(s.frames[0].boxes.is_empty());
+    assert!(s.warnings.iter().any(|w| w.contains("no label file")));
+    // Our export wrote a label file for every image, so this one was lost.
+    std::fs::write(t.0.join("export.json"), br#"{"formats":["yolo"]}"#).unwrap();
+    let e = read_export(&t.0).unwrap_err();
+    assert!(format!("{e:#}").contains("a.txt"), "{e:#}");
+}

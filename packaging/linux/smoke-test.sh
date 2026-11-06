@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # CI smoke test (ubuntu runner with sudo + systemd + docker): install the .deb, check user / unit /
-# HTTP / config; `apt remove` keeps only the data and the user; `apt purge` leaves nothing behind.
-# Then the .rpm: contents and scriptlets, and an install + `dnf remove` (which must leave nothing
-# behind: RPM has no purge) in a Fedora container.
+# HTTP / config; `apt remove` keeps only the data and the user, a seeded dataset file included; a
+# reinstall over them, with the user's uid changed, enables and starts the service and hands it the
+# data; `apt purge` leaves nothing behind. Then the .rpm: contents and scriptlets, and in a Fedora
+# container `dnf remove`, which keeps the same things (RPM has no purge), a reinstall the same way,
+# and the commands the erase prints, which must leave nothing behind.
 # Usage: packaging/linux/smoke-test.sh <file.deb> <file.rpm>
 set -euo pipefail
 
@@ -15,6 +17,11 @@ RPM="$(realpath "$2")"
 UNIT=blue-onyx-prism
 DATA=/var/lib/blue-onyx-prism
 CONFIG="$DATA/blue_onyx_prism_config.json"
+# Stands for what no download brings back (dataset frames, reviewed labels, training runs). In a
+# folder of its own: nothing the service prunes walks it.
+SEED="$DATA/dataset/smoke-test/frame.labels.json"
+# A uid no earlier blueonyx had: well below the 999 where system uids are handed out downwards.
+NEW_UID=900
 
 fail() { echo "SMOKE TEST FAILED: $*" >&2; sudo journalctl -u "$UNIT" --no-pager -n 50 || true; exit 1; }
 
@@ -28,38 +35,44 @@ id -u blueonyx >/dev/null 2>&1 || fail "user blueonyx missing"
 [ -f /opt/blue-onyx-prism/scripts/systemd_common.sh ] || fail "systemd_common.sh missing"
 [ -f /opt/blue-onyx-prism/scripts/train_model.py ] || fail "train_model.py missing"
 [ -f /usr/lib/systemd/system/$UNIT.service ] || fail "unit missing"
-systemctl is-enabled "$UNIT" >/dev/null || fail "unit not enabled"
 
-state=""
-for _ in $(seq 1 60); do
-  state="$(systemctl is-active "$UNIT" || true)"
-  [ "$state" = active ] && break
-  [ "$state" = activating ] || [ "$state" = active ] || break
-  sleep 1
-done
-[ "$state" = active ] || fail "unit state is '$state', expected active"
+# The unit is enabled and comes up ready without a restart.
+check_service() {
+  systemctl is-enabled "$UNIT" >/dev/null || fail "unit not enabled"
 
-code=""
-for _ in $(seq 1 120); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:32168/v1/status || true)"
-  case "$code" in 200 | 503) break ;; esac
-  sleep 1
-done
-case "$code" in 200 | 503) echo "status endpoint answered $code" ;; *) fail "/v1/status answered '$code'" ;; esac
+  local state=""
+  for _ in $(seq 1 60); do
+    state="$(systemctl is-active "$UNIT" || true)"
+    [ "$state" = active ] && break
+    [ "$state" = activating ] || [ "$state" = active ] || break
+    sleep 1
+  done
+  [ "$state" = active ] || fail "unit state is '$state', expected active"
 
-# Answering is not enough: the service must load the runtime it downloads and serve. A runtime
-# that cannot load (e.g. one built for a newer glibc) makes it exit and restart at every start,
-# while HTTP still answers between restarts.
-echo "== waiting until the service is ready (runtime + model downloaded, model compiled)"
-for _ in $(seq 1 180); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:32168/v1/status || true)"
-  [ "$code" = 200 ] && break
-  sleep 2
-done
-[ "$code" = 200 ] || fail "/v1/status not ready (200) within 6 min, last answer '$code'"
-restarts="$(systemctl show -p NRestarts --value "$UNIT")"
-[ "$restarts" = 0 ] || fail "the service restarted $restarts times"
-echo "service ready, no restarts"
+  local code=""
+  for _ in $(seq 1 120); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:32168/v1/status || true)"
+    case "$code" in 200 | 503) break ;; esac
+    sleep 1
+  done
+  case "$code" in 200 | 503) echo "status endpoint answered $code" ;; *) fail "/v1/status answered '$code'" ;; esac
+
+  # Answering is not enough: the service must load the runtime it downloads and serve. A runtime
+  # that cannot load (e.g. one built for a newer glibc) makes it exit and restart at every start,
+  # while HTTP still answers between restarts.
+  echo "== waiting until the service is ready (runtime + model downloaded, model compiled)"
+  for _ in $(seq 1 180); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:32168/v1/status || true)"
+    [ "$code" = 200 ] && break
+    sleep 2
+  done
+  [ "$code" = 200 ] || fail "/v1/status not ready (200) within 6 min, last answer '$code'"
+  local restarts
+  restarts="$(systemctl show -p NRestarts --value "$UNIT")"
+  [ "$restarts" = 0 ] || fail "the service restarted $restarts times"
+  echo "service ready, no restarts"
+}
+check_service
 
 sudo test -f "$CONFIG" || fail "config $CONFIG missing"
 [ "$(sudo stat -c %U:%G "$CONFIG")" = blueonyx:blueonyx ] || fail "config not owned by blueonyx"
@@ -73,8 +86,14 @@ if sudo grep -Eq '"(openvino_dir|onnxruntime_dir)": *"' "$CONFIG"; then fail "co
 orphans() { sudo find / -xdev \( -nouser -o -nogroup \) -not -path '/proc/*' 2>/dev/null | sort; }
 orphans_before="$(orphans)"
 # What the CLI creates when run from the program dir (config, downloads): not package files.
-sudo mkdir -p /opt/blue-onyx-prism/openvino
-sudo touch /opt/blue-onyx-prism/openvino/placeholder.so /opt/blue-onyx-prism/blue_onyx_prism_config.json
+add_cli_files() {
+  sudo mkdir -p /opt/blue-onyx-prism/openvino
+  sudo touch /opt/blue-onyx-prism/openvino/placeholder.so /opt/blue-onyx-prism/blue_onyx_prism_config.json
+}
+add_cli_files
+sudo install -d -o blueonyx -g blueonyx "$DATA/dataset" "$(dirname "$SEED")"
+sudo sh -c "echo 'reviewed labels' > '$SEED'"
+sudo chown blueonyx:blueonyx "$SEED"
 
 echo "== deb remove (keeps the data and the user)"
 sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y blue-onyx-prism
@@ -82,7 +101,19 @@ if systemctl is-active --quiet "$UNIT"; then fail "unit still active after remov
 [ ! -e /usr/lib/systemd/system/$UNIT.service ] || fail "unit file left behind by remove"
 [ ! -e /opt/blue-onyx-prism ] || fail "/opt/blue-onyx-prism left behind by remove"
 sudo test -f "$CONFIG" || fail "remove deleted the config (only purge may)"
+sudo test -f "$SEED" || fail "remove deleted $SEED (only purge may)"
 id -u blueonyx >/dev/null 2>&1 || fail "remove deleted the user (only purge may)"
+
+echo "== deb reinstall over the kept data, with the user's uid changed"
+# The user deleted by hand and made again: the service must own and read what the old uid wrote.
+sudo userdel blueonyx
+sudo useradd --system --uid "$NEW_UID" --user-group --no-create-home --home-dir "$DATA" --shell /usr/sbin/nologin blueonyx
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB"
+# dpkg calls this like an upgrade, but the removal disabled the unit.
+check_service
+[ "$(sudo stat -c %u "$SEED")" = "$NEW_UID" ] || fail "$SEED was not given to the new uid"
+[ "$(sudo cat "$SEED")" = "reviewed labels" ] || fail "$SEED changed over the reinstall"
+add_cli_files
 
 echo "== deb purge (leaves nothing behind)"
 sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y blue-onyx-prism
@@ -109,20 +140,49 @@ echo "$scripts" | grep -q 'pkg_scriptlet.sh post-install' || fail "rpm lacks the
 echo "$scripts" | grep -q 'pkg_scriptlet.sh pre-remove' || fail "rpm lacks the %preun scriptlet"
 rpm -qp --requires "$RPM" | grep -q systemd || fail "rpm does not require systemd"
 
-echo "== rpm install + dnf remove in Fedora (leaves nothing behind)"
+echo "== rpm install + dnf remove + reinstall in Fedora"
 # No systemd in the container: the scriptlets skip systemctl, the files and the user are real.
 FEDORA=fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814
 docker run --rm -v "${RPM%/*}:/pkg:ro" "$FEDORA" bash -euo pipefail -c '
   rpm=/pkg/'"${RPM##*/}"'
+  # Named here so the first dnf remove keeps it (it could go as an unused dependency otherwise).
+  dnf install -y -q shadow-utils
   dnf install -y -q "$rpm"
   id -u blueonyx >/dev/null || { echo "user blueonyx missing after install"; exit 1; }
   test -f /var/lib/blue-onyx-prism/blue_onyx_prism_config.json || { echo "config not seeded"; exit 1; }
   # What a running service and a CLI run from /opt would add.
-  install -d -o blueonyx -g blueonyx /var/lib/blue-onyx-prism/models
-  install -o blueonyx -g blueonyx /dev/null /var/lib/blue-onyx-prism/models/placeholder.onnx
+  data=/var/lib/blue-onyx-prism
+  seed='"$SEED"'
+  install -d -o blueonyx -g blueonyx "$data/models" "$data/dataset" "$(dirname "$seed")"
+  install -o blueonyx -g blueonyx /dev/null "$data/models/placeholder.onnx"
+  echo "reviewed labels" > "$seed" && chown blueonyx:blueonyx "$seed"
   mkdir -p /opt/blue-onyx-prism/openvino && touch /opt/blue-onyx-prism/openvino/placeholder.so
-  dnf remove -y -q blue-onyx-prism
+  dnf remove -y blue-onyx-prism
   ! rpm -q blue-onyx-prism >/dev/null || { echo "rpm still installed"; exit 1; }
+  [ ! -e /opt/blue-onyx-prism ] || { echo "/opt/blue-onyx-prism left behind by dnf remove"; exit 1; }
+  [ ! -e /usr/lib/sysusers.d/blue-onyx-prism.conf ] || { echo "sysusers file left behind"; exit 1; }
+  [ ! -e /usr/lib/systemd/system/blue-onyx-prism.service ] || { echo "unit left behind"; exit 1; }
+  test -f "$data/blue_onyx_prism_config.json" || { echo "dnf remove deleted the config"; exit 1; }
+  test -f "$seed" || { echo "dnf remove deleted $seed"; exit 1; }
+  test -f "$data/models/placeholder.onnx" || { echo "dnf remove deleted the models"; exit 1; }
+  id -u blueonyx >/dev/null || { echo "dnf remove deleted the user"; exit 1; }
+  left="$(find / -xdev \( -iname "*blue-onyx-prism*" -o -iname "*blueonyx*" \) -not -path "/pkg/*" -not -path "/proc/*" -not -path "$data" -not -path "$data/*" 2>/dev/null || true)"
+  [ -z "$left" ] || { echo "left behind by dnf remove, outside the data: $left"; exit 1; }
+
+  # A reinstall hands the data to the service user, also one with another uid (deleted by hand
+  # and made again).
+  userdel blueonyx
+  useradd --system --uid '"$NEW_UID"' --user-group --no-create-home --home-dir "$data" --shell /usr/sbin/nologin blueonyx
+  dnf install -y -q "$rpm"
+  [ "$(stat -c %u "$seed")" = '"$NEW_UID"' ] || { echo "$seed was not given to the new uid"; exit 1; }
+  [ "$(cat "$seed")" = "reviewed labels" ] || { echo "$seed changed over the reinstall"; exit 1; }
+
+  # rpm prints what a scriptlet prints: the erase says how to delete the data, and doing that
+  # leaves nothing behind.
+  out="$(rpm -e blue-onyx-prism)"
+  echo "$out"
+  echo "$out" | grep -qF "sudo rm -rf $data && sudo userdel blueonyx" || { echo "the erase did not print how to delete the data"; exit 1; }
+  rm -rf "$data" && userdel blueonyx
   ! id -u blueonyx >/dev/null 2>&1 || { echo "user blueonyx left behind"; exit 1; }
   ! getent group blueonyx >/dev/null || { echo "group blueonyx left behind"; exit 1; }
   left="$(find / -xdev \( -iname "*blue-onyx-prism*" -o -iname "*blueonyx*" \) -not -path "/pkg/*" -not -path "/proc/*" 2>/dev/null || true)"
@@ -130,7 +190,7 @@ docker run --rm -v "${RPM%/*}:/pkg:ro" "$FEDORA" bash -euo pipefail -c '
   # /pkg is the host folder mounted read-only (owned by the runner user, unknown in here).
   orphans="$(find / -xdev \( -nouser -o -nogroup \) -not -path "/proc/*" -not -path /pkg -not -path "/pkg/*" 2>/dev/null || true)"
   [ -z "$orphans" ] || { echo "files owned by the deleted user left behind: $orphans"; exit 1; }
-  echo "dnf remove left nothing behind"
+  echo "the printed commands left nothing behind"
 ' || fail "rpm install / remove in Fedora"
 
 echo "SMOKE TEST PASSED"

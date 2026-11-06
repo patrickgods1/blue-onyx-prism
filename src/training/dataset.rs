@@ -12,7 +12,8 @@
 //!      held-out images; scene / camera / date tags from a `manifest.json` (benchmark format) when
 //!      there is one.
 //!
-//!    A missing label file means "no objects" (the Ultralytics convention). `ignore.json`
+//!    A missing label file means "no objects" (the Ultralytics convention), except in a review
+//!    export, which writes one per image; a file that cannot be read is an error. `ignore.json`
 //!    ([`IgnoreFile`]) lists real objects not to train on (unsure, too small) and the frames with
 //!    nothing but parked-spot boxes; no file = none. `frames.json` ([`FrameNotes`]) names the
 //!    frames confirmed empty or accepted in bulk and `hard_negatives.json` the rejected boxes,
@@ -679,6 +680,19 @@ fn read_rejected(dir: &Path, warnings: &mut Vec<String>) -> BTreeSet<String> {
     }
 }
 
+/// Whether `dir` is a review export that holds a label file per image (an empty one for a frame
+/// without objects): its `export.json` lists the YOLO format. A file that cannot be read says
+/// nothing against it. Other YOLO folders may leave out the label files of background images.
+fn wrote_every_label(dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(dir.join("export.json")) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("formats")?.as_array().cloned())
+        .is_none_or(|formats| formats.iter().any(|f| f == "yolo"))
+}
+
 /// Read a review export / YOLO folder (see the module docs).
 pub fn read_export(dir: &Path) -> Result<Source> {
     if !dir.is_dir() {
@@ -755,6 +769,7 @@ pub fn read_export(dir: &Path) -> Result<Source> {
             entries.len()
         );
     }
+    let every_label_written = wrote_every_label(dir);
     let mut missing = 0usize;
     let mut frames = Vec::with_capacity(entries.len());
     for (img, label, split) in entries {
@@ -762,9 +777,27 @@ pub fn read_export(dir: &Path) -> Result<Source> {
             Ok(t) => {
                 parse_labels(&t, &classes).with_context(|| format!("in {}", label.display()))?
             }
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !every_label_written => {
                 missing += 1;
                 Vec::new()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+                "{} is missing, but this export wrote a label file for every image, so the \
+                 objects of {} are lost and it would train as empty; export the frames again \
+                 from the Dataset tab",
+                label.display(),
+                file_name(&img)
+            ),
+            // Unknown is not empty: its objects would train as background.
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "reading {}, so the objects of {} are unknown; check the file and its \
+                         permissions, or export the frames again from the Dataset tab",
+                        label.display(),
+                        file_name(&img)
+                    )
+                });
             }
         };
         let name = file_name(&img);

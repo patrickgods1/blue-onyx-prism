@@ -28,8 +28,10 @@ use super::layout::{self, Rel};
 use super::record::Record;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Version of the label file ([`LabelFile::version`]). Files of a newer version are skipped.
 pub const LABELS_VERSION: u32 = 1;
@@ -1236,14 +1238,153 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<LabelFile> {
 }
 
 /// Serializes label writes within the process (a save, an import and an auto-label run of the
-/// same frame). Not reentrant: only [`write`], [`update`] and [`write_checked`] take it.
+/// same frame). Not reentrant: only [`write_lock`] takes it.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn write_lock() -> std::sync::MutexGuard<'static, ()> {
-    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// The folder lock of a dataset, a zero-byte file never deleted: at the dataset's root, so day
+/// folders keep emptying for retention.
+const LOCK_FILE: &str = ".labels.lock";
+/// Longest wait for the folder lock. A write holds it for milliseconds, so running out means a
+/// stopped process or a share that never answers: saving wins over waiting.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+/// How long a folder whose lock failed goes without one before it is tried again, so a stuck lock
+/// costs one [`LOCK_WAIT`] and not one per write.
+const LOCK_RETRY: Duration = Duration::from_secs(60);
+/// Longest pause between tries of a held lock.
+const LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// Folders whose lock failed, with when: see [`LOCK_RETRY`]. A folder is listed from its first
+/// failure until a lock works there again, so it warns once.
+static NO_FOLDER_LOCK: std::sync::Mutex<BTreeMap<PathBuf, Instant>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// What [`write_lock`] holds, released on drop.
+struct WriteGuard {
+    /// Before `_process`: the folder lock goes first.
+    folder: Option<std::fs::File>,
+    _process: std::sync::MutexGuard<'static, ()>,
 }
 
-/// Write `f` to `path` atomically; the caller holds [`WRITE_LOCK`].
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        // Explicitly: a process spawning a child right now shares this open file until the
+        // child execs, and closing alone would leave the lock held for that moment
+        // (`TrainLock`'s history). An unlock acts on the shared open file.
+        if let Some(f) = &self.folder
+            && let Err(e) = fs4::FileExt::unlock(f)
+        {
+            tracing::debug!("labels: releasing the folder lock: {e}");
+        }
+    }
+}
+
+/// The dataset folder's [`LOCK_FILE`] for the label file at `path`; beside it when `path` is not
+/// in the layout (`<dir>/<scene>/<camera>/<date>/<file>`).
+fn lock_path(path: &Path) -> PathBuf {
+    let mut up = path.ancestors().skip(3);
+    let root = up
+        .next()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .filter(|n| layout::SCENES.contains(n))
+        .and_then(|_| up.next())
+        .or_else(|| path.parent())
+        .unwrap_or(Path::new("."));
+    root.join(LOCK_FILE)
+}
+
+/// Remember that `lock` failed; true the first time since a lock last worked there.
+fn folder_lock_failed(lock: &Path) -> bool {
+    let mut failed = NO_FOLDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    failed.insert(lock.to_path_buf(), Instant::now()).is_none()
+}
+
+/// Going on without the lock of `lock`: one warning per folder.
+fn without_folder_lock(lock: &Path, why: &str) {
+    if folder_lock_failed(lock) {
+        tracing::warn!(
+            "label files: {why}, so {} locks nothing for now (a network share or read-only \
+             folder, or a stopped process). Saves go on under this process's own lock; a \
+             `blue-onyx-prism train` command writing this folder at the same moment could \
+             overwrite one. Avoid running both, or move the folder to a local disk.",
+            lock.display()
+        );
+    }
+}
+
+fn open_lock(lock: &Path) -> std::io::Result<std::fs::File> {
+    let rw = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock);
+    match rw {
+        // Another account's lock file: a read handle locks as well.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::fs::File::open(lock).map_err(|_| e)
+        }
+        r => r,
+    }
+}
+
+/// The lock of the folder of the label file at `path`, waiting at most `wait`, or None to go on
+/// without it: another process writes the same files (`train autolabel` from the command line),
+/// but a lock that fails or never comes must not stop a save.
+fn folder_lock(path: &Path, wait: Duration) -> Option<std::fs::File> {
+    let lock = lock_path(path);
+    {
+        let failed = NO_FOLDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if failed.get(&lock).is_some_and(|t| t.elapsed() < LOCK_RETRY) {
+            return None;
+        }
+    }
+    let file = match open_lock(&lock) {
+        Ok(f) => f,
+        // No folder yet: the write itself says so.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            without_folder_lock(&lock, &format!("it cannot be opened ({e})"));
+            return None;
+        }
+    };
+    let start = Instant::now();
+    let mut pause = Duration::from_micros(100);
+    loop {
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => break,
+            Err(fs4::TryLockError::WouldBlock) if start.elapsed() < wait => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(LOCK_POLL);
+            }
+            Err(fs4::TryLockError::WouldBlock) => {
+                without_folder_lock(&lock, &format!("it stayed held for {wait:?}"));
+                return None;
+            }
+            Err(fs4::TryLockError::Error(e)) => {
+                without_folder_lock(&lock, &format!("it cannot be locked ({e})"));
+                return None;
+            }
+        }
+    }
+    NO_FOLDER_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&lock);
+    Some(file)
+}
+
+/// The label write lock for the file at `path`: [`WRITE_LOCK`], then the lock of its dataset
+/// folder. Held around one read-modify-rename only, never across a job.
+fn write_lock(path: &Path) -> WriteGuard {
+    let process = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    WriteGuard {
+        folder: folder_lock(path, LOCK_WAIT),
+        _process: process,
+    }
+}
+
+/// Write `f` to `path` atomically; the caller holds [`write_lock`].
 fn write_locked(path: &Path, f: &LabelFile) -> Result<()> {
     let mut text = serde_json::to_vec_pretty(f)?;
     text.push(b'\n');
@@ -1255,18 +1396,18 @@ fn write_locked(path: &Path, f: &LabelFile) -> Result<()> {
 
 /// Write `f` to `path` atomically (temporary file + rename).
 pub fn write(path: &Path, f: &LabelFile) -> Result<()> {
-    let _held = write_lock();
+    let _held = write_lock(path);
     write_locked(path, f)
 }
 
 /// Read-modify-write of the label file at `path` under the write lock: `f` gets the current
 /// file (None when there is none) and returns the file to write (None = leave it). Returns
-/// whether it wrote.
+/// whether it wrote. `f` holds up every writer of the folder, other processes too: keep it short.
 pub fn update(
     path: &Path,
     f: impl FnOnce(Option<LabelFile>) -> Result<Option<LabelFile>>,
 ) -> Result<bool> {
-    let _held = write_lock();
+    let _held = write_lock(path);
     match f(read(path)?)? {
         Some(new) => write_locked(path, &new).map(|()| true),
         None => Ok(false),
@@ -1277,7 +1418,7 @@ pub fn update(
 /// client read; `""` = it did not exist). `Ok(Err(current))` when it changed meanwhile:
 /// nothing is written.
 pub fn write_checked(path: &Path, f: &LabelFile, expected: &str) -> Result<Result<(), String>> {
-    let _held = write_lock();
+    let _held = write_lock(path);
     let current = revision(path)?;
     if current != expected {
         return Ok(Err(current));
@@ -1307,7 +1448,7 @@ pub fn is_protected(path: &Path) -> bool {
 /// Run `delete` under the write lock unless the label file at `path` is protected
 /// ([`is_protected`]; None then), so a save cannot land between the check and the delete.
 pub fn unless_protected<T>(path: &Path, delete: impl FnOnce() -> T) -> Option<T> {
-    let _held = write_lock();
+    let _held = write_lock(path);
     if is_protected(path) {
         return None;
     }
@@ -1319,10 +1460,38 @@ pub fn unless_protected<T>(path: &Path, delete: impl FnOnce() -> T) -> Option<T>
 /// Every label file under `dir` with its frame (`<scene>/<camera>/<date>/<stem>.jpg`), in day
 /// folder order then by name. Files whose frame image is gone are left out.
 pub fn label_files(dir: &Path) -> Vec<(String, PathBuf)> {
-    let mut out = Vec::new();
-    for day in layout::day_dirs(dir) {
-        let Ok(rd) = std::fs::read_dir(&day) else {
-            continue;
+    scan_labels(dir).files
+}
+
+/// What [`scan_labels`] found.
+#[derive(Debug, Default)]
+pub struct LabelScan {
+    /// Label files with their frame, as [`label_files`] lists them.
+    pub files: Vec<(String, PathBuf)>,
+    /// Label files whose frame image is gone, the same way.
+    pub orphans: Vec<(String, PathBuf)>,
+    /// Scene, camera and day folders that exist but could not be listed: their frames are in
+    /// neither list.
+    pub unreadable: Vec<PathBuf>,
+}
+
+/// The label files under `dir`, and what a caller that must not shrink silently (an export) has
+/// to tell about the ones it cannot use.
+pub fn scan_labels(dir: &Path) -> LabelScan {
+    let (days, unreadable) = layout::day_dirs_checked(dir);
+    let mut out = LabelScan {
+        unreadable,
+        ..LabelScan::default()
+    };
+    for day in days {
+        let rd = match std::fs::read_dir(&day) {
+            Ok(rd) => rd,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    out.unreadable.push(day);
+                }
+                continue;
+            }
         };
         let mut names: Vec<String> = rd
             .flatten()
@@ -1343,8 +1512,13 @@ pub fn label_files(dir: &Path) -> Vec<(String, PathBuf)> {
                 continue;
             };
             let rel = format!("{}/{stem}.jpg", rel_day.join("/"));
-            if layout::parse_rel(&rel).is_some() && day.join(format!("{stem}.jpg")).is_file() {
-                out.push((rel, day.join(n)));
+            if layout::parse_rel(&rel).is_none() {
+                continue;
+            }
+            if day.join(format!("{stem}.jpg")).is_file() {
+                out.files.push((rel, day.join(n)));
+            } else {
+                out.orphans.push((rel, day.join(n)));
             }
         }
     }
@@ -2600,6 +2774,217 @@ mod tests {
             path_of_frame(Path::new("d/x_1.jpg")),
             Path::new("d/x_1.labels.json")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A label file in the dataset layout under a new folder: (dataset folder, its path).
+    fn laid_out_label_file(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("bop-labels-{tag}-{}", uuid::Uuid::new_v4()));
+        let day = dir.join("ir/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        (dir, day.join(format!("x{LABELS_SUFFIX}")))
+    }
+
+    fn add_a_box(path: &Path) {
+        update(path, |cur| {
+            let mut f = cur.unwrap_or_default();
+            f.boxes.push(tests_support::auto_box("person"));
+            Ok(Some(f))
+        })
+        .unwrap();
+    }
+
+    /// The other process of [`two_processes_never_lose_each_others_writes`]; idle in a normal run.
+    #[test]
+    fn label_lock_child() {
+        if let (Ok(path), Ok(n)) = (
+            std::env::var("BOP_TEST_LABEL_LOCK_FILE"),
+            std::env::var("BOP_TEST_LABEL_LOCK_WRITES"),
+        ) {
+            for _ in 0..n.parse::<usize>().unwrap() {
+                add_a_box(Path::new(&path));
+            }
+        }
+    }
+
+    #[test]
+    fn two_processes_never_lose_each_others_writes() {
+        const WRITES: usize = 150;
+        let (dir, path) = laid_out_label_file("two-processes");
+        let children: Vec<_> = (0..2)
+            .map(|_| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["collect::labels::tests::label_lock_child", "--exact"])
+                    .env("BOP_TEST_LABEL_LOCK_FILE", &path)
+                    .env("BOP_TEST_LABEL_LOCK_WRITES", WRITES.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for mut c in children {
+            assert!(c.wait().unwrap().success());
+        }
+        let boxes = read(&path).unwrap().unwrap().boxes.len();
+        assert_eq!(boxes, 2 * WRITES, "writes of the other process were lost");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_write_waits_for_the_lock_another_handle_holds() {
+        let (dir, path) = laid_out_label_file("two-handles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = std::fs::File::create(dir.join(".labels.lock")).unwrap();
+        fs4::FileExt::try_lock(&held).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            add_a_box(&p);
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the write went past a held lock"
+        );
+        fs4::FileExt::unlock(&held).unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(read(&path).unwrap().unwrap().boxes.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_lock_sits_at_the_dataset_root_whatever_the_day() {
+        let root = Path::new("data").join("dataset");
+        let label = root.join("ir/cam/2026-10-22/x.labels.json");
+        assert_eq!(lock_path(&label), root.join(LOCK_FILE));
+        let label = root.join("day/ir/2026-10-22/x.labels.json");
+        assert_eq!(lock_path(&label), root.join(LOCK_FILE), "a camera named ir");
+        // Outside the layout: beside the file.
+        let flat = Path::new("some").join("where").join("x.labels.json");
+        assert_eq!(
+            lock_path(&flat),
+            Path::new("some").join("where").join(LOCK_FILE)
+        );
+    }
+
+    #[test]
+    fn a_save_goes_on_where_locks_fail_and_warns_once() {
+        let (dir, path) = laid_out_label_file("no-lock");
+        // Something at the lock's path that cannot be opened as a file.
+        std::fs::create_dir(dir.join(LOCK_FILE)).unwrap();
+        add_a_box(&path);
+        add_a_box(&path);
+        assert_eq!(read(&path).unwrap().unwrap().boxes.len(), 2);
+        // The folder is remembered, so the warning above was the only one.
+        assert!(!folder_lock_failed(&lock_path(&path)));
+        let revision = revision(&path).unwrap();
+        write_checked(&path, &LabelFile::default(), &revision)
+            .unwrap()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_dataset_root_still_saves_in_a_writable_day_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, path) = laid_out_label_file("read-only-root");
+        let mode = |m: u32| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&dir, mode(0o555)).unwrap();
+        let denied = std::fs::File::create(dir.join("probe")).is_err();
+        add_a_box(&path);
+        std::fs::set_permissions(&dir, mode(0o755)).unwrap();
+        assert_eq!(read(&path).unwrap().unwrap().boxes.len(), 1);
+        // Root writes anywhere: then the lock simply worked.
+        if denied {
+            assert!(!folder_lock_failed(&lock_path(&path)), "remembered");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_lock_held_too_long_gives_way_to_the_save_and_comes_back() {
+        let (dir, path) = laid_out_label_file("held");
+        let lock = lock_path(&path);
+        let held = std::fs::File::create(&lock).unwrap();
+        fs4::FileExt::try_lock(&held).unwrap();
+        let wait = Duration::from_millis(30);
+        let start = Instant::now();
+        assert!(folder_lock(&path, wait).is_none());
+        assert!(start.elapsed() >= wait);
+        // Only one wait: the next write goes straight on.
+        let start = Instant::now();
+        assert!(folder_lock(&path, Duration::from_secs(5)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        add_a_box(&path);
+        // Past the retry time, and the holder gone, the lock works again.
+        fs4::FileExt::unlock(&held).unwrap();
+        NO_FOLDER_LOCK
+            .lock()
+            .unwrap()
+            .insert(lock.clone(), Instant::now() - 2 * LOCK_RETRY);
+        assert!(folder_lock(&path, wait).is_some());
+        assert!(!NO_FOLDER_LOCK.lock().unwrap().contains_key(&lock));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `TrainLock`'s history: a child spawned at that moment shares the lock's open file until it
+    /// execs, so a lock released by closing alone can look held. Run without the guard's unlock,
+    /// this fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_spawned_at_the_wrong_moment_does_not_keep_the_lock() {
+        let (dir, path) = laid_out_label_file("fork");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut held = 0;
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                s.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/bin/sh")
+                            .args(["-c", "true"])
+                            .status();
+                    }
+                });
+            }
+            for _ in 0..5000 {
+                let guard = WriteGuard {
+                    folder: folder_lock(&path, Duration::ZERO),
+                    _process: WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+                };
+                if guard.folder.is_none() {
+                    held += 1;
+                    // Back on the lock for the next round.
+                    NO_FOLDER_LOCK.lock().unwrap().remove(&lock_path(&path));
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(
+            held, 0,
+            "of 5000 locks taken at once, this many looked held"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// EACCES on the folder must not read as a camera with no spot memory: the next write would
+    /// forget its parked spots.
+    #[cfg(unix)]
+    #[test]
+    fn a_spots_store_that_cannot_be_reached_is_an_error_not_an_empty_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _) = laid_out_label_file("spots");
+        let folder = dir.join(spots::SPOTS_DIR);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("cam.json"), b"{}").unwrap();
+        let mode = |m: u32| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&folder, mode(0o000)).unwrap();
+        let denied = std::fs::read_dir(&folder).is_err();
+        let read = spots::read(&dir, "cam");
+        std::fs::set_permissions(&folder, mode(0o755)).unwrap();
+        // Root reads everything: nothing to show then.
+        assert!(!denied || read.is_err(), "{read:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

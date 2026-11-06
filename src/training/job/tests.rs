@@ -1176,6 +1176,44 @@ fn the_queue_moves_to_another_training_folder_only_when_idle() {
     svc.shutdown();
 }
 
+/// The run form of `a_cancel_that_read_queued_just_before_the_start_is_not_lost`: a cancel that
+/// lost the race must stop the trainer, and the record must not say Cancelled while it runs on.
+#[test]
+fn a_cancel_racing_the_start_of_a_run_stops_it() {
+    let t = tmp("cancel-race");
+    let fake = Arc::new(TrainFake {
+        hang: true,
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(t.0.join("runs.json")),
+    );
+    let mut a = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    a.run_dir = t.0.join("a");
+    let mut b = job(&t.0, TrainFamily::Yolo26, "s", mps(), Platform::MACOS_ARM64);
+    b.run_dir = t.0.join("b");
+    let ida = svc.enqueue(a).unwrap();
+    let idb = svc.enqueue(b).unwrap();
+    let running = |id: &str| svc.get(id).is_some_and(|r| r.state == RunState::Running);
+    let until = |id: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !running(id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        running(id)
+    };
+    assert!(until(&ida), "the first run never started");
+    assert!(svc.cancel_queued_run(&ida));
+    // The queue is free only once the trainer stopped.
+    assert!(until(&idb), "the first run is still training");
+    svc.cancel(&idb);
+    svc.wait(&idb, Duration::from_secs(10)).unwrap();
+    svc.shutdown();
+}
+
 #[test]
 fn a_failed_benchmark_keeps_the_model() {
     let t = tmp("bench");
@@ -1885,4 +1923,263 @@ fn remove_with_files_deletes_only_after_its_checks() {
     .unwrap();
     assert!(!r.run_dir.exists());
     assert!(svc.get(&id).is_none());
+}
+
+/// [`Hooks::register`] failing as a `save_config` on a full disk does.
+struct RegisterFails;
+
+impl Hooks for RegisterFails {
+    fn register(&self, _: &TrainOutput) -> Result<String> {
+        bail!("writing config: no space left on device")
+    }
+    fn benchmark(
+        &self,
+        _: &TrainOutput,
+        _: &[String],
+        _: &[String],
+        _: &AtomicBool,
+    ) -> Result<Option<BenchSummary>> {
+        panic!("a model that is not registered is not benchmarked")
+    }
+}
+
+#[test]
+fn a_failed_register_keeps_the_output_and_the_checkpoints() {
+    let t = tmp("register-fails");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let work = j.run_dir.join("work");
+    let store = t.0.join("training").join("runs.json");
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(RegisterFails),
+        Some(store.clone()),
+    );
+    let id = svc.enqueue(j).unwrap();
+    let r = svc.wait(&id, Duration::from_secs(30)).unwrap();
+    svc.shutdown();
+    assert_eq!(r.state, RunState::Failed, "{}", r.describe());
+    assert_eq!(r.stage, Some(TrainStage::Register));
+    let o = r.output.as_ref().expect("the installed model is on record");
+    assert!(o.onnx.is_file());
+    let text = r.describe();
+    assert!(text.contains("no space left"), "{text}");
+    assert!(text.contains(&o.onnx.display().to_string()), "{text}");
+    assert!(text.contains("Add a model by path"), "{text}");
+    assert!(!text.contains("Retry export"), "nothing to export: {text}");
+    assert!(work.join("run/weights/best.pt").is_file(), "work is kept");
+    // On disk at once, so a crash right after the install cannot lose it either.
+    let saved = service::load_records(&store);
+    assert_eq!(saved[0].output.as_ref(), Some(o));
+}
+
+#[test]
+fn a_cancel_right_after_the_install_keeps_the_model_on_record() {
+    let t = tmp("cancel-installed");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = TrainFake {
+        checkpoint: true,
+        ..TrainFake::new()
+    };
+    let cancel = AtomicBool::new(false);
+    let hooks = RecHooks::default();
+    let mut recorded = None;
+    let r = run_training(
+        &j,
+        &fake,
+        &fake,
+        &hooks,
+        &mut |p| match p {
+            TrainReport::Installed(o) => recorded = Some(o.clone()),
+            TrainReport::Stage {
+                stage: TrainStage::Install,
+                percent: 100,
+                ..
+            } => cancel.store(true, Ordering::Relaxed),
+            _ => {}
+        },
+        &cancel,
+    );
+    assert!(r.unwrap_err().cancelled);
+    assert!(hooks.registered.lock().unwrap().is_empty());
+    let o = recorded.expect("reported before the cancel could land");
+    assert_eq!(o.onnx, j.install_dir().join(format!("{}.onnx", j.name)));
+    assert!(o.onnx.is_file());
+    assert!(
+        j.run_dir.join("work/run/weights/best.pt").is_file(),
+        "a run not registered keeps its work"
+    );
+}
+
+#[test]
+fn a_copy_never_writes_under_the_final_name() {
+    let t = tmp("copy");
+    // No such file: the rename fails, as across volumes, and the copy seam runs.
+    let from = t.0.join("staging").join("m.onnx");
+    let to = t.0.join("models").join("m.onnx");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    let copied_to = Mutex::new(None);
+    // Dies half way, as a crash or a full disk does: what it wrote must not look like the model.
+    let dying = |_: &Path, dst: &Path| -> std::io::Result<u64> {
+        *copied_to.lock().unwrap() = Some(dst.to_path_buf());
+        std::fs::write(dst, b"half a model")?;
+        assert!(!to.exists(), "a crash here leaves {} partial", to.display());
+        Err(std::io::Error::other("no space left on device"))
+    };
+    let e = format!("{:#}", move_file(&from, &to, dying).unwrap_err());
+    assert!(e.contains("no space left"), "{e}");
+    let dst = copied_to.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        dst.parent(),
+        to.parent(),
+        "same folder: the rename is atomic"
+    );
+    assert_eq!(
+        std::fs::read_dir(to.parent().unwrap()).unwrap().count(),
+        0,
+        "a failed copy leaves nothing"
+    );
+}
+
+#[test]
+fn a_copy_lands_under_the_final_name_complete() {
+    let t = tmp("copy-ok");
+    let to = t.0.join("m.onnx");
+    let copy = |_: &Path, dst: &Path| -> std::io::Result<u64> {
+        assert_ne!(dst, to);
+        std::fs::write(dst, b"the whole model")?;
+        Ok(15)
+    };
+    move_file(&t.0.join("no-such-file"), &to, copy).unwrap();
+    assert_eq!(std::fs::read(&to).unwrap(), b"the whole model");
+    assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 1, "no temporary");
+    // On one volume it is a plain rename, and the copy never runs.
+    let moved = t.0.join("moved.onnx");
+    let never = |_: &Path, _: &Path| -> std::io::Result<u64> { panic!("renamed") };
+    move_file(&to, &moved, never).unwrap();
+    assert!(moved.is_file() && !to.exists());
+}
+
+/// A failed or cancelled run can hold a model nobody can reach any other way: the text says where
+/// it is, whatever the record went through.
+#[test]
+fn the_record_of_an_unregistered_model_says_what_to_do() {
+    let t = tmp("record-text");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let store = t.0.join("runs.json");
+    let fake = Arc::new(TrainFake::new());
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(store.clone()),
+    );
+    let id = svc.enqueue(j).unwrap();
+    let mut rec = svc.wait(&id, Duration::from_secs(30)).unwrap();
+    svc.shutdown();
+    assert_eq!(rec.state, RunState::Done, "{}", rec.describe());
+    let onnx = rec.output.as_ref().unwrap().onnx.display().to_string();
+
+    // Cancelled before register, then after it.
+    rec.state = RunState::Cancelled;
+    rec.registered = None;
+    let text = rec.describe();
+    assert!(
+        text.contains(&onnx) && text.contains("Add a model by path"),
+        "{text}"
+    );
+    rec.registered = Some("added".into());
+    let text = rec.describe();
+    assert!(text.contains("is in the config"), "{text}");
+
+    // Interrupted at each of those points, and before the install.
+    let reload = |r: &service::RunRecord| {
+        let mut r = r.clone();
+        r.state = RunState::Running;
+        std::fs::write(&store, serde_json::to_vec(&vec![r]).unwrap()).unwrap();
+        service::load_records(&store).remove(0).error.unwrap()
+    };
+    assert!(reload(&rec).contains("only its benchmark"));
+    rec.registered = None;
+    let text = reload(&rec);
+    assert!(
+        text.contains(&onnx) && text.contains("Add a model by path"),
+        "{text}"
+    );
+    rec.output = None;
+    assert!(reload(&rec).contains("Retry export"));
+}
+
+/// A cancel past the register stops the benchmark and nothing else. For a retry that means there
+/// is no failure left to go back to.
+#[test]
+fn a_cancel_during_the_benchmark_keeps_the_registered_model() {
+    struct CancelledBench(Arc<Mutex<Option<String>>>);
+    impl Hooks for CancelledBench {
+        fn register(&self, _: &TrainOutput) -> Result<String> {
+            Ok("added to the config".into())
+        }
+        fn benchmark(
+            &self,
+            _: &TrainOutput,
+            _: &[String],
+            _: &[String],
+            _: &AtomicBool,
+        ) -> Result<Option<BenchSummary>> {
+            *self.0.lock().unwrap() = Some("benchmark".into());
+            Err(anyhow!(Cancelled))
+        }
+    }
+    let t = tmp("cancel-bench");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let run_dir = j.run_dir.clone();
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        ..TrainFake::new()
+    });
+    let hooks = CancelledBench(Arc::default());
+    let seen = hooks.0.clone();
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(hooks), None);
+    let id = svc.enqueue(j).unwrap();
+    let r = svc.wait(&id, Duration::from_secs(30)).unwrap();
+    assert!(seen.lock().unwrap().is_some());
+    assert_eq!(r.state, RunState::Cancelled, "{}", r.describe());
+    assert!(r.output.is_some());
+    assert_eq!(r.registered.as_deref(), Some("added to the config"));
+    assert!(
+        r.describe().contains("is in the config"),
+        "{}",
+        r.describe()
+    );
+    assert!(
+        !run_dir.join("work").exists(),
+        "registered: its work is done"
+    );
+    svc.shutdown();
+
+    let t = tmp("cancel-bench-retry");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        export_fails: vec!["RuntimeError: disagree"],
+        ..TrainFake::new()
+    });
+    let hooks = CancelledBench(Arc::default());
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(hooks), None);
+    let again = retry_of(&j);
+    let id = svc.enqueue(j).unwrap();
+    assert_eq!(
+        svc.wait(&id, Duration::from_secs(30)).unwrap().state,
+        RunState::Failed
+    );
+    svc.enqueue_retry(again).unwrap();
+    let r = svc.wait(&id, Duration::from_secs(30)).unwrap();
+    svc.shutdown();
+    assert_eq!(r.state, RunState::Cancelled, "{}", r.describe());
+    assert!(r.output.is_some());
+    assert!(!r.retrying);
 }

@@ -13,11 +13,13 @@
 //! ([`Hooks::benchmark`] on the held-out `dir:` set; a failure there is reported but does not
 //! undo the model). Cancellation kills the child's process tree (the runner's job).
 //!
-//! The checkpoints (`<run>/work`) go once the model is installed, or when the run is cancelled. A
-//! failed run keeps them: training and export share one process, so a late failure would otherwise
-//! cost the whole training. [`TrainJob::export_only`] exports such a run again ([`super::retry`]):
-//! setup, self-check, then only the export and the stages after it. A run out of memory restarts
-//! only while that costs little ([`keeps_checkpoints`]).
+//! The installed model goes on the run's record at once ([`TrainReport::Installed`]): from then on
+//! the run owns a file that blocks its name, however it ends. The checkpoints (`<run>/work`) go once
+//! the model is registered, or when the run is cancelled before it installed. A failed run keeps
+//! them: training and export share one process, so a late failure would otherwise cost the whole
+//! training. [`TrainJob::export_only`] exports such a run again ([`super::retry`]): setup,
+//! self-check, then only the export and the stages after it. A run out of memory restarts only
+//! while that costs little ([`keeps_checkpoints`]).
 
 use super::capability::Accelerator;
 use super::dataset::{self, Prepared, SceneFilter};
@@ -260,6 +262,10 @@ pub enum TrainReport<'a> {
     /// The trainer ran out of GPU memory early and the run restarts at this batch
     /// ([`OOM_RETRIES`]); the run record keeps the batch it finishes with.
     Batch(u32),
+    /// The model is in the install folder: the record names it before anything else can fail.
+    Installed(&'a TrainOutput),
+    /// [`Hooks::register`] added it to the config; its message.
+    Registered(&'a str),
 }
 
 /// The installed model.
@@ -444,9 +450,20 @@ pub const MPS_WATERMARKS: [(&str, &str); 2] = [
 /// Longest export of an export-only run: minutes on a CPU, so this only catches a hang.
 const EXPORT_ONLY_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 
+/// What a run that installed `o` but did not register it tells the user: Retry export has nothing
+/// to do there, and the file refuses the name to a new run.
+pub fn not_in_config(o: &TrainOutput) -> String {
+    format!(
+        "The model is installed as {} but is not in the config: add it on the Config page (Add a \
+         model by path), or delete it to train under that name again",
+        o.onnx.display()
+    )
+}
+
 /// Run every stage of `job` (see the module docs). A failure names the checkpoint left behind, if
-/// any; a cancelled training takes its checkpoints along, a cancelled retry keeps them (the failed
-/// run it came from is still there to retry).
+/// any, or the model that was installed but not registered; a cancelled training takes its
+/// checkpoints along, a cancelled retry keeps them (the failed run it came from is still there to
+/// retry), and so does a run cancelled with a model not registered.
 pub fn run_training(
     job: &TrainJob,
     runner: &dyn CommandRunner,
@@ -456,19 +473,28 @@ pub fn run_training(
     cancel: &AtomicBool,
 ) -> Result<RunOutcome, TrainError> {
     let mut stage = None;
-    let r = stages(job, runner, fetcher, hooks, report, cancel, &mut stage);
+    let mut unregistered = None;
+    let mut watch = |p: TrainReport<'_>| {
+        match &p {
+            TrainReport::Installed(o) => unregistered = Some(not_in_config(o)),
+            TrainReport::Registered(_) => unregistered = None,
+            _ => {}
+        }
+        report(p);
+    };
+    let r = stages(job, runner, fetcher, hooks, &mut watch, cancel, &mut stage);
     r.map_err(|e| {
         let cancelled = e.downcast_ref::<Cancelled>().is_some() || cancel.load(Ordering::Relaxed);
         let work = super::retry::work_dir(&job.run_dir);
-        if cancelled && !job.keep_work && job.export_only.is_none() {
+        if cancelled && !job.keep_work && job.export_only.is_none() && unregistered.is_none() {
             let _ = manager::remove_any(&work);
         }
         TrainError {
             stage,
-            message: if cancelled {
-                "cancelled".into()
-            } else {
-                format!("{e:#}{}", kept_note(job, &work))
+            message: match &unregistered {
+                _ if cancelled => "cancelled".into(),
+                Some(note) => format!("{e:#}. {note}"),
+                None => format!("{e:#}{}", kept_note(job, &work)),
             },
             cancelled,
         }
@@ -1231,8 +1257,8 @@ struct Finish<'a> {
 }
 
 impl Finish<'_> {
-    /// Check the script's report, install (the checkpoints go then: the model is safe), register
-    /// and benchmark.
+    /// Check the script's report, install (on the record at once), register (the checkpoints go
+    /// then: nothing is left to redo) and benchmark.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -1251,14 +1277,6 @@ impl Finish<'_> {
             cancel,
         } = *self;
         let family = recipe.family;
-        let mut enter = |stage: TrainStage, percent: u8, detail: &str| {
-            *current = Some(stage);
-            report(TrainReport::Stage {
-                stage,
-                percent,
-                detail,
-            });
-        };
         let Some(TrainEvent::Done {
             family: fam,
             classes,
@@ -1290,7 +1308,13 @@ impl Finish<'_> {
         };
 
         // 6. Install.
-        enter(TrainStage::Install, 0, "checking the output");
+        enter(
+            current,
+            report,
+            TrainStage::Install,
+            0,
+            "checking the output",
+        );
         let installed = install(
             job,
             recipe,
@@ -1303,21 +1327,35 @@ impl Finish<'_> {
         );
         let _ = manager::remove_any(staging);
         let output = installed.map_err(|e| explain_full_disk(e, job.install_dir()))?;
-        if !job.keep_work {
-            let _ = manager::remove_any(&super::retry::work_dir(&job.run_dir));
-        }
-        enter(TrainStage::Install, 100, &output.onnx.display().to_string());
+        report(TrainReport::Installed(&output));
+        enter(
+            current,
+            report,
+            TrainStage::Install,
+            100,
+            &output.onnx.display().to_string(),
+        );
         check(cancel)?;
 
         // 7. Register.
-        enter(TrainStage::Register, 0, &output.name);
+        enter(current, report, TrainStage::Register, 0, &output.name);
         let registered = hooks.register(&output)?;
-        enter(TrainStage::Register, 100, &registered);
+        report(TrainReport::Registered(&registered));
+        if !job.keep_work {
+            let _ = manager::remove_any(&super::retry::work_dir(&job.run_dir));
+        }
+        enter(current, report, TrainStage::Register, 100, &registered);
 
         // 8. Benchmark (best effort).
         let (benchmark, benchmark_error) =
             if output.heldout.is_some() || !job.request.benchmark_sets.is_empty() {
-                enter(TrainStage::Benchmark, 0, "waiting for the benchmark runner");
+                enter(
+                    current,
+                    report,
+                    TrainStage::Benchmark,
+                    0,
+                    "waiting for the benchmark runner",
+                );
                 match hooks.benchmark(
                     &output,
                     &job.request.benchmark_sets,
@@ -1338,6 +1376,8 @@ impl Finish<'_> {
         // 8b. The current default on the same frames (best effort too).
         let baseline = if benchmark.is_some() {
             enter(
+                current,
+                report,
                 TrainStage::Benchmark,
                 50,
                 "comparing with the default model",
@@ -1363,7 +1403,7 @@ impl Finish<'_> {
         } else {
             None
         };
-        enter(TrainStage::Benchmark, 100, "done");
+        enter(current, report, TrainStage::Benchmark, 100, "done");
         Ok(RunOutcome {
             output,
             prepared,
@@ -1373,6 +1413,22 @@ impl Finish<'_> {
             baseline,
         })
     }
+}
+
+/// Report `stage` and remember it as the one a failure happens in.
+fn enter(
+    current: &mut Option<TrainStage>,
+    report: &mut dyn FnMut(TrainReport<'_>),
+    stage: TrainStage,
+    percent: u8,
+    detail: &str,
+) {
+    *current = Some(stage);
+    report(TrainReport::Stage {
+        stage,
+        percent,
+        detail,
+    });
 }
 
 /// What the failure messages call a training run ([`env::explain_train_failure`]).
@@ -1559,6 +1615,35 @@ pub struct BaseWeights {
     pub files: Vec<(String, String)>,
 }
 
+/// Move `a` to `b`: a rename, else (another volume) `copy` to a temporary name in `b`'s folder,
+/// flushed and renamed into place. `b` is complete or absent: a partial `.onnx` would pass for the
+/// model and refuse its name to the next run. A crash in the copy leaves only a hidden
+/// `.<name>.<uuid>.tmp`.
+fn move_file(
+    a: &Path,
+    b: &Path,
+    copy: impl Fn(&Path, &Path) -> std::io::Result<u64>,
+) -> Result<()> {
+    if std::fs::rename(a, b).is_ok() {
+        return Ok(());
+    }
+    let name = b.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = b.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let copied = copy(a, &tmp)
+        .and_then(|_| {
+            // Opened to write: flushing a read-only handle fails on Windows.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)?
+                .sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, b));
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    copied.with_context(|| format!("moving {} to {}", a.display(), b.display()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install(
     job: &TrainJob,
@@ -1632,16 +1717,9 @@ fn install(
             dst_onnx.display()
         );
     }
-    let mv = |a: &Path, b: &Path| -> Result<()> {
-        if std::fs::rename(a, b).is_ok() {
-            return Ok(());
-        }
-        std::fs::copy(a, b)
-            .map(|_| ())
-            .with_context(|| format!("moving {} to {}", a.display(), b.display()))
-    };
+    let mv = |a: &Path, b: &Path| move_file(a, b, |from, to| std::fs::copy(from, to));
     // `.yaml` and the provenance first, the `.onnx` (what makes the model present) last.
-    std::fs::write(&dst_prov, serde_json::to_vec_pretty(&prov)?)
+    crate::collect::layout::write_atomic(&dst_prov, &serde_json::to_vec_pretty(&prov)?)
         .with_context(|| format!("writing {}", dst_prov.display()))?;
     let r = mv(&src_yaml, &dst_yaml).and_then(|()| mv(&src_onnx, &dst_onnx));
     if let Err(e) = r {

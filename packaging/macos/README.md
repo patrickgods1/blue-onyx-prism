@@ -10,7 +10,7 @@ Unsigned arm64 `.pkg` that installs the same layout as `scripts/install_launchd.
   (`bop_tray_start` in `scripts/launchd_common.sh`); the preinstall stops it before an upgrade
 - uninstaller: `/Applications/Uninstall Blue Onyx Prism.app` (compiled from `uninstaller.applescript` with
   `osacompile`, ad-hoc signed, bundle id `com.blueonyx.prism.uninstaller`, not relocatable)
-- data: `/usr/local/var/blue-onyx-prism` (config, models, cache, downloads), owned by the role account `_blueonyx`
+- data: `/usr/local/var/blue-onyx-prism` (config, models, cache, downloads, dataset, reviewed labels, training runs), owned by the role account `_blueonyx`
 - logs: `/var/log/blue-onyx-prism` (rotated through `/etc/newsyslog.d/blue-onyx-prism.conf`)
 - daemon: `/Library/LaunchDaemons/com.blueonyx.prism.plist`
 
@@ -28,7 +28,8 @@ packaging/macos/build-pkg.sh <version> <bin-dir> blue-onyx-prism-<version>-macos
 `productbuild` and `osacompile`; the postinstall helpers come from `scripts/launchd_common.sh`.
 
 Test on a macOS machine with sudo: `packaging/macos/smoke-test.sh <pkg>` (installs, waits for
-`/v1/status`, checks the uninstaller and menu bar apps and the LaunchAgent, uninstalls keeping the data, then purges).
+`/v1/status`, checks the uninstaller and menu bar apps and the LaunchAgent, uninstalls keeping the data, reinstalls over it
+with the account's id changed, then purges).
 
 ## Install an unsigned package
 
@@ -40,12 +41,22 @@ After install open http://127.0.0.1:32168/ (status and configuration).
 
 ## Uninstall
 
-Open *Uninstall Blue Onyx Prism* in Applications, choose *Keep My Data* or *Delete Everything*,
-and enter an administrator password. The app only runs the script below as root; from Terminal:
+Open *Uninstall Blue Onyx Prism* in Applications, choose *Keep My Data* (the default button) or
+*Delete Everything*, and enter an administrator password. The app only runs the script below as
+root; from Terminal:
 
 ```sh
 sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh            # keep data, logs, account
 sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh --purge    # also delete them
+```
+
+The data root holds the config, models and, unless they were pointed elsewhere, the dataset, reviewed
+labels and training runs, which no download brings back. A reinstall picks it up, and the postinstall
+hands the data root and the log dir to `_blueonyx` when the account's id changed. Keeping the data
+also removes the script itself, so it prints what deletes them later:
+
+```sh
+sudo rm -rf /usr/local/var/blue-onyx-prism /var/log/blue-onyx-prism; sudo dscl . -delete /Users/_blueonyx; sudo dscl . -delete /Groups/_blueonyx
 ```
 
 The script stops the daemon and removes its plist, the newsyslog entry, the installer receipt

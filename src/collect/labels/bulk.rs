@@ -555,53 +555,62 @@ fn edit_listed(
 }
 
 /// Accept one frame the queue listed as eligible: re-checked under the write lock (it may have
-/// changed since), saved as reviewed ([`super::normalize`]) with `bulk_accepted`; a pending box
-/// stacked on a better one is rejected as a duplicate rather than accepted
-/// ([`stacks::reject_pending_stacked`]). `Ok(None)` when it is not eligible any more, else the
-/// boxes it accepted.
+/// changed since), its pending boxes of unwanted classes rejected first ([`reject_other_class`]:
+/// a bulk accept must not turn them into labels), saved as reviewed ([`super::normalize`]) with
+/// `bulk_accepted`; a pending box stacked on a better one is rejected as a duplicate rather than
+/// accepted ([`stacks::reject_pending_stacked`]). `Ok(None)` when it is not eligible (any more),
+/// also when the rejects left nothing to accept: those stay written, the frame unreviewed. Else
+/// the boxes it accepted.
 fn accept_frame(
     dir: &Path,
     rel: &str,
-    classes: &[String],
+    wanted: &Wanted<'_>,
     now: &str,
 ) -> anyhow::Result<Option<usize>> {
     let frame = Frame::resolve(dir, rel).ok_or_else(|| anyhow::anyhow!("the frame is gone"))?;
     let rec = frame.record()?;
-    let mut boxes = 0;
-    let wrote = super::update(&frame.labels, |cur| {
+    let mut accepted = None;
+    super::update(&frame.labels, |cur| {
         let Some(mut f) = cur.filter(super::auto_accept_eligible) else {
             return Ok(None);
         };
-        let wanted = Wanted {
-            classes,
-            hidden: &[],
-        };
-        stacks::reject_pending_stacked(&mut f, &wanted);
-        boxes = f
-            .boxes
-            .iter()
-            .filter(|b| {
-                b.state == BoxState::Pending && super::resolve_pending(b) == BoxState::Accepted
-            })
-            .count();
+        let (rejected, renamed) = reject_other_class(&mut f, wanted);
+        if !super::auto_accept_eligible(&f) {
+            return Ok((rejected + renamed > 0).then_some(f));
+        }
+        stacks::reject_pending_stacked(&mut f, wanted);
+        accepted = Some(
+            f.boxes
+                .iter()
+                .filter(|b| {
+                    b.state == BoxState::Pending && super::resolve_pending(b) == BoxState::Accepted
+                })
+                .count(),
+        );
         f.status = Status::Reviewed;
-        let mut n = super::normalize(f, classes, rec.width, rec.height, now)?;
+        let mut n = super::normalize(f, wanted.classes, rec.width, rec.height, now)?;
         n.bulk_accepted = true;
         Ok(Some(n))
     })?;
-    Ok(wrote.then_some(boxes))
+    Ok(accepted)
 }
 
 /// Accept one eligible frame (see [`bulk_accept`]); `Ok(false)` when it is not eligible (any
 /// more).
 pub fn accept_one(dir: &Path, rel: &str, classes: &[String], now: &str) -> anyhow::Result<bool> {
-    accept_frame(dir, rel, classes, now).map(|n| n.is_some())
+    let wanted = Wanted {
+        classes,
+        hidden: &[],
+    };
+    accept_frame(dir, rel, &wanted, now).map(|n| n.is_some())
 }
 
 /// Save the unreviewed frames of `dir` whose auto-label triage alone settles them
 /// ([`super::auto_accept_eligible`]; `filters` with status and `auto` forced to unreviewed /
 /// accept) and that `keep` selects as reviewed with `bulk_accepted`, at most `limit` in queue
-/// order, the labels checked against `classes` at time `now`. `dry_run` only counts.
+/// order, the labels checked against `classes` at time `now`. Pending boxes of classes that map
+/// to none of `classes`, or of the hidden classes `filters.wanted` names (the caller's live
+/// `collect.hidden_classes`), are rejected, not accepted ([`accept_frame`]). `dry_run` only counts.
 pub fn bulk_accept(
     dir: &Path,
     filters: &Filters,
@@ -633,15 +642,23 @@ pub fn bulk_accept(
             .collect();
         return out;
     }
+    let wanted = Wanted {
+        classes,
+        hidden: f
+            .wanted
+            .as_ref()
+            .map_or(&[], |(_, hidden)| hidden.as_slice()),
+    };
     for rel in eligible.into_iter().take(limit) {
-        match accept_frame(dir, rel, classes, now) {
+        match accept_frame(dir, rel, &wanted, now) {
             Ok(Some(n)) => {
                 out.boxes += n;
                 out.done(rel);
             }
             Ok(None) => out.failed(
                 rel,
-                "it changed since the list was built and needs a look; review it by hand",
+                "it changed since the list was built, or holds nothing wanted to accept, and \
+                 needs a look; review it by hand",
             ),
             Err(e) => out.failed(rel, &format!("{e:#}")),
         }
@@ -1995,6 +2012,55 @@ mod tests {
         super::super::write(&frame.labels, &l).unwrap();
         let o = bulk_accept_repeats(&dir, &f, &classes, 500, "t", false, &|_| true);
         assert_eq!(o.done_count, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bulk_accept_rejects_hidden_and_unlisted_boxes_instead_of_accepting_them() {
+        let dir = std::env::temp_dir().join(format!("bop-bulk-{}", uuid::Uuid::new_v4()));
+        let classes = vec!["person".to_string(), "car".to_string(), "cat".to_string()];
+        let hidden = vec!["cat".to_string()];
+        // Far apart so that no box is a duplicate of another.
+        let at = |label: &str, x: f32| {
+            let mut b = auto_box(label, 0.9, Triage::Accept);
+            b.bbox = [x, 2.0, x + 10.0, 40.0];
+            b
+        };
+        let mixed = put_frame(
+            &dir,
+            "mixed",
+            None,
+            vec![at("person", 1.0), at("cat", 20.0), at("clock", 40.0)],
+        );
+        let only = put_frame(&dir, "only", None, vec![at("cat", 1.0)]);
+        let filters = Filters {
+            source: queue::QueueSource::All,
+            wanted: Some((classes.clone(), hidden.clone())),
+            ..Filters::default()
+        };
+        let o = bulk_accept(&dir, &filters, &classes, 10, "t", false, &|_| true);
+        // Nothing wanted left to accept: the box is rejected, the frame waits for a reviewer.
+        let f = labels_of(&dir, &only);
+        assert_eq!(f.status, Status::Unreviewed);
+        assert_eq!(f.boxes[0].state, BoxState::Rejected);
+        assert_eq!(o.done_count, 1, "{:?}", o.failed);
+        assert_eq!(o.boxes, 1, "the person only");
+        assert_eq!(o.failed_count, 1, "{:?}", o.failed);
+        let f = labels_of(&dir, &mixed);
+        assert_eq!(f.status, Status::Reviewed);
+        let got: Vec<(BoxState, Option<&str>)> = f
+            .boxes
+            .iter()
+            .map(|b| (b.state, b.reason.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (BoxState::Accepted, None),
+                (BoxState::Rejected, Some(OTHER_CLASS_REASON)),
+                (BoxState::Rejected, Some(OTHER_CLASS_REASON)),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

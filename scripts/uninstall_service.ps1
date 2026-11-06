@@ -3,6 +3,11 @@
 .SYNOPSIS
     Removes the Blue Onyx Prism Windows service, its event log source and firewall rule, and
     restores the ServicesPipeTimeout that install_service.ps1 recorded before raising it.
+.DESCRIPTION
+    Keeps the data, like every uninstall of this program. Here it sits in the install folder with
+    the program (config, models, downloads, and by default the dataset, reviewed labels and
+    training runs), so there is no switch that removes only the data: the script prints that
+    folder and the command that deletes it. A dir the config names outside it stays too.
 #>
 param([int]$Port = 32168)
 
@@ -72,5 +77,7 @@ try {
     }
 } catch { Write-Warning "Could not remove event log source: $_" }
 
-Write-Host "Done. The install dir keeps its ACL (Administrators/SYSTEM full, Users read) and data;"
-Write-Host "delete the folder to remove everything."
+$InstallDir = Split-Path -Parent $PSScriptRoot
+Write-Host "Done. Kept $InstallDir with its ACL (Administrators/SYSTEM full, Users read): the program, config,"
+Write-Host "models, downloads, dataset, reviewed labels and training runs. To delete all of it, from another folder:"
+Write-Host "  Remove-Item -LiteralPath '$InstallDir' -Recurse -Force"

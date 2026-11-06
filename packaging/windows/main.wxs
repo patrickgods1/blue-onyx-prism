@@ -21,9 +21,12 @@
     <Icon Id="AppIcon.ico" SourceFile="$(var.RepoRoot)\assets\favicon.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
 
-    <!-- Public properties (msiexec /i blue-onyx-prism.msi PORT=32169). KEEPDATA=1 on uninstall
-         (msiexec /x blue-onyx-prism.msi KEEPDATA=1) keeps C:\ProgramData\BlueOnyxPrism. -->
+    <!-- Public properties (msiexec /i blue-onyx-prism.msi PORT=32169). An uninstall keeps
+         C:\ProgramData\BlueOnyxPrism; REMOVEDATA=1 on uninstall (msiexec /x blue-onyx-prism.msi
+         REMOVEDATA=1) deletes it. KEEPDATA=1 asked for the keeping before it became the default:
+         it is still accepted, for old scripts, and wins over REMOVEDATA=1. -->
     <Property Id="PORT" Value="32168" Secure="yes" />
+    <Property Id="REMOVEDATA" Secure="yes" />
     <Property Id="KEEPDATA" Secure="yes" />
     <!-- Firewall profiles, NET_FW_PROFILE2 bits: domain (1) + private (2). The Profile attribute
          names one profile or "all", so the mask comes through a property: the extension's custom
@@ -86,8 +89,9 @@
          folder property ends in a backslash, which would escape the closing quote. Runs on every
          install, repair and upgrade, so an upgrade corrects the ACL of an older install.
          EnsureDataFolder: the folder is a Permanent component, and a failing icacls stops the
-         install, so its existence is not left to how CreateFolders treats a folder that a full
-         uninstall deleted. An existing folder makes mkdir fail, which is ignored. -->
+         install, so its existence is not left to how CreateFolders treats a folder that an
+         uninstall with REMOVEDATA=1 deleted. An existing folder makes mkdir fail, which is
+         ignored. -->
     <CustomAction Id="EnsureDataFolder"
                   Directory="CommonAppDataFolder"
                   ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c mkdir &quot;[CommonAppDataFolder]BlueOnyxPrism&quot;"
@@ -104,12 +108,14 @@
                   Directory="CommonAppDataFolder"
                   ExeCommand="&quot;[System64Folder]icacls.exe&quot; &quot;[CommonAppDataFolder]BlueOnyxPrism\tools\hf&quot; /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-19:(OI)(CI)RX /Q"
                   Execute="deferred" Impersonate="no" Return="ignore" />
-    <!-- A full uninstall (not the removal of the old version during an upgrade) leaves nothing
-         behind: it deletes the data folder (config, downloaded runtimes and models, cache, logs,
-         tools) unless KEEPDATA is set, and the program folder with whatever the program created
-         in it (e.g. a config or downloads of the console exe run from there) when it is the
-         default folder. A folder the user picked may hold other files: there only the MSI's own
-         files go. Return="ignore": a file that cannot be deleted never blocks the uninstall. -->
+    <!-- An uninstall (not the removal of the old version during an upgrade) deletes the program
+         folder with whatever the program created in it (e.g. a config or downloads of the console
+         exe run from there) when it is the default folder. A folder the user picked may hold
+         other files: there only the MSI's own files go. The data folder (config, downloaded
+         runtimes and models, cache, logs, tools, and by default the dataset, reviewed labels and
+         training runs, which no download brings back) stays, and a reinstall picks it up. Only
+         exactly REMOVEDATA=1 deletes it, and KEEPDATA=1 wins over it: a bare REMOVEDATA would also be true for
+         REMOVEDATA=0. Return="ignore": a file that cannot be deleted never blocks the uninstall. -->
     <SetProperty Id="BOP_DEFAULT_INSTALLFOLDER" Value="[ProgramFiles64Folder]Blue Onyx Prism\" After="CostFinalize" Sequence="execute" />
     <CustomAction Id="RemoveProgramFolder"
                   Directory="CommonAppDataFolder"
@@ -128,7 +134,7 @@
       <Custom Action="RemoveProgramFolder" After="RemoveFiles"
               Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND INSTALLFOLDER ~= BOP_DEFAULT_INSTALLFOLDER" />
       <Custom Action="RemoveDataFolder" After="RemoveProgramFolder"
-              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT KEEPDATA" />
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND REMOVEDATA=&quot;1&quot; AND NOT KEEPDATA" />
     </InstallExecuteSequence>
 
     <!-- Program files and the service -->
@@ -204,9 +210,10 @@
       </Component>
     </ComponentGroup>
 
-    <!-- Data folder (config, models, cache, logs): Permanent, so an upgrade keeps it; a full
-         uninstall deletes it (RemoveDataFolder above) unless KEEPDATA. ProtectDataFolder above sets
-         its DACL; everything below inherits it. -->
+    <!-- Data folder (config, models, cache, logs, dataset, training runs): Permanent, so an
+         upgrade and an uninstall keep it; only REMOVEDATA=1 deletes it (RemoveDataFolder above).
+         ProtectDataFolder above sets its DACL on every install, a reinstall over a kept folder
+         included; everything below inherits it. -->
     <ComponentGroup Id="DataFolder" Directory="DATADIR">
       <Component Id="DataDirComponent" Guid="2D8F6A14-5B7C-4E39-A0D1-93C4E7B15F68" Bitness="always64" Permanent="yes">
         <CreateFolder />

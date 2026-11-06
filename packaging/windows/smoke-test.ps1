@@ -2,10 +2,12 @@
 <#
 .SYNOPSIS
     Install / run / uninstall smoke test for the Blue Onyx Prism MSI (CI; modifies the machine).
-    Installs three times: a plain uninstall must leave nothing behind; one with KEEPDATA=1 keeps
-    only the data folder; an install over data with an older version's ACL corrects it. Each
-    install also checks the data folder's DACL, the service's required privileges and the firewall
-    rule's scope and profiles.
+    Installs four times: an uninstall with REMOVEDATA=1 must leave nothing behind; a plain one
+    keeps only the data folder, a seeded dataset file included; an install over that data with an
+    older version's ACL corrects it, and KEEPDATA=1 (old scripts) keeps it again, even with REMOVEDATA=1; a last install
+    over it and REMOVEDATA=1 removes everything, the protected token folder too. Each install also
+    checks the data folder's DACL, the service's required privileges and the firewall rule's scope
+    and profiles.
 .PARAMETER Msi
     Path of the MSI to test.
 .PARAMETER Port
@@ -31,6 +33,10 @@ $Service = "BlueOnyxPrismService"
 $DataDir = Join-Path $env:ProgramData "BlueOnyxPrism"
 $Config = Join-Path $DataDir "blue_onyx_prism_config_service.json"
 $TokenDir = Join-Path $DataDir "tools\hf"
+# Stands for what no download brings back (dataset frames, reviewed labels, training runs). In a
+# folder of its own: nothing the service prunes walks it.
+$SeedFile = Join-Path $DataDir "dataset\smoke-test\frame.labels.json"
+$SeedText = "reviewed labels"
 $InstallLog = Join-Path (Get-Location) "msi-install.log"
 $UninstallLog = Join-Path (Get-Location) "msi-uninstall.log"
 
@@ -238,11 +244,22 @@ function Install-AndCheck([string]$Log) {
     Set-Content -Path (Join-Path $ProgDir "blue_onyx_prism_config.json") -Value "{}"
 }
 
-function Uninstall-AndCheck([string]$Log, [bool]$KeepData) {
-    Write-Host "Uninstalling (KEEPDATA=$KeepData) ..."
-    $msiArgs = @("/x", "`"$Msi`"", "/qn", "/l*v", "`"$Log`"")
-    if ($KeepData) { $msiArgs += "KEEPDATA=1" }
-    $rc = Run-Msiexec $msiArgs
+function Set-SeedFile {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $SeedFile) | Out-Null
+    Set-Content -Path $SeedFile -Value $SeedText
+}
+
+function Assert-DataKept([string]$Log) {
+    if (-not (Test-Path $Config)) { Fail "$Config was removed" @($Log) }
+    if (-not (Test-Path $SeedFile)) { Fail "$SeedFile was removed" @($Log) }
+    if ((Get-Content -Path $SeedFile -Raw).Trim() -cne $SeedText) { Fail "$SeedFile was changed" @($Log) }
+    Write-Host "Data folder kept: config and the seeded dataset file are there."
+}
+
+# $Properties: what is passed to msiexec. Only REMOVEDATA=1 may delete the data folder.
+function Uninstall-AndCheck([string]$Log, [string[]]$Properties = @()) {
+    Write-Host "Uninstalling ($($Properties -join ' ')) ..."
+    $rc = Run-Msiexec (@("/x", "`"$Msi`"", "/qn", "/l*v", "`"$Log`"") + $Properties)
     if ($rc -ne 0 -and $rc -ne 3010) { Fail "msiexec /x exited with $rc" @($Log) }
 
     $deadline = (Get-Date).AddSeconds(30)
@@ -262,27 +279,31 @@ function Uninstall-AndCheck([string]$Log, [bool]$KeepData) {
     $arp = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
         Where-Object { $_.PSObject.Properties["DisplayName"] -and $_.DisplayName -like "Blue Onyx Prism*" }
     if ($arp) { Fail "Apps & features entry still present after uninstall" @($Log) }
-    if ($KeepData) {
-        if (-not (Test-Path $Config)) { Fail "$Config was removed by an uninstall with KEEPDATA=1" @($Log) }
-        Write-Host "Data folder kept with KEEPDATA=1."
+    if ($Properties -contains "KEEPDATA=1" -or $Properties -notcontains "REMOVEDATA=1") {
+        Assert-DataKept $Log
     } elseif (Test-Path $DataDir) {
         $left = (Get-ChildItem -Path $DataDir -Recurse -Force | Select-Object -First 20 | ForEach-Object { $_.FullName }) -join ", "
         Fail "$DataDir still present after uninstall ($left)" @($Log)
     }
 }
 
-# 1. Plain uninstall: nothing may be left behind.
+# 1. REMOVEDATA=1: nothing may be left behind.
 Install-AndCheck $InstallLog
-Uninstall-AndCheck $UninstallLog $false
-# 2. KEEPDATA=1: only the data folder stays.
+Uninstall-AndCheck $UninstallLog @("REMOVEDATA=1")
+# 2. Over the deleted folder, then a plain uninstall, as from Settings > Apps: only the data stays.
 Install-AndCheck (Join-Path (Get-Location) "msi-install-2.log")
-Uninstall-AndCheck (Join-Path (Get-Location) "msi-uninstall-keepdata.log") $true
-# 3. Over that data, with an older version's ACL: the install corrects it, and the full uninstall
-# still removes the protected token folder.
+Set-SeedFile
+Uninstall-AndCheck (Join-Path (Get-Location) "msi-uninstall-default.log")
+# 3. Over that data, with an older version's ACL: the install corrects it and keeps the data. Then
+# what an old script passes, and a REMOVEDATA that is not 1: both keep it.
 Set-OlderVersionData
 $Log3 = Join-Path (Get-Location) "msi-install-3.log"
 Install-AndCheck $Log3
+Assert-DataKept $Log3
 Assert-TokenFolderProtected $Log3
-Uninstall-AndCheck (Join-Path (Get-Location) "msi-uninstall-3.log") $false
+Uninstall-AndCheck (Join-Path (Get-Location) "msi-uninstall-keepdata.log") @("KEEPDATA=1", "REMOVEDATA=1")
+# 4. REMOVEDATA=1 also removes the protected token folder.
+Install-AndCheck (Join-Path (Get-Location) "msi-install-4.log")
+Uninstall-AndCheck (Join-Path (Get-Location) "msi-uninstall-removedata.log") @("REMOVEDATA=1")
 
-Write-Host "SMOKE TEST PASSED (a full uninstall leaves nothing behind; KEEPDATA=1 keeps only the data folder; an older ACL is corrected)."
+Write-Host "SMOKE TEST PASSED (a plain uninstall and KEEPDATA=1 keep only the data folder; a reinstall keeps its data and corrects an older ACL; REMOVEDATA=1 leaves nothing behind)."

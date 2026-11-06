@@ -113,6 +113,8 @@ pub(crate) struct Summary {
     pub(crate) can_train: bool,
     /// This machine can run the open-vocabulary labelers.
     pub(crate) can_autolabel: bool,
+    /// Why the folder under review cannot be used (an unplugged drive), as the page words it.
+    pub(crate) folder_problem: Option<String>,
 }
 
 /// The one suggested action: a plain sentence, the link that does it. Never an order: every tab
@@ -159,6 +161,15 @@ pub(crate) fn next_step(s: &Summary) -> NextStep {
             ),
             format!("/train/{}#jobs", j.tab),
             "See its progress",
+        );
+    }
+    if let Some(why) = &s.folder_problem {
+        return step(
+            "folder_missing",
+            REVIEW,
+            why.clone(),
+            "/train/review".to_string(),
+            "Open Review",
         );
     }
     if let Some(m) = &s.unused_model {
@@ -539,6 +550,7 @@ pub(super) fn summary_of(state: &AppState, wait: Duration) -> (Summary, Option<A
     let t = tally.as_deref();
     (
         Summary {
+            folder_problem: super::review::folder_problem(state, &review_dir),
             collecting: config.collect.enabled,
             // A folder under review holds frames of its own, and imports count once indexed.
             frames_collected: brief.summary.frames.max(t.map_or(0, |t| t.frames)),
@@ -768,6 +780,29 @@ mod tests {
         };
         let n = next_step(&s);
         assert_eq!((n.key, n.tab), ("wait_frames", IMPORT));
+    }
+
+    /// An unplugged drive is not an empty dataset: never advice to collect or import.
+    #[test]
+    fn a_missing_review_folder_is_said_before_any_advice_on_frames() {
+        let why = "The folder under review is not available: /v/x; connect the drive".to_string();
+        let s = Summary {
+            folder_problem: Some(why.clone()),
+            ..Summary::default()
+        };
+        let n = next_step(&s);
+        assert_eq!((n.key, n.tab), ("folder_missing", REVIEW));
+        assert_eq!(n.text, why);
+        // A running job still comes first: it is what the user can act on.
+        let busy = Summary {
+            job: Some(Job {
+                tab: IMPORT,
+                what: "An import",
+                paused: false,
+            }),
+            ..s
+        };
+        assert_eq!(next_step(&busy).key, "job");
     }
 
     #[test]

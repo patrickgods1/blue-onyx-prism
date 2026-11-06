@@ -883,6 +883,16 @@ become the frame's complete set of training boxes:
 - **Folders:** `out_dir` and the import `dir` are checked like the other folder settings (no system
   folders), and must be under a browse root or picked in the native dialog. An `out_dir` that does not
   exist yet must be inside the browse roots or a picked folder.
+- **Build and report:** an export is built in a hidden folder and appears under its name only once
+  complete, so a failed one is never offered to training. The answer's `lost_frames` and
+  `unreadable_folders` count reviewed frames left out because their image or sidecar is gone or a
+  folder could not be read, and warnings name up to 20 of them.
+- **An unavailable folder:** a folder under review that is not there, such as an unplugged drive, is
+  not an empty dataset. `/v1/review/next` answers `folder_missing: true`, the routes that need the
+  folder answer 503, and the Train strip says so. Nothing is rejected or pruned meanwhile.
+- **Several writers:** `<dataset root>/.labels.lock` is an empty file that keeps the service and a
+  `train autolabel` from the CLI out of each other's label writes, one write at a time. Where locks
+  do not work, such as some network shares, writes carry on with one warning.
 
 **Retention:** a reviewed frame, one with a human decision, or one with boxes waiting for review is never
 pruned and does not count toward `collect.max_gb` (see [Disk](#disk)). A label file with nothing left to

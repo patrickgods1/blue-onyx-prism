@@ -50,12 +50,14 @@ impl Finish {
     }
 
     /// Run the steps on `dataset_dir` (the frames of import `import_id` only, when given;
-    /// `classes` = `collect.classes`, the accept's class check); returns one line per step.
+    /// `classes` = `collect.classes` and `hidden` = `collect.hidden_classes`, the accept's class
+    /// check); returns one line per step.
     pub fn apply(
         &self,
         dataset_dir: &Path,
         import_id: Option<&str>,
         classes: &[String],
+        hidden: &[String],
     ) -> Vec<String> {
         let mut lines = Vec::new();
         let scope = import_id.map(|id| FrameFilter {
@@ -83,9 +85,13 @@ impl Finish {
         }
         if self.accept_auto {
             let now = crate::collect::utc_rfc3339(std::time::SystemTime::now());
+            let accept = Filters {
+                wanted: (!hidden.is_empty()).then(|| (classes.to_vec(), hidden.to_vec())),
+                ..filters.clone()
+            };
             let o = bulk::bulk_accept(
                 dataset_dir,
-                &filters,
+                &accept,
                 classes,
                 STEP_LIMIT,
                 &now,
@@ -196,6 +202,24 @@ mod tests {
         }
     }
 
+    /// A chain's accept honours the hidden classes as the Review page's does.
+    #[test]
+    fn the_accept_step_never_accepts_a_hidden_class() {
+        use crate::collect::labels::{BoxState, Status};
+        let dir = std::env::temp_dir().join(format!("bop-finish-{}", uuid::Uuid::new_v4()));
+        let rel = put_frame(&dir, "a", None, vec![auto_box("car", 0.9, Triage::Accept)]);
+        let f = Finish {
+            accept_auto: true,
+            ..Finish::default()
+        };
+        let classes = vec!["person".to_string(), "car".into()];
+        f.apply(&dir, None, &classes, &["car".to_string()]);
+        let l = labels_of(&dir, &rel);
+        assert_eq!(l.boxes[0].state, BoxState::Rejected);
+        assert_ne!(l.status, Status::Reviewed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn steps_run_in_order_scoped_to_the_import_and_failures_are_warnings() {
         let dir = std::env::temp_dir().join(format!("bop-finish-{}", uuid::Uuid::new_v4()));
@@ -218,7 +242,11 @@ mod tests {
             ],
         );
         assert!(Finish::default().is_empty());
-        assert!(Finish::default().apply(&dir, Some("x"), &[]).is_empty());
+        assert!(
+            Finish::default()
+                .apply(&dir, Some("x"), &[], &[])
+                .is_empty()
+        );
         let w = Arc::new(Writer {
             saved: Mutex::new(None),
             fail: false,
@@ -232,7 +260,7 @@ mod tests {
         assert!(!f.is_empty());
         assert!(format!("{f:?}").contains("config_writer: true"));
         let classes = vec!["person".to_string(), "car".into()];
-        let lines = f.apply(&dir, Some("x"), &classes);
+        let lines = f.apply(&dir, Some("x"), &classes, &[]);
         assert_eq!(
             lines,
             [
@@ -269,7 +297,7 @@ mod tests {
             })),
             ..Finish::default()
         };
-        let l = g.apply(&dir, None, &classes);
+        let l = g.apply(&dir, None, &classes, &[]);
         assert_eq!(l.len(), 1);
         assert!(
             l[0].starts_with("warning: the Review tab was not switched"),
@@ -277,7 +305,7 @@ mod tests {
         );
         assert!(l[0].contains("read-only"), "{l:?}");
         g.config_writer = None;
-        assert!(g.apply(&dir, None, &classes)[0].starts_with("warning: "));
+        assert!(g.apply(&dir, None, &classes, &[])[0].starts_with("warning: "));
 
         // Without a scope, every frame: the other import's frame now.
         let h = Finish {
@@ -285,7 +313,7 @@ mod tests {
             ..Finish::default()
         };
         assert_eq!(
-            h.apply(&dir, None, &classes),
+            h.apply(&dir, None, &classes, &[]),
             ["rejected 1 auto box(es) scoring below 0.3 on 1 frame(s)"]
         );
         let _ = std::fs::remove_dir_all(&dir);

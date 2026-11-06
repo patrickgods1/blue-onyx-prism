@@ -2505,9 +2505,19 @@
   }
 
   function showNone(on) {
-    $('rv-none').hidden = !on;
+    $('rv-none').hidden = !on || !!missingNote.textContent;
+    missingNote.hidden = !on || !missingNote.textContent;
     canvas.hidden = on;
     if (on && cropWrap) cropWrap.hidden = true;
+  }
+
+  // The folder under review is gone (an unplugged drive): that, not "no frame matches".
+  var missingNote = el('p', 'form-msg error-text');
+  missingNote.hidden = true;
+  $('rv-none').parentNode.insertBefore(missingNote, $('rv-none'));
+  function noteMissing(text) {
+    missingNote.textContent = text || '';
+    if (!$('rv-none').hidden || !missingNote.hidden) showNone(true);
   }
 
   function prefetch() {
@@ -2567,6 +2577,7 @@
       showCounts(j);
       fillCameras(j.cameras);
       fillLabels(j.labels);
+      noteMissing(j.folder_missing ? j.message : '');
       if (countsOnly) return;
       upcoming = Array.isArray(j.upcoming) ? j.upcoming : [];
       var text = note || '';
