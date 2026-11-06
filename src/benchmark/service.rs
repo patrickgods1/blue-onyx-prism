@@ -1130,6 +1130,15 @@ impl ServiceRun<'_> {
             h.set_current(p);
         })?;
         r.run_id = Some(self.run_id.clone());
+        let files = sets
+            .iter()
+            .flat_map(|s| s.images.iter())
+            .map(|i| i.file.as_str());
+        let (share, warning) = super::trained_on::of_model(&ctx.config, m, files);
+        r.trained_on_share = share;
+        if let Some(w) = warning {
+            h.warn(w);
+        }
         h.push_done(r.summary());
         Ok(r)
     }

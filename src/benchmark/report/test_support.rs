@@ -97,6 +97,7 @@ pub(crate) fn model(devices: Vec<DeviceResult>, configured: Option<&str>) -> Mod
         error: None,
         threshold_objective: Objective::default(),
         threshold: None,
+        trained_on_share: None,
     };
     m.finish();
     m

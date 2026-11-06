@@ -257,6 +257,10 @@ pub struct ModelResult {
     /// Best confidence threshold (from the recommended device's curves).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<ThresholdAdvice>,
+    /// Share of the benchmarked frames the model trained on, 0..=1
+    /// ([`super::trained_on`]); None = unknown (no training record, or the run's list is gone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trained_on_share: Option<f64>,
 }
 
 impl ModelResult {
@@ -282,6 +286,7 @@ impl ModelResult {
             error: None,
             threshold_objective: Objective::default(),
             threshold: None,
+            trained_on_share: None,
         }
     }
 
@@ -307,6 +312,7 @@ impl ModelResult {
             error: Some(error),
             threshold_objective: Objective::default(),
             threshold: None,
+            trained_on_share: None,
         }
     }
 

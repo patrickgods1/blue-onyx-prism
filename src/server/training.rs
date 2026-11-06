@@ -15,7 +15,7 @@ use crate::resources::export::train::{self as env, TrainPaths};
 use crate::training::capability::Capability;
 use crate::training::compare::{self, CompareRun, Comparison};
 use crate::training::dataset::{Balance, BalanceAxis, Excluded, SceneFilter};
-use crate::training::job::{BenchSummary, Hooks, TrainOutput, TrainRequest};
+use crate::training::job::{Baseline, BenchSummary, Hooks, TrainOutput, TrainRequest};
 use crate::training::recipe::{self, Augment, TrainRecipe};
 use crate::training::service::{RunRecord, RunState, TrainingService};
 use crate::training::{bench, estimate, preflight, retry};
@@ -24,7 +24,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
@@ -87,7 +87,7 @@ pub(super) fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> 
 }
 
 /// The queue if it was started (the page shows `runs.json` otherwise).
-fn runs(state: &AppState) -> Vec<RunRecord> {
+pub(super) fn runs(state: &AppState) -> Vec<RunRecord> {
     match SERVICE.get() {
         Some(s) => s.runs(),
         None => crate::training::service::load_records(&crate::training::runs_file(
@@ -138,6 +138,93 @@ impl Hooks for ServerHooks {
             devices,
             cancel,
         )
+    }
+
+    fn baseline(
+        &self,
+        out: &TrainOutput,
+        extra: &[String],
+        devices: &[String],
+        run_dir: &Path,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<Option<Baseline>> {
+        let sets = bench::datasets(&out.name, out.heldout.as_deref(), extra);
+        if sets.is_empty() {
+            return Ok(None);
+        }
+        let state = self.shared.current();
+        let config = state.config_read().clone();
+        let default = crate::training::switch::current_default(&config);
+        let name = default.clone().unwrap_or_default();
+        let key = crate::registry::normalize_name(&name);
+        let loaded = super::benchmark::loaded_devices(&state).contains_key(&key);
+        let classes = crate::training::autolabel::catalog::model_classes(&config)
+            .into_iter()
+            .find(|m| crate::registry::normalize_name(&m.name) == key)
+            .map(|m| {
+                crate::training::switch::reported(
+                    &m.classes,
+                    m.object_filter.as_deref(),
+                    &config.object_filter,
+                )
+            });
+        let skip = bench::baseline_skip(
+            default.as_deref(),
+            &out.name,
+            &out.classes,
+            classes.as_deref(),
+            loaded,
+        );
+        if let Some(why) = skip {
+            return Ok(Some(Baseline {
+                model: name,
+                summary: None,
+                note: Some(why),
+            }));
+        }
+        // Its own results file: see `bench`'s module docs.
+        let dir = run_dir.join("baseline");
+        std::fs::create_dir_all(&dir)?;
+        let results_path = dir.join(crate::benchmark::report::RESULTS_FILE);
+        let shared = self.shared.clone();
+        let ctx = move || {
+            let st = shared.current();
+            crate::benchmark::service::RunContext {
+                config: st.config_read().clone(),
+                results_path: results_path.clone(),
+                runtimes: st.registry.runtimes().cloned(),
+                loaded: super::benchmark::loaded_devices(&st),
+                resources: st.resources.clone(),
+            }
+        };
+        let result = bench::run(&state.benchmark, &ctx, &name, sets, devices, cancel);
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            // Every device failed: a result of nothing is no comparison.
+            Ok(Some(b)) if b.device.is_none() => Ok(Some(Baseline {
+                note: Some(format!(
+                    "{name} did not run on the benchmark devices; try it on the Benchmark page"
+                )),
+                model: name,
+                summary: None,
+            })),
+            Ok(summary) => Ok(Some(Baseline {
+                model: name,
+                summary,
+                note: None,
+            })),
+            Err(e)
+                if e.downcast_ref::<crate::resources::export::Cancelled>()
+                    .is_some() =>
+            {
+                Err(e)
+            }
+            Err(e) => Ok(Some(Baseline {
+                model: name,
+                summary: None,
+                note: Some(format!("{e:#}")),
+            })),
+        }
     }
 }
 
@@ -286,6 +373,12 @@ struct ResultRow {
     license: String,
     classes: String,
     benchmark: String,
+    /// The new model and the current default on the same frames, in words.
+    compare: String,
+    /// The share of the benchmark that is its own training frames, in words (empty: none).
+    trained_on: String,
+    /// It is the default model now.
+    is_default: bool,
     finished: String,
     in_config: bool,
     warnings: Vec<String>,
@@ -602,6 +695,10 @@ pub(super) struct TrainingTemplate {
     /// The models folder (where a trained model goes by default).
     models_dir: String,
     default_model: String,
+    /// The last default switch, while it can be reverted.
+    revert: Option<crate::training::switch::RevertView>,
+    /// `{model: verifier}` as JSON: the Use card's confirm names the one replaced.
+    verifiers: String,
     training_dir: String,
     /// `training.dir` as configured (empty = the default folder).
     training_dir_setting: String,
@@ -1192,6 +1289,7 @@ fn view_with(
         })
         .collect();
     let names: Vec<String> = config.models.iter().map(|m| m.effective_name()).collect();
+    let current = crate::training::switch::current_default(&config).unwrap_or_default();
     let results = all
         .iter()
         .rev()
@@ -1205,6 +1303,15 @@ fn view_with(
                 license: o.license.clone(),
                 classes: o.classes.join(", "),
                 benchmark: bench_text(r.benchmark.as_ref(), r.benchmark_error.as_deref()),
+                compare: bench::compare_text(r.benchmark.as_ref(), r.baseline.as_ref()),
+                trained_on: r
+                    .benchmark
+                    .as_ref()
+                    .and_then(|b| b.trained_on_share)
+                    .and_then(bench::trained_chip)
+                    .unwrap_or_default(),
+                is_default: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name))
+                    && o.name.eq_ignore_ascii_case(&current),
                 finished: r.finished.clone().unwrap_or_default(),
                 in_config: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name)),
                 warnings: warnings_of(r),
@@ -1343,6 +1450,9 @@ fn view_with(
         results,
         models: names,
         default_model,
+        revert: crate::training::switch::revert_view(&config),
+        verifiers: serde_json::to_string(&crate::training::switch::verifiers(&config))
+            .unwrap_or_default(),
         training_dir: crate::training::training_dir(&config).display().to_string(),
         training_dir_setting: config
             .training
@@ -2438,13 +2548,17 @@ pub(super) async fn remove(State(shared): State<Shared>, body: axum::body::Bytes
 }
 
 /// `POST /training/use` (`id`, `role` = `default` | `night` | `verify`, `target`): use a
-/// trained model as the default model, or as the night model / verifier of `target`.
+/// trained model as the default model, or as the night model / verifier of `target`. Default:
+/// `copy` copies the settings of the current default, `use_threshold` takes the suggested
+/// threshold (the benchmark's, recomputed here), `expect_current` the default the page's preview
+/// compared with. Verifier: `replace_verifier` names the existing verifier it may replace.
 pub(super) async fn use_model(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Response {
     blocking(move || {
         let f = super::dataset::parse_form(&body);
+        let mut message = String::new();
         let result = (|| -> anyhow::Result<String> {
             let id = field(&f, "id").ok_or_else(|| anyhow::anyhow!("no run id"))?;
             let rec = runs(&state)
@@ -2456,30 +2570,78 @@ pub(super) async fn use_model(
                 .ok_or_else(|| anyhow::anyhow!("run {id} has no installed model"))?;
             let role = field(&f, "role").unwrap_or("default").to_string();
             let target = field(&f, "target").map(str::to_string);
+            let threshold = if field(&f, "use_threshold").is_some() {
+                let config = state.config_read().clone();
+                let m = crate::benchmark::find_model(&config, &out.name).ok_or_else(|| {
+                    anyhow::anyhow!("{} is not in the config, so it has no benchmark", out.name)
+                })?;
+                let s = super::training_switch::suggestion_for(&state, &config, m)
+                    .map_err(anyhow::Error::msg)?;
+                Some(crate::training::switch::Accepted::from(&s))
+            } else {
+                None
+            };
+            let opts = UseOptions {
+                copy: field(&f, "copy").is_some(),
+                threshold,
+                expect_current: field(&f, "expect_current").map(str::to_string),
+                replace_verifier: field(&f, "replace_verifier").map(str::to_string),
+                at: chrono::Utc::now().to_rfc3339(),
+            };
             save_config(&state, "training page", |c| {
-                apply_use(c, &out, &role, target.as_deref())
+                message = apply_use(c, &out, &role, target.as_deref(), &opts)?;
+                Ok(())
             })
         })();
         match result {
-            Ok(m) => render(&view(&state, Some(m), None)),
+            Ok(m) => render(&view(&state, Some(format!("{message} {m}")), None)),
             Err(e) => render(&view(&state, None, Some(format!("Not saved: {e:#}")))),
         }
     })
     .await
 }
 
-/// Apply a "Use as" action to `c` (the trained model is added first when missing).
+/// The choices of a "Use as" action ([`use_model`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UseOptions {
+    /// Default: copy the current default's settings.
+    pub copy: bool,
+    /// Default: the suggested threshold, accepted.
+    pub threshold: Option<crate::training::switch::Accepted>,
+    /// Default: refuse when the default is no longer this one (the page's preview went stale).
+    pub expect_current: Option<String>,
+    /// Verifier: the existing verifier the owner agreed to replace.
+    pub replace_verifier: Option<String>,
+    /// RFC 3339 time of the action.
+    pub at: String,
+}
+
+/// Apply a "Use as" action to `c` (the trained model is added first when missing); returns what
+/// happened, for the page.
 pub(crate) fn apply_use(
     c: &mut crate::config::Config,
     out: &TrainOutput,
     role: &str,
     target: Option<&str>,
-) -> anyhow::Result<()> {
+    opts: &UseOptions,
+) -> anyhow::Result<String> {
+    use crate::training::switch;
     let idx = |c: &crate::config::Config, n: &str| {
         c.models
             .iter()
             .position(|m| m.effective_name().eq_ignore_ascii_case(n))
     };
+    let from = switch::current_default(c);
+    if role == "default"
+        && let (Some(expected), Some(now)) = (&opts.expect_current, &from)
+        && crate::registry::normalize_name(expected) != crate::registry::normalize_name(now)
+    {
+        anyhow::bail!(
+            "the default model changed to {now} while this page was open, so what it showed is \
+             out of date; open Use as default again and check it"
+        );
+    }
+    let before = idx(c, &out.name).and_then(|i| c.models.get(i)).cloned();
     if idx(c, &out.name).is_none() {
         crate::training::cli::add_trained_model(c, out)?;
     }
@@ -2489,7 +2651,29 @@ pub(crate) fn apply_use(
         m.enabled = true;
     }
     match role {
-        "default" => c.default_model = Some(out.name.clone()),
+        "default" => {
+            // Added by this switch: a Revert leaves the entry, not loaded.
+            let before = before.or_else(|| {
+                let m = idx(c, &out.name).and_then(|i| c.models.get(i))?;
+                Some(crate::config::ModelConfig {
+                    enabled: false,
+                    ..m.clone()
+                })
+            });
+            let outcome = switch::apply_switch(
+                c,
+                &out.name,
+                switch::SwitchOptions {
+                    from,
+                    before,
+                    copy: opts.copy,
+                    classes: out.classes.clone(),
+                    threshold: opts.threshold.clone(),
+                    at: opts.at.clone(),
+                },
+            )?;
+            Ok(outcome.message(&out.name))
+        }
         "night" | "verify" => {
             let t = match target {
                 Some(t) => t.to_string(),
@@ -2503,19 +2687,27 @@ pub(crate) fn apply_use(
                 anyhow::bail!("{} cannot be its own {role} model", out.name);
             }
             let i = idx(c, &t).ok_or_else(|| anyhow::anyhow!("no configured model named {t}"))?;
+            let entry = c
+                .models
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("no configured model named {t}"))?;
+            if role == "verify" {
+                switch::check_verifier(c, entry, &out.name, opts.replace_verifier.as_deref())?;
+            }
             let m = c
                 .models
                 .get_mut(i)
                 .ok_or_else(|| anyhow::anyhow!("no configured model named {t}"))?;
             if role == "night" {
                 m.night_model = Some(out.name.clone());
+                Ok(format!("{} is now the night model of {t}.", out.name))
             } else {
                 m.verify = Some(crate::verify::VerifyConfig::with_model(out.name.clone()));
+                Ok(format!("{} now verifies {t}.", out.name))
             }
         }
         other => anyhow::bail!("role: '{other}' is not default, night or verify"),
     }
-    Ok(())
 }
 
 /// A change of the saved export folders.
@@ -3205,21 +3397,131 @@ mod tests {
         };
         let mut c = Config::default();
         c.seed_default_model();
-        apply_use(&mut c, &out, "night", None).unwrap();
+        let opts = UseOptions::default();
+        apply_use(&mut c, &out, "night", None, &opts).unwrap();
         assert_eq!(c.models[0].night_model.as_deref(), Some("night-x"));
         assert!(
             c.models
                 .iter()
                 .any(|m| m.effective_name() == "night-x" && m.enabled)
         );
-        apply_use(&mut c, &out, "verify", Some("IPcam-general")).unwrap();
+        apply_use(&mut c, &out, "verify", Some("IPcam-general"), &opts).unwrap();
         assert_eq!(c.models[0].verify.as_ref().unwrap().model, "night-x");
-        apply_use(&mut c, &out, "default", None).unwrap();
+        apply_use(&mut c, &out, "default", None, &opts).unwrap();
         assert_eq!(c.default_model.as_deref(), Some("night-x"));
-        assert!(apply_use(&mut c, &out, "night", Some("night-x")).is_err());
-        assert!(apply_use(&mut c, &out, "boss", None).is_err());
-        assert!(apply_use(&mut c, &out, "night", Some("nope")).is_err());
+        assert!(apply_use(&mut c, &out, "night", Some("night-x"), &opts).is_err());
+        assert!(apply_use(&mut c, &out, "boss", None, &opts).is_err());
+        assert!(apply_use(&mut c, &out, "night", Some("nope"), &opts).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn use_as_verifier_asks_before_replacing_and_default_refuses_a_stale_page() {
+        let dir = std::env::temp_dir().join(format!("bop-train-use-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let onnx = dir.join("new-x.onnx");
+        std::fs::write(&onnx, vec![1u8; 2048]).unwrap();
+        let yaml = dir.join("new-x.yaml");
+        std::fs::write(&yaml, "NAMES:\n  - person\n").unwrap();
+        let out = TrainOutput {
+            name: "new-x".into(),
+            onnx,
+            yaml,
+            provenance: dir.join("new-x.provenance.json"),
+            family: ModelFamilyKind::Yolo26,
+            classes: vec!["person".into()],
+            license: "AGPL-3.0".into(),
+            heldout: None,
+            device: "mps".into(),
+            train_seconds: 1.0,
+        };
+        let mut c = Config::default();
+        c.seed_default_model();
+        c.models.push(crate::config::ModelConfig {
+            name: Some("checker".into()),
+            path: "models/checker.onnx".into(),
+            ..Default::default()
+        });
+        c.models[0].verify = Some(crate::verify::VerifyConfig::with_model("checker"));
+        let default = UseOptions::default();
+        let e = apply_use(&mut c, &out, "verify", Some("IPcam-general"), &default).unwrap_err();
+        assert!(e.to_string().contains("checker already verifies"), "{e}");
+        assert_eq!(c.models[0].verify.as_ref().unwrap().model, "checker");
+        let yes = UseOptions {
+            replace_verifier: Some("checker".into()),
+            ..Default::default()
+        };
+        apply_use(&mut c, &out, "verify", Some("IPcam-general"), &yes).unwrap();
+        assert_eq!(c.models[0].verify.as_ref().unwrap().model, "new-x");
+        // The preview showed another default: nothing is switched on stale facts.
+        let stale = UseOptions {
+            expect_current: Some("checker".into()),
+            ..Default::default()
+        };
+        let e = apply_use(&mut c, &out, "default", None, &stale).unwrap_err();
+        assert!(e.to_string().contains("changed to IPcam-general"), "{e}");
+        assert_eq!(c.default_model, None);
+        let msg = apply_use(&mut c, &out, "default", None, &UseOptions::default()).unwrap();
+        assert!(msg.contains("new-x is now the default model"), "{msg}");
+        let p = c.previous_default.as_ref().unwrap();
+        assert_eq!(p.model, "IPcam-general");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_home_and_training_pages_offer_revert_and_revert_applies() {
+        use crate::config::PreviousDefault;
+        use crate::server::test_util::{call, get_text, post_form, test_state_with};
+        let _queue = QUEUE_TEST_LOCK.lock().await;
+        let root = std::env::temp_dir().join(format!("bop-train-rev-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(r2);
+            c.default_model = Some("<b>evil</b>".into());
+            c.previous_default = Some(PreviousDefault {
+                model: "ipcam-general".into(),
+                default_model: Some("ipcam-general".into()),
+                switched_to: "<b>evil</b>".into(),
+                at: "2026-11-05T10:00:00Z".into(),
+                ..Default::default()
+            });
+        });
+        for page in ["/", "/training"] {
+            let (_, html) = get_text(&state, page).await;
+            assert!(html.contains("Revert to ipcam-general"), "{page}");
+            assert!(html.contains("action=\"/training/revert\""), "{page}");
+            assert!(
+                !html.contains("switched from <code>ipcam-general</code> to <code><b>"),
+                "{page}"
+            );
+        }
+        let (_, _, b) = call(&state, post_form("/training/revert", "", true)).await;
+        let html = String::from_utf8(b).unwrap();
+        assert!(html.contains("Back to ipcam-general"), "{html}");
+        assert_eq!(
+            state.config_read().default_model.as_deref(),
+            Some("ipcam-general")
+        );
+        let (_, html) = get_text(&state, "/").await;
+        assert!(
+            html.contains("Revert to &#60;b&#62;evil") || html.contains("Revert to &lt;b&gt;evil"),
+            "the undo of the undo"
+        );
+        // A record that cannot be used can be dropped.
+        let (_, _, _) = call(&state, post_form("/training/revert", "forget=1", true)).await;
+        assert_eq!(state.config_read().previous_default, None);
+        let (_, _, b) = call(&state, post_form("/training/revert", "", true)).await;
+        assert!(
+            String::from_utf8(b)
+                .unwrap()
+                .contains("Not reverted: no default switch")
+        );
+        // The preview of an unknown run says what to do.
+        let (s, text) = get_text(&state, "/v1/training/switch-preview?id=nope").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert!(text.contains("no run nope"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -3848,6 +4150,7 @@ mod tests {
             train_seed: None,
         };
         let benchmark = ap.map(|(d, n, i)| BenchSummary {
+            trained_on_share: None,
             datasets: vec![format!("heldout-{id}")],
             device: Some("ort:coreml".into()),
             ms_p50: Some(10.0 + d),
@@ -3872,6 +4175,7 @@ mod tests {
             empty_frame_alerts: Some((10.0 * n).round() as usize),
         });
         RunRecord {
+            baseline: None,
             id: id.into(),
             name: format!("{}-yolo26n-{id}", scene.label()),
             created: String::new(),
@@ -3905,6 +4209,87 @@ mod tests {
             run_dir: PathBuf::from("/runs").join(id),
             retrying: false,
         }
+    }
+
+    #[test]
+    fn the_switch_preview_compares_the_default_with_the_trained_model() {
+        use crate::server::test_util::test_state_with;
+        use crate::training::job::Baseline;
+        let root = std::env::temp_dir().join(format!("bop-train-prev-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let yaml = |name: &str, classes: &str| {
+            let p = root.join("models").join(name);
+            std::fs::write(&p, format!("NAMES:\n{classes}")).unwrap();
+            p
+        };
+        let old = yaml("old.yaml", "  - person\n  - dog\n");
+        let new = yaml("trained.yaml", "  - person\n");
+        let onnx = root.join("models/trained.onnx");
+        std::fs::write(&onnx, vec![1u8; 2048]).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(r2);
+            c.models[0].classes = Some(old);
+            c.models[0].confidence_threshold = Some(0.7);
+        });
+        let mut rec = record("r1", SceneFilter::DAY, None, RunState::Done, None);
+        rec.output = Some(TrainOutput {
+            name: "trained".into(),
+            onnx,
+            yaml: new,
+            provenance: root.join("models/trained.provenance.json"),
+            family: ModelFamilyKind::Yolo26,
+            classes: vec!["person".into()],
+            license: "AGPL-3.0".into(),
+            heldout: None,
+            device: "mps".into(),
+            train_seconds: 1.0,
+        });
+        rec.benchmark = Some(BenchSummary {
+            datasets: vec!["heldout-trained".into()],
+            images: 20,
+            trained_on_share: Some(0.5),
+            ..BenchSummary::default()
+        });
+        rec.baseline = Some(Baseline {
+            model: "ipcam-general".into(),
+            summary: None,
+            note: Some("ipcam-general is not loaded".into()),
+        });
+        // The model is not in the config yet: the preview does not add it.
+        let p = super::super::training_switch::preview_of(&state, &rec).unwrap();
+        assert!(
+            !state
+                .config_read()
+                .models
+                .iter()
+                .any(|m| m.effective_name() == "trained")
+        );
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["already_default"], false);
+        assert_eq!(
+            (v["current"].as_str(), v["new"].as_str()),
+            (Some("ipcam-general"), Some("trained"))
+        );
+        assert_eq!(v["classes"]["lost"], serde_json::json!(["dog"]));
+        assert!(
+            v["rows"][0]["current"]
+                .as_str()
+                .unwrap()
+                .starts_with("0.70"),
+            "{v}"
+        );
+        assert!(v["copy"]["copied"][0]["value"] == "0.70", "{v}");
+        assert!(
+            v["no_suggestion"]
+                .as_str()
+                .unwrap()
+                .contains("no benchmark yet"),
+            "{v}"
+        );
+        assert!(v["compare"].as_str().unwrap().contains("not loaded"), "{v}");
+        assert!(v["trained_on"].as_str().unwrap().contains("50%"), "{v}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn group_records() -> Vec<RunRecord> {

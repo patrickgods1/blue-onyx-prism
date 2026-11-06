@@ -152,7 +152,7 @@ fn display_names(maps: &[&Fields]) -> BTreeMap<String, String> {
     out
 }
 
-fn field_label(field: &str) -> String {
+pub(crate) fn field_label(field: &str) -> String {
     match field {
         "confidence_threshold" => "threshold".into(),
         "device_thresholds" => "confidence per device".into(),
@@ -205,6 +205,7 @@ fn global_label(k: &str) -> String {
         "auto_download" => "Auto download".into(),
         "allow_large_downloads" => "Allow large downloads".into(),
         "default_model" => "Default model".into(),
+        "previous_default" => "Revert record of the default model".into(),
         "max_image_pixels" => "Max image pixels".into(),
         "night_confidence_threshold" => "Night / IR confidence threshold".into(),
         "label_thresholds" => "Label thresholds".into(),
@@ -418,6 +419,7 @@ pub fn live_global(k: &str) -> bool {
         "log_level"
             | "log_timezone"
             | "default_model"
+            | "previous_default"
             | "allow_remote_admin"
             | "request_timeout_secs"
             | "confidence_threshold"

@@ -39,6 +39,7 @@ pub mod roc;
 pub mod search;
 pub mod service;
 pub mod threshold;
+pub mod trained_on;
 pub mod variant;
 
 mod run;

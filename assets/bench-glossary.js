@@ -220,6 +220,14 @@
     if (why) return tip(text, why, "chip " + c[2]);
     return el("span", "chip " + c[2], text);
   }
+  // The warning chip of a result scored on the model's own training frames (share 0..1); null
+  // when none of them were, or nobody knows.
+  function trainedChip(share) {
+    if (!has(share) || share <= 0) return null;
+    var c = el("span", "tag restart", Math.max(1, Math.round(share * 100)) + "% training frames");
+    c.title = "This set includes frames the model trained on, so these scores look better than the model will do on new frames. Score it on held-out frames to compare it fairly.";
+    return c;
+  }
   // Words for a metric's verdict.
   var WORDS = {
     p50_ms: ["faster", "slower"], infer_p50_ms: ["faster model", "slower model"], fps: ["more images/s", "fewer images/s"],
@@ -329,7 +337,7 @@
   PB.noise = noise; PB.setNoise = setNoise;
   PB.GLOSSARY = GLOSSARY; PB.LABELS = LABELS; PB.label = label; PB.tipText = tipText; PB.meaning = meaning;
   PB.term = term; PB.tip = tip; PB.head = head; PB.refreshTip = refreshTip; PB.hideTip = hide;
-  PB.chip = chip; PB.metricChip = metricChip; PB.changeChips = changeChips; PB.trustBadge = trustBadge; PB.runTag = runTag;
+  PB.chip = chip; PB.trainedChip = trainedChip; PB.metricChip = metricChip; PB.changeChips = changeChips; PB.trustBadge = trustBadge; PB.runTag = runTag;
   PB.metricValue = metricValue; PB.metricDelta = metricDelta; PB.METRIC_NAMES = METRIC_NAMES; PB.isSpeed = isSpeed;
   PB.glossaryDetails = glossaryDetails; PB.runtimeOf = runtimeOf; PB.RUNTIME_NAMES = RUNTIME_NAMES;
   PB.colorsFor = colorsFor; PB.colorOf = colorOf;

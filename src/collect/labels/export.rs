@@ -504,13 +504,14 @@ pub fn benchmark_manifest(frames: &[&ExportFrame], classes: &[String], id: &str)
     }
 }
 
-/// Which frames the benchmark set holds.
+/// Which frames the benchmark set holds. Held-out frames by default: a score on frames a model
+/// trained on says little about the frames it will see next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BenchSplit {
-    #[default]
     All,
     Train,
+    #[default]
     Val,
 }
 
@@ -946,7 +947,11 @@ pub fn run_filtered(
             })
             .collect();
         if list.is_empty() {
-            warnings.push("the benchmark set is empty for the chosen split; not written".into());
+            warnings.push(
+                "the benchmark set was not written: no frame is in the chosen split (a share of \
+                 0 holds nothing out); hold out some cameras or days, or choose another set"
+                    .into(),
+            );
         } else {
             let img = bdir.join("images");
             std::fs::create_dir_all(&img)?;
@@ -1737,6 +1742,15 @@ mod tests {
         // The dataset's parent is fine (non-empty, so a subfolder).
         assert!(prepare_out(&dir, &root, now).unwrap().starts_with(&root));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_benchmark_set_defaults_to_held_out_frames() {
+        assert_eq!(BenchSplit::default(), BenchSplit::Val);
+        // The page starts there too, and offers the others with what they mean.
+        let page = include_str!("../../../templates/review.html");
+        assert!(page.contains(r#"<option value="val" selected>held-out frames"#));
+        assert!(page.contains("all frames (includes training frames"));
     }
 
     #[test]

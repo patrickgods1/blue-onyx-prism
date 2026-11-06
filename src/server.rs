@@ -39,6 +39,7 @@ mod status;
 #[cfg(test)]
 mod test_util;
 mod training;
+mod training_switch;
 mod training_tasks;
 
 pub(crate) use apply::{apply_config, reload_models, sync_config};
@@ -298,6 +299,8 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/training/remove", post(training::remove)),
         ("/training/retry-export", post(training::retry_export)),
         ("/training/use", post(training::use_model)),
+        ("/training/revert", post(training_switch::revert)),
+        ("/v1/training/switch-preview", get(training_switch::preview)),
         ("/training/datasets", post(training::datasets)),
         ("/training/dir", post(training::set_dir)),
         ("/training/remove-env", post(training::remove_env)),
@@ -1127,6 +1130,8 @@ mod tests {
             "/training/remove",
             "/training/retry-export",
             "/training/use",
+            "/training/revert",
+            "/v1/training/switch-preview",
             "/training/datasets",
             "/training/dir",
             "/training/remove-env",

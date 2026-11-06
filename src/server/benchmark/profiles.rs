@@ -29,6 +29,8 @@ pub(super) struct DeviceFacts {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ModelFacts {
     pub model: String,
+    /// [`crate::benchmark::report::ModelResult::trained_on_share`].
+    pub trained_on_share: Option<f64>,
     pub devices: Vec<DeviceFacts>,
 }
 
@@ -39,6 +41,7 @@ pub(super) fn facts(results: &BenchmarkResults) -> Vec<ModelFacts> {
         .iter()
         .map(|m| ModelFacts {
             model: m.model.clone(),
+            trained_on_share: m.trained_on_share,
             devices: m
                 .devices
                 .iter()
@@ -131,6 +134,8 @@ pub(super) struct ProfileModel {
     pub fallback_source: &'static str,
     /// `saved`, `unsaved`, `differs` or `none` ([`status_of`]).
     pub status: &'static str,
+    /// Share of the benchmarked frames the model trained on, 0..=1; None = unknown.
+    pub trained_on_share: Option<f64>,
     pub devices: Vec<ProfileDevice>,
 }
 
@@ -208,6 +213,7 @@ pub(super) fn profiles(
                     ThresholdSource::Model => "model",
                     _ => "global",
                 },
+                trained_on_share: f.trained_on_share,
                 status: status_of(&devices),
                 devices,
             }
@@ -253,6 +259,7 @@ mod tests {
     #[test]
     fn statuses_and_now() {
         let facts = vec![ModelFacts {
+            trained_on_share: None,
             model: "M".into(),
             devices: vec![
                 dev("ort:coreml", Some(0.3)),
@@ -310,6 +317,7 @@ mod tests {
 
         // No best anywhere: none. Not configured: listed, global fallback.
         let facts = vec![ModelFacts {
+            trained_on_share: None,
             model: "gone".into(),
             devices: vec![dev("ort:cpu", None)],
         }];

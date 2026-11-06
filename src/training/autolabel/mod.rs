@@ -709,6 +709,24 @@ fn trained_frame(line: &str) -> Option<String> {
     Some(crate::collect::labels::export::parse_flat_name(flat)?.jpg())
 }
 
+/// The dataset frame a benchmark image is (`<scene>/<camera>/<date>/<stem>.jpg`, the identity of
+/// [`trained_frames`]), from its name in the set: a held-out copy (`s0-day.back.<date>.<stem>.jpg`),
+/// an export's flat name, or a path inside a dataset folder. None: not a frame of a dataset
+/// folder (a public image).
+pub fn frame_of_file(file: &str) -> Option<String> {
+    let file = file.trim().replace('\\', "/");
+    if let Some(f) = trained_frame(&file) {
+        return Some(f);
+    }
+    let name = file.rsplit('/').next()?;
+    if let Some(r) = crate::collect::labels::export::parse_flat_name(name) {
+        return Some(r.jpg());
+    }
+    let parts: Vec<&str> = file.rsplit('/').take(4).collect();
+    let rel = parts.into_iter().rev().collect::<Vec<_>>().join("/");
+    crate::collect::layout::parse_rel(&rel).map(|r| r.jpg())
+}
+
 /// The frames `model` trained on (`<scene>/<camera>/<date>/<stem>.jpg`, each once, however often
 /// balancing repeated it): its `<stem>.provenance.json` beside the model file names the run, whose
 /// `<training dir>/<run_id>/data/train.txt` lists them. Validation and held-out frames are not in

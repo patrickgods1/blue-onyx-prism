@@ -131,6 +131,9 @@ pub struct RunRecord {
     pub benchmark: Option<BenchSummary>,
     #[serde(default)]
     pub benchmark_error: Option<String>,
+    /// The current default model on the same frames ([`super::job::Baseline`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<super::job::Baseline>,
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
@@ -174,6 +177,7 @@ impl RunRecord {
             registered: None,
             benchmark: None,
             benchmark_error: None,
+            baseline: None,
             error: None,
             finished: None,
             run_dir: job.run_dir.clone(),
@@ -1071,6 +1075,7 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                     r.registered = Some(out.registered);
                     r.benchmark = out.benchmark;
                     r.benchmark_error = out.benchmark_error;
+                    r.baseline = out.baseline;
                     r.error = None;
                     r.retrying = false;
                     r.finished = Some(now());

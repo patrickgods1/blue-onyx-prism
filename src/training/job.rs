@@ -317,6 +317,23 @@ pub struct BenchSummary {
     /// older versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heldout_fingerprint: Option<String>,
+    /// [`crate::benchmark::report::ModelResult::trained_on_share`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trained_on_share: Option<f64>,
+}
+
+/// The current default model on the frames of a run's benchmark ([`Hooks::baseline`]): what the
+/// new model's result is compared with on the Training page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Baseline {
+    /// The default model; empty when the comparison failed before it was known.
+    pub model: String,
+    /// Its result; None = not compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<BenchSummary>,
+    /// Why it was not compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// AP of a subset of the held-out frames.
@@ -340,6 +357,19 @@ pub trait Hooks: Send + Sync {
         devices: &[String],
         cancel: &AtomicBool,
     ) -> Result<Option<BenchSummary>>;
+    /// Benchmark the current default model on the same sets and devices, its results kept under
+    /// `run_dir` (never in `benchmark.json`). None = this caller does not compare (the CLI: no
+    /// model is loaded there); a model that cannot be compared answers with a [`Baseline::note`].
+    fn baseline(
+        &self,
+        _out: &TrainOutput,
+        _extra: &[String],
+        _devices: &[String],
+        _run_dir: &Path,
+        _cancel: &AtomicBool,
+    ) -> Result<Option<Baseline>> {
+        Ok(None)
+    }
 }
 
 /// Hooks that do nothing (tests, `--no-register`).
@@ -369,6 +399,7 @@ pub struct RunOutcome {
     pub registered: String,
     pub benchmark: Option<BenchSummary>,
     pub benchmark_error: Option<String>,
+    pub baseline: Option<Baseline>,
 }
 
 /// Why a run failed, and in which stage.
@@ -1304,6 +1335,34 @@ impl Finish<'_> {
             } else {
                 (None, None)
             };
+        // 8b. The current default on the same frames (best effort too).
+        let baseline = if benchmark.is_some() {
+            enter(
+                TrainStage::Benchmark,
+                50,
+                "comparing with the default model",
+            );
+            match hooks.baseline(
+                &output,
+                &job.request.benchmark_sets,
+                &job.request.benchmark_devices,
+                &job.run_dir,
+                cancel,
+            ) {
+                Ok(b) => b,
+                Err(e) if e.downcast_ref::<Cancelled>().is_some() => return Err(e),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    log.line(&format!("comparison with the default model failed: {msg}"));
+                    Some(Baseline {
+                        note: Some(msg),
+                        ..Baseline::default()
+                    })
+                }
+            }
+        } else {
+            None
+        };
         enter(TrainStage::Benchmark, 100, "done");
         Ok(RunOutcome {
             output,
@@ -1311,6 +1370,7 @@ impl Finish<'_> {
             registered,
             benchmark,
             benchmark_error,
+            baseline,
         })
     }
 }

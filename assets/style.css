@@ -844,6 +844,10 @@ ol.tr-steps li a:hover { border-color: var(--accent); }
 /* A radio's or checkbox's hint on its own line under the label text. */
 .tr-form .tr-hint { display: block; }
 /* Options that belong to the field above (the VLM check's). */
+.tr-switch { padding: 0.4rem 0.2rem; }
+.tr-switch h3 { margin-top: 0.2rem; }
+.tr-compare { margin: 0.3rem 0; }
+.tr-revert p { margin: 0 0 0.4rem; }
 .tr-sub { margin: 0.4rem 0 0 0.2rem; padding-left: 0.6rem; border-left: 2px solid var(--border); }
 .tr-sub label.check { margin: 0.2rem 0; }
 .tr-form input.al-num { width: 5.5em; margin-left: 0.3rem; }

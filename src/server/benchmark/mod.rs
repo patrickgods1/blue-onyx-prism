@@ -558,6 +558,7 @@ fn saved_view(
                 .ok()
                 .flatten();
             crate::benchmark::current::rebase(&mut r, stored.as_deref(), now);
+            crate::benchmark::trained_on::backfill(&mut r, &state.config_read());
             let facts = profiles::facts(&r);
             // No history file yet: seeded in memory (written by the next run, pin or delete).
             let history = History::load_or_seed(&hist, Some(&r));
@@ -1233,7 +1234,8 @@ mod tests {
                 "fallbackSource",
                 "model",
                 "running",
-                "status"
+                "status",
+                "trainedOnShare"
             ]
         );
         assert_eq!(

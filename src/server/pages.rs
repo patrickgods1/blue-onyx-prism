@@ -178,6 +178,8 @@ struct WelcomeTemplate {
     port: u16,
     default_model: String,
     models: Vec<ModelRow>,
+    /// The last default switch, while it can be reverted.
+    revert: Option<crate::training::switch::RevertView>,
 }
 
 pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
@@ -237,6 +239,7 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
             port: state.config_read().port,
             default_model: default,
             models,
+            revert: crate::training::switch::revert_view(&state.config_read()),
         })
     })
     .await

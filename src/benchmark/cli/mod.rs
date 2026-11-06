@@ -661,8 +661,20 @@ impl RunCtx<'_> {
             threshold_objective: self.objective,
         };
         bench.progress = Some(progress);
-        let result = sweep(bench, self.runtimes, job, &opts, &mut |_| {})?;
+        let mut result = sweep(bench, self.runtimes, job, &opts, &mut |_| {})?;
         bench.progress = None;
+        if let Some(m) = entry {
+            let files = bench
+                .sets
+                .iter()
+                .flat_map(|s| s.images.iter())
+                .map(|i| i.file.as_str());
+            let (share, warning) = crate::benchmark::trained_on::of_model(self.config, m, files);
+            result.trained_on_share = share;
+            if let Some(w) = warning {
+                tracing::warn!("{w}");
+            }
+        }
         match model_report(&result) {
             Ok(m) => {
                 if !self.args.json {
