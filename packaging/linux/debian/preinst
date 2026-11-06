@@ -1,0 +1,14 @@
+#!/bin/sh
+# Debian preinst: `install <old-version> <new-version>` is a reinstall after `apt remove`, which
+# keeps the data but disabled the unit. The postinst gets the old version then, exactly as on an
+# upgrade (dpkg keeps it in the config-files state), and an upgrade must leave a unit the admin
+# disabled alone. So this is the one place that can tell them apart: leave the postinst a note.
+set -e
+if [ "$1" = install ] && [ -n "${2:-}" ]; then
+  mkdir -p /opt/blue-onyx-prism
+  : > /opt/blue-onyx-prism/.reinstall
+fi
+
+#DEBHELPER#
+
+exit 0

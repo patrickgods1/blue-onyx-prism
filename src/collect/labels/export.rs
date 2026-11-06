@@ -32,14 +32,18 @@
 //!
 //! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`], [`ignore_file`],
 //! [`frame_notes`]) plus
-//! [`run`], which writes into an empty or new folder, or a new `export-<UTC time>` folder inside a
-//! non-empty one, never into the dataset (images hard-linked, else copied), and writes
-//! `export.json` last.
+//! [`run`], which exports into an empty or new folder, or a new `export-<UTC time>` folder inside a
+//! non-empty one, never into the dataset (images hard-linked, else copied). An export appears
+//! whole or not at all, since a part of one reads as a valid folder (its `classes.txt`, without
+//! its `ignore.json`, teaches unsure objects as background): see [`Staging`].
+//!
+//! A reviewed frame that lost its image or sidecar and a folder that cannot be listed cannot be
+//! exported; the report counts them (`lost_frames`, `unreadable_folders`) and warns.
 
 use super::super::layout::{self, Rel};
 use super::super::record::Bucket;
 use super::xany;
-use super::{BoxState, Frame, LabelBox, LabelFile, Status, clamp_box, label_files, spots};
+use super::{BoxState, Frame, LabelBox, LabelFile, Status, clamp_box, spots};
 use crate::benchmark::images::{Manifest, ManifestImage, ManifestObject};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -603,6 +607,10 @@ pub struct ExportReport {
     pub class_filter: ClassFilter,
     /// Reviewed frames the class filter left out.
     pub filtered_out: usize,
+    /// Reviewed frames left out because their image or sidecar is gone.
+    pub lost_frames: usize,
+    /// Folders of the dataset that could not be listed: their frames are not in this export.
+    pub unreadable_folders: usize,
 }
 
 /// One (camera, date) group of an export.
@@ -622,24 +630,78 @@ pub fn reviewed_frames(
     classes: &[String],
     split: &SplitConfig,
 ) -> (Vec<ExportFrame>, Vec<String>) {
-    let (frames, warnings, _) =
-        reviewed_frames_filtered(dir, classes, split, &ClassFilter::default());
-    (frames, warnings)
+    let s = reviewed_frames_filtered(dir, classes, split, &ClassFilter::default());
+    (s.frames, s.warnings)
+}
+
+/// What [`reviewed_frames_filtered`] selected.
+#[derive(Debug, Default)]
+pub struct Selection {
+    pub frames: Vec<ExportFrame>,
+    pub warnings: Vec<String>,
+    /// Reviewed frames the filter left out.
+    pub filtered_out: usize,
+    /// [`ExportReport::lost_frames`].
+    pub lost_frames: usize,
+    /// [`ExportReport::unreadable_folders`].
+    pub unreadable_folders: usize,
+}
+
+/// Whether the label file at `path` is, or may be, of a reviewed frame.
+fn may_be_reviewed(path: &Path) -> bool {
+    super::read(path).map_or(true, |l| l.is_some_and(|l| l.status == Status::Reviewed))
+}
+
+/// The warning of `lost`, frames that lost a file.
+fn lost_warning(lost: &[String]) -> String {
+    let more = lost.len().saturating_sub(super::bulk::LISTED);
+    let tail = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} reviewed frame(s) left out because the image or sidecar is gone (deleted by hand, or \
+         a folder moved?): {}{tail}. Restore the files, or review other frames, for them to count",
+        lost.len(),
+        lost.iter()
+            .take(super::bulk::LISTED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// [`reviewed_frames`] that `filter` keeps, split after filtering (so both sides hold kept
-/// frames); also how many the filter left out.
+/// frames); also how many the filter left out and what could not be looked at.
 pub fn reviewed_frames_filtered(
     dir: &Path,
     classes: &[String],
     split: &SplitConfig,
     filter: &ClassFilter,
-) -> (Vec<ExportFrame>, Vec<String>, usize) {
+) -> Selection {
     let mut filtered_out = 0;
     let mut warnings = Vec::new();
     let mut frames = Vec::new();
-    for (rel, _) in label_files(dir) {
+    let scan = super::scan_labels(dir);
+    for folder in &scan.unreadable {
+        warnings.push(format!(
+            "{} could not be read, so its frames are not in this export; check the folder's \
+             permissions and the drive, then export again",
+            folder.display()
+        ));
+    }
+    let mut lost: Vec<String> = scan
+        .orphans
+        .iter()
+        .filter(|(_, path)| may_be_reviewed(path))
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    for (rel, path) in scan.files {
         let Some(frame) = Frame::resolve(dir, &rel) else {
+            if may_be_reviewed(&path) {
+                lost.push(rel);
+            }
             continue;
         };
         let labels = match frame.labels() {
@@ -700,7 +762,23 @@ pub fn reviewed_frames_filtered(
             .copied()
             .unwrap_or(Split::Train);
     }
-    (frames, warnings, filtered_out)
+    if !lost.is_empty() {
+        warnings.push(lost_warning(&lost));
+    }
+    Selection {
+        frames,
+        warnings,
+        filtered_out,
+        lost_frames: lost.len(),
+        unreadable_folders: scan.unreadable.len(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`write_file`] fails on a file of this name: a full disk at a chosen point of an export.
+    static FAIL_WRITE: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Hard-link `src` to `dst`, else copy it.
@@ -714,6 +792,10 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_WRITE.with_borrow(|n| path.file_name().is_some_and(|f| Some(f.to_owned()) == *n)) {
+        bail!("{}: writing failed (test)", path.display());
+    }
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
     }
@@ -745,9 +827,9 @@ fn resolved(p: &Path) -> PathBuf {
     }
 }
 
-/// The folder an export to `out` writes into, created: `out` when it is new or empty, else a
-/// new `export-<UTC time>` folder inside it. Never the dataset `dir` or a folder inside it
-/// (the export would mix with the frames it reads).
+/// The folder an export to `out` becomes: `out` when it is new or empty, else a new
+/// `export-<UTC time>` folder inside it. Never the dataset `dir` or a folder inside it (the export
+/// would mix with the frames it reads). Nothing is created.
 fn prepare_out(dir: &Path, out: &Path, now: std::time::SystemTime) -> Result<PathBuf> {
     if resolved(out).starts_with(resolved(dir)) {
         let hint = match dir.parent() {
@@ -760,20 +842,125 @@ fn prepare_out(dir: &Path, out: &Path, now: std::time::SystemTime) -> Result<Pat
             out.display()
         );
     }
-    let target = match std::fs::read_dir(out).map(|mut rd| rd.next().is_some()) {
+    match std::fs::read_dir(out).map(|mut rd| rd.next().is_some()) {
         Ok(true) => {
             let t = out.join(format!("export-{}", crate::collect::utc_file_ts(now)));
             if t.exists() {
                 bail!("{} already exists; export again in a moment", t.display());
             }
-            t
+            Ok(t)
         }
-        Ok(false) => out.to_path_buf(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => out.to_path_buf(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", out.display())),
-    };
-    std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
-    Ok(target)
+        Ok(false) => Ok(out.to_path_buf()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(out.to_path_buf()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", out.display())),
+    }
+}
+
+/// Files published last from an existing folder ([`Staging::publish`]), `classes.txt` and
+/// `data.yaml` being what makes a folder look like an export.
+const PUBLISHED_LAST: [&str; 3] = ["classes.txt", "data.yaml", "export.json"];
+
+/// Where an export is built until it is whole. A new target is built in a hidden folder beside
+/// it, inside a subfolder so that nothing looking for exports one level down can take it for one
+/// (a crash leaves it there), and appears by one rename: the sibling is on the target's
+/// volume, as the target would have been created in the same parent. An existing empty target may
+/// be a mount point, or sit in a parent this service cannot write, and a user's folder keeps its
+/// owner and permissions: it is built in a hidden folder inside the target and moved up file by
+/// file, the files that make a folder look like an export last.
+#[derive(Debug)]
+struct Staging {
+    target: PathBuf,
+    /// The folder the export is written to.
+    build: PathBuf,
+    /// What remains to remove once `build` is published.
+    scratch: PathBuf,
+    /// `target` is an existing folder ([`Self::publish`] moves the files).
+    inside: bool,
+}
+
+impl Staging {
+    fn new(target: &Path) -> Result<Self> {
+        let id = uuid::Uuid::new_v4().simple();
+        let inside = target.is_dir();
+        let scratch = if inside {
+            target.join(format!(".building-{id}"))
+        } else {
+            let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+                bail!(
+                    "{} cannot be created; choose another folder",
+                    target.display()
+                );
+            };
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            parent.join(format!(".{}.building-{id}", name.to_string_lossy()))
+        };
+        let build = if inside {
+            scratch.clone()
+        } else {
+            scratch.join("export")
+        };
+        std::fs::create_dir_all(&build).with_context(|| format!("creating {}", build.display()))?;
+        Ok(Self {
+            target: target.to_path_buf(),
+            build,
+            scratch,
+            inside,
+        })
+    }
+
+    /// Give up: nothing of the export stays (the dataset is its source).
+    fn discard(&self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.scratch) {
+            tracing::warn!(
+                "export: could not remove the unfinished {}: {e}; delete it by hand",
+                self.scratch.display()
+            );
+        }
+    }
+
+    fn move_up(&self) -> std::io::Result<()> {
+        let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&self.build)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<std::io::Result<_>>()?;
+        let rank = |n: &std::ffi::OsString| {
+            PUBLISHED_LAST
+                .iter()
+                .position(|l| n == l)
+                .map_or(0, |at| at + 1)
+        };
+        names.sort_by_key(rank);
+        for name in names {
+            std::fs::rename(self.build.join(&name), self.target.join(&name))?;
+        }
+        Ok(())
+    }
+
+    /// The finished export takes its place. A failure keeps what was built (it is complete, and
+    /// its `data.yaml` already names the target) and says where.
+    fn publish(&self) -> Result<()> {
+        let moved = if self.inside {
+            self.move_up()
+        } else {
+            std::fs::rename(&self.build, &self.target)
+        };
+        moved.with_context(|| {
+            format!(
+                "the export is complete in {} but could not be moved to {} (the folder is in use, \
+                 or something else was created there meanwhile); move it there by hand, or \
+                 export again",
+                self.build.display(),
+                self.target.display()
+            )
+        })?;
+        if let Err(e) = std::fs::remove_dir_all(&self.scratch) {
+            tracing::warn!(
+                "export: could not remove the empty {}: {e}; delete it by hand",
+                self.scratch.display()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Export the reviewed frames of the dataset `dir` (see the module doc), every class.
@@ -793,24 +980,31 @@ pub fn run_filtered(
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
     filter.check(classes)?;
-    let (frames, mut warnings, filtered_out) =
-        reviewed_frames_filtered(dir, classes, &req.split, filter);
+    let mut selected = reviewed_frames_filtered(dir, classes, &req.split, filter);
     let unreviewed: Vec<(Frame, LabelFile, u32, u32)> =
         if req.include_unreviewed && req.formats.contains(&Format::XAnyLabeling) {
-            unreviewed_queue_frames(dir, classes, &req.hidden_classes, &mut warnings)
+            unreviewed_queue_frames(dir, classes, &req.hidden_classes, &mut selected.warnings)
                 .into_iter()
                 .filter(|(_, labels, _, _)| filter.keeps(&preview(labels)))
                 .collect()
         } else {
             Vec::new()
         };
-    if frames.is_empty() && unreviewed.is_empty() {
-        if filtered_out > 0 {
+    if selected.frames.is_empty() && unreviewed.is_empty() {
+        if selected.lost_frames + selected.unreadable_folders > 0 {
             bail!(
-                "no reviewed frame of {} in {} ({filtered_out} reviewed frame(s) left out by the \
-                 class filter); clear the class filter or review frames of these classes first",
+                "nothing could be exported from {}: {}",
+                dir.display(),
+                selected.warnings.join("; ")
+            );
+        }
+        if selected.filtered_out > 0 {
+            bail!(
+                "no reviewed frame of {} in {} ({} reviewed frame(s) left out by the class \
+                 filter); clear the class filter or review frames of these classes first",
                 filter.labels.join(", "),
-                dir.display()
+                dir.display(),
+                selected.filtered_out
             );
         }
         bail!(
@@ -819,15 +1013,54 @@ pub fn run_filtered(
             dir.display()
         );
     }
-    let out = &prepare_out(dir, &req.out_dir, std::time::SystemTime::now())?;
+    let target = prepare_out(dir, &req.out_dir, std::time::SystemTime::now())?;
+    let staging = Staging::new(&target)?;
+    let report = build_export(
+        selected,
+        &unreviewed,
+        classes,
+        req,
+        filter,
+        &target,
+        &staging.build,
+    );
+    match report {
+        Ok(r) => staging.publish().map(|()| r),
+        Err(e) => {
+            staging.discard();
+            Err(e)
+        }
+    }
+}
+
+/// Write the export that will be at `out` into the folder `build` ([`Staging`]). Every path a
+/// reader of the export sees names `out`.
+fn build_export(
+    selected: Selection,
+    unreviewed: &[(Frame, LabelFile, u32, u32)],
+    classes: &[String],
+    req: &ExportRequest,
+    filter: &ClassFilter,
+    out: &Path,
+    build: &Path,
+) -> Result<ExportReport> {
+    let Selection {
+        frames,
+        mut warnings,
+        filtered_out,
+        lost_frames,
+        unreadable_folders,
+    } = selected;
     let mut r = ExportReport {
-        out_dir: out.clone(),
+        out_dir: out.to_path_buf(),
         formats: req.formats.clone(),
         frames: frames.len(),
         classes: classes.to_vec(),
         unreviewed_frames: unreviewed.len(),
         class_filter: filter.clone(),
         filtered_out,
+        lost_frames,
+        unreadable_folders,
         ..ExportReport::default()
     };
     let mut groups: BTreeMap<Group, (Split, usize)> = BTreeMap::new();
@@ -858,7 +1091,7 @@ pub fn run_filtered(
     let wants = |f: Format| req.formats.contains(&f);
     if (wants(Format::Yolo) || wants(Format::Coco)) && !frames.is_empty() {
         for f in &frames {
-            let dst = out.join("images").join(f.split.as_str()).join(&f.name);
+            let dst = build.join("images").join(f.split.as_str()).join(&f.name);
             if let Some(p) = dst.parent() {
                 std::fs::create_dir_all(p)?;
             }
@@ -870,7 +1103,8 @@ pub fn run_filtered(
             let txt = yolo_txt(f, classes)?;
             let stem = f.name.trim_end_matches(".jpg");
             write_file(
-                &out.join("labels")
+                &build
+                    .join("labels")
                     .join(f.split.as_str())
                     .join(format!("{stem}.txt")),
                 txt.as_bytes(),
@@ -878,7 +1112,7 @@ pub fn run_filtered(
         }
         let mut names = classes.join("\n");
         names.push('\n');
-        write_file(&out.join("classes.txt"), names.as_bytes())?;
+        write_file(&build.join("classes.txt"), names.as_bytes())?;
         let val = if r.val > 0 {
             "images/val"
         } else {
@@ -896,7 +1130,7 @@ pub fn run_filtered(
         for (i, c) in classes.iter().enumerate() {
             yaml.push_str(&format!("  {i}: {}\n", serde_json::to_string(c)?));
         }
-        write_file(&out.join("data.yaml"), yaml.as_bytes())?;
+        write_file(&build.join("data.yaml"), yaml.as_bytes())?;
         r.paths.insert("yolo".into(), out.join("data.yaml"));
     }
     if wants(Format::Coco) && !frames.is_empty() {
@@ -907,7 +1141,8 @@ pub fn run_filtered(
             }
             let v = coco_json(&list, classes)?;
             write_file(
-                &out.join("annotations")
+                &build
+                    .join("annotations")
                     .join(format!("instances_{}.json", s.as_str())),
                 &json_bytes(&v)?,
             )?;
@@ -915,7 +1150,7 @@ pub fn run_filtered(
         r.paths.insert("coco".into(), out.join("annotations"));
     }
     if wants(Format::XAnyLabeling) {
-        let xdir = out.join("xanylabeling");
+        let xdir = build.join("xanylabeling");
         std::fs::create_dir_all(&xdir)?;
         for f in &frames {
             link_or_copy(&f.image, &xdir.join(&f.name))?;
@@ -923,7 +1158,7 @@ pub fn run_filtered(
             let stem = f.name.trim_end_matches(".jpg");
             write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
         }
-        for (frame, labels, w, h) in &unreviewed {
+        for (frame, labels, w, h) in unreviewed {
             let name = flat_name(&frame.rel);
             link_or_copy(&frame.jpg, &xdir.join(&name))?;
             let preview = preview(labels).boxes;
@@ -934,10 +1169,11 @@ pub fn run_filtered(
         let mut names = classes.join("\n");
         names.push('\n');
         write_file(&xdir.join("classes.txt"), names.as_bytes())?;
-        r.paths.insert("xanylabeling".into(), xdir);
+        r.paths
+            .insert("xanylabeling".into(), out.join("xanylabeling"));
     }
     if wants(Format::Benchmark) && !frames.is_empty() {
-        let bdir = out.join("benchmark");
+        let bdir = build.join("benchmark");
         let list: Vec<&ExportFrame> = frames
             .iter()
             .filter(|f| match req.benchmark_split {
@@ -963,12 +1199,13 @@ pub fn run_filtered(
                 .map_or_else(|| "review".into(), |n| n.to_string_lossy().into_owned());
             let m = benchmark_manifest(&list, classes, &format!("review-{id}"));
             write_file(&bdir.join("manifest.json"), &json_bytes(&m)?)?;
+            let published = out.join("benchmark");
             r.benchmark_dataset = Some(format!(
                 "{}{}",
                 crate::benchmark::images::DIR_PREFIX,
-                bdir.display()
+                published.display()
             ));
-            r.paths.insert("benchmark".into(), bdir);
+            r.paths.insert("benchmark".into(), published);
         }
     }
     let negatives: Vec<serde_json::Value> = frames
@@ -992,14 +1229,17 @@ pub fn run_filtered(
         .collect();
     r.hard_negative_boxes = negatives.len();
     if !frames.is_empty() {
-        write_file(&out.join(HARD_NEGATIVES_FILE), &json_bytes(&negatives)?)?;
-        write_file(&out.join(FRAMES_FILE), &json_bytes(&frame_notes(&frames))?)?;
+        write_file(&build.join(HARD_NEGATIVES_FILE), &json_bytes(&negatives)?)?;
+        write_file(
+            &build.join(FRAMES_FILE),
+            &json_bytes(&frame_notes(&frames))?,
+        )?;
         let ignore = ignore_file(&frames);
         r.ignore_boxes = ignore.images.values().map(Vec::len).sum();
-        write_file(&out.join(IGNORE_FILE), &json_bytes(&ignore)?)?;
+        write_file(&build.join(IGNORE_FILE), &json_bytes(&ignore)?)?;
     }
     r.warnings = warnings;
-    write_file(&out.join("export.json"), &json_bytes(&r)?)?;
+    write_file(&build.join("export.json"), &json_bytes(&r)?)?;
     Ok(r)
 }
 
@@ -1716,6 +1956,11 @@ mod tests {
         // New and empty folders are used as they are.
         let new = root.join("new");
         assert_eq!(prepare_out(&dir, &new, now).unwrap(), new);
+        assert!(
+            !new.exists(),
+            "nothing is created before the export is whole"
+        );
+        std::fs::create_dir_all(&new).unwrap();
         assert_eq!(prepare_out(&dir, &new, now).unwrap(), new);
         // A non-empty one gets a new export-<UTC time> folder inside it.
         std::fs::write(new.join("x.txt"), b"x").unwrap();
@@ -1724,7 +1969,7 @@ mod tests {
             sub,
             new.join(format!("export-{}", crate::collect::utc_file_ts(now)))
         );
-        assert!(sub.is_dir());
+        std::fs::create_dir_all(&sub).unwrap();
         assert!(
             prepare_out(&dir, &new, now).is_err(),
             "that folder exists now"
@@ -1771,5 +2016,244 @@ mod tests {
         ] {
             assert_eq!(parse_flat_name(bad), None, "{bad}");
         }
+    }
+
+    fn all_formats(out: PathBuf) -> ExportRequest {
+        ExportRequest {
+            formats: Format::ALL.to_vec(),
+            out_dir: out,
+            split: SplitConfig::default(),
+            benchmark_split: BenchSplit::All,
+            include_unreviewed: false,
+            hidden_classes: Vec::new(),
+        }
+    }
+
+    fn fail_write(name: Option<&str>) {
+        FAIL_WRITE.with_borrow_mut(|n| *n = name.map(Into::into));
+    }
+
+    fn names_in(p: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(p)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_failed_export_leaves_nothing_that_looks_valid() {
+        for name in [IGNORE_FILE, FRAMES_FILE, "export.json", "classes.txt"] {
+            let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+            let dir = root.join("dataset");
+            put_reviewed(
+                &dir,
+                "drive",
+                "2026-10-21",
+                "a",
+                vec![lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted)],
+                false,
+            );
+            // A new folder under exports/ (the page's default).
+            let exports = root.join("exports");
+            let out = exports.join("new");
+            fail_write(Some(name));
+            let e = run(&dir, &classes(), &all_formats(out.clone())).unwrap_err();
+            fail_write(None);
+            assert!(format!("{e:#}").contains(name), "{e:#}");
+            assert!(!out.exists(), "{name}: {:?}", names_in(&exports));
+            assert_eq!(
+                names_in(&exports),
+                Vec::<String>::new(),
+                "{name}: the partial folder goes"
+            );
+            // An empty folder a user chose stays empty.
+            let chosen = root.join("chosen");
+            std::fs::create_dir_all(&chosen).unwrap();
+            fail_write(Some(name));
+            run(&dir, &classes(), &all_formats(chosen.clone())).unwrap_err();
+            fail_write(None);
+            assert_eq!(names_in(&chosen), Vec::<String>::new(), "{name}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_reviewed_frame_that_lost_a_file_is_counted_and_warned_about() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        let reviewed = |stem: &str| {
+            put_reviewed(
+                &dir,
+                "drive",
+                "2026-10-21",
+                stem,
+                vec![lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted)],
+                false,
+            );
+        };
+        reviewed("keep");
+        reviewed("nosidecar");
+        reviewed("noimage");
+        let day = dir.join("day/drive/2026-10-21");
+        std::fs::remove_file(day.join("nosidecar.json")).unwrap();
+        std::fs::remove_file(day.join("noimage.jpg")).unwrap();
+        let r = run(&dir, &classes(), &all_formats(root.join("out"))).unwrap();
+        assert_eq!(r.frames, 1);
+        let text = r.warnings.join("\n");
+        assert!(text.contains("nosidecar"), "{text}");
+        assert!(text.contains("noimage"), "{text}");
+        assert_eq!((r.lost_frames, r.unreadable_folders), (2, 0));
+        // Only reviewed frames count: an unreviewed one is simply not exported.
+        let empty = root.join("nothing");
+        let day = dir.join("day/drive/2026-10-21");
+        std::fs::remove_file(day.join("keep.jpg")).unwrap();
+        let e = run(&dir, &classes(), &all_formats(empty.clone())).unwrap_err();
+        assert!(format!("{e:#}").contains("keep"), "{e:#}");
+        assert!(!empty.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_day_folder_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        for date in ["2026-10-21", "2026-10-22"] {
+            put_reviewed(
+                &dir,
+                "drive",
+                date,
+                "a",
+                vec![lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted)],
+                false,
+            );
+        }
+        let day = dir.join("day/drive/2026-10-22");
+        let mode = |m: u32| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&day, mode(0o000)).unwrap();
+        if std::fs::read_dir(&day).is_ok() {
+            // Root reads everything: nothing to show here.
+            std::fs::set_permissions(&day, mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let r = run(&dir, &classes(), &all_formats(root.join("out")));
+        std::fs::set_permissions(&day, mode(0o755)).unwrap();
+        let r = r.unwrap();
+        assert_eq!(r.frames, 1);
+        let text = r.warnings.join("\n");
+        assert!(text.contains("2026-10-22"), "{text}");
+        assert_eq!((r.lost_frames, r.unreadable_folders), (0, 1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_export_into_an_empty_folder_keeps_the_folder_and_publishes_everything() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "a",
+            vec![lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted)],
+            false,
+        );
+        let (fresh, chosen) = (root.join("exports/fresh"), root.join("chosen"));
+        std::fs::create_dir_all(&chosen).unwrap();
+        // A marker the folder keeps through the export: the same folder, not a replacement.
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&chosen).unwrap().ino()
+        };
+        let a = run(&dir, &classes(), &all_formats(fresh.clone())).unwrap();
+        let b = run(&dir, &classes(), &all_formats(chosen.clone())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&chosen).unwrap().ino(), inode);
+        }
+        assert_eq!(names_in(&fresh), names_in(&chosen));
+        assert!(names_in(&fresh).iter().all(|n| !n.starts_with('.')));
+        assert_eq!(
+            names_in(&root.join("exports")),
+            ["fresh"],
+            "no scratch left"
+        );
+        for (r, out) in [(&a, &fresh), (&b, &chosen)] {
+            for must in [
+                "classes.txt",
+                "data.yaml",
+                "export.json",
+                IGNORE_FILE,
+                "benchmark/manifest.json",
+            ] {
+                assert!(out.join(must).is_file(), "{must}");
+            }
+            // Paths in the export name where it ended up, never the scratch folder.
+            assert_eq!(&r.out_dir, out);
+            assert_eq!(r.paths["yolo"], out.join("data.yaml"));
+            assert!(
+                r.benchmark_dataset
+                    .as_deref()
+                    .unwrap()
+                    .contains(&*out.to_string_lossy())
+            );
+            let yaml = std::fs::read_to_string(out.join("data.yaml")).unwrap();
+            assert!(!yaml.contains("building"), "{yaml}");
+            let report = std::fs::read_to_string(out.join("export.json")).unwrap();
+            assert!(!report.contains("building"), "{report}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_scratch_folder_left_by_a_crash_does_not_look_like_an_export() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let s = Staging::new(&root.join("exports/new")).unwrap();
+        write_file(&s.build.join("classes.txt"), b"person\n").unwrap();
+        // What `training::discover_exports` looks for, one level under exports/.
+        for entry in names_in(&root.join("exports")) {
+            let p = root.join("exports").join(entry);
+            assert!(!p.join("classes.txt").exists() && !p.join("data.yaml").exists());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_final_move_keeps_the_finished_export_and_says_where() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let target = root.join("exports/new");
+        let s = Staging::new(&target).unwrap();
+        write_file(&s.build.join("export.json"), b"{}").unwrap();
+        // Something else took the name meanwhile.
+        write_file(&target.join("x.txt"), b"x").unwrap();
+        let e = format!("{:#}", s.publish().unwrap_err());
+        assert!(e.contains("complete in"), "{e}");
+        assert!(e.contains(&*s.build.to_string_lossy()), "{e}");
+        assert!(e.contains(&*target.to_string_lossy()), "{e}");
+        assert!(s.build.join("export.json").is_file(), "kept");
+        assert!(target.join("x.txt").is_file(), "what was there stays");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn files_of_an_export_move_up_with_what_marks_it_valid_last() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let s = Staging::new(&root).unwrap();
+        for f in ["export.json", "classes.txt", "ignore.json", "data.yaml"] {
+            write_file(&s.build.join(f), b"x").unwrap();
+        }
+        // The move stops at a file that cannot arrive: a folder holds its name.
+        std::fs::create_dir_all(root.join("data.yaml/full")).unwrap();
+        s.publish().unwrap_err();
+        assert!(root.join("ignore.json").is_file(), "first");
+        assert!(!root.join("export.json").exists(), "last");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

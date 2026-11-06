@@ -113,7 +113,10 @@ fn store_path(dir: &Path, camera: &str) -> Result<PathBuf> {
 /// version is an error: going on without it would forget a camera move, and a write would lose it.
 pub fn read(dir: &Path, camera: &str) -> Result<CameraSpots> {
     let path = store_path(dir, camera)?;
-    if !path.exists() {
+    if !path
+        .try_exists()
+        .with_context(|| format!("reading {}", path.display()))?
+    {
         return Ok(CameraSpots::default());
     }
     let bytes = read_capped(&path, MAX_FILE_BYTES)?;

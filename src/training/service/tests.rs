@@ -126,6 +126,43 @@ fn state(svc: &TrainingService, id: &str) -> RunState {
     svc.get_task(id).map(|r| r.state).unwrap()
 }
 
+/// `cancel` reads the state, then acts on it: a job that started in between must still stop, not
+/// keep running while the page says the cancel went through. Called directly on a running task,
+/// which is what `cancel` meets when it loses that race.
+#[test]
+fn a_cancel_that_read_queued_just_before_the_start_is_not_lost() {
+    let dir = std::env::temp_dir().join(format!("bop-cancel-race-{}", uuid::Uuid::new_v4()));
+    let svc = TrainingService::start(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        Some(dir.join("runs.json")),
+    );
+    let id = svc
+        .enqueue_task(Box::new(HoldTask {
+            id: "t".into(),
+            keep: false,
+        }))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while state(&svc, &id) != RunState::Running {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task never started"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(svc.cancel_queued_task(&id, None));
+    let rec = svc.wait_task(&id, Duration::from_secs(10)).unwrap();
+    assert_eq!(rec.state, RunState::Cancelled);
+    assert!(
+        svc.inner.cancelled.lock_recover().is_empty(),
+        "a stale entry would cancel a later job of that id"
+    );
+    svc.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_running_task_pauses_resumes_keeps_its_place_and_cancels_while_paused() {
     let dir = std::env::temp_dir().join(format!("bop-train-pause-{}", uuid::Uuid::new_v4()));
@@ -491,4 +528,92 @@ fn the_run_records_the_balance_summary_of_its_dataset() {
     }))
     .unwrap();
     assert_eq!((old.train_frames, old.valid_groups.len()), (0, 0));
+}
+
+#[test]
+fn a_damaged_runs_file_is_moved_aside_before_anything_overwrites_it() {
+    let dir = std::env::temp_dir().join(format!("bop-runs-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join(RUNS_FILE);
+    std::fs::write(&store, b"[{\"id\":\"cut off by a cra").unwrap();
+    let tasks = task::tasks_file(&store);
+    std::fs::write(&tasks, b"not json").unwrap();
+    let svc = TrainingService::start(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(crate::training::job::NoHooks),
+        Some(store.clone()),
+    );
+    assert!(svc.runs().is_empty());
+    let id = svc
+        .enqueue_task(Box::new(HoldTask {
+            id: "t1".into(),
+            keep: false,
+        }))
+        .unwrap();
+    assert!(svc.cancel(&id));
+    svc.wait_task(&id, Duration::from_secs(10)).unwrap();
+    svc.shutdown();
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    let aside = |n: &str| {
+        names
+            .iter()
+            .find(|f| f.starts_with(&format!("{n}.corrupt-")))
+            .unwrap_or_else(|| panic!("{n} moved aside: {names:?}"))
+    };
+    assert_eq!(
+        std::fs::read(dir.join(aside(RUNS_FILE))).unwrap(),
+        b"[{\"id\":\"cut off by a cra"
+    );
+    assert_eq!(
+        std::fs::read(dir.join(aside(task::TASKS_FILE))).unwrap(),
+        b"not json"
+    );
+    assert_eq!(task::load_records(&tasks).len(), 1, "the new history");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A damaged file nothing could move aside (a read-only folder that later comes back): this
+/// process leaves it alone rather than save the empty history over it.
+#[cfg(unix)]
+#[test]
+fn a_file_that_could_not_be_moved_aside_is_not_written_over() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("bop-runs-held-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join(RUNS_FILE);
+    let tasks = task::tasks_file(&store);
+    std::fs::write(&store, b"damaged runs").unwrap();
+    std::fs::write(&tasks, b"damaged tasks").unwrap();
+    let set = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+    set(0o555).unwrap();
+    if std::fs::File::create(dir.join("probe")).is_ok() {
+        // Root ignores the mode: nothing to test here.
+        let _ = set(0o755);
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let svc = TrainingService::start(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(crate::training::job::NoHooks),
+        Some(store.clone()),
+    );
+    set(0o755).unwrap();
+    let id = svc
+        .enqueue_task(Box::new(HoldTask {
+            id: "t1".into(),
+            keep: false,
+        }))
+        .unwrap();
+    assert!(svc.cancel(&id));
+    let rec = svc.wait_task(&id, Duration::from_secs(10)).unwrap();
+    assert_eq!(rec.state, RunState::Cancelled, "the queue still works");
+    svc.shutdown();
+    assert_eq!(std::fs::read(&store).unwrap(), b"damaged runs");
+    assert_eq!(std::fs::read(&tasks).unwrap(), b"damaged tasks");
+    let _ = std::fs::remove_dir_all(&dir);
 }

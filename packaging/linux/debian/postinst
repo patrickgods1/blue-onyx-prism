@@ -1,13 +1,15 @@
 #!/bin/sh
-# Debian postinst: $1=configure, $2=previously configured version (empty on a first install).
+# Debian postinst: $1=configure, $2=previously configured version (empty on a first install, and
+# also set on a reinstall after `apt remove`: the preinst leaves .reinstall for that one).
 set -e
 case "$1" in
   configure)
-    if [ -n "${2:-}" ]; then
+    if [ -n "${2:-}" ] && [ ! -e /opt/blue-onyx-prism/.reinstall ]; then
       /opt/blue-onyx-prism/scripts/pkg_scriptlet.sh post-upgrade
     else
       /opt/blue-onyx-prism/scripts/pkg_scriptlet.sh post-install
     fi
+    rm -f /opt/blue-onyx-prism/.reinstall
     ;;
 esac
 

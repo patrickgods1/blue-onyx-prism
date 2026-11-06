@@ -1,8 +1,10 @@
 #!/bin/sh
 # remove: forget the deleted unit and delete what the program created in /opt/blue-onyx-prism
-# (dpkg only removes its own files: e.g. a config or downloads of the CLI run from there).
-# purge: also, like uninstall_systemd.sh --purge, the data root (config, models, cache,
-# downloads) and the service user. Not on upgrade (postrm upgrade): the new version keeps both.
+# (dpkg only removes its own files: e.g. a config or downloads of the CLI run from there). The
+# data root and the service user stay for a reinstall.
+# purge: also, like uninstall_systemd.sh --purge, the data root (config, models, dataset, reviewed
+# labels, training runs) and the service user. Not on upgrade (postrm upgrade): the new version
+# keeps both.
 set -e
 case "$1" in
   remove | purge)
@@ -13,6 +15,10 @@ case "$1" in
     rm -rf /opt/blue-onyx-prism
     ;;
 esac
+# Worded for both: `apt purge` of an installed package runs remove, then purge.
+if [ "$1" = remove ] && [ -d /var/lib/blue-onyx-prism ]; then
+  echo "/var/lib/blue-onyx-prism (config, models, dataset, reviewed labels, training runs) and the user blueonyx stay until: sudo apt purge blue-onyx-prism"
+fi
 if [ "$1" = purge ]; then
   rm -rf /var/lib/blue-onyx-prism
   if id -u blueonyx >/dev/null 2>&1; then

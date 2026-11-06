@@ -194,25 +194,44 @@ After installing, open `http://127.0.0.1:32168/`. The installers are not code-si
   on Domain and Private networks only, so Blue Iris on another subnet or a PC on a Public network needs
   the manual rule in [packaging/windows/README.md](packaging/windows/README.md)), and a
   Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn`. Uninstall from
-  *Settings > Apps*: it removes everything, including `C:\ProgramData\BlueOnyxPrism` (config,
-  downloads, logs); to keep that folder for a reinstall, uninstall with
-  `msiexec /x <file>.msi KEEPDATA=1` instead. Upgrading to a newer MSI always keeps it. If you installed the service earlier with `scripts\install_service.ps1`,
+  *Settings > Apps*; it keeps `C:\ProgramData\BlueOnyxPrism` ([what uninstalling keeps](#uninstalling-keeps-your-data)).
+  Upgrading to a newer MSI keeps it too. If you installed the service earlier with `scripts\install_service.ps1`,
   run `scripts\uninstall_service.ps1` first; the MSI refuses to install over it. The console
   `blue-onyx-prism.exe` in Program Files still looks for a config next to itself, so pass
   `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json` to work on the
   service's config (stop the service first).
 - **Linux:** `sudo apt install ./blue-onyx-prism_*.deb` or `sudo dnf install ./blue-onyx-prism-*.rpm`.
-  The package creates the `blueonyx` user and enables `blue-onyx-prism.service`. `apt remove` keeps
-  the data and the user for a reinstall, `apt purge` removes everything; `dnf remove` removes
-  everything (RPM has no purge).
+  The package creates the `blueonyx` user and enables `blue-onyx-prism.service`. `apt remove` and
+  `dnf remove` keep the data and the user for a reinstall; `apt purge` removes everything
+  ([what uninstalling keeps](#uninstalling-keeps-your-data)).
 - **macOS:** macOS blocks the unsigned package on first open. Open *System Settings > Privacy &
   Security*, click *Open Anyway* next to the message about the package, and run it again. To
-  uninstall, open *Uninstall Blue Onyx Prism* in *Applications*: choose *Keep My Data* (config,
-  models and logs stay for a reinstall) or *Delete Everything*, and enter your password. From
-  Terminal: `sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh` (add `--purge` to also
-  delete the data, logs and the `_blueonyx` account). macOS may not let the uninstaller app delete
+  uninstall, open *Uninstall Blue Onyx Prism* in *Applications*: choose *Keep My Data* or *Delete
+  Everything*, and enter your password. From Terminal:
+  `sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh` keeps the data, and `--purge` also
+  deletes it, with the logs and the `_blueonyx` account. macOS may not let the uninstaller app delete
   the hidden `_blueonyx` account; it then offers *Remove in Terminal*, where you enter your password
   once more (the account is harmless if you leave it, and a reinstall reuses it).
+
+### Uninstalling keeps your data
+
+An uninstall removes the program and the service. It keeps the folder in the *Config and data*
+column above, and on Linux and macOS the service account too, so a reinstall carries on where you
+left. That folder holds the config, the downloaded runtimes and models and, unless you pointed them
+elsewhere, your dataset, reviewed labels and training runs, which no download brings back (macOS
+keeps `/var/log/blue-onyx-prism` as well). To delete it too, which cannot be undone:
+
+| OS | Delete the data |
+|---|---|
+| Windows | Uninstall with `msiexec /x <file>.msi REMOVEDATA=1`, using the MSI you installed. After a plain uninstall: `Remove-Item -LiteralPath C:\ProgramData\BlueOnyxPrism -Recurse -Force` in an elevated PowerShell |
+| Debian / Ubuntu | `sudo apt purge blue-onyx-prism`, also after `apt remove` |
+| Fedora / RHEL | After `dnf remove`, which prints this: `sudo rm -rf /var/lib/blue-onyx-prism && sudo userdel blueonyx` |
+| macOS | *Delete Everything* in the uninstaller app, or the script's `--purge`. After keeping the data: `sudo rm -rf /usr/local/var/blue-onyx-prism /var/log/blue-onyx-prism; sudo dscl . -delete /Users/_blueonyx; sudo dscl . -delete /Groups/_blueonyx` |
+
+Version 0.2.0 and older worked the other way round on two of these, and an installed version
+uninstalls by its own rules: its MSI deletes the data unless you pass `KEEPDATA=1`, and `dnf remove`
+deletes it with no option to keep it. Upgrade to a newer version first, then uninstall that one.
+`KEEPDATA=1` is still accepted by newer MSIs, and wins over `REMOVEDATA=1`.
 
 **Tray / menu bar icon (Windows and macOS).** The Windows and macOS installers also install a small
 icon app that starts at login (Windows: system tray, macOS: menu bar) and shows whether the service is
@@ -846,7 +865,7 @@ menu bar icon (`blue-onyx-prism-tray`) does the same from a menu.
 
 ```powershell
 .\scripts\install_service.ps1        # service BlueOnyxPrismService, auto start, auto restart, firewall rule
-.\scripts\uninstall_service.ps1
+.\scripts\uninstall_service.ps1      # remove the service; the folder stays, with your data (it prints how to delete it)
 ```
 
 The service runs as the virtual account `NT SERVICE\BlueOnyxPrismService`, not LocalSystem. The
@@ -875,7 +894,7 @@ when services.msc or Event Viewer keeps the old one open. Logs go to the Applica
 sudo cp -r blue-onyx-prism-<version>-linux-x86_64 /opt/blue-onyx-prism
 sudo /opt/blue-onyx-prism/scripts/install_systemd.sh      # creates user blueonyx (render, video groups)
 journalctl -u blue-onyx-prism -f
-sudo /opt/blue-onyx-prism/scripts/uninstall_systemd.sh    # stop and remove the unit (--purge: also data and user)
+sudo /opt/blue-onyx-prism/scripts/uninstall_systemd.sh    # stop and remove the unit, keep the data (--purge: also data and user)
 ```
 
 Re-running `install_systemd.sh` after copying a new release over `/opt/blue-onyx-prism` restarts the
@@ -901,7 +920,7 @@ add a `save_image_path` or `log_path` outside `/var/lib/blue-onyx-prism` (`ReadW
 ```sh
 sudo cp -r blue-onyx-prism-<version>-macos-aarch64 /usr/local/blue-onyx-prism
 sudo /usr/local/blue-onyx-prism/scripts/install_launchd.sh   # KeepAlive; runs as _blueonyx
-sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh # unload, remove the daemon and the program dir (--purge: also data, logs, account; --keep-program: keep the program dir)
+sudo /usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh # unload, remove the daemon and the program dir, keep the data (--purge: also data, logs, account; --keep-program: keep the program dir)
 ```
 
 The daemon runs as the hidden role account `_blueonyx` (created by the script, UID below 500). The

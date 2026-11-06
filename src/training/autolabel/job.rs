@@ -26,6 +26,11 @@
 //! [`triage::apply_labelers`], decided per frame under the label write lock, so reviewed frames
 //! only reopen for confident new objects and their decided boxes change by nothing but votes.
 //!
+//! A label file that cannot be written (a full disk, a lost permission) does not stop the run: the
+//! frame gets no marker, its boxes are not counted, and the run's outcome says how many were lost
+//! and why ([`AutolabelJob::write_note`]). `work`, which holds the only copy of those proposals,
+//! then stays, and a run that saved no frame at all fails.
+//!
 //! [`AutolabelJob::preview`] is stage 1 alone: the same walk ([`AutolabelJob::select`]), written
 //! nowhere, for the pages' Preview and `train autolabel --dry-run`.
 
@@ -89,7 +94,8 @@ pub struct AutolabelJob {
     pub platform: Platform,
     pub accelerator: Option<Accelerator>,
     pub timeout: Duration,
-    /// `<training dir>/autolabel/<id>`: the frame list and the proposals (deleted at the end).
+    /// `<training dir>/autolabel/<id>`: the frame list and the proposals (deleted at the end,
+    /// unless a frame could not be saved).
     pub work: PathBuf,
     pub config: Box<Config>,
     /// The resolved `with_model` ([`models::resolve`]).
@@ -150,6 +156,9 @@ struct Selection {
     unreadable: u64,
 }
 
+/// Failed writes named one by one in [`AutolabelReport::warnings`]; a full disk fails them all.
+const MAX_WRITE_WARNINGS: usize = 20;
+
 /// What [`AutolabelJob::write_frame`] does with a frame's updated label file.
 #[derive(Debug, Clone, Copy, Default)]
 struct FrameWrite {
@@ -168,7 +177,7 @@ pub struct AutolabelReport {
     pub proposals: usize,
     pub accept: usize,
     pub review: usize,
-    /// Pending boxes added to label files.
+    /// Pending boxes added to label files that were written.
     pub added: usize,
     /// Proposals an existing box already covered.
     pub dropped: usize,
@@ -246,6 +255,13 @@ pub struct AutolabelReport {
     pub spot_dismissed: usize,
     /// Boxes accepted at a parked spot the reviewer marked; new ones are left out of `added`.
     pub parked_accepted: usize,
+    /// Label files written.
+    pub frames_saved: usize,
+    /// Label files that could not be written: those frames have no marker and count in nothing
+    /// above but the proposals.
+    pub frames_failed: usize,
+    /// The first of those failures.
+    pub first_write_error: Option<String>,
 }
 
 impl AutolabelReport {
@@ -274,6 +290,38 @@ impl AutolabelReport {
         self.likely += a.likely;
         self.spot_dismissed += a.spot_dismissed;
         self.parked_accepted += a.parked_accepted;
+    }
+
+    /// Note the outcome of [`AutolabelJob::write_frame`] for `rel`; true when the frame went
+    /// through, written or left as it was (only then does the caller count what it did).
+    fn count_write(&mut self, rel: &str, res: Result<bool>) -> bool {
+        match res {
+            Ok(written) => {
+                self.frames_saved += usize::from(written);
+                true
+            }
+            Err(e) => {
+                let text = format!("{rel}: {e:#}");
+                self.frames_failed += 1;
+                if self.frames_failed <= MAX_WRITE_WARNINGS {
+                    tracing::warn!("{text}");
+                    self.warnings.push(text.clone());
+                }
+                self.first_write_error.get_or_insert(text);
+                false
+            }
+        }
+    }
+
+    /// Add what one frame of a run with a model did.
+    fn count_relabel(&mut self, t: &triage::RelabelReport) {
+        self.added += t.apply.merge.added;
+        self.dropped += t.apply.merge.dropped;
+        self.annotated += t.apply.annotated;
+        self.class_suggestions += t.apply.class_suggestions;
+        self.votes += t.votes;
+        self.filtered_closed += t.closed;
+        self.disagreements += usize::from(t.disagreement.is_some());
     }
 
     /// The votes of a labelers or model run, for its summary (empty when it cast none).
@@ -402,12 +450,54 @@ impl AutolabelJob {
         }
     }
 
-    /// The error of a run that failed after `saved` frames went through the write stage: those
-    /// are queued for review like a finished run's, and the message says what is on disk.
+    /// The proposals of a labelers run, flushed by the script frame by frame.
+    fn proposals_file(&self) -> PathBuf {
+        self.work.join("proposals.jsonl")
+    }
+
+    /// What became of the frames [`AutolabelReport::count_write`] could not save and what to do
+    /// about them, for the end of an outcome's text (empty when every frame was saved). A run with
+    /// a model has no proposals file: those frames have no marker, so the same run looks at them
+    /// again.
+    fn write_note(&self, rep: &AutolabelReport) -> String {
+        if rep.frames_failed == 0 {
+            return String::new();
+        }
+        let first = rep.first_write_error.as_deref().unwrap_or("unknown");
+        let mut s = if rep.frames_saved == 0 {
+            format!(
+                "; no label file could be written ({} tried, first: {first})",
+                rep.frames_failed
+            )
+        } else {
+            format!(
+                "; {} of {} label files could not be written (first: {first})",
+                rep.frames_failed,
+                rep.frames_failed + rep.frames_saved
+            )
+        };
+        let kept = self.proposals_file();
+        if kept.is_file() {
+            s.push_str(&format!("; their proposals are kept in {}", kept.display()));
+        }
+        s.push_str(
+            "; free disk space or fix the permissions of the dataset folder, then run the same \
+             auto-label again",
+        );
+        s.push_str(if self.request.frames.again() {
+            " without again=1: it labels only the frames not saved"
+        } else {
+            ": it labels only the frames not saved"
+        });
+        s
+    }
+
+    /// The error of a run that failed after [`AutolabelReport::frames_saved`] frames went through
+    /// the write stage: those are queued for review like a finished run's, and the message says
+    /// what is on disk.
     fn failed_run(
         &self,
         e: anyhow::Error,
-        saved: usize,
         total: usize,
         rep: &AutolabelReport,
         changed: &[String],
@@ -415,8 +505,9 @@ impl AutolabelJob {
         for w in &rep.warnings {
             tracing::warn!("{w}");
         }
+        let saved = rep.frames_saved;
         if saved == 0 {
-            return e.context("the auto-labeler failed");
+            return e.context(format!("the auto-labeler failed{}", self.write_note(rep)));
         }
         let mut msg = format!(
             "the auto-labeler failed after {saved} of {total} frames; those {saved} were saved \
@@ -440,6 +531,7 @@ impl AutolabelJob {
                 rep.reopened
             ));
         }
+        msg.push_str(&self.write_note(rep));
         e.context(msg)
     }
 
@@ -589,14 +681,15 @@ impl AutolabelJob {
 
     /// Update one frame's label file (the pre-fill when it has none) under the label write lock
     /// ([`labels::update`]): `update` returns whether to write it and whether the frame changed
-    /// for the reviewer (then it is queued for review).
+    /// for the reviewer (then it is queued for review). Returns whether it wrote. `update` runs
+    /// before the write: the caller counts what it did only on `Ok`.
     fn write_frame(
         &self,
         sel: &Selected,
         rep: &mut AutolabelReport,
         changed: &mut Vec<String>,
-        update: impl FnOnce(&mut LabelFile, &mut AutolabelReport) -> FrameWrite,
-    ) -> Result<()> {
+        update: impl FnOnce(&mut LabelFile) -> FrameWrite,
+    ) -> Result<bool> {
         let frame = Frame::resolve(&self.dataset_dir, &sel.rel)
             .ok_or_else(|| anyhow!("{} is gone", sel.rel))?;
         let rec = frame.record()?;
@@ -614,7 +707,7 @@ impl AutolabelJob {
                 labels::prefill(&rec, &collect.classes, &collect.hidden_classes)
             });
             let before = file.status;
-            outcome = update(&mut file, rep);
+            outcome = update(&mut file);
             if outcome.write {
                 // Pending boxes of unwanted classes (an older pre-fill, a class hidden since):
                 // rejected, as the Review tab's class change does.
@@ -629,7 +722,7 @@ impl AutolabelJob {
                 changed.push(sel.rel.clone());
             }
         }
-        Ok(())
+        Ok(written)
     }
 
     #[allow(
@@ -641,6 +734,7 @@ impl AutolabelJob {
         ctx: TaskContext<'_>,
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
+        keep_work: &mut bool,
     ) -> Result<TaskOutcome> {
         let started = Instant::now();
         let r = &self.request;
@@ -786,7 +880,7 @@ impl AutolabelJob {
                 .collect();
             let cat_path = self.work.join("categories.json");
             std::fs::write(&cat_path, serde_json::to_vec(&cats)?)?;
-            let out = self.work.join("proposals.jsonl");
+            let out = self.proposals_file();
             let dir_of = |key: &str| -> Result<OsString> {
                 let r = list
                     .iter()
@@ -931,16 +1025,22 @@ impl AutolabelJob {
             let partial = stopped || failure.is_some();
             let text = match std::fs::read_to_string(&out) {
                 Ok(t) => t,
-                Err(e) => match failure {
-                    Some(f) => return Err(f.context("the auto-labeler failed")),
-                    None if stopped && e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    None => return Err(e).with_context(|| format!("reading {}", out.display())),
-                },
+                Err(e) => {
+                    let missing = e.kind() == std::io::ErrorKind::NotFound;
+                    // Something is there and it could not be read: not this code's to delete.
+                    *keep_work = !missing;
+                    match failure {
+                        Some(f) => return Err(f.context("the auto-labeler failed")),
+                        None if stopped && missing => String::new(),
+                        None => {
+                            return Err(e).with_context(|| format!("reading {}", out.display()));
+                        }
+                    }
+                }
             };
             let by_rel: BTreeMap<&str, &Selected> =
                 frames.iter().map(|f| (f.rel.as_str(), f)).collect();
             let mut done: BTreeSet<&str> = BTreeSet::new();
-            let mut saved = 0;
             let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
             for (i, line) in lines.iter().enumerate() {
                 if i % 10 == 0 {
@@ -996,7 +1096,8 @@ impl AutolabelJob {
                 };
                 // Decided from the file as it is now: a reviewer may have got to the frame since
                 // it was selected.
-                let res = self.write_frame(sel, &mut rep, &mut changed, |file, rep| {
+                let mut applied = None;
+                let res = self.write_frame(sel, &mut rep, &mut changed, |file| {
                     file.auto_run = Some(marker);
                     let memory = spot_memory.of(&sel.rel).map(|memory| triage::FrameSpots {
                         memory,
@@ -1005,19 +1106,22 @@ impl AutolabelJob {
                     });
                     let a =
                         triage::apply_labelers(file, boxes, self.short_labeler(), &sel.rel, memory);
-                    rep.count_labelers(&a);
-                    FrameWrite {
+                    let write = FrameWrite {
                         write: true,
                         queue: a.for_review(),
-                    }
+                    };
+                    applied = Some(a);
+                    write
                 });
-                match res {
-                    Ok(()) => saved += 1,
-                    Err(e) => rep.warnings.push(format!("{}: {e:#}", sel.rel)),
+                if rep.count_write(&sel.rel, res)
+                    && let Some(a) = applied
+                {
+                    rep.count_labelers(&a);
                 }
             }
             if let Some(e) = failure {
-                return Err(self.failed_run(e, saved, frames.len(), &rep, &changed));
+                *keep_work = rep.frames_failed > 0;
+                return Err(self.failed_run(e, frames.len(), &rep, &changed));
             }
             (stopped, done.len())
         };
@@ -1029,11 +1133,19 @@ impl AutolabelJob {
         rep.frames_total = frames.len();
         rep.frames_done = frames_done;
         rep.frames = frames_done;
+        *keep_work = rep.frames_failed > 0;
+        // A Cancel keeps its outcome: the record of a cancelled task takes no error, and this says
+        // what happened to the frames.
+        if rep.frames_failed > 0 && rep.frames_saved == 0 && !stopped {
+            bail!("{}", self.write_note(&rep).trim_start_matches("; "));
+        }
         crate::collect::layout::append_review(&self.dataset_dir, &changed)
             .context("queueing the labelled frames for review")?;
         rep.sample = changed.iter().take(20).cloned().collect();
         rep.seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
-        let _ = crate::resources::manager::remove_any(&self.work);
+        if !*keep_work {
+            let _ = crate::resources::manager::remove_any(&self.work);
+        }
         self.step(report, 5, 100, &format!("{} frames changed", changed.len()));
         let summary = if r.missing_only {
             let mut s = if stopped {
@@ -1082,7 +1194,7 @@ impl AutolabelJob {
                  done)",
                 n(frames_done),
                 n(frames.len()),
-                n(frames_done),
+                n(rep.frames_saved),
                 n(rep.proposals),
                 n(rep.accept),
                 n(rep.review),
@@ -1109,6 +1221,12 @@ impl AutolabelJob {
                 s.push_str(&format!(
                     "; {} detections of classes outside this run left out",
                     rep.dropped_other_class
+                ));
+            }
+            if rep.filtered_closed > 0 {
+                s.push_str(&format!(
+                    "; {} detections left out on skipped or confirmed-empty frames",
+                    rep.filtered_closed
                 ));
             }
             if rep.skipped_done > 0 {
@@ -1146,7 +1264,7 @@ impl AutolabelJob {
             summary + &rep.labelers_notes()
         } else {
             summary + &rep.votes_note()
-        };
+        } + &self.write_note(&rep);
         Ok(TaskOutcome {
             summary,
             result: serde_json::to_value(&rep)?,
@@ -1297,21 +1415,24 @@ impl AutolabelJob {
             if r.missing_only {
                 // [`triage::apply_missing`] rechecks the scope under the write lock: the
                 // reviewer may have changed the frame while the model ran.
-                let res = self.write_frame(f, rep, changed, |file, rep| {
+                let mut applied = None;
+                let res = self.write_frame(f, rep, changed, |file| {
                     let m = triage::apply_missing(file, out.boxes, &plan.name);
-                    rep.added += m.added;
-                    rep.overwritten += m.overwritten;
-                    rep.candidates += m.candidates();
-                    rep.dropped += m.covered + m.judged + m.full;
-                    rep.dropped_judged += m.judged;
+                    applied = Some(m);
                     let gained = m.candidates() > 0;
                     FrameWrite {
                         write: gained,
                         queue: gained,
                     }
                 });
-                if let Err(e) = res {
-                    rep.warnings.push(format!("{}: {e:#}", f.rel));
+                if rep.count_write(&f.rel, res)
+                    && let Some(m) = applied
+                {
+                    rep.added += m.added;
+                    rep.overwritten += m.overwritten;
+                    rep.candidates += m.candidates();
+                    rep.dropped += m.covered + m.judged + m.full;
+                    rep.dropped_judged += m.judged;
                 }
                 continue;
             }
@@ -1320,29 +1441,26 @@ impl AutolabelJob {
                 labeler: labeler.to_string(),
                 classes: self.classes.clone(),
             };
-            let res = self.write_frame(f, rep, changed, |file, rep| {
+            let mut applied = None;
+            let res = self.write_frame(f, rep, changed, |file| {
                 file.auto_run = Some(marker);
                 let t = triage::apply_relabel(file, &d, out.boxes, &plan.name, &self.classes);
-                let (a, disagrees) = (t.apply, t.disagreement.is_some());
-                rep.added += a.merge.added;
-                rep.dropped += a.merge.dropped;
-                rep.annotated += a.annotated;
-                rep.class_suggestions += a.class_suggestions;
-                rep.votes += t.votes;
-                if disagrees {
-                    rep.disagreements += 1;
-                }
-                FrameWrite {
+                let a = &t.apply;
+                let write = FrameWrite {
                     write: true,
                     // A vote is no change for a reviewer: it does not queue the frame.
                     queue: a.merge.added > 0
                         || a.annotated > 0
                         || a.class_suggestions > 0
-                        || disagrees,
-                }
+                        || t.disagreement.is_some(),
+                };
+                applied = Some(t);
+                write
             });
-            if let Err(e) = res {
-                rep.warnings.push(format!("{}: {e:#}", f.rel));
+            if rep.count_write(&f.rel, res)
+                && let Some(t) = applied
+            {
+                rep.count_relabel(&t);
             }
         }
         Ok((stopped, todo.len()))
@@ -1566,8 +1684,9 @@ impl Task for AutolabelJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
-        let r = self.stages(ctx, report, cancel);
-        if r.is_err() {
+        let mut keep_work = false;
+        let r = self.stages(ctx, report, cancel, &mut keep_work);
+        if r.is_err() && !keep_work {
             let _ = crate::resources::manager::remove_any(&self.work);
         }
         let mut out = r?;
@@ -1576,7 +1695,13 @@ impl Task for AutolabelJob {
             && out.result.get("cancelled") != Some(&serde_json::Value::Bool(true))
         {
             let scope = self.request.frames.import().filter(|i| *i != "any");
-            let lines = fin.apply(&self.dataset_dir, scope, &self.config.collect.classes);
+            let collect = &self.config.collect;
+            let lines = fin.apply(
+                &self.dataset_dir,
+                scope,
+                &collect.classes,
+                &collect.hidden_classes,
+            );
             crate::training::finish::append(&mut out, lines);
         }
         Ok(out)

@@ -3,12 +3,16 @@
 //! folder, and `<dir>/review-queue.jsonl`. Names, the relative-path check every served or
 //! queued path goes through ([`parse_rel`], [`resolve`]), the summary rebuilt from the index
 //! files ([`Summary::scan`]) and the review queue ([`append_review`]).
+//!
+//! The JSONL files survive a crash or a full disk: [`append_line`] ends a torn last line before
+//! writing, and [`read_lines`] costs a damaged line only that line, and counts it.
 
 use super::record::{Bucket, IndexLine, Record};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Index file of a day folder.
@@ -205,6 +209,13 @@ pub struct Summary {
     pub by_label: BTreeMap<String, BTreeMap<String, u64>>,
     /// Newest frames per bucket, newest first.
     pub newest: BTreeMap<Bucket, VecDeque<FrameRef>>,
+    /// Index lines a scan could not read ([`read_lines`]): frames it does not count.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub damaged_lines: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Summary {
@@ -260,8 +271,8 @@ impl Summary {
     }
 
     /// Rebuild from every `<scene>/<camera>/<date>/index.jsonl` under `dir` (a missing folder
-    /// is an empty dataset). Lines that do not parse are skipped; the newest frames listed must
-    /// still have their image.
+    /// is an empty dataset). Lines that do not parse are skipped and counted
+    /// ([`Self::damaged_lines`]); the newest frames listed must still have their image.
     pub fn scan(dir: &Path) -> Self {
         let mut s = Self::default();
         for day in day_dirs(dir) {
@@ -270,21 +281,38 @@ impl Summary {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
-            for line in read_index(&day.join(INDEX_FILE)) {
+            let index = read_lines::<IndexLine>(&day.join(INDEX_FILE));
+            s.damaged_lines += index.damaged as u64;
+            for line in index.lines {
                 s.add(&line, &date);
             }
         }
         for list in s.newest.values_mut() {
             list.retain(|f| resolve(dir, &f.rel, "jpg").is_some());
         }
+        if s.damaged_lines > 0 {
+            tracing::warn!(
+                "{}: {} index line(s) could not be read (a crash or a full disk while writing?) \
+                 and are skipped; those frames stay on disk but are not counted",
+                dir.display(),
+                s.damaged_lines
+            );
+        }
         s
     }
 }
 
-/// Subfolders of `p` that are real directories (symlinks skipped), sorted.
-fn subdirs(p: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(p) else {
-        return Vec::new();
+/// Subfolders of `p` that are real directories (symlinks skipped), sorted; `p` itself in
+/// `unreadable` when it exists and cannot be listed.
+fn subdirs(p: &Path, unreadable: &mut Vec<PathBuf>) -> Vec<PathBuf> {
+    let rd = match std::fs::read_dir(p) {
+        Ok(rd) => rd,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                unreadable.push(p.to_path_buf());
+            }
+            return Vec::new();
+        }
     };
     let mut out: Vec<PathBuf> = rd
         .flatten()
@@ -297,9 +325,16 @@ fn subdirs(p: &Path) -> Vec<PathBuf> {
 
 /// Every `<dir>/<scene>/<camera>/<date>` folder with valid names, oldest date first.
 pub fn day_dirs(dir: &Path) -> Vec<PathBuf> {
+    day_dirs_checked(dir).0
+}
+
+/// [`day_dirs`], and the scene and camera folders it could not list, so a caller that must not
+/// shrink silently can say so.
+pub fn day_dirs_checked(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     for scene in SCENES {
-        for cam in subdirs(&dir.join(scene)) {
+        for cam in subdirs(&dir.join(scene), &mut unreadable) {
             let cam_ok = cam
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -307,7 +342,7 @@ pub fn day_dirs(dir: &Path) -> Vec<PathBuf> {
             if !cam_ok {
                 continue;
             }
-            for day in subdirs(&cam) {
+            for day in subdirs(&cam, &mut unreadable) {
                 if day
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -319,25 +354,64 @@ pub fn day_dirs(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)));
+    (out, unreadable)
+}
+
+/// What a JSONL file holds: the lines that parse, and how many did not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonLines<T> {
+    pub lines: Vec<T>,
+    /// Lines that do not parse (torn by a crash, a damaged byte, an unknown format).
+    pub damaged: usize,
+    /// Why the file could not be read at all (a missing file is no failure: nothing in it).
+    pub failed: Option<String>,
+}
+
+/// The lines of the JSONL file `path`. Bytes are split on newlines and decoded lossily, so a
+/// damaged byte costs its own line, not the file; blank lines are not lines.
+pub fn read_lines<T: DeserializeOwned>(path: &Path) -> JsonLines<T> {
+    let mut out = JsonLines {
+        lines: Vec::new(),
+        damaged: 0,
+        failed: None,
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                out.failed = Some(format!("{}: {e}", path.display()));
+            }
+            return out;
+        }
+    };
+    for line in bytes.split(|b| *b == b'\n') {
+        let text = String::from_utf8_lossy(line);
+        if text.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(&text) {
+            Ok(v) => out.lines.push(v),
+            Err(_) => out.damaged += 1,
+        }
+    }
     out
 }
 
-/// The parsable lines of an index file (none when it is missing).
+/// The parsable lines of an index file (none when it is missing or cannot be read).
 pub fn read_index(path: &Path) -> Vec<IndexLine> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    read_lines(path).lines
 }
 
 /// Rewrite `day`'s index without the frames whose image is gone (after retention), atomically.
 /// Returns the lines kept.
 pub fn rewrite_index(day: &Path) -> Result<usize> {
     let path = day.join(INDEX_FILE);
-    let lines = read_index(&path);
+    let index = read_lines::<IndexLine>(&path);
+    // Rewriting from an index that could not be read would drop every frame's line.
+    if let Some(e) = index.failed {
+        bail!("reading {e}");
+    }
+    let lines = index.lines;
     let kept: Vec<&IndexLine> = lines
         .iter()
         .filter(|l| day.join(format!("{}.jpg", l.id)).is_file())
@@ -381,13 +455,31 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
-/// Append one line (with its newline) to `path` in a single write.
+/// Whether the file `f` is empty or ends in a newline (a crash or a full disk mid-append leaves
+/// it without one).
+fn ends_a_line(f: &mut std::fs::File) -> std::io::Result<bool> {
+    if f.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    f.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)?;
+    Ok(last == *b"\n")
+}
+
+/// Append one line (with its newline) to `path` in a single write, so concurrent appenders do not
+/// interleave. After a torn last line the write starts with a newline: the torn line stays a bad
+/// line of its own and this one is whole.
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)?;
-    let mut buf = Vec::with_capacity(line.len() + 1);
+    let mut buf = Vec::with_capacity(line.len() + 2);
+    if !ends_a_line(&mut f)? {
+        buf.push(b'\n');
+    }
     buf.extend_from_slice(line.as_bytes());
     buf.push(b'\n');
     f.write_all(&buf)
@@ -457,12 +549,19 @@ pub fn append_review(dir: &Path, rels: &[String]) -> Result<usize> {
 
 /// The parsable lines of the review queue.
 pub fn read_review(path: &Path) -> Vec<ReviewLine> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    read_lines(path).lines
+}
+
+/// Lines of `dir`'s review queue that could not be read (with `all_days`, of its index files too):
+/// frames the queue cannot list.
+pub fn damaged_lines(dir: &Path, all_days: bool) -> u64 {
+    let queue = read_lines::<ReviewLine>(&dir.join(REVIEW_QUEUE_FILE)).damaged as u64;
+    if !all_days {
+        return queue;
+    }
+    day_dirs(dir).iter().fold(queue, |n, day| {
+        n + read_lines::<IndexLine>(&day.join(INDEX_FILE)).damaged as u64
+    })
 }
 
 #[cfg(test)]
@@ -594,5 +693,160 @@ mod tests {
         assert_eq!(s.frames, 2);
         assert_eq!(s.by_label["dog"]["night"], 1);
         assert_eq!(s.by_label[NO_DETECTION]["night"], 1);
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bop-layout-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn review_line(frame: &str) -> ReviewLine {
+        ReviewLine {
+            version: REVIEW_VERSION,
+            frame: frame.into(),
+            sidecar: frame.replace(".jpg", ".json"),
+            id: "x".into(),
+            buckets: vec![Bucket::Positive],
+            scene: "ir".into(),
+            camera: "cam".into(),
+            queued_at: "2026-10-22T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_torn_last_line_does_not_swallow_the_next_good_one() {
+        let dir = tmp("torn");
+        // An index: crash or ENOSPC mid-append left half a line and no newline.
+        let index = dir.join(INDEX_FILE);
+        let good = serde_json::to_string(&index_line("a", "ir", &[])).unwrap();
+        std::fs::write(&index, format!("{good}\n{{\"id\":\"tor")).unwrap();
+        let next = serde_json::to_string(&index_line("b", "ir", &[])).unwrap();
+        append_line(&index, &next).unwrap();
+        let ids: Vec<String> = read_index(&index).into_iter().map(|l| l.id).collect();
+        assert_eq!(ids, ["a", "b"]);
+        // The review queue the same way.
+        let queue = dir.join(REVIEW_QUEUE_FILE);
+        let good = serde_json::to_string(&review_line("ir/c/2026-10-22/a.jpg")).unwrap();
+        std::fs::write(&queue, format!("{good}\n{{\"version\":1,\"fr")).unwrap();
+        let next = serde_json::to_string(&review_line("ir/c/2026-10-22/b.jpg")).unwrap();
+        append_line(&queue, &next).unwrap();
+        let frames: Vec<String> = read_review(&queue).into_iter().map(|l| l.frame).collect();
+        assert_eq!(frames, ["ir/c/2026-10-22/a.jpg", "ir/c/2026-10-22/b.jpg"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_invalid_byte_costs_only_its_line() {
+        let dir = tmp("utf8");
+        let index = dir.join(INDEX_FILE);
+        let mut bytes = Vec::new();
+        for id in ["a", "b"] {
+            bytes.extend_from_slice(
+                serde_json::to_string(&index_line(id, "ir", &[]))
+                    .unwrap()
+                    .as_bytes(),
+            );
+            bytes.push(b'\n');
+            bytes.extend_from_slice(b"\xff\xfe not json\n");
+        }
+        std::fs::write(&index, &bytes).unwrap();
+        assert_eq!(read_index(&index).len(), 2);
+        let read = read_lines::<IndexLine>(&index);
+        assert_eq!((read.lines.len(), read.damaged), (2, 2));
+        assert_eq!(read.failed, None);
+        let queue = dir.join(REVIEW_QUEUE_FILE);
+        let mut bytes = serde_json::to_vec(&review_line("ir/c/2026-10-22/a.jpg")).unwrap();
+        bytes.extend_from_slice(b"\n\xff\n");
+        std::fs::write(&queue, &bytes).unwrap();
+        assert_eq!(read_review(&queue).len(), 1);
+        assert_eq!(read_lines::<ReviewLine>(&queue).damaged, 1);
+        // Damage inside a string is kept, replaced: the line still names its frame.
+        let line = serde_json::to_string(&review_line("ir/c/2026-10-22/a.jpg")).unwrap();
+        let bytes = line.replace("\"x\"", "\"\u{1}\"").into_bytes();
+        let at = bytes.iter().position(|b| *b == 1).unwrap();
+        let mut damaged = bytes.clone();
+        damaged[at] = 0xff;
+        std::fs::write(&queue, &damaged).unwrap();
+        let read = read_lines::<ReviewLine>(&queue);
+        assert_eq!((read.lines.len(), read.damaged), (1, 0));
+        assert_eq!(read.lines[0].id, "\u{fffd}");
+        // A missing file is empty, with nothing to report.
+        let none = read_lines::<ReviewLine>(&dir.join("none.jsonl"));
+        assert_eq!((none.lines.len(), none.damaged, none.failed), (0, 0, None));
+        // A file that cannot be read is said to be so.
+        let folder = read_lines::<ReviewLine>(&dir);
+        assert!(folder.failed.is_some());
+        assert!(
+            rewrite_index(&dir.join("x")).is_ok(),
+            "no index, nothing to do"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scan_counts_the_lines_it_could_not_read() {
+        let dir = tmp("scan");
+        let day = dir.join("night/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        let mut bytes = serde_json::to_vec(&index_line("a", "night", &[])).unwrap();
+        bytes.extend_from_slice(b"\n\xff\xfe\n{\"id\":\"torn");
+        std::fs::write(day.join(INDEX_FILE), &bytes).unwrap();
+        let s = Summary::scan(&dir);
+        assert_eq!((s.frames, s.damaged_lines), (1, 2));
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["damaged_lines"],
+            serde_json::json!(2)
+        );
+        assert!(
+            serde_json::to_value(Summary::default()).unwrap()["damaged_lines"].is_null(),
+            "an intact dataset's summary is unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_index_is_not_rewritten_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let day = tmp("eacces");
+        let index = day.join(INDEX_FILE);
+        append_line(
+            &index,
+            &serde_json::to_string(&index_line("a", "ir", &[])).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&index).is_err() {
+            assert!(rewrite_index(&day).is_err());
+            assert!(index.exists(), "kept");
+        }
+        let _ = std::fs::remove_dir_all(&day);
+    }
+
+    #[test]
+    fn appending_to_an_empty_file_or_after_a_newline_adds_no_blank_line() {
+        let dir = tmp("plain");
+        let p = dir.join("x.jsonl");
+        append_line(&p, "1").unwrap();
+        append_line(&p, "2").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"1\n2\n");
+        // A torn tail gets its newline in the same write.
+        std::fs::write(&p, b"1\n2").unwrap();
+        append_line(&p, "3").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"1\n2\n3\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_index_is_not_deleted_as_empty() {
+        let day = tmp("rewrite");
+        std::fs::write(day.join("a.jpg"), b"x").unwrap();
+        let mut bytes = serde_json::to_vec(&index_line("a", "ir", &[])).unwrap();
+        bytes.extend_from_slice(b"\n\xff\n");
+        std::fs::write(day.join(INDEX_FILE), &bytes).unwrap();
+        assert_eq!(rewrite_index(&day).unwrap(), 1);
+        assert_eq!(read_index(&day.join(INDEX_FILE)).len(), 1);
+        let _ = std::fs::remove_dir_all(&day);
     }
 }

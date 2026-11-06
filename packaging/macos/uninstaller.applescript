@@ -6,6 +6,8 @@
 property appTitle : "Uninstall Blue Onyx Prism"
 property uninstallScript : "/usr/local/blue-onyx-prism/scripts/uninstall_launchd.sh"
 property dataDir : "/usr/local/var/blue-onyx-prism"
+property logDir : "/var/log/blue-onyx-prism"
+property dataKinds : "configuration, models, dataset, reviewed labels and training runs"
 
 on run
 	try
@@ -15,7 +17,7 @@ on run
 		return
 	end try
 
-	set answer to button returned of (display dialog "Uninstall Blue Onyx Prism?" & return & return & "This stops the service and removes the program." & return & return & "Your configuration, models and logs (" & dataDir & ") can be kept for a later reinstall, or deleted too." buttons {"Cancel", "Delete Everything", "Keep My Data"} default button "Keep My Data" cancel button "Cancel" with title appTitle with icon caution)
+	set answer to button returned of (display dialog "Uninstall Blue Onyx Prism?" & return & return & "This stops the service and removes the program." & return & return & "Your " & dataKinds & " (" & dataDir & ") and your logs (" & logDir & ") can be kept for a later reinstall. Delete Everything removes them for good, and it cannot be undone." buttons {"Cancel", "Delete Everything", "Keep My Data"} default button "Keep My Data" cancel button "Cancel" with title appTitle with icon caution)
 
 	set flags to ""
 	if answer is "Delete Everything" then set flags to " --purge"
@@ -47,7 +49,7 @@ on run
 	if answer is "Delete Everything" then
 		set doneText to "Blue Onyx Prism and all its data were removed."
 	else
-		set doneText to "Blue Onyx Prism was removed. Your configuration, models and logs were kept in " & dataDir & "."
+		set doneText to "Blue Onyx Prism was removed. Your " & dataKinds & " were kept in " & dataDir & ", your logs in " & logDir & "." & return & return & "A reinstall picks them up. To delete them, run in Terminal: sudo rm -rf " & dataDir & " " & logDir
 	end if
 	display dialog doneText buttons {"OK"} default button "OK" with title appTitle with icon note
 end run

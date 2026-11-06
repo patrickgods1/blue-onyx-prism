@@ -1,7 +1,8 @@
 #!/bin/bash
 # Installer postinstall (runs as root). $2 = install location, $3 = target volume.
 # Mirrors scripts/install_launchd.sh for the runtime-less pkg: the service downloads OpenVINO /
-# ONNX Runtime itself on first start into download_dir. An existing config is never overwritten.
+# ONNX Runtime itself on first start into download_dir. An existing config is never overwritten,
+# and an uninstall that kept the data leaves this data root for the install to pick up.
 set -euo pipefail
 
 TARGET="${3:-/}"
@@ -19,7 +20,25 @@ fi
 # shellcheck source=scripts/launchd_common.sh
 . "$COMMON"
 
+# Kept data can belong to an earlier _blueonyx with another id (the account was deleted by hand
+# and made again). Before bop_create_dirs, which corrects the top folders only and would hide the
+# mismatch. -h and the `/.`: links are never followed (uv's Python environment has some), a data
+# root that is itself a link to a larger disk is. A failure warns: the data is intact.
+own_kept_dirs() {
+  local dir want have
+  for dir in "$DATA_DIR" "$LOG_DIR"; do
+    [ -d "$dir" ] || continue
+    want="$(id -u "$SVC"):$(id -g "$SVC")"
+    have="$(stat -Lf %u:%g "$dir")"
+    [ "$have" != "$want" ] || continue
+    echo "$dir belongs to $have, not to $SVC ($want): changing its owner, which can take a while."
+    chown -hR "$SVC:$SVC" "$dir/." \
+      || echo "Could not change the owner of everything in $dir, so the service may fail to read it. Fix it with: sudo chown -hR $SVC:$SVC $dir/." >&2
+  done
+}
+
 bop_create_account
+own_kept_dirs
 bop_create_dirs
 bop_install_newsyslog
 bop_seed_config

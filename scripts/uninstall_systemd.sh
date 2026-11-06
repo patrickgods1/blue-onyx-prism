@@ -4,8 +4,9 @@
 #
 # Stops and disables the unit and removes its unit file. The program dir (e.g.
 # /opt/blue-onyx-prism) is left alone: delete it yourself. The data root
-# /var/lib/blue-onyx-prism (config, models, cache, downloads, benchmark.json) and the service
-# user `blueonyx` are kept unless --purge is given.
+# /var/lib/blue-onyx-prism (config, models, cache, downloads, benchmark.json, and by default the
+# dataset, reviewed labels and training runs) and the service user `blueonyx` are kept unless
+# --purge is given.
 set -euo pipefail
 
 DATA_DIR=/var/lib/blue-onyx-prism
@@ -39,5 +40,5 @@ if [ "$PURGE" -eq 1 ]; then
   fi
   echo "Deleted $DATA_DIR and the user blueonyx."
 else
-  echo "Kept $DATA_DIR (config, models, cache) and the user blueonyx; run with --purge to delete them."
+  echo "Kept $DATA_DIR (config, models, dataset, reviewed labels, training runs) and the user blueonyx; run with --purge to delete them."
 fi

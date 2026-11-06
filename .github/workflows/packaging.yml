@@ -55,6 +55,9 @@ jobs:
           shellcheck -x -S warning scripts/*systemd*.sh scripts/*launchd*.sh packaging/*.sh \
             packaging/linux/*.sh packaging/linux/debian/* packaging/linux/rpm/*.sh \
             packaging/macos/*.sh packaging/macos/scripts/*
+      - name: Test package scriptlets
+        if: runner.os == 'Linux'
+        run: packaging/linux/test-scriptlets.sh
       - name: Build installers
         shell: bash
         run: packaging/build-installers.sh ${{ matrix.target }} dist

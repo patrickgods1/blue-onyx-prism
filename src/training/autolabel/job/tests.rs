@@ -47,6 +47,11 @@ fn host() -> Capability {
 
 /// `n` imported 64x48 frames (gray = IR, else colour) in `<root>/dataset`; returns their paths.
 fn frames(root: &Path, n: usize, gray: bool) -> Vec<String> {
+    frames_every(root, n, gray, 1)
+}
+
+/// [`frames`], `step` seconds apart (a day apart = each in its own folder).
+fn frames_every(root: &Path, n: usize, gray: bool, step: u64) -> Vec<String> {
     let dir = root.join("dataset");
     let src = root.join("src.jpg");
     let mut rgb = Vec::with_capacity(64 * 48 * 3);
@@ -72,7 +77,8 @@ fn frames(root: &Path, n: usize, gray: bool) -> Vec<String> {
             file: src.clone(),
             image_name: "cam.jpg".into(),
             camera: "cam".into(),
-            time: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + i as u64),
+            time: std::time::SystemTime::UNIX_EPOCH
+                + Duration::from_secs(1_800_000_000 + i as u64 * step),
             width: 64,
             height: 48,
             stats,
@@ -106,6 +112,15 @@ struct LabelFake {
     boxes: Option<serde_json::Value>,
     /// Label files a reviewer saves while the script runs (path, new content).
     saved_during_run: Vec<(PathBuf, LabelFile)>,
+    /// Label files that cannot be written from the moment the script runs ([`unwritable`]).
+    broken_during_run: Vec<PathBuf>,
+}
+
+/// Make [`labels::update`] fail on the label file at `path`, on every OS, as a full disk or a lost
+/// permission fails it after the frames were selected. The update stops at the read, before the
+/// triage; [`a_box_that_was_not_written_is_not_counted_as_added`] covers a write that fails after it.
+fn unwritable(path: &Path) {
+    std::fs::write(path, b"not a label file").unwrap();
 }
 
 impl CommandRunner for LabelFake {
@@ -121,6 +136,9 @@ impl CommandRunner for LabelFake {
         self.cmds.lock().unwrap().push(cmd.clone());
         for (path, f) in &self.saved_during_run {
             labels::write(path, f).unwrap();
+        }
+        for path in &self.broken_during_run {
+            unwritable(path);
         }
         let list = arg_after(cmd, "--frames").unwrap();
         let out = arg_after(cmd, "--out").unwrap();
@@ -3442,4 +3460,369 @@ fn a_sam3_run_reads_no_spot() {
     let out = run_job(&sam3_job(&cfg), &fake).unwrap();
     assert_eq!(out.result["spot_dismissed"], 0, "{}", out.result);
     assert_eq!(labels_of(&dir, &rels[2]).boxes[0].state, BoxState::Pending);
+}
+
+/// The label files of `rels` (the failure seam of [`LabelFake::broken_during_run`]).
+fn label_paths(dir: &Path, rels: &[String]) -> Vec<PathBuf> {
+    rels.iter()
+        .map(|r| Frame::resolve(dir, r).unwrap().labels)
+        .collect()
+}
+
+#[test]
+fn a_frame_that_cannot_be_written_keeps_the_proposals_and_says_where() {
+    let t = tmp("write-fails");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let broken = Frame::resolve(&dir, &rels[1]).unwrap().labels;
+    std::fs::remove_file(dir.join(crate::collect::layout::REVIEW_QUEUE_FILE)).unwrap();
+    let fake = LabelFake {
+        broken_during_run: vec![broken.clone()],
+        ..LabelFake::default()
+    };
+    let out = run_job(&job, &fake).unwrap();
+    let kept = job.work.join("proposals.jsonl");
+    assert!(kept.is_file(), "the only copy of the frame's proposals");
+    let rep = &out.result;
+    assert_eq!(
+        (&rep["frames_saved"], &rep["frames_failed"]),
+        (&2.into(), &1.into()),
+        "{rep}"
+    );
+    // The two frames written, two boxes each: the failed frame's boxes are not counted.
+    assert_eq!(rep["added"], 4, "{rep}");
+    assert!(
+        out.summary
+            .contains("1 of 3 label files could not be written"),
+        "{}",
+        out.summary
+    );
+    assert!(
+        out.summary.contains(&kept.display().to_string()),
+        "{}",
+        out.summary
+    );
+    assert_eq!(std::fs::read_to_string(&kept).unwrap().lines().count(), 3);
+    // Queued: the saved frames only.
+    assert_eq!(review_queue(&dir).len(), 2);
+
+    // Once the folder is writable again, a rerun labels only the frame that was lost.
+    std::fs::remove_file(&broken).unwrap();
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    assert_eq!(out.result["frames"], 1, "{}", out.result);
+    assert_eq!(out.result["frames_failed"], 0, "{}", out.result);
+    assert!(!job.work.exists(), "a clean run removes its work folder");
+    assert!(
+        !out.summary.contains("could not be written"),
+        "{}",
+        out.summary
+    );
+}
+
+/// The file reads and only the write fails, as on a full disk: the triage ran, and what it would
+/// have added must not be reported as added.
+#[cfg(unix)]
+#[test]
+fn a_box_that_was_not_written_is_not_counted_as_added() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tmp("write-fails-added");
+    let rels = frames_every(&t.0, 2, false, 86_400);
+    let dir = t.0.join("dataset");
+    let day = Frame::resolve(&dir, &rels[0])
+        .unwrap()
+        .labels
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let set = |mode| std::fs::set_permissions(&day, std::fs::Permissions::from_mode(mode));
+    set(0o555).unwrap();
+    if std::fs::File::create(day.join("probe")).is_ok() {
+        // Root ignores the mode: nothing to test here.
+        let _ = set(0o755);
+        return;
+    }
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out = run_job(&job, &LabelFake::default());
+    set(0o755).unwrap();
+    let rep = out.unwrap().result;
+    assert_eq!(
+        (&rep["frames_saved"], &rep["frames_failed"]),
+        (&1.into(), &1.into()),
+        "{rep}"
+    );
+    assert_eq!(rep["added"], 2, "the saved frame's two boxes: {rep}");
+}
+
+#[test]
+fn a_run_that_saves_no_frame_fails_and_keeps_the_proposals() {
+    let t = tmp("write-fails-all");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let fake = LabelFake {
+        broken_during_run: label_paths(&dir, &rels),
+        ..LabelFake::default()
+    };
+    let text = format!("{:#}", run_job(&job, &fake).unwrap_err());
+    assert!(
+        text.contains("no label file could be written (2 tried"),
+        "{text}"
+    );
+    let kept = job.work.join("proposals.jsonl");
+    assert!(text.contains(&kept.display().to_string()), "{text}");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap().lines().count(), 2);
+}
+
+#[test]
+fn a_failed_run_with_a_failed_write_keeps_the_proposals_too() {
+    for (broken, says) in [
+        (1, "1 of 2 label files could not be written"),
+        (2, "no label file could be written (2 tried"),
+    ] {
+        let t = tmp("write-fails-crash");
+        let rels = frames(&t.0, 4, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        let job =
+            plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+        // The queue's order is newest first: the last two frames finish, then the script dies,
+        // and `broken` of those two cannot be saved.
+        let fake = LabelFake {
+            fail_after: Some(2),
+            broken_during_run: label_paths(&dir, &rels[4 - broken..]),
+            ..LabelFake::default()
+        };
+        let text = format!("{:#}", run_job(&job, &fake).unwrap_err());
+        assert!(text.contains("the GPU fell off the bus"), "{text}");
+        assert!(text.contains(says), "{text}");
+        let kept = job.work.join("proposals.jsonl");
+        assert!(text.contains(&kept.display().to_string()), "{text}");
+        assert!(kept.is_file(), "the only copy of those proposals");
+    }
+}
+
+#[test]
+fn a_stopped_run_says_which_frames_were_not_saved() {
+    let t = tmp("write-fails-stop");
+    let rels = frames(&t.0, 4, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let fake = LabelFake {
+        stop_after: Some(3),
+        // Newest first: the last frame is one of the two that finish.
+        broken_during_run: label_paths(&dir, &rels[3..]),
+        ..LabelFake::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let ctx = TaskContext {
+        runner: &fake,
+        fetcher: &fake,
+    };
+    let out = job.run(ctx, &mut |_| {}, &cancel).unwrap();
+    assert!(
+        out.summary.contains("those 1 were saved"),
+        "the frame not written is not called saved: {}",
+        out.summary
+    );
+    assert!(
+        out.summary
+            .contains("1 of 2 label files could not be written"),
+        "{}",
+        out.summary
+    );
+    assert!(job.work.join("proposals.jsonl").is_file());
+}
+
+#[test]
+fn a_model_run_counts_what_it_saved() {
+    let t = tmp("write-fails-model");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let dets: BTreeMap<String, Vec<Det>> = rels
+        .iter()
+        .map(|r| (r.clone(), vec![det("car", 0.9, [1.0, 1.0, 30.0, 20.0])]))
+        .collect();
+    let run = |broken: &[String]| {
+        let mut req = AutolabelRequest::new(FrameFilter::default());
+        req.with_model = Some("IPcam-general".into());
+        let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+        job.detector = Some(Arc::new(StallingDetector {
+            dets: dets.clone(),
+            before_returning: label_paths(&dir, broken),
+        }));
+        run_job(&job, &LabelFake::default())
+    };
+    // One frame fails: the run is done, and says so.
+    let out = run(&rels[..1]).unwrap();
+    let rep = &out.result;
+    assert_eq!(
+        (&rep["frames_saved"], &rep["frames_failed"]),
+        (&2.into(), &1.into()),
+        "{rep}"
+    );
+    assert_eq!(rep["added"], 2, "{rep}");
+    assert!(
+        out.summary
+            .contains("1 of 3 label files could not be written"),
+        "{}",
+        out.summary
+    );
+    // The two saved frames are skipped by their marker, and the last one still cannot be saved.
+    // No frame saved: a failure.
+    std::fs::remove_file(Frame::resolve(&dir, &rels[0]).unwrap().labels).unwrap();
+    let text = format!("{:#}", run(&rels[..1]).unwrap_err());
+    assert!(
+        text.contains("no label file could be written (1 tried"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_missing_only_run_counts_what_it_saved() {
+    let t = tmp("write-fails-missing");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    for r in &rels {
+        labels::write(
+            &Frame::resolve(&dir, r).unwrap().labels,
+            &reviewed_car(vec![]),
+        )
+        .unwrap();
+    }
+    let cfg = config(&t.0);
+    let far = det("person", 0.9, [40.0, 20.0, 60.0, 46.0]);
+    let dets: BTreeMap<String, Vec<Det>> = rels
+        .iter()
+        .map(|r| (r.clone(), vec![far.clone()]))
+        .collect();
+    let mut req =
+        AutolabelRequest::new(FrameFilter::parse("status=reviewed", "unreviewed").unwrap());
+    req.with_model = Some("IPcam-general".into());
+    req.missing_only = true;
+    let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+    job.detector = Some(Arc::new(StallingDetector {
+        dets,
+        before_returning: label_paths(&dir, &rels[..1]),
+    }));
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    let rep = &out.result;
+    assert_eq!(
+        (
+            &rep["frames_saved"],
+            &rep["frames_failed"],
+            &rep["candidates"]
+        ),
+        (&1.into(), &1.into(), &1.into()),
+        "{rep}"
+    );
+    assert!(
+        out.summary
+            .contains("1 of 2 label files could not be written"),
+        "{}",
+        out.summary
+    );
+}
+
+/// [`FakeDetector`] for frames that were selected fine and fail to save: their label files break
+/// once the model ran.
+struct StallingDetector {
+    dets: BTreeMap<String, Vec<Det>>,
+    before_returning: Vec<PathBuf>,
+}
+
+impl Detector for StallingDetector {
+    fn detect(
+        &self,
+        _: &Config,
+        _: &ModelConfig,
+        device: Option<&str>,
+        images: &[Image],
+        _: f32,
+        _: &AtomicBool,
+    ) -> Result<super::super::relabel::Detections> {
+        for p in &self.before_returning {
+            unwritable(p);
+        }
+        Ok(super::super::relabel::Detections {
+            frames: images
+                .iter()
+                .map(|i| {
+                    (
+                        i.frame.clone(),
+                        self.dets.get(&i.frame).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            device: device.unwrap_or("openvino:cpu").to_string(),
+            cancelled: false,
+        })
+    }
+}
+
+/// A `status=any` re-label over confirmed-empty and skipped frames: the marker and nothing else,
+/// so the frame stays in the exports with its hard negatives.
+#[test]
+fn a_model_run_leaves_closed_frames_closed() {
+    let t = tmp("relabel-closed");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    let closed = [
+        LabelFile {
+            status: Status::Reviewed,
+            empty_confirmed: true,
+            boxes: vec![decided("car", [5.0, 5.0, 30.0, 20.0], BoxState::Rejected)],
+            ..LabelFile::default()
+        },
+        LabelFile {
+            status: Status::Skipped,
+            ..LabelFile::default()
+        },
+    ];
+    for (r, f) in rels.iter().zip(&closed) {
+        labels::write(&Frame::resolve(&dir, r).unwrap().labels, f).unwrap();
+    }
+    let queue_file = dir.join(crate::collect::layout::REVIEW_QUEUE_FILE);
+    std::fs::remove_file(&queue_file).unwrap();
+    let cfg = config(&t.0);
+    let mut req = AutolabelRequest::new(FrameFilter::parse("status=any", "unreviewed").unwrap());
+    req.with_model = Some("IPcam-general".into());
+    let mut job = plan_autolabel(&cfg, req, &no_gpu()).unwrap();
+    let dets: BTreeMap<String, Vec<Det>> = rels
+        .iter()
+        .map(|r| {
+            (
+                r.clone(),
+                vec![det("person", 0.9, [40.0, 20.0, 60.0, 46.0])],
+            )
+        })
+        .collect();
+    job.detector = Some(Arc::new(FakeDetector::new(dets)));
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    let rep = &out.result;
+    assert_eq!(
+        (&rep["added"], &rep["disagreements"]),
+        (&0.into(), &0.into()),
+        "{rep}"
+    );
+    assert_eq!(rep["filtered_closed"], 2, "{rep}");
+    for (r, before) in rels.iter().zip(&closed) {
+        let mut f = labels_of(&dir, r);
+        assert!(f.auto_run.is_some(), "{r}: the marker, so a rerun skips it");
+        f.auto_run = None;
+        assert_eq!(&f, before);
+    }
+    assert!(review_queue(&dir).is_empty(), "nothing to review");
+    assert!(
+        out.summary
+            .contains("2 detections left out on skipped or confirmed-empty frames"),
+        "{}",
+        out.summary
+    );
 }

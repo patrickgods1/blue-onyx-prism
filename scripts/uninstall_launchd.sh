@@ -5,8 +5,9 @@
 # Unloads the daemon and removes its plist, newsyslog entry, installer receipt, the program dir
 # (the one the daemon ran from, e.g. /usr/local/blue-onyx-prism, including runtimes bundled there)
 # the menu bar app ("Blue Onyx Prism" and its LaunchAgent) and the "Uninstall Blue Onyx Prism" app. The data root /usr/local/var/blue-onyx-prism (config,
-# models, downloads), the logs in /var/log/blue-onyx-prism and the role account _blueonyx are kept
-# for a reinstall unless --purge is given. --keep-program leaves the program dir in place. Never
+# models, downloads, and by default the dataset, reviewed labels and training runs), the logs in
+# /var/log/blue-onyx-prism and the role account _blueonyx are kept for a reinstall unless --purge
+# is given. --keep-program leaves the program dir in place. Never
 # prompts, so it runs unattended (CI, scripts, the uninstaller app); it needs no other file.
 # Exit status 4: everything was removed except the account, which macOS refused to delete
 # (eDSPermissionError: the calling app, e.g. the uninstaller app, may not change user accounts;
@@ -127,5 +128,7 @@ if [ "$PURGE" -eq 1 ]; then
   fi
   echo "Deleted the account $SVC."
 else
-  echo "Kept $DATA_DIR (config, models, downloads), $LOG_DIR and the account $SVC for a reinstall; run with --purge to delete them."
+  # Commands, not "run with --purge": this script has just deleted itself with the program dir.
+  echo "Kept $DATA_DIR (config, models, dataset, reviewed labels, training runs), $LOG_DIR and the account $SVC for a reinstall. To delete them too:"
+  echo "  sudo rm -rf $DATA_DIR $LOG_DIR; sudo dscl . -delete /Users/$SVC; sudo dscl . -delete /Groups/$SVC"
 fi

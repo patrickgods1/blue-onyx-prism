@@ -7,10 +7,16 @@
 //! `<training dir>/tasks.json`. A task can follow another ([`Task::after`]: an auto-label run
 //! queued with its import): it runs only when that one finished as it needs
 //! ([`Task::skip_reason`]), else it ends Cancelled with the reason as its summary.
+//!
+//! [`load_or_move_aside`] and [`save_file`] are how `tasks.json` and `runs.json` reach the disk: a
+//! damaged file or a record this build cannot read is set aside as `<name>.corrupt-<time>` before
+//! the next save could write over it.
 
 use super::service::RunState;
 use crate::resources::export::{CommandRunner, Fetcher};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -219,13 +225,213 @@ pub fn tasks_file(runs_file: &Path) -> PathBuf {
     runs_file.with_file_name(TASKS_FILE)
 }
 
-/// Load the records of `path`; busy ones become interrupted failures.
-pub fn load_records(path: &Path) -> Vec<TaskRecord> {
-    let mut v: Vec<TaskRecord> = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    for r in &mut v {
+/// What [`load_or_move_aside`] read.
+#[derive(Debug)]
+pub struct Loaded<T> {
+    pub records: Vec<T>,
+    /// False when something damaged could not be set aside: it is still only in the file, so
+    /// nothing may be saved over that.
+    pub writable: bool,
+}
+
+/// Reads of a job record file before it counts as unreadable.
+const READ_TRIES: u32 = 3;
+/// Wait between those reads.
+const READ_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The records of the JSON list at `path`. A missing file is an empty list. Anything else that
+/// cannot be used is kept where the next save cannot reach it, logged as an error:
+///
+/// - a file that was read and is not a JSON list moves to `<name>.corrupt-<time>`, and the history
+///   starts empty;
+/// - a file that cannot be read stays where it is: a failed read says nothing about its content,
+///   and antivirus or a backup can hold a file for a moment on Windows. After [`READ_TRIES`] tries
+///   the history is empty and nothing is saved over the file until a restart;
+/// - a record of an otherwise good file that does not parse (a [`TaskKind`] of a later version,
+///   after a downgrade) is copied, alone, to such a file, and the others load. The file itself keeps
+///   it until the next save, so a later load finds it again: the same records are not copied twice.
+///
+/// Every reader comes through here, including those that never save (the page before the queue
+/// starts, `train list`): a damaged file is damaged for all of them.
+pub fn load_or_move_aside<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
+    let bytes = match read_retrying(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Loaded {
+                records: Vec::new(),
+                writable: true,
+            };
+        }
+        Err(e) => {
+            tracing::error!(
+                "{} cannot be read ({e}): job history is empty for now and nothing is saved over \
+                 the file. Check that no other program holds it, then restart",
+                path.display()
+            );
+            return Loaded {
+                records: Vec::new(),
+                writable: false,
+            };
+        }
+    };
+    let list: Vec<serde_json::Value> = match serde_json::from_slice(&bytes) {
+        Ok(l) => l,
+        Err(e) => return move_aside(path, &format!("is damaged ({e})")),
+    };
+    let mut records = Vec::with_capacity(list.len());
+    let mut unread = Vec::new();
+    let mut first_error = None;
+    for v in list {
+        match T::deserialize(&v) {
+            Ok(r) => records.push(r),
+            Err(e) => {
+                first_error.get_or_insert(e);
+                unread.push(v);
+            }
+        }
+    }
+    let writable = match first_error {
+        Some(e) => keep_aside(path, &unread, &e),
+        None => true,
+    };
+    Loaded { records, writable }
+}
+
+/// [`std::fs::read`], tried again for a moment on any failure but "not found".
+fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut tries = 1;
+    loop {
+        match std::fs::read(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound && tries < READ_TRIES => {
+                tries += 1;
+                std::thread::sleep(READ_RETRY);
+            }
+            done => return done,
+        }
+    }
+}
+
+/// `<name>.corrupt-<time>` beside `path`, in no use yet.
+fn aside_path(path: &Path) -> PathBuf {
+    let mut base = path.file_name().unwrap_or_default().to_os_string();
+    base.push(format!(
+        ".corrupt-{}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    let free = (0..)
+        .map(|i| {
+            let mut name = base.clone();
+            if i > 0 {
+                name.push(format!("-{i}"));
+            }
+            path.with_file_name(name)
+        })
+        .find(|p| !p.exists());
+    free.unwrap_or_else(|| path.with_file_name(base))
+}
+
+/// Move the whole of `path` aside. A copy will do when it cannot be renamed (Windows: another
+/// process has it open): the original can then be written over.
+fn move_aside<T>(path: &Path, why: &str) -> Loaded<T> {
+    let aside = aside_path(path);
+    let moved = std::fs::rename(path, &aside).or_else(|e| match std::fs::copy(path, &aside) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(e),
+    });
+    if let Err(e) = &moved {
+        tracing::error!(
+            "{} {why} and could not be moved aside to {} ({e}); job history starts empty and \
+             nothing is saved over the file until a restart: check the permissions of its folder",
+            path.display(),
+            aside.display()
+        );
+    } else {
+        tracing::error!(
+            "{} {why}: moved to {}; job history starts empty. Nothing was deleted: restore that \
+             file by hand if it can be repaired",
+            path.display(),
+            aside.display()
+        );
+    }
+    Loaded {
+        records: Vec::new(),
+        writable: moved.is_ok(),
+    }
+}
+
+/// Copy `unread`, the records of `path` this build cannot read, to a file of their own, unless an
+/// earlier load did. Returns whether they are safe there.
+fn keep_aside(path: &Path, unread: &[serde_json::Value], error: &serde_json::Error) -> bool {
+    let Ok(bytes) = serde_json::to_vec_pretty(unread) else {
+        return false;
+    };
+    let mut prefix = path.file_name().unwrap_or_default().to_os_string();
+    prefix.push(".corrupt-");
+    let prefix = prefix.to_string_lossy().into_owned();
+    let copied = path
+        .parent()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .any(|e| std::fs::read(e.path()).is_ok_and(|b| b == bytes));
+    if copied {
+        return true;
+    }
+    let aside = aside_path(path);
+    match crate::collect::layout::write_atomic(&aside, &bytes) {
+        Ok(()) => {
+            tracing::error!(
+                "{}: {} record(s) this version cannot read ({error}), most likely written by a \
+                 later version; kept in {}, the others loaded",
+                path.display(),
+                unread.len(),
+                aside.display()
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                "{}: {} record(s) this version cannot read ({error}) could not be copied to {} \
+                 ({e}); nothing is saved over the file until a restart: check the disk and the \
+                 permissions of its folder",
+                path.display(),
+                unread.len(),
+                aside.display()
+            );
+            false
+        }
+    }
+}
+
+/// Write `records` to `path` as a JSON list: through a temporary file, on the disk before the
+/// rename, so a crash leaves the old file or the new one. A failure only warns.
+pub fn save_file<T: Serialize>(path: &Path, records: &[T]) {
+    let tmp = path.with_extension("json.tmp");
+    let r = serde_json::to_vec_pretty(records)
+        .map_err(anyhow::Error::from)
+        .and_then(|b| {
+            if let Some(p) = path.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&b)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        });
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("saving {}: {e:#}", path.display());
+    }
+}
+
+/// [`load_or_move_aside`]; busy records become interrupted failures.
+pub fn open_records(path: &Path) -> Loaded<TaskRecord> {
+    let mut loaded = load_or_move_aside::<TaskRecord>(path);
+    for r in &mut loaded.records {
         if r.state.is_busy() {
             r.state = RunState::Failed;
             r.error = Some(
@@ -235,25 +441,17 @@ pub fn load_records(path: &Path) -> Vec<TaskRecord> {
             );
         }
     }
-    v
+    loaded
 }
 
-/// Save `records` to `path` (atomic; a failure only warns).
+/// [`open_records`], for a reader that does not save.
+pub fn load_records(path: &Path) -> Vec<TaskRecord> {
+    open_records(path).records
+}
+
+/// Save `records` to `path` ([`save_file`]).
 pub fn save_records(path: &Path, records: &[TaskRecord]) {
-    let tmp = path.with_extension("json.tmp");
-    let r = serde_json::to_vec_pretty(records)
-        .map_err(anyhow::Error::from)
-        .and_then(|b| {
-            if let Some(p) = path.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            std::fs::write(&tmp, b)?;
-            std::fs::rename(&tmp, path)?;
-            Ok(())
-        });
-    if let Err(e) = r {
-        tracing::warn!("saving {}: {e:#}", path.display());
-    }
+    save_file(path, records);
 }
 
 /// Overall percent of stage `step` (1-based) of `steps` at `pct` percent, with equal stages.
@@ -349,6 +547,145 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].state, RunState::Failed);
         assert!(back[0].error.as_deref().unwrap().contains("interrupted"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bop-records-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn record(id: &str) -> TaskRecord {
+        TaskRecord {
+            id: id.into(),
+            kind: TaskKind::Import,
+            title: "import".into(),
+            created: String::new(),
+            state: RunState::Done,
+            stage: None,
+            step: 1,
+            steps: 1,
+            percent: 100,
+            detail: String::new(),
+            log: vec![],
+            summary: None,
+            result: None,
+            error: None,
+            finished: None,
+            after: None,
+            uses: Vec::new(),
+        }
+    }
+
+    /// The `<name>.corrupt-<time>` files beside `path`, oldest name first.
+    fn asides(path: &Path) -> Vec<PathBuf> {
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let mut v: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(&format!("{name}.corrupt-"))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_missing_file_is_an_empty_history() {
+        let dir = scratch("missing");
+        let p = dir.join(TASKS_FILE);
+        assert!(load_records(&p).is_empty());
+        assert!(asides(&p).is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_file_goes_aside_and_the_next_save_cannot_touch_it() {
+        // Cut by a crash, emptied by one, or not the list this version writes.
+        for bytes in [&b"[{\"id\":\"cut"[..], b"", b"{\"id\": \"x\"}", b"\xff\xfe"] {
+            let dir = scratch("corrupt");
+            let p = dir.join(TASKS_FILE);
+            std::fs::write(&p, bytes).unwrap();
+            assert!(load_records(&p).is_empty());
+            assert!(!p.exists(), "moved, not copied");
+            let aside = asides(&p);
+            assert_eq!(aside.len(), 1);
+            assert_eq!(std::fs::read(&aside[0]).unwrap(), bytes);
+            save_records(&p, &[record("a")]);
+            assert_eq!(load_records(&p).len(), 1);
+            assert_eq!(std::fs::read(&aside[0]).unwrap(), bytes, "still there");
+            assert_eq!(asides(&p).len(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A read that fails says nothing about the file: antivirus or a backup can hold it for a
+    /// moment. It stays where it is, and nothing is saved over it.
+    #[test]
+    fn a_file_that_cannot_be_read_stays_and_is_not_written_over() {
+        let dir = scratch("unreadable");
+        let p = dir.join(TASKS_FILE);
+        // Reading a folder fails on every OS, with something other than "not found".
+        std::fs::create_dir(&p).unwrap();
+        let l: Loaded<TaskRecord> = load_or_move_aside(&p);
+        assert!(l.records.is_empty());
+        assert!(!l.writable);
+        assert!(p.exists());
+        assert!(asides(&p).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_this_build_cannot_read_stays_aside_and_the_rest_load() {
+        let dir = scratch("one-record");
+        let p = dir.join(TASKS_FILE);
+        // What a downgrade finds: a kind added by a later version.
+        let mut newer = serde_json::to_value(record("newer")).unwrap();
+        newer["kind"] = "transcode".into();
+        let list = serde_json::json!([record("a"), newer, record("b")]);
+        std::fs::write(&p, serde_json::to_vec(&list).unwrap()).unwrap();
+        let ids = |v: &[TaskRecord]| v.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&load_records(&p)), ["a", "b"]);
+        let aside = asides(&p);
+        assert_eq!(aside.len(), 1);
+        let kept: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&aside[0]).unwrap()).unwrap();
+        assert_eq!(kept, [newer.clone()]);
+        // Loading again (the page reads the file while no queue is running) adds no copy.
+        assert_eq!(ids(&load_records(&p)), ["a", "b"]);
+        assert_eq!(asides(&p).len(), 1);
+        // The next save drops it from the file, not from the disk.
+        save_records(&p, &load_records(&p));
+        assert_eq!(ids(&load_records(&p)), ["a", "b"]);
+        assert_eq!(asides(&p).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_corrupt_file_does_not_replace_the_first() {
+        let dir = scratch("twice");
+        let p = dir.join(TASKS_FILE);
+        std::fs::write(&p, b"first").unwrap();
+        load_records(&p);
+        std::fs::write(&p, b"second").unwrap();
+        load_records(&p);
+        let texts: std::collections::BTreeSet<Vec<u8>> = asides(&p)
+            .iter()
+            .map(|a| std::fs::read(a).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [b"first".to_vec(), b"second".to_vec()]
+                .into_iter()
+                .collect()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
