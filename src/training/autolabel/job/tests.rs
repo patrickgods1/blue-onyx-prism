@@ -3282,4 +3282,164 @@ fn the_summary_says_what_the_tiers_did() {
         "{s}"
     );
     assert!(s.contains("Show hidden on the Review page"), "{s}");
+    let mut spots = AutolabelReport::default();
+    spots.count_labelers(&triage::LabelersReport {
+        apply: triage::ApplyReport {
+            merge: labels::MergeReport {
+                added: 6,
+                ..labels::MergeReport::default()
+            },
+            ..triage::ApplyReport::default()
+        },
+        spot_dismissed: 2,
+        parked_accepted: 3,
+        parked_new: 1,
+        ..triage::LabelersReport::default()
+    });
+    assert_eq!(
+        (spots.added, spots.spot_dismissed, spots.parked_accepted),
+        (3, 2, 3)
+    );
+    let s = spots.labelers_notes();
+    assert!(s.contains("2 boxes hidden at spots you rejected"), "{s}");
+    assert!(s.contains("3 boxes accepted at parked spots"), "{s}");
+}
+
+/// `rels` saved as reviewed with a rejected car at `bbox`.
+fn rejected_on(dir: &Path, rels: &[String], bbox: [f32; 4]) {
+    for rel in rels {
+        let f = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![labels::LabelBox {
+                bbox,
+                state: BoxState::Rejected,
+                ..labels::tests_support::auto_box("car")
+            }],
+            ..LabelFile::default()
+        };
+        labels::write(&Frame::resolve(dir, rel).unwrap().labels, &f).unwrap();
+    }
+}
+
+fn car_at_spot(score: f32) -> serde_json::Value {
+    serde_json::json!([{"label": "car", "bbox": [4, 4, 40, 40], "score": score, "agree": false,
+                        "sources": {"gdino": score}}])
+}
+
+#[test]
+fn a_run_hides_boxes_at_rejected_spots_from_a_snapshot_taken_once() {
+    const SPOT: [f32; 4] = [4.0, 4.0, 40.0, 40.0];
+    let t = tmp("spot-hidden");
+    let rels = frames(&t.0, 4, false);
+    let dir = t.0.join("dataset");
+    rejected_on(&dir, &rels[..2], SPOT);
+    // While the script runs a reviewer accepts a car there. The run read the spots at its start,
+    // so this mixed spot still counts until the next run.
+    let accepted = LabelFile {
+        status: Status::Reviewed,
+        boxes: vec![labels::LabelBox {
+            bbox: SPOT,
+            state: BoxState::Accepted,
+            ..labels::tests_support::auto_box("car")
+        }],
+        ..LabelFile::default()
+    };
+    let fake = LabelFake {
+        boxes: Some(car_at_spot(0.3)),
+        saved_during_run: vec![(Frame::resolve(&dir, &rels[3]).unwrap().labels, accepted)],
+        ..LabelFake::default()
+    };
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(out.result["spot_dismissed"], 1, "{}", out.result);
+    assert_eq!(out.result["added"], 0, "hidden boxes are left out");
+    assert!(
+        out.summary.contains("1 boxes hidden at spots you rejected"),
+        "{}",
+        out.summary
+    );
+    let b = &labels_of(&dir, &rels[2]).boxes[0];
+    assert_eq!(
+        b.reason.as_deref(),
+        Some(labels::bulk::SPOT_DISMISSED_REASON)
+    );
+    assert_eq!(b.auto.spot_rejections, Some(2));
+    // The next run sees it: a mixed spot is no spot any more.
+    let f = LabelFile::default();
+    labels::write(&Frame::resolve(&dir, &rels[2]).unwrap().labels, &f).unwrap();
+    let fake = LabelFake {
+        boxes: Some(car_at_spot(0.3)),
+        ..LabelFake::default()
+    };
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(out.result["spot_dismissed"], 0, "{}", out.result);
+    assert_eq!(labels_of(&dir, &rels[2]).boxes[0].state, BoxState::Pending);
+}
+
+#[test]
+fn a_run_accepts_boxes_at_parked_spots_and_the_frame_can_be_saved_in_bulk() {
+    let t = tmp("spot-parked");
+    let rels = frames(&t.0, 2, false);
+    let dir = t.0.join("dataset");
+    let at = labels::spots::Place {
+        camera: "cam",
+        width: 64,
+        height: 48,
+        label: "car",
+        bbox: [4.0, 4.0, 40.0, 40.0],
+    };
+    labels::spots::add_parked(&dir, &at, "2026-10-01").unwrap();
+    let fake = LabelFake {
+        boxes: Some(car_at_spot(0.4)),
+        ..LabelFake::default()
+    };
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(out.result["parked_accepted"], 2, "{}", out.result);
+    assert_eq!(out.result["added"], 0);
+    assert!(
+        out.summary.contains("2 boxes accepted at parked spots"),
+        "{}",
+        out.summary
+    );
+    let f = labels_of(&dir, &rels[0]);
+    assert_eq!(f.status, Status::Unreviewed);
+    assert_eq!(f.boxes[0].state, BoxState::Accepted);
+    assert_eq!(
+        f.boxes[0].reason.as_deref(),
+        Some(labels::spots::PARKED_REASON)
+    );
+    assert!(labels::repeats::repeats_only(&f));
+    let classes = cfg.collect.classes.clone();
+    let filters = queue::Filters::default();
+    let o = labels::bulk::bulk_accept_repeats(&dir, &filters, &classes, 10, "t", false, &|_| true);
+    assert_eq!(o.done_count, 2, "{o:?}");
+    let saved = labels_of(&dir, &rels[0]);
+    assert_eq!(saved.status, Status::Reviewed);
+    assert_eq!(
+        saved.boxes[0].reason.as_deref(),
+        Some(labels::spots::PARKED_REASON)
+    );
+}
+
+#[test]
+fn a_sam3_run_reads_no_spot() {
+    let t = tmp("spot-sam3");
+    let rels = frames(&t.0, 4, false);
+    let dir = t.0.join("dataset");
+    rejected_on(&dir, &rels[..2], [4.0, 4.0, 40.0, 40.0]);
+    let cfg = config(&t.0);
+    let fake = LabelFake {
+        boxes: Some(
+            serde_json::json!([{"label": "car", "bbox": [4, 4, 40, 40], "score": 0.3,
+                                        "agree": false, "sources": {"sam3": 0.3}}]),
+        ),
+        ..LabelFake::default()
+    };
+    let out = run_job(&sam3_job(&cfg), &fake).unwrap();
+    assert_eq!(out.result["spot_dismissed"], 0, "{}", out.result);
+    assert_eq!(labels_of(&dir, &rels[2]).boxes[0].state, BoxState::Pending);
 }

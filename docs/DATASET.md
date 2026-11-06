@@ -35,6 +35,7 @@ folder. Nothing is uploaded anywhere.
 ```
 <dir>/                                   collect.dir, default <data root>/dataset
   review-queue.jsonl                     frames sent to review (the review page consumes it)
+  spots/<camera>.json                    parked spots of the camera (below, Review labels: Spots)
   <scene>/                               day | night | ir (src/image_stats.rs)
     <camera>/                            camera folder (see below)
       <YYYY-MM-DD>/                      UTC date
@@ -237,8 +238,8 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
   - It runs on the collector thread, the only writer: every 10 minutes (asked by the retention sweeper,
     also while collection is off, as long as the folder exists) and right after a write that crossed
     the size cap.
-  - It deletes only frame pairs in the layout above. It never deletes `review-queue.jsonl` or anything
-    else. A frame in the review queue is pruned like any other until it is labelled.
+  - It deletes only frame pairs in the layout above. It never deletes `review-queue.jsonl`, `spots/` or
+    anything else. A frame in the review queue is pruned like any other until it is labelled.
 - **Low disk:** if free space under the folder drops below 1 GB (`retention::MIN_FREE_MB`, the same
   threshold as the low-space warning), or a write fails with a full disk or exhausted quota:
   - collection stops with a warning;
@@ -318,7 +319,8 @@ folder; the collector and the Dataset page keep `collect.dir`.
   - `rejected`: a wrong box. It is kept as hard-negative evidence and never becomes a training label;
     a pending auto box rejected in bulk for its score has `reason: "low_score"`, a box rejected for an
     unwanted class (outside the list, or in `collect.hidden_classes`) `reason: "other_class"`, a box a
-    labelers run set aside for its score `reason: "auto_dismissed"` (below);
+    labelers run set aside for its score `reason: "auto_dismissed"`, a box it set aside at a spot you
+    rejected `reason: "spot_dismissed"` (below);
   - `pending`: not decided yet. Only `unreviewed` and `skipped` files have pending boxes.
 - **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
   `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
@@ -350,6 +352,15 @@ folder; the collector and the Dataset page keep `collect.dir`.
   saved in bulk (`auto=accept`, `auto=repeats`): a saved frame claims it is complete. A reviewer who saves it
   has been told how many are hidden, and a real object among them then counts as background, like any
   object left unlabelled.
+- **`reason: "spot_dismissed"`** (a *hidden* box too): a labelers run found the box at a spot you rejected
+  on at least 2 frames ([docs/TRAINING.md](TRAINING.md#spot-memory-of-fixed-cameras)). Every reader treats
+  it exactly like `auto_dismissed`: no hard negative, not in the repeats history, `auto=dismissed` finds
+  it, a later run may replace it, no bulk save takes its frame. `spot_rejections` holds the frames rejected
+  there when the run looked, for the page's *hidden: you rejected this spot N times*.
+- **`reason: "parked_spot"`** with **`parked`** (`{since, bbox}`, the spot's date and own box): a labelers
+  run accepted the box at a parked spot. It stays out of the repeats history, because a rule made the
+  decision. The frame stays `unreviewed`, with `repeat_spot` set. Rejecting the box clears both fields,
+  and then it is a look like any other.
 - **`likely`** (written only when true): a labelers run's box with a fused score of 0.25 or more and a
   yes to the VLM's yes/no question, 77% real on public sets and 96% on a fixed camera. It is listed first,
   and the frame comes first in the queue. `triage` stays `review`. Boxes of older runs have no `likely`,
@@ -488,10 +499,10 @@ frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` 
 | `accept` | the auto-labelers' triage alone settles the frame (below) |
 | `nothing` | `auto_run` set and no box carries auto evidence (the labelers found nothing) |
 | `none` | never auto-labelled: no `auto_run` and no auto evidence (frames without a label file too) |
-| `repeats` | spot edits settled every box (`repeat_spot`, nothing pending) |
+| `repeats` | spot edits or parked spots settled every box (`repeat_spot`, nothing pending, no accepted box the VLM said no to) |
 | `overlaps` | stacked or overlapping boxes no reviewer has looked at (no `overlaps_checked`), any review status |
 | `both` | a pending box two or more labelers found (`labelers`), of a wanted class; most such boxes first (item field `agreed_boxes`) |
-| `dismissed` | a box a labelers run dismissed (`reason: "auto_dismissed"`), pending boxes or not. The page shows those boxes on these frames |
+| `dismissed` | a box a labelers run dismissed (`reason: "auto_dismissed"` or `"spot_dismissed"`), pending boxes or not. The page shows those boxes on these frames |
 
 `auto=overlaps` obeys `status` and `source` like the other filters, and most frames with overlaps need
 `status=any&source=all`: a reviewed frame is often not in `review-queue.jsonl`, and reviewed frames need
@@ -626,12 +637,50 @@ stay `reviewed`, and their remaining training boxes are all of listed classes, s
 export. `dry_run` answers `{success, eligible, boxes, classes, rejected: 0}`; otherwise `{success,
 eligible, boxes, rejected, failed, frames, message}`. Both routes are admin routes like reject-low.
 
+<a id="spots"></a>
+### Spots
+
+`<review folder>/spots/<camera>.json` holds a camera's parked spots: one file per camera, entries per frame
+size. The folder sits outside the scene folders, so `layout::day_dirs`, the label walks and retention never
+go there. Only the service writes it, atomically under its own lock. A labelers run reads it once, at its
+start. A file that does not parse stops the routes that use it, and a run then gives that camera no spots
+this time, with a warning.
+
+```json
+{
+  "version": 1,
+  "moved_at": "2026-11-05T10:20:30.123Z",
+  "parked": {
+    "1920x1080": [
+      {"label": "car", "bbox": [100.0, 200.0, 400.0, 420.0], "from": "2026-10-01"},
+      {"label": "truck", "bbox": [900.0, 200.0, 1300.0, 500.0], "from": "2026-10-03", "retired": "2026-10-20"}
+    ]
+  }
+}
+```
+
+- **`from`:** the date of the frame where you pressed *Real, parked*.
+- **`retired`** (optional): the date the spot stopped counting. The entry stays as a record.
+- **`moved_at`** (optional): when you pressed *Camera moved: forget spots*. Decisions on frames from before
+  it no longer count.
+
+Rejected spots are not stored: they are derived from your decisions in the label files. What a run does
+with both kinds is in [docs/TRAINING.md](TRAINING.md#spot-memory-of-fixed-cameras).
+
+| Route (admin) | What it does |
+|---|---|
+| `GET /v1/review/spots?camera=` | parked spots, derived rejected spots (`rejections`, `last`), `moved_at`, and `live`, the number *Camera moved* would forget |
+| `POST /v1/review/spots/parked` | `{frame, label, bbox}`: add a spot, from the frame's camera, size and date. The page accepts the box itself |
+| `POST /v1/review/spots/retire` | `{camera, width, height, label, bbox}`: retire one spot, 404 if there is none |
+| `POST /v1/review/spots/moved` | `{camera}`: retire every parked spot and set `moved_at` |
+
 ### Keyboard
 
 | Key | Action |
 |---|---|
 | `a` | Accept every pending box. |
 | `r` | Reject or restore the selected box. |
+| `t` | Real, parked: accept the selected box and remember its spot. Not on drawn boxes. |
 | `1`-`9`, `0` | Pick class 1-10: relabel the selected box, else set the class of new boxes. |
 | `u` | Reject the selected box as a duplicate of the box it overlaps (Shift: every stack on the frame). |
 | `y` | Accept the overlap suggestion on screen: reject the box marked `drop?` as a duplicate and keep the other (a hint saving would reject is accepted, so the object keeps a box), or for two objects keep both. Doing anything else ignores it. |
@@ -640,7 +689,7 @@ eligible, boxes, rejected, failed, frames, message}`. Both routes are admin rout
 | `e` | Confirmed empty (rejects every box). |
 | `z` | Undo. |
 | `s`, `Enter` | Save & next. A box the auto-labelers flagged (`?`) needs a decision first: the save refuses it, on the page and on the server, however often it is pressed. |
-| `Shift+R` | Reject the rest: every box still undecided (`reason: rest_rejected`; a decision on the frame, so the repeats history leaves these out). |
+| `Shift+R` | Reject the rest: every box still undecided (`reason: rest_rejected`; these count for the repeats history and spot memory). |
 | `n` | Next without saving. |
 
 Click a box to select it. Drag on the image to draw a new one.
@@ -682,8 +731,9 @@ Click a box to select it. Drag on the image to draw a new one.
                                        bbox [x, y, w, h] px (2 decimals), area = w * h, iscrowd 0,
                                        attributes.difficult on unsure boxes (left out of YOLO)
   hard_negatives.json                  rejected model / auto boxes (frame, label, bbox, origin, reason, reject_reason), without
-                                       duplicate, too_small and auto_dismissed ones
-  ignore.json                          ignore regions per image, below
+                                       duplicate, too_small, auto_dismissed and spot_dismissed ones
+  ignore.json                          ignore regions per image, below, and in `parked` the frames whose
+                                       training boxes all came from parked spots (for the training cap)
   xanylabeling/<name>.jpg + .json      X-AnyLabeling files (below)
   benchmark/images/<name>.jpg + manifest.json   a benchmark `dir:` set
   export.json                          the report, written last

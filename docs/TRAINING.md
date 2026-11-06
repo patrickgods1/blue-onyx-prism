@@ -170,7 +170,7 @@ The Training page lists the folders in `training.datasets` and the Review page's
      labels/train/<same stem>.txt               YOLO `class cx cy w h`, normalized; empty = no objects
      labels/val/...
      benchmark/manifest.json                    tags: scene, camera:<c>, date:<d>, hard-negative
-     ignore.json                                ignore regions per image
+     ignore.json                                ignore regions per image, frames with only parked-spot boxes
    ```
 
    Scene, camera and date come from the flat file name (or the manifest tags). The export's `val`
@@ -214,6 +214,12 @@ lists [ignore regions](#ignore-regions); no file means none.
    warning. **Behaviour change**: `night` alone now means night frames only and `ir` IR frames only;
    use `night+ir` for both (what `night` used to mean). Saved requests and configs with the old
    spellings still load. In-scope frames with [ignore regions](#ignore-regions) leave the pool next.
+   **Parked-spot cap**: frames whose only boxes a labelers run accepted at a parked spot
+   ([Spot memory](#spot-memory-of-fixed-cameras)) are nearly the same crop again and again, so at most
+   20 of them per spot stay for training and validation together, by seeded rank
+   (`dataset::PARKED_CAP`). A frame with several spots stays while one of them has room. The rest
+   count as `parked_capped` in `dataset.json`, with a warning. Held-out frames are not capped. The
+   frame where you pressed *Real, parked* holds a reviewer's box, so it is not capped.
 4. **Hard negatives**: about `training.negative_share` (15%) of the training frames have no objects:
    extra empty frames are dropped (reviewer-confirmed ones are kept first); too few give a warning.
 5. **Validation**: 10% of your own training frames (of all training frames when there are none),
@@ -1196,6 +1202,50 @@ in `training/autolabel/triage.rs`; change them only after measuring again.
 
 The run's summary and report give the counts: `likely`, `dismissed` (left out of `added`) and `audit`.
 
+### Spot memory of fixed cameras
+
+On one fixed camera, 87% of the false boxes sat in 33 fixed spots. In a time-split test on that camera,
+spots learned from the first 53 frames hid 657 of the 1,008 later false boxes and 0 of the 111 real ones.
+Real parked objects there were also being rejected frame after frame, which teaches the model that a
+real car is background. One camera is all the evidence so far, so treat these numbers as a first
+result. The run does two things with what you decided, in Rust, after the tiers above, on boxes of
+frames nobody has reviewed. Serving does not change: alerts are as before.
+
+**Rejected spots.** A place is a rejected spot when you rejected a box there on at least 2 frames: same
+camera and frame size, IoU >= 0.6, the same object class (vehicle classes count as one). Spot edits, bulk
+rejects, and duplicates and too-small rejects do not count, as in the repeats history. A new box at such
+a spot is hidden with `reason: "spot_dismissed"`, which every reader treats like `auto_dismissed`, and
+the page says *hidden: you rejected this spot N times*.
+
+- Only rejections of the 30 days up to the frame's date count (`spots::REJECTED_WINDOW_DAYS`). One dated
+  after the frame does not.
+- A place where a box of that object was ever accepted is no spot, however often you rejected it there.
+- A box with a fused score of 0.5 or more stays visible, and so does a likely box (0.25 or more with a
+  VLM yes): a real object at a bad spot on an unlucky frame must not disappear.
+- `truck` may be hidden here: that exception is for the score rule, and a spot rests on your own look.
+- A SAM 3 run and a run with a model use no spots, and a box SAM 3 found is never hidden.
+- The same 1 in 50 stays visible, marked `audit`. Its verdict counts in the *Hidden-box check* with the
+  score filter's samples.
+- A box below 0.15 is hidden by the score first, so it reads as `auto_dismissed`.
+
+**Parked spots.** *Real, parked* (`t` on the decision card) accepts the box and adds a spot to
+`<review folder>/spots/<camera>.json` ([docs/DATASET.md](DATASET.md#spots)). This store exists because the
+repeats history is capped and forgets. Later a pending auto box of the exact same label at IoU >= 0.8 is
+accepted with `reason: "parked_spot"` and keeps its evidence; its frame stays unreviewed. If the VLM said
+no to the yes/no question, the box stays flagged instead, so a car that left is not labelled. A box the
+VLM was not asked about is accepted. *Accept repeat-only frames* follows the same rule: it does not save
+a frame with an accepted box the VLM said no to. A SAM 3 run accepts nothing here, because a bulk accept
+reaches the exports. An existing box from an older run is taken too, but an audit sample and a box with
+another class suggested are not. A model box from the pre-fill stays pending, even when the labelers
+confirm it.
+
+**The camera moved.** *Camera moved: forget spots* in Panel options retires every parked spot and sets
+`moved_at`, so that rejections and accepts from frames before that moment stop counting. On the day of the
+move the frame's time decides; a frame name with no time counts as before the move. A run reads the spots
+once, at its start, so a run already going keeps what it read. It also learns nothing from its own writes.
+
+The run's summary and report give `spot_dismissed` (left out of `added`) and `parked_accepted`.
+
 **Cancel** while the frames are labelled, with *Keep finished frames* on: the frames finished so far
 are not thrown away. The labelers' script writes `proposals.jsonl` line by line (flushed per frame);
 the run triages and writes those frames exactly like a finished run's (pending boxes, the `auto_run`
@@ -1534,7 +1584,7 @@ and the pending boxes keep it from adding anything twice. The report adds `missi
 (`added` + `overwritten`), `overwritten`, `dropped_judged`, `skipped_trained` to `reopened`.
 
 *Accept this spot on all frames* takes the proposals like any pending box (parked cars), `d` marks an
-unclear one.
+unclear one. For a labelers run, see [Spot memory](#spot-memory-of-fixed-cameras).
 
 ### Overlap suggestions
 

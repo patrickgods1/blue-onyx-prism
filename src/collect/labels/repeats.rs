@@ -5,7 +5,7 @@
 //! ([`repeats_only`]). IO: the per-camera history of the reviewer's decisions ([`history`], the
 //! Review page's "rejected here before" hint; cached per folder and camera, [`invalidate`] after
 //! every write of the folder's label files). The bulk edits are [`super::bulk::bulk_spot`] and
-//! [`super::bulk::bulk_accept_repeats`].
+//! [`super::bulk::bulk_accept_repeats`]; what a labelers run does with spots is in [`super::spots`].
 
 use super::{BoxState, LabelBox, LabelFile, RejectReason, Source, Status};
 use serde::Serialize;
@@ -23,6 +23,8 @@ pub const ACCEPT_SPOT_IOU: f32 = 0.8;
 pub const REPEAT_SPOT_REASON: &str = "repeat_spot";
 /// Most boxes [`history`] returns per camera (newest frames first).
 pub const HISTORY_CAP: usize = 2000;
+/// Earlier decisions at a place that make it a spot (the Review page's `REPEAT_MIN`).
+pub const REPEAT_MIN: usize = 2;
 /// How long a cached history is used without a write of the folder (label files written by
 /// other processes, such as an auto-label run, show up after this).
 pub const HISTORY_TTL: Duration = Duration::from_secs(60);
@@ -114,15 +116,20 @@ impl Spot {
 
 /// A frame whose boxes a spot edit settled: unreviewed, touched by a spot edit
 /// ([`LabelFile::repeat_spot`]), no pending box left, no dismissed box
-/// ([`LabelBox::is_dismissed`]: a save claims the frame is complete, and nobody saw those). Sorted
-/// last in the queue; the "accept repeat-only frames" bulk save takes these only.
+/// ([`LabelBox::is_dismissed`]: a save claims the frame is complete, and nobody saw those), and no
+/// accepted box the VLM said no to (a spot edit or a parked spot took it, nobody looked at this
+/// frame, and the parked car may have left: [`super::spots`]'s rule, also for the page's "accept
+/// this spot"). Sorted last in the queue; the "accept repeat-only frames" bulk save takes these
+/// only.
 pub fn repeats_only(f: &LabelFile) -> bool {
     f.status == Status::Unreviewed
         && f.repeat_spot
-        && !f
-            .boxes
-            .iter()
-            .any(|b| b.state == BoxState::Pending || b.is_dismissed())
+        && !f.boxes.iter().any(|b| {
+            b.state == BoxState::Pending
+                || b.is_dismissed()
+                || (b.state == BoxState::Accepted
+                    && b.auto.vlm.as_ref().is_some_and(super::VlmCheck::says_no))
+        })
 }
 
 /// One earlier decision at a camera ([`history`]).
@@ -151,8 +158,8 @@ pub struct History {
 
 /// Whether a decided box counts as the reviewer's own look at that spot: a model or auto box
 /// accepted or rejected, not by a rule over many frames (the low-score and unwanted-class
-/// rejects, a labelers run's dismissals, an earlier spot edit; counting those would make a spot look
-/// more certain than any look at it was). A duplicate reject is no verdict on the spot either: another box stays on the
+/// rejects, a labelers run's dismissals, its parked accepts, an earlier spot edit; counting those
+/// would make a spot look more certain than any look at it was). A duplicate reject is no verdict on the spot either: another box stays on the
 /// object there (a real parked car must not read "rejected here N times"), and neither is a
 /// too-small reject: a real object, only too small to label. Twin of the page's `lookedAt`.
 fn counts(b: &LabelBox) -> bool {
@@ -162,14 +169,14 @@ fn counts(b: &LabelBox) -> bool {
             b.reject_reason,
             Some(RejectReason::Duplicate | RejectReason::TooSmall)
         )
+        && !super::bulk::is_dismissal(b.reason.as_deref())
         && !matches!(
             b.reason.as_deref(),
             Some(
                 super::bulk::LOW_SCORE_REASON
-                    | super::bulk::DISMISSED_REASON
                     | super::bulk::OTHER_CLASS_REASON
                     | REPEAT_SPOT_REASON
-                    | super::REST_REASON
+                    | super::spots::PARKED_REASON
             )
         )
 }
@@ -451,15 +458,13 @@ mod tests {
         assert!(!counts(&b), "pending");
         b.state = BoxState::Rejected;
         assert!(counts(&b));
-        for r in [
-            "low_score",
-            "other_class",
-            REPEAT_SPOT_REASON,
-            super::super::REST_REASON,
-        ] {
+        for r in ["low_score", "other_class", REPEAT_SPOT_REASON] {
             b.reason = Some(r.into());
             assert!(!counts(&b), "{r}");
         }
+        // A reviewer looking at the frame chose to reject it: that teaches the spot.
+        b.reason = Some(super::super::REST_REASON.into());
+        assert!(counts(&b), "reject the rest");
         b.reason = Some("night_threshold".into());
         assert!(
             counts(&b),
@@ -496,6 +501,31 @@ mod tests {
         let mut judged = dismissed();
         judged.reason = None;
         assert!(counts(&judged));
+    }
+
+    #[test]
+    fn the_rules_of_a_run_teach_the_spot_nothing_either() {
+        let mut b = dismissed();
+        b.reason = Some(super::super::bulk::SPOT_DISMISSED_REASON.into());
+        assert!(!counts(&b), "spot_dismissed");
+        b.reason = Some(super::super::spots::PARKED_REASON.into());
+        b.state = BoxState::Accepted;
+        assert!(!counts(&b), "a parked accept is the rule's");
+        b.reason = None;
+        assert!(counts(&b), "\"Real, parked\" itself is a reviewer's look");
+    }
+
+    #[test]
+    fn the_page_shares_the_spot_constants() {
+        let js = include_str!("../../../assets/review.js");
+        assert!(js.contains(&format!("REPEAT_MIN = {REPEAT_MIN}")));
+        for reason in [
+            super::super::bulk::DISMISSED_REASON,
+            super::super::bulk::SPOT_DISMISSED_REASON,
+            super::super::spots::PARKED_REASON,
+        ] {
+            assert!(js.contains(&format!("'{reason}'")), "{reason}");
+        }
     }
 
     #[test]

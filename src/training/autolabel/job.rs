@@ -34,7 +34,7 @@ use super::preview::{AutolabelPreview, Counts, StatusSplit};
 use super::relabel::{Detector, Image};
 use super::triage::{self, FrameProposals};
 use super::{AutolabelRequest, Category};
-use crate::collect::labels::{self, Frame, LabelFile, Triage, queue};
+use crate::collect::labels::{self, Frame, LabelFile, Triage, queue, spots};
 use crate::config::{Config, ModelConfig};
 use crate::resources::catalog::{self, Platform, Resource, ResourceKind};
 use crate::resources::export::train::TrainPaths;
@@ -242,12 +242,21 @@ pub struct AutolabelReport {
     pub audit: usize,
     /// New boxes likely real ([`triage::Tier::Likely`]).
     pub likely: usize,
+    /// New boxes dismissed at a spot the reviewer rejected; left out of `added`.
+    pub spot_dismissed: usize,
+    /// Boxes accepted at a parked spot the reviewer marked; new ones are left out of `added`.
+    pub parked_accepted: usize,
 }
 
 impl AutolabelReport {
     /// Add what one frame of a labelers run did.
     fn count_labelers(&mut self, a: &triage::LabelersReport) {
-        self.added += a.apply.merge.added.saturating_sub(a.dismissed) + a.missing.candidates();
+        self.added += a
+            .apply
+            .merge
+            .added
+            .saturating_sub(a.dismissed + a.spot_dismissed + a.parked_new)
+            + a.missing.candidates();
         self.dropped +=
             a.apply.merge.dropped + a.missing.covered + a.missing.judged + a.missing.full;
         self.dropped_judged += a.missing.judged;
@@ -263,6 +272,8 @@ impl AutolabelReport {
         self.dismissed += a.dismissed;
         self.audit += a.audit;
         self.likely += a.likely;
+        self.spot_dismissed += a.spot_dismissed;
+        self.parked_accepted += a.parked_accepted;
     }
 
     /// The votes of a labelers or model run, for its summary (empty when it cast none).
@@ -318,6 +329,19 @@ impl AutolabelReport {
                 self.dismissed,
                 triage::DISMISS_SCORE,
                 self.audit
+            ));
+        }
+        if self.spot_dismissed > 0 {
+            s.push_str(&format!(
+                "; {} boxes hidden at spots you rejected (Show hidden on the Review page brings \
+                 them back)",
+                self.spot_dismissed
+            ));
+        }
+        if self.parked_accepted > 0 {
+            s.push_str(&format!(
+                "; {} boxes accepted at parked spots (their frames stay unreviewed)",
+                self.parked_accepted
             ));
         }
         if self.reopened > 0 {
@@ -686,6 +710,17 @@ impl AutolabelJob {
         } else {
             rep.labeler = labeler.clone();
             rep.sam3_threshold = r.sam3.then_some(r.sam3_threshold);
+            // Read once: every label this run writes would drop a per-frame look's cache. Not for
+            // SAM 3: its boxes are always reviewed.
+            let spot_memory = if r.sam3 {
+                spots::Snapshot::default()
+            } else {
+                spots::Snapshot::take(&self.dataset_dir, frames.iter().map(|f| f.rel.as_str()))
+            };
+            for w in &spot_memory.warnings {
+                tracing::warn!("{w}");
+            }
+            rep.warnings.extend(spot_memory.warnings.iter().cloned());
             // 2. Environment.
             let accel = self
                 .accelerator
@@ -963,7 +998,13 @@ impl AutolabelJob {
                 // it was selected.
                 let res = self.write_frame(sel, &mut rep, &mut changed, |file, rep| {
                     file.auto_run = Some(marker);
-                    let a = triage::apply_labelers(file, boxes, self.short_labeler(), &sel.rel);
+                    let memory = spot_memory.of(&sel.rel).map(|memory| triage::FrameSpots {
+                        memory,
+                        width: sel.width,
+                        height: sel.height,
+                    });
+                    let a =
+                        triage::apply_labelers(file, boxes, self.short_labeler(), &sel.rel, memory);
                     rep.count_labelers(&a);
                     FrameWrite {
                         write: true,

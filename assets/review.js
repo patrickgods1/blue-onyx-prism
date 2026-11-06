@@ -12,9 +12,12 @@
 // POST /training/autolabel/preview on a click. *Suggest overlaps...* queues the overlap check
 // (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
 // the frame, and `y` accepts the one on screen. A labelers run sorts its new boxes into tiers
-// (training/autolabel/triage.rs): dismissed ones (state rejected, reason auto_dismissed) are left
-// off the frame and the list until `i` shows them, likely ones come first and `c` accepts them, the
-// other flagged ones are drawn quieter.
+// (training/autolabel/triage.rs): dismissed ones (state rejected, reason auto_dismissed or, at a
+// spot the reviewer rejected, spot_dismissed) are left off the frame and the list until `i` shows
+// them, likely ones come first and `c` accepts them, the other flagged ones are drawn quieter.
+// `t` accepts a real object that stays put and remembers its spot (POST /v1/review/spots/parked);
+// later runs accept it there. GET /v1/review/spots feeds the card's line, and Panel options has
+// "Camera moved: forget spots" (POST /v1/review/spots/moved).
 // Export / import / classes / folder forms post JSON to /v1/review/{export,import,classes,folder};
 // a new folder reloads the page.
 // Classes: GET /v1/review/class-catalog feeds the class pickers (class-picker.js): the Class
@@ -151,6 +154,17 @@
     ml.appendChild(document.createTextNode(' Ask about missed objects before saving'));
     panelOpts.insertBefore(ml, panelOpts.querySelector('details'));
   }
+  // "Camera moved: forget spots" in Panel options.
+  if (panelOpts && !$('rv-camera-moved')) {
+    var movedBtn = document.createElement('button');
+    movedBtn.type = 'button';
+    movedBtn.id = 'rv-camera-moved';
+    movedBtn.className = 'small secondary';
+    movedBtn.textContent = 'Camera moved: forget spots';
+    movedBtn.title = "For this frame's camera: parked spots retire and earlier rejections stop hiding boxes. Asks first.";
+    movedBtn.addEventListener('click', function () { cameraMoved(); });
+    panelOpts.insertBefore(movedBtn, panelOpts.querySelector('details'));
+  }
   // The keys overlay.
   var keysDialog = $('rv-keys-dialog');
   if (!keysDialog) {
@@ -286,8 +300,19 @@
   // `labels::needs_decision`, which refuses the save.
   function mustDecide(b) { return isReview(b) && resolved(b) === 'accepted'; }
 
-  // Set aside by a labelers run for its score, nobody judged it (labels::LabelBox::is_dismissed).
-  function isDismissed(b) { return b.state === 'rejected' && b.reason === 'auto_dismissed'; }
+  // A reason that marks a dismissal (labels::bulk::is_dismissal).
+  function isDismissal(reason) { return reason === 'auto_dismissed' || reason === 'spot_dismissed'; }
+
+  // Set aside by a labelers run for its score or its spot, nobody judged it
+  // (labels::LabelBox::is_dismissed).
+  function isDismissed(b) { return b.state === 'rejected' && isDismissal(b.reason); }
+
+  // Why a dismissed box is hidden, for the card and the box row.
+  function hiddenWhy(b) {
+    if (b.reason !== 'spot_dismissed') return 'hidden: score below ' + DISMISS_SCORE;
+    var n = b.spot_rejections;
+    return 'hidden: you rejected this spot ' + (n ? n + ' time' + (n === 1 ? '' : 's') : 'before');
+  }
 
   // Dismissed and not shown just now.
   function isPutAway(b) { return isDismissed(b) && !dismissedOn; }
@@ -301,7 +326,7 @@
 
   // A reviewer's decision ends a dismissal: then the box is a label or a negative like any other
   // (labels::normalize does the same).
-  function endDismissal(b) { if (b.reason === 'auto_dismissed') delete b.reason; }
+  function endDismissal(b) { if (isDismissal(b.reason)) delete b.reason; }
 
   // A pending box the labelers think is real (`likely`: a score and a VLM yes).
   function isLikely(b) { return b.state === 'pending' && !!b.likely && !isUnwanted(b); }
@@ -1077,7 +1102,7 @@
       if (b.origin) m.push(b.origin.replace(/_/g, ' '));
       if (b.reason) m.push(b.reason);
       parts.push(m.join(' '));
-    } else if (isDismissed(b)) parts.push('hidden: score below ' + DISMISS_SCORE);
+    } else if (isDismissed(b)) parts.push(hiddenWhy(b));
     else if (b.reason) parts.push(b.reason);
     if (b.model_label && b.model_label !== b.label) parts.push('was ' + b.model_label);
     if (b.orig_bbox) parts.push('moved');
@@ -1131,7 +1156,11 @@
     li.appendChild(el('span', 'bx-name', b.label + (b.auto_label && b.auto_label !== b.label ? ' (' + b.auto_label + '?)' : '')));
     li.appendChild(shortState(b));
     if (isLikely(b)) li.appendChild(el('span', 'rv-chip likely', 'likely'));
-    if (isDismissed(b)) li.appendChild(el('span', 'rv-chip', 'hidden'));
+    if (isDismissed(b)) {
+      var hc = el('span', 'rv-chip', 'hidden');
+      hc.title = hiddenWhy(b);
+      li.appendChild(hc);
+    }
     if (b.state !== 'pending' && !b._checked) li.appendChild(el('span', 'rv-chip warn', 'to check'));
     if (dups.of[i] && dups.of[i].keeper !== i) li.appendChild(el('span', 'rv-chip warn', 'dup'));
     else if (dups.near[i] != null) li.appendChild(el('span', 'rv-chip warn', 'overlap'));
@@ -1219,7 +1248,7 @@
     if (n) {
       var show = decideButton((dismissedOn ? 'Hide ' : 'Show ') + n + ' hidden', 'i', 'secondary', toggleDismissed);
       show.setAttribute('aria-pressed', dismissedOn ? 'true' : 'false');
-      show.title = 'Boxes the auto-labelers set aside for a score below ' + DISMISS_SCORE + ': about 5% were real on public sets. Accept one if it is real.';
+      show.title = 'Boxes the auto-labelers set aside, for a score below ' + DISMISS_SCORE + ' (about 5% were real on public sets) or at a spot you keep rejecting. Accept one if it is real.';
       boxTools.appendChild(show);
     }
     boxTools.hidden = !likely && !n;
@@ -1272,7 +1301,7 @@
       var verb, yes, no;
       if (b.source === 'human') { verb = 'Drawn: '; yes = 'Keep'; no = 'Delete'; }
       else if (b.state === 'accepted') { verb = 'Accepted as '; yes = 'Right, keep'; no = 'No, reject'; }
-      else if (isDismissed(b)) { verb = 'Hidden for its score: is it a '; yes = 'Yes, accept'; no = 'No, reject'; }
+      else if (isDismissed(b)) { verb = (b.reason === 'spot_dismissed' ? 'Hidden at a spot you rejected: is it a ' : 'Hidden for its score: is it a '); yes = 'Yes, accept'; no = 'No, reject'; }
       else if (b.state === 'rejected') { verb = 'Rejected: is it a '; yes = 'Yes, accept'; no = 'Keep rejected'; }
       else { verb = 'Is this a '; yes = 'Yes, ' + b.label; no = 'No, reject'; }
       q.appendChild(document.createTextNode(verb));
@@ -1295,6 +1324,11 @@
       var btns = el('div', 'rv-q-btns');
       btns.appendChild(decideButton(yes, 'a', 'ok' + (rp && rp.verdict === 'accepted' ? ' suggest' : ''), acceptSelected));
       btns.appendChild(decideButton(no, 'r', 'bad' + (rp && rp.verdict === 'rejected' ? ' suggest' : ''), rejectSelected));
+      if (b.source !== 'human') {
+        var parked = decideButton('Real, parked', 't', 'ok', parkSelected);
+        parked.title = 'A real object that stays put: accept it and remember the spot, so that auto-label runs accept it there (same class, a close match) unless the VLM sees nothing';
+        btns.appendChild(parked);
+      }
       if (b.auto_label && b.auto_label !== b.label) {
         var al = b.auto_label;
         btns.appendChild(decideButton('It\'s a ' + al, null, 'ok', function () { relabelNext(i, al); }));
@@ -1325,6 +1359,16 @@
       // Repeats: what the reviewer decided at this spot before, and the spot on every frame.
       if (b.source !== 'human') {
         var sl = el('div', 'rv-q-spot');
+        var since = parkedSince(b);
+        if (since) {
+          sl.appendChild(el('span', null, 'Parked here since ' + since));
+          var live = parkedSpot(b);
+          if (live) {
+            var forget = button('Forget this spot', function () { forgetSpot(live); }, 'secondary');
+            forget.title = 'Auto-label runs stop accepting boxes here. The boxes already accepted stay.';
+            sl.appendChild(forget);
+          }
+        }
         if (rp && rp.verdict) {
           sl.appendChild(el('span', null, (rp.verdict === 'rejected' ? 'Rejected' : 'Accepted') + ' here ' + rp.n +
             ' time(s) before' + (rp.reason ? ' (' + reasonText(rp.reason) + ')' : '') +
@@ -1490,6 +1534,8 @@
     b._checked = true;
     delete b.difficult;
     endDismissal(b);
+    // A parked accept taken back is a look like any other (labels::normalize does the same).
+    if (b.reason === 'parked_spot') { delete b.reason; delete b.parked; }
     if (why) b.reject_reason = why;
   }
 
@@ -1672,7 +1718,8 @@
   function lookedAt(b) {
     return b.source !== 'human' && (b.state === 'accepted' || b.state === 'rejected') &&
       b.reject_reason !== 'duplicate' && b.reject_reason !== 'too_small' &&
-      ['low_score', 'auto_dismissed', 'other_class', 'repeat_spot', 'rest_rejected'].indexOf(b.reason) < 0;
+      !isDismissal(b.reason) &&
+      ['low_score', 'other_class', 'repeat_spot', 'parked_spot'].indexOf(b.reason) < 0;
   }
 
   // After a reviewed save: the frame's decisions replace its earlier ones in the history.
@@ -1707,6 +1754,74 @@
     if (rej >= REPEAT_MIN && rej / total >= REPEAT_SHARE) { r.verdict = 'rejected'; r.n = rej; }
     else if (acc >= REPEAT_MIN && acc / total >= REPEAT_SHARE) { r.verdict = 'accepted'; r.n = acc; r.reason = null; }
     return r;
+  }
+
+  // ---- spots: what labelers runs remember of this camera (collect/labels/spots.rs) -----------
+
+  var spots = {};                      // camera -> GET /v1/review/spots
+
+  // The camera's spots, once per camera and folder.
+  function loadSpots(cam) {
+    if (!cam || spots[cam]) return;
+    spots[cam] = { parked: {} };
+    api('/v1/review/spots?camera=' + encodeURIComponent(cam)).then(function (j) {
+      spots[cam] = j;
+      if (cur && camOf(cur.frame) === cam) refresh();
+    }).catch(function () { /* no line on the card: the review works without it */ });
+  }
+
+  function reloadSpots(cam) { delete spots[cam]; loadSpots(cam); }
+
+  // The live parked spot that takes box b: the exact label at the accept IoU (spots::parked_at).
+  function parkedSpot(b) {
+    var s = cur && spots[camOf(cur.frame)];
+    var list = s && s.parked ? s.parked[cur.width + 'x' + cur.height] || [] : [];
+    return list.filter(function (p) {
+      return !p.retired && p.label === b.label && iou(p.bbox, b.bbox) >= ACCEPT_SPOT_IOU;
+    })[0] || null;
+  }
+
+  // The date of the parked spot behind box b: the run's mark, else a live spot it sits on.
+  function parkedSince(b) {
+    if (b.parked && b.parked.since) return b.parked.since;
+    var p = parkedSpot(b);
+    return p ? p.from : null;
+  }
+
+  // `t`: a real object that stays put: accept it (unsaved, like `a`) and remember the spot (at once,
+  // so z undoes the accept only; the card's Forget this spot undoes the spot).
+  function parkSelected() {
+    var i = selected, b = boxes()[i];
+    if (!cur || !b) { say('Select a box first: t marks the selected box as real and parked.'); return; }
+    if (b.source === 'human') { say('A box you drew needs no spot: auto-label runs only look for their own boxes.'); return; }
+    var cam = camOf(cur.frame), label = b.label;
+    postJson('/v1/review/spots/parked', { frame: cur.frame, label: label, bbox: b.bbox }).then(function (j) {
+      reloadSpots(cam);
+      say(j.new ? 'Parked spot saved: auto-label runs accept ' + label + ' here from now on. z undoes the box only; Forget this spot on the card removes the spot.' : 'This spot was already marked parked, since ' + j.spot.from + '.');
+    }).catch(function (e) { say('Accepted, but the spot was not saved: ' + e.message, true); });
+    setState(i, 'accepted');
+  }
+
+  function forgetSpot(p) {
+    if (!cur) return;
+    var cam = camOf(cur.frame);
+    postJson('/v1/review/spots/retire', { camera: cam, width: cur.width, height: cur.height, label: p.label, bbox: p.bbox }).then(function () {
+      reloadSpots(cam);
+      say('Spot forgotten: auto-label runs no longer accept boxes there.');
+    }).catch(function (e) { say(e.message, true); });
+  }
+
+  // Panel options: the view changed, so what was learned about its places is wrong. Counts first.
+  function cameraMoved() {
+    var cam = cur ? camOf(cur.frame) : '';
+    if (!cam) { say('Open a frame of the camera first.', true); return; }
+    api('/v1/review/spots?camera=' + encodeURIComponent(cam)).then(function (j) {
+      if (!window.confirm('Camera ' + cam + ' moved? This forgets ' + (j.live || 0) + ' spot(s): parked spots retire, and your rejections from before now stop hiding boxes. Reviewed frames stay as they are.')) return null;
+      return postJson('/v1/review/spots/moved', { camera: cam }).then(function () {
+        reloadSpots(cam);
+        say('Spots of ' + cam + ' forgotten (' + (j.live || 0) + ').');
+      });
+    }).catch(function (e) { say(e.message, true); });
   }
 
   // The pending boxes of this frame the history says to reject.
@@ -1882,7 +1997,7 @@
   }
 
   // Shift+R: reject every box still undecided, for "the real ones are done, the rest are wrong".
-  // A decision on the frame, not on each box, so the repeats history leaves these out (z undoes).
+  // Counts for the repeats history and spot memory like a rejection by hand (z undoes).
   function rejectRest() {
     if (!cur) return;
     var todo = boxes().filter(function (b) { return b.state === 'pending' && b.source !== 'human' && !isUnwanted(b); });
@@ -2320,6 +2435,7 @@
       }
       cur = j;
       loadHistory(camOf(j.frame));
+      loadSpots(camOf(j.frame));
       if (Array.isArray(j.classes)) classes = j.classes;
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null;
@@ -2516,7 +2632,7 @@
     body.boxes.forEach(function (b) {
       // A duplicate or a too-small box is no verdict on an object, and nobody judged a dismissed
       // one: it would read as a false positive here.
-      if (b.source === 'human' || b.reject_reason === 'duplicate' || b.reject_reason === 'too_small' || b.reason === 'auto_dismissed') return;
+      if (b.source === 'human' || b.reject_reason === 'duplicate' || b.reject_reason === 'too_small' || isDismissal(b.reason) || b.reason === 'parked_spot') return;
       var r = resolved(b);
       if (r === 'accepted') acc++; else if (r === 'rejected') rej++;
     });
@@ -2615,6 +2731,7 @@
   var KEYS = [
     ['Decide', 'a', 'accept the selected box (keep a drawn one) and go to the next'],
     ['Decide', 'r', 'reject the selected box (delete a drawn one) and go to the next'],
+    ['Decide', 't', 'real, parked: accept the selected box and remember its spot, so that auto-label runs accept it there (a VLM no stays flagged); not on drawn boxes'],
     ['Decide', '1-9, 0', null],
     ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps (stacked, nested or partly overlapping)'],
     ['Decide', 'Shift+U', 'stacked boxes: keep the best of each stack, reject the others as duplicates'],
@@ -2645,7 +2762,7 @@
     ['View', 'v', 'spotlight on / off: the frame dimmed outside the selected box, the other boxes faint'],
     ['View', 'h (hold)', 'hide the boxes'],
     ['View', 'l', 'labels on the boxes on / off'],
-    ['View', 'i', 'show / put away the hidden boxes of this frame (low-score auto boxes, dimmed; accepting one makes it a label)'],
+    ['View', 'i', 'show / put away the hidden boxes of this frame (low-score auto boxes and boxes at spots you rejected, dimmed; accepting one makes it a label)'],
     ['View', '?', 'this list (Esc closes it)']
   ];
 
@@ -2752,6 +2869,7 @@
     else if (ev.code === 'Digit0' && ev.shiftKey) setImgView('auto', 1);
     else if (k === 'p') goBack();
     else if (k === 'd') toggleUnsure();
+    else if (k === 't') parkSelected();
     else if (k === 'u') { if (ev.shiftKey) rejectDuplicates(); else rejectDupSelected(); }
     else if (k === 'y') acceptOverlap();
     else if (k === 'c') { if (!ev.shiftKey) acceptLikely(); }

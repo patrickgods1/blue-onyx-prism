@@ -11,14 +11,16 @@
 //! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
 //! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
 //! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
-//! [`repeats`], the duplicate boxes on one object (stacks, overlaps) in [`stacks`] and the stored
-//! suggestions for overlapping boxes in [`overlaps`].
+//! [`repeats`], the rejected and parked spots a labelers run remembers in [`spots`], the duplicate
+//! boxes on one object (stacks, overlaps) in [`stacks`] and the stored suggestions for overlapping
+//! boxes in [`overlaps`].
 
 pub mod bulk;
 pub mod export;
 pub mod overlaps;
 pub mod queue;
 pub mod repeats;
+pub mod spots;
 pub mod stacks;
 pub mod xany;
 
@@ -33,8 +35,9 @@ use std::path::{Path, PathBuf};
 pub const LABELS_VERSION: u32 = 1;
 /// Suffix of a label file after the frame's stem (`<stem>.labels.json`).
 pub const LABELS_SUFFIX: &str = ".labels.json";
-/// [`LabelBox::reason`] of a box rejected by the page's "Reject the rest": a decision on the frame,
-/// not a look at that box, so the repeats history leaves it out.
+/// [`LabelBox::reason`] of a box rejected by the page's "Reject the rest". It counts for the repeats
+/// history and spot memory: in a time-ordered simulation on one camera, leaving it out kept 1.96
+/// boxes per frame visible against 1.43, and counting it hid 1 real object of 346.
 pub const REST_REASON: &str = "rest_rejected";
 /// Most boxes in one label file.
 pub const MAX_BOXES: usize = 500;
@@ -297,6 +300,35 @@ pub struct AutoInfo {
     /// checks the filter ([`Counts`](queue::Counts) `audit_accepted` / `audit_rejected`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub audit: bool,
+    /// A box dismissed at a rejected spot ([`bulk::SPOT_DISMISSED_REASON`]): the frames the reviewer
+    /// rejected that spot on. The Review page's "you rejected this spot N times".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_rejections: Option<u32>,
+    /// A box a labelers run accepted at a parked spot ([`spots::PARKED_REASON`]): which spot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<ParkedMark>,
+}
+
+/// The parked spot a box was accepted at ([`AutoInfo::parked`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParkedMark {
+    /// [`spots::Parked::from`]: `YYYY-MM-DD`.
+    pub since: String,
+    /// The spot's own box: the boxes accepted at it differ a little.
+    pub bbox: [f32; 4],
+}
+
+impl VlmCheck {
+    /// A clear no to the yes/no question. A seven-way answer of an older run is neither a yes nor a
+    /// no here, and a check that did not run leaves no [`VlmCheck`] at all.
+    pub fn says_no(&self) -> bool {
+        self.expected == "yes" && !self.ok
+    }
+
+    /// A clear yes to the yes/no question.
+    pub fn says_yes(&self) -> bool {
+        self.expected == "yes" && self.ok
+    }
 }
 
 impl AutoInfo {
@@ -320,11 +352,11 @@ impl LabelBox {
                 && self.reject_reason == Some(RejectReason::TooSmall))
     }
 
-    /// Set aside by a labelers run for its score ([`bulk::DISMISSED_REASON`]): rejected, so no
-    /// label and no live box, but nobody judged it, so no negative and no decision either. A
-    /// reviewer's own verdict clears the reason ([`normalize`]).
+    /// Set aside by a labelers run, for its score or for its spot ([`bulk::is_dismissal`]):
+    /// rejected, so no label and no live box, but nobody judged it, so no negative and no decision
+    /// either. A reviewer's own verdict clears the reason ([`normalize`]).
     pub fn is_dismissed(&self) -> bool {
-        self.state == BoxState::Rejected && self.reason.as_deref() == Some(bulk::DISMISSED_REASON)
+        self.state == BoxState::Rejected && bulk::is_dismissal(self.reason.as_deref())
     }
 
     /// A reviewer's verdict on an [`AutoInfo::audit`] box: `Some(true)` real, `Some(false)` not,
@@ -726,7 +758,8 @@ fn label_ok(l: &str) -> bool {
 ///   `classes`, and a frame confirmed empty must have none; `reviewed_at` = `now`;
 /// - `skipped`: `reviewed_at` = `now`; `unreviewed`: no `reviewed_at`;
 /// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
-/// - [`bulk::DISMISSED_REASON`] cleared unless the box is rejected with no reason of a reviewer's;
+/// - a dismissal ([`bulk::is_dismissal`]) cleared unless the box is rejected with no reason of a
+///   reviewer's; [`spots::PARKED_REASON`] and its mark cleared unless the box is accepted;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
 ///   (bounded), `overlaps_checked` and `overlap_suggestions` (bounded, [`overlaps::check`]) kept,
 ///   `bulk_accepted` and `checked_before_reopen` cleared;
@@ -869,7 +902,12 @@ pub fn normalize(
     // A reject reason belongs to a rejected box only; a rejected box is not "unsure". A reviewer's
     // decision ends a dismissal: then the box is a label, or a negative like any other.
     for b in &mut f.boxes {
-        let dismissed = b.reason.as_deref() == Some(bulk::DISMISSED_REASON);
+        let dismissed = bulk::is_dismissal(b.reason.as_deref());
+        // A parked box a reviewer took back is a look like any other: the rule's mark goes.
+        if b.state != BoxState::Accepted && b.reason.as_deref() == Some(spots::PARKED_REASON) {
+            b.reason = None;
+            b.auto.parked = None;
+        }
         if b.state == BoxState::Rejected {
             b.difficult = false;
             if dismissed && b.reject_reason.is_some() {
@@ -930,6 +968,11 @@ fn check_auto(a: &AutoInfo) -> Result<()> {
         && !score_ok(s)
     {
         bail!("auto_score {s} is not between 0 and 1");
+    }
+    if let Some(m) = &a.parked
+        && !(short(&m.since) && m.bbox.iter().all(|v| v.is_finite()))
+    {
+        bail!("the parked spot is not a date and a box");
     }
     if a.likely && a.audit {
         bail!(
@@ -1721,6 +1764,8 @@ mod tests {
             auto_score: None,
             likely: false,
             audit: false,
+            spot_rejections: None,
+            parked: None,
         };
         let v = serde_json::to_value(&b).unwrap();
         assert_eq!(v["agree"], true);
