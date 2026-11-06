@@ -601,13 +601,15 @@ pub struct Config {
     /// `localhost`). `127.0.0.1` keeps the service local to this machine. Process restart.
     pub bind_address: std::net::IpAddr,
     /// Serve the admin pages and actions (Config, Test, Logs, Benchmark, resources, restart)
-    /// to other machines too. Off: only loopback clients get them (403 otherwise); detection,
-    /// `/stats.json`, `/prometheus`, `/v1/devices` and `/v1/config` stay open. Applies at once.
+    /// to other machines that show the admin token ([`crate::admin_token`]). Off: only loopback
+    /// clients get them (403 otherwise); detection, `/stats.json`, `/prometheus`, `/v1/devices`
+    /// and `/v1/config` stay open. Applies at once.
     pub allow_remote_admin: bool,
     /// Host names (no scheme, port or path; at most [`MAX_ALLOWED_HOSTS`]) the admin routes
     /// answer under, besides IP addresses and `localhost`: the defence against DNS rebinding
     /// (`server::guard`). The name a reverse proxy or `http://nas.local:32168` arrives with
-    /// goes here. Stored lower-case. Applies at once.
+    /// goes here, also to sign in from a browser under that name. Stored lower-case. Applies
+    /// at once.
     pub allowed_hosts: Vec<String>,
     /// How long a request may wait in the queue + processing before it is dropped (the only
     /// request timeout; the HTTP handler waits this plus a 500 ms grace for the worker).

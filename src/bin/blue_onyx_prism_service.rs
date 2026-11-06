@@ -221,8 +221,8 @@ mod service {
                 return;
             }
         };
-        if let Ok((config, _)) = &first {
-            cli::log_startup_warnings(config);
+        if let Ok((config, path)) = &first {
+            cli::log_startup_warnings(config, path);
         }
         if let Err(e) = run_service(first, config_path, log) {
             error!("service failed: {e:#}");

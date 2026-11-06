@@ -43,7 +43,7 @@
 //! the roots rule (SV-10 unchanged), so a pick never widens what the page can list.
 
 use super::guard::{host_part, request_host};
-use super::{AppState, admin_allowed, blocking};
+use super::{AppState, blocking, loopback_peer};
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
@@ -951,7 +951,7 @@ fn peer_of(ci: Option<&ConnectInfo<SocketAddr>>) -> Option<SocketAddr> {
 
 /// Whether the peer is this machine (a dialog on the server's screen is useless otherwise).
 fn local_peer(peer: Option<SocketAddr>) -> bool {
-    admin_allowed(peer, false)
+    loopback_peer(peer)
 }
 
 fn unavailable(message: String) -> Response {
@@ -1596,6 +1596,7 @@ mod tests {
         use super::super::test_util::*;
         use axum::body::Body;
         use axum::http::{Request, header};
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let state = test_state_with(|c| c.allow_remote_admin = true);
         let post = |peer: &str, body: &str| {
             from_peer(
@@ -1606,7 +1607,15 @@ mod tests {
                 peer,
             )
         };
-        let (s, _, b) = call(&state, post(REMOTE, r#"{"kind":"folder"}"#)).await;
+        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        let signed_in = |mut r: axum::http::Request<Body>| {
+            r.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {TOKEN}").parse().unwrap(),
+            );
+            r
+        };
+        let (s, _, b) = call(&state, signed_in(post(REMOTE, r#"{"kind":"folder"}"#))).await;
         assert_eq!(s, StatusCode::CONFLICT);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);
@@ -1616,7 +1625,7 @@ mod tests {
             Request::get("/v1/fs/pick").body(Body::empty()).unwrap(),
             REMOTE,
         );
-        let (s, _, b) = call(&state, get).await;
+        let (s, _, b) = call(&state, signed_in(get)).await;
         assert_eq!(s, StatusCode::OK);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);

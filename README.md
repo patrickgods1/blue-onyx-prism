@@ -279,7 +279,7 @@ it; every key can also be set in the file.
 |---|---|---|
 | `port` | `32168` | HTTP listen port. Integer 1-65535. Applies: process restart. UI: yes |
 | `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
-| `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines too. Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
+| `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines that show the admin token (`<data root>/admin-token`, made when this is turned on). Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
 | `allowed_hosts` | `[]` | Host names the admin pages answer under, besides IP addresses and `localhost` (the defence against DNS rebinding). List of up to 32 bare names, lower-cased: no scheme, port, path or wildcard. Applies: at once. UI: yes. See [Remote access](#remote-access) |
 | `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout). Integer 1-3600. Applies: at once. UI: yes |
 | `worker_queue_size` | `0` | Per-model queue length; 0 = auto from timeout and measured inference time. Integer 0-1024. Applies: restart. UI: yes |
@@ -774,7 +774,7 @@ the most uploads allowed in progress, `body_timeout`: an upload took over 10 s t
 - `blue_onyx_prism_dataset_requests_total`, `blue_onyx_prism_dataset_offered_total`, `blue_onyx_prism_dataset_saved_total`, `blue_onyx_prism_dataset_no_bucket_total`, `blue_onyx_prism_dataset_frames_total{bucket}`, `blue_onyx_prism_dataset_dropped_total{reason="queue_full|rate|dup|disk|error"}`, `blue_onyx_prism_dataset_bytes` and `blue_onyx_prism_dataset_collect_disabled`: the dataset collector (`collect`).
 
 `log_path`, `port` and `bind_address` changes need a full process restart. The UI has no
-authentication: do not expose the port beyond your LAN.
+TLS, and clients on this machine need no login: do not expose the port beyond your LAN.
 
 ### Remote access
 
@@ -784,16 +784,39 @@ this machine only: from another machine the admin pages and actions (`/config`, 
 `/stats`, `/benchmark`, `/v1/resources*`, `/v1/models/add`, `/v1/fs/browse`, `/v1/benchmark*`,
 `/config/*`) return **403** with a short page (browsers) or JSON. Open to every client: the
 detection API (`/v1/vision/*`), `/v1/status`, `/v1/status/updateavailable`, the home page `/`, `/stats.json`,
-`/prometheus`, `/v1/devices`, `/v1/config` (read-only) and the static files.
+`/prometheus`, `/v1/devices`, `/v1/config` (a minimal answer unless the client is an admin) and the
+static files.
 
 - To administer from another machine, set `"allow_remote_admin": true` (or check *Allow remote
   administration* on the Config page from this machine). It applies at once. `--allow-remote-admin`
   does the same for one run only: it is not written to the config file, so the next plain start is
-  back to loopback-only. Be aware that remote admin opens the Config page's file browser
-  (`GET /v1/fs/browse`, which lists folders and model/YAML file names across the whole filesystem)
-  and every admin action (config writes, downloads, model export, restarts) to anyone who can
-  reach the port, without authentication, so enable it only on a trusted network. The service
-  logs a warning at every start while it is on.
+  back to loopback-only. The service logs a warning at every start while it is on, with the path
+  of the token and the command that prints it.
+- Remote administration needs the **admin token**, 256 random bits in `<data root>/admin-token`
+  (mode 0600 on Unix; on Windows the file inherits the data folder's permissions), made when
+  `allow_remote_admin` is first on. Clients on this machine never need it, and detection and the
+  other open routes never look at it.
+  - Read it on the server, as the service's account: `blue-onyx-prism admin-token`, with
+    `--config <file>` when the service has its own config (the Windows service, the packages,
+    Docker). Stdout holds the token and nothing else.
+  - A browser opens any admin page, is sent to `/login`, and pastes the token once. The cookie
+    (`bop_admin`, `HttpOnly`, `SameSite=Strict`) lasts until the browser closes; *Sign out* on the
+    Config page, or `POST /logout`, clears it. Scripts send `Authorization: Bearer <token>`, and
+    without one get a JSON 401. `GET /v1/config` gives a client without the token the minimal answer.
+  - Five wrong tokens in a minute from one address answer **429** with `Retry-After`, the right
+    token included, until the oldest of the five is a minute old.
+  - `blue-onyx-prism admin-token --rotate`, or *Rotate token* on the Config page from this machine,
+    replaces it. A running service uses the new token at once, and every signed-in browser has to
+    sign in again. If the file is missing or damaged, remote peers are refused until you rotate.
+  - The token and the cookie go over **plain HTTP**: the cookie has no `Secure` flag, because the
+    service speaks no TLS, so anyone who can watch the network can read them. Use remote
+    administration only on a trusted network or behind TLS, and treat the token as the admin
+    password. A cookie is sent to every port of that host name, so another service on the same
+    name can see it. Remote admin reaches the Config page's file browser (`GET /v1/fs/browse`, which
+    lists folders and model/YAML file names across the whole filesystem) and every admin action
+    (config writes, downloads, model export, restarts).
+  - A browser that opens the server by name (`http://nas.local:32168/`) needs that name in
+    `allowed_hosts` first, see below; by IP address it works as it is.
 - Cross-site requests (CSRF): a web page on another site cannot drive the admin actions through
   your browser. An admin request that changes something (POST, PUT, PATCH, DELETE) is refused with
   403 when the browser marks it `Sec-Fetch-Site: cross-site`, or when its `Origin` (else
@@ -810,18 +833,20 @@ detection API (`/v1/vision/*`), `/v1/status`, `/v1/status/updateavailable`, the 
   address or in the config file. Names match exactly: a subdomain needs its own entry. The
   detection API and the other open routes accept any `Host`.
 - A reverse proxy on this machine (nginx, Caddy, Traefik, e.g. for TLS) makes every proxied request
-  arrive from `127.0.0.1`, so everyone who can reach the proxy gets the admin pages: it is
-  equivalent to `"allow_remote_admin": true`. `X-Forwarded-For` and similar headers are ignored on
-  purpose (any client can send them). Restrict the admin paths in the proxy (or proxy only
-  `/v1/vision/*`) when it is reachable from other machines.
+  arrive from `127.0.0.1`, so everyone who can reach the proxy is treated as this machine and gets
+  the admin pages **with no token**, whatever `allow_remote_admin` says. `X-Forwarded-For` and
+  similar headers are ignored on purpose (any client can send them). Restrict the admin paths in
+  the proxy, put its own authentication in front of them, or proxy only `/v1/vision/*`, when it is
+  reachable from other machines; a TLS proxy on another machine needs none of that, since its
+  requests are remote and need the token. The service warns once in the log when it sees this.
 - To keep everything on this machine (Blue Iris on the same PC), set `"bind_address": "127.0.0.1"`
   (or `--bind-address 127.0.0.1`); it applies when the process restarts.
 
 #### Library folders: config file or command line only
 
 `download_dir`, `onnxruntime_dir` and `openvino_dir` decide which shared libraries the service
-loads, and a loaded library runs with the service's rights. The admin pages have no login, so
-anyone who reached them could otherwise run their own code as the service. The Config page shows
+loads, and a loaded library runs with the service's rights, so anyone who reached the admin pages
+could otherwise run their own code as the service. The Config page shows
 the three read-only, and `POST /config` refuses a changed value. To change one, edit the config
 file (`--onnxruntime-dir` and `--openvino-dir` work too; `download_dir` has no flag), then restart.
 `onnxruntime_dir` must be a folder: a file there is refused and the search goes on, while
@@ -947,11 +972,14 @@ Benchmark) answer 403 and the detection API works:
 - Blue Iris on another machine: switch to the commented LAN line (`"32168:32168"`) in
   `deploy/docker-compose.yml`. Detection is then reachable from the LAN; keep
   `allow_remote_admin` false and change settings by editing the config file in `deploy/config`.
-- Web UI: set `"allow_remote_admin": true` in that config file. With the default loopback-only
-  port only this host reaches it; from your PC use an SSH tunnel
+- Web UI: set `"allow_remote_admin": true` in that config file. Every browser, the host's own
+  included, then counts as remote and signs in with the admin token, which you read with
+  `docker exec blue-onyx-prism /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json admin-token`
+  (add `--rotate` to replace it). It lives in the `data` volume, so it survives a new container.
+  With the default loopback-only port only this host reaches it; from your PC use an SSH tunnel
   (`ssh -L 32168:127.0.0.1:32168 <docker host>`, then open `http://127.0.0.1:32168/`). With the
-  LAN line, every LAN client gets the admin pages (see [Remote access](#remote-access)): turn it
-  on only while you use them.
+  LAN line, every LAN client gets the login page, and the token travels over plain HTTP (see
+  [Remote access](#remote-access)): turn it on only on a trusted network.
 
 The container's health check polls `/v1/status` (`docker ps` shows `healthy` once a model is ready).
 
@@ -970,6 +998,9 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | GET | `/logs`, `/logs.json?after=<seq>&level=<min>` | log page; recent log events newer than `after` at `level` (`trace`..`error`) or more severe, with `last` as the next cursor |
 | GET, POST | `/test`, `/config` | test page, config editor |
 | POST | `/config/restart`, `/config/loglevel` | reload config, change log level |
+| POST | `/config/admin-token/rotate` | replace the admin token (this machine only; never answers with the token) |
+| GET, POST | `/login` | sign in with the admin token: sets the `bop_admin` cookie; `next` must be a local path |
+| POST | `/logout` | clear that cookie |
 | GET | `/v1/devices` | device options (runnable, downloadable with size, unavailable with reason) and the `auto` pick |
 | GET | `/v1/resources` | downloadable resources for this platform: state (installed, downloading with %, queued, needed, optional, available, failed with error and retry), size, what they provide, which models wait for them |
 | POST | `/v1/resources/download` | form `id` (e.g. `model:ipcam-bird`); large resources also need `confirm_large=1` unless `allow_large_downloads` |
@@ -1013,7 +1044,8 @@ The detection response is byte-compatible with CodeProject.AI: `success, message
 canUseGPU, inferenceMs, processMs, analysisRoundTripMs`.
 
 The admin routes (pages and actions) answer clients on this machine only unless
-`allow_remote_admin` is set; others get 403 (see [Remote access](#remote-access)).
+`allow_remote_admin` is set; others get 403. With it set, remote clients show the admin token:
+without it a browser goes to `/login` and anything else gets 401 (see [Remote access](#remote-access)).
 
 ## Benchmark
 
