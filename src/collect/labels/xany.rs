@@ -7,8 +7,9 @@
 //!
 //! Export ([`to_xany`]) writes the training boxes of a frame as rectangles, `checked: true` for
 //! a reviewed frame. Import ([`import_dir`], [`apply_import`]) reads such files back: a file
-//! counts as reviewed when `checked` is true (or the caller treats unchecked files as reviewed)
-//! and its shapes become the frame's complete set of training boxes (see [`apply_import`]).
+//! counts as reviewed when `checked` is true (or the caller treats unchecked files as reviewed,
+//! except one with no shapes: nobody looked at that frame) and its shapes become the frame's
+//! complete set of training boxes (see [`apply_import`]).
 
 use super::export::parse_flat_name;
 use super::{BoxState, Frame, LabelBox, LabelFile, Source, Status, iou, normalize};
@@ -297,7 +298,8 @@ fn frame_of(x: &XFile, json_name: &str) -> Option<String> {
         .map(|r| r.jpg())
 }
 
-/// Import every `*.json` directly in `src` into the dataset `dir` (see the module doc). A file
+/// Import every `*.json` directly in `src` into the dataset `dir` (see the module doc), each frame
+/// under the label write lock ([`super::update`]). A file
 /// whose image size differs from the frame's (a resized copy) or whose labels are not in
 /// `classes` is an error for that file only. A frame without a label file starts from its
 /// pre-fill without the `hidden` classes ([`super::prefill`]). Returns the report; fails only
@@ -326,6 +328,7 @@ pub fn import_dir(
         );
     }
     let mut r = ImportReport::default();
+    let mut unchecked_empty = 0usize;
     for name in names {
         let path = src.join(&name);
         let one = (|| -> Result<Option<()>> {
@@ -361,20 +364,34 @@ pub fn import_dir(
             let (rects, warnings) = rects(&x);
             r.warnings
                 .extend(warnings.into_iter().map(|w| format!("{name}: {w}")));
-            let base = frame
-                .labels()?
-                .unwrap_or_else(|| super::prefill(&rec, classes, hidden));
-            let classes_version = base.classes_version.clone();
-            let mut merged = apply_import(base, &rects);
-            merged.classes_version = classes_version;
-            let f = normalize(merged, classes, rec.width, rec.height, now)?;
-            super::write(&frame.labels, &f)?;
+            // No rectangle means "confirmed empty" only from a reviewer: an unchecked file with
+            // none is a frame nobody looked at (its boxes may all have been flagged, and those
+            // stay out of the export).
+            if rects.is_empty() && !x.checked {
+                r.unchecked += 1;
+                unchecked_empty += 1;
+                return Ok(Some(()));
+            }
+            super::update(&frame.labels, |saved| {
+                let base = saved.unwrap_or_else(|| super::prefill(&rec, classes, hidden));
+                let classes_version = base.classes_version.clone();
+                let mut merged = apply_import(base, &rects);
+                merged.classes_version = classes_version;
+                normalize(merged, classes, rec.width, rec.height, now).map(Some)
+            })?;
             r.imported += 1;
             Ok(Some(()))
         })();
         if let Err(e) = one {
             r.errors.push(format!("{name}: {e:#}"));
         }
+    }
+    if unchecked_empty > 0 {
+        r.warnings.push(format!(
+            "{unchecked_empty} unchecked file(s) with no boxes left alone: nobody confirmed those \
+             frames are empty. Review them on the Review tab, or mark the files checked in \
+             X-AnyLabeling."
+        ));
     }
     Ok(r)
 }
@@ -588,5 +605,113 @@ mod tests {
             (f.boxes[0].state, f.boxes[0].reason.as_deref()),
             (BoxState::Accepted, None)
         );
+    }
+
+    /// A frame of `dir` with no label file, one person in its sidecar.
+    fn put_frame(dir: &Path, stem: &str) -> String {
+        let day = dir.join("ir/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        image::RgbImage::from_pixel(64, 48, image::Rgb([90, 90, 90]))
+            .save(day.join(format!("{stem}.jpg")))
+            .unwrap();
+        let mut r = crate::collect::record::empty_record();
+        r.id = stem.into();
+        r.width = 64;
+        r.height = 48;
+        std::fs::write(
+            day.join(format!("{stem}.json")),
+            serde_json::to_vec(&r).unwrap(),
+        )
+        .unwrap();
+        format!("ir/cam/2026-10-22/{stem}.jpg")
+    }
+
+    /// What X-AnyLabeling keeps of frame `stem`: a file with no shapes, `checked` as given.
+    fn put_shapeless(src: &Path, stem: &str, checked: bool) {
+        std::fs::create_dir_all(src).unwrap();
+        let name = format!("ir.cam.2026-10-22.{stem}.jpg");
+        let x = to_xany(&name, 64, 48, std::iter::empty::<&LabelBox>(), checked);
+        std::fs::write(
+            src.join(format!("ir.cam.2026-10-22.{stem}.json")),
+            serde_json::to_vec(&x).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_unchecked_file_with_no_shapes_never_confirms_a_frame_empty() {
+        let root = std::env::temp_dir().join(format!("bop-xany-{}", uuid::Uuid::new_v4()));
+        let (dir, src) = (root.join("dataset"), root.join("src"));
+        let classes = crate::collect::config::default_classes();
+        // Every box of this unreviewed frame was flagged, so the export wrote no shape.
+        let rel = put_frame(&dir, "flagged");
+        let frame = Frame::resolve(&dir, &rel).unwrap();
+        let mut flagged = model_box("person", [4.0, 4.0, 30.0, 40.0], BoxState::Pending);
+        flagged.auto.triage = Some(crate::collect::labels::Triage::Review);
+        let before = LabelFile {
+            boxes: vec![flagged],
+            ..LabelFile::default()
+        };
+        super::super::write(&frame.labels, &before).unwrap();
+        put_shapeless(&src, "flagged", false);
+        // A frame nobody saved, the same.
+        let unseen = put_frame(&dir, "unseen");
+        put_shapeless(&src, "unseen", false);
+        let r = import_dir(&dir, &src, &classes, &[], true, "t").unwrap();
+        assert_eq!((r.imported, r.unchecked), (0, 2), "{r:?}");
+        assert_eq!(frame.labels().unwrap().unwrap(), before, "left alone");
+        let unseen = Frame::resolve(&dir, &unseen).unwrap();
+        assert_eq!(unseen.labels().unwrap(), None, "no label file made");
+        assert!(r.warnings.iter().any(|w| w.contains("no boxes")), "{r:?}");
+        // A file X-AnyLabeling marked checked says the frame is empty: a reviewer looked.
+        put_shapeless(&src, "unseen", true);
+        put_shapeless(&src, "flagged", true);
+        let r = import_dir(&dir, &src, &classes, &[], false, "t").unwrap();
+        assert_eq!(r.imported, 2, "{r:?}");
+        let l = unseen.labels().unwrap().unwrap();
+        assert!(l.empty_confirmed && l.status == Status::Reviewed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_import_cannot_lose_a_box_written_while_it_runs() {
+        let root = std::env::temp_dir().join(format!("bop-xany-{}", uuid::Uuid::new_v4()));
+        let (dir, src) = (root.join("dataset"), root.join("src"));
+        let classes = crate::collect::config::default_classes();
+        let rel = put_frame(&dir, "race");
+        let frame = Frame::resolve(&dir, &rel).unwrap();
+        super::super::write(&frame.labels, &LabelFile::default()).unwrap();
+        put_shapeless(&src, "race", true);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let importer = s.spawn(|| {
+                for _ in 0..400 {
+                    import_dir(&dir, &src, &classes, &[], false, "t").unwrap();
+                }
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            // A concurrent writer adds one model box at a time. An import rejects a box or
+            // keeps it; it may never drop one.
+            let mut added = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                super::super::update(&frame.labels, |cur| {
+                    let mut f = cur.unwrap();
+                    let x = 1.0 + (added % 40) as f32;
+                    f.boxes.push(model_box(
+                        "person",
+                        [x, 1.0, x + 8.0, 40.0],
+                        BoxState::Pending,
+                    ));
+                    f.empty_confirmed = false;
+                    Ok(Some(f))
+                })
+                .unwrap();
+                added += 1;
+                let now = frame.labels().unwrap().unwrap().boxes.len();
+                assert_eq!(now, added, "a box written during an import was lost");
+            }
+            importer.join().unwrap();
+        });
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

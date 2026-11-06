@@ -20,7 +20,10 @@
 //! `.../moved`.
 //! Every frame reference goes through
 //! [`Frame::resolve`] (404 otherwise); POST bodies are JSON (415 otherwise) with per-route size
-//! caps (413); the admin guard and the cross-site check of the router apply.
+//! caps (413); the admin guard and the cross-site check of the router apply. A folder under review
+//! that is not there (an unplugged drive) is its own state, `folder_missing: true` with a message
+//! ([`folder_problem`]: 200 from `/v1/review/next`, 503 where the folder is needed), not an empty
+//! dataset.
 
 use super::{AppState, Shared, blocking, encode_uri_component, render, save_config};
 use crate::collect::CollectSettings;
@@ -68,6 +71,44 @@ fn not_found() -> Response {
 
 /// An error answer not built yet (status, message): see [`fail`].
 type Problem = (StatusCode, String);
+
+/// Why the folder under review `dir` cannot be used, as the page words it; None when it can. A
+/// folder that does not exist, an unmounted drive first of all, would otherwise look like an empty
+/// dataset. Only the dataset folder may be absent, when its parent is there: nothing was collected
+/// yet (a parent that is gone too is an unplugged drive). A chosen `review_dir` must exist.
+pub(super) fn folder_problem(state: &AppState, dir: &std::path::Path) -> Option<String> {
+    let e = std::fs::read_dir(dir).err()?;
+    let collect = &state.config_read().collect;
+    if e.kind() == std::io::ErrorKind::NotFound
+        && collect.review_dir.is_none()
+        && (collect.dir.is_none() || dir.parent().is_some_and(std::path::Path::is_dir))
+    {
+        return None;
+    }
+    let why = match e.kind() {
+        std::io::ErrorKind::NotFound => String::new(),
+        _ => format!(" ({e})"),
+    };
+    Some(format!(
+        "The folder under review is not available: {}{why}; connect the drive or choose another \
+         folder.",
+        dir.display()
+    ))
+}
+
+/// The answer of a route that needs the folder under review while it is unavailable.
+fn folder_unavailable(message: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "success": false, "folder_missing": true, "message": message })),
+    )
+        .into_response()
+}
+
+/// [`not_found`], or [`folder_unavailable`] when that is why `dir` has no such frame.
+fn no_frame(state: &AppState, dir: &std::path::Path) -> Response {
+    folder_problem(state, dir).map_or_else(not_found, folder_unavailable)
+}
 
 /// The JSON body of a POST: 413 over the route's cap, 415 without a JSON content type, 400 when
 /// it does not parse.
@@ -241,7 +282,8 @@ pub(super) async fn next(
         let built = queue::build(&dir, &filters);
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
         let found = queue::next_after(&built.items, after);
-        Json(serde_json::json!({
+        let damaged = layout::damaged_lines(&dir, filters.source == queue::QueueSource::All);
+        let mut answer = serde_json::json!({
             "success": true,
             "item": found.map(|(_, i, _)| i),
             "position": found.map(|(p, _, _)| p + 1),
@@ -250,10 +292,16 @@ pub(super) async fn next(
             "counts": built.counts,
             "cameras": built.cameras,
             "labels": built.labels,
-            "unreadable": built.unreadable,
+            "unreadable": built.unreadable + damaged,
             "upcoming": built.items.iter().skip(found.map_or(0, |(p, _, _)| p + 1)).take(5).map(|i| &i.frame).collect::<Vec<_>>(),
-        }))
-        .into_response()
+        });
+        if let (Some(message), Some(fields)) =
+            (folder_problem(&state, &dir), answer.as_object_mut())
+        {
+            fields.insert("folder_missing".into(), true.into());
+            fields.insert("message".into(), message.into());
+        }
+        Json(answer).into_response()
     })
     .await
 }
@@ -343,7 +391,7 @@ pub(super) async fn labels_get(
         let hidden = hidden(&state);
         match Frame::resolve(&dir, &rel) {
             Some(f) => labels_answer(&f, &classes, &hidden, None),
-            None => not_found(),
+            None => no_frame(&state, &dir),
         }
     })
     .await
@@ -379,7 +427,7 @@ pub(super) async fn labels_post(
         let (dir, classes, _) = context(&state);
         let hidden = hidden(&state);
         let Some(frame) = Frame::resolve(&dir, &rel) else {
-            return not_found();
+            return no_frame(&state, &dir);
         };
         let rec = match frame.record() {
             Ok(r) => r,
@@ -476,13 +524,14 @@ pub(super) async fn accept_auto(
     .collect();
     q.insert("status".into(), "unreviewed".into());
     q.insert("auto".into(), "accept".into());
-    let filters = match Filters::from_query(&q) {
+    let mut filters = match Filters::from_query(&q) {
         Ok(f) => f,
         Err(e) => return fail(StatusCode::BAD_REQUEST, e),
     };
     let dry_run = b.dry_run;
     blocking(move || {
         let (dir, classes, _) = context(&state);
+        filters.wanted = Some((classes.clone(), hidden(&state)));
         let o = bulk::bulk_accept(&dir, &filters, &classes, limit, &now(), dry_run, &|_| true);
         let eligible = o.eligible;
         if dry_run {
@@ -1855,6 +1904,9 @@ pub(super) async fn export(
     }
     blocking(move || {
         let (dir, classes, root) = context(&state);
+        if let Some(message) = folder_problem(&state, &dir) {
+            return folder_unavailable(message);
+        }
         let filter = match class_filter(b.labels, b.include_empty, &classes) {
             Ok(f) => f,
             Err(e) => return fail(StatusCode::BAD_REQUEST, e),
@@ -1912,6 +1964,9 @@ pub(super) async fn import(
     };
     blocking(move || {
         let (dir, classes, root) = context(&state);
+        if let Some(message) = folder_problem(&state, &dir) {
+            return folder_unavailable(message);
+        }
         let src = match named_folder(&state, "dir", &b.dir, &root) {
             Ok(Some(p)) if p.is_dir() => p,
             Ok(Some(_)) => {
@@ -4342,5 +4397,160 @@ mod tests {
             .collect();
         std::fs::write(&frame.sidecar, serde_json::to_vec(&rec).unwrap()).unwrap();
         rel
+    }
+
+    #[tokio::test]
+    async fn a_new_dataset_folder_is_not_an_unplugged_drive() {
+        let d = ds();
+        let new = d.root.join("not-yet");
+        d.state
+            .config
+            .update("test", |c| {
+                c.collect.dir = Some(new.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(folder_problem(&d.state, &new), None);
+        // Its parent gone too is a drive that is not there.
+        let gone = d.root.join("drive").join("frames");
+        assert!(folder_problem(&d.state, &gone).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_missing_folder_under_review_is_named_not_taken_for_an_empty_dataset() {
+        let d = ds();
+        let rel = put_frame(&d.dir, "cam", "2026-10-22", "20261022T010203004Z_abcd", 0.9);
+        d.state
+            .config
+            .update("test", |c| {
+                c.collect.review_dir = Some(d.dir.clone());
+                Ok(())
+            })
+            .unwrap();
+        // The drive is unplugged.
+        let moved = d.root.join("unplugged");
+        std::fs::rename(&d.dir, &moved).unwrap();
+        let (s, v) = json(
+            &d.state,
+            Request::get("/v1/review/next").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["folder_missing"], true, "{v}");
+        let m = v["message"].as_str().unwrap();
+        assert!(m.contains("not available"), "{m}");
+        assert!(m.contains(&d.dir.display().to_string()), "{m}");
+        assert!(m.contains("connect the drive"), "{m}");
+        // A save says so too, rather than "not a frame of the dataset".
+        let (s, v) = json(
+            &d.state,
+            Request::post(format!("/v1/review/labels?frame={rel}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&LabelFile::default()).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["folder_missing"], true, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("not available"),
+            "{v}"
+        );
+        let (s, v) = json(
+            &d.state,
+            Request::post("/v1/review/export")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["folder_missing"], true, "{v}");
+        // Back again: the frame is there, nothing happened to it.
+        std::fs::rename(&moved, &d.dir).unwrap();
+        let (s, v) = json(
+            &d.state,
+            Request::get("/v1/review/next").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(v.get("folder_missing").is_none(), "{v}");
+        assert_eq!(v["total"], 1, "{v}");
+    }
+
+    #[tokio::test]
+    async fn a_damaged_queue_line_shows_as_unreadable_and_costs_only_that_line() {
+        let d = ds();
+        put_frame(&d.dir, "cam", "2026-10-22", "20261022T010203004Z_abcd", 0.9);
+        let queue = d.dir.join(layout::REVIEW_QUEUE_FILE);
+        let mut bytes = std::fs::read(&queue).unwrap();
+        bytes.extend_from_slice(b"\xff\xfe\n");
+        std::fs::write(&queue, &bytes).unwrap();
+        let (s, v) = json(
+            &d.state,
+            Request::get("/v1/review/next").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["total"].as_u64(), v["unreadable"].as_u64()),
+            (Some(1), Some(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bulk_accept_through_the_route_honours_the_hidden_classes() {
+        let d = ds_with(|c| c.collect.hidden_classes = vec!["dog".into()]);
+        let rel = put_frame(&d.dir, "cam", "2026-10-22", "20261022T010203004Z_abcd", 0.9);
+        let frame = Frame::resolve(&d.dir, &rel).unwrap();
+        let pick = |label: &str, x: f32| {
+            let mut b = crate::collect::labels::bulk::test_support::auto_box(
+                label,
+                0.9,
+                crate::collect::labels::Triage::Accept,
+            );
+            b.bbox = [x, 2.0, x + 10.0, 40.0];
+            b
+        };
+        let file = LabelFile {
+            boxes: vec![pick("person", 1.0), pick("dog", 30.0)],
+            ..LabelFile::default()
+        };
+        labels::write(&frame.labels, &file).unwrap();
+        let (s, v) = json(
+            &d.state,
+            Request::post("/v1/review/accept-auto")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["accepted"], 1, "{v}");
+        let l = frame.labels().unwrap().unwrap();
+        assert_eq!(
+            l.training().map(|b| b.label.as_str()).collect::<Vec<_>>(),
+            ["person"]
+        );
+        assert_eq!(l.boxes[1].reason.as_deref(), Some(bulk::OTHER_CLASS_REASON));
+    }
+
+    #[tokio::test]
+    async fn a_dataset_folder_nothing_was_collected_into_yet_is_just_empty() {
+        // A fresh install: the default dataset folder does not exist yet.
+        let root = std::env::temp_dir().join(format!("bop-review-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r));
+        let (s, v) = json(
+            &state,
+            Request::get("/v1/review/next").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v.get("folder_missing").is_none(), "{v}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -13,6 +13,8 @@ Build (after `cargo build --release --locked --bins --target T`):
     packaging/linux/build.sh x86_64-unknown-linux-gnu dist/
 
 Smoke test (Ubuntu with sudo + systemd): `packaging/linux/smoke-test.sh dist/*.deb dist/*.rpm`.
+`packaging/linux/test-scriptlets.sh` runs the maintainer scripts' decisions against a temp folder with
+stubbed system commands: no root, no package, any OS with bash.
 
 Files:
 
@@ -24,15 +26,28 @@ Files:
   `useradd` as fallback.
 - `pkg-scriptlet.sh` -> `/opt/blue-onyx-prism/scripts/pkg_scriptlet.sh`: the one implementation of
   post-install / post-upgrade / pre-remove, built on `scripts/systemd_common.sh` (also used by
-  `install_systemd.sh`). `debian/{postinst,prerm,postrm}` and `rpm/*.sh` are thin wrappers.
+  `install_systemd.sh`). `debian/{preinst,postinst,prerm,postrm}` and `rpm/*.sh` are thin wrappers.
 - No `systemd-units` in cargo-deb: the scriptlet does enable/start itself, so nothing is handled
   twice (`#DEBHELPER#` stays in the scripts but expands to nothing).
 
-Behavior: config is never overwritten; install enables and starts, upgrade only `try-restart`s;
-removal stops and disables (not on upgrade). `apt remove` also deletes what the program created in
-`/opt/blue-onyx-prism` and keeps `/var/lib/blue-onyx-prism` and the user for a reinstall; `apt purge`
-deletes those too (like `uninstall_systemd.sh --purge`). RPM has no purge, so an erase (`dnf remove`,
-not an upgrade) leaves nothing behind: `/opt/blue-onyx-prism`, `/var/lib/blue-onyx-prism` and the user
-and group. `smoke-test.sh` checks both, the RPM in a Fedora container, and searches the filesystem for
-leftovers (names and files owned by the deleted user).
+Behavior: config is never overwritten; install enables and starts, upgrade only `try-restart`s, so a
+unit the admin disabled stays disabled; removal stops and disables (not on upgrade).
+
+`apt remove` and `dnf remove` delete `/opt/blue-onyx-prism`, with what the program created there, and
+keep `/var/lib/blue-onyx-prism` (config, models, dataset, reviewed labels, training runs) and the
+user for a reinstall, and both say so. `apt purge` deletes those too, like
+`uninstall_systemd.sh --purge`. RPM has no purge, so the erase prints the commands:
+`sudo rm -rf /var/lib/blue-onyx-prism && sudo userdel blueonyx`. An RPM of 0.2.0 or older deleted the
+data on an erase, and an installed package erases by its own scripts: upgrade first.
+
+A reinstall over kept data works like a first install, and `apt` needs help for it: `apt remove` leaves
+the package in dpkg's config-files state, so the postinst gets the old version as on an upgrade,
+though the unit was disabled. `debian/preinst` sees `install <old-version>` and leaves
+`/opt/blue-onyx-prism/.reinstall` for the postinst. A data root whose owner is not the current
+`blueonyx` (the user was deleted by hand and made again, or the folder came from a backup) is chowned
+as a whole first, before `install -d` corrects only its top folders and hides the mismatch from
+`StateDirectory=` as well.
+
+`smoke-test.sh` checks all of this, the RPM in a Fedora container, including a reinstall with another
+uid, and searches the filesystem for leftovers (names and files owned by the deleted user).
 Scriptlets skip `systemctl` when systemd is not running (containers, chroots).

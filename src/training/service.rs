@@ -3,7 +3,8 @@
 //! dropped, a running one has its process tree killed). Every run's record ([`RunRecord`]: state,
 //! stage, progress, log tail, dataset counts, the installed model, the benchmark) is kept in
 //! memory and saved to `<training dir>/runs.json`, so the Train tab shows past runs after a
-//! restart; a run that was queued or running when the process stopped is marked interrupted.
+//! restart; a run that was queued or running when the process stopped is marked interrupted. A
+//! damaged file is set aside, never written over ([`task::load_or_move_aside`]).
 //! While idle the queue can move to another training folder ([`TrainingService::set_store`]).
 //! Footage imports and auto-label runs ([`super::task::Task`]) go through the same queue and
 //! thread (one GPU job at a time); their records are kept in `tasks.json`.
@@ -19,6 +20,7 @@
 use super::eta::{JobClock, JobTiming};
 use super::job::{
     BenchSummary, Hooks, TrainError, TrainJob, TrainOutput, TrainReport, TrainRequest, TrainStage,
+    not_in_config,
 };
 use super::progress::TrainProgress;
 use super::task::{self, Task, TaskContext, TaskRecord, TaskReport};
@@ -229,7 +231,13 @@ impl RunRecord {
                     .unwrap_or_default(),
                 self.error.as_deref().unwrap_or("unknown error")
             ),
-            RunState::Cancelled => "cancelled".into(),
+            RunState::Cancelled => match self.output.as_ref() {
+                Some(o) if self.registered.is_none() => {
+                    format!("cancelled after the install. {}", not_in_config(o))
+                }
+                Some(o) => format!("cancelled after the install: {} is in the config", o.name),
+                None => "cancelled".into(),
+            },
         }
     }
 }
@@ -248,41 +256,34 @@ pub fn new_run_id() -> String {
     )
 }
 
-/// Load the records of `path`; busy ones become interrupted failures.
-pub fn load_records(path: &Path) -> Vec<RunRecord> {
-    let mut v: Vec<RunRecord> = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    for r in &mut v {
+/// [`task::load_or_move_aside`]; busy records become interrupted failures.
+fn open_records(path: &Path) -> task::Loaded<RunRecord> {
+    let mut loaded = task::load_or_move_aside::<RunRecord>(path);
+    for r in &mut loaded.records {
         if r.state.is_busy() {
             r.state = RunState::Failed;
-            r.error = Some(
-                "interrupted: the service stopped while this run was queued or running; use Retry \
-                 export if the row offers it, else queue it again"
+            r.error = Some(match (&r.output, &r.registered) {
+                (Some(o), None) => {
+                    format!("interrupted after the install. {}", not_in_config(o))
+                }
+                (Some(o), Some(_)) => format!(
+                    "interrupted after {} was added to the config: the model is ready, only its \
+                     benchmark did not finish; run it on the Benchmark page",
+                    o.name
+                ),
+                (None, _) => "interrupted: the service stopped while this run was queued or \
+                              running; use Retry export if the row offers it, else queue it again"
                     .into(),
-            );
+            });
             r.retrying = false;
         }
     }
-    v
+    loaded
 }
 
-fn save_records(path: &Path, runs: &[RunRecord]) {
-    let tmp = path.with_extension("json.tmp");
-    let r = serde_json::to_vec_pretty(runs)
-        .map_err(anyhow::Error::from)
-        .and_then(|b| {
-            if let Some(p) = path.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            std::fs::write(&tmp, b)?;
-            std::fs::rename(&tmp, path)?;
-            Ok(())
-        });
-    if let Err(e) = r {
-        tracing::warn!("saving {}: {e:#}", path.display());
-    }
+/// [`open_records`], for a reader that does not save.
+pub fn load_records(path: &Path) -> Vec<RunRecord> {
+    open_records(path).records
 }
 
 struct Inner {
@@ -328,14 +329,37 @@ impl Current {
 struct Stores {
     runs: Option<PathBuf>,
     tasks: Option<PathBuf>,
+    /// This file holds damage that could not be set aside: this process does not write it
+    /// ([`task::Loaded::writable`]), and its records live in memory.
+    hold_runs: bool,
+    hold_tasks: bool,
 }
 
 impl Stores {
-    fn new(runs: Option<PathBuf>) -> Self {
-        Self {
-            tasks: runs.as_deref().map(task::tasks_file),
+    /// The stores at `runs` and the records they hold.
+    fn open(runs: Option<PathBuf>) -> (Self, Vec<RunRecord>, Vec<TaskRecord>) {
+        let tasks = runs.as_deref().map(task::tasks_file);
+        let run_records = runs.as_deref().map(open_records);
+        let task_records = tasks.as_deref().map(task::open_records);
+        let stores = Self {
+            hold_runs: run_records.as_ref().is_some_and(|l| !l.writable),
+            hold_tasks: task_records.as_ref().is_some_and(|l| !l.writable),
             runs,
-        }
+            tasks,
+        };
+        (
+            stores,
+            run_records.map(|l| l.records).unwrap_or_default(),
+            task_records.map(|l| l.records).unwrap_or_default(),
+        )
+    }
+
+    fn runs_to_write(&self) -> Option<PathBuf> {
+        self.runs.clone().filter(|_| !self.hold_runs)
+    }
+
+    fn tasks_to_write(&self) -> Option<PathBuf> {
+        self.tasks.clone().filter(|_| !self.hold_tasks)
     }
 }
 
@@ -356,9 +380,9 @@ impl Inner {
 
     /// Write the runs (the caller holds `persist_lock`).
     fn write_runs(&self) {
-        if let Some(p) = self.stores.lock_recover().runs.clone() {
+        if let Some(p) = self.stores.lock_recover().runs_to_write() {
             let runs = self.runs.lock_recover().clone();
-            save_records(&p, &runs);
+            task::save_file(&p, &runs);
         }
     }
 
@@ -397,7 +421,7 @@ impl Inner {
 
     /// Write the tasks (the caller holds `persist_lock`).
     fn write_tasks(&self) {
-        if let Some(p) = self.stores.lock_recover().tasks.clone() {
+        if let Some(p) = self.stores.lock_recover().tasks_to_write() {
             let tasks = self.tasks.lock_recover().clone();
             task::save_records(&p, &tasks);
         }
@@ -445,13 +469,7 @@ impl TrainingService {
         hooks: Arc<dyn Hooks>,
         store: Option<PathBuf>,
     ) -> Arc<Self> {
-        let stores = Stores::new(store);
-        let runs = stores.runs.as_deref().map(load_records).unwrap_or_default();
-        let tasks = stores
-            .tasks
-            .as_deref()
-            .map(task::load_records)
-            .unwrap_or_default();
+        let (stores, runs, tasks) = Stores::open(store);
         let inner = Arc::new(Inner {
             runner,
             fetcher,
@@ -503,13 +521,7 @@ impl TrainingService {
                     .into(),
             );
         }
-        *stores = Stores::new(Some(store.to_path_buf()));
-        *runs = load_records(store);
-        *tasks = stores
-            .tasks
-            .as_deref()
-            .map(task::load_records)
-            .unwrap_or_default();
+        (*stores, *runs, *tasks) = Stores::open(Some(store.to_path_buf()));
         drop((stores, tasks, runs));
         self.inner.changed.notify_all();
         Ok(true)
@@ -657,10 +669,7 @@ impl TrainingService {
     pub fn cancel(&self, id: &str) -> bool {
         if let Some(st) = self.get_task(id).map(|r| r.state) {
             let done = match st {
-                RunState::Queued => {
-                    self.cancel_queued_task(id, None);
-                    true
-                }
+                RunState::Queued => self.cancel_queued_task(id, None),
                 RunState::Running | RunState::Paused => self.flag_current(id),
                 _ => false,
             };
@@ -673,34 +682,53 @@ impl TrainingService {
             return false;
         };
         match st {
-            RunState::Queued => {
-                self.inner.cancelled.lock_recover().insert(id.to_string());
-                self.inner.update_persist(id, |r| {
-                    r.state = if r.retrying {
-                        RunState::Failed
-                    } else {
-                        RunState::Cancelled
-                    };
-                    r.retrying = false;
-                    r.finished = Some(now());
-                });
-                true
-            }
+            RunState::Queued => self.cancel_queued_run(id),
             RunState::Running | RunState::Paused => self.flag_current(id),
             _ => false,
         }
     }
 
-    /// Mark the queued task `id` Cancelled (with `summary`) and drop it when the worker gets it.
-    fn cancel_queued_task(&self, id: &str, summary: Option<String>) {
+    /// Cancel a run read as queued. The queue may have started it since: then it is the running
+    /// run that must stop, and only it may change its record ([`Self::flag_current`]).
+    pub(super) fn cancel_queued_run(&self, id: &str) -> bool {
         self.inner.cancelled.lock_recover().insert(id.to_string());
+        let mut queued = false;
+        self.inner.update_persist(id, |r| {
+            if r.state == RunState::Queued {
+                queued = true;
+                r.state = if r.retrying {
+                    RunState::Failed
+                } else {
+                    RunState::Cancelled
+                };
+                r.retrying = false;
+                r.finished = Some(now());
+            }
+        });
+        queued || self.cancel_started(id)
+    }
+
+    /// The job `id` left the queue while it was being cancelled: drop the mark that was for the
+    /// queue, or a later job of that id would be skipped, and stop the job. `current` is set before
+    /// a job turns Running, so a running job is found; a finished one answers false.
+    fn cancel_started(&self, id: &str) -> bool {
+        self.inner.cancelled.lock_recover().remove(id);
+        self.flag_current(id)
+    }
+
+    /// Mark the queued task `id` Cancelled (with `summary`) and drop it when the worker gets it.
+    fn cancel_queued_task(&self, id: &str, summary: Option<String>) -> bool {
+        self.inner.cancelled.lock_recover().insert(id.to_string());
+        let mut queued = false;
         self.inner.update_persist_task(id, |r| {
             if r.state == RunState::Queued {
+                queued = true;
                 r.state = RunState::Cancelled;
                 r.summary = summary;
                 r.finished = Some(now());
             }
         });
+        queued || self.cancel_started(id)
     }
 
     /// Cancel the queued tasks that follow `id`, and the ones that follow those.
@@ -718,7 +746,7 @@ impl TrainingService {
                 .collect();
             for f in followers {
                 let why = format!("not run: the {kind} it follows was cancelled");
-                self.cancel_queued_task(&f, Some(why));
+                let _ = self.cancel_queued_task(&f, Some(why));
                 todo.push(f);
             }
         }
@@ -1084,6 +1112,12 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             TrainReport::Prepared(p) => {
                 inner.update_persist(&id, |r| r.dataset = Some(DatasetCounts::of(p)));
             }
+            TrainReport::Installed(o) => {
+                inner.update_persist(&id, |r| r.output = Some(o.clone()));
+            }
+            TrainReport::Registered(m) => {
+                inner.update_persist(&id, |r| r.registered = Some(m.to_string()));
+            }
         };
         let runner = PausableRunner {
             inner: inner.runner.as_ref(),
@@ -1119,7 +1153,9 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             }) => {
                 tracing::warn!(run = %id, "training cancelled");
                 inner.update_persist(&id, |r| {
-                    r.state = if r.retrying {
+                    // A retry goes back to its failure, unless it got as far as installing: then
+                    // that failure is over.
+                    r.state = if r.retrying && r.output.is_none() {
                         RunState::Failed
                     } else {
                         RunState::Cancelled

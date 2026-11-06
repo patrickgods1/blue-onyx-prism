@@ -16,6 +16,22 @@ UNIT=blue-onyx-prism
 # systemd running as PID 1 (not a chroot / container build); otherwise skip systemctl.
 have_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
 
+# An uninstall keeps the data root, so an install can meet one written by an earlier blueonyx
+# with another uid (the user was deleted by hand, or the folder came from a backup). The check
+# must run before `install -d` below: that corrects the top folders only, which would also hide
+# the mismatch from systemd's StateDirectory=, which looks at the top folder. -h and the `/.`:
+# links are never followed (uv's Python environment has some), a data root that is itself a link
+# to a larger disk is. A failure warns: the data is intact and the service may still run.
+own_data_root() {
+  [ -d "$DATA_DIR" ] || return 0
+  want="$(id -u "$BOP_USER"):$(id -g "$BOP_USER")"
+  have="$(stat -Lc %u:%g "$DATA_DIR")"
+  [ "$have" != "$want" ] || return 0
+  echo "$DATA_DIR belongs to $have, not to $BOP_USER ($want): changing its owner, which can take a while." >&2
+  chown -hR "$BOP_USER:$BOP_USER" "$DATA_DIR/." \
+    || echo "Could not change the owner of everything in $DATA_DIR, so the service may fail to read it (is it a network share?). Fix it with: sudo chown -hR $BOP_USER:$BOP_USER $DATA_DIR/." >&2
+}
+
 case "${1:-}" in
   post-install | post-upgrade)
     if command -v systemd-sysusers >/dev/null 2>&1 \
@@ -24,6 +40,7 @@ case "${1:-}" in
     fi
     # Fallback (and idempotent top-up): useradd when sysusers is unavailable or failed.
     bop_ensure_user "$DATA_DIR"
+    own_data_root
 
     install -d -o "$BOP_USER" -g "$BOP_USER" -m 0750 "$DATA_DIR" "$DATA_DIR/models" "$DATA_DIR/cache"
     bop_seed_config "$INSTALL_DIR" "$DATA_DIR" "$CONFIG" 0

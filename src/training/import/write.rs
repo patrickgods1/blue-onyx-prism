@@ -55,13 +55,7 @@ pub struct ImportLine {
 
 /// The imports listed in `dir` (newest last; lines that do not parse are skipped).
 pub fn read_imports(dir: &Path) -> Vec<ImportLine> {
-    std::fs::read_to_string(dir.join(IMPORTS_FILE))
-        .map(|t| {
-            t.lines()
-                .filter_map(|l| serde_json::from_str(l).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    layout::read_lines(&dir.join(IMPORTS_FILE)).lines
 }
 
 fn stem_of(time: SystemTime, id4: &str, n: usize) -> String {
@@ -422,6 +416,70 @@ mod tests {
         assert_eq!(names.len(), 5, "{names:?}");
         assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
         assert_eq!(layout::read_index(&day.join(layout::INDEX_FILE)).len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_damaged_imports_file_costs_only_the_damaged_lines() {
+        let dir = std::env::temp_dir().join(format!("bop-imports-{}", uuid::Uuid::new_v4()));
+        let line = |id: &str| ImportLine {
+            id: id.into(),
+            created: "t".into(),
+            source: "s".into(),
+            kind: "path".into(),
+            license: "l".into(),
+            attribution: None,
+            frames: 1,
+            cameras: vec![],
+            scenes: Default::default(),
+        };
+        append_import(&dir, &line("a")).unwrap();
+        // An invalid byte, and a torn line with no newline.
+        let path = dir.join(IMPORTS_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"\xff\n{\"id\":\"to");
+        std::fs::write(&path, &bytes).unwrap();
+        append_import(&dir, &line("b")).unwrap();
+        let ids: Vec<String> = read_imports(&dir).into_iter().map(|l| l.id).collect();
+        assert_eq!(ids, ["a", "b"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_frame_after_a_torn_index_line_is_indexed_whole() {
+        let root = std::env::temp_dir().join(format!("bop-import-torn-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("f.jpg");
+        let bytes = jpeg(false);
+        std::fs::write(&src, &bytes).unwrap();
+        let img = crate::image::decode(&bytes).unwrap();
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let frame = |i: u32| Frame {
+            file: src.clone(),
+            image_name: "c.mp4".into(),
+            camera: "cam".into(),
+            time: frame_time(base, Some(f64::from(i))),
+            width: img.width,
+            height: img.height,
+            stats: ImageStats::compute(&img),
+            dhash: u64::from(i + 1) * 0x0101_0101,
+            provenance: Provenance::default(),
+        };
+        let (rels, _) = write_frames(&dir, "20261022-120000-ab12", &[frame(0)]).unwrap();
+        let index = LabelFrame::resolve(&dir, &rels[0])
+            .unwrap()
+            .jpg
+            .parent()
+            .unwrap()
+            .join(layout::INDEX_FILE);
+        // ENOSPC stopped an append part way: the frames went, the half line stayed.
+        let mut text = std::fs::read(&index).unwrap();
+        text.extend_from_slice(b"{\"id\":\"half");
+        std::fs::write(&index, &text).unwrap();
+        write_frames(&dir, "20261022-120000-ab12", &[frame(1)]).unwrap();
+        let read = layout::read_lines::<IndexLine>(&index);
+        assert_eq!((read.lines.len(), read.damaged), (2, 1));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

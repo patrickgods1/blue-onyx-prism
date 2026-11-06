@@ -52,16 +52,33 @@ profiles. A Blue Iris on the same subnet, or on the same PC, needs nothing more.
 `PORT` (default 32168): firewall rule port only; also set `port` in the config if you change it. Example:
 `msiexec /i blue-onyx-prism.msi /qn PORT=32169`. The install folder can be changed in the UI or with `INSTALLFOLDER=`.
 
+`REMOVEDATA=1` on uninstall deletes the data folder (below). Only the value `1` does. `KEEPDATA=1` asked for keeping
+that folder before it became the default: it is still accepted, so old scripts work, and wins over `REMOVEDATA=1`.
+
 ## Uninstall
 
-A full uninstall leaves nothing behind: program files, the service, the firewall rule, the event
-source, the Run value, the shortcuts, `HKLM\SOFTWARE\BlueOnyxPrism`, the data folder
-`C:\ProgramData\BlueOnyxPrism` (config, downloaded runtimes, models, logs) and, when the program
-folder is the default `C:\Program Files\Blue Onyx Prism`, anything the program created there
-(a folder the user picked keeps files the MSI did not install). `msiexec /x <file>.msi KEEPDATA=1`
-keeps the data folder. Removing the old version during an upgrade keeps both folders' data. The
-tray's lock file in the user's temp folder is deleted when the tray exits (also when the
-uninstall terminates it). `smoke-test.ps1` checks all of this, with and without `KEEPDATA=1`.
+An uninstall removes the program files, the service, the firewall rule, the event source, the Run
+value, the shortcuts, `HKLM\SOFTWARE\BlueOnyxPrism` and, when the program folder is the default
+`C:\Program Files\Blue Onyx Prism`, anything the program created there (a folder the user picked
+keeps files the MSI did not install).
+
+It keeps the data folder `C:\ProgramData\BlueOnyxPrism`: config, downloaded runtimes, models, logs
+and, unless they were pointed elsewhere, the dataset, reviewed labels and training runs, which no
+download brings back. A reinstall picks the folder up and sets its DACL again. To delete it too,
+which cannot be undone:
+
+```powershell
+msiexec /x <file>.msi REMOVEDATA=1    # the MSI of the installed version; then nothing is left behind
+Remove-Item -LiteralPath C:\ProgramData\BlueOnyxPrism -Recurse -Force    # or by hand, after an uninstall (elevated)
+```
+
+Removing the old version during an upgrade keeps both folders' data. The tray's lock file in the
+user's temp folder is deleted when the tray exits (also when the uninstall terminates it).
+
+An installed version uninstalls by its own rules, from the MSI Windows cached for it. Up to 0.2.0
+that means the data folder goes unless `KEEPDATA=1` is passed: upgrade first, then uninstall the new
+version. `smoke-test.ps1` checks all of this for the current MSI: a plain uninstall, `KEEPDATA=1`
+and `REMOVEDATA=1`.
 
 ## Coexistence with scripts\install_service.ps1
 
@@ -73,5 +90,7 @@ The MSI does not change `ServicesPipeTimeout`.
 
 `smoke-test.ps1 -Msi <path> [-Port 32168]` (elevated): installs, checks service/account/HTTP/config, the data folder's
 DACL, the required privileges, the firewall rule's scope and profiles and the tray exe, Run value and shortcuts (the tray
-is not run), uninstalls, checks cleanup. A third round installs over data with an older version's ACL and a token, and
-checks that both folders' DACLs are corrected and that the full uninstall still removes them.
+is not run), uninstalls, checks cleanup. Four rounds: `REMOVEDATA=1` leaves nothing behind; over the deleted folder, a plain
+uninstall keeps only the data folder, a seeded dataset file included; over that data with an older version's ACL and a
+token, both folders' DACLs are corrected, the data is intact and `KEEPDATA=1` keeps it; a last install and `REMOVEDATA=1`
+remove everything, the protected token folder too.

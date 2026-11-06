@@ -1566,7 +1566,7 @@ impl Task for ImportJob {
         if let Some(fin) = self.finish.as_ref().filter(|f| !f.is_empty())
             && !cancel.load(Ordering::Relaxed)
         {
-            let lines = fin.apply(&self.dataset_dir, Some(&self.id), &[]);
+            let lines = fin.apply(&self.dataset_dir, Some(&self.id), &[], &[]);
             crate::training::finish::append(&mut out, lines);
         }
         Ok(out)

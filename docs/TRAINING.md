@@ -751,7 +751,7 @@ Default name: `<scene>-<model>-<YYYYMMDD-HHMM>`: `custom-` for `all`, `day-`, `n
 `night-only-`, `ir-`, `day-night-`, `day-ir-`. Several models can be queued at once (one per ticked
 size, or `--model` repeated), and several scenes queue one run per scene per model
 ([Comparing](#comparing-day-nightir-and-mixed-models)); they run one at a time. Cancel
-kills the process tree. Run records are kept in `<training dir>/runs.json`; a run interrupted by a
+kills the process tree. Run records are kept in `<training dir>/runs.json` (a damaged one moves to `runs.json.corrupt-<time>` and is logged, and a file that cannot be read is left alone and not saved over; `tasks.json` likewise; the working folder goes only after the model is registered); a run interrupted by a
 stopped service is shown as failed. On Unix the trainer exits when the service process is gone; on
 Windows the job object does it.
 

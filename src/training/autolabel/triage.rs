@@ -540,6 +540,8 @@ pub struct RelabelReport {
     /// Existing boxes that gained the model as a labeler ([`vote`]). A vote changes nothing a
     /// reviewer has to look at, so it queues no frame.
     pub votes: usize,
+    /// Detections left out because the frame is closed ([`LabelersPath::Closed`]).
+    pub closed: usize,
     /// The note of a frame that went back to `unreviewed` ([`disagreement`]).
     pub disagreement: Option<String>,
 }
@@ -548,7 +550,9 @@ pub struct RelabelReport {
 /// only; the file goes back to `unreviewed`), `boxes` (its [`model_boxes`]) merged by [`apply`],
 /// and the model's votes on the boxes it found again ([`vote`]), so its name survives a proposal
 /// the merge drops. The votes come after [`apply`], as on [`apply_labelers`]' unreviewed path: a
-/// vote on a box without evidence would stop it taking the proposal's.
+/// vote on a box without evidence would stop it taking the proposal's. A skipped or confirmed-empty
+/// frame ([`LabelersPath::Closed`]) takes the votes and nothing else, as on [`apply_labelers`]: a
+/// box there would send it back to `unreviewed`, out of the exports, and lose its hard negative.
 pub fn apply_relabel(
     f: &mut LabelFile,
     dets: &[Det],
@@ -556,6 +560,14 @@ pub fn apply_relabel(
     model: &str,
     classes: &[String],
 ) -> RelabelReport {
+    if labelers_path(f) == LabelersPath::Closed {
+        let votes = vote(f, &boxes, f.boxes.len());
+        return RelabelReport {
+            votes,
+            closed: boxes.len(),
+            ..RelabelReport::default()
+        };
+    }
     let why = disagreement(f, dets, model, classes);
     undismiss_found(f, &boxes);
     let existing = f.boxes.len();
@@ -568,6 +580,7 @@ pub fn apply_relabel(
     RelabelReport {
         apply: merged,
         votes,
+        closed: 0,
         disagreement: why,
     }
 }
@@ -2602,6 +2615,54 @@ mod tests {
         // So the later save still goes through.
         f.status = Status::Reviewed;
         assert!(labels::normalize(f, &classes(), 640, 480, "t").is_ok());
+    }
+
+    /// A closed frame ([`LabelersPath::Closed`]) takes a re-label's votes and nothing else, as it
+    /// does a labelers run's.
+    #[test]
+    fn a_relabel_leaves_a_closed_frame_as_it_is_but_for_votes() {
+        let cls = classes();
+        let run = ModelRun {
+            model: "custom",
+            classes: &cls,
+            scene: "day",
+            accept_score: None,
+        };
+        let det = |label: &str, bbox| Det {
+            label: label.into(),
+            score: 0.9,
+            bbox,
+        };
+        for (status, empty_confirmed) in [
+            (Status::Reviewed, true),
+            (Status::Unreviewed, true),
+            (Status::Skipped, false),
+        ] {
+            let mut rejected = lb("car", CAR, Source::Model, BoxState::Rejected);
+            rejected.auto.labelers.insert("gdino".into(), 0.4);
+            let mut f = LabelFile {
+                status,
+                empty_confirmed,
+                boxes: vec![rejected],
+                ..LabelFile::default()
+            };
+            let before = f.clone();
+            let dets = [det("dog", OFF)];
+            let out = model_boxes(&dets, &run, 640, 480);
+            let r = apply_relabel(&mut f, &dets, out.boxes, "custom", &cls);
+            assert_eq!(f, before, "{status:?}: nothing but votes changes the file");
+            assert_eq!(r.disagreement, None, "{status:?}");
+            assert_eq!(r.apply, ApplyReport::default(), "{status:?}");
+            let dets = [det("car", CAR)];
+            let out = model_boxes(&dets, &run, 640, 480);
+            let r = apply_relabel(&mut f, &dets, out.boxes, "custom", &cls);
+            assert_eq!(r.votes, 1, "{status:?}");
+            assert_eq!(f.boxes.len(), 1, "{status:?}");
+            assert_eq!(f.boxes[0].state, BoxState::Rejected, "{status:?}");
+            assert_eq!(f.status, status, "{status:?}");
+            assert_eq!(f.disagreement, None, "{status:?}");
+            assert_eq!(f.boxes[0].auto.labelers["custom"], 0.9, "{status:?}");
+        }
     }
 
     #[test]
