@@ -13,12 +13,14 @@ Labelers, per frame (docs/TRAINING.md, "Auto-label"):
   3. Weighted boxes fusion of both (IoU --wbf-iou 0.55, weights 1:1; a class only one labeler can
      report is fused over that labeler alone). Every fused box records which labelers found it
      (`sources`) and whether both did (`agree`).
-  4. Checks: Qwen3-VL (--vlm, optional) answers "what is this crop" in one word for every person box
-     and every single-labeler box; SigLIP 2 (--siglip, optional) ranks the animal classes on the crop
-     with day or night prompts (`species_scores`). Neither deletes a box: the service's triage turns a
-     "no" into "review". --vlm-min-score skips the VLM on boxes whose fused score is below it
-     (`vlm_skipped: "score"`); --vlm-batch N asks up to N crops of a frame in one `generate` call.
-     A reply ends after its first token when that is a whole answer word (one decode step less).
+  4. Checks: Qwen3-VL (--vlm, optional) answers "Is there a real <label> in this image?" yes or no
+     for each box; SigLIP 2 (--siglip, optional) ranks the animal classes on the crop with day or
+     night prompts (`species_scores`). Neither deletes a box: the service decides what a "no" means.
+     --vlm-min-score skips the VLM on boxes whose fused score is below it (`vlm_skipped: "score"`),
+     except a --vlm-sample share of them, asked so the cutoff can be audited (`vlm_sampled`);
+     --vlm-batch N asks up to N crops of a frame in one `generate` call. A reply ends after its first
+     token when that is a whole answer word (one decode step less). An answer that is neither yes
+     nor no leaves the box without a `vlm` (`vlm_skipped: "unclear"`).
 
 Nothing is decided here: the service reads the JSONL output, triages each box (accept only when
 both labelers agree at a score >= 0.6 and no check objects; night person / animal boxes always go to
@@ -67,6 +69,7 @@ import threading
 import time
 import types
 import warnings
+import zlib
 from pathlib import Path
 
 # ---------------------------------------------------------------------------------------------
@@ -294,20 +297,24 @@ def phrase_class(text: str, phrase_to_class: dict):
     return best[1] if best else None
 
 
-VLM_WORDS = ("person", "vehicle", "animal", "statue", "rock", "plant", "nothing")
+VLM_WORDS = ("yes", "no")
+
+
+def vlm_question(label: str) -> str:
+    """The VLM's question about a box of class `label`. A seven-way "what is this" prompt called 75
+    of 171 real people "plant"; this wording, measured on the same crops, confirmed 169 of 173 real
+    objects and 50 of 1,352 false boxes on one camera; on public sets its yes is 77% real and its no
+    still 40% real, so it ranks boxes and never hides one (docs/TRAINING.md, "Measuring auto-label").
+    Do not reword it without measuring."""
+    return f"Is there a real {label.replace('_', ' ')} in this image? Answer yes or no."
 
 
 def vlm_answer(text: str) -> str:
-    """The first known word of a VLM answer ("A rock." -> "rock"; plurals folded), else the first
-    word, lowercased."""
+    """"yes" or "no" when that is the reply's first word, else "": an unclear reply is no evidence,
+    and must not count as a no."""
     words = [w.strip(".,!?;:\"'()[]").lower() for w in text.split()]
     words = [w for w in words if w]
-    for w in words:
-        s = w[:-1] if w.endswith("s") and w[:-1] in VLM_WORDS else w
-        if s in VLM_WORDS or s in ("car", "truck", "dog", "cat", "people", "man", "woman", "tree", "bush"):
-            return {"car": "vehicle", "truck": "vehicle", "dog": "animal", "cat": "animal", "people": "person",
-                    "man": "person", "woman": "person", "tree": "plant", "bush": "plant"}.get(s, s)
-    return words[0] if words else ""
+    return words[0] if words and words[0] in VLM_WORDS else ""
 
 
 def crop_box(b, w: int, h: int, pad: float = 0.2):
@@ -339,19 +346,19 @@ def crop_detections(found: list, box, w: int, h: int) -> list:
     return out
 
 
-def needs_vlm(b: dict) -> bool:
-    """The VLM checks person boxes and boxes only one labeler found (of the person, vehicle and
-    animal classes: its answers cover only those)."""
-    c = category(b["label"])
-    return c != "object" and (c == "person" or not b.get("agree", False))
+def in_vlm_sample(frame: str, b: dict, share: float) -> bool:
+    """Whether box `b` of `frame` is in the audit sample (`share` of 0..1 of the boxes): the same
+    boxes on every run, so an interrupted run resumes to the same answers."""
+    key = f"{frame}|{b['label']}|{[round(v) for v in b['bbox']]}"
+    return zlib.crc32(key.encode()) % 10000 < share * 10000
 
 
-def vlm_plan(b: dict, min_score: float):
-    """Whether the VLM checks box `b`: "ask", "score" (it would, but the fused score is below
-    `min_score`; 0 = no cutoff) or None (no check, see `needs_vlm`)."""
-    if not needs_vlm(b):
-        return None
-    return "score" if min_score > 0 and b["score"] < min_score else "ask"
+def vlm_plan(b: dict, min_score: float, frame: str = "", sample: float = 0.0):
+    """Whether the VLM checks box `b`: "ask", "sample" (below `min_score`, asked for the audit) or
+    "score" (below `min_score`; 0 = no cutoff)."""
+    if min_score > 0 and b["score"] < min_score:
+        return "sample" if in_vlm_sample(frame, b, sample) else "score"
+    return "ask"
 
 
 def answer_token_ids(tokenize) -> set:
@@ -453,33 +460,36 @@ def self_test(parity: Path = None) -> int:
     check(phrase_class("opossum", m) == "opossum", "phrase partial")
     check(phrase_class("white-tailed deer raccoon", m) == "deer", "phrase run-together")
     check(phrase_class("tree", m) is None, "phrase unknown")
-    check(vlm_answer("A rock.") == "rock" and vlm_answer("Plants") == "plant", "vlm answer")
-    check(vlm_answer("person") == "person" and vlm_answer("It is a dog") == "animal", "vlm mapping")
+    check(vlm_answer("Yes.") == "yes" and vlm_answer("no") == "no" and vlm_answer(" NO, it is") == "no", "vlm answer")
+    check(vlm_answer("A rock.") == "" and vlm_answer("") == "" and vlm_answer("Not sure") == "", "vlm unclear")
+    check(vlm_question("person") == "Is there a real person in this image? Answer yes or no.", "vlm question")
+    check(vlm_question("potted_plant") == "Is there a real potted plant in this image? Answer yes or no.", "vlm spaces")
     check(category("person") == "person" and category("truck") == "vehicle" and category("raccoon") == "animal", "category")
-    check(category("package") == "object" and not needs_vlm({"label": "package", "agree": False}), "object class")
+    check(category("package") == "object", "object class")
     check(crop_box([10, 10, 20, 30], 100, 100) == (8, 6, 22, 34), f"crop {crop_box([10, 10, 20, 30], 100, 100)}")
     check(crop_box([0, 0, 100, 100], 100, 100) == (0, 0, 100, 100), "crop clamp")
-    check(needs_vlm({"label": "person", "agree": True}) and needs_vlm({"label": "dog", "agree": False}), "needs_vlm")
-    check(not needs_vlm({"label": "dog", "agree": True}), "needs_vlm agreed animal")
-    check(vlm_plan({"label": "person", "agree": True, "score": 0.1}, 0.0) == "ask", "vlm_plan no cutoff")
-    check(vlm_plan({"label": "person", "agree": True, "score": 0.1}, 0.2) == "score", "vlm_plan below cutoff")
-    check(vlm_plan({"label": "dog", "agree": False, "score": 0.2}, 0.2) == "ask", "vlm_plan at cutoff asks")
-    check(vlm_plan({"label": "dog", "agree": True, "score": 0.05}, 0.2) is None, "vlm_plan no check wins")
-    check(vlm_plan({"label": "package", "agree": False, "score": 0.9}, 0.2) is None, "vlm_plan object class")
+    box = {"label": "person", "bbox": [1, 2, 3, 4], "score": 0.1}
+    check(vlm_plan(box, 0.0) == "ask", "vlm_plan no cutoff")
+    check(vlm_plan(box, 0.2) == "score", "vlm_plan below cutoff")
+    check(vlm_plan({**box, "score": 0.2}, 0.2) == "ask", "vlm_plan at cutoff asks")
+    check(vlm_plan({**box, "label": "package", "score": 0.9}, 0.2) == "ask", "vlm_plan any class")
+    check(vlm_plan(box, 0.2, "a.jpg", 1.0) == "sample", "vlm_plan sample all")
+    check(vlm_plan(box, 0.2, "a.jpg", 0.0) == "score", "vlm_plan sample none")
+    many = [{"label": "dog", "bbox": [i, 0, 9, 9], "score": 0.1} for i in range(2000)]
+    hits = sum(in_vlm_sample("a.jpg", b, 0.02) for b in many)
+    check(20 <= hits <= 60, f"sample share {hits} of 2000")
+    check(in_vlm_sample("a.jpg", many[7], 0.5) == in_vlm_sample("a.jpg", many[7], 0.5), "sample is stable")
     check(chunks([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]], "chunks")
     check(chunks([1, 2, 3], 8) == [[1, 2, 3]] and chunks([], 4) == [], "chunks short / empty")
     check(chunks([1, 2], 1) == [[1], [2]] and chunks([1, 2], 0) == [[1], [2]], "chunks of one")
     # Answer words as single tokens: a fake tokenizer that splits "statue" in two.
-    vocab = {w: i for i, w in enumerate(["person", "Person", "vehicle", "animal", "rock", "plant", "nothing",
-                                          "stat", "ue", "Stat", "Vehicle"])}
-    fake_tok = lambda t: [vocab["stat" if t[0] == "s" else "Stat"], vocab["ue"]] if t.lower() == "statue" else \
-        ([vocab[t]] if t in vocab else [100, 101])
+    vocab = {w: i for i, w in enumerate(["yes", "Yes", "no"])}
+    fake_tok = lambda t: [vocab[t]] if t in vocab else [100, 101]
     ids = answer_token_ids(fake_tok)
-    check(ids == {vocab[w] for w in ("person", "Person", "vehicle", "Vehicle", "animal", "rock", "plant", "nothing")},
-          f"answer_token_ids {sorted(ids)}")
-    check(first_token_done([vocab["person"]], ids) and first_token_done([vocab["Vehicle"]], ids), "first token done")
-    check(not first_token_done([vocab["stat"]], ids) and not first_token_done([], ids), "split word runs on")
-    check(not first_token_done([vocab["person"], vocab["ue"]], ids), "only the first token stops")
+    check(ids == {vocab[w] for w in ("yes", "Yes", "no")}, f"answer_token_ids {sorted(ids)}")
+    check(first_token_done([vocab["yes"]], ids) and first_token_done([vocab["no"]], ids), "first token done")
+    check(not first_token_done([100], ids) and not first_token_done([], ids), "another word runs on")
+    check(not first_token_done([vocab["yes"], vocab["no"]], ids), "only the first token stops")
     # vlm_check with fakes: batches of 2 of 3 crops, then a failing batch falls back to one at a time.
     class FakeImage:
         size = (100, 100)
@@ -489,17 +499,21 @@ def self_test(parity: Path = None) -> int:
 
     class FakeVlm:
         def __init__(self, fail):
-            self.fail, self.calls = fail, []
+            self.fail, self.calls, self.questions = fail, [], []
 
-        def ask(self, crop):
+        def answer(self, crop, question):
+            self.questions.append(question)
+            return "Yes." if crop[0] < 50 else "no"
+
+        def ask(self, crop, question):
             self.calls.append(1)
-            return "A person." if crop[0] < 50 else "rock"
+            return self.answer(crop, question)
 
-        def ask_many(self, crops):
+        def ask_many(self, crops, questions):
             if self.fail:
                 raise RuntimeError("out of memory")
             self.calls.append(len(crops))
-            return ["A person." if c[0] < 50 else "rock" for c in crops]
+            return [self.answer(c, q) for c, q in zip(crops, questions)]
 
         def free(self):
             pass
@@ -514,7 +528,7 @@ def self_test(parity: Path = None) -> int:
             vlm_check(fv, FakeImage(), bs, 2, "fake", st)
         finally:
             globals()["log"] = real_log
-        check([(b["vlm"]["answer"], b["vlm"]["ok"]) for b in bs] == [("person", True), ("rock", False), ("person", True)],
+        check([(b["vlm"]["answer"], b["vlm"]["ok"]) for b in bs] == [("yes", True), ("no", False), ("yes", True)],
               f"vlm_check answers (fail={fail}) {bs}")
         check(fv.calls == calls and st.get("fallbacks", 0) == (1 if fail else 0), f"vlm_check calls (fail={fail}) {fv.calls}")
     got = list(FrameReader([{"path": "/nonexistent/a.jpg"}, {"path": "/nonexistent/b.jpg"}], True,
@@ -911,10 +925,7 @@ class RfDetr:
 
 
 class Vlm:
-    """Qwen3-VL answering one word about a crop."""
-
-    QUESTION = ("What is in this image: a person, a vehicle, an animal, a statue, a rock, a plant, or "
-                "nothing? Answer with one word.")
+    """Qwen3-VL answering yes or no about a crop ([`vlm_question`])."""
 
     def __init__(self, path: Path, device: str, name: str, early_stop: bool = True):
         import torch
@@ -951,10 +962,10 @@ class Vlm:
 
         return {"stopping_criteria": StoppingCriteriaList([FirstWord()])}
 
-    def ask(self, crop) -> str:
+    def ask(self, crop, question: str) -> str:
         torch = self.torch
         crop = self.fit(crop)
-        messages = [{"role": "user", "content": [{"type": "image", "image": crop}, {"type": "text", "text": self.QUESTION}]}]
+        messages = [{"role": "user", "content": [{"type": "image", "image": crop}, {"type": "text", "text": question}]}]
         inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
                                                     return_dict=True, return_tensors="pt").to(self.device)
         with torch.no_grad():
@@ -974,14 +985,14 @@ class Vlm:
             crop = crop.resize((max(32, round(crop.size[0] * s)), max(32, round(crop.size[1] * s))))
         return crop
 
-    def ask_many(self, crops: list) -> list:
+    def ask_many(self, crops: list, questions: list) -> list:
         """`ask` for several crops in one `generate` call (left padding, the attention mask marks
         the padding); one answer per crop, in order."""
         if len(crops) == 1:
-            return [self.ask(crops[0])]
+            return [self.ask(crops[0], questions[0])]
         torch = self.torch
         conversations = [[{"role": "user", "content": [{"type": "image", "image": self.fit(c)},
-                                                       {"type": "text", "text": self.QUESTION}]}] for c in crops]
+                                                       {"type": "text", "text": q}]}] for c, q in zip(crops, questions)]
         inputs = self.processor.apply_chat_template(
             conversations, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt",
             processor_kwargs={"padding": True, "padding_side": "left"},
@@ -1007,11 +1018,12 @@ def vlm_check(vlm: Vlm, image, boxes: list, batch: int, name: str, state: dict) 
     at a time instead; the first failure of the run is logged, `state["fallbacks"]` counts them."""
     w, h = image.size
     crops = [image.crop(crop_box(b["bbox"], w, h)) for b in boxes]
+    questions = [vlm_question(b["label"]) for b in boxes]
     answers = []
     if batch > 1 and len(crops) > 1:
         try:
-            for part in chunks(crops, batch):
-                answers.extend(vlm.ask_many(part))
+            for part, asked in zip(chunks(crops, batch), chunks(questions, batch)):
+                answers.extend(vlm.ask_many(part, asked))
         except Exception as e:  # noqa: BLE001 - a batch that does not fit must not stop the run
             state["fallbacks"] = state.get("fallbacks", 0) + 1
             if state["fallbacks"] == 1:
@@ -1020,11 +1032,13 @@ def vlm_check(vlm: Vlm, image, boxes: list, batch: int, name: str, state: dict) 
             vlm.free()
             answers = []
     if len(answers) != len(crops):
-        answers = [vlm.ask(c) for c in crops]
+        answers = [vlm.ask(c, q) for c, q in zip(crops, questions)]
     for b, raw in zip(boxes, answers):
         ans = vlm_answer(raw)
-        exp = category(b["label"])
-        b["vlm"] = {"model": name, "answer": ans, "expected": exp, "ok": ans == exp, "raw": raw[:40]}
+        if ans:
+            b["vlm"] = {"model": name, "answer": ans, "expected": "yes", "ok": ans == "yes", "raw": raw[:40]}
+        else:
+            b["vlm_skipped"] = "unclear"
 
 
 class FrameReader:
@@ -1263,7 +1277,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--token-limit", type=int, default=200, help="most tokens of one MM-Grounding-DINO prompt (its encoder takes 256)")
     p.add_argument("--vlm-batch", type=int, default=1, help="crops of one frame per VLM generate call (1 = one at a time)")
     p.add_argument("--vlm-min-score", type=float, default=0.0,
-                   help="skip the VLM on boxes whose fused score is below this (0 = check every box needs_vlm picks)")
+                   help="skip the VLM on boxes whose fused score is below this (0 = check every box)")
+    p.add_argument("--vlm-sample", type=float, default=0.0,
+                   help="share of the boxes under --vlm-min-score asked anyway, for the audit (0..1)")
     p.add_argument("--prefetch", action="store_true", help="decode the next frames on a background thread")
     a = p.parse_args()
     if a.self_test or a.self_check:
@@ -1277,6 +1293,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--vlm-batch must be at least 1")
     if not 0.0 <= a.vlm_min_score <= 1.0:
         p.error("--vlm-min-score must be between 0 and 1")
+    if not 0 <= a.vlm_sample <= 1:
+        p.error("--vlm-sample must be between 0 and 1")
     missing = [k for k in ("frames", "out", "classes") if getattr(a, k) is None]
     if missing:
         p.error("missing: " + ", ".join("--" + m for m in missing))
@@ -1383,10 +1401,12 @@ def main() -> int:
             if vlm is not None:
                 ask = []
                 for b in fused:
-                    plan = vlm_plan(b, a.vlm_min_score)
-                    if plan == "ask":
+                    plan = vlm_plan(b, a.vlm_min_score, fr["frame"], a.vlm_sample)
+                    if plan == "sample":
+                        b["vlm_sampled"] = True
+                    if plan in ("ask", "sample"):
                         ask.append(b)
-                    elif plan == "score":
+                    else:
                         b["vlm_skipped"] = "score"
                 if ask:
                     t = time.time()

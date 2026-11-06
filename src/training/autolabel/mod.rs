@@ -6,7 +6,7 @@
 //! - **Labelers** (default): `scripts/autolabel.py` in the training environment runs
 //!   MM-Grounding-DINO or, in its seat, SAM 3 ([`AutolabelRequest::sam3`], gated) (open vocabulary,
 //!   prompts from `collect.classes` plus `training.synonyms`), RF-DETR L (COCO classes) and fuses
-//!   them (WBF), then checks person and single-labeler boxes with Qwen3-VL and ranks animal species
+//!   them (WBF), then asks Qwen3-VL "is there a real <label>" about each box above a score and ranks animal species
 //!   with SigLIP 2. The service triages every box ([`triage`]): `accept` only when both labelers
 //!   agree at a score of at least 0.6 and no check objects; night person / animal boxes and SAM 3
 //!   boxes always `review`.
@@ -390,8 +390,9 @@ pub struct AutolabelRequest {
     /// by one.
     #[serde(default = "yes")]
     pub vlm_batch: bool,
-    /// Check only the boxes with a fused score of at least this with Qwen3-VL (None = every
-    /// eligible box).
+    /// Check only the boxes with a fused score of at least this with Qwen3-VL (None = every box;
+    /// a request stored before this default keeps None). [`VLM_SAMPLE`] of the boxes below it are
+    /// asked anyway, so the cutoff can be audited.
     #[serde(default)]
     pub vlm_min_score: Option<f32>,
     /// Load and decode the next frame on a background thread while the GPU labels this one.
@@ -402,8 +403,12 @@ pub struct AutolabelRequest {
 /// Boxes per Qwen3-VL call when [`AutolabelRequest::vlm_batch`] is on.
 pub const VLM_BATCH: usize = 8;
 
-/// Default of [`AutolabelRequest::vlm_min_score`] the Training page suggests.
-pub const SUGGESTED_VLM_MIN_SCORE: f32 = 0.2;
+/// Default of [`AutolabelRequest::vlm_min_score`]: below it boxes were 5% real on public sets and
+/// none on a fixed camera (docs/TRAINING.md, "Measuring auto-label").
+pub const SUGGESTED_VLM_MIN_SCORE: f32 = 0.15;
+
+/// Share of the boxes below [`AutolabelRequest::vlm_min_score`] the VLM is asked about anyway.
+pub const VLM_SAMPLE: f32 = 0.02;
 
 /// Default of [`AutolabelRequest::sam3_threshold`].
 pub const SAM3_THRESHOLD: f32 = 0.3;
@@ -441,7 +446,7 @@ impl AutolabelRequest {
             allow_large: false,
             keep_on_cancel: true,
             vlm_batch: true,
-            vlm_min_score: None,
+            vlm_min_score: Some(SUGGESTED_VLM_MIN_SCORE),
             prefetch: true,
         }
     }
@@ -974,14 +979,17 @@ mod tests {
     fn run_options_default_on_validate_and_parse_from_old_requests() {
         let r = AutolabelRequest::new(FrameFilter::default());
         assert!(r.keep_on_cancel && r.vlm_batch && r.prefetch);
-        assert_eq!(r.vlm_min_score, None);
+        assert_eq!(r.vlm_min_score, Some(SUGGESTED_VLM_MIN_SCORE));
         // A request saved before the options existed (tasks.json) parses with the defaults.
         let mut old = serde_json::to_value(&r).unwrap();
         let obj = old.as_object_mut().unwrap();
         for k in ["keep_on_cancel", "vlm_batch", "vlm_min_score", "prefetch"] {
             assert!(obj.remove(k).is_some(), "{k}");
         }
-        let back: AutolabelRequest = serde_json::from_value(old).unwrap();
+        let mut back: AutolabelRequest = serde_json::from_value(old).unwrap();
+        // Queued before the cutoff was the default: it keeps checking every box.
+        assert_eq!(back.vlm_min_score, None);
+        back.vlm_min_score = r.vlm_min_score;
         assert_eq!(back, r);
         let mut off = r.clone();
         (off.keep_on_cancel, off.vlm_batch, off.prefetch) = (false, false, false);

@@ -238,11 +238,11 @@
       <div class="tr-field">
         <label for="al-vlm">VLM check</label>
         <select id="al-vlm" name="vlm"><option value="2b">Qwen3-VL 2B (4.3 GB)</option><option value="4b">Qwen3-VL 4B (8.9 GB)</option><option value="8b">Qwen3-VL 8B (17.5 GB)</option><option value="off">off</option></select>
-        <p class="muted small">Checks person and single-labeler boxes; most of a frame's time (about 1 s per box).</p>
+        <p class="muted small">Asks "Is there a real ...?" about each box; about 1 s per box.</p>
         <div class="tr-sub" id="al-vlm-options">
           <label class="check"><input type="checkbox" name="vlm_batch" checked> <span>Batch the check (up to 8 boxes per call)</span></label>
-          <label class="check"><input type="checkbox" name="vlm_min_on" id="al-vlm-min-on"> <span>Skip boxes scoring <span class="tr-keep">below <input type="number" name="vlm_min_score" class="al-num" min="0.01" max="1" step="0.01" value="0.2" aria-label="VLM check minimum score"></span></span></label>
-          <p class="muted small">Weak boxes are rarely confirmed but skipping can miss a few real ones; they still go to review.</p>
+          <label class="check"><input type="checkbox" name="vlm_min_on" id="al-vlm-min-on" checked> <span>Skip boxes scoring <span class="tr-keep">below <input type="number" name="vlm_min_score" class="al-num" min="0.01" max="1" step="0.01" value="0.15" aria-label="VLM check minimum score"></span></span></label>
+          <p class="muted small">Boxes this weak were almost never real when measured; they still go to review.</p>
         </div>
       </div>
       <div class="tr-field tr-checks">

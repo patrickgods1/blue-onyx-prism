@@ -25,6 +25,7 @@ cargo run -- --model models/IPcam-general.onnx --family yolo5 --device ort:cpu
 cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco-cctv|bmd45-cctv|exdark-night|dir:<p>] [--max-images 20]   # grade models x devices; benchmark.json next to the config
 cargo run -- benchmark --list-datasets       # built-in image sets (assets/bench/*.json, resource bench:<id>)
 cargo run -- train overlaps [--frames "scene=ir,limit=200,again=1"] [--dry-run] [--allow-large]   # suggestions for overlapping boxes; changes no box
+python scripts/research/eval_autolabel.py --self-test   # scores auto-label proposals against known boxes: truth / yesno / score (docs/TRAINING.md, "Measuring auto-label")
 cargo run -- hf-login                        # saves a Hugging Face token for gated downloads (no-echo prompt or stdin, never argv); `hf-logout` deletes it
 cargo run -- train autolabel --sam3 [--sam3-threshold 0.3] [--frames "status=reviewed,auto=overlaps"] [--dry-run]   # SAM 3 in gdino's seat; --dry-run previews frames and a rough time, runs nothing
 cargo run -- service status|start|stop|restart   # control the installed service (start/stop/restart need admin)
@@ -215,7 +216,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   in video order), analysis on all cores but one, `--hwaccel auto|off` (D3D11VA / CUDA / VAAPI, software on macOS where
   VideoToolbox measured slower); two-pass extraction (640 px candidates, then only the kept frames at full resolution) with a free-space
   preflight and running guard (`import/disk.rs`, ENOSPC -> one actionable error, work folder removed); `GET /v1/training/import/preview` backs the page's preview line) and `train autolabel` (`training/autolabel/`:
-  MM-Grounding-DINO + RF-DETR L, Qwen3-VL / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label;
+  MM-Grounding-DINO + RF-DETR L, Qwen3-VL (`vlm_question`, per-class yes/no, `expected: "yes"`; older files hold the seven-way answer; a no never hides a box, on public sets 40% of them were real) / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label;
   `--with-model <id> --missing-only` (`triage::apply_missing`, `autolabel::trained_frames`) proposes unlabelled real objects on reviewed
   frames, bypassing `triage::apply` and `merge_proposals`: frames the model trained on are skipped (`<model>.provenance.json` ->
   `<training dir>/<run_id>/data/train.txt`), a same-object training or pending box at IoU >= 0.3 or holding 50% of the detection covers

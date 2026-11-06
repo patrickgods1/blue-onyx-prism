@@ -890,7 +890,10 @@ mod tests {
         // The Review page and older forms post no run options: the defaults.
         let r = autolabel_from_form(&form(&[("rfdetr", "on")])).unwrap();
         assert!(r.keep_on_cancel && r.vlm_batch && r.prefetch);
-        assert_eq!(r.vlm_min_score, None);
+        assert_eq!(
+            r.vlm_min_score,
+            Some(crate::training::autolabel::SUGGESTED_VLM_MIN_SCORE)
+        );
         // The Training page with every box unticked (absent); the score alone is ignored.
         let r = autolabel_from_form(&form(&[
             ("rfdetr", "on"),
@@ -921,7 +924,10 @@ mod tests {
             ("vlm_min_score", ""),
         ]))
         .unwrap();
-        assert_eq!(r.vlm_min_score, Some(0.2));
+        assert_eq!(
+            r.vlm_min_score,
+            Some(crate::training::autolabel::SUGGESTED_VLM_MIN_SCORE)
+        );
         for bad in ["0", "1.5", "low"] {
             let e = autolabel_from_form(&form(&[
                 ("rfdetr", "on"),

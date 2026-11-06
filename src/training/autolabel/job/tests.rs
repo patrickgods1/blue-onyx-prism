@@ -1388,21 +1388,25 @@ fn script_flags_follow_the_run_options() {
             .and_then(|i| a.get(i + 1).cloned())
     };
     let has = |a: &[String], flag: &str| a.iter().any(|x| x == flag);
-    // The defaults: batches of 8, every box checked, the next frame prefetched.
+    // The defaults: batches of 8, a score cutoff with its audit sample, the next frame prefetched.
     let a = argv(&|_| {});
     assert_eq!(after(&a, "--vlm-batch").as_deref(), Some("8"), "{a:?}");
-    assert!(
-        !has(&a, "--vlm-min-score") && has(&a, "--prefetch"),
+    assert_eq!(
+        after(&a, "--vlm-min-score").as_deref(),
+        Some("0.15"),
         "{a:?}"
     );
+    assert_eq!(after(&a, "--vlm-sample").as_deref(), Some("0.02"), "{a:?}");
+    assert!(has(&a, "--prefetch"), "{a:?}");
     // Everything off.
     let a = argv(&|r| {
         r.vlm_batch = false;
+        r.vlm_min_score = None;
         r.prefetch = false;
     });
     assert_eq!(after(&a, "--vlm-batch").as_deref(), Some("1"), "{a:?}");
     assert!(
-        !has(&a, "--vlm-min-score") && !has(&a, "--prefetch"),
+        !has(&a, "--vlm-min-score") && !has(&a, "--vlm-sample") && !has(&a, "--prefetch"),
         "{a:?}"
     );
     // A minimum score.

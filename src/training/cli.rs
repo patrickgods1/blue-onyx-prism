@@ -383,10 +383,13 @@ pub struct AutolabelArgs {
     /// Ask Qwen3-VL about one box per call instead of up to 8 of a frame's boxes at once.
     #[arg(long)]
     pub no_vlm_batch: bool,
-    /// Check only boxes with a fused score of at least this (0..1] with Qwen3-VL (default:
-    /// every eligible box; most of the check time goes to boxes below 0.2).
+    /// Check only boxes with a fused score of at least this (0..1] with Qwen3-VL (default: 0.15;
+    /// most of the check time goes to boxes below it, which are almost never real).
     #[arg(long)]
     pub vlm_min_score: Option<f32>,
+    /// Check every box with Qwen3-VL, whatever its score.
+    #[arg(long, conflicts_with = "vlm_min_score")]
+    pub vlm_all_boxes: bool,
     /// Do not load the next frame on a background thread while the GPU labels this one.
     #[arg(long)]
     pub no_prefetch: bool,
@@ -533,7 +536,11 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
     r.rfdetr = !a.no_rfdetr;
     r.siglip = !a.no_siglip;
     r.vlm_batch = !a.no_vlm_batch;
-    r.vlm_min_score = a.vlm_min_score;
+    r.vlm_min_score = if a.vlm_all_boxes {
+        None
+    } else {
+        a.vlm_min_score.or(r.vlm_min_score)
+    };
     r.prefetch = !a.no_prefetch;
     r.keep_on_cancel = !a.discard_on_cancel;
     r.with_model = a.with_model.clone();
@@ -1945,7 +1952,14 @@ mod tests {
         assert_eq!(r.vlm, None);
         assert!(!r.siglip && r.rfdetr);
         assert!(r.vlm_batch && r.prefetch && r.keep_on_cancel);
-        assert_eq!(r.vlm_min_score, None);
+        assert_eq!(
+            r.vlm_min_score,
+            Some(crate::training::autolabel::SUGGESTED_VLM_MIN_SCORE)
+        );
+        let TrainCommand::Autolabel(o) = parse(&["autolabel", "--vlm-all-boxes"]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(autolabel_request(&o).unwrap().vlm_min_score, None);
         let TrainCommand::Autolabel(o) = parse(&[
             "autolabel",
             "--no-vlm-batch",

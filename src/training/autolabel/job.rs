@@ -787,6 +787,8 @@ impl AutolabelJob {
                 if let Some(m) = r.vlm_min_score {
                     args.push("--vlm-min-score".into());
                     args.push(m.to_string().into());
+                    args.push("--vlm-sample".into());
+                    args.push(super::VLM_SAMPLE.to_string().into());
                 }
             }
             if r.prefetch {
