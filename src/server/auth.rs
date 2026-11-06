@@ -1,8 +1,11 @@
 //! The admin token at the HTTP layer (RR-S4): who has to show it, how and what a refusal says.
 //! The file itself is [`crate::admin_token`].
 //!
-//! - A loopback peer never needs it, and with `allow_remote_admin` off a remote peer never gets
-//!   this far: it stays refused with 403 whatever it sends (`server::admin_only`).
+//! - A person on this machine never needs it, and with `allow_remote_admin` off a remote peer
+//!   never gets this far: it stays refused with 403 whatever it sends (`server::admin_only`). A
+//!   loopback peer with a forwarding header is a reverse proxy's client, so it is remote
+//!   (`server::direct_local`). Its failures all count under the proxy's address, the only one
+//!   there is to go by: the header's value could be anything.
 //! - With `allow_remote_admin` on, a remote peer shows the token as `Authorization: Bearer
 //!   <token>` or as the cookie `POST /login` sets, on every admin route ([`verify`]) and for the
 //!   full `GET /v1/config`. Open routes never look at it.
@@ -420,11 +423,12 @@ pub(super) struct LoginQuery {
 /// `GET /login`: the form. This machine has nothing to sign in to, so it goes straight on.
 pub(super) async fn login_page(
     peer: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
+    headers: HeaderMap,
     query: Result<Query<LoginQuery>, QueryRejection>,
 ) -> Response {
     let next = query.map(|Query(q)| q.next).unwrap_or_default();
     let next = safe_next(&next).unwrap_or_default();
-    if super::loopback_peer(peer.ok().map(|c| c.0)) {
+    if super::direct_local(peer.ok().map(|c| c.0), &headers) {
         return see_other(if next.is_empty() { "/" } else { next });
     }
     login_form(StatusCode::OK, next, None)

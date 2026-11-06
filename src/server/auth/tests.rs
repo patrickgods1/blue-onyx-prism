@@ -662,8 +662,12 @@ async fn the_rotate_button_is_for_this_machine_and_never_shows_the_token() {
     let r = bearer(req(REMOTE, "POST", ROTATE, false), &token_a());
     assert_eq!(call(&state, r).await.0, StatusCode::FORBIDDEN);
     assert_eq!(on_disk(&state), token_a());
-    // A local proxy's client is not this machine.
+    // A local proxy's client is not this machine: it needs the token, then is refused.
     let mut r = req(LOCAL, "POST", ROTATE, false);
+    r.headers_mut()
+        .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+    assert_eq!(call(&state, r).await.0, StatusCode::UNAUTHORIZED);
+    let mut r = bearer(req(LOCAL, "POST", ROTATE, false), &token_a());
     r.headers_mut()
         .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
     assert_eq!(call(&state, r).await.0, StatusCode::FORBIDDEN);
@@ -826,4 +830,144 @@ async fn a_request_without_a_peer_address_needs_the_token() {
         .unwrap();
     let resp = router(state.clone()).oneshot(r).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Every header a reverse proxy adds, as a client sends it.
+const PROXY_HEADERS: [(&str, &str); 4] = [
+    ("x-forwarded-for", "203.0.113.9"),
+    ("X-Forwarded-For", "203.0.113.9, 198.51.100.7"),
+    ("forwarded", "for=203.0.113.9"),
+    ("x-real-ip", "203.0.113.9"),
+];
+
+fn forwarded(mut r: Request<Body>, name: &str, value: &str) -> Request<Body> {
+    r.headers_mut().insert(
+        header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+        value.parse().unwrap(),
+    );
+    r
+}
+
+/// A forwarded request is a proxied client, not a person on this machine: with remote
+/// administration off it gets the usual 403, and it is told why it does not count as local.
+#[tokio::test]
+async fn a_forwarded_loopback_request_is_refused_with_remote_admin_off() {
+    let state = test_state();
+    for (name, value) in PROXY_HEADERS {
+        for (method, uri) in [
+            ("GET", "/config"),
+            ("POST", "/config/restart"),
+            ("GET", "/logs.json"),
+            ("GET", "/login"),
+            ("POST", "/logout"),
+        ] {
+            let r = forwarded(req(LOCAL, method, uri, false), name, value);
+            let (s, _, b) = call(&state, r).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{name} {method} {uri}");
+            let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            let msg = j["message"].as_str().unwrap();
+            assert!(msg.contains("allow_remote_admin"), "{msg}");
+            assert!(msg.contains("proxy"), "{msg}");
+        }
+        let r = forwarded(req(LOCAL, "GET", "/config", true), name, value);
+        let (s, h, b) = call(&state, r).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{name}");
+        assert!(
+            h[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert!(text(&b).contains("Forbidden"));
+        let r = forwarded(req(LOCAL, "GET", "/v1/config", false), name, value);
+        let (s, _, b) = call(&state, r).await;
+        assert_eq!(s, StatusCode::OK, "{name}");
+        assert!(!has_config(&b), "{name}");
+    }
+    assert!(!state.restart.is_cancelled());
+    // Open routes do not care.
+    let r = forwarded(
+        req(LOCAL, "GET", "/v1/vision/custom/list", false),
+        "x-forwarded-for",
+        "203.0.113.9",
+    );
+    assert_eq!(call(&state, r).await.0, StatusCode::OK);
+    // Without the header this machine is unchanged.
+    assert_eq!(
+        call(&state, req(LOCAL, "GET", "/config", false)).await.0,
+        StatusCode::OK
+    );
+}
+
+/// With remote administration on, a forwarded request needs the token like any remote peer.
+#[tokio::test]
+async fn a_forwarded_loopback_request_needs_the_token_with_remote_admin_on() {
+    for (name, value) in PROXY_HEADERS {
+        let state = remote_state();
+        let plain = |method, uri, html| forwarded(req(LOCAL, method, uri, html), name, value);
+        assert_eq!(
+            call(&state, plain("GET", "/config", false)).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{name}"
+        );
+        let (s, h, _) = call(&state, plain("GET", "/config", true)).await;
+        assert_eq!(s, StatusCode::SEE_OTHER, "{name}");
+        assert_eq!(location(&h), "/login?next=%2Fconfig");
+        // The login page is for it: it does not count as this machine.
+        let (s, _, b) = call(&state, plain("GET", "/login?next=/config", true)).await;
+        assert_eq!(s, StatusCode::OK, "{name}");
+        assert!(text(&b).contains("type=\"password\""));
+        let r = bearer(plain("GET", "/config", false), &token_a());
+        assert_eq!(call(&state, r).await.0, StatusCode::OK, "{name}");
+        let r = cookie(plain("GET", "/config", false), &token_a());
+        assert_eq!(call(&state, r).await.0, StatusCode::OK, "{name}");
+        let (_, _, b) = call(&state, plain("GET", "/v1/config", false)).await;
+        assert!(!has_config(&b), "{name}");
+        let r = bearer(plain("GET", "/v1/config", false), &token_a());
+        let (_, _, b) = call(&state, r).await;
+        assert!(has_config(&b), "{name}");
+        // The card is the remote one: no file, no Rotate.
+        let path = token_path(&state).display().to_string();
+        let r = bearer(plain("GET", "/config", true), &token_a());
+        let (_, _, b) = call(&state, r).await;
+        assert!(!text(&b).contains(&path) && text(&b).contains("action=\"/logout\""));
+        // Rotation stays refused, with the token too.
+        let r = bearer(
+            plain("POST", "/config/admin-token/rotate", false),
+            &token_a(),
+        );
+        assert_eq!(call(&state, r).await.0, StatusCode::FORBIDDEN, "{name}");
+        // Wrong tokens count, under the proxy's address: that is all there is to go by.
+        for _ in 0..MAX_FAILURES {
+            let r = bearer(plain("GET", "/config", false), &token_b());
+            assert_eq!(call(&state, r).await.0, StatusCode::UNAUTHORIZED);
+        }
+        let r = bearer(plain("GET", "/config", false), &token_a());
+        assert_eq!(call(&state, r).await.0, StatusCode::TOO_MANY_REQUESTS);
+        // Nothing of this touches a person on this machine.
+        assert_eq!(
+            call(&state, req(LOCAL, "GET", "/config", false)).await.0,
+            StatusCode::OK,
+            "{name}"
+        );
+    }
+}
+
+/// The header only ever takes trust away: its value is not an address anyone is believed about.
+#[tokio::test]
+async fn a_forwarding_header_never_makes_a_remote_peer_local() {
+    let state = remote_state();
+    let r = forwarded(
+        req(REMOTE, "GET", "/config", false),
+        "x-forwarded-for",
+        "127.0.0.1",
+    );
+    assert_eq!(call(&state, r).await.0, StatusCode::UNAUTHORIZED);
+    let off = test_state();
+    let r = forwarded(
+        req(REMOTE, "GET", "/config", false),
+        "x-real-ip",
+        "127.0.0.1",
+    );
+    assert_eq!(call(&off, r).await.0, StatusCode::FORBIDDEN);
 }

@@ -230,6 +230,25 @@ impl ConfigStore {
         }
     }
 
+    /// What an edit from `before` to `new` writes: `new`, but a one-off flag of this run
+    /// ([`Config::one_off_flags`]) stays in memory, or any save from a page would make it
+    /// permanent. An edit that changes such a flag is a real change and is written. With no
+    /// readable file there is nothing to keep (a file that does not parse gets replaced).
+    fn for_the_file(&self, before: &Config, new: &Config) -> Config {
+        let mut out = new.clone();
+        if let Some(file) = Config::parse_file(&self.path) {
+            let mut flags = file.one_off_flags();
+            let edits = before.one_off_flags().into_iter().zip(new.one_off_flags());
+            for (flag, (was, now)) in flags.iter_mut().zip(edits) {
+                if was != now {
+                    *flag = now;
+                }
+            }
+            out.set_one_off_flags(flags);
+        }
+        out
+    }
+
     fn lock_read(&self) -> RwLockReadGuard<'_, Inner> {
         self.inner.read_recover()
     }
@@ -410,7 +429,7 @@ impl ConfigStore {
             new.validate()?;
         }
         if changed || !self.path.exists() {
-            new.save(&self.path)?;
+            self.for_the_file(&before, &new).save(&self.path)?;
             let bytes = std::fs::read(&self.path)
                 .with_context(|| format!("reading back {}", self.path.display()))?;
             g.disk = stamp_of(&self.path, &bytes);
@@ -651,6 +670,69 @@ mod tests {
             .is_err()
         );
         assert_eq!(s.read().nms_iou, 0.5);
+    }
+
+    /// A run with `--allow-remote-admin` (or the other one-off flags) keeps them in memory, and
+    /// a save from a page must not make them permanent.
+    #[test]
+    fn one_off_flags_stay_out_of_every_save() {
+        let path = tmp();
+        let file = cfg();
+        file.save(&path).unwrap();
+        let merged = Config {
+            allow_remote_admin: true,
+            force_cpu: true,
+            save_ref_image: true,
+            ..file
+        };
+        let s = ConfigStore::new(merged, path.clone());
+        let flags = |c: &Config| (c.allow_remote_admin, c.force_cpu, c.save_ref_image);
+
+        s.update("page", |c| {
+            c.port = 4000;
+            Ok(())
+        })
+        .unwrap();
+        let on_disk = Config::load(&path).unwrap();
+        assert_eq!(on_disk.port, 4000);
+        assert_eq!(flags(&on_disk), (false, false, false));
+        // This run keeps them, and the watch sees no change in the file.
+        assert_eq!(flags(&s.read()), (true, true, true));
+        assert!(s.check_disk().is_none());
+        assert_eq!(flags(&s.read()), (true, true, true));
+
+        // Changing one by hand is a real change: that one is saved, the others stay out.
+        s.update("page", |c| {
+            c.force_cpu = false;
+            Ok(())
+        })
+        .unwrap();
+        s.update("page", |c| {
+            c.force_cpu = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(flags(&Config::load(&path).unwrap()), (false, true, false));
+    }
+
+    /// Flags the file itself holds are no one-off: a save keeps them.
+    #[test]
+    fn flags_in_the_file_survive_a_save() {
+        let path = tmp();
+        let file = Config {
+            allow_remote_admin: true,
+            save_ref_image: true,
+            ..cfg()
+        };
+        file.save(&path).unwrap();
+        let s = ConfigStore::new(file, path.clone());
+        s.update("page", |c| {
+            c.port = 4000;
+            Ok(())
+        })
+        .unwrap();
+        let on_disk = Config::load(&path).unwrap();
+        assert!(on_disk.allow_remote_admin && on_disk.save_ref_image);
     }
 
     #[test]

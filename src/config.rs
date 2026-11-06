@@ -2,7 +2,7 @@
 //! Merge rule: a flag given on the command line overrides the file value (`cli::merge_cli`; an
 //! absent flag leaves the file value alone), the result is validated and written back to the
 //! file, except the one-off flags (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`),
-//! which apply to that run only and are never written back (`cli::without_one_off_flags`).
+//! which apply to that run only and are never written back ([`Config::one_off_flags`]).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -967,6 +967,26 @@ impl Config {
             )
         })?;
         Ok(config)
+    }
+
+    /// The switches a command-line flag turns on for one run only (`allow_remote_admin`,
+    /// `force_cpu`, `save_ref_image`): every write of a config that may hold such a flag has to
+    /// put the file's values back ([`Self::set_one_off_flags`]).
+    pub fn one_off_flags(&self) -> [bool; 3] {
+        [self.allow_remote_admin, self.force_cpu, self.save_ref_image]
+    }
+
+    /// Set the switches of [`Self::one_off_flags`], in that order.
+    pub fn set_one_off_flags(&mut self, [remote, cpu, image]: [bool; 3]) {
+        self.allow_remote_admin = remote;
+        self.force_cpu = cpu;
+        self.save_ref_image = image;
+    }
+
+    /// The config in the file at `path`, parsed only (nothing is logged or checked), for what a
+    /// writer has to keep from it. `None`: no such file, or not a config.
+    pub fn parse_file(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
     }
 
     /// Give a config without any model the default catalog model ([`DEFAULT_MODEL_NAME`],

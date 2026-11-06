@@ -535,38 +535,38 @@ pub(super) fn loopback_peer(peer: Option<std::net::SocketAddr>) -> bool {
     })
 }
 
-/// Whether a client gets past the peer check of the admin routes: a loopback peer, or anyone with
-/// `allow_remote_admin` (then a remote peer still has to show the token: [`admin_only`]).
-pub(super) fn admin_allowed(peer: Option<std::net::SocketAddr>, allow_remote_admin: bool) -> bool {
-    allow_remote_admin || loopback_peer(peer)
-}
-
-/// Whether the client is this machine for what only this machine may do: a loopback peer with no
-/// sign of a reverse proxy in front of it.
+/// Whether the client is a person on this machine: a loopback peer with no forwarding header.
+/// What the admin routes, `GET /v1/config`, `/login` and the rotation all ask, so a reverse proxy's
+/// client is remote for all of them. A proxy that adds no such header cannot be told apart.
 pub(super) fn direct_local(peer: Option<std::net::SocketAddr>, headers: &HeaderMap) -> bool {
-    loopback_peer(peer) && !is_forwarded(headers)
+    loopback_peer(peer) && guard::proxy_header(headers).is_none()
 }
 
-/// Set once the "local reverse proxy" warning was logged (SV-12).
+/// Whether a client gets past the peer check of the admin routes: this machine, or anyone with
+/// `allow_remote_admin` (then a remote client still has to show the token: [`admin_only`]).
+pub(super) fn admin_allowed(
+    peer: Option<std::net::SocketAddr>,
+    headers: &HeaderMap,
+    allow_remote_admin: bool,
+) -> bool {
+    allow_remote_admin || direct_local(peer, headers)
+}
+
+/// Set once the "local reverse proxy" notice was logged (SV-12).
 static LOCAL_PROXY_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Whether a request carries a proxy's forwarding header (`X-Forwarded-For` or `Forwarded`).
-fn is_forwarded(headers: &HeaderMap) -> bool {
-    headers.contains_key("x-forwarded-for") || headers.contains_key(header::FORWARDED)
-}
-
-/// Log, once per `flag` (once per process for [`LOCAL_PROXY_WARNED`]), that admin requests
-/// arrive through a reverse proxy on this machine: the admin guard trusts the peer address
-/// only, so every proxied client counts as local and shows no token. True when this call logged
-/// it.
+/// Log, once per `flag` (once per process for [`LOCAL_PROXY_WARNED`]), that admin requests arrive
+/// through a reverse proxy on this machine, and what that takes. True when this call logged it.
 fn warn_local_proxy_once(flag: &std::sync::atomic::AtomicBool) -> bool {
     if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
     warn!(
-        "requests arrive through a local reverse proxy: every proxied client is treated as \
-         local admin and needs no admin token; restrict the admin paths in the proxy"
+        "requests arrive through a local reverse proxy: they count as remote clients, so the \
+         admin routes need allow_remote_admin and the admin token. A proxy that adds no \
+         forwarding header (X-Forwarded-For, Forwarded or X-Real-IP) cannot be told from this \
+         machine and gets the admin routes with no token, so make sure yours adds one"
     );
     true
 }
@@ -589,14 +589,21 @@ fn peer_refusal(state: &AppState, req: &axum::extract::Request) -> Option<Respon
         let foreign = guard::foreign_host(req.headers(), req.uri(), &c.allowed_hosts);
         (c.allow_remote_admin, foreign)
     };
-    if admin_allowed(peer, allow_remote) {
+    let proxied = guard::proxy_header(req.headers()).filter(|_| loopback_peer(peer));
+    if proxied.is_some() {
+        warn_local_proxy_once(&LOCAL_PROXY_WARNED);
+    }
+    if admin_allowed(peer, req.headers(), allow_remote) {
         let host = foreign?;
         return Some(guard::host_refused(req.headers(), req.uri().path(), &host));
     }
     let who = peer.map_or_else(|| "unknown".to_string(), |a| a.ip().to_string());
     warn!(peer = %who, path = %req.uri().path(), "admin route refused for a remote client");
+    let through = proxied.map_or_else(String::new, |h| {
+        format!(" This request came through a proxy ({h} header), so it is not from this machine.")
+    });
     let msg = format!(
-        "Administration is only available from this machine (your address: {who}). Set \
+        "Administration is only available from this machine (your address: {who}).{through} Set \
          \"allow_remote_admin\": true in the config (or start with --allow-remote-admin, or \
          check \"Allow remote administration\" on the Config page from this machine) to allow it \
          with the admin token."
@@ -606,7 +613,7 @@ fn peer_refusal(state: &AppState, req: &axum::extract::Request) -> Option<Respon
 
 /// Middleware of the admin routes, every method: [`peer_refusal`], then a remote peer has to show
 /// the admin token (`auth::verify`; a browser without it goes to `/login`, other clients get a
-/// JSON 401, too many wrong tokens 429). A loopback peer never does.
+/// JSON 401, too many wrong tokens 429). A person on this machine never does ([`direct_local`]).
 pub(super) async fn admin_only(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -616,10 +623,7 @@ pub(super) async fn admin_only(
         return refusal;
     }
     let peer = peer_of(&req);
-    if loopback_peer(peer) {
-        if is_forwarded(req.headers()) {
-            warn_local_proxy_once(&LOCAL_PROXY_WARNED);
-        }
+    if direct_local(peer, req.headers()) {
         return next.run(req).await;
     }
     let checked = auth::verify(&state, peer, req.headers()).await;
@@ -1114,7 +1118,8 @@ mod tests {
 
     #[test]
     fn loopback_peers_are_local() {
-        let ok = |a: &str| admin_allowed(Some(a.parse().unwrap()), false);
+        let none = HeaderMap::new();
+        let ok = |a: &str| admin_allowed(Some(a.parse().unwrap()), &none, false);
         assert!(ok("127.0.0.1:1"));
         assert!(ok("127.8.9.10:1"));
         assert!(ok("[::1]:1"));
@@ -1123,34 +1128,45 @@ mod tests {
         assert!(!ok("192.168.1.20:1"));
         assert!(!ok("[fe80::1]:1"));
         assert!(!ok("[::ffff:10.0.0.5]:1"));
-        assert!(!admin_allowed(None, false));
-        assert!(admin_allowed(Some("10.0.0.5:1".parse().unwrap()), true));
+        assert!(!admin_allowed(None, &none, false));
+        assert!(admin_allowed(
+            Some("10.0.0.5:1".parse().unwrap()),
+            &none,
+            true
+        ));
     }
 
-    /// SV-12: a loopback admin request carrying a proxy's forwarding header logs the
-    /// "local reverse proxy" warning, once per process.
+    /// SV-12: a loopback admin request carrying a proxy's forwarding header is no local request,
+    /// and says so in the log, once per process.
     #[tokio::test]
-    async fn local_proxy_is_warned_once() {
+    async fn a_local_proxy_is_noted_once() {
+        let local: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut h = HeaderMap::new();
-        assert!(!is_forwarded(&h));
-        h.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
-        assert!(is_forwarded(&h));
-        let mut h = HeaderMap::new();
-        h.insert(header::FORWARDED, "for=203.0.113.9".parse().unwrap());
-        assert!(is_forwarded(&h));
+        assert!(direct_local(Some(local), &h));
+        for (name, value) in [
+            ("x-forwarded-for", "203.0.113.9"),
+            ("forwarded", "for=203.0.113.9"),
+            ("x-real-ip", "203.0.113.9"),
+        ] {
+            h = HeaderMap::new();
+            h.insert(name, value.parse().unwrap());
+            assert!(!direct_local(Some(local), &h), "{name}");
+            assert!(admin_allowed(Some(local), &h, true), "{name}");
+            assert!(!admin_allowed(Some(local), &h, false), "{name}");
+        }
 
         let flag = std::sync::atomic::AtomicBool::new(false);
         assert!(warn_local_proxy_once(&flag));
         assert!(!warn_local_proxy_once(&flag));
 
-        // Through the admin guard: the proxied loopback request is served and sets the
+        // Through the admin guard: the proxied loopback request is refused and sets the
         // process-wide flag.
         let state = test_state();
         let mut req = from("127.0.0.1:40000", "GET", "/config", true);
         req.headers_mut()
             .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
         let (s, _, _) = call(&state, req).await;
-        assert_eq!(s, StatusCode::OK);
+        assert_eq!(s, StatusCode::FORBIDDEN);
         assert!(LOCAL_PROXY_WARNED.load(std::sync::atomic::Ordering::Relaxed));
     }
 

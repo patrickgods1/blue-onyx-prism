@@ -602,7 +602,7 @@ pub(super) async fn config_json(
     let mut stale_cookie = false;
     let admin = if foreign.is_some() {
         false
-    } else if super::loopback_peer(peer) {
+    } else if super::direct_local(peer, &headers) {
         true
     } else if allow_remote {
         let checked = super::auth::verify(&state, peer, &headers).await;

@@ -833,12 +833,18 @@ static files.
   address or in the config file. Names match exactly: a subdomain needs its own entry. The
   detection API and the other open routes accept any `Host`.
 - A reverse proxy on this machine (nginx, Caddy, Traefik, e.g. for TLS) makes every proxied request
-  arrive from `127.0.0.1`, so everyone who can reach the proxy is treated as this machine and gets
-  the admin pages **with no token**, whatever `allow_remote_admin` says. `X-Forwarded-For` and
-  similar headers are ignored on purpose (any client can send them). Restrict the admin paths in
-  the proxy, put its own authentication in front of them, or proxy only `/v1/vision/*`, when it is
-  reachable from other machines; a TLS proxy on another machine needs none of that, since its
-  requests are remote and need the token. The service warns once in the log when it sees this.
+  arrive from `127.0.0.1`. A request from a loopback address that carries `X-Forwarded-For`,
+  `Forwarded` or `X-Real-IP` counts as remote, whatever `allow_remote_admin` says: with it off the
+  admin routes answer 403, with it on they need the admin token. **A local proxy must add one of
+  these headers, or its clients count as this machine and get the admin pages with no token.**
+  nginx adds none by default and needs `proxy_set_header X-Forwarded-For $remote_addr;`; Caddy
+  adds it by itself. Check yours: `curl` an admin path through the proxy with no token, and expect
+  401 or 403. The header only ever takes trust away, and its value is ignored, because any
+  client can send it. So every client behind the proxy shares the proxy's address for the
+  wrong-token limit, and a wrong guess from one counts for all. To sign in through a proxy it must
+  also pass the browser's `Host` (nginx: `proxy_set_header Host $http_host;`) and that name must be in
+  `allowed_hosts`, or the login is refused as a cross-site request. A TLS proxy on another machine
+  needs no forwarding header, since its requests are remote anyway.
 - To keep everything on this machine (Blue Iris on the same PC), set `"bind_address": "127.0.0.1"`
   (or `--bind-address 127.0.0.1`); it applies when the process restarts.
 

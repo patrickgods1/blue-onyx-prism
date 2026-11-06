@@ -906,16 +906,12 @@ fn remote_message() -> String {
     )
 }
 
-/// Headers a reverse proxy adds: a request carrying one did not come straight from a browser
-/// on this machine, whatever the TCP peer is.
-const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
-
 /// Why a loopback request still must not open a dialog: it came through a proxy, or under a
 /// host name other than a loopback one (a DNS-rebound name, a reverse proxy that keeps the
 /// peer local). `None` = a direct local request. The `Host` is the header, else the request
 /// URI's authority (HTTP/2); a request with neither is refused too.
 fn indirect_reason(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> Option<String> {
-    if let Some(h) = PROXY_HEADERS.iter().find(|h| headers.contains_key(**h)) {
+    if let Some(h) = super::guard::proxy_header(headers) {
         return Some(format!("the request came through a proxy ({h} header)"));
     }
     let Some(host) = request_host(headers, uri) else {
@@ -1658,11 +1654,12 @@ mod tests {
         drop(g);
         assert!(BusyGuard::acquire().is_some(), "released by the guard");
 
-        // Local peers behind a proxy or under a foreign Host: unavailable, nothing opened.
+        // Local peers behind a proxy or under a foreign Host: unavailable, nothing opened. A
+        // proxied client is remote, so it gets here only with the token.
         let mut req = post(LOCAL, r#"{"kind":"folder"}"#);
         req.headers_mut()
             .insert("x-forwarded-for", "10.0.0.5".parse().unwrap());
-        let (s, _, b) = call(&state, req).await;
+        let (s, _, b) = call(&state, signed_in(req)).await;
         assert_eq!(s, StatusCode::CONFLICT);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);
@@ -1697,7 +1694,7 @@ mod tests {
                 .unwrap(),
             LOCAL,
         );
-        let (s, _, b) = call(&state, get).await;
+        let (s, _, b) = call(&state, signed_in(get)).await;
         assert_eq!(s, StatusCode::OK);
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(j["available"], false);

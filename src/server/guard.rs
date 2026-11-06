@@ -158,6 +158,16 @@ pub(crate) fn cross_site(headers: &HeaderMap) -> Result<(), CrossSite> {
     }
 }
 
+/// Headers a reverse proxy adds: a request carrying one did not come straight from a browser on
+/// this machine, whatever the TCP peer is. Read in that direction only: the header takes the
+/// trust of a loopback peer away and its value is never believed, since any client can send it.
+const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
+
+/// The first [`PROXY_HEADERS`] entry the request carries.
+pub(super) fn proxy_header(headers: &HeaderMap) -> Option<&'static str> {
+    PROXY_HEADERS.into_iter().find(|h| headers.contains_key(*h))
+}
+
 /// Most characters of a client's `Host` repeated in a refusal or in the log.
 const MAX_HOST_SHOWN: usize = 100;
 
