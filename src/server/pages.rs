@@ -845,7 +845,7 @@ mod tests {
         assert!(!stats.contains("http-equiv=\"refresh\""));
         assert!(stats.contains("<script src=\"/static/stats.js?v="));
         assert!(static_file("stats.js").is_some_and(|js| js.contains("fetch(\"/stats.json\"")));
-        assert!(stats.contains("class=\"stats sticky-first\""));
+        assert!(stats.contains("class=\"stats sticky-first rcards rgrid\""));
         assert!(stats.contains("ipcam-general") && stats.contains("title=\"CPU\""));
         assert!(!stats.contains("<b>evil</b>"));
         // Short state, the reason on its own line (as on Home).

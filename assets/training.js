@@ -420,7 +420,9 @@
     CP.fetchCatalog().then(function (cat) {
       catalog = cat;
       picker = CP.create(holder, {
-        entries: alEntries(cat), selected: restoredClasses["autolabel-form"] || CP.util.defaultSelection(cat), mode: "full", allowAdd: true,
+        // A phone gets the drop-down: the chips of every class would push the form a screen down.
+        entries: alEntries(cat), selected: restoredClasses["autolabel-form"] || CP.util.defaultSelection(cat),
+        mode: window.matchMedia("(max-width: 700px)").matches ? "compact" : "full", label: "Classes", emptyText: "your class list", allowAdd: true,
         quickSets: CP.util.quickSetsFor(cat)
       });
     }).catch(function (e) {

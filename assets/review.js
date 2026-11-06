@@ -53,6 +53,9 @@
   var fitBtn = $('rv-fit');
   var zoomText = $('rv-zoom');
   var cropWrap = $('rv-crop-wrap');
+  var phoneHead = $('rv-phone-head');
+  var phoneLine = $('rv-phone-line');
+  var likelyBar = $('rv-accept-likely');
   var cropCanvas = $('rv-crop');
   var cropCap = $('rv-crop-cap');
   var grid = canvas.closest('.review-grid');
@@ -224,10 +227,22 @@
   var MAX_ZOOM = 8;
   var HANDLE_CSS = 5;   // half size of a resize handle, CSS pixels
   var CLICK_CSS = 4;    // a pointer that moves less than this is a click
+  var TAP_CSS = 10;     // the same for a finger, which is never still
+  var TAP_NEAR_CSS = 14; // a tap this close to a box selects it (tiny boxes are smaller than a finger)
   var MIN_BOX = 3;      // frame pixels
   var DISMISS_SCORE = 0.15;   // training/autolabel/triage.rs
 
+  // The status line's keys, in the words of the buttons (no keyboard on a touch screen).
+  var TOUCH_WORDS = [
+    [' (z undoes)', ' (Undo takes it back)'], [': s saves.', ': Save & next saves.'],
+    ['a accepts, r rejects, Shift+R rejects the rest', 'answer each, or Reject the rest'],
+    ['a keeps, r rejects, or save again', 'answer each, or save again'], [' (a keep / accept, r reject)', ''],
+    ['j selects one', 'tap one'], ['click one, then a accepts it, r rejects it; i puts them away', 'tap one, then answer it'],
+    ['n returns, s saves it and returns', 'Next returns, Save & next saves it and returns']
+  ];
+
   function say(text, isError) {
+    if (text && noHover.matches) TOUCH_WORDS.forEach(function (w) { text = text.replace(w[0], w[1]); });
     msg.textContent = text || '';
     msg.className = 'form-msg' + (isError ? ' error-text' : '');
   }
@@ -806,10 +821,33 @@
 
   function lineWidth() { return Math.max(2, Math.round(canvas.width / 400)); }
 
+  var media = function (q) { return window.matchMedia ? window.matchMedia(q) : { matches: false }; };
+  // The one-column page (same width as the stylesheet); small canvas or a finger.
+  var oneColumn = media('(max-width: 900px)');
+  var touchUi = media('(max-width: 900px), (pointer: coarse)');
+  // No hover: the keys and "the pointer over a box" mean nothing, the answers name the buttons.
+  var noHover = media('(hover: none)');
+
+  // The box's shorter side as drawn, CSS pixels.
+  function boxSideCss(bb) {
+    return Math.min(bb[2] - bb[0], bb[3] - bb[1]) * view.z / cssScale();
+  }
+
+  // Half size of a handle in CSS pixels. On a small screen it follows the box, so a tiny box
+  // keeps its object in view: a sixth of the shorter side at most.
+  function handleCss(bb) {
+    return touchUi.matches ? clamp(boxSideCss(bb) / 6, 1.5, HANDLE_CSS) : HANDLE_CSS;
+  }
+
   function handlePoints(bb) {
     var cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2;
-    return [['nw', bb[0], bb[1]], ['n', cx, bb[1]], ['ne', bb[2], bb[1]], ['e', bb[2], cy],
-      ['se', bb[2], bb[3]], ['s', cx, bb[3]], ['sw', bb[0], bb[3]], ['w', bb[0], cy]];
+    var corners = [['nw', bb[0], bb[1]], ['ne', bb[2], bb[1]], ['se', bb[2], bb[3]], ['sw', bb[0], bb[3]]];
+    var shorter = touchUi.matches ? boxSideCss(bb) : Infinity;
+    // Small screens: the side handles go first, a box under 10 CSS px has none (a drag moves it).
+    if (shorter < 10) return [];
+    if (shorter < 24) return corners;
+    return [corners[0], ['n', cx, bb[1]], corners[1], ['e', bb[2], cy],
+      corners[2], ['s', cx, bb[3]], corners[3], ['w', bb[0], cy]];
   }
 
   function tagText(b, i) {
@@ -935,7 +973,7 @@
     if (hb && hoverIdx !== selected && !isOff(hb)) drawBox(hb, hoverIdx);
     if (sb && !isOff(sb)) drawBox(sb, selected);
     if (sb && !(gesture && gesture.mode === 'draw' && gesture.moved)) {
-      var hs = HANDLE_CSS * cssScale() / z;
+      var hs = handleCss(sb.bbox) * cssScale() / z;
       ctx.save();
       ctx.fillStyle = '#ffffff';
       ctx.strokeStyle = '#000000';
@@ -973,6 +1011,8 @@
     var aw = Math.max(120, cropWrap.clientWidth || 300);
     // Its height follows the window: the decision bar and the list stay in view under it.
     var ah = Math.round(Math.max(140, Math.min(wideSide ? 340 : 240, window.innerHeight * (wideSide ? 0.36 : 0.22))));
+    // One column: the frame, this and the question share the screen.
+    if (oneColumn.matches) ah = Math.round(Math.max(100, Math.min(240, window.innerHeight * 0.16)));
     var mw = bw * 1.8, mh = bh * 1.8;
     var scale = Math.min(aw / mw, ah / mh);
     if (Math.max(bw, bh) < 120) scale = Math.max(scale, 2);
@@ -1168,7 +1208,7 @@
     var rp = b.state === 'pending' ? repeatOf(b) : null;
     if (rp) li.appendChild(repeatChip(rp));
     li.appendChild(el('span', 'bx-score muted', fmtScore(b.score)));
-    li.addEventListener('click', function () { select(i); });
+    li.addEventListener('click', function () { select(i, oneColumn.matches); });
     return li;
   }
 
@@ -1199,7 +1239,7 @@
     var ev = evidence(b);
     if (ev) li.appendChild(el('span', 'bx-note', ev));
     // Accept / reject / keep / delete and "It's a <auto label>" are the decision bar's buttons.
-    li.addEventListener('click', function () { select(i); });
+    li.addEventListener('click', function () { select(i, oneColumn.matches); });
     return li;
   }
 
@@ -1239,9 +1279,14 @@
     boxTools.textContent = '';
     var likely = boxes().filter(isLikely).length, n = dismissedCount();
     if (likely) {
-      var acc = decideButton('Accept likely (' + likely + ')', 'c', 'ok', acceptLikely);
+      var acc = decideButton('Accept likely (' + likely + ')', 'c', 'ok rv-tool-likely', acceptLikely);
       acc.title = 'Accept every likely box (★) on this frame; the other boxes stay pending';
       boxTools.appendChild(acc);
+    }
+    // The bottom bar's copy (phones and tablets).
+    if (likelyBar) {
+      likelyBar.hidden = !likely;
+      likelyBar.textContent = 'Accept likely (' + likely + ')';
     }
     if (n) {
       var show = decideButton((dismissedOn ? 'Hide ' : 'Show ') + n + ' hidden', 'i', 'secondary', toggleDismissed);
@@ -1250,11 +1295,16 @@
       boxTools.appendChild(show);
     }
     boxTools.hidden = !likely && !n;
+    boxTools.classList.toggle('rv-only-likely', !!likely && !n);
   }
 
   // The "Anything missing?" question, with the frame's dismissed boxes when they are off.
   function missingText() {
     var n = dismissedOn ? 0 : dismissedCount();
+    if (noHover.matches) {
+      return 'Anything missing? Look over the whole frame and drag to draw a missed object' +
+        (n ? ' (' + n + ' hidden: Show them under the question)' : '') + '; Save & next saves.';
+    }
     return 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
       (n ? n + ' hidden: i shows them; ' : '') + 's saves.';
   }
@@ -1286,10 +1336,13 @@
     var b = boxes()[selected];
     if (!b) {
       var off = dismissedOn ? 0 : dismissedCount();
-      decide.appendChild(el('div', 'rv-q', p.undecided || p.unchecked ? 'No box selected: j selects the next one, drag on the frame to draw one.'
+      var tap = noHover.matches;
+      decide.appendChild(el('div', 'rv-q', p.undecided || p.unchecked
+        ? (tap ? 'No box selected: tap one, or drag on the frame to draw one.' : 'No box selected: j selects the next one, drag on the frame to draw one.')
         : (missingAsked === cur.frame ? missingText()
-          : (p.total ? 'Every box decided: s saves.'
-            : 'No box: drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : '')))));
+          : (p.total ? (tap ? 'Every box decided: Save & next saves.' : 'Every box decided: s saves.')
+            : (tap ? 'No box: drag on the frame to draw one, or tick Confirmed empty below.' + (off ? ' ' + off + ' hidden.' : '')
+              : 'No box: drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : ''))))));
     } else {
       var i = selected;
       var q = el('div', 'rv-q');
@@ -1477,7 +1530,9 @@
     // The page too when the decision bar is off screen (one column: the panel does not stick).
     if (page) {
       var dr = decide.getBoundingClientRect();
-      if (dr.top < 0 || dr.bottom > window.innerHeight) decide.scrollIntoView({ block: 'nearest' });
+      // Over the bottom bar counts as off screen (`scroll-margin-bottom` on the panel keeps it clear).
+      var bar = oneColumn.matches && $('rv-save').parentNode.getBoundingClientRect().height || 0;
+      if (dr.top < 0 || dr.bottom > window.innerHeight - bar) decide.scrollIntoView({ block: 'nearest' });
     }
   }
 
@@ -1489,6 +1544,13 @@
     revealSelected();
     if (!grid) return;
     var top = grid.getBoundingClientRect().top;
+    // One column: from the line over the frame (or the frame); the panel may go on below the screen.
+    if (oneColumn.matches) {
+      var head = phoneHead && phoneHead.getBoundingClientRect().height ? phoneHead : grid;
+      top = head.getBoundingClientRect().top;
+      if (Math.abs(top - 4) > 1) window.scrollBy(0, top - 4);
+      return;
+    }
     var bottom = Math.max(canvas.getBoundingClientRect().bottom, side ? side.getBoundingClientRect().bottom : 0);
     var by = 0;
     if (top < 0) by = top - 8;
@@ -2112,7 +2174,10 @@
   function handleAt(p) {
     var b = boxes()[selected];
     if (!b) return null;
-    var r = (HANDLE_CSS + 2) * cssScale() / view.z;
+    var css = HANDLE_CSS + 2;
+    // A finger needs more room; the middle third of a box stays a move.
+    if (touchUi.matches) css = Math.max(handleCss(b.bbox) + 2, Math.min(12, boxSideCss(b.bbox) / 3));
+    var r = css * cssScale() / view.z;
     var hit = null;
     handlePoints(b.bbox).forEach(function (h) {
       if (!hit && Math.abs(p[0] - h[1]) <= r && Math.abs(p[1] - h[2]) <= r) hit = h[0];
@@ -2140,6 +2205,19 @@
       if (isShown(bx) && !isUnwanted(bx) && p[0] >= bx.bbox[0] && p[0] <= bx.bbox[2] && p[1] >= bx.bbox[1] && p[1] <= bx.bbox[3] && a < area) {
         best = i; area = a;
       }
+    });
+    return best;
+  }
+
+  // The shown box whose edge is nearest to the frame point `p`, within `reach` frame pixels, else -1.
+  function boxNear(p, reach) {
+    var best = -1, bestD = reach;
+    if (hideBoxes) return -1;
+    boxes().forEach(function (b, i) {
+      if (!isShown(b)) return;
+      var dx = Math.max(b.bbox[0] - p[0], 0, p[0] - b.bbox[2]), dy = Math.max(b.bbox[1] - p[1], 0, p[1] - b.bbox[3]);
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d <= bestD) { best = i; bestD = d; }
     });
     return best;
   }
@@ -2179,6 +2257,7 @@
     if (ev.button !== 0) return;
     var p = framePoint(ev);
     var g = { mode: 'draw', cx: ev.clientX, cy: ev.clientY, x0: p[0], y0: p[1], x1: p[0], y1: p[1], moved: false };
+    g.finger = ev.pointerType === 'touch';
     if (!hideBoxes && selected >= 0) {
       var h = handleAt(p);
       if (h) { g.mode = 'resize'; g.handle = h; }
@@ -2194,7 +2273,8 @@
     var g = gesture;
     if (!g) { hoverCursor(ev); return; }
     if (!g.moved) {
-      if (Math.abs(ev.clientX - g.cx) > CLICK_CSS || Math.abs(ev.clientY - g.cy) > CLICK_CSS) {
+      var still = g.finger ? TAP_CSS : CLICK_CSS;
+      if (Math.abs(ev.clientX - g.cx) > still || Math.abs(ev.clientY - g.cy) > still) {
         g.moved = true;
         if ((g.mode === 'move' || g.mode === 'resize') && boxes()[g.idx]) {
           snapshot();
@@ -2246,8 +2326,10 @@
       return;
     }
     if (g.mode === 'resize') { draw(); return; }
-    // A click: the smallest box under the point.
-    select(boxAt([g.x0, g.y0]));
+    // A click: the smallest box under the point (a finger: else the nearest box close by).
+    var hit = boxAt([g.x0, g.y0]);
+    if (hit < 0 && g.finger) hit = boxNear([g.x0, g.y0], TAP_NEAR_CSS * cssScale() / view.z);
+    select(hit);
     hoverCursor(ev);
   });
 
@@ -2339,6 +2421,17 @@
     add('Per class', keys.length ? keys.map(function (k) { return k + ' ' + per[k]; }).join(', ') : 'none yet');
     add('Matching', j.position ? (j.position + ' of ' + j.total) : (j.total || 0));
     if (j.unreadable) add('Unreadable', j.unreadable);
+    queuePlace = j.position ? (j.position + ' of ' + j.total) : '';
+    setPhoneLine();
+  }
+
+  // Phones: one line over the frame; Details opens the counts, the filters and the frame's facts.
+  var queuePlace = '';
+  function setPhoneLine() {
+    if (!phoneLine) return;
+    var r = (cur && cur.record) || {};
+    phoneLine.textContent = [queuePlace ? 'Frame ' + queuePlace : '', r.scene, r.camera].filter(Boolean).join(' · ') || 'Review';
+    phoneLine.title = $('rv-meta').textContent;
   }
 
   function fillCameras(list) {
@@ -2408,6 +2501,7 @@
     if (cur.stale_classes) parts.push('reviewed with another class list');
     if (cur.labels && cur.labels.disagreement) parts.push('back for review: ' + cur.labels.disagreement);
     m.textContent = parts.filter(Boolean).join(' · ');
+    setPhoneLine();
   }
 
   function showNone(on) {
@@ -2672,6 +2766,15 @@
   if (backBtn) backBtn.addEventListener('click', goBack);
   $('rv-undo').addEventListener('click', doUndo);
   $('rv-accept-all').addEventListener('click', acceptProposals);
+  if (likelyBar) likelyBar.addEventListener('click', acceptLikely);
+  var infoBtn = $('rv-info-toggle');
+  if (infoBtn) {
+    infoBtn.addEventListener('click', function () {
+      var open = $('review').classList.toggle('rv-info-open');
+      infoBtn.textContent = open ? 'Hide' : 'Details';
+      infoBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+  }
   $('rv-reject-rest').addEventListener('click', rejectRest);
   if (imgBtn) imgBtn.addEventListener('click', function () { cycleImg(); canvas.focus({ preventScroll: true }); });
   if (missingBox) {

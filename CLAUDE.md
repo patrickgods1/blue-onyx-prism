@@ -345,6 +345,8 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   downloads give up after 12 attempts in the service (`manager::SERVICE_MAX_ATTEMPTS`); a config with no models is seeded with
   IPcam-general. Error messages state what happened, the likely cause and the next action.
 
+- Phones: `assets/style.css` section *Phones and tablets*: `table.rcards` (`data-label`; `rc-title`, `rc-block`, `rc-action`; `rgrid` = 3 columns) stacks under 700 px, `table.model-card` under 900 px. Review on one column: `.rv-actions-main` sticky bar, Details toggle `#rv-info-toggle`, handles scale with box size (`handleCss`, `handlePoints`; desktop unchanged). Page tests assert `<td>name</td>`, `<td class="state">` and the Stats table's class string, so add classes there with care.
+
 ## Conventions
 
 - Edition 2024, `anyhow` for app errors, `tracing` for logs. No `build.rs`. No `unsafe` outside `backend/`.

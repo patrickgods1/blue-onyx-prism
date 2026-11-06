@@ -275,7 +275,7 @@ document.addEventListener("click", function (e) {
       var sel = tr.querySelector("td.model-device select");
       upd(sel, m.device || "");
       refreshThreshold(tr, m, j, force);
-      var run = tr.querySelector("td.running"); run.className = "running st-" + m.running.stateClass;
+      var run = tr.querySelector("td.running"); run.className = "running rc-block st-" + m.running.stateClass;
       // "Failed" and its reason on one truncated line (opens to the full text; kept open across refreshes).
       var fail = m.running.stateClass === "fail" && m.running.detail ? m.running.detail : null, old = run.querySelector("details.run-detail");
       var keepOpen = !!(old && old.open && fail && old.querySelector("summary").textContent === fail);
