@@ -374,6 +374,8 @@ struct ResultRow {
     license: String,
     classes: String,
     benchmark: String,
+    /// `/benchmark?set=...#tab-compare`: Compare on the run's held-out images.
+    compare_href: String,
     /// The new model and the current default on the same frames, in words.
     compare: String,
     /// The share of the benchmark that is its own training frames, in words (empty: none).
@@ -774,6 +776,18 @@ fn state_str(s: RunState) -> &'static str {
         RunState::Done => "done",
         RunState::Failed => "failed",
         RunState::Cancelled => "cancelled",
+    }
+}
+
+/// The Benchmark page's Compare tab on the images a run was benchmarked on: its held-out set
+/// comes first in `datasets`. Without a benchmark the page opens on its default set.
+fn compare_href(b: Option<&BenchSummary>) -> String {
+    match b.and_then(|b| b.datasets.first()) {
+        Some(set) => format!(
+            "/benchmark?set={}#tab-compare",
+            super::config_page::encode_uri_component(set)
+        ),
+        None => "/benchmark#tab-compare".to_string(),
     }
 }
 
@@ -1332,6 +1346,7 @@ fn view_with(
                 license: o.license.clone(),
                 classes: o.classes.join(", "),
                 benchmark: bench_text(r.benchmark.as_ref(), r.benchmark_error.as_deref()),
+                compare_href: compare_href(r.benchmark.as_ref()),
                 compare: bench::compare_text(r.benchmark.as_ref(), r.baseline.as_ref()),
                 trained_on: r
                     .benchmark
@@ -4757,6 +4772,24 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND, "{text}");
         assert!(text.contains("cmp-nope"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_trained_model_links_to_compare_on_its_held_out_images() {
+        let b: BenchSummary = serde_json::from_value(serde_json::json!({
+            "datasets": ["heldout-a b", "coco-cctv"],
+            "device": null,
+            "ms_p50": null,
+            "ap50": null,
+            "ap50_95": null,
+            "images": 0,
+        }))
+        .unwrap();
+        assert_eq!(
+            compare_href(Some(&b)),
+            "/benchmark?set=heldout-a%20b#tab-compare"
+        );
+        assert_eq!(compare_href(None), "/benchmark#tab-compare");
     }
 
     #[test]

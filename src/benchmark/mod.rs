@@ -32,6 +32,7 @@ pub mod forget;
 pub mod grade;
 pub mod history;
 pub mod images;
+pub mod lineup;
 pub mod metrics;
 pub mod report;
 pub mod rescore;

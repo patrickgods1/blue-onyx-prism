@@ -1,7 +1,7 @@
-// Blue Onyx Prism: Benchmark page, steps 2 Profiles and 3 Apply (PrismBench.profiles).
+// Blue Onyx Prism: Benchmark page, the Tune tab (PrismBench.profiles).
 // Profiles: one card per model (id "m-<model>") with one row per device it ran on: speed, finds,
 // correct, the best confidence for the saved goal, the saved profile and a "Run on" radio (the
-// choice is remembered per browser, PrismBench.choice). Apply: the plain list of what saving
+// choice is remembered per browser, PrismBench.choice). Save: the plain list of what saving
 // changes (built from status.profiles and the choices), one POST to
 // /v1/benchmark/apply-profiles per button, the answer with Undo (the server's `undo` pairs) and
 // "Restart now" only when the answer says needsRestart.
@@ -66,7 +66,7 @@
 
   var STATUS = {
     saved: ["Saved", "status-saved", "Every measured device has its best confidence saved."],
-    unsaved: ["Not saved", "status-unsaved", "The best confidences of this benchmark are not saved yet: save them in step 3."],
+    unsaved: ["Not saved", "status-unsaved", "The best confidences of this benchmark are not saved yet: save them below."],
     differs: ["Differs from latest benchmark", "status-differs", "Saved profiles differ from the best confidences of the latest benchmark for your goal."],
     none: ["No confidences", "status-none", "This benchmark found no usable confidence for this model (no labels, or it finds no objects)."]
   };
@@ -75,7 +75,7 @@
     c.title = s[2]; return c;
   }
 
-  // ---- step 2: one card per model ---------------------------------------------------------------
+  // ---- Tune: one card per model -----------------------------------------------------------------
   function th(tr, id) { var c = el("th"); c.appendChild(PB.head(id)); tr.appendChild(c); }
   function td(tr, label, content, cls) {
     var c = el("td", cls || null); c.dataset.label = label;
@@ -137,7 +137,7 @@
   function renderCards(j) {
     var box = $("profiles"); if (!box) return;
     var list = j.profiles;
-    if (list === undefined) { box.replaceChildren(el("p", "warn", "This server does not report per-device profiles yet: update it, or use Advanced.")); return; }
+    if (list === undefined) { box.replaceChildren(el("p", "warn", "This server does not report per-device profiles yet: update it, or use Details.")); return; }
     if (!list.length) { box.replaceChildren(); return; }
     if (!L) { box.replaceChildren.apply(box, list.map(function (p) { return card(p, !!j.running); })); return; }
     var running = !!j.running;
@@ -148,7 +148,7 @@
     }));
   }
 
-  // ---- step 3: what saving changes ----------------------------------------------------------
+  // ---- Tune: what saving changes -------------------------------------------------------------
   function plan(j) {
     var out = [];
     (j.profiles || []).forEach(function (p) {
@@ -181,8 +181,8 @@
     var counts = renderDiff(j), running = !!j.running, b1 = $("ap-save-use"), b2 = $("ap-save");
     if (b1) { b1.disabled = running || S.busy || counts.profiles + counts.use === 0; b1.title = running ? "Available when the benchmark finishes" : ""; }
     if (b2) { b2.disabled = running || S.busy || counts.profiles === 0; b2.title = running ? "Available when the benchmark finishes" : ""; }
-    // The Apply tab shows how many changes wait.
-    var tab = document.querySelector('nav.wizard a[href="#tab-apply"]');
+    // The Tune tab shows how many changes wait.
+    var tab = document.querySelector('nav.wizard a[href="#tab-tune"]');
     if (tab) {
       var n = counts.profiles + counts.use, badge = tab.querySelector(".tab-count");
       if (!badge) { badge = el("span", "tab-count"); tab.appendChild(badge); }
@@ -199,7 +199,7 @@
     send(b, false);
   }
   // POST a body (pairs) to apply-profiles and show the answer in `box` (the Apply result box
-  // unless given: Advanced actions use the page's status box).
+  // unless given: Details actions use the page's status box).
   function send(body, undone, box) {
     S.busy = true; if (S.j) renderApply(S.j);
     return PB.post(ENDPOINT, body).then(function (r) { S.busy = false; showResult(r, undone, box || $("ap-result")); }, function (e) {

@@ -66,8 +66,8 @@
   // "higher" | "lower" | null. Meanings may be functions (they quote the noise constants).
   var GLOSSARY = {
     // Plain words of the Profiles and Apply steps.
-    finds: {name: "Finds", term: "recall", better: "higher", meaning: "Share of the real objects in the images that the model found, at the best confidence. 70% means it missed 3 in 10."},
-    correct: {name: "Correct", term: "precision", better: "higher", meaning: "Share of the model's detections that were a real object, at the best confidence. 90% means 9 in 10 detections were right."},
+    finds: {name: "Finds", term: "recall", better: "higher", meaning: "Share of the real objects in the images that the model found, at the confidence shown. 70% means it missed 3 in 10."},
+    correct: {name: "Correct", term: "precision", better: "higher", meaning: "Share of the model's detections that were a real object, at the confidence shown. 90% means 9 in 10 detections were right."},
     speed: {name: "Speed", term: "time per image", better: "lower", meaning: "The typical time for one image on this device, the whole request: decode, resize, detection and clean-up."},
     best_conf: {name: "Best confidence", term: "best confidence threshold", better: null, meaning: "The confidence that suits your goal best on this device. Detections below it are dropped. 0.30 means 30% in Blue Iris."},
     profile: {name: "Profile", term: "per-device confidence", better: null, meaning: "The confidence saved for one model on one device. The model uses the profile of the device it actually runs on (also with auto or after a fallback); devices without one use the model's default."},
@@ -79,6 +79,7 @@
     ap50_95: {name: "Box accuracy", term: "AP50-95", better: "higher", meaning: "AP averaged over overlap requirements from 50% to 95%: also rewards tight, well-placed boxes."},
     roc_auc: {name: "Alert separation", term: "ROC AUC (frame level)", better: "higher", meaning: "How well a frame's top confidence separates frames with an object from frames without one: 100% is perfect, 50% is chance. This is the alert decision Blue Iris makes."},
     tpr: {name: "Alert rate", term: "TPR (true-positive rate, frame level)", better: "higher", meaning: "Of the frames with an object, the share that would alert at this threshold."},
+    false_alerts: {name: "False alerts", term: "false alerts on empty frames", better: "lower", meaning: "Of the frames with nothing to find, how many would still alert, per 100 frames. A dash means the set has no empty frames."},
     fpr: {name: "False-alert rate", term: "FPR (false-positive rate, frame level)", better: "lower", meaning: "Of the frames without an object, the share that would still alert at this threshold."},
     youden: {name: "Alert minus false alert", term: "Youden's J", better: "higher", meaning: "Alert rate minus false-alert rate; the threshold that maximizes it separates the two best."},
     p50: {name: "Time per image", term: "p50 (median)", better: "lower", meaning: "The typical time for one image: half of the images took less. Whole request: decode, resize, inference and post-processing."},
@@ -102,7 +103,7 @@
     same: {name: "About the same", term: "within the noise floor", better: null, meaning: function () { return "Changes this small happen between identical runs. Speed changes under " + Math.round(noise.speed_rel * 100) + "% or " + noise.speed_abs_ms + " ms, accuracy changes within " + noise.se_factor + " standard errors (normal variation for that many objects), and a confidence that stays inside the old near-optimal range (" + noise.plateau_points + " points) count as about the same."; }},
     points: {name: "points", term: "percentage points", better: null, meaning: "The difference between two percentages: 87% to 90% is +3 points (not +3%)."},
     not_comparable: {name: "Not comparable", term: "not comparable", better: null, meaning: "The two runs differ in datasets, image count, reference model, hardware or runtime version, so their numbers are not compared."},
-    accuracy_score: {name: "Accuracy score", term: "accuracy score (ranking)", better: "higher", meaning: "The score the ranking uses: AP50 blended with small-object recall, or the frame ROC AUC, as chosen in the Custom goal (step 2)."},
+    accuracy_score: {name: "Accuracy score", term: "accuracy score (ranking)", better: "higher", meaning: "The score the ranking uses: AP50 blended with small-object recall, or the frame ROC AUC, as chosen in the Custom goal (Tune)."},
     overall: {name: "Overall", term: "overall grade", better: "higher", meaning: "Accuracy and speed grades combined by the accuracy weight (\"What matters most\")."},
     speed_grade: {name: "Speed", term: "speed grade", better: "higher", meaning: "Graded from the time per image (p50, whole request)."},
     accuracy_grade: {name: "Accuracy", term: "accuracy grade", better: "higher", meaning: "Graded from the accuracy score (AP50 with small-object recall, or ROC AUC)."},
@@ -125,7 +126,7 @@
     precision: ["Correct", "precision"], recall: ["Finds", "recall"], f1: ["Balance (F1)", "f1"], f2: ["Miss-fewer (F2)", "f2"],
     threshold: ["Confidence", "threshold"], grade: ["Grade", "grade"], agreement: ["Agreement", "agreement"],
     trust: ["Trust", "trust"], ran: ["Ran", "ran"], change: ["Δ vs last run", "change"], tradeoff: ["Trade-off", "best_tradeoff"],
-    accuracy_score: ["Accuracy score", "accuracy_score"], range: ["Near-optimal range", "plateau"], best_conf: ["Best confidence", "best_conf"], saved_conf: ["Saved", "profile"], finds: ["Finds", "finds"], correct: ["Correct", "correct"], speed: ["Speed", "speed"], run_on: ["Run on", null], now_conf: ["Confidence now", "threshold"], tpr: ["Alert rate", "tpr"], fpr: ["False alerts", "fpr"]
+    accuracy_score: ["Accuracy score", "accuracy_score"], range: ["Near-optimal range", "plateau"], best_conf: ["Best confidence", "best_conf"], saved_conf: ["Saved", "profile"], finds: ["Finds", "finds"], correct: ["Correct", "correct"], speed: ["Speed", "speed"], run_on: ["Run on", null], now_conf: ["Confidence now", "threshold"], tpr: ["Alert rate", "tpr"], fpr: ["False alerts", "fpr"], false_alerts: ["False alerts", "false_alerts"]
   };
   function label(id) { return (LABELS[id] || [id])[0]; }
 
@@ -295,8 +296,8 @@
   }
 
   // ---- glossary list (the no-hover fallback) -------------------------------------------------
-  var GLOSSARY_ORDER = ["threshold", "recall", "precision", "f1", "f2", "ap50", "ap50_95", "roc_auc", "tpr", "fpr", "youden", "frame", "iou", "fp_per_image", "p50", "p95", "mean", "infer", "load_ms", "fps", "grade", "relative", "agreement", "reference", "objective", "plateau", "trust", "best_tradeoff", "same", "not_comparable", "points"];
-  var PLAIN_ORDER = ["finds", "correct", "speed", "best_conf", "profile"];
+  var GLOSSARY_ORDER = ["threshold", "recall", "precision", "f1", "f2", "ap50", "ap50_95", "roc_auc", "tpr", "fpr", "false_alerts", "youden", "frame", "iou", "fp_per_image", "p50", "p95", "mean", "infer", "load_ms", "fps", "grade", "relative", "agreement", "reference", "objective", "plateau", "trust", "best_tradeoff", "same", "not_comparable", "points"];
+  var PLAIN_ORDER = ["finds", "correct", "false_alerts", "speed", "best_conf", "profile"];
   // `order`: "plain" (the Profiles words) or a list of keys; default every expert term.
   function glossaryDetails(key, order) {
     var d = el("details", "help glossary"); d.dataset.keep = "d:gloss:" + (key || "");

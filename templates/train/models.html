@@ -2,7 +2,7 @@
   <h2>Use a trained model</h2>
   {% include "revert.html" %}
   {% if results.is_empty() %}<p class="muted">No trained model yet: finished runs from the <a href="/train/train">Train</a> tab show here, with their held-out benchmark.</p>{% else %}
-  <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark">Benchmark</a> page.</p>
+  <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark#tab-compare">Benchmark</a> page.</p>
   <div class="scroll">
   <table>
     <thead><tr><th>Model</th><th>Family</th><th>Licence</th><th>Classes</th><th>Held-out benchmark</th><th>Use as</th></tr></thead>
@@ -13,7 +13,7 @@
       <td>{{ r.family }}</td>
       <td>{{ r.license }}</td>
       <td>{{ r.classes }}</td>
-      <td>{{ r.benchmark }}{% if !r.trained_on.is_empty() %} <span class="tag restart" title="A score on frames a model trained on says little about the frames it will see next.">{{ r.trained_on }}</span>{% endif %}{% if !r.compare.is_empty() %}<p class="tr-compare">{{ r.compare }}</p>{% endif %}{% if !r.warnings.is_empty() %}<ul class="warn-list small">{% for w in r.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}{% if !r.files.text.is_empty() %}<p class="muted small tr-files">{{ r.files.text }}.</p>{% endif %}</td>
+      <td>{{ r.benchmark }} <a class="small" href="{{ r.compare_href }}">Compare on these images</a>{% if !r.trained_on.is_empty() %} <span class="tag restart" title="A score on frames a model trained on says little about the frames it will see next.">{{ r.trained_on }}</span>{% endif %}{% if !r.compare.is_empty() %}<p class="tr-compare">{{ r.compare }}</p>{% endif %}{% if !r.warnings.is_empty() %}<ul class="warn-list small">{% for w in r.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}{% if !r.files.text.is_empty() %}<p class="muted small tr-files">{{ r.files.text }}.</p>{% endif %}</td>
       <td>
         {% if r.is_default %}<span class="tag now">Default now</span>{% endif %}
         <form method="post" action="/training/use" class="inline" data-switch="{{ r.id }}"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="role" value="default"><input type="hidden" name="copy" value="1"><button type="submit" class="small">{% if r.is_default %}Threshold&hellip;{% else %}Use as default&hellip;{% endif %}</button></form>

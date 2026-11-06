@@ -168,7 +168,7 @@ impl StoredRun {
     }
 
     /// The predictions of image `k` as scored boxes.
-    fn preds(&self, k: usize) -> Vec<PredBox> {
+    pub(crate) fn preds(&self, k: usize) -> Vec<PredBox> {
         let Some(img) = self.images.get(k) else {
             return Vec::new();
         };

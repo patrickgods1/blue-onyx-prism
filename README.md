@@ -664,11 +664,15 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
 
 - **Confidence profiles**: the best confidence differs per device (a GPU's FP16 path scores a little
   differently from the CPU), so it is saved per model and device in `device_thresholds`. The Benchmark
-  page is three steps: **1 Run** (datasets, models, devices), **2 Profiles** (choose the goal, the only
-  place it is set; then per model one row per device: speed, finds, correct, best confidence, saved
-  value, and the device to run on) and **3 Apply** (*Save profiles and use chosen devices* or *Save
-  profiles only*, one change with Undo). Compare, Confidence, Details and History are under
-  **Advanced**. On the Config page, choosing another device in a model's dropdown shows that device's
+  page has five tabs. **Compare** (opens first once there are results) is one table of the models on
+  the same images: choose the image set, read what finds, what is right, the false alerts on empty
+  frames and the speed, day / night / IR where the set allows; a value is marked best only past the
+  noise, a model with training frames in the set cannot be best, and models not scored on these images
+  are listed with why and a button to run them. **Run** chooses datasets, models and devices. **Tune**
+  chooses the goal (the only place it is set), shows per model one row per device (speed, finds,
+  correct, best confidence, saved value, the device to run on) and saves (*Save profiles and use chosen
+  devices* or *Save profiles only*, one change with Undo). **History** compares runs of one model.
+  **Details** holds every other table, each collapsed. On the Config page, choosing another device in a model's dropdown shows that device's
   saved profile, or pre-fills its benchmark best (Save keeps it). `/v1/status` shows each model's
   `threshold` and `thresholdSource` (e.g. `profile for ort:coreml`).
 
