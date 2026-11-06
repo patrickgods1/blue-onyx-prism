@@ -109,6 +109,7 @@ impl Harness {
             min_confidence: 0.0,
             image_data: image.into(),
             image_name: name.into(),
+            ..VisionDetectionRequest::default()
         };
         self.handle
             .sender
@@ -1225,7 +1226,24 @@ fn collected_frames_get_their_buckets_and_a_full_queue_never_delays_replies() {
         crate::collect::global().pending() == 0
     });
 
-    // 2. One request per camera and outcome.
+    // 2. A Test page upload is answered, and stays out of the dataset: its file name would make
+    // a camera `dog` (checked by the frame count at the end).
+    primary.script.push([det(0, 0)]);
+    let (tx, rx) = oneshot::channel();
+    let upload = VisionDetectionRequest {
+        image_data: jpeg().into(),
+        image_name: "dog.jpg".into(),
+        no_collect: true,
+        ..VisionDetectionRequest::default()
+    };
+    primary
+        .handle
+        .sender
+        .try_send(WorkItem::Detect(upload, tx, Instant::now()))
+        .unwrap();
+    assert_eq!(label(&Reply(rx).wait()), "c0");
+
+    // 3. One request per camera and outcome.
     primary.script.push([det(0, 0)]); // positive
     assert_eq!(label(&primary.send("front.jpg").wait()), "c0");
     primary.script.push([det(2, 0)]); // c2 under its label threshold: suppressed
@@ -1296,6 +1314,7 @@ fn collected_frames_get_their_buckets_and_a_full_queue_never_delays_replies() {
     assert_eq!(r.buckets, vec![Bucket::Empty]);
     let summary = crate::collect::Summary::scan(&dir);
     assert_eq!(summary.by_camera["flood"].frames, 1);
+    assert!(!summary.by_camera.contains_key("dog"));
     assert_eq!(summary.frames, 6);
     primary.stop();
     checker.stop();

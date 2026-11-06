@@ -409,7 +409,7 @@ impl WorkerCtx {
         request_id: String,
     ) -> (Meta, Input) {
         let live = self.cfg.live.load_full();
-        let original = live.collect.enabled.then(|| req.image_data.clone());
+        let original = (live.collect.enabled && !req.no_collect).then(|| req.image_data.clone());
         let meta = Meta {
             reply,
             enqueued,

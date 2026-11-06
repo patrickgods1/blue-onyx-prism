@@ -126,7 +126,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   ExDark RF-DETRs are export recipes (ExDark ones in `F32_MODELS`, non-commercial); benchmark `animal` class group.
 - `src/collect/` dataset collector (`collect` config, default off, live): after the reply, the worker `try_send`s the
   original upload + a v1 sidecar record (raw/suppressed boxes, scene, camera, verify outcomes) to one collector thread
-  (buckets positive/empty/suppressed/verify_*/near_threshold/disagreement, per-camera rate limits, dHash dedup, atomic
+  (buckets positive/empty/suppressed/verify_*/near_threshold/disagreement, per-camera rate limits, dHash dedup (`Bucket::skips_dedup`: all but positive and empty skip it, at most `DEDUP_SKIPS_PER_CAMERA` a minute), `collect/health.rs` (`collection` and `usage` on `GET /v1/dataset`), a disk stop re-arms itself, atomic
   writes under `<data root>/dataset/<scene>/<camera>/<date>/`, `retention::prune_dataset`, disk guard); admin `/dataset`
   page (frames by detected class; Review queue and export filter by class) and `review-queue.jsonl`; format in `docs/DATASET.md`. OpenVINO CACHE_DIR is `<cache>/openvino-<device>-<prec>`
   (the CPU cache hash ignores precision); `config_store::spawn_disk_watch` applies on-disk config edits within 2 s.
@@ -144,7 +144,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   same object class (vehicles one class) / same label, unreviewed frames of that camera and size, `skip_frame`, file
   marker `repeat_spot`) and `POST /v1/review/accept-repeats` (repeat-only frames, nothing pending, sorted last,
   `auto=repeats`); queue sorted by likely boxes, then fewer flagged, then uncertainty (`auto=` filter, wraps), exports YOLO / COCO /
-  X-AnyLabeling / benchmark `dir:` with a camera+day split; labelled frames are never pruned. The page reviews `collect.review_dir`
+  X-AnyLabeling / benchmark `dir:` with a camera+day split; frames with a human decision or boxes awaiting review are never pruned (`labels::is_protected`), a label file with nothing left to look at goes with its frame. The page reviews `collect.review_dir`
   (default `collect.dir`; *Folder under review*, `POST /v1/review/folder`), e.g. an import saved with `train import --out-dir`;
   auto-label runs follow it. Unwanted classes = labels mapping to no `collect.classes` entry (aliases such as `pottedplant` map) ∪
   `collect.hidden_classes` (Review "don't want (hide + reject)"; class ids and exports unchanged): left out of `prefill` and of auto-label

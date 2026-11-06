@@ -26,6 +26,7 @@ id -u blueonyx >/dev/null 2>&1 || fail "user blueonyx missing"
 [ -x /opt/blue-onyx-prism/blue-onyx-prism ] || fail "binary missing"
 [ -x /opt/blue-onyx-prism/blue-onyx-prism-benchmark ] || fail "benchmark binary missing"
 [ -f /opt/blue-onyx-prism/scripts/systemd_common.sh ] || fail "systemd_common.sh missing"
+[ -f /opt/blue-onyx-prism/scripts/train_model.py ] || fail "train_model.py missing"
 [ -f /usr/lib/systemd/system/$UNIT.service ] || fail "unit missing"
 systemctl is-enabled "$UNIT" >/dev/null || fail "unit not enabled"
 

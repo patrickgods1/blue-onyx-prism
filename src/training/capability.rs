@@ -359,10 +359,19 @@ pub struct MeasuredPeak {
     pub peak_mb: f64,
 }
 
-/// The by-hand path, appended to "not available" answers.
-pub const BY_HAND: &str = "you can still train on another machine with scripts/train_model.py \
-    (Python 3.11, packages of scripts/requirements-model-train.txt) and copy the .onnx and .yaml \
-    into the models folder (Add a model by path)";
+/// The by-hand path, appended to "not available" answers. The scripts ship in `scripts/` of the
+/// release archives and installers (the service itself runs the copies embedded in the binary,
+/// [`crate::resources::export::train`]). The command ran as written, on the CPU, down to a checked
+/// ONNX (`--epochs 1 --workers 0` added); `--allow-cpu` is a no-op when PyTorch sees a GPU.
+pub const BY_HAND: &str = "you can still train by hand, on a machine with a GPU or slowly on this \
+    one's CPU, with the scripts folder of the release: `blue-onyx-prism train prepare --out \
+    prepared`, `uv venv --python 3.11 .venv`, `uv pip install -r \
+    scripts/requirements-model-train.txt`, put yolo26n.pt from \
+    https://github.com/ultralytics/assets/releases here (AGPL-3.0, so is the result), then \
+    `.venv/bin/python scripts/train_model.py --trainer ultralytics --family yolo26 --size n \
+    --name my-model --weights yolo26n.pt --data prepared --out-dir models --work train-work \
+    --export-script scripts/export_model.py --allow-cpu` (Windows: .venv\\Scripts\\python.exe) and \
+    add models/my-model.onnx with its .yaml on the Config page (Add a model by path)";
 
 /// A GPU choice as typed (`cuda:1`, ` CUDA:1 `; empty or `auto` = the automatic pick) in its
 /// canonical form (`cuda:N`, `mps`); anything else is an error saying what is accepted.
@@ -708,6 +717,7 @@ mod tests {
             old.reasons
         );
         assert!(old.reasons.iter().any(|r| r.contains("train_model.py")));
+        assert!(old.reasons.iter().any(|r| r.contains("--allow-cpu")));
         let new = capability(
             &HardwareInfo::new("linux", "x86_64", gpu()).with_cuda_driver(13, 0),
             None,
@@ -960,5 +970,47 @@ mod tests {
         assert!(c.summary().contains("Apple MPS"));
         let intel_mac = HardwareInfo::new("macos", "x86_64", vec![]);
         assert!(capability(&intel_mac, None).reasons[0].contains("Intel Macs"));
+    }
+
+    /// `BY_HAND` names these files: every way of installing the program must carry them.
+    #[test]
+    fn the_by_hand_scripts_ship_everywhere() {
+        const FILES: [&str; 4] = [
+            "train_model.py",
+            "export_model.py",
+            "autolabel.py",
+            "requirements-model-train.txt",
+        ];
+        let places = [
+            (
+                "release.yml",
+                include_str!("../../.github/workflows/release.yml"),
+            ),
+            ("Cargo.toml", include_str!("../../Cargo.toml")),
+            (
+                "build-pkg.sh",
+                include_str!("../../packaging/macos/build-pkg.sh"),
+            ),
+            ("main.wxs", include_str!("../../packaging/windows/main.wxs")),
+        ];
+        for (place, text) in places {
+            for f in FILES {
+                assert!(text.contains(f), "{place} does not ship {f}");
+            }
+        }
+        let cargo = include_str!("../../Cargo.toml");
+        for f in FILES {
+            assert!(
+                cargo.contains(&format!(
+                    "\"scripts/{f}\", \"opt/blue-onyx-prism/scripts/\""
+                )),
+                "the deb does not ship {f}"
+            );
+            assert!(
+                cargo.contains(&format!("dest = \"/opt/blue-onyx-prism/scripts/{f}\"")),
+                "the rpm does not ship {f}"
+            );
+            assert!(BY_HAND.contains(f) || f == "autolabel.py", "{f}");
+        }
     }
 }

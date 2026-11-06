@@ -14,6 +14,8 @@ pub struct VisionDetectionRequest {
     pub min_confidence: f32,
     pub image_data: Bytes,
     pub image_name: String,
+    /// Never hand this image to the dataset collector: a Test page upload is no camera's frame.
+    pub no_collect: bool,
 }
 
 /// Prints the image size, not its bytes.
@@ -23,6 +25,7 @@ impl Debug for VisionDetectionRequest {
             .field("min_confidence", &self.min_confidence)
             .field("image_bytes", &self.image_data.len())
             .field("image_name", &self.image_name)
+            .field("no_collect", &self.no_collect)
             .finish()
     }
 }

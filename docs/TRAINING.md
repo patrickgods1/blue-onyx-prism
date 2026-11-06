@@ -23,9 +23,25 @@ of:
 
 Not supported: Intel and AMD GPUs (no pinned PyTorch build), Intel Macs, Linux arm64, CPU-only
 machines. When training is
-not available the page and the CLI say why for every GPU and point at the by-hand path: run
-`scripts/train_model.py` in an environment from `scripts/requirements-model-train.txt` on another
-machine and copy the `.onnx` and `.yaml` into the models folder (Config page, *Add a model by path*).
+not available the page and the CLI say why for every GPU and give the by-hand path. The scripts are
+in the `scripts` folder of the release archives and installers. The service does not read those copies:
+it runs the ones embedded in the binary. On a machine with a GPU, or slowly on this one's CPU:
+
+```sh
+blue-onyx-prism train prepare --out prepared   # the same data options as `train run`
+uv venv --python 3.11 .venv
+uv pip install -r scripts/requirements-model-train.txt
+# yolo26n.pt from https://github.com/ultralytics/assets/releases (AGPL-3.0, so is the result)
+.venv/bin/python scripts/train_model.py --trainer ultralytics --family yolo26 --size n --name my-model \
+  --weights yolo26n.pt --data prepared --out-dir models --work train-work \
+  --export-script scripts/export_model.py --allow-cpu    # Windows: .venv\Scripts\python.exe
+```
+
+Then add `models/my-model.onnx` with its `.yaml` on the Config page (*Add a model by path*).
+`--allow-cpu` lets the run fall back to the CPU and changes nothing when PyTorch sees a GPU. It ran end to
+end, on a small synthetic set: 18 images, 1 epoch at 640 px, ONNX export and its check, 9 s on an Apple
+M-series CPU with `--device cpu`. A real dataset on a CPU takes far longer than that suggests, and the
+pinned environment is a large download. Docker images do not hold these scripts.
 
 Sizes whose estimated memory does not fit the GPU even at batch 1 are shown but cannot be ticked.
 
@@ -1134,7 +1150,8 @@ dataset.
    (`<training dir>/imports/<id>`) are deleted (`--keep-work` keeps them).
 
 Imported frames count against `collect.max_gb` and age out after `collect.max_age_days` like collected
-ones until they are labelled (a frame with a label file is never pruned; auto-labelling writes one).
+ones until they are reviewed (a reviewed frame or one with a human decision is never pruned; a label
+file from auto-labelling alone does not protect a frame, see Disk in `docs/DATASET.md`).
 
 **ffmpeg**: not a separate tool. The PyAV wheels of the environment's lock bundle an FFmpeg build that
 reports LGPL-3.0-or-later (`av._core.library_meta`; it includes the GPL x264/x265 *encoders*, which the

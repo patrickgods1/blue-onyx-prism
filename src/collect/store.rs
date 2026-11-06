@@ -1,13 +1,15 @@
 //! The collector thread's state: bucket selection with per-camera rate limits and sampling,
 //! dHash dedup per camera, the atomic writes of image + sidecar + index line, the size / age
-//! caps (through [`crate::retention::prune_dataset`]) and the disk guard that disables
-//! collection on low free space or a full disk. Single-threaded: only the collector thread
-//! owns a [`Store`], so it is the only writer of the frame files and index files.
+//! caps (through [`crate::retention::prune_dataset`]) and the disk guard that stops collection
+//! on low free space or a full disk and re-arms it once space is back. Single-threaded: only the
+//! collector thread owns a [`Store`], so it is the only writer of the frame files and index files.
 
+use super::health::LastError;
 use super::layout::{self, Summary};
 use super::metrics::{Dropped, METRICS};
 use super::record::{Bucket, IndexLine, RECORD_VERSION};
 use super::{CollectSettings, Frame, Status, dhash};
+use crate::retention::DatasetUsage;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -18,8 +20,20 @@ use tracing::{debug, info, warn};
 pub const DEDUP_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// At most this many recent hashes per camera.
 pub const DEDUP_KEEP: usize = 32;
+/// At most this many near duplicates of one camera are saved in [`DEDUP_SKIP_WINDOW`] because
+/// their bucket skips the dedup ([`Bucket::skips_dedup`]); past it they are dropped as duplicates.
+/// Those buckets have no minimum interval by default, so in a storm of look-alike frames near the
+/// threshold this is what stops them: at most 14,400 frames a day per camera, around 4 GB at
+/// 300 kB a frame, and `max_gb` still applies. Frames that do not look like a recent one are not
+/// limited by it, as before; set a bucket's interval to limit those.
+pub const DEDUP_SKIPS_PER_CAMERA: usize = 10;
+/// See [`DEDUP_SKIPS_PER_CAMERA`].
+pub const DEDUP_SKIP_WINDOW: Duration = Duration::from_secs(60);
 /// Free space is checked at most this often.
 pub const FREE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// A disk stop re-arms on its own once this much more than the stop point
+/// ([`crate::retention::MIN_FREE_MB`]) is free, so collection does not flap around the stop point.
+pub const REARM_MARGIN_MB: u64 = 256;
 /// A size-cap prune after a write runs at most this often.
 pub const PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// An I/O failure is warned about at most this often.
@@ -40,14 +54,23 @@ pub enum Handled {
     Dropped(Dropped),
 }
 
-/// Free-space probe: a warning text when the folder's file system is low.
-pub type FreeProbe = Box<dyn Fn(&Path) -> Option<String> + Send>;
+/// Free-space probe: the bytes available on the folder's file system, None when unknown (no stop
+/// and no re-arm then).
+pub type FreeProbe = Box<dyn Fn(&Path) -> Option<u64> + Send>;
+
+const BYTES_PER_MB: u64 = 1024 * 1024;
+
+/// The free space at which a disk stop re-arms.
+fn rearm_bytes() -> u64 {
+    (crate::retention::MIN_FREE_MB + REARM_MARGIN_MB) * BYTES_PER_MB
+}
 
 /// Why collection is off on its own.
 #[derive(Debug, Clone)]
 struct Disabled {
     reason: String,
-    /// The settings when it happened: a changed `collect` section (or Resume) re-arms.
+    /// The settings when it happened: a changed `collect` section re-arms, like Resume and free
+    /// space coming back ([`Store::poll_rearm`]).
     settings: CollectSettings,
 }
 
@@ -56,10 +79,18 @@ pub struct Store {
     /// Folder the summary describes.
     dir: Option<PathBuf>,
     summary: Summary,
+    /// How the folder divides up; `prunable_bytes` is what the size cap is compared with. A review
+    /// meanwhile makes it too high until the next prune (10 minutes at most), never too low.
+    usage: DatasetUsage,
     /// (camera, bucket) -> when its last frame was saved.
     last: HashMap<(String, Bucket), SystemTime>,
     /// camera -> recent (time, dHash) of saved frames.
     recent: HashMap<String, VecDeque<(SystemTime, u64)>>,
+    /// camera -> when near duplicates were saved for a bucket that skips the dedup.
+    skips: HashMap<String, VecDeque<SystemTime>>,
+    /// When this process last saved a frame.
+    last_saved: Option<SystemTime>,
+    last_error: Option<LastError>,
     disabled: Option<Disabled>,
     free_checked: Option<Instant>,
     last_prune: Option<Instant>,
@@ -107,12 +138,11 @@ pub fn is_disk_full(e: &std::io::Error) -> bool {
 
 impl Store {
     pub fn new(shared: Arc<Mutex<Status>>) -> Self {
-        Self::with_probe(
-            shared,
-            Box::new(|d: &Path| {
-                crate::retention::free_space_warning(d, crate::retention::MIN_FREE_MB)
-            }),
-        )
+        // Tests that reach the process-wide collector must not depend on this machine's disk.
+        #[cfg(test)]
+        return Self::with_probe(shared, Box::new(|_| None));
+        #[cfg(not(test))]
+        Self::with_probe(shared, Box::new(|d: &Path| crate::retention::free_bytes(d)))
     }
 
     pub fn with_probe(shared: Arc<Mutex<Status>>, free_probe: FreeProbe) -> Self {
@@ -120,8 +150,12 @@ impl Store {
             shared,
             dir: None,
             summary: Summary::default(),
+            usage: DatasetUsage::default(),
             last: HashMap::new(),
             recent: HashMap::new(),
+            skips: HashMap::new(),
+            last_saved: None,
+            last_error: None,
             disabled: None,
             free_checked: None,
             last_prune: None,
@@ -137,7 +171,13 @@ impl Store {
         if self.dir.as_deref() == Some(dir) {
             return;
         }
+        self.adopt(dir, crate::retention::dataset_usage(dir));
+    }
+
+    /// `dir` is the folder in use, of `usage`: scan its summary and publish.
+    fn adopt(&mut self, dir: &Path, usage: DatasetUsage) {
         self.summary = Summary::scan(dir);
+        self.usage = usage;
         self.dir = Some(dir.to_path_buf());
         self.publish();
     }
@@ -156,15 +196,33 @@ impl Store {
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         s.dir = self.dir.clone();
         s.summary = self.summary.clone();
+        s.usage = self.usage;
         s.disabled = self.disabled.as_ref().map(|d| d.reason.clone());
+        s.last_saved_at = self.last_saved.map(super::utc_rfc3339);
+        s.last_error = self.last_error.clone();
+    }
+
+    /// Remember `message` as the last error, for the Dataset page, and warn (throttled).
+    pub fn note_error(&mut self, message: &str) {
+        self.warn_throttled(message);
+        self.last_error = Some(LastError {
+            message: message.to_string(),
+            at: super::utc_rfc3339(SystemTime::now()),
+        });
+        self.publish();
     }
 
     fn disable(&mut self, reason: String, settings: &CollectSettings) {
         warn!(
             dir = %settings.dir.display(),
-            "dataset collection disabled: {reason}; free some space (or lower collect.max_gb), \
-             then press Resume on the Dataset page or change the collect settings"
+            "dataset collection stopped: {reason}; it starts again on its own once {} MB is free \
+             (free some space or lower collect.max_gb)",
+            rearm_bytes() / BYTES_PER_MB
         );
+        self.last_error = Some(LastError {
+            message: format!("collection stopped: {reason}"),
+            at: super::utc_rfc3339(SystemTime::now()),
+        });
         self.disabled = Some(Disabled {
             reason,
             settings: settings.clone(),
@@ -177,6 +235,28 @@ impl Store {
         if self.disabled.take().is_some() {
             info!("dataset collection resumed");
             self.free_checked = None;
+            self.publish();
+        }
+    }
+
+    /// Re-arm a disk stop when free space is back: above the stop point by [`REARM_MARGIN_MB`],
+    /// checked at most every [`FREE_CHECK_INTERVAL`]. The collector thread calls it between
+    /// messages too, so it happens with no frame arriving. A disk whose free space is unknown stays
+    /// stopped until Resume or a settings change.
+    pub fn poll_rearm(&mut self) {
+        let Some(d) = &self.disabled else { return };
+        let now = Instant::now();
+        if self
+            .free_checked
+            .is_some_and(|t| now.saturating_duration_since(t) < FREE_CHECK_INTERVAL)
+        {
+            return;
+        }
+        let free = (self.free_probe)(&d.settings.dir);
+        self.free_checked = Some(now);
+        if free.is_some_and(|f| f >= rearm_bytes()) {
+            info!("dataset collection resumed: free space is back");
+            self.disabled = None;
             self.publish();
         }
     }
@@ -212,6 +292,7 @@ impl Store {
             self.free_checked = None;
         }
         self.use_dir(&settings.dir);
+        self.poll_rearm();
         let at = record.at;
         let matched: Vec<Bucket> =
             super::record::decide(&record.record, settings.buckets.near_margin())
@@ -219,6 +300,7 @@ impl Store {
                 .filter(|b| settings.buckets.get(*b).enabled)
                 .collect();
         if matched.is_empty() {
+            METRICS.record_no_bucket();
             return Handled::NoBucket;
         }
         if self.disabled.is_some() {
@@ -248,7 +330,10 @@ impl Store {
         let hash = match dhash::of_encoded(&image) {
             Ok((h, _, _)) => h,
             Err(e) => {
-                self.warn_throttled(&format!("could not decode a frame for its dHash: {e:#}"));
+                self.note_error(&format!(
+                    "could not read a frame Blue Iris sent, so it was not saved: {e:#}; the image \
+                     may be damaged or in a format the service cannot decode"
+                ));
                 METRICS.record_drop(Dropped::Error);
                 return Handled::Dropped(Dropped::Error);
             }
@@ -258,12 +343,19 @@ impl Store {
             at.duration_since(*t)
                 .map_or(true, |since| since <= DEDUP_WINDOW)
         });
-        if recent
+        let near_duplicate = recent
             .iter()
-            .any(|(_, h)| dhash::hamming(*h, hash) <= settings.dedup_hamming)
-        {
-            METRICS.record_drop(Dropped::Dup);
-            return Handled::Dropped(Dropped::Dup);
+            .any(|(_, h)| dhash::hamming(*h, hash) <= settings.dedup_hamming);
+        if near_duplicate {
+            let skips = self.skips.entry(camera.clone()).or_default();
+            skips.retain(|t| {
+                at.duration_since(*t)
+                    .map_or(true, |since| since < DEDUP_SKIP_WINDOW)
+            });
+            if !passing.iter().any(|b| b.skips_dedup()) || skips.len() >= DEDUP_SKIPS_PER_CAMERA {
+                METRICS.record_drop(Dropped::Dup);
+                return Handled::Dropped(Dropped::Dup);
+            }
         }
         if let Some(reason) = self.check_free(&settings) {
             self.disable(reason, &settings);
@@ -282,8 +374,9 @@ impl Store {
                 return Handled::Dropped(Dropped::Disk);
             }
             Err(e) => {
-                self.warn_throttled(&format!(
-                    "could not save a frame under {}: {e}; check that the folder is writable",
+                self.note_error(&format!(
+                    "could not save a frame under {}: {e}; check that the folder exists and that \
+                     the service's account can write to it",
                     settings.dir.display()
                 ));
                 METRICS.record_drop(Dropped::Error);
@@ -293,13 +386,19 @@ impl Store {
         for b in &passing {
             self.last.insert((camera.clone(), *b), at);
         }
-        let recent = self.recent.entry(camera).or_default();
-        recent.push_back((at, hash));
-        while recent.len() > DEDUP_KEEP {
-            recent.pop_front();
+        if near_duplicate {
+            // Its look-alike stays the one remembered, so the skip does not extend the window.
+            self.skips.entry(camera).or_default().push_back(at);
+        } else {
+            let recent = self.recent.entry(camera).or_default();
+            recent.push_back((at, hash));
+            while recent.len() > DEDUP_KEEP {
+                recent.pop_front();
+            }
         }
+        self.last_saved = Some(at);
         METRICS.record_frame(&passing);
-        if self.summary.bytes > settings.max_bytes {
+        if self.usage.prunable_bytes > settings.max_bytes {
             let due = self
                 .last_prune
                 .is_none_or(|t| t.elapsed() >= PRUNE_MIN_INTERVAL);
@@ -324,7 +423,8 @@ impl Store {
             return None;
         }
         self.free_checked = Some(now);
-        (self.free_probe)(&settings.dir)
+        let free = (self.free_probe)(&settings.dir)?;
+        crate::retention::low_space_message(&settings.dir, free, crate::retention::MIN_FREE_MB)
     }
 
     /// Image, sidecar, index line: each atomic; the sidecar after the image, so a sidecar
@@ -379,6 +479,7 @@ impl Store {
         let text = serde_json::to_string(&line).map_err(std::io::Error::other)?;
         layout::append_line(&day.join(layout::INDEX_FILE), &text)?;
         self.summary.add(&line, &date);
+        self.usage.prunable_bytes = self.usage.prunable_bytes.saturating_add(total);
         Ok(rel.jpg())
     }
 
@@ -390,14 +491,19 @@ impl Store {
             settings.max_age_days,
             settings.max_bytes,
         ) {
-            Ok(r) if r.deleted > 0 || r.failed > 0 => {
-                self.dir = None;
-                self.use_dir(&settings.dir);
+            Ok(r)
+                if r.deleted > 0 || r.failed > 0 || self.dir.as_deref() != Some(&settings.dir) =>
+            {
+                self.adopt(&settings.dir, r.usage);
             }
-            Ok(_) => {
-                self.use_dir(&settings.dir);
+            Ok(r) => {
+                self.usage = r.usage;
+                self.publish();
             }
-            Err(e) => self.warn_throttled(&format!("retention: {e:#}")),
+            Err(e) => self.note_error(&format!(
+                "could not apply the size and age caps to {}: {e:#}",
+                settings.dir.display()
+            )),
         }
     }
 }
@@ -409,6 +515,22 @@ mod tests {
     use crate::collect::record::{Det, Record};
     use crate::collect::{CollectConfig, Draft};
     use crate::image::RgbImage;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const MB: u64 = 1024 * 1024;
+    /// Free space under the stop point, between it and the re-arm point, and above that.
+    const LOW: u64 = 100 * MB;
+    const BETWEEN: u64 = (crate::retention::MIN_FREE_MB + 100) * MB;
+    const PLENTY: u64 = (crate::retention::MIN_FREE_MB + REARM_MARGIN_MB) * MB;
+
+    /// A store whose free-space probe answers `free`.
+    fn probed_store(free: &Arc<AtomicU64>, shared: &Arc<Mutex<Status>>) -> Store {
+        let free = free.clone();
+        Store::with_probe(
+            shared.clone(),
+            Box::new(move |_| Some(free.load(Ordering::Relaxed))),
+        )
+    }
 
     pub(crate) struct Tmp(pub PathBuf);
     impl Tmp {
@@ -622,28 +744,25 @@ mod tests {
     fn low_disk_disables_until_resumed_or_reconfigured() {
         let tmp = Tmp::new();
         let s = settings(&tmp.0, |c| c.buckets.positive.per_camera_min_interval_s = 0);
-        let low = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let probe_low = low.clone();
+        let free = Arc::new(AtomicU64::new(LOW));
         let shared = Arc::new(Mutex::new(Status::default()));
-        let mut st = Store::with_probe(
-            shared.clone(),
-            Box::new(move |_| {
-                probe_low
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .then(|| "low disk space".to_string())
-            }),
-        );
+        let mut st = probed_store(&free, &shared);
         assert_eq!(
             st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
             Handled::Dropped(Dropped::Disk)
         );
-        assert_eq!(
-            shared.lock().unwrap().disabled.as_deref(),
-            Some("low disk space")
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .disabled
+                .as_deref()
+                .unwrap()
+                .contains("low disk space")
         );
         assert!(METRICS.dropped(Dropped::Disk) >= 1);
         // Stays off while nothing changes, without probing again.
-        low.store(false, std::sync::atomic::Ordering::Relaxed);
+        free.store(PLENTY, Ordering::Relaxed);
         assert_eq!(
             st.handle(frame(&s, positive("a", "r2", t(1)), 2)),
             Handled::Dropped(Dropped::Disk)
@@ -685,6 +804,301 @@ mod tests {
             Handled::Dropped(Dropped::Error)
         );
         assert!(shared.lock().unwrap().disabled.is_none());
+    }
+
+    #[test]
+    fn a_disk_stop_rearms_on_its_own_once_space_is_back() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |c| c.buckets.positive.per_camera_min_interval_s = 0);
+        let free = Arc::new(AtomicU64::new(LOW));
+        let shared = Arc::new(Mutex::new(Status::default()));
+        let mut st = probed_store(&free, &shared);
+        st.handle(frame(&s, positive("a", "r1", t(0)), 1));
+        let reason = shared.lock().unwrap().disabled.clone().unwrap();
+        assert!(reason.contains("low disk space"), "{reason}");
+        let err = shared.lock().unwrap().last_error.clone().unwrap();
+        assert!(err.message.contains(&reason), "{}", err.message);
+        // Within the check interval nothing is probed, even with space back.
+        free.store(PLENTY, Ordering::Relaxed);
+        st.poll_rearm();
+        assert!(shared.lock().unwrap().disabled.is_some());
+        // Above the stop point but inside the margin: still stopped.
+        free.store(BETWEEN, Ordering::Relaxed);
+        st.free_checked = None;
+        st.poll_rearm();
+        assert!(shared.lock().unwrap().disabled.is_some());
+        // Past the margin, with no frame arriving: back on, and the next frame is saved.
+        free.store(PLENTY, Ordering::Relaxed);
+        st.free_checked = None;
+        st.poll_rearm();
+        assert!(shared.lock().unwrap().disabled.is_none());
+        assert!(matches!(
+            st.handle(frame(&s, positive("a", "r2", t(1)), 2)),
+            Handled::Saved { .. }
+        ));
+        // A frame triggers the check too.
+        free.store(LOW, Ordering::Relaxed);
+        st.free_checked = None;
+        assert_eq!(
+            st.handle(frame(&s, positive("a", "r3", t(2)), 3)),
+            Handled::Dropped(Dropped::Disk)
+        );
+        free.store(PLENTY, Ordering::Relaxed);
+        st.free_checked = None;
+        assert!(matches!(
+            st.handle(frame(&s, positive("a", "r4", t(3)), 4)),
+            Handled::Saved { .. }
+        ));
+    }
+
+    #[test]
+    fn free_space_inside_the_margin_does_not_stop_a_running_collector() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let free = Arc::new(AtomicU64::new(BETWEEN));
+        let mut st = probed_store(&free, &Arc::new(Mutex::new(Status::default())));
+        assert!(matches!(
+            st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
+            Handled::Saved { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_free_space_never_rearms() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let shared = Arc::new(Mutex::new(Status::default()));
+        let mut st = Store::with_probe(shared.clone(), Box::new(|_| None));
+        st.fail_writes = Some(std::io::ErrorKind::StorageFull);
+        st.handle(frame(&s, positive("a", "r1", t(0)), 1));
+        assert!(shared.lock().unwrap().disabled.is_some());
+        st.free_checked = None;
+        st.poll_rearm();
+        assert!(shared.lock().unwrap().disabled.is_some());
+    }
+
+    /// A frame near the threshold (a box scoring 0.45 under the default 0.5, margin 0.1).
+    fn near(camera: &str, rid: &str, at: SystemTime) -> Draft {
+        let mut d = base(camera, rid, at);
+        d.record.threshold = 0.5;
+        d.record.below_threshold = vec![Det {
+            label: "person".into(),
+            score: 0.45,
+            bbox: [1.0, 1.0, 10.0, 20.0],
+        }];
+        d.record.raw = d.record.below_threshold.clone();
+        d
+    }
+
+    #[test]
+    fn frames_a_reviewer_wants_skip_the_dedup_and_positive_and_empty_keep_it() {
+        let tmp = Tmp::new();
+        // Near-threshold only, so the row of look-alikes below tests that bucket alone.
+        let s = settings(&tmp.0, |c| {
+            c.buckets.positive.per_camera_min_interval_s = 0;
+            c.buckets.empty.per_camera_min_interval_s = 0;
+        });
+        let mut st = store();
+        assert!(matches!(
+            st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
+            Handled::Saved { .. }
+        ));
+        // The same picture: dropped as a plain positive, or as empty ...
+        assert_eq!(
+            st.handle(frame(&s, positive("a", "r2", t(1)), 1)),
+            Handled::Dropped(Dropped::Dup)
+        );
+        assert_eq!(
+            st.handle(frame(&s, base("a", "r3", t(2)), 1)),
+            Handled::Dropped(Dropped::Dup)
+        );
+        // ... saved near the threshold, and with a removed box, a verifier verdict or a
+        // disagreement.
+        let out = st.handle(frame(&s, near("a", "r4", t(3)), 1));
+        let Handled::Saved { buckets, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(buckets, vec![Bucket::NearThreshold]);
+        let mut d = positive("a", "r5", t(4));
+        d.record.suppressed = vec![crate::collect::record::Suppressed {
+            label: "person".into(),
+            score: 0.9,
+            bbox: [1.0, 1.0, 10.0, 20.0],
+            reason: "aspect".into(),
+        }];
+        let out = st.handle(frame(&s, d, 1));
+        let Handled::Saved { buckets, .. } = out else {
+            panic!("{out:?}")
+        };
+        // It is also a positive frame: it keeps every bucket it was kept for.
+        assert_eq!(buckets, vec![Bucket::Positive, Bucket::Suppressed]);
+        for (rid, outcome, want) in [
+            ("r6", "rejected", Bucket::VerifyRejected),
+            ("r7", "kept", Bucket::VerifyKept),
+        ] {
+            let mut d = base("a", rid, t(5));
+            d.record.raw = vec![Det {
+                label: "person".into(),
+                score: 0.9,
+                bbox: [1.0, 1.0, 10.0, 20.0],
+            }];
+            d.record.verify = Some(crate::collect::record::VerifyInfo {
+                candidates: vec![crate::collect::record::VerifyCandidate {
+                    label: "person".into(),
+                    score: 0.9,
+                    bbox: [1.0, 1.0, 10.0, 20.0],
+                    outcome: outcome.into(),
+                }],
+                ..Default::default()
+            });
+            let out = st.handle(frame(&s, d, 1));
+            let Handled::Saved { buckets, .. } = out else {
+                panic!("{out:?}")
+            };
+            assert!(buckets.contains(&want), "{buckets:?}");
+        }
+    }
+
+    #[test]
+    fn a_storm_of_look_alikes_is_capped_per_camera_even_at_interval_zero() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        assert_eq!(s.buckets.near_threshold.per_camera_min_interval_s, 0);
+        let mut st = store();
+        // The look-alike of the storm, saved as an ordinary positive first.
+        assert!(matches!(
+            st.handle(frame(&s, positive("a", "first", t(0)), 1)),
+            Handled::Saved { .. }
+        ));
+        let storm = |st: &mut Store, camera: &str, from: u64| {
+            (0..100u64)
+                .filter(|i| {
+                    let rid = format!("r{from}x{i}");
+                    // Five frames a second.
+                    let at = t(from) + Duration::from_millis(200 * i + 1);
+                    matches!(
+                        st.handle(frame(&s, near(camera, &rid, at), 1)),
+                        Handled::Saved { .. }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(storm(&mut st, "a", 1), DEDUP_SKIPS_PER_CAMERA);
+        // Another camera has its own allowance (its first frame is no duplicate of anything).
+        assert_eq!(storm(&mut st, "b", 1), DEDUP_SKIPS_PER_CAMERA + 1);
+        // A frame that looks different is no skip and is still saved.
+        assert!(matches!(
+            st.handle(frame(&s, near("a", "other", t(30)), 7)),
+            Handled::Saved { .. }
+        ));
+        // A new window, a new allowance.
+        assert_eq!(storm(&mut st, "a", 90), DEDUP_SKIPS_PER_CAMERA);
+    }
+
+    #[test]
+    fn write_failures_reach_the_status_with_their_time() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let shared = Arc::new(Mutex::new(Status::default()));
+        let mut st = Store::with_probe(shared.clone(), Box::new(|_| None));
+        st.fail_writes = Some(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
+            Handled::Dropped(Dropped::Error)
+        );
+        let e = shared.lock().unwrap().last_error.clone().unwrap();
+        assert!(
+            e.message.contains("could not save a frame under"),
+            "{}",
+            e.message
+        );
+        assert!(e.at.ends_with('Z'), "{}", e.at);
+        assert_eq!(shared.lock().unwrap().last_saved_at, None);
+        // A later success leaves the error on show and adds the frame's time.
+        st.fail_writes = None;
+        assert!(matches!(
+            st.handle(frame(&s, positive("a", "r2", t(1)), 2)),
+            Handled::Saved { .. }
+        ));
+        let now = shared.lock().unwrap().clone();
+        assert!(now.last_error.is_some());
+        assert_eq!(now.last_saved_at, Some(crate::collect::utc_rfc3339(t(1))));
+    }
+
+    #[test]
+    fn a_frame_no_bucket_wants_is_counted_and_an_undecodable_one_is_an_error() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |c| c.buckets.positive.enabled = false);
+        let shared = Arc::new(Mutex::new(Status::default()));
+        let mut st = Store::with_probe(shared.clone(), Box::new(|_| None));
+        let before = METRICS.no_bucket();
+        assert_eq!(
+            st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
+            Handled::NoBucket
+        );
+        assert!(METRICS.no_bucket() > before);
+        let on = settings(&tmp.0, |_| {});
+        assert_eq!(
+            st.handle(Frame {
+                settings: on,
+                image: bytes::Bytes::from_static(b"not an image"),
+                record: positive("a", "r2", t(1)),
+            }),
+            Handled::Dropped(Dropped::Error)
+        );
+        let e = shared.lock().unwrap().last_error.clone().unwrap();
+        assert!(
+            e.message.contains("could not read a frame"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn the_size_check_ignores_protected_frames_and_prunes_only_when_over() {
+        use crate::collect::labels::{self, LabelFile, Status as Reviewed};
+        let tmp = Tmp::new();
+        let mut st = store();
+        let s = settings(&tmp.0, |c| {
+            c.buckets.positive.per_camera_min_interval_s = 0;
+            c.max_gb = 1.0;
+        });
+        let out = st.handle(frame(&s, positive("a", "r1", t(0)), 1));
+        let Handled::Saved { rel, .. } = out else {
+            panic!("{out:?}")
+        };
+        let bytes = st.summary.bytes;
+        assert_eq!(st.usage.prunable_bytes, bytes);
+        let jpg = layout::resolve(&tmp.0, &rel, "jpg").unwrap();
+        labels::write(
+            &labels::path_of_frame(&jpg),
+            &LabelFile {
+                status: Reviewed::Reviewed,
+                ..LabelFile::default()
+            },
+        )
+        .unwrap();
+        // A review moves the frame out of the figure at the next prune.
+        st.prune(&s);
+        assert_eq!(st.usage.prunable_bytes, 0);
+        assert_eq!(st.usage.protected_bytes, bytes);
+        assert_eq!(st.usage.protected_frames, 1);
+        // A cap below the protected data: with nothing prunable, no prune is due after a write,
+        // although the whole folder is over the cap.
+        let tiny = settings(&tmp.0, |c| {
+            c.buckets.positive.per_camera_min_interval_s = 0;
+            c.buckets.positive.rate = 1.0;
+            c.max_gb = 1.0;
+        });
+        st.last_prune = None;
+        st.handle(frame(&tiny, positive("b", "r2", t(1)), 2));
+        assert!(st.last_prune.is_none(), "no prune below the cap");
+        assert!(st.summary.bytes > st.usage.prunable_bytes);
+        // A store that starts on the folder knows the split at once.
+        let mut fresh = store();
+        fresh.use_dir(&tmp.0);
+        assert_eq!(fresh.usage.protected_bytes, bytes);
+        assert_eq!(fresh.usage.prunable_bytes + bytes, fresh.summary.bytes);
     }
 
     #[test]

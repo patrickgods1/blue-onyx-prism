@@ -12,7 +12,9 @@
   <div><span class="k">OpenVINO devices</span> <span class="v">{{ devices }}</span></div>
   <div><span class="k">GPUs</span> <span class="v">{% if gpus.is_empty() %}none detected{% else %}{% for g in gpus %}{% if !loop.first %}; {% endif %}{{ g }}{% endfor %}{% endif %}</span></div>
   <div><span class="k">Uptime</span> <span class="v">{{ uptime }}</span></div>
+  <div><span class="k">Dataset</span> <span class="v">{{ dataset_line }} (<a href="/dataset">Dataset</a>)</span></div>
 </section>
+{% if let Some(d) = dataset_stopped %}<p class="error">Dataset collection stopped: {{ d }}. It starts again by itself once space is free; see the <a href="/dataset">Dataset</a> page.</p>{% endif %}
 {% if let Some(n) = force_cpu_note %}<p class="warn">{{ n }} <a href="/config#inference">Change</a></p>{% endif %}
 {% if let Some(n) = openvino_note %}<p class="warn">{{ n }}</p>{% endif %}
 {% include "revert.html" %}

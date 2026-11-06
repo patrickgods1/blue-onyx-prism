@@ -22,7 +22,8 @@ pub(super) struct Job {
 
 impl Job {
     /// The job of a request this worker answers (collection on, not a verifier check, the
-    /// upload's bytes kept); None otherwise.
+    /// upload's bytes kept: intake leaves them out for a `no_collect` request, a Test page upload);
+    /// None otherwise.
     pub(super) fn start(meta: &Meta, input: &DraftInput<'_>) -> Option<Self> {
         let settings = &meta.live.collect;
         if !settings.enabled || meta.verify_crop {

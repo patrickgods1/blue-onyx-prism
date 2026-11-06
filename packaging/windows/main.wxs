@@ -138,6 +138,19 @@
       <Component Id="ReadmeComponent" Bitness="always64">
         <File Id="ReadmeFile" Source="$(var.RepoRoot)\README.md" KeyPath="yes" />
       </Component>
+      <!-- By-hand training where the service cannot train (capability::BY_HAND in src/training). -->
+      <Component Id="TrainScriptComponent" Subdirectory="scripts" Bitness="always64">
+        <File Id="TrainScriptFile" Source="$(var.RepoRoot)\scripts\train_model.py" KeyPath="yes" />
+      </Component>
+      <Component Id="ExportScriptComponent" Subdirectory="scripts" Bitness="always64">
+        <File Id="ExportScriptFile" Source="$(var.RepoRoot)\scripts\export_model.py" KeyPath="yes" />
+      </Component>
+      <Component Id="AutolabelScriptComponent" Subdirectory="scripts" Bitness="always64">
+        <File Id="AutolabelScriptFile" Source="$(var.RepoRoot)\scripts\autolabel.py" KeyPath="yes" />
+      </Component>
+      <Component Id="TrainRequirementsComponent" Subdirectory="scripts" Bitness="always64">
+        <File Id="TrainRequirementsFile" Source="$(var.RepoRoot)\scripts\requirements-model-train.txt" KeyPath="yes" />
+      </Component>
 
       <!-- Marks the service as owned by this MSI (see the launch condition above). -->
       <Component Id="InstallMarkerComponent" Bitness="always64">
