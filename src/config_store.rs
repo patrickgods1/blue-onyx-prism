@@ -525,6 +525,14 @@ impl ConfigStore {
         // Always hash here (rare, and about to overwrite the file): the stat-only shortcut of
         // the poll can miss an external edit, which this write would then destroy.
         self.sync_disk(&mut w, true);
+        // A file a later version wrote is refused on load and by the disk check; a save must not
+        // write this version's format over it either (a broken file of this format it does replace).
+        if let Some(found) = crate::config::later_format_on_disk(&self.path) {
+            return Err(crate::config::newer_format_error(found).context(format!(
+                "the config file {} was not saved",
+                self.path.display()
+            )));
+        }
         let cur = self.current.load_full();
         let before = cur.config.clone();
         let mut new = before.clone();
@@ -804,6 +812,34 @@ mod tests {
         assert_eq!((on_disk.port, on_disk.nms_iou), (4000, 0.45));
         let sources: Vec<String> = s.changes(10).into_iter().map(|c| c.source).collect();
         assert_eq!(sources, ["first", "second"]);
+    }
+
+    /// A file a later version wrote (a higher `format`) is never overwritten by a save of this one.
+    #[test]
+    fn a_save_never_writes_over_a_config_of_a_later_format() {
+        let path = tmp();
+        let s = Arc::new(ConfigStore::new(cfg(), path.clone()));
+        s.update("test", |_| Ok(())).unwrap();
+        // A later version wrote the file while this one runs.
+        let later =
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .replacen("\"format\": 1", "\"format\": 9", 1);
+        assert!(later.contains("\"format\": 9"), "{later}");
+        std::fs::write(&path, &later).unwrap();
+        let err = s
+            .update("config page", |c| {
+                c.port = 4322;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("later version"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            later,
+            "left as it is"
+        );
+        assert_ne!(s.read().port, 4322, "not applied either");
     }
 
     /// The external-edit check still runs under the writer lock before every save: an edit on

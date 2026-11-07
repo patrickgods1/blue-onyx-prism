@@ -3,6 +3,16 @@
 //! Sends an image to `/v1/vision/detection` or `/v1/vision/custom/{model}` (optionally many
 //! times, optionally in parallel), prints the response or a latency summary and exits non-zero
 //! if any request failed.
+//!
+//! Two load modes:
+//! - closed loop (`--repeat N --parallel P`): at most P requests in flight, each next one sent
+//!   when one finishes. Its latency is measured from the actual send, so a slow server also
+//!   slows the client down and hides the queueing a camera system would see (coordinated
+//!   omission). Good for "how fast is one request".
+//! - open loop (`--rate R --duration S`): request i is due at `i / R` seconds and starts then,
+//!   whatever is still in flight, as cameras do. Latency is measured from the scheduled start, so
+//!   a server that falls behind shows it. Reports p50/p95/p99/max, errors, 503s (overload), and
+//!   the server's resident memory read from its metrics every second (start, peak, end).
 
 #![cfg_attr(
     not(test),
@@ -26,6 +36,7 @@ use blue_onyx_prism::api::{Prediction, VisionDetectionResponse};
 use clap::Parser;
 use futures_util::StreamExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 static DEFAULT_IMAGE: &[u8] = include_bytes!("../../tests/data/dog_bike_car.jpg");
@@ -64,6 +75,312 @@ struct Args {
     /// Save an annotated copy of the image (from the last response) to this path.
     #[arg(long)]
     save: Option<PathBuf>,
+    /// Open loop: start this many requests per second on schedule, whatever is in flight
+    /// (latency from the scheduled start). Needs --duration.
+    #[arg(
+        long,
+        requires = "duration",
+        conflicts_with_all = ["repeat", "parallel", "interval_ms", "list", "save"]
+    )]
+    rate: Option<f64>,
+    /// Open loop: seconds to keep sending (with --rate).
+    #[arg(long, requires = "rate")]
+    duration: Option<f64>,
+    /// Open loop: metrics path sampled every second for the server's resident memory.
+    #[arg(long, default_value = "/prometheus")]
+    metrics_path: String,
+}
+
+/// When each open-loop request is due: `i / rate` seconds for every `i` with `i / rate <
+/// duration`. Errors for a rate or duration that is not a positive finite number, or a run of
+/// more than [`MAX_OPEN_LOOP_REQUESTS`] requests.
+fn schedule(rate: f64, duration: f64) -> Result<Vec<Duration>> {
+    if !(rate.is_finite() && rate > 0.0) {
+        bail!("--rate must be a positive number of requests per second, not {rate}");
+    }
+    if !(duration.is_finite() && duration > 0.0) {
+        bail!("--duration must be a positive number of seconds, not {duration}");
+    }
+    let n = (rate * duration).ceil();
+    if n > MAX_OPEN_LOOP_REQUESTS as f64 {
+        bail!(
+            "--rate {rate} x --duration {duration} is {n} requests, more than the \
+             {MAX_OPEN_LOOP_REQUESTS} this client keeps in memory; shorten the run"
+        );
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "n is a positive whole number at most MAX_OPEN_LOOP_REQUESTS"
+    )]
+    let n = n as usize;
+    Ok((0..n)
+        .map(|i| Duration::from_secs_f64(i as f64 / rate))
+        .filter(|at| at.as_secs_f64() < duration)
+        .collect())
+}
+
+/// Largest open-loop run (requests).
+const MAX_OPEN_LOOP_REQUESTS: usize = 1_000_000;
+
+/// Nearest-rank percentile `p` (0..=100) of ascending `sorted`; NaN when empty.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let n = sorted.len();
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to 1..=n before the cast"
+    )]
+    let rank = ((p / 100.0) * n as f64).ceil().clamp(1.0, n as f64) as usize;
+    sorted.get(rank - 1).copied().unwrap_or(f64::NAN)
+}
+
+/// `<prefix>process_resident_memory_bytes <n>` of a Prometheus text.
+fn parse_rss(metrics: &str) -> Option<u64> {
+    metrics.lines().find_map(|l| {
+        let (name, value) = l.split_once(' ')?;
+        name.ends_with("process_resident_memory_bytes")
+            .then(|| value.trim().parse::<f64>().ok())
+            .flatten()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a non-negative byte count"
+                )]
+                let b = v as u64;
+                b
+            })
+    })
+}
+
+/// How one open-loop request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    Ok,
+    /// HTTP 503: the server's in-flight cap or a model queue (overload).
+    Overloaded,
+    /// Any other HTTP error, `success: false`, or bad JSON.
+    Failed,
+    /// No HTTP answer (connect, timeout, reset).
+    Transport,
+}
+
+struct OpenOutcome {
+    ended: Ended,
+    /// From the scheduled start to the end of the answer.
+    from_schedule_ms: f64,
+    /// From the actual send to the end of the answer.
+    from_send_ms: f64,
+    /// How late the request was sent (client lag).
+    send_lag_ms: f64,
+    note: String,
+}
+
+async fn send_scheduled(
+    client: reqwest::Client,
+    url: String,
+    image: Arc<Vec<u8>>,
+    min_confidence: f32,
+    due: tokio::time::Instant,
+) -> OpenOutcome {
+    tokio::time::sleep_until(due).await;
+    let sent = tokio::time::Instant::now();
+    let part = reqwest::multipart::Part::bytes(image.as_ref().clone()).file_name("image.jpg");
+    let mut form = reqwest::multipart::Form::new().part("image", part);
+    if min_confidence > 0.0 {
+        form = form.text("min_confidence", min_confidence.to_string());
+    }
+    let result = async {
+        let resp = client.post(&url).multipart(form).send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    }
+    .await;
+    let done = tokio::time::Instant::now();
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let (ended, note) = match result {
+        Err(e) => (Ended::Transport, format!("request failed: {e}")),
+        Ok((status, _)) if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+            (Ended::Overloaded, "HTTP 503".to_string())
+        }
+        Ok((status, body)) if !status.is_success() => {
+            (Ended::Failed, format!("HTTP {status}: {body}"))
+        }
+        Ok((_, body)) => match serde_json::from_str::<VisionDetectionResponse>(&body) {
+            Ok(r) if r.success => (Ended::Ok, String::new()),
+            Ok(r) => (
+                Ended::Failed,
+                format!("success=false: {}", r.error.unwrap_or(r.message)),
+            ),
+            Err(e) => (Ended::Failed, format!("invalid JSON ({e}): {body}")),
+        },
+    };
+    OpenOutcome {
+        ended,
+        from_schedule_ms: ms(done.saturating_duration_since(due)),
+        from_send_ms: ms(done.saturating_duration_since(sent)),
+        send_lag_ms: ms(sent.saturating_duration_since(due)),
+        note,
+    }
+}
+
+/// Server RSS samples (seconds since start, bytes) until `stop`, one a second.
+async fn sample_rss(
+    client: reqwest::Client,
+    url: String,
+    start: tokio::time::Instant,
+    stop: tokio_util::sync::CancellationToken,
+) -> Vec<(f64, u64)> {
+    let mut out = Vec::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+        if let Ok(r) = client.get(&url).send().await
+            && let Ok(text) = r.text().await
+            && let Some(b) = parse_rss(&text)
+        {
+            out.push((start.elapsed().as_secs_f64(), b));
+        }
+    }
+    out
+}
+
+fn latency_line(label: &str, mut v: Vec<f64>) {
+    if v.is_empty() {
+        println!("  {label:<26} (none)");
+        return;
+    }
+    v.sort_by(f64::total_cmp);
+    println!(
+        "  {label:<26} p50 {:>8.1}  p95 {:>8.1}  p99 {:>8.1}  max {:>8.1}",
+        percentile(&v, 50.0),
+        percentile(&v, 95.0),
+        percentile(&v, 99.0),
+        v.last().copied().unwrap_or(f64::NAN)
+    );
+}
+
+fn mb(b: u64) -> f64 {
+    b as f64 / (1024.0 * 1024.0)
+}
+
+/// `--rate R --duration S`: the open-loop run. Ok(true) when every request succeeded.
+async fn run_open_loop(
+    args: &Args,
+    client: &reqwest::Client,
+    base: &str,
+    url: &str,
+    image: Vec<u8>,
+    rate: f64,
+    duration: f64,
+) -> Result<bool> {
+    let due = schedule(rate, duration)?;
+    let image = Arc::new(image);
+    // A little ahead, so the first request is not late because tasks were still being made.
+    let start = tokio::time::Instant::now() + Duration::from_millis(200);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let sampler = tokio::spawn(sample_rss(
+        client.clone(),
+        format!("{base}{}", args.metrics_path),
+        start,
+        stop.clone(),
+    ));
+    let tasks: Vec<_> = due
+        .iter()
+        .map(|at| {
+            tokio::spawn(send_scheduled(
+                client.clone(),
+                url.to_string(),
+                image.clone(),
+                args.min_confidence,
+                start + *at,
+            ))
+        })
+        .collect();
+    let mut outcomes = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        outcomes.push(t.await.context("a request task failed")?);
+    }
+    let wall_s = start.elapsed().as_secs_f64();
+    // One sample after the last answer, so "end" is the memory once the load stopped.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    stop.cancel();
+    let rss = sampler.await.unwrap_or_default();
+
+    let count = |e: Ended| outcomes.iter().filter(|o| o.ended == e).count();
+    let (ok, overloaded, failed, transport) = (
+        count(Ended::Ok),
+        count(Ended::Overloaded),
+        count(Ended::Failed),
+        count(Ended::Transport),
+    );
+    println!("POST {url}");
+    println!(
+        "open loop: {rate} req/s for {duration} s = {} requests scheduled, {wall_s:.1} s until \
+         the last answer",
+        outcomes.len()
+    );
+    println!(
+        "  {ok} ok, {overloaded} answered 503 (overload), {failed} failed, {transport} without \
+         an answer; {:.2} ok/s",
+        ok as f64 / wall_s.max(f64::EPSILON)
+    );
+    println!("latency (ms):");
+    latency_line(
+        "from scheduled start",
+        outcomes
+            .iter()
+            .filter(|o| o.ended == Ended::Ok)
+            .map(|o| o.from_schedule_ms)
+            .collect(),
+    );
+    latency_line(
+        "from actual send",
+        outcomes
+            .iter()
+            .filter(|o| o.ended == Ended::Ok)
+            .map(|o| o.from_send_ms)
+            .collect(),
+    );
+    latency_line(
+        "all answers (sched.)",
+        outcomes
+            .iter()
+            .filter(|o| o.ended != Ended::Transport)
+            .map(|o| o.from_schedule_ms)
+            .collect(),
+    );
+    latency_line(
+        "client send lag",
+        outcomes.iter().map(|o| o.send_lag_ms).collect(),
+    );
+    match (rss.first(), rss.iter().max_by_key(|s| s.1), rss.last()) {
+        (Some(first), Some(peak), Some(last)) => println!(
+            "server RSS ({} samples): start {:.1} MB, peak {:.1} MB at {:.0} s, end {:.1} MB",
+            rss.len(),
+            mb(first.1),
+            mb(peak.1),
+            peak.0,
+            mb(last.1)
+        ),
+        _ => println!(
+            "server RSS: no samples (GET {base}{} gave no process_resident_memory_bytes)",
+            args.metrics_path
+        ),
+    }
+    for o in outcomes.iter().filter(|o| o.ended != Ended::Ok).take(5) {
+        eprintln!("failure: {}", o.note);
+    }
+    Ok(ok == outcomes.len())
 }
 
 struct Outcome {
@@ -180,6 +497,9 @@ async fn run(args: Args) -> Result<bool> {
         Some(m) => format!("{base}/v1/vision/custom/{m}"),
         None => format!("{base}/v1/vision/detection"),
     };
+    if let (Some(rate), Some(duration)) = (args.rate, args.duration) {
+        return run_open_loop(&args, &client, &base, &url, image, rate, duration).await;
+    }
     let repeat = args.repeat.max(1);
     let parallel = args.parallel.max(1);
     let interval = Duration::from_millis(args.interval_ms);
@@ -258,12 +578,68 @@ async fn run(args: Args) -> Result<bool> {
 }
 
 fn main() -> Result<()> {
+    blue_onyx_prism::panic::install();
     let args = Args::parse();
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Two threads: the open loop's timers and answers must not wait behind each other.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()?;
     if !rt.block_on(run(args))? {
         bail!("one or more requests failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_is_evenly_spaced_and_bounded() {
+        let s = schedule(5.0, 2.0).unwrap();
+        assert_eq!(s.len(), 10);
+        assert_eq!(s[0], Duration::ZERO);
+        assert_eq!(s[1], Duration::from_millis(200));
+        assert_eq!(s[9], Duration::from_millis(1800));
+        // A fraction of a request still counts while it is due before the end.
+        assert_eq!(schedule(3.0, 1.0).unwrap().len(), 3);
+        assert_eq!(schedule(2.0, 1.25).unwrap().len(), 3);
+        assert!(schedule(0.0, 1.0).is_err());
+        assert!(schedule(1.0, f64::NAN).is_err());
+        assert!(schedule(1e9, 1e9).is_err());
+    }
+
+    #[test]
+    fn percentiles_are_nearest_rank() {
+        let v: Vec<f64> = (1..=100).map(f64::from).collect();
+        assert_eq!(percentile(&v, 50.0), 50.0);
+        assert_eq!(percentile(&v, 95.0), 95.0);
+        assert_eq!(percentile(&v, 99.0), 99.0);
+        assert_eq!(percentile(&v, 100.0), 100.0);
+        assert_eq!(percentile(&[7.0], 99.0), 7.0);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0], 50.0), 2.0);
+        assert!(percentile(&[], 50.0).is_nan());
+    }
+
+    #[test]
+    fn rss_is_read_from_the_metrics_text() {
+        let text = "# HELP blue_onyx_prism_process_resident_memory_bytes Resident memory\n\
+                    # TYPE blue_onyx_prism_process_resident_memory_bytes gauge\n\
+                    blue_onyx_prism_process_resident_memory_bytes 123456789\n\
+                    blue_onyx_prism_up 1\n";
+        assert_eq!(parse_rss(text), Some(123_456_789));
+        assert_eq!(parse_rss("blue_onyx_prism_up 1\n"), None);
+    }
+
+    #[test]
+    fn open_loop_flags_need_each_other_and_exclude_closed_loop_ones() {
+        assert!(Args::try_parse_from(["t", "--rate", "5", "--duration", "30"]).is_ok());
+        assert!(Args::try_parse_from(["t", "--rate", "5"]).is_err());
+        assert!(Args::try_parse_from(["t", "--duration", "5"]).is_err());
+        assert!(
+            Args::try_parse_from(["t", "--rate", "5", "--duration", "3", "--parallel", "2"])
+                .is_err()
+        );
+    }
 }

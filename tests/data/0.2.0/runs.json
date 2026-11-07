@@ -1,0 +1,272 @@
+[
+  {
+    "id": "20261024-101500-a1b2",
+    "name": "night-rf-detr",
+    "created": "2026-10-24T10:15:00Z",
+    "request": {
+      "recipe": {
+        "family": "rfdetr",
+        "size": "nano",
+        "imgsz": 384,
+        "epochs": 100,
+        "patience": 10,
+        "batch": 4,
+        "lr": 0.0001,
+        "augment": {
+          "dark": 0.3,
+          "noise": 0.1,
+          "gray": 0.2
+        },
+        "multi_scale": "off"
+      },
+      "datasets": [
+        "/srv/data/export-20261024T100000000Z"
+      ],
+      "include_public": true,
+      "scene": "night+ir",
+      "classes": [
+        "person",
+        "car",
+        "dog"
+      ],
+      "rename": {
+        "motorbike": "motorcycle"
+      },
+      "benchmark_sets": [
+        "exdark-night"
+      ],
+      "allow_large": false,
+      "gpu": "cuda:0",
+      "excluded": "drop-frame",
+      "compare_group": "20261024-101500"
+    },
+    "device": "NVIDIA GeForce GTX 1070 Ti (CUDA 12.6, 8 GB)",
+    "state": "done",
+    "stage": "benchmark",
+    "step": 8,
+    "steps": 8,
+    "percent": 100,
+    "detail": "done",
+    "progress": {
+      "device": "cuda",
+      "epoch": 3,
+      "epochs": 100,
+      "batch": 40,
+      "batches": 40,
+      "loss": 2.9380414485931396,
+      "val_loss": null,
+      "map50": 0.712,
+      "elapsed_s": 312.5,
+      "eta_s": null,
+      "phase": "export",
+      "losses": [
+        4.207603454589844,
+        3.9526214599609375,
+        2.9380414485931396
+      ],
+      "history": [
+        {
+          "epoch": 1,
+          "elapsed_s": 101.2,
+          "metrics": {
+            "loss": 4.207603454589844,
+            "map": 0.401,
+            "map50": 0.612
+          }
+        },
+        {
+          "epoch": 2,
+          "elapsed_s": 205.9,
+          "metrics": {
+            "loss": 3.9526214599609375,
+            "map": 0.455,
+            "map50": 0.688
+          }
+        },
+        {
+          "epoch": 3,
+          "elapsed_s": 312.5,
+          "metrics": {
+            "loss": 2.9380414485931396,
+            "map": 0.47,
+            "map50": 0.712
+          }
+        }
+      ],
+      "best": {
+        "metric": "map",
+        "epoch": 3,
+        "value": 0.47
+      },
+      "note": "stopped early: no gain in 10 epochs",
+      "patience": 10,
+      "min_delta": 0.001,
+      "min_epochs": 3,
+      "since_best": 0,
+      "stopped": {
+        "reason": "patience",
+        "epoch": 3,
+        "best_epoch": 3
+      }
+    },
+    "log": [
+      "dataset: 412 train, 46 valid, 60 held-out images",
+      "training on cuda"
+    ],
+    "dataset": {
+      "classes": [
+        "person",
+        "car",
+        "dog"
+      ],
+      "train_images": 412,
+      "valid_images": 46,
+      "heldout_images": 60,
+      "heldout_dir": "@TRAINING_DIR@/20261024-101500-a1b2/data/heldout",
+      "warnings": [
+        "dog: only 31 boxes in training"
+      ],
+      "balance_summary": "class repeat factors: dog x2"
+    },
+    "output": {
+      "name": "night-rf-detr",
+      "onnx": "/srv/bop/models/night-rf-detr.onnx",
+      "yaml": "/srv/bop/models/night-rf-detr.yaml",
+      "provenance": "/srv/bop/models/night-rf-detr.provenance.json",
+      "family": "rfdetr",
+      "classes": [
+        "person",
+        "car",
+        "dog"
+      ],
+      "license": "Apache-2.0",
+      "heldout": "@TRAINING_DIR@/20261024-101500-a1b2/data/heldout",
+      "device": "cuda",
+      "train_seconds": 312.5
+    },
+    "registered": "night-rf-detr",
+    "benchmark": {
+      "datasets": [
+        "dir:@TRAINING_DIR@/20261024-101500-a1b2/data/heldout"
+      ],
+      "device": "openvino:cpu",
+      "ms_p50": 41.7,
+      "ap50": 0.688,
+      "ap50_95": 0.402,
+      "images": 60,
+      "by_scene": {
+        "ir": {
+          "ap50": 0.701,
+          "ap50_95": 0.41,
+          "images": 38
+        },
+        "night": {
+          "ap50": 0.66,
+          "ap50_95": 0.38,
+          "images": 22
+        }
+      },
+      "in_scope": {
+        "ap50": 0.688,
+        "ap50_95": 0.402,
+        "images": 60
+      },
+      "heldout_fingerprint": "9f86d081884c7d65"
+    },
+    "benchmark_error": null,
+    "error": null,
+    "finished": "2026-10-24T10:24:41Z",
+    "run_dir": "@TRAINING_DIR@/20261024-101500-a1b2"
+  },
+  {
+    "id": "20261024-120000-c3d4",
+    "name": "custom-yolo26n",
+    "created": "2026-10-24T12:00:00Z",
+    "request": {
+      "recipe": {
+        "family": "yolo26",
+        "size": "n",
+        "imgsz": 640,
+        "epochs": 50,
+        "patience": 0,
+        "batch": 16,
+        "augment": {
+          "dark": 0.0,
+          "noise": 0.0,
+          "gray": 0.0
+        }
+      },
+      "datasets": [
+        "/srv/data/export-20261024T115500000Z"
+      ],
+      "include_public": false,
+      "scene": "all",
+      "allow_large": false,
+      "excluded": "background"
+    },
+    "device": "Apple M1 GPU (Apple MPS, 9 GB unified memory usable)",
+    "state": "failed",
+    "stage": "train",
+    "step": 5,
+    "steps": 8,
+    "percent": 48,
+    "detail": "epoch 2/50",
+    "progress": null,
+    "log": [
+      "MPS backend out of memory"
+    ],
+    "dataset": null,
+    "output": null,
+    "registered": null,
+    "benchmark": null,
+    "benchmark_error": null,
+    "error": "training stopped: MPS backend out of memory; lower the batch size and queue it again",
+    "finished": "2026-10-24T12:09:30Z",
+    "run_dir": "@TRAINING_DIR@/20261024-120000-c3d4"
+  },
+  {
+    "id": "20261024-130000-e5f6",
+    "name": "day-yolo11s",
+    "created": "2026-10-24T13:00:00Z",
+    "request": {
+      "recipe": {
+        "family": "yolo11",
+        "size": "s",
+        "imgsz": 640,
+        "epochs": 60,
+        "patience": 15,
+        "batch": 8,
+        "augment": {
+          "dark": 0.0,
+          "noise": 0.0,
+          "gray": 0.0
+        }
+      },
+      "datasets": [
+        "/srv/data/export-20261024T125500000Z"
+      ],
+      "include_public": false,
+      "scene": "day",
+      "allow_large": false,
+      "install_dir": "/srv/bop/models/custom",
+      "excluded": "background"
+    },
+    "device": "CPU (12 threads)",
+    "state": "cancelled",
+    "stage": "dataset",
+    "step": 4,
+    "steps": 8,
+    "percent": 20,
+    "detail": "",
+    "progress": null,
+    "log": [],
+    "dataset": null,
+    "output": null,
+    "registered": null,
+    "benchmark": null,
+    "benchmark_error": "the benchmark did not run",
+    "error": null,
+    "finished": "2026-10-24T13:02:00Z",
+    "run_dir": "@TRAINING_DIR@/20261024-130000-e5f6"
+  }
+]

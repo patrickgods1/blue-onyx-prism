@@ -20,6 +20,39 @@ pub const SERVICE_CONFIG_FILE: &str = "blue_onyx_prism_config_service.json";
 const LEGACY_CONFIG_FILE: &str = "blue_onyx_openvino_config.json";
 const LEGACY_SERVICE_CONFIG_FILE: &str = "blue_onyx_openvino_config_service.json";
 
+/// Layout version of the config file ([`Config::format`]), written on every save. Bumped only
+/// when an older build would misread a file of this build (a key that changes meaning, a value
+/// it cannot parse); a new key keeps it, older builds ignore unknown keys. 0.2.0 wrote no
+/// `format`: a file without one is this format.
+pub const CONFIG_FORMAT: u32 = 1;
+
+/// The `format` of the config text, when it is a JSON object with a whole-number `format`.
+fn file_format(text: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Head {
+        format: Option<serde_json::Value>,
+    }
+    serde_json::from_str::<Head>(text).ok()?.format?.as_u64()
+}
+
+/// The format of the config file at `path` when a later version wrote it (above
+/// [`CONFIG_FORMAT`]); None for this format, an older one, no file, or text that is not a config.
+pub fn later_format_on_disk(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    file_format(&text).filter(|&f| f > u64::from(CONFIG_FORMAT))
+}
+
+/// Why a config of format `found` (a later one than [`CONFIG_FORMAT`]) is refused, and what to do.
+pub fn newer_format_error(found: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "format: the file was written by a later version of Blue Onyx Prism (config format \
+         {found}; this version reads format {CONFIG_FORMAT} and older), so its settings may mean \
+         something this version does not know; it is left as it is. Install that later version \
+         again, or start this one with --config <another file> (a backup of the file from before \
+         the upgrade works)"
+    )
+}
+
 /// Rename `dir/legacy` to `dir/current` when only the legacy file exists. Returns the path to use.
 fn migrate_legacy(dir: &Path, current: &str, legacy: &str) -> PathBuf {
     let path = dir.join(current);
@@ -596,6 +629,10 @@ impl ModelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    /// Layout version of the file ([`CONFIG_FORMAT`]; absent = the current one). Every save
+    /// writes the current one; a file of a later format is refused at load
+    /// ([`newer_format_error`]) rather than misread and then written over.
+    pub format: u32,
     pub port: u16,
     /// Address the HTTP listener binds (`0.0.0.0` = every IPv4 interface, plus `[::1]` for
     /// `localhost`). `127.0.0.1` keeps the service local to this machine. Process restart.
@@ -744,6 +781,10 @@ pub struct Config {
     /// Download missing resources (runtimes, models) in the background at startup. `false`
     /// (air-gapped, Docker) only reports what is missing and the command to fetch it.
     pub auto_download: bool,
+    /// Ask GitHub, at most once an hour while the home page is open, whether a newer release
+    /// exists (`GET /v1/status/updateavailable`). `false`: no request leaves the machine; the
+    /// route answers that the check is off. Read per request.
+    pub check_updates: bool,
     /// Allow downloads over 500 MB (`resources::LARGE_DOWNLOAD_BYTES`), in practice the NVIDIA
     /// CUDA/cuDNN libraries. Off by default.
     pub allow_large_downloads: bool,
@@ -893,6 +934,7 @@ impl Default for BenchmarkConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            format: CONFIG_FORMAT,
             port: crate::DEFAULT_PORT,
             bind_address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             allow_remote_admin: false,
@@ -936,6 +978,7 @@ impl Default for Config {
             hardware_profile: crate::profile::HardwareProfile::Auto,
             models_dir: PathBuf::from("models"),
             auto_download: true,
+            check_updates: true,
             allow_large_downloads: false,
             download_dir: None,
             max_image_pixels: crate::image::MAX_IMAGE_PIXELS_DEFAULT,
@@ -956,6 +999,12 @@ impl Config {
                 path.display()
             )
         })?;
+        // Before the full parse: a later format may hold a value this build cannot parse, and
+        // "not valid config JSON" would send the user after a typo that is not there.
+        if let Some(found) = file_format(&text).filter(|f| *f > u64::from(CONFIG_FORMAT)) {
+            return Err(newer_format_error(found))
+                .with_context(|| format!("the config file {} is not loaded", path.display()));
+        }
         let mut config: Config = serde_json::from_str(&text).with_context(|| {
             format!(
                 "the config file {} is not valid config JSON (most likely a hand edit: a missing \
@@ -1022,6 +1071,7 @@ impl Config {
     /// ([`ModelConfig::effective_name`]).
     pub fn saved_text(&self) -> Result<String> {
         let mut named = self.clone();
+        named.format = CONFIG_FORMAT;
         named.fill_model_names();
         Ok(serde_json::to_string_pretty(&named)?)
     }
@@ -1601,6 +1651,11 @@ impl Config {
     /// config the server runs with must pass.
     pub fn validate(&self) -> Result<()> {
         use anyhow::bail;
+        // [`Config::load`] refuses such a file first; this covers a file adopted from disk while
+        // running (`config_store`) and any other parse.
+        if self.format > CONFIG_FORMAT {
+            return Err(newer_format_error(u64::from(self.format)));
+        }
         check_range("port", self.port, 1, u16::MAX)?;
         validate_allowed_hosts(&self.allowed_hosts)?;
         check_range(
@@ -3134,6 +3189,75 @@ mod tests {
         );
         std::fs::write(&path, r#"{"port":4000}"#).unwrap();
         assert_eq!(Config::load(&path).unwrap().port, 4000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn format_is_written_and_a_file_without_one_is_the_current_format() {
+        let old: Config = serde_json::from_str(r#"{"port": 4000}"#).unwrap();
+        assert_eq!(old.format, CONFIG_FORMAT, "a 0.2.0 file has no format");
+        let text = old.saved_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["format"], CONFIG_FORMAT);
+        assert!(
+            text.trim_start_matches(['{', '\n', ' '])
+                .starts_with("\"format\""),
+            "{text}"
+        );
+        // A file of an older format is saved in the current one.
+        let older = Config {
+            format: 0,
+            ..Config::default()
+        };
+        older.validate().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&older.saved_text().unwrap()).unwrap();
+        assert_eq!(v["format"], CONFIG_FORMAT);
+    }
+
+    #[test]
+    fn a_config_of_a_later_format_is_refused_and_left_alone() {
+        let dir = std::env::temp_dir().join(format!("bop-cfg-fmt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        let later = CONFIG_FORMAT + 1;
+        // A later format may change a value's type: still the format error, not a parse error.
+        for text in [
+            format!(r#"{{"format": {later}, "port": 4000}}"#),
+            format!(r#"{{"format": {later}, "port": "a later shape"}}"#),
+            format!(r#"{{"format": {}, "port": 4000}}"#, u64::from(u32::MAX) + 1),
+        ] {
+            std::fs::write(&path, &text).unwrap();
+            let err = format!("{:#}", Config::load(&path).unwrap_err());
+            assert!(err.contains("written by a later version"), "{err}");
+            assert!(
+                err.contains(&format!("this version reads format {CONFIG_FORMAT}")),
+                "{err}"
+            );
+            assert!(err.contains("--config"), "names a way out: {err}");
+            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                text,
+                "left as it is"
+            );
+        }
+        // Parsed some other way (a disk edit adopted while running), validation refuses it.
+        let c: Config = serde_json::from_str(&format!(r#"{{"format": {later}}}"#)).unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.starts_with("format: "), "{err}");
+        // The current format, an older one, and a file without one all load.
+        for text in [
+            format!(r#"{{"format": {CONFIG_FORMAT}, "port": 4000}}"#),
+            r#"{"format": 0, "port": 4000}"#.to_string(),
+            r#"{"port": 4000}"#.to_string(),
+        ] {
+            std::fs::write(&path, &text).unwrap();
+            assert_eq!(Config::load(&path).unwrap().port, 4000, "{text}");
+        }
+        // Not a number: the ordinary parse error.
+        std::fs::write(&path, r#"{"format": "two"}"#).unwrap();
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(err.contains("not valid config JSON"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

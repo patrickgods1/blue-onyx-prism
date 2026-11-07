@@ -1,0 +1,68 @@
+[
+  {
+    "id": "20261023-055526-88d5",
+    "kind": "import",
+    "title": "import 2018-03-07.17-00-00.17-05-00.school.G419.r13.avi",
+    "created": "2026-10-23T05:55:26Z",
+    "state": "done",
+    "stage": "writing frames",
+    "step": 5,
+    "steps": 5,
+    "percent": 100,
+    "detail": "",
+    "log": [
+      "extracting 1 video(s) with 7 workers",
+      "kept 40 of 212 candidate frames"
+    ],
+    "summary": "40 frames from 1 video into /srv/data/dataset",
+    "result": {
+      "frames": 40,
+      "cameras": [
+        "meva-school-g419"
+      ],
+      "by_scene": {
+        "day": 40
+      }
+    },
+    "error": null,
+    "finished": "2026-10-23T06:02:11Z"
+  },
+  {
+    "id": "20261023-060214-1a2b",
+    "kind": "autolabel",
+    "title": "auto-label 40 frames",
+    "created": "2026-10-23T05:55:26Z",
+    "state": "failed",
+    "stage": "labelling",
+    "step": 3,
+    "steps": 4,
+    "percent": 61,
+    "detail": "24 of 40 frames",
+    "log": [
+      "loading mm-gdino-tiny",
+      "CUDA out of memory"
+    ],
+    "summary": null,
+    "result": null,
+    "error": "the auto-labeler stopped: CUDA out of memory; close other GPU programs and run it again",
+    "finished": "2026-10-23T06:20:40Z",
+    "after": "20261023-055526-88d5"
+  },
+  {
+    "id": "20261023-062000-3c4d",
+    "kind": "autolabel",
+    "title": "auto-label unreviewed frames",
+    "created": "2026-10-23T06:20:00Z",
+    "state": "cancelled",
+    "stage": null,
+    "step": 0,
+    "steps": 4,
+    "percent": 0,
+    "detail": "",
+    "log": [],
+    "summary": "skipped: the import it follows found no new frames",
+    "result": null,
+    "error": null,
+    "finished": "2026-10-23T06:20:01Z"
+  }
+]

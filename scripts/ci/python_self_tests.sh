@@ -13,4 +13,5 @@ PY=${PYTHON:-python}
 "$PY" -I scripts/autolabel.py --self-test --parity tests/data/overlaps_parity.json
 "$PY" -I scripts/import_footage.py --self-test
 "$PY" -I scripts/research/eval_autolabel.py --self-test
+"$PY" -I packaging/release/ci_green.py --self-test
 echo "python self-tests ok"

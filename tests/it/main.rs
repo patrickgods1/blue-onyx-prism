@@ -14,6 +14,7 @@ mod backend_ort;
 mod config_disk_http;
 mod enabled_models_http;
 mod families_http;
+mod formats_020;
 mod integration_http;
 mod js_poll;
 mod js_rules;

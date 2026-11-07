@@ -30,7 +30,7 @@ Modeled on [blue-onyx](https://github.com/xnorpx/blue-onyx) (MIT), adding multi-
 
 | Platform | Inference | Notes |
 |---|---|---|
-| Windows 11 x86_64 | Intel GPU (iGPU/Arc) + CPU | Primary target; Windows service. Needs the MSVC runtime redistributable. |
+| Windows 11 x86_64 | Intel GPU (iGPU/Arc) + CPU | Primary target (tested); Windows service. Windows 10 22H2 should work but is untested. The Visual C++ runtime DLLs the program needs are shipped next to the executable. |
 | Linux x86_64 | Intel GPU (`/dev/dri`) + CPU | Install `intel-opencl-icd`; user in the `render` group. systemd and Docker files provided. |
 | macOS arm64 | CPU, CoreML | launchd daemon. No OpenVINO GPU plugin exists for Apple silicon; CoreML runs through ONNX Runtime. |
 
@@ -273,6 +273,14 @@ Check it: open `http://127.0.0.1:32168/`, or `./test-blue-onyx-prism` (see [Test
 `--model <path> --family yolo5|yolo26|yolo8|rtdetr|detr|rfdetr|auto` enables that model (adding it to the config when it is not there yet).
 `blue-onyx-prism --help` lists every option; `list-models` shows the downloadable catalog.
 
+**About the default model's license:** `IPcam-general` (the model the commands above download, and the
+one a config with no models is seeded with) has AGPL-3.0 weights. In one sentence: you may run and use it
+under that license, which carries conditions if you redistribute it or offer it as a network service to others;
+read the license text and ask a lawyer if that matters for you, this is not legal advice. Every model
+shows its license on the Config page (Resources, under each model's name). To use a
+model under another license, pick it from the Resources list (RF-DETR and RT-DETRv2 are Apache-2.0; some
+models are non-commercial) or add your own with `add-model`, and remove `IPcam-general` from the Models card.
+
 The first GPU start compiles each model (20-60 s on an iGPU) and stores the result in `cache/`;
 later starts take seconds. The HTTP server is up immediately and answers `Model initializing` until
 the model is ready.
@@ -296,6 +304,7 @@ it; every key can also be set in the file.
 
 | Field | Default | Meaning |
 |---|---|---|
+| `format` | `1` | Layout version of the config file, written on every save. Leave it alone: a file with a later `format` (written by a newer version) is refused with a message instead of misread. A file without it is format 1. Integer. Applies: not editable. UI: no |
 | `port` | `32168` | HTTP listen port. Integer 1-65535. Applies: process restart. UI: yes |
 | `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
 | `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines that show the admin token (`<data root>/admin-token`, made when this is turned on). Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
@@ -309,6 +318,7 @@ it; every key can also be set in the file.
 | `openvino_dir` | `null` | OpenVINO runtime dir; default `<exe_dir>/openvino`, else the system install. Path (relative = under the exe dir). Applies: restart. UI: read-only; set it in the file or with `--openvino-dir`, see [Library folders](#library-folders-config-file-or-command-line-only) |
 | `onnxruntime_dir` | `null` | ONNX Runtime dir (user-managed, never replaced); lookup order: this field, `ORT_DYLIB_PATH`, `onnxruntime/<flavor>/` named by `onnxruntime/active.txt`, `onnxruntime/` itself (older installs), any `onnxruntime/<flavor>/`. Must be a folder; a file is refused (only `ORT_DYLIB_PATH` may name a file). Path (relative = under the exe dir). Applies: process restart (a process loads one ONNX Runtime). UI: read-only; set it in the file or with `--onnxruntime-dir`, see [Library folders](#library-folders-config-file-or-command-line-only) |
 | `auto_download` | `true` | Download missing runtimes and models at startup; see [First run](#first-run). Boolean. Applies: restart. UI: yes |
+| `check_updates` | `true` | Ask GitHub at most once an hour, while the home page is open, whether a newer release exists. `false`: no request is made and the home page shows no update hint. Boolean. Applies: at once. UI: no |
 | `allow_large_downloads` | `false` | Allow downloads over 500 MB (NVIDIA CUDA libraries). Boolean. Applies: restart. UI: yes |
 | `download_dir` | `null` | Root for downloaded runtimes and relative model paths (default: the executable's directory). Path. Applies: restart. Files already downloaded are not moved. UI: read-only; set it in the file, see [Library folders](#library-folders-config-file-or-command-line-only) |
 | `confidence_threshold` | `0.5` | Default minimum confidence (a request's `min_confidence` > 0 overrides it). Number 0-1. Applies: at once. UI: yes |
@@ -1178,7 +1188,19 @@ response has `success: false` or a non-200 status.
   user is in the `render` group (`ls -l /dev/dri`). If the GPU still fails the service falls back to
   CPU and reports `OpenVINO CPU (fallback)`. Under Windows services try `-Account` (see above).
 - **First start is slow:** GPU kernels are compiled once (20-60 s per model) and cached in `cache/`;
-  keep that directory. Windows service starts allow up to 10 minutes.
+  keep that directory. The Windows service reports Running as soon as its HTTP port is bound; models
+  compile after that (`/v1/status` says when they are ready).
+- **Port 32168 already in use:** the start-up error names the program that holds the port when the OS
+  tools can tell (`netstat` / `tasklist` on Windows, `lsof` or `ss` elsewhere), e.g. a CodeProject.AI server
+  still running. Stop it or set another `port`. The Windows service retries for 60 s, then stops with
+  service-specific exit code 3 (4: another start failure, such as a config it cannot read; 1: the server
+  thread ended unexpectedly, the panic is in the log), so its recovery actions restart it.
+- **Collecting diagnostics for a bug report:** `blue-onyx-prism diagnostics [--out <dir>]` (pass the
+  service's config with `--config <file>` before the subcommand), or `GET /v1/diagnostics` on this machine
+  (admin), writes one zip: version and OS, devices, resources, the config, the newest 5 MB of the log files,
+  metrics and a benchmark summary. It never holds camera frames, labels, datasets, model weights, the admin
+  token or a Hugging Face token (their values are also scrubbed from every file). Camera names and file paths
+  stay in it, because the config and the logs name them: look through it before posting it publicly.
 - **macOS:** only the CPU plugin exists for OpenVINO on Apple silicon. `auto` uses CoreML through ONNX Runtime
   (run `setup-onnxruntime`); set `"device": "openvino:cpu"` if that is slower for your models. The log line
   `CoreML loads a rewritten copy (...)` shows the CoreML graph rewrite (see Hardware and device selection); `BOP_COREML_REWRITE=0`
@@ -1198,7 +1220,7 @@ response has `success: false` or a non-200 status.
   compute overlaps the other's copy and NMS; Blue Iris sends one request per trigger, so 100 % is not
   expected, and the benchmark measures latency one request at a time by design.
 - **`Unable to find the openvino_c library`:** run `blue-onyx-prism setup-openvino` or set
-  `openvino_dir` / `OPENVINO_INSTALL_DIR`. On Windows install the Visual C++ redistributable.
+  `openvino_dir` / `OPENVINO_INSTALL_DIR`. On Windows the release zip and the MSI ship the Visual C++ runtime next to the exe; a build of your own needs the Visual C++ redistributable.
 - **Windows: crash with an illegal instruction (`0xC000001D`) on the first CPU inference:** on Xeons with AMX
   but no AMX-FP16 (Sapphire / Emerald Rapids, e.g. cloud VMs with a Xeon Platinum 8573C) OpenVINO's AMX kernels
   fault, so the service sets `ONEDNN_MAX_CPU_ISA=AVX512_CORE_FP16` (AMX off, AVX-512 kept) before OpenVINO loads.
@@ -1206,6 +1228,30 @@ response has `success: false` or a non-200 status.
 - **Windows error 1053 / `ServicesPipeTimeout`:** the service did not report in time; reboot once after
   installing (the timeout registry value applies at boot).
 - **Blue Iris shows `Unknown model`:** the name in the custom models field must match a configured model name.
+
+## Privacy
+
+Blue Onyx Prism sends no telemetry, usage statistics or images anywhere. These are all the outbound
+connections it makes, and how to turn each off:
+
+| Connection | When | Turn off |
+|---|---|---|
+| `api.github.com` (latest release of this project) | The server asks once an hour at most, only while the web UI home page is open in a browser. Only the version check; nothing is downloaded or installed from it. | Set `check_updates` to `false` in the config: no request is made and the home page shows no update note. Applies at once. |
+| Runtime downloads: OpenVINO (`storage.openvinotoolkit.org`), ONNX Runtime and DirectML (GitHub, `api.nuget.org`), NVIDIA CUDA libraries (PyPI wheels, `files.pythonhosted.org`) | At startup for what the config and the hardware need, and when you press Download. Each file is checked against a pinned SHA-256. | `"auto_download": false` (then only the Download button and `fetch` download). Large files also need `allow_large_downloads`. |
+| Model downloads (`huggingface.co` for the IPcam models and RT-DETRv2, GitHub releases for exportable weights) | At startup for configured models, `download-models`, `fetch`, or the Download / Export buttons. | `"auto_download": false`. Models on disk are never fetched again. |
+| Model export and training tools (`github.com`, PyPI, `huggingface.co`, `download.pytorch.org`) | Only when you start an export, an auto-label or a training run (never by `auto_download`). | Do not start them. |
+| Benchmark datasets, import samples, video URLs (`storage.googleapis.com`, `zenodo.org`, `mevadata-public-01.s3.amazonaws.com`, the site of a URL you give to `train import`) | Only when you pick a built-in dataset or import source. | `benchmark.auto_download_datasets: false`; do not use the import sources. |
+| `huggingface.co` with your token (gated SAM 3 weights) | Only after you run `blue-onyx-prism hf-login` and press the Auto-label tab's download. The token goes to huggingface.co only. | `blue-onyx-prism hf-logout`. |
+
+For a machine with no internet, set `"auto_download": false` and `"check_updates": false`, prepare
+the files elsewhere with `fetch --for-config` and copy them over (see [First run](#first-run)); the
+service then makes no outbound connection at all.
+
+## Reporting problems and security issues
+
+Bug reports and feature requests go to the GitHub issue tracker (the templates ask for
+`blue-onyx-prism --version`, your OS, the `list-devices` output and the `diagnostics` output).
+Security problems: see [SECURITY.md](SECURITY.md). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
@@ -1216,3 +1262,10 @@ distributed with this project: the on-demand export downloads the official weigh
 Ultralytics' GitHub release on your request and exports them on your machine (see above), as it
 does for RF-DETR large (Apache-2.0) and DEIMv2 (non-commercial / personal use, see the license note above). The blue-onyx IPcam models and RT-DETRv2 models are downloaded from their own
 Hugging Face repositories under their own licenses.
+
+**The default model is AGPL-3.0.** The blue-onyx `IPcam-general` weights (also the other IPcam
+models in the catalog) are licensed AGPL-3.0, and a fresh config uses `IPcam-general`. The project
+downloads them on your request and does not ship them. That license has conditions for people who
+redistribute the model or offer it as a network service to others; for private use on your own
+cameras it asks nothing extra. This is a plain summary, not legal advice. To avoid it, choose
+an Apache-2.0 model (RF-DETR, RT-DETRv2; the Config page's Resources list shows each model's license) or your own.

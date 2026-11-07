@@ -1,5 +1,5 @@
 //! Main binary: CLI subcommands (setup-openvino, setup-onnxruntime, download-models, list-models,
-//! fetch, list-resources, list-devices, benchmark) or the HTTP service.
+//! fetch, list-resources, list-devices, benchmark, diagnostics) or the HTTP service.
 
 #![cfg_attr(
     not(test),
@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 fn main() -> ExitCode {
+    blue_onyx_prism::panic::install();
     // Paths typed on the command line are relative to the cwd (config-file paths are
     // relative to the exe dir), so make them absolute before anything uses them.
     let cli = Cli::parse();
@@ -439,6 +440,17 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::HfLogout) => return resources::hf_token::logout(&read_config(&cli)?),
         Some(Command::AdminToken { rotate, config }) => {
             return admin_token_command(&cli, rotate, config);
+        }
+        Some(Command::Diagnostics { out }) => {
+            let _log = cli::init_logging(LogLevel::Warn, None)?;
+            let path = blue_onyx_prism::diagnostics::command(&config_path(&cli), out.as_deref())?;
+            println!("{}", path.display());
+            eprintln!(
+                "Wrote the diagnostics zip. It holds no frames, labels, datasets or tokens, but \
+                 camera names and file paths are in it: look through it before sharing it \
+                 publicly."
+            );
+            return Ok(());
         }
         Some(Command::Service { action }) => {
             let code = service_command(action)?;

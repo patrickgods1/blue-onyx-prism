@@ -13,7 +13,6 @@ use crate::supervisor::Status;
 use crate::worker::{TestFaults, WorkItem};
 use std::collections::VecDeque;
 use std::sync::Condvar;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 const SOON: Duration = Duration::from_secs(10);
 const OOM: &str = "[GPU] clEnqueueMapBuffer, error code: -5 CL_OUT_OF_RESOURCES";
@@ -427,21 +426,23 @@ fn a_failed_model_is_gone_before_its_replacement_loads() {
     let f = Fixture::start(&["a"], |_| {});
     let old = f.break_model("a");
     let before = f.loads.tried().len();
-    let gone = Arc::new(AtomicBool::new(false));
-    let (probe_old, flag) = (old.clone(), gone.clone());
+    // What the probe saw when the new worker's load began: None until it ran. The loader records
+    // the try before it runs the probe, so waiting on the try alone could read the flag too soon.
+    let seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let (probe_old, slot) = (old.clone(), seen.clone());
     f.loads.set_probe(move |_| {
-        flag.store(thread_gone(&probe_old), AtomicOrdering::SeqCst);
+        let gone = thread_gone(&probe_old);
+        *slot.lock_recover() = Some(gone);
     });
     f.loads.hold_after(before + 1);
     f.reg.recover_model("a", &f.config).unwrap();
     // Swapped at once: it was not serving, so nothing is kept for the load.
     let w = f.handle("a");
     assert!(!Arc::ptr_eq(&w, &old));
-    wait_until("the new worker to load", || f.loads.tried().len() > before);
-    assert!(
-        gone.load(AtomicOrdering::SeqCst),
-        "old thread still running"
-    );
+    wait_until("the new worker's load to look", || {
+        seen.lock_recover().is_some()
+    });
+    assert_eq!(*seen.lock_recover(), Some(true), "old thread still running");
     f.loads.release();
     f.ready("a");
     f.stop();

@@ -35,7 +35,7 @@
     <td class="mc-load" data-label="Load"><input type="checkbox" data-key="model:enabled:{{ m.key }}" name="enabled" value="{{ m.name }}" aria-label="Load {{ m.name }}"{% if m.enabled %} checked{% endif %}></td>
     <td class="mc-default" data-label="Default"><input type="radio" data-key="default" name="default_model" value="{{ m.name }}" aria-label="Default {{ m.name }}"{% if m.is_default %} checked{% endif %}></td>
     <td class="rc-title mc-name">{{ m.name }} <span class="tag restart pending-badge" title="{{ m.pending.join("; ") }}"{% if m.pending.is_empty() %} hidden{% endif %}>restart needed</span></td>
-    <td data-label="Family">{{ m.family }}</td>
+    <td data-label="Family">{{ m.family }}{% if let Some(l) = m.license %}<br><span class="sub muted" title="License of this model's weights">{{ l }}</span>{% endif %}</td>
     <td class="model-device rc-block" data-label="Device"><select data-key="model:device:{{ m.key }}" name="device.{{ m.name }}" aria-label="Device of {{ m.name }}">
       {% for d in m.devices %}<option value="{{ d.value }}"{% if d.selected %} selected{% endif %}{% if d.disabled %} disabled class="unavailable"{% endif %} data-key="{{ d.key }}" data-thr="{{ d.thr }}" data-src="{{ d.src }}" data-bench="{{ d.bench }}">{{ d.label }}</option>{% endfor %}
       </select>
@@ -146,7 +146,7 @@
   <tbody>
   {% for r in g.rows %}
   <tr id="resource-{{ r.id }}" data-id="{{ r.id }}" data-busy="{{ r.busy }}" data-state="{{ r.state }}">
-    <td class="rc-title-plain">{{ r.title }} <code>{{ r.id }}</code>{% if let Some(v) = r.update_available %} <span class="tag update" title="Installed in an older version; Update replaces it in place (a loaded runtime is used after a restart)">update to {{ v }}</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% endif %}</span></td>
+    <td class="rc-title-plain">{{ r.title }} <code>{{ r.id }}</code>{% if let Some(v) = r.update_available %} <span class="tag update" title="Installed in an older version; Update replaces it in place (a loaded runtime is used after a restart)">update to {{ v }}</span>{% endif %}<br><span class="muted">{{ r.description }}{% if r.kind == "cuda-libs" %} &middot; {{ r.license }}{% else if r.kind == "model" %} &middot; <span class="res-license" title="License of this model's weights">License: {{ r.license }}</span>{% endif %}</span></td>
     <td class="num" data-label="Size">{{ r.size_text }}{% if let Some(n) = r.size_note %}<br><span class="muted">{{ n }}</span>{% else if r.large && r.action != "export" %}<br><span class="muted">large</span>{% endif %}</td>
     <td class="res-state" data-label="State"><span class="res-text">{{ r.state_text }}</span>{% if r.busy %}<br><progress max="100"{% if let Some(p) = r.progress %} value="{{ p }}"{% endif %}></progress>{% endif %}{% if r.active %} <span class="tag">active</span>{% endif %}{% if r.loaded %} <span class="tag">loaded</span>{% endif %}{% if !r.blocking.is_empty() %}<br><span class="muted">needed by {{ r.blocking.join(", ") }}</span>{% endif %}{% if !r.log.is_empty() %}<details class="res-log"><summary>output</summary><pre>{% for l in r.log %}{{ l }}
 {% endfor %}</pre></details>{% endif %}</td>

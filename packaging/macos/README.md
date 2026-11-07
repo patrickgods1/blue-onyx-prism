@@ -29,7 +29,11 @@ packaging/macos/build-pkg.sh <version> <bin-dir> blue-onyx-prism-<version>-macos
 
 Test on a macOS machine with sudo: `packaging/macos/smoke-test.sh <pkg>` (installs, waits for
 `/v1/status`, checks the uninstaller and menu bar apps and the LaunchAgent, uninstalls keeping the data, reinstalls over it
-with the account's id changed, then purges).
+with the account's id changed, then purges). A kept data root or log dir holding anything (the folder
+or a file deep inside) of another owner or group is chowned as a whole (`bop_own_kept_dirs`).
+`packaging/upgrade-test.sh` (packaging.yml) installs the latest published pkg, seeds a config edit, a
+root-owned label file, a frame and a training `runs.json`, upgrades to the new pkg and checks the
+daemon, one detection and that all of it is unchanged.
 
 ## Install an unsigned package
 

@@ -123,6 +123,16 @@ pub async fn check_update(current: &str) -> StatusUpdateResponse {
     resp
 }
 
+/// The answer while `check_updates` is off: no request, the same shape, nothing to show.
+pub fn check_off(current: &str) -> StatusUpdateResponse {
+    StatusUpdateResponse {
+        success: false,
+        message: "The update check is off (check_updates in the config).".to_string(),
+        current: VersionInfo::parse(current, None).unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
 async fn check_uncached(current: &str) -> StatusUpdateResponse {
     let run = async {
         let current_v = VersionInfo::parse(current, None)?;
@@ -150,6 +160,14 @@ async fn check_uncached(current: &str) -> StatusUpdateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_check_off_answer_offers_no_update() {
+        let r = check_off("0.2.0");
+        assert!(!r.success && !r.updateAvailable);
+        assert!(r.message.contains("check_updates"), "{}", r.message);
+        assert_eq!((r.current.major, r.current.minor), (0, 2));
+    }
 
     #[test]
     fn hostile_release_bodies_never_panic_and_never_update() {

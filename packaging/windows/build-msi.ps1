@@ -78,6 +78,10 @@ foreach ($line in (Get-Content -LiteralPath (Join-Path $RepoRoot "LICENSE"))) {
 [void]$sb.Append('}')
 [System.IO.File]::WriteAllText($rtfPath, $sb.ToString(), [System.Text.Encoding]::ASCII)
 
+# --- Visual C++ runtime, installed next to the exes (stage-vcruntime.ps1, in obj/) ---------------
+$vcRuntime = Join-Path $obj "vcruntime"
+& (Join-Path $PSScriptRoot "stage-vcruntime.ps1") -Dest $vcRuntime
+
 # --- Build -------------------------------------------------------------------------------------
 $out = [System.IO.Path]::GetFullPath($OutFile)
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
@@ -90,6 +94,7 @@ $wixArgs = @(
     "-d", "BinDir=$BinDir",
     "-d", "RepoRoot=$RepoRoot",
     "-d", "LicenseRtf=$rtfPath",
+    "-d", "VcRuntimeDir=$vcRuntime",
     "-ext", "WixToolset.Util.wixext",
     "-ext", "WixToolset.Firewall.wixext",
     "-ext", "WixToolset.UI.wixext",

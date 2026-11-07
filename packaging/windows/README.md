@@ -9,13 +9,18 @@ cargo build --release --locked --bins
 .\packaging\windows\build-msi.ps1 -Version 0.1.0 -BinDir target\release -OutFile dist\blue-onyx-prism-0.1.0.msi
 ```
 
-`build-msi.ps1` installs the `wix` dotnet tool and the Util/Firewall/UI extensions (all 7.0.0) when
+`build-msi.ps1` needs Visual Studio (or the Build Tools) with the C++ workload for the runtime DLLs, installs the `wix` dotnet tool and the Util/Firewall/UI extensions (all 7.0.0) when
 `wix` is not on PATH, generates `obj\License.rtf` from `LICENSE`, and runs `wix build -acceptEula wix7`
 (WiX 7 requires accepting its OSMF EULA). Needs a .NET SDK (8+). `-Version` must be numeric `x.y.z`.
 
 ## What it installs
 
-- `C:\Program Files\Blue Onyx Prism`: service exe, CLI, tray exe (`blue-onyx-prism-tray.exe`), benchmark exe, LICENSE, THIRD_PARTY_LICENSES.md, README.md.
+- `C:\Program Files\Blue Onyx Prism`: service exe, CLI, tray exe (`blue-onyx-prism-tray.exe`), benchmark exe, LICENSE, THIRD_PARTY_LICENSES.md, README.md,
+  and the Visual C++ runtime (`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`), so no VC++ redistributable is
+  needed. `stage-vcruntime.ps1` takes them from the build machine's Visual Studio redist folder (Microsoft-signed, at
+  least 14.40, versions and SHA-256 in the build log); the release zip has the same files. Windows looks in the program
+  folder before System32, so the exes and the OpenVINO / ONNX Runtime DLLs they load use these copies; `smoke-test.ps1`
+  checks the running service loaded them from there.
 - Service `BlueOnyxPrismService` (auto start, `NT AUTHORITY\LocalService`), started `--config "C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json"`;
   restarts after 5 s / 30 s / 120 s (count reset after 1 h). Its only required privilege is `SeChangeNotifyPrivilege`:
   the SCM removes every other one from the process, as `scripts\install_service.ps1` does.

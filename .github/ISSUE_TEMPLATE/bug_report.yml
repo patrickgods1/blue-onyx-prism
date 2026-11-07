@@ -1,0 +1,47 @@
+name: Bug report
+description: Something does not work as the README says
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a security problem do not use this form: see SECURITY.md (private vulnerability reporting).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `blue-onyx-prism --version`
+      placeholder: blue-onyx-prism 0.2.0 (abc1234, 2026-10-27)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 23H2 x86_64 / Ubuntu 24.04 / macOS 15 arm64 / Docker
+    validations:
+      required: true
+  - type: textarea
+    id: devices
+    attributes:
+      label: Device
+      description: Output of `blue-onyx-prism list-devices`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Attach the output of `blue-onyx-prism diagnostics` (check it for anything private first, such as paths and camera names).
+      render: text

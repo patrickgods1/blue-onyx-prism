@@ -284,7 +284,10 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-pub(super) async fn update_available() -> impl IntoResponse {
+pub(super) async fn update_available(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !state.config_read().check_updates {
+        return Json(crate::update::check_off(crate::VERSION));
+    }
     Json(crate::update::check_update(crate::VERSION).await)
 }
 
@@ -819,6 +822,23 @@ mod tests {
 
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn the_update_check_can_be_turned_off_and_then_asks_nobody() {
+        let state = test_state_with(|c| c.check_updates = false);
+        let r = update_available(State(state)).await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(
+            (v["success"].as_bool(), v["updateAvailable"].as_bool()),
+            (Some(false), Some(false))
+        );
+        assert!(
+            v["message"].as_str().unwrap().contains("check_updates"),
+            "{v}"
+        );
+    }
 
     use axum::body::Body;
     use axum::http::Request;

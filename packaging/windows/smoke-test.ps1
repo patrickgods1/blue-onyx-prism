@@ -6,8 +6,8 @@
     keeps only the data folder, a seeded dataset file included; an install over that data with an
     older version's ACL corrects it, and KEEPDATA=1 (old scripts) keeps it again, even with REMOVEDATA=1; a last install
     over it and REMOVEDATA=1 removes everything, the protected token folder too. Each install also
-    checks the data folder's DACL, the service's required privileges and the firewall rule's scope
-    and profiles.
+    checks the data folder's DACL, the service's required privileges, the firewall rule's scope
+    and profiles, and that the service runs on the Visual C++ runtime installed next to it.
 .PARAMETER Msi
     Path of the MSI to test.
 .PARAMETER Port
@@ -148,6 +148,12 @@ function Assert-Hardening([string]$Log) {
         Fail "required privileges are '$($privileges -join ', ')', expected only SeChangeNotifyPrivilege" @($Log)
     }
     Write-Host "Required privileges: $($privileges -join ', ')."
+    # `sc failureflag 1`: recovery also when the service stops itself with an error code (a start
+    # that gave up on a busy port), not only on a crash.
+    if (-not $svcKey.PSObject.Properties["FailureActionsOnNonCrashFailures"] -or $svcKey.FailureActionsOnNonCrashFailures -ne 1) {
+        Fail "the service's failure actions do not apply to non-crash failures (sc failureflag)" @($Log)
+    }
+    Write-Host "Failure actions apply to non-crash failures."
 
     $rules = @(Get-NetFirewallRule -DisplayName "Blue Onyx Prism ($Port)")
     if ($rules.Count -ne 1) { Fail "$($rules.Count) firewall rules named 'Blue Onyx Prism ($Port)', expected 1" @($Log) }
@@ -179,6 +185,38 @@ function Assert-TokenFolderProtected([string]$Log) {
         Fail "$BuiltinUsers can read $token" @($Log)
     }
     Write-Host "Token folder DACL is protected; Users have no access."
+}
+
+# The Visual C++ runtime ships next to the exes (stage-vcruntime.ps1), and the running service
+# took those copies, not System32's: Windows looks in the program folder first, for the OpenVINO
+# and ONNX Runtime DLLs the service loaded from the data folder too. Ready (200) means those
+# loaded and serve, so this checks them against the shipped runtime.
+$VcRuntimeDlls = "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"
+function Assert-VcRuntime([int]$ProcessId, [string]$Log) {
+    foreach ($name in $VcRuntimeDlls) {
+        $path = Join-Path $ProgDir $name
+        if (-not (Test-Path $path)) { Fail "$path missing after install" @($Log) }
+        $v = (Get-Item $path).VersionInfo
+        Write-Host "Installed $name $($v.FileVersion)"
+    }
+    try {
+        $modules = @((Get-Process -Id $ProcessId -ErrorAction Stop).Modules)
+    } catch {
+        Fail "cannot list the modules of the service process $ProcessId`: $($_.Exception.Message)" @($Log)
+    }
+    foreach ($name in "vcruntime140.dll", "msvcp140.dll") {
+        $loaded = @($modules | Where-Object { $_.ModuleName -ieq $name })
+        if ($loaded.Count -eq 0) {
+            Fail "the service has no $name loaded: OpenVINO / ONNX Runtime (which use msvcp140) did not load, or the exe no longer links the runtime dynamically" @($Log)
+        }
+        foreach ($m in $loaded) {
+            if ((Split-Path -Parent $m.FileName) -ine $ProgDir) {
+                Fail "the service loaded $($m.FileName), not the copy in $ProgDir" @($Log)
+            }
+        }
+    }
+    $runtimes = @($modules | Where-Object { $_.ModuleName -match '^(openvino|onnxruntime)' } | ForEach-Object { $_.FileName })
+    Write-Host "Service uses the shipped VC++ runtime; runtime DLLs loaded: $($runtimes -join ', ')"
 }
 
 function Install-AndCheck([string]$Log) {
@@ -229,6 +267,7 @@ function Install-AndCheck([string]$Log) {
     $pidNow = (Get-CimInstance Win32_Service -Filter "Name='$Service'").ProcessId
     if ($pidNow -ne $pidRunning) { Fail "the service process changed ($pidRunning -> $pidNow): it was restarted" @($Log) }
     Write-Host "Service ready, same process."
+    Assert-VcRuntime $pidNow $Log
 
     if (-not (Test-Path $Config)) { Fail "$Config was not created" @($Log) }
     Write-Host "Config present: $Config"

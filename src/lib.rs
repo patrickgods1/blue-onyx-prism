@@ -23,6 +23,9 @@
 //! - [`runner`]    server run loop (generations, restart) shared by the CLI and the service
 //! - [`metrics`]   request/latency counters and Prometheus rendering
 //! - [`logbuf`]    in-memory ring of recent log events for the web UI's Logs page
+//! - [`panic`]     the panic hook every binary installs: panics go to the log
+//! - [`diagnostics`] the support bundle (`diagnostics` command, `GET /v1/diagnostics`)
+//! - [`port_holder`] which process listens on a port (for a bind failure's message)
 //! - [`resources`] downloadable runtimes/models: pinned catalog and the needs resolver
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
 //! - [`training`]  in-app model training: capability, recipes, dataset assembly, the run queue
@@ -70,13 +73,16 @@ pub mod config;
 pub mod config_form;
 pub mod config_merge;
 pub mod config_store;
+pub mod diagnostics;
 pub mod download;
 pub mod image;
 pub mod image_stats;
 pub mod logbuf;
 pub mod metrics;
 pub mod model;
+pub mod panic;
 pub mod parallel;
+pub mod port_holder;
 pub mod prep;
 pub mod profile;
 pub mod registry;

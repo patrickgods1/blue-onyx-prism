@@ -522,18 +522,149 @@ fn stop_server(
 /// [`run_server_on`] with a given [`Provisioner`] (tests inject catalog entries through it).
 pub fn run_server_with(
     rt: &tokio::runtime::Runtime,
+    config: Config,
+    config_path: PathBuf,
+    log: LogReloadHandle,
+    shutdown: CancellationToken,
+    provisioner: Provisioner,
+) -> Result<()> {
+    run_server_inner(rt, config, config_path, log, shutdown, provisioner, None)
+}
+
+/// [`run_server_on`] that calls `on_bound` with the port once the HTTP listener is bound (the
+/// Windows service reports Running then, not before). A bind failure is a [`BindFailed`].
+pub fn run_server_notifying(
+    rt: &tokio::runtime::Runtime,
+    config: Config,
+    config_path: PathBuf,
+    log: LogReloadHandle,
+    shutdown: CancellationToken,
+    on_bound: Box<dyn FnOnce(u16) + Send>,
+) -> Result<()> {
+    run_server_inner(
+        rt,
+        config,
+        config_path,
+        log,
+        shutdown,
+        Provisioner::new(),
+        Some(on_bound),
+    )
+}
+
+/// The HTTP listener could not be bound, so no generation started. Typed so the Windows service
+/// tells it from other startup failures (`anyhow::Error::downcast_ref::<BindFailed>()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindFailed {
+    pub address: std::net::IpAddr,
+    pub port: u16,
+    /// What failed, what holds the port ([`crate::port_holder`]) and what to do.
+    pub message: String,
+}
+
+impl std::fmt::Display for BindFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BindFailed {}
+
+impl BindFailed {
+    /// The failure to bind `address:port` (`error`), with the holder `holder` found for it.
+    pub fn new(
+        address: std::net::IpAddr,
+        port: u16,
+        error: &anyhow::Error,
+        holder: Option<&crate::port_holder::Lookup>,
+        config_path: &std::path::Path,
+    ) -> Self {
+        let held = holder
+            .map(|h| format!("; {}", h.describe(port)))
+            .unwrap_or_default();
+        Self {
+            address,
+            port,
+            message: format!(
+                "{error:#}{held}. Stop the program that holds the port, or set another `port` in \
+                 {} and start again",
+                config_path.display()
+            ),
+        }
+    }
+}
+
+/// How long the Windows service keeps retrying a port it cannot bind before it stops with an
+/// error, so the service's failure actions (restart, alert) apply instead of a service that
+/// reports Running with no HTTP server.
+pub const BIND_GIVE_UP: Duration = Duration::from_secs(60);
+
+/// The service's count of bind failures in a row: [`BindRetry::failed`] says when to give up
+/// (binds failing for [`BIND_GIVE_UP`] with no success between). Other failures (a config
+/// that cannot be read, a model registry that does not start) neither count nor reset it.
+#[derive(Debug, Clone)]
+pub struct BindRetry {
+    first_failure: Option<Instant>,
+    limit: Duration,
+}
+
+impl BindRetry {
+    pub fn new(limit: Duration) -> Self {
+        Self {
+            first_failure: None,
+            limit,
+        }
+    }
+
+    /// A bind failed at `now`: true once binds have failed for at least the limit.
+    pub fn failed(&mut self, now: Instant) -> bool {
+        let first = *self.first_failure.get_or_insert(now);
+        now.saturating_duration_since(first) >= self.limit
+    }
+
+    /// The listener is bound: the next failure starts a new count.
+    pub fn bound(&mut self) {
+        self.first_failure = None;
+    }
+
+    /// How long binds have been failing at `now` (zero when the last one succeeded).
+    pub fn failing_for(&self, now: Instant) -> Duration {
+        self.first_failure
+            .map_or(Duration::ZERO, |f| now.saturating_duration_since(f))
+    }
+}
+
+fn run_server_inner(
+    rt: &tokio::runtime::Runtime,
     mut config: Config,
     config_path: PathBuf,
     log: LogReloadHandle,
     shutdown: CancellationToken,
     provisioner: Provisioner,
+    on_bound: Option<Box<dyn FnOnce(u16) + Send>>,
 ) -> Result<()> {
     let provisioner = Arc::new(provisioner);
     ensure_models(&config, &config_path)?;
     let started = Instant::now();
     // The listener is bound once and survives generation restarts (a port change in the config
     // applies when the process restarts).
-    let listeners = rt.block_on(server::bind(config.bind_address, config.port))?;
+    let listeners = match rt.block_on(server::bind(config.bind_address, config.port)) {
+        Ok(l) => l,
+        Err(e) => {
+            let holder = (config.port != 0).then(|| crate::port_holder::lookup(config.port));
+            return Err(BindFailed::new(
+                config.bind_address,
+                config.port,
+                &e,
+                holder.as_ref(),
+                &config_path,
+            )
+            .into());
+        }
+    };
+    if let Some(f) = on_bound {
+        f(listeners.port());
+    }
     // systemd `Type=notify`: the listener is up (models compile in the background; `/v1/status`
     // reports readiness). The watchdog pings while the listener accepts connections, so a hung
     // process is restarted but a model that compiles for minutes is not.
@@ -931,6 +1062,71 @@ mod tests {
         let flags: Vec<bool> = next.models.iter().map(|m| m.enabled).collect();
         assert_eq!(flags, [true, false]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A port in use fails the start with a typed [`BindFailed`] that names the address and
+    /// what holds the port (this test process, where the OS tools can see it), and `on_bound`
+    /// is not called.
+    #[test]
+    fn a_port_in_use_is_a_typed_bind_failure() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let config = Config {
+            bind_address: [127, 0, 0, 1].into(),
+            port,
+            models: vec![ModelConfig {
+                name: Some("m".into()),
+                path: "models/m.onnx".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rt = build_runtime().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = called.clone();
+        let err = run_server_notifying(
+            &rt,
+            config,
+            PathBuf::from("/x/cfg.json"),
+            crate::cli::LogReloadHandle::detached(crate::config::LogLevel::Info),
+            CancellationToken::new(),
+            Box::new(move |_| flag.store(true, Ordering::SeqCst)),
+        )
+        .unwrap_err();
+        assert!(!called.load(Ordering::SeqCst));
+        let bind = err
+            .downcast_ref::<BindFailed>()
+            .expect("typed bind failure");
+        assert_eq!((bind.address, bind.port), ([127, 0, 0, 1].into(), port));
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("binding 127.0.0.1:{port}")), "{msg}");
+        assert!(msg.contains(&format!("port {port}")), "{msg}");
+        assert!(msg.contains("set another `port` in /x/cfg.json"), "{msg}");
+        if msg.contains("is held by") {
+            assert!(
+                msg.contains(&format!("PID {}", std::process::id())),
+                "{msg}"
+            );
+        }
+        rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    }
+
+    #[test]
+    fn bind_retry_gives_up_after_its_limit_and_resets_on_a_bind() {
+        let t0 = Instant::now();
+        let s = |n| t0 + Duration::from_secs(n);
+        let mut r = BindRetry::new(BIND_GIVE_UP);
+        assert_eq!(r.failing_for(t0), Duration::ZERO);
+        assert!(!r.failed(s(0)));
+        assert!(!r.failed(s(30)));
+        assert!(!r.failed(s(59)));
+        assert_eq!(r.failing_for(s(59)), Duration::from_secs(59));
+        assert!(r.failed(s(60)));
+        // A successful bind (e.g. a restart in between) starts a new count.
+        r.bound();
+        assert!(!r.failed(s(100)));
+        assert!(!r.failed(s(159)));
+        assert!(r.failed(s(160)));
     }
 
     #[test]

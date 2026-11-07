@@ -9,7 +9,10 @@ draft it creates. Each build job installs, checks and uninstalls its installers 
 
 1. CI is green on `main` (build-test on all three OSes, including the OpenVINO CPU,
    ONNX Runtime CPU, macOS CoreML smoke tests; the Windows DirectML smoke test is informational
-   until it is made required).
+   until it is made required). `release.yml` checks this itself: its first job (`ci-green`,
+   `packaging/release/wait-ci-green.sh`) refuses to build unless every check of the tagged commit
+   passed, waiting up to 80 minutes for running ones. Tag only a commit whose CI already finished
+   green, or the release waits, then refuses.
 2. Update `version` in `Cargo.toml` (and `Cargo.lock`) and merge to `main`. The tag must equal that
    version, or the release workflow fails.
 3. Manual NVIDIA check (CUDA/TensorRT cannot run on hosted runners). The pinned CUDA build of ONNX
