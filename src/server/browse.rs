@@ -203,7 +203,57 @@ fn roots(cfg: &Config) -> Vec<(String, PathBuf)> {
             add(&format!("{}:\\", letter as char), d);
         }
     }
+    #[cfg(unix)]
+    for v in mounted_volumes() {
+        let label = v
+            .file_name()
+            .map_or_else(|| display(&v), |n| n.to_string_lossy().into_owned());
+        add(&label, v);
+    }
     out
+}
+
+/// The folders where an external drive is mounted, the Unix twin of the Windows drive letters:
+/// macOS `/Volumes/*`, Linux `/media/*`, `/media/<user>/*`, `/run/media/<user>/*` and `/mnt/*`.
+#[cfg(unix)]
+fn mounted_volumes() -> Vec<PathBuf> {
+    let (bases, depth): (&[&str], usize) = if cfg!(target_os = "macos") {
+        (&["/Volumes"], 1)
+    } else {
+        (&["/media", "/run/media", "/mnt"], 2)
+    };
+    let mut out = Vec::new();
+    for base in bases {
+        mount_points_under(Path::new(base), depth, &mut out);
+    }
+    out
+}
+
+/// The mount points among the folders under `base`, looking `depth` levels down past folders
+/// that are not one. A mount point is a real folder (no symlink: `/Volumes/Macintosh HD` links to
+/// `/`, which would make every path browsable) on another device than the folder holding it, so
+/// an empty `/mnt/x` or a plain folder adds nothing.
+#[cfg(unix)]
+fn mount_points_under(base: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    use std::os::unix::fs::MetadataExt as _;
+    let (Ok(parent), Ok(rd)) = (std::fs::symlink_metadata(base), std::fs::read_dir(base)) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        let Ok(m) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if !m.file_type().is_dir() {
+            continue;
+        }
+        if m.dev() != parent.dev() {
+            out.push(p);
+        } else if depth > 1 {
+            mount_points_under(&p, depth - 1, out);
+        }
+    }
 }
 
 fn root_views(roots: &[(String, PathBuf)]) -> Vec<Root> {
@@ -307,7 +357,8 @@ fn resolve(cfg: &Config, raw: &str, trust_picked: bool) -> Result<PathBuf, Brows
     let outside = || BrowseError {
         status: StatusCode::FORBIDDEN,
         message: format!(
-            "{raw} is outside the browsable folders ({})",
+            "{raw} is outside the browsable folders ({}). Pick it with Browse... on this \
+             computer's screen to use it anyway.",
             roots
                 .iter()
                 .map(|(_, r)| display(r))
@@ -473,6 +524,31 @@ mod tests {
 
     fn names(l: &Listing) -> Vec<&str> {
         l.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_drives_are_roots_but_a_link_to_the_system_disk_is_not() {
+        let (root, _cfg) = setup();
+        let base = root.join("volumes");
+        std::fs::create_dir_all(base.join("plain/inner")).unwrap();
+        std::os::unix::fs::symlink("/", base.join("Macintosh HD")).unwrap();
+        let mut found = Vec::new();
+        mount_points_under(&base, 2, &mut found);
+        assert!(found.is_empty(), "no mount point here: {found:?}");
+        mount_points_under(&root.join("missing"), 2, &mut found);
+        assert!(found.is_empty());
+        // This machine's own volumes: none of them makes the whole disk browsable.
+        for v in mounted_volumes() {
+            let c = v.canonicalize().unwrap_or_else(|_| v.clone());
+            assert_ne!(c, Path::new("/"), "{} resolves to /", v.display());
+            assert!(
+                !std::fs::symlink_metadata(&v)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
     }
 
     #[test]

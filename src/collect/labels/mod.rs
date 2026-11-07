@@ -8,7 +8,7 @@
 //! ([`LabelBox::is_dismissed`]). IO: [`Frame::resolve`], [`Frame::resolve_in`] on a walk (every frame reference goes through
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
-//! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
+//! review queue is in [`queue`], with a background index of it for the Review tab in [`index`], the bulk accept and the low-score and unwanted-class rejects in
 //! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
 //! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
 //! [`repeats`], the rejected and parked spots a labelers run remembers in [`spots`], the duplicate
@@ -17,6 +17,7 @@
 
 pub mod bulk;
 pub mod export;
+pub mod index;
 pub mod overlaps;
 pub mod queue;
 pub mod repeats;
@@ -1427,6 +1428,7 @@ fn write_locked(path: &Path, f: &LabelFile) -> Result<()> {
     let r =
         layout::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()));
     repeats::written(path);
+    index::written(path);
     r
 }
 
@@ -1490,6 +1492,7 @@ pub fn unless_protected<T>(path: &Path, delete: impl FnOnce() -> T) -> Option<T>
     }
     let out = delete();
     repeats::written(path);
+    index::written(path);
     Some(out)
 }
 

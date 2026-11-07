@@ -891,6 +891,41 @@ process.stdout.write(JSON.stringify(
     assert_eq!(got, json!(want));
 }
 
+/// What a landed `loadNext` answer shows (`assets/review-rules.js` `nextLanding`): a counts refresh
+/// keeps the frame on screen, but with nothing on screen it brings the frame it found, which is how
+/// the 2 s refresh while a big folder is indexed shows the first frame to come in.
+#[test]
+fn a_refresh_keeps_the_frame_on_screen_and_brings_one_when_there_is_none() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+process.stdout.write(JSON.stringify(
+  req.map(([kind, replaced, shown]) => globalThis.ReviewRules.nextLanding(kind, replaced, shown))));
+"#;
+    let table = [
+        // A real Next shows its frame, whatever was there.
+        ("real", false, true, "frame"),
+        ("real", false, false, "frame"),
+        // A newer real intent replaced it: that one lands.
+        ("real", true, true, "counts"),
+        ("real", true, false, "counts"),
+        // A counts refresh keeps the frame on screen and its edits.
+        ("counts", false, true, "counts"),
+        // Nothing on screen (indexing, or no frame matched): it shows what it found.
+        ("counts", false, false, "frame"),
+        ("counts", true, false, "counts"),
+        ("counts", true, true, "counts"),
+    ];
+    let request: Vec<Value> = table.iter().map(|(k, r, s, _)| json!([k, r, s])).collect();
+    let got = node_with(driver, &json!(request));
+    let want: Vec<&str> = table.iter().map(|t| t.3).collect();
+    assert_eq!(got, json!(want));
+}
+
 /// Needs no `node`: the page loads the rules first, and they stay pure.
 #[test]
 fn the_page_loads_the_rules_first_and_they_touch_no_page() {

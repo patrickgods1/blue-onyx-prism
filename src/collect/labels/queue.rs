@@ -9,8 +9,8 @@
 //! on [`parallel::walk_threads`] threads, and merge in a fixed order: the answers do not depend on
 //! the threads. Nothing here writes.
 
-use super::super::layout::{self, REVIEW_QUEUE_FILE, Walker};
-use super::super::record::{Bucket, Record};
+use super::super::layout::{self, REVIEW_QUEUE_FILE, ReviewLine, Walker};
+use super::super::record::{Bucket, IndexLine, Record};
 use super::bulk::Wanted;
 use super::{BoxState, Frame, LabelFile, Status, Triage};
 use crate::parallel;
@@ -227,7 +227,7 @@ impl Filters {
     }
 
     /// Whether a frame with `labels` passes the auto filter.
-    fn auto_keeps(&self, labels: Option<&LabelFile>) -> bool {
+    pub(super) fn auto_keeps(&self, labels: Option<&LabelFile>) -> bool {
         match self.auto {
             None => true,
             Some(AutoFilter::Overlaps) => {
@@ -243,7 +243,7 @@ impl Filters {
 
     /// The sort strength of a frame with `labels`: its strongest overlap suggestion under
     /// `auto=overlaps`, else 0 (no effect on the order).
-    fn overlap_strength(&self, labels: Option<&LabelFile>) -> u32 {
+    pub(super) fn overlap_strength(&self, labels: Option<&LabelFile>) -> u32 {
         match (self.auto, labels) {
             (Some(AutoFilter::Overlaps), Some(l)) => {
                 super::overlaps::frame_strength(l, self.wanted().as_ref())
@@ -254,7 +254,7 @@ impl Filters {
 
     /// The sort count of a frame with `labels`: its agreed boxes under `auto=both`, else 0 (no
     /// effect on the order).
-    fn agreed_boxes(&self, labels: Option<&LabelFile>) -> u32 {
+    pub(super) fn agreed_boxes(&self, labels: Option<&LabelFile>) -> u32 {
         match (self.auto, labels) {
             (Some(AutoFilter::Both), Some(l)) => {
                 u32::try_from(agreed_boxes(l, self.wanted().as_ref())).unwrap_or(u32::MAX)
@@ -265,7 +265,7 @@ impl Filters {
 }
 
 /// The labels of the boxes of `l` that are not rejected.
-fn file_labels(l: &LabelFile) -> BTreeSet<String> {
+pub(super) fn file_labels(l: &LabelFile) -> BTreeSet<String> {
     l.boxes
         .iter()
         .filter(|b| b.state != super::BoxState::Rejected)
@@ -391,23 +391,7 @@ impl Uncertainty {
     /// disagreement, then the most likely boxes, fewer flagged boxes (17 flagged boxes on a frame
     /// with no likely one are mostly false: an empty yard must not open the queue), then the margin
     /// in hundredths (no box last), verifier disagreement, more suppressed boxes.
-    #[allow(
-        clippy::type_complexity,
-        reason = "a lexicographic sort key reads best as one tuple"
-    )]
-    fn key(
-        &self,
-    ) -> (
-        std::cmp::Reverse<u32>,
-        std::cmp::Reverse<u32>,
-        bool,
-        bool,
-        std::cmp::Reverse<u32>,
-        usize,
-        u32,
-        bool,
-        std::cmp::Reverse<usize>,
-    ) {
+    pub(super) fn key(&self) -> SortKey {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -429,6 +413,19 @@ impl Uncertainty {
         )
     }
 }
+
+/// What [`Uncertainty::key`] sorts by: a lexicographic key reads best as one tuple.
+pub(super) type SortKey = (
+    std::cmp::Reverse<u32>,
+    std::cmp::Reverse<u32>,
+    bool,
+    bool,
+    std::cmp::Reverse<u32>,
+    usize,
+    u32,
+    bool,
+    std::cmp::Reverse<usize>,
+);
 
 /// One frame of the sorted queue.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -556,12 +553,13 @@ pub struct Queue {
     pub unreadable: u64,
 }
 
-/// The candidates of `dir`: the review queue's frames first, then (with `All`) every indexed
-/// frame, each once.
-pub fn candidates(dir: &Path, source: QueueSource) -> Vec<Candidate> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for l in layout::read_review(&dir.join(REVIEW_QUEUE_FILE)) {
+/// Add the frames of review lines `lines` to `out`, each once with those in `seen`.
+pub(super) fn review_candidates(
+    lines: Vec<ReviewLine>,
+    seen: &mut BTreeSet<String>,
+    out: &mut Vec<Candidate>,
+) {
+    for l in lines {
         if layout::parse_rel(&l.frame).is_some() && seen.insert(l.frame.clone()) {
             out.push(Candidate {
                 rel: l.frame,
@@ -572,6 +570,40 @@ pub fn candidates(dir: &Path, source: QueueSource) -> Vec<Candidate> {
             });
         }
     }
+}
+
+/// Add the frames of `lines`, the index lines of a day folder of `date`, to `out`, each once with
+/// those in `seen`.
+pub(super) fn index_candidates(
+    lines: Vec<IndexLine>,
+    date: &str,
+    seen: &mut BTreeSet<String>,
+    out: &mut Vec<Candidate>,
+) {
+    for line in lines {
+        let rel = format!("{}/{}/{date}/{}.jpg", line.scene, line.camera, line.id);
+        if layout::parse_rel(&rel).is_some() && seen.insert(rel.clone()) {
+            out.push(Candidate {
+                rel,
+                scene: line.scene,
+                camera: line.camera,
+                buckets: line.buckets,
+                queued: false,
+            });
+        }
+    }
+}
+
+/// The candidates of `dir`: the review queue's frames first, then (with `All`) every indexed
+/// frame, each once.
+pub fn candidates(dir: &Path, source: QueueSource) -> Vec<Candidate> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    review_candidates(
+        layout::read_review(&dir.join(REVIEW_QUEUE_FILE)),
+        &mut seen,
+        &mut out,
+    );
     if source == QueueSource::All {
         for day in layout::day_dirs(dir) {
             let date = day
@@ -579,18 +611,8 @@ pub fn candidates(dir: &Path, source: QueueSource) -> Vec<Candidate> {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
-            for line in layout::read_index(&day.join(layout::INDEX_FILE)) {
-                let rel = format!("{}/{}/{date}/{}.jpg", line.scene, line.camera, line.id);
-                if layout::parse_rel(&rel).is_some() && seen.insert(rel.clone()) {
-                    out.push(Candidate {
-                        rel,
-                        scene: line.scene,
-                        camera: line.camera,
-                        buckets: line.buckets,
-                        queued: false,
-                    });
-                }
-            }
+            let lines = layout::read_index(&day.join(layout::INDEX_FILE));
+            index_candidates(lines, &date, &mut seen, &mut out);
         }
     }
     out
@@ -598,12 +620,12 @@ pub fn candidates(dir: &Path, source: QueueSource) -> Vec<Candidate> {
 
 /// The day folder of a frame's `rel` (from the path: a review line's own `camera` and `scene` may
 /// say something else).
-fn day_of(rel: &str) -> &str {
+pub(super) fn day_of(rel: &str) -> &str {
     rel.rsplit_once('/').map_or(rel, |(day, _)| day)
 }
 
 /// `candidates` per day folder, in the order each folder first comes up.
-fn by_day(candidates: Vec<Candidate>) -> Vec<Vec<Candidate>> {
+pub(super) fn by_day(candidates: Vec<Candidate>) -> Vec<Vec<Candidate>> {
     let mut at: HashMap<String, usize> = HashMap::new();
     let mut days: Vec<Vec<Candidate>> = Vec::new();
     for c in candidates {

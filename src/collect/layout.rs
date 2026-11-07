@@ -502,6 +502,7 @@ pub fn rewrite_index(day: &Path) -> Result<usize> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
         }
+        super::labels::index::day_written(day);
         return Ok(0);
     }
     let mut text = String::new();
@@ -510,6 +511,7 @@ pub fn rewrite_index(day: &Path) -> Result<usize> {
         text.push('\n');
     }
     write_atomic(&path, text.as_bytes())?;
+    super::labels::index::day_written(day);
     Ok(kept.len())
 }
 
@@ -620,6 +622,9 @@ pub fn append_review(dir: &Path, rels: &[String]) -> Result<usize> {
         append_line(&path, &serde_json::to_string(&l)?)
             .with_context(|| format!("writing {}", path.display()))?;
         added += 1;
+    }
+    if added > 0 {
+        super::labels::index::queue_written(dir);
     }
     Ok(added)
 }

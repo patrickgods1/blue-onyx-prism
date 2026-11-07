@@ -229,6 +229,18 @@
     return waiting === 'real' ? 'drop' : 'queue';
   }
 
+  // What an answer of the page's `loadNext` shows once it lands, for a walk of `kind` ('real' or
+  // 'counts'): 'frame' its frame (or "no frame matches"), 'counts' the counts and lists only. A walk
+  // a newer real intent replaced (`replaced`) leaves the frame to that one. A counts refresh keeps
+  // the frame on screen and its edits; with none on screen or loading (`shown` false) it shows what
+  // it found: that is how the 2 s refresh while a big folder is indexed brings the first frame, and
+  // swaps "Indexing..." for "No frame matches" once the index is done with none.
+  function nextLanding(kind, replaced, shown) {
+    if (replaced) return 'counts';
+    if (kind === 'real') return 'frame';
+    return shown ? 'counts' : 'frame';
+  }
+
   globalThis.ReviewRules = {
     STACK_IOU: STACK_IOU,
     OVERLAP_IOU: OVERLAP_IOU,
@@ -249,6 +261,7 @@
     markRejected: markRejected,
     markDuplicate: markDuplicate,
     acceptOverlap: acceptOverlap,
-    nextPlan: nextPlan
+    nextPlan: nextPlan,
+    nextLanding: nextLanding
   };
 }());

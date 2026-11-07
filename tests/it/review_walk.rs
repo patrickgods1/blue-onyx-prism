@@ -1,4 +1,4 @@
-//! How long the review walks take on a big folder, and what a compact index of it would weigh.
+//! How long the review walks take on a big folder, and what the review index of it weighs.
 //! A measurement, not a check (`docs/PRODUCTION_REVIEW.md`, "Review walk measurements"): it prints
 //! tables and does nothing unless `BOP_WALK_FRAMES` is set, so `--ignored` runs in CI skip it. A
 //! debug build says nothing about these costs, so use `--release`:
@@ -21,6 +21,7 @@
 
 use blue_onyx_prism::backend::memory::process_memory;
 use blue_onyx_prism::collect::labels::bulk::{self, Wanted};
+use blue_onyx_prism::collect::labels::index;
 use blue_onyx_prism::collect::labels::overlaps::{Suggestion, Verdict};
 use blue_onyx_prism::collect::labels::queue::{
     self, AutoFilter, Candidate, Filters, QueueSource, StatusFilter,
@@ -679,227 +680,103 @@ fn one_frame(
     true
 }
 
-/// One frame of a compact index: everything [`queue::build`], its filters except the two that
-/// need boxes, [`queue::sort_items`] and the counts read. Text lives in an arena, classes as ids.
-#[derive(Clone, Copy, Default)]
-#[allow(
-    dead_code,
-    reason = "the size is the point; only the query reads some fields"
-)]
-struct Row {
-    ts_ms: u64,
-    stem_at: u32,
-    classes_at: u32,
-    boxes_at: u32,
-    suggestions_at: u32,
-    camera: u16,
-    date: u16,
-    model: u16,
-    /// queued, has a label file, empty confirmed, auto run, evidence, auto review, auto accept,
-    /// repeats only, dismissed box, overlaps checked, verifier disagreement, relabel note.
-    flags: u16,
-    stem_len: u8,
-    scene: u8,
-    status: u8,
-    buckets: u8,
-    /// Hundredths; 255 = no box.
-    margin: u8,
-    suppressed: u8,
-    auto_review: u8,
-    likely: u8,
-    /// Distinct classes ([`queue::frame_labels`]), then the training boxes' classes.
-    classes: u8,
-    training: u8,
-    rejected: u8,
-    audit_accepted: u8,
-    audit_rejected: u8,
-    boxes: u8,
-    suggestions: u8,
+/// A query through the index: the answer, and how long it took.
+fn ask(dir: &Path, f: &Filters, after: Option<&str>) -> (Duration, Option<index::Answer>) {
+    timed(|| index::answer(dir, f, after))
 }
 
-/// What `auto=overlaps`, `auto=both` and `overlaps::live` read of a box, for any class list.
-#[derive(Clone, Copy, Default)]
-#[allow(dead_code, reason = "the size is the point")]
-struct BoxRow {
-    bbox: [f32; 4],
-    label: u16,
-    /// The spelling a relabel left (`overlaps::guarded`).
-    model_label: u16,
-    /// State, source, moved (`orig_bbox`).
-    flags: u8,
-    labelers: u8,
-}
-
-/// What `overlaps::live` and `strength` read of a suggestion.
-#[derive(Clone, Copy, Default)]
-#[allow(dead_code, reason = "the size is the point")]
-struct SuggestionRow {
-    a: [f32; 4],
-    b: [f32; 4],
-    kept_score: f32,
-    other_score: f32,
-    /// Verdict, low confidence, weak.
-    flags: u8,
-}
-
-#[derive(Default)]
-struct Compact {
-    rows: Vec<Row>,
-    stems: Vec<u8>,
-    classes: Vec<u16>,
-    /// Boxes of the frames with two or more live boxes, or an agreed box.
-    boxes: Vec<BoxRow>,
-    all_boxes: u64,
-    suggestions: Vec<SuggestionRow>,
-    /// `LabelFile::disagreement`: the page shows it, the sort only tests it.
-    notes: Vec<u8>,
-    names: HashMap<String, u16>,
-}
-
-fn intern(names: &mut HashMap<String, u16>, name: &str) -> u16 {
-    let next = u16::try_from(names.len()).unwrap();
-    *names.entry(name.to_string()).or_insert(next)
-}
-
-fn small(n: usize) -> u8 {
-    u8::try_from(n).unwrap_or(u8::MAX)
-}
-
-impl Compact {
-    fn add(&mut self, c: &Candidate, rec: &Record, l: Option<&LabelFile>) {
-        let r = layout::parse_rel(&c.rel).unwrap();
-        let classes = queue::frame_labels(rec, l);
-        let classes_at = u32::try_from(self.classes.len()).unwrap();
-        for name in &classes {
-            let id = intern(&mut self.names, name);
-            self.classes.push(id);
+/// The review index at its real entry: build time (first query until `indexing` is gone), the
+/// queries the page makes, a query right after one label write, bytes and resident growth.
+#[allow(clippy::cast_precision_loss, reason = "printed ratios")]
+fn indexed(dir: &Path, every: &Filters) {
+    index::forget();
+    let before = process_memory().map(|m| m.resident);
+    let start = Instant::now();
+    let mut polls = 0u32;
+    let built = loop {
+        let (_, a) = ask(dir, every, None);
+        polls += 1;
+        match a {
+            None => {
+                println!("\nThe index declined (too small, over the ceiling or no thread).");
+                return;
+            }
+            Some(a) if a.indexing.is_none() => break a,
+            Some(_) => {}
         }
-        let u = queue::Uncertainty::of(rec).with_labels(l);
-        let mut row = Row {
-            ts_ms: 0,
-            stem_at: u32::try_from(self.stems.len()).unwrap(),
-            classes_at,
-            boxes_at: u32::try_from(self.boxes.len()).unwrap(),
-            suggestions_at: u32::try_from(self.suggestions.len()).unwrap(),
-            camera: intern(&mut self.names, &c.camera),
-            date: intern(&mut self.names, &r.date),
-            model: intern(&mut self.names, &rec.model),
-            stem_len: small(r.stem.len()),
-            buckets: c.buckets.iter().fold(0, |m, b| m | 1 << (*b as u8)),
-            margin: u.margin.map_or(255, |m| small((m * 100.0) as usize)),
-            suppressed: small(u.suppressed),
-            auto_review: small(u.auto_review),
-            likely: small(u.likely_boxes as usize),
-            classes: small(classes.len()),
-            flags: u16::from(c.queued) | u16::from(u.disagreement) << 1,
-            ..Row::default()
-        };
-        self.stems.extend_from_slice(r.stem.as_bytes());
-        if let Some(l) = l {
-            row.status = l.status as u8;
-            row.flags |= 1 << 2;
-            row.flags |= u16::from(queue::AutoFilter::Accept.matches(Some(l))) << 3;
-            row.flags |= u16::from(queue::AutoFilter::Repeats.matches(Some(l))) << 4;
-            row.flags |= u16::from(queue::AutoFilter::Dismissed.matches(Some(l))) << 5;
-            row.flags |= u16::from(l.auto_run.is_some()) << 6;
-            row.flags |= u16::from(l.boxes.iter().any(|b| !b.auto.is_empty())) << 7;
-            for b in l.training() {
-                let id = intern(&mut self.names, &b.label);
-                self.classes.push(id);
-                row.training = row.training.saturating_add(1);
-            }
-            row.rejected = small(l.hard_negatives().count());
-            if let Some(note) = &l.disagreement {
-                self.notes.extend_from_slice(note.as_bytes());
-            }
-            self.all_boxes += l.boxes.len() as u64;
-            let live = l
-                .boxes
-                .iter()
-                .filter(|b| b.state != BoxState::Rejected)
-                .count();
-            let agreed = l.boxes.iter().any(|b| b.auto.labelers.len() >= 2);
-            if live >= 2 || agreed {
-                for b in &l.boxes {
-                    let label = intern(&mut self.names, &b.label);
-                    self.boxes.push(BoxRow {
-                        bbox: b.bbox,
-                        label,
-                        model_label: 0,
-                        flags: b.state as u8,
-                        labelers: small(b.auto.labelers.len()),
-                    });
-                    row.boxes = row.boxes.saturating_add(1);
-                }
-            }
-            for s in &l.overlap_suggestions {
-                self.suggestions.push(SuggestionRow {
-                    a: s.a,
-                    b: s.b,
-                    kept_score: s.kept_score.unwrap_or(0.0),
-                    other_score: s.other_score.unwrap_or(0.0),
-                    flags: s.verdict as u8,
-                });
-                row.suggestions = row.suggestions.saturating_add(1);
-            }
-        }
-        self.rows.push(row);
+        assert!(
+            start.elapsed() < Duration::from_secs(1800),
+            "build never ended"
+        );
+    };
+    let build = start.elapsed();
+    let rows = built.total.max(1);
+    let bytes = index::bytes().unwrap_or(0);
+    println!(
+        "\nReview index ({rows} frames): built in {:.0} ms ({polls} queries until done); {} bytes = \
+         {:.0} bytes/frame, {:.1} MB here, {:.1} MB at 200k frames",
+        ms(build),
+        bytes,
+        bytes as f64 / rows as f64,
+        bytes as f64 / 1e6,
+        bytes as f64 / rows as f64 * 200_000.0 / 1e6,
+    );
+    let wanted = every.wanted.clone();
+    let unreviewed = Filters {
+        status: StatusFilter::default(),
+        ..every.clone()
+    };
+    let with_auto = |auto| Filters {
+        auto: Some(auto),
+        ..every.clone()
+    };
+    let one_camera = Filters {
+        camera: Some(CAMERAS[0].to_string()),
+        ..every.clone()
+    };
+    let queries = [
+        ("status unreviewed", unreviewed),
+        ("status any", every.clone()),
+        ("auto=overlaps", with_auto(AutoFilter::Overlaps)),
+        ("auto=both", with_auto(AutoFilter::Both)),
+        ("one camera", one_camera),
+    ];
+    println!("\n| index query | first ms | warm ms | frames listed |\n|---|---|---|---|");
+    for (name, f) in &queries {
+        let (first, a) = ask(dir, f, None);
+        let n = a.as_ref().map_or(0, |a| a.total);
+        let rest = warm(|| ask(dir, f, None).0);
+        println!("| {name} | {:.2} | {:.2} | {n} |", ms(first), ms(rest));
     }
+    let walked = timed(|| index::Answer::walk(dir, every, None)).0;
+    println!(
+        "\nThe same `status any` answer by walking the files: {:.0} ms",
+        ms(walked)
+    );
 
-    /// The bytes of the frame rows, of the text and class arenas, and of the path lookup (a save
-    /// finds its row by hash: `HashMap<u64, u32>`, its capacity at the usual load).
-    fn core_bytes(&self) -> usize {
-        let lookup = self.rows.len() * 8 / 7 * (size_of::<(u64, u32)>() + 1);
-        self.rows.len() * size_of::<Row>()
-            + self.stems.len()
-            + self.classes.len() * size_of::<u16>()
-            + self.notes.len()
-            + self.names.keys().map(|k| k.len() + 48).sum::<usize>()
-            + lookup
+    // Read your own write: change one label file through the real writer, then ask at once.
+    let target = labels::label_files(dir).into_iter().next().map(|(_, p)| p);
+    if let Some(path) = target {
+        let mut file = labels::read(&path).unwrap().unwrap();
+        file.disagreement = Some("measured".into());
+        let (write, ()) = timed(|| labels::write(&path, &file).unwrap());
+        let (after, a) = ask(dir, every, None);
+        let seen = a.is_some_and(|a| a.indexing.is_none());
+        println!(
+            "A label write took {:.2} ms; the next `status any` query {:.2} ms (complete: {seen})",
+            ms(write),
+            ms(after)
+        );
     }
-
-    fn box_bytes(&self) -> usize {
-        self.boxes.len() * size_of::<BoxRow>()
+    drop(wanted);
+    if let (Some(b), Some(m)) = (before, process_memory()) {
+        println!(
+            "Process resident {:.0} MB, {:+.0} MB since before the index",
+            m.resident as f64 / 1e6,
+            (m.resident as f64 - b as f64) / 1e6,
+        );
     }
-
-    fn suggestion_bytes(&self) -> usize {
-        self.suggestions.len() * size_of::<SuggestionRow>()
-    }
-
-    /// What `/v1/review/next` would do with the index: filter, count per class, sort.
-    fn query(&self, status: u8) -> usize {
-        let mut per_class: HashMap<u16, u64> = HashMap::new();
-        let mut hits: Vec<(u16, u8, u8, u32)> = Vec::with_capacity(self.rows.len());
-        for (i, row) in self.rows.iter().enumerate() {
-            let at = row.classes_at as usize + usize::from(row.classes);
-            for id in &self.classes[at..at + usize::from(row.training)] {
-                *per_class.entry(*id).or_default() += 1;
-            }
-            if row.status == status {
-                let key = u16::from(row.likely) << 8 | u16::from(row.auto_review);
-                hits.push((key, row.margin, row.suppressed, u32::try_from(i).unwrap()));
-            }
-        }
-        hits.sort_unstable();
-        std::hint::black_box(per_class.len());
-        hits.len()
-    }
-}
-
-fn compact(dir: &Path) -> Compact {
-    let mut index = Compact::default();
-    for c in queue::candidates(dir, QueueSource::All) {
-        let frame = labels::Frame::resolve(dir, &c.rel).unwrap();
-        let rec = frame.record().unwrap();
-        let l = frame.labels().unwrap();
-        index.add(&c, &rec, l.as_ref());
-    }
-    index.rows.shrink_to_fit();
-    index.stems.shrink_to_fit();
-    index.classes.shrink_to_fit();
-    index.boxes.shrink_to_fit();
-    index.suggestions.shrink_to_fit();
-    index
+    index::forget();
 }
 
 /// The table of [`split`].
@@ -1030,55 +907,7 @@ fn report(dir: &Path, frames: u64, written: Option<&Written>) {
     });
     println!("sort_items on a clone, shuffled: {:.1} ms", ms(sort));
 
-    let (load, index) = timed(|| compact(dir));
-    let rows = index.rows.len();
-    let core = index.core_bytes();
-    let boxes = index.box_bytes();
-    let suggestions = index.suggestion_bytes();
-    let total = core + boxes + suggestions;
-    println!(
-        "\nCompact index ({rows} frames): Row {} bytes, BoxRow {}, SuggestionRow {}; {} boxes of \
-         {} kept ({:.1}/frame), {} suggestions; {} distinct names; built in {:.0} ms\n",
-        size_of::<Row>(),
-        size_of::<BoxRow>(),
-        size_of::<SuggestionRow>(),
-        index.boxes.len(),
-        index.all_boxes,
-        index.boxes.len() as f64 / rows as f64,
-        index.suggestions.len(),
-        index.names.len(),
-        ms(load),
-    );
-    println!("| part | bytes/frame | MB here | MB at 200k frames |\n|---|---|---|---|");
-    let at = |bytes: usize| {
-        let per = bytes as f64 / rows as f64;
-        format!(
-            "{per:.0} | {:.1} | {:.1}",
-            bytes as f64 / 1e6,
-            per * 200_000.0 / 1e6
-        )
-    };
-    println!("| rows, stems, classes, names, lookup | {} |", at(core));
-    println!("| boxes (overlaps, both) | {} |", at(boxes));
-    println!("| suggestions (strength) | {} |", at(suggestions));
-    println!("| total | {} |", at(total));
-    let query = warm(|| {
-        timed(|| {
-            std::hint::black_box(index.query(0));
-        })
-        .0
-    });
-    println!(
-        "\nThe same query on the index (filter, count, sort; the index in memory): {:.2} ms",
-        ms(query)
-    );
-    if let Some(m) = process_memory() {
-        println!(
-            "Process now: resident {:.0} MB, footprint {:?} MB",
-            m.resident as f64 / 1e6,
-            m.footprint.map(|b| b / 1_000_000)
-        );
-    }
+    indexed(dir, &every);
 }
 
 /// [`stacks`] on one frame, so the [`FrameMix`] stated above is known to reach the overlap filter.
@@ -1133,9 +962,20 @@ fn review_walks_on_a_big_folder() {
         let root = std::env::var_os("BOP_WALK_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
         let dir = root.join(format!("bop-walk-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        // Removed on drop, also when a walk panics. Canonical: the temp root on macOS is a link.
+        let guard = Folder(dir);
+        let dir = guard.0.canonicalize().unwrap();
         let (t, written) = timed(|| generate(&dir, frames));
         println!("generated {frames} frames in {:.1} s", t.as_secs_f64());
         report(&dir, frames, Some(&written));
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// A synthetic dataset folder, removed when dropped.
+struct Folder(PathBuf);
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

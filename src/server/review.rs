@@ -32,7 +32,7 @@ use crate::collect::labels::bulk::accept_one;
 use crate::collect::labels::export::{
     self, BenchSplit, ClassFilter, ExportRequest, Format, SplitConfig,
 };
-use crate::collect::labels::queue::{self, Filters};
+use crate::collect::labels::queue::Filters;
 use crate::collect::labels::{self, Frame, LabelFile, bulk, xany};
 use crate::collect::{Bucket, layout};
 use askama::Template;
@@ -266,7 +266,8 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
 /// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&after=`: the most
 /// uncertain frame matching the filters (after `after`, the frame shown now, when given; past
 /// the last one the first again with `wrapped`), its position, the counts and the cameras and
-/// classes for the filter lists.
+/// classes for the filter lists. A big folder answers from [`labels::index`], with
+/// `indexing: {done, total}` while its rows are still coming in; a small one is walked.
 pub(super) async fn next(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
@@ -279,22 +280,13 @@ pub(super) async fn next(
     blocking(move || {
         let (dir, classes, _) = context(&state);
         filters.wanted = Some((classes, hidden(&state)));
-        let built = queue::build(&dir, &filters);
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
-        let found = queue::next_after(&built.items, after);
-        let damaged = layout::damaged_lines(&dir, filters.source == queue::QueueSource::All);
-        let mut answer = serde_json::json!({
-            "success": true,
-            "item": found.map(|(_, i, _)| i),
-            "position": found.map(|(p, _, _)| p + 1),
-            "wrapped": found.is_some_and(|(_, _, w)| w),
-            "total": built.items.len(),
-            "counts": built.counts,
-            "cameras": built.cameras,
-            "labels": built.labels,
-            "unreadable": built.unreadable + damaged,
-            "upcoming": built.items.iter().skip(found.map_or(0, |(p, _, _)| p + 1)).take(5).map(|i| &i.frame).collect::<Vec<_>>(),
-        });
+        let found = labels::index::answer(&dir, &filters, after)
+            .unwrap_or_else(|| labels::index::Answer::walk(&dir, &filters, after));
+        let mut answer = serde_json::json!(found);
+        if let Some(fields) = answer.as_object_mut() {
+            fields.insert("success".into(), true.into());
+        }
         if let (Some(message), Some(fields)) =
             (folder_problem(&state, &dir), answer.as_object_mut())
         {
@@ -2211,6 +2203,75 @@ mod tests {
         state: Arc<AppState>,
         dir: PathBuf,
         root: PathBuf,
+        /// The dataset folder takes the review index ([`Way::Index`]).
+        _indexed: Option<Indexed>,
+    }
+
+    /// How `GET /v1/review/next` answers in a test: the walk over the files, or the review index,
+    /// which a folder this small takes only when a test asks ([`labels::index::tests::force`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Way {
+        Walk,
+        Index,
+    }
+
+    impl Way {
+        fn ds(self) -> Ds {
+            self.ds_with(|_| {})
+        }
+
+        fn ds_with(self, edit: impl FnOnce(&mut crate::config::Config)) -> Ds {
+            let mut d = ds_with(edit);
+            d._indexed = self.index(&d.dir);
+            d
+        }
+
+        /// `dir` takes the index too, until the guard goes (another folder under review).
+        fn index(self, dir: &std::path::Path) -> Option<Indexed> {
+            (self == Self::Index).then(|| Indexed::new(dir))
+        }
+    }
+
+    /// A folder the review index serves whatever its size, until this goes.
+    struct Indexed(PathBuf);
+
+    impl Indexed {
+        fn new(dir: &std::path::Path) -> Self {
+            labels::index::tests::force(dir);
+            Self(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for Indexed {
+        fn drop(&mut self) {
+            let served = labels::index::tests::served(&self.0);
+            labels::index::tests::unforce(&self.0);
+            // An indexed variant that the walk answered would prove nothing about the index. A
+            // folder that does not exist has no index to answer from.
+            if !std::thread::panicking() && self.0.is_dir() {
+                assert!(
+                    served,
+                    "the last /v1/review/next of {} was not answered by the index",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    /// One test on a walked folder and, as `$indexed`, on one the review index serves: the same
+    /// assertions hold either way.
+    macro_rules! both_ways {
+        ($walked:ident, $indexed:ident, $test:ident) => {
+            #[tokio::test]
+            async fn $walked() {
+                $test(Way::Walk).await;
+            }
+
+            #[tokio::test]
+            async fn $indexed() {
+                $test(Way::Index).await;
+            }
+        };
     }
 
     impl Drop for Ds {
@@ -2237,6 +2298,7 @@ mod tests {
             state,
             dir: root.join("dataset"),
             root,
+            _indexed: None,
         }
     }
 
@@ -2285,10 +2347,16 @@ mod tests {
         rel
     }
 
-    #[tokio::test]
-    async fn the_folder_under_review_can_be_another_folder() {
-        let d = ds();
+    both_ways!(
+        the_folder_under_review_can_be_another_folder,
+        the_folder_under_review_can_be_another_folder_indexed,
+        the_folder_under_review_can_be_another_folder_in
+    );
+
+    async fn the_folder_under_review_can_be_another_folder_in(way: Way) {
+        let d = way.ds();
         let imported = d.root.join("imported");
+        let _imported = way.index(&imported);
         let rel = put_frame(
             &imported,
             "drive",
@@ -2491,9 +2559,14 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn page_and_queue_and_labels_round_trip() {
-        let d = ds();
+    both_ways!(
+        page_and_queue_and_labels_round_trip,
+        page_and_queue_and_labels_round_trip_indexed,
+        page_and_queue_and_labels_round_trip_in
+    );
+
+    async fn page_and_queue_and_labels_round_trip_in(way: Way) {
+        let d = way.ds();
         let far = put_frame(
             &d.dir,
             "drive",
@@ -3271,9 +3344,14 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn next_wraps_past_the_last_frame() {
-        let d = ds();
+    both_ways!(
+        next_wraps_past_the_last_frame,
+        next_wraps_past_the_last_frame_indexed,
+        next_wraps_past_the_last_frame_in
+    );
+
+    async fn next_wraps_past_the_last_frame_in(way: Way) {
+        let d = way.ds();
         let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.52);
         let b = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_b", 0.95);
         let next = |after: &str| format!("/v1/review/next?after={}", encode_uri_component(after));
@@ -3327,9 +3405,14 @@ mod tests {
         labels::write(&frame.labels, &f).unwrap();
     }
 
-    #[tokio::test]
-    async fn bulk_accept_saves_only_the_frames_the_triage_settles() {
-        let d = ds();
+    both_ways!(
+        bulk_accept_saves_only_the_frames_the_triage_settles,
+        bulk_accept_saves_only_the_frames_the_triage_settles_indexed,
+        bulk_accept_saves_only_the_frames_the_triage_settles_in
+    );
+
+    async fn bulk_accept_saves_only_the_frames_the_triage_settles_in(way: Way) {
+        let d = way.ds();
         let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
         let b = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_b", 0.9);
         let c = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.9);
@@ -3572,11 +3655,16 @@ mod tests {
         assert!(v["rejected"].as_array().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn repeats_history_spot_edits_and_repeat_only_frames() {
+    both_ways!(
+        repeats_history_spot_edits_and_repeat_only_frames,
+        repeats_history_spot_edits_and_repeat_only_frames_indexed,
+        repeats_history_spot_edits_and_repeat_only_frames_in
+    );
+
+    async fn repeats_history_spot_edits_and_repeat_only_frames_in(way: Way) {
         use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
         use labels::{BoxState, Triage};
-        let d = ds();
+        let d = way.ds();
         let car = || auto_box("car", 0.4, Triage::Review); // [2, 2, 30, 40] of 64 x 48
         // A frame the reviewer looked at: the car there was rejected as a reflection.
         let seen = put_frame(&d.dir, "20261021T000000000Z_seen", None, vec![car()]);
@@ -3905,8 +3993,13 @@ mod tests {
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[tokio::test]
-    async fn reject_stacked_spans_reviewed_frames_and_counts_what_is_left() {
+    both_ways!(
+        reject_stacked_spans_reviewed_frames_and_counts_what_is_left,
+        reject_stacked_spans_reviewed_frames_and_counts_what_is_left_indexed,
+        reject_stacked_spans_reviewed_frames_and_counts_what_is_left_in
+    );
+
+    async fn reject_stacked_spans_reviewed_frames_and_counts_what_is_left_in(way: Way) {
         use crate::collect::labels::bulk::test_support::{
             auto_box, labels_of, put_frame, put_frame_at,
         };
@@ -3921,7 +4014,7 @@ mod tests {
             [0.0, 0.0, 40.0, 38.0],
             [5.0, 5.0, 25.0, 25.0],
         );
-        let d = ds_with(|c| {
+        let d = way.ds_with(|c| {
             c.collect.classes = ["person", "car"].map(String::from).to_vec();
         });
         let reviewed = put_frame(
@@ -4416,9 +4509,14 @@ mod tests {
         assert!(folder_problem(&d.state, &gone).is_some());
     }
 
-    #[tokio::test]
-    async fn a_missing_folder_under_review_is_named_not_taken_for_an_empty_dataset() {
-        let d = ds();
+    both_ways!(
+        a_missing_folder_under_review_is_named_not_taken_for_an_empty_dataset,
+        a_missing_folder_under_review_is_named_not_taken_for_an_empty_dataset_indexed,
+        a_missing_folder_under_review_is_named_not_taken_for_an_empty_dataset_in
+    );
+
+    async fn a_missing_folder_under_review_is_named_not_taken_for_an_empty_dataset_in(way: Way) {
+        let d = way.ds();
         let rel = put_frame(&d.dir, "cam", "2026-10-22", "20261022T010203004Z_abcd", 0.9);
         d.state
             .config
@@ -4480,9 +4578,14 @@ mod tests {
         assert_eq!(v["total"], 1, "{v}");
     }
 
-    #[tokio::test]
-    async fn a_damaged_queue_line_shows_as_unreadable_and_costs_only_that_line() {
-        let d = ds();
+    both_ways!(
+        a_damaged_queue_line_shows_as_unreadable_and_costs_only_that_line,
+        a_damaged_queue_line_shows_as_unreadable_and_costs_only_that_line_indexed,
+        a_damaged_queue_line_shows_as_unreadable_and_costs_only_that_line_in
+    );
+
+    async fn a_damaged_queue_line_shows_as_unreadable_and_costs_only_that_line_in(way: Way) {
+        let d = way.ds();
         put_frame(&d.dir, "cam", "2026-10-22", "20261022T010203004Z_abcd", 0.9);
         let queue = d.dir.join(layout::REVIEW_QUEUE_FILE);
         let mut bytes = std::fs::read(&queue).unwrap();
@@ -4552,5 +4655,302 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         assert!(v.get("folder_missing").is_none(), "{v}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+    // ---- the review index behind `GET /v1/review/next` ----------------------------------------
+
+    /// `GET /v1/review/next` with `params`.
+    async fn next_of(d: &Ds, params: &[(&str, &str)]) -> serde_json::Value {
+        let query = params
+            .iter()
+            .map(|(k, v)| format!("{k}={}", encode_uri_component(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let (s, v) = json(&d.state, get(&format!("/v1/review/next?{query}"))).await;
+        assert_eq!(s, StatusCode::OK, "{query}: {v}");
+        v
+    }
+
+    /// What [`next`] answers for `params` from a walk of the files, never the index.
+    fn walked(d: &Ds, params: &[(&str, &str)]) -> serde_json::Value {
+        let q: BTreeMap<String, String> = params
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let mut f = Filters::from_query(&q).unwrap();
+        let (dir, classes, _) = context(&d.state);
+        f.wanted = Some((classes, hidden(&d.state)));
+        let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
+        let mut v = serde_json::json!(labels::index::Answer::walk(&dir, &f, after));
+        v["success"] = true.into();
+        v
+    }
+
+    /// The keys and value types of `v`, not its values (an array by its first element).
+    fn shape(v: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match v {
+            Value::Object(m) => {
+                Value::Object(m.iter().map(|(k, v)| (k.clone(), shape(v))).collect())
+            }
+            Value::Array(a) => Value::Array(a.first().map(shape).into_iter().collect()),
+            Value::Null => "null".into(),
+            Value::Bool(_) => "bool".into(),
+            Value::Number(_) => "number".into(),
+            Value::String(_) => "string".into(),
+        }
+    }
+
+    /// Filters a Next is asked with, for answers compared whole with the walk's.
+    const VIEWS: [&[(&str, &str)]; 7] = [
+        &[],
+        &[("status", "any")],
+        &[("status", "reviewed")],
+        &[("status", "skipped")],
+        &[("auto", "accept")],
+        &[("auto", "review")],
+        &[("camera", "yard"), ("status", "any")],
+    ];
+
+    /// Every view of [`VIEWS`], and after its first frame, answered as the walk answers it.
+    async fn same_as_the_walk(d: &Ds, when: &str) {
+        for view in VIEWS {
+            let got = next_of(d, view).await;
+            assert_eq!(got, walked(d, view), "{when}, {view:?}");
+            if let Some(first) = got["item"]["frame"].as_str() {
+                let after = [view, &[("after", first)]].concat();
+                assert_eq!(
+                    next_of(d, &after).await,
+                    walked(d, &after),
+                    "{when}, {after:?}"
+                );
+            }
+        }
+    }
+
+    /// Twelve queued frames of cameras drive and yard, each with one pending auto car scoring
+    /// 0.2..0.75, every third triaged accept.
+    fn put_auto_frames(dir: &std::path::Path) -> Vec<String> {
+        use crate::collect::labels::bulk::test_support::{auto_box, put_frame_at};
+        (0..12u8)
+            .map(|i| {
+                let triage = if i % 3 == 0 {
+                    labels::Triage::Accept
+                } else {
+                    labels::Triage::Review
+                };
+                put_frame_at(
+                    dir,
+                    if i % 2 == 0 { "drive" } else { "yard" },
+                    &format!("20261021T0102{i:02}004Z_f{i}"),
+                    (64, 48),
+                    None,
+                    vec![auto_box("car", 0.2 + 0.05 * f32::from(i), triage)],
+                )
+            })
+            .collect()
+    }
+
+    /// A save or a bulk action, then a Next: the index answers with what was just written,
+    /// exactly as a walk of the files would, and it is the index answering.
+    #[tokio::test]
+    async fn the_index_answers_a_next_with_what_a_save_or_a_bulk_action_just_wrote() {
+        let d = Way::Index.ds();
+        let rels = put_auto_frames(&d.dir);
+        same_as_the_walk(&d, "built").await;
+
+        // A save through the page's route.
+        let shown = next_of(&d, &[]).await;
+        let frame = shown["item"]["frame"].as_str().unwrap().to_string();
+        let q = encode_uri_component(&frame);
+        let (_, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        let mut file = l["labels"].clone();
+        file["status"] = "reviewed".into();
+        file["boxes"][0]["state"] = "accepted".into();
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            l["revision"].as_str().unwrap()
+        );
+        let (s, saved) = json(&d.state, post_json(&uri, &file.to_string())).await;
+        assert_eq!(s, StatusCode::OK, "{saved}");
+        let v = next_of(&d, &[]).await;
+        assert_ne!(
+            v["item"]["frame"],
+            frame.as_str(),
+            "the saved frame left the queue at once"
+        );
+        assert_eq!(v["counts"]["reviewed"], 1, "{v}");
+        same_as_the_walk(&d, "after a save").await;
+
+        // A save as skipped.
+        let frame = v["item"]["frame"].as_str().unwrap().to_string();
+        let q = encode_uri_component(&frame);
+        let (_, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        let mut file = l["labels"].clone();
+        file["status"] = "skipped".into();
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            l["revision"].as_str().unwrap()
+        );
+        let (s, saved) = json(&d.state, post_json(&uri, &file.to_string())).await;
+        assert_eq!(s, StatusCode::OK, "{saved}");
+        assert_eq!(next_of(&d, &[("status", "skipped")]).await["total"], 1);
+        same_as_the_walk(&d, "after a skip").await;
+
+        // Bulk actions: reject the low ones, accept what the triage settles.
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/reject-low",
+                r#"{"dry_run": false, "min_score": 0.4}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        same_as_the_walk(&d, "after reject-low").await;
+        let (s, v) = json(
+            &d.state,
+            post_json("/v1/review/accept-auto", r#"{"dry_run": false}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v["accepted"].as_u64().unwrap() > 0, "{v}");
+        same_as_the_walk(&d, "after accept-auto").await;
+
+        // The index answered all along: an edit no writer of this process made waits for the
+        // minute's scan, so it is in the walk and not yet in the answer.
+        let before = next_of(&d, &[("status", "any")]).await;
+        let untouched = rels
+            .iter()
+            .find(|r| {
+                crate::collect::labels::bulk::test_support::labels_of(&d.dir, r).status
+                    == labels::Status::Unreviewed
+            })
+            .expect("a frame still unreviewed");
+        let target = Frame::resolve(&d.dir, untouched).unwrap();
+        let mut f = target.labels().unwrap().unwrap();
+        f.status = labels::Status::Reviewed;
+        std::fs::write(&target.labels, serde_json::to_vec(&f).unwrap()).unwrap();
+        let after = next_of(&d, &[("status", "any")]).await;
+        assert_eq!(after["counts"], before["counts"], "served by the index");
+        assert_ne!(
+            walked(&d, &[("status", "any")])["counts"],
+            before["counts"],
+            "the walk sees the direct edit"
+        );
+    }
+
+    /// While the index is built, the answer says how far it is (`indexing: {done, total}`) and
+    /// does not wait for it; once built, `indexing` is gone and the answer is the walk's.
+    #[tokio::test]
+    async fn indexing_is_in_the_answer_while_the_index_builds_and_gone_after() {
+        let d = Way::Index.ds();
+        put_auto_frames(&d.dir);
+        let hold = labels::index::tests::hold(&d.dir);
+        let v = next_of(&d, &[]).await;
+        let progress = |v: &serde_json::Value| {
+            let ix = v["indexing"]
+                .as_object()
+                .unwrap_or_else(|| panic!("indexing: {v}"));
+            assert_eq!(ix.len(), 2, "{v}");
+            (ix["done"].as_u64().unwrap(), ix["total"].as_u64().unwrap())
+        };
+        let (done, total) = progress(&v);
+        assert!(done <= total, "{v}");
+        assert!(hold.reached(), "the build stops at the hold");
+        let v = next_of(&d, &[("status", "any")]).await;
+        let (done, total) = progress(&v);
+        assert!(done < 12 && total <= 12, "{v}");
+        // A Next during the build moves on, past a frame it does not have yet too.
+        let v = next_of(&d, &[("after", "ir/drive/2026-10-21/nothing.jpg")]).await;
+        progress(&v);
+        hold.release();
+        let v = next_of(&d, &[]).await;
+        assert!(v.get("indexing").is_none(), "{v}");
+        assert_eq!(v, walked(&d, &[]));
+        same_as_the_walk(&d, "built after a hold").await;
+    }
+
+    /// The answer has the same keys and value types whether the index or the walk gives it, and
+    /// `indexing` only while the index is still filling in.
+    #[tokio::test]
+    async fn the_answer_has_one_shape_with_and_without_the_index() {
+        let (walk, index) = (Way::Walk.ds(), Way::Index.ds());
+        for d in [&walk, &index] {
+            put_auto_frames(&d.dir);
+            put_frame(
+                &d.dir,
+                "yard",
+                "2026-10-22",
+                "20261022T010203004Z_plain",
+                0.52,
+            );
+        }
+        for view in VIEWS {
+            let (a, b) = (next_of(&walk, view).await, next_of(&index, view).await);
+            assert_eq!(shape(&a), shape(&b), "{view:?}");
+            assert!(
+                a.get("indexing").is_none() && b.get("indexing").is_none(),
+                "{b}"
+            );
+        }
+        // During a build: the same keys, and `indexing` with two numbers.
+        let held = Way::Index.ds();
+        put_auto_frames(&held.dir);
+        let hold = labels::index::tests::hold(&held.dir);
+        let v = next_of(&held, &[]).await;
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.retain(|k| k != "indexing");
+        let walked_keys: Vec<_> = next_of(&walk, &[])
+            .await
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(keys, walked_keys);
+        assert_eq!(
+            shape(&v["indexing"]),
+            serde_json::json!({"done": "number", "total": "number"})
+        );
+        drop(hold);
+    }
+
+    /// A frame retention (or anyone) deleted behind the index's back is never the frame shown
+    /// nor one of the frames the page loads ahead.
+    #[tokio::test]
+    async fn a_frame_deleted_from_disk_is_never_shown_or_loaded_ahead() {
+        let d = Way::Index.ds();
+        for i in 0..8u8 {
+            put_frame(
+                &d.dir,
+                if i % 2 == 0 { "drive" } else { "yard" },
+                "2026-10-22",
+                &format!("20261022T0102{i:02}004Z_g{i}"),
+                0.5 + 0.05 * f32::from(i),
+            );
+        }
+        let v = next_of(&d, &[]).await;
+        let first = v["item"]["frame"].as_str().unwrap().to_string();
+        let ahead = v["upcoming"][1].as_str().unwrap().to_string();
+        // Gone as retention takes a frame: image and sidecar, no label file to tell the index.
+        for rel in [&first, &ahead] {
+            let jpg = d.dir.join(rel);
+            std::fs::remove_file(&jpg).unwrap();
+            std::fs::remove_file(jpg.with_extension("json")).unwrap();
+        }
+        for after in [None, Some(first.as_str()), Some(ahead.as_str())] {
+            let params: Vec<(&str, &str)> = after.map(|a| ("after", a)).into_iter().collect();
+            let v = next_of(&d, &params).await;
+            let shown: Vec<&str> = std::iter::once(&v["item"]["frame"])
+                .chain(v["upcoming"].as_array().unwrap())
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert!(!shown.is_empty(), "{v}");
+            for rel in shown {
+                assert!(rel != first && rel != ahead, "{rel} is gone: {v}");
+                assert!(Frame::resolve(&d.dir, rel).is_some(), "{rel}: {v}");
+            }
+            assert_eq!(v, walked(&d, &params), "{after:?}");
+        }
     }
 }
