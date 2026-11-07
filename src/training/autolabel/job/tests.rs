@@ -2987,6 +2987,26 @@ fn the_preview_takes_what_the_run_then_takes() {
 }
 
 #[test]
+fn the_preview_puts_a_labeler_the_gpu_cannot_hold_first() {
+    // A small Apple GPU (a CI virtual machine reports 4.2 GB): the VLM check cannot load there.
+    use crate::training::autolabel::tests_gpu;
+    use crate::training::capability::Accelerator;
+    let t = tmp("preview-small-gpu");
+    frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    tests_gpu::set(Some(Accelerator::Mps {
+        name: "Apple M1 (Virtual)".into(),
+        memory_mb: 4300,
+    }));
+    let p = crate::training::autolabel::preview_autolabel(&cfg, request(""));
+    tests_gpu::set(None);
+    let p = p.unwrap();
+    let first = p.warnings.first().expect("a GPU note");
+    assert!(first.starts_with("This run would be refused:"), "{first}");
+    assert!(first.contains("Qwen3-VL"), "{first}");
+}
+
+#[test]
 fn the_preview_needs_no_gpu_and_splits_by_status() {
     let t = tmp("preview-gates");
     let rels = frames(&t.0, 3, false);

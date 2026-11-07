@@ -645,13 +645,49 @@ pub fn preview_autolabel(
     let job = scoped_job(config, request)?;
     let mut p = job.preview()?;
     if job.request.with_model.is_none()
-        && let Ok(Some(a)) = super::capability_now().resolve_gpu(job.request.gpu.as_deref())
+        && let Some(a) = preview_accelerator(job.request.gpu.as_deref())
     {
         // First: a run that cannot load matters more than anything about its frames.
         let gpu = gpu_notes(&job.request, &a);
         p.warnings.splice(0..0, gpu);
     }
     Ok(p)
+}
+
+/// The GPU a preview judges the labelers against: this machine's, except in tests, where it is
+/// the one the test's thread set ([`tests_gpu::set`], none by default), so no test depends on
+/// the host.
+fn preview_accelerator(gpu: Option<&str>) -> Option<super::capability::Accelerator> {
+    #[cfg(test)]
+    {
+        let _ = gpu;
+        tests_gpu::get()
+    }
+    #[cfg(not(test))]
+    {
+        super::capability_now().resolve_gpu(gpu).ok().flatten()
+    }
+}
+
+/// The accelerator previews see in tests ([`preview_accelerator`]): per thread, so a test that sets
+/// it changes nothing for the others (route tests run the preview on other threads and see none).
+#[cfg(test)]
+pub(crate) mod tests_gpu {
+    use super::super::capability::Accelerator;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static GPU: RefCell<Option<Accelerator>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<Accelerator> {
+        GPU.with(|g| g.borrow().clone())
+    }
+
+    /// Set (or clear) it for this thread.
+    pub(crate) fn set(a: Option<Accelerator>) {
+        GPU.with(|g| *g.borrow_mut() = a);
+    }
 }
 
 /// What the preview and the run say about the labelers' GPU `a`: a labeler the card cannot hold
